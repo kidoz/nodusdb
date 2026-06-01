@@ -247,7 +247,7 @@ pub struct RoleMembershipDescriptor {
     pub member_id: PrincipalId,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ResourceRef {
     Database(DatabaseId),
     Schema(SchemaId),
@@ -374,6 +374,13 @@ pub struct RevokePrivilegeRequest {
     pub privilege: String,
 }
 
+pub struct AddRoleMemberRequest {
+    /// The role (itself a principal) that the member is being added to.
+    pub role_principal_id: PrincipalId,
+    /// The principal (user, service account, or nested role) being granted membership.
+    pub member_id: PrincipalId,
+}
+
 pub trait CatalogReader: Send + Sync {
     fn get_database(&self, name: &str) -> Result<DatabaseDescriptor>;
     fn get_schema(&self, database: &str, schema: &str) -> Result<SchemaDescriptor>;
@@ -383,6 +390,10 @@ pub trait CatalogReader: Send + Sync {
     fn get_cluster_version(&self) -> Result<ClusterVersion>;
     fn get_grants_for_resource(&self, resource: ResourceRef) -> Result<Vec<GrantDescriptor>>;
     fn get_effective_roles(&self, principal: PrincipalId) -> Result<Vec<RoleId>>;
+    /// Returns the principal itself plus the transitive closure of role
+    /// principals it is a member of. Used by the authorization engine to match
+    /// grants made either directly to a principal or to any of its roles.
+    fn get_effective_principals(&self, principal: PrincipalId) -> Result<Vec<PrincipalId>>;
 }
 
 pub trait CatalogWriter: Send + Sync {
@@ -395,6 +406,7 @@ pub trait CatalogWriter: Send + Sync {
     fn create_role(&self, request: CreateRoleRequest) -> Result<PrincipalDescriptor>;
     fn grant_privilege(&self, request: GrantPrivilegeRequest) -> Result<GrantDescriptor>;
     fn revoke_privilege(&self, request: RevokePrivilegeRequest) -> Result<()>;
+    fn add_role_member(&self, request: AddRoleMemberRequest) -> Result<()>;
 }
 
 // In-Memory MVP implementation
@@ -409,6 +421,8 @@ pub struct MemoryCatalog {
     principals: RwLock<HashMap<String, PrincipalDescriptor>>,
     grants: RwLock<Vec<GrantDescriptor>>,
     roles: RwLock<Vec<RoleMembershipDescriptor>>,
+    /// (role_principal_id, member_id) edges of the role-membership graph.
+    memberships: RwLock<Vec<(PrincipalId, PrincipalId)>>,
     catalog_version: RwLock<u64>,
 }
 
@@ -427,6 +441,7 @@ impl MemoryCatalog {
             principals: RwLock::new(HashMap::new()),
             grants: RwLock::new(Vec::new()),
             roles: RwLock::new(Vec::new()),
+            memberships: RwLock::new(Vec::new()),
             catalog_version: RwLock::new(1),
         }
     }
@@ -495,12 +510,38 @@ impl CatalogReader for MemoryCatalog {
         })
     }
 
-    fn get_grants_for_resource(&self, _resource: ResourceRef) -> Result<Vec<GrantDescriptor>> {
-        Ok(vec![])
+    fn get_grants_for_resource(&self, resource: ResourceRef) -> Result<Vec<GrantDescriptor>> {
+        let guard = self.grants.read().unwrap();
+        Ok(guard
+            .iter()
+            .filter(|g| g.state == DescriptorState::Public && g.resource == resource)
+            .cloned()
+            .collect())
     }
 
-    fn get_effective_roles(&self, _principal: PrincipalId) -> Result<Vec<RoleId>> {
-        Ok(vec![])
+    fn get_effective_roles(&self, principal: PrincipalId) -> Result<Vec<RoleId>> {
+        let guard = self.roles.read().unwrap();
+        Ok(guard
+            .iter()
+            .filter(|m| m.member_id == principal && m.state == DescriptorState::Public)
+            .map(|m| m.role_id)
+            .collect())
+    }
+
+    fn get_effective_principals(&self, principal: PrincipalId) -> Result<Vec<PrincipalId>> {
+        let edges = self.memberships.read().unwrap();
+        // Breadth-first transitive closure over the role-membership graph.
+        let mut result = vec![principal];
+        let mut frontier = vec![principal];
+        while let Some(current) = frontier.pop() {
+            for (role_principal_id, member_id) in edges.iter() {
+                if *member_id == current && !result.contains(role_principal_id) {
+                    result.push(*role_principal_id);
+                    frontier.push(*role_principal_id);
+                }
+            }
+        }
+        Ok(result)
     }
 }
 
@@ -615,8 +656,24 @@ impl CatalogWriter for MemoryCatalog {
         Ok(desc)
     }
 
-    fn revoke_privilege(&self, _request: RevokePrivilegeRequest) -> Result<()> {
-        let _v = self.increment_version();
+    fn revoke_privilege(&self, request: RevokePrivilegeRequest) -> Result<()> {
+        let mut guard = self.grants.write().unwrap();
+        guard.retain(|g| {
+            !(g.principal_id == request.principal_id
+                && g.resource == request.resource
+                && g.privilege.eq_ignore_ascii_case(&request.privilege))
+        });
+        self.increment_version();
+        Ok(())
+    }
+
+    fn add_role_member(&self, request: AddRoleMemberRequest) -> Result<()> {
+        let edge = (request.role_principal_id, request.member_id);
+        let mut guard = self.memberships.write().unwrap();
+        if !guard.contains(&edge) {
+            guard.push(edge);
+        }
+        self.increment_version();
         Ok(())
     }
 }
