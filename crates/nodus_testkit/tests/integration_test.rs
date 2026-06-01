@@ -46,4 +46,18 @@ async fn test_server_health_endpoints() {
         .await
         .expect("Failed to fetch metrics");
     assert!(res.status().is_success());
+
+    // Cluster overview is served from live ClusterState (single-node default).
+    let res = client
+        .get(format!(
+            "http://{}/api/v1/cluster/overview",
+            server.http_addr
+        ))
+        .send()
+        .await
+        .expect("Failed to fetch cluster overview");
+    assert!(res.status().is_success());
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(body["cluster_status"], "Healthy");
+    assert_eq!(body["nodes_total"], 1);
 }

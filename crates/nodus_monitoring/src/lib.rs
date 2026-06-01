@@ -135,6 +135,7 @@ pub fn monitoring_routes(state: Arc<AppState>) -> Router {
         .route("/readyz", get(readyz))
         .route("/metrics", get(metrics))
         .route("/api/v1/version", get(version))
+        .route("/api/v1/cluster/overview", get(cluster_overview))
         .with_state(state)
 }
 
@@ -143,6 +144,14 @@ async fn version() -> axum::Json<VersionInfo> {
         name: "nodusd".into(),
         version: env!("CARGO_PKG_VERSION").into(),
     })
+}
+
+async fn cluster_overview(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+) -> axum::Json<ClusterOverview> {
+    // Live membership/shard health from ClusterState. QPS rate computation is a
+    // follow-up; report 0.0 rather than a fabricated value.
+    axum::Json(state.cluster.overview(0.0, 0))
 }
 
 async fn healthz() -> &'static str {

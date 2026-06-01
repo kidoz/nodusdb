@@ -1665,6 +1665,7 @@ dependencies = [
  "nodus_security",
  "nodus_server",
  "reqwest",
+ "serde_json",
  "thiserror",
  "tokio",
  "tokio-postgres",
