@@ -192,8 +192,8 @@ impl AuthzEngine for DefaultAuthzEngine {
 mod tests {
     use super::*;
     use nodus_catalog::{
-        AddRoleMemberRequest, CatalogWriter, CreateRoleRequest, GrantPrivilegeRequest, MemoryCatalog,
-        PrincipalType, ResourceRef, TableId,
+        AddRoleMemberRequest, CatalogWriter, CreateRoleRequest, GrantPrivilegeRequest,
+        MemoryCatalog, PrincipalType, ResourceRef, TableId,
     };
 
     fn request(

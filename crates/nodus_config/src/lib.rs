@@ -4,6 +4,8 @@
 //! then environment variables prefixed with `NODUS_` (double underscore selects
 //! a nested key, e.g. `NODUS_SERVER__PGWIRE_ADDR`). Later layers win.
 
+#![allow(clippy::result_large_err, clippy::derivable_impls)]
+
 use figment::{
     Figment,
     providers::{Env, Format, Serialized, Toml},
