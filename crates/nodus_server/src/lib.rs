@@ -190,6 +190,7 @@ pub async fn run_server_with_config(
         upgrade,
         shards,
         slow_log,
+        draining: state.draining.clone(),
     };
     let app = Router::new()
         .merge(monitoring_routes(state))

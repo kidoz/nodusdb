@@ -17,6 +17,7 @@ use nodus_upgrade::{DefaultUpgradeCoordinator, UpgradeCoordinator};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use uuid::Uuid;
 
 /// Shared handles the admin endpoints operate on. Grows as more control-plane
@@ -31,6 +32,8 @@ pub struct AdminState {
     pub upgrade: Arc<DefaultUpgradeCoordinator>,
     pub shards: Arc<ShardOrchestrator>,
     pub slow_log: Arc<SlowQueryLog>,
+    /// Shared with `AppState`; flipping it makes `/readyz` report not-ready.
+    pub draining: Arc<AtomicBool>,
 }
 
 pub fn admin_routes(state: AdminState) -> Router {
@@ -52,11 +55,23 @@ pub fn admin_routes(state: AdminState) -> Router {
         .route("/api/v1/shards/:table/split", post(shards_split))
         .route("/api/v1/shards/:table/rebalance", post(shards_rebalance))
         .route("/api/v1/queries", get(slow_queries))
+        .route("/api/v1/node/drain", post(node_drain))
         .with_state(state)
 }
 
 async fn slow_queries(State(state): State<AdminState>) -> Json<Vec<SlowQuery>> {
     Json(state.slow_log.list())
+}
+
+/// Marks the node as draining: `/readyz` starts failing (so load balancers stop
+/// new traffic) and all active sessions are cancelled.
+async fn node_drain(State(state): State<AdminState>) -> Json<Value> {
+    state.draining.store(true, Ordering::Release);
+    let sessions = state.registry.list();
+    for s in &sessions {
+        state.registry.kill(&s.session_id);
+    }
+    Json(json!({ "draining": true, "sessions_cancelled": sessions.len() }))
 }
 
 async fn list_sessions(State(state): State<AdminState>) -> Json<Vec<SessionInfo>> {

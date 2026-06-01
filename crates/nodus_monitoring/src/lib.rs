@@ -189,6 +189,9 @@ impl ClusterState {
 
 pub struct AppState {
     pub is_ready: AtomicBool,
+    /// When set, the node is draining and reports not-ready so load balancers
+    /// stop sending new traffic. Shared with the admin drain endpoint.
+    pub draining: Arc<AtomicBool>,
     pub registry: std::sync::Mutex<Registry>,
     pub metrics: Metrics,
     pub cluster: Arc<ClusterState>,
@@ -200,6 +203,7 @@ impl Default for AppState {
         let metrics = Metrics::register(&mut registry);
         Self {
             is_ready: AtomicBool::new(false),
+            draining: Arc::new(AtomicBool::new(false)),
             registry: std::sync::Mutex::new(registry),
             metrics,
             cluster: Arc::new(ClusterState::default()),
@@ -245,7 +249,9 @@ async fn healthz() -> &'static str {
 async fn readyz(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
 ) -> Result<&'static str, StatusCode> {
-    if state.is_ready.load(Ordering::Acquire) {
+    let ready = state.is_ready.load(Ordering::Acquire);
+    let draining = state.draining.load(Ordering::Acquire);
+    if ready && !draining {
         Ok("OK")
     } else {
         Err(StatusCode::SERVICE_UNAVAILABLE)

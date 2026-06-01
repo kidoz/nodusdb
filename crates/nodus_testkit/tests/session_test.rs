@@ -312,6 +312,34 @@ async fn admin_shard_api_init_split() {
 }
 
 #[tokio::test]
+async fn admin_node_drain_makes_unready() {
+    let server = TestServer::start().await.expect("server starts");
+    let http = reqwest::Client::new();
+    let base = format!("http://{}", server.http_addr);
+
+    // Ready before draining.
+    let r = http.get(format!("{base}/readyz")).send().await.unwrap();
+    assert!(r.status().is_success());
+
+    let drained: serde_json::Value = http
+        .post(format!("{base}/api/v1/node/drain"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(drained["draining"], true);
+
+    // After draining, readiness fails (503) so LBs stop routing here.
+    let r = http.get(format!("{base}/readyz")).send().await.unwrap();
+    assert_eq!(r.status().as_u16(), 503);
+    // Liveness still OK.
+    let h = http.get(format!("{base}/healthz")).send().await.unwrap();
+    assert!(h.status().is_success());
+}
+
+#[tokio::test]
 async fn pgwire_rejects_bad_password() {
     let server = TestServer::start().await.expect("server starts");
     let bad = format!(

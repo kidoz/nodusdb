@@ -60,6 +60,20 @@ enum Commands {
         #[arg(long, default_value = DEFAULT_ADDR)]
         addr: String,
     },
+    /// Node lifecycle operations
+    Node {
+        #[command(subcommand)]
+        cmd: NodeCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum NodeCmd {
+    /// Drain the node: stop accepting traffic and cancel active sessions
+    Drain {
+        #[arg(long, default_value = DEFAULT_ADDR)]
+        addr: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -474,6 +488,18 @@ async fn main() -> anyhow::Result<()> {
                     q["sql"].as_str().unwrap_or("?")
                 );
             }
+        }
+        Commands::Node {
+            cmd: NodeCmd::Drain { addr },
+        } => {
+            let v: serde_json::Value = client
+                .post(format!("{addr}/api/v1/node/drain"))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&v)?);
         }
     }
 
