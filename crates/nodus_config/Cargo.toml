@@ -10,3 +10,6 @@ repository.workspace = true
 figment.workspace = true
 serde.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+figment = { workspace = true, features = ["test"] }
