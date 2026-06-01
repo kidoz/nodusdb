@@ -18,8 +18,9 @@ members = [
     "crates/nodus_authz",
     "crates/nodus_audit",
     "crates/nodus_web_console",
-    "crates/nodus_storage_api",
     "crates/nodus_storage_mem",
+    "crates/nodus_storage_lsm",
+    "crates/nodus_storage_btree",
     "crates/nodus_storage_wal",
     "crates/nodus_mvcc",
     "crates/nodus_index",
@@ -61,5 +62,4 @@ uuid = { version = "1.8.0", features = ["v4", "serde"] }
 chrono = { version = "0.4.38", features = ["serde"] }
 bytes = "1.6.0"
 openraft = { version = "0.9.16", features = ["serde"] }
-redb = "2.1.1"
 sha2 = "0.10.8"
