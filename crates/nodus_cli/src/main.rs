@@ -50,6 +50,49 @@ enum Commands {
         #[command(subcommand)]
         cmd: UpgradeCmd,
     },
+    /// Manage shards
+    Shard {
+        #[command(subcommand)]
+        cmd: ShardCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum ShardCmd {
+    /// Create an initial single shard for a table
+    Init {
+        #[arg(long)]
+        table: String,
+        #[arg(long, default_value = DEFAULT_ADDR)]
+        addr: String,
+    },
+    /// Show the shard map for a table
+    Map {
+        #[arg(long)]
+        table: String,
+        #[arg(long, default_value = DEFAULT_ADDR)]
+        addr: String,
+    },
+    /// Split a shard at a key byte (0-255)
+    Split {
+        #[arg(long)]
+        table: String,
+        #[arg(long)]
+        shard: String,
+        #[arg(long)]
+        key: u8,
+        #[arg(long, default_value = DEFAULT_ADDR)]
+        addr: String,
+    },
+    /// Rebalance a table's shards across nodes (comma-separated)
+    Rebalance {
+        #[arg(long)]
+        table: String,
+        #[arg(long)]
+        nodes: String,
+        #[arg(long, default_value = DEFAULT_ADDR)]
+        addr: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -358,6 +401,41 @@ async fn main() -> anyhow::Result<()> {
                 UpgradeCmd::Rollback { addr } => {
                     (true, format!("{addr}/api/v1/upgrade/rollback"), vec![])
                 }
+            };
+            let mut req = if method_post {
+                client.post(&path)
+            } else {
+                client.get(&path)
+            };
+            if !query.is_empty() {
+                req = req.query(&query);
+            }
+            let v: serde_json::Value = req.send().await?.error_for_status()?.json().await?;
+            println!("{}", serde_json::to_string_pretty(&v)?);
+        }
+        Commands::Shard { cmd } => {
+            let (method_post, path, query): (bool, String, Vec<(&str, String)>) = match &cmd {
+                ShardCmd::Init { table, addr } => {
+                    (true, format!("{addr}/api/v1/shards/{table}/init"), vec![])
+                }
+                ShardCmd::Map { table, addr } => {
+                    (false, format!("{addr}/api/v1/shards/{table}"), vec![])
+                }
+                ShardCmd::Split {
+                    table,
+                    shard,
+                    key,
+                    addr,
+                } => (
+                    true,
+                    format!("{addr}/api/v1/shards/{table}/split"),
+                    vec![("shard", shard.clone()), ("key", key.to_string())],
+                ),
+                ShardCmd::Rebalance { table, nodes, addr } => (
+                    true,
+                    format!("{addr}/api/v1/shards/{table}/rebalance"),
+                    vec![("nodes", nodes.clone())],
+                ),
             };
             let mut req = if method_post {
                 client.post(&path)

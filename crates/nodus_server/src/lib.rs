@@ -119,6 +119,9 @@ pub async fn run_server_with_config(
         cluster_version,
     ));
 
+    let meta = Arc::new(nodus_meta::MemMetaStore::new());
+    let shards = Arc::new(nodus_sharding::ShardOrchestrator::new(meta));
+
     let admin_state = AdminState {
         registry: registry.clone(),
         audit: audit.clone(),
@@ -126,6 +129,7 @@ pub async fn run_server_with_config(
         catalog: catalog.clone(),
         backup,
         upgrade,
+        shards,
     };
     let app = Router::new()
         .merge(monitoring_routes(state))

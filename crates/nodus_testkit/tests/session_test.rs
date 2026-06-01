@@ -263,6 +263,55 @@ async fn admin_upgrade_api_drives_lifecycle() {
 }
 
 #[tokio::test]
+async fn admin_shard_api_init_split() {
+    let server = TestServer::start().await.expect("server starts");
+    let http = reqwest::Client::new();
+    let base = format!("http://{}", server.http_addr);
+    let table = "11111111-1111-1111-1111-111111111111";
+
+    let init: serde_json::Value = http
+        .post(format!("{base}/api/v1/shards/{table}/init"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let shard_id = init["shard_id"].as_str().expect("shard_id").to_string();
+
+    let map: serde_json::Value = http
+        .get(format!("{base}/api/v1/shards/{table}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(map["shards"].as_array().unwrap().len(), 1);
+
+    let split: serde_json::Value = http
+        .post(format!("{base}/api/v1/shards/{table}/split"))
+        .query(&[("shard", shard_id.as_str()), ("key", "50")])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(split["left"].is_string() && split["right"].is_string());
+
+    let map: serde_json::Value = http
+        .get(format!("{base}/api/v1/shards/{table}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(map["shards"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
 async fn pgwire_rejects_bad_password() {
     let server = TestServer::start().await.expect("server starts");
     let bad = format!(

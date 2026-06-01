@@ -1,6 +1,6 @@
 use anyhow::Result;
 use nodus_catalog::{DescriptorState, ShardDescriptor, ShardId, TableId};
-use nodus_meta::MetaStore;
+use nodus_meta::{MetaStore, ShardMap};
 use nodus_storage_api::KeyRange;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -85,6 +85,22 @@ impl ShardOrchestrator {
             meta,
             placements: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Creates an initial single shard covering the whole key space for a table.
+    pub fn init_single_shard(&self, table_id: TableId) -> Result<ShardId> {
+        let shard = new_shard(table_id, "shard-0".into(), vec![], vec![]);
+        let id = shard.id;
+        self.meta.update_shard_map(ShardMap {
+            table_id,
+            shards: vec![shard],
+        })?;
+        Ok(id)
+    }
+
+    /// Returns the current shard map for a table.
+    pub fn shard_map(&self, table_id: TableId) -> Result<ShardMap> {
+        self.meta.get_shard_map(table_id)
     }
 
     /// Splits `shard_id` at `split_key`, producing `[start, split_key)` and
@@ -222,7 +238,7 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use chrono::Utc;
-    use nodus_meta::{MemMetaStore, ShardMap};
+    use nodus_meta::MemMetaStore;
 
     /// Asserts the shards form a contiguous, non-overlapping cover from
     /// -infinity to +infinity — i.e. no key lost or duplicated.

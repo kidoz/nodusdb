@@ -26,6 +26,8 @@ nodus_audit = { path = "../nodus_audit" }
 nodus_authz = { path = "../nodus_authz" }
 nodus_backup = { path = "../nodus_backup" }
 nodus_upgrade = { path = "../nodus_upgrade" }
+nodus_sharding = { path = "../nodus_sharding" }
+nodus_meta = { path = "../nodus_meta" }
 uuid.workspace = true
 bytes.workspace = true
 serde_json.workspace = true

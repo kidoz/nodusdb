@@ -9,8 +9,9 @@ use bytes::Bytes;
 use nodus_audit::{AuditEvent, AuditQuery, AuditQueryable, MemoryAuditSink};
 use nodus_authz::{Action, AuthzContext, AuthzEngine, AuthzExplanation, AuthzRequest};
 use nodus_backup::{BackupObject, BackupOrchestrator};
-use nodus_catalog::{CatalogReader, PrincipalId, ResourceRef};
+use nodus_catalog::{CatalogReader, PrincipalId, ResourceRef, ShardId, TableId};
 use nodus_security::{SessionInfo, SessionRegistry};
+use nodus_sharding::ShardOrchestrator;
 use nodus_upgrade::{DefaultUpgradeCoordinator, UpgradeCoordinator};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -27,6 +28,7 @@ pub struct AdminState {
     pub catalog: Arc<dyn CatalogReader>,
     pub backup: Arc<BackupOrchestrator>,
     pub upgrade: Arc<DefaultUpgradeCoordinator>,
+    pub shards: Arc<ShardOrchestrator>,
 }
 
 pub fn admin_routes(state: AdminState) -> Router {
@@ -43,6 +45,10 @@ pub fn admin_routes(state: AdminState) -> Router {
         .route("/api/v1/upgrade/node-upgraded", post(upgrade_node_upgraded))
         .route("/api/v1/upgrade/finalize", post(upgrade_finalize))
         .route("/api/v1/upgrade/rollback", post(upgrade_rollback))
+        .route("/api/v1/shards/:table/init", post(shards_init))
+        .route("/api/v1/shards/:table", get(shards_map))
+        .route("/api/v1/shards/:table/split", post(shards_split))
+        .route("/api/v1/shards/:table/rebalance", post(shards_rebalance))
         .with_state(state)
 }
 
@@ -217,4 +223,82 @@ async fn upgrade_finalize(State(state): State<AdminState>) -> Json<Value> {
 async fn upgrade_rollback(State(state): State<AdminState>) -> Json<Value> {
     let op = state.upgrade.rollback();
     upgrade_response(&state, op)
+}
+
+fn parse_table(id: &str) -> Option<TableId> {
+    Uuid::parse_str(id).ok().map(TableId)
+}
+
+async fn shards_init(State(state): State<AdminState>, Path(table): Path<String>) -> Json<Value> {
+    let Some(table_id) = parse_table(&table) else {
+        return Json(json!({ "error": "invalid table id" }));
+    };
+    match state.shards.init_single_shard(table_id) {
+        Ok(id) => Json(json!({ "table": table_id.to_string(), "shard_id": id.to_string() })),
+        Err(e) => Json(json!({ "error": e.to_string() })),
+    }
+}
+
+async fn shards_map(State(state): State<AdminState>, Path(table): Path<String>) -> Json<Value> {
+    let Some(table_id) = parse_table(&table) else {
+        return Json(json!({ "error": "invalid table id" }));
+    };
+    match state.shards.shard_map(table_id) {
+        Ok(map) => {
+            let shards: Vec<Value> = map
+                .shards
+                .iter()
+                .map(|s| {
+                    json!({
+                        "id": s.id.to_string(),
+                        "start_key": s.start_key,
+                        "end_key": s.end_key,
+                    })
+                })
+                .collect();
+            Json(json!({ "shards": shards }))
+        }
+        Err(e) => Json(json!({ "error": e.to_string() })),
+    }
+}
+
+async fn shards_split(
+    State(state): State<AdminState>,
+    Path(table): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Json<Value> {
+    let Some(table_id) = parse_table(&table) else {
+        return Json(json!({ "error": "invalid table id" }));
+    };
+    let shard_id = match params.get("shard").and_then(|s| Uuid::parse_str(s).ok()) {
+        Some(u) => ShardId(u),
+        None => return Json(json!({ "error": "missing or invalid shard id" })),
+    };
+    // Split key is given as a single unsigned byte for the MVP key space.
+    let split_key: Vec<u8> = match params.get("key").and_then(|k| k.parse::<u8>().ok()) {
+        Some(b) => vec![b],
+        None => return Json(json!({ "error": "missing or invalid key (expected 0-255)" })),
+    };
+    match state.shards.split(table_id, shard_id, split_key) {
+        Ok((l, r)) => Json(json!({ "left": l.to_string(), "right": r.to_string() })),
+        Err(e) => Json(json!({ "error": e.to_string() })),
+    }
+}
+
+async fn shards_rebalance(
+    State(state): State<AdminState>,
+    Path(table): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Json<Value> {
+    let Some(table_id) = parse_table(&table) else {
+        return Json(json!({ "error": "invalid table id" }));
+    };
+    let nodes: Vec<String> = params
+        .get("nodes")
+        .map(|s| s.split(',').map(|n| n.trim().to_string()).collect())
+        .unwrap_or_default();
+    match state.shards.rebalance(table_id, &nodes) {
+        Ok(()) => Json(json!({ "rebalanced": true, "nodes": nodes })),
+        Err(e) => Json(json!({ "error": e.to_string() })),
+    }
 }
