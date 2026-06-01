@@ -258,6 +258,13 @@ impl MemExecutor {
         (exec, cat)
     }
 
+    /// Runs one MVCC garbage-collection pass at the transaction manager's safe
+    /// watermark. Returns the number of versions reclaimed.
+    pub fn run_gc(&self) -> Result<usize> {
+        let watermark = self.txn.gc_watermark();
+        self.kv.garbage_collect(watermark)
+    }
+
     /// Deny-by-default authorization gate for a single action on a resource.
     fn authorize(
         &self,
@@ -574,5 +581,12 @@ mod tests {
         };
         assert_eq!(audit.query(&denied).unwrap().len(), 1);
         assert_eq!(audit.query(&success).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn run_gc_is_safe_with_no_active_txns() {
+        let exec = MemExecutor::default();
+        // No data/txns: GC reclaims nothing and does not error.
+        assert_eq!(exec.run_gc().unwrap(), 0);
     }
 }

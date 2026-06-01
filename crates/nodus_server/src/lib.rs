@@ -122,6 +122,22 @@ pub async fn run_server_with_config(
 
     let tls_acceptor = load_tls_acceptor(&config.tls)?;
 
+    // Background MVCC garbage collector: periodically reclaims superseded
+    // versions below the transaction manager's safe watermark.
+    let gc_executor = executor.clone();
+    let gc_metrics = state.metrics.clone();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            ticker.tick().await;
+            if let Ok(reclaimed) = gc_executor.run_gc()
+                && reclaimed > 0
+            {
+                gc_metrics.vacuum_reclaimed_total.inc_by(reclaimed as u64);
+            }
+        }
+    });
+
     let registry = Arc::new(SessionRegistry::new());
     let pgwire_metrics = state.metrics.clone();
     let pgwire_registry = registry.clone();

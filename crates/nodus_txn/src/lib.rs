@@ -51,6 +51,13 @@ pub trait TxnManager: Send + Sync {
     fn begin_txn(&self) -> Result<TxnRecord>;
     fn commit_txn(&self, txn_id: TxnId) -> Result<Timestamp>;
     fn abort_txn(&self, txn_id: TxnId) -> Result<()>;
+
+    /// The highest timestamp at or below which MVCC versions can be safely
+    /// reclaimed: the oldest in-flight read timestamp, or the current clock when
+    /// no transactions are active. Default is `0` (reclaim nothing).
+    fn gc_watermark(&self) -> Timestamp {
+        0
+    }
 }
 
 // In-Memory MVP Implementation
@@ -127,6 +134,23 @@ impl TxnManager for MemTxnManager {
         } else {
             anyhow::bail!("Transaction {} not found", txn_id.0);
         }
+    }
+
+    fn gc_watermark(&self) -> Timestamp {
+        let records = self.records.read().unwrap();
+        let oldest_active = records
+            .values()
+            .filter(|r| {
+                matches!(
+                    r.state,
+                    TxnState::Pending | TxnState::Writing | TxnState::Prepared
+                )
+            })
+            .map(|r| r.read_ts)
+            .min();
+        // Keep everything an active reader could still see; with no active txns,
+        // the current clock lets GC reclaim all superseded versions.
+        oldest_active.unwrap_or_else(|| self.hlc.read().unwrap().now())
     }
 }
 

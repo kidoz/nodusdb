@@ -28,6 +28,7 @@ pub struct Metrics {
     pub query_errors_total: Counter,
     pub pgwire_connections_total: Counter,
     pub active_sessions: Gauge,
+    pub vacuum_reclaimed_total: Counter,
 }
 
 impl Metrics {
@@ -52,6 +53,11 @@ impl Metrics {
             "nodus_active_sessions",
             "Currently open client sessions",
             m.active_sessions.clone(),
+        );
+        registry.register(
+            "nodus_vacuum_reclaimed_total",
+            "Total MVCC versions reclaimed by background GC",
+            m.vacuum_reclaimed_total.clone(),
         );
         m
     }
