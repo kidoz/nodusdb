@@ -1,24 +1,21 @@
-use std::process::Command;
+use nodus_testkit::TestServer;
 use std::time::Duration;
 use tokio_postgres::NoTls;
 
 #[tokio::test]
 async fn test_pgwire_queries() {
-    let mut server = Command::new("../../target/debug/nodus_server")
-        .spawn()
-        .expect("Failed to start server. Ensure it's compiled first.");
-
-    // Wait for the server to start
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let server = TestServer::start().await.expect("Failed to start server");
 
     // Connect to the pgwire server
     let mut is_up = false;
     let mut client_opt = None;
-    for _ in 0..10 {
-        if let Ok((client, connection)) =
-            tokio_postgres::connect("host=127.0.0.1 port=5432 user=nodus dbname=default", NoTls)
-                .await
-        {
+    let conn_str = format!(
+        "host={} port={} user=nodus dbname=default",
+        server.pgwire_addr.ip(),
+        server.pgwire_addr.port()
+    );
+    for _ in 0..30 {
+        if let Ok((client, connection)) = tokio_postgres::connect(&conn_str, NoTls).await {
             is_up = true;
             tokio::spawn(async move {
                 if let Err(e) = connection.await {
@@ -28,7 +25,7 @@ async fn test_pgwire_queries() {
             client_opt = Some(client);
             break;
         }
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
     assert!(is_up, "PGWire server did not start in time");
@@ -66,7 +63,4 @@ async fn test_pgwire_queries() {
     } else {
         panic!("Expected a row");
     }
-
-    server.kill().unwrap();
-    server.wait().unwrap();
 }

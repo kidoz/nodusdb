@@ -1589,6 +1589,7 @@ name = "nodus_testkit"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "nodus_server",
  "reqwest",
  "thiserror",
  "tokio",

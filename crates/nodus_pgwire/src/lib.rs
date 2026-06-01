@@ -134,7 +134,7 @@ impl PgWireHandlerFactory for NodusPgWireServer {
     }
 }
 
-pub async fn start_pgwire_server(addr: &str) -> anyhow::Result<()> {
+pub async fn start_pgwire_server(listener: TcpListener) -> anyhow::Result<()> {
     let factory = Arc::new(NodusPgWireServer {
         startup_handler: Arc::new(NoopStartupHandler),
         simple_query_handler: Arc::new(NodusQueryHandler {
@@ -144,8 +144,7 @@ pub async fn start_pgwire_server(addr: &str) -> anyhow::Result<()> {
         copy_handler: Arc::new(NoopCopyHandler),
     });
 
-    let listener = TcpListener::bind(addr).await?;
-    info!("PGWire server listening on {}", addr);
+    info!("PGWire server listening on {}", listener.local_addr()?);
 
     loop {
         let (socket, _) = listener.accept().await?;
