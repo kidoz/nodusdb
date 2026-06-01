@@ -4,6 +4,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
+use tower_http::cors::{Any, CorsLayer};
 
 pub struct ServerHandle {
     pub pgwire_addr: SocketAddr,
@@ -24,14 +25,21 @@ pub async fn run_server(
         .is_ready
         .store(true, std::sync::atomic::Ordering::Release);
 
+    let pgwire_metrics = state.metrics.clone();
     let pgwire_task = tokio::spawn(async move {
         let executor = Arc::new(nodus_executor::MemExecutor::default());
-        nodus_pgwire::start_pgwire_server(pgwire_listener, executor).await
+        nodus_pgwire::start_pgwire_server(pgwire_listener, executor, pgwire_metrics).await
     });
+
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any);
 
     let app = Router::new()
         .merge(monitoring_routes(state))
-        .merge(nodus_web_console::web_console_routes());
+        .merge(nodus_web_console::web_console_routes())
+        .layer(cors);
 
     let http_task = tokio::spawn(async move { axum::serve(http_listener, app).await });
 

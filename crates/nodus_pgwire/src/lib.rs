@@ -18,6 +18,7 @@ use pgwire::tokio::process_socket;
 pub struct NodusQueryHandler {
     pub session_state: nodus_sql::SessionState,
     pub executor: Arc<dyn nodus_executor::Executor>,
+    pub metrics: nodus_monitoring::Metrics,
 }
 
 #[async_trait]
@@ -33,6 +34,7 @@ impl SimpleQueryHandler for NodusQueryHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         info!("Received query: {}", query);
+        self.metrics.queries_total.inc();
 
         let ctx = nodus_executor::ExecutionContext {
             session_id: self.session_state.session_id.clone(),
@@ -45,7 +47,10 @@ impl SimpleQueryHandler for NodusQueryHandler {
                 info!("Parsed AST: {:?}", ast);
                 // In MVP, we are skipping the full translation and just mapping matching strings below.
             }
-            Err(e) => error!("Failed to parse SQL: {}", e),
+            Err(e) => {
+                error!("Failed to parse SQL: {}", e);
+                self.metrics.query_errors_total.inc();
+            }
         }
 
         let query_upper = query.trim().to_uppercase();
@@ -245,12 +250,14 @@ impl PgWireHandlerFactory for NodusPgWireServer {
 pub async fn start_pgwire_server(
     listener: TcpListener,
     executor: Arc<dyn nodus_executor::Executor>,
+    metrics: nodus_monitoring::Metrics,
 ) -> anyhow::Result<()> {
     let factory = Arc::new(NodusPgWireServer {
         startup_handler: Arc::new(NoopStartupHandler),
         simple_query_handler: Arc::new(NodusQueryHandler {
             session_state: nodus_sql::SessionState::default(),
             executor,
+            metrics: metrics.clone(),
         }),
         extended_query_handler: Arc::new(PlaceholderExtendedQueryHandler),
         copy_handler: Arc::new(NoopCopyHandler),
@@ -261,10 +268,14 @@ pub async fn start_pgwire_server(
     loop {
         let (socket, _) = listener.accept().await?;
         let factory = factory.clone();
+        let metrics = metrics.clone();
         tokio::spawn(async move {
+            metrics.pgwire_connections_total.inc();
+            metrics.active_sessions.inc();
             if let Err(e) = process_socket(socket, None, factory).await {
                 error!("Socket error: {}", e);
             }
+            metrics.active_sessions.dec();
         });
     }
 }

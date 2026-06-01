@@ -39,6 +39,7 @@ repository = "https://github.com/kidoz/nodusdb"
 [workspace.dependencies]
 tokio = { version = "1.37.0", features = ["full"] }
 axum = "0.7.5"
+tower-http = { version = "0.5.2", features = ["cors"] }
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 thiserror = "1.0.58"

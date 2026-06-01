@@ -17,3 +17,4 @@ async-trait.workspace = true
 futures-util.workspace = true
 nodus_sql = { path = "../nodus_sql" }
 nodus_executor = { path = "../nodus_executor" }
+nodus_monitoring = { path = "../nodus_monitoring" }
