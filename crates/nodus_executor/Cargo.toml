@@ -7,6 +7,15 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-nodus_sql = { path = "../nodus_sql" }
 anyhow.workspace = true
 thiserror.workspace = true
+serde.workspace = true
+uuid.workspace = true
+nodus_sql = { path = "../nodus_sql" }
+nodus_catalog = { path = "../nodus_catalog" }
+nodus_txn = { path = "../nodus_txn" }
+nodus_sharding = { path = "../nodus_sharding" }
+nodus_storage_api = { path = "../nodus_storage_api" }
+nodus_authz = { path = "../nodus_authz" }
+nodus_security = { path = "../nodus_security" }
+nodus_meta = { path = "../nodus_meta" }
