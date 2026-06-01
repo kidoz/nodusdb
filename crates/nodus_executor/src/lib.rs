@@ -95,6 +95,13 @@ fn compare(a: &Value, b: &Value) -> std::cmp::Ordering {
     }
 }
 
+/// Operand for a WHERE predicate or JOIN condition.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum Operand {
+    Literal(String),
+    Ident(String),
+}
+
 /// Comparison operator in a `WHERE` predicate.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum CompareOp {
@@ -106,12 +113,18 @@ pub enum CompareOp {
     Ge,
 }
 
-/// A single `column <op> literal` predicate; a `WHERE` clause is a conjunction.
+/// A single `left <op> right` predicate; a `WHERE` clause or `ON` clause is a conjunction.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Predicate {
-    pub column: String,
+    pub left: String,
     pub op: CompareOp,
-    pub value: String,
+    pub right: Operand,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Join {
+    pub table_name: String,
+    pub condition: Vec<Predicate>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -128,6 +141,7 @@ pub enum LogicalPlan {
     },
     Select {
         table_name: String,
+        joins: Vec<Join>,
         /// Projected column names; empty means all columns (`SELECT *`).
         projection: Vec<String>,
         /// Conjunction of `WHERE` predicates; empty means no filter.
@@ -318,13 +332,36 @@ fn collect_predicates(expr: &sqlparser::ast::Expr, out: &mut Vec<Predicate>) {
             collect_predicates(right, out);
         }
         Expr::BinaryOp { left, op, right } => {
-            if let (Some(cmp), Expr::Identifier(col), Some(val)) =
-                (compare_op(op), &**left, expr_to_string(right))
-            {
+            let left_col = match &**left {
+                Expr::Identifier(id) => id.value.clone(),
+                Expr::CompoundIdentifier(ids) => ids
+                    .iter()
+                    .map(|id| id.value.clone())
+                    .collect::<Vec<_>>()
+                    .join("."),
+                _ => return,
+            };
+            let right_op = match &**right {
+                Expr::Identifier(id) => Operand::Ident(id.value.clone()),
+                Expr::CompoundIdentifier(ids) => Operand::Ident(
+                    ids.iter()
+                        .map(|id| id.value.clone())
+                        .collect::<Vec<_>>()
+                        .join("."),
+                ),
+                expr => {
+                    if let Some(val) = expr_to_string(expr) {
+                        Operand::Literal(val)
+                    } else {
+                        return;
+                    }
+                }
+            };
+            if let Some(cmp) = compare_op(op) {
                 out.push(Predicate {
-                    column: col.value.clone(),
+                    left: left_col,
                     op: cmp,
-                    value: val,
+                    right: right_op,
                 });
             }
         }
@@ -363,6 +400,7 @@ fn plan_query(query: &sqlparser::ast::Query) -> Result<LogicalPlan> {
     };
 
     // Projection: `*` -> empty (all); otherwise plain column identifiers.
+    let joins = Vec::new();
     let mut projection = Vec::new();
     for item in &select.projection {
         match item {
@@ -393,6 +431,7 @@ fn plan_query(query: &sqlparser::ast::Query) -> Result<LogicalPlan> {
 
     Ok(LogicalPlan::Select {
         table_name,
+        joins,
         projection,
         filter: parse_predicates(&select.selection),
         order_by,
@@ -569,6 +608,48 @@ impl MemExecutor {
         Ok(())
     }
 
+    /// Evaluates predicates against a joined or single row.
+    fn eval_predicates(
+        &self,
+        row: &[Value],
+        col_names: &[String],
+        columns: &[ColumnDescriptor],
+        filter: &[Predicate],
+    ) -> bool {
+        filter.iter().all(|p| {
+            let left_idx = col_names
+                .iter()
+                .position(|c| c == &p.left || c.ends_with(&format!(".{}", p.left)));
+            let Some(idx) = left_idx else {
+                return false;
+            };
+            let left_cell = row.get(idx).unwrap_or(&Value::Null);
+
+            let right_cell = match &p.right {
+                Operand::Literal(val) => coerce(val, column_type(&columns[idx].data_type)),
+                Operand::Ident(col) => {
+                    let right_idx = col_names
+                        .iter()
+                        .position(|c| c == col || c.ends_with(&format!(".{}", col)));
+                    let Some(ridx) = right_idx else {
+                        return false;
+                    };
+                    row.get(ridx).unwrap_or(&Value::Null).clone()
+                }
+            };
+
+            let ord = compare(left_cell, &right_cell);
+            match p.op {
+                CompareOp::Eq => *left_cell == right_cell,
+                CompareOp::Ne => *left_cell != right_cell,
+                CompareOp::Lt => ord == std::cmp::Ordering::Less,
+                CompareOp::Le => ord != std::cmp::Ordering::Greater,
+                CompareOp::Gt => ord == std::cmp::Ordering::Greater,
+                CompareOp::Ge => ord != std::cmp::Ordering::Less,
+            }
+        })
+    }
+
     /// Evaluates an optional equality filter against a typed row.
     fn row_matches(
         &self,
@@ -576,22 +657,8 @@ impl MemExecutor {
         columns: &[ColumnDescriptor],
         filter: &[Predicate],
     ) -> bool {
-        filter.iter().all(|p| {
-            let Some(idx) = columns.iter().position(|c| c.name == p.column) else {
-                return false;
-            };
-            let target = coerce(&p.value, column_type(&columns[idx].data_type));
-            let cell = row.get(idx).unwrap_or(&Value::Null);
-            let ord = compare(cell, &target);
-            match p.op {
-                CompareOp::Eq => *cell == target,
-                CompareOp::Ne => *cell != target,
-                CompareOp::Lt => ord == std::cmp::Ordering::Less,
-                CompareOp::Le => ord != std::cmp::Ordering::Greater,
-                CompareOp::Gt => ord == std::cmp::Ordering::Greater,
-                CompareOp::Ge => ord != std::cmp::Ordering::Less,
-            }
-        })
+        let col_names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
+        self.eval_predicates(row, &col_names, columns, filter)
     }
 
     /// Deny-by-default authorization gate for a single action on a resource.
@@ -724,6 +791,7 @@ impl Executor for MemExecutor {
             }
             LogicalPlan::Select {
                 table_name,
+                joins,
                 projection,
                 filter,
                 order_by,
@@ -734,15 +802,62 @@ impl Executor for MemExecutor {
                     .get_table("default", "public", &table_name)?;
                 self.authorize(ctx, Action::Select, ResourceRef::Table(tbl.id))?;
 
-                let col_names: Vec<String> = tbl.columns.iter().map(|c| c.name.clone()).collect();
+                let mut joined_columns = tbl.columns.clone();
+                let mut col_names: Vec<String> = tbl
+                    .columns
+                    .iter()
+                    .map(|c| format!("{}.{}", table_name, c.name))
+                    .collect();
                 let mut stored_rows = self.scan_rows(tbl.id)?;
 
+                for join in &joins {
+                    let j_tbl =
+                        self.catalog_reader
+                            .get_table("default", "public", &join.table_name)?;
+                    self.authorize(ctx, Action::Select, ResourceRef::Table(j_tbl.id))?;
+
+                    let j_rows = self.scan_rows(j_tbl.id)?;
+                    let j_col_names: Vec<String> = j_tbl
+                        .columns
+                        .iter()
+                        .map(|c| format!("{}.{}", join.table_name, c.name))
+                        .collect();
+
+                    let mut combined_cols = col_names.clone();
+                    combined_cols.extend(j_col_names.clone());
+
+                    let mut combined_desc = joined_columns.clone();
+                    combined_desc.extend(j_tbl.columns.clone());
+
+                    let mut next_rows = Vec::new();
+                    for r1 in &stored_rows {
+                        for r2 in &j_rows {
+                            let mut combined_row = r1.clone();
+                            combined_row.extend(r2.clone());
+                            if self.eval_predicates(
+                                &combined_row,
+                                &combined_cols,
+                                &combined_desc,
+                                &join.condition,
+                            ) {
+                                next_rows.push(combined_row);
+                            }
+                        }
+                    }
+                    stored_rows = next_rows;
+                    col_names = combined_cols;
+                    joined_columns = combined_desc;
+                }
+
                 // WHERE: conjunction of typed predicates.
-                stored_rows.retain(|r| self.row_matches(r, &tbl.columns, &filter));
+                stored_rows
+                    .retain(|r| self.eval_predicates(r, &col_names, &joined_columns, &filter));
 
                 // ORDER BY a column (typed compare), then LIMIT.
                 if let Some((ocol, asc)) = &order_by
-                    && let Some(idx) = col_names.iter().position(|c| c == ocol)
+                    && let Some(idx) = col_names
+                        .iter()
+                        .position(|c| c == ocol || c.ends_with(&format!(".{}", ocol)))
                 {
                     stored_rows.sort_by(|a, b| {
                         let ord = compare(
@@ -764,7 +879,11 @@ impl Executor for MemExecutor {
                 };
                 let indices: Vec<Option<usize>> = out_cols
                     .iter()
-                    .map(|c| col_names.iter().position(|tc| tc == c))
+                    .map(|c| {
+                        col_names
+                            .iter()
+                            .position(|tc| tc == c || tc.ends_with(&format!(".{}", c)))
+                    })
                     .collect();
 
                 let rows = stored_rows
@@ -934,9 +1053,9 @@ mod tests {
 
     fn eq(col: &str, val: &str) -> Vec<Predicate> {
         vec![Predicate {
-            column: col.to_string(),
+            left: col.to_string(),
             op: CompareOp::Eq,
-            value: val.to_string(),
+            right: Operand::Literal(val.to_string()),
         }]
     }
 
@@ -1026,6 +1145,7 @@ mod tests {
                 &ctx,
                 LogicalPlan::Select {
                     table_name: "books".into(),
+                    joins: vec![],
                     projection: vec![],
                     filter: vec![],
                     order_by: None,
@@ -1033,7 +1153,7 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(all.columns, vec!["id", "title", "author"]);
+        assert_eq!(all.columns, vec!["books.id", "books.title", "books.author"]);
         assert_eq!(all.rows.len(), 2);
 
         // Projection + filter.
@@ -1042,6 +1162,7 @@ mod tests {
                 &ctx,
                 LogicalPlan::Select {
                     table_name: "books".into(),
+                    joins: vec![],
                     projection: vec!["title".into(), "author".into()],
                     filter: eq("id", "2"),
                     order_by: None,
@@ -1096,6 +1217,7 @@ mod tests {
                 &ctx,
                 LogicalPlan::Select {
                     table_name: "items".into(),
+                    joins: vec![],
                     projection: vec![],
                     filter: eq("id", "7"),
                     order_by: None,
@@ -1164,6 +1286,7 @@ mod tests {
                 &ctx,
                 LogicalPlan::Select {
                     table_name: "t".into(),
+                    joins: vec![],
                     projection: vec!["name".into()],
                     filter,
                     order_by: None,
@@ -1187,6 +1310,99 @@ mod tests {
         assert_eq!(out.tag, "DELETE 1");
         assert_eq!(read(eq("id", "1")).rows.len(), 0);
         assert_eq!(read(vec![]).rows.len(), 2);
+    }
+
+    #[test]
+    fn test_join_execution() {
+        let (exec, cat) = MemExecutor::shared(Arc::new(MemoryAuditSink::new()));
+        let admin = cat
+            .create_role(CreateRoleRequest {
+                name: "admin".into(),
+                principal_type: PrincipalType::User,
+                database_id: None,
+            })
+            .unwrap();
+        cat.grant_privilege(GrantPrivilegeRequest {
+            principal_id: admin.id,
+            resource: ResourceRef::System,
+            privilege: "ALL".into(),
+        })
+        .unwrap();
+        let ctx = ctx_for(admin.id);
+
+        // Create authors
+        exec.execute_logical(
+            &ctx,
+            LogicalPlan::CreateTable {
+                name: "authors".into(),
+                columns: cols(&[("id", "INT"), ("name", "TEXT")]),
+            },
+        )
+        .unwrap();
+
+        // Create books
+        exec.execute_logical(
+            &ctx,
+            LogicalPlan::CreateTable {
+                name: "books".into(),
+                columns: cols(&[("id", "INT"), ("title", "TEXT"), ("author_id", "INT")]),
+            },
+        )
+        .unwrap();
+
+        for (id, name) in [("1", "Herbert"), ("2", "Asimov")] {
+            exec.execute_logical(
+                &ctx,
+                LogicalPlan::Insert {
+                    table_name: "authors".into(),
+                    columns: vec!["id".into(), "name".into()],
+                    values: vec![id.into(), name.into()],
+                },
+            )
+            .unwrap();
+        }
+
+        for (id, title, author_id) in [
+            ("10", "Dune", "1"),
+            ("11", "Foundation", "2"),
+            ("12", "Dune Messiah", "1"),
+        ] {
+            exec.execute_logical(
+                &ctx,
+                LogicalPlan::Insert {
+                    table_name: "books".into(),
+                    columns: vec!["id".into(), "title".into(), "author_id".into()],
+                    values: vec![id.into(), title.into(), author_id.into()],
+                },
+            )
+            .unwrap();
+        }
+
+        let join_plan = LogicalPlan::Select {
+            table_name: "books".into(),
+            joins: vec![Join {
+                table_name: "authors".into(),
+                condition: vec![Predicate {
+                    left: "books.author_id".into(),
+                    op: CompareOp::Eq,
+                    right: Operand::Ident("authors.id".into()),
+                }],
+            }],
+            projection: vec!["books.title".into(), "authors.name".into()],
+            filter: vec![Predicate {
+                left: "authors.name".into(),
+                op: CompareOp::Eq,
+                right: Operand::Literal("Herbert".into()),
+            }],
+            order_by: Some(("books.id".into(), true)),
+            limit: None,
+        };
+
+        let out = exec.execute_logical(&ctx, join_plan).unwrap();
+        assert_eq!(out.columns, vec!["books.title", "authors.name"]);
+        assert_eq!(out.rows.len(), 2);
+        assert_eq!(out.rows[0].columns, vec!["Dune", "Herbert"]);
+        assert_eq!(out.rows[1].columns, vec!["Dune Messiah", "Herbert"]);
     }
 
     #[test]

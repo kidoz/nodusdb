@@ -4,6 +4,9 @@ use nodus_catalog::{IndexDescriptor, IndexId, TableId};
 use nodus_storage_api::{Datum, IndexKvCodec, KvEngine, RowKey, Timestamp, TxnId};
 use std::sync::Arc;
 
+pub mod backfill;
+pub use backfill::IndexBackfiller;
+
 pub struct DefaultIndexCodec;
 
 impl DefaultIndexCodec {

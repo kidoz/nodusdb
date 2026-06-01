@@ -61,4 +61,5 @@ uuid = { version = "1.8.0", features = ["v4", "serde"] }
 chrono = { version = "0.4.38", features = ["serde"] }
 bytes = "1.6.0"
 openraft = { version = "0.9.16", features = ["serde"] }
+redb = "2.1.1"
 sha2 = "0.10.8"

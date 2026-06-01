@@ -1,5 +1,5 @@
 [package]
-name = "nodus_index"
+name = "nodus_storage_redb"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -10,13 +10,11 @@ repository.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 serde.workspace = true
-bytes.workspace = true
-tokio.workspace = true
 serde_json.workspace = true
+bytes.workspace = true
+redb.workspace = true
 nodus_storage_api = { path = "../nodus_storage_api" }
-nodus_catalog = { path = "../nodus_catalog" }
-nodus_txn = { path = "../nodus_txn" }
-nodus_storage_mem = { path = "../nodus_storage_mem", optional = true }
+nodus_mvcc = { path = "../nodus_mvcc" }
 
 [dev-dependencies]
-nodus_storage_mem = { path = "../nodus_storage_mem" }
+tempfile = "3.10.1"

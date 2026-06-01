@@ -423,6 +423,12 @@ pub trait CatalogWriter: Send + Sync {
     fn grant_privilege(&self, request: GrantPrivilegeRequest) -> Result<GrantDescriptor>;
     fn revoke_privilege(&self, request: RevokePrivilegeRequest) -> Result<()>;
     fn add_role_member(&self, request: AddRoleMemberRequest) -> Result<()>;
+    fn update_index_state(
+        &self,
+        table_id: TableId,
+        index_id: IndexId,
+        state: IndexState,
+    ) -> Result<()>;
 }
 
 // In-Memory MVP implementation
@@ -701,6 +707,25 @@ impl CatalogWriter for MemoryCatalog {
         }
         self.increment_version();
         Ok(())
+    }
+
+    fn update_index_state(
+        &self,
+        _table_id: TableId,
+        index_id: IndexId,
+        state: IndexState,
+    ) -> Result<()> {
+        let mut tables = self.tables.write().unwrap();
+        for (_, tbl) in tables.iter_mut() {
+            for idx in tbl.indexes.iter_mut() {
+                if idx.id == index_id {
+                    idx.index_state = state;
+                    self.increment_version();
+                    return Ok(());
+                }
+            }
+        }
+        anyhow::bail!("Index {} not found", index_id);
     }
 }
 

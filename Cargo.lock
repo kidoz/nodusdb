@@ -1778,6 +1778,7 @@ dependencies = [
  "nodus_storage_mem",
  "nodus_txn",
  "serde",
+ "serde_json",
  "sqlparser",
  "thiserror 1.0.69",
  "uuid",
@@ -1792,8 +1793,11 @@ dependencies = [
  "nodus_catalog",
  "nodus_storage_api",
  "nodus_storage_mem",
+ "nodus_txn",
  "serde",
+ "serde_json",
  "thiserror 1.0.69",
+ "tokio",
 ]
 
 [[package]]
