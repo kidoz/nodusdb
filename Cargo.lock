@@ -1382,6 +1382,7 @@ dependencies = [
  "nodus_catalog",
  "nodus_security",
  "serde",
+ "serde_json",
  "thiserror",
 ]
 
