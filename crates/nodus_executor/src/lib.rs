@@ -101,6 +101,15 @@ pub enum LogicalPlan {
         /// Optional equality filter `(column, value)`.
         filter: Option<(String, String)>,
     },
+    Update {
+        table_name: String,
+        assignments: Vec<(String, String)>,
+        filter: Option<(String, String)>,
+    },
+    Delete {
+        table_name: String,
+        filter: Option<(String, String)>,
+    },
     Begin,
     Commit,
     Rollback,
@@ -183,6 +192,42 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement) -> Result<LogicalPlan> {
             })
         }
         Statement::Query(query) => plan_query(query),
+        Statement::Update {
+            table,
+            assignments,
+            selection,
+            ..
+        } => {
+            let table_name = table_name_of(&table.relation)?;
+            let assigns = assignments
+                .iter()
+                .filter_map(|a| {
+                    let col = a.id.last()?.value.clone();
+                    let val = expr_to_string(&a.value)?;
+                    Some((col, val))
+                })
+                .collect();
+            Ok(LogicalPlan::Update {
+                table_name,
+                assignments: assigns,
+                filter: single_eq_filter(selection),
+            })
+        }
+        Statement::Delete {
+            from, selection, ..
+        } => {
+            let tables = match from {
+                FromTable::WithFromKeyword(t) | FromTable::WithoutKeyword(t) => t,
+            };
+            let relation = &tables
+                .first()
+                .ok_or_else(|| anyhow::anyhow!("DELETE without a table"))?
+                .relation;
+            Ok(LogicalPlan::Delete {
+                table_name: table_name_of(relation)?,
+                filter: single_eq_filter(selection),
+            })
+        }
         Statement::StartTransaction { .. } => Ok(LogicalPlan::Begin),
         Statement::Commit { .. } => Ok(LogicalPlan::Commit),
         Statement::Rollback { .. } => Ok(LogicalPlan::Rollback),
@@ -196,6 +241,26 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement) -> Result<LogicalPlan> {
         }
         _ => anyhow::bail!("Unsupported SQL statement: {:?}", stmt),
     }
+}
+
+fn table_name_of(relation: &sqlparser::ast::TableFactor) -> Result<String> {
+    match relation {
+        sqlparser::ast::TableFactor::Table { name, .. } => Ok(name.to_string()),
+        other => anyhow::bail!("Unsupported table relation: {:?}", other),
+    }
+}
+
+/// Extracts a single `WHERE <col> = <literal>` equality filter, if present.
+fn single_eq_filter(selection: &Option<sqlparser::ast::Expr>) -> Option<(String, String)> {
+    use sqlparser::ast::{BinaryOperator, Expr};
+    if let Some(Expr::BinaryOp { left, op, right }) = selection {
+        if *op == BinaryOperator::Eq {
+            if let (Expr::Identifier(col), Some(val)) = (&**left, expr_to_string(right)) {
+                return Some((col.value.clone(), val));
+            }
+        }
+    }
+    None
 }
 
 fn plan_query(query: &sqlparser::ast::Query) -> Result<LogicalPlan> {
@@ -245,20 +310,10 @@ fn plan_query(query: &sqlparser::ast::Query) -> Result<LogicalPlan> {
         }
     }
 
-    // Optional `WHERE <col> = <literal>` filter.
-    let mut filter = None;
-    if let Some(Expr::BinaryOp { left, op, right }) = &select.selection {
-        if *op == BinaryOperator::Eq {
-            if let (Expr::Identifier(col), Some(val)) = (&**left, expr_to_string(right)) {
-                filter = Some((col.value.clone(), val));
-            }
-        }
-    }
-
     Ok(LogicalPlan::Select {
         table_name,
         projection,
-        filter,
+        filter: single_eq_filter(&select.selection),
     })
 }
 
@@ -414,6 +469,40 @@ impl MemExecutor {
             self.kv.commit(txn_id, commit_ts)?;
         }
         Ok(())
+    }
+
+    /// Tombstones `key`, using the active txn or an auto-commit txn.
+    fn delete_row(&self, key: String) -> Result<()> {
+        let active = *self.active_txn.read().unwrap();
+        let (txn_id, auto) = match active {
+            Some((tid, _)) => (tid, false),
+            None => (self.txn.begin_txn()?.txn_id, true),
+        };
+        self.kv.delete_intent(txn_id, Bytes::from(key))?;
+        if auto {
+            let commit_ts = self.txn.commit_txn(txn_id)?;
+            self.kv.commit(txn_id, commit_ts)?;
+        }
+        Ok(())
+    }
+
+    /// Evaluates an optional equality filter against a typed row.
+    fn row_matches(
+        &self,
+        row: &[Value],
+        columns: &[ColumnDescriptor],
+        filter: &Option<(String, String)>,
+    ) -> bool {
+        match filter {
+            None => true,
+            Some((fcol, fval)) => match columns.iter().position(|c| &c.name == fcol) {
+                Some(idx) => {
+                    let target = coerce(fval, column_type(&columns[idx].data_type));
+                    row.get(idx).map(|v| *v == target).unwrap_or(false)
+                }
+                None => false,
+            },
+        }
     }
 
     /// Deny-by-default authorization gate for a single action on a resource.
@@ -594,6 +683,56 @@ impl Executor for MemExecutor {
                     rows,
                     tag,
                 })
+            }
+            LogicalPlan::Update {
+                table_name,
+                assignments,
+                filter,
+            } => {
+                let tbl = self
+                    .catalog_reader
+                    .get_table("default", "public", &table_name)?;
+                self.authorize(ctx, Action::Update, ResourceRef::Table(tbl.id))?;
+                let col_names: Vec<&str> = tbl.columns.iter().map(|c| c.name.as_str()).collect();
+
+                let mut updated = 0;
+                for mut row in self.scan_rows(tbl.id)? {
+                    if !self.row_matches(&row, &tbl.columns, &filter) {
+                        continue;
+                    }
+                    let old_key =
+                        format!("{}:{}", tbl.id, row.first().map(render).unwrap_or_default());
+                    for (col, val) in &assignments {
+                        if let Some(idx) = col_names.iter().position(|c| c == col) {
+                            row[idx] = coerce(val, column_type(&tbl.columns[idx].data_type));
+                        }
+                    }
+                    let new_key =
+                        format!("{}:{}", tbl.id, row.first().map(render).unwrap_or_default());
+                    self.write_row(new_key.clone(), serde_json::to_string(&row)?)?;
+                    if new_key != old_key {
+                        self.delete_row(old_key)?;
+                    }
+                    updated += 1;
+                }
+                Ok(QueryOutput::tag(&format!("UPDATE {updated}")))
+            }
+            LogicalPlan::Delete { table_name, filter } => {
+                let tbl = self
+                    .catalog_reader
+                    .get_table("default", "public", &table_name)?;
+                self.authorize(ctx, Action::Delete, ResourceRef::Table(tbl.id))?;
+
+                let mut deleted = 0;
+                for row in self.scan_rows(tbl.id)? {
+                    if !self.row_matches(&row, &tbl.columns, &filter) {
+                        continue;
+                    }
+                    let key = format!("{}:{}", tbl.id, row.first().map(render).unwrap_or_default());
+                    self.delete_row(key)?;
+                    deleted += 1;
+                }
+                Ok(QueryOutput::tag(&format!("DELETE {deleted}")))
             }
             LogicalPlan::Begin => {
                 let txn_record = self.txn.begin_txn()?;
@@ -853,6 +992,88 @@ mod tests {
         assert_eq!(out.rows.len(), 1);
         // Int renders without quotes, bool as true/false.
         assert_eq!(out.rows[0].columns, vec!["7", "widget", "true"]);
+    }
+
+    #[test]
+    fn update_and_delete_rows() {
+        let (exec, cat) = MemExecutor::shared(Arc::new(MemoryAuditSink::new()));
+        let admin = cat
+            .create_role(CreateRoleRequest {
+                name: "admin".into(),
+                principal_type: PrincipalType::User,
+                database_id: None,
+            })
+            .unwrap();
+        cat.grant_privilege(GrantPrivilegeRequest {
+            principal_id: admin.id,
+            resource: ResourceRef::System,
+            privilege: "ALL".into(),
+        })
+        .unwrap();
+        let ctx = ctx_for(admin.id);
+
+        exec.execute_logical(
+            &ctx,
+            LogicalPlan::CreateTable {
+                name: "t".into(),
+                columns: cols(&[("id", "INT"), ("name", "TEXT")]),
+            },
+        )
+        .unwrap();
+        for (id, name) in [("1", "a"), ("2", "b"), ("3", "c")] {
+            exec.execute_logical(
+                &ctx,
+                LogicalPlan::Insert {
+                    table_name: "t".into(),
+                    columns: vec!["id".into(), "name".into()],
+                    values: vec![id.into(), name.into()],
+                },
+            )
+            .unwrap();
+        }
+
+        // UPDATE one row.
+        let out = exec
+            .execute_logical(
+                &ctx,
+                LogicalPlan::Update {
+                    table_name: "t".into(),
+                    assignments: vec![("name".into(), "B".into())],
+                    filter: Some(("id".into(), "2".into())),
+                },
+            )
+            .unwrap();
+        assert_eq!(out.tag, "UPDATE 1");
+
+        let read = |filter: Option<(String, String)>| {
+            exec.execute_logical(
+                &ctx,
+                LogicalPlan::Select {
+                    table_name: "t".into(),
+                    projection: vec!["name".into()],
+                    filter,
+                },
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            read(Some(("id".into(), "2".into()))).rows[0].columns,
+            vec!["B"]
+        );
+
+        // DELETE one row, then confirm it's gone and the rest remain.
+        let out = exec
+            .execute_logical(
+                &ctx,
+                LogicalPlan::Delete {
+                    table_name: "t".into(),
+                    filter: Some(("id".into(), "1".into())),
+                },
+            )
+            .unwrap();
+        assert_eq!(out.tag, "DELETE 1");
+        assert_eq!(read(Some(("id".into(), "1".into()))).rows.len(), 0);
+        assert_eq!(read(None).rows.len(), 2);
     }
 
     #[test]

@@ -40,6 +40,9 @@ pub trait KvEngine: Send + Sync {
         read_ts: Timestamp,
     ) -> Result<Box<dyn Iterator<Item = Result<KvPair>> + Send>>;
     fn write_intent(&self, txn_id: TxnId, key: Bytes, value: Bytes) -> Result<()>;
+    /// Writes a deletion (tombstone) intent for `key`. After commit the key
+    /// reads as absent at timestamps at or after the commit.
+    fn delete_intent(&self, txn_id: TxnId, key: Bytes) -> Result<()>;
     fn commit(&self, txn_id: TxnId, commit_ts: Timestamp) -> Result<()>;
     fn abort(&self, txn_id: TxnId) -> Result<()>;
 

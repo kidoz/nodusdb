@@ -26,15 +26,23 @@ impl Default for MemKvEngine {
     }
 }
 
+/// Returns the newest committed version at or below `read_ts`, if any. The
+/// caller treats a `value: None` result as a tombstone (key absent).
+fn newest_committed(versions: &[MvccValue], read_ts: Timestamp) -> Option<&MvccValue> {
+    versions
+        .iter()
+        .filter(|v| !v.is_intent && v.version <= read_ts)
+        .max_by_key(|v| v.version)
+}
+
 impl KvEngine for MemKvEngine {
     fn get(&self, key: &[u8], read_ts: Timestamp) -> Result<Option<Bytes>> {
         let guard = self.store.read().unwrap();
-        if let Some(versions) = guard.get(key) {
-            for v in versions.iter().rev() {
-                if v.is_visible(read_ts) {
-                    return Ok(v.value.as_ref().map(|val| Bytes::from(val.clone())));
-                }
-            }
+        if let Some(versions) = guard.get(key)
+            && let Some(v) = newest_committed(versions, read_ts)
+        {
+            // A tombstone (value None) means the key is absent at read_ts.
+            return Ok(v.value.as_ref().map(|val| Bytes::from(val.clone())));
         }
         Ok(None)
     }
@@ -48,17 +56,14 @@ impl KvEngine for MemKvEngine {
         let mut results = Vec::new();
 
         for (k, versions) in guard.range(range.start..range.end) {
-            for v in versions.iter().rev() {
-                if v.is_visible(read_ts) {
-                    if let Some(val) = &v.value {
-                        results.push(Ok(KvPair {
-                            key: k.clone(),
-                            value: Bytes::from(val.clone()),
-                            version: v.version,
-                        }));
-                    }
-                    break;
-                }
+            if let Some(v) = newest_committed(versions, read_ts)
+                && let Some(val) = &v.value
+            {
+                results.push(Ok(KvPair {
+                    key: k.clone(),
+                    value: Bytes::from(val.clone()),
+                    version: v.version,
+                }));
             }
         }
 
@@ -77,6 +82,22 @@ impl KvEngine for MemKvEngine {
         };
 
         store_guard.entry(key.clone()).or_default().push(val);
+        intents_guard.entry(txn_id).or_default().push(key);
+        Ok(())
+    }
+
+    fn delete_intent(&self, txn_id: TxnId, key: Bytes) -> Result<()> {
+        let mut store_guard = self.store.write().unwrap();
+        let mut intents_guard = self.intents.write().unwrap();
+
+        let tombstone = MvccValue {
+            value: None, // tombstone
+            version: u64::MAX,
+            txn_id: Some(txn_id),
+            is_intent: true,
+        };
+
+        store_guard.entry(key.clone()).or_default().push(tombstone);
         intents_guard.entry(txn_id).or_default().push(key);
         Ok(())
     }
