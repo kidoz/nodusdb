@@ -167,6 +167,57 @@ async fn admin_authz_explain_denies_unknown_principal() {
 }
 
 #[tokio::test]
+async fn admin_backup_api_create_list_verify_restore() {
+    let server = TestServer::start().await.expect("server starts");
+    let http = reqwest::Client::new();
+    let base = format!("http://{}", server.http_addr);
+
+    let created: serde_json::Value = http
+        .post(format!("{base}/api/v1/backups"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let id = created["backup_id"]
+        .as_str()
+        .expect("backup_id")
+        .to_string();
+    assert_eq!(created["status"], "Completed");
+
+    let list: serde_json::Value = http
+        .get(format!("{base}/api/v1/backups"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(list.as_array().unwrap().iter().any(|v| v == &id));
+
+    let verified: serde_json::Value = http
+        .post(format!("{base}/api/v1/backups/{id}/verify"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(verified["verified"], true);
+
+    let restored: serde_json::Value = http
+        .post(format!("{base}/api/v1/backups/{id}/restore"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(restored["restored"], 1);
+}
+
+#[tokio::test]
 async fn pgwire_rejects_bad_password() {
     let server = TestServer::start().await.expect("server starts");
     let bad = format!(

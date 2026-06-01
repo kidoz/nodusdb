@@ -2,12 +2,15 @@ mod admin;
 
 use admin::{AdminState, admin_routes};
 use axum::Router;
+use nodus_backup::{BackupOrchestrator, FsBackupRepository};
 use nodus_catalog::{
     CatalogWriter, CreateRoleRequest, GrantPrivilegeRequest, PrincipalType, ResourceRef,
 };
+use nodus_config::NodusConfig;
 use nodus_monitoring::{AppState, monitoring_routes};
 use nodus_security::{PasswordAuthenticator, SessionRegistry};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
@@ -22,9 +25,29 @@ pub struct ServerHandle {
     pub registry: Arc<SessionRegistry>,
 }
 
+/// Resolves a backup repository directory from a `file://` URI, falling back to
+/// a unique temp directory when unset so the backup API is usable in dev/tests.
+fn backup_dir(uri: &str) -> PathBuf {
+    let trimmed = uri.strip_prefix("file://").unwrap_or(uri);
+    if trimmed.is_empty() {
+        std::env::temp_dir().join(format!("nodus-backups-{}", uuid::Uuid::new_v4()))
+    } else {
+        PathBuf::from(trimmed)
+    }
+}
+
+/// Starts the server with default configuration.
 pub async fn run_server(
     pgwire_listener: TcpListener,
     http_listener: TcpListener,
+) -> anyhow::Result<ServerHandle> {
+    run_server_with_config(pgwire_listener, http_listener, NodusConfig::default()).await
+}
+
+pub async fn run_server_with_config(
+    pgwire_listener: TcpListener,
+    http_listener: TcpListener,
+    config: NodusConfig,
 ) -> anyhow::Result<ServerHandle> {
     let pgwire_addr = pgwire_listener.local_addr()?;
     let http_addr = http_listener.local_addr()?;
@@ -80,11 +103,17 @@ pub async fn run_server(
         .allow_methods(Any)
         .allow_headers(Any);
 
+    let repo = Arc::new(FsBackupRepository::new(backup_dir(
+        &config.backup.repository_uri,
+    )));
+    let backup = Arc::new(BackupOrchestrator::new(repo));
+
     let admin_state = AdminState {
         registry: registry.clone(),
         audit: audit.clone(),
         authz: authz.clone(),
         catalog: catalog.clone(),
+        backup,
     };
     let app = Router::new()
         .merge(monitoring_routes(state))

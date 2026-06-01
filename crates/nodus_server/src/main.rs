@@ -37,7 +37,8 @@ async fn main() -> anyhow::Result<()> {
         config.server.http_addr, config.server.pgwire_addr
     );
 
-    let handle = nodus_server::run_server(pgwire_listener, http_listener).await?;
+    let handle =
+        nodus_server::run_server_with_config(pgwire_listener, http_listener, config).await?;
 
     let _ = tokio::try_join!(handle.pgwire_task, handle.http_task)?;
 

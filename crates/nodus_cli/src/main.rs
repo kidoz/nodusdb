@@ -40,6 +40,39 @@ enum Commands {
         #[command(subcommand)]
         cmd: AuditCmd,
     },
+    /// Manage backups
+    Backup {
+        #[command(subcommand)]
+        cmd: BackupCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum BackupCmd {
+    /// Create a full backup
+    Create {
+        #[arg(long, default_value = DEFAULT_ADDR)]
+        addr: String,
+    },
+    /// List backup ids
+    List {
+        #[arg(long, default_value = DEFAULT_ADDR)]
+        addr: String,
+    },
+    /// Verify a backup's integrity
+    Verify {
+        #[arg(long)]
+        id: String,
+        #[arg(long, default_value = DEFAULT_ADDR)]
+        addr: String,
+    },
+    /// Restore a backup (returns object count)
+    Restore {
+        #[arg(long)]
+        id: String,
+        #[arg(long, default_value = DEFAULT_ADDR)]
+        addr: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -212,6 +245,61 @@ async fn main() -> anyhow::Result<()> {
                     e["reason"].as_str().unwrap_or("-")
                 );
             }
+        }
+        Commands::Backup {
+            cmd: BackupCmd::Create { addr },
+        } => {
+            let v: serde_json::Value = client
+                .post(format!("{addr}/api/v1/backups"))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&v)?);
+        }
+        Commands::Backup {
+            cmd: BackupCmd::List { addr },
+        } => {
+            let ids: serde_json::Value = client
+                .get(format!("{addr}/api/v1/backups"))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            let empty = vec![];
+            let arr = ids.as_array().unwrap_or(&empty);
+            if arr.is_empty() {
+                println!("No backups.");
+            }
+            for id in arr {
+                println!("{}", id.as_str().unwrap_or("?"));
+            }
+        }
+        Commands::Backup {
+            cmd: BackupCmd::Verify { id, addr },
+        } => {
+            let v: serde_json::Value = client
+                .post(format!("{addr}/api/v1/backups/{id}/verify"))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&v)?);
+        }
+        Commands::Backup {
+            cmd: BackupCmd::Restore { id, addr },
+        } => {
+            let v: serde_json::Value = client
+                .post(format!("{addr}/api/v1/backups/{id}/restore"))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&v)?);
         }
     }
 

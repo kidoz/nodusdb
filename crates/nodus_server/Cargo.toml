@@ -24,4 +24,7 @@ nodus_security = { path = "../nodus_security" }
 nodus_catalog = { path = "../nodus_catalog" }
 nodus_audit = { path = "../nodus_audit" }
 nodus_authz = { path = "../nodus_authz" }
+nodus_backup = { path = "../nodus_backup" }
 uuid.workspace = true
+bytes.workspace = true
+serde_json.workspace = true

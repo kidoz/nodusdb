@@ -5,10 +5,13 @@ use axum::{
     extract::{Path, Query, State},
     routing::{get, post},
 };
+use bytes::Bytes;
 use nodus_audit::{AuditEvent, AuditQuery, AuditQueryable, MemoryAuditSink};
 use nodus_authz::{Action, AuthzContext, AuthzEngine, AuthzExplanation, AuthzRequest};
+use nodus_backup::{BackupObject, BackupOrchestrator};
 use nodus_catalog::{CatalogReader, PrincipalId, ResourceRef};
 use nodus_security::{SessionInfo, SessionRegistry};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -21,6 +24,7 @@ pub struct AdminState {
     pub audit: Arc<MemoryAuditSink>,
     pub authz: Arc<dyn AuthzEngine>,
     pub catalog: Arc<dyn CatalogReader>,
+    pub backup: Arc<BackupOrchestrator>,
 }
 
 pub fn admin_routes(state: AdminState) -> Router {
@@ -29,6 +33,9 @@ pub fn admin_routes(state: AdminState) -> Router {
         .route("/api/v1/sessions/:id/kill", post(kill_session))
         .route("/api/v1/audit", get(query_audit))
         .route("/api/v1/authz/explain", get(explain_authz))
+        .route("/api/v1/backups", get(list_backups).post(create_backup))
+        .route("/api/v1/backups/:id/verify", post(verify_backup))
+        .route("/api/v1/backups/:id/restore", post(restore_backup))
         .with_state(state)
 }
 
@@ -104,4 +111,53 @@ async fn explain_authz(
             steps: vec!["authorization engine error".into()],
         });
     Json(explanation)
+}
+
+async fn list_backups(State(state): State<AdminState>) -> Json<Vec<String>> {
+    Json(state.backup.list_backups().await.unwrap_or_default())
+}
+
+/// Creates a full backup. As an MVP snapshot it captures the current audit
+/// trail; the export set will broaden as catalog/shard serialization lands.
+async fn create_backup(State(state): State<AdminState>) -> Json<Value> {
+    let events = state
+        .audit
+        .query(&AuditQuery::default())
+        .unwrap_or_default();
+    let bytes = serde_json::to_vec(&events).unwrap_or_default();
+    let version = state
+        .catalog
+        .get_cluster_version()
+        .map(|v| v.active_version)
+        .unwrap_or(0);
+    let objects = vec![BackupObject {
+        name: "audit.jsonl".into(),
+        bytes: Bytes::from(bytes),
+    }];
+    match state
+        .backup
+        .create_full_backup("local", 0, version, version, objects)
+        .await
+    {
+        Ok(manifest) => Json(json!({
+            "backup_id": manifest.backup_id,
+            "status": format!("{:?}", manifest.status),
+            "files": manifest.files.len(),
+        })),
+        Err(e) => Json(json!({ "error": e.to_string() })),
+    }
+}
+
+async fn verify_backup(State(state): State<AdminState>, Path(id): Path<String>) -> Json<Value> {
+    match state.backup.verify(&id).await {
+        Ok(()) => Json(json!({ "verified": true })),
+        Err(e) => Json(json!({ "verified": false, "error": e.to_string() })),
+    }
+}
+
+async fn restore_backup(State(state): State<AdminState>, Path(id): Path<String>) -> Json<Value> {
+    match state.backup.restore(&id).await {
+        Ok(objects) => Json(json!({ "restored": objects.len() })),
+        Err(e) => Json(json!({ "restored": 0, "error": e.to_string() })),
+    }
 }

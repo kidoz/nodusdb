@@ -1583,8 +1583,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "bytes",
  "nodus_audit",
  "nodus_authz",
+ "nodus_backup",
  "nodus_catalog",
  "nodus_common",
  "nodus_config",
@@ -1594,6 +1596,7 @@ dependencies = [
  "nodus_pgwire",
  "nodus_security",
  "nodus_web_console",
+ "serde_json",
  "tokio",
  "tower-http 0.5.2",
  "tracing",
