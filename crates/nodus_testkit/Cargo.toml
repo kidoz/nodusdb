@@ -10,3 +10,4 @@ repository.workspace = true
 reqwest.workspace = true
 tokio.workspace = true
 tokio-postgres.workspace = true
+anyhow.workspace = true
