@@ -1,3 +1,5 @@
+#![allow(clippy::collapsible_if, clippy::collapsible_match)]
+
 use anyhow::Result;
 use bytes::Bytes;
 use chrono::Utc;
@@ -36,6 +38,112 @@ pub enum LogicalPlan {
         table_name: String,
         id: String,
     },
+    ShowVariable {
+        variable: String,
+    },
+    SelectLiteral {
+        value: String,
+    },
+}
+
+pub fn plan_statement(stmt: &sqlparser::ast::Statement) -> Result<LogicalPlan> {
+    use sqlparser::ast::*;
+    match stmt {
+        Statement::CreateTable { name, .. } => {
+            let table_name = name.to_string();
+            Ok(LogicalPlan::CreateTable { name: table_name })
+        }
+        Statement::Insert {
+            table_name, source, ..
+        } => {
+            let t_name = table_name.to_string();
+            // Extremely naive extraction for MVP
+            let mut id_val = String::new();
+            let mut name_val = String::new();
+            if let Some(query) = source {
+                if let SetExpr::Values(values) = &*query.body {
+                    if let Some(row) = values.rows.first() {
+                        if row.len() == 2 {
+                            if let Expr::Value(Value::SingleQuotedString(s)) = &row[0] {
+                                id_val = s.clone();
+                            }
+                            if let Expr::Value(Value::SingleQuotedString(s)) = &row[1] {
+                                name_val = s.clone();
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(LogicalPlan::Insert {
+                table_name: t_name,
+                id: id_val,
+                name_val,
+            })
+        }
+        Statement::Query(query) => {
+            if let SetExpr::Select(select) = &*query.body {
+                // Check if it's a SELECT literal
+                if select.projection.len() == 1 && select.from.is_empty() {
+                    if let SelectItem::UnnamedExpr(Expr::Value(Value::Number(n, _))) =
+                        &select.projection[0]
+                    {
+                        return Ok(LogicalPlan::SelectLiteral {
+                            value: n.to_string(),
+                        });
+                    }
+                    if let SelectItem::UnnamedExpr(Expr::Value(Value::SingleQuotedString(s))) =
+                        &select.projection[0]
+                    {
+                        return Ok(LogicalPlan::SelectLiteral {
+                            value: s.to_string(),
+                        });
+                    }
+                    if let SelectItem::UnnamedExpr(Expr::Function(func)) = &select.projection[0] {
+                        return Ok(LogicalPlan::SelectLiteral {
+                            value: func.name.to_string(),
+                        }); // e.g. version
+                    }
+                }
+
+                // Naive SELECT ... FROM ... WHERE id = '...'
+                if !select.from.is_empty() {
+                    let table_name = match &select.from[0].relation {
+                        TableFactor::Table { name, .. } => name.to_string(),
+                        _ => "users".to_string(),
+                    };
+                    if let Some(selection) = &select.selection {
+                        if let Expr::BinaryOp { left, op, right } = selection {
+                            if *op == BinaryOperator::Eq {
+                                if let (
+                                    Expr::Identifier(_),
+                                    Expr::Value(Value::SingleQuotedString(id_val)),
+                                ) = (&**left, &**right)
+                                {
+                                    return Ok(LogicalPlan::SelectById {
+                                        table_name,
+                                        id: id_val.clone(),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            anyhow::bail!("Unsupported query structure: {:?}", query)
+        }
+        Statement::StartTransaction { .. } => Ok(LogicalPlan::Begin),
+        Statement::Commit { .. } => Ok(LogicalPlan::Commit),
+        Statement::Rollback { .. } => Ok(LogicalPlan::Rollback),
+        Statement::ShowVariable { variable } => {
+            let var_name = variable
+                .iter()
+                .map(|ident| ident.value.clone())
+                .collect::<Vec<_>>()
+                .join(".");
+            Ok(LogicalPlan::ShowVariable { variable: var_name })
+        }
+        _ => anyhow::bail!("Unsupported SQL statement: {:?}", stmt),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -232,6 +340,28 @@ impl Executor for MemExecutor {
                 Ok(vec![Row {
                     columns: vec!["ROLLBACK".into()],
                 }])
+            }
+            LogicalPlan::ShowVariable { variable } => {
+                if variable.to_uppercase() == "SEARCH_PATH" {
+                    Ok(vec![Row {
+                        columns: vec!["public".into()],
+                    }])
+                } else {
+                    Ok(vec![Row {
+                        columns: vec!["".into()],
+                    }])
+                }
+            }
+            LogicalPlan::SelectLiteral { value } => {
+                if value.to_uppercase() == "VERSION" {
+                    Ok(vec![Row {
+                        columns: vec!["PostgreSQL 16.0 (NodusDB)".into()],
+                    }])
+                } else {
+                    Ok(vec![Row {
+                        columns: vec![value],
+                    }])
+                }
             }
             _ => Ok(vec![]),
         }
