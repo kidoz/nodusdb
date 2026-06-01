@@ -21,6 +21,67 @@ pub struct ColumnDef {
     pub data_type: String,
 }
 
+/// A typed cell value. Rows are stored as `Vec<Value>` in table-column order.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum Value {
+    Int(i64),
+    Float(f64),
+    Text(String),
+    Bool(bool),
+    Null,
+}
+
+/// Logical column type derived from a SQL type name.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ColumnType {
+    Int,
+    Float,
+    Bool,
+    Text,
+}
+
+fn column_type(data_type: &str) -> ColumnType {
+    let t = data_type.to_uppercase();
+    if t.contains("INT") || t.contains("SERIAL") {
+        ColumnType::Int
+    } else if t.contains("FLOAT")
+        || t.contains("DOUBLE")
+        || t.contains("REAL")
+        || t.contains("NUMERIC")
+        || t.contains("DECIMAL")
+    {
+        ColumnType::Float
+    } else if t.contains("BOOL") {
+        ColumnType::Bool
+    } else {
+        ColumnType::Text
+    }
+}
+
+/// Coerces a literal string into a typed value for the given column type.
+/// Empty strings and unparseable numerics become `Null`.
+fn coerce(raw: &str, ty: ColumnType) -> Value {
+    if raw.is_empty() {
+        return Value::Null;
+    }
+    match ty {
+        ColumnType::Int => raw.parse::<i64>().map(Value::Int).unwrap_or(Value::Null),
+        ColumnType::Float => raw.parse::<f64>().map(Value::Float).unwrap_or(Value::Null),
+        ColumnType::Bool => raw.parse::<bool>().map(Value::Bool).unwrap_or(Value::Null),
+        ColumnType::Text => Value::Text(raw.to_string()),
+    }
+}
+
+fn render(value: &Value) -> String {
+    match value {
+        Value::Int(n) => n.to_string(),
+        Value::Float(f) => f.to_string(),
+        Value::Text(s) => s.clone(),
+        Value::Bool(b) => b.to_string(),
+        Value::Null => String::new(),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum LogicalPlan {
     CreateTable {
@@ -326,6 +387,19 @@ impl MemExecutor {
         }
     }
 
+    /// Scans all visible rows of a table, decoding each into typed values.
+    fn scan_rows(&self, table_id: TableId) -> Result<Vec<Vec<Value>>> {
+        let read_ts = self.read_ts();
+        let start = Bytes::from(format!("{}:", table_id));
+        let end = Bytes::from(format!("{};", table_id));
+        let mut rows = Vec::new();
+        for pair in self.kv.scan(KeyRange { start, end }, read_ts)? {
+            let pair = pair?;
+            rows.push(serde_json::from_slice::<Vec<Value>>(&pair.value)?);
+        }
+        Ok(rows)
+    }
+
     /// Writes a row value at `key`, using the active txn or an auto-commit txn.
     fn write_row(&self, key: String, value: String) -> Result<()> {
         let active = *self.active_txn.read().unwrap();
@@ -441,23 +515,30 @@ impl Executor for MemExecutor {
                 self.authorize(ctx, Action::Insert, ResourceRef::Table(tbl.id))?;
 
                 let col_names: Vec<&str> = tbl.columns.iter().map(|c| c.name.as_str()).collect();
-                // Build the row in table-column order.
-                let mut row = vec![String::new(); col_names.len()];
+                // Build the raw string row in table-column order...
+                let mut raw = vec![String::new(); col_names.len()];
                 if columns.is_empty() {
                     for (i, v) in values.iter().enumerate() {
-                        if i < row.len() {
-                            row[i] = v.clone();
+                        if i < raw.len() {
+                            raw[i] = v.clone();
                         }
                     }
                 } else {
                     for (cname, val) in columns.iter().zip(values.iter()) {
                         if let Some(idx) = col_names.iter().position(|c| c == cname) {
-                            row[idx] = val.clone();
+                            raw[idx] = val.clone();
                         }
                     }
                 }
-                // Primary key = first column's value.
-                let pk = row.first().cloned().unwrap_or_default();
+                // ...then coerce each cell to its column's type.
+                let row: Vec<Value> = tbl
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| coerce(&raw[i], column_type(&c.data_type)))
+                    .collect();
+                // Primary key = first column's rendered value.
+                let pk = row.first().map(render).unwrap_or_default();
                 let key = format!("{}:{}", tbl.id, pk);
                 let encoded = serde_json::to_string(&row)?;
                 self.write_row(key, encoded)?;
@@ -474,22 +555,13 @@ impl Executor for MemExecutor {
                 self.authorize(ctx, Action::Select, ResourceRef::Table(tbl.id))?;
 
                 let col_names: Vec<String> = tbl.columns.iter().map(|c| c.name.clone()).collect();
-                let read_ts = self.read_ts();
+                let mut stored_rows = self.scan_rows(tbl.id)?;
 
-                // Scan all rows in the table's key range.
-                let start = Bytes::from(format!("{}:", tbl.id));
-                let end = Bytes::from(format!("{};", tbl.id));
-                let mut stored_rows: Vec<Vec<String>> = Vec::new();
-                for pair in self.kv.scan(KeyRange { start, end }, read_ts)? {
-                    let pair = pair?;
-                    let row: Vec<String> = serde_json::from_slice(&pair.value)?;
-                    stored_rows.push(row);
-                }
-
-                // Apply the optional equality filter.
+                // Apply the optional equality filter (typed comparison).
                 if let Some((fcol, fval)) = &filter {
                     if let Some(idx) = col_names.iter().position(|c| c == fcol) {
-                        stored_rows.retain(|r| r.get(idx).map(|v| v == fval).unwrap_or(false));
+                        let target = coerce(fval, column_type(&tbl.columns[idx].data_type));
+                        stored_rows.retain(|r| r.get(idx).map(|v| *v == target).unwrap_or(false));
                     } else {
                         stored_rows.clear();
                     }
@@ -511,7 +583,7 @@ impl Executor for MemExecutor {
                     .map(|r| Row {
                         columns: indices
                             .iter()
-                            .map(|i| i.and_then(|i| r.get(i).cloned()).unwrap_or_default())
+                            .map(|i| i.and_then(|i| r.get(i)).map(render).unwrap_or_default())
                             .collect(),
                     })
                     .collect::<Vec<_>>();
@@ -583,8 +655,10 @@ impl Executor for MemExecutor {
                 let key = format!("{}:{}", table_id, id);
                 match self.kv.get(key.as_bytes(), read_ts)? {
                     Some(val) => {
-                        let row: Vec<String> = serde_json::from_slice(&val).unwrap_or_default();
-                        Ok(vec![Row { columns: row }])
+                        let row: Vec<Value> = serde_json::from_slice(&val).unwrap_or_default();
+                        Ok(vec![Row {
+                            columns: row.iter().map(render).collect(),
+                        }])
                     }
                     None => Ok(vec![]),
                 }
@@ -727,6 +801,58 @@ mod tests {
         assert_eq!(one.columns, vec!["title", "author"]);
         assert_eq!(one.rows.len(), 1);
         assert_eq!(one.rows[0].columns, vec!["Foundation", "Asimov"]);
+    }
+
+    #[test]
+    fn typed_values_round_trip_and_filter_by_int() {
+        let (exec, cat) = MemExecutor::shared(Arc::new(MemoryAuditSink::new()));
+        let admin = cat
+            .create_role(CreateRoleRequest {
+                name: "admin".into(),
+                principal_type: PrincipalType::User,
+                database_id: None,
+            })
+            .unwrap();
+        cat.grant_privilege(GrantPrivilegeRequest {
+            principal_id: admin.id,
+            resource: ResourceRef::System,
+            privilege: "ALL".into(),
+        })
+        .unwrap();
+        let ctx = ctx_for(admin.id);
+
+        exec.execute_logical(
+            &ctx,
+            LogicalPlan::CreateTable {
+                name: "items".into(),
+                columns: cols(&[("id", "INT"), ("name", "TEXT"), ("active", "BOOL")]),
+            },
+        )
+        .unwrap();
+        exec.execute_logical(
+            &ctx,
+            LogicalPlan::Insert {
+                table_name: "items".into(),
+                columns: vec!["id".into(), "name".into(), "active".into()],
+                values: vec!["7".into(), "widget".into(), "true".into()],
+            },
+        )
+        .unwrap();
+
+        // Filter on an INT column coerces the literal numerically.
+        let out = exec
+            .execute_logical(
+                &ctx,
+                LogicalPlan::Select {
+                    table_name: "items".into(),
+                    projection: vec![],
+                    filter: Some(("id".into(), "7".into())),
+                },
+            )
+            .unwrap();
+        assert_eq!(out.rows.len(), 1);
+        // Int renders without quotes, bool as true/false.
+        assert_eq!(out.rows[0].columns, vec!["7", "widget", "true"]);
     }
 
     #[test]
