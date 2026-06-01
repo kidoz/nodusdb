@@ -42,6 +42,14 @@ pub trait KvEngine: Send + Sync {
     fn write_intent(&self, txn_id: TxnId, key: Bytes, value: Bytes) -> Result<()>;
     fn commit(&self, txn_id: TxnId, commit_ts: Timestamp) -> Result<()>;
     fn abort(&self, txn_id: TxnId) -> Result<()>;
+
+    /// Reclaims MVCC versions that no active reader can observe: for each key,
+    /// committed versions strictly older than the newest version at or below
+    /// `watermark` are removed. `watermark` must be ≤ the oldest active read
+    /// timestamp. Returns the number of versions reclaimed. Default: no-op.
+    fn garbage_collect(&self, _watermark: Timestamp) -> Result<usize> {
+        Ok(0)
+    }
 }
 
 pub type RowKey = Bytes;

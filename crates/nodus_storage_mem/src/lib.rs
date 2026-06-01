@@ -115,6 +115,46 @@ impl KvEngine for MemKvEngine {
         }
         Ok(())
     }
+
+    fn garbage_collect(&self, watermark: Timestamp) -> Result<usize> {
+        let mut store = self.store.write().unwrap();
+        let mut removed = 0usize;
+        let mut dead_keys = Vec::new();
+
+        for (key, versions) in store.iter_mut() {
+            // Newest committed version visible at or below the watermark: this is
+            // the oldest version any reader at >= watermark could still need.
+            let keep_version = versions
+                .iter()
+                .filter(|v| !v.is_intent && v.version <= watermark)
+                .map(|v| v.version)
+                .max();
+            let Some(keep_version) = keep_version else {
+                continue;
+            };
+
+            let before = versions.len();
+            // Keep intents and everything at or newer than keep_version.
+            versions.retain(|v| v.is_intent || v.version >= keep_version);
+            removed += before - versions.len();
+
+            // If the only survivor is a tombstone at/below the watermark, the key
+            // is dead and can be dropped entirely.
+            if versions.len() == 1 {
+                let v = &versions[0];
+                if !v.is_intent && v.value.is_none() {
+                    dead_keys.push(key.clone());
+                }
+            }
+        }
+
+        for k in dead_keys {
+            if let Some(vs) = store.remove(&k) {
+                removed += vs.len();
+            }
+        }
+        Ok(removed)
+    }
 }
 
 #[cfg(test)]
@@ -143,5 +183,28 @@ mod tests {
         // Not visible at older timestamp
         let res = engine.get(k1.as_ref(), 9).unwrap();
         assert!(res.is_none());
+    }
+
+    #[test]
+    fn test_garbage_collect_prunes_old_versions() {
+        let engine = MemKvEngine::new();
+        let k = Bytes::from("k");
+
+        let t1 = TxnId::new();
+        engine.write_intent(t1, k.clone(), Bytes::from("v1")).unwrap();
+        engine.commit(t1, 5).unwrap();
+
+        let t2 = TxnId::new();
+        engine.write_intent(t2, k.clone(), Bytes::from("v2")).unwrap();
+        engine.commit(t2, 10).unwrap();
+
+        // With no reader below 10, the version at ts=5 is reclaimable.
+        let removed = engine.garbage_collect(10).unwrap();
+        assert_eq!(removed, 1);
+        // Latest value still readable.
+        assert_eq!(engine.get(k.as_ref(), 10).unwrap().unwrap(), Bytes::from("v2"));
+
+        // Idempotent: a second pass reclaims nothing.
+        assert_eq!(engine.garbage_collect(10).unwrap(), 0);
     }
 }
