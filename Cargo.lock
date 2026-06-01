@@ -1595,6 +1595,7 @@ dependencies = [
  "nodus_monitoring",
  "nodus_pgwire",
  "nodus_security",
+ "nodus_upgrade",
  "nodus_web_console",
  "serde_json",
  "tokio",

@@ -218,6 +218,51 @@ async fn admin_backup_api_create_list_verify_restore() {
 }
 
 #[tokio::test]
+async fn admin_upgrade_api_drives_lifecycle() {
+    let server = TestServer::start().await.expect("server starts");
+    let http = reqwest::Client::new();
+    let base = format!("http://{}", server.http_addr);
+
+    // Idle initially.
+    let st: serde_json::Value = http
+        .get(format!("{base}/api/v1/upgrade"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(st["phase"], "Idle");
+
+    http.post(format!("{base}/api/v1/upgrade/start?target=0.2.0"))
+        .send()
+        .await
+        .unwrap();
+    // Single node: report it upgraded to reach ReadyToFinalize.
+    let st: serde_json::Value = http
+        .post(format!("{base}/api/v1/upgrade/node-upgraded?node=n1"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(st["phase"], "ReadyToFinalize");
+
+    let st: serde_json::Value = http
+        .post(format!("{base}/api/v1/upgrade/finalize"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(st["phase"], "Finalized");
+    // The gated feature is enabled only after finalization.
+    assert_eq!(st["feature_gates"]["new_storage_format"], true);
+}
+
+#[tokio::test]
 async fn pgwire_rejects_bad_password() {
     let server = TestServer::start().await.expect("server starts");
     let bad = format!(

@@ -45,6 +45,44 @@ enum Commands {
         #[command(subcommand)]
         cmd: BackupCmd,
     },
+    /// Control rolling upgrades
+    Upgrade {
+        #[command(subcommand)]
+        cmd: UpgradeCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum UpgradeCmd {
+    /// Show upgrade state
+    Status {
+        #[arg(long, default_value = DEFAULT_ADDR)]
+        addr: String,
+    },
+    /// Start an upgrade to a target version
+    Start {
+        #[arg(long)]
+        target: String,
+        #[arg(long, default_value = DEFAULT_ADDR)]
+        addr: String,
+    },
+    /// Report a node as upgraded
+    NodeUpgraded {
+        #[arg(long)]
+        node: String,
+        #[arg(long, default_value = DEFAULT_ADDR)]
+        addr: String,
+    },
+    /// Finalize the upgrade
+    Finalize {
+        #[arg(long, default_value = DEFAULT_ADDR)]
+        addr: String,
+    },
+    /// Roll back an in-progress upgrade
+    Rollback {
+        #[arg(long, default_value = DEFAULT_ADDR)]
+        addr: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -299,6 +337,37 @@ async fn main() -> anyhow::Result<()> {
                 .error_for_status()?
                 .json()
                 .await?;
+            println!("{}", serde_json::to_string_pretty(&v)?);
+        }
+        Commands::Upgrade { cmd } => {
+            let (method_post, path, query): (bool, String, Vec<(&str, String)>) = match &cmd {
+                UpgradeCmd::Status { addr } => (false, format!("{addr}/api/v1/upgrade"), vec![]),
+                UpgradeCmd::Start { target, addr } => (
+                    true,
+                    format!("{addr}/api/v1/upgrade/start"),
+                    vec![("target", target.clone())],
+                ),
+                UpgradeCmd::NodeUpgraded { node, addr } => (
+                    true,
+                    format!("{addr}/api/v1/upgrade/node-upgraded"),
+                    vec![("node", node.clone())],
+                ),
+                UpgradeCmd::Finalize { addr } => {
+                    (true, format!("{addr}/api/v1/upgrade/finalize"), vec![])
+                }
+                UpgradeCmd::Rollback { addr } => {
+                    (true, format!("{addr}/api/v1/upgrade/rollback"), vec![])
+                }
+            };
+            let mut req = if method_post {
+                client.post(&path)
+            } else {
+                client.get(&path)
+            };
+            if !query.is_empty() {
+                req = req.query(&query);
+            }
+            let v: serde_json::Value = req.send().await?.error_for_status()?.json().await?;
             println!("{}", serde_json::to_string_pretty(&v)?);
         }
     }

@@ -11,6 +11,7 @@ use nodus_authz::{Action, AuthzContext, AuthzEngine, AuthzExplanation, AuthzRequ
 use nodus_backup::{BackupObject, BackupOrchestrator};
 use nodus_catalog::{CatalogReader, PrincipalId, ResourceRef};
 use nodus_security::{SessionInfo, SessionRegistry};
+use nodus_upgrade::{DefaultUpgradeCoordinator, UpgradeCoordinator};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -25,6 +26,7 @@ pub struct AdminState {
     pub authz: Arc<dyn AuthzEngine>,
     pub catalog: Arc<dyn CatalogReader>,
     pub backup: Arc<BackupOrchestrator>,
+    pub upgrade: Arc<DefaultUpgradeCoordinator>,
 }
 
 pub fn admin_routes(state: AdminState) -> Router {
@@ -36,6 +38,11 @@ pub fn admin_routes(state: AdminState) -> Router {
         .route("/api/v1/backups", get(list_backups).post(create_backup))
         .route("/api/v1/backups/:id/verify", post(verify_backup))
         .route("/api/v1/backups/:id/restore", post(restore_backup))
+        .route("/api/v1/upgrade", get(upgrade_state))
+        .route("/api/v1/upgrade/start", post(upgrade_start))
+        .route("/api/v1/upgrade/node-upgraded", post(upgrade_node_upgraded))
+        .route("/api/v1/upgrade/finalize", post(upgrade_finalize))
+        .route("/api/v1/upgrade/rollback", post(upgrade_rollback))
         .with_state(state)
 }
 
@@ -160,4 +167,54 @@ async fn restore_backup(State(state): State<AdminState>, Path(id): Path<String>)
         Ok(objects) => Json(json!({ "restored": objects.len() })),
         Err(e) => Json(json!({ "restored": 0, "error": e.to_string() })),
     }
+}
+
+/// Serializes the current upgrade state, or wraps an operation error alongside
+/// the (unchanged) state so clients always get a consistent shape.
+fn upgrade_response(state: &AdminState, op: Result<(), anyhow::Error>) -> Json<Value> {
+    let current = state
+        .upgrade
+        .get_state()
+        .ok()
+        .and_then(|s| serde_json::to_value(s).ok())
+        .unwrap_or_else(|| json!({}));
+    match op {
+        Ok(()) => Json(current),
+        Err(e) => Json(json!({ "error": e.to_string(), "state": current })),
+    }
+}
+
+async fn upgrade_state(State(state): State<AdminState>) -> Json<Value> {
+    upgrade_response(&state, Ok(()))
+}
+
+async fn upgrade_start(
+    State(state): State<AdminState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Json<Value> {
+    let target = params
+        .get("target")
+        .cloned()
+        .unwrap_or_else(|| "next".to_string());
+    let op = state.upgrade.start_upgrade(target);
+    upgrade_response(&state, op)
+}
+
+async fn upgrade_node_upgraded(
+    State(state): State<AdminState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Json<Value> {
+    let node = params.get("node").cloned().unwrap_or_else(|| "node".into());
+    let op = state.upgrade.report_node_upgraded(&node);
+    upgrade_response(&state, op)
+}
+
+async fn upgrade_finalize(State(state): State<AdminState>) -> Json<Value> {
+    let op = state.upgrade.finalize_upgrade();
+    upgrade_response(&state, op)
+}
+
+async fn upgrade_rollback(State(state): State<AdminState>) -> Json<Value> {
+    let op = state.upgrade.rollback();
+    upgrade_response(&state, op)
 }

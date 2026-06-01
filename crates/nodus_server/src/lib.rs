@@ -4,7 +4,8 @@ use admin::{AdminState, admin_routes};
 use axum::Router;
 use nodus_backup::{BackupOrchestrator, FsBackupRepository};
 use nodus_catalog::{
-    CatalogWriter, CreateRoleRequest, GrantPrivilegeRequest, PrincipalType, ResourceRef,
+    CatalogReader, CatalogWriter, CreateRoleRequest, GrantPrivilegeRequest, PrincipalType,
+    ResourceRef,
 };
 use nodus_config::NodusConfig;
 use nodus_monitoring::{AppState, monitoring_routes};
@@ -108,12 +109,23 @@ pub async fn run_server_with_config(
     )));
     let backup = Arc::new(BackupOrchestrator::new(repo));
 
+    let cluster_version = catalog
+        .get_cluster_version()
+        .map(|v| v.active_version)
+        .unwrap_or(1);
+    let upgrade = Arc::new(nodus_upgrade::DefaultUpgradeCoordinator::new(
+        1,
+        vec!["new_storage_format".into()],
+        cluster_version,
+    ));
+
     let admin_state = AdminState {
         registry: registry.clone(),
         audit: audit.clone(),
         authz: authz.clone(),
         catalog: catalog.clone(),
         backup,
+        upgrade,
     };
     let app = Router::new()
         .merge(monitoring_routes(state))
