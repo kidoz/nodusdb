@@ -18,6 +18,7 @@ nodus_sharding = { path = "../nodus_sharding" }
 nodus_storage_api = { path = "../nodus_storage_api" }
 nodus_authz = { path = "../nodus_authz" }
 nodus_security = { path = "../nodus_security" }
+nodus_audit = { path = "../nodus_audit" }
 nodus_meta = { path = "../nodus_meta" }
 nodus_storage_mem = { path = "../nodus_storage_mem" }
 bytes.workspace = true

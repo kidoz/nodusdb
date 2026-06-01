@@ -32,8 +32,10 @@ pub async fn run_server(
         .store(true, std::sync::atomic::Ordering::Release);
 
     // Shared catalog so the authenticator's principals and the executor's
-    // authorization grants resolve against the same data.
-    let (executor, catalog) = nodus_executor::MemExecutor::shared();
+    // authorization grants resolve against the same data. Audit events go to
+    // stdout for now; a durable file sink is wired via config separately.
+    let audit = Arc::new(nodus_audit::LogAuditSink);
+    let (executor, catalog) = nodus_executor::MemExecutor::shared(audit);
     let admin = catalog
         .create_role(CreateRoleRequest {
             name: "nodus".into(),

@@ -1469,6 +1469,7 @@ dependencies = [
  "anyhow",
  "bytes",
  "chrono",
+ "nodus_audit",
  "nodus_authz",
  "nodus_catalog",
  "nodus_meta",
@@ -1582,6 +1583,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "nodus_audit",
  "nodus_catalog",
  "nodus_common",
  "nodus_config",

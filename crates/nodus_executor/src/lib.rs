@@ -3,10 +3,11 @@
 use anyhow::Result;
 use bytes::Bytes;
 use chrono::Utc;
+use nodus_audit::{AuditEvent, AuditSink};
 use nodus_authz::{Action, AuthzContext, AuthzEngine, AuthzRequest};
 use nodus_catalog::{
-    CatalogReader, CatalogWriter, ColumnDescriptor, CreateTableRequest, DescriptorState, IndexId,
-    MemoryCatalog, PrincipalId, ResourceRef, RoleId, TableId,
+    AuditEventId, CatalogReader, CatalogWriter, ColumnDescriptor, CreateTableRequest,
+    DescriptorState, IndexId, MemoryCatalog, PrincipalId, ResourceRef, RoleId, TableId,
 };
 use nodus_storage_api::{KvEngine, Timestamp, TxnId};
 use nodus_txn::TxnManager;
@@ -196,6 +197,7 @@ pub struct MemExecutor {
     catalog_reader: Arc<dyn CatalogReader>,
     catalog_writer: Arc<dyn CatalogWriter>,
     authz: Arc<dyn AuthzEngine>,
+    audit: Arc<dyn AuditSink>,
     kv: Arc<dyn KvEngine>,
     txn: Arc<dyn TxnManager>,
     // Hack for MVP: track active transaction in memory for the single session
@@ -207,6 +209,7 @@ impl MemExecutor {
         catalog_reader: Arc<dyn CatalogReader>,
         catalog_writer: Arc<dyn CatalogWriter>,
         authz: Arc<dyn AuthzEngine>,
+        audit: Arc<dyn AuditSink>,
         kv: Arc<dyn KvEngine>,
         txn: Arc<dyn TxnManager>,
     ) -> Self {
@@ -228,6 +231,7 @@ impl MemExecutor {
             catalog_reader,
             catalog_writer,
             authz,
+            audit,
             kv,
             txn,
             active_txn: std::sync::RwLock::new(None),
@@ -236,13 +240,21 @@ impl MemExecutor {
 
     /// Builds an executor over fresh in-memory components and returns it
     /// together with the shared catalog, so callers (e.g. the server) can seed
-    /// principals/grants and an authenticator against the same catalog.
-    pub fn shared() -> (Arc<MemExecutor>, Arc<MemoryCatalog>) {
+    /// principals/grants and an authenticator against the same catalog. Audit
+    /// events are written to `audit`.
+    pub fn shared(audit: Arc<dyn AuditSink>) -> (Arc<MemExecutor>, Arc<MemoryCatalog>) {
         let cat = Arc::new(MemoryCatalog::new());
         let kv = Arc::new(nodus_storage_mem::MemKvEngine::new());
         let txn = Arc::new(nodus_txn::MemTxnManager::new());
         let authz = Arc::new(nodus_authz::DefaultAuthzEngine::new(cat.clone()));
-        let exec = Arc::new(MemExecutor::new(cat.clone(), cat.clone(), authz, kv, txn));
+        let exec = Arc::new(MemExecutor::new(
+            cat.clone(),
+            cat.clone(),
+            authz,
+            audit,
+            kv,
+            txn,
+        ));
         (exec, cat)
     }
 
@@ -256,10 +268,36 @@ impl MemExecutor {
         let decision = self.authz.authorize(AuthzRequest {
             principal_id: ctx.principal_id,
             active_roles: ctx.active_roles.clone(),
-            action,
-            resource,
+            action: action.clone(),
+            resource: resource.clone(),
             context: AuthzContext { database_id: None },
         })?;
+
+        // Record every authorization decision to the audit trail.
+        let _ = self.audit.record_event(AuditEvent {
+            id: AuditEventId::new(),
+            time: Utc::now(),
+            actor: ctx.principal_id,
+            action: action.as_privilege().to_string(),
+            resource: Some(resource),
+            source_ip: None,
+            request_id: None,
+            session_id: Some(ctx.session_id.clone()),
+            query_id: None,
+            reason: Some(format!("{:?}", decision.reason)),
+            result: if decision.allowed {
+                "Success".to_string()
+            } else {
+                "Denied".to_string()
+            },
+            error: if decision.allowed {
+                None
+            } else {
+                Some("permission denied".to_string())
+            },
+            authz_catalog_version: Some(decision.catalog_version),
+        });
+
         if !decision.allowed {
             anyhow::bail!("permission denied");
         }
@@ -274,8 +312,9 @@ impl Default for MemExecutor {
         let kv = Arc::new(nodus_storage_mem::MemKvEngine::new());
         let txn = Arc::new(nodus_txn::MemTxnManager::new());
         let authz = Arc::new(nodus_authz::DefaultAuthzEngine::new(cat.clone()));
+        let audit = Arc::new(nodus_audit::LogAuditSink);
 
-        Self::new(cat.clone(), cat, authz, kv, txn)
+        Self::new(cat.clone(), cat, authz, audit, kv, txn)
     }
 }
 
@@ -465,6 +504,7 @@ impl Executor for MemExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nodus_audit::{AuditQuery, AuditQueryable, MemoryAuditSink};
     use nodus_catalog::{CreateRoleRequest, GrantPrivilegeRequest, PrincipalType};
 
     fn ctx_for(principal: PrincipalId) -> ExecutionContext {
@@ -493,7 +533,8 @@ mod tests {
 
     #[test]
     fn create_table_denied_then_allowed_by_grant() {
-        let (exec, cat) = MemExecutor::shared();
+        let audit = Arc::new(MemoryAuditSink::new());
+        let (exec, cat) = MemExecutor::shared(audit.clone());
         let user = cat
             .create_role(CreateRoleRequest {
                 name: "bob".into(),
@@ -521,5 +562,17 @@ mod tests {
             exec.execute_logical(&ctx, LogicalPlan::CreateTable { name: "t1".into() })
                 .is_ok()
         );
+
+        // Both the denial and the success were audited.
+        let denied = AuditQuery {
+            result: Some("Denied".into()),
+            ..Default::default()
+        };
+        let success = AuditQuery {
+            result: Some("Success".into()),
+            ..Default::default()
+        };
+        assert_eq!(audit.query(&denied).unwrap().len(), 1);
+        assert_eq!(audit.query(&success).unwrap().len(), 1);
     }
 }
