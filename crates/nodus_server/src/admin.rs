@@ -178,23 +178,32 @@ async fn list_backups(State(state): State<AdminState>) -> Json<Vec<String>> {
     Json(state.backup.list_backups().await.unwrap_or_default())
 }
 
-/// Creates a full backup. As an MVP snapshot it captures the current audit
-/// trail; the export set will broaden as catalog/shard serialization lands.
+/// Creates a full backup capturing a catalog snapshot and the audit trail.
 async fn create_backup(State(state): State<AdminState>) -> Json<Value> {
-    let events = state
-        .audit
-        .query(&AuditQuery::default())
-        .unwrap_or_default();
-    let bytes = serde_json::to_vec(&events).unwrap_or_default();
     let version = state
         .catalog
         .get_cluster_version()
         .map(|v| v.active_version)
         .unwrap_or(0);
-    let objects = vec![BackupObject {
-        name: "audit.jsonl".into(),
-        bytes: Bytes::from(bytes),
-    }];
+
+    let snapshot = state.catalog.export_snapshot();
+    let catalog_bytes = serde_json::to_vec(&snapshot).unwrap_or_default();
+    let audit_events = state
+        .audit
+        .query(&AuditQuery::default())
+        .unwrap_or_default();
+    let audit_bytes = serde_json::to_vec(&audit_events).unwrap_or_default();
+
+    let objects = vec![
+        BackupObject {
+            name: "catalog.json".into(),
+            bytes: Bytes::from(catalog_bytes),
+        },
+        BackupObject {
+            name: "audit.jsonl".into(),
+            bytes: Bytes::from(audit_bytes),
+        },
+    ];
     match state
         .backup
         .create_full_backup("local", 0, version, version, objects)
@@ -218,7 +227,10 @@ async fn verify_backup(State(state): State<AdminState>, Path(id): Path<String>) 
 
 async fn restore_backup(State(state): State<AdminState>, Path(id): Path<String>) -> Json<Value> {
     match state.backup.restore(&id).await {
-        Ok(objects) => Json(json!({ "restored": objects.len() })),
+        Ok(objects) => {
+            let names: Vec<String> = objects.into_iter().map(|o| o.name).collect();
+            Json(json!({ "restored": names.len(), "objects": names }))
+        }
         Err(e) => Json(json!({ "restored": 0, "error": e.to_string() })),
     }
 }

@@ -381,6 +381,16 @@ pub struct AddRoleMemberRequest {
     pub member_id: PrincipalId,
 }
 
+/// A serializable point-in-time snapshot of catalog state, used for backups.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CatalogSnapshot {
+    pub databases: Vec<DatabaseDescriptor>,
+    pub schemas: Vec<SchemaDescriptor>,
+    pub tables: Vec<TableDescriptor>,
+    pub principals: Vec<PrincipalDescriptor>,
+    pub grants: Vec<GrantDescriptor>,
+}
+
 pub trait CatalogReader: Send + Sync {
     fn get_database(&self, name: &str) -> Result<DatabaseDescriptor>;
     fn get_schema(&self, database: &str, schema: &str) -> Result<SchemaDescriptor>;
@@ -394,6 +404,12 @@ pub trait CatalogReader: Send + Sync {
     /// principals it is a member of. Used by the authorization engine to match
     /// grants made either directly to a principal or to any of its roles.
     fn get_effective_principals(&self, principal: PrincipalId) -> Result<Vec<PrincipalId>>;
+
+    /// Exports a serializable snapshot of catalog state for backups. Default is
+    /// an empty snapshot.
+    fn export_snapshot(&self) -> CatalogSnapshot {
+        CatalogSnapshot::default()
+    }
 }
 
 pub trait CatalogWriter: Send + Sync {
@@ -542,6 +558,16 @@ impl CatalogReader for MemoryCatalog {
             }
         }
         Ok(result)
+    }
+
+    fn export_snapshot(&self) -> CatalogSnapshot {
+        CatalogSnapshot {
+            databases: self.databases.read().unwrap().values().cloned().collect(),
+            schemas: self.schemas.read().unwrap().values().cloned().collect(),
+            tables: self.tables.read().unwrap().values().cloned().collect(),
+            principals: self.principals.read().unwrap().values().cloned().collect(),
+            grants: self.grants.read().unwrap().clone(),
+        }
     }
 }
 
