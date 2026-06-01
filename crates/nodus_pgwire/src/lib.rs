@@ -376,6 +376,7 @@ pub async fn start_pgwire_server(
     metrics: nodus_monitoring::Metrics,
     registry: Arc<SessionRegistry>,
     authenticator: Arc<PasswordAuthenticator>,
+    tls: Option<Arc<tokio_rustls::TlsAcceptor>>,
 ) -> anyhow::Result<()> {
     let startup_handler = Arc::new(NodusStartupHandler {
         authenticator,
@@ -390,16 +391,21 @@ pub async fn start_pgwire_server(
         copy_handler: Arc::new(NoopCopyHandler),
     });
 
-    info!("PGWire server listening on {}", listener.local_addr()?);
+    info!(
+        "PGWire server listening on {} (tls: {})",
+        listener.local_addr()?,
+        tls.is_some()
+    );
 
     loop {
         let (socket, _) = listener.accept().await?;
         let factory = factory.clone();
         let metrics = metrics.clone();
+        let tls = tls.clone();
         tokio::spawn(async move {
             metrics.pgwire_connections_total.inc();
             metrics.active_sessions.inc();
-            if let Err(e) = process_socket(socket, None, factory).await {
+            if let Err(e) = process_socket(socket, tls, factory).await {
                 error!("Socket error: {}", e);
             }
             metrics.active_sessions.dec();

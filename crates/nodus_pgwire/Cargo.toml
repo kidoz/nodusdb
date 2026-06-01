@@ -21,3 +21,4 @@ nodus_monitoring = { path = "../nodus_monitoring" }
 nodus_security = { path = "../nodus_security" }
 nodus_catalog = { path = "../nodus_catalog" }
 uuid.workspace = true
+tokio-rustls = "0.26"

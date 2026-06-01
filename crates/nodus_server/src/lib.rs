@@ -15,6 +15,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
+use tokio_rustls::TlsAcceptor;
+use tokio_rustls::rustls::ServerConfig;
+use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tower_http::cors::{Any, CorsLayer};
 
 pub struct ServerHandle {
@@ -35,6 +38,38 @@ fn backup_dir(uri: &str) -> PathBuf {
     } else {
         PathBuf::from(trimmed)
     }
+}
+
+/// Builds a TLS acceptor from configuration. Returns `None` when TLS is
+/// disabled. Errors if enabled but the cert/key are missing or invalid.
+fn load_tls_acceptor(tls: &nodus_config::TlsConfig) -> anyhow::Result<Option<Arc<TlsAcceptor>>> {
+    if !tls.enabled {
+        return Ok(None);
+    }
+    let cert_path = tls
+        .cert_path
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("tls.enabled but cert_path is unset"))?;
+    let key_path = tls
+        .key_path
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("tls.enabled but key_path is unset"))?;
+
+    // Ensure a process-wide crypto provider is available (aws-lc-rs, as enabled
+    // by pgwire). Ignored if one is already installed.
+    let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+    let cert_bytes = std::fs::read(cert_path)?;
+    let certs: Vec<CertificateDer> =
+        rustls_pemfile::certs(&mut cert_bytes.as_slice()).collect::<Result<_, _>>()?;
+    let key_bytes = std::fs::read(key_path)?;
+    let key: PrivateKeyDer = rustls_pemfile::private_key(&mut key_bytes.as_slice())?
+        .ok_or_else(|| anyhow::anyhow!("no private key found in {key_path}"))?;
+
+    let config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)?;
+    Ok(Some(Arc::new(TlsAcceptor::from(Arc::new(config)))))
 }
 
 /// Starts the server with default configuration.
@@ -85,6 +120,8 @@ pub async fn run_server_with_config(
     // Default development credentials; override before production use.
     authenticator.set_password("nodus", admin.id, "nodus");
 
+    let tls_acceptor = load_tls_acceptor(&config.tls)?;
+
     let registry = Arc::new(SessionRegistry::new());
     let pgwire_metrics = state.metrics.clone();
     let pgwire_registry = registry.clone();
@@ -95,6 +132,7 @@ pub async fn run_server_with_config(
             pgwire_metrics,
             pgwire_registry,
             authenticator,
+            tls_acceptor,
         )
         .await
     });
@@ -146,4 +184,36 @@ pub async fn run_server_with_config(
         http_task,
         registry,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nodus_config::TlsConfig;
+
+    #[test]
+    fn tls_disabled_yields_no_acceptor() {
+        let cfg = TlsConfig::default();
+        assert!(load_tls_acceptor(&cfg).unwrap().is_none());
+    }
+
+    #[test]
+    fn tls_enabled_without_paths_errors() {
+        let cfg = TlsConfig {
+            enabled: true,
+            cert_path: None,
+            key_path: None,
+        };
+        assert!(load_tls_acceptor(&cfg).is_err());
+    }
+
+    #[test]
+    fn backup_dir_parses_file_uri() {
+        assert_eq!(
+            backup_dir("file:///var/lib/nodus/backups"),
+            PathBuf::from("/var/lib/nodus/backups")
+        );
+        // Empty falls back to a unique temp dir.
+        assert!(backup_dir("").starts_with(std::env::temp_dir()));
+    }
 }
