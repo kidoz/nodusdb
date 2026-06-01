@@ -82,6 +82,38 @@ fn render(value: &Value) -> String {
     }
 }
 
+/// Orders two values of the same logical type. Mixed/None types fall back to
+/// comparing rendered strings so ordering is always total.
+fn compare(a: &Value, b: &Value) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (a, b) {
+        (Value::Int(x), Value::Int(y)) => x.cmp(y),
+        (Value::Float(x), Value::Float(y)) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
+        (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
+        (Value::Text(x), Value::Text(y)) => x.cmp(y),
+        _ => render(a).cmp(&render(b)),
+    }
+}
+
+/// Comparison operator in a `WHERE` predicate.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum CompareOp {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+/// A single `column <op> literal` predicate; a `WHERE` clause is a conjunction.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Predicate {
+    pub column: String,
+    pub op: CompareOp,
+    pub value: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum LogicalPlan {
     CreateTable {
@@ -98,17 +130,21 @@ pub enum LogicalPlan {
         table_name: String,
         /// Projected column names; empty means all columns (`SELECT *`).
         projection: Vec<String>,
-        /// Optional equality filter `(column, value)`.
-        filter: Option<(String, String)>,
+        /// Conjunction of `WHERE` predicates; empty means no filter.
+        filter: Vec<Predicate>,
+        /// Optional `ORDER BY (column, ascending)`.
+        order_by: Option<(String, bool)>,
+        /// Optional `LIMIT`.
+        limit: Option<usize>,
     },
     Update {
         table_name: String,
         assignments: Vec<(String, String)>,
-        filter: Option<(String, String)>,
+        filter: Vec<Predicate>,
     },
     Delete {
         table_name: String,
-        filter: Option<(String, String)>,
+        filter: Vec<Predicate>,
     },
     Begin,
     Commit,
@@ -210,7 +246,7 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement) -> Result<LogicalPlan> {
             Ok(LogicalPlan::Update {
                 table_name,
                 assignments: assigns,
-                filter: single_eq_filter(selection),
+                filter: parse_predicates(selection),
             })
         }
         Statement::Delete {
@@ -225,7 +261,7 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement) -> Result<LogicalPlan> {
                 .relation;
             Ok(LogicalPlan::Delete {
                 table_name: table_name_of(relation)?,
-                filter: single_eq_filter(selection),
+                filter: parse_predicates(selection),
             })
         }
         Statement::StartTransaction { .. } => Ok(LogicalPlan::Begin),
@@ -250,17 +286,50 @@ fn table_name_of(relation: &sqlparser::ast::TableFactor) -> Result<String> {
     }
 }
 
-/// Extracts a single `WHERE <col> = <literal>` equality filter, if present.
-fn single_eq_filter(selection: &Option<sqlparser::ast::Expr>) -> Option<(String, String)> {
+fn compare_op(op: &sqlparser::ast::BinaryOperator) -> Option<CompareOp> {
+    use sqlparser::ast::BinaryOperator::*;
+    match op {
+        Eq => Some(CompareOp::Eq),
+        NotEq => Some(CompareOp::Ne),
+        Lt => Some(CompareOp::Lt),
+        LtEq => Some(CompareOp::Le),
+        Gt => Some(CompareOp::Gt),
+        GtEq => Some(CompareOp::Ge),
+        _ => None,
+    }
+}
+
+/// Parses a `WHERE` clause into a conjunction of `column <op> literal`
+/// predicates (AND only; other expressions are ignored).
+fn parse_predicates(selection: &Option<sqlparser::ast::Expr>) -> Vec<Predicate> {
+    let mut out = Vec::new();
+    if let Some(expr) = selection {
+        collect_predicates(expr, &mut out);
+    }
+    out
+}
+
+fn collect_predicates(expr: &sqlparser::ast::Expr, out: &mut Vec<Predicate>) {
     use sqlparser::ast::{BinaryOperator, Expr};
-    if let Some(Expr::BinaryOp { left, op, right }) = selection {
-        if *op == BinaryOperator::Eq {
-            if let (Expr::Identifier(col), Some(val)) = (&**left, expr_to_string(right)) {
-                return Some((col.value.clone(), val));
+    match expr {
+        Expr::Nested(inner) => collect_predicates(inner, out),
+        Expr::BinaryOp { left, op, right } if *op == BinaryOperator::And => {
+            collect_predicates(left, out);
+            collect_predicates(right, out);
+        }
+        Expr::BinaryOp { left, op, right } => {
+            if let (Some(cmp), Expr::Identifier(col), Some(val)) =
+                (compare_op(op), &**left, expr_to_string(right))
+            {
+                out.push(Predicate {
+                    column: col.value.clone(),
+                    op: cmp,
+                    value: val,
+                });
             }
         }
+        _ => {}
     }
-    None
 }
 
 fn plan_query(query: &sqlparser::ast::Query) -> Result<LogicalPlan> {
@@ -310,10 +379,24 @@ fn plan_query(query: &sqlparser::ast::Query) -> Result<LogicalPlan> {
         }
     }
 
+    // ORDER BY first column, if present.
+    let order_by = query.order_by.first().and_then(|o| match &o.expr {
+        Expr::Identifier(id) => Some((id.value.clone(), o.asc.unwrap_or(true))),
+        _ => None,
+    });
+
+    // LIMIT <n>.
+    let limit = query.limit.as_ref().and_then(|e| match e {
+        Expr::Value(Value::Number(n, _)) => n.parse::<usize>().ok(),
+        _ => None,
+    });
+
     Ok(LogicalPlan::Select {
         table_name,
         projection,
-        filter: single_eq_filter(&select.selection),
+        filter: parse_predicates(&select.selection),
+        order_by,
+        limit,
     })
 }
 
@@ -491,18 +574,24 @@ impl MemExecutor {
         &self,
         row: &[Value],
         columns: &[ColumnDescriptor],
-        filter: &Option<(String, String)>,
+        filter: &[Predicate],
     ) -> bool {
-        match filter {
-            None => true,
-            Some((fcol, fval)) => match columns.iter().position(|c| &c.name == fcol) {
-                Some(idx) => {
-                    let target = coerce(fval, column_type(&columns[idx].data_type));
-                    row.get(idx).map(|v| *v == target).unwrap_or(false)
-                }
-                None => false,
-            },
-        }
+        filter.iter().all(|p| {
+            let Some(idx) = columns.iter().position(|c| c.name == p.column) else {
+                return false;
+            };
+            let target = coerce(&p.value, column_type(&columns[idx].data_type));
+            let cell = row.get(idx).unwrap_or(&Value::Null);
+            let ord = compare(cell, &target);
+            match p.op {
+                CompareOp::Eq => *cell == target,
+                CompareOp::Ne => *cell != target,
+                CompareOp::Lt => ord == std::cmp::Ordering::Less,
+                CompareOp::Le => ord != std::cmp::Ordering::Greater,
+                CompareOp::Gt => ord == std::cmp::Ordering::Greater,
+                CompareOp::Ge => ord != std::cmp::Ordering::Less,
+            }
+        })
     }
 
     /// Deny-by-default authorization gate for a single action on a resource.
@@ -637,6 +726,8 @@ impl Executor for MemExecutor {
                 table_name,
                 projection,
                 filter,
+                order_by,
+                limit,
             } => {
                 let tbl = self
                     .catalog_reader
@@ -646,14 +737,23 @@ impl Executor for MemExecutor {
                 let col_names: Vec<String> = tbl.columns.iter().map(|c| c.name.clone()).collect();
                 let mut stored_rows = self.scan_rows(tbl.id)?;
 
-                // Apply the optional equality filter (typed comparison).
-                if let Some((fcol, fval)) = &filter {
-                    if let Some(idx) = col_names.iter().position(|c| c == fcol) {
-                        let target = coerce(fval, column_type(&tbl.columns[idx].data_type));
-                        stored_rows.retain(|r| r.get(idx).map(|v| *v == target).unwrap_or(false));
-                    } else {
-                        stored_rows.clear();
-                    }
+                // WHERE: conjunction of typed predicates.
+                stored_rows.retain(|r| self.row_matches(r, &tbl.columns, &filter));
+
+                // ORDER BY a column (typed compare), then LIMIT.
+                if let Some((ocol, asc)) = &order_by
+                    && let Some(idx) = col_names.iter().position(|c| c == ocol)
+                {
+                    stored_rows.sort_by(|a, b| {
+                        let ord = compare(
+                            a.get(idx).unwrap_or(&Value::Null),
+                            b.get(idx).unwrap_or(&Value::Null),
+                        );
+                        if *asc { ord } else { ord.reverse() }
+                    });
+                }
+                if let Some(n) = limit {
+                    stored_rows.truncate(n);
                 }
 
                 // Resolve projection (empty = all columns).
@@ -832,6 +932,14 @@ mod tests {
             .collect()
     }
 
+    fn eq(col: &str, val: &str) -> Vec<Predicate> {
+        vec![Predicate {
+            column: col.to_string(),
+            op: CompareOp::Eq,
+            value: val.to_string(),
+        }]
+    }
+
     #[test]
     fn create_table_denied_then_allowed_by_grant() {
         let audit = Arc::new(MemoryAuditSink::new());
@@ -919,7 +1027,9 @@ mod tests {
                 LogicalPlan::Select {
                     table_name: "books".into(),
                     projection: vec![],
-                    filter: None,
+                    filter: vec![],
+                    order_by: None,
+                    limit: None,
                 },
             )
             .unwrap();
@@ -933,7 +1043,9 @@ mod tests {
                 LogicalPlan::Select {
                     table_name: "books".into(),
                     projection: vec!["title".into(), "author".into()],
-                    filter: Some(("id".into(), "2".into())),
+                    filter: eq("id", "2"),
+                    order_by: None,
+                    limit: None,
                 },
             )
             .unwrap();
@@ -985,7 +1097,9 @@ mod tests {
                 LogicalPlan::Select {
                     table_name: "items".into(),
                     projection: vec![],
-                    filter: Some(("id".into(), "7".into())),
+                    filter: eq("id", "7"),
+                    order_by: None,
+                    limit: None,
                 },
             )
             .unwrap();
@@ -1039,27 +1153,26 @@ mod tests {
                 LogicalPlan::Update {
                     table_name: "t".into(),
                     assignments: vec![("name".into(), "B".into())],
-                    filter: Some(("id".into(), "2".into())),
+                    filter: eq("id", "2"),
                 },
             )
             .unwrap();
         assert_eq!(out.tag, "UPDATE 1");
 
-        let read = |filter: Option<(String, String)>| {
+        let read = |filter: Vec<Predicate>| {
             exec.execute_logical(
                 &ctx,
                 LogicalPlan::Select {
                     table_name: "t".into(),
                     projection: vec!["name".into()],
                     filter,
+                    order_by: None,
+                    limit: None,
                 },
             )
             .unwrap()
         };
-        assert_eq!(
-            read(Some(("id".into(), "2".into()))).rows[0].columns,
-            vec!["B"]
-        );
+        assert_eq!(read(eq("id", "2")).rows[0].columns, vec!["B"]);
 
         // DELETE one row, then confirm it's gone and the rest remain.
         let out = exec
@@ -1067,13 +1180,13 @@ mod tests {
                 &ctx,
                 LogicalPlan::Delete {
                     table_name: "t".into(),
-                    filter: Some(("id".into(), "1".into())),
+                    filter: eq("id", "1"),
                 },
             )
             .unwrap();
         assert_eq!(out.tag, "DELETE 1");
-        assert_eq!(read(Some(("id".into(), "1".into()))).rows.len(), 0);
-        assert_eq!(read(None).rows.len(), 2);
+        assert_eq!(read(eq("id", "1")).rows.len(), 0);
+        assert_eq!(read(vec![]).rows.len(), 2);
     }
 
     #[test]

@@ -66,6 +66,60 @@ async fn test_arbitrary_table_sql() {
 }
 
 #[tokio::test]
+async fn test_where_order_limit() {
+    let server = TestServer::start().await.expect("server starts");
+    let client = connect(&server).await;
+
+    client
+        .simple_query("CREATE TABLE scores (id INT PRIMARY KEY, points INT);")
+        .await
+        .unwrap();
+    for (id, pts) in [("1", "30"), ("2", "10"), ("3", "50"), ("4", "20")] {
+        client
+            .simple_query(&format!(
+                "INSERT INTO scores (id, points) VALUES ({id}, {pts});"
+            ))
+            .await
+            .unwrap();
+    }
+
+    // Comparison + ORDER BY DESC + LIMIT, numeric (not lexical) ordering.
+    let msgs = client
+        .simple_query("SELECT id FROM scores WHERE points > 15 ORDER BY points DESC LIMIT 2;")
+        .await
+        .unwrap();
+    let rows = rows_of(&msgs);
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].get(0).unwrap(), "3"); // 50
+    assert_eq!(rows[1].get(0).unwrap(), "1"); // 30
+
+    // Conjunction (AND) of predicates.
+    let msgs = client
+        .simple_query("SELECT id FROM scores WHERE points >= 10 AND id < 3;")
+        .await
+        .unwrap();
+    let mut ids: Vec<String> = rows_of(&msgs)
+        .iter()
+        .map(|r| r.get(0).unwrap().to_string())
+        .collect();
+    ids.sort();
+    assert_eq!(ids, vec!["1", "2"]);
+
+    // UPDATE then DELETE through the wire.
+    let msgs = client
+        .simple_query("UPDATE scores SET points = 0 WHERE id = 2;")
+        .await
+        .unwrap();
+    assert!(matches!(&msgs[0], SimpleQueryMessage::CommandComplete(_)));
+    client
+        .simple_query("DELETE FROM scores WHERE id = 4;")
+        .await
+        .unwrap();
+    let msgs = client.simple_query("SELECT id FROM scores;").await.unwrap();
+    assert_eq!(rows_of(&msgs).len(), 3);
+}
+
+#[tokio::test]
 async fn test_pgwire_queries() {
     let server = TestServer::start().await.expect("Failed to start server");
 
