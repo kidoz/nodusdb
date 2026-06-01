@@ -1347,6 +1347,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "nodus_backup"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bytes",
+ "chrono",
+ "nodus_catalog",
+ "nodus_monitoring",
+ "nodus_storage_api",
+ "serde",
+ "thiserror",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "nodus_catalog"
 version = "0.1.0"
 dependencies = [
