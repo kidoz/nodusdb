@@ -1,0 +1,15 @@
+[package]
+name = "nodus_sharding"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+bytes.workspace = true
+nodus_catalog = { path = "../nodus_catalog" }
+nodus_storage_api = { path = "../nodus_storage_api" }

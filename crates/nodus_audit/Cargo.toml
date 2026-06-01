@@ -1,0 +1,15 @@
+[package]
+name = "nodus_audit"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+chrono.workspace = true
+nodus_catalog = { path = "../nodus_catalog" }
+nodus_security = { path = "../nodus_security" }

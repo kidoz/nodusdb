@@ -1,0 +1,19 @@
+[package]
+name = "nodus_web_console"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+axum.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+nodus_catalog = { path = "../nodus_catalog" }
+nodus_authz = { path = "../nodus_authz" }
+nodus_audit = { path = "../nodus_audit" }

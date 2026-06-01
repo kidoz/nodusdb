@@ -1,0 +1,12 @@
+[package]
+name = "nodus_sql"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+sqlparser.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true

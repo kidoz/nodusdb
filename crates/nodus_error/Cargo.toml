@@ -1,0 +1,10 @@
+[package]
+name = "nodus_error"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+thiserror.workspace = true

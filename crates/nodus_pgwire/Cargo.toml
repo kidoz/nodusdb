@@ -1,0 +1,19 @@
+[package]
+name = "nodus_pgwire"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+pgwire.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+postgres-types.workspace = true
+async-trait.workspace = true
+futures-util.workspace = true
+nodus_sql = { path = "../nodus_sql" }
+nodus_executor = { path = "../nodus_executor" }

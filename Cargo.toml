@@ -1,0 +1,60 @@
+[workspace]
+members = [
+    "crates/nodus_server",
+    "crates/nodus_cli",
+    "crates/nodus_common",
+    "crates/nodus_config",
+    "crates/nodus_error",
+    "crates/nodus_monitoring",
+    "crates/nodus_testkit",
+    "crates/nodus_pgwire",
+    "crates/nodus_sql",
+    "crates/nodus_executor",
+    "crates/nodus_catalog",
+    "crates/nodus_meta",
+    "crates/nodus_sharding",
+    "crates/nodus_upgrade",
+    "crates/nodus_security",
+    "crates/nodus_authz",
+    "crates/nodus_audit",
+    "crates/nodus_web_console",
+    "crates/nodus_storage_api",
+    "crates/nodus_storage_mem",
+    "crates/nodus_storage_wal",
+    "crates/nodus_mvcc",
+    "crates/nodus_index",
+    "crates/nodus_txn",
+    "crates/nodus_raftstore",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["Aleksandr Pavlov <ckidoz@gmail.com>"]
+license = "MIT"
+repository = "https://github.com/kidoz/nodusdb"
+
+[workspace.dependencies]
+tokio = { version = "1.37.0", features = ["full"] }
+axum = "0.7.5"
+tracing = "0.1.40"
+tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
+thiserror = "1.0.58"
+anyhow = "1.0.81"
+clap = { version = "4.5.4", features = ["derive"] }
+serde = { version = "1.0.197", features = ["derive"] }
+serde_json = "1.0.115"
+prometheus-client = "0.22.2"
+reqwest = { version = "0.12.3", features = ["json"] }
+figment = { version = "0.10.15", features = ["toml", "env"] }
+pgwire = "0.23.0"
+sqlparser = "0.45.0"
+postgres-types = { version = "0.2.6", features = ["derive"] }
+tokio-postgres = "0.7.10"
+async-trait = "0.1.80"
+futures-util = "0.3.30"
+uuid = { version = "1.8.0", features = ["v4", "serde"] }
+chrono = { version = "0.4.38", features = ["serde"] }
+bytes = "1.6.0"
+openraft = { version = "0.9.16", features = ["serde"] }

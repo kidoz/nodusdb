@@ -1,0 +1,12 @@
+[package]
+name = "nodus_testkit"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+reqwest.workspace = true
+tokio.workspace = true
+tokio-postgres.workspace = true

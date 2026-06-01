@@ -1,0 +1,20 @@
+[package]
+name = "nodus_server"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+tokio.workspace = true
+axum.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+nodus_common = { path = "../nodus_common" }
+nodus_config = { path = "../nodus_config" }
+nodus_error = { path = "../nodus_error" }
+nodus_monitoring = { path = "../nodus_monitoring" }
+nodus_pgwire = { path = "../nodus_pgwire" }
+nodus_web_console = { path = "../nodus_web_console" }
