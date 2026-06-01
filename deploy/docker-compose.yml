@@ -21,6 +21,7 @@ services:
       - "9090:9090"
     volumes:
       - ./docker/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./docker/alerts.yml:/etc/prometheus/alerts.yml:ro
     depends_on:
       - nodusd
 

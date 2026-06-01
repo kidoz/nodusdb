@@ -1,0 +1,58 @@
+{
+  "title": "NodusDB Overview",
+  "uid": "nodusdb-overview",
+  "schemaVersion": 39,
+  "timezone": "browser",
+  "refresh": "15s",
+  "time": { "from": "now-1h", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "instance",
+        "type": "query",
+        "datasource": "Prometheus",
+        "query": "label_values(up{job=\"nodusd\"}, instance)",
+        "includeAll": true,
+        "multi": true
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Query throughput (qps)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "targets": [
+        { "expr": "rate(nodus_queries_total{instance=~\"$instance\"}[1m])", "legendFormat": "{{instance}}" }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Query error rate",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "targets": [
+        { "expr": "rate(nodus_query_errors_total{instance=~\"$instance\"}[1m])", "legendFormat": "{{instance}}" }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Active sessions",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "targets": [
+        { "expr": "nodus_active_sessions{instance=~\"$instance\"}", "legendFormat": "{{instance}}" }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Total connections accepted",
+      "type": "stat",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "targets": [
+        { "expr": "sum(nodus_pgwire_connections_total{instance=~\"$instance\"})" }
+      ]
+    }
+  ]
+}
