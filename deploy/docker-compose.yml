@@ -1,0 +1,42 @@
+# Local development stack: one nodusd node, Prometheus, and MinIO (for backup
+# testing). Bring up with: docker compose -f deploy/docker-compose.yml up --build
+services:
+  nodusd:
+    build:
+      context: ..
+      dockerfile: deploy/docker/Dockerfile
+    ports:
+      - "5432:5432"   # PostgreSQL wire protocol
+      - "8088:8088"   # HTTP admin / metrics / web console
+    environment:
+      NODUS_OBSERVABILITY__LOG_LEVEL: info
+      NODUS_BACKUP__REPOSITORY_URI: "file:///var/lib/nodus/backups"
+    volumes:
+      - nodus-data:/var/lib/nodus/data
+      - nodus-backups:/var/lib/nodus/backups
+
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./docker/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    depends_on:
+      - nodusd
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: nodus
+      MINIO_ROOT_PASSWORD: nodus-secret
+    volumes:
+      - minio-data:/data
+
+volumes:
+  nodus-data:
+  nodus-backups:
+  minio-data:

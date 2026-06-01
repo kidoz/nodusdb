@@ -1,0 +1,22 @@
+# Example NodusDB configuration. Every value here is also overridable via
+# environment variables prefixed with NODUS_ (double underscore for nesting),
+# e.g. NODUS_SERVER__HTTP_ADDR=0.0.0.0:8088.
+
+[server]
+pgwire_addr = "127.0.0.1:5432"
+http_addr = "127.0.0.1:8088"
+max_connections = 100
+
+[tls]
+enabled = false
+# cert_path = "/etc/nodus/tls/server.crt"
+# key_path = "/etc/nodus/tls/server.key"
+
+[backup]
+# Required in production. Empty disables backups.
+repository_uri = "file:///var/lib/nodus/backups"
+
+[observability]
+metrics_enabled = true
+log_level = "info"
+log_redaction = true

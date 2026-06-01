@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "nodusdb.fullname" . }}
+  labels:
+    {{- include "nodusdb.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  clusterIP: None   # headless, for stable StatefulSet DNS
+  selector:
+    {{- include "nodusdb.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: pgwire
+      port: {{ .Values.service.pgwirePort }}
+      targetPort: pgwire
+    - name: http
+      port: {{ .Values.service.httpPort }}
+      targetPort: http

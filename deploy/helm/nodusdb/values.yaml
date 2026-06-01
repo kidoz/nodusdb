@@ -1,0 +1,36 @@
+replicaCount: 3
+
+image:
+  repository: ghcr.io/kidoz/nodusdb
+  tag: ""          # defaults to .Chart.AppVersion
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  pgwirePort: 5432
+  httpPort: 8088
+
+# Mounted at /etc/nodus/nodus.toml. Values here become the node config.
+config:
+  logLevel: info
+  maxConnections: 100
+  backupRepositoryUri: "file:///var/lib/nodus/backups"
+
+persistence:
+  enabled: true
+  size: 10Gi
+  # storageClass: ""
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 2
+
+# Emit a Prometheus Operator ServiceMonitor.
+serviceMonitor:
+  enabled: false
+  interval: 15s
+
+resources: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}

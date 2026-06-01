@@ -1,0 +1,24 @@
+[Unit]
+Description=NodusDB server (nodusd)
+Documentation=https://github.com/kidoz/nodusdb
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nodus
+Group=nodus
+Environment=NODUS_CONFIG=/etc/nodus/nodus.toml
+ExecStart=/usr/local/bin/nodus_server
+Restart=on-failure
+RestartSec=5s
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/nodus
+
+[Install]
+WantedBy=multi-user.target

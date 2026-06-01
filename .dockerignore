@@ -1,0 +1,7 @@
+target/
+.git/
+frontend/node_modules/
+**/*.md
+.agents/
+.claude/
+.idea/

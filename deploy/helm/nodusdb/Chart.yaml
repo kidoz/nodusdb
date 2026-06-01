@@ -1,0 +1,9 @@
+apiVersion: v2
+name: nodusdb
+description: NodusDB — PostgreSQL-wire-compatible distributed SQL database
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+home: https://github.com/kidoz/nodusdb
+sources:
+  - https://github.com/kidoz/nodusdb
