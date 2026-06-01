@@ -123,12 +123,26 @@ impl Default for AppState {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VersionInfo {
+    pub name: String,
+    pub version: String,
+}
+
 pub fn monitoring_routes(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .route("/metrics", get(metrics))
+        .route("/api/v1/version", get(version))
         .with_state(state)
+}
+
+async fn version() -> axum::Json<VersionInfo> {
+    axum::Json(VersionInfo {
+        name: "nodusd".into(),
+        version: env!("CARGO_PKG_VERSION").into(),
+    })
 }
 
 async fn healthz() -> &'static str {
