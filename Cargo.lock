@@ -1535,14 +1535,17 @@ dependencies = [
  "anyhow",
  "async-trait",
  "futures-util",
+ "nodus_catalog",
  "nodus_executor",
  "nodus_monitoring",
+ "nodus_security",
  "nodus_sql",
  "pgwire",
  "postgres-types",
  "thiserror",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -1585,6 +1588,7 @@ dependencies = [
  "nodus_executor",
  "nodus_monitoring",
  "nodus_pgwire",
+ "nodus_security",
  "nodus_web_console",
  "tokio",
  "tower-http 0.5.2",
@@ -1655,6 +1659,7 @@ name = "nodus_testkit"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "nodus_security",
  "nodus_server",
  "reqwest",
  "thiserror",

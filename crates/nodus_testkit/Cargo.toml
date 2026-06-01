@@ -13,3 +13,4 @@ tokio-postgres.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 nodus_server = { path = "../nodus_server" }
+nodus_security = { path = "../nodus_security" }

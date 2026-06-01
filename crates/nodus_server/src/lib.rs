@@ -1,5 +1,6 @@
 use axum::Router;
 use nodus_monitoring::{AppState, monitoring_routes};
+use nodus_security::SessionRegistry;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -11,6 +12,8 @@ pub struct ServerHandle {
     pub http_addr: SocketAddr,
     pub pgwire_task: JoinHandle<anyhow::Result<()>>,
     pub http_task: JoinHandle<std::io::Result<()>>,
+    /// Shared registry of active client sessions (inspection + cancellation).
+    pub registry: Arc<SessionRegistry>,
 }
 
 pub async fn run_server(
@@ -25,10 +28,18 @@ pub async fn run_server(
         .is_ready
         .store(true, std::sync::atomic::Ordering::Release);
 
+    let registry = Arc::new(SessionRegistry::new());
     let pgwire_metrics = state.metrics.clone();
+    let pgwire_registry = registry.clone();
     let pgwire_task = tokio::spawn(async move {
         let executor = Arc::new(nodus_executor::MemExecutor::default());
-        nodus_pgwire::start_pgwire_server(pgwire_listener, executor, pgwire_metrics).await
+        nodus_pgwire::start_pgwire_server(
+            pgwire_listener,
+            executor,
+            pgwire_metrics,
+            pgwire_registry,
+        )
+        .await
     });
 
     let cors = CorsLayer::new()
@@ -48,5 +59,6 @@ pub async fn run_server(
         http_addr,
         pgwire_task,
         http_task,
+        registry,
     })
 }

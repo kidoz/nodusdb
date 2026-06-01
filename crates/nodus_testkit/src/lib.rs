@@ -1,12 +1,15 @@
 pub mod fault;
 
+use nodus_security::SessionRegistry;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
 pub struct TestServer {
     pub pgwire_addr: SocketAddr,
     pub http_addr: SocketAddr,
+    pub registry: Arc<SessionRegistry>,
     pgwire_task: JoinHandle<anyhow::Result<()>>,
     http_task: JoinHandle<std::io::Result<()>>,
 }
@@ -21,6 +24,7 @@ impl TestServer {
         Ok(Self {
             pgwire_addr: handle.pgwire_addr,
             http_addr: handle.http_addr,
+            registry: handle.registry,
             pgwire_task: handle.pgwire_task,
             http_task: handle.http_task,
         })

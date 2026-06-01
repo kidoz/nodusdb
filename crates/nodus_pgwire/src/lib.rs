@@ -1,11 +1,14 @@
 use std::fmt::Debug;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use futures_util::{Sink, stream};
 use tokio::net::TcpListener;
 use tracing::{error, info};
 
+use nodus_catalog::PrincipalId;
+use nodus_security::{Session, SessionRegistry};
 use pgwire::api::auth::noop::NoopStartupHandler;
 use pgwire::api::copy::NoopCopyHandler;
 use pgwire::api::query::{PlaceholderExtendedQueryHandler, SimpleQueryHandler};
@@ -14,11 +17,25 @@ use pgwire::api::{ClientInfo, PgWireHandlerFactory, Type};
 use pgwire::error::{PgWireError, PgWireResult};
 use pgwire::messages::PgWireBackendMessage;
 use pgwire::tokio::process_socket;
+use uuid::Uuid;
 
 pub struct NodusQueryHandler {
+    /// Unique per-connection session id, also the registry key.
+    pub session_id: String,
     pub session_state: nodus_sql::SessionState,
     pub executor: Arc<dyn nodus_executor::Executor>,
     pub metrics: nodus_monitoring::Metrics,
+    registry: Arc<SessionRegistry>,
+    /// Cancellation token for this session; flipped by an admin `kill`.
+    cancel: Arc<AtomicBool>,
+}
+
+impl Drop for NodusQueryHandler {
+    fn drop(&mut self) {
+        // The handler lives for the connection's lifetime (one per socket), so
+        // dropping it means the client disconnected.
+        self.registry.deregister(&self.session_id);
+    }
 }
 
 #[async_trait]
@@ -36,8 +53,15 @@ impl SimpleQueryHandler for NodusQueryHandler {
         info!("Received query: {}", query);
         self.metrics.queries_total.inc();
 
+        // Honor an administrative cancellation of this session.
+        if self.cancel.load(Ordering::SeqCst) {
+            self.metrics.query_errors_total.inc();
+            return Err(std::io::Error::other("session terminated by administrator").into());
+        }
+        self.registry.set_current_query(&self.session_id, query);
+
         let ctx = nodus_executor::ExecutionContext {
-            session_id: self.session_state.session_id.clone(),
+            session_id: self.session_id.clone(),
             authz_catalog_version: 1,
         };
 
@@ -219,7 +243,9 @@ impl SimpleQueryHandler for NodusQueryHandler {
 
 pub struct NodusPgWireServer {
     startup_handler: Arc<NoopStartupHandler>,
-    simple_query_handler: Arc<NodusQueryHandler>,
+    executor: Arc<dyn nodus_executor::Executor>,
+    metrics: nodus_monitoring::Metrics,
+    registry: Arc<SessionRegistry>,
     extended_query_handler: Arc<PlaceholderExtendedQueryHandler>,
     copy_handler: Arc<NoopCopyHandler>,
 }
@@ -230,8 +256,26 @@ impl PgWireHandlerFactory for NodusPgWireServer {
     type ExtendedQueryHandler = PlaceholderExtendedQueryHandler;
     type CopyHandler = NoopCopyHandler;
 
+    // Called once per connection by `process_socket`, so each client gets its
+    // own session registered in the shared registry.
     fn simple_query_handler(&self) -> Arc<Self::SimpleQueryHandler> {
-        self.simple_query_handler.clone()
+        let session_id = Uuid::new_v4().to_string();
+        // Anonymous until authentication is wired into the startup handler.
+        let session = Session {
+            session_id: session_id.clone(),
+            principal_id: PrincipalId::new(),
+            active_roles: vec![],
+            database_id: None,
+        };
+        let cancel = self.registry.register(&session);
+        Arc::new(NodusQueryHandler {
+            session_id,
+            session_state: nodus_sql::SessionState::default(),
+            executor: self.executor.clone(),
+            metrics: self.metrics.clone(),
+            registry: self.registry.clone(),
+            cancel,
+        })
     }
 
     fn extended_query_handler(&self) -> Arc<Self::ExtendedQueryHandler> {
@@ -251,14 +295,13 @@ pub async fn start_pgwire_server(
     listener: TcpListener,
     executor: Arc<dyn nodus_executor::Executor>,
     metrics: nodus_monitoring::Metrics,
+    registry: Arc<SessionRegistry>,
 ) -> anyhow::Result<()> {
     let factory = Arc::new(NodusPgWireServer {
         startup_handler: Arc::new(NoopStartupHandler),
-        simple_query_handler: Arc::new(NodusQueryHandler {
-            session_state: nodus_sql::SessionState::default(),
-            executor,
-            metrics: metrics.clone(),
-        }),
+        executor,
+        metrics: metrics.clone(),
+        registry,
         extended_query_handler: Arc::new(PlaceholderExtendedQueryHandler),
         copy_handler: Arc::new(NoopCopyHandler),
     });

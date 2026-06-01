@@ -18,3 +18,6 @@ futures-util.workspace = true
 nodus_sql = { path = "../nodus_sql" }
 nodus_executor = { path = "../nodus_executor" }
 nodus_monitoring = { path = "../nodus_monitoring" }
+nodus_security = { path = "../nodus_security" }
+nodus_catalog = { path = "../nodus_catalog" }
+uuid.workspace = true

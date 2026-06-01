@@ -20,3 +20,4 @@ nodus_monitoring = { path = "../nodus_monitoring" }
 nodus_pgwire = { path = "../nodus_pgwire" }
 nodus_web_console = { path = "../nodus_web_console" }
 nodus_executor = { path = "../nodus_executor" }
+nodus_security = { path = "../nodus_security" }

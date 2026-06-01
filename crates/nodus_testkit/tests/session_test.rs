@@ -1,0 +1,51 @@
+use nodus_testkit::TestServer;
+use std::time::Duration;
+use tokio_postgres::NoTls;
+
+async fn connect(addr: &std::net::SocketAddr) -> tokio_postgres::Client {
+    let conn_str = format!(
+        "host={} port={} user=nodus dbname=default",
+        addr.ip(),
+        addr.port()
+    );
+    for _ in 0..30 {
+        if let Ok((client, connection)) = tokio_postgres::connect(&conn_str, NoTls).await {
+            tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            return client;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("could not connect to pgwire");
+}
+
+#[tokio::test]
+async fn pgwire_sessions_are_per_connection_and_killable() {
+    let server = TestServer::start().await.expect("server starts");
+
+    // Two independent connections => two distinct registered sessions.
+    let client_a = connect(&server.pgwire_addr).await;
+    let client_b = connect(&server.pgwire_addr).await;
+    client_a.simple_query("SELECT 1").await.unwrap();
+    client_b.simple_query("SELECT 1").await.unwrap();
+
+    let sessions = server.registry.list();
+    assert_eq!(
+        sessions.len(),
+        2,
+        "each connection registers its own session"
+    );
+    assert_ne!(sessions[0].session_id, sessions[1].session_id);
+    // The most recent statement is visible to the inspector.
+    assert!(sessions.iter().all(|s| s.current_query.is_some()));
+
+    // Killing every session causes in-flight connections to fail their next query.
+    for s in &sessions {
+        assert!(server.registry.kill(&s.session_id));
+    }
+    assert!(
+        client_a.simple_query("SELECT 1").await.is_err(),
+        "a killed session must reject further queries"
+    );
+}
