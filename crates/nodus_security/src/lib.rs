@@ -1,7 +1,9 @@
+use chrono::{DateTime, Utc};
 use nodus_catalog::{CatalogReader, DatabaseId, PrincipalId, RoleId};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use uuid::Uuid;
 
@@ -11,6 +13,106 @@ pub struct Session {
     pub principal_id: PrincipalId,
     pub active_roles: Vec<RoleId>,
     pub database_id: Option<DatabaseId>,
+}
+
+/// A point-in-time snapshot of an active session for the admin inspector.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionInfo {
+    pub session_id: String,
+    pub principal_id: PrincipalId,
+    pub current_query: Option<String>,
+    pub started_at: DateTime<Utc>,
+    pub cancelled: bool,
+}
+
+struct SessionEntry {
+    principal_id: PrincipalId,
+    current_query: Option<String>,
+    started_at: DateTime<Utc>,
+    cancel: Arc<AtomicBool>,
+}
+
+/// Tracks live client sessions so operators can inspect and cancel them.
+///
+/// `register` hands back a cancellation token the session's work loop should
+/// poll between statements; `kill` flips that token. This is the mechanism
+/// behind the admin "active queries" view and `KILL`/`pg_terminate_backend`.
+#[derive(Default)]
+pub struct SessionRegistry {
+    sessions: RwLock<HashMap<String, SessionEntry>>,
+}
+
+impl SessionRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Registers a session and returns its cancellation token.
+    pub fn register(&self, session: &Session) -> Arc<AtomicBool> {
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.sessions.write().unwrap().insert(
+            session.session_id.clone(),
+            SessionEntry {
+                principal_id: session.principal_id,
+                current_query: None,
+                started_at: Utc::now(),
+                cancel: cancel.clone(),
+            },
+        );
+        cancel
+    }
+
+    pub fn deregister(&self, session_id: &str) {
+        self.sessions.write().unwrap().remove(session_id);
+    }
+
+    pub fn set_current_query(&self, session_id: &str, sql: impl Into<String>) {
+        if let Some(e) = self.sessions.write().unwrap().get_mut(session_id) {
+            e.current_query = Some(sql.into());
+        }
+    }
+
+    pub fn clear_current_query(&self, session_id: &str) {
+        if let Some(e) = self.sessions.write().unwrap().get_mut(session_id) {
+            e.current_query = None;
+        }
+    }
+
+    /// Requests cancellation of a session. Returns false if it is not known.
+    pub fn kill(&self, session_id: &str) -> bool {
+        match self.sessions.read().unwrap().get(session_id) {
+            Some(e) => {
+                e.cancel.store(true, Ordering::SeqCst);
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub fn is_cancelled(&self, session_id: &str) -> bool {
+        self.sessions
+            .read()
+            .unwrap()
+            .get(session_id)
+            .map(|e| e.cancel.load(Ordering::SeqCst))
+            .unwrap_or(false)
+    }
+
+    /// Lists active sessions for the inspector.
+    pub fn list(&self) -> Vec<SessionInfo> {
+        self.sessions
+            .read()
+            .unwrap()
+            .iter()
+            .map(|(id, e)| SessionInfo {
+                session_id: id.clone(),
+                principal_id: e.principal_id,
+                current_query: e.current_query.clone(),
+                started_at: e.started_at,
+                cancelled: e.cancel.load(Ordering::SeqCst),
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -165,6 +267,32 @@ mod tests {
             auth.authenticate("nobody", "x"),
             Err(AuthError::UnknownUser(_))
         ));
+    }
+
+    #[test]
+    fn session_registry_inspect_and_kill() {
+        let reg = SessionRegistry::new();
+        let session = Session {
+            session_id: "s1".into(),
+            principal_id: PrincipalId::new(),
+            active_roles: vec![],
+            database_id: None,
+        };
+        let token = reg.register(&session);
+        reg.set_current_query("s1", "SELECT 1");
+
+        let listed = reg.list();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].current_query.as_deref(), Some("SELECT 1"));
+        assert!(!token.load(Ordering::SeqCst));
+
+        assert!(reg.kill("s1"));
+        assert!(reg.is_cancelled("s1"));
+        assert!(token.load(Ordering::SeqCst)); // the running session observes it
+        assert!(!reg.kill("missing"));
+
+        reg.deregister("s1");
+        assert!(reg.list().is_empty());
     }
 
     #[test]
