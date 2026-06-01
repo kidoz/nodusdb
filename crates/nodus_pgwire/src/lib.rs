@@ -154,6 +154,9 @@ impl SimpleQueryHandler for NodusQueryHandler {
         }
         self.registry.set_current_query(&self.session_id, query);
 
+        // OpenTelemetry span covering the statement (no-op unless OTLP is on).
+        let _otel_span = nodus_telemetry::start_span("pgwire.simple_query");
+
         // Times the whole statement regardless of which branch returns.
         let _timer = QueryTimer {
             start: std::time::Instant::now(),

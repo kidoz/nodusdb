@@ -81,6 +81,9 @@ pub struct ObservabilityConfig {
     pub log_level: String,
     /// Redact potentially sensitive values (query literals, secrets) from logs.
     pub log_redaction: bool,
+    /// OTLP HTTP endpoint for trace export (e.g. `http://127.0.0.1:4318`). When
+    /// unset, tracing spans are no-ops.
+    pub otlp_endpoint: Option<String>,
 }
 
 impl Default for NodusConfig {
@@ -131,6 +134,7 @@ impl Default for ObservabilityConfig {
             metrics_enabled: true,
             log_level: "info".into(),
             log_redaction: true,
+            otlp_endpoint: None,
         }
     }
 }

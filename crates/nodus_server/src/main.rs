@@ -29,6 +29,15 @@ async fn main() -> anyhow::Result<()> {
         info!("TLS configured (termination wired separately)");
     }
 
+    // Install OpenTelemetry trace export when an OTLP endpoint is configured.
+    let _otel_provider = match &config.observability.otlp_endpoint {
+        Some(endpoint) => {
+            info!("Exporting traces via OTLP to {endpoint}");
+            Some(nodus_telemetry::init_otlp(endpoint)?)
+        }
+        None => None,
+    };
+
     let pgwire_listener = TcpListener::bind(&config.server.pgwire_addr).await?;
     let http_listener = TcpListener::bind(&config.server.http_addr).await?;
 

@@ -1,0 +1,14 @@
+[package]
+name = "nodus_telemetry"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+tokio.workspace = true
+opentelemetry = "0.27"
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio", "testing"] }
+opentelemetry-otlp = { version = "0.27", default-features = false, features = ["trace", "http-proto", "reqwest-client"] }
