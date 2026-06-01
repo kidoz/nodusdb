@@ -55,6 +55,11 @@ enum Commands {
         #[command(subcommand)]
         cmd: ShardCmd,
     },
+    /// Show recent slow queries
+    Queries {
+        #[arg(long, default_value = DEFAULT_ADDR)]
+        addr: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -447,6 +452,28 @@ async fn main() -> anyhow::Result<()> {
             }
             let v: serde_json::Value = req.send().await?.error_for_status()?.json().await?;
             println!("{}", serde_json::to_string_pretty(&v)?);
+        }
+        Commands::Queries { addr } => {
+            let rows: serde_json::Value = client
+                .get(format!("{addr}/api/v1/queries"))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            let empty = vec![];
+            let arr = rows.as_array().unwrap_or(&empty);
+            if arr.is_empty() {
+                println!("No slow queries recorded.");
+            }
+            for q in arr {
+                println!(
+                    "{} ms  session={}  {}",
+                    q["duration_ms"].as_u64().unwrap_or(0),
+                    q["session_id"].as_str().unwrap_or("?"),
+                    q["sql"].as_str().unwrap_or("?")
+                );
+            }
         }
     }
 

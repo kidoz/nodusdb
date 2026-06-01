@@ -138,9 +138,13 @@ pub async fn run_server_with_config(
         }
     });
 
+    // Slow-query log: queries slower than 200ms are retained (most recent 100).
+    let slow_log = Arc::new(nodus_monitoring::SlowQueryLog::new(100, 200));
+
     let registry = Arc::new(SessionRegistry::new());
     let pgwire_metrics = state.metrics.clone();
     let pgwire_registry = registry.clone();
+    let pgwire_slow_log = slow_log.clone();
     let pgwire_task = tokio::spawn(async move {
         nodus_pgwire::start_pgwire_server(
             pgwire_listener,
@@ -148,6 +152,7 @@ pub async fn run_server_with_config(
             pgwire_metrics,
             pgwire_registry,
             authenticator,
+            pgwire_slow_log,
             tls_acceptor,
         )
         .await
@@ -184,6 +189,7 @@ pub async fn run_server_with_config(
         backup,
         upgrade,
         shards,
+        slow_log,
     };
     let app = Router::new()
         .merge(monitoring_routes(state))

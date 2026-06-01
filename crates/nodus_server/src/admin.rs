@@ -10,6 +10,7 @@ use nodus_audit::{AuditEvent, AuditQuery, AuditQueryable, MemoryAuditSink};
 use nodus_authz::{Action, AuthzContext, AuthzEngine, AuthzExplanation, AuthzRequest};
 use nodus_backup::{BackupObject, BackupOrchestrator};
 use nodus_catalog::{CatalogReader, PrincipalId, ResourceRef, ShardId, TableId};
+use nodus_monitoring::{SlowQuery, SlowQueryLog};
 use nodus_security::{SessionInfo, SessionRegistry};
 use nodus_sharding::ShardOrchestrator;
 use nodus_upgrade::{DefaultUpgradeCoordinator, UpgradeCoordinator};
@@ -29,6 +30,7 @@ pub struct AdminState {
     pub backup: Arc<BackupOrchestrator>,
     pub upgrade: Arc<DefaultUpgradeCoordinator>,
     pub shards: Arc<ShardOrchestrator>,
+    pub slow_log: Arc<SlowQueryLog>,
 }
 
 pub fn admin_routes(state: AdminState) -> Router {
@@ -49,7 +51,12 @@ pub fn admin_routes(state: AdminState) -> Router {
         .route("/api/v1/shards/:table", get(shards_map))
         .route("/api/v1/shards/:table/split", post(shards_split))
         .route("/api/v1/shards/:table/rebalance", post(shards_rebalance))
+        .route("/api/v1/queries", get(slow_queries))
         .with_state(state)
+}
+
+async fn slow_queries(State(state): State<AdminState>) -> Json<Vec<SlowQuery>> {
+    Json(state.slow_log.list())
 }
 
 async fn list_sessions(State(state): State<AdminState>) -> Json<Vec<SessionInfo>> {

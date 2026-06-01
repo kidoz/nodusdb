@@ -31,8 +31,34 @@ pub struct NodusQueryHandler {
     pub executor: Arc<dyn nodus_executor::Executor>,
     pub metrics: nodus_monitoring::Metrics,
     registry: Arc<SessionRegistry>,
+    slow_log: Arc<nodus_monitoring::SlowQueryLog>,
     /// Cancellation token for this session; flipped by an admin `kill`.
     cancel: Arc<AtomicBool>,
+}
+
+/// Observes query latency on drop, so every `do_query` return path is covered:
+/// records into the histogram and, if slow, into the slow-query log.
+struct QueryTimer<'a> {
+    start: std::time::Instant,
+    sql: &'a str,
+    session_id: &'a str,
+    metrics: &'a nodus_monitoring::Metrics,
+    slow_log: &'a nodus_monitoring::SlowQueryLog,
+}
+
+impl Drop for QueryTimer<'_> {
+    fn drop(&mut self) {
+        let elapsed = self.start.elapsed();
+        self.metrics
+            .query_latency_seconds
+            .observe(elapsed.as_secs_f64());
+        let ms = elapsed.as_millis() as u64;
+        if ms >= self.slow_log.threshold_ms() {
+            self.slow_log
+                .record(self.sql.to_string(), ms, self.session_id.to_string());
+            self.metrics.slow_queries_total.inc();
+        }
+    }
 }
 
 impl Drop for NodusQueryHandler {
@@ -127,6 +153,15 @@ impl SimpleQueryHandler for NodusQueryHandler {
             return Err(std::io::Error::other("session terminated by administrator").into());
         }
         self.registry.set_current_query(&self.session_id, query);
+
+        // Times the whole statement regardless of which branch returns.
+        let _timer = QueryTimer {
+            start: std::time::Instant::now(),
+            sql: query,
+            session_id: &self.session_id,
+            metrics: &self.metrics,
+            slow_log: &self.slow_log,
+        };
 
         // The authenticated principal was stashed in connection metadata by the
         // startup handler; carry it into the execution context for authorization.
@@ -325,6 +360,7 @@ pub struct NodusPgWireServer {
     executor: Arc<dyn nodus_executor::Executor>,
     metrics: nodus_monitoring::Metrics,
     registry: Arc<SessionRegistry>,
+    slow_log: Arc<nodus_monitoring::SlowQueryLog>,
     extended_query_handler: Arc<PlaceholderExtendedQueryHandler>,
     copy_handler: Arc<NoopCopyHandler>,
 }
@@ -353,6 +389,7 @@ impl PgWireHandlerFactory for NodusPgWireServer {
             executor: self.executor.clone(),
             metrics: self.metrics.clone(),
             registry: self.registry.clone(),
+            slow_log: self.slow_log.clone(),
             cancel,
         })
     }
@@ -376,6 +413,7 @@ pub async fn start_pgwire_server(
     metrics: nodus_monitoring::Metrics,
     registry: Arc<SessionRegistry>,
     authenticator: Arc<PasswordAuthenticator>,
+    slow_log: Arc<nodus_monitoring::SlowQueryLog>,
     tls: Option<Arc<tokio_rustls::TlsAcceptor>>,
 ) -> anyhow::Result<()> {
     let startup_handler = Arc::new(NodusStartupHandler {
@@ -387,6 +425,7 @@ pub async fn start_pgwire_server(
         executor,
         metrics: metrics.clone(),
         registry,
+        slow_log,
         extended_query_handler: Arc::new(PlaceholderExtendedQueryHandler),
         copy_handler: Arc::new(NoopCopyHandler),
     });

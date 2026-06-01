@@ -1,10 +1,12 @@
 use axum::{Router, http::StatusCode, routing::get};
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::gauge::Gauge;
+use prometheus_client::metrics::histogram::{Histogram, exponential_buckets};
 use prometheus_client::registry::Registry;
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, AtomicU32, Ordering},
 };
 
@@ -22,13 +24,30 @@ pub struct ClusterOverview {
 /// Server metrics registered into the Prometheus registry. The fields are
 /// cheap-to-clone handles (atomic-backed); incrementing a handle is reflected
 /// in the registry and surfaced on `/metrics`.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct Metrics {
     pub queries_total: Counter,
     pub query_errors_total: Counter,
     pub pgwire_connections_total: Counter,
     pub active_sessions: Gauge,
     pub vacuum_reclaimed_total: Counter,
+    pub slow_queries_total: Counter,
+    pub query_latency_seconds: Histogram,
+}
+
+impl Default for Metrics {
+    fn default() -> Self {
+        Self {
+            queries_total: Counter::default(),
+            query_errors_total: Counter::default(),
+            pgwire_connections_total: Counter::default(),
+            active_sessions: Gauge::default(),
+            vacuum_reclaimed_total: Counter::default(),
+            slow_queries_total: Counter::default(),
+            // ~0.5ms .. ~1s across 12 exponential buckets.
+            query_latency_seconds: Histogram::new(exponential_buckets(0.0005, 2.0, 12)),
+        }
+    }
 }
 
 impl Metrics {
@@ -59,7 +78,66 @@ impl Metrics {
             "Total MVCC versions reclaimed by background GC",
             m.vacuum_reclaimed_total.clone(),
         );
+        registry.register(
+            "nodus_slow_queries_total",
+            "Total queries exceeding the slow-query threshold",
+            m.slow_queries_total.clone(),
+        );
+        registry.register(
+            "nodus_query_latency_seconds",
+            "Query execution latency",
+            m.query_latency_seconds.clone(),
+        );
         m
+    }
+}
+
+/// A bounded, in-memory log of recent slow queries for the admin inspector.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SlowQuery {
+    pub sql: String,
+    pub duration_ms: u64,
+    pub session_id: String,
+}
+
+pub struct SlowQueryLog {
+    inner: Mutex<VecDeque<SlowQuery>>,
+    capacity: usize,
+    threshold_ms: u64,
+}
+
+impl SlowQueryLog {
+    pub fn new(capacity: usize, threshold_ms: u64) -> Self {
+        Self {
+            inner: Mutex::new(VecDeque::new()),
+            capacity,
+            threshold_ms,
+        }
+    }
+
+    pub fn threshold_ms(&self) -> u64 {
+        self.threshold_ms
+    }
+
+    /// Records a query if it met the slow threshold, evicting the oldest entry
+    /// when the buffer is full.
+    pub fn record(&self, sql: String, duration_ms: u64, session_id: String) {
+        if duration_ms < self.threshold_ms {
+            return;
+        }
+        let mut guard = self.inner.lock().unwrap();
+        if guard.len() >= self.capacity {
+            guard.pop_front();
+        }
+        guard.push_back(SlowQuery {
+            sql,
+            duration_ms,
+            session_id,
+        });
+    }
+
+    pub fn list(&self) -> Vec<SlowQuery> {
+        self.inner.lock().unwrap().iter().cloned().collect()
     }
 }
 

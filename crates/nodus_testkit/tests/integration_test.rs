@@ -46,6 +46,18 @@ async fn test_server_health_endpoints() {
         .await
         .expect("Failed to fetch metrics");
     assert!(res.status().is_success());
+    let metrics_body = res.text().await.unwrap();
+    assert!(metrics_body.contains("nodus_query_latency_seconds"));
+
+    // Slow-query log endpoint is available and returns a JSON array.
+    let res = client
+        .get(format!("http://{}/api/v1/queries", server.http_addr))
+        .send()
+        .await
+        .expect("Failed to fetch slow queries");
+    assert!(res.status().is_success());
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert!(body.is_array());
 
     // Cluster overview is served from live ClusterState (single-node default).
     let res = client
