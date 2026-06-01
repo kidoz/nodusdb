@@ -24,3 +24,4 @@ nodus_storage_mem = { path = "../nodus_storage_mem" }
 bytes.workspace = true
 chrono.workspace = true
 sqlparser.workspace = true
+serde_json.workspace = true

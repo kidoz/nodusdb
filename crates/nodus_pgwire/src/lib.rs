@@ -182,179 +182,52 @@ impl SimpleQueryHandler for NodusQueryHandler {
             authz_catalog_version: 1,
         };
 
-        // Minimal AST path
-        match nodus_sql::parse_sql(query) {
-            Ok(ast) => {
-                info!("Parsed AST: {:?}", ast);
-                // In MVP, we are skipping the full translation and just mapping matching strings below.
-            }
+        // Parse SQL and translate to a logical plan. Unsupported/unparseable
+        // statements are accepted as no-ops so clients (psql, drivers) that send
+        // SET/discovery queries don't break the connection.
+        let stmt = match nodus_sql::parse_sql(query) {
+            Ok(mut stmts) if !stmts.is_empty() => stmts.remove(0),
+            Ok(_) => return Ok(vec![Response::Execution(Tag::new("OK"))]),
             Err(e) => {
                 error!("Failed to parse SQL: {}", e);
                 self.metrics.query_errors_total.inc();
+                return Ok(vec![Response::Execution(Tag::new("OK"))]);
             }
+        };
+        let plan = match nodus_executor::plan_statement(&stmt) {
+            Ok(plan) => plan,
+            Err(_) => return Ok(vec![Response::Execution(Tag::new("OK"))]),
+        };
+
+        let out = self
+            .executor
+            .execute_logical(&ctx, plan)
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+
+        // No projected columns => a command tag (CREATE TABLE, INSERT, BEGIN…).
+        if out.columns.is_empty() {
+            return Ok(vec![Response::Execution(Tag::new(&out.tag))]);
         }
 
-        let query_upper = query.trim().to_uppercase();
-
-        if query_upper.starts_with("CREATE TABLE") {
-            let table_name = "users".to_string(); // MVP hardcode parsing
-            let _res = self
-                .executor
-                .execute_logical(
-                    &ctx,
-                    nodus_executor::LogicalPlan::CreateTable { name: table_name },
-                )
-                .map_err(|e| std::io::Error::other(e.to_string()))?;
-            return Ok(vec![Response::Execution(Tag::new("CREATE TABLE"))]);
-        }
-
-        if query_upper.starts_with("INSERT INTO") {
-            // "INSERT INTO users (id, name) VALUES ('123', 'alice')"
-            // Very naive MVP parsing: split on 'VALUES'
-            let parts: Vec<&str> = query.split("VALUES").collect();
-            if parts.len() == 2 {
-                let vals = parts[1]
-                    .trim()
-                    .trim_matches(|c| c == '(' || c == ')' || c == ';');
-                let vals_split: Vec<&str> = vals.split(',').collect();
-                if vals_split.len() == 2 {
-                    let id = vals_split[0].trim().trim_matches('\'').to_string();
-                    let name = vals_split[1].trim().trim_matches('\'').to_string();
-                    self.executor
-                        .execute_logical(
-                            &ctx,
-                            nodus_executor::LogicalPlan::Insert {
-                                table_name: "users".into(),
-                                id,
-                                name_val: name,
-                            },
-                        )
-                        .map_err(|e| std::io::Error::other(e.to_string()))?;
-                    return Ok(vec![Response::Execution(Tag::new("INSERT 0 1"))]);
-                }
-            }
-        }
-
-        if query_upper.starts_with("SELECT ID, NAME FROM USERS WHERE ID") {
-            // "SELECT id, name FROM users WHERE id = '123'"
-            let parts: Vec<&str> = query.split('=').collect();
-            if parts.len() == 2 {
-                let id = parts[1]
-                    .trim()
-                    .trim_matches(|c| c == '\'' || c == ';')
-                    .to_string();
-                let rows = self
-                    .executor
-                    .execute_logical(
-                        &ctx,
-                        nodus_executor::LogicalPlan::SelectById {
-                            table_name: "users".into(),
-                            id,
-                        },
-                    )
+        // Otherwise a row set: build field descriptors and encode each row.
+        let field_info = Arc::new(
+            out.columns
+                .iter()
+                .map(|c| FieldInfo::new(c.clone(), None, None, Type::VARCHAR, FieldFormat::Text))
+                .collect::<Vec<_>>(),
+        );
+        let mut data_rows = Vec::new();
+        for row in &out.rows {
+            let mut encoder = DataRowEncoder::new(field_info.clone());
+            for value in &row.columns {
+                encoder
+                    .encode_field(value)
                     .map_err(|e| std::io::Error::other(e.to_string()))?;
-
-                let field_info = Arc::new(vec![
-                    FieldInfo::new("id".into(), None, None, Type::VARCHAR, FieldFormat::Text),
-                    FieldInfo::new("name".into(), None, None, Type::VARCHAR, FieldFormat::Text),
-                ]);
-
-                let mut rows_stream = Vec::new();
-                for r in rows {
-                    let mut encoder = DataRowEncoder::new(field_info.clone());
-                    encoder
-                        .encode_field(&r.columns[0])
-                        .map_err(|e| std::io::Error::other(e.to_string()))?;
-                    encoder
-                        .encode_field(&r.columns[1])
-                        .map_err(|e| std::io::Error::other(e.to_string()))?;
-                    rows_stream.push(encoder.finish());
-                }
-
-                let response = QueryResponse::new(field_info, stream::iter(rows_stream));
-                return Ok(vec![Response::Query(response)]);
             }
+            data_rows.push(encoder.finish());
         }
-
-        if query_upper.starts_with("BEGIN") {
-            self.executor
-                .execute_logical(&ctx, nodus_executor::LogicalPlan::Begin)
-                .map_err(|e| std::io::Error::other(e.to_string()))?;
-            return Ok(vec![Response::Execution(Tag::new("BEGIN"))]);
-        }
-        if query_upper.starts_with("COMMIT") {
-            self.executor
-                .execute_logical(&ctx, nodus_executor::LogicalPlan::Commit)
-                .map_err(|e| std::io::Error::other(e.to_string()))?;
-            return Ok(vec![Response::Execution(Tag::new("COMMIT"))]);
-        }
-        if query_upper.starts_with("ROLLBACK") {
-            self.executor
-                .execute_logical(&ctx, nodus_executor::LogicalPlan::Rollback)
-                .map_err(|e| std::io::Error::other(e.to_string()))?;
-            return Ok(vec![Response::Execution(Tag::new("ROLLBACK"))]);
-        }
-        if query_upper == "SELECT 1;" || query_upper == "SELECT 1" {
-            let field_info = Arc::new(vec![FieldInfo::new(
-                "?column?".into(),
-                None,
-                None,
-                Type::INT4,
-                FieldFormat::Text,
-            )]);
-            let mut encoder = DataRowEncoder::new(field_info.clone());
-            encoder.encode_field(&1i32)?;
-            let row = encoder.finish();
-            let response = QueryResponse::new(field_info, stream::iter(vec![row]));
-            return Ok(vec![Response::Query(response)]);
-        }
-
-        if query_upper.starts_with("SELECT 'HELLO'") {
-            let field_info = Arc::new(vec![FieldInfo::new(
-                "?column?".into(),
-                None,
-                None,
-                Type::VARCHAR,
-                FieldFormat::Text,
-            )]);
-            let mut encoder = DataRowEncoder::new(field_info.clone());
-            encoder.encode_field(&"hello")?;
-            let row = encoder.finish();
-            let response = QueryResponse::new(field_info, stream::iter(vec![row]));
-            return Ok(vec![Response::Query(response)]);
-        }
-
-        if query_upper.starts_with("SELECT VERSION()") {
-            let field_info = Arc::new(vec![FieldInfo::new(
-                "version".into(),
-                None,
-                None,
-                Type::VARCHAR,
-                FieldFormat::Text,
-            )]);
-            let mut encoder = DataRowEncoder::new(field_info.clone());
-            encoder.encode_field(&"PostgreSQL 16.0 (NodusDB)")?;
-            let row = encoder.finish();
-            let response = QueryResponse::new(field_info, stream::iter(vec![row]));
-            return Ok(vec![Response::Query(response)]);
-        }
-
-        if query_upper.starts_with("SHOW SEARCH_PATH") {
-            let field_info = Arc::new(vec![FieldInfo::new(
-                "search_path".into(),
-                None,
-                None,
-                Type::VARCHAR,
-                FieldFormat::Text,
-            )]);
-            let mut encoder = DataRowEncoder::new(field_info.clone());
-            encoder.encode_field(&"public")?;
-            let row = encoder.finish();
-            let response = QueryResponse::new(field_info, stream::iter(vec![row]));
-            return Ok(vec![Response::Query(response)]);
-        }
-
-        Ok(vec![Response::Execution(Tag::new("OK"))])
+        let response = QueryResponse::new(field_info, stream::iter(data_rows));
+        Ok(vec![Response::Query(response)])
     }
 }
 

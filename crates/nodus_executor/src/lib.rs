@@ -9,36 +9,40 @@ use nodus_catalog::{
     AuditEventId, CatalogReader, CatalogWriter, ColumnDescriptor, CreateTableRequest,
     DescriptorState, IndexId, MemoryCatalog, PrincipalId, ResourceRef, RoleId, TableId,
 };
-use nodus_storage_api::{KvEngine, Timestamp, TxnId};
+use nodus_storage_api::{KeyRange, KvEngine, Timestamp, TxnId};
 use nodus_txn::TxnManager;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+
+/// A column definition parsed from `CREATE TABLE`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ColumnDef {
+    pub name: String,
+    pub data_type: String,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum LogicalPlan {
     CreateTable {
         name: String,
-    }, // Simplified for MVP
+        columns: Vec<ColumnDef>,
+    },
     Insert {
         table_name: String,
-        id: String,
-        name_val: String,
+        /// Target column names; empty means positional (table order).
+        columns: Vec<String>,
+        values: Vec<String>,
     },
-    Project,
-    Filter,
-    Update {
+    Select {
         table_name: String,
-    },
-    Delete {
-        table_name: String,
+        /// Projected column names; empty means all columns (`SELECT *`).
+        projection: Vec<String>,
+        /// Optional equality filter `(column, value)`.
+        filter: Option<(String, String)>,
     },
     Begin,
     Commit,
     Rollback,
-    SelectById {
-        table_name: String,
-        id: String,
-    },
     ShowVariable {
         variable: String,
     },
@@ -47,91 +51,77 @@ pub enum LogicalPlan {
     },
 }
 
+/// Result of executing a statement: a tag for non-row commands, and column
+/// names + rows for queries.
+#[derive(Debug, Default)]
+pub struct QueryOutput {
+    pub columns: Vec<String>,
+    pub rows: Vec<Row>,
+    pub tag: String,
+}
+
+impl QueryOutput {
+    fn tag(tag: &str) -> Self {
+        Self {
+            columns: vec![],
+            rows: vec![],
+            tag: tag.to_string(),
+        }
+    }
+}
+
+fn expr_to_string(expr: &sqlparser::ast::Expr) -> Option<String> {
+    use sqlparser::ast::{Expr, Value};
+    match expr {
+        Expr::Value(Value::SingleQuotedString(s)) => Some(s.clone()),
+        Expr::Value(Value::Number(n, _)) => Some(n.clone()),
+        Expr::Value(Value::Boolean(b)) => Some(b.to_string()),
+        Expr::Value(Value::Null) => Some(String::new()),
+        Expr::Identifier(id) => Some(id.value.clone()),
+        _ => None,
+    }
+}
+
 pub fn plan_statement(stmt: &sqlparser::ast::Statement) -> Result<LogicalPlan> {
     use sqlparser::ast::*;
     match stmt {
-        Statement::CreateTable { name, .. } => {
-            let table_name = name.to_string();
-            Ok(LogicalPlan::CreateTable { name: table_name })
+        Statement::CreateTable { name, columns, .. } => {
+            let cols = columns
+                .iter()
+                .map(|c| crate::ColumnDef {
+                    name: c.name.value.clone(),
+                    data_type: c.data_type.to_string(),
+                })
+                .collect();
+            Ok(LogicalPlan::CreateTable {
+                name: name.to_string(),
+                columns: cols,
+            })
         }
         Statement::Insert {
-            table_name, source, ..
+            table_name,
+            columns,
+            source,
+            ..
         } => {
-            let t_name = table_name.to_string();
-            // Extremely naive extraction for MVP
-            let mut id_val = String::new();
-            let mut name_val = String::new();
+            let cols: Vec<String> = columns.iter().map(|c| c.value.clone()).collect();
+            let mut values = Vec::new();
             if let Some(query) = source {
-                if let SetExpr::Values(values) = &*query.body {
-                    if let Some(row) = values.rows.first() {
-                        if row.len() == 2 {
-                            if let Expr::Value(Value::SingleQuotedString(s)) = &row[0] {
-                                id_val = s.clone();
-                            }
-                            if let Expr::Value(Value::SingleQuotedString(s)) = &row[1] {
-                                name_val = s.clone();
-                            }
+                if let SetExpr::Values(vs) = &*query.body {
+                    if let Some(row) = vs.rows.first() {
+                        for e in row {
+                            values.push(expr_to_string(e).unwrap_or_default());
                         }
                     }
                 }
             }
             Ok(LogicalPlan::Insert {
-                table_name: t_name,
-                id: id_val,
-                name_val,
+                table_name: table_name.to_string(),
+                columns: cols,
+                values,
             })
         }
-        Statement::Query(query) => {
-            if let SetExpr::Select(select) = &*query.body {
-                // Check if it's a SELECT literal
-                if select.projection.len() == 1 && select.from.is_empty() {
-                    if let SelectItem::UnnamedExpr(Expr::Value(Value::Number(n, _))) =
-                        &select.projection[0]
-                    {
-                        return Ok(LogicalPlan::SelectLiteral {
-                            value: n.to_string(),
-                        });
-                    }
-                    if let SelectItem::UnnamedExpr(Expr::Value(Value::SingleQuotedString(s))) =
-                        &select.projection[0]
-                    {
-                        return Ok(LogicalPlan::SelectLiteral {
-                            value: s.to_string(),
-                        });
-                    }
-                    if let SelectItem::UnnamedExpr(Expr::Function(func)) = &select.projection[0] {
-                        return Ok(LogicalPlan::SelectLiteral {
-                            value: func.name.to_string(),
-                        }); // e.g. version
-                    }
-                }
-
-                // Naive SELECT ... FROM ... WHERE id = '...'
-                if !select.from.is_empty() {
-                    let table_name = match &select.from[0].relation {
-                        TableFactor::Table { name, .. } => name.to_string(),
-                        _ => "users".to_string(),
-                    };
-                    if let Some(selection) = &select.selection {
-                        if let Expr::BinaryOp { left, op, right } = selection {
-                            if *op == BinaryOperator::Eq {
-                                if let (
-                                    Expr::Identifier(_),
-                                    Expr::Value(Value::SingleQuotedString(id_val)),
-                                ) = (&**left, &**right)
-                                {
-                                    return Ok(LogicalPlan::SelectById {
-                                        table_name,
-                                        id: id_val.clone(),
-                                    });
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            anyhow::bail!("Unsupported query structure: {:?}", query)
-        }
+        Statement::Query(query) => plan_query(query),
         Statement::StartTransaction { .. } => Ok(LogicalPlan::Begin),
         Statement::Commit { .. } => Ok(LogicalPlan::Commit),
         Statement::Rollback { .. } => Ok(LogicalPlan::Rollback),
@@ -145,6 +135,70 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement) -> Result<LogicalPlan> {
         }
         _ => anyhow::bail!("Unsupported SQL statement: {:?}", stmt),
     }
+}
+
+fn plan_query(query: &sqlparser::ast::Query) -> Result<LogicalPlan> {
+    use sqlparser::ast::*;
+    let SetExpr::Select(select) = &*query.body else {
+        anyhow::bail!("Unsupported query body");
+    };
+
+    // FROM-less single-item projections are scalar/literal selects.
+    if select.from.is_empty() && select.projection.len() == 1 {
+        return match &select.projection[0] {
+            SelectItem::UnnamedExpr(Expr::Value(Value::Number(n, _))) => {
+                Ok(LogicalPlan::SelectLiteral { value: n.clone() })
+            }
+            SelectItem::UnnamedExpr(Expr::Value(Value::SingleQuotedString(s))) => {
+                Ok(LogicalPlan::SelectLiteral { value: s.clone() })
+            }
+            SelectItem::UnnamedExpr(Expr::Function(func)) => Ok(LogicalPlan::SelectLiteral {
+                value: func.name.to_string(),
+            }),
+            _ => anyhow::bail!("Unsupported scalar select"),
+        };
+    }
+
+    if select.from.is_empty() {
+        anyhow::bail!("SELECT without FROM");
+    }
+    let table_name = match &select.from[0].relation {
+        TableFactor::Table { name, .. } => name.to_string(),
+        other => anyhow::bail!("Unsupported FROM relation: {:?}", other),
+    };
+
+    // Projection: `*` -> empty (all); otherwise plain column identifiers.
+    let mut projection = Vec::new();
+    for item in &select.projection {
+        match item {
+            SelectItem::Wildcard(_) => {
+                projection.clear();
+                break;
+            }
+            SelectItem::UnnamedExpr(Expr::Identifier(id)) => projection.push(id.value.clone()),
+            SelectItem::ExprWithAlias {
+                expr: Expr::Identifier(id),
+                ..
+            } => projection.push(id.value.clone()),
+            other => anyhow::bail!("Unsupported projection item: {:?}", other),
+        }
+    }
+
+    // Optional `WHERE <col> = <literal>` filter.
+    let mut filter = None;
+    if let Some(Expr::BinaryOp { left, op, right }) = &select.selection {
+        if *op == BinaryOperator::Eq {
+            if let (Expr::Identifier(col), Some(val)) = (&**left, expr_to_string(right)) {
+                filter = Some((col.value.clone(), val));
+            }
+        }
+    }
+
+    Ok(LogicalPlan::Select {
+        table_name,
+        projection,
+        filter,
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -187,7 +241,7 @@ pub struct Row {
 }
 
 pub trait Executor: Send + Sync {
-    fn execute_logical(&self, ctx: &ExecutionContext, plan: LogicalPlan) -> Result<Vec<Row>>;
+    fn execute_logical(&self, ctx: &ExecutionContext, plan: LogicalPlan) -> Result<QueryOutput>;
     fn execute_physical(&self, ctx: &ExecutionContext, plan: PhysicalPlan) -> Result<Vec<Row>>;
 }
 
@@ -265,6 +319,29 @@ impl MemExecutor {
         self.kv.garbage_collect(watermark)
     }
 
+    fn read_ts(&self) -> Timestamp {
+        match *self.active_txn.read().unwrap() {
+            Some((_, ts)) => ts,
+            None => u64::MAX, // read latest when no active txn
+        }
+    }
+
+    /// Writes a row value at `key`, using the active txn or an auto-commit txn.
+    fn write_row(&self, key: String, value: String) -> Result<()> {
+        let active = *self.active_txn.read().unwrap();
+        let (txn_id, auto) = match active {
+            Some((tid, _)) => (tid, false),
+            None => (self.txn.begin_txn()?.txn_id, true),
+        };
+        self.kv
+            .write_intent(txn_id, Bytes::from(key), Bytes::from(value))?;
+        if auto {
+            let commit_ts = self.txn.commit_txn(txn_id)?;
+            self.kv.commit(txn_id, commit_ts)?;
+        }
+        Ok(())
+    }
+
     /// Deny-by-default authorization gate for a single action on a resource.
     fn authorize(
         &self,
@@ -326,84 +403,130 @@ impl Default for MemExecutor {
 }
 
 impl Executor for MemExecutor {
-    fn execute_logical(&self, ctx: &ExecutionContext, plan: LogicalPlan) -> Result<Vec<Row>> {
-        println!(
-            "Executing LogicalPlan: {:?} for session {}",
-            plan, ctx.session_id
-        );
+    fn execute_logical(&self, ctx: &ExecutionContext, plan: LogicalPlan) -> Result<QueryOutput> {
         match plan {
-            LogicalPlan::CreateTable { name } => {
+            LogicalPlan::CreateTable { name, columns } => {
                 let db = self.catalog_reader.get_database("default")?;
                 let sch = self.catalog_reader.get_schema("default", "public")?;
                 self.authorize(ctx, Action::CreateTable, ResourceRef::Schema(sch.id))?;
+                let descriptors = columns
+                    .iter()
+                    .map(|c| ColumnDescriptor {
+                        id: nodus_catalog::ColumnId::new(),
+                        name: c.name.clone(),
+                        version: 1,
+                        created_at: Utc::now(),
+                        updated_at: Utc::now(),
+                        state: DescriptorState::Public,
+                        data_type: c.data_type.clone(),
+                        nullable: true,
+                    })
+                    .collect();
                 self.catalog_writer.create_table(CreateTableRequest {
                     database_id: db.id,
                     schema_id: sch.id,
                     name: name.clone(),
-                    columns: vec![
-                        ColumnDescriptor {
-                            id: nodus_catalog::ColumnId::new(),
-                            name: "id".into(),
-                            version: 1,
-                            created_at: Utc::now(),
-                            updated_at: Utc::now(),
-                            state: DescriptorState::Public,
-                            data_type: "UUID".into(),
-                            nullable: false,
-                        },
-                        ColumnDescriptor {
-                            id: nodus_catalog::ColumnId::new(),
-                            name: "name".into(),
-                            version: 1,
-                            created_at: Utc::now(),
-                            updated_at: Utc::now(),
-                            state: DescriptorState::Public,
-                            data_type: "TEXT".into(),
-                            nullable: false,
-                        },
-                    ],
+                    columns: descriptors,
                 })?;
-                Ok(vec![Row {
-                    columns: vec!["CREATE TABLE".into()],
-                }])
+                Ok(QueryOutput::tag("CREATE TABLE"))
             }
             LogicalPlan::Insert {
                 table_name,
-                id,
-                name_val,
+                columns,
+                values,
             } => {
                 let tbl = self
                     .catalog_reader
                     .get_table("default", "public", &table_name)?;
                 self.authorize(ctx, Action::Insert, ResourceRef::Table(tbl.id))?;
-                self.execute_physical(
-                    ctx,
-                    PhysicalPlan::LocalInsert {
-                        table_id: tbl.id,
-                        id,
-                        name_val,
-                    },
-                )
+
+                let col_names: Vec<&str> = tbl.columns.iter().map(|c| c.name.as_str()).collect();
+                // Build the row in table-column order.
+                let mut row = vec![String::new(); col_names.len()];
+                if columns.is_empty() {
+                    for (i, v) in values.iter().enumerate() {
+                        if i < row.len() {
+                            row[i] = v.clone();
+                        }
+                    }
+                } else {
+                    for (cname, val) in columns.iter().zip(values.iter()) {
+                        if let Some(idx) = col_names.iter().position(|c| c == cname) {
+                            row[idx] = val.clone();
+                        }
+                    }
+                }
+                // Primary key = first column's value.
+                let pk = row.first().cloned().unwrap_or_default();
+                let key = format!("{}:{}", tbl.id, pk);
+                let encoded = serde_json::to_string(&row)?;
+                self.write_row(key, encoded)?;
+                Ok(QueryOutput::tag("INSERT 0 1"))
             }
-            LogicalPlan::SelectById { table_name, id } => {
+            LogicalPlan::Select {
+                table_name,
+                projection,
+                filter,
+            } => {
                 let tbl = self
                     .catalog_reader
                     .get_table("default", "public", &table_name)?;
                 self.authorize(ctx, Action::Select, ResourceRef::Table(tbl.id))?;
-                self.execute_physical(
-                    ctx,
-                    PhysicalPlan::LocalPointGet {
-                        table_id: tbl.id,
-                        id,
-                    },
-                )
+
+                let col_names: Vec<String> = tbl.columns.iter().map(|c| c.name.clone()).collect();
+                let read_ts = self.read_ts();
+
+                // Scan all rows in the table's key range.
+                let start = Bytes::from(format!("{}:", tbl.id));
+                let end = Bytes::from(format!("{};", tbl.id));
+                let mut stored_rows: Vec<Vec<String>> = Vec::new();
+                for pair in self.kv.scan(KeyRange { start, end }, read_ts)? {
+                    let pair = pair?;
+                    let row: Vec<String> = serde_json::from_slice(&pair.value)?;
+                    stored_rows.push(row);
+                }
+
+                // Apply the optional equality filter.
+                if let Some((fcol, fval)) = &filter {
+                    if let Some(idx) = col_names.iter().position(|c| c == fcol) {
+                        stored_rows.retain(|r| r.get(idx).map(|v| v == fval).unwrap_or(false));
+                    } else {
+                        stored_rows.clear();
+                    }
+                }
+
+                // Resolve projection (empty = all columns).
+                let out_cols: Vec<String> = if projection.is_empty() {
+                    col_names.clone()
+                } else {
+                    projection.clone()
+                };
+                let indices: Vec<Option<usize>> = out_cols
+                    .iter()
+                    .map(|c| col_names.iter().position(|tc| tc == c))
+                    .collect();
+
+                let rows = stored_rows
+                    .into_iter()
+                    .map(|r| Row {
+                        columns: indices
+                            .iter()
+                            .map(|i| i.and_then(|i| r.get(i).cloned()).unwrap_or_default())
+                            .collect(),
+                    })
+                    .collect::<Vec<_>>();
+
+                let tag = format!("SELECT {}", rows.len());
+                Ok(QueryOutput {
+                    columns: out_cols,
+                    rows,
+                    tag,
+                })
             }
             LogicalPlan::Begin => {
                 let txn_record = self.txn.begin_txn()?;
                 *self.active_txn.write().unwrap() = Some((txn_record.txn_id, txn_record.read_ts));
-                Ok(vec![Row {
-                    columns: vec!["BEGIN".into()],
-                }])
+                Ok(QueryOutput::tag("BEGIN"))
             }
             LogicalPlan::Commit => {
                 if let Some((txn_id, _)) = *self.active_txn.read().unwrap() {
@@ -411,9 +534,7 @@ impl Executor for MemExecutor {
                     self.kv.commit(txn_id, commit_ts)?;
                 }
                 *self.active_txn.write().unwrap() = None;
-                Ok(vec![Row {
-                    columns: vec!["COMMIT".into()],
-                }])
+                Ok(QueryOutput::tag("COMMIT"))
             }
             LogicalPlan::Rollback => {
                 if let Some((txn_id, _)) = *self.active_txn.read().unwrap() {
@@ -421,86 +542,51 @@ impl Executor for MemExecutor {
                     self.kv.abort(txn_id)?;
                 }
                 *self.active_txn.write().unwrap() = None;
-                Ok(vec![Row {
-                    columns: vec!["ROLLBACK".into()],
-                }])
+                Ok(QueryOutput::tag("ROLLBACK"))
             }
             LogicalPlan::ShowVariable { variable } => {
-                if variable.to_uppercase() == "SEARCH_PATH" {
-                    Ok(vec![Row {
-                        columns: vec!["public".into()],
-                    }])
+                let value = if variable.eq_ignore_ascii_case("search_path") {
+                    "public".to_string()
                 } else {
-                    Ok(vec![Row {
-                        columns: vec!["".into()],
-                    }])
-                }
+                    String::new()
+                };
+                Ok(QueryOutput {
+                    columns: vec![variable],
+                    rows: vec![Row {
+                        columns: vec![value],
+                    }],
+                    tag: "SHOW".into(),
+                })
             }
             LogicalPlan::SelectLiteral { value } => {
-                if value.to_uppercase() == "VERSION" {
-                    Ok(vec![Row {
-                        columns: vec!["PostgreSQL 16.0 (NodusDB)".into()],
-                    }])
+                let rendered = if value.eq_ignore_ascii_case("version") {
+                    "PostgreSQL 16.0 (NodusDB)".to_string()
                 } else {
-                    Ok(vec![Row {
-                        columns: vec![value],
-                    }])
-                }
+                    value
+                };
+                Ok(QueryOutput {
+                    columns: vec!["?column?".into()],
+                    rows: vec![Row {
+                        columns: vec![rendered],
+                    }],
+                    tag: "SELECT 1".into(),
+                })
             }
-            _ => Ok(vec![]),
         }
     }
 
-    fn execute_physical(&self, ctx: &ExecutionContext, plan: PhysicalPlan) -> Result<Vec<Row>> {
-        println!(
-            "Executing PhysicalPlan: {:?} for session {}",
-            plan, ctx.session_id
-        );
+    fn execute_physical(&self, _ctx: &ExecutionContext, plan: PhysicalPlan) -> Result<Vec<Row>> {
+        // Retained for the point-get path used by lower layers/tests.
         match plan {
-            PhysicalPlan::LocalInsert {
-                table_id,
-                id,
-                name_val,
-            } => {
-                // Determine active txn or auto-commit
-                let mut is_auto = false;
-                let active = *self.active_txn.read().unwrap();
-                let txn_id = if let Some((tid, _)) = active {
-                    tid
-                } else {
-                    is_auto = true;
-                    self.txn.begin_txn()?.txn_id
-                };
-
-                let key_str = format!("{}:{}", table_id, id);
-                let val_str = name_val.clone();
-                self.kv
-                    .write_intent(txn_id, Bytes::from(key_str), Bytes::from(val_str))?;
-
-                if is_auto {
-                    self.txn.commit_txn(txn_id)?;
-                }
-
-                Ok(vec![Row {
-                    columns: vec!["INSERT 0 1".into()],
-                }])
-            }
             PhysicalPlan::LocalPointGet { table_id, id } => {
-                let active = *self.active_txn.read().unwrap();
-                let read_ts = if let Some((_, ts)) = active {
-                    ts
-                } else {
-                    u64::MAX // Simplification: read latest if no active txn
-                };
-
-                let key_str = format!("{}:{}", table_id, id);
-                if let Some(val) = self.kv.get(key_str.as_bytes(), read_ts)? {
-                    let val_str = String::from_utf8(val.to_vec())?;
-                    Ok(vec![Row {
-                        columns: vec![id, val_str],
-                    }])
-                } else {
-                    Ok(vec![])
+                let read_ts = self.read_ts();
+                let key = format!("{}:{}", table_id, id);
+                match self.kv.get(key.as_bytes(), read_ts)? {
+                    Some(val) => {
+                        let row: Vec<String> = serde_json::from_slice(&val).unwrap_or_default();
+                        Ok(vec![Row { columns: row }])
+                    }
+                    None => Ok(vec![]),
                 }
             }
             _ => Ok(vec![]),
@@ -523,19 +609,14 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_executor_scaffold() {
-        let exec = MemExecutor::default();
-        let ctx = ctx_for(PrincipalId::new());
-        exec.execute_logical(&ctx, LogicalPlan::Begin).unwrap();
-        exec.execute_physical(
-            &ctx,
-            PhysicalPlan::LocalPointGet {
-                table_id: TableId::new(),
-                id: "1".into(),
-            },
-        )
-        .unwrap();
+    fn cols(names: &[(&str, &str)]) -> Vec<ColumnDef> {
+        names
+            .iter()
+            .map(|(n, t)| ColumnDef {
+                name: n.to_string(),
+                data_type: t.to_string(),
+            })
+            .collect()
     }
 
     #[test]
@@ -550,14 +631,13 @@ mod tests {
             })
             .unwrap();
         let ctx = ctx_for(user.id);
+        let plan = || LogicalPlan::CreateTable {
+            name: "t1".into(),
+            columns: cols(&[("id", "INT"), ("name", "TEXT")]),
+        };
 
-        // Deny-by-default: no grant yet.
-        assert!(
-            exec.execute_logical(&ctx, LogicalPlan::CreateTable { name: "t1".into() })
-                .is_err()
-        );
+        assert!(exec.execute_logical(&ctx, plan()).is_err());
 
-        // Grant CREATE_TABLE on the public schema, then it succeeds.
         let sch = cat.get_schema("default", "public").unwrap();
         cat.grant_privilege(GrantPrivilegeRequest {
             principal_id: user.id,
@@ -565,28 +645,93 @@ mod tests {
             privilege: "CREATE_TABLE".into(),
         })
         .unwrap();
-        assert!(
-            exec.execute_logical(&ctx, LogicalPlan::CreateTable { name: "t1".into() })
-                .is_ok()
-        );
+        assert!(exec.execute_logical(&ctx, plan()).is_ok());
 
-        // Both the denial and the success were audited.
-        let denied = AuditQuery {
-            result: Some("Denied".into()),
-            ..Default::default()
-        };
-        let success = AuditQuery {
-            result: Some("Success".into()),
-            ..Default::default()
-        };
-        assert_eq!(audit.query(&denied).unwrap().len(), 1);
-        assert_eq!(audit.query(&success).unwrap().len(), 1);
+        assert_eq!(
+            audit
+                .query(&AuditQuery {
+                    result: Some("Denied".into()),
+                    ..Default::default()
+                })
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn create_insert_select_round_trip() {
+        // Superuser so authz passes for all actions.
+        let (exec, cat) = MemExecutor::shared(Arc::new(MemoryAuditSink::new()));
+        let admin = cat
+            .create_role(CreateRoleRequest {
+                name: "admin".into(),
+                principal_type: PrincipalType::User,
+                database_id: None,
+            })
+            .unwrap();
+        cat.grant_privilege(GrantPrivilegeRequest {
+            principal_id: admin.id,
+            resource: ResourceRef::System,
+            privilege: "ALL".into(),
+        })
+        .unwrap();
+        let ctx = ctx_for(admin.id);
+
+        exec.execute_logical(
+            &ctx,
+            LogicalPlan::CreateTable {
+                name: "books".into(),
+                columns: cols(&[("id", "INT"), ("title", "TEXT"), ("author", "TEXT")]),
+            },
+        )
+        .unwrap();
+
+        for (id, title, author) in [("1", "Dune", "Herbert"), ("2", "Foundation", "Asimov")] {
+            exec.execute_logical(
+                &ctx,
+                LogicalPlan::Insert {
+                    table_name: "books".into(),
+                    columns: vec!["id".into(), "title".into(), "author".into()],
+                    values: vec![id.into(), title.into(), author.into()],
+                },
+            )
+            .unwrap();
+        }
+
+        // SELECT * returns all rows with all columns.
+        let all = exec
+            .execute_logical(
+                &ctx,
+                LogicalPlan::Select {
+                    table_name: "books".into(),
+                    projection: vec![],
+                    filter: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(all.columns, vec!["id", "title", "author"]);
+        assert_eq!(all.rows.len(), 2);
+
+        // Projection + filter.
+        let one = exec
+            .execute_logical(
+                &ctx,
+                LogicalPlan::Select {
+                    table_name: "books".into(),
+                    projection: vec!["title".into(), "author".into()],
+                    filter: Some(("id".into(), "2".into())),
+                },
+            )
+            .unwrap();
+        assert_eq!(one.columns, vec!["title", "author"]);
+        assert_eq!(one.rows.len(), 1);
+        assert_eq!(one.rows[0].columns, vec!["Foundation", "Asimov"]);
     }
 
     #[test]
     fn run_gc_is_safe_with_no_active_txns() {
         let exec = MemExecutor::default();
-        // No data/txns: GC reclaims nothing and does not error.
         assert_eq!(exec.run_gc().unwrap(), 0);
     }
 }

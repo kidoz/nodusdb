@@ -1,6 +1,69 @@
 use nodus_testkit::TestServer;
 use std::time::Duration;
-use tokio_postgres::NoTls;
+use tokio_postgres::{NoTls, SimpleQueryMessage};
+
+async fn connect(server: &TestServer) -> tokio_postgres::Client {
+    let conn_str = format!(
+        "host={} port={} user=nodus password=nodus dbname=default",
+        server.pgwire_addr.ip(),
+        server.pgwire_addr.port()
+    );
+    for _ in 0..30 {
+        if let Ok((client, connection)) = tokio_postgres::connect(&conn_str, NoTls).await {
+            tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            return client;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("PGWire server did not start in time");
+}
+
+fn rows_of(msgs: &[SimpleQueryMessage]) -> Vec<&tokio_postgres::SimpleQueryRow> {
+    msgs.iter()
+        .filter_map(|m| match m {
+            SimpleQueryMessage::Row(r) => Some(r),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn test_arbitrary_table_sql() {
+    let server = TestServer::start().await.expect("server starts");
+    let client = connect(&server).await;
+
+    client
+        .simple_query("CREATE TABLE products (sku TEXT PRIMARY KEY, name TEXT, price TEXT);")
+        .await
+        .unwrap();
+    client
+        .simple_query("INSERT INTO products (sku, name, price) VALUES ('s1', 'Widget', '9.99');")
+        .await
+        .unwrap();
+    client
+        .simple_query("INSERT INTO products (sku, name, price) VALUES ('s2', 'Gadget', '19.99');")
+        .await
+        .unwrap();
+
+    // SELECT * returns every row with all columns in table order.
+    let msgs = client
+        .simple_query("SELECT * FROM products;")
+        .await
+        .unwrap();
+    assert_eq!(rows_of(&msgs).len(), 2);
+
+    // Projection + filter on the primary key.
+    let msgs = client
+        .simple_query("SELECT name, price FROM products WHERE sku = 's2';")
+        .await
+        .unwrap();
+    let rows = rows_of(&msgs);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get(0).unwrap(), "Gadget");
+    assert_eq!(rows[0].get(1).unwrap(), "19.99");
+}
 
 #[tokio::test]
 async fn test_pgwire_queries() {
