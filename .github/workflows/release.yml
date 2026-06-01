@@ -1,0 +1,64 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  id-token: write   # for keyless cosign signing
+
+jobs:
+  release:
+    name: Build, sign, and publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Build release binaries
+        run: cargo build --release --bin nodus_server --bin nodus_cli
+
+      - name: Stage artifacts
+        run: |
+          mkdir -p dist
+          cp target/release/nodus_server dist/
+          cp target/release/nodus_cli dist/nodusctl
+
+      - name: Generate checksums
+        working-directory: dist
+        run: sha256sum nodus_server nodusctl > SHA256SUMS
+
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          path: ./dist
+          format: spdx-json
+          output-file: dist/sbom.spdx.json
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign checksums (keyless)
+        env:
+          COSIGN_YES: "true"
+        run: cosign sign-blob --yes dist/SHA256SUMS --bundle dist/SHA256SUMS.cosign.bundle
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/nodus_server
+            dist/nodusctl
+            dist/SHA256SUMS
+            dist/SHA256SUMS.cosign.bundle
+            dist/sbom.spdx.json
