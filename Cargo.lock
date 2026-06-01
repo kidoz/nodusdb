@@ -1408,6 +1408,8 @@ dependencies = [
  "nodus_monitoring",
  "nodus_storage_api",
  "serde",
+ "serde_json",
+ "sha2 0.10.9",
  "thiserror",
  "tokio",
  "uuid",

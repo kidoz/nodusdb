@@ -15,6 +15,8 @@ bytes.workspace = true
 chrono.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
 nodus_catalog = { path = "../nodus_catalog" }
 nodus_storage_api = { path = "../nodus_storage_api" }
 nodus_monitoring = { path = "../nodus_monitoring" }
