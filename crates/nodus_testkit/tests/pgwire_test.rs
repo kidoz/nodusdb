@@ -10,7 +10,7 @@ async fn test_pgwire_queries() {
     let mut is_up = false;
     let mut client_opt = None;
     let conn_str = format!(
-        "host={} port={} user=nodus dbname=default",
+        "host={} port={} user=nodus password=nodus dbname=default",
         server.pgwire_addr.ip(),
         server.pgwire_addr.port()
     );

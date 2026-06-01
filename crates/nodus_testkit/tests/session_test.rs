@@ -4,7 +4,7 @@ use tokio_postgres::NoTls;
 
 async fn connect(addr: &std::net::SocketAddr) -> tokio_postgres::Client {
     let conn_str = format!(
-        "host={} port={} user=nodus dbname=default",
+        "host={} port={} user=nodus password=nodus dbname=default",
         addr.ip(),
         addr.port()
     );
@@ -47,5 +47,21 @@ async fn pgwire_sessions_are_per_connection_and_killable() {
     assert!(
         client_a.simple_query("SELECT 1").await.is_err(),
         "a killed session must reject further queries"
+    );
+}
+
+#[tokio::test]
+async fn pgwire_rejects_bad_password() {
+    let server = TestServer::start().await.expect("server starts");
+    let bad = format!(
+        "host={} port={} user=nodus password=wrong dbname=default",
+        server.pgwire_addr.ip(),
+        server.pgwire_addr.port()
+    );
+    // Give the listener a moment, then a wrong password must be refused.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        tokio_postgres::connect(&bad, NoTls).await.is_err(),
+        "authentication must reject an incorrect password"
     );
 }

@@ -3,19 +3,24 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
-use futures_util::{Sink, stream};
+use futures_util::{Sink, SinkExt, stream};
 use tokio::net::TcpListener;
 use tracing::{error, info};
 
-use nodus_catalog::PrincipalId;
-use nodus_security::{Session, SessionRegistry};
-use pgwire::api::auth::noop::NoopStartupHandler;
+use nodus_catalog::{CatalogWriter, CreateRoleRequest, MemoryCatalog, PrincipalId, PrincipalType};
+use nodus_security::{Authenticator, PasswordAuthenticator, Session, SessionRegistry};
+use pgwire::api::auth::{
+    DefaultServerParameterProvider, LoginInfo, StartupHandler, finish_authentication,
+    save_startup_parameters_to_metadata,
+};
 use pgwire::api::copy::NoopCopyHandler;
 use pgwire::api::query::{PlaceholderExtendedQueryHandler, SimpleQueryHandler};
 use pgwire::api::results::{DataRowEncoder, FieldFormat, FieldInfo, QueryResponse, Response, Tag};
-use pgwire::api::{ClientInfo, PgWireHandlerFactory, Type};
-use pgwire::error::{PgWireError, PgWireResult};
+use pgwire::api::{ClientInfo, PgWireConnectionState, PgWireHandlerFactory, Type};
+use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::PgWireBackendMessage;
+use pgwire::messages::response::ErrorResponse;
+use pgwire::messages::startup::Authentication;
 use pgwire::tokio::process_socket;
 use uuid::Uuid;
 
@@ -35,6 +40,69 @@ impl Drop for NodusQueryHandler {
         // The handler lives for the connection's lifetime (one per socket), so
         // dropping it means the client disconnected.
         self.registry.deregister(&self.session_id);
+    }
+}
+
+/// Startup handler that authenticates clients with cleartext passwords against
+/// the [`PasswordAuthenticator`]. On success the principal id is stashed in the
+/// connection metadata for downstream authorization.
+pub struct NodusStartupHandler {
+    authenticator: Arc<PasswordAuthenticator>,
+    param_provider: DefaultServerParameterProvider,
+}
+
+#[async_trait]
+impl StartupHandler for NodusStartupHandler {
+    async fn on_startup<C>(
+        &self,
+        client: &mut C,
+        message: pgwire::messages::PgWireFrontendMessage,
+    ) -> PgWireResult<()>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        match message {
+            pgwire::messages::PgWireFrontendMessage::Startup(ref startup) => {
+                save_startup_parameters_to_metadata(client, startup);
+                client.set_state(PgWireConnectionState::AuthenticationInProgress);
+                client
+                    .send(PgWireBackendMessage::Authentication(
+                        Authentication::CleartextPassword,
+                    ))
+                    .await?;
+            }
+            pgwire::messages::PgWireFrontendMessage::PasswordMessageFamily(pwd) => {
+                let pwd = pwd.into_password()?;
+                let login = LoginInfo::from_client_info(client);
+                let user = login.user().map(|u| u.to_string()).unwrap_or_default();
+                match self.authenticator.authenticate(&user, &pwd.password) {
+                    Ok(session) => {
+                        client.metadata_mut().insert(
+                            "nodus_principal_id".to_string(),
+                            session.principal_id.to_string(),
+                        );
+                        finish_authentication(client, &self.param_provider).await;
+                    }
+                    Err(_) => {
+                        let error_info = ErrorInfo::new(
+                            "FATAL".to_owned(),
+                            "28P01".to_owned(),
+                            "password authentication failed".to_owned(),
+                        );
+                        client
+                            .feed(PgWireBackendMessage::ErrorResponse(ErrorResponse::from(
+                                error_info,
+                            )))
+                            .await?;
+                        client.close().await?;
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
     }
 }
 
@@ -242,7 +310,7 @@ impl SimpleQueryHandler for NodusQueryHandler {
 }
 
 pub struct NodusPgWireServer {
-    startup_handler: Arc<NoopStartupHandler>,
+    startup_handler: Arc<NodusStartupHandler>,
     executor: Arc<dyn nodus_executor::Executor>,
     metrics: nodus_monitoring::Metrics,
     registry: Arc<SessionRegistry>,
@@ -251,7 +319,7 @@ pub struct NodusPgWireServer {
 }
 
 impl PgWireHandlerFactory for NodusPgWireServer {
-    type StartupHandler = NoopStartupHandler;
+    type StartupHandler = NodusStartupHandler;
     type SimpleQueryHandler = NodusQueryHandler;
     type ExtendedQueryHandler = PlaceholderExtendedQueryHandler;
     type CopyHandler = NoopCopyHandler;
@@ -291,14 +359,36 @@ impl PgWireHandlerFactory for NodusPgWireServer {
     }
 }
 
+/// Builds a password authenticator seeded with a default superuser. The
+/// catalog here is dedicated to authentication; sharing it with the executor's
+/// catalog (so grants line up) follows when authorization is wired in.
+pub fn default_authenticator() -> Arc<PasswordAuthenticator> {
+    let catalog = Arc::new(MemoryCatalog::new());
+    let admin = catalog
+        .create_role(CreateRoleRequest {
+            name: "nodus".into(),
+            principal_type: PrincipalType::User,
+            database_id: None,
+        })
+        .expect("seed default admin principal");
+    let authenticator = Arc::new(PasswordAuthenticator::new(catalog));
+    // Default development credentials; override before production use.
+    authenticator.set_password("nodus", admin.id, "nodus");
+    authenticator
+}
+
 pub async fn start_pgwire_server(
     listener: TcpListener,
     executor: Arc<dyn nodus_executor::Executor>,
     metrics: nodus_monitoring::Metrics,
     registry: Arc<SessionRegistry>,
 ) -> anyhow::Result<()> {
+    let startup_handler = Arc::new(NodusStartupHandler {
+        authenticator: default_authenticator(),
+        param_provider: DefaultServerParameterProvider::default(),
+    });
     let factory = Arc::new(NodusPgWireServer {
-        startup_handler: Arc::new(NoopStartupHandler),
+        startup_handler,
         executor,
         metrics: metrics.clone(),
         registry,
