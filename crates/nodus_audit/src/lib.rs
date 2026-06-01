@@ -181,9 +181,11 @@ mod tests {
         let sink = MemoryAuditSink::new();
         let alice = PrincipalId::new();
         let bob = PrincipalId::new();
-        sink.record_event(event(alice, "SELECT", "Success")).unwrap();
+        sink.record_event(event(alice, "SELECT", "Success"))
+            .unwrap();
         sink.record_event(event(bob, "INSERT", "Denied")).unwrap();
-        sink.record_event(event(alice, "DELETE", "Success")).unwrap();
+        sink.record_event(event(alice, "DELETE", "Success"))
+            .unwrap();
 
         assert_eq!(sink.query(&AuditQuery::default()).unwrap().len(), 3);
         let by_actor = AuditQuery {
@@ -208,7 +210,8 @@ mod tests {
         let path = std::env::temp_dir().join(format!("nodus_audit_{}.jsonl", AuditEventId::new()));
         let sink = FileAuditSink::new(&path);
         let alice = PrincipalId::new();
-        sink.record_event(event(alice, "SELECT", "Success")).unwrap();
+        sink.record_event(event(alice, "SELECT", "Success"))
+            .unwrap();
         sink.record_event(event(PrincipalId::new(), "INSERT", "Success"))
             .unwrap();
 

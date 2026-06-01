@@ -336,7 +336,9 @@ impl BackupOrchestrator {
             .put_object(
                 &manifest_key(&backup_id),
                 Bytes::from(body),
-                PutOptions { content_type: Some("application/json".into()) },
+                PutOptions {
+                    content_type: Some("application/json".into()),
+                },
             )
             .await?;
 
@@ -426,11 +428,18 @@ mod tests {
     async fn test_fs_repository_roundtrip() {
         let dir = std::env::temp_dir().join(format!("nodus_bk_{}", Uuid::new_v4()));
         let repo = FsBackupRepository::new(&dir);
-        repo.put_object("a/b.txt", Bytes::from("data"), PutOptions { content_type: None })
-            .await
-            .unwrap();
+        repo.put_object(
+            "a/b.txt",
+            Bytes::from("data"),
+            PutOptions { content_type: None },
+        )
+        .await
+        .unwrap();
         assert!(repo.object_exists("a/b.txt").await.unwrap());
-        assert_eq!(repo.get_object("a/b.txt", None).await.unwrap(), Bytes::from("data"));
+        assert_eq!(
+            repo.get_object("a/b.txt", None).await.unwrap(),
+            Bytes::from("data")
+        );
         let listed = repo.list_objects("a/").await.unwrap();
         assert_eq!(listed.len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
@@ -449,8 +458,14 @@ mod tests {
                 7,
                 3,
                 vec![
-                    BackupObject { name: "catalog".into(), bytes: Bytes::from("cat") },
-                    BackupObject { name: "shard-0".into(), bytes: Bytes::from("rows") },
+                    BackupObject {
+                        name: "catalog".into(),
+                        bytes: Bytes::from("cat"),
+                    },
+                    BackupObject {
+                        name: "shard-0".into(),
+                        bytes: Bytes::from("rows"),
+                    },
                 ],
             )
             .await
@@ -462,13 +477,20 @@ mod tests {
         let restored = orch.restore(&manifest.backup_id).await.unwrap();
         assert_eq!(restored.len(), 2);
 
-        assert_eq!(orch.list_backups().await.unwrap(), vec![manifest.backup_id.clone()]);
+        assert_eq!(
+            orch.list_backups().await.unwrap(),
+            vec![manifest.backup_id.clone()]
+        );
 
         // Corrupting a file is detected by verify.
         let key = data_key(&manifest.backup_id, "shard-0");
-        repo.put_object(&key, Bytes::from("tampered"), PutOptions { content_type: None })
-            .await
-            .unwrap();
+        repo.put_object(
+            &key,
+            Bytes::from("tampered"),
+            PutOptions { content_type: None },
+        )
+        .await
+        .unwrap();
         assert!(orch.verify(&manifest.backup_id).await.is_err());
 
         let _ = std::fs::remove_dir_all(&dir);

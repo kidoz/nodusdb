@@ -191,18 +191,25 @@ mod tests {
         let k = Bytes::from("k");
 
         let t1 = TxnId::new();
-        engine.write_intent(t1, k.clone(), Bytes::from("v1")).unwrap();
+        engine
+            .write_intent(t1, k.clone(), Bytes::from("v1"))
+            .unwrap();
         engine.commit(t1, 5).unwrap();
 
         let t2 = TxnId::new();
-        engine.write_intent(t2, k.clone(), Bytes::from("v2")).unwrap();
+        engine
+            .write_intent(t2, k.clone(), Bytes::from("v2"))
+            .unwrap();
         engine.commit(t2, 10).unwrap();
 
         // With no reader below 10, the version at ts=5 is reclaimable.
         let removed = engine.garbage_collect(10).unwrap();
         assert_eq!(removed, 1);
         // Latest value still readable.
-        assert_eq!(engine.get(k.as_ref(), 10).unwrap().unwrap(), Bytes::from("v2"));
+        assert_eq!(
+            engine.get(k.as_ref(), 10).unwrap().unwrap(),
+            Bytes::from("v2")
+        );
 
         // Idempotent: a second pass reclaims nothing.
         assert_eq!(engine.garbage_collect(10).unwrap(), 0);

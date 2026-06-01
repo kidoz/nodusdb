@@ -159,7 +159,10 @@ impl UpgradeCoordinator for DefaultUpgradeCoordinator {
         {
             let state = self.state.read().unwrap();
             if !matches!(state.phase, UpgradePhase::Idle | UpgradePhase::Failed) {
-                anyhow::bail!("an upgrade is already in progress (phase {:?})", state.phase);
+                anyhow::bail!(
+                    "an upgrade is already in progress (phase {:?})",
+                    state.phase
+                );
             }
         }
         self.preflight()?;

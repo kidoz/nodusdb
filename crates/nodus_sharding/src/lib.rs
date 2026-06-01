@@ -53,7 +53,12 @@ impl ShardRouter for CatalogShardRouter {
 // Shard administration: split, merge, move, and rebalance. These operations
 // preserve the invariant that, for a table, shard ranges form a contiguous,
 // non-overlapping cover of the key space — no key is ever lost or duplicated.
-fn new_shard(table_id: TableId, name: String, start_key: Vec<u8>, end_key: Vec<u8>) -> ShardDescriptor {
+fn new_shard(
+    table_id: TableId,
+    name: String,
+    start_key: Vec<u8>,
+    end_key: Vec<u8>,
+) -> ShardDescriptor {
     let now = chrono::Utc::now();
     ShardDescriptor {
         id: ShardId::new(),
@@ -98,8 +103,10 @@ impl ShardOrchestrator {
             .ok_or_else(|| anyhow::anyhow!("shard {shard_id} not found"))?;
         let shard = &map.shards[idx];
 
-        let after_start = shard.start_key.is_empty() || split_key.as_slice() > shard.start_key.as_slice();
-        let before_end = shard.end_key.is_empty() || split_key.as_slice() < shard.end_key.as_slice();
+        let after_start =
+            shard.start_key.is_empty() || split_key.as_slice() > shard.start_key.as_slice();
+        let before_end =
+            shard.end_key.is_empty() || split_key.as_slice() < shard.end_key.as_slice();
         if split_key.is_empty() || !after_start || !before_end {
             anyhow::bail!("split key is not strictly within shard {shard_id}");
         }
@@ -192,7 +199,7 @@ impl ShardOrchestrator {
         }
         let map = self.meta.get_shard_map(table_id)?;
         let mut shards = map.shards.clone();
-        shards.sort_by(|a, b| sort_key(&a.start_key).cmp(&sort_key(&b.start_key)));
+        shards.sort_by_key(|s| sort_key(&s.start_key));
         let mut p = self.placements.write().unwrap();
         for (i, shard) in shards.iter().enumerate() {
             p.insert(shard.id, nodes[i % nodes.len()].clone());
@@ -221,11 +228,20 @@ mod tests {
     /// -infinity to +infinity — i.e. no key lost or duplicated.
     fn assert_contiguous_cover(map: &ShardMap) {
         let mut shards = map.shards.clone();
-        shards.sort_by(|a, b| sort_key(&a.start_key).cmp(&sort_key(&b.start_key)));
-        assert!(shards.first().unwrap().start_key.is_empty(), "missing -inf start");
-        assert!(shards.last().unwrap().end_key.is_empty(), "missing +inf end");
+        shards.sort_by_key(|s| sort_key(&s.start_key));
+        assert!(
+            shards.first().unwrap().start_key.is_empty(),
+            "missing -inf start"
+        );
+        assert!(
+            shards.last().unwrap().end_key.is_empty(),
+            "missing +inf end"
+        );
         for w in shards.windows(2) {
-            assert_eq!(w[0].end_key, w[1].start_key, "gap or overlap between shards");
+            assert_eq!(
+                w[0].end_key, w[1].start_key,
+                "gap or overlap between shards"
+            );
         }
     }
 
