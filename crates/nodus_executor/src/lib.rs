@@ -12,6 +12,7 @@ use nodus_catalog::{
 use nodus_storage_api::{KeyRange, KvEngine, Timestamp, TxnId};
 use nodus_txn::TxnManager;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// A column definition parsed from `CREATE TABLE`.
@@ -492,8 +493,9 @@ pub struct MemExecutor {
     audit: Arc<dyn AuditSink>,
     kv: Arc<dyn KvEngine>,
     txn: Arc<dyn TxnManager>,
-    // Hack for MVP: track active transaction in memory for the single session
-    active_txn: std::sync::RwLock<Option<(TxnId, Timestamp)>>,
+    /// Active explicit transaction per session id (`BEGIN`..`COMMIT`/`ROLLBACK`).
+    /// Keyed by session so one connection's transaction can't affect another's.
+    active_txns: std::sync::RwLock<HashMap<String, (TxnId, Timestamp)>>,
 }
 
 impl MemExecutor {
@@ -526,7 +528,7 @@ impl MemExecutor {
             audit,
             kv,
             txn,
-            active_txn: std::sync::RwLock::new(None),
+            active_txns: std::sync::RwLock::new(HashMap::new()),
         }
     }
 
@@ -557,16 +559,27 @@ impl MemExecutor {
         self.kv.garbage_collect(watermark)
     }
 
-    fn read_ts(&self) -> Timestamp {
-        match *self.active_txn.read().unwrap() {
-            Some((_, ts)) => ts,
-            None => u64::MAX, // read latest when no active txn
+    /// Read timestamp for a session: its active transaction's snapshot, or the
+    /// latest committed state when the session has no open transaction.
+    fn read_ts(&self, session: &str) -> Timestamp {
+        match self.active_txns.read().unwrap().get(session) {
+            Some((_, ts)) => *ts,
+            None => u64::MAX,
+        }
+    }
+
+    /// Returns the session's active txn id, or begins a fresh auto-commit txn.
+    /// The bool is true when the caller must commit (auto-commit).
+    fn txn_for(&self, session: &str) -> Result<(TxnId, bool)> {
+        match self.active_txns.read().unwrap().get(session) {
+            Some((tid, _)) => Ok((*tid, false)),
+            None => Ok((self.txn.begin_txn()?.txn_id, true)),
         }
     }
 
     /// Scans all visible rows of a table, decoding each into typed values.
-    fn scan_rows(&self, table_id: TableId) -> Result<Vec<Vec<Value>>> {
-        let read_ts = self.read_ts();
+    fn scan_rows(&self, table_id: TableId, session: &str) -> Result<Vec<Vec<Value>>> {
+        let read_ts = self.read_ts(session);
         let start = Bytes::from(format!("{}:", table_id));
         let end = Bytes::from(format!("{};", table_id));
         let mut rows = Vec::new();
@@ -577,13 +590,9 @@ impl MemExecutor {
         Ok(rows)
     }
 
-    /// Writes a row value at `key`, using the active txn or an auto-commit txn.
-    fn write_row(&self, key: String, value: String) -> Result<()> {
-        let active = *self.active_txn.read().unwrap();
-        let (txn_id, auto) = match active {
-            Some((tid, _)) => (tid, false),
-            None => (self.txn.begin_txn()?.txn_id, true),
-        };
+    /// Writes a row value at `key`, using the session's txn or an auto-commit txn.
+    fn write_row(&self, session: &str, key: String, value: String) -> Result<()> {
+        let (txn_id, auto) = self.txn_for(session)?;
         self.kv
             .write_intent(txn_id, Bytes::from(key), Bytes::from(value))?;
         if auto {
@@ -593,13 +602,9 @@ impl MemExecutor {
         Ok(())
     }
 
-    /// Tombstones `key`, using the active txn or an auto-commit txn.
-    fn delete_row(&self, key: String) -> Result<()> {
-        let active = *self.active_txn.read().unwrap();
-        let (txn_id, auto) = match active {
-            Some((tid, _)) => (tid, false),
-            None => (self.txn.begin_txn()?.txn_id, true),
-        };
+    /// Tombstones `key`, using the session's txn or an auto-commit txn.
+    fn delete_row(&self, session: &str, key: String) -> Result<()> {
+        let (txn_id, auto) = self.txn_for(session)?;
         self.kv.delete_intent(txn_id, Bytes::from(key))?;
         if auto {
             let commit_ts = self.txn.commit_txn(txn_id)?;
@@ -786,7 +791,7 @@ impl Executor for MemExecutor {
                 let pk = row.first().map(render).unwrap_or_default();
                 let key = format!("{}:{}", tbl.id, pk);
                 let encoded = serde_json::to_string(&row)?;
-                self.write_row(key, encoded)?;
+                self.write_row(&ctx.session_id, key, encoded)?;
                 Ok(QueryOutput::tag("INSERT 0 1"))
             }
             LogicalPlan::Select {
@@ -808,7 +813,7 @@ impl Executor for MemExecutor {
                     .iter()
                     .map(|c| format!("{}.{}", table_name, c.name))
                     .collect();
-                let mut stored_rows = self.scan_rows(tbl.id)?;
+                let mut stored_rows = self.scan_rows(tbl.id, &ctx.session_id)?;
 
                 for join in &joins {
                     let j_tbl =
@@ -816,7 +821,7 @@ impl Executor for MemExecutor {
                             .get_table("default", "public", &join.table_name)?;
                     self.authorize(ctx, Action::Select, ResourceRef::Table(j_tbl.id))?;
 
-                    let j_rows = self.scan_rows(j_tbl.id)?;
+                    let j_rows = self.scan_rows(j_tbl.id, &ctx.session_id)?;
                     let j_col_names: Vec<String> = j_tbl
                         .columns
                         .iter()
@@ -915,7 +920,7 @@ impl Executor for MemExecutor {
                 let col_names: Vec<&str> = tbl.columns.iter().map(|c| c.name.as_str()).collect();
 
                 let mut updated = 0;
-                for mut row in self.scan_rows(tbl.id)? {
+                for mut row in self.scan_rows(tbl.id, &ctx.session_id)? {
                     if !self.row_matches(&row, &tbl.columns, &filter) {
                         continue;
                     }
@@ -928,9 +933,13 @@ impl Executor for MemExecutor {
                     }
                     let new_key =
                         format!("{}:{}", tbl.id, row.first().map(render).unwrap_or_default());
-                    self.write_row(new_key.clone(), serde_json::to_string(&row)?)?;
+                    self.write_row(
+                        &ctx.session_id,
+                        new_key.clone(),
+                        serde_json::to_string(&row)?,
+                    )?;
                     if new_key != old_key {
-                        self.delete_row(old_key)?;
+                        self.delete_row(&ctx.session_id, old_key)?;
                     }
                     updated += 1;
                 }
@@ -943,35 +952,38 @@ impl Executor for MemExecutor {
                 self.authorize(ctx, Action::Delete, ResourceRef::Table(tbl.id))?;
 
                 let mut deleted = 0;
-                for row in self.scan_rows(tbl.id)? {
+                for row in self.scan_rows(tbl.id, &ctx.session_id)? {
                     if !self.row_matches(&row, &tbl.columns, &filter) {
                         continue;
                     }
                     let key = format!("{}:{}", tbl.id, row.first().map(render).unwrap_or_default());
-                    self.delete_row(key)?;
+                    self.delete_row(&ctx.session_id, key)?;
                     deleted += 1;
                 }
                 Ok(QueryOutput::tag(&format!("DELETE {deleted}")))
             }
             LogicalPlan::Begin => {
                 let txn_record = self.txn.begin_txn()?;
-                *self.active_txn.write().unwrap() = Some((txn_record.txn_id, txn_record.read_ts));
+                self.active_txns.write().unwrap().insert(
+                    ctx.session_id.clone(),
+                    (txn_record.txn_id, txn_record.read_ts),
+                );
                 Ok(QueryOutput::tag("BEGIN"))
             }
             LogicalPlan::Commit => {
-                if let Some((txn_id, _)) = *self.active_txn.read().unwrap() {
+                if let Some((txn_id, _)) = self.active_txns.write().unwrap().remove(&ctx.session_id)
+                {
                     let commit_ts = self.txn.commit_txn(txn_id)?;
                     self.kv.commit(txn_id, commit_ts)?;
                 }
-                *self.active_txn.write().unwrap() = None;
                 Ok(QueryOutput::tag("COMMIT"))
             }
             LogicalPlan::Rollback => {
-                if let Some((txn_id, _)) = *self.active_txn.read().unwrap() {
+                if let Some((txn_id, _)) = self.active_txns.write().unwrap().remove(&ctx.session_id)
+                {
                     self.txn.abort_txn(txn_id)?;
                     self.kv.abort(txn_id)?;
                 }
-                *self.active_txn.write().unwrap() = None;
                 Ok(QueryOutput::tag("ROLLBACK"))
             }
             LogicalPlan::ShowVariable { variable } => {
@@ -1005,11 +1017,11 @@ impl Executor for MemExecutor {
         }
     }
 
-    fn execute_physical(&self, _ctx: &ExecutionContext, plan: PhysicalPlan) -> Result<Vec<Row>> {
+    fn execute_physical(&self, ctx: &ExecutionContext, plan: PhysicalPlan) -> Result<Vec<Row>> {
         // Retained for the point-get path used by lower layers/tests.
         match plan {
             PhysicalPlan::LocalPointGet { table_id, id } => {
-                let read_ts = self.read_ts();
+                let read_ts = self.read_ts(&ctx.session_id);
                 let key = format!("{}:{}", table_id, id);
                 match self.kv.get(key.as_bytes(), read_ts)? {
                     Some(val) => {
@@ -1403,6 +1415,89 @@ mod tests {
         assert_eq!(out.rows.len(), 2);
         assert_eq!(out.rows[0].columns, vec!["Dune", "Herbert"]);
         assert_eq!(out.rows[1].columns, vec!["Dune Messiah", "Herbert"]);
+    }
+
+    #[test]
+    fn transactions_are_isolated_per_session() {
+        let (exec, cat) = MemExecutor::shared(Arc::new(MemoryAuditSink::new()));
+        let admin = cat
+            .create_role(CreateRoleRequest {
+                name: "admin".into(),
+                principal_type: PrincipalType::User,
+                database_id: None,
+            })
+            .unwrap();
+        cat.grant_privilege(GrantPrivilegeRequest {
+            principal_id: admin.id,
+            resource: ResourceRef::System,
+            privilege: "ALL".into(),
+        })
+        .unwrap();
+
+        let ctx_a = ExecutionContext {
+            session_id: "sess-a".into(),
+            principal_id: admin.id,
+            active_roles: vec![],
+            authz_catalog_version: 1,
+        };
+        let ctx_b = ExecutionContext {
+            session_id: "sess-b".into(),
+            principal_id: admin.id,
+            active_roles: vec![],
+            authz_catalog_version: 1,
+        };
+
+        exec.execute_logical(
+            &ctx_a,
+            LogicalPlan::CreateTable {
+                name: "t".into(),
+                columns: cols(&[("id", "INT"), ("name", "TEXT")]),
+            },
+        )
+        .unwrap();
+
+        // Session A opens a transaction; session B does NOT.
+        exec.execute_logical(&ctx_a, LogicalPlan::Begin).unwrap();
+
+        // Session B auto-commits an insert while A's txn is open.
+        exec.execute_logical(
+            &ctx_b,
+            LogicalPlan::Insert {
+                table_name: "t".into(),
+                columns: vec!["id".into(), "name".into()],
+                values: vec!["1".into(), "b".into()],
+            },
+        )
+        .unwrap();
+
+        // B sees its own committed row immediately (B has no open snapshot).
+        let read = |ctx: &ExecutionContext| {
+            exec.execute_logical(
+                ctx,
+                LogicalPlan::Select {
+                    table_name: "t".into(),
+                    joins: vec![],
+                    projection: vec![],
+                    filter: vec![],
+                    order_by: None,
+                    limit: None,
+                },
+            )
+            .unwrap()
+            .rows
+            .len()
+        };
+        assert_eq!(
+            read(&ctx_b),
+            1,
+            "session B sees its own auto-committed write"
+        );
+
+        // A COMMIT from B must not touch A's still-open transaction.
+        exec.execute_logical(&ctx_b, LogicalPlan::Commit).unwrap();
+        // A's transaction is still open and independently committable.
+        exec.execute_logical(&ctx_a, LogicalPlan::Commit).unwrap();
+        assert_eq!(read(&ctx_a), 1);
     }
 
     #[test]
