@@ -1,3 +1,6 @@
+mod admin;
+
+use admin::{AdminState, admin_routes};
 use axum::Router;
 use nodus_catalog::{
     CatalogWriter, CreateRoleRequest, GrantPrivilegeRequest, PrincipalType, ResourceRef,
@@ -74,8 +77,12 @@ pub async fn run_server(
         .allow_methods(Any)
         .allow_headers(Any);
 
+    let admin_state = AdminState {
+        registry: registry.clone(),
+    };
     let app = Router::new()
         .merge(monitoring_routes(state))
+        .merge(admin_routes(admin_state))
         .merge(nodus_web_console::web_console_routes())
         .layer(cors);
 

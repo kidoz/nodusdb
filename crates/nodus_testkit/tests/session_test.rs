@@ -51,6 +51,50 @@ async fn pgwire_sessions_are_per_connection_and_killable() {
 }
 
 #[tokio::test]
+async fn admin_session_api_lists_and_kills() {
+    let server = TestServer::start().await.expect("server starts");
+    let client = connect(&server.pgwire_addr).await;
+    client.simple_query("SELECT 1").await.unwrap();
+
+    let http = reqwest::Client::new();
+    let base = format!("http://{}", server.http_addr);
+
+    let sessions: serde_json::Value = http
+        .get(format!("{base}/api/v1/sessions"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let arr = sessions.as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    let id = arr[0]["session_id"].as_str().unwrap().to_string();
+
+    let killed: bool = http
+        .post(format!("{base}/api/v1/sessions/{id}/kill"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(killed);
+    assert!(server.registry.is_cancelled(&id));
+
+    // Unknown id returns false.
+    let missing: bool = http
+        .post(format!("{base}/api/v1/sessions/does-not-exist/kill"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(!missing);
+}
+
+#[tokio::test]
 async fn pgwire_rejects_bad_password() {
     let server = TestServer::start().await.expect("server starts");
     let bad = format!(

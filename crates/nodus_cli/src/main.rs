@@ -30,12 +30,33 @@ enum Commands {
         #[arg(long, default_value = DEFAULT_ADDR)]
         addr: String,
     },
+    /// Inspect and manage active sessions
+    Session {
+        #[command(subcommand)]
+        cmd: SessionCmd,
+    },
 }
 
 #[derive(Subcommand)]
 enum ClusterCmd {
     /// Show a cluster overview (nodes, shards, QPS, alerts)
     Info {
+        #[arg(long, default_value = DEFAULT_ADDR)]
+        addr: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum SessionCmd {
+    /// List active client sessions
+    List {
+        #[arg(long, default_value = DEFAULT_ADDR)]
+        addr: String,
+    },
+    /// Terminate a session by id
+    Kill {
+        #[arg(long)]
+        id: String,
         #[arg(long, default_value = DEFAULT_ADDR)]
         addr: String,
     },
@@ -85,6 +106,46 @@ async fn main() -> anyhow::Result<()> {
                 .text()
                 .await?;
             print!("{body}");
+        }
+        Commands::Session {
+            cmd: SessionCmd::List { addr },
+        } => {
+            let sessions: serde_json::Value = client
+                .get(format!("{addr}/api/v1/sessions"))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            let empty = vec![];
+            let arr = sessions.as_array().unwrap_or(&empty);
+            if arr.is_empty() {
+                println!("No active sessions.");
+            }
+            for s in arr {
+                println!(
+                    "{}  principal={}  query={}",
+                    s["session_id"].as_str().unwrap_or("?"),
+                    s["principal_id"].as_str().unwrap_or("?"),
+                    s["current_query"].as_str().unwrap_or("-")
+                );
+            }
+        }
+        Commands::Session {
+            cmd: SessionCmd::Kill { id, addr },
+        } => {
+            let killed: bool = client
+                .post(format!("{addr}/api/v1/sessions/{id}/kill"))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            if killed {
+                println!("Session {id} terminated.");
+            } else {
+                anyhow::bail!("session {id} not found");
+            }
         }
     }
 
