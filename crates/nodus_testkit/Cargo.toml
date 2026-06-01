@@ -11,3 +11,4 @@ reqwest.workspace = true
 tokio.workspace = true
 tokio-postgres.workspace = true
 anyhow.workspace = true
+thiserror.workspace = true
