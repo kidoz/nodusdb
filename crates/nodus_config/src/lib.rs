@@ -27,6 +27,15 @@ pub struct NodusConfig {
     pub tls: TlsConfig,
     pub backup: BackupConfig,
     pub observability: ObservabilityConfig,
+    pub admin: AdminConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct AdminConfig {
+    /// Bearer token required on `/api/v1/*` admin endpoints. When unset (default),
+    /// the admin API is unauthenticated — only safe bound to localhost.
+    pub token: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -72,6 +81,7 @@ impl Default for NodusConfig {
             tls: TlsConfig::default(),
             backup: BackupConfig::default(),
             observability: ObservabilityConfig::default(),
+            admin: AdminConfig::default(),
         }
     }
 }

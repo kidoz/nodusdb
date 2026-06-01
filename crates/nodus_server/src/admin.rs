@@ -2,7 +2,10 @@
 
 use axum::{
     Json, Router,
-    extract::{Path, Query, State},
+    extract::{Path, Query, Request, State},
+    http::{StatusCode, header::AUTHORIZATION},
+    middleware::{Next, from_fn_with_state},
+    response::Response,
     routing::{get, post},
 };
 use bytes::Bytes;
@@ -34,6 +37,28 @@ pub struct AdminState {
     pub slow_log: Arc<SlowQueryLog>,
     /// Shared with `AppState`; flipping it makes `/readyz` report not-ready.
     pub draining: Arc<AtomicBool>,
+    /// Bearer token required on admin endpoints; `None` disables auth.
+    pub admin_token: Option<String>,
+}
+
+/// Rejects requests lacking a valid `Authorization: Bearer <token>` header when
+/// an admin token is configured. A no-op when no token is set.
+async fn require_token(
+    State(state): State<AdminState>,
+    req: Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    if let Some(expected) = &state.admin_token {
+        let provided = req
+            .headers()
+            .get(AUTHORIZATION)
+            .and_then(|h| h.to_str().ok())
+            .and_then(|h| h.strip_prefix("Bearer "));
+        if provided != Some(expected.as_str()) {
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+    }
+    Ok(next.run(req).await)
 }
 
 pub fn admin_routes(state: AdminState) -> Router {
@@ -56,6 +81,7 @@ pub fn admin_routes(state: AdminState) -> Router {
         .route("/api/v1/shards/:table/rebalance", post(shards_rebalance))
         .route("/api/v1/queries", get(slow_queries))
         .route("/api/v1/node/drain", post(node_drain))
+        .route_layer(from_fn_with_state(state.clone(), require_token))
         .with_state(state)
 }
 

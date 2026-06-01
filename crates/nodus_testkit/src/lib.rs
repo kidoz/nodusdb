@@ -16,10 +16,15 @@ pub struct TestServer {
 
 impl TestServer {
     pub async fn start() -> anyhow::Result<Self> {
+        Self::start_with_config(nodus_config::NodusConfig::default()).await
+    }
+
+    pub async fn start_with_config(config: nodus_config::NodusConfig) -> anyhow::Result<Self> {
         let pgwire_listener = TcpListener::bind("127.0.0.1:0").await?;
         let http_listener = TcpListener::bind("127.0.0.1:0").await?;
 
-        let handle = nodus_server::run_server(pgwire_listener, http_listener).await?;
+        let handle =
+            nodus_server::run_server_with_config(pgwire_listener, http_listener, config).await?;
 
         Ok(Self {
             pgwire_addr: handle.pgwire_addr,

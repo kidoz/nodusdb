@@ -340,6 +340,47 @@ async fn admin_node_drain_makes_unready() {
 }
 
 #[tokio::test]
+async fn admin_api_requires_token_when_configured() {
+    let mut config = nodus_config::NodusConfig::default();
+    config.admin.token = Some("s3cr3t".into());
+    let server = TestServer::start_with_config(config)
+        .await
+        .expect("server starts");
+    let http = reqwest::Client::new();
+    let base = format!("http://{}", server.http_addr);
+
+    // No token → 401.
+    let r = http
+        .get(format!("{base}/api/v1/sessions"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 401);
+
+    // Wrong token → 401.
+    let r = http
+        .get(format!("{base}/api/v1/sessions"))
+        .header("Authorization", "Bearer nope")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 401);
+
+    // Correct token → 200.
+    let r = http
+        .get(format!("{base}/api/v1/sessions"))
+        .header("Authorization", "Bearer s3cr3t")
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success());
+
+    // Health/readiness are not behind the admin token.
+    let r = http.get(format!("{base}/readyz")).send().await.unwrap();
+    assert!(r.status().is_success());
+}
+
+#[tokio::test]
 async fn pgwire_rejects_bad_password() {
     let server = TestServer::start().await.expect("server starts");
     let bad = format!(

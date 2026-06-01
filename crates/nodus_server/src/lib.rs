@@ -191,6 +191,7 @@ pub async fn run_server_with_config(
         shards,
         slow_log,
         draining: state.draining.clone(),
+        admin_token: config.admin.token.clone(),
     };
     let app = Router::new()
         .merge(monitoring_routes(state))
