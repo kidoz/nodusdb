@@ -1582,6 +1582,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "nodus_catalog",
  "nodus_common",
  "nodus_config",
  "nodus_error",

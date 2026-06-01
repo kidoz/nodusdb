@@ -1,6 +1,9 @@
 use axum::Router;
+use nodus_catalog::{
+    CatalogWriter, CreateRoleRequest, GrantPrivilegeRequest, PrincipalType, ResourceRef,
+};
 use nodus_monitoring::{AppState, monitoring_routes};
-use nodus_security::SessionRegistry;
+use nodus_security::{PasswordAuthenticator, SessionRegistry};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -28,16 +31,38 @@ pub async fn run_server(
         .is_ready
         .store(true, std::sync::atomic::Ordering::Release);
 
+    // Shared catalog so the authenticator's principals and the executor's
+    // authorization grants resolve against the same data.
+    let (executor, catalog) = nodus_executor::MemExecutor::shared();
+    let admin = catalog
+        .create_role(CreateRoleRequest {
+            name: "nodus".into(),
+            principal_type: PrincipalType::User,
+            database_id: None,
+        })
+        .map_err(|e| anyhow::anyhow!("seed admin: {e}"))?;
+    // Bootstrap superuser: ALL on System bypasses per-resource grant checks.
+    catalog
+        .grant_privilege(GrantPrivilegeRequest {
+            principal_id: admin.id,
+            resource: ResourceRef::System,
+            privilege: "ALL".into(),
+        })
+        .map_err(|e| anyhow::anyhow!("seed admin grant: {e}"))?;
+    let authenticator = Arc::new(PasswordAuthenticator::new(catalog));
+    // Default development credentials; override before production use.
+    authenticator.set_password("nodus", admin.id, "nodus");
+
     let registry = Arc::new(SessionRegistry::new());
     let pgwire_metrics = state.metrics.clone();
     let pgwire_registry = registry.clone();
     let pgwire_task = tokio::spawn(async move {
-        let executor = Arc::new(nodus_executor::MemExecutor::default());
         nodus_pgwire::start_pgwire_server(
             pgwire_listener,
             executor,
             pgwire_metrics,
             pgwire_registry,
+            authenticator,
         )
         .await
     });

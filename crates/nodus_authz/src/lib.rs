@@ -112,13 +112,32 @@ impl DefaultAuthzEngine {
         });
         Ok((matched, effective, catalog_version))
     }
+
+    /// True when an effective principal holds an `ALL` grant on the `System`
+    /// resource, i.e. a superuser who bypasses per-resource grant checks.
+    fn is_superuser(&self, effective: &[PrincipalId]) -> Result<bool> {
+        let sys_grants = self.catalog.get_grants_for_resource(ResourceRef::System)?;
+        Ok(sys_grants.iter().any(|g| {
+            effective.contains(&g.principal_id) && g.privilege.eq_ignore_ascii_case("ALL")
+        }))
+    }
 }
 
 impl AuthzEngine for DefaultAuthzEngine {
     fn authorize(&self, request: AuthzRequest) -> Result<AuthzDecision> {
         // Deny-by-default: a request is allowed only when a grant on the
         // resource matches the principal (directly or via one of its roles).
-        let (matched, _effective, catalog_version) = self.find_matching_grant(&request)?;
+        let (matched, effective, catalog_version) = self.find_matching_grant(&request)?;
+
+        if self.is_superuser(&effective)? {
+            return Ok(AuthzDecision {
+                allowed: true,
+                reason: AuthzReason::Superuser,
+                matched_grants: vec![],
+                matched_policies: vec![],
+                catalog_version,
+            });
+        }
 
         match matched {
             Some(grant) => {
@@ -163,6 +182,15 @@ impl AuthzEngine for DefaultAuthzEngine {
                 effective.len().saturating_sub(1)
             ),
         ];
+
+        if self.is_superuser(&effective)? {
+            steps.push("Principal holds ALL on System (superuser).".to_string());
+            steps.push("Decision: ALLOW.".to_string());
+            return Ok(AuthzExplanation {
+                is_allowed: true,
+                steps,
+            });
+        }
 
         match matched {
             Some(grant) => {

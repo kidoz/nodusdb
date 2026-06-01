@@ -7,7 +7,7 @@ use futures_util::{Sink, SinkExt, stream};
 use tokio::net::TcpListener;
 use tracing::{error, info};
 
-use nodus_catalog::{CatalogWriter, CreateRoleRequest, MemoryCatalog, PrincipalId, PrincipalType};
+use nodus_catalog::PrincipalId;
 use nodus_security::{Authenticator, PasswordAuthenticator, Session, SessionRegistry};
 use pgwire::api::auth::{
     DefaultServerParameterProvider, LoginInfo, StartupHandler, finish_authentication,
@@ -110,7 +110,7 @@ impl StartupHandler for NodusStartupHandler {
 impl SimpleQueryHandler for NodusQueryHandler {
     async fn do_query<'a, C>(
         &self,
-        _client: &mut C,
+        client: &mut C,
         query: &'a str,
     ) -> PgWireResult<Vec<Response<'a>>>
     where
@@ -128,8 +128,19 @@ impl SimpleQueryHandler for NodusQueryHandler {
         }
         self.registry.set_current_query(&self.session_id, query);
 
+        // The authenticated principal was stashed in connection metadata by the
+        // startup handler; carry it into the execution context for authorization.
+        let principal_id = client
+            .metadata()
+            .get("nodus_principal_id")
+            .and_then(|s| Uuid::parse_str(s).ok())
+            .map(PrincipalId)
+            .unwrap_or_default();
+
         let ctx = nodus_executor::ExecutionContext {
             session_id: self.session_id.clone(),
+            principal_id,
+            active_roles: vec![],
             authz_catalog_version: 1,
         };
 
@@ -359,32 +370,15 @@ impl PgWireHandlerFactory for NodusPgWireServer {
     }
 }
 
-/// Builds a password authenticator seeded with a default superuser. The
-/// catalog here is dedicated to authentication; sharing it with the executor's
-/// catalog (so grants line up) follows when authorization is wired in.
-pub fn default_authenticator() -> Arc<PasswordAuthenticator> {
-    let catalog = Arc::new(MemoryCatalog::new());
-    let admin = catalog
-        .create_role(CreateRoleRequest {
-            name: "nodus".into(),
-            principal_type: PrincipalType::User,
-            database_id: None,
-        })
-        .expect("seed default admin principal");
-    let authenticator = Arc::new(PasswordAuthenticator::new(catalog));
-    // Default development credentials; override before production use.
-    authenticator.set_password("nodus", admin.id, "nodus");
-    authenticator
-}
-
 pub async fn start_pgwire_server(
     listener: TcpListener,
     executor: Arc<dyn nodus_executor::Executor>,
     metrics: nodus_monitoring::Metrics,
     registry: Arc<SessionRegistry>,
+    authenticator: Arc<PasswordAuthenticator>,
 ) -> anyhow::Result<()> {
     let startup_handler = Arc::new(NodusStartupHandler {
-        authenticator: default_authenticator(),
+        authenticator,
         param_provider: DefaultServerParameterProvider::default(),
     });
     let factory = Arc::new(NodusPgWireServer {

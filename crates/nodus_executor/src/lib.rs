@@ -3,10 +3,10 @@
 use anyhow::Result;
 use bytes::Bytes;
 use chrono::Utc;
-use nodus_authz::AuthzEngine;
+use nodus_authz::{Action, AuthzContext, AuthzEngine, AuthzRequest};
 use nodus_catalog::{
     CatalogReader, CatalogWriter, ColumnDescriptor, CreateTableRequest, DescriptorState, IndexId,
-    TableId,
+    MemoryCatalog, PrincipalId, ResourceRef, RoleId, TableId,
 };
 use nodus_storage_api::{KvEngine, Timestamp, TxnId};
 use nodus_txn::TxnManager;
@@ -174,6 +174,9 @@ pub enum PhysicalPlan {
 
 pub struct ExecutionContext {
     pub session_id: String,
+    /// Authenticated principal making the request; used for authorization.
+    pub principal_id: PrincipalId,
+    pub active_roles: Vec<RoleId>,
     pub authz_catalog_version: u64,
 }
 
@@ -230,6 +233,38 @@ impl MemExecutor {
             active_txn: std::sync::RwLock::new(None),
         }
     }
+
+    /// Builds an executor over fresh in-memory components and returns it
+    /// together with the shared catalog, so callers (e.g. the server) can seed
+    /// principals/grants and an authenticator against the same catalog.
+    pub fn shared() -> (Arc<MemExecutor>, Arc<MemoryCatalog>) {
+        let cat = Arc::new(MemoryCatalog::new());
+        let kv = Arc::new(nodus_storage_mem::MemKvEngine::new());
+        let txn = Arc::new(nodus_txn::MemTxnManager::new());
+        let authz = Arc::new(nodus_authz::DefaultAuthzEngine::new(cat.clone()));
+        let exec = Arc::new(MemExecutor::new(cat.clone(), cat.clone(), authz, kv, txn));
+        (exec, cat)
+    }
+
+    /// Deny-by-default authorization gate for a single action on a resource.
+    fn authorize(
+        &self,
+        ctx: &ExecutionContext,
+        action: Action,
+        resource: ResourceRef,
+    ) -> Result<()> {
+        let decision = self.authz.authorize(AuthzRequest {
+            principal_id: ctx.principal_id,
+            active_roles: ctx.active_roles.clone(),
+            action,
+            resource,
+            context: AuthzContext { database_id: None },
+        })?;
+        if !decision.allowed {
+            anyhow::bail!("permission denied");
+        }
+        Ok(())
+    }
 }
 
 // Temporary default constructor so we don't break existing setups
@@ -254,6 +289,7 @@ impl Executor for MemExecutor {
             LogicalPlan::CreateTable { name } => {
                 let db = self.catalog_reader.get_database("default")?;
                 let sch = self.catalog_reader.get_schema("default", "public")?;
+                self.authorize(ctx, Action::CreateTable, ResourceRef::Schema(sch.id))?;
                 self.catalog_writer.create_table(CreateTableRequest {
                     database_id: db.id,
                     schema_id: sch.id,
@@ -293,6 +329,7 @@ impl Executor for MemExecutor {
                 let tbl = self
                     .catalog_reader
                     .get_table("default", "public", &table_name)?;
+                self.authorize(ctx, Action::Insert, ResourceRef::Table(tbl.id))?;
                 self.execute_physical(
                     ctx,
                     PhysicalPlan::LocalInsert {
@@ -306,6 +343,7 @@ impl Executor for MemExecutor {
                 let tbl = self
                     .catalog_reader
                     .get_table("default", "public", &table_name)?;
+                self.authorize(ctx, Action::Select, ResourceRef::Table(tbl.id))?;
                 self.execute_physical(
                     ctx,
                     PhysicalPlan::LocalPointGet {
@@ -427,14 +465,21 @@ impl Executor for MemExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nodus_catalog::{CreateRoleRequest, GrantPrivilegeRequest, PrincipalType};
+
+    fn ctx_for(principal: PrincipalId) -> ExecutionContext {
+        ExecutionContext {
+            session_id: "test".to_string(),
+            principal_id: principal,
+            active_roles: vec![],
+            authz_catalog_version: 1,
+        }
+    }
 
     #[test]
     fn test_executor_scaffold() {
         let exec = MemExecutor::default();
-        let ctx = ExecutionContext {
-            session_id: "test".to_string(),
-            authz_catalog_version: 1,
-        };
+        let ctx = ctx_for(PrincipalId::new());
         exec.execute_logical(&ctx, LogicalPlan::Begin).unwrap();
         exec.execute_physical(
             &ctx,
@@ -444,5 +489,37 @@ mod tests {
             },
         )
         .unwrap();
+    }
+
+    #[test]
+    fn create_table_denied_then_allowed_by_grant() {
+        let (exec, cat) = MemExecutor::shared();
+        let user = cat
+            .create_role(CreateRoleRequest {
+                name: "bob".into(),
+                principal_type: PrincipalType::User,
+                database_id: None,
+            })
+            .unwrap();
+        let ctx = ctx_for(user.id);
+
+        // Deny-by-default: no grant yet.
+        assert!(
+            exec.execute_logical(&ctx, LogicalPlan::CreateTable { name: "t1".into() })
+                .is_err()
+        );
+
+        // Grant CREATE_TABLE on the public schema, then it succeeds.
+        let sch = cat.get_schema("default", "public").unwrap();
+        cat.grant_privilege(GrantPrivilegeRequest {
+            principal_id: user.id,
+            resource: ResourceRef::Schema(sch.id),
+            privilege: "CREATE_TABLE".into(),
+        })
+        .unwrap();
+        assert!(
+            exec.execute_logical(&ctx, LogicalPlan::CreateTable { name: "t1".into() })
+                .is_ok()
+        );
     }
 }
