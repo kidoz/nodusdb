@@ -76,14 +76,22 @@ fn load_tls_acceptor(tls: &nodus_config::TlsConfig) -> anyhow::Result<Option<Arc
 pub async fn run_server(
     pgwire_listener: TcpListener,
     http_listener: TcpListener,
+    shutdown: tokio::sync::watch::Receiver<()>,
 ) -> anyhow::Result<ServerHandle> {
-    run_server_with_config(pgwire_listener, http_listener, NodusConfig::default()).await
+    run_server_with_config(
+        pgwire_listener,
+        http_listener,
+        NodusConfig::default(),
+        shutdown,
+    )
+    .await
 }
 
 pub async fn run_server_with_config(
     pgwire_listener: TcpListener,
     http_listener: TcpListener,
     config: NodusConfig,
+    mut shutdown: tokio::sync::watch::Receiver<()>,
 ) -> anyhow::Result<ServerHandle> {
     let pgwire_addr = pgwire_listener.local_addr()?;
     let http_addr = http_listener.local_addr()?;
@@ -110,7 +118,11 @@ pub async fn run_server_with_config(
             (sink.clone(), sink)
         }
     };
-    let (executor, catalog) = nodus_executor::MemExecutor::shared(audit_sink);
+    let (executor, catalog) = match &config.storage.data_dir {
+        Some(dir) => nodus_executor::MemExecutor::persistent(audit_sink, dir)?,
+        None => nodus_executor::MemExecutor::shared(audit_sink),
+    };
+
     let admin = catalog
         .create_role(CreateRoleRequest {
             name: "nodus".into(),
@@ -157,6 +169,7 @@ pub async fn run_server_with_config(
     let pgwire_metrics = state.metrics.clone();
     let pgwire_registry = registry.clone();
     let pgwire_slow_log = slow_log.clone();
+    let pgwire_shutdown = shutdown.clone();
     let pgwire_task = tokio::spawn(async move {
         nodus_pgwire::start_pgwire_server(
             pgwire_listener,
@@ -166,6 +179,7 @@ pub async fn run_server_with_config(
             authenticator,
             pgwire_slow_log,
             tls_acceptor,
+            pgwire_shutdown,
         )
         .await
     });
@@ -211,7 +225,13 @@ pub async fn run_server_with_config(
         .merge(nodus_web_console::web_console_routes())
         .layer(cors);
 
-    let http_task = tokio::spawn(async move { axum::serve(http_listener, app).await });
+    let http_task = tokio::spawn(async move {
+        axum::serve(http_listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = shutdown.changed().await;
+            })
+            .await
+    });
 
     Ok(ServerHandle {
         pgwire_addr,

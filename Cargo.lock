@@ -1721,6 +1721,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "serde",
+ "serde_json",
  "thiserror 1.0.69",
  "uuid",
 ]
@@ -1775,6 +1776,7 @@ dependencies = [
  "nodus_sharding",
  "nodus_sql",
  "nodus_storage_api",
+ "nodus_storage_lsm",
  "nodus_storage_mem",
  "nodus_txn",
  "serde",
@@ -1901,7 +1903,10 @@ dependencies = [
  "nodus_pgwire",
  "nodus_security",
  "nodus_sharding",
+ "nodus_storage_api",
+ "nodus_storage_lsm",
  "nodus_telemetry",
+ "nodus_txn",
  "nodus_upgrade",
  "nodus_web_console",
  "rustls-pemfile",
@@ -1971,6 +1976,7 @@ dependencies = [
  "bytes",
  "nodus_mvcc",
  "nodus_storage_api",
+ "nodus_storage_wal",
  "serde",
  "serde_json",
  "tempfile",
@@ -1994,9 +2000,11 @@ name = "nodus_storage_wal"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "byteorder",
  "bytes",
  "nodus_storage_api",
  "serde",
+ "serde_json",
  "thiserror 1.0.69",
 ]
 

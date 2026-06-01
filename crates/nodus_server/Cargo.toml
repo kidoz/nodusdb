@@ -20,10 +20,13 @@ nodus_monitoring = { path = "../nodus_monitoring" }
 nodus_pgwire = { path = "../nodus_pgwire" }
 nodus_web_console = { path = "../nodus_web_console" }
 nodus_executor = { path = "../nodus_executor" }
+nodus_storage_api = { path = "../nodus_storage_api" }
+nodus_storage_lsm = { path = "../nodus_storage_lsm" }
+nodus_txn = { path = "../nodus_txn" }
+nodus_authz = { path = "../nodus_authz" }
 nodus_security = { path = "../nodus_security" }
 nodus_catalog = { path = "../nodus_catalog" }
 nodus_audit = { path = "../nodus_audit" }
-nodus_authz = { path = "../nodus_authz" }
 nodus_backup = { path = "../nodus_backup" }
 nodus_telemetry = { path = "../nodus_telemetry" }
 nodus_upgrade = { path = "../nodus_upgrade" }

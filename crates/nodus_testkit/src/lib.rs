@@ -10,8 +10,11 @@ pub struct TestServer {
     pub pgwire_addr: SocketAddr,
     pub http_addr: SocketAddr,
     pub registry: Arc<SessionRegistry>,
+    #[allow(dead_code)]
     pgwire_task: JoinHandle<anyhow::Result<()>>,
+    #[allow(dead_code)]
     http_task: JoinHandle<std::io::Result<()>>,
+    shutdown_tx: tokio::sync::watch::Sender<()>,
 }
 
 impl TestServer {
@@ -23,8 +26,15 @@ impl TestServer {
         let pgwire_listener = TcpListener::bind("127.0.0.1:0").await?;
         let http_listener = TcpListener::bind("127.0.0.1:0").await?;
 
-        let handle =
-            nodus_server::run_server_with_config(pgwire_listener, http_listener, config).await?;
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+
+        let handle = nodus_server::run_server_with_config(
+            pgwire_listener,
+            http_listener,
+            config,
+            shutdown_rx,
+        )
+        .await?;
 
         Ok(Self {
             pgwire_addr: handle.pgwire_addr,
@@ -32,13 +42,13 @@ impl TestServer {
             registry: handle.registry,
             pgwire_task: handle.pgwire_task,
             http_task: handle.http_task,
+            shutdown_tx,
         })
     }
 }
 
 impl Drop for TestServer {
     fn drop(&mut self) {
-        self.pgwire_task.abort();
-        self.http_task.abort();
+        let _ = self.shutdown_tx.send(());
     }
 }

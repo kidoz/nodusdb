@@ -446,6 +446,7 @@ pub struct MemoryCatalog {
     /// (role_principal_id, member_id) edges of the role-membership graph.
     memberships: RwLock<Vec<(PrincipalId, PrincipalId)>>,
     catalog_version: RwLock<u64>,
+    path: Option<std::path::PathBuf>,
 }
 
 impl Default for MemoryCatalog {
@@ -454,7 +455,77 @@ impl Default for MemoryCatalog {
     }
 }
 
+#[derive(Serialize, Deserialize)]
+struct MemoryCatalogState {
+    databases: HashMap<String, DatabaseDescriptor>,
+    schemas: Vec<((DatabaseId, String), SchemaDescriptor)>,
+    tables: Vec<((DatabaseId, SchemaId, String), TableDescriptor)>,
+    principals: HashMap<String, PrincipalDescriptor>,
+    grants: Vec<GrantDescriptor>,
+    roles: Vec<RoleMembershipDescriptor>,
+    memberships: Vec<(PrincipalId, PrincipalId)>,
+    catalog_version: u64,
+}
+
 impl MemoryCatalog {
+    pub fn load_from_disk(path: std::path::PathBuf) -> Result<Self> {
+        if path.exists() {
+            let data = std::fs::read_to_string(&path)?;
+            let state: MemoryCatalogState = serde_json::from_str(&data)?;
+            let schemas_map = state.schemas.into_iter().collect();
+            let tables_map = state.tables.into_iter().collect();
+            Ok(Self {
+                databases: RwLock::new(state.databases),
+                schemas: RwLock::new(schemas_map),
+                tables: RwLock::new(tables_map),
+                principals: RwLock::new(state.principals),
+                grants: RwLock::new(state.grants),
+                roles: RwLock::new(state.roles),
+                memberships: RwLock::new(state.memberships),
+                catalog_version: RwLock::new(state.catalog_version),
+                path: Some(path),
+            })
+        } else {
+            let mut cat = Self::new();
+            cat.path = Some(path);
+            Ok(cat)
+        }
+    }
+
+    pub fn save_to_disk(&self) -> Result<()> {
+        if let Some(path) = &self.path {
+            let schemas_vec: Vec<_> = self
+                .schemas
+                .read()
+                .unwrap()
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            let tables_vec: Vec<_> = self
+                .tables
+                .read()
+                .unwrap()
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+
+            let state = MemoryCatalogState {
+                databases: self.databases.read().unwrap().clone(),
+                schemas: schemas_vec,
+                tables: tables_vec,
+                principals: self.principals.read().unwrap().clone(),
+                grants: self.grants.read().unwrap().clone(),
+                roles: self.roles.read().unwrap().clone(),
+                memberships: self.memberships.read().unwrap().clone(),
+                catalog_version: *self.catalog_version.read().unwrap(),
+            };
+
+            let data = serde_json::to_string_pretty(&state)?;
+            std::fs::write(path, data)?;
+        }
+        Ok(())
+    }
+
     pub fn new() -> Self {
         Self {
             databases: RwLock::new(HashMap::new()),
@@ -465,13 +536,17 @@ impl MemoryCatalog {
             roles: RwLock::new(Vec::new()),
             memberships: RwLock::new(Vec::new()),
             catalog_version: RwLock::new(1),
+            path: None,
         }
     }
 
     fn increment_version(&self) -> u64 {
         let mut v = self.catalog_version.write().unwrap();
         *v += 1;
-        *v
+        let val = *v;
+        drop(v);
+        let _ = self.save_to_disk();
+        val
     }
 }
 

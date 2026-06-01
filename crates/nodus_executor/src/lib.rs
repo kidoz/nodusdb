@@ -532,6 +532,30 @@ impl MemExecutor {
         }
     }
 
+    /// Builds an executor over durable components (custom LSM + catalog snapshot)
+    pub fn persistent(
+        audit: Arc<dyn AuditSink>,
+        data_dir: &str,
+    ) -> Result<(Arc<MemExecutor>, Arc<MemoryCatalog>)> {
+        let path = std::path::Path::new(data_dir);
+        std::fs::create_dir_all(path)?;
+        let cat_path = path.join("catalog.json");
+        let cat = Arc::new(MemoryCatalog::load_from_disk(cat_path)?);
+
+        let kv = Arc::new(nodus_storage_lsm::LsmKvEngine::new()); // No path arg since it's currently memory MVP
+        let txn = Arc::new(nodus_txn::MemTxnManager::new());
+        let authz = Arc::new(nodus_authz::DefaultAuthzEngine::new(cat.clone()));
+
+        let exec = Arc::new(MemExecutor::new(
+            cat.clone(),
+            cat.clone(),
+            authz,
+            audit,
+            kv,
+            txn,
+        ));
+        Ok((exec, cat))
+    }
     /// Builds an executor over fresh in-memory components and returns it
     /// together with the shared catalog, so callers (e.g. the server) can seed
     /// principals/grants and an authenticator against the same catalog. Audit
@@ -593,6 +617,7 @@ impl MemExecutor {
     /// Writes a row value at `key`, using the session's txn or an auto-commit txn.
     fn write_row(&self, session: &str, key: String, value: String) -> Result<()> {
         let (txn_id, auto) = self.txn_for(session)?;
+        self.txn.track_write(txn_id, key.as_bytes().to_vec())?;
         self.kv
             .write_intent(txn_id, Bytes::from(key), Bytes::from(value))?;
         if auto {
@@ -605,6 +630,7 @@ impl MemExecutor {
     /// Tombstones `key`, using the session's txn or an auto-commit txn.
     fn delete_row(&self, session: &str, key: String) -> Result<()> {
         let (txn_id, auto) = self.txn_for(session)?;
+        self.txn.track_write(txn_id, key.as_bytes().to_vec())?;
         self.kv.delete_intent(txn_id, Bytes::from(key))?;
         if auto {
             let commit_ts = self.txn.commit_txn(txn_id)?;

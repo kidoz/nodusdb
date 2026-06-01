@@ -46,8 +46,17 @@ async fn main() -> anyhow::Result<()> {
         config.server.http_addr, config.server.pgwire_addr
     );
 
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+
+    tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        info!("Received Ctrl-C, shutting down gracefully...");
+        let _ = shutdown_tx.send(());
+    });
+
     let handle =
-        nodus_server::run_server_with_config(pgwire_listener, http_listener, config).await?;
+        nodus_server::run_server_with_config(pgwire_listener, http_listener, config, shutdown_rx)
+            .await?;
 
     let _ = tokio::try_join!(handle.pgwire_task, handle.http_task)?;
 

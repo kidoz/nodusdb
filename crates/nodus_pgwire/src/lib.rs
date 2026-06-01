@@ -283,6 +283,7 @@ impl PgWireHandlerFactory for NodusPgWireServer {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn start_pgwire_server(
     listener: TcpListener,
     executor: Arc<dyn nodus_executor::Executor>,
@@ -291,6 +292,7 @@ pub async fn start_pgwire_server(
     authenticator: Arc<PasswordAuthenticator>,
     slow_log: Arc<nodus_monitoring::SlowQueryLog>,
     tls: Option<Arc<tokio_rustls::TlsAcceptor>>,
+    mut shutdown: tokio::sync::watch::Receiver<()>,
 ) -> anyhow::Result<()> {
     let startup_handler = Arc::new(NodusStartupHandler {
         authenticator,
@@ -313,17 +315,32 @@ pub async fn start_pgwire_server(
     );
 
     loop {
-        let (socket, _) = listener.accept().await?;
-        let factory = factory.clone();
-        let metrics = metrics.clone();
-        let tls = tls.clone();
-        tokio::spawn(async move {
-            metrics.pgwire_connections_total.inc();
-            metrics.active_sessions.inc();
-            if let Err(e) = process_socket(socket, tls, factory).await {
-                error!("Socket error: {}", e);
+        tokio::select! {
+            _ = shutdown.changed() => {
+                info!("PGWire server shutting down...");
+                break;
             }
-            metrics.active_sessions.dec();
-        });
+            accept_result = listener.accept() => {
+                match accept_result {
+                    Ok((socket, _)) => {
+                        let factory = factory.clone();
+                        let metrics = metrics.clone();
+                        let tls = tls.clone();
+                        tokio::spawn(async move {
+                            metrics.pgwire_connections_total.inc();
+                            metrics.active_sessions.inc();
+                            if let Err(e) = process_socket(socket, tls, factory).await {
+                                error!("Socket error: {}", e);
+                            }
+                            metrics.active_sessions.dec();
+                        });
+                    }
+                    Err(e) => {
+                        error!("PGWire accept error: {}", e);
+                    }
+                }
+            }
+        }
     }
+    Ok(())
 }

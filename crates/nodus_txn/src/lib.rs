@@ -18,6 +18,8 @@ pub struct TxnRecord {
     pub state: TxnState,
     pub read_ts: Timestamp,
     pub commit_ts: Option<Timestamp>,
+    /// Keys written by this transaction.
+    pub write_set: Vec<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -49,6 +51,11 @@ impl HybridLogicalClock {
 
 pub trait TxnManager: Send + Sync {
     fn begin_txn(&self) -> Result<TxnRecord>;
+    /// Tracks a write intent to enable OCC (Optimistic Concurrency Control) conflict detection.
+    fn track_write(&self, txn_id: TxnId, key: Vec<u8>) -> Result<()>;
+    /// Commits the transaction if no concurrent writes conflict.
+    /// NodusDB uses Snapshot Isolation (OCC). Concurrent writes to the same key
+    /// by a transaction that committed after our read_ts will abort this transaction.
     fn commit_txn(&self, txn_id: TxnId) -> Result<Timestamp>;
     fn abort_txn(&self, txn_id: TxnId) -> Result<()>;
 
@@ -97,6 +104,7 @@ impl TxnManager for MemTxnManager {
             state: TxnState::Pending,
             read_ts,
             commit_ts: None,
+            write_set: Vec::new(),
         };
 
         let mut guard = self.records.write().unwrap();
@@ -104,23 +112,57 @@ impl TxnManager for MemTxnManager {
         Ok(record)
     }
 
+    fn track_write(&self, txn_id: TxnId, key: Vec<u8>) -> Result<()> {
+        let mut guard = self.records.write().unwrap();
+        if let Some(record) = guard.get_mut(&txn_id) {
+            record.write_set.push(key);
+            Ok(())
+        } else {
+            anyhow::bail!("Transaction {} not found", txn_id.0);
+        }
+    }
+
     fn commit_txn(&self, txn_id: TxnId) -> Result<Timestamp> {
+        let mut guard = self.records.write().unwrap();
+
+        let record = guard
+            .get(&txn_id)
+            .ok_or_else(|| anyhow::anyhow!("Transaction {} not found", txn_id.0))?;
+        if record.state != TxnState::Pending && record.state != TxnState::Writing {
+            anyhow::bail!("Cannot commit transaction in state {:?}", record.state);
+        }
+        let read_ts = record.read_ts;
+        let write_set = record.write_set.clone();
+
+        // Snapshot Isolation (OCC) Conflict Check:
+        // Has any transaction committed since `read_ts` written to keys in our `write_set`?
+        for other in guard.values() {
+            if other.txn_id == txn_id || other.state != TxnState::Committed {
+                continue;
+            }
+            if let Some(other_commit_ts) = other.commit_ts
+                && other_commit_ts > read_ts
+            {
+                // Check intersection
+                for key in &write_set {
+                    if other.write_set.contains(key) {
+                        // Conflict detected
+                        guard.get_mut(&txn_id).unwrap().state = TxnState::Aborted;
+                        anyhow::bail!("Write-write conflict detected on key. Transaction aborted.");
+                    }
+                }
+            }
+        }
+
         let commit_ts = {
             let mut hlc = self.hlc.write().unwrap();
             hlc.tick()
         };
 
-        let mut guard = self.records.write().unwrap();
-        if let Some(record) = guard.get_mut(&txn_id) {
-            if record.state != TxnState::Pending && record.state != TxnState::Writing {
-                anyhow::bail!("Cannot commit transaction in state {:?}", record.state);
-            }
-            record.state = TxnState::Committed;
-            record.commit_ts = Some(commit_ts);
-            Ok(commit_ts)
-        } else {
-            anyhow::bail!("Transaction {} not found", txn_id.0);
-        }
+        let record_mut = guard.get_mut(&txn_id).unwrap();
+        record_mut.state = TxnState::Committed;
+        record_mut.commit_ts = Some(commit_ts);
+        Ok(commit_ts)
     }
 
     fn abort_txn(&self, txn_id: TxnId) -> Result<()> {

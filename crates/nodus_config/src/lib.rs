@@ -24,11 +24,24 @@ pub enum ConfigError {
 #[serde(default)]
 pub struct NodusConfig {
     pub server: ServerConfig,
+    pub storage: StorageConfig,
     pub tls: TlsConfig,
     pub backup: BackupConfig,
     pub observability: ObservabilityConfig,
     pub admin: AdminConfig,
     pub audit: AuditConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct StorageConfig {
+    pub data_dir: Option<String>,
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self { data_dir: None }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -90,6 +103,7 @@ impl Default for NodusConfig {
     fn default() -> Self {
         Self {
             server: ServerConfig::default(),
+            storage: StorageConfig::default(),
             tls: TlsConfig::default(),
             backup: BackupConfig::default(),
             observability: ObservabilityConfig::default(),
