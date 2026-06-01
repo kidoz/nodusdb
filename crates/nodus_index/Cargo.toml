@@ -12,3 +12,8 @@ thiserror.workspace = true
 serde.workspace = true
 bytes.workspace = true
 nodus_storage_api = { path = "../nodus_storage_api" }
+nodus_catalog = { path = "../nodus_catalog" }
+nodus_storage_mem = { path = "../nodus_storage_mem", optional = true }
+
+[dev-dependencies]
+nodus_storage_mem = { path = "../nodus_storage_mem" }
