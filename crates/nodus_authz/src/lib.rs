@@ -36,6 +36,23 @@ impl Action {
             Action::ManageGrants => "MANAGE_GRANTS",
         }
     }
+
+    /// Parses a privilege string (case-insensitive) back into an `Action`.
+    pub fn from_privilege(s: &str) -> Option<Action> {
+        match s.to_uppercase().as_str() {
+            "CONNECT" => Some(Action::Connect),
+            "USAGE" => Some(Action::Usage),
+            "SELECT" => Some(Action::Select),
+            "INSERT" => Some(Action::Insert),
+            "UPDATE" => Some(Action::Update),
+            "DELETE" => Some(Action::Delete),
+            "CREATE_DATABASE" => Some(Action::CreateDatabase),
+            "CREATE_SCHEMA" => Some(Action::CreateSchema),
+            "CREATE_TABLE" => Some(Action::CreateTable),
+            "MANAGE_GRANTS" => Some(Action::ManageGrants),
+            _ => None,
+        }
+    }
 }
 
 pub struct AuthzContext {
@@ -68,6 +85,7 @@ pub struct AuthzDecision {
     pub catalog_version: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthzExplanation {
     pub is_allowed: bool,
     pub steps: Vec<String>,

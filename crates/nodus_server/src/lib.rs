@@ -55,7 +55,9 @@ pub async fn run_server(
             privilege: "ALL".into(),
         })
         .map_err(|e| anyhow::anyhow!("seed admin grant: {e}"))?;
-    let authenticator = Arc::new(PasswordAuthenticator::new(catalog));
+    // A read-only authz engine over the same catalog for the admin explain API.
+    let authz = Arc::new(nodus_authz::DefaultAuthzEngine::new(catalog.clone()));
+    let authenticator = Arc::new(PasswordAuthenticator::new(catalog.clone()));
     // Default development credentials; override before production use.
     authenticator.set_password("nodus", admin.id, "nodus");
 
@@ -81,6 +83,8 @@ pub async fn run_server(
     let admin_state = AdminState {
         registry: registry.clone(),
         audit: audit.clone(),
+        authz: authz.clone(),
+        catalog: catalog.clone(),
     };
     let app = Router::new()
         .merge(monitoring_routes(state))

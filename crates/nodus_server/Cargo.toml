@@ -23,4 +23,5 @@ nodus_executor = { path = "../nodus_executor" }
 nodus_security = { path = "../nodus_security" }
 nodus_catalog = { path = "../nodus_catalog" }
 nodus_audit = { path = "../nodus_audit" }
+nodus_authz = { path = "../nodus_authz" }
 uuid.workspace = true

@@ -132,6 +132,41 @@ async fn admin_audit_api_returns_events() {
 }
 
 #[tokio::test]
+async fn admin_authz_explain_denies_unknown_principal() {
+    let server = TestServer::start().await.expect("server starts");
+    let http = reqwest::Client::new();
+    let base = format!("http://{}", server.http_addr);
+    let principal = "00000000-0000-0000-0000-000000000001";
+
+    // System-level check for an unknown principal: deny-by-default with steps.
+    let body: serde_json::Value = http
+        .get(format!(
+            "{base}/api/v1/authz/explain?principal={principal}&action=SELECT"
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["is_allowed"], false);
+    assert!(!body["steps"].as_array().unwrap().is_empty());
+
+    // Unknown table is reported clearly.
+    let body: serde_json::Value = http
+        .get(format!(
+            "{base}/api/v1/authz/explain?principal={principal}&action=SELECT&table=missing"
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["is_allowed"], false);
+}
+
+#[tokio::test]
 async fn pgwire_rejects_bad_password() {
     let server = TestServer::start().await.expect("server starts");
     let bad = format!(
