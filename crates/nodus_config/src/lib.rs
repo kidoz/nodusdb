@@ -28,6 +28,7 @@ pub struct NodusConfig {
     pub backup: BackupConfig,
     pub observability: ObservabilityConfig,
     pub admin: AdminConfig,
+    pub audit: AuditConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -36,6 +37,14 @@ pub struct AdminConfig {
     /// Bearer token required on `/api/v1/*` admin endpoints. When unset (default),
     /// the admin API is unauthenticated — only safe bound to localhost.
     pub token: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct AuditConfig {
+    /// Path to a durable JSONL audit log. When set, audit events are persisted
+    /// there; when unset (default), an in-memory sink is used.
+    pub file_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -82,6 +91,7 @@ impl Default for NodusConfig {
             backup: BackupConfig::default(),
             observability: ObservabilityConfig::default(),
             admin: AdminConfig::default(),
+            audit: AuditConfig::default(),
         }
     }
 }

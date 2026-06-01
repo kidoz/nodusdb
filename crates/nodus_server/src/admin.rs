@@ -9,7 +9,7 @@ use axum::{
     routing::{get, post},
 };
 use bytes::Bytes;
-use nodus_audit::{AuditEvent, AuditQuery, AuditQueryable, MemoryAuditSink};
+use nodus_audit::{AuditEvent, AuditQuery, AuditQueryable};
 use nodus_authz::{Action, AuthzContext, AuthzEngine, AuthzExplanation, AuthzRequest};
 use nodus_backup::{BackupObject, BackupOrchestrator};
 use nodus_catalog::{CatalogReader, PrincipalId, ResourceRef, ShardId, TableId};
@@ -28,7 +28,7 @@ use uuid::Uuid;
 #[derive(Clone)]
 pub struct AdminState {
     pub registry: Arc<SessionRegistry>,
-    pub audit: Arc<MemoryAuditSink>,
+    pub audit: Arc<dyn AuditQueryable>,
     pub authz: Arc<dyn AuthzEngine>,
     pub catalog: Arc<dyn CatalogReader>,
     pub backup: Arc<BackupOrchestrator>,

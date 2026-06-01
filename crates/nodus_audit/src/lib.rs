@@ -71,7 +71,7 @@ impl AuditQuery {
 }
 
 /// A queryable audit trail.
-pub trait AuditQueryable {
+pub trait AuditQueryable: Send + Sync {
     fn query(&self, query: &AuditQuery) -> anyhow::Result<Vec<AuditEvent>>;
 }
 

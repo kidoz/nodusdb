@@ -94,11 +94,23 @@ pub async fn run_server_with_config(
         .store(true, std::sync::atomic::Ordering::Release);
 
     // Shared catalog so the authenticator's principals and the executor's
-    // authorization grants resolve against the same data. Audit events go to an
-    // in-memory sink that the admin audit API can query (a durable file sink is
-    // selectable via config separately).
-    let audit = Arc::new(nodus_audit::MemoryAuditSink::new());
-    let (executor, catalog) = nodus_executor::MemExecutor::shared(audit.clone());
+    // authorization grants resolve against the same data. The audit sink is
+    // durable (JSONL file) when configured, else in-memory; the same object
+    // backs both executor emission and the admin audit query API.
+    let (audit_sink, audit_query): (
+        Arc<dyn nodus_audit::AuditSink>,
+        Arc<dyn nodus_audit::AuditQueryable>,
+    ) = match &config.audit.file_path {
+        Some(path) => {
+            let sink = Arc::new(nodus_audit::FileAuditSink::new(path));
+            (sink.clone(), sink)
+        }
+        None => {
+            let sink = Arc::new(nodus_audit::MemoryAuditSink::new());
+            (sink.clone(), sink)
+        }
+    };
+    let (executor, catalog) = nodus_executor::MemExecutor::shared(audit_sink);
     let admin = catalog
         .create_role(CreateRoleRequest {
             name: "nodus".into(),
@@ -183,7 +195,7 @@ pub async fn run_server_with_config(
 
     let admin_state = AdminState {
         registry: registry.clone(),
-        audit: audit.clone(),
+        audit: audit_query,
         authz: authz.clone(),
         catalog: catalog.clone(),
         backup,

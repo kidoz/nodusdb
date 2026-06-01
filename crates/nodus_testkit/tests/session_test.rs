@@ -381,6 +381,40 @@ async fn admin_api_requires_token_when_configured() {
 }
 
 #[tokio::test]
+async fn durable_audit_persists_to_configured_file() {
+    let path = std::env::temp_dir().join(format!("nodus_audit_it_{}.jsonl", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let mut config = nodus_config::NodusConfig::default();
+    config.audit.file_path = Some(path.to_string_lossy().to_string());
+
+    let server = TestServer::start_with_config(config)
+        .await
+        .expect("server starts");
+    let client = connect(&server.pgwire_addr).await;
+    client
+        .simple_query("CREATE TABLE t (id UUID PRIMARY KEY, name TEXT NOT NULL);")
+        .await
+        .unwrap();
+
+    // The audit query API reads from the same durable sink.
+    let http = reqwest::Client::new();
+    let events: serde_json::Value = http
+        .get(format!("http://{}/api/v1/audit", server.http_addr))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(!events.as_array().unwrap().is_empty());
+
+    // And the events were written to the configured JSONL file.
+    let contents = std::fs::read_to_string(&path).expect("audit file exists");
+    assert!(contents.contains("CREATE_TABLE"));
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
 async fn pgwire_rejects_bad_password() {
     let server = TestServer::start().await.expect("server starts");
     let bad = format!(
