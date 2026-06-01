@@ -1505,7 +1505,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "chrono",
  "nodus_catalog",
+ "nodus_meta",
  "nodus_storage_api",
  "serde",
  "thiserror",
