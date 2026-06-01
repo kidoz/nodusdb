@@ -1,9 +1,21 @@
 use axum::{Router, http::StatusCode, routing::get};
 use prometheus_client::registry::Registry;
+use serde::{Deserialize, Serialize};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClusterOverview {
+    pub cluster_status: String,
+    pub nodes_live: u32,
+    pub nodes_total: u32,
+    pub shards_total: u32,
+    pub shards_unavailable: u32,
+    pub qps: f64,
+    pub active_alerts: u32,
+}
 
 pub struct AppState {
     pub is_ready: AtomicBool,
