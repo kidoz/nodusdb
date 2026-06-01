@@ -35,6 +35,28 @@ enum Commands {
         #[command(subcommand)]
         cmd: SessionCmd,
     },
+    /// Query the audit trail
+    Audit {
+        #[command(subcommand)]
+        cmd: AuditCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum AuditCmd {
+    /// Query audit events with optional filters
+    Query {
+        #[arg(long)]
+        actor: Option<String>,
+        #[arg(long)]
+        action: Option<String>,
+        #[arg(long)]
+        result: Option<String>,
+        #[arg(long)]
+        limit: Option<usize>,
+        #[arg(long, default_value = DEFAULT_ADDR)]
+        addr: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -145,6 +167,50 @@ async fn main() -> anyhow::Result<()> {
                 println!("Session {id} terminated.");
             } else {
                 anyhow::bail!("session {id} not found");
+            }
+        }
+        Commands::Audit {
+            cmd:
+                AuditCmd::Query {
+                    actor,
+                    action,
+                    result,
+                    limit,
+                    addr,
+                },
+        } => {
+            let mut req = client.get(format!("{addr}/api/v1/audit"));
+            let mut q: Vec<(&str, String)> = Vec::new();
+            if let Some(a) = actor {
+                q.push(("actor", a.clone()));
+            }
+            if let Some(a) = action {
+                q.push(("action", a.clone()));
+            }
+            if let Some(r) = result {
+                q.push(("result", r.clone()));
+            }
+            if let Some(l) = limit {
+                q.push(("limit", l.to_string()));
+            }
+            if !q.is_empty() {
+                req = req.query(&q);
+            }
+            let events: serde_json::Value = req.send().await?.error_for_status()?.json().await?;
+            let empty = vec![];
+            let arr = events.as_array().unwrap_or(&empty);
+            if arr.is_empty() {
+                println!("No audit events.");
+            }
+            for e in arr {
+                println!(
+                    "{}  actor={}  action={}  result={}  reason={}",
+                    e["time"].as_str().unwrap_or("?"),
+                    e["actor"].as_str().unwrap_or("?"),
+                    e["action"].as_str().unwrap_or("?"),
+                    e["result"].as_str().unwrap_or("?"),
+                    e["reason"].as_str().unwrap_or("-")
+                );
             }
         }
     }

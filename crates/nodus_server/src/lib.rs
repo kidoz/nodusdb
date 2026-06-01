@@ -35,10 +35,11 @@ pub async fn run_server(
         .store(true, std::sync::atomic::Ordering::Release);
 
     // Shared catalog so the authenticator's principals and the executor's
-    // authorization grants resolve against the same data. Audit events go to
-    // stdout for now; a durable file sink is wired via config separately.
-    let audit = Arc::new(nodus_audit::LogAuditSink);
-    let (executor, catalog) = nodus_executor::MemExecutor::shared(audit);
+    // authorization grants resolve against the same data. Audit events go to an
+    // in-memory sink that the admin audit API can query (a durable file sink is
+    // selectable via config separately).
+    let audit = Arc::new(nodus_audit::MemoryAuditSink::new());
+    let (executor, catalog) = nodus_executor::MemExecutor::shared(audit.clone());
     let admin = catalog
         .create_role(CreateRoleRequest {
             name: "nodus".into(),
@@ -79,6 +80,7 @@ pub async fn run_server(
 
     let admin_state = AdminState {
         registry: registry.clone(),
+        audit: audit.clone(),
     };
     let app = Router::new()
         .merge(monitoring_routes(state))

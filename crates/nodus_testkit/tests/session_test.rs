@@ -95,6 +95,43 @@ async fn admin_session_api_lists_and_kills() {
 }
 
 #[tokio::test]
+async fn admin_audit_api_returns_events() {
+    let server = TestServer::start().await.expect("server starts");
+    // The seeded superuser runs a statement that triggers an authz decision.
+    let client = connect(&server.pgwire_addr).await;
+    client
+        .simple_query("CREATE TABLE t (id UUID PRIMARY KEY, name TEXT NOT NULL);")
+        .await
+        .unwrap();
+
+    let http = reqwest::Client::new();
+    let base = format!("http://{}", server.http_addr);
+
+    let all: serde_json::Value = http
+        .get(format!("{base}/api/v1/audit"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(!all.as_array().unwrap().is_empty(), "expected audit events");
+
+    // Filter by result=Success returns only successful decisions.
+    let success: serde_json::Value = http
+        .get(format!("{base}/api/v1/audit?result=Success"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let arr = success.as_array().unwrap();
+    assert!(!arr.is_empty());
+    assert!(arr.iter().all(|e| e["result"] == "Success"));
+}
+
+#[tokio::test]
 async fn pgwire_rejects_bad_password() {
     let server = TestServer::start().await.expect("server starts");
     let bad = format!(
