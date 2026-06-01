@@ -56,13 +56,19 @@ export function Dashboard({
             </p>
           </div>
           <div className="hero-meter" aria-label="Cluster readiness summary">
-            <span>{overview ? `${overview.nodes_live}/${overview.nodes_total}` : '-'}</span>
+            <span>
+              {overview
+                ? `${overview.nodes_live}/${overview.nodes_total}`
+                : '-'}
+            </span>
             <small>live nodes</small>
           </div>
         </section>
 
         {loading && !overview ? (
-          <div className="notice notice--loading">Loading cluster overview...</div>
+          <div className="notice notice--loading">
+            Loading cluster overview...
+          </div>
         ) : null}
 
         {error ? (
