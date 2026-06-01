@@ -11,6 +11,6 @@ pub struct MvccValue {
 
 impl MvccValue {
     pub fn is_visible(&self, read_ts: Timestamp) -> bool {
-        !self.is_intent && self.version <= read_ts && self.value.is_some()
+        !self.is_intent && self.version <= read_ts
     }
 }

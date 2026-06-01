@@ -307,4 +307,72 @@ mod tests {
         assert!(engine.get(k1.as_ref(), 15).unwrap().is_none());
         assert_eq!(engine.get(k1.as_ref(), 25).unwrap().unwrap(), v2);
     }
+
+    #[test]
+    fn test_custom_btree_scan() {
+        let engine = BTreeKvEngine::new();
+        let txn = TxnId::new();
+        engine
+            .write_intent(txn, Bytes::from("a1"), Bytes::from("v1"))
+            .unwrap();
+        engine
+            .write_intent(txn, Bytes::from("a2"), Bytes::from("v2"))
+            .unwrap();
+        engine
+            .write_intent(txn, Bytes::from("a3"), Bytes::from("v3"))
+            .unwrap();
+        engine.commit(txn, 10).unwrap();
+
+        let mut scan = engine
+            .scan(
+                KeyRange {
+                    start: Bytes::from("a1"),
+                    end: Bytes::from("a3"),
+                },
+                15,
+            )
+            .unwrap();
+
+        let res1 = scan.next().unwrap().unwrap();
+        assert_eq!(res1.key, Bytes::from("a1"));
+        assert_eq!(res1.value, Bytes::from("v1"));
+
+        let res2 = scan.next().unwrap().unwrap();
+        assert_eq!(res2.key, Bytes::from("a2"));
+        assert_eq!(res2.value, Bytes::from("v2"));
+
+        assert!(scan.next().is_none()); // a3 is exclusive
+    }
+
+    #[test]
+    fn test_custom_btree_abort() {
+        let engine = BTreeKvEngine::new();
+        let txn = TxnId::new();
+        engine
+            .write_intent(txn, Bytes::from("k1"), Bytes::from("v1"))
+            .unwrap();
+        assert!(engine.get(b"k1", 10).unwrap().is_none());
+
+        engine.abort(txn).unwrap();
+        assert!(engine.get(b"k1", 10).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_custom_btree_delete_intent() {
+        let engine = BTreeKvEngine::new();
+        let txn1 = TxnId::new();
+        engine
+            .write_intent(txn1, Bytes::from("k1"), Bytes::from("v1"))
+            .unwrap();
+        engine.commit(txn1, 10).unwrap();
+
+        assert_eq!(engine.get(b"k1", 15).unwrap().unwrap(), Bytes::from("v1"));
+
+        let txn2 = TxnId::new();
+        engine.delete_intent(txn2, Bytes::from("k1")).unwrap();
+        engine.commit(txn2, 20).unwrap();
+
+        assert!(engine.get(b"k1", 25).unwrap().is_none()); // Tombstoned
+        assert_eq!(engine.get(b"k1", 15).unwrap().unwrap(), Bytes::from("v1")); // Still visible in past snapshot
+    }
 }
