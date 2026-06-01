@@ -63,4 +63,27 @@ async fn test_pgwire_queries() {
     } else {
         panic!("Expected a row");
     }
+
+    // Execute the vertical slice pipeline
+    client
+        .simple_query("CREATE TABLE users (id UUID PRIMARY KEY, name TEXT NOT NULL);")
+        .await
+        .unwrap();
+    client.simple_query("BEGIN;").await.unwrap();
+    client
+        .simple_query("INSERT INTO users (id, name) VALUES ('u1', 'alice');")
+        .await
+        .unwrap();
+    client.simple_query("COMMIT;").await.unwrap();
+
+    let rows = client
+        .simple_query("SELECT id, name FROM users WHERE id = 'u1';")
+        .await
+        .unwrap();
+    if let tokio_postgres::SimpleQueryMessage::Row(row) = &rows[1] {
+        assert_eq!(row.get(0).unwrap(), "u1");
+        assert_eq!(row.get(1).unwrap(), "alice");
+    } else {
+        panic!("Expected a row");
+    }
 }

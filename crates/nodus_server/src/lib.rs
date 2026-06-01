@@ -24,8 +24,10 @@ pub async fn run_server(
         .is_ready
         .store(true, std::sync::atomic::Ordering::Release);
 
-    let pgwire_task =
-        tokio::spawn(async move { nodus_pgwire::start_pgwire_server(pgwire_listener).await });
+    let pgwire_task = tokio::spawn(async move {
+        let executor = Arc::new(nodus_executor::MemExecutor::default());
+        nodus_pgwire::start_pgwire_server(pgwire_listener, executor).await
+    });
 
     let app = Router::new()
         .merge(monitoring_routes(state))

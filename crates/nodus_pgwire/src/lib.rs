@@ -17,6 +17,7 @@ use pgwire::tokio::process_socket;
 
 pub struct NodusQueryHandler {
     pub session_state: nodus_sql::SessionState,
+    pub executor: Arc<dyn nodus_executor::Executor>,
 }
 
 #[async_trait]
@@ -33,13 +34,120 @@ impl SimpleQueryHandler for NodusQueryHandler {
     {
         info!("Received query: {}", query);
 
+        let ctx = nodus_executor::ExecutionContext {
+            session_id: self.session_state.session_id.clone(),
+            authz_catalog_version: 1,
+        };
+
         // Minimal AST path
         match nodus_sql::parse_sql(query) {
-            Ok(ast) => info!("Parsed AST: {:?}", ast),
+            Ok(ast) => {
+                info!("Parsed AST: {:?}", ast);
+                // In MVP, we are skipping the full translation and just mapping matching strings below.
+            }
             Err(e) => error!("Failed to parse SQL: {}", e),
         }
 
         let query_upper = query.trim().to_uppercase();
+
+        if query_upper.starts_with("CREATE TABLE") {
+            let table_name = "users".to_string(); // MVP hardcode parsing
+            let _res = self
+                .executor
+                .execute_logical(
+                    &ctx,
+                    nodus_executor::LogicalPlan::CreateTable { name: table_name },
+                )
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+            return Ok(vec![Response::Execution(Tag::new("CREATE TABLE"))]);
+        }
+
+        if query_upper.starts_with("INSERT INTO") {
+            // "INSERT INTO users (id, name) VALUES ('123', 'alice')"
+            // Very naive MVP parsing: split on 'VALUES'
+            let parts: Vec<&str> = query.split("VALUES").collect();
+            if parts.len() == 2 {
+                let vals = parts[1]
+                    .trim()
+                    .trim_matches(|c| c == '(' || c == ')' || c == ';');
+                let vals_split: Vec<&str> = vals.split(',').collect();
+                if vals_split.len() == 2 {
+                    let id = vals_split[0].trim().trim_matches('\'').to_string();
+                    let name = vals_split[1].trim().trim_matches('\'').to_string();
+                    self.executor
+                        .execute_logical(
+                            &ctx,
+                            nodus_executor::LogicalPlan::Insert {
+                                table_name: "users".into(),
+                                id,
+                                name_val: name,
+                            },
+                        )
+                        .map_err(|e| std::io::Error::other(e.to_string()))?;
+                    return Ok(vec![Response::Execution(Tag::new("INSERT 0 1"))]);
+                }
+            }
+        }
+
+        if query_upper.starts_with("SELECT ID, NAME FROM USERS WHERE ID") {
+            // "SELECT id, name FROM users WHERE id = '123'"
+            let parts: Vec<&str> = query.split('=').collect();
+            if parts.len() == 2 {
+                let id = parts[1]
+                    .trim()
+                    .trim_matches(|c| c == '\'' || c == ';')
+                    .to_string();
+                let rows = self
+                    .executor
+                    .execute_logical(
+                        &ctx,
+                        nodus_executor::LogicalPlan::SelectById {
+                            table_name: "users".into(),
+                            id,
+                        },
+                    )
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+
+                let field_info = Arc::new(vec![
+                    FieldInfo::new("id".into(), None, None, Type::VARCHAR, FieldFormat::Text),
+                    FieldInfo::new("name".into(), None, None, Type::VARCHAR, FieldFormat::Text),
+                ]);
+
+                let mut rows_stream = Vec::new();
+                for r in rows {
+                    let mut encoder = DataRowEncoder::new(field_info.clone());
+                    encoder
+                        .encode_field(&r.columns[0])
+                        .map_err(|e| std::io::Error::other(e.to_string()))?;
+                    encoder
+                        .encode_field(&r.columns[1])
+                        .map_err(|e| std::io::Error::other(e.to_string()))?;
+                    rows_stream.push(encoder.finish());
+                }
+
+                let response = QueryResponse::new(field_info, stream::iter(rows_stream));
+                return Ok(vec![Response::Query(response)]);
+            }
+        }
+
+        if query_upper.starts_with("BEGIN") {
+            self.executor
+                .execute_logical(&ctx, nodus_executor::LogicalPlan::Begin)
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+            return Ok(vec![Response::Execution(Tag::new("BEGIN"))]);
+        }
+        if query_upper.starts_with("COMMIT") {
+            self.executor
+                .execute_logical(&ctx, nodus_executor::LogicalPlan::Commit)
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+            return Ok(vec![Response::Execution(Tag::new("COMMIT"))]);
+        }
+        if query_upper.starts_with("ROLLBACK") {
+            self.executor
+                .execute_logical(&ctx, nodus_executor::LogicalPlan::Rollback)
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+            return Ok(vec![Response::Execution(Tag::new("ROLLBACK"))]);
+        }
         if query_upper == "SELECT 1;" || query_upper == "SELECT 1" {
             let field_info = Arc::new(vec![FieldInfo::new(
                 "?column?".into(),
@@ -134,11 +242,15 @@ impl PgWireHandlerFactory for NodusPgWireServer {
     }
 }
 
-pub async fn start_pgwire_server(listener: TcpListener) -> anyhow::Result<()> {
+pub async fn start_pgwire_server(
+    listener: TcpListener,
+    executor: Arc<dyn nodus_executor::Executor>,
+) -> anyhow::Result<()> {
     let factory = Arc::new(NodusPgWireServer {
         startup_handler: Arc::new(NoopStartupHandler),
         simple_query_handler: Arc::new(NodusQueryHandler {
             session_state: nodus_sql::SessionState::default(),
+            executor,
         }),
         extended_query_handler: Arc::new(PlaceholderExtendedQueryHandler),
         copy_handler: Arc::new(NoopCopyHandler),

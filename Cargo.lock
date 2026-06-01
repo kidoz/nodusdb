@@ -1412,6 +1412,8 @@ name = "nodus_executor"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
+ "chrono",
  "nodus_authz",
  "nodus_catalog",
  "nodus_meta",
@@ -1419,6 +1421,7 @@ dependencies = [
  "nodus_sharding",
  "nodus_sql",
  "nodus_storage_api",
+ "nodus_storage_mem",
  "nodus_txn",
  "serde",
  "thiserror",
@@ -1518,6 +1521,7 @@ dependencies = [
  "nodus_common",
  "nodus_config",
  "nodus_error",
+ "nodus_executor",
  "nodus_monitoring",
  "nodus_pgwire",
  "nodus_web_console",
