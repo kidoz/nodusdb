@@ -2154,12 +2154,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "nodus_compatibility_tests"
+version = "0.1.0"
+dependencies = [
+ "nodus_testkit",
+ "tokio",
+ "tokio-postgres",
+]
+
+[[package]]
 name = "nodus_config"
 version = "0.1.0"
 dependencies = [
  "figment",
  "serde",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "nodus_distributed_tests"
+version = "0.1.0"
+dependencies = [
+ "madsim",
+ "nodus_testkit",
+ "porcupine-rs",
+ "tokio-postgres",
 ]
 
 [[package]]
@@ -2195,6 +2214,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "nodus_fault_tests"
+version = "0.1.0"
+dependencies = [
+ "nodus_testkit",
+]
+
+[[package]]
 name = "nodus_index"
 version = "0.1.0"
 dependencies = [
@@ -2208,6 +2234,18 @@ dependencies = [
  "serde_json",
  "thiserror 1.0.69",
  "tokio",
+]
+
+[[package]]
+name = "nodus_integration_tests"
+version = "0.1.0"
+dependencies = [
+ "nodus_config",
+ "nodus_testkit",
+ "reqwest",
+ "serde_json",
+ "tokio",
+ "tokio-postgres",
 ]
 
 [[package]]
@@ -2352,6 +2390,10 @@ dependencies = [
  "sqlparser",
  "thiserror 1.0.69",
 ]
+
+[[package]]
+name = "nodus_sqllogictest"
+version = "0.1.0"
 
 [[package]]
 name = "nodus_storage_api"

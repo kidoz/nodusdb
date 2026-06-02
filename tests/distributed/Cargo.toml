@@ -1,0 +1,17 @@
+[package]
+name = "nodus_distributed_tests"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+madsim = "0.2.34"
+nodus_testkit = { path = "../../crates/nodus_testkit" }
+porcupine-rs = "0.3.0"
+tokio-postgres.workspace = true

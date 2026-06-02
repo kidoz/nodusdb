@@ -16,9 +16,28 @@ clippy:
 test:
     cargo test --workspace
 
+# Run product integration tests
+test-integration:
+    cargo test -p nodus_integration_tests
+
+# Run PostgreSQL client and wire compatibility tests
+test-compat:
+    cargo test -p nodus_compatibility_tests
+
+# Run SQL golden tests
+test-sql:
+    cargo test -p nodus_sqllogictest
+
+# Run crash and fault-injection tests
+test-fault:
+    cargo test -p nodus_fault_tests
+
+# Run all normal cross-crate test suites
+test-cross: test-integration test-compat test-sql
+
 # Run deterministic simulation tests
 test-sim:
-    RUSTFLAGS="--cfg madsim" cargo test -p nodus_testkit --test sim_test -- --ignored
+    RUSTFLAGS="--cfg madsim" cargo test -p nodus_distributed_tests --test sim_test -- --ignored
 
 # Run loom model-checked concurrency tests for the transaction manager
 test-loom:

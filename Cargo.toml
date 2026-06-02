@@ -28,6 +28,11 @@ members = [
     "crates/nodus_raftstore",
     "crates/nodus_backup",
     "crates/nodus_telemetry",
+    "tests/integration",
+    "tests/compatibility",
+    "tests/sqllogictest",
+    "tests/fault",
+    "tests/distributed",
 ]
 resolver = "2"
 

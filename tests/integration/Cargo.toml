@@ -1,0 +1,19 @@
+[package]
+name = "nodus_integration_tests"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+nodus_config = { path = "../../crates/nodus_config" }
+nodus_testkit = { path = "../../crates/nodus_testkit" }
+reqwest.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-postgres.workspace = true

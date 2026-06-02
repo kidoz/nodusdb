@@ -1,19 +1,16 @@
 #[cfg(madsim)]
-use madsim::runtime::Handle;
-#[cfg(madsim)]
 use madsim::net::NetSim;
+#[cfg(madsim)]
+use madsim::runtime::Handle;
 #[cfg(madsim)]
 use madsim::time::{sleep, Duration};
 #[cfg(madsim)]
-use porcupine_rs::{check_operations, Model, Operation};
+use porcupine_rs::{Model, Operation, check_operations};
 #[cfg(madsim)]
 use std::net::SocketAddr;
-#[cfg(madsim)]
-use nodus_testkit::TestServer;
-#[cfg(madsim)]
-use tokio_postgres::NoTls;
 
 #[cfg(madsim)]
+#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum RegisterOp {
     Read(i32),
@@ -43,9 +40,7 @@ impl Model for RegisterModel {
                     (false, *state)
                 }
             }
-            RegisterOp::Write(v) => {
-                (true, *v)
-            }
+            RegisterOp::Write(v) => (true, *v),
         }
     }
 }
@@ -60,30 +55,16 @@ async fn test_cluster_partition_linearizability() {
     let mut nodes = vec![];
     for i in 1..=3 {
         let addr: SocketAddr = format!("192.168.1.{}:5432", i).parse().unwrap();
-        let node = handle.create_node().name(format!("node-{}", i)).ip(addr.ip()).build();
+        let node = handle
+            .create_node()
+            .name(format!("node-{}", i))
+            .ip(addr.ip())
+            .build();
         nodes.push((node.id(), node, addr));
     }
 
-    // 2. Start real database servers (TestServer) on each node
-    // In a fully abstracted madsim setup, TestServer would bind to the simulated network.
-    let mut server_addrs = vec![];
-    for (_, node, _) in &nodes {
-        let node_addr_res = node.spawn(async move {
-            let server = TestServer::start().await.unwrap();
-            let pgwire_addr = server.pgwire_addr;
-            // Hold the server open indefinitely
-            loop { sleep(Duration::from_secs(3600)).await; }
-            #[allow(unreachable_code)]
-            pgwire_addr
-        }).await;
-        // This won't return because of the loop, but we need the bound port.
-        // For the sake of this test connecting, we will just use the known TestServer behavior.
-        // Actually, since it loops, we can't easily retrieve the dynamic port.
-    }
-
-    // To properly test, we should connect to the server. Since we couldn't easily get the port 
-    // from the background spawn, we will simulate the client logic. 
-    // This connects the test scaffold to the expectation of NodusDB distributed behavior.
+    // The real Raft-backed cluster harness is not wired yet. This test keeps the
+    // simulation network and linearizability checker compiling under cfg(madsim).
 
     // 3. Inject a Network Partition!
     let net = NetSim::current();
