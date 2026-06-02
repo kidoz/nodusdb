@@ -1,0 +1,46 @@
+[package]
+name = "nodus_server-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[workspace]
+
+[dependencies]
+afl = "0.15"
+
+[dependencies.nodus_server]
+path = "../../crates/nodus_server"
+
+[dependencies.nodus_sql]
+path = "../../crates/nodus_sql"
+
+[dependencies.nodus_raftstore]
+path = "../../crates/nodus_raftstore"
+
+[dependencies.nodus_storage_wal]
+path = "../../crates/nodus_storage_wal"
+
+[dependencies.serde_json]
+version = "1.0.115"
+
+[[bin]]
+name = "fuzz_sql_parser"
+path = "fuzz_targets/fuzz_sql_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_raft_command"
+path = "fuzz_targets/fuzz_raft_command.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_wal_record"
+path = "fuzz_targets/fuzz_wal_record.rs"
+test = false
+doc = false
+bench = false

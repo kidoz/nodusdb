@@ -1,0 +1,33 @@
+name: Fuzz
+
+on:
+  schedule:
+    - cron: '0 2 * * *' # Run nightly at 2 AM
+  workflow_dispatch:
+
+jobs:
+  fuzz:
+    name: Fuzz nodus_sql
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-afl
+        run: cargo install cargo-afl
+      - name: Build fuzzer targets
+        run: cd tests/fuzz && cargo afl build
+      - name: Run AFL for SQL Parser (Smoke test, 10 seconds)
+        run: |
+          mkdir -p tests/fuzz/in_sql
+          echo "SELECT 1;" > tests/fuzz/in_sql/1.sql
+          cd tests/fuzz && timeout 10 cargo afl fuzz -i in_sql -o out_sql target/debug/fuzz_sql_parser || true
+      - name: Run AFL for Raft Command (Smoke test, 10 seconds)
+        run: |
+          mkdir -p tests/fuzz/in_raft
+          echo "{}" > tests/fuzz/in_raft/1.json
+          cd tests/fuzz && timeout 10 cargo afl fuzz -i in_raft -o out_raft target/debug/fuzz_raft_command || true
+      - name: Run AFL for WAL Record (Smoke test, 10 seconds)
+        run: |
+          mkdir -p tests/fuzz/in_wal
+          echo "{}" > tests/fuzz/in_wal/1.json
+          cd tests/fuzz && timeout 10 cargo afl fuzz -i in_wal -o out_wal target/debug/fuzz_wal_record || true

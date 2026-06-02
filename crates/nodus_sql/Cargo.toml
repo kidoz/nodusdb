@@ -10,3 +10,6 @@ repository.workspace = true
 sqlparser.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

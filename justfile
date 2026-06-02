@@ -16,6 +16,10 @@ clippy:
 test:
     cargo test --workspace
 
+# Run deterministic simulation tests
+test-sim:
+    RUSTFLAGS="--cfg madsim" cargo test -p nodus_testkit --test sim_test -- --ignored
+
 # Run fmt, clippy, and test
 check: fmt clippy test
 

@@ -537,4 +537,40 @@ mod tests {
         let res = recovered_engine.get(k1.as_ref(), 15).unwrap();
         assert_eq!(res.unwrap(), v1);
     }
+
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn test_mvcc_read_your_writes(key in any::<Vec<u8>>(), val in any::<Vec<u8>>()) {
+            if key.starts_with(b"intent:") || key.is_empty() { return Ok(()); }
+            let engine = LsmKvEngine::new();
+            let k = Bytes::from(key);
+            let v = Bytes::from(val);
+            let txn = TxnId::new();
+            engine.write_intent(txn, k.clone(), v.clone()).unwrap();
+            engine.commit(txn, 10).unwrap();
+
+            let res = engine.get(&k, 15).unwrap();
+            prop_assert_eq!(res, Some(v));
+        }
+
+        #[test]
+        fn test_mvcc_snapshot_isolation(val1 in any::<Vec<u8>>(), val2 in any::<Vec<u8>>()) {
+            let engine = LsmKvEngine::new();
+            let k = Bytes::from("prop_key");
+            
+            let txn1 = TxnId::new();
+            engine.write_intent(txn1, k.clone(), Bytes::from(val1.clone())).unwrap();
+            engine.commit(txn1, 10).unwrap();
+
+            let txn2 = TxnId::new();
+            engine.write_intent(txn2, k.clone(), Bytes::from(val2.clone())).unwrap();
+            engine.commit(txn2, 20).unwrap();
+
+            prop_assert_eq!(engine.get(&k, 15).unwrap(), Some(Bytes::from(val1)));
+            prop_assert_eq!(engine.get(&k, 25).unwrap(), Some(Bytes::from(val2)));
+            prop_assert_eq!(engine.get(&k, 5).unwrap(), None);
+        }
+    }
 }

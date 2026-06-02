@@ -6,6 +6,9 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 reqwest.workspace = true
 tokio.workspace = true
@@ -15,6 +18,9 @@ thiserror.workspace = true
 nodus_server = { path = "../nodus_server" }
 nodus_security = { path = "../nodus_security" }
 nodus_config = { path = "../nodus_config" }
+madsim = "0.2.34"
 
 [dev-dependencies]
+madsim = "0.2.34"
+porcupine-rs = "0.3.0"
 serde_json.workspace = true

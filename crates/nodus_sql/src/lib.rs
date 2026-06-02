@@ -36,10 +36,27 @@ pub fn parse_sql(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn test_parse_simple() {
         let stmts = parse_sql("SELECT 1;").unwrap();
         assert_eq!(stmts.len(), 1);
+    }
+
+    proptest! {
+        #[test]
+        fn test_parser_no_panic_on_garbage(ref s in "\\PC*") {
+            // The parser should return an Error rather than panicking.
+            let _ = parse_sql(s);
+        }
+
+        #[test]
+        fn test_parser_valid_select(ref c in "[a-zA-Z_][a-zA-Z0-9_]*", ref t in "[a-zA-Z_][a-zA-Z0-9_]*") {
+            // Test that generating a syntactically valid SELECT statement always parses successfully
+            let query = format!("SELECT {} FROM {};", c, t);
+            let res = parse_sql(&query);
+            prop_assert!(res.is_ok(), "Failed to parse: {}", query);
+        }
     }
 }

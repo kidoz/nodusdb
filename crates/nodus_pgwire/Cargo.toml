@@ -23,3 +23,6 @@ nodus_catalog = { path = "../nodus_catalog" }
 nodus_telemetry = { path = "../nodus_telemetry" }
 uuid.workspace = true
 tokio-rustls = "0.26"
+
+[dev-dependencies]
+proptest.workspace = true

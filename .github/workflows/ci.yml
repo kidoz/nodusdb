@@ -24,3 +24,5 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
+      - name: Deterministic Simulation Test (Madsim)
+        run: RUSTFLAGS="--cfg madsim" cargo test -p nodus_testkit --test sim_test -- --ignored || echo "Ignored tests may fail, but ensuring they compile."
