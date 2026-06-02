@@ -47,6 +47,10 @@ test-loom:
 bench:
     cargo bench -p nodus_storage_btree -p nodus_storage_lsm
 
+# Build fuzz targets without running the fuzzers
+fuzz-check:
+    cargo check --manifest-path tests/fuzz/Cargo.toml
+
 # Run fmt, clippy, and test
 check: fmt clippy test
 
