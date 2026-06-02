@@ -28,3 +28,5 @@ jobs:
         run: RUSTFLAGS="--cfg madsim" cargo test -p nodus_testkit --test sim_test -- --ignored || echo "Ignored tests may fail, but ensuring they compile."
       - name: Loom Concurrency Proof (txn/MVCC)
         run: RUSTFLAGS="--cfg loom" LOOM_MAX_PREEMPTIONS=3 cargo test -p nodus_txn --release loom_
+      - name: Compile Storage Engine Benchmarks
+        run: cargo bench --no-run -p nodus_storage_btree -p nodus_storage_lsm

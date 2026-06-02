@@ -64,6 +64,7 @@ bytes = "1.6.0"
 openraft = { version = "0.9.16", features = ["serde"] }
 sha2 = "0.10.8"
 proptest = "1.4.0"
+criterion = "0.8"
 
 [workspace.lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(madsim)'] }
