@@ -20,6 +20,10 @@ test:
 test-sim:
     RUSTFLAGS="--cfg madsim" cargo test -p nodus_testkit --test sim_test -- --ignored
 
+# Run loom model-checked concurrency tests for the transaction manager
+test-loom:
+    RUSTFLAGS="--cfg loom" LOOM_MAX_PREEMPTIONS=3 cargo test -p nodus_txn --release loom_
+
 # Run fmt, clippy, and test
 check: fmt clippy test
 

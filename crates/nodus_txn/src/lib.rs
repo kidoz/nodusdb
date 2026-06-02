@@ -2,6 +2,21 @@ use anyhow::Result;
 use nodus_storage_api::{Timestamp, TxnId};
 use serde::{Deserialize, Serialize};
 
+/// Concurrency primitives for the transaction manager.
+///
+/// Under `--cfg loom` these resolve to loom's model-checked shims, letting the
+/// concurrency-control locking in [`MemTxnManager`] be exhaustively verified by
+/// the loom tests at the bottom of this file. In every normal build they are the
+/// `std` primitives used in production, so the loom proof covers the real code
+/// path rather than a separate model.
+pub(crate) mod sync {
+    #[cfg(loom)]
+    pub(crate) use loom::sync::{Arc, RwLock};
+    #[cfg(not(loom))]
+    #[allow(unused_imports)] // `Arc` is only used by the loom tests.
+    pub(crate) use std::sync::{Arc, RwLock};
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TxnState {
     Pending,
@@ -68,8 +83,8 @@ pub trait TxnManager: Send + Sync {
 }
 
 // In-Memory MVP Implementation
+use crate::sync::RwLock;
 use std::collections::HashMap;
-use std::sync::RwLock;
 
 pub struct MemTxnManager {
     records: RwLock<HashMap<TxnId, TxnRecord>>,
@@ -196,7 +211,9 @@ impl TxnManager for MemTxnManager {
     }
 }
 
-#[cfg(test)]
+// Regular unit tests use std locks and must not run under loom, where lock
+// operations are only valid inside a `loom::model` closure.
+#[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
 
@@ -211,5 +228,93 @@ mod tests {
 
         // Aborting already committed should fail
         assert!(manager.abort_txn(txn.txn_id).is_err());
+    }
+}
+
+// Loom model-checked concurrency tests.
+//
+// These run under `--cfg loom` (see `just test-loom`) and exhaustively explore
+// thread interleavings of `MemTxnManager`'s commit path to prove its
+// snapshot-isolation / OCC invariants hold for the real production locking, not
+// a hand-written model. The transactions are created sequentially on the main
+// thread; only the conflicting work — `commit_txn` — runs concurrently, keeping
+// the state space tractable.
+#[cfg(all(test, loom))]
+mod loom_tests {
+    use super::*;
+    use crate::sync::Arc;
+    use loom::thread;
+
+    /// Two transactions whose read snapshots overlap and that write the same
+    /// key must not both commit: at most one may win, or a lost update would
+    /// silently occur. Because the first committer's timestamp is always issued
+    /// after both read timestamps, the loser is guaranteed to observe the
+    /// conflict, so in fact *exactly* one wins under every interleaving.
+    #[test]
+    fn loom_conflicting_commits_exactly_one_wins() {
+        loom::model(|| {
+            let mgr = Arc::new(MemTxnManager::new());
+
+            let t1 = mgr.begin_txn().unwrap();
+            let t2 = mgr.begin_txn().unwrap();
+            mgr.track_write(t1.txn_id, b"k".to_vec()).unwrap();
+            mgr.track_write(t2.txn_id, b"k".to_vec()).unwrap();
+
+            let (id1, id2) = (t1.txn_id, t2.txn_id);
+            let m1 = Arc::clone(&mgr);
+            let h = thread::spawn(move || m1.commit_txn(id1).is_ok());
+            let ok2 = mgr.commit_txn(id2).is_ok();
+            let ok1 = h.join().unwrap();
+
+            assert!(
+                ok1 ^ ok2,
+                "write-write conflict invariant violated: ok1={ok1}, ok2={ok2}"
+            );
+        });
+    }
+
+    /// Transactions that touch disjoint keys never conflict, so both must commit
+    /// regardless of how their commit critical sections interleave.
+    #[test]
+    fn loom_disjoint_commits_both_win() {
+        loom::model(|| {
+            let mgr = Arc::new(MemTxnManager::new());
+
+            let t1 = mgr.begin_txn().unwrap();
+            let t2 = mgr.begin_txn().unwrap();
+            mgr.track_write(t1.txn_id, b"k1".to_vec()).unwrap();
+            mgr.track_write(t2.txn_id, b"k2".to_vec()).unwrap();
+
+            let (id1, id2) = (t1.txn_id, t2.txn_id);
+            let m1 = Arc::clone(&mgr);
+            let h = thread::spawn(move || m1.commit_txn(id1).is_ok());
+            let ok2 = mgr.commit_txn(id2).is_ok();
+            let ok1 = h.join().unwrap();
+
+            assert!(ok1 && ok2, "disjoint commits must both succeed");
+        });
+    }
+
+    /// The hybrid logical clock is ticked while holding the records write lock,
+    /// so two commits that race must still be assigned distinct, monotonic
+    /// commit timestamps — no two committed transactions may share a version.
+    #[test]
+    fn loom_concurrent_commits_get_distinct_timestamps() {
+        loom::model(|| {
+            let mgr = Arc::new(MemTxnManager::new());
+
+            let t1 = mgr.begin_txn().unwrap();
+            let t2 = mgr.begin_txn().unwrap();
+            mgr.track_write(t1.txn_id, b"k1".to_vec()).unwrap();
+            mgr.track_write(t2.txn_id, b"k2".to_vec()).unwrap();
+
+            let (id1, id2) = (t1.txn_id, t2.txn_id);
+            let m1 = Arc::clone(&mgr);
+            let h = thread::spawn(move || m1.commit_txn(id1).unwrap());
+            let ts2 = mgr.commit_txn(id2).unwrap();
+            let ts1 = h.join().unwrap();
+
+            assert_ne!(ts1, ts2, "concurrent commits shared a commit timestamp");
+        });
     }
 }

@@ -13,3 +13,13 @@ serde.workspace = true
 uuid.workspace = true
 nodus_storage_api = { path = "../nodus_storage_api" }
 nodus_mvcc = { path = "../nodus_mvcc" }
+
+# loom is only compiled in when concurrency tests are run with `--cfg loom`
+# (see `just test-loom`); it is absent from normal and production builds.
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
+
+# Register `loom` as an expected cfg so `cargo clippy -- -D warnings` does not
+# reject the `#[cfg(loom)]` / `#[cfg(not(loom))]` gates in regular builds.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }

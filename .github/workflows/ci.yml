@@ -26,3 +26,5 @@ jobs:
         run: cargo test --workspace
       - name: Deterministic Simulation Test (Madsim)
         run: RUSTFLAGS="--cfg madsim" cargo test -p nodus_testkit --test sim_test -- --ignored || echo "Ignored tests may fail, but ensuring they compile."
+      - name: Loom Concurrency Proof (txn/MVCC)
+        run: RUSTFLAGS="--cfg loom" LOOM_MAX_PREEMPTIONS=3 cargo test -p nodus_txn --release loom_
