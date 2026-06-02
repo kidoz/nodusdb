@@ -536,13 +536,14 @@ impl MemExecutor {
     pub fn persistent(
         audit: Arc<dyn AuditSink>,
         data_dir: &str,
+        encryption_key: Option<[u8; 32]>,
     ) -> Result<(Arc<MemExecutor>, Arc<MemoryCatalog>)> {
         let path = std::path::Path::new(data_dir);
         std::fs::create_dir_all(path)?;
         let cat_path = path.join("catalog.json");
         let cat = Arc::new(MemoryCatalog::load_from_disk(cat_path)?);
 
-        let kv = Arc::new(nodus_storage_lsm::LsmKvEngine::new()); // No path arg since it's currently memory MVP
+        let kv = Arc::new(nodus_storage_lsm::LsmKvEngine::with_wal(path, encryption_key)?);
         let txn = Arc::new(nodus_txn::MemTxnManager::new());
         let authz = Arc::new(nodus_authz::DefaultAuthzEngine::new(cat.clone()));
 

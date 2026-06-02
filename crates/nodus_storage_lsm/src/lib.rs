@@ -20,11 +20,11 @@ impl LsmKvEngine {
         }
     }
 
-    pub fn with_wal<P: AsRef<Path>>(data_dir: P) -> Result<Self> {
+    pub fn with_wal<P: AsRef<Path>>(data_dir: P, key: Option<[u8; 32]>) -> Result<Self> {
         let path = data_dir.as_ref();
         std::fs::create_dir_all(path)?;
         let wal_path = path.join("wal.log");
-        let wal = Arc::new(FileWalEngine::new(&wal_path)?);
+        let wal = Arc::new(FileWalEngine::with_encryption(&wal_path, key)?);
 
         let engine = Self {
             memtable: RwLock::new(BTreeMap::new()),
@@ -527,13 +527,13 @@ mod tests {
         let txn1 = TxnId::new();
 
         {
-            let engine = LsmKvEngine::with_wal(temp_dir.path()).unwrap();
+            let engine = LsmKvEngine::with_wal(temp_dir.path(), None).unwrap();
             engine.write_intent(txn1, k1.clone(), v1.clone()).unwrap();
             engine.commit(txn1, 10).unwrap();
         } // Engine drops, releasing file locks
 
         // Re-instantiate against same directory should recover MemTable from WAL
-        let recovered_engine = LsmKvEngine::with_wal(temp_dir.path()).unwrap();
+        let recovered_engine = LsmKvEngine::with_wal(temp_dir.path(), None).unwrap();
         let res = recovered_engine.get(k1.as_ref(), 15).unwrap();
         assert_eq!(res.unwrap(), v1);
     }

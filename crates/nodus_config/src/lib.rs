@@ -36,11 +36,16 @@ pub struct NodusConfig {
 #[serde(default)]
 pub struct StorageConfig {
     pub data_dir: Option<String>,
+    /// Optional 256-bit AES-GCM key (32 bytes as a hex string) for Transparent Data Encryption (TDE).
+    pub encryption_key: Option<String>,
 }
 
 impl Default for StorageConfig {
     fn default() -> Self {
-        Self { data_dir: None }
+        Self { 
+            data_dir: None,
+            encryption_key: None,
+        }
     }
 }
 
@@ -76,6 +81,10 @@ pub struct TlsConfig {
     pub enabled: bool,
     pub cert_path: Option<String>,
     pub key_path: Option<String>,
+    /// Path to a CA certificate bundle used to verify client certificates (mTLS).
+    pub client_ca_path: Option<String>,
+    /// If true, clients must present a valid certificate signed by `client_ca_path`.
+    pub require_client_auth: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -130,6 +139,8 @@ impl Default for TlsConfig {
             enabled: false,
             cert_path: None,
             key_path: None,
+            client_ca_path: None,
+            require_client_auth: false,
         }
     }
 }

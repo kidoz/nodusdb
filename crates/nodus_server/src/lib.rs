@@ -18,6 +18,8 @@ use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::ServerConfig;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use tokio_rustls::rustls::server::WebPkiClientVerifier;
+use tokio_rustls::rustls::RootCertStore;
 use tower_http::cors::{Any, CorsLayer};
 
 pub struct ServerHandle {
@@ -66,8 +68,23 @@ fn load_tls_acceptor(tls: &nodus_config::TlsConfig) -> anyhow::Result<Option<Arc
     let key: PrivateKeyDer = rustls_pemfile::private_key(&mut key_bytes.as_slice())?
         .ok_or_else(|| anyhow::anyhow!("no private key found in {key_path}"))?;
 
+    let client_auth = if let Some(ca_path) = &tls.client_ca_path {
+        let ca_bytes = std::fs::read(ca_path)?;
+        let mut root_cert_store = RootCertStore::empty();
+        for cert in rustls_pemfile::certs(&mut ca_bytes.as_slice()) {
+            root_cert_store.add(cert?)?;
+        }
+        if tls.require_client_auth {
+            WebPkiClientVerifier::builder(root_cert_store.into()).build()?
+        } else {
+            WebPkiClientVerifier::builder(root_cert_store.into()).allow_unauthenticated().build()?
+        }
+    } else {
+        WebPkiClientVerifier::no_client_auth()
+    };
+
     let config = ServerConfig::builder()
-        .with_no_client_auth()
+        .with_client_cert_verifier(client_auth)
         .with_single_cert(certs, key)?;
     Ok(Some(Arc::new(TlsAcceptor::from(Arc::new(config)))))
 }
@@ -118,8 +135,20 @@ pub async fn run_server_with_config(
             (sink.clone(), sink)
         }
     };
+    let encryption_key = if let Some(hex_key) = &config.storage.encryption_key {
+        let bytes = hex::decode(hex_key).map_err(|e| anyhow::anyhow!("invalid encryption_key hex: {}", e))?;
+        let mut key = [0u8; 32];
+        if bytes.len() != 32 {
+            return Err(anyhow::anyhow!("encryption_key must be exactly 32 bytes (64 hex characters)"));
+        }
+        key.copy_from_slice(&bytes);
+        Some(key)
+    } else {
+        None
+    };
+
     let (executor, catalog) = match &config.storage.data_dir {
-        Some(dir) => nodus_executor::MemExecutor::persistent(audit_sink, dir)?,
+        Some(dir) => nodus_executor::MemExecutor::persistent(audit_sink, dir, encryption_key)?,
         None => nodus_executor::MemExecutor::shared(audit_sink),
     };
 
@@ -259,6 +288,8 @@ mod tests {
             enabled: true,
             cert_path: None,
             key_path: None,
+            client_ca_path: None,
+            require_client_auth: false,
         };
         assert!(load_tls_acceptor(&cfg).is_err());
     }
