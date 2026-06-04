@@ -1,13 +1,13 @@
 use anyhow::Result;
 use bytes::Bytes;
-use nodus_mvcc::MvccValue;
+use nodus_mvcc::VersionChain;
 use nodus_storage_api::{KeyRange, KvEngine, KvPair, Timestamp, TxnId};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::RwLock;
 
 pub struct MemKvEngine {
-    // simplified: key -> array of values sorted by version desc
-    store: RwLock<BTreeMap<Bytes, Vec<MvccValue>>>,
+    // simplified: key -> version chain
+    store: RwLock<BTreeMap<Bytes, VersionChain>>,
     intents: RwLock<HashMap<TxnId, Vec<Bytes>>>,
 }
 
@@ -26,23 +26,13 @@ impl Default for MemKvEngine {
     }
 }
 
-/// Returns the newest committed version at or below `read_ts`, if any. The
-/// caller treats a `value: None` result as a tombstone (key absent).
-fn newest_committed(versions: &[MvccValue], read_ts: Timestamp) -> Option<&MvccValue> {
-    versions
-        .iter()
-        .filter(|v| !v.is_intent && v.version <= read_ts)
-        .max_by_key(|v| v.version)
-}
-
 impl KvEngine for MemKvEngine {
     fn get(&self, key: &[u8], read_ts: Timestamp) -> Result<Option<Bytes>> {
         let guard = self.store.read().unwrap();
-        if let Some(versions) = guard.get(key)
-            && let Some(v) = newest_committed(versions, read_ts)
-        {
-            // A tombstone (value None) means the key is absent at read_ts.
-            return Ok(v.value.as_ref().map(|val| Bytes::from(val.clone())));
+        if let Some(chain) = guard.get(key) {
+            if let Some(val) = chain.read(read_ts) {
+                return Ok(Some(Bytes::from(val.to_vec())));
+            }
         }
         Ok(None)
     }
@@ -55,14 +45,20 @@ impl KvEngine for MemKvEngine {
         let guard = self.store.read().unwrap();
         let mut results = Vec::new();
 
-        for (k, versions) in guard.range(range.start..range.end) {
-            if let Some(v) = newest_committed(versions, read_ts)
-                && let Some(val) = &v.value
-            {
+        for (k, chain) in guard.range(range.start..range.end) {
+            if let Some(val) = chain.read(read_ts) {
+                // Find the version of this read - for the scanner we need the actual version.
+                // We'll peek into the versions since `read` just gives us the value.
+                let version = chain.versions.iter()
+                    .filter(|v| v.is_visible(read_ts))
+                    .map(|v| v.version)
+                    .max()
+                    .unwrap_or(0);
+
                 results.push(Ok(KvPair {
                     key: k.clone(),
-                    value: Bytes::from(val.clone()),
-                    version: v.version,
+                    value: Bytes::from(val.to_vec()),
+                    version,
                 }));
             }
         }
@@ -74,14 +70,11 @@ impl KvEngine for MemKvEngine {
         let mut store_guard = self.store.write().unwrap();
         let mut intents_guard = self.intents.write().unwrap();
 
-        let val = MvccValue {
-            value: Some(value.to_vec()),
-            version: u64::MAX, // max version during intent phase
-            txn_id: Some(txn_id),
-            is_intent: true,
-        };
+        let chain = store_guard.entry(key.clone()).or_default();
+        if let Err(e) = chain.write_intent(txn_id, value.to_vec()) {
+            anyhow::bail!("Write intent failed: {}", e);
+        }
 
-        store_guard.entry(key.clone()).or_default().push(val);
         intents_guard.entry(txn_id).or_default().push(key);
         Ok(())
     }
@@ -90,14 +83,11 @@ impl KvEngine for MemKvEngine {
         let mut store_guard = self.store.write().unwrap();
         let mut intents_guard = self.intents.write().unwrap();
 
-        let tombstone = MvccValue {
-            value: None, // tombstone
-            version: u64::MAX,
-            txn_id: Some(txn_id),
-            is_intent: true,
-        };
+        let chain = store_guard.entry(key.clone()).or_default();
+        if let Err(e) = chain.delete_intent(txn_id) {
+            anyhow::bail!("Delete intent failed: {}", e);
+        }
 
-        store_guard.entry(key.clone()).or_default().push(tombstone);
         intents_guard.entry(txn_id).or_default().push(key);
         Ok(())
     }
@@ -108,15 +98,8 @@ impl KvEngine for MemKvEngine {
 
         if let Some(keys) = intents_guard.remove(&txn_id) {
             for key in keys {
-                if let Some(versions) = store_guard.get_mut(&key) {
-                    for v in versions.iter_mut() {
-                        if v.txn_id == Some(txn_id) && v.is_intent {
-                            v.is_intent = false;
-                            v.version = commit_ts;
-                        }
-                    }
-                    // Re-sort just in case (though they should naturally be in order mostly)
-                    versions.sort_by_key(|v| v.version);
+                if let Some(chain) = store_guard.get_mut(&key) {
+                    let _ = chain.commit(txn_id, commit_ts);
                 }
             }
         }
@@ -129,8 +112,8 @@ impl KvEngine for MemKvEngine {
 
         if let Some(keys) = intents_guard.remove(&txn_id) {
             for key in keys {
-                if let Some(versions) = store_guard.get_mut(&key) {
-                    versions.retain(|v| v.txn_id != Some(txn_id) || !v.is_intent);
+                if let Some(chain) = store_guard.get_mut(&key) {
+                    let _ = chain.abort(txn_id);
                 }
             }
         }
@@ -142,37 +125,15 @@ impl KvEngine for MemKvEngine {
         let mut removed = 0usize;
         let mut dead_keys = Vec::new();
 
-        for (key, versions) in store.iter_mut() {
-            // Newest committed version visible at or below the watermark: this is
-            // the oldest version any reader at >= watermark could still need.
-            let keep_version = versions
-                .iter()
-                .filter(|v| !v.is_intent && v.version <= watermark)
-                .map(|v| v.version)
-                .max();
-            let Some(keep_version) = keep_version else {
-                continue;
-            };
-
-            let before = versions.len();
-            // Keep intents and everything at or newer than keep_version.
-            versions.retain(|v| v.is_intent || v.version >= keep_version);
-            removed += before - versions.len();
-
-            // If the only survivor is a tombstone at/below the watermark, the key
-            // is dead and can be dropped entirely.
-            if versions.len() == 1 {
-                let v = &versions[0];
-                if !v.is_intent && v.value.is_none() {
-                    dead_keys.push(key.clone());
-                }
+        for (key, chain) in store.iter_mut() {
+            removed += chain.garbage_collect(watermark);
+            if chain.versions.is_empty() {
+                dead_keys.push(key.clone());
             }
         }
 
         for k in dead_keys {
-            if let Some(vs) = store.remove(&k) {
-                removed += vs.len();
-            }
+            store.remove(&k);
         }
         Ok(removed)
     }
