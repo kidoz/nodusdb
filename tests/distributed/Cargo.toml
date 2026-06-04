@@ -15,3 +15,8 @@ madsim = "0.2.34"
 nodus_testkit = { path = "../../crates/nodus_testkit" }
 porcupine-rs = "0.3.0"
 tokio-postgres.workspace = true
+axum.workspace = true
+tokio.workspace = true
+reqwest.workspace = true
+openraft.workspace = true
+nodus_raftstore = { path = "../../crates/nodus_raftstore" }

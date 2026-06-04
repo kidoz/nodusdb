@@ -2191,9 +2191,14 @@ dependencies = [
 name = "nodus_distributed_tests"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "madsim",
+ "nodus_raftstore",
  "nodus_testkit",
+ "openraft",
  "porcupine-rs",
+ "reqwest",
+ "tokio",
  "tokio-postgres",
 ]
 
