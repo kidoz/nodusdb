@@ -248,10 +248,20 @@ pub async fn run_server_with_config(
         draining: state.draining.clone(),
         admin_token: config.admin.token.clone(),
     };
+
+    let raft_config = Arc::new(openraft::Config::default().validate().unwrap());
+    let (log_store, state_machine) = openraft::storage::Adaptor::new(nodus_raftstore::NodusRaftStore::new());
+    let raft_network = nodus_raftstore::network::NodusNetworkFactory::new();
+    let raft = nodus_raftstore::server::NodusRaft::new(1, raft_config, raft_network, log_store, state_machine)
+        .await
+        .map_err(|e| anyhow::anyhow!("raft init: {e}"))?;
+    let raft_state = nodus_raftstore::server::RaftState { raft };
+
     let app = Router::new()
         .merge(monitoring_routes(state))
         .merge(admin_routes(admin_state))
         .merge(nodus_web_console::web_console_routes())
+        .merge(nodus_raftstore::server::raft_routes().with_state(raft_state))
         .layer(cors);
 
     let http_task = tokio::spawn(async move {

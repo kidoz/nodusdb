@@ -38,3 +38,5 @@ serde_json.workspace = true
 tokio-rustls = "0.26"
 rustls-pemfile = "2"
 hex = "0.4.3"
+nodus_raftstore = { path = "../nodus_raftstore" }
+openraft.workspace = true
