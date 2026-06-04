@@ -18,3 +18,4 @@ nodus_catalog = { path = "../nodus_catalog" }
 nodus_authz = { path = "../nodus_authz" }
 nodus_audit = { path = "../nodus_audit" }
 nodus_monitoring = { path = "../nodus_monitoring" }
+tower-http.workspace = true
