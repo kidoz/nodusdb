@@ -69,6 +69,7 @@ pub struct ShardResponse {
 pub struct StateMachine {
     pub last_applied_log: Option<LogId<u64>>,
     pub last_membership: StoredMembership<u64, openraft::BasicNode>,
+    pub data: BTreeMap<String, String>,
 }
 
 #[derive(Clone)]
@@ -92,6 +93,7 @@ impl NodusRaftStore {
             state_machine: Arc::new(RwLock::new(StateMachine {
                 last_applied_log: None,
                 last_membership: StoredMembership::default(),
+                data: BTreeMap::new(),
             })),
         }
     }
@@ -114,13 +116,16 @@ impl RaftLogReader<NodusTypeConfig> for NodusRaftStore {
 impl RaftSnapshotBuilder<NodusTypeConfig> for NodusRaftStore {
     async fn build_snapshot(&mut self) -> Result<Snapshot<NodusTypeConfig>, StorageError<u64>> {
         let sm = self.state_machine.read().await;
+        
+        let data_bytes = serde_json::to_vec(&sm.data).unwrap_or_default();
+        
         Ok(Snapshot {
             meta: SnapshotMeta {
                 last_log_id: sm.last_applied_log,
                 last_membership: sm.last_membership.clone(),
                 snapshot_id: "snapshot".to_string(),
             },
-            snapshot: Box::new(Cursor::new(vec![])),
+            snapshot: Box::new(Cursor::new(data_bytes)),
         })
     }
 }
@@ -199,7 +204,13 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
         for entry in entries {
             sm.last_applied_log = Some(entry.log_id);
             match &entry.payload {
-                EntryPayload::Normal(_) => res.push(ShardResponse { success: true }),
+                EntryPayload::Normal(cmd) => {
+                    if let ShardCommand::PutIntent { key, value, .. } = cmd
+                        && let (Ok(k), Ok(v)) = (String::from_utf8(key.clone()), String::from_utf8(value.clone())) {
+                            sm.data.insert(k, v);
+                        }
+                    res.push(ShardResponse { success: true });
+                }
                 EntryPayload::Membership(mem) => {
                     sm.last_membership = StoredMembership::new(Some(entry.log_id), mem.clone());
                     res.push(ShardResponse { success: true });
@@ -223,11 +234,17 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
     async fn install_snapshot(
         &mut self,
         meta: &SnapshotMeta<u64, openraft::BasicNode>,
-        _snapshot: Box<Cursor<Vec<u8>>>,
+        snapshot: Box<Cursor<Vec<u8>>>,
     ) -> Result<(), StorageError<u64>> {
         let mut sm = self.state_machine.write().await;
         sm.last_applied_log = meta.last_log_id;
         sm.last_membership = meta.last_membership.clone();
+        
+        let bytes = snapshot.into_inner();
+        if let Ok(data) = serde_json::from_slice(&bytes) {
+            sm.data = data;
+        }
+        
         Ok(())
     }
 
