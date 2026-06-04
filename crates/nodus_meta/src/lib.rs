@@ -1,9 +1,12 @@
 use anyhow::Result;
+use bytes::Bytes;
 use nodus_catalog::{ShardDescriptor, TableId};
+use nodus_storage_api::{KvEngine, TxnId};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShardMap {
     pub table_id: TableId,
     pub shards: Vec<ShardDescriptor>,
@@ -44,6 +47,50 @@ impl MetaStore for MemMetaStore {
     fn update_shard_map(&self, shard_map: ShardMap) -> Result<()> {
         let mut guard = self.maps.write().unwrap();
         guard.insert(shard_map.table_id, shard_map);
+        Ok(())
+    }
+}
+
+pub struct PersistentMetaStore {
+    kv: Arc<dyn KvEngine>,
+}
+
+impl PersistentMetaStore {
+    pub fn new(kv: Arc<dyn KvEngine>) -> Self {
+        Self { kv }
+    }
+
+    fn key_for(table_id: TableId) -> Bytes {
+        Bytes::from(format!("meta:shard_map:{}", table_id))
+    }
+}
+
+impl MetaStore for PersistentMetaStore {
+    fn get_shard_map(&self, table_id: TableId) -> Result<ShardMap> {
+        let key = Self::key_for(table_id);
+        let val = self.kv.get(&key, u64::MAX)?;
+        if let Some(bytes) = val {
+            let map: ShardMap = serde_json::from_slice(&bytes)?;
+            Ok(map)
+        } else {
+            anyhow::bail!("Shard map not found for table {}", table_id)
+        }
+    }
+
+    fn update_shard_map(&self, shard_map: ShardMap) -> Result<()> {
+        let key = Self::key_for(shard_map.table_id);
+        let val = Bytes::from(serde_json::to_vec(&shard_map)?);
+        
+        let txn_id = TxnId::new();
+        self.kv.write_intent(txn_id, key, val)?;
+        
+        // Use current timestamp as commit_ts
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros() as u64;
+            
+        self.kv.commit(txn_id, ts)?;
         Ok(())
     }
 }

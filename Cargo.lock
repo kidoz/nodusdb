@@ -2253,8 +2253,11 @@ name = "nodus_meta"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "nodus_catalog",
+ "nodus_storage_api",
  "serde",
+ "serde_json",
  "thiserror 1.0.69",
 ]
 
