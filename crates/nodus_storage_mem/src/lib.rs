@@ -29,11 +29,10 @@ impl Default for MemKvEngine {
 impl KvEngine for MemKvEngine {
     fn get(&self, key: &[u8], read_ts: Timestamp) -> Result<Option<Bytes>> {
         let guard = self.store.read().unwrap();
-        if let Some(chain) = guard.get(key) {
-            if let Some(val) = chain.read(read_ts) {
+        if let Some(chain) = guard.get(key)
+            && let Some(val) = chain.read(read_ts) {
                 return Ok(Some(Bytes::from(val.to_vec())));
             }
-        }
         Ok(None)
     }
 

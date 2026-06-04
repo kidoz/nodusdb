@@ -114,7 +114,7 @@ impl VersionChain {
         self.versions.push(intent);
         // Sort descending by version so the newest is first if needed, though we use max_by_key in read().
         // Sorting helps keep the chain ordered for efficient gc or scans.
-        self.versions.sort_by(|a, b| b.version.cmp(&a.version));
+        self.versions.sort_by_key(|b| std::cmp::Reverse(b.version));
         
         Ok(())
     }
@@ -163,13 +163,12 @@ impl VersionChain {
                 let newest = self.versions.iter().map(|v| v.version).max().unwrap_or(0);
                 if newest <= watermark {
                     // Check if the newest is a tombstone.
-                    if let Some(newest_v) = self.versions.iter().find(|v| v.version == newest) {
-                        if newest_v.value.is_none() && !newest_v.is_intent {
+                    if let Some(newest_v) = self.versions.iter().find(|v| v.version == newest)
+                        && newest_v.value.is_none() && !newest_v.is_intent {
                             // Fully reclaimable tombstone
                             self.versions.retain(|v| v.version != newest);
                             reclaimed += 1;
                         }
-                    }
                 }
             }
         }
