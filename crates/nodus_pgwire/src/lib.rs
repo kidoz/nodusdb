@@ -274,7 +274,11 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
             .metadata()
             .get("nodus_session_id")
             .cloned()
-            .unwrap_or_else(|| Uuid::new_v4().to_string());
+            .unwrap_or_else(|| {
+                let id = Uuid::new_v4().to_string();
+                client.metadata_mut().insert("nodus_session_id".to_string(), id.clone());
+                id
+            });
 
         let _timer = QueryTimer {
             start: std::time::Instant::now(),
@@ -431,19 +435,32 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
         let mut fields = vec![];
         if let Ok(mut stmts) = nodus_sql::parse_sql(&stmt.statement)
             && let Some(parsed) = stmts.pop()
-                && let Ok(nodus_executor::LogicalPlan::Select { projection, .. }) =
-                    nodus_executor::plan_statement(&parsed)
-                {
-                    for col in projection {
+            && let Ok(plan) = nodus_executor::plan_statement(&parsed) {
+                match plan {
+                    nodus_executor::LogicalPlan::Select { projection, .. } => {
+                        for col in projection {
+                            fields.push(FieldInfo::new(
+                                col,
+                                None,
+                                None,
+                                Type::VARCHAR,
+                                FieldFormat::Text,
+                            ));
+                        }
+                    }
+                    nodus_executor::LogicalPlan::SelectLiteral { .. }
+                    | nodus_executor::LogicalPlan::ShowVariable { .. } => {
                         fields.push(FieldInfo::new(
-                            col,
+                            "?column?".to_string(),
                             None,
                             None,
                             Type::VARCHAR,
                             FieldFormat::Text,
                         ));
                     }
+                    _ => {}
                 }
+            }
 
         Ok(DescribeStatementResponse::new(param_types, fields))
     }
@@ -462,19 +479,32 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
         let mut fields = vec![];
         if let Ok(mut stmts) = nodus_sql::parse_sql(&portal.statement.statement)
             && let Some(parsed) = stmts.pop()
-                && let Ok(nodus_executor::LogicalPlan::Select { projection, .. }) =
-                    nodus_executor::plan_statement(&parsed)
-                {
-                    for col in projection {
+            && let Ok(plan) = nodus_executor::plan_statement(&parsed) {
+                match plan {
+                    nodus_executor::LogicalPlan::Select { projection, .. } => {
+                        for col in projection {
+                            fields.push(FieldInfo::new(
+                                col,
+                                None,
+                                None,
+                                Type::VARCHAR,
+                                FieldFormat::Text,
+                            ));
+                        }
+                    }
+                    nodus_executor::LogicalPlan::SelectLiteral { .. }
+                    | nodus_executor::LogicalPlan::ShowVariable { .. } => {
                         fields.push(FieldInfo::new(
-                            col,
+                            "?column?".to_string(),
                             None,
                             None,
                             Type::VARCHAR,
                             FieldFormat::Text,
                         ));
                     }
+                    _ => {}
                 }
+            }
         Ok(DescribePortalResponse::new(fields))
     }
 }
