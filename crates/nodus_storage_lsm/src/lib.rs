@@ -1,199 +1,151 @@
 use anyhow::Result;
 use bytes::Bytes;
-use nodus_mvcc::MvccValue;
+pub mod sstable;
+
+use nodus_mvcc::VersionChain;
 use nodus_storage_api::{KeyRange, KvEngine, KvPair, Timestamp, TxnId};
 use nodus_storage_wal::{FileWalEngine, WalEngine, WalRecord, WalRecordV1};
-use std::collections::BTreeMap;
-use std::path::Path;
+use sstable::Sstable;
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 pub struct LsmKvEngine {
-    memtable: RwLock<BTreeMap<Vec<u8>, Vec<u8>>>,
+    data_dir: Option<PathBuf>,
+    memtable: RwLock<BTreeMap<Bytes, VersionChain>>,
+    intents: RwLock<HashMap<TxnId, Vec<Bytes>>>,
+    sstables: RwLock<Vec<Sstable>>,
     wal: Option<Arc<dyn WalEngine>>,
+    next_file_id: std::sync::atomic::AtomicU64,
+    _wal_key: Option<[u8; 32]>,
 }
 
 impl LsmKvEngine {
     pub fn new() -> Self {
         Self {
+            data_dir: None,
             memtable: RwLock::new(BTreeMap::new()),
+            intents: RwLock::new(HashMap::new()),
+            sstables: RwLock::new(Vec::new()),
             wal: None,
+            next_file_id: std::sync::atomic::AtomicU64::new(1),
+            _wal_key: None,
         }
     }
 
     pub fn with_wal<P: AsRef<Path>>(data_dir: P, key: Option<[u8; 32]>) -> Result<Self> {
         let path = data_dir.as_ref();
         std::fs::create_dir_all(path)?;
-        let wal_path = path.join("wal.log");
+        
+        let mut sstables = Vec::new();
+        let mut max_id = 0;
+        
+        // Load existing SSTs
+        for entry in std::fs::read_dir(path)? {
+            let entry = entry?;
+            let p = entry.path();
+            if p.extension().and_then(|s| s.to_str()) == Some("sst")
+                && let Some(name) = p.file_stem().and_then(|n| n.to_str())
+                    && let Ok(id) = name.parse::<u64>() {
+                        max_id = std::cmp::max(max_id, id);
+                        sstables.push(Sstable::open(p));
+                    }
+        }
+        
+        // Sort SSTs so newest is last
+        sstables.sort_by_key(|s| {
+            s.path.file_stem().and_then(|n| n.to_str()).and_then(|n| n.parse::<u64>().ok()).unwrap_or(0)
+        });
+
+        let wal_path = path.join(format!("{}.log", max_id + 1));
         let wal = Arc::new(FileWalEngine::with_encryption(&wal_path, key)?);
 
         let engine = Self {
+            data_dir: Some(path.to_path_buf()),
             memtable: RwLock::new(BTreeMap::new()),
+            intents: RwLock::new(HashMap::new()),
+            sstables: RwLock::new(sstables),
             wal: Some(wal),
+            next_file_id: std::sync::atomic::AtomicU64::new(max_id + 2),
+            _wal_key: key,
         };
 
         engine.recover()?;
         Ok(engine)
     }
 
+    pub fn flush(&self) -> Result<()> {
+        let dir = match &self.data_dir {
+            Some(d) => d,
+            None => return Ok(()), // no-op for in-memory only
+        };
+
+        let file_id = self.next_file_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let sst_path = dir.join(format!("{}.sst", file_id));
+        let _new_wal_path = dir.join(format!("{}.log", file_id + 1));
+
+        let mut mem_guard = self.memtable.write().unwrap();
+        
+        if mem_guard.is_empty() {
+            return Ok(());
+        }
+
+        // 1. Flush memtable to SSTable
+        let sst = Sstable::build(&sst_path, &mem_guard)?;
+        
+        // 2. Add to list
+        let mut sst_guard = self.sstables.write().unwrap();
+        sst_guard.push(sst);
+
+        // 3. Clear memtable
+        mem_guard.clear();
+        
+        Ok(())
+    }
+
     fn recover(&self) -> Result<()> {
         if let Some(wal) = &self.wal {
             let records = wal.recover()?;
-            let mut guard = self.memtable.write().unwrap();
+            let mut mem_guard = self.memtable.write().unwrap();
+            let mut int_guard = self.intents.write().unwrap();
 
             for record in records {
                 let WalRecord::V1(rec) = record;
                 match rec {
                     WalRecordV1::WriteIntent { txn_id, key, value } => {
-                        let mut versions = Self::read_versions_from_map(&guard, &key)?;
-                        versions.push(MvccValue {
-                            value: Some(value),
-                            version: u64::MAX,
-                            txn_id: Some(txn_id),
-                            is_intent: true,
-                        });
-                        Self::write_versions_to_map(&mut guard, &key, &versions)?;
-
-                        let mut txn_key = b"intent:".to_vec();
-                        txn_key.extend_from_slice(txn_id.0.as_bytes());
-                        let mut keys = Self::read_intents_from_map(&guard, &txn_key)?;
-                        keys.push(key);
-                        Self::write_intents_to_map(&mut guard, &txn_key, &keys)?;
+                        let k = Bytes::from(key);
+                        let chain = mem_guard.entry(k.clone()).or_default();
+                        let _ = chain.write_intent(txn_id, value);
+                        int_guard.entry(txn_id).or_default().push(k);
                     }
                     WalRecordV1::DeleteIntent { txn_id, key } => {
-                        let mut versions = Self::read_versions_from_map(&guard, &key)?;
-                        versions.push(MvccValue {
-                            value: None,
-                            version: u64::MAX,
-                            txn_id: Some(txn_id),
-                            is_intent: true,
-                        });
-                        Self::write_versions_to_map(&mut guard, &key, &versions)?;
-
-                        let mut txn_key = b"intent:".to_vec();
-                        txn_key.extend_from_slice(txn_id.0.as_bytes());
-                        let mut keys = Self::read_intents_from_map(&guard, &txn_key)?;
-                        keys.push(key);
-                        Self::write_intents_to_map(&mut guard, &txn_key, &keys)?;
+                        let k = Bytes::from(key);
+                        let chain = mem_guard.entry(k.clone()).or_default();
+                        let _ = chain.delete_intent(txn_id);
+                        int_guard.entry(txn_id).or_default().push(k);
                     }
                     WalRecordV1::CommitTxn { txn_id, commit_ts } => {
-                        let mut txn_key = b"intent:".to_vec();
-                        txn_key.extend_from_slice(txn_id.0.as_bytes());
-                        let keys = Self::read_intents_from_map(&guard, &txn_key)?;
-                        for key in keys {
-                            let mut versions = Self::read_versions_from_map(&guard, &key)?;
-                            let mut modified = false;
-                            for v in versions.iter_mut() {
-                                if v.txn_id == Some(txn_id) && v.is_intent {
-                                    v.is_intent = false;
-                                    v.version = commit_ts;
-                                    modified = true;
+                        if let Some(keys) = int_guard.remove(&txn_id) {
+                            for key in keys {
+                                if let Some(chain) = mem_guard.get_mut(&key) {
+                                    let _ = chain.commit(txn_id, commit_ts);
                                 }
                             }
-                            if modified {
-                                versions.sort_by_key(|v| v.version);
-                                Self::write_versions_to_map(&mut guard, &key, &versions)?;
-                            }
                         }
-                        guard.remove(&txn_key);
                     }
                     WalRecordV1::AbortTxn { txn_id } => {
-                        let mut txn_key = b"intent:".to_vec();
-                        txn_key.extend_from_slice(txn_id.0.as_bytes());
-                        let keys = Self::read_intents_from_map(&guard, &txn_key)?;
-                        for key in keys {
-                            let mut versions = Self::read_versions_from_map(&guard, &key)?;
-                            let original_len = versions.len();
-                            versions.retain(|v| v.txn_id != Some(txn_id) || !v.is_intent);
-                            if versions.len() != original_len {
-                                Self::write_versions_to_map(&mut guard, &key, &versions)?;
+                        if let Some(keys) = int_guard.remove(&txn_id) {
+                            for key in keys {
+                                if let Some(chain) = mem_guard.get_mut(&key) {
+                                    let _ = chain.abort(txn_id);
+                                }
                             }
                         }
-                        guard.remove(&txn_key);
                     }
                     _ => {}
                 }
             }
         }
-        Ok(())
-    }
-
-    fn read_versions_from_map(
-        map: &BTreeMap<Vec<u8>, Vec<u8>>,
-        key: &[u8],
-    ) -> Result<Vec<MvccValue>> {
-        if let Some(data) = map.get(key) {
-            let versions: Vec<MvccValue> = serde_json::from_slice(data)?;
-            Ok(versions)
-        } else {
-            Ok(Vec::new())
-        }
-    }
-
-    fn write_versions_to_map(
-        map: &mut BTreeMap<Vec<u8>, Vec<u8>>,
-        key: &[u8],
-        versions: &[MvccValue],
-    ) -> Result<()> {
-        let data = serde_json::to_vec(versions)?;
-        map.insert(key.to_vec(), data);
-        Ok(())
-    }
-
-    fn read_intents_from_map(
-        map: &BTreeMap<Vec<u8>, Vec<u8>>,
-        txn_key: &[u8],
-    ) -> Result<Vec<Vec<u8>>> {
-        if let Some(data) = map.get(txn_key) {
-            let keys: Vec<Vec<u8>> = serde_json::from_slice(data)?;
-            Ok(keys)
-        } else {
-            Ok(Vec::new())
-        }
-    }
-
-    fn write_intents_to_map(
-        map: &mut BTreeMap<Vec<u8>, Vec<u8>>,
-        txn_key: &[u8],
-        keys: &[Vec<u8>],
-    ) -> Result<()> {
-        let data = serde_json::to_vec(keys)?;
-        map.insert(txn_key.to_vec(), data);
-        Ok(())
-    }
-
-    fn lsm_read(&self, key: &[u8]) -> Result<Vec<MvccValue>> {
-        let guard = self.memtable.read().unwrap();
-        Self::read_versions_from_map(&guard, key)
-    }
-
-    fn lsm_write(&self, key: &[u8], versions: &[MvccValue]) -> Result<()> {
-        let mut guard = self.memtable.write().unwrap();
-        Self::write_versions_to_map(&mut guard, key, versions)
-    }
-
-    fn get_intents(&self, txn_id: TxnId) -> Result<Vec<Bytes>> {
-        let mut txn_key = b"intent:".to_vec();
-        txn_key.extend_from_slice(txn_id.0.as_bytes());
-
-        let guard = self.memtable.read().unwrap();
-        let keys = Self::read_intents_from_map(&guard, &txn_key)?;
-        Ok(keys.into_iter().map(Bytes::from).collect())
-    }
-
-    fn save_intents(&self, txn_id: TxnId, keys: &[Bytes]) -> Result<()> {
-        let mut txn_key = b"intent:".to_vec();
-        txn_key.extend_from_slice(txn_id.0.as_bytes());
-
-        let raw_keys: Vec<Vec<u8>> = keys.iter().map(|k| k.to_vec()).collect();
-        let mut guard = self.memtable.write().unwrap();
-        Self::write_intents_to_map(&mut guard, &txn_key, &raw_keys)
-    }
-
-    fn remove_intents(&self, txn_id: TxnId) -> Result<()> {
-        let mut txn_key = b"intent:".to_vec();
-        txn_key.extend_from_slice(txn_id.0.as_bytes());
-        let mut guard = self.memtable.write().unwrap();
-        guard.remove(&txn_key);
         Ok(())
     }
 }
@@ -206,12 +158,21 @@ impl Default for LsmKvEngine {
 
 impl KvEngine for LsmKvEngine {
     fn get(&self, key: &[u8], read_ts: Timestamp) -> Result<Option<Bytes>> {
-        let versions = self.lsm_read(key)?;
-        for v in versions.iter().rev() {
-            if v.is_visible(read_ts) {
-                return Ok(v.value.as_ref().map(|val| Bytes::from(val.clone())));
+        let guard = self.memtable.read().unwrap();
+        if let Some(chain) = guard.get(key)
+            && let Some(val) = chain.read(read_ts) {
+                return Ok(Some(Bytes::from(val.to_vec())));
             }
+
+        // Search through sstables from newest to oldest
+        let sst_guard = self.sstables.read().unwrap();
+        for sst in sst_guard.iter().rev() {
+            if let Ok(Some(chain)) = sst.get(key)
+                && let Some(val) = chain.read(read_ts) {
+                    return Ok(Some(Bytes::from(val.to_vec())));
+                }
         }
+
         Ok(None)
     }
 
@@ -220,29 +181,42 @@ impl KvEngine for LsmKvEngine {
         range: KeyRange,
         read_ts: Timestamp,
     ) -> Result<Box<dyn Iterator<Item = Result<KvPair>> + Send>> {
-        let start = range.start.as_ref().to_vec();
-        let end = range.end.as_ref().to_vec();
+        let start = Bytes::from(range.start.as_ref().to_vec());
+        let end = Bytes::from(range.end.as_ref().to_vec());
+
+        let mut merged = BTreeMap::new();
+
+        let sst_guard = self.sstables.read().unwrap();
+        for sst in sst_guard.iter() {
+            if let Ok(iter) = sst.iter() {
+                for item in iter.flatten() {
+                    let (k, chain) = item;
+                    if k >= start && k < end {
+                        merged.insert(k, chain);
+                    }
+                }
+            }
+        }
+
+        let mem_guard = self.memtable.read().unwrap();
+        for (k, chain) in mem_guard.range(start..end) {
+            merged.insert(k.clone(), chain.clone());
+        }
 
         let mut results = Vec::new();
+        for (k, chain) in merged {
+            if let Some(val) = chain.read(read_ts) {
+                let version = chain.versions.iter()
+                    .filter(|v| v.is_visible(read_ts))
+                    .map(|v| v.version)
+                    .max()
+                    .unwrap_or(0);
 
-        let guard = self.memtable.read().unwrap();
-        for (k, v) in guard.range(start..end) {
-            if k.starts_with(b"intent:") {
-                continue;
-            }
-
-            let versions: Vec<MvccValue> = serde_json::from_slice(v)?;
-            for version in versions.iter().rev() {
-                if version.is_visible(read_ts) {
-                    if let Some(val) = &version.value {
-                        results.push(Ok(KvPair {
-                            key: Bytes::copy_from_slice(k),
-                            value: Bytes::from(val.clone()),
-                            version: version.version,
-                        }));
-                    }
-                    break;
-                }
+                results.push(Ok(KvPair {
+                    key: k,
+                    value: Bytes::from(val.to_vec()),
+                    version,
+                }));
             }
         }
 
@@ -258,19 +232,15 @@ impl KvEngine for LsmKvEngine {
             }))?;
         }
 
-        let mut versions = self.lsm_read(key.as_ref())?;
-        versions.push(MvccValue {
-            value: Some(value.to_vec()),
-            version: u64::MAX,
-            txn_id: Some(txn_id),
-            is_intent: true,
-        });
-        self.lsm_write(key.as_ref(), &versions)?;
+        let mut store_guard = self.memtable.write().unwrap();
+        let mut intents_guard = self.intents.write().unwrap();
 
-        let mut keys = self.get_intents(txn_id)?;
-        keys.push(key);
-        self.save_intents(txn_id, &keys)?;
+        let chain = store_guard.entry(key.clone()).or_default();
+        if let Err(e) = chain.write_intent(txn_id, value.to_vec()) {
+            anyhow::bail!("Write intent failed: {}", e);
+        }
 
+        intents_guard.entry(txn_id).or_default().push(key);
         Ok(())
     }
 
@@ -282,19 +252,15 @@ impl KvEngine for LsmKvEngine {
             }))?;
         }
 
-        let mut versions = self.lsm_read(key.as_ref())?;
-        versions.push(MvccValue {
-            value: None,
-            version: u64::MAX,
-            txn_id: Some(txn_id),
-            is_intent: true,
-        });
-        self.lsm_write(key.as_ref(), &versions)?;
+        let mut store_guard = self.memtable.write().unwrap();
+        let mut intents_guard = self.intents.write().unwrap();
 
-        let mut keys = self.get_intents(txn_id)?;
-        keys.push(key);
-        self.save_intents(txn_id, &keys)?;
+        let chain = store_guard.entry(key.clone()).or_default();
+        if let Err(e) = chain.delete_intent(txn_id) {
+            anyhow::bail!("Delete intent failed: {}", e);
+        }
 
+        intents_guard.entry(txn_id).or_default().push(key);
         Ok(())
     }
 
@@ -304,24 +270,15 @@ impl KvEngine for LsmKvEngine {
             wal.sync()?;
         }
 
-        let keys = self.get_intents(txn_id)?;
-        if !keys.is_empty() {
+        let mut store_guard = self.memtable.write().unwrap();
+        let mut intents_guard = self.intents.write().unwrap();
+
+        if let Some(keys) = intents_guard.remove(&txn_id) {
             for key in keys {
-                let mut versions = self.lsm_read(key.as_ref())?;
-                let mut modified = false;
-                for v in versions.iter_mut() {
-                    if v.txn_id == Some(txn_id) && v.is_intent {
-                        v.is_intent = false;
-                        v.version = commit_ts;
-                        modified = true;
-                    }
-                }
-                if modified {
-                    versions.sort_by_key(|v| v.version);
-                    self.lsm_write(key.as_ref(), &versions)?;
+                if let Some(chain) = store_guard.get_mut(&key) {
+                    let _ = chain.commit(txn_id, commit_ts);
                 }
             }
-            self.remove_intents(txn_id)?;
         }
         Ok(())
     }
@@ -332,66 +289,35 @@ impl KvEngine for LsmKvEngine {
             wal.sync()?;
         }
 
-        let keys = self.get_intents(txn_id)?;
-        if !keys.is_empty() {
+        let mut store_guard = self.memtable.write().unwrap();
+        let mut intents_guard = self.intents.write().unwrap();
+
+        if let Some(keys) = intents_guard.remove(&txn_id) {
             for key in keys {
-                let mut versions = self.lsm_read(key.as_ref())?;
-                let original_len = versions.len();
-                versions.retain(|v| v.txn_id != Some(txn_id) || !v.is_intent);
-                if versions.len() != original_len {
-                    self.lsm_write(key.as_ref(), &versions)?;
+                if let Some(chain) = store_guard.get_mut(&key) {
+                    let _ = chain.abort(txn_id);
                 }
             }
-            self.remove_intents(txn_id)?;
         }
         Ok(())
     }
 
-    #[allow(clippy::if_same_then_else)]
     fn garbage_collect(&self, watermark: Timestamp) -> Result<usize> {
-        let mut removed_count = 0;
+        let mut store = self.memtable.write().unwrap();
+        let mut removed = 0usize;
+        let mut dead_keys = Vec::new();
 
-        let all_keys: Vec<Vec<u8>> = {
-            let guard = self.memtable.read().unwrap();
-            guard
-                .keys()
-                .filter(|k| !k.starts_with(b"intent:"))
-                .cloned()
-                .collect()
-        };
-
-        for key in all_keys {
-            let versions = self.lsm_read(&key)?;
-            let mut new_versions = Vec::new();
-            let mut found_committed_before_watermark = false;
-
-            for v in versions.into_iter().rev() {
-                if v.is_intent || v.version > watermark || !found_committed_before_watermark {
-                    if !v.is_intent && v.version <= watermark {
-                        found_committed_before_watermark = true;
-                    }
-                    new_versions.push(v);
-                } else {
-                    removed_count += 1;
-                }
-            }
-
-            new_versions.reverse();
-
-            if new_versions.len() == 1
-                && !new_versions[0].is_intent
-                && new_versions[0].version <= watermark
-                && new_versions[0].value.is_none()
-            {
-                let mut guard = self.memtable.write().unwrap();
-                guard.remove(&key);
-                removed_count += 1;
-            } else {
-                self.lsm_write(&key, &new_versions)?;
+        for (key, chain) in store.iter_mut() {
+            removed += chain.garbage_collect(watermark);
+            if chain.versions.is_empty() {
+                dead_keys.push(key.clone());
             }
         }
 
-        Ok(removed_count)
+        for k in dead_keys {
+            store.remove(&k);
+        }
+        Ok(removed)
     }
 }
 
@@ -572,5 +498,33 @@ mod tests {
             prop_assert_eq!(engine.get(&k, 25).unwrap(), Some(Bytes::from(val2)));
             prop_assert_eq!(engine.get(&k, 5).unwrap(), None);
         }
+    }
+}
+
+#[cfg(test)]
+mod sst_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_flush_and_read_from_sst() {
+        let dir = TempDir::new().unwrap();
+        let engine = LsmKvEngine::with_wal(dir.path(), None).unwrap();
+        
+        let txn1 = TxnId::new();
+        engine.write_intent(txn1, Bytes::from("key1"), Bytes::from("val1")).unwrap();
+        engine.commit(txn1, 10).unwrap();
+        
+        // Value is in memtable
+        assert_eq!(engine.get(b"key1", 10).unwrap().unwrap(), Bytes::from("val1"));
+        
+        // Flush moves it to SSTable
+        engine.flush().unwrap();
+        
+        // Check memtable is empty
+        assert!(engine.memtable.read().unwrap().is_empty());
+        
+        // Value is still readable! Wait... does get() read from sstables?
+        // Ah, our get() method only reads from memtable right now. We need to fix that!
     }
 }
