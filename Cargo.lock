@@ -2307,12 +2307,15 @@ name = "nodus_raftstore"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "bytes",
  "nodus_catalog",
  "nodus_sharding",
  "nodus_storage_api",
  "openraft",
+ "reqwest",
  "serde",
+ "serde_json",
  "thiserror 1.0.69",
  "tokio",
 ]
