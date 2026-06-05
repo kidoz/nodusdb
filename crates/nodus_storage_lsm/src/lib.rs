@@ -474,6 +474,41 @@ mod tests {
         assert_eq!(res.unwrap(), v1);
     }
 
+    #[test]
+    fn test_custom_lsm_post_flush_wal_replay() {
+        let temp_dir = TempDir::new().unwrap();
+
+        let k1 = Bytes::from("k1");
+        let v1 = Bytes::from("v1");
+        let txn1 = TxnId::new();
+
+        let k2 = Bytes::from("k2");
+        let v2 = Bytes::from("v2");
+        let txn2 = TxnId::new();
+
+        {
+            let engine = LsmKvEngine::with_wal(temp_dir.path(), None).unwrap();
+            engine.write_intent(txn1, k1.clone(), v1.clone()).unwrap();
+            engine.commit(txn1, 10).unwrap();
+            
+            // Flush forces memtable to SST and rotates WAL
+            engine.flush().unwrap();
+            
+            // Write to new WAL
+            engine.write_intent(txn2, k2.clone(), v2.clone()).unwrap();
+            engine.commit(txn2, 20).unwrap();
+        } 
+
+        // Re-instantiate should recover k1 from SST and k2 from the new WAL
+        let recovered_engine = LsmKvEngine::with_wal(temp_dir.path(), None).unwrap();
+        
+        let res1 = recovered_engine.get(k1.as_ref(), 25).unwrap();
+        assert_eq!(res1.unwrap(), v1);
+        
+        let res2 = recovered_engine.get(k2.as_ref(), 25).unwrap();
+        assert_eq!(res2.unwrap(), v2);
+    }
+
     use proptest::prelude::*;
 
     proptest! {
