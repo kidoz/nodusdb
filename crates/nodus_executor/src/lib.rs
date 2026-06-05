@@ -873,12 +873,11 @@ impl MemExecutor {
         }
     }
 
-    /// Returns the session's active txn id, or begins a fresh auto-commit txn.
-    /// The bool is true when the caller must commit (auto-commit).
-    fn txn_for(&self, session: &str) -> Result<(TxnId, bool)> {
+    /// Returns the session's active txn id. Expects a transaction to be active.
+    fn txn_for(&self, session: &str) -> Result<TxnId> {
         match self.active_txns.read().unwrap().get(session) {
-            Some((tid, _)) => Ok((*tid, false)),
-            None => Ok((self.txn.begin_txn()?.txn_id, true)),
+            Some((tid, _)) => Ok(*tid),
+            None => anyhow::bail!("No active transaction for session"),
         }
     }
 
@@ -936,14 +935,15 @@ impl MemExecutor {
             }
         }
 
-        if unique_col_indices.is_empty() {
-            return Ok(());
-        }
+        let new_pk = new_row.first().map(render).unwrap_or_default();
 
         for existing in self.scan_rows(tbl.id, session)? {
             let pk = existing.first().map(render).unwrap_or_default();
             if Some(pk.as_str()) == skip_pk {
                 continue;
+            }
+            if pk == new_pk {
+                anyhow::bail!("Unique constraint violation on primary key");
             }
             for (idx_name, col_idx) in &unique_col_indices {
                 let existing_val = existing.get(*col_idx).unwrap_or(&Value::Null);
@@ -956,28 +956,20 @@ impl MemExecutor {
         Ok(())
     }
 
-    /// Writes a row value at `key`, using the session's txn or an auto-commit txn.
+    /// Writes a row value at `key`, using the session's txn.
     fn write_row(&self, session: &str, key: String, value: String) -> Result<()> {
-        let (txn_id, auto) = self.txn_for(session)?;
+        let txn_id = self.txn_for(session)?;
         self.txn.track_write(txn_id, key.as_bytes().to_vec())?;
         self.kv
             .write_intent(txn_id, Bytes::from(key), Bytes::from(value))?;
-        if auto {
-            let commit_ts = self.txn.commit_txn(txn_id)?;
-            self.kv.commit(txn_id, commit_ts)?;
-        }
         Ok(())
     }
 
-    /// Tombstones `key`, using the session's txn or an auto-commit txn.
+    /// Tombstones `key`, using the session's txn.
     fn delete_row(&self, session: &str, key: String) -> Result<()> {
-        let (txn_id, auto) = self.txn_for(session)?;
+        let txn_id = self.txn_for(session)?;
         self.txn.track_write(txn_id, key.as_bytes().to_vec())?;
         self.kv.delete_intent(txn_id, Bytes::from(key))?;
-        if auto {
-            let commit_ts = self.txn.commit_txn(txn_id)?;
-            self.kv.commit(txn_id, commit_ts)?;
-        }
         Ok(())
     }
 
@@ -1183,6 +1175,40 @@ impl Default for MemExecutor {
 
 impl Executor for MemExecutor {
     fn execute_logical(&self, ctx: &ExecutionContext, plan: LogicalPlan) -> Result<QueryOutput> {
+        let is_txn_control = matches!(plan, LogicalPlan::Begin | LogicalPlan::Commit | LogicalPlan::Rollback);
+        let mut implicit_txn = None;
+
+        if !is_txn_control && self.active_txns.read().unwrap().get(&ctx.session_id).is_none() {
+            let txn_record = self.txn.begin_txn()?;
+            self.active_txns.write().unwrap().insert(ctx.session_id.clone(), (txn_record.txn_id, txn_record.read_ts));
+            implicit_txn = Some(txn_record.txn_id);
+        }
+
+        let result = self.execute_logical_inner(ctx, plan);
+
+        if let Some(txn_id) = implicit_txn {
+            self.active_txns.write().unwrap().remove(&ctx.session_id);
+            match &result {
+                Ok(_) => {
+                    let commit_ts = self.txn.commit_txn(txn_id)?;
+                    self.kv.commit(txn_id, commit_ts)?;
+                }
+                Err(_) => {
+                    let _ = self.txn.abort_txn(txn_id);
+                    let _ = self.kv.abort(txn_id);
+                }
+            }
+        }
+        result
+    }
+
+    fn execute_physical(&self, ctx: &ExecutionContext, plan: PhysicalPlan) -> Result<Vec<Row>> {
+        self.execute_physical_inner(ctx, plan)
+    }
+}
+
+impl MemExecutor {
+    fn execute_logical_inner(&self, ctx: &ExecutionContext, plan: LogicalPlan) -> Result<QueryOutput> {
         match plan {
             LogicalPlan::CreateTable { name, columns } => {
                 let db = self.catalog_reader.get_database("default")?;
@@ -1890,7 +1916,7 @@ returning,
                     updated_at: Utc::now(),
                     state: DescriptorState::Public,
                     index_type: idx_type,
-                    index_state: nodus_catalog::IndexState::Ready,
+                    index_state: nodus_catalog::IndexState::Creating,
                     key_columns: index_cols,
                     include_columns: vec![],
                     unique,
@@ -1903,16 +1929,28 @@ returning,
                 self.catalog_writer.update_table_descriptor(change)?;
                 
                 // Backfill existing rows into the new index
+                let mut seen_values = std::collections::HashSet::new();
                 for row in self.scan_rows(tbl.id, &ctx.session_id)? {
                     let pk_str = row.first().map(render).unwrap_or_default();
                     for kcol in &index.key_columns {
                         if let Some(pos) = tbl.columns.iter().position(|c| c.id == kcol.column_id) {
                             let index_val = row.get(pos).unwrap_or(&Value::Null);
+                            
+                            if unique {
+                                let val_str = render(index_val);
+                                if val_str != "NULL" && !seen_values.insert(val_str) {
+                                    // Set state to Failed/Dropping or just error out. We'd need to drop it, but we can just error for now.
+                                    let _ = self.catalog_writer.update_index_state(tbl.id, index.id, nodus_catalog::IndexState::Dropping);
+                                    anyhow::bail!("Unique constraint violation during index backfill for value: {:?}", index_val);
+                                }
+                            }
+                            
                             self.write_index_entry(&ctx.session_id, index.id, index_val, &pk_str)?;
                         }
                     }
                 }
                 
+                self.catalog_writer.update_index_state(tbl.id, index.id, nodus_catalog::IndexState::Ready)?;
                 Ok(QueryOutput::tag("CREATE INDEX"))
             }
             LogicalPlan::Begin => {
@@ -1970,7 +2008,7 @@ returning,
         }
     }
 
-    fn execute_physical(&self, ctx: &ExecutionContext, plan: PhysicalPlan) -> Result<Vec<Row>> {
+    fn execute_physical_inner(&self, ctx: &ExecutionContext, plan: PhysicalPlan) -> Result<Vec<Row>> {
         // Retained for the point-get path used by lower layers/tests.
         match plan {
             PhysicalPlan::LocalPointGet { table_id, id } => {
