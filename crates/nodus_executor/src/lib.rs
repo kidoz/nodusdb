@@ -138,7 +138,7 @@ pub enum LogicalPlan {
         table_name: String,
         /// Target column names; empty means positional (table order).
         columns: Vec<String>,
-        values: Vec<String>,
+        values_list: Vec<Vec<String>>,
     },
     Select {
         table_name: String,
@@ -191,19 +191,29 @@ impl QueryOutput {
     }
 }
 
-fn expr_to_string(expr: &sqlparser::ast::Expr) -> Option<String> {
+fn expr_to_string(expr: &sqlparser::ast::Expr, params: &[String]) -> Option<String> {
     use sqlparser::ast::{Expr, Value};
     match expr {
         Expr::Value(Value::SingleQuotedString(s)) => Some(s.clone()),
         Expr::Value(Value::Number(n, _)) => Some(n.clone()),
         Expr::Value(Value::Boolean(b)) => Some(b.to_string()),
         Expr::Value(Value::Null) => Some(String::new()),
+        Expr::Value(Value::Placeholder(s)) => {
+            if let Some(stripped) = s.strip_prefix('$') {
+                if let Ok(idx) = stripped.parse::<usize>() {
+                    if idx > 0 && idx <= params.len() {
+                        return Some(params[idx - 1].clone());
+                    }
+                }
+            }
+            None
+        }
         Expr::Identifier(id) => Some(id.value.clone()),
         _ => None,
     }
 }
 
-pub fn plan_statement(stmt: &sqlparser::ast::Statement) -> Result<LogicalPlan> {
+pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[String]) -> Result<LogicalPlan> {
     use sqlparser::ast::*;
     match stmt {
         Statement::CreateTable { name, columns, .. } => {
@@ -226,23 +236,25 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement) -> Result<LogicalPlan> {
             ..
         } => {
             let cols: Vec<String> = columns.iter().map(|c| c.value.clone()).collect();
-            let mut values = Vec::new();
+            let mut values_list = Vec::new();
             if let Some(query) = source {
                 if let SetExpr::Values(vs) = &*query.body {
-                    if let Some(row) = vs.rows.first() {
+                    for row in &vs.rows {
+                        let mut row_values = Vec::new();
                         for e in row {
-                            values.push(expr_to_string(e).unwrap_or_default());
+                            row_values.push(expr_to_string(e, params).unwrap_or_default());
                         }
+                        values_list.push(row_values);
                     }
                 }
             }
             Ok(LogicalPlan::Insert {
                 table_name: table_name.to_string(),
                 columns: cols,
-                values,
+                values_list,
             })
         }
-        Statement::Query(query) => plan_query(query),
+        Statement::Query(query) => plan_query(query, params),
         Statement::Update {
             table,
             assignments,
@@ -254,14 +266,14 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement) -> Result<LogicalPlan> {
                 .iter()
                 .filter_map(|a| {
                     let col = a.id.last()?.value.clone();
-                    let val = expr_to_string(&a.value)?;
+                    let val = expr_to_string(&a.value, params)?;
                     Some((col, val))
                 })
                 .collect();
             Ok(LogicalPlan::Update {
                 table_name,
                 assignments: assigns,
-                filter: parse_predicates(selection),
+                filter: parse_predicates(selection, params),
             })
         }
         Statement::Delete {
@@ -276,7 +288,7 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement) -> Result<LogicalPlan> {
                 .relation;
             Ok(LogicalPlan::Delete {
                 table_name: table_name_of(relation)?,
-                filter: parse_predicates(selection),
+                filter: parse_predicates(selection, params),
             })
         }
         Statement::StartTransaction { .. } => Ok(LogicalPlan::Begin),
@@ -316,21 +328,21 @@ fn compare_op(op: &sqlparser::ast::BinaryOperator) -> Option<CompareOp> {
 
 /// Parses a `WHERE` clause into a conjunction of `column <op> literal`
 /// predicates (AND only; other expressions are ignored).
-fn parse_predicates(selection: &Option<sqlparser::ast::Expr>) -> Vec<Predicate> {
+fn parse_predicates(selection: &Option<sqlparser::ast::Expr>, params: &[String]) -> Vec<Predicate> {
     let mut out = Vec::new();
     if let Some(expr) = selection {
-        collect_predicates(expr, &mut out);
+        collect_predicates(expr, &mut out, params);
     }
     out
 }
 
-fn collect_predicates(expr: &sqlparser::ast::Expr, out: &mut Vec<Predicate>) {
+fn collect_predicates(expr: &sqlparser::ast::Expr, out: &mut Vec<Predicate>, params: &[String]) {
     use sqlparser::ast::{BinaryOperator, Expr};
     match expr {
-        Expr::Nested(inner) => collect_predicates(inner, out),
+        Expr::Nested(inner) => collect_predicates(inner, out, params),
         Expr::BinaryOp { left, op, right } if *op == BinaryOperator::And => {
-            collect_predicates(left, out);
-            collect_predicates(right, out);
+            collect_predicates(left, out, params);
+            collect_predicates(right, out, params);
         }
         Expr::BinaryOp { left, op, right } => {
             let left_col = match &**left {
@@ -351,7 +363,7 @@ fn collect_predicates(expr: &sqlparser::ast::Expr, out: &mut Vec<Predicate>) {
                         .join("."),
                 ),
                 expr => {
-                    if let Some(val) = expr_to_string(expr) {
+                    if let Some(val) = expr_to_string(expr, params) {
                         Operand::Literal(val)
                     } else {
                         return;
@@ -370,7 +382,7 @@ fn collect_predicates(expr: &sqlparser::ast::Expr, out: &mut Vec<Predicate>) {
     }
 }
 
-fn plan_query(query: &sqlparser::ast::Query) -> Result<LogicalPlan> {
+fn plan_query(query: &sqlparser::ast::Query, params: &[String]) -> Result<LogicalPlan> {
     use sqlparser::ast::*;
     let SetExpr::Select(select) = &*query.body else {
         anyhow::bail!("Unsupported query body");
@@ -379,15 +391,15 @@ fn plan_query(query: &sqlparser::ast::Query) -> Result<LogicalPlan> {
     // FROM-less single-item projections are scalar/literal selects.
     if select.from.is_empty() && select.projection.len() == 1 {
         return match &select.projection[0] {
-            SelectItem::UnnamedExpr(Expr::Value(Value::Number(n, _))) => {
-                Ok(LogicalPlan::SelectLiteral { value: n.clone() })
+            SelectItem::UnnamedExpr(expr) => {
+                if let Some(val) = expr_to_string(expr, params) {
+                    Ok(LogicalPlan::SelectLiteral { value: val })
+                } else if let Expr::Function(func) = expr {
+                    Ok(LogicalPlan::SelectLiteral { value: func.name.to_string() })
+                } else {
+                    anyhow::bail!("Unsupported scalar select")
+                }
             }
-            SelectItem::UnnamedExpr(Expr::Value(Value::SingleQuotedString(s))) => {
-                Ok(LogicalPlan::SelectLiteral { value: s.clone() })
-            }
-            SelectItem::UnnamedExpr(Expr::Function(func)) => Ok(LogicalPlan::SelectLiteral {
-                value: func.name.to_string(),
-            }),
             _ => anyhow::bail!("Unsupported scalar select"),
         };
     }
@@ -425,16 +437,15 @@ fn plan_query(query: &sqlparser::ast::Query) -> Result<LogicalPlan> {
     });
 
     // LIMIT <n>.
-    let limit = query.limit.as_ref().and_then(|e| match e {
-        Expr::Value(Value::Number(n, _)) => n.parse::<usize>().ok(),
-        _ => None,
+    let limit = query.limit.as_ref().and_then(|e| {
+        expr_to_string(e, params).and_then(|s| s.parse::<usize>().ok())
     });
 
     Ok(LogicalPlan::Select {
         table_name,
         joins,
         projection,
-        filter: parse_predicates(&select.selection),
+        filter: parse_predicates(&select.selection, params),
         order_by,
         limit,
     })
@@ -784,7 +795,7 @@ impl Executor for MemExecutor {
             LogicalPlan::Insert {
                 table_name,
                 columns,
-                values,
+                values_list,
             } => {
                 let tbl = self
                     .catalog_reader
@@ -792,34 +803,40 @@ impl Executor for MemExecutor {
                 self.authorize(ctx, Action::Insert, ResourceRef::Table(tbl.id))?;
 
                 let col_names: Vec<&str> = tbl.columns.iter().map(|c| c.name.as_str()).collect();
-                // Build the raw string row in table-column order...
-                let mut raw = vec![String::new(); col_names.len()];
-                if columns.is_empty() {
-                    for (i, v) in values.iter().enumerate() {
-                        if i < raw.len() {
-                            raw[i] = v.clone();
+                let mut inserted_count = 0;
+
+                for values in values_list {
+                    // Build the raw string row in table-column order...
+                    let mut raw = vec![String::new(); col_names.len()];
+                    if columns.is_empty() {
+                        for (i, v) in values.iter().enumerate() {
+                            if i < raw.len() {
+                                raw[i] = v.clone();
+                            }
+                        }
+                    } else {
+                        for (cname, val) in columns.iter().zip(values.iter()) {
+                            if let Some(idx) = col_names.iter().position(|c| c == cname) {
+                                raw[idx] = val.clone();
+                            }
                         }
                     }
-                } else {
-                    for (cname, val) in columns.iter().zip(values.iter()) {
-                        if let Some(idx) = col_names.iter().position(|c| c == cname) {
-                            raw[idx] = val.clone();
-                        }
-                    }
+                    // ...then coerce each cell to its column's type.
+                    let row: Vec<Value> = tbl
+                        .columns
+                        .iter()
+                        .enumerate()
+                        .map(|(i, c)| coerce(&raw[i], column_type(&c.data_type)))
+                        .collect();
+                    // Primary key = first column's rendered value.
+                    let pk = row.first().map(render).unwrap_or_default();
+                    let key = format!("{}:{}", tbl.id, pk);
+                    let encoded = serde_json::to_string(&row)?;
+                    self.write_row(&ctx.session_id, key, encoded)?;
+                    inserted_count += 1;
                 }
-                // ...then coerce each cell to its column's type.
-                let row: Vec<Value> = tbl
-                    .columns
-                    .iter()
-                    .enumerate()
-                    .map(|(i, c)| coerce(&raw[i], column_type(&c.data_type)))
-                    .collect();
-                // Primary key = first column's rendered value.
-                let pk = row.first().map(render).unwrap_or_default();
-                let key = format!("{}:{}", tbl.id, pk);
-                let encoded = serde_json::to_string(&row)?;
-                self.write_row(&ctx.session_id, key, encoded)?;
-                Ok(QueryOutput::tag("INSERT 0 1"))
+                
+                Ok(QueryOutput::tag(&format!("INSERT 0 {}", inserted_count)))
             }
             LogicalPlan::Select {
                 table_name,
@@ -1172,7 +1189,7 @@ mod tests {
                 LogicalPlan::Insert {
                     table_name: "books".into(),
                     columns: vec!["id".into(), "title".into(), "author".into()],
-                    values: vec![id.into(), title.into(), author.into()],
+                    values_list: vec![vec![id.into(), title.into(), author.into()]],
                 },
             )
             .unwrap();
@@ -1245,7 +1262,7 @@ mod tests {
             LogicalPlan::Insert {
                 table_name: "items".into(),
                 columns: vec!["id".into(), "name".into(), "active".into()],
-                values: vec!["7".into(), "widget".into(), "true".into()],
+                values_list: vec![vec!["7".into(), "widget".into(), "true".into()]],
             },
         )
         .unwrap();
@@ -1301,7 +1318,7 @@ mod tests {
                 LogicalPlan::Insert {
                     table_name: "t".into(),
                     columns: vec!["id".into(), "name".into()],
-                    values: vec![id.into(), name.into()],
+                    values_list: vec![vec![id.into(), name.into()]],
                 },
             )
             .unwrap();
@@ -1395,7 +1412,7 @@ mod tests {
                 LogicalPlan::Insert {
                     table_name: "authors".into(),
                     columns: vec!["id".into(), "name".into()],
-                    values: vec![id.into(), name.into()],
+                    values_list: vec![vec![id.into(), name.into()]],
                 },
             )
             .unwrap();
@@ -1411,7 +1428,7 @@ mod tests {
                 LogicalPlan::Insert {
                     table_name: "books".into(),
                     columns: vec!["id".into(), "title".into(), "author_id".into()],
-                    values: vec![id.into(), title.into(), author_id.into()],
+                    values_list: vec![vec![id.into(), title.into(), author_id.into()]],
                 },
             )
             .unwrap();
@@ -1492,7 +1509,7 @@ mod tests {
             LogicalPlan::Insert {
                 table_name: "t".into(),
                 columns: vec!["id".into(), "name".into()],
-                values: vec!["1".into(), "b".into()],
+                values_list: vec![vec!["1".into(), "b".into()]],
             },
         )
         .unwrap();

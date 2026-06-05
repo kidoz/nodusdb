@@ -202,7 +202,7 @@ impl SimpleQueryHandler for NodusQueryHandler {
                 return Ok(vec![Response::Execution(Tag::new("OK"))]);
             }
         };
-        let plan = match nodus_executor::plan_statement(&stmt) {
+        let plan = match nodus_executor::plan_statement(&stmt, &[]) {
             Ok(plan) => plan,
             Err(_) => return Ok(vec![Response::Execution(Tag::new("OK"))]),
         };
@@ -302,27 +302,26 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
             authz_catalog_version: 1,
         };
 
-        // Substitute parameters into the query string
-        let mut sql = raw_sql.clone();
+        // Extract parameters from the portal into a Vec<String>
         let len = portal.parameter_len();
-        for i in (0..len).rev() {
+        let mut params = Vec::with_capacity(len);
+        for i in 0..len {
             let param_type = portal
                 .statement
                 .parameter_types
                 .get(i)
                 .unwrap_or(&Type::UNKNOWN);
-            let placeholder = format!("${}", i + 1);
 
             let val_str = if portal.parameters.get(i).is_none_or(|p| p.is_none()) {
-                "NULL".to_string()
+                "".to_string() // Represent NULL as empty string
             } else {
                 match *param_type {
                     Type::BOOL => {
                         let v = portal.parameter::<bool>(i, param_type)?.unwrap_or_default();
                         if v {
-                            "TRUE".to_string()
+                            "true".to_string()
                         } else {
-                            "FALSE".to_string()
+                            "false".to_string()
                         }
                     }
                     Type::INT2 => {
@@ -346,24 +345,22 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
                         v.to_string()
                     }
                     Type::TEXT | Type::VARCHAR => {
-                        let v = portal
+                        portal
                             .parameter::<String>(i, param_type)?
-                            .unwrap_or_default();
-                        format!("'{}'", v.replace('\'', "''"))
+                            .unwrap_or_default()
                     }
                     _ => {
-                        let v = portal
+                        portal
                             .parameter::<String>(i, &Type::TEXT)
-                            .unwrap_or(Some("NULL".to_string()))
-                            .unwrap_or_default();
-                        format!("'{}'", v.replace('\'', "''"))
+                            .unwrap_or(Some("".to_string()))
+                            .unwrap_or_default()
                     }
                 }
             };
-            sql = sql.replace(&placeholder, &val_str);
+            params.push(val_str);
         }
 
-        let stmt = match nodus_sql::parse_sql(&sql) {
+        let stmt = match nodus_sql::parse_sql(raw_sql) {
             Ok(mut stmts) if !stmts.is_empty() => stmts.remove(0),
             Ok(_) => return Ok(Response::Execution(Tag::new("OK"))),
             Err(e) => {
@@ -372,7 +369,7 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
                 return Ok(Response::Execution(Tag::new("OK")));
             }
         };
-        let plan = match nodus_executor::plan_statement(&stmt) {
+        let plan = match nodus_executor::plan_statement(&stmt, &params) {
             Ok(plan) => plan,
             Err(_) => return Ok(Response::Execution(Tag::new("OK"))),
         };
@@ -435,7 +432,7 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
         let mut fields = vec![];
         if let Ok(mut stmts) = nodus_sql::parse_sql(&stmt.statement)
             && let Some(parsed) = stmts.pop()
-            && let Ok(plan) = nodus_executor::plan_statement(&parsed) {
+            && let Ok(plan) = nodus_executor::plan_statement(&parsed, &[]) {
                 match plan {
                     nodus_executor::LogicalPlan::Select { projection, .. } => {
                         for col in projection {
@@ -479,7 +476,7 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
         let mut fields = vec![];
         if let Ok(mut stmts) = nodus_sql::parse_sql(&portal.statement.statement)
             && let Some(parsed) = stmts.pop()
-            && let Ok(plan) = nodus_executor::plan_statement(&parsed) {
+            && let Ok(plan) = nodus_executor::plan_statement(&parsed, &[]) {
                 match plan {
                     nodus_executor::LogicalPlan::Select { projection, .. } => {
                         for col in projection {

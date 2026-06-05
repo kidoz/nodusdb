@@ -71,6 +71,23 @@ async fn test_full_pg_client_coverage() {
     client.execute(&insert_dept, &[&2i32, &"HR"]).await.unwrap();
 
     // ---------------------------------------------------------
+    // 2.5 Multi-Row INSERT
+    // ---------------------------------------------------------
+    let multi_insert_emp = client
+        .prepare_typed(
+            "INSERT INTO employees (id, name, is_active) VALUES ($1, $2, $3), ($4, $5, $6)",
+            &[
+                tokio_postgres::types::Type::INT4, tokio_postgres::types::Type::TEXT, tokio_postgres::types::Type::BOOL,
+                tokio_postgres::types::Type::INT4, tokio_postgres::types::Type::TEXT, tokio_postgres::types::Type::BOOL,
+            ],
+        )
+        .await
+        .unwrap();
+
+    let rows_inserted = client.execute(&multi_insert_emp, &[&10i32, &"Zara", &true, &11i32, &"Xander", &false]).await.unwrap();
+    assert_eq!(rows_inserted, 2);
+
+    // ---------------------------------------------------------
     // 3. SELECT with WHERE, ORDER BY, LIMIT
     // ---------------------------------------------------------
     let select_active = client
@@ -87,8 +104,8 @@ async fn test_full_pg_client_coverage() {
     // NodusDB returns everything as string/varchar for now in Extended Query Handler Describe.
     let id_str: &str = rows[0].get(0);
     let name_str: &str = rows[0].get(1);
-    assert_eq!(id_str, "2");
-    assert_eq!(name_str, "Bob");
+    assert_eq!(id_str, "10");
+    assert_eq!(name_str, "Zara");
 
     // ---------------------------------------------------------
     // 4. UPDATE and DELETE
@@ -117,7 +134,7 @@ async fn test_full_pg_client_coverage() {
     assert_eq!(name_str, "Alice Updated");
 
     let rows = client.query("SELECT id FROM employees", &[]).await.unwrap();
-    assert_eq!(rows.len(), 2, "Only Alice and Bob should remain");
+    assert_eq!(rows.len(), 4, "Alice, Bob, Zara, Xander should remain");
 
     // ---------------------------------------------------------
     // 5. Transactions (BEGIN, COMMIT, ROLLBACK)

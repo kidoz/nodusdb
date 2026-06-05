@@ -36,6 +36,13 @@ pub fn parse_sql(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_placeholder_parsing() {
+        let sql = "SELECT * FROM users WHERE id = $1 AND name = $2";
+        let stmts = parse_sql(sql).unwrap();
+        println!("{:#?}", stmts);
+    }
     use proptest::prelude::*;
 
     #[test]
