@@ -81,10 +81,16 @@ pub struct ShardOrchestrator {
 
 impl ShardOrchestrator {
     pub fn new(meta: Arc<dyn MetaStore>) -> Self {
+        let loaded_placements = meta.get_shard_placements().unwrap_or_default();
         Self {
             meta,
-            placements: RwLock::new(HashMap::new()),
+            placements: RwLock::new(loaded_placements),
         }
+    }
+
+    fn save_placements(&self) -> Result<()> {
+        let p = self.placements.read().unwrap();
+        self.meta.update_shard_placements(&*p)
     }
 
     /// Creates an initial single shard covering the whole key space for a table.
@@ -148,13 +154,14 @@ impl ShardOrchestrator {
             let mut p = self.placements.write().unwrap();
             p.insert(left.id, node.clone());
             p.insert(right.id, node);
+            p.remove(&shard_id);
         }
 
         map.shards.remove(idx);
         map.shards.push(left);
         map.shards.push(right);
         self.meta.update_shard_map(map)?;
-        self.placements.write().unwrap().remove(&shard_id);
+        self.save_placements()?;
         Ok(ids)
     }
 
@@ -191,6 +198,8 @@ impl ShardOrchestrator {
         let mut p = self.placements.write().unwrap();
         p.remove(&left_id);
         p.remove(&right_id);
+        drop(p);
+        self.save_placements()?;
         Ok(merged_id)
     }
 
@@ -200,6 +209,7 @@ impl ShardOrchestrator {
             .write()
             .unwrap()
             .insert(shard_id, node.to_string());
+        self.save_placements()?;
         Ok(())
     }
 
@@ -220,6 +230,8 @@ impl ShardOrchestrator {
         for (i, shard) in shards.iter().enumerate() {
             p.insert(shard.id, nodes[i % nodes.len()].clone());
         }
+        drop(p);
+        self.save_placements()?;
         Ok(())
     }
 }
@@ -372,5 +384,17 @@ mod tests {
         let pr = orch.placement(right);
         assert!(pl.is_some() && pr.is_some());
         assert_ne!(pl, pr, "two shards should spread across two nodes");
+    }
+
+    #[test]
+    fn test_shard_placement_persistence() {
+        let (meta, table_id, shard_id) = single_shard_table();
+        let orch1 = ShardOrchestrator::new(meta.clone());
+        orch1.move_shard(shard_id, "node-b").unwrap();
+        assert_eq!(orch1.placement(shard_id).as_deref(), Some("node-b"));
+
+        // Simulate restart by creating a new orchestrator with the same meta store
+        let orch2 = ShardOrchestrator::new(meta.clone());
+        assert_eq!(orch2.placement(shard_id).as_deref(), Some("node-b"));
     }
 }
