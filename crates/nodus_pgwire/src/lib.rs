@@ -190,21 +190,34 @@ impl SimpleQueryHandler for NodusQueryHandler {
             authz_catalog_version: 1,
         };
 
-        // Parse SQL and translate to a logical plan. Unsupported/unparseable
-        // statements are accepted as no-ops so clients (psql, drivers) that send
-        // SET/discovery queries don't break the connection.
+        // Parse SQL and translate to a logical plan. We now return actual errors
+        // instead of silently succeeding, so unsupported queries fail fast.
         let stmt = match nodus_sql::parse_sql(query) {
             Ok(mut stmts) if !stmts.is_empty() => stmts.remove(0),
             Ok(_) => return Ok(vec![Response::Execution(Tag::new("OK"))]),
             Err(e) => {
                 error!("Failed to parse SQL: {}", e);
                 self.metrics.query_errors_total.inc();
-                return Ok(vec![Response::Execution(Tag::new("OK"))]);
+                let err = ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "42601".to_owned(),
+                    format!("Syntax error: {}", e),
+                );
+                return Err(PgWireError::UserError(Box::new(err)));
             }
         };
         let plan = match nodus_executor::plan_statement(&stmt, &[]) {
             Ok(plan) => plan,
-            Err(_) => return Ok(vec![Response::Execution(Tag::new("OK"))]),
+            Err(e) => {
+                error!("Failed to plan SQL: {}", e);
+                self.metrics.query_errors_total.inc();
+                let err = ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "0A000".to_owned(),
+                    format!("Unsupported feature: {}", e),
+                );
+                return Err(PgWireError::UserError(Box::new(err)));
+            }
         };
 
         let out = self
@@ -276,7 +289,9 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
             .cloned()
             .unwrap_or_else(|| {
                 let id = Uuid::new_v4().to_string();
-                client.metadata_mut().insert("nodus_session_id".to_string(), id.clone());
+                client
+                    .metadata_mut()
+                    .insert("nodus_session_id".to_string(), id.clone());
                 id
             });
 
@@ -364,12 +379,26 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
             Err(e) => {
                 error!("Failed to parse SQL: {}", e);
                 self.metrics.query_errors_total.inc();
-                return Ok(Response::Execution(Tag::new("OK")));
+                let err = ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "42601".to_owned(),
+                    format!("Syntax error: {}", e),
+                );
+                return Err(PgWireError::UserError(Box::new(err)));
             }
         };
         let plan = match nodus_executor::plan_statement(&stmt, &params) {
             Ok(plan) => plan,
-            Err(_) => return Ok(Response::Execution(Tag::new("OK"))),
+            Err(e) => {
+                error!("Failed to plan SQL: {}", e);
+                self.metrics.query_errors_total.inc();
+                let err = ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "0A000".to_owned(),
+                    format!("Unsupported feature: {}", e),
+                );
+                return Err(PgWireError::UserError(Box::new(err)));
+            }
         };
 
         let out = self
@@ -430,36 +459,39 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
         let mut fields = vec![];
         if let Ok(mut stmts) = nodus_sql::parse_sql(&stmt.statement)
             && let Some(parsed) = stmts.pop()
-            && let Ok(plan) = nodus_executor::plan_statement(&parsed, &[]) {
-                match plan {
-                    nodus_executor::LogicalPlan::Select { projection, .. } => {
-                        for col in projection {
-                            let col_name = match col {
-                                nodus_executor::ProjectionItem::Column(c) => c,
-                                nodus_executor::ProjectionItem::Aggregate(op, inner) => format!("{:?}({})", op, inner),
-                            };
-                            fields.push(FieldInfo::new(
-                                col_name,
-                                None,
-                                None,
-                                Type::VARCHAR,
-                                FieldFormat::Text,
-                            ));
-                        }
-                    }
-                    nodus_executor::LogicalPlan::SelectLiteral { .. }
-                    | nodus_executor::LogicalPlan::ShowVariable { .. } => {
+            && let Ok(plan) = nodus_executor::plan_statement(&parsed, &[])
+        {
+            match plan {
+                nodus_executor::LogicalPlan::Select { projection, .. } => {
+                    for col in projection {
+                        let col_name = match col {
+                            nodus_executor::ProjectionItem::Column(c) => c,
+                            nodus_executor::ProjectionItem::Aggregate(op, inner) => {
+                                format!("{:?}({})", op, inner)
+                            }
+                        };
                         fields.push(FieldInfo::new(
-                            "?column?".to_string(),
+                            col_name,
                             None,
                             None,
                             Type::VARCHAR,
                             FieldFormat::Text,
                         ));
                     }
-                    _ => {}
                 }
+                nodus_executor::LogicalPlan::SelectLiteral { .. }
+                | nodus_executor::LogicalPlan::ShowVariable { .. } => {
+                    fields.push(FieldInfo::new(
+                        "?column?".to_string(),
+                        None,
+                        None,
+                        Type::VARCHAR,
+                        FieldFormat::Text,
+                    ));
+                }
+                _ => {}
             }
+        }
 
         Ok(DescribeStatementResponse::new(param_types, fields))
     }
@@ -478,36 +510,39 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
         let mut fields = vec![];
         if let Ok(mut stmts) = nodus_sql::parse_sql(&portal.statement.statement)
             && let Some(parsed) = stmts.pop()
-            && let Ok(plan) = nodus_executor::plan_statement(&parsed, &[]) {
-                match plan {
-                    nodus_executor::LogicalPlan::Select { projection, .. } => {
-                        for col in projection {
-                            let col_name = match col {
-                                nodus_executor::ProjectionItem::Column(c) => c,
-                                nodus_executor::ProjectionItem::Aggregate(op, inner) => format!("{:?}({})", op, inner),
-                            };
-                            fields.push(FieldInfo::new(
-                                col_name,
-                                None,
-                                None,
-                                Type::VARCHAR,
-                                FieldFormat::Text,
-                            ));
-                        }
-                    }
-                    nodus_executor::LogicalPlan::SelectLiteral { .. }
-                    | nodus_executor::LogicalPlan::ShowVariable { .. } => {
+            && let Ok(plan) = nodus_executor::plan_statement(&parsed, &[])
+        {
+            match plan {
+                nodus_executor::LogicalPlan::Select { projection, .. } => {
+                    for col in projection {
+                        let col_name = match col {
+                            nodus_executor::ProjectionItem::Column(c) => c,
+                            nodus_executor::ProjectionItem::Aggregate(op, inner) => {
+                                format!("{:?}({})", op, inner)
+                            }
+                        };
                         fields.push(FieldInfo::new(
-                            "?column?".to_string(),
+                            col_name,
                             None,
                             None,
                             Type::VARCHAR,
                             FieldFormat::Text,
                         ));
                     }
-                    _ => {}
                 }
+                nodus_executor::LogicalPlan::SelectLiteral { .. }
+                | nodus_executor::LogicalPlan::ShowVariable { .. } => {
+                    fields.push(FieldInfo::new(
+                        "?column?".to_string(),
+                        None,
+                        None,
+                        Type::VARCHAR,
+                        FieldFormat::Text,
+                    ));
+                }
+                _ => {}
             }
+        }
         Ok(DescribePortalResponse::new(fields))
     }
 }
