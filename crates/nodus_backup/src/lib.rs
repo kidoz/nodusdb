@@ -346,7 +346,19 @@ impl BackupOrchestrator {
             .await?;
 
         // Re-verify before reporting success.
-        self.verify(&backup_id).await?;
+        if let Err(e) = self.verify(&backup_id).await {
+            let mut failed_manifest = manifest.clone();
+            failed_manifest.status = BackupStatus::Failed;
+            let failed_body = serde_json::to_vec(&BackupManifest::V1(failed_manifest))?;
+            let _ = self.repo.put_object(
+                &manifest_key(&backup_id),
+                Bytes::from(failed_body),
+                PutOptions {
+                    content_type: Some("application/json".into()),
+                },
+            ).await;
+            anyhow::bail!("Backup verification failed: {}", e);
+        }
         Ok(manifest)
     }
 

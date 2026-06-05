@@ -188,30 +188,48 @@ async fn create_backup(State(state): State<AdminState>) -> Json<Value> {
         .unwrap_or(0);
 
     let snapshot = state.catalog.export_snapshot();
-    let catalog_bytes = serde_json::to_vec(&snapshot).unwrap_or_default();
-    let audit_events = state
-        .audit
-        .query(&AuditQuery::default())
-        .unwrap_or_default();
-    let audit_bytes = serde_json::to_vec(&audit_events).unwrap_or_default();
+    let catalog_bytes = match serde_json::to_vec(&snapshot) {
+        Ok(b) => b,
+        Err(e) => return Json(json!({ "error": format!("Failed to serialize catalog: {e}") })),
+    };
+    
+    let audit_events = match state.audit.query(&AuditQuery::default()) {
+        Ok(events) => events,
+        Err(e) => return Json(json!({ "error": format!("Failed to query audit: {e}") })),
+    };
+    let audit_bytes = match serde_json::to_vec(&audit_events) {
+        Ok(b) => b,
+        Err(e) => return Json(json!({ "error": format!("Failed to serialize audit: {e}") })),
+    };
 
     let mut kv_dump = Vec::new();
     let range = nodus_storage_api::KeyRange {
         start: Bytes::new(),
         end: Bytes::from(vec![255u8; 1024]),
     };
-    if let Ok(iter) = state.kv.scan(range, u64::MAX) {
-        for pair_res in iter {
-            if let Ok(pair) = pair_res {
-                kv_dump.push(json!({
-                    "key": pair.key.to_vec(),
-                    "value": pair.value.to_vec(),
-                    "version": pair.version,
-                }));
+    
+    match state.kv.scan(range, u64::MAX) {
+        Ok(iter) => {
+            for pair_res in iter {
+                match pair_res {
+                    Ok(pair) => {
+                        kv_dump.push(json!({
+                            "key": pair.key.to_vec(),
+                            "value": pair.value.to_vec(),
+                            "version": pair.version,
+                        }));
+                    }
+                    Err(e) => return Json(json!({ "error": format!("Failed to scan KV pair: {e}") })),
+                }
             }
         }
+        Err(e) => return Json(json!({ "error": format!("Failed to start KV scan: {e}") })),
     }
-    let kv_bytes = serde_json::to_vec(&kv_dump).unwrap_or_default();
+    
+    let kv_bytes = match serde_json::to_vec(&kv_dump) {
+        Ok(b) => b,
+        Err(e) => return Json(json!({ "error": format!("Failed to serialize KV dump: {e}") })),
+    };
 
     let objects = vec![
         BackupObject {
