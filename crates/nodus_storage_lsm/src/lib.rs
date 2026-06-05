@@ -36,25 +36,30 @@ impl LsmKvEngine {
     pub fn with_wal<P: AsRef<Path>>(data_dir: P, key: Option<[u8; 32]>) -> Result<Self> {
         let path = data_dir.as_ref();
         std::fs::create_dir_all(path)?;
-        
+
         let mut sstables = Vec::new();
         let mut max_id = 0;
-        
+
         // Load existing SSTs
         for entry in std::fs::read_dir(path)? {
             let entry = entry?;
             let p = entry.path();
             if p.extension().and_then(|s| s.to_str()) == Some("sst")
                 && let Some(name) = p.file_stem().and_then(|n| n.to_str())
-                    && let Ok(id) = name.parse::<u64>() {
-                        max_id = std::cmp::max(max_id, id);
-                        sstables.push(Sstable::open(p));
-                    }
+                && let Ok(id) = name.parse::<u64>()
+            {
+                max_id = std::cmp::max(max_id, id);
+                sstables.push(Sstable::open(p));
+            }
         }
-        
+
         // Sort SSTs so newest is last
         sstables.sort_by_key(|s| {
-            s.path.file_stem().and_then(|n| n.to_str()).and_then(|n| n.parse::<u64>().ok()).unwrap_or(0)
+            s.path
+                .file_stem()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.parse::<u64>().ok())
+                .unwrap_or(0)
         });
 
         let wal_path = path.join(format!("{}.log", max_id + 1));
@@ -81,30 +86,35 @@ impl LsmKvEngine {
         };
 
         let mut mem_guard = self.memtable.write().unwrap();
-        
+
         if mem_guard.is_empty() {
             return Ok(());
         }
 
-        let file_id = self.next_file_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let file_id = self
+            .next_file_id
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let sst_path = dir.join(format!("{}.sst", file_id));
         let new_wal_path = dir.join(format!("{}.log", file_id + 1));
 
         // 1. Flush memtable to SSTable
         let sst = Sstable::build(&sst_path, &mem_guard)?;
-        
+
         // 2. Add to list
         let mut sst_guard = self.sstables.write().unwrap();
         sst_guard.push(sst);
 
         // 3. Clear memtable
         mem_guard.clear();
-        
+
         // 4. Rotate WAL
-        let new_wal = Arc::new(FileWalEngine::with_encryption(&new_wal_path, self._wal_key)?);
+        let new_wal = Arc::new(FileWalEngine::with_encryption(
+            &new_wal_path,
+            self._wal_key,
+        )?);
         let mut wal_guard = self.wal.write().unwrap();
         *wal_guard = Some(new_wal);
-        
+
         Ok(())
     }
 
@@ -166,17 +176,19 @@ impl KvEngine for LsmKvEngine {
     fn get(&self, key: &[u8], read_ts: Timestamp) -> Result<Option<Bytes>> {
         let guard = self.memtable.read().unwrap();
         if let Some(chain) = guard.get(key)
-            && let Some(val) = chain.read(read_ts) {
-                return Ok(Some(Bytes::from(val.to_vec())));
-            }
+            && let Some(val) = chain.read(read_ts)
+        {
+            return Ok(Some(Bytes::from(val.to_vec())));
+        }
 
         // Search through sstables from newest to oldest
         let sst_guard = self.sstables.read().unwrap();
         for sst in sst_guard.iter().rev() {
             if let Ok(Some(chain)) = sst.get(key)
-                && let Some(val) = chain.read(read_ts) {
-                    return Ok(Some(Bytes::from(val.to_vec())));
-                }
+                && let Some(val) = chain.read(read_ts)
+            {
+                return Ok(Some(Bytes::from(val.to_vec())));
+            }
         }
 
         Ok(None)
@@ -212,7 +224,9 @@ impl KvEngine for LsmKvEngine {
         let mut results = Vec::new();
         for (k, chain) in merged {
             if let Some(val) = chain.read(read_ts) {
-                let version = chain.versions.iter()
+                let version = chain
+                    .versions
+                    .iter()
                     .filter(|v| v.is_visible(read_ts))
                     .map(|v| v.version)
                     .max()
@@ -490,21 +504,21 @@ mod tests {
             let engine = LsmKvEngine::with_wal(temp_dir.path(), None).unwrap();
             engine.write_intent(txn1, k1.clone(), v1.clone()).unwrap();
             engine.commit(txn1, 10).unwrap();
-            
+
             // Flush forces memtable to SST and rotates WAL
             engine.flush().unwrap();
-            
+
             // Write to new WAL
             engine.write_intent(txn2, k2.clone(), v2.clone()).unwrap();
             engine.commit(txn2, 20).unwrap();
-        } 
+        }
 
         // Re-instantiate should recover k1 from SST and k2 from the new WAL
         let recovered_engine = LsmKvEngine::with_wal(temp_dir.path(), None).unwrap();
-        
+
         let res1 = recovered_engine.get(k1.as_ref(), 25).unwrap();
         assert_eq!(res1.unwrap(), v1);
-        
+
         let res2 = recovered_engine.get(k2.as_ref(), 25).unwrap();
         assert_eq!(res2.unwrap(), v2);
     }
@@ -530,7 +544,7 @@ mod tests {
         fn test_mvcc_snapshot_isolation(val1 in any::<Vec<u8>>(), val2 in any::<Vec<u8>>()) {
             let engine = LsmKvEngine::new();
             let k = Bytes::from("prop_key");
-            
+
             let txn1 = TxnId::new();
             engine.write_intent(txn1, k.clone(), Bytes::from(val1.clone())).unwrap();
             engine.commit(txn1, 10).unwrap();
@@ -555,20 +569,25 @@ mod sst_tests {
     fn test_flush_and_read_from_sst() {
         let dir = TempDir::new().unwrap();
         let engine = LsmKvEngine::with_wal(dir.path(), None).unwrap();
-        
+
         let txn1 = TxnId::new();
-        engine.write_intent(txn1, Bytes::from("key1"), Bytes::from("val1")).unwrap();
+        engine
+            .write_intent(txn1, Bytes::from("key1"), Bytes::from("val1"))
+            .unwrap();
         engine.commit(txn1, 10).unwrap();
-        
+
         // Value is in memtable
-        assert_eq!(engine.get(b"key1", 10).unwrap().unwrap(), Bytes::from("val1"));
-        
+        assert_eq!(
+            engine.get(b"key1", 10).unwrap().unwrap(),
+            Bytes::from("val1")
+        );
+
         // Flush moves it to SSTable
         engine.flush().unwrap();
-        
+
         // Check memtable is empty
         assert!(engine.memtable.read().unwrap().is_empty());
-        
+
         // Value is still readable! Wait... does get() read from sstables?
         // Ah, our get() method only reads from memtable right now. We need to fix that!
     }

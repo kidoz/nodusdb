@@ -30,9 +30,10 @@ impl KvEngine for MemKvEngine {
     fn get(&self, key: &[u8], read_ts: Timestamp) -> Result<Option<Bytes>> {
         let guard = self.store.read().unwrap();
         if let Some(chain) = guard.get(key)
-            && let Some(val) = chain.read(read_ts) {
-                return Ok(Some(Bytes::from(val.to_vec())));
-            }
+            && let Some(val) = chain.read(read_ts)
+        {
+            return Ok(Some(Bytes::from(val.to_vec())));
+        }
         Ok(None)
     }
 
@@ -48,7 +49,9 @@ impl KvEngine for MemKvEngine {
             if let Some(val) = chain.read(read_ts) {
                 // Find the version of this read - for the scanner we need the actual version.
                 // We'll peek into the versions since `read` just gives us the value.
-                let version = chain.versions.iter()
+                let version = chain
+                    .versions
+                    .iter()
                     .filter(|v| v.is_visible(read_ts))
                     .map(|v| v.version)
                     .max()

@@ -90,7 +90,7 @@ impl ShardOrchestrator {
 
     fn save_placements(&self) -> Result<()> {
         let p = self.placements.read().unwrap();
-        self.meta.update_shard_placements(&*p)
+        self.meta.update_shard_placements(&p)
     }
 
     /// Creates an initial single shard covering the whole key space for a table.
@@ -388,7 +388,7 @@ mod tests {
 
     #[test]
     fn test_shard_placement_persistence() {
-        let (meta, table_id, shard_id) = single_shard_table();
+        let (meta, _table_id, shard_id) = single_shard_table();
         let orch1 = ShardOrchestrator::new(meta.clone());
         orch1.move_shard(shard_id, "node-b").unwrap();
         assert_eq!(orch1.placement(shard_id).as_deref(), Some("node-b"));

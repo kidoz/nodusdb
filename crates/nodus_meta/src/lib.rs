@@ -16,7 +16,10 @@ pub trait MetaStore: Send + Sync {
     fn get_shard_map(&self, table_id: TableId) -> Result<ShardMap>;
     fn update_shard_map(&self, shard_map: ShardMap) -> Result<()>;
     fn get_shard_placements(&self) -> Result<HashMap<nodus_catalog::ShardId, String>>;
-    fn update_shard_placements(&self, placements: &HashMap<nodus_catalog::ShardId, String>) -> Result<()>;
+    fn update_shard_placements(
+        &self,
+        placements: &HashMap<nodus_catalog::ShardId, String>,
+    ) -> Result<()>;
 }
 
 pub struct MemMetaStore {
@@ -58,7 +61,10 @@ impl MetaStore for MemMetaStore {
         Ok(self.placements.read().unwrap().clone())
     }
 
-    fn update_shard_placements(&self, placements: &HashMap<nodus_catalog::ShardId, String>) -> Result<()> {
+    fn update_shard_placements(
+        &self,
+        placements: &HashMap<nodus_catalog::ShardId, String>,
+    ) -> Result<()> {
         *self.placements.write().unwrap() = placements.clone();
         Ok(())
     }
@@ -97,16 +103,16 @@ impl MetaStore for PersistentMetaStore {
     fn update_shard_map(&self, shard_map: ShardMap) -> Result<()> {
         let key = Self::key_for(shard_map.table_id);
         let val = Bytes::from(serde_json::to_vec(&shard_map)?);
-        
+
         let txn_id = TxnId::new();
         self.kv.write_intent(txn_id, key, val)?;
-        
+
         // Use current timestamp as commit_ts
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_micros() as u64;
-            
+
         self.kv.commit(txn_id, ts)?;
         Ok(())
     }
@@ -122,18 +128,21 @@ impl MetaStore for PersistentMetaStore {
         }
     }
 
-    fn update_shard_placements(&self, placements: &HashMap<nodus_catalog::ShardId, String>) -> Result<()> {
+    fn update_shard_placements(
+        &self,
+        placements: &HashMap<nodus_catalog::ShardId, String>,
+    ) -> Result<()> {
         let key = Self::placements_key();
         let val = Bytes::from(serde_json::to_vec(placements)?);
-        
+
         let txn_id = TxnId::new();
         self.kv.write_intent(txn_id, key, val)?;
-        
+
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_micros() as u64;
-            
+
         self.kv.commit(txn_id, ts)?;
         Ok(())
     }

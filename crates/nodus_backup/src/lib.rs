@@ -350,13 +350,16 @@ impl BackupOrchestrator {
             let mut failed_manifest = manifest.clone();
             failed_manifest.status = BackupStatus::Failed;
             let failed_body = serde_json::to_vec(&BackupManifest::V1(failed_manifest))?;
-            let _ = self.repo.put_object(
-                &manifest_key(&backup_id),
-                Bytes::from(failed_body),
-                PutOptions {
-                    content_type: Some("application/json".into()),
-                },
-            ).await;
+            let _ = self
+                .repo
+                .put_object(
+                    &manifest_key(&backup_id),
+                    Bytes::from(failed_body),
+                    PutOptions {
+                        content_type: Some("application/json".into()),
+                    },
+                )
+                .await;
             anyhow::bail!("Backup verification failed: {}", e);
         }
         Ok(manifest)
@@ -531,18 +534,34 @@ mod tests {
             checksums: std::collections::HashMap::new(),
             status: BackupStatus::Completed,
         };
-        manifest.checksums.insert("f1".to_string(), "abc".to_string());
-        
+        manifest
+            .checksums
+            .insert("f1".to_string(), "abc".to_string());
+
         let body = serde_json::to_vec(&BackupManifest::V1(manifest.clone())).unwrap();
-        repo.put_object(&manifest_key("test-id-123"), Bytes::from(body), PutOptions { content_type: None }).await.unwrap();
-        repo.put_object("f1", Bytes::from("bad"), PutOptions { content_type: None }).await.unwrap();
-        
+        repo.put_object(
+            &manifest_key("test-id-123"),
+            Bytes::from(body),
+            PutOptions { content_type: None },
+        )
+        .await
+        .unwrap();
+        repo.put_object("f1", Bytes::from("bad"), PutOptions { content_type: None })
+            .await
+            .unwrap();
+
         if orch.verify("test-id-123").await.is_err() {
             manifest.status = BackupStatus::Failed;
             let fb = serde_json::to_vec(&BackupManifest::V1(manifest)).unwrap();
-            repo.put_object(&manifest_key("test-id-123"), Bytes::from(fb), PutOptions { content_type: None }).await.unwrap();
+            repo.put_object(
+                &manifest_key("test-id-123"),
+                Bytes::from(fb),
+                PutOptions { content_type: None },
+            )
+            .await
+            .unwrap();
         }
-        
+
         let m = orch.load_manifest("test-id-123").await.unwrap();
         assert_eq!(m.status, BackupStatus::Failed);
 

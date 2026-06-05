@@ -16,10 +16,10 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
+use tokio_rustls::rustls::RootCertStore;
 use tokio_rustls::rustls::ServerConfig;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_rustls::rustls::server::WebPkiClientVerifier;
-use tokio_rustls::rustls::RootCertStore;
 use tower_http::cors::{Any, CorsLayer};
 
 pub struct ServerHandle {
@@ -77,7 +77,9 @@ fn load_tls_acceptor(tls: &nodus_config::TlsConfig) -> anyhow::Result<Option<Arc
         if tls.require_client_auth {
             WebPkiClientVerifier::builder(root_cert_store.into()).build()?
         } else {
-            WebPkiClientVerifier::builder(root_cert_store.into()).allow_unauthenticated().build()?
+            WebPkiClientVerifier::builder(root_cert_store.into())
+                .allow_unauthenticated()
+                .build()?
         }
     } else {
         WebPkiClientVerifier::no_client_auth()
@@ -136,10 +138,13 @@ pub async fn run_server_with_config(
         }
     };
     let encryption_key = if let Some(hex_key) = &config.storage.encryption_key {
-        let bytes = hex::decode(hex_key).map_err(|e| anyhow::anyhow!("invalid encryption_key hex: {}", e))?;
+        let bytes = hex::decode(hex_key)
+            .map_err(|e| anyhow::anyhow!("invalid encryption_key hex: {}", e))?;
         let mut key = [0u8; 32];
         if bytes.len() != 32 {
-            return Err(anyhow::anyhow!("encryption_key must be exactly 32 bytes (64 hex characters)"));
+            return Err(anyhow::anyhow!(
+                "encryption_key must be exactly 32 bytes (64 hex characters)"
+            ));
         }
         key.copy_from_slice(&bytes);
         Some(key)
@@ -158,10 +163,12 @@ pub async fn run_server_with_config(
         database_id: None,
     }) {
         Ok(desc) => desc,
-        Err(e) if e.to_string().contains("already exists") => catalog.get_principal_by_name("nodus")?,
+        Err(e) if e.to_string().contains("already exists") => {
+            catalog.get_principal_by_name("nodus")?
+        }
         Err(e) => anyhow::bail!("seed admin: {e}"),
     };
-    
+
     // Bootstrap superuser: ALL on System bypasses per-resource grant checks.
     let _ = catalog.grant_privilege(GrantPrivilegeRequest {
         principal_id: admin.id,
@@ -262,11 +269,18 @@ pub async fn run_server_with_config(
     };
 
     let raft_config = Arc::new(openraft::Config::default().validate().unwrap());
-    let (log_store, state_machine) = openraft::storage::Adaptor::new(nodus_raftstore::NodusRaftStore::new());
+    let (log_store, state_machine) =
+        openraft::storage::Adaptor::new(nodus_raftstore::NodusRaftStore::new());
     let raft_network = nodus_raftstore::network::NodusNetworkFactory::new();
-    let raft = nodus_raftstore::server::NodusRaft::new(1, raft_config, raft_network, log_store, state_machine)
-        .await
-        .map_err(|e| anyhow::anyhow!("raft init: {e}"))?;
+    let raft = nodus_raftstore::server::NodusRaft::new(
+        1,
+        raft_config,
+        raft_network,
+        log_store,
+        state_machine,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("raft init: {e}"))?;
     let raft_state = nodus_raftstore::server::RaftState { raft };
 
     let app = Router::new()

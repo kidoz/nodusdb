@@ -83,7 +83,9 @@ impl WalEngine for FileWalEngine {
             let mut nonce_bytes = [0u8; 12];
             rand::rng().fill_bytes(&mut nonce_bytes);
             let nonce = Nonce::from_slice(&nonce_bytes);
-            data = cipher.encrypt(nonce, data.as_ref()).map_err(|e| anyhow::anyhow!("encryption failed: {}", e))?;
+            data = cipher
+                .encrypt(nonce, data.as_ref())
+                .map_err(|e| anyhow::anyhow!("encryption failed: {}", e))?;
             // Prepend nonce to data
             let mut final_data = nonce_bytes.to_vec();
             final_data.extend_from_slice(&data);
@@ -116,13 +118,15 @@ impl WalEngine for FileWalEngine {
                 Ok(len) => {
                     let mut buf = vec![0u8; len as usize];
                     reader.read_exact(&mut buf)?;
-                    
+
                     let data = if let Some(cipher) = &self.cipher {
                         if buf.len() < 12 {
                             return Err(anyhow::anyhow!("corrupt WAL record: too short for nonce"));
                         }
                         let nonce = Nonce::from_slice(&buf[..12]);
-                        cipher.decrypt(nonce, &buf[12..]).map_err(|e| anyhow::anyhow!("decryption failed: {}", e))?
+                        cipher
+                            .decrypt(nonce, &buf[12..])
+                            .map_err(|e| anyhow::anyhow!("decryption failed: {}", e))?
                     } else {
                         buf
                     };
@@ -151,11 +155,13 @@ mod tests {
     fn test_wal_encryption_roundtrip() {
         let file = NamedTempFile::new().unwrap();
         let path = file.path().to_path_buf();
-        
+
         let key = [42u8; 32];
         let engine = FileWalEngine::with_encryption(&path, Some(key)).unwrap();
 
-        let record = WalRecord::V1(WalRecordV1::BeginTxn { txn_id: TxnId::new() });
+        let record = WalRecord::V1(WalRecordV1::BeginTxn {
+            txn_id: TxnId::new(),
+        });
         engine.append(record.clone()).unwrap();
         engine.sync().unwrap();
 

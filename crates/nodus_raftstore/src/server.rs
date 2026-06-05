@@ -1,10 +1,8 @@
 use axum::extract::State;
 use axum::routing::post;
 use axum::{Json, Router};
-use openraft::raft::{
-    AppendEntriesRequest, InstallSnapshotRequest, VoteRequest,
-};
 use openraft::Raft;
+use openraft::raft::{AppendEntriesRequest, InstallSnapshotRequest, VoteRequest};
 
 use crate::NodusTypeConfig;
 

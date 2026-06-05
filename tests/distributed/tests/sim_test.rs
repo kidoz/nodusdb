@@ -1,18 +1,25 @@
-use porcupine_rs::{Model, Operation, check_operations};
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::time::{sleep, Duration};
-use axum::{extract::State, routing::{post, get}, Json, Router};
-use nodus_raftstore::server::{RaftState, NodusRaft, raft_routes};
+use axum::{
+    Json,
+    extract::State,
+    routing::{get, post},
+};
 use nodus_raftstore::NodusRaftStore;
 use nodus_raftstore::network::{NodusNetwork, NodusNetworkFactory};
-use openraft::network::{RaftNetwork, RaftNetworkFactory, RPCOption};
-use openraft::error::{RPCError, RaftError, NetworkError};
-use openraft::raft::{AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse, VoteRequest, VoteResponse};
-use openraft::{Config, BasicNode};
-use nodus_raftstore::{ShardCommand, NodusTypeConfig};
+use nodus_raftstore::server::{NodusRaft, RaftState, raft_routes};
+use nodus_raftstore::{NodusTypeConfig, ShardCommand};
+use openraft::error::{NetworkError, RPCError, RaftError};
+use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
+use openraft::raft::{
+    AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
+    VoteRequest, VoteResponse,
+};
+use openraft::{BasicNode, Config};
+use porcupine_rs::{Model, Operation, check_operations};
+use std::collections::BTreeMap;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::time::{Duration, sleep};
 
 #[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -49,7 +56,7 @@ impl Model for RegisterModel {
 
 async fn read_val(State(state): State<RaftState>) -> Json<i32> {
     let sm = state.raft.with_raft_state(|rs| rs.clone()).await;
-    let _ = sm; 
+    let _ = sm;
     Json(0)
 }
 
@@ -67,10 +74,25 @@ async fn write_val(State(state): State<RaftState>, Json(val): Json<i32>) -> Json
 
 async fn init_cluster(State(state): State<RaftState>) -> Json<bool> {
     let mut nodes = BTreeMap::new();
-    nodes.insert(1, BasicNode { addr: "127.0.0.1:15431".to_string() });
-    nodes.insert(2, BasicNode { addr: "127.0.0.1:15432".to_string() });
-    nodes.insert(3, BasicNode { addr: "127.0.0.1:15433".to_string() });
-    
+    nodes.insert(
+        1,
+        BasicNode {
+            addr: "127.0.0.1:15431".to_string(),
+        },
+    );
+    nodes.insert(
+        2,
+        BasicNode {
+            addr: "127.0.0.1:15432".to_string(),
+        },
+    );
+    nodes.insert(
+        3,
+        BasicNode {
+            addr: "127.0.0.1:15433".to_string(),
+        },
+    );
+
     let _ = state.raft.initialize(nodes).await;
     Json(true)
 }
@@ -89,7 +111,9 @@ impl RaftNetwork<NodusTypeConfig> for FaultyNetwork {
         option: RPCOption,
     ) -> Result<AppendEntriesResponse<u64>, RPCError<u64, BasicNode, RaftError<u64>>> {
         if self.partitioned.load(Ordering::SeqCst) && self.target == 3 {
-            return Err(RPCError::Network(NetworkError::new(&std::io::Error::other("Partitioned"))));
+            return Err(RPCError::Network(NetworkError::new(
+                &std::io::Error::other("Partitioned"),
+            )));
         }
         self.inner.append_entries(rpc, option).await
     }
@@ -98,9 +122,14 @@ impl RaftNetwork<NodusTypeConfig> for FaultyNetwork {
         &mut self,
         rpc: InstallSnapshotRequest<NodusTypeConfig>,
         option: RPCOption,
-    ) -> Result<InstallSnapshotResponse<u64>, RPCError<u64, BasicNode, RaftError<u64, openraft::error::InstallSnapshotError>>> {
+    ) -> Result<
+        InstallSnapshotResponse<u64>,
+        RPCError<u64, BasicNode, RaftError<u64, openraft::error::InstallSnapshotError>>,
+    > {
         if self.partitioned.load(Ordering::SeqCst) && self.target == 3 {
-            return Err(RPCError::Network(NetworkError::new(&std::io::Error::other("Partitioned"))));
+            return Err(RPCError::Network(NetworkError::new(
+                &std::io::Error::other("Partitioned"),
+            )));
         }
         self.inner.install_snapshot(rpc, option).await
     }
@@ -111,7 +140,9 @@ impl RaftNetwork<NodusTypeConfig> for FaultyNetwork {
         option: RPCOption,
     ) -> Result<VoteResponse<u64>, RPCError<u64, BasicNode, RaftError<u64>>> {
         if self.partitioned.load(Ordering::SeqCst) && self.target == 3 {
-            return Err(RPCError::Network(NetworkError::new(&std::io::Error::other("Partitioned"))));
+            return Err(RPCError::Network(NetworkError::new(
+                &std::io::Error::other("Partitioned"),
+            )));
         }
         self.inner.vote(rpc, option).await
     }
@@ -138,19 +169,23 @@ impl RaftNetworkFactory<NodusTypeConfig> for FaultyNetworkFactory {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_cluster_partition_linearizability() {
     let mut nodes = vec![];
-    let raft_config = Arc::new(Config {
-        heartbeat_interval: 100,
-        election_timeout_min: 300,
-        election_timeout_max: 600,
-        ..Default::default()
-    }.validate().unwrap());
+    let raft_config = Arc::new(
+        Config {
+            heartbeat_interval: 100,
+            election_timeout_min: 300,
+            election_timeout_max: 600,
+            ..Default::default()
+        }
+        .validate()
+        .unwrap(),
+    );
 
     let mut stores = BTreeMap::new();
     let partitioned = Arc::new(AtomicBool::new(false));
 
     for i in 1..=3 {
         let addr: SocketAddr = format!("127.0.0.1:1543{}", i).parse().unwrap();
-        
+
         let store = NodusRaftStore::new();
         stores.insert(i as u64, store.clone());
         let raft_config_clone = raft_config.clone();
@@ -162,8 +197,15 @@ async fn test_cluster_partition_linearizability() {
                 inner: NodusNetworkFactory::new(),
                 partitioned: part_clone,
             };
-            let raft = NodusRaft::new(i as u64, raft_config_clone, raft_network, log_store, state_machine)
-                .await.unwrap();
+            let raft = NodusRaft::new(
+                i as u64,
+                raft_config_clone,
+                raft_network,
+                log_store,
+                state_machine,
+            )
+            .await
+            .unwrap();
             let raft_state = RaftState { raft };
 
             let app = raft_routes()
@@ -182,8 +224,12 @@ async fn test_cluster_partition_linearizability() {
 
     // 2. Initialize cluster
     let client = reqwest::Client::new();
-    client.post(format!("http://{}/test/init", nodes[0].1)).send().await.unwrap();
-    
+    client
+        .post(format!("http://{}/test/init", nodes[0].1))
+        .send()
+        .await
+        .unwrap();
+
     // Wait for election to complete
     sleep(Duration::from_secs(2)).await;
 
@@ -192,7 +238,8 @@ async fn test_cluster_partition_linearizability() {
     partitioned.store(true, Ordering::SeqCst);
 
     // Send a write to node 1
-    let write_res = client.post(format!("http://{}/test/write", nodes[0].1))
+    let write_res = client
+        .post(format!("http://{}/test/write", nodes[0].1))
         .json(&42)
         .send()
         .await;
@@ -211,12 +258,12 @@ async fn test_cluster_partition_linearizability() {
     // Verify linearizability with porcupine!
     println!("Verifying linearizability...");
     let mut history: Vec<Operation<RegisterModel>> = vec![];
-    
+
     // Just a basic check that data actually replicated to node 3
     let sm3 = stores.get(&3).unwrap().state_machine.read().await;
     let val_str = sm3.data.get("register").unwrap();
     assert_eq!(val_str, "42");
-    
+
     history.push(Operation {
         op: RegisterOp::Write(42),
         client_id: Some(1),
