@@ -26,3 +26,4 @@ bytes.workspace = true
 chrono.workspace = true
 sqlparser.workspace = true
 serde_json.workspace = true
+regex = "1.12.3"

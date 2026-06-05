@@ -123,9 +123,19 @@ pub struct Predicate {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum FilterExpr {
+    Predicate(Predicate),
+    And(Box<FilterExpr>, Box<FilterExpr>),
+    Or(Box<FilterExpr>, Box<FilterExpr>),
+    Not(Box<FilterExpr>),
+    Like { left: String, right: Operand, negated: bool },
+    InList { left: String, list: Vec<Operand>, negated: bool },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Join {
     pub table_name: String,
-    pub condition: Vec<Predicate>,
+    pub condition: Option<FilterExpr>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -146,7 +156,7 @@ pub enum LogicalPlan {
         /// Projected column names; empty means all columns (`SELECT *`).
         projection: Vec<String>,
         /// Conjunction of `WHERE` predicates; empty means no filter.
-        filter: Vec<Predicate>,
+        filter: Option<FilterExpr>,
         /// Optional `ORDER BY (column, ascending)`.
         order_by: Option<(String, bool)>,
         /// Optional `LIMIT`.
@@ -155,11 +165,11 @@ pub enum LogicalPlan {
     Update {
         table_name: String,
         assignments: Vec<(String, String)>,
-        filter: Vec<Predicate>,
+        filter: Option<FilterExpr>,
     },
     Delete {
         table_name: String,
-        filter: Vec<Predicate>,
+        filter: Option<FilterExpr>,
     },
     Begin,
     Commit,
@@ -328,57 +338,116 @@ fn compare_op(op: &sqlparser::ast::BinaryOperator) -> Option<CompareOp> {
 
 /// Parses a `WHERE` clause into a conjunction of `column <op> literal`
 /// predicates (AND only; other expressions are ignored).
-fn parse_predicates(selection: &Option<sqlparser::ast::Expr>, params: &[String]) -> Vec<Predicate> {
-    let mut out = Vec::new();
+fn parse_predicates(selection: &Option<sqlparser::ast::Expr>, params: &[String]) -> Option<FilterExpr> {
     if let Some(expr) = selection {
-        collect_predicates(expr, &mut out, params);
+        parse_filter_expr(expr, params)
+    } else {
+        None
     }
-    out
 }
 
-fn collect_predicates(expr: &sqlparser::ast::Expr, out: &mut Vec<Predicate>, params: &[String]) {
+fn parse_filter_expr(expr: &sqlparser::ast::Expr, params: &[String]) -> Option<FilterExpr> {
     use sqlparser::ast::{BinaryOperator, Expr};
     match expr {
-        Expr::Nested(inner) => collect_predicates(inner, out, params),
+        Expr::Nested(inner) => parse_filter_expr(inner, params),
         Expr::BinaryOp { left, op, right } if *op == BinaryOperator::And => {
-            collect_predicates(left, out, params);
-            collect_predicates(right, out, params);
+            let l = parse_filter_expr(left, params);
+            let r = parse_filter_expr(right, params);
+            match (l, r) {
+                (Some(l), Some(r)) => Some(FilterExpr::And(Box::new(l), Box::new(r))),
+                (Some(l), None) => Some(l),
+                (None, Some(r)) => Some(r),
+                (None, None) => None,
+            }
+        }
+        Expr::BinaryOp { left, op, right } if *op == BinaryOperator::Or => {
+            let l = parse_filter_expr(left, params);
+            let r = parse_filter_expr(right, params);
+            match (l, r) {
+                (Some(l), Some(r)) => Some(FilterExpr::Or(Box::new(l), Box::new(r))),
+                _ => None,
+            }
+        }
+        Expr::UnaryOp { op, expr } if *op == sqlparser::ast::UnaryOperator::Not => {
+            if let Some(inner) = parse_filter_expr(expr, params) {
+                Some(FilterExpr::Not(Box::new(inner)))
+            } else {
+                None
+            }
+        }
+        Expr::Like { negated, expr, pattern, .. } => {
+            let left_col = extract_col_name(expr)?;
+            let right_op = extract_operand(pattern, params)?;
+            Some(FilterExpr::Like {
+                left: left_col,
+                right: right_op,
+                negated: *negated,
+            })
+        }
+        Expr::InList { expr, list, negated } => {
+            let left_col = extract_col_name(expr)?;
+            let mut ops = Vec::new();
+            for item in list {
+                if let Some(op) = extract_operand(item, params) {
+                    ops.push(op);
+                } else {
+                    return None;
+                }
+            }
+            Some(FilterExpr::InList {
+                left: left_col,
+                list: ops,
+                negated: *negated,
+            })
         }
         Expr::BinaryOp { left, op, right } => {
-            let left_col = match &**left {
-                Expr::Identifier(id) => id.value.clone(),
-                Expr::CompoundIdentifier(ids) => ids
-                    .iter()
-                    .map(|id| id.value.clone())
-                    .collect::<Vec<_>>()
-                    .join("."),
-                _ => return,
-            };
-            let right_op = match &**right {
-                Expr::Identifier(id) => Operand::Ident(id.value.clone()),
-                Expr::CompoundIdentifier(ids) => Operand::Ident(
-                    ids.iter()
-                        .map(|id| id.value.clone())
-                        .collect::<Vec<_>>()
-                        .join("."),
-                ),
-                expr => {
-                    if let Some(val) = expr_to_string(expr, params) {
-                        Operand::Literal(val)
-                    } else {
-                        return;
-                    }
-                }
-            };
+            let left_col = extract_col_name(left)?;
+            let right_op = extract_operand(right, params)?;
             if let Some(cmp) = compare_op(op) {
-                out.push(Predicate {
+                Some(FilterExpr::Predicate(Predicate {
                     left: left_col,
                     op: cmp,
                     right: right_op,
-                });
+                }))
+            } else {
+                None
             }
         }
-        _ => {}
+        _ => None,
+    }
+}
+
+fn extract_col_name(expr: &sqlparser::ast::Expr) -> Option<String> {
+    use sqlparser::ast::Expr;
+    match expr {
+        Expr::Identifier(id) => Some(id.value.clone()),
+        Expr::CompoundIdentifier(ids) => Some(
+            ids.iter()
+                .map(|id| id.value.clone())
+                .collect::<Vec<_>>()
+                .join("."),
+        ),
+        _ => None,
+    }
+}
+
+fn extract_operand(expr: &sqlparser::ast::Expr, params: &[String]) -> Option<Operand> {
+    use sqlparser::ast::Expr;
+    match expr {
+        Expr::Identifier(id) => Some(Operand::Ident(id.value.clone())),
+        Expr::CompoundIdentifier(ids) => Some(Operand::Ident(
+            ids.iter()
+                .map(|id| id.value.clone())
+                .collect::<Vec<_>>()
+                .join("."),
+        )),
+        _ => {
+            if let Some(val) = expr_to_string(expr, params) {
+                Some(Operand::Literal(val))
+            } else {
+                None
+            }
+        }
     }
 }
 
@@ -652,45 +721,90 @@ impl MemExecutor {
     }
 
     /// Evaluates predicates against a joined or single row.
-    fn eval_predicates(
+    fn eval_operand(&self, row: &[Value], col_names: &[String], _columns: &[ColumnDescriptor], op: &Operand, expected_type: &str) -> Value {
+        match op {
+            Operand::Literal(val) => coerce(val, column_type(expected_type)),
+            Operand::Ident(col) => {
+                let idx = col_names.iter().position(|c| c == col || c.ends_with(&format!(".{}", col)));
+                idx.and_then(|i| row.get(i)).cloned().unwrap_or(Value::Null)
+            }
+        }
+    }
+
+    /// Evaluates a FilterExpr against a joined or single row.
+    fn eval_filter(
         &self,
         row: &[Value],
         col_names: &[String],
         columns: &[ColumnDescriptor],
-        filter: &[Predicate],
+        filter: Option<&FilterExpr>,
     ) -> bool {
-        filter.iter().all(|p| {
-            let left_idx = col_names
-                .iter()
-                .position(|c| c == &p.left || c.ends_with(&format!(".{}", p.left)));
-            let Some(idx) = left_idx else {
-                return false;
-            };
-            let left_cell = row.get(idx).unwrap_or(&Value::Null);
-
-            let right_cell = match &p.right {
-                Operand::Literal(val) => coerce(val, column_type(&columns[idx].data_type)),
-                Operand::Ident(col) => {
-                    let right_idx = col_names
-                        .iter()
-                        .position(|c| c == col || c.ends_with(&format!(".{}", col)));
-                    let Some(ridx) = right_idx else {
-                        return false;
-                    };
-                    row.get(ridx).unwrap_or(&Value::Null).clone()
-                }
-            };
-
-            let ord = compare(left_cell, &right_cell);
-            match p.op {
-                CompareOp::Eq => *left_cell == right_cell,
-                CompareOp::Ne => *left_cell != right_cell,
-                CompareOp::Lt => ord == std::cmp::Ordering::Less,
-                CompareOp::Le => ord != std::cmp::Ordering::Greater,
-                CompareOp::Gt => ord == std::cmp::Ordering::Greater,
-                CompareOp::Ge => ord != std::cmp::Ordering::Less,
+        let Some(expr) = filter else {
+            return true;
+        };
+        match expr {
+            FilterExpr::And(left, right) => {
+                self.eval_filter(row, col_names, columns, Some(left))
+                    && self.eval_filter(row, col_names, columns, Some(right))
             }
-        })
+            FilterExpr::Or(left, right) => {
+                self.eval_filter(row, col_names, columns, Some(left))
+                    || self.eval_filter(row, col_names, columns, Some(right))
+            }
+            FilterExpr::Not(inner) => {
+                !self.eval_filter(row, col_names, columns, Some(inner))
+            }
+            FilterExpr::Predicate(p) => {
+                let left_idx = col_names.iter().position(|c| c == &p.left || c.ends_with(&format!(".{}", p.left)));
+                let Some(idx) = left_idx else { return false; };
+                let left_cell = row.get(idx).unwrap_or(&Value::Null);
+                let right_cell = self.eval_operand(row, col_names, columns, &p.right, &columns[idx].data_type);
+
+                let ord = compare(left_cell, &right_cell);
+                match p.op {
+                    CompareOp::Eq => *left_cell == right_cell,
+                    CompareOp::Ne => *left_cell != right_cell,
+                    CompareOp::Lt => ord == std::cmp::Ordering::Less,
+                    CompareOp::Le => ord != std::cmp::Ordering::Greater,
+                    CompareOp::Gt => ord == std::cmp::Ordering::Greater,
+                    CompareOp::Ge => ord != std::cmp::Ordering::Less,
+                }
+            }
+            FilterExpr::Like { left, right, negated } => {
+                let left_idx = col_names.iter().position(|c| c == left || c.ends_with(&format!(".{}", left)));
+                let Some(idx) = left_idx else { return false; };
+                let left_cell = row.get(idx).unwrap_or(&Value::Null);
+                let right_cell = self.eval_operand(row, col_names, columns, right, &columns[idx].data_type);
+                
+                let matches = match (left_cell, &right_cell) {
+                    (Value::Text(s), Value::Text(p)) => {
+                        let regex_str = format!("^{}$", p.replace("%", ".*").replace("_", "."));
+                        if let Ok(re) = regex::Regex::new(&regex_str) {
+                            re.is_match(s)
+                        } else {
+                            false
+                        }
+                    }
+                    _ => false,
+                };
+                if *negated { !matches } else { matches }
+            }
+            FilterExpr::InList { left, list, negated } => {
+                let left_idx = col_names.iter().position(|c| c == left || c.ends_with(&format!(".{}", left)));
+                let Some(idx) = left_idx else { return false; };
+                let left_cell = row.get(idx).unwrap_or(&Value::Null);
+                
+                let mut matches = false;
+                for op in list {
+                    let right_cell = self.eval_operand(row, col_names, columns, op, &columns[idx].data_type);
+                    if *left_cell == right_cell {
+                        matches = true;
+                        break;
+                    }
+                }
+                if *negated { !matches } else { matches }
+            }
+        }
     }
 
     /// Evaluates an optional equality filter against a typed row.
@@ -698,10 +812,10 @@ impl MemExecutor {
         &self,
         row: &[Value],
         columns: &[ColumnDescriptor],
-        filter: &[Predicate],
+        filter: Option<&FilterExpr>,
     ) -> bool {
         let col_names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
-        self.eval_predicates(row, &col_names, columns, filter)
+        self.eval_filter(row, &col_names, columns, filter)
     }
 
     /// Deny-by-default authorization gate for a single action on a resource.
@@ -883,11 +997,11 @@ impl Executor for MemExecutor {
                         for r2 in &j_rows {
                             let mut combined_row = r1.clone();
                             combined_row.extend(r2.clone());
-                            if self.eval_predicates(
+                            if self.eval_filter(
                                 &combined_row,
                                 &combined_cols,
                                 &combined_desc,
-                                &join.condition,
+                                join.condition.as_ref(),
                             ) {
                                 next_rows.push(combined_row);
                             }
@@ -900,7 +1014,7 @@ impl Executor for MemExecutor {
 
                 // WHERE: conjunction of typed predicates.
                 stored_rows
-                    .retain(|r| self.eval_predicates(r, &col_names, &joined_columns, &filter));
+                    .retain(|r| self.eval_filter(r, &col_names, &joined_columns, filter.as_ref()));
 
                 // ORDER BY a column (typed compare), then LIMIT.
                 if let Some((ocol, asc)) = &order_by
@@ -965,7 +1079,7 @@ impl Executor for MemExecutor {
 
                 let mut updated = 0;
                 for mut row in self.scan_rows(tbl.id, &ctx.session_id)? {
-                    if !self.row_matches(&row, &tbl.columns, &filter) {
+                    if !self.row_matches(&row, &tbl.columns, filter.as_ref()) {
                         continue;
                     }
                     let old_key =
@@ -997,7 +1111,7 @@ impl Executor for MemExecutor {
 
                 let mut deleted = 0;
                 for row in self.scan_rows(tbl.id, &ctx.session_id)? {
-                    if !self.row_matches(&row, &tbl.columns, &filter) {
+                    if !self.row_matches(&row, &tbl.columns, filter.as_ref()) {
                         continue;
                     }
                     let key = format!("{}:{}", tbl.id, row.first().map(render).unwrap_or_default());
@@ -1107,12 +1221,12 @@ mod tests {
             .collect()
     }
 
-    fn eq(col: &str, val: &str) -> Vec<Predicate> {
-        vec![Predicate {
+    fn eq(col: &str, val: &str) -> Option<FilterExpr> {
+        Some(FilterExpr::Predicate(Predicate {
             left: col.to_string(),
             op: CompareOp::Eq,
             right: Operand::Literal(val.to_string()),
-        }]
+        }))
     }
 
     #[test]
@@ -1203,7 +1317,7 @@ mod tests {
                     table_name: "books".into(),
                     joins: vec![],
                     projection: vec![],
-                    filter: vec![],
+                    filter: None,
                     order_by: None,
                     limit: None,
                 },
@@ -1337,7 +1451,7 @@ mod tests {
             .unwrap();
         assert_eq!(out.tag, "UPDATE 1");
 
-        let read = |filter: Vec<Predicate>| {
+        let read = |filter: Option<FilterExpr>| {
             exec.execute_logical(
                 &ctx,
                 LogicalPlan::Select {
@@ -1365,7 +1479,7 @@ mod tests {
             .unwrap();
         assert_eq!(out.tag, "DELETE 1");
         assert_eq!(read(eq("id", "1")).rows.len(), 0);
-        assert_eq!(read(vec![]).rows.len(), 2);
+        assert_eq!(read(None).rows.len(), 2);
     }
 
     #[test]
@@ -1438,18 +1552,18 @@ mod tests {
             table_name: "books".into(),
             joins: vec![Join {
                 table_name: "authors".into(),
-                condition: vec![Predicate {
+                condition: Some(FilterExpr::Predicate(Predicate {
                     left: "books.author_id".into(),
                     op: CompareOp::Eq,
                     right: Operand::Ident("authors.id".into()),
-                }],
+                })),
             }],
             projection: vec!["books.title".into(), "authors.name".into()],
-            filter: vec![Predicate {
+            filter: Some(FilterExpr::Predicate(Predicate {
                 left: "authors.name".into(),
                 op: CompareOp::Eq,
                 right: Operand::Literal("Herbert".into()),
-            }],
+            })),
             order_by: Some(("books.id".into(), true)),
             limit: None,
         };
@@ -1522,7 +1636,7 @@ mod tests {
                     table_name: "t".into(),
                     joins: vec![],
                     projection: vec![],
-                    filter: vec![],
+                    filter: None,
                     order_by: None,
                     limit: None,
                 },
@@ -1548,5 +1662,59 @@ mod tests {
     fn run_gc_is_safe_with_no_active_txns() {
         let exec = MemExecutor::default();
         assert_eq!(exec.run_gc().unwrap(), 0);
+    }
+    #[test]
+    fn test_complex_filters() {
+        let (exec, cat) = MemExecutor::shared(Arc::new(MemoryAuditSink::new()));
+        let admin = cat
+            .create_role(CreateRoleRequest {
+                name: "admin".into(),
+                principal_type: PrincipalType::User,
+                database_id: None,
+            })
+            .unwrap();
+        cat.grant_privilege(GrantPrivilegeRequest {
+            principal_id: admin.id,
+            resource: ResourceRef::System,
+            privilege: "ALL".into(),
+        })
+        .unwrap();
+        let ctx = ctx_for(admin.id);
+
+        exec.execute_logical(
+            &ctx,
+            LogicalPlan::CreateTable {
+                name: "t".into(),
+                columns: cols(&[("id", "int"), ("name", "text"), ("status", "text")]),
+            },
+        ).unwrap();
+
+        let insert = |id: &str, name: &str, status: &str| {
+            exec.execute_logical(
+                &ctx,
+                LogicalPlan::Insert {
+                    table_name: "t".into(),
+                    columns: vec![],
+                    values_list: vec![vec![id.into(), name.into(), status.into()]],
+                },
+            ).unwrap();
+        };
+
+        insert("1", "alice", "active");
+        insert("2", "bob", "inactive");
+        insert("3", "charlie", "active");
+        insert("4", "dave", "banned");
+
+        let read = |sql: &str| {
+            let mut stmts = nodus_sql::parse_sql(sql).unwrap();
+            let plan = plan_statement(&stmts.remove(0), &[]).unwrap();
+            exec.execute_logical(&ctx, plan).unwrap().rows.len()
+        };
+
+        assert_eq!(read("SELECT * FROM t WHERE status = 'active' OR status = 'banned'"), 3);
+        assert_eq!(read("SELECT * FROM t WHERE status IN ('active', 'banned')"), 3);
+        assert_eq!(read("SELECT * FROM t WHERE name LIKE 'a%'"), 1);
+        assert_eq!(read("SELECT * FROM t WHERE name LIKE '%e'"), 3); // alice, charlie, dave
+        assert_eq!(read("SELECT * FROM t WHERE NOT status = 'active'"), 2);
     }
 }

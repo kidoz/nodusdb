@@ -2227,6 +2227,7 @@ dependencies = [
  "nodus_storage_lsm",
  "nodus_storage_mem",
  "nodus_txn",
+ "regex",
  "serde",
  "serde_json",
  "sqlparser",
