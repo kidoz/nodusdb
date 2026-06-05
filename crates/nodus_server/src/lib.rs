@@ -152,21 +152,22 @@ pub async fn run_server_with_config(
         None => nodus_executor::MemExecutor::shared(audit_sink),
     };
 
-    let admin = catalog
-        .create_role(CreateRoleRequest {
-            name: "nodus".into(),
-            principal_type: PrincipalType::User,
-            database_id: None,
-        })
-        .map_err(|e| anyhow::anyhow!("seed admin: {e}"))?;
+    let admin = match catalog.create_role(CreateRoleRequest {
+        name: "nodus".into(),
+        principal_type: PrincipalType::User,
+        database_id: None,
+    }) {
+        Ok(desc) => desc,
+        Err(e) if e.to_string().contains("already exists") => catalog.get_principal_by_name("nodus")?,
+        Err(e) => anyhow::bail!("seed admin: {e}"),
+    };
+    
     // Bootstrap superuser: ALL on System bypasses per-resource grant checks.
-    catalog
-        .grant_privilege(GrantPrivilegeRequest {
-            principal_id: admin.id,
-            resource: ResourceRef::System,
-            privilege: "ALL".into(),
-        })
-        .map_err(|e| anyhow::anyhow!("seed admin grant: {e}"))?;
+    let _ = catalog.grant_privilege(GrantPrivilegeRequest {
+        principal_id: admin.id,
+        resource: ResourceRef::System,
+        privilege: "ALL".into(),
+    });
     // A read-only authz engine over the same catalog for the admin explain API.
     let authz = Arc::new(nodus_authz::DefaultAuthzEngine::new(catalog.clone()));
     let authenticator = Arc::new(PasswordAuthenticator::new(catalog.clone()));

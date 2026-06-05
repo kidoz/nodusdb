@@ -402,6 +402,7 @@ pub trait CatalogReader: Send + Sync {
     fn resolve_object(&self, request: ResolveObjectRequest) -> Result<ObjectDescriptor>;
     fn get_table(&self, database: &str, schema: &str, table: &str) -> Result<TableDescriptor>;
     fn list_tables(&self, database: &str, schema: &str) -> Result<Vec<TableDescriptor>>;
+    fn get_principal_by_name(&self, name: &str) -> Result<PrincipalDescriptor>;
     fn get_cluster_version(&self) -> Result<ClusterVersion>;
     fn get_grants_for_resource(&self, resource: ResourceRef) -> Result<Vec<GrantDescriptor>>;
     fn get_effective_roles(&self, principal: PrincipalId) -> Result<Vec<RoleId>>;
@@ -617,6 +618,14 @@ impl CatalogReader for MemoryCatalog {
             }
         }
         Ok(res)
+    }
+
+    fn get_principal_by_name(&self, name: &str) -> Result<PrincipalDescriptor> {
+        let guard = self.principals.read().unwrap();
+        guard
+            .get(name)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Principal {} not found", name))
     }
 
     fn get_cluster_version(&self) -> Result<ClusterVersion> {
