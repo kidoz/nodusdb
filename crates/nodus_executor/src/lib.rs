@@ -890,6 +890,67 @@ impl MemExecutor {
         Ok(rows)
     }
 
+    /// Scans a secondary index to quickly look up primary keys, then fetches those rows.
+    fn index_scan(&self, index_id: nodus_catalog::IndexId, index_val: &Value, table_id: TableId, session: &str) -> Result<Vec<Vec<Value>>> {
+        let read_ts = self.read_ts(session);
+        let prefix = format!("i:{}:{}:", index_id, render(index_val));
+        let start = Bytes::from(prefix.clone());
+        let end_prefix = format!("i:{}:{};", index_id, render(index_val));
+        let end = Bytes::from(end_prefix);
+        
+        let mut rows = Vec::new();
+        for pair in self.kv.scan(KeyRange { start, end }, read_ts)? {
+            let pair = pair?;
+            let key_str = String::from_utf8_lossy(&pair.key);
+            if let Some(pk) = key_str.strip_prefix(&prefix) {
+                // Fetch the actual row
+                let row_key = Bytes::from(format!("{}:{}", table_id, pk));
+                if let Ok(Some(row_val)) = self.kv.get(&row_key, read_ts) {
+                    rows.push(serde_json::from_slice::<Vec<Value>>(&row_val)?);
+                }
+            }
+        }
+        Ok(rows)
+    }
+
+    fn check_unique_constraints(
+        &self,
+        session: &str,
+        tbl: &nodus_catalog::TableDescriptor,
+        new_row: &[Value],
+        skip_pk: Option<&str>,
+    ) -> Result<()> {
+        let mut unique_col_indices = Vec::new();
+        for idx in &tbl.indexes {
+            if idx.unique {
+                for kcol in &idx.key_columns {
+                    if let Some(pos) = tbl.columns.iter().position(|c| c.id == kcol.column_id) {
+                        unique_col_indices.push((idx.name.clone(), pos));
+                    }
+                }
+            }
+        }
+
+        if unique_col_indices.is_empty() {
+            return Ok(());
+        }
+
+        for existing in self.scan_rows(tbl.id, session)? {
+            let pk = existing.first().map(render).unwrap_or_default();
+            if Some(pk.as_str()) == skip_pk {
+                continue;
+            }
+            for (idx_name, col_idx) in &unique_col_indices {
+                let existing_val = existing.get(*col_idx).unwrap_or(&Value::Null);
+                let new_val = new_row.get(*col_idx).unwrap_or(&Value::Null);
+                if existing_val != &Value::Null && existing_val == new_val {
+                    anyhow::bail!("Unique constraint violation on index '{}'", idx_name);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Writes a row value at `key`, using the session's txn or an auto-commit txn.
     fn write_row(&self, session: &str, key: String, value: String) -> Result<()> {
         let (txn_id, auto) = self.txn_for(session)?;
@@ -913,6 +974,20 @@ impl MemExecutor {
             self.kv.commit(txn_id, commit_ts)?;
         }
         Ok(())
+    }
+
+    fn index_key(index_id: nodus_catalog::IndexId, index_val: &Value, pk: &str) -> String {
+        format!("i:{}:{}:{}", index_id, render(index_val), pk)
+    }
+
+    fn write_index_entry(&self, session: &str, index_id: nodus_catalog::IndexId, index_val: &Value, pk: &str) -> Result<()> {
+        let key = Self::index_key(index_id, index_val, pk);
+        self.write_row(session, key, "".to_string())
+    }
+
+    fn delete_index_entry(&self, session: &str, index_id: nodus_catalog::IndexId, index_val: &Value, pk: &str) -> Result<()> {
+        let key = Self::index_key(index_id, index_val, pk);
+        self.delete_row(session, key)
     }
 
     /// Evaluates predicates against a joined or single row.
@@ -1208,11 +1283,25 @@ returning,
                         }
                         row.push(val);
                     }
+                    
+                    self.check_unique_constraints(&ctx.session_id, &tbl, &row, None)?;
+
                     // Primary key = first column's rendered value.
                     let pk = row.first().map(render).unwrap_or_default();
                     let key = format!("{}:{}", tbl.id, pk);
                     let encoded = serde_json::to_string(&row)?;
                     self.write_row(&ctx.session_id, key, encoded)?;
+                    
+                    // Maintain secondary indexes.
+                    for idx in &tbl.indexes {
+                        for kcol in &idx.key_columns {
+                            if let Some(pos) = tbl.columns.iter().position(|c| c.id == kcol.column_id) {
+                                let index_val = row.get(pos).unwrap_or(&Value::Null);
+                                self.write_index_entry(&ctx.session_id, idx.id, index_val, &pk)?;
+                            }
+                        }
+                    }
+
                     inserted_count += 1;
                     if !returning.is_empty() {
                         returning_rows.push(row);
@@ -1259,7 +1348,26 @@ returning,
                     .iter()
                     .map(|c| format!("{}.{}", table_name, c.name))
                     .collect();
-                let mut stored_rows = self.scan_rows(tbl.id, &ctx.session_id)?;
+                
+                let mut stored_rows = None;
+                if let Some(FilterExpr::Predicate(Predicate { left, op: CompareOp::Eq, right })) = filter.as_ref() {
+                    let col_name = left.split('.').last().unwrap_or(left);
+                    if let Some(col) = tbl.columns.iter().find(|c| c.name == *col_name) {
+                        for idx in &tbl.indexes {
+                            if idx.key_columns.iter().any(|kc| kc.column_id == col.id) {
+                                let val = self.eval_operand(&[], &[], &[], right, &col.data_type);
+                                if let Ok(rows) = self.index_scan(idx.id, &val, tbl.id, &ctx.session_id) {
+                                    stored_rows = Some(rows);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                let mut stored_rows = match stored_rows {
+                    Some(rows) => rows,
+                    None => self.scan_rows(tbl.id, &ctx.session_id)?,
+                };
 
                 for join in &joins {
                     let j_tbl =
@@ -1573,8 +1681,10 @@ returning,
                     if !self.row_matches(ctx, &row, &tbl.columns, filter.as_ref()) {
                         continue;
                     }
+                    let old_row = row.clone();
+                    let old_pk_str = old_row.first().map(render).unwrap_or_default();
                     let old_key =
-                        format!("{}:{}", tbl.id, row.first().map(render).unwrap_or_default());
+                        format!("{}:{}", tbl.id, old_pk_str);
                     for (col, val) in &assignments {
                         if let Some(idx) = col_names.iter().position(|c| c == col) {
                             let coerced = match val {
@@ -1587,8 +1697,12 @@ returning,
                             row[idx] = coerced;
                         }
                     }
+                    
+                    let pk_str = row.first().map(render).unwrap_or_default();
+                    self.check_unique_constraints(&ctx.session_id, &tbl, &row, Some(&pk_str))?;
+
                     let new_key =
-                        format!("{}:{}", tbl.id, row.first().map(render).unwrap_or_default());
+                        format!("{}:{}", tbl.id, pk_str);
                     self.write_row(
                         &ctx.session_id,
                         new_key.clone(),
@@ -1597,6 +1711,21 @@ returning,
                     if new_key != old_key {
                         self.delete_row(&ctx.session_id, old_key)?;
                     }
+
+                    // Maintain secondary indexes.
+                    for idx in &tbl.indexes {
+                        for kcol in &idx.key_columns {
+                            if let Some(pos) = tbl.columns.iter().position(|c| c.id == kcol.column_id) {
+                                let old_index_val = old_row.get(pos).unwrap_or(&Value::Null);
+                                let new_index_val = row.get(pos).unwrap_or(&Value::Null);
+                                if old_index_val != new_index_val || old_pk_str != pk_str {
+                                    self.delete_index_entry(&ctx.session_id, idx.id, old_index_val, &old_pk_str)?;
+                                    self.write_index_entry(&ctx.session_id, idx.id, new_index_val, &pk_str)?;
+                                }
+                            }
+                        }
+                    }
+
                     updated += 1;
                     if !returning.is_empty() {
                         returning_rows.push(row);
@@ -1633,8 +1762,20 @@ returning,
                     if !self.row_matches(ctx, &row, &tbl.columns, filter.as_ref()) {
                         continue;
                     }
-                    let key = format!("{}:{}", tbl.id, row.first().map(render).unwrap_or_default());
+                    let pk_str = row.first().map(render).unwrap_or_default();
+                    let key = format!("{}:{}", tbl.id, pk_str);
                     self.delete_row(&ctx.session_id, key)?;
+                    
+                    // Maintain secondary indexes.
+                    for idx in &tbl.indexes {
+                        for kcol in &idx.key_columns {
+                            if let Some(pos) = tbl.columns.iter().position(|c| c.id == kcol.column_id) {
+                                let index_val = row.get(pos).unwrap_or(&Value::Null);
+                                self.delete_index_entry(&ctx.session_id, idx.id, index_val, &pk_str)?;
+                            }
+                        }
+                    }
+
                     deleted += 1;
                     if !returning.is_empty() {
                         returning_rows.push(row);
@@ -1676,9 +1817,37 @@ returning,
                             data_type,
                             nullable,
                         };
+                        
+                        // Migrate existing data to include the new column (as NULL)
+                        for mut row in self.scan_rows(tbl.id, &ctx.session_id)? {
+                            let pk_str = row.first().map(render).unwrap_or_default();
+                            let key = format!("{}:{}", tbl.id, pk_str);
+                            row.push(Value::Null); // Append null for the new column
+                            self.write_row(&ctx.session_id, key, serde_json::to_string(&row)?)?;
+                        }
+
                         nodus_catalog::TableDescriptorChange::AddColumn { table_id: tbl.id, column }
                     }
                     AlterTableOp::DropColumn { name } => {
+                        if let Some(col_idx) = tbl.columns.iter().position(|c| c.name == name) {
+                            // Cannot drop primary key (assuming first column is PK for now)
+                            if col_idx == 0 {
+                                anyhow::bail!("Cannot drop primary key column");
+                            }
+                            
+                            // Migrate existing data to remove the column
+                            for mut row in self.scan_rows(tbl.id, &ctx.session_id)? {
+                                let pk_str = row.first().map(render).unwrap_or_default();
+                                let key = format!("{}:{}", tbl.id, pk_str);
+                                if col_idx < row.len() {
+                                    row.remove(col_idx);
+                                }
+                                self.write_row(&ctx.session_id, key, serde_json::to_string(&row)?)?;
+                            }
+                        } else {
+                            anyhow::bail!("Column {} not found", name);
+                        }
+
                         nodus_catalog::TableDescriptorChange::DropColumn { table_id: tbl.id, column_name: name }
                     }
                     AlterTableOp::RenameTable { new_name } => {
@@ -1725,79 +1894,20 @@ returning,
                     expressions: vec![],
                 };
 
-                let change = nodus_catalog::TableDescriptorChange::AddIndex { table_id: tbl.id, index };
+                let change = nodus_catalog::TableDescriptorChange::AddIndex { table_id: tbl.id, index: index.clone() };
                 self.catalog_writer.update_table_descriptor(change)?;
-                Ok(QueryOutput::tag("CREATE INDEX"))
-            }
-            LogicalPlan::AlterTable { table_name, operation } => {
-                let tbl = self
-                    .catalog_reader
-                    .get_table("default", "public", &table_name)?;
-                self.authorize(ctx, Action::CreateTable, ResourceRef::Table(tbl.id))?;
-
-                let change = match operation {
-                    AlterTableOp::AddColumn { name, data_type, nullable } => {
-                        let column = ColumnDescriptor {
-                            id: nodus_catalog::ColumnId::new(),
-                            name,
-                            version: 1,
-                            created_at: Utc::now(),
-                            updated_at: Utc::now(),
-                            state: DescriptorState::Public,
-                            data_type,
-                            nullable,
-                        };
-                        nodus_catalog::TableDescriptorChange::AddColumn { table_id: tbl.id, column }
-                    }
-                    AlterTableOp::DropColumn { name } => {
-                        nodus_catalog::TableDescriptorChange::DropColumn { table_id: tbl.id, column_name: name }
-                    }
-                    AlterTableOp::RenameTable { new_name } => {
-                        nodus_catalog::TableDescriptorChange::RenameTable { table_id: tbl.id, new_name }
-                    }
-                };
-                self.catalog_writer.update_table_descriptor(change)?;
-                Ok(QueryOutput::tag("ALTER TABLE"))
-            }
-            LogicalPlan::CreateIndex { name, table_name, columns, unique } => {
-                let tbl = self
-                    .catalog_reader
-                    .get_table("default", "public", &table_name)?;
-                self.authorize(ctx, Action::CreateTable, ResourceRef::Table(tbl.id))?;
                 
-                let mut index_cols = Vec::new();
-                for c in &columns {
-                    if let Some(col) = tbl.columns.iter().find(|tc| tc.name == *c) {
-                        index_cols.push(nodus_catalog::IndexColumn {
-                            column_id: col.id,
-                            descending: false,
-                        });
-                    } else {
-                        anyhow::bail!("Column not found for index: {}", c);
+                // Backfill existing rows into the new index
+                for row in self.scan_rows(tbl.id, &ctx.session_id)? {
+                    let pk_str = row.first().map(render).unwrap_or_default();
+                    for kcol in &index.key_columns {
+                        if let Some(pos) = tbl.columns.iter().position(|c| c.id == kcol.column_id) {
+                            let index_val = row.get(pos).unwrap_or(&Value::Null);
+                            self.write_index_entry(&ctx.session_id, index.id, index_val, &pk_str)?;
+                        }
                     }
                 }
                 
-                let idx_type = if unique { nodus_catalog::IndexType::Unique } else { nodus_catalog::IndexType::LocalSecondary };
-
-                let index = nodus_catalog::IndexDescriptor {
-                    id: nodus_catalog::IndexId::new(),
-                    name,
-                    version: 1,
-                    created_at: Utc::now(),
-                    updated_at: Utc::now(),
-                    state: DescriptorState::Public,
-                    index_type: idx_type,
-                    index_state: nodus_catalog::IndexState::Ready,
-                    key_columns: index_cols,
-                    include_columns: vec![],
-                    unique,
-                    global: false,
-                    predicate: None,
-                    expressions: vec![],
-                };
-
-                let change = nodus_catalog::TableDescriptorChange::AddIndex { table_id: tbl.id, index };
-                self.catalog_writer.update_table_descriptor(change)?;
                 Ok(QueryOutput::tag("CREATE INDEX"))
             }
             LogicalPlan::Begin => {
@@ -2915,5 +3025,338 @@ mod phase3_tests {
 
         assert_eq!(out.rows.len(), 1);
         assert_eq!(out.rows[0].columns[0], "Bob");
+    }
+
+    #[test]
+    fn test_unique_constraints() {
+        use super::*;
+        let (exec, cat) = MemExecutor::shared(Arc::new(MemoryAuditSink::new()));
+        let admin = cat.create_role(nodus_catalog::CreateRoleRequest {
+            name: "admin".into(),
+            principal_type: nodus_catalog::PrincipalType::User,
+            database_id: None,
+        }).unwrap();
+        cat.grant_privilege(nodus_catalog::GrantPrivilegeRequest {
+            principal_id: admin.id,
+            resource: nodus_catalog::ResourceRef::System,
+            privilege: "ALL".into(),
+        }).unwrap();
+        let ctx = test_ctx(admin.id);
+
+        exec.execute_logical(&ctx, LogicalPlan::CreateTable {
+            name: "users".into(),
+            columns: vec![
+                ColumnDef { name: "id".into(), data_type: "INT".into(), nullable: false, unique: true },
+                ColumnDef { name: "email".into(), data_type: "TEXT".into(), nullable: false, unique: true },
+            ],
+        }).unwrap();
+
+        exec.execute_logical(&ctx, LogicalPlan::Insert {
+            table_name: "users".into(),
+            columns: vec![],
+            values_list: vec![
+                vec![Value::Int(1), Value::Text("a@a.com".into())],
+                vec![Value::Int(2), Value::Text("b@b.com".into())],
+            ],
+            returning: vec![],
+        }).unwrap();
+
+        let res = exec.execute_logical(&ctx, LogicalPlan::Insert {
+            table_name: "users".into(),
+            columns: vec![],
+            values_list: vec![vec![Value::Int(1), Value::Text("c@c.com".into())]],
+            returning: vec![],
+        });
+        assert!(res.is_err());
+        assert!(res.unwrap_err().to_string().contains("Unique constraint violation"));
+
+        let res2 = exec.execute_logical(&ctx, LogicalPlan::Insert {
+            table_name: "users".into(),
+            columns: vec![],
+            values_list: vec![vec![Value::Int(3), Value::Text("b@b.com".into())]],
+            returning: vec![],
+        });
+        assert!(res2.is_err());
+
+        let res3 = exec.execute_logical(&ctx, LogicalPlan::Update {
+            table_name: "users".into(),
+            assignments: vec![("email".into(), Value::Text("a@a.com".into()))],
+            filter: Some(FilterExpr::Predicate(Predicate {
+                left: "id".into(),
+                op: CompareOp::Eq,
+                right: Operand::Literal(Value::Int(2)),
+            })),
+            returning: vec![],
+        });
+        assert!(res3.is_err());
+
+        let res4 = exec.execute_logical(&ctx, LogicalPlan::Update {
+            table_name: "users".into(),
+            assignments: vec![("email".into(), Value::Text("b@b.com".into()))],
+            filter: Some(FilterExpr::Predicate(Predicate {
+                left: "id".into(),
+                op: CompareOp::Eq,
+                right: Operand::Literal(Value::Int(2)),
+            })),
+            returning: vec![],
+        });
+        assert!(res4.is_ok());
+    }
+
+    #[test]
+    fn test_secondary_indexing() {
+        use super::*;
+        let (exec, cat) = MemExecutor::shared(Arc::new(MemoryAuditSink::new()));
+        let admin = cat.create_role(nodus_catalog::CreateRoleRequest {
+            name: "admin".into(),
+            principal_type: nodus_catalog::PrincipalType::User,
+            database_id: None,
+        }).unwrap();
+        cat.grant_privilege(nodus_catalog::GrantPrivilegeRequest {
+            principal_id: admin.id,
+            resource: nodus_catalog::ResourceRef::System,
+            privilege: "ALL".into(),
+        }).unwrap();
+        let ctx = test_ctx(admin.id);
+
+        exec.execute_logical(&ctx, LogicalPlan::CreateTable {
+            name: "products".into(),
+            columns: vec![
+                ColumnDef { name: "id".into(), data_type: "INT".into(), nullable: false, unique: true },
+                ColumnDef { name: "category".into(), data_type: "TEXT".into(), nullable: false, unique: false },
+            ],
+        }).unwrap();
+
+        // 1. Insert rows before indexing
+        exec.execute_logical(&ctx, LogicalPlan::Insert {
+            table_name: "products".into(),
+            columns: vec![],
+            values_list: vec![
+                vec![Value::Int(1), Value::Text("A".into())],
+                vec![Value::Int(2), Value::Text("B".into())],
+                vec![Value::Int(3), Value::Text("A".into())],
+            ],
+            returning: vec![],
+        }).unwrap();
+
+        // 2. Create index on category (should backfill)
+        exec.execute_logical(&ctx, LogicalPlan::CreateIndex {
+            name: "idx_cat".into(),
+            table_name: "products".into(),
+            columns: vec!["category".into()],
+            unique: false,
+        }).unwrap();
+
+        // 3. Insert rows after indexing (should synchronously maintain index)
+        exec.execute_logical(&ctx, LogicalPlan::Insert {
+            table_name: "products".into(),
+            columns: vec![],
+            values_list: vec![
+                vec![Value::Int(4), Value::Text("C".into())],
+                vec![Value::Int(5), Value::Text("A".into())],
+            ],
+            returning: vec![],
+        }).unwrap();
+
+        // 4. Query using index
+        let out = exec.execute_logical(&ctx, LogicalPlan::Select {
+            table_name: "products".into(),
+            joins: vec![],
+            projection: vec![ProjectionItem::Column("id".into())],
+            group_by: vec![],
+            filter: Some(FilterExpr::Predicate(Predicate {
+                left: "category".into(),
+                op: CompareOp::Eq,
+                right: Operand::Literal(Value::Text("A".into())),
+            })),
+            order_by: Some(("id".into(), true)),
+            limit: None,
+            offset: None,
+            distinct: false,
+        }).unwrap();
+
+        assert_eq!(out.rows.len(), 3);
+        assert_eq!(out.rows[0].columns[0], "1");
+        assert_eq!(out.rows[1].columns[0], "3");
+        assert_eq!(out.rows[2].columns[0], "5");
+
+        // 5. Update row (change category from A to B)
+        exec.execute_logical(&ctx, LogicalPlan::Update {
+            table_name: "products".into(),
+            assignments: vec![("category".into(), Value::Text("B".into()))],
+            filter: Some(FilterExpr::Predicate(Predicate {
+                left: "id".into(),
+                op: CompareOp::Eq,
+                right: Operand::Literal(Value::Int(1)),
+            })),
+            returning: vec![],
+        }).unwrap();
+
+        // Query category A again
+        let out_a = exec.execute_logical(&ctx, LogicalPlan::Select {
+            table_name: "products".into(),
+            joins: vec![],
+            projection: vec![ProjectionItem::Column("id".into())],
+            group_by: vec![],
+            filter: Some(FilterExpr::Predicate(Predicate {
+                left: "category".into(),
+                op: CompareOp::Eq,
+                right: Operand::Literal(Value::Text("A".into())),
+            })),
+            order_by: Some(("id".into(), true)),
+            limit: None,
+            offset: None,
+            distinct: false,
+        }).unwrap();
+        assert_eq!(out_a.rows.len(), 2); // 3 and 5
+
+        // Query category B
+        let out_b = exec.execute_logical(&ctx, LogicalPlan::Select {
+            table_name: "products".into(),
+            joins: vec![],
+            projection: vec![ProjectionItem::Column("id".into())],
+            group_by: vec![],
+            filter: Some(FilterExpr::Predicate(Predicate {
+                left: "category".into(),
+                op: CompareOp::Eq,
+                right: Operand::Literal(Value::Text("B".into())),
+            })),
+            order_by: Some(("id".into(), true)),
+            limit: None,
+            offset: None,
+            distinct: false,
+        }).unwrap();
+        assert_eq!(out_b.rows.len(), 2); // 1 and 2
+
+        // 6. Delete row
+        exec.execute_logical(&ctx, LogicalPlan::Delete {
+            table_name: "products".into(),
+            filter: Some(FilterExpr::Predicate(Predicate {
+                left: "id".into(),
+                op: CompareOp::Eq,
+                right: Operand::Literal(Value::Int(2)),
+            })),
+            returning: vec![],
+        }).unwrap();
+
+        // Query category B again
+        let out_b2 = exec.execute_logical(&ctx, LogicalPlan::Select {
+            table_name: "products".into(),
+            joins: vec![],
+            projection: vec![ProjectionItem::Column("id".into())],
+            group_by: vec![],
+            filter: Some(FilterExpr::Predicate(Predicate {
+                left: "category".into(),
+                op: CompareOp::Eq,
+                right: Operand::Literal(Value::Text("B".into())),
+            })),
+            order_by: Some(("id".into(), true)),
+            limit: None,
+            offset: None,
+            distinct: false,
+        }).unwrap();
+        assert_eq!(out_b2.rows.len(), 1); // Only 1 should be left
+        assert_eq!(out_b2.rows[0].columns[0], "1");
+    }
+
+    #[test]
+    fn test_alter_table_migrations() {
+        use super::*;
+        let (exec, cat) = MemExecutor::shared(Arc::new(MemoryAuditSink::new()));
+        let admin = cat.create_role(nodus_catalog::CreateRoleRequest {
+            name: "admin".into(),
+            principal_type: nodus_catalog::PrincipalType::User,
+            database_id: None,
+        }).unwrap();
+        cat.grant_privilege(nodus_catalog::GrantPrivilegeRequest {
+            principal_id: admin.id,
+            resource: nodus_catalog::ResourceRef::System,
+            privilege: "ALL".into(),
+        }).unwrap();
+        let ctx = test_ctx(admin.id);
+
+        exec.execute_logical(&ctx, LogicalPlan::CreateTable {
+            name: "users".into(),
+            columns: vec![
+                ColumnDef { name: "id".into(), data_type: "INT".into(), nullable: false, unique: true },
+                ColumnDef { name: "name".into(), data_type: "TEXT".into(), nullable: false, unique: false },
+            ],
+        }).unwrap();
+
+        exec.execute_logical(&ctx, LogicalPlan::Insert {
+            table_name: "users".into(),
+            columns: vec![],
+            values_list: vec![
+                vec![Value::Int(1), Value::Text("Alice".into())],
+            ],
+            returning: vec![],
+        }).unwrap();
+
+        // Add column
+        exec.execute_logical(&ctx, LogicalPlan::AlterTable {
+            table_name: "users".into(),
+            operation: AlterTableOp::AddColumn {
+                name: "age".into(),
+                data_type: "INT".into(),
+                nullable: true,
+            },
+        }).unwrap();
+
+        // Read to ensure column exists and is NULL
+        let out1 = exec.execute_logical(&ctx, LogicalPlan::Select {
+            table_name: "users".into(),
+            joins: vec![],
+            projection: vec![],
+            group_by: vec![],
+            filter: None,
+            order_by: None,
+            limit: None,
+            offset: None,
+            distinct: false,
+        }).unwrap();
+        assert_eq!(out1.rows[0].columns.len(), 3);
+        assert_eq!(out1.rows[0].columns[2], "");
+
+        // Update the new column
+        exec.execute_logical(&ctx, LogicalPlan::Update {
+            table_name: "users".into(),
+            assignments: vec![("age".into(), Value::Int(30))],
+            filter: None,
+            returning: vec![],
+        }).unwrap();
+
+        let out2 = exec.execute_logical(&ctx, LogicalPlan::Select {
+            table_name: "users".into(),
+            joins: vec![],
+            projection: vec![],
+            group_by: vec![],
+            filter: None,
+            order_by: None,
+            limit: None,
+            offset: None,
+            distinct: false,
+        }).unwrap();
+        assert_eq!(out2.rows[0].columns[2], "30");
+
+        // Drop the column
+        exec.execute_logical(&ctx, LogicalPlan::AlterTable {
+            table_name: "users".into(),
+            operation: AlterTableOp::DropColumn {
+                name: "age".into(),
+            },
+        }).unwrap();
+
+        let out3 = exec.execute_logical(&ctx, LogicalPlan::Select {
+            table_name: "users".into(),
+            joins: vec![],
+            projection: vec![],
+            group_by: vec![],
+            filter: None,
+            order_by: None,
+            limit: None,
+            offset: None,
+            distinct: false,
+        }).unwrap();
+        assert_eq!(out3.rows[0].columns.len(), 2);
     }
 }
