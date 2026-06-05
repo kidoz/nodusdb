@@ -15,7 +15,7 @@ pub struct LsmKvEngine {
     memtable: RwLock<BTreeMap<Bytes, VersionChain>>,
     intents: RwLock<HashMap<TxnId, Vec<Bytes>>>,
     sstables: RwLock<Vec<Sstable>>,
-    wal: Option<Arc<dyn WalEngine>>,
+    wal: RwLock<Option<Arc<dyn WalEngine>>>,
     next_file_id: std::sync::atomic::AtomicU64,
     _wal_key: Option<[u8; 32]>,
 }
@@ -27,7 +27,7 @@ impl LsmKvEngine {
             memtable: RwLock::new(BTreeMap::new()),
             intents: RwLock::new(HashMap::new()),
             sstables: RwLock::new(Vec::new()),
-            wal: None,
+            wal: RwLock::new(None),
             next_file_id: std::sync::atomic::AtomicU64::new(1),
             _wal_key: None,
         }
@@ -65,7 +65,7 @@ impl LsmKvEngine {
             memtable: RwLock::new(BTreeMap::new()),
             intents: RwLock::new(HashMap::new()),
             sstables: RwLock::new(sstables),
-            wal: Some(wal),
+            wal: RwLock::new(Some(wal)),
             next_file_id: std::sync::atomic::AtomicU64::new(max_id + 2),
             _wal_key: key,
         };
@@ -80,15 +80,15 @@ impl LsmKvEngine {
             None => return Ok(()), // no-op for in-memory only
         };
 
-        let file_id = self.next_file_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let sst_path = dir.join(format!("{}.sst", file_id));
-        let _new_wal_path = dir.join(format!("{}.log", file_id + 1));
-
         let mut mem_guard = self.memtable.write().unwrap();
         
         if mem_guard.is_empty() {
             return Ok(());
         }
+
+        let file_id = self.next_file_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let sst_path = dir.join(format!("{}.sst", file_id));
+        let new_wal_path = dir.join(format!("{}.log", file_id + 1));
 
         // 1. Flush memtable to SSTable
         let sst = Sstable::build(&sst_path, &mem_guard)?;
@@ -100,11 +100,17 @@ impl LsmKvEngine {
         // 3. Clear memtable
         mem_guard.clear();
         
+        // 4. Rotate WAL
+        let new_wal = Arc::new(FileWalEngine::with_encryption(&new_wal_path, self._wal_key)?);
+        let mut wal_guard = self.wal.write().unwrap();
+        *wal_guard = Some(new_wal);
+        
         Ok(())
     }
 
     fn recover(&self) -> Result<()> {
-        if let Some(wal) = &self.wal {
+        let wal_guard = self.wal.read().unwrap();
+        if let Some(wal) = wal_guard.as_ref() {
             let records = wal.recover()?;
             let mut mem_guard = self.memtable.write().unwrap();
             let mut int_guard = self.intents.write().unwrap();
@@ -224,7 +230,8 @@ impl KvEngine for LsmKvEngine {
     }
 
     fn write_intent(&self, txn_id: TxnId, key: Bytes, value: Bytes) -> Result<()> {
-        if let Some(wal) = &self.wal {
+        let wal_guard = self.wal.read().unwrap();
+        if let Some(wal) = wal_guard.as_ref() {
             wal.append(WalRecord::V1(WalRecordV1::WriteIntent {
                 txn_id,
                 key: key.to_vec(),
@@ -245,7 +252,8 @@ impl KvEngine for LsmKvEngine {
     }
 
     fn delete_intent(&self, txn_id: TxnId, key: Bytes) -> Result<()> {
-        if let Some(wal) = &self.wal {
+        let wal_guard = self.wal.read().unwrap();
+        if let Some(wal) = wal_guard.as_ref() {
             wal.append(WalRecord::V1(WalRecordV1::DeleteIntent {
                 txn_id,
                 key: key.to_vec(),
@@ -265,7 +273,8 @@ impl KvEngine for LsmKvEngine {
     }
 
     fn commit(&self, txn_id: TxnId, commit_ts: Timestamp) -> Result<()> {
-        if let Some(wal) = &self.wal {
+        let wal_guard = self.wal.read().unwrap();
+        if let Some(wal) = wal_guard.as_ref() {
             wal.append(WalRecord::V1(WalRecordV1::CommitTxn { txn_id, commit_ts }))?;
             wal.sync()?;
         }
@@ -284,7 +293,8 @@ impl KvEngine for LsmKvEngine {
     }
 
     fn abort(&self, txn_id: TxnId) -> Result<()> {
-        if let Some(wal) = &self.wal {
+        let wal_guard = self.wal.read().unwrap();
+        if let Some(wal) = wal_guard.as_ref() {
             wal.append(WalRecord::V1(WalRecordV1::AbortTxn { txn_id }))?;
             wal.sync()?;
         }
