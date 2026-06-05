@@ -14,6 +14,14 @@ data:
     [backup]
     repository_uri = "{{ .Values.config.backupRepositoryUri }}"
 
+    [admin]
+    {{- if .Values.config.adminToken }}
+    token = "{{ .Values.config.adminToken }}"
+    {{- end }}
+    {{- if .Values.config.adminPassword }}
+    password = "{{ .Values.config.adminPassword }}"
+    {{- end }}
+
     [observability]
     metrics_enabled = true
     log_level = "{{ .Values.config.logLevel }}"

@@ -19,7 +19,9 @@ pub struct TestServer {
 
 impl TestServer {
     pub async fn start() -> anyhow::Result<Self> {
-        Self::start_with_config(nodus_config::NodusConfig::default()).await
+        let mut config = nodus_config::NodusConfig::default();
+        config.admin.password = Some("nodus".into());
+        Self::start_with_config(config).await
     }
 
     pub async fn start_with_config(config: nodus_config::NodusConfig) -> anyhow::Result<Self> {

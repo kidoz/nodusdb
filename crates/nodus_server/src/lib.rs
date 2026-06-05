@@ -171,8 +171,16 @@ pub async fn run_server_with_config(
     // A read-only authz engine over the same catalog for the admin explain API.
     let authz = Arc::new(nodus_authz::DefaultAuthzEngine::new(catalog.clone()));
     let authenticator = Arc::new(PasswordAuthenticator::new(catalog.clone()));
-    // Default development credentials; override before production use.
-    authenticator.set_password("nodus", admin.id, "nodus");
+
+    let admin_password = config.admin.password.clone().unwrap_or_else(|| {
+        let generated = uuid::Uuid::new_v4().to_string();
+        tracing::warn!(
+            "No admin.password configured; generated random password for 'nodus' superuser: {}",
+            generated
+        );
+        generated
+    });
+    authenticator.set_password("nodus", admin.id, &admin_password);
 
     let tls_acceptor = load_tls_acceptor(&config.tls)?;
 

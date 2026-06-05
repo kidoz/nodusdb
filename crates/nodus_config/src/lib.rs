@@ -42,7 +42,7 @@ pub struct StorageConfig {
 
 impl Default for StorageConfig {
     fn default() -> Self {
-        Self { 
+        Self {
             data_dir: None,
             encryption_key: None,
         }
@@ -55,6 +55,8 @@ pub struct AdminConfig {
     /// Bearer token required on `/api/v1/*` admin endpoints. When unset (default),
     /// the admin API is unauthenticated — only safe bound to localhost.
     pub token: Option<String>,
+    /// Password for the default 'nodus' superuser. If unset, a random password is generated on startup.
+    pub password: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]

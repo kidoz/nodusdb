@@ -15,6 +15,12 @@ config:
   logLevel: info
   maxConnections: 100
   backupRepositoryUri: "file:///var/lib/nodus/backups"
+  # Authentication token for admin APIs (e.g. /api/v1/backups, /api/v1/shards, etc.)
+  # If left empty, admin endpoints will be exposed unauthenticated.
+  adminToken: ""
+  # Password for the default 'nodus' superuser over pgwire.
+  # If left empty, a random password will be generated.
+  adminPassword: ""
 
 persistence:
   enabled: true

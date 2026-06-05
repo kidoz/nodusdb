@@ -389,6 +389,7 @@ async fn durable_audit_persists_to_configured_file() {
     let path = std::env::temp_dir().join(format!("nodus_audit_it_{}.jsonl", std::process::id()));
     let _ = std::fs::remove_file(&path);
     let mut config = nodus_config::NodusConfig::default();
+    config.admin.password = Some("nodus".into());
     config.audit.file_path = Some(path.to_string_lossy().to_string());
 
     let server = TestServer::start_with_config(config)
