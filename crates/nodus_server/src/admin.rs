@@ -12,7 +12,7 @@ use bytes::Bytes;
 use nodus_audit::{AuditEvent, AuditQuery, AuditQueryable};
 use nodus_authz::{Action, AuthzContext, AuthzEngine, AuthzExplanation, AuthzRequest};
 use nodus_backup::{BackupObject, BackupOrchestrator};
-use nodus_catalog::{CatalogReader, PrincipalId, ResourceRef, ShardId, TableId};
+use nodus_catalog::{CatalogReader, CatalogWriter, PrincipalId, ResourceRef, ShardId, TableId};
 use nodus_monitoring::{SlowQuery, SlowQueryLog};
 use nodus_security::{SessionInfo, SessionRegistry};
 use nodus_sharding::ShardOrchestrator;
@@ -31,6 +31,7 @@ pub struct AdminState {
     pub audit: Arc<dyn AuditQueryable>,
     pub authz: Arc<dyn AuthzEngine>,
     pub catalog: Arc<dyn CatalogReader>,
+    pub catalog_writer: Arc<dyn CatalogWriter>,
     pub backup: Arc<BackupOrchestrator>,
     pub upgrade: Arc<DefaultUpgradeCoordinator>,
     pub shards: Arc<ShardOrchestrator>,
@@ -192,7 +193,7 @@ async fn create_backup(State(state): State<AdminState>) -> Json<Value> {
         Ok(b) => b,
         Err(e) => return Json(json!({ "error": format!("Failed to serialize catalog: {e}") })),
     };
-    
+
     let audit_events = match state.audit.query(&AuditQuery::default()) {
         Ok(events) => events,
         Err(e) => return Json(json!({ "error": format!("Failed to query audit: {e}") })),
@@ -207,7 +208,7 @@ async fn create_backup(State(state): State<AdminState>) -> Json<Value> {
         start: Bytes::new(),
         end: Bytes::from(vec![255u8; 1024]),
     };
-    
+
     match state.kv.scan(range, u64::MAX) {
         Ok(iter) => {
             for pair_res in iter {
@@ -219,13 +220,15 @@ async fn create_backup(State(state): State<AdminState>) -> Json<Value> {
                             "version": pair.version,
                         }));
                     }
-                    Err(e) => return Json(json!({ "error": format!("Failed to scan KV pair: {e}") })),
+                    Err(e) => {
+                        return Json(json!({ "error": format!("Failed to scan KV pair: {e}") }));
+                    }
                 }
             }
         }
         Err(e) => return Json(json!({ "error": format!("Failed to start KV scan: {e}") })),
     }
-    
+
     let kv_bytes = match serde_json::to_vec(&kv_dump) {
         Ok(b) => b,
         Err(e) => return Json(json!({ "error": format!("Failed to serialize KV dump: {e}") })),
@@ -269,6 +272,43 @@ async fn verify_backup(State(state): State<AdminState>, Path(id): Path<String>) 
 async fn restore_backup(State(state): State<AdminState>, Path(id): Path<String>) -> Json<Value> {
     match state.backup.restore(&id).await {
         Ok(objects) => {
+            for obj in &objects {
+                if obj.name == "catalog.json" {
+                    if let Ok(snapshot) = serde_json::from_slice(&obj.bytes) {
+                        let _ = state.catalog_writer.import_snapshot(snapshot);
+                    }
+                } else if obj.name == "kv_data.json" {
+                    #[allow(clippy::collapsible_if)]
+                    if let Ok(dump) = serde_json::from_slice::<Vec<serde_json::Value>>(&obj.bytes) {
+                        for pair in dump {
+                            if let (Some(k), Some(v), Some(ver)) = (
+                                pair.get("key").and_then(|k| k.as_array()),
+                                pair.get("value").and_then(|v| v.as_array()),
+                                pair.get("version").and_then(|v| v.as_u64()),
+                            ) {
+                                let key_bytes: Vec<u8> = k
+                                    .iter()
+                                    .filter_map(|x| x.as_u64())
+                                    .map(|x| x as u8)
+                                    .collect();
+                                let val_bytes: Vec<u8> = v
+                                    .iter()
+                                    .filter_map(|x| x.as_u64())
+                                    .map(|x| x as u8)
+                                    .collect();
+
+                                let txn_id = nodus_storage_api::TxnId::new();
+                                let _ = state.kv.write_intent(
+                                    txn_id,
+                                    Bytes::from(key_bytes),
+                                    Bytes::from(val_bytes),
+                                );
+                                let _ = state.kv.commit(txn_id, ver);
+                            }
+                        }
+                    }
+                }
+            }
             let names: Vec<String> = objects.into_iter().map(|o| o.name).collect();
             Json(json!({ "restored": names.len(), "objects": names }))
         }

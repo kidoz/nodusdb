@@ -355,10 +355,22 @@ pub struct RevokePrivilegesRequest {
 
 #[derive(Debug, Clone)]
 pub enum TableDescriptorChange {
-    AddColumn { table_id: TableId, column: ColumnDescriptor },
-    RenameTable { table_id: TableId, new_name: String },
-    DropColumn { table_id: TableId, column_name: String },
-    AddIndex { table_id: TableId, index: IndexDescriptor },
+    AddColumn {
+        table_id: TableId,
+        column: ColumnDescriptor,
+    },
+    RenameTable {
+        table_id: TableId,
+        new_name: String,
+    },
+    DropColumn {
+        table_id: TableId,
+        column_name: String,
+    },
+    AddIndex {
+        table_id: TableId,
+        index: IndexDescriptor,
+    },
 }
 
 pub struct CreateRoleRequest {
@@ -435,6 +447,7 @@ pub trait CatalogWriter: Send + Sync {
         index_id: IndexId,
         state: IndexState,
     ) -> Result<()>;
+    fn import_snapshot(&self, snapshot: CatalogSnapshot) -> Result<()>;
 }
 
 // In-Memory MVP implementation
@@ -527,7 +540,18 @@ impl MemoryCatalog {
             };
 
             let data = serde_json::to_string_pretty(&state)?;
-            std::fs::write(path, data)?;
+
+            // Atomic durable write: write to temp file, sync, and rename
+            let tmp_path = path.with_extension("tmp");
+            std::fs::write(&tmp_path, data)?;
+            if let Ok(file) = std::fs::File::open(&tmp_path) {
+                let _ = file.sync_all();
+            }
+            std::fs::rename(&tmp_path, path)?;
+
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::File::open(parent).and_then(|dir| dir.sync_all());
+            }
         }
         Ok(())
     }
@@ -574,6 +598,7 @@ impl CatalogReader for MemoryCatalog {
             .ok_or_else(|| anyhow::anyhow!("Schema {} not found", schema))
     }
 
+    #[allow(clippy::collapsible_if)]
     fn resolve_object(&self, request: ResolveObjectRequest) -> Result<ObjectDescriptor> {
         // Table lookup: DB, Schema, and Name provided
         if let (Some(db_name), Some(schema_name)) = (&request.database, &request.schema) {
@@ -581,7 +606,7 @@ impl CatalogReader for MemoryCatalog {
                 return Ok(ObjectDescriptor::Table(table));
             }
         }
-        
+
         // Schema lookup: DB and Name provided
         if let Some(db_name) = &request.database {
             if let Ok(schema) = self.get_schema(db_name, &request.name) {
@@ -777,7 +802,7 @@ impl CatalogWriter for MemoryCatalog {
             TableDescriptorChange::DropColumn { table_id, .. } => *table_id,
             TableDescriptorChange::AddIndex { table_id, .. } => *table_id,
         };
-        
+
         let mut target_key = None;
         for (k, v) in guard.iter() {
             if v.id == table_id {
@@ -785,15 +810,15 @@ impl CatalogWriter for MemoryCatalog {
                 break;
             }
         }
-        
+
         let key = target_key.ok_or_else(|| anyhow::anyhow!("Table not found"))?;
         let mut table = guard.remove(&key).unwrap();
-        
+
         table.version += 1;
         table.updated_at = Utc::now();
-        
+
         let mut new_key = key.clone();
-        
+
         match change {
             TableDescriptorChange::AddColumn { column, .. } => {
                 table.columns.push(column);
@@ -809,7 +834,7 @@ impl CatalogWriter for MemoryCatalog {
                 table.indexes.push(index);
             }
         }
-        
+
         let out = table.clone();
         guard.insert(new_key, table);
         Ok(out)
@@ -889,6 +914,32 @@ impl CatalogWriter for MemoryCatalog {
             }
         }
         anyhow::bail!("Index {} not found", index_id);
+    }
+
+    fn import_snapshot(&self, snapshot: CatalogSnapshot) -> Result<()> {
+        *self.databases.write().unwrap() = snapshot
+            .databases
+            .into_iter()
+            .map(|d| (d.name.clone(), d))
+            .collect();
+        *self.schemas.write().unwrap() = snapshot
+            .schemas
+            .into_iter()
+            .map(|s| ((s.database_id, s.name.clone()), s))
+            .collect();
+        *self.tables.write().unwrap() = snapshot
+            .tables
+            .into_iter()
+            .map(|t| ((t.database_id, t.schema_id, t.name.clone()), t))
+            .collect();
+        *self.principals.write().unwrap() = snapshot
+            .principals
+            .into_iter()
+            .map(|p| (p.name.clone(), p))
+            .collect();
+        *self.grants.write().unwrap() = snapshot.grants;
+        self.increment_version();
+        Ok(())
     }
 }
 

@@ -251,6 +251,7 @@ pub async fn run_server_with_config(
         audit: audit_query,
         authz: authz.clone(),
         catalog: catalog.clone(),
+        catalog_writer: catalog.clone(),
         backup,
         upgrade,
         shards,
