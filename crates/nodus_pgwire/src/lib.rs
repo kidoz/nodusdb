@@ -302,7 +302,7 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
             authz_catalog_version: 1,
         };
 
-        // Extract parameters from the portal into a Vec<String>
+        // Extract parameters from the portal natively into Vec<nodus_executor::Value>
         let len = portal.parameter_len();
         let mut params = Vec::with_capacity(len);
         for i in 0..len {
@@ -312,52 +312,50 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
                 .get(i)
                 .unwrap_or(&Type::UNKNOWN);
 
-            let val_str = if portal.parameters.get(i).is_none_or(|p| p.is_none()) {
-                "".to_string() // Represent NULL as empty string
+            let val = if portal.parameters.get(i).is_none_or(|p| p.is_none()) {
+                nodus_executor::Value::Null
             } else {
                 match *param_type {
                     Type::BOOL => {
                         let v = portal.parameter::<bool>(i, param_type)?.unwrap_or_default();
-                        if v {
-                            "true".to_string()
-                        } else {
-                            "false".to_string()
-                        }
+                        nodus_executor::Value::Bool(v)
                     }
                     Type::INT2 => {
                         let v = portal.parameter::<i16>(i, param_type)?.unwrap_or_default();
-                        v.to_string()
+                        nodus_executor::Value::Int(v as i64)
                     }
                     Type::INT4 => {
                         let v = portal.parameter::<i32>(i, param_type)?.unwrap_or_default();
-                        v.to_string()
+                        nodus_executor::Value::Int(v as i64)
                     }
                     Type::INT8 => {
                         let v = portal.parameter::<i64>(i, param_type)?.unwrap_or_default();
-                        v.to_string()
+                        nodus_executor::Value::Int(v)
                     }
                     Type::FLOAT4 => {
                         let v = portal.parameter::<f32>(i, param_type)?.unwrap_or_default();
-                        v.to_string()
+                        nodus_executor::Value::Float(v as f64)
                     }
                     Type::FLOAT8 => {
                         let v = portal.parameter::<f64>(i, param_type)?.unwrap_or_default();
-                        v.to_string()
+                        nodus_executor::Value::Float(v)
                     }
                     Type::TEXT | Type::VARCHAR => {
-                        portal
+                        let v = portal
                             .parameter::<String>(i, param_type)?
-                            .unwrap_or_default()
+                            .unwrap_or_default();
+                        nodus_executor::Value::Text(v)
                     }
                     _ => {
-                        portal
+                        let v = portal
                             .parameter::<String>(i, &Type::TEXT)
                             .unwrap_or(Some("".to_string()))
-                            .unwrap_or_default()
+                            .unwrap_or_default();
+                        nodus_executor::Value::Text(v)
                     }
                 }
             };
-            params.push(val_str);
+            params.push(val);
         }
 
         let stmt = match nodus_sql::parse_sql(raw_sql) {
@@ -436,8 +434,12 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
                 match plan {
                     nodus_executor::LogicalPlan::Select { projection, .. } => {
                         for col in projection {
+                            let col_name = match col {
+                                nodus_executor::ProjectionItem::Column(c) => c,
+                                nodus_executor::ProjectionItem::Aggregate(op, inner) => format!("{:?}({})", op, inner),
+                            };
                             fields.push(FieldInfo::new(
-                                col,
+                                col_name,
                                 None,
                                 None,
                                 Type::VARCHAR,
@@ -480,8 +482,12 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
                 match plan {
                     nodus_executor::LogicalPlan::Select { projection, .. } => {
                         for col in projection {
+                            let col_name = match col {
+                                nodus_executor::ProjectionItem::Column(c) => c,
+                                nodus_executor::ProjectionItem::Aggregate(op, inner) => format!("{:?}({})", op, inner),
+                            };
                             fields.push(FieldInfo::new(
-                                col,
+                                col_name,
                                 None,
                                 None,
                                 Type::VARCHAR,

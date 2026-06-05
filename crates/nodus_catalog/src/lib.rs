@@ -351,9 +351,12 @@ pub struct RevokePrivilegesRequest {
     pub privilege: String,
 }
 
-pub struct TableDescriptorChange {
-    pub table_id: TableId,
-    // delta
+#[derive(Debug, Clone)]
+pub enum TableDescriptorChange {
+    AddColumn { table_id: TableId, column: ColumnDescriptor },
+    RenameTable { table_id: TableId, new_name: String },
+    DropColumn { table_id: TableId, column_name: String },
+    AddIndex { table_id: TableId, index: IndexDescriptor },
 }
 
 pub struct CreateRoleRequest {
@@ -723,8 +726,50 @@ impl CatalogWriter for MemoryCatalog {
         anyhow::bail!("Not implemented")
     }
 
-    fn update_table_descriptor(&self, _change: TableDescriptorChange) -> Result<TableDescriptor> {
-        anyhow::bail!("Not implemented")
+    fn update_table_descriptor(&self, change: TableDescriptorChange) -> Result<TableDescriptor> {
+        let mut guard = self.tables.write().unwrap();
+        let table_id = match &change {
+            TableDescriptorChange::AddColumn { table_id, .. } => *table_id,
+            TableDescriptorChange::RenameTable { table_id, .. } => *table_id,
+            TableDescriptorChange::DropColumn { table_id, .. } => *table_id,
+            TableDescriptorChange::AddIndex { table_id, .. } => *table_id,
+        };
+        
+        let mut target_key = None;
+        for (k, v) in guard.iter() {
+            if v.id == table_id {
+                target_key = Some(k.clone());
+                break;
+            }
+        }
+        
+        let key = target_key.ok_or_else(|| anyhow::anyhow!("Table not found"))?;
+        let mut table = guard.remove(&key).unwrap();
+        
+        table.version += 1;
+        table.updated_at = Utc::now();
+        
+        let mut new_key = key.clone();
+        
+        match change {
+            TableDescriptorChange::AddColumn { column, .. } => {
+                table.columns.push(column);
+            }
+            TableDescriptorChange::RenameTable { new_name, .. } => {
+                table.name = new_name.clone();
+                new_key.2 = new_name;
+            }
+            TableDescriptorChange::DropColumn { column_name, .. } => {
+                table.columns.retain(|c| c.name != column_name);
+            }
+            TableDescriptorChange::AddIndex { index, .. } => {
+                table.indexes.push(index);
+            }
+        }
+        
+        let out = table.clone();
+        guard.insert(new_key, table);
+        Ok(out)
     }
 
     fn create_role(&self, request: CreateRoleRequest) -> Result<PrincipalDescriptor> {

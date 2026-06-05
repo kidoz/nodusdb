@@ -20,6 +20,8 @@ use std::sync::Arc;
 pub struct ColumnDef {
     pub name: String,
     pub data_type: String,
+    pub nullable: bool,
+    pub unique: bool,
 }
 
 /// A typed cell value. Rows are stored as `Vec<Value>` in table-column order.
@@ -66,9 +68,9 @@ fn coerce(raw: &str, ty: ColumnType) -> Value {
         return Value::Null;
     }
     match ty {
-        ColumnType::Int => raw.parse::<i64>().map(Value::Int).unwrap_or(Value::Null),
-        ColumnType::Float => raw.parse::<f64>().map(Value::Float).unwrap_or(Value::Null),
-        ColumnType::Bool => raw.parse::<bool>().map(Value::Bool).unwrap_or(Value::Null),
+        ColumnType::Int => raw.parse::<i64>().map(Value::Int).unwrap_or(crate::Value::Null),
+        ColumnType::Float => raw.parse::<f64>().map(Value::Float).unwrap_or(crate::Value::Null),
+        ColumnType::Bool => raw.parse::<bool>().map(Value::Bool).unwrap_or(crate::Value::Null),
         ColumnType::Text => Value::Text(raw.to_string()),
     }
 }
@@ -99,7 +101,7 @@ fn compare(a: &Value, b: &Value) -> std::cmp::Ordering {
 /// Operand for a WHERE predicate or JOIN condition.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum Operand {
-    Literal(String),
+    Literal(Value),
     Ident(String),
 }
 
@@ -130,6 +132,7 @@ pub enum FilterExpr {
     Not(Box<FilterExpr>),
     Like { left: String, right: Operand, negated: bool },
     InList { left: String, list: Vec<Operand>, negated: bool },
+    InSubquery { left: String, subquery: Box<LogicalPlan>, negated: bool },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -145,38 +148,77 @@ pub struct Join {
     pub join_type: JoinType,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum AggregateOp {
+    Count,
+    Sum,
+    Min,
+    Max,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum ProjectionItem {
+    Column(String),
+    Aggregate(AggregateOp, String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum AlterTableOp {
+    AddColumn { name: String, data_type: String, nullable: bool },
+    DropColumn { name: String },
+    RenameTable { new_name: String },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum LogicalPlan {
     CreateTable {
         name: String,
         columns: Vec<ColumnDef>,
     },
+    AlterTable {
+        table_name: String,
+        operation: AlterTableOp,
+    },
+    CreateIndex {
+        name: String,
+        table_name: String,
+        columns: Vec<String>,
+        unique: bool,
+    },
     Insert {
         table_name: String,
         /// Target column names; empty means positional (table order).
         columns: Vec<String>,
-        values_list: Vec<Vec<String>>,
+        values_list: Vec<Vec<Value>>,
+        returning: Vec<String>,
     },
     Select {
         table_name: String,
         joins: Vec<Join>,
         /// Projected column names; empty means all columns (`SELECT *`).
-        projection: Vec<String>,
+        projection: Vec<ProjectionItem>,
+        group_by: Vec<String>,
         /// Conjunction of `WHERE` predicates; empty means no filter.
         filter: Option<FilterExpr>,
         /// Optional `ORDER BY (column, ascending)`.
         order_by: Option<(String, bool)>,
         /// Optional `LIMIT`.
         limit: Option<usize>,
+        /// Optional `OFFSET`.
+        offset: Option<usize>,
+        /// DISTINCT
+        distinct: bool,
     },
     Update {
         table_name: String,
-        assignments: Vec<(String, String)>,
+        assignments: Vec<(String, Value)>,
         filter: Option<FilterExpr>,
+        returning: Vec<String>,
     },
     Delete {
         table_name: String,
         filter: Option<FilterExpr>,
+        returning: Vec<String>,
     },
     Begin,
     Commit,
@@ -208,14 +250,22 @@ impl QueryOutput {
     }
 }
 
-fn expr_to_string(expr: &sqlparser::ast::Expr, params: &[String]) -> Option<String> {
-    use sqlparser::ast::{Expr, Value};
+pub fn expr_to_value(expr: &sqlparser::ast::Expr, params: &[crate::Value]) -> Option<crate::Value> {
+    use sqlparser::ast::{Expr, Value as SqlValue};
     match expr {
-        Expr::Value(Value::SingleQuotedString(s)) => Some(s.clone()),
-        Expr::Value(Value::Number(n, _)) => Some(n.clone()),
-        Expr::Value(Value::Boolean(b)) => Some(b.to_string()),
-        Expr::Value(Value::Null) => Some(String::new()),
-        Expr::Value(Value::Placeholder(s)) => {
+        Expr::Value(SqlValue::SingleQuotedString(s)) => Some(crate::Value::Text(s.clone())),
+        Expr::Value(SqlValue::Number(n, _)) => {
+            if let Ok(i) = n.parse::<i64>() {
+                Some(crate::Value::Int(i))
+            } else if let Ok(f) = n.parse::<f64>() {
+                Some(crate::Value::Float(f))
+            } else {
+                Some(crate::Value::Text(n.clone()))
+            }
+        },
+        Expr::Value(SqlValue::Boolean(b)) => Some(crate::Value::Bool(*b)),
+        Expr::Value(SqlValue::Null) => Some(crate::Value::Null),
+        Expr::Value(SqlValue::Placeholder(s)) => {
             if let Some(stripped) = s.strip_prefix('$') {
                 if let Ok(idx) = stripped.parse::<usize>() {
                     if idx > 0 && idx <= params.len() {
@@ -225,22 +275,36 @@ fn expr_to_string(expr: &sqlparser::ast::Expr, params: &[String]) -> Option<Stri
             }
             None
         }
-        Expr::Identifier(id) => Some(id.value.clone()),
+        Expr::Identifier(id) => Some(crate::Value::Text(id.value.clone())),
         _ => None,
     }
 }
 
-pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[String]) -> Result<LogicalPlan> {
+pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Result<LogicalPlan> {
     use sqlparser::ast::*;
     match stmt {
         Statement::CreateTable { name, columns, .. } => {
-            let cols = columns
-                .iter()
-                .map(|c| crate::ColumnDef {
+            let mut cols = Vec::new();
+            for c in columns {
+                let mut nullable = true;
+                let mut unique = false;
+                for opt in &c.options {
+                    match &opt.option {
+                        sqlparser::ast::ColumnOption::NotNull => nullable = false,
+                        sqlparser::ast::ColumnOption::Unique { is_primary, .. } => {
+                            unique = true;
+                            if *is_primary { nullable = false; }
+                        }
+                        _ => {}
+                    }
+                }
+                cols.push(crate::ColumnDef {
                     name: c.name.value.clone(),
                     data_type: c.data_type.to_string(),
-                })
-                .collect();
+                    nullable,
+                    unique,
+                });
+            }
             Ok(LogicalPlan::CreateTable {
                 name: name.to_string(),
                 columns: cols,
@@ -250,8 +314,17 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[String]) -> Re
             table_name,
             columns,
             source,
+            returning,
             ..
         } => {
+            let returning = if let Some(r) = returning {
+                r.iter().filter_map(|item| match item {
+                    sqlparser::ast::SelectItem::UnnamedExpr(sqlparser::ast::Expr::Identifier(id)) => Some(id.value.clone()),
+                    _ => None,
+                }).collect()
+            } else {
+                Vec::new()
+            };
             let cols: Vec<String> = columns.iter().map(|c| c.value.clone()).collect();
             let mut values_list = Vec::new();
             if let Some(query) = source {
@@ -259,7 +332,7 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[String]) -> Re
                     for row in &vs.rows {
                         let mut row_values = Vec::new();
                         for e in row {
-                            row_values.push(expr_to_string(e, params).unwrap_or_default());
+                            row_values.push(expr_to_value(e, params).unwrap_or(crate::Value::Null));
                         }
                         values_list.push(row_values);
                     }
@@ -269,6 +342,7 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[String]) -> Re
                 table_name: table_name.to_string(),
                 columns: cols,
                 values_list,
+                returning,
             })
         }
         Statement::Query(query) => plan_query(query, params),
@@ -276,14 +350,23 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[String]) -> Re
             table,
             assignments,
             selection,
+            returning,
             ..
         } => {
+            let returning = if let Some(r) = returning {
+                r.iter().filter_map(|item| match item {
+                    sqlparser::ast::SelectItem::UnnamedExpr(sqlparser::ast::Expr::Identifier(id)) => Some(id.value.clone()),
+                    _ => None,
+                }).collect()
+            } else {
+                Vec::new()
+            };
             let table_name = table_name_of(&table.relation)?;
             let assigns = assignments
                 .iter()
                 .filter_map(|a| {
                     let col = a.id.last()?.value.clone();
-                    let val = expr_to_string(&a.value, params)?;
+                    let val = expr_to_value(&a.value, params)?;
                     Some((col, val))
                 })
                 .collect();
@@ -291,11 +374,20 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[String]) -> Re
                 table_name,
                 assignments: assigns,
                 filter: parse_predicates(selection, params),
+                returning,
             })
         }
         Statement::Delete {
-            from, selection, ..
+            from, selection, returning, ..
         } => {
+            let returning = if let Some(r) = returning {
+                r.iter().filter_map(|item| match item {
+                    sqlparser::ast::SelectItem::UnnamedExpr(sqlparser::ast::Expr::Identifier(id)) => Some(id.value.clone()),
+                    _ => None,
+                }).collect()
+            } else {
+                Vec::new()
+            };
             let tables = match from {
                 FromTable::WithFromKeyword(t) | FromTable::WithoutKeyword(t) => t,
             };
@@ -306,6 +398,7 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[String]) -> Re
             Ok(LogicalPlan::Delete {
                 table_name: table_name_of(relation)?,
                 filter: parse_predicates(selection, params),
+                returning,
             })
         }
         Statement::StartTransaction { .. } => Ok(LogicalPlan::Begin),
@@ -345,7 +438,7 @@ fn compare_op(op: &sqlparser::ast::BinaryOperator) -> Option<CompareOp> {
 
 /// Parses a `WHERE` clause into a conjunction of `column <op> literal`
 /// predicates (AND only; other expressions are ignored).
-fn parse_predicates(selection: &Option<sqlparser::ast::Expr>, params: &[String]) -> Option<FilterExpr> {
+fn parse_predicates(selection: &Option<sqlparser::ast::Expr>, params: &[Value]) -> Option<FilterExpr> {
     if let Some(expr) = selection {
         parse_filter_expr(expr, params)
     } else {
@@ -353,7 +446,7 @@ fn parse_predicates(selection: &Option<sqlparser::ast::Expr>, params: &[String])
     }
 }
 
-fn parse_filter_expr(expr: &sqlparser::ast::Expr, params: &[String]) -> Option<FilterExpr> {
+fn parse_filter_expr(expr: &sqlparser::ast::Expr, params: &[Value]) -> Option<FilterExpr> {
     use sqlparser::ast::{BinaryOperator, Expr};
     match expr {
         Expr::Nested(inner) => parse_filter_expr(inner, params),
@@ -407,6 +500,15 @@ fn parse_filter_expr(expr: &sqlparser::ast::Expr, params: &[String]) -> Option<F
                 negated: *negated,
             })
         }
+        Expr::InSubquery { expr, subquery, negated } => {
+            let left_col = extract_col_name(expr)?;
+            let sub_plan = plan_query(subquery, params).ok()?;
+            Some(FilterExpr::InSubquery {
+                left: left_col,
+                subquery: Box::new(sub_plan),
+                negated: *negated,
+            })
+        }
         Expr::BinaryOp { left, op, right } => {
             let left_col = extract_col_name(left)?;
             let right_op = extract_operand(right, params)?;
@@ -438,7 +540,7 @@ fn extract_col_name(expr: &sqlparser::ast::Expr) -> Option<String> {
     }
 }
 
-fn extract_operand(expr: &sqlparser::ast::Expr, params: &[String]) -> Option<Operand> {
+fn extract_operand(expr: &sqlparser::ast::Expr, params: &[Value]) -> Option<Operand> {
     use sqlparser::ast::Expr;
     match expr {
         Expr::Identifier(id) => Some(Operand::Ident(id.value.clone())),
@@ -449,7 +551,7 @@ fn extract_operand(expr: &sqlparser::ast::Expr, params: &[String]) -> Option<Ope
                 .join("."),
         )),
         _ => {
-            if let Some(val) = expr_to_string(expr, params) {
+            if let Some(val) = expr_to_value(expr, params) {
                 Some(Operand::Literal(val))
             } else {
                 None
@@ -458,7 +560,7 @@ fn extract_operand(expr: &sqlparser::ast::Expr, params: &[String]) -> Option<Ope
     }
 }
 
-fn plan_query(query: &sqlparser::ast::Query, params: &[String]) -> Result<LogicalPlan> {
+fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Result<LogicalPlan> {
     use sqlparser::ast::*;
     let SetExpr::Select(select) = &*query.body else {
         anyhow::bail!("Unsupported query body");
@@ -468,8 +570,8 @@ fn plan_query(query: &sqlparser::ast::Query, params: &[String]) -> Result<Logica
     if select.from.is_empty() && select.projection.len() == 1 {
         return match &select.projection[0] {
             SelectItem::UnnamedExpr(expr) => {
-                if let Some(val) = expr_to_string(expr, params) {
-                    Ok(LogicalPlan::SelectLiteral { value: val })
+                if let Some(val) = expr_to_value(expr, params) {
+                    Ok(LogicalPlan::SelectLiteral { value: render(&val) })
                 } else if let Expr::Function(func) = expr {
                     Ok(LogicalPlan::SelectLiteral { value: func.name.to_string() })
                 } else {
@@ -518,13 +620,68 @@ fn plan_query(query: &sqlparser::ast::Query, params: &[String]) -> Result<Logica
                 projection.clear();
                 break;
             }
-            SelectItem::UnnamedExpr(Expr::Identifier(id)) => projection.push(id.value.clone()),
+            SelectItem::UnnamedExpr(Expr::Identifier(id)) => projection.push(ProjectionItem::Column(id.value.clone())),
             SelectItem::ExprWithAlias {
                 expr: Expr::Identifier(id),
                 ..
-            } => projection.push(id.value.clone()),
+            } => projection.push(ProjectionItem::Column(id.value.clone())),
+            SelectItem::UnnamedExpr(Expr::Function(func)) => {
+                let fname = func.name.to_string().to_uppercase();
+                let op = match fname.as_str() {
+                    "COUNT" => AggregateOp::Count,
+                    "SUM" => AggregateOp::Sum,
+                    "MIN" => AggregateOp::Min,
+                    "MAX" => AggregateOp::Max,
+                    _ => anyhow::bail!("Unsupported aggregate function: {}", fname),
+                };
+                let inner = if let Some(arg) = func.args.first() {
+                    match arg {
+                        sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(Expr::Identifier(id))) => id.value.clone(),
+                        sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Wildcard) => "*".to_string(),
+                        _ => anyhow::bail!("Unsupported aggregate argument"),
+                    }
+                } else {
+                    anyhow::bail!("Aggregate function requires an argument");
+                };
+                projection.push(ProjectionItem::Aggregate(op, inner));
+            }
+            SelectItem::ExprWithAlias {
+                expr: Expr::Function(func),
+                ..
+            } => {
+                let fname = func.name.to_string().to_uppercase();
+                let op = match fname.as_str() {
+                    "COUNT" => AggregateOp::Count,
+                    "SUM" => AggregateOp::Sum,
+                    "MIN" => AggregateOp::Min,
+                    "MAX" => AggregateOp::Max,
+                    _ => anyhow::bail!("Unsupported aggregate function: {}", fname),
+                };
+                let inner = if let Some(arg) = func.args.first() {
+                    match arg {
+                        sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(Expr::Identifier(id))) => id.value.clone(),
+                        sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Wildcard) => "*".to_string(),
+                        _ => anyhow::bail!("Unsupported aggregate argument"),
+                    }
+                } else {
+                    anyhow::bail!("Aggregate function requires an argument");
+                };
+                projection.push(ProjectionItem::Aggregate(op, inner));
+            }
             other => anyhow::bail!("Unsupported projection item: {:?}", other),
         }
+    }
+    
+    let mut group_by = Vec::new();
+    match &select.group_by {
+        sqlparser::ast::GroupByExpr::Expressions(exprs) => {
+            for expr in exprs {
+                if let sqlparser::ast::Expr::Identifier(id) = expr {
+                    group_by.push(id.value.clone());
+                }
+            }
+        }
+        _ => {}
     }
 
     // ORDER BY first column, if present.
@@ -535,16 +692,26 @@ fn plan_query(query: &sqlparser::ast::Query, params: &[String]) -> Result<Logica
 
     // LIMIT <n>.
     let limit = query.limit.as_ref().and_then(|e| {
-        expr_to_string(e, params).and_then(|s| s.parse::<usize>().ok())
+        expr_to_value(e, params).and_then(|v| render(&v).parse::<usize>().ok())
+    });
+    
+    // OFFSET <n>.
+    let offset = query.offset.as_ref().and_then(|o| {
+        expr_to_value(&o.value, params).and_then(|v| render(&v).parse::<usize>().ok())
     });
 
+    let distinct = select.distinct.is_some();
+
     Ok(LogicalPlan::Select {
-        table_name,
-        joins,
-        projection,
+                table_name,
+                joins,
+                projection,
+                group_by,
         filter: parse_predicates(&select.selection, params),
         order_by,
         limit,
+        offset,
+        distinct,
     })
 }
 
@@ -751,10 +918,15 @@ impl MemExecutor {
     /// Evaluates predicates against a joined or single row.
     fn eval_operand(&self, row: &[Value], col_names: &[String], _columns: &[ColumnDescriptor], op: &Operand, expected_type: &str) -> Value {
         match op {
-            Operand::Literal(val) => coerce(val, column_type(expected_type)),
+            Operand::Literal(val) => {
+                match val {
+                    Value::Text(s) => coerce(s, column_type(expected_type)),
+                    _ => val.clone(), // already typed correctly if it was binary bound
+                }
+            }
             Operand::Ident(col) => {
                 let idx = col_names.iter().position(|c| c == col || c.ends_with(&format!(".{}", col)));
-                idx.and_then(|i| row.get(i)).cloned().unwrap_or(Value::Null)
+                idx.and_then(|i| row.get(i)).cloned().unwrap_or(crate::Value::Null)
             }
         }
     }
@@ -762,6 +934,7 @@ impl MemExecutor {
     /// Evaluates a FilterExpr against a joined or single row.
     fn eval_filter(
         &self,
+        ctx: &ExecutionContext,
         row: &[Value],
         col_names: &[String],
         columns: &[ColumnDescriptor],
@@ -772,15 +945,15 @@ impl MemExecutor {
         };
         match expr {
             FilterExpr::And(left, right) => {
-                self.eval_filter(row, col_names, columns, Some(left))
-                    && self.eval_filter(row, col_names, columns, Some(right))
+                self.eval_filter(ctx, row, col_names, columns, Some(left))
+                    && self.eval_filter(ctx, row, col_names, columns, Some(right))
             }
             FilterExpr::Or(left, right) => {
-                self.eval_filter(row, col_names, columns, Some(left))
-                    || self.eval_filter(row, col_names, columns, Some(right))
+                self.eval_filter(ctx, row, col_names, columns, Some(left))
+                    || self.eval_filter(ctx, row, col_names, columns, Some(right))
             }
             FilterExpr::Not(inner) => {
-                !self.eval_filter(row, col_names, columns, Some(inner))
+                !self.eval_filter(ctx, row, col_names, columns, Some(inner))
             }
             FilterExpr::Predicate(p) => {
                 let left_idx = col_names.iter().position(|c| c == &p.left || c.ends_with(&format!(".{}", p.left)));
@@ -832,18 +1005,40 @@ impl MemExecutor {
                 }
                 if *negated { !matches } else { matches }
             }
+            FilterExpr::InSubquery { left, subquery, negated } => {
+                let left_idx = col_names.iter().position(|c| c == left || c.ends_with(&format!(".{}", left)));
+                let Some(idx) = left_idx else { return false; };
+                let left_cell = row.get(idx).unwrap_or(&Value::Null);
+                
+                let exec_res = self.execute_logical(ctx, *subquery.clone());
+                if exec_res.is_err() { println!("SUBQUERY ERROR: {:?}", exec_res); }
+                let out = exec_res.unwrap_or(QueryOutput { columns: vec![], rows: vec![], tag: String::new() });
+                
+                let mut matches = false;
+                for r in out.rows {
+                    if let Some(c) = r.columns.first() {
+                        let right_cell = coerce(c, column_type(&columns[idx].data_type));
+                        if *left_cell == right_cell {
+                            matches = true;
+                            break;
+                        }
+                    }
+                }
+                if *negated { !matches } else { matches }
+            }
         }
     }
 
     /// Evaluates an optional equality filter against a typed row.
     fn row_matches(
         &self,
+        ctx: &ExecutionContext,
         row: &[Value],
         columns: &[ColumnDescriptor],
         filter: Option<&FilterExpr>,
     ) -> bool {
         let col_names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
-        self.eval_filter(row, &col_names, columns, filter)
+        self.eval_filter(ctx, row, &col_names, columns, filter)
     }
 
     /// Deny-by-default authorization gate for a single action on a resource.
@@ -913,7 +1108,7 @@ impl Executor for MemExecutor {
                 let db = self.catalog_reader.get_database("default")?;
                 let sch = self.catalog_reader.get_schema("default", "public")?;
                 self.authorize(ctx, Action::CreateTable, ResourceRef::Schema(sch.id))?;
-                let descriptors = columns
+                let descriptors: Vec<_> = columns
                     .iter()
                     .map(|c| ColumnDescriptor {
                         id: nodus_catalog::ColumnId::new(),
@@ -923,22 +1118,59 @@ impl Executor for MemExecutor {
                         updated_at: Utc::now(),
                         state: DescriptorState::Public,
                         data_type: c.data_type.clone(),
-                        nullable: true,
+                        nullable: c.nullable,
                     })
                     .collect();
-                self.catalog_writer.create_table(CreateTableRequest {
+
+                let mut unique_cols = Vec::new();
+                for (c, d) in columns.iter().zip(descriptors.iter()) {
+                    if c.unique {
+                        unique_cols.push(d.clone());
+                    }
+                }
+
+                let tbl = self.catalog_writer.create_table(CreateTableRequest {
                     database_id: db.id,
                     schema_id: sch.id,
                     name: name.clone(),
                     columns: descriptors,
                 })?;
+                
+                for col in unique_cols {
+                    let index = nodus_catalog::IndexDescriptor {
+                        id: nodus_catalog::IndexId::new(),
+                        name: format!("{}_{}_idx", name, col.name),
+                        version: 1,
+                        created_at: Utc::now(),
+                        updated_at: Utc::now(),
+                        state: DescriptorState::Public,
+                        index_type: nodus_catalog::IndexType::Unique,
+                        index_state: nodus_catalog::IndexState::Ready,
+                        key_columns: vec![nodus_catalog::IndexColumn {
+                            column_id: col.id,
+                            descending: false,
+                        }],
+                        include_columns: vec![],
+                        unique: true,
+                        global: false,
+                        predicate: None,
+                        expressions: vec![],
+                    };
+                    self.catalog_writer.update_table_descriptor(nodus_catalog::TableDescriptorChange::AddIndex {
+                        table_id: tbl.id,
+                        index,
+                    })?;
+                }
+
                 Ok(QueryOutput::tag("CREATE TABLE"))
             }
             LogicalPlan::Insert {
                 table_name,
                 columns,
                 values_list,
-            } => {
+            
+returning,
+} => {
                 let tbl = self
                     .catalog_reader
                     .get_table("default", "public", &table_name)?;
@@ -946,10 +1178,11 @@ impl Executor for MemExecutor {
 
                 let col_names: Vec<&str> = tbl.columns.iter().map(|c| c.name.as_str()).collect();
                 let mut inserted_count = 0;
+                let mut returning_rows = Vec::new();
 
                 for values in values_list {
-                    // Build the raw string row in table-column order...
-                    let mut raw = vec![String::new(); col_names.len()];
+                    // Build the Values row in table-column order...
+                    let mut raw = vec![Value::Null; col_names.len()];
                     if columns.is_empty() {
                         for (i, v) in values.iter().enumerate() {
                             if i < raw.len() {
@@ -963,30 +1196,57 @@ impl Executor for MemExecutor {
                             }
                         }
                     }
-                    // ...then coerce each cell to its column's type.
-                    let row: Vec<Value> = tbl
-                        .columns
-                        .iter()
-                        .enumerate()
-                        .map(|(i, c)| coerce(&raw[i], column_type(&c.data_type)))
-                        .collect();
+                    // ...then coerce each cell to its column's type if it's Text, otherwise assume it's correctly bound.
+                    let mut row = Vec::new();
+                    for (i, c) in tbl.columns.iter().enumerate() {
+                        let val = match &raw[i] {
+                            Value::Text(s) => coerce(s, column_type(&c.data_type)),
+                            other => other.clone(),
+                        };
+                        if !c.nullable && val == Value::Null {
+                            anyhow::bail!("Column {} cannot be NULL", c.name);
+                        }
+                        row.push(val);
+                    }
                     // Primary key = first column's rendered value.
                     let pk = row.first().map(render).unwrap_or_default();
                     let key = format!("{}:{}", tbl.id, pk);
                     let encoded = serde_json::to_string(&row)?;
                     self.write_row(&ctx.session_id, key, encoded)?;
                     inserted_count += 1;
+                    if !returning.is_empty() {
+                        returning_rows.push(row);
+                    }
                 }
                 
-                Ok(QueryOutput::tag(&format!("INSERT 0 {}", inserted_count)))
+                if returning.is_empty() {
+                    Ok(QueryOutput::tag(&format!("INSERT 0 {}", inserted_count)))
+                } else {
+                    let col_names: Vec<&str> = tbl.columns.iter().map(|c| c.name.as_str()).collect();
+                    let indices: Vec<Option<usize>> = returning
+                        .iter()
+                        .map(|c| col_names.iter().position(|&tc| tc == c || tc.ends_with(&format!(".{}", c))))
+                        .collect();
+                    let rows = returning_rows.into_iter().map(|r| Row {
+                        columns: indices.iter().map(|i| i.and_then(|idx| r.get(idx)).map(render).unwrap_or_default()).collect()
+                    }).collect();
+                    Ok(QueryOutput {
+                        tag: format!("INSERT 0 {}", inserted_count),
+                        columns: returning.clone(),
+                        rows,
+                    })
+                }
             }
             LogicalPlan::Select {
                 table_name,
                 joins,
                 projection,
+                group_by,
                 filter,
                 order_by,
                 limit,
+                offset,
+                distinct,
             } => {
                 let tbl = self
                     .catalog_reader
@@ -1027,6 +1287,7 @@ impl Executor for MemExecutor {
                             let mut combined_row = r1.clone();
                             combined_row.extend(r2.clone());
                             if self.eval_filter(
+                                ctx,
                                 &combined_row,
                                 &combined_cols,
                                 &combined_desc,
@@ -1051,48 +1312,238 @@ impl Executor for MemExecutor {
 
                 // WHERE: conjunction of typed predicates.
                 stored_rows
-                    .retain(|r| self.eval_filter(r, &col_names, &joined_columns, filter.as_ref()));
+                    .retain(|r| self.eval_filter(ctx, r, &col_names, &joined_columns, filter.as_ref()));
 
-                // ORDER BY a column (typed compare), then LIMIT.
-                if let Some((ocol, asc)) = &order_by
-                    && let Some(idx) = col_names
+                // GROUP BY & Aggregation
+                let is_agg = !group_by.is_empty() || projection.iter().any(|p| matches!(p, ProjectionItem::Aggregate(_, _)));
+                
+                if !is_agg {
+                    if let Some((ocol, asc)) = &order_by {
+                        let idx = col_names
+                            .iter()
+                            .position(|c| c == ocol || c.ends_with(&format!(".{}", ocol)));
+                        if let Some(idx) = idx {
+                            stored_rows.sort_by(|a, b| {
+                                let ord = compare(
+                                    a.get(idx).unwrap_or(&crate::Value::Null),
+                                    b.get(idx).unwrap_or(&crate::Value::Null),
+                                );
+                                if *asc { ord } else { ord.reverse() }
+                            });
+                        }
+                    }
+                }
+                
+                let mut out_rows = Vec::new();
+                let mut out_cols = Vec::new();
+
+                if is_agg {
+                    let mut groups: std::collections::BTreeMap<Vec<Vec<u8>>, Vec<Vec<Value>>> = std::collections::BTreeMap::new();
+                    
+                    let group_by_indices: Vec<Option<usize>> = group_by
                         .iter()
-                        .position(|c| c == ocol || c.ends_with(&format!(".{}", ocol)))
-                {
-                    stored_rows.sort_by(|a, b| {
-                        let ord = compare(
-                            a.get(idx).unwrap_or(&Value::Null),
-                            b.get(idx).unwrap_or(&Value::Null),
-                        );
-                        if *asc { ord } else { ord.reverse() }
+                        .map(|c| col_names.iter().position(|tc| tc == c || tc.ends_with(&format!(".{}", c))))
+                        .collect();
+
+                    if stored_rows.is_empty() && group_by.is_empty() {
+                        // Empty set but scalar agg like COUNT(*), yields one row
+                        groups.insert(vec![], vec![]);
+                    } else {
+                        for r in stored_rows {
+                            let key = group_by_indices.iter().map(|i| {
+                                let val = i.and_then(|idx| r.get(idx)).unwrap_or(&Value::Null);
+                                // serialize for BTreeMap key
+                                serde_json::to_vec(val).unwrap_or_default()
+                            }).collect::<Vec<_>>();
+                            groups.entry(key).or_default().push(r);
+                        }
+                    }
+
+                    for (_k, group_rows) in groups {
+                        let mut out_row = Vec::new();
+                        for proj_item in &projection {
+                            match proj_item {
+                                ProjectionItem::Column(c) => {
+                                    let idx = col_names.iter().position(|tc| tc == c || tc.ends_with(&format!(".{}", c)));
+                                    // Take from first row of group
+                                    out_row.push(group_rows.first().and_then(|r| idx.and_then(|i| r.get(i))).cloned().unwrap_or(crate::Value::Null));
+                                }
+                                ProjectionItem::Aggregate(op, inner) => {
+                                    let mut idx = col_names.iter().position(|tc| tc == inner || tc.ends_with(&format!(".{}", inner)));
+                                    if inner == "*" {
+                                        idx = Some(0); // For COUNT(*)
+                                    }
+                                    
+                                    match op {
+                                        AggregateOp::Count => {
+                                            let count = if inner == "*" {
+                                                group_rows.len() as i64
+                                            } else {
+                                                group_rows.iter().filter(|r| {
+                                                    idx.and_then(|i| r.get(i)).map_or(false, |v| !matches!(v, Value::Null))
+                                                }).count() as i64
+                                            };
+                                            out_row.push(Value::Int(count));
+                                        }
+                                        AggregateOp::Sum => {
+                                            let mut sum_int = 0i64;
+                                            let mut sum_float = 0f64;
+                                            let mut is_float = false;
+                                            for r in &group_rows {
+                                                if let Some(v) = idx.and_then(|i| r.get(i)) {
+                                                    match v {
+                                                        Value::Int(n) => if is_float { sum_float += *n as f64 } else { sum_int += n },
+                                                        Value::Float(f) => {
+                                                            if !is_float {
+                                                                sum_float = sum_int as f64;
+                                                                is_float = true;
+                                                            }
+                                                            sum_float += f;
+                                                        }
+                                                        _ => {}
+                                                    }
+                                                }
+                                            }
+                                            if group_rows.is_empty() {
+                                                out_row.push(Value::Null);
+                                            } else if is_float {
+                                                out_row.push(Value::Float(sum_float));
+                                            } else {
+                                                out_row.push(Value::Int(sum_int));
+                                            }
+                                        }
+                                        AggregateOp::Min => {
+                                            let mut min_val: Option<Value> = None;
+                                            for r in &group_rows {
+                                                if let Some(v) = idx.and_then(|i| r.get(i)) {
+                                                    if !matches!(v, Value::Null) {
+                                                        if let Some(cur) = &min_val {
+                                                            if compare(v, cur) == std::cmp::Ordering::Less {
+                                                                min_val = Some(v.clone());
+                                                            }
+                                                        } else {
+                                                            min_val = Some(v.clone());
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            out_row.push(min_val.unwrap_or(crate::Value::Null));
+                                        }
+                                        AggregateOp::Max => {
+                                            let mut max_val: Option<Value> = None;
+                                            for r in &group_rows {
+                                                if let Some(v) = idx.and_then(|i| r.get(i)) {
+                                                    if !matches!(v, Value::Null) {
+                                                        if let Some(cur) = &max_val {
+                                                            if compare(v, cur) == std::cmp::Ordering::Greater {
+                                                                max_val = Some(v.clone());
+                                                            }
+                                                        } else {
+                                                            max_val = Some(v.clone());
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            out_row.push(max_val.unwrap_or(crate::Value::Null));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        out_rows.push(out_row);
+                    }
+
+                    out_cols = if projection.is_empty() {
+                        col_names.clone()
+                    } else {
+                        projection.iter().map(|p| match p {
+                            ProjectionItem::Column(c) => c.clone(),
+                            ProjectionItem::Aggregate(op, inner) => format!("{:?}({})", op, inner),
+                        }).collect()
+                    };
+
+                } else {
+                    out_cols = if projection.is_empty() {
+                        col_names.clone()
+                    } else {
+                        projection.iter().filter_map(|p| match p {
+                            ProjectionItem::Column(c) => Some(c.clone()),
+                            _ => None,
+                        }).collect()
+                    };
+
+                    let indices: Vec<Option<usize>> = out_cols
+                        .iter()
+                        .map(|c| {
+                            col_names
+                                .iter()
+                                .position(|tc| tc == c || tc.ends_with(&format!(".{}", c)))
+                        })
+                        .collect();
+
+                    out_rows = stored_rows
+                        .into_iter()
+                        .map(|r| {
+                            indices
+                                .iter()
+                                .map(|i| i.and_then(|idx| r.get(idx)).cloned().unwrap_or(crate::Value::Null))
+                                .collect::<Vec<Value>>()
+                        })
+                        .collect::<Vec<_>>();
+                }
+
+                // ORDER BY for aggregates (uses out_cols). For non-aggregates, it was already sorted.
+                if is_agg {
+                    if let Some((ocol, asc)) = &order_by {
+                        let idx = out_cols
+                            .iter()
+                            .position(|c| c == ocol || c.ends_with(&format!(".{}", ocol)));
+                        if let Some(idx) = idx {
+                            out_rows.sort_by(|a, b| {
+                                let ord = compare(
+                                    a.get(idx).unwrap_or(&crate::Value::Null),
+                                    b.get(idx).unwrap_or(&crate::Value::Null),
+                                );
+                                if *asc { ord } else { ord.reverse() }
+                            });
+                        }
+                    }
+                }
+
+                // DISTINCT
+                if distinct {
+                    let mut seen = Vec::new();
+                    out_rows.retain(|r| {
+                        let is_seen = seen.iter().any(|s: &Vec<Value>| {
+                            s.iter().zip(r.iter()).all(|(va, vb)| compare(va, vb) == std::cmp::Ordering::Equal)
+                        });
+                        if is_seen {
+                            false
+                        } else {
+                            seen.push(r.clone());
+                            true
+                        }
                     });
                 }
-                if let Some(n) = limit {
-                    stored_rows.truncate(n);
+
+                // OFFSET
+                if let Some(o) = offset {
+                    if o < out_rows.len() {
+                        out_rows.drain(0..o);
+                    } else {
+                        out_rows.clear();
+                    }
                 }
 
-                // Resolve projection (empty = all columns).
-                let out_cols: Vec<String> = if projection.is_empty() {
-                    col_names.clone()
-                } else {
-                    projection.clone()
-                };
-                let indices: Vec<Option<usize>> = out_cols
-                    .iter()
-                    .map(|c| {
-                        col_names
-                            .iter()
-                            .position(|tc| tc == c || tc.ends_with(&format!(".{}", c)))
-                    })
-                    .collect();
+                // LIMIT
+                if let Some(n) = limit {
+                    out_rows.truncate(n);
+                }
 
-                let rows = stored_rows
+                let rows = out_rows
                     .into_iter()
                     .map(|r| Row {
-                        columns: indices
-                            .iter()
-                            .map(|i| i.and_then(|i| r.get(i)).map(render).unwrap_or_default())
-                            .collect(),
+                        columns: r.into_iter().map(|v| render(&v)).collect(),
                     })
                     .collect::<Vec<_>>();
 
@@ -1107,7 +1558,9 @@ impl Executor for MemExecutor {
                 table_name,
                 assignments,
                 filter,
-            } => {
+            
+returning,
+} => {
                 let tbl = self
                     .catalog_reader
                     .get_table("default", "public", &table_name)?;
@@ -1115,15 +1568,23 @@ impl Executor for MemExecutor {
                 let col_names: Vec<&str> = tbl.columns.iter().map(|c| c.name.as_str()).collect();
 
                 let mut updated = 0;
+                let mut returning_rows = Vec::new();
                 for mut row in self.scan_rows(tbl.id, &ctx.session_id)? {
-                    if !self.row_matches(&row, &tbl.columns, filter.as_ref()) {
+                    if !self.row_matches(ctx, &row, &tbl.columns, filter.as_ref()) {
                         continue;
                     }
                     let old_key =
                         format!("{}:{}", tbl.id, row.first().map(render).unwrap_or_default());
                     for (col, val) in &assignments {
                         if let Some(idx) = col_names.iter().position(|c| c == col) {
-                            row[idx] = coerce(val, column_type(&tbl.columns[idx].data_type));
+                            let coerced = match val {
+                                Value::Text(s) => coerce(s, column_type(&tbl.columns[idx].data_type)),
+                                other => other.clone(),
+                            };
+                            if !tbl.columns[idx].nullable && coerced == Value::Null {
+                                anyhow::bail!("Column {} cannot be NULL", col);
+                            }
+                            row[idx] = coerced;
                         }
                     }
                     let new_key =
@@ -1137,25 +1598,207 @@ impl Executor for MemExecutor {
                         self.delete_row(&ctx.session_id, old_key)?;
                     }
                     updated += 1;
+                    if !returning.is_empty() {
+                        returning_rows.push(row);
+                    }
                 }
-                Ok(QueryOutput::tag(&format!("UPDATE {updated}")))
+                if returning.is_empty() {
+                    Ok(QueryOutput::tag(&format!("UPDATE {updated}")))
+                } else {
+                    let indices: Vec<Option<usize>> = returning
+                        .iter()
+                        .map(|c| col_names.iter().position(|&tc| tc == c || tc.ends_with(&format!(".{}", c))))
+                        .collect();
+                    let rows = returning_rows.into_iter().map(|r| Row {
+                        columns: indices.iter().map(|i| i.and_then(|idx| r.get(idx)).map(render).unwrap_or_default()).collect()
+                    }).collect();
+                    Ok(QueryOutput {
+                        tag: format!("UPDATE {updated}"),
+                        columns: returning.clone(),
+                        rows,
+                    })
+                }
             }
-            LogicalPlan::Delete { table_name, filter } => {
+            LogicalPlan::Delete { table_name, filter ,
+returning,
+} => {
                 let tbl = self
                     .catalog_reader
                     .get_table("default", "public", &table_name)?;
                 self.authorize(ctx, Action::Delete, ResourceRef::Table(tbl.id))?;
 
                 let mut deleted = 0;
+                let mut returning_rows = Vec::new();
                 for row in self.scan_rows(tbl.id, &ctx.session_id)? {
-                    if !self.row_matches(&row, &tbl.columns, filter.as_ref()) {
+                    if !self.row_matches(ctx, &row, &tbl.columns, filter.as_ref()) {
                         continue;
                     }
                     let key = format!("{}:{}", tbl.id, row.first().map(render).unwrap_or_default());
                     self.delete_row(&ctx.session_id, key)?;
                     deleted += 1;
+                    if !returning.is_empty() {
+                        returning_rows.push(row);
+                    }
                 }
-                Ok(QueryOutput::tag(&format!("DELETE {deleted}")))
+                if returning.is_empty() {
+                    Ok(QueryOutput::tag(&format!("DELETE {deleted}")))
+                } else {
+                    let col_names: Vec<&str> = tbl.columns.iter().map(|c| c.name.as_str()).collect();
+                    let indices: Vec<Option<usize>> = returning
+                        .iter()
+                        .map(|c| col_names.iter().position(|&tc| tc == c || tc.ends_with(&format!(".{}", c))))
+                        .collect();
+                    let rows = returning_rows.into_iter().map(|r| Row {
+                        columns: indices.iter().map(|i| i.and_then(|idx| r.get(idx)).map(render).unwrap_or_default()).collect()
+                    }).collect();
+                    Ok(QueryOutput {
+                        tag: format!("DELETE {deleted}"),
+                        columns: returning.clone(),
+                        rows,
+                    })
+                }
+            }
+            LogicalPlan::AlterTable { table_name, operation } => {
+                let tbl = self
+                    .catalog_reader
+                    .get_table("default", "public", &table_name)?;
+                self.authorize(ctx, Action::CreateTable, ResourceRef::Table(tbl.id))?;
+
+                let change = match operation {
+                    AlterTableOp::AddColumn { name, data_type, nullable } => {
+                        let column = ColumnDescriptor {
+                            id: nodus_catalog::ColumnId::new(),
+                            name,
+                            version: 1,
+                            created_at: Utc::now(),
+                            updated_at: Utc::now(),
+                            state: DescriptorState::Public,
+                            data_type,
+                            nullable,
+                        };
+                        nodus_catalog::TableDescriptorChange::AddColumn { table_id: tbl.id, column }
+                    }
+                    AlterTableOp::DropColumn { name } => {
+                        nodus_catalog::TableDescriptorChange::DropColumn { table_id: tbl.id, column_name: name }
+                    }
+                    AlterTableOp::RenameTable { new_name } => {
+                        nodus_catalog::TableDescriptorChange::RenameTable { table_id: tbl.id, new_name }
+                    }
+                };
+                self.catalog_writer.update_table_descriptor(change)?;
+                Ok(QueryOutput::tag("ALTER TABLE"))
+            }
+            LogicalPlan::CreateIndex { name, table_name, columns, unique } => {
+                let tbl = self
+                    .catalog_reader
+                    .get_table("default", "public", &table_name)?;
+                self.authorize(ctx, Action::CreateTable, ResourceRef::Table(tbl.id))?;
+                
+                let mut index_cols = Vec::new();
+                for c in &columns {
+                    if let Some(col) = tbl.columns.iter().find(|tc| tc.name == *c) {
+                        index_cols.push(nodus_catalog::IndexColumn {
+                            column_id: col.id,
+                            descending: false,
+                        });
+                    } else {
+                        anyhow::bail!("Column not found for index: {}", c);
+                    }
+                }
+                
+                let idx_type = if unique { nodus_catalog::IndexType::Unique } else { nodus_catalog::IndexType::LocalSecondary };
+
+                let index = nodus_catalog::IndexDescriptor {
+                    id: nodus_catalog::IndexId::new(),
+                    name,
+                    version: 1,
+                    created_at: Utc::now(),
+                    updated_at: Utc::now(),
+                    state: DescriptorState::Public,
+                    index_type: idx_type,
+                    index_state: nodus_catalog::IndexState::Ready,
+                    key_columns: index_cols,
+                    include_columns: vec![],
+                    unique,
+                    global: false,
+                    predicate: None,
+                    expressions: vec![],
+                };
+
+                let change = nodus_catalog::TableDescriptorChange::AddIndex { table_id: tbl.id, index };
+                self.catalog_writer.update_table_descriptor(change)?;
+                Ok(QueryOutput::tag("CREATE INDEX"))
+            }
+            LogicalPlan::AlterTable { table_name, operation } => {
+                let tbl = self
+                    .catalog_reader
+                    .get_table("default", "public", &table_name)?;
+                self.authorize(ctx, Action::CreateTable, ResourceRef::Table(tbl.id))?;
+
+                let change = match operation {
+                    AlterTableOp::AddColumn { name, data_type, nullable } => {
+                        let column = ColumnDescriptor {
+                            id: nodus_catalog::ColumnId::new(),
+                            name,
+                            version: 1,
+                            created_at: Utc::now(),
+                            updated_at: Utc::now(),
+                            state: DescriptorState::Public,
+                            data_type,
+                            nullable,
+                        };
+                        nodus_catalog::TableDescriptorChange::AddColumn { table_id: tbl.id, column }
+                    }
+                    AlterTableOp::DropColumn { name } => {
+                        nodus_catalog::TableDescriptorChange::DropColumn { table_id: tbl.id, column_name: name }
+                    }
+                    AlterTableOp::RenameTable { new_name } => {
+                        nodus_catalog::TableDescriptorChange::RenameTable { table_id: tbl.id, new_name }
+                    }
+                };
+                self.catalog_writer.update_table_descriptor(change)?;
+                Ok(QueryOutput::tag("ALTER TABLE"))
+            }
+            LogicalPlan::CreateIndex { name, table_name, columns, unique } => {
+                let tbl = self
+                    .catalog_reader
+                    .get_table("default", "public", &table_name)?;
+                self.authorize(ctx, Action::CreateTable, ResourceRef::Table(tbl.id))?;
+                
+                let mut index_cols = Vec::new();
+                for c in &columns {
+                    if let Some(col) = tbl.columns.iter().find(|tc| tc.name == *c) {
+                        index_cols.push(nodus_catalog::IndexColumn {
+                            column_id: col.id,
+                            descending: false,
+                        });
+                    } else {
+                        anyhow::bail!("Column not found for index: {}", c);
+                    }
+                }
+                
+                let idx_type = if unique { nodus_catalog::IndexType::Unique } else { nodus_catalog::IndexType::LocalSecondary };
+
+                let index = nodus_catalog::IndexDescriptor {
+                    id: nodus_catalog::IndexId::new(),
+                    name,
+                    version: 1,
+                    created_at: Utc::now(),
+                    updated_at: Utc::now(),
+                    state: DescriptorState::Public,
+                    index_type: idx_type,
+                    index_state: nodus_catalog::IndexState::Ready,
+                    key_columns: index_cols,
+                    include_columns: vec![],
+                    unique,
+                    global: false,
+                    predicate: None,
+                    expressions: vec![],
+                };
+
+                let change = nodus_catalog::TableDescriptorChange::AddIndex { table_id: tbl.id, index };
+                self.catalog_writer.update_table_descriptor(change)?;
+                Ok(QueryOutput::tag("CREATE INDEX"))
             }
             LogicalPlan::Begin => {
                 let txn_record = self.txn.begin_txn()?;
@@ -1248,12 +1891,14 @@ mod tests {
         }
     }
 
-    fn cols(names: &[(&str, &str)]) -> Vec<ColumnDef> {
+    pub fn cols(names: &[(&str, &str)]) -> Vec<ColumnDef> {
         names
             .iter()
             .map(|(n, t)| ColumnDef {
                 name: n.to_string(),
                 data_type: t.to_string(),
+                nullable: true,
+                unique: false,
             })
             .collect()
     }
@@ -1262,7 +1907,7 @@ mod tests {
         Some(FilterExpr::Predicate(Predicate {
             left: col.to_string(),
             op: CompareOp::Eq,
-            right: Operand::Literal(val.to_string()),
+            right: Operand::Literal(crate::Value::Text(val.to_string())),
         }))
     }
 
@@ -1340,8 +1985,10 @@ mod tests {
                 LogicalPlan::Insert {
                     table_name: "books".into(),
                     columns: vec!["id".into(), "title".into(), "author".into()],
-                    values_list: vec![vec![id.into(), title.into(), author.into()]],
-                },
+                    values_list: vec![vec![Value::Text(id.into()), Value::Text(title.into()), Value::Text(author.into())]],
+                
+returning: vec![],
+},
             )
             .unwrap();
         }
@@ -1351,13 +1998,17 @@ mod tests {
             .execute_logical(
                 &ctx,
                 LogicalPlan::Select {
+                    group_by: vec![],
                     table_name: "books".into(),
                     joins: vec![],
                     projection: vec![],
                     filter: None,
                     order_by: None,
                     limit: None,
-                },
+                
+offset: None,
+distinct: false,
+},
             )
             .unwrap();
         assert_eq!(all.columns, vec!["books.id", "books.title", "books.author"]);
@@ -1368,13 +2019,17 @@ mod tests {
             .execute_logical(
                 &ctx,
                 LogicalPlan::Select {
+                    group_by: vec![],
                     table_name: "books".into(),
                     joins: vec![],
-                    projection: vec!["title".into(), "author".into()],
+                    projection: vec![ProjectionItem::Column("title".into()), ProjectionItem::Column("author".into())],
                     filter: eq("id", "2"),
                     order_by: None,
                     limit: None,
-                },
+                
+offset: None,
+distinct: false,
+},
             )
             .unwrap();
         assert_eq!(one.columns, vec!["title", "author"]);
@@ -1413,8 +2068,10 @@ mod tests {
             LogicalPlan::Insert {
                 table_name: "items".into(),
                 columns: vec!["id".into(), "name".into(), "active".into()],
-                values_list: vec![vec!["7".into(), "widget".into(), "true".into()]],
-            },
+                values_list: vec![vec![Value::Text("7".into()), Value::Text("widget".into()), Value::Text("true".into())]],
+            
+returning: vec![],
+},
         )
         .unwrap();
 
@@ -1423,13 +2080,17 @@ mod tests {
             .execute_logical(
                 &ctx,
                 LogicalPlan::Select {
+                    group_by: vec![],
                     table_name: "items".into(),
                     joins: vec![],
                     projection: vec![],
                     filter: eq("id", "7"),
                     order_by: None,
                     limit: None,
-                },
+                
+offset: None,
+distinct: false,
+},
             )
             .unwrap();
         assert_eq!(out.rows.len(), 1);
@@ -1469,8 +2130,10 @@ mod tests {
                 LogicalPlan::Insert {
                     table_name: "t".into(),
                     columns: vec!["id".into(), "name".into()],
-                    values_list: vec![vec![id.into(), name.into()]],
-                },
+                    values_list: vec![vec![Value::Text(id.into()), Value::Text(name.into())]],
+                
+returning: vec![],
+},
             )
             .unwrap();
         }
@@ -1481,9 +2144,11 @@ mod tests {
                 &ctx,
                 LogicalPlan::Update {
                     table_name: "t".into(),
-                    assignments: vec![("name".into(), "B".into())],
+                    assignments: vec![("name".into(), Value::Text("B".into()))],
                     filter: eq("id", "2"),
-                },
+                
+returning: vec![],
+},
             )
             .unwrap();
         assert_eq!(out.tag, "UPDATE 1");
@@ -1492,13 +2157,17 @@ mod tests {
             exec.execute_logical(
                 &ctx,
                 LogicalPlan::Select {
+                    group_by: vec![],
                     table_name: "t".into(),
                     joins: vec![],
-                    projection: vec!["name".into()],
+                    projection: vec![ProjectionItem::Column("name".into())],
                     filter,
                     order_by: None,
                     limit: None,
-                },
+                
+offset: None,
+distinct: false,
+},
             )
             .unwrap()
         };
@@ -1511,7 +2180,9 @@ mod tests {
                 LogicalPlan::Delete {
                     table_name: "t".into(),
                     filter: eq("id", "1"),
-                },
+                
+returning: vec![],
+},
             )
             .unwrap();
         assert_eq!(out.tag, "DELETE 1");
@@ -1563,8 +2234,10 @@ mod tests {
                 LogicalPlan::Insert {
                     table_name: "authors".into(),
                     columns: vec!["id".into(), "name".into()],
-                    values_list: vec![vec![id.into(), name.into()]],
-                },
+                    values_list: vec![vec![Value::Text(id.into()), Value::Text(name.into())]],
+                
+returning: vec![],
+},
             )
             .unwrap();
         }
@@ -1579,13 +2252,16 @@ mod tests {
                 LogicalPlan::Insert {
                     table_name: "books".into(),
                     columns: vec!["id".into(), "title".into(), "author_id".into()],
-                    values_list: vec![vec![id.into(), title.into(), author_id.into()]],
-                },
+                    values_list: vec![vec![Value::Text(id.into()), Value::Text(title.into()), Value::Text(author_id.into())]],
+                
+returning: vec![],
+},
             )
             .unwrap();
         }
 
         let join_plan = LogicalPlan::Select {
+                    group_by: vec![],
             table_name: "books".into(),
             joins: vec![Join {
                 table_name: "authors".into(),
@@ -1596,15 +2272,18 @@ mod tests {
                 })),
                 join_type: JoinType::Inner,
             }],
-            projection: vec!["books.title".into(), "authors.name".into()],
+            projection: vec![ProjectionItem::Column("books.title".into()), ProjectionItem::Column("authors.name".into())],
             filter: Some(FilterExpr::Predicate(Predicate {
                 left: "authors.name".into(),
                 op: CompareOp::Eq,
-                right: Operand::Literal("Herbert".into()),
+                right: Operand::Literal(Value::Text("Herbert".into())),
             })),
             order_by: Some(("books.id".into(), true)),
             limit: None,
-        };
+        
+offset: None,
+distinct: false,
+};
 
         let out = exec.execute_logical(&ctx, join_plan).unwrap();
         assert_eq!(out.columns, vec!["books.title", "authors.name"]);
@@ -1661,8 +2340,10 @@ mod tests {
             LogicalPlan::Insert {
                 table_name: "t".into(),
                 columns: vec!["id".into(), "name".into()],
-                values_list: vec![vec!["1".into(), "b".into()]],
-            },
+                values_list: vec![vec![Value::Text("1".into()), Value::Text("b".into())]],
+            
+returning: vec![],
+},
         )
         .unwrap();
 
@@ -1671,13 +2352,17 @@ mod tests {
             exec.execute_logical(
                 ctx,
                 LogicalPlan::Select {
+                    group_by: vec![],
                     table_name: "t".into(),
                     joins: vec![],
                     projection: vec![],
                     filter: None,
                     order_by: None,
                     limit: None,
-                },
+                
+offset: None,
+distinct: false,
+},
             )
             .unwrap()
             .rows
@@ -1733,8 +2418,10 @@ mod tests {
                 LogicalPlan::Insert {
                     table_name: "t".into(),
                     columns: vec![],
-                    values_list: vec![vec![id.into(), name.into(), status.into()]],
-                },
+                    values_list: vec![vec![Value::Text(id.into()), Value::Text(name.into()), Value::Text(status.into())]],
+                
+returning: vec![],
+},
             ).unwrap();
         };
 
@@ -1796,8 +2483,10 @@ mod tests {
                 LogicalPlan::Insert {
                     table_name: "users".into(),
                     columns: vec![],
-                    values_list: vec![vec![id.into(), name.into()]],
-                },
+                    values_list: vec![vec![Value::Text(id.into()), Value::Text(name.into())]],
+                
+returning: vec![],
+},
             ).unwrap();
         };
 
@@ -1807,8 +2496,10 @@ mod tests {
                 LogicalPlan::Insert {
                     table_name: "orders".into(),
                     columns: vec![],
-                    values_list: vec![vec![id.into(), uid.into(), amt.into()]],
-                },
+                    values_list: vec![vec![Value::Text(id.into()), Value::Text(uid.into()), Value::Text(amt.into())]],
+                
+returning: vec![],
+},
             ).unwrap();
         };
 
@@ -1840,5 +2531,389 @@ mod tests {
         assert_eq!(bob_row.columns[2], ""); // order.id
         assert_eq!(bob_row.columns[3], ""); // order.user_id
         assert_eq!(bob_row.columns[4], ""); // order.amount
+    }
+}
+
+#[cfg(test)]
+mod phase1_tests {
+    use super::*;
+    use nodus_audit::MemoryAuditSink;
+    use crate::tests::cols;
+
+    fn test_ctx(admin_id: PrincipalId) -> ExecutionContext {
+        ExecutionContext {
+            session_id: "test".into(),
+            principal_id: admin_id,
+            active_roles: vec![],
+            authz_catalog_version: 1,
+        }
+    }
+
+    #[test]
+    fn test_offset_distinct_returning() {
+        let (exec, cat) = MemExecutor::shared(Arc::new(MemoryAuditSink::new()));
+        let admin = cat
+            .create_role(nodus_catalog::CreateRoleRequest {
+                name: "admin".into(),
+                principal_type: nodus_catalog::PrincipalType::User,
+                database_id: None,
+            })
+            .unwrap();
+        cat.grant_privilege(nodus_catalog::GrantPrivilegeRequest {
+            principal_id: admin.id,
+            resource: nodus_catalog::ResourceRef::System,
+            privilege: "ALL".into(),
+        })
+        .unwrap();
+        let ctx = test_ctx(admin.id);
+
+        exec.execute_logical(
+            &ctx,
+            LogicalPlan::CreateTable {
+                name: "t".into(),
+                columns: cols(&[("id", "int"), ("val", "text")]),
+            },
+        ).unwrap();
+
+        // 1. Multi-row INSERT with RETURNING
+        let insert_out = exec.execute_logical(
+            &ctx,
+            LogicalPlan::Insert {
+                table_name: "t".into(),
+                columns: vec!["id".into(), "val".into()],
+                values_list: vec![
+                    vec![Value::Text("1".into()), Value::Text("A".into())],
+                    vec![Value::Text("2".into()), Value::Text("B".into())],
+                    vec![Value::Text("3".into()), Value::Text("A".into())],
+                    vec![Value::Text("4".into()), Value::Text("C".into())],
+                ],
+                returning: vec!["id".into(), "val".into()],
+            },
+        ).unwrap();
+        
+        assert_eq!(insert_out.tag, "INSERT 0 4");
+        assert_eq!(insert_out.rows.len(), 4);
+        assert_eq!(insert_out.rows[0].columns, vec!["1", "A"]);
+        assert_eq!(insert_out.rows[3].columns, vec!["4", "C"]);
+
+        let read = |offset: Option<usize>, limit: Option<usize>, distinct: bool, proj: Vec<&str>| {
+            let out = exec.execute_logical(
+                &ctx,
+                LogicalPlan::Select {
+                    group_by: vec![],
+                    table_name: "t".into(),
+                    joins: vec![],
+                    projection: proj.into_iter().map(|s| ProjectionItem::Column(s.to_string())).collect(),
+                    filter: None,
+                    order_by: None,
+                    limit,
+                    offset,
+                    distinct,
+                },
+            ).unwrap();
+            out.rows.into_iter().map(|r| r.columns.join(",")).collect::<Vec<_>>()
+        };
+
+        // 2. OFFSET and LIMIT
+        let p1 = read(None, Some(2), false, vec![]);
+        assert_eq!(p1, vec!["1,A", "2,B"]);
+
+        let p2 = read(Some(2), Some(2), false, vec![]);
+        assert_eq!(p2, vec!["3,A", "4,C"]);
+
+        let p3 = read(Some(3), None, false, vec![]);
+        assert_eq!(p3, vec!["4,C"]);
+
+        // 3. DISTINCT
+        let dist = read(None, None, true, vec!["val"]);
+        // Should only be A, B, C (3 items)
+        assert_eq!(dist.len(), 3);
+        assert!(dist.contains(&"A".to_string()));
+        assert!(dist.contains(&"B".to_string()));
+        assert!(dist.contains(&"C".to_string()));
+
+        // 4. RETURNING on UPDATE
+        let update_out = exec.execute_logical(
+            &ctx,
+            LogicalPlan::Update {
+                table_name: "t".into(),
+                assignments: vec![("val".into(), Value::Text("Z".into()))],
+                filter: Some(FilterExpr::Predicate(Predicate {
+                    left: "id".into(),
+                    op: CompareOp::Eq,
+                    right: Operand::Literal(Value::Text("2".into())),
+                })),
+                returning: vec!["id".into(), "val".into()],
+            },
+        ).unwrap();
+        assert_eq!(update_out.tag, "UPDATE 1");
+        assert_eq!(update_out.rows.len(), 1);
+        assert_eq!(update_out.rows[0].columns, vec!["2", "Z"]);
+    }
+}
+
+#[cfg(test)]
+mod phase2_tests {
+    use super::*;
+    use nodus_audit::MemoryAuditSink;
+    use crate::tests::cols;
+
+    fn test_ctx(admin_id: PrincipalId) -> ExecutionContext {
+        ExecutionContext {
+            session_id: "test".into(),
+            principal_id: admin_id,
+            active_roles: vec![],
+            authz_catalog_version: 1,
+        }
+    }
+
+    #[test]
+    fn test_group_by_aggregates() {
+        let (exec, cat) = MemExecutor::shared(Arc::new(MemoryAuditSink::new()));
+        let admin = cat
+            .create_role(nodus_catalog::CreateRoleRequest {
+                name: "admin".into(),
+                principal_type: nodus_catalog::PrincipalType::User,
+                database_id: None,
+            })
+            .unwrap();
+        cat.grant_privilege(nodus_catalog::GrantPrivilegeRequest {
+            principal_id: admin.id,
+            resource: nodus_catalog::ResourceRef::System,
+            privilege: "ALL".into(),
+        })
+        .unwrap();
+        let ctx = test_ctx(admin.id);
+
+        exec.execute_logical(
+            &ctx,
+            LogicalPlan::CreateTable {
+                name: "sales".into(),
+                columns: cols(&[("id", "int"), ("category", "text"), ("amount", "int")]),
+            },
+        ).unwrap();
+
+        let insert = |id: &str, cat: &str, amt: &str| {
+            exec.execute_logical(
+                &ctx,
+                LogicalPlan::Insert {
+                    table_name: "sales".into(),
+                    columns: vec![],
+                    values_list: vec![vec![Value::Text(id.into()), Value::Text(cat.into()), Value::Text(amt.into())]],
+                    returning: vec![],
+                },
+            ).unwrap();
+        };
+
+        insert("1", "A", "10");
+        insert("2", "A", "20");
+        insert("3", "B", "15");
+        insert("4", "C", "5");
+        insert("5", "C", "5");
+        insert("6", "C", "5");
+
+        let read = |sql: &str| {
+            let mut stmts = nodus_sql::parse_sql(sql).unwrap();
+            let plan = plan_statement(&stmts.remove(0), &[]).unwrap();
+            let out = exec.execute_logical(&ctx, plan).unwrap();
+            
+            // To ignore unpredictable hashmap/btree iteration order of groups, we'll sort the output strings.
+            let mut res: Vec<String> = out.rows.into_iter().map(|r| r.columns.join(",")).collect();
+            res.sort();
+            res
+        };
+
+        // 1. Group By with COUNT and SUM
+        let p1 = read("SELECT category, COUNT(id), SUM(amount) FROM sales GROUP BY category");
+        assert_eq!(p1, vec![
+            "A,2,30",
+            "B,1,15",
+            "C,3,15",
+        ]);
+
+        // 2. MIN / MAX
+        let p2 = read("SELECT category, MIN(amount), MAX(amount) FROM sales GROUP BY category");
+        assert_eq!(p2, vec![
+            "A,10,20",
+            "B,15,15",
+            "C,5,5",
+        ]);
+
+        // 3. Scalar Aggregation without GROUP BY
+        let p3 = read("SELECT COUNT(*), SUM(amount), MAX(amount) FROM sales");
+        assert_eq!(p3, vec!["6,60,20"]);
+
+        // 4. Scalar empty aggregation
+        // Delete all rows
+        exec.execute_logical(&ctx, LogicalPlan::Delete {
+            table_name: "sales".into(),
+            filter: None,
+            returning: vec![],
+        }).unwrap();
+
+        let p4 = read("SELECT COUNT(*) FROM sales");
+        assert_eq!(p4, vec!["0"]);
+    }
+}
+
+
+#[cfg(test)]
+mod phase3_tests {
+    use super::*;
+    use nodus_audit::MemoryAuditSink;
+    use crate::tests::cols;
+
+    fn test_ctx(admin_id: PrincipalId) -> ExecutionContext {
+        ExecutionContext {
+            session_id: "test".into(),
+            principal_id: admin_id,
+            active_roles: vec![],
+            authz_catalog_version: 1,
+        }
+    }
+
+    #[test]
+    fn test_ddl_and_subqueries() {
+        let (exec, cat) = MemExecutor::shared(Arc::new(MemoryAuditSink::new()));
+        let admin = cat
+            .create_role(nodus_catalog::CreateRoleRequest {
+                name: "admin".into(),
+                principal_type: nodus_catalog::PrincipalType::User,
+                database_id: None,
+            })
+            .unwrap();
+        cat.grant_privilege(nodus_catalog::GrantPrivilegeRequest {
+            principal_id: admin.id,
+            resource: nodus_catalog::ResourceRef::System,
+            privilege: "ALL".into(),
+        })
+        .unwrap();
+        let ctx = test_ctx(admin.id);
+
+        exec.execute_logical(
+            &ctx,
+            LogicalPlan::CreateTable {
+                name: "employees".into(),
+                columns: vec![
+                    ColumnDef { name: "id".into(), data_type: "INT".into(), nullable: false, unique: true },
+                    ColumnDef { name: "name".into(), data_type: "TEXT".into(), nullable: false, unique: false },
+                    ColumnDef { name: "dept_id".into(), data_type: "INT".into(), nullable: true, unique: false },
+                ],
+            },
+        ).unwrap();
+
+        exec.execute_logical(
+            &ctx,
+            LogicalPlan::Insert {
+                table_name: "employees".into(),
+                columns: vec![],
+                values_list: vec![
+                    vec![Value::Text("1".into()), Value::Text("Alice".into()), Value::Text("100".into())],
+                    vec![Value::Text("2".into()), Value::Text("Bob".into()), Value::Text("200".into())],
+                ],
+                returning: vec![],
+            },
+        ).unwrap();
+
+        exec.execute_logical(
+            &ctx,
+            LogicalPlan::AlterTable {
+                table_name: "employees".into(),
+                operation: AlterTableOp::AddColumn {
+                    name: "salary".into(),
+                    data_type: "INT".into(),
+                    nullable: true,
+                },
+            },
+        ).unwrap();
+
+        let tbl = cat.get_table("default", "public", "employees").unwrap();
+        assert_eq!(tbl.columns.len(), 4);
+        assert_eq!(tbl.columns[3].name, "salary");
+        assert_eq!(tbl.indexes.len(), 1);
+
+        exec.execute_logical(
+            &ctx,
+            LogicalPlan::CreateIndex {
+                name: "idx_emp_dept".into(),
+                table_name: "employees".into(),
+                columns: vec!["dept_id".into()],
+                unique: false,
+            },
+        ).unwrap();
+
+        let tbl = cat.get_table("default", "public", "employees").unwrap();
+        assert_eq!(tbl.indexes.len(), 2);
+        assert_eq!(tbl.indexes[1].name, "idx_emp_dept");
+
+        exec.execute_logical(
+            &ctx,
+            LogicalPlan::AlterTable {
+                table_name: "employees".into(),
+                operation: AlterTableOp::RenameTable {
+                    new_name: "staff".into(),
+                },
+            },
+        ).unwrap();
+
+        assert!(cat.get_table("default", "public", "employees").is_err());
+        assert!(cat.get_table("default", "public", "staff").is_ok());
+
+        exec.execute_logical(
+            &ctx,
+            LogicalPlan::CreateTable {
+                name: "departments".into(),
+                columns: cols(&[("id", "int"), ("name", "text")]),
+            },
+        ).unwrap();
+
+        exec.execute_logical(
+            &ctx,
+            LogicalPlan::Insert {
+                table_name: "departments".into(),
+                columns: vec![],
+                values_list: vec![vec![Value::Text("200".into()), Value::Text("Engineering".into())]],
+                returning: vec![],
+            },
+        ).unwrap();
+
+        let subquery = LogicalPlan::Select {
+                    group_by: vec![],
+                    table_name: "departments".into(),
+                    joins: vec![],
+                    projection: vec![ProjectionItem::Column("id".into())],
+                    filter: None,
+            order_by: None,
+            limit: None,
+            offset: None,
+            distinct: false,
+        };
+
+        let check_out = exec.execute_logical(&ctx, subquery.clone()).unwrap();
+        println!("SUBQUERY OUTPUT: {:?}", check_out);
+        
+        let filter = FilterExpr::InSubquery {
+            left: "dept_id".into(),
+            subquery: Box::new(subquery),
+            negated: false,
+        };
+
+        let out = exec.execute_logical(
+            &ctx,
+            LogicalPlan::Select {
+                    group_by: vec![],
+                    table_name: "staff".into(),
+                    joins: vec![],
+                    projection: vec![ProjectionItem::Column("name".into())],
+                    filter: Some(filter),
+                order_by: None,
+                limit: None,
+                offset: None,
+                distinct: false,
+            },
+        ).unwrap();
+
+        assert_eq!(out.rows.len(), 1);
+        assert_eq!(out.rows[0].columns[0], "Bob");
     }
 }
