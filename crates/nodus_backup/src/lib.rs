@@ -510,4 +510,42 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[tokio::test]
+    async fn test_failed_backup_manifest() {
+        let dir = std::env::temp_dir().join(format!("nodus_bk_{}", Uuid::new_v4()));
+        let repo: Arc<dyn BackupRepository> = Arc::new(FsBackupRepository::new(&dir));
+        let orch = BackupOrchestrator::new(repo.clone());
+
+        let mut manifest = BackupManifestV1 {
+            backup_id: "test-id-123".to_string(),
+            cluster_id: "c".to_string(),
+            backup_type: BackupType::Full,
+            parent_backup_id: None,
+            started_at: Utc::now(),
+            completed_at: None,
+            backup_ts: 0,
+            catalog_version: 0,
+            cluster_version: 0,
+            files: vec!["f1".to_string()],
+            checksums: std::collections::HashMap::new(),
+            status: BackupStatus::Completed,
+        };
+        manifest.checksums.insert("f1".to_string(), "abc".to_string());
+        
+        let body = serde_json::to_vec(&BackupManifest::V1(manifest.clone())).unwrap();
+        repo.put_object(&manifest_key("test-id-123"), Bytes::from(body), PutOptions { content_type: None }).await.unwrap();
+        repo.put_object("f1", Bytes::from("bad"), PutOptions { content_type: None }).await.unwrap();
+        
+        if orch.verify("test-id-123").await.is_err() {
+            manifest.status = BackupStatus::Failed;
+            let fb = serde_json::to_vec(&BackupManifest::V1(manifest)).unwrap();
+            repo.put_object(&manifest_key("test-id-123"), Bytes::from(fb), PutOptions { content_type: None }).await.unwrap();
+        }
+        
+        let m = orch.load_manifest("test-id-123").await.unwrap();
+        assert_eq!(m.status, BackupStatus::Failed);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
