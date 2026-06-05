@@ -214,10 +214,11 @@ async fn admin_backup_api_create_list_verify_restore() {
         .json()
         .await
         .unwrap();
-    // Backup now captures a catalog snapshot plus the audit trail.
-    assert_eq!(restored["restored"], 2);
+    // Backup now captures a catalog snapshot, the audit trail, and the KV dump.
+    assert_eq!(restored["restored"], 3);
     let names = restored["objects"].as_array().unwrap();
     assert!(names.iter().any(|n| n == "catalog.json"));
+    assert!(names.iter().any(|n| n == "kv_data.json"));
 }
 
 #[tokio::test]

@@ -859,6 +859,11 @@ impl MemExecutor {
         self.kv.garbage_collect(watermark)
     }
 
+    /// Exposes the underlying key-value engine, e.g., for backup payload extraction.
+    pub fn kv(&self) -> Arc<dyn KvEngine> {
+        self.kv.clone()
+    }
+
     /// Read timestamp for a session: its active transaction's snapshot, or the
     /// latest committed state when the session has no open transaction.
     fn read_ts(&self, session: &str) -> Timestamp {

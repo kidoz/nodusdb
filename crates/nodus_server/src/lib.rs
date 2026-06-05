@@ -199,10 +199,11 @@ pub async fn run_server_with_config(
     let pgwire_registry = registry.clone();
     let pgwire_slow_log = slow_log.clone();
     let pgwire_shutdown = shutdown.clone();
+    let pgwire_executor = executor.clone();
     let pgwire_task = tokio::spawn(async move {
         nodus_pgwire::start_pgwire_server(
             pgwire_listener,
-            executor,
+            pgwire_executor,
             pgwire_metrics,
             pgwire_registry,
             authenticator,
@@ -245,6 +246,7 @@ pub async fn run_server_with_config(
         upgrade,
         shards,
         slow_log,
+        kv: executor.kv(),
         draining: state.draining.clone(),
         admin_token: config.admin.token.clone(),
     };

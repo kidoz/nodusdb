@@ -35,6 +35,7 @@ pub struct AdminState {
     pub upgrade: Arc<DefaultUpgradeCoordinator>,
     pub shards: Arc<ShardOrchestrator>,
     pub slow_log: Arc<SlowQueryLog>,
+    pub kv: Arc<dyn nodus_storage_api::KvEngine>,
     /// Shared with `AppState`; flipping it makes `/readyz` report not-ready.
     pub draining: Arc<AtomicBool>,
     /// Bearer token required on admin endpoints; `None` disables auth.
@@ -194,6 +195,24 @@ async fn create_backup(State(state): State<AdminState>) -> Json<Value> {
         .unwrap_or_default();
     let audit_bytes = serde_json::to_vec(&audit_events).unwrap_or_default();
 
+    let mut kv_dump = Vec::new();
+    let range = nodus_storage_api::KeyRange {
+        start: Bytes::new(),
+        end: Bytes::from(vec![255u8; 1024]),
+    };
+    if let Ok(iter) = state.kv.scan(range, u64::MAX) {
+        for pair_res in iter {
+            if let Ok(pair) = pair_res {
+                kv_dump.push(json!({
+                    "key": pair.key.to_vec(),
+                    "value": pair.value.to_vec(),
+                    "version": pair.version,
+                }));
+            }
+        }
+    }
+    let kv_bytes = serde_json::to_vec(&kv_dump).unwrap_or_default();
+
     let objects = vec![
         BackupObject {
             name: "catalog.json".into(),
@@ -202,6 +221,10 @@ async fn create_backup(State(state): State<AdminState>) -> Json<Value> {
         BackupObject {
             name: "audit.jsonl".into(),
             bytes: Bytes::from(audit_bytes),
+        },
+        BackupObject {
+            name: "kv_data.json".into(),
+            bytes: Bytes::from(kv_bytes),
         },
     ];
     match state
