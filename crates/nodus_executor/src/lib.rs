@@ -133,9 +133,16 @@ pub enum FilterExpr {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum JoinType {
+    Inner,
+    LeftOuter,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Join {
     pub table_name: String,
     pub condition: Option<FilterExpr>,
+    pub join_type: JoinType,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -481,8 +488,29 @@ fn plan_query(query: &sqlparser::ast::Query, params: &[String]) -> Result<Logica
         other => anyhow::bail!("Unsupported FROM relation: {:?}", other),
     };
 
+    let mut joins = Vec::new();
+    for j in &select.from[0].joins {
+        let table_name = match &j.relation {
+            TableFactor::Table { name, .. } => name.to_string(),
+            other => anyhow::bail!("Unsupported join relation: {:?}", other),
+        };
+        let (join_type, condition) = match &j.join_operator {
+            JoinOperator::Inner(JoinConstraint::On(expr)) => {
+                (JoinType::Inner, parse_filter_expr(expr, params))
+            }
+            JoinOperator::LeftOuter(JoinConstraint::On(expr)) => {
+                (JoinType::LeftOuter, parse_filter_expr(expr, params))
+            }
+            other => anyhow::bail!("Unsupported join operator: {:?}", other),
+        };
+        joins.push(crate::Join {
+            table_name,
+            condition,
+            join_type,
+        });
+    }
+
     // Projection: `*` -> empty (all); otherwise plain column identifiers.
-    let joins = Vec::new();
     let mut projection = Vec::new();
     for item in &select.projection {
         match item {
@@ -994,6 +1022,7 @@ impl Executor for MemExecutor {
 
                     let mut next_rows = Vec::new();
                     for r1 in &stored_rows {
+                        let mut matched = false;
                         for r2 in &j_rows {
                             let mut combined_row = r1.clone();
                             combined_row.extend(r2.clone());
@@ -1004,7 +1033,15 @@ impl Executor for MemExecutor {
                                 join.condition.as_ref(),
                             ) {
                                 next_rows.push(combined_row);
+                                matched = true;
                             }
+                        }
+                        if !matched && matches!(join.join_type, JoinType::LeftOuter) {
+                            let mut combined_row = r1.clone();
+                            // Left join requires filling the right side with NULLs
+                            let num_nulls = j_tbl.columns.len();
+                            combined_row.extend(vec![Value::Null; num_nulls]);
+                            next_rows.push(combined_row);
                         }
                     }
                     stored_rows = next_rows;
@@ -1557,6 +1594,7 @@ mod tests {
                     op: CompareOp::Eq,
                     right: Operand::Ident("authors.id".into()),
                 })),
+                join_type: JoinType::Inner,
             }],
             projection: vec!["books.title".into(), "authors.name".into()],
             filter: Some(FilterExpr::Predicate(Predicate {
@@ -1716,5 +1754,91 @@ mod tests {
         assert_eq!(read("SELECT * FROM t WHERE name LIKE 'a%'"), 1);
         assert_eq!(read("SELECT * FROM t WHERE name LIKE '%e'"), 3); // alice, charlie, dave
         assert_eq!(read("SELECT * FROM t WHERE NOT status = 'active'"), 2);
+    }
+
+    #[test]
+    fn test_left_outer_join() {
+        let (exec, cat) = MemExecutor::shared(Arc::new(MemoryAuditSink::new()));
+        let admin = cat
+            .create_role(CreateRoleRequest {
+                name: "admin".into(),
+                principal_type: PrincipalType::User,
+                database_id: None,
+            })
+            .unwrap();
+        cat.grant_privilege(GrantPrivilegeRequest {
+            principal_id: admin.id,
+            resource: ResourceRef::System,
+            privilege: "ALL".into(),
+        })
+        .unwrap();
+        let ctx = ctx_for(admin.id);
+
+        exec.execute_logical(
+            &ctx,
+            LogicalPlan::CreateTable {
+                name: "users".into(),
+                columns: cols(&[("id", "int"), ("name", "text")]),
+            },
+        ).unwrap();
+
+        exec.execute_logical(
+            &ctx,
+            LogicalPlan::CreateTable {
+                name: "orders".into(),
+                columns: cols(&[("id", "int"), ("user_id", "int"), ("amount", "int")]),
+            },
+        ).unwrap();
+
+        let insert_user = |id: &str, name: &str| {
+            exec.execute_logical(
+                &ctx,
+                LogicalPlan::Insert {
+                    table_name: "users".into(),
+                    columns: vec![],
+                    values_list: vec![vec![id.into(), name.into()]],
+                },
+            ).unwrap();
+        };
+
+        let insert_order = |id: &str, uid: &str, amt: &str| {
+            exec.execute_logical(
+                &ctx,
+                LogicalPlan::Insert {
+                    table_name: "orders".into(),
+                    columns: vec![],
+                    values_list: vec![vec![id.into(), uid.into(), amt.into()]],
+                },
+            ).unwrap();
+        };
+
+        insert_user("1", "Alice");
+        insert_user("2", "Bob");
+        insert_user("3", "Charlie");
+
+        insert_order("101", "1", "500");
+        insert_order("102", "1", "300");
+        insert_order("103", "3", "700");
+
+        let read = |sql: &str| {
+            let mut stmts = nodus_sql::parse_sql(sql).unwrap();
+            let plan = plan_statement(&stmts.remove(0), &[]).unwrap();
+            exec.execute_logical(&ctx, plan).unwrap()
+        };
+
+        // Inner Join
+        let inner = read("SELECT * FROM users JOIN orders ON users.id = orders.user_id");
+        assert_eq!(inner.rows.len(), 3); // 2 for Alice, 0 for Bob, 1 for Charlie
+
+        // Left Join
+        let left = read("SELECT * FROM users LEFT JOIN orders ON users.id = orders.user_id");
+        assert_eq!(left.rows.len(), 4); // 2 for Alice, 1 for Bob (NULLs), 1 for Charlie
+        
+        // Let's verify Bob's row has NULLs
+        let bob_row = left.rows.iter().find(|r| r.columns[1] == "Bob").unwrap();
+        assert_eq!(bob_row.columns.len(), 5); // users(id, name) + orders(id, user_id, amount)
+        assert_eq!(bob_row.columns[2], ""); // order.id
+        assert_eq!(bob_row.columns[3], ""); // order.user_id
+        assert_eq!(bob_row.columns[4], ""); // order.amount
     }
 }
