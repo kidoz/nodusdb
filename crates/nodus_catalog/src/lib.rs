@@ -307,8 +307,10 @@ pub struct ColumnMaskDescriptor {
 }
 
 #[derive(Debug, Clone)]
-pub struct ObjectDescriptor {
-    // A resolved object that can be DB, Schema, or Table.
+pub enum ObjectDescriptor {
+    Database(DatabaseDescriptor),
+    Schema(SchemaDescriptor),
+    Table(TableDescriptor),
 }
 
 // API Traits
@@ -571,8 +573,27 @@ impl CatalogReader for MemoryCatalog {
             .ok_or_else(|| anyhow::anyhow!("Schema {} not found", schema))
     }
 
-    fn resolve_object(&self, _request: ResolveObjectRequest) -> Result<ObjectDescriptor> {
-        anyhow::bail!("resolve_object not implemented")
+    fn resolve_object(&self, request: ResolveObjectRequest) -> Result<ObjectDescriptor> {
+        // Table lookup: DB, Schema, and Name provided
+        if let (Some(db_name), Some(schema_name)) = (&request.database, &request.schema) {
+            if let Ok(table) = self.get_table(db_name, schema_name, &request.name) {
+                return Ok(ObjectDescriptor::Table(table));
+            }
+        }
+        
+        // Schema lookup: DB and Name provided
+        if let Some(db_name) = &request.database {
+            if let Ok(schema) = self.get_schema(db_name, &request.name) {
+                return Ok(ObjectDescriptor::Schema(schema));
+            }
+        }
+
+        // Database lookup
+        if let Ok(db) = self.get_database(&request.name) {
+            return Ok(ObjectDescriptor::Database(db));
+        }
+
+        anyhow::bail!("Object not found: {:?}", request.name)
     }
 
     fn get_table(&self, database: &str, schema: &str, table: &str) -> Result<TableDescriptor> {
@@ -718,8 +739,21 @@ impl CatalogWriter for MemoryCatalog {
         Ok(desc)
     }
 
-    fn grant_privileges(&self, _request: GrantPrivilegesRequest) -> Result<GrantDescriptor> {
-        anyhow::bail!("Not implemented")
+    fn grant_privileges(&self, request: GrantPrivilegesRequest) -> Result<GrantDescriptor> {
+        let mut guard = self.grants.write().unwrap();
+        let desc = GrantDescriptor {
+            id: GrantId::new(),
+            name: "grant".into(),
+            version: self.increment_version(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            state: DescriptorState::Public,
+            principal_id: request.principal_id,
+            resource: request.resource,
+            privilege: request.privilege,
+        };
+        guard.push(desc.clone());
+        Ok(desc)
     }
 
     fn revoke_privileges(&self, _request: RevokePrivilegesRequest) -> Result<()> {
