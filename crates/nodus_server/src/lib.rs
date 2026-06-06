@@ -47,7 +47,7 @@ fn backup_dir(uri: &str) -> PathBuf {
 
 /// Builds a TLS acceptor from configuration. Returns `None` when TLS is
 /// disabled. Errors if enabled but the cert/key are missing or invalid.
-fn load_tls_acceptor(tls: &nodus_config::TlsConfig) -> anyhow::Result<Option<Arc<TlsAcceptor>>> {
+fn load_tls_config(tls: &nodus_config::TlsConfig) -> anyhow::Result<Option<Arc<ServerConfig>>> {
     if !tls.enabled {
         return Ok(None);
     }
@@ -91,7 +91,7 @@ fn load_tls_acceptor(tls: &nodus_config::TlsConfig) -> anyhow::Result<Option<Arc
     let config = ServerConfig::builder()
         .with_client_cert_verifier(client_auth)
         .with_single_cert(certs, key)?;
-    Ok(Some(Arc::new(TlsAcceptor::from(Arc::new(config)))))
+    Ok(Some(Arc::new(config)))
 }
 
 /// Starts the server with default configuration.
@@ -366,7 +366,8 @@ pub async fn run_server_with_config(
     });
     authenticator.set_password("nodus", admin.id, &admin_password);
 
-    let tls_acceptor = load_tls_acceptor(&config.tls)?;
+    let server_config = load_tls_config(&config.tls)?;
+    let tls_acceptor = server_config.as_ref().map(|c| Arc::new(TlsAcceptor::from(c.clone())));
     println!("TLS acceptor loaded");
 
     // Background MVCC garbage collector: periodically reclaims superseded
@@ -509,11 +510,25 @@ pub async fn run_server_with_config(
     });
 
     let http_task = tokio::spawn(async move {
-        axum::serve(http_listener, app)
-            .with_graceful_shutdown(async move {
+        if let Some(cfg) = server_config {
+            let handle = axum_server::Handle::new();
+            let handle_clone = handle.clone();
+            tokio::spawn(async move {
                 let _ = shutdown.changed().await;
-            })
-            .await
+                handle_clone.graceful_shutdown(Some(std::time::Duration::from_secs(5)));
+            });
+            let tls_config = axum_server::tls_rustls::RustlsConfig::from_config(cfg);
+            axum_server::from_tcp_rustls(http_listener.into_std().unwrap(), tls_config).unwrap()
+                .handle(handle)
+                .serve(app.into_make_service())
+                .await
+        } else {
+            axum::serve(http_listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = shutdown.changed().await;
+                })
+                .await
+        }
     });
 
     Ok(ServerHandle {

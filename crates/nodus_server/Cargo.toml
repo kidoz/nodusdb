@@ -46,3 +46,4 @@ nodus_storage_wal = { version = "0.1.0", path = "../nodus_storage_wal" }
 reqwest = { workspace = true, features = ["json"] }
 chrono.workspace = true
 base64 = "0.22.1"
+axum-server = { version = "0.8.0", features = ["tls-rustls"] }
