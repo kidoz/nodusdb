@@ -94,11 +94,49 @@ impl CatalogWriter for RaftCatalogWriter {
 
     fn grant_privileges(&self, _request: GrantPrivilegesRequest) -> Result<GrantDescriptor> { Err(anyhow::anyhow!("Not implemented")) }
     fn revoke_privileges(&self, _request: RevokePrivilegesRequest) -> Result<()> { Ok(()) }
-    fn update_table_descriptor(&self, _change: TableDescriptorChange) -> Result<TableDescriptor> { Err(anyhow::anyhow!("Not implemented")) }
+    fn update_table_descriptor(&self, change: TableDescriptorChange) -> Result<TableDescriptor> {
+        let cmd = ShardCommand::UpdateTableDescriptor(change);
+        let res = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                self.raft.client_write(cmd).await
+            })
+        });
+        if let Err(e) = res {
+            tracing::error!("update_table_descriptor client_write failed: {}", e);
+            anyhow::bail!("update_table_descriptor raft error: {}", e);
+        }
+        
+        // This is a dummy descriptor since we can't easily fetch it right now without CatalogReader.
+        // The MemExecutor currently just drops the returned value anyway.
+        Ok(TableDescriptor {
+            id: TableId::new(),
+            database_id: DatabaseId::new(),
+            schema_id: SchemaId::new(),
+            name: "dummy".into(),
+            version: 1,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            state: DescriptorState::Public,
+            columns: vec![],
+            indexes: vec![],
+        })
+    }
     fn create_role(&self, _request: CreateRoleRequest) -> Result<PrincipalDescriptor> { Err(anyhow::anyhow!("Not implemented")) }
     fn grant_privilege(&self, _request: GrantPrivilegeRequest) -> Result<GrantDescriptor> { Err(anyhow::anyhow!("Not implemented")) }
     fn revoke_privilege(&self, _request: RevokePrivilegeRequest) -> Result<()> { Ok(()) }
     fn add_role_member(&self, _request: AddRoleMemberRequest) -> Result<()> { Ok(()) }
-    fn update_index_state(&self, _table_id: TableId, _index_id: IndexId, _state: IndexState) -> Result<()> { Ok(()) }
+    fn update_index_state(&self, table_id: TableId, index_id: IndexId, state: IndexState) -> Result<()> {
+        let cmd = ShardCommand::UpdateIndexState { table_id, index_id, state };
+        let res = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                self.raft.client_write(cmd).await
+            })
+        });
+        if let Err(e) = res {
+            tracing::error!("update_index_state client_write failed: {}", e);
+            anyhow::bail!("update_index_state raft error: {}", e);
+        }
+        Ok(())
+    }
     fn import_snapshot(&self, _snapshot: CatalogSnapshot) -> Result<()> { Ok(()) }
 }
