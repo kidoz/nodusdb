@@ -140,6 +140,8 @@ pub enum FilterExpr {
     And(Box<FilterExpr>, Box<FilterExpr>),
     Or(Box<FilterExpr>, Box<FilterExpr>),
     Not(Box<FilterExpr>),
+    IsNull(String),
+    IsNotNull(String),
     Like {
         left: String,
         right: Operand,
@@ -231,7 +233,7 @@ pub enum LogicalPlan {
         /// Conjunction of `WHERE` predicates; empty means no filter.
         filter: Option<FilterExpr>,
         /// Optional `ORDER BY (column, ascending)`.
-        order_by: Option<(String, bool)>,
+        order_by: Vec<(String, bool)>,
         /// Optional `LIMIT`.
         limit: Option<usize>,
         /// Optional `OFFSET`.
@@ -528,6 +530,8 @@ fn parse_filter_expr(expr: &sqlparser::ast::Expr, params: &[Value]) -> Option<Fi
                 None
             }
         }
+        Expr::IsNull(expr) => extract_col_name(expr).map(FilterExpr::IsNull),
+        Expr::IsNotNull(expr) => extract_col_name(expr).map(FilterExpr::IsNotNull),
         Expr::Like {
             negated,
             expr,
@@ -765,10 +769,10 @@ fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Result<Logical
     }
 
     // ORDER BY first column, if present.
-    let order_by = query.order_by.first().and_then(|o| match &o.expr {
+    let order_by = query.order_by.iter().filter_map(|o| match &o.expr {
         Expr::Identifier(id) => Some((id.value.clone(), o.asc.unwrap_or(true))),
         _ => None,
-    });
+    }).collect();
 
     // LIMIT <n>.
     let limit = query
@@ -1132,47 +1136,77 @@ impl MemExecutor {
     }
 
     /// Evaluates a FilterExpr against a joined or single row.
-    fn eval_filter(
+        fn eval_filter(
         &self,
         ctx: &ExecutionContext,
         row: &[Value],
         col_names: &[String],
         columns: &[ColumnDescriptor],
         filter: Option<&FilterExpr>,
-    ) -> bool {
+    ) -> Option<bool> {
         let Some(expr) = filter else {
-            return true;
+            return Some(true);
         };
         match expr {
             FilterExpr::And(left, right) => {
-                self.eval_filter(ctx, row, col_names, columns, Some(left))
-                    && self.eval_filter(ctx, row, col_names, columns, Some(right))
+                let l = self.eval_filter(ctx, row, col_names, columns, Some(left));
+                let r = self.eval_filter(ctx, row, col_names, columns, Some(right));
+                match (l, r) {
+                    (Some(false), _) | (_, Some(false)) => Some(false),
+                    (Some(true), Some(true)) => Some(true),
+                    _ => None,
+                }
             }
             FilterExpr::Or(left, right) => {
-                self.eval_filter(ctx, row, col_names, columns, Some(left))
-                    || self.eval_filter(ctx, row, col_names, columns, Some(right))
+                let l = self.eval_filter(ctx, row, col_names, columns, Some(left));
+                let r = self.eval_filter(ctx, row, col_names, columns, Some(right));
+                match (l, r) {
+                    (Some(true), _) | (_, Some(true)) => Some(true),
+                    (Some(false), Some(false)) => Some(false),
+                    _ => None,
+                }
             }
-            FilterExpr::Not(inner) => !self.eval_filter(ctx, row, col_names, columns, Some(inner)),
+            FilterExpr::Not(inner) => self.eval_filter(ctx, row, col_names, columns, Some(inner)).map(|b| !b),
+            FilterExpr::IsNull(col) => {
+                let idx = col_names.iter().position(|c| c == col || c.ends_with(&format!(".{}", col)));
+                if let Some(i) = idx {
+                    Some(row.get(i).unwrap_or(&Value::Null) == &Value::Null)
+                } else {
+                    Some(false)
+                }
+            }
+            FilterExpr::IsNotNull(col) => {
+                let idx = col_names.iter().position(|c| c == col || c.ends_with(&format!(".{}", col)));
+                if let Some(i) = idx {
+                    Some(row.get(i).unwrap_or(&Value::Null) != &Value::Null)
+                } else {
+                    Some(false)
+                }
+            }
             FilterExpr::Predicate(p) => {
                 let left_idx = col_names
                     .iter()
                     .position(|c| c == &p.left || c.ends_with(&format!(".{}", p.left)));
                 let Some(idx) = left_idx else {
-                    return false;
+                    return Some(false);
                 };
                 let left_cell = row.get(idx).unwrap_or(&Value::Null);
                 let right_cell =
                     self.eval_operand(row, col_names, columns, &p.right, &columns[idx].data_type);
 
+                if left_cell == &Value::Null || right_cell == Value::Null {
+                    return None;
+                }
+
                 let ord = compare(left_cell, &right_cell);
-                match p.op {
+                Some(match p.op {
                     CompareOp::Eq => *left_cell == right_cell,
                     CompareOp::Ne => *left_cell != right_cell,
                     CompareOp::Lt => ord == std::cmp::Ordering::Less,
                     CompareOp::Le => ord != std::cmp::Ordering::Greater,
                     CompareOp::Gt => ord == std::cmp::Ordering::Greater,
                     CompareOp::Ge => ord != std::cmp::Ordering::Less,
-                }
+                })
             }
             FilterExpr::Like {
                 left,
@@ -1183,24 +1217,25 @@ impl MemExecutor {
                     .iter()
                     .position(|c| c == left || c.ends_with(&format!(".{}", left)));
                 let Some(idx) = left_idx else {
-                    return false;
+                    return Some(false);
                 };
                 let left_cell = row.get(idx).unwrap_or(&Value::Null);
                 let right_cell =
                     self.eval_operand(row, col_names, columns, right, &columns[idx].data_type);
 
-                let matches = match (left_cell, &right_cell) {
-                    (Value::Text(s), Value::Text(p)) => {
-                        let regex_str = format!("^{}$", p.replace("%", ".*").replace("_", "."));
-                        if let Ok(re) = regex::Regex::new(&regex_str) {
-                            re.is_match(s)
-                        } else {
-                            false
-                        }
-                    }
-                    _ => false,
-                };
-                if *negated { !matches } else { matches }
+                if left_cell == &Value::Null || right_cell == Value::Null {
+                    return None;
+                }
+
+                if let (Value::Text(l), Value::Text(r)) = (left_cell, right_cell) {
+                    let regex_str = format!("^{}$", r.replace('%', ".*").replace('_', "."));
+                    let is_match = regex::Regex::new(&regex_str)
+                        .map(|re| re.is_match(l))
+                        .unwrap_or(false);
+                    Some(if *negated { !is_match } else { is_match })
+                } else {
+                    Some(false)
+                }
             }
             FilterExpr::InList {
                 left,
@@ -1211,20 +1246,44 @@ impl MemExecutor {
                     .iter()
                     .position(|c| c == left || c.ends_with(&format!(".{}", left)));
                 let Some(idx) = left_idx else {
-                    return false;
+                    return Some(false);
                 };
                 let left_cell = row.get(idx).unwrap_or(&Value::Null);
+                
+                if left_cell == &Value::Null {
+                    return None;
+                }
 
-                let mut matches = false;
+                let mut is_match = false;
+                let mut found_null = false;
                 for op in list {
                     let right_cell =
                         self.eval_operand(row, col_names, columns, op, &columns[idx].data_type);
-                    if *left_cell == right_cell {
-                        matches = true;
+                    if right_cell == Value::Null {
+                        found_null = true;
+                    } else if *left_cell == right_cell {
+                        is_match = true;
                         break;
                     }
                 }
-                if *negated { !matches } else { matches }
+                
+                if *negated {
+                    if is_match {
+                        Some(false)
+                    } else if found_null {
+                        None
+                    } else {
+                        Some(true)
+                    }
+                } else {
+                    if is_match {
+                        Some(true)
+                    } else if found_null {
+                        None
+                    } else {
+                        Some(false)
+                    }
+                }
             }
             FilterExpr::InSubquery {
                 left,
@@ -1235,14 +1294,16 @@ impl MemExecutor {
                     .iter()
                     .position(|c| c == left || c.ends_with(&format!(".{}", left)));
                 let Some(idx) = left_idx else {
-                    return false;
+                    return Some(false);
                 };
                 let left_cell = row.get(idx).unwrap_or(&Value::Null);
 
-                let exec_res = self.execute_logical(ctx, *subquery.clone());
-                if exec_res.is_err() {
-                    println!("SUBQUERY ERROR: {:?}", exec_res);
+                if left_cell == &Value::Null {
+                    return None;
                 }
+
+                // Blocking execution
+                let exec_res = self.execute_logical_inner(ctx, *subquery.clone());
                 let out = exec_res.unwrap_or(QueryOutput {
                     columns: vec![],
                     types: vec![],
@@ -1251,22 +1312,41 @@ impl MemExecutor {
                 });
 
                 let mut matches = false;
+                let mut found_null = false;
                 for r in out.rows {
                     if let Some(c) = r.values.first() {
                         let right_cell = coerce(&render(c), column_type(&columns[idx].data_type));
-                        if *left_cell == right_cell {
+                        if right_cell == Value::Null {
+                            found_null = true;
+                        } else if *left_cell == right_cell {
                             matches = true;
                             break;
                         }
                     }
                 }
-                if *negated { !matches } else { matches }
+
+                if *negated {
+                    if matches {
+                        Some(false)
+                    } else if found_null {
+                        None
+                    } else {
+                        Some(true)
+                    }
+                } else {
+                    if matches {
+                        Some(true)
+                    } else if found_null {
+                        None
+                    } else {
+                        Some(false)
+                    }
+                }
             }
         }
     }
 
-    /// Evaluates an optional equality filter against a typed row.
-    fn row_matches(
+fn row_matches(
         &self,
         ctx: &ExecutionContext,
         row: &[Value],
@@ -1274,7 +1354,7 @@ impl MemExecutor {
         filter: Option<&FilterExpr>,
     ) -> bool {
         let col_names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
-        self.eval_filter(ctx, row, &col_names, columns, filter)
+        self.eval_filter(ctx, row, &col_names, columns, filter).unwrap_or(false)
     }
 
     /// Deny-by-default authorization gate for a single action on a resource.
@@ -1646,7 +1726,7 @@ impl MemExecutor {
                                 &combined_cols,
                                 &combined_desc,
                                 join.condition.as_ref(),
-                            ) {
+                            ).unwrap_or(false) {
                                 next_rows.push(combined_row);
                                 matched = true;
                             }
@@ -1666,7 +1746,7 @@ impl MemExecutor {
 
                 // WHERE: conjunction of typed predicates.
                 stored_rows.retain(|r| {
-                    self.eval_filter(ctx, r, &col_names, &joined_columns, filter.as_ref())
+                    self.eval_filter(ctx, r, &col_names, &joined_columns, filter.as_ref()).unwrap_or(false)
                 });
 
                 // GROUP BY & Aggregation
@@ -1676,19 +1756,28 @@ impl MemExecutor {
                         .any(|p| matches!(p, ProjectionItem::Aggregate(_, _)));
 
                 if !is_agg {
-                    if let Some((ocol, asc)) = &order_by {
-                        let idx = col_names
-                            .iter()
-                            .position(|c| c == ocol || c.ends_with(&format!(".{}", ocol)));
-                        if let Some(idx) = idx {
-                            stored_rows.sort_by(|a, b| {
-                                let ord = compare(
-                                    a.get(idx).unwrap_or(&crate::Value::Null),
-                                    b.get(idx).unwrap_or(&crate::Value::Null),
-                                );
-                                if *asc { ord } else { ord.reverse() }
-                            });
+                    if !order_by.is_empty() {
+                        let mut order_indices = Vec::new();
+                        for (ocol, asc) in &order_by {
+                            let idx = col_names
+                                .iter()
+                                .position(|c| c == ocol || c.ends_with(&format!(".{}", ocol)));
+                            if let Some(i) = idx {
+                                order_indices.push((i, *asc));
+                            }
                         }
+                        stored_rows.sort_by(|a, b| {
+                            for (idx, asc) in &order_indices {
+                                let ord = compare(
+                                    a.get(*idx).unwrap_or(&crate::Value::Null),
+                                    b.get(*idx).unwrap_or(&crate::Value::Null),
+                                );
+                                if ord != std::cmp::Ordering::Equal {
+                                    return if *asc { ord } else { ord.reverse() };
+                                }
+                            }
+                            std::cmp::Ordering::Equal
+                        });
                     }
                 }
 
@@ -1898,19 +1987,28 @@ impl MemExecutor {
 
                 // ORDER BY for aggregates (uses out_cols). For non-aggregates, it was already sorted.
                 if is_agg {
-                    if let Some((ocol, asc)) = &order_by {
-                        let idx = out_cols
-                            .iter()
-                            .position(|c| c == ocol || c.ends_with(&format!(".{}", ocol)));
-                        if let Some(idx) = idx {
-                            out_rows.sort_by(|a, b| {
-                                let ord = compare(
-                                    a.get(idx).unwrap_or(&crate::Value::Null),
-                                    b.get(idx).unwrap_or(&crate::Value::Null),
-                                );
-                                if *asc { ord } else { ord.reverse() }
-                            });
+                    if !order_by.is_empty() {
+                        let mut order_indices = Vec::new();
+                        for (ocol, asc) in &order_by {
+                            let idx = out_cols
+                                .iter()
+                                .position(|c| c == ocol || c.ends_with(&format!(".{}", ocol)));
+                            if let Some(i) = idx {
+                                order_indices.push((i, *asc));
+                            }
                         }
+                        out_rows.sort_by(|a, b| {
+                            for (idx, asc) in &order_indices {
+                                let ord = compare(
+                                    a.get(*idx).unwrap_or(&crate::Value::Null),
+                                    b.get(*idx).unwrap_or(&crate::Value::Null),
+                                );
+                                if ord != std::cmp::Ordering::Equal {
+                                    return if *asc { ord } else { ord.reverse() };
+                                }
+                            }
+                            std::cmp::Ordering::Equal
+                        });
                     }
                 }
 
@@ -2542,7 +2640,7 @@ fn render_row(row: &Row) -> Vec<String> {
                     joins: vec![],
                     projection: vec![],
                     filter: None,
-                    order_by: None,
+                    order_by: vec![],
                     limit: None,
 
                     offset: None,
@@ -2566,7 +2664,7 @@ fn render_row(row: &Row) -> Vec<String> {
                         ProjectionItem::Column("author".into()),
                     ],
                     filter: eq("id", "2"),
-                    order_by: None,
+                    order_by: vec![],
                     limit: None,
 
                     offset: None,
@@ -2633,7 +2731,7 @@ fn render_row(row: &Row) -> Vec<String> {
                     joins: vec![],
                     projection: vec![],
                     filter: eq("id", "7"),
-                    order_by: None,
+                    order_by: vec![],
                     limit: None,
 
                     offset: None,
@@ -2712,7 +2810,7 @@ fn render_row(row: &Row) -> Vec<String> {
                     joins: vec![],
                     projection: vec![ProjectionItem::Column("name".into())],
                     filter,
-                    order_by: None,
+                    order_by: vec![],
                     limit: None,
 
                     offset: None,
@@ -2837,7 +2935,7 @@ fn render_row(row: &Row) -> Vec<String> {
                 op: CompareOp::Eq,
                 right: Operand::Literal(Value::Text("Herbert".into())),
             })),
-            order_by: Some(("books.id".into(), true)),
+            order_by: vec![("books.id".into(), true)],
             limit: None,
 
             offset: None,
@@ -2918,7 +3016,7 @@ fn render_row(row: &Row) -> Vec<String> {
                     joins: vec![],
                     projection: vec![],
                     filter: None,
-                    order_by: None,
+                    order_by: vec![],
                     limit: None,
 
                     offset: None,
@@ -3125,6 +3223,10 @@ mod phase1_tests {
     use crate::tests::cols;
     use nodus_audit::MemoryAuditSink;
 
+    fn render_row(row: &Row) -> Vec<String> {
+        row.values.iter().map(render).collect()
+    }
+
     fn test_ctx(admin_id: PrincipalId) -> ExecutionContext {
         ExecutionContext {
             session_id: "test".into(),
@@ -3183,8 +3285,8 @@ mod phase1_tests {
 
         assert_eq!(insert_out.tag, "INSERT 0 4");
         assert_eq!(insert_out.rows.len(), 4);
-        assert_eq!(insert_render_row(&out.rows[0]), vec!["1", "A"]);
-        assert_eq!(insert_render_row(&out.rows[3]), vec!["4", "C"]);
+        assert_eq!(render_row(&insert_out.rows[0]), vec!["1", "A"]);
+        assert_eq!(render_row(&insert_out.rows[3]), vec!["4", "C"]);
 
         let read =
             |offset: Option<usize>, limit: Option<usize>, distinct: bool, proj: Vec<&str>| {
@@ -3200,7 +3302,7 @@ mod phase1_tests {
                                 .map(|s| ProjectionItem::Column(s.to_string()))
                                 .collect(),
                             filter: None,
-                            order_by: None,
+                            order_by: vec![],
                             limit,
                             offset,
                             distinct,
@@ -3209,7 +3311,7 @@ mod phase1_tests {
                     .unwrap();
                 out.rows
                     .into_iter()
-                    .map(|r| render_row(r).join(","))
+                    .map(|r| render_row(&r).join(","))
                     .collect::<Vec<_>>()
             };
 
@@ -3249,7 +3351,7 @@ mod phase1_tests {
             .unwrap();
         assert_eq!(update_out.tag, "UPDATE 1");
         assert_eq!(update_out.rows.len(), 1);
-        assert_eq!(update_render_row(&out.rows[0]), vec!["2", "Z"]);
+        assert_eq!(render_row(&update_out.rows[0]), vec!["2", "Z"]);
     }
 }
 
@@ -3333,7 +3435,7 @@ fn render_row(row: &Row) -> Vec<String> {
             let out = exec.execute_logical(&ctx, plan).unwrap();
 
             // To ignore unpredictable hashmap/btree iteration order of groups, we'll sort the output strings.
-            let mut res: Vec<String> = out.rows.into_iter().map(|r| render_row(r).join(",")).collect();
+            let mut res: Vec<String> = out.rows.into_iter().map(|r| render_row(&r).join(",")).collect();
             res.sort();
             res
         };
@@ -3534,7 +3636,7 @@ fn render_row(row: &Row) -> Vec<String> {
             joins: vec![],
             projection: vec![ProjectionItem::Column("id".into())],
             filter: None,
-            order_by: None,
+            order_by: vec![],
             limit: None,
             offset: None,
             distinct: false,
@@ -3558,7 +3660,7 @@ fn render_row(row: &Row) -> Vec<String> {
                     joins: vec![],
                     projection: vec![ProjectionItem::Column("name".into())],
                     filter: Some(filter),
-                    order_by: None,
+                    order_by: vec![],
                     limit: None,
                     offset: None,
                     distinct: false,
@@ -3785,7 +3887,7 @@ fn render_row(row: &Row) -> Vec<String> {
                         op: CompareOp::Eq,
                         right: Operand::Literal(Value::Text("A".into())),
                     })),
-                    order_by: Some(("id".into(), true)),
+                    order_by: vec![("id".into(), true)],
                     limit: None,
                     offset: None,
                     distinct: false,
@@ -3828,7 +3930,7 @@ fn render_row(row: &Row) -> Vec<String> {
                         op: CompareOp::Eq,
                         right: Operand::Literal(Value::Text("A".into())),
                     })),
-                    order_by: Some(("id".into(), true)),
+                    order_by: vec![("id".into(), true)],
                     limit: None,
                     offset: None,
                     distinct: false,
@@ -3851,7 +3953,7 @@ fn render_row(row: &Row) -> Vec<String> {
                         op: CompareOp::Eq,
                         right: Operand::Literal(Value::Text("B".into())),
                     })),
-                    order_by: Some(("id".into(), true)),
+                    order_by: vec![("id".into(), true)],
                     limit: None,
                     offset: None,
                     distinct: false,
@@ -3889,7 +3991,7 @@ fn render_row(row: &Row) -> Vec<String> {
                         op: CompareOp::Eq,
                         right: Operand::Literal(Value::Text("B".into())),
                     })),
-                    order_by: Some(("id".into(), true)),
+                    order_by: vec![("id".into(), true)],
                     limit: None,
                     offset: None,
                     distinct: false,
@@ -3978,7 +4080,7 @@ fn render_row(row: &Row) -> Vec<String> {
                     projection: vec![],
                     group_by: vec![],
                     filter: None,
-                    order_by: None,
+                    order_by: vec![],
                     limit: None,
                     offset: None,
                     distinct: false,
@@ -4009,7 +4111,7 @@ fn render_row(row: &Row) -> Vec<String> {
                     projection: vec![],
                     group_by: vec![],
                     filter: None,
-                    order_by: None,
+                    order_by: vec![],
                     limit: None,
                     offset: None,
                     distinct: false,
@@ -4037,7 +4139,7 @@ fn render_row(row: &Row) -> Vec<String> {
                     projection: vec![],
                     group_by: vec![],
                     filter: None,
-                    order_by: None,
+                    order_by: vec![],
                     limit: None,
                     offset: None,
                     distinct: false,
