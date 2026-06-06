@@ -8,6 +8,7 @@ use openraft::raft::{
 };
 
 pub struct NodusNetwork {
+    shard_id: String,
     target: u64,
     target_node: BasicNode,
     client: reqwest::Client,
@@ -19,7 +20,7 @@ impl RaftNetwork<NodusTypeConfig> for NodusNetwork {
         rpc: AppendEntriesRequest<NodusTypeConfig>,
         _option: RPCOption,
     ) -> Result<AppendEntriesResponse<u64>, RPCError<u64, BasicNode, RaftError<u64>>> {
-        let url = format!("http://{}/raft/append", self.target_node.addr);
+        let url = format!("http://{}/raft/{}/append", self.target_node.addr, self.shard_id);
         let resp = self
             .client
             .post(url)
@@ -44,7 +45,7 @@ impl RaftNetwork<NodusTypeConfig> for NodusNetwork {
         InstallSnapshotResponse<u64>,
         RPCError<u64, BasicNode, RaftError<u64, InstallSnapshotError>>,
     > {
-        let url = format!("http://{}/raft/snapshot", self.target_node.addr);
+        let url = format!("http://{}/raft/{}/snapshot", self.target_node.addr, self.shard_id);
         let resp = self
             .client
             .post(url)
@@ -66,7 +67,7 @@ impl RaftNetwork<NodusTypeConfig> for NodusNetwork {
         rpc: VoteRequest<u64>,
         _option: RPCOption,
     ) -> Result<VoteResponse<u64>, RPCError<u64, BasicNode, RaftError<u64>>> {
-        let url = format!("http://{}/raft/vote", self.target_node.addr);
+        let url = format!("http://{}/raft/{}/vote", self.target_node.addr, self.shard_id);
         let resp = self
             .client
             .post(url)
@@ -85,20 +86,16 @@ impl RaftNetwork<NodusTypeConfig> for NodusNetwork {
 }
 
 pub struct NodusNetworkFactory {
+    shard_id: String,
     client: reqwest::Client,
 }
 
 impl NodusNetworkFactory {
-    pub fn new() -> Self {
+    pub fn new(shard_id: String) -> Self {
         Self {
+            shard_id,
             client: reqwest::Client::new(),
         }
-    }
-}
-
-impl Default for NodusNetworkFactory {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -107,6 +104,7 @@ impl RaftNetworkFactory<NodusTypeConfig> for NodusNetworkFactory {
 
     async fn new_client(&mut self, target: u64, node: &BasicNode) -> Self::Network {
         NodusNetwork {
+            shard_id: self.shard_id.clone(),
             target,
             target_node: node.clone(),
             client: self.client.clone(),

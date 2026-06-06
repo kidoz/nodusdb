@@ -78,6 +78,11 @@ pub enum ShardCommand {
         index_id: nodus_catalog::IndexId,
         state: nodus_catalog::IndexState,
     },
+    // Upgrade Replication Commands
+    UpgradeStart { target_version: String },
+    UpgradeNodeUpgraded { node_id: String },
+    UpgradeFinalize,
+    UpgradeRollback,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -89,7 +94,9 @@ pub struct StateMachine {
     pub last_applied_log: Option<LogId<u64>>,
     pub last_membership: StoredMembership<u64, openraft::BasicNode>,
     pub kv: Option<Arc<dyn nodus_storage_api::KvEngine>>,
-    pub catalog: Option<Arc<dyn nodus_catalog::CatalogWriter>>,
+    pub catalog_writer: Option<Arc<dyn nodus_catalog::CatalogWriter>>,
+    pub catalog_reader: Option<Arc<dyn nodus_catalog::CatalogReader>>,
+    pub upgrade: Option<Arc<dyn nodus_upgrade::UpgradeCoordinator>>,
 }
 
 #[derive(Clone)]
@@ -114,12 +121,14 @@ impl NodusRaftStore {
                 last_applied_log: None,
                 last_membership: StoredMembership::default(),
                 kv: None,
-                catalog: None,
+                catalog_writer: None,
+                catalog_reader: None,
+                upgrade: None,
             })),
         }
     }
 
-    pub fn with_kv_and_catalog(kv: Arc<dyn nodus_storage_api::KvEngine>, catalog: Arc<dyn nodus_catalog::CatalogWriter>) -> Self {
+    pub fn with_kv_and_catalog(kv: Arc<dyn nodus_storage_api::KvEngine>, catalog_writer: Arc<dyn nodus_catalog::CatalogWriter>, catalog_reader: Arc<dyn nodus_catalog::CatalogReader>) -> Self {
         Self {
             log: Arc::new(RwLock::new(BTreeMap::new())),
             vote: Arc::new(RwLock::new(None)),
@@ -127,7 +136,29 @@ impl NodusRaftStore {
                 last_applied_log: None,
                 last_membership: StoredMembership::default(),
                 kv: Some(kv),
-                catalog: Some(catalog),
+                catalog_writer: Some(catalog_writer),
+                catalog_reader: Some(catalog_reader),
+                upgrade: None,
+            })),
+        }
+    }
+
+    pub fn with_components(
+        kv: Arc<dyn nodus_storage_api::KvEngine>,
+        catalog_writer: Arc<dyn nodus_catalog::CatalogWriter>,
+        catalog_reader: Arc<dyn nodus_catalog::CatalogReader>,
+        upgrade: Arc<dyn nodus_upgrade::UpgradeCoordinator>,
+    ) -> Self {
+        Self {
+            log: Arc::new(RwLock::new(BTreeMap::new())),
+            vote: Arc::new(RwLock::new(None)),
+            state_machine: Arc::new(RwLock::new(StateMachine {
+                last_applied_log: None,
+                last_membership: StoredMembership::default(),
+                kv: Some(kv),
+                catalog_writer: Some(catalog_writer),
+                catalog_reader: Some(catalog_reader),
+                upgrade: Some(upgrade),
             })),
         }
     }
@@ -147,17 +178,45 @@ impl RaftLogReader<NodusTypeConfig> for NodusRaftStore {
     }
 }
 
+#[derive(Serialize, Deserialize)]
+struct FullStateSnapshot {
+    pub catalog: Option<nodus_catalog::CatalogSnapshot>,
+    pub kv: Vec<(Vec<u8>, Vec<u8>, u64)>,
+}
+
 impl RaftSnapshotBuilder<NodusTypeConfig> for NodusRaftStore {
     async fn build_snapshot(&mut self) -> Result<Snapshot<NodusTypeConfig>, StorageError<u64>> {
         let sm = self.state_machine.read().await;
 
-        let data_bytes = b"{}".to_vec();
+        let mut kv_data = vec![];
+        if let Some(kv) = &sm.kv {
+            let range = nodus_storage_api::KeyRange {
+                start: bytes::Bytes::new(),
+                end: bytes::Bytes::from(vec![255u8; 1024]),
+            };
+            if let Ok(iter) = kv.scan(range, u64::MAX) {
+                for pair_res in iter {
+                    if let Ok(pair) = pair_res {
+                        kv_data.push((pair.key.to_vec(), pair.value.to_vec(), pair.version));
+                    }
+                }
+            }
+        }
+
+        let catalog_snapshot = sm.catalog_reader.as_ref().map(|c| c.export_snapshot());
+
+        let snapshot_obj = FullStateSnapshot {
+            catalog: catalog_snapshot,
+            kv: kv_data,
+        };
+
+        let data_bytes = serde_json::to_vec(&snapshot_obj).unwrap_or_else(|_| b"{}".to_vec());
 
         Ok(Snapshot {
             meta: SnapshotMeta {
                 last_log_id: sm.last_applied_log,
                 last_membership: sm.last_membership.clone(),
-                snapshot_id: "snapshot".to_string(),
+                snapshot_id: format!("snapshot-{}", uuid::Uuid::new_v4()),
             },
             snapshot: Box::new(Cursor::new(data_bytes)),
         })
@@ -285,7 +344,7 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
                             _ => {}
                         }
                     }
-                    if let Some(catalog) = &sm.catalog {
+                    if let Some(catalog) = &sm.catalog_writer {
                         match cmd {
                             ShardCommand::CreateDatabase(req) => { 
                                 if let Err(e) = catalog.create_database(req.clone()) {
@@ -314,6 +373,31 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
                             ShardCommand::RevokePrivilege(req) => { let _ = catalog.revoke_privilege(req.clone()); }
                             ShardCommand::AddRoleMember(req) => { let _ = catalog.add_role_member(req.clone()); }
                             ShardCommand::UpdateIndexState { table_id, index_id, state } => { let _ = catalog.update_index_state(table_id.clone(), index_id.clone(), state.clone()); }
+                            _ => {}
+                        }
+                    }
+                    if let Some(upgrade) = &sm.upgrade {
+                        match cmd {
+                            ShardCommand::UpgradeStart { target_version } => {
+                                if let Err(e) = upgrade.start_upgrade(target_version.clone()) {
+                                    tracing::error!("UpgradeStart error: {}", e);
+                                }
+                            }
+                            ShardCommand::UpgradeNodeUpgraded { node_id } => {
+                                if let Err(e) = upgrade.report_node_upgraded(node_id) {
+                                    tracing::error!("UpgradeNodeUpgraded error: {}", e);
+                                }
+                            }
+                            ShardCommand::UpgradeFinalize => {
+                                if let Err(e) = upgrade.finalize_upgrade() {
+                                    tracing::error!("UpgradeFinalize error: {}", e);
+                                }
+                            }
+                            ShardCommand::UpgradeRollback => {
+                                if let Err(e) = upgrade.rollback() {
+                                    tracing::error!("UpgradeRollback error: {}", e);
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -348,8 +432,26 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
         sm.last_applied_log = meta.last_log_id;
         sm.last_membership = meta.last_membership.clone();
 
-        // KV snapshot installation would happen here
-        let _ = snapshot.into_inner();
+        let data = snapshot.into_inner();
+        if let Ok(snapshot_obj) = serde_json::from_slice::<FullStateSnapshot>(&data) {
+            if let Some(cat_snap) = snapshot_obj.catalog {
+                if let Some(cat) = &sm.catalog_writer {
+                    let _ = cat.import_snapshot(cat_snap);
+                }
+            }
+            if let Some(kv) = &sm.kv {
+                // To restore KV, we iterate and inject rows.
+                // Depending on the KV engine, we may need to clear it first.
+                // For MVP, we'll just write_intent and commit the dumped versions.
+                use nodus_storage_api::TxnId;
+                use bytes::Bytes;
+                for (k, v, version) in snapshot_obj.kv {
+                    let tid = TxnId::new();
+                    let _ = kv.write_intent(tid, Bytes::from(k), Bytes::from(v));
+                    let _ = kv.commit(tid, version);
+                }
+            }
+        }
 
         Ok(())
     }

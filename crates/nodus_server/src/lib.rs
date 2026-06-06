@@ -175,8 +175,8 @@ pub async fn run_server_with_config(
     println!("Initializing raft network and state");
     let raft_config = Arc::new(openraft::Config::default().validate().unwrap());
     let (log_store, state_machine) =
-        openraft::storage::Adaptor::new(nodus_raftstore::NodusRaftStore::with_kv_and_catalog(local_kv.clone(), catalog.clone()));
-    let raft_network = nodus_raftstore::network::NodusNetworkFactory::new();
+        openraft::storage::Adaptor::new(nodus_raftstore::NodusRaftStore::with_kv_and_catalog(local_kv.clone(), catalog.clone(), catalog.clone()));
+    let raft_network = nodus_raftstore::network::NodusNetworkFactory::new("shard-meta".to_string());
     let raft = nodus_raftstore::server::NodusRaft::new(
         config.cluster.node_id,
         raft_config,
@@ -199,9 +199,13 @@ pub async fn run_server_with_config(
         raft: raft.clone(),
     });
 
+    let raft_state = nodus_raftstore::server::RaftState::new();
+    raft_state.rafts.write().await.insert("shard-meta".to_string(), raft.clone());
+
     let raft_catalog_writer = Arc::new(crate::raft_catalog::RaftCatalogWriter {
         local: catalog.clone(),
-        raft: raft.clone(),
+        reader: catalog.clone(),
+        raft_state: raft_state.clone(),
     });
 
     let txn = Arc::new(nodus_txn::MemTxnManager::new());
@@ -466,11 +470,11 @@ pub async fn run_server_with_config(
         wal_key: encryption_key,
         draining: state.draining.clone(),
         admin_token: config.admin.token.clone(),
-        raft: raft.clone(),
+        raft_state: raft_state.clone(),
         membership_lock: Arc::new(tokio::sync::Mutex::new(())),
     };
 
-    let raft_state = nodus_raftstore::server::RaftState { raft: raft.clone() };
+    
 
     let app = Router::new()
         .merge(monitoring_routes(state.clone()))

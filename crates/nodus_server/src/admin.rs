@@ -17,7 +17,6 @@ use nodus_monitoring::{SlowQuery, SlowQueryLog};
 use nodus_security::{SessionInfo, SessionRegistry};
 use nodus_sharding::ShardOrchestrator;
 use nodus_storage_wal::WalEngine;
-use nodus_upgrade::{DefaultUpgradeCoordinator, UpgradeCoordinator};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -34,7 +33,7 @@ pub struct AdminState {
     pub catalog: Arc<dyn CatalogReader>,
     pub catalog_writer: Arc<dyn CatalogWriter>,
     pub backup: Arc<BackupOrchestrator>,
-    pub upgrade: Arc<DefaultUpgradeCoordinator>,
+    pub upgrade: Arc<dyn nodus_upgrade::UpgradeCoordinator>,
     pub shards: Arc<ShardOrchestrator>,
     pub slow_log: Arc<SlowQueryLog>,
     pub kv: Arc<dyn nodus_storage_api::KvEngine>,
@@ -43,7 +42,7 @@ pub struct AdminState {
     pub draining: Arc<AtomicBool>,
     /// Bearer token required on admin endpoints; `None` disables auth.
     pub admin_token: Option<String>,
-    pub raft: nodus_raftstore::server::NodusRaft,
+    pub raft_state: nodus_raftstore::server::RaftState,
     pub membership_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
@@ -104,13 +103,14 @@ async fn cluster_join(
 ) -> impl axum::response::IntoResponse {
     let _guard = state.membership_lock.lock().await;
     let node = openraft::BasicNode::new(&req.raft_advertise_addr);
-    match state.raft.add_learner(req.node_id, node, true).await {
+    let raft = state.raft_state.rafts.read().await.get("shard-meta").cloned().unwrap();
+    match raft.add_learner(req.node_id, node, true).await {
         Ok(_) => {
             // Once learner is added, attempt to promote it to a voter.
-            let metrics = state.raft.metrics().borrow().clone();
+            let metrics = raft.metrics().borrow().clone();
             let mut members: std::collections::BTreeSet<u64> = metrics.membership_config.membership().voter_ids().collect();
             members.insert(req.node_id);
-            match state.raft.change_membership(members, true).await {
+            match raft.change_membership(members, true).await {
                 Ok(_) => (StatusCode::OK, Json(json!({ "joined": true, "node_id": req.node_id }))),
                 Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("Failed to change membership: {}", e) }))),
             }

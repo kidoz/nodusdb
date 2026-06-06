@@ -55,7 +55,8 @@ impl Model for RegisterModel {
 }
 
 async fn read_val(State(state): State<RaftState>) -> Json<i32> {
-    let sm = state.raft.with_raft_state(|rs| rs.clone()).await;
+    let raft = state.rafts.read().await.get("shard-meta").cloned().unwrap();
+    let sm = raft.with_raft_state(|rs| rs.clone()).await;
     let _ = sm;
     Json(0)
 }
@@ -71,10 +72,11 @@ async fn write_val(State(state): State<RaftState>, Json(val): Json<i32>) -> Json
         txn_id,
         commit_ts: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_micros() as u64,
     };
-    if state.raft.client_write(cmd1).await.is_err() {
+    let raft = state.rafts.read().await.get("shard-meta").cloned().unwrap();
+    if raft.client_write(cmd1).await.is_err() {
         return Json(false);
     }
-    match state.raft.client_write(cmd2).await {
+    match raft.client_write(cmd2).await {
         Ok(_) => Json(true),
         Err(_) => Json(false),
     }
@@ -101,7 +103,8 @@ async fn init_cluster(State(state): State<RaftState>) -> Json<bool> {
         },
     );
 
-    let _ = state.raft.initialize(nodes).await;
+    let raft = state.rafts.read().await.get("shard-meta").cloned().unwrap();
+    let _ = raft.initialize(nodes).await;
     Json(true)
 }
 
@@ -196,7 +199,7 @@ async fn test_cluster_partition_linearizability() {
 
         let kv = Arc::new(nodus_storage_mem::MemKvEngine::new());
         let catalog = std::sync::Arc::new(nodus_catalog::MemoryCatalog::new());
-        let store = NodusRaftStore::with_kv_and_catalog(kv, catalog);
+        let store = NodusRaftStore::with_kv_and_catalog(kv, catalog.clone(), catalog.clone());
         stores.insert(i as u64, store.clone());
         let raft_config_clone = raft_config.clone();
         let part_clone = partitioned.clone();
@@ -204,7 +207,7 @@ async fn test_cluster_partition_linearizability() {
         tokio::spawn(async move {
             let (log_store, state_machine) = openraft::storage::Adaptor::new(store);
             let raft_network = FaultyNetworkFactory {
-                inner: NodusNetworkFactory::new(),
+                inner: NodusNetworkFactory::new("shard-meta".to_string()),
                 partitioned: part_clone,
             };
             let raft = NodusRaft::new(
@@ -216,7 +219,8 @@ async fn test_cluster_partition_linearizability() {
             )
             .await
             .unwrap();
-            let raft_state = RaftState { raft };
+            let raft_state = RaftState::new();
+            raft_state.rafts.write().await.insert("shard-meta".to_string(), raft);
 
             let app = raft_routes()
                 .route("/test/init", post(init_cluster))
