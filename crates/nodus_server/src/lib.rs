@@ -1,5 +1,6 @@
 mod admin;
 mod raft_kv;
+mod raft_catalog;
 
 use admin::{AdminState, admin_routes};
 use axum::Router;
@@ -174,10 +175,10 @@ pub async fn run_server_with_config(
     println!("Initializing raft network and state");
     let raft_config = Arc::new(openraft::Config::default().validate().unwrap());
     let (log_store, state_machine) =
-        openraft::storage::Adaptor::new(nodus_raftstore::NodusRaftStore::with_kv(local_kv.clone()));
+        openraft::storage::Adaptor::new(nodus_raftstore::NodusRaftStore::with_kv_and_catalog(local_kv.clone(), catalog.clone()));
     let raft_network = nodus_raftstore::network::NodusNetworkFactory::new();
     let raft = nodus_raftstore::server::NodusRaft::new(
-        1,
+        config.cluster.node_id,
         raft_config,
         raft_network,
         log_store,
@@ -188,16 +189,18 @@ pub async fn run_server_with_config(
     println!("Raft created");
 
     let raft_clone = raft.clone();
-    tokio::spawn(async move {
-        println!("Background initializing raft cluster");
-        let mut nodes = std::collections::BTreeMap::new();
-        nodes.insert(1, openraft::BasicNode::new("127.0.0.1:0"));
-        let _ = raft_clone.initialize(nodes).await;
-        println!("Background raft initialization complete");
-    });
+    let join_peers = config.cluster.join_peers.clone();
+    let node_id = config.cluster.node_id;
+    let advertise_addr = config.cluster.raft_advertise_addr.clone();
+    let admin_token = config.admin.token.clone();
 
     let raft_kv = Arc::new(crate::raft_kv::RaftKvEngine {
         local: local_kv.clone(),
+        raft: raft.clone(),
+    });
+
+    let raft_catalog_writer = Arc::new(crate::raft_catalog::RaftCatalogWriter {
+        local: catalog.clone(),
         raft: raft.clone(),
     });
 
@@ -206,7 +209,7 @@ pub async fn run_server_with_config(
 
     let executor = Arc::new(nodus_executor::MemExecutor::new(
         catalog.clone(),
-        catalog.clone(),
+        raft_catalog_writer.clone(),
         authz.clone(),
         audit_sink,
         raft_kv,
@@ -214,6 +217,95 @@ pub async fn run_server_with_config(
     ));
 
     println!("Executor created");
+
+    let executor_clone = executor.clone();
+    tokio::spawn(async move {
+        if join_peers.is_empty() {
+            println!("Background initializing raft cluster as singleton");
+            let mut nodes = std::collections::BTreeMap::new();
+            nodes.insert(node_id, openraft::BasicNode::new(&advertise_addr));
+            let _ = raft_clone.initialize(nodes).await;
+            println!("Background raft initialization complete");
+            
+            // Wait for leader to establish
+            let mut retries = 0;
+            while retries < 10 {
+                let leader = raft_clone.metrics().borrow().current_leader;
+                println!("Waiting for leader... current_leader: {:?}", leader);
+                if leader == Some(node_id) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                retries += 1;
+            }
+            
+            // Bootstrap the catalog on the leader
+            println!("Running bootstrap!");
+            let db_id = nodus_catalog::DatabaseId::new();
+            let cmd1 = nodus_raftstore::ShardCommand::CreateDatabase(nodus_catalog::CreateDatabaseRequest {
+                id: db_id,
+                name: "default".into(),
+                owner_role_id: None,
+            });
+            if let Err(e) = raft_clone.client_write(cmd1).await {
+                println!("Bootstrap create_database failed: {}", e);
+            } else {
+                let cmd2 = nodus_raftstore::ShardCommand::CreateSchema(nodus_catalog::CreateSchemaRequest {
+                    id: nodus_catalog::SchemaId::new(),
+                    database_id: db_id,
+                    name: "public".into(),
+                    owner_role_id: None,
+                    managed_access: false,
+                });
+                if let Err(e) = raft_clone.client_write(cmd2).await {
+                    println!("Bootstrap create_schema failed: {}", e);
+                } else {
+                    println!("Bootstrap succeeded");
+                }
+            }
+        } else {
+            println!("Attempting to join existing cluster via {:?}", join_peers);
+            let client = reqwest::Client::new();
+            let mut joined = false;
+            for _ in 0..5 {
+                for peer in &join_peers {
+                    let url = format!("http://{}/api/v1/cluster/join", peer);
+                    let payload = serde_json::json!({
+                        "node_id": node_id,
+                        "raft_advertise_addr": advertise_addr
+                    });
+                    
+                    let mut req = client.post(&url).json(&payload);
+                    if let Some(token) = &admin_token {
+                        req = req.bearer_auth(token);
+                    }
+                    
+                    match req.send().await {
+                        Ok(resp) if resp.status().is_success() => {
+                            println!("Successfully joined cluster via {}", peer);
+                            joined = true;
+                            break;
+                        }
+                        Ok(resp) => {
+                            let status = resp.status();
+                            let text = resp.text().await.unwrap_or_default();
+                            println!("Failed to join via {}: status {}, body: {}", peer, status, text);
+                        }
+                        Err(e) => {
+                            println!("Failed to join via {}: {}", peer, e);
+                        }
+                    }
+                }
+                if joined {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+            if !joined {
+                println!("FATAL: Failed to join cluster after retries");
+            }
+        }
+    });
 
     let admin = match catalog.create_role(CreateRoleRequest {
         name: "nodus".into(),
@@ -359,7 +451,7 @@ pub async fn run_server_with_config(
         audit: audit_query,
         authz: authz.clone(),
         catalog: catalog.clone(),
-        catalog_writer: catalog.clone(),
+        catalog_writer: raft_catalog_writer.clone(),
         backup,
         upgrade,
         shards,
@@ -368,16 +460,28 @@ pub async fn run_server_with_config(
         wal_key: encryption_key,
         draining: state.draining.clone(),
         admin_token: config.admin.token.clone(),
+        raft: raft.clone(),
     };
 
-    let raft_state = nodus_raftstore::server::RaftState { raft };
+    let raft_state = nodus_raftstore::server::RaftState { raft: raft.clone() };
 
     let app = Router::new()
-        .merge(monitoring_routes(state))
+        .merge(monitoring_routes(state.clone()))
         .merge(admin_routes(admin_state))
         .merge(nodus_web_console::web_console_routes())
         .merge(nodus_raftstore::server::raft_routes().with_state(raft_state))
         .layer(cors);
+
+    let metrics_state = state.clone();
+    let mut raft_metrics = raft.metrics();
+    tokio::spawn(async move {
+        while raft_metrics.changed().await.is_ok() {
+            let m = raft_metrics.borrow().clone();
+            let count = m.membership_config.membership().voter_ids().count() as u32;
+            metrics_state.cluster.nodes_total.store(count, std::sync::atomic::Ordering::Relaxed);
+            metrics_state.cluster.nodes_live.store(count, std::sync::atomic::Ordering::Relaxed); // Simplified: assuming all voters are live for MVP
+        }
+    });
 
     let http_task = tokio::spawn(async move {
         axum::serve(http_listener, app)

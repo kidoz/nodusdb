@@ -2147,6 +2147,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 1.0.69",
+ "tracing",
  "uuid",
 ]
 
@@ -2193,12 +2194,14 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "madsim",
+ "nodus_catalog",
  "nodus_raftstore",
  "nodus_storage_mem",
  "nodus_testkit",
  "openraft",
  "porcupine-rs",
  "reqwest",
+ "tempfile",
  "tokio",
  "tokio-postgres",
  "uuid",
@@ -2345,6 +2348,7 @@ dependencies = [
  "serde_json",
  "thiserror 1.0.69",
  "tokio",
+ "tracing",
  "uuid",
 ]
 
@@ -2368,6 +2372,7 @@ dependencies = [
  "anyhow",
  "axum",
  "bytes",
+ "chrono",
  "hex",
  "nodus_audit",
  "nodus_authz",
@@ -2392,6 +2397,7 @@ dependencies = [
  "nodus_upgrade",
  "nodus_web_console",
  "openraft",
+ "reqwest",
  "rustls-pemfile",
  "serde",
  "serde_json",

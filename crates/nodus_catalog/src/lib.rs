@@ -316,44 +316,53 @@ pub enum ObjectDescriptor {
 // API Traits
 use anyhow::Result;
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResolveObjectRequest {
     pub database: Option<String>,
     pub schema: Option<String>,
     pub name: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateDatabaseRequest {
+    pub id: DatabaseId,
     pub name: String,
     pub owner_role_id: Option<RoleId>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateSchemaRequest {
+    pub id: SchemaId,
     pub database_id: DatabaseId,
     pub name: String,
     pub owner_role_id: Option<RoleId>,
     pub managed_access: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateTableRequest {
+    pub id: TableId,
     pub database_id: DatabaseId,
     pub schema_id: SchemaId,
     pub name: String,
     pub columns: Vec<ColumnDescriptor>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GrantPrivilegesRequest {
     pub principal_id: PrincipalId,
     pub resource: ResourceRef,
     pub privilege: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RevokePrivilegesRequest {
     pub principal_id: PrincipalId,
     pub resource: ResourceRef,
     pub privilege: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TableDescriptorChange {
     AddColumn {
         table_id: TableId,
@@ -373,24 +382,28 @@ pub enum TableDescriptorChange {
     },
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateRoleRequest {
     pub name: String,
     pub principal_type: PrincipalType,
     pub database_id: Option<DatabaseId>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GrantPrivilegeRequest {
     pub principal_id: PrincipalId,
     pub resource: ResourceRef,
     pub privilege: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RevokePrivilegeRequest {
     pub principal_id: PrincipalId,
     pub resource: ResourceRef,
     pub privilege: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AddRoleMemberRequest {
     /// The role (itself a principal) that the member is being added to.
     pub role_principal_id: PrincipalId,
@@ -620,13 +633,20 @@ impl CatalogReader for MemoryCatalog {
     }
 
     fn get_table(&self, database: &str, schema: &str, table: &str) -> Result<TableDescriptor> {
+        tracing::info!("get_table CALLED for database={}, schema={}, table={}", database, schema, table);
         let db = self.get_database(database)?;
         let sch = self.get_schema(database, schema)?;
         let guard = self.tables.read().unwrap();
-        guard
-            .get(&(db.id, sch.id, table.to_string()))
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("Table {} not found", table))
+        if let Some(t) = guard.get(&(db.id, sch.id, table.to_string())) {
+            Ok(t.clone())
+        } else {
+            tracing::error!("get_table failed. Looking for: db={}, sch={}, table={}", db.id, sch.id, table);
+            tracing::error!("Available tables:");
+            for (k, _) in guard.iter() {
+                tracing::error!("  {:?}", k);
+            }
+            anyhow::bail!("Table {} not found", table)
+        }
     }
 
     fn list_tables(&self, database: &str, schema: &str) -> Result<Vec<TableDescriptor>> {
@@ -714,7 +734,7 @@ impl CatalogWriter for MemoryCatalog {
             anyhow::bail!("Database {} already exists", request.name);
         }
         let desc = DatabaseDescriptor {
-            id: DatabaseId::new(),
+            id: request.id,
             name: request.name.clone(),
             version: self.increment_version(),
             created_at: Utc::now(),
@@ -735,7 +755,7 @@ impl CatalogWriter for MemoryCatalog {
             anyhow::bail!("Schema {} already exists", request.name);
         }
         let desc = SchemaDescriptor {
-            id: SchemaId::new(),
+            id: request.id,
             database_id: request.database_id,
             name: request.name.clone(),
             version: self.increment_version(),
@@ -759,7 +779,7 @@ impl CatalogWriter for MemoryCatalog {
             anyhow::bail!("Table {} already exists", request.name);
         }
         let desc = TableDescriptor {
-            id: TableId::new(),
+            id: request.id,
             database_id: request.database_id,
             schema_id: request.schema_id,
             name: request.name.clone(),
@@ -964,6 +984,7 @@ mod tests {
 
         let db = catalog
             .create_database(CreateDatabaseRequest {
+                id: DatabaseId::new(),
                 name: "testdb".into(),
                 owner_role_id: None,
             })
@@ -973,6 +994,7 @@ mod tests {
 
         let sch = catalog
             .create_schema(CreateSchemaRequest {
+                id: SchemaId::new(),
                 database_id: db.id,
                 name: "public".into(),
                 owner_role_id: None,
@@ -984,6 +1006,7 @@ mod tests {
 
         let tbl = catalog
             .create_table(CreateTableRequest {
+                id: TableId::new(),
                 database_id: db.id,
                 schema_id: sch.id,
                 name: "users".into(),

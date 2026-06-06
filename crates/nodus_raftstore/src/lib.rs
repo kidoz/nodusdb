@@ -27,7 +27,7 @@ openraft::declare_raft_types!(
         AsyncRuntime = openraft::TokioRuntime,
 );
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ShardCommand {
     PutIntent {
         txn_id: String,
@@ -62,6 +62,22 @@ pub enum ShardCommand {
     InstallSnapshot {
         snapshot_id: String,
     },
+    // Catalog Replication Commands
+    CreateDatabase(nodus_catalog::CreateDatabaseRequest),
+    CreateSchema(nodus_catalog::CreateSchemaRequest),
+    CreateTable(nodus_catalog::CreateTableRequest),
+    GrantPrivileges(nodus_catalog::GrantPrivilegesRequest),
+    RevokePrivileges(nodus_catalog::RevokePrivilegesRequest),
+    UpdateTableDescriptor(nodus_catalog::TableDescriptorChange),
+    CreateRole(nodus_catalog::CreateRoleRequest),
+    GrantPrivilege(nodus_catalog::GrantPrivilegeRequest),
+    RevokePrivilege(nodus_catalog::RevokePrivilegeRequest),
+    AddRoleMember(nodus_catalog::AddRoleMemberRequest),
+    UpdateIndexState {
+        table_id: nodus_catalog::TableId,
+        index_id: nodus_catalog::IndexId,
+        state: nodus_catalog::IndexState,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -73,6 +89,7 @@ pub struct StateMachine {
     pub last_applied_log: Option<LogId<u64>>,
     pub last_membership: StoredMembership<u64, openraft::BasicNode>,
     pub kv: Option<Arc<dyn nodus_storage_api::KvEngine>>,
+    pub catalog: Option<Arc<dyn nodus_catalog::CatalogWriter>>,
 }
 
 #[derive(Clone)]
@@ -97,11 +114,12 @@ impl NodusRaftStore {
                 last_applied_log: None,
                 last_membership: StoredMembership::default(),
                 kv: None,
+                catalog: None,
             })),
         }
     }
 
-    pub fn with_kv(kv: Arc<dyn nodus_storage_api::KvEngine>) -> Self {
+    pub fn with_kv_and_catalog(kv: Arc<dyn nodus_storage_api::KvEngine>, catalog: Arc<dyn nodus_catalog::CatalogWriter>) -> Self {
         Self {
             log: Arc::new(RwLock::new(BTreeMap::new())),
             vote: Arc::new(RwLock::new(None)),
@@ -109,6 +127,7 @@ impl NodusRaftStore {
                 last_applied_log: None,
                 last_membership: StoredMembership::default(),
                 kv: Some(kv),
+                catalog: Some(catalog),
             })),
         }
     }
@@ -226,6 +245,7 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
             sm.last_applied_log = Some(entry.log_id);
             match &entry.payload {
                 EntryPayload::Normal(cmd) => {
+                    tracing::info!("Raft applying command: {:?}", cmd);
                     if let Some(kv) = &sm.kv {
                         use nodus_storage_api::TxnId;
                         use bytes::Bytes;
@@ -262,6 +282,38 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
                                     let _ = kv.delete_intent(TxnId(tid), Bytes::from(key.clone()));
                                 }
                             }
+                            _ => {}
+                        }
+                    }
+                    if let Some(catalog) = &sm.catalog {
+                        match cmd {
+                            ShardCommand::CreateDatabase(req) => { 
+                                if let Err(e) = catalog.create_database(req.clone()) {
+                                    println!("CreateDatabase error: {}", e);
+                                }
+                            }
+                            ShardCommand::CreateSchema(req) => { 
+                                if let Err(e) = catalog.create_schema(req.clone()) {
+                                    println!("CreateSchema error: {}", e);
+                                }
+                            }
+                            ShardCommand::CreateTable(req) => { 
+                                if let Err(e) = catalog.create_table(req.clone()) {
+                                    println!("CreateTable error: {}", e);
+                                }
+                            }
+                            ShardCommand::GrantPrivileges(req) => { let _ = catalog.grant_privileges(req.clone()); }
+                            ShardCommand::RevokePrivileges(req) => { let _ = catalog.revoke_privileges(req.clone()); }
+                            ShardCommand::UpdateTableDescriptor(req) => { let _ = catalog.update_table_descriptor(req.clone()); }
+                            ShardCommand::CreateRole(req) => { 
+                                if let Err(e) = catalog.create_role(req.clone()) {
+                                    println!("CreateRole error: {}", e);
+                                }
+                            }
+                            ShardCommand::GrantPrivilege(req) => { let _ = catalog.grant_privilege(req.clone()); }
+                            ShardCommand::RevokePrivilege(req) => { let _ = catalog.revoke_privilege(req.clone()); }
+                            ShardCommand::AddRoleMember(req) => { let _ = catalog.add_role_member(req.clone()); }
+                            ShardCommand::UpdateIndexState { table_id, index_id, state } => { let _ = catalog.update_index_state(table_id.clone(), index_id.clone(), state.clone()); }
                             _ => {}
                         }
                     }

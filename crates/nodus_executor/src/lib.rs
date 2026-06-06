@@ -860,20 +860,6 @@ impl MemExecutor {
         kv: Arc<dyn KvEngine>,
         txn: Arc<dyn TxnManager>,
     ) -> Self {
-        // Bootstrapping the default database and schema
-        let _db = catalog_writer.create_database(nodus_catalog::CreateDatabaseRequest {
-            name: "default".into(),
-            owner_role_id: None,
-        });
-        if let Ok(db) = catalog_reader.get_database("default") {
-            let _sch = catalog_writer.create_schema(nodus_catalog::CreateSchemaRequest {
-                database_id: db.id,
-                name: "public".into(),
-                owner_role_id: None,
-                managed_access: false,
-            });
-        }
-
         Self {
             catalog_reader,
             catalog_writer,
@@ -1406,6 +1392,7 @@ impl MemExecutor {
                 }
 
                 let tbl = self.catalog_writer.create_table(CreateTableRequest {
+                    id: nodus_catalog::TableId::new(),
                     database_id: db.id,
                     schema_id: sch.id,
                     name: name.clone(),

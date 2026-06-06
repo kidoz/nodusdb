@@ -195,7 +195,8 @@ async fn test_cluster_partition_linearizability() {
         let addr: SocketAddr = format!("127.0.0.1:1543{}", i).parse().unwrap();
 
         let kv = Arc::new(nodus_storage_mem::MemKvEngine::new());
-        let store = NodusRaftStore::with_kv(kv);
+        let catalog = std::sync::Arc::new(nodus_catalog::MemoryCatalog::new());
+        let store = NodusRaftStore::with_kv_and_catalog(kv, catalog);
         stores.insert(i as u64, store.clone());
         let raft_config_clone = raft_config.clone();
         let part_clone = partitioned.clone();

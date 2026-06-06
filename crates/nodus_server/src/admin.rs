@@ -43,6 +43,7 @@ pub struct AdminState {
     pub draining: Arc<AtomicBool>,
     /// Bearer token required on admin endpoints; `None` disables auth.
     pub admin_token: Option<String>,
+    pub raft: nodus_raftstore::server::NodusRaft,
 }
 
 /// Rejects requests lacking a valid `Authorization: Bearer <token>` header when
@@ -85,8 +86,35 @@ pub fn admin_routes(state: AdminState) -> Router {
         .route("/api/v1/shards/:table/rebalance", post(shards_rebalance))
         .route("/api/v1/queries", get(slow_queries))
         .route("/api/v1/node/drain", post(node_drain))
+        .route("/api/v1/cluster/join", post(cluster_join))
         .route_layer(from_fn_with_state(state.clone(), require_token))
         .with_state(state)
+}
+
+#[derive(serde::Deserialize)]
+pub struct JoinRequest {
+    pub node_id: u64,
+    pub raft_advertise_addr: String,
+}
+
+async fn cluster_join(
+    State(state): State<AdminState>,
+    Json(req): Json<JoinRequest>,
+) -> impl axum::response::IntoResponse {
+    let node = openraft::BasicNode::new(&req.raft_advertise_addr);
+    match state.raft.add_learner(req.node_id, node, true).await {
+        Ok(_) => {
+            // Once learner is added, attempt to promote it to a voter.
+            let metrics = state.raft.metrics().borrow().clone();
+            let mut members: std::collections::BTreeSet<u64> = metrics.membership_config.membership().voter_ids().collect();
+            members.insert(req.node_id);
+            match state.raft.change_membership(members, true).await {
+                Ok(_) => (StatusCode::OK, Json(json!({ "joined": true, "node_id": req.node_id }))),
+                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("Failed to change membership: {}", e) }))),
+            }
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("Failed to add learner: {}", e) }))),
+    }
 }
 
 async fn slow_queries(State(state): State<AdminState>) -> Json<Vec<SlowQuery>> {
