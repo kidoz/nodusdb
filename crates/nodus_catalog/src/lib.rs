@@ -426,13 +426,18 @@ pub struct CatalogSnapshot {
 
 pub trait CatalogReader: Send + Sync {
     fn get_database(&self, name: &str) -> Result<DatabaseDescriptor>;
+    fn get_database_by_id(&self, id: DatabaseId) -> Result<DatabaseDescriptor>;
     fn get_schema(&self, database: &str, schema: &str) -> Result<SchemaDescriptor>;
+    fn get_schema_by_id(&self, id: SchemaId) -> Result<SchemaDescriptor>;
     fn resolve_object(&self, request: ResolveObjectRequest) -> Result<ObjectDescriptor>;
     fn get_table(&self, database: &str, schema: &str, table: &str) -> Result<TableDescriptor>;
+    fn get_table_by_id(&self, id: TableId) -> Result<TableDescriptor>;
     fn list_tables(&self, database: &str, schema: &str) -> Result<Vec<TableDescriptor>>;
     fn get_principal_by_name(&self, name: &str) -> Result<PrincipalDescriptor>;
+    fn get_principal_by_id(&self, id: PrincipalId) -> Result<PrincipalDescriptor>;
     fn get_cluster_version(&self) -> Result<ClusterVersion>;
     fn get_grants_for_resource(&self, resource: ResourceRef) -> Result<Vec<GrantDescriptor>>;
+    fn get_grant_by_id(&self, id: GrantId) -> Result<GrantDescriptor>;
     fn get_effective_roles(&self, principal: PrincipalId) -> Result<Vec<RoleId>>;
     /// Returns the principal itself plus the transitive closure of role
     /// principals it is a member of. Used by the authorization engine to match
@@ -602,6 +607,15 @@ impl CatalogReader for MemoryCatalog {
             .ok_or_else(|| anyhow::anyhow!("Database {} not found", name))
     }
 
+    fn get_database_by_id(&self, id: DatabaseId) -> Result<DatabaseDescriptor> {
+        let guard = self.databases.read().unwrap();
+        guard
+            .values()
+            .find(|d| d.id == id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Database ID {} not found", id))
+    }
+
     fn get_schema(&self, database: &str, schema: &str) -> Result<SchemaDescriptor> {
         let db = self.get_database(database)?;
         let guard = self.schemas.read().unwrap();
@@ -609,6 +623,15 @@ impl CatalogReader for MemoryCatalog {
             .get(&(db.id, schema.to_string()))
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("Schema {} not found", schema))
+    }
+
+    fn get_schema_by_id(&self, id: SchemaId) -> Result<SchemaDescriptor> {
+        let guard = self.schemas.read().unwrap();
+        guard
+            .values()
+            .find(|s| s.id == id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Schema ID {} not found", id))
     }
 
     #[allow(clippy::collapsible_if)]
@@ -665,12 +688,30 @@ impl CatalogReader for MemoryCatalog {
         Ok(res)
     }
 
+    fn get_table_by_id(&self, id: TableId) -> Result<TableDescriptor> {
+        let guard = self.tables.read().unwrap();
+        guard
+            .values()
+            .find(|t| t.id == id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Table ID {} not found", id))
+    }
+
     fn get_principal_by_name(&self, name: &str) -> Result<PrincipalDescriptor> {
         let guard = self.principals.read().unwrap();
         guard
             .get(name)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("Principal {} not found", name))
+    }
+
+    fn get_principal_by_id(&self, id: PrincipalId) -> Result<PrincipalDescriptor> {
+        let guard = self.principals.read().unwrap();
+        guard
+            .values()
+            .find(|p| p.id == id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Principal ID {} not found", id))
     }
 
     fn get_cluster_version(&self) -> Result<ClusterVersion> {
@@ -692,6 +733,15 @@ impl CatalogReader for MemoryCatalog {
             .filter(|g| g.state == DescriptorState::Public && g.resource == resource)
             .cloned()
             .collect())
+    }
+
+    fn get_grant_by_id(&self, id: GrantId) -> Result<GrantDescriptor> {
+        let guard = self.grants.read().unwrap();
+        guard
+            .iter()
+            .find(|g| g.id == id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Grant ID {} not found", id))
     }
 
     fn get_effective_roles(&self, principal: PrincipalId) -> Result<Vec<RoleId>> {
