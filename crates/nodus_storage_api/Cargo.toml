@@ -13,3 +13,4 @@ serde.workspace = true
 bytes.workspace = true
 uuid.workspace = true
 nodus_catalog = { path = "../nodus_catalog" }
+async-trait.workspace = true

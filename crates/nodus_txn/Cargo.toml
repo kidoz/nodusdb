@@ -13,6 +13,7 @@ serde.workspace = true
 uuid.workspace = true
 nodus_storage_api = { path = "../nodus_storage_api" }
 nodus_mvcc = { path = "../nodus_mvcc" }
+async-trait.workspace = true
 
 # loom is only compiled in when concurrency tests are run with `--cfg loom`
 # (see `just test-loom`); it is absent from normal and production builds.

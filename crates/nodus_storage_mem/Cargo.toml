@@ -13,3 +13,4 @@ serde.workspace = true
 bytes.workspace = true
 nodus_storage_api = { path = "../nodus_storage_api" }
 nodus_mvcc = { path = "../nodus_mvcc" }
+async-trait.workspace = true

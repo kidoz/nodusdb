@@ -15,3 +15,4 @@ nodus_catalog = { path = "../nodus_catalog" }
 nodus_storage_api = { path = "../nodus_storage_api" }
 nodus_meta = { path = "../nodus_meta" }
 chrono.workspace = true
+async-trait.workspace = true

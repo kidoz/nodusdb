@@ -2143,6 +2143,7 @@ name = "nodus_catalog"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "chrono",
  "serde",
  "serde_json",
@@ -2219,6 +2220,7 @@ name = "nodus_executor"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "bytes",
  "chrono",
  "nodus_audit",
@@ -2280,6 +2282,7 @@ name = "nodus_meta"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "bytes",
  "nodus_catalog",
  "nodus_storage_api",
@@ -2342,6 +2345,7 @@ dependencies = [
  "nodus_catalog",
  "nodus_sharding",
  "nodus_storage_api",
+ "nodus_upgrade",
  "openraft",
  "reqwest",
  "serde",
@@ -2414,6 +2418,7 @@ name = "nodus_sharding"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "bytes",
  "chrono",
  "nodus_catalog",
@@ -2442,6 +2447,7 @@ name = "nodus_storage_api"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "bytes",
  "nodus_catalog",
  "serde",
@@ -2469,6 +2475,7 @@ name = "nodus_storage_lsm"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "bytes",
  "criterion",
  "nodus_mvcc",
@@ -2486,6 +2493,7 @@ name = "nodus_storage_mem"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "bytes",
  "nodus_mvcc",
  "nodus_storage_api",
@@ -2542,6 +2550,7 @@ name = "nodus_txn"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "loom",
  "nodus_mvcc",
  "nodus_storage_api",
@@ -2555,6 +2564,7 @@ name = "nodus_upgrade"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "chrono",
  "nodus_catalog",
  "serde",

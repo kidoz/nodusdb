@@ -146,10 +146,10 @@ impl IndexBackfiller {
         if !index_intents.is_empty() {
             let write_txn = self.txn.begin_txn()?;
             for (key, val) in index_intents {
-                self.kv.write_intent(write_txn.txn_id, key, val)?;
+                self.kv.write_intent(write_txn.txn_id, key, val).await?;
             }
             let commit_ts = self.txn.commit_txn(write_txn.txn_id)?;
-            self.kv.commit(write_txn.txn_id, commit_ts)?;
+            self.kv.commit(write_txn.txn_id, commit_ts).await?;
         }
 
         // Set state to Ready (skipping Validating for MVP)
