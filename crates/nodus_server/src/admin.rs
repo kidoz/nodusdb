@@ -16,6 +16,7 @@ use nodus_catalog::{CatalogReader, CatalogWriter, PrincipalId, ResourceRef, Shar
 use nodus_monitoring::{SlowQuery, SlowQueryLog};
 use nodus_security::{SessionInfo, SessionRegistry};
 use nodus_sharding::ShardOrchestrator;
+use nodus_storage_wal::WalEngine;
 use nodus_upgrade::{DefaultUpgradeCoordinator, UpgradeCoordinator};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -37,6 +38,7 @@ pub struct AdminState {
     pub shards: Arc<ShardOrchestrator>,
     pub slow_log: Arc<SlowQueryLog>,
     pub kv: Arc<dyn nodus_storage_api::KvEngine>,
+    pub wal_key: Option<[u8; 32]>,
     /// Shared with `AppState`; flipping it makes `/readyz` report not-ready.
     pub draining: Arc<AtomicBool>,
     /// Bearer token required on admin endpoints; `None` disables auth.
@@ -269,7 +271,16 @@ async fn verify_backup(State(state): State<AdminState>, Path(id): Path<String>) 
     }
 }
 
-async fn restore_backup(State(state): State<AdminState>, Path(id): Path<String>) -> Json<Value> {
+#[derive(serde::Deserialize)]
+pub struct RestoreQuery {
+    pub target_ts: Option<u64>,
+}
+
+async fn restore_backup(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+    Query(query): Query<RestoreQuery>,
+) -> Json<Value> {
     match state.backup.restore(&id).await {
         Ok(objects) => {
             for obj in &objects {
@@ -300,15 +311,64 @@ async fn restore_backup(State(state): State<AdminState>, Path(id): Path<String>)
                                 let txn_id = nodus_storage_api::TxnId::new();
                                 let _ = state.kv.write_intent(
                                     txn_id,
-                                    Bytes::from(key_bytes),
+                                    Bytes::from(key_bytes.clone()),
                                     Bytes::from(val_bytes),
                                 );
                                 let _ = state.kv.commit(txn_id, ver);
+                                println!("Restored KV pair from baseline: key={:?}", String::from_utf8_lossy(&key_bytes));
                             }
                         }
                     }
                 }
             }
+
+            if let Some(target_ts) = query.target_ts {
+                if let Ok(wals) = state.backup.get_archived_wals().await {
+                    let mut active_txns = std::collections::HashSet::new();
+                    for (_name, bytes) in wals {
+                        let tmp = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+                        std::fs::write(&tmp, bytes).unwrap();
+                        if let Ok(wal_engine) = nodus_storage_wal::FileWalEngine::with_encryption(&tmp, state.wal_key) {
+                            if let Ok(records) = wal_engine.recover() {
+                                for record in records {
+                                    let nodus_storage_wal::WalRecord::V1(rec) = record;
+                                    match rec {
+                                        nodus_storage_wal::WalRecordV1::WriteIntent { txn_id, key, value } => {
+                                            let _ = state.kv.write_intent(txn_id, Bytes::from(key), Bytes::from(value));
+                                            active_txns.insert(txn_id);
+                                        }
+                                        nodus_storage_wal::WalRecordV1::DeleteIntent { txn_id, key } => {
+                                            let _ = state.kv.delete_intent(txn_id, Bytes::from(key));
+                                            active_txns.insert(txn_id);
+                                        }
+                                        nodus_storage_wal::WalRecordV1::CommitTxn { txn_id, commit_ts } => {
+                                            if commit_ts <= target_ts {
+                                                println!("Replayed commit_ts {} <= target_ts {}", commit_ts, target_ts);
+                                                let _ = state.kv.commit(txn_id, commit_ts);
+                                            } else {
+                                                println!("Skipped commit_ts {} > target_ts {}", commit_ts, target_ts);
+                                                let _ = state.kv.abort(txn_id);
+                                            }
+                                            active_txns.remove(&txn_id);
+                                        }
+                                        nodus_storage_wal::WalRecordV1::AbortTxn { txn_id } => {
+                                            let _ = state.kv.abort(txn_id);
+                                            active_txns.remove(&txn_id);
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+                        let _ = std::fs::remove_file(&tmp);
+                    }
+                    // Abort any pending transactions
+                    for txn_id in active_txns {
+                        let _ = state.kv.abort(txn_id);
+                    }
+                }
+            }
+
             let names: Vec<String> = objects.into_iter().map(|o| o.name).collect();
             Json(json!({ "restored": names.len(), "objects": names }))
         }

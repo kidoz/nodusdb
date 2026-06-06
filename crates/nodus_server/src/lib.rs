@@ -153,6 +153,7 @@ pub async fn run_server_with_config(
         None
     };
 
+    println!("Loading KV and catalog");
     let (local_kv, catalog): (Arc<dyn nodus_storage_api::KvEngine>, _) = match &config.storage.data_dir {
         Some(dir) => {
             let path = std::path::Path::new(dir);
@@ -168,7 +169,9 @@ pub async fn run_server_with_config(
             (k, cat)
         }
     };
+    println!("Loaded KV and catalog");
 
+    println!("Initializing raft network and state");
     let raft_config = Arc::new(openraft::Config::default().validate().unwrap());
     let (log_store, state_machine) =
         openraft::storage::Adaptor::new(nodus_raftstore::NodusRaftStore::with_kv(local_kv.clone()));
@@ -182,13 +185,19 @@ pub async fn run_server_with_config(
     )
     .await
     .map_err(|e| anyhow::anyhow!("raft init: {e}"))?;
+    println!("Raft created");
 
-    let mut nodes = std::collections::BTreeMap::new();
-    nodes.insert(1, openraft::BasicNode::new("127.0.0.1:0"));
-    let _ = raft.initialize(nodes).await;
+    let raft_clone = raft.clone();
+    tokio::spawn(async move {
+        println!("Background initializing raft cluster");
+        let mut nodes = std::collections::BTreeMap::new();
+        nodes.insert(1, openraft::BasicNode::new("127.0.0.1:0"));
+        let _ = raft_clone.initialize(nodes).await;
+        println!("Background raft initialization complete");
+    });
 
     let raft_kv = Arc::new(crate::raft_kv::RaftKvEngine {
-        local: local_kv,
+        local: local_kv.clone(),
         raft: raft.clone(),
     });
 
@@ -204,6 +213,8 @@ pub async fn run_server_with_config(
         txn,
     ));
 
+    println!("Executor created");
+
     let admin = match catalog.create_role(CreateRoleRequest {
         name: "nodus".into(),
         principal_type: PrincipalType::User,
@@ -215,6 +226,7 @@ pub async fn run_server_with_config(
         }
         Err(e) => anyhow::bail!("seed admin: {e}"),
     };
+    println!("Admin seeded");
 
     // Bootstrap superuser: ALL on System bypasses per-resource grant checks.
     let _ = catalog.grant_privilege(GrantPrivilegeRequest {
@@ -237,6 +249,7 @@ pub async fn run_server_with_config(
     authenticator.set_password("nodus", admin.id, &admin_password);
 
     let tls_acceptor = load_tls_acceptor(&config.tls)?;
+    println!("TLS acceptor loaded");
 
     // Background MVCC garbage collector: periodically reclaims superseded
     // versions below the transaction manager's safe watermark.
@@ -287,6 +300,47 @@ pub async fn run_server_with_config(
     )));
     let backup = Arc::new(BackupOrchestrator::new(repo));
 
+    // Background WAL archiver
+    let backup_clone = backup.clone();
+    let data_dir_clone = config.storage.data_dir.clone();
+    let local_kv_clone = local_kv.clone();
+    tokio::spawn(async move {
+        if let Some(dir_path_str) = data_dir_clone {
+            let dir_path = std::path::Path::new(&dir_path_str);
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
+            loop {
+                ticker.tick().await;
+                let _ = local_kv_clone.flush();
+                if let Ok(entries) = std::fs::read_dir(dir_path) {
+                    let mut logs = Vec::new();
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.extension().and_then(|s| s.to_str()) == Some("log") {
+                            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                                if let Ok(id) = stem.parse::<u64>() {
+                                    logs.push((id, path));
+                                }
+                            }
+                        }
+                    }
+                    if !logs.is_empty() {
+                        let max_id = logs.iter().map(|(id, _)| *id).max().unwrap();
+                        for (id, path) in logs {
+                            if id < max_id {
+                                if let Ok(bytes) = std::fs::read(&path) {
+                                    let filename = format!("{}.log", id);
+                                    if backup_clone.archive_wal(&filename, bytes::Bytes::from(bytes)).await.is_ok() {
+                                        let _ = std::fs::remove_file(&path);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
+
     let cluster_version = catalog
         .get_cluster_version()
         .map(|v| v.active_version)
@@ -311,6 +365,7 @@ pub async fn run_server_with_config(
         shards,
         slow_log,
         kv: executor.kv(),
+        wal_key: encryption_key,
         draining: state.draining.clone(),
         admin_token: config.admin.token.clone(),
     };

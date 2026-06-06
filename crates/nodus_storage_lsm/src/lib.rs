@@ -173,6 +173,10 @@ impl Default for LsmKvEngine {
 }
 
 impl KvEngine for LsmKvEngine {
+    fn flush(&self) -> Result<()> {
+        self.flush()
+    }
+
     fn get(&self, key: &[u8], read_ts: Timestamp) -> Result<Option<Bytes>> {
         let guard = self.memtable.read().unwrap();
         if let Some(chain) = guard.get(key)

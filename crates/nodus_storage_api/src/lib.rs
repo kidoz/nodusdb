@@ -53,6 +53,11 @@ pub trait KvEngine: Send + Sync {
     fn garbage_collect(&self, _watermark: Timestamp) -> Result<usize> {
         Ok(0)
     }
+    
+    /// Flushes any in-memory data to persistent storage and rotates the write-ahead log.
+    fn flush(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 pub type RowKey = Bytes;

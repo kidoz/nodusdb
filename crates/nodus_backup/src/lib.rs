@@ -414,6 +414,27 @@ impl BackupOrchestrator {
             .filter_map(|o| o.key.strip_suffix("/manifest.json").map(|s| s.to_string()))
             .collect())
     }
+
+    /// Archives a WAL segment.
+    pub async fn archive_wal(&self, filename: &str, data: Bytes) -> Result<()> {
+        let key = format!("wal_archive/{}", filename);
+        self.repo.put_object(&key, data, PutOptions { content_type: None }).await.map(|_| ())
+    }
+
+    /// Retrieves all archived WAL segments, sorted chronologically by numeric file stem.
+    pub async fn get_archived_wals(&self) -> Result<Vec<(String, Bytes)>> {
+        let objects = self.repo.list_objects("wal_archive/").await?;
+        let mut wals = Vec::new();
+        for obj in objects {
+            let bytes = self.repo.get_object(&obj.key, None).await?;
+            let name = obj.key.strip_prefix("wal_archive/").unwrap_or(&obj.key).to_string();
+            wals.push((name, bytes));
+        }
+        wals.sort_by_key(|(name, _)| {
+            name.strip_suffix(".log").unwrap_or("0").parse::<u64>().unwrap_or(0)
+        });
+        Ok(wals)
+    }
 }
 
 #[cfg(test)]
