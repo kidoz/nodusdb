@@ -16,6 +16,27 @@ use pgwire::api::auth::{
 use pgwire::api::copy::NoopCopyHandler;
 use pgwire::api::portal::Portal;
 use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
+
+fn map_type(data_type: &str) -> Type {
+    match data_type.to_uppercase().as_str() {
+        "INT" | "INTEGER" => Type::INT8,
+        "FLOAT" | "DOUBLE" | "REAL" => Type::FLOAT8,
+        "BOOL" | "BOOLEAN" => Type::BOOL,
+        "VARCHAR" | "TEXT" | "CHAR" => Type::VARCHAR,
+        _ => Type::VARCHAR,
+    }
+}
+
+fn encode_value(value: &nodus_executor::Value, encoder: &mut DataRowEncoder) -> std::io::Result<()> {
+    match value {
+        nodus_executor::Value::Int(i) => encoder.encode_field(&i),
+        nodus_executor::Value::Float(f) => encoder.encode_field(&f),
+        nodus_executor::Value::Text(s) => encoder.encode_field(&s),
+        nodus_executor::Value::Bool(b) => encoder.encode_field(&b),
+        nodus_executor::Value::Null => encoder.encode_field(&None::<i64>),
+    }.map_err(|e| std::io::Error::other(e.to_string()))
+}
+
 use pgwire::api::results::{
     DataRowEncoder, DescribePortalResponse, DescribeStatementResponse, FieldFormat, FieldInfo,
     QueryResponse, Response, Tag,
@@ -234,16 +255,15 @@ impl SimpleQueryHandler for NodusQueryHandler {
         let field_info = Arc::new(
             out.columns
                 .iter()
-                .map(|c| FieldInfo::new(c.clone(), None, None, Type::VARCHAR, FieldFormat::Text))
+                .zip(out.types.iter())
+                .map(|(c, t)| FieldInfo::new(c.clone(), None, None, map_type(t), FieldFormat::Text))
                 .collect::<Vec<_>>(),
         );
         let mut data_rows = Vec::new();
         for row in &out.rows {
             let mut encoder = DataRowEncoder::new(field_info.clone());
-            for value in &row.columns {
-                encoder
-                    .encode_field(value)
-                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+            for value in &row.values {
+                encode_value(value, &mut encoder)?;
             }
             data_rows.push(encoder.finish());
         }
@@ -413,16 +433,15 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
         let field_info = Arc::new(
             out.columns
                 .iter()
-                .map(|c| FieldInfo::new(c.clone(), None, None, Type::VARCHAR, FieldFormat::Text))
+                .zip(out.types.iter())
+                .map(|(c, t)| FieldInfo::new(c.clone(), None, None, map_type(t), FieldFormat::Text))
                 .collect::<Vec<_>>(),
         );
         let mut data_rows = Vec::new();
         for row in &out.rows {
             let mut encoder = DataRowEncoder::new(field_info.clone());
-            for value in &row.columns {
-                encoder
-                    .encode_field(value)
-                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+            for value in &row.values {
+                encode_value(value, &mut encoder)?;
             }
             data_rows.push(encoder.finish());
         }

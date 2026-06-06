@@ -264,8 +264,10 @@ pub enum LogicalPlan {
 /// Result of executing a statement: a tag for non-row commands, and column
 /// names + rows for queries.
 #[derive(Debug, Default)]
+#[derive(Clone)]
 pub struct QueryOutput {
     pub columns: Vec<String>,
+    pub types: Vec<String>,
     pub rows: Vec<Row>,
     pub tag: String,
 }
@@ -274,6 +276,7 @@ impl QueryOutput {
     fn tag(tag: &str) -> Self {
         Self {
             columns: vec![],
+            types: vec![],
             rows: vec![],
             tag: tag.to_string(),
         }
@@ -827,9 +830,9 @@ pub struct ExecutionContext {
     pub authz_catalog_version: u64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Row {
-    pub columns: Vec<String>,
+    pub values: Vec<Value>,
 }
 
 pub trait Executor: Send + Sync {
@@ -1242,14 +1245,15 @@ impl MemExecutor {
                 }
                 let out = exec_res.unwrap_or(QueryOutput {
                     columns: vec![],
+                    types: vec![],
                     rows: vec![],
                     tag: String::new(),
                 });
 
                 let mut matches = false;
                 for r in out.rows {
-                    if let Some(c) = r.columns.first() {
-                        let right_cell = coerce(c, column_type(&columns[idx].data_type));
+                    if let Some(c) = r.values.first() {
+                        let right_cell = coerce(&render(c), column_type(&columns[idx].data_type));
                         if *left_cell == right_cell {
                             matches = true;
                             break;
@@ -1545,10 +1549,10 @@ impl MemExecutor {
                     let rows = returning_rows
                         .into_iter()
                         .map(|r| Row {
-                            columns: indices
+                            values: indices
                                 .iter()
                                 .map(|i| {
-                                    i.and_then(|idx| r.get(idx)).map(render).unwrap_or_default()
+                                    i.and_then(|idx| r.get(idx)).cloned().unwrap_or(Value::Null)
                                 })
                                 .collect(),
                         })
@@ -1556,8 +1560,9 @@ impl MemExecutor {
                     Ok(QueryOutput {
                         tag: format!("INSERT 0 {}", inserted_count),
                         columns: returning.clone(),
+                        types: returning.iter().map(|_| "VARCHAR".to_string()).collect(),
                         rows,
-                    })
+                        })
                 }
             }
             LogicalPlan::Select {
@@ -1944,16 +1949,28 @@ impl MemExecutor {
                 let rows = out_rows
                     .into_iter()
                     .map(|r| Row {
-                        columns: r.into_iter().map(|v| render(&v)).collect(),
+                        values: r,
                     })
                     .collect::<Vec<_>>();
 
                 let tag = format!("SELECT {}", rows.len());
+                let mut types = Vec::new();
+                for c in &out_cols {
+                    // Quick lookup for type. Default to VARCHAR.
+                    let mut ty = "VARCHAR".to_string();
+                    if let Ok(tbl_desc) = self.catalog_reader.get_table("default", "public", &table_name) {
+                        if let Some(col_desc) = tbl_desc.columns.iter().find(|x| x.name == *c || format!("{}.{}", table_name, x.name) == *c) {
+                            ty = col_desc.data_type.clone();
+                        }
+                    }
+                    types.push(ty);
+                }
                 Ok(QueryOutput {
                     columns: out_cols,
+                    types,
                     rows,
                     tag,
-                })
+                    })
             }
             LogicalPlan::Update {
                 table_name,
@@ -2050,10 +2067,10 @@ impl MemExecutor {
                     let rows = returning_rows
                         .into_iter()
                         .map(|r| Row {
-                            columns: indices
+                            values: indices
                                 .iter()
                                 .map(|i| {
-                                    i.and_then(|idx| r.get(idx)).map(render).unwrap_or_default()
+                                    i.and_then(|idx| r.get(idx)).cloned().unwrap_or(Value::Null)
                                 })
                                 .collect(),
                         })
@@ -2061,6 +2078,7 @@ impl MemExecutor {
                     Ok(QueryOutput {
                         tag: format!("UPDATE {updated}"),
                         columns: returning.clone(),
+                        types: returning.iter().map(|_| "VARCHAR".to_string()).collect(),
                         rows,
                     })
                 }
@@ -2123,10 +2141,10 @@ impl MemExecutor {
                     let rows = returning_rows
                         .into_iter()
                         .map(|r| Row {
-                            columns: indices
+                            values: indices
                                 .iter()
                                 .map(|i| {
-                                    i.and_then(|idx| r.get(idx)).map(render).unwrap_or_default()
+                                    i.and_then(|idx| r.get(idx)).cloned().unwrap_or(Value::Null)
                                 })
                                 .collect(),
                         })
@@ -2134,6 +2152,7 @@ impl MemExecutor {
                     Ok(QueryOutput {
                         tag: format!("DELETE {deleted}"),
                         columns: returning.clone(),
+                        types: returning.iter().map(|_| "VARCHAR".to_string()).collect(),
                         rows,
                     })
                 }
@@ -2332,8 +2351,9 @@ impl MemExecutor {
                 };
                 Ok(QueryOutput {
                     columns: vec![variable],
+                    types: vec!["VARCHAR".to_string()],
                     rows: vec![Row {
-                        columns: vec![value],
+                        values: vec![Value::Text(value)],
                     }],
                     tag: "SHOW".into(),
                 })
@@ -2346,8 +2366,9 @@ impl MemExecutor {
                 };
                 Ok(QueryOutput {
                     columns: vec!["?column?".into()],
+                    types: vec!["VARCHAR".to_string()],
                     rows: vec![Row {
-                        columns: vec![rendered],
+                        values: vec![Value::Text(rendered)],
                     }],
                     tag: "SELECT 1".into(),
                 })
@@ -2369,7 +2390,7 @@ impl MemExecutor {
                     Some(val) => {
                         let row: Vec<Value> = serde_json::from_slice(&val).unwrap_or_default();
                         Ok(vec![Row {
-                            columns: row.iter().map(render).collect(),
+                            values: row.into_iter().collect(),
                         }])
                     }
                     None => Ok(vec![]),
@@ -3084,11 +3105,11 @@ mod tests {
         assert_eq!(left.rows.len(), 4); // 2 for Alice, 1 for Bob (NULLs), 1 for Charlie
 
         // Let's verify Bob's row has NULLs
-        let bob_row = left.rows.iter().find(|r| r.columns[1] == "Bob").unwrap();
-        assert_eq!(bob_row.columns.len(), 5); // users(id, name) + orders(id, user_id, amount)
-        assert_eq!(bob_row.columns[2], ""); // order.id
-        assert_eq!(bob_row.columns[3], ""); // order.user_id
-        assert_eq!(bob_row.columns[4], ""); // order.amount
+        let bob_row = left.rows.iter().find(|r| r.values[1] == &Value::Text("Bob".to_string())).unwrap();
+        assert_eq!(bob_row.values.len(), 5); // users(id, name) + orders(id, user_id, amount)
+        assert_eq!(bob_row.values[2], ""); // order.id
+        assert_eq!(bob_row.values[3], ""); // order.user_id
+        assert_eq!(bob_row.values[4], ""); // order.amount
     }
 }
 
@@ -3946,8 +3967,8 @@ mod phase3_tests {
                 },
             )
             .unwrap();
-        assert_eq!(out1.rows[0].columns.len(), 3);
-        assert_eq!(out1.rows[0].columns[2], "");
+        assert_eq!(out1.rows[0].values.len(), 3);
+        assert_eq!(out1.rows[0].values[2], "");
 
         // Update the new column
         exec.execute_logical(
@@ -4005,6 +4026,6 @@ mod phase3_tests {
                 },
             )
             .unwrap();
-        assert_eq!(out3.rows[0].columns.len(), 2);
+        assert_eq!(out3.rows[0].values.len(), 2);
     }
 }
