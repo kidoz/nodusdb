@@ -1324,6 +1324,10 @@ impl Executor for MemExecutor {
             plan,
             LogicalPlan::Begin | LogicalPlan::Commit | LogicalPlan::Rollback
         );
+        let is_read_only = matches!(
+            plan,
+            LogicalPlan::Select { .. } | LogicalPlan::SelectLiteral { .. }
+        );
         let mut implicit_txn = None;
 
         if !is_txn_control
@@ -1349,11 +1353,15 @@ impl Executor for MemExecutor {
             match &result {
                 Ok(_) => {
                     let commit_ts = self.txn.commit_txn(txn_id)?;
-                    self.kv.commit(txn_id, commit_ts)?;
+                    if !is_read_only {
+                        self.kv.commit(txn_id, commit_ts)?;
+                    }
                 }
                 Err(_) => {
                     let _ = self.txn.abort_txn(txn_id);
-                    let _ = self.kv.abort(txn_id);
+                    if !is_read_only {
+                        let _ = self.kv.abort(txn_id);
+                    }
                 }
             }
         }
