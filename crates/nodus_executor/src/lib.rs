@@ -2403,6 +2403,12 @@ impl MemExecutor {
 
 #[cfg(test)]
 mod tests {
+use super::render;
+
+fn render_row(row: &Row) -> Vec<String> {
+    row.values.iter().map(render).collect()
+}
+
     use super::*;
     use nodus_audit::{AuditQuery, AuditQueryable, MemoryAuditSink};
     use nodus_catalog::{CreateRoleRequest, GrantPrivilegeRequest, PrincipalType};
@@ -2570,7 +2576,7 @@ mod tests {
             .unwrap();
         assert_eq!(one.columns, vec!["title", "author"]);
         assert_eq!(one.rows.len(), 1);
-        assert_eq!(one.rows[0].columns, vec!["Foundation", "Asimov"]);
+        assert_eq!(render_row(&one.rows[0]), vec!["Foundation", "Asimov"]);
     }
 
     #[test]
@@ -2637,7 +2643,7 @@ mod tests {
             .unwrap();
         assert_eq!(out.rows.len(), 1);
         // Int renders without quotes, bool as true/false.
-        assert_eq!(out.rows[0].columns, vec!["7", "widget", "true"]);
+        assert_eq!(render_row(&out.rows[0]), vec!["7", "widget", "true"]);
     }
 
     #[test]
@@ -2715,7 +2721,7 @@ mod tests {
             )
             .unwrap()
         };
-        assert_eq!(read(eq("id", "2")).rows[0].columns, vec!["B"]);
+        assert_eq!(render_row(&read(eq("id", "2")).rows[0]), vec!["B"]);
 
         // DELETE one row, then confirm it's gone and the rest remain.
         let out = exec
@@ -2841,8 +2847,8 @@ mod tests {
         let out = exec.execute_logical(&ctx, join_plan).unwrap();
         assert_eq!(out.columns, vec!["books.title", "authors.name"]);
         assert_eq!(out.rows.len(), 2);
-        assert_eq!(out.rows[0].columns, vec!["Dune", "Herbert"]);
-        assert_eq!(out.rows[1].columns, vec!["Dune Messiah", "Herbert"]);
+        assert_eq!(render_row(&out.rows[0]), vec!["Dune", "Herbert"]);
+        assert_eq!(render_row(&out.rows[1]), vec!["Dune Messiah", "Herbert"]);
     }
 
     #[test]
@@ -3105,11 +3111,11 @@ mod tests {
         assert_eq!(left.rows.len(), 4); // 2 for Alice, 1 for Bob (NULLs), 1 for Charlie
 
         // Let's verify Bob's row has NULLs
-        let bob_row = left.rows.iter().find(|r| r.values[1] == &Value::Text("Bob".to_string())).unwrap();
+        let bob_row = left.rows.iter().find(|r| r.values[1] == Value::Text("Bob".to_string())).unwrap();
         assert_eq!(bob_row.values.len(), 5); // users(id, name) + orders(id, user_id, amount)
-        assert_eq!(bob_row.values[2], ""); // order.id
-        assert_eq!(bob_row.values[3], ""); // order.user_id
-        assert_eq!(bob_row.values[4], ""); // order.amount
+        assert_eq!(bob_row.values[2], Value::Null); // order.id
+        assert_eq!(bob_row.values[3], Value::Null); // order.user_id
+        assert_eq!(bob_row.values[4], Value::Null); // order.amount
     }
 }
 
@@ -3177,8 +3183,8 @@ mod phase1_tests {
 
         assert_eq!(insert_out.tag, "INSERT 0 4");
         assert_eq!(insert_out.rows.len(), 4);
-        assert_eq!(insert_out.rows[0].columns, vec!["1", "A"]);
-        assert_eq!(insert_out.rows[3].columns, vec!["4", "C"]);
+        assert_eq!(insert_render_row(&out.rows[0]), vec!["1", "A"]);
+        assert_eq!(insert_render_row(&out.rows[3]), vec!["4", "C"]);
 
         let read =
             |offset: Option<usize>, limit: Option<usize>, distinct: bool, proj: Vec<&str>| {
@@ -3203,7 +3209,7 @@ mod phase1_tests {
                     .unwrap();
                 out.rows
                     .into_iter()
-                    .map(|r| r.columns.join(","))
+                    .map(|r| render_row(r).join(","))
                     .collect::<Vec<_>>()
             };
 
@@ -3243,12 +3249,18 @@ mod phase1_tests {
             .unwrap();
         assert_eq!(update_out.tag, "UPDATE 1");
         assert_eq!(update_out.rows.len(), 1);
-        assert_eq!(update_out.rows[0].columns, vec!["2", "Z"]);
+        assert_eq!(update_render_row(&out.rows[0]), vec!["2", "Z"]);
     }
 }
 
 #[cfg(test)]
 mod phase2_tests {
+use super::{render, Row};
+
+fn render_row(row: &Row) -> Vec<String> {
+    row.values.iter().map(render).collect()
+}
+
     use super::*;
     use crate::tests::cols;
     use nodus_audit::MemoryAuditSink;
@@ -3321,7 +3333,7 @@ mod phase2_tests {
             let out = exec.execute_logical(&ctx, plan).unwrap();
 
             // To ignore unpredictable hashmap/btree iteration order of groups, we'll sort the output strings.
-            let mut res: Vec<String> = out.rows.into_iter().map(|r| r.columns.join(",")).collect();
+            let mut res: Vec<String> = out.rows.into_iter().map(|r| render_row(r).join(",")).collect();
             res.sort();
             res
         };
@@ -3357,6 +3369,12 @@ mod phase2_tests {
 
 #[cfg(test)]
 mod phase3_tests {
+use super::{render, Row};
+
+fn render_row(row: &Row) -> Vec<String> {
+    row.values.iter().map(render).collect()
+}
+
     use super::*;
     use crate::tests::cols;
     use nodus_audit::MemoryAuditSink;
@@ -3549,7 +3567,7 @@ mod phase3_tests {
             .unwrap();
 
         assert_eq!(out.rows.len(), 1);
-        assert_eq!(out.rows[0].columns[0], "Bob");
+        assert_eq!(render_row(&out.rows[0])[0], "Bob");
     }
 
     #[test]
@@ -3776,9 +3794,9 @@ mod phase3_tests {
             .unwrap();
 
         assert_eq!(out.rows.len(), 3);
-        assert_eq!(out.rows[0].columns[0], "1");
-        assert_eq!(out.rows[1].columns[0], "3");
-        assert_eq!(out.rows[2].columns[0], "5");
+        assert_eq!(render_row(&out.rows[0])[0], "1");
+        assert_eq!(render_row(&out.rows[1])[0], "3");
+        assert_eq!(render_row(&out.rows[2])[0], "5");
 
         // 5. Update row (change category from A to B)
         exec.execute_logical(
@@ -3879,7 +3897,7 @@ mod phase3_tests {
             )
             .unwrap();
         assert_eq!(out_b2.rows.len(), 1); // Only 1 should be left
-        assert_eq!(out_b2.rows[0].columns[0], "1");
+        assert_eq!(render_row(&out_b2.rows[0])[0], "1");
     }
 
     #[test]
@@ -3968,7 +3986,7 @@ mod phase3_tests {
             )
             .unwrap();
         assert_eq!(out1.rows[0].values.len(), 3);
-        assert_eq!(out1.rows[0].values[2], "");
+        assert_eq!(out1.rows[0].values[2], Value::Null);
 
         // Update the new column
         exec.execute_logical(
@@ -3998,7 +4016,7 @@ mod phase3_tests {
                 },
             )
             .unwrap();
-        assert_eq!(out2.rows[0].columns[2], "30");
+        assert_eq!(render_row(&out2.rows[0])[2], "30");
 
         // Drop the column
         exec.execute_logical(
