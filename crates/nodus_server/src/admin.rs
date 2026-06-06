@@ -146,6 +146,7 @@ pub fn admin_routes(state: AdminState) -> Router {
         .route("/api/v1/shards/:table/rebalance", post(shards_rebalance))
         .route("/api/v1/queries", get(slow_queries))
         .route("/api/v1/node/drain", post(node_drain))
+        .route("/api/v1/node/take-leadership/:shard_id", post(take_leadership))
         .route("/api/v1/cluster/join", post(cluster_join))
         .route_layer(from_fn_with_state(state.clone(), require_token))
         .with_state(state)
@@ -185,13 +186,65 @@ async fn slow_queries(State(state): State<AdminState>) -> Json<Vec<SlowQuery>> {
 
 /// Marks the node as draining: `/readyz` starts failing (so load balancers stop
 /// new traffic) and all active sessions are cancelled.
-async fn node_drain(State(state): State<AdminState>) -> Json<Value> {
+async fn node_drain(
+    headers: axum::http::HeaderMap,
+    State(state): State<AdminState>,
+) -> Json<Value> {
     state.draining.store(true, Ordering::Release);
     let sessions = state.registry.list();
     for s in &sessions {
         state.registry.kill(&s.session_id);
     }
-    Json(json!({ "draining": true, "sessions_cancelled": sessions.len() }))
+
+    let mut transfers = 0;
+    let client = reqwest::Client::new();
+    let rafts = state.raft_state.rafts.read().await;
+    
+    // Grab the auth header to forward it to the peer
+    let auth_header = headers.get(axum::http::header::AUTHORIZATION).and_then(|h| h.to_str().ok());
+
+    for (shard_id, raft) in rafts.iter() {
+        let metrics = raft.metrics().borrow().clone();
+        if metrics.state == openraft::ServerState::Leader {
+            let voters: Vec<u64> = metrics.membership_config.membership().voter_ids().collect();
+            for node in voters {
+                if node != metrics.id {
+                    if let Some(n) = metrics.membership_config.membership().nodes().find(|(k, _)| k == &&node) {
+                        let url = format!("http://{}/api/v1/node/take-leadership/{}", n.1.addr, shard_id);
+                        
+                        let mut req = client.post(&url);
+                        if let Some(auth) = auth_header {
+                            req = req.header(axum::http::header::AUTHORIZATION, auth);
+                        }
+                        
+                        if let Ok(resp) = req.send().await {
+                            if resp.status().is_success() {
+                                transfers += 1;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Json(json!({ "draining": true, "sessions_cancelled": sessions.len(), "leadership_transfers": transfers }))
+}
+
+async fn take_leadership(
+    Path(shard_id): Path<String>,
+    State(state): State<AdminState>,
+) -> impl axum::response::IntoResponse {
+    let rafts = state.raft_state.rafts.read().await;
+    if let Some(raft) = rafts.get(&shard_id) {
+        if let Err(e) = raft.trigger().elect().await {
+            return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })));
+        }
+        (axum::http::StatusCode::OK, Json(json!({ "status": "election_triggered" })))
+    } else {
+        (axum::http::StatusCode::NOT_FOUND, Json(json!({ "error": "shard not found" })))
+    }
 }
 
 async fn list_sessions(State(state): State<AdminState>) -> Json<Vec<SessionInfo>> {
