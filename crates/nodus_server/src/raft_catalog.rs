@@ -138,5 +138,10 @@ impl CatalogWriter for RaftCatalogWriter {
         }
         Ok(())
     }
-    fn import_snapshot(&self, _snapshot: CatalogSnapshot) -> Result<()> { Ok(()) }
+    fn import_snapshot(&self, snapshot: CatalogSnapshot) -> Result<()> {
+        // In a fully replicated setup, this should be sent via Raft.
+        // For MVP, since restore operations are usually orchestrated manually or on a single node before clustering,
+        // we write it directly to the local catalog.
+        self.local.import_snapshot(snapshot)
+    }
 }
