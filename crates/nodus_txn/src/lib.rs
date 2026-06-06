@@ -54,13 +54,11 @@ impl HybridLogicalClock {
     }
 
     pub fn now(&self) -> Timestamp {
-        // Simplified for MVP, returning logical time
-        self.logical_time
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_micros() as u64
     }
 
     pub fn tick(&mut self) -> Timestamp {
-        self.logical_time += 1;
-        self.logical_time
+        self.now()
     }
 }
 
