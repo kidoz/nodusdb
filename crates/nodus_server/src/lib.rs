@@ -1,6 +1,7 @@
 mod admin;
 mod raft_kv;
 mod raft_catalog;
+mod raft_upgrade;
 
 use admin::{AdminState, admin_routes};
 use axum::Router;
@@ -172,10 +173,25 @@ pub async fn run_server_with_config(
     };
     println!("Loaded KV and catalog");
 
+    let cluster_version = catalog
+        .get_cluster_version()
+        .map(|v| v.active_version)
+        .unwrap_or(1);
+    let local_upgrade = Arc::new(nodus_upgrade::DefaultUpgradeCoordinator::new(
+        1,
+        vec!["new_storage_format".into()],
+        cluster_version,
+    ));
+
     println!("Initializing raft network and state");
     let raft_config = Arc::new(openraft::Config::default().validate().unwrap());
     let (log_store, state_machine) =
-        openraft::storage::Adaptor::new(nodus_raftstore::NodusRaftStore::with_kv_and_catalog(local_kv.clone(), catalog.clone(), catalog.clone()));
+        openraft::storage::Adaptor::new(nodus_raftstore::NodusRaftStore::with_components(
+            local_kv.clone(),
+            catalog.clone(),
+            catalog.clone(),
+            local_upgrade.clone(),
+        ));
     let raft_network = nodus_raftstore::network::NodusNetworkFactory::new("shard-meta".to_string());
     let raft = nodus_raftstore::server::NodusRaft::new(
         config.cluster.node_id,
@@ -377,14 +393,16 @@ pub async fn run_server_with_config(
     let pgwire_registry = registry.clone();
     let pgwire_slow_log = slow_log.clone();
     let pgwire_shutdown = shutdown.clone();
-    let pgwire_executor = executor.clone();
+    let pgwire_registry = registry.clone();
+    let pgwire_authenticator = authenticator.clone();
+    let executor_pgwire = executor.clone();
     let pgwire_task = tokio::spawn(async move {
         nodus_pgwire::start_pgwire_server(
             pgwire_listener,
-            pgwire_executor,
+            executor_pgwire,
             pgwire_metrics,
             pgwire_registry,
-            authenticator,
+            pgwire_authenticator,
             pgwire_slow_log,
             tls_acceptor,
             pgwire_shutdown,
@@ -443,18 +461,13 @@ pub async fn run_server_with_config(
         }
     });
 
-    let cluster_version = catalog
-        .get_cluster_version()
-        .map(|v| v.active_version)
-        .unwrap_or(1);
-    let upgrade = Arc::new(nodus_upgrade::DefaultUpgradeCoordinator::new(
-        1,
-        vec!["new_storage_format".into()],
-        cluster_version,
-    ));
-
     let meta = Arc::new(nodus_meta::MemMetaStore::new());
     let shards = Arc::new(nodus_sharding::ShardOrchestrator::new(meta));
+
+    let raft_upgrade_coordinator = Arc::new(crate::raft_upgrade::RaftUpgradeCoordinator {
+        local: local_upgrade.clone(),
+        raft_state: raft_state.clone(),
+    });
 
     let admin_state = AdminState {
         registry: registry.clone(),
@@ -463,12 +476,13 @@ pub async fn run_server_with_config(
         catalog: catalog.clone(),
         catalog_writer: raft_catalog_writer.clone(),
         backup,
-        upgrade,
+        upgrade: raft_upgrade_coordinator,
         shards,
-        slow_log,
+        slow_log: slow_log.clone(),
         kv: executor.kv(),
         wal_key: encryption_key,
         draining: state.draining.clone(),
+        authenticator: authenticator.clone(),
         admin_token: config.admin.token.clone(),
         raft_state: raft_state.clone(),
         membership_lock: Arc::new(tokio::sync::Mutex::new(())),

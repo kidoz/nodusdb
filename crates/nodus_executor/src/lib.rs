@@ -1297,7 +1297,7 @@ impl MemExecutor {
             id: AuditEventId::new(),
             time: Utc::now(),
             actor: ctx.principal_id,
-            action: action.as_privilege().to_string(),
+            action: action.to_privilege().to_string(),
             resource: Some(resource),
             source_ip: None,
             request_id: None,

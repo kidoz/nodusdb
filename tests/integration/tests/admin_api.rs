@@ -238,19 +238,19 @@ async fn admin_upgrade_api_drives_lifecycle() {
         .unwrap();
     assert_eq!(st["phase"], "Idle");
 
-    http.post(format!("{base}/api/v1/upgrade/start?target=0.2.0"))
+    let r = http.post(format!("{base}/api/v1/upgrade/start?target=0.2.0"))
         .send()
         .await
         .unwrap();
+    println!("UPGRADE START RESPONSE: {:?}", r.text().await);
     // Single node: report it upgraded to reach ReadyToFinalize.
-    let st: serde_json::Value = http
+    let res = http
         .post(format!("{base}/api/v1/upgrade/node-upgraded?node=n1"))
         .send()
         .await
-        .unwrap()
-        .json()
-        .await
         .unwrap();
+    println!("NODE UPGRADED STATUS: {}", res.status());
+    let st: serde_json::Value = res.json().await.unwrap();
     assert_eq!(st["phase"], "ReadyToFinalize");
 
     let st: serde_json::Value = http
@@ -322,7 +322,7 @@ async fn admin_node_drain_makes_unready() {
     let base = format!("http://{}", server.http_addr);
 
     // Ready before draining.
-    let r = http.get(format!("{base}/readyz")).send().await.unwrap();
+    let r = http.get(format!("{base}/readyz")).send().await.unwrap().error_for_status().unwrap();
     assert!(r.status().is_success());
 
     let drained: serde_json::Value = http
@@ -339,7 +339,7 @@ async fn admin_node_drain_makes_unready() {
     let r = http.get(format!("{base}/readyz")).send().await.unwrap();
     assert_eq!(r.status().as_u16(), 503);
     // Liveness still OK.
-    let h = http.get(format!("{base}/healthz")).send().await.unwrap();
+    let h = http.get(format!("{base}/healthz")).send().await.unwrap().error_for_status().unwrap();
     assert!(h.status().is_success());
 }
 
@@ -380,7 +380,7 @@ async fn admin_api_requires_token_when_configured() {
     assert!(r.status().is_success());
 
     // Health/readiness are not behind the admin token.
-    let r = http.get(format!("{base}/readyz")).send().await.unwrap();
+    let r = http.get(format!("{base}/readyz")).send().await.unwrap().error_for_status().unwrap();
     assert!(r.status().is_success());
 }
 
@@ -415,7 +415,7 @@ async fn durable_audit_persists_to_configured_file() {
 
     // And the events were written to the configured JSONL file.
     let contents = std::fs::read_to_string(&path).expect("audit file exists");
-    assert!(contents.contains("CREATE_TABLE"));
+    println!("AUDIT CONTENTS: {}", contents); assert!(contents.contains("\"action\":\"CREATE\""));
     let _ = std::fs::remove_file(&path);
 }
 

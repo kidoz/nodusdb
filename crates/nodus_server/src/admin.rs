@@ -18,6 +18,7 @@ use nodus_security::{SessionInfo, SessionRegistry};
 use nodus_sharding::ShardOrchestrator;
 use nodus_storage_wal::WalEngine;
 use serde_json::{Value, json};
+use base64::Engine;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -25,6 +26,8 @@ use uuid::Uuid;
 
 /// Shared handles the admin endpoints operate on. Grows as more control-plane
 /// surfaces are wired in.
+use nodus_security::{Authenticator, PasswordAuthenticator};
+
 #[derive(Clone)]
 pub struct AdminState {
     pub registry: Arc<SessionRegistry>,
@@ -40,7 +43,7 @@ pub struct AdminState {
     pub wal_key: Option<[u8; 32]>,
     /// Shared with `AppState`; flipping it makes `/readyz` report not-ready.
     pub draining: Arc<AtomicBool>,
-    /// Bearer token required on admin endpoints; `None` disables auth.
+    pub authenticator: Arc<PasswordAuthenticator>,
     pub admin_token: Option<String>,
     pub raft_state: nodus_raftstore::server::RaftState,
     pub membership_lock: Arc<tokio::sync::Mutex<()>>,
@@ -53,16 +56,73 @@ async fn require_token(
     req: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    if let Some(expected) = &state.admin_token {
-        let provided = req
-            .headers()
-            .get(AUTHORIZATION)
-            .and_then(|h| h.to_str().ok())
-            .and_then(|h| h.strip_prefix("Bearer "));
-        if provided != Some(expected.as_str()) {
+    let path = req.uri().path();
+    let action = match path {
+        p if p.starts_with("/api/v1/sessions") => nodus_authz::Action::ManageSessions,
+        p if p.starts_with("/api/v1/audit") => nodus_authz::Action::ReadAudit,
+        p if p.starts_with("/api/v1/authz/explain") => nodus_authz::Action::ReadAudit,
+        p if p.starts_with("/api/v1/backups") => nodus_authz::Action::ManageBackups,
+        p if p.starts_with("/api/v1/upgrade") => nodus_authz::Action::ManageUpgrades,
+        p if p.starts_with("/api/v1/shards") => nodus_authz::Action::ManageShards,
+        p if p.starts_with("/api/v1/node") => nodus_authz::Action::ManageNode,
+        p if p.starts_with("/api/v1/cluster") => nodus_authz::Action::ManageCluster,
+        p if p.starts_with("/api/v1/queries") => nodus_authz::Action::ReadAudit,
+        _ => return Err(StatusCode::FORBIDDEN),
+    };
+
+    let principal_id = if let Some(auth) = req.headers().get(AUTHORIZATION).and_then(|h| h.to_str().ok()) {
+        if let Some(basic) = auth.strip_prefix("Basic ") {
+            let decoded = base64::engine::general_purpose::STANDARD.decode(basic).map_err(|_| StatusCode::UNAUTHORIZED)?;
+            let s = String::from_utf8(decoded).map_err(|_| StatusCode::UNAUTHORIZED)?;
+            let mut parts = s.splitn(2, ':');
+            let user = parts.next().unwrap_or("");
+            let pass = parts.next().unwrap_or("");
+            match state.authenticator.authenticate(user, pass) {
+                Ok(session) => session.principal_id,
+                Err(_) => return Err(StatusCode::UNAUTHORIZED),
+            }
+        } else if let Some(bearer) = auth.strip_prefix("Bearer ") {
+            if let Some(expected) = &state.admin_token {
+                if bearer == expected {
+                    let Ok(p) = state.catalog.get_principal_by_name("nodus") else {
+                        return Err(StatusCode::UNAUTHORIZED);
+                    };
+                    p.id
+                } else {
+                    return Err(StatusCode::UNAUTHORIZED);
+                }
+            } else {
+                return Err(StatusCode::UNAUTHORIZED);
+            }
+        } else {
             return Err(StatusCode::UNAUTHORIZED);
         }
+    } else {
+        if state.admin_token.is_none() {
+            if let Ok(p) = state.catalog.get_principal_by_name("nodus") {
+                p.id
+            } else {
+                return Err(StatusCode::UNAUTHORIZED);
+            }
+        } else {
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+    };
+
+    let authz_req = nodus_authz::AuthzRequest {
+        principal_id: principal_id,
+        active_roles: vec![],
+        action: action.clone(),
+        resource: nodus_catalog::ResourceRef::System,
+        context: nodus_authz::AuthzContext { database_id: None },
+    };
+    
+    let decision = state.authz.authorize(authz_req).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if !decision.allowed {
+        println!("Authorization failed for principal {} on action {:?}", principal_id, action);
+        return Err(StatusCode::FORBIDDEN);
     }
+
     Ok(next.run(req).await)
 }
 

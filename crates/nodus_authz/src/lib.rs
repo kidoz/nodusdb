@@ -17,12 +17,20 @@ pub enum Action {
     CreateSchema,
     CreateTable,
     ManageGrants,
-    // Add other actions...
+    // Admin Actions
+    ViewSessions,
+    ManageSessions,
+    ReadAudit,
+    ManageBackups,
+    ManageUpgrades,
+    ManageShards,
+    ManageNode,
+    ManageCluster,
 }
 
 impl Action {
     /// Maps an action to the privilege string stored on grants.
-    pub fn as_privilege(&self) -> &'static str {
+    pub fn to_privilege(&self) -> &'static str {
         match self {
             Action::Connect => "CONNECT",
             Action::Usage => "USAGE",
@@ -30,10 +38,16 @@ impl Action {
             Action::Insert => "INSERT",
             Action::Update => "UPDATE",
             Action::Delete => "DELETE",
-            Action::CreateDatabase => "CREATE_DATABASE",
-            Action::CreateSchema => "CREATE_SCHEMA",
-            Action::CreateTable => "CREATE_TABLE",
-            Action::ManageGrants => "MANAGE_GRANTS",
+            Action::CreateDatabase | Action::CreateSchema | Action::CreateTable => "CREATE",
+            Action::ManageGrants => "GRANT",
+            Action::ViewSessions => "VIEW_SESSIONS",
+            Action::ManageSessions => "MANAGE_SESSIONS",
+            Action::ReadAudit => "READ_AUDIT",
+            Action::ManageBackups => "MANAGE_BACKUPS",
+            Action::ManageUpgrades => "MANAGE_UPGRADES",
+            Action::ManageShards => "MANAGE_SHARDS",
+            Action::ManageNode => "MANAGE_NODE",
+            Action::ManageCluster => "MANAGE_CLUSTER",
         }
     }
 
@@ -118,7 +132,7 @@ impl DefaultAuthzEngine {
         let effective = self
             .catalog
             .get_effective_principals(request.principal_id)?;
-        let wanted = request.action.as_privilege();
+        let wanted = request.action.to_privilege();
         let grants = self
             .catalog
             .get_grants_for_resource(request.resource.clone())?;
@@ -189,7 +203,7 @@ impl AuthzEngine for DefaultAuthzEngine {
     }
 
     fn explain(&self, request: AuthzRequest) -> Result<AuthzExplanation> {
-        let wanted = request.action.as_privilege().to_string();
+        let wanted = request.action.to_privilege().to_string();
         let (matched, effective, _version) = self.find_matching_grant(&request)?;
 
         let mut steps = vec![
