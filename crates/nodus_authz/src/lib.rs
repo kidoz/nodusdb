@@ -273,6 +273,7 @@ mod tests {
         let catalog = Arc::new(MemoryCatalog::new());
         let user = catalog
             .create_role(CreateRoleRequest {
+                id: nodus_catalog::PrincipalId::new(),
                 name: "alice".into(),
                 principal_type: PrincipalType::User,
                 database_id: None,
@@ -281,6 +282,7 @@ mod tests {
         let table = ResourceRef::Table(TableId::new());
         catalog
             .grant_privilege(GrantPrivilegeRequest {
+                id: nodus_catalog::GrantId::new(),
                 principal_id: user.id,
                 resource: table.clone(),
                 privilege: "SELECT".into(),
@@ -298,6 +300,7 @@ mod tests {
         let catalog = Arc::new(MemoryCatalog::new());
         let role = catalog
             .create_role(CreateRoleRequest {
+                id: nodus_catalog::PrincipalId::new(),
                 name: "readers".into(),
                 principal_type: PrincipalType::Role,
                 database_id: None,
@@ -305,6 +308,7 @@ mod tests {
             .unwrap();
         let user = catalog
             .create_role(CreateRoleRequest {
+                id: nodus_catalog::PrincipalId::new(),
                 name: "bob".into(),
                 principal_type: PrincipalType::User,
                 database_id: None,
@@ -319,6 +323,7 @@ mod tests {
         let table = ResourceRef::Table(TableId::new());
         catalog
             .grant_privilege(GrantPrivilegeRequest {
+                id: nodus_catalog::GrantId::new(),
                 principal_id: role.id,
                 resource: table.clone(),
                 privilege: "SELECT".into(),

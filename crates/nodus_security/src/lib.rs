@@ -248,6 +248,7 @@ mod tests {
         let catalog = Arc::new(MemoryCatalog::new());
         let user = catalog
             .create_role(CreateRoleRequest {
+                id: nodus_catalog::PrincipalId::new(),
                 name: "alice".into(),
                 principal_type: PrincipalType::User,
                 database_id: None,
