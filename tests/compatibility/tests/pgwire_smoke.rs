@@ -120,10 +120,42 @@ async fn test_where_order_limit() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_pgwire_transactions_and_drop() {
+    let server = TestServer::start().await.expect("server starts");
+    let client = connect(&server).await;
+
+    client
+        .simple_query("CREATE TABLE tx_test (id INT PRIMARY KEY, val TEXT);")
+        .await
+        .unwrap();
+
+    // Begin, insert, rollback
+    client.simple_query("BEGIN;").await.unwrap();
+    client
+        .simple_query("INSERT INTO tx_test (id, val) VALUES (1, 'kept'), (2, 'lost');")
+        .await
+        .unwrap();
+    client.simple_query("ROLLBACK;").await.unwrap();
+
+    // Table should be empty
+    let msgs = client.simple_query("SELECT * FROM tx_test;").await.unwrap();
+    assert_eq!(rows_of(&msgs).len(), 0);
+
+    // Begin, insert, commit
+    client.simple_query("BEGIN;").await.unwrap();
+    client
+        .simple_query("INSERT INTO tx_test (id, val) VALUES (1, 'kept');")
+        .await
+        .unwrap();
+    client.simple_query("COMMIT;").await.unwrap();
+
+    // Table should have 1 row
+    let msgs = client.simple_query("SELECT * FROM tx_test;").await.unwrap();
+    assert_eq!(rows_of(&msgs).len(), 1);
+}
+#[tokio::test(flavor = "multi_thread")]
 async fn test_pgwire_queries() {
     let server = TestServer::start().await.expect("Failed to start server");
-
-    // Connect to the pgwire server
     let mut is_up = false;
     let mut client_opt = None;
     let conn_str = format!(
