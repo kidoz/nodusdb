@@ -48,7 +48,11 @@ impl Default for UpgradeState {
 pub trait UpgradeCoordinator: Send + Sync {
     fn get_state(&self) -> anyhow::Result<UpgradeState>;
     fn start_upgrade(&self, target_version: String) -> anyhow::Result<()>;
+    fn report_node_upgraded(&self, node_id: &str) -> anyhow::Result<()>;
     fn finalize_upgrade(&self) -> anyhow::Result<()>;
+    fn rollback(&self) -> anyhow::Result<()>;
+    fn is_gate_enabled(&self, feature: &str) -> bool;
+    fn current_cluster_version(&self) -> u64;
 }
 
 use std::collections::HashSet;
@@ -95,59 +99,6 @@ impl DefaultUpgradeCoordinator {
         }
         Ok(())
     }
-
-    /// Records that a node has been rolled to the target binary, advancing the
-    /// phase once every node reports in.
-    pub fn report_node_upgraded(&self, node_id: &str) -> anyhow::Result<()> {
-        let mut state = self.state.write().unwrap();
-        if state.phase != UpgradePhase::RollingNodes && state.phase != UpgradePhase::MixedVersion {
-            anyhow::bail!("not rolling nodes (phase {:?})", state.phase);
-        }
-        let mut upgraded = self.nodes_upgraded.write().unwrap();
-        upgraded.insert(node_id.to_string());
-        state.phase = if upgraded.len() >= self.nodes_total {
-            UpgradePhase::ReadyToFinalize
-        } else {
-            UpgradePhase::MixedVersion
-        };
-        Ok(())
-    }
-
-    /// Aborts an in-progress upgrade. Permitted any time before `Finalizing`,
-    /// since no irreversible feature gates have been enabled yet.
-    pub fn rollback(&self) -> anyhow::Result<()> {
-        let mut state = self.state.write().unwrap();
-        match state.phase {
-            UpgradePhase::Finalizing | UpgradePhase::Finalized | UpgradePhase::RollbackClosed => {
-                anyhow::bail!("cannot roll back after finalization has begun");
-            }
-            _ => {}
-        }
-        self.nodes_upgraded.write().unwrap().clear();
-        *state = UpgradeState {
-            feature_gates: state.feature_gates.clone(),
-            ..UpgradeState::default()
-        };
-        for v in state.feature_gates.values_mut() {
-            *v = false;
-        }
-        state.phase = UpgradePhase::Idle;
-        Ok(())
-    }
-
-    pub fn is_gate_enabled(&self, feature: &str) -> bool {
-        self.state
-            .read()
-            .unwrap()
-            .feature_gates
-            .get(feature)
-            .copied()
-            .unwrap_or(false)
-    }
-
-    pub fn current_cluster_version(&self) -> u64 {
-        *self.cluster_version.read().unwrap()
-    }
 }
 
 impl UpgradeCoordinator for DefaultUpgradeCoordinator {
@@ -175,6 +126,55 @@ impl UpgradeCoordinator for DefaultUpgradeCoordinator {
             *v = false;
         }
         Ok(())
+    }
+
+    fn report_node_upgraded(&self, node_id: &str) -> anyhow::Result<()> {
+        let mut state = self.state.write().unwrap();
+        if state.phase != UpgradePhase::RollingNodes && state.phase != UpgradePhase::MixedVersion {
+            anyhow::bail!("not rolling nodes (phase {:?})", state.phase);
+        }
+        let mut upgraded = self.nodes_upgraded.write().unwrap();
+        upgraded.insert(node_id.to_string());
+        state.phase = if upgraded.len() >= self.nodes_total {
+            UpgradePhase::ReadyToFinalize
+        } else {
+            UpgradePhase::MixedVersion
+        };
+        Ok(())
+    }
+
+    fn rollback(&self) -> anyhow::Result<()> {
+        let mut state = self.state.write().unwrap();
+        match state.phase {
+            UpgradePhase::Finalizing | UpgradePhase::Finalized | UpgradePhase::RollbackClosed => {
+                anyhow::bail!("cannot roll back after finalization has begun");
+            }
+            _ => {}
+        }
+        self.nodes_upgraded.write().unwrap().clear();
+        *state = UpgradeState {
+            feature_gates: state.feature_gates.clone(),
+            ..UpgradeState::default()
+        };
+        for v in state.feature_gates.values_mut() {
+            *v = false;
+        }
+        state.phase = UpgradePhase::Idle;
+        Ok(())
+    }
+
+    fn is_gate_enabled(&self, feature: &str) -> bool {
+        self.state
+            .read()
+            .unwrap()
+            .feature_gates
+            .get(feature)
+            .copied()
+            .unwrap_or(false)
+    }
+
+    fn current_cluster_version(&self) -> u64 {
+        *self.cluster_version.read().unwrap()
     }
 
     fn finalize_upgrade(&self) -> anyhow::Result<()> {
