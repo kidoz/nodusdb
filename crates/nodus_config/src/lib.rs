@@ -23,6 +23,7 @@ pub enum ConfigError {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct NodusConfig {
+    pub cluster: ClusterConfig,
     pub server: ServerConfig,
     pub storage: StorageConfig,
     pub tls: TlsConfig,
@@ -30,6 +31,27 @@ pub struct NodusConfig {
     pub observability: ObservabilityConfig,
     pub admin: AdminConfig,
     pub audit: AuditConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ClusterConfig {
+    /// Unique integer identifier for the node.
+    pub node_id: u64,
+    /// The HTTP address this node advertises to peers for Raft communication.
+    pub raft_advertise_addr: String,
+    /// A list of addresses of existing nodes to contact for joining.
+    pub join_peers: Vec<String>,
+}
+
+impl Default for ClusterConfig {
+    fn default() -> Self {
+        Self {
+            node_id: 1,
+            raft_advertise_addr: "127.0.0.1:8088".into(),
+            join_peers: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -113,6 +135,7 @@ pub struct ObservabilityConfig {
 impl Default for NodusConfig {
     fn default() -> Self {
         Self {
+            cluster: ClusterConfig::default(),
             server: ServerConfig::default(),
             storage: StorageConfig::default(),
             tls: TlsConfig::default(),
