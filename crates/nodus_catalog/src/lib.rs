@@ -350,6 +350,7 @@ pub struct CreateTableRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GrantPrivilegesRequest {
+    pub id: GrantId,
     pub principal_id: PrincipalId,
     pub resource: ResourceRef,
     pub privilege: String,
@@ -384,6 +385,7 @@ pub enum TableDescriptorChange {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateRoleRequest {
+    pub id: PrincipalId,
     pub name: String,
     pub principal_type: PrincipalType,
     pub database_id: Option<DatabaseId>,
@@ -391,6 +393,7 @@ pub struct CreateRoleRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GrantPrivilegeRequest {
+    pub id: GrantId,
     pub principal_id: PrincipalId,
     pub resource: ResourceRef,
     pub privilege: String,
@@ -799,7 +802,7 @@ impl CatalogWriter for MemoryCatalog {
     fn grant_privileges(&self, request: GrantPrivilegesRequest) -> Result<GrantDescriptor> {
         let mut guard = self.grants.write().unwrap();
         let desc = GrantDescriptor {
-            id: GrantId::new(),
+            id: request.id,
             name: "grant".into(),
             version: self.increment_version(),
             created_at: Utc::now(),
@@ -815,8 +818,17 @@ impl CatalogWriter for MemoryCatalog {
         Ok(desc)
     }
 
-    fn revoke_privileges(&self, _request: RevokePrivilegesRequest) -> Result<()> {
-        anyhow::bail!("Not implemented")
+    fn revoke_privileges(&self, request: RevokePrivilegesRequest) -> Result<()> {
+        let mut guard = self.grants.write().unwrap();
+        guard.retain(|g| {
+            !(g.principal_id == request.principal_id
+                && g.resource == request.resource
+                && g.privilege.eq_ignore_ascii_case(&request.privilege))
+        });
+        self.increment_version();
+        drop(guard);
+        let _ = self.save_to_disk();
+        Ok(())
     }
 
     fn update_table_descriptor(&self, change: TableDescriptorChange) -> Result<TableDescriptor> {
@@ -871,7 +883,7 @@ impl CatalogWriter for MemoryCatalog {
             anyhow::bail!("Principal {} already exists", request.name);
         }
         let desc = PrincipalDescriptor {
-            id: PrincipalId::new(),
+            id: request.id,
             name: request.name.clone(),
             version: self.increment_version(),
             created_at: Utc::now(),
@@ -889,7 +901,7 @@ impl CatalogWriter for MemoryCatalog {
     fn grant_privilege(&self, request: GrantPrivilegeRequest) -> Result<GrantDescriptor> {
         let mut guard = self.grants.write().unwrap();
         let desc = GrantDescriptor {
-            id: GrantId::new(),
+            id: request.id,
             name: "grant".into(),
             version: self.increment_version(),
             created_at: Utc::now(),

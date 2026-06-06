@@ -312,6 +312,7 @@ pub async fn run_server_with_config(
     });
 
     let admin = match catalog.create_role(CreateRoleRequest {
+        id: nodus_catalog::PrincipalId::new(),
         name: "nodus".into(),
         principal_type: PrincipalType::User,
         database_id: None,
@@ -326,6 +327,7 @@ pub async fn run_server_with_config(
 
     // Bootstrap superuser: ALL on System bypasses per-resource grant checks.
     let _ = catalog.grant_privilege(GrantPrivilegeRequest {
+        id: nodus_catalog::GrantId::new(),
         principal_id: admin.id,
         resource: ResourceRef::System,
         privilege: "ALL".into(),

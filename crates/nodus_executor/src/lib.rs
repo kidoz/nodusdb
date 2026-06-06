@@ -2421,6 +2421,7 @@ mod tests {
         let (exec, cat) = MemExecutor::shared(audit.clone());
         let user = cat
             .create_role(CreateRoleRequest {
+                id: nodus_catalog::PrincipalId::new(),
                 name: "bob".into(),
                 principal_type: PrincipalType::User,
                 database_id: None,
@@ -2436,6 +2437,7 @@ mod tests {
 
         let sch = cat.get_schema("default", "public").unwrap();
         cat.grant_privilege(GrantPrivilegeRequest {
+            id: nodus_catalog::GrantId::new(),
             principal_id: user.id,
             resource: ResourceRef::Schema(sch.id),
             privilege: "CREATE_TABLE".into(),
@@ -2461,12 +2463,14 @@ mod tests {
         let (exec, cat) = MemExecutor::shared(Arc::new(MemoryAuditSink::new()));
         let admin = cat
             .create_role(CreateRoleRequest {
+                id: nodus_catalog::PrincipalId::new(),
                 name: "admin".into(),
                 principal_type: PrincipalType::User,
                 database_id: None,
             })
             .unwrap();
         cat.grant_privilege(GrantPrivilegeRequest {
+            id: nodus_catalog::GrantId::new(),
             principal_id: admin.id,
             resource: ResourceRef::System,
             privilege: "ALL".into(),
@@ -2553,12 +2557,14 @@ mod tests {
         let (exec, cat) = MemExecutor::shared(Arc::new(MemoryAuditSink::new()));
         let admin = cat
             .create_role(CreateRoleRequest {
+                id: nodus_catalog::PrincipalId::new(),
                 name: "admin".into(),
                 principal_type: PrincipalType::User,
                 database_id: None,
             })
             .unwrap();
         cat.grant_privilege(GrantPrivilegeRequest {
+            id: nodus_catalog::GrantId::new(),
             principal_id: admin.id,
             resource: ResourceRef::System,
             privilege: "ALL".into(),
@@ -2618,12 +2624,14 @@ mod tests {
         let (exec, cat) = MemExecutor::shared(Arc::new(MemoryAuditSink::new()));
         let admin = cat
             .create_role(CreateRoleRequest {
+                id: nodus_catalog::PrincipalId::new(),
                 name: "admin".into(),
                 principal_type: PrincipalType::User,
                 database_id: None,
             })
             .unwrap();
         cat.grant_privilege(GrantPrivilegeRequest {
+            id: nodus_catalog::GrantId::new(),
             principal_id: admin.id,
             resource: ResourceRef::System,
             privilege: "ALL".into(),
@@ -2710,12 +2718,14 @@ mod tests {
         let (exec, cat) = MemExecutor::shared(Arc::new(MemoryAuditSink::new()));
         let admin = cat
             .create_role(CreateRoleRequest {
+                id: nodus_catalog::PrincipalId::new(),
                 name: "admin".into(),
                 principal_type: PrincipalType::User,
                 database_id: None,
             })
             .unwrap();
         cat.grant_privilege(GrantPrivilegeRequest {
+            id: nodus_catalog::GrantId::new(),
             principal_id: admin.id,
             resource: ResourceRef::System,
             privilege: "ALL".into(),
@@ -2819,12 +2829,14 @@ mod tests {
         let (exec, cat) = MemExecutor::shared(Arc::new(MemoryAuditSink::new()));
         let admin = cat
             .create_role(CreateRoleRequest {
+                id: nodus_catalog::PrincipalId::new(),
                 name: "admin".into(),
                 principal_type: PrincipalType::User,
                 database_id: None,
             })
             .unwrap();
         cat.grant_privilege(GrantPrivilegeRequest {
+            id: nodus_catalog::GrantId::new(),
             principal_id: admin.id,
             resource: ResourceRef::System,
             privilege: "ALL".into(),
@@ -2913,12 +2925,14 @@ mod tests {
         let (exec, cat) = MemExecutor::shared(Arc::new(MemoryAuditSink::new()));
         let admin = cat
             .create_role(CreateRoleRequest {
+                id: nodus_catalog::PrincipalId::new(),
                 name: "admin".into(),
                 principal_type: PrincipalType::User,
                 database_id: None,
             })
             .unwrap();
         cat.grant_privilege(GrantPrivilegeRequest {
+            id: nodus_catalog::GrantId::new(),
             principal_id: admin.id,
             resource: ResourceRef::System,
             privilege: "ALL".into(),
@@ -2982,12 +2996,14 @@ mod tests {
         let (exec, cat) = MemExecutor::shared(Arc::new(MemoryAuditSink::new()));
         let admin = cat
             .create_role(CreateRoleRequest {
+                id: nodus_catalog::PrincipalId::new(),
                 name: "admin".into(),
                 principal_type: PrincipalType::User,
                 database_id: None,
             })
             .unwrap();
         cat.grant_privilege(GrantPrivilegeRequest {
+            id: nodus_catalog::GrantId::new(),
             principal_id: admin.id,
             resource: ResourceRef::System,
             privilege: "ALL".into(),
@@ -3096,12 +3112,14 @@ mod phase1_tests {
         let (exec, cat) = MemExecutor::shared(Arc::new(MemoryAuditSink::new()));
         let admin = cat
             .create_role(nodus_catalog::CreateRoleRequest {
+                id: nodus_catalog::PrincipalId::new(),
                 name: "admin".into(),
                 principal_type: nodus_catalog::PrincipalType::User,
                 database_id: None,
             })
             .unwrap();
         cat.grant_privilege(nodus_catalog::GrantPrivilegeRequest {
+            id: nodus_catalog::GrantId::new(),
             principal_id: admin.id,
             resource: nodus_catalog::ResourceRef::System,
             privilege: "ALL".into(),
@@ -3228,12 +3246,14 @@ mod phase2_tests {
         let (exec, cat) = MemExecutor::shared(Arc::new(MemoryAuditSink::new()));
         let admin = cat
             .create_role(nodus_catalog::CreateRoleRequest {
+                id: nodus_catalog::PrincipalId::new(),
                 name: "admin".into(),
                 principal_type: nodus_catalog::PrincipalType::User,
                 database_id: None,
             })
             .unwrap();
         cat.grant_privilege(nodus_catalog::GrantPrivilegeRequest {
+            id: nodus_catalog::GrantId::new(),
             principal_id: admin.id,
             resource: nodus_catalog::ResourceRef::System,
             privilege: "ALL".into(),
@@ -3334,12 +3354,14 @@ mod phase3_tests {
         let (exec, cat) = MemExecutor::shared(Arc::new(MemoryAuditSink::new()));
         let admin = cat
             .create_role(nodus_catalog::CreateRoleRequest {
+                id: nodus_catalog::PrincipalId::new(),
                 name: "admin".into(),
                 principal_type: nodus_catalog::PrincipalType::User,
                 database_id: None,
             })
             .unwrap();
         cat.grant_privilege(nodus_catalog::GrantPrivilegeRequest {
+            id: nodus_catalog::GrantId::new(),
             principal_id: admin.id,
             resource: nodus_catalog::ResourceRef::System,
             privilege: "ALL".into(),
@@ -3515,12 +3537,14 @@ mod phase3_tests {
         let (exec, cat) = MemExecutor::shared(Arc::new(MemoryAuditSink::new()));
         let admin = cat
             .create_role(nodus_catalog::CreateRoleRequest {
+                id: nodus_catalog::PrincipalId::new(),
                 name: "admin".into(),
                 principal_type: nodus_catalog::PrincipalType::User,
                 database_id: None,
             })
             .unwrap();
         cat.grant_privilege(nodus_catalog::GrantPrivilegeRequest {
+            id: nodus_catalog::GrantId::new(),
             principal_id: admin.id,
             resource: nodus_catalog::ResourceRef::System,
             privilege: "ALL".into(),
@@ -3628,12 +3652,14 @@ mod phase3_tests {
         let (exec, cat) = MemExecutor::shared(Arc::new(MemoryAuditSink::new()));
         let admin = cat
             .create_role(nodus_catalog::CreateRoleRequest {
+                id: nodus_catalog::PrincipalId::new(),
                 name: "admin".into(),
                 principal_type: nodus_catalog::PrincipalType::User,
                 database_id: None,
             })
             .unwrap();
         cat.grant_privilege(nodus_catalog::GrantPrivilegeRequest {
+            id: nodus_catalog::GrantId::new(),
             principal_id: admin.id,
             resource: nodus_catalog::ResourceRef::System,
             privilege: "ALL".into(),
@@ -3841,12 +3867,14 @@ mod phase3_tests {
         let (exec, cat) = MemExecutor::shared(Arc::new(MemoryAuditSink::new()));
         let admin = cat
             .create_role(nodus_catalog::CreateRoleRequest {
+                id: nodus_catalog::PrincipalId::new(),
                 name: "admin".into(),
                 principal_type: nodus_catalog::PrincipalType::User,
                 database_id: None,
             })
             .unwrap();
         cat.grant_privilege(nodus_catalog::GrantPrivilegeRequest {
+            id: nodus_catalog::GrantId::new(),
             principal_id: admin.id,
             resource: nodus_catalog::ResourceRef::System,
             privilege: "ALL".into(),

@@ -92,8 +92,43 @@ impl CatalogWriter for RaftCatalogWriter {
         })
     }
 
-    fn grant_privileges(&self, _request: GrantPrivilegesRequest) -> Result<GrantDescriptor> { Err(anyhow::anyhow!("Not implemented")) }
-    fn revoke_privileges(&self, _request: RevokePrivilegesRequest) -> Result<()> { Ok(()) }
+    fn grant_privileges(&self, request: GrantPrivilegesRequest) -> Result<GrantDescriptor> {
+        let cmd = ShardCommand::GrantPrivileges(request.clone());
+        let res = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                self.raft.client_write(cmd).await
+            })
+        });
+        if let Err(e) = res {
+            tracing::error!("grant_privileges client_write failed: {}", e);
+            anyhow::bail!("grant_privileges raft error: {}", e);
+        }
+        Ok(GrantDescriptor {
+            id: GrantId::new(),
+            name: "grant".into(),
+            version: 1,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            principal_id: request.principal_id,
+            resource: request.resource,
+            privilege: request.privilege,
+            state: DescriptorState::Public,
+        })
+    }
+    
+    fn revoke_privileges(&self, request: RevokePrivilegesRequest) -> Result<()> {
+        let cmd = ShardCommand::RevokePrivileges(request);
+        let res = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                self.raft.client_write(cmd).await
+            })
+        });
+        if let Err(e) = res {
+            tracing::error!("revoke_privileges client_write failed: {}", e);
+            anyhow::bail!("revoke_privileges raft error: {}", e);
+        }
+        Ok(())
+    }
     fn update_table_descriptor(&self, change: TableDescriptorChange) -> Result<TableDescriptor> {
         let cmd = ShardCommand::UpdateTableDescriptor(change);
         let res = tokio::task::block_in_place(|| {
@@ -121,10 +156,81 @@ impl CatalogWriter for RaftCatalogWriter {
             indexes: vec![],
         })
     }
-    fn create_role(&self, _request: CreateRoleRequest) -> Result<PrincipalDescriptor> { Err(anyhow::anyhow!("Not implemented")) }
-    fn grant_privilege(&self, _request: GrantPrivilegeRequest) -> Result<GrantDescriptor> { Err(anyhow::anyhow!("Not implemented")) }
-    fn revoke_privilege(&self, _request: RevokePrivilegeRequest) -> Result<()> { Ok(()) }
-    fn add_role_member(&self, _request: AddRoleMemberRequest) -> Result<()> { Ok(()) }
+    fn create_role(&self, request: CreateRoleRequest) -> Result<PrincipalDescriptor> {
+        let name = request.name.clone();
+        let cmd = ShardCommand::CreateRole(request.clone());
+        let res = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                self.raft.client_write(cmd).await
+            })
+        });
+        if let Err(e) = res {
+            tracing::error!("create_role client_write failed: {}", e);
+            anyhow::bail!("create_role raft error: {}", e);
+        }
+        Ok(PrincipalDescriptor {
+            id: PrincipalId::new(),
+            name,
+            principal_type: request.principal_type,
+            database_id: request.database_id,
+            version: 1,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            state: DescriptorState::Public,
+        })
+    }
+    
+    fn grant_privilege(&self, request: GrantPrivilegeRequest) -> Result<GrantDescriptor> {
+        let cmd = ShardCommand::GrantPrivilege(request.clone());
+        let res = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                self.raft.client_write(cmd).await
+            })
+        });
+        if let Err(e) = res {
+            tracing::error!("grant_privilege client_write failed: {}", e);
+            anyhow::bail!("grant_privilege raft error: {}", e);
+        }
+        Ok(GrantDescriptor {
+            id: GrantId::new(),
+            name: "grant".into(),
+            version: 1,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            principal_id: request.principal_id,
+            resource: request.resource,
+            privilege: request.privilege,
+            state: DescriptorState::Public,
+        })
+    }
+    
+    fn revoke_privilege(&self, request: RevokePrivilegeRequest) -> Result<()> {
+        let cmd = ShardCommand::RevokePrivilege(request);
+        let res = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                self.raft.client_write(cmd).await
+            })
+        });
+        if let Err(e) = res {
+            tracing::error!("revoke_privilege client_write failed: {}", e);
+            anyhow::bail!("revoke_privilege raft error: {}", e);
+        }
+        Ok(())
+    }
+    
+    fn add_role_member(&self, request: AddRoleMemberRequest) -> Result<()> {
+        let cmd = ShardCommand::AddRoleMember(request);
+        let res = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                self.raft.client_write(cmd).await
+            })
+        });
+        if let Err(e) = res {
+            tracing::error!("add_role_member client_write failed: {}", e);
+            anyhow::bail!("add_role_member raft error: {}", e);
+        }
+        Ok(())
+    }
     fn update_index_state(&self, table_id: TableId, index_id: IndexId, state: IndexState) -> Result<()> {
         let cmd = ShardCommand::UpdateIndexState { table_id, index_id, state };
         let res = tokio::task::block_in_place(|| {
