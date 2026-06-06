@@ -573,10 +573,7 @@ impl MemoryCatalog {
     fn increment_version(&self) -> u64 {
         let mut v = self.catalog_version.write().unwrap();
         *v += 1;
-        let val = *v;
-        drop(v);
-        let _ = self.save_to_disk();
-        val
+        *v
     }
 }
 
@@ -726,6 +723,8 @@ impl CatalogWriter for MemoryCatalog {
             owner_role_id: request.owner_role_id,
         };
         guard.insert(request.name.clone(), desc.clone());
+        drop(guard);
+        let _ = self.save_to_disk();
         Ok(desc)
     }
 
@@ -748,6 +747,8 @@ impl CatalogWriter for MemoryCatalog {
             system_schema: false,
         };
         guard.insert(key, desc.clone());
+        drop(guard);
+        let _ = self.save_to_disk();
         Ok(desc)
     }
 
@@ -770,6 +771,8 @@ impl CatalogWriter for MemoryCatalog {
             indexes: vec![],
         };
         guard.insert(key, desc.clone());
+        drop(guard);
+        let _ = self.save_to_disk();
         Ok(desc)
     }
 
@@ -787,6 +790,8 @@ impl CatalogWriter for MemoryCatalog {
             privilege: request.privilege,
         };
         guard.push(desc.clone());
+        drop(guard);
+        let _ = self.save_to_disk();
         Ok(desc)
     }
 
@@ -856,6 +861,8 @@ impl CatalogWriter for MemoryCatalog {
             database_id: request.database_id,
         };
         guard.insert(request.name.clone(), desc.clone());
+        drop(guard);
+        let _ = self.save_to_disk();
         Ok(desc)
     }
 
@@ -873,6 +880,8 @@ impl CatalogWriter for MemoryCatalog {
             privilege: request.privilege,
         };
         guard.push(desc.clone());
+        drop(guard);
+        let _ = self.save_to_disk();
         Ok(desc)
     }
 
@@ -884,6 +893,8 @@ impl CatalogWriter for MemoryCatalog {
                 && g.privilege.eq_ignore_ascii_case(&request.privilege))
         });
         self.increment_version();
+        drop(guard);
+        let _ = self.save_to_disk();
         Ok(())
     }
 
@@ -894,6 +905,8 @@ impl CatalogWriter for MemoryCatalog {
             guard.push(edge);
         }
         self.increment_version();
+        drop(guard);
+        let _ = self.save_to_disk();
         Ok(())
     }
 
@@ -909,6 +922,8 @@ impl CatalogWriter for MemoryCatalog {
                 if idx.id == index_id {
                     idx.index_state = state;
                     self.increment_version();
+                    drop(tables);
+                    let _ = self.save_to_disk();
                     return Ok(());
                 }
             }
@@ -932,13 +947,9 @@ impl CatalogWriter for MemoryCatalog {
             .into_iter()
             .map(|t| ((t.database_id, t.schema_id, t.name.clone()), t))
             .collect();
-        *self.principals.write().unwrap() = snapshot
-            .principals
-            .into_iter()
-            .map(|p| (p.name.clone(), p))
-            .collect();
-        *self.grants.write().unwrap() = snapshot.grants;
+        // Do not overwrite principals, grants, or roles to preserve server-level auth state
         self.increment_version();
+        let _ = self.save_to_disk();
         Ok(())
     }
 }
