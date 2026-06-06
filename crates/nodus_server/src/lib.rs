@@ -465,6 +465,7 @@ pub async fn run_server_with_config(
         draining: state.draining.clone(),
         admin_token: config.admin.token.clone(),
         raft: raft.clone(),
+        membership_lock: Arc::new(tokio::sync::Mutex::new(())),
     };
 
     let raft_state = nodus_raftstore::server::RaftState { raft: raft.clone() };

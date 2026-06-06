@@ -44,6 +44,7 @@ pub struct AdminState {
     /// Bearer token required on admin endpoints; `None` disables auth.
     pub admin_token: Option<String>,
     pub raft: nodus_raftstore::server::NodusRaft,
+    pub membership_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// Rejects requests lacking a valid `Authorization: Bearer <token>` header when
@@ -101,6 +102,7 @@ async fn cluster_join(
     State(state): State<AdminState>,
     Json(req): Json<JoinRequest>,
 ) -> impl axum::response::IntoResponse {
+    let _guard = state.membership_lock.lock().await;
     let node = openraft::BasicNode::new(&req.raft_advertise_addr);
     match state.raft.add_learner(req.node_id, node, true).await {
         Ok(_) => {
