@@ -1,4 +1,5 @@
 mod admin;
+mod raft_kv;
 
 use admin::{AdminState, admin_routes};
 use axum::Router;
@@ -152,10 +153,56 @@ pub async fn run_server_with_config(
         None
     };
 
-    let (executor, catalog) = match &config.storage.data_dir {
-        Some(dir) => nodus_executor::MemExecutor::persistent(audit_sink, dir, encryption_key)?,
-        None => nodus_executor::MemExecutor::shared(audit_sink),
+    let (local_kv, catalog): (Arc<dyn nodus_storage_api::KvEngine>, _) = match &config.storage.data_dir {
+        Some(dir) => {
+            let path = std::path::Path::new(dir);
+            std::fs::create_dir_all(path).unwrap();
+            let cat_path = path.join("catalog.json");
+            let cat = Arc::new(nodus_catalog::MemoryCatalog::load_from_disk(cat_path).unwrap());
+            let k = Arc::new(nodus_storage_lsm::LsmKvEngine::with_wal(path, encryption_key).unwrap());
+            (k, cat)
+        }
+        None => {
+            let cat = Arc::new(nodus_catalog::MemoryCatalog::new());
+            let k = Arc::new(nodus_storage_mem::MemKvEngine::new());
+            (k, cat)
+        }
     };
+
+    let raft_config = Arc::new(openraft::Config::default().validate().unwrap());
+    let (log_store, state_machine) =
+        openraft::storage::Adaptor::new(nodus_raftstore::NodusRaftStore::with_kv(local_kv.clone()));
+    let raft_network = nodus_raftstore::network::NodusNetworkFactory::new();
+    let raft = nodus_raftstore::server::NodusRaft::new(
+        1,
+        raft_config,
+        raft_network,
+        log_store,
+        state_machine,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("raft init: {e}"))?;
+
+    let mut nodes = std::collections::BTreeMap::new();
+    nodes.insert(1, openraft::BasicNode::new("127.0.0.1:0"));
+    let _ = raft.initialize(nodes).await;
+
+    let raft_kv = Arc::new(crate::raft_kv::RaftKvEngine {
+        local: local_kv,
+        raft: raft.clone(),
+    });
+
+    let txn = Arc::new(nodus_txn::MemTxnManager::new());
+    let authz = Arc::new(nodus_authz::DefaultAuthzEngine::new(catalog.clone()));
+
+    let executor = Arc::new(nodus_executor::MemExecutor::new(
+        catalog.clone(),
+        catalog.clone(),
+        authz.clone(),
+        audit_sink,
+        raft_kv,
+        txn,
+    ));
 
     let admin = match catalog.create_role(CreateRoleRequest {
         name: "nodus".into(),
@@ -268,19 +315,6 @@ pub async fn run_server_with_config(
         admin_token: config.admin.token.clone(),
     };
 
-    let raft_config = Arc::new(openraft::Config::default().validate().unwrap());
-    let (log_store, state_machine) =
-        openraft::storage::Adaptor::new(nodus_raftstore::NodusRaftStore::new());
-    let raft_network = nodus_raftstore::network::NodusNetworkFactory::new();
-    let raft = nodus_raftstore::server::NodusRaft::new(
-        1,
-        raft_config,
-        raft_network,
-        log_store,
-        state_machine,
-    )
-    .await
-    .map_err(|e| anyhow::anyhow!("raft init: {e}"))?;
     let raft_state = nodus_raftstore::server::RaftState { raft };
 
     let app = Router::new()

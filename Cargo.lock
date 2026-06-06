@@ -2194,12 +2194,14 @@ dependencies = [
  "axum",
  "madsim",
  "nodus_raftstore",
+ "nodus_storage_mem",
  "nodus_testkit",
  "openraft",
  "porcupine-rs",
  "reqwest",
  "tokio",
  "tokio-postgres",
+ "uuid",
 ]
 
 [[package]]
@@ -2343,6 +2345,7 @@ dependencies = [
  "serde_json",
  "thiserror 1.0.69",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -2382,6 +2385,7 @@ dependencies = [
  "nodus_sharding",
  "nodus_storage_api",
  "nodus_storage_lsm",
+ "nodus_storage_mem",
  "nodus_telemetry",
  "nodus_txn",
  "nodus_upgrade",

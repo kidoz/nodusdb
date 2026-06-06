@@ -20,3 +20,5 @@ tokio.workspace = true
 reqwest.workspace = true
 openraft.workspace = true
 nodus_raftstore = { path = "../../crates/nodus_raftstore" }
+uuid.workspace = true
+nodus_storage_mem = { version = "0.1.0", path = "../../crates/nodus_storage_mem" }

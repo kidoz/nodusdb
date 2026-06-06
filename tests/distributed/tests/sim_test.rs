@@ -61,12 +61,20 @@ async fn read_val(State(state): State<RaftState>) -> Json<i32> {
 }
 
 async fn write_val(State(state): State<RaftState>, Json(val): Json<i32>) -> Json<bool> {
-    let cmd = ShardCommand::PutIntent {
-        txn_id: "test-txn".to_string(),
+    let txn_id = uuid::Uuid::new_v4().to_string();
+    let cmd1 = ShardCommand::PutIntent {
+        txn_id: txn_id.clone(),
         key: b"register".to_vec(),
         value: val.to_string().into_bytes(),
     };
-    match state.raft.client_write(cmd).await {
+    let cmd2 = ShardCommand::CommitTxn {
+        txn_id,
+        commit_ts: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_micros() as u64,
+    };
+    if state.raft.client_write(cmd1).await.is_err() {
+        return Json(false);
+    }
+    match state.raft.client_write(cmd2).await {
         Ok(_) => Json(true),
         Err(_) => Json(false),
     }
@@ -186,7 +194,8 @@ async fn test_cluster_partition_linearizability() {
     for i in 1..=3 {
         let addr: SocketAddr = format!("127.0.0.1:1543{}", i).parse().unwrap();
 
-        let store = NodusRaftStore::new();
+        let kv = Arc::new(nodus_storage_mem::MemKvEngine::new());
+        let store = NodusRaftStore::with_kv(kv);
         stores.insert(i as u64, store.clone());
         let raft_config_clone = raft_config.clone();
         let part_clone = partitioned.clone();
@@ -242,10 +251,11 @@ async fn test_cluster_partition_linearizability() {
         .post(format!("http://{}/test/write", nodes[0].1))
         .json(&42)
         .send()
-        .await;
+        .await
+        .unwrap();
 
     // It should succeed if it has quorum (nodes 1 and 2)
-    assert!(write_res.is_ok());
+    assert!(write_res.json::<bool>().await.unwrap());
 
     sleep(Duration::from_secs(1)).await;
 
@@ -261,7 +271,9 @@ async fn test_cluster_partition_linearizability() {
 
     // Just a basic check that data actually replicated to node 3
     let sm3 = stores.get(&3).unwrap().state_machine.read().await;
-    let val_str = sm3.data.get("register").unwrap();
+    let kv = sm3.kv.as_ref().unwrap();
+    let val_bytes = kv.get(b"register", u64::MAX).unwrap().unwrap();
+    let val_str = String::from_utf8(val_bytes.to_vec()).unwrap();
     assert_eq!(val_str, "42");
 
     history.push(Operation {

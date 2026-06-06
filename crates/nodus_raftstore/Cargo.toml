@@ -19,3 +19,4 @@ nodus_sharding = { path = "../nodus_sharding" }
 reqwest.workspace = true
 axum.workspace = true
 serde_json.workspace = true
+uuid.workspace = true

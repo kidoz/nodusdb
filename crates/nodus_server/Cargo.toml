@@ -40,3 +40,4 @@ rustls-pemfile = "2"
 hex = "0.4.3"
 nodus_raftstore = { path = "../nodus_raftstore" }
 openraft.workspace = true
+nodus_storage_mem = { version = "0.1.0", path = "../nodus_storage_mem" }

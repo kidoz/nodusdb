@@ -52,6 +52,10 @@ pub enum ShardCommand {
         index_id: String,
         key: Vec<u8>,
     },
+    DeleteIntent {
+        txn_id: String,
+        key: Vec<u8>,
+    },
     SplitShard {
         split_key: Vec<u8>,
     },
@@ -68,7 +72,7 @@ pub struct ShardResponse {
 pub struct StateMachine {
     pub last_applied_log: Option<LogId<u64>>,
     pub last_membership: StoredMembership<u64, openraft::BasicNode>,
-    pub data: BTreeMap<String, String>,
+    pub kv: Option<Arc<dyn nodus_storage_api::KvEngine>>,
 }
 
 #[derive(Clone)]
@@ -92,7 +96,19 @@ impl NodusRaftStore {
             state_machine: Arc::new(RwLock::new(StateMachine {
                 last_applied_log: None,
                 last_membership: StoredMembership::default(),
-                data: BTreeMap::new(),
+                kv: None,
+            })),
+        }
+    }
+
+    pub fn with_kv(kv: Arc<dyn nodus_storage_api::KvEngine>) -> Self {
+        Self {
+            log: Arc::new(RwLock::new(BTreeMap::new())),
+            vote: Arc::new(RwLock::new(None)),
+            state_machine: Arc::new(RwLock::new(StateMachine {
+                last_applied_log: None,
+                last_membership: StoredMembership::default(),
+                kv: Some(kv),
             })),
         }
     }
@@ -116,7 +132,7 @@ impl RaftSnapshotBuilder<NodusTypeConfig> for NodusRaftStore {
     async fn build_snapshot(&mut self) -> Result<Snapshot<NodusTypeConfig>, StorageError<u64>> {
         let sm = self.state_machine.read().await;
 
-        let data_bytes = serde_json::to_vec(&sm.data).unwrap_or_default();
+        let data_bytes = b"{}".to_vec();
 
         Ok(Snapshot {
             meta: SnapshotMeta {
@@ -210,13 +226,44 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
             sm.last_applied_log = Some(entry.log_id);
             match &entry.payload {
                 EntryPayload::Normal(cmd) => {
-                    if let ShardCommand::PutIntent { key, value, .. } = cmd
-                        && let (Ok(k), Ok(v)) = (
-                            String::from_utf8(key.clone()),
-                            String::from_utf8(value.clone()),
-                        )
-                    {
-                        sm.data.insert(k, v);
+                    if let Some(kv) = &sm.kv {
+                        use nodus_storage_api::TxnId;
+                        use bytes::Bytes;
+                        use std::str::FromStr;
+
+                        match cmd {
+                            ShardCommand::PutIntent { txn_id, key, value } => {
+                                if let Ok(tid) = uuid::Uuid::from_str(txn_id) {
+                                    let _ = kv.write_intent(TxnId(tid), Bytes::from(key.clone()), Bytes::from(value.clone()));
+                                }
+                            }
+                            ShardCommand::DeleteIntent { txn_id, key } => {
+                                if let Ok(tid) = uuid::Uuid::from_str(txn_id) {
+                                    let _ = kv.delete_intent(TxnId(tid), Bytes::from(key.clone()));
+                                }
+                            }
+                            ShardCommand::CommitTxn { txn_id, commit_ts } => {
+                                if let Ok(tid) = uuid::Uuid::from_str(txn_id) {
+                                    let _ = kv.commit(TxnId(tid), *commit_ts);
+                                }
+                            }
+                            ShardCommand::AbortTxn { txn_id } => {
+                                if let Ok(tid) = uuid::Uuid::from_str(txn_id) {
+                                    let _ = kv.abort(TxnId(tid));
+                                }
+                            }
+                            ShardCommand::IndexPutIntent { txn_id, key, value, .. } => {
+                                if let Ok(tid) = uuid::Uuid::from_str(txn_id) {
+                                    let _ = kv.write_intent(TxnId(tid), Bytes::from(key.clone()), Bytes::from(value.clone()));
+                                }
+                            }
+                            ShardCommand::IndexDeleteIntent { txn_id, key, .. } => {
+                                if let Ok(tid) = uuid::Uuid::from_str(txn_id) {
+                                    let _ = kv.delete_intent(TxnId(tid), Bytes::from(key.clone()));
+                                }
+                            }
+                            _ => {}
+                        }
                     }
                     res.push(ShardResponse { success: true });
                 }
@@ -249,10 +296,8 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
         sm.last_applied_log = meta.last_log_id;
         sm.last_membership = meta.last_membership.clone();
 
-        let bytes = snapshot.into_inner();
-        if let Ok(data) = serde_json::from_slice(&bytes) {
-            sm.data = data;
-        }
+        // KV snapshot installation would happen here
+        let _ = snapshot.into_inner();
 
         Ok(())
     }
