@@ -120,7 +120,7 @@ pub async fn run_server_with_config(
     let state = Arc::new(AppState::default());
     state
         .is_ready
-        .store(true, std::sync::atomic::Ordering::Release);
+        .store(false, std::sync::atomic::Ordering::Release);
 
     // Shared catalog so the authenticator's principals and the executor's
     // authorization grants resolve against the same data. The audit sink is
@@ -219,6 +219,7 @@ pub async fn run_server_with_config(
     println!("Executor created");
 
     let executor_clone = executor.clone();
+    let state_clone = state.clone();
     tokio::spawn(async move {
         if join_peers.is_empty() {
             println!("Background initializing raft cluster as singleton");
@@ -263,6 +264,7 @@ pub async fn run_server_with_config(
                     println!("Bootstrap succeeded");
                 }
             }
+            state_clone.is_ready.store(true, std::sync::atomic::Ordering::Release);
         } else {
             println!("Attempting to join existing cluster via {:?}", join_peers);
             let client = reqwest::Client::new();
@@ -303,6 +305,8 @@ pub async fn run_server_with_config(
             }
             if !joined {
                 println!("FATAL: Failed to join cluster after retries");
+            } else {
+                state_clone.is_ready.store(true, std::sync::atomic::Ordering::Release);
             }
         }
     });

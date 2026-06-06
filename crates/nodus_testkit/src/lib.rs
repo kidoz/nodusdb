@@ -38,6 +38,23 @@ impl TestServer {
         )
         .await?;
 
+        // Wait for the server to be ready before returning
+        let client = reqwest::Client::new();
+        let readyz_url = format!("http://127.0.0.1:{}/readyz", handle.http_addr.port());
+        let mut ready = false;
+        for _ in 0..50 {
+            if let Ok(resp) = client.get(&readyz_url).send().await {
+                if resp.status().is_success() {
+                    ready = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        if !ready {
+            anyhow::bail!("Server did not become ready in time");
+        }
+
         Ok(Self {
             pgwire_addr: handle.pgwire_addr,
             http_addr: handle.http_addr,
