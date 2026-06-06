@@ -882,6 +882,21 @@ impl MemExecutor {
         let cat_path = path.join("catalog.json");
         let cat = Arc::new(MemoryCatalog::load_from_disk(cat_path)?);
 
+        if cat.get_database("default").is_err() {
+            let db = cat.create_database(nodus_catalog::CreateDatabaseRequest {
+                id: nodus_catalog::DatabaseId::new(),
+                name: "default".into(),
+                owner_role_id: None,
+            })?;
+            cat.create_schema(nodus_catalog::CreateSchemaRequest {
+                id: nodus_catalog::SchemaId::new(),
+                database_id: db.id,
+                name: "public".into(),
+                owner_role_id: None,
+                managed_access: false,
+            })?;
+        }
+
         let kv = Arc::new(nodus_storage_lsm::LsmKvEngine::with_wal(
             path,
             encryption_key,
@@ -905,6 +920,20 @@ impl MemExecutor {
     /// events are written to `audit`.
     pub fn shared(audit: Arc<dyn AuditSink>) -> (Arc<MemExecutor>, Arc<MemoryCatalog>) {
         let cat = Arc::new(MemoryCatalog::new());
+
+        let db = cat.create_database(nodus_catalog::CreateDatabaseRequest {
+            id: nodus_catalog::DatabaseId::new(),
+            name: "default".into(),
+            owner_role_id: None,
+        }).unwrap();
+        cat.create_schema(nodus_catalog::CreateSchemaRequest {
+            id: nodus_catalog::SchemaId::new(),
+            database_id: db.id,
+            name: "public".into(),
+            owner_role_id: None,
+            managed_access: false,
+        }).unwrap();
+
         let kv = Arc::new(nodus_storage_mem::MemKvEngine::new());
         let txn = Arc::new(nodus_txn::MemTxnManager::new());
         let authz = Arc::new(nodus_authz::DefaultAuthzEngine::new(cat.clone()));
