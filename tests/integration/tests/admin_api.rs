@@ -20,7 +20,7 @@ async fn connect(addr: &std::net::SocketAddr) -> tokio_postgres::Client {
     panic!("could not connect to pgwire");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn pgwire_sessions_are_per_connection_and_killable() {
     let server = TestServer::start().await.expect("server starts");
 
@@ -50,7 +50,7 @@ async fn pgwire_sessions_are_per_connection_and_killable() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn admin_session_api_lists_and_kills() {
     let server = TestServer::start().await.expect("server starts");
     let client = connect(&server.pgwire_addr).await;
@@ -94,7 +94,7 @@ async fn admin_session_api_lists_and_kills() {
     assert!(!missing);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn admin_audit_api_returns_events() {
     let server = TestServer::start().await.expect("server starts");
     // The seeded superuser runs a statement that triggers an authz decision.
@@ -131,7 +131,7 @@ async fn admin_audit_api_returns_events() {
     assert!(arr.iter().all(|e| e["result"] == "Success"));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn admin_authz_explain_denies_unknown_principal() {
     let server = TestServer::start().await.expect("server starts");
     let http = reqwest::Client::new();
@@ -166,7 +166,7 @@ async fn admin_authz_explain_denies_unknown_principal() {
     assert_eq!(body["is_allowed"], false);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn admin_backup_api_create_list_verify_restore() {
     let server = TestServer::start().await.expect("server starts");
     let http = reqwest::Client::new();
@@ -221,7 +221,7 @@ async fn admin_backup_api_create_list_verify_restore() {
     assert!(names.iter().any(|n| n == "kv_data.json"));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn admin_upgrade_api_drives_lifecycle() {
     let server = TestServer::start().await.expect("server starts");
     let http = reqwest::Client::new();
@@ -266,7 +266,7 @@ async fn admin_upgrade_api_drives_lifecycle() {
     assert_eq!(st["feature_gates"]["new_storage_format"], true);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn admin_shard_api_init_split() {
     let server = TestServer::start().await.expect("server starts");
     let http = reqwest::Client::new();
@@ -315,7 +315,7 @@ async fn admin_shard_api_init_split() {
     assert_eq!(map["shards"].as_array().unwrap().len(), 2);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn admin_node_drain_makes_unready() {
     let server = TestServer::start().await.expect("server starts");
     let http = reqwest::Client::new();
@@ -343,7 +343,7 @@ async fn admin_node_drain_makes_unready() {
     assert!(h.status().is_success());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn admin_api_requires_token_when_configured() {
     let mut config = nodus_config::NodusConfig::default();
     config.admin.token = Some("s3cr3t".into());
@@ -384,7 +384,7 @@ async fn admin_api_requires_token_when_configured() {
     assert!(r.status().is_success());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn durable_audit_persists_to_configured_file() {
     let path = std::env::temp_dir().join(format!("nodus_audit_it_{}.jsonl", std::process::id()));
     let _ = std::fs::remove_file(&path);
@@ -419,7 +419,7 @@ async fn durable_audit_persists_to_configured_file() {
     let _ = std::fs::remove_file(&path);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn pgwire_rejects_bad_password() {
     let server = TestServer::start().await.expect("server starts");
     let bad = format!(

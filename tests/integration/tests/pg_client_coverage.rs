@@ -20,7 +20,7 @@ async fn connect(addr: &std::net::SocketAddr) -> tokio_postgres::Client {
     panic!("Failed to connect to pgwire");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_full_pg_client_coverage() {
     let server = TestServer::start().await.expect("Failed to start server");
     let client = connect(&server.pgwire_addr).await;

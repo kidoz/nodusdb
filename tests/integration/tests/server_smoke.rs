@@ -2,7 +2,7 @@ use nodus_testkit::TestServer;
 use reqwest::Client;
 use std::time::Duration;
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_server_health_endpoints() {
     let server = TestServer::start().await.expect("Failed to start server");
 

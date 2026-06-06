@@ -29,7 +29,7 @@ fn rows_of(msgs: &[SimpleQueryMessage]) -> Vec<&tokio_postgres::SimpleQueryRow> 
         .collect()
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_arbitrary_table_sql() {
     let server = TestServer::start().await.expect("server starts");
     let client = connect(&server).await;
@@ -65,7 +65,7 @@ async fn test_arbitrary_table_sql() {
     assert_eq!(rows[0].get(1).unwrap(), "19.99");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_where_order_limit() {
     let server = TestServer::start().await.expect("server starts");
     let client = connect(&server).await;
@@ -119,7 +119,7 @@ async fn test_where_order_limit() {
     assert_eq!(rows_of(&msgs).len(), 3);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_pgwire_queries() {
     let server = TestServer::start().await.expect("Failed to start server");
 
