@@ -149,6 +149,7 @@ pub struct ClusterState {
     pub nodes_total: AtomicU32,
     pub shards_total: AtomicU32,
     pub shards_unavailable: AtomicU32,
+    pub qps: std::sync::atomic::AtomicU64,
 }
 
 impl Default for ClusterState {
@@ -159,15 +160,17 @@ impl Default for ClusterState {
             nodes_total: AtomicU32::new(1),
             shards_total: AtomicU32::new(0),
             shards_unavailable: AtomicU32::new(0),
+            qps: std::sync::atomic::AtomicU64::new(0f64.to_bits()),
         }
     }
 }
 
 impl ClusterState {
-    pub fn overview(&self, qps: f64, active_alerts: u32) -> ClusterOverview {
+    pub fn overview(&self, active_alerts: u32) -> ClusterOverview {
         let nodes_live = self.nodes_live.load(Ordering::Relaxed);
         let nodes_total = self.nodes_total.load(Ordering::Relaxed);
         let shards_unavailable = self.shards_unavailable.load(Ordering::Relaxed);
+        let qps = f64::from_bits(self.qps.load(Ordering::Relaxed));
         let cluster_status = if shards_unavailable > 0 {
             "Unhealthy"
         } else if nodes_live < nodes_total {
@@ -237,9 +240,7 @@ async fn version() -> axum::Json<VersionInfo> {
 async fn cluster_overview(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
 ) -> axum::Json<ClusterOverview> {
-    // Live membership/shard health from ClusterState. QPS rate computation is a
-    // follow-up; report 0.0 rather than a fabricated value.
-    axum::Json(state.cluster.overview(0.0, 0))
+    axum::Json(state.cluster.overview(0))
 }
 
 async fn healthz() -> &'static str {

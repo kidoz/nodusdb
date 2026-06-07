@@ -509,6 +509,19 @@ pub async fn run_server_with_config(
         }
     });
 
+    let qps_state = state.clone();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
+        let mut last_queries = qps_state.metrics.queries_total.get();
+        loop {
+            ticker.tick().await;
+            let current = qps_state.metrics.queries_total.get();
+            let delta = current.saturating_sub(last_queries);
+            last_queries = current;
+            qps_state.cluster.qps.store((delta as f64).to_bits(), std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+
     let http_task = tokio::spawn(async move {
         if let Some(cfg) = server_config {
             let handle = axum_server::Handle::new();
