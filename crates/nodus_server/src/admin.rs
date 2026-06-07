@@ -1,3 +1,4 @@
+#![allow(clippy::collapsible_if)]
 //! Admin HTTP API (`/api/v1/...`) backed by shared runtime handles.
 
 use axum::{
@@ -110,7 +111,7 @@ async fn require_token(
     };
 
     let authz_req = nodus_authz::AuthzRequest {
-        principal_id: principal_id,
+        principal_id,
         active_roles: vec![],
         action: action.clone(),
         resource: nodus_catalog::ResourceRef::System,
@@ -119,7 +120,7 @@ async fn require_token(
     
     let decision = state.authz.authorize(authz_req).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     if !decision.allowed {
-        println!("Authorization failed for principal {} on action {:?}", principal_id, action);
+        tracing::debug!("Authorization failed for principal {} on action {:?}", principal_id, action);
         return Err(StatusCode::FORBIDDEN);
     }
 
@@ -490,7 +491,7 @@ async fn restore_backup(
                                     Bytes::from(val_bytes),
                                 );
                                 let _ = state.kv.commit(txn_id, ver);
-                                println!("Restored KV pair from baseline: key={:?}", String::from_utf8_lossy(&key_bytes));
+                                tracing::debug!("Restored KV pair from baseline: key={:?}", String::from_utf8_lossy(&key_bytes));
                             }
                         }
                     }
@@ -518,10 +519,10 @@ async fn restore_backup(
                                         }
                                         nodus_storage_wal::WalRecordV1::CommitTxn { txn_id, commit_ts } => {
                                             if commit_ts <= target_ts {
-                                                println!("Replayed commit_ts {} <= target_ts {}", commit_ts, target_ts);
+                                                tracing::debug!("Replayed commit_ts {} <= target_ts {}", commit_ts, target_ts);
                                                 let _ = state.kv.commit(txn_id, commit_ts);
                                             } else {
-                                                println!("Skipped commit_ts {} > target_ts {}", commit_ts, target_ts);
+                                                tracing::debug!("Skipped commit_ts {} > target_ts {}", commit_ts, target_ts);
                                                 let _ = state.kv.abort(txn_id);
                                             }
                                             active_txns.remove(&txn_id);

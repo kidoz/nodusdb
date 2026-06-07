@@ -195,10 +195,8 @@ impl RaftSnapshotBuilder<NodusTypeConfig> for NodusRaftStore {
                 end: bytes::Bytes::from(vec![255u8; 1024]),
             };
             if let Ok(iter) = kv.scan(range, u64::MAX) {
-                for pair_res in iter {
-                    if let Ok(pair) = pair_res {
-                        kv_data.push((pair.key.to_vec(), pair.value.to_vec(), pair.version));
-                    }
+                for pair in iter.flatten() {
+                    kv_data.push((pair.key.to_vec(), pair.value.to_vec(), pair.version));
                 }
             }
         }
@@ -348,17 +346,17 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
                         match cmd {
                             ShardCommand::CreateDatabase(req) => { 
                                 if let Err(e) = catalog.create_database(req.clone()) {
-                                    println!("CreateDatabase error: {}", e);
+                                    tracing::debug!("CreateDatabase error: {}", e);
                                 }
                             }
                             ShardCommand::CreateSchema(req) => { 
                                 if let Err(e) = catalog.create_schema(req.clone()) {
-                                    println!("CreateSchema error: {}", e);
+                                    tracing::debug!("CreateSchema error: {}", e);
                                 }
                             }
                             ShardCommand::CreateTable(req) => { 
                                 if let Err(e) = catalog.create_table(req.clone()) {
-                                    println!("CreateTable error: {}", e);
+                                    tracing::debug!("CreateTable error: {}", e);
                                 }
                             }
                             ShardCommand::GrantPrivileges(req) => { let _ = catalog.grant_privileges(req.clone()); }
@@ -366,13 +364,13 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
                             ShardCommand::UpdateTableDescriptor(req) => { let _ = catalog.update_table_descriptor(req.clone()); }
                             ShardCommand::CreateRole(req) => { 
                                 if let Err(e) = catalog.create_role(req.clone()) {
-                                    println!("CreateRole error: {}", e);
+                                    tracing::debug!("CreateRole error: {}", e);
                                 }
                             }
                             ShardCommand::GrantPrivilege(req) => { let _ = catalog.grant_privilege(req.clone()); }
                             ShardCommand::RevokePrivilege(req) => { let _ = catalog.revoke_privilege(req.clone()); }
                             ShardCommand::AddRoleMember(req) => { let _ = catalog.add_role_member(req.clone()); }
-                            ShardCommand::UpdateIndexState { table_id, index_id, state } => { let _ = catalog.update_index_state(table_id.clone(), index_id.clone(), state.clone()); }
+                            ShardCommand::UpdateIndexState { table_id, index_id, state } => { let _ = catalog.update_index_state(*table_id, *index_id, state.clone()); }
                             _ => {}
                         }
                     }
@@ -434,10 +432,8 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
 
         let data = snapshot.into_inner();
         if let Ok(snapshot_obj) = serde_json::from_slice::<FullStateSnapshot>(&data) {
-            if let Some(cat_snap) = snapshot_obj.catalog {
-                if let Some(cat) = &sm.catalog_writer {
-                    let _ = cat.import_snapshot(cat_snap);
-                }
+            if let (Some(cat_snap), Some(cat)) = (snapshot_obj.catalog, &sm.catalog_writer) {
+                let _ = cat.import_snapshot(cat_snap);
             }
             if let Some(kv) = &sm.kv {
                 // To restore KV, we iterate and inject rows.

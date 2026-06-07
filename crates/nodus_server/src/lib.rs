@@ -1,3 +1,4 @@
+#![allow(clippy::collapsible_if)]
 mod admin;
 mod raft_kv;
 mod raft_catalog;
@@ -155,7 +156,7 @@ pub async fn run_server_with_config(
         None
     };
 
-    println!("Loading KV and catalog");
+    tracing::debug!("Loading KV and catalog");
     let (local_kv, catalog): (Arc<dyn nodus_storage_api::KvEngine>, _) = match &config.storage.data_dir {
         Some(dir) => {
             let path = std::path::Path::new(dir);
@@ -171,7 +172,7 @@ pub async fn run_server_with_config(
             (k, cat)
         }
     };
-    println!("Loaded KV and catalog");
+    tracing::debug!("Loaded KV and catalog");
 
     let cluster_version = catalog
         .get_cluster_version()
@@ -183,7 +184,7 @@ pub async fn run_server_with_config(
         cluster_version,
     ));
 
-    println!("Initializing raft network and state");
+    tracing::debug!("Initializing raft network and state");
     let raft_config = Arc::new(openraft::Config::default().validate().unwrap());
     let (log_store, state_machine) =
         openraft::storage::Adaptor::new(nodus_raftstore::NodusRaftStore::with_components(
@@ -202,7 +203,7 @@ pub async fn run_server_with_config(
     )
     .await
     .map_err(|e| anyhow::anyhow!("raft init: {e}"))?;
-    println!("Raft created");
+    tracing::debug!("Raft created");
 
     let raft_clone = raft.clone();
     let join_peers = config.cluster.join_peers.clone();
@@ -236,23 +237,23 @@ pub async fn run_server_with_config(
         txn,
     ));
 
-    println!("Executor created");
+    tracing::debug!("Executor created");
 
-    let executor_clone = executor.clone();
+    let _executor_clone = executor.clone();
     let state_clone = state.clone();
     tokio::spawn(async move {
         if join_peers.is_empty() {
-            println!("Background initializing raft cluster as singleton");
+            tracing::debug!("Background initializing raft cluster as singleton");
             let mut nodes = std::collections::BTreeMap::new();
             nodes.insert(node_id, openraft::BasicNode::new(&advertise_addr));
             let _ = raft_clone.initialize(nodes).await;
-            println!("Background raft initialization complete");
+            tracing::debug!("Background raft initialization complete");
             
             // Wait for leader to establish
             let mut retries = 0;
             while retries < 10 {
                 let leader = raft_clone.metrics().borrow().current_leader;
-                println!("Waiting for leader... current_leader: {:?}", leader);
+                tracing::debug!("Waiting for leader... current_leader: {:?}", leader);
                 if leader == Some(node_id) {
                     break;
                 }
@@ -261,7 +262,7 @@ pub async fn run_server_with_config(
             }
             
             // Bootstrap the catalog on the leader
-            println!("Running bootstrap!");
+            tracing::debug!("Running bootstrap!");
             let db_id = nodus_catalog::DatabaseId::new();
             let cmd1 = nodus_raftstore::ShardCommand::CreateDatabase(nodus_catalog::CreateDatabaseRequest {
                 id: db_id,
@@ -269,7 +270,7 @@ pub async fn run_server_with_config(
                 owner_role_id: None,
             });
             if let Err(e) = raft_clone.client_write(cmd1).await {
-                println!("Bootstrap create_database failed: {}", e);
+                tracing::debug!("Bootstrap create_database failed: {}", e);
             } else {
                 let cmd2 = nodus_raftstore::ShardCommand::CreateSchema(nodus_catalog::CreateSchemaRequest {
                     id: nodus_catalog::SchemaId::new(),
@@ -279,14 +280,14 @@ pub async fn run_server_with_config(
                     managed_access: false,
                 });
                 if let Err(e) = raft_clone.client_write(cmd2).await {
-                    println!("Bootstrap create_schema failed: {}", e);
+                    tracing::debug!("Bootstrap create_schema failed: {}", e);
                 } else {
-                    println!("Bootstrap succeeded");
+                    tracing::debug!("Bootstrap succeeded");
                 }
             }
             state_clone.is_ready.store(true, std::sync::atomic::Ordering::Release);
         } else {
-            println!("Attempting to join existing cluster via {:?}", join_peers);
+            tracing::debug!("Attempting to join existing cluster via {:?}", join_peers);
             let client = reqwest::Client::new();
             let mut joined = false;
             for _ in 0..5 {
@@ -304,17 +305,17 @@ pub async fn run_server_with_config(
                     
                     match req.send().await {
                         Ok(resp) if resp.status().is_success() => {
-                            println!("Successfully joined cluster via {}", peer);
+                            tracing::debug!("Successfully joined cluster via {}", peer);
                             joined = true;
                             break;
                         }
                         Ok(resp) => {
                             let status = resp.status();
                             let text = resp.text().await.unwrap_or_default();
-                            println!("Failed to join via {}: status {}, body: {}", peer, status, text);
+                            tracing::debug!("Failed to join via {}: status {}, body: {}", peer, status, text);
                         }
                         Err(e) => {
-                            println!("Failed to join via {}: {}", peer, e);
+                            tracing::debug!("Failed to join via {}: {}", peer, e);
                         }
                     }
                 }
@@ -324,7 +325,7 @@ pub async fn run_server_with_config(
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             }
             if !joined {
-                println!("FATAL: Failed to join cluster after retries");
+                tracing::debug!("FATAL: Failed to join cluster after retries");
             } else {
                 state_clone.is_ready.store(true, std::sync::atomic::Ordering::Release);
             }
@@ -343,7 +344,7 @@ pub async fn run_server_with_config(
         }
         Err(e) => anyhow::bail!("seed admin: {e}"),
     };
-    println!("Admin seeded");
+    tracing::debug!("Admin seeded");
 
     // Bootstrap superuser: ALL on System bypasses per-resource grant checks.
     let _ = catalog.grant_privilege(GrantPrivilegeRequest {
@@ -368,7 +369,7 @@ pub async fn run_server_with_config(
 
     let server_config = load_tls_config(&config.tls)?;
     let tls_acceptor = server_config.as_ref().map(|c| Arc::new(TlsAcceptor::from(c.clone())));
-    println!("TLS acceptor loaded");
+    tracing::debug!("TLS acceptor loaded");
 
     // Background MVCC garbage collector: periodically reclaims superseded
     // versions below the transaction manager's safe watermark.
@@ -398,7 +399,6 @@ pub async fn run_server_with_config(
 
     let registry = Arc::new(SessionRegistry::new());
     let pgwire_metrics = state.metrics.clone();
-    let pgwire_registry = registry.clone();
     let pgwire_slow_log = slow_log.clone();
     let pgwire_shutdown = shutdown.clone();
     let pgwire_registry = registry.clone();

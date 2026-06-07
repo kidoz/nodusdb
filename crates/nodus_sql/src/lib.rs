@@ -40,8 +40,8 @@ mod tests {
     #[test]
     fn test_placeholder_parsing() {
         let sql = "SELECT * FROM users WHERE id = $1 AND name = $2";
-        let stmts = parse_sql(sql).unwrap();
-        println!("{:#?}", stmts);
+        let _stmts = parse_sql(sql).unwrap();
+        // Debugging output removed
     }
     use proptest::prelude::*;
 

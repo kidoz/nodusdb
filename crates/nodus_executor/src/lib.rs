@@ -3643,7 +3643,7 @@ fn render_row(row: &Row) -> Vec<String> {
         };
 
         let check_out = exec.execute_logical(&ctx, subquery.clone()).unwrap();
-        println!("SUBQUERY OUTPUT: {:?}", check_out);
+        // Debugging output removed
 
         let filter = FilterExpr::InSubquery {
             left: "dept_id".into(),

@@ -28,7 +28,7 @@ pub struct LogAuditSink;
 impl AuditSink for LogAuditSink {
     fn record_event(&self, event: AuditEvent) -> anyhow::Result<()> {
         // Just print to standard out for MVP
-        println!("AUDIT: {:?}", event);
+        tracing::debug!("AUDIT: {:?}", event);
         Ok(())
     }
 }

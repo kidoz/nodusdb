@@ -19,7 +19,7 @@ impl RaftCatalogWriter {
 
 impl CatalogWriter for RaftCatalogWriter {
     fn create_database(&self, request: CreateDatabaseRequest) -> Result<DatabaseDescriptor> {
-        let name = request.name.clone();
+        let _name = request.name.clone();
         let id = request.id;
         let cmd = ShardCommand::CreateDatabase(request);
         let res = tokio::task::block_in_place(|| {
@@ -36,9 +36,9 @@ impl CatalogWriter for RaftCatalogWriter {
     }
 
     fn create_schema(&self, request: CreateSchemaRequest) -> Result<SchemaDescriptor> {
-        let name = request.name.clone();
+        let _name = request.name.clone();
         let id = request.id;
-        let db_id = request.database_id;
+        let _db_id = request.database_id;
         let cmd = ShardCommand::CreateSchema(request);
         let res = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
@@ -54,9 +54,9 @@ impl CatalogWriter for RaftCatalogWriter {
     }
 
     fn create_table(&self, request: CreateTableRequest) -> Result<TableDescriptor> {
-        let name = request.name.clone();
-        let db_id = request.database_id;
-        let sch_id = request.schema_id;
+        let _name = request.name.clone();
+        let _db_id = request.database_id;
+        let _sch_id = request.schema_id;
         let id = request.id;
         
         let cmd = ShardCommand::CreateTable(request);
@@ -124,7 +124,7 @@ impl CatalogWriter for RaftCatalogWriter {
         self.reader.get_table_by_id(table_id)
     }
     fn create_role(&self, request: CreateRoleRequest) -> Result<PrincipalDescriptor> {
-        let name = request.name.clone();
+        let _name = request.name.clone();
         let id = request.id;
         let cmd = ShardCommand::CreateRole(request.clone());
         let res = tokio::task::block_in_place(|| {
