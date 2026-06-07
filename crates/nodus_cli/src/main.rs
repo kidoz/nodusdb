@@ -170,6 +170,8 @@ enum BackupCmd {
     Restore {
         #[arg(long)]
         id: String,
+        #[arg(long)]
+        target_ts: Option<u64>,
         #[arg(long, default_value = DEFAULT_ADDR)]
         addr: String,
     },
@@ -390,10 +392,15 @@ async fn main() -> anyhow::Result<()> {
             println!("{}", serde_json::to_string_pretty(&v)?);
         }
         Commands::Backup {
-            cmd: BackupCmd::Restore { id, addr },
+            cmd: BackupCmd::Restore { id, target_ts, addr },
         } => {
+            let url = if let Some(ts) = target_ts {
+                format!("{addr}/api/v1/backups/{id}/restore?target_ts={ts}")
+            } else {
+                format!("{addr}/api/v1/backups/{id}/restore")
+            };
             let v: serde_json::Value = client
-                .post(format!("{addr}/api/v1/backups/{id}/restore"))
+                .post(&url)
                 .send()
                 .await?
                 .error_for_status()?
