@@ -1,5 +1,8 @@
 # NodusDB
 
+> **⚠️ STATUS: EXPERIMENTAL**  
+> This project is in an early, experimental stage. It is under active development, and features, APIs, and the storage format are subject to breaking changes without notice. It is **not** recommended for production use.
+
 ![Language](https://img.shields.io/badge/Language-Rust-orange.svg)
 ![Edition](https://img.shields.io/badge/Edition-2024-blue.svg)
 ![License](https://img.shields.io/badge/License-MIT-green.svg)
