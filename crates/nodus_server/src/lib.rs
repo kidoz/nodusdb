@@ -561,7 +561,7 @@ mod tests {
     #[test]
     fn tls_disabled_yields_no_acceptor() {
         let cfg = TlsConfig::default();
-        assert!(load_tls_acceptor(&cfg).unwrap().is_none());
+        assert!(load_tls_config(&cfg).unwrap().is_none());
     }
 
     #[test]
@@ -573,7 +573,7 @@ mod tests {
             client_ca_path: None,
             require_client_auth: false,
         };
-        assert!(load_tls_acceptor(&cfg).is_err());
+        assert!(load_tls_config(&cfg).is_err());
     }
 
     #[test]
