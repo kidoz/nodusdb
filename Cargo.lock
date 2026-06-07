@@ -2243,6 +2243,7 @@ dependencies = [
  "openraft",
  "porcupine-rs",
  "reqwest",
+ "serde_json",
  "tempfile",
  "tokio",
  "tokio-postgres",

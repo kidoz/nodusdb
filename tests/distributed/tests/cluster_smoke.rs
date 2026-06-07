@@ -121,3 +121,31 @@ async fn test_cluster_replication() {
     }
     assert!(found, "Follower did not replicate the row in time");
 }
+
+#[tokio::test]
+async fn test_cluster_draining() {
+    let _n1 = spawn_node(1, "127.0.0.1:8191", "127.0.0.1:5541", None);
+    wait_for_readyz("127.0.0.1:8191").await;
+    
+    let _n2 = spawn_node(2, "127.0.0.1:8192", "127.0.0.1:5542", Some("127.0.0.1:8191"));
+    let _n3 = spawn_node(3, "127.0.0.1:8193", "127.0.0.1:5543", Some("127.0.0.1:8191"));
+    
+    wait_for_readyz("127.0.0.1:8192").await;
+    wait_for_readyz("127.0.0.1:8193").await;
+
+    // Node 1 is the leader initially because it boots first.
+    let http = reqwest::Client::new();
+
+    // Call drain on node 1
+    let resp: serde_json::Value = http.post("http://127.0.0.1:8191/api/v1/node/drain")
+        .send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+
+    assert_eq!(resp["draining"], true);
+    assert!(resp["leadership_transfers"].as_u64().unwrap_or(0) > 0, "Expected leadership transfer to occur during drain");
+
+    // readyz should now return 503 for node 1
+    let r = http.get("http://127.0.0.1:8191/readyz").send().await.unwrap();
+    assert_eq!(r.status().as_u16(), 503);
+
+    // Node 2 or 3 should now be the leader.
+}
