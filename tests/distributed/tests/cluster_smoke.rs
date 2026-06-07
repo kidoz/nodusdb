@@ -1,3 +1,4 @@
+#![allow(clippy::collapsible_if)]
 use std::time::Duration;
 use tokio::time::sleep;
 use tokio_postgres::NoTls;
@@ -26,6 +27,7 @@ async fn wait_for_server(addr: &str) -> Result<tokio_postgres::Client, tokio_pos
 
 struct NodeGuard {
     child: Child,
+    #[allow(dead_code)]
     dir: tempfile::TempDir,
 }
 

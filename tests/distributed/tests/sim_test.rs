@@ -258,9 +258,9 @@ async fn test_cluster_partition_linearizability() {
 
     // Send a write to the leader
     let mut success = false;
-    for i in 0..3 {
+    for node in nodes.iter().take(3) {
         let write_res = client
-            .post(format!("http://{}/test/write", nodes[i].1))
+            .post(format!("http://{}/test/write", node.1))
             .json(&42)
             .send()
             .await
