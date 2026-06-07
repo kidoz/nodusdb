@@ -392,10 +392,65 @@ impl BackupOrchestrator {
         Ok(())
     }
 
+    pub async fn create_incremental_backup(
+        &self,
+        cluster_id: &str,
+        parent_backup_id: &str,
+        backup_ts: u64,
+        catalog_version: u64,
+        cluster_version: u64,
+    ) -> Result<BackupManifestV1> {
+        let backup_id = Uuid::new_v4().to_string();
+        let started_at = Utc::now();
+
+        // Verify parent exists
+        let _parent = self.load_manifest(parent_backup_id).await?;
+
+        let manifest = BackupManifestV1 {
+            backup_id: backup_id.clone(),
+            cluster_id: cluster_id.to_string(),
+            backup_type: BackupType::Incremental,
+            parent_backup_id: Some(parent_backup_id.to_string()),
+            started_at,
+            completed_at: Some(Utc::now()),
+            backup_ts,
+            catalog_version,
+            cluster_version,
+            files: vec![],
+            checksums: HashMap::new(),
+            status: BackupStatus::Completed,
+        };
+
+        let body = serde_json::to_vec(&BackupManifest::V1(manifest.clone()))?;
+        self.repo
+            .put_object(
+                &manifest_key(&backup_id),
+                Bytes::from(body),
+                PutOptions {
+                    content_type: Some("application/json".into()),
+                },
+            )
+            .await?;
+
+        Ok(manifest)
+    }
+
     /// Verifies then returns the backed-up objects keyed by their logical name.
-    pub async fn restore(&self, backup_id: &str) -> Result<Vec<BackupObject>> {
-        self.verify(backup_id).await?;
-        let manifest = self.load_manifest(backup_id).await?;
+    /// For incremental backups, this recursively resolves the parent backup.
+    pub fn restore<'a>(&'a self, backup_id: &'a str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<BackupObject>>> + Send + 'a>> {
+        Box::pin(async move {
+            self.verify(backup_id).await?;
+            let manifest = self.load_manifest(backup_id).await?;
+            
+            if manifest.backup_type == BackupType::Incremental {
+                if let Some(parent) = manifest.parent_backup_id {
+                    // Return the parent's objects. PITR logic (WAL replay) will handle the diff.
+                    return self.restore(&parent).await;
+                } else {
+                    anyhow::bail!("Incremental backup {} missing parent_backup_id", backup_id);
+                }
+            }
+
         let prefix = format!("{backup_id}/data/");
         let mut out = Vec::new();
         for key in &manifest.files {
@@ -404,6 +459,17 @@ impl BackupOrchestrator {
             out.push(BackupObject { name, bytes });
         }
         Ok(out)
+        })
+    }
+
+    /// Deletes a backup's manifest and associated data files.
+    pub async fn delete_backup(&self, backup_id: &str) -> Result<()> {
+        let prefix = format!("{backup_id}/");
+        let objects = self.repo.list_objects(&prefix).await?;
+        for obj in objects {
+            self.repo.delete_object(&obj.key).await?;
+        }
+        Ok(())
     }
 
     /// Lists the ids of backups that have a manifest in the repository.

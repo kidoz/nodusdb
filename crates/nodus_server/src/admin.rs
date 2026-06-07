@@ -134,6 +134,7 @@ pub fn admin_routes(state: AdminState) -> Router {
         .route("/api/v1/authz/explain", get(explain_authz))
         .route("/api/v1/backups", get(list_backups).post(create_backup))
         .route("/api/v1/backups/:id/verify", post(verify_backup))
+        .route("/api/v1/backups/:id", axum::routing::delete(delete_backup))
         .route("/api/v1/backups/:id/restore", post(restore_backup))
         .route("/api/v1/upgrade", get(upgrade_state))
         .route("/api/v1/upgrade/start", post(upgrade_start))
@@ -325,8 +326,16 @@ async fn list_backups(State(state): State<AdminState>) -> Json<Vec<String>> {
     Json(state.backup.list_backups().await.unwrap_or_default())
 }
 
+#[derive(serde::Deserialize)]
+pub struct CreateBackupQuery {
+    pub parent_backup_id: Option<String>,
+}
+
 /// Creates a full backup capturing a catalog snapshot and the audit trail.
-async fn create_backup(State(state): State<AdminState>) -> Json<Value> {
+async fn create_backup(
+    State(state): State<AdminState>,
+    Query(query): Query<CreateBackupQuery>,
+) -> Json<Value> {
     let version = state
         .catalog
         .get_cluster_version()
@@ -393,17 +402,40 @@ async fn create_backup(State(state): State<AdminState>) -> Json<Value> {
             bytes: Bytes::from(kv_bytes),
         },
     ];
-    match state
-        .backup
-        .create_full_backup("local", 0, version, version, objects)
-        .await
-    {
-        Ok(manifest) => Json(json!({
-            "backup_id": manifest.backup_id,
-            "status": format!("{:?}", manifest.status),
-            "files": manifest.files.len(),
-        })),
-        Err(e) => Json(json!({ "error": e.to_string() })),
+    if let Some(parent_id) = query.parent_backup_id {
+        match state
+            .backup
+            .create_incremental_backup("local", &parent_id, 0, version, version)
+            .await
+        {
+            Ok(manifest) => Json(json!({
+                "backup_id": manifest.backup_id,
+                "status": format!("{:?}", manifest.status),
+                "files": manifest.files.len(),
+            })),
+            Err(e) => Json(json!({ "error": e.to_string() })),
+        }
+    } else {
+        match state
+            .backup
+            .create_full_backup("local", 0, version, version, objects)
+            .await
+        {
+            Ok(manifest) => Json(json!({
+                "backup_id": manifest.backup_id,
+                "status": format!("{:?}", manifest.status),
+                "files": manifest.files.len(),
+            })),
+            Err(e) => Json(json!({ "error": e.to_string() })),
+        }
+    }
+}
+
+
+async fn delete_backup(State(state): State<AdminState>, Path(id): Path<String>) -> Json<Value> {
+    match state.backup.delete_backup(&id).await {
+        Ok(()) => Json(json!({ "deleted": true })),
+        Err(e) => Json(json!({ "deleted": false, "error": e.to_string() })),
     }
 }
 
