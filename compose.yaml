@@ -1,0 +1,17 @@
+services:
+  nodusdb:
+    build:
+      context: .
+      dockerfile: deploy/docker/Dockerfile
+    container_name: nodusdb
+    ports:
+      - "5432:5432" # PostgreSQL wire protocol
+      - "8088:8088" # HTTP admin / metrics / web console
+    environment:
+      NODUS_OBSERVABILITY__LOG_LEVEL: info
+      NODUS_ADMIN__PASSWORD: nodus
+    volumes:
+      - nodus-data:/var/lib/nodus/data
+
+volumes:
+  nodus-data:
