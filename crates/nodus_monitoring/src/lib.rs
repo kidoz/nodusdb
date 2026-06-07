@@ -282,7 +282,7 @@ mod tests {
         cs.nodes_total.store(3, Ordering::Relaxed);
         cs.nodes_live.store(3, Ordering::Relaxed);
         cs.shards_total.store(6, Ordering::Relaxed);
-        let o = cs.overview(10.0, 0);
+        let o = cs.overview(0);
         assert_eq!(o.cluster_status, "Healthy");
         assert_eq!(o.nodes_live, 3);
         assert_eq!(o.shards_total, 6);
@@ -293,9 +293,9 @@ mod tests {
         let cs = ClusterState::default();
         cs.nodes_total.store(3, Ordering::Relaxed);
         cs.nodes_live.store(2, Ordering::Relaxed);
-        assert_eq!(cs.overview(0.0, 0).cluster_status, "Degraded");
+        assert_eq!(cs.overview(0).cluster_status, "Degraded");
         cs.shards_unavailable.store(1, Ordering::Relaxed);
-        assert_eq!(cs.overview(0.0, 0).cluster_status, "Unhealthy");
+        assert_eq!(cs.overview(0).cluster_status, "Unhealthy");
     }
 
     #[test]

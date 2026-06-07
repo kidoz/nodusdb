@@ -2565,7 +2565,7 @@ fn render_row(row: &Row) -> Vec<String> {
             id: nodus_catalog::GrantId::new(),
             principal_id: user.id,
             resource: ResourceRef::Schema(sch.id),
-            privilege: "CREATE_TABLE".into(),
+            privilege: "CREATE".into(),
         })
         .unwrap();
         assert!(exec.execute_logical(&ctx, plan()).is_ok());
