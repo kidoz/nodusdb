@@ -374,14 +374,21 @@ pub async fn run_server_with_config(
     // versions below the transaction manager's safe watermark.
     let gc_executor = executor.clone();
     let gc_metrics = state.metrics.clone();
+    let mut gc_shutdown = shutdown.clone();
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
         loop {
-            ticker.tick().await;
-            if let Ok(reclaimed) = gc_executor.run_gc()
-                && reclaimed > 0
-            {
-                gc_metrics.vacuum_reclaimed_total.inc_by(reclaimed as u64);
+            tokio::select! {
+                _ = ticker.tick() => {
+                    if let Ok(reclaimed) = gc_executor.run_gc()
+                        && reclaimed > 0
+                    {
+                        gc_metrics.vacuum_reclaimed_total.inc_by(reclaimed as u64);
+                    }
+                }
+                _ = gc_shutdown.changed() => {
+                    break;
+                }
             }
         }
     });
@@ -425,37 +432,44 @@ pub async fn run_server_with_config(
     let backup_clone = backup.clone();
     let data_dir_clone = config.storage.data_dir.clone();
     let local_kv_clone = local_kv.clone();
+    let mut wal_shutdown = shutdown.clone();
     tokio::spawn(async move {
         if let Some(dir_path_str) = data_dir_clone {
             let dir_path = std::path::Path::new(&dir_path_str);
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
             loop {
-                ticker.tick().await;
-                let _ = local_kv_clone.flush();
-                if let Ok(entries) = std::fs::read_dir(dir_path) {
-                    let mut logs = Vec::new();
-                    for entry in entries.flatten() {
-                        let path = entry.path();
-                        if path.extension().and_then(|s| s.to_str()) == Some("log") {
-                            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                                if let Ok(id) = stem.parse::<u64>() {
-                                    logs.push((id, path));
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        let _ = local_kv_clone.flush();
+                        if let Ok(entries) = std::fs::read_dir(dir_path) {
+                            let mut logs = Vec::new();
+                            for entry in entries.flatten() {
+                                let path = entry.path();
+                                if path.extension().and_then(|s| s.to_str()) == Some("log") {
+                                    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                                        if let Ok(id) = stem.parse::<u64>() {
+                                            logs.push((id, path));
+                                        }
+                                    }
                                 }
                             }
-                        }
-                    }
-                    if !logs.is_empty() {
-                        let max_id = logs.iter().map(|(id, _)| *id).max().unwrap();
-                        for (id, path) in logs {
-                            if id < max_id {
-                                if let Ok(bytes) = std::fs::read(&path) {
-                                    let filename = format!("{}.log", id);
-                                    if backup_clone.archive_wal(&filename, bytes::Bytes::from(bytes)).await.is_ok() {
-                                        let _ = std::fs::remove_file(&path);
+                            if !logs.is_empty() {
+                                let max_id = logs.iter().map(|(id, _)| *id).max().unwrap();
+                                for (id, path) in logs {
+                                    if id < max_id {
+                                        if let Ok(bytes) = std::fs::read(&path) {
+                                            let filename = format!("{}.log", id);
+                                            if backup_clone.archive_wal(&filename, bytes::Bytes::from(bytes)).await.is_ok() {
+                                                let _ = std::fs::remove_file(&path);
+                                            }
+                                        }
                                     }
                                 }
                             }
                         }
+                    }
+                    _ = wal_shutdown.changed() => {
+                        break;
                     }
                 }
             }
@@ -500,25 +514,41 @@ pub async fn run_server_with_config(
 
     let metrics_state = state.clone();
     let mut raft_metrics = raft.metrics();
+    let mut rm_shutdown = shutdown.clone();
     tokio::spawn(async move {
-        while raft_metrics.changed().await.is_ok() {
-            let m = raft_metrics.borrow().clone();
-            let count = m.membership_config.membership().voter_ids().count() as u32;
-            metrics_state.cluster.nodes_total.store(count, std::sync::atomic::Ordering::Relaxed);
-            metrics_state.cluster.nodes_live.store(count, std::sync::atomic::Ordering::Relaxed); // Simplified: assuming all voters are live for MVP
+        loop {
+            tokio::select! {
+                res = raft_metrics.changed() => {
+                    if res.is_err() { break; }
+                    let m = raft_metrics.borrow().clone();
+                    let count = m.membership_config.membership().voter_ids().count() as u32;
+                    metrics_state.cluster.nodes_total.store(count, std::sync::atomic::Ordering::Relaxed);
+                    metrics_state.cluster.nodes_live.store(count, std::sync::atomic::Ordering::Relaxed); // Simplified: assuming all voters are live for MVP
+                }
+                _ = rm_shutdown.changed() => {
+                    break;
+                }
+            }
         }
     });
 
     let qps_state = state.clone();
+    let mut qps_shutdown = shutdown.clone();
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
         let mut last_queries = qps_state.metrics.queries_total.get();
         loop {
-            ticker.tick().await;
-            let current = qps_state.metrics.queries_total.get();
-            let delta = current.saturating_sub(last_queries);
-            last_queries = current;
-            qps_state.cluster.qps.store((delta as f64).to_bits(), std::sync::atomic::Ordering::Relaxed);
+            tokio::select! {
+                _ = ticker.tick() => {
+                    let current = qps_state.metrics.queries_total.get();
+                    let delta = current.saturating_sub(last_queries);
+                    last_queries = current;
+                    qps_state.cluster.qps.store((delta as f64).to_bits(), std::sync::atomic::Ordering::Relaxed);
+                }
+                _ = qps_shutdown.changed() => {
+                    break;
+                }
+            }
         }
     });
 
