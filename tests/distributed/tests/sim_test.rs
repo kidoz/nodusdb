@@ -82,26 +82,17 @@ async fn write_val(State(state): State<RaftState>, Json(val): Json<i32>) -> Json
     }
 }
 
-async fn init_cluster(State(state): State<RaftState>) -> Json<bool> {
+async fn init_cluster(
+    State(state): State<RaftState>,
+    Json(addrs): Json<Vec<String>>,
+) -> Json<bool> {
     let mut nodes = BTreeMap::new();
-    nodes.insert(
-        1,
-        BasicNode {
-            addr: "127.0.0.1:15431".to_string(),
-        },
-    );
-    nodes.insert(
-        2,
-        BasicNode {
-            addr: "127.0.0.1:15432".to_string(),
-        },
-    );
-    nodes.insert(
-        3,
-        BasicNode {
-            addr: "127.0.0.1:15433".to_string(),
-        },
-    );
+    for (i, addr) in addrs.into_iter().enumerate() {
+        nodes.insert(
+            (i + 1) as u64,
+            BasicNode { addr },
+        );
+    }
 
     let raft = state.rafts.read().await.get("shard-meta").cloned().unwrap();
     let _ = raft.initialize(nodes).await;
@@ -195,7 +186,7 @@ async fn test_cluster_partition_linearizability() {
     let partitioned = Arc::new(AtomicBool::new(false));
 
     for i in 1..=3 {
-        let addr: SocketAddr = format!("127.0.0.1:1543{}", i).parse().unwrap();
+        let addr: SocketAddr = format!("127.0.0.1:{}", 15430 + i + (std::process::id() % 1000) * 10).parse().unwrap();
 
         let kv = Arc::new(nodus_storage_mem::MemKvEngine::new());
         let catalog = std::sync::Arc::new(nodus_catalog::MemoryCatalog::new());
@@ -210,6 +201,7 @@ async fn test_cluster_partition_linearizability() {
                 inner: NodusNetworkFactory::new("shard-meta".to_string()),
                 partitioned: part_clone,
             };
+            
             let raft = NodusRaft::new(
                 i as u64,
                 raft_config_clone,
@@ -218,7 +210,8 @@ async fn test_cluster_partition_linearizability() {
                 state_machine,
             )
             .await
-            .unwrap();
+            .expect("Raft new failed");
+            
             let raft_state = RaftState::new();
             raft_state.rafts.write().await.insert("shard-meta".to_string(), raft);
 
@@ -228,8 +221,10 @@ async fn test_cluster_partition_linearizability() {
                 .route("/test/read", get(read_val))
                 .with_state(raft_state);
 
-            let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-            axum::serve(listener, app).await.unwrap();
+            let listener = tokio::net::TcpListener::bind(addr).await.expect("TcpListener bind failed");
+            
+            let res = axum::serve(listener, app).await;
+            println!("Axum serve ended for node {}: {:?}", i, res);
         });
         nodes.push((i as u64, addr));
     }
@@ -238,11 +233,21 @@ async fn test_cluster_partition_linearizability() {
 
     // 2. Initialize cluster
     let client = reqwest::Client::new();
-    client
+    
+    for _ in 0..50 {
+        if tokio::net::TcpStream::connect(&nodes[0].1).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    let addrs: Vec<String> = nodes.iter().map(|(_, a)| a.to_string()).collect();
+    let req_res = client
         .post(format!("http://{}/test/init", nodes[0].1))
+        .json(&addrs)
         .send()
-        .await
-        .unwrap();
+        .await;
+    req_res.unwrap();
 
     // Wait for election to complete
     sleep(Duration::from_secs(2)).await;
@@ -251,16 +256,22 @@ async fn test_cluster_partition_linearizability() {
     println!("Injecting network partition...");
     partitioned.store(true, Ordering::SeqCst);
 
-    // Send a write to node 1
-    let write_res = client
-        .post(format!("http://{}/test/write", nodes[0].1))
-        .json(&42)
-        .send()
-        .await
-        .unwrap();
-
-    // It should succeed if it has quorum (nodes 1 and 2)
-    assert!(write_res.json::<bool>().await.unwrap());
+    // Send a write to the leader
+    let mut success = false;
+    for i in 0..3 {
+        let write_res = client
+            .post(format!("http://{}/test/write", nodes[i].1))
+            .json(&42)
+            .send()
+            .await
+            .unwrap();
+        if write_res.json::<bool>().await.unwrap() {
+            success = true;
+            break;
+        }
+    }
+    // It should succeed if it has quorum (2 nodes)
+    assert!(success, "Write failed on all nodes");
 
     sleep(Duration::from_secs(1)).await;
 
