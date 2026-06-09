@@ -1,0 +1,51 @@
+# PostgreSQL 18 Compatibility Suite
+# Focus: Advanced Types (JSONB, Arrays) and Functions
+
+statement ok
+CREATE SCHEMA pg18_adv_types;
+
+statement ok
+CREATE TABLE pg18_adv_types.events (
+    id INT PRIMARY KEY,
+    payload JSONB,
+    tags TEXT[]
+);
+
+# 1. JSONB Operations
+statement ok
+INSERT INTO pg18_adv_types.events (id, payload, tags) VALUES 
+    (1, '{"user": "alice", "active": true, "clicks": 5}', ARRAY['login', 'signup']),
+    (2, '{"user": "bob", "active": false, "clicks": 0}', ARRAY['logout']),
+    (3, '{"user": "charlie", "preferences": {"theme": "dark"}}', ARRAY['settings']);
+
+# JSON Operator ->> (Get JSON object field as text)
+query T
+SELECT payload->>'user' FROM pg18_adv_types.events WHERE id = 1;
+----
+alice
+
+# JSON Operator @> (Does the left JSON value contain the right JSON path/value at the top level?)
+query I
+SELECT id FROM pg18_adv_types.events WHERE payload @> '{"active": true}';
+----
+1
+
+# 2. Array Operations
+# Array contains operator @>
+query I
+SELECT id FROM pg18_adv_types.events WHERE tags @> ARRAY['signup'];
+----
+1
+
+# 3. Standard Functions
+query T
+SELECT CONCAT(payload->>'user', '-', id) FROM pg18_adv_types.events WHERE id = 1;
+----
+alice-1
+
+# Clean up
+statement ok
+DROP TABLE pg18_adv_types.events;
+
+statement ok
+DROP SCHEMA pg18_adv_types;
