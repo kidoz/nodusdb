@@ -629,9 +629,12 @@ pub async fn start_pgwire_server(
     tls: Option<Arc<tokio_rustls::TlsAcceptor>>,
     mut shutdown: tokio::sync::watch::Receiver<()>,
 ) -> anyhow::Result<()> {
+    let mut param_provider = DefaultServerParameterProvider::default();
+    param_provider.server_version = "16.0".to_string();
+
     let startup_handler = Arc::new(NodusStartupHandler {
         authenticator,
-        param_provider: DefaultServerParameterProvider::default(),
+        param_provider,
     });
     let factory = Arc::new(NodusPgWireServer {
         startup_handler,
