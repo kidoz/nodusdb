@@ -66,6 +66,8 @@ pub enum ShardCommand {
     CreateDatabase(nodus_catalog::CreateDatabaseRequest),
     CreateSchema(nodus_catalog::CreateSchemaRequest),
     CreateTable(nodus_catalog::CreateTableRequest),
+    DropTable(nodus_catalog::TableId),
+    DropSchema(nodus_catalog::SchemaId),
     GrantPrivileges(nodus_catalog::GrantPrivilegesRequest),
     RevokePrivileges(nodus_catalog::RevokePrivilegesRequest),
     UpdateTableDescriptor(nodus_catalog::TableDescriptorChange),
@@ -357,6 +359,16 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
                             ShardCommand::CreateTable(req) => { 
                                 if let Err(e) = catalog.create_table(req.clone()) {
                                     tracing::debug!("CreateTable error: {}", e);
+                                }
+                            }
+                            ShardCommand::DropTable(id) => {
+                                if let Err(e) = catalog.drop_table(*id) {
+                                    tracing::debug!("DropTable error: {}", e);
+                                }
+                            }
+                            ShardCommand::DropSchema(id) => {
+                                if let Err(e) = catalog.drop_schema(*id) {
+                                    tracing::debug!("DropSchema error: {}", e);
                                 }
                             }
                             ShardCommand::GrantPrivileges(req) => { let _ = catalog.grant_privileges(req.clone()); }

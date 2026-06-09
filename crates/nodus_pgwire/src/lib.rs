@@ -34,6 +34,20 @@ fn encode_value(value: &nodus_executor::Value, encoder: &mut DataRowEncoder) -> 
         nodus_executor::Value::Text(s) => encoder.encode_field(&s),
         nodus_executor::Value::Bool(b) => encoder.encode_field(&b),
         nodus_executor::Value::Null => encoder.encode_field(&None::<i64>),
+        nodus_executor::Value::Array(arr) => {
+            let rendered: Vec<String> = arr.iter().map(|v| match v {
+                nodus_executor::Value::Int(n) => n.to_string(),
+                nodus_executor::Value::Float(f) => f.to_string(),
+                nodus_executor::Value::Text(s) => format!("\"{}\"", s.replace('"', "\\\"")),
+                nodus_executor::Value::Bool(b) => b.to_string(),
+                nodus_executor::Value::Null => "NULL".to_string(),
+                nodus_executor::Value::Array(_) => "[]".to_string(),
+                nodus_executor::Value::Jsonb(j) => format!("\"{}\"", j.to_string().replace('"', "\\\"")),
+            }).collect();
+            let arr_str = format!("{{{}}}", rendered.join(","));
+            encoder.encode_field(&arr_str)
+        }
+        nodus_executor::Value::Jsonb(j) => encoder.encode_field(&j.to_string()),
     }.map_err(|e| std::io::Error::other(e.to_string()))
 }
 
@@ -241,10 +255,25 @@ impl SimpleQueryHandler for NodusQueryHandler {
             }
         };
 
-        let out = self
-            .executor
-            .execute_logical(&ctx, plan)
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        let out = match self.executor.execute_logical(&ctx, plan) {
+            Ok(out) => out,
+            Err(e) => {
+                let err_str = e.to_string();
+                let code = if err_str.contains("Unique constraint violation") {
+                    "23505"
+                } else if err_str.contains("cannot be NULL") {
+                    "23502"
+                } else {
+                    "XX000"
+                };
+                let err = ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    code.to_owned(),
+                    err_str,
+                );
+                return Err(PgWireError::UserError(Box::new(err)));
+            }
+        };
 
         // No projected columns => a command tag (CREATE TABLE, INSERT, BEGIN…).
         if out.columns.is_empty() {
@@ -421,10 +450,25 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
             }
         };
 
-        let out = self
-            .executor
-            .execute_logical(&ctx, plan)
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        let out = match self.executor.execute_logical(&ctx, plan) {
+            Ok(out) => out,
+            Err(e) => {
+                let err_str = e.to_string();
+                let code = if err_str.contains("Unique constraint violation") {
+                    "23505"
+                } else if err_str.contains("cannot be NULL") {
+                    "23502"
+                } else {
+                    "XX000"
+                };
+                let err = ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    code.to_owned(),
+                    err_str,
+                );
+                return Err(PgWireError::UserError(Box::new(err)));
+            }
+        };
 
         if out.columns.is_empty() {
             return Ok(Response::Execution(Tag::new(&out.tag)));
@@ -484,11 +528,14 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
                 nodus_executor::LogicalPlan::Select { projection, .. } => {
                     for col in projection {
                         let col_name = match col {
-                            nodus_executor::ProjectionItem::Column(c) => c,
-                            nodus_executor::ProjectionItem::AliasedColumn(_, a) => a,
+                            nodus_executor::ProjectionItem::Column(c) => c.clone(),
+                            nodus_executor::ProjectionItem::AliasedColumn(_, a) => a.clone(),
                             nodus_executor::ProjectionItem::Aggregate(op, inner) => {
                                 format!("{:?}({})", op, inner)
                             }
+                            nodus_executor::ProjectionItem::WindowFunction { func_name, alias, .. } => alias.clone().unwrap_or_else(|| func_name.clone()),
+                            nodus_executor::ProjectionItem::ScalarFunction { func_name, alias, .. } => alias.clone().unwrap_or_else(|| func_name.clone()),
+                            nodus_executor::ProjectionItem::JsonAccess { left, operator, right, alias } => alias.clone().unwrap_or_else(|| format!("{}{}{}", left, operator, right)),
                         };
                         fields.push(FieldInfo::new(
                             col_name,
@@ -546,11 +593,14 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
                 nodus_executor::LogicalPlan::Select { projection, .. } => {
                     for col in projection {
                         let col_name = match col {
-                            nodus_executor::ProjectionItem::Column(c) => c,
-                            nodus_executor::ProjectionItem::AliasedColumn(_, a) => a,
+                            nodus_executor::ProjectionItem::Column(c) => c.clone(),
+                            nodus_executor::ProjectionItem::AliasedColumn(_, a) => a.clone(),
                             nodus_executor::ProjectionItem::Aggregate(op, inner) => {
                                 format!("{:?}({})", op, inner)
                             }
+                            nodus_executor::ProjectionItem::WindowFunction { func_name, alias, .. } => alias.clone().unwrap_or_else(|| func_name.clone()),
+                            nodus_executor::ProjectionItem::ScalarFunction { func_name, alias, .. } => alias.clone().unwrap_or_else(|| func_name.clone()),
+                            nodus_executor::ProjectionItem::JsonAccess { left, operator, right, alias } => alias.clone().unwrap_or_else(|| format!("{}{}{}", left, operator, right)),
                         };
                         fields.push(FieldInfo::new(
                             col_name,

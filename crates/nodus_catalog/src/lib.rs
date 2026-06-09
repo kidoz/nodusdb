@@ -88,6 +88,24 @@ pub struct TableDescriptor {
     pub state: DescriptorState,
     pub columns: Vec<ColumnDescriptor>,
     pub indexes: Vec<IndexDescriptor>,
+    #[serde(default)]
+    pub constraints: Vec<TableConstraint>,
+    #[serde(default)]
+    pub view_query: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum TableConstraint {
+    Check {
+        name: Option<String>,
+        expr: String, // AST expr as string for evaluation
+    },
+    ForeignKey {
+        name: Option<String>,
+        columns: Vec<String>,
+        foreign_table: String,
+        referred_columns: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -346,6 +364,9 @@ pub struct CreateTableRequest {
     pub schema_id: SchemaId,
     pub name: String,
     pub columns: Vec<ColumnDescriptor>,
+    pub constraints: Vec<TableConstraint>,
+    #[serde(default)]
+    pub view_query: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -371,6 +392,11 @@ pub enum TableDescriptorChange {
     },
     RenameTable {
         table_id: TableId,
+        new_name: String,
+    },
+    RenameColumn {
+        table_id: TableId,
+        old_name: String,
         new_name: String,
     },
     DropColumn {
@@ -429,10 +455,12 @@ pub trait CatalogReader: Send + Sync {
     fn get_database_by_id(&self, id: DatabaseId) -> Result<DatabaseDescriptor>;
     fn get_schema(&self, database: &str, schema: &str) -> Result<SchemaDescriptor>;
     fn get_schema_by_id(&self, id: SchemaId) -> Result<SchemaDescriptor>;
+    fn list_schemas(&self, database: &str) -> Result<Vec<SchemaDescriptor>>;
     fn resolve_object(&self, request: ResolveObjectRequest) -> Result<ObjectDescriptor>;
     fn get_table(&self, database: &str, schema: &str, table: &str) -> Result<TableDescriptor>;
     fn get_table_by_id(&self, id: TableId) -> Result<TableDescriptor>;
     fn list_tables(&self, database: &str, schema: &str) -> Result<Vec<TableDescriptor>>;
+    fn list_all_tables(&self, database: &str) -> Result<Vec<TableDescriptor>>;
     fn get_principal_by_name(&self, name: &str) -> Result<PrincipalDescriptor>;
     fn get_principal_by_id(&self, id: PrincipalId) -> Result<PrincipalDescriptor>;
     fn get_cluster_version(&self) -> Result<ClusterVersion>;
@@ -455,6 +483,8 @@ pub trait CatalogWriter: Send + Sync {
     fn create_database(&self, request: CreateDatabaseRequest) -> Result<DatabaseDescriptor>;
     fn create_schema(&self, request: CreateSchemaRequest) -> Result<SchemaDescriptor>;
     fn create_table(&self, request: CreateTableRequest) -> Result<TableDescriptor>;
+    fn drop_table(&self, id: TableId) -> Result<()>;
+    fn drop_schema(&self, id: SchemaId) -> Result<()>;
     fn grant_privileges(&self, request: GrantPrivilegesRequest) -> Result<GrantDescriptor>;
     fn revoke_privileges(&self, request: RevokePrivilegesRequest) -> Result<()>;
     fn update_table_descriptor(&self, change: TableDescriptorChange) -> Result<TableDescriptor>;
@@ -632,6 +662,26 @@ impl CatalogReader for MemoryCatalog {
             .find(|s| s.id == id)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("Schema ID {} not found", id))
+    }
+
+    fn list_schemas(&self, database: &str) -> Result<Vec<SchemaDescriptor>> {
+        let db = self.get_database(database)?;
+        let guard = self.schemas.read().unwrap();
+        Ok(guard
+            .values()
+            .filter(|s| s.database_id == db.id && s.state == DescriptorState::Public)
+            .cloned()
+            .collect())
+    }
+
+    fn list_all_tables(&self, database: &str) -> Result<Vec<TableDescriptor>> {
+        let db = self.get_database(database)?;
+        let guard = self.tables.read().unwrap();
+        Ok(guard
+            .values()
+            .filter(|t| t.database_id == db.id && t.state == DescriptorState::Public)
+            .cloned()
+            .collect())
     }
 
     #[allow(clippy::collapsible_if)]
@@ -842,11 +892,39 @@ impl CatalogWriter for MemoryCatalog {
             state: DescriptorState::Public,
             columns: request.columns,
             indexes: vec![],
+            constraints: request.constraints,
+            view_query: request.view_query,
         };
         guard.insert(key, desc.clone());
         drop(guard);
         let _ = self.save_to_disk();
         Ok(desc)
+    }
+
+    fn drop_table(&self, id: TableId) -> Result<()> {
+        let mut guard = self.tables.write().unwrap();
+        let key = guard.iter().find(|(_, t)| t.id == id).map(|(k, _)| k.clone());
+        if let Some(key) = key {
+            guard.remove(&key);
+            drop(guard);
+            let _ = self.save_to_disk();
+            Ok(())
+        } else {
+            anyhow::bail!("Table not found")
+        }
+    }
+
+    fn drop_schema(&self, id: SchemaId) -> Result<()> {
+        let mut guard = self.schemas.write().unwrap();
+        let key = guard.iter().find(|(_, s)| s.id == id).map(|(k, _)| k.clone());
+        if let Some(key) = key {
+            guard.remove(&key);
+            drop(guard);
+            let _ = self.save_to_disk();
+            Ok(())
+        } else {
+            anyhow::bail!("Schema not found")
+        }
     }
 
     fn grant_privileges(&self, request: GrantPrivilegesRequest) -> Result<GrantDescriptor> {
@@ -886,6 +964,7 @@ impl CatalogWriter for MemoryCatalog {
         let table_id = match &change {
             TableDescriptorChange::AddColumn { table_id, .. } => *table_id,
             TableDescriptorChange::RenameTable { table_id, .. } => *table_id,
+            TableDescriptorChange::RenameColumn { table_id, .. } => *table_id,
             TableDescriptorChange::DropColumn { table_id, .. } => *table_id,
             TableDescriptorChange::AddIndex { table_id, .. } => *table_id,
         };
@@ -913,6 +992,13 @@ impl CatalogWriter for MemoryCatalog {
             TableDescriptorChange::RenameTable { new_name, .. } => {
                 table.name = new_name.clone();
                 new_key.2 = new_name;
+            }
+            TableDescriptorChange::RenameColumn { old_name, new_name, .. } => {
+                if let Some(col) = table.columns.iter_mut().find(|c| c.name == old_name) {
+                    col.name = new_name;
+                } else {
+                    anyhow::bail!("Column {} not found", old_name);
+                }
             }
             TableDescriptorChange::DropColumn { column_name, .. } => {
                 table.columns.retain(|c| c.name != column_name);

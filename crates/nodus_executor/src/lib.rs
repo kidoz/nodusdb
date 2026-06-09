@@ -32,6 +32,8 @@ pub enum Value {
     Float(f64),
     Text(String),
     Bool(bool),
+    Array(Vec<Value>),
+    Jsonb(serde_json::Value),
     Null,
 }
 
@@ -90,7 +92,12 @@ fn render(value: &Value) -> String {
         Value::Int(n) => n.to_string(),
         Value::Float(f) => f.to_string(),
         Value::Text(s) => s.clone(),
-        Value::Bool(b) => b.to_string(),
+        Value::Bool(b) => if *b { "t".to_string() } else { "f".to_string() },
+        Value::Array(a) => {
+            let rendered: Vec<String> = a.iter().map(render).collect();
+            format!("{{{}}}", rendered.join(","))
+        }
+        Value::Jsonb(j) => j.to_string(),
         Value::Null => String::new(),
     }
 }
@@ -124,6 +131,8 @@ pub enum CompareOp {
     Le,
     Gt,
     Ge,
+    Contains, // @>
+    ContainedBy, // <@
 }
 
 /// A single `left <op> right` predicate; a `WHERE` clause or `ON` clause is a conjunction.
@@ -163,11 +172,14 @@ pub enum FilterExpr {
 pub enum JoinType {
     Inner,
     LeftOuter,
+    RightOuter,
+    FullOuter,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Join {
     pub table_name: String,
+    pub table_alias: Option<String>,
     pub condition: Option<FilterExpr>,
     pub join_type: JoinType,
 }
@@ -185,6 +197,23 @@ pub enum ProjectionItem {
     Column(String),
     AliasedColumn(String, String),
     Aggregate(AggregateOp, String),
+    ScalarFunction {
+        func_name: String,
+        args: Vec<String>,
+        alias: Option<String>,
+    },
+    JsonAccess {
+        left: String,
+        operator: String,
+        right: String,
+        alias: Option<String>,
+    },
+    WindowFunction {
+        func_name: String,
+        partition_by: Vec<String>,
+        order_by: Vec<(String, bool)>, // (col_name, ascending)
+        alias: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -193,6 +222,10 @@ pub enum AlterTableOp {
         name: String,
         data_type: String,
         nullable: bool,
+    },
+    RenameColumn {
+        old_name: String,
+        new_name: String,
     },
     DropColumn {
         name: String,
@@ -208,9 +241,27 @@ pub enum LogicalPlan {
         schema_name: String,
         if_not_exists: bool,
     },
+    DropSchema {
+        schema_name: String,
+        if_exists: bool,
+        cascade: bool,
+    },
     CreateTable {
         name: String,
         columns: Vec<ColumnDef>,
+        constraints: Vec<nodus_catalog::TableConstraint>,
+    },
+    DropTable {
+        name: String,
+        if_exists: bool,
+    },
+    CreateView {
+        name: String,
+        query: Box<LogicalPlan>,
+    },
+    DropView {
+        name: String,
+        if_exists: bool,
     },
     AlterTable {
         table_name: String,
@@ -222,6 +273,19 @@ pub enum LogicalPlan {
         columns: Vec<String>,
         unique: bool,
     },
+    CreateRole {
+        name: String,
+    },
+    Grant {
+        privilege: String,
+        object_name: String,
+        grantee: String,
+    },
+    Revoke {
+        privilege: String,
+        object_name: String,
+        revokee: String,
+    },
     Insert {
         table_name: String,
         /// Target column names; empty means positional (table order).
@@ -230,7 +294,9 @@ pub enum LogicalPlan {
         returning: Vec<String>,
     },
     Select {
+        ctes: Vec<(String, Box<LogicalPlan>)>,
         table_name: String,
+        table_alias: Option<String>,
         joins: Vec<Join>,
         /// Projected column names; empty means all columns (`SELECT *`).
         projection: Vec<ProjectionItem>,
@@ -320,6 +386,17 @@ pub fn expr_to_value(expr: &sqlparser::ast::Expr, params: &[crate::Value]) -> Op
             None
         }
         Expr::Identifier(id) => Some(crate::Value::Text(id.value.clone())),
+        Expr::Array(sqlparser::ast::Array { elem, .. }) => {
+            let mut arr = Vec::new();
+            for e in elem {
+                if let Some(v) = expr_to_value(e, params) {
+                    arr.push(v);
+                } else {
+                    return None;
+                }
+            }
+            Some(crate::Value::Array(arr))
+        }
         _ => None,
     }
 }
@@ -337,9 +414,10 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                 if_not_exists: *if_not_exists,
             })
         }
-        Statement::CreateTable { name, columns, .. } => {
-            let table_name = name.0.last().map(|i| i.value.clone()).unwrap_or_else(|| name.to_string());
+        Statement::CreateTable { name, columns, constraints, .. } => {
+            let table_name = name.to_string();
             let mut cols = Vec::new();
+            let mut tbl_constraints = Vec::new();
             for c in columns {
                 let mut nullable = true;
                 let mut unique = false;
@@ -352,6 +430,20 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                                 nullable = false;
                             }
                         }
+                        sqlparser::ast::ColumnOption::Check(expr) => {
+                            tbl_constraints.push(nodus_catalog::TableConstraint::Check {
+                                name: opt.name.as_ref().map(|n| n.value.clone()),
+                                expr: expr.to_string(),
+                            });
+                        }
+                        sqlparser::ast::ColumnOption::ForeignKey { foreign_table, referred_columns, .. } => {
+                            tbl_constraints.push(nodus_catalog::TableConstraint::ForeignKey {
+                                name: opt.name.as_ref().map(|n| n.value.clone()),
+                                columns: vec![c.name.value.clone()],
+                                foreign_table: foreign_table.to_string(),
+                                referred_columns: referred_columns.iter().map(|i| i.value.clone()).collect(),
+                            });
+                        }
                         _ => {}
                     }
                 }
@@ -362,10 +454,112 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                     unique,
                 });
             }
+
+            for tc in constraints {
+                match tc {
+                    sqlparser::ast::TableConstraint::Unique { columns, .. } => {
+                        for col in columns {
+                            if let Some(c) = cols.iter_mut().find(|c| c.name == col.value) {
+                                c.unique = true;
+                            }
+                        }
+                    }
+                    sqlparser::ast::TableConstraint::PrimaryKey { columns, .. } => {
+                        for col in columns {
+                            if let Some(c) = cols.iter_mut().find(|c| c.name == col.value) {
+                                c.unique = true;
+                                c.nullable = false;
+                            }
+                        }
+                    }
+                    sqlparser::ast::TableConstraint::Check { name, expr } => {
+                        tbl_constraints.push(nodus_catalog::TableConstraint::Check {
+                            name: name.as_ref().map(|n| n.value.clone()),
+                            expr: expr.to_string(),
+                        });
+                    }
+                    sqlparser::ast::TableConstraint::ForeignKey { name, columns, foreign_table, referred_columns, .. } => {
+                        tbl_constraints.push(nodus_catalog::TableConstraint::ForeignKey {
+                            name: name.as_ref().map(|n| n.value.clone()),
+                            columns: columns.iter().map(|c| c.value.clone()).collect(),
+                            foreign_table: foreign_table.to_string(),
+                            referred_columns: referred_columns.iter().map(|i| i.value.clone()).collect(),
+                        });
+                    }
+                    _ => {}
+                }
+            }
+
             Ok(LogicalPlan::CreateTable {
                 name: table_name,
                 columns: cols,
+                constraints: tbl_constraints,
             })
+        }
+        Statement::CreateView { name, query, .. } => {
+            Ok(LogicalPlan::CreateView {
+                name: name.to_string(),
+                query: Box::new(plan_query(query, params)?),
+            })
+        }
+        Statement::Drop { object_type, if_exists, names, cascade, .. } => {
+            let name = names.first().ok_or_else(|| anyhow::anyhow!("DROP without a name"))?.to_string();
+            match object_type {
+                sqlparser::ast::ObjectType::Table => Ok(LogicalPlan::DropTable {
+                    name,
+                    if_exists: *if_exists,
+                }),
+                sqlparser::ast::ObjectType::View => Ok(LogicalPlan::DropView {
+                    name,
+                    if_exists: *if_exists,
+                }),
+                sqlparser::ast::ObjectType::Schema => Ok(LogicalPlan::DropSchema {
+                    schema_name: name,
+                    if_exists: *if_exists,
+                    cascade: *cascade,
+                }),
+                _ => anyhow::bail!("Unsupported DROP object type: {:?}", object_type),
+            }
+        }
+        Statement::CreateIndex { name, table_name, columns, unique, .. } => {
+            let idx_name = name.as_ref().map(|n| n.to_string()).unwrap_or_else(|| "unnamed_idx".to_string());
+            let cols = columns.iter().filter_map(|c| extract_col_name(&c.expr)).collect();
+            Ok(LogicalPlan::CreateIndex {
+                name: idx_name,
+                table_name: table_name.to_string(),
+                columns: cols,
+                unique: *unique,
+            })
+        }
+        Statement::CreateRole { names, .. } => {
+            let name = names.first().ok_or_else(|| anyhow::anyhow!("CREATE ROLE without a name"))?.to_string();
+            Ok(LogicalPlan::CreateRole { name })
+        }
+        Statement::Grant { privileges, objects, grantees, .. } => {
+            let privilege = match privileges {
+                sqlparser::ast::Privileges::Actions(actions) => actions.first().map(|a| a.to_string()).unwrap_or_else(|| "ALL".to_string()),
+                _ => "ALL".to_string(),
+            };
+            let grantee = grantees.first().ok_or_else(|| anyhow::anyhow!("GRANT without grantee"))?.to_string();
+            if let GrantObjects::Tables(tables) = objects {
+                let object_name = tables.first().ok_or_else(|| anyhow::anyhow!("GRANT without table name"))?.to_string();
+                Ok(LogicalPlan::Grant { privilege, object_name, grantee })
+            } else {
+                anyhow::bail!("Unsupported GRANT target");
+            }
+        }
+        Statement::Revoke { privileges, objects, grantees, .. } => {
+            let privilege = match privileges {
+                sqlparser::ast::Privileges::Actions(actions) => actions.first().map(|a| a.to_string()).unwrap_or_else(|| "ALL".to_string()),
+                _ => "ALL".to_string(),
+            };
+            let revokee = grantees.first().ok_or_else(|| anyhow::anyhow!("REVOKE without revokee"))?.to_string();
+            if let GrantObjects::Tables(tables) = objects {
+                let object_name = tables.first().ok_or_else(|| anyhow::anyhow!("REVOKE without table name"))?.to_string();
+                Ok(LogicalPlan::Revoke { privilege, object_name, revokee })
+            } else {
+                anyhow::bail!("Unsupported REVOKE target");
+            }
         }
         Statement::Insert {
             table_name,
@@ -492,6 +686,46 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                 value: var_val,
             })
         }
+        Statement::AlterTable { name, operations, .. } => {
+            let table_name = name.to_string();
+            let op = operations.first().ok_or_else(|| anyhow::anyhow!("ALTER TABLE without operations"))?;
+            let alter_op = match op {
+                sqlparser::ast::AlterTableOperation::AddColumn { column_def, .. } => {
+                    let mut nullable = true;
+                    for opt in &column_def.options {
+                        if let sqlparser::ast::ColumnOption::NotNull = &opt.option {
+                            nullable = false;
+                        }
+                    }
+                    AlterTableOp::AddColumn {
+                        name: column_def.name.value.clone(),
+                        data_type: column_def.data_type.to_string(),
+                        nullable,
+                    }
+                }
+                sqlparser::ast::AlterTableOperation::RenameColumn { old_column_name, new_column_name } => {
+                    AlterTableOp::RenameColumn {
+                        old_name: old_column_name.value.clone(),
+                        new_name: new_column_name.value.clone(),
+                    }
+                }
+                sqlparser::ast::AlterTableOperation::DropColumn { column_name, .. } => {
+                    AlterTableOp::DropColumn {
+                        name: column_name.value.clone(),
+                    }
+                }
+                sqlparser::ast::AlterTableOperation::RenameTable { table_name: new_table_name } => {
+                    AlterTableOp::RenameTable {
+                        new_name: new_table_name.to_string(),
+                    }
+                }
+                _ => anyhow::bail!("Unsupported ALTER TABLE operation: {:?}", op),
+            };
+            Ok(LogicalPlan::AlterTable {
+                table_name,
+                operation: alter_op,
+            })
+        }
         _ => anyhow::bail!("Unsupported SQL statement: {:?}", stmt),
     }
 }
@@ -500,6 +734,16 @@ fn table_name_of(relation: &sqlparser::ast::TableFactor) -> Result<String> {
     match relation {
         sqlparser::ast::TableFactor::Table { name, .. } => Ok(name.to_string()),
         other => anyhow::bail!("Unsupported table relation: {:?}", other),
+    }
+}
+
+pub fn parse_object_name(name: &str) -> Result<(&str, &str, &str)> {
+    let parts: Vec<&str> = name.split('.').collect();
+    match parts.len() {
+        1 => Ok(("default", "public", parts[0])),
+        2 => Ok(("default", parts[0], parts[1])),
+        3 => Ok((parts[0], parts[1], parts[2])),
+        _ => anyhow::bail!("Invalid object name: {}", name),
     }
 }
 
@@ -512,6 +756,8 @@ fn compare_op(op: &sqlparser::ast::BinaryOperator) -> Option<CompareOp> {
         LtEq => Some(CompareOp::Le),
         Gt => Some(CompareOp::Gt),
         GtEq => Some(CompareOp::Ge),
+        Custom(s) if s == "@>" => Some(CompareOp::Contains),
+        Custom(s) if s == "<@" => Some(CompareOp::ContainedBy),
         _ => None,
     }
 }
@@ -620,6 +866,20 @@ fn parse_filter_expr(expr: &sqlparser::ast::Expr, params: &[Value]) -> Option<Fi
                 None
             }
         }
+        Expr::JsonAccess { left, operator, right } => {
+            let left_col = extract_col_name(left)?;
+            let right_op = extract_operand(right, params)?;
+            let cmp = match operator {
+                sqlparser::ast::JsonOperator::AtArrow => CompareOp::Contains,
+                sqlparser::ast::JsonOperator::ArrowAt => CompareOp::ContainedBy,
+                _ => return None,
+            };
+            Some(FilterExpr::Predicate(Predicate {
+                left: left_col,
+                op: cmp,
+                right: right_op,
+            }))
+        }
         _ => None,
     }
 }
@@ -634,6 +894,25 @@ fn extract_col_name(expr: &sqlparser::ast::Expr) -> Option<String> {
                 .collect::<Vec<_>>()
                 .join("."),
         ),
+        Expr::JsonAccess { left, operator, right } => {
+            let left_col = extract_col_name(left)?;
+            let right_val = match &**right {
+                Expr::Value(v) => match v {
+                    sqlparser::ast::Value::SingleQuotedString(s) => s.clone(),
+                    sqlparser::ast::Value::Number(n, _) => n.clone(),
+                    _ => return None,
+                },
+                _ => return None,
+            };
+            let op_str = match operator {
+                sqlparser::ast::JsonOperator::LongArrow => "->>",
+                sqlparser::ast::JsonOperator::Arrow => "->",
+                sqlparser::ast::JsonOperator::HashArrow => "#>",
+                sqlparser::ast::JsonOperator::HashLongArrow => "#>>",
+                _ => return None,
+            };
+            Some(format!("{}{}'{}'", left_col, op_str, right_val))
+        }
         Expr::Cast { expr, .. } => extract_col_name(expr),
         _ => None,
     }
@@ -661,6 +940,16 @@ fn extract_operand(expr: &sqlparser::ast::Expr, params: &[Value]) -> Option<Oper
 
 fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Result<LogicalPlan> {
     use sqlparser::ast::*;
+    
+    let mut ctes = Vec::new();
+    if let Some(with) = &query.with {
+        for cte in &with.cte_tables {
+            let cte_name = cte.alias.name.value.clone();
+            let cte_plan = plan_query(&cte.query, params)?;
+            ctes.push((cte_name, Box::new(cte_plan)));
+        }
+    }
+
     let SetExpr::Select(select) = &*query.body else {
         anyhow::bail!("Unsupported query body");
     };
@@ -706,15 +995,15 @@ fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Result<Logical
         }
         return Ok(LogicalPlan::SelectLiteral { values });
     }
-    let table_name = match &select.from[0].relation {
-        TableFactor::Table { name, .. } => name.to_string(),
+    let (table_name, table_alias) = match &select.from[0].relation {
+        TableFactor::Table { name, alias, .. } => (name.to_string(), alias.as_ref().map(|a| a.name.value.clone())),
         other => anyhow::bail!("Unsupported FROM relation: {:?}", other),
     };
 
     let mut joins = Vec::new();
     for j in &select.from[0].joins {
-        let table_name = match &j.relation {
-            TableFactor::Table { name, .. } => name.to_string(),
+        let (join_table_name, join_table_alias) = match &j.relation {
+            TableFactor::Table { name, alias, .. } => (name.to_string(), alias.as_ref().map(|a| a.name.value.clone())),
             other => anyhow::bail!("Unsupported join relation: {:?}", other),
         };
         let (join_type, condition) = match &j.join_operator {
@@ -724,10 +1013,17 @@ fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Result<Logical
             JoinOperator::LeftOuter(JoinConstraint::On(expr)) => {
                 (JoinType::LeftOuter, parse_filter_expr(expr, params))
             }
+            JoinOperator::RightOuter(JoinConstraint::On(expr)) => {
+                (JoinType::RightOuter, parse_filter_expr(expr, params))
+            }
+            JoinOperator::FullOuter(JoinConstraint::On(expr)) => {
+                (JoinType::FullOuter, parse_filter_expr(expr, params))
+            }
             other => anyhow::bail!("Unsupported join operator: {:?}", other),
         };
         joins.push(crate::Join {
-            table_name,
+            table_name: join_table_name,
+            table_alias: join_table_alias,
             condition,
             join_type,
         });
@@ -744,32 +1040,92 @@ fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Result<Logical
             SelectItem::UnnamedExpr(expr) => {
                 if let Expr::Function(func) = expr {
                     let fname = func.name.to_string().to_uppercase();
-                    if fname.starts_with("PG_CATALOG.") || fname.starts_with("PG_") || fname.eq_ignore_ascii_case("FORMAT_TYPE") {
+                    if let Some(over) = &func.over {
+                        let mut partition_by = Vec::new();
+                        let mut order_by = Vec::new();
+                        if let sqlparser::ast::WindowType::WindowSpec(spec) = over {
+                            for expr in &spec.partition_by {
+                                if let Some(col) = extract_col_name(expr) {
+                                    partition_by.push(col);
+                                }
+                            }
+                            for expr in &spec.order_by {
+                                if let Some(col) = extract_col_name(&expr.expr) {
+                                    order_by.push((col, expr.asc.unwrap_or(true)));
+                                }
+                            }
+                        }
+                        projection.push(ProjectionItem::WindowFunction {
+                            func_name: fname,
+                            partition_by,
+                            order_by,
+                            alias: None,
+                        });
+                    } else if fname.starts_with("PG_CATALOG.") || fname.starts_with("PG_") || fname.eq_ignore_ascii_case("FORMAT_TYPE") {
                         // Dummy handling for system functions during introspection, just treat it as a string literal
                         projection.push(ProjectionItem::Column(fname));
                     } else {
-                        let op = match fname.as_str() {
-                            "COUNT" => AggregateOp::Count,
-                            "SUM" => AggregateOp::Sum,
-                            "MIN" => AggregateOp::Min,
-                            "MAX" => AggregateOp::Max,
-                            _ => anyhow::bail!("Unsupported aggregate function: {}", fname),
-                        };
-                        let inner = if let Some(arg) = func.args.first() {
-                            match arg {
-                                sqlparser::ast::FunctionArg::Unnamed(
-                                    sqlparser::ast::FunctionArgExpr::Expr(Expr::Identifier(id)),
-                                ) => id.value.clone(),
-                                sqlparser::ast::FunctionArg::Unnamed(
-                                    sqlparser::ast::FunctionArgExpr::Wildcard,
-                                ) => "*".to_string(),
-                                _ => anyhow::bail!("Unsupported aggregate argument"),
+                        match fname.as_str() {
+                            "COUNT" | "SUM" | "MIN" | "MAX" => {
+                                let op = match fname.as_str() {
+                                    "COUNT" => AggregateOp::Count,
+                                    "SUM" => AggregateOp::Sum,
+                                    "MIN" => AggregateOp::Min,
+                                    "MAX" => AggregateOp::Max,
+                                    _ => unreachable!(),
+                                };
+                                let inner = if let Some(arg) = func.args.first() {
+                                    match arg {
+                                        sqlparser::ast::FunctionArg::Unnamed(
+                                            sqlparser::ast::FunctionArgExpr::Expr(Expr::Identifier(id)),
+                                        ) => id.value.clone(),
+                                        sqlparser::ast::FunctionArg::Unnamed(
+                                            sqlparser::ast::FunctionArgExpr::Wildcard,
+                                        ) => "*".to_string(),
+                                        _ => anyhow::bail!("Unsupported aggregate argument"),
+                                    }
+                                } else {
+                                    anyhow::bail!("Aggregate function requires an argument");
+                                };
+                                projection.push(ProjectionItem::Aggregate(op, inner));
                             }
-                        } else {
-                            anyhow::bail!("Aggregate function requires an argument");
-                        };
-                        projection.push(ProjectionItem::Aggregate(op, inner));
+                            _ => {
+                                let mut args = Vec::new();
+                                for arg in &func.args {
+                                    if let sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(e)) = arg {
+                                        if let Some(col) = extract_col_name(e) {
+                                            args.push(col);
+                                        } else if let Some(crate::Value::Text(s)) = expr_to_value(e, &[]) {
+                                            args.push(format!("'{}'", s));
+                                        }
+                                    }
+                                }
+                                projection.push(ProjectionItem::ScalarFunction {
+                                    func_name: fname.clone(),
+                                    args,
+                                    alias: None, // Will fix later for ExprWithAlias
+                                });
+                            }
+                        }
                     }
+                } else if let Expr::JsonAccess { left, operator, right } = expr {
+                    let left_col = extract_col_name(left).ok_or_else(|| anyhow::anyhow!("Invalid JSON left"))?;
+                    let right_val = match &**right {
+                        Expr::Value(v) => match v {
+                            sqlparser::ast::Value::SingleQuotedString(s) => s.clone(),
+                            sqlparser::ast::Value::Number(n, _) => n.clone(),
+                            _ => anyhow::bail!("Unsupported JSON path"),
+                        },
+                        _ => anyhow::bail!("Unsupported JSON path"),
+                    };
+                    let op_str = match operator {
+                        sqlparser::ast::JsonOperator::LongArrow => "->>",
+                        sqlparser::ast::JsonOperator::Arrow => "->",
+                        sqlparser::ast::JsonOperator::HashArrow => "#>",
+                        sqlparser::ast::JsonOperator::HashLongArrow => "#>>",
+                        _ => anyhow::bail!("Unsupported JSON operator"),
+                    };
+                    projection.push(ProjectionItem::JsonAccess { left: left_col, operator: op_str.to_string(), right: right_val, alias: None });
                 } else if let Some(col) = extract_col_name(expr) {
                     projection.push(ProjectionItem::Column(col));
                 } else {
@@ -779,31 +1135,91 @@ fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Result<Logical
             SelectItem::ExprWithAlias { expr, alias } => {
                 if let Expr::Function(func) = expr {
                     let fname = func.name.to_string().to_uppercase();
-                    if fname.starts_with("PG_CATALOG.") || fname.starts_with("PG_") || fname.eq_ignore_ascii_case("FORMAT_TYPE") {
+                    if let Some(over) = &func.over {
+                        let mut partition_by = Vec::new();
+                        let mut order_by = Vec::new();
+                        if let sqlparser::ast::WindowType::WindowSpec(spec) = over {
+                            for expr in &spec.partition_by {
+                                if let Some(col) = extract_col_name(expr) {
+                                    partition_by.push(col);
+                                }
+                            }
+                            for expr in &spec.order_by {
+                                if let Some(col) = extract_col_name(&expr.expr) {
+                                    order_by.push((col, expr.asc.unwrap_or(true)));
+                                }
+                            }
+                        }
+                        projection.push(ProjectionItem::WindowFunction {
+                            func_name: fname,
+                            partition_by,
+                            order_by,
+                            alias: Some(alias.value.clone()),
+                        });
+                    } else if fname.starts_with("PG_CATALOG.") || fname.starts_with("PG_") || fname.eq_ignore_ascii_case("FORMAT_TYPE") {
                         projection.push(ProjectionItem::AliasedColumn(fname, alias.value.clone()));
                     } else {
-                        let op = match fname.as_str() {
-                            "COUNT" => AggregateOp::Count,
-                            "SUM" => AggregateOp::Sum,
-                            "MIN" => AggregateOp::Min,
-                            "MAX" => AggregateOp::Max,
-                            _ => anyhow::bail!("Unsupported aggregate function: {}", fname),
-                        };
-                        let inner = if let Some(arg) = func.args.first() {
-                            match arg {
-                                sqlparser::ast::FunctionArg::Unnamed(
-                                    sqlparser::ast::FunctionArgExpr::Expr(Expr::Identifier(id)),
-                                ) => id.value.clone(),
-                                sqlparser::ast::FunctionArg::Unnamed(
-                                    sqlparser::ast::FunctionArgExpr::Wildcard,
-                                ) => "*".to_string(),
-                                _ => anyhow::bail!("Unsupported aggregate argument"),
+                        match fname.as_str() {
+                            "COUNT" | "SUM" | "MIN" | "MAX" => {
+                                let op = match fname.as_str() {
+                                    "COUNT" => AggregateOp::Count,
+                                    "SUM" => AggregateOp::Sum,
+                                    "MIN" => AggregateOp::Min,
+                                    "MAX" => AggregateOp::Max,
+                                    _ => unreachable!(),
+                                };
+                                let inner = if let Some(arg) = func.args.first() {
+                                    match arg {
+                                        sqlparser::ast::FunctionArg::Unnamed(
+                                            sqlparser::ast::FunctionArgExpr::Expr(Expr::Identifier(id)),
+                                        ) => id.value.clone(),
+                                        sqlparser::ast::FunctionArg::Unnamed(
+                                            sqlparser::ast::FunctionArgExpr::Wildcard,
+                                        ) => "*".to_string(),
+                                        _ => anyhow::bail!("Unsupported aggregate argument"),
+                                    }
+                                } else {
+                                    anyhow::bail!("Aggregate function requires an argument");
+                                };
+                                projection.push(ProjectionItem::Aggregate(op, inner));
                             }
-                        } else {
-                            anyhow::bail!("Aggregate function requires an argument");
-                        };
-                        projection.push(ProjectionItem::Aggregate(op, inner));
+                            _ => {
+                                let mut args = Vec::new();
+                                for arg in &func.args {
+                                    if let sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(e)) = arg {
+                                        if let Some(col) = extract_col_name(e) {
+                                            args.push(col);
+                                        } else if let Some(crate::Value::Text(s)) = expr_to_value(e, &[]) {
+                                            args.push(format!("'{}'", s));
+                                        }
+                                    }
+                                }
+                                projection.push(ProjectionItem::ScalarFunction {
+                                    func_name: fname.clone(),
+                                    args,
+                                    alias: Some(alias.value.clone()),
+                                });
+                            }
+                        }
                     }
+                } else if let Expr::JsonAccess { left, operator, right } = expr {
+                    let left_col = extract_col_name(left).ok_or_else(|| anyhow::anyhow!("Invalid JSON left"))?;
+                    let right_val = match &**right {
+                        Expr::Value(v) => match v {
+                            sqlparser::ast::Value::SingleQuotedString(s) => s.clone(),
+                            sqlparser::ast::Value::Number(n, _) => n.clone(),
+                            _ => anyhow::bail!("Unsupported JSON path"),
+                        },
+                        _ => anyhow::bail!("Unsupported JSON path"),
+                    };
+                    let op_str = match operator {
+                        sqlparser::ast::JsonOperator::LongArrow => "->>",
+                        sqlparser::ast::JsonOperator::Arrow => "->",
+                        sqlparser::ast::JsonOperator::HashArrow => "#>",
+                        sqlparser::ast::JsonOperator::HashLongArrow => "#>>",
+                        _ => anyhow::bail!("Unsupported JSON operator"),
+                    };
+                    projection.push(ProjectionItem::JsonAccess { left: left_col, operator: op_str.to_string(), right: right_val, alias: Some(alias.value.clone()) });
                 } else if let Some(col) = extract_col_name(expr) {
                     projection.push(ProjectionItem::AliasedColumn(col, alias.value.clone()));
                 } else {
@@ -848,7 +1264,9 @@ fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Result<Logical
     let distinct = select.distinct.is_some();
 
     Ok(LogicalPlan::Select {
+        ctes,
         table_name,
+        table_alias,
         joins,
         projection,
         group_by,
@@ -1125,6 +1543,64 @@ impl MemExecutor {
         Ok(())
     }
 
+    fn check_table_constraints(
+        &self,
+        ctx: &ExecutionContext,
+        tbl: &nodus_catalog::TableDescriptor,
+        new_row: &[Value],
+        col_names: &[String],
+    ) -> Result<()> {
+        for tc in &tbl.constraints {
+            match tc {
+                nodus_catalog::TableConstraint::Check { name: _, expr } => {
+                    let ast_expr = match sqlparser::parser::Parser::new(&sqlparser::dialect::PostgreSqlDialect {}).try_with_sql(expr) {
+                        Ok(mut p) => match p.parse_expr() {
+                            Ok(e) => e,
+                            Err(e) => anyhow::bail!("Failed to parse CHECK constraint expr: {}", e),
+                        },
+                        Err(e) => anyhow::bail!("Failed to init parser: {}", e),
+                    };
+                    if let Some(filter) = parse_filter_expr(&ast_expr, &[]) {
+                        let result = self.eval_filter(ctx, new_row, col_names, &tbl.columns, Some(&filter));
+                        if result != Some(true) {
+                            anyhow::bail!("violates check constraint");
+                        }
+                    }
+                }
+                nodus_catalog::TableConstraint::ForeignKey { columns, foreign_table, referred_columns, .. } => {
+                    // Simple FK check
+                    let (db_name, schema_name, table_only) = parse_object_name(foreign_table).unwrap_or(("default", "public", foreign_table));
+                    let f_tbl = self.catalog_reader.get_table(db_name, schema_name, table_only)?;
+                    
+                    let mut all_match = true;
+                    for (i, c) in columns.iter().enumerate() {
+                        let ref_c = &referred_columns[i];
+                        let val_idx = col_names.iter().position(|name| name == c).unwrap();
+                        let val = &new_row[val_idx];
+                        if val == &Value::Null { continue; } // Nulls skip FK checks
+
+                        let ref_idx = f_tbl.columns.iter().position(|name| &name.name == ref_c).unwrap();
+                        let mut found = false;
+                        for f_row in self.scan_rows(f_tbl.id, &ctx.session_id)? {
+                            if &f_row[ref_idx] == val {
+                                found = true;
+                                break;
+                            }
+                        }
+                        if !found {
+                            all_match = false;
+                            break;
+                        }
+                    }
+                    if !all_match {
+                        anyhow::bail!("violates foreign key constraint");
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Writes a row value at `key`, using the session's txn.
     fn write_row(&self, session: &str, key: String, value: String) -> Result<()> {
         let txn_id = self.txn_for(session)?;
@@ -1266,6 +1742,65 @@ impl MemExecutor {
                     CompareOp::Le => ord != std::cmp::Ordering::Greater,
                     CompareOp::Gt => ord == std::cmp::Ordering::Greater,
                     CompareOp::Ge => ord != std::cmp::Ordering::Less,
+                    CompareOp::Contains => {
+                        println!("Contains: left={:?}, right={:?}", left_cell, right_cell);
+                        match (left_cell, &right_cell) {
+                            (Value::Array(l), Value::Array(r)) => {
+                                r.iter().all(|r_item| l.contains(r_item))
+                            }
+                            (Value::Text(l), Value::Text(r)) if l.starts_with('{') || l.starts_with('[') => {
+                                // Simplified JSONB @> eval for MVP text-encoded JSON
+                                let l_json: Result<serde_json::Value, _> = serde_json::from_str(l);
+                                let r_json: Result<serde_json::Value, _> = serde_json::from_str(r);
+                                if let (Ok(l_obj), Ok(r_obj)) = (l_json, r_json) {
+                                    if let (Some(l_map), Some(r_map)) = (l_obj.as_object(), r_obj.as_object()) {
+                                        let matched = r_map.iter().all(|(k, v)| {
+                                            if let Some(lv) = l_map.get(k) {
+                                                lv == v
+                                            } else {
+                                                false
+                                            }
+                                        });
+                                        println!("JSONB @> l='{}', r='{}', matched={}", l, r, matched);
+                                        matched
+                                    } else {
+                                        false
+                                    }
+                                } else {
+                                    false
+                                }
+                            }
+                            (Value::Text(l), Value::Array(r)) if l.starts_with('{') => {
+                                // Array check against text representing array: "{login,signup}"
+                                let mut l_str = l.clone();
+                                if l_str.starts_with('{') && l_str.ends_with('}') {
+                                    l_str = l_str[1..l_str.len()-1].to_string();
+                                }
+                                let l_items: Vec<&str> = l_str.split(',').collect();
+                                r.iter().all(|r_item| {
+                                    let r_str = render(r_item);
+                                    l_items.iter().any(|&s| s == r_str || s == format!("'{}'", r_str))
+                                })
+                            }
+                            (Value::Array(l), Value::Text(r)) => {
+                                // Right might be a text parsing failure for ARRAY[] in some ASTs?
+                                // Actually, `right_cell` should be evaluated correctly if it's an ARRAY[] literal.
+                                false
+                            }
+                            (Value::Jsonb(l), Value::Jsonb(r)) => {
+                                if let (Some(l_map), Some(r_map)) = (l.as_object(), r.as_object()) {
+                                    r_map.iter().all(|(k, v)| l_map.get(k) == Some(v))
+                                } else {
+                                    false
+                                }
+                            }
+                            _ => false,
+                        }
+                    }
+                    CompareOp::ContainedBy => {
+                        // <@
+                        false // Simplified MVP
+                    }
                 })
             }
             FilterExpr::Like {
@@ -1533,6 +2068,171 @@ impl Executor for MemExecutor {
 }
 
 impl MemExecutor {
+    fn get_virtual_table(&self, db_name: &str, table_only: &str) -> Result<(Vec<ColumnDescriptor>, Vec<Vec<Value>>)> {
+        match table_only.to_lowercase().as_str() {
+            "pg_namespace" => {
+                let schemas = self.catalog_reader.list_schemas(db_name)?;
+                let cols = vec![
+                    ColumnDescriptor { id: nodus_catalog::ColumnId::new(), name: "oid".into(), version: 1, created_at: chrono::Utc::now(), updated_at: chrono::Utc::now(), state: nodus_catalog::DescriptorState::Public, data_type: "INT".into(), nullable: false },
+                    ColumnDescriptor { id: nodus_catalog::ColumnId::new(), name: "nspname".into(), version: 1, created_at: chrono::Utc::now(), updated_at: chrono::Utc::now(), state: nodus_catalog::DescriptorState::Public, data_type: "TEXT".into(), nullable: false },
+                ];
+                let mut rows = Vec::new();
+                for (i, s) in schemas.iter().enumerate() {
+                    let oid = (i + 1) as i64; // Fake OID
+                    rows.push(vec![Value::Int(oid), Value::Text(s.name.clone())]);
+                }
+                Ok((cols, rows))
+            }
+            "pg_class" => {
+                let schemas = self.catalog_reader.list_schemas(db_name)?;
+                let tables = self.catalog_reader.list_all_tables(db_name)?;
+                let cols = vec![
+                    ColumnDescriptor { id: nodus_catalog::ColumnId::new(), name: "oid".into(), version: 1, created_at: chrono::Utc::now(), updated_at: chrono::Utc::now(), state: nodus_catalog::DescriptorState::Public, data_type: "INT".into(), nullable: false },
+                    ColumnDescriptor { id: nodus_catalog::ColumnId::new(), name: "relname".into(), version: 1, created_at: chrono::Utc::now(), updated_at: chrono::Utc::now(), state: nodus_catalog::DescriptorState::Public, data_type: "TEXT".into(), nullable: false },
+                    ColumnDescriptor { id: nodus_catalog::ColumnId::new(), name: "relnamespace".into(), version: 1, created_at: chrono::Utc::now(), updated_at: chrono::Utc::now(), state: nodus_catalog::DescriptorState::Public, data_type: "INT".into(), nullable: false },
+                    ColumnDescriptor { id: nodus_catalog::ColumnId::new(), name: "relkind".into(), version: 1, created_at: chrono::Utc::now(), updated_at: chrono::Utc::now(), state: nodus_catalog::DescriptorState::Public, data_type: "TEXT".into(), nullable: false },
+                ];
+                let mut rows = Vec::new();
+                for (i, t) in tables.iter().enumerate() {
+                    let oid = (i + 1000) as i64; // Fake OID
+                    let mut nsp_oid = 0;
+                    for (si, s) in schemas.iter().enumerate() {
+                        if s.id == t.schema_id {
+                            nsp_oid = (si + 1) as i64;
+                            break;
+                        }
+                    }
+                    rows.push(vec![Value::Int(oid), Value::Text(t.name.clone()), Value::Int(nsp_oid), Value::Text("r".into())]);
+                }
+                Ok((cols, rows))
+            }
+            "pg_attribute" => {
+                let tables = self.catalog_reader.list_all_tables(db_name)?;
+                let cols = vec![
+                    ColumnDescriptor { id: nodus_catalog::ColumnId::new(), name: "attrelid".into(), version: 1, created_at: chrono::Utc::now(), updated_at: chrono::Utc::now(), state: nodus_catalog::DescriptorState::Public, data_type: "INT".into(), nullable: false },
+                    ColumnDescriptor { id: nodus_catalog::ColumnId::new(), name: "attname".into(), version: 1, created_at: chrono::Utc::now(), updated_at: chrono::Utc::now(), state: nodus_catalog::DescriptorState::Public, data_type: "TEXT".into(), nullable: false },
+                    ColumnDescriptor { id: nodus_catalog::ColumnId::new(), name: "atttypid".into(), version: 1, created_at: chrono::Utc::now(), updated_at: chrono::Utc::now(), state: nodus_catalog::DescriptorState::Public, data_type: "INT".into(), nullable: false },
+                    ColumnDescriptor { id: nodus_catalog::ColumnId::new(), name: "attnum".into(), version: 1, created_at: chrono::Utc::now(), updated_at: chrono::Utc::now(), state: nodus_catalog::DescriptorState::Public, data_type: "INT".into(), nullable: false },
+                    ColumnDescriptor { id: nodus_catalog::ColumnId::new(), name: "attnotnull".into(), version: 1, created_at: chrono::Utc::now(), updated_at: chrono::Utc::now(), state: nodus_catalog::DescriptorState::Public, data_type: "BOOL".into(), nullable: false },
+                    ColumnDescriptor { id: nodus_catalog::ColumnId::new(), name: "atthasdef".into(), version: 1, created_at: chrono::Utc::now(), updated_at: chrono::Utc::now(), state: nodus_catalog::DescriptorState::Public, data_type: "BOOL".into(), nullable: false },
+                    ColumnDescriptor { id: nodus_catalog::ColumnId::new(), name: "attisdropped".into(), version: 1, created_at: chrono::Utc::now(), updated_at: chrono::Utc::now(), state: nodus_catalog::DescriptorState::Public, data_type: "BOOL".into(), nullable: false },
+                ];
+                let mut rows = Vec::new();
+                for (i, t) in tables.iter().enumerate() {
+                    let relid = (i + 1000) as i64;
+                    for (c_idx, c) in t.columns.iter().enumerate() {
+                        let attnum = (c_idx + 1) as i64;
+                        let atttypid = match c.data_type.to_uppercase().as_str() {
+                            "INT" | "INTEGER" | "BIGINT" => 23,
+                            "TEXT" | "VARCHAR" => 25,
+                            "BOOL" | "BOOLEAN" => 16,
+                            "JSONB" => 3802,
+                            _ => 25, // default to TEXT
+                        };
+                        rows.push(vec![
+                            Value::Int(relid),
+                            Value::Text(c.name.clone()),
+                            Value::Int(atttypid),
+                            Value::Int(attnum),
+                            Value::Bool(!c.nullable),
+                            Value::Bool(false),
+                            Value::Bool(false),
+                        ]);
+                    }
+                }
+                Ok((cols, rows))
+            }
+            "pg_index" => {
+                let tables = self.catalog_reader.list_all_tables(db_name)?;
+                let cols = vec![
+                    ColumnDescriptor { id: nodus_catalog::ColumnId::new(), name: "indexrelid".into(), version: 1, created_at: chrono::Utc::now(), updated_at: chrono::Utc::now(), state: nodus_catalog::DescriptorState::Public, data_type: "INT".into(), nullable: false },
+                    ColumnDescriptor { id: nodus_catalog::ColumnId::new(), name: "indrelid".into(), version: 1, created_at: chrono::Utc::now(), updated_at: chrono::Utc::now(), state: nodus_catalog::DescriptorState::Public, data_type: "INT".into(), nullable: false },
+                    ColumnDescriptor { id: nodus_catalog::ColumnId::new(), name: "indisprimary".into(), version: 1, created_at: chrono::Utc::now(), updated_at: chrono::Utc::now(), state: nodus_catalog::DescriptorState::Public, data_type: "BOOL".into(), nullable: false },
+                    ColumnDescriptor { id: nodus_catalog::ColumnId::new(), name: "indisunique".into(), version: 1, created_at: chrono::Utc::now(), updated_at: chrono::Utc::now(), state: nodus_catalog::DescriptorState::Public, data_type: "BOOL".into(), nullable: false },
+                ];
+                let mut rows = Vec::new();
+                for (i, t) in tables.iter().enumerate() {
+                    let relid = (i + 1000) as i64;
+                    for (i_idx, _idx) in t.indexes.iter().enumerate() {
+                        let idxrelid = relid + 10000 + i_idx as i64; // Fake OID
+                        rows.push(vec![
+                            Value::Int(idxrelid),
+                            Value::Int(relid),
+                            Value::Bool(true), // Hack for MVP: Assuming primary/unique based on usage
+                            Value::Bool(true),
+                        ]);
+                    }
+                }
+                Ok((cols, rows))
+            }
+            "pg_type" => {
+                let cols = vec![
+                    ColumnDescriptor { id: nodus_catalog::ColumnId::new(), name: "oid".into(), version: 1, created_at: chrono::Utc::now(), updated_at: chrono::Utc::now(), state: nodus_catalog::DescriptorState::Public, data_type: "INT".into(), nullable: false },
+                    ColumnDescriptor { id: nodus_catalog::ColumnId::new(), name: "typname".into(), version: 1, created_at: chrono::Utc::now(), updated_at: chrono::Utc::now(), state: nodus_catalog::DescriptorState::Public, data_type: "TEXT".into(), nullable: false },
+                ];
+                let rows = vec![
+                    vec![Value::Int(16), Value::Text("bool".into())],
+                    vec![Value::Int(23), Value::Text("int4".into())],
+                    vec![Value::Int(20), Value::Text("int8".into())],
+                    vec![Value::Int(25), Value::Text("text".into())],
+                    vec![Value::Int(1043), Value::Text("varchar".into())],
+                    vec![Value::Int(3802), Value::Text("jsonb".into())],
+                ];
+                Ok((cols, rows))
+            }
+            "tables" => {
+                let schemas = self.catalog_reader.list_schemas(db_name)?;
+                let tables = self.catalog_reader.list_all_tables(db_name)?;
+                let cols = vec![
+                    ColumnDescriptor { id: nodus_catalog::ColumnId::new(), name: "table_catalog".into(), version: 1, created_at: chrono::Utc::now(), updated_at: chrono::Utc::now(), state: nodus_catalog::DescriptorState::Public, data_type: "TEXT".into(), nullable: false },
+                    ColumnDescriptor { id: nodus_catalog::ColumnId::new(), name: "table_schema".into(), version: 1, created_at: chrono::Utc::now(), updated_at: chrono::Utc::now(), state: nodus_catalog::DescriptorState::Public, data_type: "TEXT".into(), nullable: false },
+                    ColumnDescriptor { id: nodus_catalog::ColumnId::new(), name: "table_name".into(), version: 1, created_at: chrono::Utc::now(), updated_at: chrono::Utc::now(), state: nodus_catalog::DescriptorState::Public, data_type: "TEXT".into(), nullable: false },
+                    ColumnDescriptor { id: nodus_catalog::ColumnId::new(), name: "table_type".into(), version: 1, created_at: chrono::Utc::now(), updated_at: chrono::Utc::now(), state: nodus_catalog::DescriptorState::Public, data_type: "TEXT".into(), nullable: false },
+                ];
+                let mut rows = Vec::new();
+                for t in tables {
+                    let mut nsp_name = "".to_string();
+                    for s in &schemas {
+                        if s.id == t.schema_id {
+                            nsp_name = s.name.clone();
+                            break;
+                        }
+                    }
+                    rows.push(vec![Value::Text(db_name.to_string()), Value::Text(nsp_name), Value::Text(t.name.clone()), Value::Text("BASE TABLE".into())]);
+                }
+                Ok((cols, rows))
+            }
+            "columns" => {
+                let schemas = self.catalog_reader.list_schemas(db_name)?;
+                let tables = self.catalog_reader.list_all_tables(db_name)?;
+                let cols = vec![
+                    ColumnDescriptor { id: nodus_catalog::ColumnId::new(), name: "table_catalog".into(), version: 1, created_at: chrono::Utc::now(), updated_at: chrono::Utc::now(), state: nodus_catalog::DescriptorState::Public, data_type: "TEXT".into(), nullable: false },
+                    ColumnDescriptor { id: nodus_catalog::ColumnId::new(), name: "table_schema".into(), version: 1, created_at: chrono::Utc::now(), updated_at: chrono::Utc::now(), state: nodus_catalog::DescriptorState::Public, data_type: "TEXT".into(), nullable: false },
+                    ColumnDescriptor { id: nodus_catalog::ColumnId::new(), name: "table_name".into(), version: 1, created_at: chrono::Utc::now(), updated_at: chrono::Utc::now(), state: nodus_catalog::DescriptorState::Public, data_type: "TEXT".into(), nullable: false },
+                    ColumnDescriptor { id: nodus_catalog::ColumnId::new(), name: "column_name".into(), version: 1, created_at: chrono::Utc::now(), updated_at: chrono::Utc::now(), state: nodus_catalog::DescriptorState::Public, data_type: "TEXT".into(), nullable: false },
+                    ColumnDescriptor { id: nodus_catalog::ColumnId::new(), name: "data_type".into(), version: 1, created_at: chrono::Utc::now(), updated_at: chrono::Utc::now(), state: nodus_catalog::DescriptorState::Public, data_type: "TEXT".into(), nullable: false },
+                ];
+                let mut rows = Vec::new();
+                for t in tables {
+                    let mut nsp_name = "".to_string();
+                    for s in &schemas {
+                        if s.id == t.schema_id {
+                            nsp_name = s.name.clone();
+                            break;
+                        }
+                    }
+                    for c in t.columns {
+                        rows.push(vec![Value::Text(db_name.to_string()), Value::Text(nsp_name.clone()), Value::Text(t.name.clone()), Value::Text(c.name), Value::Text(c.data_type)]);
+                    }
+                }
+                Ok((cols, rows))
+            }
+            _ => {
+                anyhow::bail!("Unsupported virtual table: {}", table_only)
+            }
+        }
+    }
+
     fn execute_logical_inner(
         &self,
         ctx: &ExecutionContext,
@@ -1559,9 +2259,13 @@ impl MemExecutor {
                     }
                 }
             }
-            LogicalPlan::CreateTable { name, columns } => {
-                let db = self.catalog_reader.get_database("default")?;
-                let sch = self.catalog_reader.get_schema("default", "public")?;
+            LogicalPlan::DropSchema { .. } => {
+                anyhow::bail!("DROP SCHEMA not yet supported")
+            }
+            LogicalPlan::CreateTable { name, columns, constraints } => {
+                let (db_name, schema_name, table_only) = parse_object_name(&name)?;
+                let db = self.catalog_reader.get_database(db_name)?;
+                let sch = self.catalog_reader.get_schema(db_name, schema_name)?;
                 self.authorize(ctx, Action::CreateTable, ResourceRef::Schema(sch.id))?;
                 let descriptors: Vec<_> = columns
                     .iter()
@@ -1588,8 +2292,10 @@ impl MemExecutor {
                     id: nodus_catalog::TableId::new(),
                     database_id: db.id,
                     schema_id: sch.id,
-                    name: name.clone(),
+                    name: table_only.to_string(),
                     columns: descriptors,
+                    constraints,
+                    view_query: None,
                 })?;
 
                 for col in unique_cols {
@@ -1622,6 +2328,15 @@ impl MemExecutor {
 
                 Ok(QueryOutput::tag("CREATE TABLE"))
             }
+            LogicalPlan::CreateView { .. } => {
+                anyhow::bail!("CREATE VIEW not yet supported")
+            }
+            LogicalPlan::DropView { .. } => {
+                anyhow::bail!("DROP VIEW not yet supported")
+            }
+            LogicalPlan::DropTable { .. } => {
+                anyhow::bail!("DROP TABLE not yet supported")
+            }
             LogicalPlan::Insert {
                 table_name,
                 columns,
@@ -1629,9 +2344,10 @@ impl MemExecutor {
 
                 returning,
             } => {
+                let (db_name, schema_name, table_only) = parse_object_name(&table_name)?;
                 let tbl = self
                     .catalog_reader
-                    .get_table("default", "public", &table_name)?;
+                    .get_table(db_name, schema_name, table_only)?;
                 self.authorize(ctx, Action::Insert, ResourceRef::Table(tbl.id))?;
 
                 let col_names: Vec<&str> = tbl.columns.iter().map(|c| c.name.as_str()).collect();
@@ -1668,6 +2384,7 @@ impl MemExecutor {
                     }
 
                     self.check_unique_constraints(&ctx.session_id, &tbl, &row, None)?;
+                    self.check_table_constraints(ctx, &tbl, &row, &col_names.iter().map(|s| s.to_string()).collect::<Vec<_>>())?;
 
                     // Primary key = first column's rendered value.
                     let pk = row.first().map(render).unwrap_or_default();
@@ -1726,7 +2443,9 @@ impl MemExecutor {
                 }
             }
             LogicalPlan::Select {
+                ctes,
                 table_name,
+                table_alias,
                 joins,
                 projection,
                 group_by,
@@ -1777,92 +2496,149 @@ impl MemExecutor {
                         tag: "SELECT 1".into(),
                     });
                 }
-                if table_name.to_lowercase().starts_with("pg_catalog.") || table_name.to_lowercase().starts_with("pg_stat_") || table_name.to_lowercase().starts_with("information_schema.") {
-                    let mut cols = Vec::new();
-                    let mut types = Vec::new();
-                    for proj in &projection {
-                        let col_name = match proj {
-                            ProjectionItem::Column(c) => c.clone(),
-                            ProjectionItem::AliasedColumn(_, a) => a.clone(),
-                            ProjectionItem::Aggregate(op, inner) => format!("{:?}({})", op, inner),
-                        };
-                        cols.push(col_name);
-                        types.push("VARCHAR".to_string());
-                    }
-                    if cols.is_empty() {
-                        cols.push("?column?".to_string());
-                        types.push("VARCHAR".to_string());
-                    }
-                    return Ok(QueryOutput {
-                        columns: cols,
-                        types,
-                        rows: vec![],
-                        tag: "SELECT 0".into(),
-                    });
+
+                let mut cte_results = std::collections::HashMap::new();
+                for (name, cte_plan) in ctes {
+                    let out = self.execute_logical_inner(ctx, *cte_plan)?;
+                    cte_results.insert(name, out);
                 }
 
-                let tbl = self
-                    .catalog_reader
-                    .get_table("default", "public", &table_name)?;
-                self.authorize(ctx, Action::Select, ResourceRef::Table(tbl.id))?;
+                let (tbl_cols, mut col_names, mut stored_rows) = if let Some(cte_out) = cte_results.get(&table_name) {
+                    let mut cols = Vec::new();
+                    for (i, c) in cte_out.columns.iter().enumerate() {
+                        let ty = cte_out.types.get(i).unwrap_or(&"VARCHAR".to_string()).clone();
+                        cols.push(ColumnDescriptor {
+                            id: nodus_catalog::ColumnId::new(),
+                            name: c.clone(),
+                            version: 1,
+                            created_at: chrono::Utc::now(),
+                            updated_at: chrono::Utc::now(),
+                            state: nodus_catalog::DescriptorState::Public,
+                            data_type: ty,
+                            nullable: true,
+                        });
+                    }
+                    let prefix = table_alias.as_deref().unwrap_or(&table_name);
+                    let col_names = cols.iter().map(|c| format!("{}.{}", prefix, c.name)).collect();
+                    (cols, col_names, Some(cte_out.rows.iter().map(|r| r.values.clone()).collect()))
+                } else {
+                    let (db_name, schema_name, table_only) = parse_object_name(&table_name)?;
+                    let (tbl_cols, col_names, rows) = if schema_name == "pg_catalog" {
+                        let (cols, rows) = self.get_virtual_table(db_name, table_only)?;
+                        let prefix = table_alias.as_deref().unwrap_or(&table_name);
+                        let col_names: Vec<String> = cols
+                            .iter()
+                            .map(|c| format!("{}.{}", prefix, c.name))
+                            .collect();
+                        (cols, col_names, rows)
+                    } else {
+                        let tbl = self
+                            .catalog_reader
+                            .get_table(db_name, schema_name, table_only)?;
+                        self.authorize(ctx, Action::Select, ResourceRef::Table(tbl.id))?;
 
-                let mut joined_columns = tbl.columns.clone();
-                let mut col_names: Vec<String> = tbl
-                    .columns
-                    .iter()
-                    .map(|c| format!("{}.{}", table_name, c.name))
-                    .collect();
-
-                let mut stored_rows = None;
-                if let Some(FilterExpr::Predicate(Predicate {
-                    left,
-                    op: CompareOp::Eq,
-                    right,
-                })) = filter.as_ref()
-                {
-                    let col_name = left.split('.').last().unwrap_or(left);
-                    if let Some(col) = tbl.columns.iter().find(|c| c.name == *col_name) {
-                        for idx in &tbl.indexes {
-                            if idx.key_columns.iter().any(|kc| kc.column_id == col.id) {
-                                let val = self.eval_operand(&[], &[], &[], right, &col.data_type);
-                                if let Ok(rows) =
-                                    self.index_scan(idx.id, &val, tbl.id, &ctx.session_id)
-                                {
-                                    stored_rows = Some(rows);
-                                    break;
+                        let prefix = table_alias.as_deref().unwrap_or(&table_name);
+                        let col_names: Vec<String> = tbl
+                            .columns
+                            .iter()
+                            .map(|c| format!("{}.{}", prefix, c.name))
+                            .collect();
+                        
+                        let mut rows = None;
+                        if let Some(FilterExpr::Predicate(Predicate {
+                            left,
+                            op: CompareOp::Eq,
+                            right,
+                        })) = filter.as_ref()
+                        {
+                            let col_name = left.split('.').last().unwrap_or(left);
+                            if let Some(col) = tbl.columns.iter().find(|c| c.name == *col_name) {
+                                for idx in &tbl.indexes {
+                                    if idx.key_columns.iter().any(|kc| kc.column_id == col.id) {
+                                        let val = self.eval_operand(&[], &[], &[], right, &col.data_type);
+                                        if let Ok(indexed_rows) =
+                                            self.index_scan(idx.id, &val, tbl.id, &ctx.session_id)
+                                        {
+                                            rows = Some(indexed_rows);
+                                            break;
+                                        }
+                                    }
                                 }
                             }
                         }
-                    }
-                }
-                let mut stored_rows = match stored_rows {
-                    Some(rows) => rows,
-                    None => self.scan_rows(tbl.id, &ctx.session_id)?,
+                        let rows = match rows {
+                            Some(r) => r,
+                            None => {
+                                if let Some(vq) = &tbl.view_query {
+                                    let plan: LogicalPlan = serde_json::from_str(vq)?;
+                                    let out = self.execute_logical_inner(ctx, plan)?;
+                                    out.rows.iter().map(|r| r.values.clone()).collect()
+                                } else {
+                                    self.scan_rows(tbl.id, &ctx.session_id)?
+                                }
+                            }
+                        };
+                        (tbl.columns.clone(), col_names, rows)
+                    };
+                    (tbl_cols, col_names, Some(rows))
                 };
+                
+                let mut joined_columns = tbl_cols;
+                let mut stored_rows = stored_rows.unwrap();
 
                 for join in &joins {
-                    let j_tbl =
-                        self.catalog_reader
-                            .get_table("default", "public", &join.table_name)?;
-                    self.authorize(ctx, Action::Select, ResourceRef::Table(j_tbl.id))?;
+                    let (j_cols, j_rows) = if let Some(cte_out) = cte_results.get(&join.table_name) {
+                        let mut cols = Vec::new();
+                        for (i, c) in cte_out.columns.iter().enumerate() {
+                            let ty = cte_out.types.get(i).unwrap_or(&"VARCHAR".to_string()).clone();
+                            cols.push(ColumnDescriptor {
+                                id: nodus_catalog::ColumnId::new(),
+                                name: c.clone(),
+                                version: 1,
+                                created_at: chrono::Utc::now(),
+                                updated_at: chrono::Utc::now(),
+                                state: nodus_catalog::DescriptorState::Public,
+                                data_type: ty,
+                                nullable: true,
+                            });
+                        }
+                        (cols, cte_out.rows.iter().map(|r| r.values.clone()).collect())
+                    } else {
+                        let (j_db, j_sch, j_tbl_name) = parse_object_name(&join.table_name)?;
+                        if j_sch == "pg_catalog" {
+                            let (cols, rows) = self.get_virtual_table(j_db, j_tbl_name)?;
+                            (cols, rows)
+                        } else {
+                            let j_tbl = self.catalog_reader.get_table(j_db, j_sch, j_tbl_name)?;
+                            self.authorize(ctx, Action::Select, ResourceRef::Table(j_tbl.id))?;
+                            let j_rows = if let Some(vq) = &j_tbl.view_query {
+                                let plan: LogicalPlan = serde_json::from_str(vq)?;
+                                let out = self.execute_logical_inner(ctx, plan)?;
+                                out.rows.iter().map(|r| r.values.clone()).collect()
+                            } else {
+                                self.scan_rows(j_tbl.id, &ctx.session_id)?
+                            };
+                            (j_tbl.columns.clone(), j_rows)
+                        }
+                    };
 
-                    let j_rows = self.scan_rows(j_tbl.id, &ctx.session_id)?;
-                    let j_col_names: Vec<String> = j_tbl
-                        .columns
+                    let j_prefix = join.table_alias.as_deref().unwrap_or(&join.table_name);
+                    let j_col_names: Vec<String> = j_cols
                         .iter()
-                        .map(|c| format!("{}.{}", join.table_name, c.name))
+                        .map(|c| format!("{}.{}", j_prefix, c.name))
                         .collect();
 
                     let mut combined_cols = col_names.clone();
                     combined_cols.extend(j_col_names.clone());
 
                     let mut combined_desc = joined_columns.clone();
-                    combined_desc.extend(j_tbl.columns.clone());
+                    combined_desc.extend(j_cols.clone());
 
                     let mut next_rows = Vec::new();
+                    let mut right_matched = vec![false; j_rows.len()];
                     for r1 in &stored_rows {
                         let mut matched = false;
-                        for r2 in &j_rows {
+                        for (j_idx, r2) in j_rows.iter().enumerate() {
                             let mut combined_row = r1.clone();
                             combined_row.extend(r2.clone());
                             if self.eval_filter(
@@ -1874,14 +2650,25 @@ impl MemExecutor {
                             ).unwrap_or(false) {
                                 next_rows.push(combined_row);
                                 matched = true;
+                                right_matched[j_idx] = true;
                             }
                         }
-                        if !matched && matches!(join.join_type, JoinType::LeftOuter) {
+                        if !matched && matches!(join.join_type, JoinType::LeftOuter | JoinType::FullOuter) {
                             let mut combined_row = r1.clone();
-                            // Left join requires filling the right side with NULLs
-                            let num_nulls = j_tbl.columns.len();
+                            // Left or Full join requires filling the right side with NULLs
+                            let num_nulls = j_cols.len();
                             combined_row.extend(vec![Value::Null; num_nulls]);
                             next_rows.push(combined_row);
+                        }
+                    }
+                    if matches!(join.join_type, JoinType::RightOuter | JoinType::FullOuter) {
+                        let left_len = col_names.len();
+                        for (j_idx, matched) in right_matched.into_iter().enumerate() {
+                            if !matched {
+                                let mut combined_row = vec![Value::Null; left_len];
+                                combined_row.extend(j_rows[j_idx].clone());
+                                next_rows.push(combined_row);
+                            }
                         }
                     }
                     stored_rows = next_rows;
@@ -1972,9 +2759,14 @@ impl MemExecutor {
                                         group_rows
                                             .first()
                                             .and_then(|r| idx.and_then(|i| r.get(i)))
-                                            .cloned()
+                                            .map(|v| v.clone())
                                             .unwrap_or(crate::Value::Null),
                                     );
+                                }
+                                ProjectionItem::WindowFunction { .. } 
+                                | ProjectionItem::ScalarFunction { .. }
+                                | ProjectionItem::JsonAccess { .. } => {
+                                    out_row.push(Value::Null); // MVP fallback
                                 }
                                 ProjectionItem::Aggregate(op, inner) => {
                                     let mut idx = col_names.iter().position(|tc| {
@@ -2011,7 +2803,7 @@ impl MemExecutor {
                                                     match v {
                                                         Value::Int(n) => {
                                                             if is_float {
-                                                                sum_float += *n as f64
+                                                                sum_float += (*n) as f64
                                                             } else {
                                                                 sum_int += n
                                                             }
@@ -2041,7 +2833,7 @@ impl MemExecutor {
                                                 if let Some(v) = idx.and_then(|i| r.get(i)) {
                                                     if !matches!(v, Value::Null) {
                                                         if let Some(cur) = &min_val {
-                                                            if compare(v, cur)
+                                                            if compare(&v, cur)
                                                                 == std::cmp::Ordering::Less
                                                             {
                                                                 min_val = Some(v.clone());
@@ -2060,7 +2852,7 @@ impl MemExecutor {
                                                 if let Some(v) = idx.and_then(|i| r.get(i)) {
                                                     if !matches!(v, Value::Null) {
                                                         if let Some(cur) = &max_val {
-                                                            if compare(v, cur)
+                                                            if compare(&v, cur)
                                                                 == std::cmp::Ordering::Greater
                                                             {
                                                                 max_val = Some(v.clone());
@@ -2086,8 +2878,11 @@ impl MemExecutor {
                         projection
                             .iter()
                             .map(|p| match p {
-                                ProjectionItem::Column(c) => c.clone(),
+                                ProjectionItem::Column(c) => c.split('.').last().unwrap_or(c).to_string(),
                                 ProjectionItem::AliasedColumn(_, a) => a.clone(),
+                                ProjectionItem::WindowFunction { func_name, alias, .. } => alias.clone().unwrap_or_else(|| func_name.clone()),
+                            ProjectionItem::ScalarFunction { func_name, alias, .. } => alias.clone().unwrap_or_else(|| func_name.clone()),
+                            ProjectionItem::JsonAccess { left, operator, right, alias } => alias.clone().unwrap_or_else(|| format!("{}{}{}", left, operator, right)),
                                 ProjectionItem::Aggregate(op, inner) => {
                                     format!("{:?}({})", op, inner)
                                 }
@@ -2096,17 +2891,143 @@ impl MemExecutor {
                     };
                 } else {
                     out_cols = if projection.is_empty() {
-                        col_names.clone()
+                        col_names.iter().map(|c| c.split('.').last().unwrap_or(c).to_string()).collect()
                     } else {
                         projection
                             .iter()
                             .filter_map(|p| match p {
-                                ProjectionItem::Column(c) => Some(c.clone()),
+                                ProjectionItem::Column(c) => Some(c.split('.').last().unwrap_or(c).to_string()),
                                 ProjectionItem::AliasedColumn(_, a) => Some(a.clone()),
+                                ProjectionItem::WindowFunction { alias, func_name, .. } => Some(alias.clone().unwrap_or_else(|| func_name.clone())),
+                                ProjectionItem::ScalarFunction { alias, func_name, .. } => Some(alias.clone().unwrap_or_else(|| func_name.clone())),
+                                ProjectionItem::JsonAccess { left, operator, right, alias } => Some(alias.clone().unwrap_or_else(|| format!("{}{}{}", left, operator, right))),
                                 _ => None,
                             })
                             .collect()
                     };
+
+                    // Evaluate Window Functions and Scalar Expressions before projecting
+                    for proj_item in projection.iter() {
+                        match proj_item {
+                            ProjectionItem::WindowFunction { func_name, partition_by, order_by: w_order_by, alias } => {
+                                let p_indices: Vec<usize> = partition_by.iter().filter_map(|c| {
+                                    col_names.iter().position(|tc| tc == c || tc.ends_with(&format!(".{}", c)))
+                                }).collect();
+                                
+                                let o_indices: Vec<(usize, bool)> = w_order_by.iter().filter_map(|(c, asc)| {
+                                    col_names.iter().position(|tc| tc == c || tc.ends_with(&format!(".{}", c))).map(|idx| (idx, *asc))
+                                }).collect();
+
+                                let mut row_indices: Vec<usize> = (0..stored_rows.len()).collect();
+                                row_indices.sort_by(|&a_idx, &b_idx| {
+                                    let a = &stored_rows[a_idx];
+                                    let b = &stored_rows[b_idx];
+                                    for &p_idx in &p_indices {
+                                        let cmp = compare(a.get(p_idx).unwrap_or(&Value::Null), b.get(p_idx).unwrap_or(&Value::Null));
+                                        if cmp != std::cmp::Ordering::Equal {
+                                            return cmp;
+                                        }
+                                    }
+                                    for &(o_idx, asc) in &o_indices {
+                                        let mut cmp = compare(a.get(o_idx).unwrap_or(&Value::Null), b.get(o_idx).unwrap_or(&Value::Null));
+                                        if !asc {
+                                            cmp = cmp.reverse();
+                                        }
+                                        if cmp != std::cmp::Ordering::Equal {
+                                            return cmp;
+                                        }
+                                    }
+                                    std::cmp::Ordering::Equal
+                                });
+
+                                let mut results = vec![Value::Null; stored_rows.len()];
+                                if func_name == "ROW_NUMBER" {
+                                    let mut current_partition: Vec<Value> = Vec::new();
+                                    let mut row_num = 1i64;
+                                    for &row_idx in &row_indices {
+                                        let row = &stored_rows[row_idx];
+                                        let partition_key: Vec<Value> = p_indices.iter().map(|&idx| row.get(idx).unwrap_or(&Value::Null).clone()).collect();
+                                        if partition_key != current_partition {
+                                            current_partition = partition_key;
+                                            row_num = 1;
+                                        }
+                                        results[row_idx] = Value::Int(row_num);
+                                        row_num += 1;
+                                    }
+                                } else {
+                                    anyhow::bail!("Unsupported window function: {}", func_name);
+                                }
+
+                                // Append the result to `stored_rows`
+                                for (row_idx, row) in stored_rows.iter_mut().enumerate() {
+                                    row.push(results[row_idx].clone());
+                                }
+                                let w_col_name = alias.clone().unwrap_or_else(|| func_name.clone());
+                                col_names.push(w_col_name);
+                            }
+                            ProjectionItem::ScalarFunction { func_name, args, alias } => {
+                                let mut results = vec![Value::Null; stored_rows.len()];
+                                for (row_idx, row) in stored_rows.iter().enumerate() {
+                                    if func_name == "CONCAT" {
+                                        let mut s = String::new();
+                                        for arg in args {
+                                            if arg.starts_with('\'') && arg.ends_with('\'') {
+                                                s.push_str(&arg[1..arg.len()-1]);
+                                            } else {
+                                                let c_idx = col_names.iter().position(|tc| tc == arg || tc.ends_with(&format!(".{}", arg)));
+                                                if let Some(i) = c_idx {
+                                                    if let Some(v) = row.get(i) {
+                                                        if *v != Value::Null {
+                                                            s.push_str(&render(v));
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        results[row_idx] = Value::Text(s);
+                                    }
+                                }
+                                for (row_idx, row) in stored_rows.iter_mut().enumerate() {
+                                    row.push(results[row_idx].clone());
+                                }
+                                let w_col_name = alias.clone().unwrap_or_else(|| func_name.clone());
+                                col_names.push(w_col_name);
+                            }
+                            ProjectionItem::JsonAccess { left, operator, right, alias } => {
+                                let mut results = vec![Value::Null; stored_rows.len()];
+                                for (row_idx, row) in stored_rows.iter().enumerate() {
+                                    let c_idx = col_names.iter().position(|tc| tc == left || tc.ends_with(&format!(".{}", left)));
+                                    if let Some(i) = c_idx {
+                                        if let Some(v) = row.get(i) {
+                                            if operator == "->>" {
+                                                let json_str = match v {
+                                                    Value::Jsonb(j) => j.to_string(),
+                                                    Value::Text(s) => s.clone(),
+                                                    _ => "".to_string(),
+                                                };
+                                                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&json_str) {
+                                                    if let Some(obj) = json.as_object() {
+                                                        if let Some(val) = obj.get(right) {
+                                                            results[row_idx] = match val {
+                                                                serde_json::Value::String(s) => Value::Text(s.clone()),
+                                                                _ => Value::Text(val.to_string()),
+                                                            };
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                for (row_idx, row) in stored_rows.iter_mut().enumerate() {
+                                    row.push(results[row_idx].clone());
+                                }
+                                let w_col_name = alias.clone().unwrap_or_else(|| format!("{}{}{}", left, operator, right));
+                                col_names.push(w_col_name);
+                            }
+                            _ => {}
+                        }
+                    }
 
                     let indices: Vec<Option<usize>> = out_cols
                         .iter()
@@ -2116,11 +3037,14 @@ impl MemExecutor {
                                 col_names.iter().position(|tc| tc == c || tc.ends_with(&format!(".{}", c)))
                             } else {
                                 let actual_col = match &projection[pi] {
-                                    ProjectionItem::Column(c) => c,
-                                    ProjectionItem::AliasedColumn(c, _) => c,
-                                    _ => c,
+                                    ProjectionItem::Column(c) => c.clone(),
+                                    ProjectionItem::AliasedColumn(c, _) => c.clone(),
+                                    ProjectionItem::WindowFunction { func_name, alias, .. } => alias.clone().unwrap_or_else(|| func_name.clone()),
+                            ProjectionItem::ScalarFunction { func_name, alias, .. } => alias.clone().unwrap_or_else(|| func_name.clone()),
+                            ProjectionItem::JsonAccess { left, operator, right, alias } => alias.clone().unwrap_or_else(|| format!("{}{}{}", left, operator, right)),
+                                    _ => c.clone(),
                                 };
-                                col_names.iter().position(|tc| tc == actual_col || tc.ends_with(&format!(".{}", actual_col)))
+                                col_names.iter().position(|tc| tc == &actual_col || tc.ends_with(&format!(".{}", actual_col)))
                             }
                         })
                         .collect();
@@ -2211,7 +3135,8 @@ impl MemExecutor {
                 for c in &out_cols {
                     // Quick lookup for type. Default to VARCHAR.
                     let mut ty = "VARCHAR".to_string();
-                    if let Ok(tbl_desc) = self.catalog_reader.get_table("default", "public", &table_name) {
+                    let (db_name, schema_name, table_only) = parse_object_name(&table_name).unwrap_or(("default", "public", &table_name));
+                    if let Ok(tbl_desc) = self.catalog_reader.get_table(db_name, schema_name, table_only) {
                         if let Some(col_desc) = tbl_desc.columns.iter().find(|x| x.name == *c || format!("{}.{}", table_name, x.name) == *c) {
                             ty = col_desc.data_type.clone();
                         }
@@ -2229,12 +3154,12 @@ impl MemExecutor {
                 table_name,
                 assignments,
                 filter,
-
                 returning,
             } => {
+                let (db_name, schema_name, table_only) = parse_object_name(&table_name)?;
                 let tbl = self
                     .catalog_reader
-                    .get_table("default", "public", &table_name)?;
+                    .get_table(db_name, schema_name, table_only)?;
                 self.authorize(ctx, Action::Update, ResourceRef::Table(tbl.id))?;
                 let col_names: Vec<&str> = tbl.columns.iter().map(|c| c.name.as_str()).collect();
 
@@ -2264,6 +3189,7 @@ impl MemExecutor {
 
                     let pk_str = row.first().map(render).unwrap_or_default();
                     self.check_unique_constraints(&ctx.session_id, &tbl, &row, Some(&pk_str))?;
+                    self.check_table_constraints(ctx, &tbl, &row, &col_names.iter().map(|s| s.to_string()).collect::<Vec<_>>())?;
 
                     let new_key = format!("{}:{}", tbl.id, pk_str);
                     self.write_row(
@@ -2341,9 +3267,10 @@ impl MemExecutor {
                 filter,
                 returning,
             } => {
+                let (db_name, schema_name, table_only) = parse_object_name(&table_name)?;
                 let tbl = self
                     .catalog_reader
-                    .get_table("default", "public", &table_name)?;
+                    .get_table(db_name, schema_name, table_only)?;
                 self.authorize(ctx, Action::Delete, ResourceRef::Table(tbl.id))?;
 
                 let mut deleted = 0;
@@ -2414,9 +3341,10 @@ impl MemExecutor {
                 table_name,
                 operation,
             } => {
+                let (db_name, schema_name, table_only) = parse_object_name(&table_name)?;
                 let tbl = self
                     .catalog_reader
-                    .get_table("default", "public", &table_name)?;
+                    .get_table(db_name, schema_name, table_only)?;
                 self.authorize(ctx, Action::CreateTable, ResourceRef::Table(tbl.id))?;
 
                 let change = match operation {
@@ -2474,6 +3402,13 @@ impl MemExecutor {
                             column_name: name,
                         }
                     }
+                    AlterTableOp::RenameColumn { old_name, new_name } => {
+                        nodus_catalog::TableDescriptorChange::RenameColumn {
+                            table_id: tbl.id,
+                            old_name,
+                            new_name,
+                        }
+                    }
                     AlterTableOp::RenameTable { new_name } => {
                         nodus_catalog::TableDescriptorChange::RenameTable {
                             table_id: tbl.id,
@@ -2490,9 +3425,10 @@ impl MemExecutor {
                 columns,
                 unique,
             } => {
+                let (db_name, schema_name, table_only) = parse_object_name(&table_name)?;
                 let tbl = self
                     .catalog_reader
-                    .get_table("default", "public", &table_name)?;
+                    .get_table(db_name, schema_name, table_only)?;
                 self.authorize(ctx, Action::CreateTable, ResourceRef::Table(tbl.id))?;
 
                 let mut index_cols = Vec::new();
@@ -2571,6 +3507,15 @@ impl MemExecutor {
                     nodus_catalog::IndexState::Ready,
                 )?;
                 Ok(QueryOutput::tag("CREATE INDEX"))
+            }
+            LogicalPlan::CreateRole { .. } => {
+                anyhow::bail!("CREATE ROLE not yet supported")
+            }
+            LogicalPlan::Grant { .. } => {
+                anyhow::bail!("GRANT not yet supported")
+            }
+            LogicalPlan::Revoke { .. } => {
+                anyhow::bail!("REVOKE not yet supported")
             }
             LogicalPlan::Begin => {
                 let txn_record = self.txn.begin_txn()?;
@@ -2796,7 +3741,7 @@ fn render_row(row: &Row) -> Vec<String> {
         let all = exec
             .execute_logical(
                 &ctx,
-                LogicalPlan::Select {
+                LogicalPlan::Select { ctes: vec![],
                     group_by: vec![],
                     table_name: "books".into(),
                     joins: vec![],
@@ -2817,7 +3762,7 @@ fn render_row(row: &Row) -> Vec<String> {
         let one = exec
             .execute_logical(
                 &ctx,
-                LogicalPlan::Select {
+                LogicalPlan::Select { ctes: vec![],
                     group_by: vec![],
                     table_name: "books".into(),
                     joins: vec![],
@@ -2887,7 +3832,7 @@ fn render_row(row: &Row) -> Vec<String> {
         let out = exec
             .execute_logical(
                 &ctx,
-                LogicalPlan::Select {
+                LogicalPlan::Select { ctes: vec![],
                     group_by: vec![],
                     table_name: "items".into(),
                     joins: vec![],
@@ -2966,7 +3911,7 @@ fn render_row(row: &Row) -> Vec<String> {
         let read = |filter: Option<FilterExpr>| {
             exec.execute_logical(
                 &ctx,
-                LogicalPlan::Select {
+                LogicalPlan::Select { ctes: vec![],
                     group_by: vec![],
                     table_name: "t".into(),
                     joins: vec![],
@@ -3076,7 +4021,7 @@ fn render_row(row: &Row) -> Vec<String> {
             .unwrap();
         }
 
-        let join_plan = LogicalPlan::Select {
+        let join_plan = LogicalPlan::Select { ctes: vec![],
             group_by: vec![],
             table_name: "books".into(),
             joins: vec![Join {
@@ -3172,7 +4117,7 @@ fn render_row(row: &Row) -> Vec<String> {
         let read = |ctx: &ExecutionContext| {
             exec.execute_logical(
                 ctx,
-                LogicalPlan::Select {
+                LogicalPlan::Select { ctes: vec![],
                     group_by: vec![],
                     table_name: "t".into(),
                     joins: vec![],
@@ -3455,7 +4400,7 @@ mod phase1_tests {
                 let out = exec
                     .execute_logical(
                         &ctx,
-                        LogicalPlan::Select {
+                        LogicalPlan::Select { ctes: vec![],
                             group_by: vec![],
                             table_name: "t".into(),
                             joins: vec![],
@@ -3792,7 +4737,7 @@ fn render_row(row: &Row) -> Vec<String> {
         )
         .unwrap();
 
-        let subquery = LogicalPlan::Select {
+        let subquery = LogicalPlan::Select { ctes: vec![],
             group_by: vec![],
             table_name: "departments".into(),
             joins: vec![],
@@ -3816,7 +4761,7 @@ fn render_row(row: &Row) -> Vec<String> {
         let out = exec
             .execute_logical(
                 &ctx,
-                LogicalPlan::Select {
+                LogicalPlan::Select { ctes: vec![],
                     group_by: vec![],
                     table_name: "staff".into(),
                     joins: vec![],
@@ -4039,7 +4984,7 @@ fn render_row(row: &Row) -> Vec<String> {
         let out = exec
             .execute_logical(
                 &ctx,
-                LogicalPlan::Select {
+                LogicalPlan::Select { ctes: vec![],
                     table_name: "products".into(),
                     joins: vec![],
                     projection: vec![ProjectionItem::Column("id".into())],
@@ -4082,7 +5027,7 @@ fn render_row(row: &Row) -> Vec<String> {
         let out_a = exec
             .execute_logical(
                 &ctx,
-                LogicalPlan::Select {
+                LogicalPlan::Select { ctes: vec![],
                     table_name: "products".into(),
                     joins: vec![],
                     projection: vec![ProjectionItem::Column("id".into())],
@@ -4105,7 +5050,7 @@ fn render_row(row: &Row) -> Vec<String> {
         let out_b = exec
             .execute_logical(
                 &ctx,
-                LogicalPlan::Select {
+                LogicalPlan::Select { ctes: vec![],
                     table_name: "products".into(),
                     joins: vec![],
                     projection: vec![ProjectionItem::Column("id".into())],
@@ -4143,7 +5088,7 @@ fn render_row(row: &Row) -> Vec<String> {
         let out_b2 = exec
             .execute_logical(
                 &ctx,
-                LogicalPlan::Select {
+                LogicalPlan::Select { ctes: vec![],
                     table_name: "products".into(),
                     joins: vec![],
                     projection: vec![ProjectionItem::Column("id".into())],
@@ -4236,7 +5181,7 @@ fn render_row(row: &Row) -> Vec<String> {
         let out1 = exec
             .execute_logical(
                 &ctx,
-                LogicalPlan::Select {
+                LogicalPlan::Select { ctes: vec![],
                     table_name: "users".into(),
                     joins: vec![],
                     projection: vec![],
@@ -4267,7 +5212,7 @@ fn render_row(row: &Row) -> Vec<String> {
         let out2 = exec
             .execute_logical(
                 &ctx,
-                LogicalPlan::Select {
+                LogicalPlan::Select { ctes: vec![],
                     table_name: "users".into(),
                     joins: vec![],
                     projection: vec![],
@@ -4295,7 +5240,7 @@ fn render_row(row: &Row) -> Vec<String> {
         let out3 = exec
             .execute_logical(
                 &ctx,
-                LogicalPlan::Select {
+                LogicalPlan::Select { ctes: vec![],
                     table_name: "users".into(),
                     joins: vec![],
                     projection: vec![],

@@ -73,6 +73,36 @@ impl CatalogWriter for RaftCatalogWriter {
         self.reader.get_table_by_id(id)
     }
 
+    fn drop_table(&self, id: TableId) -> Result<()> {
+        let cmd = ShardCommand::DropTable(id);
+        let res = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                let raft = self.get_raft().await?;
+                raft.client_write(cmd).await.map_err(|e| anyhow::anyhow!("raft write error: {}", e))
+            })
+        });
+        if let Err(e) = res {
+            tracing::error!("drop_table client_write failed: {}", e);
+            anyhow::bail!("drop_table raft error: {}", e);
+        }
+        Ok(())
+    }
+
+    fn drop_schema(&self, id: SchemaId) -> Result<()> {
+        let cmd = ShardCommand::DropSchema(id);
+        let res = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                let raft = self.get_raft().await?;
+                raft.client_write(cmd).await.map_err(|e| anyhow::anyhow!("raft write error: {}", e))
+            })
+        });
+        if let Err(e) = res {
+            tracing::error!("drop_schema client_write failed: {}", e);
+            anyhow::bail!("drop_schema raft error: {}", e);
+        }
+        Ok(())
+    }
+
     fn grant_privileges(&self, request: GrantPrivilegesRequest) -> Result<GrantDescriptor> {
         let id = request.id;
         let cmd = ShardCommand::GrantPrivileges(request.clone());
@@ -107,6 +137,7 @@ impl CatalogWriter for RaftCatalogWriter {
         let table_id = match &change {
             TableDescriptorChange::AddColumn { table_id, .. } => *table_id,
             TableDescriptorChange::RenameTable { table_id, .. } => *table_id,
+            TableDescriptorChange::RenameColumn { table_id, .. } => *table_id,
             TableDescriptorChange::DropColumn { table_id, .. } => *table_id,
             TableDescriptorChange::AddIndex { table_id, .. } => *table_id,
         };
