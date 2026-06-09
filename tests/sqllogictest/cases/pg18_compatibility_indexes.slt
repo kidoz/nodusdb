@@ -1,0 +1,37 @@
+# PostgreSQL 18 Compatibility Suite
+# Focus: Schema Objects (Indexes)
+
+statement ok
+CREATE SCHEMA pg18_indexes;
+
+statement ok
+CREATE TABLE pg18_indexes.base_table (id INT PRIMARY KEY, val TEXT, category TEXT);
+
+statement ok
+INSERT INTO pg18_indexes.base_table VALUES (1, 'A', 'CAT1'), (2, 'B', 'CAT1'), (3, 'C', 'CAT2');
+
+# Create a secondary index
+statement ok
+CREATE INDEX idx_category ON pg18_indexes.base_table (category);
+
+# Query utilizing the index implicitly (or at least checking syntax works)
+query ITT
+SELECT * FROM pg18_indexes.base_table WHERE category = 'CAT1' ORDER BY id;
+----
+1 A CAT1
+2 B CAT1
+
+# Create a unique index
+statement ok
+CREATE UNIQUE INDEX idx_val_unique ON pg18_indexes.base_table (val);
+
+# Attempting to insert a duplicate value should fail if unique index is enforced
+statement error
+INSERT INTO pg18_indexes.base_table VALUES (4, 'A', 'CAT3');
+
+# Clean up
+statement ok
+DROP TABLE pg18_indexes.base_table;
+
+statement ok
+DROP SCHEMA pg18_indexes;
