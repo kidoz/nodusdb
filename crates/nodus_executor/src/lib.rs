@@ -203,6 +203,10 @@ pub enum AlterTableOp {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum LogicalPlan {
+    CreateSchema {
+        schema_name: String,
+        if_not_exists: bool,
+    },
     CreateTable {
         name: String,
         columns: Vec<ColumnDef>,
@@ -318,7 +322,18 @@ pub fn expr_to_value(expr: &sqlparser::ast::Expr, params: &[crate::Value]) -> Op
 pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Result<LogicalPlan> {
     use sqlparser::ast::*;
     match stmt {
+        Statement::CreateSchema { schema_name, if_not_exists } => {
+            let name = match schema_name {
+                sqlparser::ast::SchemaName::Simple(name) => name.to_string(),
+                _ => anyhow::bail!("Unsupported schema name format"),
+            };
+            Ok(LogicalPlan::CreateSchema {
+                schema_name: name,
+                if_not_exists: *if_not_exists,
+            })
+        }
         Statement::CreateTable { name, columns, .. } => {
+            let table_name = name.0.last().map(|i| i.value.clone()).unwrap_or_else(|| name.to_string());
             let mut cols = Vec::new();
             for c in columns {
                 let mut nullable = true;
@@ -343,7 +358,7 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                 });
             }
             Ok(LogicalPlan::CreateTable {
-                name: name.to_string(),
+                name: table_name,
                 columns: cols,
             })
         }
@@ -1479,6 +1494,26 @@ impl MemExecutor {
         plan: LogicalPlan,
     ) -> Result<QueryOutput> {
         match plan {
+            LogicalPlan::CreateSchema { schema_name, if_not_exists } => {
+                let db = self.catalog_reader.get_database("default")?;
+                self.authorize(ctx, Action::CreateSchema, ResourceRef::Database(db.id))?;
+                match self.catalog_writer.create_schema(nodus_catalog::CreateSchemaRequest {
+                    id: nodus_catalog::SchemaId::new(),
+                    database_id: db.id,
+                    name: schema_name,
+                    owner_role_id: None,
+                    managed_access: false,
+                }) {
+                    Ok(_) => Ok(QueryOutput::tag("CREATE SCHEMA")),
+                    Err(e) => {
+                        if if_not_exists && e.to_string().contains("already exists") {
+                            Ok(QueryOutput::tag("CREATE SCHEMA"))
+                        } else {
+                            Err(anyhow::anyhow!(e))
+                        }
+                    }
+                }
+            }
             LogicalPlan::CreateTable { name, columns } => {
                 let db = self.catalog_reader.get_database("default")?;
                 let sch = self.catalog_reader.get_schema("default", "public")?;
