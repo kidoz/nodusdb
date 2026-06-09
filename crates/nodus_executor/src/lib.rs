@@ -2259,8 +2259,22 @@ impl MemExecutor {
                     }
                 }
             }
-            LogicalPlan::DropSchema { .. } => {
-                anyhow::bail!("DROP SCHEMA not yet supported")
+            LogicalPlan::DropSchema { schema_name, if_exists, cascade: _ } => {
+                let db_name = "default";
+                match self.catalog_reader.get_schema(db_name, &schema_name) {
+                    Ok(sch) => {
+                        self.authorize(ctx, Action::CreateSchema, ResourceRef::Schema(sch.id))?;
+                        self.catalog_writer.drop_schema(sch.id)?;
+                        Ok(QueryOutput::tag("DROP SCHEMA"))
+                    }
+                    Err(e) => {
+                        if if_exists {
+                            Ok(QueryOutput::tag("DROP SCHEMA"))
+                        } else {
+                            Err(anyhow::anyhow!(e))
+                        }
+                    }
+                }
             }
             LogicalPlan::CreateTable { name, columns, constraints } => {
                 let (db_name, schema_name, table_only) = parse_object_name(&name)?;
@@ -2331,11 +2345,42 @@ impl MemExecutor {
             LogicalPlan::CreateView { .. } => {
                 anyhow::bail!("CREATE VIEW not yet supported")
             }
-            LogicalPlan::DropView { .. } => {
-                anyhow::bail!("DROP VIEW not yet supported")
+            LogicalPlan::DropView { name, if_exists } => {
+                let (db_name, schema_name, view_only) = parse_object_name(&name)?;
+                match self.catalog_reader.get_table(db_name, schema_name, view_only) {
+                    Ok(tbl) => {
+                        self.authorize(ctx, Action::CreateTable, ResourceRef::Table(tbl.id))?;
+                        if tbl.view_query.is_none() {
+                            anyhow::bail!("{} is not a view", name);
+                        }
+                        self.catalog_writer.drop_table(tbl.id)?;
+                        Ok(QueryOutput::tag("DROP VIEW"))
+                    }
+                    Err(e) => {
+                        if if_exists {
+                            Ok(QueryOutput::tag("DROP VIEW"))
+                        } else {
+                            Err(anyhow::anyhow!(e))
+                        }
+                    }
+                }
             }
-            LogicalPlan::DropTable { .. } => {
-                anyhow::bail!("DROP TABLE not yet supported")
+            LogicalPlan::DropTable { name, if_exists } => {
+                let (db_name, schema_name, table_only) = parse_object_name(&name)?;
+                match self.catalog_reader.get_table(db_name, schema_name, table_only) {
+                    Ok(tbl) => {
+                        self.authorize(ctx, Action::CreateTable, ResourceRef::Table(tbl.id))?;
+                        self.catalog_writer.drop_table(tbl.id)?;
+                        Ok(QueryOutput::tag("DROP TABLE"))
+                    }
+                    Err(e) => {
+                        if if_exists {
+                            Ok(QueryOutput::tag("DROP TABLE"))
+                        } else {
+                            Err(anyhow::anyhow!(e))
+                        }
+                    }
+                }
             }
             LogicalPlan::Insert {
                 table_name,
