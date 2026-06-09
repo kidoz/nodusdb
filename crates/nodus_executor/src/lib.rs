@@ -263,6 +263,10 @@ pub enum LogicalPlan {
     ShowVariable {
         variable: String,
     },
+    SetVariable {
+        variable: String,
+        value: String,
+    },
     SelectLiteral {
         value: String,
     },
@@ -479,6 +483,14 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                 .collect::<Vec<_>>()
                 .join(".");
             Ok(LogicalPlan::ShowVariable { variable: var_name })
+        }
+        Statement::SetVariable { variable, value, .. } => {
+            let var_name = variable.to_string();
+            let var_val = value.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(" ");
+            Ok(LogicalPlan::SetVariable {
+                variable: var_name,
+                value: var_val,
+            })
         }
         _ => anyhow::bail!("Unsupported SQL statement: {:?}", stmt),
     }
@@ -2515,6 +2527,10 @@ impl MemExecutor {
                     }],
                     tag: "SHOW".into(),
                 })
+            }
+            LogicalPlan::SetVariable { variable, value: _ } => {
+                // Acknowledging SET requests to support clients like JDBC
+                Ok(QueryOutput::tag("SET"))
             }
             LogicalPlan::SelectLiteral { value } => {
                 let rendered = if value.eq_ignore_ascii_case("version") {
