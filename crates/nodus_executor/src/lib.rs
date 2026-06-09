@@ -183,6 +183,7 @@ pub enum AggregateOp {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum ProjectionItem {
     Column(String),
+    AliasedColumn(String, String),
     Aggregate(AggregateOp, String),
 }
 
@@ -621,6 +622,7 @@ fn extract_col_name(expr: &sqlparser::ast::Expr) -> Option<String> {
                 .collect::<Vec<_>>()
                 .join("."),
         ),
+        Expr::Cast { expr, .. } => extract_col_name(expr),
         _ => None,
     }
 }
@@ -709,65 +711,78 @@ fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Result<Logical
                 projection.clear();
                 break;
             }
-            SelectItem::UnnamedExpr(Expr::Identifier(id)) => {
-                projection.push(ProjectionItem::Column(id.value.clone()))
-            }
-            SelectItem::ExprWithAlias {
-                expr: Expr::Identifier(id),
-                ..
-            } => projection.push(ProjectionItem::Column(id.value.clone())),
-            SelectItem::UnnamedExpr(Expr::Function(func)) => {
-                let fname = func.name.to_string().to_uppercase();
-                let op = match fname.as_str() {
-                    "COUNT" => AggregateOp::Count,
-                    "SUM" => AggregateOp::Sum,
-                    "MIN" => AggregateOp::Min,
-                    "MAX" => AggregateOp::Max,
-                    _ => anyhow::bail!("Unsupported aggregate function: {}", fname),
-                };
-                let inner = if let Some(arg) = func.args.first() {
-                    match arg {
-                        sqlparser::ast::FunctionArg::Unnamed(
-                            sqlparser::ast::FunctionArgExpr::Expr(Expr::Identifier(id)),
-                        ) => id.value.clone(),
-                        sqlparser::ast::FunctionArg::Unnamed(
-                            sqlparser::ast::FunctionArgExpr::Wildcard,
-                        ) => "*".to_string(),
-                        _ => anyhow::bail!("Unsupported aggregate argument"),
+            SelectItem::UnnamedExpr(expr) => {
+                if let Expr::Function(func) = expr {
+                    let fname = func.name.to_string().to_uppercase();
+                    if fname.starts_with("PG_CATALOG.") || fname.starts_with("PG_") || fname.eq_ignore_ascii_case("FORMAT_TYPE") {
+                        // Dummy handling for system functions during introspection, just treat it as a string literal
+                        projection.push(ProjectionItem::Column(fname));
+                    } else {
+                        let op = match fname.as_str() {
+                            "COUNT" => AggregateOp::Count,
+                            "SUM" => AggregateOp::Sum,
+                            "MIN" => AggregateOp::Min,
+                            "MAX" => AggregateOp::Max,
+                            _ => anyhow::bail!("Unsupported aggregate function: {}", fname),
+                        };
+                        let inner = if let Some(arg) = func.args.first() {
+                            match arg {
+                                sqlparser::ast::FunctionArg::Unnamed(
+                                    sqlparser::ast::FunctionArgExpr::Expr(Expr::Identifier(id)),
+                                ) => id.value.clone(),
+                                sqlparser::ast::FunctionArg::Unnamed(
+                                    sqlparser::ast::FunctionArgExpr::Wildcard,
+                                ) => "*".to_string(),
+                                _ => anyhow::bail!("Unsupported aggregate argument"),
+                            }
+                        } else {
+                            anyhow::bail!("Aggregate function requires an argument");
+                        };
+                        projection.push(ProjectionItem::Aggregate(op, inner));
                     }
+                } else if let Some(col) = extract_col_name(expr) {
+                    projection.push(ProjectionItem::Column(col));
                 } else {
-                    anyhow::bail!("Aggregate function requires an argument");
-                };
-                projection.push(ProjectionItem::Aggregate(op, inner));
+                    anyhow::bail!("Unsupported projection item: {:?}", item);
+                }
             }
-            SelectItem::ExprWithAlias {
-                expr: Expr::Function(func),
-                ..
-            } => {
-                let fname = func.name.to_string().to_uppercase();
-                let op = match fname.as_str() {
-                    "COUNT" => AggregateOp::Count,
-                    "SUM" => AggregateOp::Sum,
-                    "MIN" => AggregateOp::Min,
-                    "MAX" => AggregateOp::Max,
-                    _ => anyhow::bail!("Unsupported aggregate function: {}", fname),
-                };
-                let inner = if let Some(arg) = func.args.first() {
-                    match arg {
-                        sqlparser::ast::FunctionArg::Unnamed(
-                            sqlparser::ast::FunctionArgExpr::Expr(Expr::Identifier(id)),
-                        ) => id.value.clone(),
-                        sqlparser::ast::FunctionArg::Unnamed(
-                            sqlparser::ast::FunctionArgExpr::Wildcard,
-                        ) => "*".to_string(),
-                        _ => anyhow::bail!("Unsupported aggregate argument"),
+            SelectItem::ExprWithAlias { expr, alias } => {
+                if let Expr::Function(func) = expr {
+                    let fname = func.name.to_string().to_uppercase();
+                    if fname.starts_with("PG_CATALOG.") || fname.starts_with("PG_") || fname.eq_ignore_ascii_case("FORMAT_TYPE") {
+                        projection.push(ProjectionItem::AliasedColumn(fname, alias.value.clone()));
+                    } else {
+                        let op = match fname.as_str() {
+                            "COUNT" => AggregateOp::Count,
+                            "SUM" => AggregateOp::Sum,
+                            "MIN" => AggregateOp::Min,
+                            "MAX" => AggregateOp::Max,
+                            _ => anyhow::bail!("Unsupported aggregate function: {}", fname),
+                        };
+                        let inner = if let Some(arg) = func.args.first() {
+                            match arg {
+                                sqlparser::ast::FunctionArg::Unnamed(
+                                    sqlparser::ast::FunctionArgExpr::Expr(Expr::Identifier(id)),
+                                ) => id.value.clone(),
+                                sqlparser::ast::FunctionArg::Unnamed(
+                                    sqlparser::ast::FunctionArgExpr::Wildcard,
+                                ) => "*".to_string(),
+                                _ => anyhow::bail!("Unsupported aggregate argument"),
+                            }
+                        } else {
+                            anyhow::bail!("Aggregate function requires an argument");
+                        };
+                        projection.push(ProjectionItem::Aggregate(op, inner));
                     }
+                } else if let Some(col) = extract_col_name(expr) {
+                    projection.push(ProjectionItem::AliasedColumn(col, alias.value.clone()));
                 } else {
-                    anyhow::bail!("Aggregate function requires an argument");
-                };
-                projection.push(ProjectionItem::Aggregate(op, inner));
+                    anyhow::bail!("Unsupported projection item: {:?}", item);
+                }
             }
-            other => anyhow::bail!("Unsupported projection item: {:?}", other),
+            SelectItem::QualifiedWildcard(_, _) => {
+                anyhow::bail!("Qualified wildcard not supported");
+            }
         }
     }
 
@@ -1853,7 +1868,7 @@ impl MemExecutor {
                         let mut out_row = Vec::new();
                         for proj_item in &projection {
                             match proj_item {
-                                ProjectionItem::Column(c) => {
+                                ProjectionItem::Column(c) | ProjectionItem::AliasedColumn(c, _) => {
                                     let idx = col_names
                                         .iter()
                                         .position(|tc| tc == c || tc.ends_with(&format!(".{}", c)));
@@ -1977,6 +1992,7 @@ impl MemExecutor {
                             .iter()
                             .map(|p| match p {
                                 ProjectionItem::Column(c) => c.clone(),
+                                ProjectionItem::AliasedColumn(_, a) => a.clone(),
                                 ProjectionItem::Aggregate(op, inner) => {
                                     format!("{:?}({})", op, inner)
                                 }
@@ -1991,6 +2007,7 @@ impl MemExecutor {
                             .iter()
                             .filter_map(|p| match p {
                                 ProjectionItem::Column(c) => Some(c.clone()),
+                                ProjectionItem::AliasedColumn(_, a) => Some(a.clone()),
                                 _ => None,
                             })
                             .collect()
@@ -1998,10 +2015,18 @@ impl MemExecutor {
 
                     let indices: Vec<Option<usize>> = out_cols
                         .iter()
-                        .map(|c| {
-                            col_names
-                                .iter()
-                                .position(|tc| tc == c || tc.ends_with(&format!(".{}", c)))
+                        .enumerate()
+                        .map(|(pi, c)| {
+                            if projection.is_empty() {
+                                col_names.iter().position(|tc| tc == c || tc.ends_with(&format!(".{}", c)))
+                            } else {
+                                let actual_col = match &projection[pi] {
+                                    ProjectionItem::Column(c) => c,
+                                    ProjectionItem::AliasedColumn(c, _) => c,
+                                    _ => c,
+                                };
+                                col_names.iter().position(|tc| tc == actual_col || tc.ends_with(&format!(".{}", actual_col)))
+                            }
                         })
                         .collect();
 

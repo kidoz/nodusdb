@@ -485,6 +485,7 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
                     for col in projection {
                         let col_name = match col {
                             nodus_executor::ProjectionItem::Column(c) => c,
+                            nodus_executor::ProjectionItem::AliasedColumn(_, a) => a,
                             nodus_executor::ProjectionItem::Aggregate(op, inner) => {
                                 format!("{:?}({})", op, inner)
                             }
@@ -536,6 +537,7 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
                     for col in projection {
                         let col_name = match col {
                             nodus_executor::ProjectionItem::Column(c) => c,
+                            nodus_executor::ProjectionItem::AliasedColumn(_, a) => a,
                             nodus_executor::ProjectionItem::Aggregate(op, inner) => {
                                 format!("{:?}({})", op, inner)
                             }
