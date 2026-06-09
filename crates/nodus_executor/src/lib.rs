@@ -2342,8 +2342,53 @@ impl MemExecutor {
 
                 Ok(QueryOutput::tag("CREATE TABLE"))
             }
-            LogicalPlan::CreateView { .. } => {
-                anyhow::bail!("CREATE VIEW not yet supported")
+            LogicalPlan::CreateView { name, query } => {
+                let (db_name, schema_name, view_only) = parse_object_name(&name)?;
+                let db = self.catalog_reader.get_database(db_name)?;
+                let sch = self.catalog_reader.get_schema(db_name, schema_name)?;
+                self.authorize(ctx, Action::CreateTable, ResourceRef::Schema(sch.id))?;
+
+                // Resolve the schema of the view by planning/executing a dummy pass or just full execute
+                // For MVP, we can just execute the query and take its output columns.
+                let mut is_valid = false;
+                let mut view_cols = Vec::new();
+                
+                // Hack: serialize the logical plan to store it
+                let view_query_json = serde_json::to_string(&*query)?;
+
+                // Run query to get shape
+                if let Ok(out) = self.execute_logical_inner(ctx, *query) {
+                    for (i, cname) in out.columns.iter().enumerate() {
+                        let ty = out.types.get(i).unwrap_or(&"VARCHAR".to_string()).clone();
+                        view_cols.push(ColumnDescriptor {
+                            id: nodus_catalog::ColumnId::new(),
+                            name: cname.clone(),
+                            version: 1,
+                            created_at: Utc::now(),
+                            updated_at: Utc::now(),
+                            state: DescriptorState::Public,
+                            data_type: ty,
+                            nullable: true,
+                        });
+                    }
+                    is_valid = true;
+                }
+
+                if !is_valid {
+                    anyhow::bail!("Failed to resolve view query schema");
+                }
+
+                self.catalog_writer.create_table(CreateTableRequest {
+                    id: nodus_catalog::TableId::new(),
+                    database_id: db.id,
+                    schema_id: sch.id,
+                    name: view_only.to_string(),
+                    columns: view_cols,
+                    constraints: vec![],
+                    view_query: Some(view_query_json),
+                })?;
+
+                Ok(QueryOutput::tag("CREATE VIEW"))
             }
             LogicalPlan::DropView { name, if_exists } => {
                 let (db_name, schema_name, view_only) = parse_object_name(&name)?;
