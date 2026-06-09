@@ -2450,6 +2450,7 @@ dependencies = [
  "rustls-pemfile",
  "serde",
  "serde_json",
+ "sqlparser",
  "tokio",
  "tokio-rustls",
  "tower-http 0.5.2",
