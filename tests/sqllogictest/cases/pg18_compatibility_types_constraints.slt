@@ -1,0 +1,93 @@
+# PostgreSQL 18 Compatibility Suite
+# Focus: Data Types and Constraints
+
+statement ok
+CREATE SCHEMA pg18_types_schema;
+
+# 1. NOT NULL and UNIQUE constraints
+statement ok
+CREATE TABLE pg18_types_schema.users (
+    id INT PRIMARY KEY,
+    username TEXT NOT NULL UNIQUE,
+    email TEXT UNIQUE
+);
+
+statement ok
+INSERT INTO pg18_types_schema.users (id, username, email) VALUES (1, 'alice', 'alice@example.com');
+
+# Should fail: NOT NULL constraint
+statement error
+INSERT INTO pg18_types_schema.users (id, username, email) VALUES (2, NULL, 'bob@example.com');
+
+# Should fail: UNIQUE constraint
+statement error
+INSERT INTO pg18_types_schema.users (id, username, email) VALUES (3, 'alice', 'alice2@example.com');
+
+# 2. CHECK constraint
+statement ok
+CREATE TABLE pg18_types_schema.products (
+    id INT PRIMARY KEY,
+    name TEXT NOT NULL,
+    price NUMERIC CHECK (price > 0)
+);
+
+statement ok
+INSERT INTO pg18_types_schema.products (id, name, price) VALUES (1, 'Widget', 10.50);
+
+# Should fail: CHECK constraint
+statement error
+INSERT INTO pg18_types_schema.products (id, name, price) VALUES (2, 'Freebie', 0);
+
+statement error
+INSERT INTO pg18_types_schema.products (id, name, price) VALUES (3, 'Debt', -5.0);
+
+# 3. FOREIGN KEY constraint
+statement ok
+CREATE TABLE pg18_types_schema.orders (
+    order_id INT PRIMARY KEY,
+    user_id INT REFERENCES pg18_types_schema.users(id),
+    amount NUMERIC
+);
+
+statement ok
+INSERT INTO pg18_types_schema.orders (order_id, user_id, amount) VALUES (101, 1, 50.0);
+
+# Should fail: FOREIGN KEY constraint
+statement error
+INSERT INTO pg18_types_schema.orders (order_id, user_id, amount) VALUES (102, 999, 10.0);
+
+# 4. Data Types
+statement ok
+CREATE TABLE pg18_types_schema.all_types (
+    id INT PRIMARY KEY,
+    is_active BOOLEAN,
+    score REAL,
+    rating DOUBLE PRECISION,
+    created_at TIMESTAMP,
+    start_date DATE
+);
+
+statement ok
+INSERT INTO pg18_types_schema.all_types (id, is_active, score, rating, created_at, start_date) 
+VALUES (1, true, 4.5, 4.555, '2026-06-08 12:00:00', '2026-06-08');
+
+query IRRFTT
+SELECT id, is_active, score, rating, created_at, start_date FROM pg18_types_schema.all_types WHERE id = 1;
+----
+1 true 4.5 4.555 2026-06-08 12:00:00 2026-06-08
+
+# Clean up
+statement ok
+DROP TABLE pg18_types_schema.orders;
+
+statement ok
+DROP TABLE pg18_types_schema.products;
+
+statement ok
+DROP TABLE pg18_types_schema.all_types;
+
+statement ok
+DROP TABLE pg18_types_schema.users;
+
+statement ok
+DROP SCHEMA pg18_types_schema;
