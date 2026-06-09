@@ -3598,14 +3598,41 @@ impl MemExecutor {
                 )?;
                 Ok(QueryOutput::tag("CREATE INDEX"))
             }
-            LogicalPlan::CreateRole { .. } => {
-                anyhow::bail!("CREATE ROLE not yet supported")
+            LogicalPlan::CreateRole { name } => {
+                // Must be superuser or have create role privilege in a real system
+                self.catalog_writer.create_role(nodus_catalog::CreateRoleRequest {
+                    id: nodus_catalog::PrincipalId::new(),
+                    name: name.clone(),
+                    principal_type: nodus_catalog::PrincipalType::Role,
+                    database_id: None,
+                })?;
+                Ok(QueryOutput::tag("CREATE ROLE"))
             }
-            LogicalPlan::Grant { .. } => {
-                anyhow::bail!("GRANT not yet supported")
+            LogicalPlan::Grant { privilege, object_name, grantee } => {
+                let role = self.catalog_reader.get_principal_by_name(&grantee)?;
+                let (db_name, schema_name, table_only) = parse_object_name(&object_name)?;
+                let tbl = self.catalog_reader.get_table(db_name, schema_name, table_only)?;
+                // Typically you need to own the table or have grant option
+                self.authorize(ctx, Action::CreateTable, ResourceRef::Table(tbl.id))?;
+                self.catalog_writer.grant_privileges(nodus_catalog::GrantPrivilegesRequest {
+                    id: nodus_catalog::GrantId::new(),
+                    principal_id: role.id,
+                    resource: ResourceRef::Table(tbl.id),
+                    privilege: privilege.clone(),
+                })?;
+                Ok(QueryOutput::tag("GRANT"))
             }
-            LogicalPlan::Revoke { .. } => {
-                anyhow::bail!("REVOKE not yet supported")
+            LogicalPlan::Revoke { privilege, object_name, revokee } => {
+                let role = self.catalog_reader.get_principal_by_name(&revokee)?;
+                let (db_name, schema_name, table_only) = parse_object_name(&object_name)?;
+                let tbl = self.catalog_reader.get_table(db_name, schema_name, table_only)?;
+                self.authorize(ctx, Action::CreateTable, ResourceRef::Table(tbl.id))?;
+                self.catalog_writer.revoke_privileges(nodus_catalog::RevokePrivilegesRequest {
+                    principal_id: role.id,
+                    resource: ResourceRef::Table(tbl.id),
+                    privilege: privilege.clone(),
+                })?;
+                Ok(QueryOutput::tag("REVOKE"))
             }
             LogicalPlan::Begin => {
                 let txn_record = self.txn.begin_txn()?;
