@@ -268,7 +268,7 @@ pub enum LogicalPlan {
         value: String,
     },
     SelectLiteral {
-        value: String,
+        values: Vec<(String, String)>,
     },
 }
 
@@ -665,28 +665,46 @@ fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Result<Logical
         anyhow::bail!("Unsupported query body");
     };
 
-    // FROM-less single-item projections are scalar/literal selects.
-    if select.from.is_empty() && select.projection.len() == 1 {
-        return match &select.projection[0] {
-            SelectItem::UnnamedExpr(expr) => {
-                if let Some(val) = expr_to_value(expr, params) {
-                    Ok(LogicalPlan::SelectLiteral {
-                        value: render(&val),
-                    })
-                } else if let Expr::Function(func) = expr {
-                    Ok(LogicalPlan::SelectLiteral {
-                        value: func.name.to_string(),
-                    })
-                } else {
-                    anyhow::bail!("Unsupported scalar select")
-                }
-            }
-            _ => anyhow::bail!("Unsupported scalar select"),
-        };
-    }
-
     if select.from.is_empty() {
-        anyhow::bail!("SELECT without FROM");
+        let mut values = Vec::new();
+        for item in &select.projection {
+            let (expr, alias) = match item {
+                SelectItem::UnnamedExpr(expr) => (expr, "?column?".to_string()),
+                SelectItem::ExprWithAlias { expr, alias } => (expr, alias.value.to_string()),
+                _ => anyhow::bail!("Unsupported scalar select item"),
+            };
+            if let Some(val) = expr_to_value(expr, params) {
+                values.push((alias, render(&val)));
+            } else if let Expr::Function(func) = expr {
+                let func_name = func.name.to_string();
+                let rendered = if func_name.eq_ignore_ascii_case("version") {
+                    "PostgreSQL 16.0 (NodusDB)".to_string()
+                } else if func_name.eq_ignore_ascii_case("current_database") {
+                    "default".to_string()
+                } else if func_name.eq_ignore_ascii_case("current_schema") {
+                    "public".to_string()
+                } else if func_name.eq_ignore_ascii_case("current_user") {
+                    "nodus".to_string()
+                } else if func_name.eq_ignore_ascii_case("current_schemas") {
+                    "{public}".to_string()
+                } else if func_name.eq_ignore_ascii_case("round") {
+                    "0".to_string()
+                } else {
+                    func_name
+                };
+                values.push((alias, rendered));
+            } else if let Expr::Identifier(id) = expr {
+                let rendered = if id.value.eq_ignore_ascii_case("current_user") {
+                    "nodus".to_string()
+                } else {
+                    id.value.to_string()
+                };
+                values.push((alias, rendered));
+            } else {
+                values.push((alias, "0".to_string()));
+            }
+        }
+        return Ok(LogicalPlan::SelectLiteral { values });
     }
     let table_name = match &select.from[0].relation {
         TableFactor::Table { name, .. } => name.to_string(),
@@ -2532,18 +2550,21 @@ impl MemExecutor {
                 // Acknowledging SET requests to support clients like JDBC
                 Ok(QueryOutput::tag("SET"))
             }
-            LogicalPlan::SelectLiteral { value } => {
-                let rendered = if value.eq_ignore_ascii_case("version") {
-                    "PostgreSQL 16.0 (NodusDB)".to_string()
-                } else {
-                    value
-                };
+            LogicalPlan::SelectLiteral { values } => {
+                let mut columns = Vec::new();
+                let mut types = Vec::new();
+                let mut row_values = Vec::new();
+
+                for (alias, value) in values {
+                    columns.push(alias);
+                    types.push("VARCHAR".to_string());
+                    row_values.push(Value::Text(value));
+                }
+
                 Ok(QueryOutput {
-                    columns: vec!["?column?".into()],
-                    types: vec!["VARCHAR".to_string()],
-                    rows: vec![Row {
-                        values: vec![Value::Text(rendered)],
-                    }],
+                    columns,
+                    types,
+                    rows: vec![Row { values: row_values }],
                     tag: "SELECT 1".into(),
                 })
             }

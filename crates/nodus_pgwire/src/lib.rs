@@ -499,8 +499,18 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
                         ));
                     }
                 }
-                nodus_executor::LogicalPlan::SelectLiteral { .. }
-                | nodus_executor::LogicalPlan::ShowVariable { .. } => {
+                nodus_executor::LogicalPlan::SelectLiteral { values } => {
+                    for (alias, _) in values {
+                        fields.push(FieldInfo::new(
+                            alias,
+                            None,
+                            None,
+                            Type::VARCHAR,
+                            FieldFormat::Text,
+                        ));
+                    }
+                }
+                nodus_executor::LogicalPlan::ShowVariable { .. } => {
                     fields.push(FieldInfo::new(
                         "?column?".to_string(),
                         None,
@@ -551,8 +561,18 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
                         ));
                     }
                 }
-                nodus_executor::LogicalPlan::SelectLiteral { .. }
-                | nodus_executor::LogicalPlan::ShowVariable { .. } => {
+                nodus_executor::LogicalPlan::SelectLiteral { values } => {
+                    for (alias, _) in values {
+                        fields.push(FieldInfo::new(
+                            alias,
+                            None,
+                            None,
+                            Type::VARCHAR,
+                            FieldFormat::Text,
+                        ));
+                    }
+                }
+                nodus_executor::LogicalPlan::ShowVariable { .. } => {
                     fields.push(FieldInfo::new(
                         "?column?".to_string(),
                         None,
