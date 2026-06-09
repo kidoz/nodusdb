@@ -1,0 +1,31 @@
+# PostgreSQL 18 Compatibility Suite
+# Focus: Schema Objects (Views)
+
+statement ok
+CREATE SCHEMA pg18_views;
+
+statement ok
+CREATE TABLE pg18_views.base_table (id INT, val TEXT);
+
+statement ok
+INSERT INTO pg18_views.base_table VALUES (1, 'A'), (2, 'B');
+
+# Create a standard view
+statement ok
+CREATE VIEW pg18_views.my_view AS SELECT id, val FROM pg18_views.base_table WHERE id = 1;
+
+# Query the view
+query IT
+SELECT id, val FROM pg18_views.my_view;
+----
+1 A
+
+# Clean up
+statement ok
+DROP VIEW pg18_views.my_view;
+
+statement ok
+DROP TABLE pg18_views.base_table;
+
+statement ok
+DROP SCHEMA pg18_views;
