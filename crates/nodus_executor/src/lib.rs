@@ -1736,6 +1736,71 @@ impl MemExecutor {
                 offset,
                 distinct,
             } => {
+                if table_name.eq_ignore_ascii_case("pg_catalog.pg_database") {
+                    return Ok(QueryOutput {
+                        columns: vec![
+                            "id".to_string(), 
+                            "name".to_string(), 
+                            "description".to_string(), 
+                            "is_template".to_string(), 
+                            "allow_connections".to_string(), 
+                            "owner".to_string()
+                        ],
+                        types: vec![
+                            "BIGINT".to_string(), 
+                            "VARCHAR".to_string(), 
+                            "VARCHAR".to_string(), 
+                            "BOOL".to_string(), 
+                            "BOOL".to_string(), 
+                            "VARCHAR".to_string()
+                        ],
+                        rows: vec![Row {
+                            values: vec![
+                                Value::Int(1),
+                                Value::Text("default".to_string()),
+                                Value::Text("Default database".to_string()),
+                                Value::Bool(false),
+                                Value::Bool(true),
+                                Value::Text("nodus".to_string()),
+                            ],
+                        }],
+                        tag: "SELECT 1".into(),
+                    });
+                }
+                if table_name.eq_ignore_ascii_case("pg_stat_ssl") {
+                    return Ok(QueryOutput {
+                        columns: vec!["ssl".to_string()],
+                        types: vec!["BOOL".to_string()],
+                        rows: vec![Row {
+                            values: vec![Value::Bool(false)],
+                        }],
+                        tag: "SELECT 1".into(),
+                    });
+                }
+                if table_name.to_lowercase().starts_with("pg_catalog.") || table_name.to_lowercase().starts_with("pg_stat_") || table_name.to_lowercase().starts_with("information_schema.") {
+                    let mut cols = Vec::new();
+                    let mut types = Vec::new();
+                    for proj in &projection {
+                        let col_name = match proj {
+                            ProjectionItem::Column(c) => c.clone(),
+                            ProjectionItem::AliasedColumn(_, a) => a.clone(),
+                            ProjectionItem::Aggregate(op, inner) => format!("{:?}({})", op, inner),
+                        };
+                        cols.push(col_name);
+                        types.push("VARCHAR".to_string());
+                    }
+                    if cols.is_empty() {
+                        cols.push("?column?".to_string());
+                        types.push("VARCHAR".to_string());
+                    }
+                    return Ok(QueryOutput {
+                        columns: cols,
+                        types,
+                        rows: vec![],
+                        tag: "SELECT 0".into(),
+                    });
+                }
+
                 let tbl = self
                     .catalog_reader
                     .get_table("default", "public", &table_name)?;
