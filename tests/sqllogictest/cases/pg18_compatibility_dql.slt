@@ -1,0 +1,109 @@
+# PostgreSQL 18 Compatibility Suite
+# Focus: Advanced Querying (Joins, CTEs, Window Functions)
+
+statement ok
+CREATE SCHEMA pg18_dql;
+
+statement ok
+CREATE TABLE pg18_dql.employees (
+    emp_id INT PRIMARY KEY,
+    name TEXT,
+    dept_id INT,
+    salary NUMERIC
+);
+
+statement ok
+CREATE TABLE pg18_dql.departments (
+    dept_id INT PRIMARY KEY,
+    dept_name TEXT
+);
+
+statement ok
+INSERT INTO pg18_dql.departments (dept_id, dept_name) VALUES (1, 'Engineering'), (2, 'Sales'), (3, 'HR');
+
+statement ok
+INSERT INTO pg18_dql.employees (emp_id, name, dept_id, salary) VALUES 
+    (101, 'Alice', 1, 90000),
+    (102, 'Bob', 1, 85000),
+    (103, 'Charlie', 2, 75000),
+    (104, 'David', NULL, 60000);
+
+# 1. Advanced Joins
+# INNER JOIN (Basic)
+query ITT
+SELECT e.emp_id, e.name, d.dept_name 
+FROM pg18_dql.employees e 
+JOIN pg18_dql.departments d ON e.dept_id = d.dept_id
+ORDER BY e.emp_id;
+----
+101 Alice Engineering
+102 Bob Engineering
+103 Charlie Sales
+
+# LEFT JOIN
+query ITT
+SELECT e.emp_id, e.name, d.dept_name 
+FROM pg18_dql.employees e 
+LEFT JOIN pg18_dql.departments d ON e.dept_id = d.dept_id
+ORDER BY e.emp_id;
+----
+101 Alice Engineering
+102 Bob Engineering
+103 Charlie Sales
+104 David NULL
+
+# RIGHT JOIN
+query ITT
+SELECT e.emp_id, e.name, d.dept_name 
+FROM pg18_dql.employees e 
+RIGHT JOIN pg18_dql.departments d ON e.dept_id = d.dept_id
+ORDER BY d.dept_id, e.emp_id;
+----
+101 Alice Engineering
+102 Bob Engineering
+103 Charlie Sales
+NULL NULL HR
+
+# FULL OUTER JOIN
+query ITT
+SELECT e.emp_id, e.name, d.dept_name 
+FROM pg18_dql.employees e 
+FULL OUTER JOIN pg18_dql.departments d ON e.dept_id = d.dept_id
+ORDER BY e.emp_id NULLS LAST, d.dept_id;
+----
+101 Alice Engineering
+102 Bob Engineering
+103 Charlie Sales
+104 David NULL
+NULL NULL HR
+
+# 2. CTEs (Common Table Expressions)
+query IT
+WITH eng_emps AS (
+    SELECT emp_id, name FROM pg18_dql.employees WHERE dept_id = 1
+)
+SELECT emp_id, name FROM eng_emps ORDER BY emp_id;
+----
+101 Alice
+102 Bob
+
+# 3. Window Functions
+query ITI
+SELECT emp_id, name, ROW_NUMBER() OVER (PARTITION BY dept_id ORDER BY salary DESC) as rnk
+FROM pg18_dql.employees
+ORDER BY emp_id;
+----
+101 Alice 1
+102 Bob 2
+103 Charlie 1
+104 David 1
+
+# Clean up
+statement ok
+DROP TABLE pg18_dql.employees;
+
+statement ok
+DROP TABLE pg18_dql.departments;
+
+statement ok
+DROP SCHEMA pg18_dql;
