@@ -70,6 +70,14 @@ impl CatalogWriter for RaftCatalogWriter {
             tracing::error!("create_table client_write failed: {}", e);
             anyhow::bail!("create_table raft error: {}", e);
         }
+        
+        // Wait for state machine application
+        for _ in 0..1000 {
+            if let Ok(tbl) = self.reader.get_table_by_id(id) {
+                return Ok(tbl);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         self.reader.get_table_by_id(id)
     }
 
