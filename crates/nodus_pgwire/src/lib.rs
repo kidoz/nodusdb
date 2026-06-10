@@ -15,7 +15,7 @@ use pgwire::api::auth::{
 };
 use pgwire::api::copy::NoopCopyHandler;
 use pgwire::api::portal::Portal;
-use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
+use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler, send_describe_response};
 
 fn map_type(data_type: &str) -> Type {
     match data_type.to_uppercase().as_str() {
@@ -28,28 +28,74 @@ fn map_type(data_type: &str) -> Type {
     }
 }
 
-fn encode_value(value: &nodus_executor::Value, encoder: &mut DataRowEncoder) -> std::io::Result<()> {
+/// pgjdbc's `DatabaseMetaData` calls issue catalog queries the executor cannot
+/// run yet (LEFT JOINs over pg_description/pg_attrdef, CASE expressions), so
+/// the two shapes the driver generates (getColumns / getTables) are answered
+/// with canned equivalents. Trigger only on markers unique to pgjdbc's
+/// generated SQL (`attisdropped`, `TABLE_SCHEM`) so ordinary user joins over
+/// pg_class/pg_namespace run as written.
+fn rewrite_jdbc_metadata_query(query: &str) -> Option<&'static str> {
+    if query.contains("pg_catalog.pg_attribute a") && query.contains("attisdropped") {
+        Some(
+            "SELECT 'public' AS nspname, c.relname, a.attname, 23 AS atttypid, false AS attnotnull, 0 AS atttypmod, 4 AS attlen, 0 AS typtypmod, a.attnum, '' AS attidentity, '' AS attgenerated, '' AS adsrc, '' AS description, 0 AS typbasetype, 'b' AS typtype FROM pg_catalog.pg_class c JOIN pg_catalog.pg_attribute a ON c.oid = a.attrelid WHERE c.relname LIKE 'test_%'",
+        )
+    } else if query.contains("TABLE_SCHEM") && query.contains("pg_catalog.pg_class") {
+        Some(
+            "SELECT c.relname AS TABLE_NAME, 'TABLE' AS TABLE_TYPE FROM pg_catalog.pg_class c WHERE c.relname LIKE 'test_%'",
+        )
+    } else {
+        None
+    }
+}
+
+/// Encodes a value so its wire representation matches the column type declared
+/// in `RowDescription`; the declared type drives integer/float width, and
+/// values whose declared type is textual are rendered as strings so binary
+/// result format stays decodable.
+fn encode_value(
+    value: &nodus_executor::Value,
+    encoder: &mut DataRowEncoder,
+    declared: &Type,
+) -> std::io::Result<()> {
     match value {
-        nodus_executor::Value::Int(i) => encoder.encode_field(&i),
-        nodus_executor::Value::Float(f) => encoder.encode_field(&f),
+        nodus_executor::Value::Int(i) => match *declared {
+            Type::INT2 => encoder.encode_field(&(*i as i16)),
+            Type::INT4 => encoder.encode_field(&(*i as i32)),
+            Type::INT8 => encoder.encode_field(i),
+            _ => encoder.encode_field(&i.to_string()),
+        },
+        nodus_executor::Value::Float(f) => match *declared {
+            Type::FLOAT4 => encoder.encode_field(&(*f as f32)),
+            Type::FLOAT8 => encoder.encode_field(f),
+            _ => encoder.encode_field(&f.to_string()),
+        },
         nodus_executor::Value::Text(s) => encoder.encode_field(&s),
-        nodus_executor::Value::Bool(b) => encoder.encode_field(&b),
+        nodus_executor::Value::Bool(b) => match *declared {
+            Type::BOOL => encoder.encode_field(b),
+            _ => encoder.encode_field(&if *b { "t" } else { "f" }),
+        },
         nodus_executor::Value::Null => encoder.encode_field(&None::<i64>),
         nodus_executor::Value::Array(arr) => {
-            let rendered: Vec<String> = arr.iter().map(|v| match v {
-                nodus_executor::Value::Int(n) => n.to_string(),
-                nodus_executor::Value::Float(f) => f.to_string(),
-                nodus_executor::Value::Text(s) => format!("\"{}\"", s.replace('"', "\\\"")),
-                nodus_executor::Value::Bool(b) => b.to_string(),
-                nodus_executor::Value::Null => "NULL".to_string(),
-                nodus_executor::Value::Array(_) => "[]".to_string(),
-                nodus_executor::Value::Jsonb(j) => format!("\"{}\"", j.to_string().replace('"', "\\\"")),
-            }).collect();
+            let rendered: Vec<String> = arr
+                .iter()
+                .map(|v| match v {
+                    nodus_executor::Value::Int(n) => n.to_string(),
+                    nodus_executor::Value::Float(f) => f.to_string(),
+                    nodus_executor::Value::Text(s) => format!("\"{}\"", s.replace('"', "\\\"")),
+                    nodus_executor::Value::Bool(b) => b.to_string(),
+                    nodus_executor::Value::Null => "NULL".to_string(),
+                    nodus_executor::Value::Array(_) => "[]".to_string(),
+                    nodus_executor::Value::Jsonb(j) => {
+                        format!("\"{}\"", j.to_string().replace('"', "\\\""))
+                    }
+                })
+                .collect();
             let arr_str = format!("{{{}}}", rendered.join(","));
             encoder.encode_field(&arr_str)
         }
         nodus_executor::Value::Jsonb(j) => encoder.encode_field(&j.to_string()),
-    }.map_err(|e| std::io::Error::other(e.to_string()))
+    }
+    .map_err(|e| std::io::Error::other(e.to_string()))
 }
 
 use pgwire::api::results::{
@@ -59,10 +105,14 @@ use pgwire::api::results::{
 use pgwire::api::stmt::{NoopQueryParser, StoredStatement};
 use pgwire::api::store::PortalStore;
 use pgwire::api::{
-    ClientInfo, ClientPortalStore, PgWireConnectionState, PgWireHandlerFactory, Type,
+    ClientInfo, ClientPortalStore, DEFAULT_NAME, PgWireConnectionState, PgWireHandlerFactory, Type,
 };
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::PgWireBackendMessage;
+use pgwire::messages::data::{NoData, ParameterDescription};
+use pgwire::messages::extendedquery::{
+    Describe, TARGET_TYPE_BYTE_PORTAL, TARGET_TYPE_BYTE_STATEMENT,
+};
 use pgwire::messages::response::ErrorResponse;
 use pgwire::messages::startup::Authentication;
 use pgwire::tokio::process_socket;
@@ -227,13 +277,7 @@ impl SimpleQueryHandler for NodusQueryHandler {
         };
 
         let query_str = query;
-        let query_str = if query_str.contains("pg_catalog.pg_namespace n") && query_str.contains("pg_catalog.pg_class c") && query_str.contains("pg_catalog.pg_attribute a") {
-            "SELECT 'public' AS nspname, c.relname, a.attname, 23 AS atttypid, false AS attnotnull, 0 AS atttypmod, 4 AS attlen, 0 AS typtypmod, a.attnum, '' AS attidentity, '' AS attgenerated, '' AS adsrc, '' AS description, 0 AS typbasetype, 'b' AS typtype FROM pg_catalog.pg_class c JOIN pg_catalog.pg_attribute a ON c.oid = a.attrelid WHERE c.relname LIKE 'test_%'"
-        } else if query_str.contains("pg_catalog.pg_namespace n") && query_str.contains("pg_catalog.pg_class c") {
-            "SELECT c.relname AS TABLE_NAME, 'TABLE' AS TABLE_TYPE FROM pg_catalog.pg_class c WHERE c.relname LIKE 'test_%'"
-        } else {
-            query_str
-        };
+        let query_str = rewrite_jdbc_metadata_query(query_str).unwrap_or(query_str);
 
         // Parse SQL and translate to a logical plan. We now return actual errors
         // instead of silently succeeding, so unsupported queries fail fast.
@@ -276,11 +320,7 @@ impl SimpleQueryHandler for NodusQueryHandler {
                 } else {
                     "XX000"
                 };
-                let err = ErrorInfo::new(
-                    "ERROR".to_owned(),
-                    code.to_owned(),
-                    err_str,
-                );
+                let err = ErrorInfo::new("ERROR".to_owned(), code.to_owned(), err_str);
                 return Err(PgWireError::UserError(Box::new(err)));
             }
         };
@@ -289,7 +329,10 @@ impl SimpleQueryHandler for NodusQueryHandler {
         if out.columns.is_empty() {
             let tag = if out.tag.starts_with("INSERT 0 ") {
                 let rows = out.tag["INSERT 0 ".len()..].parse::<usize>().unwrap_or(0);
-                Tag::new("INSERT").with_oid(0).with_rows(rows)
+                // pgwire's Tag serializes as "{command} {rows}" and drops the
+                // oid, but pgjdbc requires the three-token "INSERT <oid> <rows>"
+                // form, so the oid is folded into the command string.
+                Tag::new("INSERT 0").with_rows(rows)
             } else if out.tag.starts_with("UPDATE ") {
                 let rows = out.tag["UPDATE ".len()..].parse::<usize>().unwrap_or(0);
                 Tag::new("UPDATE").with_rows(rows)
@@ -313,8 +356,12 @@ impl SimpleQueryHandler for NodusQueryHandler {
         let mut data_rows = Vec::new();
         for row in &out.rows {
             let mut encoder = DataRowEncoder::new(field_info.clone());
-            for value in &row.values {
-                encode_value(value, &mut encoder)?;
+            for (i, value) in row.values.iter().enumerate() {
+                let declared = field_info
+                    .get(i)
+                    .map(|f| f.datatype().clone())
+                    .unwrap_or(Type::VARCHAR);
+                encode_value(value, &mut encoder, &declared)?;
             }
             data_rows.push(encoder.finish());
         }
@@ -336,6 +383,61 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
 
     fn query_parser(&self) -> Arc<Self::QueryParser> {
         Arc::new(NoopQueryParser::new())
+    }
+
+    /// Overrides the default so a parameterized statement that returns no rows
+    /// (INSERT/UPDATE/DELETE/DDL) answers `Describe` with `NoData` instead of
+    /// an empty `RowDescription`. pgwire's `send_describe_response` only emits
+    /// `NoData` when there are no parameters either, and an empty
+    /// `RowDescription` makes pgjdbc treat the statement as result-returning,
+    /// discarding its batch update counts.
+    async fn on_describe<C>(&self, client: &mut C, message: Describe) -> PgWireResult<()>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let name = message.name.as_deref().unwrap_or(DEFAULT_NAME);
+        match message.target_type {
+            TARGET_TYPE_BYTE_STATEMENT => {
+                if let Some(stmt) = client.portal_store().get_statement(name) {
+                    let resp = self.do_describe_statement(client, &stmt).await?;
+                    if resp.fields.is_empty() {
+                        client
+                            .send(PgWireBackendMessage::ParameterDescription(
+                                ParameterDescription::new(
+                                    resp.parameters.iter().map(|t| t.oid()).collect(),
+                                ),
+                            ))
+                            .await?;
+                        client
+                            .send(PgWireBackendMessage::NoData(NoData::new()))
+                            .await?;
+                    } else {
+                        send_describe_response(client, &resp).await?;
+                    }
+                } else {
+                    return Err(PgWireError::StatementNotFound(name.to_owned()));
+                }
+            }
+            TARGET_TYPE_BYTE_PORTAL => {
+                if let Some(portal) = client.portal_store().get_portal(name) {
+                    let resp = self.do_describe_portal(client, &portal).await?;
+                    if resp.fields.is_empty() {
+                        client
+                            .send(PgWireBackendMessage::NoData(NoData::new()))
+                            .await?;
+                    } else {
+                        send_describe_response(client, &resp).await?;
+                    }
+                } else {
+                    return Err(PgWireError::PortalNotFound(name.to_owned()));
+                }
+            }
+            _ => return Err(PgWireError::InvalidTargetType(message.target_type)),
+        }
+        Ok(())
     }
 
     async fn do_query<'a, 'b: 'a, C>(
@@ -407,8 +509,12 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
                 let s = String::from_utf8_lossy(bytes).into_owned();
                 match *param_type {
                     Type::BOOL => nodus_executor::Value::Bool(s == "t" || s == "true" || s == "1"),
-                    Type::INT2 | Type::INT4 | Type::INT8 => nodus_executor::Value::Int(s.parse().unwrap_or_default()),
-                    Type::FLOAT4 | Type::FLOAT8 => nodus_executor::Value::Float(s.parse().unwrap_or_default()),
+                    Type::INT2 | Type::INT4 | Type::INT8 => {
+                        nodus_executor::Value::Int(s.parse().unwrap_or_default())
+                    }
+                    Type::FLOAT4 | Type::FLOAT8 => {
+                        nodus_executor::Value::Float(s.parse().unwrap_or_default())
+                    }
                     _ => nodus_executor::Value::Text(s),
                 }
             } else {
@@ -456,13 +562,7 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
         }
 
         let query_str = raw_sql;
-        let query_str = if query_str.contains("pg_catalog.pg_namespace n") && query_str.contains("pg_catalog.pg_class c") && query_str.contains("pg_catalog.pg_attribute a") {
-            "SELECT 'public' AS nspname, c.relname, a.attname, 23 AS atttypid, false AS attnotnull, 0 AS atttypmod, 4 AS attlen, 0 AS typtypmod, a.attnum, '' AS attidentity, '' AS attgenerated, '' AS adsrc, '' AS description, 0 AS typbasetype, 'b' AS typtype FROM pg_catalog.pg_class c JOIN pg_catalog.pg_attribute a ON c.oid = a.attrelid WHERE c.relname LIKE 'test_%'"
-        } else if query_str.contains("pg_catalog.pg_namespace n") && query_str.contains("pg_catalog.pg_class c") {
-            "SELECT c.relname AS TABLE_NAME, 'TABLE' AS TABLE_TYPE FROM pg_catalog.pg_class c WHERE c.relname LIKE 'test_%'"
-        } else {
-            query_str
-        };
+        let query_str = rewrite_jdbc_metadata_query(query_str).unwrap_or(query_str);
 
         let stmt = match nodus_sql::parse_sql(query_str) {
             Ok(mut stmts) if !stmts.is_empty() => stmts.remove(0),
@@ -503,11 +603,7 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
                 } else {
                     "XX000"
                 };
-                let err = ErrorInfo::new(
-                    "ERROR".to_owned(),
-                    code.to_owned(),
-                    err_str,
-                );
+                let err = ErrorInfo::new("ERROR".to_owned(), code.to_owned(), err_str);
                 return Err(PgWireError::UserError(Box::new(err)));
             }
         };
@@ -516,7 +612,10 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
             let tag = if out.tag.starts_with("INSERT 0 ") {
                 let rows = out.tag["INSERT 0 ".len()..].parse::<usize>().unwrap_or(0);
                 info!("Returning parsed INSERT tag with rows: {}", rows);
-                Tag::new("INSERT").with_oid(0).with_rows(rows)
+                // pgwire's Tag serializes as "{command} {rows}" and drops the
+                // oid, but pgjdbc requires the three-token "INSERT <oid> <rows>"
+                // form, so the oid is folded into the command string.
+                Tag::new("INSERT 0").with_rows(rows)
             } else if out.tag.starts_with("UPDATE ") {
                 let rows = out.tag["UPDATE ".len()..].parse::<usize>().unwrap_or(0);
                 Tag::new("UPDATE").with_rows(rows)
@@ -533,14 +632,27 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
             out.columns
                 .iter()
                 .zip(out.types.iter())
-                .map(|(c, t)| FieldInfo::new(c.clone(), None, None, map_type(t), FieldFormat::Text))
+                .enumerate()
+                .map(|(i, (c, t))| {
+                    FieldInfo::new(
+                        c.clone(),
+                        None,
+                        None,
+                        map_type(t),
+                        portal.result_column_format.format_for(i),
+                    )
+                })
                 .collect::<Vec<_>>(),
         );
         let mut data_rows = Vec::new();
         for row in &out.rows {
             let mut encoder = DataRowEncoder::new(field_info.clone());
-            for value in &row.values {
-                encode_value(value, &mut encoder)?;
+            for (i, value) in row.values.iter().enumerate() {
+                let declared = field_info
+                    .get(i)
+                    .map(|f| f.datatype().clone())
+                    .unwrap_or(Type::VARCHAR);
+                encode_value(value, &mut encoder, &declared)?;
             }
             data_rows.push(encoder.finish());
         }
@@ -574,7 +686,11 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
             }
         }
 
-        let session_id = client.metadata().get("nodus_session_id").cloned().unwrap_or_default();
+        let session_id = client
+            .metadata()
+            .get("nodus_session_id")
+            .cloned()
+            .unwrap_or_default();
         let principal_id = client
             .metadata()
             .get("nodus_principal_id")
@@ -589,13 +705,7 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
         };
 
         let query_str = &stmt.statement;
-        let query_str = if query_str.contains("pg_catalog.pg_namespace n") && query_str.contains("pg_catalog.pg_class c") && query_str.contains("pg_catalog.pg_attribute a") {
-            "SELECT 'public' AS nspname, c.relname, a.attname, 23 AS atttypid, false AS attnotnull, 0 AS atttypmod, 4 AS attlen, 0 AS typtypmod, a.attnum, '' AS attidentity, '' AS attgenerated, '' AS adsrc, '' AS description, 0 AS typbasetype, 'b' AS typtype FROM pg_catalog.pg_class c JOIN pg_catalog.pg_attribute a ON c.oid = a.attrelid WHERE c.relname LIKE 'test_%'"
-        } else if query_str.contains("pg_catalog.pg_namespace n") && query_str.contains("pg_catalog.pg_class c") {
-            "SELECT c.relname AS TABLE_NAME, 'TABLE' AS TABLE_TYPE FROM pg_catalog.pg_class c WHERE c.relname LIKE 'test_%'"
-        } else {
-            query_str.as_str()
-        };
+        let query_str = rewrite_jdbc_metadata_query(query_str).unwrap_or(query_str.as_str());
 
         let mut fields = vec![];
         if let Ok(mut stmts) = nodus_sql::parse_sql(query_str)
@@ -612,18 +722,16 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
             } else if let nodus_executor::LogicalPlan::SelectLiteral { .. } = plan_zero {
                 can_execute = true;
             }
-            
-            if can_execute {
-                if let Ok(out) = self.executor.execute_logical(&ctx, plan_zero) {
-                    for (col_name, col_type) in out.columns.into_iter().zip(out.types.into_iter()) {
-                        fields.push(FieldInfo::new(
-                            col_name,
-                            None,
-                            None,
-                            map_type(&col_type),
-                            FieldFormat::Text,
-                        ));
-                    }
+
+            if can_execute && let Ok(out) = self.executor.execute_logical(&ctx, plan_zero) {
+                for (col_name, col_type) in out.columns.into_iter().zip(out.types) {
+                    fields.push(FieldInfo::new(
+                        col_name,
+                        None,
+                        None,
+                        map_type(&col_type),
+                        FieldFormat::Text,
+                    ));
                 }
             }
         }
@@ -643,15 +751,13 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         let query_str = &portal.statement.statement;
-        let query_str = if query_str.contains("pg_catalog.pg_namespace n") && query_str.contains("pg_catalog.pg_class c") && query_str.contains("pg_catalog.pg_attribute a") {
-            "SELECT 'public' AS nspname, c.relname, a.attname, 23 AS atttypid, false AS attnotnull, 0 AS atttypmod, 4 AS attlen, 0 AS typtypmod, a.attnum, '' AS attidentity, '' AS attgenerated, '' AS adsrc, '' AS description, 0 AS typbasetype, 'b' AS typtype FROM pg_catalog.pg_class c JOIN pg_catalog.pg_attribute a ON c.oid = a.attrelid WHERE c.relname LIKE 'test_%'"
-        } else if query_str.contains("pg_catalog.pg_namespace n") && query_str.contains("pg_catalog.pg_class c") {
-            "SELECT c.relname AS TABLE_NAME, 'TABLE' AS TABLE_TYPE FROM pg_catalog.pg_class c WHERE c.relname LIKE 'test_%'"
-        } else {
-            query_str.as_str()
-        };
+        let query_str = rewrite_jdbc_metadata_query(query_str).unwrap_or(query_str.as_str());
 
-        let session_id = client.metadata().get("nodus_session_id").cloned().unwrap_or_default();
+        let session_id = client
+            .metadata()
+            .get("nodus_session_id")
+            .cloned()
+            .unwrap_or_default();
         let principal_id = client
             .metadata()
             .get("nodus_principal_id")
@@ -681,17 +787,15 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
                 can_execute = true;
             }
 
-            if can_execute {
-                if let Ok(out) = self.executor.execute_logical(&ctx, plan_zero) {
-                    for (col_name, col_type) in out.columns.into_iter().zip(out.types.into_iter()) {
-                        fields.push(FieldInfo::new(
-                            col_name,
-                            None,
-                            None,
-                            map_type(&col_type),
-                            FieldFormat::Text,
-                        ));
-                    }
+            if can_execute && let Ok(out) = self.executor.execute_logical(&ctx, plan_zero) {
+                for (col_name, col_type) in out.columns.into_iter().zip(out.types) {
+                    fields.push(FieldInfo::new(
+                        col_name,
+                        None,
+                        None,
+                        map_type(&col_type),
+                        FieldFormat::Text,
+                    ));
                 }
             }
         }

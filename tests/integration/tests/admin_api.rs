@@ -238,7 +238,8 @@ async fn admin_upgrade_api_drives_lifecycle() {
         .unwrap();
     assert_eq!(st["phase"], "Idle");
 
-    let r = http.post(format!("{base}/api/v1/upgrade/start?target=0.2.0"))
+    let r = http
+        .post(format!("{base}/api/v1/upgrade/start?target=0.2.0"))
         .send()
         .await
         .unwrap();
@@ -322,7 +323,13 @@ async fn admin_node_drain_makes_unready() {
     let base = format!("http://{}", server.http_addr);
 
     // Ready before draining.
-    let r = http.get(format!("{base}/readyz")).send().await.unwrap().error_for_status().unwrap();
+    let r = http
+        .get(format!("{base}/readyz"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
     assert!(r.status().is_success());
 
     let drained: serde_json::Value = http
@@ -339,7 +346,13 @@ async fn admin_node_drain_makes_unready() {
     let r = http.get(format!("{base}/readyz")).send().await.unwrap();
     assert_eq!(r.status().as_u16(), 503);
     // Liveness still OK.
-    let h = http.get(format!("{base}/healthz")).send().await.unwrap().error_for_status().unwrap();
+    let h = http
+        .get(format!("{base}/healthz"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
     assert!(h.status().is_success());
 }
 
@@ -380,7 +393,13 @@ async fn admin_api_requires_token_when_configured() {
     assert!(r.status().is_success());
 
     // Health/readiness are not behind the admin token.
-    let r = http.get(format!("{base}/readyz")).send().await.unwrap().error_for_status().unwrap();
+    let r = http
+        .get(format!("{base}/readyz"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
     assert!(r.status().is_success());
 }
 
@@ -415,7 +434,8 @@ async fn durable_audit_persists_to_configured_file() {
 
     // And the events were written to the configured JSONL file.
     let contents = std::fs::read_to_string(&path).expect("audit file exists");
-    println!("AUDIT CONTENTS: {}", contents); assert!(contents.contains("\"action\":\"CREATE\""));
+    println!("AUDIT CONTENTS: {}", contents);
+    assert!(contents.contains("\"action\":\"CREATE\""));
     let _ = std::fs::remove_file(&path);
 }
 
@@ -448,14 +468,22 @@ async fn admin_backup_pitr_restore() {
     config.backup.repository_uri = format!("file://{}", backup_dir.to_string_lossy());
 
     println!("Starting TestServer");
-    let server = TestServer::start_with_config(config.clone()).await.expect("server starts");
+    let server = TestServer::start_with_config(config.clone())
+        .await
+        .expect("server starts");
     println!("TestServer started, connecting");
     let client = connect(&server.pgwire_addr).await;
 
     println!("Executing CREATE");
-    client.execute("CREATE TABLE pitr (id INT PRIMARY KEY, val TEXT);", &[]).await.unwrap();
+    client
+        .execute("CREATE TABLE pitr (id INT PRIMARY KEY, val TEXT);", &[])
+        .await
+        .unwrap();
     println!("Executing INSERT 1");
-    client.execute("INSERT INTO pitr (id, val) VALUES (1, 'one');", &[]).await.unwrap();
+    client
+        .execute("INSERT INTO pitr (id, val) VALUES (1, 'one');", &[])
+        .await
+        .unwrap();
 
     // Give it a moment to commit properly
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -463,22 +491,37 @@ async fn admin_backup_pitr_restore() {
     // Take full backup
     let http = reqwest::Client::new();
     let base = format!("http://{}", server.http_addr);
-    
+
     println!("Creating backup");
-    let backup_resp: serde_json::Value = http.post(format!("{base}/api/v1/backups"))
-        .send().await.unwrap().json().await.unwrap();
+    let backup_resp: serde_json::Value = http
+        .post(format!("{base}/api/v1/backups"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     let backup_id = backup_resp["backup_id"].as_str().unwrap().to_string();
     println!("Backup ID: {}", backup_id);
 
     println!("Executing INSERT 2");
-    client.execute("INSERT INTO pitr (id, val) VALUES (2, 'two');", &[]).await.unwrap();
-    
+    client
+        .execute("INSERT INTO pitr (id, val) VALUES (2, 'two');", &[])
+        .await
+        .unwrap();
+
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    let target_ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_micros() as u64;
+    let target_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_micros() as u64;
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
     println!("Executing INSERT 3");
-    client.execute("INSERT INTO pitr (id, val) VALUES (3, 'three');", &[]).await.unwrap();
+    client
+        .execute("INSERT INTO pitr (id, val) VALUES (3, 'three');", &[])
+        .await
+        .unwrap();
 
     // Wait for WAL archiver to tick and flush/archive (interval is 1s, we wait 3s)
     println!("Waiting for WAL archiver...");
@@ -493,29 +536,46 @@ async fn admin_backup_pitr_restore() {
 
     // Start a new server
     println!("Starting new TestServer for restore");
-    let server2 = TestServer::start_with_config(config).await.expect("new server starts");
+    let server2 = TestServer::start_with_config(config)
+        .await
+        .expect("new server starts");
     let http2 = reqwest::Client::new();
     let base2 = format!("http://{}", server2.http_addr);
 
     // Restore to target_ts
     println!("Sending Restore request");
-    let restore_resp: serde_json::Value = http2.post(format!("{base2}/api/v1/backups/{backup_id}/restore?target_ts={target_ts}"))
-        .send().await.unwrap().json().await.unwrap();
+    let restore_resp: serde_json::Value = http2
+        .post(format!(
+            "{base2}/api/v1/backups/{backup_id}/restore?target_ts={target_ts}"
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     println!("Restore Response: {:?}", restore_resp);
 
-    assert!(restore_resp.get("error").is_none(), "Restore failed: {:?}", restore_resp);
+    assert!(
+        restore_resp.get("error").is_none(),
+        "Restore failed: {:?}",
+        restore_resp
+    );
 
     // Give Raft a moment to apply all commits
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     let client2 = connect(&server2.pgwire_addr).await;
-    let msgs = client2.query("SELECT id FROM pitr ORDER BY id;", &[]).await.unwrap();
+    let msgs = client2
+        .query("SELECT id FROM pitr ORDER BY id;", &[])
+        .await
+        .unwrap();
     assert_eq!(msgs.len(), 2, "Expected exactly 2 rows after PITR restore");
-    
-    let id1: &str = msgs[0].get(0);
-    let id2: &str = msgs[1].get(0);
-    assert_eq!(id1, "1");
-    assert_eq!(id2, "2");
+
+    let id1: i32 = msgs[0].get(0);
+    let id2: i32 = msgs[1].get(0);
+    assert_eq!(id1, 1);
+    assert_eq!(id2, 2);
 
     let _ = std::fs::remove_dir_all(&data_dir);
     let _ = std::fs::remove_dir_all(&backup_dir);

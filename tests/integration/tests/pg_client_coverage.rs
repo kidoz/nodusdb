@@ -127,10 +127,10 @@ async fn test_full_pg_client_coverage() {
     let rows = client.query(&select_active, &[&true]).await.unwrap();
     assert_eq!(rows.len(), 1);
 
-    // NodusDB returns everything as string/varchar for now in Extended Query Handler Describe.
-    let id_str: &str = rows[0].get(0);
+    // INT columns are declared as INT4 on the wire, so read them typed.
+    let id: i32 = rows[0].get(0);
     let name_str: &str = rows[0].get(1);
-    assert_eq!(id_str, "10");
+    assert_eq!(id, 10);
     assert_eq!(name_str, "Zara");
 
     // ---------------------------------------------------------
