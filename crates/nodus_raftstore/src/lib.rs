@@ -346,19 +346,19 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
                     }
                     if let Some(catalog) = &sm.catalog_writer {
                         match cmd {
-                            ShardCommand::CreateDatabase(req) => { 
+                            ShardCommand::CreateDatabase(req) => {
                                 if let Err(e) = catalog.create_database(req.clone()) {
-                                    tracing::debug!("CreateDatabase error: {}", e);
+                                    tracing::error!("CreateDatabase apply failed: {}", e);
                                 }
                             }
-                            ShardCommand::CreateSchema(req) => { 
+                            ShardCommand::CreateSchema(req) => {
                                 if let Err(e) = catalog.create_schema(req.clone()) {
-                                    tracing::debug!("CreateSchema error: {}", e);
+                                    tracing::error!("CreateSchema apply failed: {}", e);
                                 }
                             }
-                            ShardCommand::CreateTable(req) => { 
+                            ShardCommand::CreateTable(req) => {
                                 if let Err(e) = catalog.create_table(req.clone()) {
-                                    tracing::debug!("CreateTable error: {}", e);
+                                    tracing::error!("CreateTable apply failed: {}", e);
                                 }
                             }
                             ShardCommand::DropTable(id) => {

@@ -70,14 +70,11 @@ impl CatalogWriter for RaftCatalogWriter {
             tracing::error!("create_table client_write failed: {}", e);
             anyhow::bail!("create_table raft error: {}", e);
         }
-        
-        // Wait for state machine application
-        for _ in 0..1000 {
-            if let Ok(tbl) = self.reader.get_table_by_id(id) {
-                return Ok(tbl);
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+
+        // `client_write` (openraft 0.9) resolves only after the entry is applied to
+        // the leader's state machine, so the table is already visible here. Reading
+        // the local catalog is correct because a non-leader would have failed the
+        // `client_write` above with ForwardToLeader.
         self.reader.get_table_by_id(id)
     }
 
