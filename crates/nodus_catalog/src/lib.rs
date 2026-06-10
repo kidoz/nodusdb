@@ -709,14 +709,24 @@ impl CatalogReader for MemoryCatalog {
     }
 
     fn get_table(&self, database: &str, schema: &str, table: &str) -> Result<TableDescriptor> {
-        tracing::info!("get_table CALLED for database={}, schema={}, table={}", database, schema, table);
+        tracing::info!(
+            "get_table CALLED for database={}, schema={}, table={}",
+            database,
+            schema,
+            table
+        );
         let db = self.get_database(database)?;
         let sch = self.get_schema(database, schema)?;
         let guard = self.tables.read().unwrap();
         if let Some(t) = guard.get(&(db.id, sch.id, table.to_string())) {
             Ok(t.clone())
         } else {
-            tracing::error!("get_table failed. Looking for: db={}, sch={}, table={}", db.id, sch.id, table);
+            tracing::error!(
+                "get_table failed. Looking for: db={}, sch={}, table={}",
+                db.id,
+                sch.id,
+                table
+            );
             tracing::error!("Available tables:");
             for (k, _) in guard.iter() {
                 tracing::error!("  {:?}", k);
@@ -903,7 +913,10 @@ impl CatalogWriter for MemoryCatalog {
 
     fn drop_table(&self, id: TableId) -> Result<()> {
         let mut guard = self.tables.write().unwrap();
-        let key = guard.iter().find(|(_, t)| t.id == id).map(|(k, _)| k.clone());
+        let key = guard
+            .iter()
+            .find(|(_, t)| t.id == id)
+            .map(|(k, _)| k.clone());
         if let Some(key) = key {
             guard.remove(&key);
             drop(guard);
@@ -916,7 +929,10 @@ impl CatalogWriter for MemoryCatalog {
 
     fn drop_schema(&self, id: SchemaId) -> Result<()> {
         let mut guard = self.schemas.write().unwrap();
-        let key = guard.iter().find(|(_, s)| s.id == id).map(|(k, _)| k.clone());
+        let key = guard
+            .iter()
+            .find(|(_, s)| s.id == id)
+            .map(|(k, _)| k.clone());
         if let Some(key) = key {
             guard.remove(&key);
             drop(guard);
@@ -993,7 +1009,9 @@ impl CatalogWriter for MemoryCatalog {
                 table.name = new_name.clone();
                 new_key.2 = new_name;
             }
-            TableDescriptorChange::RenameColumn { old_name, new_name, .. } => {
+            TableDescriptorChange::RenameColumn {
+                old_name, new_name, ..
+            } => {
                 if let Some(col) = table.columns.iter_mut().find(|c| c.name == old_name) {
                     col.name = new_name;
                 } else {
@@ -1159,6 +1177,8 @@ mod tests {
                 schema_id: sch.id,
                 name: "users".into(),
                 columns: vec![],
+                constraints: vec![],
+                view_query: None,
             })
             .unwrap();
         assert_eq!(tbl.name, "users");
