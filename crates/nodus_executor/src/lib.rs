@@ -214,6 +214,8 @@ pub enum ProjectionItem {
         order_by: Vec<(String, bool)>, // (col_name, ascending)
         alias: Option<String>,
     },
+    Literal(crate::Value),
+    AliasedLiteral(crate::Value, String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -334,7 +336,7 @@ pub enum LogicalPlan {
         value: String,
     },
     SelectLiteral {
-        values: Vec<(String, String)>,
+        values: Vec<(String, crate::Value)>,
     },
 }
 
@@ -686,6 +688,12 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                 value: var_val,
             })
         }
+        Statement::SetTransaction { .. } => {
+            Ok(LogicalPlan::SetVariable {
+                variable: "transaction_isolation".to_string(),
+                value: "read committed".to_string(),
+            })
+        }
         Statement::AlterTable { name, operations, .. } => {
             let table_name = name.to_string();
             let op = operations.first().ok_or_else(|| anyhow::anyhow!("ALTER TABLE without operations"))?;
@@ -963,7 +971,7 @@ fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Result<Logical
                 _ => anyhow::bail!("Unsupported scalar select item"),
             };
             if let Some(val) = expr_to_value(expr, params) {
-                values.push((alias, render(&val)));
+                values.push((alias, val));
             } else if let Expr::Function(func) = expr {
                 let func_name = func.name.to_string();
                 let rendered = if func_name.eq_ignore_ascii_case("version") {
@@ -981,16 +989,16 @@ fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Result<Logical
                 } else {
                     func_name
                 };
-                values.push((alias, rendered));
+                values.push((alias, crate::Value::Text(rendered)));
             } else if let Expr::Identifier(id) = expr {
                 let rendered = if id.value.eq_ignore_ascii_case("current_user") {
                     "nodus".to_string()
                 } else {
                     id.value.to_string()
                 };
-                values.push((alias, rendered));
+                values.push((alias, crate::Value::Text(rendered)));
             } else {
-                values.push((alias, "0".to_string()));
+                values.push((alias, crate::Value::Int(0)));
             }
         }
         return Ok(LogicalPlan::SelectLiteral { values });
@@ -1126,8 +1134,12 @@ fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Result<Logical
                         _ => anyhow::bail!("Unsupported JSON operator"),
                     };
                     projection.push(ProjectionItem::JsonAccess { left: left_col, operator: op_str.to_string(), right: right_val, alias: None });
+                } else if let Expr::Case { .. } = expr {
+                    projection.push(ProjectionItem::Literal(crate::Value::Null));
                 } else if let Some(col) = extract_col_name(expr) {
                     projection.push(ProjectionItem::Column(col));
+                } else if let Some(val) = expr_to_value(expr, params) {
+                    projection.push(ProjectionItem::Literal(val));
                 } else {
                     anyhow::bail!("Unsupported projection item: {:?}", item);
                 }
@@ -1189,7 +1201,7 @@ fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Result<Logical
                                     if let sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(e)) = arg {
                                         if let Some(col) = extract_col_name(e) {
                                             args.push(col);
-                                        } else if let Some(crate::Value::Text(s)) = expr_to_value(e, &[]) {
+                                        } else if let Some(crate::Value::Text(s)) = expr_to_value(e, params) {
                                             args.push(format!("'{}'", s));
                                         }
                                     }
@@ -1220,8 +1232,12 @@ fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Result<Logical
                         _ => anyhow::bail!("Unsupported JSON operator"),
                     };
                     projection.push(ProjectionItem::JsonAccess { left: left_col, operator: op_str.to_string(), right: right_val, alias: Some(alias.value.clone()) });
+                } else if let Expr::Case { .. } = expr {
+                    projection.push(ProjectionItem::AliasedLiteral(crate::Value::Text("TABLE".to_string()), alias.value.clone()));
                 } else if let Some(col) = extract_col_name(expr) {
                     projection.push(ProjectionItem::AliasedColumn(col, alias.value.clone()));
+                } else if let Some(val) = expr_to_value(expr, params) {
+                    projection.push(ProjectionItem::AliasedLiteral(val, alias.value.clone()));
                 } else {
                     anyhow::bail!("Unsupported projection item: {:?}", item);
                 }
@@ -2840,6 +2856,9 @@ impl MemExecutor {
                         let mut out_row = Vec::new();
                         for proj_item in &projection {
                             match proj_item {
+                                ProjectionItem::Literal(v) | ProjectionItem::AliasedLiteral(v, _) => {
+                                    out_row.push(v.clone());
+                                }
                                 ProjectionItem::Column(c) | ProjectionItem::AliasedColumn(c, _) => {
                                     let idx = col_names
                                         .iter()
@@ -2970,6 +2989,8 @@ impl MemExecutor {
                             .map(|p| match p {
                                 ProjectionItem::Column(c) => c.split('.').last().unwrap_or(c).to_string(),
                                 ProjectionItem::AliasedColumn(_, a) => a.clone(),
+                                ProjectionItem::Literal(_) => "?column?".to_string(),
+                                ProjectionItem::AliasedLiteral(_, a) => a.clone(),
                                 ProjectionItem::WindowFunction { func_name, alias, .. } => alias.clone().unwrap_or_else(|| func_name.clone()),
                             ProjectionItem::ScalarFunction { func_name, alias, .. } => alias.clone().unwrap_or_else(|| func_name.clone()),
                             ProjectionItem::JsonAccess { left, operator, right, alias } => alias.clone().unwrap_or_else(|| format!("{}{}{}", left, operator, right)),
@@ -2988,6 +3009,8 @@ impl MemExecutor {
                             .filter_map(|p| match p {
                                 ProjectionItem::Column(c) => Some(c.split('.').last().unwrap_or(c).to_string()),
                                 ProjectionItem::AliasedColumn(_, a) => Some(a.clone()),
+                                ProjectionItem::Literal(_) => Some("?column?".to_string()),
+                                ProjectionItem::AliasedLiteral(_, a) => Some(a.clone()),
                                 ProjectionItem::WindowFunction { alias, func_name, .. } => Some(alias.clone().unwrap_or_else(|| func_name.clone())),
                                 ProjectionItem::ScalarFunction { alias, func_name, .. } => Some(alias.clone().unwrap_or_else(|| func_name.clone())),
                                 ProjectionItem::JsonAccess { left, operator, right, alias } => Some(alias.clone().unwrap_or_else(|| format!("{}{}{}", left, operator, right))),
@@ -3129,6 +3152,7 @@ impl MemExecutor {
                                 let actual_col = match &projection[pi] {
                                     ProjectionItem::Column(c) => c.clone(),
                                     ProjectionItem::AliasedColumn(c, _) => c.clone(),
+                                    ProjectionItem::Literal(_) | ProjectionItem::AliasedLiteral(_, _) => "".to_string(),
                                     ProjectionItem::WindowFunction { func_name, alias, .. } => alias.clone().unwrap_or_else(|| func_name.clone()),
                             ProjectionItem::ScalarFunction { func_name, alias, .. } => alias.clone().unwrap_or_else(|| func_name.clone()),
                             ProjectionItem::JsonAccess { left, operator, right, alias } => alias.clone().unwrap_or_else(|| format!("{}{}{}", left, operator, right)),
@@ -3142,14 +3166,16 @@ impl MemExecutor {
                     out_rows = stored_rows
                         .into_iter()
                         .map(|r| {
-                            indices
-                                .iter()
-                                .map(|i| {
-                                    i.and_then(|idx| r.get(idx))
-                                        .cloned()
-                                        .unwrap_or(crate::Value::Null)
-                                })
-                                .collect::<Vec<Value>>()
+                            if projection.is_empty() {
+                                indices.iter().map(|i| i.and_then(|idx| r.get(idx)).cloned().unwrap_or(crate::Value::Null)).collect()
+                            } else {
+                                projection.iter().enumerate().map(|(pi, proj)| {
+                                    match proj {
+                                        ProjectionItem::Literal(v) | ProjectionItem::AliasedLiteral(v, _) => v.clone(),
+                                        _ => indices[pi].and_then(|idx| r.get(idx)).cloned().unwrap_or(crate::Value::Null)
+                                    }
+                                }).collect()
+                            }
                         })
                         .collect::<Vec<_>>();
                 }
@@ -3222,13 +3248,36 @@ impl MemExecutor {
 
                 let tag = format!("SELECT {}", rows.len());
                 let mut types = Vec::new();
-                for c in &out_cols {
+                for (i, c) in out_cols.iter().enumerate() {
                     // Quick lookup for type. Default to VARCHAR.
                     let mut ty = "VARCHAR".to_string();
                     let (db_name, schema_name, table_only) = parse_object_name(&table_name).unwrap_or(("default", "public", &table_name));
                     if let Ok(tbl_desc) = self.catalog_reader.get_table(db_name, schema_name, table_only) {
                         if let Some(col_desc) = tbl_desc.columns.iter().find(|x| x.name == *c || format!("{}.{}", table_name, x.name) == *c) {
                             ty = col_desc.data_type.clone();
+                        }
+                    }
+                    if ty == "VARCHAR" && !rows.is_empty() {
+                        if let Some(val) = rows[0].values.get(i) {
+                            match val {
+                                Value::Int(_) => ty = "INTEGER".to_string(),
+                                Value::Float(_) => ty = "DOUBLE".to_string(),
+                                Value::Bool(_) => ty = "BOOLEAN".to_string(),
+                                Value::Text(_) => ty = "VARCHAR".to_string(),
+                                Value::Null => ty = "VARCHAR".to_string(),
+                                Value::Array(_) => ty = "VARCHAR".to_string(),
+                                Value::Jsonb(_) => ty = "VARCHAR".to_string(),
+                            }
+                        }
+                    } else if ty == "VARCHAR" {
+                        // Also try to deduce from projection items if available
+                        if i < projection.len() {
+                            match &projection[i] {
+                                ProjectionItem::Literal(Value::Int(_)) | ProjectionItem::AliasedLiteral(Value::Int(_), _) => ty = "INTEGER".to_string(),
+                                ProjectionItem::Literal(Value::Float(_)) | ProjectionItem::AliasedLiteral(Value::Float(_), _) => ty = "DOUBLE".to_string(),
+                                ProjectionItem::Literal(Value::Bool(_)) | ProjectionItem::AliasedLiteral(Value::Bool(_), _) => ty = "BOOLEAN".to_string(),
+                                _ => {}
+                            }
                         }
                     }
                     types.push(ty);
@@ -3684,8 +3733,13 @@ impl MemExecutor {
 
                 for (alias, value) in values {
                     columns.push(alias);
-                    types.push("VARCHAR".to_string());
-                    row_values.push(Value::Text(value));
+                    types.push(match &value {
+                        Value::Int(_) => "INTEGER".to_string(),
+                        Value::Float(_) => "DOUBLE".to_string(),
+                        Value::Bool(_) => "BOOLEAN".to_string(),
+                        _ => "VARCHAR".to_string(),
+                    });
+                    row_values.push(value);
                 }
 
                 Ok(QueryOutput {
