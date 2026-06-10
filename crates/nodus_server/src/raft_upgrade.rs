@@ -12,7 +12,10 @@ pub struct RaftUpgradeCoordinator {
 impl RaftUpgradeCoordinator {
     async fn get_raft(&self) -> Result<Raft<NodusTypeConfig>> {
         let rafts = self.raft_state.rafts.read().await;
-        rafts.get("shard-meta").cloned().ok_or_else(|| anyhow::anyhow!("Meta shard raft not found"))
+        rafts
+            .get("shard-meta")
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Meta shard raft not found"))
     }
 }
 
@@ -26,7 +29,9 @@ impl UpgradeCoordinator for RaftUpgradeCoordinator {
         let res = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
                 let raft = self.get_raft().await?;
-                raft.client_write(cmd).await.map_err(|e| anyhow::anyhow!("raft write error: {}", e))
+                raft.client_write(cmd)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("raft write error: {}", e))
             })
         });
         if let Err(e) = res {
@@ -37,11 +42,15 @@ impl UpgradeCoordinator for RaftUpgradeCoordinator {
     }
 
     fn report_node_upgraded(&self, node_id: &str) -> Result<()> {
-        let cmd = ShardCommand::UpgradeNodeUpgraded { node_id: node_id.to_string() };
+        let cmd = ShardCommand::UpgradeNodeUpgraded {
+            node_id: node_id.to_string(),
+        };
         let res = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
                 let raft = self.get_raft().await?;
-                raft.client_write(cmd).await.map_err(|e| anyhow::anyhow!("raft write error: {}", e))
+                raft.client_write(cmd)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("raft write error: {}", e))
             })
         });
         if let Err(e) = res {
@@ -56,7 +65,9 @@ impl UpgradeCoordinator for RaftUpgradeCoordinator {
         let res = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
                 let raft = self.get_raft().await?;
-                raft.client_write(cmd).await.map_err(|e| anyhow::anyhow!("raft write error: {}", e))
+                raft.client_write(cmd)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("raft write error: {}", e))
             })
         });
         if let Err(e) = res {
@@ -71,7 +82,9 @@ impl UpgradeCoordinator for RaftUpgradeCoordinator {
         let res = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
                 let raft = self.get_raft().await?;
-                raft.client_write(cmd).await.map_err(|e| anyhow::anyhow!("raft write error: {}", e))
+                raft.client_write(cmd)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("raft write error: {}", e))
             })
         });
         if let Err(e) = res {

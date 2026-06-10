@@ -13,7 +13,10 @@ pub struct RaftCatalogWriter {
 impl RaftCatalogWriter {
     async fn get_raft(&self) -> Result<Raft<NodusTypeConfig>> {
         let rafts = self.raft_state.rafts.read().await;
-        rafts.get("shard-meta").cloned().ok_or_else(|| anyhow::anyhow!("Meta shard raft not found"))
+        rafts
+            .get("shard-meta")
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Meta shard raft not found"))
     }
 }
 
@@ -25,7 +28,9 @@ impl CatalogWriter for RaftCatalogWriter {
         let res = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
                 let raft = self.get_raft().await?;
-                raft.client_write(cmd).await.map_err(|e| anyhow::anyhow!("raft write error: {}", e))
+                raft.client_write(cmd)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("raft write error: {}", e))
             })
         });
         if let Err(e) = res {
@@ -43,7 +48,9 @@ impl CatalogWriter for RaftCatalogWriter {
         let res = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
                 let raft = self.get_raft().await?;
-                raft.client_write(cmd).await.map_err(|e| anyhow::anyhow!("raft write error: {}", e))
+                raft.client_write(cmd)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("raft write error: {}", e))
             })
         });
         if let Err(e) = res {
@@ -58,12 +65,14 @@ impl CatalogWriter for RaftCatalogWriter {
         let _db_id = request.database_id;
         let _sch_id = request.schema_id;
         let id = request.id;
-        
+
         let cmd = ShardCommand::CreateTable(request);
         let res = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
                 let raft = self.get_raft().await?;
-                raft.client_write(cmd).await.map_err(|e| anyhow::anyhow!("raft write error: {}", e))
+                raft.client_write(cmd)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("raft write error: {}", e))
             })
         });
         if let Err(e) = res {
@@ -83,7 +92,9 @@ impl CatalogWriter for RaftCatalogWriter {
         let res = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
                 let raft = self.get_raft().await?;
-                raft.client_write(cmd).await.map_err(|e| anyhow::anyhow!("raft write error: {}", e))
+                raft.client_write(cmd)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("raft write error: {}", e))
             })
         });
         if let Err(e) = res {
@@ -98,7 +109,9 @@ impl CatalogWriter for RaftCatalogWriter {
         let res = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
                 let raft = self.get_raft().await?;
-                raft.client_write(cmd).await.map_err(|e| anyhow::anyhow!("raft write error: {}", e))
+                raft.client_write(cmd)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("raft write error: {}", e))
             })
         });
         if let Err(e) = res {
@@ -114,7 +127,9 @@ impl CatalogWriter for RaftCatalogWriter {
         let res = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
                 let raft = self.get_raft().await?;
-                raft.client_write(cmd).await.map_err(|e| anyhow::anyhow!("raft write error: {}", e))
+                raft.client_write(cmd)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("raft write error: {}", e))
             })
         });
         if let Err(e) = res {
@@ -123,13 +138,15 @@ impl CatalogWriter for RaftCatalogWriter {
         }
         self.reader.get_grant_by_id(id)
     }
-    
+
     fn revoke_privileges(&self, request: RevokePrivilegesRequest) -> Result<()> {
         let cmd = ShardCommand::RevokePrivileges(request);
         let res = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
                 let raft = self.get_raft().await?;
-                raft.client_write(cmd).await.map_err(|e| anyhow::anyhow!("raft write error: {}", e))
+                raft.client_write(cmd)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("raft write error: {}", e))
             })
         });
         if let Err(e) = res {
@@ -138,7 +155,7 @@ impl CatalogWriter for RaftCatalogWriter {
         }
         Ok(())
     }
-        fn update_table_descriptor(&self, change: TableDescriptorChange) -> Result<TableDescriptor> {
+    fn update_table_descriptor(&self, change: TableDescriptorChange) -> Result<TableDescriptor> {
         let table_id = match &change {
             TableDescriptorChange::AddColumn { table_id, .. } => *table_id,
             TableDescriptorChange::RenameTable { table_id, .. } => *table_id,
@@ -150,7 +167,9 @@ impl CatalogWriter for RaftCatalogWriter {
         let res = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
                 let raft = self.get_raft().await?;
-                raft.client_write(cmd).await.map_err(|e| anyhow::anyhow!("raft write error: {}", e))
+                raft.client_write(cmd)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("raft write error: {}", e))
             })
         });
         if let Err(e) = res {
@@ -166,7 +185,9 @@ impl CatalogWriter for RaftCatalogWriter {
         let res = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
                 let raft = self.get_raft().await?;
-                raft.client_write(cmd).await.map_err(|e| anyhow::anyhow!("raft write error: {}", e))
+                raft.client_write(cmd)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("raft write error: {}", e))
             })
         });
         if let Err(e) = res {
@@ -175,14 +196,16 @@ impl CatalogWriter for RaftCatalogWriter {
         }
         self.reader.get_principal_by_id(id)
     }
-    
+
     fn grant_privilege(&self, request: GrantPrivilegeRequest) -> Result<GrantDescriptor> {
         let id = request.id;
         let cmd = ShardCommand::GrantPrivilege(request.clone());
         let res = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
                 let raft = self.get_raft().await?;
-                raft.client_write(cmd).await.map_err(|e| anyhow::anyhow!("raft write error: {}", e))
+                raft.client_write(cmd)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("raft write error: {}", e))
             })
         });
         if let Err(e) = res {
@@ -191,13 +214,15 @@ impl CatalogWriter for RaftCatalogWriter {
         }
         self.reader.get_grant_by_id(id)
     }
-    
+
     fn revoke_privilege(&self, request: RevokePrivilegeRequest) -> Result<()> {
         let cmd = ShardCommand::RevokePrivilege(request);
         let res = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
                 let raft = self.get_raft().await?;
-                raft.client_write(cmd).await.map_err(|e| anyhow::anyhow!("raft write error: {}", e))
+                raft.client_write(cmd)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("raft write error: {}", e))
             })
         });
         if let Err(e) = res {
@@ -206,13 +231,15 @@ impl CatalogWriter for RaftCatalogWriter {
         }
         Ok(())
     }
-    
+
     fn add_role_member(&self, request: AddRoleMemberRequest) -> Result<()> {
         let cmd = ShardCommand::AddRoleMember(request);
         let res = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
                 let raft = self.get_raft().await?;
-                raft.client_write(cmd).await.map_err(|e| anyhow::anyhow!("raft write error: {}", e))
+                raft.client_write(cmd)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("raft write error: {}", e))
             })
         });
         if let Err(e) = res {
@@ -221,12 +248,23 @@ impl CatalogWriter for RaftCatalogWriter {
         }
         Ok(())
     }
-    fn update_index_state(&self, table_id: TableId, index_id: IndexId, state: IndexState) -> Result<()> {
-        let cmd = ShardCommand::UpdateIndexState { table_id, index_id, state };
+    fn update_index_state(
+        &self,
+        table_id: TableId,
+        index_id: IndexId,
+        state: IndexState,
+    ) -> Result<()> {
+        let cmd = ShardCommand::UpdateIndexState {
+            table_id,
+            index_id,
+            state,
+        };
         let res = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
                 let raft = self.get_raft().await?;
-                raft.client_write(cmd).await.map_err(|e| anyhow::anyhow!("raft write error: {}", e))
+                raft.client_write(cmd)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("raft write error: {}", e))
             })
         });
         if let Err(e) = res {

@@ -70,7 +70,10 @@ async fn write_val(State(state): State<RaftState>, Json(val): Json<i32>) -> Json
     };
     let cmd2 = ShardCommand::CommitTxn {
         txn_id,
-        commit_ts: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_micros() as u64,
+        commit_ts: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_micros() as u64,
     };
     let raft = state.rafts.read().await.get("shard-meta").cloned().unwrap();
     if raft.client_write(cmd1).await.is_err() {
@@ -88,10 +91,7 @@ async fn init_cluster(
 ) -> Json<bool> {
     let mut nodes = BTreeMap::new();
     for (i, addr) in addrs.into_iter().enumerate() {
-        nodes.insert(
-            (i + 1) as u64,
-            BasicNode { addr },
-        );
+        nodes.insert((i + 1) as u64, BasicNode { addr });
     }
 
     let raft = state.rafts.read().await.get("shard-meta").cloned().unwrap();
@@ -186,7 +186,10 @@ async fn test_cluster_partition_linearizability() {
     let partitioned = Arc::new(AtomicBool::new(false));
 
     for i in 1..=3 {
-        let addr: SocketAddr = format!("127.0.0.1:{}", 15430 + i + (std::process::id() % 1000) * 10).parse().unwrap();
+        let addr: SocketAddr =
+            format!("127.0.0.1:{}", 15430 + i + (std::process::id() % 1000) * 10)
+                .parse()
+                .unwrap();
 
         let kv = Arc::new(nodus_storage_mem::MemKvEngine::new());
         let catalog = std::sync::Arc::new(nodus_catalog::MemoryCatalog::new());
@@ -201,7 +204,7 @@ async fn test_cluster_partition_linearizability() {
                 inner: NodusNetworkFactory::new("shard-meta".to_string()),
                 partitioned: part_clone,
             };
-            
+
             let raft = NodusRaft::new(
                 i as u64,
                 raft_config_clone,
@@ -211,9 +214,13 @@ async fn test_cluster_partition_linearizability() {
             )
             .await
             .expect("Raft new failed");
-            
+
             let raft_state = RaftState::new();
-            raft_state.rafts.write().await.insert("shard-meta".to_string(), raft);
+            raft_state
+                .rafts
+                .write()
+                .await
+                .insert("shard-meta".to_string(), raft);
 
             let app = raft_routes()
                 .route("/test/init", post(init_cluster))
@@ -221,8 +228,10 @@ async fn test_cluster_partition_linearizability() {
                 .route("/test/read", get(read_val))
                 .with_state(raft_state);
 
-            let listener = tokio::net::TcpListener::bind(addr).await.expect("TcpListener bind failed");
-            
+            let listener = tokio::net::TcpListener::bind(addr)
+                .await
+                .expect("TcpListener bind failed");
+
             let res = axum::serve(listener, app).await;
             println!("Axum serve ended for node {}: {:?}", i, res);
         });
@@ -233,7 +242,7 @@ async fn test_cluster_partition_linearizability() {
 
     // 2. Initialize cluster
     let client = reqwest::Client::new();
-    
+
     for _ in 0..50 {
         if tokio::net::TcpStream::connect(&nodes[0].1).await.is_ok() {
             break;

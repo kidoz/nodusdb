@@ -1,10 +1,10 @@
 use anyhow::Result;
 use bytes::Bytes;
+use nodus_raftstore::NodusTypeConfig;
 use nodus_raftstore::ShardCommand;
 use nodus_storage_api::{KeyRange, KvEngine, KvPair, Timestamp, TxnId};
 use openraft::Raft;
 use std::sync::Arc;
-use nodus_raftstore::NodusTypeConfig;
 
 pub struct RaftKvEngine {
     pub local: Arc<dyn KvEngine>,
@@ -32,7 +32,11 @@ impl KvEngine for RaftKvEngine {
         };
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
-                let _ = self.raft.client_write(cmd).await.map_err(|e| anyhow::anyhow!("raft write error: {}", e))?;
+                let _ = self
+                    .raft
+                    .client_write(cmd)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("raft write error: {}", e))?;
                 Ok::<(), anyhow::Error>(())
             })
         })?;
@@ -46,7 +50,11 @@ impl KvEngine for RaftKvEngine {
         };
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
-                let _ = self.raft.client_write(cmd).await.map_err(|e| anyhow::anyhow!("raft write error: {}", e))?;
+                let _ = self
+                    .raft
+                    .client_write(cmd)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("raft write error: {}", e))?;
                 Ok::<(), anyhow::Error>(())
             })
         })?;
@@ -60,7 +68,11 @@ impl KvEngine for RaftKvEngine {
         };
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
-                let _ = self.raft.client_write(cmd).await.map_err(|e| anyhow::anyhow!("raft write error: {}", e))?;
+                let _ = self
+                    .raft
+                    .client_write(cmd)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("raft write error: {}", e))?;
                 Ok::<(), anyhow::Error>(())
             })
         })?;
@@ -73,7 +85,11 @@ impl KvEngine for RaftKvEngine {
         };
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
-                let _ = self.raft.client_write(cmd).await.map_err(|e| anyhow::anyhow!("raft write error: {}", e))?;
+                let _ = self
+                    .raft
+                    .client_write(cmd)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("raft write error: {}", e))?;
                 Ok::<(), anyhow::Error>(())
             })
         })?;

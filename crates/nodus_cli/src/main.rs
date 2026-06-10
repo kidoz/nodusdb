@@ -392,7 +392,12 @@ async fn main() -> anyhow::Result<()> {
             println!("{}", serde_json::to_string_pretty(&v)?);
         }
         Commands::Backup {
-            cmd: BackupCmd::Restore { id, target_ts, addr },
+            cmd:
+                BackupCmd::Restore {
+                    id,
+                    target_ts,
+                    addr,
+                },
         } => {
             let url = if let Some(ts) = target_ts {
                 format!("{addr}/api/v1/backups/{id}/restore?target_ts={ts}")

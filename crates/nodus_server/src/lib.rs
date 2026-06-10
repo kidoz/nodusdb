@@ -1,7 +1,7 @@
 #![allow(clippy::collapsible_if)]
 mod admin;
-mod raft_kv;
 mod raft_catalog;
+mod raft_kv;
 mod raft_upgrade;
 
 use admin::{AdminState, admin_routes};
@@ -157,21 +157,24 @@ pub async fn run_server_with_config(
     };
 
     tracing::debug!("Loading KV and catalog");
-    let (local_kv, catalog): (Arc<dyn nodus_storage_api::KvEngine>, _) = match &config.storage.data_dir {
-        Some(dir) => {
-            let path = std::path::Path::new(dir);
-            std::fs::create_dir_all(path).unwrap();
-            let cat_path = path.join("catalog.json");
-            let cat = Arc::new(nodus_catalog::MemoryCatalog::load_from_disk(cat_path).unwrap());
-            let k = Arc::new(nodus_storage_lsm::LsmKvEngine::with_wal(path, encryption_key).unwrap());
-            (k, cat)
-        }
-        None => {
-            let cat = Arc::new(nodus_catalog::MemoryCatalog::new());
-            let k = Arc::new(nodus_storage_mem::MemKvEngine::new());
-            (k, cat)
-        }
-    };
+    let (local_kv, catalog): (Arc<dyn nodus_storage_api::KvEngine>, _) =
+        match &config.storage.data_dir {
+            Some(dir) => {
+                let path = std::path::Path::new(dir);
+                std::fs::create_dir_all(path).unwrap();
+                let cat_path = path.join("catalog.json");
+                let cat = Arc::new(nodus_catalog::MemoryCatalog::load_from_disk(cat_path).unwrap());
+                let k = Arc::new(
+                    nodus_storage_lsm::LsmKvEngine::with_wal(path, encryption_key).unwrap(),
+                );
+                (k, cat)
+            }
+            None => {
+                let cat = Arc::new(nodus_catalog::MemoryCatalog::new());
+                let k = Arc::new(nodus_storage_mem::MemKvEngine::new());
+                (k, cat)
+            }
+        };
     tracing::debug!("Loaded KV and catalog");
 
     let cluster_version = catalog
@@ -217,7 +220,11 @@ pub async fn run_server_with_config(
     });
 
     let raft_state = nodus_raftstore::server::RaftState::new();
-    raft_state.rafts.write().await.insert("shard-meta".to_string(), raft.clone());
+    raft_state
+        .rafts
+        .write()
+        .await
+        .insert("shard-meta".to_string(), raft.clone());
 
     let raft_catalog_writer = Arc::new(crate::raft_catalog::RaftCatalogWriter {
         local: catalog.clone(),
@@ -248,7 +255,7 @@ pub async fn run_server_with_config(
             nodes.insert(node_id, openraft::BasicNode::new(&advertise_addr));
             let _ = raft_clone.initialize(nodes).await;
             tracing::debug!("Background raft initialization complete");
-            
+
             // Wait for leader to establish
             let mut retries = 0;
             while retries < 10 {
@@ -260,32 +267,38 @@ pub async fn run_server_with_config(
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 retries += 1;
             }
-            
+
             // Bootstrap the catalog on the leader
             tracing::debug!("Running bootstrap!");
             let db_id = nodus_catalog::DatabaseId::new();
-            let cmd1 = nodus_raftstore::ShardCommand::CreateDatabase(nodus_catalog::CreateDatabaseRequest {
-                id: db_id,
-                name: "default".into(),
-                owner_role_id: None,
-            });
+            let cmd1 = nodus_raftstore::ShardCommand::CreateDatabase(
+                nodus_catalog::CreateDatabaseRequest {
+                    id: db_id,
+                    name: "default".into(),
+                    owner_role_id: None,
+                },
+            );
             if let Err(e) = raft_clone.client_write(cmd1).await {
                 tracing::debug!("Bootstrap create_database failed: {}", e);
             } else {
-                let cmd2 = nodus_raftstore::ShardCommand::CreateSchema(nodus_catalog::CreateSchemaRequest {
-                    id: nodus_catalog::SchemaId::new(),
-                    database_id: db_id,
-                    name: "public".into(),
-                    owner_role_id: None,
-                    managed_access: false,
-                });
+                let cmd2 = nodus_raftstore::ShardCommand::CreateSchema(
+                    nodus_catalog::CreateSchemaRequest {
+                        id: nodus_catalog::SchemaId::new(),
+                        database_id: db_id,
+                        name: "public".into(),
+                        owner_role_id: None,
+                        managed_access: false,
+                    },
+                );
                 if let Err(e) = raft_clone.client_write(cmd2).await {
                     tracing::debug!("Bootstrap create_schema failed: {}", e);
                 } else {
                     tracing::debug!("Bootstrap succeeded");
                 }
             }
-            state_clone.is_ready.store(true, std::sync::atomic::Ordering::Release);
+            state_clone
+                .is_ready
+                .store(true, std::sync::atomic::Ordering::Release);
         } else {
             tracing::debug!("Attempting to join existing cluster via {:?}", join_peers);
             let client = reqwest::Client::new();
@@ -297,12 +310,12 @@ pub async fn run_server_with_config(
                         "node_id": node_id,
                         "raft_advertise_addr": advertise_addr
                     });
-                    
+
                     let mut req = client.post(&url).json(&payload);
                     if let Some(token) = &admin_token {
                         req = req.bearer_auth(token);
                     }
-                    
+
                     match req.send().await {
                         Ok(resp) if resp.status().is_success() => {
                             tracing::debug!("Successfully joined cluster via {}", peer);
@@ -312,7 +325,12 @@ pub async fn run_server_with_config(
                         Ok(resp) => {
                             let status = resp.status();
                             let text = resp.text().await.unwrap_or_default();
-                            tracing::debug!("Failed to join via {}: status {}, body: {}", peer, status, text);
+                            tracing::debug!(
+                                "Failed to join via {}: status {}, body: {}",
+                                peer,
+                                status,
+                                text
+                            );
                         }
                         Err(e) => {
                             tracing::debug!("Failed to join via {}: {}", peer, e);
@@ -327,7 +345,9 @@ pub async fn run_server_with_config(
             if !joined {
                 tracing::debug!("FATAL: Failed to join cluster after retries");
             } else {
-                state_clone.is_ready.store(true, std::sync::atomic::Ordering::Release);
+                state_clone
+                    .is_ready
+                    .store(true, std::sync::atomic::Ordering::Release);
             }
         }
     });
@@ -368,7 +388,9 @@ pub async fn run_server_with_config(
     authenticator.set_password("nodus", admin.id, &admin_password);
 
     let server_config = load_tls_config(&config.tls)?;
-    let tls_acceptor = server_config.as_ref().map(|c| Arc::new(TlsAcceptor::from(c.clone())));
+    let tls_acceptor = server_config
+        .as_ref()
+        .map(|c| Arc::new(TlsAcceptor::from(c.clone())));
     tracing::debug!("TLS acceptor loaded");
 
     // Background MVCC garbage collector: periodically reclaims superseded
@@ -503,8 +525,6 @@ pub async fn run_server_with_config(
         membership_lock: Arc::new(tokio::sync::Mutex::new(())),
     };
 
-    
-
     let app = Router::new()
         .merge(monitoring_routes(state.clone()))
         .merge(admin_routes(admin_state))
@@ -561,7 +581,8 @@ pub async fn run_server_with_config(
                 handle_clone.graceful_shutdown(Some(std::time::Duration::from_secs(5)));
             });
             let tls_config = axum_server::tls_rustls::RustlsConfig::from_config(cfg);
-            axum_server::from_tcp_rustls(http_listener.into_std().unwrap(), tls_config).unwrap()
+            axum_server::from_tcp_rustls(http_listener.into_std().unwrap(), tls_config)
+                .unwrap()
                 .handle(handle)
                 .serve(app.into_make_service())
                 .await

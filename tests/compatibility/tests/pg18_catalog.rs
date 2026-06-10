@@ -34,47 +34,64 @@ async fn test_pg18_catalog_introspection() {
     let server = TestServer::start().await.expect("server starts");
     let client = connect(&server).await;
 
-    client.simple_query("CREATE SCHEMA orm_test;").await.unwrap();
     client
-        .simple_query("CREATE TABLE orm_test.users (id INT PRIMARY KEY, name TEXT NOT NULL, age INT);")
+        .simple_query("CREATE SCHEMA orm_test;")
+        .await
+        .unwrap();
+    client
+        .simple_query(
+            "CREATE TABLE orm_test.users (id INT PRIMARY KEY, name TEXT NOT NULL, age INT);",
+        )
         .await
         .unwrap();
 
     // Query pg_namespace
-    let msgs = client.simple_query("SELECT nspname FROM pg_catalog.pg_namespace WHERE nspname = 'orm_test';").await.unwrap();
+    let msgs = client
+        .simple_query("SELECT nspname FROM pg_catalog.pg_namespace WHERE nspname = 'orm_test';")
+        .await
+        .unwrap();
     let rows = rows_of(&msgs);
     assert_eq!(rows.len(), 1, "Expected 1 namespace row");
     assert_eq!(rows[0].get("nspname"), Some("orm_test"));
 
     // Query pg_class (tables)
-    let msgs = client.simple_query(
-        "SELECT c.relname \n\
+    let msgs = client
+        .simple_query(
+            "SELECT c.relname \n\
          FROM pg_catalog.pg_class c \n\
          JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \n\
-         WHERE n.nspname = 'orm_test' AND c.relname = 'users';"
-    ).await.unwrap();
+         WHERE n.nspname = 'orm_test' AND c.relname = 'users';",
+        )
+        .await
+        .unwrap();
     let rows = rows_of(&msgs);
     assert_eq!(rows.len(), 1, "Expected 1 pg_class row");
     assert_eq!(rows[0].get("relname"), Some("users"));
 
     // Query pg_attribute (columns)
-    let msgs = client.simple_query(
-        "SELECT a.attname, a.attnotnull \n\
+    let msgs = client
+        .simple_query(
+            "SELECT a.attname, a.attnotnull \n\
          FROM pg_catalog.pg_attribute a \n\
          JOIN pg_catalog.pg_class c ON a.attrelid = c.oid \n\
          JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \n\
-         WHERE n.nspname = 'orm_test' AND c.relname = 'users' AND a.attnum > 0;"
-    ).await.unwrap();
+         WHERE n.nspname = 'orm_test' AND c.relname = 'users' AND a.attnum > 0;",
+        )
+        .await
+        .unwrap();
     let rows = rows_of(&msgs);
     assert_eq!(rows.len(), 3, "Expected 3 pg_attribute rows");
-    
+
     // Sort or just check existence
     let mut cols: Vec<Option<&str>> = rows.iter().map(|r| r.get("attname")).collect();
     cols.sort();
     assert_eq!(cols, vec![Some("age"), Some("id"), Some("name")]);
 
     // Query pg_type (types)
-    let msgs = client.simple_query("SELECT typname FROM pg_catalog.pg_type WHERE oid = 23;").await.unwrap();
+    let msgs = client
+        .simple_query("SELECT typname FROM pg_catalog.pg_type WHERE oid = 23;")
+        .await
+        .unwrap();
     let rows = rows_of(&msgs);
     assert_eq!(rows.len(), 1, "Expected 1 pg_type row");
     assert_eq!(rows[0].get("typname"), Some("int4"));

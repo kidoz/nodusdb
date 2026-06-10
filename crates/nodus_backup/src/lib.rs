@@ -437,11 +437,15 @@ impl BackupOrchestrator {
 
     /// Verifies then returns the backed-up objects keyed by their logical name.
     /// For incremental backups, this recursively resolves the parent backup.
-    pub fn restore<'a>(&'a self, backup_id: &'a str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<BackupObject>>> + Send + 'a>> {
+    pub fn restore<'a>(
+        &'a self,
+        backup_id: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<BackupObject>>> + Send + 'a>>
+    {
         Box::pin(async move {
             self.verify(backup_id).await?;
             let manifest = self.load_manifest(backup_id).await?;
-            
+
             if manifest.backup_type == BackupType::Incremental {
                 if let Some(parent) = manifest.parent_backup_id {
                     // Return the parent's objects. PITR logic (WAL replay) will handle the diff.
@@ -451,14 +455,14 @@ impl BackupOrchestrator {
                 }
             }
 
-        let prefix = format!("{backup_id}/data/");
-        let mut out = Vec::new();
-        for key in &manifest.files {
-            let bytes = self.repo.get_object(key, None).await?;
-            let name = key.strip_prefix(&prefix).unwrap_or(key).to_string();
-            out.push(BackupObject { name, bytes });
-        }
-        Ok(out)
+            let prefix = format!("{backup_id}/data/");
+            let mut out = Vec::new();
+            for key in &manifest.files {
+                let bytes = self.repo.get_object(key, None).await?;
+                let name = key.strip_prefix(&prefix).unwrap_or(key).to_string();
+                out.push(BackupObject { name, bytes });
+            }
+            Ok(out)
         })
     }
 
@@ -484,7 +488,10 @@ impl BackupOrchestrator {
     /// Archives a WAL segment.
     pub async fn archive_wal(&self, filename: &str, data: Bytes) -> Result<()> {
         let key = format!("wal_archive/{}", filename);
-        self.repo.put_object(&key, data, PutOptions { content_type: None }).await.map(|_| ())
+        self.repo
+            .put_object(&key, data, PutOptions { content_type: None })
+            .await
+            .map(|_| ())
     }
 
     /// Retrieves all archived WAL segments, sorted chronologically by numeric file stem.
@@ -493,11 +500,18 @@ impl BackupOrchestrator {
         let mut wals = Vec::new();
         for obj in objects {
             let bytes = self.repo.get_object(&obj.key, None).await?;
-            let name = obj.key.strip_prefix("wal_archive/").unwrap_or(&obj.key).to_string();
+            let name = obj
+                .key
+                .strip_prefix("wal_archive/")
+                .unwrap_or(&obj.key)
+                .to_string();
             wals.push((name, bytes));
         }
         wals.sort_by_key(|(name, _)| {
-            name.strip_suffix(".log").unwrap_or("0").parse::<u64>().unwrap_or(0)
+            name.strip_suffix(".log")
+                .unwrap_or("0")
+                .parse::<u64>()
+                .unwrap_or(0)
         });
         Ok(wals)
     }

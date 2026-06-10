@@ -34,7 +34,10 @@ async fn test_pg18_not_null_unique() {
     let server = TestServer::start().await.expect("server starts");
     let client = connect(&server).await;
 
-    client.simple_query("CREATE SCHEMA pg18_types_schema;").await.unwrap();
+    client
+        .simple_query("CREATE SCHEMA pg18_types_schema;")
+        .await
+        .unwrap();
 
     client
         .simple_query("CREATE TABLE pg18_types_schema.users (id INT PRIMARY KEY, username TEXT NOT NULL UNIQUE, email TEXT UNIQUE);")
@@ -52,7 +55,11 @@ async fn test_pg18_not_null_unique() {
         .await
         .unwrap_err();
     let db_err = err.as_db_error().expect("Expected DbError");
-    assert!(db_err.message().contains("cannot be NULL") || db_err.message().contains("NOT NULL"), "Expected NOT NULL error, got: {}", db_err.message());
+    assert!(
+        db_err.message().contains("cannot be NULL") || db_err.message().contains("NOT NULL"),
+        "Expected NOT NULL error, got: {}",
+        db_err.message()
+    );
 
     // Should fail: UNIQUE constraint
     let err = client
@@ -60,7 +67,14 @@ async fn test_pg18_not_null_unique() {
         .await
         .unwrap_err();
     let db_err = err.as_db_error().expect("Expected DbError");
-    assert!(db_err.message().contains("Unique constraint violation") || db_err.message().contains("UNIQUE") || db_err.message().contains("Duplicate") || db_err.message().contains("conflict"), "Expected UNIQUE error, got: {}", db_err.message());
+    assert!(
+        db_err.message().contains("Unique constraint violation")
+            || db_err.message().contains("UNIQUE")
+            || db_err.message().contains("Duplicate")
+            || db_err.message().contains("conflict"),
+        "Expected UNIQUE error, got: {}",
+        db_err.message()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -68,7 +82,10 @@ async fn test_pg18_check_constraint() {
     let server = TestServer::start().await.expect("server starts");
     let client = connect(&server).await;
 
-    client.simple_query("CREATE SCHEMA pg18_types_schema;").await.unwrap();
+    client
+        .simple_query("CREATE SCHEMA pg18_types_schema;")
+        .await
+        .unwrap();
 
     client
         .simple_query("CREATE TABLE pg18_types_schema.products (id INT PRIMARY KEY, name TEXT NOT NULL, price NUMERIC CHECK (price > 0));")
@@ -76,16 +93,26 @@ async fn test_pg18_check_constraint() {
         .unwrap();
 
     client
-        .simple_query("INSERT INTO pg18_types_schema.products (id, name, price) VALUES (1, 'Widget', 10.50);")
+        .simple_query(
+            "INSERT INTO pg18_types_schema.products (id, name, price) VALUES (1, 'Widget', 10.50);",
+        )
         .await
         .unwrap();
 
     let err = client
-        .simple_query("INSERT INTO pg18_types_schema.products (id, name, price) VALUES (2, 'Freebie', 0);")
+        .simple_query(
+            "INSERT INTO pg18_types_schema.products (id, name, price) VALUES (2, 'Freebie', 0);",
+        )
         .await
         .unwrap_err();
     let db_err = err.as_db_error().expect("Expected DbError");
-    assert!(db_err.message().contains("violates check constraint") || db_err.message().contains("CHECK") || db_err.message().contains("check constraint"), "Expected CHECK constraint error, got: {}", db_err.message());
+    assert!(
+        db_err.message().contains("violates check constraint")
+            || db_err.message().contains("CHECK")
+            || db_err.message().contains("check constraint"),
+        "Expected CHECK constraint error, got: {}",
+        db_err.message()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -93,7 +120,10 @@ async fn test_pg18_foreign_key() {
     let server = TestServer::start().await.expect("server starts");
     let client = connect(&server).await;
 
-    client.simple_query("CREATE SCHEMA pg18_types_schema;").await.unwrap();
+    client
+        .simple_query("CREATE SCHEMA pg18_types_schema;")
+        .await
+        .unwrap();
 
     client
         .simple_query("CREATE TABLE pg18_types_schema.users (id INT PRIMARY KEY);")
@@ -120,7 +150,13 @@ async fn test_pg18_foreign_key() {
         .await
         .unwrap_err();
     let db_err = err.as_db_error().expect("Expected DbError");
-    assert!(db_err.message().contains("violates foreign key constraint") || db_err.message().contains("FOREIGN KEY") || db_err.message().contains("foreign key constraint"), "Expected FK error, got: {}", db_err.message());
+    assert!(
+        db_err.message().contains("violates foreign key constraint")
+            || db_err.message().contains("FOREIGN KEY")
+            || db_err.message().contains("foreign key constraint"),
+        "Expected FK error, got: {}",
+        db_err.message()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -128,17 +164,22 @@ async fn test_pg18_data_types() {
     let server = TestServer::start().await.expect("server starts");
     let client = connect(&server).await;
 
-    client.simple_query("CREATE SCHEMA pg18_types_schema;").await.unwrap();
+    client
+        .simple_query("CREATE SCHEMA pg18_types_schema;")
+        .await
+        .unwrap();
 
     client
-        .simple_query("CREATE TABLE pg18_types_schema.all_types (
+        .simple_query(
+            "CREATE TABLE pg18_types_schema.all_types (
             id INT PRIMARY KEY,
             is_active BOOLEAN,
             score REAL,
             rating DOUBLE PRECISION,
             created_at TIMESTAMP,
             start_date DATE
-        );")
+        );",
+        )
         .await
         .unwrap();
 
@@ -153,7 +194,7 @@ async fn test_pg18_data_types() {
         .unwrap();
     let rows = rows_of(&msgs);
     assert_eq!(rows.len(), 1);
-    
+
     assert_eq!(rows[0].get("id"), Some("1"));
     assert_eq!(rows[0].get("is_active"), Some("t"));
     assert_eq!(rows[0].get("score"), Some("4.5"));

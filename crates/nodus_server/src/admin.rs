@@ -9,6 +9,7 @@ use axum::{
     response::Response,
     routing::{get, post},
 };
+use base64::Engine;
 use bytes::Bytes;
 use nodus_audit::{AuditEvent, AuditQuery, AuditQueryable};
 use nodus_authz::{Action, AuthzContext, AuthzEngine, AuthzExplanation, AuthzRequest};
@@ -19,7 +20,6 @@ use nodus_security::{SessionInfo, SessionRegistry};
 use nodus_sharding::ShardOrchestrator;
 use nodus_storage_wal::WalEngine;
 use serde_json::{Value, json};
-use base64::Engine;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -71,9 +71,15 @@ async fn require_token(
         _ => return Err(StatusCode::FORBIDDEN),
     };
 
-    let principal_id = if let Some(auth) = req.headers().get(AUTHORIZATION).and_then(|h| h.to_str().ok()) {
+    let principal_id = if let Some(auth) = req
+        .headers()
+        .get(AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+    {
         if let Some(basic) = auth.strip_prefix("Basic ") {
-            let decoded = base64::engine::general_purpose::STANDARD.decode(basic).map_err(|_| StatusCode::UNAUTHORIZED)?;
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(basic)
+                .map_err(|_| StatusCode::UNAUTHORIZED)?;
             let s = String::from_utf8(decoded).map_err(|_| StatusCode::UNAUTHORIZED)?;
             let mut parts = s.splitn(2, ':');
             let user = parts.next().unwrap_or("");
@@ -117,10 +123,17 @@ async fn require_token(
         resource: nodus_catalog::ResourceRef::System,
         context: nodus_authz::AuthzContext { database_id: None },
     };
-    
-    let decision = state.authz.authorize(authz_req).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let decision = state
+        .authz
+        .authorize(authz_req)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     if !decision.allowed {
-        tracing::debug!("Authorization failed for principal {} on action {:?}", principal_id, action);
+        tracing::debug!(
+            "Authorization failed for principal {} on action {:?}",
+            principal_id,
+            action
+        );
         return Err(StatusCode::FORBIDDEN);
     }
 
@@ -148,7 +161,10 @@ pub fn admin_routes(state: AdminState) -> Router {
         .route("/api/v1/shards/:table/rebalance", post(shards_rebalance))
         .route("/api/v1/queries", get(slow_queries))
         .route("/api/v1/node/drain", post(node_drain))
-        .route("/api/v1/node/take-leadership/:shard_id", post(take_leadership))
+        .route(
+            "/api/v1/node/take-leadership/:shard_id",
+            post(take_leadership),
+        )
         .route("/api/v1/cluster/join", post(cluster_join))
         .route_layer(from_fn_with_state(state.clone(), require_token))
         .with_state(state)
@@ -166,19 +182,36 @@ async fn cluster_join(
 ) -> impl axum::response::IntoResponse {
     let _guard = state.membership_lock.lock().await;
     let node = openraft::BasicNode::new(&req.raft_advertise_addr);
-    let raft = state.raft_state.rafts.read().await.get("shard-meta").cloned().unwrap();
+    let raft = state
+        .raft_state
+        .rafts
+        .read()
+        .await
+        .get("shard-meta")
+        .cloned()
+        .unwrap();
     match raft.add_learner(req.node_id, node, true).await {
         Ok(_) => {
             // Once learner is added, attempt to promote it to a voter.
             let metrics = raft.metrics().borrow().clone();
-            let mut members: std::collections::BTreeSet<u64> = metrics.membership_config.membership().voter_ids().collect();
+            let mut members: std::collections::BTreeSet<u64> =
+                metrics.membership_config.membership().voter_ids().collect();
             members.insert(req.node_id);
             match raft.change_membership(members, true).await {
-                Ok(_) => (StatusCode::OK, Json(json!({ "joined": true, "node_id": req.node_id }))),
-                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("Failed to change membership: {}", e) }))),
+                Ok(_) => (
+                    StatusCode::OK,
+                    Json(json!({ "joined": true, "node_id": req.node_id })),
+                ),
+                Err(e) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": format!("Failed to change membership: {}", e) })),
+                ),
             }
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("Failed to add learner: {}", e) }))),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("Failed to add learner: {}", e) })),
+        ),
     }
 }
 
@@ -201,9 +234,11 @@ async fn node_drain(
     let mut transfers = 0;
     let client = reqwest::Client::new();
     let rafts = state.raft_state.rafts.read().await;
-    
+
     // Grab the auth header to forward it to the peer
-    let auth_header = headers.get(axum::http::header::AUTHORIZATION).and_then(|h| h.to_str().ok());
+    let auth_header = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok());
 
     for (shard_id, raft) in rafts.iter() {
         let metrics = raft.metrics().borrow().clone();
@@ -211,14 +246,22 @@ async fn node_drain(
             let voters: Vec<u64> = metrics.membership_config.membership().voter_ids().collect();
             for node in voters {
                 if node != metrics.id {
-                    if let Some(n) = metrics.membership_config.membership().nodes().find(|(k, _)| k == &&node) {
-                        let url = format!("http://{}/api/v1/node/take-leadership/{}", n.1.addr, shard_id);
-                        
+                    if let Some(n) = metrics
+                        .membership_config
+                        .membership()
+                        .nodes()
+                        .find(|(k, _)| k == &&node)
+                    {
+                        let url = format!(
+                            "http://{}/api/v1/node/take-leadership/{}",
+                            n.1.addr, shard_id
+                        );
+
                         let mut req = client.post(&url);
                         if let Some(auth) = auth_header {
                             req = req.header(axum::http::header::AUTHORIZATION, auth);
                         }
-                        
+
                         if let Ok(resp) = req.send().await {
                             if resp.status().is_success() {
                                 transfers += 1;
@@ -231,7 +274,9 @@ async fn node_drain(
         }
     }
 
-    Json(json!({ "draining": true, "sessions_cancelled": sessions.len(), "leadership_transfers": transfers }))
+    Json(
+        json!({ "draining": true, "sessions_cancelled": sessions.len(), "leadership_transfers": transfers }),
+    )
 }
 
 async fn take_leadership(
@@ -241,11 +286,20 @@ async fn take_leadership(
     let rafts = state.raft_state.rafts.read().await;
     if let Some(raft) = rafts.get(&shard_id) {
         if let Err(e) = raft.trigger().elect().await {
-            return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })));
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": e.to_string() })),
+            );
         }
-        (axum::http::StatusCode::OK, Json(json!({ "status": "election_triggered" })))
+        (
+            axum::http::StatusCode::OK,
+            Json(json!({ "status": "election_triggered" })),
+        )
     } else {
-        (axum::http::StatusCode::NOT_FOUND, Json(json!({ "error": "shard not found" })))
+        (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(json!({ "error": "shard not found" })),
+        )
     }
 }
 
@@ -432,7 +486,6 @@ async fn create_backup(
     }
 }
 
-
 async fn delete_backup(State(state): State<AdminState>, Path(id): Path<String>) -> Json<Value> {
     match state.backup.delete_backup(&id).await {
         Ok(()) => Json(json!({ "deleted": true })),
@@ -491,7 +544,10 @@ async fn restore_backup(
                                     Bytes::from(val_bytes),
                                 );
                                 let _ = state.kv.commit(txn_id, ver);
-                                tracing::debug!("Restored KV pair from baseline: key={:?}", String::from_utf8_lossy(&key_bytes));
+                                tracing::debug!(
+                                    "Restored KV pair from baseline: key={:?}",
+                                    String::from_utf8_lossy(&key_bytes)
+                                );
                             }
                         }
                     }
@@ -504,25 +560,50 @@ async fn restore_backup(
                     for (_name, bytes) in wals {
                         let tmp = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
                         std::fs::write(&tmp, bytes).unwrap();
-                        if let Ok(wal_engine) = nodus_storage_wal::FileWalEngine::with_encryption(&tmp, state.wal_key) {
+                        if let Ok(wal_engine) =
+                            nodus_storage_wal::FileWalEngine::with_encryption(&tmp, state.wal_key)
+                        {
                             if let Ok(records) = wal_engine.recover() {
                                 for record in records {
                                     let nodus_storage_wal::WalRecord::V1(rec) = record;
                                     match rec {
-                                        nodus_storage_wal::WalRecordV1::WriteIntent { txn_id, key, value } => {
-                                            let _ = state.kv.write_intent(txn_id, Bytes::from(key), Bytes::from(value));
+                                        nodus_storage_wal::WalRecordV1::WriteIntent {
+                                            txn_id,
+                                            key,
+                                            value,
+                                        } => {
+                                            let _ = state.kv.write_intent(
+                                                txn_id,
+                                                Bytes::from(key),
+                                                Bytes::from(value),
+                                            );
                                             active_txns.insert(txn_id);
                                         }
-                                        nodus_storage_wal::WalRecordV1::DeleteIntent { txn_id, key } => {
-                                            let _ = state.kv.delete_intent(txn_id, Bytes::from(key));
+                                        nodus_storage_wal::WalRecordV1::DeleteIntent {
+                                            txn_id,
+                                            key,
+                                        } => {
+                                            let _ =
+                                                state.kv.delete_intent(txn_id, Bytes::from(key));
                                             active_txns.insert(txn_id);
                                         }
-                                        nodus_storage_wal::WalRecordV1::CommitTxn { txn_id, commit_ts } => {
+                                        nodus_storage_wal::WalRecordV1::CommitTxn {
+                                            txn_id,
+                                            commit_ts,
+                                        } => {
                                             if commit_ts <= target_ts {
-                                                tracing::debug!("Replayed commit_ts {} <= target_ts {}", commit_ts, target_ts);
+                                                tracing::debug!(
+                                                    "Replayed commit_ts {} <= target_ts {}",
+                                                    commit_ts,
+                                                    target_ts
+                                                );
                                                 let _ = state.kv.commit(txn_id, commit_ts);
                                             } else {
-                                                tracing::debug!("Skipped commit_ts {} > target_ts {}", commit_ts, target_ts);
+                                                tracing::debug!(
+                                                    "Skipped commit_ts {} > target_ts {}",
+                                                    commit_ts,
+                                                    target_ts
+                                                );
                                                 let _ = state.kv.abort(txn_id);
                                             }
                                             active_txns.remove(&txn_id);

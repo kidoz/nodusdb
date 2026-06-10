@@ -20,7 +20,10 @@ impl RaftNetwork<NodusTypeConfig> for NodusNetwork {
         rpc: AppendEntriesRequest<NodusTypeConfig>,
         _option: RPCOption,
     ) -> Result<AppendEntriesResponse<u64>, RPCError<u64, BasicNode, RaftError<u64>>> {
-        let url = format!("http://{}/raft/{}/append", self.target_node.addr, self.shard_id);
+        let url = format!(
+            "http://{}/raft/{}/append",
+            self.target_node.addr, self.shard_id
+        );
         let resp = self
             .client
             .post(url)
@@ -45,7 +48,10 @@ impl RaftNetwork<NodusTypeConfig> for NodusNetwork {
         InstallSnapshotResponse<u64>,
         RPCError<u64, BasicNode, RaftError<u64, InstallSnapshotError>>,
     > {
-        let url = format!("http://{}/raft/{}/snapshot", self.target_node.addr, self.shard_id);
+        let url = format!(
+            "http://{}/raft/{}/snapshot",
+            self.target_node.addr, self.shard_id
+        );
         let resp = self
             .client
             .post(url)
@@ -67,7 +73,10 @@ impl RaftNetwork<NodusTypeConfig> for NodusNetwork {
         rpc: VoteRequest<u64>,
         _option: RPCOption,
     ) -> Result<VoteResponse<u64>, RPCError<u64, BasicNode, RaftError<u64>>> {
-        let url = format!("http://{}/raft/{}/vote", self.target_node.addr, self.shard_id);
+        let url = format!(
+            "http://{}/raft/{}/vote",
+            self.target_node.addr, self.shard_id
+        );
         let resp = self
             .client
             .post(url)

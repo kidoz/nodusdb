@@ -81,8 +81,12 @@ pub enum ShardCommand {
         state: nodus_catalog::IndexState,
     },
     // Upgrade Replication Commands
-    UpgradeStart { target_version: String },
-    UpgradeNodeUpgraded { node_id: String },
+    UpgradeStart {
+        target_version: String,
+    },
+    UpgradeNodeUpgraded {
+        node_id: String,
+    },
     UpgradeFinalize,
     UpgradeRollback,
 }
@@ -130,7 +134,11 @@ impl NodusRaftStore {
         }
     }
 
-    pub fn with_kv_and_catalog(kv: Arc<dyn nodus_storage_api::KvEngine>, catalog_writer: Arc<dyn nodus_catalog::CatalogWriter>, catalog_reader: Arc<dyn nodus_catalog::CatalogReader>) -> Self {
+    pub fn with_kv_and_catalog(
+        kv: Arc<dyn nodus_storage_api::KvEngine>,
+        catalog_writer: Arc<dyn nodus_catalog::CatalogWriter>,
+        catalog_reader: Arc<dyn nodus_catalog::CatalogReader>,
+    ) -> Self {
         Self {
             log: Arc::new(RwLock::new(BTreeMap::new())),
             vote: Arc::new(RwLock::new(None)),
@@ -306,14 +314,18 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
                 EntryPayload::Normal(cmd) => {
                     tracing::info!("Raft applying command: {:?}", cmd);
                     if let Some(kv) = &sm.kv {
-                        use nodus_storage_api::TxnId;
                         use bytes::Bytes;
+                        use nodus_storage_api::TxnId;
                         use std::str::FromStr;
 
                         match cmd {
                             ShardCommand::PutIntent { txn_id, key, value } => {
                                 if let Ok(tid) = uuid::Uuid::from_str(txn_id) {
-                                    let _ = kv.write_intent(TxnId(tid), Bytes::from(key.clone()), Bytes::from(value.clone()));
+                                    let _ = kv.write_intent(
+                                        TxnId(tid),
+                                        Bytes::from(key.clone()),
+                                        Bytes::from(value.clone()),
+                                    );
                                 }
                             }
                             ShardCommand::DeleteIntent { txn_id, key } => {
@@ -331,9 +343,15 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
                                     let _ = kv.abort(TxnId(tid));
                                 }
                             }
-                            ShardCommand::IndexPutIntent { txn_id, key, value, .. } => {
+                            ShardCommand::IndexPutIntent {
+                                txn_id, key, value, ..
+                            } => {
                                 if let Ok(tid) = uuid::Uuid::from_str(txn_id) {
-                                    let _ = kv.write_intent(TxnId(tid), Bytes::from(key.clone()), Bytes::from(value.clone()));
+                                    let _ = kv.write_intent(
+                                        TxnId(tid),
+                                        Bytes::from(key.clone()),
+                                        Bytes::from(value.clone()),
+                                    );
                                 }
                             }
                             ShardCommand::IndexDeleteIntent { txn_id, key, .. } => {
@@ -371,18 +389,37 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
                                     tracing::debug!("DropSchema error: {}", e);
                                 }
                             }
-                            ShardCommand::GrantPrivileges(req) => { let _ = catalog.grant_privileges(req.clone()); }
-                            ShardCommand::RevokePrivileges(req) => { let _ = catalog.revoke_privileges(req.clone()); }
-                            ShardCommand::UpdateTableDescriptor(req) => { let _ = catalog.update_table_descriptor(req.clone()); }
-                            ShardCommand::CreateRole(req) => { 
+                            ShardCommand::GrantPrivileges(req) => {
+                                let _ = catalog.grant_privileges(req.clone());
+                            }
+                            ShardCommand::RevokePrivileges(req) => {
+                                let _ = catalog.revoke_privileges(req.clone());
+                            }
+                            ShardCommand::UpdateTableDescriptor(req) => {
+                                let _ = catalog.update_table_descriptor(req.clone());
+                            }
+                            ShardCommand::CreateRole(req) => {
                                 if let Err(e) = catalog.create_role(req.clone()) {
                                     tracing::debug!("CreateRole error: {}", e);
                                 }
                             }
-                            ShardCommand::GrantPrivilege(req) => { let _ = catalog.grant_privilege(req.clone()); }
-                            ShardCommand::RevokePrivilege(req) => { let _ = catalog.revoke_privilege(req.clone()); }
-                            ShardCommand::AddRoleMember(req) => { let _ = catalog.add_role_member(req.clone()); }
-                            ShardCommand::UpdateIndexState { table_id, index_id, state } => { let _ = catalog.update_index_state(*table_id, *index_id, state.clone()); }
+                            ShardCommand::GrantPrivilege(req) => {
+                                let _ = catalog.grant_privilege(req.clone());
+                            }
+                            ShardCommand::RevokePrivilege(req) => {
+                                let _ = catalog.revoke_privilege(req.clone());
+                            }
+                            ShardCommand::AddRoleMember(req) => {
+                                let _ = catalog.add_role_member(req.clone());
+                            }
+                            ShardCommand::UpdateIndexState {
+                                table_id,
+                                index_id,
+                                state,
+                            } => {
+                                let _ =
+                                    catalog.update_index_state(*table_id, *index_id, state.clone());
+                            }
                             _ => {}
                         }
                     }
@@ -451,8 +488,8 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
                 // To restore KV, we iterate and inject rows.
                 // Depending on the KV engine, we may need to clear it first.
                 // For MVP, we'll just write_intent and commit the dumped versions.
-                use nodus_storage_api::TxnId;
                 use bytes::Bytes;
+                use nodus_storage_api::TxnId;
                 for (k, v, version) in snapshot_obj.kv {
                     let tid = TxnId::new();
                     let _ = kv.write_intent(tid, Bytes::from(k), Bytes::from(v));

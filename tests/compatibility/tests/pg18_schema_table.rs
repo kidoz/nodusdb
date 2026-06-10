@@ -42,7 +42,9 @@ async fn test_pg18_schema_operations() {
 
     // 2. Create Table in Schema
     client
-        .simple_query("CREATE TABLE test_schema.users (id INT PRIMARY KEY, name TEXT, created_at TIMESTAMP);")
+        .simple_query(
+            "CREATE TABLE test_schema.users (id INT PRIMARY KEY, name TEXT, created_at TIMESTAMP);",
+        )
         .await
         .expect("Failed to create table in schema");
 
@@ -57,7 +59,7 @@ async fn test_pg18_schema_operations() {
         .simple_query("SELECT id, name FROM test_schema.users WHERE id = 1;")
         .await
         .expect("Failed to select from schema table");
-    
+
     let rows = rows_of(&msgs);
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].get("id"), Some("1"));
@@ -123,7 +125,10 @@ async fn test_pg18_table_alterations() {
         .await
         .unwrap();
 
-    let msgs = client.simple_query("SELECT description FROM alter_test WHERE id = 1;").await.unwrap();
+    let msgs = client
+        .simple_query("SELECT description FROM alter_test WHERE id = 1;")
+        .await
+        .unwrap();
     let rows = rows_of(&msgs);
     assert_eq!(rows[0].get("description"), Some("Test desc"));
 
@@ -133,7 +138,10 @@ async fn test_pg18_table_alterations() {
         .await
         .expect("Failed to rename column");
 
-    let msgs = client.simple_query("SELECT details FROM alter_test WHERE id = 1;").await.unwrap();
+    let msgs = client
+        .simple_query("SELECT details FROM alter_test WHERE id = 1;")
+        .await
+        .unwrap();
     let rows = rows_of(&msgs);
     assert_eq!(rows[0].get("details"), Some("Test desc"));
 

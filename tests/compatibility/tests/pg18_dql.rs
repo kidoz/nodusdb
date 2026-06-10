@@ -34,9 +34,17 @@ async fn test_pg18_joins() {
     let server = TestServer::start().await.expect("server starts");
     let client = connect(&server).await;
 
-    client.simple_query("CREATE SCHEMA pg18_dql;").await.unwrap();
+    client
+        .simple_query("CREATE SCHEMA pg18_dql;")
+        .await
+        .unwrap();
 
-    client.simple_query("CREATE TABLE pg18_dql.departments (dept_id INT PRIMARY KEY, dept_name TEXT);").await.unwrap();
+    client
+        .simple_query(
+            "CREATE TABLE pg18_dql.departments (dept_id INT PRIMARY KEY, dept_name TEXT);",
+        )
+        .await
+        .unwrap();
     client.simple_query("CREATE TABLE pg18_dql.employees (emp_id INT PRIMARY KEY, name TEXT, dept_id INT, salary NUMERIC);").await.unwrap();
 
     client.simple_query("INSERT INTO pg18_dql.departments (dept_id, dept_name) VALUES (1, 'Engineering'), (2, 'Sales'), (3, 'HR');").await.unwrap();
@@ -46,7 +54,10 @@ async fn test_pg18_joins() {
     let msgs = client.simple_query("SELECT e.emp_id, e.name, d.dept_name FROM pg18_dql.employees e JOIN pg18_dql.departments d ON e.dept_id = d.dept_id ORDER BY e.emp_id;").await.unwrap();
     let rows = rows_of(&msgs);
     if let Some(r) = rows.first() {
-        println!("COLUMNS: {:?}", r.columns().iter().map(|c| c.name()).collect::<Vec<_>>());
+        println!(
+            "COLUMNS: {:?}",
+            r.columns().iter().map(|c| c.name()).collect::<Vec<_>>()
+        );
     }
     assert_eq!(rows.len(), 3);
     assert_eq!(rows[0].get("emp_id"), Some("101"));
@@ -59,14 +70,14 @@ async fn test_pg18_joins() {
     assert_eq!(rows.len(), 4);
     assert_eq!(rows[3].get("emp_id"), Some("104"));
     assert_eq!(rows[3].get("dept_name"), None); // NULL in the text format
-    
+
     // RIGHT JOIN
     let msgs = client.simple_query("SELECT e.emp_id, e.name, d.dept_name FROM pg18_dql.employees e RIGHT JOIN pg18_dql.departments d ON e.dept_id = d.dept_id ORDER BY d.dept_id, e.emp_id;").await.unwrap();
     let rows = rows_of(&msgs);
     assert_eq!(rows.len(), 4);
     assert_eq!(rows[3].get("dept_name"), Some("HR"));
     assert_eq!(rows[3].get("emp_id"), None);
-    
+
     // FULL OUTER JOIN
     let msgs = client.simple_query("SELECT e.emp_id, e.name, d.dept_name FROM pg18_dql.employees e FULL OUTER JOIN pg18_dql.departments d ON e.dept_id = d.dept_id;").await.unwrap();
     let rows = rows_of(&msgs);
@@ -78,8 +89,16 @@ async fn test_pg18_ctes() {
     let server = TestServer::start().await.expect("server starts");
     let client = connect(&server).await;
 
-    client.simple_query("CREATE SCHEMA pg18_dql;").await.unwrap();
-    client.simple_query("CREATE TABLE pg18_dql.employees (emp_id INT PRIMARY KEY, name TEXT, dept_id INT);").await.unwrap();
+    client
+        .simple_query("CREATE SCHEMA pg18_dql;")
+        .await
+        .unwrap();
+    client
+        .simple_query(
+            "CREATE TABLE pg18_dql.employees (emp_id INT PRIMARY KEY, name TEXT, dept_id INT);",
+        )
+        .await
+        .unwrap();
     client.simple_query("INSERT INTO pg18_dql.employees (emp_id, name, dept_id) VALUES (101, 'Alice', 1), (102, 'Bob', 1);").await.unwrap();
 
     // Basic CTE
@@ -95,7 +114,10 @@ async fn test_pg18_window_functions() {
     let server = TestServer::start().await.expect("server starts");
     let client = connect(&server).await;
 
-    client.simple_query("CREATE SCHEMA pg18_dql;").await.unwrap();
+    client
+        .simple_query("CREATE SCHEMA pg18_dql;")
+        .await
+        .unwrap();
     client.simple_query("CREATE TABLE pg18_dql.employees (emp_id INT PRIMARY KEY, name TEXT, dept_id INT, salary NUMERIC);").await.unwrap();
     client.simple_query("INSERT INTO pg18_dql.employees (emp_id, name, dept_id, salary) VALUES (101, 'Alice', 1, 90000), (102, 'Bob', 1, 85000), (103, 'Charlie', 2, 75000), (104, 'David', 1, 60000);").await.unwrap();
 

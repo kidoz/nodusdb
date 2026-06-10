@@ -34,7 +34,10 @@ async fn test_pg18_jsonb() {
     let server = TestServer::start().await.expect("server starts");
     let client = connect(&server).await;
 
-    client.simple_query("CREATE SCHEMA pg18_adv_types;").await.unwrap();
+    client
+        .simple_query("CREATE SCHEMA pg18_adv_types;")
+        .await
+        .unwrap();
 
     client
         .simple_query("CREATE TABLE pg18_adv_types.events (id INT PRIMARY KEY, payload JSONB);")
@@ -47,15 +50,26 @@ async fn test_pg18_jsonb() {
         .unwrap();
 
     // JSON Operator ->>
-    let msgs = client.simple_query("SELECT payload->>'user' as username FROM pg18_adv_types.events WHERE id = 1;").await.unwrap();
+    let msgs = client
+        .simple_query(
+            "SELECT payload->>'user' as username FROM pg18_adv_types.events WHERE id = 1;",
+        )
+        .await
+        .unwrap();
     let rows = rows_of(&msgs);
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].get("username"), Some("alice"));
 
     // JSON Operator @>
-    let msgs = client.simple_query("SELECT id FROM pg18_adv_types.events WHERE payload @> '{\"active\": true}';").await.unwrap();
+    let msgs = client
+        .simple_query("SELECT id FROM pg18_adv_types.events WHERE payload @> '{\"active\": true}';")
+        .await
+        .unwrap();
     let rows = rows_of(&msgs);
-    println!("JSONB Rows: {:?}", rows.iter().map(|r| r.get("id")).collect::<Vec<_>>());
+    println!(
+        "JSONB Rows: {:?}",
+        rows.iter().map(|r| r.get("id")).collect::<Vec<_>>()
+    );
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].get("id"), Some("1"));
 }
@@ -65,7 +79,10 @@ async fn test_pg18_arrays() {
     let server = TestServer::start().await.expect("server starts");
     let client = connect(&server).await;
 
-    client.simple_query("CREATE SCHEMA pg18_adv_types;").await.unwrap();
+    client
+        .simple_query("CREATE SCHEMA pg18_adv_types;")
+        .await
+        .unwrap();
 
     client
         .simple_query("CREATE TABLE pg18_adv_types.events (id INT PRIMARY KEY, tags TEXT[]);")
@@ -78,7 +95,10 @@ async fn test_pg18_arrays() {
         .unwrap();
 
     // Array contains @>
-    let msgs = client.simple_query("SELECT id FROM pg18_adv_types.events WHERE tags @> ARRAY['signup'];").await.unwrap();
+    let msgs = client
+        .simple_query("SELECT id FROM pg18_adv_types.events WHERE tags @> ARRAY['signup'];")
+        .await
+        .unwrap();
     let rows = rows_of(&msgs);
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].get("id"), Some("1"));
@@ -89,7 +109,10 @@ async fn test_pg18_functions() {
     let server = TestServer::start().await.expect("server starts");
     let client = connect(&server).await;
 
-    client.simple_query("CREATE SCHEMA pg18_adv_types;").await.unwrap();
+    client
+        .simple_query("CREATE SCHEMA pg18_adv_types;")
+        .await
+        .unwrap();
 
     client
         .simple_query("CREATE TABLE pg18_adv_types.users (id INT PRIMARY KEY, first_name TEXT, last_name TEXT);")

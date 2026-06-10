@@ -34,20 +34,35 @@ async fn test_pg18_views() {
     let server = TestServer::start().await.expect("server starts");
     let client = connect(&server).await;
 
-    client.simple_query("CREATE SCHEMA pg18_views;").await.unwrap();
-    client.simple_query("CREATE TABLE pg18_views.base_table (id INT, val TEXT);").await.unwrap();
-    client.simple_query("INSERT INTO pg18_views.base_table VALUES (1, 'A'), (2, 'B');").await.unwrap();
+    client
+        .simple_query("CREATE SCHEMA pg18_views;")
+        .await
+        .unwrap();
+    client
+        .simple_query("CREATE TABLE pg18_views.base_table (id INT, val TEXT);")
+        .await
+        .unwrap();
+    client
+        .simple_query("INSERT INTO pg18_views.base_table VALUES (1, 'A'), (2, 'B');")
+        .await
+        .unwrap();
 
     // Create a view
     client.simple_query("CREATE VIEW pg18_views.my_view AS SELECT id, val FROM pg18_views.base_table WHERE id = 1;").await.unwrap();
 
     // Query the view
-    let msgs = client.simple_query("SELECT id, val FROM pg18_views.my_view;").await.unwrap();
+    let msgs = client
+        .simple_query("SELECT id, val FROM pg18_views.my_view;")
+        .await
+        .unwrap();
     let rows = rows_of(&msgs);
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].get("id"), Some("1"));
     assert_eq!(rows[0].get("val"), Some("A"));
 
     // Drop the view
-    client.simple_query("DROP VIEW pg18_views.my_view;").await.unwrap();
+    client
+        .simple_query("DROP VIEW pg18_views.my_view;")
+        .await
+        .unwrap();
 }
