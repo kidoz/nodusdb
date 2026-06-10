@@ -34,11 +34,18 @@ async fn test_java_jdbc_driver() {
         server.pgwire_addr.port()
     );
 
-    // Run `./gradlew test` in the java project directory
-    let mut cmd = Command::new("./tests/compatibility/jdbc/gradlew");
-    let status = cmd
+    // Skip (don't fail) on machines without a JVM; CI installs one.
+    if Command::new("java").arg("-version").output().is_err() {
+        eprintln!("skipping JDBC suite: `java` not found on PATH");
+        return;
+    }
+
+    // Run `./gradlew test` in the java project directory. Cargo runs test
+    // binaries with the package root as CWD, so resolve via CARGO_MANIFEST_DIR.
+    let jdbc_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("jdbc");
+    let status = Command::new(jdbc_dir.join("gradlew"))
         .arg("test")
-        .current_dir("tests/compatibility/jdbc")
+        .current_dir(&jdbc_dir)
         .env("NODUS_JDBC_URL", jdbc_url)
         .status()
         .expect("Failed to execute Gradle.");
