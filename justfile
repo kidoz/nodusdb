@@ -69,3 +69,8 @@ compose-up:
 # Tear down the local dev stack
 compose-down:
     docker compose -f deploy/docker-compose.yml down
+
+# Rebuild and rerun the root Docker Compose test stack
+compose-rerun:
+    docker compose -f compose.yaml down --remove-orphans
+    docker compose -f compose.yaml up --build --force-recreate

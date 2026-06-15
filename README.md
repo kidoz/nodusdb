@@ -46,6 +46,12 @@ To run the Docker Compose test stack:
 docker compose up --build
 ```
 
+To rebuild and rerun it through the task runner:
+
+```bash
+just compose-rerun
+```
+
 ## Development
 The project uses `just` as its task runner.
 
