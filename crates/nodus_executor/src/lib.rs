@@ -2281,6 +2281,20 @@ impl Executor for MemExecutor {
 }
 
 impl MemExecutor {
+    /// Builds a column descriptor for a synthesized pg_catalog table.
+    fn virtual_column(name: &str, data_type: &str) -> ColumnDescriptor {
+        ColumnDescriptor {
+            id: nodus_catalog::ColumnId::new(),
+            name: name.into(),
+            version: 1,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            state: nodus_catalog::DescriptorState::Public,
+            data_type: data_type.into(),
+            nullable: true,
+        }
+    }
+
     fn get_virtual_table(
         &self,
         db_name: &str,
@@ -2712,8 +2726,42 @@ impl MemExecutor {
                 }
                 Ok((cols, rows))
             }
+            // Synthesized as empty: NodusDB has no lock introspection, no
+            // COMMENT ON support, and no stored column defaults yet, so zero
+            // rows is the semantically correct answer. Introspecting clients
+            // (pgjdbc DatabaseMetaData, DataGrip/IntelliJ) scan or join these
+            // and handle empty results.
+            "pg_locks" => {
+                let cols = vec![
+                    Self::virtual_column("locktype", "TEXT"),
+                    Self::virtual_column("database", "INT"),
+                    Self::virtual_column("relation", "INT"),
+                    Self::virtual_column("pid", "INT"),
+                    Self::virtual_column("mode", "TEXT"),
+                    Self::virtual_column("granted", "BOOL"),
+                ];
+                Ok((cols, Vec::new()))
+            }
+            "pg_description" => {
+                let cols = vec![
+                    Self::virtual_column("objoid", "INT"),
+                    Self::virtual_column("classoid", "INT"),
+                    Self::virtual_column("objsubid", "INT"),
+                    Self::virtual_column("description", "TEXT"),
+                ];
+                Ok((cols, Vec::new()))
+            }
+            "pg_attrdef" => {
+                let cols = vec![
+                    Self::virtual_column("oid", "INT"),
+                    Self::virtual_column("adrelid", "INT"),
+                    Self::virtual_column("adnum", "INT"),
+                    Self::virtual_column("adbin", "TEXT"),
+                ];
+                Ok((cols, Vec::new()))
+            }
             _ => {
-                anyhow::bail!("Unsupported virtual table: {}", table_only)
+                anyhow::bail!("relation \"pg_catalog.{}\" does not exist", table_only)
             }
         }
     }

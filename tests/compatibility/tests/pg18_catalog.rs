@@ -96,3 +96,52 @@ async fn test_pg18_catalog_introspection() {
     assert_eq!(rows.len(), 1, "Expected 1 pg_type row");
     assert_eq!(rows[0].get("typname"), Some("int4"));
 }
+
+// pgjdbc DatabaseMetaData and DataGrip/IntelliJ introspection scan these
+// catalogs; they must answer with zero rows rather than error.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_pg18_catalog_introspection_only_tables_are_empty() {
+    let server = TestServer::start().await.expect("server starts");
+    let client = connect(&server).await;
+
+    for (query, table) in [
+        (
+            "SELECT locktype, database, relation, pid, mode, granted FROM pg_catalog.pg_locks;",
+            "pg_locks",
+        ),
+        (
+            "SELECT objoid, classoid, objsubid, description FROM pg_catalog.pg_description;",
+            "pg_description",
+        ),
+        (
+            "SELECT adrelid, adnum, adbin FROM pg_catalog.pg_attrdef;",
+            "pg_attrdef",
+        ),
+    ] {
+        let msgs = client.simple_query(query).await.unwrap();
+        assert_eq!(rows_of(&msgs).len(), 0, "Expected {} to be empty", table);
+    }
+}
+
+// Unknown pg_catalog relations must fail with SQLSTATE 42P01 (undefined
+// table), which introspecting clients handle quietly, not XX000.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_pg18_catalog_unknown_relation_is_undefined_table() {
+    let server = TestServer::start().await.expect("server starts");
+    let client = connect(&server).await;
+
+    let err = client
+        .simple_query("SELECT * FROM pg_catalog.pg_no_such_table;")
+        .await
+        .expect_err("unknown pg_catalog relation should error");
+    let db_err = err.as_db_error().expect("expected a database error");
+    assert_eq!(
+        db_err.code(),
+        &tokio_postgres::error::SqlState::UNDEFINED_TABLE
+    );
+    assert!(
+        db_err.message().contains("pg_no_such_table"),
+        "message should name the missing relation: {}",
+        db_err.message()
+    );
+}
