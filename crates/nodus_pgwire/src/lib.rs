@@ -181,26 +181,6 @@ fn map_type(data_type: &str) -> Type {
     map_declared_type(data_type).ty
 }
 
-/// pgjdbc's `DatabaseMetaData` calls issue catalog queries the executor cannot
-/// run yet (LEFT JOINs over pg_description/pg_attrdef, CASE expressions), so
-/// the two shapes the driver generates (getColumns / getTables) are answered
-/// with canned equivalents. Trigger only on markers unique to pgjdbc's
-/// generated SQL (`attisdropped`, `TABLE_SCHEM`) so ordinary user joins over
-/// pg_class/pg_namespace run as written.
-fn rewrite_jdbc_metadata_query(query: &str) -> Option<&'static str> {
-    if query.contains("pg_catalog.pg_attribute a") && query.contains("attisdropped") {
-        Some(
-            "SELECT 'public' AS nspname, c.relname, a.attname, 23 AS atttypid, false AS attnotnull, 0 AS atttypmod, 4 AS attlen, 0 AS typtypmod, a.attnum, '' AS attidentity, '' AS attgenerated, '' AS adsrc, '' AS description, 0 AS typbasetype, 'b' AS typtype FROM pg_catalog.pg_class c JOIN pg_catalog.pg_attribute a ON c.oid = a.attrelid WHERE c.relname LIKE 'test_%'",
-        )
-    } else if query.contains("TABLE_SCHEM") && query.contains("pg_catalog.pg_class") {
-        Some(
-            "SELECT c.relname AS TABLE_NAME, 'TABLE' AS TABLE_TYPE FROM pg_catalog.pg_class c WHERE c.relname LIKE 'test_%'",
-        )
-    } else {
-        None
-    }
-}
-
 /// Maps executor error text to the closest SQLSTATE so clients can react to
 /// the failure class (constraint handling, missing-relation fallbacks during
 /// introspection) instead of treating every error as an internal server fault.
@@ -1368,7 +1348,6 @@ impl SimpleQueryHandler for NodusQueryHandler {
         };
 
         let query_str = query;
-        let query_str = rewrite_jdbc_metadata_query(query_str).unwrap_or(query_str);
 
         // Parse SQL and translate to a logical plan. We now return actual errors
         // instead of silently succeeding, so unsupported queries fail fast.
@@ -1480,7 +1459,6 @@ impl NodusExtendedQueryHandler {
     where
         C: ClientInfo,
     {
-        let query_str = rewrite_jdbc_metadata_query(query_str).unwrap_or(query_str);
         let session_id = session_id_from_client(client);
         let principal_id = principal_id_from_client(client);
         let ctx = nodus_executor::ExecutionContext {
@@ -2126,7 +2104,6 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
         }
 
         let query_str = raw_sql;
-        let query_str = rewrite_jdbc_metadata_query(query_str).unwrap_or(query_str);
 
         let stmt = match nodus_sql::parse_sql(query_str) {
             Ok(mut stmts) if !stmts.is_empty() => stmts.remove(0),
@@ -2239,8 +2216,7 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
             authz_catalog_version: 1,
         };
 
-        let query_str = &stmt.statement;
-        let query_str = rewrite_jdbc_metadata_query(query_str).unwrap_or(query_str.as_str());
+        let query_str = stmt.statement.as_str();
 
         let mut fields = vec![];
         if let Ok(mut stmts) = nodus_sql::parse_sql(query_str)
@@ -2285,8 +2261,7 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        let query_str = &portal.statement.statement;
-        let query_str = rewrite_jdbc_metadata_query(query_str).unwrap_or(query_str.as_str());
+        let query_str = portal.statement.statement.as_str();
 
         let session_id = client
             .metadata()

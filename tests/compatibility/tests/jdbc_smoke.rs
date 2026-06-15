@@ -45,6 +45,7 @@ async fn test_java_jdbc_driver() {
     let jdbc_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("jdbc");
     let status = Command::new(jdbc_dir.join("gradlew"))
         .arg("test")
+        .arg("--rerun-tasks")
         .current_dir(&jdbc_dir)
         .env("NODUS_JDBC_URL", jdbc_url)
         .status()

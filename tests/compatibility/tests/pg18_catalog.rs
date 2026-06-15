@@ -123,6 +123,170 @@ async fn test_pg18_catalog_introspection_only_tables_are_empty() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn test_pg18_catalog_and_information_schema_metadata_surface() {
+    let server = TestServer::start().await.expect("server starts");
+    let client = connect(&server).await;
+
+    client
+        .simple_query("CREATE SCHEMA catalog_more;")
+        .await
+        .unwrap();
+    client
+        .simple_query(
+            "CREATE TABLE catalog_more.items (
+                id INT PRIMARY KEY,
+                code TEXT UNIQUE,
+                price NUMERIC CHECK (price > 0),
+                payload JSONB
+            );",
+        )
+        .await
+        .unwrap();
+    client
+        .simple_query("CREATE INDEX idx_items_payload ON catalog_more.items (payload);")
+        .await
+        .unwrap();
+
+    let msgs = client
+        .simple_query("SELECT datname FROM pg_catalog.pg_database WHERE datname = 'default';")
+        .await
+        .unwrap();
+    let rows = rows_of(&msgs);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("datname"), Some("default"));
+
+    let msgs = client
+        .simple_query(
+            "SELECT name, setting FROM pg_catalog.pg_settings \
+             WHERE name IN ('server_version_num', 'TimeZone') ORDER BY name;",
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows_of(&msgs).len(), 2);
+
+    let msgs = client
+        .simple_query("SELECT rolname FROM pg_catalog.pg_roles WHERE rolname = 'nodus';")
+        .await
+        .unwrap();
+    let rows = rows_of(&msgs);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("rolname"), Some("nodus"));
+
+    let msgs = client
+        .simple_query(
+            "SELECT collname FROM pg_catalog.pg_collation WHERE collname IN ('C', 'default');",
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows_of(&msgs).len(), 2);
+
+    let msgs = client
+        .simple_query("SELECT amname FROM pg_catalog.pg_am WHERE amname = 'btree';")
+        .await
+        .unwrap();
+    let rows = rows_of(&msgs);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("amname"), Some("btree"));
+
+    let msgs = client
+        .simple_query("SELECT oprname FROM pg_catalog.pg_operator WHERE oprname = '=';")
+        .await
+        .unwrap();
+    assert!(!rows_of(&msgs).is_empty());
+
+    let msgs = client
+        .simple_query("SELECT castsource, casttarget FROM pg_catalog.pg_cast;")
+        .await
+        .unwrap();
+    assert!(!rows_of(&msgs).is_empty());
+
+    let msgs = client
+        .simple_query(
+            "SELECT con.conname, con.contype \
+             FROM pg_catalog.pg_constraint con \
+             JOIN pg_catalog.pg_class cls ON con.conrelid = cls.oid \
+             JOIN pg_catalog.pg_namespace nsp ON cls.relnamespace = nsp.oid \
+             WHERE nsp.nspname = 'catalog_more' AND cls.relname = 'items';",
+        )
+        .await
+        .unwrap();
+    let rows = rows_of(&msgs);
+    assert!(
+        rows.iter().any(|row| row.get("contype") == Some("p")),
+        "expected primary key constraint"
+    );
+    assert!(
+        rows.iter().any(|row| row.get("contype") == Some("u")),
+        "expected unique constraint"
+    );
+    assert!(
+        rows.iter().any(|row| row.get("contype") == Some("c")),
+        "expected check constraint"
+    );
+
+    let msgs = client
+        .simple_query(
+            "SELECT table_name FROM information_schema.tables \
+             WHERE table_schema = 'catalog_more' AND table_name = 'items';",
+        )
+        .await
+        .unwrap();
+    let rows = rows_of(&msgs);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("table_name"), Some("items"));
+
+    let msgs = client
+        .simple_query(
+            "SELECT column_name, data_type FROM information_schema.columns \
+             WHERE table_schema = 'catalog_more' AND table_name = 'items';",
+        )
+        .await
+        .unwrap();
+    let rows = rows_of(&msgs);
+    assert_eq!(rows.len(), 4);
+    assert!(
+        rows.iter()
+            .any(|row| row.get("column_name") == Some("payload")
+                && row.get("data_type") == Some("jsonb"))
+    );
+
+    let msgs = client
+        .simple_query(
+            "SELECT constraint_name, constraint_type FROM information_schema.table_constraints \
+             WHERE table_schema = 'catalog_more' AND table_name = 'items';",
+        )
+        .await
+        .unwrap();
+    assert!(!rows_of(&msgs).is_empty());
+
+    let msgs = client
+        .simple_query(
+            "SELECT indexname FROM pg_catalog.pg_indexes \
+             WHERE schemaname = 'catalog_more' AND tablename = 'items';",
+        )
+        .await
+        .unwrap();
+    assert!(
+        rows_of(&msgs)
+            .iter()
+            .any(|row| row.get("indexname") == Some("idx_items_payload"))
+    );
+
+    let msgs = client
+        .simple_query(
+            "SELECT index_name FROM information_schema.indexes \
+             WHERE table_schema = 'catalog_more' AND table_name = 'items';",
+        )
+        .await
+        .unwrap();
+    assert!(
+        rows_of(&msgs)
+            .iter()
+            .any(|row| row.get("index_name") == Some("idx_items_payload"))
+    );
+}
+
 // Unknown pg_catalog relations must fail with SQLSTATE 42P01 (undefined
 // table), which introspecting clients handle quietly, not XX000.
 #[tokio::test(flavor = "multi_thread")]
