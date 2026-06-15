@@ -9,9 +9,11 @@ repositories {
     mavenCentral()
 }
 
+def pgjdbcVersion = System.getenv("NODUS_PGJDBC_VERSION") ?: "42.7.11"
+
 dependencies {
     // PostgreSQL JDBC Driver
-    testImplementation 'org.postgresql:postgresql:42.7.1'
+    testImplementation "org.postgresql:postgresql:${pgjdbcVersion}"
 
     // JUnit Jupiter (JUnit 5)
     testImplementation platform('org.junit:junit-bom:5.10.1')
@@ -24,6 +26,7 @@ test {
     
     // Pass the NODUS_JDBC_URL environment variable to the test JVM
     environment "NODUS_JDBC_URL", System.getenv("NODUS_JDBC_URL")
+    environment "NODUS_PGJDBC_VERSION", pgjdbcVersion
 }
 
 java {

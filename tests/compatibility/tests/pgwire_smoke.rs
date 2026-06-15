@@ -6,9 +6,66 @@ use serde_json::json;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::time::timeout;
 use tokio_postgres::types::Type;
 use tokio_postgres::{NoTls, SimpleQueryMessage};
 use uuid::Uuid;
+
+async fn write_startup(stream: &mut TcpStream) {
+    let mut body = Vec::new();
+    body.extend_from_slice(&196_608_i32.to_be_bytes());
+    body.extend_from_slice(b"user\0nodus\0database\0default\0\0");
+
+    let len = (body.len() + 4) as i32;
+    stream.write_all(&len.to_be_bytes()).await.unwrap();
+    stream.write_all(&body).await.unwrap();
+}
+
+async fn write_frontend_message(stream: &mut TcpStream, message_type: u8, body: &[u8]) {
+    stream.write_all(&[message_type]).await.unwrap();
+    stream
+        .write_all(&((body.len() + 4) as i32).to_be_bytes())
+        .await
+        .unwrap();
+    stream.write_all(body).await.unwrap();
+}
+
+async fn read_backend_message(stream: &mut TcpStream) -> (u8, Vec<u8>) {
+    let mut message_type = [0_u8; 1];
+    timeout(Duration::from_secs(5), stream.read_exact(&mut message_type))
+        .await
+        .expect("timed out reading backend message type")
+        .unwrap();
+    let mut len = [0_u8; 4];
+    timeout(Duration::from_secs(5), stream.read_exact(&mut len))
+        .await
+        .expect("timed out reading backend message length")
+        .unwrap();
+    let body_len = i32::from_be_bytes(len) as usize - 4;
+    let mut body = vec![0_u8; body_len];
+    timeout(Duration::from_secs(5), stream.read_exact(&mut body))
+        .await
+        .expect("timed out reading backend message body")
+        .unwrap();
+    (message_type[0], body)
+}
+
+async fn open_raw_pgwire(server: &TestServer) -> TcpStream {
+    let mut stream = TcpStream::connect(server.pgwire_addr).await.unwrap();
+    write_startup(&mut stream).await;
+    loop {
+        let (message_type, body) = read_backend_message(&mut stream).await;
+        if message_type == b'R' && body.len() >= 4 {
+            let auth_code = i32::from_be_bytes([body[0], body[1], body[2], body[3]]);
+            if auth_code == 3 {
+                write_frontend_message(&mut stream, b'p', b"nodus\0").await;
+            }
+        }
+        if message_type == b'Z' {
+            return stream;
+        }
+    }
+}
 
 async fn connect(server: &TestServer) -> tokio_postgres::Client {
     let conn_str = format!(
@@ -26,6 +83,51 @@ async fn connect(server: &TestServer) -> tokio_postgres::Client {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     panic!("PGWire server did not start in time");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wire_simple_query_batch_returns_each_result_before_ready() {
+    let server = TestServer::start().await.expect("server starts");
+    let mut stream = open_raw_pgwire(&server).await;
+
+    write_frontend_message(&mut stream, b'Q', b"SELECT 1; SELECT 2;\0").await;
+
+    let mut sequence = Vec::new();
+    loop {
+        let (message_type, _) = read_backend_message(&mut stream).await;
+        sequence.push(message_type);
+        if message_type == b'Z' {
+            break;
+        }
+    }
+
+    assert_eq!(sequence, [b'T', b'D', b'C', b'T', b'D', b'C', b'Z']);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wire_binary_copy_response_reports_format_and_columns() {
+    let server = TestServer::start().await.expect("server starts");
+    let mut stream = open_raw_pgwire(&server).await;
+
+    write_frontend_message(
+        &mut stream,
+        b'Q',
+        b"COPY copy_binary_wire (id, name) FROM STDIN (FORMAT BINARY)\0",
+    )
+    .await;
+
+    let (message_type, body) = read_backend_message(&mut stream).await;
+    assert_eq!(message_type, b'G');
+    assert_eq!(body[0], 1, "COPY format should be binary");
+    let columns = i16::from_be_bytes([body[1], body[2]]);
+    assert_eq!(columns, 2);
+    assert_eq!(i16::from_be_bytes([body[3], body[4]]), 1);
+    assert_eq!(i16::from_be_bytes([body[5], body[6]]), 1);
+
+    write_frontend_message(&mut stream, b'c', &[]).await;
+    let (complete, _) = read_backend_message(&mut stream).await;
+    let (ready, _) = read_backend_message(&mut stream).await;
+    assert_eq!((complete, ready), (b'C', b'Z'));
 }
 
 #[tokio::test(flavor = "multi_thread")]
