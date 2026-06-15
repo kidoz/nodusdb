@@ -114,6 +114,10 @@ async fn test_pg18_catalog_introspection_only_tables_are_empty() {
             "pg_description",
         ),
         (
+            "SELECT objoid, classoid, description FROM pg_catalog.pg_shdescription;",
+            "pg_shdescription",
+        ),
+        (
             "SELECT adrelid, adnum, adbin FROM pg_catalog.pg_attrdef;",
             "pg_attrdef",
         ),

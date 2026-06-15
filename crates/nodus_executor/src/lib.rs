@@ -2680,6 +2680,7 @@ impl MemExecutor {
                 | "pg_indexes"
                 | "pg_attrdef"
                 | "pg_description"
+                | "pg_shdescription"
                 | "pg_enum"
                 | "pg_collation"
                 | "pg_am"
@@ -3196,6 +3197,17 @@ impl MemExecutor {
                     ("objoid", "OID"),
                     ("classoid", "OID"),
                     ("objsubid", "INT"),
+                    ("description", "TEXT"),
+                ]),
+                Vec::new(),
+            )),
+            // Shared-object comments. NodusDB has no COMMENT ON support, so this
+            // is synthesized empty like pg_description; pgjdbc/DataGrip join it
+            // during introspection and tolerate zero rows.
+            "pg_shdescription" => Some((
+                Self::virtual_columns(&[
+                    ("objoid", "OID"),
+                    ("classoid", "OID"),
                     ("description", "TEXT"),
                 ]),
                 Vec::new(),
