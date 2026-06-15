@@ -13,6 +13,9 @@ workspace = true
 [dependencies]
 nodus_testkit = { path = "../../crates/nodus_testkit" }
 bytes.workspace = true
+chrono.workspace = true
 futures-util.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
 tokio-postgres.workspace = true
+uuid.workspace = true

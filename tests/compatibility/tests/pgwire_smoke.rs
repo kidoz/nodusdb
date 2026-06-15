@@ -1,10 +1,14 @@
 use bytes::Bytes;
+use chrono::{NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
 use futures_util::{SinkExt, StreamExt};
 use nodus_testkit::TestServer;
+use serde_json::json;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio_postgres::types::Type;
 use tokio_postgres::{NoTls, SimpleQueryMessage};
+use uuid::Uuid;
 
 async fn connect(server: &TestServer) -> tokio_postgres::Client {
     let conn_str = format!(
@@ -127,6 +131,146 @@ async fn test_startup_parameters_and_ready_state_basics() {
     client.simple_query("BEGIN").await.unwrap();
     client.simple_query("SELECT 1").await.unwrap();
     client.simple_query("ROLLBACK").await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_declared_type_oids_binary_values_and_nulls() {
+    let server = TestServer::start().await.expect("server starts");
+    let client = connect(&server).await;
+
+    client
+        .simple_query(
+            "CREATE TABLE driver_types (
+                id INT PRIMARY KEY,
+                uid UUID,
+                raw BYTEA,
+                event_date DATE,
+                event_time TIME,
+                event_ts TIMESTAMP,
+                event_tstz TIMESTAMPTZ,
+                payload JSONB,
+                tags TEXT[],
+                nums INT[],
+                obj_oid OID,
+                type_name NAME,
+                amount NUMERIC(12, 2),
+                reg REGTYPE,
+                maybe_int INT
+            );",
+        )
+        .await
+        .unwrap();
+
+    let uid = Uuid::parse_str("7b1eb2d8-c2d1-4d3a-9cf6-55f1436cfe6f").unwrap();
+    let raw = vec![0xde, 0xad, 0xbe, 0xef];
+    let event_date = NaiveDate::from_ymd_opt(2026, 6, 15).unwrap();
+    let event_time = NaiveTime::from_hms_micro_opt(12, 34, 56, 789).unwrap();
+    let event_ts = NaiveDateTime::new(event_date, event_time);
+    let event_tstz = Utc.with_ymd_and_hms(2026, 6, 15, 9, 34, 56).unwrap();
+    let payload = json!({"user": "alice", "active": true, "clicks": 5});
+    let tags = vec!["login".to_string(), "signup".to_string()];
+    let nums = vec![10_i32, 20_i32, 30_i32];
+    let obj_oid = 23_u32;
+    let type_name = "driver_type".to_string();
+
+    let insert = client
+        .prepare_typed(
+            "INSERT INTO driver_types
+             (id, uid, raw, event_date, event_time, event_ts, event_tstz, payload, tags, nums, obj_oid, type_name, amount, reg, maybe_int)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 42.50, 'int4', $13);",
+            &[
+                Type::INT4,
+                Type::UUID,
+                Type::BYTEA,
+                Type::DATE,
+                Type::TIME,
+                Type::TIMESTAMP,
+                Type::TIMESTAMPTZ,
+                Type::JSONB,
+                Type::TEXT_ARRAY,
+                Type::INT4_ARRAY,
+                Type::OID,
+                Type::NAME,
+                Type::INT4,
+            ],
+        )
+        .await
+        .unwrap();
+
+    client
+        .execute(
+            &insert,
+            &[
+                &1_i32,
+                &uid,
+                &raw,
+                &event_date,
+                &event_time,
+                &event_ts,
+                &event_tstz,
+                &payload,
+                &tags,
+                &nums,
+                &obj_oid,
+                &type_name,
+                &Option::<i32>::None,
+            ],
+        )
+        .await
+        .unwrap();
+
+    let select = client
+        .prepare(
+            "SELECT uid, raw, event_date, event_time, event_ts, event_tstz, payload, tags, nums, obj_oid, type_name, maybe_int
+             FROM driver_types WHERE id = 1;",
+        )
+        .await
+        .unwrap();
+
+    let column_types = select
+        .columns()
+        .iter()
+        .map(|c| c.type_().clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        column_types,
+        vec![
+            Type::UUID,
+            Type::BYTEA,
+            Type::DATE,
+            Type::TIME,
+            Type::TIMESTAMP,
+            Type::TIMESTAMPTZ,
+            Type::JSONB,
+            Type::TEXT_ARRAY,
+            Type::INT4_ARRAY,
+            Type::OID,
+            Type::NAME,
+            Type::INT4,
+        ]
+    );
+
+    let row = client.query_one(&select, &[]).await.unwrap();
+    assert_eq!(row.get::<_, Uuid>(0), uid);
+    assert_eq!(row.get::<_, Vec<u8>>(1), raw);
+    assert_eq!(row.get::<_, NaiveDate>(2), event_date);
+    assert_eq!(row.get::<_, NaiveTime>(3), event_time);
+    assert_eq!(row.get::<_, NaiveDateTime>(4), event_ts);
+    assert_eq!(row.get::<_, chrono::DateTime<Utc>>(5), event_tstz);
+    assert_eq!(row.get::<_, serde_json::Value>(6), payload);
+    assert_eq!(row.get::<_, Vec<String>>(7), tags);
+    assert_eq!(row.get::<_, Vec<i32>>(8), nums);
+    assert_eq!(row.get::<_, u32>(9), obj_oid);
+    assert_eq!(row.get::<_, String>(10), type_name);
+    assert_eq!(row.get::<_, Option<i32>>(11), None);
+
+    let meta = client
+        .prepare("SELECT amount, reg FROM driver_types WHERE id = 1;")
+        .await
+        .unwrap();
+    assert_eq!(meta.columns()[0].type_(), &Type::NUMERIC);
+    assert_eq!(meta.columns()[0].type_modifier(), ((12 << 16) | 2) + 4);
+    assert_eq!(meta.columns()[1].type_(), &Type::REGTYPE);
 }
 
 fn rows_of(msgs: &[SimpleQueryMessage]) -> Vec<&tokio_postgres::SimpleQueryRow> {

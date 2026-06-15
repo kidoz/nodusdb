@@ -5,8 +5,10 @@ use std::sync::Arc;
 use std::sync::RwLock;
 
 use async_trait::async_trait;
-use bytes::Buf;
+use bytes::{Buf, BufMut, BytesMut};
+use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use futures_util::{Sink, SinkExt, StreamExt, stream};
+use postgres_types::{IsNull, Json, Kind, ToSql};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::codec::Framed;
@@ -20,7 +22,7 @@ use pgwire::api::auth::{
 };
 use pgwire::api::copy::CopyHandler;
 use pgwire::api::portal::Portal;
-use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler, send_describe_response};
+use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
 use pgwire::tokio::PgWireMessageServerCodec;
 
 const METADATA_NODUS_SESSION_ID: &str = "nodus_session_id";
@@ -31,21 +33,152 @@ const METADATA_TX_STATUS: &str = "nodus_tx_status";
 const METADATA_COPY_ROWS: &str = "nodus_copy_rows";
 const METADATA_COPY_EXTENDED: &str = "nodus_copy_extended";
 
+const POSTGRES_TYPEMOD_NONE: i32 = -1;
+
 const CANCEL_REQUEST_MAGIC: i32 = 80877102;
 const SSL_REQUEST_MAGIC: i32 = 80877103;
 const GSSENC_REQUEST_MAGIC: i32 = 80877104;
 const STARTUP_PACKET_HEADER_LEN: usize = 8;
 const CANCEL_REQUEST_LEN: usize = 16;
 
-fn map_type(data_type: &str) -> Type {
-    match data_type.to_uppercase().as_str() {
-        "INT" | "INTEGER" => Type::INT4,
-        "BIGINT" | "INT8" => Type::INT8,
-        "FLOAT" | "DOUBLE" | "REAL" => Type::FLOAT8,
-        "BOOL" | "BOOLEAN" => Type::BOOL,
-        "VARCHAR" | "TEXT" | "CHAR" => Type::VARCHAR,
-        _ => Type::VARCHAR,
+#[derive(Debug, Clone)]
+struct PgDeclaredType {
+    ty: Type,
+    typmod: i32,
+}
+
+fn normalize_type_name(data_type: &str) -> String {
+    data_type
+        .trim()
+        .trim_matches('"')
+        .to_ascii_uppercase()
+        .replace("CHARACTER VARYING", "VARCHAR")
+        .replace("DOUBLE PRECISION", "DOUBLE")
+        .replace("TIMESTAMP WITH TIME ZONE", "TIMESTAMPTZ")
+        .replace("TIMESTAMP WITHOUT TIME ZONE", "TIMESTAMP")
+        .replace("TIME WITH TIME ZONE", "TIMETZ")
+        .replace("TIME WITHOUT TIME ZONE", "TIME")
+}
+
+fn type_base_and_args(normalized: &str) -> (&str, Option<&str>) {
+    let Some(open) = normalized.find('(') else {
+        return (normalized.trim(), None);
+    };
+    let close = normalized.rfind(')').unwrap_or(normalized.len());
+    (
+        normalized[..open].trim(),
+        Some(normalized[open + 1..close].trim()),
+    )
+}
+
+fn numeric_typmod(args: Option<&str>) -> i32 {
+    let Some(args) = args else {
+        return POSTGRES_TYPEMOD_NONE;
+    };
+    let mut parts = args.split(',').map(str::trim);
+    let precision = parts.next().and_then(|v| v.parse::<i32>().ok());
+    let scale = parts
+        .next()
+        .and_then(|v| v.parse::<i32>().ok())
+        .unwrap_or(0);
+    match precision {
+        Some(precision) if precision > 0 && (0..=precision).contains(&scale) => {
+            ((precision << 16) | scale) + 4
+        }
+        _ => POSTGRES_TYPEMOD_NONE,
     }
+}
+
+fn length_typmod(args: Option<&str>) -> i32 {
+    args.and_then(|v| v.trim().parse::<i32>().ok())
+        .filter(|v| *v > 0)
+        .map(|len| len + 4)
+        .unwrap_or(POSTGRES_TYPEMOD_NONE)
+}
+
+fn array_type_for_base(base: &str) -> Type {
+    match base {
+        "BOOL" | "BOOLEAN" => Type::BOOL_ARRAY,
+        "BYTEA" => Type::BYTEA_ARRAY,
+        "CHAR" | "CHARACTER" | "BPCHAR" => Type::BPCHAR_ARRAY,
+        "DATE" => Type::DATE_ARRAY,
+        "FLOAT4" | "REAL" => Type::FLOAT4_ARRAY,
+        "FLOAT8" | "FLOAT" | "DOUBLE" => Type::FLOAT8_ARRAY,
+        "INT2" | "SMALLINT" | "SMALLSERIAL" => Type::INT2_ARRAY,
+        "INT4" | "INT" | "INTEGER" | "SERIAL" => Type::INT4_ARRAY,
+        "INT8" | "BIGINT" | "BIGSERIAL" => Type::INT8_ARRAY,
+        "JSON" => Type::JSON_ARRAY,
+        "JSONB" => Type::JSONB_ARRAY,
+        "NAME" => Type::NAME_ARRAY,
+        "NUMERIC" | "DECIMAL" => Type::NUMERIC_ARRAY,
+        "OID" => Type::OID_ARRAY,
+        "REGTYPE" => Type::REGTYPE_ARRAY,
+        "TEXT" => Type::TEXT_ARRAY,
+        "TIME" => Type::TIME_ARRAY,
+        "TIMESTAMP" => Type::TIMESTAMP_ARRAY,
+        "TIMESTAMPTZ" => Type::TIMESTAMPTZ_ARRAY,
+        "UUID" => Type::UUID_ARRAY,
+        "VARCHAR" | "CHARACTER VARYING" => Type::VARCHAR_ARRAY,
+        _ => Type::TEXT_ARRAY,
+    }
+}
+
+fn map_declared_type(data_type: &str) -> PgDeclaredType {
+    let normalized = normalize_type_name(data_type);
+    let is_array = normalized.ends_with("[]");
+    let normalized = normalized.trim_end_matches("[]").trim();
+    let (base, args) = type_base_and_args(normalized);
+    if is_array {
+        return PgDeclaredType {
+            ty: array_type_for_base(base),
+            typmod: POSTGRES_TYPEMOD_NONE,
+        };
+    }
+
+    let ty = match base {
+        "BOOL" | "BOOLEAN" => Type::BOOL,
+        "BYTEA" => Type::BYTEA,
+        "CHAR" | "CHARACTER" | "BPCHAR" => Type::BPCHAR,
+        "DATE" => Type::DATE,
+        "FLOAT4" | "REAL" => Type::FLOAT4,
+        "FLOAT8" | "FLOAT" | "DOUBLE" => Type::FLOAT8,
+        "INT2" | "SMALLINT" | "SMALLSERIAL" => Type::INT2,
+        "INT4" | "INT" | "INTEGER" | "SERIAL" => Type::INT4,
+        "INT8" | "BIGINT" | "BIGSERIAL" => Type::INT8,
+        "JSON" => Type::JSON,
+        "JSONB" => Type::JSONB,
+        "NAME" => Type::NAME,
+        "NUMERIC" | "DECIMAL" => Type::NUMERIC,
+        "OID" => Type::OID,
+        "REGCLASS" => Type::REGCLASS,
+        "REGCONFIG" => Type::REGCONFIG,
+        "REGDICTIONARY" => Type::REGDICTIONARY,
+        "REGNAMESPACE" => Type::REGNAMESPACE,
+        "REGOPER" => Type::REGOPER,
+        "REGOPERATOR" => Type::REGOPERATOR,
+        "REGPROC" => Type::REGPROC,
+        "REGPROCEDURE" => Type::REGPROCEDURE,
+        "REGROLE" => Type::REGROLE,
+        "REGTYPE" => Type::REGTYPE,
+        "TEXT" => Type::TEXT,
+        "TIME" => Type::TIME,
+        "TIMETZ" => Type::TIMETZ,
+        "TIMESTAMP" => Type::TIMESTAMP,
+        "TIMESTAMPTZ" => Type::TIMESTAMPTZ,
+        "UUID" => Type::UUID,
+        "VARCHAR" => Type::VARCHAR,
+        _ => Type::TEXT,
+    };
+    let typmod = match ty {
+        Type::BPCHAR | Type::VARCHAR => length_typmod(args),
+        Type::NUMERIC => numeric_typmod(args),
+        _ => POSTGRES_TYPEMOD_NONE,
+    };
+    PgDeclaredType { ty, typmod }
+}
+
+fn map_type(data_type: &str) -> Type {
+    map_declared_type(data_type).ty
 }
 
 /// pgjdbc's `DatabaseMetaData` calls issue catalog queries the executor cannot
@@ -166,14 +299,40 @@ fn row_description(fields: &[FieldInfo]) -> RowDescription {
         fields
             .iter()
             .map(|field| {
+                let ty = field.datatype();
                 FieldDescription::new(
                     field.name().to_owned(),
                     field.table_id().unwrap_or(0),
                     field.column_id().unwrap_or(0),
-                    field.datatype().oid(),
-                    0,
-                    0,
+                    ty.oid(),
+                    type_size(ty),
+                    POSTGRES_TYPEMOD_NONE,
                     field.format().value(),
+                )
+            })
+            .collect(),
+    )
+}
+
+fn row_description_from_metadata(
+    columns: &[(String, String)],
+    format_for: impl Fn(usize, &Type) -> FieldFormat,
+) -> RowDescription {
+    RowDescription::new(
+        columns
+            .iter()
+            .enumerate()
+            .map(|(i, (name, declared))| {
+                let declared = map_declared_type(declared);
+                let format = effective_result_format(&declared.ty, format_for(i, &declared.ty));
+                FieldDescription::new(
+                    name.clone(),
+                    0,
+                    0,
+                    declared.ty.oid(),
+                    type_size(&declared.ty),
+                    declared.typmod,
+                    format.value(),
                 )
             })
             .collect(),
@@ -190,59 +349,634 @@ fn is_copy_to_stdout(query: &str) -> bool {
     q.starts_with("COPY ") && q.contains(" TO STDOUT")
 }
 
-/// Encodes a value so its wire representation matches the column type declared
-/// in `RowDescription`; the declared type drives integer/float width, and
-/// values whose declared type is textual are rendered as strings so binary
-/// result format stays decodable.
-fn encode_value(
-    value: &nodus_executor::Value,
-    encoder: &mut DataRowEncoder,
-    declared: &Type,
-) -> std::io::Result<()> {
-    match value {
-        nodus_executor::Value::Int(i) => match *declared {
-            Type::INT2 => encoder.encode_field(&(*i as i16)),
-            Type::INT4 => encoder.encode_field(&(*i as i32)),
-            Type::INT8 => encoder.encode_field(i),
-            _ => encoder.encode_field(&i.to_string()),
-        },
-        nodus_executor::Value::Float(f) => match *declared {
-            Type::FLOAT4 => encoder.encode_field(&(*f as f32)),
-            Type::FLOAT8 => encoder.encode_field(f),
-            _ => encoder.encode_field(&f.to_string()),
-        },
-        nodus_executor::Value::Text(s) => encoder.encode_field(&s),
-        nodus_executor::Value::Bool(b) => match *declared {
-            Type::BOOL => encoder.encode_field(b),
-            _ => encoder.encode_field(&if *b { "t" } else { "f" }),
-        },
-        nodus_executor::Value::Null => encoder.encode_field(&None::<i64>),
-        nodus_executor::Value::Array(arr) => {
-            let rendered: Vec<String> = arr
-                .iter()
-                .map(|v| match v {
-                    nodus_executor::Value::Int(n) => n.to_string(),
-                    nodus_executor::Value::Float(f) => f.to_string(),
-                    nodus_executor::Value::Text(s) => format!("\"{}\"", s.replace('"', "\\\"")),
-                    nodus_executor::Value::Bool(b) => b.to_string(),
-                    nodus_executor::Value::Null => "NULL".to_string(),
-                    nodus_executor::Value::Array(_) => "[]".to_string(),
-                    nodus_executor::Value::Jsonb(j) => {
-                        format!("\"{}\"", j.to_string().replace('"', "\\\""))
-                    }
-                })
-                .collect();
-            let arr_str = format!("{{{}}}", rendered.join(","));
-            encoder.encode_field(&arr_str)
-        }
-        nodus_executor::Value::Jsonb(j) => encoder.encode_field(&j.to_string()),
+fn type_size(ty: &Type) -> i16 {
+    match *ty {
+        Type::BOOL => 1,
+        Type::INT2 => 2,
+        Type::INT4
+        | Type::OID
+        | Type::REGCLASS
+        | Type::REGCONFIG
+        | Type::REGDICTIONARY
+        | Type::REGNAMESPACE
+        | Type::REGOPER
+        | Type::REGOPERATOR
+        | Type::REGPROC
+        | Type::REGPROCEDURE
+        | Type::REGROLE
+        | Type::REGTYPE
+        | Type::FLOAT4
+        | Type::DATE => 4,
+        Type::INT8 | Type::FLOAT8 | Type::TIME | Type::TIMESTAMP | Type::TIMESTAMPTZ => 8,
+        Type::UUID => 16,
+        Type::NAME => 64,
+        _ => -1,
     }
-    .map_err(|e| std::io::Error::other(e.to_string()))
+}
+
+fn supports_binary_result(ty: &Type) -> bool {
+    !matches!(
+        *ty,
+        Type::NUMERIC
+            | Type::NUMERIC_ARRAY
+            | Type::REGCLASS
+            | Type::REGCONFIG
+            | Type::REGDICTIONARY
+            | Type::REGNAMESPACE
+            | Type::REGOPER
+            | Type::REGOPERATOR
+            | Type::REGPROC
+            | Type::REGPROCEDURE
+            | Type::REGROLE
+            | Type::REGTYPE
+            | Type::REGTYPE_ARRAY
+            | Type::TIMETZ
+    )
+}
+
+fn effective_result_format(ty: &Type, requested: FieldFormat) -> FieldFormat {
+    if requested == FieldFormat::Binary && supports_binary_result(ty) {
+        FieldFormat::Binary
+    } else {
+        FieldFormat::Text
+    }
+}
+
+fn field_info_for_output(
+    names: &[String],
+    declared_types: &[String],
+    requested_format: impl Fn(usize, &Type) -> FieldFormat,
+) -> Arc<Vec<FieldInfo>> {
+    Arc::new(
+        names
+            .iter()
+            .zip(declared_types.iter())
+            .enumerate()
+            .map(|(i, (name, declared))| {
+                let declared = map_declared_type(declared);
+                let _typmod = declared.typmod;
+                let format =
+                    effective_result_format(&declared.ty, requested_format(i, &declared.ty));
+                FieldInfo::new(name.clone(), None, None, declared.ty, format)
+            })
+            .collect(),
+    )
+}
+
+fn render_scalar_text(value: &nodus_executor::Value, declared: &Type) -> String {
+    match value {
+        nodus_executor::Value::Int(i) => i.to_string(),
+        nodus_executor::Value::Float(f) => f.to_string(),
+        nodus_executor::Value::Text(s) if *declared == Type::BYTEA => render_bytea_text(s),
+        nodus_executor::Value::Text(s) => s.clone(),
+        nodus_executor::Value::Bool(b) => {
+            if *b {
+                "t".to_owned()
+            } else {
+                "f".to_owned()
+            }
+        }
+        nodus_executor::Value::Array(arr) => render_array_text(arr),
+        nodus_executor::Value::Jsonb(j) => j.to_string(),
+        nodus_executor::Value::Null => String::new(),
+    }
+}
+
+fn render_bytea_text(raw: &str) -> String {
+    if raw.starts_with("\\x") {
+        raw.to_owned()
+    } else {
+        format!("\\x{}", hex_encode(raw.as_bytes()))
+    }
+}
+
+fn render_array_text(arr: &[nodus_executor::Value]) -> String {
+    let rendered = arr
+        .iter()
+        .map(|v| match v {
+            nodus_executor::Value::Null => "NULL".to_owned(),
+            nodus_executor::Value::Array(nested) => render_array_text(nested),
+            _ => quote_array_value(&render_scalar_text(v, &Type::TEXT)),
+        })
+        .collect::<Vec<_>>();
+    format!("{{{}}}", rendered.join(","))
+}
+
+fn quote_array_value(value: &str) -> String {
+    if value.is_empty()
+        || value.eq_ignore_ascii_case("NULL")
+        || value
+            .bytes()
+            .any(|b| matches!(b, b'"' | b'\\' | b',' | b'{' | b'}') || b.is_ascii_whitespace())
+    {
+        format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+    } else {
+        value.to_owned()
+    }
+}
+
+fn value_to_string(value: &nodus_executor::Value) -> String {
+    render_scalar_text(value, &Type::TEXT)
+}
+
+fn parse_i64(value: &nodus_executor::Value) -> std::io::Result<i64> {
+    match value {
+        nodus_executor::Value::Int(i) => Ok(*i),
+        nodus_executor::Value::Float(f) => Ok(*f as i64),
+        _ => value_to_string(value)
+            .parse::<i64>()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+    }
+}
+
+fn parse_f64(value: &nodus_executor::Value) -> std::io::Result<f64> {
+    match value {
+        nodus_executor::Value::Int(i) => Ok(*i as f64),
+        nodus_executor::Value::Float(f) => Ok(*f),
+        _ => value_to_string(value)
+            .parse::<f64>()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+    }
+}
+
+fn parse_bool(value: &nodus_executor::Value) -> std::io::Result<bool> {
+    match value {
+        nodus_executor::Value::Bool(b) => Ok(*b),
+        _ => match value_to_string(value).to_ascii_lowercase().as_str() {
+            "t" | "true" | "1" | "yes" | "on" => Ok(true),
+            "f" | "false" | "0" | "no" | "off" => Ok(false),
+            other => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid boolean value {other:?}"),
+            )),
+        },
+    }
+}
+
+fn parse_json(value: &nodus_executor::Value) -> std::io::Result<serde_json::Value> {
+    match value {
+        nodus_executor::Value::Jsonb(j) => Ok(j.clone()),
+        _ => serde_json::from_str(&value_to_string(value))
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+    }
+}
+
+fn parse_uuid(value: &nodus_executor::Value) -> std::io::Result<Uuid> {
+    Uuid::parse_str(&value_to_string(value))
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+fn parse_date(value: &nodus_executor::Value) -> std::io::Result<NaiveDate> {
+    NaiveDate::parse_from_str(&value_to_string(value), "%Y-%m-%d")
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+fn parse_time(value: &nodus_executor::Value) -> std::io::Result<NaiveTime> {
+    let s = value_to_string(value);
+    NaiveTime::parse_from_str(&s, "%H:%M:%S%.f")
+        .or_else(|_| NaiveTime::parse_from_str(&s, "%H:%M"))
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+fn parse_timestamp(value: &nodus_executor::Value) -> std::io::Result<NaiveDateTime> {
+    let s = value_to_string(value).replace('T', " ");
+    NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S%.f")
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+fn parse_timestamptz(value: &nodus_executor::Value) -> std::io::Result<DateTime<Utc>> {
+    let s = value_to_string(value);
+    if let Ok(dt) = DateTime::parse_from_rfc3339(&s) {
+        return Ok(dt.with_timezone(&Utc));
+    }
+    if let Ok(dt) = DateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S%.f%#z") {
+        return Ok(dt.with_timezone(&Utc));
+    }
+    parse_timestamp(value).map(|naive| naive.and_utc())
+}
+
+fn parse_bytea(value: &nodus_executor::Value) -> std::io::Result<Vec<u8>> {
+    let raw = value_to_string(value);
+    let Some(hex) = raw.strip_prefix("\\x").or_else(|| raw.strip_prefix("\\X")) else {
+        return Ok(raw.into_bytes());
+    };
+    hex_decode(hex)
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(TABLE[(byte >> 4) as usize] as char);
+        out.push(TABLE[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn hex_decode(hex: &str) -> std::io::Result<Vec<u8>> {
+    if !hex.len().is_multiple_of(2) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "odd-length bytea hex value",
+        ));
+    }
+    let mut out = Vec::with_capacity(hex.len() / 2);
+    let bytes = hex.as_bytes();
+    for pair in bytes.chunks_exact(2) {
+        let high = hex_value(pair[0])?;
+        let low = hex_value(pair[1])?;
+        out.push((high << 4) | low);
+    }
+    Ok(out)
+}
+
+fn hex_value(byte: u8) -> std::io::Result<u8> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid bytea hex digit",
+        )),
+    }
+}
+
+fn append_tosql<T: ToSql>(row: &mut BytesMut, ty: &Type, value: &T) -> std::io::Result<()> {
+    let mut encoded = BytesMut::new();
+    let is_null = value
+        .to_sql(ty, &mut encoded)
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    match is_null {
+        IsNull::Yes => row.put_i32(-1),
+        IsNull::No => {
+            row.put_i32(encoded.len() as i32);
+            row.put_slice(&encoded);
+        }
+    }
+    Ok(())
+}
+
+fn append_text(row: &mut BytesMut, text: String) {
+    row.put_i32(text.len() as i32);
+    row.put_slice(text.as_bytes());
+}
+
+fn array_values(value: &nodus_executor::Value) -> std::io::Result<&[nodus_executor::Value]> {
+    match value {
+        nodus_executor::Value::Array(values) => Ok(values),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "expected array value",
+        )),
+    }
+}
+
+fn encode_array_binary(
+    row: &mut BytesMut,
+    value: &nodus_executor::Value,
+    declared: &Type,
+) -> std::io::Result<bool> {
+    let values = array_values(value)?;
+    match *declared {
+        Type::BOOL_ARRAY => append_tosql(
+            row,
+            declared,
+            &values
+                .iter()
+                .map(optional_bool)
+                .collect::<std::io::Result<Vec<_>>>()?,
+        ),
+        Type::BYTEA_ARRAY => append_tosql(
+            row,
+            declared,
+            &values
+                .iter()
+                .map(optional_bytea)
+                .collect::<std::io::Result<Vec<_>>>()?,
+        ),
+        Type::DATE_ARRAY => append_tosql(
+            row,
+            declared,
+            &values
+                .iter()
+                .map(optional_date)
+                .collect::<std::io::Result<Vec<_>>>()?,
+        ),
+        Type::FLOAT4_ARRAY => append_tosql(
+            row,
+            declared,
+            &values
+                .iter()
+                .map(optional_f32)
+                .collect::<std::io::Result<Vec<_>>>()?,
+        ),
+        Type::FLOAT8_ARRAY => append_tosql(
+            row,
+            declared,
+            &values
+                .iter()
+                .map(optional_f64)
+                .collect::<std::io::Result<Vec<_>>>()?,
+        ),
+        Type::INT2_ARRAY => append_tosql(
+            row,
+            declared,
+            &values
+                .iter()
+                .map(optional_i16)
+                .collect::<std::io::Result<Vec<_>>>()?,
+        ),
+        Type::INT4_ARRAY => append_tosql(
+            row,
+            declared,
+            &values
+                .iter()
+                .map(optional_i32)
+                .collect::<std::io::Result<Vec<_>>>()?,
+        ),
+        Type::INT8_ARRAY => append_tosql(
+            row,
+            declared,
+            &values
+                .iter()
+                .map(optional_i64)
+                .collect::<std::io::Result<Vec<_>>>()?,
+        ),
+        Type::JSON_ARRAY | Type::JSONB_ARRAY => append_tosql(
+            row,
+            declared,
+            &values
+                .iter()
+                .map(optional_json)
+                .collect::<std::io::Result<Vec<_>>>()?,
+        ),
+        Type::TEXT_ARRAY | Type::VARCHAR_ARRAY | Type::BPCHAR_ARRAY | Type::NAME_ARRAY => {
+            append_tosql(
+                row,
+                declared,
+                &values.iter().map(optional_string).collect::<Vec<_>>(),
+            )
+        }
+        Type::TIME_ARRAY => append_tosql(
+            row,
+            declared,
+            &values
+                .iter()
+                .map(optional_time)
+                .collect::<std::io::Result<Vec<_>>>()?,
+        ),
+        Type::TIMESTAMP_ARRAY => append_tosql(
+            row,
+            declared,
+            &values
+                .iter()
+                .map(optional_timestamp)
+                .collect::<std::io::Result<Vec<_>>>()?,
+        ),
+        Type::TIMESTAMPTZ_ARRAY => append_tosql(
+            row,
+            declared,
+            &values
+                .iter()
+                .map(optional_timestamptz)
+                .collect::<std::io::Result<Vec<_>>>()?,
+        ),
+        Type::UUID_ARRAY => append_tosql(
+            row,
+            declared,
+            &values
+                .iter()
+                .map(optional_uuid)
+                .collect::<std::io::Result<Vec<_>>>()?,
+        ),
+        _ => return Ok(false),
+    }?;
+    Ok(true)
+}
+
+fn optional_string(value: &nodus_executor::Value) -> Option<String> {
+    if matches!(value, nodus_executor::Value::Null) {
+        None
+    } else {
+        Some(value_to_string(value))
+    }
+}
+
+fn optional_bool(value: &nodus_executor::Value) -> std::io::Result<Option<bool>> {
+    if matches!(value, nodus_executor::Value::Null) {
+        Ok(None)
+    } else {
+        parse_bool(value).map(Some)
+    }
+}
+
+fn optional_bytea(value: &nodus_executor::Value) -> std::io::Result<Option<Vec<u8>>> {
+    if matches!(value, nodus_executor::Value::Null) {
+        Ok(None)
+    } else {
+        parse_bytea(value).map(Some)
+    }
+}
+
+fn optional_date(value: &nodus_executor::Value) -> std::io::Result<Option<NaiveDate>> {
+    if matches!(value, nodus_executor::Value::Null) {
+        Ok(None)
+    } else {
+        parse_date(value).map(Some)
+    }
+}
+
+fn optional_time(value: &nodus_executor::Value) -> std::io::Result<Option<NaiveTime>> {
+    if matches!(value, nodus_executor::Value::Null) {
+        Ok(None)
+    } else {
+        parse_time(value).map(Some)
+    }
+}
+
+fn optional_timestamp(value: &nodus_executor::Value) -> std::io::Result<Option<NaiveDateTime>> {
+    if matches!(value, nodus_executor::Value::Null) {
+        Ok(None)
+    } else {
+        parse_timestamp(value).map(Some)
+    }
+}
+
+fn optional_timestamptz(value: &nodus_executor::Value) -> std::io::Result<Option<DateTime<Utc>>> {
+    if matches!(value, nodus_executor::Value::Null) {
+        Ok(None)
+    } else {
+        parse_timestamptz(value).map(Some)
+    }
+}
+
+fn optional_uuid(value: &nodus_executor::Value) -> std::io::Result<Option<Uuid>> {
+    if matches!(value, nodus_executor::Value::Null) {
+        Ok(None)
+    } else {
+        parse_uuid(value).map(Some)
+    }
+}
+
+fn optional_json(
+    value: &nodus_executor::Value,
+) -> std::io::Result<Option<Json<serde_json::Value>>> {
+    if matches!(value, nodus_executor::Value::Null) {
+        Ok(None)
+    } else {
+        parse_json(value).map(Json).map(Some)
+    }
+}
+
+fn optional_i16(value: &nodus_executor::Value) -> std::io::Result<Option<i16>> {
+    optional_i64(value).map(|v| v.map(|n| n as i16))
+}
+
+fn optional_i32(value: &nodus_executor::Value) -> std::io::Result<Option<i32>> {
+    optional_i64(value).map(|v| v.map(|n| n as i32))
+}
+
+fn optional_i64(value: &nodus_executor::Value) -> std::io::Result<Option<i64>> {
+    if matches!(value, nodus_executor::Value::Null) {
+        Ok(None)
+    } else {
+        parse_i64(value).map(Some)
+    }
+}
+
+fn optional_f32(value: &nodus_executor::Value) -> std::io::Result<Option<f32>> {
+    optional_f64(value).map(|v| v.map(|n| n as f32))
+}
+
+fn optional_f64(value: &nodus_executor::Value) -> std::io::Result<Option<f64>> {
+    if matches!(value, nodus_executor::Value::Null) {
+        Ok(None)
+    } else {
+        parse_f64(value).map(Some)
+    }
+}
+
+fn append_value(
+    row: &mut BytesMut,
+    value: &nodus_executor::Value,
+    declared: &Type,
+    format: FieldFormat,
+) -> std::io::Result<()> {
+    if matches!(value, nodus_executor::Value::Null) {
+        row.put_i32(-1);
+        return Ok(());
+    }
+    if format == FieldFormat::Text {
+        append_text(row, render_scalar_text(value, declared));
+        return Ok(());
+    }
+
+    match *declared {
+        Type::BOOL => append_tosql(row, declared, &parse_bool(value)?),
+        Type::BYTEA => append_tosql(row, declared, &parse_bytea(value)?),
+        Type::DATE => append_tosql(row, declared, &parse_date(value)?),
+        Type::FLOAT4 => append_tosql(row, declared, &(parse_f64(value)? as f32)),
+        Type::FLOAT8 => append_tosql(row, declared, &parse_f64(value)?),
+        Type::INT2 => append_tosql(row, declared, &(parse_i64(value)? as i16)),
+        Type::INT4 => append_tosql(row, declared, &(parse_i64(value)? as i32)),
+        Type::INT8 => append_tosql(row, declared, &parse_i64(value)?),
+        Type::JSON | Type::JSONB => append_tosql(row, declared, &Json(parse_json(value)?)),
+        Type::NAME | Type::TEXT | Type::VARCHAR | Type::BPCHAR => {
+            append_tosql(row, declared, &value_to_string(value))
+        }
+        Type::OID => append_tosql(row, declared, &(parse_i64(value)? as u32)),
+        Type::TIME => append_tosql(row, declared, &parse_time(value)?),
+        Type::TIMESTAMP => append_tosql(row, declared, &parse_timestamp(value)?),
+        Type::TIMESTAMPTZ => append_tosql(row, declared, &parse_timestamptz(value)?),
+        Type::UUID => append_tosql(row, declared, &parse_uuid(value)?),
+        _ if matches!(declared.kind(), Kind::Array(_))
+            && encode_array_binary(row, value, declared)? =>
+        {
+            Ok(())
+        }
+        _ => {
+            append_text(row, render_scalar_text(value, declared));
+            Ok(())
+        }
+    }
+}
+
+fn encode_row(
+    values: &[nodus_executor::Value],
+    field_info: Arc<Vec<FieldInfo>>,
+) -> std::io::Result<DataRow> {
+    let mut row = BytesMut::new();
+    for (i, value) in values.iter().enumerate() {
+        let Some(field) = field_info.get(i) else {
+            break;
+        };
+        append_value(&mut row, value, field.datatype(), field.format())?;
+    }
+    Ok(DataRow::new(row, values.len() as i16))
+}
+
+fn parse_text_array_parameter(raw: &str) -> nodus_executor::Value {
+    let inner = raw
+        .trim()
+        .strip_prefix('{')
+        .and_then(|s| s.strip_suffix('}'))
+        .unwrap_or(raw);
+    let values = if inner.is_empty() {
+        Vec::new()
+    } else {
+        inner
+            .split(',')
+            .map(|part| {
+                let value = part.trim().trim_matches('"').replace("\\\"", "\"");
+                if value.eq_ignore_ascii_case("NULL") {
+                    nodus_executor::Value::Null
+                } else {
+                    nodus_executor::Value::Text(value)
+                }
+            })
+            .collect()
+    };
+    nodus_executor::Value::Array(values)
+}
+
+fn text_parameter_value(param_type: &Type, raw: String) -> nodus_executor::Value {
+    match *param_type {
+        Type::BOOL => nodus_executor::Value::Bool(matches!(
+            raw.to_ascii_lowercase().as_str(),
+            "t" | "true" | "1" | "yes" | "on"
+        )),
+        Type::INT2 | Type::INT4 | Type::INT8 | Type::OID => raw
+            .parse::<i64>()
+            .map(nodus_executor::Value::Int)
+            .unwrap_or(nodus_executor::Value::Null),
+        Type::FLOAT4 | Type::FLOAT8 | Type::NUMERIC => raw
+            .parse::<f64>()
+            .map(nodus_executor::Value::Float)
+            .unwrap_or(nodus_executor::Value::Null),
+        Type::JSON | Type::JSONB => serde_json::from_str(&raw)
+            .map(nodus_executor::Value::Jsonb)
+            .unwrap_or(nodus_executor::Value::Text(raw)),
+        _ if matches!(param_type.kind(), Kind::Array(_)) => parse_text_array_parameter(&raw),
+        _ => nodus_executor::Value::Text(raw),
+    }
+}
+
+fn values_to_array<T, F>(values: Vec<Option<T>>, render: F) -> nodus_executor::Value
+where
+    F: Fn(T) -> nodus_executor::Value,
+{
+    nodus_executor::Value::Array(
+        values
+            .into_iter()
+            .map(|value| value.map(&render).unwrap_or(nodus_executor::Value::Null))
+            .collect(),
+    )
 }
 
 use pgwire::api::results::{
-    DataRowEncoder, DescribePortalResponse, DescribeStatementResponse, FieldFormat, FieldInfo,
-    QueryResponse, Response, Tag,
+    DescribePortalResponse, DescribeStatementResponse, FieldFormat, FieldInfo, QueryResponse,
+    Response, Tag,
 };
 use pgwire::api::stmt::{NoopQueryParser, StoredStatement};
 use pgwire::api::store::PortalStore;
@@ -695,24 +1429,11 @@ impl SimpleQueryHandler for NodusQueryHandler {
         }
 
         // Otherwise a row set: build field descriptors and encode each row.
-        let field_info = Arc::new(
-            out.columns
-                .iter()
-                .zip(out.types.iter())
-                .map(|(c, t)| FieldInfo::new(c.clone(), None, None, map_type(t), FieldFormat::Text))
-                .collect::<Vec<_>>(),
-        );
+        let field_info = field_info_for_output(&out.columns, &out.types, |_, _| FieldFormat::Text);
         let mut data_rows = Vec::new();
         for row in &out.rows {
-            let mut encoder = DataRowEncoder::new(field_info.clone());
-            for (i, value) in row.values.iter().enumerate() {
-                let declared = field_info
-                    .get(i)
-                    .map(|f| f.datatype().clone())
-                    .unwrap_or(Type::VARCHAR);
-                encode_value(value, &mut encoder, &declared)?;
-            }
-            data_rows.push(encoder.finish());
+            data_rows
+                .push(encode_row(&row.values, field_info.clone()).map_err(PgWireError::IoError));
         }
         let response = QueryResponse::new(field_info, stream::iter(data_rows));
         Ok(vec![Response::Query(response)])
@@ -752,6 +1473,52 @@ impl PortalCursor {
 
 fn cursor_key(session_id: &str, portal_name: &str) -> String {
     format!("{session_id}:{portal_name}")
+}
+
+impl NodusExtendedQueryHandler {
+    fn output_metadata_for_query<C>(&self, client: &C, query_str: &str) -> Vec<(String, String)>
+    where
+        C: ClientInfo,
+    {
+        let query_str = rewrite_jdbc_metadata_query(query_str).unwrap_or(query_str);
+        let session_id = session_id_from_client(client);
+        let principal_id = principal_id_from_client(client);
+        let ctx = nodus_executor::ExecutionContext {
+            session_id,
+            principal_id,
+            active_roles: vec![],
+            authz_catalog_version: 1,
+        };
+
+        let Ok(mut stmts) = nodus_sql::parse_sql(query_str) else {
+            return Vec::new();
+        };
+        let Some(parsed) = stmts.pop() else {
+            return Vec::new();
+        };
+        let Ok(plan) = nodus_executor::plan_statement(&parsed, &[]) else {
+            return Vec::new();
+        };
+
+        let mut plan_zero = plan.clone();
+        let can_execute = match &mut plan_zero {
+            nodus_executor::LogicalPlan::Select { limit, .. } => {
+                *limit = Some(0);
+                true
+            }
+            nodus_executor::LogicalPlan::ShowVariable { .. }
+            | nodus_executor::LogicalPlan::SelectLiteral { .. } => true,
+            _ => false,
+        };
+        if !can_execute {
+            return Vec::new();
+        }
+
+        self.executor
+            .execute_logical(&ctx, plan_zero)
+            .map(|out| out.columns.into_iter().zip(out.types).collect())
+            .unwrap_or_default()
+    }
 }
 
 #[async_trait]
@@ -1028,7 +1795,22 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
                             .send(PgWireBackendMessage::NoData(NoData::new()))
                             .await?;
                     } else {
-                        send_describe_response(client, &resp).await?;
+                        client
+                            .send(PgWireBackendMessage::ParameterDescription(
+                                ParameterDescription::new(
+                                    resp.parameters.iter().map(|t| t.oid()).collect(),
+                                ),
+                            ))
+                            .await?;
+                        let metadata = self.output_metadata_for_query(client, &stmt.statement);
+                        let row_desc = if metadata.is_empty() {
+                            row_description(&resp.fields)
+                        } else {
+                            row_description_from_metadata(&metadata, |_, _| FieldFormat::Text)
+                        };
+                        client
+                            .send(PgWireBackendMessage::RowDescription(row_desc))
+                            .await?;
                     }
                 } else {
                     return Err(PgWireError::StatementNotFound(name.to_owned()));
@@ -1042,7 +1824,21 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
                             .send(PgWireBackendMessage::NoData(NoData::new()))
                             .await?;
                     } else {
-                        send_describe_response(client, &resp).await?;
+                        let metadata =
+                            self.output_metadata_for_query(client, &portal.statement.statement);
+                        let row_desc = if metadata.is_empty() {
+                            row_description(&resp.fields)
+                        } else {
+                            row_description_from_metadata(&metadata, |i, ty| {
+                                effective_result_format(
+                                    ty,
+                                    portal.result_column_format.format_for(i),
+                                )
+                            })
+                        };
+                        client
+                            .send(PgWireBackendMessage::RowDescription(row_desc))
+                            .await?;
                     }
                 } else {
                     return Err(PgWireError::PortalNotFound(name.to_owned()));
@@ -1126,16 +1922,7 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
             } else if format == pgwire::api::results::FieldFormat::Text {
                 let bytes = portal.parameters.get(i).unwrap().as_ref().unwrap();
                 let s = String::from_utf8_lossy(bytes).into_owned();
-                match *param_type {
-                    Type::BOOL => nodus_executor::Value::Bool(s == "t" || s == "true" || s == "1"),
-                    Type::INT2 | Type::INT4 | Type::INT8 => {
-                        nodus_executor::Value::Int(s.parse().unwrap_or_default())
-                    }
-                    Type::FLOAT4 | Type::FLOAT8 => {
-                        nodus_executor::Value::Float(s.parse().unwrap_or_default())
-                    }
-                    _ => nodus_executor::Value::Text(s),
-                }
+                text_parameter_value(param_type, s)
             } else {
                 match *param_type {
                     Type::BOOL => {
@@ -1162,11 +1949,169 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
                         let v = portal.parameter::<f64>(i, param_type)?.unwrap_or_default();
                         nodus_executor::Value::Float(v)
                     }
+                    Type::NUMERIC => {
+                        let bytes = portal.parameters.get(i).unwrap().as_ref().unwrap();
+                        let s = String::from_utf8_lossy(bytes).into_owned();
+                        text_parameter_value(param_type, s)
+                    }
+                    Type::OID => {
+                        let v = portal.parameter::<u32>(i, param_type)?.unwrap_or_default();
+                        nodus_executor::Value::Int(v as i64)
+                    }
                     Type::TEXT | Type::VARCHAR => {
                         let v = portal
                             .parameter::<String>(i, param_type)?
                             .unwrap_or_default();
                         nodus_executor::Value::Text(v)
+                    }
+                    Type::NAME | Type::BPCHAR => {
+                        let v = portal
+                            .parameter::<String>(i, param_type)?
+                            .unwrap_or_default();
+                        nodus_executor::Value::Text(v)
+                    }
+                    Type::BYTEA => {
+                        let v = portal
+                            .parameter::<Vec<u8>>(i, param_type)?
+                            .unwrap_or_default();
+                        nodus_executor::Value::Text(format!("\\x{}", hex_encode(&v)))
+                    }
+                    Type::DATE => {
+                        let v = portal
+                            .parameter::<NaiveDate>(i, param_type)?
+                            .map(|v| v.to_string())
+                            .unwrap_or_default();
+                        nodus_executor::Value::Text(v)
+                    }
+                    Type::TIME => {
+                        let v = portal
+                            .parameter::<NaiveTime>(i, param_type)?
+                            .map(|v| v.format("%H:%M:%S%.f").to_string())
+                            .unwrap_or_default();
+                        nodus_executor::Value::Text(v)
+                    }
+                    Type::TIMESTAMP => {
+                        let v = portal
+                            .parameter::<NaiveDateTime>(i, param_type)?
+                            .map(|v| v.format("%Y-%m-%d %H:%M:%S%.f").to_string())
+                            .unwrap_or_default();
+                        nodus_executor::Value::Text(v)
+                    }
+                    Type::TIMESTAMPTZ => {
+                        let v = portal
+                            .parameter::<DateTime<Utc>>(i, param_type)?
+                            .map(|v| v.to_rfc3339())
+                            .unwrap_or_default();
+                        nodus_executor::Value::Text(v)
+                    }
+                    Type::UUID => {
+                        let v = portal
+                            .parameter::<Uuid>(i, param_type)?
+                            .map(|v| v.to_string())
+                            .unwrap_or_default();
+                        nodus_executor::Value::Text(v)
+                    }
+                    Type::JSON | Type::JSONB => {
+                        let v = portal
+                            .parameter::<Json<serde_json::Value>>(i, param_type)?
+                            .map(|v| v.0)
+                            .unwrap_or(serde_json::Value::Null);
+                        nodus_executor::Value::Jsonb(v)
+                    }
+                    Type::TEXT_ARRAY
+                    | Type::VARCHAR_ARRAY
+                    | Type::BPCHAR_ARRAY
+                    | Type::NAME_ARRAY => {
+                        let v = portal
+                            .parameter::<Vec<Option<String>>>(i, param_type)?
+                            .unwrap_or_default();
+                        values_to_array(v, nodus_executor::Value::Text)
+                    }
+                    Type::INT2_ARRAY => {
+                        let v = portal
+                            .parameter::<Vec<Option<i16>>>(i, param_type)?
+                            .unwrap_or_default();
+                        values_to_array(v, |n| nodus_executor::Value::Int(n as i64))
+                    }
+                    Type::INT4_ARRAY => {
+                        let v = portal
+                            .parameter::<Vec<Option<i32>>>(i, param_type)?
+                            .unwrap_or_default();
+                        values_to_array(v, |n| nodus_executor::Value::Int(n as i64))
+                    }
+                    Type::INT8_ARRAY => {
+                        let v = portal
+                            .parameter::<Vec<Option<i64>>>(i, param_type)?
+                            .unwrap_or_default();
+                        values_to_array(v, nodus_executor::Value::Int)
+                    }
+                    Type::FLOAT4_ARRAY => {
+                        let v = portal
+                            .parameter::<Vec<Option<f32>>>(i, param_type)?
+                            .unwrap_or_default();
+                        values_to_array(v, |n| nodus_executor::Value::Float(n as f64))
+                    }
+                    Type::FLOAT8_ARRAY => {
+                        let v = portal
+                            .parameter::<Vec<Option<f64>>>(i, param_type)?
+                            .unwrap_or_default();
+                        values_to_array(v, nodus_executor::Value::Float)
+                    }
+                    Type::BOOL_ARRAY => {
+                        let v = portal
+                            .parameter::<Vec<Option<bool>>>(i, param_type)?
+                            .unwrap_or_default();
+                        values_to_array(v, nodus_executor::Value::Bool)
+                    }
+                    Type::UUID_ARRAY => {
+                        let v = portal
+                            .parameter::<Vec<Option<Uuid>>>(i, param_type)?
+                            .unwrap_or_default();
+                        values_to_array(v, |uuid| nodus_executor::Value::Text(uuid.to_string()))
+                    }
+                    Type::JSON_ARRAY | Type::JSONB_ARRAY => {
+                        let v = portal
+                            .parameter::<Vec<Option<Json<serde_json::Value>>>>(i, param_type)?
+                            .unwrap_or_default();
+                        values_to_array(v, |json| nodus_executor::Value::Jsonb(json.0))
+                    }
+                    Type::BYTEA_ARRAY => {
+                        let v = portal
+                            .parameter::<Vec<Option<Vec<u8>>>>(i, param_type)?
+                            .unwrap_or_default();
+                        values_to_array(v, |bytes| {
+                            nodus_executor::Value::Text(format!("\\x{}", hex_encode(&bytes)))
+                        })
+                    }
+                    Type::DATE_ARRAY => {
+                        let v = portal
+                            .parameter::<Vec<Option<NaiveDate>>>(i, param_type)?
+                            .unwrap_or_default();
+                        values_to_array(v, |date| nodus_executor::Value::Text(date.to_string()))
+                    }
+                    Type::TIME_ARRAY => {
+                        let v = portal
+                            .parameter::<Vec<Option<NaiveTime>>>(i, param_type)?
+                            .unwrap_or_default();
+                        values_to_array(v, |time| {
+                            nodus_executor::Value::Text(time.format("%H:%M:%S%.f").to_string())
+                        })
+                    }
+                    Type::TIMESTAMP_ARRAY => {
+                        let v = portal
+                            .parameter::<Vec<Option<NaiveDateTime>>>(i, param_type)?
+                            .unwrap_or_default();
+                        values_to_array(v, |ts| {
+                            nodus_executor::Value::Text(
+                                ts.format("%Y-%m-%d %H:%M:%S%.f").to_string(),
+                            )
+                        })
+                    }
+                    Type::TIMESTAMPTZ_ARRAY => {
+                        let v = portal
+                            .parameter::<Vec<Option<DateTime<Utc>>>>(i, param_type)?
+                            .unwrap_or_default();
+                        values_to_array(v, |ts| nodus_executor::Value::Text(ts.to_rfc3339()))
                     }
                     _ => {
                         let v = portal
@@ -1238,33 +2183,13 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
             return Ok(Response::Execution(tag));
         }
 
-        let field_info = Arc::new(
-            out.columns
-                .iter()
-                .zip(out.types.iter())
-                .enumerate()
-                .map(|(i, (c, t))| {
-                    FieldInfo::new(
-                        c.clone(),
-                        None,
-                        None,
-                        map_type(t),
-                        portal.result_column_format.format_for(i),
-                    )
-                })
-                .collect::<Vec<_>>(),
-        );
+        let field_info = field_info_for_output(&out.columns, &out.types, |i, _| {
+            portal.result_column_format.format_for(i)
+        });
         let mut data_rows = Vec::new();
         for row in &out.rows {
-            let mut encoder = DataRowEncoder::new(field_info.clone());
-            for (i, value) in row.values.iter().enumerate() {
-                let declared = field_info
-                    .get(i)
-                    .map(|f| f.datatype().clone())
-                    .unwrap_or(Type::VARCHAR);
-                encode_value(value, &mut encoder, &declared)?;
-            }
-            data_rows.push(encoder.finish());
+            data_rows
+                .push(encode_row(&row.values, field_info.clone()).map_err(PgWireError::IoError));
         }
         let response = QueryResponse::new(field_info, stream::iter(data_rows));
         Ok(Response::Query(response))

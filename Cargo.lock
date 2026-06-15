@@ -2218,10 +2218,13 @@ name = "nodus_compatibility_tests"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "chrono",
  "futures-util",
  "nodus_testkit",
+ "serde_json",
  "tokio",
  "tokio-postgres",
+ "uuid",
 ]
 
 [[package]]
@@ -2364,6 +2367,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bytes",
+ "chrono",
  "futures-util",
  "nodus_catalog",
  "nodus_executor",
@@ -2374,6 +2378,7 @@ dependencies = [
  "pgwire",
  "postgres-types",
  "proptest",
+ "serde_json",
  "thiserror 1.0.69",
  "tokio",
  "tokio-rustls",
@@ -3168,6 +3173,9 @@ dependencies = [
  "fallible-iterator",
  "postgres-derive",
  "postgres-protocol",
+ "serde_core",
+ "serde_json",
+ "uuid",
 ]
 
 [[package]]
