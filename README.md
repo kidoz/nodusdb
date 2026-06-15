@@ -25,14 +25,25 @@ NodusDB targets high-load OLTP workloads by combining the familiar PostgreSQL in
 - **Observability First**: Built-in Prometheus metrics (`/metrics`), `/healthz`, and `/readyz` endpoints out-of-the-box.
 
 ## Getting Started
-To run the server locally:
+To run the server locally with durable storage and explicit dev credentials:
+
 ```bash
-just run
+NODUS_CONFIG=nodus.toml.example cargo run --bin nodus_server
 ```
 
 To run the CLI:
 ```bash
 cargo run --bin nodus_cli -- help
+```
+
+The example config listens on `127.0.0.1:5432`, stores data under
+`.local/nodus/`, and uses the local-only `nodus` / `nodus` database user.
+Copy it to `nodus.toml` and change `[admin]` values before sharing an instance.
+
+To run the Docker Compose test stack:
+
+```bash
+docker compose up --build
 ```
 
 ## Development

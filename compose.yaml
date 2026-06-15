@@ -8,10 +8,19 @@ services:
       - "5432:5432" # PostgreSQL wire protocol
       - "8088:8088" # HTTP admin / metrics / web console
     environment:
-      NODUS_OBSERVABILITY__LOG_LEVEL: info
+      NODUS_CONFIG: /etc/nodus/nodus.toml
+      NODUS_SERVER__PGWIRE_ADDR: 0.0.0.0:5432
+      NODUS_SERVER__HTTP_ADDR: 0.0.0.0:8088
       NODUS_ADMIN__PASSWORD: nodus
+      NODUS_ADMIN__TOKEN: nodus-dev-token
+      NODUS_OBSERVABILITY__LOG_LEVEL: info
     volumes:
+      - ./deploy/nodus.example.toml:/etc/nodus/nodus.toml:ro
       - nodus-data:/var/lib/nodus/data
+      - nodus-backups:/var/lib/nodus/backups
+      - nodus-audit:/var/log/nodus
 
 volumes:
   nodus-data:
+  nodus-backups:
+  nodus-audit:

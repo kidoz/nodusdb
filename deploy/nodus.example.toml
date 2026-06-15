@@ -1,22 +1,47 @@
-# Example NodusDB configuration. Every value here is also overridable via
-# environment variables prefixed with NODUS_ (double underscore for nesting),
-# e.g. NODUS_SERVER__HTTP_ADDR=0.0.0.0:8088.
+# Example NodusDB configuration for container and service deployments.
+#
+# Every value here is also overridable via environment variables prefixed with
+# NODUS_ (double underscore for nesting), e.g.
+# NODUS_SERVER__HTTP_ADDR=0.0.0.0:8088.
 
 [server]
 pgwire_addr = "127.0.0.1:5432"
 http_addr = "127.0.0.1:8088"
 max_connections = 100
 
+[cluster]
+node_id = 1
+raft_advertise_addr = "127.0.0.1:8088"
+join_peers = []
+
+[storage]
+# Required for durable data. If unset, nodusd uses in-memory storage.
+data_dir = "/var/lib/nodus/data"
+# Optional 256-bit AES-GCM key: exactly 64 hex characters.
+# encryption_key = "0000000000000000000000000000000000000000000000000000000000000000"
+
+[admin]
+# Replace these in real deployments. Compose overrides them for local tests.
+password = "change-me"
+token = "change-me-admin-token"
+
 [tls]
 enabled = false
 # cert_path = "/etc/nodus/tls/server.crt"
 # key_path = "/etc/nodus/tls/server.key"
+# client_ca_path = "/etc/nodus/tls/client-ca.crt"
+require_client_auth = false
 
 [backup]
 # Required in production. Empty disables backups.
 repository_uri = "file:///var/lib/nodus/backups"
 
+[audit]
+# Required for durable audit events. If unset, audit events are in-memory only.
+file_path = "/var/log/nodus/audit.jsonl"
+
 [observability]
 metrics_enabled = true
 log_level = "info"
 log_redaction = true
+# otlp_endpoint = "http://otel-collector:4318"

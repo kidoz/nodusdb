@@ -1,0 +1,47 @@
+# Example NodusDB configuration for local host development.
+#
+# Copy to nodus.toml or run with:
+#   NODUS_CONFIG=nodus.toml.example cargo run --bin nodus_server
+#
+# Every value is overridable via NODUS_-prefixed environment variables, using
+# double underscore for nesting, e.g. NODUS_SERVER__PGWIRE_ADDR=127.0.0.1:55432.
+
+[server]
+pgwire_addr = "127.0.0.1:5432"
+http_addr = "127.0.0.1:8088"
+max_connections = 100
+
+[cluster]
+node_id = 1
+raft_advertise_addr = "127.0.0.1:8088"
+join_peers = []
+
+[storage]
+# Required for durable data. If unset, nodusd uses in-memory storage.
+data_dir = "./.local/nodus/data"
+# Optional 256-bit AES-GCM key: exactly 64 hex characters.
+# encryption_key = "0000000000000000000000000000000000000000000000000000000000000000"
+
+[admin]
+# Local dev/test credentials only. Replace before sharing an instance.
+password = "nodus"
+token = "nodus-dev-token"
+
+[tls]
+enabled = false
+# cert_path = "./.local/nodus/tls/server.crt"
+# key_path = "./.local/nodus/tls/server.key"
+# client_ca_path = "./.local/nodus/tls/client-ca.crt"
+require_client_auth = false
+
+[backup]
+repository_uri = "file://./.local/nodus/backups"
+
+[audit]
+file_path = "./.local/nodus/audit.jsonl"
+
+[observability]
+metrics_enabled = true
+log_level = "info"
+log_redaction = true
+# otlp_endpoint = "http://127.0.0.1:4318"

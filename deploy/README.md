@@ -21,6 +21,13 @@ docker compose -f deploy/docker-compose.yml up --build
 - Admin / metrics / console: `http://localhost:8088`
 - Prometheus: `http://localhost:9090`
 - MinIO console: `http://localhost:9001`
+- Local test database user: `nodus`
+- Local test database password: `nodus`
+- Local test admin token: `nodus-dev-token`
+
+The Compose stack mounts `deploy/nodus.example.toml` into the container and
+overrides container bind addresses plus local-only test credentials through
+environment variables.
 
 ## Kubernetes (Helm)
 
@@ -46,3 +53,10 @@ sudo systemctl enable --now nodusd
 All settings in `deploy/nodus.example.toml` are overridable via `NODUS_`-prefixed
 environment variables (double underscore for nesting), e.g.
 `NODUS_SERVER__HTTP_ADDR=0.0.0.0:8088`.
+
+For host-local development outside Docker, use the repository-root
+`nodus.toml.example`:
+
+```bash
+NODUS_CONFIG=nodus.toml.example cargo run --bin nodus_server
+```
