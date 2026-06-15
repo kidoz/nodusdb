@@ -30,6 +30,11 @@ public class JdbcFeatureCoverageTest {
         return DriverManager.getConnection(url, props);
     }
 
+    private static void assertPostgresBoolColumn(ResultSetMetaData meta, int column) throws Exception {
+        assertEquals(Types.BIT, meta.getColumnType(column));
+        assertEquals("bool", meta.getColumnTypeName(column));
+    }
+
     @Test
     public void testDatabaseMetaData() throws Exception {
         // Many custom databases fail here because pgjdbc relies heavily on pg_catalog 
@@ -92,6 +97,9 @@ public class JdbcFeatureCoverageTest {
                     "from pg_catalog.pg_database N " +
                     "  left join pg_catalog.pg_shdescription D on N.oid = D.objoid " +
                     "order by case when datname = pg_catalog.current_database() then -1::bigint else N.oid::bigint end")) {
+                ResultSetMetaData meta = rs.getMetaData();
+                assertPostgresBoolColumn(meta, 4);
+                assertPostgresBoolColumn(meta, 5);
                 assertTrue(rs.next());
                 assertTrue(rs.getLong("id") > 0);
                 assertEquals("default", rs.getString("name"));

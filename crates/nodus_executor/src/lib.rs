@@ -5492,30 +5492,27 @@ impl MemExecutor {
                 for (i, c) in out_cols.iter().enumerate() {
                     // Quick lookup for type. Default to VARCHAR.
                     let mut ty = "VARCHAR".to_string();
-                    let (db_name, schema_name, table_only) = parse_object_name(&table_name)
-                        .unwrap_or(("default", "public", &table_name));
-                    if Self::is_virtual_schema(schema_name) {
-                        if let Ok((cols, _)) =
-                            self.get_virtual_table(db_name, schema_name, table_only)
-                        {
-                            if let Some(col_desc) = cols.iter().find(|x| {
-                                x.name == *c || format!("{}.{}", table_name, x.name) == *c
-                            }) {
+
+                    if projection.is_empty() {
+                        if let Some(col_desc) = joined_columns.get(i) {
+                            ty = col_desc.data_type.clone();
+                        }
+                    } else if let Some(source_col) = projection.get(i).and_then(|item| match item {
+                        ProjectionItem::Column(col) | ProjectionItem::AliasedColumn(col, _) => {
+                            Some(col)
+                        }
+                        _ => None,
+                    }) {
+                        if let Some(source_idx) = col_names.iter().position(|candidate| {
+                            candidate == source_col
+                                || candidate.ends_with(&format!(".{}", source_col))
+                        }) {
+                            if let Some(col_desc) = joined_columns.get(source_idx) {
                                 ty = col_desc.data_type.clone();
                             }
                         }
-                    } else if let Ok(tbl_desc) =
-                        self.catalog_reader
-                            .get_table(db_name, schema_name, table_only)
-                    {
-                        if let Some(col_desc) = tbl_desc
-                            .columns
-                            .iter()
-                            .find(|x| x.name == *c || format!("{}.{}", table_name, x.name) == *c)
-                        {
-                            ty = col_desc.data_type.clone();
-                        }
                     }
+
                     if ty == "VARCHAR" && !rows.is_empty() {
                         if let Some(val) = rows[0].values.get(i) {
                             match val {
