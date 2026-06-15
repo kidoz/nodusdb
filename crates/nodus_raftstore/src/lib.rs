@@ -96,6 +96,50 @@ pub struct ShardResponse {
     pub success: bool,
 }
 
+/// Logs a catalog-apply failure. State-machine apply must be idempotent: log
+/// replay on restart and the non-idempotent bootstrap both re-issue create
+/// commands. A replay is expected only when the catalog already has the
+/// descriptor ID carried by the Raft command; duplicate names with different
+/// IDs remain real apply failures.
+fn log_create_apply_error(command: &str, err: &anyhow::Error, already_applied: bool) {
+    if already_applied {
+        tracing::debug!("{} already applied: {}", command, err);
+    } else {
+        tracing::error!("{} apply failed: {}", command, err);
+    }
+}
+
+fn database_create_already_applied(
+    reader: Option<&Arc<dyn nodus_catalog::CatalogReader>>,
+    req: &nodus_catalog::CreateDatabaseRequest,
+) -> bool {
+    reader
+        .and_then(|reader| reader.get_database_by_id(req.id).ok())
+        .is_some_and(|database| database.name == req.name)
+}
+
+fn schema_create_already_applied(
+    reader: Option<&Arc<dyn nodus_catalog::CatalogReader>>,
+    req: &nodus_catalog::CreateSchemaRequest,
+) -> bool {
+    reader
+        .and_then(|reader| reader.get_schema_by_id(req.id).ok())
+        .is_some_and(|schema| schema.database_id == req.database_id && schema.name == req.name)
+}
+
+fn table_create_already_applied(
+    reader: Option<&Arc<dyn nodus_catalog::CatalogReader>>,
+    req: &nodus_catalog::CreateTableRequest,
+) -> bool {
+    reader
+        .and_then(|reader| reader.get_table_by_id(req.id).ok())
+        .is_some_and(|table| {
+            table.database_id == req.database_id
+                && table.schema_id == req.schema_id
+                && table.name == req.name
+        })
+}
+
 pub struct StateMachine {
     pub last_applied_log: Option<LogId<u64>>,
     pub last_membership: StoredMembership<u64, openraft::BasicNode>,
@@ -363,20 +407,33 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
                         }
                     }
                     if let Some(catalog) = &sm.catalog_writer {
+                        let catalog_reader = sm.catalog_reader.as_ref();
                         match cmd {
                             ShardCommand::CreateDatabase(req) => {
                                 if let Err(e) = catalog.create_database(req.clone()) {
-                                    tracing::error!("CreateDatabase apply failed: {}", e);
+                                    log_create_apply_error(
+                                        "CreateDatabase",
+                                        &e,
+                                        database_create_already_applied(catalog_reader, req),
+                                    );
                                 }
                             }
                             ShardCommand::CreateSchema(req) => {
                                 if let Err(e) = catalog.create_schema(req.clone()) {
-                                    tracing::error!("CreateSchema apply failed: {}", e);
+                                    log_create_apply_error(
+                                        "CreateSchema",
+                                        &e,
+                                        schema_create_already_applied(catalog_reader, req),
+                                    );
                                 }
                             }
                             ShardCommand::CreateTable(req) => {
                                 if let Err(e) = catalog.create_table(req.clone()) {
-                                    tracing::error!("CreateTable apply failed: {}", e);
+                                    log_create_apply_error(
+                                        "CreateTable",
+                                        &e,
+                                        table_create_already_applied(catalog_reader, req),
+                                    );
                                 }
                             }
                             ShardCommand::DropTable(id) => {
@@ -505,5 +562,105 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
         &mut self,
     ) -> Result<Option<Snapshot<NodusTypeConfig>>, StorageError<u64>> {
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nodus_catalog::{CatalogWriter, MemoryCatalog};
+
+    fn catalog_reader(catalog: &Arc<MemoryCatalog>) -> Arc<dyn nodus_catalog::CatalogReader> {
+        catalog.clone()
+    }
+
+    #[test]
+    fn create_database_replay_is_detected_by_descriptor_id() {
+        let catalog = Arc::new(MemoryCatalog::new());
+        let reader = catalog_reader(&catalog);
+        let req = nodus_catalog::CreateDatabaseRequest {
+            id: nodus_catalog::DatabaseId::new(),
+            name: "default".into(),
+            owner_role_id: None,
+        };
+
+        catalog.create_database(req.clone()).unwrap();
+
+        assert!(database_create_already_applied(Some(&reader), &req));
+
+        let conflicting_replay = nodus_catalog::CreateDatabaseRequest {
+            id: nodus_catalog::DatabaseId::new(),
+            name: req.name.clone(),
+            owner_role_id: None,
+        };
+        assert!(!database_create_already_applied(
+            Some(&reader),
+            &conflicting_replay
+        ));
+    }
+
+    #[test]
+    fn create_schema_replay_is_detected_by_descriptor_id() {
+        let catalog = Arc::new(MemoryCatalog::new());
+        let reader = catalog_reader(&catalog);
+        let database_id = nodus_catalog::DatabaseId::new();
+        let req = nodus_catalog::CreateSchemaRequest {
+            id: nodus_catalog::SchemaId::new(),
+            database_id,
+            name: "public".into(),
+            owner_role_id: None,
+            managed_access: false,
+        };
+
+        catalog.create_schema(req.clone()).unwrap();
+
+        assert!(schema_create_already_applied(Some(&reader), &req));
+
+        let conflicting_replay = nodus_catalog::CreateSchemaRequest {
+            id: nodus_catalog::SchemaId::new(),
+            database_id,
+            name: req.name.clone(),
+            owner_role_id: None,
+            managed_access: false,
+        };
+        assert!(!schema_create_already_applied(
+            Some(&reader),
+            &conflicting_replay
+        ));
+    }
+
+    #[test]
+    fn create_table_replay_is_detected_by_descriptor_id() {
+        let catalog = Arc::new(MemoryCatalog::new());
+        let reader = catalog_reader(&catalog);
+        let database_id = nodus_catalog::DatabaseId::new();
+        let schema_id = nodus_catalog::SchemaId::new();
+        let req = nodus_catalog::CreateTableRequest {
+            id: nodus_catalog::TableId::new(),
+            database_id,
+            schema_id,
+            name: "users".into(),
+            columns: Vec::new(),
+            constraints: Vec::new(),
+            view_query: None,
+        };
+
+        catalog.create_table(req.clone()).unwrap();
+
+        assert!(table_create_already_applied(Some(&reader), &req));
+
+        let conflicting_replay = nodus_catalog::CreateTableRequest {
+            id: nodus_catalog::TableId::new(),
+            database_id,
+            schema_id,
+            name: req.name.clone(),
+            columns: Vec::new(),
+            constraints: Vec::new(),
+            view_query: None,
+        };
+        assert!(!table_create_already_applied(
+            Some(&reader),
+            &conflicting_replay
+        ));
     }
 }

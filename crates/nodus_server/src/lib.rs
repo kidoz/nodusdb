@@ -46,6 +46,38 @@ fn backup_dir(uri: &str) -> PathBuf {
     }
 }
 
+fn bootstrap_catalog_commands(catalog: &dyn CatalogReader) -> Vec<nodus_raftstore::ShardCommand> {
+    let mut commands = Vec::new();
+    let db_id = match catalog.get_database("default") {
+        Ok(database) => database.id,
+        Err(_) => {
+            let id = nodus_catalog::DatabaseId::new();
+            commands.push(nodus_raftstore::ShardCommand::CreateDatabase(
+                nodus_catalog::CreateDatabaseRequest {
+                    id,
+                    name: "default".into(),
+                    owner_role_id: None,
+                },
+            ));
+            id
+        }
+    };
+
+    if catalog.get_schema("default", "public").is_err() {
+        commands.push(nodus_raftstore::ShardCommand::CreateSchema(
+            nodus_catalog::CreateSchemaRequest {
+                id: nodus_catalog::SchemaId::new(),
+                database_id: db_id,
+                name: "public".into(),
+                owner_role_id: None,
+                managed_access: false,
+            },
+        ));
+    }
+
+    commands
+}
+
 /// Builds a TLS acceptor from configuration. Returns `None` when TLS is
 /// disabled. Errors if enabled but the cert/key are missing or invalid.
 fn load_tls_config(tls: &nodus_config::TlsConfig) -> anyhow::Result<Option<Arc<ServerConfig>>> {
@@ -213,6 +245,7 @@ pub async fn run_server_with_config(
     let node_id = config.cluster.node_id;
     let advertise_addr = config.cluster.raft_advertise_addr.clone();
     let admin_token = config.admin.token.clone();
+    let bootstrap_catalog = catalog.clone();
 
     let raft_kv = Arc::new(crate::raft_kv::RaftKvEngine {
         local: local_kv.clone(),
@@ -268,32 +301,19 @@ pub async fn run_server_with_config(
                 retries += 1;
             }
 
-            // Bootstrap the catalog on the leader
-            tracing::debug!("Running bootstrap!");
-            let db_id = nodus_catalog::DatabaseId::new();
-            let cmd1 = nodus_raftstore::ShardCommand::CreateDatabase(
-                nodus_catalog::CreateDatabaseRequest {
-                    id: db_id,
-                    name: "default".into(),
-                    owner_role_id: None,
-                },
-            );
-            if let Err(e) = raft_clone.client_write(cmd1).await {
-                tracing::debug!("Bootstrap create_database failed: {}", e);
+            let bootstrap_commands = bootstrap_catalog_commands(bootstrap_catalog.as_ref());
+            if bootstrap_commands.is_empty() {
+                tracing::debug!("Bootstrap catalog already exists");
             } else {
-                let cmd2 = nodus_raftstore::ShardCommand::CreateSchema(
-                    nodus_catalog::CreateSchemaRequest {
-                        id: nodus_catalog::SchemaId::new(),
-                        database_id: db_id,
-                        name: "public".into(),
-                        owner_role_id: None,
-                        managed_access: false,
-                    },
+                tracing::debug!(
+                    "Running bootstrap with {} catalog command(s)",
+                    bootstrap_commands.len()
                 );
-                if let Err(e) = raft_clone.client_write(cmd2).await {
-                    tracing::debug!("Bootstrap create_schema failed: {}", e);
-                } else {
-                    tracing::debug!("Bootstrap succeeded");
+                for command in bootstrap_commands {
+                    if let Err(e) = raft_clone.client_write(command).await {
+                        tracing::debug!("Bootstrap catalog command failed: {}", e);
+                        break;
+                    }
                 }
             }
             state_clone
@@ -607,6 +627,7 @@ pub async fn run_server_with_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nodus_catalog::MemoryCatalog;
     use nodus_config::TlsConfig;
 
     #[test]
@@ -635,5 +656,72 @@ mod tests {
         );
         // Empty falls back to a unique temp dir.
         assert!(backup_dir("").starts_with(std::env::temp_dir()));
+    }
+
+    #[test]
+    fn bootstrap_catalog_commands_create_missing_database_and_schema() {
+        let catalog = MemoryCatalog::new();
+        let commands = bootstrap_catalog_commands(&catalog);
+
+        assert_eq!(commands.len(), 2);
+        let db_id = match &commands[0] {
+            nodus_raftstore::ShardCommand::CreateDatabase(req) => {
+                assert_eq!(req.name, "default");
+                req.id
+            }
+            other => panic!("expected CreateDatabase, got {other:?}"),
+        };
+        match &commands[1] {
+            nodus_raftstore::ShardCommand::CreateSchema(req) => {
+                assert_eq!(req.name, "public");
+                assert_eq!(req.database_id, db_id);
+            }
+            other => panic!("expected CreateSchema, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bootstrap_catalog_commands_skip_existing_database_and_schema() {
+        let catalog = MemoryCatalog::new();
+        let db = catalog
+            .create_database(nodus_catalog::CreateDatabaseRequest {
+                id: nodus_catalog::DatabaseId::new(),
+                name: "default".into(),
+                owner_role_id: None,
+            })
+            .unwrap();
+        catalog
+            .create_schema(nodus_catalog::CreateSchemaRequest {
+                id: nodus_catalog::SchemaId::new(),
+                database_id: db.id,
+                name: "public".into(),
+                owner_role_id: None,
+                managed_access: false,
+            })
+            .unwrap();
+
+        assert!(bootstrap_catalog_commands(&catalog).is_empty());
+    }
+
+    #[test]
+    fn bootstrap_catalog_commands_reuse_existing_database_for_missing_schema() {
+        let catalog = MemoryCatalog::new();
+        let db = catalog
+            .create_database(nodus_catalog::CreateDatabaseRequest {
+                id: nodus_catalog::DatabaseId::new(),
+                name: "default".into(),
+                owner_role_id: None,
+            })
+            .unwrap();
+
+        let commands = bootstrap_catalog_commands(&catalog);
+        assert_eq!(commands.len(), 1);
+        match &commands[0] {
+            nodus_raftstore::ShardCommand::CreateSchema(req) => {
+                assert_eq!(req.name, "public");
+                assert_eq!(req.database_id, db.id);
+            }
+            other => panic!("expected CreateSchema, got {other:?}"),
+        }
     }
 }
