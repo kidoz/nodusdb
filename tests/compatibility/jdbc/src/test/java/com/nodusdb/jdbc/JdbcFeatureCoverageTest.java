@@ -22,6 +22,7 @@ public class JdbcFeatureCoverageTest {
         Properties props = new Properties();
         props.setProperty("user", "nodus");
         props.setProperty("password", "nodus");
+        props.setProperty("ApplicationName", "pgjdbc-compat-tests");
         // Bumped to 18.0 as requested. This forces the pgjdbc driver into modern modes,
         // altering how it issues catalog queries and handles metadata.
         props.setProperty("assumeMinServerVersion", "18.0"); 
@@ -95,6 +96,37 @@ public class JdbcFeatureCoverageTest {
                  ResultSet rs = stmt.executeQuery("SELECT count(*) FROM test_tx WHERE id = 999")) {
                 assertTrue(rs.next());
                 assertEquals(0, rs.getInt(1), "Rollback failed to undo the insert");
+            }
+        }
+    }
+
+    @Test
+    public void testSavepointsAndGeneratedKeys() throws Exception {
+        try (Connection conn = getConnection();
+             Statement stmt = conn.createStatement()) {
+
+            stmt.execute("CREATE TABLE IF NOT EXISTS test_savepoints (id INT PRIMARY KEY, name TEXT)");
+
+            conn.setAutoCommit(false);
+            stmt.execute("INSERT INTO test_savepoints (id, name) VALUES (1, 'kept')");
+            Savepoint savepoint = conn.setSavepoint("sp_driver");
+            stmt.execute("INSERT INTO test_savepoints (id, name) VALUES (2, 'rolled_back')");
+            conn.rollback(savepoint);
+            conn.releaseSavepoint(savepoint);
+            conn.commit();
+            conn.setAutoCommit(true);
+
+            try (ResultSet rs = stmt.executeQuery("SELECT count(*) FROM test_savepoints WHERE id = 2")) {
+                assertTrue(rs.next());
+                assertEquals(0, rs.getInt(1));
+            }
+
+            try (PreparedStatement pstmt = conn.prepareStatement(
+                    "INSERT INTO test_savepoints (id, name) VALUES (3, 'generated') RETURNING id")) {
+                try (ResultSet keys = pstmt.executeQuery()) {
+                    assertTrue(keys.next());
+                    assertEquals(3, keys.getInt(1));
+                }
             }
         }
     }

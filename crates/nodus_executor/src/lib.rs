@@ -10,7 +10,7 @@ use nodus_catalog::{
     AuditEventId, CatalogReader, CatalogWriter, ColumnDescriptor, CreateTableRequest,
     DescriptorState, IndexId, MemoryCatalog, PrincipalId, ResourceRef, RoleId, TableId,
 };
-use nodus_storage_api::{KeyRange, KvEngine, Timestamp, TxnId};
+use nodus_storage_api::{IntentReplacement, KeyRange, KvEngine, Timestamp, TxnId};
 use nodus_txn::TxnManager;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -335,6 +335,15 @@ pub enum LogicalPlan {
     Begin,
     Commit,
     Rollback,
+    Savepoint {
+        name: String,
+    },
+    RollbackToSavepoint {
+        name: String,
+    },
+    ReleaseSavepoint {
+        name: String,
+    },
     ShowVariable {
         variable: String,
     },
@@ -763,7 +772,21 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
         }
         Statement::StartTransaction { .. } => Ok(LogicalPlan::Begin),
         Statement::Commit { .. } => Ok(LogicalPlan::Commit),
-        Statement::Rollback { .. } => Ok(LogicalPlan::Rollback),
+        Statement::Rollback { savepoint, .. } => {
+            if let Some(name) = savepoint {
+                Ok(LogicalPlan::RollbackToSavepoint {
+                    name: name.value.clone(),
+                })
+            } else {
+                Ok(LogicalPlan::Rollback)
+            }
+        }
+        Statement::Savepoint { name } => Ok(LogicalPlan::Savepoint {
+            name: name.value.clone(),
+        }),
+        Statement::ReleaseSavepoint { name } => Ok(LogicalPlan::ReleaseSavepoint {
+            name: name.value.clone(),
+        }),
         Statement::ShowVariable { variable } => {
             let var_name = variable
                 .iter()
@@ -1522,6 +1545,34 @@ pub struct ExecutionContext {
 }
 
 #[derive(Debug, Clone)]
+struct SavepointState {
+    name: String,
+    write_log_len: usize,
+    overlay: HashMap<String, Option<String>>,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveTxn {
+    txn_id: TxnId,
+    read_ts: Timestamp,
+    write_log: Vec<String>,
+    overlay: HashMap<String, Option<String>>,
+    savepoints: Vec<SavepointState>,
+}
+
+impl ActiveTxn {
+    fn new(txn_id: TxnId, read_ts: Timestamp) -> Self {
+        Self {
+            txn_id,
+            read_ts,
+            write_log: Vec::new(),
+            overlay: HashMap::new(),
+            savepoints: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct Row {
     pub values: Vec<Value>,
 }
@@ -1542,7 +1593,7 @@ pub struct MemExecutor {
     txn: Arc<dyn TxnManager>,
     /// Active explicit transaction per session id (`BEGIN`..`COMMIT`/`ROLLBACK`).
     /// Keyed by session so one connection's transaction can't affect another's.
-    active_txns: std::sync::RwLock<HashMap<String, (TxnId, Timestamp)>>,
+    active_txns: std::sync::RwLock<HashMap<String, ActiveTxn>>,
 }
 
 impl MemExecutor {
@@ -1661,7 +1712,7 @@ impl MemExecutor {
     /// latest committed state when the session has no open transaction.
     fn read_ts(&self, session: &str) -> Timestamp {
         match self.active_txns.read().unwrap().get(session) {
-            Some((_, ts)) => *ts,
+            Some(txn) => txn.read_ts,
             None => u64::MAX,
         }
     }
@@ -1669,7 +1720,7 @@ impl MemExecutor {
     /// Returns the session's active txn id. Expects a transaction to be active.
     fn txn_for(&self, session: &str) -> Result<TxnId> {
         match self.active_txns.read().unwrap().get(session) {
-            Some((tid, _)) => Ok(*tid),
+            Some(txn) => Ok(txn.txn_id),
             None => anyhow::bail!("No active transaction for session"),
         }
     }
@@ -1679,12 +1730,31 @@ impl MemExecutor {
         let read_ts = self.read_ts(session);
         let start = Bytes::from(format!("{}:", table_id));
         let end = Bytes::from(format!("{};", table_id));
-        let mut rows = Vec::new();
+        let mut keyed_rows = std::collections::BTreeMap::new();
         for pair in self.kv.scan(KeyRange { start, end }, read_ts)? {
             let pair = pair?;
-            rows.push(serde_json::from_slice::<Vec<Value>>(&pair.value)?);
+            keyed_rows.insert(
+                String::from_utf8_lossy(&pair.key).to_string(),
+                serde_json::from_slice::<Vec<Value>>(&pair.value)?,
+            );
         }
-        Ok(rows)
+        if let Some(txn) = self.active_txns.read().unwrap().get(session) {
+            let start = format!("{}:", table_id);
+            let end = format!("{};", table_id);
+            for (key, value) in &txn.overlay {
+                if key >= &start && key < &end {
+                    match value {
+                        Some(encoded) => {
+                            keyed_rows.insert(key.clone(), serde_json::from_str(encoded)?);
+                        }
+                        None => {
+                            keyed_rows.remove(key);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(keyed_rows.into_values().collect())
     }
 
     /// Scans a secondary index to quickly look up primary keys, then fetches those rows.
@@ -1837,7 +1907,11 @@ impl MemExecutor {
         let txn_id = self.txn_for(session)?;
         self.txn.track_write(txn_id, key.as_bytes().to_vec())?;
         self.kv
-            .write_intent(txn_id, Bytes::from(key), Bytes::from(value))?;
+            .write_intent(txn_id, Bytes::from(key.clone()), Bytes::from(value.clone()))?;
+        if let Some(txn) = self.active_txns.write().unwrap().get_mut(session) {
+            txn.write_log.push(key.clone());
+            txn.overlay.insert(key, Some(value));
+        }
         Ok(())
     }
 
@@ -1845,7 +1919,11 @@ impl MemExecutor {
     fn delete_row(&self, session: &str, key: String) -> Result<()> {
         let txn_id = self.txn_for(session)?;
         self.txn.track_write(txn_id, key.as_bytes().to_vec())?;
-        self.kv.delete_intent(txn_id, Bytes::from(key))?;
+        self.kv.delete_intent(txn_id, Bytes::from(key.clone()))?;
+        if let Some(txn) = self.active_txns.write().unwrap().get_mut(session) {
+            txn.write_log.push(key.clone());
+            txn.overlay.insert(key, None);
+        }
         Ok(())
     }
 
@@ -2263,7 +2341,12 @@ impl Executor for MemExecutor {
     fn execute_logical(&self, ctx: &ExecutionContext, plan: LogicalPlan) -> Result<QueryOutput> {
         let is_txn_control = matches!(
             plan,
-            LogicalPlan::Begin | LogicalPlan::Commit | LogicalPlan::Rollback
+            LogicalPlan::Begin
+                | LogicalPlan::Commit
+                | LogicalPlan::Rollback
+                | LogicalPlan::Savepoint { .. }
+                | LogicalPlan::RollbackToSavepoint { .. }
+                | LogicalPlan::ReleaseSavepoint { .. }
         );
         let is_read_only = matches!(
             plan,
@@ -2282,7 +2365,7 @@ impl Executor for MemExecutor {
             let txn_record = self.txn.begin_txn()?;
             self.active_txns.write().unwrap().insert(
                 ctx.session_id.clone(),
-                (txn_record.txn_id, txn_record.read_ts),
+                ActiveTxn::new(txn_record.txn_id, txn_record.read_ts),
             );
             implicit_txn = Some(txn_record.txn_id);
         }
@@ -2515,6 +2598,19 @@ impl MemExecutor {
                 let _ = db_name;
                 "public".to_string()
             })
+    }
+
+    fn returning_types(columns: &[ColumnDescriptor], returning: &[String]) -> Vec<String> {
+        returning
+            .iter()
+            .map(|name| {
+                columns
+                    .iter()
+                    .find(|column| column.name.eq_ignore_ascii_case(name))
+                    .map(|column| column.data_type.clone())
+                    .unwrap_or_else(|| "VARCHAR".to_string())
+            })
+            .collect()
     }
 
     fn pg_catalog_virtual_table(
@@ -4250,7 +4346,7 @@ impl MemExecutor {
                     Ok(QueryOutput {
                         tag: format!("INSERT 0 {}", inserted_count),
                         columns: returning.clone(),
-                        types: returning.iter().map(|_| "VARCHAR".to_string()).collect(),
+                        types: Self::returning_types(&tbl.columns, &returning),
                         rows,
                     })
                 }
@@ -4341,11 +4437,19 @@ impl MemExecutor {
                             .collect();
 
                         let mut rows = None;
-                        if let Some(FilterExpr::Predicate(Predicate {
-                            left,
-                            op: CompareOp::Eq,
-                            right,
-                        })) = filter.as_ref()
+                        let has_session_overlay = self
+                            .active_txns
+                            .read()
+                            .unwrap()
+                            .get(&ctx.session_id)
+                            .map(|txn| !txn.overlay.is_empty())
+                            .unwrap_or(false);
+                        if !has_session_overlay
+                            && let Some(FilterExpr::Predicate(Predicate {
+                                left,
+                                op: CompareOp::Eq,
+                                right,
+                            })) = filter.as_ref()
                         {
                             let col_name = left.split('.').last().unwrap_or(left);
                             if let Some(col) = tbl.columns.iter().find(|c| c.name == *col_name) {
@@ -5241,7 +5345,7 @@ impl MemExecutor {
                     Ok(QueryOutput {
                         tag: format!("UPDATE {updated}"),
                         columns: returning.clone(),
-                        types: returning.iter().map(|_| "VARCHAR".to_string()).collect(),
+                        types: Self::returning_types(&tbl.columns, &returning),
                         rows,
                     })
                 }
@@ -5316,7 +5420,7 @@ impl MemExecutor {
                     Ok(QueryOutput {
                         tag: format!("DELETE {deleted}"),
                         columns: returning.clone(),
-                        types: returning.iter().map(|_| "VARCHAR".to_string()).collect(),
+                        types: Self::returning_types(&tbl.columns, &returning),
                         rows,
                     })
                 }
@@ -5547,25 +5651,93 @@ impl MemExecutor {
                 let txn_record = self.txn.begin_txn()?;
                 self.active_txns.write().unwrap().insert(
                     ctx.session_id.clone(),
-                    (txn_record.txn_id, txn_record.read_ts),
+                    ActiveTxn::new(txn_record.txn_id, txn_record.read_ts),
                 );
                 Ok(QueryOutput::tag("BEGIN"))
             }
             LogicalPlan::Commit => {
-                if let Some((txn_id, _)) = self.active_txns.write().unwrap().remove(&ctx.session_id)
-                {
-                    let commit_ts = self.txn.commit_txn(txn_id)?;
-                    self.kv.commit(txn_id, commit_ts)?;
+                if let Some(txn) = self.active_txns.write().unwrap().remove(&ctx.session_id) {
+                    let commit_ts = self.txn.commit_txn(txn.txn_id)?;
+                    self.kv.commit(txn.txn_id, commit_ts)?;
                 }
                 Ok(QueryOutput::tag("COMMIT"))
             }
             LogicalPlan::Rollback => {
-                if let Some((txn_id, _)) = self.active_txns.write().unwrap().remove(&ctx.session_id)
-                {
-                    self.txn.abort_txn(txn_id)?;
-                    self.kv.abort(txn_id)?;
+                if let Some(txn) = self.active_txns.write().unwrap().remove(&ctx.session_id) {
+                    self.txn.abort_txn(txn.txn_id)?;
+                    self.kv.abort(txn.txn_id)?;
                 }
                 Ok(QueryOutput::tag("ROLLBACK"))
+            }
+            LogicalPlan::Savepoint { name } => {
+                let mut guard = self.active_txns.write().unwrap();
+                let txn = guard.get_mut(&ctx.session_id).ok_or_else(|| {
+                    anyhow::anyhow!("SAVEPOINT can only be used in transaction blocks")
+                })?;
+                txn.savepoints.push(SavepointState {
+                    name,
+                    write_log_len: txn.write_log.len(),
+                    overlay: txn.overlay.clone(),
+                });
+                Ok(QueryOutput::tag("SAVEPOINT"))
+            }
+            LogicalPlan::RollbackToSavepoint { name } => {
+                let (txn_id, affected, snapshot, keep_len, keep_savepoints) = {
+                    let guard = self.active_txns.read().unwrap();
+                    let txn = guard.get(&ctx.session_id).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "ROLLBACK TO SAVEPOINT can only be used in transaction blocks"
+                        )
+                    })?;
+                    let savepoint_idx = txn
+                        .savepoints
+                        .iter()
+                        .rposition(|savepoint| savepoint.name.eq_ignore_ascii_case(&name))
+                        .ok_or_else(|| anyhow::anyhow!("savepoint \"{}\" does not exist", name))?;
+                    let savepoint = txn.savepoints[savepoint_idx].clone();
+                    let affected = txn.write_log[savepoint.write_log_len..].to_vec();
+                    (
+                        txn.txn_id,
+                        affected,
+                        savepoint.overlay,
+                        savepoint.write_log_len,
+                        savepoint_idx + 1,
+                    )
+                };
+
+                let mut unique_keys = affected;
+                unique_keys.sort();
+                unique_keys.dedup();
+                for key in unique_keys {
+                    let replacement = match snapshot.get(&key) {
+                        Some(Some(value)) => IntentReplacement::Put(Bytes::from(value.clone())),
+                        Some(None) => IntentReplacement::Delete,
+                        None => IntentReplacement::Clear,
+                    };
+                    self.kv
+                        .replace_intent(txn_id, Bytes::from(key), replacement)?;
+                }
+
+                let mut guard = self.active_txns.write().unwrap();
+                if let Some(txn) = guard.get_mut(&ctx.session_id) {
+                    txn.overlay = snapshot;
+                    txn.write_log.truncate(keep_len);
+                    txn.savepoints.truncate(keep_savepoints);
+                }
+                Ok(QueryOutput::tag("ROLLBACK"))
+            }
+            LogicalPlan::ReleaseSavepoint { name } => {
+                let mut guard = self.active_txns.write().unwrap();
+                let txn = guard.get_mut(&ctx.session_id).ok_or_else(|| {
+                    anyhow::anyhow!("RELEASE SAVEPOINT can only be used in transaction blocks")
+                })?;
+                let savepoint_idx = txn
+                    .savepoints
+                    .iter()
+                    .rposition(|savepoint| savepoint.name.eq_ignore_ascii_case(&name))
+                    .ok_or_else(|| anyhow::anyhow!("savepoint \"{}\" does not exist", name))?;
+                txn.savepoints.truncate(savepoint_idx);
+                Ok(QueryOutput::tag("RELEASE"))
             }
             LogicalPlan::ShowVariable { variable } => {
                 let value = if variable.eq_ignore_ascii_case("search_path") {

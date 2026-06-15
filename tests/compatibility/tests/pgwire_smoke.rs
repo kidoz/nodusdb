@@ -77,6 +77,105 @@ async fn test_cancel_request_is_accepted_without_killing_idle_session() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_statement_timeout_returns_query_cancelled_and_keeps_session_alive() {
+    let server = TestServer::start().await.expect("server starts");
+    let client = connect(&server).await;
+
+    client
+        .simple_query("SET statement_timeout = 1")
+        .await
+        .unwrap();
+    let err = client
+        .simple_query("SELECT pg_sleep(1)")
+        .await
+        .expect_err("pg_sleep should exceed statement_timeout");
+    let db_err = err.as_db_error().expect("expected database error");
+    assert_eq!(
+        db_err.code(),
+        &tokio_postgres::error::SqlState::QUERY_CANCELED
+    );
+
+    client
+        .simple_query("SET statement_timeout = 0")
+        .await
+        .unwrap();
+    let rows = client.query("SELECT 1", &[]).await.unwrap();
+    assert_eq!(rows.len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_savepoints_rollback_release_and_read_your_writes() {
+    let server = TestServer::start().await.expect("server starts");
+    let client = connect(&server).await;
+
+    client
+        .simple_query("CREATE TABLE savepoint_rows (id INT PRIMARY KEY, name TEXT);")
+        .await
+        .unwrap();
+
+    client.simple_query("BEGIN").await.unwrap();
+    client
+        .simple_query("INSERT INTO savepoint_rows (id, name) VALUES (1, 'kept');")
+        .await
+        .unwrap();
+    let rows = client
+        .query("SELECT name FROM savepoint_rows WHERE id = 1", &[])
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1, "transaction should read its own insert");
+    let name: &str = rows[0].get(0);
+    assert_eq!(name, "kept");
+
+    client.simple_query("SAVEPOINT sp1").await.unwrap();
+    client
+        .simple_query("INSERT INTO savepoint_rows (id, name) VALUES (2, 'rolled_back');")
+        .await
+        .unwrap();
+    client
+        .simple_query("ROLLBACK TO SAVEPOINT sp1")
+        .await
+        .unwrap();
+    client.simple_query("RELEASE SAVEPOINT sp1").await.unwrap();
+    client.simple_query("COMMIT").await.unwrap();
+
+    let rows = client
+        .query("SELECT id, name FROM savepoint_rows ORDER BY id", &[])
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    let id: i32 = rows[0].get(0);
+    let name: &str = rows[0].get(1);
+    assert_eq!((id, name), (1, "kept"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_returning_reports_declared_types_for_generated_key_paths() {
+    let server = TestServer::start().await.expect("server starts");
+    let client = connect(&server).await;
+
+    client
+        .simple_query("CREATE TABLE returning_keys (id INT PRIMARY KEY, label TEXT);")
+        .await
+        .unwrap();
+    let stmt = client
+        .prepare_typed(
+            "INSERT INTO returning_keys (id, label) VALUES ($1, $2) RETURNING id, label;",
+            &[Type::INT4, Type::TEXT],
+        )
+        .await
+        .unwrap();
+    let columns = stmt.columns();
+    assert_eq!(columns[0].type_(), &Type::INT4);
+    assert_eq!(columns[1].type_(), &Type::TEXT);
+
+    let rows = client.query(&stmt, &[&7_i32, &"seven"]).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    let id: i32 = rows[0].get(0);
+    let label: &str = rows[0].get(1);
+    assert_eq!((id, label), (7, "seven"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_ssl_and_gss_negotiation_are_refused_cleanly() {
     let server = TestServer::start().await.expect("server starts");
 

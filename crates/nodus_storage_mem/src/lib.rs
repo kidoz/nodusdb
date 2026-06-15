@@ -1,7 +1,7 @@
 use anyhow::Result;
 use bytes::Bytes;
 use nodus_mvcc::VersionChain;
-use nodus_storage_api::{KeyRange, KvEngine, KvPair, Timestamp, TxnId};
+use nodus_storage_api::{IntentReplacement, KeyRange, KvEngine, KvPair, Timestamp, TxnId};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::RwLock;
 
@@ -91,6 +91,43 @@ impl KvEngine for MemKvEngine {
         }
 
         intents_guard.entry(txn_id).or_default().push(key);
+        Ok(())
+    }
+
+    fn replace_intent(
+        &self,
+        txn_id: TxnId,
+        key: Bytes,
+        replacement: IntentReplacement,
+    ) -> Result<()> {
+        let mut store_guard = self.store.write().unwrap();
+        let mut intents_guard = self.intents.write().unwrap();
+        let chain = store_guard.entry(key.clone()).or_default();
+        chain
+            .versions
+            .retain(|v| !(v.is_intent && v.txn_id == Some(txn_id)));
+        match replacement {
+            IntentReplacement::Put(value) => {
+                chain
+                    .write_intent(txn_id, value.to_vec())
+                    .map_err(|e| anyhow::anyhow!("Write intent failed: {}", e))?;
+                intents_guard.entry(txn_id).or_default().push(key);
+            }
+            IntentReplacement::Delete => {
+                chain
+                    .delete_intent(txn_id)
+                    .map_err(|e| anyhow::anyhow!("Delete intent failed: {}", e))?;
+                intents_guard.entry(txn_id).or_default().push(key);
+            }
+            IntentReplacement::Clear => {
+                if let Some(keys) = intents_guard.get_mut(&txn_id) {
+                    keys.retain(|k| k != &key);
+                    if keys.is_empty() {
+                        intents_guard.remove(&txn_id);
+                    }
+                }
+            }
+        }
         Ok(())
     }
 

@@ -2,7 +2,7 @@ use anyhow::Result;
 use bytes::Bytes;
 use nodus_raftstore::NodusTypeConfig;
 use nodus_raftstore::ShardCommand;
-use nodus_storage_api::{KeyRange, KvEngine, KvPair, Timestamp, TxnId};
+use nodus_storage_api::{IntentReplacement, KeyRange, KvEngine, KvPair, Timestamp, TxnId};
 use openraft::Raft;
 use std::sync::Arc;
 
@@ -59,6 +59,15 @@ impl KvEngine for RaftKvEngine {
             })
         })?;
         Ok(())
+    }
+
+    fn replace_intent(
+        &self,
+        txn_id: TxnId,
+        key: Bytes,
+        replacement: IntentReplacement,
+    ) -> Result<()> {
+        self.local.replace_intent(txn_id, key, replacement)
     }
 
     fn commit(&self, txn_id: TxnId, commit_ts: Timestamp) -> Result<()> {

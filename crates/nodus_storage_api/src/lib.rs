@@ -32,6 +32,12 @@ pub struct KvPair {
     pub version: Timestamp,
 }
 
+pub enum IntentReplacement {
+    Put(Bytes),
+    Delete,
+    Clear,
+}
+
 pub trait KvEngine: Send + Sync {
     fn get(&self, key: &[u8], read_ts: Timestamp) -> Result<Option<Bytes>>;
     fn scan(
@@ -43,6 +49,15 @@ pub trait KvEngine: Send + Sync {
     /// Writes a deletion (tombstone) intent for `key`. After commit the key
     /// reads as absent at timestamps at or after the commit.
     fn delete_intent(&self, txn_id: TxnId, key: Bytes) -> Result<()>;
+    /// Replaces or clears this transaction's current intent for one key.
+    /// Used by SQL savepoints to restore the uncommitted state that existed
+    /// when the savepoint was created.
+    fn replace_intent(
+        &self,
+        txn_id: TxnId,
+        key: Bytes,
+        replacement: IntentReplacement,
+    ) -> Result<()>;
     fn commit(&self, txn_id: TxnId, commit_ts: Timestamp) -> Result<()>;
     fn abort(&self, txn_id: TxnId) -> Result<()>;
 

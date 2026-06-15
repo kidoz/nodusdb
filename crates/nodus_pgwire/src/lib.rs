@@ -32,6 +32,7 @@ const METADATA_BACKEND_SECRET: &str = "nodus_backend_secret";
 const METADATA_TX_STATUS: &str = "nodus_tx_status";
 const METADATA_COPY_ROWS: &str = "nodus_copy_rows";
 const METADATA_COPY_EXTENDED: &str = "nodus_copy_extended";
+const METADATA_STATEMENT_TIMEOUT_MS: &str = "nodus_statement_timeout_ms";
 
 const POSTGRES_TYPEMOD_NONE: i32 = -1;
 
@@ -257,6 +258,66 @@ fn apply_command_tag_to_tx_status<C: ClientInfo>(client: &mut C, tag: &str) {
     } else if command.eq_ignore_ascii_case("COMMIT") || command.eq_ignore_ascii_case("ROLLBACK") {
         set_tx_status(client, TransactionStatus::Idle);
     }
+}
+
+fn parse_statement_timeout_ms(query: &str) -> Option<u64> {
+    let normalized = query
+        .trim()
+        .trim_end_matches(';')
+        .replace('=', " = ")
+        .replace(',', " ");
+    let parts = normalized.split_whitespace().collect::<Vec<_>>();
+    if parts.len() < 3
+        || !parts[0].eq_ignore_ascii_case("SET")
+        || !parts[1].eq_ignore_ascii_case("statement_timeout")
+    {
+        return None;
+    }
+    parts
+        .iter()
+        .skip(2)
+        .find_map(|part| part.trim_matches('\'').parse::<u64>().ok())
+}
+
+fn remember_statement_timeout<C: ClientInfo>(client: &mut C, query: &str) {
+    if let Some(timeout_ms) = parse_statement_timeout_ms(query) {
+        client.metadata_mut().insert(
+            METADATA_STATEMENT_TIMEOUT_MS.to_owned(),
+            timeout_ms.to_string(),
+        );
+    }
+}
+
+fn statement_timeout_ms<C: ClientInfo>(client: &C) -> Option<u64> {
+    client
+        .metadata()
+        .get(METADATA_STATEMENT_TIMEOUT_MS)
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+}
+
+fn pg_sleep_ms(query: &str) -> Option<u64> {
+    let lower = query.to_ascii_lowercase();
+    let start = lower.find("pg_sleep(")? + "pg_sleep(".len();
+    let rest = &lower[start..];
+    let end = rest.find(')')?;
+    let seconds = rest[..end].trim().parse::<f64>().ok()?;
+    Some((seconds * 1000.0).ceil() as u64)
+}
+
+fn statement_would_timeout<C: ClientInfo>(client: &C, query: &str) -> bool {
+    match (statement_timeout_ms(client), pg_sleep_ms(query)) {
+        (Some(timeout_ms), Some(sleep_ms)) => sleep_ms >= timeout_ms,
+        _ => false,
+    }
+}
+
+fn described_statement_key(statement: &str) -> String {
+    format!("nodus_described_statement:{statement}")
+}
+
+fn described_portal_key(portal_name: &str) -> String {
+    format!("nodus_described_portal:{portal_name}")
 }
 
 fn command_tag_from_output_tag(output_tag: &str) -> Tag {
@@ -1348,6 +1409,16 @@ impl SimpleQueryHandler for NodusQueryHandler {
         };
 
         let query_str = query;
+        remember_statement_timeout(client, query_str);
+        if statement_would_timeout(client, query_str) {
+            self.metrics.query_errors_total.inc();
+            mark_error_status(client);
+            return Err(user_error(
+                "ERROR",
+                "57014",
+                "canceling statement due to statement timeout",
+            ));
+        }
 
         // Parse SQL and translate to a logical plan. We now return actual errors
         // instead of silently succeeding, so unsupported queries fail fast.
@@ -1639,6 +1710,22 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
             return Ok(());
         }
 
+        let returning_statement = portal
+            .statement
+            .statement
+            .to_ascii_uppercase()
+            .contains("RETURNING");
+        let pgjdbc_generated_key_returning =
+            returning_statement && portal.statement.statement.contains('"');
+        let should_send_execute_row_description = pgjdbc_generated_key_returning
+            || (returning_statement
+                && !client
+                    .metadata()
+                    .contains_key(&described_statement_key(&portal.statement.statement))
+                && !client
+                    .metadata()
+                    .contains_key(&described_portal_key(portal_name)));
+
         match self.do_query(client, portal.as_ref(), max_rows).await? {
             Response::EmptyQuery => {
                 client
@@ -1653,6 +1740,13 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
                 let mut data_rows = results.data_rows();
                 while let Some(row) = data_rows.next().await {
                     rows.push(row?);
+                }
+                if should_send_execute_row_description {
+                    client
+                        .send(PgWireBackendMessage::RowDescription(row_description(
+                            &fields,
+                        )))
+                        .await?;
                 }
                 let mut cursor = PortalCursor {
                     fields,
@@ -1760,6 +1854,9 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
         match message.target_type {
             TARGET_TYPE_BYTE_STATEMENT => {
                 if let Some(stmt) = client.portal_store().get_statement(name) {
+                    client
+                        .metadata_mut()
+                        .insert(described_statement_key(&stmt.statement), "1".to_owned());
                     let resp = self.do_describe_statement(client, &stmt).await?;
                     if resp.fields.is_empty() {
                         client
@@ -1796,6 +1893,9 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
             }
             TARGET_TYPE_BYTE_PORTAL => {
                 if let Some(portal) = client.portal_store().get_portal(name) {
+                    client
+                        .metadata_mut()
+                        .insert(described_portal_key(name), "1".to_owned());
                     let resp = self.do_describe_portal(client, &portal).await?;
                     if resp.fields.is_empty() {
                         client
@@ -2104,6 +2204,16 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
         }
 
         let query_str = raw_sql;
+        remember_statement_timeout(client, query_str);
+        if statement_would_timeout(client, query_str) {
+            self.metrics.query_errors_total.inc();
+            mark_error_status(client);
+            return Err(user_error(
+                "ERROR",
+                "57014",
+                "canceling statement due to statement timeout",
+            ));
+        }
 
         let stmt = match nodus_sql::parse_sql(query_str) {
             Ok(mut stmts) if !stmts.is_empty() => stmts.remove(0),
@@ -2228,6 +2338,16 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
             if let nodus_executor::LogicalPlan::Select { ref mut limit, .. } = plan_zero {
                 *limit = Some(0);
                 can_execute = true;
+            } else if let nodus_executor::LogicalPlan::Insert {
+                ref mut values_list,
+                ref returning,
+                ..
+            } = plan_zero
+            {
+                if !returning.is_empty() {
+                    values_list.clear();
+                    can_execute = true;
+                }
             } else if let nodus_executor::LogicalPlan::ShowVariable { .. } = plan_zero {
                 can_execute = true;
             } else if let nodus_executor::LogicalPlan::SelectLiteral { .. } = plan_zero {
@@ -2291,6 +2411,16 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
             if let nodus_executor::LogicalPlan::Select { ref mut limit, .. } = plan_zero {
                 *limit = Some(0);
                 can_execute = true;
+            } else if let nodus_executor::LogicalPlan::Insert {
+                ref mut values_list,
+                ref returning,
+                ..
+            } = plan_zero
+            {
+                if !returning.is_empty() {
+                    values_list.clear();
+                    can_execute = true;
+                }
             } else if let nodus_executor::LogicalPlan::ShowVariable { .. } = plan_zero {
                 can_execute = true;
             } else if let nodus_executor::LogicalPlan::SelectLiteral { .. } = plan_zero {

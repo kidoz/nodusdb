@@ -1,7 +1,7 @@
 use anyhow::Result;
 use bytes::Bytes;
 use nodus_mvcc::MvccValue;
-use nodus_storage_api::{KeyRange, KvEngine, KvPair, Timestamp, TxnId};
+use nodus_storage_api::{IntentReplacement, KeyRange, KvEngine, KvPair, Timestamp, TxnId};
 use std::collections::BTreeMap;
 use std::sync::RwLock;
 
@@ -163,6 +163,41 @@ impl KvEngine for BTreeKvEngine {
         keys.push(key);
         self.save_intents(txn_id, &keys)?;
 
+        Ok(())
+    }
+
+    fn replace_intent(
+        &self,
+        txn_id: TxnId,
+        key: Bytes,
+        replacement: IntentReplacement,
+    ) -> Result<()> {
+        let mut versions = self.disk_read(key.as_ref())?;
+        versions.retain(|v| v.txn_id != Some(txn_id) || !v.is_intent);
+        let clear = matches!(replacement, IntentReplacement::Clear);
+        match replacement {
+            IntentReplacement::Put(value) => versions.push(MvccValue {
+                value: Some(value.to_vec()),
+                version: u64::MAX,
+                txn_id: Some(txn_id),
+                is_intent: true,
+            }),
+            IntentReplacement::Delete => versions.push(MvccValue {
+                value: None,
+                version: u64::MAX,
+                txn_id: Some(txn_id),
+                is_intent: true,
+            }),
+            IntentReplacement::Clear => {}
+        }
+        self.disk_write(key.as_ref(), &versions)?;
+
+        let mut keys = self.get_intents(txn_id)?;
+        keys.retain(|k| k != &key);
+        if !clear {
+            keys.push(key);
+        }
+        self.save_intents(txn_id, &keys)?;
         Ok(())
     }
 
