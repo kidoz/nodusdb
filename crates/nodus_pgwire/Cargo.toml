@@ -15,6 +15,7 @@ thiserror.workspace = true
 postgres-types.workspace = true
 async-trait.workspace = true
 futures-util.workspace = true
+bytes.workspace = true
 nodus_sql = { path = "../nodus_sql" }
 nodus_executor = { path = "../nodus_executor" }
 nodus_monitoring = { path = "../nodus_monitoring" }
@@ -23,6 +24,7 @@ nodus_catalog = { path = "../nodus_catalog" }
 nodus_telemetry = { path = "../nodus_telemetry" }
 uuid.workspace = true
 tokio-rustls = "0.26"
+tokio-util = "0.7"
 
 [dev-dependencies]
 proptest.workspace = true

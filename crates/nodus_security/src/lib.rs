@@ -28,13 +28,16 @@ pub struct SessionInfo {
 struct SessionEntry {
     principal_id: PrincipalId,
     current_query: Option<String>,
+    active_query: bool,
     started_at: DateTime<Utc>,
-    cancel: Arc<AtomicBool>,
+    terminate: Arc<AtomicBool>,
+    query_cancel: Arc<AtomicBool>,
+    backend_key: Option<(i32, i32)>,
 }
 
 /// Tracks live client sessions so operators can inspect and cancel them.
 ///
-/// `register` hands back a cancellation token the session's work loop should
+/// `register` hands back a termination token the session's work loop should
 /// poll between statements; `kill` flips that token. This is the mechanism
 /// behind the admin "active queries" view and `KILL`/`pg_terminate_backend`.
 #[derive(Default)]
@@ -47,19 +50,22 @@ impl SessionRegistry {
         Self::default()
     }
 
-    /// Registers a session and returns its cancellation token.
+    /// Registers a session and returns its termination token.
     pub fn register(&self, session: &Session) -> Arc<AtomicBool> {
-        let cancel = Arc::new(AtomicBool::new(false));
+        let terminate = Arc::new(AtomicBool::new(false));
         self.sessions.write().unwrap().insert(
             session.session_id.clone(),
             SessionEntry {
                 principal_id: session.principal_id,
                 current_query: None,
+                active_query: false,
                 started_at: Utc::now(),
-                cancel: cancel.clone(),
+                terminate: terminate.clone(),
+                query_cancel: Arc::new(AtomicBool::new(false)),
+                backend_key: None,
             },
         );
-        cancel
+        terminate
     }
 
     pub fn deregister(&self, session_id: &str) {
@@ -69,12 +75,34 @@ impl SessionRegistry {
     pub fn set_current_query(&self, session_id: &str, sql: impl Into<String>) {
         if let Some(e) = self.sessions.write().unwrap().get_mut(session_id) {
             e.current_query = Some(sql.into());
+            e.active_query = true;
+        }
+    }
+
+    pub fn finish_current_query(&self, session_id: &str) {
+        if let Some(e) = self.sessions.write().unwrap().get_mut(session_id) {
+            e.active_query = false;
+            e.query_cancel.store(false, Ordering::SeqCst);
         }
     }
 
     pub fn clear_current_query(&self, session_id: &str) {
         if let Some(e) = self.sessions.write().unwrap().get_mut(session_id) {
             e.current_query = None;
+            e.active_query = false;
+            e.query_cancel.store(false, Ordering::SeqCst);
+        }
+    }
+
+    pub fn update_principal(&self, session_id: &str, principal_id: PrincipalId) {
+        if let Some(e) = self.sessions.write().unwrap().get_mut(session_id) {
+            e.principal_id = principal_id;
+        }
+    }
+
+    pub fn register_backend_key(&self, session_id: &str, pid: i32, secret_key: i32) {
+        if let Some(e) = self.sessions.write().unwrap().get_mut(session_id) {
+            e.backend_key = Some((pid, secret_key));
         }
     }
 
@@ -82,7 +110,7 @@ impl SessionRegistry {
     pub fn kill(&self, session_id: &str) -> bool {
         match self.sessions.read().unwrap().get(session_id) {
             Some(e) => {
-                e.cancel.store(true, Ordering::SeqCst);
+                e.terminate.store(true, Ordering::SeqCst);
                 true
             }
             None => false,
@@ -94,7 +122,35 @@ impl SessionRegistry {
             .read()
             .unwrap()
             .get(session_id)
-            .map(|e| e.cancel.load(Ordering::SeqCst))
+            .map(|e| e.terminate.load(Ordering::SeqCst))
+            .unwrap_or(false)
+    }
+
+    /// Requests cancellation of the currently running query for a backend key.
+    ///
+    /// PostgreSQL cancel requests are one-shot and should not kill the session.
+    /// If the session is idle, the request is accepted but has no later effect.
+    pub fn cancel_backend_query(&self, pid: i32, secret_key: i32) -> bool {
+        let guard = self.sessions.read().unwrap();
+        if let Some(entry) = guard
+            .values()
+            .find(|e| e.backend_key == Some((pid, secret_key)))
+        {
+            if entry.active_query {
+                entry.query_cancel.store(true, Ordering::SeqCst);
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn is_query_cancelled(&self, session_id: &str) -> bool {
+        self.sessions
+            .read()
+            .unwrap()
+            .get(session_id)
+            .map(|e| e.query_cancel.load(Ordering::SeqCst))
             .unwrap_or(false)
     }
 
@@ -109,7 +165,8 @@ impl SessionRegistry {
                 principal_id: e.principal_id,
                 current_query: e.current_query.clone(),
                 started_at: e.started_at,
-                cancelled: e.cancel.load(Ordering::SeqCst),
+                cancelled: e.terminate.load(Ordering::SeqCst)
+                    || e.query_cancel.load(Ordering::SeqCst),
             })
             .collect()
     }
@@ -281,11 +338,17 @@ mod tests {
         };
         let token = reg.register(&session);
         reg.set_current_query("s1", "SELECT 1");
+        reg.register_backend_key("s1", 123, 456);
 
         let listed = reg.list();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].current_query.as_deref(), Some("SELECT 1"));
         assert!(!token.load(Ordering::SeqCst));
+
+        assert!(reg.cancel_backend_query(123, 456));
+        assert!(reg.is_query_cancelled("s1"));
+        reg.clear_current_query("s1");
+        assert!(!reg.is_query_cancelled("s1"));
 
         assert!(reg.kill("s1"));
         assert!(reg.is_cancelled("s1"));

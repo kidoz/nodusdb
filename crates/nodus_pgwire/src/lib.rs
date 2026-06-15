@@ -1,21 +1,41 @@
+use std::collections::HashMap;
 use std::fmt::Debug;
+use std::io::Error as IoError;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::RwLock;
 
 use async_trait::async_trait;
-use futures_util::{Sink, SinkExt, stream};
-use tokio::net::TcpListener;
+use bytes::Buf;
+use futures_util::{Sink, SinkExt, StreamExt, stream};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio_util::codec::Framed;
 use tracing::{error, info};
 
 use nodus_catalog::PrincipalId;
 use nodus_security::{Authenticator, PasswordAuthenticator, Session, SessionRegistry};
 use pgwire::api::auth::{
-    DefaultServerParameterProvider, LoginInfo, StartupHandler, finish_authentication,
+    DefaultServerParameterProvider, LoginInfo, ServerParameterProvider, StartupHandler,
     save_startup_parameters_to_metadata,
 };
-use pgwire::api::copy::NoopCopyHandler;
+use pgwire::api::copy::CopyHandler;
 use pgwire::api::portal::Portal;
 use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler, send_describe_response};
+use pgwire::tokio::PgWireMessageServerCodec;
+
+const METADATA_NODUS_SESSION_ID: &str = "nodus_session_id";
+const METADATA_NODUS_PRINCIPAL_ID: &str = "nodus_principal_id";
+const METADATA_BACKEND_PID: &str = "nodus_backend_pid";
+const METADATA_BACKEND_SECRET: &str = "nodus_backend_secret";
+const METADATA_TX_STATUS: &str = "nodus_tx_status";
+const METADATA_COPY_ROWS: &str = "nodus_copy_rows";
+const METADATA_COPY_EXTENDED: &str = "nodus_copy_extended";
+
+const CANCEL_REQUEST_MAGIC: i32 = 80877102;
+const SSL_REQUEST_MAGIC: i32 = 80877103;
+const GSSENC_REQUEST_MAGIC: i32 = 80877104;
+const STARTUP_PACKET_HEADER_LEN: usize = 8;
+const CANCEL_REQUEST_LEN: usize = 16;
 
 fn map_type(data_type: &str) -> Type {
     match data_type.to_uppercase().as_str() {
@@ -46,6 +66,128 @@ fn rewrite_jdbc_metadata_query(query: &str) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+/// Maps executor error text to the closest SQLSTATE so clients can react to
+/// the failure class (constraint handling, missing-relation fallbacks during
+/// introspection) instead of treating every error as an internal server fault.
+fn sqlstate_for_execution_error(err_str: &str) -> &'static str {
+    if err_str.contains("Unique constraint violation") {
+        "23505"
+    } else if err_str.contains("cannot be NULL") {
+        "23502"
+    } else if err_str.contains("relation \"") && err_str.contains("does not exist") {
+        "42P01"
+    } else {
+        "XX000"
+    }
+}
+
+fn user_error(severity: &str, code: &str, message: impl Into<String>) -> PgWireError {
+    PgWireError::UserError(Box::new(ErrorInfo::new(
+        severity.to_owned(),
+        code.to_owned(),
+        message.into(),
+    )))
+}
+
+fn session_id_from_client<C: ClientInfo>(client: &C) -> String {
+    client
+        .metadata()
+        .get(METADATA_NODUS_SESSION_ID)
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn principal_id_from_client<C: ClientInfo>(client: &C) -> PrincipalId {
+    client
+        .metadata()
+        .get(METADATA_NODUS_PRINCIPAL_ID)
+        .and_then(|s| Uuid::parse_str(s).ok())
+        .map(PrincipalId)
+        .unwrap_or_default()
+}
+
+fn tx_status_from_client<C: ClientInfo>(client: &C) -> TransactionStatus {
+    match client
+        .metadata()
+        .get(METADATA_TX_STATUS)
+        .map(String::as_str)
+    {
+        Some("T") => TransactionStatus::Transaction,
+        Some("E") => TransactionStatus::Error,
+        _ => TransactionStatus::Idle,
+    }
+}
+
+fn set_tx_status<C: ClientInfo>(client: &mut C, status: TransactionStatus) {
+    let encoded = match status {
+        TransactionStatus::Idle => "I",
+        TransactionStatus::Transaction => "T",
+        TransactionStatus::Error => "E",
+    };
+    client
+        .metadata_mut()
+        .insert(METADATA_TX_STATUS.to_owned(), encoded.to_owned());
+}
+
+fn mark_error_status<C: ClientInfo>(client: &mut C) {
+    if tx_status_from_client(client) == TransactionStatus::Transaction {
+        set_tx_status(client, TransactionStatus::Error);
+    }
+}
+
+fn apply_command_tag_to_tx_status<C: ClientInfo>(client: &mut C, tag: &str) {
+    let command = tag.split_whitespace().next().unwrap_or(tag);
+    if command.eq_ignore_ascii_case("BEGIN") {
+        set_tx_status(client, TransactionStatus::Transaction);
+    } else if command.eq_ignore_ascii_case("COMMIT") || command.eq_ignore_ascii_case("ROLLBACK") {
+        set_tx_status(client, TransactionStatus::Idle);
+    }
+}
+
+fn command_tag_from_output_tag(output_tag: &str) -> Tag {
+    if let Some(rest) = output_tag.strip_prefix("INSERT 0 ") {
+        let rows = rest.parse::<usize>().unwrap_or(0);
+        Tag::new("INSERT 0").with_rows(rows)
+    } else if let Some(rest) = output_tag.strip_prefix("UPDATE ") {
+        let rows = rest.parse::<usize>().unwrap_or(0);
+        Tag::new("UPDATE").with_rows(rows)
+    } else if let Some(rest) = output_tag.strip_prefix("DELETE ") {
+        let rows = rest.parse::<usize>().unwrap_or(0);
+        Tag::new("DELETE").with_rows(rows)
+    } else {
+        Tag::new(output_tag)
+    }
+}
+
+fn row_description(fields: &[FieldInfo]) -> RowDescription {
+    RowDescription::new(
+        fields
+            .iter()
+            .map(|field| {
+                FieldDescription::new(
+                    field.name().to_owned(),
+                    field.table_id().unwrap_or(0),
+                    field.column_id().unwrap_or(0),
+                    field.datatype().oid(),
+                    0,
+                    0,
+                    field.format().value(),
+                )
+            })
+            .collect(),
+    )
+}
+
+fn is_copy_from_stdin(query: &str) -> bool {
+    let q = query.trim().to_ascii_uppercase();
+    q.starts_with("COPY ") && q.contains(" FROM STDIN")
+}
+
+fn is_copy_to_stdout(query: &str) -> bool {
+    let q = query.trim().to_ascii_uppercase();
+    q.starts_with("COPY ") && q.contains(" TO STDOUT")
 }
 
 /// Encodes a value so its wire representation matches the column type declared
@@ -105,29 +247,34 @@ use pgwire::api::results::{
 use pgwire::api::stmt::{NoopQueryParser, StoredStatement};
 use pgwire::api::store::PortalStore;
 use pgwire::api::{
-    ClientInfo, ClientPortalStore, DEFAULT_NAME, PgWireConnectionState, PgWireHandlerFactory, Type,
+    ClientInfo, ClientPortalStore, DEFAULT_NAME, DefaultClient, PgWireConnectionState,
+    PgWireHandlerFactory, Type,
 };
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::PgWireBackendMessage;
-use pgwire::messages::data::{NoData, ParameterDescription};
-use pgwire::messages::extendedquery::{
-    Describe, TARGET_TYPE_BYTE_PORTAL, TARGET_TYPE_BYTE_STATEMENT,
+use pgwire::messages::copy::{CopyData, CopyDone, CopyFail};
+use pgwire::messages::data::{
+    DataRow, FieldDescription, NoData, ParameterDescription, RowDescription,
 };
-use pgwire::messages::response::ErrorResponse;
-use pgwire::messages::startup::Authentication;
-use pgwire::tokio::process_socket;
+use pgwire::messages::extendedquery::{
+    Bind, BindComplete, Close, CloseComplete, Describe, Execute, Parse, ParseComplete,
+    PortalSuspended, Sync as PgSync, TARGET_TYPE_BYTE_PORTAL, TARGET_TYPE_BYTE_STATEMENT,
+};
+use pgwire::messages::response::{
+    CommandComplete, EmptyQueryResponse, ErrorResponse, ReadyForQuery, SslResponse,
+    TransactionStatus,
+};
+use pgwire::messages::startup::{Authentication, BackendKeyData, ParameterStatus};
 use uuid::Uuid;
 
 pub struct NodusQueryHandler {
-    /// Unique per-connection session id, also the registry key.
+    /// Fallback session id for tests that instantiate the handler directly.
     pub session_id: String,
     pub session_state: nodus_sql::SessionState,
     pub executor: Arc<dyn nodus_executor::Executor>,
     pub metrics: nodus_monitoring::Metrics,
     registry: Arc<SessionRegistry>,
     slow_log: Arc<nodus_monitoring::SlowQueryLog>,
-    /// Cancellation token for this session; flipped by an admin `kill`.
-    cancel: Arc<AtomicBool>,
 }
 
 /// Observes query latency on drop, so every `do_query` return path is covered:
@@ -155,11 +302,22 @@ impl Drop for QueryTimer<'_> {
     }
 }
 
+struct CurrentQueryGuard<'a> {
+    registry: &'a SessionRegistry,
+    session_id: &'a str,
+}
+
+impl Drop for CurrentQueryGuard<'_> {
+    fn drop(&mut self) {
+        self.registry.finish_current_query(self.session_id);
+    }
+}
+
 impl Drop for NodusQueryHandler {
     fn drop(&mut self) {
-        // The handler lives for the connection's lifetime (one per socket), so
-        // dropping it means the client disconnected.
-        self.registry.deregister(&self.session_id);
+        if !self.session_id.is_empty() {
+            self.registry.deregister(&self.session_id);
+        }
     }
 }
 
@@ -169,6 +327,69 @@ impl Drop for NodusQueryHandler {
 pub struct NodusStartupHandler {
     authenticator: Arc<PasswordAuthenticator>,
     param_provider: DefaultServerParameterProvider,
+    registry: Arc<SessionRegistry>,
+}
+
+async fn finish_nodus_authentication<C>(
+    client: &mut C,
+    server_parameter_provider: &DefaultServerParameterProvider,
+) -> PgWireResult<()>
+where
+    C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send,
+    C::Error: Debug,
+    PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+{
+    client
+        .send(PgWireBackendMessage::Authentication(Authentication::Ok))
+        .await?;
+
+    if let Some(mut parameters) = server_parameter_provider.server_parameters(client) {
+        parameters.insert("server_version_num".to_owned(), "160000".to_owned());
+        parameters.insert("TimeZone".to_owned(), "UTC".to_owned());
+        parameters.insert("IntervalStyle".to_owned(), "postgres".to_owned());
+        parameters.insert("standard_conforming_strings".to_owned(), "on".to_owned());
+        parameters.insert("is_superuser".to_owned(), "on".to_owned());
+        parameters.insert("session_authorization".to_owned(), "nodus".to_owned());
+        let app = client
+            .metadata()
+            .get("application_name")
+            .cloned()
+            .unwrap_or_default();
+        parameters.insert("application_name".to_owned(), app);
+        let mut parameters: Vec<_> = parameters.into_iter().collect();
+        parameters.sort_by(|a, b| a.0.cmp(&b.0));
+        for (name, value) in parameters {
+            client
+                .send(PgWireBackendMessage::ParameterStatus(ParameterStatus::new(
+                    name, value,
+                )))
+                .await?;
+        }
+    }
+
+    let pid = client
+        .metadata()
+        .get(METADATA_BACKEND_PID)
+        .and_then(|s| s.parse::<i32>().ok())
+        .unwrap_or(std::process::id() as i32);
+    let secret = client
+        .metadata()
+        .get(METADATA_BACKEND_SECRET)
+        .and_then(|s| s.parse::<i32>().ok())
+        .unwrap_or_default();
+    client
+        .send(PgWireBackendMessage::BackendKeyData(BackendKeyData::new(
+            pid, secret,
+        )))
+        .await?;
+    client
+        .send(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
+            tx_status_from_client(client),
+        )))
+        .await?;
+    client.flush().await?;
+    client.set_state(PgWireConnectionState::ReadyForQuery);
+    Ok(())
 }
 
 #[async_trait]
@@ -199,11 +420,14 @@ impl StartupHandler for NodusStartupHandler {
                 let user = login.user().map(|u| u.to_string()).unwrap_or_default();
                 match self.authenticator.authenticate(&user, &pwd.password) {
                     Ok(session) => {
+                        let session_id = session_id_from_client(client);
+                        self.registry
+                            .update_principal(&session_id, session.principal_id);
                         client.metadata_mut().insert(
-                            "nodus_principal_id".to_string(),
+                            METADATA_NODUS_PRINCIPAL_ID.to_string(),
                             session.principal_id.to_string(),
                         );
-                        finish_authentication(client, &self.param_provider).await;
+                        finish_nodus_authentication(client, &self.param_provider).await?;
                     }
                     Err(_) => {
                         let error_info = ErrorInfo::new(
@@ -228,6 +452,119 @@ impl StartupHandler for NodusStartupHandler {
 
 #[async_trait]
 impl SimpleQueryHandler for NodusQueryHandler {
+    async fn on_query<C>(
+        &self,
+        client: &mut C,
+        query: pgwire::messages::simplequery::Query,
+    ) -> PgWireResult<()>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        client.set_state(PgWireConnectionState::QueryInProgress);
+        let query_string = query.query;
+        if query_string.trim().is_empty() || query_string.trim() == ";" {
+            client
+                .feed(PgWireBackendMessage::EmptyQueryResponse(
+                    EmptyQueryResponse::new(),
+                ))
+                .await?;
+        } else if is_copy_from_stdin(&query_string) {
+            let session_id = session_id_from_client(client);
+            self.registry.set_current_query(&session_id, &query_string);
+            client.metadata_mut().extend([
+                (METADATA_COPY_ROWS.to_owned(), "0".to_owned()),
+                (METADATA_COPY_EXTENDED.to_owned(), "0".to_owned()),
+            ]);
+            client
+                .send(PgWireBackendMessage::CopyInResponse(
+                    pgwire::messages::copy::CopyInResponse::new(0, 0, vec![]),
+                ))
+                .await?;
+            client.flush().await?;
+            client.set_state(PgWireConnectionState::CopyInProgress);
+            return Ok(());
+        } else if is_copy_to_stdout(&query_string) {
+            let session_id = session_id_from_client(client);
+            self.registry.set_current_query(&session_id, &query_string);
+            self.registry.finish_current_query(&session_id);
+            client
+                .send(PgWireBackendMessage::CopyOutResponse(
+                    pgwire::messages::copy::CopyOutResponse::new(0, 0, vec![]),
+                ))
+                .await?;
+            client
+                .send(PgWireBackendMessage::CopyDone(CopyDone::new()))
+                .await?;
+            client
+                .send(PgWireBackendMessage::CommandComplete(CommandComplete::new(
+                    "COPY 0".to_owned(),
+                )))
+                .await?;
+        } else {
+            let resp = self.do_query(client, &query_string).await?;
+            for r in resp {
+                match r {
+                    Response::EmptyQuery => {
+                        client
+                            .feed(PgWireBackendMessage::EmptyQueryResponse(
+                                EmptyQueryResponse::new(),
+                            ))
+                            .await?;
+                    }
+                    Response::Query(results) => {
+                        let row_desc = row_description(&results.row_schema());
+                        client
+                            .send(PgWireBackendMessage::RowDescription(row_desc))
+                            .await?;
+                        let command_tag = results.command_tag().to_owned();
+                        let mut rows = 0;
+                        let mut data_rows = results.data_rows();
+                        while let Some(row) = data_rows.next().await {
+                            rows += 1;
+                            client.feed(PgWireBackendMessage::DataRow(row?)).await?;
+                        }
+                        client
+                            .send(PgWireBackendMessage::CommandComplete(
+                                Tag::new(&command_tag).with_rows(rows).into(),
+                            ))
+                            .await?;
+                    }
+                    Response::Execution(tag) => {
+                        let command: CommandComplete = tag.into();
+                        apply_command_tag_to_tx_status(client, &command.tag);
+                        client
+                            .send(PgWireBackendMessage::CommandComplete(command))
+                            .await?;
+                    }
+                    Response::Error(e) => {
+                        mark_error_status(client);
+                        client
+                            .send(PgWireBackendMessage::ErrorResponse((*e).into()))
+                            .await?;
+                    }
+                    Response::CopyIn(_) | Response::CopyOut(_) | Response::CopyBoth(_) => {
+                        return Err(user_error(
+                            "ERROR",
+                            "0A000",
+                            "COPY response is only supported by COPY statements",
+                        ));
+                    }
+                }
+            }
+        }
+
+        client
+            .send(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
+                tx_status_from_client(client),
+            )))
+            .await?;
+        client.flush().await?;
+        client.set_state(PgWireConnectionState::ReadyForQuery);
+        Ok(())
+    }
+
     async fn do_query<'a, C>(
         &self,
         client: &mut C,
@@ -241,12 +578,37 @@ impl SimpleQueryHandler for NodusQueryHandler {
         info!("Received query: {}", query);
         self.metrics.queries_total.inc();
 
-        // Honor an administrative cancellation of this session.
-        if self.cancel.load(Ordering::SeqCst) {
+        let session_id = {
+            let id = session_id_from_client(client);
+            if id.is_empty() {
+                self.session_id.clone()
+            } else {
+                id
+            }
+        };
+
+        // Honor administrative termination and PostgreSQL cancel requests.
+        if self.registry.is_cancelled(&session_id) {
             self.metrics.query_errors_total.inc();
-            return Err(std::io::Error::other("session terminated by administrator").into());
+            return Err(user_error(
+                "ERROR",
+                "57P01",
+                "session terminated by administrator",
+            ));
         }
-        self.registry.set_current_query(&self.session_id, query);
+        if self.registry.is_query_cancelled(&session_id) {
+            self.metrics.query_errors_total.inc();
+            return Err(user_error(
+                "ERROR",
+                "57014",
+                "canceling statement due to user request",
+            ));
+        }
+        self.registry.set_current_query(&session_id, query);
+        let _current_query = CurrentQueryGuard {
+            registry: &self.registry,
+            session_id: &session_id,
+        };
 
         // OpenTelemetry span covering the statement (no-op unless OTLP is on).
         let _otel_span = nodus_telemetry::start_span("pgwire.simple_query");
@@ -255,22 +617,17 @@ impl SimpleQueryHandler for NodusQueryHandler {
         let _timer = QueryTimer {
             start: std::time::Instant::now(),
             sql: query,
-            session_id: &self.session_id,
+            session_id: &session_id,
             metrics: &self.metrics,
             slow_log: &self.slow_log,
         };
 
         // The authenticated principal was stashed in connection metadata by the
         // startup handler; carry it into the execution context for authorization.
-        let principal_id = client
-            .metadata()
-            .get("nodus_principal_id")
-            .and_then(|s| Uuid::parse_str(s).ok())
-            .map(PrincipalId)
-            .unwrap_or_default();
+        let principal_id = principal_id_from_client(client);
 
         let ctx = nodus_executor::ExecutionContext {
-            session_id: self.session_id.clone(),
+            session_id: session_id.clone(),
             principal_id,
             active_roles: vec![],
             authz_catalog_version: 1,
@@ -313,35 +670,27 @@ impl SimpleQueryHandler for NodusQueryHandler {
             Ok(out) => out,
             Err(e) => {
                 let err_str = e.to_string();
-                let code = if err_str.contains("Unique constraint violation") {
-                    "23505"
-                } else if err_str.contains("cannot be NULL") {
-                    "23502"
-                } else {
-                    "XX000"
-                };
+                let code = sqlstate_for_execution_error(&err_str);
                 let err = ErrorInfo::new("ERROR".to_owned(), code.to_owned(), err_str);
+                mark_error_status(client);
                 return Err(PgWireError::UserError(Box::new(err)));
             }
         };
 
+        if self.registry.is_query_cancelled(&session_id) {
+            self.metrics.query_errors_total.inc();
+            mark_error_status(client);
+            return Err(user_error(
+                "ERROR",
+                "57014",
+                "canceling statement due to user request",
+            ));
+        }
+
         // No projected columns => a command tag (CREATE TABLE, INSERT, BEGIN…).
         if out.columns.is_empty() {
-            let tag = if out.tag.starts_with("INSERT 0 ") {
-                let rows = out.tag["INSERT 0 ".len()..].parse::<usize>().unwrap_or(0);
-                // pgwire's Tag serializes as "{command} {rows}" and drops the
-                // oid, but pgjdbc requires the three-token "INSERT <oid> <rows>"
-                // form, so the oid is folded into the command string.
-                Tag::new("INSERT 0").with_rows(rows)
-            } else if out.tag.starts_with("UPDATE ") {
-                let rows = out.tag["UPDATE ".len()..].parse::<usize>().unwrap_or(0);
-                Tag::new("UPDATE").with_rows(rows)
-            } else if out.tag.starts_with("DELETE ") {
-                let rows = out.tag["DELETE ".len()..].parse::<usize>().unwrap_or(0);
-                Tag::new("DELETE").with_rows(rows)
-            } else {
-                Tag::new(&out.tag)
-            };
+            apply_command_tag_to_tx_status(client, &out.tag);
+            let tag = command_tag_from_output_tag(&out.tag);
             return Ok(vec![Response::Execution(tag)]);
         }
 
@@ -374,6 +723,35 @@ pub struct NodusExtendedQueryHandler {
     pub executor: Arc<dyn nodus_executor::Executor>,
     pub metrics: nodus_monitoring::Metrics,
     pub slow_log: Arc<nodus_monitoring::SlowQueryLog>,
+    registry: Arc<SessionRegistry>,
+    cursors: RwLock<HashMap<String, PortalCursor>>,
+}
+
+struct PortalCursor {
+    fields: Arc<Vec<FieldInfo>>,
+    rows: Vec<DataRow>,
+    position: usize,
+    total_rows: usize,
+}
+
+impl PortalCursor {
+    fn next_chunk(&mut self, max_rows: usize) -> (Vec<DataRow>, bool) {
+        let remaining = self.rows.len().saturating_sub(self.position);
+        let take = if max_rows == 0 {
+            remaining
+        } else {
+            remaining.min(max_rows)
+        };
+        let start = self.position;
+        let end = start + take;
+        self.position = end;
+        let suspended = self.position < self.rows.len();
+        (self.rows[start..end].to_vec(), suspended)
+    }
+}
+
+fn cursor_key(session_id: &str, portal_name: &str) -> String {
+    format!("{session_id}:{portal_name}")
 }
 
 #[async_trait]
@@ -383,6 +761,241 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
 
     fn query_parser(&self) -> Arc<Self::QueryParser> {
         Arc::new(NoopQueryParser::new())
+    }
+
+    async fn on_parse<C>(&self, client: &mut C, message: Parse) -> PgWireResult<()>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let types = message
+            .type_oids
+            .iter()
+            .map(|oid| Type::from_oid(*oid).unwrap_or(Type::UNKNOWN))
+            .collect::<Vec<Type>>();
+        let stmt = StoredStatement::new(
+            message.name.unwrap_or_else(|| DEFAULT_NAME.to_owned()),
+            message.query,
+            types,
+        );
+        client.portal_store().put_statement(Arc::new(stmt));
+        client
+            .send(PgWireBackendMessage::ParseComplete(ParseComplete::new()))
+            .await?;
+        Ok(())
+    }
+
+    async fn on_bind<C>(&self, client: &mut C, message: Bind) -> PgWireResult<()>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let statement_name = message.statement_name.as_deref().unwrap_or(DEFAULT_NAME);
+        let Some(statement) = client.portal_store().get_statement(statement_name) else {
+            return Err(PgWireError::StatementNotFound(statement_name.to_owned()));
+        };
+        let portal = Portal::try_new(&message, statement)?;
+        let key = cursor_key(&session_id_from_client(client), &portal.name);
+        self.cursors.write().unwrap().remove(&key);
+        client.portal_store().put_portal(Arc::new(portal));
+        client
+            .send(PgWireBackendMessage::BindComplete(BindComplete::new()))
+            .await?;
+        Ok(())
+    }
+
+    async fn on_execute<C>(&self, client: &mut C, message: Execute) -> PgWireResult<()>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let portal_name = message.name.as_deref().unwrap_or(DEFAULT_NAME);
+        let key = cursor_key(&session_id_from_client(client), portal_name);
+        let max_rows = message.max_rows as usize;
+        let existing = {
+            let mut cursors = self.cursors.write().unwrap();
+            if let Some(cursor) = cursors.get_mut(&key) {
+                let (rows, suspended) = cursor.next_chunk(max_rows);
+                let done = !suspended;
+                let fields = cursor.fields.clone();
+                let total_rows = cursor.total_rows;
+                if done {
+                    cursors.remove(&key);
+                }
+                Some((fields, rows, suspended, total_rows))
+            } else {
+                None
+            }
+        };
+        if let Some((fields, rows, suspended, total_rows)) = existing {
+            for row in rows {
+                client.send(PgWireBackendMessage::DataRow(row)).await?;
+            }
+            if suspended {
+                client
+                    .send(PgWireBackendMessage::PortalSuspended(PortalSuspended::new()))
+                    .await?;
+            } else {
+                client
+                    .send(PgWireBackendMessage::CommandComplete(
+                        Tag::new("SELECT").with_rows(total_rows).into(),
+                    ))
+                    .await?;
+            }
+            let _ = fields;
+            return Ok(());
+        }
+
+        let Some(portal) = client.portal_store().get_portal(portal_name) else {
+            return Err(PgWireError::PortalNotFound(portal_name.to_owned()));
+        };
+
+        if is_copy_from_stdin(&portal.statement.statement) {
+            let session_id = session_id_from_client(client);
+            self.registry
+                .set_current_query(&session_id, &portal.statement.statement);
+            client.metadata_mut().extend([
+                (METADATA_COPY_ROWS.to_owned(), "0".to_owned()),
+                (METADATA_COPY_EXTENDED.to_owned(), "1".to_owned()),
+            ]);
+            client
+                .send(PgWireBackendMessage::CopyInResponse(
+                    pgwire::messages::copy::CopyInResponse::new(0, 0, vec![]),
+                ))
+                .await?;
+            client.flush().await?;
+            client.set_state(PgWireConnectionState::CopyInProgress);
+            return Ok(());
+        }
+        if is_copy_to_stdout(&portal.statement.statement) {
+            let session_id = session_id_from_client(client);
+            self.registry
+                .set_current_query(&session_id, &portal.statement.statement);
+            self.registry.finish_current_query(&session_id);
+            client
+                .send(PgWireBackendMessage::CopyOutResponse(
+                    pgwire::messages::copy::CopyOutResponse::new(0, 0, vec![]),
+                ))
+                .await?;
+            client
+                .send(PgWireBackendMessage::CopyDone(CopyDone::new()))
+                .await?;
+            client
+                .send(PgWireBackendMessage::CommandComplete(CommandComplete::new(
+                    "COPY 0".to_owned(),
+                )))
+                .await?;
+            return Ok(());
+        }
+
+        match self.do_query(client, portal.as_ref(), max_rows).await? {
+            Response::EmptyQuery => {
+                client
+                    .send(PgWireBackendMessage::EmptyQueryResponse(
+                        EmptyQueryResponse::new(),
+                    ))
+                    .await?;
+            }
+            Response::Query(results) => {
+                let fields = results.row_schema();
+                let mut rows = Vec::new();
+                let mut data_rows = results.data_rows();
+                while let Some(row) = data_rows.next().await {
+                    rows.push(row?);
+                }
+                let mut cursor = PortalCursor {
+                    fields,
+                    rows,
+                    position: 0,
+                    total_rows: 0,
+                };
+                cursor.total_rows = cursor.rows.len();
+                let (chunk, suspended) = cursor.next_chunk(max_rows);
+                for row in chunk {
+                    client.send(PgWireBackendMessage::DataRow(row)).await?;
+                }
+                if suspended {
+                    self.cursors.write().unwrap().insert(key, cursor);
+                    client
+                        .send(PgWireBackendMessage::PortalSuspended(PortalSuspended::new()))
+                        .await?;
+                } else {
+                    client
+                        .send(PgWireBackendMessage::CommandComplete(
+                            Tag::new("SELECT").with_rows(cursor.position).into(),
+                        ))
+                        .await?;
+                }
+            }
+            Response::Execution(tag) => {
+                let command: CommandComplete = tag.into();
+                apply_command_tag_to_tx_status(client, &command.tag);
+                client
+                    .send(PgWireBackendMessage::CommandComplete(command))
+                    .await?;
+            }
+            Response::Error(err) => {
+                mark_error_status(client);
+                client
+                    .send(PgWireBackendMessage::ErrorResponse((*err).into()))
+                    .await?;
+            }
+            Response::CopyIn(_) | Response::CopyOut(_) | Response::CopyBoth(_) => {
+                return Err(user_error(
+                    "ERROR",
+                    "0A000",
+                    "COPY response is only supported by COPY statements",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    async fn on_sync<C>(&self, client: &mut C, _message: PgSync) -> PgWireResult<()>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        client
+            .send(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
+                tx_status_from_client(client),
+            )))
+            .await?;
+        client.flush().await?;
+        client.set_state(PgWireConnectionState::ReadyForQuery);
+        Ok(())
+    }
+
+    async fn on_close<C>(&self, client: &mut C, message: Close) -> PgWireResult<()>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let name = message.name.as_deref().unwrap_or(DEFAULT_NAME);
+        match message.target_type {
+            TARGET_TYPE_BYTE_STATEMENT => {
+                client.portal_store().rm_statement(name);
+            }
+            TARGET_TYPE_BYTE_PORTAL => {
+                client.portal_store().rm_portal(name);
+                let key = cursor_key(&session_id_from_client(client), name);
+                self.cursors.write().unwrap().remove(&key);
+            }
+            _ => {}
+        }
+        client
+            .send(PgWireBackendMessage::CloseComplete(CloseComplete::new()))
+            .await?;
+        Ok(())
     }
 
     /// Overrides the default so a parameterized statement that returns no rows
@@ -456,17 +1069,28 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
         info!("Received extended query: {}", raw_sql);
         self.metrics.queries_total.inc();
 
-        let session_id = client
-            .metadata()
-            .get("nodus_session_id")
-            .cloned()
-            .unwrap_or_else(|| {
-                let id = Uuid::new_v4().to_string();
-                client
-                    .metadata_mut()
-                    .insert("nodus_session_id".to_string(), id.clone());
-                id
-            });
+        let session_id = session_id_from_client(client);
+        if self.registry.is_cancelled(&session_id) {
+            self.metrics.query_errors_total.inc();
+            return Err(user_error(
+                "ERROR",
+                "57P01",
+                "session terminated by administrator",
+            ));
+        }
+        if self.registry.is_query_cancelled(&session_id) {
+            self.metrics.query_errors_total.inc();
+            return Err(user_error(
+                "ERROR",
+                "57014",
+                "canceling statement due to user request",
+            ));
+        }
+        self.registry.set_current_query(&session_id, raw_sql);
+        let _current_query = CurrentQueryGuard {
+            registry: &self.registry,
+            session_id: &session_id,
+        };
 
         let _timer = QueryTimer {
             start: std::time::Instant::now(),
@@ -476,12 +1100,7 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
             slow_log: &self.slow_log,
         };
 
-        let principal_id = client
-            .metadata()
-            .get("nodus_principal_id")
-            .and_then(|s| Uuid::parse_str(s).ok())
-            .map(PrincipalId)
-            .unwrap_or_default();
+        let principal_id = principal_id_from_client(client);
 
         let ctx = nodus_executor::ExecutionContext {
             session_id: session_id.clone(),
@@ -596,35 +1215,26 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
             Ok(out) => out,
             Err(e) => {
                 let err_str = e.to_string();
-                let code = if err_str.contains("Unique constraint violation") {
-                    "23505"
-                } else if err_str.contains("cannot be NULL") {
-                    "23502"
-                } else {
-                    "XX000"
-                };
+                let code = sqlstate_for_execution_error(&err_str);
                 let err = ErrorInfo::new("ERROR".to_owned(), code.to_owned(), err_str);
+                mark_error_status(client);
                 return Err(PgWireError::UserError(Box::new(err)));
             }
         };
 
+        if self.registry.is_query_cancelled(&session_id) {
+            self.metrics.query_errors_total.inc();
+            mark_error_status(client);
+            return Err(user_error(
+                "ERROR",
+                "57014",
+                "canceling statement due to user request",
+            ));
+        }
+
         if out.columns.is_empty() {
-            let tag = if out.tag.starts_with("INSERT 0 ") {
-                let rows = out.tag["INSERT 0 ".len()..].parse::<usize>().unwrap_or(0);
-                info!("Returning parsed INSERT tag with rows: {}", rows);
-                // pgwire's Tag serializes as "{command} {rows}" and drops the
-                // oid, but pgjdbc requires the three-token "INSERT <oid> <rows>"
-                // form, so the oid is folded into the command string.
-                Tag::new("INSERT 0").with_rows(rows)
-            } else if out.tag.starts_with("UPDATE ") {
-                let rows = out.tag["UPDATE ".len()..].parse::<usize>().unwrap_or(0);
-                Tag::new("UPDATE").with_rows(rows)
-            } else if out.tag.starts_with("DELETE ") {
-                let rows = out.tag["DELETE ".len()..].parse::<usize>().unwrap_or(0);
-                Tag::new("DELETE").with_rows(rows)
-            } else {
-                Tag::new(&out.tag)
-            };
+            apply_command_tag_to_tx_status(client, &out.tag);
+            let tag = command_tag_from_output_tag(&out.tag);
             return Ok(Response::Execution(tag));
         }
 
@@ -804,6 +1414,108 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
     }
 }
 
+#[derive(Default)]
+pub struct NodusCopyHandler {
+    registry: Arc<SessionRegistry>,
+}
+
+#[async_trait]
+impl CopyHandler for NodusCopyHandler {
+    async fn on_copy_data<C>(&self, client: &mut C, copy_data: CopyData) -> PgWireResult<()>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let rows = client
+            .metadata()
+            .get(METADATA_COPY_ROWS)
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0);
+        let chunk_rows = copy_data
+            .data
+            .iter()
+            .filter(|b| **b == b'\n')
+            .count()
+            .max(1);
+        client.metadata_mut().insert(
+            METADATA_COPY_ROWS.to_owned(),
+            rows.saturating_add(chunk_rows).to_string(),
+        );
+        Ok(())
+    }
+
+    async fn on_copy_done<C>(&self, client: &mut C, _done: CopyDone) -> PgWireResult<()>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let rows = client
+            .metadata_mut()
+            .remove(METADATA_COPY_ROWS)
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0);
+        let extended_copy = client
+            .metadata_mut()
+            .remove(METADATA_COPY_EXTENDED)
+            .as_deref()
+            == Some("1");
+        let session_id = session_id_from_client(client);
+        self.registry.finish_current_query(&session_id);
+        client
+            .send(PgWireBackendMessage::CommandComplete(CommandComplete::new(
+                format!("COPY {rows}"),
+            )))
+            .await?;
+        if !extended_copy {
+            client
+                .send(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
+                    tx_status_from_client(client),
+                )))
+                .await?;
+        }
+        client.flush().await?;
+        if extended_copy {
+            client.set_state(PgWireConnectionState::AwaitingSync);
+        } else {
+            client.set_state(PgWireConnectionState::ReadyForQuery);
+        }
+        Ok(())
+    }
+
+    async fn on_copy_fail<C>(&self, client: &mut C, fail: CopyFail) -> PgWireResult<()>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        client.metadata_mut().remove(METADATA_COPY_ROWS);
+        client.metadata_mut().remove(METADATA_COPY_EXTENDED);
+        let session_id = session_id_from_client(client);
+        self.registry.finish_current_query(&session_id);
+        mark_error_status(client);
+        let msg = if fail.message.is_empty() {
+            "COPY failed".to_owned()
+        } else {
+            fail.message
+        };
+        client
+            .send(PgWireBackendMessage::ErrorResponse(
+                ErrorInfo::new("ERROR".to_owned(), "57014".to_owned(), msg).into(),
+            ))
+            .await?;
+        client
+            .send(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
+                tx_status_from_client(client),
+            )))
+            .await?;
+        client.flush().await?;
+        client.set_state(PgWireConnectionState::ReadyForQuery);
+        Ok(())
+    }
+}
+
 pub struct NodusPgWireServer {
     startup_handler: Arc<NodusStartupHandler>,
     executor: Arc<dyn nodus_executor::Executor>,
@@ -811,35 +1523,25 @@ pub struct NodusPgWireServer {
     registry: Arc<SessionRegistry>,
     slow_log: Arc<nodus_monitoring::SlowQueryLog>,
     extended_query_handler: Arc<NodusExtendedQueryHandler>,
-    copy_handler: Arc<NoopCopyHandler>,
+    copy_handler: Arc<NodusCopyHandler>,
 }
 
 impl PgWireHandlerFactory for NodusPgWireServer {
     type StartupHandler = NodusStartupHandler;
     type SimpleQueryHandler = NodusQueryHandler;
     type ExtendedQueryHandler = NodusExtendedQueryHandler;
-    type CopyHandler = NoopCopyHandler;
+    type CopyHandler = NodusCopyHandler;
 
     // Called once per connection by `process_socket`, so each client gets its
     // own session registered in the shared registry.
     fn simple_query_handler(&self) -> Arc<Self::SimpleQueryHandler> {
-        let session_id = Uuid::new_v4().to_string();
-        // Anonymous until authentication is wired into the startup handler.
-        let session = Session {
-            session_id: session_id.clone(),
-            principal_id: PrincipalId::new(),
-            active_roles: vec![],
-            database_id: None,
-        };
-        let cancel = self.registry.register(&session);
         Arc::new(NodusQueryHandler {
-            session_id,
+            session_id: String::new(),
             session_state: nodus_sql::SessionState::default(),
             executor: self.executor.clone(),
             metrics: self.metrics.clone(),
             registry: self.registry.clone(),
             slow_log: self.slow_log.clone(),
-            cancel,
         })
     }
 
@@ -853,6 +1555,315 @@ impl PgWireHandlerFactory for NodusPgWireServer {
 
     fn copy_handler(&self) -> Arc<Self::CopyHandler> {
         self.copy_handler.clone()
+    }
+}
+
+enum StartupControl {
+    Plain(TcpStream),
+    Secure(Box<tokio_rustls::server::TlsStream<TcpStream>>),
+    Closed,
+}
+
+async fn negotiate_startup_control(
+    mut socket: TcpStream,
+    tls: Option<Arc<tokio_rustls::TlsAcceptor>>,
+    registry: Arc<SessionRegistry>,
+) -> Result<StartupControl, IoError> {
+    loop {
+        let mut header = [0u8; STARTUP_PACKET_HEADER_LEN];
+        loop {
+            let read = socket.peek(&mut header).await?;
+            if read == 0 {
+                return Ok(StartupControl::Closed);
+            }
+            if read >= STARTUP_PACKET_HEADER_LEN {
+                break;
+            }
+        }
+        let magic = (&header[4..8]).get_i32();
+        match magic {
+            CANCEL_REQUEST_MAGIC => {
+                let mut packet = [0u8; CANCEL_REQUEST_LEN];
+                socket.read_exact(&mut packet).await?;
+                let mut body = &packet[8..];
+                let pid = body.get_i32();
+                let secret = body.get_i32();
+                let accepted = registry.cancel_backend_query(pid, secret);
+                info!(
+                    "Received cancel request for backend pid={} accepted={}",
+                    pid, accepted
+                );
+                return Ok(StartupControl::Closed);
+            }
+            SSL_REQUEST_MAGIC => {
+                let mut packet = [0u8; STARTUP_PACKET_HEADER_LEN];
+                socket.read_exact(&mut packet).await?;
+                if let Some(acceptor) = tls {
+                    socket.write_all(&[SslResponse::BYTE_ACCEPT]).await?;
+                    let tls_socket = acceptor.accept(socket).await?;
+                    return Ok(StartupControl::Secure(Box::new(tls_socket)));
+                }
+                socket.write_all(&[SslResponse::BYTE_REFUSE]).await?;
+            }
+            GSSENC_REQUEST_MAGIC => {
+                let mut packet = [0u8; STARTUP_PACKET_HEADER_LEN];
+                socket.read_exact(&mut packet).await?;
+                socket.write_all(&[SslResponse::BYTE_REFUSE]).await?;
+            }
+            _ => return Ok(StartupControl::Plain(socket)),
+        }
+    }
+}
+
+fn register_socket_session<S>(
+    framed: &mut Framed<S, PgWireMessageServerCodec<String>>,
+    registry: &SessionRegistry,
+) -> String {
+    let session_id = Uuid::new_v4().to_string();
+    let secret_uuid = Uuid::new_v4();
+    let secret = (secret_uuid.as_u128() & 0x7fff_ffff) as i32;
+    let pid = std::process::id() as i32;
+    let session = Session {
+        session_id: session_id.clone(),
+        principal_id: PrincipalId::new(),
+        active_roles: vec![],
+        database_id: None,
+    };
+    registry.register(&session);
+    registry.register_backend_key(&session_id, pid, secret);
+    framed
+        .codec_mut()
+        .client_info
+        .metadata
+        .insert(METADATA_NODUS_SESSION_ID.to_owned(), session_id.clone());
+    framed
+        .codec_mut()
+        .client_info
+        .metadata
+        .insert(METADATA_BACKEND_PID.to_owned(), pid.to_string());
+    framed
+        .codec_mut()
+        .client_info
+        .metadata
+        .insert(METADATA_BACKEND_SECRET.to_owned(), secret.to_string());
+    framed
+        .codec_mut()
+        .client_info
+        .metadata
+        .insert(METADATA_TX_STATUS.to_owned(), "I".to_owned());
+    session_id
+}
+
+async fn process_nodus_message<S>(
+    message: pgwire::messages::PgWireFrontendMessage,
+    socket: &mut Framed<S, PgWireMessageServerCodec<String>>,
+    factory: Arc<NodusPgWireServer>,
+) -> PgWireResult<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + Sync,
+{
+    match socket.codec().client_info.state() {
+        PgWireConnectionState::AwaitingStartup
+        | PgWireConnectionState::AuthenticationInProgress => {
+            factory
+                .startup_handler()
+                .on_startup(socket, message)
+                .await?;
+        }
+        PgWireConnectionState::AwaitingSync => {
+            if let pgwire::messages::PgWireFrontendMessage::Sync(sync) = message {
+                factory
+                    .extended_query_handler()
+                    .on_sync(socket, sync)
+                    .await?;
+                socket.set_state(PgWireConnectionState::ReadyForQuery);
+            }
+        }
+        PgWireConnectionState::CopyInProgress => match message {
+            pgwire::messages::PgWireFrontendMessage::CopyData(copy_data) => {
+                factory
+                    .copy_handler()
+                    .on_copy_data(socket, copy_data)
+                    .await?;
+            }
+            pgwire::messages::PgWireFrontendMessage::CopyDone(copy_done) => {
+                factory
+                    .copy_handler()
+                    .on_copy_done(socket, copy_done)
+                    .await?;
+            }
+            pgwire::messages::PgWireFrontendMessage::CopyFail(copy_fail) => {
+                factory
+                    .copy_handler()
+                    .on_copy_fail(socket, copy_fail)
+                    .await?;
+            }
+            pgwire::messages::PgWireFrontendMessage::Sync(_) => {}
+            pgwire::messages::PgWireFrontendMessage::Flush(_) => {
+                socket.flush().await?;
+            }
+            _ => {
+                return Err(user_error(
+                    "ERROR",
+                    "08P01",
+                    "only COPY data, done, or fail messages are valid during COPY",
+                ));
+            }
+        },
+        _ => match message {
+            pgwire::messages::PgWireFrontendMessage::Query(query) => {
+                factory
+                    .simple_query_handler()
+                    .on_query(socket, query)
+                    .await?;
+            }
+            pgwire::messages::PgWireFrontendMessage::Parse(parse) => {
+                factory
+                    .extended_query_handler()
+                    .on_parse(socket, parse)
+                    .await?;
+            }
+            pgwire::messages::PgWireFrontendMessage::Bind(bind) => {
+                factory
+                    .extended_query_handler()
+                    .on_bind(socket, bind)
+                    .await?;
+            }
+            pgwire::messages::PgWireFrontendMessage::Execute(execute) => {
+                factory
+                    .extended_query_handler()
+                    .on_execute(socket, execute)
+                    .await?;
+            }
+            pgwire::messages::PgWireFrontendMessage::Describe(describe) => {
+                factory
+                    .extended_query_handler()
+                    .on_describe(socket, describe)
+                    .await?;
+            }
+            pgwire::messages::PgWireFrontendMessage::Sync(sync) => {
+                factory
+                    .extended_query_handler()
+                    .on_sync(socket, sync)
+                    .await?;
+            }
+            pgwire::messages::PgWireFrontendMessage::Close(close) => {
+                factory
+                    .extended_query_handler()
+                    .on_close(socket, close)
+                    .await?;
+            }
+            pgwire::messages::PgWireFrontendMessage::Flush(_) => {
+                socket.flush().await?;
+            }
+            pgwire::messages::PgWireFrontendMessage::Terminate(_) => {}
+            pgwire::messages::PgWireFrontendMessage::CopyData(_)
+            | pgwire::messages::PgWireFrontendMessage::CopyDone(_)
+            | pgwire::messages::PgWireFrontendMessage::CopyFail(_) => {
+                return Err(user_error(
+                    "ERROR",
+                    "08P01",
+                    "COPY message outside COPY mode",
+                ));
+            }
+            _ => {}
+        },
+    }
+    Ok(())
+}
+
+async fn process_nodus_error<S>(
+    socket: &mut Framed<S, PgWireMessageServerCodec<String>>,
+    error: PgWireError,
+    wait_for_sync: bool,
+) -> Result<(), IoError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + Sync,
+{
+    mark_error_status(socket);
+    match error {
+        PgWireError::UserError(error_info) => {
+            socket
+                .feed(PgWireBackendMessage::ErrorResponse((*error_info).into()))
+                .await?;
+        }
+        PgWireError::ApiError(e) => {
+            let error_info = ErrorInfo::new("ERROR".to_owned(), "XX000".to_owned(), e.to_string());
+            socket
+                .feed(PgWireBackendMessage::ErrorResponse(error_info.into()))
+                .await?;
+        }
+        other => {
+            let error_info =
+                ErrorInfo::new("FATAL".to_owned(), "XX000".to_owned(), other.to_string());
+            socket
+                .send(PgWireBackendMessage::ErrorResponse(error_info.into()))
+                .await?;
+            return socket.close().await;
+        }
+    }
+
+    if wait_for_sync {
+        socket.set_state(PgWireConnectionState::AwaitingSync);
+    } else {
+        socket
+            .feed(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
+                tx_status_from_client(socket),
+            )))
+            .await?;
+    }
+    socket.flush().await?;
+    Ok(())
+}
+
+async fn process_framed_nodus_socket<S>(
+    mut socket: Framed<S, PgWireMessageServerCodec<String>>,
+    factory: Arc<NodusPgWireServer>,
+) -> Result<(), IoError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + Sync,
+{
+    let session_id = register_socket_session(&mut socket, &factory.registry);
+    while let Some(msg) = socket.next().await {
+        let msg = match msg {
+            Ok(msg) => msg,
+            Err(e) => {
+                process_nodus_error(&mut socket, e, false).await?;
+                continue;
+            }
+        };
+        if matches!(msg, pgwire::messages::PgWireFrontendMessage::Terminate(_)) {
+            break;
+        }
+        let is_extended_query = msg.is_extended_query();
+        if let Err(e) = process_nodus_message(msg, &mut socket, factory.clone()).await {
+            process_nodus_error(&mut socket, e, is_extended_query).await?;
+        }
+    }
+    factory.registry.deregister(&session_id);
+    Ok(())
+}
+
+async fn process_nodus_socket(
+    tcp_socket: TcpStream,
+    tls: Option<Arc<tokio_rustls::TlsAcceptor>>,
+    factory: Arc<NodusPgWireServer>,
+) -> Result<(), IoError> {
+    let addr = tcp_socket.peer_addr()?;
+    tcp_socket.set_nodelay(true)?;
+
+    match negotiate_startup_control(tcp_socket, tls, factory.registry.clone()).await? {
+        StartupControl::Plain(socket) => {
+            let client_info = DefaultClient::new(addr, false);
+            let framed = Framed::new(socket, PgWireMessageServerCodec::new(client_info));
+            process_framed_nodus_socket(framed, factory).await
+        }
+        StartupControl::Secure(socket) => {
+            let client_info = DefaultClient::new(addr, true);
+            let framed = Framed::new(*socket, PgWireMessageServerCodec::new(client_info));
+            process_framed_nodus_socket(framed, factory).await
+        }
+        StartupControl::Closed => Ok(()),
     }
 }
 
@@ -873,19 +1884,24 @@ pub async fn start_pgwire_server(
     let startup_handler = Arc::new(NodusStartupHandler {
         authenticator,
         param_provider,
+        registry: registry.clone(),
     });
     let factory = Arc::new(NodusPgWireServer {
         startup_handler,
         executor: executor.clone(),
         metrics: metrics.clone(),
-        registry,
+        registry: registry.clone(),
         slow_log: slow_log.clone(),
         extended_query_handler: Arc::new(NodusExtendedQueryHandler {
             executor,
             metrics: metrics.clone(),
             slow_log,
+            registry: registry.clone(),
+            cursors: RwLock::new(HashMap::new()),
         }),
-        copy_handler: Arc::new(NoopCopyHandler),
+        copy_handler: Arc::new(NodusCopyHandler {
+            registry: registry.clone(),
+        }),
     });
 
     info!(
@@ -909,7 +1925,7 @@ pub async fn start_pgwire_server(
                         tokio::spawn(async move {
                             metrics.pgwire_connections_total.inc();
                             metrics.active_sessions.inc();
-                            if let Err(e) = process_socket(socket, tls, factory).await {
+                            if let Err(e) = process_nodus_socket(socket, tls, factory).await {
                                 error!("Socket error: {}", e);
                             }
                             metrics.active_sessions.dec();

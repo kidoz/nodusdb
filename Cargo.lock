@@ -2217,6 +2217,8 @@ dependencies = [
 name = "nodus_compatibility_tests"
 version = "0.1.0"
 dependencies = [
+ "bytes",
+ "futures-util",
  "nodus_testkit",
  "tokio",
  "tokio-postgres",
@@ -2361,6 +2363,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "bytes",
  "futures-util",
  "nodus_catalog",
  "nodus_executor",
@@ -2374,6 +2377,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tokio-rustls",
+ "tokio-util",
  "tracing",
  "uuid",
 ]

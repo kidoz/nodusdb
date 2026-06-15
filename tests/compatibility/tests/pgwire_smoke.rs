@@ -1,5 +1,9 @@
+use bytes::Bytes;
+use futures_util::{SinkExt, StreamExt};
 use nodus_testkit::TestServer;
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tokio_postgres::{NoTls, SimpleQueryMessage};
 
 async fn connect(server: &TestServer) -> tokio_postgres::Client {
@@ -18,6 +22,111 @@ async fn connect(server: &TestServer) -> tokio_postgres::Client {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     panic!("PGWire server did not start in time");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_extended_portal_row_limits_suspend_and_resume() {
+    let server = TestServer::start().await.expect("server starts");
+    let mut client = connect(&server).await;
+
+    client
+        .simple_query("CREATE TABLE portal_rows (id INT PRIMARY KEY);")
+        .await
+        .unwrap();
+    client
+        .simple_query("INSERT INTO portal_rows (id) VALUES (1), (2), (3);")
+        .await
+        .unwrap();
+
+    let tx = client.transaction().await.unwrap();
+    let stmt = tx
+        .prepare("SELECT id FROM portal_rows ORDER BY id;")
+        .await
+        .unwrap();
+    let portal = tx.bind(&stmt, &[]).await.unwrap();
+
+    let first = tx.query_portal(&portal, 2).await.unwrap();
+    assert_eq!(first.len(), 2);
+    let first_id: i32 = first[0].get(0);
+    let second_id: i32 = first[1].get(0);
+    assert_eq!((first_id, second_id), (1, 2));
+
+    let second = tx.query_portal(&portal, 2).await.unwrap();
+    assert_eq!(second.len(), 1);
+    let third_id: i32 = second[0].get(0);
+    assert_eq!(third_id, 3);
+
+    tx.commit().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_cancel_request_is_accepted_without_killing_idle_session() {
+    let server = TestServer::start().await.expect("server starts");
+    let client = connect(&server).await;
+
+    client.cancel_token().cancel_query(NoTls).await.unwrap();
+
+    let rows = client.query("SELECT 1", &[]).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    let value: i32 = rows[0].get(0);
+    assert_eq!(value, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_ssl_and_gss_negotiation_are_refused_cleanly() {
+    let server = TestServer::start().await.expect("server starts");
+
+    for magic in [80877103_i32, 80877104_i32] {
+        let mut stream = TcpStream::connect(server.pgwire_addr).await.unwrap();
+        let mut packet = Vec::with_capacity(8);
+        packet.extend_from_slice(&8_i32.to_be_bytes());
+        packet.extend_from_slice(&magic.to_be_bytes());
+        stream.write_all(&packet).await.unwrap();
+
+        let mut response = [0_u8; 1];
+        stream.read_exact(&mut response).await.unwrap();
+        assert_eq!(response, [b'N']);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_copy_protocol_in_and_out_complete_cleanly() {
+    let server = TestServer::start().await.expect("server starts");
+    let client = connect(&server).await;
+
+    let mut sink = Box::pin(
+        client
+            .copy_in::<_, Bytes>("COPY copy_sink FROM STDIN")
+            .await
+            .unwrap(),
+    );
+    sink.as_mut()
+        .send(Bytes::from_static(b"1\talpha\n2\tbeta\n"))
+        .await
+        .unwrap();
+    let copied = sink.as_mut().finish().await.unwrap();
+    assert_eq!(copied, 2);
+
+    let mut out = Box::pin(client.copy_out("COPY copy_sink TO STDOUT").await.unwrap());
+    assert!(out.next().await.is_none());
+
+    let rows = client.query("SELECT 1", &[]).await.unwrap();
+    assert_eq!(rows.len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_startup_parameters_and_ready_state_basics() {
+    let server = TestServer::start().await.expect("server starts");
+    let client = connect(&server).await;
+
+    let rows = client.query("SHOW search_path", &[]).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    let search_path: &str = rows[0].get(0);
+    assert_eq!(search_path, "public");
+
+    client.simple_query("BEGIN").await.unwrap();
+    client.simple_query("SELECT 1").await.unwrap();
+    client.simple_query("ROLLBACK").await.unwrap();
 }
 
 fn rows_of(msgs: &[SimpleQueryMessage]) -> Vec<&tokio_postgres::SimpleQueryRow> {
