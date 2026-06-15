@@ -58,6 +58,52 @@ public class JdbcFeatureCoverageTest {
     }
 
     @Test
+    public void testJetBrainsDatabaseIntrospectionQueries() throws Exception {
+        try (Connection conn = getConnection();
+             Statement stmt = conn.createStatement()) {
+
+            try (ResultSet rs = stmt.executeQuery(
+                    "select L.transactionid::varchar::bigint as transaction_id " +
+                    "from pg_catalog.pg_locks L " +
+                    "where L.transactionid is not null " +
+                    "order by pg_catalog.age(L.transactionid) desc " +
+                    "limit 1")) {
+                if (rs.next()) {
+                    rs.getLong("transaction_id");
+                }
+            }
+
+            try (ResultSet rs = stmt.executeQuery(
+                    "select case " +
+                    "  when pg_catalog.pg_is_in_recovery() then null " +
+                    "  else (pg_catalog.txid_current() % 4294967296)::varchar::bigint " +
+                    "end as current_txid")) {
+                assertTrue(rs.next());
+                rs.getLong("current_txid");
+            }
+
+            try (ResultSet rs = stmt.executeQuery(
+                    "select N.oid::bigint as id, " +
+                    "       datname as name, " +
+                    "       D.description, " +
+                    "       datistemplate as is_template, " +
+                    "       datallowconn as allow_connections, " +
+                    "       pg_catalog.pg_get_userbyid(N.datdba) as \"owner\" " +
+                    "from pg_catalog.pg_database N " +
+                    "  left join pg_catalog.pg_shdescription D on N.oid = D.objoid " +
+                    "order by case when datname = pg_catalog.current_database() then -1::bigint else N.oid::bigint end")) {
+                assertTrue(rs.next());
+                assertTrue(rs.getLong("id") > 0);
+                assertEquals("default", rs.getString("name"));
+                rs.getString("description");
+                assertFalse(rs.getBoolean("is_template"));
+                assertTrue(rs.getBoolean("allow_connections"));
+                rs.getString("owner");
+            }
+        }
+    }
+
+    @Test
     public void testResultSetMetaData() throws Exception {
         try (Connection conn = getConnection();
              Statement stmt = conn.createStatement()) {

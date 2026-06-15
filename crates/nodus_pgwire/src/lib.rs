@@ -101,6 +101,7 @@ fn array_type_for_base(base: &str) -> Type {
     match base {
         "BOOL" | "BOOLEAN" => Type::BOOL_ARRAY,
         "BYTEA" => Type::BYTEA_ARRAY,
+        "PG_CHAR" => Type::CHAR_ARRAY,
         "CHAR" | "CHARACTER" | "BPCHAR" => Type::BPCHAR_ARRAY,
         "DATE" => Type::DATE_ARRAY,
         "FLOAT4" | "REAL" => Type::FLOAT4_ARRAY,
@@ -139,6 +140,7 @@ fn map_declared_type(data_type: &str) -> PgDeclaredType {
     let ty = match base {
         "BOOL" | "BOOLEAN" => Type::BOOL,
         "BYTEA" => Type::BYTEA,
+        "PG_CHAR" => Type::CHAR,
         "CHAR" | "CHARACTER" | "BPCHAR" => Type::BPCHAR,
         "DATE" => Type::DATE,
         "FLOAT4" | "REAL" => Type::FLOAT4,
@@ -432,6 +434,7 @@ fn copy_column_count(query: &str) -> i16 {
 fn type_size(ty: &Type) -> i16 {
     match *ty {
         Type::BOOL => 1,
+        Type::CHAR => 1,
         Type::INT2 => 2,
         Type::INT4
         | Type::OID
@@ -457,7 +460,9 @@ fn type_size(ty: &Type) -> i16 {
 fn supports_binary_result(ty: &Type) -> bool {
     !matches!(
         *ty,
-        Type::NUMERIC
+        Type::CHAR
+            | Type::CHAR_ARRAY
+            | Type::NUMERIC
             | Type::NUMERIC_ARRAY
             | Type::REGCLASS
             | Type::REGCONFIG
@@ -791,13 +796,15 @@ fn encode_array_binary(
                 .map(optional_json)
                 .collect::<std::io::Result<Vec<_>>>()?,
         ),
-        Type::TEXT_ARRAY | Type::VARCHAR_ARRAY | Type::BPCHAR_ARRAY | Type::NAME_ARRAY => {
-            append_tosql(
-                row,
-                declared,
-                &values.iter().map(optional_string).collect::<Vec<_>>(),
-            )
-        }
+        Type::TEXT_ARRAY
+        | Type::VARCHAR_ARRAY
+        | Type::BPCHAR_ARRAY
+        | Type::NAME_ARRAY
+        | Type::CHAR_ARRAY => append_tosql(
+            row,
+            declared,
+            &values.iter().map(optional_string).collect::<Vec<_>>(),
+        ),
         Type::TIME_ARRAY => append_tosql(
             row,
             declared,
@@ -962,7 +969,7 @@ fn append_value(
         Type::INT4 => append_tosql(row, declared, &(parse_i64(value)? as i32)),
         Type::INT8 => append_tosql(row, declared, &parse_i64(value)?),
         Type::JSON | Type::JSONB => append_tosql(row, declared, &Json(parse_json(value)?)),
-        Type::NAME | Type::TEXT | Type::VARCHAR | Type::BPCHAR => {
+        Type::CHAR | Type::NAME | Type::TEXT | Type::VARCHAR | Type::BPCHAR => {
             append_tosql(row, declared, &value_to_string(value))
         }
         Type::OID => append_tosql(row, declared, &(parse_i64(value)? as u32)),
