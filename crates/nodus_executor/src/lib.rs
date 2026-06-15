@@ -215,6 +215,14 @@ pub enum ProjectionItem {
         right: String,
         alias: Option<String>,
     },
+    CaseWhenEq {
+        left: String,
+        equals: crate::Value,
+        then_value: crate::Value,
+        then_column: Option<String>,
+        else_column: String,
+        alias: Option<String>,
+    },
     WindowFunction {
         func_name: String,
         partition_by: Vec<String>,
@@ -350,6 +358,9 @@ pub enum LogicalPlan {
     SetVariable {
         variable: String,
         value: String,
+    },
+    Noop {
+        tag: String,
     },
     SelectLiteral {
         values: Vec<(String, crate::Value)>,
@@ -813,6 +824,12 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
             variable: "transaction_isolation".to_string(),
             value: "read committed".to_string(),
         }),
+        Statement::Discard { .. } => Ok(LogicalPlan::Noop {
+            tag: "DISCARD ALL".to_string(),
+        }),
+        Statement::Deallocate { .. } => Ok(LogicalPlan::Noop {
+            tag: "DEALLOCATE".to_string(),
+        }),
         Statement::AlterTable {
             name, operations, ..
         } => {
@@ -872,9 +889,17 @@ fn table_name_of(relation: &sqlparser::ast::TableFactor) -> Result<String> {
 pub fn parse_object_name(name: &str) -> Result<(&str, &str, &str)> {
     let parts: Vec<&str> = name.split('.').collect();
     match parts.len() {
-        1 => Ok(("default", "public", parts[0])),
-        2 => Ok(("default", parts[0], parts[1])),
-        3 => Ok((parts[0], parts[1], parts[2])),
+        1 => Ok(("default", "public", parts[0].trim_matches('"'))),
+        2 => Ok((
+            "default",
+            parts[0].trim_matches('"'),
+            parts[1].trim_matches('"'),
+        )),
+        3 => Ok((
+            parts[0].trim_matches('"'),
+            parts[1].trim_matches('"'),
+            parts[2].trim_matches('"'),
+        )),
         _ => anyhow::bail!("Invalid object name: {}", name),
     }
 }
@@ -1056,6 +1081,47 @@ fn extract_col_name(expr: &sqlparser::ast::Expr) -> Option<String> {
         Expr::Cast { expr, .. } => extract_col_name(expr),
         _ => None,
     }
+}
+
+fn parse_simple_case_when_eq(
+    expr: &sqlparser::ast::Expr,
+    alias: Option<String>,
+    params: &[Value],
+) -> Option<ProjectionItem> {
+    use sqlparser::ast::{BinaryOperator, Expr};
+    let Expr::Case {
+        operand: None,
+        conditions,
+        results,
+        else_result: Some(else_result),
+    } = expr
+    else {
+        return None;
+    };
+    let condition = conditions.first()?;
+    let then_expr = results.first()?;
+    let Expr::BinaryOp { left, op, right } = condition else {
+        return None;
+    };
+    if *op != BinaryOperator::Eq {
+        return None;
+    }
+    let left = extract_col_name(left)?;
+    let equals = expr_to_value(right, params)?;
+    let (then_value, then_column) = if let Some(value) = expr_to_value(then_expr, params) {
+        (value, None)
+    } else {
+        (Value::Null, Some(extract_col_name(then_expr)?))
+    };
+    let else_column = extract_col_name(else_result)?;
+    Some(ProjectionItem::CaseWhenEq {
+        left,
+        equals,
+        then_value,
+        then_column,
+        else_column,
+        alias,
+    })
 }
 
 fn extract_operand(expr: &sqlparser::ast::Expr, params: &[Value]) -> Option<Operand> {
@@ -1320,7 +1386,11 @@ fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Result<Logical
                         alias: None,
                     });
                 } else if let Expr::Case { .. } = expr {
-                    projection.push(ProjectionItem::Literal(crate::Value::Null));
+                    if let Some(case_projection) = parse_simple_case_when_eq(expr, None, params) {
+                        projection.push(case_projection);
+                    } else {
+                        projection.push(ProjectionItem::Literal(crate::Value::Null));
+                    }
                 } else if let Some(col) = extract_col_name(expr) {
                     projection.push(ProjectionItem::Column(col));
                 } else if let Some(val) = expr_to_value(expr, params) {
@@ -1439,10 +1509,16 @@ fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Result<Logical
                         alias: Some(alias.value.clone()),
                     });
                 } else if let Expr::Case { .. } = expr {
-                    projection.push(ProjectionItem::AliasedLiteral(
-                        crate::Value::Text("TABLE".to_string()),
-                        alias.value.clone(),
-                    ));
+                    if let Some(case_projection) =
+                        parse_simple_case_when_eq(expr, Some(alias.value.clone()), params)
+                    {
+                        projection.push(case_projection);
+                    } else {
+                        projection.push(ProjectionItem::AliasedLiteral(
+                            crate::Value::Text("TABLE".to_string()),
+                            alias.value.clone(),
+                        ));
+                    }
                 } else if let Some(col) = extract_col_name(expr) {
                     projection.push(ProjectionItem::AliasedColumn(col, alias.value.clone()));
                 } else if let Some(val) = expr_to_value(expr, params) {
@@ -2585,6 +2661,34 @@ impl MemExecutor {
             || schema_name.eq_ignore_ascii_case("information_schema")
     }
 
+    fn is_pg_catalog_virtual_table_name(table_name: &str) -> bool {
+        matches!(
+            table_name.to_ascii_lowercase().as_str(),
+            "pg_database"
+                | "pg_namespace"
+                | "pg_class"
+                | "pg_attribute"
+                | "pg_index"
+                | "pg_constraint"
+                | "pg_type"
+                | "pg_proc"
+                | "pg_range"
+                | "pg_settings"
+                | "pg_roles"
+                | "pg_user"
+                | "pg_tables"
+                | "pg_indexes"
+                | "pg_attrdef"
+                | "pg_description"
+                | "pg_enum"
+                | "pg_collation"
+                | "pg_am"
+                | "pg_operator"
+                | "pg_cast"
+                | "pg_locks"
+        )
+    }
+
     fn schema_name_by_id(
         db_name: &str,
         schemas: &[nodus_catalog::SchemaDescriptor],
@@ -2668,17 +2772,28 @@ impl MemExecutor {
                     ("nspowner", "OID"),
                     ("nspacl", "TEXT[]"),
                 ]);
-                let rows = schemas
-                    .iter()
-                    .map(|schema| {
-                        vec![
-                            Value::Int(Self::schema_oid(db_name, &schema.name)),
-                            Value::Text(schema.name.clone()),
-                            Value::Int(10),
-                            Value::Null,
-                        ]
-                    })
-                    .collect();
+                let mut rows = vec![
+                    vec![
+                        Value::Int(Self::schema_oid(db_name, "pg_catalog")),
+                        Value::Text("pg_catalog".into()),
+                        Value::Int(10),
+                        Value::Null,
+                    ],
+                    vec![
+                        Value::Int(Self::schema_oid(db_name, "information_schema")),
+                        Value::Text("information_schema".into()),
+                        Value::Int(10),
+                        Value::Null,
+                    ],
+                ];
+                rows.extend(schemas.iter().map(|schema| {
+                    vec![
+                        Value::Int(Self::schema_oid(db_name, &schema.name)),
+                        Value::Text(schema.name.clone()),
+                        Value::Int(10),
+                        Value::Null,
+                    ]
+                }));
                 Some((cols, rows))
             }
             "pg_class" => {
@@ -2984,6 +3099,84 @@ impl MemExecutor {
                 Some((cols, self.pg_constraint_rows(db_name, &schemas, &tables)))
             }
             "pg_type" => Some(self.pg_type_virtual_table(db_name)),
+            "pg_proc" => Some((
+                Self::virtual_columns(&[
+                    ("oid", "OID"),
+                    ("proname", "NAME"),
+                    ("pronamespace", "OID"),
+                    ("proowner", "OID"),
+                    ("prolang", "OID"),
+                    ("procost", "FLOAT4"),
+                    ("prorows", "FLOAT4"),
+                    ("provariadic", "OID"),
+                    ("prosupport", "REGPROC"),
+                    ("prokind", "CHAR"),
+                    ("prosecdef", "BOOL"),
+                    ("proleakproof", "BOOL"),
+                    ("proisstrict", "BOOL"),
+                    ("proretset", "BOOL"),
+                    ("provolatile", "CHAR"),
+                    ("proparallel", "CHAR"),
+                    ("pronargs", "INT"),
+                    ("pronargdefaults", "INT"),
+                    ("prorettype", "OID"),
+                    ("proargtypes", "OID[]"),
+                    ("proallargtypes", "OID[]"),
+                    ("proargmodes", "CHAR[]"),
+                    ("proargnames", "TEXT[]"),
+                    ("proargdefaults", "TEXT"),
+                    ("protrftypes", "OID[]"),
+                    ("prosrc", "TEXT"),
+                    ("probin", "TEXT"),
+                    ("prosqlbody", "TEXT"),
+                    ("proconfig", "TEXT[]"),
+                    ("proacl", "TEXT[]"),
+                ]),
+                vec![vec![
+                    Value::Int(750),
+                    Value::Text("array_recv".into()),
+                    Value::Int(Self::schema_oid(db_name, "pg_catalog")),
+                    Value::Int(10),
+                    Value::Int(12),
+                    Value::Float(1.0),
+                    Value::Float(0.0),
+                    Value::Int(0),
+                    Value::Int(0),
+                    Value::Text("f".into()),
+                    Value::Bool(false),
+                    Value::Bool(false),
+                    Value::Bool(false),
+                    Value::Bool(false),
+                    Value::Text("i".into()),
+                    Value::Text("s".into()),
+                    Value::Int(0),
+                    Value::Int(0),
+                    Value::Int(0),
+                    Value::Array(Vec::new()),
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    Value::Text("array_recv".into()),
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                ]],
+            )),
+            "pg_range" => Some((
+                Self::virtual_columns(&[
+                    ("rngtypid", "OID"),
+                    ("rngsubtype", "OID"),
+                    ("rngmultitypid", "OID"),
+                    ("rngcollation", "OID"),
+                    ("rngsubopc", "OID"),
+                    ("rngcanonical", "REGPROC"),
+                    ("rngsubdiff", "REGPROC"),
+                ]),
+                Vec::new(),
+            )),
             "pg_settings" => Some(self.pg_settings_virtual_table()),
             "pg_roles" => Some(self.pg_roles_virtual_table()),
             "pg_user" => Some(self.pg_user_virtual_table()),
@@ -3085,65 +3278,98 @@ impl MemExecutor {
         ]);
         let pg_ns = Self::schema_oid(db_name, "pg_catalog");
         let type_specs = [
-            (16, "bool", 1, 0, 1000),
-            (17, "bytea", -1, 0, 1001),
-            (19, "name", 64, 0, 1003),
-            (20, "int8", 8, 0, 1016),
-            (21, "int2", 2, 0, 1005),
-            (23, "int4", 4, 0, 1007),
-            (25, "text", -1, 0, 1009),
-            (26, "oid", 4, 0, 1028),
-            (700, "float4", 4, 0, 1021),
-            (701, "float8", 8, 0, 1022),
-            (1042, "bpchar", -1, 0, 1014),
-            (1043, "varchar", -1, 0, 1015),
-            (1082, "date", 4, 0, 1182),
-            (1083, "time", 8, 0, 1183),
-            (1114, "timestamp", 8, 0, 1115),
-            (1184, "timestamptz", 8, 0, 1185),
-            (1700, "numeric", -1, 0, 1231),
-            (2206, "regtype", 4, 0, 2211),
-            (2950, "uuid", 16, 0, 2951),
-            (3802, "jsonb", -1, 0, 3807),
+            (16, "bool", 1, 1000, "_bool"),
+            (17, "bytea", -1, 1001, "_bytea"),
+            (19, "name", 64, 1003, "_name"),
+            (20, "int8", 8, 1016, "_int8"),
+            (21, "int2", 2, 1005, "_int2"),
+            (23, "int4", 4, 1007, "_int4"),
+            (25, "text", -1, 1009, "_text"),
+            (26, "oid", 4, 1028, "_oid"),
+            (700, "float4", 4, 1021, "_float4"),
+            (701, "float8", 8, 1022, "_float8"),
+            (1042, "bpchar", -1, 1014, "_bpchar"),
+            (1043, "varchar", -1, 1015, "_varchar"),
+            (1082, "date", 4, 1182, "_date"),
+            (1083, "time", 8, 1183, "_time"),
+            (1114, "timestamp", 8, 1115, "_timestamp"),
+            (1184, "timestamptz", 8, 1185, "_timestamptz"),
+            (1700, "numeric", -1, 1231, "_numeric"),
+            (2206, "regtype", 4, 2211, "_regtype"),
+            (2950, "uuid", 16, 2951, "_uuid"),
+            (3802, "jsonb", -1, 3807, "_jsonb"),
         ];
-        let rows = type_specs
-            .into_iter()
-            .map(|(oid, name, len, elem, array)| {
-                vec![
-                    Value::Int(oid),
-                    Value::Text(name.into()),
-                    Value::Int(pg_ns),
-                    Value::Int(10),
-                    Value::Int(len),
-                    Value::Bool(matches!(len, 1 | 2 | 4 | 8)),
-                    Value::Text("b".into()),
-                    Value::Text("U".into()),
-                    Value::Bool(false),
-                    Value::Bool(true),
-                    Value::Text(",".into()),
-                    Value::Int(0),
-                    Value::Int(elem),
-                    Value::Int(array),
-                    Value::Text("-".into()),
-                    Value::Text("-".into()),
-                    Value::Text("-".into()),
-                    Value::Text("-".into()),
-                    Value::Text("-".into()),
-                    Value::Text("-".into()),
-                    Value::Text("-".into()),
-                    Value::Text("i".into()),
-                    Value::Text("p".into()),
-                    Value::Bool(false),
-                    Value::Int(0),
-                    Value::Int(-1),
-                    Value::Int(0),
-                    Value::Int(100),
-                    Value::Null,
-                    Value::Null,
-                    Value::Null,
-                ]
-            })
-            .collect();
+        let mut rows = Vec::new();
+        for (oid, name, len, array, _) in type_specs {
+            rows.push(vec![
+                Value::Int(oid),
+                Value::Text(name.into()),
+                Value::Int(pg_ns),
+                Value::Int(10),
+                Value::Int(len),
+                Value::Bool(matches!(len, 1 | 2 | 4 | 8)),
+                Value::Text("b".into()),
+                Value::Text("U".into()),
+                Value::Bool(false),
+                Value::Bool(true),
+                Value::Text(",".into()),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Int(array),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Text("i".into()),
+                Value::Text("p".into()),
+                Value::Bool(false),
+                Value::Int(0),
+                Value::Int(-1),
+                Value::Int(0),
+                Value::Int(100),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+            ]);
+        }
+        for (elem_oid, _, _, array_oid, array_name) in type_specs {
+            rows.push(vec![
+                Value::Int(array_oid),
+                Value::Text(array_name.into()),
+                Value::Int(pg_ns),
+                Value::Int(10),
+                Value::Int(-1),
+                Value::Bool(false),
+                Value::Text("a".into()),
+                Value::Text("A".into()),
+                Value::Bool(false),
+                Value::Bool(true),
+                Value::Text(",".into()),
+                Value::Int(0),
+                Value::Int(elem_oid),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Int(750),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Text("i".into()),
+                Value::Text("x".into()),
+                Value::Bool(false),
+                Value::Int(0),
+                Value::Int(-1),
+                Value::Int(1),
+                Value::Int(100),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+            ]);
+        }
         (cols, rows)
     }
 
@@ -4414,6 +4640,13 @@ impl MemExecutor {
                     )
                 } else {
                     let (db_name, schema_name, table_only) = parse_object_name(&table_name)?;
+                    let schema_name = if schema_name.eq_ignore_ascii_case("public")
+                        && Self::is_pg_catalog_virtual_table_name(table_only)
+                    {
+                        "pg_catalog"
+                    } else {
+                        schema_name
+                    };
                     let (tbl_cols, col_names, rows) = if Self::is_virtual_schema(schema_name) {
                         let (cols, rows) =
                             self.get_virtual_table(db_name, schema_name, table_only)?;
@@ -4514,6 +4747,13 @@ impl MemExecutor {
                         )
                     } else {
                         let (j_db, j_sch, j_tbl_name) = parse_object_name(&join.table_name)?;
+                        let j_sch = if j_sch.eq_ignore_ascii_case("public")
+                            && Self::is_pg_catalog_virtual_table_name(j_tbl_name)
+                        {
+                            "pg_catalog"
+                        } else {
+                            j_sch
+                        };
                         if Self::is_virtual_schema(j_sch) {
                             let (cols, rows) = self.get_virtual_table(j_db, j_sch, j_tbl_name)?;
                             (cols, rows)
@@ -4684,7 +4924,8 @@ impl MemExecutor {
                                 }
                                 ProjectionItem::WindowFunction { .. }
                                 | ProjectionItem::ScalarFunction { .. }
-                                | ProjectionItem::JsonAccess { .. } => {
+                                | ProjectionItem::JsonAccess { .. }
+                                | ProjectionItem::CaseWhenEq { .. } => {
                                     out_row.push(Value::Null); // MVP fallback
                                 }
                                 ProjectionItem::Aggregate(op, inner) => {
@@ -4817,6 +5058,15 @@ impl MemExecutor {
                                 } => alias
                                     .clone()
                                     .unwrap_or_else(|| format!("{}{}{}", left, operator, right)),
+                                ProjectionItem::CaseWhenEq {
+                                    else_column, alias, ..
+                                } => alias.clone().unwrap_or_else(|| {
+                                    else_column
+                                        .split('.')
+                                        .last()
+                                        .unwrap_or(else_column)
+                                        .to_string()
+                                }),
                                 ProjectionItem::Aggregate(op, inner) => {
                                     format!("{:?}({})", op, inner)
                                 }
@@ -4853,6 +5103,15 @@ impl MemExecutor {
                                         alias,
                                     } => Some(alias.clone().unwrap_or_else(|| {
                                         format!("{}{}{}", left, operator, right)
+                                    })),
+                                    ProjectionItem::CaseWhenEq {
+                                        else_column, alias, ..
+                                    } => Some(alias.clone().unwrap_or_else(|| {
+                                        else_column
+                                            .split('.')
+                                            .last()
+                                            .unwrap_or(else_column)
+                                            .to_string()
                                     })),
                                     _ => None,
                                 })
@@ -5060,6 +5319,9 @@ impl MemExecutor {
                                     } => alias.clone().unwrap_or_else(|| {
                                         format!("{}{}{}", left, operator, right)
                                     }),
+                                    ProjectionItem::CaseWhenEq {
+                                        else_column, alias, ..
+                                    } => alias.clone().unwrap_or_else(|| else_column.clone()),
                                     _ => c.clone(),
                                 };
                                 col_names.iter().position(|tc| {
@@ -5088,6 +5350,50 @@ impl MemExecutor {
                                     .map(|(pi, proj)| match proj {
                                         ProjectionItem::Literal(v)
                                         | ProjectionItem::AliasedLiteral(v, _) => v.clone(),
+                                        ProjectionItem::CaseWhenEq {
+                                            left,
+                                            equals,
+                                            then_value,
+                                            then_column,
+                                            else_column,
+                                            ..
+                                        } => {
+                                            let left_idx = col_names.iter().position(|tc| {
+                                                tc == left || tc.ends_with(&format!(".{}", left))
+                                            });
+                                            let else_idx = col_names.iter().position(|tc| {
+                                                tc == else_column
+                                                    || tc.ends_with(&format!(".{}", else_column))
+                                            });
+                                            let left_value = left_idx
+                                                .and_then(|idx| r.get(idx))
+                                                .unwrap_or(&Value::Null);
+                                            if compare(left_value, equals)
+                                                == std::cmp::Ordering::Equal
+                                            {
+                                                if let Some(then_column) = then_column {
+                                                    col_names
+                                                        .iter()
+                                                        .position(|tc| {
+                                                            tc == then_column
+                                                                || tc.ends_with(&format!(
+                                                                    ".{}",
+                                                                    then_column
+                                                                ))
+                                                        })
+                                                        .and_then(|idx| r.get(idx))
+                                                        .cloned()
+                                                        .unwrap_or(Value::Null)
+                                                } else {
+                                                    then_value.clone()
+                                                }
+                                            } else {
+                                                else_idx
+                                                    .and_then(|idx| r.get(idx))
+                                                    .cloned()
+                                                    .unwrap_or(Value::Null)
+                                            }
+                                        }
                                         _ => indices[pi]
                                             .and_then(|idx| r.get(idx))
                                             .cloned()
@@ -5667,7 +5973,7 @@ impl MemExecutor {
                     self.txn.abort_txn(txn.txn_id)?;
                     self.kv.abort(txn.txn_id)?;
                 }
-                Ok(QueryOutput::tag("ROLLBACK"))
+                Ok(QueryOutput::tag("SAVEPOINT"))
             }
             LogicalPlan::Savepoint { name } => {
                 let mut guard = self.active_txns.write().unwrap();
@@ -5758,6 +6064,7 @@ impl MemExecutor {
                 // Acknowledging SET requests to support clients like JDBC
                 Ok(QueryOutput::tag("SET"))
             }
+            LogicalPlan::Noop { tag } => Ok(QueryOutput::tag(&tag)),
             LogicalPlan::SelectLiteral { values } => {
                 let mut columns = Vec::new();
                 let mut types = Vec::new();

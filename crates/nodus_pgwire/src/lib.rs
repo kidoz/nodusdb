@@ -255,7 +255,8 @@ fn apply_command_tag_to_tx_status<C: ClientInfo>(client: &mut C, tag: &str) {
     let command = tag.split_whitespace().next().unwrap_or(tag);
     if command.eq_ignore_ascii_case("BEGIN") {
         set_tx_status(client, TransactionStatus::Transaction);
-    } else if command.eq_ignore_ascii_case("COMMIT") || command.eq_ignore_ascii_case("ROLLBACK") {
+    } else if command.eq_ignore_ascii_case("COMMIT") || tag.trim().eq_ignore_ascii_case("ROLLBACK")
+    {
         set_tx_status(client, TransactionStatus::Idle);
     }
 }
@@ -310,6 +311,11 @@ fn statement_would_timeout<C: ClientInfo>(client: &C, query: &str) -> bool {
         (Some(timeout_ms), Some(sleep_ms)) => sleep_ms >= timeout_ms,
         _ => false,
     }
+}
+
+fn is_set_default_statement(query: &str) -> bool {
+    let q = query.trim().to_ascii_uppercase();
+    q.starts_with("SET ") && q.contains(" DEFAULT")
 }
 
 fn described_statement_key(statement: &str) -> String {
@@ -388,6 +394,39 @@ fn is_copy_from_stdin(query: &str) -> bool {
 fn is_copy_to_stdout(query: &str) -> bool {
     let q = query.trim().to_ascii_uppercase();
     q.starts_with("COPY ") && q.contains(" TO STDOUT")
+}
+
+fn copy_format_code(query: &str) -> i8 {
+    let q = query.trim().to_ascii_uppercase();
+    if q.contains("FORMAT BINARY") || q.contains("WITH BINARY") {
+        1
+    } else {
+        0
+    }
+}
+
+fn copy_column_count(query: &str) -> i16 {
+    let upper = query.to_ascii_uppercase();
+    let boundary = upper
+        .find(" FROM STDIN")
+        .or_else(|| upper.find(" TO STDOUT"))
+        .unwrap_or(query.len());
+    let head = &query[..boundary];
+    let Some(open) = head.find('(') else {
+        return 0;
+    };
+    let Some(close) = head.rfind(')') else {
+        return 0;
+    };
+    if close <= open {
+        return 0;
+    }
+    head[open + 1..close]
+        .split(',')
+        .filter(|part| !part.trim().is_empty())
+        .count()
+        .try_into()
+        .unwrap_or(i16::MAX)
 }
 
 fn type_size(ty: &Type) -> i16 {
@@ -1254,7 +1293,14 @@ impl SimpleQueryHandler for NodusQueryHandler {
             ]);
             client
                 .send(PgWireBackendMessage::CopyInResponse(
-                    pgwire::messages::copy::CopyInResponse::new(0, 0, vec![]),
+                    pgwire::messages::copy::CopyInResponse::new(
+                        copy_format_code(&query_string),
+                        copy_column_count(&query_string),
+                        vec![
+                            copy_format_code(&query_string) as i16;
+                            copy_column_count(&query_string) as usize
+                        ],
+                    ),
                 ))
                 .await?;
             client.flush().await?;
@@ -1266,7 +1312,14 @@ impl SimpleQueryHandler for NodusQueryHandler {
             self.registry.finish_current_query(&session_id);
             client
                 .send(PgWireBackendMessage::CopyOutResponse(
-                    pgwire::messages::copy::CopyOutResponse::new(0, 0, vec![]),
+                    pgwire::messages::copy::CopyOutResponse::new(
+                        copy_format_code(&query_string),
+                        copy_column_count(&query_string),
+                        vec![
+                            copy_format_code(&query_string) as i16;
+                            copy_column_count(&query_string) as usize
+                        ],
+                    ),
                 ))
                 .await?;
             client
@@ -1419,11 +1472,15 @@ impl SimpleQueryHandler for NodusQueryHandler {
                 "canceling statement due to statement timeout",
             ));
         }
+        if is_set_default_statement(query_str) {
+            return Ok(vec![Response::Execution(Tag::new("SET"))]);
+        }
 
-        // Parse SQL and translate to a logical plan. We now return actual errors
-        // instead of silently succeeding, so unsupported queries fail fast.
-        let stmt = match nodus_sql::parse_sql(query_str) {
-            Ok(mut stmts) if !stmts.is_empty() => stmts.remove(0),
+        // Parse SQL and translate every statement in a simple-query batch.
+        // Drivers such as Npgsql issue startup metadata batches and expect one
+        // protocol result for each statement before ReadyForQuery.
+        let statements = match nodus_sql::parse_sql(query_str) {
+            Ok(stmts) if !stmts.is_empty() => stmts,
             Ok(_) => return Ok(vec![Response::Execution(Tag::new("OK"))]),
             Err(e) => {
                 error!("Failed to parse SQL: {}", e);
@@ -1436,57 +1493,67 @@ impl SimpleQueryHandler for NodusQueryHandler {
                 return Err(PgWireError::UserError(Box::new(err)));
             }
         };
-        let plan = match nodus_executor::plan_statement(&stmt, &[]) {
-            Ok(plan) => plan,
-            Err(e) => {
-                error!("Failed to plan SQL: {}", e);
+
+        let mut responses = Vec::new();
+        for stmt in statements {
+            let plan = match nodus_executor::plan_statement(&stmt, &[]) {
+                Ok(plan) => plan,
+                Err(e) => {
+                    error!("Failed to plan SQL: {}", e);
+                    self.metrics.query_errors_total.inc();
+                    let err = ErrorInfo::new(
+                        "ERROR".to_owned(),
+                        "0A000".to_owned(),
+                        format!("Unsupported feature: {}", e),
+                    );
+                    return Err(PgWireError::UserError(Box::new(err)));
+                }
+            };
+
+            let out = match self.executor.execute_logical(&ctx, plan) {
+                Ok(out) => out,
+                Err(e) => {
+                    let err_str = e.to_string();
+                    let code = sqlstate_for_execution_error(&err_str);
+                    let err = ErrorInfo::new("ERROR".to_owned(), code.to_owned(), err_str);
+                    mark_error_status(client);
+                    return Err(PgWireError::UserError(Box::new(err)));
+                }
+            };
+
+            if self.registry.is_query_cancelled(&session_id) {
                 self.metrics.query_errors_total.inc();
-                let err = ErrorInfo::new(
-                    "ERROR".to_owned(),
-                    "0A000".to_owned(),
-                    format!("Unsupported feature: {}", e),
-                );
-                return Err(PgWireError::UserError(Box::new(err)));
-            }
-        };
-
-        let out = match self.executor.execute_logical(&ctx, plan) {
-            Ok(out) => out,
-            Err(e) => {
-                let err_str = e.to_string();
-                let code = sqlstate_for_execution_error(&err_str);
-                let err = ErrorInfo::new("ERROR".to_owned(), code.to_owned(), err_str);
                 mark_error_status(client);
-                return Err(PgWireError::UserError(Box::new(err)));
+                return Err(user_error(
+                    "ERROR",
+                    "57014",
+                    "canceling statement due to user request",
+                ));
             }
-        };
 
-        if self.registry.is_query_cancelled(&session_id) {
-            self.metrics.query_errors_total.inc();
-            mark_error_status(client);
-            return Err(user_error(
-                "ERROR",
-                "57014",
-                "canceling statement due to user request",
-            ));
-        }
+            // No projected columns => a command tag (CREATE TABLE, INSERT, BEGIN...).
+            if out.columns.is_empty() {
+                apply_command_tag_to_tx_status(client, &out.tag);
+                let tag = command_tag_from_output_tag(&out.tag);
+                responses.push(Response::Execution(tag));
+                continue;
+            }
 
-        // No projected columns => a command tag (CREATE TABLE, INSERT, BEGIN…).
-        if out.columns.is_empty() {
-            apply_command_tag_to_tx_status(client, &out.tag);
-            let tag = command_tag_from_output_tag(&out.tag);
-            return Ok(vec![Response::Execution(tag)]);
+            // Otherwise a row set: build field descriptors and encode each row.
+            let field_info =
+                field_info_for_output(&out.columns, &out.types, |_, _| FieldFormat::Text);
+            let mut data_rows = Vec::new();
+            for row in &out.rows {
+                data_rows.push(
+                    encode_row(&row.values, field_info.clone()).map_err(PgWireError::IoError),
+                );
+            }
+            responses.push(Response::Query(QueryResponse::new(
+                field_info,
+                stream::iter(data_rows),
+            )));
         }
-
-        // Otherwise a row set: build field descriptors and encode each row.
-        let field_info = field_info_for_output(&out.columns, &out.types, |_, _| FieldFormat::Text);
-        let mut data_rows = Vec::new();
-        for row in &out.rows {
-            data_rows
-                .push(encode_row(&row.values, field_info.clone()).map_err(PgWireError::IoError));
-        }
-        let response = QueryResponse::new(field_info, stream::iter(data_rows));
-        Ok(vec![Response::Query(response)])
+        Ok(responses)
     }
 }
 
@@ -1682,7 +1749,14 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
             ]);
             client
                 .send(PgWireBackendMessage::CopyInResponse(
-                    pgwire::messages::copy::CopyInResponse::new(0, 0, vec![]),
+                    pgwire::messages::copy::CopyInResponse::new(
+                        copy_format_code(&portal.statement.statement),
+                        copy_column_count(&portal.statement.statement),
+                        vec![
+                            copy_format_code(&portal.statement.statement) as i16;
+                            copy_column_count(&portal.statement.statement) as usize
+                        ],
+                    ),
                 ))
                 .await?;
             client.flush().await?;
@@ -1696,7 +1770,14 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
             self.registry.finish_current_query(&session_id);
             client
                 .send(PgWireBackendMessage::CopyOutResponse(
-                    pgwire::messages::copy::CopyOutResponse::new(0, 0, vec![]),
+                    pgwire::messages::copy::CopyOutResponse::new(
+                        copy_format_code(&portal.statement.statement),
+                        copy_column_count(&portal.statement.statement),
+                        vec![
+                            copy_format_code(&portal.statement.statement) as i16;
+                            copy_column_count(&portal.statement.statement) as usize
+                        ],
+                    ),
                 ))
                 .await?;
             client
@@ -2213,6 +2294,9 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
                 "57014",
                 "canceling statement due to statement timeout",
             ));
+        }
+        if is_set_default_statement(query_str) {
+            return Ok(Response::Execution(Tag::new("SET")));
         }
 
         let stmt = match nodus_sql::parse_sql(query_str) {
