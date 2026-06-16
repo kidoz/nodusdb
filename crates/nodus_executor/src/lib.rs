@@ -365,6 +365,10 @@ pub enum LogicalPlan {
     SelectLiteral {
         values: Vec<(String, crate::Value)>,
     },
+    UnionAll {
+        left: Box<LogicalPlan>,
+        right: Box<LogicalPlan>,
+    },
 }
 
 /// Result of executing a statement: a tag for non-row commands, and column
@@ -1154,6 +1158,38 @@ fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Result<Logical
             let cte_plan = plan_query(&cte.query, params)?;
             ctes.push((cte_name, Box::new(cte_plan)));
         }
+    }
+
+    if let SetExpr::SetOperation { op, set_quantifier, left, right } = &*query.body {
+        if *op == SetOperator::Union && *set_quantifier == SetQuantifier::All {
+            let left_plan = plan_query(&Query {
+                with: None,
+                body: left.clone(),
+                order_by: vec![],
+                limit: None,
+                limit_by: vec![],
+                offset: None,
+                fetch: None,
+                locks: vec![],
+                for_clause: None,
+            }, params)?;
+            let right_plan = plan_query(&Query {
+                with: None,
+                body: right.clone(),
+                order_by: vec![],
+                limit: None,
+                limit_by: vec![],
+                offset: None,
+                fetch: None,
+                locks: vec![],
+                for_clause: None,
+            }, params)?;
+            return Ok(LogicalPlan::UnionAll {
+                left: Box::new(left_plan),
+                right: Box::new(right_plan),
+            });
+        }
+        anyhow::bail!("Unsupported set operation");
     }
 
     let SetExpr::Select(select) = &*query.body else {
@@ -2426,7 +2462,7 @@ impl Executor for MemExecutor {
         );
         let is_read_only = matches!(
             plan,
-            LogicalPlan::Select { .. } | LogicalPlan::SelectLiteral { .. }
+            LogicalPlan::Select { .. } | LogicalPlan::SelectLiteral { .. } | LogicalPlan::UnionAll { .. }
         );
         let mut implicit_txn = None;
 
@@ -6102,6 +6138,13 @@ impl MemExecutor {
                     rows: vec![Row { values: row_values }],
                     tag: "SELECT 1".into(),
                 })
+            }
+            LogicalPlan::UnionAll { left, right } => {
+                let mut left_out = self.execute_logical_inner(ctx, *left)?;
+                let right_out = self.execute_logical_inner(ctx, *right)?;
+                // Assume columns match in count.
+                left_out.rows.extend(right_out.rows);
+                Ok(left_out)
             }
         }
     }
