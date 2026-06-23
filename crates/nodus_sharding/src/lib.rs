@@ -217,6 +217,12 @@ impl ShardOrchestrator {
         self.placements.read().unwrap().get(&shard_id).cloned()
     }
 
+    /// A snapshot of all shard placements (`ShardId -> node id`), for the group
+    /// reconciler to decide which shards this node must host.
+    pub fn placements(&self) -> HashMap<ShardId, String> {
+        self.placements.read().unwrap().clone()
+    }
+
     /// Evenly distributes a table's shards across `nodes` (round-robin by start
     /// key) and records the resulting placements.
     pub fn rebalance(&self, table_id: TableId, nodes: &[String]) -> Result<()> {

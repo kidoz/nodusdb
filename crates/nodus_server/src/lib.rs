@@ -14,6 +14,7 @@ use nodus_catalog::{
     ResourceRef,
 };
 use nodus_config::NodusConfig;
+use nodus_meta::MetaStore;
 use nodus_monitoring::{AppState, monitoring_routes};
 use nodus_security::{PasswordAuthenticator, SessionRegistry};
 use std::net::SocketAddr;
@@ -229,6 +230,7 @@ pub async fn run_server_with_config(
     // groups are created on demand (routing lands in Phase 2).
     let multi_raft = Arc::new(crate::multi_raft::MultiRaftManager::new(
         config.cluster.node_id,
+        config.cluster.raft_advertise_addr.clone(),
         raft_config,
         raft_state.clone(),
         local_kv.clone(),
@@ -257,7 +259,9 @@ pub async fn run_server_with_config(
 
     // Cluster metadata + shard routing. Shared by the KV write/read path (to
     // route keys to their owning group) and the shard admin orchestrator.
-    let meta = Arc::new(nodus_meta::MemMetaStore::new());
+    // KV-backed so shard maps and placements survive a restart (durable when the
+    // local store is persistent); reads/writes go to the meta group's engine.
+    let meta = Arc::new(nodus_meta::PersistentMetaStore::new(local_kv.clone()));
     let shard_router: Arc<dyn nodus_sharding::ShardRouter> =
         Arc::new(nodus_sharding::CatalogShardRouter::new(meta.clone()));
 
@@ -293,6 +297,8 @@ pub async fn run_server_with_config(
     let _executor_clone = executor.clone();
     let state_clone = state.clone();
     let recover_kv = raft_kv.clone();
+    let reconcile_meta = meta.clone();
+    let reconcile_manager = multi_raft.clone();
     tokio::spawn(async move {
         if join_peers.is_empty() {
             tracing::debug!("Background initializing raft cluster as singleton");
@@ -338,6 +344,20 @@ pub async fn run_server_with_config(
                 Ok(Ok(_)) => {}
                 Ok(Err(e)) => tracing::warn!("2PC recovery failed: {e}"),
                 Err(e) => tracing::warn!("2PC recovery task panicked: {e}"),
+            }
+
+            // Re-host data-shard groups assigned to this node. Placement is
+            // durable (see `PersistentMetaStore`), so after a restart this
+            // restores exactly the shards this node owned.
+            match reconcile_meta.get_shard_placements() {
+                Ok(placements) => match reconcile_manager.reconcile(&placements).await {
+                    Ok(n) if n > 0 => {
+                        tracing::info!("Reconciled {n} data-shard group(s) for this node")
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!("shard reconcile failed: {e}"),
+                },
+                Err(e) => tracing::warn!("could not load shard placements: {e}"),
             }
 
             state_clone
@@ -559,6 +579,7 @@ pub async fn run_server_with_config(
         backup,
         upgrade: raft_upgrade_coordinator,
         shards,
+        manager: multi_raft.clone(),
         slow_log: slow_log.clone(),
         kv: executor.kv(),
         wal_key: encryption_key,

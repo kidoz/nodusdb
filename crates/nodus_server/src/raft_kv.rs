@@ -387,7 +387,7 @@ mod tests {
         // Manager over a shared base store; meta group + the data group, both led.
         let base: Arc<dyn KvEngine> = Arc::new(nodus_storage_mem::MemKvEngine::new());
         let config = Arc::new(openraft::Config::default().validate().unwrap());
-        let manager = Arc::new(MultiRaftManager::new(1, config, RaftState::new(), base.clone()));
+        let manager = Arc::new(MultiRaftManager::new(1, "127.0.0.1:0".into(), config, RaftState::new(), base.clone()));
 
         let catalog = Arc::new(nodus_catalog::MemoryCatalog::new());
         let upgrade = Arc::new(nodus_upgrade::DefaultUpgradeCoordinator::new(
@@ -477,7 +477,7 @@ mod tests {
 
         let base: Arc<dyn KvEngine> = Arc::new(nodus_storage_mem::MemKvEngine::new());
         let config = Arc::new(openraft::Config::default().validate().unwrap());
-        let manager = Arc::new(MultiRaftManager::new(1, config, RaftState::new(), base.clone()));
+        let manager = Arc::new(MultiRaftManager::new(1, "127.0.0.1:0".into(), config, RaftState::new(), base.clone()));
 
         let catalog = Arc::new(nodus_catalog::MemoryCatalog::new());
         let upgrade = Arc::new(nodus_upgrade::DefaultUpgradeCoordinator::new(

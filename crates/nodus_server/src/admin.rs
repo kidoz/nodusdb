@@ -39,6 +39,9 @@ pub struct AdminState {
     pub backup: Arc<BackupOrchestrator>,
     pub upgrade: Arc<dyn nodus_upgrade::UpgradeCoordinator>,
     pub shards: Arc<ShardOrchestrator>,
+    /// Hosts this node's Raft groups; reconciled after placement changes so a
+    /// newly placed shard is activated without waiting for a restart.
+    pub manager: Arc<crate::multi_raft::MultiRaftManager>,
     pub slow_log: Arc<SlowQueryLog>,
     pub kv: Arc<dyn nodus_storage_api::KvEngine>,
     pub wal_key: Option<[u8; 32]>,
@@ -770,8 +773,19 @@ async fn shards_split(
         None => return Json(json!({ "error": "missing or invalid key (expected 0-255)" })),
     };
     match state.shards.split(table_id, shard_id, split_key) {
-        Ok((l, r)) => Json(json!({ "left": l.to_string(), "right": r.to_string() })),
+        Ok((l, r)) => {
+            reconcile_shards(&state).await;
+            Json(json!({ "left": l.to_string(), "right": r.to_string() }))
+        }
         Err(e) => Json(json!({ "error": e.to_string() })),
+    }
+}
+
+/// Brings hosted Raft groups in line with current placements after an admin
+/// operation changed them, so a newly placed shard activates without a restart.
+async fn reconcile_shards(state: &AdminState) {
+    if let Err(e) = state.manager.reconcile(&state.shards.placements()).await {
+        tracing::warn!("post-admin shard reconcile failed: {e}");
     }
 }
 
@@ -788,7 +802,10 @@ async fn shards_rebalance(
         .map(|s| s.split(',').map(|n| n.trim().to_string()).collect())
         .unwrap_or_default();
     match state.shards.rebalance(table_id, &nodes) {
-        Ok(()) => Json(json!({ "rebalanced": true, "nodes": nodes })),
+        Ok(()) => {
+            reconcile_shards(&state).await;
+            Json(json!({ "rebalanced": true, "nodes": nodes }))
+        }
         Err(e) => Json(json!({ "error": e.to_string() })),
     }
 }

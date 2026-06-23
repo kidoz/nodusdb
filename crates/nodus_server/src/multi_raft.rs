@@ -6,12 +6,13 @@
 //! independent per-shard groups, each with an isolated KV namespace (so a
 //! group's snapshot only contains its own keys). Routing user writes to data
 //! groups (deciding which group owns a key) is Phase 2; placement-driven group
-//! lifecycle is Phase 5.
+//! lifecycle ([`MultiRaftManager::reconcile`]) is Phase 5.
 
 use anyhow::Result;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
+use nodus_catalog::ShardId;
 use nodus_raftstore::NodusRaftStore;
 use nodus_raftstore::network::NodusNetworkFactory;
 use nodus_raftstore::server::{NodusRaft, RaftState};
@@ -24,6 +25,9 @@ pub const META_SHARD: &str = "shard-meta";
 /// groups on demand. Cheap to clone is not required; it is held behind an `Arc`.
 pub struct MultiRaftManager {
     node_id: u64,
+    /// This node's Raft advertise address, used when single-node-initializing a
+    /// freshly created data group.
+    advertise_addr: String,
     config: Arc<openraft::Config>,
     state: RaftState,
     /// The node's local KV store; data groups receive namespaced views of it.
@@ -37,12 +41,14 @@ pub struct MultiRaftManager {
 impl MultiRaftManager {
     pub fn new(
         node_id: u64,
+        advertise_addr: String,
         config: Arc<openraft::Config>,
         state: RaftState,
         base_kv: Arc<dyn KvEngine>,
     ) -> Self {
         Self {
             node_id,
+            advertise_addr,
             config,
             state,
             base_kv,
@@ -77,9 +83,7 @@ impl MultiRaftManager {
 
     /// Returns the data group for `shard_id`, creating it (backed by a
     /// namespaced view of the node's store) if absent. The new group is inert
-    /// until its membership is initialized by the caller. Wired into the write
-    /// path by Phase 2 (routing); covered by tests until then.
-    #[allow(dead_code)]
+    /// until its membership is initialized by the caller.
     pub async fn get_or_create_data(&self, shard_id: &str) -> Result<NodusRaft> {
         if let Some(existing) = self.get(shard_id).await {
             return Ok(existing);
@@ -117,8 +121,40 @@ impl MultiRaftManager {
     /// Group id convention for the data shard identified by `shard_id`. Also the
     /// KV namespace prefix, so the routing read/write path and the group's own
     /// state-machine engine agree on where a key lives.
-    pub fn data_group_id(shard_id: nodus_catalog::ShardId) -> String {
+    pub fn data_group_id(shard_id: ShardId) -> String {
         format!("shard-{shard_id}")
+    }
+
+    /// Brings this node's hosted groups into line with `placements`
+    /// (`ShardId -> node id`): every shard placed on this node gets a data group,
+    /// created and single-node-initialized if missing. Idempotent — already-hosted
+    /// shards are skipped. Returns the number newly created.
+    ///
+    /// Called at startup (to re-host assigned shards after a restart) and after
+    /// placement-changing admin operations. Tear-down of groups no longer placed
+    /// here is deferred to data movement (Phase 6); a placement string matches a
+    /// node by its `cluster.node_id` rendered as text.
+    pub async fn reconcile(&self, placements: &HashMap<ShardId, String>) -> Result<usize> {
+        let mine = self.node_id.to_string();
+        let mut created = 0;
+        for (shard_id, node) in placements {
+            if *node != mine {
+                continue;
+            }
+            let group_id = Self::data_group_id(*shard_id);
+            if self.hosts(&group_id) {
+                continue;
+            }
+            let raft = self.get_or_create_data(&group_id).await?;
+            // Single-node bootstrap so the group can immediately accept writes,
+            // mirroring how the meta group is initialized. Multi-replica shard
+            // membership lands with data movement (Phase 6).
+            let mut members = BTreeMap::new();
+            members.insert(self.node_id, openraft::BasicNode::new(&self.advertise_addr));
+            let _ = raft.initialize(members).await;
+            created += 1;
+        }
+        Ok(created)
     }
 }
 
@@ -132,7 +168,7 @@ mod tests {
     fn manager() -> MultiRaftManager {
         let config = Arc::new(openraft::Config::default().validate().unwrap());
         let base_kv: Arc<dyn KvEngine> = Arc::new(nodus_storage_mem::MemKvEngine::new());
-        MultiRaftManager::new(1, config, RaftState::new(), base_kv)
+        MultiRaftManager::new(1, "127.0.0.1:0".into(), config, RaftState::new(), base_kv)
     }
 
     async fn elect_single_node(raft: &NodusRaft) -> bool {
@@ -180,6 +216,61 @@ mod tests {
         // Each group elects a leader independently of the other.
         assert!(elect_single_node(&meta).await, "meta group should elect");
         assert!(elect_single_node(&data).await, "data group should elect");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconcile_hosts_shards_placed_on_this_node() {
+        let mgr = manager(); // node_id = 1
+        let mine = ShardId::new();
+        let other = ShardId::new();
+        let mut placements = HashMap::new();
+        placements.insert(mine, "1".to_string()); // placed on this node
+        placements.insert(other, "2".to_string()); // placed elsewhere
+
+        let created = mgr.reconcile(&placements).await.unwrap();
+        assert_eq!(created, 1, "only the shard placed here is created");
+        assert!(mgr.hosts(&MultiRaftManager::data_group_id(mine)));
+        assert!(!mgr.hosts(&MultiRaftManager::data_group_id(other)));
+
+        // Idempotent: a second reconcile creates nothing new.
+        assert_eq!(mgr.reconcile(&placements).await.unwrap(), 0);
+
+        // The hosted group is led and ready to accept writes.
+        let raft = mgr
+            .get(&MultiRaftManager::data_group_id(mine))
+            .await
+            .unwrap();
+        let mut led = false;
+        for _ in 0..30 {
+            if raft.metrics().borrow().current_leader == Some(1) {
+                led = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(led, "reconciled shard group should elect a leader");
+    }
+
+    #[test]
+    fn placements_and_shard_maps_survive_reopening_a_persistent_store() {
+        let kv: Arc<dyn KvEngine> = Arc::new(nodus_storage_mem::MemKvEngine::new());
+        let table = nodus_catalog::TableId(uuid::Uuid::new_v4());
+
+        // Write shard map + placement through one store/orchestrator.
+        let shard_id = {
+            let meta = Arc::new(nodus_meta::PersistentMetaStore::new(kv.clone()));
+            let orch = nodus_sharding::ShardOrchestrator::new(meta);
+            let sid = orch.init_single_shard(table).unwrap();
+            orch.move_shard(sid, "1").unwrap();
+            sid
+        };
+
+        // Reopen against the same backing KV (a restart on a persistent store):
+        // the orchestrator reloads placements, and the shard map is still there.
+        let meta = Arc::new(nodus_meta::PersistentMetaStore::new(kv));
+        let orch = nodus_sharding::ShardOrchestrator::new(meta);
+        assert_eq!(orch.placement(shard_id), Some("1".to_string()));
+        assert!(orch.shard_map(table).is_ok());
     }
 
     #[test]
