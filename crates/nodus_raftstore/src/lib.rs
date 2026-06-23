@@ -50,6 +50,14 @@ pub enum ShardCommand {
         #[serde(default)]
         shard_id: Option<String>,
     },
+    /// Two-phase-commit prepare vote for a cross-shard transaction. The intents
+    /// were already durably replicated by their `PutIntent`s; applying this
+    /// confirms the participant's leader is current and ready to commit.
+    PrepareTxn {
+        txn_id: String,
+        #[serde(default)]
+        shard_id: Option<String>,
+    },
     IndexPutIntent {
         txn_id: String,
         index_id: String,
@@ -419,6 +427,12 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
                                 if let Ok(tid) = uuid::Uuid::from_str(txn_id) {
                                     let _ = kv.abort(TxnId(tid));
                                 }
+                            }
+                            ShardCommand::PrepareTxn { txn_id, .. } => {
+                                // Durably acknowledged by virtue of being applied;
+                                // the actual intents are already present. No state
+                                // change — the decision is recorded by the coordinator.
+                                tracing::debug!("Raft prepared txn {txn_id} for commit");
                             }
                             ShardCommand::IndexPutIntent {
                                 txn_id, key, value, ..

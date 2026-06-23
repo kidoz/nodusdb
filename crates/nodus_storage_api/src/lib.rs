@@ -111,6 +111,18 @@ impl NamespacedKvEngine {
         out.extend_from_slice(key);
         Bytes::from(out)
     }
+
+    /// Derives a per-namespace transaction id. `commit`/`abort` on the shared
+    /// inner engine are keyed by transaction id and would otherwise finalize a
+    /// transaction's intents across *every* namespace at once; mapping the id
+    /// deterministically per namespace keeps each shard's commit independent
+    /// (essential for cross-shard 2PC, where one shard may commit before
+    /// another). The mapping is deterministic so writes and their later
+    /// commit/abort agree.
+    fn namespaced_txn(&self, txn_id: TxnId) -> TxnId {
+        let ns = Uuid::new_v5(&Uuid::NAMESPACE_OID, &self.prefix);
+        TxnId(Uuid::new_v5(&ns, txn_id.0.as_bytes()))
+    }
 }
 
 impl KvEngine for NamespacedKvEngine {
@@ -146,11 +158,12 @@ impl KvEngine for NamespacedKvEngine {
 
     fn write_intent(&self, txn_id: TxnId, key: Bytes, value: Bytes) -> Result<()> {
         self.inner
-            .write_intent(txn_id, self.physical_key(&key), value)
+            .write_intent(self.namespaced_txn(txn_id), self.physical_key(&key), value)
     }
 
     fn delete_intent(&self, txn_id: TxnId, key: Bytes) -> Result<()> {
-        self.inner.delete_intent(txn_id, self.physical_key(&key))
+        self.inner
+            .delete_intent(self.namespaced_txn(txn_id), self.physical_key(&key))
     }
 
     fn replace_intent(
@@ -160,15 +173,15 @@ impl KvEngine for NamespacedKvEngine {
         replacement: IntentReplacement,
     ) -> Result<()> {
         self.inner
-            .replace_intent(txn_id, self.physical_key(&key), replacement)
+            .replace_intent(self.namespaced_txn(txn_id), self.physical_key(&key), replacement)
     }
 
     fn commit(&self, txn_id: TxnId, commit_ts: Timestamp) -> Result<()> {
-        self.inner.commit(txn_id, commit_ts)
+        self.inner.commit(self.namespaced_txn(txn_id), commit_ts)
     }
 
     fn abort(&self, txn_id: TxnId) -> Result<()> {
-        self.inner.abort(txn_id)
+        self.inner.abort(self.namespaced_txn(txn_id))
     }
 
     fn garbage_collect(&self, watermark: Timestamp) -> Result<usize> {

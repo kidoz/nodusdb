@@ -284,7 +284,7 @@ pub async fn run_server_with_config(
         raft_catalog_writer.clone(),
         authz.clone(),
         audit_sink,
-        raft_kv,
+        raft_kv.clone(),
         txn,
     ));
 
@@ -292,6 +292,7 @@ pub async fn run_server_with_config(
 
     let _executor_clone = executor.clone();
     let state_clone = state.clone();
+    let recover_kv = raft_kv.clone();
     tokio::spawn(async move {
         if join_peers.is_empty() {
             tracing::debug!("Background initializing raft cluster as singleton");
@@ -327,6 +328,18 @@ pub async fn run_server_with_config(
                     }
                 }
             }
+
+            // Re-drive any cross-shard commit that was decided but not fully
+            // applied before a restart. Runs on a blocking thread (it submits
+            // through the Raft router) now that this node leads the meta group.
+            let recover_kv = recover_kv.clone();
+            match tokio::task::spawn_blocking(move || recover_kv.recover_pending_txns()).await {
+                Ok(Ok(n)) if n > 0 => tracing::info!("Recovered {n} pending cross-shard commit(s)"),
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => tracing::warn!("2PC recovery failed: {e}"),
+                Err(e) => tracing::warn!("2PC recovery task panicked: {e}"),
+            }
+
             state_clone
                 .is_ready
                 .store(true, std::sync::atomic::Ordering::Release);
