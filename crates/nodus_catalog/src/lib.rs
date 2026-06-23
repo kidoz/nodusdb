@@ -505,6 +505,18 @@ pub trait CatalogWriter: Send + Sync {
 use std::collections::HashMap;
 use std::sync::RwLock;
 
+/// Durable backing for the catalog's serialized state. Defined here (rather than
+/// using a `KvEngine` directly) so `nodus_catalog` stays free of a storage
+/// dependency — `nodus_storage_api` already depends on this crate. The server
+/// implements it over the same LSM store the KV data lives in, so the catalog
+/// and user data share one durable mechanism and one recovery path.
+pub trait CatalogStore: Send + Sync {
+    /// Returns the most recently saved catalog state, if any.
+    fn load(&self) -> Option<Vec<u8>>;
+    /// Durably persists the catalog state.
+    fn save(&self, bytes: &[u8]) -> Result<()>;
+}
+
 #[allow(dead_code)]
 pub struct MemoryCatalog {
     databases: RwLock<HashMap<String, DatabaseDescriptor>>,
@@ -516,7 +528,8 @@ pub struct MemoryCatalog {
     /// (role_principal_id, member_id) edges of the role-membership graph.
     memberships: RwLock<Vec<(PrincipalId, PrincipalId)>>,
     catalog_version: RwLock<u64>,
-    path: Option<std::path::PathBuf>,
+    /// Durable backing store; `None` for a purely in-memory catalog.
+    store: Option<std::sync::Arc<dyn CatalogStore>>,
 }
 
 impl Default for MemoryCatalog {
@@ -538,73 +551,61 @@ struct MemoryCatalogState {
 }
 
 impl MemoryCatalog {
-    pub fn load_from_disk(path: std::path::PathBuf) -> Result<Self> {
-        if path.exists() {
-            let data = std::fs::read_to_string(&path)?;
-            let state: MemoryCatalogState = serde_json::from_str(&data)?;
-            let schemas_map = state.schemas.into_iter().collect();
-            let tables_map = state.tables.into_iter().collect();
-            Ok(Self {
+    /// Builds a catalog backed by `store`, loading any previously persisted
+    /// state from it. All subsequent mutations are persisted through the same
+    /// store, so the catalog shares the KV layer's durability and recovery.
+    pub fn with_store(store: std::sync::Arc<dyn CatalogStore>) -> Self {
+        if let Some(bytes) = store.load()
+            && let Ok(state) = serde_json::from_slice::<MemoryCatalogState>(&bytes)
+        {
+            return Self {
                 databases: RwLock::new(state.databases),
-                schemas: RwLock::new(schemas_map),
-                tables: RwLock::new(tables_map),
+                schemas: RwLock::new(state.schemas.into_iter().collect()),
+                tables: RwLock::new(state.tables.into_iter().collect()),
                 principals: RwLock::new(state.principals),
                 grants: RwLock::new(state.grants),
                 roles: RwLock::new(state.roles),
                 memberships: RwLock::new(state.memberships),
                 catalog_version: RwLock::new(state.catalog_version),
-                path: Some(path),
-            })
-        } else {
-            let mut cat = Self::new();
-            cat.path = Some(path);
-            Ok(cat)
+                store: Some(store),
+            };
         }
+        let mut cat = Self::new();
+        cat.store = Some(store);
+        cat
     }
 
+    /// Persists the full catalog state through the backing [`CatalogStore`]
+    /// (no-op for an in-memory catalog). Durability is the store's concern — the
+    /// server backs it with the crash-safe LSM, so this no longer maintains a
+    /// separate on-disk file.
     pub fn save_to_disk(&self) -> Result<()> {
-        if let Some(path) = &self.path {
-            let schemas_vec: Vec<_> = self
+        let Some(store) = &self.store else {
+            return Ok(());
+        };
+        let state = MemoryCatalogState {
+            databases: self.databases.read().unwrap().clone(),
+            schemas: self
                 .schemas
                 .read()
                 .unwrap()
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
-            let tables_vec: Vec<_> = self
+                .collect(),
+            tables: self
                 .tables
                 .read()
                 .unwrap()
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
-
-            let state = MemoryCatalogState {
-                databases: self.databases.read().unwrap().clone(),
-                schemas: schemas_vec,
-                tables: tables_vec,
-                principals: self.principals.read().unwrap().clone(),
-                grants: self.grants.read().unwrap().clone(),
-                roles: self.roles.read().unwrap().clone(),
-                memberships: self.memberships.read().unwrap().clone(),
-                catalog_version: *self.catalog_version.read().unwrap(),
-            };
-
-            let data = serde_json::to_string_pretty(&state)?;
-
-            // Atomic durable write: write to temp file, sync, and rename
-            let tmp_path = path.with_extension("tmp");
-            std::fs::write(&tmp_path, data)?;
-            if let Ok(file) = std::fs::File::open(&tmp_path) {
-                let _ = file.sync_all();
-            }
-            std::fs::rename(&tmp_path, path)?;
-
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::File::open(parent).and_then(|dir| dir.sync_all());
-            }
-        }
-        Ok(())
+                .collect(),
+            principals: self.principals.read().unwrap().clone(),
+            grants: self.grants.read().unwrap().clone(),
+            roles: self.roles.read().unwrap().clone(),
+            memberships: self.memberships.read().unwrap().clone(),
+            catalog_version: *self.catalog_version.read().unwrap(),
+        };
+        store.save(&serde_json::to_vec(&state)?)
     }
 
     pub fn new() -> Self {
@@ -617,7 +618,7 @@ impl MemoryCatalog {
             roles: RwLock::new(Vec::new()),
             memberships: RwLock::new(Vec::new()),
             catalog_version: RwLock::new(1),
-            path: None,
+            store: None,
         }
     }
 

@@ -192,24 +192,21 @@ pub async fn run_server_with_config(
     };
 
     tracing::debug!("Loading KV and catalog");
-    let (local_kv, catalog): (Arc<dyn nodus_storage_api::KvEngine>, _) =
-        match &config.storage.data_dir {
-            Some(dir) => {
-                let path = std::path::Path::new(dir);
-                std::fs::create_dir_all(path).unwrap();
-                let cat_path = path.join("catalog.json");
-                let cat = Arc::new(nodus_catalog::MemoryCatalog::load_from_disk(cat_path).unwrap());
-                let k = Arc::new(
-                    nodus_storage_lsm::LsmKvEngine::with_wal(path, encryption_key).unwrap(),
-                );
-                (k, cat)
-            }
-            None => {
-                let cat = Arc::new(nodus_catalog::MemoryCatalog::new());
-                let k = Arc::new(nodus_storage_mem::MemKvEngine::new());
-                (k, cat)
-            }
-        };
+    // Build the KV engine first, then back the catalog with that same store so
+    // the catalog and user data share one durable mechanism and recovery path
+    // (no separate catalog.json). The store wraps the local engine directly — a
+    // materialization of the replicated catalog, not a routed write.
+    let local_kv: Arc<dyn nodus_storage_api::KvEngine> = match &config.storage.data_dir {
+        Some(dir) => {
+            let path = std::path::Path::new(dir);
+            std::fs::create_dir_all(path).unwrap();
+            Arc::new(nodus_storage_lsm::LsmKvEngine::with_wal(path, encryption_key).unwrap())
+        }
+        None => Arc::new(nodus_storage_mem::MemKvEngine::new()),
+    };
+    let catalog = Arc::new(nodus_catalog::MemoryCatalog::with_store(Arc::new(
+        nodus_executor::KvCatalogStore::new(local_kv.clone()),
+    )));
     tracing::debug!("Loaded KV and catalog");
 
     let cluster_version = catalog

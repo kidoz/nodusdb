@@ -1707,6 +1707,67 @@ pub trait Executor: Send + Sync {
     fn execute_physical(&self, ctx: &ExecutionContext, plan: PhysicalPlan) -> Result<Vec<Row>>;
 }
 
+/// Reserved KV key under which the catalog's serialized state is stored. The
+/// leading NUL keeps it out of any `{table_id}:{pk}` row key space.
+const CATALOG_STATE_KEY: &[u8] = b"\x00catalog\x00state";
+
+/// A [`nodus_catalog::CatalogStore`] backed by a [`KvEngine`], so the catalog
+/// persists into the same (crash-safe) store as user data — one durable
+/// mechanism, one recovery path. Should wrap the node's *local* engine (a direct
+/// materialization, like the meta store), not the routing engine.
+pub struct KvCatalogStore {
+    kv: Arc<dyn KvEngine>,
+    last_ts: std::sync::atomic::AtomicU64,
+}
+
+impl KvCatalogStore {
+    pub fn new(kv: Arc<dyn KvEngine>) -> Self {
+        Self {
+            kv,
+            last_ts: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+}
+
+impl nodus_catalog::CatalogStore for KvCatalogStore {
+    fn load(&self) -> Option<Vec<u8>> {
+        self.kv
+            .get(CATALOG_STATE_KEY, u64::MAX)
+            .ok()
+            .flatten()
+            .map(|b| b.to_vec())
+    }
+
+    fn save(&self, bytes: &[u8]) -> Result<()> {
+        // Strictly-monotonic commit ts so a later save always supersedes earlier
+        // ones (reads use `u64::MAX`); wall-clock alone could collide within a µs.
+        use std::sync::atomic::Ordering::SeqCst;
+        let wall = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros() as u64;
+        let ts = loop {
+            let last = self.last_ts.load(SeqCst);
+            let next = wall.max(last + 1);
+            if self
+                .last_ts
+                .compare_exchange(last, next, SeqCst, SeqCst)
+                .is_ok()
+            {
+                break next;
+            }
+        };
+        let txn = TxnId::new();
+        self.kv.write_intent(
+            txn,
+            Bytes::from_static(CATALOG_STATE_KEY),
+            Bytes::copy_from_slice(bytes),
+        )?;
+        self.kv.commit(txn, ts)?;
+        Ok(())
+    }
+}
+
 // MVP implementation mapping to required interfaces
 #[allow(dead_code)]
 pub struct MemExecutor {
@@ -1749,8 +1810,15 @@ impl MemExecutor {
     ) -> Result<(Arc<MemExecutor>, Arc<MemoryCatalog>)> {
         let path = std::path::Path::new(data_dir);
         std::fs::create_dir_all(path)?;
-        let cat_path = path.join("catalog.json");
-        let cat = Arc::new(MemoryCatalog::load_from_disk(cat_path)?);
+        // Build the KV engine first, then back the catalog with it so both share
+        // one durable store and recovery path.
+        let kv = Arc::new(nodus_storage_lsm::LsmKvEngine::with_wal(
+            path,
+            encryption_key,
+        )?);
+        let cat = Arc::new(MemoryCatalog::with_store(Arc::new(KvCatalogStore::new(
+            kv.clone(),
+        ))));
 
         if cat.get_database("default").is_err() {
             let db = cat.create_database(nodus_catalog::CreateDatabaseRequest {
@@ -1767,10 +1835,6 @@ impl MemExecutor {
             })?;
         }
 
-        let kv = Arc::new(nodus_storage_lsm::LsmKvEngine::with_wal(
-            path,
-            encryption_key,
-        )?);
         let txn = Arc::new(nodus_txn::MemTxnManager::new());
         let authz = Arc::new(nodus_authz::DefaultAuthzEngine::new(cat.clone()));
 
