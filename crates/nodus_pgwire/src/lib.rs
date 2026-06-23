@@ -1088,6 +1088,22 @@ use pgwire::messages::response::{
 use pgwire::messages::startup::{Authentication, BackendKeyData, ParameterStatus};
 use uuid::Uuid;
 
+/// Runs the synchronous executor on the blocking pool so the calling reactor
+/// worker is never parked. This is required for correctness: executor write
+/// paths route through the async `RaftRouter`, which waits via `blocking_recv`
+/// and would panic (and risk worker-pool starvation) if called on a runtime
+/// worker thread.
+async fn execute_off_reactor(
+    executor: Arc<dyn nodus_executor::Executor>,
+    ctx: nodus_executor::ExecutionContext,
+    plan: nodus_executor::LogicalPlan,
+) -> anyhow::Result<nodus_executor::QueryOutput> {
+    match tokio::task::spawn_blocking(move || executor.execute_logical(&ctx, plan)).await {
+        Ok(result) => result,
+        Err(join_err) => Err(anyhow::anyhow!("execution task failed: {join_err}")),
+    }
+}
+
 pub struct NodusQueryHandler {
     /// Fallback session id for tests that instantiate the handler directly.
     pub session_id: String,
@@ -1517,7 +1533,7 @@ impl SimpleQueryHandler for NodusQueryHandler {
                 }
             };
 
-            let out = match self.executor.execute_logical(&ctx, plan) {
+            let out = match execute_off_reactor(self.executor.clone(), ctx.clone(), plan).await {
                 Ok(out) => out,
                 Err(e) => {
                     let err_str = e.to_string();
@@ -1600,9 +1616,9 @@ fn cursor_key(session_id: &str, portal_name: &str) -> String {
 }
 
 impl NodusExtendedQueryHandler {
-    fn output_metadata_for_query<C>(&self, client: &C, query_str: &str) -> Vec<(String, String)>
+    async fn output_metadata_for_query<C>(&self, client: &C, query_str: &str) -> Vec<(String, String)>
     where
-        C: ClientInfo,
+        C: ClientInfo + Sync,
     {
         let session_id = session_id_from_client(client);
         let principal_id = principal_id_from_client(client);
@@ -1637,10 +1653,10 @@ impl NodusExtendedQueryHandler {
             return Vec::new();
         }
 
-        self.executor
-            .execute_logical(&ctx, plan_zero)
-            .map(|out| out.columns.into_iter().zip(out.types).collect())
-            .unwrap_or_default()
+        match execute_off_reactor(self.executor.clone(), ctx, plan_zero).await {
+            Ok(out) => out.columns.into_iter().zip(out.types).collect(),
+            Err(_) => Vec::new(),
+        }
     }
 }
 
@@ -1965,7 +1981,9 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
                                 ),
                             ))
                             .await?;
-                        let metadata = self.output_metadata_for_query(client, &stmt.statement);
+                        let metadata = self
+                            .output_metadata_for_query(client, &stmt.statement)
+                            .await;
                         let row_desc = if metadata.is_empty() {
                             row_description(&resp.fields)
                         } else {
@@ -1990,8 +2008,9 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
                             .send(PgWireBackendMessage::NoData(NoData::new()))
                             .await?;
                     } else {
-                        let metadata =
-                            self.output_metadata_for_query(client, &portal.statement.statement);
+                        let metadata = self
+                            .output_metadata_for_query(client, &portal.statement.statement)
+                            .await;
                         let row_desc = if metadata.is_empty() {
                             row_description(&resp.fields)
                         } else {
@@ -2334,7 +2353,7 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
             }
         };
 
-        let out = match self.executor.execute_logical(&ctx, plan) {
+        let out = match execute_off_reactor(self.executor.clone(), ctx.clone(), plan).await {
             Ok(out) => out,
             Err(e) => {
                 let err_str = e.to_string();
@@ -2445,7 +2464,14 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
                 can_execute = true;
             }
 
-            if can_execute && let Ok(out) = self.executor.execute_logical(&ctx, plan_zero) {
+            let described = if can_execute {
+                execute_off_reactor(self.executor.clone(), ctx.clone(), plan_zero)
+                    .await
+                    .ok()
+            } else {
+                None
+            };
+            if let Some(out) = described {
                 for (col_name, col_type) in out.columns.into_iter().zip(out.types) {
                     fields.push(FieldInfo::new(
                         col_name,
@@ -2518,7 +2544,14 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
                 can_execute = true;
             }
 
-            if can_execute && let Ok(out) = self.executor.execute_logical(&ctx, plan_zero) {
+            let described = if can_execute {
+                execute_off_reactor(self.executor.clone(), ctx.clone(), plan_zero)
+                    .await
+                    .ok()
+            } else {
+                None
+            };
+            if let Some(out) = described {
                 for (col_name, col_type) in out.columns.into_iter().zip(out.types) {
                     fields.push(FieldInfo::new(
                         col_name,

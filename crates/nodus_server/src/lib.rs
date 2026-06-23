@@ -2,6 +2,7 @@
 mod admin;
 mod raft_catalog;
 mod raft_kv;
+mod raft_router;
 mod raft_upgrade;
 
 use admin::{AdminState, admin_routes};
@@ -247,11 +248,6 @@ pub async fn run_server_with_config(
     let admin_token = config.admin.token.clone();
     let bootstrap_catalog = catalog.clone();
 
-    let raft_kv = Arc::new(crate::raft_kv::RaftKvEngine {
-        local: local_kv.clone(),
-        raft: raft.clone(),
-    });
-
     let raft_state = nodus_raftstore::server::RaftState::new();
     raft_state
         .rafts
@@ -259,10 +255,21 @@ pub async fn run_server_with_config(
         .await
         .insert("shard-meta".to_string(), raft.clone());
 
+    // Async write-submission actor: bridges the synchronous KV/catalog write
+    // traits to async Raft `client_write` without `block_in_place`.
+    let raft_router = crate::raft_router::RaftRouter::spawn(raft_state.clone());
+
+    let raft_kv = Arc::new(crate::raft_kv::RaftKvEngine {
+        local: local_kv.clone(),
+        router: raft_router.clone(),
+        shard_id: "shard-meta".to_string(),
+    });
+
     let raft_catalog_writer = Arc::new(crate::raft_catalog::RaftCatalogWriter {
         local: catalog.clone(),
         reader: catalog.clone(),
-        raft_state: raft_state.clone(),
+        router: raft_router.clone(),
+        shard_id: "shard-meta".to_string(),
     });
 
     let txn = Arc::new(nodus_txn::MemTxnManager::new());

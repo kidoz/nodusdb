@@ -512,56 +512,72 @@ async fn restore_backup(
 ) -> Json<Value> {
     match state.backup.restore(&id).await {
         Ok(objects) => {
-            for obj in &objects {
-                if obj.name == "catalog.json" {
-                    if let Ok(snapshot) = serde_json::from_slice(&obj.bytes) {
-                        let _ = state.catalog_writer.import_snapshot(snapshot);
-                    }
-                } else if obj.name == "kv_data.json" {
-                    #[allow(clippy::collapsible_if)]
-                    if let Ok(dump) = serde_json::from_slice::<Vec<serde_json::Value>>(&obj.bytes) {
-                        for pair in dump {
-                            if let (Some(k), Some(v), Some(ver)) = (
-                                pair.get("key").and_then(|k| k.as_array()),
-                                pair.get("value").and_then(|v| v.as_array()),
-                                pair.get("version").and_then(|v| v.as_u64()),
-                            ) {
-                                let key_bytes: Vec<u8> = k
-                                    .iter()
-                                    .filter_map(|x| x.as_u64())
-                                    .map(|x| x as u8)
-                                    .collect();
-                                let val_bytes: Vec<u8> = v
-                                    .iter()
-                                    .filter_map(|x| x.as_u64())
-                                    .map(|x| x as u8)
-                                    .collect();
+            // Pre-fetch archived WALs (async) before the blocking replay below.
+            let archived_wals = match query.target_ts {
+                Some(_) => state.backup.get_archived_wals().await.ok(),
+                None => None,
+            };
+            let names: Vec<String> = objects.iter().map(|o| o.name.clone()).collect();
 
-                                let txn_id = nodus_storage_api::TxnId::new();
-                                let _ = state.kv.write_intent(
-                                    txn_id,
-                                    Bytes::from(key_bytes.clone()),
-                                    Bytes::from(val_bytes),
-                                );
-                                let _ = state.kv.commit(txn_id, ver);
-                                tracing::debug!(
-                                    "Restored KV pair from baseline: key={:?}",
-                                    String::from_utf8_lossy(&key_bytes)
-                                );
+            // Catalog/KV writes route through the synchronous traits, which submit
+            // to the async RaftRouter via `blocking_recv`; run them on the blocking
+            // pool so we never park (or panic on) a reactor worker thread.
+            let kv = state.kv.clone();
+            let catalog_writer = state.catalog_writer.clone();
+            let wal_key = state.wal_key;
+            let target_ts = query.target_ts;
+            let _ = tokio::task::spawn_blocking(move || {
+                for obj in &objects {
+                    if obj.name == "catalog.json" {
+                        if let Ok(snapshot) = serde_json::from_slice(&obj.bytes) {
+                            let _ = catalog_writer.import_snapshot(snapshot);
+                        }
+                    } else if obj.name == "kv_data.json" {
+                        #[allow(clippy::collapsible_if)]
+                        if let Ok(dump) =
+                            serde_json::from_slice::<Vec<serde_json::Value>>(&obj.bytes)
+                        {
+                            for pair in dump {
+                                if let (Some(k), Some(v), Some(ver)) = (
+                                    pair.get("key").and_then(|k| k.as_array()),
+                                    pair.get("value").and_then(|v| v.as_array()),
+                                    pair.get("version").and_then(|v| v.as_u64()),
+                                ) {
+                                    let key_bytes: Vec<u8> = k
+                                        .iter()
+                                        .filter_map(|x| x.as_u64())
+                                        .map(|x| x as u8)
+                                        .collect();
+                                    let val_bytes: Vec<u8> = v
+                                        .iter()
+                                        .filter_map(|x| x.as_u64())
+                                        .map(|x| x as u8)
+                                        .collect();
+
+                                    let txn_id = nodus_storage_api::TxnId::new();
+                                    let _ = kv.write_intent(
+                                        txn_id,
+                                        Bytes::from(key_bytes.clone()),
+                                        Bytes::from(val_bytes),
+                                    );
+                                    let _ = kv.commit(txn_id, ver);
+                                    tracing::debug!(
+                                        "Restored KV pair from baseline: key={:?}",
+                                        String::from_utf8_lossy(&key_bytes)
+                                    );
+                                }
                             }
                         }
                     }
                 }
-            }
 
-            if let Some(target_ts) = query.target_ts {
-                if let Ok(wals) = state.backup.get_archived_wals().await {
+                if let (Some(target_ts), Some(wals)) = (target_ts, archived_wals) {
                     let mut active_txns = std::collections::HashSet::new();
                     for (_name, bytes) in wals {
                         let tmp = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
                         std::fs::write(&tmp, bytes).unwrap();
                         if let Ok(wal_engine) =
-                            nodus_storage_wal::FileWalEngine::with_encryption(&tmp, state.wal_key)
+                            nodus_storage_wal::FileWalEngine::with_encryption(&tmp, wal_key)
                         {
                             if let Ok(records) = wal_engine.recover() {
                                 for record in records {
@@ -572,7 +588,7 @@ async fn restore_backup(
                                             key,
                                             value,
                                         } => {
-                                            let _ = state.kv.write_intent(
+                                            let _ = kv.write_intent(
                                                 txn_id,
                                                 Bytes::from(key),
                                                 Bytes::from(value),
@@ -583,8 +599,7 @@ async fn restore_backup(
                                             txn_id,
                                             key,
                                         } => {
-                                            let _ =
-                                                state.kv.delete_intent(txn_id, Bytes::from(key));
+                                            let _ = kv.delete_intent(txn_id, Bytes::from(key));
                                             active_txns.insert(txn_id);
                                         }
                                         nodus_storage_wal::WalRecordV1::CommitTxn {
@@ -597,19 +612,19 @@ async fn restore_backup(
                                                     commit_ts,
                                                     target_ts
                                                 );
-                                                let _ = state.kv.commit(txn_id, commit_ts);
+                                                let _ = kv.commit(txn_id, commit_ts);
                                             } else {
                                                 tracing::debug!(
                                                     "Skipped commit_ts {} > target_ts {}",
                                                     commit_ts,
                                                     target_ts
                                                 );
-                                                let _ = state.kv.abort(txn_id);
+                                                let _ = kv.abort(txn_id);
                                             }
                                             active_txns.remove(&txn_id);
                                         }
                                         nodus_storage_wal::WalRecordV1::AbortTxn { txn_id } => {
-                                            let _ = state.kv.abort(txn_id);
+                                            let _ = kv.abort(txn_id);
                                             active_txns.remove(&txn_id);
                                         }
                                         _ => {}
@@ -621,12 +636,12 @@ async fn restore_backup(
                     }
                     // Abort any pending transactions
                     for txn_id in active_txns {
-                        let _ = state.kv.abort(txn_id);
+                        let _ = kv.abort(txn_id);
                     }
                 }
-            }
+            })
+            .await;
 
-            let names: Vec<String> = objects.into_iter().map(|o| o.name).collect();
             Json(json!({ "restored": names.len(), "objects": names }))
         }
         Err(e) => Json(json!({ "restored": 0, "error": e.to_string() })),

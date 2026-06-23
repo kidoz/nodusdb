@@ -1648,6 +1648,7 @@ pub enum PhysicalPlan {
     },
 }
 
+#[derive(Clone)]
 pub struct ExecutionContext {
     pub session_id: String,
     /// Authenticated principal making the request; used for authorization.
