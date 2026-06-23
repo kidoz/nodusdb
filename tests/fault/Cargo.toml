@@ -12,3 +12,9 @@ workspace = true
 
 [dependencies]
 nodus_testkit = { path = "../../crates/nodus_testkit" }
+
+[dev-dependencies]
+nodus_config = { path = "../../crates/nodus_config" }
+tokio.workspace = true
+tokio-postgres.workspace = true
+uuid.workspace = true
