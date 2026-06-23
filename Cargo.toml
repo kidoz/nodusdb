@@ -33,11 +33,12 @@ members = [
     "tests/fault",
     "tests/distributed",
 ]
-resolver = "2"
+resolver = "3"
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
 authors = ["Aleksandr Pavlov <ckidoz@gmail.com>"]
 license = "MIT"
 repository = "https://github.com/kidoz/nodusdb"
