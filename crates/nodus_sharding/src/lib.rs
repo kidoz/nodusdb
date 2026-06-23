@@ -10,6 +10,21 @@ pub trait ShardRouter: Send + Sync {
     fn locate_range(&self, table_id: TableId, range: KeyRange) -> Result<Vec<ShardId>>;
 }
 
+/// A planned-but-uncommitted shard split. A data migrator creates the children,
+/// relocates `source_id`'s bytes into them (partitioned at `split_key`), then
+/// calls [`ShardOrchestrator::commit_split`] to flip routing.
+#[derive(Clone)]
+pub struct SplitPlan {
+    pub source_id: ShardId,
+    pub split_key: Vec<u8>,
+    /// Node currently hosting the source shard, if placed; the children inherit it.
+    pub source_node: Option<String>,
+    pub left: ShardDescriptor,
+    pub right: ShardDescriptor,
+    /// The table's shard map after the split (source removed, children added).
+    pub new_map: ShardMap,
+}
+
 pub struct CatalogShardRouter {
     meta_store: Arc<dyn MetaStore>,
 }
@@ -109,14 +124,17 @@ impl ShardOrchestrator {
         self.meta.get_shard_map(table_id)
     }
 
-    /// Splits `shard_id` at `split_key`, producing `[start, split_key)` and
-    /// `[split_key, end)`. The split key must lie strictly inside the shard.
-    pub fn split(
+    /// Computes (but does not commit) a split of `shard_id` at `split_key` into
+    /// `[start, split_key)` and `[split_key, end)`. The split key must lie
+    /// strictly inside the shard. Separating planning from commit lets a data
+    /// migrator relocate the shard's bytes into the children *before* the
+    /// routing flip, so no read ever lands on an empty child.
+    pub fn plan_split(
         &self,
         table_id: TableId,
         shard_id: ShardId,
         split_key: Vec<u8>,
-    ) -> Result<(ShardId, ShardId)> {
+    ) -> Result<SplitPlan> {
         let mut map = self.meta.get_shard_map(table_id)?;
         let idx = map
             .shards
@@ -142,26 +160,49 @@ impl ShardOrchestrator {
         let right = new_shard(
             table_id,
             format!("{}-r", shard.name),
-            split_key,
+            split_key.clone(),
             shard.end_key.clone(),
         );
-        let ids = (left.id, right.id);
-
-        // New shards inherit the original's placement. Read the inherited node
-        // into a local first so the read guard is dropped before we write.
-        let inherited = self.placements.read().unwrap().get(&shard_id).cloned();
-        if let Some(node) = inherited {
-            let mut p = self.placements.write().unwrap();
-            p.insert(left.id, node.clone());
-            p.insert(right.id, node);
-            p.remove(&shard_id);
-        }
 
         map.shards.remove(idx);
-        map.shards.push(left);
-        map.shards.push(right);
-        self.meta.update_shard_map(map)?;
-        self.save_placements()?;
+        map.shards.push(left.clone());
+        map.shards.push(right.clone());
+
+        Ok(SplitPlan {
+            source_id: shard_id,
+            split_key,
+            source_node: self.placements.read().unwrap().get(&shard_id).cloned(),
+            left,
+            right,
+            new_map: map,
+        })
+    }
+
+    /// Commits a planned split: atomically replaces the table's shard map (the
+    /// routing flip) and updates placements so the children inherit the source's
+    /// node and the source is dropped.
+    pub fn commit_split(&self, plan: &SplitPlan) -> Result<()> {
+        self.meta.update_shard_map(plan.new_map.clone())?;
+        if let Some(node) = &plan.source_node {
+            let mut p = self.placements.write().unwrap();
+            p.insert(plan.left.id, node.clone());
+            p.insert(plan.right.id, node.clone());
+            p.remove(&plan.source_id);
+        }
+        self.save_placements()
+    }
+
+    /// Splits `shard_id` at `split_key` (metadata only — see [`Self::plan_split`]
+    /// and a data migrator for physical relocation).
+    pub fn split(
+        &self,
+        table_id: TableId,
+        shard_id: ShardId,
+        split_key: Vec<u8>,
+    ) -> Result<(ShardId, ShardId)> {
+        let plan = self.plan_split(table_id, shard_id, split_key)?;
+        let ids = (plan.left.id, plan.right.id);
+        self.commit_split(&plan)?;
         Ok(ids)
     }
 

@@ -9,14 +9,16 @@
 //! lifecycle ([`MultiRaftManager::reconcile`]) is Phase 5.
 
 use anyhow::Result;
+use bytes::Bytes;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
-use nodus_catalog::ShardId;
+use nodus_catalog::{ShardId, TableId};
 use nodus_raftstore::NodusRaftStore;
 use nodus_raftstore::network::NodusNetworkFactory;
 use nodus_raftstore::server::{NodusRaft, RaftState};
-use nodus_storage_api::{KvEngine, NamespacedKvEngine};
+use nodus_sharding::ShardOrchestrator;
+use nodus_storage_api::{KeyRange, KvEngine, NamespacedKvEngine, TxnId};
 
 /// Identifier of the metadata group that owns catalog, RBAC, and cluster state.
 pub const META_SHARD: &str = "shard-meta";
@@ -146,15 +148,110 @@ impl MultiRaftManager {
                 continue;
             }
             let raft = self.get_or_create_data(&group_id).await?;
-            // Single-node bootstrap so the group can immediately accept writes,
-            // mirroring how the meta group is initialized. Multi-replica shard
-            // membership lands with data movement (Phase 6).
-            let mut members = BTreeMap::new();
-            members.insert(self.node_id, openraft::BasicNode::new(&self.advertise_addr));
-            let _ = raft.initialize(members).await;
+            self.init_single(&raft).await;
             created += 1;
         }
         Ok(created)
+    }
+
+    /// Single-node bootstrap so a freshly created group can immediately accept
+    /// writes, mirroring how the meta group is initialized. Multi-replica shard
+    /// membership is future work.
+    async fn init_single(&self, raft: &NodusRaft) {
+        let mut members = BTreeMap::new();
+        members.insert(self.node_id, openraft::BasicNode::new(&self.advertise_addr));
+        let _ = raft.initialize(members).await;
+    }
+
+    /// Decommissions the group for `group_id`: shuts down its Raft instance and
+    /// drops it from the group map / hosted set, so routing no longer reaches it.
+    /// The namespace's bytes become unreachable; physical reclamation is left to
+    /// GC/compaction.
+    pub async fn remove_group(&self, group_id: &str) -> Result<()> {
+        let raft = self.state.rafts.write().await.remove(group_id);
+        self.hosted.write().unwrap().remove(group_id);
+        if let Some(raft) = raft {
+            let _ = raft.shutdown().await;
+        }
+        Ok(())
+    }
+
+    /// Physically splits a shard. Plans the split, creates and initializes the
+    /// child groups, **relocates the source's data into them before flipping
+    /// routing** (so no read lands on an empty child and no committed key is lost
+    /// or duplicated), commits the flip, then decommissions the source group.
+    /// Single-node today; cross-node transfer (learner + snapshot ship) is future.
+    pub async fn split_shard(
+        &self,
+        orchestrator: &ShardOrchestrator,
+        table_id: TableId,
+        shard_id: ShardId,
+        split_key: Vec<u8>,
+    ) -> Result<(ShardId, ShardId)> {
+        let plan = orchestrator.plan_split(table_id, shard_id, split_key)?;
+        let (left_id, right_id) = (plan.left.id, plan.right.id);
+        let local = plan.source_node.as_deref() == Some(self.node_id.to_string().as_str());
+
+        if local {
+            let left_group = Self::data_group_id(left_id);
+            let right_group = Self::data_group_id(right_id);
+            let lr = self.get_or_create_data(&left_group).await?;
+            self.init_single(&lr).await;
+            let rr = self.get_or_create_data(&right_group).await?;
+            self.init_single(&rr).await;
+            self.relocate_partition(
+                &Self::data_group_id(shard_id),
+                &left_group,
+                &right_group,
+                &plan.split_key,
+            )?;
+        }
+
+        orchestrator.commit_split(&plan)?; // atomic routing flip
+
+        if local {
+            self.remove_group(&Self::data_group_id(shard_id)).await?;
+        }
+        Ok((left_id, right_id))
+    }
+
+    /// Copies every committed entry from the source namespace into the left or
+    /// right child namespace depending on whether its (namespace-stripped) key
+    /// sorts before `split_key`, preserving each entry's commit version. Writes
+    /// go straight to the shared base store under the child namespaces, which on
+    /// a single node is equivalent to the child group applying them.
+    fn relocate_partition(
+        &self,
+        source_group: &str,
+        left_group: &str,
+        right_group: &str,
+        split_key: &[u8],
+    ) -> Result<()> {
+        let source = NamespacedKvEngine::new(self.base_kv.clone(), source_group);
+        let left = NamespacedKvEngine::new(self.base_kv.clone(), left_group);
+        let right = NamespacedKvEngine::new(self.base_kv.clone(), right_group);
+
+        let full = KeyRange {
+            start: Bytes::new(),
+            end: Bytes::from(vec![255u8; 1024]),
+        };
+        let entries: Vec<(Bytes, Bytes, u64)> = source
+            .scan(full, u64::MAX)?
+            .filter_map(|r| r.ok())
+            .map(|p| (p.key, p.value, p.version))
+            .collect();
+
+        for (key, value, version) in entries {
+            let dest = if key.as_ref() < split_key {
+                &left
+            } else {
+                &right
+            };
+            let txn = TxnId::new();
+            dest.write_intent(txn, key, value)?;
+            dest.commit(txn, version)?;
+        }
+        Ok(())
     }
 }
 
@@ -249,6 +346,53 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         assert!(led, "reconciled shard group should elect a leader");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn split_relocates_data_into_children_and_decommissions_the_source() {
+        let base: Arc<dyn KvEngine> = Arc::new(nodus_storage_mem::MemKvEngine::new());
+        let config = Arc::new(openraft::Config::default().validate().unwrap());
+        let mgr = MultiRaftManager::new(
+            1,
+            "127.0.0.1:0".into(),
+            config,
+            RaftState::new(),
+            base.clone(),
+        );
+
+        let meta = Arc::new(nodus_meta::PersistentMetaStore::new(base.clone()));
+        let orch = nodus_sharding::ShardOrchestrator::new(meta);
+        let table = TableId(uuid::Uuid::new_v4());
+        let source = orch.init_single_shard(table).unwrap();
+        orch.move_shard(source, "1").unwrap();
+
+        // Host the source group and seed it with one key on each side of 'm'.
+        mgr.reconcile(&orch.placements()).await.unwrap();
+        let src_ns = NamespacedKvEngine::new(base.clone(), &MultiRaftManager::data_group_id(source));
+        for (k, v) in [(b"a".as_slice(), b"va".as_slice()), (b"z", b"vz")] {
+            let t = TxnId::new();
+            src_ns
+                .write_intent(t, Bytes::copy_from_slice(k), Bytes::copy_from_slice(v))
+                .unwrap();
+            src_ns.commit(t, 5).unwrap();
+        }
+
+        // Split at 'm' (0x6d): "a" → left, "z" → right.
+        let (left, right) = mgr.split_shard(&orch, table, source, vec![0x6d]).await.unwrap();
+
+        // Routing flipped: children hosted, source decommissioned.
+        assert!(mgr.hosts(&MultiRaftManager::data_group_id(left)));
+        assert!(mgr.hosts(&MultiRaftManager::data_group_id(right)));
+        assert!(!mgr.hosts(&MultiRaftManager::data_group_id(source)));
+        assert_eq!(orch.shard_map(table).unwrap().shards.len(), 2);
+
+        // Each committed key lands in exactly one child, version preserved.
+        let lhs = NamespacedKvEngine::new(base.clone(), &MultiRaftManager::data_group_id(left));
+        let rhs = NamespacedKvEngine::new(base.clone(), &MultiRaftManager::data_group_id(right));
+        assert_eq!(lhs.get(b"a", 100).unwrap(), Some(Bytes::from_static(b"va")));
+        assert_eq!(lhs.get(b"z", 100).unwrap(), None);
+        assert_eq!(rhs.get(b"z", 100).unwrap(), Some(Bytes::from_static(b"vz")));
+        assert_eq!(rhs.get(b"a", 100).unwrap(), None);
     }
 
     #[test]

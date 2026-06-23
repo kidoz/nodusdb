@@ -772,11 +772,15 @@ async fn shards_split(
         Some(b) => vec![b],
         None => return Json(json!({ "error": "missing or invalid key (expected 0-255)" })),
     };
-    match state.shards.split(table_id, shard_id, split_key) {
-        Ok((l, r)) => {
-            reconcile_shards(&state).await;
-            Json(json!({ "left": l.to_string(), "right": r.to_string() }))
-        }
+    // Physically relocates the shard's data into the children before flipping
+    // routing, and decommissions the source group (no-op data move when the
+    // shard isn't placed on this node).
+    match state
+        .manager
+        .split_shard(&state.shards, table_id, shard_id, split_key)
+        .await
+    {
+        Ok((l, r)) => Json(json!({ "left": l.to_string(), "right": r.to_string() })),
         Err(e) => Json(json!({ "error": e.to_string() })),
     }
 }
