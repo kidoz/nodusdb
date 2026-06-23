@@ -85,31 +85,31 @@ impl LsmKvEngine {
         std::fs::create_dir_all(path)?;
 
         // Prefer the manifest (authoritative file set). Fall back to a directory
-        // scan for stores written before manifests existed, or fresh dirs.
-        let (mut sst_ids, active_wal_id): (Vec<u64>, u64) =
-            match std::fs::read(path.join(MANIFEST_FILE)) {
-                Ok(bytes) => {
-                    let m: Manifest = serde_json::from_slice(&bytes)?;
-                    (m.sstables, m.active_wal)
-                }
-                Err(_) => {
-                    let mut ids = Vec::new();
-                    let mut max_id = 0;
-                    for entry in std::fs::read_dir(path)? {
-                        let p = entry?.path();
-                        // Only complete `*.sst` (atomic rename guarantees this);
-                        // partial `*.sst.tmp` and orphans are ignored.
-                        if p.extension().and_then(|s| s.to_str()) == Some("sst")
-                            && let Some(name) = p.file_stem().and_then(|n| n.to_str())
-                            && let Ok(id) = name.parse::<u64>()
-                        {
-                            max_id = std::cmp::max(max_id, id);
-                            ids.push(id);
-                        }
+        // scan when it is absent (pre-manifest / fresh dirs) OR unreadable/corrupt
+        // — a torn manifest must not make the engine unstartable.
+        let manifest: Option<Manifest> = std::fs::read(path.join(MANIFEST_FILE))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+        let (mut sst_ids, active_wal_id): (Vec<u64>, u64) = match manifest {
+            Some(m) => (m.sstables, m.active_wal),
+            None => {
+                let mut ids = Vec::new();
+                let mut max_id = 0;
+                for entry in std::fs::read_dir(path)? {
+                    let p = entry?.path();
+                    // Only complete `*.sst` (atomic rename guarantees this);
+                    // partial `*.sst.tmp` and orphans are ignored.
+                    if p.extension().and_then(|s| s.to_str()) == Some("sst")
+                        && let Some(name) = p.file_stem().and_then(|n| n.to_str())
+                        && let Ok(id) = name.parse::<u64>()
+                    {
+                        max_id = std::cmp::max(max_id, id);
+                        ids.push(id);
                     }
-                    (ids, max_id + 1)
                 }
-            };
+                (ids, max_id + 1)
+            }
+        };
 
         sst_ids.sort_unstable();
         let sstables: Vec<Sstable> = sst_ids
@@ -1129,6 +1129,61 @@ mod sst_tests {
         assert_eq!(
             engine.get(b"wal_only", 1_000_000).unwrap().unwrap(),
             Bytes::from("w")
+        );
+    }
+
+    #[test]
+    fn orphan_sstable_not_in_manifest_is_ignored() {
+        let dir = TempDir::new().unwrap();
+        {
+            let engine = LsmKvEngine::with_wal(dir.path(), None).unwrap();
+            let txn = TxnId::new();
+            engine
+                .write_intent(txn, Bytes::from("real"), Bytes::from("v"))
+                .unwrap();
+            engine.commit(txn, 10).unwrap();
+            engine.flush().unwrap();
+        }
+        // Simulate a crash mid-flush/compaction: a fully-built SSTable that was
+        // never recorded in the manifest (the manifest is the commit point).
+        let mut ghost = std::collections::BTreeMap::new();
+        let mut chain = VersionChain::new();
+        let t = TxnId::new();
+        chain.write_intent(t, b"ghost-value".to_vec()).unwrap();
+        chain.commit(t, 5).unwrap();
+        ghost.insert(Bytes::from("ghost"), chain);
+        Sstable::build(dir.path().join("999.sst"), &ghost).unwrap();
+
+        // Recovery trusts the manifest: the orphan is ignored, the real data stays.
+        let engine = LsmKvEngine::with_wal(dir.path(), None).unwrap();
+        assert!(
+            engine.get(b"ghost", 100).unwrap().is_none(),
+            "orphan SSTable ignored"
+        );
+        assert_eq!(engine.get(b"real", 100).unwrap().unwrap(), Bytes::from("v"));
+    }
+
+    #[test]
+    fn corrupt_manifest_recovers_via_directory_scan() {
+        let dir = TempDir::new().unwrap();
+        {
+            let engine = LsmKvEngine::with_wal(dir.path(), None).unwrap();
+            let txn = TxnId::new();
+            engine
+                .write_intent(txn, Bytes::from("survivor"), Bytes::from("v"))
+                .unwrap();
+            engine.commit(txn, 10).unwrap();
+            engine.flush().unwrap();
+        }
+        // A torn manifest must not make the engine unstartable: recovery falls
+        // back to scanning the SSTable files on disk.
+        std::fs::write(dir.path().join("MANIFEST"), b"{ this is not valid json").unwrap();
+
+        let engine = LsmKvEngine::with_wal(dir.path(), None).unwrap();
+        assert_eq!(
+            engine.get(b"survivor", 100).unwrap().unwrap(),
+            Bytes::from("v"),
+            "recovered despite a corrupt manifest"
         );
     }
 }
