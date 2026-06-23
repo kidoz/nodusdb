@@ -43,9 +43,9 @@ test-sim:
 test-loom:
     RUSTFLAGS="--cfg loom" LOOM_MAX_PREEMPTIONS=3 cargo test -p nodus_txn --release loom_
 
-# Run criterion benchmarks for the storage engines (btree + lsm)
+# Run criterion benchmarks for the storage engine
 bench:
-    cargo bench -p nodus_storage_btree -p nodus_storage_lsm
+    cargo bench -p nodus_storage_lsm
 
 # Build fuzz targets without running the fuzzers
 fuzz-check:

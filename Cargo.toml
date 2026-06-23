@@ -20,7 +20,6 @@ members = [
     "crates/nodus_web_console",
     "crates/nodus_storage_mem",
     "crates/nodus_storage_lsm",
-    "crates/nodus_storage_btree",
     "crates/nodus_storage_wal",
     "crates/nodus_mvcc",
     "crates/nodus_index",

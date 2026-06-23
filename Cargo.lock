@@ -2515,21 +2515,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "nodus_storage_btree"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bytes",
- "criterion",
- "nodus_mvcc",
- "nodus_storage_api",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 1.0.69",
-]
-
-[[package]]
 name = "nodus_storage_lsm"
 version = "0.1.0"
 dependencies = [

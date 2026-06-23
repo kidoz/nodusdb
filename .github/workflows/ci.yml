@@ -29,4 +29,4 @@ jobs:
       - name: Loom Concurrency Proof (txn/MVCC)
         run: RUSTFLAGS="--cfg loom" LOOM_MAX_PREEMPTIONS=3 cargo test -p nodus_txn --release loom_
       - name: Compile Storage Engine Benchmarks
-        run: cargo bench --no-run -p nodus_storage_btree -p nodus_storage_lsm
+        run: cargo bench --no-run -p nodus_storage_lsm
