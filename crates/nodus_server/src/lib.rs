@@ -1,5 +1,6 @@
 #![allow(clippy::collapsible_if)]
 mod admin;
+mod multi_raft;
 mod raft_catalog;
 mod raft_kv;
 mod raft_router;
@@ -222,23 +223,25 @@ pub async fn run_server_with_config(
 
     tracing::debug!("Initializing raft network and state");
     let raft_config = Arc::new(openraft::Config::default().validate().unwrap());
-    let (log_store, state_machine) =
-        openraft::storage::Adaptor::new(nodus_raftstore::NodusRaftStore::with_components(
+    let raft_state = nodus_raftstore::server::RaftState::new();
+
+    // Owns this node's Raft groups. The meta group is created now; data-shard
+    // groups are created on demand (routing lands in Phase 2).
+    let multi_raft = Arc::new(crate::multi_raft::MultiRaftManager::new(
+        config.cluster.node_id,
+        raft_config,
+        raft_state.clone(),
+        local_kv.clone(),
+    ));
+    let raft = multi_raft
+        .create_meta(
             local_kv.clone(),
             catalog.clone(),
             catalog.clone(),
             local_upgrade.clone(),
-        ));
-    let raft_network = nodus_raftstore::network::NodusNetworkFactory::new("shard-meta".to_string());
-    let raft = nodus_raftstore::server::NodusRaft::new(
-        config.cluster.node_id,
-        raft_config,
-        raft_network,
-        log_store,
-        state_machine,
-    )
-    .await
-    .map_err(|e| anyhow::anyhow!("raft init: {e}"))?;
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("raft init: {e}"))?;
     tracing::debug!("Raft created");
 
     let raft_clone = raft.clone();
@@ -248,28 +251,21 @@ pub async fn run_server_with_config(
     let admin_token = config.admin.token.clone();
     let bootstrap_catalog = catalog.clone();
 
-    let raft_state = nodus_raftstore::server::RaftState::new();
-    raft_state
-        .rafts
-        .write()
-        .await
-        .insert("shard-meta".to_string(), raft.clone());
-
     // Async write-submission actor: bridges the synchronous KV/catalog write
     // traits to async Raft `client_write` without `block_in_place`.
-    let raft_router = crate::raft_router::RaftRouter::spawn(raft_state.clone());
+    let raft_router = crate::raft_router::RaftRouter::spawn(multi_raft.clone());
 
     let raft_kv = Arc::new(crate::raft_kv::RaftKvEngine {
         local: local_kv.clone(),
         router: raft_router.clone(),
-        shard_id: "shard-meta".to_string(),
+        shard_id: crate::multi_raft::META_SHARD.to_string(),
     });
 
     let raft_catalog_writer = Arc::new(crate::raft_catalog::RaftCatalogWriter {
         local: catalog.clone(),
         reader: catalog.clone(),
         router: raft_router.clone(),
-        shard_id: "shard-meta".to_string(),
+        shard_id: crate::multi_raft::META_SHARD.to_string(),
     });
 
     let txn = Arc::new(nodus_txn::MemTxnManager::new());
@@ -531,7 +527,7 @@ pub async fn run_server_with_config(
     let raft_upgrade_coordinator = Arc::new(crate::raft_upgrade::RaftUpgradeCoordinator {
         local: local_upgrade.clone(),
         router: raft_router.clone(),
-        shard_id: "shard-meta".to_string(),
+        shard_id: crate::multi_raft::META_SHARD.to_string(),
     });
 
     let admin_state = AdminState {

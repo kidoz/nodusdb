@@ -16,10 +16,12 @@
 //! `tokio::task::spawn_blocking`), never directly on a reactor worker thread.
 
 use anyhow::{Result, anyhow};
-use nodus_raftstore::server::RaftState;
 use nodus_raftstore::{NodusTypeConfig, ShardCommand};
 use openraft::Raft;
+use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
+
+use crate::multi_raft::MultiRaftManager;
 
 type WriteResult = Result<()>;
 
@@ -38,11 +40,13 @@ pub struct RaftRouter {
 
 impl RaftRouter {
     /// Spawn the dispatcher task. Must be called from within the Tokio runtime.
-    pub fn spawn(raft_state: RaftState) -> Self {
+    /// Groups are resolved per request through the [`MultiRaftManager`], so a
+    /// shard whose group is created later is reachable without re-spawning.
+    pub fn spawn(manager: Arc<MultiRaftManager>) -> Self {
         let (tx, mut rx) = mpsc::unbounded_channel::<WriteRequest>();
         tokio::spawn(async move {
             while let Some(req) = rx.recv().await {
-                let raft = raft_state.rafts.read().await.get(&req.shard_id).cloned();
+                let raft = manager.get(&req.shard_id).await;
                 match raft {
                     Some(raft) => {
                         // Drive each replication concurrently so independent

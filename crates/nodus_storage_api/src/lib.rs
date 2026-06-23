@@ -2,6 +2,7 @@ use anyhow::Result;
 use bytes::Bytes;
 use nodus_catalog::{IndexId, TableId};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use uuid::Uuid;
 
 pub type Timestamp = u64;
@@ -72,6 +73,110 @@ pub trait KvEngine: Send + Sync {
     /// Flushes any in-memory data to persistent storage and rotates the write-ahead log.
     fn flush(&self) -> Result<()> {
         Ok(())
+    }
+}
+
+/// A `KvEngine` view that confines all keys to a per-shard namespace by
+/// prefixing them, so multiple Raft groups can share one underlying store
+/// without their key spaces overlapping. Keys are transparently prefixed on
+/// write and stripped on read; scans are translated into the namespace's
+/// physical key range. As a result, a group's snapshot (a full scan of its
+/// engine) only ever observes its own namespace's keys.
+///
+/// Transaction-scoped operations (`commit`/`abort`) and `garbage_collect`
+/// delegate to the inner engine unchanged: they act per transaction id or by
+/// watermark, not per key, and a given transaction writes within one namespace.
+pub struct NamespacedKvEngine {
+    inner: Arc<dyn KvEngine>,
+    prefix: Bytes,
+}
+
+impl NamespacedKvEngine {
+    /// Builds a namespace from `namespace` plus a `0x00` separator. The
+    /// separator guarantees one namespace's prefix is never a prefix of
+    /// another's (e.g. `shard-1` vs `shard-10`).
+    pub fn new(inner: Arc<dyn KvEngine>, namespace: &str) -> Self {
+        let mut prefix = Vec::with_capacity(namespace.len() + 1);
+        prefix.extend_from_slice(namespace.as_bytes());
+        prefix.push(0u8);
+        Self {
+            inner,
+            prefix: Bytes::from(prefix),
+        }
+    }
+
+    fn physical_key(&self, key: &[u8]) -> Bytes {
+        let mut out = Vec::with_capacity(self.prefix.len() + key.len());
+        out.extend_from_slice(&self.prefix);
+        out.extend_from_slice(key);
+        Bytes::from(out)
+    }
+}
+
+impl KvEngine for NamespacedKvEngine {
+    fn get(&self, key: &[u8], read_ts: Timestamp) -> Result<Option<Bytes>> {
+        self.inner.get(&self.physical_key(key), read_ts)
+    }
+
+    fn scan(
+        &self,
+        range: KeyRange,
+        read_ts: Timestamp,
+    ) -> Result<Box<dyn Iterator<Item = Result<KvPair>> + Send>> {
+        let physical = KeyRange {
+            start: self.physical_key(range.start.as_ref()),
+            end: self.physical_key(range.end.as_ref()),
+        };
+        let prefix = self.prefix.clone();
+        let iter = self.inner.scan(physical, read_ts)?;
+        Ok(Box::new(iter.map(move |item| {
+            item.map(|pair| {
+                let key = match pair.key.strip_prefix(prefix.as_ref()) {
+                    Some(suffix) => Bytes::copy_from_slice(suffix),
+                    None => pair.key,
+                };
+                KvPair {
+                    key,
+                    value: pair.value,
+                    version: pair.version,
+                }
+            })
+        })))
+    }
+
+    fn write_intent(&self, txn_id: TxnId, key: Bytes, value: Bytes) -> Result<()> {
+        self.inner
+            .write_intent(txn_id, self.physical_key(&key), value)
+    }
+
+    fn delete_intent(&self, txn_id: TxnId, key: Bytes) -> Result<()> {
+        self.inner.delete_intent(txn_id, self.physical_key(&key))
+    }
+
+    fn replace_intent(
+        &self,
+        txn_id: TxnId,
+        key: Bytes,
+        replacement: IntentReplacement,
+    ) -> Result<()> {
+        self.inner
+            .replace_intent(txn_id, self.physical_key(&key), replacement)
+    }
+
+    fn commit(&self, txn_id: TxnId, commit_ts: Timestamp) -> Result<()> {
+        self.inner.commit(txn_id, commit_ts)
+    }
+
+    fn abort(&self, txn_id: TxnId) -> Result<()> {
+        self.inner.abort(txn_id)
+    }
+
+    fn garbage_collect(&self, watermark: Timestamp) -> Result<usize> {
+        self.inner.garbage_collect(watermark)
+    }
+
+    fn flush(&self) -> Result<()> {
+        self.inner.flush()
     }
 }
 

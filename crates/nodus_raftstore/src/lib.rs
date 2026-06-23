@@ -197,6 +197,24 @@ impl NodusRaftStore {
         }
     }
 
+    /// Builds a store for a data shard: it applies only KV commands to its
+    /// (namespaced) engine. Catalog/RBAC and upgrade commands are no-ops on a
+    /// data group — those are owned by the meta group.
+    pub fn with_kv(kv: Arc<dyn nodus_storage_api::KvEngine>) -> Self {
+        Self {
+            log: Arc::new(RwLock::new(BTreeMap::new())),
+            vote: Arc::new(RwLock::new(None)),
+            state_machine: Arc::new(RwLock::new(StateMachine {
+                last_applied_log: None,
+                last_membership: StoredMembership::default(),
+                kv: Some(kv),
+                catalog_writer: None,
+                catalog_reader: None,
+                upgrade: None,
+            })),
+        }
+    }
+
     pub fn with_components(
         kv: Arc<dyn nodus_storage_api::KvEngine>,
         catalog_writer: Arc<dyn nodus_catalog::CatalogWriter>,
