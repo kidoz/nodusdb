@@ -109,6 +109,146 @@ fn render(value: &Value) -> String {
     }
 }
 
+/// Encodes a literal projection-function argument back into the string form the
+/// planner stores: `'text'` for strings, plain digits for numbers/bools. (The
+/// projection model stores args as strings; [`resolve_scalar_arg`] parses them
+/// back at evaluation time.)
+fn literal_arg(value: &Value) -> String {
+    match value {
+        Value::Text(s) => format!("'{s}'"),
+        Value::Int(i) => i.to_string(),
+        Value::Float(f) => f.to_string(),
+        Value::Bool(b) => b.to_string(),
+        _ => String::new(),
+    }
+}
+
+/// Resolves one scalar-function argument to a value for a given row: a quoted
+/// `'…'` literal, a numeric literal, or otherwise a column reference.
+fn resolve_scalar_arg(arg: &str, row: &[Value], col_names: &[String]) -> Value {
+    if arg.len() >= 2 && arg.starts_with('\'') && arg.ends_with('\'') {
+        Value::Text(arg[1..arg.len() - 1].to_string())
+    } else if let Ok(i) = arg.parse::<i64>() {
+        Value::Int(i)
+    } else if let Ok(f) = arg.parse::<f64>() {
+        Value::Float(f)
+    } else {
+        col_names
+            .iter()
+            .position(|tc| tc == arg || tc.ends_with(&format!(".{arg}")))
+            .and_then(|i| row.get(i))
+            .cloned()
+            .unwrap_or(Value::Null)
+    }
+}
+
+/// Evaluates a scalar SQL function over already-resolved argument values.
+/// Unknown functions yield `Null` (the prior behaviour). NULL propagation
+/// follows SQL: most functions return NULL on a NULL primary argument.
+fn eval_scalar_function(name: &str, args: &[Value]) -> Value {
+    let as_text = |v: &Value| -> Option<String> {
+        match v {
+            Value::Null => None,
+            Value::Text(s) => Some(s.clone()),
+            other => Some(render(other)),
+        }
+    };
+    let as_num = |v: &Value| -> Option<f64> {
+        match v {
+            Value::Int(i) => Some(*i as f64),
+            Value::Float(f) => Some(*f),
+            Value::Text(s) => s.parse().ok(),
+            _ => None,
+        }
+    };
+    match name {
+        "CONCAT" => Value::Text(
+            args.iter()
+                .filter(|v| **v != Value::Null)
+                .map(render)
+                .collect(),
+        ),
+        "UPPER" => args
+            .first()
+            .and_then(&as_text)
+            .map_or(Value::Null, |s| Value::Text(s.to_uppercase())),
+        "LOWER" => args
+            .first()
+            .and_then(&as_text)
+            .map_or(Value::Null, |s| Value::Text(s.to_lowercase())),
+        "LENGTH" | "CHAR_LENGTH" | "CHARACTER_LENGTH" => args
+            .first()
+            .and_then(&as_text)
+            .map_or(Value::Null, |s| Value::Int(s.chars().count() as i64)),
+        "TRIM" => args
+            .first()
+            .and_then(&as_text)
+            .map_or(Value::Null, |s| Value::Text(s.trim().to_string())),
+        "LTRIM" => args
+            .first()
+            .and_then(&as_text)
+            .map_or(Value::Null, |s| Value::Text(s.trim_start().to_string())),
+        "RTRIM" => args
+            .first()
+            .and_then(&as_text)
+            .map_or(Value::Null, |s| Value::Text(s.trim_end().to_string())),
+        "COALESCE" => args
+            .iter()
+            .find(|v| **v != Value::Null)
+            .cloned()
+            .unwrap_or(Value::Null),
+        "NULLIF" => {
+            if args.len() == 2 && args[0] == args[1] {
+                Value::Null
+            } else {
+                args.first().cloned().unwrap_or(Value::Null)
+            }
+        }
+        "ABS" => match args.first() {
+            Some(Value::Int(i)) => Value::Int(i.abs()),
+            Some(Value::Float(f)) => Value::Float(f.abs()),
+            _ => Value::Null,
+        },
+        "ROUND" => match args.first().and_then(&as_num) {
+            Some(x) => {
+                let digits = args.get(1).and_then(&as_num).unwrap_or(0.0) as i32;
+                let factor = 10f64.powi(digits);
+                Value::Float((x * factor).round() / factor)
+            }
+            None => Value::Null,
+        },
+        "REPLACE" => {
+            if let (Some(s), Some(from), Some(to)) = (
+                args.first().and_then(&as_text),
+                args.get(1).and_then(&as_text),
+                args.get(2).and_then(&as_text),
+            ) {
+                Value::Text(s.replace(&from, &to))
+            } else {
+                Value::Null
+            }
+        }
+        "SUBSTR" | "SUBSTRING" => {
+            let Some(s) = args.first().and_then(&as_text) else {
+                return Value::Null;
+            };
+            let chars: Vec<char> = s.chars().collect();
+            let start = args.get(1).and_then(&as_num).unwrap_or(1.0) as i64; // 1-based
+            let start_idx = (start.max(1) - 1) as usize;
+            let out: String = match args.get(2).and_then(&as_num) {
+                Some(len) => chars
+                    .iter()
+                    .skip(start_idx)
+                    .take(len.max(0.0) as usize)
+                    .collect(),
+                None => chars.iter().skip(start_idx).collect(),
+            };
+            Value::Text(out)
+        }
+        _ => Value::Null,
+    }
+}
+
 /// Orders two values of the same logical type. Mixed/None types fall back to
 /// comparing rendered strings so ordering is always total.
 fn compare(a: &Value, b: &Value) -> std::cmp::Ordering {
@@ -1389,10 +1529,8 @@ fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Result<Logical
                                     {
                                         if let Some(col) = extract_col_name(e) {
                                             args.push(col);
-                                        } else if let Some(crate::Value::Text(s)) =
-                                            expr_to_value(e, &[])
-                                        {
-                                            args.push(format!("'{}'", s));
+                                        } else if let Some(val) = expr_to_value(e, params) {
+                                            args.push(literal_arg(&val));
                                         }
                                     }
                                 }
@@ -1512,10 +1650,8 @@ fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Result<Logical
                                     {
                                         if let Some(col) = extract_col_name(e) {
                                             args.push(col);
-                                        } else if let Some(crate::Value::Text(s)) =
-                                            expr_to_value(e, params)
-                                        {
-                                            args.push(format!("'{}'", s));
+                                        } else if let Some(val) = expr_to_value(e, params) {
+                                            args.push(literal_arg(&val));
                                         }
                                     }
                                 }
@@ -5346,26 +5482,11 @@ impl MemExecutor {
                             } => {
                                 let mut results = vec![Value::Null; stored_rows.len()];
                                 for (row_idx, row) in stored_rows.iter().enumerate() {
-                                    if func_name == "CONCAT" {
-                                        let mut s = String::new();
-                                        for arg in args {
-                                            if arg.starts_with('\'') && arg.ends_with('\'') {
-                                                s.push_str(&arg[1..arg.len() - 1]);
-                                            } else {
-                                                let c_idx = col_names.iter().position(|tc| {
-                                                    tc == arg || tc.ends_with(&format!(".{}", arg))
-                                                });
-                                                if let Some(i) = c_idx {
-                                                    if let Some(v) = row.get(i) {
-                                                        if *v != Value::Null {
-                                                            s.push_str(&render(v));
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        results[row_idx] = Value::Text(s);
-                                    }
+                                    let resolved: Vec<Value> = args
+                                        .iter()
+                                        .map(|a| resolve_scalar_arg(a, row, &col_names))
+                                        .collect();
+                                    results[row_idx] = eval_scalar_function(func_name, &resolved);
                                 }
                                 for (row_idx, row) in stored_rows.iter_mut().enumerate() {
                                     row.push(results[row_idx].clone());
@@ -7256,6 +7377,54 @@ mod phase2_tests {
 
         let p4 = read("SELECT COUNT(*) FROM sales");
         assert_eq!(p4, vec!["0"]);
+    }
+
+    #[test]
+    fn test_scalar_functions() {
+        let (exec, cat) = MemExecutor::shared(Arc::new(MemoryAuditSink::new()));
+        let admin = cat
+            .create_role(nodus_catalog::CreateRoleRequest {
+                id: nodus_catalog::PrincipalId::new(),
+                name: "admin".into(),
+                principal_type: nodus_catalog::PrincipalType::User,
+                database_id: None,
+            })
+            .unwrap();
+        cat.grant_privilege(nodus_catalog::GrantPrivilegeRequest {
+            id: nodus_catalog::GrantId::new(),
+            principal_id: admin.id,
+            resource: nodus_catalog::ResourceRef::System,
+            privilege: "ALL".into(),
+        })
+        .unwrap();
+        let ctx = test_ctx(admin.id);
+
+        let run = |sql: &str| {
+            let mut stmts = nodus_sql::parse_sql(sql).unwrap();
+            let plan = plan_statement(&stmts.remove(0), &[]).unwrap();
+            exec.execute_logical(&ctx, plan).unwrap()
+        };
+
+        run("CREATE TABLE t (id INT, name TEXT)");
+        run("INSERT INTO t (id, name) VALUES (1, 'Alice')");
+
+        // Column args resolve per row; string/numeric literal args (e.g. SUBSTR
+        // start/len, ROUND digits) are now captured by the planner.
+        let out = run(
+            "SELECT UPPER(name), LOWER(name), LENGTH(name), SUBSTR(name, 1, 3), \
+             COALESCE(name, 'x'), CONCAT(name, '!'), REPLACE(name, 'lic', 'LIC'), \
+             ROUND(12.345, 1) FROM t",
+        );
+        assert_eq!(out.rows.len(), 1);
+        let row = render_row(&out.rows[0]);
+        assert_eq!(row[0], "ALICE"); // UPPER
+        assert_eq!(row[1], "alice"); // LOWER
+        assert_eq!(row[2], "5"); // LENGTH
+        assert_eq!(row[3], "Ali"); // SUBSTR(name, 1, 3)
+        assert_eq!(row[4], "Alice"); // COALESCE(name, 'x')
+        assert_eq!(row[5], "Alice!"); // CONCAT(name, '!')
+        assert_eq!(row[6], "ALICe"); // REPLACE(name, 'lic', 'LIC')
+        assert_eq!(row[7], "12.3"); // ROUND(12.345, 1)
     }
 }
 
