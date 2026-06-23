@@ -48,3 +48,6 @@ chrono.workspace = true
 base64 = "0.22.1"
 axum-server = { version = "0.8.0", features = ["tls-rustls"] }
 sqlparser.workspace = true
+
+[lints]
+workspace = true

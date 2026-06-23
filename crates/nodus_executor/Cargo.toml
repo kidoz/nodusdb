@@ -28,3 +28,6 @@ sqlparser.workspace = true
 serde_json.workspace = true
 regex = "1.12.3"
 async-trait.workspace = true
+
+[lints]
+workspace = true

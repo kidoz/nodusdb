@@ -11,3 +11,5 @@ prometheus-client.workspace = true
 axum.workspace = true
 tokio.workspace = true
 serde.workspace = true
+[lints]
+workspace = true

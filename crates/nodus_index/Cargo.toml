@@ -20,3 +20,5 @@ nodus_storage_mem = { path = "../nodus_storage_mem", optional = true }
 
 [dev-dependencies]
 nodus_storage_mem = { path = "../nodus_storage_mem" }
+[lints]
+workspace = true

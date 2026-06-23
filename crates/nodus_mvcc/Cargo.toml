@@ -12,3 +12,5 @@ thiserror.workspace = true
 serde.workspace = true
 bytes.workspace = true
 nodus_storage_api = { path = "../nodus_storage_api" }
+[lints]
+workspace = true

@@ -13,3 +13,5 @@ tokio.workspace = true
 anyhow.workspace = true
 serde_json.workspace = true
 nodus_monitoring = { path = "../nodus_monitoring" }
+[lints]
+workspace = true

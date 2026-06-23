@@ -15,3 +15,6 @@ chrono.workspace = true
 nodus_catalog = { path = "../nodus_catalog" }
 nodus_security = { path = "../nodus_security" }
 tracing.workspace = true
+
+[lints]
+workspace = true

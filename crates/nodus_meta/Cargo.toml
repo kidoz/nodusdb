@@ -15,3 +15,6 @@ nodus_storage_api = { path = "../nodus_storage_api" }
 serde_json.workspace = true
 bytes.workspace = true
 async-trait.workspace = true
+
+[lints]
+workspace = true

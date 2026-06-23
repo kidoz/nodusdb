@@ -12,3 +12,5 @@ thiserror.workspace = true
 serde.workspace = true
 nodus_catalog = { path = "../nodus_catalog" }
 nodus_security = { path = "../nodus_security" }
+[lints]
+workspace = true

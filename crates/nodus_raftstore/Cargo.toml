@@ -22,3 +22,6 @@ serde_json.workspace = true
 uuid.workspace = true
 tracing.workspace = true
 nodus_upgrade = { version = "0.1.0", path = "../nodus_upgrade" }
+
+[lints]
+workspace = true

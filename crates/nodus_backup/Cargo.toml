@@ -22,3 +22,5 @@ object_store = { version = "0.11", features = ["aws"] }
 nodus_catalog = { path = "../nodus_catalog" }
 nodus_storage_api = { path = "../nodus_storage_api" }
 nodus_monitoring = { path = "../nodus_monitoring" }
+[lints]
+workspace = true
