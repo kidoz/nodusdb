@@ -695,4 +695,67 @@ mod sst_tests {
         // Value is still readable! Wait... does get() read from sstables?
         // Ah, our get() method only reads from memtable right now. We need to fix that!
     }
+
+    #[test]
+    fn block_indexed_sstable_round_trips_many_keys() {
+        let dir = TempDir::new().unwrap();
+        let engine = LsmKvEngine::with_wal(dir.path(), None).unwrap();
+
+        // Enough keys to span several ~4 KiB data blocks, exercising the sparse
+        // index binary search and the bloom filter.
+        let n = 500u32;
+        let txn = TxnId::new();
+        for i in 0..n {
+            engine
+                .write_intent(
+                    txn,
+                    Bytes::from(format!("key{i:05}")),
+                    Bytes::from(format!("val{i:05}")),
+                )
+                .unwrap();
+        }
+        engine.commit(txn, 10).unwrap();
+        engine.flush().unwrap();
+        assert!(
+            engine.memtable.read().unwrap().is_empty(),
+            "flushed to SSTable"
+        );
+
+        // Point lookups across the block range resolve via index + bloom.
+        for i in [0u32, 1, 250, 499] {
+            assert_eq!(
+                engine
+                    .get(format!("key{i:05}").as_bytes(), 15)
+                    .unwrap()
+                    .unwrap(),
+                Bytes::from(format!("val{i:05}"))
+            );
+        }
+        // Absent keys (bloom-negative or index-miss) return None, no false hits.
+        assert!(engine.get(b"key99999", 15).unwrap().is_none());
+        assert!(engine.get(b"aaa", 15).unwrap().is_none());
+        assert!(engine.get(b"zzz", 15).unwrap().is_none());
+
+        // Scans still yield sorted entries across blocks.
+        let scanned: Vec<Bytes> = engine
+            .scan(
+                KeyRange {
+                    start: Bytes::from("key00100"),
+                    end: Bytes::from("key00103"),
+                },
+                15,
+            )
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .map(|p| p.key)
+            .collect();
+        assert_eq!(
+            scanned,
+            vec![
+                Bytes::from("key00100"),
+                Bytes::from("key00101"),
+                Bytes::from("key00102"),
+            ]
+        );
+    }
 }
