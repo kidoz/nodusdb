@@ -598,17 +598,41 @@ pub async fn run_server_with_config(
         .layer(cors);
 
     let metrics_state = state.clone();
+    let metrics_manager = multi_raft.clone();
+    let metrics_node_id = config.cluster.node_id;
     let mut raft_metrics = raft.metrics();
     let mut rm_shutdown = shutdown.clone();
     tokio::spawn(async move {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut shard_tick = tokio::time::interval(std::time::Duration::from_secs(2));
         loop {
             tokio::select! {
                 res = raft_metrics.changed() => {
                     if res.is_err() { break; }
                     let m = raft_metrics.borrow().clone();
-                    let count = m.membership_config.membership().voter_ids().count() as u32;
-                    metrics_state.cluster.nodes_total.store(count, std::sync::atomic::Ordering::Relaxed);
-                    metrics_state.cluster.nodes_live.store(count, std::sync::atomic::Ordering::Relaxed); // Simplified: assuming all voters are live for MVP
+                    let voters = m.membership_config.membership().voter_ids().count() as u32;
+                    // Live nodes from the meta leader's view: itself, plus voters
+                    // it is actively replicating to. A follower cannot assess its
+                    // peers, so it reports the full membership. (Heartbeat-recency
+                    // liveness would be more precise; this replaces the previous
+                    // "assume every voter is live".)
+                    let live = if m.current_leader == Some(metrics_node_id) {
+                        let followers = m
+                            .replication
+                            .as_ref()
+                            .map(|r| r.values().filter(|v| v.is_some()).count() as u32)
+                            .unwrap_or(0);
+                        (1 + followers).min(voters.max(1))
+                    } else {
+                        voters
+                    };
+                    metrics_state.cluster.nodes_total.store(voters, Relaxed);
+                    metrics_state.cluster.nodes_live.store(live, Relaxed);
+                }
+                _ = shard_tick.tick() => {
+                    let (total, unavailable) = metrics_manager.shard_health().await;
+                    metrics_state.cluster.shards_total.store(total, Relaxed);
+                    metrics_state.cluster.shards_unavailable.store(unavailable, Relaxed);
                 }
                 _ = rm_shutdown.changed() => {
                     break;

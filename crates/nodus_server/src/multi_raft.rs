@@ -69,6 +69,25 @@ impl MultiRaftManager {
         self.hosted.read().unwrap().contains(shard_id)
     }
 
+    /// Health of the data-shard groups hosted here: `(total, without_leader)`.
+    /// A group with no current leader is unavailable for reads/writes. The meta
+    /// group is excluded. Feeds the cluster-overview shard health.
+    pub async fn shard_health(&self) -> (u32, u32) {
+        let rafts = self.state.rafts.read().await;
+        let mut total = 0;
+        let mut without_leader = 0;
+        for (id, raft) in rafts.iter() {
+            if id == META_SHARD {
+                continue;
+            }
+            total += 1;
+            if raft.metrics().borrow().current_leader.is_none() {
+                without_leader += 1;
+            }
+        }
+        (total, without_leader)
+    }
+
     /// Creates the metadata group with full catalog/RBAC/upgrade components.
     /// Membership initialization (single-node bootstrap or join) is driven by
     /// the caller, as today.
@@ -346,6 +365,25 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         assert!(led, "reconciled shard group should elect a leader");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shard_health_reports_groups_without_a_leader() {
+        let mgr = manager(); // node_id = 1
+        // A led group and an uninitialized (leaderless) group.
+        let led = mgr.get_or_create_data("shard-led").await.unwrap();
+        mgr.init_single(&led).await;
+        for _ in 0..30 {
+            if led.metrics().borrow().current_leader == Some(1) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let _idle = mgr.get_or_create_data("shard-idle").await.unwrap();
+
+        let (total, without_leader) = mgr.shard_health().await;
+        assert_eq!(total, 2, "both data groups counted");
+        assert_eq!(without_leader, 1, "only the uninitialized group lacks a leader");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
