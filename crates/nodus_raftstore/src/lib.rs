@@ -33,13 +33,22 @@ pub enum ShardCommand {
         txn_id: String,
         key: Vec<u8>,
         value: Vec<u8>,
+        /// Data shard this write was routed to (`None` = the meta group). Recorded
+        /// for observability and forward use (cross-shard commit, data movement);
+        /// the applying group already owns the correct (namespaced) engine.
+        #[serde(default)]
+        shard_id: Option<String>,
     },
     CommitTxn {
         txn_id: String,
         commit_ts: u64,
+        #[serde(default)]
+        shard_id: Option<String>,
     },
     AbortTxn {
         txn_id: String,
+        #[serde(default)]
+        shard_id: Option<String>,
     },
     IndexPutIntent {
         txn_id: String,
@@ -55,6 +64,8 @@ pub enum ShardCommand {
     DeleteIntent {
         txn_id: String,
         key: Vec<u8>,
+        #[serde(default)]
+        shard_id: Option<String>,
     },
     SplitShard {
         split_key: Vec<u8>,
@@ -381,7 +392,9 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
                         use std::str::FromStr;
 
                         match cmd {
-                            ShardCommand::PutIntent { txn_id, key, value } => {
+                            ShardCommand::PutIntent {
+                                txn_id, key, value, ..
+                            } => {
                                 if let Ok(tid) = uuid::Uuid::from_str(txn_id) {
                                     let _ = kv.write_intent(
                                         TxnId(tid),
@@ -390,17 +403,19 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
                                     );
                                 }
                             }
-                            ShardCommand::DeleteIntent { txn_id, key } => {
+                            ShardCommand::DeleteIntent { txn_id, key, .. } => {
                                 if let Ok(tid) = uuid::Uuid::from_str(txn_id) {
                                     let _ = kv.delete_intent(TxnId(tid), Bytes::from(key.clone()));
                                 }
                             }
-                            ShardCommand::CommitTxn { txn_id, commit_ts } => {
+                            ShardCommand::CommitTxn {
+                                txn_id, commit_ts, ..
+                            } => {
                                 if let Ok(tid) = uuid::Uuid::from_str(txn_id) {
                                     let _ = kv.commit(TxnId(tid), *commit_ts);
                                 }
                             }
-                            ShardCommand::AbortTxn { txn_id } => {
+                            ShardCommand::AbortTxn { txn_id, .. } => {
                                 if let Ok(tid) = uuid::Uuid::from_str(txn_id) {
                                     let _ = kv.abort(TxnId(tid));
                                 }

@@ -255,10 +255,18 @@ pub async fn run_server_with_config(
     // traits to async Raft `client_write` without `block_in_place`.
     let raft_router = crate::raft_router::RaftRouter::spawn(multi_raft.clone());
 
+    // Cluster metadata + shard routing. Shared by the KV write/read path (to
+    // route keys to their owning group) and the shard admin orchestrator.
+    let meta = Arc::new(nodus_meta::MemMetaStore::new());
+    let shard_router: Arc<dyn nodus_sharding::ShardRouter> =
+        Arc::new(nodus_sharding::CatalogShardRouter::new(meta.clone()));
+
     let raft_kv = Arc::new(crate::raft_kv::RaftKvEngine {
         local: local_kv.clone(),
         router: raft_router.clone(),
-        shard_id: crate::multi_raft::META_SHARD.to_string(),
+        shard_router: shard_router.clone(),
+        manager: multi_raft.clone(),
+        txn_groups: std::sync::Mutex::new(std::collections::HashMap::new()),
     });
 
     let raft_catalog_writer = Arc::new(crate::raft_catalog::RaftCatalogWriter {
@@ -521,8 +529,7 @@ pub async fn run_server_with_config(
         }
     });
 
-    let meta = Arc::new(nodus_meta::MemMetaStore::new());
-    let shards = Arc::new(nodus_sharding::ShardOrchestrator::new(meta));
+    let shards = Arc::new(nodus_sharding::ShardOrchestrator::new(meta.clone()));
 
     let raft_upgrade_coordinator = Arc::new(crate::raft_upgrade::RaftUpgradeCoordinator {
         local: local_upgrade.clone(),

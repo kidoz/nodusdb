@@ -67,6 +67,7 @@ async fn write_val(State(state): State<RaftState>, Json(val): Json<i32>) -> Json
         txn_id: txn_id.clone(),
         key: b"register".to_vec(),
         value: val.to_string().into_bytes(),
+        shard_id: None,
     };
     let cmd2 = ShardCommand::CommitTxn {
         txn_id,
@@ -74,6 +75,7 @@ async fn write_val(State(state): State<RaftState>, Json(val): Json<i32>) -> Json
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_micros() as u64,
+        shard_id: None,
     };
     let raft = state.rafts.read().await.get("shard-meta").cloned().unwrap();
     if raft.client_write(cmd1).await.is_err() {

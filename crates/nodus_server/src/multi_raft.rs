@@ -9,7 +9,8 @@
 //! lifecycle is Phase 5.
 
 use anyhow::Result;
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, RwLock};
 
 use nodus_raftstore::NodusRaftStore;
 use nodus_raftstore::network::NodusNetworkFactory;
@@ -26,9 +27,11 @@ pub struct MultiRaftManager {
     config: Arc<openraft::Config>,
     state: RaftState,
     /// The node's local KV store; data groups receive namespaced views of it.
-    /// Consumed by `get_or_create_data` once routing lands in Phase 2.
-    #[allow(dead_code)]
     base_kv: Arc<dyn KvEngine>,
+    /// Synchronous mirror of the group ids in `state`, so the (synchronous)
+    /// KV write/read path can check group membership without awaiting the
+    /// async `RaftState` lock. Always updated alongside `state`.
+    hosted: Arc<RwLock<HashSet<String>>>,
 }
 
 impl MultiRaftManager {
@@ -43,12 +46,19 @@ impl MultiRaftManager {
             config,
             state,
             base_kv,
+            hosted: Arc::new(RwLock::new(HashSet::new())),
         }
     }
 
     /// Returns an existing group's handle, if this node hosts it.
     pub async fn get(&self, shard_id: &str) -> Option<NodusRaft> {
         self.state.rafts.read().await.get(shard_id).cloned()
+    }
+
+    /// Synchronously reports whether this node hosts a group for `shard_id`.
+    /// Used by the KV write/read path to decide routing without awaiting.
+    pub fn hosts(&self, shard_id: &str) -> bool {
+        self.hosted.read().unwrap().contains(shard_id)
     }
 
     /// Creates the metadata group with full catalog/RBAC/upgrade components.
@@ -100,7 +110,15 @@ impl MultiRaftManager {
             .write()
             .await
             .insert(shard_id.to_string(), raft.clone());
+        self.hosted.write().unwrap().insert(shard_id.to_string());
         Ok(raft)
+    }
+
+    /// Group id convention for the data shard identified by `shard_id`. Also the
+    /// KV namespace prefix, so the routing read/write path and the group's own
+    /// state-machine engine agree on where a key lives.
+    pub fn data_group_id(shard_id: nodus_catalog::ShardId) -> String {
+        format!("shard-{shard_id}")
     }
 }
 
