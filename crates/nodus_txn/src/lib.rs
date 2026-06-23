@@ -37,9 +37,19 @@ pub struct TxnRecord {
     pub write_set: Vec<Vec<u8>>,
 }
 
+/// A hybrid logical clock: wall-clock-driven but strictly monotonic, and
+/// mergeable with timestamps observed from other nodes so that timestamps stay
+/// comparable cluster-wide (bounded by clock skew).
+///
+/// Timestamps are microseconds since the Unix epoch, with the HLC's logical
+/// component expressed as extra microseconds: each event advances the clock by
+/// at least one µs, so two events in the same wall-clock microsecond still get
+/// distinct, increasing timestamps. Keeping the µs scale preserves the meaning
+/// of `commit_ts` for PITR/WAL replay while guaranteeing monotonicity.
 #[derive(Debug, Clone, Copy)]
 pub struct HybridLogicalClock {
-    pub logical_time: u64,
+    /// The most recently issued timestamp.
+    last: Timestamp,
 }
 
 impl Default for HybridLogicalClock {
@@ -50,18 +60,39 @@ impl Default for HybridLogicalClock {
 
 impl HybridLogicalClock {
     pub fn new() -> Self {
-        Self { logical_time: 0 }
+        Self { last: 0 }
     }
 
-    pub fn now(&self) -> Timestamp {
+    fn wall_now() -> Timestamp {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_micros() as u64
     }
 
+    /// Reads the current clock without advancing it: the larger of wall-clock
+    /// now and the last issued timestamp. Used as the GC watermark when no
+    /// transactions are in flight.
+    pub fn now(&self) -> Timestamp {
+        Self::wall_now().max(self.last)
+    }
+
+    /// Issues the next timestamp for a local event. Strictly greater than every
+    /// timestamp this clock has issued, and ≥ wall-clock now.
     pub fn tick(&mut self) -> Timestamp {
-        self.now()
+        let next = Self::wall_now().max(self.last + 1);
+        self.last = next;
+        next
+    }
+
+    /// Merges a timestamp observed from another node (an HLC "receive" event):
+    /// issues a fresh timestamp strictly greater than both the local last and
+    /// the remote timestamp. Afterwards, locally issued timestamps order after
+    /// the observed remote event.
+    pub fn update(&mut self, remote: Timestamp) -> Timestamp {
+        let next = Self::wall_now().max(self.last + 1).max(remote + 1);
+        self.last = next;
+        next
     }
 }
 
@@ -81,6 +112,12 @@ pub trait TxnManager: Send + Sync {
     fn gc_watermark(&self) -> Timestamp {
         0
     }
+
+    /// Merges a timestamp observed from another node into the local clock so
+    /// future timestamps order strictly after it (HLC receive). This is what
+    /// keeps `read_ts`/`commit_ts` comparable across nodes once they exchange
+    /// timestamps; cross-shard transactions (2PC) rely on it. Default: no-op.
+    fn observe_timestamp(&self, _ts: Timestamp) {}
 }
 
 // In-Memory MVP Implementation
@@ -210,6 +247,10 @@ impl TxnManager for MemTxnManager {
         // the current clock lets GC reclaim all superseded versions.
         oldest_active.unwrap_or_else(|| self.hlc.read().unwrap().now())
     }
+
+    fn observe_timestamp(&self, ts: Timestamp) {
+        self.hlc.write().unwrap().update(ts);
+    }
 }
 
 // Regular unit tests use std locks and must not run under loom, where lock
@@ -229,6 +270,45 @@ mod tests {
 
         // Aborting already committed should fail
         assert!(manager.abort_txn(txn.txn_id).is_err());
+    }
+
+    #[test]
+    fn clock_ticks_are_strictly_monotonic_within_a_microsecond() {
+        // A tight burst issues many timestamps within the same wall-clock µs;
+        // each must still be strictly greater than the last.
+        let mut hlc = HybridLogicalClock::new();
+        let mut prev = hlc.tick();
+        for _ in 0..100_000 {
+            let next = hlc.tick();
+            assert!(next > prev, "clock went backwards or stalled: {next} <= {prev}");
+            prev = next;
+        }
+    }
+
+    #[test]
+    fn update_advances_strictly_past_a_remote_timestamp() {
+        let mut hlc = HybridLogicalClock::new();
+        let local = hlc.tick();
+        let remote = local + 5_000_000_000; // far ahead of local wall clock
+        let merged = hlc.update(remote);
+        assert!(merged > remote, "merge must order after the remote event");
+        assert!(hlc.tick() > merged, "subsequent ticks stay ahead of the merge");
+    }
+
+    #[test]
+    fn observed_timestamps_order_future_transactions_after_them() {
+        let manager = MemTxnManager::new();
+        let first = manager.begin_txn().unwrap();
+        let remote = first.read_ts + 5_000_000_000;
+        manager.observe_timestamp(remote);
+
+        let next = manager.begin_txn().unwrap();
+        assert!(
+            next.read_ts > remote,
+            "a read_ts issued after observing a remote ts must order after it"
+        );
+        let commit_ts = manager.commit_txn(next.txn_id).unwrap();
+        assert!(commit_ts > next.read_ts);
     }
 }
 
