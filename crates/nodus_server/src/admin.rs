@@ -648,6 +648,19 @@ async fn restore_backup(
     }
 }
 
+/// Runs a synchronous upgrade-coordinator write on the blocking pool. The
+/// coordinator routes through the async `RaftRouter` (waiting via `blocking_recv`),
+/// so the call must not run on a reactor worker thread.
+async fn run_upgrade_op<F>(op: F) -> Result<(), anyhow::Error>
+where
+    F: FnOnce() -> Result<(), anyhow::Error> + Send + 'static,
+{
+    match tokio::task::spawn_blocking(op).await {
+        Ok(res) => res,
+        Err(join_err) => Err(anyhow::anyhow!("upgrade task failed: {join_err}")),
+    }
+}
+
 /// Serializes the current upgrade state, or wraps an operation error alongside
 /// the (unchanged) state so clients always get a consistent shape.
 fn upgrade_response(state: &AdminState, op: Result<(), anyhow::Error>) -> Json<Value> {
@@ -675,7 +688,8 @@ async fn upgrade_start(
         .get("target")
         .cloned()
         .unwrap_or_else(|| "next".to_string());
-    let op = state.upgrade.start_upgrade(target);
+    let upgrade = state.upgrade.clone();
+    let op = run_upgrade_op(move || upgrade.start_upgrade(target)).await;
     upgrade_response(&state, op)
 }
 
@@ -684,17 +698,20 @@ async fn upgrade_node_upgraded(
     Query(params): Query<HashMap<String, String>>,
 ) -> Json<Value> {
     let node = params.get("node").cloned().unwrap_or_else(|| "node".into());
-    let op = state.upgrade.report_node_upgraded(&node);
+    let upgrade = state.upgrade.clone();
+    let op = run_upgrade_op(move || upgrade.report_node_upgraded(&node)).await;
     upgrade_response(&state, op)
 }
 
 async fn upgrade_finalize(State(state): State<AdminState>) -> Json<Value> {
-    let op = state.upgrade.finalize_upgrade();
+    let upgrade = state.upgrade.clone();
+    let op = run_upgrade_op(move || upgrade.finalize_upgrade()).await;
     upgrade_response(&state, op)
 }
 
 async fn upgrade_rollback(State(state): State<AdminState>) -> Json<Value> {
-    let op = state.upgrade.rollback();
+    let upgrade = state.upgrade.clone();
+    let op = run_upgrade_op(move || upgrade.rollback()).await;
     upgrade_response(&state, op)
 }
 

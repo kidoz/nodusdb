@@ -530,7 +530,8 @@ pub async fn run_server_with_config(
 
     let raft_upgrade_coordinator = Arc::new(crate::raft_upgrade::RaftUpgradeCoordinator {
         local: local_upgrade.clone(),
-        raft_state: raft_state.clone(),
+        router: raft_router.clone(),
+        shard_id: "shard-meta".to_string(),
     });
 
     let admin_state = AdminState {

@@ -1,21 +1,29 @@
 use anyhow::Result;
-use nodus_raftstore::{NodusTypeConfig, ShardCommand};
+use nodus_raftstore::ShardCommand;
 use nodus_upgrade::{UpgradeCoordinator, UpgradeState};
-use openraft::Raft;
 use std::sync::Arc;
 
+use crate::raft_router::RaftRouter;
+
+/// `UpgradeCoordinator` that replicates rolling-upgrade transitions through Raft
+/// (the `shard-meta` group) before reading state back from the local coordinator.
+///
+/// Write methods route through the async [`RaftRouter`], whose `submit` waits via
+/// `blocking_recv` — so they MUST be invoked from a blocking context (e.g. inside
+/// `tokio::task::spawn_blocking`), never directly on a runtime worker thread.
 pub struct RaftUpgradeCoordinator {
     pub local: Arc<dyn UpgradeCoordinator>,
-    pub raft_state: nodus_raftstore::server::RaftState,
+    pub router: RaftRouter,
+    pub shard_id: String,
 }
 
 impl RaftUpgradeCoordinator {
-    async fn get_raft(&self) -> Result<Raft<NodusTypeConfig>> {
-        let rafts = self.raft_state.rafts.read().await;
-        rafts
-            .get("shard-meta")
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("Meta shard raft not found"))
+    /// Replicate an upgrade command and surface a labelled error on failure.
+    fn replicate(&self, op: &str, cmd: ShardCommand) -> Result<()> {
+        self.router.submit(&self.shard_id, cmd).map_err(|e| {
+            tracing::error!("{op} client_write failed: {e}");
+            anyhow::anyhow!("{op} raft error: {e}")
+        })
     }
 }
 
@@ -25,73 +33,24 @@ impl UpgradeCoordinator for RaftUpgradeCoordinator {
     }
 
     fn start_upgrade(&self, target_version: String) -> Result<()> {
-        let cmd = ShardCommand::UpgradeStart { target_version };
-        let res = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                let raft = self.get_raft().await?;
-                raft.client_write(cmd)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("raft write error: {}", e))
-            })
-        });
-        if let Err(e) = res {
-            tracing::error!("start_upgrade client_write failed: {}", e);
-            anyhow::bail!("start_upgrade raft error: {}", e);
-        }
-        Ok(())
+        self.replicate("start_upgrade", ShardCommand::UpgradeStart { target_version })
     }
 
     fn report_node_upgraded(&self, node_id: &str) -> Result<()> {
-        let cmd = ShardCommand::UpgradeNodeUpgraded {
-            node_id: node_id.to_string(),
-        };
-        let res = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                let raft = self.get_raft().await?;
-                raft.client_write(cmd)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("raft write error: {}", e))
-            })
-        });
-        if let Err(e) = res {
-            tracing::error!("report_node_upgraded client_write failed: {}", e);
-            anyhow::bail!("report_node_upgraded raft error: {}", e);
-        }
-        Ok(())
+        self.replicate(
+            "report_node_upgraded",
+            ShardCommand::UpgradeNodeUpgraded {
+                node_id: node_id.to_string(),
+            },
+        )
     }
 
     fn finalize_upgrade(&self) -> Result<()> {
-        let cmd = ShardCommand::UpgradeFinalize;
-        let res = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                let raft = self.get_raft().await?;
-                raft.client_write(cmd)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("raft write error: {}", e))
-            })
-        });
-        if let Err(e) = res {
-            tracing::error!("finalize_upgrade client_write failed: {}", e);
-            anyhow::bail!("finalize_upgrade raft error: {}", e);
-        }
-        Ok(())
+        self.replicate("finalize_upgrade", ShardCommand::UpgradeFinalize)
     }
 
     fn rollback(&self) -> Result<()> {
-        let cmd = ShardCommand::UpgradeRollback;
-        let res = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                let raft = self.get_raft().await?;
-                raft.client_write(cmd)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("raft write error: {}", e))
-            })
-        });
-        if let Err(e) = res {
-            tracing::error!("rollback client_write failed: {}", e);
-            anyhow::bail!("rollback raft error: {}", e);
-        }
-        Ok(())
+        self.replicate("rollback", ShardCommand::UpgradeRollback)
     }
 
     fn is_gate_enabled(&self, feature: &str) -> bool {
