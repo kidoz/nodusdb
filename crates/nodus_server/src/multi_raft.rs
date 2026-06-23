@@ -383,7 +383,10 @@ mod tests {
 
         let (total, without_leader) = mgr.shard_health().await;
         assert_eq!(total, 2, "both data groups counted");
-        assert_eq!(without_leader, 1, "only the uninitialized group lacks a leader");
+        assert_eq!(
+            without_leader, 1,
+            "only the uninitialized group lacks a leader"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -406,7 +409,8 @@ mod tests {
 
         // Host the source group and seed it with one key on each side of 'm'.
         mgr.reconcile(&orch.placements()).await.unwrap();
-        let src_ns = NamespacedKvEngine::new(base.clone(), &MultiRaftManager::data_group_id(source));
+        let src_ns =
+            NamespacedKvEngine::new(base.clone(), &MultiRaftManager::data_group_id(source));
         for (k, v) in [(b"a".as_slice(), b"va".as_slice()), (b"z", b"vz")] {
             let t = TxnId::new();
             src_ns
@@ -416,7 +420,10 @@ mod tests {
         }
 
         // Split at 'm' (0x6d): "a" → left, "z" → right.
-        let (left, right) = mgr.split_shard(&orch, table, source, vec![0x6d]).await.unwrap();
+        let (left, right) = mgr
+            .split_shard(&orch, table, source, vec![0x6d])
+            .await
+            .unwrap();
 
         // Routing flipped: children hosted, source decommissioned.
         assert!(mgr.hosts(&MultiRaftManager::data_group_id(left)));

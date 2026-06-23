@@ -1160,30 +1160,42 @@ fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Result<Logical
         }
     }
 
-    if let SetExpr::SetOperation { op, set_quantifier, left, right } = &*query.body {
+    if let SetExpr::SetOperation {
+        op,
+        set_quantifier,
+        left,
+        right,
+    } = &*query.body
+    {
         if *op == SetOperator::Union && *set_quantifier == SetQuantifier::All {
-            let left_plan = plan_query(&Query {
-                with: None,
-                body: left.clone(),
-                order_by: vec![],
-                limit: None,
-                limit_by: vec![],
-                offset: None,
-                fetch: None,
-                locks: vec![],
-                for_clause: None,
-            }, params)?;
-            let right_plan = plan_query(&Query {
-                with: None,
-                body: right.clone(),
-                order_by: vec![],
-                limit: None,
-                limit_by: vec![],
-                offset: None,
-                fetch: None,
-                locks: vec![],
-                for_clause: None,
-            }, params)?;
+            let left_plan = plan_query(
+                &Query {
+                    with: None,
+                    body: left.clone(),
+                    order_by: vec![],
+                    limit: None,
+                    limit_by: vec![],
+                    offset: None,
+                    fetch: None,
+                    locks: vec![],
+                    for_clause: None,
+                },
+                params,
+            )?;
+            let right_plan = plan_query(
+                &Query {
+                    with: None,
+                    body: right.clone(),
+                    order_by: vec![],
+                    limit: None,
+                    limit_by: vec![],
+                    offset: None,
+                    fetch: None,
+                    locks: vec![],
+                    for_clause: None,
+                },
+                params,
+            )?;
             return Ok(LogicalPlan::UnionAll {
                 left: Box::new(left_plan),
                 right: Box::new(right_plan),
@@ -2463,7 +2475,9 @@ impl Executor for MemExecutor {
         );
         let is_read_only = matches!(
             plan,
-            LogicalPlan::Select { .. } | LogicalPlan::SelectLiteral { .. } | LogicalPlan::UnionAll { .. }
+            LogicalPlan::Select { .. }
+                | LogicalPlan::SelectLiteral { .. }
+                | LogicalPlan::UnionAll { .. }
         );
         let mut implicit_txn = None;
 

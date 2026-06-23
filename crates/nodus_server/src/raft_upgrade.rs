@@ -33,7 +33,10 @@ impl UpgradeCoordinator for RaftUpgradeCoordinator {
     }
 
     fn start_upgrade(&self, target_version: String) -> Result<()> {
-        self.replicate("start_upgrade", ShardCommand::UpgradeStart { target_version })
+        self.replicate(
+            "start_upgrade",
+            ShardCommand::UpgradeStart { target_version },
+        )
     }
 
     fn report_node_upgraded(&self, node_id: &str) -> Result<()> {

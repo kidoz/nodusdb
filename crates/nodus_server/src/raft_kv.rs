@@ -3,7 +3,9 @@ use bytes::Bytes;
 use nodus_catalog::TableId;
 use nodus_raftstore::ShardCommand;
 use nodus_sharding::ShardRouter;
-use nodus_storage_api::{IntentReplacement, KeyRange, KvEngine, KvPair, NamespacedKvEngine, Timestamp, TxnId};
+use nodus_storage_api::{
+    IntentReplacement, KeyRange, KvEngine, KvPair, NamespacedKvEngine, Timestamp, TxnId,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -162,12 +164,7 @@ impl RaftKvEngine {
         Ok(())
     }
 
-    fn drive_commit(
-        &self,
-        txn: &str,
-        participants: &[String],
-        commit_ts: Timestamp,
-    ) -> Result<()> {
+    fn drive_commit(&self, txn: &str, participants: &[String], commit_ts: Timestamp) -> Result<()> {
         for group_id in participants {
             self.router.submit(
                 group_id,
@@ -392,7 +389,13 @@ mod tests {
         // Manager over a shared base store; meta group + the data group, both led.
         let base: Arc<dyn KvEngine> = Arc::new(nodus_storage_mem::MemKvEngine::new());
         let config = Arc::new(openraft::Config::default().validate().unwrap());
-        let manager = Arc::new(MultiRaftManager::new(1, "127.0.0.1:0".into(), config, RaftState::new(), base.clone()));
+        let manager = Arc::new(MultiRaftManager::new(
+            1,
+            "127.0.0.1:0".into(),
+            config,
+            RaftState::new(),
+            base.clone(),
+        ));
 
         let catalog = Arc::new(nodus_catalog::MemoryCatalog::new());
         let upgrade = Arc::new(nodus_upgrade::DefaultUpgradeCoordinator::new(
@@ -478,12 +481,20 @@ mod tests {
         let orchestrator = nodus_sharding::ShardOrchestrator::new(meta.clone());
         let table_t = TableId(Uuid::new_v4());
         let table_u = TableId(Uuid::new_v4());
-        let group_t = MultiRaftManager::data_group_id(orchestrator.init_single_shard(table_t).unwrap());
-        let group_u = MultiRaftManager::data_group_id(orchestrator.init_single_shard(table_u).unwrap());
+        let group_t =
+            MultiRaftManager::data_group_id(orchestrator.init_single_shard(table_t).unwrap());
+        let group_u =
+            MultiRaftManager::data_group_id(orchestrator.init_single_shard(table_u).unwrap());
 
         let base: Arc<dyn KvEngine> = Arc::new(nodus_storage_mem::MemKvEngine::new());
         let config = Arc::new(openraft::Config::default().validate().unwrap());
-        let manager = Arc::new(MultiRaftManager::new(1, "127.0.0.1:0".into(), config, RaftState::new(), base.clone()));
+        let manager = Arc::new(MultiRaftManager::new(
+            1,
+            "127.0.0.1:0".into(),
+            config,
+            RaftState::new(),
+            base.clone(),
+        ));
 
         let catalog = Arc::new(nodus_catalog::MemoryCatalog::new());
         let upgrade = Arc::new(nodus_upgrade::DefaultUpgradeCoordinator::new(
@@ -491,7 +502,13 @@ mod tests {
             vec!["new_storage_format".into()],
             1,
         ));
-        elect(&manager.create_meta(base.clone(), catalog.clone(), catalog, upgrade).await.unwrap()).await;
+        elect(
+            &manager
+                .create_meta(base.clone(), catalog.clone(), catalog, upgrade)
+                .await
+                .unwrap(),
+        )
+        .await;
         elect(&manager.get_or_create_data(&group_t).await.unwrap()).await;
         elect(&manager.get_or_create_data(&group_u).await.unwrap()).await;
 
@@ -534,7 +551,10 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(recovered, 0, "a completed commit must leave no pending record");
+        assert_eq!(
+            recovered, 0,
+            "a completed commit must leave no pending record"
+        );
         assert_eq!(
             engine.metrics.cross_shard_commits_total.get(),
             1,
@@ -574,8 +594,10 @@ mod tests {
                 commit_ts: 10,
             })
             .unwrap();
-            e.meta_put_committed(&record_key(&txn_str), &record, 10).unwrap();
-            e.drive_commit(&txn_str, std::slice::from_ref(&group_t), 10).unwrap(); // only T commits
+            e.meta_put_committed(&record_key(&txn_str), &record, 10)
+                .unwrap();
+            e.drive_commit(&txn_str, std::slice::from_ref(&group_t), 10)
+                .unwrap(); // only T commits
             txn_str
         })
         .await

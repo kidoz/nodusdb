@@ -280,7 +280,10 @@ mod tests {
         let mut prev = hlc.tick();
         for _ in 0..100_000 {
             let next = hlc.tick();
-            assert!(next > prev, "clock went backwards or stalled: {next} <= {prev}");
+            assert!(
+                next > prev,
+                "clock went backwards or stalled: {next} <= {prev}"
+            );
             prev = next;
         }
     }
@@ -292,7 +295,10 @@ mod tests {
         let remote = local + 5_000_000_000; // far ahead of local wall clock
         let merged = hlc.update(remote);
         assert!(merged > remote, "merge must order after the remote event");
-        assert!(hlc.tick() > merged, "subsequent ticks stay ahead of the merge");
+        assert!(
+            hlc.tick() > merged,
+            "subsequent ticks stay ahead of the merge"
+        );
     }
 
     #[test]

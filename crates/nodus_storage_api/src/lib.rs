@@ -172,8 +172,11 @@ impl KvEngine for NamespacedKvEngine {
         key: Bytes,
         replacement: IntentReplacement,
     ) -> Result<()> {
-        self.inner
-            .replace_intent(self.namespaced_txn(txn_id), self.physical_key(&key), replacement)
+        self.inner.replace_intent(
+            self.namespaced_txn(txn_id),
+            self.physical_key(&key),
+            replacement,
+        )
     }
 
     fn commit(&self, txn_id: TxnId, commit_ts: Timestamp) -> Result<()> {

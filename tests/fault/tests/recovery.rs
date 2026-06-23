@@ -55,7 +55,10 @@ async fn committed_data_survives_a_restart() {
             .execute("INSERT INTO survivor (id, note) VALUES (1, 'durable')", &[])
             .await
             .unwrap();
-        let rows = client.query("SELECT note FROM survivor", &[]).await.unwrap();
+        let rows = client
+            .query("SELECT note FROM survivor", &[])
+            .await
+            .unwrap();
         assert_eq!(rows.len(), 1);
         // Drop the server (sends shutdown); give tasks a moment to wind down.
     }
@@ -67,7 +70,10 @@ async fn committed_data_survives_a_restart() {
             .await
             .expect("server restarts");
         let client = connect(&server.pgwire_addr).await;
-        let rows = client.query("SELECT note FROM survivor", &[]).await.unwrap();
+        let rows = client
+            .query("SELECT note FROM survivor", &[])
+            .await
+            .unwrap();
         assert_eq!(rows.len(), 1, "committed row must survive restart");
         let note: &str = rows[0].get(0);
         assert_eq!(note, "durable");
@@ -112,7 +118,10 @@ async fn rolled_back_writes_are_never_visible() {
             .expect("server restarts");
         let client = connect(&server.pgwire_addr).await;
         let rows = client.query("SELECT id FROM ghosts", &[]).await.unwrap();
-        assert!(rows.is_empty(), "rolled-back write must stay absent across restart");
+        assert!(
+            rows.is_empty(),
+            "rolled-back write must stay absent across restart"
+        );
     }
 
     let _ = std::fs::remove_dir_all(&data_dir);

@@ -1616,7 +1616,11 @@ fn cursor_key(session_id: &str, portal_name: &str) -> String {
 }
 
 impl NodusExtendedQueryHandler {
-    async fn output_metadata_for_query<C>(&self, client: &C, query_str: &str) -> Vec<(String, String)>
+    async fn output_metadata_for_query<C>(
+        &self,
+        client: &C,
+        query_str: &str,
+    ) -> Vec<(String, String)>
     where
         C: ClientInfo + Sync,
     {
