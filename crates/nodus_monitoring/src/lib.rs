@@ -33,6 +33,13 @@ pub struct Metrics {
     pub vacuum_reclaimed_total: Counter,
     pub slow_queries_total: Counter,
     pub query_latency_seconds: Histogram,
+    /// Cross-shard transactions committed via two-phase commit.
+    pub cross_shard_commits_total: Counter,
+    /// Cross-shard commits re-driven by startup recovery.
+    pub txn_recoveries_total: Counter,
+    /// Data-shard Raft groups hosted on this node, and how many lack a leader.
+    pub shard_groups: Gauge,
+    pub shard_groups_unavailable: Gauge,
 }
 
 impl Default for Metrics {
@@ -46,6 +53,10 @@ impl Default for Metrics {
             slow_queries_total: Counter::default(),
             // ~0.5ms .. ~1s across 12 exponential buckets.
             query_latency_seconds: Histogram::new(exponential_buckets(0.0005, 2.0, 12)),
+            cross_shard_commits_total: Counter::default(),
+            txn_recoveries_total: Counter::default(),
+            shard_groups: Gauge::default(),
+            shard_groups_unavailable: Gauge::default(),
         }
     }
 }
@@ -87,6 +98,26 @@ impl Metrics {
             "nodus_query_latency_seconds",
             "Query execution latency",
             m.query_latency_seconds.clone(),
+        );
+        registry.register(
+            "nodus_cross_shard_commits_total",
+            "Cross-shard transactions committed via two-phase commit",
+            m.cross_shard_commits_total.clone(),
+        );
+        registry.register(
+            "nodus_txn_recoveries_total",
+            "Cross-shard commits re-driven by startup recovery",
+            m.txn_recoveries_total.clone(),
+        );
+        registry.register(
+            "nodus_shard_groups",
+            "Data-shard Raft groups hosted on this node",
+            m.shard_groups.clone(),
+        );
+        registry.register(
+            "nodus_shard_groups_unavailable",
+            "Hosted data-shard groups currently without a leader",
+            m.shard_groups_unavailable.clone(),
         );
         m
     }

@@ -50,9 +50,10 @@ pub struct RaftKvEngine {
     pub shard_router: Arc<dyn ShardRouter>,
     pub manager: Arc<MultiRaftManager>,
     /// Groups each in-flight transaction has written to, so `commit`/`abort`
-    /// target exactly those groups. Cross-shard commit is non-atomic until 2PC
-    /// (Phase 4).
+    /// target exactly those groups.
     pub txn_groups: Mutex<HashMap<TxnId, HashSet<String>>>,
+    /// Observability for the cross-shard commit/recovery paths.
+    pub metrics: nodus_monitoring::Metrics,
 }
 
 /// Parses the leading `{table_id}` of a row key. Returns `None` for non-row keys
@@ -131,6 +132,7 @@ impl RaftKvEngine {
         commit_ts: Timestamp,
     ) -> Result<()> {
         let txn = txn_id.0.to_string();
+        let _span = tracing::info_span!("txn.cross_shard_commit", txn = %txn, participants = participants.len()).entered();
 
         // Phase 1 — prepare. Confirms each participant's leader is current and
         // ready; a failure here aborts before any decision is recorded.
@@ -156,6 +158,7 @@ impl RaftKvEngine {
         // clear is lost to a crash, recovery re-commits idempotently and clears.
         self.drive_commit(&txn, participants, commit_ts)?;
         self.meta_delete_committed(&record_key(&txn), commit_ts + 1)?;
+        self.metrics.cross_shard_commits_total.inc();
         Ok(())
     }
 
@@ -227,6 +230,7 @@ impl RaftKvEngine {
     /// already-committed transaction is a no-op. MUST run on a blocking thread
     /// (it submits through the Raft router). Returns the number repaired.
     pub fn recover_pending_txns(&self) -> Result<usize> {
+        let _span = tracing::info_span!("txn.recover_pending").entered();
         let mut end = TXN2PC_PREFIX.to_vec();
         *end.last_mut().unwrap() += 1; // prefix successor bounds the scan
         let range = KeyRange {
@@ -255,6 +259,7 @@ impl RaftKvEngine {
             self.meta_delete_committed(&key, rec.commit_ts + 1)?;
             repaired += 1;
         }
+        self.metrics.txn_recoveries_total.inc_by(repaired as u64);
         Ok(repaired)
     }
 }
@@ -413,6 +418,7 @@ mod tests {
             shard_router,
             manager: manager.clone(),
             txn_groups: Mutex::new(HashMap::new()),
+            metrics: nodus_monitoring::Metrics::default(),
         });
 
         let row_t = format!("{table_t}:pk1");
@@ -495,6 +501,7 @@ mod tests {
             shard_router: Arc::new(nodus_sharding::CatalogShardRouter::new(meta)),
             manager,
             txn_groups: Mutex::new(HashMap::new()),
+            metrics: nodus_monitoring::Metrics::default(),
         });
         TwoShard {
             engine,
@@ -528,6 +535,11 @@ mod tests {
         .unwrap();
 
         assert_eq!(recovered, 0, "a completed commit must leave no pending record");
+        assert_eq!(
+            engine.metrics.cross_shard_commits_total.get(),
+            1,
+            "the cross-shard commit should be counted"
+        );
         assert_eq!(
             engine.get(row_t.as_bytes(), 100).unwrap(),
             Some(Bytes::from_static(b"vt"))

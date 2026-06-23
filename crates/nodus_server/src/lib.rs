@@ -271,6 +271,7 @@ pub async fn run_server_with_config(
         shard_router: shard_router.clone(),
         manager: multi_raft.clone(),
         txn_groups: std::sync::Mutex::new(std::collections::HashMap::new()),
+        metrics: state.metrics.clone(),
     });
 
     let raft_catalog_writer = Arc::new(crate::raft_catalog::RaftCatalogWriter {
@@ -633,6 +634,8 @@ pub async fn run_server_with_config(
                     let (total, unavailable) = metrics_manager.shard_health().await;
                     metrics_state.cluster.shards_total.store(total, Relaxed);
                     metrics_state.cluster.shards_unavailable.store(unavailable, Relaxed);
+                    metrics_state.metrics.shard_groups.set(total as i64);
+                    metrics_state.metrics.shard_groups_unavailable.set(unavailable as i64);
                 }
                 _ = rm_shutdown.changed() => {
                     break;
