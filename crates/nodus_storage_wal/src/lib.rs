@@ -40,6 +40,21 @@ pub enum WalRecord {
     V1(WalRecordV1),
 }
 
+/// CRC32 (IEEE/reflected) of `data`, used to detect torn or corrupt WAL records
+/// on recovery. Bit-by-bit (no table) — WAL records are small, so the cost is
+/// negligible and it keeps the crate dependency-free.
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for &byte in data {
+        crc ^= byte as u32;
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+        }
+    }
+    !crc
+}
+
 pub trait WalEngine: Send + Sync {
     fn append(&self, record: WalRecord) -> anyhow::Result<u64>; // returns LSN
     fn sync(&self) -> anyhow::Result<()>;
@@ -93,9 +108,13 @@ impl WalEngine for FileWalEngine {
         }
 
         let len = data.len() as u32;
+        let crc = crc32(&data);
 
-        // Write length prefix then data
+        // Frame: [len: u32][crc32: u32][payload]. The CRC lets recovery detect a
+        // torn or corrupt trailing record and stop cleanly rather than replaying
+        // garbage.
         file.write_u32::<LittleEndian>(len)?;
+        file.write_u32::<LittleEndian>(crc)?;
         file.write_all(&data)?;
 
         // Return a dummy LSN for MVP
@@ -114,31 +133,44 @@ impl WalEngine for FileWalEngine {
         let mut records = Vec::new();
 
         loop {
-            match reader.read_u32::<LittleEndian>() {
-                Ok(len) => {
-                    let mut buf = vec![0u8; len as usize];
-                    reader.read_exact(&mut buf)?;
+            // A clean end of log: nothing more to read.
+            let len = match reader.read_u32::<LittleEndian>() {
+                Ok(len) => len,
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(e.into()),
+            };
 
-                    let data = if let Some(cipher) = &self.cipher {
-                        if buf.len() < 12 {
-                            return Err(anyhow::anyhow!("corrupt WAL record: too short for nonce"));
-                        }
-                        let nonce = Nonce::from_slice(&buf[..12]);
-                        cipher
-                            .decrypt(nonce, &buf[12..])
-                            .map_err(|e| anyhow::anyhow!("decryption failed: {}", e))?
-                    } else {
-                        buf
-                    };
+            // From here on, any short read or checksum mismatch means the tail
+            // record was torn/corrupted by a crash mid-append. Stop replaying at
+            // that point instead of erroring out — every record before it is
+            // valid and durable, so the engine still recovers and starts.
+            let crc = match reader.read_u32::<LittleEndian>() {
+                Ok(crc) => crc,
+                Err(_) => break,
+            };
+            let mut buf = vec![0u8; len as usize];
+            if reader.read_exact(&mut buf).is_err() {
+                break;
+            }
+            if crc32(&buf) != crc {
+                break;
+            }
 
-                    if let Ok(record) = serde_json::from_slice(&data) {
-                        records.push(record);
-                    }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+            let data = if let Some(cipher) = &self.cipher {
+                if buf.len() < 12 {
                     break;
                 }
-                Err(e) => return Err(e.into()),
+                let nonce = Nonce::from_slice(&buf[..12]);
+                match cipher.decrypt(nonce, &buf[12..]) {
+                    Ok(data) => data,
+                    Err(_) => break,
+                }
+            } else {
+                buf
+            };
+
+            if let Ok(record) = serde_json::from_slice(&data) {
+                records.push(record);
             }
         }
 

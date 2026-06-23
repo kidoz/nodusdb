@@ -40,7 +40,10 @@ impl LsmKvEngine {
         let mut sstables = Vec::new();
         let mut max_id = 0;
 
-        // Load existing SSTs
+        // Load existing complete SSTables. A crash mid-flush leaves a partial
+        // `*.sst.tmp` (extension `tmp`), which is ignored — the atomic rename in
+        // `Sstable::build` means a `*.sst` is always complete, so it never inflates
+        // `max_id` and the WAL segment that produced it is still replayed.
         for entry in std::fs::read_dir(path)? {
             let entry = entry?;
             let p = entry.path();
@@ -62,6 +65,9 @@ impl LsmKvEngine {
                 .unwrap_or(0)
         });
 
+        // The active WAL is `{max_sst_id + 1}.log` — the segment holding writes
+        // not yet captured in an SSTable. Flush keeps this coupling (sst `N`,
+        // wal `N+1`), so this is exactly the un-flushed segment to replay.
         let wal_path = path.join(format!("{}.log", max_id + 1));
         let wal = Arc::new(FileWalEngine::with_encryption(&wal_path, key)?);
 
@@ -97,23 +103,22 @@ impl LsmKvEngine {
         let sst_path = dir.join(format!("{}.sst", file_id));
         let new_wal_path = dir.join(format!("{}.log", file_id + 1));
 
-        // 1. Flush memtable to SSTable
+        // 1. Durably + atomically publish the memtable as an SSTable (write-tmp →
+        //    fsync → rename → fsync dir, in `Sstable::build`). A crash mid-build
+        //    never leaves a `*.sst` readers can see.
         let sst = Sstable::build(&sst_path, &mem_guard)?;
-
-        // 2. Add to list
-        let mut sst_guard = self.sstables.write().unwrap();
-        sst_guard.push(sst);
-
-        // 3. Clear memtable
+        self.sstables.write().unwrap().push(sst);
         mem_guard.clear();
 
-        // 4. Rotate WAL
+        // 2. Rotate to a fresh WAL segment, keeping the `sst N` / `wal N+1`
+        //    naming coupling that recovery relies on. Older WAL segments are left
+        //    on disk for the backup WAL-archiver / PITR; reclaiming them is a
+        //    separate retention concern (see STORAGE_DURABILITY_PLAN).
         let new_wal = Arc::new(FileWalEngine::with_encryption(
             &new_wal_path,
             self._wal_key,
         )?);
-        let mut wal_guard = self.wal.write().unwrap();
-        *wal_guard = Some(new_wal);
+        *self.wal.write().unwrap() = Some(new_wal);
 
         Ok(())
     }
@@ -208,6 +213,9 @@ impl KvEngine for LsmKvEngine {
 
         let mut merged = BTreeMap::new();
 
+        // Lock order is always memtable-before-sstables (see `get`/`flush`) to
+        // stay deadlock-free; iterate SSTables first so the memtable overrides.
+        let mem_guard = self.memtable.read().unwrap();
         let sst_guard = self.sstables.read().unwrap();
         for sst in sst_guard.iter() {
             if let Ok(iter) = sst.iter() {
@@ -219,11 +227,11 @@ impl KvEngine for LsmKvEngine {
                 }
             }
         }
-
-        let mem_guard = self.memtable.read().unwrap();
         for (k, chain) in mem_guard.range(start..end) {
             merged.insert(k.clone(), chain.clone());
         }
+        drop(sst_guard);
+        drop(mem_guard);
 
         let mut results = Vec::new();
         for (k, chain) in merged {
@@ -248,13 +256,18 @@ impl KvEngine for LsmKvEngine {
     }
 
     fn write_intent(&self, txn_id: TxnId, key: Bytes, value: Bytes) -> Result<()> {
-        let wal_guard = self.wal.read().unwrap();
-        if let Some(wal) = wal_guard.as_ref() {
-            wal.append(WalRecord::V1(WalRecordV1::WriteIntent {
-                txn_id,
-                key: key.to_vec(),
-                value: value.to_vec(),
-            }))?;
+        // Append to the WAL and release the WAL lock *before* taking the memtable
+        // lock, so this never holds wal+memtable in the opposite order from
+        // `flush` (which holds memtable then rotates the WAL) — avoiding deadlock.
+        {
+            let wal_guard = self.wal.read().unwrap();
+            if let Some(wal) = wal_guard.as_ref() {
+                wal.append(WalRecord::V1(WalRecordV1::WriteIntent {
+                    txn_id,
+                    key: key.to_vec(),
+                    value: value.to_vec(),
+                }))?;
+            }
         }
 
         let mut store_guard = self.memtable.write().unwrap();
@@ -270,12 +283,14 @@ impl KvEngine for LsmKvEngine {
     }
 
     fn delete_intent(&self, txn_id: TxnId, key: Bytes) -> Result<()> {
-        let wal_guard = self.wal.read().unwrap();
-        if let Some(wal) = wal_guard.as_ref() {
-            wal.append(WalRecord::V1(WalRecordV1::DeleteIntent {
-                txn_id,
-                key: key.to_vec(),
-            }))?;
+        {
+            let wal_guard = self.wal.read().unwrap();
+            if let Some(wal) = wal_guard.as_ref() {
+                wal.append(WalRecord::V1(WalRecordV1::DeleteIntent {
+                    txn_id,
+                    key: key.to_vec(),
+                }))?;
+            }
         }
 
         let mut store_guard = self.memtable.write().unwrap();
@@ -328,10 +343,12 @@ impl KvEngine for LsmKvEngine {
     }
 
     fn commit(&self, txn_id: TxnId, commit_ts: Timestamp) -> Result<()> {
-        let wal_guard = self.wal.read().unwrap();
-        if let Some(wal) = wal_guard.as_ref() {
-            wal.append(WalRecord::V1(WalRecordV1::CommitTxn { txn_id, commit_ts }))?;
-            wal.sync()?;
+        {
+            let wal_guard = self.wal.read().unwrap();
+            if let Some(wal) = wal_guard.as_ref() {
+                wal.append(WalRecord::V1(WalRecordV1::CommitTxn { txn_id, commit_ts }))?;
+                wal.sync()?;
+            }
         }
 
         let mut store_guard = self.memtable.write().unwrap();
@@ -348,10 +365,12 @@ impl KvEngine for LsmKvEngine {
     }
 
     fn abort(&self, txn_id: TxnId) -> Result<()> {
-        let wal_guard = self.wal.read().unwrap();
-        if let Some(wal) = wal_guard.as_ref() {
-            wal.append(WalRecord::V1(WalRecordV1::AbortTxn { txn_id }))?;
-            wal.sync()?;
+        {
+            let wal_guard = self.wal.read().unwrap();
+            if let Some(wal) = wal_guard.as_ref() {
+                wal.append(WalRecord::V1(WalRecordV1::AbortTxn { txn_id }))?;
+                wal.sync()?;
+            }
         }
 
         let mut store_guard = self.memtable.write().unwrap();
@@ -562,6 +581,50 @@ mod tests {
 
         let res2 = recovered_engine.get(k2.as_ref(), 25).unwrap();
         assert_eq!(res2.unwrap(), v2);
+    }
+
+    #[test]
+    fn torn_wal_tail_does_not_prevent_recovery() {
+        let dir = TempDir::new().unwrap();
+        let (k1, v1, txn) = (Bytes::from("k1"), Bytes::from("v1"), TxnId::new());
+        {
+            let engine = LsmKvEngine::with_wal(dir.path(), None).unwrap();
+            engine.write_intent(txn, k1.clone(), v1.clone()).unwrap();
+            engine.commit(txn, 10).unwrap();
+        }
+        // Simulate a crash mid-append: a bogus partial frame at the WAL tail
+        // (claims a 1000-byte record but only a few bytes follow).
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(dir.path().join("1.log"))
+                .unwrap();
+            f.write_all(&1000u32.to_le_bytes()).unwrap();
+            f.write_all(&[1, 2, 3, 4]).unwrap();
+            f.sync_all().unwrap();
+        }
+        // Recovery truncates at the torn record and still returns the commit.
+        let recovered = LsmKvEngine::with_wal(dir.path(), None).unwrap();
+        assert_eq!(recovered.get(k1.as_ref(), 15).unwrap().unwrap(), v1);
+    }
+
+    #[test]
+    fn partial_sstable_tmp_is_ignored_on_recovery() {
+        let dir = TempDir::new().unwrap();
+        let txn = TxnId::new();
+        {
+            let engine = LsmKvEngine::with_wal(dir.path(), None).unwrap();
+            engine
+                .write_intent(txn, Bytes::from("k"), Bytes::from("v"))
+                .unwrap();
+            engine.commit(txn, 10).unwrap();
+        }
+        // A crash mid-flush leaves a partial `*.sst.tmp`; recovery must ignore it
+        // and rebuild from the (intact) WAL rather than loading garbage.
+        std::fs::write(dir.path().join("99.sst.tmp"), b"garbage partial sstable").unwrap();
+        let recovered = LsmKvEngine::with_wal(dir.path(), None).unwrap();
+        assert_eq!(recovered.get(b"k", 15).unwrap().unwrap(), Bytes::from("v"));
     }
 
     use proptest::prelude::*;
