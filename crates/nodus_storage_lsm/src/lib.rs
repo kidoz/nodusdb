@@ -5,10 +5,28 @@ pub mod sstable;
 use nodus_mvcc::VersionChain;
 use nodus_storage_api::{IntentReplacement, KeyRange, KvEngine, KvPair, Timestamp, TxnId};
 use nodus_storage_wal::{FileWalEngine, WalEngine, WalRecord, WalRecordV1};
+use serde::{Deserialize, Serialize};
 use sstable::Sstable;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
+
+/// Flush the memtable once its (approximate) live size reaches this many bytes.
+const DEFAULT_FLUSH_THRESHOLD: usize = 4 * 1024 * 1024;
+/// Compact once this many SSTables accumulate, to bound read amplification.
+const COMPACTION_TRIGGER: usize = 4;
+const MANIFEST_FILE: &str = "MANIFEST";
+
+/// The durable record of which files make up the store: the live SSTables and
+/// the active WAL segment. Recovery reads this instead of guessing from file
+/// names, which decouples SSTable ids from WAL ids and lets compaction rewrite
+/// the SSTable set atomically (swap the manifest, then delete the old files).
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct Manifest {
+    active_wal: u64,
+    sstables: Vec<u64>,
+}
 
 pub struct LsmKvEngine {
     data_dir: Option<PathBuf>,
@@ -16,8 +34,27 @@ pub struct LsmKvEngine {
     intents: RwLock<HashMap<TxnId, Vec<Bytes>>>,
     sstables: RwLock<Vec<Sstable>>,
     wal: RwLock<Option<Arc<dyn WalEngine>>>,
-    next_file_id: std::sync::atomic::AtomicU64,
+    /// Id of the active WAL segment (`{id}.log`), recorded in the manifest.
+    active_wal_id: AtomicU64,
+    next_file_id: AtomicU64,
+    /// Approximate live size of the memtable, driving size-triggered flushes.
+    memtable_bytes: AtomicUsize,
+    flush_threshold: AtomicUsize,
+    /// Most recent GC watermark, applied to SSTables during compaction.
+    gc_watermark: AtomicU64,
+    /// Serializes flush and compaction (both rewrite the SSTable set + manifest).
+    flush_compact_lock: Mutex<()>,
     _wal_key: Option<[u8; 32]>,
+}
+
+/// Approximate in-memory size of a key's version chain, for the flush threshold.
+fn chain_bytes(key: &[u8], chain: &VersionChain) -> usize {
+    key.len()
+        + chain
+            .versions
+            .iter()
+            .map(|v| v.value.as_ref().map_or(0, |x| x.len()) + 24)
+            .sum::<usize>()
 }
 
 impl LsmKvEngine {
@@ -28,47 +65,66 @@ impl LsmKvEngine {
             intents: RwLock::new(HashMap::new()),
             sstables: RwLock::new(Vec::new()),
             wal: RwLock::new(None),
-            next_file_id: std::sync::atomic::AtomicU64::new(1),
+            active_wal_id: AtomicU64::new(0),
+            next_file_id: AtomicU64::new(1),
+            memtable_bytes: AtomicUsize::new(0),
+            flush_threshold: AtomicUsize::new(DEFAULT_FLUSH_THRESHOLD),
+            gc_watermark: AtomicU64::new(0),
+            flush_compact_lock: Mutex::new(()),
             _wal_key: None,
         }
+    }
+
+    /// Overrides the memtable flush threshold (bytes). Mainly for tests.
+    pub fn set_flush_threshold(&self, bytes: usize) {
+        self.flush_threshold.store(bytes, Ordering::Relaxed);
     }
 
     pub fn with_wal<P: AsRef<Path>>(data_dir: P, key: Option<[u8; 32]>) -> Result<Self> {
         let path = data_dir.as_ref();
         std::fs::create_dir_all(path)?;
 
-        let mut sstables = Vec::new();
-        let mut max_id = 0;
+        // Prefer the manifest (authoritative file set). Fall back to a directory
+        // scan for stores written before manifests existed, or fresh dirs.
+        let (mut sst_ids, active_wal_id): (Vec<u64>, u64) =
+            match std::fs::read(path.join(MANIFEST_FILE)) {
+                Ok(bytes) => {
+                    let m: Manifest = serde_json::from_slice(&bytes)?;
+                    (m.sstables, m.active_wal)
+                }
+                Err(_) => {
+                    let mut ids = Vec::new();
+                    let mut max_id = 0;
+                    for entry in std::fs::read_dir(path)? {
+                        let p = entry?.path();
+                        // Only complete `*.sst` (atomic rename guarantees this);
+                        // partial `*.sst.tmp` and orphans are ignored.
+                        if p.extension().and_then(|s| s.to_str()) == Some("sst")
+                            && let Some(name) = p.file_stem().and_then(|n| n.to_str())
+                            && let Ok(id) = name.parse::<u64>()
+                        {
+                            max_id = std::cmp::max(max_id, id);
+                            ids.push(id);
+                        }
+                    }
+                    (ids, max_id + 1)
+                }
+            };
 
-        // Load existing complete SSTables. A crash mid-flush leaves a partial
-        // `*.sst.tmp` (extension `tmp`), which is ignored — the atomic rename in
-        // `Sstable::build` means a `*.sst` is always complete, so it never inflates
-        // `max_id` and the WAL segment that produced it is still replayed.
-        for entry in std::fs::read_dir(path)? {
-            let entry = entry?;
-            let p = entry.path();
-            if p.extension().and_then(|s| s.to_str()) == Some("sst")
-                && let Some(name) = p.file_stem().and_then(|n| n.to_str())
-                && let Ok(id) = name.parse::<u64>()
-            {
-                max_id = std::cmp::max(max_id, id);
-                sstables.push(Sstable::open(p));
-            }
-        }
+        sst_ids.sort_unstable();
+        let sstables: Vec<Sstable> = sst_ids
+            .iter()
+            .map(|id| Sstable::open(path.join(format!("{id}.sst"))))
+            .collect();
+        let next = sst_ids
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0)
+            .max(active_wal_id)
+            + 1;
 
-        // Sort SSTs so newest is last
-        sstables.sort_by_key(|s| {
-            s.path
-                .file_stem()
-                .and_then(|n| n.to_str())
-                .and_then(|n| n.parse::<u64>().ok())
-                .unwrap_or(0)
-        });
-
-        // The active WAL is `{max_sst_id + 1}.log` — the segment holding writes
-        // not yet captured in an SSTable. Flush keeps this coupling (sst `N`,
-        // wal `N+1`), so this is exactly the un-flushed segment to replay.
-        let wal_path = path.join(format!("{}.log", max_id + 1));
+        let wal_path = path.join(format!("{active_wal_id}.log"));
         let wal = Arc::new(FileWalEngine::with_encryption(&wal_path, key)?);
 
         let engine = Self {
@@ -77,49 +133,210 @@ impl LsmKvEngine {
             intents: RwLock::new(HashMap::new()),
             sstables: RwLock::new(sstables),
             wal: RwLock::new(Some(wal)),
-            next_file_id: std::sync::atomic::AtomicU64::new(max_id + 2),
+            active_wal_id: AtomicU64::new(active_wal_id),
+            next_file_id: AtomicU64::new(next),
+            memtable_bytes: AtomicUsize::new(0),
+            flush_threshold: AtomicUsize::new(DEFAULT_FLUSH_THRESHOLD),
+            gc_watermark: AtomicU64::new(0),
+            flush_compact_lock: Mutex::new(()),
             _wal_key: key,
         };
 
         engine.recover()?;
+        // Recompute the memtable size from what the WAL replay restored, and make
+        // sure a manifest exists (writes the initial one for legacy/fresh dirs).
+        let restored = engine
+            .memtable
+            .read()
+            .unwrap()
+            .iter()
+            .map(|(k, c)| chain_bytes(k, c))
+            .sum();
+        engine.memtable_bytes.store(restored, Ordering::Relaxed);
+        engine.save_manifest()?;
         Ok(engine)
+    }
+
+    /// Path of the manifest file, when persistent.
+    fn manifest_path(&self) -> Option<PathBuf> {
+        self.data_dir.as_ref().map(|d| d.join(MANIFEST_FILE))
+    }
+
+    /// Atomically persists the current file set (live SSTables + active WAL).
+    fn save_manifest(&self) -> Result<()> {
+        let Some(manifest_path) = self.manifest_path() else {
+            return Ok(());
+        };
+        let sstables: Vec<u64> = self
+            .sstables
+            .read()
+            .unwrap()
+            .iter()
+            .filter_map(|s| s.path.file_stem()?.to_str()?.parse::<u64>().ok())
+            .collect();
+        let manifest = Manifest {
+            active_wal: self.active_wal_id.load(Ordering::Relaxed),
+            sstables,
+        };
+        let bytes = serde_json::to_vec(&manifest)?;
+        let tmp = manifest_path.with_extension("tmp");
+        std::fs::write(&tmp, &bytes)?;
+        if let Ok(f) = std::fs::File::open(&tmp) {
+            let _ = f.sync_all();
+        }
+        std::fs::rename(&tmp, &manifest_path)?;
+        if let Some(dir) = manifest_path.parent()
+            && let Ok(f) = std::fs::File::open(dir)
+        {
+            let _ = f.sync_all();
+        }
+        Ok(())
     }
 
     pub fn flush(&self) -> Result<()> {
         let dir = match &self.data_dir {
-            Some(d) => d,
+            Some(d) => d.clone(),
             None => return Ok(()), // no-op for in-memory only
         };
 
-        let mut mem_guard = self.memtable.write().unwrap();
+        {
+            // Serialize against compaction; both rewrite the SSTable set + manifest.
+            let _guard = self.flush_compact_lock.lock().unwrap();
+            let mut mem_guard = self.memtable.write().unwrap();
+            if mem_guard.is_empty() {
+                return Ok(());
+            }
 
-        if mem_guard.is_empty() {
+            // Flush only fully-committed keys. Keys still carrying an uncommitted
+            // intent are retained in the memtable, so a later `commit`/`abort`
+            // (which mutates the chain in place) can still find them — otherwise a
+            // flush mid-transaction would strand the intent in an SSTable forever.
+            let active_keys: HashSet<Bytes> = self
+                .intents
+                .read()
+                .unwrap()
+                .values()
+                .flatten()
+                .cloned()
+                .collect();
+            let mut to_flush = BTreeMap::new();
+            mem_guard.retain(|k, chain| {
+                if active_keys.contains(k) {
+                    true
+                } else {
+                    to_flush.insert(k.clone(), chain.clone());
+                    false
+                }
+            });
+            let retained: usize = mem_guard.iter().map(|(k, c)| chain_bytes(k, c)).sum();
+            self.memtable_bytes.store(retained, Ordering::Relaxed);
+
+            if !to_flush.is_empty() {
+                // Durably + atomically publish committed data as an SSTable.
+                let sst_id = self.next_file_id.fetch_add(1, Ordering::SeqCst);
+                let sst = Sstable::build(dir.join(format!("{sst_id}.sst")), &to_flush)?;
+                self.sstables.write().unwrap().push(sst);
+            }
+
+            // Rotate to a fresh WAL segment; older segments stay on disk for the
+            // backup WAL-archiver / PITR. The manifest swap below makes the new
+            // file set durable (recovery reads the manifest, not file names).
+            let wal_id = self.next_file_id.fetch_add(1, Ordering::SeqCst);
+            let new_wal = Arc::new(FileWalEngine::with_encryption(
+                dir.join(format!("{wal_id}.log")),
+                self._wal_key,
+            )?);
+            *self.wal.write().unwrap() = Some(new_wal);
+            self.active_wal_id.store(wal_id, Ordering::Relaxed);
+            self.save_manifest()?;
+        }
+
+        // Bound read amplification once enough SSTables have accumulated.
+        if self.sstables.read().unwrap().len() >= COMPACTION_TRIGGER {
+            self.compact()?;
+        }
+        Ok(())
+    }
+
+    /// Merges all live SSTables into one, combining each key's version chains and
+    /// dropping versions reclaimable below the current GC watermark. Crash-safe:
+    /// the new SSTable is published durably, the manifest is swapped to point at
+    /// it alone (the commit point — a crash before this leaves the old set in the
+    /// manifest, orphaning the new file), then the old files are deleted.
+    pub fn compact(&self) -> Result<()> {
+        let dir = match &self.data_dir {
+            Some(d) => d.clone(),
+            None => return Ok(()),
+        };
+        let _guard = self.flush_compact_lock.lock().unwrap();
+
+        // Snapshot the current SSTable paths. `flush_compact_lock` ensures the set
+        // does not change underneath us, so replacing it wholesale below is safe.
+        let old_paths: Vec<PathBuf> = self
+            .sstables
+            .read()
+            .unwrap()
+            .iter()
+            .map(|s| s.path.clone())
+            .collect();
+        if old_paths.len() < 2 {
             return Ok(());
         }
 
-        let file_id = self
-            .next_file_id
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let sst_path = dir.join(format!("{}.sst", file_id));
-        let new_wal_path = dir.join(format!("{}.log", file_id + 1));
+        // Merge oldest → newest so newer versions extend the chain.
+        let watermark = self.gc_watermark.load(Ordering::Relaxed);
+        let mut merged: BTreeMap<Bytes, VersionChain> = BTreeMap::new();
+        let sorted = {
+            let mut p = old_paths.clone();
+            p.sort_by_key(|path| {
+                path.file_stem()
+                    .and_then(|n| n.to_str())
+                    .and_then(|n| n.parse::<u64>().ok())
+                    .unwrap_or(0)
+            });
+            p
+        };
+        for path in &sorted {
+            for item in Sstable::open(path).iter()? {
+                let (key, chain) = item?;
+                merged
+                    .entry(key)
+                    .or_default()
+                    .versions
+                    .extend(chain.versions);
+            }
+        }
+        // Normalize each merged chain (dedup + drop GC-able versions); drop keys
+        // left with no versions.
+        merged.retain(|_, chain| {
+            chain.versions.sort_by_key(|v| v.version);
+            chain.versions.dedup();
+            chain.garbage_collect(watermark);
+            !chain.versions.is_empty()
+        });
 
-        // 1. Durably + atomically publish the memtable as an SSTable (write-tmp →
-        //    fsync → rename → fsync dir, in `Sstable::build`). A crash mid-build
-        //    never leaves a `*.sst` readers can see.
-        let sst = Sstable::build(&sst_path, &mem_guard)?;
-        self.sstables.write().unwrap().push(sst);
-        mem_guard.clear();
+        let new_id = self.next_file_id.fetch_add(1, Ordering::SeqCst);
+        let new_sst = Sstable::build(dir.join(format!("{new_id}.sst")), &merged)?;
 
-        // 2. Rotate to a fresh WAL segment, keeping the `sst N` / `wal N+1`
-        //    naming coupling that recovery relies on. Older WAL segments are left
-        //    on disk for the backup WAL-archiver / PITR; reclaiming them is a
-        //    separate retention concern (see STORAGE_DURABILITY_PLAN).
-        let new_wal = Arc::new(FileWalEngine::with_encryption(
-            &new_wal_path,
-            self._wal_key,
-        )?);
-        *self.wal.write().unwrap() = Some(new_wal);
+        // Atomic swap: install the single compacted SSTable, persist the manifest
+        // (commit point), then delete the now-orphaned old files.
+        *self.sstables.write().unwrap() = vec![new_sst];
+        self.save_manifest()?;
+        for path in old_paths {
+            let _ = std::fs::remove_file(path);
+        }
+        Ok(())
+    }
 
+    /// Flushes if the memtable has grown past its byte threshold. Called after
+    /// each write; the guards are already released, so `flush` can re-take them.
+    fn maybe_flush_by_size(&self) -> Result<()> {
+        if self.data_dir.is_some()
+            && self.memtable_bytes.load(Ordering::Relaxed)
+                >= self.flush_threshold.load(Ordering::Relaxed)
+        {
+            self.flush()?;
+        }
         Ok(())
     }
 
@@ -270,15 +487,19 @@ impl KvEngine for LsmKvEngine {
             }
         }
 
-        let mut store_guard = self.memtable.write().unwrap();
-        let mut intents_guard = self.intents.write().unwrap();
+        let added = key.len() + value.len() + 32;
+        {
+            let mut store_guard = self.memtable.write().unwrap();
+            let mut intents_guard = self.intents.write().unwrap();
 
-        let chain = store_guard.entry(key.clone()).or_default();
-        if let Err(e) = chain.write_intent(txn_id, value.to_vec()) {
-            anyhow::bail!("Write intent failed: {}", e);
+            let chain = store_guard.entry(key.clone()).or_default();
+            if let Err(e) = chain.write_intent(txn_id, value.to_vec()) {
+                anyhow::bail!("Write intent failed: {}", e);
+            }
+            intents_guard.entry(txn_id).or_default().push(key);
         }
-
-        intents_guard.entry(txn_id).or_default().push(key);
+        self.memtable_bytes.fetch_add(added, Ordering::Relaxed);
+        self.maybe_flush_by_size()?;
         Ok(())
     }
 
@@ -293,15 +514,19 @@ impl KvEngine for LsmKvEngine {
             }
         }
 
-        let mut store_guard = self.memtable.write().unwrap();
-        let mut intents_guard = self.intents.write().unwrap();
+        let added = key.len() + 32;
+        {
+            let mut store_guard = self.memtable.write().unwrap();
+            let mut intents_guard = self.intents.write().unwrap();
 
-        let chain = store_guard.entry(key.clone()).or_default();
-        if let Err(e) = chain.delete_intent(txn_id) {
-            anyhow::bail!("Delete intent failed: {}", e);
+            let chain = store_guard.entry(key.clone()).or_default();
+            if let Err(e) = chain.delete_intent(txn_id) {
+                anyhow::bail!("Delete intent failed: {}", e);
+            }
+            intents_guard.entry(txn_id).or_default().push(key);
         }
-
-        intents_guard.entry(txn_id).or_default().push(key);
+        self.memtable_bytes.fetch_add(added, Ordering::Relaxed);
+        self.maybe_flush_by_size()?;
         Ok(())
     }
 
@@ -387,6 +612,9 @@ impl KvEngine for LsmKvEngine {
     }
 
     fn garbage_collect(&self, watermark: Timestamp) -> Result<usize> {
+        // Remember the watermark so the next compaction can reclaim superseded
+        // versions from SSTables too, not just the memtable.
+        self.gc_watermark.store(watermark, Ordering::Relaxed);
         let mut store = self.memtable.write().unwrap();
         let mut removed = 0usize;
         let mut dead_keys = Vec::new();
@@ -756,6 +984,151 @@ mod sst_tests {
                 Bytes::from("key00101"),
                 Bytes::from("key00102"),
             ]
+        );
+    }
+
+    #[test]
+    fn flush_retains_uncommitted_intents() {
+        let dir = TempDir::new().unwrap();
+        let engine = LsmKvEngine::with_wal(dir.path(), None).unwrap();
+
+        let t1 = TxnId::new();
+        engine
+            .write_intent(t1, Bytes::from("committed"), Bytes::from("v"))
+            .unwrap();
+        engine.commit(t1, 10).unwrap();
+
+        // An intent that is still in flight when a flush happens.
+        let t2 = TxnId::new();
+        engine
+            .write_intent(t2, Bytes::from("pending"), Bytes::from("p"))
+            .unwrap();
+        engine.flush().unwrap();
+
+        // Committed data is flushed; the uncommitted intent is invisible but must
+        // be retained so its commit can still land.
+        assert!(engine.get(b"committed", 15).unwrap().is_some());
+        assert!(engine.get(b"pending", 15).unwrap().is_none());
+
+        engine.commit(t2, 20).unwrap();
+        assert_eq!(
+            engine.get(b"pending", 25).unwrap().unwrap(),
+            Bytes::from("p"),
+            "intent survived the flush and committed"
+        );
+    }
+
+    #[test]
+    fn size_triggered_flush_persists_and_bounds_memtable() {
+        let dir = TempDir::new().unwrap();
+        let engine = LsmKvEngine::with_wal(dir.path(), None).unwrap();
+        engine.set_flush_threshold(512);
+
+        for i in 0..100u32 {
+            let txn = TxnId::new();
+            engine
+                .write_intent(
+                    txn,
+                    Bytes::from(format!("key{i:03}")),
+                    Bytes::from(vec![b'x'; 32]),
+                )
+                .unwrap();
+            engine.commit(txn, (i as u64 + 1) * 10).unwrap();
+        }
+
+        assert!(
+            !engine.sstables.read().unwrap().is_empty(),
+            "size-triggered flush produced SSTables"
+        );
+        assert!(
+            engine.memtable_bytes.load(Ordering::Relaxed) < 100 * 64,
+            "memtable stayed bounded well under the total written"
+        );
+        for i in 0..100u32 {
+            assert_eq!(
+                engine
+                    .get(format!("key{i:03}").as_bytes(), 100_000)
+                    .unwrap()
+                    .unwrap(),
+                Bytes::from(vec![b'x'; 32])
+            );
+        }
+    }
+
+    #[test]
+    fn compaction_merges_accumulated_sstables() {
+        let dir = TempDir::new().unwrap();
+        let engine = LsmKvEngine::with_wal(dir.path(), None).unwrap();
+
+        // One SSTable per flush; the COMPACTION_TRIGGER-th flush compacts them.
+        for i in 0..COMPACTION_TRIGGER {
+            let txn = TxnId::new();
+            engine
+                .write_intent(
+                    txn,
+                    Bytes::from(format!("k{i}")),
+                    Bytes::from(format!("v{i}")),
+                )
+                .unwrap();
+            engine.commit(txn, (i as u64 + 1) * 10).unwrap();
+            engine.flush().unwrap();
+        }
+        assert_eq!(
+            engine.sstables.read().unwrap().len(),
+            1,
+            "accumulated SSTables compacted into one"
+        );
+        for i in 0..COMPACTION_TRIGGER {
+            assert_eq!(
+                engine
+                    .get(format!("k{i}").as_bytes(), 100_000)
+                    .unwrap()
+                    .unwrap(),
+                Bytes::from(format!("v{i}"))
+            );
+        }
+    }
+
+    #[test]
+    fn manifest_recovery_after_flush_and_compaction() {
+        let dir = TempDir::new().unwrap();
+        {
+            let engine = LsmKvEngine::with_wal(dir.path(), None).unwrap();
+            for i in 0..(COMPACTION_TRIGGER + 1) {
+                let txn = TxnId::new();
+                engine
+                    .write_intent(
+                        txn,
+                        Bytes::from(format!("m{i}")),
+                        Bytes::from(format!("v{i}")),
+                    )
+                    .unwrap();
+                engine.commit(txn, (i as u64 + 1) * 10).unwrap();
+                engine.flush().unwrap();
+            }
+            // Also leave a key only in the active WAL (no flush after it).
+            let txn = TxnId::new();
+            engine
+                .write_intent(txn, Bytes::from("wal_only"), Bytes::from("w"))
+                .unwrap();
+            engine.commit(txn, 100_000).unwrap();
+        }
+
+        // Reopen: the manifest names the live (compacted) SSTables, and the active
+        // WAL is replayed for the un-flushed key.
+        let engine = LsmKvEngine::with_wal(dir.path(), None).unwrap();
+        for i in 0..(COMPACTION_TRIGGER + 1) {
+            assert_eq!(
+                engine
+                    .get(format!("m{i}").as_bytes(), 1_000_000)
+                    .unwrap()
+                    .unwrap(),
+                Bytes::from(format!("v{i}"))
+            );
+        }
+        assert_eq!(
+            engine.get(b"wal_only", 1_000_000).unwrap().unwrap(),
+            Bytes::from("w")
         );
     }
 }
