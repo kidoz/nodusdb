@@ -590,6 +590,31 @@ impl MemExecutor {
                     ],
                 ],
             )),
+            // Installed extensions. NodusDB has none, but PostgreSQL always ships
+            // `plpgsql`, and tools list this relation to populate an extensions
+            // view; advertise just that one so the view is non-empty and valid.
+            "pg_extension" => Some((
+                Self::virtual_columns(&[
+                    ("oid", "OID"),
+                    ("extname", "NAME"),
+                    ("extowner", "OID"),
+                    ("extnamespace", "OID"),
+                    ("extrelocatable", "BOOL"),
+                    ("extversion", "TEXT"),
+                    ("extconfig", "TEXT"),
+                    ("extcondition", "TEXT"),
+                ]),
+                vec![vec![
+                    Value::Int(Self::stable_oid("extension:plpgsql", 13000)),
+                    Value::Text("plpgsql".into()),
+                    Value::Int(10),
+                    Value::Int(11), // pg_catalog namespace
+                    Value::Bool(false),
+                    Value::Text("1.0".into()),
+                    Value::Null,
+                    Value::Null,
+                ]],
+            )),
             // Event triggers are not supported.
             "pg_event_trigger" => Some((
                 Self::virtual_columns(&[

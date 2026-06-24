@@ -383,6 +383,15 @@ async fn test_pg_catalog_introspection_relations_resolve() {
     assert_eq!(rows[0].get(0), Some("pg_default"));
     assert_eq!(rows[1].get(0), Some("pg_global"));
 
+    // The built-in plpgsql extension is advertised.
+    let msgs = client
+        .simple_query("SELECT extname FROM pg_catalog.pg_extension;")
+        .await
+        .expect("pg_extension resolves");
+    let rows = rows_of(&msgs);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get(0), Some("plpgsql"));
+
     let msgs = client
         .simple_query("SELECT name, utc_offset FROM pg_catalog.pg_timezone_names;")
         .await

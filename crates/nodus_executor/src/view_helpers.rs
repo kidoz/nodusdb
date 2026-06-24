@@ -231,6 +231,7 @@ impl MemExecutor {
                 | "pg_auth_members"
                 | "pg_tablespace"
                 | "pg_event_trigger"
+                | "pg_extension"
         )
     }
 
