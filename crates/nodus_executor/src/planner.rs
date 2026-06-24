@@ -7,7 +7,7 @@
 
 use crate::{
     AggregateOp, AlterTableOp, ColumnDef, CompareOp, FilterExpr, Join, JoinType, LogicalPlan,
-    Operand, Predicate, ProjectionItem, Value, coerce, column_type, literal_arg, render,
+    Operand, Predicate, ProjectionItem, SetOpKind, Value, coerce, column_type, literal_arg, render,
 };
 use anyhow::Result;
 use nodus_catalog::TableConstraint;
@@ -790,41 +790,31 @@ fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Result<Logical
         right,
     } = &*query.body
     {
-        if *op == SetOperator::Union && *set_quantifier == SetQuantifier::All {
-            let left_plan = plan_query(
-                &Query {
-                    with: None,
-                    body: left.clone(),
-                    order_by: vec![],
-                    limit: None,
-                    limit_by: vec![],
-                    offset: None,
-                    fetch: None,
-                    locks: vec![],
-                    for_clause: None,
-                },
-                params,
-            )?;
-            let right_plan = plan_query(
-                &Query {
-                    with: None,
-                    body: right.clone(),
-                    order_by: vec![],
-                    limit: None,
-                    limit_by: vec![],
-                    offset: None,
-                    fetch: None,
-                    locks: vec![],
-                    for_clause: None,
-                },
-                params,
-            )?;
-            return Ok(LogicalPlan::UnionAll {
-                left: Box::new(left_plan),
-                right: Box::new(right_plan),
-            });
-        }
-        anyhow::bail!("Unsupported set operation");
+        let kind = match op {
+            SetOperator::Union => SetOpKind::Union,
+            SetOperator::Intersect => SetOpKind::Intersect,
+            SetOperator::Except => SetOpKind::Except,
+        };
+        let all = *set_quantifier == SetQuantifier::All;
+        let wrap = |body: &Box<SetExpr>| Query {
+            with: None,
+            body: body.clone(),
+            order_by: vec![],
+            limit: None,
+            limit_by: vec![],
+            offset: None,
+            fetch: None,
+            locks: vec![],
+            for_clause: None,
+        };
+        let left_plan = plan_query(&wrap(left), params)?;
+        let right_plan = plan_query(&wrap(right), params)?;
+        return Ok(LogicalPlan::SetOp {
+            op: kind,
+            all,
+            left: Box::new(left_plan),
+            right: Box::new(right_plan),
+        });
     }
 
     let SetExpr::Select(select) = &*query.body else {

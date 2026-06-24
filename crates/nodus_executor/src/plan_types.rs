@@ -248,8 +248,19 @@ pub enum LogicalPlan {
     SelectLiteral {
         values: Vec<(String, crate::Value)>,
     },
-    UnionAll {
+    SetOp {
+        op: SetOpKind,
+        /// `ALL` keeps duplicates; otherwise the result is a distinct multiset.
+        all: bool,
         left: Box<LogicalPlan>,
         right: Box<LogicalPlan>,
     },
+}
+
+/// The kind of set operation combining two query results.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum SetOpKind {
+    Union,
+    Intersect,
+    Except,
 }

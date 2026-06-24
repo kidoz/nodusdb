@@ -161,3 +161,89 @@ fn test_scalar_functions() {
     assert_eq!(row[6], "ALICe"); // REPLACE(name, 'lic', 'LIC')
     assert_eq!(row[7], "12.3"); // ROUND(12.345, 1)
 }
+
+#[test]
+fn test_set_operations() {
+    let (exec, cat) = MemExecutor::shared(Arc::new(MemoryAuditSink::new()));
+    let admin = cat
+        .create_role(nodus_catalog::CreateRoleRequest {
+            id: nodus_catalog::PrincipalId::new(),
+            name: "admin".into(),
+            principal_type: nodus_catalog::PrincipalType::User,
+            database_id: None,
+        })
+        .unwrap();
+    cat.grant_privilege(nodus_catalog::GrantPrivilegeRequest {
+        id: nodus_catalog::GrantId::new(),
+        principal_id: admin.id,
+        resource: nodus_catalog::ResourceRef::System,
+        privilege: "ALL".into(),
+    })
+    .unwrap();
+    let ctx = test_ctx(admin.id);
+
+    for t in ["a", "b"] {
+        exec.execute_logical(
+            &ctx,
+            LogicalPlan::CreateTable {
+                constraints: vec![],
+                name: t.into(),
+                columns: cols(&[("id", "int"), ("n", "int")]),
+            },
+        )
+        .unwrap();
+    }
+    let insert = |t: &str, id: usize, n: &str| {
+        exec.execute_logical(
+            &ctx,
+            LogicalPlan::Insert {
+                table_name: t.into(),
+                columns: vec![],
+                values_list: vec![vec![Value::Text(id.to_string()), Value::Text(n.into())]],
+                returning: vec![],
+            },
+        )
+        .unwrap();
+    };
+    // a.n = {1,2,2,3}, b.n = {2,3,3,4}
+    for (i, n) in ["1", "2", "2", "3"].iter().enumerate() {
+        insert("a", i, n);
+    }
+    for (i, n) in ["2", "3", "3", "4"].iter().enumerate() {
+        insert("b", i, n);
+    }
+
+    let read = |sql: &str| {
+        let mut stmts = nodus_sql::parse_sql(sql).unwrap();
+        let plan = plan_statement(&stmts.remove(0), &[]).unwrap();
+        let out = exec.execute_logical(&ctx, plan).unwrap();
+        let mut res: Vec<String> = out.rows.iter().map(|r| render_row(r).join(",")).collect();
+        res.sort();
+        res
+    };
+
+    assert_eq!(
+        read("SELECT n FROM a UNION SELECT n FROM b"),
+        vec!["1", "2", "3", "4"]
+    );
+    assert_eq!(
+        read("SELECT n FROM a UNION ALL SELECT n FROM b").len(),
+        8,
+        "UNION ALL keeps all rows"
+    );
+    assert_eq!(
+        read("SELECT n FROM a INTERSECT SELECT n FROM b"),
+        vec!["2", "3"]
+    );
+    assert_eq!(
+        read("SELECT n FROM a INTERSECT ALL SELECT n FROM b"),
+        vec!["2", "3"],
+        "a has one 2 and one matching, two 3s vs two 3s -> 2,3"
+    );
+    assert_eq!(read("SELECT n FROM a EXCEPT SELECT n FROM b"), vec!["1"]);
+    assert_eq!(
+        read("SELECT n FROM a EXCEPT ALL SELECT n FROM b"),
+        vec!["1", "2"],
+        "multiset diff: a has two 2s, b has one -> one 2 remains; 1 remains"
+    );
+}

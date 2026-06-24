@@ -25,7 +25,7 @@ mod planner;
 mod value;
 pub use plan_types::{
     AggregateOp, AlterTableOp, CompareOp, FilterExpr, Join, JoinType, LogicalPlan, Operand,
-    Predicate, ProjectionItem,
+    Predicate, ProjectionItem, SetOpKind,
 };
 pub(crate) use planner::parse_filter_expr;
 pub use planner::{expr_to_value, parse_object_name, plan_statement};
@@ -522,7 +522,7 @@ impl Executor for MemExecutor {
             plan,
             LogicalPlan::Select { .. }
                 | LogicalPlan::SelectLiteral { .. }
-                | LogicalPlan::UnionAll { .. }
+                | LogicalPlan::SetOp { .. }
         );
         let mut implicit_txn = None;
 
