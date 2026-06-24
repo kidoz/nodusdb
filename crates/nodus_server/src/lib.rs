@@ -220,10 +220,28 @@ pub async fn run_server_with_config(
     let local_kv: Arc<dyn nodus_storage_api::KvEngine> = match &config.storage.data_dir {
         Some(dir) => {
             let path = std::path::Path::new(dir);
-            std::fs::create_dir_all(path).unwrap();
-            Arc::new(nodus_storage_lsm::LsmKvEngine::with_wal(path, encryption_key).unwrap())
+            std::fs::create_dir_all(path)
+                .map_err(|e| anyhow::anyhow!("creating storage.data_dir '{dir}': {e}"))?;
+            let engine = nodus_storage_lsm::LsmKvEngine::with_wal(path, encryption_key)
+                .map_err(|e| anyhow::anyhow!("opening durable storage at '{dir}': {e}"))?;
+            tracing::info!("Durable storage at {dir}");
+            Arc::new(engine)
         }
-        None => Arc::new(nodus_storage_mem::MemKvEngine::new()),
+        None => {
+            // No data_dir => in-memory storage, which loses everything (Raft log,
+            // catalog, data) on restart. Refuse unless explicitly allowed.
+            if !config.storage.allow_ephemeral {
+                anyhow::bail!(
+                    "storage.data_dir is unset and storage.allow_ephemeral is false; \
+                     set a data_dir for durable storage (or allow_ephemeral=true for dev)"
+                );
+            }
+            tracing::warn!(
+                "Running with IN-MEMORY storage (storage.data_dir is unset) — all data, \
+                 including the Raft log, will be LOST on restart. Set storage.data_dir for durability."
+            );
+            Arc::new(nodus_storage_mem::MemKvEngine::new())
+        }
     };
     let catalog = Arc::new(nodus_catalog::MemoryCatalog::with_store(Arc::new(
         nodus_executor::KvCatalogStore::new(local_kv.clone()),
@@ -752,6 +770,24 @@ mod tests {
     fn tls_disabled_yields_no_acceptor() {
         let cfg = TlsConfig::default();
         assert!(load_tls_config(&cfg).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn refuses_to_start_in_memory_when_ephemeral_disallowed() {
+        let pgwire = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+
+        // data_dir unset + allow_ephemeral=false must fail fast rather than
+        // silently run non-durable.
+        let mut config = NodusConfig::default();
+        config.storage.allow_ephemeral = false;
+
+        let result = run_server_with_config(pgwire, http, config, shutdown_rx).await;
+        assert!(
+            result.is_err(),
+            "server must refuse in-memory storage when allow_ephemeral is false"
+        );
     }
 
     #[test]

@@ -60,6 +60,11 @@ pub struct StorageConfig {
     pub data_dir: Option<String>,
     /// Optional 256-bit AES-GCM key (32 bytes as a hex string) for Transparent Data Encryption (TDE).
     pub encryption_key: Option<String>,
+    /// Whether to permit running with **in-memory** storage when `data_dir` is
+    /// unset. In-memory storage loses ALL data (including the durable Raft log)
+    /// on restart, so production deployments should set this to `false` to refuse
+    /// to start without a `data_dir`. Defaults to `true` for dev/test ergonomics.
+    pub allow_ephemeral: bool,
 }
 
 impl Default for StorageConfig {
@@ -67,6 +72,7 @@ impl Default for StorageConfig {
         Self {
             data_dir: None,
             encryption_key: None,
+            allow_ephemeral: true,
         }
     }
 }
@@ -299,6 +305,20 @@ mod tests {
             assert_eq!(cfg.backup.repository_uri, "file:///var/lib/nodus/backups");
             // Untouched fields keep their defaults.
             assert_eq!(cfg.server.pgwire_addr, "127.0.0.1:5432");
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn allow_ephemeral_defaults_true_and_is_env_overridable() {
+        // Default keeps dev/test ergonomics (in-memory allowed).
+        assert!(NodusConfig::default().storage.allow_ephemeral);
+
+        // Operators can require a data dir by turning it off.
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("NODUS_STORAGE__ALLOW_EPHEMERAL", "false");
+            let cfg = NodusConfig::from_env().unwrap();
+            assert!(!cfg.storage.allow_ephemeral);
             Ok(())
         });
     }

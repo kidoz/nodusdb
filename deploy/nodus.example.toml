@@ -17,6 +17,10 @@ join_peers = []
 [storage]
 # Required for durable data. If unset, nodusd uses in-memory storage.
 data_dir = "/var/lib/nodus/data"
+# Refuse to start with in-memory storage (no data_dir): production should set
+# this false so a missing data_dir fails loudly instead of silently losing data
+# on restart. Leave true only for dev/test.
+allow_ephemeral = false
 # Optional 256-bit AES-GCM key: exactly 64 hex characters.
 # encryption_key = "0000000000000000000000000000000000000000000000000000000000000000"
 
