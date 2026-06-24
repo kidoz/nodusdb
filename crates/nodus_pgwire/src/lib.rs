@@ -13,11 +13,8 @@ use tokio_util::codec::Framed;
 use tracing::{error, info};
 
 use nodus_catalog::PrincipalId;
-use nodus_security::{Authenticator, PasswordAuthenticator, Session, SessionRegistry};
-use pgwire::api::auth::{
-    DefaultServerParameterProvider, LoginInfo, ServerParameterProvider, StartupHandler,
-    save_startup_parameters_to_metadata,
-};
+use nodus_security::{PasswordAuthenticator, Session, SessionRegistry};
+use pgwire::api::auth::{DefaultServerParameterProvider, StartupHandler};
 use pgwire::api::copy::CopyHandler;
 use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
 use pgwire::tokio::PgWireMessageServerCodec;
@@ -26,12 +23,14 @@ mod client_meta;
 mod copy;
 mod encoding;
 mod extended_query;
+mod startup;
 mod type_map;
 mod wire_format;
 use client_meta::*;
 use copy::NodusCopyHandler;
 use encoding::*;
 use extended_query::NodusExtendedQueryHandler;
+use startup::NodusStartupHandler;
 use type_map::map_declared_type;
 use wire_format::*;
 
@@ -60,10 +59,7 @@ use pgwire::api::{ClientInfo, DefaultClient, PgWireConnectionState, PgWireHandle
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::PgWireBackendMessage;
 use pgwire::messages::copy::CopyDone;
-use pgwire::messages::response::{
-    CommandComplete, EmptyQueryResponse, ErrorResponse, ReadyForQuery, SslResponse,
-};
-use pgwire::messages::startup::{Authentication, BackendKeyData, ParameterStatus};
+use pgwire::messages::response::{CommandComplete, EmptyQueryResponse, ReadyForQuery, SslResponse};
 use uuid::Uuid;
 
 /// Runs the synchronous executor on the blocking pool so the calling reactor
@@ -133,135 +129,6 @@ impl Drop for NodusQueryHandler {
         if !self.session_id.is_empty() {
             self.registry.deregister(&self.session_id);
         }
-    }
-}
-
-/// Startup handler that authenticates clients with cleartext passwords against
-/// the [`PasswordAuthenticator`]. On success the principal id is stashed in the
-/// connection metadata for downstream authorization.
-pub struct NodusStartupHandler {
-    authenticator: Arc<PasswordAuthenticator>,
-    param_provider: DefaultServerParameterProvider,
-    registry: Arc<SessionRegistry>,
-}
-
-async fn finish_nodus_authentication<C>(
-    client: &mut C,
-    server_parameter_provider: &DefaultServerParameterProvider,
-) -> PgWireResult<()>
-where
-    C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send,
-    C::Error: Debug,
-    PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
-{
-    client
-        .send(PgWireBackendMessage::Authentication(Authentication::Ok))
-        .await?;
-
-    if let Some(mut parameters) = server_parameter_provider.server_parameters(client) {
-        parameters.insert("server_version_num".to_owned(), "160000".to_owned());
-        parameters.insert("TimeZone".to_owned(), "UTC".to_owned());
-        parameters.insert("IntervalStyle".to_owned(), "postgres".to_owned());
-        parameters.insert("standard_conforming_strings".to_owned(), "on".to_owned());
-        parameters.insert("is_superuser".to_owned(), "on".to_owned());
-        parameters.insert("session_authorization".to_owned(), "nodus".to_owned());
-        let app = client
-            .metadata()
-            .get("application_name")
-            .cloned()
-            .unwrap_or_default();
-        parameters.insert("application_name".to_owned(), app);
-        let mut parameters: Vec<_> = parameters.into_iter().collect();
-        parameters.sort_by(|a, b| a.0.cmp(&b.0));
-        for (name, value) in parameters {
-            client
-                .send(PgWireBackendMessage::ParameterStatus(ParameterStatus::new(
-                    name, value,
-                )))
-                .await?;
-        }
-    }
-
-    let pid = client
-        .metadata()
-        .get(METADATA_BACKEND_PID)
-        .and_then(|s| s.parse::<i32>().ok())
-        .unwrap_or(std::process::id() as i32);
-    let secret = client
-        .metadata()
-        .get(METADATA_BACKEND_SECRET)
-        .and_then(|s| s.parse::<i32>().ok())
-        .unwrap_or_default();
-    client
-        .send(PgWireBackendMessage::BackendKeyData(BackendKeyData::new(
-            pid, secret,
-        )))
-        .await?;
-    client
-        .send(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
-            tx_status_from_client(client),
-        )))
-        .await?;
-    client.flush().await?;
-    client.set_state(PgWireConnectionState::ReadyForQuery);
-    Ok(())
-}
-
-#[async_trait]
-impl StartupHandler for NodusStartupHandler {
-    async fn on_startup<C>(
-        &self,
-        client: &mut C,
-        message: pgwire::messages::PgWireFrontendMessage,
-    ) -> PgWireResult<()>
-    where
-        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send,
-        C::Error: Debug,
-        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
-    {
-        match message {
-            pgwire::messages::PgWireFrontendMessage::Startup(ref startup) => {
-                save_startup_parameters_to_metadata(client, startup);
-                client.set_state(PgWireConnectionState::AuthenticationInProgress);
-                client
-                    .send(PgWireBackendMessage::Authentication(
-                        Authentication::CleartextPassword,
-                    ))
-                    .await?;
-            }
-            pgwire::messages::PgWireFrontendMessage::PasswordMessageFamily(pwd) => {
-                let pwd = pwd.into_password()?;
-                let login = LoginInfo::from_client_info(client);
-                let user = login.user().map(|u| u.to_string()).unwrap_or_default();
-                match self.authenticator.authenticate(&user, &pwd.password) {
-                    Ok(session) => {
-                        let session_id = session_id_from_client(client);
-                        self.registry
-                            .update_principal(&session_id, session.principal_id);
-                        client.metadata_mut().insert(
-                            METADATA_NODUS_PRINCIPAL_ID.to_string(),
-                            session.principal_id.to_string(),
-                        );
-                        finish_nodus_authentication(client, &self.param_provider).await?;
-                    }
-                    Err(_) => {
-                        let error_info = ErrorInfo::new(
-                            "FATAL".to_owned(),
-                            "28P01".to_owned(),
-                            "password authentication failed".to_owned(),
-                        );
-                        client
-                            .feed(PgWireBackendMessage::ErrorResponse(ErrorResponse::from(
-                                error_info,
-                            )))
-                            .await?;
-                        client.close().await?;
-                    }
-                }
-            }
-            _ => {}
-        }
-        Ok(())
     }
 }
 
