@@ -182,6 +182,24 @@ impl MultiRaftManager {
         let _ = raft.initialize(members).await;
     }
 
+    /// Shuts down every Raft group on this node and clears the group map. Called
+    /// on server shutdown so a stopped node stops participating in consensus
+    /// (otherwise it keeps heartbeating to peers and they never re-elect).
+    pub async fn shutdown_all(&self) {
+        let groups: Vec<NodusRaft> = self
+            .state
+            .rafts
+            .write()
+            .await
+            .drain()
+            .map(|(_, r)| r)
+            .collect();
+        self.hosted.write().unwrap().clear();
+        for raft in groups {
+            let _ = raft.shutdown().await;
+        }
+    }
+
     /// Decommissions the group for `group_id`: shuts down its Raft instance and
     /// drops it from the group map / hosted set, so routing no longer reaches it.
     /// The namespace's bytes become unreachable; physical reclamation is left to

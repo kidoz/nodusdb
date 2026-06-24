@@ -493,6 +493,16 @@ pub async fn run_server_with_config(
         .map(|c| Arc::new(TlsAcceptor::from(c.clone())));
     tracing::debug!("TLS acceptor loaded");
 
+    // Graceful Raft shutdown: when the server is told to stop, shut down its
+    // Raft groups so it stops participating in consensus (a node that keeps
+    // heartbeating after "stopping" prevents its peers from re-electing).
+    let raft_shutdown_manager = multi_raft.clone();
+    let mut raft_shutdown = shutdown.clone();
+    let raft_shutdown_task = tokio::spawn(async move {
+        let _ = raft_shutdown.changed().await;
+        raft_shutdown_manager.shutdown_all().await;
+    });
+
     // Background MVCC garbage collector: periodically reclaims superseded
     // versions below the transaction manager's safe watermark.
     let gc_executor = executor.clone();
@@ -727,7 +737,7 @@ pub async fn run_server_with_config(
         http_addr,
         pgwire_task,
         http_task,
-        background_tasks: vec![gc_task, wal_archiver_task],
+        background_tasks: vec![gc_task, wal_archiver_task, raft_shutdown_task],
         registry,
     })
 }
