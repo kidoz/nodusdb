@@ -92,7 +92,7 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
             } else if let Expr::Function(func) = expr {
                 let func_name = func.name.to_string();
                 let rendered = if func_name.eq_ignore_ascii_case("version") {
-                    "PostgreSQL 16.0 (NodusDB)".to_string()
+                    "PostgreSQL 18.0 (NodusDB)".to_string()
                 } else if func_name.eq_ignore_ascii_case("current_database") {
                     "default".to_string()
                 } else if func_name.eq_ignore_ascii_case("current_schema") {

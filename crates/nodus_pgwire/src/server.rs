@@ -405,7 +405,7 @@ pub async fn start_pgwire_server(
     mut shutdown: tokio::sync::watch::Receiver<()>,
 ) -> anyhow::Result<()> {
     let mut param_provider = DefaultServerParameterProvider::default();
-    param_provider.server_version = "16.0".to_string();
+    param_provider.server_version = "18.0".to_string();
 
     let startup_handler = Arc::new(NodusStartupHandler {
         authenticator,

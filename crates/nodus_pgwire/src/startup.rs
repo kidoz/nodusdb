@@ -40,7 +40,7 @@ where
         .await?;
 
     if let Some(mut parameters) = server_parameter_provider.server_parameters(client) {
-        parameters.insert("server_version_num".to_owned(), "160000".to_owned());
+        parameters.insert("server_version_num".to_owned(), "180000".to_owned());
         parameters.insert("TimeZone".to_owned(), "UTC".to_owned());
         parameters.insert("IntervalStyle".to_owned(), "postgres".to_owned());
         parameters.insert("standard_conforming_strings".to_owned(), "on".to_owned());
