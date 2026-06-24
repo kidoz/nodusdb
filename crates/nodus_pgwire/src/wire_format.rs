@@ -12,15 +12,49 @@ use pgwire::messages::data::{FieldDescription, RowDescription};
 use crate::POSTGRES_TYPEMOD_NONE;
 use crate::type_map::map_declared_type;
 
+/// Maps an executor error message to the closest PostgreSQL SQLSTATE so drivers
+/// and ORMs can branch on the error class instead of parsing English text.
+///
+/// The match is intentionally message-driven: the executor raises plain
+/// `anyhow` errors, and this is the single place that classifies them. Order
+/// matters — more specific substrings are tested before generic ones (e.g. a
+/// missing *column* before a missing *relation*). Anything unrecognized falls
+/// back to `XX000` (`internal_error`), which is the signal that a new class
+/// should be added here rather than silently mislabeled.
 pub(crate) fn sqlstate_for_execution_error(err_str: &str) -> &'static str {
+    // Integrity-constraint violations (class 23).
     if err_str.contains("Unique constraint violation") {
-        "23505"
+        "23505" // unique_violation
     } else if err_str.contains("cannot be NULL") {
-        "23502"
-    } else if err_str.contains("relation \"") && err_str.contains("does not exist") {
-        "42P01"
+        "23502" // not_null_violation
+    } else if err_str.contains("violates foreign key constraint") {
+        "23503" // foreign_key_violation
+    } else if err_str.contains("violates check constraint") {
+        "23514" // check_violation
+    // Invalid text representation for a typed value (class 22).
+    } else if err_str.contains("invalid input syntax") {
+        "22P02" // invalid_text_representation
+    // Duplicate object on CREATE without IF NOT EXISTS (class 42). Catalog and
+    // DDL paths phrase this differently ("Database X already exists" vs
+    // "relation \"x\" already exists"), so classify case-insensitively.
+    } else if err_str.contains("already exists") {
+        let lower = err_str.to_ascii_lowercase();
+        if lower.contains("database") {
+            "42P04" // duplicate_database
+        } else if lower.contains("schema") {
+            "42P06" // duplicate_schema
+        } else {
+            "42P07" // duplicate_table (relation / table / index / view)
+        }
+    // Missing object (class 42 / 3B).
+    } else if err_str.contains("savepoint \"") && err_str.contains("does not exist") {
+        "3B001" // invalid_savepoint_specification
+    } else if err_str.contains("column") && err_str.contains("does not exist") {
+        "42703" // undefined_column
+    } else if err_str.contains("does not exist") {
+        "42P01" // undefined_table (relation / index "x" does not exist)
     } else {
-        "XX000"
+        "XX000" // internal_error
     }
 }
 
@@ -195,4 +229,87 @@ pub(crate) fn field_info_for_output(
             })
             .collect(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sqlstate_for_execution_error;
+
+    #[test]
+    fn maps_constraint_violations() {
+        assert_eq!(
+            sqlstate_for_execution_error("Unique constraint violation on primary key"),
+            "23505"
+        );
+        assert_eq!(
+            sqlstate_for_execution_error("Column email cannot be NULL"),
+            "23502"
+        );
+        assert_eq!(
+            sqlstate_for_execution_error("violates foreign key constraint"),
+            "23503"
+        );
+        assert_eq!(
+            sqlstate_for_execution_error("violates check constraint"),
+            "23514"
+        );
+    }
+
+    #[test]
+    fn maps_duplicate_objects_case_insensitively() {
+        // DDL-path phrasing.
+        assert_eq!(
+            sqlstate_for_execution_error("relation \"users\" already exists"),
+            "42P07"
+        );
+        // Catalog-path phrasing.
+        assert_eq!(
+            sqlstate_for_execution_error("Table users already exists"),
+            "42P07"
+        );
+        assert_eq!(
+            sqlstate_for_execution_error("Schema app already exists"),
+            "42P06"
+        );
+        assert_eq!(
+            sqlstate_for_execution_error("Database shop already exists"),
+            "42P04"
+        );
+    }
+
+    #[test]
+    fn maps_missing_objects() {
+        assert_eq!(
+            sqlstate_for_execution_error("relation \"pg_catalog.nope\" does not exist"),
+            "42P01"
+        );
+        assert_eq!(
+            sqlstate_for_execution_error("index \"idx_x\" does not exist"),
+            "42P01"
+        );
+        assert_eq!(
+            sqlstate_for_execution_error("column \"missing\" does not exist"),
+            "42703"
+        );
+        assert_eq!(
+            sqlstate_for_execution_error("savepoint \"sp1\" does not exist"),
+            "3B001"
+        );
+    }
+
+    #[test]
+    fn maps_invalid_text_representation() {
+        assert_eq!(
+            sqlstate_for_execution_error("invalid input syntax for type integer: \"abc\""),
+            "22P02"
+        );
+    }
+
+    #[test]
+    fn falls_back_to_internal_error() {
+        assert_eq!(
+            sqlstate_for_execution_error("something nobody classified yet"),
+            "XX000"
+        );
+    }
 }
