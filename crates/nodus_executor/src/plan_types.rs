@@ -110,6 +110,9 @@ pub enum ProjectionItem {
     },
     WindowFunction {
         func_name: String,
+        /// Function arguments: the target column for LAG/LEAD and aggregate
+        /// windows, plus an optional offset literal for LAG/LEAD.
+        args: Vec<String>,
         partition_by: Vec<String>,
         order_by: Vec<(String, bool)>, // (col_name, ascending)
         alias: Option<String>,

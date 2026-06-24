@@ -159,3 +159,22 @@ pub(crate) fn extract_operand(expr: &sqlparser::ast::Expr, params: &[Value]) -> 
         }
     }
 }
+
+/// Extracts a window/scalar function's arguments as strings: column names via
+/// `extract_col_name`, or numeric/string literals (e.g. the LAG/LEAD offset).
+pub(crate) fn window_args(func: &sqlparser::ast::Function) -> Vec<String> {
+    use sqlparser::ast::{Expr, FunctionArg, FunctionArgExpr, Value as SqlValue};
+    func.args
+        .iter()
+        .filter_map(|a| match a {
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => {
+                extract_col_name(e).or_else(|| match e {
+                    Expr::Value(SqlValue::Number(n, _)) => Some(n.clone()),
+                    Expr::Value(SqlValue::SingleQuotedString(s)) => Some(s.clone()),
+                    _ => None,
+                })
+            }
+            _ => None,
+        })
+        .collect()
+}

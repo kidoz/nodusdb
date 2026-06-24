@@ -384,3 +384,75 @@ fn test_having() {
         vec!["C"]
     );
 }
+
+#[test]
+fn test_window_functions() {
+    let (exec, cat) = MemExecutor::shared(Arc::new(MemoryAuditSink::new()));
+    let admin = cat
+        .create_role(nodus_catalog::CreateRoleRequest {
+            id: nodus_catalog::PrincipalId::new(),
+            name: "admin".into(),
+            principal_type: nodus_catalog::PrincipalType::User,
+            database_id: None,
+        })
+        .unwrap();
+    cat.grant_privilege(nodus_catalog::GrantPrivilegeRequest {
+        id: nodus_catalog::GrantId::new(),
+        principal_id: admin.id,
+        resource: nodus_catalog::ResourceRef::System,
+        privilege: "ALL".into(),
+    })
+    .unwrap();
+    let ctx = test_ctx(admin.id);
+
+    exec.execute_logical(
+        &ctx,
+        LogicalPlan::CreateTable {
+            constraints: vec![],
+            name: "emp".into(),
+            columns: cols(&[("id", "int"), ("amount", "int")]),
+        },
+    )
+    .unwrap();
+    let insert = |id: &str, amt: &str| {
+        exec.execute_logical(
+            &ctx,
+            LogicalPlan::Insert {
+                table_name: "emp".into(),
+                columns: vec![],
+                values_list: vec![vec![Value::Text(id.into()), Value::Text(amt.into())]],
+                returning: vec![],
+            },
+        )
+        .unwrap();
+    };
+    // amounts: 10, 10, 20, 30
+    insert("1", "10");
+    insert("2", "10");
+    insert("3", "20");
+    insert("4", "30");
+
+    let run = |sql: &str| {
+        let mut stmts = nodus_sql::parse_sql(sql).unwrap();
+        let plan = plan_statement(&stmts.remove(0), &[]).unwrap();
+        let out = exec.execute_logical(&ctx, plan).unwrap();
+        out.rows
+            .iter()
+            .map(|r| render_row(r).join(","))
+            .collect::<Vec<_>>()
+    };
+
+    // RANK over amount asc -> 1,1,3,4 ; DENSE_RANK -> 1,1,2,3
+    let rank = run("SELECT id, RANK() OVER (ORDER BY amount) FROM emp ORDER BY id");
+    assert_eq!(rank, vec!["1,1", "2,1", "3,3", "4,4"]);
+    let dense = run("SELECT id, DENSE_RANK() OVER (ORDER BY amount) FROM emp ORDER BY id");
+    assert_eq!(dense, vec!["1,1", "2,1", "3,2", "4,3"]);
+
+    // LAG(amount) ordered by id -> NULL,10,10,20
+    let lag = run("SELECT id, LAG(amount) OVER (ORDER BY id) FROM emp ORDER BY id");
+    assert_eq!(lag, vec!["1,", "2,10", "3,10", "4,20"]);
+
+    // SUM(amount) OVER () -> 70 for all rows
+    let sum = run("SELECT id, SUM(amount) OVER () FROM emp ORDER BY id");
+    assert_eq!(sum, vec!["1,70", "2,70", "3,70", "4,70"]);
+}

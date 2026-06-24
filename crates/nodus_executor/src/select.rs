@@ -464,6 +464,7 @@ impl MemExecutor {
                 match proj_item {
                     ProjectionItem::WindowFunction {
                         func_name,
+                        args,
                         partition_by,
                         order_by: w_order_by,
                         alias,
@@ -516,21 +517,146 @@ impl MemExecutor {
                         });
 
                         let mut results = vec![Value::Null; stored_rows.len()];
+                        let partition_key_of = |row: &[Value]| -> Vec<Value> {
+                            p_indices
+                                .iter()
+                                .map(|&idx| row.get(idx).unwrap_or(&Value::Null).clone())
+                                .collect()
+                        };
+                        let order_key_of = |row: &[Value]| -> Vec<Value> {
+                            o_indices
+                                .iter()
+                                .map(|&(idx, _)| row.get(idx).unwrap_or(&Value::Null).clone())
+                                .collect()
+                        };
                         if func_name == "ROW_NUMBER" {
                             let mut current_partition: Vec<Value> = Vec::new();
                             let mut row_num = 1i64;
+                            let mut first = true;
                             for &row_idx in &row_indices {
-                                let row = &stored_rows[row_idx];
-                                let partition_key: Vec<Value> = p_indices
-                                    .iter()
-                                    .map(|&idx| row.get(idx).unwrap_or(&Value::Null).clone())
-                                    .collect();
-                                if partition_key != current_partition {
+                                let partition_key = partition_key_of(&stored_rows[row_idx]);
+                                if first || partition_key != current_partition {
                                     current_partition = partition_key;
                                     row_num = 1;
+                                    first = false;
                                 }
                                 results[row_idx] = Value::Int(row_num);
                                 row_num += 1;
+                            }
+                        } else if func_name == "RANK" || func_name == "DENSE_RANK" {
+                            // RANK leaves gaps after ties (1,1,3); DENSE_RANK does not (1,1,2).
+                            let dense = func_name == "DENSE_RANK";
+                            let mut current_partition: Vec<Value> = Vec::new();
+                            let mut rank = 0i64;
+                            let mut seen = 0i64;
+                            let mut prev_order: Option<Vec<Value>> = None;
+                            let mut first = true;
+                            for &row_idx in &row_indices {
+                                let row = &stored_rows[row_idx];
+                                let partition_key = partition_key_of(row);
+                                let order_key = order_key_of(row);
+                                if first || partition_key != current_partition {
+                                    current_partition = partition_key;
+                                    rank = 1;
+                                    seen = 1;
+                                    prev_order = Some(order_key);
+                                    first = false;
+                                } else {
+                                    seen += 1;
+                                    if Some(&order_key) != prev_order.as_ref() {
+                                        rank = if dense { rank + 1 } else { seen };
+                                        prev_order = Some(order_key);
+                                    }
+                                }
+                                results[row_idx] = Value::Int(rank);
+                            }
+                        } else if func_name == "LAG" || func_name == "LEAD" {
+                            // Group the partition-then-order-sorted rows by partition.
+                            let groups =
+                                partition_groups(&row_indices, &partition_key_of, &stored_rows);
+                            let arg_idx = args.first().and_then(|c| {
+                                col_names
+                                    .iter()
+                                    .position(|tc| tc == c || tc.ends_with(&format!(".{}", c)))
+                            });
+                            let offset: usize =
+                                args.get(1).and_then(|s| s.parse().ok()).unwrap_or(1);
+                            let lead = func_name == "LEAD";
+                            for group in &groups {
+                                for (pos, &row_idx) in group.iter().enumerate() {
+                                    let target = if lead {
+                                        pos.checked_add(offset)
+                                    } else {
+                                        pos.checked_sub(offset)
+                                    };
+                                    results[row_idx] = target
+                                        .and_then(|t| group.get(t))
+                                        .and_then(|&ti| {
+                                            arg_idx.and_then(|ai| stored_rows[ti].get(ai))
+                                        })
+                                        .cloned()
+                                        .unwrap_or(Value::Null);
+                                }
+                            }
+                        } else if matches!(
+                            func_name.as_str(),
+                            "SUM" | "COUNT" | "AVG" | "MIN" | "MAX"
+                        ) {
+                            // Aggregate window over the whole partition (no frame clause).
+                            let groups =
+                                partition_groups(&row_indices, &partition_key_of, &stored_rows);
+                            let arg = args.first().cloned().unwrap_or_else(|| "*".to_string());
+                            for group in &groups {
+                                let group_rows: Vec<Vec<Value>> =
+                                    group.iter().map(|&i| stored_rows[i].clone()).collect();
+                                let agg = match func_name.as_str() {
+                                    "AVG" => {
+                                        let sum = compute_aggregate(
+                                            &AggregateOp::Sum,
+                                            &arg,
+                                            &group_rows,
+                                            &col_names,
+                                        );
+                                        let count = group_rows.len() as f64;
+                                        match sum {
+                                            Value::Int(s) if count > 0.0 => {
+                                                Value::Float(s as f64 / count)
+                                            }
+                                            Value::Float(s) if count > 0.0 => {
+                                                Value::Float(s / count)
+                                            }
+                                            _ => Value::Null,
+                                        }
+                                    }
+                                    "SUM" => compute_aggregate(
+                                        &AggregateOp::Sum,
+                                        &arg,
+                                        &group_rows,
+                                        &col_names,
+                                    ),
+                                    "COUNT" => compute_aggregate(
+                                        &AggregateOp::Count,
+                                        &arg,
+                                        &group_rows,
+                                        &col_names,
+                                    ),
+                                    "MIN" => compute_aggregate(
+                                        &AggregateOp::Min,
+                                        &arg,
+                                        &group_rows,
+                                        &col_names,
+                                    ),
+                                    "MAX" => compute_aggregate(
+                                        &AggregateOp::Max,
+                                        &arg,
+                                        &group_rows,
+                                        &col_names,
+                                    ),
+                                    _ => Value::Null,
+                                };
+                                for &row_idx in group {
+                                    results[row_idx] = agg.clone();
+                                }
                             }
                         } else {
                             anyhow::bail!("Unsupported window function: {}", func_name);
@@ -849,4 +975,26 @@ impl MemExecutor {
             tag,
         })
     }
+}
+
+/// Groups partition-then-order-sorted row indices into per-partition runs,
+/// used by LAG/LEAD and aggregate window functions.
+fn partition_groups<F: Fn(&[Value]) -> Vec<Value>>(
+    row_indices: &[usize],
+    partition_key_of: F,
+    stored_rows: &[Vec<Value>],
+) -> Vec<Vec<usize>> {
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    let mut current: Vec<Value> = Vec::new();
+    let mut first = true;
+    for &row_idx in row_indices {
+        let pk = partition_key_of(&stored_rows[row_idx]);
+        if first || pk != current {
+            groups.push(Vec::new());
+            current = pk;
+            first = false;
+        }
+        groups.last_mut().unwrap().push(row_idx);
+    }
+    groups
 }

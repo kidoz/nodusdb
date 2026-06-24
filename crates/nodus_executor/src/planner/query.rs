@@ -215,6 +215,7 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
                         }
                         projection.push(ProjectionItem::WindowFunction {
                             func_name: fname,
+                            args: window_args(func),
                             partition_by,
                             order_by,
                             alias: None,
@@ -337,6 +338,7 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
                         }
                         projection.push(ProjectionItem::WindowFunction {
                             func_name: fname,
+                            args: window_args(func),
                             partition_by,
                             order_by,
                             alias: Some(alias.value.clone()),
