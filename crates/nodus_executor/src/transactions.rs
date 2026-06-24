@@ -115,12 +115,24 @@ impl MemExecutor {
         Ok(QueryOutput::tag("RELEASE"))
     }
 
-    pub(crate) fn exec_show_variable(&self, variable: String) -> Result<QueryOutput> {
-        let value = if variable.eq_ignore_ascii_case("search_path") {
-            "public".to_string()
-        } else {
-            String::new()
-        };
+    /// `SHOW <var>` — returns the session's set value, or the built-in default,
+    /// or an empty string for variables NodusDB does not model.
+    pub(crate) fn exec_show_variable(
+        &self,
+        ctx: &ExecutionContext,
+        variable: String,
+    ) -> Result<QueryOutput> {
+        let key = variable.trim().to_ascii_lowercase();
+        let set_value = self
+            .session_vars
+            .read()
+            .unwrap()
+            .get(&ctx.session_id)
+            .and_then(|vars| vars.get(&key))
+            .cloned();
+        let value = set_value
+            .or_else(|| crate::session_vars::default_session_var(&key).map(str::to_owned))
+            .unwrap_or_default();
         Ok(QueryOutput {
             columns: vec![variable],
             types: vec!["VARCHAR".to_string()],
@@ -131,8 +143,26 @@ impl MemExecutor {
         })
     }
 
-    pub(crate) fn exec_set_variable(&self) -> Result<QueryOutput> {
-        // Acknowledging SET requests to support clients like JDBC
+    /// `SET <var> = <value>` — persists into the per-session overlay so a later
+    /// `SHOW` reflects it. `SET <var> = DEFAULT` clears the override (reverting
+    /// to the built-in default). The value is acknowledged for every variable,
+    /// including ones NodusDB does not act on, to keep drivers like pgjdbc/Npgsql
+    /// happy.
+    pub(crate) fn exec_set_variable(
+        &self,
+        ctx: &ExecutionContext,
+        variable: String,
+        value: String,
+    ) -> Result<QueryOutput> {
+        let key = variable.trim().to_ascii_lowercase();
+        let normalized = crate::session_vars::normalize_var_value(&value);
+        let mut guard = self.session_vars.write().unwrap();
+        let vars = guard.entry(ctx.session_id.clone()).or_default();
+        if normalized.eq_ignore_ascii_case("default") {
+            vars.remove(&key);
+        } else {
+            vars.insert(key, normalized);
+        }
         Ok(QueryOutput::tag("SET"))
     }
 }

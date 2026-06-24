@@ -405,6 +405,13 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
             variable: "transaction_isolation".to_string(),
             value: "read committed".to_string(),
         }),
+        // `SET TIME ZONE <x>` is the SQL-standard spelling of `SET timezone = <x>`;
+        // route it to the same per-session variable so it persists and `SHOW
+        // TimeZone` reflects it (`DEFAULT`/`LOCAL` clear the override).
+        Statement::SetTimeZone { value, .. } => Ok(LogicalPlan::SetVariable {
+            variable: "timezone".to_string(),
+            value: value.to_string(),
+        }),
         Statement::Discard { .. } => Ok(LogicalPlan::Noop {
             tag: "DISCARD ALL".to_string(),
         }),

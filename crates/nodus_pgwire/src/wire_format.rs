@@ -58,6 +58,39 @@ pub(crate) fn sqlstate_for_execution_error(err_str: &str) -> &'static str {
     }
 }
 
+/// For a settable `GUC_REPORT` variable, returns the canonical name PostgreSQL
+/// uses in `ParameterStatus` messages (correct casing); `None` for variables
+/// that are not reported to clients on change. Drivers (Npgsql's timezone
+/// handling, pgjdbc's `standard_conforming_strings` tracking) rely on these
+/// echoes after a `SET`.
+pub(crate) fn reportable_guc_canonical_name(lower_name: &str) -> Option<&'static str> {
+    Some(match lower_name {
+        "application_name" => "application_name",
+        "client_encoding" => "client_encoding",
+        "datestyle" => "DateStyle",
+        "intervalstyle" => "IntervalStyle",
+        "timezone" => "TimeZone",
+        "standard_conforming_strings" => "standard_conforming_strings",
+        "default_transaction_read_only" => "default_transaction_read_only",
+        _ => return None,
+    })
+}
+
+/// Strips one surrounding layer of single/double quotes from a `SET` value so
+/// the `ParameterStatus` echo carries the bare value (`'UTC'` -> `UTC`).
+pub(crate) fn normalize_guc_value(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let bytes = trimmed.as_bytes();
+    if bytes.len() >= 2 {
+        let first = bytes[0];
+        let last = bytes[bytes.len() - 1];
+        if (first == b'\'' && last == b'\'') || (first == b'"' && last == b'"') {
+            return trimmed[1..trimmed.len() - 1].to_string();
+        }
+    }
+    trimmed.to_string()
+}
+
 pub(crate) fn user_error(severity: &str, code: &str, message: impl Into<String>) -> PgWireError {
     PgWireError::UserError(Box::new(ErrorInfo::new(
         severity.to_owned(),

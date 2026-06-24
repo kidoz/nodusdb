@@ -690,3 +690,132 @@ async fn test_pgwire_queries() {
         panic!("Expected a row");
     }
 }
+
+/// Helper: run a simple query and return the first column of the first data row.
+async fn show_value(client: &tokio_postgres::Client, sql: &str) -> String {
+    let rows = client.simple_query(sql).await.unwrap();
+    for msg in &rows {
+        if let SimpleQueryMessage::Row(row) = msg {
+            return row.get(0).unwrap_or_default().to_string();
+        }
+    }
+    panic!("no row returned for `{sql}`");
+}
+
+/// `SET` must persist in the session and `SHOW` must reflect it, including the
+/// built-in defaults and `= DEFAULT` reset — the session-variable round-trip
+/// drivers and ORMs depend on.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_session_variables_persist_and_reset() {
+    let server = TestServer::start().await.expect("server starts");
+    let client = connect(&server).await;
+
+    // Defaults before any SET.
+    assert_eq!(show_value(&client, "SHOW search_path").await, "public");
+    assert_eq!(show_value(&client, "SHOW client_encoding").await, "UTF8");
+    assert_eq!(show_value(&client, "SHOW application_name").await, "");
+
+    // SET persists and SHOW reflects (quotes stripped from the reported value).
+    client
+        .simple_query("SET application_name TO 'nodus_app'")
+        .await
+        .unwrap();
+    assert_eq!(
+        show_value(&client, "SHOW application_name").await,
+        "nodus_app"
+    );
+
+    client
+        .simple_query("SET search_path TO myschema")
+        .await
+        .unwrap();
+    assert_eq!(show_value(&client, "SHOW search_path").await, "myschema");
+
+    // SET ... = DEFAULT reverts to the built-in default.
+    client
+        .simple_query("SET search_path = DEFAULT")
+        .await
+        .unwrap();
+    assert_eq!(show_value(&client, "SHOW search_path").await, "public");
+
+    // The SQL-standard `SET TIME ZONE <x>` spelling persists like `SET timezone`.
+    client
+        .simple_query("SET TIME ZONE 'America/New_York'")
+        .await
+        .unwrap();
+    assert_eq!(
+        show_value(&client, "SHOW TimeZone").await,
+        "America/New_York"
+    );
+    client.simple_query("SET TIME ZONE DEFAULT").await.unwrap();
+    assert_eq!(show_value(&client, "SHOW TimeZone").await, "UTC");
+}
+
+/// Session variables are per-connection: one client's `SET` must not leak into
+/// another's view.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_session_variables_are_isolated_per_connection() {
+    let server = TestServer::start().await.expect("server starts");
+    let client_a = connect(&server).await;
+    let client_b = connect(&server).await;
+
+    client_a
+        .simple_query("SET application_name TO 'only_a'")
+        .await
+        .unwrap();
+
+    assert_eq!(
+        show_value(&client_a, "SHOW application_name").await,
+        "only_a"
+    );
+    assert_eq!(show_value(&client_b, "SHOW application_name").await, "");
+}
+
+/// A successful `SET` of a GUC_REPORT variable emits a `ParameterStatus` ('S')
+/// message before `ReadyForQuery` ('Z'), as PostgreSQL does, so drivers can
+/// track the new value. Non-reportable variables do not.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_reportable_set_emits_parameter_status() {
+    let server = TestServer::start().await.expect("server starts");
+    let mut stream = open_raw_pgwire(&server).await;
+
+    write_frontend_message(&mut stream, b'Q', b"SET TimeZone TO 'America/New_York'\0").await;
+
+    let mut saw_parameter_status = false;
+    loop {
+        let (message_type, body) = read_backend_message(&mut stream).await;
+        if message_type == b'S' {
+            saw_parameter_status = true;
+            assert!(
+                body.windows(b"TimeZone\0".len())
+                    .any(|w| w == b"TimeZone\0"),
+                "ParameterStatus should name TimeZone"
+            );
+            assert!(
+                body.windows(b"America/New_York\0".len())
+                    .any(|w| w == b"America/New_York\0"),
+                "ParameterStatus should carry the new value"
+            );
+        }
+        if message_type == b'Z' {
+            break;
+        }
+    }
+    assert!(
+        saw_parameter_status,
+        "expected a ParameterStatus after SET TimeZone"
+    );
+
+    // A non-reportable variable must NOT trigger ParameterStatus.
+    write_frontend_message(&mut stream, b'Q', b"SET statement_timeout TO 0\0").await;
+    loop {
+        let (message_type, _) = read_backend_message(&mut stream).await;
+        assert_ne!(
+            message_type, b'S',
+            "statement_timeout is not a GUC_REPORT variable"
+        );
+        if message_type == b'Z' {
+            break;
+        }
+    }
+}

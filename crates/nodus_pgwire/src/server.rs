@@ -366,6 +366,7 @@ where
         }
     }
     factory.registry.deregister(&session_id);
+    factory.executor.end_session(&session_id);
     Ok(())
 }
 

@@ -787,10 +787,6 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
                 "canceling statement due to statement timeout",
             ));
         }
-        if is_set_default_statement(query_str) {
-            return Ok(Response::Execution(Tag::new("SET")));
-        }
-
         let stmt = match nodus_sql::parse_sql(query_str) {
             Ok(mut stmts) if !stmts.is_empty() => stmts.remove(0),
             Ok(_) => return Ok(Response::Execution(Tag::new("OK"))),

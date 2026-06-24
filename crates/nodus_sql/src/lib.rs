@@ -33,6 +33,32 @@ pub fn parse_sql(
     Parser::parse_sql(&dialect, sql)
 }
 
+/// Extracts `(name, value)` from a parsed `SET <name> = <value>` statement when
+/// the value is a single scalar. Returns `None` for non-`SET` statements and for
+/// list- or multi-valued sets (e.g. `SET search_path TO a, b`). The value keeps
+/// the parser's rendering (quotes included); callers normalize as needed.
+///
+/// The wire layer uses this to decide whether a successful `SET` should be
+/// echoed back as a `ParameterStatus` message (for `GUC_REPORT` variables),
+/// without re-parsing the raw SQL text.
+pub fn set_variable_parts(stmt: &sqlparser::ast::Statement) -> Option<(String, String)> {
+    use sqlparser::ast::Statement;
+    match stmt {
+        Statement::SetVariable {
+            variable, value, ..
+        } => {
+            let values: Vec<String> = value.iter().map(|v| v.to_string()).collect();
+            if values.len() != 1 {
+                return None;
+            }
+            Some((variable.to_string(), values.into_iter().next()?))
+        }
+        // `SET TIME ZONE <x>` is the SQL-standard spelling of `SET timezone = <x>`.
+        Statement::SetTimeZone { value, .. } => Some(("timezone".to_string(), value.to_string())),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

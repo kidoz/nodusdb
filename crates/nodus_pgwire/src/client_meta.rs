@@ -120,11 +120,6 @@ pub(crate) fn statement_would_timeout<C: ClientInfo>(client: &C, query: &str) ->
     }
 }
 
-pub(crate) fn is_set_default_statement(query: &str) -> bool {
-    let q = query.trim().to_ascii_uppercase();
-    q.starts_with("SET ") && q.contains(" DEFAULT")
-}
-
 pub(crate) fn described_statement_key(statement: &str) -> String {
     format!("nodus_described_statement:{statement}")
 }

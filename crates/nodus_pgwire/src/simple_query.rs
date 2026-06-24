@@ -13,6 +13,7 @@ use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::PgWireBackendMessage;
 use pgwire::messages::copy::CopyDone;
 use pgwire::messages::response::{CommandComplete, EmptyQueryResponse, ReadyForQuery};
+use pgwire::messages::startup::ParameterStatus;
 use tracing::{error, info};
 
 use crate::client_meta::*;
@@ -229,10 +230,6 @@ impl SimpleQueryHandler for NodusQueryHandler {
                 "canceling statement due to statement timeout",
             ));
         }
-        if is_set_default_statement(query_str) {
-            return Ok(vec![Response::Execution(Tag::new("SET"))]);
-        }
-
         // Parse SQL and translate every statement in a simple-query batch.
         // Drivers such as Npgsql issue startup metadata batches and expect one
         // protocol result for each statement before ReadyForQuery.
@@ -286,6 +283,21 @@ impl SimpleQueryHandler for NodusQueryHandler {
                     "57014",
                     "canceling statement due to user request",
                 ));
+            }
+
+            // A successful `SET` of a GUC_REPORT variable is echoed back as a
+            // ParameterStatus, the same as PostgreSQL, so drivers can track
+            // session state (e.g. Npgsql's TimeZone, pgjdbc's
+            // standard_conforming_strings) without re-querying.
+            if let Some((name, value)) = nodus_sql::set_variable_parts(&stmt)
+                && let Some(canonical) = reportable_guc_canonical_name(&name.to_ascii_lowercase())
+            {
+                client
+                    .send(PgWireBackendMessage::ParameterStatus(ParameterStatus::new(
+                        canonical.to_owned(),
+                        normalize_guc_value(&value),
+                    )))
+                    .await?;
             }
 
             // No projected columns => a command tag (CREATE TABLE, INSERT, BEGIN...).

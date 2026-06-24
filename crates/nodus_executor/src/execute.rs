@@ -120,11 +120,10 @@ impl MemExecutor {
             LogicalPlan::Savepoint { name } => self.exec_savepoint(ctx, name),
             LogicalPlan::RollbackToSavepoint { name } => self.exec_rollback_to_savepoint(ctx, name),
             LogicalPlan::ReleaseSavepoint { name } => self.exec_release_savepoint(ctx, name),
-            LogicalPlan::ShowVariable { variable } => self.exec_show_variable(variable),
-            LogicalPlan::SetVariable {
-                variable: _,
-                value: _,
-            } => self.exec_set_variable(),
+            LogicalPlan::ShowVariable { variable } => self.exec_show_variable(ctx, variable),
+            LogicalPlan::SetVariable { variable, value } => {
+                self.exec_set_variable(ctx, variable, value)
+            }
             LogicalPlan::Noop { tag } => Ok(QueryOutput::tag(&tag)),
             LogicalPlan::SelectLiteral { values } => self.exec_select_literal(values),
             LogicalPlan::SetOp {

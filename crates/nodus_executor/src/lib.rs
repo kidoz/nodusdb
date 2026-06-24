@@ -27,6 +27,7 @@ mod pg_catalog;
 mod plan_types;
 mod planner;
 mod select;
+mod session_vars;
 mod set_ops;
 mod system_views;
 mod transactions;
@@ -135,6 +136,10 @@ pub struct Row {
 pub trait Executor: Send + Sync {
     fn execute_logical(&self, ctx: &ExecutionContext, plan: LogicalPlan) -> Result<QueryOutput>;
     fn execute_physical(&self, ctx: &ExecutionContext, plan: PhysicalPlan) -> Result<Vec<Row>>;
+
+    /// Releases any per-session state (GUC overlay, dangling transaction) when a
+    /// connection closes. Default is a no-op for executors that hold none.
+    fn end_session(&self, _session_id: &str) {}
 }
 
 /// Reserved KV key under which the catalog's serialized state is stored. The
@@ -210,6 +215,10 @@ pub struct MemExecutor {
     /// Active explicit transaction per session id (`BEGIN`..`COMMIT`/`ROLLBACK`).
     /// Keyed by session so one connection's transaction can't affect another's.
     pub(crate) active_txns: std::sync::RwLock<HashMap<String, ActiveTxn>>,
+    /// Per-session GUC overlay (`SET`/`SHOW`). Keyed by session id; each value is
+    /// a map of lowercased variable name to its set value. Cleared on session
+    /// end so it cannot grow unbounded. See [`crate::session_vars`].
+    pub(crate) session_vars: std::sync::RwLock<HashMap<String, HashMap<String, String>>>,
 }
 
 impl MemExecutor {
@@ -229,6 +238,7 @@ impl MemExecutor {
             kv,
             txn,
             active_txns: std::sync::RwLock::new(HashMap::new()),
+            session_vars: std::sync::RwLock::new(HashMap::new()),
         }
     }
 
@@ -624,6 +634,16 @@ impl Executor for MemExecutor {
 
     fn execute_physical(&self, ctx: &ExecutionContext, plan: PhysicalPlan) -> Result<Vec<Row>> {
         self.execute_physical_inner(ctx, plan)
+    }
+
+    fn end_session(&self, session_id: &str) {
+        self.session_vars.write().unwrap().remove(session_id);
+        if let Some(txn) = self.active_txns.write().unwrap().remove(session_id) {
+            // A client that drops mid-transaction must not leave the write intent
+            // dangling; abort so the row locks/intents are released.
+            let _ = self.txn.abort_txn(txn.txn_id);
+            let _ = self.kv.abort(txn.txn_id);
+        }
     }
 }
 
