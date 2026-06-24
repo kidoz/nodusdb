@@ -34,6 +34,10 @@ pub struct ServerHandle {
     pub http_addr: SocketAddr,
     pub pgwire_task: JoinHandle<anyhow::Result<()>>,
     pub http_task: JoinHandle<std::io::Result<()>>,
+    /// Detached-no-more background loops (MVCC GC, WAL archiver). They observe
+    /// the shutdown watch and exit cleanly; retaining the handles lets the
+    /// process await an in-flight pass instead of dropping it on the floor.
+    pub background_tasks: Vec<JoinHandle<()>>,
     /// Shared registry of active client sessions (inspection + cancellation).
     pub registry: Arc<SessionRegistry>,
 }
@@ -464,7 +468,7 @@ pub async fn run_server_with_config(
     let gc_executor = executor.clone();
     let gc_metrics = state.metrics.clone();
     let mut gc_shutdown = shutdown.clone();
-    tokio::spawn(async move {
+    let gc_task = tokio::spawn(async move {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
         loop {
             tokio::select! {
@@ -521,7 +525,7 @@ pub async fn run_server_with_config(
     let data_dir_clone = config.storage.data_dir.clone();
     let local_kv_clone = local_kv.clone();
     let mut wal_shutdown = shutdown.clone();
-    tokio::spawn(async move {
+    let wal_archiver_task = tokio::spawn(async move {
         if let Some(dir_path_str) = data_dir_clone {
             let dir_path = std::path::Path::new(&dir_path_str);
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
@@ -693,6 +697,7 @@ pub async fn run_server_with_config(
         http_addr,
         pgwire_task,
         http_task,
+        background_tasks: vec![gc_task, wal_archiver_task],
         registry,
     })
 }

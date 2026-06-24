@@ -60,5 +60,11 @@ async fn main() -> anyhow::Result<()> {
 
     let _ = tokio::try_join!(handle.pgwire_task, handle.http_task)?;
 
+    // Let the background loops (MVCC GC, WAL archiver) finish their current pass
+    // after the shutdown signal instead of being abandoned mid-flight.
+    for task in handle.background_tasks {
+        let _ = task.await;
+    }
+
     Ok(())
 }
