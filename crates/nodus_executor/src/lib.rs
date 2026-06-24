@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 mod aggregates;
 mod constraints;
+mod dml;
 mod execute;
 mod filter_eval;
 mod information_schema;
