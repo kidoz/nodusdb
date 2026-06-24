@@ -1,26 +1,126 @@
+# Local development cluster: three NodusDB nodes plus the Vite web console.
+#
+#   docker compose up --build
+#
+# Topology
+#   - nodus1 bootstraps the Raft meta group (no join peers) and leads it.
+#   - nodus2 / nodus3 auto-join nodus1 once it is healthy, via
+#     NODUS_CLUSTER__JOIN_PEERS (figment parses the JSON array from the env var).
+#   - Each node advertises its compose-network address (service name : 8088) for
+#     Raft, and overrides the shared TOML's per-node fields via env vars.
+#
+# Endpoints on the host
+#   - Web console (Vite dev server) : http://localhost:5173
+#   - nodus1  pgwire 5432  http/admin 8088   (the console talks to this one)
+#   - nodus2  pgwire 5433  http/admin 8089
+#   - nodus3  pgwire 5434  http/admin 8090
+#
+# psql:  psql "host=127.0.0.1 port=5432 user=nodus password=nodus dbname=default"
+
+# Shared image build — built once and reused by all three nodes.
+x-nodus-image: &nodus-image
+  build:
+    context: .
+    dockerfile: deploy/docker/Dockerfile
+  image: nodusdb:dev
+  restart: unless-stopped
+
+# Settings common to every node; per-node cluster identity is layered on top.
+x-nodus-env: &nodus-env
+  NODUS_CONFIG: /etc/nodus/nodus.toml
+  NODUS_SERVER__PGWIRE_ADDR: 0.0.0.0:5432
+  NODUS_SERVER__HTTP_ADDR: 0.0.0.0:8088
+  NODUS_ADMIN__PASSWORD: nodus
+  NODUS_ADMIN__TOKEN: nodus-dev-token
+  NODUS_OBSERVABILITY__LOG_LEVEL: info
+
 services:
-  nodusdb:
-    build:
-      context: .
-      dockerfile: deploy/docker/Dockerfile
-    container_name: nodusdb
+  nodus1:
+    <<: *nodus-image
+    container_name: nodus1
+    environment:
+      <<: *nodus-env
+      NODUS_CLUSTER__NODE_ID: "1"
+      NODUS_CLUSTER__RAFT_ADVERTISE_ADDR: nodus1:8088
+      # No join peers: this node initializes the cluster as the seed leader.
     ports:
       - "5432:5432" # PostgreSQL wire protocol
       - "8088:8088" # HTTP admin / metrics / web console
-    environment:
-      NODUS_CONFIG: /etc/nodus/nodus.toml
-      NODUS_SERVER__PGWIRE_ADDR: 0.0.0.0:5432
-      NODUS_SERVER__HTTP_ADDR: 0.0.0.0:8088
-      NODUS_ADMIN__PASSWORD: nodus
-      NODUS_ADMIN__TOKEN: nodus-dev-token
-      NODUS_OBSERVABILITY__LOG_LEVEL: info
     volumes:
       - ./deploy/nodus.example.toml:/etc/nodus/nodus.toml:ro
-      - nodus-data:/var/lib/nodus/data
-      - nodus-backups:/var/lib/nodus/backups
-      - nodus-audit:/var/log/nodus
+      - nodus1-data:/var/lib/nodus/data
+      - nodus1-backups:/var/lib/nodus/backups
+      - nodus1-audit:/var/log/nodus
+
+  nodus2:
+    <<: *nodus-image
+    container_name: nodus2
+    depends_on:
+      nodus1:
+        condition: service_healthy
+    environment:
+      <<: *nodus-env
+      NODUS_CLUSTER__NODE_ID: "2"
+      NODUS_CLUSTER__RAFT_ADVERTISE_ADDR: nodus2:8088
+      NODUS_CLUSTER__JOIN_PEERS: '["nodus1:8088"]'
+    ports:
+      - "5433:5432"
+      - "8089:8088"
+    volumes:
+      - ./deploy/nodus.example.toml:/etc/nodus/nodus.toml:ro
+      - nodus2-data:/var/lib/nodus/data
+      - nodus2-backups:/var/lib/nodus/backups
+      - nodus2-audit:/var/log/nodus
+
+  nodus3:
+    <<: *nodus-image
+    container_name: nodus3
+    depends_on:
+      nodus1:
+        condition: service_healthy
+    environment:
+      <<: *nodus-env
+      NODUS_CLUSTER__NODE_ID: "3"
+      NODUS_CLUSTER__RAFT_ADVERTISE_ADDR: nodus3:8088
+      NODUS_CLUSTER__JOIN_PEERS: '["nodus1:8088"]'
+    ports:
+      - "5434:5432"
+      - "8090:8088"
+    volumes:
+      - ./deploy/nodus.example.toml:/etc/nodus/nodus.toml:ro
+      - nodus3-data:/var/lib/nodus/data
+      - nodus3-backups:/var/lib/nodus/backups
+      - nodus3-audit:/var/log/nodus
+
+  # Web console: the Vite dev server with hot reload. The browser runs on the
+  # host, so the SPA reaches nodus1's public /api/v1/cluster/overview at
+  # http://127.0.0.1:8088 directly (CORS is open); this service only serves the
+  # app bundle.
+  frontend:
+    image: node:22-bookworm-slim
+    container_name: nodus-console
+    working_dir: /app
+    command: sh -c "npm install && npm run dev -- --host 0.0.0.0 --port 5173"
+    depends_on:
+      - nodus1
+    environment:
+      # Reliable file watching across the bind mount.
+      CHOKIDAR_USEPOLLING: "true"
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./frontend:/app
+      # Keep container-built node_modules off the host mount.
+      - frontend-node-modules:/app/node_modules
 
 volumes:
-  nodus-data:
-  nodus-backups:
-  nodus-audit:
+  nodus1-data:
+  nodus1-backups:
+  nodus1-audit:
+  nodus2-data:
+  nodus2-backups:
+  nodus2-audit:
+  nodus3-data:
+  nodus3-backups:
+  nodus3-audit:
+  frontend-node-modules:
