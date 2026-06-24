@@ -32,6 +32,11 @@ impl TestServer {
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
 
+        // TLS is a single global config applied to BOTH the pgwire and admin
+        // HTTP listeners, so when it's on the readiness probe must speak HTTPS
+        // (and accept the throwaway self-signed test cert).
+        let tls_enabled = config.tls.enabled;
+
         let handle = nodus_server::run_server_with_config(
             pgwire_listener,
             http_listener,
@@ -41,8 +46,15 @@ impl TestServer {
         .await?;
 
         // Wait for the server to be ready before returning
-        let client = reqwest::Client::new();
-        let readyz_url = format!("http://127.0.0.1:{}/readyz", handle.http_addr.port());
+        let scheme = if tls_enabled { "https" } else { "http" };
+        let client = if tls_enabled {
+            reqwest::Client::builder()
+                .danger_accept_invalid_certs(true)
+                .build()?
+        } else {
+            reqwest::Client::new()
+        };
+        let readyz_url = format!("{scheme}://127.0.0.1:{}/readyz", handle.http_addr.port());
         let mut ready = false;
         for _ in 0..50 {
             if let Ok(resp) = client.get(&readyz_url).send().await {
