@@ -114,74 +114,9 @@ impl MemExecutor {
                     CompareOp::Le => ord != std::cmp::Ordering::Greater,
                     CompareOp::Gt => ord == std::cmp::Ordering::Greater,
                     CompareOp::Ge => ord != std::cmp::Ordering::Less,
-                    CompareOp::Contains => {
-                        println!("Contains: left={:?}, right={:?}", left_cell, right_cell);
-                        match (left_cell, &right_cell) {
-                            (Value::Array(l), Value::Array(r)) => {
-                                r.iter().all(|r_item| l.contains(r_item))
-                            }
-                            (Value::Text(l), Value::Text(r))
-                                if l.starts_with('{') || l.starts_with('[') =>
-                            {
-                                // Simplified JSONB @> eval for MVP text-encoded JSON
-                                let l_json: Result<serde_json::Value, _> = serde_json::from_str(l);
-                                let r_json: Result<serde_json::Value, _> = serde_json::from_str(r);
-                                if let (Ok(l_obj), Ok(r_obj)) = (l_json, r_json) {
-                                    if let (Some(l_map), Some(r_map)) =
-                                        (l_obj.as_object(), r_obj.as_object())
-                                    {
-                                        let matched = r_map.iter().all(|(k, v)| {
-                                            if let Some(lv) = l_map.get(k) {
-                                                lv == v
-                                            } else {
-                                                false
-                                            }
-                                        });
-                                        println!(
-                                            "JSONB @> l='{}', r='{}', matched={}",
-                                            l, r, matched
-                                        );
-                                        matched
-                                    } else {
-                                        false
-                                    }
-                                } else {
-                                    false
-                                }
-                            }
-                            (Value::Text(l), Value::Array(r)) if l.starts_with('{') => {
-                                // Array check against text representing array: "{login,signup}"
-                                let mut l_str = l.clone();
-                                if l_str.starts_with('{') && l_str.ends_with('}') {
-                                    l_str = l_str[1..l_str.len() - 1].to_string();
-                                }
-                                let l_items: Vec<&str> = l_str.split(',').collect();
-                                r.iter().all(|r_item| {
-                                    let r_str = render(r_item);
-                                    l_items
-                                        .iter()
-                                        .any(|&s| s == r_str || s == format!("'{}'", r_str))
-                                })
-                            }
-                            (Value::Array(l), Value::Text(r)) => {
-                                // Right might be a text parsing failure for ARRAY[] in some ASTs?
-                                // Actually, `right_cell` should be evaluated correctly if it's an ARRAY[] literal.
-                                false
-                            }
-                            (Value::Jsonb(l), Value::Jsonb(r)) => {
-                                if let (Some(l_map), Some(r_map)) = (l.as_object(), r.as_object()) {
-                                    r_map.iter().all(|(k, v)| l_map.get(k) == Some(v))
-                                } else {
-                                    false
-                                }
-                            }
-                            _ => false,
-                        }
-                    }
-                    CompareOp::ContainedBy => {
-                        // <@
-                        false // Simplified MVP
-                    }
+                    // `@>` left contains right; `<@` left contained by right.
+                    CompareOp::Contains => value_contains(left_cell, &right_cell),
+                    CompareOp::ContainedBy => value_contains(&right_cell, left_cell),
                 })
             }
             FilterExpr::Like {
@@ -332,5 +267,122 @@ impl MemExecutor {
         let col_names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
         self.eval_filter(ctx, row, &col_names, columns, filter)
             .unwrap_or(false)
+    }
+}
+
+/// Recursive JSON containment matching PostgreSQL's `@>` semantics: objects
+/// contain a subset of keys (with contained values), arrays contain every
+/// right element somewhere on the left, and scalars must be equal.
+fn json_contains(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+    use serde_json::Value as J;
+    match (a, b) {
+        (J::Object(am), J::Object(bm)) => bm
+            .iter()
+            .all(|(k, bv)| am.get(k).is_some_and(|av| json_contains(av, bv))),
+        (J::Array(av), J::Array(bv)) => bv
+            .iter()
+            .all(|be| av.iter().any(|ae| json_contains(ae, be))),
+        (J::Array(av), be) => av.iter().any(|ae| json_contains(ae, be)),
+        _ => a == b,
+    }
+}
+
+/// Coerces a cell value into a JSON document for containment checks. Text that
+/// parses as JSON is treated as JSON; a PostgreSQL array text literal (`{a,b}`)
+/// becomes a JSON string array; other text becomes a JSON string scalar.
+fn value_to_json(v: &Value) -> Option<serde_json::Value> {
+    use serde_json::Value as J;
+    match v {
+        Value::Jsonb(j) => Some(j.clone()),
+        Value::Int(i) => Some(J::from(*i)),
+        Value::Float(f) => serde_json::Number::from_f64(*f).map(J::Number),
+        Value::Bool(b) => Some(J::Bool(*b)),
+        Value::Null => Some(J::Null),
+        Value::Array(items) => items
+            .iter()
+            .map(value_to_json)
+            .collect::<Option<Vec<_>>>()
+            .map(J::Array),
+        Value::Text(s) => {
+            let t = s.trim();
+            if t.starts_with('{') || t.starts_with('[') {
+                if let Ok(j) = serde_json::from_str::<J>(t) {
+                    return Some(j);
+                }
+                // PostgreSQL array text literal, e.g. `{login,signup}`.
+                if t.starts_with('{') && t.ends_with('}') {
+                    let inner = &t[1..t.len() - 1];
+                    let arr = if inner.is_empty() {
+                        vec![]
+                    } else {
+                        inner
+                            .split(',')
+                            .map(|x| J::String(x.trim().trim_matches('"').to_string()))
+                            .collect()
+                    };
+                    return Some(J::Array(arr));
+                }
+                None
+            } else {
+                Some(J::String(s.clone()))
+            }
+        }
+    }
+}
+
+/// True if `left` contains `right` under JSONB/array containment semantics.
+fn value_contains(left: &Value, right: &Value) -> bool {
+    match (value_to_json(left), value_to_json(right)) {
+        (Some(l), Some(r)) => json_contains(&l, &r),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod containment_tests {
+    use super::value_contains;
+    use crate::Value;
+    use serde_json::json;
+
+    #[test]
+    fn jsonb_object_containment() {
+        let big = Value::Jsonb(json!({"a": 1, "b": {"c": 2}}));
+        assert!(value_contains(&big, &Value::Jsonb(json!({"a": 1}))));
+        assert!(value_contains(&big, &Value::Jsonb(json!({"b": {"c": 2}}))));
+        // not contained: nested value differs / extra keys
+        assert!(!value_contains(
+            &Value::Jsonb(json!({"a": 1})),
+            &Value::Jsonb(json!({"a": 1, "b": 2})),
+        ));
+        assert!(!value_contains(&big, &Value::Jsonb(json!({"b": {"c": 3}}))));
+    }
+
+    #[test]
+    fn array_containment_and_membership() {
+        let arr = Value::Array(vec![
+            Value::Text("login".into()),
+            Value::Text("signup".into()),
+        ]);
+        assert!(value_contains(
+            &arr,
+            &Value::Array(vec![Value::Text("login".into())])
+        ));
+        // PostgreSQL array @> scalar is element membership.
+        assert!(value_contains(&arr, &Value::Text("login".into())));
+        assert!(!value_contains(&arr, &Value::Text("logout".into())));
+        // PostgreSQL array text literal parses as a JSON string array.
+        assert!(value_contains(
+            &Value::Text("{login,signup}".into()),
+            &Value::Text("login".into()),
+        ));
+    }
+
+    #[test]
+    fn contained_by_relation() {
+        // `<@` evaluates as value_contains(right, left).
+        let small = Value::Jsonb(json!({"a": 1}));
+        let big = Value::Jsonb(json!({"a": 1, "b": 2}));
+        assert!(value_contains(&big, &small)); // small <@ big
+        assert!(!value_contains(&small, &big)); // big not <@ small
     }
 }
