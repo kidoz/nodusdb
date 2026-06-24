@@ -53,6 +53,19 @@ fn backup_dir(uri: &str) -> PathBuf {
     }
 }
 
+/// Backoff for the cluster-join retry loop: exponential (250ms → cap 10s) with
+/// a deterministic per-node jitter so simultaneously-starting joiners don't
+/// retry in lockstep and hammer the seed node together.
+fn join_backoff(attempt: u32, node_id: u64) -> std::time::Duration {
+    use std::time::Duration;
+    // 250ms * 2^attempt, saturating, capped at 10s. `attempt.min(6)` bounds the
+    // shift so it can't overflow regardless of how long we've been retrying.
+    let exp = Duration::from_millis(250).saturating_mul(1u32 << attempt.min(6));
+    let capped = exp.min(Duration::from_secs(10));
+    let jitter = Duration::from_millis(node_id.wrapping_mul(2_654_435_761) % 250);
+    capped + jitter
+}
+
 fn bootstrap_catalog_commands(catalog: &dyn CatalogReader) -> Vec<nodus_raftstore::ShardCommand> {
     let mut commands = Vec::new();
     let db_id = match catalog.get_database("default") {
@@ -373,7 +386,13 @@ pub async fn run_server_with_config(
             tracing::debug!("Attempting to join existing cluster via {:?}", join_peers);
             let client = reqwest::Client::new();
             let mut joined = false;
-            for _ in 0..5 {
+            // A seed peer may still be bootstrapping (no meta group yet) or
+            // mid-election (no leader yet) when we first try, and both answer
+            // with a retryable status. Retry with exponential backoff over a
+            // generous window rather than giving up after a fixed handful.
+            const MAX_JOIN_ATTEMPTS: u32 = 30;
+            let mut attempt = 0u32;
+            while !joined && attempt < MAX_JOIN_ATTEMPTS {
                 for peer in &join_peers {
                     let url = format!("http://{}/api/v1/cluster/join", peer);
                     let payload = serde_json::json!({
@@ -396,28 +415,39 @@ pub async fn run_server_with_config(
                             let status = resp.status();
                             let text = resp.text().await.unwrap_or_default();
                             tracing::debug!(
-                                "Failed to join via {}: status {}, body: {}",
+                                "Join via {} not ready (status {}): {}",
                                 peer,
                                 status,
                                 text
                             );
                         }
                         Err(e) => {
-                            tracing::debug!("Failed to join via {}: {}", peer, e);
+                            tracing::debug!("Failed to reach {} to join: {}", peer, e);
                         }
                     }
                 }
                 if joined {
                     break;
                 }
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                let backoff = join_backoff(attempt, node_id);
+                tracing::debug!(
+                    "Join attempt {} failed; retrying in {:?}",
+                    attempt + 1,
+                    backoff
+                );
+                tokio::time::sleep(backoff).await;
+                attempt += 1;
             }
-            if !joined {
-                tracing::debug!("FATAL: Failed to join cluster after retries");
-            } else {
+            if joined {
                 state_clone
                     .is_ready
                     .store(true, std::sync::atomic::Ordering::Release);
+            } else {
+                tracing::warn!(
+                    "Failed to join cluster via {:?} after {} attempts; node stays not-ready",
+                    join_peers,
+                    MAX_JOIN_ATTEMPTS
+                );
             }
         }
     });
@@ -712,6 +742,34 @@ mod tests {
     fn tls_disabled_yields_no_acceptor() {
         let cfg = TlsConfig::default();
         assert!(load_tls_config(&cfg).unwrap().is_none());
+    }
+
+    #[test]
+    fn join_backoff_grows_then_caps() {
+        // Monotonic non-decreasing and capped at 10s + max jitter (<250ms).
+        let ceiling = std::time::Duration::from_secs(10) + std::time::Duration::from_millis(250);
+        let mut prev = std::time::Duration::ZERO;
+        for attempt in 0..12 {
+            let d = join_backoff(attempt, 1);
+            assert!(d >= prev, "backoff must not shrink at attempt {attempt}");
+            assert!(
+                d <= ceiling,
+                "backoff must stay capped at attempt {attempt}"
+            );
+            prev = d;
+        }
+        // Reaches the cap and stays there for large attempts.
+        assert!(join_backoff(20, 1) <= ceiling);
+        assert!(join_backoff(20, 1) >= std::time::Duration::from_secs(10));
+    }
+
+    #[test]
+    fn join_backoff_jitter_desyncs_nodes() {
+        // Different node ids get different jitter at the same attempt, so
+        // simultaneous joiners don't retry in lockstep.
+        let a = join_backoff(3, 1);
+        let b = join_backoff(3, 2);
+        assert_ne!(a, b);
     }
 
     #[test]

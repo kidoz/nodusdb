@@ -186,41 +186,73 @@ pub struct JoinRequest {
     pub raft_advertise_addr: String,
 }
 
+/// Adds a node to the `shard-meta` Raft group. Designed to be safe under the
+/// client's retry loop:
+///   - returns `503` (retryable) — never panics — when the meta group hasn't
+///     been created yet or this node isn't the leader, so the joining node
+///     simply tries another peer / backs off and retries;
+///   - is idempotent: a node that is already a voter gets `200 joined` without
+///     re-running a membership change.
 async fn cluster_join(
     State(state): State<AdminState>,
     Json(req): Json<JoinRequest>,
 ) -> impl axum::response::IntoResponse {
     let _guard = state.membership_lock.lock().await;
-    let node = openraft::BasicNode::new(&req.raft_advertise_addr);
-    let raft = state
+    let Some(raft) = state
         .raft_state
         .rafts
         .read()
         .await
         .get("shard-meta")
         .cloned()
-        .unwrap();
-    match raft.add_learner(req.node_id, node, true).await {
-        Ok(_) => {
-            // Once learner is added, attempt to promote it to a voter.
-            let metrics = raft.metrics().borrow().clone();
-            let mut members: std::collections::BTreeSet<u64> =
-                metrics.membership_config.membership().voter_ids().collect();
-            members.insert(req.node_id);
-            match raft.change_membership(members, true).await {
-                Ok(_) => (
-                    StatusCode::OK,
-                    Json(json!({ "joined": true, "node_id": req.node_id })),
-                ),
-                Err(e) => (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({ "error": format!("Failed to change membership: {}", e) })),
-                ),
-            }
-        }
+    else {
+        // Still bootstrapping — no meta group yet. Retryable.
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "meta group not initialized yet" })),
+        );
+    };
+
+    let metrics = raft.metrics().borrow().clone();
+    let voters: std::collections::BTreeSet<u64> =
+        metrics.membership_config.membership().voter_ids().collect();
+
+    // Idempotent: already a member — succeed without touching membership.
+    if voters.contains(&req.node_id) {
+        return (
+            StatusCode::OK,
+            Json(json!({ "joined": true, "node_id": req.node_id, "already_member": true })),
+        );
+    }
+
+    // Membership changes must run on the leader. If we're not it, tell the
+    // caller to retry (it will cycle to another peer / back off).
+    if metrics.current_leader != Some(metrics.id) {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "not leader", "leader": metrics.current_leader })),
+        );
+    }
+
+    let node = openraft::BasicNode::new(&req.raft_advertise_addr);
+    if let Err(e) = raft.add_learner(req.node_id, node, true).await {
+        // Transient (e.g. leadership changed mid-call) — retryable.
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": format!("add_learner failed: {}", e) })),
+        );
+    }
+
+    let mut members = voters;
+    members.insert(req.node_id);
+    match raft.change_membership(members, true).await {
+        Ok(_) => (
+            StatusCode::OK,
+            Json(json!({ "joined": true, "node_id": req.node_id })),
+        ),
         Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": format!("Failed to add learner: {}", e) })),
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": format!("change_membership failed: {}", e) })),
         ),
     }
 }
