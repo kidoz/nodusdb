@@ -24,6 +24,7 @@ mod information_schema;
 mod pg_catalog;
 mod plan_types;
 mod planner;
+mod select;
 mod set_ops;
 mod system_views;
 mod transactions;
