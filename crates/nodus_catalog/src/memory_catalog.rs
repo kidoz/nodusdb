@@ -208,28 +208,16 @@ impl CatalogReader for MemoryCatalog {
     }
 
     fn get_table(&self, database: &str, schema: &str, table: &str) -> Result<TableDescriptor> {
-        tracing::info!(
-            "get_table CALLED for database={}, schema={}, table={}",
-            database,
-            schema,
-            table
-        );
         let db = self.get_database(database)?;
         let sch = self.get_schema(database, schema)?;
         let guard = self.tables.read().unwrap();
         if let Some(t) = guard.get(&(db.id, sch.id, table.to_string())) {
             Ok(t.clone())
         } else {
-            tracing::error!(
-                "get_table failed. Looking for: db={}, sch={}, table={}",
-                db.id,
-                sch.id,
-                table
-            );
-            tracing::error!("Available tables:");
-            for (k, _) in guard.iter() {
-                tracing::error!("  {:?}", k);
-            }
+            // A miss is normal control flow — existence checks and catalog probes
+            // (e.g. IDE introspection) routinely look up tables that don't exist —
+            // so this is debug-level, not an error.
+            tracing::debug!(database, schema, table, "get_table: not found");
             anyhow::bail!("Table {} not found", table)
         }
     }
