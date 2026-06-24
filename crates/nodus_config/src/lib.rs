@@ -81,12 +81,30 @@ pub struct AdminConfig {
     pub password: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct AuditConfig {
     /// Path to a durable JSONL audit log. When set, audit events are persisted
     /// there; when unset (default), an in-memory sink is used.
     pub file_path: Option<String>,
+    /// Rotate the durable log once it would exceed this many bytes. `None` (the
+    /// default) keeps the historical unbounded append-only behavior.
+    pub max_size_bytes: Option<u64>,
+    /// Number of rotated segments (`<file>.1` ..= `<file>.N`) to retain when
+    /// rotation is enabled.
+    pub max_files: usize,
+}
+
+impl Default for AuditConfig {
+    fn default() -> Self {
+        Self {
+            file_path: None,
+            max_size_bytes: None,
+            // Sensible retention once a size cap is configured; ignored while
+            // `max_size_bytes` is `None`.
+            max_files: 5,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

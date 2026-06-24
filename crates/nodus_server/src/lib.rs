@@ -168,7 +168,11 @@ pub async fn run_server_with_config(
         Arc<dyn nodus_audit::AuditQueryable>,
     ) = match &config.audit.file_path {
         Some(path) => {
-            let sink = Arc::new(nodus_audit::FileAuditSink::new(path));
+            let sink = Arc::new(nodus_audit::FileAuditSink::with_rotation(
+                path,
+                config.audit.max_size_bytes,
+                config.audit.max_files,
+            ));
             (sink.clone(), sink)
         }
         None => {
