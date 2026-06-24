@@ -313,3 +313,53 @@ async fn test_pg18_catalog_unknown_relation_is_undefined_table() {
         db_err.message()
     );
 }
+
+/// `pg_locks` stays empty under autocommit but reports a `transactionid` row for
+/// an open explicit transaction — the signal DataGrip/JetBrains use to find
+/// sessions holding a transaction open. The implicit per-statement transaction
+/// that wraps the `pg_locks` query itself must not appear.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_pg_locks_reports_explicit_transactions_only() {
+    let server = TestServer::start().await.expect("server starts");
+    let client = connect(&server).await;
+
+    // Autocommit: the query's own implicit transaction is not reported.
+    let msgs = client
+        .simple_query("SELECT transactionid FROM pg_catalog.pg_locks;")
+        .await
+        .unwrap();
+    assert_eq!(
+        rows_of(&msgs).len(),
+        0,
+        "pg_locks should be empty outside an explicit transaction"
+    );
+
+    // Inside an explicit BEGIN block, exactly one transactionid lock shows up.
+    client.simple_query("BEGIN;").await.unwrap();
+    let msgs = client
+        .simple_query("SELECT locktype, mode, granted, transactionid FROM pg_catalog.pg_locks;")
+        .await
+        .unwrap();
+    let rows = rows_of(&msgs);
+    assert_eq!(rows.len(), 1, "expected one lock row inside a transaction");
+    assert_eq!(rows[0].get(0), Some("transactionid"));
+    assert_eq!(rows[0].get(1), Some("ExclusiveLock"));
+    assert_eq!(rows[0].get(2), Some("t"));
+    assert!(
+        rows[0].get(3).is_some_and(|v| !v.is_empty()),
+        "transactionid should be populated"
+    );
+
+    client.simple_query("COMMIT;").await.unwrap();
+
+    // After COMMIT the lock is released again.
+    let msgs = client
+        .simple_query("SELECT transactionid FROM pg_catalog.pg_locks;")
+        .await
+        .unwrap();
+    assert_eq!(
+        rows_of(&msgs).len(),
+        0,
+        "pg_locks should be empty after COMMIT"
+    );
+}

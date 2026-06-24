@@ -499,6 +499,10 @@ impl MemExecutor {
                 ]),
                 Vec::new(),
             )),
+            // Enum types are not yet a NodusDB concept, so there are no labels to
+            // list. The relation is still presented (with its real shape) because
+            // pgjdbc/DataGrip join it during type introspection and tolerate zero
+            // rows; populate this once `CREATE TYPE ... AS ENUM` lands.
             "pg_enum" => Some((
                 Self::virtual_columns(&[
                     ("oid", "OID"),
@@ -525,21 +529,57 @@ impl MemExecutor {
             )),
             "pg_operator" => Some(self.pg_operator_virtual_table(db_name)),
             "pg_cast" => Some(self.pg_cast_virtual_table()),
-            "pg_locks" => Some((
-                Self::virtual_columns(&[
-                    ("locktype", "TEXT"),
-                    ("database", "OID"),
-                    ("relation", "OID"),
-                    ("transactionid", "INT8"),
-                    ("pid", "INT"),
-                    ("mode", "TEXT"),
-                    ("granted", "BOOL"),
-                ]),
-                Vec::new(),
-            )),
+            "pg_locks" => Some(self.pg_locks_virtual_table(db_name)),
             _ => None,
         };
         Ok(result)
+    }
+
+    /// `pg_locks` synthesized from the in-flight *explicit* transactions.
+    ///
+    /// NodusDB has no general lock manager to expose, but DataGrip/JetBrains and
+    /// other tools poll `pg_locks` to find long-running transactions. Each active
+    /// `BEGIN` block contributes one `transactionid` row (the lock every backend
+    /// holds on its own xid), which is enough for that "who is holding a
+    /// transaction open" introspection. Autocommit statements run in throwaway
+    /// implicit transactions and are intentionally omitted, so a bare
+    /// `SELECT FROM pg_locks` reports nothing rather than its own xid.
+    pub(crate) fn pg_locks_virtual_table(
+        &self,
+        db_name: &str,
+    ) -> (Vec<ColumnDescriptor>, Vec<Vec<Value>>) {
+        let cols = Self::virtual_columns(&[
+            ("locktype", "TEXT"),
+            ("database", "OID"),
+            ("relation", "OID"),
+            ("transactionid", "INT8"),
+            ("pid", "INT"),
+            ("mode", "TEXT"),
+            ("granted", "BOOL"),
+        ]);
+        let database = Self::database_oid(db_name);
+        let rows = self
+            .active_txns
+            .read()
+            .unwrap()
+            .values()
+            .filter(|txn| txn.explicit)
+            .map(|txn| {
+                // xid is a 32-bit counter in PostgreSQL; our txn id is a UUID, so
+                // fold it to a stable positive integer for the INT8 column.
+                let xid = Self::stable_oid(&txn.txn_id.0.to_string(), 0);
+                vec![
+                    Value::Text("transactionid".into()),
+                    Value::Int(database),
+                    Value::Null,
+                    Value::Int(xid),
+                    Value::Null,
+                    Value::Text("ExclusiveLock".into()),
+                    Value::Bool(true),
+                ]
+            })
+            .collect();
+        (cols, rows)
     }
 
     pub(crate) fn pg_type_virtual_table(

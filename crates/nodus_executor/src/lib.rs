@@ -114,16 +114,22 @@ pub(crate) struct ActiveTxn {
     pub(crate) write_log: Vec<String>,
     pub(crate) overlay: HashMap<String, Option<String>>,
     pub(crate) savepoints: Vec<SavepointState>,
+    /// `true` for a user-issued `BEGIN`, `false` for the single-statement
+    /// implicit transaction that wraps each autocommit statement. Only explicit
+    /// transactions are surfaced in `pg_locks`, so a bare `SELECT FROM pg_locks`
+    /// (itself implicitly wrapped) does not report its own throwaway xid.
+    pub(crate) explicit: bool,
 }
 
 impl ActiveTxn {
-    pub(crate) fn new(txn_id: TxnId, read_ts: Timestamp) -> Self {
+    pub(crate) fn new(txn_id: TxnId, read_ts: Timestamp, explicit: bool) -> Self {
         Self {
             txn_id,
             read_ts,
             write_log: Vec::new(),
             overlay: HashMap::new(),
             savepoints: Vec::new(),
+            explicit,
         }
     }
 }
@@ -605,7 +611,7 @@ impl Executor for MemExecutor {
             let txn_record = self.txn.begin_txn()?;
             self.active_txns.write().unwrap().insert(
                 ctx.session_id.clone(),
-                ActiveTxn::new(txn_record.txn_id, txn_record.read_ts),
+                ActiveTxn::new(txn_record.txn_id, txn_record.read_ts, false),
             );
             implicit_txn = Some(txn_record.txn_id);
         }

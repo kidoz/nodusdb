@@ -11,7 +11,7 @@ impl MemExecutor {
         let txn_record = self.txn.begin_txn()?;
         self.active_txns.write().unwrap().insert(
             ctx.session_id.clone(),
-            ActiveTxn::new(txn_record.txn_id, txn_record.read_ts),
+            ActiveTxn::new(txn_record.txn_id, txn_record.read_ts, true),
         );
         Ok(QueryOutput::tag("BEGIN"))
     }
