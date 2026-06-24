@@ -25,6 +25,22 @@ pub struct SplitPlan {
     pub new_map: ShardMap,
 }
 
+/// A planned-but-uncommitted merge of two adjacent shards. A data migrator
+/// creates the merged group, relocates both sources' bytes into it, then calls
+/// [`ShardOrchestrator::commit_merge`] to flip routing — copy-before-flip, so no
+/// read lands on an empty merged shard and no committed key is lost.
+#[derive(Clone)]
+pub struct MergePlan {
+    pub left_id: ShardId,
+    pub right_id: ShardId,
+    /// Node hosting the sources (taken from the left shard); the merged shard
+    /// inherits it. Physical relocation only runs when this is the local node.
+    pub source_node: Option<String>,
+    pub merged: ShardDescriptor,
+    /// The table's shard map after the merge (sources removed, merged added).
+    pub new_map: ShardMap,
+}
+
 pub struct CatalogShardRouter {
     meta_store: Arc<dyn MetaStore>,
 }
@@ -206,9 +222,17 @@ impl ShardOrchestrator {
         Ok(ids)
     }
 
-    /// Merges two adjacent shards (`left.end_key == right.start_key`) into one
-    /// spanning `[left.start, right.end)`.
-    pub fn merge(&self, table_id: TableId, left_id: ShardId, right_id: ShardId) -> Result<ShardId> {
+    /// Computes (but does not commit) a merge of two adjacent shards
+    /// (`left.end_key == right.start_key`) into one spanning
+    /// `[left.start, right.end)`. Separating planning from commit lets a data
+    /// migrator relocate both shards' bytes into the merged group *before* the
+    /// routing flip.
+    pub fn plan_merge(
+        &self,
+        table_id: TableId,
+        left_id: ShardId,
+        right_id: ShardId,
+    ) -> Result<MergePlan> {
         let mut map = self.meta.get_shard_map(table_id)?;
         let left = map
             .shards
@@ -232,15 +256,39 @@ impl ShardOrchestrator {
             left.start_key.clone(),
             right.end_key.clone(),
         );
-        let merged_id = merged.id;
         map.shards.retain(|s| s.id != left_id && s.id != right_id);
-        map.shards.push(merged);
-        self.meta.update_shard_map(map)?;
+        map.shards.push(merged.clone());
+
+        Ok(MergePlan {
+            left_id,
+            right_id,
+            source_node: self.placements.read().unwrap().get(&left_id).cloned(),
+            merged,
+            new_map: map,
+        })
+    }
+
+    /// Commits a planned merge: atomically replaces the table's shard map (the
+    /// routing flip) and updates placements so the merged shard inherits the
+    /// sources' node and both sources are dropped.
+    pub fn commit_merge(&self, plan: &MergePlan) -> Result<()> {
+        self.meta.update_shard_map(plan.new_map.clone())?;
         let mut p = self.placements.write().unwrap();
-        p.remove(&left_id);
-        p.remove(&right_id);
+        if let Some(node) = &plan.source_node {
+            p.insert(plan.merged.id, node.clone());
+        }
+        p.remove(&plan.left_id);
+        p.remove(&plan.right_id);
         drop(p);
-        self.save_placements()?;
+        self.save_placements()
+    }
+
+    /// Merges two adjacent shards (metadata only — see [`Self::plan_merge`] and a
+    /// data migrator for physical relocation).
+    pub fn merge(&self, table_id: TableId, left_id: ShardId, right_id: ShardId) -> Result<ShardId> {
+        let plan = self.plan_merge(table_id, left_id, right_id)?;
+        let merged_id = plan.merged.id;
+        self.commit_merge(&plan)?;
         Ok(merged_id)
     }
 

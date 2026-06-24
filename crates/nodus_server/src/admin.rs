@@ -168,6 +168,7 @@ pub fn admin_routes(state: AdminState) -> Router {
         .route("/api/v1/shards/:table/init", post(shards_init))
         .route("/api/v1/shards/:table", get(shards_map))
         .route("/api/v1/shards/:table/split", post(shards_split))
+        .route("/api/v1/shards/:table/merge", post(shards_merge))
         .route("/api/v1/shards/:table/rebalance", post(shards_rebalance))
         .route("/api/v1/queries", get(slow_queries))
         .route("/api/v1/node/drain", post(node_drain))
@@ -996,6 +997,35 @@ async fn shards_split(
         .await
     {
         Ok((l, r)) => Json(json!({ "left": l.to_string(), "right": r.to_string() })),
+        Err(e) => Json(json!({ "error": e.to_string() })),
+    }
+}
+
+/// Merges two adjacent shards, relocating both sources' data into the merged
+/// group before flipping routing and decommissioning the sources (no-op data
+/// move when the shards aren't placed on this node).
+async fn shards_merge(
+    State(state): State<AdminState>,
+    Path(table): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Json<Value> {
+    let Some(table_id) = parse_table(&table) else {
+        return Json(json!({ "error": "invalid table id" }));
+    };
+    let left = match params.get("left").and_then(|s| Uuid::parse_str(s).ok()) {
+        Some(u) => ShardId(u),
+        None => return Json(json!({ "error": "missing or invalid left shard id" })),
+    };
+    let right = match params.get("right").and_then(|s| Uuid::parse_str(s).ok()) {
+        Some(u) => ShardId(u),
+        None => return Json(json!({ "error": "missing or invalid right shard id" })),
+    };
+    match state
+        .manager
+        .merge_shards(&state.shards, table_id, left, right)
+        .await
+    {
+        Ok(merged) => Json(json!({ "merged": merged.to_string() })),
         Err(e) => Json(json!({ "error": e.to_string() })),
     }
 }

@@ -168,6 +168,17 @@ enum ShardCmd {
         #[arg(long, default_value = DEFAULT_ADDR)]
         addr: String,
     },
+    /// Merge two adjacent shards into one
+    Merge {
+        #[arg(long)]
+        table: String,
+        #[arg(long)]
+        left: String,
+        #[arg(long)]
+        right: String,
+        #[arg(long, default_value = DEFAULT_ADDR)]
+        addr: String,
+    },
     /// Rebalance a table's shards across nodes (comma-separated)
     Rebalance {
         #[arg(long)]
@@ -527,6 +538,16 @@ async fn main() -> anyhow::Result<()> {
                     true,
                     format!("{addr}/api/v1/shards/{table}/split"),
                     vec![("shard", shard.clone()), ("key", key.to_string())],
+                ),
+                ShardCmd::Merge {
+                    table,
+                    left,
+                    right,
+                    addr,
+                } => (
+                    true,
+                    format!("{addr}/api/v1/shards/{table}/merge"),
+                    vec![("left", left.clone()), ("right", right.clone())],
                 ),
                 ShardCmd::Rebalance { table, nodes, addr } => (
                     true,

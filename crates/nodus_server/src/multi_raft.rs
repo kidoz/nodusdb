@@ -272,6 +272,73 @@ impl MultiRaftManager {
         }
         Ok(())
     }
+
+    /// Physically merges two adjacent shards. Plans the merge, creates and
+    /// initializes the merged group, **relocates both sources' data into it
+    /// before flipping routing** (so no read lands on an empty merged shard and
+    /// no committed key is lost), commits the flip, then decommissions both
+    /// source groups. Single-node today; cross-node transfer is future.
+    pub async fn merge_shards(
+        &self,
+        orchestrator: &ShardOrchestrator,
+        table_id: TableId,
+        left_id: ShardId,
+        right_id: ShardId,
+    ) -> Result<ShardId> {
+        let plan = orchestrator.plan_merge(table_id, left_id, right_id)?;
+        let merged_id = plan.merged.id;
+        let local = plan.source_node.as_deref() == Some(self.node_id.to_string().as_str());
+
+        if local {
+            let merged_group = Self::data_group_id(merged_id);
+            let mr = self.get_or_create_data(&merged_group).await?;
+            self.init_single(&mr).await;
+            self.relocate_merge(
+                &Self::data_group_id(left_id),
+                &Self::data_group_id(right_id),
+                &merged_group,
+            )?;
+        }
+
+        orchestrator.commit_merge(&plan)?; // atomic routing flip
+
+        if local {
+            self.remove_group(&Self::data_group_id(left_id)).await?;
+            self.remove_group(&Self::data_group_id(right_id)).await?;
+        }
+        Ok(merged_id)
+    }
+
+    /// Copies every committed entry from both source namespaces into the merged
+    /// namespace, preserving each entry's commit version. The two sources cover
+    /// disjoint adjacent ranges, so their keys never collide; the merged shard
+    /// ends up holding the exact union with no key lost or duplicated.
+    fn relocate_merge(
+        &self,
+        left_group: &str,
+        right_group: &str,
+        merged_group: &str,
+    ) -> Result<()> {
+        let merged = NamespacedKvEngine::new(self.base_kv.clone(), merged_group);
+        for src_group in [left_group, right_group] {
+            let source = NamespacedKvEngine::new(self.base_kv.clone(), src_group);
+            let full = KeyRange {
+                start: Bytes::new(),
+                end: Bytes::from(vec![255u8; 1024]),
+            };
+            let entries: Vec<(Bytes, Bytes, u64)> = source
+                .scan(full, u64::MAX)?
+                .filter_map(|r| r.ok())
+                .map(|p| (p.key, p.value, p.version))
+                .collect();
+            for (key, value, version) in entries {
+                let txn = TxnId::new();
+                merged.write_intent(txn, key, value)?;
+                merged.commit(txn, version)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -438,6 +505,65 @@ mod tests {
         assert_eq!(lhs.get(b"z", 100).unwrap(), None);
         assert_eq!(rhs.get(b"z", 100).unwrap(), Some(Bytes::from_static(b"vz")));
         assert_eq!(rhs.get(b"a", 100).unwrap(), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn merge_relocates_both_sources_into_the_merged_group_and_decommissions_them() {
+        let base: Arc<dyn KvEngine> = Arc::new(nodus_storage_mem::MemKvEngine::new());
+        let config = Arc::new(openraft::Config::default().validate().unwrap());
+        let mgr = MultiRaftManager::new(
+            1,
+            "127.0.0.1:0".into(),
+            config,
+            RaftState::new(),
+            base.clone(),
+        );
+
+        let meta = Arc::new(nodus_meta::PersistentMetaStore::new(base.clone()));
+        let orch = nodus_sharding::ShardOrchestrator::new(meta);
+        let table = TableId(uuid::Uuid::new_v4());
+        let source = orch.init_single_shard(table).unwrap();
+        orch.move_shard(source, "1").unwrap();
+        mgr.reconcile(&orch.placements()).await.unwrap();
+
+        // Seed one key on each side of 'm', then split so we have two adjacent,
+        // populated, hosted children to merge back.
+        let src_ns =
+            NamespacedKvEngine::new(base.clone(), &MultiRaftManager::data_group_id(source));
+        for (k, v) in [(b"a".as_slice(), b"va".as_slice()), (b"z", b"vz")] {
+            let t = TxnId::new();
+            src_ns
+                .write_intent(t, Bytes::copy_from_slice(k), Bytes::copy_from_slice(v))
+                .unwrap();
+            src_ns.commit(t, 5).unwrap();
+        }
+        let (left, right) = mgr
+            .split_shard(&orch, table, source, vec![0x6d])
+            .await
+            .unwrap();
+
+        // Merge the two children back into one shard.
+        let merged = mgr.merge_shards(&orch, table, left, right).await.unwrap();
+
+        // Routing flipped: merged hosted, both sources decommissioned, one shard.
+        assert!(mgr.hosts(&MultiRaftManager::data_group_id(merged)));
+        assert!(!mgr.hosts(&MultiRaftManager::data_group_id(left)));
+        assert!(!mgr.hosts(&MultiRaftManager::data_group_id(right)));
+        let map = orch.shard_map(table).unwrap();
+        assert_eq!(map.shards.len(), 1);
+        assert_eq!(map.shards[0].id, merged);
+
+        // Both committed keys now live in the merged namespace, versions intact.
+        let merged_ns =
+            NamespacedKvEngine::new(base.clone(), &MultiRaftManager::data_group_id(merged));
+        assert_eq!(
+            merged_ns.get(b"a", 100).unwrap(),
+            Some(Bytes::from_static(b"va"))
+        );
+        assert_eq!(
+            merged_ns.get(b"z", 100).unwrap(),
+            Some(Bytes::from_static(b"vz"))
+        );
     }
 
     #[test]
