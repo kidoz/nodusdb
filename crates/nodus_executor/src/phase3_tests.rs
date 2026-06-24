@@ -116,6 +116,7 @@ fn test_ddl_and_subqueries() {
             table_name: "employees".into(),
             columns: vec!["dept_id".into()],
             unique: false,
+            if_not_exists: false,
         },
     )
     .unwrap();
@@ -398,6 +399,7 @@ fn test_secondary_indexing() {
             table_name: "products".into(),
             columns: vec!["category".into()],
             unique: false,
+            if_not_exists: false,
         },
     )
     .unwrap();

@@ -156,6 +156,10 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                     if_exists: *if_exists,
                     cascade: *cascade,
                 }),
+                sqlparser::ast::ObjectType::Index => Ok(LogicalPlan::DropIndex {
+                    name,
+                    if_exists: *if_exists,
+                }),
                 _ => anyhow::bail!("Unsupported DROP object type: {:?}", object_type),
             }
         }
@@ -164,6 +168,7 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
             table_name,
             columns,
             unique,
+            if_not_exists,
             ..
         } => {
             let idx_name = name
@@ -179,6 +184,7 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                 table_name: table_name.to_string(),
                 columns: cols,
                 unique: *unique,
+                if_not_exists: *if_not_exists,
             })
         }
         Statement::CreateRole { names, .. } => {

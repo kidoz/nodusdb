@@ -456,3 +456,39 @@ fn test_window_functions() {
     let sum = run("SELECT id, SUM(amount) OVER () FROM emp ORDER BY id");
     assert_eq!(sum, vec!["1,70", "2,70", "3,70", "4,70"]);
 }
+
+#[test]
+fn test_index_ddl() {
+    let (exec, cat) = MemExecutor::shared(Arc::new(MemoryAuditSink::new()));
+    let admin = cat
+        .create_role(nodus_catalog::CreateRoleRequest {
+            id: nodus_catalog::PrincipalId::new(),
+            name: "admin".into(),
+            principal_type: nodus_catalog::PrincipalType::User,
+            database_id: None,
+        })
+        .unwrap();
+    cat.grant_privilege(nodus_catalog::GrantPrivilegeRequest {
+        id: nodus_catalog::GrantId::new(),
+        principal_id: admin.id,
+        resource: nodus_catalog::ResourceRef::System,
+        privilege: "ALL".into(),
+    })
+    .unwrap();
+    let ctx = test_ctx(admin.id);
+    let run = |sql: &str| {
+        let mut stmts = nodus_sql::parse_sql(sql).unwrap();
+        let plan = plan_statement(&stmts.remove(0), &[]).unwrap();
+        exec.execute_logical(&ctx, plan)
+    };
+    run("CREATE TABLE t (id INT, name TEXT)").unwrap();
+    run("CREATE INDEX idx_name ON t (name)").unwrap();
+    // CREATE INDEX IF NOT EXISTS on an existing index -> ok (no error)
+    run("CREATE INDEX IF NOT EXISTS idx_name ON t (name)").unwrap();
+    // DROP INDEX -> ok
+    run("DROP INDEX idx_name").unwrap();
+    // DROP INDEX again without IF EXISTS -> error
+    assert!(run("DROP INDEX idx_name").is_err());
+    // DROP INDEX IF EXISTS on missing -> ok
+    run("DROP INDEX IF EXISTS idx_name").unwrap();
+}

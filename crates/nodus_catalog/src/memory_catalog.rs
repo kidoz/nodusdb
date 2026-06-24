@@ -482,6 +482,7 @@ impl CatalogWriter for MemoryCatalog {
             TableDescriptorChange::RenameColumn { table_id, .. } => *table_id,
             TableDescriptorChange::DropColumn { table_id, .. } => *table_id,
             TableDescriptorChange::AddIndex { table_id, .. } => *table_id,
+            TableDescriptorChange::DropIndex { table_id, .. } => *table_id,
         };
 
         let mut target_key = None;
@@ -522,6 +523,9 @@ impl CatalogWriter for MemoryCatalog {
             }
             TableDescriptorChange::AddIndex { index, .. } => {
                 table.indexes.push(index);
+            }
+            TableDescriptorChange::DropIndex { index_name, .. } => {
+                table.indexes.retain(|i| i.name != index_name);
             }
         }
 

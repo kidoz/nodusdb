@@ -177,6 +177,11 @@ pub enum LogicalPlan {
         table_name: String,
         columns: Vec<String>,
         unique: bool,
+        if_not_exists: bool,
+    },
+    DropIndex {
+        name: String,
+        if_exists: bool,
     },
     CreateRole {
         name: String,

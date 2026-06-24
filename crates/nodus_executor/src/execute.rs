@@ -98,7 +98,11 @@ impl MemExecutor {
                 table_name,
                 columns,
                 unique,
-            } => self.exec_create_index(ctx, name, table_name, columns, unique),
+                if_not_exists,
+            } => self.exec_create_index(ctx, name, table_name, columns, unique, if_not_exists),
+            LogicalPlan::DropIndex { name, if_exists } => {
+                self.exec_drop_index(ctx, name, if_exists)
+            }
             LogicalPlan::CreateRole { name } => self.exec_create_role(ctx, name),
             LogicalPlan::Grant {
                 privilege,

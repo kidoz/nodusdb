@@ -84,6 +84,10 @@ pub enum TableDescriptorChange {
         table_id: TableId,
         index: IndexDescriptor,
     },
+    DropIndex {
+        table_id: TableId,
+        index_name: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

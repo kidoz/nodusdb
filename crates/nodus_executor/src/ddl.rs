@@ -337,12 +337,20 @@ impl MemExecutor {
         table_name: String,
         columns: Vec<String>,
         unique: bool,
+        if_not_exists: bool,
     ) -> Result<QueryOutput> {
         let (db_name, schema_name, table_only) = parse_object_name(&table_name)?;
         let tbl = self
             .catalog_reader
             .get_table(db_name, schema_name, table_only)?;
         self.authorize(ctx, Action::CreateTable, ResourceRef::Table(tbl.id))?;
+
+        if tbl.indexes.iter().any(|i| i.name == name) {
+            if if_not_exists {
+                return Ok(QueryOutput::tag("CREATE INDEX"));
+            }
+            anyhow::bail!("relation \"{}\" already exists", name);
+        }
 
         let mut index_cols = Vec::new();
         for c in &columns {
@@ -421,6 +429,34 @@ impl MemExecutor {
         )?;
         Ok(QueryOutput::tag("CREATE INDEX"))
     }
+
+    pub(crate) fn exec_drop_index(
+        &self,
+        ctx: &ExecutionContext,
+        name: String,
+        if_exists: bool,
+    ) -> Result<QueryOutput> {
+        // DROP INDEX names the index, not its table, so locate the owning table.
+        let tables = self.catalog_reader.list_all_tables("default")?;
+        for tbl in tables {
+            if tbl.indexes.iter().any(|i| i.name == name) {
+                self.authorize(ctx, Action::CreateTable, ResourceRef::Table(tbl.id))?;
+                self.catalog_writer.update_table_descriptor(
+                    nodus_catalog::TableDescriptorChange::DropIndex {
+                        table_id: tbl.id,
+                        index_name: name.clone(),
+                    },
+                )?;
+                return Ok(QueryOutput::tag("DROP INDEX"));
+            }
+        }
+        if if_exists {
+            Ok(QueryOutput::tag("DROP INDEX"))
+        } else {
+            anyhow::bail!("index \"{}\" does not exist", name)
+        }
+    }
+
     pub(crate) fn exec_create_role(
         &self,
         ctx: &ExecutionContext,

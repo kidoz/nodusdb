@@ -76,6 +76,7 @@ impl CatalogWriter for RaftCatalogWriter {
             TableDescriptorChange::RenameColumn { table_id, .. } => *table_id,
             TableDescriptorChange::DropColumn { table_id, .. } => *table_id,
             TableDescriptorChange::AddIndex { table_id, .. } => *table_id,
+            TableDescriptorChange::DropIndex { table_id, .. } => *table_id,
         };
         self.replicate(
             "update_table_descriptor",
