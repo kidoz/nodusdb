@@ -83,6 +83,7 @@ fn test_offset_distinct_returning() {
                         .map(|s| ProjectionItem::Column(s.to_string()))
                         .collect(),
                     filter: None,
+                    having: None,
                     order_by: vec![],
                     limit,
                     offset,

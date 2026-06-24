@@ -706,6 +706,22 @@ fn extract_col_name(expr: &sqlparser::ast::Expr) -> Option<String> {
             Some(format!("{}{}'{}'", left_col, op_str, right_val))
         }
         Expr::Cast { expr, .. } => extract_col_name(expr),
+        // Aggregate function calls render to a canonical `FUNC(arg)` key so a
+        // `HAVING` predicate can name them. Non-aggregate functions stay `None`
+        // so they don't silently match in a `WHERE` clause.
+        Expr::Function(func) => {
+            use sqlparser::ast::{FunctionArg, FunctionArgExpr};
+            let fname = func.name.to_string().to_uppercase();
+            if !matches!(fname.as_str(), "COUNT" | "SUM" | "MIN" | "MAX" | "AVG") {
+                return None;
+            }
+            let arg = match func.args.first() {
+                Some(FunctionArg::Unnamed(FunctionArgExpr::Wildcard)) => "*".to_string(),
+                Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(e))) => extract_col_name(e)?,
+                _ => return None,
+            };
+            Some(format!("{fname}({arg})"))
+        }
         _ => None,
     }
 }
@@ -1229,6 +1245,11 @@ fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Result<Logical
 
     let distinct = select.distinct.is_some();
 
+    let having = select
+        .having
+        .as_ref()
+        .and_then(|expr| parse_filter_expr(expr, params));
+
     Ok(LogicalPlan::Select {
         ctes,
         table_name,
@@ -1237,6 +1258,7 @@ fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Result<Logical
         projection,
         group_by,
         filter: parse_predicates(&select.selection, params),
+        having,
         order_by,
         limit,
         offset,

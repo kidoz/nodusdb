@@ -357,6 +357,7 @@ impl MemExecutor {
                 projection,
                 group_by,
                 filter,
+                having,
                 order_by,
                 limit,
                 offset,
@@ -674,6 +675,12 @@ impl MemExecutor {
                     }
 
                     for (_k, group_rows) in groups {
+                        // HAVING filters whole groups after aggregation.
+                        if let Some(h) = having.as_ref() {
+                            if !eval_having(h, &group_rows, &col_names) {
+                                continue;
+                            }
+                        }
                         let mut out_row = Vec::new();
                         for proj_item in &projection {
                             match proj_item {
@@ -701,103 +708,12 @@ impl MemExecutor {
                                     out_row.push(Value::Null); // MVP fallback
                                 }
                                 ProjectionItem::Aggregate(op, inner) => {
-                                    let mut idx = col_names.iter().position(|tc| {
-                                        tc == inner || tc.ends_with(&format!(".{}", inner))
-                                    });
-                                    if inner == "*" {
-                                        idx = Some(0); // For COUNT(*)
-                                    }
-
-                                    match op {
-                                        AggregateOp::Count => {
-                                            let count = if inner == "*" {
-                                                group_rows.len() as i64
-                                            } else {
-                                                group_rows
-                                                    .iter()
-                                                    .filter(|r| {
-                                                        idx.and_then(|i| r.get(i))
-                                                            .map_or(false, |v| {
-                                                                !matches!(v, Value::Null)
-                                                            })
-                                                    })
-                                                    .count()
-                                                    as i64
-                                            };
-                                            out_row.push(Value::Int(count));
-                                        }
-                                        AggregateOp::Sum => {
-                                            let mut sum_int = 0i64;
-                                            let mut sum_float = 0f64;
-                                            let mut is_float = false;
-                                            for r in &group_rows {
-                                                if let Some(v) = idx.and_then(|i| r.get(i)) {
-                                                    match v {
-                                                        Value::Int(n) => {
-                                                            if is_float {
-                                                                sum_float += (*n) as f64
-                                                            } else {
-                                                                sum_int += n
-                                                            }
-                                                        }
-                                                        Value::Float(f) => {
-                                                            if !is_float {
-                                                                sum_float = sum_int as f64;
-                                                                is_float = true;
-                                                            }
-                                                            sum_float += f;
-                                                        }
-                                                        _ => {}
-                                                    }
-                                                }
-                                            }
-                                            if group_rows.is_empty() {
-                                                out_row.push(Value::Null);
-                                            } else if is_float {
-                                                out_row.push(Value::Float(sum_float));
-                                            } else {
-                                                out_row.push(Value::Int(sum_int));
-                                            }
-                                        }
-                                        AggregateOp::Min => {
-                                            let mut min_val: Option<Value> = None;
-                                            for r in &group_rows {
-                                                if let Some(v) = idx.and_then(|i| r.get(i)) {
-                                                    if !matches!(v, Value::Null) {
-                                                        if let Some(cur) = &min_val {
-                                                            if compare(&v, cur)
-                                                                == std::cmp::Ordering::Less
-                                                            {
-                                                                min_val = Some(v.clone());
-                                                            }
-                                                        } else {
-                                                            min_val = Some(v.clone());
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                            out_row.push(min_val.unwrap_or(crate::Value::Null));
-                                        }
-                                        AggregateOp::Max => {
-                                            let mut max_val: Option<Value> = None;
-                                            for r in &group_rows {
-                                                if let Some(v) = idx.and_then(|i| r.get(i)) {
-                                                    if !matches!(v, Value::Null) {
-                                                        if let Some(cur) = &max_val {
-                                                            if compare(&v, cur)
-                                                                == std::cmp::Ordering::Greater
-                                                            {
-                                                                max_val = Some(v.clone());
-                                                            }
-                                                        } else {
-                                                            max_val = Some(v.clone());
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                            out_row.push(max_val.unwrap_or(crate::Value::Null));
-                                        }
-                                    }
+                                    out_row.push(compute_aggregate(
+                                        op,
+                                        inner,
+                                        &group_rows,
+                                        &col_names,
+                                    ));
                                 }
                             }
                         }
@@ -1960,5 +1876,176 @@ fn set_op_rows(op: SetOpKind, all: bool, left: Vec<Row>, right: Vec<Row>) -> Vec
             }
             out
         }
+    }
+}
+
+/// Computes one aggregate over a group's rows. `inner` is the aggregated column
+/// name (or `*` for `COUNT(*)`). Shared by SELECT projection and HAVING.
+fn compute_aggregate(
+    op: &AggregateOp,
+    inner: &str,
+    group_rows: &[Vec<Value>],
+    col_names: &[String],
+) -> Value {
+    let mut idx = col_names
+        .iter()
+        .position(|tc| tc == inner || tc.ends_with(&format!(".{inner}")));
+    if inner == "*" {
+        idx = Some(0);
+    }
+    match op {
+        AggregateOp::Count => {
+            let count = if inner == "*" {
+                group_rows.len() as i64
+            } else {
+                group_rows
+                    .iter()
+                    .filter(|r| {
+                        idx.and_then(|i| r.get(i))
+                            .is_some_and(|v| !matches!(v, Value::Null))
+                    })
+                    .count() as i64
+            };
+            Value::Int(count)
+        }
+        AggregateOp::Sum => {
+            let mut sum_int = 0i64;
+            let mut sum_float = 0f64;
+            let mut is_float = false;
+            for r in group_rows {
+                if let Some(v) = idx.and_then(|i| r.get(i)) {
+                    match v {
+                        Value::Int(n) => {
+                            if is_float {
+                                sum_float += (*n) as f64
+                            } else {
+                                sum_int += n
+                            }
+                        }
+                        Value::Float(f) => {
+                            if !is_float {
+                                sum_float = sum_int as f64;
+                                is_float = true;
+                            }
+                            sum_float += f;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if group_rows.is_empty() {
+                Value::Null
+            } else if is_float {
+                Value::Float(sum_float)
+            } else {
+                Value::Int(sum_int)
+            }
+        }
+        AggregateOp::Min | AggregateOp::Max => {
+            let want_less = matches!(op, AggregateOp::Min);
+            let mut acc: Option<Value> = None;
+            for r in group_rows {
+                if let Some(v) = idx.and_then(|i| r.get(i)) {
+                    if matches!(v, Value::Null) {
+                        continue;
+                    }
+                    let replace = match &acc {
+                        Some(cur) => {
+                            let ord = compare(v, cur);
+                            if want_less {
+                                ord == std::cmp::Ordering::Less
+                            } else {
+                                ord == std::cmp::Ordering::Greater
+                            }
+                        }
+                        None => true,
+                    };
+                    if replace {
+                        acc = Some(v.clone());
+                    }
+                }
+            }
+            acc.unwrap_or(Value::Null)
+        }
+    }
+}
+
+/// Parses a HAVING predicate left-hand side: an aggregate key like `SUM(amount)`
+/// or `COUNT(*)`, otherwise `None` (a plain group column).
+fn parse_aggregate_key(key: &str) -> Option<(AggregateOp, String)> {
+    let open = key.find('(')?;
+    if !key.ends_with(')') {
+        return None;
+    }
+    let func = key[..open].to_ascii_uppercase();
+    let arg = key[open + 1..key.len() - 1].to_string();
+    let op = match func.as_str() {
+        "COUNT" => AggregateOp::Count,
+        "SUM" => AggregateOp::Sum,
+        "MIN" => AggregateOp::Min,
+        "MAX" => AggregateOp::Max,
+        _ => return None,
+    };
+    Some((op, arg))
+}
+
+/// Resolves a HAVING reference (aggregate key or group column) to a value.
+fn having_value(name: &str, group_rows: &[Vec<Value>], col_names: &[String]) -> Option<Value> {
+    if let Some((op, arg)) = parse_aggregate_key(name) {
+        return Some(compute_aggregate(&op, &arg, group_rows, col_names));
+    }
+    let idx = col_names
+        .iter()
+        .position(|tc| tc == name || tc.ends_with(&format!(".{name}")))?;
+    group_rows.first().and_then(|r| r.get(idx)).cloned()
+}
+
+/// Coerces a numeric-looking text operand so comparisons are numeric, not lexical.
+fn having_operand(op: &Operand, group_rows: &[Vec<Value>], col_names: &[String]) -> Option<Value> {
+    match op {
+        Operand::Literal(Value::Text(s)) => {
+            if let Ok(i) = s.parse::<i64>() {
+                Some(Value::Int(i))
+            } else if let Ok(f) = s.parse::<f64>() {
+                Some(Value::Float(f))
+            } else {
+                Some(Value::Text(s.clone()))
+            }
+        }
+        Operand::Literal(v) => Some(v.clone()),
+        Operand::Ident(name) => having_value(name, group_rows, col_names),
+    }
+}
+
+/// Evaluates a HAVING predicate against one aggregated group.
+fn eval_having(expr: &FilterExpr, group_rows: &[Vec<Value>], col_names: &[String]) -> bool {
+    match expr {
+        FilterExpr::And(l, r) => {
+            eval_having(l, group_rows, col_names) && eval_having(r, group_rows, col_names)
+        }
+        FilterExpr::Or(l, r) => {
+            eval_having(l, group_rows, col_names) || eval_having(r, group_rows, col_names)
+        }
+        FilterExpr::Not(inner) => !eval_having(inner, group_rows, col_names),
+        FilterExpr::Predicate(p) => {
+            let (Some(left), Some(right)) = (
+                having_value(&p.left, group_rows, col_names),
+                having_operand(&p.right, group_rows, col_names),
+            ) else {
+                return false;
+            };
+            let ord = compare(&left, &right);
+            match p.op {
+                CompareOp::Eq => left == right,
+                CompareOp::Ne => left != right,
+                CompareOp::Lt => ord == std::cmp::Ordering::Less,
+                CompareOp::Le => ord != std::cmp::Ordering::Greater,
+                CompareOp::Gt => ord == std::cmp::Ordering::Greater,
+                CompareOp::Ge => ord != std::cmp::Ordering::Less,
+                _ => false,
+            }
+        }
+        // Other shapes (LIKE/IN/subquery) are not meaningful in HAVING here.
+        _ => true,
     }
 }

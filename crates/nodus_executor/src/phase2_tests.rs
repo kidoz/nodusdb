@@ -303,3 +303,84 @@ fn test_cross_join() {
     res.sort();
     assert_eq!(res, vec!["x-p", "x-q", "y-p", "y-q"]);
 }
+
+#[test]
+fn test_having() {
+    let (exec, cat) = MemExecutor::shared(Arc::new(MemoryAuditSink::new()));
+    let admin = cat
+        .create_role(nodus_catalog::CreateRoleRequest {
+            id: nodus_catalog::PrincipalId::new(),
+            name: "admin".into(),
+            principal_type: nodus_catalog::PrincipalType::User,
+            database_id: None,
+        })
+        .unwrap();
+    cat.grant_privilege(nodus_catalog::GrantPrivilegeRequest {
+        id: nodus_catalog::GrantId::new(),
+        principal_id: admin.id,
+        resource: nodus_catalog::ResourceRef::System,
+        privilege: "ALL".into(),
+    })
+    .unwrap();
+    let ctx = test_ctx(admin.id);
+
+    exec.execute_logical(
+        &ctx,
+        LogicalPlan::CreateTable {
+            constraints: vec![],
+            name: "sales".into(),
+            columns: cols(&[("id", "int"), ("category", "text"), ("amount", "int")]),
+        },
+    )
+    .unwrap();
+    let insert = |id: &str, c: &str, amt: &str| {
+        exec.execute_logical(
+            &ctx,
+            LogicalPlan::Insert {
+                table_name: "sales".into(),
+                columns: vec![],
+                values_list: vec![vec![
+                    Value::Text(id.into()),
+                    Value::Text(c.into()),
+                    Value::Text(amt.into()),
+                ]],
+                returning: vec![],
+            },
+        )
+        .unwrap();
+    };
+    // A: 2 rows (sum 30), B: 1 row (sum 15), C: 3 rows (sum 15)
+    insert("1", "A", "10");
+    insert("2", "A", "20");
+    insert("3", "B", "15");
+    insert("4", "C", "5");
+    insert("5", "C", "5");
+    insert("6", "C", "5");
+
+    let read = |sql: &str| {
+        let mut stmts = nodus_sql::parse_sql(sql).unwrap();
+        let plan = plan_statement(&stmts.remove(0), &[]).unwrap();
+        let out = exec.execute_logical(&ctx, plan).unwrap();
+        let mut res: Vec<String> = out.rows.iter().map(|r| render_row(r).join(",")).collect();
+        res.sort();
+        res
+    };
+
+    // COUNT(*) > 1 -> A (2) and C (3)
+    assert_eq!(
+        read("SELECT category, COUNT(id) FROM sales GROUP BY category HAVING COUNT(*) > 1"),
+        vec!["A,2", "C,3"]
+    );
+    // SUM(amount) > 20 -> only A (30)
+    assert_eq!(
+        read("SELECT category FROM sales GROUP BY category HAVING SUM(amount) > 20"),
+        vec!["A"]
+    );
+    // group column predicate + aggregate predicate combined
+    assert_eq!(
+        read(
+            "SELECT category FROM sales GROUP BY category HAVING COUNT(*) >= 2 AND MIN(amount) = 5"
+        ),
+        vec!["C"]
+    );
+}

@@ -142,6 +142,7 @@ fn create_insert_select_round_trip() {
                 joins: vec![],
                 projection: vec![],
                 filter: None,
+                having: None,
                 order_by: vec![],
                 limit: None,
 
@@ -168,6 +169,7 @@ fn create_insert_select_round_trip() {
                     ProjectionItem::Column("author".into()),
                 ],
                 filter: eq("id", "2"),
+                having: None,
                 order_by: vec![],
                 limit: None,
 
@@ -238,6 +240,7 @@ fn typed_values_round_trip_and_filter_by_int() {
                 joins: vec![],
                 projection: vec![],
                 filter: eq("id", "7"),
+                having: None,
                 order_by: vec![],
                 limit: None,
 
@@ -320,6 +323,7 @@ fn update_and_delete_rows() {
                 joins: vec![],
                 projection: vec![ProjectionItem::Column("name".into())],
                 filter,
+                having: None,
                 order_by: vec![],
                 limit: None,
 
@@ -450,6 +454,7 @@ fn test_join_execution() {
             op: CompareOp::Eq,
             right: Operand::Literal(Value::Text("Herbert".into())),
         })),
+        having: None,
         order_by: vec![("books.id".into(), true)],
         limit: None,
 
@@ -534,6 +539,7 @@ fn transactions_are_isolated_per_session() {
                 joins: vec![],
                 projection: vec![],
                 filter: None,
+                having: None,
                 order_by: vec![],
                 limit: None,
 

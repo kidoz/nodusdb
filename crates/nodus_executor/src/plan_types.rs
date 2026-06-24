@@ -205,6 +205,8 @@ pub enum LogicalPlan {
         group_by: Vec<String>,
         /// Conjunction of `WHERE` predicates; empty means no filter.
         filter: Option<FilterExpr>,
+        /// `HAVING` predicate applied to groups after aggregation.
+        having: Option<FilterExpr>,
         /// Optional `ORDER BY (column, ascending)`.
         order_by: Vec<(String, bool)>,
         /// Optional `LIMIT`.
