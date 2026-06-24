@@ -9,7 +9,8 @@ use pgwire::api::results::{FieldFormat, FieldInfo};
 use pgwire::error::{ErrorInfo, PgWireError};
 use pgwire::messages::data::{FieldDescription, RowDescription};
 
-use crate::{POSTGRES_TYPEMOD_NONE, map_declared_type};
+use crate::POSTGRES_TYPEMOD_NONE;
+use crate::type_map::map_declared_type;
 
 pub(crate) fn sqlstate_for_execution_error(err_str: &str) -> &'static str {
     if err_str.contains("Unique constraint violation") {
