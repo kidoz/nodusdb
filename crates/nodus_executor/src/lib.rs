@@ -24,6 +24,7 @@ mod pg_catalog;
 mod plan_types;
 mod planner;
 mod system_views;
+mod transactions;
 mod value;
 mod view_helpers;
 pub use plan_types::{
@@ -94,23 +95,23 @@ pub struct ExecutionContext {
 }
 
 #[derive(Debug, Clone)]
-struct SavepointState {
-    name: String,
-    write_log_len: usize,
-    overlay: HashMap<String, Option<String>>,
+pub(crate) struct SavepointState {
+    pub(crate) name: String,
+    pub(crate) write_log_len: usize,
+    pub(crate) overlay: HashMap<String, Option<String>>,
 }
 
 #[derive(Debug, Clone)]
-struct ActiveTxn {
-    txn_id: TxnId,
-    read_ts: Timestamp,
-    write_log: Vec<String>,
-    overlay: HashMap<String, Option<String>>,
-    savepoints: Vec<SavepointState>,
+pub(crate) struct ActiveTxn {
+    pub(crate) txn_id: TxnId,
+    pub(crate) read_ts: Timestamp,
+    pub(crate) write_log: Vec<String>,
+    pub(crate) overlay: HashMap<String, Option<String>>,
+    pub(crate) savepoints: Vec<SavepointState>,
 }
 
 impl ActiveTxn {
-    fn new(txn_id: TxnId, read_ts: Timestamp) -> Self {
+    pub(crate) fn new(txn_id: TxnId, read_ts: Timestamp) -> Self {
         Self {
             txn_id,
             read_ts,
