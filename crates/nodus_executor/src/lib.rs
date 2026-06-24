@@ -16,13 +16,16 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-mod catalog_views;
 mod constraints;
 mod execute;
 mod filter_eval;
+mod information_schema;
+mod pg_catalog;
 mod plan_types;
 mod planner;
+mod system_views;
 mod value;
+mod view_helpers;
 pub use plan_types::{
     AggregateOp, AlterTableOp, CompareOp, FilterExpr, Join, JoinType, LogicalPlan, Operand,
     Predicate, ProjectionItem, SetOpKind,

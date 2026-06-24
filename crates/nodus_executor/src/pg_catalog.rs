@@ -1,267 +1,11 @@
-//! Synthesized `pg_catalog` and `information_schema` virtual tables, plus the
-//! stable-OID and pg_type metadata helpers that back driver introspection.
-//!
-//! These methods build column descriptors and row sets from catalog data passed
-//! in by the executor; they read no `MemExecutor` field state directly.
-
+//! Synthesized `pg_catalog` virtual tables (pg_class, pg_type, pg_settings, ...).
 use crate::{MemExecutor, Value, parse_object_name};
 use anyhow::Result;
 use chrono::Utc;
 use nodus_catalog::ColumnDescriptor;
 
 impl MemExecutor {
-    /// Builds a column descriptor for a synthesized pg_catalog table.
-    fn virtual_column(name: &str, data_type: &str) -> ColumnDescriptor {
-        ColumnDescriptor {
-            id: nodus_catalog::ColumnId::new(),
-            name: name.into(),
-            version: 1,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
-            state: nodus_catalog::DescriptorState::Public,
-            data_type: data_type.into(),
-            nullable: true,
-        }
-    }
-
-    fn virtual_columns(columns: &[(&str, &str)]) -> Vec<ColumnDescriptor> {
-        columns
-            .iter()
-            .map(|(name, data_type)| Self::virtual_column(name, data_type))
-            .collect()
-    }
-
-    fn stable_oid(seed: &str, base: i64) -> i64 {
-        let mut hash = 0xcbf29ce484222325_u64;
-        for byte in seed.as_bytes() {
-            hash ^= u64::from(*byte);
-            hash = hash.wrapping_mul(0x100000001b3);
-        }
-        base + (hash % 1_000_000_000) as i64
-    }
-
-    fn database_oid(db_name: &str) -> i64 {
-        Self::stable_oid(&format!("database:{db_name}"), 10_000)
-    }
-
-    fn schema_oid(db_name: &str, schema_name: &str) -> i64 {
-        match schema_name {
-            "pg_catalog" => 11,
-            "public" => 2200,
-            "information_schema" => 13_337,
-            _ => Self::stable_oid(&format!("schema:{db_name}.{schema_name}"), 20_000),
-        }
-    }
-
-    fn table_oid(db_name: &str, schema_name: &str, table_name: &str) -> i64 {
-        Self::stable_oid(
-            &format!("table:{db_name}.{schema_name}.{table_name}"),
-            100_000,
-        )
-    }
-
-    fn index_oid(db_name: &str, schema_name: &str, table_name: &str, index_name: &str) -> i64 {
-        Self::stable_oid(
-            &format!("index:{db_name}.{schema_name}.{table_name}.{index_name}"),
-            2_000_000_000,
-        )
-    }
-
-    fn constraint_oid(
-        db_name: &str,
-        schema_name: &str,
-        table_name: &str,
-        constraint_name: &str,
-    ) -> i64 {
-        Self::stable_oid(
-            &format!("constraint:{db_name}.{schema_name}.{table_name}.{constraint_name}"),
-            1_000_000_000,
-        )
-    }
-
-    fn pg_type_oid(data_type: &str) -> i64 {
-        let normalized = data_type
-            .trim()
-            .trim_matches('"')
-            .to_ascii_uppercase()
-            .replace("CHARACTER VARYING", "VARCHAR")
-            .replace("DOUBLE PRECISION", "DOUBLE")
-            .replace("TIMESTAMP WITH TIME ZONE", "TIMESTAMPTZ")
-            .replace("TIMESTAMP WITHOUT TIME ZONE", "TIMESTAMP");
-        let is_array = normalized.ends_with("[]");
-        let base = normalized
-            .trim_end_matches("[]")
-            .split('(')
-            .next()
-            .unwrap_or("TEXT")
-            .trim();
-        if is_array {
-            return match base {
-                "BOOL" | "BOOLEAN" => 1000,
-                "BYTEA" => 1001,
-                "PG_CHAR" => 1002,
-                "CHAR" | "CHARACTER" | "BPCHAR" => 1014,
-                "INT2" | "SMALLINT" => 1005,
-                "INT4" | "INT" | "INTEGER" | "SERIAL" => 1007,
-                "INT8" | "BIGINT" => 1016,
-                "TEXT" => 1009,
-                "VARCHAR" => 1015,
-                "OID" => 1028,
-                "FLOAT4" | "REAL" => 1021,
-                "FLOAT8" | "FLOAT" | "DOUBLE" => 1022,
-                "NUMERIC" | "DECIMAL" => 1231,
-                "DATE" => 1182,
-                "TIME" => 1183,
-                "TIMESTAMP" => 1115,
-                "TIMESTAMPTZ" => 1185,
-                "UUID" => 2951,
-                "JSON" => 199,
-                "JSONB" => 3807,
-                "REGTYPE" => 2211,
-                _ => 1009,
-            };
-        }
-        match base {
-            "BOOL" | "BOOLEAN" => 16,
-            "BYTEA" => 17,
-            "PG_CHAR" => 18,
-            "CHAR" | "CHARACTER" | "BPCHAR" => 1042,
-            "INT2" | "SMALLINT" => 21,
-            "INT4" | "INT" | "INTEGER" | "SERIAL" => 23,
-            "INT8" | "BIGINT" => 20,
-            "TEXT" => 25,
-            "OID" => 26,
-            "FLOAT4" | "REAL" => 700,
-            "FLOAT8" | "FLOAT" | "DOUBLE" => 701,
-            "VARCHAR" => 1043,
-            "DATE" => 1082,
-            "TIME" => 1083,
-            "TIMESTAMP" => 1114,
-            "TIMESTAMPTZ" => 1184,
-            "NUMERIC" | "DECIMAL" => 1700,
-            "UUID" => 2950,
-            "JSON" => 114,
-            "JSONB" => 3802,
-            "NAME" => 19,
-            "REGPROC" => 24,
-            "REGOPER" => 2203,
-            "REGOPERATOR" => 2204,
-            "REGCLASS" => 2205,
-            "REGTYPE" => 2206,
-            "REGROLE" => 4096,
-            "REGNAMESPACE" => 4089,
-            "REGCONFIG" => 3734,
-            "REGDICTIONARY" => 3769,
-            _ => 25,
-        }
-    }
-
-    fn pg_type_name(data_type: &str) -> String {
-        match Self::pg_type_oid(data_type) {
-            16 => "bool",
-            17 => "bytea",
-            18 => "char",
-            19 => "name",
-            20 => "int8",
-            21 => "int2",
-            23 => "int4",
-            25 => "text",
-            26 => "oid",
-            700 => "float4",
-            701 => "float8",
-            1042 => "bpchar",
-            1043 => "varchar",
-            1082 => "date",
-            1083 => "time",
-            1114 => "timestamp",
-            1184 => "timestamptz",
-            1700 => "numeric",
-            2206 => "regtype",
-            2950 => "uuid",
-            3802 => "jsonb",
-            _ => "text",
-        }
-        .to_string()
-    }
-
-    fn pg_type_length(data_type: &str) -> i64 {
-        match Self::pg_type_oid(data_type) {
-            16 => 1,
-            20 | 701 | 1083 | 1114 | 1184 => 8,
-            18 => 1,
-            21 => 2,
-            23 | 26 | 700 | 1082 | 2206 => 4,
-            2950 => 16,
-            _ => -1,
-        }
-    }
-
-    pub(crate) fn is_virtual_schema(schema_name: &str) -> bool {
-        schema_name.eq_ignore_ascii_case("pg_catalog")
-            || schema_name.eq_ignore_ascii_case("information_schema")
-    }
-
-    pub(crate) fn is_pg_catalog_virtual_table_name(table_name: &str) -> bool {
-        matches!(
-            table_name.to_ascii_lowercase().as_str(),
-            "pg_database"
-                | "pg_namespace"
-                | "pg_class"
-                | "pg_attribute"
-                | "pg_index"
-                | "pg_constraint"
-                | "pg_type"
-                | "pg_proc"
-                | "pg_range"
-                | "pg_settings"
-                | "pg_roles"
-                | "pg_user"
-                | "pg_tables"
-                | "pg_indexes"
-                | "pg_attrdef"
-                | "pg_description"
-                | "pg_shdescription"
-                | "pg_enum"
-                | "pg_collation"
-                | "pg_am"
-                | "pg_operator"
-                | "pg_cast"
-                | "pg_locks"
-        )
-    }
-
-    fn schema_name_by_id(
-        db_name: &str,
-        schemas: &[nodus_catalog::SchemaDescriptor],
-        schema_id: nodus_catalog::SchemaId,
-    ) -> String {
-        schemas
-            .iter()
-            .find(|schema| schema.id == schema_id)
-            .map(|schema| schema.name.clone())
-            .unwrap_or_else(|| {
-                let _ = db_name;
-                "public".to_string()
-            })
-    }
-
-    pub(crate) fn returning_types(
-        columns: &[ColumnDescriptor],
-        returning: &[String],
-    ) -> Vec<String> {
-        returning
-            .iter()
-            .map(|name| {
-                columns
-                    .iter()
-                    .find(|column| column.name.eq_ignore_ascii_case(name))
-                    .map(|column| column.data_type.clone())
-                    .unwrap_or_else(|| "VARCHAR".to_string())
-            })
-            .collect()
-    }
-
-    fn pg_catalog_virtual_table(
+    pub(crate) fn pg_catalog_virtual_table(
         &self,
         db_name: &str,
         table_only: &str,
@@ -798,7 +542,10 @@ impl MemExecutor {
         Ok(result)
     }
 
-    fn pg_type_virtual_table(&self, db_name: &str) -> (Vec<ColumnDescriptor>, Vec<Vec<Value>>) {
+    pub(crate) fn pg_type_virtual_table(
+        &self,
+        db_name: &str,
+    ) -> (Vec<ColumnDescriptor>, Vec<Vec<Value>>) {
         let cols = Self::virtual_columns(&[
             ("oid", "OID"),
             ("typname", "NAME"),
@@ -930,7 +677,7 @@ impl MemExecutor {
         (cols, rows)
     }
 
-    fn pg_settings_virtual_table(&self) -> (Vec<ColumnDescriptor>, Vec<Vec<Value>>) {
+    pub(crate) fn pg_settings_virtual_table(&self) -> (Vec<ColumnDescriptor>, Vec<Vec<Value>>) {
         let cols = Self::virtual_columns(&[
             ("name", "TEXT"),
             ("setting", "TEXT"),
@@ -991,7 +738,7 @@ impl MemExecutor {
         (cols, rows)
     }
 
-    fn pg_roles_virtual_table(&self) -> (Vec<ColumnDescriptor>, Vec<Vec<Value>>) {
+    pub(crate) fn pg_roles_virtual_table(&self) -> (Vec<ColumnDescriptor>, Vec<Vec<Value>>) {
         let cols = Self::virtual_columns(&[
             ("oid", "OID"),
             ("rolname", "NAME"),
@@ -1025,7 +772,7 @@ impl MemExecutor {
         (cols, rows)
     }
 
-    fn pg_user_virtual_table(&self) -> (Vec<ColumnDescriptor>, Vec<Vec<Value>>) {
+    pub(crate) fn pg_user_virtual_table(&self) -> (Vec<ColumnDescriptor>, Vec<Vec<Value>>) {
         let cols = Self::virtual_columns(&[
             ("usename", "NAME"),
             ("usesysid", "OID"),
@@ -1051,7 +798,7 @@ impl MemExecutor {
         (cols, rows)
     }
 
-    fn pg_tables_virtual_table(
+    pub(crate) fn pg_tables_virtual_table(
         &self,
         db_name: &str,
         schemas: &[nodus_catalog::SchemaDescriptor],
@@ -1086,7 +833,7 @@ impl MemExecutor {
         (cols, rows)
     }
 
-    fn pg_indexes_virtual_table(
+    pub(crate) fn pg_indexes_virtual_table(
         &self,
         db_name: &str,
         schemas: &[nodus_catalog::SchemaDescriptor],
@@ -1134,7 +881,7 @@ impl MemExecutor {
         (cols, rows)
     }
 
-    fn pg_constraint_rows(
+    pub(crate) fn pg_constraint_rows(
         &self,
         db_name: &str,
         schemas: &[nodus_catalog::SchemaDescriptor],
@@ -1314,7 +1061,7 @@ impl MemExecutor {
         rows
     }
 
-    fn pg_collation_virtual_table(
+    pub(crate) fn pg_collation_virtual_table(
         &self,
         db_name: &str,
     ) -> (Vec<ColumnDescriptor>, Vec<Vec<Value>>) {
@@ -1363,7 +1110,10 @@ impl MemExecutor {
         (cols, rows)
     }
 
-    fn pg_operator_virtual_table(&self, db_name: &str) -> (Vec<ColumnDescriptor>, Vec<Vec<Value>>) {
+    pub(crate) fn pg_operator_virtual_table(
+        &self,
+        db_name: &str,
+    ) -> (Vec<ColumnDescriptor>, Vec<Vec<Value>>) {
         let cols = Self::virtual_columns(&[
             ("oid", "OID"),
             ("oprname", "NAME"),
@@ -1412,7 +1162,7 @@ impl MemExecutor {
         (cols, rows)
     }
 
-    fn pg_cast_virtual_table(&self) -> (Vec<ColumnDescriptor>, Vec<Vec<Value>>) {
+    pub(crate) fn pg_cast_virtual_table(&self) -> (Vec<ColumnDescriptor>, Vec<Vec<Value>>) {
         let cols = Self::virtual_columns(&[
             ("oid", "OID"),
             ("castsource", "OID"),
@@ -1446,360 +1196,5 @@ impl MemExecutor {
             })
             .collect();
         (cols, rows)
-    }
-
-    fn information_schema_virtual_table(
-        &self,
-        db_name: &str,
-        table_only: &str,
-    ) -> Result<Option<(Vec<ColumnDescriptor>, Vec<Vec<Value>>)>> {
-        let schemas = self
-            .catalog_reader
-            .list_schemas(db_name)
-            .unwrap_or_default();
-        let tables = self
-            .catalog_reader
-            .list_all_tables(db_name)
-            .unwrap_or_default();
-        let result = match table_only.to_ascii_lowercase().as_str() {
-            "tables" => Some(self.information_schema_tables(db_name, &schemas, &tables)),
-            "columns" => Some(self.information_schema_columns(db_name, &schemas, &tables)),
-            "table_constraints" | "constraints" => {
-                Some(self.information_schema_table_constraints(db_name, &schemas, &tables))
-            }
-            "key_column_usage" => {
-                Some(self.information_schema_key_column_usage(db_name, &schemas, &tables))
-            }
-            "constraint_column_usage" => Some(self.information_schema_constraint_column_usage()),
-            "indexes" => Some(self.information_schema_indexes(db_name, &schemas, &tables)),
-            "schemata" => Some(self.information_schema_schemata(db_name, &schemas)),
-            _ => None,
-        };
-        Ok(result)
-    }
-
-    fn information_schema_tables(
-        &self,
-        db_name: &str,
-        schemas: &[nodus_catalog::SchemaDescriptor],
-        tables: &[nodus_catalog::TableDescriptor],
-    ) -> (Vec<ColumnDescriptor>, Vec<Vec<Value>>) {
-        let cols = Self::virtual_columns(&[
-            ("table_catalog", "TEXT"),
-            ("table_schema", "TEXT"),
-            ("table_name", "TEXT"),
-            ("table_type", "TEXT"),
-            ("self_referencing_column_name", "TEXT"),
-            ("reference_generation", "TEXT"),
-            ("user_defined_type_catalog", "TEXT"),
-            ("user_defined_type_schema", "TEXT"),
-            ("user_defined_type_name", "TEXT"),
-            ("is_insertable_into", "TEXT"),
-            ("is_typed", "TEXT"),
-            ("commit_action", "TEXT"),
-        ]);
-        let rows = tables
-            .iter()
-            .map(|table| {
-                vec![
-                    Value::Text(db_name.into()),
-                    Value::Text(Self::schema_name_by_id(db_name, schemas, table.schema_id)),
-                    Value::Text(table.name.clone()),
-                    Value::Text(
-                        if table.view_query.is_some() {
-                            "VIEW"
-                        } else {
-                            "BASE TABLE"
-                        }
-                        .into(),
-                    ),
-                    Value::Null,
-                    Value::Null,
-                    Value::Null,
-                    Value::Null,
-                    Value::Null,
-                    Value::Text("YES".into()),
-                    Value::Text("NO".into()),
-                    Value::Null,
-                ]
-            })
-            .collect();
-        (cols, rows)
-    }
-
-    fn information_schema_columns(
-        &self,
-        db_name: &str,
-        schemas: &[nodus_catalog::SchemaDescriptor],
-        tables: &[nodus_catalog::TableDescriptor],
-    ) -> (Vec<ColumnDescriptor>, Vec<Vec<Value>>) {
-        let cols = Self::virtual_columns(&[
-            ("table_catalog", "TEXT"),
-            ("table_schema", "TEXT"),
-            ("table_name", "TEXT"),
-            ("column_name", "TEXT"),
-            ("ordinal_position", "INT"),
-            ("column_default", "TEXT"),
-            ("is_nullable", "TEXT"),
-            ("data_type", "TEXT"),
-            ("character_maximum_length", "INT"),
-            ("numeric_precision", "INT"),
-            ("numeric_scale", "INT"),
-            ("datetime_precision", "INT"),
-            ("udt_catalog", "TEXT"),
-            ("udt_schema", "TEXT"),
-            ("udt_name", "TEXT"),
-            ("is_identity", "TEXT"),
-            ("identity_generation", "TEXT"),
-            ("is_generated", "TEXT"),
-            ("generation_expression", "TEXT"),
-        ]);
-        let mut rows = Vec::new();
-        for table in tables {
-            let schema_name = Self::schema_name_by_id(db_name, schemas, table.schema_id);
-            for (idx, column) in table.columns.iter().enumerate() {
-                rows.push(vec![
-                    Value::Text(db_name.into()),
-                    Value::Text(schema_name.clone()),
-                    Value::Text(table.name.clone()),
-                    Value::Text(column.name.clone()),
-                    Value::Int((idx + 1) as i64),
-                    Value::Null,
-                    Value::Text(if column.nullable { "YES" } else { "NO" }.into()),
-                    Value::Text(column.data_type.to_ascii_lowercase()),
-                    Value::Null,
-                    Value::Null,
-                    Value::Null,
-                    Value::Null,
-                    Value::Text(db_name.into()),
-                    Value::Text("pg_catalog".into()),
-                    Value::Text(Self::pg_type_name(&column.data_type)),
-                    Value::Text("NO".into()),
-                    Value::Null,
-                    Value::Text("NEVER".into()),
-                    Value::Null,
-                ]);
-            }
-        }
-        (cols, rows)
-    }
-
-    fn information_schema_table_constraints(
-        &self,
-        db_name: &str,
-        schemas: &[nodus_catalog::SchemaDescriptor],
-        tables: &[nodus_catalog::TableDescriptor],
-    ) -> (Vec<ColumnDescriptor>, Vec<Vec<Value>>) {
-        let cols = Self::virtual_columns(&[
-            ("constraint_catalog", "TEXT"),
-            ("constraint_schema", "TEXT"),
-            ("constraint_name", "TEXT"),
-            ("table_schema", "TEXT"),
-            ("table_name", "TEXT"),
-            ("constraint_type", "TEXT"),
-            ("is_deferrable", "TEXT"),
-            ("initially_deferred", "TEXT"),
-            ("enforced", "TEXT"),
-        ]);
-        let mut rows = Vec::new();
-        for table in tables {
-            let schema_name = Self::schema_name_by_id(db_name, schemas, table.schema_id);
-            for index in &table.indexes {
-                if index.unique {
-                    rows.push(vec![
-                        Value::Text(db_name.into()),
-                        Value::Text(schema_name.clone()),
-                        Value::Text(index.name.clone()),
-                        Value::Text(schema_name.clone()),
-                        Value::Text(table.name.clone()),
-                        Value::Text(
-                            if matches!(index.index_type, nodus_catalog::IndexType::Primary) {
-                                "PRIMARY KEY"
-                            } else {
-                                "UNIQUE"
-                            }
-                            .into(),
-                        ),
-                        Value::Text("NO".into()),
-                        Value::Text("NO".into()),
-                        Value::Text("YES".into()),
-                    ]);
-                }
-            }
-            for (idx, constraint) in table.constraints.iter().enumerate() {
-                let (name, constraint_type) = match constraint {
-                    nodus_catalog::TableConstraint::Check { name, .. } => (
-                        name.clone()
-                            .unwrap_or_else(|| format!("{}_check_{}", table.name, idx + 1)),
-                        "CHECK",
-                    ),
-                    nodus_catalog::TableConstraint::ForeignKey { name, columns, .. } => (
-                        name.clone().unwrap_or_else(|| {
-                            format!("{}_{}_fkey", table.name, columns.join("_"))
-                        }),
-                        "FOREIGN KEY",
-                    ),
-                };
-                rows.push(vec![
-                    Value::Text(db_name.into()),
-                    Value::Text(schema_name.clone()),
-                    Value::Text(name),
-                    Value::Text(schema_name.clone()),
-                    Value::Text(table.name.clone()),
-                    Value::Text(constraint_type.into()),
-                    Value::Text("NO".into()),
-                    Value::Text("NO".into()),
-                    Value::Text("YES".into()),
-                ]);
-            }
-        }
-        (cols, rows)
-    }
-
-    fn information_schema_key_column_usage(
-        &self,
-        db_name: &str,
-        schemas: &[nodus_catalog::SchemaDescriptor],
-        tables: &[nodus_catalog::TableDescriptor],
-    ) -> (Vec<ColumnDescriptor>, Vec<Vec<Value>>) {
-        let cols = Self::virtual_columns(&[
-            ("constraint_catalog", "TEXT"),
-            ("constraint_schema", "TEXT"),
-            ("constraint_name", "TEXT"),
-            ("table_catalog", "TEXT"),
-            ("table_schema", "TEXT"),
-            ("table_name", "TEXT"),
-            ("column_name", "TEXT"),
-            ("ordinal_position", "INT"),
-            ("position_in_unique_constraint", "INT"),
-        ]);
-        let mut rows = Vec::new();
-        for table in tables {
-            let schema_name = Self::schema_name_by_id(db_name, schemas, table.schema_id);
-            for index in &table.indexes {
-                if !index.unique {
-                    continue;
-                }
-                for (idx, key) in index.key_columns.iter().enumerate() {
-                    if let Some(column) = table
-                        .columns
-                        .iter()
-                        .find(|column| column.id == key.column_id)
-                    {
-                        rows.push(vec![
-                            Value::Text(db_name.into()),
-                            Value::Text(schema_name.clone()),
-                            Value::Text(index.name.clone()),
-                            Value::Text(db_name.into()),
-                            Value::Text(schema_name.clone()),
-                            Value::Text(table.name.clone()),
-                            Value::Text(column.name.clone()),
-                            Value::Int((idx + 1) as i64),
-                            Value::Null,
-                        ]);
-                    }
-                }
-            }
-        }
-        (cols, rows)
-    }
-
-    fn information_schema_constraint_column_usage(
-        &self,
-    ) -> (Vec<ColumnDescriptor>, Vec<Vec<Value>>) {
-        let cols = Self::virtual_columns(&[
-            ("table_catalog", "TEXT"),
-            ("table_schema", "TEXT"),
-            ("table_name", "TEXT"),
-            ("column_name", "TEXT"),
-            ("constraint_catalog", "TEXT"),
-            ("constraint_schema", "TEXT"),
-            ("constraint_name", "TEXT"),
-        ]);
-        (cols, Vec::new())
-    }
-
-    fn information_schema_indexes(
-        &self,
-        db_name: &str,
-        schemas: &[nodus_catalog::SchemaDescriptor],
-        tables: &[nodus_catalog::TableDescriptor],
-    ) -> (Vec<ColumnDescriptor>, Vec<Vec<Value>>) {
-        let cols = Self::virtual_columns(&[
-            ("table_catalog", "TEXT"),
-            ("table_schema", "TEXT"),
-            ("table_name", "TEXT"),
-            ("index_name", "TEXT"),
-            ("is_unique", "BOOL"),
-        ]);
-        let mut rows = Vec::new();
-        for table in tables {
-            let schema_name = Self::schema_name_by_id(db_name, schemas, table.schema_id);
-            for index in &table.indexes {
-                rows.push(vec![
-                    Value::Text(db_name.into()),
-                    Value::Text(schema_name.clone()),
-                    Value::Text(table.name.clone()),
-                    Value::Text(index.name.clone()),
-                    Value::Bool(index.unique),
-                ]);
-            }
-        }
-        (cols, rows)
-    }
-
-    fn information_schema_schemata(
-        &self,
-        db_name: &str,
-        schemas: &[nodus_catalog::SchemaDescriptor],
-    ) -> (Vec<ColumnDescriptor>, Vec<Vec<Value>>) {
-        let cols = Self::virtual_columns(&[
-            ("catalog_name", "TEXT"),
-            ("schema_name", "TEXT"),
-            ("schema_owner", "TEXT"),
-            ("default_character_set_catalog", "TEXT"),
-            ("default_character_set_schema", "TEXT"),
-            ("default_character_set_name", "TEXT"),
-            ("sql_path", "TEXT"),
-        ]);
-        let rows = schemas
-            .iter()
-            .map(|schema| {
-                vec![
-                    Value::Text(db_name.into()),
-                    Value::Text(schema.name.clone()),
-                    Value::Text("nodus".into()),
-                    Value::Null,
-                    Value::Null,
-                    Value::Null,
-                    Value::Null,
-                ]
-            })
-            .collect();
-        (cols, rows)
-    }
-
-    pub(crate) fn get_virtual_table(
-        &self,
-        db_name: &str,
-        schema_name: &str,
-        table_only: &str,
-    ) -> Result<(Vec<ColumnDescriptor>, Vec<Vec<Value>>)> {
-        if schema_name.eq_ignore_ascii_case("pg_catalog") {
-            if let Some(table) = self.pg_catalog_virtual_table(db_name, table_only)? {
-                return Ok(table);
-            }
-            anyhow::bail!("relation \"pg_catalog.{}\" does not exist", table_only);
-        } else if schema_name.eq_ignore_ascii_case("information_schema") {
-            if let Some(table) = self.information_schema_virtual_table(db_name, table_only)? {
-                return Ok(table);
-            }
-            anyhow::bail!(
-                "relation \"information_schema.{}\" does not exist",
-                table_only
-            );
-        } else {
-            anyhow::bail!("relation \"{}.{}\" does not exist", schema_name, table_only);
-        }
     }
 }
