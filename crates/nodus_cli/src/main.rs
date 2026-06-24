@@ -346,8 +346,9 @@ async fn main() -> anyhow::Result<()> {
             }
             for s in arr {
                 println!(
-                    "{}  principal={}  query={}",
+                    "{}  user={}  principal={}  query={}",
                     s["session_id"].as_str().unwrap_or("?"),
+                    s["user_name"].as_str().unwrap_or("(anonymous)"),
                     s["principal_id"].as_str().unwrap_or("?"),
                     s["current_query"].as_str().unwrap_or("-")
                 );

@@ -313,8 +313,33 @@ async fn take_leadership(
     }
 }
 
-async fn list_sessions(State(state): State<AdminState>) -> Json<Vec<SessionInfo>> {
-    Json(state.registry.list())
+/// A session enriched with the authenticated user's name. The registry only
+/// tracks the opaque `principal_id`; operators want the human-readable user, so
+/// we resolve it against the catalog here (the registry has no catalog handle).
+#[derive(serde::Serialize)]
+struct SessionView {
+    #[serde(flatten)]
+    info: SessionInfo,
+    /// Resolved name for `principal_id`, or `None` if the principal is anonymous
+    /// (pre-authentication) or no longer in the catalog.
+    user_name: Option<String>,
+}
+
+async fn list_sessions(State(state): State<AdminState>) -> Json<Vec<SessionView>> {
+    let views = state
+        .registry
+        .list()
+        .into_iter()
+        .map(|info| {
+            let user_name = state
+                .catalog
+                .get_principal_by_id(info.principal_id)
+                .ok()
+                .map(|p| p.name);
+            SessionView { info, user_name }
+        })
+        .collect();
+    Json(views)
 }
 
 // ---------------------------------------------------------------------------

@@ -70,6 +70,8 @@ async fn admin_session_api_lists_and_kills() {
     let arr = sessions.as_array().unwrap();
     assert_eq!(arr.len(), 1);
     let id = arr[0]["session_id"].as_str().unwrap().to_string();
+    // The authenticated principal is surfaced by name, not just its opaque id.
+    assert_eq!(arr[0]["user_name"].as_str(), Some("nodus"));
 
     let killed: bool = http
         .post(format!("{base}/api/v1/sessions/{id}/kill"))
