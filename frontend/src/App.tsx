@@ -10,9 +10,9 @@ function App() {
 
   const fetchOverview = async () => {
     try {
-      const response = await fetch(
-        'http://127.0.0.1:8088/api/v1/cluster/overview',
-      )
+      // Relative path: served same-origin in production and proxied to the
+      // backend by the Vite dev server (see vite.config.ts).
+      const response = await fetch('/api/v1/cluster/overview')
       if (!response.ok) {
         throw new Error(`HTTP error! status: ${response.status}`)
       }
