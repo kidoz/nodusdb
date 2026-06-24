@@ -405,6 +405,55 @@ impl MemExecutor {
         Ok(rows)
     }
 
+    /// Merges the session's uncommitted overlay into committed equality
+    /// index-scan results, keyed by primary key (the first column). This lets an
+    /// equality lookup use the index *inside* a transaction instead of falling
+    /// back to a full table scan, while staying consistent with the txn's own
+    /// pending writes. Rows are keyed by `render(first column)`, matching the
+    /// `{table_id}:{pk}` overlay-key convention.
+    pub(crate) fn merge_overlay_eq(
+        &self,
+        committed: Vec<Vec<Value>>,
+        table_id: TableId,
+        col_pos: Option<usize>,
+        val: &Value,
+        session: &str,
+    ) -> Vec<Vec<Value>> {
+        let mut map: std::collections::BTreeMap<String, Vec<Value>> = committed
+            .into_iter()
+            .map(|r| (r.first().map(render).unwrap_or_default(), r))
+            .collect();
+        if let Some(txn) = self.active_txns.read().unwrap().get(session) {
+            let start = format!("{}:", table_id);
+            let end = format!("{};", table_id);
+            for (key, value) in &txn.overlay {
+                if key < &start || key >= &end {
+                    continue;
+                }
+                let pk = key.strip_prefix(&start).unwrap_or(key).to_string();
+                match value {
+                    None => {
+                        map.remove(&pk);
+                    }
+                    Some(encoded) => {
+                        if let Ok(row) = serde_json::from_str::<Vec<Value>>(encoded) {
+                            let matches = col_pos
+                                .and_then(|p| row.get(p))
+                                .map(|cv| compare(cv, val) == std::cmp::Ordering::Equal)
+                                .unwrap_or(false);
+                            if matches {
+                                map.insert(pk, row);
+                            } else {
+                                map.remove(&pk);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        map.into_values().collect()
+    }
+
     /// Writes a row value at `key`, using the session's txn.
     pub(crate) fn write_row(&self, session: &str, key: String, value: String) -> Result<()> {
         let txn_id = self.txn_for(session)?;

@@ -107,29 +107,31 @@ impl MemExecutor {
                     .collect();
 
                 let mut rows = None;
-                let has_session_overlay = self
-                    .active_txns
-                    .read()
-                    .unwrap()
-                    .get(&ctx.session_id)
-                    .map(|txn| !txn.overlay.is_empty())
-                    .unwrap_or(false);
-                if !has_session_overlay
-                    && let Some(FilterExpr::Predicate(Predicate {
-                        left,
-                        op: CompareOp::Eq,
-                        right,
-                    })) = filter.as_ref()
+                // Equality on an indexed column uses the index. The session's
+                // uncommitted overlay is merged into the result, so the index is
+                // usable inside a transaction rather than forcing a full scan.
+                if let Some(FilterExpr::Predicate(Predicate {
+                    left,
+                    op: CompareOp::Eq,
+                    right,
+                })) = filter.as_ref()
                 {
                     let col_name = left.split('.').last().unwrap_or(left);
                     if let Some(col) = tbl.columns.iter().find(|c| c.name == *col_name) {
+                        let col_pos = tbl.columns.iter().position(|c| c.id == col.id);
                         for idx in &tbl.indexes {
                             if idx.key_columns.iter().any(|kc| kc.column_id == col.id) {
                                 let val = self.eval_operand(&[], &[], &[], right, &col.data_type);
                                 if let Ok(indexed_rows) =
                                     self.index_scan(idx.id, &val, tbl.id, &ctx.session_id)
                                 {
-                                    rows = Some(indexed_rows);
+                                    rows = Some(self.merge_overlay_eq(
+                                        indexed_rows,
+                                        tbl.id,
+                                        col_pos,
+                                        &val,
+                                        &ctx.session_id,
+                                    ));
                                     break;
                                 }
                             }

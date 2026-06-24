@@ -532,3 +532,62 @@ fn test_general_case() {
     );
     assert_eq!(res, vec!["1,low", "2,mid", "3,high"]);
 }
+
+#[test]
+fn test_index_overlay_merge() {
+    let (exec, cat) = MemExecutor::shared(Arc::new(MemoryAuditSink::new()));
+    let admin = cat
+        .create_role(nodus_catalog::CreateRoleRequest {
+            id: nodus_catalog::PrincipalId::new(),
+            name: "admin".into(),
+            principal_type: nodus_catalog::PrincipalType::User,
+            database_id: None,
+        })
+        .unwrap();
+    cat.grant_privilege(nodus_catalog::GrantPrivilegeRequest {
+        id: nodus_catalog::GrantId::new(),
+        principal_id: admin.id,
+        resource: nodus_catalog::ResourceRef::System,
+        privilege: "ALL".into(),
+    })
+    .unwrap();
+    let ctx = test_ctx(admin.id);
+    let exec_sql = |sql: &str| {
+        let mut stmts = nodus_sql::parse_sql(sql).unwrap();
+        let plan = plan_statement(&stmts.remove(0), &[]).unwrap();
+        exec.execute_logical(&ctx, plan).unwrap()
+    };
+    let query = |sql: &str| {
+        let mut stmts = nodus_sql::parse_sql(sql).unwrap();
+        let plan = plan_statement(&stmts.remove(0), &[]).unwrap();
+        let out = exec.execute_logical(&ctx, plan).unwrap();
+        let mut r: Vec<String> = out
+            .rows
+            .iter()
+            .map(|row| render_row(row).join(","))
+            .collect();
+        r.sort();
+        r
+    };
+
+    exec_sql("CREATE TABLE t (id INT, n INT)");
+    exec_sql("CREATE INDEX idx_n ON t (n)");
+    exec_sql("INSERT INTO t (id, n) VALUES (1, 10)");
+    exec_sql("INSERT INTO t (id, n) VALUES (2, 20)");
+
+    // Outside a transaction: equality lookup hits the index.
+    assert_eq!(query("SELECT id FROM t WHERE n = 10"), vec!["1"]);
+
+    // Inside a transaction, the overlay must merge with the index result.
+    exec_sql("BEGIN");
+    exec_sql("INSERT INTO t (id, n) VALUES (3, 10)"); // overlay row matching n=10
+    assert_eq!(
+        query("SELECT id FROM t WHERE n = 10"),
+        vec!["1", "3"],
+        "index lookup inside a txn sees the uncommitted overlay row"
+    );
+    exec_sql("COMMIT");
+
+    // After commit, the row is durably visible via the index.
+    assert_eq!(query("SELECT id FROM t WHERE n = 10"), vec!["1", "3"]);
+}
