@@ -65,6 +65,71 @@ enum Commands {
         #[command(subcommand)]
         cmd: NodeCmd,
     },
+    /// Manage roles and users
+    Role {
+        #[command(subcommand)]
+        cmd: RoleCmd,
+    },
+    /// Manage privilege grants
+    Grant {
+        #[command(subcommand)]
+        cmd: GrantCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum RoleCmd {
+    /// List roles and users
+    List {
+        #[arg(long, default_value = DEFAULT_ADDR)]
+        addr: String,
+    },
+    /// Create a role
+    Create {
+        #[arg(long)]
+        name: String,
+        #[arg(long, default_value = DEFAULT_ADDR)]
+        addr: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum GrantCmd {
+    /// List privilege grants
+    List {
+        #[arg(long, default_value = DEFAULT_ADDR)]
+        addr: String,
+    },
+    /// Grant a privilege on a table to a principal
+    Add {
+        #[arg(long)]
+        principal: String,
+        #[arg(long)]
+        privilege: String,
+        #[arg(long, default_value = "default")]
+        database: String,
+        #[arg(long, default_value = "public")]
+        schema: String,
+        #[arg(long)]
+        table: String,
+        #[arg(long, default_value = DEFAULT_ADDR)]
+        addr: String,
+    },
+    /// Revoke a privilege on a table from a principal
+    Revoke {
+        #[arg(long)]
+        principal: String,
+        #[arg(long)]
+        privilege: String,
+        #[arg(long, default_value = "default")]
+        database: String,
+        #[arg(long, default_value = "public")]
+        schema: String,
+        #[arg(long)]
+        table: String,
+        #[arg(long, default_value = DEFAULT_ADDR)]
+        addr: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -506,6 +571,121 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let v: serde_json::Value = client
                 .post(format!("{addr}/api/v1/node/drain"))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&v)?);
+        }
+        Commands::Role {
+            cmd: RoleCmd::List { addr },
+        } => {
+            let roles: serde_json::Value = client
+                .get(format!("{addr}/api/v1/roles"))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            let empty = vec![];
+            let arr = roles.as_array().unwrap_or(&empty);
+            if arr.is_empty() {
+                println!("No roles.");
+            }
+            for r in arr {
+                println!(
+                    "{}  type={}  id={}",
+                    r["name"].as_str().unwrap_or("?"),
+                    r["type"].as_str().unwrap_or("?"),
+                    r["id"].as_str().unwrap_or("?"),
+                );
+            }
+        }
+        Commands::Role {
+            cmd: RoleCmd::Create { name, addr },
+        } => {
+            let v: serde_json::Value = client
+                .post(format!("{addr}/api/v1/roles"))
+                .json(&serde_json::json!({ "name": name }))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&v)?);
+        }
+        Commands::Grant {
+            cmd: GrantCmd::List { addr },
+        } => {
+            let grants: serde_json::Value = client
+                .get(format!("{addr}/api/v1/grants"))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            let empty = vec![];
+            let arr = grants.as_array().unwrap_or(&empty);
+            if arr.is_empty() {
+                println!("No grants.");
+            }
+            for g in arr {
+                println!(
+                    "{} ON {} TO {}",
+                    g["privilege"].as_str().unwrap_or("?"),
+                    g["resource"].as_str().unwrap_or("?"),
+                    g["principal"].as_str().unwrap_or("?"),
+                );
+            }
+        }
+        Commands::Grant {
+            cmd:
+                GrantCmd::Add {
+                    principal,
+                    privilege,
+                    database,
+                    schema,
+                    table,
+                    addr,
+                },
+        } => {
+            let v: serde_json::Value = client
+                .post(format!("{addr}/api/v1/grants"))
+                .json(&serde_json::json!({
+                    "principal": principal,
+                    "privilege": privilege,
+                    "database": database,
+                    "schema": schema,
+                    "table": table,
+                }))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&v)?);
+        }
+        Commands::Grant {
+            cmd:
+                GrantCmd::Revoke {
+                    principal,
+                    privilege,
+                    database,
+                    schema,
+                    table,
+                    addr,
+                },
+        } => {
+            let v: serde_json::Value = client
+                .delete(format!("{addr}/api/v1/grants"))
+                .json(&serde_json::json!({
+                    "principal": principal,
+                    "privilege": privilege,
+                    "database": database,
+                    "schema": schema,
+                    "table": table,
+                }))
                 .send()
                 .await?
                 .error_for_status()?

@@ -24,6 +24,17 @@ pub trait CatalogReader: Send + Sync {
     /// grants made either directly to a principal or to any of its roles.
     fn get_effective_principals(&self, principal: PrincipalId) -> Result<Vec<PrincipalId>>;
 
+    /// Lists every principal (users and roles) for admin inspection. Default is
+    /// empty for readers that don't model principals.
+    fn list_principals(&self) -> Result<Vec<PrincipalDescriptor>> {
+        Ok(Vec::new())
+    }
+
+    /// Lists every privilege grant for admin inspection. Default is empty.
+    fn list_grants(&self) -> Result<Vec<GrantDescriptor>> {
+        Ok(Vec::new())
+    }
+
     /// Exports a serializable snapshot of catalog state for backups. Default is
     /// an empty snapshot.
     fn export_snapshot(&self) -> CatalogSnapshot {

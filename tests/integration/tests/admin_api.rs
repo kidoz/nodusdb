@@ -580,3 +580,95 @@ async fn admin_backup_pitr_restore() {
     let _ = std::fs::remove_dir_all(&data_dir);
     let _ = std::fs::remove_dir_all(&backup_dir);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_role_and_grant_api_round_trip() {
+    let server = TestServer::start().await.expect("server starts");
+    let base = format!("http://{}", server.http_addr);
+    let http = reqwest::Client::new();
+
+    // A table to grant on.
+    let client = connect(&server.pgwire_addr).await;
+    client
+        .simple_query("CREATE TABLE reports (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+
+    // Create a role.
+    let created: serde_json::Value = http
+        .post(format!("{base}/api/v1/roles"))
+        .json(&serde_json::json!({ "name": "analyst" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(created["created"], serde_json::json!(true));
+
+    // It shows up in the role list.
+    let roles: serde_json::Value = http
+        .get(format!("{base}/api/v1/roles"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        roles
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["name"] == serde_json::json!("analyst")),
+        "created role should be listed"
+    );
+
+    // Grant SELECT on the table to the role.
+    let grant_body = serde_json::json!({
+        "principal": "analyst",
+        "privilege": "SELECT",
+        "database": "default",
+        "schema": "public",
+        "table": "reports",
+    });
+    let granted: serde_json::Value = http
+        .post(format!("{base}/api/v1/grants"))
+        .json(&grant_body)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(granted["granted"], serde_json::json!(true));
+
+    // The grant is listed, resolved to the role + table names.
+    let grants: serde_json::Value = http
+        .get(format!("{base}/api/v1/grants"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        grants.as_array().unwrap().iter().any(|g| {
+            g["principal"] == serde_json::json!("analyst")
+                && g["privilege"] == serde_json::json!("SELECT")
+        }),
+        "grant should be listed with resolved principal name"
+    );
+
+    // Revoke it again.
+    let revoked: serde_json::Value = http
+        .delete(format!("{base}/api/v1/grants"))
+        .json(&grant_body)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(revoked["revoked"], serde_json::json!(true));
+}

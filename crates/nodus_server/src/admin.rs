@@ -65,6 +65,8 @@ async fn require_token(
         p if p.starts_with("/api/v1/sessions") => nodus_authz::Action::ManageSessions,
         p if p.starts_with("/api/v1/audit") => nodus_authz::Action::ReadAudit,
         p if p.starts_with("/api/v1/authz/explain") => nodus_authz::Action::ReadAudit,
+        p if p.starts_with("/api/v1/roles") => nodus_authz::Action::ManageGrants,
+        p if p.starts_with("/api/v1/grants") => nodus_authz::Action::ManageGrants,
         p if p.starts_with("/api/v1/backups") => nodus_authz::Action::ManageBackups,
         p if p.starts_with("/api/v1/upgrade") => nodus_authz::Action::ManageUpgrades,
         p if p.starts_with("/api/v1/shards") => nodus_authz::Action::ManageShards,
@@ -149,6 +151,11 @@ pub fn admin_routes(state: AdminState) -> Router {
         .route("/api/v1/sessions/:id/kill", post(kill_session))
         .route("/api/v1/audit", get(query_audit))
         .route("/api/v1/authz/explain", get(explain_authz))
+        .route("/api/v1/roles", get(list_roles).post(create_role))
+        .route(
+            "/api/v1/grants",
+            get(list_grants).post(create_grant).delete(revoke_grant),
+        )
         .route("/api/v1/backups", get(list_backups).post(create_backup))
         .route("/api/v1/backups/:id/verify", post(verify_backup))
         .route("/api/v1/backups/:id", axum::routing::delete(delete_backup))
@@ -308,6 +315,157 @@ async fn take_leadership(
 
 async fn list_sessions(State(state): State<AdminState>) -> Json<Vec<SessionInfo>> {
     Json(state.registry.list())
+}
+
+// ---------------------------------------------------------------------------
+// Role / grant management
+//
+// Mirrors the SQL `CREATE ROLE` / `GRANT` / `REVOKE` path through the same
+// catalog writer, so operators can manage RBAC from the CLI/admin API without a
+// SQL session. All routes require the `ManageGrants` privilege (see
+// `require_token`).
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Deserialize)]
+struct CreateRoleBody {
+    name: String,
+}
+
+#[derive(serde::Deserialize)]
+struct GrantBody {
+    principal: String,
+    privilege: String,
+    database: String,
+    schema: String,
+    table: String,
+}
+
+async fn list_roles(State(state): State<AdminState>) -> Json<Value> {
+    let principals = state.catalog.list_principals().unwrap_or_default();
+    let out: Vec<Value> = principals
+        .iter()
+        .map(|p| {
+            json!({
+                "id": p.id.to_string(),
+                "name": p.name,
+                "type": format!("{:?}", p.principal_type),
+            })
+        })
+        .collect();
+    Json(json!(out))
+}
+
+async fn create_role(
+    State(state): State<AdminState>,
+    Json(body): Json<CreateRoleBody>,
+) -> Json<Value> {
+    // Catalog writes route through Raft, whose `submit` blocks the calling
+    // thread; offload it so we don't block (and panic on) the async reactor.
+    let writer = state.catalog_writer.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        writer.create_role(nodus_catalog::CreateRoleRequest {
+            id: PrincipalId::new(),
+            name: body.name,
+            principal_type: nodus_catalog::PrincipalType::Role,
+            database_id: None,
+        })
+    })
+    .await;
+    match result {
+        Ok(Ok(p)) => Json(json!({ "created": true, "id": p.id.to_string(), "name": p.name })),
+        Ok(Err(e)) => Json(json!({ "created": false, "error": e.to_string() })),
+        Err(e) => Json(json!({ "created": false, "error": format!("task failed: {e}") })),
+    }
+}
+
+async fn list_grants(State(state): State<AdminState>) -> Json<Value> {
+    let grants = state.catalog.list_grants().unwrap_or_default();
+    let out: Vec<Value> = grants
+        .iter()
+        .map(|g| {
+            let principal = state
+                .catalog
+                .get_principal_by_id(g.principal_id)
+                .map(|p| p.name)
+                .unwrap_or_else(|_| g.principal_id.to_string());
+            let resource = match &g.resource {
+                ResourceRef::Table(id) => state
+                    .catalog
+                    .get_table_by_id(*id)
+                    .map(|t| format!("table {}", t.name))
+                    .unwrap_or_else(|_| format!("table {id}")),
+                other => format!("{other:?}"),
+            };
+            json!({
+                "id": g.id.to_string(),
+                "principal": principal,
+                "privilege": g.privilege,
+                "resource": resource,
+            })
+        })
+        .collect();
+    Json(json!(out))
+}
+
+/// Resolves the `(principal, table)` named in a grant request to their ids.
+fn resolve_grant_target(
+    state: &AdminState,
+    body: &GrantBody,
+) -> Result<(PrincipalId, TableId), String> {
+    let principal = state
+        .catalog
+        .get_principal_by_name(&body.principal)
+        .map_err(|e| e.to_string())?;
+    let table = state
+        .catalog
+        .get_table(&body.database, &body.schema, &body.table)
+        .map_err(|e| e.to_string())?;
+    Ok((principal.id, table.id))
+}
+
+async fn create_grant(State(state): State<AdminState>, Json(body): Json<GrantBody>) -> Json<Value> {
+    let (principal_id, table_id) = match resolve_grant_target(&state, &body) {
+        Ok(ids) => ids,
+        Err(e) => return Json(json!({ "granted": false, "error": e })),
+    };
+    let writer = state.catalog_writer.clone();
+    let privilege = body.privilege.to_uppercase();
+    let result = tokio::task::spawn_blocking(move || {
+        writer.grant_privileges(nodus_catalog::GrantPrivilegesRequest {
+            id: nodus_catalog::GrantId::new(),
+            principal_id,
+            resource: ResourceRef::Table(table_id),
+            privilege,
+        })
+    })
+    .await;
+    match result {
+        Ok(Ok(g)) => Json(json!({ "granted": true, "id": g.id.to_string() })),
+        Ok(Err(e)) => Json(json!({ "granted": false, "error": e.to_string() })),
+        Err(e) => Json(json!({ "granted": false, "error": format!("task failed: {e}") })),
+    }
+}
+
+async fn revoke_grant(State(state): State<AdminState>, Json(body): Json<GrantBody>) -> Json<Value> {
+    let (principal_id, table_id) = match resolve_grant_target(&state, &body) {
+        Ok(ids) => ids,
+        Err(e) => return Json(json!({ "revoked": false, "error": e })),
+    };
+    let writer = state.catalog_writer.clone();
+    let privilege = body.privilege.to_uppercase();
+    let result = tokio::task::spawn_blocking(move || {
+        writer.revoke_privileges(nodus_catalog::RevokePrivilegesRequest {
+            principal_id,
+            resource: ResourceRef::Table(table_id),
+            privilege,
+        })
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => Json(json!({ "revoked": true })),
+        Ok(Err(e)) => Json(json!({ "revoked": false, "error": e.to_string() })),
+        Err(e) => Json(json!({ "revoked": false, "error": format!("task failed: {e}") })),
+    }
 }
 
 async fn kill_session(State(state): State<AdminState>, Path(id): Path<String>) -> Json<bool> {

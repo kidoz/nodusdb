@@ -294,6 +294,21 @@ impl CatalogReader for MemoryCatalog {
             .collect())
     }
 
+    fn list_principals(&self) -> Result<Vec<PrincipalDescriptor>> {
+        Ok(self.principals.read().unwrap().values().cloned().collect())
+    }
+
+    fn list_grants(&self) -> Result<Vec<GrantDescriptor>> {
+        Ok(self
+            .grants
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|g| g.state == DescriptorState::Public)
+            .cloned()
+            .collect())
+    }
+
     fn get_grant_by_id(&self, id: GrantId) -> Result<GrantDescriptor> {
         let guard = self.grants.read().unwrap();
         guard
