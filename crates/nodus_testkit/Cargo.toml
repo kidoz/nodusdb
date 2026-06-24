@@ -19,8 +19,9 @@ nodus_server = { path = "../nodus_server" }
 nodus_security = { path = "../nodus_security" }
 nodus_config = { path = "../nodus_config" }
 madsim = "0.2.34"
+serde_json.workspace = true
+tempfile = "3.27.0"
 
 [dev-dependencies]
 madsim = "0.2.34"
 porcupine-rs = "0.3.0"
-serde_json.workspace = true

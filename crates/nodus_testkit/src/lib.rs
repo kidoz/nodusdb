@@ -1,5 +1,6 @@
 #![allow(clippy::collapsible_if)]
 
+pub mod cluster;
 pub mod fault;
 
 use nodus_security::SessionRegistry;
