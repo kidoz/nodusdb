@@ -140,6 +140,57 @@ pub(crate) fn parse_simple_case_when_eq(
     })
 }
 
+/// Parses a searched or simple `CASE` into a general multi-branch projection.
+/// Simple `CASE x WHEN v` becomes the predicate `x = v`; searched `CASE WHEN
+/// <pred>` parses the predicate directly. Branches whose predicate can't be
+/// parsed are skipped.
+pub(crate) fn parse_case(
+    expr: &sqlparser::ast::Expr,
+    alias: Option<String>,
+    params: &[Value],
+) -> Option<ProjectionItem> {
+    use sqlparser::ast::Expr;
+    let Expr::Case {
+        operand,
+        conditions,
+        results,
+        else_result,
+    } = expr
+    else {
+        return None;
+    };
+    let mut branches = Vec::new();
+    for (cond, res) in conditions.iter().zip(results.iter()) {
+        let pred = match operand {
+            // Simple CASE: `operand = cond`.
+            Some(op_expr) => Predicate {
+                left: extract_col_name(op_expr)?,
+                op: CompareOp::Eq,
+                right: extract_operand(cond, params)?,
+            },
+            // Searched CASE: `cond` is a single-comparison predicate.
+            None => match parse_filter_expr(cond, params)? {
+                FilterExpr::Predicate(p) => p,
+                _ => return None,
+            },
+        };
+        let then = extract_operand(res, params)?;
+        branches.push((pred, then));
+    }
+    if branches.is_empty() {
+        return None;
+    }
+    let else_result = match else_result {
+        Some(e) => extract_operand(e, params),
+        None => None,
+    };
+    Some(ProjectionItem::Case {
+        branches,
+        else_result,
+        alias,
+    })
+}
+
 pub(crate) fn extract_operand(expr: &sqlparser::ast::Expr, params: &[Value]) -> Option<Operand> {
     use sqlparser::ast::Expr;
     match expr {

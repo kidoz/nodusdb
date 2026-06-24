@@ -492,3 +492,43 @@ fn test_index_ddl() {
     // DROP INDEX IF EXISTS on missing -> ok
     run("DROP INDEX IF EXISTS idx_name").unwrap();
 }
+
+#[test]
+fn test_general_case() {
+    let (exec, cat) = MemExecutor::shared(Arc::new(MemoryAuditSink::new()));
+    let admin = cat
+        .create_role(nodus_catalog::CreateRoleRequest {
+            id: nodus_catalog::PrincipalId::new(),
+            name: "admin".into(),
+            principal_type: nodus_catalog::PrincipalType::User,
+            database_id: None,
+        })
+        .unwrap();
+    cat.grant_privilege(nodus_catalog::GrantPrivilegeRequest {
+        id: nodus_catalog::GrantId::new(),
+        principal_id: admin.id,
+        resource: nodus_catalog::ResourceRef::System,
+        privilege: "ALL".into(),
+    })
+    .unwrap();
+    let ctx = test_ctx(admin.id);
+    let run = |sql: &str| {
+        let mut stmts = nodus_sql::parse_sql(sql).unwrap();
+        let plan = plan_statement(&stmts.remove(0), &[]).unwrap();
+        let out = exec.execute_logical(&ctx, plan).unwrap();
+        out.rows
+            .iter()
+            .map(|r| render_row(r).join(","))
+            .collect::<Vec<_>>()
+    };
+    run("CREATE TABLE t (id INT, n INT)");
+    run("INSERT INTO t (id, n) VALUES (1, 5)");
+    run("INSERT INTO t (id, n) VALUES (2, 15)");
+    run("INSERT INTO t (id, n) VALUES (3, 25)");
+
+    // Searched multi-branch CASE with ELSE.
+    let res = run(
+        "SELECT id, CASE WHEN n < 10 THEN 'low' WHEN n < 20 THEN 'mid' ELSE 'high' END AS bucket FROM t ORDER BY id",
+    );
+    assert_eq!(res, vec!["1,low", "2,mid", "3,high"]);
+}

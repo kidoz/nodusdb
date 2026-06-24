@@ -305,7 +305,7 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
                         alias: None,
                     });
                 } else if let Expr::Case { .. } = expr {
-                    if let Some(case_projection) = parse_simple_case_when_eq(expr, None, params) {
+                    if let Some(case_projection) = parse_case(expr, None, params) {
                         projection.push(case_projection);
                     } else {
                         projection.push(ProjectionItem::Literal(crate::Value::Null));
@@ -428,7 +428,7 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
                     });
                 } else if let Expr::Case { .. } = expr {
                     if let Some(case_projection) =
-                        parse_simple_case_when_eq(expr, Some(alias.value.clone()), params)
+                        parse_case(expr, Some(alias.value.clone()), params)
                     {
                         projection.push(case_projection);
                     } else {

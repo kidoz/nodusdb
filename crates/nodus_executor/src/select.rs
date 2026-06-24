@@ -363,7 +363,8 @@ impl MemExecutor {
                         ProjectionItem::WindowFunction { .. }
                         | ProjectionItem::ScalarFunction { .. }
                         | ProjectionItem::JsonAccess { .. }
-                        | ProjectionItem::CaseWhenEq { .. } => {
+                        | ProjectionItem::CaseWhenEq { .. }
+                        | ProjectionItem::Case { .. } => {
                             out_row.push(Value::Null); // MVP fallback
                         }
                         ProjectionItem::Aggregate(op, inner) => {
@@ -407,6 +408,9 @@ impl MemExecutor {
                                 .unwrap_or(else_column)
                                 .to_string()
                         }),
+                        ProjectionItem::Case { alias, .. } => {
+                            alias.clone().unwrap_or_else(|| "case".to_string())
+                        }
                         ProjectionItem::Aggregate(op, inner) => {
                             format!("{:?}({})", op, inner)
                         }
@@ -835,6 +839,43 @@ impl MemExecutor {
                                             .cloned()
                                             .unwrap_or(Value::Null)
                                     }
+                                }
+                                ProjectionItem::Case {
+                                    branches,
+                                    else_result,
+                                    ..
+                                } => {
+                                    let matched = branches.iter().find_map(|(pred, then)| {
+                                        let hit = self.eval_filter(
+                                            ctx,
+                                            &r,
+                                            &col_names,
+                                            &joined_columns,
+                                            Some(&FilterExpr::Predicate(pred.clone())),
+                                        ) == Some(true);
+                                        hit.then(|| {
+                                            self.eval_operand(
+                                                &r,
+                                                &col_names,
+                                                &joined_columns,
+                                                then,
+                                                "VARCHAR",
+                                            )
+                                        })
+                                    });
+                                    matched
+                                        .or_else(|| {
+                                            else_result.as_ref().map(|o| {
+                                                self.eval_operand(
+                                                    &r,
+                                                    &col_names,
+                                                    &joined_columns,
+                                                    o,
+                                                    "VARCHAR",
+                                                )
+                                            })
+                                        })
+                                        .unwrap_or(Value::Null)
                                 }
                                 _ => indices[pi]
                                     .and_then(|idx| r.get(idx))

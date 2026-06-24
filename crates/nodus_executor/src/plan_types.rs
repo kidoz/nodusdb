@@ -26,7 +26,7 @@ pub enum CompareOp {
 }
 
 /// A single `left <op> right` predicate; a `WHERE` clause or `ON` clause is a conjunction.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Predicate {
     pub left: String,
     pub op: CompareOp,
@@ -106,6 +106,16 @@ pub enum ProjectionItem {
         then_value: crate::Value,
         then_column: Option<String>,
         else_column: String,
+        alias: Option<String>,
+    },
+    /// Searched or simple `CASE`: the first branch whose predicate matches yields
+    /// its result; otherwise `else_result` (or NULL). Results are literals or
+    /// column references.
+    Case {
+        /// Each `(predicate, result)`: the first matching predicate's result is
+        /// used. Predicates are single comparisons (the common CASE shape).
+        branches: Vec<(Predicate, Operand)>,
+        else_result: Option<Operand>,
         alias: Option<String>,
     },
     WindowFunction {
