@@ -247,3 +247,59 @@ fn test_set_operations() {
         "multiset diff: a has two 2s, b has one -> one 2 remains; 1 remains"
     );
 }
+
+#[test]
+fn test_cross_join() {
+    let (exec, cat) = MemExecutor::shared(Arc::new(MemoryAuditSink::new()));
+    let admin = cat
+        .create_role(nodus_catalog::CreateRoleRequest {
+            id: nodus_catalog::PrincipalId::new(),
+            name: "admin".into(),
+            principal_type: nodus_catalog::PrincipalType::User,
+            database_id: None,
+        })
+        .unwrap();
+    cat.grant_privilege(nodus_catalog::GrantPrivilegeRequest {
+        id: nodus_catalog::GrantId::new(),
+        principal_id: admin.id,
+        resource: nodus_catalog::ResourceRef::System,
+        privilege: "ALL".into(),
+    })
+    .unwrap();
+    let ctx = test_ctx(admin.id);
+
+    for (t, col) in [("a", "n"), ("b", "m")] {
+        exec.execute_logical(
+            &ctx,
+            LogicalPlan::CreateTable {
+                constraints: vec![],
+                name: t.into(),
+                columns: cols(&[("id", "int"), (col, "text")]),
+            },
+        )
+        .unwrap();
+    }
+    let insert = |t: &str, id: &str, v: &str| {
+        exec.execute_logical(
+            &ctx,
+            LogicalPlan::Insert {
+                table_name: t.into(),
+                columns: vec![],
+                values_list: vec![vec![Value::Text(id.into()), Value::Text(v.into())]],
+                returning: vec![],
+            },
+        )
+        .unwrap();
+    };
+    insert("a", "1", "x");
+    insert("a", "2", "y");
+    insert("b", "1", "p");
+    insert("b", "2", "q");
+
+    let mut stmts = nodus_sql::parse_sql("SELECT a.n, b.m FROM a CROSS JOIN b").unwrap();
+    let plan = plan_statement(&stmts.remove(0), &[]).unwrap();
+    let out = exec.execute_logical(&ctx, plan).unwrap();
+    let mut res: Vec<String> = out.rows.iter().map(|r| render_row(r).join("-")).collect();
+    res.sort();
+    assert_eq!(res, vec!["x-p", "x-q", "y-p", "y-q"]);
+}

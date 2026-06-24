@@ -918,6 +918,7 @@ fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Result<Logical
             JoinOperator::FullOuter(JoinConstraint::On(expr)) => {
                 (JoinType::FullOuter, parse_filter_expr(expr, params))
             }
+            JoinOperator::CrossJoin => (JoinType::Cross, None),
             other => anyhow::bail!("Unsupported join operator: {:?}", other),
         };
         joins.push(crate::Join {

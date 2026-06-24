@@ -64,6 +64,8 @@ pub enum JoinType {
     LeftOuter,
     RightOuter,
     FullOuter,
+    /// Cartesian product (`CROSS JOIN`); carries no `ON` condition.
+    Cross,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
