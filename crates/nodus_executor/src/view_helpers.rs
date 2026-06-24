@@ -227,6 +227,10 @@ impl MemExecutor {
                 | "pg_operator"
                 | "pg_cast"
                 | "pg_locks"
+                | "pg_timezone_names"
+                | "pg_auth_members"
+                | "pg_tablespace"
+                | "pg_event_trigger"
         )
     }
 

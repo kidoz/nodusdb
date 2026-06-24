@@ -363,3 +363,49 @@ async fn test_pg_locks_reports_explicit_transactions_only() {
         "pg_locks should be empty after COMMIT"
     );
 }
+
+/// IDE/driver introspection (DataGrip/pgjdbc) probes several `pg_catalog`
+/// relations NodusDB does not model. They must resolve (not error with 42P01):
+/// the standard tablespaces and the UTC timezone are advertised; role
+/// membership and event triggers are present but empty.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_pg_catalog_introspection_relations_resolve() {
+    let server = TestServer::start().await.expect("server starts");
+    let client = connect(&server).await;
+
+    // These exist with their two/one built-in rows.
+    let msgs = client
+        .simple_query("SELECT spcname FROM pg_catalog.pg_tablespace ORDER BY oid;")
+        .await
+        .expect("pg_tablespace resolves");
+    let rows = rows_of(&msgs);
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].get(0), Some("pg_default"));
+    assert_eq!(rows[1].get(0), Some("pg_global"));
+
+    let msgs = client
+        .simple_query("SELECT name, utc_offset FROM pg_catalog.pg_timezone_names;")
+        .await
+        .expect("pg_timezone_names resolves");
+    let rows = rows_of(&msgs);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get(0), Some("UTC"));
+
+    // These resolve but are empty.
+    for (query, table) in [
+        (
+            "SELECT roleid, member FROM pg_catalog.pg_auth_members;",
+            "pg_auth_members",
+        ),
+        (
+            "SELECT evtname, evtevent FROM pg_catalog.pg_event_trigger;",
+            "pg_event_trigger",
+        ),
+    ] {
+        let msgs = client
+            .simple_query(query)
+            .await
+            .unwrap_or_else(|e| panic!("{table} should resolve, got: {e}"));
+        assert_eq!(rows_of(&msgs).len(), 0, "{table} should be empty");
+    }
+}

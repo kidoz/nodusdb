@@ -530,6 +530,79 @@ impl MemExecutor {
             "pg_operator" => Some(self.pg_operator_virtual_table(db_name)),
             "pg_cast" => Some(self.pg_cast_virtual_table()),
             "pg_locks" => Some(self.pg_locks_virtual_table(db_name)),
+            // The relations below exist so IDE/driver introspection
+            // (DataGrip/pgjdbc) can join them without erroring. NodusDB does not
+            // model these concepts yet, so they are presented with their real
+            // shape and (mostly) zero rows.
+            //
+            // Timezone catalog: NodusDB operates in UTC, so advertise just that.
+            "pg_timezone_names" => Some((
+                Self::virtual_columns(&[
+                    ("name", "TEXT"),
+                    ("abbrev", "TEXT"),
+                    ("utc_offset", "TEXT"),
+                    ("is_dst", "BOOL"),
+                ]),
+                vec![vec![
+                    Value::Text("UTC".into()),
+                    Value::Text("UTC".into()),
+                    Value::Text("00:00:00".into()),
+                    Value::Bool(false),
+                ]],
+            )),
+            // Role membership graph: no role-in-role membership is modeled yet.
+            "pg_auth_members" => Some((
+                Self::virtual_columns(&[
+                    ("oid", "OID"),
+                    ("roleid", "OID"),
+                    ("member", "OID"),
+                    ("grantor", "OID"),
+                    ("admin_option", "BOOL"),
+                    ("inherit_option", "BOOL"),
+                    ("set_option", "BOOL"),
+                ]),
+                Vec::new(),
+            )),
+            // Tablespaces: NodusDB has no user tablespaces, but the two built-in
+            // ones always exist in PostgreSQL and some tools assume them.
+            "pg_tablespace" => Some((
+                Self::virtual_columns(&[
+                    ("oid", "OID"),
+                    ("spcname", "NAME"),
+                    ("spcowner", "OID"),
+                    ("spcacl", "TEXT"),
+                    ("spcoptions", "TEXT"),
+                ]),
+                vec![
+                    vec![
+                        Value::Int(1663),
+                        Value::Text("pg_default".into()),
+                        Value::Int(10),
+                        Value::Null,
+                        Value::Null,
+                    ],
+                    vec![
+                        Value::Int(1664),
+                        Value::Text("pg_global".into()),
+                        Value::Int(10),
+                        Value::Null,
+                        Value::Null,
+                    ],
+                ],
+            )),
+            // Event triggers are not supported.
+            "pg_event_trigger" => Some((
+                Self::virtual_columns(&[
+                    ("oid", "OID"),
+                    ("evtname", "NAME"),
+                    ("evtevent", "NAME"),
+                    ("evtowner", "OID"),
+                    ("evtfoid", "OID"),
+                    ("evtenabled", "PG_CHAR"),
+                    ("evttags", "TEXT"),
+                ]),
+                Vec::new(),
+            )),
             _ => None,
         };
         Ok(result)
