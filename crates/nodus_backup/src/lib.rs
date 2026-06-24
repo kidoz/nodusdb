@@ -14,7 +14,7 @@ pub struct ObjectMetadata {
     pub last_modified: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct PutOptions {
     pub content_type: Option<String>,
 }

@@ -55,7 +55,56 @@ mod tests {
         assert_eq!(spans[0].name.as_ref(), "unit-span");
     }
 
-    /// Exercises real OTLP export; ignored unless a collector is reachable:
+    /// Verifies the OTLP/HTTP export network path end-to-end in CI by standing up
+    /// a tiny in-process collector and asserting it actually receives the
+    /// exported span batch — no external collector required.
+    ///
+    /// Multi-threaded on purpose: `force_flush` blocks the calling thread until
+    /// the batch processor drains, which would deadlock a single-threaded
+    /// runtime that also has to run that processor.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn otlp_export_reaches_in_process_collector() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // A catch-all handler counts every POST the exporter makes (the path is
+        // `/v1/traces`, but matching anything keeps us robust to endpoint
+        // normalization).
+        let hits = Arc::new(AtomicUsize::new(0));
+        let handler_hits = hits.clone();
+        let app = axum::Router::new().fallback(move || {
+            let hits = handler_hits.clone();
+            async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                axum::http::StatusCode::OK
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let provider = init_otlp(&format!("http://{addr}")).unwrap();
+        {
+            let _span = start_span("otlp-span");
+        }
+        let _ = provider.force_flush();
+
+        // The export batch is delivered on a background task; give it a moment.
+        let mut received = false;
+        for _ in 0..50 {
+            if hits.load(Ordering::SeqCst) > 0 {
+                received = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(received, "OTLP collector never received an export");
+    }
+
+    /// Exercises real OTLP export against an external collector; ignored unless
+    /// one is reachable:
     /// `NODUS_OTLP_ENDPOINT=http://127.0.0.1:4318 cargo test -p nodus_telemetry -- --ignored`
     #[tokio::test]
     #[ignore = "requires a running OTLP collector"]

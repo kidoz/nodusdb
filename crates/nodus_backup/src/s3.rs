@@ -7,6 +7,7 @@ use bytes::Bytes;
 use chrono::Utc;
 use futures_util::StreamExt;
 use object_store::{ObjectStore, aws::AmazonS3Builder, path::Path as ObjPath};
+use std::sync::Arc;
 
 /// Connection settings for an S3-compatible object store.
 #[derive(Debug, Clone)]
@@ -21,7 +22,7 @@ pub struct S3Config {
 }
 
 pub struct S3BackupRepository {
-    store: object_store::aws::AmazonS3,
+    store: Arc<dyn ObjectStore>,
 }
 
 impl S3BackupRepository {
@@ -35,7 +36,16 @@ impl S3BackupRepository {
             .with_allow_http(true)
             .with_virtual_hosted_style_request(!cfg.path_style)
             .build()?;
-        Ok(Self { store })
+        Ok(Self {
+            store: Arc::new(store),
+        })
+    }
+
+    /// Builds a repository over any `object_store` backend. The S3 wire protocol
+    /// still needs a live endpoint, but this lets the repository's put/get/list/
+    /// delete logic run in CI against, e.g., `object_store::memory::InMemory`.
+    pub fn with_store(store: Arc<dyn ObjectStore>) -> Self {
+        Self { store }
     }
 }
 
@@ -103,6 +113,52 @@ mod tests {
     use super::*;
     use crate::BackupOrchestrator;
     use std::sync::Arc;
+
+    /// CI-runnable repository round-trip: drives the same `S3BackupRepository`
+    /// put/get/list/delete code the S3 path uses, but over an in-memory object
+    /// store so no network or MinIO is required. This keeps the repository logic
+    /// (and the full backup → verify → restore orchestration) covered in CI; the
+    /// ignored test below still exercises the real S3 wire protocol on demand.
+    #[tokio::test]
+    async fn s3_repository_round_trip_in_memory() {
+        let store = Arc::new(object_store::memory::InMemory::new());
+        let repo: Arc<dyn BackupRepository> = Arc::new(S3BackupRepository::with_store(store));
+
+        // Direct repository operations.
+        repo.put_object("a/b.txt", Bytes::from("hello"), PutOptions::default())
+            .await
+            .unwrap();
+        assert!(repo.object_exists("a/b.txt").await.unwrap());
+        assert_eq!(repo.get_object("a/b.txt", None).await.unwrap(), "hello");
+        // Range read.
+        assert_eq!(
+            repo.get_object("a/b.txt", Some(ByteRange { start: 1, end: 3 }))
+                .await
+                .unwrap(),
+            Bytes::from("ell")
+        );
+        assert_eq!(repo.list_objects("a/").await.unwrap().len(), 1);
+        repo.delete_object("a/b.txt").await.unwrap();
+        assert!(!repo.object_exists("a/b.txt").await.unwrap());
+
+        // The full orchestration (backup → verify → restore) over the same store.
+        let orch = BackupOrchestrator::new(repo);
+        let manifest = orch
+            .create_full_backup(
+                "cluster-1",
+                1,
+                1,
+                1,
+                vec![crate::BackupObject {
+                    name: "catalog".into(),
+                    bytes: Bytes::from("data"),
+                }],
+            )
+            .await
+            .unwrap();
+        orch.verify(&manifest.backup_id).await.unwrap();
+        assert_eq!(orch.restore(&manifest.backup_id).await.unwrap().len(), 1);
+    }
 
     /// End-to-end backup round-trip against a real MinIO/S3. Ignored by default;
     /// run with a configured endpoint:
