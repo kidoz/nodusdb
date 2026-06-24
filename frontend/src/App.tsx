@@ -6,6 +6,7 @@ function App() {
   const [overview, setOverview] = useState<ClusterOverview | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState<boolean>(true)
+  const [updatedAt, setUpdatedAt] = useState<Date | null>(null)
 
   const fetchOverview = async () => {
     try {
@@ -17,6 +18,7 @@ function App() {
       }
       const data = await response.json()
       setOverview(data)
+      setUpdatedAt(new Date())
       setError(null)
     } catch (error: unknown) {
       setError(error instanceof Error ? error.message : String(error))
@@ -31,7 +33,14 @@ function App() {
     return () => clearInterval(interval)
   }, [])
 
-  return <Dashboard overview={overview} loading={loading} error={error} />
+  return (
+    <Dashboard
+      overview={overview}
+      loading={loading}
+      error={error}
+      updatedAt={updatedAt}
+    />
+  )
 }
 
 export default App

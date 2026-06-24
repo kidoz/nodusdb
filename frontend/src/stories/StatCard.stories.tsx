@@ -5,10 +5,11 @@ const meta = {
   title: 'Components/StatCard',
   component: StatCard,
   args: {
-    label: 'Queries per second',
-    value: '842.4',
-    detail: 'current sample',
-    tone: 'neutral',
+    label: 'Queries / sec',
+    value: '1843.2',
+    detail: '▲ 4.1% vs 1h avg',
+    tone: 'healthy',
+    emphasis: false,
   },
   argTypes: {
     tone: {
@@ -30,11 +31,22 @@ type Story = StoryObj<typeof meta>
 
 export const Default: Story = {}
 
+export const Emphasis: Story = {
+  args: {
+    label: 'Active alerts',
+    value: 0,
+    detail: 'all checks passing',
+    tone: 'healthy',
+    emphasis: true,
+  },
+}
+
 export const Critical: Story = {
   args: {
     label: 'Active alerts',
     value: 3,
-    detail: 'requires review',
+    detail: 'needs attention',
     tone: 'critical',
+    emphasis: true,
   },
 }
