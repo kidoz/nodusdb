@@ -264,6 +264,51 @@ impl ClusterFixture {
         anyhow::bail!("could not connect to node {idx} pgwire")
     }
 
+    /// Single attempt to connect to node `idx` (no retry). Returns `None` if the
+    /// listener isn't accepting (e.g. the node is stopped).
+    async fn try_connect(&self, idx: usize) -> Option<tokio_postgres::Client> {
+        let conn_str = format!(
+            "host=127.0.0.1 port={} user=nodus password=nodus dbname=default",
+            self.nodes[idx].pgwire_port
+        );
+        match tokio_postgres::connect(&conn_str, tokio_postgres::NoTls).await {
+            Ok((client, connection)) => {
+                tokio::spawn(async move {
+                    let _ = connection.await;
+                });
+                Some(client)
+            }
+            Err(_) => None,
+        }
+    }
+
+    /// Runs `sql` against whichever of `candidates` is the current leader,
+    /// retrying until one accepts the write or `timeout` elapses. A write to a
+    /// non-leader is rejected fast (forward-to-leader), so this converges on the
+    /// node that won the election. Returns the leader's index on success.
+    ///
+    /// Used by failover tests: after the original leader is killed, the survivors
+    /// re-elect and exactly one starts accepting writes.
+    pub async fn write_on_any(
+        &self,
+        candidates: &[usize],
+        sql: &str,
+        timeout: Duration,
+    ) -> Option<usize> {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            for &idx in candidates {
+                if let Some(client) = self.try_connect(idx).await
+                    && client.simple_query(sql).await.is_ok()
+                {
+                    return Some(idx);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+        None
+    }
+
     /// Stops node `idx` (graceful shutdown), releasing its ports. The data dir is
     /// retained so a later [`Self::restart`] reuses it.
     pub async fn stop(&mut self, idx: usize) -> Result<()> {

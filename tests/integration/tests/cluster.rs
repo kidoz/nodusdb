@@ -131,3 +131,54 @@ async fn a_restarted_node_rejoins_and_recovers_its_data() {
         "the restarted node should recover the replicated write"
     );
 }
+
+/// Killing the leader does not lose committed data: the surviving majority
+/// re-elects a new leader that keeps serving, and the pre-failure write is still
+/// readable. This is the consensus payoff of the harness + durable log.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cluster_survives_leader_failure_and_reelects() {
+    let mut cluster = ClusterFixture::start(3)
+        .await
+        .expect("3-node cluster forms");
+    assert!(cluster.wait_nodes_live(3, Duration::from_secs(45)).await);
+
+    // Commit a row through the original leader (the seed, node 0).
+    let leader = cluster.pg_client(0).await.unwrap();
+    leader
+        .simple_query("CREATE TABLE f (id INT PRIMARY KEY, v TEXT)")
+        .await
+        .unwrap();
+    leader
+        .simple_query("INSERT INTO f (id, v) VALUES (1, 'before')")
+        .await
+        .unwrap();
+
+    // Kill the leader. The surviving two nodes (1, 2) are a majority and must
+    // re-elect; one of them starts accepting writes.
+    cluster.stop(0).await.unwrap();
+    let new_leader = cluster
+        .write_on_any(
+            &[1, 2],
+            "INSERT INTO f (id, v) VALUES (2, 'after')",
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("a surviving node should win the election and accept writes");
+
+    // The new leader serves both the pre-failure and post-failover rows — no
+    // committed data was lost across the leadership change.
+    let client = cluster.pg_client(new_leader).await.unwrap();
+    let mut rows = Vec::new();
+    for _ in 0..50 {
+        if let Ok(r) = client.query("SELECT v FROM f ORDER BY id", &[]).await
+            && r.len() == 2
+        {
+            rows = r;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert_eq!(rows.len(), 2, "both rows should be present after failover");
+    assert_eq!(rows[0].get::<_, String>(0), "before");
+    assert_eq!(rows[1].get::<_, String>(0), "after");
+}
