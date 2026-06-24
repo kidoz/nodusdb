@@ -82,3 +82,52 @@ async fn cluster_tolerates_a_follower_failure() {
     assert_eq!(rows[0].get::<_, String>(0), "a");
     assert_eq!(rows[1].get::<_, String>(0), "b");
 }
+
+/// A stopped node restarts from its data dir — durable Raft log/vote + KV +
+/// catalog — rejoins the cluster, and serves the data written while it was a
+/// member. This only works because the Raft log/vote/applied-state is durable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restarted_node_rejoins_and_recovers_its_data() {
+    let mut cluster = ClusterFixture::start(3)
+        .await
+        .expect("3-node cluster forms");
+    assert!(cluster.wait_nodes_live(3, Duration::from_secs(45)).await);
+
+    let leader = cluster.pg_client(0).await.unwrap();
+    leader
+        .simple_query("CREATE TABLE d (id INT PRIMARY KEY, v TEXT)")
+        .await
+        .unwrap();
+    leader
+        .simple_query("INSERT INTO d (id, v) VALUES (1, 'durable')")
+        .await
+        .unwrap();
+
+    // Restart a follower on its same ports + data directory.
+    cluster.stop(2).await.unwrap();
+    cluster.restart(2).await.unwrap();
+
+    // It rejoins (membership recovered from its durable Raft state)...
+    assert!(
+        cluster.wait_nodes_live(3, Duration::from_secs(60)).await,
+        "the restarted node should rejoin the cluster"
+    );
+
+    // ...and serves the replicated row (recovered or caught up after rejoin).
+    let rejoined = cluster.pg_client(2).await.unwrap();
+    let mut seen: Option<String> = None;
+    for _ in 0..75 {
+        if let Ok(rows) = rejoined.query("SELECT v FROM d WHERE id = 1", &[]).await
+            && let Some(row) = rows.first()
+        {
+            seen = Some(row.get::<_, String>(0));
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert_eq!(
+        seen.as_deref(),
+        Some("durable"),
+        "the restarted node should recover the replicated write"
+    );
+}

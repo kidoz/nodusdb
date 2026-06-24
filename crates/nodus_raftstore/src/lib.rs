@@ -3,7 +3,12 @@ use std::fmt::Debug;
 use std::io::Cursor;
 use std::ops::RangeBounds;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
+
+use bytes::Bytes;
+use nodus_storage_api::{KeyRange, KvEngine, TxnId};
 
 use openraft::storage::{LogState, RaftLogReader, RaftSnapshotBuilder, RaftStorage, Snapshot};
 use openraft::{
@@ -159,9 +164,148 @@ fn table_create_already_applied(
         })
 }
 
+// Reserved keys under which a group's Raft consensus state is persisted into its
+// `KvEngine`. The leading `\0` sorts them before any user/catalog/2PC key, and
+// `build_snapshot` excludes the whole `\0`-prefixed range from the data snapshot.
+const RAFT_VOTE_KEY: &[u8] = b"\x00raft\x00vote";
+const RAFT_APPLIED_KEY: &[u8] = b"\x00raft\x00applied";
+const RAFT_LOG_PREFIX: &[u8] = b"\x00raft\x00log\x00";
+const RAFT_LOG_END: &[u8] = b"\x00raft\x00log\x01";
+
+fn log_key(index: u64) -> Vec<u8> {
+    let mut key = RAFT_LOG_PREFIX.to_vec();
+    key.extend_from_slice(&index.to_be_bytes()); // big-endian: keys sort by index
+    key
+}
+
+/// The applied-state pointer persisted alongside the log: how far the state
+/// machine has applied, the membership at that point, and the purge watermark.
+#[derive(Serialize, Deserialize, Default, Clone)]
+struct AppliedState {
+    last_applied: Option<LogId<u64>>,
+    last_membership: StoredMembership<u64, openraft::BasicNode>,
+    last_purged: Option<LogId<u64>>,
+}
+
+/// Persists Raft vote, log entries, and applied-state into a `KvEngine` so a
+/// node's consensus state survives restart. Commit timestamps are wall-clock
+/// monotonic (`max(now, last + 1)`) so the newest write always wins even after a
+/// restart resets the in-memory counter — the same scheme the catalog store uses.
+struct RaftMetaStore {
+    kv: Arc<dyn KvEngine>,
+    last_ts: AtomicU64,
+}
+
+impl RaftMetaStore {
+    fn new(kv: Arc<dyn KvEngine>) -> Self {
+        Self {
+            kv,
+            last_ts: AtomicU64::new(0),
+        }
+    }
+
+    fn next_ts(&self) -> u64 {
+        let wall = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_micros() as u64)
+            .unwrap_or(0);
+        loop {
+            let last = self.last_ts.load(Ordering::SeqCst);
+            let next = wall.max(last + 1);
+            if self
+                .last_ts
+                .compare_exchange(last, next, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                return next;
+            }
+        }
+    }
+
+    fn put(&self, key: &[u8], value: Vec<u8>) {
+        let txn = TxnId::new();
+        if self
+            .kv
+            .write_intent(txn, Bytes::copy_from_slice(key), Bytes::from(value))
+            .is_ok()
+        {
+            let _ = self.kv.commit(txn, self.next_ts());
+        }
+    }
+
+    fn delete(&self, key: &[u8]) {
+        let txn = TxnId::new();
+        if self
+            .kv
+            .delete_intent(txn, Bytes::copy_from_slice(key))
+            .is_ok()
+        {
+            let _ = self.kv.commit(txn, self.next_ts());
+        }
+    }
+
+    fn save_vote(&self, vote: &Vote<u64>) {
+        if let Ok(bytes) = serde_json::to_vec(vote) {
+            self.put(RAFT_VOTE_KEY, bytes);
+        }
+    }
+
+    fn load_vote(&self) -> Option<Vote<u64>> {
+        self.kv
+            .get(RAFT_VOTE_KEY, u64::MAX)
+            .ok()
+            .flatten()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+    }
+
+    fn append_entry(&self, entry: &Entry<NodusTypeConfig>) {
+        if let Ok(bytes) = serde_json::to_vec(entry) {
+            self.put(&log_key(entry.log_id.index), bytes);
+        }
+    }
+
+    fn delete_entry(&self, index: u64) {
+        self.delete(&log_key(index));
+    }
+
+    fn load_log(&self) -> BTreeMap<u64, Entry<NodusTypeConfig>> {
+        let mut out = BTreeMap::new();
+        let range = KeyRange {
+            start: Bytes::from_static(RAFT_LOG_PREFIX),
+            end: Bytes::from_static(RAFT_LOG_END),
+        };
+        if let Ok(iter) = self.kv.scan(range, u64::MAX) {
+            for pair in iter.flatten() {
+                if let Ok(entry) = serde_json::from_slice::<Entry<NodusTypeConfig>>(&pair.value) {
+                    out.insert(entry.log_id.index, entry);
+                }
+            }
+        }
+        out
+    }
+
+    fn save_applied(&self, state: &AppliedState) {
+        if let Ok(bytes) = serde_json::to_vec(state) {
+            self.put(RAFT_APPLIED_KEY, bytes);
+        }
+    }
+
+    fn load_applied(&self) -> AppliedState {
+        self.kv
+            .get(RAFT_APPLIED_KEY, u64::MAX)
+            .ok()
+            .flatten()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default()
+    }
+}
+
 pub struct StateMachine {
     pub last_applied_log: Option<LogId<u64>>,
     pub last_membership: StoredMembership<u64, openraft::BasicNode>,
+    /// Log purge watermark; persisted so `get_log_state` reports it after a
+    /// restart even once the purged entries are gone.
+    pub last_purged: Option<LogId<u64>>,
     pub kv: Option<Arc<dyn nodus_storage_api::KvEngine>>,
     pub catalog_writer: Option<Arc<dyn nodus_catalog::CatalogWriter>>,
     pub catalog_reader: Option<Arc<dyn nodus_catalog::CatalogReader>>,
@@ -173,6 +317,10 @@ pub struct NodusRaftStore {
     pub log: Arc<RwLock<BTreeMap<u64, Entry<NodusTypeConfig>>>>,
     pub vote: Arc<RwLock<Option<Vote<u64>>>>,
     pub state_machine: Arc<RwLock<StateMachine>>,
+    /// Durable backing for log/vote/applied-state. `None` for the in-memory
+    /// store ([`Self::new`], used in unit tests); `Some` whenever a `KvEngine`
+    /// is provided, so consensus state survives restart.
+    meta: Option<Arc<RaftMetaStore>>,
 }
 
 impl Default for NodusRaftStore {
@@ -182,6 +330,7 @@ impl Default for NodusRaftStore {
 }
 
 impl NodusRaftStore {
+    /// In-memory store (no durability) — for tests and ephemeral groups.
     pub fn new() -> Self {
         Self {
             log: Arc::new(RwLock::new(BTreeMap::new())),
@@ -189,11 +338,42 @@ impl NodusRaftStore {
             state_machine: Arc::new(RwLock::new(StateMachine {
                 last_applied_log: None,
                 last_membership: StoredMembership::default(),
+                last_purged: None,
                 kv: None,
                 catalog_writer: None,
                 catalog_reader: None,
                 upgrade: None,
             })),
+            meta: None,
+        }
+    }
+
+    /// Builds a durable store over `kv`, **recovering** any previously persisted
+    /// vote, log, and applied-state so a restarted node resumes its term,
+    /// membership, and committed log.
+    fn with(
+        kv: Arc<dyn nodus_storage_api::KvEngine>,
+        catalog_writer: Option<Arc<dyn nodus_catalog::CatalogWriter>>,
+        catalog_reader: Option<Arc<dyn nodus_catalog::CatalogReader>>,
+        upgrade: Option<Arc<dyn nodus_upgrade::UpgradeCoordinator>>,
+    ) -> Self {
+        let meta = Arc::new(RaftMetaStore::new(kv.clone()));
+        let log = meta.load_log();
+        let vote = meta.load_vote();
+        let applied = meta.load_applied();
+        Self {
+            log: Arc::new(RwLock::new(log)),
+            vote: Arc::new(RwLock::new(vote)),
+            state_machine: Arc::new(RwLock::new(StateMachine {
+                last_applied_log: applied.last_applied,
+                last_membership: applied.last_membership,
+                last_purged: applied.last_purged,
+                kv: Some(kv),
+                catalog_writer,
+                catalog_reader,
+                upgrade,
+            })),
+            meta: Some(meta),
         }
     }
 
@@ -202,36 +382,14 @@ impl NodusRaftStore {
         catalog_writer: Arc<dyn nodus_catalog::CatalogWriter>,
         catalog_reader: Arc<dyn nodus_catalog::CatalogReader>,
     ) -> Self {
-        Self {
-            log: Arc::new(RwLock::new(BTreeMap::new())),
-            vote: Arc::new(RwLock::new(None)),
-            state_machine: Arc::new(RwLock::new(StateMachine {
-                last_applied_log: None,
-                last_membership: StoredMembership::default(),
-                kv: Some(kv),
-                catalog_writer: Some(catalog_writer),
-                catalog_reader: Some(catalog_reader),
-                upgrade: None,
-            })),
-        }
+        Self::with(kv, Some(catalog_writer), Some(catalog_reader), None)
     }
 
     /// Builds a store for a data shard: it applies only KV commands to its
     /// (namespaced) engine. Catalog/RBAC and upgrade commands are no-ops on a
     /// data group — those are owned by the meta group.
     pub fn with_kv(kv: Arc<dyn nodus_storage_api::KvEngine>) -> Self {
-        Self {
-            log: Arc::new(RwLock::new(BTreeMap::new())),
-            vote: Arc::new(RwLock::new(None)),
-            state_machine: Arc::new(RwLock::new(StateMachine {
-                last_applied_log: None,
-                last_membership: StoredMembership::default(),
-                kv: Some(kv),
-                catalog_writer: None,
-                catalog_reader: None,
-                upgrade: None,
-            })),
-        }
+        Self::with(kv, None, None, None)
     }
 
     pub fn with_components(
@@ -240,17 +398,23 @@ impl NodusRaftStore {
         catalog_reader: Arc<dyn nodus_catalog::CatalogReader>,
         upgrade: Arc<dyn nodus_upgrade::UpgradeCoordinator>,
     ) -> Self {
-        Self {
-            log: Arc::new(RwLock::new(BTreeMap::new())),
-            vote: Arc::new(RwLock::new(None)),
-            state_machine: Arc::new(RwLock::new(StateMachine {
-                last_applied_log: None,
-                last_membership: StoredMembership::default(),
-                kv: Some(kv),
-                catalog_writer: Some(catalog_writer),
-                catalog_reader: Some(catalog_reader),
-                upgrade: Some(upgrade),
-            })),
+        Self::with(
+            kv,
+            Some(catalog_writer),
+            Some(catalog_reader),
+            Some(upgrade),
+        )
+    }
+
+    /// Persists the current applied-state pointer (durable when backed by a
+    /// `KvEngine`; a no-op for the in-memory store).
+    fn persist_applied(&self, sm: &StateMachine) {
+        if let Some(meta) = &self.meta {
+            meta.save_applied(&AppliedState {
+                last_applied: sm.last_applied_log,
+                last_membership: sm.last_membership.clone(),
+                last_purged: sm.last_purged,
+            });
         }
     }
 }
@@ -281,8 +445,11 @@ impl RaftSnapshotBuilder<NodusTypeConfig> for NodusRaftStore {
 
         let mut kv_data = vec![];
         if let Some(kv) = &sm.kv {
+            // Start at 0x01 so the snapshot carries only user data, not the
+            // `\0`-prefixed reserved keys (Raft log/vote/applied, catalog state,
+            // 2PC records) — those are restored by their own mechanisms.
             let range = nodus_storage_api::KeyRange {
-                start: bytes::Bytes::new(),
+                start: bytes::Bytes::from_static(&[1]),
                 end: bytes::Bytes::from(vec![255u8; 1024]),
             };
             if let Ok(iter) = kv.scan(range, u64::MAX) {
@@ -318,6 +485,9 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
 
     async fn save_vote(&mut self, vote: &Vote<u64>) -> Result<(), StorageError<u64>> {
         *self.vote.write().await = Some(*vote);
+        if let Some(meta) = &self.meta {
+            meta.save_vote(vote);
+        }
         Ok(())
     }
 
@@ -326,11 +496,13 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
     }
 
     async fn get_log_state(&mut self) -> Result<LogState<NodusTypeConfig>, StorageError<u64>> {
-        let log = self.log.read().await;
-        let last = log.values().last().map(|e| e.log_id);
+        let last = self.log.read().await.values().last().map(|e| e.log_id);
+        let purged = self.state_machine.read().await.last_purged;
         Ok(LogState {
-            last_purged_log_id: None,
-            last_log_id: last,
+            last_purged_log_id: purged,
+            // After a restart that purged everything, the last log id is the
+            // purge watermark.
+            last_log_id: last.or(purged),
         })
     }
 
@@ -344,6 +516,11 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
     {
         let mut log = self.log.write().await;
         for entry in entries {
+            // Persist before caching so a crash never leaves an acked-but-lost
+            // entry — a leader must not ack a write it hasn't durably stored.
+            if let Some(meta) = &self.meta {
+                meta.append_entry(&entry);
+            }
             log.insert(entry.log_id.index, entry);
         }
         Ok(())
@@ -357,16 +534,27 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
         let keys: Vec<u64> = log.range(log_id.index..).map(|(k, _)| *k).collect();
         for key in keys {
             log.remove(&key);
+            if let Some(meta) = &self.meta {
+                meta.delete_entry(key);
+            }
         }
         Ok(())
     }
 
     async fn purge_logs_upto(&mut self, log_id: LogId<u64>) -> Result<(), StorageError<u64>> {
-        let mut log = self.log.write().await;
-        let keys: Vec<u64> = log.range(..=log_id.index).map(|(k, _)| *k).collect();
-        for key in keys {
-            log.remove(&key);
+        {
+            let mut log = self.log.write().await;
+            let keys: Vec<u64> = log.range(..=log_id.index).map(|(k, _)| *k).collect();
+            for key in keys {
+                log.remove(&key);
+                if let Some(meta) = &self.meta {
+                    meta.delete_entry(key);
+                }
+            }
         }
+        let mut sm = self.state_machine.write().await;
+        sm.last_purged = Some(log_id);
+        self.persist_applied(&sm);
         Ok(())
     }
 
@@ -561,6 +749,9 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
                 EntryPayload::Blank => res.push(ShardResponse { success: true }),
             }
         }
+        // Persist how far we've applied (and the membership at that point) so a
+        // restart resumes from here instead of re-applying the whole log.
+        self.persist_applied(&sm);
         Ok(res)
     }
 
@@ -582,6 +773,7 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
         let mut sm = self.state_machine.write().await;
         sm.last_applied_log = meta.last_log_id;
         sm.last_membership = meta.last_membership.clone();
+        self.persist_applied(&sm);
 
         let data = snapshot.into_inner();
         if let Ok(snapshot_obj) = serde_json::from_slice::<FullStateSnapshot>(&data) {
@@ -616,6 +808,84 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
 mod tests {
     use super::*;
     use nodus_catalog::{CatalogWriter, MemoryCatalog};
+
+    fn blank_entry(term: u64, index: u64) -> Entry<NodusTypeConfig> {
+        Entry {
+            log_id: LogId::new(openraft::CommittedLeaderId::new(term, 1), index),
+            payload: EntryPayload::Blank,
+        }
+    }
+
+    /// Vote, log, and applied-state written through one store are recovered by a
+    /// fresh store over the same `KvEngine` — i.e. a node's consensus state
+    /// survives a restart.
+    #[tokio::test]
+    async fn raft_consensus_state_survives_reopening_the_store() {
+        let kv: Arc<dyn KvEngine> = Arc::new(nodus_storage_mem::MemKvEngine::new());
+
+        {
+            let mut store = NodusRaftStore::with_kv(kv.clone());
+            store.save_vote(&Vote::new(3, 1)).await.unwrap();
+            store
+                .append_to_log(vec![
+                    blank_entry(1, 1),
+                    blank_entry(1, 2),
+                    blank_entry(3, 3),
+                ])
+                .await
+                .unwrap();
+            // Apply up to index 2; index 3 remains an un-applied log tail.
+            store
+                .apply_to_state_machine(&[blank_entry(1, 1), blank_entry(1, 2)])
+                .await
+                .unwrap();
+        }
+
+        // Reopen over the same KV — recovery path runs in the constructor.
+        let mut store = NodusRaftStore::with_kv(kv.clone());
+
+        assert_eq!(store.read_vote().await.unwrap(), Some(Vote::new(3, 1)));
+
+        let state = store.get_log_state().await.unwrap();
+        assert_eq!(state.last_log_id.map(|l| l.index), Some(3), "log recovered");
+
+        let entries = store.try_get_log_entries(1..=3).await.unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[2].log_id.index, 3);
+
+        let (applied, _membership) = store.last_applied_state().await.unwrap();
+        assert_eq!(
+            applied.map(|l| l.index),
+            Some(2),
+            "applied pointer recovered"
+        );
+    }
+
+    /// A conflicting-log truncation is durable: removed tail entries do not
+    /// reappear after reopening.
+    #[tokio::test]
+    async fn truncated_log_entries_stay_gone_after_reopen() {
+        let kv: Arc<dyn KvEngine> = Arc::new(nodus_storage_mem::MemKvEngine::new());
+        {
+            let mut store = NodusRaftStore::with_kv(kv.clone());
+            store
+                .append_to_log(vec![
+                    blank_entry(1, 1),
+                    blank_entry(1, 2),
+                    blank_entry(1, 3),
+                ])
+                .await
+                .unwrap();
+            store
+                .delete_conflict_logs_since(LogId::new(openraft::CommittedLeaderId::new(1, 1), 2))
+                .await
+                .unwrap();
+        }
+        let mut store = NodusRaftStore::with_kv(kv.clone());
+        let entries = store.try_get_log_entries(1..=3).await.unwrap();
+        assert_eq!(entries.len(), 1, "only the un-truncated entry survives");
+        assert_eq!(entries[0].log_id.index, 1);
+    }
 
     fn catalog_reader(catalog: &Arc<MemoryCatalog>) -> Arc<dyn nodus_catalog::CatalogReader> {
         catalog.clone()

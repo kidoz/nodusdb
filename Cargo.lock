@@ -2452,6 +2452,7 @@ dependencies = [
  "nodus_catalog",
  "nodus_sharding",
  "nodus_storage_api",
+ "nodus_storage_mem",
  "nodus_upgrade",
  "openraft",
  "reqwest",

@@ -23,5 +23,8 @@ uuid.workspace = true
 tracing.workspace = true
 nodus_upgrade = { version = "0.1.0", path = "../nodus_upgrade" }
 
+[dev-dependencies]
+nodus_storage_mem = { path = "../nodus_storage_mem" }
+
 [lints]
 workspace = true
