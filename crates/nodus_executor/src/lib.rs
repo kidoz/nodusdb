@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+mod aggregates;
 mod constraints;
 mod execute;
 mod filter_eval;
