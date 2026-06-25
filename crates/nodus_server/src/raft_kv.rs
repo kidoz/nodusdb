@@ -395,6 +395,7 @@ mod tests {
             config,
             RaftState::new(),
             base.clone(),
+            None,
         ));
 
         let catalog = Arc::new(nodus_catalog::MemoryCatalog::new());
@@ -500,6 +501,7 @@ mod tests {
             config,
             RaftState::new(),
             base.clone(),
+            None,
         ));
 
         let catalog = Arc::new(nodus_catalog::MemoryCatalog::new());

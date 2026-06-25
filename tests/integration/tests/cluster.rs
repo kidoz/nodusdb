@@ -232,3 +232,75 @@ async fn shard_map_replicates_across_the_cluster() {
         "the shard map should replicate to another node"
     );
 }
+
+/// A data shard placed on one node forms a Raft group replicated across the
+/// whole cluster: the primary drives every other node to host a replica and
+/// folds them in as voters. Before Phase 2 a data group was single-node.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial(cluster)]
+async fn data_shard_forms_a_multi_node_group() {
+    let cluster = ClusterFixture::start(3)
+        .await
+        .expect("3-node cluster forms");
+    assert!(cluster.wait_nodes_live(3, Duration::from_secs(45)).await);
+
+    let table = "22222222-2222-2222-2222-222222222222";
+
+    // Create the shard map on the meta leader (node 0 = node_id 1), then place
+    // the single shard on that node so it becomes the group's primary. The
+    // rebalance triggers an immediate reconcile that forms the group across the
+    // cluster.
+    cluster
+        .admin_post(0, &format!("/api/v1/shards/{table}/init"))
+        .await
+        .expect("shard init succeeds");
+    cluster
+        .admin_post(0, &format!("/api/v1/shards/{table}/rebalance?nodes=1"))
+        .await
+        .expect("placing the shard on node 1 succeeds");
+
+    // The primary (node 0) should report the data group with all three nodes as
+    // voters once formation completes.
+    let mut primary_voters = 0;
+    for _ in 0..75 {
+        if let Ok(groups) = cluster.admin_get(0, "/api/v1/cluster/groups").await {
+            primary_voters = groups
+                .get("groups")
+                .and_then(|g| g.as_array())
+                .and_then(|a| a.first())
+                .and_then(|g| g.get("voters"))
+                .and_then(|v| v.as_array())
+                .map(|v| v.len())
+                .unwrap_or(0);
+            if primary_voters == 3 {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert_eq!(
+        primary_voters, 3,
+        "the data group should span all three nodes as voters"
+    );
+
+    // A non-primary node (node 2) must now host its own replica of the group —
+    // proof the primary instantiated it cross-node, not just locally.
+    let mut replica_hosted = false;
+    for _ in 0..75 {
+        if let Ok(groups) = cluster.admin_get(2, "/api/v1/cluster/groups").await {
+            replica_hosted = groups
+                .get("groups")
+                .and_then(|g| g.as_array())
+                .map(|a| !a.is_empty())
+                .unwrap_or(false);
+            if replica_hosted {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(
+        replica_hosted,
+        "a follower should host a replica of the data group"
+    );
+}

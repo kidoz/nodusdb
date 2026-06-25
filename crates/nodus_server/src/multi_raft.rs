@@ -10,7 +10,7 @@
 
 use anyhow::Result;
 use bytes::Bytes;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
 use nodus_catalog::{ShardId, TableId};
@@ -38,6 +38,11 @@ pub struct MultiRaftManager {
     /// KV write/read path can check group membership without awaiting the
     /// async `RaftState` lock. Always updated alongside `state`.
     hosted: Arc<RwLock<HashSet<String>>>,
+    /// Bearer token presented when asking a peer to instantiate a replica of a
+    /// data group (the `/api/v1/shards/{group}/replica` admin endpoint).
+    admin_token: Option<String>,
+    /// Reused HTTP client for peer replica-instantiation requests.
+    http: reqwest::Client,
 }
 
 impl MultiRaftManager {
@@ -47,6 +52,7 @@ impl MultiRaftManager {
         config: Arc<openraft::Config>,
         state: RaftState,
         base_kv: Arc<dyn KvEngine>,
+        admin_token: Option<String>,
     ) -> Self {
         Self {
             node_id,
@@ -55,6 +61,8 @@ impl MultiRaftManager {
             state,
             base_kv,
             hosted: Arc::new(RwLock::new(HashSet::new())),
+            admin_token,
+            http: reqwest::Client::new(),
         }
     }
 
@@ -154,14 +162,18 @@ impl MultiRaftManager {
     }
 
     /// Brings this node's hosted groups into line with `placements`
-    /// (`ShardId -> node id`): every shard placed on this node gets a data group,
-    /// created and single-node-initialized if missing. Idempotent — already-hosted
-    /// shards are skipped. Returns the number newly created.
+    /// (`ShardId -> node id`): every shard placed on this node is formed as a
+    /// data group replicated across all current cluster members, with this node
+    /// as the primary (see [`Self::form_replicated`]). Idempotent and
+    /// convergent — re-running folds in nodes that joined after a group formed
+    /// and re-instantiates replicas on restarted peers. Returns the number of
+    /// groups newly created on this node.
     ///
-    /// Called at startup (to re-host assigned shards after a restart) and after
-    /// placement-changing admin operations. Tear-down of groups no longer placed
-    /// here is deferred to data movement (Phase 6); a placement string matches a
-    /// node by its `cluster.node_id` rendered as text.
+    /// Called at startup (to re-host assigned shards after a restart), after
+    /// placement-changing admin operations, and periodically by the reconcile
+    /// loop. Tear-down of groups no longer placed here is deferred to data
+    /// movement (Phase 6); a placement string matches a node by its
+    /// `cluster.node_id` rendered as text.
     pub async fn reconcile(&self, placements: &HashMap<ShardId, String>) -> Result<usize> {
         let mine = self.node_id.to_string();
         let mut created = 0;
@@ -170,23 +182,147 @@ impl MultiRaftManager {
                 continue;
             }
             let group_id = Self::data_group_id(*shard_id);
-            if self.hosts(&group_id) {
+            let newly = !self.hosts(&group_id);
+            if let Err(e) = self.form_replicated(&group_id).await {
+                tracing::warn!("forming data group {group_id} failed: {e}");
                 continue;
             }
-            let raft = self.get_or_create_data(&group_id).await?;
-            self.init_single(&raft).await;
-            created += 1;
+            if newly {
+                created += 1;
+            }
         }
         Ok(created)
     }
 
     /// Single-node bootstrap so a freshly created group can immediately accept
-    /// writes, mirroring how the meta group is initialized. Multi-replica shard
-    /// membership is future work.
+    /// writes and lead, mirroring how the meta group is initialized. Cross-node
+    /// voters are then folded in by [`Self::form_replicated`].
     async fn init_single(&self, raft: &NodusRaft) {
         let mut members = BTreeMap::new();
         members.insert(self.node_id, openraft::BasicNode::new(&self.advertise_addr));
         let _ = raft.initialize(members).await;
+    }
+
+    /// The current cluster membership (`node id -> raft advertise/HTTP address`),
+    /// read from the meta group's Raft membership — the authoritative roster of
+    /// nodes and where to reach them. Empty if the meta group isn't hosted here.
+    pub async fn cluster_members(&self) -> BTreeMap<u64, String> {
+        let Some(meta) = self.get(META_SHARD).await else {
+            return BTreeMap::new();
+        };
+        let metrics = meta.metrics().borrow().clone();
+        metrics
+            .membership_config
+            .membership()
+            .nodes()
+            .map(|(id, node)| (*id, node.addr.clone()))
+            .collect()
+    }
+
+    /// Polls until this node is the leader of `raft` (so membership changes are
+    /// accepted) or a short deadline passes. Returns whether leadership settled.
+    async fn await_leadership(&self, raft: &NodusRaft) -> bool {
+        for _ in 0..30 {
+            if raft.metrics().borrow().current_leader == Some(self.node_id) {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        false
+    }
+
+    /// Asks the peer at `addr` to instantiate a local replica of `group_id` so it
+    /// can receive the group's log. Idempotent on the peer side (re-instantiating
+    /// reloads durable Raft state). The peer's HTTP address doubles as its Raft
+    /// advertise address.
+    async fn instantiate_remote(&self, addr: &str, group_id: &str) -> Result<()> {
+        let url = format!("http://{addr}/api/v1/shards/{group_id}/replica");
+        let mut req = self.http.post(&url);
+        if let Some(token) = &self.admin_token {
+            req = req.bearer_auth(token);
+        }
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("replica request to {addr}: {e}"))?;
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!(
+                "replica instantiate on {addr} returned {}",
+                resp.status()
+            ))
+        }
+    }
+
+    /// Forms `group_id` as a Raft group replicated across all current cluster
+    /// members, with this node as the primary. Bootstraps the group single-node
+    /// (so this node leads), then — for every other member — instantiates a
+    /// replica there and folds it in as a voter. Idempotent and convergent:
+    /// re-running re-instantiates restarted replicas and adds members that
+    /// joined the cluster after the group first formed.
+    ///
+    /// Membership changes require leadership, so if this node isn't (yet) the
+    /// group's leader the call returns without changing membership and a later
+    /// reconcile pass retries.
+    pub async fn form_replicated(&self, group_id: &str) -> Result<()> {
+        let raft = self.get_or_create_data(group_id).await?;
+
+        // Bootstrap as a single-node leader the first time we host the group; a
+        // group that already carries voters (this node restarted, or a prior
+        // pass formed it) is left as-is.
+        let initialized = raft
+            .metrics()
+            .borrow()
+            .membership_config
+            .membership()
+            .voter_ids()
+            .next()
+            .is_some();
+        if !initialized {
+            self.init_single(&raft).await;
+        }
+
+        // Only the leader may drive membership; back off if leadership hasn't
+        // settled (or has moved elsewhere) and let a later pass converge.
+        if !self.await_leadership(&raft).await {
+            return Ok(());
+        }
+
+        let members = self.cluster_members().await;
+        let current: BTreeSet<u64> = raft
+            .metrics()
+            .borrow()
+            .membership_config
+            .membership()
+            .voter_ids()
+            .collect();
+        let mut target = current.clone();
+        for (id, addr) in &members {
+            if *id == self.node_id {
+                continue;
+            }
+            // Ensure the peer hosts a (possibly freshly recreated) replica so it
+            // can receive the log; idempotent on the peer side.
+            if let Err(e) = self.instantiate_remote(addr, group_id).await {
+                tracing::warn!("replica of {group_id} on node {id} unavailable: {e}");
+                continue;
+            }
+            if !current.contains(id) {
+                let node = openraft::BasicNode::new(addr);
+                if let Err(e) = raft.add_learner(*id, node, true).await {
+                    tracing::warn!("add_learner {id} for {group_id} failed: {e}");
+                    continue;
+                }
+                target.insert(*id);
+            }
+        }
+        if target != current {
+            raft.change_membership(target, true)
+                .await
+                .map_err(|e| anyhow::anyhow!("change_membership for {group_id}: {e}"))?;
+        }
+        Ok(())
     }
 
     /// Shuts down every Raft group on this node and clears the group map. Called
@@ -391,7 +527,14 @@ mod tests {
     fn manager() -> MultiRaftManager {
         let config = Arc::new(openraft::Config::default().validate().unwrap());
         let base_kv: Arc<dyn KvEngine> = Arc::new(nodus_storage_mem::MemKvEngine::new());
-        MultiRaftManager::new(1, "127.0.0.1:0".into(), config, RaftState::new(), base_kv)
+        MultiRaftManager::new(
+            1,
+            "127.0.0.1:0".into(),
+            config,
+            RaftState::new(),
+            base_kv,
+            None,
+        )
     }
 
     async fn elect_single_node(raft: &NodusRaft) -> bool {
@@ -507,6 +650,7 @@ mod tests {
             config,
             RaftState::new(),
             base.clone(),
+            None,
         );
 
         let meta = Arc::new(nodus_meta::PersistentMetaStore::new(base.clone()));
@@ -558,6 +702,7 @@ mod tests {
             config,
             RaftState::new(),
             base.clone(),
+            None,
         );
 
         let meta = Arc::new(nodus_meta::PersistentMetaStore::new(base.clone()));

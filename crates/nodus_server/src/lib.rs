@@ -270,6 +270,7 @@ pub async fn run_server_with_config(
         raft_config,
         raft_state.clone(),
         local_kv.clone(),
+        config.admin.token.clone(),
     ));
 
     // Local cluster-metadata store (shard maps + placements), KV-backed so it
@@ -739,6 +740,31 @@ pub async fn run_server_with_config(
         }
     });
 
+    // Periodically reconcile data-shard groups against current placements:
+    // forms multi-node groups for shards owned here, folds in nodes that joined
+    // after a group formed, and re-instantiates replicas on restarted peers.
+    // Convergent and idempotent, so a missed/raced admin-triggered reconcile is
+    // eventually repaired.
+    let reconcile_loop_meta = meta.clone();
+    let reconcile_loop_manager = multi_raft.clone();
+    let mut reconcile_shutdown = shutdown.clone();
+    let shard_reconcile_task = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(10));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {
+                    if let Ok(placements) = reconcile_loop_meta.get_shard_placements() {
+                        if let Err(e) = reconcile_loop_manager.reconcile(&placements).await {
+                            tracing::debug!("periodic shard reconcile: {e}");
+                        }
+                    }
+                }
+                _ = reconcile_shutdown.changed() => break,
+            }
+        }
+    });
+
     let http_task = tokio::spawn(async move {
         if let Some(cfg) = server_config {
             let handle = axum_server::Handle::new();
@@ -767,7 +793,12 @@ pub async fn run_server_with_config(
         http_addr,
         pgwire_task,
         http_task,
-        background_tasks: vec![gc_task, wal_archiver_task, raft_shutdown_task],
+        background_tasks: vec![
+            gc_task,
+            wal_archiver_task,
+            raft_shutdown_task,
+            shard_reconcile_task,
+        ],
         registry,
     })
 }

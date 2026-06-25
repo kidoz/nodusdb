@@ -170,6 +170,8 @@ pub fn admin_routes(state: AdminState) -> Router {
         .route("/api/v1/shards/:table/split", post(shards_split))
         .route("/api/v1/shards/:table/merge", post(shards_merge))
         .route("/api/v1/shards/:table/rebalance", post(shards_rebalance))
+        .route("/api/v1/shards/:table/replica", post(shards_replica))
+        .route("/api/v1/cluster/groups", get(cluster_groups))
         .route("/api/v1/queries", get(slow_queries))
         .route("/api/v1/node/drain", post(node_drain))
         .route(
@@ -1068,4 +1070,42 @@ async fn shards_rebalance(
         Ok(Err(e)) => Json(json!({ "error": e.to_string() })),
         Err(e) => Json(json!({ "error": format!("task failed: {e}") })),
     }
+}
+
+/// Instantiates a local replica of data group `table` (a `shard-{id}` group id)
+/// so it can receive the group's log from the primary. Idempotent — recreating
+/// an existing group is a no-op that reloads its durable Raft state. Driven by
+/// the group's primary during formation/reconcile, never by an operator.
+async fn shards_replica(
+    State(state): State<AdminState>,
+    Path(group): Path<String>,
+) -> (StatusCode, Json<Value>) {
+    match state.manager.get_or_create_data(&group).await {
+        Ok(_) => (StatusCode::OK, Json(json!({ "hosted": group }))),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        ),
+    }
+}
+
+/// Reports the data-shard Raft groups this node hosts and their membership, so
+/// operators and tests can confirm a group formed across the cluster. The meta
+/// group is excluded.
+async fn cluster_groups(State(state): State<AdminState>) -> Json<Value> {
+    let rafts = state.raft_state.rafts.read().await;
+    let mut groups: Vec<Value> = Vec::new();
+    for (id, raft) in rafts.iter() {
+        if id == crate::multi_raft::META_SHARD {
+            continue;
+        }
+        let metrics = raft.metrics().borrow().clone();
+        let voters: Vec<u64> = metrics.membership_config.membership().voter_ids().collect();
+        groups.push(json!({
+            "id": id,
+            "voters": voters,
+            "leader": metrics.current_leader,
+        }));
+    }
+    Json(json!({ "groups": groups }))
 }
