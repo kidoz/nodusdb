@@ -115,11 +115,63 @@ fn put_u32(buf: &mut Vec<u8>, v: u32) {
     buf.extend_from_slice(&v.to_le_bytes());
 }
 
+/// Reads `len` bytes at `offset`, but first verifies the range lies within the
+/// file. This bounds the allocation: a corrupt length read from the footer or
+/// index can never request a multi-gigabyte buffer (or read past EOF).
 fn read_range(file: &mut File, offset: u64, len: usize) -> Result<Vec<u8>> {
+    let file_len = file.seek(SeekFrom::End(0))?;
+    let end = offset
+        .checked_add(len as u64)
+        .ok_or_else(|| anyhow::anyhow!("sstable: range offset+len overflow"))?;
+    if end > file_len {
+        bail!("sstable: range {offset}+{len} exceeds file length {file_len}");
+    }
     file.seek(SeekFrom::Start(offset))?;
     let mut buf = vec![0u8; len];
     file.read_exact(&mut buf)?;
     Ok(buf)
+}
+
+/// A bounds-checked cursor over an in-memory buffer. Every read validates the
+/// requested length against what remains, so parsing untrusted on-disk records
+/// returns an error instead of panicking on a truncated or corrupt file.
+struct ByteReader<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> ByteReader<'a> {
+    fn new(buf: &'a [u8]) -> Self {
+        Self { buf, pos: 0 }
+    }
+
+    fn remaining(&self) -> usize {
+        self.buf.len() - self.pos
+    }
+
+    fn take(&mut self, n: usize) -> Result<&'a [u8]> {
+        let end = self
+            .pos
+            .checked_add(n)
+            .ok_or_else(|| anyhow::anyhow!("sstable: record length overflow"))?;
+        if end > self.buf.len() {
+            bail!(
+                "sstable: truncated record (need {n}, have {})",
+                self.remaining()
+            );
+        }
+        let slice = &self.buf[self.pos..end];
+        self.pos = end;
+        Ok(slice)
+    }
+
+    fn take_u32(&mut self) -> Result<u32> {
+        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+    }
+
+    fn take_u64(&mut self) -> Result<u64> {
+        Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+    }
 }
 
 impl Sstable {
@@ -243,21 +295,23 @@ impl Sstable {
 
     fn read_index(file: &mut File, footer: &Footer) -> Result<Vec<BlockHandle>> {
         let buf = read_range(file, footer.index_offset, footer.index_len as usize)?;
-        let mut cur = 0usize;
-        let take_u32 = |buf: &[u8], cur: &mut usize| -> u32 {
-            let v = u32::from_le_bytes(buf[*cur..*cur + 4].try_into().unwrap());
-            *cur += 4;
-            v
-        };
-        let num_blocks = take_u32(&buf, &mut cur);
-        let mut index = Vec::with_capacity(num_blocks as usize);
+        let mut reader = ByteReader::new(&buf);
+        let num_blocks = reader.take_u32()? as usize;
+        // Each block entry is at least 16 bytes (klen + offset + len), so a valid
+        // index of N blocks occupies >= 16*N bytes. Reject an impossible count
+        // before reserving, so a corrupt length can't drive a huge allocation.
+        if num_blocks.saturating_mul(16) > buf.len() {
+            bail!(
+                "sstable: index claims {num_blocks} blocks but is only {} bytes",
+                buf.len()
+            );
+        }
+        let mut index = Vec::with_capacity(num_blocks);
         for _ in 0..num_blocks {
-            let klen = take_u32(&buf, &mut cur) as usize;
-            let first_key = buf[cur..cur + klen].to_vec();
-            cur += klen;
-            let offset = u64::from_le_bytes(buf[cur..cur + 8].try_into().unwrap());
-            cur += 8;
-            let len = take_u32(&buf, &mut cur);
+            let klen = reader.take_u32()? as usize;
+            let first_key = reader.take(klen)?.to_vec();
+            let offset = reader.take_u64()?;
+            let len = reader.take_u32()?;
             index.push(BlockHandle {
                 first_key,
                 offset,
@@ -293,19 +347,16 @@ impl Sstable {
 
         // Scan just that block.
         let buf = read_range(&mut file, block.offset, block.len as usize)?;
-        let mut cur = 0usize;
-        while cur + 4 <= buf.len() {
-            let klen = u32::from_le_bytes(buf[cur..cur + 4].try_into().unwrap()) as usize;
-            cur += 4;
-            let entry_key = &buf[cur..cur + klen];
-            cur += klen;
-            let vlen = u32::from_le_bytes(buf[cur..cur + 4].try_into().unwrap()) as usize;
-            cur += 4;
+        let mut reader = ByteReader::new(&buf);
+        while reader.remaining() >= 4 {
+            let klen = reader.take_u32()? as usize;
+            let entry_key = reader.take(klen)?;
+            let vlen = reader.take_u32()? as usize;
+            let val = reader.take(vlen)?;
             if entry_key == key {
-                let chain: VersionChain = bincode::deserialize(&buf[cur..cur + vlen])?;
+                let chain: VersionChain = bincode::deserialize(val)?;
                 return Ok(Some(chain));
             }
-            cur += vlen;
         }
         Ok(None)
     }
@@ -346,7 +397,17 @@ impl Iterator for SstableIterator {
         if self.position >= self.data_end {
             return None;
         }
+        let data_end = self.data_end;
+        let start = self.position;
         let mut read = |n: usize| -> std::io::Result<Vec<u8>> {
+            // Bound the allocation against the data region so a corrupt length
+            // can't request a huge buffer before `read_exact` fails.
+            if n as u64 > data_end.saturating_sub(start) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "sstable: entry length exceeds data region",
+                ));
+            }
             let mut b = vec![0u8; n];
             self.file.read_exact(&mut b)?;
             Ok(b)
@@ -360,5 +421,63 @@ impl Iterator for SstableIterator {
             Ok((Bytes::from(key), bincode::deserialize(&val)?))
         })();
         Some(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use tempfile::TempDir;
+
+    fn build_sample(path: &Path) {
+        let mut data = BTreeMap::new();
+        data.insert(Bytes::from_static(b"k1"), VersionChain::default());
+        data.insert(Bytes::from_static(b"k2"), VersionChain::default());
+        Sstable::build(path, &data).unwrap();
+    }
+
+    #[test]
+    fn valid_sstable_round_trips() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("t.sst");
+        build_sample(&path);
+        let sst = Sstable::open(&path);
+        assert!(sst.get(b"k1").unwrap().is_some());
+        assert!(sst.get(b"missing").unwrap().is_none());
+        assert_eq!(sst.iter().unwrap().count(), 2);
+    }
+
+    #[test]
+    fn corrupt_index_length_errors_instead_of_panicking() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("t.sst");
+        build_sample(&path);
+
+        // Footer (last 32 bytes): index_offset(8) index_len(4) ... Overwrite the
+        // index length with a value past EOF; the read must be rejected.
+        let mut bytes = std::fs::read(&path).unwrap();
+        let n = bytes.len();
+        bytes[n - 24..n - 20].copy_from_slice(&u32::MAX.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+
+        assert!(Sstable::open(&path).get(b"k1").is_err());
+    }
+
+    #[test]
+    fn corrupt_block_count_errors_instead_of_panicking() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("t.sst");
+        build_sample(&path);
+
+        // Drive the index's block count to a huge value; parsing must reject it
+        // rather than panic or reserve an enormous vector.
+        let mut bytes = std::fs::read(&path).unwrap();
+        let n = bytes.len();
+        let index_offset = u64::from_le_bytes(bytes[n - 32..n - 24].try_into().unwrap()) as usize;
+        bytes[index_offset..index_offset + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+
+        assert!(Sstable::open(&path).get(b"k1").is_err());
     }
 }
