@@ -69,11 +69,41 @@ pub fn parse_copy_header(header: &str) -> Result<CopySpec> {
         CopyFormat::Text
     };
 
+    // The table and column names are interpolated into a synthesized INSERT
+    // (and on the wire COPY path the header is client-controlled), so reject any
+    // identifier that isn't a plain dotted name. This neutralizes SQL/identifier
+    // injection at the single choke point both ingestion paths share.
+    if !is_safe_qualified_name(&table) {
+        bail!("unsafe COPY target identifier: {table:?}");
+    }
+    for column in &columns {
+        if !is_safe_identifier(column) {
+            bail!("unsafe COPY column identifier: {column:?}");
+        }
+    }
+
     Ok(CopySpec {
         table,
         columns,
         format,
     })
+}
+
+/// A bare SQL identifier safe to interpolate unquoted: non-empty, ASCII
+/// alphanumeric plus `_` (and a leading non-digit). Deliberately conservative —
+/// exotic quoted identifiers are rejected rather than risk injection.
+fn is_safe_identifier(ident: &str) -> bool {
+    let mut chars = ident.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// A `schema.table`-style name: every dot-separated part is a safe identifier.
+fn is_safe_qualified_name(name: &str) -> bool {
+    !name.is_empty() && name.split('.').all(is_safe_identifier)
 }
 
 /// Decodes a COPY data body into rows of cells for the given format.
@@ -288,6 +318,27 @@ mod tests {
         assert_eq!(spec.table, "public.t");
         assert_eq!(spec.columns, vec!["a", "b", "c"]);
         assert_eq!(spec.format, CopyFormat::Text);
+    }
+
+    #[test]
+    fn rejects_injection_in_table_and_column_identifiers() {
+        // Any identifier reaching the synthesized INSERT must be a plain dotted
+        // name; these all carry SQL punctuation and must be rejected.
+        assert!(parse_copy_header("COPY t;DROP TABLE x FROM stdin").is_err());
+        assert!(parse_copy_header("COPY evil drop FROM stdin").is_err());
+        assert!(parse_copy_header("COPY t (a b) FROM stdin").is_err());
+        assert!(parse_copy_header("COPY t (id, x-1) FROM stdin").is_err());
+    }
+
+    #[test]
+    fn safe_identifier_classifies_correctly() {
+        assert!(is_safe_identifier("users"));
+        assert!(is_safe_identifier("_x9"));
+        assert!(is_safe_qualified_name("public.users"));
+        assert!(!is_safe_identifier("9x"));
+        assert!(!is_safe_identifier("a b"));
+        assert!(!is_safe_identifier("a;b"));
+        assert!(!is_safe_qualified_name(""));
     }
 
     #[test]
