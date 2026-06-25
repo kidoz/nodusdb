@@ -2440,6 +2440,7 @@ dependencies = [
  "futures-util",
  "nodus_catalog",
  "nodus_executor",
+ "nodus_import",
  "nodus_monitoring",
  "nodus_security",
  "nodus_sql",

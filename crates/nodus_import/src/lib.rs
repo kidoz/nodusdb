@@ -16,7 +16,7 @@
 mod copy_decoder;
 mod splitter;
 
-pub use copy_decoder::{Cell, CopyFormat, CopySpec};
+pub use copy_decoder::{Cell, CopyFormat, CopySpec, decode_rows, parse_copy_header};
 pub use splitter::{RawUnit, is_copy_from_stdin, split};
 
 use serde::{Deserialize, Serialize};
@@ -445,7 +445,8 @@ fn emit_copy_block(
 /// Builds an `INSERT INTO <table> [(cols)] VALUES (...), ...;` from decoded
 /// rows. Every cell is emitted as a text literal (or `NULL`); the executor
 /// coerces to the column's type, matching how it already handles `INSERT`.
-fn synthesize_insert(spec: &CopySpec, rows: &[Vec<Cell>]) -> String {
+/// Shared with the wire-protocol `COPY FROM STDIN` path.
+pub fn synthesize_insert(spec: &CopySpec, rows: &[Vec<Cell>]) -> String {
     let mut sql = String::from("INSERT INTO ");
     sql.push_str(&spec.table);
     if !spec.columns.is_empty() {

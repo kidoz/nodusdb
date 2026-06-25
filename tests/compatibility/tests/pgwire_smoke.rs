@@ -299,9 +299,14 @@ async fn test_copy_protocol_in_and_out_complete_cleanly() {
     let server = TestServer::start().await.expect("server starts");
     let client = connect(&server).await;
 
+    client
+        .batch_execute("CREATE TABLE copy_sink (id int, label text)")
+        .await
+        .unwrap();
+
     let mut sink = Box::pin(
         client
-            .copy_in::<_, Bytes>("COPY copy_sink FROM STDIN")
+            .copy_in::<_, Bytes>("COPY copy_sink (id, label) FROM STDIN")
             .await
             .unwrap(),
     );
@@ -312,11 +317,17 @@ async fn test_copy_protocol_in_and_out_complete_cleanly() {
     let copied = sink.as_mut().finish().await.unwrap();
     assert_eq!(copied, 2);
 
+    // The rows must actually persist, not just be counted on the wire.
+    let rows = client
+        .query("SELECT id, label FROM copy_sink ORDER BY id", &[])
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    let label: String = rows[0].get("label");
+    assert_eq!(label, "alpha");
+
     let mut out = Box::pin(client.copy_out("COPY copy_sink TO STDOUT").await.unwrap());
     assert!(out.next().await.is_none());
-
-    let rows = client.query("SELECT 1", &[]).await.unwrap();
-    assert_eq!(rows.len(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]

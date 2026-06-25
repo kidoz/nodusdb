@@ -20,7 +20,7 @@ use crate::client_meta::*;
 use crate::encoding::*;
 use crate::wire_format::*;
 use crate::{CurrentQueryGuard, NodusQueryHandler, QueryTimer, execute_off_reactor};
-use crate::{METADATA_COPY_EXTENDED, METADATA_COPY_ROWS};
+use crate::{METADATA_COPY_EXTENDED, METADATA_COPY_ROWS, METADATA_COPY_STMT};
 
 #[async_trait]
 impl SimpleQueryHandler for NodusQueryHandler {
@@ -48,6 +48,7 @@ impl SimpleQueryHandler for NodusQueryHandler {
             client.metadata_mut().extend([
                 (METADATA_COPY_ROWS.to_owned(), "0".to_owned()),
                 (METADATA_COPY_EXTENDED.to_owned(), "0".to_owned()),
+                (METADATA_COPY_STMT.to_owned(), query_string.clone()),
             ]);
             client
                 .send(PgWireBackendMessage::CopyInResponse(

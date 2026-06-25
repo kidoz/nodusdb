@@ -39,7 +39,8 @@ use crate::encoding::*;
 use crate::type_map::*;
 use crate::wire_format::*;
 use crate::{
-    CurrentQueryGuard, METADATA_COPY_EXTENDED, METADATA_COPY_ROWS, QueryTimer, execute_off_reactor,
+    CurrentQueryGuard, METADATA_COPY_EXTENDED, METADATA_COPY_ROWS, METADATA_COPY_STMT, QueryTimer,
+    execute_off_reactor,
 };
 
 pub struct NodusExtendedQueryHandler {
@@ -235,6 +236,10 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
             client.metadata_mut().extend([
                 (METADATA_COPY_ROWS.to_owned(), "0".to_owned()),
                 (METADATA_COPY_EXTENDED.to_owned(), "1".to_owned()),
+                (
+                    METADATA_COPY_STMT.to_owned(),
+                    portal.statement.statement.clone(),
+                ),
             ]);
             client
                 .send(PgWireBackendMessage::CopyInResponse(

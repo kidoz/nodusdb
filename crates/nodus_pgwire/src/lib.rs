@@ -20,6 +20,9 @@ pub(crate) const METADATA_BACKEND_SECRET: &str = "nodus_backend_secret";
 pub(crate) const METADATA_TX_STATUS: &str = "nodus_tx_status";
 pub(crate) const METADATA_COPY_ROWS: &str = "nodus_copy_rows";
 pub(crate) const METADATA_COPY_EXTENDED: &str = "nodus_copy_extended";
+/// The `COPY ... FROM STDIN` statement text, stashed when entering copy-in so
+/// the copy handler can resolve the target table, columns, and format.
+pub(crate) const METADATA_COPY_STMT: &str = "nodus_copy_stmt";
 pub(crate) const METADATA_STATEMENT_TIMEOUT_MS: &str = "nodus_statement_timeout_ms";
 
 pub(crate) const POSTGRES_TYPEMOD_NONE: i32 = -1;

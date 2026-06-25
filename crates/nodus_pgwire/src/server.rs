@@ -419,15 +419,13 @@ pub async fn start_pgwire_server(
         registry: registry.clone(),
         slow_log: slow_log.clone(),
         extended_query_handler: Arc::new(NodusExtendedQueryHandler {
-            executor,
+            executor: executor.clone(),
             metrics: metrics.clone(),
             slow_log,
             registry: registry.clone(),
             cursors: RwLock::new(HashMap::new()),
         }),
-        copy_handler: Arc::new(NodusCopyHandler {
-            registry: registry.clone(),
-        }),
+        copy_handler: Arc::new(NodusCopyHandler::new(registry.clone(), executor.clone())),
     });
 
     info!(
