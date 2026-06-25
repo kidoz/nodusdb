@@ -2355,6 +2355,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "nodus_import"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "sqlparser",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "nodus_index"
 version = "0.1.0"
 dependencies = [

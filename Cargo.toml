@@ -26,6 +26,7 @@ members = [
     "crates/nodus_txn",
     "crates/nodus_raftstore",
     "crates/nodus_backup",
+    "crates/nodus_import",
     "crates/nodus_telemetry",
     "tests/integration",
     "tests/compatibility",
