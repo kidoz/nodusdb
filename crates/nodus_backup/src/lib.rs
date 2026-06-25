@@ -65,7 +65,7 @@ pub trait BackupRepository: Send + Sync {
 }
 
 // In-Memory MVP Repository for tests
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::RwLock;
 
 pub struct MemBackupRepository {
@@ -304,6 +304,60 @@ pub struct ProtectedTimestamp {
     pub created_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum WalArchiveUploadState {
+    Completed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WalCommittedTxn {
+    pub txn_id: String,
+    pub commit_ts: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WalArchiveIndex {
+    pub index_version: u64,
+    pub timeline_id: String,
+    pub segment_id: String,
+    pub wal_object_key: String,
+    pub index_object_key: String,
+    pub size: u64,
+    pub checksum: String,
+    pub first_commit_ts: Option<u64>,
+    pub last_commit_ts: Option<u64>,
+    pub record_txn_ids: Vec<String>,
+    pub committed_txns: Vec<WalCommittedTxn>,
+    pub archived_at: DateTime<Utc>,
+    pub upload_state: WalArchiveUploadState,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PitrRestoreWalSegment {
+    pub segment_id: String,
+    pub wal_object_key: String,
+    pub index_object_key: String,
+    pub first_commit_ts: Option<u64>,
+    pub last_commit_ts: Option<u64>,
+    pub checksum: String,
+    pub size: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PitrRestorePlan {
+    pub plan_version: u64,
+    pub cluster_id: String,
+    pub timeline_id: String,
+    pub base_backup_id: String,
+    pub base_backup_chain: Vec<String>,
+    pub base_snapshot_ts: u64,
+    pub target_ts: u64,
+    pub replay_start_ts: u64,
+    pub replay_end_ts: u64,
+    pub wal_segments: Vec<PitrRestoreWalSegment>,
+    pub generated_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackupManifest {
     pub manifest_version: u64,
@@ -340,6 +394,8 @@ use uuid::Uuid;
 const CURRENT_MANIFEST_VERSION: u64 = 2;
 const CURRENT_REPOSITORY_LAYOUT_VERSION: u64 = 2;
 const CURRENT_OBJECT_FORMAT_VERSION: u64 = 1;
+const CURRENT_WAL_ARCHIVE_INDEX_VERSION: u64 = 1;
+const CURRENT_PITR_RESTORE_PLAN_VERSION: u64 = 1;
 const DEFAULT_TIMELINE_ID: &str = "default";
 
 fn checksum(bytes: &[u8]) -> String {
@@ -358,6 +414,22 @@ fn manifest_key(backup_id: &str) -> String {
 
 fn data_key(backup_id: &str, name: &str) -> String {
     format!("{backup_id}/data/{name}")
+}
+
+fn wal_key(filename: &str) -> String {
+    format!("wal_archive/{filename}")
+}
+
+fn wal_index_key(filename: &str) -> String {
+    format!("wal_archive/{filename}.index.json")
+}
+
+fn wal_segment_sequence(segment_id: &str) -> Result<u64> {
+    segment_id
+        .strip_suffix(".log")
+        .unwrap_or(segment_id)
+        .parse::<u64>()
+        .map_err(|_| anyhow::anyhow!("unsupported non-numeric WAL segment id {segment_id}"))
 }
 
 /// A unit of data to back up: a logical name and its bytes (e.g. a shard export
@@ -722,13 +794,135 @@ impl BackupOrchestrator {
         Ok(self.completed_manifests().await?.is_empty())
     }
 
+    pub async fn wal_segment_cleanup_allowed(&self, filename: &str) -> Result<bool> {
+        let completed = self.completed_manifests().await?;
+        if completed.is_empty() {
+            return Ok(true);
+        }
+        let oldest_needed_ts = completed
+            .iter()
+            .filter_map(|manifest| {
+                manifest
+                    .protected_timestamp
+                    .as_ref()
+                    .map(|_| manifest.snapshot_ts)
+            })
+            .min()
+            .ok_or_else(|| anyhow::anyhow!("retained backups have no protected timestamps"))?;
+        let indexes = self.load_wal_archive_indexes().await?;
+        let Some(index) = indexes.iter().find(|index| {
+            index.segment_id == filename || index.wal_object_key == wal_key(filename)
+        }) else {
+            return Ok(false);
+        };
+
+        if index.upload_state != WalArchiveUploadState::Completed {
+            return Ok(false);
+        }
+        if index
+            .last_commit_ts
+            .is_some_and(|last_commit_ts| last_commit_ts >= oldest_needed_ts)
+        {
+            return Ok(false);
+        }
+
+        let mut commits_needed_after_segment = std::collections::HashSet::new();
+        for archived in &indexes {
+            for committed in &archived.committed_txns {
+                if committed.commit_ts >= oldest_needed_ts {
+                    commits_needed_after_segment.insert(committed.txn_id.as_str());
+                }
+            }
+        }
+
+        Ok(!index
+            .record_txn_ids
+            .iter()
+            .any(|txn_id| commits_needed_after_segment.contains(txn_id.as_str())))
+    }
+
     /// Archives a WAL segment.
     pub async fn archive_wal(&self, filename: &str, data: Bytes) -> Result<()> {
-        let key = format!("wal_archive/{}", filename);
+        let key = wal_key(filename);
         self.repo
             .put_object(&key, data, PutOptions::default())
             .await
             .map(|_| ())
+    }
+
+    pub async fn archive_wal_indexed(
+        &self,
+        filename: &str,
+        data: Bytes,
+        record_txn_ids: Vec<String>,
+        committed_txns: Vec<WalCommittedTxn>,
+    ) -> Result<WalArchiveIndex> {
+        let mut record_txn_ids = record_txn_ids;
+        record_txn_ids.sort();
+        record_txn_ids.dedup();
+
+        let mut committed_txns = committed_txns;
+        committed_txns.sort_by(|left, right| {
+            left.commit_ts
+                .cmp(&right.commit_ts)
+                .then_with(|| left.txn_id.cmp(&right.txn_id))
+        });
+        committed_txns.dedup();
+
+        let first_commit_ts = committed_txns.iter().map(|txn| txn.commit_ts).min();
+        let last_commit_ts = committed_txns.iter().map(|txn| txn.commit_ts).max();
+        let wal_object_key = wal_key(filename);
+        let index_object_key = wal_index_key(filename);
+        let index = WalArchiveIndex {
+            index_version: CURRENT_WAL_ARCHIVE_INDEX_VERSION,
+            timeline_id: DEFAULT_TIMELINE_ID.to_string(),
+            segment_id: filename.to_string(),
+            wal_object_key: wal_object_key.clone(),
+            index_object_key: index_object_key.clone(),
+            size: data.len() as u64,
+            checksum: checksum(&data),
+            first_commit_ts,
+            last_commit_ts,
+            record_txn_ids,
+            committed_txns,
+            archived_at: Utc::now(),
+            upload_state: WalArchiveUploadState::Completed,
+        };
+
+        self.repo
+            .put_object(&wal_object_key, data, PutOptions::default())
+            .await?;
+        self.put_wal_archive_index(&index).await?;
+        Ok(index)
+    }
+
+    async fn put_wal_archive_index(&self, index: &WalArchiveIndex) -> Result<()> {
+        let body = serde_json::to_vec(index)?;
+        self.repo
+            .put_object(
+                &index.index_object_key,
+                Bytes::from(body),
+                PutOptions {
+                    content_type: Some("application/json".into()),
+                },
+            )
+            .await
+            .map(|_| ())
+    }
+
+    pub async fn load_wal_archive_indexes(&self) -> Result<Vec<WalArchiveIndex>> {
+        let objects = self.repo.list_objects("wal_archive/").await?;
+        let mut indexes = Vec::new();
+        for object in objects {
+            if !object.key.ends_with(".index.json") {
+                continue;
+            }
+            let bytes = self.repo.get_object(&object.key, None).await?;
+            let index = serde_json::from_slice::<WalArchiveIndex>(&bytes)?;
+            indexes.push(index);
+        }
+        indexes.sort_by(|left, right| left.segment_id.cmp(&right.segment_id));
+        Ok(indexes)
     }
 
     /// Retrieves all archived WAL segments, sorted chronologically by numeric file stem.
@@ -736,6 +930,9 @@ impl BackupOrchestrator {
         let objects = self.repo.list_objects("wal_archive/").await?;
         let mut wals = Vec::new();
         for obj in objects {
+            if !obj.key.ends_with(".log") {
+                continue;
+            }
             let bytes = self.repo.get_object(&obj.key, None).await?;
             let name = obj
                 .key
@@ -1150,5 +1347,94 @@ mod tests {
         orch.delete_backup(&full.backup_id).await.unwrap();
         assert_eq!(orch.protected_gc_watermark().await.unwrap(), None);
         assert!(orch.wal_cleanup_allowed().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_wal_archive_index_drives_segment_cleanup() {
+        let repo: Arc<dyn BackupRepository> = Arc::new(MemBackupRepository::new());
+        let orch = BackupOrchestrator::new(repo);
+
+        assert!(
+            orch.archive_wal_indexed(
+                "0.log",
+                Bytes::from("old"),
+                vec!["old-txn".into()],
+                vec![WalCommittedTxn {
+                    txn_id: "old-txn".into(),
+                    commit_ts: 5,
+                }],
+            )
+            .await
+            .is_ok()
+        );
+        assert!(orch.wal_segment_cleanup_allowed("0.log").await.unwrap());
+
+        let full = orch
+            .create_full_backup(
+                "cluster-1",
+                10,
+                1,
+                1,
+                vec![BackupObject {
+                    name: "kv_data.json".into(),
+                    bytes: Bytes::from("full"),
+                }],
+            )
+            .await
+            .unwrap();
+
+        orch.archive_wal_indexed(
+            "1.log",
+            Bytes::from("before"),
+            vec!["before-txn".into()],
+            vec![WalCommittedTxn {
+                txn_id: "before-txn".into(),
+                commit_ts: 5,
+            }],
+        )
+        .await
+        .unwrap();
+        orch.archive_wal_indexed(
+            "2.log",
+            Bytes::from("after"),
+            vec!["after-txn".into()],
+            vec![WalCommittedTxn {
+                txn_id: "after-txn".into(),
+                commit_ts: 12,
+            }],
+        )
+        .await
+        .unwrap();
+        orch.archive_wal_indexed(
+            "3.log",
+            Bytes::from("write-before-commit"),
+            vec!["late-txn".into()],
+            vec![],
+        )
+        .await
+        .unwrap();
+        orch.archive_wal_indexed(
+            "4.log",
+            Bytes::from("commit-after"),
+            vec![],
+            vec![WalCommittedTxn {
+                txn_id: "late-txn".into(),
+                commit_ts: 15,
+            }],
+        )
+        .await
+        .unwrap();
+
+        assert!(orch.wal_segment_cleanup_allowed("1.log").await.unwrap());
+        assert!(!orch.wal_segment_cleanup_allowed("2.log").await.unwrap());
+        assert!(!orch.wal_segment_cleanup_allowed("3.log").await.unwrap());
+        assert!(!orch.wal_segment_cleanup_allowed("4.log").await.unwrap());
+        assert_eq!(orch.load_wal_archive_indexes().await.unwrap().len(), 5);
+        assert_eq!(orch.get_archived_wals().await.unwrap().len(), 5);
+
+        orch.delete_backup(&full.backup_id).await.unwrap();
+        assert!(orch.wal_segment_cleanup_allowed("2.log").await.unwrap());
+        assert!(orch.wal_segment_cleanup_allowed("3.log").await.unwrap());
+        assert!(orch.wal_segment_cleanup_allowed("4.log").await.unwrap());
     }
 }

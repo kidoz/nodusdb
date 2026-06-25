@@ -9,7 +9,7 @@ mod raft_upgrade;
 
 use admin::{AdminState, admin_routes};
 use axum::Router;
-use nodus_backup::{BackupOrchestrator, FsBackupRepository};
+use nodus_backup::{BackupOrchestrator, FsBackupRepository, WalCommittedTxn};
 use nodus_catalog::{
     CatalogReader, CatalogWriter, CreateRoleRequest, GrantPrivilegeRequest, PrincipalType,
     ResourceRef,
@@ -51,6 +51,42 @@ fn backup_dir(uri: &str) -> PathBuf {
     } else {
         PathBuf::from(trimmed)
     }
+}
+
+fn wal_archive_txn_index(
+    bytes: &[u8],
+    wal_key: Option<[u8; 32]>,
+) -> anyhow::Result<(Vec<String>, Vec<WalCommittedTxn>)> {
+    use nodus_storage_wal::{FileWalEngine, WalEngine, WalRecord, WalRecordV1};
+
+    let path = std::env::temp_dir().join(format!("nodus-wal-index-{}.log", uuid::Uuid::new_v4()));
+    std::fs::write(&path, bytes)?;
+    let result = (|| {
+        let wal = FileWalEngine::with_encryption(&path, wal_key)?;
+        let records = wal.recover()?;
+        let mut record_txn_ids = Vec::new();
+        let mut committed_txns = Vec::new();
+        for record in records {
+            let WalRecord::V1(record) = record;
+            match record {
+                WalRecordV1::BeginTxn { txn_id }
+                | WalRecordV1::WriteIntent { txn_id, .. }
+                | WalRecordV1::DeleteIntent { txn_id, .. } => {
+                    record_txn_ids.push(txn_id.0.to_string());
+                }
+                WalRecordV1::CommitTxn { txn_id, commit_ts } => {
+                    committed_txns.push(WalCommittedTxn {
+                        txn_id: txn_id.0.to_string(),
+                        commit_ts,
+                    });
+                }
+                WalRecordV1::AbortTxn { .. } | WalRecordV1::Checkpoint { .. } => {}
+            }
+        }
+        Ok((record_txn_ids, committed_txns))
+    })();
+    let _ = std::fs::remove_file(&path);
+    result
 }
 
 /// Backoff for the cluster-join retry loop: exponential (250ms → cap 10s) with
@@ -598,6 +634,7 @@ pub async fn run_server_with_config(
     let backup_clone = backup.clone();
     let data_dir_clone = config.storage.data_dir.clone();
     let local_kv_clone = local_kv.clone();
+    let wal_key = encryption_key;
     let mut wal_shutdown = shutdown.clone();
     let wal_archiver_task = tokio::spawn(async move {
         if let Some(dir_path_str) = data_dir_clone {
@@ -621,18 +658,37 @@ pub async fn run_server_with_config(
                             }
                             if !logs.is_empty() {
                                 let max_id = logs.iter().map(|(id, _)| *id).max().unwrap();
-                                let cleanup_allowed = backup_clone
-                                    .wal_cleanup_allowed()
-                                    .await
-                                    .unwrap_or(false);
                                 for (id, path) in logs {
                                     if id < max_id {
                                         if let Ok(bytes) = std::fs::read(&path) {
                                             let filename = format!("{}.log", id);
-                                            if backup_clone.archive_wal(&filename, bytes::Bytes::from(bytes)).await.is_ok() {
-                                                if cleanup_allowed {
+                                            if let Ok((record_txn_ids, committed_txns)) =
+                                                wal_archive_txn_index(&bytes, wal_key)
+                                            {
+                                                let data = bytes::Bytes::from(bytes);
+                                                if backup_clone
+                                                    .archive_wal_indexed(
+                                                        &filename,
+                                                        data,
+                                                        record_txn_ids,
+                                                        committed_txns,
+                                                    )
+                                                    .await
+                                                    .is_ok()
+                                                    && backup_clone
+                                                        .wal_segment_cleanup_allowed(&filename)
+                                                        .await
+                                                        .unwrap_or(false)
+                                                {
                                                     let _ = std::fs::remove_file(&path);
                                                 }
+                                            } else {
+                                                let _ = backup_clone
+                                                    .archive_wal(
+                                                        &filename,
+                                                        bytes::Bytes::from(bytes),
+                                                    )
+                                                    .await;
                                             }
                                         }
                                     }
@@ -890,6 +946,40 @@ mod tests {
         );
         // Empty falls back to a unique temp dir.
         assert!(backup_dir("").starts_with(std::env::temp_dir()));
+    }
+
+    #[test]
+    fn wal_archive_txn_index_reads_real_wal_bytes() {
+        use nodus_storage_api::TxnId;
+        use nodus_storage_wal::{FileWalEngine, WalEngine, WalRecord, WalRecordV1};
+
+        let path =
+            std::env::temp_dir().join(format!("nodus-wal-test-{}.log", uuid::Uuid::new_v4()));
+        let wal = FileWalEngine::new(&path).unwrap();
+        let txn_id = TxnId::new();
+        wal.append(WalRecord::V1(WalRecordV1::BeginTxn { txn_id }))
+            .unwrap();
+        wal.append(WalRecord::V1(WalRecordV1::WriteIntent {
+            txn_id,
+            key: b"k".to_vec(),
+            value: b"v".to_vec(),
+        }))
+        .unwrap();
+        wal.append(WalRecord::V1(WalRecordV1::CommitTxn {
+            txn_id,
+            commit_ts: 42,
+        }))
+        .unwrap();
+        wal.sync().unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        let (record_txn_ids, committed_txns) = wal_archive_txn_index(&bytes, None).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert!(record_txn_ids.contains(&txn_id.0.to_string()));
+        assert_eq!(committed_txns.len(), 1);
+        assert_eq!(committed_txns[0].txn_id, txn_id.0.to_string());
+        assert_eq!(committed_txns[0].commit_ts, 42);
     }
 
     #[test]
