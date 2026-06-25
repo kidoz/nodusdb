@@ -14,7 +14,9 @@ use bytes::Bytes;
 use nodus_audit::{AuditEvent, AuditQuery, AuditQueryable};
 use nodus_authz::{Action, AuthzContext, AuthzEngine, AuthzExplanation, AuthzRequest};
 use nodus_backup::{BackupObject, BackupOrchestrator};
-use nodus_catalog::{CatalogReader, CatalogWriter, PrincipalId, ResourceRef, ShardId, TableId};
+use nodus_catalog::{
+    CatalogReader, CatalogSnapshot, CatalogWriter, PrincipalId, ResourceRef, ShardId, TableId,
+};
 use nodus_monitoring::{SlowQuery, SlowQueryLog};
 use nodus_security::{SessionInfo, SessionRegistry};
 use nodus_sharding::ShardOrchestrator;
@@ -53,6 +55,9 @@ pub struct AdminState {
     pub admin_token: Option<String>,
     pub raft_state: nodus_raftstore::server::RaftState,
     pub membership_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes backup restores so two never interleave their catalog/KV
+    /// mutations into a corrupt result.
+    pub restore_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// Rejects requests lacking a valid `Authorization: Bearer <token>` header when
@@ -782,11 +787,71 @@ pub struct RestoreQuery {
     pub target_ts: Option<u64>,
 }
 
+/// Applies a restore to the engine, validating that every backup object parses
+/// **before** mutating anything — so a malformed backup is rejected with zero
+/// changes instead of leaving the catalog and KV in an inconsistent half-restored
+/// state. Catalog is imported before KV so a catalog failure leaves no orphan
+/// rows. (Full isolation from concurrent queries and rollback of a mid-write
+/// engine failure still require offline staging — tracked as follow-up.)
+fn apply_restore(
+    objects: &[BackupObject],
+    pitr: Option<(
+        nodus_backup::PitrRestorePlan,
+        Vec<nodus_backup::PitrWalSegmentBytes>,
+    )>,
+    kv: &dyn nodus_storage_api::KvEngine,
+    catalog_writer: &dyn CatalogWriter,
+    wal_key: Option<[u8; 32]>,
+) -> anyhow::Result<nodus_backup::PitrReplayReport> {
+    // 1. Validate all inputs parse, mutating nothing.
+    let mut catalog_snapshot: Option<CatalogSnapshot> = None;
+    for obj in objects {
+        match obj.name.as_str() {
+            "catalog.json" => {
+                catalog_snapshot = Some(
+                    serde_json::from_slice::<CatalogSnapshot>(&obj.bytes)
+                        .map_err(|e| anyhow::anyhow!("invalid catalog snapshot in backup: {e}"))?,
+                );
+            }
+            "kv_data.json" => {
+                serde_json::from_slice::<Vec<serde_json::Value>>(&obj.bytes)
+                    .map_err(|e| anyhow::anyhow!("invalid kv_data.json in backup: {e}"))?;
+            }
+            _ => {}
+        }
+    }
+
+    // 2. Mutate: catalog first, then KV, then WAL replay.
+    if let Some(snapshot) = catalog_snapshot {
+        catalog_writer.import_snapshot(snapshot)?;
+    }
+    let base_report = BackupOrchestrator::restore_backup_objects_to_kv(objects, kv)?;
+    match pitr {
+        Some((plan, wal_segments)) => {
+            let wal_report =
+                BackupOrchestrator::replay_pitr_wal_segments(&plan, &wal_segments, kv, wal_key)?;
+            Ok(BackupOrchestrator::merge_pitr_replay_reports(
+                base_report,
+                wal_report,
+            ))
+        }
+        None => Ok(base_report),
+    }
+}
+
 async fn restore_backup(
     State(state): State<AdminState>,
     Path(id): Path<String>,
     Query(query): Query<RestoreQuery>,
 ) -> Json<Value> {
+    // Serialize restores: two interleaving restores would corrupt the result.
+    let _restore_guard = match state.restore_lock.try_lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            return Json(json!({ "restored": 0, "error": "a restore is already in progress" }));
+        }
+    };
+
     let (objects, pitr) = if let Some(target_ts) = query.target_ts {
         let plan = match state.backup.plan_pitr_restore(target_ts).await {
             Ok(plan) => plan,
@@ -826,29 +891,13 @@ async fn restore_backup(
     let catalog_writer = state.catalog_writer.clone();
     let wal_key = state.wal_key;
     let replay = tokio::task::spawn_blocking(move || {
-        for obj in &objects {
-            if obj.name == "catalog.json"
-                && let Ok(snapshot) = serde_json::from_slice(&obj.bytes)
-            {
-                catalog_writer.import_snapshot(snapshot)?;
-            }
-        }
-
-        let base_report = BackupOrchestrator::restore_backup_objects_to_kv(&objects, kv.as_ref())?;
-        if let Some((plan, wal_segments)) = pitr {
-            let wal_report = BackupOrchestrator::replay_pitr_wal_segments(
-                &plan,
-                &wal_segments,
-                kv.as_ref(),
-                wal_key,
-            )?;
-            Ok::<_, anyhow::Error>(BackupOrchestrator::merge_pitr_replay_reports(
-                base_report,
-                wal_report,
-            ))
-        } else {
-            Ok(base_report)
-        }
+        apply_restore(
+            &objects,
+            pitr,
+            kv.as_ref(),
+            catalog_writer.as_ref(),
+            wal_key,
+        )
     })
     .await;
 
@@ -1263,5 +1312,72 @@ ALTER TABLE ONLY t ADD CONSTRAINT t_pkey PRIMARY KEY (id);
         let plan = nodus_executor::plan_statement(&stmts[0], &[]).unwrap();
         let out = executor.execute_logical(&ctx, plan).unwrap();
         assert_eq!(out.rows.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod restore_tests {
+    use super::*;
+
+    fn engine_and_catalog() -> (
+        std::sync::Arc<dyn nodus_storage_api::KvEngine>,
+        std::sync::Arc<nodus_catalog::MemoryCatalog>,
+    ) {
+        let (exec, cat) =
+            nodus_executor::MemExecutor::shared(Arc::new(nodus_audit::MemoryAuditSink::new()));
+        (exec.kv(), cat)
+    }
+
+    fn kv_object(json: serde_json::Value) -> BackupObject {
+        BackupObject {
+            name: "kv_data.json".into(),
+            bytes: Bytes::from(serde_json::to_vec(&json).unwrap()),
+        }
+    }
+
+    #[test]
+    fn apply_restore_loads_valid_objects() {
+        let (kv, cat) = engine_and_catalog();
+        // key [107]='k', value [118]='v', committed at version 10.
+        let objects = vec![kv_object(
+            json!([{"key": [107], "value": [118], "version": 10}]),
+        )];
+
+        let report = apply_restore(&objects, None, kv.as_ref(), cat.as_ref(), None).unwrap();
+        assert_eq!(report.base_kv_versions_restored, 1);
+        assert_eq!(
+            kv.get(b"k", u64::MAX).unwrap(),
+            Some(Bytes::from_static(b"v"))
+        );
+    }
+
+    #[test]
+    fn apply_restore_rejects_malformed_kv_without_mutating() {
+        let (kv, cat) = engine_and_catalog();
+        let objects = vec![BackupObject {
+            name: "kv_data.json".into(),
+            bytes: Bytes::from_static(b"this is not json"),
+        }];
+
+        assert!(apply_restore(&objects, None, kv.as_ref(), cat.as_ref(), None).is_err());
+        // Validate-first: nothing was written.
+        assert!(kv.get(b"k", u64::MAX).unwrap().is_none());
+    }
+
+    #[test]
+    fn apply_restore_rejects_malformed_catalog_before_touching_kv() {
+        let (kv, cat) = engine_and_catalog();
+        // A *valid* KV dump alongside a *malformed* catalog: the catalog failure
+        // must abort the whole restore before any KV write.
+        let objects = vec![
+            BackupObject {
+                name: "catalog.json".into(),
+                bytes: Bytes::from_static(b"not a snapshot"),
+            },
+            kv_object(json!([{"key": [107], "value": [118], "version": 10}])),
+        ];
+
+        assert!(apply_restore(&objects, None, kv.as_ref(), cat.as_ref(), None).is_err());
+        assert!(kv.get(b"k", u64::MAX).unwrap().is_none());
     }
 }

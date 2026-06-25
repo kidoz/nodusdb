@@ -780,6 +780,7 @@ pub async fn run_server_with_config(
         admin_token: config.admin.token.clone(),
         raft_state: raft_state.clone(),
         membership_lock: Arc::new(tokio::sync::Mutex::new(())),
+        restore_lock: Arc::new(tokio::sync::Mutex::new(())),
     };
 
     let app = Router::new()
