@@ -70,6 +70,7 @@ async fn require_token(
         p if p.starts_with("/api/v1/backups") => nodus_authz::Action::ManageBackups,
         p if p.starts_with("/api/v1/upgrade") => nodus_authz::Action::ManageUpgrades,
         p if p.starts_with("/api/v1/shards") => nodus_authz::Action::ManageShards,
+        p if p.starts_with("/api/v1/catalog") => nodus_authz::Action::ManageShards,
         p if p.starts_with("/api/v1/node") => nodus_authz::Action::ManageNode,
         p if p.starts_with("/api/v1/cluster") => nodus_authz::Action::ManageCluster,
         p if p.starts_with("/api/v1/queries") => nodus_authz::Action::ReadAudit,
@@ -171,6 +172,7 @@ pub fn admin_routes(state: AdminState) -> Router {
         .route("/api/v1/shards/:table/merge", post(shards_merge))
         .route("/api/v1/shards/:table/rebalance", post(shards_rebalance))
         .route("/api/v1/shards/:table/replica", post(shards_replica))
+        .route("/api/v1/catalog/table", get(catalog_table))
         .route("/api/v1/cluster/groups", get(cluster_groups))
         .route("/api/v1/queries", get(slow_queries))
         .route("/api/v1/node/drain", post(node_drain))
@@ -1089,6 +1091,24 @@ async fn shards_replica(
     }
 }
 
+/// Resolves a table's catalog id (`uuid`) by name, so operators and tests can
+/// turn a `db.schema.table` into the id the shard APIs and row keys are keyed
+/// by. Defaults `db` to `default` and `schema` to `public`.
+async fn catalog_table(
+    State(state): State<AdminState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Json<Value> {
+    let db = params.get("db").map(String::as_str).unwrap_or("default");
+    let schema = params.get("schema").map(String::as_str).unwrap_or("public");
+    let Some(name) = params.get("name") else {
+        return Json(json!({ "error": "missing 'name'" }));
+    };
+    match state.catalog.get_table(db, schema, name) {
+        Ok(desc) => Json(json!({ "id": desc.id.to_string(), "name": name })),
+        Err(e) => Json(json!({ "error": e.to_string() })),
+    }
+}
+
 /// Reports the data-shard Raft groups this node hosts and their membership, so
 /// operators and tests can confirm a group formed across the cluster. The meta
 /// group is excluded.
@@ -1105,6 +1125,7 @@ async fn cluster_groups(State(state): State<AdminState>) -> Json<Value> {
             "id": id,
             "voters": voters,
             "leader": metrics.current_leader,
+            "applied": metrics.last_applied.map(|l| l.index),
         }));
     }
     Json(json!({ "groups": groups }))
