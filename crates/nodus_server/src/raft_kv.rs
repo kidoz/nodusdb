@@ -406,7 +406,13 @@ mod tests {
         // The meta group shares the base store, exactly as `run_server` wires it
         // (the meta group's engine == `RaftKvEngine.local`).
         let meta_raft = manager
-            .create_meta(base.clone(), catalog.clone(), catalog.clone(), upgrade)
+            .create_meta(
+                base.clone(),
+                catalog.clone(),
+                catalog.clone(),
+                upgrade,
+                Arc::new(nodus_meta::MemMetaStore::new()),
+            )
             .await
             .unwrap();
         elect(&meta_raft).await;
@@ -504,7 +510,13 @@ mod tests {
         ));
         elect(
             &manager
-                .create_meta(base.clone(), catalog.clone(), catalog, upgrade)
+                .create_meta(
+                    base.clone(),
+                    catalog.clone(),
+                    catalog,
+                    upgrade,
+                    Arc::new(nodus_meta::MemMetaStore::new()),
+                )
                 .await
                 .unwrap(),
         )

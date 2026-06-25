@@ -4,6 +4,7 @@ mod multi_raft;
 mod raft_catalog;
 mod raft_kv;
 mod raft_router;
+mod raft_shard_meta;
 mod raft_upgrade;
 
 use admin::{AdminState, admin_routes};
@@ -14,7 +15,6 @@ use nodus_catalog::{
     ResourceRef,
 };
 use nodus_config::NodusConfig;
-use nodus_meta::MetaStore;
 use nodus_monitoring::{AppState, monitoring_routes};
 use nodus_security::{PasswordAuthenticator, SessionRegistry};
 use std::net::SocketAddr;
@@ -271,12 +271,19 @@ pub async fn run_server_with_config(
         raft_state.clone(),
         local_kv.clone(),
     ));
+
+    // Local cluster-metadata store (shard maps + placements), KV-backed so it
+    // survives restart. The meta group's state machine applies shard-map and
+    // placement commands into *this* store, so every node converges on it.
+    let local_meta = Arc::new(nodus_meta::PersistentMetaStore::new(local_kv.clone()));
+
     let raft = multi_raft
         .create_meta(
             local_kv.clone(),
             catalog.clone(),
             catalog.clone(),
             local_upgrade.clone(),
+            local_meta.clone(),
         )
         .await
         .map_err(|e| anyhow::anyhow!("raft init: {e}"))?;
@@ -293,13 +300,18 @@ pub async fn run_server_with_config(
     // traits to async Raft `client_write` without `block_in_place`.
     let raft_router = crate::raft_router::RaftRouter::spawn(multi_raft.clone());
 
-    // Cluster metadata + shard routing. Shared by the KV write/read path (to
-    // route keys to their owning group) and the shard admin orchestrator.
-    // KV-backed so shard maps and placements survive a restart (durable when the
-    // local store is persistent); reads/writes go to the meta group's engine.
-    let meta = Arc::new(nodus_meta::PersistentMetaStore::new(local_kv.clone()));
+    // Routing reads the LOCAL store (kept current by the meta group's apply
+    // path), so every node routes identically.
     let shard_router: Arc<dyn nodus_sharding::ShardRouter> =
-        Arc::new(nodus_sharding::CatalogShardRouter::new(meta.clone()));
+        Arc::new(nodus_sharding::CatalogShardRouter::new(local_meta.clone()));
+
+    // The orchestrator WRITES shard maps/placements through the meta Raft group
+    // (so all nodes apply them); reads fall through to the local store.
+    let meta: Arc<dyn nodus_meta::MetaStore> =
+        Arc::new(crate::raft_shard_meta::RaftShardMetaStore {
+            local: local_meta.clone(),
+            router: raft_router.clone(),
+        });
 
     let raft_kv = Arc::new(crate::raft_kv::RaftKvEngine {
         local: local_kv.clone(),

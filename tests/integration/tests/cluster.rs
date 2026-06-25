@@ -4,10 +4,12 @@
 //! fault-tolerance.
 
 use nodus_testkit::cluster::ClusterFixture;
+use serial_test::serial;
 use std::time::Duration;
 
 /// Three nodes form a cluster and a write on the leader replicates to a follower.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial(cluster)]
 async fn three_node_cluster_forms_and_replicates() {
     let cluster = ClusterFixture::start(3)
         .await
@@ -50,6 +52,7 @@ async fn three_node_cluster_forms_and_replicates() {
 
 /// With one follower down the leader keeps quorum (2/3) and still serves writes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial(cluster)]
 async fn cluster_tolerates_a_follower_failure() {
     let mut cluster = ClusterFixture::start(3)
         .await
@@ -87,6 +90,7 @@ async fn cluster_tolerates_a_follower_failure() {
 /// catalog — rejoins the cluster, and serves the data written while it was a
 /// member. This only works because the Raft log/vote/applied-state is durable.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial(cluster)]
 async fn a_restarted_node_rejoins_and_recovers_its_data() {
     let mut cluster = ClusterFixture::start(3)
         .await
@@ -136,6 +140,7 @@ async fn a_restarted_node_rejoins_and_recovers_its_data() {
 /// re-elects a new leader that keeps serving, and the pre-failure write is still
 /// readable. This is the consensus payoff of the harness + durable log.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial(cluster)]
 async fn cluster_survives_leader_failure_and_reelects() {
     let mut cluster = ClusterFixture::start(3)
         .await
@@ -181,4 +186,49 @@ async fn cluster_survives_leader_failure_and_reelects() {
     assert_eq!(rows.len(), 2, "both rows should be present after failover");
     assert_eq!(rows[0].get::<_, String>(0), "before");
     assert_eq!(rows[1].get::<_, String>(0), "after");
+}
+
+/// A shard map created on one node replicates through the meta Raft group so
+/// every node routes identically. Before Phase 1 this write was node-local.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial(cluster)]
+async fn shard_map_replicates_across_the_cluster() {
+    let cluster = ClusterFixture::start(3)
+        .await
+        .expect("3-node cluster forms");
+    assert!(cluster.wait_nodes_live(3, Duration::from_secs(45)).await);
+
+    // A fixed table id (no catalog row needed — the shard map is keyed by id).
+    let table = "11111111-1111-1111-1111-111111111111";
+
+    // Initialize a shard on the meta leader (node 0). This write replicates
+    // through the meta group to every node's local store.
+    let init = cluster
+        .admin_post(0, &format!("/api/v1/shards/{table}/init"))
+        .await
+        .expect("shard init succeeds on the leader");
+    assert!(init.get("shard_id").is_some(), "shard created: {init:?}");
+
+    // A different node now sees the same shard map (allow time for the apply).
+    let mut shards_seen = 0;
+    for _ in 0..60 {
+        if let Ok(map) = cluster
+            .admin_get(2, &format!("/api/v1/shards/{table}"))
+            .await
+        {
+            shards_seen = map
+                .get("shards")
+                .and_then(|s| s.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
+            if shards_seen > 0 {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert_eq!(
+        shards_seen, 1,
+        "the shard map should replicate to another node"
+    );
 }

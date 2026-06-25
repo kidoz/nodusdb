@@ -264,6 +264,34 @@ impl ClusterFixture {
         anyhow::bail!("could not connect to node {idx} pgwire")
     }
 
+    /// Authenticated admin `POST` to node `idx`, returning the JSON body.
+    pub async fn admin_post(&self, idx: usize, path: &str) -> Result<serde_json::Value> {
+        let url = format!("http://{}{}", self.nodes[idx].http_addr(), path);
+        Ok(self
+            .http
+            .post(url)
+            .bearer_auth(ADMIN_TOKEN)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    }
+
+    /// Authenticated admin `GET` from node `idx`, returning the JSON body.
+    pub async fn admin_get(&self, idx: usize, path: &str) -> Result<serde_json::Value> {
+        let url = format!("http://{}{}", self.nodes[idx].http_addr(), path);
+        Ok(self
+            .http
+            .get(url)
+            .bearer_auth(ADMIN_TOKEN)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    }
+
     /// Single attempt to connect to node `idx` (no retry). Returns `None` if the
     /// listener isn't accepting (e.g. the node is stopped).
     async fn try_connect(&self, idx: usize) -> Option<tokio_postgres::Client> {

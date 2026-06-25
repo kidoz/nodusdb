@@ -97,8 +97,15 @@ impl MultiRaftManager {
         catalog_writer: Arc<dyn nodus_catalog::CatalogWriter>,
         catalog_reader: Arc<dyn nodus_catalog::CatalogReader>,
         upgrade: Arc<dyn nodus_upgrade::UpgradeCoordinator>,
+        meta_store: Arc<dyn nodus_meta::MetaStore>,
     ) -> Result<NodusRaft> {
-        let store = NodusRaftStore::with_components(kv, catalog_writer, catalog_reader, upgrade);
+        let store = NodusRaftStore::with_components(
+            kv,
+            catalog_writer,
+            catalog_reader,
+            upgrade,
+            meta_store,
+        );
         self.spawn_group(META_SHARD, store).await
     }
 
@@ -220,7 +227,7 @@ impl MultiRaftManager {
     /// Single-node today; cross-node transfer (learner + snapshot ship) is future.
     pub async fn split_shard(
         &self,
-        orchestrator: &ShardOrchestrator,
+        orchestrator: &Arc<ShardOrchestrator>,
         table_id: TableId,
         shard_id: ShardId,
         split_key: Vec<u8>,
@@ -244,7 +251,12 @@ impl MultiRaftManager {
             )?;
         }
 
-        orchestrator.commit_split(&plan)?; // atomic routing flip
+        // The routing flip replicates through the meta Raft group (blocking
+        // submit), so commit off the reactor.
+        let orch = orchestrator.clone();
+        tokio::task::spawn_blocking(move || orch.commit_split(&plan))
+            .await
+            .map_err(|e| anyhow::anyhow!("commit_split task panicked: {e}"))??;
 
         if local {
             self.remove_group(&Self::data_group_id(shard_id)).await?;
@@ -268,8 +280,11 @@ impl MultiRaftManager {
         let left = NamespacedKvEngine::new(self.base_kv.clone(), left_group);
         let right = NamespacedKvEngine::new(self.base_kv.clone(), right_group);
 
+        // Start at 0x01 to copy only user data — never the source group's own
+        // `\0`-prefixed Raft state (log/vote/applied), which is private to it and
+        // would otherwise collide with the destination group's Raft keys.
         let full = KeyRange {
-            start: Bytes::new(),
+            start: Bytes::from_static(&[1]),
             end: Bytes::from(vec![255u8; 1024]),
         };
         let entries: Vec<(Bytes, Bytes, u64)> = source
@@ -298,7 +313,7 @@ impl MultiRaftManager {
     /// source groups. Single-node today; cross-node transfer is future.
     pub async fn merge_shards(
         &self,
-        orchestrator: &ShardOrchestrator,
+        orchestrator: &Arc<ShardOrchestrator>,
         table_id: TableId,
         left_id: ShardId,
         right_id: ShardId,
@@ -318,7 +333,12 @@ impl MultiRaftManager {
             )?;
         }
 
-        orchestrator.commit_merge(&plan)?; // atomic routing flip
+        // The routing flip replicates through the meta Raft group (blocking
+        // submit), so commit off the reactor.
+        let orch = orchestrator.clone();
+        tokio::task::spawn_blocking(move || orch.commit_merge(&plan))
+            .await
+            .map_err(|e| anyhow::anyhow!("commit_merge task panicked: {e}"))??;
 
         if local {
             self.remove_group(&Self::data_group_id(left_id)).await?;
@@ -340,8 +360,10 @@ impl MultiRaftManager {
         let merged = NamespacedKvEngine::new(self.base_kv.clone(), merged_group);
         for src_group in [left_group, right_group] {
             let source = NamespacedKvEngine::new(self.base_kv.clone(), src_group);
+            // Skip the source group's `\0`-prefixed Raft state — copy user data
+            // only (see `relocate_partition`).
             let full = KeyRange {
-                start: Bytes::new(),
+                start: Bytes::from_static(&[1]),
                 end: Bytes::from(vec![255u8; 1024]),
             };
             let entries: Vec<(Bytes, Bytes, u64)> = source
@@ -401,6 +423,7 @@ mod tests {
                 catalog.clone(),
                 catalog.clone(),
                 upgrade,
+                Arc::new(nodus_meta::MemMetaStore::new()),
             )
             .await
             .unwrap();
@@ -487,7 +510,7 @@ mod tests {
         );
 
         let meta = Arc::new(nodus_meta::PersistentMetaStore::new(base.clone()));
-        let orch = nodus_sharding::ShardOrchestrator::new(meta);
+        let orch = Arc::new(nodus_sharding::ShardOrchestrator::new(meta));
         let table = TableId(uuid::Uuid::new_v4());
         let source = orch.init_single_shard(table).unwrap();
         orch.move_shard(source, "1").unwrap();
@@ -538,7 +561,7 @@ mod tests {
         );
 
         let meta = Arc::new(nodus_meta::PersistentMetaStore::new(base.clone()));
-        let orch = nodus_sharding::ShardOrchestrator::new(meta);
+        let orch = Arc::new(nodus_sharding::ShardOrchestrator::new(meta));
         let table = TableId(uuid::Uuid::new_v4());
         let source = orch.init_single_shard(table).unwrap();
         orch.move_shard(source, "1").unwrap();
@@ -592,7 +615,7 @@ mod tests {
         // Write shard map + placement through one store/orchestrator.
         let shard_id = {
             let meta = Arc::new(nodus_meta::PersistentMetaStore::new(kv.clone()));
-            let orch = nodus_sharding::ShardOrchestrator::new(meta);
+            let orch = Arc::new(nodus_sharding::ShardOrchestrator::new(meta));
             let sid = orch.init_single_shard(table).unwrap();
             orch.move_shard(sid, "1").unwrap();
             sid
@@ -601,7 +624,7 @@ mod tests {
         // Reopen against the same backing KV (a restart on a persistent store):
         // the orchestrator reloads placements, and the shard map is still there.
         let meta = Arc::new(nodus_meta::PersistentMetaStore::new(kv));
-        let orch = nodus_sharding::ShardOrchestrator::new(meta);
+        let orch = Arc::new(nodus_sharding::ShardOrchestrator::new(meta));
         assert_eq!(orch.placement(shard_id), Some("1".to_string()));
         assert!(orch.shard_map(table).is_ok());
     }

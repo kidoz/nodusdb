@@ -86,6 +86,10 @@ pub enum ShardCommand {
     InstallSnapshot {
         snapshot_id: String,
     },
+    // Cluster-metadata replication (applied on the meta group so every node's
+    // local `MetaStore` agrees on routing and shard placement).
+    UpdateShardMap(nodus_meta::ShardMap),
+    UpdateShardPlacements(std::collections::HashMap<nodus_catalog::ShardId, String>),
     // Catalog Replication Commands
     CreateDatabase(nodus_catalog::CreateDatabaseRequest),
     CreateSchema(nodus_catalog::CreateSchemaRequest),
@@ -310,6 +314,9 @@ pub struct StateMachine {
     pub catalog_writer: Option<Arc<dyn nodus_catalog::CatalogWriter>>,
     pub catalog_reader: Option<Arc<dyn nodus_catalog::CatalogReader>>,
     pub upgrade: Option<Arc<dyn nodus_upgrade::UpgradeCoordinator>>,
+    /// Local cluster-metadata store the meta group applies shard-map/placement
+    /// commands to, so every node converges on the same routing state.
+    pub meta_store: Option<Arc<dyn nodus_meta::MetaStore>>,
 }
 
 #[derive(Clone)]
@@ -343,6 +350,7 @@ impl NodusRaftStore {
                 catalog_writer: None,
                 catalog_reader: None,
                 upgrade: None,
+                meta_store: None,
             })),
             meta: None,
         }
@@ -356,6 +364,7 @@ impl NodusRaftStore {
         catalog_writer: Option<Arc<dyn nodus_catalog::CatalogWriter>>,
         catalog_reader: Option<Arc<dyn nodus_catalog::CatalogReader>>,
         upgrade: Option<Arc<dyn nodus_upgrade::UpgradeCoordinator>>,
+        meta_store: Option<Arc<dyn nodus_meta::MetaStore>>,
     ) -> Self {
         let meta = Arc::new(RaftMetaStore::new(kv.clone()));
         let log = meta.load_log();
@@ -372,6 +381,7 @@ impl NodusRaftStore {
                 catalog_writer,
                 catalog_reader,
                 upgrade,
+                meta_store,
             })),
             meta: Some(meta),
         }
@@ -382,27 +392,32 @@ impl NodusRaftStore {
         catalog_writer: Arc<dyn nodus_catalog::CatalogWriter>,
         catalog_reader: Arc<dyn nodus_catalog::CatalogReader>,
     ) -> Self {
-        Self::with(kv, Some(catalog_writer), Some(catalog_reader), None)
+        Self::with(kv, Some(catalog_writer), Some(catalog_reader), None, None)
     }
 
     /// Builds a store for a data shard: it applies only KV commands to its
     /// (namespaced) engine. Catalog/RBAC and upgrade commands are no-ops on a
     /// data group — those are owned by the meta group.
     pub fn with_kv(kv: Arc<dyn nodus_storage_api::KvEngine>) -> Self {
-        Self::with(kv, None, None, None)
+        Self::with(kv, None, None, None, None)
     }
 
+    /// Builds the meta-group store with full catalog/RBAC/upgrade components plus
+    /// the local cluster-metadata store that shard-map/placement commands apply
+    /// to.
     pub fn with_components(
         kv: Arc<dyn nodus_storage_api::KvEngine>,
         catalog_writer: Arc<dyn nodus_catalog::CatalogWriter>,
         catalog_reader: Arc<dyn nodus_catalog::CatalogReader>,
         upgrade: Arc<dyn nodus_upgrade::UpgradeCoordinator>,
+        meta_store: Arc<dyn nodus_meta::MetaStore>,
     ) -> Self {
         Self::with(
             kv,
             Some(catalog_writer),
             Some(catalog_reader),
             Some(upgrade),
+            Some(meta_store),
         )
     }
 
@@ -711,6 +726,21 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
                             } => {
                                 let _ =
                                     catalog.update_index_state(*table_id, *index_id, state.clone());
+                            }
+                            _ => {}
+                        }
+                    }
+                    if let Some(meta_store) = &sm.meta_store {
+                        match cmd {
+                            ShardCommand::UpdateShardMap(map) => {
+                                if let Err(e) = meta_store.update_shard_map(map.clone()) {
+                                    tracing::error!("UpdateShardMap apply failed: {e}");
+                                }
+                            }
+                            ShardCommand::UpdateShardPlacements(placements) => {
+                                if let Err(e) = meta_store.update_shard_placements(placements) {
+                                    tracing::error!("UpdateShardPlacements apply failed: {e}");
+                                }
                             }
                             _ => {}
                         }

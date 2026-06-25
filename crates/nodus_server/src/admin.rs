@@ -942,9 +942,14 @@ async fn shards_init(State(state): State<AdminState>, Path(table): Path<String>)
     let Some(table_id) = parse_table(&table) else {
         return Json(json!({ "error": "invalid table id" }));
     };
-    match state.shards.init_single_shard(table_id) {
-        Ok(id) => Json(json!({ "table": table_id.to_string(), "shard_id": id.to_string() })),
-        Err(e) => Json(json!({ "error": e.to_string() })),
+    // The orchestrator's shard-map write replicates through Raft (blocking
+    // submit), so run it off the reactor.
+    let shards = state.shards.clone();
+    let result = tokio::task::spawn_blocking(move || shards.init_single_shard(table_id)).await;
+    match result {
+        Ok(Ok(id)) => Json(json!({ "table": table_id.to_string(), "shard_id": id.to_string() })),
+        Ok(Err(e)) => Json(json!({ "error": e.to_string() })),
+        Err(e) => Json(json!({ "error": format!("task failed: {e}") })),
     }
 }
 
@@ -1050,11 +1055,17 @@ async fn shards_rebalance(
         .get("nodes")
         .map(|s| s.split(',').map(|n| n.trim().to_string()).collect())
         .unwrap_or_default();
-    match state.shards.rebalance(table_id, &nodes) {
-        Ok(()) => {
+    // Placement write replicates through Raft (blocking submit) — run off-reactor.
+    let shards = state.shards.clone();
+    let nodes_for_task = nodes.clone();
+    let result =
+        tokio::task::spawn_blocking(move || shards.rebalance(table_id, &nodes_for_task)).await;
+    match result {
+        Ok(Ok(())) => {
             reconcile_shards(&state).await;
             Json(json!({ "rebalanced": true, "nodes": nodes }))
         }
-        Err(e) => Json(json!({ "error": e.to_string() })),
+        Ok(Err(e)) => Json(json!({ "error": e.to_string() })),
+        Err(e) => Json(json!({ "error": format!("task failed: {e}") })),
     }
 }

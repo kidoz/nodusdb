@@ -16,6 +16,7 @@ tokio.workspace = true
 nodus_catalog = { path = "../nodus_catalog" }
 nodus_storage_api = { path = "../nodus_storage_api" }
 nodus_sharding = { path = "../nodus_sharding" }
+nodus_meta = { path = "../nodus_meta" }
 reqwest.workspace = true
 axum.workspace = true
 serde_json.workspace = true
