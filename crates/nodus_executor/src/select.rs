@@ -128,6 +128,7 @@ impl MemExecutor {
                                     rows = Some(self.merge_overlay_eq(
                                         indexed_rows,
                                         tbl.id,
+                                        &Self::pk_positions(&tbl),
                                         col_pos,
                                         &val,
                                         &ctx.session_id,

@@ -394,9 +394,10 @@ impl MemExecutor {
         self.catalog_writer.update_table_descriptor(change)?;
 
         // Backfill existing rows into the new index
+        let pk_positions = Self::pk_positions(&tbl);
         let mut seen_values = std::collections::HashSet::new();
         for row in self.scan_rows(tbl.id, &ctx.session_id)? {
-            let pk_str = row.first().map(render).unwrap_or_default();
+            let pk_str = Self::row_pk(&pk_positions, &row);
             for kcol in &index.key_columns {
                 if let Some(pos) = tbl.columns.iter().position(|c| c.id == kcol.column_id) {
                     let index_val = row.get(pos).unwrap_or(&Value::Null);

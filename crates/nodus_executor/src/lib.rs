@@ -435,19 +435,20 @@ impl MemExecutor {
     /// index-scan results, keyed by primary key (the first column). This lets an
     /// equality lookup use the index *inside* a transaction instead of falling
     /// back to a full table scan, while staying consistent with the txn's own
-    /// pending writes. Rows are keyed by `render(first column)`, matching the
-    /// `{table_id}:{pk}` overlay-key convention.
+    /// pending writes. Rows are keyed by their declared primary key (see
+    /// [`Self::row_pk`]), matching the `{table_id}:{pk}` overlay-key convention.
     pub(crate) fn merge_overlay_eq(
         &self,
         committed: Vec<Vec<Value>>,
         table_id: TableId,
+        pk_positions: &[usize],
         col_pos: Option<usize>,
         val: &Value,
         session: &str,
     ) -> Vec<Vec<Value>> {
         let mut map: std::collections::BTreeMap<String, Vec<Value>> = committed
             .into_iter()
-            .map(|r| (r.first().map(render).unwrap_or_default(), r))
+            .map(|r| (Self::row_pk(pk_positions, &r), r))
             .collect();
         if let Some(txn) = self.active_txns.read().unwrap().get(session) {
             let start = format!("{}:", table_id);

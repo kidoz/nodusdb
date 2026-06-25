@@ -184,6 +184,120 @@ fn create_insert_select_round_trip() {
 }
 
 #[test]
+fn rows_keyed_by_declared_pk_not_first_column() {
+    // Regression: rows must be keyed by the declared PRIMARY KEY, not the first
+    // column. Here the PK is the *second* column; the first column is not unique.
+    let (exec, cat) = MemExecutor::shared(Arc::new(MemoryAuditSink::new()));
+    let admin = cat
+        .create_role(CreateRoleRequest {
+            id: nodus_catalog::PrincipalId::new(),
+            name: "admin".into(),
+            principal_type: PrincipalType::User,
+            database_id: None,
+        })
+        .unwrap();
+    cat.grant_privilege(GrantPrivilegeRequest {
+        id: nodus_catalog::GrantId::new(),
+        principal_id: admin.id,
+        resource: ResourceRef::System,
+        privilege: "ALL".into(),
+    })
+    .unwrap();
+    let ctx = ctx_for(admin.id);
+
+    let columns = vec![
+        ColumnDef {
+            name: "label".into(),
+            data_type: "TEXT".into(),
+            nullable: false,
+            unique: false,
+            primary: false,
+        },
+        ColumnDef {
+            name: "id".into(),
+            data_type: "INT".into(),
+            nullable: false,
+            // PRIMARY KEY implies UNIQUE, as the SQL planner produces it.
+            unique: true,
+            primary: true,
+        },
+    ];
+    exec.execute_logical(
+        &ctx,
+        LogicalPlan::CreateTable {
+            constraints: vec![],
+            name: "t".into(),
+            columns,
+        },
+    )
+    .unwrap();
+
+    // Two rows share the first column ("dup") but have distinct primary keys.
+    // Pre-fix this collided on key `t:dup` (rejected as a PK violation / overwrite).
+    for id in ["1", "2"] {
+        exec.execute_logical(
+            &ctx,
+            LogicalPlan::Insert {
+                table_name: "t".into(),
+                columns: vec!["label".into(), "id".into()],
+                values_list: vec![vec![Value::Text("dup".into()), Value::Text(id.into())]],
+                returning: vec![],
+            },
+        )
+        .unwrap_or_else(|e| panic!("insert id={id} must succeed: {e}"));
+    }
+
+    let select_all = || LogicalPlan::Select {
+        ctes: vec![],
+        table_alias: None,
+        group_by: vec![],
+        table_name: "t".into(),
+        joins: vec![],
+        projection: vec![],
+        filter: None,
+        having: None,
+        order_by: vec![],
+        limit: None,
+        offset: None,
+        distinct: false,
+    };
+
+    // Both distinct-PK rows persist independently.
+    let all = exec.execute_logical(&ctx, select_all()).unwrap();
+    assert_eq!(all.rows.len(), 2, "both rows must persist");
+
+    // A genuine duplicate primary key is still rejected.
+    let dup = exec.execute_logical(
+        &ctx,
+        LogicalPlan::Insert {
+            table_name: "t".into(),
+            columns: vec!["label".into(), "id".into()],
+            values_list: vec![vec![Value::Text("other".into()), Value::Text("1".into())]],
+            returning: vec![],
+        },
+    );
+    assert!(dup.is_err(), "duplicate primary key must be rejected");
+
+    // DELETE keyed by the declared PK removes exactly the targeted row.
+    exec.execute_logical(
+        &ctx,
+        LogicalPlan::Delete {
+            table_name: "t".into(),
+            filter: eq("id", "1"),
+            returning: vec![],
+        },
+    )
+    .unwrap();
+    let remaining = exec.execute_logical(&ctx, select_all()).unwrap();
+    assert_eq!(remaining.rows.len(), 1, "exactly one row should remain");
+    // The surviving row is the one whose PK is 2.
+    assert!(
+        remaining.rows[0].values.iter().any(|v| render(v) == "2"),
+        "row with id=2 should survive"
+    );
+}
+
+#[test]
 fn typed_values_round_trip_and_filter_by_int() {
     let (exec, cat) = MemExecutor::shared(Arc::new(MemoryAuditSink::new()));
     let admin = cat

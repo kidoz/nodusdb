@@ -24,10 +24,11 @@ impl MemExecutor {
             }
         }
 
-        let new_pk = new_row.first().map(render).unwrap_or_default();
+        let pk_positions = Self::pk_positions(tbl);
+        let new_pk = Self::row_pk(&pk_positions, new_row);
 
         for existing in self.scan_rows(tbl.id, session)? {
-            let pk = existing.first().map(render).unwrap_or_default();
+            let pk = Self::row_pk(&pk_positions, &existing);
             if Some(pk.as_str()) == skip_pk {
                 continue;
             }

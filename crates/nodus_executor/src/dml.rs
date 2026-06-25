@@ -10,6 +10,46 @@ use nodus_catalog::{ColumnDescriptor, DescriptorState};
 use nodus_storage_api::{KeyRange, KvEngine};
 
 impl MemExecutor {
+    /// Positions (in table-column order) of the columns that form the table's
+    /// declared `PRIMARY KEY`. Falls back to the first column when no primary
+    /// index is present (e.g. a PK-less table), preserving the legacy rowid so
+    /// existing data stays addressable.
+    pub(crate) fn pk_positions(tbl: &nodus_catalog::TableDescriptor) -> Vec<usize> {
+        // A composite PRIMARY KEY is modeled as one Primary index per column, so
+        // gather key columns from every primary index, then order them by their
+        // table-column position for a deterministic composite key.
+        let mut positions: Vec<usize> = tbl
+            .indexes
+            .iter()
+            .filter(|i| i.index_type == nodus_catalog::IndexType::Primary)
+            .flat_map(|i| i.key_columns.iter())
+            .filter_map(|kc| tbl.columns.iter().position(|c| c.id == kc.column_id))
+            .collect();
+        positions.sort_unstable();
+        positions.dedup();
+        if positions.is_empty() {
+            vec![0]
+        } else {
+            positions
+        }
+    }
+
+    /// Renders a row's primary-key string from the given column positions. A
+    /// single-column key renders to exactly that column's value — identical to
+    /// the legacy `render(first column)` encoding — while a composite key joins
+    /// its parts with a `\u{1}` separator that cannot occur at a column
+    /// boundary, so distinct keys never collide.
+    pub(crate) fn row_pk(positions: &[usize], row: &[Value]) -> String {
+        if let [pos] = positions {
+            return row.get(*pos).map(render).unwrap_or_default();
+        }
+        positions
+            .iter()
+            .map(|&p| row.get(p).map(render).unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join("\u{1}")
+    }
+
     pub(crate) fn exec_insert(
         &self,
         ctx: &ExecutionContext,
@@ -25,6 +65,7 @@ impl MemExecutor {
         self.authorize(ctx, Action::Insert, ResourceRef::Table(tbl.id))?;
 
         let col_names: Vec<&str> = tbl.columns.iter().map(|c| c.name.as_str()).collect();
+        let pk_positions = Self::pk_positions(&tbl);
         let mut inserted_count = 0;
         let mut returning_rows = Vec::new();
 
@@ -65,8 +106,8 @@ impl MemExecutor {
                 &col_names.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
             )?;
 
-            // Primary key = first column's rendered value.
-            let pk = row.first().map(render).unwrap_or_default();
+            // Primary key derived from the table's declared PRIMARY KEY columns.
+            let pk = Self::row_pk(&pk_positions, &row);
             let key = format!("{}:{}", tbl.id, pk);
             let encoded = serde_json::to_string(&row)?;
             self.write_row(&ctx.session_id, key, encoded)?;
@@ -130,6 +171,7 @@ impl MemExecutor {
             .get_table(db_name, schema_name, table_only)?;
         self.authorize(ctx, Action::Update, ResourceRef::Table(tbl.id))?;
         let col_names: Vec<&str> = tbl.columns.iter().map(|c| c.name.as_str()).collect();
+        let pk_positions = Self::pk_positions(&tbl);
 
         let mut updated = 0;
         let mut returning_rows = Vec::new();
@@ -138,7 +180,7 @@ impl MemExecutor {
                 continue;
             }
             let old_row = row.clone();
-            let old_pk_str = old_row.first().map(render).unwrap_or_default();
+            let old_pk_str = Self::row_pk(&pk_positions, &old_row);
             let old_key = format!("{}:{}", tbl.id, old_pk_str);
             for (col, val) in &assignments {
                 if let Some(idx) = col_names.iter().position(|c| c == col) {
@@ -153,7 +195,7 @@ impl MemExecutor {
                 }
             }
 
-            let pk_str = row.first().map(render).unwrap_or_default();
+            let pk_str = Self::row_pk(&pk_positions, &row);
             self.check_unique_constraints(&ctx.session_id, &tbl, &row, Some(&pk_str))?;
             self.check_table_constraints(
                 ctx,
@@ -242,13 +284,14 @@ impl MemExecutor {
             .get_table(db_name, schema_name, table_only)?;
         self.authorize(ctx, Action::Delete, ResourceRef::Table(tbl.id))?;
 
+        let pk_positions = Self::pk_positions(&tbl);
         let mut deleted = 0;
         let mut returning_rows = Vec::new();
         for row in self.scan_rows(tbl.id, &ctx.session_id)? {
             if !self.row_matches(ctx, &row, &tbl.columns, filter.as_ref()) {
                 continue;
             }
-            let pk_str = row.first().map(render).unwrap_or_default();
+            let pk_str = Self::row_pk(&pk_positions, &row);
             let key = format!("{}:{}", tbl.id, pk_str);
             self.delete_row(&ctx.session_id, key)?;
 
