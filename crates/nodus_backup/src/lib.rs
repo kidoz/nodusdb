@@ -5,6 +5,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
+use nodus_storage_api::KvEngine;
+use nodus_storage_wal::{FileWalEngine, WalEngine, WalRecord, WalRecordV1};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -358,6 +360,26 @@ pub struct PitrRestorePlan {
     pub generated_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PitrWalSegmentBytes {
+    pub segment_id: String,
+    pub bytes: Bytes,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PitrReplayReport {
+    pub base_objects_restored: usize,
+    pub base_kv_versions_restored: usize,
+    pub wal_segments_replayed: usize,
+    pub records_seen: usize,
+    pub writes_applied: usize,
+    pub deletes_applied: usize,
+    pub commits_applied: usize,
+    pub commits_skipped: usize,
+    pub aborts_applied: usize,
+    pub pending_txns_aborted: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackupManifest {
     pub manifest_version: u64,
@@ -430,6 +452,35 @@ fn wal_segment_sequence(segment_id: &str) -> Result<u64> {
         .unwrap_or(segment_id)
         .parse::<u64>()
         .map_err(|_| anyhow::anyhow!("unsupported non-numeric WAL segment id {segment_id}"))
+}
+
+fn recover_wal_records(
+    segment_id: &str,
+    bytes: &Bytes,
+    wal_key: Option<[u8; 32]>,
+) -> Result<Vec<WalRecord>> {
+    let path = std::env::temp_dir().join(format!(
+        "nodus-pitr-replay-{}-{}",
+        segment_id.replace('/', "_"),
+        Uuid::new_v4()
+    ));
+    std::fs::write(&path, bytes)?;
+    let result = (|| {
+        let wal = FileWalEngine::with_encryption(&path, wal_key)?;
+        wal.recover()
+    })();
+    let _ = std::fs::remove_file(&path);
+    result
+}
+
+fn json_bytes_field(value: &serde_json::Value, field: &str) -> Option<Bytes> {
+    let bytes = value
+        .get(field)?
+        .as_array()?
+        .iter()
+        .map(|byte| byte.as_u64().and_then(|byte| u8::try_from(byte).ok()))
+        .collect::<Option<Vec<_>>>()?;
+    Some(Bytes::from(bytes))
 }
 
 /// A unit of data to back up: a logical name and its bytes (e.g. a shard export
@@ -903,6 +954,185 @@ impl BackupOrchestrator {
         Ok(plan_segments)
     }
 
+    pub async fn load_pitr_wal_segments(
+        &self,
+        plan: &PitrRestorePlan,
+    ) -> Result<Vec<PitrWalSegmentBytes>> {
+        if plan.plan_version != CURRENT_PITR_RESTORE_PLAN_VERSION {
+            anyhow::bail!(
+                "unsupported PITR restore plan version {}",
+                plan.plan_version
+            );
+        }
+
+        let mut segments = Vec::new();
+        for planned in &plan.wal_segments {
+            let bytes = self.repo.get_object(&planned.wal_object_key, None).await?;
+            if bytes.len() as u64 != planned.size {
+                anyhow::bail!(
+                    "archived WAL object {} size mismatch: expected {}, got {}",
+                    planned.wal_object_key,
+                    planned.size,
+                    bytes.len()
+                );
+            }
+            if checksum(&bytes) != planned.checksum {
+                anyhow::bail!(
+                    "archived WAL object {} checksum mismatch",
+                    planned.wal_object_key
+                );
+            }
+            segments.push(PitrWalSegmentBytes {
+                segment_id: planned.segment_id.clone(),
+                bytes,
+            });
+        }
+        Ok(segments)
+    }
+
+    pub fn replay_pitr_wal_segments(
+        plan: &PitrRestorePlan,
+        segments: &[PitrWalSegmentBytes],
+        kv: &dyn KvEngine,
+        wal_key: Option<[u8; 32]>,
+    ) -> Result<PitrReplayReport> {
+        if plan.plan_version != CURRENT_PITR_RESTORE_PLAN_VERSION {
+            anyhow::bail!(
+                "unsupported PITR restore plan version {}",
+                plan.plan_version
+            );
+        }
+        if segments.len() != plan.wal_segments.len() {
+            anyhow::bail!(
+                "PITR replay segment count mismatch: plan has {}, loaded {}",
+                plan.wal_segments.len(),
+                segments.len()
+            );
+        }
+
+        let mut report = PitrReplayReport::default();
+        let mut active_txns = HashSet::new();
+        for (planned, segment) in plan.wal_segments.iter().zip(segments.iter()) {
+            if planned.segment_id != segment.segment_id {
+                anyhow::bail!(
+                    "PITR replay segment order mismatch: expected {}, got {}",
+                    planned.segment_id,
+                    segment.segment_id
+                );
+            }
+            if segment.bytes.len() as u64 != planned.size {
+                anyhow::bail!(
+                    "archived WAL segment {} size mismatch during replay",
+                    segment.segment_id
+                );
+            }
+            if checksum(&segment.bytes) != planned.checksum {
+                anyhow::bail!(
+                    "archived WAL segment {} checksum mismatch during replay",
+                    segment.segment_id
+                );
+            }
+
+            let records = recover_wal_records(&segment.segment_id, &segment.bytes, wal_key)?;
+            report.wal_segments_replayed += 1;
+            for record in records {
+                report.records_seen += 1;
+                let WalRecord::V1(record) = record;
+                match record {
+                    WalRecordV1::BeginTxn { txn_id } => {
+                        active_txns.insert(txn_id);
+                    }
+                    WalRecordV1::WriteIntent { txn_id, key, value } => {
+                        kv.write_intent(txn_id, Bytes::from(key), Bytes::from(value))?;
+                        active_txns.insert(txn_id);
+                        report.writes_applied += 1;
+                    }
+                    WalRecordV1::DeleteIntent { txn_id, key } => {
+                        kv.delete_intent(txn_id, Bytes::from(key))?;
+                        active_txns.insert(txn_id);
+                        report.deletes_applied += 1;
+                    }
+                    WalRecordV1::CommitTxn { txn_id, commit_ts } => {
+                        if commit_ts <= plan.target_ts {
+                            kv.commit(txn_id, commit_ts)?;
+                            report.commits_applied += 1;
+                        } else {
+                            kv.abort(txn_id)?;
+                            report.commits_skipped += 1;
+                        }
+                        active_txns.remove(&txn_id);
+                    }
+                    WalRecordV1::AbortTxn { txn_id } => {
+                        kv.abort(txn_id)?;
+                        active_txns.remove(&txn_id);
+                        report.aborts_applied += 1;
+                    }
+                    WalRecordV1::Checkpoint { .. } => {}
+                }
+            }
+        }
+
+        report.pending_txns_aborted = active_txns.len();
+        for txn_id in active_txns {
+            kv.abort(txn_id)?;
+        }
+        Ok(report)
+    }
+
+    pub fn restore_backup_objects_to_kv(
+        objects: &[BackupObject],
+        kv: &dyn KvEngine,
+    ) -> Result<PitrReplayReport> {
+        let mut report = PitrReplayReport {
+            base_objects_restored: objects.len(),
+            ..PitrReplayReport::default()
+        };
+        for obj in objects {
+            if obj.name != "kv_data.json" {
+                continue;
+            }
+            let dump = serde_json::from_slice::<Vec<serde_json::Value>>(&obj.bytes)?;
+            for pair in dump {
+                let Some(key) = json_bytes_field(&pair, "key") else {
+                    continue;
+                };
+                let Some(version) = pair.get("version").and_then(|value| value.as_u64()) else {
+                    continue;
+                };
+                let txn_id = nodus_storage_api::TxnId::new();
+                if pair
+                    .get("deleted")
+                    .and_then(|deleted| deleted.as_bool())
+                    .unwrap_or(false)
+                {
+                    kv.delete_intent(txn_id, key)?;
+                } else if let Some(value) = json_bytes_field(&pair, "value") {
+                    kv.write_intent(txn_id, key, value)?;
+                } else {
+                    continue;
+                }
+                kv.commit(txn_id, version)?;
+                report.base_kv_versions_restored += 1;
+            }
+        }
+        Ok(report)
+    }
+
+    pub fn merge_pitr_replay_reports(
+        mut base: PitrReplayReport,
+        wal: PitrReplayReport,
+    ) -> PitrReplayReport {
+        base.wal_segments_replayed += wal.wal_segments_replayed;
+        base.records_seen += wal.records_seen;
+        base.writes_applied += wal.writes_applied;
+        base.deletes_applied += wal.deletes_applied;
+        base.commits_applied += wal.commits_applied;
+        base.commits_skipped += wal.commits_skipped;
+        base.aborts_applied += wal.aborts_applied;
+        base.pending_txns_aborted += wal.pending_txns_aborted;
+        base
+    }
+
     /// Deletes a backup's manifest and associated data files.
     pub async fn delete_backup(&self, backup_id: &str) -> Result<()> {
         for manifest in self.completed_manifests().await? {
@@ -1122,6 +1352,21 @@ impl BackupOrchestrator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nodus_storage_api::{KvEngine, TxnId};
+    use nodus_storage_mem::MemKvEngine;
+    use nodus_storage_wal::{WalRecord, WalRecordV1};
+
+    fn test_wal_bytes(records: Vec<WalRecord>) -> Bytes {
+        let path = std::env::temp_dir().join(format!("nodus-backup-test-wal-{}", Uuid::new_v4()));
+        let wal = FileWalEngine::new(&path).unwrap();
+        for record in records {
+            wal.append(record).unwrap();
+        }
+        wal.sync().unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        Bytes::from(bytes)
+    }
 
     #[tokio::test]
     async fn test_mem_repository() {
@@ -1861,5 +2106,203 @@ mod tests {
 
         let err = orch.plan_pitr_restore(12).await.unwrap_err();
         assert!(err.to_string().contains("checksum mismatch"));
+    }
+
+    #[tokio::test]
+    async fn test_pitr_replay_restores_base_and_replays_to_target_ts() {
+        let repo: Arc<dyn BackupRepository> = Arc::new(MemBackupRepository::new());
+        let orch = BackupOrchestrator::new(repo);
+        let base_dump = serde_json::json!([
+            {
+                "key": [98],
+                "value": [48],
+                "deleted": false,
+                "version": 10
+            }
+        ]);
+        orch.create_full_backup(
+            "cluster-1",
+            10,
+            1,
+            1,
+            vec![BackupObject {
+                name: "kv_data.json".into(),
+                bytes: Bytes::from(serde_json::to_vec(&base_dump).unwrap()),
+            }],
+        )
+        .await
+        .unwrap();
+
+        let committed = TxnId::new();
+        let exact = TxnId::new();
+        let late = TxnId::new();
+        let pending = TxnId::new();
+        let wal = test_wal_bytes(vec![
+            WalRecord::V1(WalRecordV1::BeginTxn { txn_id: committed }),
+            WalRecord::V1(WalRecordV1::WriteIntent {
+                txn_id: committed,
+                key: b"a".to_vec(),
+                value: b"15".to_vec(),
+            }),
+            WalRecord::V1(WalRecordV1::CommitTxn {
+                txn_id: committed,
+                commit_ts: 15,
+            }),
+            WalRecord::V1(WalRecordV1::BeginTxn { txn_id: exact }),
+            WalRecord::V1(WalRecordV1::WriteIntent {
+                txn_id: exact,
+                key: b"e".to_vec(),
+                value: b"20".to_vec(),
+            }),
+            WalRecord::V1(WalRecordV1::CommitTxn {
+                txn_id: exact,
+                commit_ts: 20,
+            }),
+            WalRecord::V1(WalRecordV1::BeginTxn { txn_id: late }),
+            WalRecord::V1(WalRecordV1::WriteIntent {
+                txn_id: late,
+                key: b"l".to_vec(),
+                value: b"25".to_vec(),
+            }),
+            WalRecord::V1(WalRecordV1::CommitTxn {
+                txn_id: late,
+                commit_ts: 25,
+            }),
+            WalRecord::V1(WalRecordV1::BeginTxn { txn_id: pending }),
+            WalRecord::V1(WalRecordV1::WriteIntent {
+                txn_id: pending,
+                key: b"p".to_vec(),
+                value: b"pending".to_vec(),
+            }),
+        ]);
+        orch.archive_wal_indexed(
+            "1.log",
+            wal,
+            vec![
+                committed.0.to_string(),
+                exact.0.to_string(),
+                late.0.to_string(),
+                pending.0.to_string(),
+            ],
+            vec![
+                WalCommittedTxn {
+                    txn_id: committed.0.to_string(),
+                    commit_ts: 15,
+                },
+                WalCommittedTxn {
+                    txn_id: exact.0.to_string(),
+                    commit_ts: 20,
+                },
+                WalCommittedTxn {
+                    txn_id: late.0.to_string(),
+                    commit_ts: 25,
+                },
+            ],
+        )
+        .await
+        .unwrap();
+
+        let plan = orch.plan_pitr_restore(20).await.unwrap();
+        let objects = orch.restore(&plan.base_backup_id).await.unwrap();
+        let wal_segments = orch.load_pitr_wal_segments(&plan).await.unwrap();
+        let kv = MemKvEngine::new();
+        let base_report = BackupOrchestrator::restore_backup_objects_to_kv(&objects, &kv).unwrap();
+        let wal_report =
+            BackupOrchestrator::replay_pitr_wal_segments(&plan, &wal_segments, &kv, None).unwrap();
+        let report = BackupOrchestrator::merge_pitr_replay_reports(base_report, wal_report);
+
+        assert_eq!(kv.get(b"b", 20).unwrap(), Some(Bytes::from_static(b"0")));
+        assert_eq!(kv.get(b"a", 20).unwrap(), Some(Bytes::from_static(b"15")));
+        assert_eq!(kv.get(b"e", 20).unwrap(), Some(Bytes::from_static(b"20")));
+        assert_eq!(kv.get(b"l", 30).unwrap(), None);
+        assert_eq!(kv.get(b"p", 30).unwrap(), None);
+        assert_eq!(report.base_kv_versions_restored, 1);
+        assert_eq!(report.wal_segments_replayed, 1);
+        assert_eq!(report.commits_applied, 2);
+        assert_eq!(report.commits_skipped, 1);
+        assert_eq!(report.pending_txns_aborted, 1);
+    }
+
+    #[tokio::test]
+    async fn test_pitr_replay_preserves_aborts_and_delete_tombstones() {
+        let repo: Arc<dyn BackupRepository> = Arc::new(MemBackupRepository::new());
+        let orch = BackupOrchestrator::new(repo);
+        orch.create_full_backup(
+            "cluster-1",
+            10,
+            1,
+            1,
+            vec![BackupObject {
+                name: "kv_data.json".into(),
+                bytes: Bytes::from("[]"),
+            }],
+        )
+        .await
+        .unwrap();
+
+        let put = TxnId::new();
+        let delete = TxnId::new();
+        let aborted = TxnId::new();
+        let wal = test_wal_bytes(vec![
+            WalRecord::V1(WalRecordV1::WriteIntent {
+                txn_id: put,
+                key: b"d".to_vec(),
+                value: b"visible-before-delete".to_vec(),
+            }),
+            WalRecord::V1(WalRecordV1::CommitTxn {
+                txn_id: put,
+                commit_ts: 12,
+            }),
+            WalRecord::V1(WalRecordV1::DeleteIntent {
+                txn_id: delete,
+                key: b"d".to_vec(),
+            }),
+            WalRecord::V1(WalRecordV1::CommitTxn {
+                txn_id: delete,
+                commit_ts: 18,
+            }),
+            WalRecord::V1(WalRecordV1::WriteIntent {
+                txn_id: aborted,
+                key: b"x".to_vec(),
+                value: b"aborted".to_vec(),
+            }),
+            WalRecord::V1(WalRecordV1::AbortTxn { txn_id: aborted }),
+        ]);
+        orch.archive_wal_indexed(
+            "1.log",
+            wal,
+            vec![
+                put.0.to_string(),
+                delete.0.to_string(),
+                aborted.0.to_string(),
+            ],
+            vec![
+                WalCommittedTxn {
+                    txn_id: put.0.to_string(),
+                    commit_ts: 12,
+                },
+                WalCommittedTxn {
+                    txn_id: delete.0.to_string(),
+                    commit_ts: 18,
+                },
+            ],
+        )
+        .await
+        .unwrap();
+
+        let plan = orch.plan_pitr_restore(20).await.unwrap();
+        let wal_segments = orch.load_pitr_wal_segments(&plan).await.unwrap();
+        let kv = MemKvEngine::new();
+        let report =
+            BackupOrchestrator::replay_pitr_wal_segments(&plan, &wal_segments, &kv, None).unwrap();
+
+        assert_eq!(
+            kv.get(b"d", 17).unwrap(),
+            Some(Bytes::from_static(b"visible-before-delete"))
+        );
+        assert_eq!(kv.get(b"d", 20).unwrap(), None);
+        assert_eq!(kv.get(b"x", 20).unwrap(), None);
+        assert_eq!(report.deletes_applied, 1);
+        assert_eq!(report.aborts_applied, 1);
     }
 }

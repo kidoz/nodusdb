@@ -21,6 +21,11 @@ futures-util.workspace = true
 object_store = { version = "0.11", features = ["aws"] }
 nodus_catalog = { path = "../nodus_catalog" }
 nodus_storage_api = { path = "../nodus_storage_api" }
+nodus_storage_wal = { path = "../nodus_storage_wal" }
 nodus_monitoring = { path = "../nodus_monitoring" }
+
+[dev-dependencies]
+nodus_storage_mem = { path = "../nodus_storage_mem" }
+
 [lints]
 workspace = true

@@ -2218,6 +2218,8 @@ dependencies = [
  "nodus_catalog",
  "nodus_monitoring",
  "nodus_storage_api",
+ "nodus_storage_mem",
+ "nodus_storage_wal",
  "object_store",
  "serde",
  "serde_json",

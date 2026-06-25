@@ -18,7 +18,6 @@ use nodus_catalog::{CatalogReader, CatalogWriter, PrincipalId, ResourceRef, Shar
 use nodus_monitoring::{SlowQuery, SlowQueryLog};
 use nodus_security::{SessionInfo, SessionRegistry};
 use nodus_sharding::ShardOrchestrator;
-use nodus_storage_wal::WalEngine;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -783,151 +782,79 @@ async fn restore_backup(
     Path(id): Path<String>,
     Query(query): Query<RestoreQuery>,
 ) -> Json<Value> {
-    match state.backup.restore(&id).await {
-        Ok(objects) => {
-            // Pre-fetch archived WALs (async) before the blocking replay below.
-            let archived_wals = match query.target_ts {
-                Some(_) => state.backup.get_archived_wals().await.ok(),
-                None => None,
-            };
-            let names: Vec<String> = objects.iter().map(|o| o.name.clone()).collect();
+    let (objects, pitr) = if let Some(target_ts) = query.target_ts {
+        let plan = match state.backup.plan_pitr_restore(target_ts).await {
+            Ok(plan) => plan,
+            Err(e) => return Json(json!({ "restored": 0, "error": e.to_string() })),
+        };
+        let objects = match state.backup.restore(&plan.base_backup_id).await {
+            Ok(objects) => objects,
+            Err(e) => return Json(json!({ "restored": 0, "error": e.to_string() })),
+        };
+        let wal_segments = match state.backup.load_pitr_wal_segments(&plan).await {
+            Ok(segments) => segments,
+            Err(e) => return Json(json!({ "restored": 0, "error": e.to_string() })),
+        };
+        (objects, Some((plan, wal_segments)))
+    } else {
+        let objects = match state.backup.restore(&id).await {
+            Ok(objects) => objects,
+            Err(e) => return Json(json!({ "restored": 0, "error": e.to_string() })),
+        };
+        (objects, None)
+    };
 
-            // Catalog/KV writes route through the synchronous traits, which submit
-            // to the async RaftRouter via `blocking_recv`; run them on the blocking
-            // pool so we never park (or panic on) a reactor worker thread.
-            let kv = state.kv.clone();
-            let catalog_writer = state.catalog_writer.clone();
-            let wal_key = state.wal_key;
-            let target_ts = query.target_ts;
-            let _ = tokio::task::spawn_blocking(move || {
-                for obj in &objects {
-                    if obj.name == "catalog.json" {
-                        if let Ok(snapshot) = serde_json::from_slice(&obj.bytes) {
-                            let _ = catalog_writer.import_snapshot(snapshot);
-                        }
-                    } else if obj.name == "kv_data.json" {
-                        #[allow(clippy::collapsible_if)]
-                        if let Ok(dump) =
-                            serde_json::from_slice::<Vec<serde_json::Value>>(&obj.bytes)
-                        {
-                            for pair in dump {
-                                if let (Some(k), Some(ver)) = (
-                                    pair.get("key").and_then(|k| k.as_array()),
-                                    pair.get("version").and_then(|v| v.as_u64()),
-                                ) {
-                                    let key_bytes: Vec<u8> = k
-                                        .iter()
-                                        .filter_map(|x| x.as_u64())
-                                        .map(|x| x as u8)
-                                        .collect();
-                                    let txn_id = nodus_storage_api::TxnId::new();
-                                    if pair
-                                        .get("deleted")
-                                        .and_then(|deleted| deleted.as_bool())
-                                        .unwrap_or(false)
-                                    {
-                                        let _ = kv
-                                            .delete_intent(txn_id, Bytes::from(key_bytes.clone()));
-                                    } else if let Some(v) =
-                                        pair.get("value").and_then(|v| v.as_array())
-                                    {
-                                        let val_bytes: Vec<u8> = v
-                                            .iter()
-                                            .filter_map(|x| x.as_u64())
-                                            .map(|x| x as u8)
-                                            .collect();
-                                        let _ = kv.write_intent(
-                                            txn_id,
-                                            Bytes::from(key_bytes.clone()),
-                                            Bytes::from(val_bytes),
-                                        );
-                                    } else {
-                                        continue;
-                                    }
-                                    let _ = kv.commit(txn_id, ver);
-                                    tracing::debug!(
-                                        "Restored KV pair from baseline: key={:?}",
-                                        String::from_utf8_lossy(&key_bytes)
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
+    let names: Vec<String> = objects.iter().map(|o| o.name.clone()).collect();
+    let pitr_response = pitr.as_ref().map(|(plan, _)| {
+        json!({
+            "base_backup_id": &plan.base_backup_id,
+            "base_backup_chain": &plan.base_backup_chain,
+            "target_ts": plan.target_ts,
+            "wal_segments": plan.wal_segments.len(),
+        })
+    });
 
-                if let (Some(target_ts), Some(wals)) = (target_ts, archived_wals) {
-                    let mut active_txns = std::collections::HashSet::new();
-                    for (_name, bytes) in wals {
-                        let tmp = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
-                        std::fs::write(&tmp, bytes).unwrap();
-                        if let Ok(wal_engine) =
-                            nodus_storage_wal::FileWalEngine::with_encryption(&tmp, wal_key)
-                        {
-                            if let Ok(records) = wal_engine.recover() {
-                                for record in records {
-                                    let nodus_storage_wal::WalRecord::V1(rec) = record;
-                                    match rec {
-                                        nodus_storage_wal::WalRecordV1::WriteIntent {
-                                            txn_id,
-                                            key,
-                                            value,
-                                        } => {
-                                            let _ = kv.write_intent(
-                                                txn_id,
-                                                Bytes::from(key),
-                                                Bytes::from(value),
-                                            );
-                                            active_txns.insert(txn_id);
-                                        }
-                                        nodus_storage_wal::WalRecordV1::DeleteIntent {
-                                            txn_id,
-                                            key,
-                                        } => {
-                                            let _ = kv.delete_intent(txn_id, Bytes::from(key));
-                                            active_txns.insert(txn_id);
-                                        }
-                                        nodus_storage_wal::WalRecordV1::CommitTxn {
-                                            txn_id,
-                                            commit_ts,
-                                        } => {
-                                            if commit_ts <= target_ts {
-                                                tracing::debug!(
-                                                    "Replayed commit_ts {} <= target_ts {}",
-                                                    commit_ts,
-                                                    target_ts
-                                                );
-                                                let _ = kv.commit(txn_id, commit_ts);
-                                            } else {
-                                                tracing::debug!(
-                                                    "Skipped commit_ts {} > target_ts {}",
-                                                    commit_ts,
-                                                    target_ts
-                                                );
-                                                let _ = kv.abort(txn_id);
-                                            }
-                                            active_txns.remove(&txn_id);
-                                        }
-                                        nodus_storage_wal::WalRecordV1::AbortTxn { txn_id } => {
-                                            let _ = kv.abort(txn_id);
-                                            active_txns.remove(&txn_id);
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                            }
-                        }
-                        let _ = std::fs::remove_file(&tmp);
-                    }
-                    // Abort any pending transactions
-                    for txn_id in active_txns {
-                        let _ = kv.abort(txn_id);
-                    }
-                }
-            })
-            .await;
-
-            Json(json!({ "restored": names.len(), "objects": names }))
+    // Catalog/KV writes route through the synchronous traits, which submit
+    // to the async RaftRouter via `blocking_recv`; run them on the blocking
+    // pool so we never park (or panic on) a reactor worker thread.
+    let kv = state.kv.clone();
+    let catalog_writer = state.catalog_writer.clone();
+    let wal_key = state.wal_key;
+    let replay = tokio::task::spawn_blocking(move || {
+        for obj in &objects {
+            if obj.name == "catalog.json"
+                && let Ok(snapshot) = serde_json::from_slice(&obj.bytes)
+            {
+                catalog_writer.import_snapshot(snapshot)?;
+            }
         }
+
+        let base_report = BackupOrchestrator::restore_backup_objects_to_kv(&objects, kv.as_ref())?;
+        if let Some((plan, wal_segments)) = pitr {
+            let wal_report = BackupOrchestrator::replay_pitr_wal_segments(
+                &plan,
+                &wal_segments,
+                kv.as_ref(),
+                wal_key,
+            )?;
+            Ok::<_, anyhow::Error>(BackupOrchestrator::merge_pitr_replay_reports(
+                base_report,
+                wal_report,
+            ))
+        } else {
+            Ok(base_report)
+        }
+    })
+    .await;
+
+    match replay {
+        Ok(Ok(report)) => Json(json!({
+            "restored": names.len(),
+            "objects": names,
+            "pitr": pitr_response,
+            "replay": report,
+        })),
+        Ok(Err(e)) => Json(json!({ "restored": 0, "error": e.to_string() })),
         Err(e) => Json(json!({ "restored": 0, "error": e.to_string() })),
     }
 }
