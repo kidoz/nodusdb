@@ -569,6 +569,31 @@ fn run_gc_is_safe_with_no_active_txns() {
     let exec = MemExecutor::default();
     assert_eq!(exec.run_gc().unwrap(), 0);
 }
+
+#[test]
+fn run_gc_honors_protected_watermark() {
+    let exec = MemExecutor::default();
+    let kv = exec.kv();
+    let key = bytes::Bytes::from("protected-key");
+
+    let txn1 = nodus_storage_api::TxnId::new();
+    kv.write_intent(txn1, key.clone(), bytes::Bytes::from("v1"))
+        .unwrap();
+    kv.commit(txn1, 10).unwrap();
+
+    let txn2 = nodus_storage_api::TxnId::new();
+    kv.write_intent(txn2, key.clone(), bytes::Bytes::from("v2"))
+        .unwrap();
+    kv.commit(txn2, 20).unwrap();
+
+    assert_eq!(kv.get(&key, 15).unwrap().unwrap(), bytes::Bytes::from("v1"));
+    assert_eq!(exec.run_gc_with_protected_watermark(Some(10)).unwrap(), 0);
+    assert_eq!(kv.get(&key, 15).unwrap().unwrap(), bytes::Bytes::from("v1"));
+
+    assert_eq!(exec.run_gc_with_protected_watermark(None).unwrap(), 1);
+    assert!(kv.get(&key, 15).unwrap().is_none());
+}
+
 #[test]
 fn test_complex_filters() {
     let (exec, cat) = MemExecutor::shared(Arc::new(MemoryAuditSink::new()));

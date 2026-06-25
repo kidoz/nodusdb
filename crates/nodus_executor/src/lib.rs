@@ -338,6 +338,16 @@ impl MemExecutor {
         self.kv.garbage_collect(watermark)
     }
 
+    /// Runs MVCC garbage collection while honoring an external protected
+    /// timestamp, such as the oldest retained backup snapshot. The effective
+    /// watermark is the lower of the transaction-safe watermark and the
+    /// protected timestamp.
+    pub fn run_gc_with_protected_watermark(&self, protected: Option<Timestamp>) -> Result<usize> {
+        let txn_watermark = self.txn.gc_watermark();
+        let watermark = protected.map_or(txn_watermark, |ts| txn_watermark.min(ts));
+        self.kv.garbage_collect(watermark)
+    }
+
     /// Exposes the underlying key-value engine, e.g., for backup payload extraction.
     pub fn kv(&self) -> Arc<dyn KvEngine> {
         self.kv.clone()

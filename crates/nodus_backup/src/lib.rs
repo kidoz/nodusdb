@@ -665,6 +665,14 @@ impl BackupOrchestrator {
 
     /// Deletes a backup's manifest and associated data files.
     pub async fn delete_backup(&self, backup_id: &str) -> Result<()> {
+        for manifest in self.completed_manifests().await? {
+            if manifest.parent_backup_id.as_deref() == Some(backup_id) {
+                anyhow::bail!(
+                    "cannot delete backup {backup_id}; retained backup {} depends on it",
+                    manifest.backup_id
+                );
+            }
+        }
         let prefix = format!("{backup_id}/");
         let objects = self.repo.list_objects(&prefix).await?;
         for obj in objects {
@@ -675,20 +683,43 @@ impl BackupOrchestrator {
 
     /// Lists the ids of backups that have a manifest in the repository.
     pub async fn list_backups(&self) -> Result<Vec<String>> {
-        let objects = self.repo.list_objects("").await?;
         let mut backups = Vec::new();
-        for object in objects {
-            let Some(backup_id) = object.key.strip_suffix("/manifest.json") else {
-                continue;
-            };
-            let Ok(manifest) = self.load_manifest(backup_id).await else {
-                continue;
-            };
-            if manifest.status == BackupStatus::Completed {
-                backups.push(backup_id.to_string());
-            }
+        for manifest in self.completed_manifests().await? {
+            backups.push(manifest.backup_id);
         }
         Ok(backups)
+    }
+
+    async fn completed_manifests(&self) -> Result<Vec<BackupManifest>> {
+        let objects = self.repo.list_objects("").await?;
+        let mut manifests = Vec::new();
+        for object in objects {
+            if let Some(backup_id) = object.key.strip_suffix("/manifest.json")
+                && let Ok(manifest) = self.load_manifest(backup_id).await
+                && manifest.status == BackupStatus::Completed
+            {
+                manifests.push(manifest);
+            }
+        }
+        Ok(manifests)
+    }
+
+    /// Returns the oldest backup snapshot that still protects MVCC history for
+    /// future incrementals. Runtime GC must not advance beyond this timestamp.
+    pub async fn protected_gc_watermark(&self) -> Result<Option<u64>> {
+        Ok(self
+            .completed_manifests()
+            .await?
+            .into_iter()
+            .filter_map(|manifest| manifest.protected_timestamp.map(|_| manifest.snapshot_ts))
+            .min())
+    }
+
+    /// Local WAL segment deletion is unsafe until WAL archive indexes can prove
+    /// no retained restore point needs a segment. Archiving may continue, but
+    /// cleanup should wait while any completed backup is retained.
+    pub async fn wal_cleanup_allowed(&self) -> Result<bool> {
+        Ok(self.completed_manifests().await?.is_empty())
     }
 
     /// Archives a WAL segment.
@@ -1067,5 +1098,57 @@ mod tests {
             .await
             .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn test_retained_backups_protect_gc_and_wal_cleanup() {
+        let repo: Arc<dyn BackupRepository> = Arc::new(MemBackupRepository::new());
+        let orch = BackupOrchestrator::new(repo);
+
+        assert_eq!(orch.protected_gc_watermark().await.unwrap(), None);
+        assert!(orch.wal_cleanup_allowed().await.unwrap());
+
+        let full = orch
+            .create_full_backup(
+                "cluster-1",
+                10,
+                1,
+                1,
+                vec![BackupObject {
+                    name: "kv_data.json".into(),
+                    bytes: Bytes::from("full"),
+                }],
+            )
+            .await
+            .unwrap();
+        let incremental = orch
+            .create_incremental_backup(
+                "cluster-1",
+                &full.backup_id,
+                20,
+                1,
+                1,
+                vec![BackupObject {
+                    name: "kv_data.json".into(),
+                    bytes: Bytes::from("incremental"),
+                }],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(orch.protected_gc_watermark().await.unwrap(), Some(10));
+        assert!(!orch.wal_cleanup_allowed().await.unwrap());
+
+        assert!(orch.delete_backup(&full.backup_id).await.is_err());
+        assert_eq!(orch.protected_gc_watermark().await.unwrap(), Some(10));
+        assert!(!orch.wal_cleanup_allowed().await.unwrap());
+
+        orch.delete_backup(&incremental.backup_id).await.unwrap();
+        assert_eq!(orch.protected_gc_watermark().await.unwrap(), Some(10));
+        assert!(!orch.wal_cleanup_allowed().await.unwrap());
+
+        orch.delete_backup(&full.backup_id).await.unwrap();
+        assert_eq!(orch.protected_gc_watermark().await.unwrap(), None);
+        assert!(orch.wal_cleanup_allowed().await.unwrap());
     }
 }

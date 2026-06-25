@@ -524,6 +524,11 @@ pub async fn run_server_with_config(
         .map(|c| Arc::new(TlsAcceptor::from(c.clone())));
     tracing::debug!("TLS acceptor loaded");
 
+    let repo = Arc::new(FsBackupRepository::new(backup_dir(
+        &config.backup.repository_uri,
+    )));
+    let backup = Arc::new(BackupOrchestrator::new(repo));
+
     // Graceful Raft shutdown: when the server is told to stop, shut down its
     // Raft groups so it stops participating in consensus (a node that keeps
     // heartbeating after "stopping" prevents its peers from re-electing).
@@ -535,8 +540,10 @@ pub async fn run_server_with_config(
     });
 
     // Background MVCC garbage collector: periodically reclaims superseded
-    // versions below the transaction manager's safe watermark.
+    // versions below the transaction manager's safe watermark, clamped by the
+    // oldest retained backup snapshot.
     let gc_executor = executor.clone();
+    let gc_backup = backup.clone();
     let gc_metrics = state.metrics.clone();
     let mut gc_shutdown = shutdown.clone();
     let gc_task = tokio::spawn(async move {
@@ -544,7 +551,8 @@ pub async fn run_server_with_config(
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
-                    if let Ok(reclaimed) = gc_executor.run_gc()
+                    let protected = gc_backup.protected_gc_watermark().await.ok().flatten();
+                    if let Ok(reclaimed) = gc_executor.run_gc_with_protected_watermark(protected)
                         && reclaimed > 0
                     {
                         gc_metrics.vacuum_reclaimed_total.inc_by(reclaimed as u64);
@@ -586,11 +594,6 @@ pub async fn run_server_with_config(
         .allow_methods(Any)
         .allow_headers(Any);
 
-    let repo = Arc::new(FsBackupRepository::new(backup_dir(
-        &config.backup.repository_uri,
-    )));
-    let backup = Arc::new(BackupOrchestrator::new(repo));
-
     // Background WAL archiver
     let backup_clone = backup.clone();
     let data_dir_clone = config.storage.data_dir.clone();
@@ -618,12 +621,18 @@ pub async fn run_server_with_config(
                             }
                             if !logs.is_empty() {
                                 let max_id = logs.iter().map(|(id, _)| *id).max().unwrap();
+                                let cleanup_allowed = backup_clone
+                                    .wal_cleanup_allowed()
+                                    .await
+                                    .unwrap_or(false);
                                 for (id, path) in logs {
                                     if id < max_id {
                                         if let Ok(bytes) = std::fs::read(&path) {
                                             let filename = format!("{}.log", id);
                                             if backup_clone.archive_wal(&filename, bytes::Bytes::from(bytes)).await.is_ok() {
-                                                let _ = std::fs::remove_file(&path);
+                                                if cleanup_allowed {
+                                                    let _ = std::fs::remove_file(&path);
+                                                }
                                             }
                                         }
                                     }
