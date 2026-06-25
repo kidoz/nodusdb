@@ -735,6 +735,174 @@ impl BackupOrchestrator {
         Ok(out)
     }
 
+    /// Builds a PITR restore plan without replaying WAL. The planner selects the
+    /// newest completed backup at or before `target_ts`, verifies the backup and
+    /// every selected archived WAL object, and rejects gaps in the indexed WAL
+    /// segment sequence needed for replay.
+    pub async fn plan_pitr_restore(&self, target_ts: u64) -> Result<PitrRestorePlan> {
+        let manifests = self.completed_manifests().await?;
+        let base = manifests
+            .iter()
+            .filter(|manifest| manifest.snapshot_ts <= target_ts)
+            .max_by(|left, right| {
+                left.snapshot_ts
+                    .cmp(&right.snapshot_ts)
+                    .then_with(|| left.backup_id.cmp(&right.backup_id))
+            })
+            .cloned()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no completed backup snapshot is at or before target_ts {target_ts}"
+                )
+            })?;
+
+        self.verify(&base.backup_id).await?;
+        let base_backup_chain = self.backup_chain_for_restore(&base).await?;
+        let wal_segments = if target_ts == base.snapshot_ts {
+            Vec::new()
+        } else {
+            self.plan_wal_segments(&base, target_ts).await?
+        };
+
+        Ok(PitrRestorePlan {
+            plan_version: CURRENT_PITR_RESTORE_PLAN_VERSION,
+            cluster_id: base.cluster_id,
+            timeline_id: base.timeline_id,
+            base_backup_id: base.backup_id,
+            base_backup_chain,
+            base_snapshot_ts: base.snapshot_ts,
+            target_ts,
+            replay_start_ts: base.snapshot_ts,
+            replay_end_ts: target_ts,
+            wal_segments,
+            generated_at: Utc::now(),
+        })
+    }
+
+    async fn backup_chain_for_restore(&self, manifest: &BackupManifest) -> Result<Vec<String>> {
+        let mut chain = Vec::new();
+        let mut current = manifest.clone();
+        loop {
+            chain.push(current.backup_id.clone());
+            let Some(parent_id) = current.parent_backup_id.clone() else {
+                break;
+            };
+            current = self.load_manifest(&parent_id).await?;
+            if current.status != BackupStatus::Completed {
+                anyhow::bail!("backup chain parent {parent_id} is not COMPLETE");
+            }
+        }
+        chain.reverse();
+        Ok(chain)
+    }
+
+    async fn plan_wal_segments(
+        &self,
+        base: &BackupManifest,
+        target_ts: u64,
+    ) -> Result<Vec<PitrRestoreWalSegment>> {
+        let mut indexes = Vec::new();
+        for index in self.load_wal_archive_indexes().await? {
+            if index.index_version != CURRENT_WAL_ARCHIVE_INDEX_VERSION {
+                anyhow::bail!(
+                    "unsupported WAL archive index version {} for {}",
+                    index.index_version,
+                    index.index_object_key
+                );
+            }
+            if index.timeline_id == base.timeline_id
+                && index.upload_state == WalArchiveUploadState::Completed
+            {
+                indexes.push(index);
+            }
+        }
+
+        let txn_ids_needed = indexes
+            .iter()
+            .flat_map(|index| index.committed_txns.iter())
+            .filter(|txn| txn.commit_ts > base.snapshot_ts && txn.commit_ts <= target_ts)
+            .map(|txn| txn.txn_id.clone())
+            .collect::<HashSet<_>>();
+
+        let mut indexes_by_sequence = BTreeMap::new();
+        let mut needed_sequences = BTreeSet::new();
+        for index in indexes {
+            let has_needed_commit = index
+                .committed_txns
+                .iter()
+                .any(|txn| txn.commit_ts > base.snapshot_ts && txn.commit_ts <= target_ts);
+            let has_needed_txn_record = index
+                .record_txn_ids
+                .iter()
+                .any(|txn_id| txn_ids_needed.contains(txn_id.as_str()));
+
+            let sequence = wal_segment_sequence(&index.segment_id)?;
+            if has_needed_commit || has_needed_txn_record {
+                needed_sequences.insert(sequence);
+            }
+            if indexes_by_sequence.insert(sequence, index).is_some() {
+                anyhow::bail!("duplicate WAL archive index for segment {sequence}.log");
+            }
+        }
+
+        if needed_sequences.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let first = needed_sequences
+            .iter()
+            .next()
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("PITR restore plan selected no WAL segments"))?;
+        let last = needed_sequences
+            .iter()
+            .next_back()
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("PITR restore plan selected no WAL segments"))?;
+        let mut selected = BTreeMap::new();
+        for segment_id in first..=last {
+            let index = indexes_by_sequence.remove(&segment_id).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "missing required WAL archive index for segment {segment_id}.log while planning PITR from {} to {}",
+                    base.snapshot_ts,
+                    target_ts
+                )
+            })?;
+            selected.insert(segment_id, index);
+        }
+
+        let mut plan_segments = Vec::new();
+        for (_, index) in selected {
+            let bytes = self.repo.get_object(&index.wal_object_key, None).await?;
+            if bytes.len() as u64 != index.size {
+                anyhow::bail!(
+                    "archived WAL object {} size mismatch: expected {}, got {}",
+                    index.wal_object_key,
+                    index.size,
+                    bytes.len()
+                );
+            }
+            let actual_checksum = checksum(&bytes);
+            if actual_checksum != index.checksum {
+                anyhow::bail!(
+                    "archived WAL object {} checksum mismatch",
+                    index.wal_object_key
+                );
+            }
+            plan_segments.push(PitrRestoreWalSegment {
+                segment_id: index.segment_id,
+                wal_object_key: index.wal_object_key,
+                index_object_key: index.index_object_key,
+                first_commit_ts: index.first_commit_ts,
+                last_commit_ts: index.last_commit_ts,
+                checksum: index.checksum,
+                size: index.size,
+            });
+        }
+
+        Ok(plan_segments)
+    }
+
     /// Deletes a backup's manifest and associated data files.
     pub async fn delete_backup(&self, backup_id: &str) -> Result<()> {
         for manifest in self.completed_manifests().await? {
@@ -1436,5 +1604,262 @@ mod tests {
         assert!(orch.wal_segment_cleanup_allowed("2.log").await.unwrap());
         assert!(orch.wal_segment_cleanup_allowed("3.log").await.unwrap());
         assert!(orch.wal_segment_cleanup_allowed("4.log").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_pitr_restore_plan_selects_latest_base_and_wal_range() {
+        let repo: Arc<dyn BackupRepository> = Arc::new(MemBackupRepository::new());
+        let orch = BackupOrchestrator::new(repo);
+
+        let full = orch
+            .create_full_backup(
+                "cluster-1",
+                10,
+                1,
+                1,
+                vec![BackupObject {
+                    name: "kv_data.json".into(),
+                    bytes: Bytes::from("full"),
+                }],
+            )
+            .await
+            .unwrap();
+        let incremental = orch
+            .create_incremental_backup(
+                "cluster-1",
+                &full.backup_id,
+                20,
+                1,
+                1,
+                vec![BackupObject {
+                    name: "kv_data.json".into(),
+                    bytes: Bytes::from("incremental"),
+                }],
+            )
+            .await
+            .unwrap();
+
+        orch.archive_wal_indexed(
+            "1.log",
+            Bytes::from("before-base"),
+            vec!["before-base".into()],
+            vec![WalCommittedTxn {
+                txn_id: "before-base".into(),
+                commit_ts: 12,
+            }],
+        )
+        .await
+        .unwrap();
+        orch.archive_wal_indexed(
+            "2.log",
+            Bytes::from("after-base"),
+            vec!["after-base".into()],
+            vec![WalCommittedTxn {
+                txn_id: "after-base".into(),
+                commit_ts: 22,
+            }],
+        )
+        .await
+        .unwrap();
+        orch.archive_wal_indexed(
+            "3.log",
+            Bytes::from("late-write"),
+            vec!["late-txn".into()],
+            vec![],
+        )
+        .await
+        .unwrap();
+        orch.archive_wal_indexed(
+            "4.log",
+            Bytes::from("late-commit"),
+            vec![],
+            vec![WalCommittedTxn {
+                txn_id: "late-txn".into(),
+                commit_ts: 24,
+            }],
+        )
+        .await
+        .unwrap();
+
+        let plan = orch.plan_pitr_restore(25).await.unwrap();
+        assert_eq!(plan.plan_version, CURRENT_PITR_RESTORE_PLAN_VERSION);
+        assert_eq!(plan.base_backup_id, incremental.backup_id);
+        assert_eq!(
+            plan.base_backup_chain,
+            vec![full.backup_id, incremental.backup_id]
+        );
+        assert_eq!(plan.base_snapshot_ts, 20);
+        assert_eq!(plan.target_ts, 25);
+        assert_eq!(
+            plan.wal_segments
+                .iter()
+                .map(|segment| segment.segment_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["2.log", "3.log", "4.log"]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pitr_restore_plan_allows_snapshot_target_without_wal() {
+        let repo: Arc<dyn BackupRepository> = Arc::new(MemBackupRepository::new());
+        let orch = BackupOrchestrator::new(repo);
+        let full = orch
+            .create_full_backup(
+                "cluster-1",
+                10,
+                1,
+                1,
+                vec![BackupObject {
+                    name: "kv_data.json".into(),
+                    bytes: Bytes::from("full"),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let plan = orch.plan_pitr_restore(10).await.unwrap();
+        assert_eq!(plan.base_backup_id, full.backup_id);
+        assert!(plan.wal_segments.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_pitr_restore_plan_rejects_missing_required_wal_segment() {
+        let repo: Arc<dyn BackupRepository> = Arc::new(MemBackupRepository::new());
+        let orch = BackupOrchestrator::new(repo);
+        orch.create_full_backup(
+            "cluster-1",
+            10,
+            1,
+            1,
+            vec![BackupObject {
+                name: "kv_data.json".into(),
+                bytes: Bytes::from("full"),
+            }],
+        )
+        .await
+        .unwrap();
+
+        orch.archive_wal_indexed(
+            "1.log",
+            Bytes::from("first"),
+            vec!["first".into()],
+            vec![WalCommittedTxn {
+                txn_id: "first".into(),
+                commit_ts: 12,
+            }],
+        )
+        .await
+        .unwrap();
+        orch.archive_wal_indexed(
+            "3.log",
+            Bytes::from("third"),
+            vec!["third".into()],
+            vec![WalCommittedTxn {
+                txn_id: "third".into(),
+                commit_ts: 14,
+            }],
+        )
+        .await
+        .unwrap();
+
+        let err = orch.plan_pitr_restore(15).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("missing required WAL archive index")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pitr_restore_plan_includes_intermediate_indexed_segments() {
+        let repo: Arc<dyn BackupRepository> = Arc::new(MemBackupRepository::new());
+        let orch = BackupOrchestrator::new(repo);
+        orch.create_full_backup(
+            "cluster-1",
+            10,
+            1,
+            1,
+            vec![BackupObject {
+                name: "kv_data.json".into(),
+                bytes: Bytes::from("full"),
+            }],
+        )
+        .await
+        .unwrap();
+
+        orch.archive_wal_indexed(
+            "1.log",
+            Bytes::from("first"),
+            vec!["first".into()],
+            vec![WalCommittedTxn {
+                txn_id: "first".into(),
+                commit_ts: 12,
+            }],
+        )
+        .await
+        .unwrap();
+        orch.archive_wal_indexed("2.log", Bytes::from("checkpoint"), vec![], vec![])
+            .await
+            .unwrap();
+        orch.archive_wal_indexed(
+            "3.log",
+            Bytes::from("third"),
+            vec!["third".into()],
+            vec![WalCommittedTxn {
+                txn_id: "third".into(),
+                commit_ts: 14,
+            }],
+        )
+        .await
+        .unwrap();
+
+        let plan = orch.plan_pitr_restore(15).await.unwrap();
+        assert_eq!(
+            plan.wal_segments
+                .iter()
+                .map(|segment| segment.segment_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["1.log", "2.log", "3.log"]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pitr_restore_plan_rejects_corrupt_archived_wal_object() {
+        let repo: Arc<dyn BackupRepository> = Arc::new(MemBackupRepository::new());
+        let orch = BackupOrchestrator::new(repo.clone());
+        orch.create_full_backup(
+            "cluster-1",
+            10,
+            1,
+            1,
+            vec![BackupObject {
+                name: "kv_data.json".into(),
+                bytes: Bytes::from("full"),
+            }],
+        )
+        .await
+        .unwrap();
+        let index = orch
+            .archive_wal_indexed(
+                "1.log",
+                Bytes::from("original"),
+                vec!["txn".into()],
+                vec![WalCommittedTxn {
+                    txn_id: "txn".into(),
+                    commit_ts: 12,
+                }],
+            )
+            .await
+            .unwrap();
+
+        repo.put_object(
+            &index.wal_object_key,
+            Bytes::from("tampered"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        let err = orch.plan_pitr_restore(12).await.unwrap_err();
+        assert!(err.to_string().contains("checksum mismatch"));
     }
 }
