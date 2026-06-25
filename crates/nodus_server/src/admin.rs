@@ -619,6 +619,18 @@ async fn create_backup(
         .get_cluster_version()
         .map(|v| v.active_version)
         .unwrap_or(0);
+    let parent_snapshot_ts = if let Some(parent_id) = query.parent_backup_id.as_ref() {
+        match state.backup.load_manifest(parent_id).await {
+            Ok(manifest) => Some(manifest.snapshot_ts),
+            Err(e) => {
+                return Json(json!({
+                    "error": format!("Failed to load parent backup {parent_id}: {e}")
+                }));
+            }
+        }
+    } else {
+        None
+    };
 
     let snapshot = state.catalog.export_snapshot();
     let catalog_bytes = match serde_json::to_vec(&snapshot) {
@@ -636,29 +648,64 @@ async fn create_backup(
     };
 
     let mut kv_dump = Vec::new();
+    let mut max_kv_version = 0;
     let range = nodus_storage_api::KeyRange {
         start: Bytes::new(),
         end: Bytes::from(vec![255u8; 1024]),
     };
 
-    match state.kv.scan(range, u64::MAX) {
-        Ok(iter) => {
-            for pair_res in iter {
-                match pair_res {
-                    Ok(pair) => {
-                        kv_dump.push(json!({
-                            "key": pair.key.to_vec(),
-                            "value": pair.value.to_vec(),
-                            "version": pair.version,
-                        }));
-                    }
-                    Err(e) => {
-                        return Json(json!({ "error": format!("Failed to scan KV pair: {e}") }));
+    if let Some(parent_ts) = parent_snapshot_ts {
+        match state.kv.scan_versions(range, parent_ts, u64::MAX) {
+            Ok(iter) => {
+                for version_res in iter {
+                    match version_res {
+                        Ok(version) => {
+                            max_kv_version = max_kv_version.max(version.version);
+                            kv_dump.push(json!({
+                                "key": version.key.to_vec(),
+                                "value": version.value.as_ref().map(|value| value.to_vec()),
+                                "deleted": version.value.is_none(),
+                                "version": version.version,
+                            }));
+                        }
+                        Err(e) => {
+                            return Json(json!({
+                                "error": format!("Failed to scan KV version: {e}")
+                            }));
+                        }
                     }
                 }
             }
+            Err(e) => {
+                return Json(json!({
+                    "error": format!("Failed to start KV version scan: {e}")
+                }));
+            }
         }
-        Err(e) => return Json(json!({ "error": format!("Failed to start KV scan: {e}") })),
+    } else {
+        match state.kv.scan(range, u64::MAX) {
+            Ok(iter) => {
+                for pair_res in iter {
+                    match pair_res {
+                        Ok(pair) => {
+                            max_kv_version = max_kv_version.max(pair.version);
+                            kv_dump.push(json!({
+                                "key": pair.key.to_vec(),
+                                "value": pair.value.to_vec(),
+                                "deleted": false,
+                                "version": pair.version,
+                            }));
+                        }
+                        Err(e) => {
+                            return Json(json!({
+                                "error": format!("Failed to scan KV pair: {e}")
+                            }));
+                        }
+                    }
+                }
+            }
+            Err(e) => return Json(json!({ "error": format!("Failed to start KV scan: {e}") })),
+        }
     }
 
     let kv_bytes = match serde_json::to_vec(&kv_dump) {
@@ -680,10 +727,13 @@ async fn create_backup(
             bytes: Bytes::from(kv_bytes),
         },
     ];
+    let backup_ts = parent_snapshot_ts
+        .map(|parent_ts| max_kv_version.max(parent_ts.saturating_add(1)))
+        .unwrap_or(max_kv_version);
     if let Some(parent_id) = query.parent_backup_id {
         match state
             .backup
-            .create_incremental_backup("local", &parent_id, 0, version, version)
+            .create_incremental_backup("local", &parent_id, backup_ts, version, version, objects)
             .await
         {
             Ok(manifest) => Json(json!({
@@ -696,7 +746,7 @@ async fn create_backup(
     } else {
         match state
             .backup
-            .create_full_backup("local", 0, version, version, objects)
+            .create_full_backup("local", backup_ts, version, version, objects)
             .await
         {
             Ok(manifest) => Json(json!({
@@ -761,9 +811,8 @@ async fn restore_backup(
                             serde_json::from_slice::<Vec<serde_json::Value>>(&obj.bytes)
                         {
                             for pair in dump {
-                                if let (Some(k), Some(v), Some(ver)) = (
+                                if let (Some(k), Some(ver)) = (
                                     pair.get("key").and_then(|k| k.as_array()),
-                                    pair.get("value").and_then(|v| v.as_array()),
                                     pair.get("version").and_then(|v| v.as_u64()),
                                 ) {
                                     let key_bytes: Vec<u8> = k
@@ -771,18 +820,30 @@ async fn restore_backup(
                                         .filter_map(|x| x.as_u64())
                                         .map(|x| x as u8)
                                         .collect();
-                                    let val_bytes: Vec<u8> = v
-                                        .iter()
-                                        .filter_map(|x| x.as_u64())
-                                        .map(|x| x as u8)
-                                        .collect();
-
                                     let txn_id = nodus_storage_api::TxnId::new();
-                                    let _ = kv.write_intent(
-                                        txn_id,
-                                        Bytes::from(key_bytes.clone()),
-                                        Bytes::from(val_bytes),
-                                    );
+                                    if pair
+                                        .get("deleted")
+                                        .and_then(|deleted| deleted.as_bool())
+                                        .unwrap_or(false)
+                                    {
+                                        let _ = kv
+                                            .delete_intent(txn_id, Bytes::from(key_bytes.clone()));
+                                    } else if let Some(v) =
+                                        pair.get("value").and_then(|v| v.as_array())
+                                    {
+                                        let val_bytes: Vec<u8> = v
+                                            .iter()
+                                            .filter_map(|x| x.as_u64())
+                                            .map(|x| x as u8)
+                                            .collect();
+                                        let _ = kv.write_intent(
+                                            txn_id,
+                                            Bytes::from(key_bytes.clone()),
+                                            Bytes::from(val_bytes),
+                                        );
+                                    } else {
+                                        continue;
+                                    }
                                     let _ = kv.commit(txn_id, ver);
                                     tracing::debug!(
                                         "Restored KV pair from baseline: key={:?}",

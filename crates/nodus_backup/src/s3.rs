@@ -1,6 +1,6 @@
 //! S3-compatible (AWS S3 / MinIO) backup repository backed by `object_store`.
 
-use crate::{BackupRepository, ByteRange, ObjectMetadata, PutOptions};
+use crate::{BackupRepository, ByteRange, ObjectMetadata, PutOptions, RepositoryCapabilities};
 use anyhow::Result;
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -51,6 +51,16 @@ impl S3BackupRepository {
 
 #[async_trait]
 impl BackupRepository for S3BackupRepository {
+    fn capabilities(&self) -> RepositoryCapabilities {
+        RepositoryCapabilities {
+            immutable_objects: false,
+            conditional_put: false,
+            range_reads: true,
+            multipart_upload: false,
+            server_side_encryption: false,
+        }
+    }
+
     async fn put_object(
         &self,
         key: &str,
