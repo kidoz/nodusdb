@@ -138,6 +138,17 @@ pub trait TxnManager: Send + Sync {
     /// keeps `read_ts`/`commit_ts` comparable across nodes once they exchange
     /// timestamps; cross-shard transactions (2PC) rely on it. Default: no-op.
     fn observe_timestamp(&self, _ts: Timestamp) {}
+
+    /// Like [`Self::observe_timestamp`], but also extends the durable reservation
+    /// so the observed timestamp survives a restart. Applied when a node ingests
+    /// a replicated commit (e.g. a follower applying `CommitTxn`): once a node
+    /// has durably stored a version at `ts`, it must never — even after a restart
+    /// and leadership change — issue a commit timestamp at or below `ts`.
+    /// Default: in-memory only (no persistence).
+    fn observe_durable(&self, ts: Timestamp) -> Result<()> {
+        self.observe_timestamp(ts);
+        Ok(())
+    }
 }
 
 // In-Memory MVP Implementation
@@ -326,6 +337,14 @@ impl TxnManager for MemTxnManager {
         // past it will reserve before returning.
         self.clock.write().unwrap().hlc.update(ts);
     }
+
+    fn observe_durable(&self, ts: Timestamp) -> Result<()> {
+        // A version was durably applied at `ts`, so the clock must resume past it
+        // after a restart: advance and extend the reservation to cover `ts`.
+        let mut clock = self.clock.write().unwrap();
+        clock.hlc.update(ts);
+        self.reserve_through(&mut clock, ts)
+    }
 }
 
 // Regular unit tests use std locks and must not run under loom, where lock
@@ -422,6 +441,33 @@ mod tests {
         assert!(
             resumed > big_commit_ts,
             "commit timestamp regressed after restart: {resumed} <= {big_commit_ts}"
+        );
+    }
+
+    #[test]
+    fn durably_observed_timestamps_survive_restart() {
+        let store = MockStore::default();
+
+        // A follower applies a replicated commit far ahead of its wall clock.
+        let applied_ts = {
+            let mgr =
+                MemTxnManager::with_timestamp_store(std::sync::Arc::new(store.clone())).unwrap();
+            let base = mgr.begin_txn().unwrap().read_ts;
+            let applied = base + 10_000_000_000; // ~2.7 hours ahead
+            mgr.observe_durable(applied).unwrap();
+            applied
+        };
+        // The reservation must cover the durably-applied timestamp.
+        assert!(store.0.lock().unwrap().unwrap() >= applied_ts);
+
+        // After "restart" and promotion to coordinator, the first issued commit
+        // must order strictly after the timestamp it already applied.
+        let mgr = MemTxnManager::with_timestamp_store(std::sync::Arc::new(store.clone())).unwrap();
+        let t = mgr.begin_txn().unwrap();
+        let commit = mgr.commit_txn(t.txn_id).unwrap();
+        assert!(
+            commit > applied_ts,
+            "issued {commit} <= durably applied {applied_ts}"
         );
     }
 

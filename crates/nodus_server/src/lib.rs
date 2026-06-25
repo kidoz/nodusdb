@@ -343,6 +343,13 @@ pub async fn run_server_with_config(
     let raft_config = Arc::new(openraft::Config::default().validate().unwrap());
     let raft_state = nodus_raftstore::server::RaftState::new();
 
+    // Seed the transaction clock from a durable, node-local high-water mark so
+    // commit timestamps never regress across a restart. Created before the Raft
+    // manager so applied commits can advance it as groups ingest replicated writes.
+    let txn = Arc::new(nodus_txn::MemTxnManager::with_timestamp_store(Arc::new(
+        KvTimestampStore::new(local_kv.clone()),
+    ))?);
+
     // Owns this node's Raft groups. The meta group is created now; data-shard
     // groups are created on demand (routing lands in Phase 2).
     let multi_raft = Arc::new(crate::multi_raft::MultiRaftManager::new(
@@ -352,6 +359,7 @@ pub async fn run_server_with_config(
         raft_state.clone(),
         local_kv.clone(),
         config.admin.token.clone(),
+        txn.clone(),
     ));
 
     // Local cluster-metadata store (shard maps + placements), KV-backed so it
@@ -411,11 +419,6 @@ pub async fn run_server_with_config(
         shard_id: crate::multi_raft::META_SHARD.to_string(),
     });
 
-    // Seed the transaction clock from a durable, node-local high-water mark so
-    // commit timestamps never regress across a restart.
-    let txn = Arc::new(nodus_txn::MemTxnManager::with_timestamp_store(Arc::new(
-        KvTimestampStore::new(local_kv.clone()),
-    ))?);
     let authz = Arc::new(nodus_authz::DefaultAuthzEngine::new(catalog.clone()));
 
     let executor = Arc::new(nodus_executor::MemExecutor::new(

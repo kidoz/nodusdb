@@ -19,7 +19,79 @@ use nodus_raftstore::ShardCommand;
 use nodus_raftstore::network::NodusNetworkFactory;
 use nodus_raftstore::server::{NodusRaft, RaftState};
 use nodus_sharding::ShardOrchestrator;
-use nodus_storage_api::{KeyRange, KvEngine, NamespacedKvEngine};
+use nodus_storage_api::{
+    IntentReplacement, KeyRange, KvEngine, KvPair, KvVersion, NamespacedKvEngine, Timestamp, TxnId,
+};
+
+/// Wraps a group's KV engine so that applying a committed transaction also
+/// advances (and durably reserves) this node's transaction clock past the
+/// commit timestamp. This keeps commit timestamps monotonic across a leadership
+/// change: a follower that applied `commit_ts` will never, once promoted, issue
+/// a commit at or below it — even after a restart. All other operations
+/// delegate unchanged.
+struct ClockAdvancingKvEngine {
+    inner: Arc<dyn KvEngine>,
+    clock: Arc<dyn nodus_txn::TxnManager>,
+}
+
+impl ClockAdvancingKvEngine {
+    fn wrap(inner: Arc<dyn KvEngine>, clock: Arc<dyn nodus_txn::TxnManager>) -> Arc<dyn KvEngine> {
+        Arc::new(Self { inner, clock })
+    }
+}
+
+impl KvEngine for ClockAdvancingKvEngine {
+    fn get(&self, key: &[u8], read_ts: Timestamp) -> Result<Option<Bytes>> {
+        self.inner.get(key, read_ts)
+    }
+    fn scan(
+        &self,
+        range: KeyRange,
+        read_ts: Timestamp,
+    ) -> Result<Box<dyn Iterator<Item = Result<KvPair>> + Send>> {
+        self.inner.scan(range, read_ts)
+    }
+    fn scan_versions(
+        &self,
+        range: KeyRange,
+        since_ts: Timestamp,
+        read_ts: Timestamp,
+    ) -> Result<Box<dyn Iterator<Item = Result<KvVersion>> + Send>> {
+        self.inner.scan_versions(range, since_ts, read_ts)
+    }
+    fn write_intent(&self, txn_id: TxnId, key: Bytes, value: Bytes) -> Result<()> {
+        self.inner.write_intent(txn_id, key, value)
+    }
+    fn delete_intent(&self, txn_id: TxnId, key: Bytes) -> Result<()> {
+        self.inner.delete_intent(txn_id, key)
+    }
+    fn replace_intent(
+        &self,
+        txn_id: TxnId,
+        key: Bytes,
+        replacement: IntentReplacement,
+    ) -> Result<()> {
+        self.inner.replace_intent(txn_id, key, replacement)
+    }
+    fn commit(&self, txn_id: TxnId, commit_ts: Timestamp) -> Result<()> {
+        self.inner.commit(txn_id, commit_ts)?;
+        // Best-effort: a failed clock persist must not fail the already-durable
+        // commit; the next issued timestamp will reserve again.
+        if let Err(e) = self.clock.observe_durable(commit_ts) {
+            tracing::warn!("clock advance on applied commit {commit_ts} failed: {e}");
+        }
+        Ok(())
+    }
+    fn abort(&self, txn_id: TxnId) -> Result<()> {
+        self.inner.abort(txn_id)
+    }
+    fn garbage_collect(&self, watermark: Timestamp) -> Result<usize> {
+        self.inner.garbage_collect(watermark)
+    }
+    fn flush(&self) -> Result<()> {
+        self.inner.flush()
+    }
+}
 
 /// Identifier of the metadata group that owns catalog, RBAC, and cluster state.
 pub const META_SHARD: &str = "shard-meta";
@@ -44,6 +116,9 @@ pub struct MultiRaftManager {
     admin_token: Option<String>,
     /// Reused HTTP client for peer replica-instantiation requests.
     http: reqwest::Client,
+    /// This node's transaction clock; advanced as groups apply committed writes
+    /// so timestamps stay monotonic across leadership changes.
+    clock: Arc<dyn nodus_txn::TxnManager>,
 }
 
 impl MultiRaftManager {
@@ -54,6 +129,7 @@ impl MultiRaftManager {
         state: RaftState,
         base_kv: Arc<dyn KvEngine>,
         admin_token: Option<String>,
+        clock: Arc<dyn nodus_txn::TxnManager>,
     ) -> Self {
         Self {
             node_id,
@@ -64,6 +140,7 @@ impl MultiRaftManager {
             hosted: Arc::new(RwLock::new(HashSet::new())),
             admin_token,
             http: reqwest::Client::new(),
+            clock,
         }
     }
 
@@ -108,6 +185,7 @@ impl MultiRaftManager {
         upgrade: Arc<dyn nodus_upgrade::UpgradeCoordinator>,
         meta_store: Arc<dyn nodus_meta::MetaStore>,
     ) -> Result<NodusRaft> {
+        let kv = ClockAdvancingKvEngine::wrap(kv, self.clock.clone());
         let store = NodusRaftStore::with_components(
             kv,
             catalog_writer,
@@ -127,6 +205,7 @@ impl MultiRaftManager {
         }
         let kv: Arc<dyn KvEngine> =
             Arc::new(NamespacedKvEngine::new(self.base_kv.clone(), shard_id));
+        let kv = ClockAdvancingKvEngine::wrap(kv, self.clock.clone());
         let store = NodusRaftStore::with_kv(kv);
         self.spawn_group(shard_id, store).await
     }
@@ -571,6 +650,7 @@ mod tests {
             RaftState::new(),
             base_kv,
             None,
+            Arc::new(nodus_txn::MemTxnManager::new()),
         )
     }
 
@@ -724,6 +804,7 @@ mod tests {
             RaftState::new(),
             base.clone(),
             None,
+            Arc::new(nodus_txn::MemTxnManager::new()),
         );
 
         let meta = Arc::new(nodus_meta::PersistentMetaStore::new(base.clone()));
@@ -776,6 +857,7 @@ mod tests {
             RaftState::new(),
             base.clone(),
             None,
+            Arc::new(nodus_txn::MemTxnManager::new()),
         );
 
         let meta = Arc::new(nodus_meta::PersistentMetaStore::new(base.clone()));
