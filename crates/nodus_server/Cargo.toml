@@ -20,6 +20,8 @@ nodus_monitoring = { path = "../nodus_monitoring" }
 nodus_pgwire = { path = "../nodus_pgwire" }
 nodus_web_console = { path = "../nodus_web_console" }
 nodus_executor = { path = "../nodus_executor" }
+nodus_sql = { path = "../nodus_sql" }
+nodus_import = { path = "../nodus_import" }
 nodus_storage_api = { path = "../nodus_storage_api" }
 nodus_storage_lsm = { path = "../nodus_storage_lsm" }
 nodus_txn = { path = "../nodus_txn" }

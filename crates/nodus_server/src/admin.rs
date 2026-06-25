@@ -43,6 +43,9 @@ pub struct AdminState {
     pub manager: Arc<crate::multi_raft::MultiRaftManager>,
     pub slow_log: Arc<SlowQueryLog>,
     pub kv: Arc<dyn nodus_storage_api::KvEngine>,
+    /// In-process query executor, used by the dump-import endpoint to replay
+    /// translated statements without a network round-trip.
+    pub executor: Arc<dyn nodus_executor::Executor>,
     pub wal_key: Option<[u8; 32]>,
     /// Shared with `AppState`; flipping it makes `/readyz` report not-ready.
     pub draining: Arc<AtomicBool>,
@@ -67,6 +70,7 @@ async fn require_token(
         p if p.starts_with("/api/v1/roles") => nodus_authz::Action::ManageGrants,
         p if p.starts_with("/api/v1/grants") => nodus_authz::Action::ManageGrants,
         p if p.starts_with("/api/v1/backups") => nodus_authz::Action::ManageBackups,
+        p if p.starts_with("/api/v1/import") => nodus_authz::Action::ManageBackups,
         p if p.starts_with("/api/v1/upgrade") => nodus_authz::Action::ManageUpgrades,
         p if p.starts_with("/api/v1/shards") => nodus_authz::Action::ManageShards,
         p if p.starts_with("/api/v1/catalog") => nodus_authz::Action::ManageShards,
@@ -157,6 +161,7 @@ pub fn admin_routes(state: AdminState) -> Router {
             get(list_grants).post(create_grant).delete(revoke_grant),
         )
         .route("/api/v1/backups", get(list_backups).post(create_backup))
+        .route("/api/v1/import", post(import_dump))
         .route("/api/v1/backups/:id/verify", post(verify_backup))
         .route("/api/v1/backups/:id", axum::routing::delete(delete_backup))
         .route("/api/v1/backups/:id/restore", post(restore_backup))
@@ -1117,4 +1122,146 @@ async fn cluster_groups(State(state): State<AdminState>) -> Json<Value> {
         }));
     }
     Json(json!({ "groups": groups }))
+}
+
+/// Query parameters for the dump-import endpoint.
+#[derive(serde::Deserialize)]
+pub struct ImportQuery {
+    /// `stop` to abort on the first failing statement; defaults to `continue`.
+    pub on_error: Option<String>,
+    /// Rows folded into each synthesized `INSERT` (defaults to 500).
+    pub batch_rows: Option<usize>,
+}
+
+/// An [`nodus_import::ImportSink`] that replays translated statements through
+/// the in-process executor. Each statement is parsed, planned, and executed
+/// synchronously; DDL/DML therefore flows through the executor's normal
+/// authorization and audit path.
+struct ExecutorImportSink {
+    executor: Arc<dyn nodus_executor::Executor>,
+    ctx: nodus_executor::ExecutionContext,
+}
+
+impl nodus_import::ImportSink for ExecutorImportSink {
+    fn execute(&mut self, stmt: &nodus_import::ImportStatement) -> anyhow::Result<u64> {
+        for parsed in nodus_sql::parse_sql(&stmt.sql)? {
+            let plan = nodus_executor::plan_statement(&parsed, &[])?;
+            self.executor.execute_logical(&self.ctx, plan)?;
+        }
+        Ok(stmt.rows)
+    }
+}
+
+/// Imports a plain-format PostgreSQL dump supplied as the request body. The dump
+/// is translated by `nodus_import` and replayed against the in-process executor
+/// on the blocking pool; the response is the versioned import report.
+async fn import_dump(
+    State(state): State<AdminState>,
+    Query(query): Query<ImportQuery>,
+    body: String,
+) -> Json<Value> {
+    let executor = state.executor.clone();
+    let principal_id = state
+        .catalog
+        .get_principal_by_name("nodus")
+        .map(|p| p.id)
+        .unwrap_or_else(|_| PrincipalId::new());
+    let ctx = nodus_executor::ExecutionContext {
+        session_id: format!("admin-import-{}", Uuid::new_v4()),
+        principal_id,
+        active_roles: vec![],
+        authz_catalog_version: 1,
+    };
+    let opts = nodus_import::ImportOptions {
+        batch_rows: query.batch_rows.unwrap_or(500).max(1),
+        on_error: match query.on_error.as_deref() {
+            Some("stop") => nodus_import::OnError::Stop,
+            _ => nodus_import::OnError::Continue,
+        },
+        ..nodus_import::ImportOptions::default()
+    };
+
+    // Executor writes route through synchronous traits, so run the whole replay
+    // on the blocking pool to avoid parking a reactor worker.
+    let result = tokio::task::spawn_blocking(move || {
+        let mut sink = ExecutorImportSink { executor, ctx };
+        nodus_import::import_str(&body, &opts, &mut sink)
+    })
+    .await;
+
+    match result {
+        Ok(report) => Json(json!({ "report": report })),
+        Err(e) => Json(json!({ "error": format!("import task failed: {e}") })),
+    }
+}
+
+#[cfg(test)]
+mod import_tests {
+    use super::*;
+    use nodus_import::{ImportOptions, ImportSink, import_str};
+
+    /// Imports a dump (schema + COPY data + folded PK) through the in-process
+    /// executor, then confirms the rows are queryable.
+    #[test]
+    fn imports_dump_through_in_process_executor() {
+        use nodus_catalog::{CreateRoleRequest, GrantPrivilegeRequest, PrincipalType};
+
+        let audit = Arc::new(nodus_audit::MemoryAuditSink::new());
+        let (executor, catalog) = nodus_executor::MemExecutor::shared(audit);
+
+        // A superuser principal (ALL on System) so DDL/DML is authorized, the
+        // same role the real endpoint resolves via `get_principal_by_name`.
+        let admin = catalog
+            .create_role(CreateRoleRequest {
+                id: PrincipalId::new(),
+                name: "importer".into(),
+                principal_type: PrincipalType::User,
+                database_id: None,
+            })
+            .unwrap();
+        catalog
+            .grant_privilege(GrantPrivilegeRequest {
+                id: nodus_catalog::GrantId::new(),
+                principal_id: admin.id,
+                resource: ResourceRef::System,
+                privilege: "ALL".into(),
+            })
+            .unwrap();
+
+        let executor: Arc<dyn nodus_executor::Executor> = executor;
+        let ctx = nodus_executor::ExecutionContext {
+            session_id: "test-import".into(),
+            principal_id: admin.id,
+            active_roles: vec![],
+            authz_catalog_version: 1,
+        };
+
+        let dump = "\
+CREATE TABLE t (id integer, name text);
+COPY t (id, name) FROM stdin;
+1\talpha
+2\tbeta
+\\.
+ALTER TABLE ONLY t ADD CONSTRAINT t_pkey PRIMARY KEY (id);
+";
+        let mut sink = ExecutorImportSink {
+            executor: executor.clone(),
+            ctx: ctx.clone(),
+        };
+        let report = import_str(dump, &ImportOptions::default(), &mut sink);
+
+        assert_eq!(report.tables_created, 1);
+        assert_eq!(report.rows_inserted, 2);
+        assert_eq!(report.constraints_folded, 1);
+        assert!(
+            report.is_clean(),
+            "unexpected failures: {:?}",
+            report.failures
+        );
+
+        let stmts = nodus_sql::parse_sql("SELECT id, name FROM t ORDER BY id").unwrap();
+        let plan = nodus_executor::plan_statement(&stmts[0], &[]).unwrap();
+        let out = executor.execute_logical(&ctx, plan).unwrap();
+        assert_eq!(out.rows.len(), 2);
+    }
 }

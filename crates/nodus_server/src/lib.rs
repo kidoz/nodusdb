@@ -724,6 +724,7 @@ pub async fn run_server_with_config(
         manager: multi_raft.clone(),
         slow_log: slow_log.clone(),
         kv: executor.kv(),
+        executor: executor.clone(),
         wal_key: encryption_key,
         draining: state.draining.clone(),
         authenticator: authenticator.clone(),
