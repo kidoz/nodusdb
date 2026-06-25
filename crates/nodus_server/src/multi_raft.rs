@@ -15,10 +15,11 @@ use std::sync::{Arc, RwLock};
 
 use nodus_catalog::{ShardId, TableId};
 use nodus_raftstore::NodusRaftStore;
+use nodus_raftstore::ShardCommand;
 use nodus_raftstore::network::NodusNetworkFactory;
 use nodus_raftstore::server::{NodusRaft, RaftState};
 use nodus_sharding::ShardOrchestrator;
-use nodus_storage_api::{KeyRange, KvEngine, NamespacedKvEngine, TxnId};
+use nodus_storage_api::{KeyRange, KvEngine, NamespacedKvEngine};
 
 /// Identifier of the metadata group that owns catalog, RBAC, and cluster state.
 pub const META_SHARD: &str = "shard-meta";
@@ -177,11 +178,13 @@ impl MultiRaftManager {
     pub async fn reconcile(&self, placements: &HashMap<ShardId, String>) -> Result<usize> {
         let mine = self.node_id.to_string();
         let mut created = 0;
+        let mut owned: HashSet<String> = HashSet::new();
         for (shard_id, node) in placements {
             if *node != mine {
                 continue;
             }
             let group_id = Self::data_group_id(*shard_id);
+            owned.insert(group_id.clone());
             let newly = !self.hosts(&group_id);
             if let Err(e) = self.form_replicated(&group_id).await {
                 tracing::warn!("forming data group {group_id} failed: {e}");
@@ -189,6 +192,27 @@ impl MultiRaftManager {
             }
             if newly {
                 created += 1;
+            }
+        }
+
+        // Leadership-aware pass: for any data group this node currently *leads*
+        // but does not own (it failed over here from its original primary), keep
+        // its replica set in sync with the cluster. Without this, a group whose
+        // owner is gone would never fold in a node that joined or restarted
+        // afterwards. A no-op in steady state, where a node only leads groups it
+        // owns.
+        let led: Vec<(String, NodusRaft)> = {
+            let rafts = self.state.rafts.read().await;
+            rafts
+                .iter()
+                .filter(|(id, _)| id.as_str() != META_SHARD && !owned.contains(id.as_str()))
+                .filter(|(_, raft)| raft.metrics().borrow().current_leader == Some(self.node_id))
+                .map(|(id, raft)| (id.clone(), raft.clone()))
+                .collect()
+        };
+        for (group_id, raft) in led {
+            if let Err(e) = self.ensure_group_membership(&group_id, &raft).await {
+                tracing::warn!("ensuring membership for led group {group_id} failed: {e}");
             }
         }
         Ok(created)
@@ -284,19 +308,34 @@ impl MultiRaftManager {
         }
 
         // Only the leader may drive membership; back off if leadership hasn't
-        // settled (or has moved elsewhere) and let a later pass converge.
+        // settled and let a later pass converge.
         if !self.await_leadership(&raft).await {
+            return Ok(());
+        }
+        self.ensure_group_membership(group_id, &raft).await
+    }
+
+    /// Leader-only: brings `group_id`'s voter set up to the full cluster
+    /// membership — instantiating a replica on every other member and folding it
+    /// in. A no-op unless this node currently leads the group, so it is safe to
+    /// call on any hosted group. Idempotent and convergent: re-instantiates
+    /// restarted replicas and adds members that joined after the group formed.
+    /// This is what makes membership self-healing regardless of *which* node
+    /// leads the group (see the leadership-aware pass in [`Self::reconcile`]).
+    async fn ensure_group_membership(&self, group_id: &str, raft: &NodusRaft) -> Result<()> {
+        let metrics = raft.metrics();
+        let (is_leader, current): (bool, BTreeSet<u64>) = {
+            let m = metrics.borrow();
+            (
+                m.current_leader == Some(self.node_id),
+                m.membership_config.membership().voter_ids().collect(),
+            )
+        };
+        if !is_leader {
             return Ok(());
         }
 
         let members = self.cluster_members().await;
-        let current: BTreeSet<u64> = raft
-            .metrics()
-            .borrow()
-            .membership_config
-            .membership()
-            .voter_ids()
-            .collect();
         let mut target = current.clone();
         for (id, addr) in &members {
             if *id == self.node_id {
@@ -356,11 +395,12 @@ impl MultiRaftManager {
         Ok(())
     }
 
-    /// Physically splits a shard. Plans the split, creates and initializes the
-    /// child groups, **relocates the source's data into them before flipping
-    /// routing** (so no read lands on an empty child and no committed key is lost
-    /// or duplicated), commits the flip, then decommissions the source group.
-    /// Single-node today; cross-node transfer (learner + snapshot ship) is future.
+    /// Physically splits a shard. Plans the split, forms the child groups
+    /// **replicated across the cluster** (this node as primary), **relocates the
+    /// source's data into them through Raft before flipping routing** (so the
+    /// data lands on every child replica — not just locally — and no read hits an
+    /// empty child or loses a committed key), commits the flip, then
+    /// decommissions the source group on this node.
     pub async fn split_shard(
         &self,
         orchestrator: &Arc<ShardOrchestrator>,
@@ -375,16 +415,32 @@ impl MultiRaftManager {
         if local {
             let left_group = Self::data_group_id(left_id);
             let right_group = Self::data_group_id(right_id);
-            let lr = self.get_or_create_data(&left_group).await?;
-            self.init_single(&lr).await;
-            let rr = self.get_or_create_data(&right_group).await?;
-            self.init_single(&rr).await;
-            self.relocate_partition(
-                &Self::data_group_id(shard_id),
-                &left_group,
-                &right_group,
-                &plan.split_key,
-            )?;
+            // Read the source's committed data before forming the children, then
+            // form each child as a replicated group led here.
+            let entries = self.scan_user_data(&Self::data_group_id(shard_id))?;
+            self.form_replicated(&left_group).await?;
+            self.form_replicated(&right_group).await?;
+            let left = self
+                .get(&left_group)
+                .await
+                .ok_or_else(|| anyhow::anyhow!("left child group {left_group} missing"))?;
+            let right = self
+                .get(&right_group)
+                .await
+                .ok_or_else(|| anyhow::anyhow!("right child group {right_group} missing"))?;
+
+            // Relocate each key into the child whose range it falls in, through
+            // that child's Raft so every replica applies it. Commit version is
+            // preserved.
+            for (key, value, version) in entries {
+                let (dest, dest_group) = if key.as_ref() < plan.split_key.as_slice() {
+                    (&left, &left_group)
+                } else {
+                    (&right, &right_group)
+                };
+                self.raft_relocate(dest, dest_group, key, value, version)
+                    .await?;
+            }
         }
 
         // The routing flip replicates through the meta Raft group (blocking
@@ -400,53 +456,11 @@ impl MultiRaftManager {
         Ok((left_id, right_id))
     }
 
-    /// Copies every committed entry from the source namespace into the left or
-    /// right child namespace depending on whether its (namespace-stripped) key
-    /// sorts before `split_key`, preserving each entry's commit version. Writes
-    /// go straight to the shared base store under the child namespaces, which on
-    /// a single node is equivalent to the child group applying them.
-    fn relocate_partition(
-        &self,
-        source_group: &str,
-        left_group: &str,
-        right_group: &str,
-        split_key: &[u8],
-    ) -> Result<()> {
-        let source = NamespacedKvEngine::new(self.base_kv.clone(), source_group);
-        let left = NamespacedKvEngine::new(self.base_kv.clone(), left_group);
-        let right = NamespacedKvEngine::new(self.base_kv.clone(), right_group);
-
-        // Start at 0x01 to copy only user data — never the source group's own
-        // `\0`-prefixed Raft state (log/vote/applied), which is private to it and
-        // would otherwise collide with the destination group's Raft keys.
-        let full = KeyRange {
-            start: Bytes::from_static(&[1]),
-            end: Bytes::from(vec![255u8; 1024]),
-        };
-        let entries: Vec<(Bytes, Bytes, u64)> = source
-            .scan(full, u64::MAX)?
-            .filter_map(|r| r.ok())
-            .map(|p| (p.key, p.value, p.version))
-            .collect();
-
-        for (key, value, version) in entries {
-            let dest = if key.as_ref() < split_key {
-                &left
-            } else {
-                &right
-            };
-            let txn = TxnId::new();
-            dest.write_intent(txn, key, value)?;
-            dest.commit(txn, version)?;
-        }
-        Ok(())
-    }
-
-    /// Physically merges two adjacent shards. Plans the merge, creates and
-    /// initializes the merged group, **relocates both sources' data into it
-    /// before flipping routing** (so no read lands on an empty merged shard and
-    /// no committed key is lost), commits the flip, then decommissions both
-    /// source groups. Single-node today; cross-node transfer is future.
+    /// Physically merges two adjacent shards. Plans the merge, forms the merged
+    /// group **replicated across the cluster** (this node as primary),
+    /// **relocates both sources' data into it through Raft before flipping
+    /// routing** (so the union lands on every merged replica with no key lost),
+    /// commits the flip, then decommissions both source groups on this node.
     pub async fn merge_shards(
         &self,
         orchestrator: &Arc<ShardOrchestrator>,
@@ -460,13 +474,21 @@ impl MultiRaftManager {
 
         if local {
             let merged_group = Self::data_group_id(merged_id);
-            let mr = self.get_or_create_data(&merged_group).await?;
-            self.init_single(&mr).await;
-            self.relocate_merge(
-                &Self::data_group_id(left_id),
-                &Self::data_group_id(right_id),
-                &merged_group,
-            )?;
+            // Read both sources' committed data before forming the merged group.
+            let mut entries = self.scan_user_data(&Self::data_group_id(left_id))?;
+            entries.extend(self.scan_user_data(&Self::data_group_id(right_id))?);
+            self.form_replicated(&merged_group).await?;
+            let merged = self
+                .get(&merged_group)
+                .await
+                .ok_or_else(|| anyhow::anyhow!("merged group {merged_group} missing"))?;
+
+            // The two sources cover disjoint ranges, so their keys never collide;
+            // relocate the union into the merged group through Raft.
+            for (key, value, version) in entries {
+                self.raft_relocate(&merged, &merged_group, key, value, version)
+                    .await?;
+            }
         }
 
         // The routing flip replicates through the meta Raft group (blocking
@@ -483,36 +505,51 @@ impl MultiRaftManager {
         Ok(merged_id)
     }
 
-    /// Copies every committed entry from both source namespaces into the merged
-    /// namespace, preserving each entry's commit version. The two sources cover
-    /// disjoint adjacent ranges, so their keys never collide; the merged shard
-    /// ends up holding the exact union with no key lost or duplicated.
-    fn relocate_merge(
+    /// Snapshots a group's committed user data (`key, value, commit version`).
+    /// Starts at `0x01` so the group's own `\0`-prefixed Raft state (log/vote/
+    /// applied) is never read — that is private to the group and would collide
+    /// with a destination group's Raft keys.
+    fn scan_user_data(&self, group_id: &str) -> Result<Vec<(Bytes, Bytes, u64)>> {
+        let source = NamespacedKvEngine::new(self.base_kv.clone(), group_id);
+        let full = KeyRange {
+            start: Bytes::from_static(&[1]),
+            end: Bytes::from(vec![255u8; 1024]),
+        };
+        Ok(source
+            .scan(full, u64::MAX)?
+            .filter_map(|r| r.ok())
+            .map(|p| (p.key, p.value, p.version))
+            .collect())
+    }
+
+    /// Relocates one committed entry into `dest_group` through its Raft, so every
+    /// replica of the destination applies it. The commit version is preserved by
+    /// committing at the source entry's version. `dest` must be led by this node.
+    async fn raft_relocate(
         &self,
-        left_group: &str,
-        right_group: &str,
-        merged_group: &str,
+        dest: &NodusRaft,
+        dest_group: &str,
+        key: Bytes,
+        value: Bytes,
+        version: u64,
     ) -> Result<()> {
-        let merged = NamespacedKvEngine::new(self.base_kv.clone(), merged_group);
-        for src_group in [left_group, right_group] {
-            let source = NamespacedKvEngine::new(self.base_kv.clone(), src_group);
-            // Skip the source group's `\0`-prefixed Raft state — copy user data
-            // only (see `relocate_partition`).
-            let full = KeyRange {
-                start: Bytes::from_static(&[1]),
-                end: Bytes::from(vec![255u8; 1024]),
-            };
-            let entries: Vec<(Bytes, Bytes, u64)> = source
-                .scan(full, u64::MAX)?
-                .filter_map(|r| r.ok())
-                .map(|p| (p.key, p.value, p.version))
-                .collect();
-            for (key, value, version) in entries {
-                let txn = TxnId::new();
-                merged.write_intent(txn, key, value)?;
-                merged.commit(txn, version)?;
-            }
-        }
+        let txn_id = uuid::Uuid::new_v4().to_string();
+        let shard_id = Some(dest_group.to_string());
+        dest.client_write(ShardCommand::PutIntent {
+            txn_id: txn_id.clone(),
+            key: key.to_vec(),
+            value: value.to_vec(),
+            shard_id: shard_id.clone(),
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("relocate put into {dest_group}: {e}"))?;
+        dest.client_write(ShardCommand::CommitTxn {
+            txn_id,
+            commit_ts: version,
+            shard_id,
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("relocate commit into {dest_group}: {e}"))?;
         Ok(())
     }
 }
@@ -616,6 +653,42 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         assert!(led, "reconciled shard group should elect a leader");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconcile_maintains_membership_of_groups_it_leads_but_does_not_own() {
+        let mgr = manager(); // node_id = 1
+        // Host and lead a data group with NO placement for it — i.e. one this
+        // node leads but does not own (as if it failed over here).
+        let group = mgr.get_or_create_data("shard-led-unowned").await.unwrap();
+        mgr.init_single(&group).await;
+        for _ in 0..30 {
+            if group.metrics().borrow().current_leader == Some(1) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+
+        // Reconcile owns nothing, but the leadership-aware pass must still visit
+        // the led group (without error) and leave it hosted. With no meta group
+        // there are no cluster members to fold in, so membership is unchanged.
+        let created = mgr.reconcile(&HashMap::new()).await.unwrap();
+        assert_eq!(created, 0, "nothing owned is newly created");
+        assert!(
+            mgr.hosts("shard-led-unowned"),
+            "the led-but-unowned group stays hosted across reconcile"
+        );
+        let voters = group
+            .metrics()
+            .borrow()
+            .membership_config
+            .membership()
+            .voter_ids()
+            .count();
+        assert_eq!(
+            voters, 1,
+            "no cluster members to add, so still single-voter"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

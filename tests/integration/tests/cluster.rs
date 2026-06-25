@@ -304,3 +304,117 @@ async fn data_shard_forms_a_multi_node_group() {
         "a follower should host a replica of the data group"
     );
 }
+
+/// Voter count for the group with `group_id` in a `/api/v1/cluster/groups`
+/// body, or 0 if the node doesn't host it.
+fn voters_of(groups: &serde_json::Value, group_id: &str) -> usize {
+    groups
+        .get("groups")
+        .and_then(|g| g.as_array())
+        .into_iter()
+        .flatten()
+        .find(|g| g.get("id").and_then(|i| i.as_str()) == Some(group_id))
+        .and_then(|g| g.get("voters"))
+        .and_then(|v| v.as_array())
+        .map(|v| v.len())
+        .unwrap_or(0)
+}
+
+/// Splitting a shard that is replicated across the cluster forms **both child
+/// groups across the cluster too**: relocation runs through each child's Raft,
+/// so the children come up as multi-node groups (not single-node copies on the
+/// splitting node). Before Phase 3 split children were single-node and their
+/// data never reached followers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial(cluster)]
+async fn split_forms_child_groups_across_the_cluster() {
+    let cluster = ClusterFixture::start(3)
+        .await
+        .expect("3-node cluster forms");
+    assert!(cluster.wait_nodes_live(3, Duration::from_secs(45)).await);
+
+    let table = "33333333-3333-3333-3333-333333333333";
+    let init = cluster
+        .admin_post(0, &format!("/api/v1/shards/{table}/init"))
+        .await
+        .expect("shard init succeeds");
+    let source = init
+        .get("shard_id")
+        .and_then(|s| s.as_str())
+        .expect("init returns a shard id")
+        .to_string();
+    cluster
+        .admin_post(0, &format!("/api/v1/shards/{table}/rebalance?nodes=1"))
+        .await
+        .expect("placing the source shard on node 1 succeeds");
+
+    // Wait for the source group to form across all three nodes before splitting.
+    let source_group = format!("shard-{source}");
+    let mut formed = false;
+    for _ in 0..75 {
+        if let Ok(groups) = cluster.admin_get(0, "/api/v1/cluster/groups").await {
+            if voters_of(&groups, &source_group) == 3 {
+                formed = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(formed, "the source group should form across the cluster");
+
+    // Split the source shard at key 128.
+    let split = cluster
+        .admin_post(
+            0,
+            &format!("/api/v1/shards/{table}/split?shard={source}&key=128"),
+        )
+        .await
+        .expect("split succeeds");
+    let left_group = format!(
+        "shard-{}",
+        split.get("left").and_then(|s| s.as_str()).expect("left id")
+    );
+    let right_group = format!(
+        "shard-{}",
+        split
+            .get("right")
+            .and_then(|s| s.as_str())
+            .expect("right id")
+    );
+
+    // The primary (node 0) hosts both children as three-voter groups and has
+    // decommissioned the source.
+    let mut children_formed = false;
+    for _ in 0..75 {
+        if let Ok(groups) = cluster.admin_get(0, "/api/v1/cluster/groups").await {
+            if voters_of(&groups, &left_group) == 3
+                && voters_of(&groups, &right_group) == 3
+                && voters_of(&groups, &source_group) == 0
+            {
+                children_formed = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(
+        children_formed,
+        "both child groups should form across the cluster and the source be gone on the primary"
+    );
+
+    // A follower hosts replicas of both children too.
+    let mut follower_has_children = false;
+    for _ in 0..75 {
+        if let Ok(groups) = cluster.admin_get(2, "/api/v1/cluster/groups").await {
+            if voters_of(&groups, &left_group) == 3 && voters_of(&groups, &right_group) == 3 {
+                follower_has_children = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(
+        follower_has_children,
+        "a follower should host both child group replicas"
+    );
+}
