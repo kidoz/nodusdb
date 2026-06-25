@@ -18,6 +18,9 @@ COPY deploy/nodus.example.toml /etc/nodus/nodus.toml
 
 ENV NODUS_CONFIG=/etc/nodus/nodus.toml
 # Bind to all interfaces inside the container; restrict via published ports.
+# Because the admin port is non-loopback, the server refuses to start unless a
+# token (NODUS_ADMIN__TOKEN) or NODUS_ADMIN__ALLOW_INSECURE=true is provided at
+# runtime. The bundled docker-compose sets a token; set one in production.
 ENV NODUS_SERVER__PGWIRE_ADDR=0.0.0.0:5432
 ENV NODUS_SERVER__HTTP_ADDR=0.0.0.0:8088
 

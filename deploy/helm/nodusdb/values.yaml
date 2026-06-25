@@ -16,8 +16,13 @@ config:
   maxConnections: 100
   backupRepositoryUri: "file:///var/lib/nodus/backups"
   # Authentication token for admin APIs (e.g. /api/v1/backups, /api/v1/shards, etc.)
-  # If left empty, admin endpoints will be exposed unauthenticated.
+  # The pod binds the admin port on 0.0.0.0, so the server refuses to start with
+  # an empty token UNLESS adminAllowInsecure is set. Set a token for production.
   adminToken: ""
+  # Explicitly allow an unauthenticated admin API on the non-loopback pod bind.
+  # Only safe when the admin port is network-isolated (ClusterIP + NetworkPolicy).
+  # Ignored when adminToken is set. Required (true) for an unauthenticated install.
+  adminAllowInsecure: false
   # Password for the default 'nodus' superuser over pgwire.
   # If left empty, a random password will be generated.
   adminPassword: ""

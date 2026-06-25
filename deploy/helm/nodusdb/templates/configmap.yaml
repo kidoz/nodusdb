@@ -21,6 +21,11 @@ data:
     {{- if .Values.config.adminPassword }}
     password = "{{ .Values.config.adminPassword }}"
     {{- end }}
+    {{- if .Values.config.adminAllowInsecure }}
+    # Unauthenticated admin API on a non-loopback bind. Only safe when the admin
+    # port is network-isolated (e.g. ClusterIP + NetworkPolicy). Prefer adminToken.
+    allow_insecure = true
+    {{- end }}
 
     [observability]
     metrics_enabled = true

@@ -85,6 +85,10 @@ pub struct AdminConfig {
     pub token: Option<String>,
     /// Password for the default 'nodus' superuser. If unset, a random password is generated on startup.
     pub password: Option<String>,
+    /// Explicitly permit an unauthenticated admin API on a non-loopback bind
+    /// (e.g. when fronted by an authenticating proxy). Off by default: the
+    /// server refuses to start with a non-loopback `http_addr` and no `token`.
+    pub allow_insecure: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -260,8 +264,38 @@ impl NodusConfig {
                 "tls.enabled requires both cert_path and key_path".into(),
             ));
         }
+        // An unauthenticated admin API falls back to the `nodus` superuser, so a
+        // non-loopback bind without a token exposes unauthenticated cluster
+        // control. Refuse it unless explicitly opted into.
+        if self.admin.token.is_none()
+            && !self.admin.allow_insecure
+            && !is_loopback_addr(&self.server.http_addr)
+        {
+            return Err(ConfigError::Invalid(format!(
+                "admin API is unauthenticated (no admin.token) but server.http_addr '{}' is not \
+                 loopback; set admin.token, bind to localhost, or set admin.allow_insecure=true",
+                self.server.http_addr
+            )));
+        }
         Ok(())
     }
+}
+
+/// Returns `true` if `addr` (a `host:port`) binds only the loopback interface.
+/// Unparsable or non-loopback hosts are treated as non-loopback (fail closed).
+fn is_loopback_addr(addr: &str) -> bool {
+    let host = match addr.rfind(':') {
+        // Strip the port; keep IPv6 literals like `[::1]` intact otherwise.
+        Some(idx) if !addr[idx + 1..].contains(']') => &addr[..idx],
+        _ => addr,
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -274,6 +308,34 @@ mod tests {
         assert!(cfg.validate().is_ok());
         assert!(cfg.server.http_addr.starts_with("127.0.0.1"));
         assert!(cfg.observability.metrics_enabled);
+    }
+
+    #[test]
+    fn loopback_detection() {
+        assert!(is_loopback_addr("127.0.0.1:8088"));
+        assert!(is_loopback_addr("127.5.0.1:8088"));
+        assert!(is_loopback_addr("localhost:8088"));
+        assert!(is_loopback_addr("[::1]:8088"));
+        assert!(!is_loopback_addr("0.0.0.0:8088"));
+        assert!(!is_loopback_addr("192.168.1.5:8088"));
+        assert!(!is_loopback_addr("example.com:8088"));
+    }
+
+    #[test]
+    fn unauthenticated_admin_on_non_loopback_is_rejected() {
+        let mut cfg = NodusConfig::default();
+        cfg.server.http_addr = "0.0.0.0:8088".into();
+        // No token + non-loopback bind => refused.
+        assert!(cfg.validate().is_err());
+
+        // A token makes it acceptable.
+        cfg.admin.token = Some("secret".into());
+        assert!(cfg.validate().is_ok());
+
+        // Or an explicit opt-out.
+        cfg.admin.token = None;
+        cfg.admin.allow_insecure = true;
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]

@@ -27,7 +27,11 @@ allow_ephemeral = false
 [admin]
 # Replace these in real deployments. Compose overrides them for local tests.
 password = "change-me"
+# The admin API falls back to the 'nodus' superuser when unauthenticated, so the
+# server refuses to start with a non-loopback http_addr and no token. Set a token
+# (below) or, only when the admin port is network-isolated, set allow_insecure.
 token = "change-me-admin-token"
+# allow_insecure = false
 
 [tls]
 enabled = false
