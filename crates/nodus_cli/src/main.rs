@@ -45,6 +45,20 @@ enum Commands {
         #[command(subcommand)]
         cmd: BackupCmd,
     },
+    /// Import a plain-format PostgreSQL dump (e.g. `pg_dump --inserts`)
+    Import {
+        /// Path to the dump file to import.
+        #[arg(long)]
+        file: String,
+        /// `stop` to abort on the first failing statement, else `continue`.
+        #[arg(long, default_value = "continue")]
+        on_error: String,
+        /// Rows folded into each synthesized INSERT.
+        #[arg(long, default_value_t = 500)]
+        batch_rows: usize,
+        #[arg(long, default_value = DEFAULT_ADDR)]
+        addr: String,
+    },
     /// Control rolling upgrades
     Upgrade {
         #[command(subcommand)]
@@ -430,6 +444,26 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let v: serde_json::Value = client
                 .post(format!("{addr}/api/v1/backups"))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&v)?);
+        }
+        Commands::Import {
+            file,
+            on_error,
+            batch_rows,
+            addr,
+        } => {
+            let dump = std::fs::read_to_string(file)
+                .map_err(|e| anyhow::anyhow!("failed to read dump {file}: {e}"))?;
+            let url = format!("{addr}/api/v1/import?on_error={on_error}&batch_rows={batch_rows}");
+            let v: serde_json::Value = client
+                .post(&url)
+                .header(reqwest::header::CONTENT_TYPE, "text/plain")
+                .body(dump)
                 .send()
                 .await?
                 .error_for_status()?
