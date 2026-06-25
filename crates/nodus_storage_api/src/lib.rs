@@ -33,6 +33,12 @@ pub struct KvPair {
     pub version: Timestamp,
 }
 
+pub struct KvVersion {
+    pub key: Bytes,
+    pub value: Option<Bytes>,
+    pub version: Timestamp,
+}
+
 pub enum IntentReplacement {
     Put(Bytes),
     Delete,
@@ -46,6 +52,28 @@ pub trait KvEngine: Send + Sync {
         range: KeyRange,
         read_ts: Timestamp,
     ) -> Result<Box<dyn Iterator<Item = Result<KvPair>> + Send>>;
+
+    /// Scans committed MVCC versions in `range` with `since_ts < version <= read_ts`.
+    /// Unlike `scan`, this includes tombstones (`value = None`) so incremental
+    /// backup can preserve deletes.
+    fn scan_versions(
+        &self,
+        range: KeyRange,
+        since_ts: Timestamp,
+        read_ts: Timestamp,
+    ) -> Result<Box<dyn Iterator<Item = Result<KvVersion>> + Send>> {
+        let iter = self.scan(range, read_ts)?;
+        Ok(Box::new(iter.filter_map(move |item| match item {
+            Ok(pair) if pair.version > since_ts => Some(Ok(KvVersion {
+                key: pair.key,
+                value: Some(pair.value),
+                version: pair.version,
+            })),
+            Ok(_) => None,
+            Err(e) => Some(Err(e)),
+        })))
+    }
+
     fn write_intent(&self, txn_id: TxnId, key: Bytes, value: Bytes) -> Result<()>;
     /// Writes a deletion (tombstone) intent for `key`. After commit the key
     /// reads as absent at timestamps at or after the commit.
@@ -151,6 +179,33 @@ impl KvEngine for NamespacedKvEngine {
                     key,
                     value: pair.value,
                     version: pair.version,
+                }
+            })
+        })))
+    }
+
+    fn scan_versions(
+        &self,
+        range: KeyRange,
+        since_ts: Timestamp,
+        read_ts: Timestamp,
+    ) -> Result<Box<dyn Iterator<Item = Result<KvVersion>> + Send>> {
+        let physical = KeyRange {
+            start: self.physical_key(range.start.as_ref()),
+            end: self.physical_key(range.end.as_ref()),
+        };
+        let prefix = self.prefix.clone();
+        let iter = self.inner.scan_versions(physical, since_ts, read_ts)?;
+        Ok(Box::new(iter.map(move |item| {
+            item.map(|version| {
+                let key = match version.key.strip_prefix(prefix.as_ref()) {
+                    Some(suffix) => Bytes::copy_from_slice(suffix),
+                    None => version.key,
+                };
+                KvVersion {
+                    key,
+                    value: version.value,
+                    version: version.version,
                 }
             })
         })))

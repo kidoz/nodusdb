@@ -1,7 +1,9 @@
 use anyhow::Result;
 use bytes::Bytes;
 use nodus_mvcc::VersionChain;
-use nodus_storage_api::{IntentReplacement, KeyRange, KvEngine, KvPair, Timestamp, TxnId};
+use nodus_storage_api::{
+    IntentReplacement, KeyRange, KvEngine, KvPair, KvVersion, Timestamp, TxnId,
+};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::RwLock;
 
@@ -64,6 +66,42 @@ impl KvEngine for MemKvEngine {
                 }));
             }
         }
+
+        Ok(Box::new(results.into_iter()))
+    }
+
+    fn scan_versions(
+        &self,
+        range: KeyRange,
+        since_ts: Timestamp,
+        read_ts: Timestamp,
+    ) -> Result<Box<dyn Iterator<Item = Result<KvVersion>> + Send>> {
+        let guard = self.store.read().unwrap();
+        let mut results = Vec::new();
+
+        for (key, chain) in guard.range(range.start..range.end) {
+            for version in chain
+                .versions
+                .iter()
+                .filter(|v| !v.is_intent && v.version > since_ts && v.version <= read_ts)
+            {
+                results.push(Ok(KvVersion {
+                    key: key.clone(),
+                    value: version
+                        .value
+                        .as_ref()
+                        .map(|value| Bytes::from(value.clone())),
+                    version: version.version,
+                }));
+            }
+        }
+        results.sort_by(|a, b| match (a, b) {
+            (Ok(left), Ok(right)) => left
+                .key
+                .cmp(&right.key)
+                .then_with(|| left.version.cmp(&right.version)),
+            _ => std::cmp::Ordering::Equal,
+        });
 
         Ok(Box::new(results.into_iter()))
     }
@@ -204,6 +242,40 @@ mod tests {
         // Not visible at older timestamp
         let res = engine.get(k1.as_ref(), 9).unwrap();
         assert!(res.is_none());
+    }
+
+    #[test]
+    fn test_scan_versions_includes_tombstones() {
+        let engine = MemKvEngine::new();
+        let key = Bytes::from("k1");
+
+        let put = TxnId::new();
+        engine
+            .write_intent(put, key.clone(), Bytes::from("v1"))
+            .unwrap();
+        engine.commit(put, 10).unwrap();
+
+        let delete = TxnId::new();
+        engine.delete_intent(delete, key.clone()).unwrap();
+        engine.commit(delete, 20).unwrap();
+
+        let versions: Vec<_> = engine
+            .scan_versions(
+                KeyRange {
+                    start: Bytes::from("k"),
+                    end: Bytes::from("l"),
+                },
+                10,
+                30,
+            )
+            .unwrap()
+            .map(|item| item.unwrap())
+            .collect();
+
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].key, key);
+        assert_eq!(versions[0].version, 20);
+        assert!(versions[0].value.is_none());
     }
 
     #[test]

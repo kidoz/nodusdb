@@ -278,6 +278,17 @@ impl KvEngine for RaftKvEngine {
         self.engine_for(&group_id).scan(range, read_ts)
     }
 
+    fn scan_versions(
+        &self,
+        range: KeyRange,
+        since_ts: Timestamp,
+        read_ts: Timestamp,
+    ) -> Result<Box<dyn Iterator<Item = Result<nodus_storage_api::KvVersion>> + Send>> {
+        let group_id = self.route(range.start.as_ref());
+        self.engine_for(&group_id)
+            .scan_versions(range, since_ts, read_ts)
+    }
+
     fn write_intent(&self, txn_id: TxnId, key: Bytes, value: Bytes) -> Result<()> {
         let group_id = self.route(&key);
         self.record_txn_group(txn_id, &group_id);

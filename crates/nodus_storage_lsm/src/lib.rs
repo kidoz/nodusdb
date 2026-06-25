@@ -3,7 +3,9 @@ use bytes::Bytes;
 pub mod sstable;
 
 use nodus_mvcc::VersionChain;
-use nodus_storage_api::{IntentReplacement, KeyRange, KvEngine, KvPair, Timestamp, TxnId};
+use nodus_storage_api::{
+    IntentReplacement, KeyRange, KvEngine, KvPair, KvVersion, Timestamp, TxnId,
+};
 use nodus_storage_wal::{FileWalEngine, WalEngine, WalRecord, WalRecordV1};
 use serde::{Deserialize, Serialize};
 use sstable::Sstable;
@@ -472,6 +474,72 @@ impl KvEngine for LsmKvEngine {
         Ok(Box::new(results.into_iter()))
     }
 
+    fn scan_versions(
+        &self,
+        range: KeyRange,
+        since_ts: Timestamp,
+        read_ts: Timestamp,
+    ) -> Result<Box<dyn Iterator<Item = Result<KvVersion>> + Send>> {
+        let start = Bytes::from(range.start.as_ref().to_vec());
+        let end = Bytes::from(range.end.as_ref().to_vec());
+        let mut merged: BTreeMap<Bytes, VersionChain> = BTreeMap::new();
+
+        let mem_guard = self.memtable.read().unwrap();
+        let sst_guard = self.sstables.read().unwrap();
+        for sst in sst_guard.iter() {
+            if let Ok(iter) = sst.iter() {
+                for item in iter.flatten() {
+                    let (key, chain) = item;
+                    if key >= start && key < end {
+                        merged
+                            .entry(key)
+                            .or_default()
+                            .versions
+                            .extend(chain.versions);
+                    }
+                }
+            }
+        }
+        for (key, chain) in mem_guard.range(start..end) {
+            merged
+                .entry(key.clone())
+                .or_default()
+                .versions
+                .extend(chain.versions.clone());
+        }
+        drop(sst_guard);
+        drop(mem_guard);
+
+        let mut results = Vec::new();
+        for (key, mut chain) in merged {
+            chain.versions.sort_by_key(|v| (v.version, v.value.clone()));
+            chain.versions.dedup();
+            for version in chain
+                .versions
+                .iter()
+                .filter(|v| !v.is_intent && v.version > since_ts && v.version <= read_ts)
+            {
+                results.push(Ok(KvVersion {
+                    key: key.clone(),
+                    value: version
+                        .value
+                        .as_ref()
+                        .map(|value| Bytes::from(value.clone())),
+                    version: version.version,
+                }));
+            }
+        }
+        results.sort_by(|a, b| match (a, b) {
+            (Ok(left), Ok(right)) => left
+                .key
+                .cmp(&right.key)
+                .then_with(|| left.version.cmp(&right.version)),
+            _ => std::cmp::Ordering::Equal,
+        });
+
+        Ok(Box::new(results.into_iter()))
+    }
+
     fn write_intent(&self, txn_id: TxnId, key: Bytes, value: Bytes) -> Result<()> {
         // Append to the WAL and release the WAL lock *before* taking the memtable
         // lock, so this never holds wal+memtable in the opposite order from
@@ -722,6 +790,43 @@ mod tests {
         assert_eq!(res2.value, Bytes::from("v2"));
 
         assert!(scan.next().is_none()); // a3 is exclusive
+    }
+
+    #[test]
+    fn test_scan_versions_includes_tombstones_after_flush() {
+        let dir = TempDir::new().unwrap();
+        let engine = LsmKvEngine::with_wal(dir.path(), None).unwrap();
+        let key = Bytes::from("k1");
+
+        let put = TxnId::new();
+        engine
+            .write_intent(put, key.clone(), Bytes::from("v1"))
+            .unwrap();
+        engine.commit(put, 10).unwrap();
+        engine.flush().unwrap();
+
+        let delete = TxnId::new();
+        engine.delete_intent(delete, key.clone()).unwrap();
+        engine.commit(delete, 20).unwrap();
+        engine.flush().unwrap();
+
+        let versions: Vec<_> = engine
+            .scan_versions(
+                KeyRange {
+                    start: Bytes::from("k"),
+                    end: Bytes::from("l"),
+                },
+                10,
+                30,
+            )
+            .unwrap()
+            .map(|item| item.unwrap())
+            .collect();
+
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].key, key);
+        assert_eq!(versions[0].version, 20);
+        assert!(versions[0].value.is_none());
     }
 
     #[test]
