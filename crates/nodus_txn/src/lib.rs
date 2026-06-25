@@ -96,6 +96,26 @@ impl HybridLogicalClock {
     }
 }
 
+/// Durably persists the clock's high-water mark so issued commit timestamps
+/// never regress across a restart. Without this, the in-memory clock restarts
+/// from `0`/wall-clock, and a clock that is behind the newest persisted
+/// `commit_ts` (skew, fast restart, or a peer-advanced timestamp) would issue
+/// new commits *below* existing committed MVCC versions — silently shadowing
+/// them. Implemented by the server over its durable local engine.
+pub trait TimestampStore: Send + Sync {
+    /// Loads the last persisted reservation high-water mark, if any.
+    fn load(&self) -> Result<Option<Timestamp>>;
+    /// Durably stores a new reservation high-water mark.
+    fn store(&self, watermark: Timestamp) -> Result<()>;
+}
+
+/// How far ahead of the latest issued timestamp each durable reservation
+/// reaches (microseconds). This bounds persistence to roughly one durable write
+/// per second of clock advancement (or per `RESERVATION_WINDOW` timestamps),
+/// instead of an fsync per commit; on restart the clock resumes at least this
+/// far past the last *issued* timestamp, never below it.
+const RESERVATION_WINDOW: Timestamp = 1_000_000;
+
 pub trait TxnManager: Send + Sync {
     fn begin_txn(&self) -> Result<TxnRecord>;
     /// Tracks a write intent to enable OCC (Optimistic Concurrency Control) conflict detection.
@@ -124,17 +144,61 @@ pub trait TxnManager: Send + Sync {
 use crate::sync::RwLock;
 use std::collections::HashMap;
 
+/// The clock plus the highest timestamp it has durably reserved. Issued
+/// timestamps never exceed `reserved` without a preceding [`TimestampStore::store`].
+struct ClockState {
+    hlc: HybridLogicalClock,
+    reserved: Timestamp,
+}
+
 pub struct MemTxnManager {
     records: RwLock<HashMap<TxnId, TxnRecord>>,
-    hlc: RwLock<HybridLogicalClock>,
+    clock: RwLock<ClockState>,
+    persistence: Option<std::sync::Arc<dyn TimestampStore>>,
 }
 
 impl MemTxnManager {
     pub fn new() -> Self {
         Self {
             records: RwLock::new(HashMap::new()),
-            hlc: RwLock::new(HybridLogicalClock::new()),
+            clock: RwLock::new(ClockState {
+                hlc: HybridLogicalClock::new(),
+                reserved: 0,
+            }),
+            persistence: None,
         }
+    }
+
+    /// Builds a manager whose clock is seeded from `store` and that durably
+    /// reserves timestamp space ahead of issuance. The clock resumes at the
+    /// larger of the persisted reservation and wall-clock now, so commit
+    /// timestamps issued after a restart strictly exceed every commit timestamp
+    /// issued before it.
+    pub fn with_timestamp_store(store: std::sync::Arc<dyn TimestampStore>) -> Result<Self> {
+        let persisted = store.load()?.unwrap_or(0);
+        let last = persisted.max(HybridLogicalClock::wall_now());
+        Ok(Self {
+            records: RwLock::new(HashMap::new()),
+            clock: RwLock::new(ClockState {
+                hlc: HybridLogicalClock { last },
+                reserved: persisted,
+            }),
+            persistence: Some(store),
+        })
+    }
+
+    /// Guarantees `ts` is covered by a durable reservation before it is handed
+    /// out as a commit timestamp. Persists a new window only when crossing the
+    /// current reservation, so the durable write is amortized.
+    fn reserve_through(&self, clock: &mut ClockState, ts: Timestamp) -> Result<()> {
+        if ts > clock.reserved {
+            let new_reserved = ts.saturating_add(RESERVATION_WINDOW);
+            if let Some(store) = &self.persistence {
+                store.store(new_reserved)?;
+            }
+            clock.reserved = new_reserved;
+        }
+        Ok(())
     }
 }
 
@@ -146,9 +210,11 @@ impl Default for MemTxnManager {
 
 impl TxnManager for MemTxnManager {
     fn begin_txn(&self) -> Result<TxnRecord> {
+        // A read timestamp is a snapshot, never written as a durable version, so
+        // it needs no reservation — only commit timestamps must survive restart.
         let read_ts = {
-            let mut hlc = self.hlc.write().unwrap();
-            hlc.tick()
+            let mut clock = self.clock.write().unwrap();
+            clock.hlc.tick()
         };
 
         let txn_id = TxnId::new();
@@ -207,9 +273,15 @@ impl TxnManager for MemTxnManager {
             }
         }
 
+        // Issue the commit timestamp and ensure it is durably reserved before it
+        // is returned (and thus before any version is written at it). If the
+        // reservation cannot be persisted, the commit fails rather than risk a
+        // timestamp that could regress after a crash.
         let commit_ts = {
-            let mut hlc = self.hlc.write().unwrap();
-            hlc.tick()
+            let mut clock = self.clock.write().unwrap();
+            let ts = clock.hlc.tick();
+            self.reserve_through(&mut clock, ts)?;
+            ts
         };
 
         let record_mut = guard.get_mut(&txn_id).unwrap();
@@ -245,11 +317,14 @@ impl TxnManager for MemTxnManager {
             .min();
         // Keep everything an active reader could still see; with no active txns,
         // the current clock lets GC reclaim all superseded versions.
-        oldest_active.unwrap_or_else(|| self.hlc.read().unwrap().now())
+        oldest_active.unwrap_or_else(|| self.clock.read().unwrap().hlc.now())
     }
 
     fn observe_timestamp(&self, ts: Timestamp) {
-        self.hlc.write().unwrap().update(ts);
+        // Advancing the clock here needs no reservation: nothing durable is
+        // written at this timestamp, and the next commit that issues a value
+        // past it will reserve before returning.
+        self.clock.write().unwrap().hlc.update(ts);
     }
 }
 
@@ -298,6 +373,55 @@ mod tests {
         assert!(
             hlc.tick() > merged,
             "subsequent ticks stay ahead of the merge"
+        );
+    }
+
+    /// An in-memory [`TimestampStore`] standing in for the durable engine.
+    #[derive(Clone, Default)]
+    struct MockStore(std::sync::Arc<std::sync::Mutex<Option<Timestamp>>>);
+
+    impl TimestampStore for MockStore {
+        fn load(&self) -> Result<Option<Timestamp>> {
+            Ok(*self.0.lock().unwrap())
+        }
+        fn store(&self, watermark: Timestamp) -> Result<()> {
+            *self.0.lock().unwrap() = Some(watermark);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn commit_timestamps_do_not_regress_across_restart() {
+        let store = MockStore::default();
+
+        // First "process": advance the clock far past wall time (as a peer HLC
+        // would), commit, and capture the issued timestamp.
+        let big_commit_ts = {
+            let mgr =
+                MemTxnManager::with_timestamp_store(std::sync::Arc::new(store.clone())).unwrap();
+            let t = mgr.begin_txn().unwrap();
+            let remote = t.read_ts + 10_000_000_000; // ~2.7 hours ahead of wall
+            mgr.observe_timestamp(remote);
+            let t2 = mgr.begin_txn().unwrap();
+            let ts = mgr.commit_txn(t2.txn_id).unwrap();
+            assert!(
+                ts > remote,
+                "commit must order after the observed remote ts"
+            );
+            // The issued commit ts must be durably covered by a reservation.
+            assert!(store.0.lock().unwrap().unwrap() >= ts);
+            ts
+        };
+
+        // "Restart": a fresh manager seeded from the same durable store. Without
+        // persistence it would restart near wall-clock now — far below the
+        // peer-advanced timestamp — and issue a regressing commit ts.
+        let mgr = MemTxnManager::with_timestamp_store(std::sync::Arc::new(store.clone())).unwrap();
+        let t = mgr.begin_txn().unwrap();
+        let resumed = mgr.commit_txn(t.txn_id).unwrap();
+        assert!(
+            resumed > big_commit_ts,
+            "commit timestamp regressed after restart: {resumed} <= {big_commit_ts}"
         );
     }
 

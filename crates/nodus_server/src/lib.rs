@@ -42,6 +42,51 @@ pub struct ServerHandle {
     pub registry: Arc<SessionRegistry>,
 }
 
+/// Reserved key under which the transaction clock's high-water mark is stored
+/// in the durable local engine. The leading NUL keeps it out of the
+/// `{table_id}:{pk}` row key space (and distinct from the catalog/raft keys).
+const HLC_WATERMARK_KEY: &[u8] = b"\x00hlc\x00watermark";
+
+/// Persists the transaction clock's high-water mark in the node-local durable
+/// engine so commit timestamps never regress across a restart. Node-local on
+/// purpose: each node is the timestamp authority for the writes it coordinates,
+/// so this must not be replicated through Raft.
+struct KvTimestampStore {
+    kv: Arc<dyn nodus_storage_api::KvEngine>,
+}
+
+impl KvTimestampStore {
+    fn new(kv: Arc<dyn nodus_storage_api::KvEngine>) -> Self {
+        Self { kv }
+    }
+}
+
+impl nodus_txn::TimestampStore for KvTimestampStore {
+    fn load(&self) -> anyhow::Result<Option<u64>> {
+        match self.kv.get(HLC_WATERMARK_KEY, u64::MAX)? {
+            Some(bytes) if bytes.len() == 8 => {
+                let mut buf = [0u8; 8];
+                buf.copy_from_slice(&bytes);
+                Ok(Some(u64::from_le_bytes(buf)))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn store(&self, watermark: u64) -> anyhow::Result<()> {
+        // A single overwritten key; committing at `watermark` keeps versions
+        // monotonic so a latest read always returns the newest reservation.
+        let txn = nodus_storage_api::TxnId::new();
+        self.kv.write_intent(
+            txn,
+            bytes::Bytes::from_static(HLC_WATERMARK_KEY),
+            bytes::Bytes::copy_from_slice(&watermark.to_le_bytes()),
+        )?;
+        self.kv.commit(txn, watermark)?;
+        Ok(())
+    }
+}
+
 /// Resolves a backup repository directory from a `file://` URI, falling back to
 /// a unique temp directory when unset so the backup API is usable in dev/tests.
 fn backup_dir(uri: &str) -> PathBuf {
@@ -366,7 +411,11 @@ pub async fn run_server_with_config(
         shard_id: crate::multi_raft::META_SHARD.to_string(),
     });
 
-    let txn = Arc::new(nodus_txn::MemTxnManager::new());
+    // Seed the transaction clock from a durable, node-local high-water mark so
+    // commit timestamps never regress across a restart.
+    let txn = Arc::new(nodus_txn::MemTxnManager::with_timestamp_store(Arc::new(
+        KvTimestampStore::new(local_kv.clone()),
+    ))?);
     let authz = Arc::new(nodus_authz::DefaultAuthzEngine::new(catalog.clone()));
 
     let executor = Arc::new(nodus_executor::MemExecutor::new(
