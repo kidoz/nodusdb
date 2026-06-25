@@ -525,27 +525,31 @@ async fn sharded_table_replicates_and_survives_leader_failure() {
         "follower should serve both replicated sharded rows"
     );
 
-    // Kill the data-group (and meta) leader. Its committed rows live on the
-    // surviving majority of the data group.
+    // Kill the data-group (and meta) leader. The surviving two nodes are a
+    // majority of both groups.
     cluster.stop(0).await.unwrap();
 
-    // A survivor still serves the committed sharded rows from its local replica.
-    // Reads are local to the data-group replica, so they survive the leader's
-    // loss with no election needed — the payoff of replicating the shard.
-    //
-    // (We assert durability, not a *new* write after failover: a sharded INSERT
-    // must land on a node that leads *both* the data group and the meta group,
-    // since neither write path forwards across leaders. After this kill the two
-    // groups re-elect independently among the survivors and may split, so a
-    // post-failover write is not guaranteed without leader colocation/forwarding
-    // — a separate concern from data durability.)
-    let survivor = cluster.pg_client(1).await.unwrap();
+    // A survivor accepts a NEW sharded write after the failover. The data-group
+    // and meta-group leaders re-elect independently and may land on different
+    // survivors, but the write path forwards each command to its group's leader,
+    // so any survivor can serve the INSERT regardless of leader colocation.
+    let new_leader = cluster
+        .write_on_any(
+            &[1, 2],
+            "INSERT INTO sharded (id, val) VALUES (3, 'three')",
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("a survivor accepts the forwarded sharded write after failover");
+
+    // It serves the pre-failure rows (no committed data lost) plus the new one.
+    let client = cluster.pg_client(new_leader).await.unwrap();
     let mut vals: Vec<String> = Vec::new();
     for _ in 0..75 {
-        if let Ok(rows) = survivor
+        if let Ok(rows) = client
             .query("SELECT val FROM sharded ORDER BY id", &[])
             .await
-            && rows.len() == 2
+            && rows.len() == 3
         {
             vals = rows.iter().map(|r| r.get::<_, String>(0)).collect();
             break;
@@ -554,7 +558,7 @@ async fn sharded_table_replicates_and_survives_leader_failure() {
     }
     assert_eq!(
         vals,
-        vec!["one".to_string(), "two".to_string()],
-        "committed sharded rows survive the data-group leader's failure"
+        vec!["one".to_string(), "two".to_string(), "three".to_string()],
+        "all rows survive the failover and the new write lands across the data group"
     );
 }

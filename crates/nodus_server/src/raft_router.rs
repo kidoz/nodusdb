@@ -18,6 +18,7 @@
 use anyhow::{Result, anyhow};
 use nodus_raftstore::{NodusTypeConfig, ShardCommand};
 use openraft::Raft;
+use openraft::error::{ClientWriteError, ForwardToLeader, RaftError};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
@@ -44,6 +45,7 @@ impl RaftRouter {
     /// shard whose group is created later is reachable without re-spawning.
     pub fn spawn(manager: Arc<MultiRaftManager>) -> Self {
         let (tx, mut rx) = mpsc::unbounded_channel::<WriteRequest>();
+        let http = reqwest::Client::new();
         tokio::spawn(async move {
             while let Some(req) = rx.recv().await {
                 let raft = manager.get(&req.shard_id).await;
@@ -51,9 +53,15 @@ impl RaftRouter {
                     Some(raft) => {
                         // Drive each replication concurrently so independent
                         // submissions do not serialize behind one another.
+                        let http = http.clone();
+                        let WriteRequest {
+                            shard_id,
+                            cmd,
+                            resp,
+                        } = req;
                         tokio::spawn(async move {
-                            let res = replicate(raft, req.cmd).await;
-                            let _ = req.resp.send(res);
+                            let res = replicate(raft, &shard_id, cmd, &http).await;
+                            let _ = resp.send(res);
                         });
                     }
                     None => {
@@ -89,9 +97,67 @@ impl RaftRouter {
     }
 }
 
-async fn replicate(raft: Raft<NodusTypeConfig>, cmd: ShardCommand) -> WriteResult {
-    raft.client_write(cmd)
+/// Replicates `cmd` to `group_id`, **forwarding to the leader** when this node
+/// isn't it. OpenRaft's `client_write` only succeeds on the leader (it returns
+/// `ForwardToLeader` otherwise and never auto-forwards), so a non-leader posts
+/// the command to the leader's `/raft/{group}/write`. Bounded retries let a
+/// transient election settle and re-resolve a leader that moves mid-forward.
+///
+/// This decouples *where a write is issued* from *which node leads the group*:
+/// any node can accept a write for any group it can route to — essential after a
+/// failover, when the data-group and meta-group leaders may sit on different
+/// nodes than the one serving the query.
+async fn replicate(
+    raft: Raft<NodusTypeConfig>,
+    group_id: &str,
+    cmd: ShardCommand,
+    http: &reqwest::Client,
+) -> WriteResult {
+    for _ in 0..25 {
+        match raft.client_write(cmd.clone()).await {
+            Ok(_) => return Ok(()),
+            Err(RaftError::APIError(ClientWriteError::ForwardToLeader(ForwardToLeader {
+                leader_node: Some(node),
+                ..
+            }))) => match forward(http, &node.addr, group_id, &cmd).await {
+                Ok(()) => return Ok(()),
+                // The leader may have just changed; re-evaluate after a beat.
+                Err(e) => {
+                    tracing::debug!("forward of {group_id} write to {} failed: {e}", node.addr)
+                }
+            },
+            // No known leader yet — wait for an election, then retry.
+            Err(RaftError::APIError(ClientWriteError::ForwardToLeader(ForwardToLeader {
+                leader_node: None,
+                ..
+            }))) => {}
+            Err(e) => return Err(anyhow!("raft write error: {}", e)),
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    Err(anyhow!("raft write to '{group_id}' did not reach a leader"))
+}
+
+/// Posts a command to `addr`'s leader-side write endpoint for `group_id`.
+async fn forward(
+    http: &reqwest::Client,
+    addr: &str,
+    group_id: &str,
+    cmd: &ShardCommand,
+) -> WriteResult {
+    let url = format!("http://{addr}/raft/{group_id}/write");
+    let resp = http
+        .post(&url)
+        .json(cmd)
+        .send()
         .await
-        .map(|_| ())
-        .map_err(|e| anyhow!("raft write error: {}", e))
+        .map_err(|e| anyhow!("forward to {addr}: {e}"))?;
+    if resp.status().is_success() {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "leader {addr} rejected forwarded write: {}",
+            resp.status()
+        ))
+    }
 }

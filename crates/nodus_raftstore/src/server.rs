@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use crate::NodusTypeConfig;
+use crate::{NodusTypeConfig, ShardCommand};
 
 pub type NodusRaft = Raft<NodusTypeConfig>;
 
@@ -37,6 +37,7 @@ pub fn raft_routes() -> Router<RaftState> {
         .route("/raft/:shard_id/vote", post(vote))
         .route("/raft/:shard_id/append", post(append))
         .route("/raft/:shard_id/snapshot", post(snapshot))
+        .route("/raft/:shard_id/write", post(write))
 }
 
 async fn get_raft(state: &RaftState, shard_id: &str) -> Option<NodusRaft> {
@@ -79,5 +80,24 @@ async fn snapshot(
         Json(res).into_response()
     } else {
         (axum::http::StatusCode::NOT_FOUND, "Shard not found").into_response()
+    }
+}
+
+/// Applies a client command on this node's replica of `shard_id` — used to
+/// *forward* a write to the group's leader. The write path posts here when its
+/// local `client_write` returns `ForwardToLeader`. Returns `503` (retryable)
+/// when this node isn't the leader either (leadership moved again), so the
+/// forwarder re-evaluates and retries.
+async fn write(
+    Path(shard_id): Path<String>,
+    State(state): State<RaftState>,
+    Json(cmd): Json<ShardCommand>,
+) -> impl axum::response::IntoResponse {
+    let Some(raft) = get_raft(&state, &shard_id).await else {
+        return (axum::http::StatusCode::NOT_FOUND, "Shard not found").into_response();
+    };
+    match raft.client_write(cmd).await {
+        Ok(_) => axum::http::StatusCode::OK.into_response(),
+        Err(e) => (axum::http::StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response(),
     }
 }
