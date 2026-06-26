@@ -215,6 +215,17 @@ const RAFT_VOTE_KEY: &[u8] = b"\x00raft\x00vote";
 const RAFT_APPLIED_KEY: &[u8] = b"\x00raft\x00applied";
 const RAFT_LOG_PREFIX: &[u8] = b"\x00raft\x00log\x00";
 const RAFT_LOG_END: &[u8] = b"\x00raft\x00log\x01";
+const RAFT_SNAPSHOT_KEY: &[u8] = b"\x00raft\x00snapshot";
+
+/// A persisted snapshot: openraft's metadata plus the opaque snapshot bytes. It
+/// is stored durably so a restarted node can resume from the snapshot (and the
+/// log purged below it) instead of replaying the whole log, and so
+/// `get_current_snapshot` can serve it to a lagging follower without rebuilding.
+#[derive(Clone, Serialize, Deserialize)]
+struct StoredSnapshot {
+    meta: SnapshotMeta<u64, openraft::BasicNode>,
+    data: Vec<u8>,
+}
 
 fn log_key(index: u64) -> Vec<u8> {
     let mut key = RAFT_LOG_PREFIX.to_vec();
@@ -410,6 +421,20 @@ impl RaftMetaStore {
             .and_then(|b| decode_raft(&b).and_then(|p| serde_json::from_slice(p).ok()))
             .unwrap_or_default()
     }
+
+    fn save_snapshot(&self, snapshot: &StoredSnapshot) {
+        if let Ok(bytes) = serde_json::to_vec(snapshot) {
+            self.put(RAFT_SNAPSHOT_KEY, encode_raft(bytes));
+        }
+    }
+
+    fn load_snapshot(&self) -> Option<StoredSnapshot> {
+        self.kv
+            .get(RAFT_SNAPSHOT_KEY, u64::MAX)
+            .ok()
+            .flatten()
+            .and_then(|b| decode_raft(&b).and_then(|p| serde_json::from_slice(p).ok()))
+    }
 }
 
 /// On-disk format version of persisted Raft records (vote, log entries, applied
@@ -458,6 +483,10 @@ pub struct NodusRaftStore {
     /// store ([`Self::new`], used in unit tests); `Some` whenever a `KvEngine`
     /// is provided, so consensus state survives restart.
     meta: Option<Arc<RaftMetaStore>>,
+    /// The most recently built/installed snapshot, served by
+    /// `get_current_snapshot` and (when `meta` is set) persisted so it survives
+    /// restart — without it openraft would replay the entire log on every start.
+    current_snapshot: Arc<RwLock<Option<StoredSnapshot>>>,
 }
 
 impl Default for NodusRaftStore {
@@ -483,6 +512,7 @@ impl NodusRaftStore {
                 meta_store: None,
             })),
             meta: None,
+            current_snapshot: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -505,6 +535,9 @@ impl NodusRaftStore {
             // across a subsequent restart, even if no apply/purge runs first.
             meta.save_applied(&applied);
         }
+        // Recover the persisted snapshot so a restarted node can resume from it
+        // (and the purged log below it) rather than replaying the whole log.
+        let snapshot = meta.load_snapshot();
         Self {
             log: Arc::new(RwLock::new(log)),
             vote: Arc::new(RwLock::new(vote)),
@@ -519,6 +552,7 @@ impl NodusRaftStore {
                 meta_store,
             })),
             meta: Some(meta),
+            current_snapshot: Arc::new(RwLock::new(snapshot)),
         }
     }
 
@@ -620,12 +654,27 @@ impl RaftSnapshotBuilder<NodusTypeConfig> for NodusRaftStore {
             .map(encode_raft)
             .unwrap_or_else(|_| b"{}".to_vec());
 
+        let meta = SnapshotMeta {
+            last_log_id: sm.last_applied_log,
+            last_membership: sm.last_membership.clone(),
+            snapshot_id: format!("snapshot-{}", uuid::Uuid::new_v4()),
+        };
+        drop(sm);
+
+        // Persist and cache the snapshot so it survives restart (openraft can
+        // then purge the log below it and resume from the snapshot) and so
+        // `get_current_snapshot` can serve it to a lagging follower.
+        let stored = StoredSnapshot {
+            meta: meta.clone(),
+            data: data_bytes.clone(),
+        };
+        if let Some(meta_store) = &self.meta {
+            meta_store.save_snapshot(&stored);
+        }
+        *self.current_snapshot.write().await = Some(stored);
+
         Ok(Snapshot {
-            meta: SnapshotMeta {
-                last_log_id: sm.last_applied_log,
-                last_membership: sm.last_membership.clone(),
-                snapshot_id: format!("snapshot-{}", uuid::Uuid::new_v4()),
-            },
+            meta,
             snapshot: Box::new(Cursor::new(data_bytes)),
         })
     }
@@ -992,6 +1041,18 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
                 }
             }
         }
+        drop(sm);
+
+        // Persist and cache the installed snapshot so this node can later serve
+        // it from `get_current_snapshot` and resume from it after a restart.
+        let stored = StoredSnapshot {
+            meta: meta.clone(),
+            data,
+        };
+        if let Some(meta_store) = &self.meta {
+            meta_store.save_snapshot(&stored);
+        }
+        *self.current_snapshot.write().await = Some(stored);
 
         Ok(())
     }
@@ -999,7 +1060,15 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
     async fn get_current_snapshot(
         &mut self,
     ) -> Result<Option<Snapshot<NodusTypeConfig>>, StorageError<u64>> {
-        Ok(None)
+        Ok(self
+            .current_snapshot
+            .read()
+            .await
+            .as_ref()
+            .map(|stored| Snapshot {
+                meta: stored.meta.clone(),
+                snapshot: Box::new(Cursor::new(stored.data.clone())),
+            }))
     }
 }
 
@@ -1180,6 +1249,45 @@ mod tests {
             store.try_get_log_entries(1..=2).await.unwrap().is_empty(),
             "no stale entries below the purge watermark"
         );
+    }
+
+    /// A built snapshot is served by `get_current_snapshot` and is durable: a
+    /// store reopened over the same engine recovers it, so a restarted node can
+    /// resume from the snapshot instead of replaying the whole log.
+    #[tokio::test]
+    async fn snapshot_is_served_and_survives_reopening() {
+        let kv: Arc<dyn KvEngine> = Arc::new(nodus_storage_mem::MemKvEngine::new());
+        let snapshot_id;
+        {
+            let mut store = NodusRaftStore::with_kv(kv.clone());
+            store.append_to_log(vec![blank_entry(1, 1)]).await.unwrap();
+            store
+                .apply_to_state_machine(&[blank_entry(1, 1)])
+                .await
+                .unwrap();
+
+            let snapshot = store.build_snapshot().await.unwrap();
+            snapshot_id = snapshot.meta.snapshot_id.clone();
+            assert_eq!(snapshot.meta.last_log_id.map(|l| l.index), Some(1));
+
+            // Immediately served from the cache.
+            let current = store
+                .get_current_snapshot()
+                .await
+                .unwrap()
+                .expect("snapshot is available right after building it");
+            assert_eq!(current.meta.snapshot_id, snapshot_id);
+        }
+
+        // Reopen over the same engine: the persisted snapshot is recovered.
+        let mut store = NodusRaftStore::with_kv(kv.clone());
+        let recovered = store
+            .get_current_snapshot()
+            .await
+            .unwrap()
+            .expect("snapshot survives reopening the store");
+        assert_eq!(recovered.meta.snapshot_id, snapshot_id);
+        assert_eq!(recovered.meta.last_log_id.map(|l| l.index), Some(1));
     }
 
     /// A conflicting-log truncation is durable: removed tail entries do not
