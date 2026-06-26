@@ -136,7 +136,9 @@ fn spawn_node(id: u64, http: &str, pg: &str, peers: Option<&str>) -> NodeGuard {
 /// "no leader" error is retried; an "already exists" error means a prior attempt
 /// landed (its response was lost), so it counts as success.
 async fn execute_until_ok(client: &tokio_postgres::Client, sql: &str) {
-    for _ in 0..50 {
+    // Generous budget: a 3-node meta-group election (plus learner promotion) can
+    // take a while to settle under CI load before the first write is accepted.
+    for _ in 0..150 {
         match client.execute(sql, &[]).await {
             Ok(_) => return,
             Err(e) => {
