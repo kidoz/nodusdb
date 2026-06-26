@@ -21,7 +21,7 @@ use pgwire::tokio::PgWireMessageServerCodec;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::codec::Framed;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::client_meta::*;
@@ -407,6 +407,7 @@ pub async fn start_pgwire_server(
     authenticator: Arc<PasswordAuthenticator>,
     slow_log: Arc<nodus_monitoring::SlowQueryLog>,
     tls: Option<Arc<tokio_rustls::TlsAcceptor>>,
+    max_connections: usize,
     mut shutdown: tokio::sync::watch::Receiver<()>,
 ) -> anyhow::Result<()> {
     let mut param_provider = DefaultServerParameterProvider::default();
@@ -433,10 +434,17 @@ pub async fn start_pgwire_server(
         copy_handler: Arc::new(NodusCopyHandler::new(registry.clone(), executor.clone())),
     });
 
+    // Bound concurrent connections so an unauthenticated client cannot exhaust
+    // memory/file descriptors by opening unlimited sockets; excess connections
+    // are refused (closed) rather than each spawning an unbounded task.
+    let max_connections = max_connections.max(1);
+    let conn_limiter = Arc::new(tokio::sync::Semaphore::new(max_connections));
+
     info!(
-        "PGWire server listening on {} (tls: {})",
+        "PGWire server listening on {} (tls: {}, max_connections: {})",
         listener.local_addr()?,
-        tls.is_some()
+        tls.is_some(),
+        max_connections,
     );
 
     loop {
@@ -447,11 +455,23 @@ pub async fn start_pgwire_server(
             }
             accept_result = listener.accept() => {
                 match accept_result {
-                    Ok((socket, _)) => {
+                    Ok((socket, peer)) => {
+                        let permit = match conn_limiter.clone().try_acquire_owned() {
+                            Ok(permit) => permit,
+                            Err(_) => {
+                                warn!(
+                                    "refusing connection from {peer}: max_connections ({max_connections}) reached"
+                                );
+                                drop(socket);
+                                continue;
+                            }
+                        };
                         let factory = factory.clone();
                         let metrics = metrics.clone();
                         let tls = tls.clone();
                         tokio::spawn(async move {
+                            // Held for the connection's lifetime; a slot frees on drop.
+                            let _permit = permit;
                             metrics.pgwire_connections_total.inc();
                             metrics.active_sessions.inc();
                             if let Err(e) = process_nodus_socket(socket, tls, factory).await {

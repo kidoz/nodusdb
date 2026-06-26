@@ -663,6 +663,7 @@ pub async fn run_server_with_config(
     let pgwire_registry = registry.clone();
     let pgwire_authenticator = authenticator.clone();
     let executor_pgwire = executor.clone();
+    let pgwire_max_connections = config.server.max_connections as usize;
     let pgwire_task = tokio::spawn(async move {
         nodus_pgwire::start_pgwire_server(
             pgwire_listener,
@@ -672,6 +673,7 @@ pub async fn run_server_with_config(
             pgwire_authenticator,
             pgwire_slow_log,
             tls_acceptor,
+            pgwire_max_connections,
             pgwire_shutdown,
         )
         .await

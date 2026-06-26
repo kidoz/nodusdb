@@ -24,6 +24,11 @@ use crate::client_meta::{
 };
 use crate::{METADATA_COPY_EXTENDED, METADATA_COPY_STMT};
 
+/// Upper bound on a single connection's buffered `COPY FROM STDIN` body. The
+/// body is held in memory until `CopyDone`, so this caps the per-connection
+/// memory a COPY can pin (256 MiB).
+const MAX_COPY_INFLIGHT_BYTES: usize = 256 * 1024 * 1024;
+
 pub struct NodusCopyHandler {
     pub(crate) registry: Arc<SessionRegistry>,
     pub(crate) executor: Arc<dyn nodus_executor::Executor>,
@@ -118,10 +123,18 @@ impl CopyHandler for NodusCopyHandler {
     {
         let session_id = session_id_from_client(client);
         let mut inflight = self.inflight.lock().unwrap();
-        inflight
-            .entry(session_id)
-            .or_default()
-            .extend_from_slice(&copy_data.data);
+        let buffer = inflight.entry(session_id.clone()).or_default();
+        // Cap the per-connection COPY buffer: the whole body is held in RAM until
+        // CopyDone, so an unbounded stream is a memory-exhaustion vector.
+        if buffer.len().saturating_add(copy_data.data.len()) > MAX_COPY_INFLIGHT_BYTES {
+            inflight.remove(&session_id);
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "54000".to_owned(), // program_limit_exceeded
+                format!("COPY data exceeds the {MAX_COPY_INFLIGHT_BYTES}-byte buffer limit"),
+            ))));
+        }
+        buffer.extend_from_slice(&copy_data.data);
         Ok(())
     }
 
