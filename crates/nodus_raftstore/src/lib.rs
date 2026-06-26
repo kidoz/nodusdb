@@ -288,6 +288,41 @@ impl RaftMetaStore {
         }
     }
 
+    /// Atomically persists several records in one transaction (one durable
+    /// commit), so a multi-record write is all-or-nothing across a crash and
+    /// costs a single fsync instead of one per record. Used for a batch of
+    /// appended log entries: a partial batch can never survive recovery.
+    fn put_batch(&self, items: Vec<(Vec<u8>, Vec<u8>)>) {
+        if items.is_empty() {
+            return;
+        }
+        let txn = TxnId::new();
+        for (key, value) in items {
+            if self
+                .kv
+                .write_intent(txn, Bytes::from(key), Bytes::from(value))
+                .is_err()
+            {
+                let _ = self.kv.abort(txn);
+                return;
+            }
+        }
+        let _ = self.kv.commit(txn, self.next_ts());
+    }
+
+    /// Persists a batch of log entries atomically (see [`Self::put_batch`]).
+    fn append_entries(&self, entries: &[Entry<NodusTypeConfig>]) {
+        let items: Vec<(Vec<u8>, Vec<u8>)> = entries
+            .iter()
+            .filter_map(|entry| {
+                serde_json::to_vec(entry)
+                    .ok()
+                    .map(|bytes| (log_key(entry.log_id.index), encode_raft(bytes)))
+            })
+            .collect();
+        self.put_batch(items);
+    }
+
     fn delete(&self, key: &[u8]) {
         let txn = TxnId::new();
         if self
@@ -311,12 +346,6 @@ impl RaftMetaStore {
             .ok()
             .flatten()
             .and_then(|b| decode_raft(&b).and_then(|p| serde_json::from_slice(p).ok()))
-    }
-
-    fn append_entry(&self, entry: &Entry<NodusTypeConfig>) {
-        if let Ok(bytes) = serde_json::to_vec(entry) {
-            self.put(&log_key(entry.log_id.index), encode_raft(bytes));
-        }
     }
 
     fn delete_entry(&self, index: u64) {
@@ -612,12 +641,14 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
         I: IntoIterator<Item = Entry<NodusTypeConfig>> + OptionalSend,
     {
         let mut log = self.log.write().await;
-        for entry in entries {
-            // Persist before caching so a crash never leaves an acked-but-lost
-            // entry — a leader must not ack a write it hasn't durably stored.
-            if let Some(meta) = &self.meta {
-                meta.append_entry(&entry);
-            }
+        let batch: Vec<Entry<NodusTypeConfig>> = entries.into_iter().collect();
+        // Persist the whole append atomically before caching, so a crash never
+        // leaves an acked-but-lost entry and a multi-entry append is never half
+        // durable — a leader must not ack a write it hasn't durably stored.
+        if let Some(meta) = &self.meta {
+            meta.append_entries(&batch);
+        }
+        for entry in batch {
             log.insert(entry.log_id.index, entry);
         }
         Ok(())
