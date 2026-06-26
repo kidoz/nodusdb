@@ -47,6 +47,9 @@ repository_uri = "file:///var/lib/nodus/backups"
 [audit]
 # Required for durable audit events. If unset, audit events are in-memory only.
 file_path = "/var/log/nodus/audit.jsonl"
+# Rotate at 100 MiB and retain five historical segments.
+max_size_bytes = 104857600
+max_files = 5
 
 [observability]
 metrics_enabled = true
