@@ -60,9 +60,11 @@ async fn committed_data_survives_a_restart() {
             .await
             .unwrap();
         assert_eq!(rows.len(), 1);
-        // Drop the server (sends shutdown); give tasks a moment to wind down.
+        // Cleanly shut down so the data dir is flushed and released before the
+        // restart reopens it (a bare drop only signals and cannot await).
+        drop(client);
+        server.shutdown().await;
     }
-    tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Second lifetime: same data dir — the table and row must still be there.
     {
@@ -108,8 +110,9 @@ async fn rolled_back_writes_are_never_visible() {
 
         let rows = client.query("SELECT id FROM ghosts", &[]).await.unwrap();
         assert!(rows.is_empty(), "rolled-back write must not be visible");
+        drop(client);
+        server.shutdown().await;
     }
-    tokio::time::sleep(Duration::from_millis(500)).await;
 
     // And it must not reappear after a restart.
     {

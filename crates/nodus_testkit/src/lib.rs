@@ -17,6 +17,10 @@ pub struct TestServer {
     pgwire_task: JoinHandle<anyhow::Result<()>>,
     #[allow(dead_code)]
     http_task: JoinHandle<std::io::Result<()>>,
+    /// GC, WAL archiver, Raft, etc. They hold the storage handles, so
+    /// [`TestServer::shutdown`] must await them for the data dir to be fully
+    /// released and flushed before another server reopens it.
+    background_tasks: Vec<JoinHandle<()>>,
     shutdown_tx: tokio::sync::watch::Sender<()>,
 }
 
@@ -76,8 +80,24 @@ impl TestServer {
             registry: handle.registry,
             pgwire_task: handle.pgwire_task,
             http_task: handle.http_task,
+            background_tasks: handle.background_tasks,
             shutdown_tx,
         })
+    }
+
+    /// Signals shutdown and waits for every server task — the listeners and the
+    /// background loops holding the storage/Raft handles — to finish, so the
+    /// data dir is fully flushed and released. Tests that restart a server on
+    /// the same data directory must call this (rather than relying on `Drop`,
+    /// which only signals and cannot await) to avoid racing the old server's
+    /// teardown.
+    pub async fn shutdown(mut self) {
+        let _ = self.shutdown_tx.send(());
+        let _ = (&mut self.pgwire_task).await;
+        let _ = (&mut self.http_task).await;
+        for task in &mut self.background_tasks {
+            let _ = task.await;
+        }
     }
 }
 
