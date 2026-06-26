@@ -675,7 +675,15 @@ async fn create_backup(
                 for version_res in iter {
                     match version_res {
                         Ok(version) => {
-                            max_kv_version = max_kv_version.max(version.version);
+                            // The HLC watermark is a clock *reservation* committed
+                            // ahead of wall time (up to RESERVATION_WINDOW), so it
+                            // must be backed up but must not define the snapshot's
+                            // logical time — otherwise `snapshot_ts` lands in the
+                            // future and PITR can't select this backup for a
+                            // wall-clock `target_ts`.
+                            if version.key.as_ref() != crate::HLC_WATERMARK_KEY {
+                                max_kv_version = max_kv_version.max(version.version);
+                            }
                             kv_dump.push(json!({
                                 "key": version.key.to_vec(),
                                 "value": version.value.as_ref().map(|value| value.to_vec()),
@@ -703,7 +711,12 @@ async fn create_backup(
                 for pair_res in iter {
                     match pair_res {
                         Ok(pair) => {
-                            max_kv_version = max_kv_version.max(pair.version);
+                            // See the version-scan branch: exclude the HLC
+                            // watermark reservation from the snapshot's logical
+                            // time while still backing the key up.
+                            if pair.key.as_ref() != crate::HLC_WATERMARK_KEY {
+                                max_kv_version = max_kv_version.max(pair.version);
+                            }
                             kv_dump.push(json!({
                                 "key": pair.key.to_vec(),
                                 "value": pair.value.to_vec(),
