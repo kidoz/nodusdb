@@ -7,6 +7,29 @@ use uuid::Uuid;
 
 pub type Timestamp = u64;
 
+/// A typed failure from a `KvEngine` mutation. The distinguished variants let a
+/// caller — notably Raft state-machine apply — tell a benign, idempotent outcome
+/// (e.g. committing a transaction whose intent was already consumed, which
+/// happens on legitimate post-crash log replay) apart from a real storage/I/O
+/// failure that must not be silently dropped.
+#[derive(Debug, thiserror::Error)]
+pub enum KvError {
+    /// No pending intent exists for the transaction — e.g. it was already
+    /// committed/aborted. On apply this is the benign replay-of-an-applied-entry
+    /// case.
+    #[error("no pending intent for transaction {0:?}")]
+    IntentNotFound(TxnId),
+    /// A concurrent committed write conflicts with this intent.
+    #[error("write-write conflict for transaction {0:?}")]
+    WriteConflict(TxnId),
+    /// Any other (storage/I/O/serialization) failure. Treated as fatal by
+    /// callers that distinguish benign outcomes.
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
+}
+
+pub type KvResult<T> = std::result::Result<T, KvError>;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TxnId(pub Uuid);
 
@@ -74,10 +97,10 @@ pub trait KvEngine: Send + Sync {
         })))
     }
 
-    fn write_intent(&self, txn_id: TxnId, key: Bytes, value: Bytes) -> Result<()>;
+    fn write_intent(&self, txn_id: TxnId, key: Bytes, value: Bytes) -> KvResult<()>;
     /// Writes a deletion (tombstone) intent for `key`. After commit the key
     /// reads as absent at timestamps at or after the commit.
-    fn delete_intent(&self, txn_id: TxnId, key: Bytes) -> Result<()>;
+    fn delete_intent(&self, txn_id: TxnId, key: Bytes) -> KvResult<()>;
     /// Replaces or clears this transaction's current intent for one key.
     /// Used by SQL savepoints to restore the uncommitted state that existed
     /// when the savepoint was created.
@@ -86,9 +109,9 @@ pub trait KvEngine: Send + Sync {
         txn_id: TxnId,
         key: Bytes,
         replacement: IntentReplacement,
-    ) -> Result<()>;
-    fn commit(&self, txn_id: TxnId, commit_ts: Timestamp) -> Result<()>;
-    fn abort(&self, txn_id: TxnId) -> Result<()>;
+    ) -> KvResult<()>;
+    fn commit(&self, txn_id: TxnId, commit_ts: Timestamp) -> KvResult<()>;
+    fn abort(&self, txn_id: TxnId) -> KvResult<()>;
 
     /// Reclaims MVCC versions that no active reader can observe: for each key,
     /// committed versions strictly older than the newest version at or below
@@ -211,12 +234,12 @@ impl KvEngine for NamespacedKvEngine {
         })))
     }
 
-    fn write_intent(&self, txn_id: TxnId, key: Bytes, value: Bytes) -> Result<()> {
+    fn write_intent(&self, txn_id: TxnId, key: Bytes, value: Bytes) -> KvResult<()> {
         self.inner
             .write_intent(self.namespaced_txn(txn_id), self.physical_key(&key), value)
     }
 
-    fn delete_intent(&self, txn_id: TxnId, key: Bytes) -> Result<()> {
+    fn delete_intent(&self, txn_id: TxnId, key: Bytes) -> KvResult<()> {
         self.inner
             .delete_intent(self.namespaced_txn(txn_id), self.physical_key(&key))
     }
@@ -226,7 +249,7 @@ impl KvEngine for NamespacedKvEngine {
         txn_id: TxnId,
         key: Bytes,
         replacement: IntentReplacement,
-    ) -> Result<()> {
+    ) -> KvResult<()> {
         self.inner.replace_intent(
             self.namespaced_txn(txn_id),
             self.physical_key(&key),
@@ -234,11 +257,11 @@ impl KvEngine for NamespacedKvEngine {
         )
     }
 
-    fn commit(&self, txn_id: TxnId, commit_ts: Timestamp) -> Result<()> {
+    fn commit(&self, txn_id: TxnId, commit_ts: Timestamp) -> KvResult<()> {
         self.inner.commit(self.namespaced_txn(txn_id), commit_ts)
     }
 
-    fn abort(&self, txn_id: TxnId) -> Result<()> {
+    fn abort(&self, txn_id: TxnId) -> KvResult<()> {
         self.inner.abort(self.namespaced_txn(txn_id))
     }
 

@@ -4,7 +4,7 @@ use nodus_catalog::TableId;
 use nodus_raftstore::ShardCommand;
 use nodus_sharding::ShardRouter;
 use nodus_storage_api::{
-    IntentReplacement, KeyRange, KvEngine, KvPair, NamespacedKvEngine, Timestamp, TxnId,
+    IntentReplacement, KeyRange, KvEngine, KvPair, KvResult, NamespacedKvEngine, Timestamp, TxnId,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -289,7 +289,7 @@ impl KvEngine for RaftKvEngine {
             .scan_versions(range, since_ts, read_ts)
     }
 
-    fn write_intent(&self, txn_id: TxnId, key: Bytes, value: Bytes) -> Result<()> {
+    fn write_intent(&self, txn_id: TxnId, key: Bytes, value: Bytes) -> KvResult<()> {
         let group_id = self.route(&key);
         self.record_txn_group(txn_id, &group_id);
         let cmd = ShardCommand::PutIntent {
@@ -298,10 +298,10 @@ impl KvEngine for RaftKvEngine {
             value: value.to_vec(),
             shard_id: Self::shard_field(&group_id),
         };
-        self.router.submit(&group_id, cmd)
+        Ok(self.router.submit(&group_id, cmd)?)
     }
 
-    fn delete_intent(&self, txn_id: TxnId, key: Bytes) -> Result<()> {
+    fn delete_intent(&self, txn_id: TxnId, key: Bytes) -> KvResult<()> {
         let group_id = self.route(&key);
         self.record_txn_group(txn_id, &group_id);
         let cmd = ShardCommand::DeleteIntent {
@@ -309,7 +309,7 @@ impl KvEngine for RaftKvEngine {
             key: key.to_vec(),
             shard_id: Self::shard_field(&group_id),
         };
-        self.router.submit(&group_id, cmd)
+        Ok(self.router.submit(&group_id, cmd)?)
     }
 
     fn replace_intent(
@@ -317,7 +317,7 @@ impl KvEngine for RaftKvEngine {
         txn_id: TxnId,
         key: Bytes,
         replacement: IntentReplacement,
-    ) -> Result<()> {
+    ) -> KvResult<()> {
         // Savepoint overlay fix-up is applied locally (not replicated), against
         // the same engine view the key's writes target.
         let group_id = self.route(&key);
@@ -325,9 +325,9 @@ impl KvEngine for RaftKvEngine {
             .replace_intent(txn_id, key, replacement)
     }
 
-    fn commit(&self, txn_id: TxnId, commit_ts: Timestamp) -> Result<()> {
+    fn commit(&self, txn_id: TxnId, commit_ts: Timestamp) -> KvResult<()> {
         let targets = self.finalize_targets(txn_id);
-        if targets.len() <= 1 {
+        let result = if targets.len() <= 1 {
             // Single-shard (incl. meta fallback): one atomic group commit.
             let group_id = targets
                 .into_iter()
@@ -343,10 +343,11 @@ impl KvEngine for RaftKvEngine {
             )
         } else {
             self.commit_cross_shard(txn_id, &targets, commit_ts)
-        }
+        };
+        Ok(result?)
     }
 
-    fn abort(&self, txn_id: TxnId) -> Result<()> {
+    fn abort(&self, txn_id: TxnId) -> KvResult<()> {
         for group_id in self.finalize_targets(txn_id) {
             let cmd = ShardCommand::AbortTxn {
                 txn_id: txn_id.0.to_string(),

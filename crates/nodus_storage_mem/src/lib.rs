@@ -2,7 +2,7 @@ use anyhow::Result;
 use bytes::Bytes;
 use nodus_mvcc::VersionChain;
 use nodus_storage_api::{
-    IntentReplacement, KeyRange, KvEngine, KvPair, KvVersion, Timestamp, TxnId,
+    IntentReplacement, KeyRange, KvEngine, KvPair, KvResult, KvVersion, Timestamp, TxnId,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::sync::RwLock;
@@ -106,27 +106,23 @@ impl KvEngine for MemKvEngine {
         Ok(Box::new(results.into_iter()))
     }
 
-    fn write_intent(&self, txn_id: TxnId, key: Bytes, value: Bytes) -> Result<()> {
+    fn write_intent(&self, txn_id: TxnId, key: Bytes, value: Bytes) -> KvResult<()> {
         let mut store_guard = self.store.write().unwrap();
         let mut intents_guard = self.intents.write().unwrap();
 
         let chain = store_guard.entry(key.clone()).or_default();
-        if let Err(e) = chain.write_intent(txn_id, value.to_vec()) {
-            anyhow::bail!("Write intent failed: {}", e);
-        }
+        chain.write_intent(txn_id, value.to_vec())?;
 
         intents_guard.entry(txn_id).or_default().push(key);
         Ok(())
     }
 
-    fn delete_intent(&self, txn_id: TxnId, key: Bytes) -> Result<()> {
+    fn delete_intent(&self, txn_id: TxnId, key: Bytes) -> KvResult<()> {
         let mut store_guard = self.store.write().unwrap();
         let mut intents_guard = self.intents.write().unwrap();
 
         let chain = store_guard.entry(key.clone()).or_default();
-        if let Err(e) = chain.delete_intent(txn_id) {
-            anyhow::bail!("Delete intent failed: {}", e);
-        }
+        chain.delete_intent(txn_id)?;
 
         intents_guard.entry(txn_id).or_default().push(key);
         Ok(())
@@ -137,7 +133,7 @@ impl KvEngine for MemKvEngine {
         txn_id: TxnId,
         key: Bytes,
         replacement: IntentReplacement,
-    ) -> Result<()> {
+    ) -> KvResult<()> {
         let mut store_guard = self.store.write().unwrap();
         let mut intents_guard = self.intents.write().unwrap();
         let chain = store_guard.entry(key.clone()).or_default();
@@ -146,15 +142,11 @@ impl KvEngine for MemKvEngine {
             .retain(|v| !(v.is_intent && v.txn_id == Some(txn_id)));
         match replacement {
             IntentReplacement::Put(value) => {
-                chain
-                    .write_intent(txn_id, value.to_vec())
-                    .map_err(|e| anyhow::anyhow!("Write intent failed: {}", e))?;
+                chain.write_intent(txn_id, value.to_vec())?;
                 intents_guard.entry(txn_id).or_default().push(key);
             }
             IntentReplacement::Delete => {
-                chain
-                    .delete_intent(txn_id)
-                    .map_err(|e| anyhow::anyhow!("Delete intent failed: {}", e))?;
+                chain.delete_intent(txn_id)?;
                 intents_guard.entry(txn_id).or_default().push(key);
             }
             IntentReplacement::Clear => {
@@ -169,7 +161,7 @@ impl KvEngine for MemKvEngine {
         Ok(())
     }
 
-    fn commit(&self, txn_id: TxnId, commit_ts: Timestamp) -> Result<()> {
+    fn commit(&self, txn_id: TxnId, commit_ts: Timestamp) -> KvResult<()> {
         let mut store_guard = self.store.write().unwrap();
         let mut intents_guard = self.intents.write().unwrap();
 
@@ -183,7 +175,7 @@ impl KvEngine for MemKvEngine {
         Ok(())
     }
 
-    fn abort(&self, txn_id: TxnId) -> Result<()> {
+    fn abort(&self, txn_id: TxnId) -> KvResult<()> {
         let mut store_guard = self.store.write().unwrap();
         let mut intents_guard = self.intents.write().unwrap();
 

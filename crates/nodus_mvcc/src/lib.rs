@@ -27,6 +27,19 @@ impl fmt::Display for MvccError {
 
 impl std::error::Error for MvccError {}
 
+impl From<MvccError> for nodus_storage_api::KvError {
+    fn from(err: MvccError) -> Self {
+        match err {
+            MvccError::WriteConflict { existing_txn } => {
+                nodus_storage_api::KvError::WriteConflict(existing_txn)
+            }
+            MvccError::IntentNotFound { txn_id } => {
+                nodus_storage_api::KvError::IntentNotFound(txn_id)
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MvccValue {
     pub value: Option<Vec<u8>>, // None = Tombstone

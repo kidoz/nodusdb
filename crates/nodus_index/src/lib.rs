@@ -79,7 +79,7 @@ impl IndexManager {
         row_data: Bytes,
     ) -> Result<()> {
         let key = self.codec.encode_primary_key(table_id, primary_key, 0)?; // MVCC logic lives in KvEngine values
-        self.kv.write_intent(txn_id, key, row_data)
+        Ok(self.kv.write_intent(txn_id, key, row_data)?)
     }
 
     pub fn get_primary(
@@ -104,7 +104,7 @@ impl IndexManager {
             .encode_secondary_key(index_desc.id, values, primary_key, 0)?;
         // For secondary indexes, the value is typically empty (or contains included columns).
         // For MVP, we just store an empty byte array.
-        self.kv.write_intent(txn_id, key, Bytes::new())
+        Ok(self.kv.write_intent(txn_id, key, Bytes::new())?)
     }
 
     // We would add secondary index point lookups and range scans here.

@@ -20,7 +20,8 @@ use nodus_raftstore::network::NodusNetworkFactory;
 use nodus_raftstore::server::{NodusRaft, RaftState};
 use nodus_sharding::ShardOrchestrator;
 use nodus_storage_api::{
-    IntentReplacement, KeyRange, KvEngine, KvPair, KvVersion, NamespacedKvEngine, Timestamp, TxnId,
+    IntentReplacement, KeyRange, KvEngine, KvPair, KvResult, KvVersion, NamespacedKvEngine,
+    Timestamp, TxnId,
 };
 
 /// Wraps a group's KV engine so that applying a committed transaction also
@@ -59,10 +60,10 @@ impl KvEngine for ClockAdvancingKvEngine {
     ) -> Result<Box<dyn Iterator<Item = Result<KvVersion>> + Send>> {
         self.inner.scan_versions(range, since_ts, read_ts)
     }
-    fn write_intent(&self, txn_id: TxnId, key: Bytes, value: Bytes) -> Result<()> {
+    fn write_intent(&self, txn_id: TxnId, key: Bytes, value: Bytes) -> KvResult<()> {
         self.inner.write_intent(txn_id, key, value)
     }
-    fn delete_intent(&self, txn_id: TxnId, key: Bytes) -> Result<()> {
+    fn delete_intent(&self, txn_id: TxnId, key: Bytes) -> KvResult<()> {
         self.inner.delete_intent(txn_id, key)
     }
     fn replace_intent(
@@ -70,10 +71,10 @@ impl KvEngine for ClockAdvancingKvEngine {
         txn_id: TxnId,
         key: Bytes,
         replacement: IntentReplacement,
-    ) -> Result<()> {
+    ) -> KvResult<()> {
         self.inner.replace_intent(txn_id, key, replacement)
     }
-    fn commit(&self, txn_id: TxnId, commit_ts: Timestamp) -> Result<()> {
+    fn commit(&self, txn_id: TxnId, commit_ts: Timestamp) -> KvResult<()> {
         self.inner.commit(txn_id, commit_ts)?;
         // The data commit is already durable, so a watermark-persist failure must
         // not fail it — but it is a real durability hazard (a restart/leadership
@@ -88,7 +89,7 @@ impl KvEngine for ClockAdvancingKvEngine {
         }
         Ok(())
     }
-    fn abort(&self, txn_id: TxnId) -> Result<()> {
+    fn abort(&self, txn_id: TxnId) -> KvResult<()> {
         self.inner.abort(txn_id)
     }
     fn garbage_collect(&self, watermark: Timestamp) -> Result<usize> {
