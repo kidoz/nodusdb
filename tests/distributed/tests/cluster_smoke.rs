@@ -132,6 +132,24 @@ fn spawn_node(id: u64, http: &str, pg: &str, peers: Option<&str>) -> NodeGuard {
     }
 }
 
+/// Executes `sql`, retrying while the cluster settles a leader. A transient
+/// "no leader" error is retried; an "already exists" error means a prior attempt
+/// landed (its response was lost), so it counts as success.
+async fn execute_until_ok(client: &tokio_postgres::Client, sql: &str) {
+    for _ in 0..50 {
+        match client.execute(sql, &[]).await {
+            Ok(_) => return,
+            Err(e) => {
+                if e.to_string().to_lowercase().contains("already exists") {
+                    return;
+                }
+                sleep(Duration::from_millis(200)).await;
+            }
+        }
+    }
+    panic!("statement never succeeded against the cluster: {sql}");
+}
+
 async fn wait_for_readyz(addr: &str) {
     let client = reqwest::Client::new();
     let url = format!("http://{}/readyz", addr);
@@ -171,10 +189,11 @@ async fn test_cluster_replication() {
         .await
         .expect("connect leader");
 
-    leader
-        .execute("CREATE TABLE dist_test (id INT, value TEXT);", &[])
-        .await
-        .unwrap();
+    // `readyz` means the process is up, not that the meta group has elected a
+    // leader, so the first DDL can race the election. Retry until it lands
+    // (treating "already exists" as a prior attempt that succeeded), then the
+    // single INSERT below runs against an established leader.
+    execute_until_ok(&leader, "CREATE TABLE dist_test (id INT, value TEXT);").await;
     leader
         .execute(
             "INSERT INTO dist_test (id, value) VALUES (1, 'hello raft');",
