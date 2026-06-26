@@ -365,11 +365,11 @@ async fn split_forms_child_groups_across_the_cluster() {
     let source_group = format!("shard-{source}");
     let mut formed = false;
     for _ in 0..75 {
-        if let Ok(groups) = cluster.admin_get(0, "/api/v1/cluster/groups").await {
-            if voters_of(&groups, &source_group) == 3 {
-                formed = true;
-                break;
-            }
+        if let Ok(groups) = cluster.admin_get(0, "/api/v1/cluster/groups").await
+            && voters_of(&groups, &source_group) == 3
+        {
+            formed = true;
+            break;
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
@@ -399,14 +399,13 @@ async fn split_forms_child_groups_across_the_cluster() {
     // decommissioned the source.
     let mut children_formed = false;
     for _ in 0..75 {
-        if let Ok(groups) = cluster.admin_get(0, "/api/v1/cluster/groups").await {
-            if voters_of(&groups, &left_group) == 3
-                && voters_of(&groups, &right_group) == 3
-                && voters_of(&groups, &source_group) == 0
-            {
-                children_formed = true;
-                break;
-            }
+        if let Ok(groups) = cluster.admin_get(0, "/api/v1/cluster/groups").await
+            && voters_of(&groups, &left_group) == 3
+            && voters_of(&groups, &right_group) == 3
+            && voters_of(&groups, &source_group) == 0
+        {
+            children_formed = true;
+            break;
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
@@ -418,11 +417,12 @@ async fn split_forms_child_groups_across_the_cluster() {
     // A follower hosts replicas of both children too.
     let mut follower_has_children = false;
     for _ in 0..75 {
-        if let Ok(groups) = cluster.admin_get(2, "/api/v1/cluster/groups").await {
-            if voters_of(&groups, &left_group) == 3 && voters_of(&groups, &right_group) == 3 {
-                follower_has_children = true;
-                break;
-            }
+        if let Ok(groups) = cluster.admin_get(2, "/api/v1/cluster/groups").await
+            && voters_of(&groups, &left_group) == 3
+            && voters_of(&groups, &right_group) == 3
+        {
+            follower_has_children = true;
+            break;
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
