@@ -11,6 +11,14 @@ use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum WalRecordV1 {
+    /// First record of a rotated WAL segment, naming the segment it follows.
+    /// This makes the WAL-segment lineage explicit so PITR can verify an
+    /// unbroken chain of archived segments even though segment ids are sparse
+    /// (the file-id counter is shared with SSTables/compaction). `predecessor`
+    /// is `None` for the very first segment.
+    SegmentHeader {
+        predecessor: Option<u64>,
+    },
     BeginTxn {
         txn_id: TxnId,
     },

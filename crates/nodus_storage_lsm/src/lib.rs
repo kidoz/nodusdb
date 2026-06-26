@@ -243,11 +243,17 @@ impl LsmKvEngine {
             // Rotate to a fresh WAL segment; older segments stay on disk for the
             // backup WAL-archiver / PITR. The manifest swap below makes the new
             // file set durable (recovery reads the manifest, not file names).
+            let predecessor = self.active_wal_id.load(Ordering::Relaxed);
             let wal_id = self.next_file_id.fetch_add(1, Ordering::SeqCst);
             let new_wal = Arc::new(FileWalEngine::with_encryption(
                 dir.join(format!("{wal_id}.log")),
                 self._wal_key,
             )?);
+            // Record this segment's lineage as its first record so PITR can
+            // verify an unbroken archived chain despite sparse segment ids.
+            new_wal.append(WalRecord::V1(WalRecordV1::SegmentHeader {
+                predecessor: Some(predecessor),
+            }))?;
             *self.wal.write().unwrap() = Some(new_wal);
             self.active_wal_id.store(wal_id, Ordering::Relaxed);
             self.save_manifest()?;

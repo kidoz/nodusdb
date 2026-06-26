@@ -330,6 +330,11 @@ pub struct WalArchiveIndex {
     pub last_commit_ts: Option<u64>,
     pub record_txn_ids: Vec<String>,
     pub committed_txns: Vec<WalCommittedTxn>,
+    /// The WAL-segment id this segment follows, recorded so PITR can verify an
+    /// unbroken lineage across the (sparse) segment-id space. `None` for the
+    /// first segment, or a segment archived before lineage was recorded.
+    #[serde(default)]
+    pub predecessor: Option<u64>,
     pub archived_at: DateTime<Utc>,
     pub upload_state: WalArchiveUploadState,
 }
@@ -900,26 +905,57 @@ impl BackupOrchestrator {
             return Ok(Vec::new());
         }
 
-        let first = needed_sequences
+        let first = *needed_sequences
             .iter()
             .next()
-            .copied()
-            .ok_or_else(|| anyhow::anyhow!("PITR restore plan selected no WAL segments"))?;
-        let last = needed_sequences
+            .expect("needed_sequences is non-empty");
+        let last = *needed_sequences
             .iter()
             .next_back()
-            .copied()
-            .ok_or_else(|| anyhow::anyhow!("PITR restore plan selected no WAL segments"))?;
+            .expect("needed_sequences is non-empty");
+
+        // Walk the segment lineage from `last` back to `first` via each segment's
+        // recorded predecessor, rather than assuming a dense integer id range:
+        // segment ids are sparse (the file-id counter is shared with SSTables and
+        // compaction), so a contiguous-id check raised false "missing segment"
+        // errors on perfectly intact archives. Every segment on the chain down to
+        // `first` must be present; a break in the chain is a real, unrecoverable
+        // gap and must fail rather than restore a partial window.
         let mut selected = BTreeMap::new();
-        for segment_id in first..=last {
-            let index = indexes_by_sequence.remove(&segment_id).ok_or_else(|| {
+        let mut current = last;
+        loop {
+            let index = indexes_by_sequence.remove(&current).ok_or_else(|| {
                 anyhow::anyhow!(
-                    "missing required WAL archive index for segment {segment_id}.log while planning PITR from {} to {}",
+                    "missing required WAL archive segment {current}.log while planning PITR from {} to {} (broken segment lineage)",
                     base.snapshot_ts,
                     target_ts
                 )
             })?;
-            selected.insert(segment_id, index);
+            let predecessor = index.predecessor;
+            selected.insert(current, index);
+            if current == first {
+                break;
+            }
+            match predecessor {
+                // Keep walking while the predecessor is still inside the window.
+                Some(p) if p >= first => current = p,
+                // The predecessor precedes the window (its commits are in the
+                // base) or lineage wasn't recorded — every needed segment is in.
+                _ => break,
+            }
+        }
+
+        // Defense in depth: every segment carrying a needed commit must have been
+        // reached by the lineage walk; a broken or pre-lineage chain that skipped
+        // one means we cannot replay the full window consistently.
+        for sequence in &needed_sequences {
+            if !selected.contains_key(sequence) {
+                anyhow::bail!(
+                    "WAL segment {sequence}.log needed for PITR from {} to {} is not on the archived segment lineage",
+                    base.snapshot_ts,
+                    target_ts
+                );
+            }
         }
 
         let mut plan_segments = Vec::new();
@@ -1067,7 +1103,8 @@ impl BackupOrchestrator {
                         active_txns.remove(&txn_id);
                         report.aborts_applied += 1;
                     }
-                    WalRecordV1::Checkpoint { .. } => {}
+                    // Lineage/metadata records carry no replayable mutation.
+                    WalRecordV1::Checkpoint { .. } | WalRecordV1::SegmentHeader { .. } => {}
                 }
             }
         }
@@ -1254,6 +1291,7 @@ impl BackupOrchestrator {
         data: Bytes,
         record_txn_ids: Vec<String>,
         committed_txns: Vec<WalCommittedTxn>,
+        predecessor: Option<u64>,
     ) -> Result<WalArchiveIndex> {
         let mut record_txn_ids = record_txn_ids;
         record_txn_ids.sort();
@@ -1283,6 +1321,7 @@ impl BackupOrchestrator {
             last_commit_ts,
             record_txn_ids,
             committed_txns,
+            predecessor,
             archived_at: Utc::now(),
             upload_state: WalArchiveUploadState::Completed,
         };
@@ -1776,6 +1815,7 @@ mod tests {
                     txn_id: "old-txn".into(),
                     commit_ts: 5,
                 }],
+                None,
             )
             .await
             .is_ok()
@@ -1804,6 +1844,7 @@ mod tests {
                 txn_id: "before-txn".into(),
                 commit_ts: 5,
             }],
+            Some(0),
         )
         .await
         .unwrap();
@@ -1815,6 +1856,7 @@ mod tests {
                 txn_id: "after-txn".into(),
                 commit_ts: 12,
             }],
+            Some(1),
         )
         .await
         .unwrap();
@@ -1823,6 +1865,7 @@ mod tests {
             Bytes::from("write-before-commit"),
             vec!["late-txn".into()],
             vec![],
+            Some(2),
         )
         .await
         .unwrap();
@@ -1834,6 +1877,7 @@ mod tests {
                 txn_id: "late-txn".into(),
                 commit_ts: 15,
             }],
+            Some(3),
         )
         .await
         .unwrap();
@@ -1892,6 +1936,7 @@ mod tests {
                 txn_id: "before-base".into(),
                 commit_ts: 12,
             }],
+            Some(0),
         )
         .await
         .unwrap();
@@ -1903,6 +1948,7 @@ mod tests {
                 txn_id: "after-base".into(),
                 commit_ts: 22,
             }],
+            Some(1),
         )
         .await
         .unwrap();
@@ -1911,6 +1957,7 @@ mod tests {
             Bytes::from("late-write"),
             vec!["late-txn".into()],
             vec![],
+            Some(2),
         )
         .await
         .unwrap();
@@ -1922,6 +1969,7 @@ mod tests {
                 txn_id: "late-txn".into(),
                 commit_ts: 24,
             }],
+            Some(3),
         )
         .await
         .unwrap();
@@ -1992,6 +2040,7 @@ mod tests {
                 txn_id: "first".into(),
                 commit_ts: 12,
             }],
+            Some(0),
         )
         .await
         .unwrap();
@@ -2003,14 +2052,15 @@ mod tests {
                 txn_id: "third".into(),
                 commit_ts: 14,
             }],
+            Some(2),
         )
         .await
         .unwrap();
 
         let err = orch.plan_pitr_restore(15).await.unwrap_err();
         assert!(
-            err.to_string()
-                .contains("missing required WAL archive index")
+            err.to_string().contains("broken segment lineage"),
+            "expected a lineage-gap error, got: {err}"
         );
     }
 
@@ -2039,10 +2089,11 @@ mod tests {
                 txn_id: "first".into(),
                 commit_ts: 12,
             }],
+            Some(0),
         )
         .await
         .unwrap();
-        orch.archive_wal_indexed("2.log", Bytes::from("checkpoint"), vec![], vec![])
+        orch.archive_wal_indexed("2.log", Bytes::from("checkpoint"), vec![], vec![], Some(1))
             .await
             .unwrap();
         orch.archive_wal_indexed(
@@ -2053,6 +2104,7 @@ mod tests {
                 txn_id: "third".into(),
                 commit_ts: 14,
             }],
+            Some(2),
         )
         .await
         .unwrap();
@@ -2064,6 +2116,77 @@ mod tests {
                 .map(|segment| segment.segment_id.as_str())
                 .collect::<Vec<_>>(),
             vec!["1.log", "2.log", "3.log"]
+        );
+    }
+
+    /// WAL-segment ids are sparse (the file-id counter is shared with SSTables
+    /// and compaction), so the planner must follow the recorded lineage rather
+    /// than require every integer id between first and last — which would have
+    /// failed this intact archive with a false "missing segment".
+    #[tokio::test]
+    async fn test_pitr_restore_plan_accepts_sparse_segment_ids() {
+        let repo: Arc<dyn BackupRepository> = Arc::new(MemBackupRepository::new());
+        let orch = BackupOrchestrator::new(repo);
+        orch.create_full_backup(
+            "cluster-1",
+            10,
+            1,
+            1,
+            vec![BackupObject {
+                name: "kv_data.json".into(),
+                bytes: Bytes::from("full"),
+            }],
+        )
+        .await
+        .unwrap();
+
+        // Segments 2 → 6 → 9: ids 3,4,5,7,8 were SSTable/compaction files, never
+        // WAL segments. The lineage links make this an unbroken chain.
+        orch.archive_wal_indexed(
+            "2.log",
+            Bytes::from("a"),
+            vec!["a".into()],
+            vec![WalCommittedTxn {
+                txn_id: "a".into(),
+                commit_ts: 12,
+            }],
+            Some(1),
+        )
+        .await
+        .unwrap();
+        orch.archive_wal_indexed(
+            "6.log",
+            Bytes::from("b"),
+            vec!["b".into()],
+            vec![WalCommittedTxn {
+                txn_id: "b".into(),
+                commit_ts: 13,
+            }],
+            Some(2),
+        )
+        .await
+        .unwrap();
+        orch.archive_wal_indexed(
+            "9.log",
+            Bytes::from("c"),
+            vec!["c".into()],
+            vec![WalCommittedTxn {
+                txn_id: "c".into(),
+                commit_ts: 14,
+            }],
+            Some(6),
+        )
+        .await
+        .unwrap();
+
+        let plan = orch.plan_pitr_restore(15).await.unwrap();
+        assert_eq!(
+            plan.wal_segments
+                .iter()
+                .map(|segment| segment.segment_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["2.log", "6.log", "9.log"],
+            "intact sparse-id chain must not be rejected as a gap"
         );
     }
 
@@ -2092,6 +2215,7 @@ mod tests {
                     txn_id: "txn".into(),
                     commit_ts: 12,
                 }],
+                Some(0),
             )
             .await
             .unwrap();
@@ -2198,6 +2322,7 @@ mod tests {
                     commit_ts: 25,
                 },
             ],
+            Some(0),
         )
         .await
         .unwrap();
@@ -2286,6 +2411,7 @@ mod tests {
                     commit_ts: 18,
                 },
             ],
+            Some(0),
         )
         .await
         .unwrap();

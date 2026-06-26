@@ -101,7 +101,7 @@ fn backup_dir(uri: &str) -> PathBuf {
 fn wal_archive_txn_index(
     bytes: &[u8],
     wal_key: Option<[u8; 32]>,
-) -> anyhow::Result<(Vec<String>, Vec<WalCommittedTxn>)> {
+) -> anyhow::Result<(Vec<String>, Vec<WalCommittedTxn>, Option<u64>)> {
     use nodus_storage_wal::{FileWalEngine, WalEngine, WalRecord, WalRecordV1};
 
     let path = std::env::temp_dir().join(format!("nodus-wal-index-{}.log", uuid::Uuid::new_v4()));
@@ -111,9 +111,15 @@ fn wal_archive_txn_index(
         let records = wal.recover()?;
         let mut record_txn_ids = Vec::new();
         let mut committed_txns = Vec::new();
+        // The segment's lineage: the WAL-segment id this one follows (`None` for
+        // the first/root segment, or a segment written before lineage records).
+        let mut predecessor = None;
         for record in records {
             let WalRecord::V1(record) = record;
             match record {
+                WalRecordV1::SegmentHeader { predecessor: prev } => {
+                    predecessor = prev;
+                }
                 WalRecordV1::BeginTxn { txn_id }
                 | WalRecordV1::WriteIntent { txn_id, .. }
                 | WalRecordV1::DeleteIntent { txn_id, .. } => {
@@ -128,7 +134,7 @@ fn wal_archive_txn_index(
                 WalRecordV1::AbortTxn { .. } | WalRecordV1::Checkpoint { .. } => {}
             }
         }
-        Ok((record_txn_ids, committed_txns))
+        Ok((record_txn_ids, committed_txns, predecessor))
     })();
     let _ = std::fs::remove_file(&path);
     result
@@ -716,8 +722,11 @@ pub async fn run_server_with_config(
                                     if id < max_id {
                                         if let Ok(bytes) = std::fs::read(&path) {
                                             let filename = format!("{}.log", id);
-                                            if let Ok((record_txn_ids, committed_txns)) =
-                                                wal_archive_txn_index(&bytes, wal_key)
+                                            if let Ok((
+                                                record_txn_ids,
+                                                committed_txns,
+                                                predecessor,
+                                            )) = wal_archive_txn_index(&bytes, wal_key)
                                             {
                                                 let data = bytes::Bytes::from(bytes);
                                                 if backup_clone
@@ -726,6 +735,7 @@ pub async fn run_server_with_config(
                                                         data,
                                                         record_txn_ids,
                                                         committed_txns,
+                                                        predecessor,
                                                     )
                                                     .await
                                                     .is_ok()
@@ -1031,7 +1041,8 @@ mod tests {
         wal.sync().unwrap();
 
         let bytes = std::fs::read(&path).unwrap();
-        let (record_txn_ids, committed_txns) = wal_archive_txn_index(&bytes, None).unwrap();
+        let (record_txn_ids, committed_txns, _predecessor) =
+            wal_archive_txn_index(&bytes, None).unwrap();
         let _ = std::fs::remove_file(&path);
 
         assert!(record_txn_ids.contains(&txn_id.0.to_string()));
