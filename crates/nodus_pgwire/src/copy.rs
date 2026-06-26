@@ -57,6 +57,9 @@ impl NodusCopyHandler {
             // Binary fields carry no type tag, so resolve the target columns'
             // types and decode the raw bytes against them. The text formats are
             // self-describing and decode straight from the (UTF-8) row stream.
+            // An empty body carries no rows (and no signature) — skip the schema
+            // probe so a data-less COPY completes without touching the catalog.
+            nodus_import::CopyFormat::Binary if bytes.is_empty() => Vec::new(),
             nodus_import::CopyFormat::Binary => {
                 let types = Self::resolve_column_types(executor.as_ref(), &ctx, &spec)?;
                 nodus_import::decode_binary_rows(&bytes, &types)?
