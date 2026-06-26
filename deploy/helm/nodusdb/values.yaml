@@ -1,4 +1,7 @@
-replicaCount: 3
+# One node is the safe default while distributed data-shard execution is still
+# partial. Increasing this starts additional nodes that join the seed node's
+# control plane, but it should not be treated as production HA yet.
+replicaCount: 1
 
 image:
   repository: ghcr.io/kidoz/nodusdb
@@ -14,17 +17,23 @@ service:
 config:
   logLevel: info
   maxConnections: 100
+  dataDir: /var/lib/nodus/data
+  allowEphemeral: false
   backupRepositoryUri: "file:///var/lib/nodus/backups"
+  auditFilePath: /var/lib/nodus/audit/audit.jsonl
+  auditMaxSizeBytes: 104857600
+  auditMaxFiles: 5
   # Authentication token for admin APIs (e.g. /api/v1/backups, /api/v1/shards, etc.)
   # The pod binds the admin port on 0.0.0.0, so the server refuses to start with
-  # an empty token UNLESS adminAllowInsecure is set. Set a token for production.
+  # an empty token UNLESS adminAllowInsecure is set. When empty, the chart
+  # generates and stores a token in a Secret.
   adminToken: ""
   # Explicitly allow an unauthenticated admin API on the non-loopback pod bind.
   # Only safe when the admin port is network-isolated (ClusterIP + NetworkPolicy).
   # Ignored when adminToken is set. Required (true) for an unauthenticated install.
   adminAllowInsecure: false
   # Password for the default 'nodus' superuser over pgwire.
-  # If left empty, a random password will be generated.
+  # If left empty, the chart generates and stores a password in a Secret.
   adminPassword: ""
 
 persistence:
@@ -32,14 +41,35 @@ persistence:
   size: 10Gi
   # storageClass: ""
 
+tls:
+  enabled: false
+  # Raw PEM content. Prefer --set-file tls.cert=server.crt --set-file tls.key=server.key.
+  cert: ""
+  key: ""
+  clientCa: ""
+  requireClientAuth: false
+
 podDisruptionBudget:
-  enabled: true
-  minAvailable: 2
+  enabled: false
+  minAvailable: 1
 
 # Emit a Prometheus Operator ServiceMonitor.
 serviceMonitor:
   enabled: false
   interval: 15s
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  fsGroupChangePolicy: OnRootMismatch
+
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
 
 resources: {}
 nodeSelector: {}

@@ -15,13 +15,42 @@ spec:
       labels:
         {{- include "nodusdb.selectorLabels" . | nindent 8 }}
     spec:
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
       containers:
         - name: nodusd
           image: {{ include "nodusdb.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - /bin/sh
+            - -ec
+            - |
+              ordinal="${POD_NAME##*-}"
+              export NODUS_CLUSTER__NODE_ID="$((ordinal + 1))"
+              export NODUS_CLUSTER__RAFT_ADVERTISE_ADDR="${POD_NAME}.{{ include "nodusdb.fullname" . }}:{{ .Values.service.httpPort }}"
+              if [ "$ordinal" != "0" ]; then
+                export NODUS_CLUSTER__JOIN_PEERS="[\"{{ include "nodusdb.fullname" . }}-0.{{ include "nodusdb.fullname" . }}:{{ .Values.service.httpPort }}\"]"
+              fi
+              exec /usr/local/bin/nodus_server
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
           env:
             - name: NODUS_CONFIG
               value: /etc/nodus/nodus.toml
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: NODUS_ADMIN__TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "nodusdb.fullname" . }}-admin
+                  key: admin-token
+            - name: NODUS_ADMIN__PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "nodusdb.fullname" . }}-admin
+                  key: admin-password
           ports:
             - name: pgwire
               containerPort: {{ .Values.service.pgwirePort }}
@@ -42,12 +71,26 @@ spec:
           volumeMounts:
             - name: config
               mountPath: /etc/nodus
+            {{- if .Values.tls.enabled }}
+            - name: tls
+              mountPath: /etc/nodus/tls
+              readOnly: true
+            {{- end }}
             - name: data
-              mountPath: /var/lib/nodus/data
+              mountPath: /var/lib/nodus
       volumes:
         - name: config
           configMap:
             name: {{ include "nodusdb.fullname" . }}-config
+        {{- if .Values.tls.enabled }}
+        - name: tls
+          secret:
+            secretName: {{ include "nodusdb.fullname" . }}-tls
+        {{- end }}
+        {{- if not .Values.persistence.enabled }}
+        - name: data
+          emptyDir: {}
+        {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

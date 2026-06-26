@@ -11,21 +11,40 @@ data:
     http_addr = "0.0.0.0:{{ .Values.service.httpPort }}"
     max_connections = {{ .Values.config.maxConnections }}
 
+    [cluster]
+    node_id = 1
+    raft_advertise_addr = "127.0.0.1:{{ .Values.service.httpPort }}"
+    join_peers = []
+
+    [storage]
+    data_dir = "{{ .Values.config.dataDir }}"
+    allow_ephemeral = {{ .Values.config.allowEphemeral }}
+
+    [tls]
+    enabled = {{ .Values.tls.enabled }}
+    {{ if .Values.tls.enabled }}
+    cert_path = "/etc/nodus/tls/tls.crt"
+    key_path = "/etc/nodus/tls/tls.key"
+    {{ if .Values.tls.clientCa }}
+    client_ca_path = "/etc/nodus/tls/client-ca.crt"
+    {{ end }}
+    require_client_auth = {{ .Values.tls.requireClientAuth }}
+    {{ end }}
+
     [backup]
     repository_uri = "{{ .Values.config.backupRepositoryUri }}"
 
     [admin]
-    {{- if .Values.config.adminToken }}
-    token = "{{ .Values.config.adminToken }}"
-    {{- end }}
-    {{- if .Values.config.adminPassword }}
-    password = "{{ .Values.config.adminPassword }}"
-    {{- end }}
-    {{- if .Values.config.adminAllowInsecure }}
+    {{ if .Values.config.adminAllowInsecure }}
     # Unauthenticated admin API on a non-loopback bind. Only safe when the admin
     # port is network-isolated (e.g. ClusterIP + NetworkPolicy). Prefer adminToken.
     allow_insecure = true
-    {{- end }}
+    {{ end }}
+
+    [audit]
+    file_path = "{{ .Values.config.auditFilePath }}"
+    max_size_bytes = {{ .Values.config.auditMaxSizeBytes | int64 }}
+    max_files = {{ .Values.config.auditMaxFiles }}
 
     [observability]
     metrics_enabled = true
