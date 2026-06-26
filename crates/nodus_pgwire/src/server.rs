@@ -366,7 +366,12 @@ where
         }
     }
     factory.registry.deregister(&session_id);
-    factory.executor.end_session(&session_id);
+    // `end_session` aborts any open transaction, which routes through the
+    // synchronous Raft write path (`blocking_recv`) and panics if run on a
+    // reactor worker — drive it on the blocking pool like every other executor
+    // call (see `execute_off_reactor`).
+    let executor = factory.executor.clone();
+    let _ = tokio::task::spawn_blocking(move || executor.end_session(&session_id)).await;
     Ok(())
 }
 
