@@ -30,7 +30,11 @@ fn nodus_server_bin() -> PathBuf {
     let target_dir = std::env::var_os("CARGO_TARGET_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| workspace_root.join("target"));
-    let profile = if cfg!(debug_assertions) { "debug" } else { "release" };
+    let profile = if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    };
     let bin = target_dir.join(profile).join("nodus_server");
 
     if !bin.exists() {
