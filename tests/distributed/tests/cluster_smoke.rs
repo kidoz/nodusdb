@@ -1,9 +1,56 @@
 #![allow(clippy::collapsible_if)]
 use std::path::PathBuf;
 use std::process::{Child, Command};
+use std::sync::Once;
 use std::time::Duration;
 use tokio::time::sleep;
 use tokio_postgres::NoTls;
+
+/// Absolute path to the `nodus_server` binary, building it once if the
+/// workspace hasn't already produced it.
+///
+/// These tests run from the `nodus_distributed_tests` package, where the old
+/// `cargo run --bin nodus_server` fallback failed with *"no bin target named
+/// nodus_server in default-run packages"* and the relative
+/// `../../target/debug` path was brittle to the test process's working
+/// directory. Resolving the path from this crate's manifest dir and spawning
+/// the prebuilt binary fixes both and keeps node startup within the readiness
+/// window (no per-node `cargo` build-lock contention).
+fn nodus_server_bin() -> PathBuf {
+    if let Ok(explicit) = std::env::var("NODUS_SERVER_BIN") {
+        return PathBuf::from(explicit);
+    }
+
+    // <workspace>/tests/distributed -> <workspace>
+    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .expect("workspace root sits two levels above the test crate")
+        .to_path_buf();
+    let target_dir = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| workspace_root.join("target"));
+    let profile = if cfg!(debug_assertions) { "debug" } else { "release" };
+    let bin = target_dir.join(profile).join("nodus_server");
+
+    if !bin.exists() {
+        // Both cluster tests run concurrently — build the binary exactly once.
+        static BUILD: Once = Once::new();
+        BUILD.call_once(|| {
+            let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+            let mut build = Command::new(cargo);
+            build
+                .args(["build", "-p", "nodus_server", "--bin", "nodus_server"])
+                .current_dir(&workspace_root);
+            if !cfg!(debug_assertions) {
+                build.arg("--release");
+            }
+            let status = build.status().expect("run cargo build for nodus_server");
+            assert!(status.success(), "failed to build the nodus_server binary");
+        });
+    }
+    bin
+}
 
 async fn wait_for_server(addr: &str) -> Result<tokio_postgres::Client, tokio_postgres::Error> {
     for _ in 0..20 {
@@ -59,18 +106,7 @@ impl Drop for NodeGuard {
 fn spawn_node(id: u64, http: &str, pg: &str, peers: Option<&str>) -> NodeGuard {
     let dir = tempfile::tempdir().unwrap();
 
-    // We expect `nodusd` or `nodus_server` to be in PATH or built locally
-    let bin_path = if PathBuf::from("../../target/debug/nodus_server").exists() {
-        "../../target/debug/nodus_server"
-    } else {
-        "cargo"
-    };
-
-    let mut cmd = Command::new(bin_path);
-    if bin_path == "cargo" {
-        cmd.arg("run").arg("--bin").arg("nodus_server").arg("--");
-    }
-
+    let mut cmd = Command::new(nodus_server_bin());
     cmd.env("NODUS_CLUSTER__NODE_ID", id.to_string())
         .env("NODUS_SERVER__HTTP_ADDR", http)
         .env("NODUS_SERVER__PGWIRE_ADDR", pg)
