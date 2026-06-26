@@ -44,6 +44,3 @@ path = "fuzz_targets/fuzz_wal_record.rs"
 test = false
 doc = false
 bench = false
-
-[lints]
-workspace = true
