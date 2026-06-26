@@ -110,7 +110,7 @@ async fn require_token(
             }
         } else if let Some(bearer) = auth.strip_prefix("Bearer ") {
             if let Some(expected) = &state.admin_token {
-                if bearer == expected {
+                if nodus_security::constant_time_eq(bearer.as_bytes(), expected.as_bytes()) {
                     let Ok(p) = state.catalog.get_principal_by_name("nodus") else {
                         return Err(StatusCode::UNAUTHORIZED);
                     };

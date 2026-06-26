@@ -1,11 +1,20 @@
 use chrono::{DateTime, Utc};
+use hmac::{Hmac, KeyInit, Mac};
 use nodus_catalog::{CatalogReader, DatabaseId, PrincipalId, RoleId};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
+use subtle::ConstantTimeEq;
 use uuid::Uuid;
+
+/// Compares two byte strings in constant time (independent of where they first
+/// differ), so secret comparisons — passwords, bearer tokens — don't leak their
+/// contents through timing. Returns `false` for differing lengths.
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.ct_eq(b).into()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
@@ -180,20 +189,57 @@ pub enum AuthError {
     UnknownUser(String),
 }
 
-/// A stored password credential: a random per-user salt plus the SHA-256 hash
-/// of `salt || password`. Plaintext passwords are never retained.
+/// A stored password credential: a random per-user salt plus a PBKDF2-HMAC-SHA256
+/// derived key. The iteration count is stored alongside so the work factor can be
+/// raised later without invalidating existing credentials. Plaintext passwords
+/// are never retained.
 #[derive(Debug, Clone)]
 struct PasswordCredential {
     principal_id: PrincipalId,
     salt: String,
+    iterations: u32,
     hash: String,
 }
 
+/// PBKDF2-HMAC-SHA256 work factor. A deliberate cost (vs. a single SHA-256) so an
+/// attacker who exfiltrates the credential store can't brute-force at hash speed.
+const PBKDF2_ITERATIONS: u32 = 100_000;
+
+type HmacSha256 = Hmac<Sha256>;
+
+/// PBKDF2-HMAC-SHA256 with a single 32-byte output block (`dkLen == hLen`), which
+/// is all a password verifier needs. Implemented over `hmac` directly since no
+/// `pbkdf2` crate is vendored.
+fn pbkdf2_sha256(password: &[u8], salt: &[u8], iterations: u32) -> [u8; 32] {
+    let prf = |parts: &[&[u8]]| -> [u8; 32] {
+        let mut mac = HmacSha256::new_from_slice(password).expect("HMAC accepts any key length");
+        for part in parts {
+            mac.update(part);
+        }
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&mac.finalize().into_bytes());
+        out
+    };
+    // U1 = PRF(password, salt || INT_32_BE(1)); DK = U1 ^ U2 ^ … ^ Uc.
+    let mut u = prf(&[salt, &1u32.to_be_bytes()]);
+    let mut dk = u;
+    for _ in 1..iterations.max(1) {
+        u = prf(&[&u]);
+        for (acc, x) in dk.iter_mut().zip(u.iter()) {
+            *acc ^= *x;
+        }
+    }
+    dk
+}
+
 fn hash_password(salt: &str, password: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(salt.as_bytes());
-    hasher.update(password.as_bytes());
-    format!("{:x}", hasher.finalize())
+    let dk = pbkdf2_sha256(password.as_bytes(), salt.as_bytes(), PBKDF2_ITERATIONS);
+    let mut hex = String::with_capacity(dk.len() * 2);
+    for byte in dk {
+        use std::fmt::Write;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
 }
 
 /// Authenticates a `(username, password)` pair and issues a [`Session`].
@@ -226,6 +272,7 @@ impl PasswordAuthenticator {
             PasswordCredential {
                 principal_id,
                 salt,
+                iterations: PBKDF2_ITERATIONS,
                 hash,
             },
         );
@@ -242,7 +289,13 @@ impl Authenticator for PasswordAuthenticator {
                 .ok_or_else(|| AuthError::UnknownUser(username.to_string()))?
         };
 
-        if hash_password(&cred.salt, password) != cred.hash {
+        let derived = pbkdf2_sha256(password.as_bytes(), cred.salt.as_bytes(), cred.iterations);
+        let mut computed = String::with_capacity(derived.len() * 2);
+        for byte in derived {
+            use std::fmt::Write;
+            let _ = write!(computed, "{byte:02x}");
+        }
+        if !constant_time_eq(computed.as_bytes(), cred.hash.as_bytes()) {
             return Err(AuthError::InvalidCredentials(username.to_string()));
         }
 
@@ -325,6 +378,35 @@ mod tests {
             auth.authenticate("nobody", "x"),
             Err(AuthError::UnknownUser(_))
         ));
+    }
+
+    #[test]
+    fn pbkdf2_is_deterministic_salted_and_not_plain_sha256() {
+        // Deterministic for the same salt+password+iterations.
+        let a = pbkdf2_sha256(b"pw", b"salt", 1000);
+        let b = pbkdf2_sha256(b"pw", b"salt", 1000);
+        assert_eq!(a, b);
+        // Salt and iteration count both change the output.
+        assert_ne!(a, pbkdf2_sha256(b"pw", b"other-salt", 1000));
+        assert_ne!(a, pbkdf2_sha256(b"pw", b"salt", 1001));
+        // Not a single SHA-256 of salt||password (that would be the old scheme).
+        let single = {
+            use sha2::Digest;
+            let mut h = sha2::Sha256::new();
+            h.update(b"salt");
+            h.update(b"pw");
+            let mut out = [0u8; 32];
+            out.copy_from_slice(&h.finalize());
+            out
+        };
+        assert_ne!(pbkdf2_sha256(b"pw", b"salt", PBKDF2_ITERATIONS), single);
+    }
+
+    #[test]
+    fn constant_time_eq_matches_equality() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"abcd")); // length mismatch
     }
 
     #[test]
