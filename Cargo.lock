@@ -2626,6 +2626,7 @@ dependencies = [
  "anyhow",
  "byteorder",
  "bytes",
+ "nodus_common",
  "nodus_storage_api",
  "rand 0.10.1",
  "serde",

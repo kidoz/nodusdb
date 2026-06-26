@@ -40,6 +40,12 @@ pub enum WalRecord {
     V1(WalRecordV1),
 }
 
+/// On-disk format version of a WAL record payload. Carried in a self-describing
+/// envelope so the record encoding can evolve (and a future serializer change)
+/// without the serde enum tag being the only version signal — and so an older
+/// binary refuses to misreplay a record from a newer format.
+const WAL_RECORD_VERSION: u16 = 1;
+
 /// CRC32 (IEEE/reflected) of `data`, used to detect torn or corrupt WAL records
 /// on recovery. Bit-by-bit (no table) — WAL records are small, so the cost is
 /// negligible and it keeps the crate dependency-free.
@@ -92,7 +98,10 @@ impl FileWalEngine {
 impl WalEngine for FileWalEngine {
     fn append(&self, record: WalRecord) -> anyhow::Result<u64> {
         let mut file = self.file.lock().unwrap();
-        let mut data = serde_json::to_vec(&record)?;
+        // Wrap the serialized record in a versioned envelope before framing, so a
+        // reader can dispatch on the record format version.
+        let mut data =
+            nodus_common::versioned::encode(WAL_RECORD_VERSION, &serde_json::to_vec(&record)?);
 
         if let Some(cipher) = &self.cipher {
             let mut nonce_bytes = [0u8; 12];
@@ -169,8 +178,26 @@ impl WalEngine for FileWalEngine {
                 buf
             };
 
-            if let Ok(record) = serde_json::from_slice(&data) {
-                records.push(record);
+            // Dispatch on the record envelope: parse a supported version or
+            // legacy (pre-envelope) bytes; refuse a record from a newer WAL
+            // format rather than silently misreplaying it.
+            use nodus_common::versioned::{Envelope, decode};
+            match decode(&data) {
+                Envelope::Versioned { version, payload } if version == WAL_RECORD_VERSION => {
+                    if let Ok(record) = serde_json::from_slice(payload) {
+                        records.push(record);
+                    }
+                }
+                Envelope::Versioned { version, .. } => {
+                    anyhow::bail!(
+                        "unsupported WAL record version {version}; this binary supports {WAL_RECORD_VERSION}"
+                    );
+                }
+                Envelope::Legacy(legacy) => {
+                    if let Ok(record) = serde_json::from_slice(legacy) {
+                        records.push(record);
+                    }
+                }
             }
         }
 
@@ -206,5 +233,69 @@ mod tests {
         } else {
             panic!("Wrong record type recovered");
         }
+    }
+
+    /// Writes one frame (`[len][crc][payload]`) of raw bytes, as a pre-envelope
+    /// WAL writer would have.
+    fn write_legacy_frame(path: &Path, payload: &[u8]) {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap();
+        file.write_u32::<LittleEndian>(payload.len() as u32)
+            .unwrap();
+        file.write_u32::<LittleEndian>(crc32(payload)).unwrap();
+        file.write_all(payload).unwrap();
+        file.sync_data().unwrap();
+    }
+
+    #[test]
+    fn recovers_legacy_unversioned_records() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+
+        // A pre-envelope record: the raw JSON of the record, framed directly.
+        let record = WalRecord::V1(WalRecordV1::CommitTxn {
+            txn_id: TxnId::new(),
+            commit_ts: 42,
+        });
+        write_legacy_frame(&path, &serde_json::to_vec(&record).unwrap());
+
+        let recovered = FileWalEngine::new(&path).unwrap().recover().unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert!(matches!(
+            recovered[0],
+            WalRecord::V1(WalRecordV1::CommitTxn { commit_ts: 42, .. })
+        ));
+    }
+
+    #[test]
+    fn versioned_records_round_trip_unencrypted() {
+        let file = NamedTempFile::new().unwrap();
+        let engine = FileWalEngine::new(file.path()).unwrap();
+        engine
+            .append(WalRecord::V1(WalRecordV1::Checkpoint { ts: 99 }))
+            .unwrap();
+        engine.sync().unwrap();
+        let recovered = engine.recover().unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert!(matches!(
+            recovered[0],
+            WalRecord::V1(WalRecordV1::Checkpoint { ts: 99 })
+        ));
+    }
+
+    #[test]
+    fn recover_rejects_a_newer_record_version() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+
+        // A record from a newer WAL format: a valid frame whose payload is a
+        // versioned envelope this binary does not support.
+        let future = nodus_common::versioned::encode(WAL_RECORD_VERSION + 1, b"{}");
+        write_legacy_frame(&path, &future);
+
+        assert!(FileWalEngine::new(&path).unwrap().recover().is_err());
     }
 }

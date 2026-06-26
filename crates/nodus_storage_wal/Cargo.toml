@@ -13,6 +13,7 @@ serde.workspace = true
 serde_json.workspace = true
 byteorder = "1.5.0"
 bytes.workspace = true
+nodus_common = { path = "../nodus_common" }
 nodus_storage_api = { path = "../nodus_storage_api" }
 aes-gcm = "0.10.3"
 rand = "0.10.1"
