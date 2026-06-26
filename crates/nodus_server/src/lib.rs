@@ -326,7 +326,7 @@ pub async fn run_server_with_config(
     };
     let catalog = Arc::new(nodus_catalog::MemoryCatalog::with_store(Arc::new(
         nodus_executor::KvCatalogStore::new(local_kv.clone()),
-    )));
+    ))?);
     tracing::debug!("Loaded KV and catalog");
 
     let cluster_version = catalog

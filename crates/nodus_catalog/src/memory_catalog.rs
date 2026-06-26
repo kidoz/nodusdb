@@ -36,6 +36,9 @@ impl Default for MemoryCatalog {
     }
 }
 
+/// On-disk format version of the persisted catalog snapshot.
+const CATALOG_SNAPSHOT_VERSION: u16 = 1;
+
 #[derive(Serialize, Deserialize)]
 struct MemoryCatalogState {
     databases: HashMap<String, DatabaseDescriptor>,
@@ -52,25 +55,45 @@ impl MemoryCatalog {
     /// Builds a catalog backed by `store`, loading any previously persisted
     /// state from it. All subsequent mutations are persisted through the same
     /// store, so the catalog shares the KV layer's durability and recovery.
-    pub fn with_store(store: std::sync::Arc<dyn CatalogStore>) -> Self {
-        if let Some(bytes) = store.load()
-            && let Ok(state) = serde_json::from_slice::<MemoryCatalogState>(&bytes)
-        {
-            return Self {
-                databases: RwLock::new(state.databases),
-                schemas: RwLock::new(state.schemas.into_iter().collect()),
-                tables: RwLock::new(state.tables.into_iter().collect()),
-                principals: RwLock::new(state.principals),
-                grants: RwLock::new(state.grants),
-                roles: RwLock::new(state.roles),
-                memberships: RwLock::new(state.memberships),
-                catalog_version: RwLock::new(state.catalog_version),
-                store: Some(store),
-            };
+    ///
+    /// A persisted snapshot that cannot be decoded — corruption, or a format
+    /// version newer than this binary understands — is a hard error rather than
+    /// a silent reset to an empty catalog (which would erase every database,
+    /// table, and grant).
+    pub fn with_store(store: std::sync::Arc<dyn CatalogStore>) -> Result<Self> {
+        let Some(bytes) = store.load() else {
+            // First start: no snapshot persisted yet.
+            let mut cat = Self::new();
+            cat.store = Some(store);
+            return Ok(cat);
+        };
+        let state = Self::decode_snapshot(&bytes)?;
+        Ok(Self {
+            databases: RwLock::new(state.databases),
+            schemas: RwLock::new(state.schemas.into_iter().collect()),
+            tables: RwLock::new(state.tables.into_iter().collect()),
+            principals: RwLock::new(state.principals),
+            grants: RwLock::new(state.grants),
+            roles: RwLock::new(state.roles),
+            memberships: RwLock::new(state.memberships),
+            catalog_version: RwLock::new(state.catalog_version),
+            store: Some(store),
+        })
+    }
+
+    /// Decodes a persisted snapshot, dispatching on its envelope version and
+    /// accepting legacy (pre-envelope) JSON for backward compatibility.
+    fn decode_snapshot(bytes: &[u8]) -> Result<MemoryCatalogState> {
+        use nodus_common::versioned::{Envelope, decode};
+        match decode(bytes) {
+            Envelope::Versioned { version, payload } if version == CATALOG_SNAPSHOT_VERSION => {
+                Ok(serde_json::from_slice(payload)?)
+            }
+            Envelope::Versioned { version, .. } => anyhow::bail!(
+                "unsupported catalog snapshot version {version}; this binary supports {CATALOG_SNAPSHOT_VERSION}"
+            ),
+            Envelope::Legacy(legacy) => Ok(serde_json::from_slice(legacy)?),
         }
-        let mut cat = Self::new();
-        cat.store = Some(store);
-        cat
     }
 
     /// Persists the full catalog state through the backing [`CatalogStore`]
@@ -103,7 +126,11 @@ impl MemoryCatalog {
             memberships: self.memberships.read().unwrap().clone(),
             catalog_version: *self.catalog_version.read().unwrap(),
         };
-        store.save(&serde_json::to_vec(&state)?)
+        let payload = serde_json::to_vec(&state)?;
+        store.save(&nodus_common::versioned::encode(
+            CATALOG_SNAPSHOT_VERSION,
+            &payload,
+        ))
     }
 
     pub fn new() -> Self {
@@ -649,6 +676,75 @@ impl CatalogWriter for MemoryCatalog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An in-memory [`CatalogStore`] for exercising persistence.
+    #[derive(Default)]
+    struct MemStore(std::sync::Mutex<Option<Vec<u8>>>);
+
+    impl CatalogStore for MemStore {
+        fn load(&self) -> Option<Vec<u8>> {
+            self.0.lock().unwrap().clone()
+        }
+        fn save(&self, bytes: &[u8]) -> Result<()> {
+            *self.0.lock().unwrap() = Some(bytes.to_vec());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn versioned_snapshot_round_trips_through_store() {
+        let store = std::sync::Arc::new(MemStore::default());
+        let cat = MemoryCatalog::with_store(store.clone()).unwrap();
+        cat.create_database(CreateDatabaseRequest {
+            id: DatabaseId::new(),
+            name: "db1".into(),
+            owner_role_id: None,
+        })
+        .unwrap();
+        cat.save_to_disk().unwrap();
+
+        // Persisted bytes carry the versioned envelope.
+        let bytes = store.load().unwrap();
+        assert!(matches!(
+            nodus_common::versioned::decode(&bytes),
+            nodus_common::versioned::Envelope::Versioned {
+                version: CATALOG_SNAPSHOT_VERSION,
+                ..
+            }
+        ));
+
+        // Reloading recovers the database (not a silent reset to empty).
+        let reloaded = MemoryCatalog::with_store(store).unwrap();
+        assert!(reloaded.get_database("db1").is_ok());
+    }
+
+    #[test]
+    fn legacy_unversioned_snapshot_still_loads() {
+        // A pre-envelope snapshot: raw JSON with no magic.
+        let state = MemoryCatalogState {
+            databases: HashMap::new(),
+            schemas: Vec::new(),
+            tables: Vec::new(),
+            principals: HashMap::new(),
+            grants: Vec::new(),
+            roles: Vec::new(),
+            memberships: Vec::new(),
+            catalog_version: 7,
+        };
+        let store = std::sync::Arc::new(MemStore(std::sync::Mutex::new(Some(
+            serde_json::to_vec(&state).unwrap(),
+        ))));
+        let cat = MemoryCatalog::with_store(store).unwrap();
+        assert_eq!(*cat.catalog_version.read().unwrap(), 7);
+    }
+
+    #[test]
+    fn unknown_snapshot_version_fails_loudly() {
+        // A snapshot from a newer binary must error, not reset to empty.
+        let future = nodus_common::versioned::encode(CATALOG_SNAPSHOT_VERSION + 1, b"{}");
+        let store = std::sync::Arc::new(MemStore(std::sync::Mutex::new(Some(future))));
+        assert!(MemoryCatalog::with_store(store).is_err());
+    }
 
     #[test]
     fn test_create_database_schema_table() {

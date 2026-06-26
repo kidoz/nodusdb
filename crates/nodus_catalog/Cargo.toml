@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+nodus_common = { path = "../nodus_common" }
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -264,7 +264,7 @@ impl MemExecutor {
         )?);
         let cat = Arc::new(MemoryCatalog::with_store(Arc::new(KvCatalogStore::new(
             kv.clone(),
-        ))));
+        )))?);
 
         if cat.get_database("default").is_err() {
             let db = cat.create_database(nodus_catalog::CreateDatabaseRequest {

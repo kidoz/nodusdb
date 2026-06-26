@@ -10,6 +10,7 @@ repository.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 serde.workspace = true
+nodus_common = { path = "../nodus_common" }
 nodus_catalog = { path = "../nodus_catalog" }
 nodus_storage_api = { path = "../nodus_storage_api" }
 serde_json.workspace = true
