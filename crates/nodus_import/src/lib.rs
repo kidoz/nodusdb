@@ -16,7 +16,9 @@
 mod copy_decoder;
 mod splitter;
 
-pub use copy_decoder::{Cell, CopyFormat, CopySpec, decode_rows, parse_copy_header};
+pub use copy_decoder::{
+    Cell, CopyFormat, CopySpec, decode_binary_rows, decode_rows, parse_copy_header,
+};
 pub use splitter::{RawUnit, is_copy_from_stdin, split};
 
 use serde::{Deserialize, Serialize};

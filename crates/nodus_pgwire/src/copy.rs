@@ -53,9 +53,20 @@ impl NodusCopyHandler {
         bytes: Vec<u8>,
     ) -> anyhow::Result<usize> {
         let spec = nodus_import::parse_copy_header(&header)?;
-        // Wire COPY data is the row stream only (no psql `\.` terminator).
-        let body = String::from_utf8_lossy(&bytes);
-        let rows = nodus_import::decode_rows(&body, spec.format)?;
+        let rows = match spec.format {
+            // Binary fields carry no type tag, so resolve the target columns'
+            // types and decode the raw bytes against them. The text formats are
+            // self-describing and decode straight from the (UTF-8) row stream.
+            nodus_import::CopyFormat::Binary => {
+                let types = Self::resolve_column_types(executor.as_ref(), &ctx, &spec)?;
+                nodus_import::decode_binary_rows(&bytes, &types)?
+            }
+            _ => {
+                // Wire COPY data is the row stream only (no psql `\.` terminator).
+                let body = String::from_utf8_lossy(&bytes);
+                nodus_import::decode_rows(&body, spec.format)?
+            }
+        };
         let total = rows.len();
         for chunk in rows.chunks(500) {
             let sql = nodus_import::synthesize_insert(&spec, chunk);
@@ -65,6 +76,32 @@ impl NodusCopyHandler {
             }
         }
         Ok(total)
+    }
+
+    /// Resolves the declared types of the COPY target columns (or all columns
+    /// when none are listed) by running a zero-row projection through the
+    /// executor. Binary COPY needs these to interpret each field's bytes.
+    fn resolve_column_types(
+        executor: &dyn nodus_executor::Executor,
+        ctx: &nodus_executor::ExecutionContext,
+        spec: &nodus_import::CopySpec,
+    ) -> anyhow::Result<Vec<String>> {
+        // `spec.table`/`spec.columns` are validated as plain identifiers by the
+        // header parser, so this interpolation cannot inject.
+        let cols = if spec.columns.is_empty() {
+            "*".to_string()
+        } else {
+            spec.columns.join(", ")
+        };
+        let probe = format!("SELECT {cols} FROM {} LIMIT 0", spec.table);
+        let mut output = None;
+        for stmt in nodus_sql::parse_sql(&probe)? {
+            let plan = nodus_executor::plan_statement(&stmt, &[])?;
+            output = Some(executor.execute_logical(ctx, plan)?);
+        }
+        output
+            .map(|o| o.types)
+            .ok_or_else(|| anyhow::anyhow!("could not resolve COPY column types for {}", spec.table))
     }
 }
 

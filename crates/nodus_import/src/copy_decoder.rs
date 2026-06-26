@@ -19,6 +19,10 @@ pub enum Cell {
 pub enum CopyFormat {
     Text,
     Csv,
+    /// PostgreSQL binary COPY (`FORMAT BINARY`). Decoded by
+    /// [`decode_binary_rows`], which needs the column types — unlike the
+    /// self-describing text formats — so it is not handled by [`decode_rows`].
+    Binary,
 }
 
 /// Parsed `COPY` header: where the rows go and how they are encoded.
@@ -63,7 +67,9 @@ pub fn parse_copy_header(header: &str) -> Result<CopySpec> {
     }
 
     let upper = tail.to_ascii_uppercase();
-    let format = if upper.contains("FORMAT CSV") || upper.contains("CSV") {
+    let format = if upper.contains("BINARY") {
+        CopyFormat::Binary
+    } else if upper.contains("FORMAT CSV") || upper.contains("CSV") {
         CopyFormat::Csv
     } else {
         CopyFormat::Text
@@ -106,11 +112,171 @@ fn is_safe_qualified_name(name: &str) -> bool {
     !name.is_empty() && name.split('.').all(is_safe_identifier)
 }
 
-/// Decodes a COPY data body into rows of cells for the given format.
+/// Decodes a text/CSV COPY data body into rows of cells. Binary bodies are not
+/// self-describing (the wire carries no type tags), so they go through
+/// [`decode_binary_rows`] with the column types instead.
 pub fn decode_rows(body: &str, format: CopyFormat) -> Result<Vec<Vec<Cell>>> {
     match format {
         CopyFormat::Text => Ok(decode_text(body)),
         CopyFormat::Csv => decode_csv(body),
+        CopyFormat::Binary => {
+            bail!("binary COPY must be decoded via decode_binary_rows with column types")
+        }
+    }
+}
+
+/// The 11-byte signature that opens every PostgreSQL binary COPY stream.
+const BINARY_SIGNATURE: &[u8] = b"PGCOPY\n\xff\r\n\0";
+
+/// OID-inclusion bit in the binary COPY header flags field.
+const BINARY_FLAG_HAS_OIDS: i32 = 1 << 16;
+
+/// The engine's four logical column kinds, which a SQL type name collapses to.
+/// Binary COPY fields carry no type tag, so the declared column type selects how
+/// each field's bytes are interpreted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BinaryKind {
+    Int,
+    Float,
+    Bool,
+    Text,
+}
+
+/// Mirrors the executor's `column_type`: maps a SQL type name to a logical kind.
+fn binary_kind(type_name: &str) -> BinaryKind {
+    let t = type_name.to_ascii_uppercase();
+    if t.contains("INT") || t.contains("SERIAL") {
+        BinaryKind::Int
+    } else if t.contains("FLOAT")
+        || t.contains("DOUBLE")
+        || t.contains("REAL")
+        || t.contains("NUMERIC")
+        || t.contains("DECIMAL")
+    {
+        BinaryKind::Float
+    } else if t.contains("BOOL") {
+        BinaryKind::Bool
+    } else {
+        BinaryKind::Text
+    }
+}
+
+/// Decodes a PostgreSQL binary-format COPY body into text cells, using the
+/// declared column types (in field order) to interpret each field's bytes.
+///
+/// The binary wire format carries no per-field type, so `type_names` must list
+/// the target columns' types in the same order the rows were written. Only the
+/// engine's four logical kinds are supported (int, float, bool, text); the
+/// field byte length disambiguates integer/float widths. Columns whose type is
+/// none of these are read as UTF-8 text, matching the engine's simplified model.
+pub fn decode_binary_rows(bytes: &[u8], type_names: &[String]) -> Result<Vec<Vec<Cell>>> {
+    let kinds: Vec<BinaryKind> = type_names.iter().map(|t| binary_kind(t)).collect();
+    let mut cur = ByteReader::new(bytes);
+
+    if cur.read(BINARY_SIGNATURE.len())? != BINARY_SIGNATURE {
+        bail!("invalid binary COPY signature");
+    }
+    let flags = cur.read_i32()?;
+    if flags & BINARY_FLAG_HAS_OIDS != 0 {
+        bail!("binary COPY with OIDs is not supported");
+    }
+    let ext_len = cur.read_i32()?;
+    if ext_len < 0 {
+        bail!("invalid binary COPY header extension length: {ext_len}");
+    }
+    cur.read(ext_len as usize)?;
+
+    let mut rows = Vec::new();
+    loop {
+        let field_count = cur.read_i16()?;
+        if field_count == -1 {
+            break; // The -1 tuple field-count is the end-of-data trailer.
+        }
+        if field_count < 0 {
+            bail!("invalid binary COPY field count: {field_count}");
+        }
+        let mut row = Vec::with_capacity(field_count as usize);
+        for i in 0..field_count as usize {
+            let len = cur.read_i32()?;
+            if len == -1 {
+                row.push(Cell::Null);
+                continue;
+            }
+            if len < 0 {
+                bail!("invalid binary COPY field length: {len}");
+            }
+            let field = cur.read(len as usize)?;
+            let kind = kinds.get(i).copied().unwrap_or(BinaryKind::Text);
+            row.push(decode_binary_field(field, kind)?);
+        }
+        rows.push(row);
+    }
+    Ok(rows)
+}
+
+/// Renders one binary field as the text form `synthesize_insert` will quote and
+/// the executor will coerce back to the column's type.
+fn decode_binary_field(bytes: &[u8], kind: BinaryKind) -> Result<Cell> {
+    let text = match kind {
+        BinaryKind::Int => match bytes.len() {
+            1 => (bytes[0] as i8 as i64).to_string(),
+            2 => i16::from_be_bytes([bytes[0], bytes[1]]).to_string(),
+            4 => i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]).to_string(),
+            8 => i64::from_be_bytes([
+                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+            ])
+            .to_string(),
+            n => bail!("unsupported binary integer width: {n} bytes"),
+        },
+        BinaryKind::Float => match bytes.len() {
+            4 => f32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]).to_string(),
+            8 => f64::from_be_bytes([
+                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+            ])
+            .to_string(),
+            n => bail!("unsupported binary float width: {n} bytes"),
+        },
+        BinaryKind::Bool => match bytes {
+            [0] => "false".to_string(),
+            [_] => "true".to_string(),
+            _ => bail!("binary bool must be 1 byte, got {}", bytes.len()),
+        },
+        BinaryKind::Text => String::from_utf8_lossy(bytes).into_owned(),
+    };
+    Ok(Cell::Text(text))
+}
+
+/// A minimal big-endian byte cursor with bounds-checked reads, so a truncated or
+/// malformed binary COPY body errors instead of panicking on a slice index.
+struct ByteReader<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> ByteReader<'a> {
+    fn new(buf: &'a [u8]) -> Self {
+        Self { buf, pos: 0 }
+    }
+
+    fn read(&mut self, n: usize) -> Result<&'a [u8]> {
+        let end = self
+            .pos
+            .checked_add(n)
+            .filter(|end| *end <= self.buf.len())
+            .ok_or_else(|| anyhow::anyhow!("binary COPY truncated at offset {}", self.pos))?;
+        let slice = &self.buf[self.pos..end];
+        self.pos = end;
+        Ok(slice)
+    }
+
+    fn read_i16(&mut self) -> Result<i16> {
+        let b = self.read(2)?;
+        Ok(i16::from_be_bytes([b[0], b[1]]))
+    }
+
+    fn read_i32(&mut self) -> Result<i32> {
+        let b = self.read(4)?;
+        Ok(i32::from_be_bytes([b[0], b[1], b[2], b[3]]))
     }
 }
 
@@ -339,6 +505,65 @@ mod tests {
         assert!(!is_safe_identifier("a b"));
         assert!(!is_safe_identifier("a;b"));
         assert!(!is_safe_qualified_name(""));
+    }
+
+    #[test]
+    fn parses_binary_format_header() {
+        let spec =
+            parse_copy_header("COPY t (id, name) FROM stdin (FORMAT BINARY)").unwrap();
+        assert_eq!(spec.columns, vec!["id", "name"]);
+        assert_eq!(spec.format, CopyFormat::Binary);
+    }
+
+    /// Builds a one-row binary COPY stream the way a driver's binary importer
+    /// does, then round-trips it through the decoder against declared types.
+    #[test]
+    fn decodes_binary_int_text_bool_float_and_null() {
+        let mut body = Vec::new();
+        body.extend_from_slice(BINARY_SIGNATURE);
+        body.extend_from_slice(&0i32.to_be_bytes()); // flags
+        body.extend_from_slice(&0i32.to_be_bytes()); // header extension length
+
+        // One row: int4=1, text="one", bool=true, float8=1.5, NULL.
+        body.extend_from_slice(&5i16.to_be_bytes());
+        body.extend_from_slice(&4i32.to_be_bytes());
+        body.extend_from_slice(&1i32.to_be_bytes());
+        body.extend_from_slice(&3i32.to_be_bytes());
+        body.extend_from_slice(b"one");
+        body.extend_from_slice(&1i32.to_be_bytes());
+        body.push(1);
+        body.extend_from_slice(&8i32.to_be_bytes());
+        body.extend_from_slice(&1.5f64.to_be_bytes());
+        body.extend_from_slice(&(-1i32).to_be_bytes()); // NULL field
+        body.extend_from_slice(&(-1i16).to_be_bytes()); // trailer
+
+        let types = ["INT", "TEXT", "BOOL", "DOUBLE", "TEXT"].map(String::from);
+        let rows = decode_binary_rows(&body, &types).unwrap();
+        assert_eq!(
+            rows,
+            vec![vec![
+                Cell::Text("1".into()),
+                Cell::Text("one".into()),
+                Cell::Text("true".into()),
+                Cell::Text("1.5".into()),
+                Cell::Null,
+            ]]
+        );
+    }
+
+    #[test]
+    fn rejects_truncated_and_unsigned_binary_streams() {
+        // Bad signature.
+        assert!(decode_binary_rows(b"NOTPGCOPY..", &[]).is_err());
+        // Valid header but the tuple is cut off mid-field — must error, not panic.
+        let mut body = Vec::new();
+        body.extend_from_slice(BINARY_SIGNATURE);
+        body.extend_from_slice(&0i32.to_be_bytes());
+        body.extend_from_slice(&0i32.to_be_bytes());
+        body.extend_from_slice(&1i16.to_be_bytes()); // one field
+        body.extend_from_slice(&4i32.to_be_bytes()); // claims 4 bytes
+        body.extend_from_slice(&[0u8, 0]); // but only 2 present
+        assert!(decode_binary_rows(&body, &[String::from("INT")]).is_err());
     }
 
     #[test]
