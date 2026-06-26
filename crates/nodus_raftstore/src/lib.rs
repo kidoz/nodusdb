@@ -191,6 +191,43 @@ struct AppliedState {
     last_purged: Option<LogId<u64>>,
 }
 
+/// Repairs a torn recovery so openraft sees a self-consistent log state.
+///
+/// Log entries, `last_applied`, and `last_purged` are persisted as independent
+/// KV records, so a crash can durably retain an inconsistent subset — most
+/// notably the applied-state pointer surviving while the log entries it refers
+/// to do not. openraft's startup (`Raft::new` → `get_initial_state`) requires
+/// `last_applied <= last_log_id` with every index in `(last_purged, last_log_id]`
+/// present in the log; a torn state otherwise makes it read a missing entry and
+/// abort with *"try to get log at index N but got None"*.
+///
+/// The state machine's data is durable independently of the Raft log, so every
+/// entry at or below `last_applied` is already captured there. When the log is
+/// missing part of that applied prefix, report the prefix as purged (raise
+/// `last_purged` to `last_applied`) and drop any stale cached entries at or
+/// below it — yielding a consistent view that serves applied state from the
+/// snapshot/state machine. A healthy recovery (the applied prefix fully present
+/// in the log) is left untouched, preserving the log for follower replication.
+///
+/// Returns `true` when it changed the recovered state.
+fn reconcile_torn_recovery(
+    log: &mut BTreeMap<u64, Entry<NodusTypeConfig>>,
+    applied: &mut AppliedState,
+) -> bool {
+    let Some(applied_id) = applied.last_applied else {
+        return false;
+    };
+    let purged_idx = applied.last_purged.map(|l| l.index).unwrap_or(0);
+    let expected = applied_id.index.saturating_sub(purged_idx);
+    let present = log.range(purged_idx + 1..=applied_id.index).count() as u64;
+    if present == expected {
+        return false; // Applied prefix intact — healthy recovery.
+    }
+    applied.last_purged = Some(applied_id);
+    log.retain(|index, _| *index > applied_id.index);
+    true
+}
+
 /// Persists Raft vote, log entries, and applied-state into a `KvEngine` so a
 /// node's consensus state survives restart. Commit timestamps are wall-clock
 /// monotonic (`max(now, last + 1)`) so the newest write always wins even after a
@@ -391,9 +428,14 @@ impl NodusRaftStore {
         meta_store: Option<Arc<dyn nodus_meta::MetaStore>>,
     ) -> Self {
         let meta = Arc::new(RaftMetaStore::new(kv.clone()));
-        let log = meta.load_log();
+        let mut log = meta.load_log();
         let vote = meta.load_vote();
-        let applied = meta.load_applied();
+        let mut applied = meta.load_applied();
+        if reconcile_torn_recovery(&mut log, &mut applied) {
+            // Persist the repaired watermark so the consistent view is stable
+            // across a subsequent restart, even if no apply/purge runs first.
+            meta.save_applied(&applied);
+        }
         Self {
             log: Arc::new(RwLock::new(log)),
             vote: Arc::new(RwLock::new(vote)),
@@ -928,6 +970,98 @@ mod tests {
             applied.map(|l| l.index),
             Some(2),
             "applied pointer recovered"
+        );
+    }
+
+    fn applied_at(index: u64) -> AppliedState {
+        AppliedState {
+            last_applied: Some(LogId::new(openraft::CommittedLeaderId::new(1, 1), index)),
+            last_membership: StoredMembership::default(),
+            last_purged: None,
+        }
+    }
+
+    #[test]
+    fn reconcile_leaves_a_healthy_recovery_untouched() {
+        // The applied prefix (indices 1..=2) is fully present, plus an unapplied
+        // tail at 3 — a normal restart, which must not be disturbed.
+        let mut log: BTreeMap<u64, Entry<NodusTypeConfig>> = [1, 2, 3]
+            .into_iter()
+            .map(|i| (i, blank_entry(1, i)))
+            .collect();
+        let mut applied = applied_at(2);
+        assert!(!reconcile_torn_recovery(&mut log, &mut applied));
+        assert_eq!(log.len(), 3, "log preserved for follower replication");
+        assert_eq!(applied.last_purged, None);
+    }
+
+    #[test]
+    fn reconcile_repairs_an_applied_pointer_beyond_a_lost_log() {
+        // Applied through index 3, but every log entry was lost on the crash.
+        let mut log: BTreeMap<u64, Entry<NodusTypeConfig>> = BTreeMap::new();
+        let mut applied = applied_at(3);
+        let applied_id = applied.last_applied;
+        assert!(reconcile_torn_recovery(&mut log, &mut applied));
+        // Reported as purged through the applied watermark, so openraft serves
+        // it from the snapshot/state machine instead of reading a missing entry.
+        assert_eq!(applied.last_purged, applied_id);
+        assert!(log.is_empty());
+    }
+
+    #[test]
+    fn reconcile_drops_a_partial_applied_prefix() {
+        // Applied through 3, but only 1,2 survived (index 3's append was lost).
+        let mut log: BTreeMap<u64, Entry<NodusTypeConfig>> =
+            [1, 2].into_iter().map(|i| (i, blank_entry(1, i))).collect();
+        let mut applied = applied_at(3);
+        assert!(reconcile_torn_recovery(&mut log, &mut applied));
+        assert_eq!(applied.last_purged, applied.last_applied);
+        assert!(
+            log.is_empty(),
+            "stale applied entries dropped below the purge watermark"
+        );
+    }
+
+    /// A torn crash that durably keeps the applied-state pointer but loses the
+    /// log entries it refers to must recover into an openraft-consistent state,
+    /// not one that reads a compacted index and aborts `Raft::new`.
+    #[tokio::test]
+    async fn recovery_repairs_an_applied_pointer_that_outlives_the_log() {
+        let kv: Arc<dyn KvEngine> = Arc::new(nodus_storage_mem::MemKvEngine::new());
+        {
+            let mut store = NodusRaftStore::with_kv(kv.clone());
+            store
+                .append_to_log(vec![blank_entry(1, 1), blank_entry(1, 2)])
+                .await
+                .unwrap();
+            store
+                .apply_to_state_machine(&[blank_entry(1, 1), blank_entry(1, 2)])
+                .await
+                .unwrap();
+        }
+        // Simulate the torn durability: the applied-state record survived, but
+        // the log entries (separate KV records) did not.
+        let meta = RaftMetaStore::new(kv.clone());
+        meta.delete_entry(1);
+        meta.delete_entry(2);
+
+        // Reopen — recovery must reconcile rather than expose a torn view.
+        let mut store = NodusRaftStore::with_kv(kv.clone());
+        let state = store.get_log_state().await.unwrap();
+        assert_eq!(
+            state.last_log_id.map(|l| l.index),
+            Some(2),
+            "last_log_id still covers the applied pointer"
+        );
+        assert_eq!(
+            state.last_purged_log_id.map(|l| l.index),
+            Some(2),
+            "the lost applied prefix is reported as purged"
+        );
+        // `(last_purged, last_log_id]` is empty, so no phantom log reads remain.
+        assert!(
+            store.try_get_log_entries(1..=2).await.unwrap().is_empty(),
+            "no stale entries below the purge watermark"
         );
     }
 
