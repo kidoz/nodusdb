@@ -198,6 +198,39 @@ impl MemTxnManager {
         })
     }
 
+    /// Drops transaction records that can no longer affect a conflict check, so
+    /// the records map stays bounded instead of retaining every transaction ever
+    /// run. A committed record is only a conflict source for a future committer
+    /// whose `read_ts` is below its `commit_ts`; once `commit_ts` is at or below
+    /// the oldest still-open `read_ts` (and ≤ every future `read_ts`, since the
+    /// clock only advances), it can never conflict again. Aborted records never
+    /// participate in the check at all.
+    fn reap_finished(records: &mut HashMap<TxnId, TxnRecord>) {
+        let is_open = |s: TxnState| {
+            matches!(
+                s,
+                TxnState::Pending | TxnState::Writing | TxnState::Prepared | TxnState::Resolving
+            )
+        };
+        let watermark = records
+            .values()
+            .filter(|r| is_open(r.state))
+            .map(|r| r.read_ts)
+            .min();
+        records.retain(|_, r| match r.state {
+            s if is_open(s) => true,
+            TxnState::Aborted => false,
+            // With no open readers, no future committer can have a read_ts below
+            // any existing commit_ts, so every committed record is reapable.
+            TxnState::Committed => match (watermark, r.commit_ts) {
+                (Some(w), Some(c)) => c >= w,
+                _ => false,
+            },
+            // Unreachable: every other state is covered by `is_open` above.
+            _ => true,
+        });
+    }
+
     /// Guarantees `ts` is covered by a durable reservation before it is handed
     /// out as a commit timestamp. Persists a new window only when crossing the
     /// current reservation, so the durable write is amortized.
@@ -276,8 +309,8 @@ impl TxnManager for MemTxnManager {
                 // Check intersection
                 for key in &write_set {
                     if other.write_set.contains(key) {
-                        // Conflict detected
-                        guard.get_mut(&txn_id).unwrap().state = TxnState::Aborted;
+                        // Conflict detected — the txn is aborted; drop its record.
+                        guard.remove(&txn_id);
                         anyhow::bail!("Write-write conflict detected on key. Transaction aborted.");
                     }
                 }
@@ -298,19 +331,25 @@ impl TxnManager for MemTxnManager {
         let record_mut = guard.get_mut(&txn_id).unwrap();
         record_mut.state = TxnState::Committed;
         record_mut.commit_ts = Some(commit_ts);
+        // Bound the records map: reclaim finished transactions that can no longer
+        // be a conflict source now that this commit advanced the timeline.
+        Self::reap_finished(&mut guard);
         Ok(commit_ts)
     }
 
     fn abort_txn(&self, txn_id: TxnId) -> Result<()> {
         let mut guard = self.records.write().unwrap();
-        if let Some(record) = guard.get_mut(&txn_id) {
-            if record.state == TxnState::Committed {
+        match guard.get(&txn_id) {
+            Some(record) if record.state == TxnState::Committed => {
                 anyhow::bail!("Cannot abort already committed transaction");
             }
-            record.state = TxnState::Aborted;
-            Ok(())
-        } else {
-            anyhow::bail!("Transaction {} not found", txn_id.0);
+            Some(_) => {
+                // An aborted transaction never participates in a conflict check,
+                // so drop its record immediately rather than retaining it.
+                guard.remove(&txn_id);
+                Ok(())
+            }
+            None => anyhow::bail!("Transaction {} not found", txn_id.0),
         }
     }
 
@@ -364,6 +403,28 @@ mod tests {
 
         // Aborting already committed should fail
         assert!(manager.abort_txn(txn.txn_id).is_err());
+    }
+
+    #[test]
+    fn finished_transactions_are_reaped() {
+        let manager = MemTxnManager::new();
+        for _ in 0..50 {
+            let t = manager.begin_txn().unwrap();
+            manager.commit_txn(t.txn_id).unwrap();
+        }
+        for _ in 0..50 {
+            let t = manager.begin_txn().unwrap();
+            manager.abort_txn(t.txn_id).unwrap();
+        }
+        // Nothing is still open, so no record is retained.
+        assert_eq!(manager.records.read().unwrap().len(), 0);
+
+        // A committed record must be retained while an older reader is still
+        // open — it could be a conflict source when that reader commits.
+        let _reader = manager.begin_txn().unwrap(); // low read_ts, stays open
+        let writer = manager.begin_txn().unwrap();
+        manager.commit_txn(writer.txn_id).unwrap();
+        assert_eq!(manager.records.read().unwrap().len(), 2);
     }
 
     #[test]
