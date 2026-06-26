@@ -99,9 +99,9 @@ impl NodusCopyHandler {
             let plan = nodus_executor::plan_statement(&stmt, &[])?;
             output = Some(executor.execute_logical(ctx, plan)?);
         }
-        output
-            .map(|o| o.types)
-            .ok_or_else(|| anyhow::anyhow!("could not resolve COPY column types for {}", spec.table))
+        output.map(|o| o.types).ok_or_else(|| {
+            anyhow::anyhow!("could not resolve COPY column types for {}", spec.table)
+        })
     }
 }
 

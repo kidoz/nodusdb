@@ -509,8 +509,7 @@ mod tests {
 
     #[test]
     fn parses_binary_format_header() {
-        let spec =
-            parse_copy_header("COPY t (id, name) FROM stdin (FORMAT BINARY)").unwrap();
+        let spec = parse_copy_header("COPY t (id, name) FROM stdin (FORMAT BINARY)").unwrap();
         assert_eq!(spec.columns, vec!["id", "name"]);
         assert_eq!(spec.format, CopyFormat::Binary);
     }
