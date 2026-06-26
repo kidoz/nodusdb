@@ -706,33 +706,49 @@ async fn create_backup(
             }
         }
     } else {
-        match state.kv.scan(range, u64::MAX) {
+        // A consistent base snapshot: `scan_versions` takes an atomic
+        // memtable+sstable read, so every key reflects one logical point in time
+        // (no torn mid-scan reads that a per-key `scan(.., u64::MAX)` allows) and
+        // it carries tombstones, so deletes survive a restore instead of
+        // resurrecting. Collapse the version history to the latest version per
+        // key to keep the base dump compact.
+        let mut latest: std::collections::HashMap<Vec<u8>, (u64, Option<Vec<u8>>)> =
+            std::collections::HashMap::new();
+        match state.kv.scan_versions(range, 0, u64::MAX) {
             Ok(iter) => {
-                for pair_res in iter {
-                    match pair_res {
-                        Ok(pair) => {
-                            // See the version-scan branch: exclude the HLC
-                            // watermark reservation from the snapshot's logical
-                            // time while still backing the key up.
-                            if pair.key.as_ref() != crate::HLC_WATERMARK_KEY {
-                                max_kv_version = max_kv_version.max(pair.version);
+                for version_res in iter {
+                    match version_res {
+                        Ok(version) => {
+                            let key = version.key.to_vec();
+                            let value = version.value.as_ref().map(|value| value.to_vec());
+                            let slot = latest.entry(key).or_insert((0, None));
+                            if version.version >= slot.0 {
+                                *slot = (version.version, value);
                             }
-                            kv_dump.push(json!({
-                                "key": pair.key.to_vec(),
-                                "value": pair.value.to_vec(),
-                                "deleted": false,
-                                "version": pair.version,
-                            }));
                         }
                         Err(e) => {
                             return Json(json!({
-                                "error": format!("Failed to scan KV pair: {e}")
+                                "error": format!("Failed to scan KV version: {e}")
                             }));
                         }
                     }
                 }
             }
             Err(e) => return Json(json!({ "error": format!("Failed to start KV scan: {e}") })),
+        }
+        for (key, (version, value)) in latest {
+            // Exclude the HLC watermark reservation from the snapshot's logical
+            // time (it is committed ahead of wall time) while still backing it up.
+            if key.as_slice() != crate::HLC_WATERMARK_KEY {
+                max_kv_version = max_kv_version.max(version);
+            }
+            let deleted = value.is_none();
+            kv_dump.push(json!({
+                "key": key,
+                "value": value,
+                "deleted": deleted,
+                "version": version,
+            }));
         }
     }
 
