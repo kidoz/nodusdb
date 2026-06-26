@@ -113,13 +113,17 @@ async fn replicate(
     cmd: ShardCommand,
     http: &reqwest::Client,
 ) -> WriteResult {
+    // A stable id for this logical write, shared across every retry/forward
+    // below, so the leader can dedup a re-forwarded write whose prior response
+    // was lost (see `RequestDedup`) instead of applying it twice.
+    let request_id = uuid::Uuid::new_v4().to_string();
     for _ in 0..25 {
         match raft.client_write(cmd.clone()).await {
             Ok(_) => return Ok(()),
             Err(RaftError::APIError(ClientWriteError::ForwardToLeader(ForwardToLeader {
                 leader_node: Some(node),
                 ..
-            }))) => match forward(http, &node.addr, group_id, &cmd).await {
+            }))) => match forward(http, &node.addr, group_id, &cmd, &request_id).await {
                 Ok(()) => return Ok(()),
                 // The leader may have just changed; re-evaluate after a beat.
                 Err(e) => {
@@ -138,16 +142,19 @@ async fn replicate(
     Err(anyhow!("raft write to '{group_id}' did not reach a leader"))
 }
 
-/// Posts a command to `addr`'s leader-side write endpoint for `group_id`.
+/// Posts a command to `addr`'s leader-side write endpoint for `group_id`,
+/// tagging it with `request_id` so the leader can dedup a retried forward.
 async fn forward(
     http: &reqwest::Client,
     addr: &str,
     group_id: &str,
     cmd: &ShardCommand,
+    request_id: &str,
 ) -> WriteResult {
     let url = format!("http://{addr}/raft/{group_id}/write");
     let resp = http
         .post(&url)
+        .header(nodus_raftstore::server::REQUEST_ID_HEADER, request_id)
         .json(cmd)
         .send()
         .await
