@@ -58,6 +58,12 @@ pub struct AdminState {
     /// Serializes backup restores so two never interleave their catalog/KV
     /// mutations into a corrupt result.
     pub restore_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Set while a restore mutates the engine; the executor rejects statements
+    /// while it is set, so no query observes a partially restored state.
+    pub restoring: Arc<AtomicBool>,
+    /// Drain/exclusion gate shared with the executor: a restore takes the write
+    /// guard to drain in-flight statements and run with exclusive access.
+    pub restore_gate: Arc<std::sync::RwLock<()>>,
 }
 
 /// Rejects requests lacking a valid `Authorization: Bearer <token>` header when
@@ -791,20 +797,19 @@ pub struct RestoreQuery {
 /// **before** mutating anything — so a malformed backup is rejected with zero
 /// changes instead of leaving the catalog and KV in an inconsistent half-restored
 /// state. Catalog is imported before KV so a catalog failure leaves no orphan
-/// rows. (Full isolation from concurrent queries and rollback of a mid-write
-/// engine failure still require offline staging — tracked as follow-up.)
-fn apply_restore(
-    objects: &[BackupObject],
-    pitr: Option<(
-        nodus_backup::PitrRestorePlan,
-        Vec<nodus_backup::PitrWalSegmentBytes>,
-    )>,
-    kv: &dyn nodus_storage_api::KvEngine,
-    catalog_writer: &dyn CatalogWriter,
-    wal_key: Option<[u8; 32]>,
-) -> anyhow::Result<nodus_backup::PitrReplayReport> {
-    // 1. Validate all inputs parse, mutating nothing.
-    let mut catalog_snapshot: Option<CatalogSnapshot> = None;
+/// rows. Validation is separated from mutation so the caller can fence queries
+/// only once mutation begins: a validation failure changes nothing, while a
+/// failure after mutation has begun keeps the engine fenced (fail-closed) so a
+/// partially restored state is never served.
+type PitrInput = (
+    nodus_backup::PitrRestorePlan,
+    Vec<nodus_backup::PitrWalSegmentBytes>,
+);
+
+/// Validates that every backup object parses, mutating nothing. Returns the
+/// parsed catalog snapshot (if present) for the mutation phase.
+fn validate_restore_objects(objects: &[BackupObject]) -> anyhow::Result<Option<CatalogSnapshot>> {
+    let mut catalog_snapshot = None;
     for obj in objects {
         match obj.name.as_str() {
             "catalog.json" => {
@@ -820,8 +825,19 @@ fn apply_restore(
             _ => {}
         }
     }
+    Ok(catalog_snapshot)
+}
 
-    // 2. Mutate: catalog first, then KV, then WAL replay.
+/// Applies a validated restore to the engine: catalog first, then KV, then WAL
+/// replay. Mutates; must run with queries fenced.
+fn apply_restore_mutations(
+    objects: &[BackupObject],
+    catalog_snapshot: Option<CatalogSnapshot>,
+    pitr: Option<PitrInput>,
+    kv: &dyn nodus_storage_api::KvEngine,
+    catalog_writer: &dyn CatalogWriter,
+    wal_key: Option<[u8; 32]>,
+) -> anyhow::Result<nodus_backup::PitrReplayReport> {
     if let Some(snapshot) = catalog_snapshot {
         catalog_writer.import_snapshot(snapshot)?;
     }
@@ -837,6 +853,19 @@ fn apply_restore(
         }
         None => Ok(base_report),
     }
+}
+
+/// Validates then applies a restore in one step (used by tests).
+#[cfg(test)]
+fn apply_restore(
+    objects: &[BackupObject],
+    pitr: Option<PitrInput>,
+    kv: &dyn nodus_storage_api::KvEngine,
+    catalog_writer: &dyn CatalogWriter,
+    wal_key: Option<[u8; 32]>,
+) -> anyhow::Result<nodus_backup::PitrReplayReport> {
+    let catalog_snapshot = validate_restore_objects(objects)?;
+    apply_restore_mutations(objects, catalog_snapshot, pitr, kv, catalog_writer, wal_key)
 }
 
 async fn restore_backup(
@@ -890,14 +919,33 @@ async fn restore_backup(
     let kv = state.kv.clone();
     let catalog_writer = state.catalog_writer.clone();
     let wal_key = state.wal_key;
+    let restoring = state.restoring.clone();
+    let restore_gate = state.restore_gate.clone();
     let replay = tokio::task::spawn_blocking(move || {
-        apply_restore(
+        // Validate first — a bad backup changes nothing and must not fence.
+        let catalog_snapshot = validate_restore_objects(&objects)?;
+
+        // Begin fencing: reject new statements, then take the exclusive gate,
+        // which blocks until every in-flight statement has drained. From here no
+        // query can observe the engine until we finish.
+        restoring.store(true, std::sync::atomic::Ordering::Release);
+        let _exclusive = restore_gate.write().unwrap();
+
+        let result = apply_restore_mutations(
             &objects,
+            catalog_snapshot,
             pitr,
             kv.as_ref(),
             catalog_writer.as_ref(),
             wal_key,
-        )
+        );
+        // On success, resume serving. On a mid-write failure, stay fenced
+        // (fail-closed) so a partially restored state is never served; the
+        // idempotent restore can be retried to completion.
+        if result.is_ok() {
+            restoring.store(false, std::sync::atomic::Ordering::Release);
+        }
+        result
     })
     .await;
 
@@ -908,8 +956,16 @@ async fn restore_backup(
             "pitr": pitr_response,
             "replay": report,
         })),
-        Ok(Err(e)) => Json(json!({ "restored": 0, "error": e.to_string() })),
-        Err(e) => Json(json!({ "restored": 0, "error": e.to_string() })),
+        Ok(Err(e)) => Json(json!({
+            "restored": 0,
+            "error": e.to_string(),
+            "queries_fenced": state.restoring.load(std::sync::atomic::Ordering::Acquire),
+        })),
+        Err(e) => Json(json!({
+            "restored": 0,
+            "error": format!("restore task failed: {e}"),
+            "queries_fenced": state.restoring.load(std::sync::atomic::Ordering::Acquire),
+        })),
     }
 }
 

@@ -184,6 +184,26 @@ fn create_insert_select_round_trip() {
 }
 
 #[test]
+fn execution_is_fenced_while_restoring() {
+    use std::sync::atomic::Ordering;
+    let (exec, _cat) = MemExecutor::shared(Arc::new(MemoryAuditSink::new()));
+    let ctx = ctx_for(nodus_catalog::PrincipalId::new());
+
+    // While a restore is in progress, every statement is rejected up front so it
+    // cannot observe partially restored state.
+    exec.restoring_flag().store(true, Ordering::SeqCst);
+    let err = exec.execute_logical(&ctx, LogicalPlan::Begin).unwrap_err();
+    assert!(
+        err.to_string().contains("restore in progress"),
+        "expected fence error, got: {err}"
+    );
+
+    // Clearing the flag resumes normal execution.
+    exec.restoring_flag().store(false, Ordering::SeqCst);
+    assert!(exec.execute_logical(&ctx, LogicalPlan::Begin).is_ok());
+}
+
+#[test]
 fn rows_keyed_by_declared_pk_not_first_column() {
     // Regression: rows must be keyed by the declared PRIMARY KEY, not the first
     // column. Here the PK is the *second* column; the first column is not unique.

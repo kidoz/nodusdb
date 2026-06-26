@@ -225,6 +225,13 @@ pub struct MemExecutor {
     /// a map of lowercased variable name to its set value. Cleared on session
     /// end so it cannot grow unbounded. See [`crate::session_vars`].
     pub(crate) session_vars: std::sync::RwLock<HashMap<String, HashMap<String, String>>>,
+    /// Set while a restore is replacing the engine's data: new statements are
+    /// rejected so no query observes a partially restored state.
+    pub(crate) restoring: Arc<std::sync::atomic::AtomicBool>,
+    /// Drain/exclusion gate for restores. Each statement holds a read guard for
+    /// its duration; a restore takes the write guard, which blocks until every
+    /// in-flight statement has drained and then runs with exclusive access.
+    pub(crate) restore_gate: Arc<std::sync::RwLock<()>>,
 }
 
 impl MemExecutor {
@@ -245,7 +252,21 @@ impl MemExecutor {
             txn,
             active_txns: std::sync::RwLock::new(HashMap::new()),
             session_vars: std::sync::RwLock::new(HashMap::new()),
+            restoring: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            restore_gate: Arc::new(std::sync::RwLock::new(())),
         }
+    }
+
+    /// Shared handle to the restore-in-progress flag, so the admin restore path
+    /// can fence query execution while it replaces engine data.
+    pub fn restoring_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        self.restoring.clone()
+    }
+
+    /// Shared handle to the restore drain/exclusion gate (take the write guard to
+    /// drain in-flight statements and run a restore with exclusive access).
+    pub fn restore_gate(&self) -> Arc<std::sync::RwLock<()>> {
+        self.restore_gate.clone()
     }
 
     /// Builds an executor over durable components (custom LSM + catalog snapshot)
@@ -594,6 +615,16 @@ impl Default for MemExecutor {
 
 impl Executor for MemExecutor {
     fn execute_logical(&self, ctx: &ExecutionContext, plan: LogicalPlan) -> Result<QueryOutput> {
+        // Fence query execution during a restore: reject new statements, and
+        // hold a drain guard for the rest of this call so a concurrently
+        // starting restore waits for us to finish before mutating the engine.
+        // Together this guarantees no statement ever observes a partially
+        // restored state.
+        if self.restoring.load(std::sync::atomic::Ordering::Acquire) {
+            anyhow::bail!("restore in progress; retry shortly");
+        }
+        let _drain_guard = self.restore_gate.read().unwrap();
+
         let is_txn_control = matches!(
             plan,
             LogicalPlan::Begin

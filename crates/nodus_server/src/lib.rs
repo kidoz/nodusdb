@@ -784,6 +784,8 @@ pub async fn run_server_with_config(
         raft_state: raft_state.clone(),
         membership_lock: Arc::new(tokio::sync::Mutex::new(())),
         restore_lock: Arc::new(tokio::sync::Mutex::new(())),
+        restoring: executor.restoring_flag(),
+        restore_gate: executor.restore_gate(),
     };
 
     let app = Router::new()
