@@ -560,6 +560,113 @@ fn test_secondary_indexing() {
     assert_eq!(render_row(&out_b2.rows[0])[0], "1");
 }
 
+/// An index value containing the `:` key separator must not over-match a prefix
+/// lookup: `category = 'a'` must not return the row whose category is `'a:b'`.
+#[test]
+fn test_index_value_containing_separator_does_not_overmatch() {
+    use super::*;
+    let (exec, cat) = MemExecutor::shared(Arc::new(MemoryAuditSink::new()));
+    let admin = cat
+        .create_role(nodus_catalog::CreateRoleRequest {
+            id: nodus_catalog::PrincipalId::new(),
+            name: "admin".into(),
+            principal_type: nodus_catalog::PrincipalType::User,
+            database_id: None,
+        })
+        .unwrap();
+    cat.grant_privilege(nodus_catalog::GrantPrivilegeRequest {
+        id: nodus_catalog::GrantId::new(),
+        principal_id: admin.id,
+        resource: nodus_catalog::ResourceRef::System,
+        privilege: "ALL".into(),
+    })
+    .unwrap();
+    let ctx = test_ctx(admin.id);
+
+    exec.execute_logical(
+        &ctx,
+        LogicalPlan::CreateTable {
+            constraints: vec![],
+            name: "labels".into(),
+            columns: vec![
+                ColumnDef {
+                    name: "id".into(),
+                    data_type: "INT".into(),
+                    nullable: false,
+                    unique: true,
+                    primary: true,
+                },
+                ColumnDef {
+                    name: "tag".into(),
+                    data_type: "TEXT".into(),
+                    nullable: false,
+                    unique: false,
+                    primary: false,
+                },
+            ],
+        },
+    )
+    .unwrap();
+    exec.execute_logical(
+        &ctx,
+        LogicalPlan::Insert {
+            table_name: "labels".into(),
+            columns: vec![],
+            // "a:b" would, unescaped, share the `i:{id}:a:` scan prefix of "a".
+            values_list: vec![
+                vec![Value::Int(1), Value::Text("a:b".into())],
+                vec![Value::Int(2), Value::Text("a".into())],
+            ],
+            returning: vec![],
+        },
+    )
+    .unwrap();
+    exec.execute_logical(
+        &ctx,
+        LogicalPlan::CreateIndex {
+            name: "idx_tag".into(),
+            table_name: "labels".into(),
+            columns: vec!["tag".into()],
+            unique: false,
+            if_not_exists: false,
+        },
+    )
+    .unwrap();
+
+    let lookup = |needle: &str| {
+        exec.execute_logical(
+            &ctx,
+            LogicalPlan::Select {
+                ctes: vec![],
+                table_alias: None,
+                table_name: "labels".into(),
+                joins: vec![],
+                projection: vec![ProjectionItem::Column("id".into())],
+                group_by: vec![],
+                filter: Some(FilterExpr::Predicate(Predicate {
+                    left: "tag".into(),
+                    op: CompareOp::Eq,
+                    right: Operand::Literal(Value::Text(needle.into())),
+                })),
+                having: None,
+                order_by: vec![("id".into(), true)],
+                limit: None,
+                offset: None,
+                distinct: false,
+            },
+        )
+        .unwrap()
+    };
+
+    let a = lookup("a");
+    assert_eq!(a.rows.len(), 1, "lookup 'a' must not match 'a:b'");
+    assert_eq!(render_row(&a.rows[0])[0], "2");
+
+    let ab = lookup("a:b");
+    assert_eq!(ab.rows.len(), 1, "lookup 'a:b' returns exactly its row");
+    assert_eq!(render_row(&ab.rows[0])[0], "1");
+}
+
 #[test]
 fn test_alter_table_migrations() {
     use super::*;

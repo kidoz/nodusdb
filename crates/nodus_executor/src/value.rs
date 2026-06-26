@@ -232,8 +232,36 @@ pub(crate) fn compare(a: &Value, b: &Value) -> std::cmp::Ordering {
     match (a, b) {
         (Value::Int(x), Value::Int(y)) => x.cmp(y),
         (Value::Float(x), Value::Float(y)) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
+        // Mixed numeric operands must compare by value, not by their rendered
+        // text — otherwise e.g. `Int(9)` vs `Float(10.0)` would compare "9" > "10"
+        // lexically and silently corrupt WHERE/ORDER BY/MIN/MAX/join results.
+        (Value::Int(x), Value::Float(y)) => (*x as f64).partial_cmp(y).unwrap_or(Ordering::Equal),
+        (Value::Float(x), Value::Int(y)) => x.partial_cmp(&(*y as f64)).unwrap_or(Ordering::Equal),
         (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
         (Value::Text(x), Value::Text(y)) => x.cmp(y),
         _ => render(a).cmp(&render(b)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cmp::Ordering;
+
+    #[test]
+    fn mixed_int_float_compares_numerically_not_lexically() {
+        // The lexical bug: "9" > "10". Numerically 9 < 10.
+        assert_eq!(compare(&Value::Int(9), &Value::Float(10.0)), Ordering::Less);
+        assert_eq!(
+            compare(&Value::Float(10.0), &Value::Int(9)),
+            Ordering::Greater
+        );
+        assert_eq!(compare(&Value::Int(2), &Value::Float(2.0)), Ordering::Equal);
+        assert_eq!(
+            compare(&Value::Float(2.5), &Value::Int(2)),
+            Ordering::Greater
+        );
+        // Same-type paths are unaffected.
+        assert_eq!(compare(&Value::Int(9), &Value::Int(10)), Ordering::Less);
     }
 }

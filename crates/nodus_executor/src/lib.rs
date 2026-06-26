@@ -432,9 +432,10 @@ impl MemExecutor {
         session: &str,
     ) -> Result<Vec<Vec<Value>>> {
         let read_ts = self.read_ts(session);
-        let prefix = format!("i:{}:{}:", index_id, render(index_val));
+        let escaped = Self::escape_index_value(&render(index_val));
+        let prefix = format!("i:{}:{}:", index_id, escaped);
         let start = Bytes::from(prefix.clone());
-        let end_prefix = format!("i:{}:{};", index_id, render(index_val));
+        let end_prefix = format!("i:{}:{};", index_id, escaped);
         let end = Bytes::from(end_prefix);
 
         let mut rows = Vec::new();
@@ -527,8 +528,21 @@ impl MemExecutor {
         Ok(())
     }
 
+    /// Escapes an index *value* component so a value containing the `:`
+    /// separator (text, UUIDs, timestamps, …) cannot be confused with the
+    /// value/PK boundary in the `i:{id}:{value}:{pk}` key layout. The PK is the
+    /// open-ended tail and needs no escaping.
+    fn escape_index_value(value: &str) -> String {
+        value.replace('\\', "\\\\").replace(':', "\\:")
+    }
+
     fn index_key(index_id: nodus_catalog::IndexId, index_val: &Value, pk: &str) -> String {
-        format!("i:{}:{}:{}", index_id, render(index_val), pk)
+        format!(
+            "i:{}:{}:{}",
+            index_id,
+            Self::escape_index_value(&render(index_val)),
+            pk
+        )
     }
 
     pub(crate) fn write_index_entry(
