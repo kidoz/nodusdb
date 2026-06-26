@@ -250,7 +250,7 @@ impl RaftMetaStore {
 
     fn save_vote(&self, vote: &Vote<u64>) {
         if let Ok(bytes) = serde_json::to_vec(vote) {
-            self.put(RAFT_VOTE_KEY, bytes);
+            self.put(RAFT_VOTE_KEY, encode_raft(bytes));
         }
     }
 
@@ -259,12 +259,12 @@ impl RaftMetaStore {
             .get(RAFT_VOTE_KEY, u64::MAX)
             .ok()
             .flatten()
-            .and_then(|b| serde_json::from_slice(&b).ok())
+            .and_then(|b| decode_raft(&b).and_then(|p| serde_json::from_slice(p).ok()))
     }
 
     fn append_entry(&self, entry: &Entry<NodusTypeConfig>) {
         if let Ok(bytes) = serde_json::to_vec(entry) {
-            self.put(&log_key(entry.log_id.index), bytes);
+            self.put(&log_key(entry.log_id.index), encode_raft(bytes));
         }
     }
 
@@ -280,7 +280,9 @@ impl RaftMetaStore {
         };
         if let Ok(iter) = self.kv.scan(range, u64::MAX) {
             for pair in iter.flatten() {
-                if let Ok(entry) = serde_json::from_slice::<Entry<NodusTypeConfig>>(&pair.value) {
+                if let Some(entry) = decode_raft(&pair.value)
+                    .and_then(|p| serde_json::from_slice::<Entry<NodusTypeConfig>>(p).ok())
+                {
                     out.insert(entry.log_id.index, entry);
                 }
             }
@@ -290,7 +292,7 @@ impl RaftMetaStore {
 
     fn save_applied(&self, state: &AppliedState) {
         if let Ok(bytes) = serde_json::to_vec(state) {
-            self.put(RAFT_APPLIED_KEY, bytes);
+            self.put(RAFT_APPLIED_KEY, encode_raft(bytes));
         }
     }
 
@@ -299,8 +301,30 @@ impl RaftMetaStore {
             .get(RAFT_APPLIED_KEY, u64::MAX)
             .ok()
             .flatten()
-            .and_then(|b| serde_json::from_slice(&b).ok())
+            .and_then(|b| decode_raft(&b).and_then(|p| serde_json::from_slice(p).ok()))
             .unwrap_or_default()
+    }
+}
+
+/// On-disk format version of persisted Raft records (vote, log entries, applied
+/// state) and the snapshot payload.
+const RAFT_RECORD_VERSION: u16 = 1;
+
+/// Wraps a serialized Raft record in the versioned envelope for storage.
+fn encode_raft(payload: Vec<u8>) -> Vec<u8> {
+    nodus_common::versioned::encode(RAFT_RECORD_VERSION, &payload)
+}
+
+/// Returns the payload of a persisted Raft record for a supported version, or
+/// legacy (pre-envelope) bytes. Returns `None` for an unrecognized future
+/// version, so a load path treats that state as absent — the node re-syncs it
+/// from the leader — rather than misparsing a format it does not understand.
+fn decode_raft(bytes: &[u8]) -> Option<&[u8]> {
+    use nodus_common::versioned::{Envelope, decode};
+    match decode(bytes) {
+        Envelope::Versioned { version, payload } if version == RAFT_RECORD_VERSION => Some(payload),
+        Envelope::Versioned { .. } => None,
+        Envelope::Legacy(legacy) => Some(legacy),
     }
 }
 
@@ -481,7 +505,9 @@ impl RaftSnapshotBuilder<NodusTypeConfig> for NodusRaftStore {
             kv: kv_data,
         };
 
-        let data_bytes = serde_json::to_vec(&snapshot_obj).unwrap_or_else(|_| b"{}".to_vec());
+        let data_bytes = serde_json::to_vec(&snapshot_obj)
+            .map(encode_raft)
+            .unwrap_or_else(|_| b"{}".to_vec());
 
         Ok(Snapshot {
             meta: SnapshotMeta {
@@ -806,7 +832,9 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
         self.persist_applied(&sm);
 
         let data = snapshot.into_inner();
-        if let Ok(snapshot_obj) = serde_json::from_slice::<FullStateSnapshot>(&data) {
+        if let Some(snapshot_obj) =
+            decode_raft(&data).and_then(|p| serde_json::from_slice::<FullStateSnapshot>(p).ok())
+        {
             if let (Some(cat_snap), Some(cat)) = (snapshot_obj.catalog, &sm.catalog_writer) {
                 let _ = cat.import_snapshot(cat_snap);
             }
@@ -838,6 +866,18 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
 mod tests {
     use super::*;
     use nodus_catalog::{CatalogWriter, MemoryCatalog};
+
+    #[test]
+    fn raft_records_round_trip_and_tolerate_legacy_and_future_versions() {
+        // Versioned round-trip.
+        let encoded = encode_raft(b"payload".to_vec());
+        assert_eq!(decode_raft(&encoded), Some(&b"payload"[..]));
+        // Legacy (pre-envelope) bytes pass through unchanged.
+        assert_eq!(decode_raft(b"legacy-json"), Some(&b"legacy-json"[..]));
+        // A record from a newer format decodes as absent, not misparsed.
+        let future = nodus_common::versioned::encode(RAFT_RECORD_VERSION + 1, b"{}");
+        assert_eq!(decode_raft(&future), None);
+    }
 
     fn blank_entry(term: u64, index: u64) -> Entry<NodusTypeConfig> {
         Entry {

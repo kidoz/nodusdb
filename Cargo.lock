@@ -2467,6 +2467,7 @@ dependencies = [
  "axum",
  "bytes",
  "nodus_catalog",
+ "nodus_common",
  "nodus_meta",
  "nodus_sharding",
  "nodus_storage_api",
