@@ -96,6 +96,16 @@ impl MemoryCatalog {
         }
     }
 
+    /// Persists the catalog snapshot, logging (rather than silently dropping) a
+    /// failure. The Raft-replicated catalog log remains the durable source of
+    /// truth — this local snapshot is a fast-start cache rebuilt on replay — so a
+    /// persist failure is surfaced for operators but does not fail the DDL.
+    fn persist(&self) {
+        if let Err(e) = self.save_to_disk() {
+            tracing::error!("catalog snapshot persist failed: {e}");
+        }
+    }
+
     /// Persists the full catalog state through the backing [`CatalogStore`]
     /// (no-op for an in-memory catalog). Durability is the store's concern — the
     /// server backs it with the crash-safe LSM, so this no longer maintains a
@@ -386,7 +396,7 @@ impl CatalogWriter for MemoryCatalog {
         };
         guard.insert(request.name.clone(), desc.clone());
         drop(guard);
-        let _ = self.save_to_disk();
+        self.persist();
         Ok(desc)
     }
 
@@ -410,7 +420,7 @@ impl CatalogWriter for MemoryCatalog {
         };
         guard.insert(key, desc.clone());
         drop(guard);
-        let _ = self.save_to_disk();
+        self.persist();
         Ok(desc)
     }
 
@@ -436,7 +446,7 @@ impl CatalogWriter for MemoryCatalog {
         };
         guard.insert(key, desc.clone());
         drop(guard);
-        let _ = self.save_to_disk();
+        self.persist();
         Ok(desc)
     }
 
@@ -449,7 +459,7 @@ impl CatalogWriter for MemoryCatalog {
         if let Some(key) = key {
             guard.remove(&key);
             drop(guard);
-            let _ = self.save_to_disk();
+            self.persist();
             Ok(())
         } else {
             anyhow::bail!("Table not found")
@@ -465,7 +475,7 @@ impl CatalogWriter for MemoryCatalog {
         if let Some(key) = key {
             guard.remove(&key);
             drop(guard);
-            let _ = self.save_to_disk();
+            self.persist();
             Ok(())
         } else {
             anyhow::bail!("Schema not found")
@@ -487,7 +497,7 @@ impl CatalogWriter for MemoryCatalog {
         };
         guard.push(desc.clone());
         drop(guard);
-        let _ = self.save_to_disk();
+        self.persist();
         Ok(desc)
     }
 
@@ -500,7 +510,7 @@ impl CatalogWriter for MemoryCatalog {
         });
         self.increment_version();
         drop(guard);
-        let _ = self.save_to_disk();
+        self.persist();
         Ok(())
     }
 
@@ -561,6 +571,8 @@ impl CatalogWriter for MemoryCatalog {
 
         let out = table.clone();
         guard.insert(new_key, table);
+        drop(guard);
+        self.persist();
         Ok(out)
     }
 
@@ -581,7 +593,7 @@ impl CatalogWriter for MemoryCatalog {
         };
         guard.insert(request.name.clone(), desc.clone());
         drop(guard);
-        let _ = self.save_to_disk();
+        self.persist();
         Ok(desc)
     }
 
@@ -600,7 +612,7 @@ impl CatalogWriter for MemoryCatalog {
         };
         guard.push(desc.clone());
         drop(guard);
-        let _ = self.save_to_disk();
+        self.persist();
         Ok(desc)
     }
 
@@ -613,7 +625,7 @@ impl CatalogWriter for MemoryCatalog {
         });
         self.increment_version();
         drop(guard);
-        let _ = self.save_to_disk();
+        self.persist();
         Ok(())
     }
 
@@ -625,7 +637,7 @@ impl CatalogWriter for MemoryCatalog {
         }
         self.increment_version();
         drop(guard);
-        let _ = self.save_to_disk();
+        self.persist();
         Ok(())
     }
 
@@ -642,7 +654,7 @@ impl CatalogWriter for MemoryCatalog {
                     idx.index_state = state;
                     self.increment_version();
                     drop(tables);
-                    let _ = self.save_to_disk();
+                    self.persist();
                     return Ok(());
                 }
             }
@@ -668,7 +680,7 @@ impl CatalogWriter for MemoryCatalog {
             .collect();
         // Do not overwrite principals, grants, or roles to preserve server-level auth state
         self.increment_version();
-        let _ = self.save_to_disk();
+        self.persist();
         Ok(())
     }
 }

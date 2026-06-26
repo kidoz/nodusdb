@@ -75,10 +75,16 @@ impl KvEngine for ClockAdvancingKvEngine {
     }
     fn commit(&self, txn_id: TxnId, commit_ts: Timestamp) -> Result<()> {
         self.inner.commit(txn_id, commit_ts)?;
-        // Best-effort: a failed clock persist must not fail the already-durable
-        // commit; the next issued timestamp will reserve again.
+        // The data commit is already durable, so a watermark-persist failure must
+        // not fail it — but it is a real durability hazard (a restart/leadership
+        // change could then issue a commit_ts at or below this applied version),
+        // so surface it at ERROR rather than swallowing it. The next issued
+        // timestamp re-reserves on this node, recovering the watermark.
         if let Err(e) = self.clock.observe_durable(commit_ts) {
-            tracing::warn!("clock advance on applied commit {commit_ts} failed: {e}");
+            tracing::error!(
+                "clock watermark persist failed for applied commit {commit_ts}: {e}; \
+                 commit_ts could regress after a restart until the next reservation"
+            );
         }
         Ok(())
     }

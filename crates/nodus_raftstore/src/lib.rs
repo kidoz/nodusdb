@@ -124,6 +124,20 @@ pub struct ShardResponse {
     pub success: bool,
 }
 
+/// Surfaces a state-machine KV apply failure instead of silently dropping it.
+/// A committed Raft entry whose KV effect fails to apply is a durability concern
+/// (the entry is below the applied watermark yet not reflected in the store), so
+/// it must be visible to operators. It is logged rather than made fatal because
+/// post-crash log replay legitimately re-applies entries above the last
+/// *persisted* applied index, and re-committing an already-applied transaction
+/// returns a benign "intent not found" — distinguishing those from a real I/O
+/// failure needs typed engine errors (a follow-up).
+fn log_apply_kv(command: &str, txn_id: &str, result: Result<(), anyhow::Error>) {
+    if let Err(e) = result {
+        tracing::warn!("Raft apply {command} (txn {txn_id}) KV op failed: {e}");
+    }
+}
+
 /// Logs a catalog-apply failure. State-machine apply must be idempotent: log
 /// replay on restart and the non-idempotent bootstrap both re-issue create
 /// commands. A replay is expected only when the catalog already has the
@@ -675,28 +689,40 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
                                 txn_id, key, value, ..
                             } => {
                                 if let Ok(tid) = uuid::Uuid::from_str(txn_id) {
-                                    let _ = kv.write_intent(
-                                        TxnId(tid),
-                                        Bytes::from(key.clone()),
-                                        Bytes::from(value.clone()),
+                                    log_apply_kv(
+                                        "PutIntent",
+                                        txn_id,
+                                        kv.write_intent(
+                                            TxnId(tid),
+                                            Bytes::from(key.clone()),
+                                            Bytes::from(value.clone()),
+                                        ),
                                     );
                                 }
                             }
                             ShardCommand::DeleteIntent { txn_id, key, .. } => {
                                 if let Ok(tid) = uuid::Uuid::from_str(txn_id) {
-                                    let _ = kv.delete_intent(TxnId(tid), Bytes::from(key.clone()));
+                                    log_apply_kv(
+                                        "DeleteIntent",
+                                        txn_id,
+                                        kv.delete_intent(TxnId(tid), Bytes::from(key.clone())),
+                                    );
                                 }
                             }
                             ShardCommand::CommitTxn {
                                 txn_id, commit_ts, ..
                             } => {
                                 if let Ok(tid) = uuid::Uuid::from_str(txn_id) {
-                                    let _ = kv.commit(TxnId(tid), *commit_ts);
+                                    log_apply_kv(
+                                        "CommitTxn",
+                                        txn_id,
+                                        kv.commit(TxnId(tid), *commit_ts),
+                                    );
                                 }
                             }
                             ShardCommand::AbortTxn { txn_id, .. } => {
                                 if let Ok(tid) = uuid::Uuid::from_str(txn_id) {
-                                    let _ = kv.abort(TxnId(tid));
+                                    log_apply_kv("AbortTxn", txn_id, kv.abort(TxnId(tid)));
                                 }
                             }
                             ShardCommand::PrepareTxn { txn_id, .. } => {
@@ -709,16 +735,24 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
                                 txn_id, key, value, ..
                             } => {
                                 if let Ok(tid) = uuid::Uuid::from_str(txn_id) {
-                                    let _ = kv.write_intent(
-                                        TxnId(tid),
-                                        Bytes::from(key.clone()),
-                                        Bytes::from(value.clone()),
+                                    log_apply_kv(
+                                        "IndexPutIntent",
+                                        txn_id,
+                                        kv.write_intent(
+                                            TxnId(tid),
+                                            Bytes::from(key.clone()),
+                                            Bytes::from(value.clone()),
+                                        ),
                                     );
                                 }
                             }
                             ShardCommand::IndexDeleteIntent { txn_id, key, .. } => {
                                 if let Ok(tid) = uuid::Uuid::from_str(txn_id) {
-                                    let _ = kv.delete_intent(TxnId(tid), Bytes::from(key.clone()));
+                                    log_apply_kv(
+                                        "IndexDeleteIntent",
+                                        txn_id,
+                                        kv.delete_intent(TxnId(tid), Bytes::from(key.clone())),
+                                    );
                                 }
                             }
                             _ => {}
@@ -888,8 +922,16 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
                 use nodus_storage_api::TxnId;
                 for (k, v, version) in snapshot_obj.kv {
                     let tid = TxnId::new();
-                    let _ = kv.write_intent(tid, Bytes::from(k), Bytes::from(v));
-                    let _ = kv.commit(tid, version);
+                    // A fresh txn per key, so any error here is a genuine restore
+                    // failure (not a benign replay duplicate) — surface it.
+                    if let Err(e) = kv
+                        .write_intent(tid, Bytes::from(k), Bytes::from(v))
+                        .and_then(|_| kv.commit(tid, version))
+                    {
+                        tracing::error!(
+                            "snapshot install KV write failed at version {version}: {e}"
+                        );
+                    }
                 }
             }
         }
