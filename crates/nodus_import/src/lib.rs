@@ -606,10 +606,10 @@ mod tests {
 
     impl ImportSink for CollectingSink {
         fn execute(&mut self, stmt: &ImportStatement) -> anyhow::Result<u64> {
-            if let Some(needle) = &self.fail_on {
-                if stmt.sql.contains(needle.as_str()) {
-                    anyhow::bail!("forced failure");
-                }
+            if let Some(needle) = &self.fail_on
+                && stmt.sql.contains(needle.as_str())
+            {
+                anyhow::bail!("forced failure");
             }
             self.executed.push(stmt.sql.clone());
             Ok(stmt.rows)

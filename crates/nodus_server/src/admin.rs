@@ -1303,7 +1303,7 @@ async fn import_dump(
 #[cfg(test)]
 mod import_tests {
     use super::*;
-    use nodus_import::{ImportOptions, ImportSink, import_str};
+    use nodus_import::{ImportOptions, import_str};
 
     /// Imports a dump (schema + COPY data + folded PK) through the in-process
     /// executor, then confirms the rows are queryable.
