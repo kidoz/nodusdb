@@ -12,6 +12,10 @@ Environment=NODUS_CONFIG=/etc/nodus/nodus.toml
 ExecStart=/usr/local/bin/nodus_server
 Restart=on-failure
 RestartSec=5s
+StateDirectory=nodus
+LogsDirectory=nodus
+ConfigurationDirectory=nodus
+UMask=0077
 
 # Hardening
 NoNewPrivileges=true
@@ -19,6 +23,7 @@ ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
 ReadWritePaths=/var/lib/nodus
+ReadWritePaths=/var/log/nodus
 
 [Install]
 WantedBy=multi-user.target

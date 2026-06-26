@@ -9,8 +9,11 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Separate data and backup directories (operational default).
-RUN mkdir -p /var/lib/nodus/data /var/lib/nodus/backups /etc/nodus
+# Separate data, backup, and audit directories (operational default).
+RUN groupadd --system --gid 10001 nodus \
+    && useradd --system --uid 10001 --gid nodus --home-dir /var/lib/nodus --shell /usr/sbin/nologin nodus \
+    && mkdir -p /var/lib/nodus/data /var/lib/nodus/backups /var/log/nodus /etc/nodus \
+    && chown -R nodus:nodus /var/lib/nodus /var/log/nodus
 
 COPY --from=builder /src/target/release/nodus_server /usr/local/bin/nodus_server
 COPY --from=builder /src/target/release/nodus_cli /usr/local/bin/nodusctl
@@ -29,4 +32,5 @@ EXPOSE 5432 8088
 HEALTHCHECK --interval=10s --timeout=3s --retries=5 \
     CMD nodusctl health --addr http://127.0.0.1:8088 || exit 1
 
+USER nodus
 ENTRYPOINT ["/usr/local/bin/nodus_server"]
