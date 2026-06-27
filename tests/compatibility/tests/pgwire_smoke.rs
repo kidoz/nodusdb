@@ -635,6 +635,49 @@ async fn test_simple_query_streams_large_result() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_extended_query_streams_large_result() {
+    let server = TestServer::start().await.expect("server starts");
+    let client = connect(&server).await;
+
+    client
+        .simple_query("CREATE TABLE ebig (id INT PRIMARY KEY, name TEXT);")
+        .await
+        .unwrap();
+
+    const N: usize = 1500;
+    for chunk_start in (0..N).step_by(500) {
+        let mut insert = String::from("INSERT INTO ebig (id, name) VALUES ");
+        for i in chunk_start..(chunk_start + 500).min(N) {
+            if i > chunk_start {
+                insert.push(',');
+            }
+            insert.push_str(&format!("({i}, 'n{i}')"));
+        }
+        insert.push(';');
+        client.simple_query(&insert).await.unwrap();
+    }
+
+    // `query` uses the extended protocol (Parse/Bind/Describe/Execute, max_rows=0),
+    // so this exercises the extended-path streaming.
+    let rows = client.query("SELECT * FROM ebig", &[]).await.unwrap();
+    assert_eq!(rows.len(), N);
+    let mut ids: Vec<i32> = rows
+        .iter()
+        .map(|r| {
+            let id: i32 = r.get(0);
+            let name: &str = r.get(1);
+            assert_eq!(name, format!("n{id}"));
+            id
+        })
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(ids.len(), N);
+    assert_eq!(ids[0], 0);
+    assert_eq!(ids[N - 1], (N - 1) as i32);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_arbitrary_table_sql() {
     let server = TestServer::start().await.expect("server starts");
     let client = connect(&server).await;

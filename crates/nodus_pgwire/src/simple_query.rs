@@ -3,71 +3,26 @@
 //! transaction control, and metadata introspection.
 
 use std::fmt::Debug;
-use std::sync::Arc;
 use std::time::Instant;
 
 use async_trait::async_trait;
 use futures_util::{Sink, SinkExt, StreamExt, stream};
-use nodus_executor::{Row as ExecRow, RowSink};
 use pgwire::api::query::SimpleQueryHandler;
-use pgwire::api::results::{FieldFormat, FieldInfo, QueryResponse, Response, Tag};
+use pgwire::api::results::{FieldFormat, QueryResponse, Response, Tag};
 use pgwire::api::{ClientInfo, PgWireConnectionState};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::PgWireBackendMessage;
 use pgwire::messages::copy::CopyDone;
-use pgwire::messages::data::DataRow;
 use pgwire::messages::response::{CommandComplete, EmptyQueryResponse, ReadyForQuery};
 use pgwire::messages::startup::ParameterStatus;
-use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info};
 
 use crate::client_meta::*;
 use crate::encoding::*;
+use crate::streaming::{join_producer, start_row_stream};
 use crate::wire_format::*;
 use crate::{CurrentQueryGuard, NodusQueryHandler, QueryTimer, execute_off_reactor};
 use crate::{METADATA_COPY_EXTENDED, METADATA_COPY_ROWS, METADATA_COPY_STMT};
-
-/// Bounded in-flight rows between the blocking executor and the socket writer.
-/// Small enough to bound memory, large enough to keep the socket busy; a full
-/// channel back-pressures the producer (it blocks on send) so a slow client
-/// throttles the scan instead of buffering the whole result.
-const STREAM_CHANNEL_CAPACITY: usize = 512;
-
-/// A [`RowSink`] that encodes each row on the blocking executor thread and sends
-/// it to the socket-writing task through a bounded channel. The schema is handed
-/// over once via a oneshot so the writer can emit `RowDescription` before the
-/// first row.
-struct ChannelSink {
-    schema_tx: Option<oneshot::Sender<Arc<Vec<FieldInfo>>>>,
-    row_tx: mpsc::Sender<DataRow>,
-    field_info: Option<Arc<Vec<FieldInfo>>>,
-}
-
-impl RowSink for ChannelSink {
-    fn schema(&mut self, columns: Vec<String>, types: Vec<String>) {
-        let field_info = field_info_for_output(&columns, &types, |_, _| FieldFormat::Text);
-        self.field_info = Some(field_info.clone());
-        if let Some(tx) = self.schema_tx.take() {
-            // A dropped receiver means the writer task went away; the next `row`
-            // send will observe it and stop the producer.
-            let _ = tx.send(field_info);
-        }
-    }
-
-    fn row(&mut self, row: ExecRow) -> anyhow::Result<()> {
-        let field_info = self
-            .field_info
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("row produced before schema"))?;
-        let data_row = encode_row(&row.values, field_info)?;
-        // Blocking send applies back-pressure; an error means the consumer (the
-        // socket writer) has stopped, so abort the scan promptly.
-        self.row_tx
-            .blocking_send(data_row)
-            .map_err(|_| anyhow::anyhow!("client went away"))?;
-        Ok(())
-    }
-}
 
 #[async_trait]
 impl SimpleQueryHandler for NodusQueryHandler {
@@ -460,17 +415,17 @@ impl NodusQueryHandler {
         };
 
         // Producer: the (blocking) executor streams rows into the bounded channel.
-        let (schema_tx, schema_rx) = oneshot::channel::<Arc<Vec<FieldInfo>>>();
-        let (row_tx, mut row_rx) = mpsc::channel::<DataRow>(STREAM_CHANNEL_CAPACITY);
-        let executor = self.executor.clone();
-        let producer = tokio::task::spawn_blocking(move || {
-            let mut sink = ChannelSink {
-                schema_tx: Some(schema_tx),
-                row_tx,
-                field_info: None,
-            };
-            executor.execute_streaming(&ctx, plan, &mut sink)
-        });
+        // The simple-query protocol always uses text format.
+        let crate::streaming::RowStream {
+            schema_rx,
+            mut row_rx,
+            producer,
+        } = start_row_stream(
+            self.executor.clone(),
+            ctx,
+            plan,
+            pgwire::api::portal::Format::UnifiedText,
+        );
 
         let to_exec_error = |e: anyhow::Error, this: &Self| -> PgWireError {
             this.metrics.query_errors_total.inc();
@@ -545,14 +500,4 @@ impl NodusQueryHandler {
             }
         }
     }
-}
-
-/// Awaits the producer task, turning a join failure (panic/cancel) into a
-/// PgWire-level error.
-async fn join_producer(
-    handle: tokio::task::JoinHandle<anyhow::Result<String>>,
-) -> PgWireResult<anyhow::Result<String>> {
-    handle
-        .await
-        .map_err(|e| user_error("ERROR", "XX000", format!("execution task failed: {e}")))
 }

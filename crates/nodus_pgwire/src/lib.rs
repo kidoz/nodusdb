@@ -9,6 +9,7 @@ mod extended_query;
 mod server;
 mod simple_query;
 mod startup;
+mod streaming;
 mod type_map;
 mod wire_format;
 pub use server::start_pgwire_server;

@@ -125,6 +125,157 @@ impl NodusExtendedQueryHandler {
             Err(_) => Vec::new(),
         }
     }
+
+    /// Streams a fetch-all (`max_rows == 0`) parameterless single `SELECT` straight
+    /// to the socket, returning `true` when it handled the execute. Parameterized
+    /// portals and everything else return `false` for the buffered cursor path —
+    /// this targets the unbounded-scan case (e.g. `SELECT * FROM big`) that the
+    /// cursor would otherwise materialize in full. The schema is delivered by a
+    /// prior `Describe`, so only `DataRow`s and `CommandComplete` are emitted here.
+    async fn try_stream_execute<C>(
+        &self,
+        client: &mut C,
+        portal: &Portal<String>,
+    ) -> PgWireResult<bool>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        // Parameterized queries keep the buffered path (decoding params lives in
+        // `do_query`); they are usually filtered and small anyway.
+        if portal.parameter_len() != 0 {
+            return Ok(false);
+        }
+        let raw_sql = &portal.statement.statement;
+        let plan = match nodus_sql::parse_sql(raw_sql) {
+            Ok(stmts) if stmts.len() == 1 => match nodus_executor::plan_statement(&stmts[0], &[]) {
+                Ok(plan @ nodus_executor::LogicalPlan::Select { .. }) => plan,
+                _ => return Ok(false),
+            },
+            _ => return Ok(false),
+        };
+
+        // Mirror `do_query`'s preamble (cancel/terminate, current-query tracking,
+        // timing) for the statements it would otherwise run.
+        self.metrics.queries_total.inc();
+        let session_id = session_id_from_client(client);
+        if self.registry.is_cancelled(&session_id) {
+            self.metrics.query_errors_total.inc();
+            return Err(user_error(
+                "ERROR",
+                "57P01",
+                "session terminated by administrator",
+            ));
+        }
+        if self.registry.is_query_cancelled(&session_id) {
+            self.metrics.query_errors_total.inc();
+            return Err(user_error(
+                "ERROR",
+                "57014",
+                "canceling statement due to user request",
+            ));
+        }
+        self.registry.set_current_query(&session_id, raw_sql);
+        let _current_query = CurrentQueryGuard {
+            registry: &self.registry,
+            session_id: &session_id,
+        };
+        let _timer = QueryTimer {
+            start: std::time::Instant::now(),
+            sql: raw_sql,
+            session_id: &session_id,
+            metrics: &self.metrics,
+            slow_log: &self.slow_log,
+        };
+
+        let principal_id = principal_id_from_client(client);
+        let ctx = nodus_executor::ExecutionContext {
+            session_id: session_id.clone(),
+            principal_id,
+            active_roles: vec![],
+            authz_catalog_version: 1,
+        };
+
+        self.stream_execute(
+            client,
+            ctx,
+            plan,
+            &session_id,
+            portal.result_column_format.clone(),
+        )
+        .await?;
+        Ok(true)
+    }
+
+    /// Streams a SELECT's rows directly to the socket: the (blocking) executor
+    /// produces rows into a bounded channel and we forward each `DataRow` as it
+    /// arrives, back-pressuring the scan on a slow client. No `RowDescription` is
+    /// emitted — under the extended protocol the client got it from `Describe`.
+    async fn stream_execute<C>(
+        &self,
+        client: &mut C,
+        ctx: nodus_executor::ExecutionContext,
+        plan: nodus_executor::LogicalPlan,
+        session_id: &str,
+        format: pgwire::api::portal::Format,
+    ) -> PgWireResult<()>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let crate::streaming::RowStream {
+            schema_rx,
+            mut row_rx,
+            producer,
+        } = crate::streaming::start_row_stream(self.executor.clone(), ctx, plan, format);
+        // Rows are encoded on the producer side; the schema is only needed for
+        // RowDescription, which the extended-protocol client already has.
+        drop(schema_rx);
+
+        let mut count = 0usize;
+        while let Some(data_row) = row_rx.recv().await {
+            client.feed(PgWireBackendMessage::DataRow(data_row)).await?;
+            count += 1;
+            if count.is_multiple_of(1024)
+                && (self.registry.is_query_cancelled(session_id)
+                    || self.registry.is_cancelled(session_id))
+            {
+                drop(row_rx);
+                let _ = producer.await;
+                self.metrics.query_errors_total.inc();
+                mark_error_status(client);
+                return Err(user_error(
+                    "ERROR",
+                    "57014",
+                    "canceling statement due to user request",
+                ));
+            }
+        }
+
+        match crate::streaming::join_producer(producer).await? {
+            Ok(_tag) => {
+                client
+                    .send(PgWireBackendMessage::CommandComplete(
+                        Tag::new("SELECT").with_rows(count).into(),
+                    ))
+                    .await?;
+                Ok(())
+            }
+            Err(e) => {
+                self.metrics.query_errors_total.inc();
+                mark_error_status(client);
+                let msg = e.to_string();
+                let code = sqlstate_for_execution_error(&msg);
+                Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    code.to_owned(),
+                    msg,
+                ))))
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -300,6 +451,12 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
                 && !client
                     .metadata()
                     .contains_key(&described_portal_key(portal_name)));
+
+        // Fetch-all of a single SELECT streams straight to the socket; everything
+        // else (chunked fetches, non-SELECT, batches) takes the buffered path.
+        if max_rows == 0 && self.try_stream_execute(client, portal.as_ref()).await? {
+            return Ok(());
+        }
 
         match self.do_query(client, portal.as_ref(), max_rows).await? {
             Response::EmptyQuery => {
