@@ -16,7 +16,7 @@
 //! `tokio::task::spawn_blocking`), never directly on a reactor worker thread.
 
 use anyhow::{Result, anyhow};
-use nodus_raftstore::{NodusTypeConfig, ShardCommand};
+use nodus_raftstore::{NodusTypeConfig, ShardCommand, ShardResponse};
 use openraft::Raft;
 use openraft::error::{ClientWriteError, ForwardToLeader, RaftError};
 use std::sync::Arc;
@@ -24,7 +24,9 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::multi_raft::MultiRaftManager;
 
-type WriteResult = Result<()>;
+/// The applied command's response (carries the 2PC prepare vote in
+/// [`ShardResponse::success`]).
+type WriteResult = Result<ShardResponse>;
 
 struct WriteRequest {
     shard_id: String,
@@ -83,6 +85,16 @@ impl RaftRouter {
     /// a subsequent local read observes the write (read-your-writes); a non-leader
     /// fails here with `ForwardToLeader`.
     pub fn submit(&self, shard_id: &str, cmd: ShardCommand) -> Result<()> {
+        self.submit_inner(shard_id, cmd).map(|_| ())
+    }
+
+    /// Like [`Self::submit`] but returns the applied [`ShardResponse`], so the
+    /// caller can read its `success` flag — used for the 2PC prepare vote.
+    pub fn submit_voting(&self, shard_id: &str, cmd: ShardCommand) -> Result<ShardResponse> {
+        self.submit_inner(shard_id, cmd)
+    }
+
+    fn submit_inner(&self, shard_id: &str, cmd: ShardCommand) -> Result<ShardResponse> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(WriteRequest {
@@ -119,12 +131,12 @@ async fn replicate(
     let request_id = uuid::Uuid::new_v4().to_string();
     for _ in 0..25 {
         match raft.client_write(cmd.clone()).await {
-            Ok(_) => return Ok(()),
+            Ok(resp) => return Ok(resp.data),
             Err(RaftError::APIError(ClientWriteError::ForwardToLeader(ForwardToLeader {
                 leader_node: Some(node),
                 ..
             }))) => match forward(http, &node.addr, group_id, &cmd, &request_id).await {
-                Ok(()) => return Ok(()),
+                Ok(resp) => return Ok(resp),
                 // The leader may have just changed; re-evaluate after a beat.
                 Err(e) => {
                     tracing::debug!("forward of {group_id} write to {} failed: {e}", node.addr)
@@ -160,7 +172,11 @@ async fn forward(
         .await
         .map_err(|e| anyhow!("forward to {addr}: {e}"))?;
     if resp.status().is_success() {
-        Ok(())
+        // The leader returns the applied ShardResponse so a forwarded prepare's
+        // vote reaches the coordinator.
+        resp.json::<ShardResponse>()
+            .await
+            .map_err(|e| anyhow!("parse forwarded write response from {addr}: {e}"))
     } else {
         Err(anyhow!(
             "leader {addr} rejected forwarded write: {}",

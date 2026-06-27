@@ -35,6 +35,8 @@ pub struct Metrics {
     pub query_latency_seconds: Histogram,
     /// Cross-shard transactions committed via two-phase commit.
     pub cross_shard_commits_total: Counter,
+    /// Cross-shard transactions aborted because a participant could not prepare.
+    pub cross_shard_aborts_total: Counter,
     /// Cross-shard commits re-driven by startup recovery.
     pub txn_recoveries_total: Counter,
     /// Data-shard Raft groups hosted on this node, and how many lack a leader.
@@ -54,6 +56,7 @@ impl Default for Metrics {
             // ~0.5ms .. ~1s across 12 exponential buckets.
             query_latency_seconds: Histogram::new(exponential_buckets(0.0005, 2.0, 12)),
             cross_shard_commits_total: Counter::default(),
+            cross_shard_aborts_total: Counter::default(),
             txn_recoveries_total: Counter::default(),
             shard_groups: Gauge::default(),
             shard_groups_unavailable: Gauge::default(),
@@ -103,6 +106,11 @@ impl Metrics {
             "nodus_cross_shard_commits_total",
             "Cross-shard transactions committed via two-phase commit",
             m.cross_shard_commits_total.clone(),
+        );
+        registry.register(
+            "nodus_cross_shard_aborts_total",
+            "Cross-shard transactions aborted because a participant could not prepare",
+            m.cross_shard_aborts_total.clone(),
         );
         registry.register(
             "nodus_txn_recoveries_total",

@@ -999,6 +999,8 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
             match &entry.payload {
                 EntryPayload::Normal(cmd) => {
                     tracing::info!("Raft applying command: {:?}", cmd);
+                    // 2PC prepare vote for this entry; only `PrepareTxn` can clear it.
+                    let mut success = true;
                     if let Some(kv) = &sm.kv {
                         use bytes::Bytes;
                         use nodus_storage_api::TxnId;
@@ -1046,10 +1048,23 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
                                 }
                             }
                             ShardCommand::PrepareTxn { txn_id, .. } => {
-                                // Durably acknowledged by virtue of being applied;
-                                // the actual intents are already present. No state
-                                // change — the decision is recorded by the coordinator.
-                                tracing::debug!("Raft prepared txn {txn_id} for commit");
+                                // Real 2PC vote: this participant can commit only if
+                                // it still holds the transaction's intents. A
+                                // vanished intent (lost, aborted, or never
+                                // replicated here) is a NO vote, so the coordinator
+                                // aborts instead of driving a torn commit. Prepare
+                                // changes no state, so re-applying a retried prepare
+                                // re-checks and yields the same vote.
+                                if let Ok(tid) = uuid::Uuid::from_str(txn_id) {
+                                    if kv.pending_intent_keys(TxnId(tid)).is_empty() {
+                                        success = false;
+                                        tracing::warn!(
+                                            "Raft prepare voted NO for txn {txn_id}: no live intents on this participant"
+                                        );
+                                    } else {
+                                        tracing::debug!("Raft prepared txn {txn_id} for commit");
+                                    }
+                                }
                             }
                             ShardCommand::IndexPutIntent {
                                 txn_id, key, value, ..
@@ -1192,7 +1207,7 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
                             _ => {}
                         }
                     }
-                    res.push(ShardResponse { success: true });
+                    res.push(ShardResponse { success });
                 }
                 EntryPayload::Membership(mem) => {
                     sm.last_membership = StoredMembership::new(Some(entry.log_id), mem.clone());

@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use tokio::sync::RwLock;
 
-use crate::{NodusTypeConfig, ShardCommand};
+use crate::{NodusTypeConfig, ShardCommand, ShardResponse};
 
 pub type NodusRaft = Raft<NodusTypeConfig>;
 
@@ -142,21 +142,29 @@ async fn write(
         .and_then(|value| value.to_str().ok())
         .map(|id| id.to_string());
 
+    // `PrepareTxn` changes no state and its vote reflects the *current* intents,
+    // so it is never deduped — a retried prepare must re-vote, not get a stale
+    // ack. All other commands keep dedup to avoid a duplicate Raft log entry.
+    let is_prepare = matches!(cmd, ShardCommand::PrepareTxn { .. });
+
     // A retried forward (the original's response was lost) carries the same
     // request id; if we already applied it, ack without writing a duplicate
     // entry to the Raft log.
-    if let Some(id) = &request_id
+    if !is_prepare
+        && let Some(id) = &request_id
         && state.dedup.lock().unwrap().contains(id)
     {
-        return axum::http::StatusCode::OK.into_response();
+        return axum::Json(ShardResponse { success: true }).into_response();
     }
 
     match raft.client_write(cmd).await {
-        Ok(_) => {
-            if let Some(id) = request_id {
+        Ok(resp) => {
+            if !is_prepare && let Some(id) = request_id {
                 state.dedup.lock().unwrap().record(id);
             }
-            axum::http::StatusCode::OK.into_response()
+            // Return the applied response so a forwarded prepare's vote (and any
+            // other applied result) reaches the forwarding node.
+            axum::Json(resp.data).into_response()
         }
         Err(e) => (axum::http::StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response(),
     }

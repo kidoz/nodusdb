@@ -136,16 +136,40 @@ impl RaftKvEngine {
         let txn = txn_id.0.to_string();
         let _span = tracing::info_span!("txn.cross_shard_commit", txn = %txn, participants = participants.len()).entered();
 
-        // Phase 1 — prepare. Confirms each participant's leader is current and
-        // ready; a failure here aborts before any decision is recorded.
+        // Phase 1 — prepare. Each participant votes whether it can commit: it must
+        // still hold this transaction's intents. Any NO vote — or a participant we
+        // can't reach to ask — aborts the whole transaction before any commit
+        // decision is recorded, so a lost intent can never produce a torn commit.
+        let mut prepared = true;
         for group_id in participants {
-            self.router.submit(
+            match self.router.submit_voting(
                 group_id,
                 ShardCommand::PrepareTxn {
                     txn_id: txn.clone(),
                     shard_id: Self::shard_field(group_id),
                 },
-            )?;
+            ) {
+                Ok(resp) if resp.success => {}
+                Ok(_) => {
+                    tracing::warn!("cross-shard prepare: {group_id} voted NO for txn {txn}");
+                    prepared = false;
+                    break;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "cross-shard prepare: {group_id} unreachable for txn {txn}: {e}"
+                    );
+                    prepared = false;
+                    break;
+                }
+            }
+        }
+        if !prepared {
+            // No decision was recorded, so the intents are simply discarded: the
+            // transaction commits nowhere. Abort every participant to release them.
+            self.abort_participants(&txn, participants);
+            self.metrics.cross_shard_aborts_total.inc();
+            anyhow::bail!("cross-shard transaction aborted: a participant could not prepare");
         }
 
         // Decision point — durably record COMMIT before any participant commits.
@@ -162,6 +186,22 @@ impl RaftKvEngine {
         self.meta_delete_committed(&record_key(&txn), commit_ts + 1)?;
         self.metrics.cross_shard_commits_total.inc();
         Ok(())
+    }
+
+    /// Aborts a transaction on every participant (best-effort): releases their
+    /// intents when a prepare vote fails. Errors are ignored — an unreachable
+    /// participant's intents are uncommitted, hence invisible, so the outcome is
+    /// still "committed nowhere".
+    fn abort_participants(&self, txn: &str, participants: &[String]) {
+        for group_id in participants {
+            let _ = self.router.submit(
+                group_id,
+                ShardCommand::AbortTxn {
+                    txn_id: txn.to_string(),
+                    shard_id: Self::shard_field(group_id),
+                },
+            );
+        }
     }
 
     fn drive_commit(&self, txn: &str, participants: &[String], commit_ts: Timestamp) -> Result<()> {
@@ -600,6 +640,69 @@ mod tests {
             engine.get(row_u.as_bytes(), 100).unwrap(),
             Some(Bytes::from_static(b"vu"))
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cross_shard_commit_aborts_when_a_participant_cannot_prepare() {
+        let fx = setup_two_shards().await;
+        let engine = fx.engine.clone();
+        let row_t = format!("{}:pk", fx.table_t);
+        let row_u = format!("{}:pk", fx.table_u);
+        let group_u = fx.group_u.clone();
+
+        let (e, rt, ru, gu) = (
+            engine.clone(),
+            row_t.clone(),
+            row_u.clone(),
+            group_u.clone(),
+        );
+        let result = tokio::task::spawn_blocking(move || {
+            let txn = TxnId::new();
+            e.write_intent(txn, Bytes::from(rt.into_bytes()), Bytes::from_static(b"vt"))
+                .unwrap();
+            e.write_intent(txn, Bytes::from(ru.into_bytes()), Bytes::from_static(b"vu"))
+                .unwrap();
+            // Simulate group U losing this transaction's intent (GC'd, aborted, or
+            // never replicated there) by aborting it on U alone, before commit.
+            e.router
+                .submit(
+                    &gu,
+                    ShardCommand::AbortTxn {
+                        txn_id: txn.0.to_string(),
+                        shard_id: Some(gu.clone()),
+                    },
+                )
+                .unwrap();
+            // The cross-shard commit must now FAIL (U can't prepare) rather than
+            // committing T and silently dropping U — a torn write.
+            e.commit(txn, 10)
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            result.is_err(),
+            "commit must fail when a participant cannot prepare"
+        );
+        assert_eq!(engine.metrics.cross_shard_aborts_total.get(), 1);
+        assert_eq!(
+            engine.metrics.cross_shard_commits_total.get(),
+            0,
+            "an aborted transaction must not be counted as committed"
+        );
+        // All-or-nothing: neither participant committed.
+        assert_eq!(
+            engine.get(row_t.as_bytes(), 100).unwrap(),
+            None,
+            "T must not commit when U aborts"
+        );
+        assert_eq!(engine.get(row_u.as_bytes(), 100).unwrap(), None);
+        // No commit decision was recorded, so recovery has nothing to re-drive.
+        let e = engine.clone();
+        let pending = tokio::task::spawn_blocking(move || e.recover_pending_txns().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(pending, 0, "no commit decision should have been recorded");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

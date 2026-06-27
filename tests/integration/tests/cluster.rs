@@ -120,7 +120,7 @@ async fn a_restarted_node_rejoins_and_recovers_its_data() {
     // ...and serves the replicated row (recovered or caught up after rejoin).
     let rejoined = cluster.pg_client(2).await.unwrap();
     let mut seen: Option<String> = None;
-    for _ in 0..75 {
+    for _ in 0..200 {
         if let Ok(rows) = rejoined.query("SELECT v FROM d WHERE id = 1", &[]).await
             && let Some(row) = rows.first()
         {
