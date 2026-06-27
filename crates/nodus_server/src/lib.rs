@@ -6,6 +6,7 @@ mod raft_kv;
 mod raft_router;
 mod raft_shard_meta;
 mod raft_upgrade;
+mod tls;
 
 use admin::{AdminState, admin_routes};
 use axum::Router;
@@ -20,12 +21,12 @@ use nodus_security::{PasswordAuthenticator, SessionRegistry};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tls::ReloadableCertResolver;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::RootCertStore;
 use tokio_rustls::rustls::ServerConfig;
-use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_rustls::rustls::server::WebPkiClientVerifier;
 use tower_http::cors::{Any, CorsLayer};
 
@@ -185,9 +186,13 @@ fn bootstrap_catalog_commands(catalog: &dyn CatalogReader) -> Vec<nodus_raftstor
     commands
 }
 
-/// Builds a TLS acceptor from configuration. Returns `None` when TLS is
-/// disabled. Errors if enabled but the cert/key are missing or invalid.
-fn load_tls_config(tls: &nodus_config::TlsConfig) -> anyhow::Result<Option<Arc<ServerConfig>>> {
+/// Builds the pgwire/HTTP TLS config from configuration. Returns `None` when TLS
+/// is disabled. The server certificate is served through a reloadable resolver
+/// (returned alongside the config) so it can be rotated on `SIGHUP`. Errors if
+/// enabled but the cert/key are missing or invalid.
+fn load_tls_config(
+    tls: &nodus_config::TlsConfig,
+) -> anyhow::Result<Option<(Arc<ServerConfig>, Arc<ReloadableCertResolver>)>> {
     if !tls.enabled {
         return Ok(None);
     }
@@ -200,16 +205,7 @@ fn load_tls_config(tls: &nodus_config::TlsConfig) -> anyhow::Result<Option<Arc<S
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("tls.enabled but key_path is unset"))?;
 
-    // Ensure a process-wide crypto provider is available (aws-lc-rs, as enabled
-    // by pgwire). Ignored if one is already installed.
-    let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
-
-    let cert_bytes = std::fs::read(cert_path)?;
-    let certs: Vec<CertificateDer> =
-        rustls_pemfile::certs(&mut cert_bytes.as_slice()).collect::<Result<_, _>>()?;
-    let key_bytes = std::fs::read(key_path)?;
-    let key: PrivateKeyDer = rustls_pemfile::private_key(&mut key_bytes.as_slice())?
-        .ok_or_else(|| anyhow::anyhow!("no private key found in {key_path}"))?;
+    ensure_crypto_provider();
 
     let client_auth = if let Some(ca_path) = &tls.client_ca_path {
         let ca_bytes = std::fs::read(ca_path)?;
@@ -228,10 +224,11 @@ fn load_tls_config(tls: &nodus_config::TlsConfig) -> anyhow::Result<Option<Arc<S
         WebPkiClientVerifier::no_client_auth()
     };
 
+    let resolver = ReloadableCertResolver::load(cert_path, key_path)?;
     let config = ServerConfig::builder()
         .with_client_cert_verifier(client_auth)
-        .with_single_cert(certs, key)?;
-    Ok(Some(Arc::new(config)))
+        .with_cert_resolver(resolver.clone());
+    Ok(Some((Arc::new(config), resolver)))
 }
 
 /// Ensures a process-wide rustls crypto provider is installed (aws-lc-rs).
@@ -247,7 +244,7 @@ fn ensure_crypto_provider() {
 /// only Raft RPCs, never admin/web traffic.
 fn load_raft_tls_config(
     tls: &nodus_config::ClusterTlsConfig,
-) -> anyhow::Result<Option<Arc<ServerConfig>>> {
+) -> anyhow::Result<Option<(Arc<ServerConfig>, Arc<ReloadableCertResolver>)>> {
     if !tls.enabled {
         return Ok(None);
     }
@@ -266,13 +263,6 @@ fn load_raft_tls_config(
 
     ensure_crypto_provider();
 
-    let cert_bytes = std::fs::read(cert_path)?;
-    let certs: Vec<CertificateDer> =
-        rustls_pemfile::certs(&mut cert_bytes.as_slice()).collect::<Result<_, _>>()?;
-    let key_bytes = std::fs::read(key_path)?;
-    let key: PrivateKeyDer = rustls_pemfile::private_key(&mut key_bytes.as_slice())?
-        .ok_or_else(|| anyhow::anyhow!("no private key found in {key_path}"))?;
-
     let ca_bytes = std::fs::read(ca_path)?;
     let mut roots = RootCertStore::empty();
     for cert in rustls_pemfile::certs(&mut ca_bytes.as_slice()) {
@@ -280,10 +270,11 @@ fn load_raft_tls_config(
     }
     let client_auth = WebPkiClientVerifier::builder(roots.into()).build()?;
 
+    let resolver = ReloadableCertResolver::load(cert_path, key_path)?;
     let config = ServerConfig::builder()
         .with_client_cert_verifier(client_auth)
-        .with_single_cert(certs, key)?;
-    Ok(Some(Arc::new(config)))
+        .with_cert_resolver(resolver.clone());
+    Ok(Some((Arc::new(config), resolver)))
 }
 
 /// Builds the outbound Raft RPC transport. With peer TLS disabled this is a
@@ -736,7 +727,12 @@ pub async fn run_server_with_config(
     });
     authenticator.set_password("nodus", admin.id, &admin_password);
 
-    let server_config = load_tls_config(&config.tls)?;
+    // The pgwire and HTTP listeners share one TLS config and its reloadable
+    // certificate resolver (rotated together on SIGHUP).
+    let (server_config, http_tls_resolver) = match load_tls_config(&config.tls)? {
+        Some((cfg, resolver)) => (Some(cfg), Some(resolver)),
+        None => (None, None),
+    };
     let tls_acceptor = server_config
         .as_ref()
         .map(|c| Arc::new(TlsAcceptor::from(c.clone())));
@@ -939,8 +935,11 @@ pub async fn run_server_with_config(
 
     // Dedicated Raft peer listener (separate from admin/web), with mandatory
     // client-certificate mTLS when `cluster.tls` is enabled.
+    let mut raft_tls_resolver: Option<Arc<ReloadableCertResolver>> = None;
     let raft_serve_task = if let Some(addr) = raft_listen_addr.clone() {
-        let raft_server_config = load_raft_tls_config(&config.cluster.tls)?;
+        let raft_tls = load_raft_tls_config(&config.cluster.tls)?;
+        raft_tls_resolver = raft_tls.as_ref().map(|(_, resolver)| resolver.clone());
+        let raft_server_config = raft_tls.map(|(cfg, _)| cfg);
         let raft_listener = TcpListener::bind(&addr).await?;
         let raft_app =
             Router::new().merge(nodus_raftstore::server::raft_routes().with_state(raft_state));
@@ -975,6 +974,50 @@ pub async fn run_server_with_config(
     } else {
         None
     };
+
+    // Hot certificate rotation: on SIGHUP, re-read every TLS listener's
+    // certificate from disk (operators replace the files in place, then signal).
+    // A reload that fails to parse keeps the previous certificate serving.
+    #[cfg(unix)]
+    {
+        let resolvers: Vec<Arc<ReloadableCertResolver>> =
+            [http_tls_resolver.clone(), raft_tls_resolver.clone()]
+                .into_iter()
+                .flatten()
+                .collect();
+        if !resolvers.is_empty() {
+            let mut sighup_shutdown = shutdown.clone();
+            tokio::spawn(async move {
+                let mut hup =
+                    match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
+                        Ok(sig) => sig,
+                        Err(e) => {
+                            tracing::error!("failed to install SIGHUP handler for TLS reload: {e}");
+                            return;
+                        }
+                    };
+                loop {
+                    tokio::select! {
+                        _ = hup.recv() => {
+                            for resolver in &resolvers {
+                                match resolver.reload() {
+                                    Ok(()) => tracing::info!("reloaded TLS certificate on SIGHUP"),
+                                    Err(e) => tracing::error!(
+                                        "TLS certificate reload failed, keeping previous: {e}"
+                                    ),
+                                }
+                            }
+                        }
+                        _ = sighup_shutdown.changed() => break,
+                    }
+                }
+            });
+        }
+    }
+    // `http_tls_resolver` is consumed by the SIGHUP task on unix; reference it on
+    // other platforms so it isn't flagged unused.
+    #[cfg(not(unix))]
+    let _ = &http_tls_resolver;
 
     let metrics_state = state.clone();
     let metrics_manager = multi_raft.clone();
@@ -1180,7 +1223,7 @@ mod tests {
         };
 
         // Server: serve the Raft routes with mandatory client-cert mTLS.
-        let server_cfg = load_raft_tls_config(&cluster.tls).unwrap().unwrap();
+        let (server_cfg, _resolver) = load_raft_tls_config(&cluster.tls).unwrap().unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let app = Router::new().merge(
