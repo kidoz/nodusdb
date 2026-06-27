@@ -161,6 +161,15 @@ impl KvEngine for MemKvEngine {
         Ok(())
     }
 
+    fn pending_intent_keys(&self, txn_id: TxnId) -> Vec<Bytes> {
+        self.intents
+            .read()
+            .unwrap()
+            .get(&txn_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
     fn commit(&self, txn_id: TxnId, commit_ts: Timestamp) -> KvResult<()> {
         let mut store_guard = self.store.write().unwrap();
         let mut intents_guard = self.intents.write().unwrap();

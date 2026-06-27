@@ -92,6 +92,9 @@ impl KvEngine for ClockAdvancingKvEngine {
     fn abort(&self, txn_id: TxnId) -> KvResult<()> {
         self.inner.abort(txn_id)
     }
+    fn pending_intent_keys(&self, txn_id: TxnId) -> Vec<bytes::Bytes> {
+        self.inner.pending_intent_keys(txn_id)
+    }
     fn garbage_collect(&self, watermark: Timestamp) -> Result<usize> {
         self.inner.garbage_collect(watermark)
     }

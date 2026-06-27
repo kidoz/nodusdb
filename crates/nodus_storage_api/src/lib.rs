@@ -113,6 +113,16 @@ pub trait KvEngine: Send + Sync {
     fn commit(&self, txn_id: TxnId, commit_ts: Timestamp) -> KvResult<()>;
     fn abort(&self, txn_id: TxnId) -> KvResult<()>;
 
+    /// Keys on which `txn_id` currently holds uncommitted intents in this engine
+    /// (empty once it commits, aborts, or if it never wrote here). Cross-shard
+    /// 2PC prepare uses this to vote: a participant asked to prepare a
+    /// transaction whose intents have vanished cannot commit it, so it must vote
+    /// no rather than later swallow a missing-intent commit as a benign replay.
+    /// Default: empty — an engine that doesn't track intents reports none.
+    fn pending_intent_keys(&self, _txn_id: TxnId) -> Vec<Bytes> {
+        Vec::new()
+    }
+
     /// Reclaims MVCC versions that no active reader can observe: for each key,
     /// committed versions strictly older than the newest version at or below
     /// `watermark` are removed. `watermark` must be ≤ the oldest active read
@@ -263,6 +273,12 @@ impl KvEngine for NamespacedKvEngine {
 
     fn abort(&self, txn_id: TxnId) -> KvResult<()> {
         self.inner.abort(self.namespaced_txn(txn_id))
+    }
+
+    fn pending_intent_keys(&self, txn_id: TxnId) -> Vec<Bytes> {
+        // The namespaced txn id isolates this group's intents in the shared
+        // inner store, so this is precise per group with no key filtering.
+        self.inner.pending_intent_keys(self.namespaced_txn(txn_id))
     }
 
     fn garbage_collect(&self, watermark: Timestamp) -> Result<usize> {

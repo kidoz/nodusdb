@@ -733,6 +733,15 @@ impl KvEngine for LsmKvEngine {
         Ok(())
     }
 
+    fn pending_intent_keys(&self, txn_id: TxnId) -> Vec<Bytes> {
+        self.intents
+            .read()
+            .unwrap()
+            .get(&txn_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
     fn commit(&self, txn_id: TxnId, commit_ts: Timestamp) -> KvResult<()> {
         {
             let wal_guard = self.wal.read().unwrap();
