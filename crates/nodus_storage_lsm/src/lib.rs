@@ -127,18 +127,25 @@ impl Iterator for LazyMergeScan {
                 .min();
             let min_key = min_key?;
 
-            // Advance every source positioned on this key; the last (highest
-            // precedence) chain wins.
-            let mut chosen: Option<VersionChain> = None;
+            // Merge the version chains of EVERY source holding this key. A key's
+            // history can be split across the memtable and several SSTables (each
+            // flush captures only the versions live at that moment), so the
+            // version visible at `read_ts` may sit in a lower-precedence source.
+            // Reading only the highest-precedence chain (as before) would skip
+            // such a key entirely — silently omitting a row that `get` returns,
+            // because `get` falls through sources. `read`/visibility are
+            // order-independent (max visible version wins, intents excluded), so
+            // concatenating versions is correct, mirroring `scan_versions`.
+            let mut merged = VersionChain::default();
             for source in &mut self.sources {
                 if source.front.as_ref().is_some_and(|(k, _)| *k == min_key) {
-                    chosen = Some(source.front.take().unwrap().1);
+                    let (_, chain) = source.front.take().unwrap();
+                    merged.versions.extend(chain.versions);
                 }
             }
-            let chain = chosen.expect("a source held min_key");
 
-            if let Some(val) = chain.read(self.read_ts) {
-                let version = chain
+            if let Some(val) = merged.read(self.read_ts) {
+                let version = merged
                     .versions
                     .iter()
                     .filter(|v| v.is_visible(self.read_ts))
@@ -887,6 +894,30 @@ mod tests {
 
         // At ts=20 only k1 is visible; k2's only version (ts=30) is in the future.
         assert_eq!(scan_all(&engine, 20), vec![("k1".into(), "a".into())]);
+    }
+
+    #[test]
+    fn scan_finds_an_old_version_split_across_sstables() {
+        let dir = TempDir::new().unwrap();
+        let engine = LsmKvEngine::with_wal(dir.path(), None).unwrap();
+
+        // `k` = v1 @10, flushed to one SSTable; then `k` = v2 @30, flushed to a
+        // second. The two versions of the same key now live in different
+        // SSTables (the normal state between compactions).
+        put(&engine, "k", "v1", 10);
+        engine.flush().unwrap();
+        put(&engine, "k", "v2", 30);
+        engine.flush().unwrap();
+
+        // At read_ts=20 only v1 is visible — and it lives in the *older*,
+        // lower-precedence SSTable. `scan` must find it (merging chains across
+        // sources), agreeing with `get` rather than picking only the newest
+        // SSTable's chain and skipping the key.
+        assert_eq!(engine.get(b"k", 20).unwrap(), Some(Bytes::from("v1")));
+        assert_eq!(scan_all(&engine, 20), vec![("k".into(), "v1".into())]);
+
+        // At read_ts=30 the newer version wins.
+        assert_eq!(scan_all(&engine, 30), vec![("k".into(), "v2".into())]);
     }
 
     #[test]
