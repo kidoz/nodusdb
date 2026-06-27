@@ -9,6 +9,9 @@ use std::sync::{Arc, RwLock};
 use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
+pub mod scram;
+pub use scram::{ClientFirst, ScramError, ScramKeys, ScramVerifier};
+
 /// Compares two byte strings in constant time (independent of where they first
 /// differ), so secret comparisons — passwords, bearer tokens — don't leak their
 /// contents through timing. Returns `false` for differing lengths.
@@ -189,16 +192,16 @@ pub enum AuthError {
     UnknownUser(String),
 }
 
-/// A stored password credential: a random per-user salt plus a PBKDF2-HMAC-SHA256
-/// derived key. The iteration count is stored alongside so the work factor can be
-/// raised later without invalidating existing credentials. Plaintext passwords
-/// are never retained.
+/// A stored credential: the principal it authenticates plus the SCRAM-SHA-256
+/// verifier material (a random per-user salt, the iteration count, and the
+/// derived `StoredKey`/`ServerKey`). The same material backs both the SASL/SCRAM
+/// wire flow and direct password checks (admin Basic auth); the iteration count
+/// is stored alongside so the work factor can be raised later without
+/// invalidating existing credentials. Plaintext passwords are never retained.
 #[derive(Debug, Clone)]
-struct PasswordCredential {
+struct StoredCredential {
     principal_id: PrincipalId,
-    salt: String,
-    iterations: u32,
-    hash: String,
+    keys: ScramKeys,
 }
 
 /// PBKDF2-HMAC-SHA256 work factor. A deliberate cost (vs. a single SHA-256) so an
@@ -208,9 +211,9 @@ const PBKDF2_ITERATIONS: u32 = 100_000;
 type HmacSha256 = Hmac<Sha256>;
 
 /// PBKDF2-HMAC-SHA256 with a single 32-byte output block (`dkLen == hLen`), which
-/// is all a password verifier needs. Implemented over `hmac` directly since no
-/// `pbkdf2` crate is vendored.
-fn pbkdf2_sha256(password: &[u8], salt: &[u8], iterations: u32) -> [u8; 32] {
+/// is exactly the SCRAM `SaltedPassword` for SHA-256. Implemented over `hmac`
+/// directly since no `pbkdf2` crate is vendored.
+pub(crate) fn pbkdf2_sha256(password: &[u8], salt: &[u8], iterations: u32) -> [u8; 32] {
     let prf = |parts: &[&[u8]]| -> [u8; 32] {
         let mut mac = HmacSha256::new_from_slice(password).expect("HMAC accepts any key length");
         for part in parts {
@@ -232,25 +235,18 @@ fn pbkdf2_sha256(password: &[u8], salt: &[u8], iterations: u32) -> [u8; 32] {
     dk
 }
 
-fn hash_password(salt: &str, password: &str) -> String {
-    let dk = pbkdf2_sha256(password.as_bytes(), salt.as_bytes(), PBKDF2_ITERATIONS);
-    let mut hex = String::with_capacity(dk.len() * 2);
-    for byte in dk {
-        use std::fmt::Write;
-        let _ = write!(hex, "{byte:02x}");
-    }
-    hex
-}
-
 /// Authenticates a `(username, password)` pair and issues a [`Session`].
 pub trait Authenticator: Send + Sync {
     fn authenticate(&self, username: &str, password: &str) -> Result<Session, AuthError>;
 }
 
-/// In-memory password authenticator. Role membership for the issued session is
-/// resolved from the catalog so the session reflects current grants.
+/// In-memory credential store. Each password is kept as SCRAM-SHA-256 verifier
+/// material, which serves both the SASL/SCRAM wire handshake (passwords never
+/// cross the wire) and direct password checks for the admin HTTP API. Role
+/// membership for an issued session is resolved from the catalog so the session
+/// reflects current grants.
 pub struct PasswordAuthenticator {
-    credentials: RwLock<HashMap<String, PasswordCredential>>,
+    credentials: RwLock<HashMap<String, StoredCredential>>,
     catalog: Arc<dyn CatalogReader>,
 }
 
@@ -262,20 +258,54 @@ impl PasswordAuthenticator {
         }
     }
 
-    /// Registers (or replaces) a user's password. The salt is generated here so
-    /// callers never deal with hashing.
+    /// Registers (or replaces) a user's password. A fresh 128-bit salt is
+    /// generated here and the SCRAM keys are derived, so callers never deal with
+    /// hashing or the password beyond this call.
     pub fn set_password(&self, username: &str, principal_id: PrincipalId, password: &str) {
-        let salt = Uuid::new_v4().to_string();
-        let hash = hash_password(&salt, password);
+        let salt = Uuid::new_v4().as_bytes().to_vec();
+        let keys = ScramKeys::derive(password, salt, PBKDF2_ITERATIONS);
         self.credentials.write().unwrap().insert(
             username.to_string(),
-            PasswordCredential {
-                principal_id,
-                salt,
-                iterations: PBKDF2_ITERATIONS,
-                hash,
-            },
+            StoredCredential { principal_id, keys },
         );
+    }
+
+    /// Returns the stored SCRAM verifier material for `username`, if known. Used
+    /// by the SASL/SCRAM startup handler to run a challenge/response without ever
+    /// seeing the plaintext password.
+    pub fn scram_keys(&self, username: &str) -> Option<ScramKeys> {
+        self.credentials
+            .read()
+            .unwrap()
+            .get(username)
+            .map(|c| c.keys.clone())
+    }
+
+    /// Issues a session for an already-authenticated user (e.g. after a SCRAM
+    /// exchange has verified the client's proof). Fails only if the user is
+    /// unknown.
+    pub fn issue_session(&self, username: &str) -> Result<Session, AuthError> {
+        let principal_id = self
+            .credentials
+            .read()
+            .unwrap()
+            .get(username)
+            .map(|c| c.principal_id)
+            .ok_or_else(|| AuthError::UnknownUser(username.to_string()))?;
+        Ok(self.build_session(principal_id))
+    }
+
+    fn build_session(&self, principal_id: PrincipalId) -> Session {
+        let active_roles = self
+            .catalog
+            .get_effective_roles(principal_id)
+            .unwrap_or_default();
+        Session {
+            session_id: Uuid::new_v4().to_string(),
+            principal_id,
+            active_roles,
+            database_id: None,
+        }
     }
 }
 
@@ -289,27 +319,15 @@ impl Authenticator for PasswordAuthenticator {
                 .ok_or_else(|| AuthError::UnknownUser(username.to_string()))?
         };
 
-        let derived = pbkdf2_sha256(password.as_bytes(), cred.salt.as_bytes(), cred.iterations);
-        let mut computed = String::with_capacity(derived.len() * 2);
-        for byte in derived {
-            use std::fmt::Write;
-            let _ = write!(computed, "{byte:02x}");
-        }
-        if !constant_time_eq(computed.as_bytes(), cred.hash.as_bytes()) {
+        // Re-derive the SCRAM StoredKey from the supplied password and compare it
+        // to the stored one in constant time. This keeps the admin Basic-auth
+        // path working off the same material the SCRAM handshake uses.
+        let candidate = ScramKeys::derive(password, cred.keys.salt.clone(), cred.keys.iterations);
+        if !constant_time_eq(&candidate.stored_key, &cred.keys.stored_key) {
             return Err(AuthError::InvalidCredentials(username.to_string()));
         }
 
-        let active_roles = self
-            .catalog
-            .get_effective_roles(cred.principal_id)
-            .unwrap_or_default();
-
-        Ok(Session {
-            session_id: Uuid::new_v4().to_string(),
-            principal_id: cred.principal_id,
-            active_roles,
-            database_id: None,
-        })
+        Ok(self.build_session(cred.principal_id))
     }
 }
 

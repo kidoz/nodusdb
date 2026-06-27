@@ -366,6 +366,9 @@ where
         }
     }
     factory.registry.deregister(&session_id);
+    // Drop any half-finished SCRAM exchange for a connection that dropped between
+    // its client-first and client-final messages.
+    factory.startup_handler().clear_scram(&session_id);
     // `end_session` aborts any open transaction, which routes through the
     // synchronous Raft write path (`blocking_recv`) and panics if run on a
     // reactor worker — drive it on the blocking pool like every other executor
@@ -413,11 +416,11 @@ pub async fn start_pgwire_server(
     let mut param_provider = DefaultServerParameterProvider::default();
     param_provider.server_version = "18.0".to_string();
 
-    let startup_handler = Arc::new(NodusStartupHandler {
+    let startup_handler = Arc::new(NodusStartupHandler::new(
         authenticator,
         param_provider,
-        registry: registry.clone(),
-    });
+        registry.clone(),
+    ));
     let factory = Arc::new(NodusPgWireServer {
         startup_handler,
         executor: executor.clone(),
