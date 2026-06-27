@@ -14,7 +14,7 @@ use pgwire::api::portal::Format;
 use pgwire::api::results::FieldInfo;
 use pgwire::error::PgWireError;
 use pgwire::messages::data::DataRow;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Semaphore, mpsc, oneshot};
 
 use crate::encoding::encode_row;
 use crate::wire_format::{field_info_for_output, user_error};
@@ -22,6 +22,17 @@ use crate::wire_format::{field_info_for_output, user_error};
 /// Bounded in-flight rows between the blocking executor and the socket writer.
 /// Small enough to bound memory, large enough to keep the socket busy.
 pub(crate) const STREAM_CHANNEL_CAPACITY: usize = 512;
+
+/// Process-wide cap on concurrent streaming producers. Each producer occupies a
+/// `spawn_blocking` thread for its whole scan (and blocks there under
+/// back-pressure from a slow client). That same blocking pool — Tokio's default
+/// of 512 threads — also serves every write/commit/teardown via
+/// `execute_off_reactor`, so an unbounded number of slow streaming clients could
+/// starve all execution. Capping streams well below the pool size leaves ample
+/// threads for the rest; excess streams simply wait (on the reactor, pinning no
+/// thread) for a permit.
+const MAX_CONCURRENT_STREAMS: usize = 64;
+static STREAM_SEMAPHORE: Semaphore = Semaphore::const_new(MAX_CONCURRENT_STREAMS);
 
 /// A [`RowSink`] that encodes each row on the blocking executor thread and sends
 /// it to the socket-writing task through a bounded channel.
@@ -68,16 +79,27 @@ pub(crate) struct RowStream {
 }
 
 /// Spawns the executor on the blocking pool, streaming `plan`'s rows into a
-/// bounded channel, encoding each in the client's requested `format`.
-pub(crate) fn start_row_stream(
+/// bounded channel, encoding each in the client's requested `format`. Acquires a
+/// [`STREAM_SEMAPHORE`] permit first (awaiting on the reactor if the cap is
+/// reached, not pinning a blocking thread) and holds it for the producer's whole
+/// lifetime, so concurrent streams can't exhaust the blocking pool.
+pub(crate) async fn start_row_stream(
     executor: Arc<dyn Executor>,
     ctx: ExecutionContext,
     plan: LogicalPlan,
     format: Format,
 ) -> RowStream {
+    // The semaphore is never closed, so acquisition cannot fail.
+    let permit = STREAM_SEMAPHORE
+        .acquire()
+        .await
+        .expect("stream semaphore is never closed");
     let (schema_tx, schema_rx) = oneshot::channel::<Arc<Vec<FieldInfo>>>();
     let (row_tx, row_rx) = mpsc::channel::<DataRow>(STREAM_CHANNEL_CAPACITY);
     let producer = tokio::task::spawn_blocking(move || {
+        // Held for the scan's duration; the slot frees when the producer ends
+        // (completion, error, or the consumer dropping the receiver).
+        let _permit = permit;
         let mut sink = ChannelSink {
             schema_tx: Some(schema_tx),
             row_tx,

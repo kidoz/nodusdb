@@ -229,7 +229,7 @@ impl NodusExtendedQueryHandler {
             schema_rx,
             mut row_rx,
             producer,
-        } = crate::streaming::start_row_stream(self.executor.clone(), ctx, plan, format);
+        } = crate::streaming::start_row_stream(self.executor.clone(), ctx, plan, format).await;
         // Rows are encoded on the producer side; the schema is only needed for
         // RowDescription, which the extended-protocol client already has.
         drop(schema_rx);

@@ -425,7 +425,8 @@ impl NodusQueryHandler {
             ctx,
             plan,
             pgwire::api::portal::Format::UnifiedText,
-        );
+        )
+        .await;
 
         let to_exec_error = |e: anyhow::Error, this: &Self| -> PgWireError {
             this.metrics.query_errors_total.inc();
