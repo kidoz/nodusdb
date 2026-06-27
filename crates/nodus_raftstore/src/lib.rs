@@ -1021,11 +1021,52 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
                 let _ = cat.import_snapshot(cat_snap);
             }
             if let Some(kv) = &sm.kv {
-                // To restore KV, we iterate and inject rows.
-                // Depending on the KV engine, we may need to clear it first.
-                // For MVP, we'll just write_intent and commit the dumped versions.
                 use bytes::Bytes;
-                use nodus_storage_api::TxnId;
+                use nodus_storage_api::{KeyRange, TxnId};
+
+                // A snapshot install *replaces* the state machine, so drop any
+                // local user key absent from the snapshot (an orphan left by
+                // divergent or earlier local state) rather than merging — which
+                // would leave a follower with a superset of the leader's state.
+                // User data starts at 0x01; the `\0`-prefixed reserved range
+                // (Raft log/vote/applied, catalog state, 2PC) is restored by its
+                // own mechanisms and must not be cleared here.
+                let snapshot_keys: std::collections::HashSet<Vec<u8>> =
+                    snapshot_obj.kv.iter().map(|(k, _, _)| k.clone()).collect();
+                let max_snapshot_version = snapshot_obj
+                    .kv
+                    .iter()
+                    .map(|(_, _, v)| *v)
+                    .max()
+                    .unwrap_or(0);
+
+                let user_range = KeyRange {
+                    start: Bytes::from_static(&[1]),
+                    end: Bytes::from(vec![255u8; 1024]),
+                };
+                let mut orphans = Vec::new();
+                let mut max_existing_version = 0;
+                if let Ok(iter) = kv.scan(user_range, u64::MAX) {
+                    for pair in iter.flatten() {
+                        max_existing_version = max_existing_version.max(pair.version);
+                        if !snapshot_keys.contains(pair.key.as_ref()) {
+                            orphans.push(pair.key.to_vec());
+                        }
+                    }
+                }
+                // Tombstone orphans above every retained version so they read as
+                // absent once the snapshot's versions are installed below.
+                let clear_version = max_snapshot_version.max(max_existing_version) + 1;
+                for key in orphans {
+                    let tid = TxnId::new();
+                    if let Err(e) = kv
+                        .delete_intent(tid, Bytes::from(key))
+                        .and_then(|_| kv.commit(tid, clear_version))
+                    {
+                        tracing::error!("snapshot install orphan delete failed: {e}");
+                    }
+                }
+
                 for (k, v, version) in snapshot_obj.kv {
                     let tid = TxnId::new();
                     // A fresh txn per key, so any error here is a genuine restore
@@ -1288,6 +1329,55 @@ mod tests {
             .expect("snapshot survives reopening the store");
         assert_eq!(recovered.meta.snapshot_id, snapshot_id);
         assert_eq!(recovered.meta.last_log_id.map(|l| l.index), Some(1));
+    }
+
+    /// Installing a snapshot replaces the state machine: a local key absent from
+    /// the snapshot (an orphan) is dropped rather than left behind.
+    #[tokio::test]
+    async fn install_snapshot_drops_orphan_keys() {
+        use bytes::Bytes;
+        use nodus_storage_api::TxnId;
+
+        // Source state machine carries one user key, captured in a snapshot.
+        let src_kv: Arc<dyn KvEngine> = Arc::new(nodus_storage_mem::MemKvEngine::new());
+        let mut src = NodusRaftStore::with_kv(src_kv.clone());
+        let tid = TxnId::new();
+        src_kv
+            .write_intent(
+                tid,
+                Bytes::from_static(b"\x01keep"),
+                Bytes::from_static(b"v"),
+            )
+            .unwrap();
+        src_kv.commit(tid, 10).unwrap();
+        let snapshot = src.build_snapshot().await.unwrap();
+
+        // Target has an orphan key not present in the snapshot.
+        let dst_kv: Arc<dyn KvEngine> = Arc::new(nodus_storage_mem::MemKvEngine::new());
+        let mut dst = NodusRaftStore::with_kv(dst_kv.clone());
+        let t2 = TxnId::new();
+        dst_kv
+            .write_intent(
+                t2,
+                Bytes::from_static(b"\x01orphan"),
+                Bytes::from_static(b"x"),
+            )
+            .unwrap();
+        dst_kv.commit(t2, 5).unwrap();
+
+        dst.install_snapshot(&snapshot.meta, snapshot.snapshot)
+            .await
+            .unwrap();
+
+        assert!(
+            dst_kv.get(b"\x01orphan", u64::MAX).unwrap().is_none(),
+            "orphan key must be dropped on install"
+        );
+        assert_eq!(
+            dst_kv.get(b"\x01keep", u64::MAX).unwrap().as_deref(),
+            Some(&b"v"[..]),
+            "snapshot key must be installed"
+        );
     }
 
     /// A conflicting-log truncation is durable: removed tail entries do not
