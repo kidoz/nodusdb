@@ -2268,14 +2268,17 @@ dependencies = [
 name = "nodus_compatibility_tests"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "bytes",
  "chrono",
  "futures-util",
+ "hmac",
  "nodus_config",
  "nodus_testkit",
  "rcgen",
  "rustls",
  "serde_json",
+ "sha2 0.11.0",
  "tokio",
  "tokio-postgres",
  "tokio-postgres-rustls",

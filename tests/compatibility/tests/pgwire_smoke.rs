@@ -50,17 +50,109 @@ async fn read_backend_message(stream: &mut TcpStream) -> (u8, Vec<u8>) {
     (message_type[0], body)
 }
 
+fn hmac_sha256(key: &[u8], parts: &[&[u8]]) -> [u8; 32] {
+    use hmac::{Hmac, KeyInit, Mac};
+    use sha2::Sha256;
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).unwrap();
+    for part in parts {
+        mac.update(part);
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&mac.finalize().into_bytes());
+    out
+}
+
+fn sha256(data: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(data);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&h.finalize());
+    out
+}
+
+fn pbkdf2_sha256(password: &[u8], salt: &[u8], iterations: u32) -> [u8; 32] {
+    let mut u = hmac_sha256(password, &[salt, &1u32.to_be_bytes()]);
+    let mut dk = u;
+    for _ in 1..iterations {
+        u = hmac_sha256(password, &[&u]);
+        for i in 0..32 {
+            dk[i] ^= u[i];
+        }
+    }
+    dk
+}
+
+/// Drives a raw-socket SCRAM-SHA-256 client handshake to authenticate as `nodus`,
+/// mirroring what a real PostgreSQL driver does, so the wire-level tests below
+/// can use a plain `TcpStream` while the server speaks SASL.
+async fn scram_authenticate(stream: &mut TcpStream, password: &str) {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD;
+
+    // Expect AuthenticationSASL (R, code 10).
+    let (mt, body) = read_backend_message(stream).await;
+    assert_eq!(mt, b'R');
+    assert_eq!(i32::from_be_bytes([body[0], body[1], body[2], body[3]]), 10);
+
+    // client-first. PostgreSQL takes the username from the startup packet, so the
+    // SCRAM `n=` field is empty.
+    let client_nonce = Uuid::new_v4().simple().to_string();
+    let client_first_bare = format!("n=,r={client_nonce}");
+    let client_first = format!("n,,{client_first_bare}");
+    let mut init = Vec::new();
+    init.extend_from_slice(b"SCRAM-SHA-256\0");
+    init.extend_from_slice(&(client_first.len() as i32).to_be_bytes());
+    init.extend_from_slice(client_first.as_bytes());
+    write_frontend_message(stream, b'p', &init).await;
+
+    // Expect SASLContinue (R, code 11) carrying the server-first message.
+    let (mt, body) = read_backend_message(stream).await;
+    assert_eq!(mt, b'R');
+    assert_eq!(i32::from_be_bytes([body[0], body[1], body[2], body[3]]), 11);
+    let server_first = String::from_utf8(body[4..].to_vec()).unwrap();
+    let mut combined = "";
+    let mut salt_b64 = "";
+    let mut iterations = 0u32;
+    for field in server_first.split(',') {
+        if let Some(v) = field.strip_prefix("r=") {
+            combined = v;
+        } else if let Some(v) = field.strip_prefix("s=") {
+            salt_b64 = v;
+        } else if let Some(v) = field.strip_prefix("i=") {
+            iterations = v.parse().unwrap();
+        }
+    }
+    let salt = b64.decode(salt_b64).unwrap();
+    let salted = pbkdf2_sha256(password.as_bytes(), &salt, iterations);
+    let client_key = hmac_sha256(&salted, &[b"Client Key"]);
+    let stored_key = sha256(&client_key);
+    let without_proof = format!("c=biws,r={combined}");
+    let auth_message = format!("{client_first_bare},{server_first},{without_proof}");
+    let client_sig = hmac_sha256(&stored_key, &[auth_message.as_bytes()]);
+    let mut proof = [0u8; 32];
+    for i in 0..32 {
+        proof[i] = client_key[i] ^ client_sig[i];
+    }
+    let client_final = format!("{without_proof},p={}", b64.encode(proof));
+    write_frontend_message(stream, b'p', client_final.as_bytes()).await;
+
+    // Expect SASLFinal (R, code 12) then AuthenticationOk (R, code 0).
+    let (mt, body) = read_backend_message(stream).await;
+    assert_eq!(mt, b'R');
+    assert_eq!(i32::from_be_bytes([body[0], body[1], body[2], body[3]]), 12);
+    let (mt, body) = read_backend_message(stream).await;
+    assert_eq!(mt, b'R');
+    assert_eq!(i32::from_be_bytes([body[0], body[1], body[2], body[3]]), 0);
+}
+
 async fn open_raw_pgwire(server: &TestServer) -> TcpStream {
     let mut stream = TcpStream::connect(server.pgwire_addr).await.unwrap();
     write_startup(&mut stream).await;
+    scram_authenticate(&mut stream, "nodus").await;
+    // Drain the post-auth parameter status / backend key data up to ReadyForQuery.
     loop {
-        let (message_type, body) = read_backend_message(&mut stream).await;
-        if message_type == b'R' && body.len() >= 4 {
-            let auth_code = i32::from_be_bytes([body[0], body[1], body[2], body[3]]);
-            if auth_code == 3 {
-                write_frontend_message(&mut stream, b'p', b"nodus\0").await;
-            }
-        }
+        let (message_type, _body) = read_backend_message(&mut stream).await;
         if message_type == b'Z' {
             return stream;
         }
