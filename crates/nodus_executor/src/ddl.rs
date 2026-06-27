@@ -463,7 +463,10 @@ impl MemExecutor {
         ctx: &ExecutionContext,
         name: String,
     ) -> Result<QueryOutput> {
-        // Must be superuser or have create role privilege in a real system
+        // Creating roles is a grant-management operation: require it explicitly
+        // (a superuser holds ALL on System, so this still passes for them) so an
+        // ordinary user can't mint roles as a privilege-escalation primitive.
+        self.authorize(ctx, Action::ManageGrants, ResourceRef::System)?;
         self.catalog_writer
             .create_role(nodus_catalog::CreateRoleRequest {
                 id: nodus_catalog::PrincipalId::new(),
@@ -485,8 +488,11 @@ impl MemExecutor {
         let tbl = self
             .catalog_reader
             .get_table(db_name, schema_name, table_only)?;
-        // Typically you need to own the table or have grant option
-        self.authorize(ctx, Action::CreateTable, ResourceRef::Table(tbl.id))?;
+        // Granting privileges requires grant-management authority on the object,
+        // not merely CREATE on it — otherwise anyone who can create/own a table
+        // could hand its privileges to any principal. (Superuser passes via
+        // ALL-on-System.)
+        self.authorize(ctx, Action::ManageGrants, ResourceRef::Table(tbl.id))?;
         self.catalog_writer
             .grant_privileges(nodus_catalog::GrantPrivilegesRequest {
                 id: nodus_catalog::GrantId::new(),
@@ -508,7 +514,7 @@ impl MemExecutor {
         let tbl = self
             .catalog_reader
             .get_table(db_name, schema_name, table_only)?;
-        self.authorize(ctx, Action::CreateTable, ResourceRef::Table(tbl.id))?;
+        self.authorize(ctx, Action::ManageGrants, ResourceRef::Table(tbl.id))?;
         self.catalog_writer
             .revoke_privileges(nodus_catalog::RevokePrivilegesRequest {
                 principal_id: role.id,

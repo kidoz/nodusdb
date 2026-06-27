@@ -39,6 +39,94 @@ fn eq(col: &str, val: &str) -> Option<FilterExpr> {
 }
 
 #[test]
+fn create_role_and_grant_require_grant_management() {
+    let audit = Arc::new(MemoryAuditSink::new());
+    let (exec, cat) = MemExecutor::shared(audit.clone());
+
+    // A superuser (ALL on System) sets up a table to grant on.
+    let admin = cat
+        .create_role(CreateRoleRequest {
+            id: nodus_catalog::PrincipalId::new(),
+            name: "admin".into(),
+            principal_type: PrincipalType::User,
+            database_id: None,
+        })
+        .unwrap();
+    cat.grant_privilege(GrantPrivilegeRequest {
+        id: nodus_catalog::GrantId::new(),
+        principal_id: admin.id,
+        resource: ResourceRef::System,
+        privilege: "ALL".into(),
+    })
+    .unwrap();
+    let admin_ctx = ctx_for(admin.id);
+    exec.execute_logical(
+        &admin_ctx,
+        LogicalPlan::CreateTable {
+            constraints: vec![],
+            name: "t".into(),
+            columns: cols(&[("id", "INT")]),
+        },
+    )
+    .unwrap();
+
+    // An ordinary user with no grants can neither create roles nor grant.
+    let bob = cat
+        .create_role(CreateRoleRequest {
+            id: nodus_catalog::PrincipalId::new(),
+            name: "bob".into(),
+            principal_type: PrincipalType::User,
+            database_id: None,
+        })
+        .unwrap();
+    let bob_ctx = ctx_for(bob.id);
+    assert!(
+        exec.execute_logical(
+            &bob_ctx,
+            LogicalPlan::CreateRole {
+                name: "evil".into()
+            },
+        )
+        .is_err(),
+        "an unprivileged user must not be able to CREATE ROLE"
+    );
+    assert!(
+        exec.execute_logical(
+            &bob_ctx,
+            LogicalPlan::Grant {
+                privilege: "SELECT".into(),
+                object_name: "t".into(),
+                grantee: "bob".into(),
+            },
+        )
+        .is_err(),
+        "an unprivileged user must not be able to GRANT"
+    );
+
+    // The superuser can do both.
+    assert!(
+        exec.execute_logical(
+            &admin_ctx,
+            LogicalPlan::CreateRole {
+                name: "auditor".into()
+            },
+        )
+        .is_ok()
+    );
+    assert!(
+        exec.execute_logical(
+            &admin_ctx,
+            LogicalPlan::Grant {
+                privilege: "SELECT".into(),
+                object_name: "t".into(),
+                grantee: "bob".into(),
+            },
+        )
+        .is_ok()
+    );
+}
+
+#[test]
 fn create_table_denied_then_allowed_by_grant() {
     let audit = Arc::new(MemoryAuditSink::new());
     let (exec, cat) = MemExecutor::shared(audit.clone());
