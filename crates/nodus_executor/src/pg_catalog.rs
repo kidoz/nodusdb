@@ -550,6 +550,27 @@ impl MemExecutor {
                     Value::Bool(false),
                 ]],
             )),
+            // Timezone abbreviations. NodusDB operates in UTC, so advertise the
+            // UTC/GMT abbreviations IDE introspection (DataGrip/pgjdbc) lists.
+            "pg_timezone_abbrevs" => Some((
+                Self::virtual_columns(&[
+                    ("abbrev", "TEXT"),
+                    ("utc_offset", "TEXT"),
+                    ("is_dst", "BOOL"),
+                ]),
+                vec![
+                    vec![
+                        Value::Text("UTC".into()),
+                        Value::Text("00:00:00".into()),
+                        Value::Bool(false),
+                    ],
+                    vec![
+                        Value::Text("GMT".into()),
+                        Value::Text("00:00:00".into()),
+                        Value::Bool(false),
+                    ],
+                ],
+            )),
             // Role membership graph: no role-in-role membership is modeled yet.
             "pg_auth_members" => Some((
                 Self::virtual_columns(&[

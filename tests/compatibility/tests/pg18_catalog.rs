@@ -400,6 +400,18 @@ async fn test_pg_catalog_introspection_relations_resolve() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].get(0), Some("UTC"));
 
+    // pg_timezone_abbrevs is probed alongside pg_timezone_names by DataGrip's
+    // timezone introspection; it must resolve rather than error with 42P01.
+    let msgs = client
+        .simple_query("SELECT abbrev, utc_offset, is_dst FROM pg_catalog.pg_timezone_abbrevs;")
+        .await
+        .expect("pg_timezone_abbrevs resolves");
+    let rows = rows_of(&msgs);
+    assert!(
+        rows.iter().any(|r| r.get(0) == Some("UTC")),
+        "pg_timezone_abbrevs should advertise UTC"
+    );
+
     // These resolve but are empty.
     for (query, table) in [
         (
