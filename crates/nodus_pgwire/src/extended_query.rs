@@ -79,6 +79,36 @@ fn cursor_key(session_id: &str, portal_name: &str) -> String {
 }
 
 impl NodusExtendedQueryHandler {
+    /// Resolves the result-column field descriptors for `query_str` by executing
+    /// a side-effect-free [`describe_probe_plan`] of it. Returns an empty vector
+    /// for a statement that yields no row set (the caller then answers `Describe`
+    /// with `NoData`). Shared by statement and portal describe so both agree on
+    /// which statements are result-returning.
+    async fn describe_output_fields(
+        &self,
+        query_str: &str,
+        ctx: &nodus_executor::ExecutionContext,
+    ) -> Vec<FieldInfo> {
+        let mut fields = vec![];
+        if let Ok(mut stmts) = nodus_sql::parse_sql(query_str)
+            && let Some(parsed) = stmts.pop()
+            && let Ok(plan) = nodus_executor::plan_statement(&parsed, &[])
+            && let Some(probe) = describe_probe_plan(&plan)
+            && let Ok(out) = execute_off_reactor(self.executor.clone(), ctx.clone(), probe).await
+        {
+            for (col_name, col_type) in out.columns.into_iter().zip(out.types) {
+                fields.push(FieldInfo::new(
+                    col_name,
+                    None,
+                    None,
+                    map_type(&col_type),
+                    FieldFormat::Text,
+                ));
+            }
+        }
+        fields
+    }
+
     async fn output_metadata_for_query<C>(
         &self,
         client: &C,
@@ -1061,53 +1091,7 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
         };
 
         let query_str = stmt.statement.as_str();
-
-        let mut fields = vec![];
-        if let Ok(mut stmts) = nodus_sql::parse_sql(query_str)
-            && let Some(parsed) = stmts.pop()
-            && let Ok(plan) = nodus_executor::plan_statement(&parsed, &[])
-        {
-            let mut plan_zero = plan.clone();
-            let mut can_execute = false;
-            if let nodus_executor::LogicalPlan::Select { ref mut limit, .. } = plan_zero {
-                *limit = Some(0);
-                can_execute = true;
-            } else if let nodus_executor::LogicalPlan::Insert {
-                ref mut values_list,
-                ref returning,
-                ..
-            } = plan_zero
-            {
-                if !returning.is_empty() {
-                    values_list.clear();
-                    can_execute = true;
-                }
-            } else if let nodus_executor::LogicalPlan::ShowVariable { .. } = plan_zero {
-                can_execute = true;
-            } else if let nodus_executor::LogicalPlan::SelectLiteral { .. } = plan_zero {
-                can_execute = true;
-            }
-
-            let described = if can_execute {
-                execute_off_reactor(self.executor.clone(), ctx.clone(), plan_zero)
-                    .await
-                    .ok()
-            } else {
-                None
-            };
-            if let Some(out) = described {
-                for (col_name, col_type) in out.columns.into_iter().zip(out.types) {
-                    fields.push(FieldInfo::new(
-                        col_name,
-                        None,
-                        None,
-                        map_type(&col_type),
-                        FieldFormat::Text,
-                    ));
-                }
-            }
-        }
-
+        let fields = self.describe_output_fields(query_str, &ctx).await;
         Ok(DescribeStatementResponse::new(param_types, fields))
     }
 
@@ -1142,52 +1126,40 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
             authz_catalog_version: 1,
         };
 
-        let mut fields = vec![];
-        if let Ok(mut stmts) = nodus_sql::parse_sql(query_str)
-            && let Some(parsed) = stmts.pop()
-            && let Ok(plan) = nodus_executor::plan_statement(&parsed, &[])
-        {
-            let mut plan_zero = plan.clone();
-            let mut can_execute = false;
-            if let nodus_executor::LogicalPlan::Select { ref mut limit, .. } = plan_zero {
-                *limit = Some(0);
-                can_execute = true;
-            } else if let nodus_executor::LogicalPlan::Insert {
-                ref mut values_list,
-                ref returning,
-                ..
-            } = plan_zero
-            {
-                if !returning.is_empty() {
-                    values_list.clear();
-                    can_execute = true;
-                }
-            } else if let nodus_executor::LogicalPlan::ShowVariable { .. } = plan_zero {
-                can_execute = true;
-            } else if let nodus_executor::LogicalPlan::SelectLiteral { .. } = plan_zero {
-                can_execute = true;
-            }
-
-            let described = if can_execute {
-                execute_off_reactor(self.executor.clone(), ctx.clone(), plan_zero)
-                    .await
-                    .ok()
-            } else {
-                None
-            };
-            if let Some(out) = described {
-                for (col_name, col_type) in out.columns.into_iter().zip(out.types) {
-                    fields.push(FieldInfo::new(
-                        col_name,
-                        None,
-                        None,
-                        map_type(&col_type),
-                        FieldFormat::Text,
-                    ));
-                }
-            }
-        }
-
+        let fields = self.describe_output_fields(query_str, &ctx).await;
         Ok(DescribePortalResponse::new(fields))
+    }
+}
+
+/// Builds a side-effect-free "describe probe" from `plan`: a variant that, when
+/// executed, yields the statement's result columns with (almost) no rows, or
+/// `None` if the statement returns no row set at all.
+///
+/// `Describe` answers with a `RowDescription` built from these columns, so a
+/// client that caches the described shape and reuses it for `Execute` (pgjdbc
+/// does) never receives rows it has no field structure for. The set of plans
+/// this returns `Some` for MUST match those that produce a row set at execute
+/// time — notably set operations (`UNION`/`INTERSECT`/`EXCEPT`), whose result
+/// columns are those of the left input, so probing the left branch suffices.
+fn describe_probe_plan(plan: &nodus_executor::LogicalPlan) -> Option<nodus_executor::LogicalPlan> {
+    use nodus_executor::LogicalPlan;
+    match plan {
+        LogicalPlan::Select { .. } => {
+            let mut probe = plan.clone();
+            if let LogicalPlan::Select { limit, .. } = &mut probe {
+                *limit = Some(0);
+            }
+            Some(probe)
+        }
+        LogicalPlan::ShowVariable { .. } | LogicalPlan::SelectLiteral { .. } => Some(plan.clone()),
+        LogicalPlan::Insert { returning, .. } if !returning.is_empty() => {
+            let mut probe = plan.clone();
+            if let LogicalPlan::Insert { values_list, .. } = &mut probe {
+                values_list.clear();
+            }
+            Some(probe)
+        }
+        LogicalPlan::SetOp { left, .. } => describe_probe_plan(left),
+        _ => None,
     }
 }

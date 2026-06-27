@@ -364,6 +364,32 @@ async fn test_pg_locks_reports_explicit_transactions_only() {
     );
 }
 
+/// A set operation (`UNION`) run over the *extended* protocol must answer
+/// `Describe` with a real `RowDescription`, not `NoData`. pgjdbc caches the
+/// described shape and reuses it for `Execute`; if Describe reports no columns
+/// for a query that then returns rows, the driver throws "Received resultset
+/// tuples, but no field structure for them". `client.query` uses the extended
+/// protocol (Parse/Bind/Describe/Execute), so it exercises that path.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_union_over_extended_protocol_has_field_structure() {
+    let server = TestServer::start().await.expect("server starts");
+    let client = connect(&server).await;
+
+    let rows = client
+        .query("SELECT 1 AS n UNION ALL SELECT 2 AS n", &[])
+        .await
+        .expect("a UNION must describe its columns over the extended protocol");
+    assert_eq!(rows.len(), 2, "the UNION should return both rows");
+    assert_eq!(
+        rows[0].columns()[0].name(),
+        "n",
+        "the described result must carry the set operation's column"
+    );
+    let mut values: Vec<i32> = rows.iter().map(|r| r.get::<_, i32>("n")).collect();
+    values.sort_unstable();
+    assert_eq!(values, vec![1, 2]);
+}
+
 /// IDE/driver introspection (DataGrip/pgjdbc) probes several `pg_catalog`
 /// relations NodusDB does not model. They must resolve (not error with 42P01):
 /// the standard tablespaces and the UTC timezone are advertised; role
