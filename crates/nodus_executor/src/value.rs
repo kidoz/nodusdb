@@ -66,6 +66,42 @@ pub(crate) fn coerce(raw: &str, ty: ColumnType) -> Value {
     }
 }
 
+/// Coerces a write value to its declared column type so a column never stores a
+/// representation that disagrees with its type. `Text` is parsed into the column
+/// type (as before). A non-`Text` value bound into a *scalar* column (INT, FLOAT,
+/// BOOL) is normalized into that type — e.g. a `Float(3.7)` into an INT column
+/// becomes `Int(4)` instead of being stored verbatim. Text-classified columns
+/// also cover JSONB/ARRAY/UUID/timestamps, whose values must be preserved as-is,
+/// so non-`Text` values bound into them are left untouched.
+pub(crate) fn coerce_for_column(value: &Value, data_type: &str) -> Value {
+    match value {
+        Value::Null => Value::Null,
+        // Complex values are never re-typed: they belong to JSONB/ARRAY columns,
+        // which the coarse `column_type` may misclassify (e.g. `INT[]` contains
+        // "INT"), so coercing them would corrupt the value.
+        Value::Array(_) | Value::Jsonb(_) => value.clone(),
+        Value::Text(s) => coerce(s, column_type(data_type)),
+        scalar => match column_type(data_type) {
+            ColumnType::Int => match scalar {
+                Value::Int(_) => scalar.clone(),
+                Value::Float(f) => Value::Int(f.round() as i64),
+                _ => coerce(&render(scalar), ColumnType::Int),
+            },
+            ColumnType::Float => match scalar {
+                Value::Float(_) => scalar.clone(),
+                Value::Int(n) => Value::Float(*n as f64),
+                _ => coerce(&render(scalar), ColumnType::Float),
+            },
+            ColumnType::Bool => match scalar {
+                Value::Bool(_) => scalar.clone(),
+                _ => coerce(&render(scalar), ColumnType::Bool),
+            },
+            // TEXT/VARCHAR and the catch-all: keep the scalar's representation.
+            ColumnType::Text => scalar.clone(),
+        },
+    }
+}
+
 pub(crate) fn render(value: &Value) -> String {
     match value {
         Value::Int(n) => n.to_string(),
@@ -289,6 +325,30 @@ pub(crate) fn values_equal(a: &Value, b: &Value) -> bool {
 mod tests {
     use super::*;
     use std::cmp::Ordering;
+
+    #[test]
+    fn coerce_for_column_normalizes_scalars_but_preserves_complex_values() {
+        use serde_json::json;
+        // A non-Text value bound into a scalar column is normalized into it.
+        assert_eq!(coerce_for_column(&Value::Float(3.7), "INT"), Value::Int(4));
+        assert_eq!(
+            coerce_for_column(&Value::Int(5), "DOUBLE"),
+            Value::Float(5.0)
+        );
+        // Text still parses into the column type.
+        assert_eq!(
+            coerce_for_column(&Value::Text("7".into()), "INTEGER"),
+            Value::Int(7)
+        );
+        // JSONB and ARRAY columns are Text-classified, but their non-Text values
+        // must be preserved (not stringified).
+        let j = Value::Jsonb(json!({"a": 1}));
+        assert_eq!(coerce_for_column(&j, "JSONB"), j);
+        let arr = Value::Array(vec![Value::Int(1), Value::Int(2)]);
+        assert_eq!(coerce_for_column(&arr, "INT[]"), arr);
+        // NULL is preserved.
+        assert_eq!(coerce_for_column(&Value::Null, "INT"), Value::Null);
+    }
 
     #[test]
     fn cross_type_orders_by_rank_not_rendered_text() {

@@ -88,10 +88,7 @@ impl MemExecutor {
             // ...then coerce each cell to its column's type if it's Text, otherwise assume it's correctly bound.
             let mut row = Vec::new();
             for (i, c) in tbl.columns.iter().enumerate() {
-                let val = match &raw[i] {
-                    Value::Text(s) => coerce(s, column_type(&c.data_type)),
-                    other => other.clone(),
-                };
+                let val = crate::value::coerce_for_column(&raw[i], &c.data_type);
                 if !c.nullable && val == Value::Null {
                     anyhow::bail!("Column {} cannot be NULL", c.name);
                 }
@@ -184,10 +181,7 @@ impl MemExecutor {
             let old_key = format!("{}:{}", tbl.id, old_pk_str);
             for (col, val) in &assignments {
                 if let Some(idx) = col_names.iter().position(|c| c == col) {
-                    let coerced = match val {
-                        Value::Text(s) => coerce(s, column_type(&tbl.columns[idx].data_type)),
-                        other => other.clone(),
-                    };
+                    let coerced = crate::value::coerce_for_column(val, &tbl.columns[idx].data_type);
                     if !tbl.columns[idx].nullable && coerced == Value::Null {
                         anyhow::bail!("Column {} cannot be NULL", col);
                     }
