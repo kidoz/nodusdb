@@ -50,6 +50,48 @@ async fn three_node_cluster_forms_and_replicates() {
     );
 }
 
+/// A linearizable read (`SET nodus.linearizable_reads = on`) observes a write
+/// the instant it is committed — without any client-side polling. The read's
+/// ReadIndex barrier blocks the follower until its state machine has caught up to
+/// the leader's commit, so read-your-writes holds across nodes deterministically.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial(cluster)]
+async fn linearizable_read_observes_a_fresh_write_without_polling() {
+    let cluster = ClusterFixture::start(3)
+        .await
+        .expect("3-node cluster forms");
+    assert!(cluster.wait_nodes_live(3, Duration::from_secs(45)).await);
+
+    let leader = cluster.pg_client(0).await.unwrap();
+    leader
+        .simple_query("CREATE TABLE lin (id INT PRIMARY KEY, v TEXT)")
+        .await
+        .unwrap();
+
+    // A follower connection that demands linearizable reads.
+    let follower = cluster.pg_client(1).await.unwrap();
+    follower
+        .simple_query("SET nodus.linearizable_reads = on")
+        .await
+        .unwrap();
+
+    // Write on the leader, then read on the follower with no retry loop: the
+    // barrier must make the just-committed row visible on the very first read.
+    leader
+        .simple_query("INSERT INTO lin (id, v) VALUES (1, 'fresh')")
+        .await
+        .unwrap();
+    let rows = follower
+        .query("SELECT v FROM lin WHERE id = 1", &[])
+        .await
+        .expect("linearizable read succeeds");
+    assert_eq!(
+        rows.first().map(|r| r.get::<_, String>(0)),
+        Some("fresh".to_string()),
+        "a linearizable read must observe the committed write on the first try"
+    );
+}
+
 /// With one follower down the leader keeps quorum (2/3) and still serves writes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial(cluster)]

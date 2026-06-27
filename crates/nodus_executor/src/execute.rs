@@ -145,6 +145,7 @@ impl MemExecutor {
             PhysicalPlan::LocalPointGet { table_id, id } => {
                 let read_ts = self.read_ts(&ctx.session_id);
                 let key = format!("{}:{}", table_id, id);
+                self.maybe_read_barrier(&ctx.session_id, key.as_bytes())?;
                 match self.kv.get(key.as_bytes(), read_ts)? {
                     Some(val) => {
                         let row: Vec<Value> = serde_json::from_slice(&val).unwrap_or_default();

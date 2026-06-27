@@ -182,6 +182,10 @@ pub trait Executor: Send + Sync {
 /// leading NUL keeps it out of any `{table_id}:{pk}` row key space.
 const CATALOG_STATE_KEY: &[u8] = b"\x00catalog\x00state";
 
+/// Session GUC requesting linearizable reads (read-your-writes across nodes).
+/// See [`MemExecutor::linearizable_reads`].
+const LINEARIZABLE_READS_VAR: &str = "nodus.linearizable_reads";
+
 /// A [`nodus_catalog::CatalogStore`] backed by a [`KvEngine`], so the catalog
 /// persists into the same (crash-safe) store as user data — one durable
 /// mechanism, one recovery path. Should wrap the node's *local* engine (a direct
@@ -413,6 +417,32 @@ impl MemExecutor {
         }
     }
 
+    /// Whether the session opted into linearizable reads via the
+    /// `nodus.linearizable_reads` GUC (`SET nodus.linearizable_reads = on`).
+    /// Default off — reads serve from the local replica's snapshot, which is fast
+    /// but can lag the leader; turning it on trades a Raft ReadIndex round-trip
+    /// for read-your-writes guarantees across nodes.
+    fn linearizable_reads(&self, session: &str) -> bool {
+        self.session_vars
+            .read()
+            .unwrap()
+            .get(session)
+            .and_then(|vars| vars.get(LINEARIZABLE_READS_VAR))
+            .map(|v| matches!(v.to_ascii_lowercase().as_str(), "on" | "true" | "1" | "yes"))
+            .unwrap_or(false)
+    }
+
+    /// When the session requested linearizable reads, force the engine to reflect
+    /// every write committed before this read for the group that owns `key`. A
+    /// no-op under the default snapshot consistency and for non-replicated
+    /// engines. MUST run on a blocking thread (the Raft barrier blocks).
+    pub(crate) fn maybe_read_barrier(&self, session: &str, key: &[u8]) -> Result<()> {
+        if self.linearizable_reads(session) {
+            self.kv.read_barrier(key)?;
+        }
+        Ok(())
+    }
+
     /// Returns the session's active txn id. Expects a transaction to be active.
     fn txn_for(&self, session: &str) -> Result<TxnId> {
         match self.active_txns.read().unwrap().get(session) {
@@ -426,6 +456,7 @@ impl MemExecutor {
         let read_ts = self.read_ts(session);
         let start = Bytes::from(format!("{}:", table_id));
         let end = Bytes::from(format!("{};", table_id));
+        self.maybe_read_barrier(session, &start)?;
         let mut keyed_rows = std::collections::BTreeMap::new();
         for pair in self.kv.scan(KeyRange { start, end }, read_ts)? {
             let pair = pair?;
@@ -479,6 +510,7 @@ impl MemExecutor {
         let read_ts = self.read_ts(session);
         let start = Bytes::from(format!("{}:", table_id));
         let end = Bytes::from(format!("{};", table_id));
+        self.maybe_read_barrier(session, &start)?;
         let mut rows = Vec::with_capacity(cap.min(1024));
         for pair in self.kv.scan(KeyRange { start, end }, read_ts)?.take(cap) {
             let pair = pair?;
@@ -496,6 +528,8 @@ impl MemExecutor {
         session: &str,
     ) -> Result<Vec<Vec<Value>>> {
         let read_ts = self.read_ts(session);
+        // Barrier the table group whose rows this index lookup will fetch.
+        self.maybe_read_barrier(session, format!("{}:", table_id).as_bytes())?;
         let escaped = Self::escape_index_value(&render(index_val));
         let prefix = format!("i:{}:{}:", index_id, escaped);
         let start = Bytes::from(prefix.clone());

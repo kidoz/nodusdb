@@ -217,6 +217,10 @@ impl MemExecutor {
             None => self.read_ts(&ctx.session_id),
         };
 
+        // Barrier before committing to the stream, so a failed linearizable read
+        // surfaces as an error rather than a half-emitted result set.
+        self.maybe_read_barrier(&ctx.session_id, format!("{}:", tbl.id).as_bytes())?;
+
         // Committed to streaming: emit the schema, then the rows.
         sink.schema(out_cols, out_types);
 
