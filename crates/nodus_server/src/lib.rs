@@ -346,7 +346,21 @@ pub async fn run_server_with_config(
     ));
 
     tracing::debug!("Initializing raft network and state");
-    let raft_config = Arc::new(openraft::Config::default().validate().unwrap());
+    // Make snapshotting/compaction intentional rather than relying on
+    // undocumented openraft defaults. `snapshot_max_chunk_size` bounds the
+    // per-RPC payload so a large snapshot transfers as a series of chunks (each
+    // `install_snapshot` request carries at most this many bytes) instead of one
+    // oversized body; election/heartbeat timers stay at their defaults.
+    let raft_config = Arc::new(
+        openraft::Config {
+            snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(5000),
+            snapshot_max_chunk_size: 4 * 1024 * 1024,
+            max_in_snapshot_log_to_keep: 1000,
+            ..Default::default()
+        }
+        .validate()
+        .unwrap(),
+    );
     let raft_state = nodus_raftstore::server::RaftState::new();
 
     // Seed the transaction clock from a durable, node-local high-water mark so
