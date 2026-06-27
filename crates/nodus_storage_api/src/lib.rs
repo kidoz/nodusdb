@@ -123,6 +123,16 @@ pub trait KvEngine: Send + Sync {
         Vec::new()
     }
 
+    /// Ensures this engine reflects every write committed before the call for the
+    /// group that owns `key` — a linearizable-read barrier. A reader that runs
+    /// this before scanning observes all earlier committed writes, closing the
+    /// stale-read window a replica's replication lag would otherwise open.
+    /// Default: no-op — a single-node engine has no lag to wait out; only the
+    /// Raft routing engine performs a real cross-node (ReadIndex) barrier.
+    fn read_barrier(&self, _key: &[u8]) -> KvResult<()> {
+        Ok(())
+    }
+
     /// Reclaims MVCC versions that no active reader can observe: for each key,
     /// committed versions strictly older than the newest version at or below
     /// `watermark` are removed. `watermark` must be ≤ the oldest active read

@@ -39,6 +39,8 @@ pub struct Metrics {
     pub cross_shard_aborts_total: Counter,
     /// Cross-shard commits re-driven by startup recovery.
     pub txn_recoveries_total: Counter,
+    /// Reads that performed a linearizable (Raft ReadIndex) barrier before scanning.
+    pub linearizable_reads_total: Counter,
     /// Data-shard Raft groups hosted on this node, and how many lack a leader.
     pub shard_groups: Gauge,
     pub shard_groups_unavailable: Gauge,
@@ -58,6 +60,7 @@ impl Default for Metrics {
             cross_shard_commits_total: Counter::default(),
             cross_shard_aborts_total: Counter::default(),
             txn_recoveries_total: Counter::default(),
+            linearizable_reads_total: Counter::default(),
             shard_groups: Gauge::default(),
             shard_groups_unavailable: Gauge::default(),
         }
@@ -116,6 +119,11 @@ impl Metrics {
             "nodus_txn_recoveries_total",
             "Cross-shard commits re-driven by startup recovery",
             m.txn_recoveries_total.clone(),
+        );
+        registry.register(
+            "nodus_linearizable_reads_total",
+            "Reads that performed a linearizable Raft ReadIndex barrier before scanning",
+            m.linearizable_reads_total.clone(),
         );
         registry.register(
             "nodus_shard_groups",

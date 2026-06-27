@@ -16,10 +16,11 @@
 //! `tokio::task::spawn_blocking`), never directly on a reactor worker thread.
 
 use anyhow::{Result, anyhow};
-use nodus_raftstore::{NodusTypeConfig, ShardCommand, ShardResponse};
+use nodus_raftstore::{NodusTypeConfig, ReadIndexResponse, ShardCommand, ShardResponse};
 use openraft::Raft;
-use openraft::error::{ClientWriteError, ForwardToLeader, RaftError};
+use openraft::error::{CheckIsLeaderError, ClientWriteError, ForwardToLeader, RaftError};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::multi_raft::MultiRaftManager;
@@ -28,17 +29,30 @@ use crate::multi_raft::MultiRaftManager;
 /// [`ShardResponse::success`]).
 type WriteResult = Result<ShardResponse>;
 
-struct WriteRequest {
-    shard_id: String,
-    cmd: ShardCommand,
-    resp: oneshot::Sender<WriteResult>,
+/// How long a follower waits for its state machine to catch up to the leader's
+/// read index before giving the linearizable read up (and retrying).
+const BARRIER_WAIT: Duration = Duration::from_secs(5);
+
+/// A request handed to the dispatcher: replicate a command, or run a
+/// linearizable-read barrier on a group. Both are bridged sync→async here so the
+/// synchronous storage traits can drive them via `blocking_recv`.
+enum RouterRequest {
+    Write {
+        shard_id: String,
+        cmd: ShardCommand,
+        resp: oneshot::Sender<WriteResult>,
+    },
+    Barrier {
+        shard_id: String,
+        resp: oneshot::Sender<Result<()>>,
+    },
 }
 
 /// Cheap, clonable handle used by synchronous write paths to replicate commands
 /// through the appropriate Raft group.
 #[derive(Clone)]
 pub struct RaftRouter {
-    tx: mpsc::UnboundedSender<WriteRequest>,
+    tx: mpsc::UnboundedSender<RouterRequest>,
 }
 
 impl RaftRouter {
@@ -46,30 +60,36 @@ impl RaftRouter {
     /// Groups are resolved per request through the [`MultiRaftManager`], so a
     /// shard whose group is created later is reachable without re-spawning.
     pub fn spawn(manager: Arc<MultiRaftManager>) -> Self {
-        let (tx, mut rx) = mpsc::unbounded_channel::<WriteRequest>();
+        let (tx, mut rx) = mpsc::unbounded_channel::<RouterRequest>();
         let http = reqwest::Client::new();
         tokio::spawn(async move {
             while let Some(req) = rx.recv().await {
-                let raft = manager.get(&req.shard_id).await;
-                match raft {
-                    Some(raft) => {
-                        // Drive each replication concurrently so independent
-                        // submissions do not serialize behind one another.
-                        let http = http.clone();
-                        let WriteRequest {
-                            shard_id,
-                            cmd,
-                            resp,
-                        } = req;
+                let shard_id = match &req {
+                    RouterRequest::Write { shard_id, .. } => shard_id.clone(),
+                    RouterRequest::Barrier { shard_id, .. } => shard_id.clone(),
+                };
+                let raft = manager.get(&shard_id).await;
+                let http = http.clone();
+                // Drive each request concurrently so independent submissions do
+                // not serialize behind one another.
+                match (raft, req) {
+                    (Some(raft), RouterRequest::Write { cmd, resp, .. }) => {
                         tokio::spawn(async move {
                             let res = replicate(raft, &shard_id, cmd, &http).await;
                             let _ = resp.send(res);
                         });
                     }
-                    None => {
-                        let _ = req
-                            .resp
-                            .send(Err(anyhow!("raft group '{}' not found", req.shard_id)));
+                    (Some(raft), RouterRequest::Barrier { resp, .. }) => {
+                        tokio::spawn(async move {
+                            let res = linearizable_barrier(raft, &shard_id, &http).await;
+                            let _ = resp.send(res);
+                        });
+                    }
+                    (None, RouterRequest::Write { resp, .. }) => {
+                        let _ = resp.send(Err(anyhow!("raft group '{shard_id}' not found")));
+                    }
+                    (None, RouterRequest::Barrier { resp, .. }) => {
+                        let _ = resp.send(Err(anyhow!("raft group '{shard_id}' not found")));
                     }
                 }
             }
@@ -97,9 +117,28 @@ impl RaftRouter {
     fn submit_inner(&self, shard_id: &str, cmd: ShardCommand) -> Result<ShardResponse> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
-            .send(WriteRequest {
+            .send(RouterRequest::Write {
                 shard_id: shard_id.to_string(),
                 cmd,
+                resp: resp_tx,
+            })
+            .map_err(|_| anyhow!("raft router dispatcher stopped"))?;
+        resp_rx
+            .blocking_recv()
+            .map_err(|_| anyhow!("raft router dropped response"))?
+    }
+
+    /// Blocks until this node's replica of `shard_id` reflects every write
+    /// committed before the call — a linearizable-read barrier (Raft ReadIndex).
+    /// After it returns, a local read at the latest snapshot observes all such
+    /// writes, so a read served from any replica is linearizable.
+    ///
+    /// MUST be called from a blocking context (it waits via `blocking_recv`).
+    pub fn read_barrier(&self, shard_id: &str) -> Result<()> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(RouterRequest::Barrier {
+                shard_id: shard_id.to_string(),
                 resp: resp_tx,
             })
             .map_err(|_| anyhow!("raft router dispatcher stopped"))?;
@@ -180,6 +219,85 @@ async fn forward(
     } else {
         Err(anyhow!(
             "leader {addr} rejected forwarded write: {}",
+            resp.status()
+        ))
+    }
+}
+
+/// Runs a linearizable-read barrier on this node's replica of `group_id`.
+///
+/// On the leader, [`Raft::ensure_linearizable`] heartbeats a quorum to confirm
+/// leadership and blocks until the state machine has applied up to the read log
+/// id — a complete barrier. On a follower it returns `ForwardToLeader`; we then
+/// ask the leader for its read index (where the leader confirms *its* leadership)
+/// and wait for this node's own state machine to apply at least that far. Either
+/// way, once this returns a subsequent local read reflects all writes committed
+/// before the barrier. Bounded retries ride out an in-flight election.
+async fn linearizable_barrier(
+    raft: Raft<NodusTypeConfig>,
+    group_id: &str,
+    http: &reqwest::Client,
+) -> Result<()> {
+    for _ in 0..25 {
+        match raft.ensure_linearizable().await {
+            // Leader: leadership confirmed and the state machine is caught up.
+            Ok(_) => return Ok(()),
+            // Follower: fetch the leader's read index, then wait for our own
+            // state machine to catch up to it before reading locally.
+            Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(ForwardToLeader {
+                leader_node: Some(node),
+                ..
+            }))) => match fetch_read_index(http, &node.addr, group_id).await {
+                Ok(Some(index)) => {
+                    raft.wait(Some(BARRIER_WAIT))
+                        .applied_index_at_least(Some(index), "linearizable read barrier")
+                        .await
+                        .map_err(|e| anyhow!("await applied index {index} for {group_id}: {e}"))?;
+                    return Ok(());
+                }
+                // Empty leader log — nothing committed yet, so nothing to wait for.
+                Ok(None) => return Ok(()),
+                Err(e) => {
+                    tracing::debug!("read-index for {group_id} from {} failed: {e}", node.addr)
+                }
+            },
+            // No known leader, or leadership unconfirmable for now — retry.
+            Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(ForwardToLeader {
+                leader_node: None,
+                ..
+            })))
+            | Err(RaftError::APIError(CheckIsLeaderError::QuorumNotEnough(_))) => {}
+            Err(e) => return Err(anyhow!("linearizable barrier on {group_id}: {e}")),
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    Err(anyhow!(
+        "linearizable barrier on '{group_id}' did not converge"
+    ))
+}
+
+/// Asks the leader at `addr` for its read log index for `group_id`. The leader
+/// confirms its own leadership (quorum heartbeat) before answering, so the
+/// returned index is a safe linearization point for a follower to wait on.
+async fn fetch_read_index(
+    http: &reqwest::Client,
+    addr: &str,
+    group_id: &str,
+) -> Result<Option<u64>> {
+    let url = format!("http://{addr}/raft/{group_id}/read_index");
+    let resp = http
+        .post(&url)
+        .send()
+        .await
+        .map_err(|e| anyhow!("read-index to {addr}: {e}"))?;
+    if resp.status().is_success() {
+        resp.json::<ReadIndexResponse>()
+            .await
+            .map(|r| r.index)
+            .map_err(|e| anyhow!("parse read-index response from {addr}: {e}"))
+    } else {
+        Err(anyhow!(
+            "leader {addr} could not serve read-index: {}",
             resp.status()
         ))
     }

@@ -398,6 +398,14 @@ impl KvEngine for RaftKvEngine {
         Ok(())
     }
 
+    fn read_barrier(&self, key: &[u8]) -> KvResult<()> {
+        // Barrier the group that owns the key, exactly where its reads route.
+        let group_id = self.route(key);
+        self.router.read_barrier(&group_id)?;
+        self.metrics.linearizable_reads_total.inc();
+        Ok(())
+    }
+
     fn garbage_collect(&self, watermark: Timestamp) -> Result<usize> {
         self.local.garbage_collect(watermark)
     }
@@ -703,6 +711,30 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(pending, 0, "no commit decision should have been recorded");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn read_barrier_succeeds_on_the_leader() {
+        // On a single-node group this node is the leader, so the linearizable
+        // barrier resolves via `ensure_linearizable` (a self-quorum heartbeat)
+        // without needing a follower read-index round-trip.
+        let fx = setup_two_shards().await;
+        let engine = fx.engine.clone();
+        let row_t = format!("{}:pk", fx.table_t);
+
+        let e = engine.clone();
+        let key = row_t.clone();
+        tokio::task::spawn_blocking(move || e.read_barrier(key.as_bytes()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            engine.metrics.linearizable_reads_total.get(),
+            1,
+            "a completed barrier should be counted"
+        );
+        // The barrier is a pure precondition: a read after it still works.
+        assert_eq!(engine.get(row_t.as_bytes(), 100).unwrap(), None);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

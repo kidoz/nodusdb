@@ -137,6 +137,16 @@ pub struct ShardResponse {
     pub success: bool,
 }
 
+/// The leader's read log index, returned by the `/raft/{group}/read_index`
+/// endpoint. A follower serving a linearizable read asks the leader for this
+/// index (the leader confirms its leadership via a quorum heartbeat first), then
+/// waits for its own state machine to apply at least this far before reading.
+/// `None` means the leader's log is empty, so there is nothing to wait for.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReadIndexResponse {
+    pub index: Option<u64>,
+}
+
 /// Classifies a state-machine KV apply result so a real failure is never
 /// silently dropped. A committed Raft entry whose KV effect fails to apply is a
 /// durability hazard: the entry sits below the applied watermark yet isn't

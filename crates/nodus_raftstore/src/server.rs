@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use tokio::sync::RwLock;
 
-use crate::{NodusTypeConfig, ShardCommand, ShardResponse};
+use crate::{NodusTypeConfig, ReadIndexResponse, ShardCommand, ShardResponse};
 
 pub type NodusRaft = Raft<NodusTypeConfig>;
 
@@ -78,6 +78,7 @@ pub fn raft_routes() -> Router<RaftState> {
         .route("/raft/:shard_id/append", post(append))
         .route("/raft/:shard_id/snapshot", post(snapshot))
         .route("/raft/:shard_id/write", post(write))
+        .route("/raft/:shard_id/read_index", post(read_index))
 }
 
 async fn get_raft(state: &RaftState, shard_id: &str) -> Option<NodusRaft> {
@@ -166,6 +167,27 @@ async fn write(
             // other applied result) reaches the forwarding node.
             axum::Json(resp.data).into_response()
         }
+        Err(e) => (axum::http::StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response(),
+    }
+}
+
+/// Returns the leader's read log index for `shard_id`, used by a follower to
+/// satisfy a linearizable read. `get_read_log_id` confirms this node is still
+/// the leader by heartbeating a quorum before answering, so the index it returns
+/// is a safe linearization point. A non-leader (or a node that can't confirm
+/// leadership) answers `503` so the caller re-resolves the leader and retries.
+async fn read_index(
+    Path(shard_id): Path<String>,
+    State(state): State<RaftState>,
+) -> impl axum::response::IntoResponse {
+    let Some(raft) = get_raft(&state, &shard_id).await else {
+        return (axum::http::StatusCode::NOT_FOUND, "Shard not found").into_response();
+    };
+    match raft.get_read_log_id().await {
+        Ok((read_log_id, _applied)) => axum::Json(ReadIndexResponse {
+            index: read_log_id.map(|l| l.index),
+        })
+        .into_response(),
         Err(e) => (axum::http::StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response(),
     }
 }
