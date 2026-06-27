@@ -16,7 +16,7 @@ use std::sync::{Arc, RwLock};
 use nodus_catalog::{ShardId, TableId};
 use nodus_raftstore::NodusRaftStore;
 use nodus_raftstore::ShardCommand;
-use nodus_raftstore::network::NodusNetworkFactory;
+use nodus_raftstore::network::{NodusNetworkFactory, RaftTransport};
 use nodus_raftstore::server::{NodusRaft, RaftState};
 use nodus_sharding::ShardOrchestrator;
 use nodus_storage_api::{
@@ -126,6 +126,9 @@ pub struct MultiRaftManager {
     /// This node's transaction clock; advanced as groups apply committed writes
     /// so timestamps stay monotonic across leadership changes.
     clock: Arc<dyn nodus_txn::TxnManager>,
+    /// Outbound Raft RPC transport (plain HTTP, or an mTLS `https` client when
+    /// inter-node TLS is enabled). Cloned into each group's network factory.
+    transport: RaftTransport,
     /// Data directory; each group's snapshots stream to/from durable files under
     /// `{data_dir}/snapshots/{shard_id}`. `None` (no data dir) falls back to a
     /// temp directory, matching the ephemeral in-memory store.
@@ -143,6 +146,7 @@ impl MultiRaftManager {
         admin_token: Option<String>,
         clock: Arc<dyn nodus_txn::TxnManager>,
         data_dir: Option<std::path::PathBuf>,
+        transport: RaftTransport,
     ) -> Self {
         Self {
             node_id,
@@ -155,6 +159,7 @@ impl MultiRaftManager {
             http: reqwest::Client::new(),
             clock,
             data_dir,
+            transport,
         }
     }
 
@@ -241,7 +246,7 @@ impl MultiRaftManager {
     /// routed to `/raft/{shard_id}/...` on peers.
     async fn spawn_group(&self, shard_id: &str, store: NodusRaftStore) -> Result<NodusRaft> {
         let (log_store, state_machine) = openraft::storage::Adaptor::new(store);
-        let network = NodusNetworkFactory::new(shard_id.to_string());
+        let network = NodusNetworkFactory::new(shard_id.to_string(), self.transport.clone());
         let raft = NodusRaft::new(
             self.node_id,
             self.config.clone(),
@@ -678,6 +683,7 @@ mod tests {
             None,
             Arc::new(nodus_txn::MemTxnManager::new()),
             None,
+            nodus_raftstore::network::RaftTransport::default(),
         )
     }
 
@@ -833,6 +839,7 @@ mod tests {
             None,
             Arc::new(nodus_txn::MemTxnManager::new()),
             None,
+            nodus_raftstore::network::RaftTransport::default(),
         );
 
         let meta = Arc::new(nodus_meta::PersistentMetaStore::new(base.clone()));
@@ -887,6 +894,7 @@ mod tests {
             None,
             Arc::new(nodus_txn::MemTxnManager::new()),
             None,
+            nodus_raftstore::network::RaftTransport::default(),
         );
 
         let meta = Arc::new(nodus_meta::PersistentMetaStore::new(base.clone()));

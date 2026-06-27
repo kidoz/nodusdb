@@ -38,10 +38,19 @@ pub struct NodusConfig {
 pub struct ClusterConfig {
     /// Unique integer identifier for the node.
     pub node_id: u64,
-    /// The HTTP address this node advertises to peers for Raft communication.
+    /// The address this node advertises to peers for Raft communication. When a
+    /// dedicated `raft_listen_addr` is configured, this should point at it (with
+    /// a hostname/IP that matches the peer certificate when `tls` is enabled).
     pub raft_advertise_addr: String,
     /// A list of addresses of existing nodes to contact for joining.
     pub join_peers: Vec<String>,
+    /// Optional dedicated listen address for inter-node Raft RPCs. When set, Raft
+    /// traffic is served here instead of on the public HTTP listener, isolating
+    /// peer authentication (mTLS) from client/admin access. Required when
+    /// `tls.enabled`.
+    pub raft_listen_addr: Option<String>,
+    /// Mutual-TLS settings for the inter-node Raft channel.
+    pub tls: ClusterTlsConfig,
 }
 
 impl Default for ClusterConfig {
@@ -50,8 +59,27 @@ impl Default for ClusterConfig {
             node_id: 1,
             raft_advertise_addr: "127.0.0.1:8088".into(),
             join_peers: Vec::new(),
+            raft_listen_addr: None,
+            tls: ClusterTlsConfig::default(),
         }
     }
+}
+
+/// Mutual-TLS configuration for the dedicated Raft peer listener. When enabled,
+/// the listener serves Raft RPCs over TLS and requires every peer to present a
+/// client certificate signed by `ca_path`; the outbound Raft client presents
+/// `cert_path`/`key_path` and verifies peers against the same `ca_path`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct ClusterTlsConfig {
+    pub enabled: bool,
+    /// This node's certificate, presented to peers (as a server) and to the
+    /// peer it dials (as a client).
+    pub cert_path: Option<String>,
+    pub key_path: Option<String>,
+    /// CA bundle that signs every node's certificate; used to verify both
+    /// inbound peer certificates and the certificate of a dialed peer.
+    pub ca_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -264,6 +292,27 @@ impl NodusConfig {
                 "tls.enabled requires both cert_path and key_path".into(),
             ));
         }
+        // Inter-node mTLS must run on its own listener: requiring client
+        // certificates on the shared HTTP port would also lock out admin/web
+        // clients, so a dedicated `raft_listen_addr` is mandatory.
+        if self.cluster.tls.enabled {
+            if self.cluster.tls.cert_path.is_none()
+                || self.cluster.tls.key_path.is_none()
+                || self.cluster.tls.ca_path.is_none()
+            {
+                return Err(ConfigError::Invalid(
+                    "cluster.tls.enabled requires cluster.tls cert_path, key_path, and ca_path"
+                        .into(),
+                ));
+            }
+            if self.cluster.raft_listen_addr.is_none() {
+                return Err(ConfigError::Invalid(
+                    "cluster.tls.enabled requires a dedicated cluster.raft_listen_addr so peer \
+                     mTLS does not gate the public HTTP listener"
+                        .into(),
+                ));
+            }
+        }
         // An unauthenticated admin API falls back to the `nodus` superuser, so a
         // non-loopback bind without a token exposes unauthenticated cluster
         // control. Refuse it unless explicitly opted into.
@@ -383,6 +432,23 @@ mod tests {
             assert!(!cfg.storage.allow_ephemeral);
             Ok(())
         });
+    }
+
+    #[test]
+    fn cluster_mtls_requires_certs_and_dedicated_listener() {
+        let mut cfg = NodusConfig::default();
+        cfg.cluster.tls.enabled = true;
+        // Missing cert/key/ca => refused.
+        assert!(cfg.validate().is_err());
+
+        cfg.cluster.tls.cert_path = Some("/tmp/node.crt".into());
+        cfg.cluster.tls.key_path = Some("/tmp/node.key".into());
+        cfg.cluster.tls.ca_path = Some("/tmp/ca.crt".into());
+        // Certs present but no dedicated peer listener => still refused.
+        assert!(cfg.validate().is_err());
+
+        cfg.cluster.raft_listen_addr = Some("0.0.0.0:8090".into());
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]

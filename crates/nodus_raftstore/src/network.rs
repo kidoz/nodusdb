@@ -6,12 +6,53 @@ use openraft::raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
     VoteRequest, VoteResponse,
 };
+use std::sync::Arc;
+
+/// The HTTP client and URL scheme used for inter-node Raft RPCs. Plain HTTP by
+/// default; a TLS-configured client with `https` is supplied when inter-node
+/// mTLS is enabled, so the same RPC code path serves both.
+#[derive(Clone)]
+pub struct RaftTransport {
+    client: reqwest::Client,
+    scheme: Arc<str>,
+}
+
+impl RaftTransport {
+    /// Plain-HTTP transport (no peer TLS).
+    pub fn plain() -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            scheme: Arc::from("http"),
+        }
+    }
+
+    /// Transport over a caller-built client (e.g. one carrying a client identity
+    /// and peer-CA trust) with the given scheme (`http` or `https`).
+    pub fn new(client: reqwest::Client, scheme: impl Into<Arc<str>>) -> Self {
+        Self {
+            client,
+            scheme: scheme.into(),
+        }
+    }
+
+    /// The URL scheme RPCs are issued over (`http` or `https`).
+    pub fn scheme(&self) -> &str {
+        &self.scheme
+    }
+}
+
+impl Default for RaftTransport {
+    fn default() -> Self {
+        Self::plain()
+    }
+}
 
 pub struct NodusNetwork {
     shard_id: String,
     target: u64,
     target_node: BasicNode,
     client: reqwest::Client,
+    scheme: Arc<str>,
 }
 
 impl RaftNetwork<NodusTypeConfig> for NodusNetwork {
@@ -21,8 +62,8 @@ impl RaftNetwork<NodusTypeConfig> for NodusNetwork {
         _option: RPCOption,
     ) -> Result<AppendEntriesResponse<u64>, RPCError<u64, BasicNode, RaftError<u64>>> {
         let url = format!(
-            "http://{}/raft/{}/append",
-            self.target_node.addr, self.shard_id
+            "{}://{}/raft/{}/append",
+            self.scheme, self.target_node.addr, self.shard_id
         );
         let resp = self
             .client
@@ -49,8 +90,8 @@ impl RaftNetwork<NodusTypeConfig> for NodusNetwork {
         RPCError<u64, BasicNode, RaftError<u64, InstallSnapshotError>>,
     > {
         let url = format!(
-            "http://{}/raft/{}/snapshot",
-            self.target_node.addr, self.shard_id
+            "{}://{}/raft/{}/snapshot",
+            self.scheme, self.target_node.addr, self.shard_id
         );
         let resp = self
             .client
@@ -74,8 +115,8 @@ impl RaftNetwork<NodusTypeConfig> for NodusNetwork {
         _option: RPCOption,
     ) -> Result<VoteResponse<u64>, RPCError<u64, BasicNode, RaftError<u64>>> {
         let url = format!(
-            "http://{}/raft/{}/vote",
-            self.target_node.addr, self.shard_id
+            "{}://{}/raft/{}/vote",
+            self.scheme, self.target_node.addr, self.shard_id
         );
         let resp = self
             .client
@@ -96,14 +137,15 @@ impl RaftNetwork<NodusTypeConfig> for NodusNetwork {
 
 pub struct NodusNetworkFactory {
     shard_id: String,
-    client: reqwest::Client,
+    transport: RaftTransport,
 }
 
 impl NodusNetworkFactory {
-    pub fn new(shard_id: String) -> Self {
+    /// Builds a factory for `shard_id` over `transport` (plain HTTP or peer-mTLS).
+    pub fn new(shard_id: String, transport: RaftTransport) -> Self {
         Self {
             shard_id,
-            client: reqwest::Client::new(),
+            transport,
         }
     }
 }
@@ -116,7 +158,8 @@ impl RaftNetworkFactory<NodusTypeConfig> for NodusNetworkFactory {
             shard_id: self.shard_id.clone(),
             target,
             target_node: node.clone(),
-            client: self.client.clone(),
+            client: self.transport.client.clone(),
+            scheme: self.transport.scheme.clone(),
         }
     }
 }

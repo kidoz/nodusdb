@@ -15,6 +15,20 @@ max_connections = 100
 node_id = 1
 raft_advertise_addr = "127.0.0.1:8088"
 join_peers = []
+# Dedicated listener for inter-node Raft RPCs. When set, Raft traffic is served
+# here instead of on the public HTTP port, isolating peer auth (mTLS) from
+# admin/web access. Point raft_advertise_addr at this address for peers to reach.
+# raft_listen_addr = "0.0.0.0:8090"
+
+# Mutual TLS for the inter-node Raft channel. When enabled, the dedicated
+# listener requires every peer to present a certificate signed by ca_path, and
+# this node presents cert_path/key_path when dialing peers. Requires
+# raft_listen_addr to be set.
+[cluster.tls]
+enabled = false
+# cert_path = "./.local/nodus/tls/node.crt"
+# key_path = "./.local/nodus/tls/node.key"
+# ca_path = "./.local/nodus/tls/cluster-ca.crt"
 
 [storage]
 # Required for durable data. If unset, nodusd uses in-memory storage.

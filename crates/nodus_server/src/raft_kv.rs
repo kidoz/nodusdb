@@ -410,6 +410,7 @@ mod tests {
             None,
             Arc::new(nodus_txn::MemTxnManager::new()),
             None,
+            nodus_raftstore::network::RaftTransport::default(),
         ));
 
         let catalog = Arc::new(nodus_catalog::MemoryCatalog::new());
@@ -518,6 +519,7 @@ mod tests {
             None,
             Arc::new(nodus_txn::MemTxnManager::new()),
             None,
+            nodus_raftstore::network::RaftTransport::default(),
         ));
 
         let catalog = Arc::new(nodus_catalog::MemoryCatalog::new());

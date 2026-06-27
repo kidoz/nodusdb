@@ -234,6 +234,106 @@ fn load_tls_config(tls: &nodus_config::TlsConfig) -> anyhow::Result<Option<Arc<S
     Ok(Some(Arc::new(config)))
 }
 
+/// Ensures a process-wide rustls crypto provider is installed (aws-lc-rs).
+/// Idempotent: a no-op once one is present.
+fn ensure_crypto_provider() {
+    let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
+}
+
+/// Builds the TLS server config for the dedicated Raft listener: presents this
+/// node's certificate and **requires** every peer to present a client
+/// certificate signed by the cluster CA. Returns `None` when peer TLS is
+/// disabled. Mandatory client auth is safe here because this listener serves
+/// only Raft RPCs, never admin/web traffic.
+fn load_raft_tls_config(
+    tls: &nodus_config::ClusterTlsConfig,
+) -> anyhow::Result<Option<Arc<ServerConfig>>> {
+    if !tls.enabled {
+        return Ok(None);
+    }
+    let cert_path = tls
+        .cert_path
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("cluster.tls.enabled but cert_path is unset"))?;
+    let key_path = tls
+        .key_path
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("cluster.tls.enabled but key_path is unset"))?;
+    let ca_path = tls
+        .ca_path
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("cluster.tls.enabled but ca_path is unset"))?;
+
+    ensure_crypto_provider();
+
+    let cert_bytes = std::fs::read(cert_path)?;
+    let certs: Vec<CertificateDer> =
+        rustls_pemfile::certs(&mut cert_bytes.as_slice()).collect::<Result<_, _>>()?;
+    let key_bytes = std::fs::read(key_path)?;
+    let key: PrivateKeyDer = rustls_pemfile::private_key(&mut key_bytes.as_slice())?
+        .ok_or_else(|| anyhow::anyhow!("no private key found in {key_path}"))?;
+
+    let ca_bytes = std::fs::read(ca_path)?;
+    let mut roots = RootCertStore::empty();
+    for cert in rustls_pemfile::certs(&mut ca_bytes.as_slice()) {
+        roots.add(cert?)?;
+    }
+    let client_auth = WebPkiClientVerifier::builder(roots.into()).build()?;
+
+    let config = ServerConfig::builder()
+        .with_client_cert_verifier(client_auth)
+        .with_single_cert(certs, key)?;
+    Ok(Some(Arc::new(config)))
+}
+
+/// Builds the outbound Raft RPC transport. With peer TLS disabled this is a
+/// plain-HTTP client; with it enabled the client presents this node's
+/// certificate and trusts only the cluster CA (so connections to peers are
+/// mutually authenticated), and RPC URLs use `https`.
+fn build_raft_transport(
+    cluster: &nodus_config::ClusterConfig,
+) -> anyhow::Result<nodus_raftstore::network::RaftTransport> {
+    if !cluster.tls.enabled {
+        return Ok(nodus_raftstore::network::RaftTransport::plain());
+    }
+    let cert_path = cluster
+        .tls
+        .cert_path
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("cluster.tls.enabled but cert_path is unset"))?;
+    let key_path = cluster
+        .tls
+        .key_path
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("cluster.tls.enabled but key_path is unset"))?;
+    let ca_path = cluster
+        .tls
+        .ca_path
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("cluster.tls.enabled but ca_path is unset"))?;
+
+    ensure_crypto_provider();
+
+    // `Identity::from_pem` scans the buffer for both the certificate chain and
+    // the private key, so the two PEMs are simply concatenated.
+    let mut identity_pem = std::fs::read(cert_path)?;
+    identity_pem.push(b'\n');
+    identity_pem.extend_from_slice(&std::fs::read(key_path)?);
+    let identity = reqwest::Identity::from_pem(&identity_pem)?;
+    let ca = reqwest::Certificate::from_pem(&std::fs::read(ca_path)?)?;
+
+    let client = reqwest::Client::builder()
+        .use_rustls_tls()
+        // Trust only the cluster CA, not the system root store.
+        .tls_built_in_root_certs(false)
+        .add_root_certificate(ca)
+        .identity(identity)
+        .build()?;
+    Ok(nodus_raftstore::network::RaftTransport::new(
+        client, "https",
+    ))
+}
+
 /// Starts the server with default configuration.
 pub async fn run_server(
     pgwire_listener: TcpListener,
@@ -370,6 +470,10 @@ pub async fn run_server_with_config(
         KvTimestampStore::new(local_kv.clone()),
     ))?);
 
+    // Outbound Raft transport: plain HTTP, or an mTLS `https` client when
+    // inter-node TLS is configured.
+    let raft_transport = build_raft_transport(&config.cluster)?;
+
     // Owns this node's Raft groups. The meta group is created now; data-shard
     // groups are created on demand (routing lands in Phase 2).
     let multi_raft = Arc::new(crate::multi_raft::MultiRaftManager::new(
@@ -385,6 +489,7 @@ pub async fn run_server_with_config(
             .data_dir
             .clone()
             .map(std::path::PathBuf::from),
+        raft_transport,
     ));
 
     // Local cluster-metadata store (shard maps + placements), KV-backed so it
@@ -819,12 +924,57 @@ pub async fn run_server_with_config(
         restore_gate: executor.restore_gate(),
     };
 
-    let app = Router::new()
+    // Raft RPCs run on a dedicated, mTLS-capable listener when
+    // `cluster.raft_listen_addr` is set; otherwise they share the public HTTP
+    // listener (the historical layout, used by single-port/dev deployments).
+    let raft_listen_addr = config.cluster.raft_listen_addr.clone();
+    let mut app = Router::new()
         .merge(monitoring_routes(state.clone()))
         .merge(admin_routes(admin_state))
-        .merge(nodus_web_console::web_console_routes())
-        .merge(nodus_raftstore::server::raft_routes().with_state(raft_state))
-        .layer(cors);
+        .merge(nodus_web_console::web_console_routes());
+    if raft_listen_addr.is_none() {
+        app = app.merge(nodus_raftstore::server::raft_routes().with_state(raft_state.clone()));
+    }
+    let app = app.layer(cors);
+
+    // Dedicated Raft peer listener (separate from admin/web), with mandatory
+    // client-certificate mTLS when `cluster.tls` is enabled.
+    let raft_serve_task = if let Some(addr) = raft_listen_addr.clone() {
+        let raft_server_config = load_raft_tls_config(&config.cluster.tls)?;
+        let raft_listener = TcpListener::bind(&addr).await?;
+        let raft_app =
+            Router::new().merge(nodus_raftstore::server::raft_routes().with_state(raft_state));
+        let mut raft_shutdown = shutdown.clone();
+        tracing::info!(
+            "Raft peer listener on {} (mTLS: {})",
+            addr,
+            raft_server_config.is_some()
+        );
+        Some(tokio::spawn(async move {
+            if let Some(cfg) = raft_server_config {
+                let handle = axum_server::Handle::new();
+                let handle_clone = handle.clone();
+                tokio::spawn(async move {
+                    let _ = raft_shutdown.changed().await;
+                    handle_clone.graceful_shutdown(Some(std::time::Duration::from_secs(5)));
+                });
+                let tls_config = axum_server::tls_rustls::RustlsConfig::from_config(cfg);
+                let _ = axum_server::from_tcp_rustls(raft_listener.into_std().unwrap(), tls_config)
+                    .unwrap()
+                    .handle(handle)
+                    .serve(raft_app.into_make_service())
+                    .await;
+            } else {
+                let _ = axum::serve(raft_listener, raft_app)
+                    .with_graceful_shutdown(async move {
+                        let _ = raft_shutdown.changed().await;
+                    })
+                    .await;
+            }
+        }))
+    } else {
+        None
+    };
 
     let metrics_state = state.clone();
     let metrics_manager = multi_raft.clone();
@@ -945,12 +1095,18 @@ pub async fn run_server_with_config(
         http_addr,
         pgwire_task,
         http_task,
-        background_tasks: vec![
-            gc_task,
-            wal_archiver_task,
-            raft_shutdown_task,
-            shard_reconcile_task,
-        ],
+        background_tasks: {
+            let mut tasks = vec![
+                gc_task,
+                wal_archiver_task,
+                raft_shutdown_task,
+                shard_reconcile_task,
+            ];
+            if let Some(task) = raft_serve_task {
+                tasks.push(task);
+            }
+            tasks
+        },
         registry,
     })
 }
@@ -965,6 +1121,116 @@ mod tests {
     fn tls_disabled_yields_no_acceptor() {
         let cfg = TlsConfig::default();
         assert!(load_tls_config(&cfg).unwrap().is_none());
+    }
+
+    #[test]
+    fn raft_transport_is_plain_when_cluster_tls_disabled() {
+        let cluster = nodus_config::ClusterConfig::default();
+        let transport = build_raft_transport(&cluster).unwrap();
+        assert_eq!(transport.scheme(), "http");
+    }
+
+    /// Builds a tiny PKI — a CA plus one leaf certificate signed by it (valid for
+    /// both server and client auth, with a `127.0.0.1` IP SAN) — and writes the
+    /// leaf cert, leaf key, and CA cert PEMs into `dir`. The one leaf doubles as
+    /// every node's identity, which is all a one-host mTLS handshake test needs.
+    fn write_test_certs(dir: &std::path::Path) -> (String, String, String) {
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+
+        let leaf_key = rcgen::KeyPair::generate().unwrap();
+        let mut leaf_params = rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()]).unwrap();
+        leaf_params.extended_key_usages = vec![
+            rcgen::ExtendedKeyUsagePurpose::ServerAuth,
+            rcgen::ExtendedKeyUsagePurpose::ClientAuth,
+        ];
+        let leaf_cert = leaf_params.signed_by(&leaf_key, &ca_cert, &ca_key).unwrap();
+
+        let cert_path = dir.join("node.crt");
+        let key_path = dir.join("node.key");
+        let ca_path = dir.join("ca.crt");
+        std::fs::write(&cert_path, leaf_cert.pem()).unwrap();
+        std::fs::write(&key_path, leaf_key.serialize_pem()).unwrap();
+        std::fs::write(&ca_path, ca_cert.pem()).unwrap();
+        (
+            cert_path.to_string_lossy().into_owned(),
+            key_path.to_string_lossy().into_owned(),
+            ca_path.to_string_lossy().into_owned(),
+        )
+    }
+
+    /// The dedicated Raft listener with mandatory mTLS accepts a peer presenting a
+    /// CA-signed client certificate and rejects one that presents none.
+    #[tokio::test]
+    async fn raft_listener_enforces_mutual_tls() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cert_path, key_path, ca_path) = write_test_certs(dir.path());
+
+        let cluster = nodus_config::ClusterConfig {
+            tls: nodus_config::ClusterTlsConfig {
+                enabled: true,
+                cert_path: Some(cert_path.clone()),
+                key_path: Some(key_path.clone()),
+                ca_path: Some(ca_path.clone()),
+            },
+            raft_listen_addr: Some("127.0.0.1:0".into()),
+            ..Default::default()
+        };
+
+        // Server: serve the Raft routes with mandatory client-cert mTLS.
+        let server_cfg = load_raft_tls_config(&cluster.tls).unwrap().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().merge(
+            nodus_raftstore::server::raft_routes()
+                .with_state(nodus_raftstore::server::RaftState::new()),
+        );
+        let tls_config = axum_server::tls_rustls::RustlsConfig::from_config(server_cfg);
+        tokio::spawn(async move {
+            let _ = axum_server::from_tcp_rustls(listener.into_std().unwrap(), tls_config)
+                .unwrap()
+                .serve(app.into_make_service())
+                .await;
+        });
+        // Give the listener a moment to start accepting.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let url = format!("https://127.0.0.1:{}/raft/shard-meta/vote", addr.port());
+        let body = serde_json::json!({
+            "vote": {"leader_id": {"term": 1, "node_id": 1}, "committed": false},
+            "last_log_id": null
+        });
+
+        // A peer presenting the cluster-signed identity completes the handshake;
+        // the unknown shard then yields a clean 404 (proving TLS succeeded).
+        let mut identity_pem = std::fs::read(&cert_path).unwrap();
+        identity_pem.push(b'\n');
+        identity_pem.extend_from_slice(&std::fs::read(&key_path).unwrap());
+        let ca = reqwest::Certificate::from_pem(&std::fs::read(&ca_path).unwrap()).unwrap();
+        let mtls_client = reqwest::Client::builder()
+            .use_rustls_tls()
+            .tls_built_in_root_certs(false)
+            .add_root_certificate(ca.clone())
+            .identity(reqwest::Identity::from_pem(&identity_pem).unwrap())
+            .build()
+            .unwrap();
+        let resp = mtls_client.post(&url).json(&body).send().await;
+        let status = resp.expect("mTLS peer should connect").status();
+        assert_eq!(status, reqwest::StatusCode::NOT_FOUND);
+
+        // A client with no certificate is rejected at the TLS layer.
+        let no_cert_client = reqwest::Client::builder()
+            .use_rustls_tls()
+            .tls_built_in_root_certs(false)
+            .add_root_certificate(ca)
+            .build()
+            .unwrap();
+        assert!(
+            no_cert_client.post(&url).json(&body).send().await.is_err(),
+            "a peer without a client certificate must be rejected"
+        );
     }
 
     #[tokio::test]
