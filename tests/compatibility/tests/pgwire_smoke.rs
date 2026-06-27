@@ -587,6 +587,54 @@ fn rows_of(msgs: &[SimpleQueryMessage]) -> Vec<&tokio_postgres::SimpleQueryRow> 
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_simple_query_streams_large_result() {
+    let server = TestServer::start().await.expect("server starts");
+    let client = connect(&server).await;
+
+    client
+        .simple_query("CREATE TABLE big (id INT PRIMARY KEY, name TEXT);")
+        .await
+        .unwrap();
+
+    // 1500 rows > the streaming channel capacity (512), so the result can't be
+    // buffered in one chunk — it must stream with back-pressure. Insert in
+    // multi-row batches to keep the test quick.
+    const N: usize = 1500;
+    for chunk_start in (0..N).step_by(500) {
+        let mut insert = String::from("INSERT INTO big (id, name) VALUES ");
+        for i in chunk_start..(chunk_start + 500).min(N) {
+            if i > chunk_start {
+                insert.push(',');
+            }
+            insert.push_str(&format!("({i}, 'name{i}')"));
+        }
+        insert.push(';');
+        client.simple_query(&insert).await.unwrap();
+    }
+
+    // Stream the whole table back over the simple-query protocol.
+    let msgs = client.simple_query("SELECT * FROM big;").await.unwrap();
+    let rows = rows_of(&msgs);
+    assert_eq!(rows.len(), N, "every streamed row must arrive");
+
+    // Every id 0..N is present exactly once, and each row's name matches its id
+    // (so values aren't misaligned across the channel).
+    let mut ids: Vec<i64> = rows
+        .iter()
+        .map(|r| {
+            let id: i64 = r.get(0).unwrap().parse().unwrap();
+            assert_eq!(r.get(1).unwrap(), format!("name{id}"));
+            id
+        })
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(ids.len(), N);
+    assert_eq!(ids[0], 0);
+    assert_eq!(ids[N - 1], (N - 1) as i64);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_arbitrary_table_sql() {
     let server = TestServer::start().await.expect("server starts");
     let client = connect(&server).await;

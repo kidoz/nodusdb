@@ -3,17 +3,22 @@
 //! transaction control, and metadata introspection.
 
 use std::fmt::Debug;
+use std::sync::Arc;
+use std::time::Instant;
 
 use async_trait::async_trait;
 use futures_util::{Sink, SinkExt, StreamExt, stream};
+use nodus_executor::{Row as ExecRow, RowSink};
 use pgwire::api::query::SimpleQueryHandler;
-use pgwire::api::results::{FieldFormat, QueryResponse, Response, Tag};
+use pgwire::api::results::{FieldFormat, FieldInfo, QueryResponse, Response, Tag};
 use pgwire::api::{ClientInfo, PgWireConnectionState};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::PgWireBackendMessage;
 use pgwire::messages::copy::CopyDone;
+use pgwire::messages::data::DataRow;
 use pgwire::messages::response::{CommandComplete, EmptyQueryResponse, ReadyForQuery};
 use pgwire::messages::startup::ParameterStatus;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info};
 
 use crate::client_meta::*;
@@ -21,6 +26,48 @@ use crate::encoding::*;
 use crate::wire_format::*;
 use crate::{CurrentQueryGuard, NodusQueryHandler, QueryTimer, execute_off_reactor};
 use crate::{METADATA_COPY_EXTENDED, METADATA_COPY_ROWS, METADATA_COPY_STMT};
+
+/// Bounded in-flight rows between the blocking executor and the socket writer.
+/// Small enough to bound memory, large enough to keep the socket busy; a full
+/// channel back-pressures the producer (it blocks on send) so a slow client
+/// throttles the scan instead of buffering the whole result.
+const STREAM_CHANNEL_CAPACITY: usize = 512;
+
+/// A [`RowSink`] that encodes each row on the blocking executor thread and sends
+/// it to the socket-writing task through a bounded channel. The schema is handed
+/// over once via a oneshot so the writer can emit `RowDescription` before the
+/// first row.
+struct ChannelSink {
+    schema_tx: Option<oneshot::Sender<Arc<Vec<FieldInfo>>>>,
+    row_tx: mpsc::Sender<DataRow>,
+    field_info: Option<Arc<Vec<FieldInfo>>>,
+}
+
+impl RowSink for ChannelSink {
+    fn schema(&mut self, columns: Vec<String>, types: Vec<String>) {
+        let field_info = field_info_for_output(&columns, &types, |_, _| FieldFormat::Text);
+        self.field_info = Some(field_info.clone());
+        if let Some(tx) = self.schema_tx.take() {
+            // A dropped receiver means the writer task went away; the next `row`
+            // send will observe it and stop the producer.
+            let _ = tx.send(field_info);
+        }
+    }
+
+    fn row(&mut self, row: ExecRow) -> anyhow::Result<()> {
+        let field_info = self
+            .field_info
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("row produced before schema"))?;
+        let data_row = encode_row(&row.values, field_info)?;
+        // Blocking send applies back-pressure; an error means the consumer (the
+        // socket writer) has stopped, so abort the scan promptly.
+        self.row_tx
+            .blocking_send(data_row)
+            .map_err(|_| anyhow::anyhow!("client went away"))?;
+        Ok(())
+    }
+}
 
 #[async_trait]
 impl SimpleQueryHandler for NodusQueryHandler {
@@ -89,6 +136,8 @@ impl SimpleQueryHandler for NodusQueryHandler {
                     "COPY 0".to_owned(),
                 )))
                 .await?;
+        } else if self.try_stream_select(client, &query_string).await? {
+            // A single-statement SELECT was streamed straight to the socket.
         } else {
             let resp = self.do_query(client, &query_string).await?;
             for r in resp {
@@ -325,4 +374,185 @@ impl SimpleQueryHandler for NodusQueryHandler {
         }
         Ok(responses)
     }
+}
+
+impl NodusQueryHandler {
+    /// Streams a single-statement `SELECT` straight to the socket: the executor
+    /// produces rows on the blocking pool into a bounded channel, and this task
+    /// writes each `DataRow` as it arrives, so neither side holds the whole result
+    /// (a slow client back-pressures the scan). Returns `Ok(true)` when it handled
+    /// the query; `Ok(false)` for anything else (multi-statement batches, parse or
+    /// plan failures, non-`SELECT` statements), which the caller routes to the
+    /// buffered path.
+    async fn try_stream_select<C>(&self, client: &mut C, query: &str) -> PgWireResult<bool>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        // Stream only a lone SELECT; batches and other statements keep the
+        // existing path (which echoes ParameterStatus, drives tx state, etc.).
+        let plan = match nodus_sql::parse_sql(query) {
+            Ok(stmts) if stmts.len() == 1 => match nodus_executor::plan_statement(&stmts[0], &[]) {
+                Ok(plan @ nodus_executor::LogicalPlan::Select { .. }) => plan,
+                _ => return Ok(false),
+            },
+            _ => return Ok(false),
+        };
+
+        self.metrics.queries_total.inc();
+        let session_id = {
+            let id = session_id_from_client(client);
+            if id.is_empty() {
+                self.session_id.clone()
+            } else {
+                id
+            }
+        };
+
+        if self.registry.is_cancelled(&session_id) {
+            self.metrics.query_errors_total.inc();
+            return Err(user_error(
+                "ERROR",
+                "57P01",
+                "session terminated by administrator",
+            ));
+        }
+        if self.registry.is_query_cancelled(&session_id) {
+            self.metrics.query_errors_total.inc();
+            return Err(user_error(
+                "ERROR",
+                "57014",
+                "canceling statement due to user request",
+            ));
+        }
+        self.registry.set_current_query(&session_id, query);
+        let _current_query = CurrentQueryGuard {
+            registry: &self.registry,
+            session_id: &session_id,
+        };
+        let _otel_span = nodus_telemetry::start_span("pgwire.simple_query");
+        let _timer = QueryTimer {
+            start: Instant::now(),
+            sql: query,
+            session_id: &session_id,
+            metrics: &self.metrics,
+            slow_log: &self.slow_log,
+        };
+
+        remember_statement_timeout(client, query);
+        if statement_would_timeout(client, query) {
+            self.metrics.query_errors_total.inc();
+            mark_error_status(client);
+            return Err(user_error(
+                "ERROR",
+                "57014",
+                "canceling statement due to statement timeout",
+            ));
+        }
+
+        let principal_id = principal_id_from_client(client);
+        let ctx = nodus_executor::ExecutionContext {
+            session_id: session_id.clone(),
+            principal_id,
+            active_roles: vec![],
+            authz_catalog_version: 1,
+        };
+
+        // Producer: the (blocking) executor streams rows into the bounded channel.
+        let (schema_tx, schema_rx) = oneshot::channel::<Arc<Vec<FieldInfo>>>();
+        let (row_tx, mut row_rx) = mpsc::channel::<DataRow>(STREAM_CHANNEL_CAPACITY);
+        let executor = self.executor.clone();
+        let producer = tokio::task::spawn_blocking(move || {
+            let mut sink = ChannelSink {
+                schema_tx: Some(schema_tx),
+                row_tx,
+                field_info: None,
+            };
+            executor.execute_streaming(&ctx, plan, &mut sink)
+        });
+
+        let to_exec_error = |e: anyhow::Error, this: &Self| -> PgWireError {
+            this.metrics.query_errors_total.inc();
+            let msg = e.to_string();
+            let code = sqlstate_for_execution_error(&msg);
+            PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                code.to_owned(),
+                msg,
+            )))
+        };
+
+        // Wait for the schema (sent before the first row) — or an early failure.
+        let field_info = match schema_rx.await {
+            Ok(field_info) => field_info,
+            Err(_) => {
+                // No schema arrived: the producer finished early (an error, since a
+                // SELECT always has a schema).
+                let result = join_producer(producer).await?;
+                return match result {
+                    Ok(_) => Ok(true),
+                    Err(e) => {
+                        mark_error_status(client);
+                        Err(to_exec_error(e, self))
+                    }
+                };
+            }
+        };
+
+        client
+            .send(PgWireBackendMessage::RowDescription(row_description(
+                &field_info,
+            )))
+            .await?;
+
+        let mut count = 0usize;
+        while let Some(data_row) = row_rx.recv().await {
+            client.feed(PgWireBackendMessage::DataRow(data_row)).await?;
+            count += 1;
+            // Honor cancel/terminate mid-stream. Dropping the receiver makes the
+            // producer's next send fail, stopping the scan.
+            if count.is_multiple_of(1024)
+                && (self.registry.is_query_cancelled(&session_id)
+                    || self.registry.is_cancelled(&session_id))
+            {
+                drop(row_rx);
+                let _ = producer.await;
+                self.metrics.query_errors_total.inc();
+                mark_error_status(client);
+                return Err(user_error(
+                    "ERROR",
+                    "57014",
+                    "canceling statement due to user request",
+                ));
+            }
+        }
+
+        match join_producer(producer).await? {
+            Ok(_tag) => {
+                client
+                    .send(PgWireBackendMessage::CommandComplete(
+                        Tag::new("SELECT").with_rows(count).into(),
+                    ))
+                    .await?;
+                Ok(true)
+            }
+            Err(e) => {
+                // Rows may already have been sent; an ErrorResponse after them is
+                // valid and the established behavior for a mid-result failure.
+                mark_error_status(client);
+                Err(to_exec_error(e, self))
+            }
+        }
+    }
+}
+
+/// Awaits the producer task, turning a join failure (panic/cancel) into a
+/// PgWire-level error.
+async fn join_producer(
+    handle: tokio::task::JoinHandle<anyhow::Result<String>>,
+) -> PgWireResult<anyhow::Result<String>> {
+    handle
+        .await
+        .map_err(|e| user_error("ERROR", "XX000", format!("execution task failed: {e}")))
 }
