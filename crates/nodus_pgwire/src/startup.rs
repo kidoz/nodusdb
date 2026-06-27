@@ -16,7 +16,7 @@ use bytes::Bytes;
 use futures_util::{Sink, SinkExt};
 use nodus_security::{PasswordAuthenticator, ScramVerifier, SessionRegistry};
 use pgwire::api::auth::{
-    DefaultServerParameterProvider, ServerParameterProvider, StartupHandler,
+    DefaultServerParameterProvider, LoginInfo, ServerParameterProvider, StartupHandler,
     save_startup_parameters_to_metadata,
 };
 use pgwire::api::{ClientInfo, PgWireConnectionState};
@@ -190,18 +190,22 @@ impl StartupHandler for NodusStartupHandler {
                         Ok(cf) => cf,
                         Err(_) => return reject_authentication(client).await,
                     };
-                    let Some(keys) = self.authenticator.scram_keys(&cf.username) else {
+                    // PostgreSQL carries the username in the startup `user`
+                    // parameter, not in the SCRAM `n=` field (which clients leave
+                    // empty), so resolve the credential from the login info.
+                    let username = LoginInfo::from_client_info(client)
+                        .user()
+                        .map(|u| u.to_string())
+                        .unwrap_or_default();
+                    let Some(keys) = self.authenticator.scram_keys(&username) else {
                         return reject_authentication(client).await;
                     };
                     let server_nonce = uuid::Uuid::new_v4().simple().to_string();
                     let (server_first, verifier) = ScramVerifier::start(&cf, &keys, &server_nonce);
-                    self.scram_states.write().unwrap().insert(
-                        session_id,
-                        ScramExchange {
-                            username: cf.username,
-                            verifier,
-                        },
-                    );
+                    self.scram_states
+                        .write()
+                        .unwrap()
+                        .insert(session_id, ScramExchange { username, verifier });
                     client
                         .send(PgWireBackendMessage::Authentication(
                             Authentication::SASLContinue(Bytes::from(server_first.into_bytes())),
