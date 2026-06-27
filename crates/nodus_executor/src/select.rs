@@ -45,6 +45,32 @@ impl MemExecutor {
             cte_results.insert(name, out);
         }
 
+        // LIMIT/OFFSET push-down: when the pipeline is a plain row-by-row scan of
+        // a single base table — no join, grouping, ordering, DISTINCT, HAVING,
+        // WHERE, or aggregate/window projection — the result is just the first
+        // `offset + limit` rows in scan order, so we can stop scanning there
+        // instead of materializing the whole table. Any of those operators needs
+        // the full input, so they disable the push-down.
+        let scan_cap: Option<usize> = match limit {
+            Some(lim)
+                if joins.is_empty()
+                    && group_by.is_empty()
+                    && order_by.is_empty()
+                    && having.is_none()
+                    && filter.is_none()
+                    && !distinct
+                    && projection.iter().all(|p| {
+                        !matches!(
+                            p,
+                            ProjectionItem::Aggregate(..) | ProjectionItem::WindowFunction { .. }
+                        )
+                    }) =>
+            {
+                Some(offset.unwrap_or(0).saturating_add(lim))
+            }
+            _ => None,
+        };
+
         let (tbl_cols, mut col_names, mut stored_rows) = if let Some(cte_out) =
             cte_results.get(&table_name)
         {
@@ -146,6 +172,13 @@ impl MemExecutor {
                             let plan: LogicalPlan = serde_json::from_str(vq)?;
                             let out = self.execute_logical_inner(ctx, plan)?;
                             out.rows.iter().map(|r| r.values.clone()).collect()
+                        } else if let Some(cap) = scan_cap {
+                            // Bounded prefix scan; falls back to a full scan if the
+                            // session has pending overlay rows for this table.
+                            match self.scan_rows_capped(tbl.id, &ctx.session_id, cap)? {
+                                Some(rows) => rows,
+                                None => self.scan_rows(tbl.id, &ctx.session_id)?,
+                            }
                         } else {
                             self.scan_rows(tbl.id, &ctx.session_id)?
                         }

@@ -423,6 +423,40 @@ impl MemExecutor {
         Ok(keyed_rows.into_values().collect())
     }
 
+    /// Like [`Self::scan_rows`] but stops after `cap` rows, for `LIMIT`/`OFFSET`
+    /// push-down: the underlying KV scan yields keys in order, so consuming only
+    /// the first `cap` of them avoids reading (and deserializing) the whole table
+    /// for a query that only needs a bounded prefix.
+    ///
+    /// Returns `None` — signalling the caller to fall back to a full
+    /// [`Self::scan_rows`] — when the session has uncommitted overlay rows in this
+    /// table's range, since a capped committed scan could otherwise skip a pending
+    /// row that sorts within the cap. A read-only/autocommit statement has no such
+    /// overlay, which is the case this optimization targets.
+    pub(crate) fn scan_rows_capped(
+        &self,
+        table_id: TableId,
+        session: &str,
+        cap: usize,
+    ) -> Result<Option<Vec<Vec<Value>>>> {
+        if let Some(txn) = self.active_txns.read().unwrap().get(session) {
+            let start = format!("{}:", table_id);
+            let end = format!("{};", table_id);
+            if txn.overlay.keys().any(|k| k >= &start && k < &end) {
+                return Ok(None);
+            }
+        }
+        let read_ts = self.read_ts(session);
+        let start = Bytes::from(format!("{}:", table_id));
+        let end = Bytes::from(format!("{};", table_id));
+        let mut rows = Vec::with_capacity(cap.min(1024));
+        for pair in self.kv.scan(KeyRange { start, end }, read_ts)?.take(cap) {
+            let pair = pair?;
+            rows.push(serde_json::from_slice::<Vec<Value>>(&pair.value)?);
+        }
+        Ok(Some(rows))
+    }
+
     /// Scans a secondary index to quickly look up primary keys, then fetches those rows.
     pub(crate) fn index_scan(
         &self,
@@ -715,5 +749,7 @@ mod phase1_tests;
 mod phase2_tests;
 #[cfg(test)]
 mod phase3_tests;
+#[cfg(test)]
+mod streaming_tests;
 #[cfg(test)]
 mod tests;
