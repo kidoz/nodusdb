@@ -372,8 +372,53 @@ impl Sstable {
             file,
             position: 0,
             data_end,
+            end: None,
         })
     }
+
+    /// A lazy iterator over entries with key in `[start, end)`. The block index
+    /// is used to seek directly to the block that may contain `start` (instead of
+    /// the file head), and iteration stops as soon as a key reaches `end`. The
+    /// first block may include a few keys below `start`; callers filter those.
+    /// This keeps a ranged scan's I/O proportional to the range, not the file.
+    pub fn range_iter(&self, start: &[u8], end: Bytes) -> Result<SstableIterator> {
+        let mut file = File::open(&self.path)?;
+        let Some(footer) = Self::read_footer(&mut file)? else {
+            return Ok(SstableIterator {
+                file,
+                position: 0,
+                data_end: 0,
+                end: Some(end),
+            });
+        };
+        let index = Self::read_index(&mut file, &footer)?;
+        // The last block whose first key is <= `start` is the one that could hold
+        // `start`; if `start` precedes every block, begin at the first.
+        let candidate = index.partition_point(|bh| bh.first_key.as_slice() <= start);
+        let position = if candidate == 0 {
+            0
+        } else {
+            index[candidate - 1].offset
+        };
+        file.seek(SeekFrom::Start(position))?;
+        Ok(SstableIterator {
+            file,
+            position,
+            data_end: footer.index_offset,
+            end: Some(end),
+        })
+    }
+}
+
+/// Reads `n` bytes from `file`, refusing a length that exceeds `avail` (the bytes
+/// remaining in the data region) so a corrupt length can't drive a huge buffer.
+fn read_entry_bytes(file: &mut File, n: usize, avail: u64) -> Result<Vec<u8>> {
+    if n as u64 > avail {
+        bail!("sstable: entry length exceeds data region");
+    }
+    let mut b = vec![0u8; n];
+    file.read_exact(&mut b)?;
+    Ok(b)
 }
 
 struct Footer {
@@ -383,11 +428,42 @@ struct Footer {
     bloom_len: u32,
 }
 
-/// Iterates the data region in key order (blocks are written in sorted order).
+/// Iterates the data region in key order (blocks are written in sorted order),
+/// optionally stopping at an exclusive upper-bound key (`end`).
 pub struct SstableIterator {
     file: File,
     position: u64,
     data_end: u64,
+    /// Exclusive upper bound; iteration ends once a key reaches it. `None` scans
+    /// the whole data region.
+    end: Option<Bytes>,
+}
+
+impl SstableIterator {
+    /// Reads one entry at the current position. `Ok(None)` means the key reached
+    /// the `end` bound (stop without error).
+    fn read_entry(&mut self) -> Result<Option<(Bytes, VersionChain)>> {
+        let avail = self.data_end.saturating_sub(self.position);
+        let klen = u32::from_le_bytes(
+            read_entry_bytes(&mut self.file, 4, avail)?
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let key = read_entry_bytes(&mut self.file, klen, avail)?;
+        if let Some(end) = self.end.as_ref()
+            && key.as_slice() >= end.as_ref()
+        {
+            return Ok(None);
+        }
+        let vlen = u32::from_le_bytes(
+            read_entry_bytes(&mut self.file, 4, avail)?
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let val = read_entry_bytes(&mut self.file, vlen, avail)?;
+        self.position += (8 + klen + vlen) as u64;
+        Ok(Some((Bytes::from(key), bincode::deserialize(&val)?)))
+    }
 }
 
 impl Iterator for SstableIterator {
@@ -397,30 +473,19 @@ impl Iterator for SstableIterator {
         if self.position >= self.data_end {
             return None;
         }
-        let data_end = self.data_end;
-        let start = self.position;
-        let mut read = |n: usize| -> std::io::Result<Vec<u8>> {
-            // Bound the allocation against the data region so a corrupt length
-            // can't request a huge buffer before `read_exact` fails.
-            if n as u64 > data_end.saturating_sub(start) {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "sstable: entry length exceeds data region",
-                ));
+        match self.read_entry() {
+            Ok(Some(entry)) => Some(Ok(entry)),
+            // Reached `end`, or a read error — either way, stop the iterator (mark
+            // it exhausted so a consumer that ignores the error can't spin).
+            Ok(None) => {
+                self.position = self.data_end;
+                None
             }
-            let mut b = vec![0u8; n];
-            self.file.read_exact(&mut b)?;
-            Ok(b)
-        };
-        let result = (|| -> Result<(Bytes, VersionChain)> {
-            let klen = u32::from_le_bytes(read(4)?.try_into().unwrap()) as usize;
-            let key = read(klen)?;
-            let vlen = u32::from_le_bytes(read(4)?.try_into().unwrap()) as usize;
-            let val = read(vlen)?;
-            self.position += (8 + klen + vlen) as u64;
-            Ok((Bytes::from(key), bincode::deserialize(&val)?))
-        })();
-        Some(result)
+            Err(e) => {
+                self.position = self.data_end;
+                Some(Err(e))
+            }
+        }
     }
 }
 

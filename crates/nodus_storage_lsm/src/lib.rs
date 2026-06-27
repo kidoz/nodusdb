@@ -59,6 +59,104 @@ fn chain_bytes(key: &[u8], chain: &VersionChain) -> usize {
             .sum::<usize>()
 }
 
+/// One key-ordered source (an SSTable's ranged iterator or the memtable
+/// snapshot) feeding the lazy merge, with one item buffered for peeking.
+struct ScanSource {
+    iter: Box<dyn Iterator<Item = Result<(Bytes, VersionChain)>> + Send>,
+    front: Option<(Bytes, VersionChain)>,
+    done: bool,
+}
+
+impl ScanSource {
+    fn new(iter: Box<dyn Iterator<Item = Result<(Bytes, VersionChain)>> + Send>) -> Self {
+        Self {
+            iter,
+            front: None,
+            done: false,
+        }
+    }
+
+    /// Ensures `front` holds the next item, pulling one if needed. A read error
+    /// is surfaced to the caller and leaves the source exhausted.
+    fn fill(&mut self) -> Result<()> {
+        if self.front.is_none() && !self.done {
+            match self.iter.next() {
+                Some(Ok(item)) => self.front = Some(item),
+                Some(Err(e)) => {
+                    self.done = true;
+                    return Err(e);
+                }
+                None => self.done = true,
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A lazy k-way merge over key-ordered [`ScanSource`]s. It yields each key once,
+/// in ascending order, resolving the MVCC version visible at `read_ts` from the
+/// highest-precedence source holding that key (sources are ordered ascending in
+/// precedence, so a later source wins). Peak memory is the number of sources
+/// plus one buffered entry each — independent of the range's size — instead of
+/// materializing the whole range up front.
+struct LazyMergeScan {
+    sources: Vec<ScanSource>,
+    read_ts: Timestamp,
+    errored: bool,
+}
+
+impl Iterator for LazyMergeScan {
+    type Item = Result<KvPair>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.errored {
+            return None;
+        }
+        loop {
+            for source in &mut self.sources {
+                if let Err(e) = source.fill() {
+                    self.errored = true;
+                    return Some(Err(e));
+                }
+            }
+
+            let min_key = self
+                .sources
+                .iter()
+                .filter_map(|s| s.front.as_ref().map(|(k, _)| k.clone()))
+                .min();
+            let min_key = min_key?;
+
+            // Advance every source positioned on this key; the last (highest
+            // precedence) chain wins.
+            let mut chosen: Option<VersionChain> = None;
+            for source in &mut self.sources {
+                if source.front.as_ref().is_some_and(|(k, _)| *k == min_key) {
+                    chosen = Some(source.front.take().unwrap().1);
+                }
+            }
+            let chain = chosen.expect("a source held min_key");
+
+            if let Some(val) = chain.read(self.read_ts) {
+                let version = chain
+                    .versions
+                    .iter()
+                    .filter(|v| v.is_visible(self.read_ts))
+                    .map(|v| v.version)
+                    .max()
+                    .unwrap_or(0);
+                return Some(Ok(KvPair {
+                    key: min_key,
+                    value: Bytes::from(val.to_vec()),
+                    version,
+                }));
+            }
+            // No version visible at read_ts (tombstone or newer write): skip this
+            // key and continue with the next.
+        }
+    }
+}
+
 impl LsmKvEngine {
     pub fn new() -> Self {
         Self {
@@ -436,48 +534,43 @@ impl KvEngine for LsmKvEngine {
         let start = Bytes::from(range.start.as_ref().to_vec());
         let end = Bytes::from(range.end.as_ref().to_vec());
 
-        let mut merged = BTreeMap::new();
-
-        // Lock order is always memtable-before-sstables (see `get`/`flush`) to
-        // stay deadlock-free; iterate SSTables first so the memtable overrides.
+        // Snapshot the memtable range (bounded by the flush threshold) and open
+        // one lazy file iterator per SSTable, then release the locks. Each
+        // iterator owns its file descriptor, so a compaction that later unlinks
+        // the file doesn't disturb an in-flight scan (the inode stays alive while
+        // the fd is open). Lock order is memtable-before-sstables, as in `get`.
         let mem_guard = self.memtable.read().unwrap();
         let sst_guard = self.sstables.read().unwrap();
+        let mem_snapshot: Vec<(Bytes, VersionChain)> = mem_guard
+            .range(start.clone()..end.clone())
+            .map(|(k, chain)| (k.clone(), chain.clone()))
+            .collect();
+        // Ascending precedence: earlier SSTables first, then the memtable last, so
+        // the highest-precedence chain for a key wins the merge (matching `get`).
+        let mut sources: Vec<ScanSource> = Vec::with_capacity(sst_guard.len() + 1);
         for sst in sst_guard.iter() {
-            if let Ok(iter) = sst.iter() {
-                for item in iter.flatten() {
-                    let (k, chain) = item;
-                    if k >= start && k < end {
-                        merged.insert(k, chain);
-                    }
-                }
+            // An unreadable SSTable contributes nothing, matching the previous
+            // `iter().flatten()` behavior of skipping it.
+            if let Ok(iter) = sst.range_iter(&start, end.clone()) {
+                let lower = start.clone();
+                // `range_iter` may emit a few keys below `start` from the first
+                // block; drop them here.
+                let bounded = iter.filter(move |item| match item {
+                    Ok((k, _)) => k.as_ref() >= lower.as_ref(),
+                    Err(_) => true,
+                });
+                sources.push(ScanSource::new(Box::new(bounded)));
             }
-        }
-        for (k, chain) in mem_guard.range(start..end) {
-            merged.insert(k.clone(), chain.clone());
         }
         drop(sst_guard);
         drop(mem_guard);
+        sources.push(ScanSource::new(Box::new(mem_snapshot.into_iter().map(Ok))));
 
-        let mut results = Vec::new();
-        for (k, chain) in merged {
-            if let Some(val) = chain.read(read_ts) {
-                let version = chain
-                    .versions
-                    .iter()
-                    .filter(|v| v.is_visible(read_ts))
-                    .map(|v| v.version)
-                    .max()
-                    .unwrap_or(0);
-
-                results.push(Ok(KvPair {
-                    key: k,
-                    value: Bytes::from(val.to_vec()),
-                    version,
-                }));
-            }
-        }
-
-        Ok(Box::new(results.into_iter()))
+        Ok(Box::new(LazyMergeScan {
+            sources,
+            read_ts,
+            errored: false,
+        }))
     }
 
     fn scan_versions(
@@ -703,6 +796,124 @@ impl KvEngine for LsmKvEngine {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// Commits `key=value` at `ts` in one transaction.
+    fn put(engine: &LsmKvEngine, key: &str, value: &str, ts: Timestamp) {
+        let txn = TxnId::new();
+        engine
+            .write_intent(
+                txn,
+                Bytes::from(key.to_owned()),
+                Bytes::from(value.to_owned()),
+            )
+            .unwrap();
+        engine.commit(txn, ts).unwrap();
+    }
+
+    fn scan_all(engine: &LsmKvEngine, read_ts: Timestamp) -> Vec<(String, String)> {
+        engine
+            .scan(
+                KeyRange {
+                    start: Bytes::from_static(b""),
+                    end: Bytes::from_static(b"\xff"),
+                },
+                read_ts,
+            )
+            .unwrap()
+            .map(|p| {
+                let p = p.unwrap();
+                (
+                    String::from_utf8(p.key.to_vec()).unwrap(),
+                    String::from_utf8(p.value.to_vec()).unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn scan_merges_memtable_over_sstable_in_key_order() {
+        let dir = TempDir::new().unwrap();
+        let engine = LsmKvEngine::with_wal(dir.path(), None).unwrap();
+
+        // Three keys flushed to an SSTable...
+        put(&engine, "k1", "a", 10);
+        put(&engine, "k2", "b", 10);
+        put(&engine, "k3", "c", 10);
+        engine.flush().unwrap();
+        // ...then an update to k2 and a new k4 in the memtable.
+        put(&engine, "k2", "B", 20);
+        put(&engine, "k4", "d", 20);
+
+        // The merge yields every key once, in order, with the memtable's k2
+        // overriding the SSTable's.
+        assert_eq!(
+            scan_all(&engine, 20),
+            vec![
+                ("k1".into(), "a".into()),
+                ("k2".into(), "B".into()),
+                ("k3".into(), "c".into()),
+                ("k4".into(), "d".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn scan_skips_keys_deleted_in_the_memtable() {
+        let dir = TempDir::new().unwrap();
+        let engine = LsmKvEngine::with_wal(dir.path(), None).unwrap();
+
+        put(&engine, "k1", "a", 10);
+        put(&engine, "k2", "b", 10);
+        engine.flush().unwrap();
+
+        // Tombstone k2 in the memtable; the merge must drop it (the memtable
+        // tombstone outranks the SSTable value).
+        let txn = TxnId::new();
+        engine
+            .delete_intent(txn, Bytes::from_static(b"k2"))
+            .unwrap();
+        engine.commit(txn, 20).unwrap();
+
+        assert_eq!(scan_all(&engine, 20), vec![("k1".into(), "a".into())]);
+    }
+
+    #[test]
+    fn scan_respects_an_older_read_timestamp() {
+        let dir = TempDir::new().unwrap();
+        let engine = LsmKvEngine::with_wal(dir.path(), None).unwrap();
+
+        put(&engine, "k1", "a", 10);
+        put(&engine, "k2", "b", 30);
+
+        // At ts=20 only k1 is visible; k2's only version (ts=30) is in the future.
+        assert_eq!(scan_all(&engine, 20), vec![("k1".into(), "a".into())]);
+    }
+
+    #[test]
+    fn sstable_range_iter_stops_at_end_without_reading_the_rest() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("many.sst");
+        let mut data = std::collections::BTreeMap::new();
+        for i in 0..1000 {
+            // Zero-padded keys sort lexicographically in numeric order.
+            data.insert(Bytes::from(format!("key{i:04}")), VersionChain::default());
+        }
+        Sstable::build(&path, &data).unwrap();
+        let sst = Sstable::open(&path);
+
+        // Starting before all keys and bounding at "key0005" must yield exactly
+        // the first five entries — the iterator stops at the bound instead of
+        // walking all 1000.
+        let prefix: Vec<String> = sst
+            .range_iter(b"", Bytes::from_static(b"key0005"))
+            .unwrap()
+            .map(|item| String::from_utf8(item.unwrap().0.to_vec()).unwrap())
+            .collect();
+        assert_eq!(
+            prefix,
+            vec!["key0000", "key0001", "key0002", "key0003", "key0004"]
+        );
+    }
 
     #[test]
     fn test_custom_lsm_mvcc_visibility() {
