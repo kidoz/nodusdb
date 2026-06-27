@@ -53,6 +53,10 @@ pub struct AdminState {
     pub draining: Arc<AtomicBool>,
     pub authenticator: Arc<PasswordAuthenticator>,
     pub admin_token: Option<String>,
+    /// Explicit opt-in to an unauthenticated admin API: only when this is set does
+    /// an anonymous (no-credential) request fall back to the `nodus` superuser.
+    /// Off by default, so a misconfigured node never silently exposes superuser.
+    pub allow_insecure: bool,
     pub raft_state: nodus_raftstore::server::RaftState,
     pub membership_lock: Arc<tokio::sync::Mutex<()>>,
     /// Serializes backup restores so two never interleave their catalog/KV
@@ -125,7 +129,11 @@ async fn require_token(
             return Err(StatusCode::UNAUTHORIZED);
         }
     } else {
-        if state.admin_token.is_none() {
+        // No credentials presented. Fall back to the `nodus` superuser only when
+        // an unauthenticated admin API was explicitly opted into; otherwise deny,
+        // so an anonymous request can never be silently elevated to superuser
+        // (e.g. via SSRF or a co-located low-privilege process on loopback).
+        if state.admin_token.is_none() && state.allow_insecure {
             if let Ok(p) = state.catalog.get_principal_by_name("nodus") {
                 p.id
             } else {

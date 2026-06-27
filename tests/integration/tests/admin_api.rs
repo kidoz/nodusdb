@@ -411,6 +411,7 @@ async fn durable_audit_persists_to_configured_file() {
     let _ = std::fs::remove_file(&path);
     let mut config = nodus_config::NodusConfig::default();
     config.admin.password = Some("nodus".into());
+    config.admin.allow_insecure = true;
     config.audit.file_path = Some(path.to_string_lossy().to_string());
 
     let server = TestServer::start_with_config(config)
@@ -466,6 +467,7 @@ async fn admin_backup_pitr_restore() {
 
     let mut config = nodus_config::NodusConfig::default();
     config.admin.password = Some("nodus".into());
+    config.admin.allow_insecure = true;
     config.storage.data_dir = Some(data_dir.to_string_lossy().to_string());
     config.backup.repository_uri = format!("file://{}", backup_dir.to_string_lossy());
 
@@ -673,4 +675,43 @@ async fn admin_role_and_grant_api_round_trip() {
         .await
         .unwrap();
     assert_eq!(revoked["revoked"], serde_json::json!(true));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn anonymous_admin_is_denied_unless_allow_insecure() {
+    // No admin token and allow_insecure left at its default (false): an
+    // anonymous admin request must be denied, not silently elevated to the
+    // `nodus` superuser. Credentialed (Basic) access still works.
+    let mut config = nodus_config::NodusConfig::default();
+    config.admin.password = Some("nodus".into());
+    let server = TestServer::start_with_config(config)
+        .await
+        .expect("server starts");
+    let base = format!("http://{}", server.http_addr);
+    let http = reqwest::Client::new();
+
+    let anon = http
+        .get(format!("{base}/api/v1/sessions"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        anon.status().as_u16(),
+        401,
+        "anonymous admin request must be rejected"
+    );
+
+    let authed = http
+        .get(format!("{base}/api/v1/sessions"))
+        .basic_auth("nodus", Some("nodus"))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        authed.status().is_success(),
+        "superuser Basic auth must be accepted, got {}",
+        authed.status()
+    );
+
+    server.shutdown().await;
 }

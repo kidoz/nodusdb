@@ -913,6 +913,7 @@ pub async fn run_server_with_config(
         draining: state.draining.clone(),
         authenticator: authenticator.clone(),
         admin_token: config.admin.token.clone(),
+        allow_insecure: config.admin.allow_insecure,
         raft_state: raft_state.clone(),
         membership_lock: Arc::new(tokio::sync::Mutex::new(())),
         restore_lock: Arc::new(tokio::sync::Mutex::new(())),

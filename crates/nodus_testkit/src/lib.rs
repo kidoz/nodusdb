@@ -28,6 +28,9 @@ impl TestServer {
     pub async fn start() -> anyhow::Result<Self> {
         let mut config = nodus_config::NodusConfig::default();
         config.admin.password = Some("nodus".into());
+        // Test harness: allow the unauthenticated admin API (anonymous superuser)
+        // so tests can call admin endpoints without wiring a token.
+        config.admin.allow_insecure = true;
         Self::start_with_config(config).await
     }
 

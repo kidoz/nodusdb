@@ -117,6 +117,8 @@ fn spawn_node(id: u64, http: &str, pg: &str, peers: Option<&str>) -> NodeGuard {
         .env("NODUS_CLUSTER__RAFT_ADVERTISE_ADDR", http)
         .env("NODUS_STORAGE__DATA_DIR", dir.path())
         .env("NODUS_ADMIN__PASSWORD", "nodus")
+        // Test harness: drain is called without admin credentials below.
+        .env("NODUS_ADMIN__ALLOW_INSECURE", "true")
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit());
 
