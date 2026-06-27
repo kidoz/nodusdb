@@ -126,9 +126,14 @@ pub struct MultiRaftManager {
     /// This node's transaction clock; advanced as groups apply committed writes
     /// so timestamps stay monotonic across leadership changes.
     clock: Arc<dyn nodus_txn::TxnManager>,
+    /// Data directory; each group's snapshots stream to/from durable files under
+    /// `{data_dir}/snapshots/{shard_id}`. `None` (no data dir) falls back to a
+    /// temp directory, matching the ephemeral in-memory store.
+    data_dir: Option<std::path::PathBuf>,
 }
 
 impl MultiRaftManager {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         node_id: u64,
         advertise_addr: String,
@@ -137,6 +142,7 @@ impl MultiRaftManager {
         base_kv: Arc<dyn KvEngine>,
         admin_token: Option<String>,
         clock: Arc<dyn nodus_txn::TxnManager>,
+        data_dir: Option<std::path::PathBuf>,
     ) -> Self {
         Self {
             node_id,
@@ -148,6 +154,18 @@ impl MultiRaftManager {
             admin_token,
             http: reqwest::Client::new(),
             clock,
+            data_dir,
+        }
+    }
+
+    /// Durable directory for `shard_id`'s snapshots, or a unique temp dir when no
+    /// data dir is configured (ephemeral / in-memory mode).
+    fn group_snapshot_dir(&self, shard_id: &str) -> std::path::PathBuf {
+        match &self.data_dir {
+            Some(dir) => dir.join("snapshots").join(shard_id),
+            None => {
+                std::env::temp_dir().join(format!("nodus-snap-{shard_id}-{}", uuid::Uuid::new_v4()))
+            }
         }
     }
 
@@ -199,6 +217,7 @@ impl MultiRaftManager {
             catalog_reader,
             upgrade,
             meta_store,
+            self.group_snapshot_dir(META_SHARD),
         );
         self.spawn_group(META_SHARD, store).await
     }
@@ -213,7 +232,7 @@ impl MultiRaftManager {
         let kv: Arc<dyn KvEngine> =
             Arc::new(NamespacedKvEngine::new(self.base_kv.clone(), shard_id));
         let kv = ClockAdvancingKvEngine::wrap(kv, self.clock.clone());
-        let store = NodusRaftStore::with_kv(kv);
+        let store = NodusRaftStore::with_kv_at(kv, self.group_snapshot_dir(shard_id));
         self.spawn_group(shard_id, store).await
     }
 
@@ -658,6 +677,7 @@ mod tests {
             base_kv,
             None,
             Arc::new(nodus_txn::MemTxnManager::new()),
+            None,
         )
     }
 
@@ -812,6 +832,7 @@ mod tests {
             base.clone(),
             None,
             Arc::new(nodus_txn::MemTxnManager::new()),
+            None,
         );
 
         let meta = Arc::new(nodus_meta::PersistentMetaStore::new(base.clone()));
@@ -865,6 +886,7 @@ mod tests {
             base.clone(),
             None,
             Arc::new(nodus_txn::MemTxnManager::new()),
+            None,
         );
 
         let meta = Arc::new(nodus_meta::PersistentMetaStore::new(base.clone()));

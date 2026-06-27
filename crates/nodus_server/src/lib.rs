@@ -380,6 +380,11 @@ pub async fn run_server_with_config(
         local_kv.clone(),
         config.admin.token.clone(),
         txn.clone(),
+        config
+            .storage
+            .data_dir
+            .clone()
+            .map(std::path::PathBuf::from),
     ));
 
     // Local cluster-metadata store (shard maps + placements), KV-backed so it

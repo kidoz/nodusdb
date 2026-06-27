@@ -409,6 +409,7 @@ mod tests {
             base.clone(),
             None,
             Arc::new(nodus_txn::MemTxnManager::new()),
+            None,
         ));
 
         let catalog = Arc::new(nodus_catalog::MemoryCatalog::new());
@@ -516,6 +517,7 @@ mod tests {
             base.clone(),
             None,
             Arc::new(nodus_txn::MemTxnManager::new()),
+            None,
         ));
 
         let catalog = Arc::new(nodus_catalog::MemoryCatalog::new());
