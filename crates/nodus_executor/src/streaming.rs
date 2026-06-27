@@ -11,7 +11,23 @@
 use crate::*;
 use anyhow::Result;
 use bytes::Bytes;
-use nodus_storage_api::{KeyRange, KvEngine};
+use nodus_storage_api::{KeyRange, KvEngine, TxnId};
+use nodus_txn::TxnManager;
+
+/// Aborts an implicit read transaction when the streaming scan ends (including on
+/// an early `?` return), releasing its GC-watermark hold.
+struct ImplicitReadTxn<'a> {
+    txn: &'a std::sync::Arc<dyn TxnManager>,
+    id: Option<TxnId>,
+}
+
+impl Drop for ImplicitReadTxn<'_> {
+    fn drop(&mut self) {
+        if let Some(id) = self.id {
+            let _ = self.txn.abort_txn(id);
+        }
+    }
+}
 
 impl MemExecutor {
     /// Streams `plan` to `sink` if it is a plain single-table scan; otherwise
@@ -176,10 +192,34 @@ impl MemExecutor {
             (cols, types, idx)
         };
 
+        // Establish a consistent read snapshot. An autocommit scan has no active
+        // transaction, so `read_ts` would be `u64::MAX` ("read the latest version
+        // of each key as the scan progresses") — not a snapshot. Open a short
+        // implicit read transaction for the scan's duration so it sees one fixed
+        // snapshot, exactly as `execute_logical` does for the buffered path. (It
+        // also registers the read with the GC watermark for its lifetime.)
+        let has_active_txn = self
+            .active_txns
+            .read()
+            .unwrap()
+            .contains_key(&ctx.session_id);
+        let implicit = if has_active_txn {
+            None
+        } else {
+            Some(self.txn.begin_txn()?)
+        };
+        let _read_txn = ImplicitReadTxn {
+            txn: &self.txn,
+            id: implicit.as_ref().map(|rec| rec.txn_id),
+        };
+        let read_ts = match &implicit {
+            Some(rec) => rec.read_ts,
+            None => self.read_ts(&ctx.session_id),
+        };
+
         // Committed to streaming: emit the schema, then the rows.
         sink.schema(out_cols, out_types);
 
-        let read_ts = self.read_ts(&ctx.session_id);
         let start = Bytes::from(format!("{}:", tbl.id));
         let end = Bytes::from(format!("{};", tbl.id));
         let mut produced = 0usize;

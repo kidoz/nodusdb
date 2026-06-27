@@ -13,13 +13,15 @@ use nodus_storage_api::{
     IntentReplacement, KeyRange, KvEngine, KvPair, KvResult, Timestamp, TxnId,
 };
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// Wraps a KV engine and counts how many pairs are *pulled* from each scan
-/// iterator, so a test can assert the executor consumed only a bounded prefix.
+/// iterator (so a test can assert the executor consumed only a bounded prefix),
+/// and records the `read_ts` of the most recent scan.
 struct CountingKv {
     inner: Arc<dyn KvEngine>,
     scanned: Arc<AtomicUsize>,
+    last_scan_read_ts: Arc<AtomicU64>,
 }
 
 struct CountingIter {
@@ -47,6 +49,7 @@ impl KvEngine for CountingKv {
         range: KeyRange,
         read_ts: Timestamp,
     ) -> Result<Box<dyn Iterator<Item = Result<KvPair>> + Send>> {
+        self.last_scan_read_ts.store(read_ts, Ordering::SeqCst);
         let inner = self.inner.scan(range, read_ts)?;
         Ok(Box::new(CountingIter {
             inner,
@@ -92,7 +95,14 @@ fn ctx_for(principal: PrincipalId) -> ExecutionContext {
 
 /// Builds an executor over a counting KV engine, with a superuser principal and a
 /// `t(id INT, name TEXT)` table holding `n` rows.
-fn exec_with_rows(n: i64) -> (Arc<MemExecutor>, Arc<AtomicUsize>, ExecutionContext) {
+fn exec_with_rows(
+    n: i64,
+) -> (
+    Arc<MemExecutor>,
+    Arc<AtomicUsize>,
+    Arc<AtomicU64>,
+    ExecutionContext,
+) {
     let cat = Arc::new(MemoryCatalog::new());
     let db = cat
         .create_database(CreateDatabaseRequest {
@@ -111,9 +121,11 @@ fn exec_with_rows(n: i64) -> (Arc<MemExecutor>, Arc<AtomicUsize>, ExecutionConte
     .unwrap();
 
     let scanned = Arc::new(AtomicUsize::new(0));
+    let last_scan_read_ts = Arc::new(AtomicU64::new(0));
     let kv = Arc::new(CountingKv {
         inner: Arc::new(nodus_storage_mem::MemKvEngine::new()),
         scanned: scanned.clone(),
+        last_scan_read_ts: last_scan_read_ts.clone(),
     });
     let txn = Arc::new(nodus_txn::MemTxnManager::new());
     let authz = Arc::new(nodus_authz::DefaultAuthzEngine::new(cat.clone()));
@@ -181,7 +193,7 @@ fn exec_with_rows(n: i64) -> (Arc<MemExecutor>, Arc<AtomicUsize>, ExecutionConte
         .unwrap();
     }
 
-    (exec, scanned, ctx)
+    (exec, scanned, last_scan_read_ts, ctx)
 }
 
 fn select_plan(
@@ -251,7 +263,7 @@ impl RowSink for AbortAfter {
 
 #[test]
 fn streaming_select_star_matches_the_full_path() {
-    let (exec, _scanned, ctx) = exec_with_rows(20);
+    let (exec, _scanned, _read_ts, ctx) = exec_with_rows(20);
 
     let full = exec
         .execute_logical(&ctx, select_plan(None, None, None))
@@ -269,7 +281,7 @@ fn streaming_select_star_matches_the_full_path() {
 
 #[test]
 fn streaming_projects_columns_with_where_and_limit() {
-    let (exec, _scanned, ctx) = exec_with_rows(30);
+    let (exec, _scanned, _read_ts, ctx) = exec_with_rows(30);
 
     // SELECT name FROM t WHERE name = 'n7' LIMIT 5 — column projection + filter.
     let filter = Some(FilterExpr::Predicate(Predicate {
@@ -303,7 +315,7 @@ fn streaming_projects_columns_with_where_and_limit() {
 
 #[test]
 fn streaming_stops_scanning_when_the_sink_aborts() {
-    let (exec, scanned, ctx) = exec_with_rows(50);
+    let (exec, scanned, _read_ts, ctx) = exec_with_rows(50);
 
     // The sink accepts 3 rows then errors; the scan must stop right after,
     // never reading the remaining ~47 rows.
@@ -320,7 +332,7 @@ fn streaming_stops_scanning_when_the_sink_aborts() {
 
 #[test]
 fn streaming_falls_back_for_non_streamable_shapes() {
-    let (exec, _scanned, ctx) = exec_with_rows(10);
+    let (exec, _scanned, _read_ts, ctx) = exec_with_rows(10);
 
     // ORDER BY needs the full input, so this takes the fallback path; the result
     // must still be correct (and sorted).
@@ -351,7 +363,7 @@ fn streaming_falls_back_for_non_streamable_shapes() {
 
 #[test]
 fn limit_pushdown_scans_only_the_capped_prefix() {
-    let (exec, scanned, ctx) = exec_with_rows(50);
+    let (exec, scanned, _read_ts, ctx) = exec_with_rows(50);
 
     // LIMIT 5: the scan must yield only 5 rows, not all 50.
     scanned.store(0, Ordering::SeqCst);
@@ -384,7 +396,7 @@ fn limit_pushdown_scans_only_the_capped_prefix() {
 
 #[test]
 fn pushdown_returns_the_same_rows_as_the_full_pipeline() {
-    let (exec, _scanned, ctx) = exec_with_rows(40);
+    let (exec, _scanned, _read_ts, ctx) = exec_with_rows(40);
 
     let full = exec
         .execute_logical(&ctx, select_plan(None, None, None))
@@ -406,7 +418,7 @@ fn pushdown_returns_the_same_rows_as_the_full_pipeline() {
 
 #[test]
 fn a_where_filter_disables_pushdown() {
-    let (exec, scanned, ctx) = exec_with_rows(50);
+    let (exec, scanned, _read_ts, ctx) = exec_with_rows(50);
 
     // A WHERE clause could remove rows, so the cap can't be applied pre-filter:
     // the scan must read the whole table even with a LIMIT.
@@ -425,4 +437,25 @@ fn a_where_filter_disables_pushdown() {
         50,
         "a filtered LIMIT must not cap the scan"
     );
+}
+
+#[test]
+fn streaming_uses_a_snapshot_read_ts_not_latest() {
+    // An autocommit streamed SELECT must read at a fixed snapshot (a real clock
+    // timestamp), not u64::MAX ("read the latest version of each key as the scan
+    // progresses"), so a concurrent write can't be seen mid-scan.
+    let (exec, _scanned, read_ts, ctx) = exec_with_rows(5);
+
+    let mut sink = CollectSink::default();
+    exec.execute_streaming(&ctx, select_plan(None, None, None), &mut sink)
+        .unwrap();
+    assert_eq!(sink.rows.len(), 5);
+
+    let used = read_ts.load(Ordering::SeqCst);
+    assert_ne!(
+        used,
+        u64::MAX,
+        "streamed scan must use a snapshot read_ts, not u64::MAX (read-latest)"
+    );
+    assert!(used > 0, "read_ts should be a real clock timestamp");
 }
