@@ -29,6 +29,7 @@ mod planner;
 mod select;
 mod session_vars;
 mod set_ops;
+mod streaming;
 mod system_views;
 mod transactions;
 mod value;
@@ -63,6 +64,15 @@ impl QueryOutput {
             tag: tag.to_string(),
         }
     }
+}
+
+/// Receives a streamed query result: the schema exactly once (before any row),
+/// then each row in turn. [`RowSink::row`] returns `Err` to abort streaming early
+/// — e.g. when the downstream consumer (the client socket) has gone away — so the
+/// producer stops promptly instead of scanning the rest of the table.
+pub trait RowSink {
+    fn schema(&mut self, columns: Vec<String>, types: Vec<String>);
+    fn row(&mut self, row: Row) -> Result<()>;
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -146,6 +156,25 @@ pub trait Executor: Send + Sync {
     /// Releases any per-session state (GUC overlay, dangling transaction) when a
     /// connection closes. Default is a no-op for executors that hold none.
     fn end_session(&self, _session_id: &str) {}
+
+    /// Executes `plan`, streaming its result to `sink`: the schema first, then
+    /// each row. A plain single-table scan streams row-by-row with bounded
+    /// memory; every other shape is fully executed and its rows then pushed.
+    /// Returns the command tag. The default materializes via
+    /// [`Executor::execute_logical`]; implementations override it to stream.
+    fn execute_streaming(
+        &self,
+        ctx: &ExecutionContext,
+        plan: LogicalPlan,
+        sink: &mut dyn RowSink,
+    ) -> Result<String> {
+        let out = self.execute_logical(ctx, plan)?;
+        sink.schema(out.columns, out.types);
+        for row in out.rows {
+            sink.row(row)?;
+        }
+        Ok(out.tag)
+    }
 }
 
 /// Reserved KV key under which the catalog's serialized state is stored. The
@@ -730,6 +759,15 @@ impl Executor for MemExecutor {
 
     fn execute_physical(&self, ctx: &ExecutionContext, plan: PhysicalPlan) -> Result<Vec<Row>> {
         self.execute_physical_inner(ctx, plan)
+    }
+
+    fn execute_streaming(
+        &self,
+        ctx: &ExecutionContext,
+        plan: LogicalPlan,
+        sink: &mut dyn RowSink,
+    ) -> Result<String> {
+        self.stream_or_fallback(ctx, plan, sink)
     }
 
     fn end_session(&self, session_id: &str) {

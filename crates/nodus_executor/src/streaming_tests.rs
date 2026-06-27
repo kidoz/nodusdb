@@ -212,6 +212,143 @@ fn rendered(out: &QueryOutput) -> Vec<Vec<String>> {
         .collect()
 }
 
+/// A [`RowSink`] that records the schema and every row (rendered to strings).
+#[derive(Default)]
+struct CollectSink {
+    columns: Vec<String>,
+    types: Vec<String>,
+    rows: Vec<Vec<String>>,
+}
+
+impl RowSink for CollectSink {
+    fn schema(&mut self, columns: Vec<String>, types: Vec<String>) {
+        self.columns = columns;
+        self.types = types;
+    }
+    fn row(&mut self, row: Row) -> anyhow::Result<()> {
+        self.rows.push(row.values.iter().map(render).collect());
+        Ok(())
+    }
+}
+
+/// A [`RowSink`] that aborts (returns `Err`) once it has accepted `limit` rows,
+/// modelling a client that disconnects mid-stream.
+struct AbortAfter {
+    limit: usize,
+    count: usize,
+}
+
+impl RowSink for AbortAfter {
+    fn schema(&mut self, _columns: Vec<String>, _types: Vec<String>) {}
+    fn row(&mut self, _row: Row) -> anyhow::Result<()> {
+        self.count += 1;
+        if self.count > self.limit {
+            anyhow::bail!("consumer gone");
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn streaming_select_star_matches_the_full_path() {
+    let (exec, _scanned, ctx) = exec_with_rows(20);
+
+    let full = exec
+        .execute_logical(&ctx, select_plan(None, None, None))
+        .unwrap();
+    let mut sink = CollectSink::default();
+    let tag = exec
+        .execute_streaming(&ctx, select_plan(None, None, None), &mut sink)
+        .unwrap();
+
+    assert_eq!(sink.columns, full.columns);
+    assert_eq!(sink.types, full.types);
+    assert_eq!(sink.rows, rendered(&full));
+    assert_eq!(tag, "SELECT 20");
+}
+
+#[test]
+fn streaming_projects_columns_with_where_and_limit() {
+    let (exec, _scanned, ctx) = exec_with_rows(30);
+
+    // SELECT name FROM t WHERE name = 'n7' LIMIT 5 — column projection + filter.
+    let filter = Some(FilterExpr::Predicate(Predicate {
+        left: "name".into(),
+        op: CompareOp::Eq,
+        right: Operand::Literal(Value::Text("n7".into())),
+    }));
+    let plan = LogicalPlan::Select {
+        ctes: vec![],
+        table_alias: None,
+        group_by: vec![],
+        table_name: "t".into(),
+        joins: vec![],
+        projection: vec![ProjectionItem::Column("name".into())],
+        filter,
+        having: None,
+        order_by: vec![],
+        limit: Some(5),
+        offset: None,
+        distinct: false,
+    };
+
+    let full = exec.execute_logical(&ctx, plan.clone()).unwrap();
+    let mut sink = CollectSink::default();
+    exec.execute_streaming(&ctx, plan, &mut sink).unwrap();
+
+    assert_eq!(sink.columns, vec!["name".to_string()]);
+    assert_eq!(sink.rows, rendered(&full));
+    assert_eq!(sink.rows, vec![vec!["n7".to_string()]]);
+}
+
+#[test]
+fn streaming_stops_scanning_when_the_sink_aborts() {
+    let (exec, scanned, ctx) = exec_with_rows(50);
+
+    // The sink accepts 3 rows then errors; the scan must stop right after,
+    // never reading the remaining ~47 rows.
+    scanned.store(0, Ordering::SeqCst);
+    let mut sink = AbortAfter { limit: 3, count: 0 };
+    let result = exec.execute_streaming(&ctx, select_plan(None, None, None), &mut sink);
+    assert!(result.is_err(), "the aborted sink should surface an error");
+    assert!(
+        scanned.load(Ordering::SeqCst) <= 4,
+        "scan should stop within one row of the abort, read {}",
+        scanned.load(Ordering::SeqCst)
+    );
+}
+
+#[test]
+fn streaming_falls_back_for_non_streamable_shapes() {
+    let (exec, _scanned, ctx) = exec_with_rows(10);
+
+    // ORDER BY needs the full input, so this takes the fallback path; the result
+    // must still be correct (and sorted).
+    let plan = LogicalPlan::Select {
+        ctes: vec![],
+        table_alias: None,
+        group_by: vec![],
+        table_name: "t".into(),
+        joins: vec![],
+        projection: vec![],
+        filter: None,
+        having: None,
+        order_by: vec![("id".into(), false)], // DESC
+        limit: Some(3),
+        offset: None,
+        distinct: false,
+    };
+
+    let full = exec.execute_logical(&ctx, plan.clone()).unwrap();
+    let mut sink = CollectSink::default();
+    exec.execute_streaming(&ctx, plan, &mut sink).unwrap();
+
+    assert_eq!(sink.rows, rendered(&full));
+    assert_eq!(sink.rows.len(), 3);
+    // DESC: first id is the largest (9).
+    assert_eq!(sink.rows[0][0], "9");
+}
+
 #[test]
 fn limit_pushdown_scans_only_the_capped_prefix() {
     let (exec, scanned, ctx) = exec_with_rows(50);
