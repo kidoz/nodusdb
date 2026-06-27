@@ -4,7 +4,7 @@
 
 use crate::{
     CompareOp, ExecutionContext, FilterExpr, MemExecutor, Operand, Predicate, QueryOutput, Value,
-    coerce, column_type, compare, render,
+    coerce, column_type, compare, render, values_equal,
 };
 use anyhow::Result;
 use nodus_catalog::ColumnDescriptor;
@@ -108,8 +108,10 @@ impl MemExecutor {
 
                 let ord = compare(left_cell, &right_cell);
                 Some(match p.op {
-                    CompareOp::Eq => *left_cell == right_cell,
-                    CompareOp::Ne => *left_cell != right_cell,
+                    // Equality routes through `compare` (via `values_equal`) so it
+                    // agrees with ordering — `5 = 5.0` is true, `5 = '5'` is false.
+                    CompareOp::Eq => values_equal(left_cell, &right_cell),
+                    CompareOp::Ne => !values_equal(left_cell, &right_cell),
                     CompareOp::Lt => ord == std::cmp::Ordering::Less,
                     CompareOp::Le => ord != std::cmp::Ordering::Greater,
                     CompareOp::Gt => ord == std::cmp::Ordering::Greater,
@@ -172,7 +174,7 @@ impl MemExecutor {
                         self.eval_operand(row, col_names, columns, op, &columns[idx].data_type);
                     if right_cell == Value::Null {
                         found_null = true;
-                    } else if *left_cell == right_cell {
+                    } else if values_equal(left_cell, &right_cell) {
                         is_match = true;
                         break;
                     }
@@ -229,7 +231,7 @@ impl MemExecutor {
                         let right_cell = coerce(&render(c), column_type(&columns[idx].data_type));
                         if right_cell == Value::Null {
                             found_null = true;
-                        } else if *left_cell == right_cell {
+                        } else if values_equal(left_cell, &right_cell) {
                             matches = true;
                             break;
                         }

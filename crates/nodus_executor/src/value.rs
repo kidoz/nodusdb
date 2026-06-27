@@ -176,7 +176,7 @@ pub(crate) fn eval_scalar_function(name: &str, args: &[Value]) -> Value {
             .cloned()
             .unwrap_or(Value::Null),
         "NULLIF" => {
-            if args.len() == 2 && args[0] == args[1] {
+            if args.len() == 2 && values_equal(&args[0], &args[1]) {
                 Value::Null
             } else {
                 args.first().cloned().unwrap_or(Value::Null)
@@ -227,26 +227,119 @@ pub(crate) fn eval_scalar_function(name: &str, args: &[Value]) -> Value {
     }
 }
 
+/// A fixed ordering rank per value category, so cross-category comparisons are
+/// total and deterministic instead of rendering to text. `Int`/`Float` share a
+/// rank because they compare numerically.
+fn type_rank(v: &Value) -> u8 {
+    match v {
+        Value::Null => 0,
+        Value::Bool(_) => 1,
+        Value::Int(_) | Value::Float(_) => 2,
+        Value::Text(_) => 3,
+        Value::Array(_) => 4,
+        Value::Jsonb(_) => 5,
+    }
+}
+
+/// Total ordering over values, used for ORDER BY, DISTINCT, MIN/MAX, and (via
+/// [`values_equal`]) SQL equality so they all agree.
+///
+/// Numbers compare by magnitude (`Int`/`Float` interchangeably); within a
+/// category the natural order applies. Values of *different* categories are
+/// never compared by their rendered text — that made `Int(5)` and `Text("5")`
+/// compare *equal* while `=` treated them as distinct, silently corrupting
+/// `WHERE`/`JOIN`/`ORDER BY`/aggregates on any column holding mixed types.
+/// Cross-category pairs order by [`type_rank`], keeping the relation total and
+/// consistent with equality.
 pub(crate) fn compare(a: &Value, b: &Value) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     match (a, b) {
         (Value::Int(x), Value::Int(y)) => x.cmp(y),
         (Value::Float(x), Value::Float(y)) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
-        // Mixed numeric operands must compare by value, not by their rendered
-        // text — otherwise e.g. `Int(9)` vs `Float(10.0)` would compare "9" > "10"
-        // lexically and silently corrupt WHERE/ORDER BY/MIN/MAX/join results.
         (Value::Int(x), Value::Float(y)) => (*x as f64).partial_cmp(y).unwrap_or(Ordering::Equal),
         (Value::Float(x), Value::Int(y)) => x.partial_cmp(&(*y as f64)).unwrap_or(Ordering::Equal),
         (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
         (Value::Text(x), Value::Text(y)) => x.cmp(y),
-        _ => render(a).cmp(&render(b)),
+        (Value::Null, Value::Null) => Ordering::Equal,
+        (Value::Array(x), Value::Array(y)) => {
+            for (xe, ye) in x.iter().zip(y.iter()) {
+                let ord = compare(xe, ye);
+                if ord != Ordering::Equal {
+                    return ord;
+                }
+            }
+            x.len().cmp(&y.len())
+        }
+        (Value::Jsonb(x), Value::Jsonb(y)) => x.to_string().cmp(&y.to_string()),
+        // Different categories: order by rank, never by rendered text.
+        _ => type_rank(a).cmp(&type_rank(b)),
     }
+}
+
+/// SQL value equality, defined as `compare(a, b) == Equal` so ordering and
+/// equality never disagree. Numerically-equal `Int`/`Float` are equal; values of
+/// different categories (e.g. `Int(5)` vs `Text("5")`) are not. NULL handling
+/// (three-valued logic) is the caller's responsibility — callers that need it
+/// short-circuit on NULL before calling this.
+pub(crate) fn values_equal(a: &Value, b: &Value) -> bool {
+    compare(a, b) == std::cmp::Ordering::Equal
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::cmp::Ordering;
+
+    #[test]
+    fn cross_type_orders_by_rank_not_rendered_text() {
+        // The core soundness bug: `Int(5)` and `Text("5")` rendered to "5" and
+        // compared *equal*. They are different categories and must not be equal.
+        assert_eq!(
+            compare(&Value::Int(5), &Value::Text("5".into())),
+            Ordering::Less
+        );
+        assert!(!values_equal(&Value::Int(5), &Value::Text("5".into())));
+        // And ordering is by category rank, not lexical text ("10" < "9").
+        assert_eq!(
+            compare(&Value::Int(10), &Value::Text("9".into())),
+            Ordering::Less
+        );
+        // Bool vs Text, Null vs anything: total, deterministic, never equal.
+        assert_eq!(
+            compare(&Value::Bool(true), &Value::Text("t".into())),
+            Ordering::Less
+        );
+        assert!(!values_equal(&Value::Bool(true), &Value::Text("t".into())));
+        assert_eq!(compare(&Value::Null, &Value::Int(0)), Ordering::Less);
+    }
+
+    #[test]
+    fn equality_agrees_with_ordering() {
+        // For every pair, `values_equal` is exactly `compare == Equal`.
+        let vals = [
+            Value::Null,
+            Value::Bool(false),
+            Value::Bool(true),
+            Value::Int(5),
+            Value::Float(5.0),
+            Value::Float(5.5),
+            Value::Text("5".into()),
+            Value::Text("abc".into()),
+        ];
+        for a in &vals {
+            for b in &vals {
+                assert_eq!(
+                    values_equal(a, b),
+                    compare(a, b) == Ordering::Equal,
+                    "inconsistent for {a:?} vs {b:?}"
+                );
+            }
+        }
+        // Numerically-equal Int/Float are equal; same value across categories is not.
+        assert!(values_equal(&Value::Int(5), &Value::Float(5.0)));
+        assert!(!values_equal(&Value::Int(5), &Value::Bool(true)));
+        assert!(values_equal(&Value::Null, &Value::Null));
+    }
 
     #[test]
     fn mixed_int_float_compares_numerically_not_lexically() {

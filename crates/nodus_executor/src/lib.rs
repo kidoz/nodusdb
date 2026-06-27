@@ -43,6 +43,7 @@ pub use planner::{expr_to_value, parse_object_name, plan_statement};
 pub use value::{ColumnDef, Value};
 pub(crate) use value::{
     coerce, column_type, compare, eval_scalar_function, literal_arg, render, resolve_scalar_arg,
+    values_equal,
 };
 
 /// Result of executing a statement: a tag for non-row commands, and column

@@ -2,7 +2,10 @@
 //! table-level CHECK and foreign-key validation, evaluated against the table's
 //! current rows.
 
-use crate::{ExecutionContext, MemExecutor, Value, parse_filter_expr, parse_object_name, render};
+use crate::{
+    ExecutionContext, MemExecutor, Value, parse_filter_expr, parse_object_name, render,
+    values_equal,
+};
 use anyhow::Result;
 
 impl MemExecutor {
@@ -38,7 +41,7 @@ impl MemExecutor {
             for (idx_name, col_idx) in &unique_col_indices {
                 let existing_val = existing.get(*col_idx).unwrap_or(&Value::Null);
                 let new_val = new_row.get(*col_idx).unwrap_or(&Value::Null);
-                if existing_val != &Value::Null && existing_val == new_val {
+                if existing_val != &Value::Null && values_equal(existing_val, new_val) {
                     anyhow::bail!("Unique constraint violation on index '{}'", idx_name);
                 }
             }
@@ -104,7 +107,7 @@ impl MemExecutor {
                             .unwrap();
                         let mut found = false;
                         for f_row in self.scan_rows(f_tbl.id, &ctx.session_id)? {
-                            if &f_row[ref_idx] == val {
+                            if values_equal(&f_row[ref_idx], val) {
                                 found = true;
                                 break;
                             }
