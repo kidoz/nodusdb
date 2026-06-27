@@ -6,7 +6,7 @@ RUN cargo build --release --bin nodus_server --bin nodus_cli
 
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends ca-certificates gosu \
     && rm -rf /var/lib/apt/lists/*
 
 # Separate data, backup, and audit directories (operational default).
@@ -18,6 +18,7 @@ RUN groupadd --system --gid 10001 nodus \
 COPY --from=builder /src/target/release/nodus_server /usr/local/bin/nodus_server
 COPY --from=builder /src/target/release/nodus_cli /usr/local/bin/nodusctl
 COPY deploy/nodus.example.toml /etc/nodus/nodus.toml
+COPY deploy/docker/entrypoint.sh /usr/local/bin/nodus-entrypoint
 
 ENV NODUS_CONFIG=/etc/nodus/nodus.toml
 # Bind to all interfaces inside the container; restrict via published ports.
@@ -32,5 +33,5 @@ EXPOSE 5432 8088
 HEALTHCHECK --interval=10s --timeout=3s --retries=5 \
     CMD nodusctl health --addr http://127.0.0.1:8088 || exit 1
 
-USER nodus
-ENTRYPOINT ["/usr/local/bin/nodus_server"]
+ENTRYPOINT ["/usr/local/bin/nodus-entrypoint"]
+CMD ["/usr/local/bin/nodus_server"]
