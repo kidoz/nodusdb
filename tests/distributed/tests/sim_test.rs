@@ -203,7 +203,10 @@ async fn test_cluster_partition_linearizability() {
         tokio::spawn(async move {
             let (log_store, state_machine) = openraft::storage::Adaptor::new(store);
             let raft_network = FaultyNetworkFactory {
-                inner: NodusNetworkFactory::new("shard-meta".to_string()),
+                inner: NodusNetworkFactory::new(
+                    "shard-meta".to_string(),
+                    nodus_raftstore::network::RaftTransport::default(),
+                ),
                 partitioned: part_clone,
             };
 
