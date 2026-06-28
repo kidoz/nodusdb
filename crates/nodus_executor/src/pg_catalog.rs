@@ -649,6 +649,160 @@ impl MemExecutor {
                 ]),
                 Vec::new(),
             )),
+            // Procedural languages. NodusDB runs no user functions, but PostgreSQL
+            // always ships these four, and IDE introspection joins against them;
+            // advertise them so those joins resolve.
+            "pg_language" => Some((
+                Self::virtual_columns(&[
+                    ("oid", "OID"),
+                    ("lanname", "NAME"),
+                    ("lanowner", "OID"),
+                    ("lanispl", "BOOL"),
+                    ("lanpltrusted", "BOOL"),
+                    ("lanplcallfoid", "OID"),
+                    ("laninline", "OID"),
+                    ("lanvalidator", "OID"),
+                    ("lanacl", "TEXT"),
+                ]),
+                vec![
+                    vec![
+                        Value::Int(12),
+                        Value::Text("internal".into()),
+                        Value::Int(10),
+                        Value::Bool(false),
+                        Value::Bool(false),
+                        Value::Int(0),
+                        Value::Int(0),
+                        Value::Int(0),
+                        Value::Null,
+                    ],
+                    vec![
+                        Value::Int(13),
+                        Value::Text("c".into()),
+                        Value::Int(10),
+                        Value::Bool(false),
+                        Value::Bool(false),
+                        Value::Int(0),
+                        Value::Int(0),
+                        Value::Int(0),
+                        Value::Null,
+                    ],
+                    vec![
+                        Value::Int(14),
+                        Value::Text("sql".into()),
+                        Value::Int(10),
+                        Value::Bool(false),
+                        Value::Bool(true),
+                        Value::Int(0),
+                        Value::Int(0),
+                        Value::Int(0),
+                        Value::Null,
+                    ],
+                    vec![
+                        Value::Int(Self::stable_oid("language:plpgsql", 13500)),
+                        Value::Text("plpgsql".into()),
+                        Value::Int(10),
+                        Value::Bool(true),
+                        Value::Bool(true),
+                        Value::Int(0),
+                        Value::Int(0),
+                        Value::Int(0),
+                        Value::Null,
+                    ],
+                ],
+            )),
+            // Dependency graph: NodusDB does not track inter-object dependencies,
+            // so the relation exists but is empty (tools tolerate no dependencies).
+            "pg_depend" => Some((
+                Self::virtual_columns(&[
+                    ("classid", "OID"),
+                    ("objid", "OID"),
+                    ("objsubid", "INT4"),
+                    ("refclassid", "OID"),
+                    ("refobjid", "OID"),
+                    ("refobjsubid", "INT4"),
+                    ("deptype", "PG_CHAR"),
+                ]),
+                Vec::new(),
+            )),
+            // Foreign-data infrastructure: NodusDB has no FDWs, servers, or user
+            // mappings, but IDE introspection lists these relations; present them
+            // with their real shape and no rows.
+            "pg_foreign_data_wrapper" => Some((
+                Self::virtual_columns(&[
+                    ("oid", "OID"),
+                    ("fdwname", "NAME"),
+                    ("fdwowner", "OID"),
+                    ("fdwhandler", "OID"),
+                    ("fdwvalidator", "OID"),
+                    ("fdwacl", "TEXT"),
+                    ("fdwoptions", "TEXT"),
+                ]),
+                Vec::new(),
+            )),
+            "pg_foreign_server" => Some((
+                Self::virtual_columns(&[
+                    ("oid", "OID"),
+                    ("srvname", "NAME"),
+                    ("srvowner", "OID"),
+                    ("srvfdw", "OID"),
+                    ("srvtype", "TEXT"),
+                    ("srvversion", "TEXT"),
+                    ("srvacl", "TEXT"),
+                    ("srvoptions", "TEXT"),
+                ]),
+                Vec::new(),
+            )),
+            "pg_user_mapping" => Some((
+                Self::virtual_columns(&[
+                    ("oid", "OID"),
+                    ("umuser", "OID"),
+                    ("umserver", "OID"),
+                    ("umoptions", "TEXT"),
+                ]),
+                Vec::new(),
+            )),
+            // Available extensions. NodusDB ships only the always-present plpgsql,
+            // mirrored by pg_extension; advertise it here too so the extensions
+            // browser is populated and valid.
+            "pg_available_extensions" => Some((
+                Self::virtual_columns(&[
+                    ("name", "NAME"),
+                    ("default_version", "TEXT"),
+                    ("installed_version", "TEXT"),
+                    ("comment", "TEXT"),
+                ]),
+                vec![vec![
+                    Value::Text("plpgsql".into()),
+                    Value::Text("1.0".into()),
+                    Value::Text("1.0".into()),
+                    Value::Text("PL/pgSQL procedural language".into()),
+                ]],
+            )),
+            "pg_available_extension_versions" => Some((
+                Self::virtual_columns(&[
+                    ("name", "NAME"),
+                    ("version", "TEXT"),
+                    ("installed", "BOOL"),
+                    ("superuser", "BOOL"),
+                    ("trusted", "BOOL"),
+                    ("relocatable", "BOOL"),
+                    ("schema", "NAME"),
+                    ("requires", "TEXT"),
+                    ("comment", "TEXT"),
+                ]),
+                vec![vec![
+                    Value::Text("plpgsql".into()),
+                    Value::Text("1.0".into()),
+                    Value::Bool(true),
+                    Value::Bool(true),
+                    Value::Bool(true),
+                    Value::Bool(false),
+                    Value::Null,
+                    Value::Null,
+                    Value::Text("PL/pgSQL procedural language".into()),
+                ]],
+            )),
             _ => None,
         };
         Ok(result)

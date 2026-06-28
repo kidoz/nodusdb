@@ -438,6 +438,38 @@ async fn test_pg_catalog_introspection_relations_resolve() {
         "pg_timezone_abbrevs should advertise UTC"
     );
 
+    // The built-in procedural languages are advertised.
+    let msgs = client
+        .simple_query("SELECT lanname FROM pg_catalog.pg_language ORDER BY oid;")
+        .await
+        .expect("pg_language resolves");
+    let langs: Vec<Option<&str>> = rows_of(&msgs).iter().map(|r| r.get(0)).collect();
+    assert_eq!(
+        langs,
+        vec![Some("internal"), Some("c"), Some("sql"), Some("plpgsql")]
+    );
+
+    // The available-extensions views list plpgsql, consistent with pg_extension.
+    let msgs = client
+        .simple_query("SELECT name FROM pg_catalog.pg_available_extensions;")
+        .await
+        .expect("pg_available_extensions resolves");
+    assert!(rows_of(&msgs).iter().any(|r| r.get(0) == Some("plpgsql")));
+    let msgs = client
+        .simple_query("SELECT name, version FROM pg_catalog.pg_available_extension_versions;")
+        .await
+        .expect("pg_available_extension_versions resolves");
+    assert!(rows_of(&msgs).iter().any(|r| r.get(0) == Some("plpgsql")));
+
+    // An *unqualified* reference to a catalog relation must resolve too: pgjdbc
+    // probes `pg_depend` without a schema, and an unknown table there surfaced as
+    // a generic "Table not found" (XX000) rather than resolving.
+    let msgs = client
+        .simple_query("SELECT classid, objid, refobjid FROM pg_depend;")
+        .await
+        .expect("unqualified pg_depend resolves");
+    assert_eq!(rows_of(&msgs).len(), 0, "pg_depend should be empty");
+
     // These resolve but are empty.
     for (query, table) in [
         (
@@ -447,6 +479,22 @@ async fn test_pg_catalog_introspection_relations_resolve() {
         (
             "SELECT evtname, evtevent FROM pg_catalog.pg_event_trigger;",
             "pg_event_trigger",
+        ),
+        (
+            "SELECT classid, objid, deptype FROM pg_catalog.pg_depend;",
+            "pg_depend",
+        ),
+        (
+            "SELECT fdwname, fdwowner FROM pg_catalog.pg_foreign_data_wrapper;",
+            "pg_foreign_data_wrapper",
+        ),
+        (
+            "SELECT srvname, srvfdw FROM pg_catalog.pg_foreign_server;",
+            "pg_foreign_server",
+        ),
+        (
+            "SELECT umuser, umserver FROM pg_catalog.pg_user_mapping;",
+            "pg_user_mapping",
         ),
     ] {
         let msgs = client

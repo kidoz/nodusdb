@@ -233,6 +233,13 @@ impl MemExecutor {
                 | "pg_tablespace"
                 | "pg_event_trigger"
                 | "pg_extension"
+                | "pg_language"
+                | "pg_depend"
+                | "pg_foreign_data_wrapper"
+                | "pg_foreign_server"
+                | "pg_user_mapping"
+                | "pg_available_extensions"
+                | "pg_available_extension_versions"
         )
     }
 
