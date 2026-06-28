@@ -226,9 +226,18 @@ impl MemExecutor {
                 let mut combined_desc = joined_columns.clone();
                 combined_desc.extend(fn_cols);
 
+                let keep_empty = matches!(join.join_type, JoinType::LeftOuter);
+                let width = hdr_names.len();
                 let mut next_rows = Vec::new();
                 for r1 in &stored_rows {
                     let (_, _, fn_rows) = self.eval_table_function(spec, r1, &col_names)?;
+                    if fn_rows.is_empty() && keep_empty {
+                        // LEFT JOIN LATERAL: keep the driving row, NULL-filling the
+                        // function's columns when it produces nothing.
+                        let mut combined = r1.clone();
+                        combined.extend(std::iter::repeat_n(Value::Null, width));
+                        next_rows.push(combined);
+                    }
                     for fr in fn_rows {
                         let mut combined = r1.clone();
                         combined.extend(fr);

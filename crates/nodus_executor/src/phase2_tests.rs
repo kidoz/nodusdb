@@ -205,6 +205,28 @@ fn test_table_functions() {
     run("INSERT INTO d (id) VALUES (7)");
     let out = run("SELECT * FROM d, generate_series(1, 3) AS g(n)");
     assert_eq!(out.rows.len(), 3, "1 driving row x 3 series rows");
+
+    // Multi-argument unnest: one column per array, shorter arrays padded NULL.
+    let out = run("SELECT * FROM unnest(ARRAY[1, 2, 3], ARRAY['a', 'b']) WITH ORDINALITY");
+    assert_eq!(out.rows.len(), 3);
+    assert_eq!(out.columns.len(), 3, "two value columns + ordinality");
+    let r0 = render_row(&out.rows[0]);
+    assert_eq!(r0[0], "1");
+    assert_eq!(r0[1], "a");
+    assert_eq!(render_row(&out.rows[2])[0], "3"); // longer array still present
+
+    // regexp_split_to_table.
+    let out = run("SELECT * FROM regexp_split_to_table('a,b,c', ',')");
+    assert_eq!(out.rows.len(), 3);
+    assert_eq!(render_row(&out.rows[1]), vec!["b"]);
+
+    // LEFT JOIN LATERAL keeps the driving row when the function yields nothing.
+    let out = run("SELECT d.id FROM d LEFT JOIN generate_series(1, 0) AS g ON true");
+    assert_eq!(
+        out.rows.len(),
+        1,
+        "LEFT lateral keeps the empty-function driving row"
+    );
 }
 
 #[test]
