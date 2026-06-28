@@ -163,6 +163,51 @@ fn test_scalar_functions() {
 }
 
 #[test]
+fn test_table_functions() {
+    let (exec, cat) = MemExecutor::shared(Arc::new(MemoryAuditSink::new()));
+    let admin = cat
+        .create_role(nodus_catalog::CreateRoleRequest {
+            id: nodus_catalog::PrincipalId::new(),
+            name: "admin".into(),
+            principal_type: nodus_catalog::PrincipalType::User,
+            database_id: None,
+        })
+        .unwrap();
+    cat.grant_privilege(nodus_catalog::GrantPrivilegeRequest {
+        id: nodus_catalog::GrantId::new(),
+        principal_id: admin.id,
+        resource: nodus_catalog::ResourceRef::System,
+        privilege: "ALL".into(),
+    })
+    .unwrap();
+    let ctx = test_ctx(admin.id);
+    let run = |sql: &str| {
+        let mut stmts = nodus_sql::parse_sql(sql).unwrap();
+        let plan = plan_statement(&stmts.remove(0), &[]).unwrap();
+        exec.execute_logical(&ctx, plan).unwrap()
+    };
+
+    // generate_series as the sole driving relation.
+    let out = run("SELECT * FROM generate_series(1, 5)");
+    assert_eq!(out.rows.len(), 5);
+    assert_eq!(render_row(&out.rows[0]), vec!["1"]);
+    assert_eq!(render_row(&out.rows[4]), vec!["5"]);
+
+    // unnest of a literal array WITH ORDINALITY -> value + 1-based index columns.
+    let out = run("SELECT * FROM unnest(ARRAY[10, 20, 30]) WITH ORDINALITY");
+    assert_eq!(out.rows.len(), 3);
+    assert_eq!(out.columns.len(), 2);
+    assert_eq!(render_row(&out.rows[0]), vec!["10", "1"]);
+    assert_eq!(render_row(&out.rows[2]), vec!["30", "3"]);
+
+    // Comma-join (cross) table function: each driving row x the function's rows.
+    run("CREATE TABLE d (id INT)");
+    run("INSERT INTO d (id) VALUES (7)");
+    let out = run("SELECT * FROM d, generate_series(1, 3) AS g(n)");
+    assert_eq!(out.rows.len(), 3, "1 driving row x 3 series rows");
+}
+
+#[test]
 fn test_set_operations() {
     let (exec, cat) = MemExecutor::shared(Arc::new(MemoryAuditSink::new()));
     let admin = cat

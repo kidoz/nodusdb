@@ -68,12 +68,34 @@ pub enum JoinType {
     Cross,
 }
 
+/// A set-returning function used in `FROM` (e.g. `unnest(arr)`,
+/// `generate_series(a, b)`), optionally with `WITH ORDINALITY`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TableFnSpec {
+    /// Lowercased function name (`"unnest"`, `"generate_series"`).
+    pub name: String,
+    /// Arguments: an [`Operand::Literal`] for a constant/parameter, or an
+    /// [`Operand::Ident`] for a column reference — the latter makes the call
+    /// *lateral* (resolved against each driving row).
+    pub args: Vec<Operand>,
+    /// `WITH ORDINALITY` / `WITH OFFSET`: append a 1-based index column.
+    pub with_ordinality: bool,
+    /// Output relation alias (and default value-column name).
+    pub alias: Option<String>,
+    /// Explicit column names from `AS alias(col[, ord])`.
+    pub column_aliases: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Join {
     pub table_name: String,
     pub table_alias: Option<String>,
     pub condition: Option<FilterExpr>,
     pub join_type: JoinType,
+    /// When set, this join's right side is a (possibly lateral) table function
+    /// evaluated per driving row rather than a base/CTE relation.
+    #[serde(default)]
+    pub table_fn: Option<TableFnSpec>,
     /// Columns named in a `USING (...)` clause. The join matches rows whose values
     /// are equal in each named column on both sides; resolved against the actual
     /// row schemas at execution time (so it composes with chained joins).
@@ -290,6 +312,10 @@ pub enum LogicalPlan {
         left: Box<LogicalPlan>,
         right: Box<LogicalPlan>,
     },
+    /// A standalone (non-lateral) set-returning function in `FROM`, e.g.
+    /// `SELECT * FROM generate_series(1, 5)`. Lateral table functions are carried
+    /// on [`Join::table_fn`] instead.
+    TableFunction(TableFnSpec),
 }
 
 /// The kind of set operation combining two query results.

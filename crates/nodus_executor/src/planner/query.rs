@@ -122,29 +122,58 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
         }
         return Ok(LogicalPlan::SelectLiteral { values });
     }
-    let (table_name, table_alias) = match &select.from[0].relation {
-        TableFactor::Table { name, alias, .. } => (
-            name.to_string(),
-            alias.as_ref().map(|a| a.name.value.clone()),
-        ),
-        TableFactor::Derived {
-            subquery, alias, ..
-        } => {
-            let alias = alias
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("Derived table requires an alias"))?
-                .name
-                .value
-                .clone();
-            let sub_plan = plan_query(subquery, params)?;
-            ctes.push((alias.clone(), Box::new(sub_plan)));
+    let (table_name, table_alias) =
+        if let Some(spec) = table_fn_from_factor(&select.from[0].relation, params) {
+            // A set-returning function as the sole driving relation (e.g.
+            // `FROM generate_series(1, 5)`): materialize it like a CTE and reference
+            // it by alias.
+            let alias = spec.alias.clone().unwrap_or_else(|| spec.name.clone());
+            ctes.push((alias.clone(), Box::new(LogicalPlan::TableFunction(spec))));
             (alias, None)
-        }
-        other => anyhow::bail!("Unsupported FROM relation: {:?}", other),
-    };
+        } else {
+            match &select.from[0].relation {
+                TableFactor::Table { name, alias, .. } => (
+                    name.to_string(),
+                    alias.as_ref().map(|a| a.name.value.clone()),
+                ),
+                TableFactor::Derived {
+                    subquery, alias, ..
+                } => {
+                    let alias = alias
+                        .as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("Derived table requires an alias"))?
+                        .name
+                        .value
+                        .clone();
+                    let sub_plan = plan_query(subquery, params)?;
+                    ctes.push((alias.clone(), Box::new(sub_plan)));
+                    (alias, None)
+                }
+                other => anyhow::bail!("Unsupported FROM relation: {:?}", other),
+            }
+        };
 
     let mut joins = Vec::new();
     for j in &select.from[0].joins {
+        // A table function on the right of a join (incl. `CROSS JOIN LATERAL`) is
+        // evaluated per driving row by the executor.
+        if let Some(spec) = table_fn_from_factor(&j.relation, params) {
+            let join_type = match &j.join_operator {
+                JoinOperator::LeftOuter(_) | JoinOperator::Left(_) => JoinType::LeftOuter,
+                _ => JoinType::Inner,
+            };
+            let alias = spec.alias.clone().unwrap_or_else(|| spec.name.clone());
+            joins.push(crate::Join {
+                table_name: alias.clone(),
+                table_alias: Some(alias),
+                condition: None,
+                join_type,
+                using_columns: Vec::new(),
+                natural: false,
+                table_fn: Some(spec),
+            });
+            continue;
+        }
         let (join_table_name, join_table_alias) = match &j.relation {
             TableFactor::Table { name, alias, .. } => (
                 name.to_string(),
@@ -189,7 +218,60 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
             join_type,
             using_columns,
             natural,
+            table_fn: None,
         });
+    }
+
+    // Comma-separated `FROM a, b, ...` items become cross joins. This is how
+    // PostgreSQL clients (and introspection) write a lateral table function, e.g.
+    // `FROM pg_index i, unnest(i.indkey) WITH ORDINALITY`.
+    for twj in &select.from[1..] {
+        if let Some(spec) = table_fn_from_factor(&twj.relation, params) {
+            let alias = spec.alias.clone().unwrap_or_else(|| spec.name.clone());
+            joins.push(crate::Join {
+                table_name: alias.clone(),
+                table_alias: Some(alias),
+                condition: None,
+                join_type: JoinType::Cross,
+                using_columns: Vec::new(),
+                natural: false,
+                table_fn: Some(spec),
+            });
+            continue;
+        }
+        match &twj.relation {
+            TableFactor::Table { name, alias, .. } => joins.push(crate::Join {
+                table_name: name.to_string(),
+                table_alias: alias.as_ref().map(|a| a.name.value.clone()),
+                condition: None,
+                join_type: JoinType::Cross,
+                using_columns: Vec::new(),
+                natural: false,
+                table_fn: None,
+            }),
+            TableFactor::Derived {
+                subquery, alias, ..
+            } => {
+                let alias = alias
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("Derived table requires an alias"))?
+                    .name
+                    .value
+                    .clone();
+                let sub_plan = plan_query(subquery, params)?;
+                ctes.push((alias.clone(), Box::new(sub_plan)));
+                joins.push(crate::Join {
+                    table_name: alias.clone(),
+                    table_alias: Some(alias),
+                    condition: None,
+                    join_type: JoinType::Cross,
+                    using_columns: Vec::new(),
+                    natural: false,
+                    table_fn: None,
+                });
+            }
+            other => anyhow::bail!("Unsupported FROM relation: {:?}", other),
+        }
     }
 
     // Projection: `*` -> empty (all); otherwise plain column identifiers.
@@ -647,5 +729,90 @@ fn join_constraint(
         ),
         JoinConstraint::Natural => (join_type, None, Vec::new(), true),
         JoinConstraint::None => (join_type, None, Vec::new(), false),
+    }
+}
+
+/// Recognizes a set-returning function used as a `FROM`/join relation —
+/// `unnest(...)`, `generate_series(...)` (any `name(args)` call), plus the
+/// BigQuery `UNNEST([...])` form — capturing its arguments, `WITH ORDINALITY`
+/// flag, and alias/column names. Returns `None` for an ordinary table.
+fn table_fn_from_factor(
+    factor: &sqlparser::ast::TableFactor,
+    params: &[Value],
+) -> Option<TableFnSpec> {
+    use sqlparser::ast::TableFactor;
+    match factor {
+        TableFactor::Table {
+            name,
+            args: Some(table_args),
+            with_ordinality,
+            alias,
+            ..
+        } => {
+            let args = table_args
+                .args
+                .iter()
+                .filter_map(|a| function_arg_to_operand(a, params))
+                .collect();
+            Some(build_table_fn_spec(
+                name.to_string().to_lowercase(),
+                args,
+                *with_ordinality,
+                alias.as_ref(),
+            ))
+        }
+        TableFactor::UNNEST {
+            array_exprs,
+            with_ordinality,
+            alias,
+            ..
+        } => {
+            let args = array_exprs
+                .iter()
+                .filter_map(|e| expr_to_operand(e, params))
+                .collect();
+            Some(build_table_fn_spec(
+                "unnest".to_string(),
+                args,
+                *with_ordinality,
+                alias.as_ref(),
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn build_table_fn_spec(
+    name: String,
+    args: Vec<Operand>,
+    with_ordinality: bool,
+    alias: Option<&sqlparser::ast::TableAlias>,
+) -> TableFnSpec {
+    TableFnSpec {
+        name,
+        args,
+        with_ordinality,
+        alias: alias.map(|a| a.name.value.clone()),
+        column_aliases: alias
+            .map(|a| a.columns.iter().map(|c| c.name.value.clone()).collect())
+            .unwrap_or_default(),
+    }
+}
+
+fn function_arg_to_operand(arg: &sqlparser::ast::FunctionArg, params: &[Value]) -> Option<Operand> {
+    use sqlparser::ast::{FunctionArg, FunctionArgExpr};
+    match arg {
+        FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => expr_to_operand(e, params),
+        _ => None,
+    }
+}
+
+/// A `FROM`-function argument is either a column reference (lateral — resolved
+/// per driving row) or a constant/parameter value.
+fn expr_to_operand(expr: &sqlparser::ast::Expr, params: &[Value]) -> Option<Operand> {
+    if let Some(col) = extract_col_name(expr) {
+        Some(Operand::Ident(col))
+    } else {
+        expr_to_value(expr, params).map(Operand::Literal)
     }
 }

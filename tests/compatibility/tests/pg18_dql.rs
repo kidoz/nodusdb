@@ -251,3 +251,48 @@ async fn test_pg18_window_functions() {
     assert_eq!(rows[2].get("rnk"), Some("1"));
     assert_eq!(rows[3].get("rnk"), Some("3"));
 }
+
+/// Set-returning functions in FROM: `generate_series`, `unnest` (+ WITH
+/// ORDINALITY and column aliases), and the comma/lateral form used by
+/// introspection. These previously failed to parse/plan.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_pg18_table_functions() {
+    let server = TestServer::start().await.expect("server starts");
+    let client = connect(&server).await;
+
+    // Standalone generate_series.
+    let msgs = client
+        .simple_query("SELECT * FROM generate_series(1, 4);")
+        .await
+        .expect("generate_series resolves");
+    assert_eq!(rows_of(&msgs).len(), 4);
+
+    // unnest of a literal array WITH ORDINALITY, with AS u(value, n) column names.
+    let msgs = client
+        .simple_query(
+            "SELECT v, n FROM unnest(ARRAY['a','b','c']) WITH ORDINALITY AS u(v, n) ORDER BY n;",
+        )
+        .await
+        .expect("unnest WITH ORDINALITY resolves");
+    let rows = rows_of(&msgs);
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0].get("v"), Some("a"));
+    assert_eq!(rows[0].get("n"), Some("1"));
+    assert_eq!(rows[2].get("n"), Some("3"));
+
+    // Comma/lateral form: a table cross-joined with a set-returning function —
+    // the shape introspection uses (`FROM t, unnest(...) WITH ORDINALITY`).
+    client
+        .simple_query("CREATE TABLE tf (id INT PRIMARY KEY);")
+        .await
+        .unwrap();
+    client
+        .simple_query("INSERT INTO tf (id) VALUES (10);")
+        .await
+        .unwrap();
+    let msgs = client
+        .simple_query("SELECT t.id FROM tf t, generate_series(1, 3) AS g;")
+        .await
+        .expect("comma-joined table function resolves");
+    assert_eq!(rows_of(&msgs).len(), 3, "1 driving row x 3 series rows");
+}

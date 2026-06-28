@@ -193,6 +193,54 @@ impl MemExecutor {
         let mut stored_rows = stored_rows.unwrap();
 
         for join in &joins {
+            // Lateral (or standalone) table function: its rows are produced per
+            // driving row, so they can't be materialized once. Evaluate against
+            // each left row and append the function's columns. A driving row whose
+            // function yields nothing is dropped (cross-join-lateral / comma-join
+            // semantics).
+            if let Some(spec) = &join.table_fn {
+                let prefix = join
+                    .table_alias
+                    .clone()
+                    .or_else(|| spec.alias.clone())
+                    .unwrap_or_else(|| spec.name.clone());
+                // Headers are row-independent; derive them once.
+                let (hdr_names, hdr_types, _) = self.eval_table_function(spec, &[], &col_names)?;
+                let now = Utc::now();
+                let fn_cols: Vec<ColumnDescriptor> = hdr_names
+                    .iter()
+                    .zip(&hdr_types)
+                    .map(|(name, ty)| ColumnDescriptor {
+                        id: nodus_catalog::ColumnId::new(),
+                        name: name.clone(),
+                        version: 1,
+                        created_at: now,
+                        updated_at: now,
+                        state: DescriptorState::Public,
+                        data_type: ty.clone(),
+                        nullable: true,
+                    })
+                    .collect();
+                let mut combined_cols = col_names.clone();
+                combined_cols.extend(hdr_names.iter().map(|n| format!("{prefix}.{n}")));
+                let mut combined_desc = joined_columns.clone();
+                combined_desc.extend(fn_cols);
+
+                let mut next_rows = Vec::new();
+                for r1 in &stored_rows {
+                    let (_, _, fn_rows) = self.eval_table_function(spec, r1, &col_names)?;
+                    for fr in fn_rows {
+                        let mut combined = r1.clone();
+                        combined.extend(fr);
+                        next_rows.push(combined);
+                    }
+                }
+                stored_rows = next_rows;
+                col_names = combined_cols;
+                joined_columns = combined_desc;
+                continue;
+            }
+
             let (j_cols, j_rows) = if let Some(cte_out) = cte_results.get(&join.table_name) {
                 let mut cols = Vec::new();
                 for (i, c) in cte_out.columns.iter().enumerate() {

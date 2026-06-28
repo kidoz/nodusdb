@@ -668,6 +668,7 @@ fn test_join_execution() {
             join_type: JoinType::Inner,
             using_columns: vec![],
             natural: false,
+            table_fn: None,
         }],
         projection: vec![
             ProjectionItem::Column("books.title".into()),

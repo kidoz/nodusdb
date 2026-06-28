@@ -132,6 +132,7 @@ impl MemExecutor {
                 left,
                 right,
             } => self.exec_set_op(ctx, op, all, left, right),
+            LogicalPlan::TableFunction(spec) => self.exec_table_function(spec),
         }
     }
 

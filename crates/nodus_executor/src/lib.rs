@@ -31,12 +31,13 @@ mod session_vars;
 mod set_ops;
 mod streaming;
 mod system_views;
+mod table_functions;
 mod transactions;
 mod value;
 mod view_helpers;
 pub use plan_types::{
     AggregateOp, AlterTableOp, CompareOp, FilterExpr, Join, JoinType, LogicalPlan, Operand,
-    Predicate, ProjectionItem, SetOpKind,
+    Predicate, ProjectionItem, SetOpKind, TableFnSpec,
 };
 pub(crate) use planner::parse_filter_expr;
 pub use planner::{expr_to_value, parse_object_name, plan_statement};
