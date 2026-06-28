@@ -297,7 +297,7 @@ impl MemExecutor {
                     ("indisready", "BOOL"),
                     ("indislive", "BOOL"),
                     ("indisreplident", "BOOL"),
-                    ("indkey", "TEXT"),
+                    ("indkey", "INT[]"),
                     ("indcollation", "TEXT"),
                     ("indclass", "TEXT"),
                     ("indoption", "TEXT"),
@@ -309,7 +309,10 @@ impl MemExecutor {
                     let schema_name = Self::schema_name_by_id(db_name, &schemas, table.schema_id);
                     let relid = Self::table_oid(db_name, &schema_name, &table.name);
                     for index in &table.indexes {
-                        let keys = index
+                        // `indkey` is the ordered list of 1-based column positions
+                        // (attnums), as a real array so `unnest(i.indkey)`
+                        // introspection returns one row per indexed column.
+                        let keys: Vec<Value> = index
                             .key_columns
                             .iter()
                             .filter_map(|key| {
@@ -317,10 +320,9 @@ impl MemExecutor {
                                     .columns
                                     .iter()
                                     .position(|column| column.id == key.column_id)
-                                    .map(|pos| (pos + 1).to_string())
+                                    .map(|pos| Value::Int((pos + 1) as i64))
                             })
-                            .collect::<Vec<_>>()
-                            .join(" ");
+                            .collect();
                         rows.push(vec![
                             Value::Int(Self::index_oid(
                                 db_name,
@@ -344,7 +346,7 @@ impl MemExecutor {
                             Value::Bool(true),
                             Value::Bool(true),
                             Value::Bool(false),
-                            Value::Text(keys),
+                            Value::Array(keys),
                             Value::Text(String::new()),
                             Value::Text(String::new()),
                             Value::Text(String::new()),

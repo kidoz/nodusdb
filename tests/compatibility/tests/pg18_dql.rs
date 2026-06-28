@@ -295,4 +295,27 @@ async fn test_pg18_table_functions() {
         .await
         .expect("comma-joined table function resolves");
     assert_eq!(rows_of(&msgs).len(), 3, "1 driving row x 3 series rows");
+
+    // The real introspection shape: unnest pg_index.indkey (a genuine array of
+    // column attnums) to expand an index's columns. A two-column index yields
+    // one row per column.
+    client
+        .simple_query("CREATE TABLE ixt (a INT PRIMARY KEY, b INT, c INT);")
+        .await
+        .unwrap();
+    client
+        .simple_query("CREATE INDEX ix_ab ON ixt (a, b);")
+        .await
+        .unwrap();
+    let msgs = client
+        .simple_query(
+            "SELECT k.attnum FROM pg_catalog.pg_index i, \
+             unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord);",
+        )
+        .await
+        .expect("unnest(indkey) resolves");
+    assert!(
+        rows_of(&msgs).len() >= 2,
+        "unnesting a 2-column index's indkey must surface its columns"
+    );
 }
