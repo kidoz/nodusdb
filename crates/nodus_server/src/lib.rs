@@ -441,12 +441,27 @@ pub async fn run_server_with_config(
     // undocumented openraft defaults. `snapshot_max_chunk_size` bounds the
     // per-RPC payload so a large snapshot transfers as a series of chunks (each
     // `install_snapshot` request carries at most this many bytes) instead of one
-    // oversized body; election/heartbeat timers stay at their defaults.
+    // oversized body.
+    //
+    // Heartbeat/election timers come from cluster config (see [`ClusterConfig`]),
+    // defaulting well past openraft's own 50ms/150-300ms — which assume a cheap
+    // in-process or UDP transport. NodusDB replicates over HTTP+JSON (reqwest),
+    // and openraft bounds each AppendEntries by exactly `heartbeat_interval` (see
+    // replication: `C::timeout(heartbeat, append_entries)`). At 50ms a cold
+    // connection — worse under mTLS — plus the follower's real WAL append
+    // routinely overran the deadline, so heartbeats timed out and elections fired
+    // spuriously, churning leadership. The default heartbeat gives each RPC ample
+    // room (warm-pool reuse keeps it far under that), and the election window
+    // only replaces a leader after several genuinely missed beats. Tests override
+    // these with openraft's fast defaults, since loopback has no such latency.
     let raft_config = Arc::new(
         openraft::Config {
             snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(5000),
             snapshot_max_chunk_size: 4 * 1024 * 1024,
             max_in_snapshot_log_to_keep: 1000,
+            heartbeat_interval: config.cluster.raft_heartbeat_ms,
+            election_timeout_min: config.cluster.raft_election_timeout_min_ms,
+            election_timeout_max: config.cluster.raft_election_timeout_max_ms,
             ..Default::default()
         }
         .validate()

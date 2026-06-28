@@ -51,6 +51,19 @@ pub struct ClusterConfig {
     pub raft_listen_addr: Option<String>,
     /// Mutual-TLS settings for the inter-node Raft channel.
     pub tls: ClusterTlsConfig,
+    /// Raft leader→follower heartbeat interval (ms). openraft also uses this as
+    /// the per-`AppendEntries` RPC deadline, so it must comfortably exceed the
+    /// replication round-trip — an HTTP connect (worse cold/under mTLS) plus the
+    /// follower's WAL append. The default is sized for that, well above
+    /// openraft's own 50ms, which assumes a cheaper transport and caused
+    /// spurious replication timeouts here.
+    pub raft_heartbeat_ms: u64,
+    /// Lower bound (ms) of the randomized election timeout: how long a follower
+    /// waits without leader contact before campaigning. Must be several
+    /// heartbeats wide so one slow round-trip doesn't trigger a needless election.
+    pub raft_election_timeout_min_ms: u64,
+    /// Upper bound (ms) of the randomized election timeout.
+    pub raft_election_timeout_max_ms: u64,
 }
 
 impl Default for ClusterConfig {
@@ -61,6 +74,9 @@ impl Default for ClusterConfig {
             join_peers: Vec::new(),
             raft_listen_addr: None,
             tls: ClusterTlsConfig::default(),
+            raft_heartbeat_ms: 200,
+            raft_election_timeout_min_ms: 600,
+            raft_election_timeout_max_ms: 1200,
         }
     }
 }

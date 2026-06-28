@@ -9,6 +9,16 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
+/// Applies openraft's fast default Raft timers to a test config. Loopback has
+/// none of the cold-connection/WAL latency the production defaults guard
+/// against, so tests keep elections and failover quick (and avoid the slower
+/// recovery the wider production window would add).
+pub fn apply_fast_raft_timers(config: &mut nodus_config::NodusConfig) {
+    config.cluster.raft_heartbeat_ms = 50;
+    config.cluster.raft_election_timeout_min_ms = 150;
+    config.cluster.raft_election_timeout_max_ms = 300;
+}
+
 pub struct TestServer {
     pub pgwire_addr: SocketAddr,
     pub http_addr: SocketAddr,
@@ -31,6 +41,7 @@ impl TestServer {
         // Test harness: allow the unauthenticated admin API (anonymous superuser)
         // so tests can call admin endpoints without wiring a token.
         config.admin.allow_insecure = true;
+        apply_fast_raft_timers(&mut config);
         Self::start_with_config(config).await
     }
 

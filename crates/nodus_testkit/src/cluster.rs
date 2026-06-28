@@ -91,6 +91,7 @@ impl ClusterNode {
         config.cluster.raft_advertise_addr = self.http_addr();
         config.cluster.join_peers = self.seed_http.clone().into_iter().collect();
         config.storage.data_dir = Some(self.data_path.to_string_lossy().into_owned());
+        crate::apply_fast_raft_timers(&mut config);
         config
     }
 
