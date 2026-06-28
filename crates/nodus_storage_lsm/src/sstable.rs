@@ -224,7 +224,7 @@ impl Sstable {
 
             put_u32(&mut out, key.len() as u32);
             out.extend_from_slice(key);
-            let val = bincode::serialize(chain)?;
+            let val = bincode::serde::encode_to_vec(chain, bincode::config::standard())?;
             put_u32(&mut out, val.len() as u32);
             out.extend_from_slice(&val);
 
@@ -354,7 +354,8 @@ impl Sstable {
             let vlen = reader.take_u32()? as usize;
             let val = reader.take(vlen)?;
             if entry_key == key {
-                let chain: VersionChain = bincode::deserialize(val)?;
+                let (chain, _): (VersionChain, usize) =
+                    bincode::serde::decode_from_slice(val, bincode::config::standard())?;
                 return Ok(Some(chain));
             }
         }
@@ -462,7 +463,9 @@ impl SstableIterator {
         ) as usize;
         let val = read_entry_bytes(&mut self.file, vlen, avail)?;
         self.position += (8 + klen + vlen) as u64;
-        Ok(Some((Bytes::from(key), bincode::deserialize(&val)?)))
+        let (chain, _): (VersionChain, usize) =
+            bincode::serde::decode_from_slice(&val, bincode::config::standard())?;
+        Ok(Some((Bytes::from(key), chain)))
     }
 }
 
