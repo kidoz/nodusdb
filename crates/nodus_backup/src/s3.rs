@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::Utc;
 use futures_util::StreamExt;
-use object_store::{ObjectStore, aws::AmazonS3Builder, path::Path as ObjPath};
+use object_store::{ObjectStore, ObjectStoreExt, aws::AmazonS3Builder, path::Path as ObjPath};
 use std::sync::Arc;
 
 /// Connection settings for an S3-compatible object store.
@@ -101,7 +101,7 @@ impl BackupRepository for S3BackupRepository {
             let meta = meta?;
             out.push(ObjectMetadata {
                 key: meta.location.to_string(),
-                size: meta.size as u64,
+                size: meta.size,
                 last_modified: meta.last_modified,
             });
         }

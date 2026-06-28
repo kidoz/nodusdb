@@ -74,11 +74,11 @@ impl Default for RaftState {
 
 pub fn raft_routes() -> Router<RaftState> {
     Router::new()
-        .route("/raft/:shard_id/vote", post(vote))
-        .route("/raft/:shard_id/append", post(append))
-        .route("/raft/:shard_id/snapshot", post(snapshot))
-        .route("/raft/:shard_id/write", post(write))
-        .route("/raft/:shard_id/read_index", post(read_index))
+        .route("/raft/{shard_id}/vote", post(vote))
+        .route("/raft/{shard_id}/append", post(append))
+        .route("/raft/{shard_id}/snapshot", post(snapshot))
+        .route("/raft/{shard_id}/write", post(write))
+        .route("/raft/{shard_id}/read_index", post(read_index))
 }
 
 async fn get_raft(state: &RaftState, shard_id: &str) -> Option<NodusRaft> {

@@ -19,7 +19,7 @@ nodus_storage_wal = { path = "../nodus_storage_wal" }
 async-trait.workspace = true
 
 [dev-dependencies]
-tempfile = "3.10.1"
+tempfile = "3.27.0"
 proptest.workspace = true
 criterion.workspace = true
 

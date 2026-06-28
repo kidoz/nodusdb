@@ -315,9 +315,9 @@ fn build_raft_transport(
 
     let client = reqwest::Client::builder()
         .use_rustls_tls()
-        // Trust only the cluster CA, not the system root store.
-        .tls_built_in_root_certs(false)
-        .add_root_certificate(ca)
+        // Trust only the cluster CA, not the system root store. reqwest 0.13's
+        // `tls_certs_only` both disables the built-in roots and adds our CA.
+        .tls_certs_only([ca])
         .identity(identity)
         .build()?;
     Ok(nodus_raftstore::network::RaftTransport::new(
@@ -1198,6 +1198,9 @@ mod tests {
         let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
         ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
         let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+        // rcgen 0.14: a cert is signed by an `Issuer` (params + signing key),
+        // not by passing the CA cert and key separately.
+        let ca_issuer = rcgen::Issuer::new(ca_params, ca_key);
 
         let leaf_key = rcgen::KeyPair::generate().unwrap();
         let mut leaf_params = rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()]).unwrap();
@@ -1205,7 +1208,7 @@ mod tests {
             rcgen::ExtendedKeyUsagePurpose::ServerAuth,
             rcgen::ExtendedKeyUsagePurpose::ClientAuth,
         ];
-        let leaf_cert = leaf_params.signed_by(&leaf_key, &ca_cert, &ca_key).unwrap();
+        let leaf_cert = leaf_params.signed_by(&leaf_key, &ca_issuer).unwrap();
 
         let cert_path = dir.join("node.crt");
         let key_path = dir.join("node.key");
@@ -1270,8 +1273,7 @@ mod tests {
         let ca = reqwest::Certificate::from_pem(&std::fs::read(&ca_path).unwrap()).unwrap();
         let mtls_client = reqwest::Client::builder()
             .use_rustls_tls()
-            .tls_built_in_root_certs(false)
-            .add_root_certificate(ca.clone())
+            .tls_certs_only([ca.clone()])
             .identity(reqwest::Identity::from_pem(&identity_pem).unwrap())
             .build()
             .unwrap();
@@ -1282,8 +1284,7 @@ mod tests {
         // A client with no certificate is rejected at the TLS layer.
         let no_cert_client = reqwest::Client::builder()
             .use_rustls_tls()
-            .tls_built_in_root_certs(false)
-            .add_root_certificate(ca)
+            .tls_certs_only([ca])
             .build()
             .unwrap();
         assert!(

@@ -51,19 +51,21 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
         let kind = match op {
             SetOperator::Union => SetOpKind::Union,
             SetOperator::Intersect => SetOpKind::Intersect,
-            SetOperator::Except => SetOpKind::Except,
+            // `MINUS` is a non-standard alias for `EXCEPT` (Oracle/ClickHouse).
+            SetOperator::Except | SetOperator::Minus => SetOpKind::Except,
         };
         let all = *set_quantifier == SetQuantifier::All;
         let wrap = |body: &Box<SetExpr>| Query {
             with: None,
             body: body.clone(),
-            order_by: vec![],
-            limit: None,
-            limit_by: vec![],
-            offset: None,
+            order_by: None,
+            limit_clause: None,
             fetch: None,
             locks: vec![],
             for_clause: None,
+            settings: None,
+            format_clause: None,
+            pipe_operators: vec![],
         };
         let left_plan = plan_query(&wrap(left), params)?;
         let right_plan = plan_query(&wrap(right), params)?;
@@ -164,11 +166,20 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
             other => anyhow::bail!("Unsupported join relation: {:?}", other),
         };
         let (join_type, condition, using_columns, natural) = match &j.join_operator {
-            JoinOperator::Inner(c) => join_constraint(JoinType::Inner, c, params),
-            JoinOperator::LeftOuter(c) => join_constraint(JoinType::LeftOuter, c, params),
-            JoinOperator::RightOuter(c) => join_constraint(JoinType::RightOuter, c, params),
+            // 0.62 distinguishes the bare keyword forms (`JOIN`, `LEFT JOIN`,
+            // `RIGHT JOIN`) from the explicit `... OUTER JOIN` spellings; both map
+            // to the same join type.
+            JoinOperator::Join(c) | JoinOperator::Inner(c) => {
+                join_constraint(JoinType::Inner, c, params)
+            }
+            JoinOperator::Left(c) | JoinOperator::LeftOuter(c) => {
+                join_constraint(JoinType::LeftOuter, c, params)
+            }
+            JoinOperator::Right(c) | JoinOperator::RightOuter(c) => {
+                join_constraint(JoinType::RightOuter, c, params)
+            }
             JoinOperator::FullOuter(c) => join_constraint(JoinType::FullOuter, c, params),
-            JoinOperator::CrossJoin => (JoinType::Cross, None, Vec::new(), false),
+            JoinOperator::CrossJoin(_) => (JoinType::Cross, None, Vec::new(), false),
             other => anyhow::bail!("Unsupported join operator: {:?}", other),
         };
         joins.push(crate::Join {
@@ -203,7 +214,7 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
                             }
                             for expr in &spec.order_by {
                                 if let Some(col) = extract_col_name(&expr.expr) {
-                                    order_by.push((col, expr.asc.unwrap_or(true)));
+                                    order_by.push((col, expr.options.asc.unwrap_or(true)));
                                 }
                             }
                         }
@@ -230,7 +241,13 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
                                     "MAX" => AggregateOp::Max,
                                     _ => unreachable!(),
                                 };
-                                let inner = if let Some(arg) = func.args.first() {
+                                let first_arg = match &func.args {
+                                    sqlparser::ast::FunctionArguments::List(list) => {
+                                        list.args.first()
+                                    }
+                                    _ => None,
+                                };
+                                let inner = if let Some(arg) = first_arg {
                                     match arg {
                                         sqlparser::ast::FunctionArg::Unnamed(
                                             sqlparser::ast::FunctionArgExpr::Expr(
@@ -249,7 +266,14 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
                             }
                             _ => {
                                 let mut args = Vec::new();
-                                for arg in &func.args {
+                                let func_arg_list: &[sqlparser::ast::FunctionArg] = match &func.args
+                                {
+                                    sqlparser::ast::FunctionArguments::List(list) => {
+                                        list.args.as_slice()
+                                    }
+                                    _ => &[],
+                                };
+                                for arg in func_arg_list {
                                     if let sqlparser::ast::FunctionArg::Unnamed(
                                         sqlparser::ast::FunctionArgExpr::Expr(e),
                                     ) = arg
@@ -269,27 +293,30 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
                             }
                         }
                     }
-                } else if let Expr::JsonAccess {
-                    left,
-                    operator,
-                    right,
-                } = expr
+                } else if let Expr::BinaryOp { left, op, right } = expr
+                    && matches!(
+                        op,
+                        BinaryOperator::Arrow
+                            | BinaryOperator::LongArrow
+                            | BinaryOperator::HashArrow
+                            | BinaryOperator::HashLongArrow
+                    )
                 {
                     let left_col = extract_col_name(left)
                         .ok_or_else(|| anyhow::anyhow!("Invalid JSON left"))?;
                     let right_val = match &**right {
-                        Expr::Value(v) => match v {
+                        Expr::Value(v) => match &v.value {
                             sqlparser::ast::Value::SingleQuotedString(s) => s.clone(),
                             sqlparser::ast::Value::Number(n, _) => n.clone(),
                             _ => anyhow::bail!("Unsupported JSON path"),
                         },
                         _ => anyhow::bail!("Unsupported JSON path"),
                     };
-                    let op_str = match operator {
-                        sqlparser::ast::JsonOperator::LongArrow => "->>",
-                        sqlparser::ast::JsonOperator::Arrow => "->",
-                        sqlparser::ast::JsonOperator::HashArrow => "#>",
-                        sqlparser::ast::JsonOperator::HashLongArrow => "#>>",
+                    let op_str = match op {
+                        BinaryOperator::LongArrow => "->>",
+                        BinaryOperator::Arrow => "->",
+                        BinaryOperator::HashArrow => "#>",
+                        BinaryOperator::HashLongArrow => "#>>",
                         _ => anyhow::bail!("Unsupported JSON operator"),
                     };
                     projection.push(ProjectionItem::JsonAccess {
@@ -304,6 +331,20 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
                     } else {
                         projection.push(ProjectionItem::Literal(crate::Value::Null));
                     }
+                } else if let Expr::Substring {
+                    expr: inner,
+                    substring_from,
+                    substring_for,
+                    ..
+                } = expr
+                {
+                    // sqlparser 0.62 parses `SUBSTR(x, a, b)` as a dedicated
+                    // `Substring` node; map it back to the SUBSTR scalar function.
+                    projection.push(ProjectionItem::ScalarFunction {
+                        func_name: "SUBSTR".to_string(),
+                        args: substring_args(inner, substring_from, substring_for, params),
+                        alias: None,
+                    });
                 } else if let Some(col) = extract_col_name(expr) {
                     projection.push(ProjectionItem::Column(col));
                 } else if let Some(val) = expr_to_value(expr, params) {
@@ -333,7 +374,7 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
                             }
                             for expr in &spec.order_by {
                                 if let Some(col) = extract_col_name(&expr.expr) {
-                                    order_by.push((col, expr.asc.unwrap_or(true)));
+                                    order_by.push((col, expr.options.asc.unwrap_or(true)));
                                 }
                             }
                         }
@@ -359,7 +400,13 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
                                     "MAX" => AggregateOp::Max,
                                     _ => unreachable!(),
                                 };
-                                let inner = if let Some(arg) = func.args.first() {
+                                let first_arg = match &func.args {
+                                    sqlparser::ast::FunctionArguments::List(list) => {
+                                        list.args.first()
+                                    }
+                                    _ => None,
+                                };
+                                let inner = if let Some(arg) = first_arg {
                                     match arg {
                                         sqlparser::ast::FunctionArg::Unnamed(
                                             sqlparser::ast::FunctionArgExpr::Expr(
@@ -378,7 +425,14 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
                             }
                             _ => {
                                 let mut args = Vec::new();
-                                for arg in &func.args {
+                                let func_arg_list: &[sqlparser::ast::FunctionArg] = match &func.args
+                                {
+                                    sqlparser::ast::FunctionArguments::List(list) => {
+                                        list.args.as_slice()
+                                    }
+                                    _ => &[],
+                                };
+                                for arg in func_arg_list {
                                     if let sqlparser::ast::FunctionArg::Unnamed(
                                         sqlparser::ast::FunctionArgExpr::Expr(e),
                                     ) = arg
@@ -398,27 +452,30 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
                             }
                         }
                     }
-                } else if let Expr::JsonAccess {
-                    left,
-                    operator,
-                    right,
-                } = expr
+                } else if let Expr::BinaryOp { left, op, right } = expr
+                    && matches!(
+                        op,
+                        BinaryOperator::Arrow
+                            | BinaryOperator::LongArrow
+                            | BinaryOperator::HashArrow
+                            | BinaryOperator::HashLongArrow
+                    )
                 {
                     let left_col = extract_col_name(left)
                         .ok_or_else(|| anyhow::anyhow!("Invalid JSON left"))?;
                     let right_val = match &**right {
-                        Expr::Value(v) => match v {
+                        Expr::Value(v) => match &v.value {
                             sqlparser::ast::Value::SingleQuotedString(s) => s.clone(),
                             sqlparser::ast::Value::Number(n, _) => n.clone(),
                             _ => anyhow::bail!("Unsupported JSON path"),
                         },
                         _ => anyhow::bail!("Unsupported JSON path"),
                     };
-                    let op_str = match operator {
-                        sqlparser::ast::JsonOperator::LongArrow => "->>",
-                        sqlparser::ast::JsonOperator::Arrow => "->",
-                        sqlparser::ast::JsonOperator::HashArrow => "#>",
-                        sqlparser::ast::JsonOperator::HashLongArrow => "#>>",
+                    let op_str = match op {
+                        BinaryOperator::LongArrow => "->>",
+                        BinaryOperator::Arrow => "->",
+                        BinaryOperator::HashArrow => "#>",
+                        BinaryOperator::HashLongArrow => "#>>",
                         _ => anyhow::bail!("Unsupported JSON operator"),
                     };
                     projection.push(ProjectionItem::JsonAccess {
@@ -438,6 +495,18 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
                             alias.value.clone(),
                         ));
                     }
+                } else if let Expr::Substring {
+                    expr: inner,
+                    substring_from,
+                    substring_for,
+                    ..
+                } = expr
+                {
+                    projection.push(ProjectionItem::ScalarFunction {
+                        func_name: "SUBSTR".to_string(),
+                        args: substring_args(inner, substring_from, substring_for, params),
+                        alias: Some(alias.value.clone()),
+                    });
                 } else if let Some(col) = extract_col_name(expr) {
                     projection.push(ProjectionItem::AliasedColumn(col, alias.value.clone()));
                 } else if let Some(val) = expr_to_value(expr, params) {
@@ -457,12 +526,15 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
                 projection.clear();
                 break;
             }
+            SelectItem::ExprWithAliases { .. } => {
+                anyhow::bail!("Unsupported multi-alias select item")
+            }
         }
     }
 
     let mut group_by = Vec::new();
     match &select.group_by {
-        sqlparser::ast::GroupByExpr::Expressions(exprs) => {
+        sqlparser::ast::GroupByExpr::Expressions(exprs, _) => {
             for expr in exprs {
                 if let sqlparser::ast::Expr::Identifier(id) = expr {
                     group_by.push(id.value.clone());
@@ -473,25 +545,32 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
     }
 
     // ORDER BY first column, if present.
-    let order_by = query
-        .order_by
-        .iter()
-        .filter_map(|o| match &o.expr {
-            Expr::Identifier(id) => Some((id.value.clone(), o.asc.unwrap_or(true))),
-            _ => None,
-        })
-        .collect();
+    let order_by = match &query.order_by {
+        Some(OrderBy {
+            kind: OrderByKind::Expressions(exprs),
+            ..
+        }) => exprs
+            .iter()
+            .filter_map(|o| match &o.expr {
+                Expr::Identifier(id) => Some((id.value.clone(), o.options.asc.unwrap_or(true))),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
 
-    // LIMIT <n>.
-    let limit = query
-        .limit
-        .as_ref()
+    // LIMIT <n> / OFFSET <n>, both carried by the `LimitClause`.
+    let (limit_expr, offset_expr) = match &query.limit_clause {
+        Some(LimitClause::LimitOffset { limit, offset, .. }) => {
+            (limit.as_ref(), offset.as_ref().map(|o| &o.value))
+        }
+        Some(LimitClause::OffsetCommaLimit { offset, limit }) => (Some(limit), Some(offset)),
+        None => (None, None),
+    };
+    let limit = limit_expr
         .and_then(|e| expr_to_value(e, params).and_then(|v| render(&v).parse::<usize>().ok()));
-
-    // OFFSET <n>.
-    let offset = query.offset.as_ref().and_then(|o| {
-        expr_to_value(&o.value, params).and_then(|v| render(&v).parse::<usize>().ok())
-    });
+    let offset = offset_expr
+        .and_then(|e| expr_to_value(e, params).and_then(|v| render(&v).parse::<usize>().ok()));
 
     let distinct = select.distinct.is_some();
 
@@ -516,6 +595,32 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
     })
 }
 
+/// Builds the SUBSTR scalar-function argument strings from a parsed `Substring`
+/// node (`SUBSTR(expr, from, for)`): each present operand resolves to a column
+/// name or a rendered literal, matching how the planner captures other scalar
+/// function arguments.
+fn substring_args(
+    inner: &sqlparser::ast::Expr,
+    substring_from: &Option<Box<sqlparser::ast::Expr>>,
+    substring_for: &Option<Box<sqlparser::ast::Expr>>,
+    params: &[Value],
+) -> Vec<String> {
+    let mut args = Vec::new();
+    let operands = [
+        Some(inner),
+        substring_from.as_deref(),
+        substring_for.as_deref(),
+    ];
+    for e in operands.into_iter().flatten() {
+        if let Some(col) = extract_col_name(e) {
+            args.push(col);
+        } else if let Some(val) = expr_to_value(e, params) {
+            args.push(literal_arg(&val));
+        }
+    }
+    args
+}
+
 /// Translates a parsed JOIN constraint into NodusDB's join representation:
 /// `(join_type, ON-condition, USING-columns, natural)`. `ON` becomes a filter
 /// condition; `USING (cols)` and `NATURAL` carry their column intent for the
@@ -537,7 +642,7 @@ fn join_constraint(
         JoinConstraint::Using(cols) => (
             join_type,
             None,
-            cols.iter().map(|c| c.value.clone()).collect(),
+            cols.iter().map(|c| c.to_string()).collect(),
             false,
         ),
         JoinConstraint::Natural => (join_type, None, Vec::new(), true),

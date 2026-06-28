@@ -428,7 +428,12 @@ const DEFAULT_TIMELINE_ID: &str = "default";
 fn checksum(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
-    format!("{:x}", hasher.finalize())
+    // sha2 0.11 returns a `hybrid_array::Array` (no `LowerHex`); hex-encode bytes.
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 fn pending_manifest_key(backup_id: &str) -> String {

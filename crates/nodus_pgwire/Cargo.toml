@@ -26,8 +26,8 @@ nodus_catalog = { path = "../nodus_catalog" }
 nodus_telemetry = { path = "../nodus_telemetry" }
 serde_json.workspace = true
 uuid.workspace = true
-tokio-rustls = "0.26"
-tokio-util = "0.7"
+tokio-rustls = "0.26.4"
+tokio-util = "0.7.18"
 
 [dev-dependencies]
 proptest.workspace = true

@@ -7,28 +7,31 @@ use nodus_catalog::TableConstraint;
 pub fn expr_to_value(expr: &sqlparser::ast::Expr, params: &[crate::Value]) -> Option<crate::Value> {
     use sqlparser::ast::{Expr, Value as SqlValue};
     match expr {
-        Expr::Value(SqlValue::SingleQuotedString(s)) => Some(crate::Value::Text(s.clone())),
-        Expr::Value(SqlValue::Number(n, _)) => {
-            if let Ok(i) = n.parse::<i64>() {
-                Some(crate::Value::Int(i))
-            } else if let Ok(f) = n.parse::<f64>() {
-                Some(crate::Value::Float(f))
-            } else {
-                Some(crate::Value::Text(n.clone()))
-            }
-        }
-        Expr::Value(SqlValue::Boolean(b)) => Some(crate::Value::Bool(*b)),
-        Expr::Value(SqlValue::Null) => Some(crate::Value::Null),
-        Expr::Value(SqlValue::Placeholder(s)) => {
-            if let Some(stripped) = s.strip_prefix('$') {
-                if let Ok(idx) = stripped.parse::<usize>() {
-                    if idx > 0 && idx <= params.len() {
-                        return Some(params[idx - 1].clone());
-                    }
+        Expr::Value(v) => match &v.value {
+            SqlValue::SingleQuotedString(s) => Some(crate::Value::Text(s.clone())),
+            SqlValue::Number(n, _) => {
+                if let Ok(i) = n.parse::<i64>() {
+                    Some(crate::Value::Int(i))
+                } else if let Ok(f) = n.parse::<f64>() {
+                    Some(crate::Value::Float(f))
+                } else {
+                    Some(crate::Value::Text(n.clone()))
                 }
             }
-            None
-        }
+            SqlValue::Boolean(b) => Some(crate::Value::Bool(*b)),
+            SqlValue::Null => Some(crate::Value::Null),
+            SqlValue::Placeholder(s) => {
+                if let Some(stripped) = s.strip_prefix('$') {
+                    if let Ok(idx) = stripped.parse::<usize>() {
+                        if idx > 0 && idx <= params.len() {
+                            return Some(params[idx - 1].clone());
+                        }
+                    }
+                }
+                None
+            }
+            _ => None,
+        },
         Expr::Identifier(id) => Some(crate::Value::Text(id.value.clone())),
         Expr::Array(sqlparser::ast::Array { elem, .. }) => {
             let mut arr = Vec::new();
@@ -55,25 +58,30 @@ pub(crate) fn extract_col_name(expr: &sqlparser::ast::Expr) -> Option<String> {
                 .collect::<Vec<_>>()
                 .join("."),
         ),
-        Expr::JsonAccess {
-            left,
-            operator,
-            right,
-        } => {
+        // PostgreSQL JSON access (`->`/`->>`/`#>`/`#>>`) parses as a binary op.
+        Expr::BinaryOp { left, op, right }
+            if matches!(
+                op,
+                sqlparser::ast::BinaryOperator::Arrow
+                    | sqlparser::ast::BinaryOperator::LongArrow
+                    | sqlparser::ast::BinaryOperator::HashArrow
+                    | sqlparser::ast::BinaryOperator::HashLongArrow
+            ) =>
+        {
             let left_col = extract_col_name(left)?;
             let right_val = match &**right {
-                Expr::Value(v) => match v {
+                Expr::Value(v) => match &v.value {
                     sqlparser::ast::Value::SingleQuotedString(s) => s.clone(),
                     sqlparser::ast::Value::Number(n, _) => n.clone(),
                     _ => return None,
                 },
                 _ => return None,
             };
-            let op_str = match operator {
-                sqlparser::ast::JsonOperator::LongArrow => "->>",
-                sqlparser::ast::JsonOperator::Arrow => "->",
-                sqlparser::ast::JsonOperator::HashArrow => "#>",
-                sqlparser::ast::JsonOperator::HashLongArrow => "#>>",
+            let op_str = match op {
+                sqlparser::ast::BinaryOperator::LongArrow => "->>",
+                sqlparser::ast::BinaryOperator::Arrow => "->",
+                sqlparser::ast::BinaryOperator::HashArrow => "#>",
+                sqlparser::ast::BinaryOperator::HashLongArrow => "#>>",
                 _ => return None,
             };
             Some(format!("{}{}'{}'", left_col, op_str, right_val))
@@ -83,12 +91,16 @@ pub(crate) fn extract_col_name(expr: &sqlparser::ast::Expr) -> Option<String> {
         // `HAVING` predicate can name them. Non-aggregate functions stay `None`
         // so they don't silently match in a `WHERE` clause.
         Expr::Function(func) => {
-            use sqlparser::ast::{FunctionArg, FunctionArgExpr};
+            use sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArguments};
             let fname = func.name.to_string().to_uppercase();
             if !matches!(fname.as_str(), "COUNT" | "SUM" | "MIN" | "MAX" | "AVG") {
                 return None;
             }
-            let arg = match func.args.first() {
+            let first_arg = match &func.args {
+                FunctionArguments::List(list) => list.args.first(),
+                _ => None,
+            };
+            let arg = match first_arg {
                 Some(FunctionArg::Unnamed(FunctionArgExpr::Wildcard)) => "*".to_string(),
                 Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(e))) => extract_col_name(e)?,
                 _ => return None,
@@ -108,14 +120,15 @@ pub(crate) fn parse_simple_case_when_eq(
     let Expr::Case {
         operand: None,
         conditions,
-        results,
         else_result: Some(else_result),
+        ..
     } = expr
     else {
         return None;
     };
-    let condition = conditions.first()?;
-    let then_expr = results.first()?;
+    let when = conditions.first()?;
+    let condition = &when.condition;
+    let then_expr = &when.result;
     let Expr::BinaryOp { left, op, right } = condition else {
         return None;
     };
@@ -153,14 +166,16 @@ pub(crate) fn parse_case(
     let Expr::Case {
         operand,
         conditions,
-        results,
         else_result,
+        ..
     } = expr
     else {
         return None;
     };
     let mut branches = Vec::new();
-    for (cond, res) in conditions.iter().zip(results.iter()) {
+    for when in conditions.iter() {
+        let cond = &when.condition;
+        let res = &when.result;
         let pred = match operand {
             // Simple CASE: `operand = cond`.
             Some(op_expr) => Predicate {
@@ -214,14 +229,22 @@ pub(crate) fn extract_operand(expr: &sqlparser::ast::Expr, params: &[Value]) -> 
 /// Extracts a window/scalar function's arguments as strings: column names via
 /// `extract_col_name`, or numeric/string literals (e.g. the LAG/LEAD offset).
 pub(crate) fn window_args(func: &sqlparser::ast::Function) -> Vec<String> {
-    use sqlparser::ast::{Expr, FunctionArg, FunctionArgExpr, Value as SqlValue};
-    func.args
-        .iter()
+    use sqlparser::ast::{
+        Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Value as SqlValue,
+    };
+    let args = match &func.args {
+        FunctionArguments::List(list) => list.args.as_slice(),
+        _ => &[],
+    };
+    args.iter()
         .filter_map(|a| match a {
             FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => {
                 extract_col_name(e).or_else(|| match e {
-                    Expr::Value(SqlValue::Number(n, _)) => Some(n.clone()),
-                    Expr::Value(SqlValue::SingleQuotedString(s)) => Some(s.clone()),
+                    Expr::Value(v) => match &v.value {
+                        SqlValue::Number(n, _) => Some(n.clone()),
+                        SqlValue::SingleQuotedString(s) => Some(s.clone()),
+                        _ => None,
+                    },
                     _ => None,
                 })
             }

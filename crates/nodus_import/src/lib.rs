@@ -299,19 +299,17 @@ fn collect_schema(
             let name = schema_name.to_string();
             schemas.push(format!("CREATE SCHEMA IF NOT EXISTS {name}"));
         }
-        Statement::CreateTable { ref name, .. } => {
-            let name = name.to_string();
+        Statement::CreateTable(ref ct) => {
+            let name = ct.name.to_string();
             tables.push(PendingTable {
                 name,
                 stmt: stmt.clone(),
             });
         }
-        Statement::AlterTable {
-            name, operations, ..
-        } => {
-            let target = name.to_string();
-            for op in operations {
-                if let AlterTableOperation::AddConstraint(constraint) = op {
+        Statement::AlterTable(at) => {
+            let target = at.name.to_string();
+            for op in at.operations {
+                if let AlterTableOperation::AddConstraint { constraint, .. } = op {
                     fold_constraint(tables, &target, constraint, report);
                 }
                 // Non-constraint ALTERs are reported as skipped in pass 2.
@@ -330,9 +328,9 @@ fn fold_constraint(
     report: &mut ImportReport,
 ) {
     if let Some(pending) = tables.iter_mut().find(|t| t.name == target)
-        && let Statement::CreateTable { constraints, .. } = &mut pending.stmt
+        && let Statement::CreateTable(ct) = &mut pending.stmt
     {
-        constraints.push(constraint);
+        ct.constraints.push(constraint);
         report.constraints_folded += 1;
     }
 }
@@ -347,8 +345,12 @@ fn emit_data_statement(
 ) -> bool {
     let parsed = parse_one(text);
     let (kind, table) = match &parsed {
-        Some(Statement::Insert { table_name, .. }) => {
-            (StmtKind::Insert, Some(table_name.to_string()))
+        Some(Statement::Insert(insert)) => {
+            let table_name = match &insert.table {
+                sqlparser::ast::TableObject::TableName(name) => name.to_string(),
+                other => other.to_string(),
+            };
+            (StmtKind::Insert, Some(table_name))
         }
         Some(Statement::Update { .. }) => (StmtKind::Update, None),
         Some(Statement::Delete { .. }) => (StmtKind::Delete, None),
@@ -363,13 +365,14 @@ fn emit_data_statement(
             return false;
         }
         // Schema statements were handled in pass 1.
-        Some(Statement::CreateTable { .. })
+        Some(Statement::CreateTable(_))
         | Some(Statement::CreateSchema { .. })
         | Some(Statement::CreateIndex { .. }) => return false,
-        Some(Statement::AlterTable { operations, .. }) => {
-            if operations
+        Some(Statement::AlterTable(at)) => {
+            if at
+                .operations
                 .iter()
-                .all(|op| matches!(op, AlterTableOperation::AddConstraint(_)))
+                .all(|op| matches!(op, AlterTableOperation::AddConstraint { .. }))
             {
                 return false; // already folded
             }
@@ -482,10 +485,10 @@ pub fn synthesize_insert(spec: &CopySpec, rows: &[Vec<Cell>]) -> String {
 
 /// Removes `DEFAULT`/identity clauses from a `CREATE TABLE`, noting each drop.
 fn strip_table_defaults(stmt: &mut Statement, table: &str, report: &mut ImportReport) {
-    let Statement::CreateTable { columns, .. } = stmt else {
+    let Statement::CreateTable(ct) = stmt else {
         return;
     };
-    for col in columns {
+    for col in &mut ct.columns {
         let had = col.options.len();
         let col_name = col.name.to_string();
         col.options.retain(|opt| {
@@ -507,10 +510,10 @@ fn strip_table_defaults(stmt: &mut Statement, table: &str, report: &mut ImportRe
 
 /// Records columns whose declared type NodusDB stores losslessly only as text.
 fn record_lossy_types(stmt: &Statement, table: &str, report: &mut ImportReport) {
-    let Statement::CreateTable { columns, .. } = stmt else {
+    let Statement::CreateTable(ct) = stmt else {
         return;
     };
-    for col in columns {
+    for col in &ct.columns {
         let ty = col.data_type.to_string().to_ascii_uppercase();
         let detail = if ty.contains("TIMESTAMP") || ty.contains("DATE") || ty.contains("TIME") {
             Some("temporal type stored as text")

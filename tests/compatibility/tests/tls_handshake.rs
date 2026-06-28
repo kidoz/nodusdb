@@ -43,7 +43,7 @@ fn generate_cert() -> CertFixture {
     let cert_path = dir.join("server.crt");
     let key_path = dir.join("server.key");
     std::fs::write(&cert_path, cert.cert.pem()).expect("write cert");
-    std::fs::write(&key_path, cert.key_pair.serialize_pem()).expect("write key");
+    std::fs::write(&key_path, cert.signing_key.serialize_pem()).expect("write key");
 
     CertFixture {
         dir,

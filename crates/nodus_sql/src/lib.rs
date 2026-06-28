@@ -42,19 +42,21 @@ pub fn parse_sql(
 /// echoed back as a `ParameterStatus` message (for `GUC_REPORT` variables),
 /// without re-parsing the raw SQL text.
 pub fn set_variable_parts(stmt: &sqlparser::ast::Statement) -> Option<(String, String)> {
-    use sqlparser::ast::Statement;
+    use sqlparser::ast::{Set, Statement};
     match stmt {
-        Statement::SetVariable {
-            variable, value, ..
-        } => {
-            let values: Vec<String> = value.iter().map(|v| v.to_string()).collect();
-            if values.len() != 1 {
+        Statement::Set(Set::SingleAssignment {
+            variable, values, ..
+        }) => {
+            let rendered: Vec<String> = values.iter().map(|v| v.to_string()).collect();
+            if rendered.len() != 1 {
                 return None;
             }
-            Some((variable.to_string(), values.into_iter().next()?))
+            Some((variable.to_string(), rendered.into_iter().next()?))
         }
         // `SET TIME ZONE <x>` is the SQL-standard spelling of `SET timezone = <x>`.
-        Statement::SetTimeZone { value, .. } => Some(("timezone".to_string(), value.to_string())),
+        Statement::Set(Set::SetTimeZone { value, .. }) => {
+            Some(("timezone".to_string(), value.to_string()))
+        }
         _ => None,
     }
 }

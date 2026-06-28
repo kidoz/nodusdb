@@ -9,20 +9,22 @@ use opentelemetry::global;
 use opentelemetry::global::BoxedSpan;
 use opentelemetry::trace::Tracer;
 use opentelemetry_otlp::WithExportConfig;
-use opentelemetry_sdk::trace::TracerProvider;
+use opentelemetry_sdk::trace::SdkTracerProvider;
 
 const SERVICE: &str = "nodusd";
 
 /// Builds an OTLP (HTTP/protobuf) batch exporter to `endpoint` and installs it
 /// as the global tracer provider. Keep the returned provider alive for the
 /// process lifetime; spans are flushed on a background batch processor.
-pub fn init_otlp(endpoint: &str) -> Result<TracerProvider> {
+pub fn init_otlp(endpoint: &str) -> Result<SdkTracerProvider> {
     let exporter = opentelemetry_otlp::SpanExporter::builder()
         .with_http()
         .with_endpoint(endpoint)
         .build()?;
-    let provider = TracerProvider::builder()
-        .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
+    // opentelemetry_sdk 0.32: the batch processor is thread-based and no longer
+    // takes a runtime argument.
+    let provider = SdkTracerProvider::builder()
+        .with_batch_exporter(exporter)
         .build();
     global::set_tracer_provider(provider.clone());
     Ok(provider)
@@ -38,12 +40,12 @@ pub fn start_span(name: &'static str) -> BoxedSpan {
 mod tests {
     use super::*;
     use opentelemetry::trace::TracerProvider as _;
-    use opentelemetry_sdk::testing::trace::InMemorySpanExporter;
+    use opentelemetry_sdk::trace::InMemorySpanExporter;
 
     #[test]
     fn span_is_exported_to_provider() {
         let exporter = InMemorySpanExporter::default();
-        let provider = TracerProvider::builder()
+        let provider = SdkTracerProvider::builder()
             .with_simple_exporter(exporter.clone())
             .build();
         let tracer = provider.tracer("test");

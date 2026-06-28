@@ -13,6 +13,8 @@ pub(crate) fn compare_op(op: &sqlparser::ast::BinaryOperator) -> Option<CompareO
         LtEq => Some(CompareOp::Le),
         Gt => Some(CompareOp::Gt),
         GtEq => Some(CompareOp::Ge),
+        AtArrow => Some(CompareOp::Contains),
+        ArrowAt => Some(CompareOp::ContainedBy),
         Custom(s) if s == "@>" => Some(CompareOp::Contains),
         Custom(s) if s == "<@" => Some(CompareOp::ContainedBy),
         _ => None,
@@ -125,24 +127,6 @@ pub(crate) fn parse_filter_expr(
             } else {
                 None
             }
-        }
-        Expr::JsonAccess {
-            left,
-            operator,
-            right,
-        } => {
-            let left_col = extract_col_name(left)?;
-            let right_op = extract_operand(right, params)?;
-            let cmp = match operator {
-                sqlparser::ast::JsonOperator::AtArrow => CompareOp::Contains,
-                sqlparser::ast::JsonOperator::ArrowAt => CompareOp::ContainedBy,
-                _ => return None,
-            };
-            Some(FilterExpr::Predicate(Predicate {
-                left: left_col,
-                op: cmp,
-                right: right_op,
-            }))
         }
         _ => None,
     }

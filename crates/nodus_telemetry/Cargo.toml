@@ -9,14 +9,14 @@ repository.workspace = true
 [dependencies]
 anyhow.workspace = true
 tokio.workspace = true
-opentelemetry = "0.27"
-opentelemetry_sdk = { version = "0.27", features = ["rt-tokio", "testing"] }
-opentelemetry-otlp = { version = "0.27", default-features = false, features = ["trace", "http-proto", "reqwest-client"] }
+opentelemetry = "0.32.0"
+opentelemetry_sdk = { version = "0.32.1", features = ["rt-tokio", "testing"] }
+opentelemetry-otlp = { version = "0.32.0", default-features = false, features = ["trace", "http-proto", "reqwest-client"] }
 
 [dev-dependencies]
 # In-process OTLP/HTTP collector for CI: verifies the export network path
 # without a standalone collector.
-axum = "0.7.5"
+axum = "0.8.9"
 
 [lints]
 workspace = true
