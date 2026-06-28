@@ -76,6 +76,14 @@ pub enum TableDescriptorChange {
         old_name: String,
         new_name: String,
     },
+    /// Changes a column's declared type. Only catalog metadata is updated;
+    /// existing stored values are left as-is (a best-effort `ALTER ... SET DATA
+    /// TYPE`), with the type system coercing on subsequent reads/writes.
+    AlterColumnType {
+        table_id: TableId,
+        column_name: String,
+        data_type: String,
+    },
     DropColumn {
         table_id: TableId,
         column_name: String,

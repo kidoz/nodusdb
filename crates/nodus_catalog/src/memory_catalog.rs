@@ -520,6 +520,7 @@ impl CatalogWriter for MemoryCatalog {
             TableDescriptorChange::AddColumn { table_id, .. } => *table_id,
             TableDescriptorChange::RenameTable { table_id, .. } => *table_id,
             TableDescriptorChange::RenameColumn { table_id, .. } => *table_id,
+            TableDescriptorChange::AlterColumnType { table_id, .. } => *table_id,
             TableDescriptorChange::DropColumn { table_id, .. } => *table_id,
             TableDescriptorChange::AddIndex { table_id, .. } => *table_id,
             TableDescriptorChange::DropIndex { table_id, .. } => *table_id,
@@ -556,6 +557,18 @@ impl CatalogWriter for MemoryCatalog {
                     col.name = new_name;
                 } else {
                     anyhow::bail!("Column {} not found", old_name);
+                }
+            }
+            TableDescriptorChange::AlterColumnType {
+                column_name,
+                data_type,
+                ..
+            } => {
+                if let Some(col) = table.columns.iter_mut().find(|c| c.name == column_name) {
+                    col.data_type = data_type;
+                    col.updated_at = chrono::Utc::now();
+                } else {
+                    anyhow::bail!("Column {} not found", column_name);
                 }
             }
             TableDescriptorChange::DropColumn { column_name, .. } => {

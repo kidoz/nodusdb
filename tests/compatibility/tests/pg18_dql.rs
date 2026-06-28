@@ -144,6 +144,65 @@ async fn test_pg18_join_using_and_natural() {
         .await
         .expect("ARRAY[col] projection does not error");
     assert_eq!(rows_of(&msgs).len(), 3);
+
+    // A qualified wildcard `t.*` projects the table's columns rather than erroring.
+    let msgs = client
+        .simple_query("SELECT e.* FROM j.employees e ORDER BY e.emp_id;")
+        .await
+        .expect("qualified wildcard resolves");
+    let rows = rows_of(&msgs);
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0].get("name"), Some("Alice"));
+    assert_eq!(rows[0].get("dept_id"), Some("1"));
+}
+
+/// ALTER TABLE ... ALTER COLUMN ... SET DATA TYPE retypes a column (catalog
+/// metadata) without erroring, and the table keeps serving its rows.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_pg18_alter_column_set_data_type() {
+    let server = TestServer::start().await.expect("server starts");
+    let client = connect(&server).await;
+    client.simple_query("CREATE SCHEMA a;").await.unwrap();
+    client
+        .simple_query("CREATE TABLE a.t (id INT PRIMARY KEY, v TEXT);")
+        .await
+        .unwrap();
+    client
+        .simple_query("INSERT INTO a.t (id, v) VALUES (1, 'x'), (2, 'y');")
+        .await
+        .unwrap();
+
+    client
+        .simple_query("ALTER TABLE a.t ALTER COLUMN id SET DATA TYPE NUMERIC USING id::NUMERIC;")
+        .await
+        .expect("ALTER COLUMN SET DATA TYPE succeeds");
+
+    // The new declared type is reflected in the catalog.
+    let msgs = client
+        .simple_query(
+            "SELECT data_type FROM information_schema.columns \
+             WHERE table_schema = 'a' AND table_name = 't' AND column_name = 'id';",
+        )
+        .await
+        .unwrap();
+    let rows = rows_of(&msgs);
+    assert_eq!(rows.len(), 1);
+    assert!(
+        rows[0]
+            .get("data_type")
+            .unwrap_or_default()
+            .to_lowercase()
+            .contains("numeric"),
+        "id should be retyped to numeric, got {:?}",
+        rows[0].get("data_type")
+    );
+
+    // Existing rows still read back.
+    let msgs = client
+        .simple_query("SELECT id, v FROM a.t ORDER BY id;")
+        .await
+        .unwrap();
+    assert_eq!(rows_of(&msgs).len(), 2);
 }
 
 #[tokio::test(flavor = "multi_thread")]

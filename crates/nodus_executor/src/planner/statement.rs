@@ -451,6 +451,13 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                         name: column_name.value.clone(),
                     }
                 }
+                sqlparser::ast::AlterTableOperation::AlterColumn {
+                    column_name,
+                    op: sqlparser::ast::AlterColumnOperation::SetDataType { data_type, .. },
+                } => AlterTableOp::AlterColumnType {
+                    name: column_name.value.clone(),
+                    data_type: data_type.to_string(),
+                },
                 sqlparser::ast::AlterTableOperation::RenameTable {
                     table_name: new_table_name,
                 } => AlterTableOp::RenameTable {

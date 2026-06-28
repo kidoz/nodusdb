@@ -151,6 +151,10 @@ pub enum AlterTableOp {
         old_name: String,
         new_name: String,
     },
+    AlterColumnType {
+        name: String,
+        data_type: String,
+    },
     DropColumn {
         name: String,
     },

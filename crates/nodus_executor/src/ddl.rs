@@ -320,6 +320,19 @@ impl MemExecutor {
                     new_name,
                 }
             }
+            AlterTableOp::AlterColumnType { name, data_type } => {
+                if !tbl.columns.iter().any(|c| c.name == name) {
+                    anyhow::bail!("Column {} not found", name);
+                }
+                // Catalog-only retype: existing rows keep their stored values and
+                // the type system coerces them on later reads/writes. The parsed
+                // `USING <cast>` expression is not applied as a bulk rewrite.
+                nodus_catalog::TableDescriptorChange::AlterColumnType {
+                    table_id: tbl.id,
+                    column_name: name,
+                    data_type,
+                }
+            }
             AlterTableOp::RenameTable { new_name } => {
                 nodus_catalog::TableDescriptorChange::RenameTable {
                     table_id: tbl.id,

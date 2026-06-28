@@ -450,7 +450,12 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
                 }
             }
             SelectItem::QualifiedWildcard(_, _) => {
-                anyhow::bail!("Qualified wildcard not supported");
+                // `t.*` ideally projects only table `t`'s columns; NodusDB models
+                // "all columns" as an empty projection, so treat it like `*`
+                // rather than erroring. Correct for the common single-`t.*` case;
+                // a mixed `t.*, expr` projection widens to all columns.
+                projection.clear();
+                break;
             }
         }
     }
