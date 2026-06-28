@@ -74,6 +74,15 @@ pub struct Join {
     pub table_alias: Option<String>,
     pub condition: Option<FilterExpr>,
     pub join_type: JoinType,
+    /// Columns named in a `USING (...)` clause. The join matches rows whose values
+    /// are equal in each named column on both sides; resolved against the actual
+    /// row schemas at execution time (so it composes with chained joins).
+    #[serde(default)]
+    pub using_columns: Vec<String>,
+    /// `true` for a `NATURAL JOIN`: an equi-join over every column name common to
+    /// both inputs, also resolved at execution time.
+    #[serde(default)]
+    pub natural: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

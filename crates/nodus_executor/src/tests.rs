@@ -666,6 +666,8 @@ fn test_join_execution() {
                 right: Operand::Ident("authors.id".into()),
             })),
             join_type: JoinType::Inner,
+            using_columns: vec![],
+            natural: false,
         }],
         projection: vec![
             ProjectionItem::Column("books.title".into()),

@@ -254,6 +254,40 @@ impl MemExecutor {
             let mut combined_desc = joined_columns.clone();
             combined_desc.extend(j_cols.clone());
 
+            // `USING (cols)` / `NATURAL` are equi-joins over named columns common
+            // to both inputs. Resolve them here, against the actual (prefixed) row
+            // schemas, into pairs of combined-row indices to compare for equality
+            // — so they compose with chained joins where the left input already
+            // spans several tables. `None` means use the `ON` condition instead.
+            let named_eq_pairs: Option<Vec<(usize, usize)>> =
+                if join.natural || !join.using_columns.is_empty() {
+                    let left_len = col_names.len();
+                    let unqual = |s: &str| s.rsplit('.').next().unwrap_or(s).to_ascii_lowercase();
+                    let names: Vec<String> = if join.natural {
+                        col_names
+                            .iter()
+                            .map(|c| unqual(c))
+                            .filter(|n| j_col_names.iter().any(|jc| unqual(jc) == *n))
+                            .collect()
+                    } else {
+                        join.using_columns
+                            .iter()
+                            .map(|c| c.to_ascii_lowercase())
+                            .collect()
+                    };
+                    let pairs = names
+                        .iter()
+                        .filter_map(|n| {
+                            let li = col_names.iter().position(|c| unqual(c) == *n)?;
+                            let ri = j_col_names.iter().position(|c| unqual(c) == *n)?;
+                            Some((li, left_len + ri))
+                        })
+                        .collect();
+                    Some(pairs)
+                } else {
+                    None
+                };
+
             let mut next_rows = Vec::new();
             let mut right_matched = vec![false; j_rows.len()];
             for r1 in &stored_rows {
@@ -261,16 +295,21 @@ impl MemExecutor {
                 for (j_idx, r2) in j_rows.iter().enumerate() {
                     let mut combined_row = r1.clone();
                     combined_row.extend(r2.clone());
-                    if self
-                        .eval_filter(
-                            ctx,
-                            &combined_row,
-                            &combined_cols,
-                            &combined_desc,
-                            join.condition.as_ref(),
-                        )
-                        .unwrap_or(false)
-                    {
+                    let is_match = match &named_eq_pairs {
+                        Some(pairs) => pairs.iter().all(|(l, r)| {
+                            crate::value::values_equal(&combined_row[*l], &combined_row[*r])
+                        }),
+                        None => self
+                            .eval_filter(
+                                ctx,
+                                &combined_row,
+                                &combined_cols,
+                                &combined_desc,
+                                join.condition.as_ref(),
+                            )
+                            .unwrap_or(false),
+                    };
+                    if is_match {
                         next_rows.push(combined_row);
                         matched = true;
                         right_matched[j_idx] = true;

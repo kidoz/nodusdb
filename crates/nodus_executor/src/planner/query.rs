@@ -163,20 +163,12 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
             }
             other => anyhow::bail!("Unsupported join relation: {:?}", other),
         };
-        let (join_type, condition) = match &j.join_operator {
-            JoinOperator::Inner(JoinConstraint::On(expr)) => {
-                (JoinType::Inner, parse_filter_expr(expr, params))
-            }
-            JoinOperator::LeftOuter(JoinConstraint::On(expr)) => {
-                (JoinType::LeftOuter, parse_filter_expr(expr, params))
-            }
-            JoinOperator::RightOuter(JoinConstraint::On(expr)) => {
-                (JoinType::RightOuter, parse_filter_expr(expr, params))
-            }
-            JoinOperator::FullOuter(JoinConstraint::On(expr)) => {
-                (JoinType::FullOuter, parse_filter_expr(expr, params))
-            }
-            JoinOperator::CrossJoin => (JoinType::Cross, None),
+        let (join_type, condition, using_columns, natural) = match &j.join_operator {
+            JoinOperator::Inner(c) => join_constraint(JoinType::Inner, c, params),
+            JoinOperator::LeftOuter(c) => join_constraint(JoinType::LeftOuter, c, params),
+            JoinOperator::RightOuter(c) => join_constraint(JoinType::RightOuter, c, params),
+            JoinOperator::FullOuter(c) => join_constraint(JoinType::FullOuter, c, params),
+            JoinOperator::CrossJoin => (JoinType::Cross, None, Vec::new(), false),
             other => anyhow::bail!("Unsupported join operator: {:?}", other),
         };
         joins.push(crate::Join {
@@ -184,6 +176,8 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
             table_alias: join_table_alias,
             condition,
             join_type,
+            using_columns,
+            natural,
         });
     }
 
@@ -313,6 +307,13 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
                 } else if let Some(col) = extract_col_name(expr) {
                     projection.push(ProjectionItem::Column(col));
                 } else if let Some(val) = expr_to_value(expr, params) {
+                    projection.push(ProjectionItem::Literal(val));
+                } else if matches!(expr, Expr::Array(_)) {
+                    // An `ARRAY[...]` of literals folds to a constant; one with
+                    // column refs (e.g. `ARRAY[d.objsubid]` in pg_depend
+                    // introspection) can't be folded here, so surface NULL rather
+                    // than failing the statement.
+                    let val = expr_to_value(expr, params).unwrap_or(crate::Value::Null);
                     projection.push(ProjectionItem::Literal(val));
                 } else {
                     anyhow::bail!("Unsupported projection item: {:?}", item);
@@ -508,4 +509,33 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
         offset,
         distinct,
     })
+}
+
+/// Translates a parsed JOIN constraint into NodusDB's join representation:
+/// `(join_type, ON-condition, USING-columns, natural)`. `ON` becomes a filter
+/// condition; `USING (cols)` and `NATURAL` carry their column intent for the
+/// executor to resolve against the actual row schemas (so they compose with
+/// chained joins, where the left input spans several tables).
+fn join_constraint(
+    join_type: JoinType,
+    constraint: &sqlparser::ast::JoinConstraint,
+    params: &[Value],
+) -> (JoinType, Option<FilterExpr>, Vec<String>, bool) {
+    use sqlparser::ast::JoinConstraint;
+    match constraint {
+        JoinConstraint::On(expr) => (
+            join_type,
+            parse_filter_expr(expr, params),
+            Vec::new(),
+            false,
+        ),
+        JoinConstraint::Using(cols) => (
+            join_type,
+            None,
+            cols.iter().map(|c| c.value.clone()).collect(),
+            false,
+        ),
+        JoinConstraint::Natural => (join_type, None, Vec::new(), true),
+        JoinConstraint::None => (join_type, None, Vec::new(), false),
+    }
 }

@@ -84,6 +84,68 @@ async fn test_pg18_joins() {
     assert_eq!(rows.len(), 5);
 }
 
+/// JOIN ... USING (col) and NATURAL JOIN — equi-joins over named common columns.
+/// Both are used by IDE introspection (and ordinary SQL); they must equi-join on
+/// the shared column, not error or cross-join.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_pg18_join_using_and_natural() {
+    let server = TestServer::start().await.expect("server starts");
+    let client = connect(&server).await;
+    client.simple_query("CREATE SCHEMA j;").await.unwrap();
+    client
+        .simple_query("CREATE TABLE j.departments (dept_id INT PRIMARY KEY, dept_name TEXT);")
+        .await
+        .unwrap();
+    client
+        .simple_query("CREATE TABLE j.employees (emp_id INT PRIMARY KEY, name TEXT, dept_id INT);")
+        .await
+        .unwrap();
+    client
+        .simple_query(
+            "INSERT INTO j.departments (dept_id, dept_name) VALUES (1, 'Eng'), (2, 'Sales');",
+        )
+        .await
+        .unwrap();
+    client
+        .simple_query("INSERT INTO j.employees (emp_id, name, dept_id) VALUES (101, 'Alice', 1), (102, 'Bob', 2), (103, 'Cara', 1);")
+        .await
+        .unwrap();
+
+    // USING (dept_id): one row per employee, matched to its department.
+    let msgs = client
+        .simple_query(
+            "SELECT e.name, d.dept_name FROM j.employees e \
+             JOIN j.departments d USING (dept_id) ORDER BY e.emp_id;",
+        )
+        .await
+        .expect("JOIN USING resolves");
+    let rows = rows_of(&msgs);
+    assert_eq!(
+        rows.len(),
+        3,
+        "USING must equi-join on dept_id, not cross-join"
+    );
+    assert_eq!(rows[0].get("dept_name"), Some("Eng"));
+    assert_eq!(rows[1].get("dept_name"), Some("Sales"));
+
+    // NATURAL JOIN: dept_id is the only common column, so same pairing.
+    let msgs = client
+        .simple_query(
+            "SELECT name, dept_name FROM j.employees NATURAL JOIN j.departments ORDER BY emp_id;",
+        )
+        .await
+        .expect("NATURAL JOIN resolves");
+    assert_eq!(rows_of(&msgs).len(), 3, "NATURAL must equi-join on dept_id");
+
+    // An ARRAY[...] constructor over a column ref in the projection must not fail
+    // the statement (introspection builds these, e.g. ARRAY[d.objsubid]).
+    let msgs = client
+        .simple_query("SELECT ARRAY[emp_id] FROM j.employees;")
+        .await
+        .expect("ARRAY[col] projection does not error");
+    assert_eq!(rows_of(&msgs).len(), 3);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_pg18_ctes() {
     let server = TestServer::start().await.expect("server starts");
