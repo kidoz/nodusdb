@@ -240,6 +240,16 @@ impl MemExecutor {
                 | "pg_user_mapping"
                 | "pg_available_extensions"
                 | "pg_available_extension_versions"
+                | "pg_opclass"
+                | "pg_opfamily"
+                | "pg_amop"
+                | "pg_amproc"
+                | "pg_aggregate"
+                | "pg_sequence"
+                | "pg_foreign_table"
+                | "pg_rewrite"
+                | "pg_policy"
+                | "pg_trigger"
         )
     }
 

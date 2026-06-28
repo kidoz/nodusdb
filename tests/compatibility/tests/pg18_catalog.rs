@@ -496,6 +496,46 @@ async fn test_pg_catalog_introspection_relations_resolve() {
             "SELECT umuser, umserver FROM pg_catalog.pg_user_mapping;",
             "pg_user_mapping",
         ),
+        (
+            "SELECT opcname, opcmethod FROM pg_catalog.pg_opclass;",
+            "pg_opclass",
+        ),
+        (
+            "SELECT opfname, opfmethod FROM pg_catalog.pg_opfamily;",
+            "pg_opfamily",
+        ),
+        (
+            "SELECT amopopr, amopstrategy FROM pg_catalog.pg_amop;",
+            "pg_amop",
+        ),
+        (
+            "SELECT amproc, amprocnum FROM pg_catalog.pg_amproc;",
+            "pg_amproc",
+        ),
+        (
+            "SELECT aggfnoid, aggkind FROM pg_catalog.pg_aggregate;",
+            "pg_aggregate",
+        ),
+        (
+            "SELECT seqrelid, seqstart FROM pg_catalog.pg_sequence;",
+            "pg_sequence",
+        ),
+        (
+            "SELECT ftrelid, ftserver FROM pg_catalog.pg_foreign_table;",
+            "pg_foreign_table",
+        ),
+        (
+            "SELECT rulename, ev_class FROM pg_catalog.pg_rewrite;",
+            "pg_rewrite",
+        ),
+        (
+            "SELECT polname, polrelid FROM pg_catalog.pg_policy;",
+            "pg_policy",
+        ),
+        (
+            "SELECT tgname, tgrelid FROM pg_catalog.pg_trigger;",
+            "pg_trigger",
+        ),
     ] {
         let msgs = client
             .simple_query(query)

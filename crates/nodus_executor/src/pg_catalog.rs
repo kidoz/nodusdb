@@ -803,6 +803,144 @@ impl MemExecutor {
                     Value::Text("PL/pgSQL procedural language".into()),
                 ]],
             )),
+            // Access-method support catalogs (operator classes/families and their
+            // operators/procedures). NodusDB has no user-defined opclasses, so
+            // these exist with their real shape and no rows — enough for IDE
+            // introspection to join across them without erroring.
+            "pg_opclass" => Some((
+                Self::virtual_columns(&[
+                    ("oid", "OID"),
+                    ("opcmethod", "OID"),
+                    ("opcname", "NAME"),
+                    ("opcnamespace", "OID"),
+                    ("opcowner", "OID"),
+                    ("opcfamily", "OID"),
+                    ("opcintype", "OID"),
+                    ("opcdefault", "BOOL"),
+                    ("opckeytype", "OID"),
+                ]),
+                Vec::new(),
+            )),
+            "pg_opfamily" => Some((
+                Self::virtual_columns(&[
+                    ("oid", "OID"),
+                    ("opfmethod", "OID"),
+                    ("opfname", "NAME"),
+                    ("opfnamespace", "OID"),
+                    ("opfowner", "OID"),
+                ]),
+                Vec::new(),
+            )),
+            "pg_amop" => Some((
+                Self::virtual_columns(&[
+                    ("oid", "OID"),
+                    ("amopfamily", "OID"),
+                    ("amoplefttype", "OID"),
+                    ("amoprighttype", "OID"),
+                    ("amopstrategy", "INT2"),
+                    ("amoppurpose", "PG_CHAR"),
+                    ("amopopr", "OID"),
+                    ("amopmethod", "OID"),
+                    ("amopsortfamily", "OID"),
+                ]),
+                Vec::new(),
+            )),
+            "pg_amproc" => Some((
+                Self::virtual_columns(&[
+                    ("oid", "OID"),
+                    ("amprocfamily", "OID"),
+                    ("amproclefttype", "OID"),
+                    ("amprocrighttype", "OID"),
+                    ("amprocnum", "INT2"),
+                    ("amproc", "REGPROC"),
+                ]),
+                Vec::new(),
+            )),
+            // Aggregate definitions. NodusDB's aggregates are built into the
+            // executor, not catalogued, so this is presented empty.
+            "pg_aggregate" => Some((
+                Self::virtual_columns(&[
+                    ("aggfnoid", "REGPROC"),
+                    ("aggkind", "PG_CHAR"),
+                    ("aggnumdirectargs", "INT2"),
+                    ("aggtransfn", "REGPROC"),
+                    ("aggfinalfn", "REGPROC"),
+                    ("aggtranstype", "OID"),
+                    ("agginitval", "TEXT"),
+                ]),
+                Vec::new(),
+            )),
+            // Sequences: NodusDB allocates identity values without a catalogued
+            // sequence relation, so this is empty.
+            "pg_sequence" => Some((
+                Self::virtual_columns(&[
+                    ("seqrelid", "OID"),
+                    ("seqtypid", "OID"),
+                    ("seqstart", "INT8"),
+                    ("seqincrement", "INT8"),
+                    ("seqmax", "INT8"),
+                    ("seqmin", "INT8"),
+                    ("seqcache", "INT8"),
+                    ("seqcycle", "BOOL"),
+                ]),
+                Vec::new(),
+            )),
+            // Foreign tables: none (NodusDB has no FDWs).
+            "pg_foreign_table" => Some((
+                Self::virtual_columns(&[
+                    ("ftrelid", "OID"),
+                    ("ftserver", "OID"),
+                    ("ftoptions", "TEXT"),
+                ]),
+                Vec::new(),
+            )),
+            // Rules, row-security policies, and triggers are not supported, so
+            // these are present (so introspection joins resolve) but empty.
+            "pg_rewrite" => Some((
+                Self::virtual_columns(&[
+                    ("oid", "OID"),
+                    ("rulename", "NAME"),
+                    ("ev_class", "OID"),
+                    ("ev_type", "PG_CHAR"),
+                    ("ev_enabled", "PG_CHAR"),
+                    ("is_instead", "BOOL"),
+                    ("ev_qual", "TEXT"),
+                    ("ev_action", "TEXT"),
+                ]),
+                Vec::new(),
+            )),
+            "pg_policy" => Some((
+                Self::virtual_columns(&[
+                    ("oid", "OID"),
+                    ("polname", "NAME"),
+                    ("polrelid", "OID"),
+                    ("polcmd", "PG_CHAR"),
+                    ("polpermissive", "BOOL"),
+                    ("polroles", "TEXT"),
+                    ("polqual", "TEXT"),
+                    ("polwithcheck", "TEXT"),
+                ]),
+                Vec::new(),
+            )),
+            "pg_trigger" => Some((
+                Self::virtual_columns(&[
+                    ("oid", "OID"),
+                    ("tgrelid", "OID"),
+                    ("tgparentid", "OID"),
+                    ("tgname", "NAME"),
+                    ("tgfoid", "OID"),
+                    ("tgtype", "INT2"),
+                    ("tgenabled", "PG_CHAR"),
+                    ("tgisinternal", "BOOL"),
+                    ("tgconstrrelid", "OID"),
+                    ("tgconstrindid", "OID"),
+                    ("tgconstraint", "OID"),
+                    ("tgnargs", "INT2"),
+                    ("tgargs", "TEXT"),
+                    ("tgqual", "TEXT"),
+                ]),
+                Vec::new(),
+            )),
             _ => None,
         };
         Ok(result)
