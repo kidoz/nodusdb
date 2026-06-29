@@ -6,22 +6,38 @@ use openraft::raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
     VoteRequest, VoteResponse,
 };
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 /// The HTTP client and URL scheme used for inter-node Raft RPCs. Plain HTTP by
 /// default; a TLS-configured client with `https` is supplied when inter-node
 /// mTLS is enabled, so the same RPC code path serves both.
 #[derive(Clone)]
 pub struct RaftTransport {
-    client: reqwest::Client,
+    client: RaftClient,
     scheme: Arc<str>,
 }
 
+/// The outbound HTTP client behind a [`RaftTransport`].
+#[derive(Clone)]
+enum RaftClient {
+    /// A plain-HTTP client, built lazily on the first outbound RPC. A single-node
+    /// server (and every test) issues no peer RPCs at all, so the client is never
+    /// constructed — which matters because `reqwest::Client::new()` performs a
+    /// one-time TLS-stack initialization that, on some platforms (notably macOS,
+    /// where it reaches the keychain/Gatekeeper through the system trust store),
+    /// can block for many seconds. Deferring it keeps that cost off the startup
+    /// path until a peer is actually contacted.
+    Lazy(Arc<OnceLock<reqwest::Client>>),
+    /// A caller-supplied client (e.g. one carrying a peer-mTLS identity and CA
+    /// trust), built eagerly by the caller.
+    Ready(reqwest::Client),
+}
+
 impl RaftTransport {
-    /// Plain-HTTP transport (no peer TLS).
+    /// Plain-HTTP transport (no peer TLS). The HTTP client is built on first use.
     pub fn plain() -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: RaftClient::Lazy(Arc::new(OnceLock::new())),
             scheme: Arc::from("http"),
         }
     }
@@ -30,7 +46,7 @@ impl RaftTransport {
     /// and peer-CA trust) with the given scheme (`http` or `https`).
     pub fn new(client: reqwest::Client, scheme: impl Into<Arc<str>>) -> Self {
         Self {
-            client,
+            client: RaftClient::Ready(client),
             scheme: scheme.into(),
         }
     }
@@ -38,6 +54,15 @@ impl RaftTransport {
     /// The URL scheme RPCs are issued over (`http` or `https`).
     pub fn scheme(&self) -> &str {
         &self.scheme
+    }
+
+    /// The HTTP client for outbound RPCs, building the lazy plain-HTTP client on
+    /// first access and reusing it thereafter.
+    fn client(&self) -> reqwest::Client {
+        match &self.client {
+            RaftClient::Ready(client) => client.clone(),
+            RaftClient::Lazy(cell) => cell.get_or_init(reqwest::Client::new).clone(),
+        }
     }
 }
 
@@ -158,7 +183,7 @@ impl RaftNetworkFactory<NodusTypeConfig> for NodusNetworkFactory {
             shard_id: self.shard_id.clone(),
             target,
             target_node: node.clone(),
-            client: self.transport.client.clone(),
+            client: self.transport.client(),
             scheme: self.transport.scheme.clone(),
         }
     }

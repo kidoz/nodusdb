@@ -124,8 +124,13 @@ pub struct MultiRaftManager {
     /// Bearer token presented when asking a peer to instantiate a replica of a
     /// data group (the `/api/v1/shards/{group}/replica` admin endpoint).
     admin_token: Option<String>,
-    /// Reused HTTP client for peer replica-instantiation requests.
-    http: reqwest::Client,
+    /// Reused HTTP client for peer replica-instantiation requests, built on first
+    /// use. A single-node server (and every test) instantiates no remote replicas,
+    /// so the client is never constructed — which matters because the first
+    /// `reqwest::Client::new()` in a process initializes the rustls + aws-lc-rs
+    /// TLS stack, a one-time native-library load that on macOS goes through a
+    /// Gatekeeper code-signing assessment and can block startup for many seconds.
+    http: std::sync::OnceLock<reqwest::Client>,
     /// This node's transaction clock; advanced as groups apply committed writes
     /// so timestamps stay monotonic across leadership changes.
     clock: Arc<dyn nodus_txn::TxnManager>,
@@ -159,7 +164,7 @@ impl MultiRaftManager {
             base_kv,
             hosted: Arc::new(RwLock::new(HashSet::new())),
             admin_token,
-            http: reqwest::Client::new(),
+            http: std::sync::OnceLock::new(),
             clock,
             data_dir,
             transport,
@@ -368,13 +373,19 @@ impl MultiRaftManager {
         false
     }
 
+    /// The HTTP client for peer replica-instantiation requests, built on first
+    /// use (see the `http` field).
+    fn http(&self) -> &reqwest::Client {
+        self.http.get_or_init(reqwest::Client::new)
+    }
+
     /// Asks the peer at `addr` to instantiate a local replica of `group_id` so it
     /// can receive the group's log. Idempotent on the peer side (re-instantiating
     /// reloads durable Raft state). The peer's HTTP address doubles as its Raft
     /// advertise address.
     async fn instantiate_remote(&self, addr: &str, group_id: &str) -> Result<()> {
         let url = format!("http://{addr}/api/v1/shards/{group_id}/replica");
-        let mut req = self.http.post(&url);
+        let mut req = self.http().post(&url);
         if let Some(token) = &self.admin_token {
             req = req.bearer_auth(token);
         }

@@ -581,16 +581,20 @@ pub async fn run_server_with_config(
             let _ = raft_clone.initialize(nodes).await;
             tracing::debug!("Background raft initialization complete");
 
-            // Wait for leader to establish
-            let mut retries = 0;
-            while retries < 10 {
-                let leader = raft_clone.metrics().borrow().current_leader;
-                tracing::debug!("Waiting for leader... current_leader: {:?}", leader);
-                if leader == Some(node_id) {
+            // Wait for this node to establish leadership before bootstrapping.
+            // Poll at a fine granularity (capped at ~5s) so readiness is detected
+            // as soon as the election settles — single-node elections complete in
+            // milliseconds — rather than waiting out a coarse fixed interval.
+            let leader_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                if raft_clone.metrics().borrow().current_leader == Some(node_id) {
                     break;
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                retries += 1;
+                if tokio::time::Instant::now() >= leader_deadline {
+                    tracing::debug!("Timed out waiting for leader to establish");
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }
 
             let bootstrap_commands = bootstrap_catalog_commands(bootstrap_catalog.as_ref());

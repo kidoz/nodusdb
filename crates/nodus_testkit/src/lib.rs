@@ -19,6 +19,47 @@ pub fn apply_fast_raft_timers(config: &mut nodus_config::NodusConfig) {
     config.cluster.raft_election_timeout_max_ms = 300;
 }
 
+/// Plain-HTTP readiness probe over a raw socket (`GET /readyz`), returning true
+/// only when the server answers `200`. Deliberately avoids `reqwest`: building
+/// any reqwest client pulls in the rustls + aws-lc-rs TLS stack, whose first
+/// per-process native-library load on macOS goes through a Gatekeeper
+/// code-signing assessment that can stall the first server start for tens of
+/// seconds. The default (non-TLS) test config never needs TLS to reach a
+/// loopback admin port, so a hand-rolled GET keeps that stack out of the path.
+async fn readyz_http(port: u16) -> bool {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let Ok(mut stream) = tokio::net::TcpStream::connect(("127.0.0.1", port)).await else {
+        return false;
+    };
+    let req = "GET /readyz HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
+    if stream.write_all(req.as_bytes()).await.is_err() {
+        return false;
+    }
+    // The status line is the first bytes of the response; one read of a loopback
+    // reply reliably contains it.
+    let mut buf = [0u8; 64];
+    let Ok(n) = stream.read(&mut buf).await else {
+        return false;
+    };
+    let head = String::from_utf8_lossy(&buf[..n]);
+    head.starts_with("HTTP/1.1 200") || head.starts_with("HTTP/1.0 200")
+}
+
+/// HTTPS readiness probe for the TLS test config, accepting the throwaway
+/// self-signed test certificate. `danger_accept_invalid_certs` also installs a
+/// no-op verifier rather than the platform one, so this doesn't reach the system
+/// trust store.
+async fn readyz_https(port: u16) -> bool {
+    let Ok(client) = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+    else {
+        return false;
+    };
+    let url = format!("https://127.0.0.1:{port}/readyz");
+    matches!(client.get(&url).send().await, Ok(resp) if resp.status().is_success())
+}
+
 pub struct TestServer {
     pub pgwire_addr: SocketAddr,
     pub http_addr: SocketAddr,
@@ -64,23 +105,18 @@ impl TestServer {
         )
         .await?;
 
-        // Wait for the server to be ready before returning
-        let scheme = if tls_enabled { "https" } else { "http" };
-        let client = if tls_enabled {
-            reqwest::Client::builder()
-                .danger_accept_invalid_certs(true)
-                .build()?
-        } else {
-            reqwest::Client::new()
-        };
-        let readyz_url = format!("{scheme}://127.0.0.1:{}/readyz", handle.http_addr.port());
+        // Wait for the server to be ready (`/readyz` → 200) before returning.
+        let http_port = handle.http_addr.port();
         let mut ready = false;
         for _ in 0..50 {
-            if let Ok(resp) = client.get(&readyz_url).send().await {
-                if resp.status().is_success() {
-                    ready = true;
-                    break;
-                }
+            let ok = if tls_enabled {
+                readyz_https(http_port).await
+            } else {
+                readyz_http(http_port).await
+            };
+            if ok {
+                ready = true;
+                break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }

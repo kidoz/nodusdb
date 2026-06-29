@@ -61,7 +61,14 @@ impl RaftRouter {
     /// shard whose group is created later is reachable without re-spawning.
     pub fn spawn(manager: Arc<MultiRaftManager>) -> Self {
         let (tx, mut rx) = mpsc::unbounded_channel::<RouterRequest>();
-        let http = reqwest::Client::new();
+        // Built on first actual use, inside `forward`/`fetch_read_index`. The
+        // client is only needed to forward a request to a remote leader (or run a
+        // cross-node read barrier); a single-node leader does neither, so it is
+        // never constructed there. That matters because the first
+        // `reqwest::Client::new()` in a process initializes the rustls + aws-lc-rs
+        // TLS stack, whose native-library load on macOS goes through a Gatekeeper
+        // code-signing assessment that can block startup for seconds.
+        let http: Arc<std::sync::OnceLock<reqwest::Client>> = Arc::new(std::sync::OnceLock::new());
         tokio::spawn(async move {
             while let Some(req) = rx.recv().await {
                 let shard_id = match &req {
@@ -162,7 +169,7 @@ async fn replicate(
     raft: Raft<NodusTypeConfig>,
     group_id: &str,
     cmd: ShardCommand,
-    http: &reqwest::Client,
+    http: &std::sync::OnceLock<reqwest::Client>,
 ) -> WriteResult {
     // A stable id for this logical write, shared across every retry/forward
     // below, so the leader can dedup a re-forwarded write whose prior response
@@ -174,7 +181,15 @@ async fn replicate(
             Err(RaftError::APIError(ClientWriteError::ForwardToLeader(ForwardToLeader {
                 leader_node: Some(node),
                 ..
-            }))) => match forward(http, &node.addr, group_id, &cmd, &request_id).await {
+            }))) => match forward(
+                http.get_or_init(reqwest::Client::new),
+                &node.addr,
+                group_id,
+                &cmd,
+                &request_id,
+            )
+            .await
+            {
                 Ok(resp) => return Ok(resp),
                 // The leader may have just changed; re-evaluate after a beat.
                 Err(e) => {
@@ -236,7 +251,7 @@ async fn forward(
 async fn linearizable_barrier(
     raft: Raft<NodusTypeConfig>,
     group_id: &str,
-    http: &reqwest::Client,
+    http: &std::sync::OnceLock<reqwest::Client>,
 ) -> Result<()> {
     for _ in 0..25 {
         match raft.ensure_linearizable().await {
@@ -247,20 +262,26 @@ async fn linearizable_barrier(
             Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(ForwardToLeader {
                 leader_node: Some(node),
                 ..
-            }))) => match fetch_read_index(http, &node.addr, group_id).await {
-                Ok(Some(index)) => {
-                    raft.wait(Some(BARRIER_WAIT))
-                        .applied_index_at_least(Some(index), "linearizable read barrier")
-                        .await
-                        .map_err(|e| anyhow!("await applied index {index} for {group_id}: {e}"))?;
-                    return Ok(());
+            }))) => {
+                match fetch_read_index(http.get_or_init(reqwest::Client::new), &node.addr, group_id)
+                    .await
+                {
+                    Ok(Some(index)) => {
+                        raft.wait(Some(BARRIER_WAIT))
+                            .applied_index_at_least(Some(index), "linearizable read barrier")
+                            .await
+                            .map_err(|e| {
+                                anyhow!("await applied index {index} for {group_id}: {e}")
+                            })?;
+                        return Ok(());
+                    }
+                    // Empty leader log — nothing committed yet, so nothing to wait for.
+                    Ok(None) => return Ok(()),
+                    Err(e) => {
+                        tracing::debug!("read-index for {group_id} from {} failed: {e}", node.addr)
+                    }
                 }
-                // Empty leader log — nothing committed yet, so nothing to wait for.
-                Ok(None) => return Ok(()),
-                Err(e) => {
-                    tracing::debug!("read-index for {group_id} from {} failed: {e}", node.addr)
-                }
-            },
+            }
             // No known leader, or leadership unconfirmable for now — retry.
             Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(ForwardToLeader {
                 leader_node: None,
