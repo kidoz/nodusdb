@@ -9,7 +9,8 @@ use async_trait::async_trait;
 use futures_util::{Sink, SinkExt, StreamExt, stream};
 use pgwire::api::query::SimpleQueryHandler;
 use pgwire::api::results::{FieldFormat, QueryResponse, Response, Tag};
-use pgwire::api::{ClientInfo, PgWireConnectionState};
+use pgwire::api::store::PortalStore;
+use pgwire::api::{ClientInfo, ClientPortalStore, PgWireConnectionState};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::PgWireBackendMessage;
 use pgwire::messages::copy::CopyDone;
@@ -32,7 +33,8 @@ impl SimpleQueryHandler for NodusQueryHandler {
         query: pgwire::messages::simplequery::Query,
     ) -> PgWireResult<()>
     where
-        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore,
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
@@ -65,7 +67,7 @@ impl SimpleQueryHandler for NodusQueryHandler {
                 ))
                 .await?;
             client.flush().await?;
-            client.set_state(PgWireConnectionState::CopyInProgress);
+            client.set_state(PgWireConnectionState::CopyInProgress(false));
             return Ok(());
         } else if is_copy_to_stdout(&query_string) {
             let session_id = session_id_from_client(client);
@@ -104,14 +106,14 @@ impl SimpleQueryHandler for NodusQueryHandler {
                             ))
                             .await?;
                     }
-                    Response::Query(results) => {
+                    Response::Query(mut results) => {
                         let row_desc = row_description(&results.row_schema());
                         client
                             .send(PgWireBackendMessage::RowDescription(row_desc))
                             .await?;
                         let command_tag = results.command_tag().to_owned();
                         let mut rows = 0;
-                        let mut data_rows = results.data_rows();
+                        let data_rows = results.data_rows();
                         while let Some(row) = data_rows.next().await {
                             rows += 1;
                             client.feed(PgWireBackendMessage::DataRow(row?)).await?;
@@ -122,7 +124,9 @@ impl SimpleQueryHandler for NodusQueryHandler {
                             ))
                             .await?;
                     }
-                    Response::Execution(tag) => {
+                    Response::Execution(tag)
+                    | Response::TransactionStart(tag)
+                    | Response::TransactionEnd(tag) => {
                         let command: CommandComplete = tag.into();
                         apply_command_tag_to_tx_status(client, &command.tag);
                         client
@@ -156,13 +160,10 @@ impl SimpleQueryHandler for NodusQueryHandler {
         Ok(())
     }
 
-    async fn do_query<'a, C>(
-        &self,
-        client: &mut C,
-        query: &'a str,
-    ) -> PgWireResult<Vec<Response<'a>>>
+    async fn do_query<C>(&self, client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
     where
-        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore,
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
@@ -341,7 +342,8 @@ impl NodusQueryHandler {
     /// buffered path.
     async fn try_stream_select<C>(&self, client: &mut C, query: &str) -> PgWireResult<bool>
     where
-        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore,
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {

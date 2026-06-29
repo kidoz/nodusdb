@@ -17,11 +17,9 @@ use pgwire::api::{ClientInfo, PgWireConnectionState};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::PgWireBackendMessage;
 use pgwire::messages::copy::{CopyData, CopyDone, CopyFail};
-use pgwire::messages::response::{CommandComplete, ReadyForQuery};
+use pgwire::messages::response::CommandComplete;
 
-use crate::client_meta::{
-    mark_error_status, principal_id_from_client, session_id_from_client, tx_status_from_client,
-};
+use crate::client_meta::{mark_error_status, principal_id_from_client, session_id_from_client};
 use crate::{METADATA_COPY_EXTENDED, METADATA_COPY_STMT};
 
 /// Upper bound on a single connection's buffered `COPY FROM STDIN` body. The
@@ -196,23 +194,23 @@ impl CopyHandler for NodusCopyHandler {
             }
         }
 
-        if !extended_copy {
-            client
-                .send(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
-                    tx_status_from_client(client),
-                )))
-                .await?;
-        }
         client.flush().await?;
+        // pgwire's process loop owns the post-COPY handshake for the simple
+        // protocol: once `on_copy_done` returns it resets the state and sends the
+        // `ReadyForQuery` itself, so emitting one here would be a second, desyncing
+        // one. The extended protocol gets neither from the loop — the client sends
+        // a `Sync` after `CopyDone` — so move to `AwaitingSync` and let `on_sync`
+        // answer.
         if extended_copy {
             client.set_state(PgWireConnectionState::AwaitingSync);
-        } else {
-            client.set_state(PgWireConnectionState::ReadyForQuery);
         }
         Ok(())
     }
 
-    async fn on_copy_fail<C>(&self, client: &mut C, fail: CopyFail) -> PgWireResult<()>
+    // pgwire 0.40: `on_copy_fail` returns the `PgWireError` to surface; pgwire
+    // itself emits the ErrorResponse and the subsequent ReadyForQuery. We only do
+    // our own cleanup and hand back the error.
+    async fn on_copy_fail<C>(&self, client: &mut C, fail: CopyFail) -> PgWireError
     where
         C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
         C::Error: Debug,
@@ -229,18 +227,10 @@ impl CopyHandler for NodusCopyHandler {
         } else {
             fail.message
         };
-        client
-            .send(PgWireBackendMessage::ErrorResponse(
-                ErrorInfo::new("ERROR".to_owned(), "57014".to_owned(), msg).into(),
-            ))
-            .await?;
-        client
-            .send(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
-                tx_status_from_client(client),
-            )))
-            .await?;
-        client.flush().await?;
-        client.set_state(PgWireConnectionState::ReadyForQuery);
-        Ok(())
+        PgWireError::UserError(Box::new(ErrorInfo::new(
+            "ERROR".to_owned(),
+            "57014".to_owned(),
+            msg,
+        )))
     }
 }

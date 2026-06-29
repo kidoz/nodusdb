@@ -30,7 +30,7 @@ use pgwire::messages::extendedquery::{
     PortalSuspended, Sync as PgSync, TARGET_TYPE_BYTE_PORTAL, TARGET_TYPE_BYTE_STATEMENT,
 };
 use pgwire::messages::response::{CommandComplete, EmptyQueryResponse, ReadyForQuery};
-use postgres_types::Json;
+use postgres_types::{FromSqlOwned, Json};
 use tracing::{error, info};
 use uuid::Uuid;
 
@@ -327,8 +327,8 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
         let types = message
             .type_oids
             .iter()
-            .map(|oid| Type::from_oid(*oid).unwrap_or(Type::UNKNOWN))
-            .collect::<Vec<Type>>();
+            .map(|oid| Type::from_oid(*oid))
+            .collect::<Vec<Option<Type>>>();
         let stmt = StoredStatement::new(
             message.name.unwrap_or_else(|| DEFAULT_NAME.to_owned()),
             message.query,
@@ -435,7 +435,7 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
                 ))
                 .await?;
             client.flush().await?;
-            client.set_state(PgWireConnectionState::CopyInProgress);
+            client.set_state(PgWireConnectionState::CopyInProgress(true));
             return Ok(());
         }
         if is_copy_to_stdout(&portal.statement.statement) {
@@ -496,10 +496,10 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
                     ))
                     .await?;
             }
-            Response::Query(results) => {
+            Response::Query(mut results) => {
                 let fields = results.row_schema();
                 let mut rows = Vec::new();
-                let mut data_rows = results.data_rows();
+                let data_rows = results.data_rows();
                 while let Some(row) = data_rows.next().await {
                     rows.push(row?);
                 }
@@ -534,7 +534,9 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
                         .await?;
                 }
             }
-            Response::Execution(tag) => {
+            Response::Execution(tag)
+            | Response::TransactionStart(tag)
+            | Response::TransactionEnd(tag) => {
                 let command: CommandComplete = tag.into();
                 apply_command_tag_to_tx_status(client, &command.tag);
                 client
@@ -692,12 +694,12 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
         Ok(())
     }
 
-    async fn do_query<'a, 'b: 'a, C>(
-        &'b self,
+    async fn do_query<C>(
+        &self,
         client: &mut C,
-        portal: &'a Portal<Self::Statement>,
+        portal: &Portal<Self::Statement>,
         _max_rows: usize,
-    ) -> PgWireResult<Response<'a>>
+    ) -> PgWireResult<Response>
     where
         C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
         C::PortalStore: PortalStore<Statement = Self::Statement>,
@@ -756,6 +758,7 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
                 .statement
                 .parameter_types
                 .get(i)
+                .and_then(|t| t.as_ref())
                 .unwrap_or(&Type::UNKNOWN);
 
             let format = portal.parameter_format.format_for(i);
@@ -841,15 +844,13 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
                         nodus_executor::Value::Text(v)
                     }
                     Type::TIMESTAMPTZ => {
-                        let v = portal
-                            .parameter::<DateTime<Utc>>(i, param_type)?
+                        let v = binary_param::<DateTime<Utc>>(portal, i, param_type)?
                             .map(|v| v.to_rfc3339())
                             .unwrap_or_default();
                         nodus_executor::Value::Text(v)
                     }
                     Type::UUID => {
-                        let v = portal
-                            .parameter::<Uuid>(i, param_type)?
+                        let v = binary_param::<Uuid>(portal, i, param_type)?
                             .map(|v| v.to_string())
                             .unwrap_or_default();
                         nodus_executor::Value::Text(v)
@@ -907,8 +908,7 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
                         values_to_array(v, nodus_executor::Value::Bool)
                     }
                     Type::UUID_ARRAY => {
-                        let v = portal
-                            .parameter::<Vec<Option<Uuid>>>(i, param_type)?
+                        let v = binary_param::<Vec<Option<Uuid>>>(portal, i, param_type)?
                             .unwrap_or_default();
                         values_to_array(v, |uuid| nodus_executor::Value::Text(uuid.to_string()))
                     }
@@ -951,8 +951,7 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
                         })
                     }
                     Type::TIMESTAMPTZ_ARRAY => {
-                        let v = portal
-                            .parameter::<Vec<Option<DateTime<Utc>>>>(i, param_type)?
+                        let v = binary_param::<Vec<Option<DateTime<Utc>>>>(portal, i, param_type)?
                             .unwrap_or_default();
                         values_to_array(v, |ts| nodus_executor::Value::Text(ts.to_rfc3339()))
                     }
@@ -1057,7 +1056,11 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        let mut param_types = stmt.parameter_types.clone();
+        let mut param_types: Vec<Type> = stmt
+            .parameter_types
+            .iter()
+            .map(|t| t.clone().unwrap_or(Type::UNKNOWN))
+            .collect();
         if param_types.is_empty() {
             let mut max_param = 0;
             let query = &stmt.statement;
@@ -1128,6 +1131,24 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
 
         let fields = self.describe_output_fields(query_str, &ctx).await;
         Ok(DescribePortalResponse::new(fields))
+    }
+}
+
+/// Decodes a binary-format bound parameter directly from its raw bytes.
+///
+/// pgwire 0.40's `Portal::parameter` requires `T: FromSqlText` so it can serve
+/// both wire formats, but `Uuid`/`DateTime<Utc>` (and their arrays) implement
+/// only the binary `FromSql`. These callers already know the parameter is in
+/// binary format, so decode straight from the bytes and skip the text path.
+fn binary_param<T>(portal: &Portal<String>, idx: usize, pg_type: &Type) -> PgWireResult<Option<T>>
+where
+    T: FromSqlOwned,
+{
+    match portal.parameters.get(idx).and_then(|p| p.as_ref()) {
+        Some(bytes) => T::from_sql(pg_type, bytes)
+            .map(Some)
+            .map_err(PgWireError::FailedToParseParameter),
+        None => Ok(None),
     }
 }
 
