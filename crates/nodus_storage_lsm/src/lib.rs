@@ -28,6 +28,15 @@ const MANIFEST_FILE: &str = "MANIFEST";
 struct Manifest {
     active_wal: u64,
     sstables: Vec<u64>,
+    /// Oldest WAL segment id that crash recovery must replay. Recovery walks the
+    /// `SegmentHeader.predecessor` lineage back from `active_wal` down to (and
+    /// including) this floor. The floor only advances past a flush that retained
+    /// no uncommitted intents — otherwise an intent whose records were rotated
+    /// into an older segment (with its commit landing in a newer one) would be
+    /// dropped, losing a committed transaction. `#[serde(default)]` keeps legacy
+    /// manifests (floor 0 ⇒ replay the full available lineage) readable.
+    #[serde(default)]
+    min_replay_wal: u64,
 }
 
 pub struct LsmKvEngine {
@@ -38,6 +47,8 @@ pub struct LsmKvEngine {
     wal: RwLock<Option<Arc<dyn WalEngine>>>,
     /// Id of the active WAL segment (`{id}.log`), recorded in the manifest.
     active_wal_id: AtomicU64,
+    /// Oldest WAL segment recovery must replay (see [`Manifest::min_replay_wal`]).
+    min_replay_wal: AtomicU64,
     next_file_id: AtomicU64,
     /// Approximate live size of the memtable, driving size-triggered flushes.
     memtable_bytes: AtomicUsize,
@@ -173,6 +184,7 @@ impl LsmKvEngine {
             sstables: RwLock::new(Vec::new()),
             wal: RwLock::new(None),
             active_wal_id: AtomicU64::new(0),
+            min_replay_wal: AtomicU64::new(0),
             next_file_id: AtomicU64::new(1),
             memtable_bytes: AtomicUsize::new(0),
             flush_threshold: AtomicUsize::new(DEFAULT_FLUSH_THRESHOLD),
@@ -197,8 +209,8 @@ impl LsmKvEngine {
         let manifest: Option<Manifest> = std::fs::read(path.join(MANIFEST_FILE))
             .ok()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok());
-        let (mut sst_ids, active_wal_id): (Vec<u64>, u64) = match manifest {
-            Some(m) => (m.sstables, m.active_wal),
+        let (mut sst_ids, active_wal_id, min_replay_wal): (Vec<u64>, u64, u64) = match manifest {
+            Some(m) => (m.sstables, m.active_wal, m.min_replay_wal),
             None => {
                 let mut ids = Vec::new();
                 let mut max_id = 0;
@@ -214,7 +226,8 @@ impl LsmKvEngine {
                         ids.push(id);
                     }
                 }
-                (ids, max_id + 1)
+                // No manifest ⇒ replay whatever WAL lineage is on disk (floor 0).
+                (ids, max_id + 1, 0)
             }
         };
 
@@ -241,6 +254,7 @@ impl LsmKvEngine {
             sstables: RwLock::new(sstables),
             wal: RwLock::new(Some(wal)),
             active_wal_id: AtomicU64::new(active_wal_id),
+            min_replay_wal: AtomicU64::new(min_replay_wal),
             next_file_id: AtomicU64::new(next),
             memtable_bytes: AtomicUsize::new(0),
             flush_threshold: AtomicUsize::new(DEFAULT_FLUSH_THRESHOLD),
@@ -284,6 +298,7 @@ impl LsmKvEngine {
         let manifest = Manifest {
             active_wal: self.active_wal_id.load(Ordering::Relaxed),
             sstables,
+            min_replay_wal: self.min_replay_wal.load(Ordering::Relaxed),
         };
         let bytes = serde_json::to_vec(&manifest)?;
         let tmp = manifest_path.with_extension("tmp");
@@ -355,10 +370,24 @@ impl LsmKvEngine {
                 self._wal_key,
             )?);
             // Record this segment's lineage as its first record so PITR can
-            // verify an unbroken archived chain despite sparse segment ids.
+            // verify an unbroken archived chain despite sparse segment ids, and
+            // so crash recovery can walk back to any segment still holding a
+            // live intent. fsync the header before the manifest commit below so
+            // the lineage link is durable: recovery and PITR both depend on it.
             new_wal.append(WalRecord::V1(WalRecordV1::SegmentHeader {
                 predecessor: Some(predecessor),
             }))?;
+            new_wal.sync()?;
+            // Advance the replay floor only when this flush retained no
+            // uncommitted intents: then all committed data is durably in
+            // SSTables and no older segment needs replaying. If intents were
+            // retained (`mem_guard` still holds their keys), an older segment may
+            // carry their `WriteIntent`/committed-version records while the
+            // matching `CommitTxn` will land in this new segment, so the floor
+            // must stay put to keep the whole lineage in the replay window.
+            if mem_guard.is_empty() {
+                self.min_replay_wal.store(wal_id, Ordering::Relaxed);
+            }
             *self.wal.write().unwrap() = Some(new_wal);
             self.active_wal_id.store(wal_id, Ordering::Relaxed);
             self.save_manifest()?;
@@ -454,46 +483,95 @@ impl LsmKvEngine {
     }
 
     fn recover(&self) -> Result<()> {
-        let wal_guard = self.wal.read().unwrap();
-        if let Some(wal) = wal_guard.as_ref() {
-            let records = wal.recover()?;
+        let Some(dir) = self.data_dir.clone() else {
+            return Ok(());
+        };
+        let active = self.active_wal_id.load(Ordering::Relaxed);
+        let floor = self.min_replay_wal.load(Ordering::Relaxed);
+
+        // Walk the WAL-segment lineage backward from the active segment down to
+        // the replay floor, collecting each segment's records. A flush rotates
+        // to a fresh segment but retains keys with uncommitted intents in the
+        // memtable; those intents' `WriteIntent` records live in the *older*
+        // segment while the matching `CommitTxn` lands in a newer one. Replaying
+        // only the active segment (the previous behavior) therefore dropped any
+        // transaction whose intent predated a flush — a committed-data-loss bug.
+        // Replaying the whole lineage oldest→newest reconstructs it correctly;
+        // versions are ordered by commit ts, so re-applying data already flushed
+        // to an SSTable is idempotent (duplicate versions dedup on compaction).
+        let mut segments: Vec<Vec<WalRecord>> = Vec::new();
+        let mut cur = Some(active);
+        let mut visited: HashSet<u64> = HashSet::new();
+        while let Some(id) = cur {
+            if id < floor || !visited.insert(id) {
+                break;
+            }
+            let seg_path = dir.join(format!("{id}.log"));
+            if !seg_path.exists() {
+                break;
+            }
+            // Reuse the already-open active segment; open older segments read-only.
+            let records = if id == active {
+                match self.wal.read().unwrap().as_ref() {
+                    Some(w) => w.recover()?,
+                    None => break,
+                }
+            } else {
+                FileWalEngine::with_encryption(&seg_path, self._wal_key)?.recover()?
+            };
+            // A segment's predecessor is named in its `SegmentHeader` (first
+            // record). The very first segment ever created has none, which ends
+            // the walk.
+            let predecessor = records.iter().find_map(|r| match r {
+                WalRecord::V1(WalRecordV1::SegmentHeader { predecessor }) => *predecessor,
+                _ => None,
+            });
+            segments.push(records);
+            cur = predecessor;
+        }
+
+        {
             let mut mem_guard = self.memtable.write().unwrap();
             let mut int_guard = self.intents.write().unwrap();
 
-            for record in records {
-                let WalRecord::V1(rec) = record;
-                match rec {
-                    WalRecordV1::WriteIntent { txn_id, key, value } => {
-                        let k = Bytes::from(key);
-                        let chain = mem_guard.entry(k.clone()).or_default();
-                        let _ = chain.write_intent(txn_id, value);
-                        int_guard.entry(txn_id).or_default().push(k);
-                    }
-                    WalRecordV1::DeleteIntent { txn_id, key } => {
-                        let k = Bytes::from(key);
-                        let chain = mem_guard.entry(k.clone()).or_default();
-                        let _ = chain.delete_intent(txn_id);
-                        int_guard.entry(txn_id).or_default().push(k);
-                    }
-                    WalRecordV1::CommitTxn { txn_id, commit_ts } => {
-                        if let Some(keys) = int_guard.remove(&txn_id) {
-                            for key in keys {
-                                if let Some(chain) = mem_guard.get_mut(&key) {
-                                    let _ = chain.commit(txn_id, commit_ts);
+            // Oldest → newest so commits observe their intents and later versions
+            // extend earlier ones.
+            for records in segments.into_iter().rev() {
+                for record in records {
+                    let WalRecord::V1(rec) = record;
+                    match rec {
+                        WalRecordV1::WriteIntent { txn_id, key, value } => {
+                            let k = Bytes::from(key);
+                            let chain = mem_guard.entry(k.clone()).or_default();
+                            let _ = chain.write_intent(txn_id, value);
+                            int_guard.entry(txn_id).or_default().push(k);
+                        }
+                        WalRecordV1::DeleteIntent { txn_id, key } => {
+                            let k = Bytes::from(key);
+                            let chain = mem_guard.entry(k.clone()).or_default();
+                            let _ = chain.delete_intent(txn_id);
+                            int_guard.entry(txn_id).or_default().push(k);
+                        }
+                        WalRecordV1::CommitTxn { txn_id, commit_ts } => {
+                            if let Some(keys) = int_guard.remove(&txn_id) {
+                                for key in keys {
+                                    if let Some(chain) = mem_guard.get_mut(&key) {
+                                        let _ = chain.commit(txn_id, commit_ts);
+                                    }
                                 }
                             }
                         }
-                    }
-                    WalRecordV1::AbortTxn { txn_id } => {
-                        if let Some(keys) = int_guard.remove(&txn_id) {
-                            for key in keys {
-                                if let Some(chain) = mem_guard.get_mut(&key) {
-                                    let _ = chain.abort(txn_id);
+                        WalRecordV1::AbortTxn { txn_id } => {
+                            if let Some(keys) = int_guard.remove(&txn_id) {
+                                for key in keys {
+                                    if let Some(chain) = mem_guard.get_mut(&key) {
+                                        let _ = chain.abort(txn_id);
+                                    }
                                 }
                             }
                         }
+                        _ => {}
                     }
-                    _ => {}
                 }
             }
         }
@@ -1539,5 +1617,64 @@ mod sst_tests {
             Bytes::from("v"),
             "recovered despite a corrupt manifest"
         );
+    }
+
+    #[test]
+    fn commit_survives_when_intent_predates_a_flush() {
+        // Regression: an intent whose `WriteIntent` was rotated into an older WAL
+        // segment by a flush, with its `CommitTxn` landing in the new active
+        // segment, must survive crash recovery. Replaying only the active segment
+        // would drop it — a committed-data-loss bug.
+        let dir = TempDir::new().unwrap();
+        let txn = TxnId::new();
+        {
+            let engine = LsmKvEngine::with_wal(dir.path(), None).unwrap();
+
+            // Open an intent but do NOT commit it yet.
+            engine
+                .write_intent(txn, Bytes::from("pending"), Bytes::from("v1"))
+                .unwrap();
+
+            // Flush: "pending" still carries an uncommitted intent, so it is
+            // retained in the memtable and its `WriteIntent` stays in the old
+            // segment while the WAL rotates to a fresh active segment.
+            engine.flush().unwrap();
+
+            // Now commit — the `CommitTxn` record lands in the NEW segment.
+            engine.commit(txn, 30).unwrap();
+            // Engine drops here, simulating a crash/restart (commit() fsynced).
+        }
+
+        let engine = LsmKvEngine::with_wal(dir.path(), None).unwrap();
+        assert_eq!(
+            engine.get(b"pending", 100).unwrap(),
+            Some(Bytes::from("v1")),
+            "committed value lost: recovery did not replay the predecessor segment"
+        );
+    }
+
+    #[test]
+    fn replay_floor_advances_when_no_intent_is_retained() {
+        // A clean flush (no retained intents) should advance the replay floor so
+        // recovery need not replay older segments — but data must still survive,
+        // because the committed data is durably in an SSTable by then.
+        let commit = |engine: &LsmKvEngine, k: &str, v: &str, ts: Timestamp| {
+            let txn = TxnId::new();
+            engine
+                .write_intent(txn, Bytes::from(k.to_owned()), Bytes::from(v.to_owned()))
+                .unwrap();
+            engine.commit(txn, ts).unwrap();
+        };
+        let dir = TempDir::new().unwrap();
+        {
+            let engine = LsmKvEngine::with_wal(dir.path(), None).unwrap();
+            commit(&engine, "k1", "a", 10);
+            engine.flush().unwrap(); // no open intents -> floor advances
+            commit(&engine, "k2", "b", 20);
+            engine.flush().unwrap();
+        }
+        let engine = LsmKvEngine::with_wal(dir.path(), None).unwrap();
+        assert_eq!(engine.get(b"k1", 100).unwrap(), Some(Bytes::from("a")));
+        assert_eq!(engine.get(b"k2", 100).unwrap(), Some(Bytes::from("b")));
     }
 }
