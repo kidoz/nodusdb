@@ -10,7 +10,7 @@ use object_store::{ObjectStore, ObjectStoreExt, aws::AmazonS3Builder, path::Path
 use std::sync::Arc;
 
 /// Connection settings for an S3-compatible object store.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct S3Config {
     pub endpoint: String,
     pub bucket: String,
@@ -19,6 +19,21 @@ pub struct S3Config {
     pub secret_key: String,
     /// Use path-style addressing (`endpoint/bucket/key`), required by MinIO.
     pub path_style: bool,
+}
+
+// Hand-written so a `{:?}` (in a log line, panic, or error chain) can never leak
+// the AWS access/secret keys held here.
+impl std::fmt::Debug for S3Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("S3Config")
+            .field("endpoint", &self.endpoint)
+            .field("bucket", &self.bucket)
+            .field("region", &self.region)
+            .field("access_key", &"<redacted>")
+            .field("secret_key", &"<redacted>")
+            .field("path_style", &self.path_style)
+            .finish()
+    }
 }
 
 pub struct S3BackupRepository {

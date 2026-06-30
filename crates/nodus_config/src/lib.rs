@@ -98,7 +98,7 @@ pub struct ClusterTlsConfig {
     pub ca_path: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct StorageConfig {
     pub data_dir: Option<String>,
@@ -121,7 +121,22 @@ impl Default for StorageConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+// Redact the TDE key so a `{:?}` of the config (startup logs, error chains)
+// cannot leak it; show only whether one is configured.
+impl std::fmt::Debug for StorageConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StorageConfig")
+            .field("data_dir", &self.data_dir)
+            .field(
+                "encryption_key",
+                &self.encryption_key.as_ref().map(|_| "<redacted>"),
+            )
+            .field("allow_ephemeral", &self.allow_ephemeral)
+            .finish()
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(default)]
 pub struct AdminConfig {
     /// Bearer token required on `/api/v1/*` admin endpoints. When unset (default),
@@ -133,6 +148,17 @@ pub struct AdminConfig {
     /// (e.g. when fronted by an authenticating proxy). Off by default: the
     /// server refuses to start with a non-loopback `http_addr` and no `token`.
     pub allow_insecure: bool,
+}
+
+// Redact the admin token and superuser password from `{:?}` output.
+impl std::fmt::Debug for AdminConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdminConfig")
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("allow_insecure", &self.allow_insecure)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -206,7 +206,11 @@ struct StoredCredential {
 
 /// PBKDF2-HMAC-SHA256 work factor. A deliberate cost (vs. a single SHA-256) so an
 /// attacker who exfiltrates the credential store can't brute-force at hash speed.
-const PBKDF2_ITERATIONS: u32 = 100_000;
+/// Set to the OWASP-recommended minimum for PBKDF2-HMAC-SHA256. The count each
+/// credential was derived with is stored alongside it (`ScramKeys::iterations`)
+/// and used for verification, so raising this only affects newly set passwords —
+/// existing credentials keep verifying — making the increase backward-compatible.
+const PBKDF2_ITERATIONS: u32 = 600_000;
 
 type HmacSha256 = Hmac<Sha256>;
 
