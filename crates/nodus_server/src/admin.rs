@@ -2,7 +2,7 @@
 //! Admin HTTP API (`/api/v1/...`) backed by shared runtime handles.
 
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     extract::{Path, Query, Request, State},
     http::{StatusCode, header::AUTHORIZATION},
     middleware::{Next, from_fn_with_state},
@@ -11,9 +11,10 @@ use axum::{
 };
 use base64::Engine;
 use bytes::Bytes;
-use nodus_audit::{AuditEvent, AuditQuery, AuditQueryable};
+use nodus_audit::{AuditEvent, AuditQuery, AuditQueryable, AuditSink};
 use nodus_authz::{Action, AuthzContext, AuthzEngine, AuthzExplanation, AuthzRequest};
 use nodus_backup::{BackupObject, BackupOrchestrator};
+use nodus_catalog::AuditEventId;
 use nodus_catalog::{
     CatalogReader, CatalogSnapshot, CatalogWriter, PrincipalId, ResourceRef, ShardId, TableId,
 };
@@ -34,6 +35,10 @@ use nodus_security::{Authenticator, PasswordAuthenticator};
 pub struct AdminState {
     pub registry: Arc<SessionRegistry>,
     pub audit: Arc<dyn AuditQueryable>,
+    /// Writer side of the audit trail. Every mutating control-plane action is
+    /// recorded here by the `require_token` middleware, satisfying the invariant
+    /// that web/admin actions must be both authorized AND audited.
+    pub audit_sink: Arc<dyn AuditSink>,
     pub authz: Arc<dyn AuthzEngine>,
     pub catalog: Arc<dyn CatalogReader>,
     pub catalog_writer: Arc<dyn CatalogWriter>,
@@ -70,11 +75,19 @@ pub struct AdminState {
     pub restore_gate: Arc<parking_lot::RwLock<()>>,
 }
 
+/// The authenticated principal for a request, made available to handlers via a
+/// request extension set by [`require_token`]. Handlers that act on behalf of
+/// the caller (e.g. dump import) use this instead of assuming the superuser, so
+/// privileges are enforced against the real actor and the audit trail attributes
+/// the action correctly.
+#[derive(Clone, Copy)]
+pub struct AuthPrincipal(pub PrincipalId);
+
 /// Rejects requests lacking a valid `Authorization: Bearer <token>` header when
 /// an admin token is configured. A no-op when no token is set.
 async fn require_token(
     State(state): State<AdminState>,
-    req: Request,
+    mut req: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
     let path = req.uri().path();
@@ -156,16 +169,58 @@ async fn require_token(
         .authz
         .authorize(authz_req)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // Audit every mutating control-plane request (anything but a read). Capture
+    // the method/path now because `next.run` consumes `req`.
+    let method = req.method().clone();
+    let path = path.to_string();
+    let is_mutation = !matches!(
+        method,
+        axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS
+    );
+    let record_audit = |result: &str, error: Option<String>| {
+        if !is_mutation {
+            return;
+        }
+        let _ = state.audit_sink.record_event(AuditEvent {
+            id: AuditEventId::new(),
+            time: chrono::Utc::now(),
+            actor: principal_id,
+            action: format!("{action:?}"),
+            resource: Some(nodus_catalog::ResourceRef::System),
+            source_ip: None,
+            request_id: None,
+            session_id: None,
+            query_id: None,
+            reason: Some(format!("{method} {path}")),
+            result: result.to_string(),
+            error,
+            authz_catalog_version: None,
+        });
+    };
+
     if !decision.allowed {
         tracing::debug!(
             "Authorization failed for principal {} on action {:?}",
             principal_id,
             action
         );
+        record_audit("Denied", Some("permission denied".to_string()));
         return Err(StatusCode::FORBIDDEN);
     }
 
-    Ok(next.run(req).await)
+    // Make the authenticated principal available to handlers that act on the
+    // caller's behalf.
+    req.extensions_mut().insert(AuthPrincipal(principal_id));
+
+    let response = next.run(req).await;
+    let status = response.status();
+    if status.is_success() {
+        record_audit("Success", None);
+    } else {
+        record_audit("Failure", Some(format!("status {}", status.as_u16())));
+    }
+    Ok(response)
 }
 
 pub fn admin_routes(state: AdminState) -> Router {
@@ -1299,15 +1354,16 @@ impl nodus_import::ImportSink for ExecutorImportSink {
 /// on the blocking pool; the response is the versioned import report.
 async fn import_dump(
     State(state): State<AdminState>,
+    Extension(AuthPrincipal(principal_id)): Extension<AuthPrincipal>,
     Query(query): Query<ImportQuery>,
     body: String,
 ) -> Json<Value> {
     let executor = state.executor.clone();
-    let principal_id = state
-        .catalog
-        .get_principal_by_name("nodus")
-        .map(|p| p.id)
-        .unwrap_or_else(|_| PrincipalId::new());
+    // Run the import AS the authenticated caller, not as the `nodus` superuser:
+    // every translated DDL/DML statement is authorized against the caller's own
+    // privileges and the executor audits it under their identity. Running as
+    // superuser (as before) let any holder of the ManageBackups action execute
+    // arbitrary catalog/data mutations and misattributed them to `nodus`.
     let ctx = nodus_executor::ExecutionContext {
         session_id: format!("admin-import-{}", Uuid::new_v4()),
         principal_id,

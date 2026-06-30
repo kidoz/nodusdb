@@ -561,7 +561,7 @@ pub async fn run_server_with_config(
         catalog.clone(),
         raft_catalog_writer.clone(),
         authz.clone(),
-        audit_sink,
+        audit_sink.clone(),
         raft_kv.clone(),
         txn,
     ));
@@ -918,6 +918,7 @@ pub async fn run_server_with_config(
     let admin_state = AdminState {
         registry: registry.clone(),
         audit: audit_query,
+        audit_sink,
         authz: authz.clone(),
         catalog: catalog.clone(),
         catalog_writer: raft_catalog_writer.clone(),
