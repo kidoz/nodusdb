@@ -29,8 +29,47 @@ pub fn parse_object_name(name: &str) -> Result<(&str, &str, &str)> {
     }
 }
 
+/// Hard ceiling on nested-query planning depth (CTEs, set operations, and
+/// subqueries each recurse through [`plan_query`]). sqlparser already caps
+/// expression depth at parse time, but nested query structures recurse here too;
+/// this guard turns a pathologically nested query into a clean error instead of
+/// a stack overflow — which, unlike a panic, cannot be caught and would abort
+/// the whole process.
+const MAX_QUERY_PLAN_DEPTH: usize = 100;
+
+thread_local! {
+    static PLAN_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// RAII guard that increments the per-thread planning depth on entry and
+/// decrements it on drop, erroring if the depth ceiling is exceeded. Planning is
+/// synchronous and single-threaded per statement (it runs on a blocking-pool
+/// thread), so a thread-local counter is sufficient.
+struct PlanDepthGuard;
+
+impl PlanDepthGuard {
+    fn enter() -> Result<Self> {
+        PLAN_DEPTH.with(|d| {
+            let next = d.get() + 1;
+            if next > MAX_QUERY_PLAN_DEPTH {
+                anyhow::bail!("query nesting too deep (limit {MAX_QUERY_PLAN_DEPTH})");
+            }
+            d.set(next);
+            Ok(PlanDepthGuard)
+        })
+    }
+}
+
+impl Drop for PlanDepthGuard {
+    fn drop(&mut self) {
+        PLAN_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
 pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Result<LogicalPlan> {
     use sqlparser::ast::*;
+
+    let _depth_guard = PlanDepthGuard::enter()?;
 
     let mut ctes = Vec::new();
     if let Some(with) = &query.with {
@@ -814,5 +853,29 @@ fn expr_to_operand(expr: &sqlparser::ast::Expr, params: &[Value]) -> Option<Oper
         Some(Operand::Ident(col))
     } else {
         expr_to_value(expr, params).map(Operand::Literal)
+    }
+}
+
+#[cfg(test)]
+mod recursion_tests {
+    /// A pathologically nested query must be rejected with a clean error rather
+    /// than overflowing the stack (which is uncatchable and aborts the process).
+    /// The rejection may come from sqlparser's own parse-time recursion limit or
+    /// from `plan_query`'s depth guard; either is a safe, non-crashing outcome.
+    #[test]
+    fn deeply_nested_query_is_rejected_without_overflow() {
+        let mut sql = String::from("SELECT 1");
+        for _ in 0..400 {
+            sql = format!("SELECT * FROM ({sql}) t");
+        }
+        let result = (|| {
+            let mut stmts = nodus_sql::parse_sql(&sql)?;
+            super::plan_statement(&stmts.remove(0), &[])
+                .map_err(|e| sqlparser::parser::ParserError::ParserError(e.to_string()))
+        })();
+        assert!(
+            result.is_err(),
+            "deeply nested query should be rejected, not planned"
+        );
     }
 }

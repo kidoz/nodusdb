@@ -91,10 +91,25 @@ impl MemExecutor {
                         .catalog_reader
                         .get_table(db_name, schema_name, table_only)?;
 
+                    // A malformed FK (mismatched arity, or naming a column that is
+                    // not on the local/foreign table) must surface a SQL error,
+                    // never panic — these are reachable from ordinary INSERT/UPDATE
+                    // and a panic here would poison shared locks (whole-server DoS).
+                    if columns.len() != referred_columns.len() {
+                        anyhow::bail!(
+                            "foreign key constraint references {} columns but {} referenced columns",
+                            columns.len(),
+                            referred_columns.len()
+                        );
+                    }
+
                     let mut all_match = true;
                     for (i, c) in columns.iter().enumerate() {
                         let ref_c = &referred_columns[i];
-                        let val_idx = col_names.iter().position(|name| name == c).unwrap();
+                        let val_idx =
+                            col_names.iter().position(|name| name == c).ok_or_else(|| {
+                                anyhow::anyhow!("foreign key column {c} not found in table")
+                            })?;
                         let val = &new_row[val_idx];
                         if val == &Value::Null {
                             continue;
@@ -104,7 +119,11 @@ impl MemExecutor {
                             .columns
                             .iter()
                             .position(|name| &name.name == ref_c)
-                            .unwrap();
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "foreign key references column {ref_c} not present in {foreign_table}"
+                                )
+                            })?;
                         let mut found = false;
                         for f_row in self.scan_rows(f_tbl.id, &ctx.session_id)? {
                             if values_equal(&f_row[ref_idx], val) {
