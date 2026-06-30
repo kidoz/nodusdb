@@ -206,11 +206,20 @@ struct StoredCredential {
 
 /// PBKDF2-HMAC-SHA256 work factor. A deliberate cost (vs. a single SHA-256) so an
 /// attacker who exfiltrates the credential store can't brute-force at hash speed.
-/// Set to the OWASP-recommended minimum for PBKDF2-HMAC-SHA256. The count each
-/// credential was derived with is stored alongside it (`ScramKeys::iterations`)
-/// and used for verification, so raising this only affects newly set passwords —
-/// existing credentials keep verifying — making the increase backward-compatible.
-const PBKDF2_ITERATIONS: u32 = 600_000;
+///
+/// Capped at 100_000 because this same count is advertised on the wire as the
+/// SCRAM `i=` parameter, and conforming PostgreSQL clients refuse to authenticate
+/// against a server that asks for more: pgjdbc and libpq (via `postgres-protocol`)
+/// both reject any server iteration count above 100_000 to bound the PBKDF2 work a
+/// malicious server can force on them (CVE-2026-42198). A higher value (e.g. the
+/// OWASP storage recommendation of 600_000) is therefore *not* interoperable —
+/// every real driver would fail login with an "authentication error". 100_000 is
+/// 24x the PostgreSQL default of 4096 and exactly the maximum modern clients accept.
+///
+/// The count each credential was derived with is stored alongside it
+/// (`ScramKeys::iterations`) and used for verification, so this can be lowered
+/// without invalidating existing credentials.
+const PBKDF2_ITERATIONS: u32 = 100_000;
 
 type HmacSha256 = Hmac<Sha256>;
 
