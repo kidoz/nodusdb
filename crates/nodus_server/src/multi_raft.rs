@@ -536,7 +536,22 @@ impl MultiRaftManager {
         let (left_id, right_id) = (plan.left.id, plan.right.id);
         let local = plan.source_node.as_deref() == Some(self.node_id.to_string().as_str());
 
-        if local {
+        // Refuse to flip routing on a node that does not host the source shard.
+        // Relocation only runs for a local source; committing the split here when
+        // the data lives elsewhere would repoint reads at empty children and
+        // silently lose every key in the shard. The split must be issued on the
+        // shard's placement host. (Invariant: shard split must not lose keys.)
+        if !local {
+            anyhow::bail!(
+                "shard {shard_id} is not placed on this node {}; its placement is {:?}. \
+                 Issue the split on its owning node so the data is relocated before \
+                 routing flips — flipping routing here would lose the shard's keys",
+                self.node_id,
+                plan.source_node,
+            );
+        }
+
+        {
             let left_group = Self::data_group_id(left_id);
             let right_group = Self::data_group_id(right_id);
             // Read the source's committed data before forming the children, then
@@ -574,9 +589,7 @@ impl MultiRaftManager {
             .await
             .map_err(|e| anyhow::anyhow!("commit_split task panicked: {e}"))??;
 
-        if local {
-            self.remove_group(&Self::data_group_id(shard_id)).await?;
-        }
+        self.remove_group(&Self::data_group_id(shard_id)).await?;
         Ok((left_id, right_id))
     }
 
@@ -596,7 +609,20 @@ impl MultiRaftManager {
         let merged_id = plan.merged.id;
         let local = plan.source_node.as_deref() == Some(self.node_id.to_string().as_str());
 
-        if local {
+        // See `split_shard`: never flip routing on a node that does not host the
+        // sources, or the merged shard's reads would observe an empty group and
+        // both sources' keys would be lost. (Invariant: shard merge must not lose
+        // keys.)
+        if !local {
+            anyhow::bail!(
+                "shards {left_id}/{right_id} are not placed on this node {}; placement is {:?}. \
+                 Issue the merge on their owning node so the data is relocated before routing flips",
+                self.node_id,
+                plan.source_node,
+            );
+        }
+
+        {
             let merged_group = Self::data_group_id(merged_id);
             // Read both sources' committed data before forming the merged group.
             let mut entries = self.scan_user_data(&Self::data_group_id(left_id))?;
@@ -622,10 +648,8 @@ impl MultiRaftManager {
             .await
             .map_err(|e| anyhow::anyhow!("commit_merge task panicked: {e}"))??;
 
-        if local {
-            self.remove_group(&Self::data_group_id(left_id)).await?;
-            self.remove_group(&Self::data_group_id(right_id)).await?;
-        }
+        self.remove_group(&Self::data_group_id(left_id)).await?;
+        self.remove_group(&Self::data_group_id(right_id)).await?;
         Ok(merged_id)
     }
 
@@ -893,6 +917,48 @@ mod tests {
         assert_eq!(lhs.get(b"z", 100).unwrap(), None);
         assert_eq!(rhs.get(b"z", 100).unwrap(), Some(Bytes::from_static(b"vz")));
         assert_eq!(rhs.get(b"a", 100).unwrap(), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn split_on_a_non_owning_node_is_refused_without_flipping_routing() {
+        // A split issued on a node that does not host the shard must be rejected
+        // before the routing flip — otherwise reads would repoint at empty
+        // children and every key in the shard would be silently lost.
+        let base: Arc<dyn KvEngine> = Arc::new(nodus_storage_mem::MemKvEngine::new());
+        let config = Arc::new(openraft::Config::default().validate().unwrap());
+        let mgr = MultiRaftManager::new(
+            1, // this node is node 1
+            "127.0.0.1:0".into(),
+            config,
+            RaftState::new(),
+            base.clone(),
+            None,
+            Arc::new(nodus_txn::MemTxnManager::new()),
+            None,
+            nodus_raftstore::network::RaftTransport::default(),
+        );
+
+        let meta = Arc::new(nodus_meta::PersistentMetaStore::new(base.clone()));
+        let orch = Arc::new(nodus_sharding::ShardOrchestrator::new(meta));
+        let table = TableId(uuid::Uuid::new_v4());
+        let source = orch.init_single_shard(table).unwrap();
+        // Placed on node "2", NOT this node.
+        orch.move_shard(source, "2").unwrap();
+
+        let err = mgr
+            .split_shard(&orch, table, source, vec![0x6d])
+            .await
+            .expect_err("split on a non-owning node must be refused");
+        assert!(
+            err.to_string().contains("not placed on this node"),
+            "unexpected error: {err}"
+        );
+        // Routing must be untouched: still a single shard.
+        assert_eq!(
+            orch.shard_map(table).unwrap().shards.len(),
+            1,
+            "routing must not flip when the split is refused"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -121,6 +121,11 @@ pub enum ShardCommand {
         index_id: nodus_catalog::IndexId,
         state: nodus_catalog::IndexState,
     },
+    /// Replicated catalog restore: replaces catalog state from a snapshot. Routed
+    /// through Raft so a cluster restore reaches every node's catalog rather than
+    /// only the node that served the request (which would split-brain the
+    /// replicated catalog).
+    ImportCatalogSnapshot(nodus_catalog::CatalogSnapshot),
     // Upgrade Replication Commands
     UpgradeStart {
         target_version: String,
@@ -1173,6 +1178,11 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
                             } => {
                                 let _ =
                                     catalog.update_index_state(*table_id, *index_id, state.clone());
+                            }
+                            ShardCommand::ImportCatalogSnapshot(snapshot) => {
+                                if let Err(e) = catalog.import_snapshot(snapshot.clone()) {
+                                    tracing::error!("ImportCatalogSnapshot apply failed: {e}");
+                                }
                             }
                             _ => {}
                         }

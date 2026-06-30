@@ -123,9 +123,14 @@ impl CatalogWriter for RaftCatalogWriter {
     }
 
     fn import_snapshot(&self, snapshot: CatalogSnapshot) -> Result<()> {
-        // In a fully replicated setup, this should be sent via Raft.
-        // For MVP, since restore operations are usually orchestrated manually or on a single node before clustering,
-        // we write it directly to the local catalog.
-        self.local.import_snapshot(snapshot)
+        // Replicate the restore through Raft so it is applied to every node's
+        // catalog. Writing only `self.local` (as before) restored the catalog on
+        // the node that served the request while leaving peers — and the
+        // replicated catalog log — divergent, i.e. a silent split-brain after a
+        // cluster restore. The state machine applies this to the local catalog.
+        self.replicate(
+            "import_snapshot",
+            ShardCommand::ImportCatalogSnapshot(snapshot),
+        )
     }
 }
