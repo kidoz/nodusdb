@@ -11,7 +11,10 @@ anyhow.workspace = true
 tokio.workspace = true
 opentelemetry = "0.32.0"
 opentelemetry_sdk = { version = "0.32.1", features = ["rt-tokio", "testing"] }
-opentelemetry-otlp = { version = "0.32.0", default-features = false, features = ["trace", "http-proto", "reqwest-client"] }
+# Use the *blocking* reqwest client: opentelemetry_sdk 0.32's batch processor
+# drives the exporter from a dedicated OS thread with no Tokio runtime, so an
+# async (`reqwest-client`) HTTP client panics with "there is no reactor running".
+opentelemetry-otlp = { version = "0.32.0", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client"] }
 
 [dev-dependencies]
 # In-process OTLP/HTTP collector for CI: verifies the export network path
