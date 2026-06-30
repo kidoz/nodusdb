@@ -1136,12 +1136,26 @@ async fn shards_init(State(state): State<AdminState>, Path(table): Path<String>)
     let Some(table_id) = parse_table(&table) else {
         return Json(json!({ "error": "invalid table id" }));
     };
-    // The orchestrator's shard-map write replicates through Raft (blocking
-    // submit), so run it off the reactor.
+    // Create the shard and place it on this node in one off-reactor step (both
+    // the shard-map and placement writes replicate through Raft via blocking
+    // submit). Without recording a placement, the shard belongs to no node, so a
+    // later split/merge would refuse — its locality check compares the placement
+    // against this node's id (see `MultiRaftManager::split_shard`).
     let shards = state.shards.clone();
-    let result = tokio::task::spawn_blocking(move || shards.init_single_shard(table_id)).await;
+    let mine = state.manager.node_id().to_string();
+    let result = tokio::task::spawn_blocking(move || {
+        let id = shards.init_single_shard(table_id)?;
+        shards.move_shard(id, &mine)?;
+        anyhow::Ok(id)
+    })
+    .await;
     match result {
-        Ok(Ok(id)) => Json(json!({ "table": table_id.to_string(), "shard_id": id.to_string() })),
+        Ok(Ok(id)) => {
+            // Form the shard's data group locally so it is immediately hostable
+            // (and splittable) without waiting for an explicit rebalance.
+            reconcile_shards(&state).await;
+            Json(json!({ "table": table_id.to_string(), "shard_id": id.to_string() }))
+        }
         Ok(Err(e)) => Json(json!({ "error": e.to_string() })),
         Err(e) => Json(json!({ "error": format!("task failed: {e}") })),
     }

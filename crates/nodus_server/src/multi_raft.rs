@@ -171,6 +171,13 @@ impl MultiRaftManager {
         }
     }
 
+    /// This node's cluster id. It is the value shard placements are keyed by:
+    /// `reconcile`, `split_shard`, and `merge_shards` all decide locality by
+    /// comparing a placement string against `node_id().to_string()`.
+    pub fn node_id(&self) -> u64 {
+        self.node_id
+    }
+
     /// Durable directory for `shard_id`'s snapshots, or a unique temp dir when no
     /// data dir is configured (ephemeral / in-memory mode).
     fn group_snapshot_dir(&self, shard_id: &str) -> std::path::PathBuf {
