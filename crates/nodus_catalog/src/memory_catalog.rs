@@ -10,9 +10,9 @@ use crate::{
 };
 use anyhow::Result;
 use chrono::Utc;
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::RwLock;
 use uuid::Uuid;
 
 #[allow(dead_code)]
@@ -115,26 +115,24 @@ impl MemoryCatalog {
             return Ok(());
         };
         let state = MemoryCatalogState {
-            databases: self.databases.read().unwrap().clone(),
+            databases: self.databases.read().clone(),
             schemas: self
                 .schemas
                 .read()
-                .unwrap()
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
             tables: self
                 .tables
                 .read()
-                .unwrap()
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
-            principals: self.principals.read().unwrap().clone(),
-            grants: self.grants.read().unwrap().clone(),
-            roles: self.roles.read().unwrap().clone(),
-            memberships: self.memberships.read().unwrap().clone(),
-            catalog_version: *self.catalog_version.read().unwrap(),
+            principals: self.principals.read().clone(),
+            grants: self.grants.read().clone(),
+            roles: self.roles.read().clone(),
+            memberships: self.memberships.read().clone(),
+            catalog_version: *self.catalog_version.read(),
         };
         let payload = serde_json::to_vec(&state)?;
         store.save(&nodus_common::versioned::encode(
@@ -158,7 +156,7 @@ impl MemoryCatalog {
     }
 
     fn increment_version(&self) -> u64 {
-        let mut v = self.catalog_version.write().unwrap();
+        let mut v = self.catalog_version.write();
         *v += 1;
         *v
     }
@@ -166,7 +164,7 @@ impl MemoryCatalog {
 
 impl CatalogReader for MemoryCatalog {
     fn get_database(&self, name: &str) -> Result<DatabaseDescriptor> {
-        let guard = self.databases.read().unwrap();
+        let guard = self.databases.read();
         guard
             .get(name)
             .cloned()
@@ -174,7 +172,7 @@ impl CatalogReader for MemoryCatalog {
     }
 
     fn get_database_by_id(&self, id: DatabaseId) -> Result<DatabaseDescriptor> {
-        let guard = self.databases.read().unwrap();
+        let guard = self.databases.read();
         guard
             .values()
             .find(|d| d.id == id)
@@ -184,7 +182,7 @@ impl CatalogReader for MemoryCatalog {
 
     fn get_schema(&self, database: &str, schema: &str) -> Result<SchemaDescriptor> {
         let db = self.get_database(database)?;
-        let guard = self.schemas.read().unwrap();
+        let guard = self.schemas.read();
         guard
             .get(&(db.id, schema.to_string()))
             .cloned()
@@ -192,7 +190,7 @@ impl CatalogReader for MemoryCatalog {
     }
 
     fn get_schema_by_id(&self, id: SchemaId) -> Result<SchemaDescriptor> {
-        let guard = self.schemas.read().unwrap();
+        let guard = self.schemas.read();
         guard
             .values()
             .find(|s| s.id == id)
@@ -202,7 +200,7 @@ impl CatalogReader for MemoryCatalog {
 
     fn list_schemas(&self, database: &str) -> Result<Vec<SchemaDescriptor>> {
         let db = self.get_database(database)?;
-        let guard = self.schemas.read().unwrap();
+        let guard = self.schemas.read();
         Ok(guard
             .values()
             .filter(|s| s.database_id == db.id && s.state == DescriptorState::Public)
@@ -212,7 +210,7 @@ impl CatalogReader for MemoryCatalog {
 
     fn list_all_tables(&self, database: &str) -> Result<Vec<TableDescriptor>> {
         let db = self.get_database(database)?;
-        let guard = self.tables.read().unwrap();
+        let guard = self.tables.read();
         Ok(guard
             .values()
             .filter(|t| t.database_id == db.id && t.state == DescriptorState::Public)
@@ -247,7 +245,7 @@ impl CatalogReader for MemoryCatalog {
     fn get_table(&self, database: &str, schema: &str, table: &str) -> Result<TableDescriptor> {
         let db = self.get_database(database)?;
         let sch = self.get_schema(database, schema)?;
-        let guard = self.tables.read().unwrap();
+        let guard = self.tables.read();
         if let Some(t) = guard.get(&(db.id, sch.id, table.to_string())) {
             Ok(t.clone())
         } else {
@@ -262,7 +260,7 @@ impl CatalogReader for MemoryCatalog {
     fn list_tables(&self, database: &str, schema: &str) -> Result<Vec<TableDescriptor>> {
         let db = self.get_database(database)?;
         let sch = self.get_schema(database, schema)?;
-        let guard = self.tables.read().unwrap();
+        let guard = self.tables.read();
         let mut res = Vec::new();
         for ((d_id, s_id, _), t) in guard.iter() {
             if *d_id == db.id && *s_id == sch.id {
@@ -273,7 +271,7 @@ impl CatalogReader for MemoryCatalog {
     }
 
     fn get_table_by_id(&self, id: TableId) -> Result<TableDescriptor> {
-        let guard = self.tables.read().unwrap();
+        let guard = self.tables.read();
         guard
             .values()
             .find(|t| t.id == id)
@@ -282,7 +280,7 @@ impl CatalogReader for MemoryCatalog {
     }
 
     fn get_principal_by_name(&self, name: &str) -> Result<PrincipalDescriptor> {
-        let guard = self.principals.read().unwrap();
+        let guard = self.principals.read();
         guard
             .get(name)
             .cloned()
@@ -290,7 +288,7 @@ impl CatalogReader for MemoryCatalog {
     }
 
     fn get_principal_by_id(&self, id: PrincipalId) -> Result<PrincipalDescriptor> {
-        let guard = self.principals.read().unwrap();
+        let guard = self.principals.read();
         guard
             .values()
             .find(|p| p.id == id)
@@ -311,7 +309,7 @@ impl CatalogReader for MemoryCatalog {
     }
 
     fn get_grants_for_resource(&self, resource: ResourceRef) -> Result<Vec<GrantDescriptor>> {
-        let guard = self.grants.read().unwrap();
+        let guard = self.grants.read();
         Ok(guard
             .iter()
             .filter(|g| g.state == DescriptorState::Public && g.resource == resource)
@@ -320,14 +318,13 @@ impl CatalogReader for MemoryCatalog {
     }
 
     fn list_principals(&self) -> Result<Vec<PrincipalDescriptor>> {
-        Ok(self.principals.read().unwrap().values().cloned().collect())
+        Ok(self.principals.read().values().cloned().collect())
     }
 
     fn list_grants(&self) -> Result<Vec<GrantDescriptor>> {
         Ok(self
             .grants
             .read()
-            .unwrap()
             .iter()
             .filter(|g| g.state == DescriptorState::Public)
             .cloned()
@@ -335,7 +332,7 @@ impl CatalogReader for MemoryCatalog {
     }
 
     fn get_grant_by_id(&self, id: GrantId) -> Result<GrantDescriptor> {
-        let guard = self.grants.read().unwrap();
+        let guard = self.grants.read();
         guard
             .iter()
             .find(|g| g.id == id)
@@ -344,7 +341,7 @@ impl CatalogReader for MemoryCatalog {
     }
 
     fn get_effective_roles(&self, principal: PrincipalId) -> Result<Vec<RoleId>> {
-        let guard = self.roles.read().unwrap();
+        let guard = self.roles.read();
         Ok(guard
             .iter()
             .filter(|m| m.member_id == principal && m.state == DescriptorState::Public)
@@ -353,7 +350,7 @@ impl CatalogReader for MemoryCatalog {
     }
 
     fn get_effective_principals(&self, principal: PrincipalId) -> Result<Vec<PrincipalId>> {
-        let edges = self.memberships.read().unwrap();
+        let edges = self.memberships.read();
         // Breadth-first transitive closure over the role-membership graph.
         let mut result = vec![principal];
         let mut frontier = vec![principal];
@@ -370,18 +367,18 @@ impl CatalogReader for MemoryCatalog {
 
     fn export_snapshot(&self) -> CatalogSnapshot {
         CatalogSnapshot {
-            databases: self.databases.read().unwrap().values().cloned().collect(),
-            schemas: self.schemas.read().unwrap().values().cloned().collect(),
-            tables: self.tables.read().unwrap().values().cloned().collect(),
-            principals: self.principals.read().unwrap().values().cloned().collect(),
-            grants: self.grants.read().unwrap().clone(),
+            databases: self.databases.read().values().cloned().collect(),
+            schemas: self.schemas.read().values().cloned().collect(),
+            tables: self.tables.read().values().cloned().collect(),
+            principals: self.principals.read().values().cloned().collect(),
+            grants: self.grants.read().clone(),
         }
     }
 }
 
 impl CatalogWriter for MemoryCatalog {
     fn create_database(&self, request: CreateDatabaseRequest) -> Result<DatabaseDescriptor> {
-        let mut guard = self.databases.write().unwrap();
+        let mut guard = self.databases.write();
         if guard.contains_key(&request.name) {
             anyhow::bail!("Database {} already exists", request.name);
         }
@@ -401,7 +398,7 @@ impl CatalogWriter for MemoryCatalog {
     }
 
     fn create_schema(&self, request: CreateSchemaRequest) -> Result<SchemaDescriptor> {
-        let mut guard = self.schemas.write().unwrap();
+        let mut guard = self.schemas.write();
         let key = (request.database_id, request.name.clone());
         if guard.contains_key(&key) {
             anyhow::bail!("Schema {} already exists", request.name);
@@ -425,7 +422,7 @@ impl CatalogWriter for MemoryCatalog {
     }
 
     fn create_table(&self, request: CreateTableRequest) -> Result<TableDescriptor> {
-        let mut guard = self.tables.write().unwrap();
+        let mut guard = self.tables.write();
         let key = (request.database_id, request.schema_id, request.name.clone());
         if guard.contains_key(&key) {
             anyhow::bail!("Table {} already exists", request.name);
@@ -451,7 +448,7 @@ impl CatalogWriter for MemoryCatalog {
     }
 
     fn drop_table(&self, id: TableId) -> Result<()> {
-        let mut guard = self.tables.write().unwrap();
+        let mut guard = self.tables.write();
         let key = guard
             .iter()
             .find(|(_, t)| t.id == id)
@@ -467,7 +464,7 @@ impl CatalogWriter for MemoryCatalog {
     }
 
     fn drop_schema(&self, id: SchemaId) -> Result<()> {
-        let mut guard = self.schemas.write().unwrap();
+        let mut guard = self.schemas.write();
         let key = guard
             .iter()
             .find(|(_, s)| s.id == id)
@@ -483,7 +480,7 @@ impl CatalogWriter for MemoryCatalog {
     }
 
     fn grant_privileges(&self, request: GrantPrivilegesRequest) -> Result<GrantDescriptor> {
-        let mut guard = self.grants.write().unwrap();
+        let mut guard = self.grants.write();
         let desc = GrantDescriptor {
             id: request.id,
             name: "grant".into(),
@@ -502,7 +499,7 @@ impl CatalogWriter for MemoryCatalog {
     }
 
     fn revoke_privileges(&self, request: RevokePrivilegesRequest) -> Result<()> {
-        let mut guard = self.grants.write().unwrap();
+        let mut guard = self.grants.write();
         guard.retain(|g| {
             !(g.principal_id == request.principal_id
                 && g.resource == request.resource
@@ -515,7 +512,7 @@ impl CatalogWriter for MemoryCatalog {
     }
 
     fn update_table_descriptor(&self, change: TableDescriptorChange) -> Result<TableDescriptor> {
-        let mut guard = self.tables.write().unwrap();
+        let mut guard = self.tables.write();
         let table_id = match &change {
             TableDescriptorChange::AddColumn { table_id, .. } => *table_id,
             TableDescriptorChange::RenameTable { table_id, .. } => *table_id,
@@ -590,7 +587,7 @@ impl CatalogWriter for MemoryCatalog {
     }
 
     fn create_role(&self, request: CreateRoleRequest) -> Result<PrincipalDescriptor> {
-        let mut guard = self.principals.write().unwrap();
+        let mut guard = self.principals.write();
         if guard.contains_key(&request.name) {
             anyhow::bail!("Principal {} already exists", request.name);
         }
@@ -611,7 +608,7 @@ impl CatalogWriter for MemoryCatalog {
     }
 
     fn grant_privilege(&self, request: GrantPrivilegeRequest) -> Result<GrantDescriptor> {
-        let mut guard = self.grants.write().unwrap();
+        let mut guard = self.grants.write();
         let desc = GrantDescriptor {
             id: request.id,
             name: "grant".into(),
@@ -630,7 +627,7 @@ impl CatalogWriter for MemoryCatalog {
     }
 
     fn revoke_privilege(&self, request: RevokePrivilegeRequest) -> Result<()> {
-        let mut guard = self.grants.write().unwrap();
+        let mut guard = self.grants.write();
         guard.retain(|g| {
             !(g.principal_id == request.principal_id
                 && g.resource == request.resource
@@ -644,7 +641,7 @@ impl CatalogWriter for MemoryCatalog {
 
     fn add_role_member(&self, request: AddRoleMemberRequest) -> Result<()> {
         let edge = (request.role_principal_id, request.member_id);
-        let mut guard = self.memberships.write().unwrap();
+        let mut guard = self.memberships.write();
         if !guard.contains(&edge) {
             guard.push(edge);
         }
@@ -660,7 +657,7 @@ impl CatalogWriter for MemoryCatalog {
         index_id: IndexId,
         state: IndexState,
     ) -> Result<()> {
-        let mut tables = self.tables.write().unwrap();
+        let mut tables = self.tables.write();
         for (_, tbl) in tables.iter_mut() {
             for idx in tbl.indexes.iter_mut() {
                 if idx.id == index_id {
@@ -676,17 +673,17 @@ impl CatalogWriter for MemoryCatalog {
     }
 
     fn import_snapshot(&self, snapshot: CatalogSnapshot) -> Result<()> {
-        *self.databases.write().unwrap() = snapshot
+        *self.databases.write() = snapshot
             .databases
             .into_iter()
             .map(|d| (d.name.clone(), d))
             .collect();
-        *self.schemas.write().unwrap() = snapshot
+        *self.schemas.write() = snapshot
             .schemas
             .into_iter()
             .map(|s| ((s.database_id, s.name.clone()), s))
             .collect();
-        *self.tables.write().unwrap() = snapshot
+        *self.tables.write() = snapshot
             .tables
             .into_iter()
             .map(|t| ((t.database_id, t.schema_id, t.name.clone()), t))
@@ -760,7 +757,7 @@ mod tests {
             serde_json::to_vec(&state).unwrap(),
         ))));
         let cat = MemoryCatalog::with_store(store).unwrap();
-        assert_eq!(*cat.catalog_version.read().unwrap(), 7);
+        assert_eq!(*cat.catalog_version.read(), 7);
     }
 
     #[test]

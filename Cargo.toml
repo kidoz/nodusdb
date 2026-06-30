@@ -67,6 +67,7 @@ futures-util = "0.3.32"
 uuid = { version = "1.23.4", features = ["v4", "v5", "serde"] }
 chrono = { version = "0.4.45", features = ["serde"] }
 bytes = "1.12.0"
+parking_lot = "0.12.5"
 openraft = { version = "0.9.24", features = ["serde"] }
 sha2 = "0.11.0"
 proptest = "1.11.0"

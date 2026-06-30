@@ -974,7 +974,6 @@ impl MemExecutor {
         let rows = self
             .active_txns
             .read()
-            .unwrap()
             .values()
             .filter(|txn| txn.explicit)
             .map(|txn| {

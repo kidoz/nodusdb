@@ -36,6 +36,7 @@ nodus_sharding = { path = "../nodus_sharding" }
 nodus_meta = { path = "../nodus_meta" }
 uuid.workspace = true
 bytes.workspace = true
+parking_lot.workspace = true
 serde_json.workspace = true
 tokio-rustls = "0.26.4"
 rustls-pemfile = "2.2.0"

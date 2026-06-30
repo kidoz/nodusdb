@@ -111,7 +111,7 @@ impl MemExecutor {
         if self.restoring.load(std::sync::atomic::Ordering::Acquire) {
             anyhow::bail!("restore in progress; retry shortly");
         }
-        let _drain_guard = self.restore_gate.read().unwrap();
+        let _drain_guard = self.restore_gate.read();
 
         let (db_name, schema_name, table_only) = parse_object_name(table_name)?;
         let schema_name = if schema_name.eq_ignore_ascii_case("public")
@@ -140,7 +140,7 @@ impl MemExecutor {
         // within the result, so fall back when the session has uncommitted writes
         // to this table. A read-only/autocommit statement has none.
         {
-            let guard = self.active_txns.read().unwrap();
+            let guard = self.active_txns.read();
             if let Some(txn) = guard.get(&ctx.session_id) {
                 let start = format!("{}:", tbl.id);
                 let end = format!("{};", tbl.id);
@@ -198,11 +198,7 @@ impl MemExecutor {
         // implicit read transaction for the scan's duration so it sees one fixed
         // snapshot, exactly as `execute_logical` does for the buffered path. (It
         // also registers the read with the GC watermark for its lifetime.)
-        let has_active_txn = self
-            .active_txns
-            .read()
-            .unwrap()
-            .contains_key(&ctx.session_id);
+        let has_active_txn = self.active_txns.read().contains_key(&ctx.session_id);
         let implicit = if has_active_txn {
             None
         } else {

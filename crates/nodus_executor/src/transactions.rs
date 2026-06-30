@@ -9,7 +9,7 @@ use nodus_storage_api::IntentReplacement;
 impl MemExecutor {
     pub(crate) fn exec_begin(&self, ctx: &ExecutionContext) -> Result<QueryOutput> {
         let txn_record = self.txn.begin_txn()?;
-        self.active_txns.write().unwrap().insert(
+        self.active_txns.write().insert(
             ctx.session_id.clone(),
             ActiveTxn::new(txn_record.txn_id, txn_record.read_ts, true),
         );
@@ -17,7 +17,7 @@ impl MemExecutor {
     }
 
     pub(crate) fn exec_commit(&self, ctx: &ExecutionContext) -> Result<QueryOutput> {
-        if let Some(txn) = self.active_txns.write().unwrap().remove(&ctx.session_id) {
+        if let Some(txn) = self.active_txns.write().remove(&ctx.session_id) {
             let commit_ts = self.txn.commit_txn(txn.txn_id)?;
             self.kv.commit(txn.txn_id, commit_ts)?;
         }
@@ -25,7 +25,7 @@ impl MemExecutor {
     }
 
     pub(crate) fn exec_rollback(&self, ctx: &ExecutionContext) -> Result<QueryOutput> {
-        if let Some(txn) = self.active_txns.write().unwrap().remove(&ctx.session_id) {
+        if let Some(txn) = self.active_txns.write().remove(&ctx.session_id) {
             self.txn.abort_txn(txn.txn_id)?;
             self.kv.abort(txn.txn_id)?;
         }
@@ -37,7 +37,7 @@ impl MemExecutor {
         ctx: &ExecutionContext,
         name: String,
     ) -> Result<QueryOutput> {
-        let mut guard = self.active_txns.write().unwrap();
+        let mut guard = self.active_txns.write();
         let txn = guard
             .get_mut(&ctx.session_id)
             .ok_or_else(|| anyhow::anyhow!("SAVEPOINT can only be used in transaction blocks"))?;
@@ -55,7 +55,7 @@ impl MemExecutor {
         name: String,
     ) -> Result<QueryOutput> {
         let (txn_id, affected, snapshot, keep_len, keep_savepoints) = {
-            let guard = self.active_txns.read().unwrap();
+            let guard = self.active_txns.read();
             let txn = guard.get(&ctx.session_id).ok_or_else(|| {
                 anyhow::anyhow!("ROLLBACK TO SAVEPOINT can only be used in transaction blocks")
             })?;
@@ -88,7 +88,7 @@ impl MemExecutor {
                 .replace_intent(txn_id, Bytes::from(key), replacement)?;
         }
 
-        let mut guard = self.active_txns.write().unwrap();
+        let mut guard = self.active_txns.write();
         if let Some(txn) = guard.get_mut(&ctx.session_id) {
             txn.overlay = snapshot;
             txn.write_log.truncate(keep_len);
@@ -102,7 +102,7 @@ impl MemExecutor {
         ctx: &ExecutionContext,
         name: String,
     ) -> Result<QueryOutput> {
-        let mut guard = self.active_txns.write().unwrap();
+        let mut guard = self.active_txns.write();
         let txn = guard.get_mut(&ctx.session_id).ok_or_else(|| {
             anyhow::anyhow!("RELEASE SAVEPOINT can only be used in transaction blocks")
         })?;
@@ -126,7 +126,6 @@ impl MemExecutor {
         let set_value = self
             .session_vars
             .read()
-            .unwrap()
             .get(&ctx.session_id)
             .and_then(|vars| vars.get(&key))
             .cloned();
@@ -156,7 +155,7 @@ impl MemExecutor {
     ) -> Result<QueryOutput> {
         let key = variable.trim().to_ascii_lowercase();
         let normalized = crate::session_vars::normalize_var_value(&value);
-        let mut guard = self.session_vars.write().unwrap();
+        let mut guard = self.session_vars.write();
         let vars = guard.entry(ctx.session_id.clone()).or_default();
         if normalized.eq_ignore_ascii_case("default") {
             vars.remove(&key);

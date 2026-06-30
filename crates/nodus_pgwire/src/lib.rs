@@ -40,7 +40,28 @@ pub(crate) async fn execute_off_reactor(
 ) -> anyhow::Result<nodus_executor::QueryOutput> {
     match tokio::task::spawn_blocking(move || executor.execute_logical(&ctx, plan)).await {
         Ok(result) => result,
-        Err(join_err) => Err(anyhow::anyhow!("execution task failed: {join_err}")),
+        Err(join_err) => {
+            // `spawn_blocking` is our unwind boundary: a panic inside the
+            // executor unwinds into a `JoinError` here rather than aborting the
+            // process or tearing down the connection task. Surface the panic
+            // payload so the client gets an actionable error instead of an
+            // opaque "task failed", and the panic is reported as a normal query
+            // failure. (Any `std::sync` lock the panicking statement held is now
+            // poison-tolerant — see the parking_lot locks in the catalog and
+            // executor — so one panicking query can't brick later ones.)
+            let detail = if join_err.is_panic() {
+                match join_err.into_panic().downcast::<String>() {
+                    Ok(s) => *s,
+                    Err(p) => match p.downcast::<&'static str>() {
+                        Ok(s) => s.to_string(),
+                        Err(_) => "unknown panic".to_string(),
+                    },
+                }
+            } else {
+                "execution task cancelled".to_string()
+            };
+            Err(anyhow::anyhow!("internal error executing query: {detail}"))
+        }
     }
 }
 

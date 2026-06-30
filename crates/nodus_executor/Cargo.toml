@@ -23,6 +23,7 @@ nodus_meta = { path = "../nodus_meta" }
 nodus_storage_mem = { path = "../nodus_storage_mem" }
 nodus_storage_lsm = { path = "../nodus_storage_lsm" }
 bytes.workspace = true
+parking_lot.workspace = true
 chrono.workspace = true
 sqlparser.workspace = true
 serde_json.workspace = true

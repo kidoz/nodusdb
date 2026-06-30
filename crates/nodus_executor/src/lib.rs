@@ -255,18 +255,18 @@ pub struct MemExecutor {
     pub(crate) txn: Arc<dyn TxnManager>,
     /// Active explicit transaction per session id (`BEGIN`..`COMMIT`/`ROLLBACK`).
     /// Keyed by session so one connection's transaction can't affect another's.
-    pub(crate) active_txns: std::sync::RwLock<HashMap<String, ActiveTxn>>,
+    pub(crate) active_txns: parking_lot::RwLock<HashMap<String, ActiveTxn>>,
     /// Per-session GUC overlay (`SET`/`SHOW`). Keyed by session id; each value is
     /// a map of lowercased variable name to its set value. Cleared on session
     /// end so it cannot grow unbounded. See [`crate::session_vars`].
-    pub(crate) session_vars: std::sync::RwLock<HashMap<String, HashMap<String, String>>>,
+    pub(crate) session_vars: parking_lot::RwLock<HashMap<String, HashMap<String, String>>>,
     /// Set while a restore is replacing the engine's data: new statements are
     /// rejected so no query observes a partially restored state.
     pub(crate) restoring: Arc<std::sync::atomic::AtomicBool>,
     /// Drain/exclusion gate for restores. Each statement holds a read guard for
     /// its duration; a restore takes the write guard, which blocks until every
     /// in-flight statement has drained and then runs with exclusive access.
-    pub(crate) restore_gate: Arc<std::sync::RwLock<()>>,
+    pub(crate) restore_gate: Arc<parking_lot::RwLock<()>>,
 }
 
 impl MemExecutor {
@@ -285,10 +285,10 @@ impl MemExecutor {
             audit,
             kv,
             txn,
-            active_txns: std::sync::RwLock::new(HashMap::new()),
-            session_vars: std::sync::RwLock::new(HashMap::new()),
+            active_txns: parking_lot::RwLock::new(HashMap::new()),
+            session_vars: parking_lot::RwLock::new(HashMap::new()),
             restoring: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            restore_gate: Arc::new(std::sync::RwLock::new(())),
+            restore_gate: Arc::new(parking_lot::RwLock::new(())),
         }
     }
 
@@ -300,7 +300,7 @@ impl MemExecutor {
 
     /// Shared handle to the restore drain/exclusion gate (take the write guard to
     /// drain in-flight statements and run a restore with exclusive access).
-    pub fn restore_gate(&self) -> Arc<std::sync::RwLock<()>> {
+    pub fn restore_gate(&self) -> Arc<parking_lot::RwLock<()>> {
         self.restore_gate.clone()
     }
 
@@ -412,7 +412,7 @@ impl MemExecutor {
     /// Read timestamp for a session: its active transaction's snapshot, or the
     /// latest committed state when the session has no open transaction.
     pub(crate) fn read_ts(&self, session: &str) -> Timestamp {
-        match self.active_txns.read().unwrap().get(session) {
+        match self.active_txns.read().get(session) {
             Some(txn) => txn.read_ts,
             None => u64::MAX,
         }
@@ -426,7 +426,6 @@ impl MemExecutor {
     fn linearizable_reads(&self, session: &str) -> bool {
         self.session_vars
             .read()
-            .unwrap()
             .get(session)
             .and_then(|vars| vars.get(LINEARIZABLE_READS_VAR))
             .map(|v| matches!(v.to_ascii_lowercase().as_str(), "on" | "true" | "1" | "yes"))
@@ -446,7 +445,7 @@ impl MemExecutor {
 
     /// Returns the session's active txn id. Expects a transaction to be active.
     fn txn_for(&self, session: &str) -> Result<TxnId> {
-        match self.active_txns.read().unwrap().get(session) {
+        match self.active_txns.read().get(session) {
             Some(txn) => Ok(txn.txn_id),
             None => anyhow::bail!("No active transaction for session"),
         }
@@ -466,7 +465,7 @@ impl MemExecutor {
                 serde_json::from_slice::<Vec<Value>>(&pair.value)?,
             );
         }
-        if let Some(txn) = self.active_txns.read().unwrap().get(session) {
+        if let Some(txn) = self.active_txns.read().get(session) {
             let start = format!("{}:", table_id);
             let end = format!("{};", table_id);
             for (key, value) in &txn.overlay {
@@ -501,7 +500,7 @@ impl MemExecutor {
         session: &str,
         cap: usize,
     ) -> Result<Option<Vec<Vec<Value>>>> {
-        if let Some(txn) = self.active_txns.read().unwrap().get(session) {
+        if let Some(txn) = self.active_txns.read().get(session) {
             let start = format!("{}:", table_id);
             let end = format!("{};", table_id);
             if txn.overlay.keys().any(|k| k >= &start && k < &end) {
@@ -571,7 +570,7 @@ impl MemExecutor {
             .into_iter()
             .map(|r| (Self::row_pk(pk_positions, &r), r))
             .collect();
-        if let Some(txn) = self.active_txns.read().unwrap().get(session) {
+        if let Some(txn) = self.active_txns.read().get(session) {
             let start = format!("{}:", table_id);
             let end = format!("{};", table_id);
             for (key, value) in &txn.overlay {
@@ -608,7 +607,7 @@ impl MemExecutor {
         self.txn.track_write(txn_id, key.as_bytes().to_vec())?;
         self.kv
             .write_intent(txn_id, Bytes::from(key.clone()), Bytes::from(value.clone()))?;
-        if let Some(txn) = self.active_txns.write().unwrap().get_mut(session) {
+        if let Some(txn) = self.active_txns.write().get_mut(session) {
             txn.write_log.push(key.clone());
             txn.overlay.insert(key, Some(value));
         }
@@ -620,7 +619,7 @@ impl MemExecutor {
         let txn_id = self.txn_for(session)?;
         self.txn.track_write(txn_id, key.as_bytes().to_vec())?;
         self.kv.delete_intent(txn_id, Bytes::from(key.clone()))?;
-        if let Some(txn) = self.active_txns.write().unwrap().get_mut(session) {
+        if let Some(txn) = self.active_txns.write().get_mut(session) {
             txn.write_log.push(key.clone());
             txn.overlay.insert(key, None);
         }
@@ -736,7 +735,7 @@ impl Executor for MemExecutor {
         if self.restoring.load(std::sync::atomic::Ordering::Acquire) {
             anyhow::bail!("restore in progress; retry shortly");
         }
-        let _drain_guard = self.restore_gate.read().unwrap();
+        let _drain_guard = self.restore_gate.read();
 
         let is_txn_control = matches!(
             plan,
@@ -755,16 +754,9 @@ impl Executor for MemExecutor {
         );
         let mut implicit_txn = None;
 
-        if !is_txn_control
-            && self
-                .active_txns
-                .read()
-                .unwrap()
-                .get(&ctx.session_id)
-                .is_none()
-        {
+        if !is_txn_control && self.active_txns.read().get(&ctx.session_id).is_none() {
             let txn_record = self.txn.begin_txn()?;
-            self.active_txns.write().unwrap().insert(
+            self.active_txns.write().insert(
                 ctx.session_id.clone(),
                 ActiveTxn::new(txn_record.txn_id, txn_record.read_ts, false),
             );
@@ -774,7 +766,7 @@ impl Executor for MemExecutor {
         let result = self.execute_logical_inner(ctx, plan);
 
         if let Some(txn_id) = implicit_txn {
-            self.active_txns.write().unwrap().remove(&ctx.session_id);
+            self.active_txns.write().remove(&ctx.session_id);
             match &result {
                 Ok(_) => {
                     let commit_ts = self.txn.commit_txn(txn_id)?;
@@ -807,8 +799,8 @@ impl Executor for MemExecutor {
     }
 
     fn end_session(&self, session_id: &str) {
-        self.session_vars.write().unwrap().remove(session_id);
-        if let Some(txn) = self.active_txns.write().unwrap().remove(session_id) {
+        self.session_vars.write().remove(session_id);
+        if let Some(txn) = self.active_txns.write().remove(session_id) {
             // A client that drops mid-transaction must not leave the write intent
             // dangling; abort so the row locks/intents are released.
             let _ = self.txn.abort_txn(txn.txn_id);

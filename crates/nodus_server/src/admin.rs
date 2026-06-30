@@ -67,7 +67,7 @@ pub struct AdminState {
     pub restoring: Arc<AtomicBool>,
     /// Drain/exclusion gate shared with the executor: a restore takes the write
     /// guard to drain in-flight statements and run with exclusive access.
-    pub restore_gate: Arc<std::sync::RwLock<()>>,
+    pub restore_gate: Arc<parking_lot::RwLock<()>>,
 }
 
 /// Rejects requests lacking a valid `Authorization: Bearer <token>` header when
@@ -966,7 +966,7 @@ async fn restore_backup(
         // which blocks until every in-flight statement has drained. From here no
         // query can observe the engine until we finish.
         restoring.store(true, std::sync::atomic::Ordering::Release);
-        let _exclusive = restore_gate.write().unwrap();
+        let _exclusive = restore_gate.write();
 
         let result = apply_restore_mutations(
             &objects,
