@@ -12,7 +12,6 @@ use crate::raft_router::RaftRouter;
 /// `blocking_recv` — so they MUST be invoked from a blocking context (e.g. inside
 /// `tokio::task::spawn_blocking`), never directly on a runtime worker thread.
 pub struct RaftCatalogWriter {
-    pub local: Arc<dyn CatalogWriter>,
     pub reader: Arc<dyn CatalogReader>,
     pub router: RaftRouter,
     pub shard_id: String,
@@ -124,10 +123,10 @@ impl CatalogWriter for RaftCatalogWriter {
 
     fn import_snapshot(&self, snapshot: CatalogSnapshot) -> Result<()> {
         // Replicate the restore through Raft so it is applied to every node's
-        // catalog. Writing only `self.local` (as before) restored the catalog on
-        // the node that served the request while leaving peers — and the
-        // replicated catalog log — divergent, i.e. a silent split-brain after a
-        // cluster restore. The state machine applies this to the local catalog.
+        // catalog. Writing only the local catalog (as before) restored it on the
+        // node that served the request while leaving peers — and the replicated
+        // catalog log — divergent, i.e. a silent split-brain after a cluster
+        // restore. The state machine applies this to the local catalog.
         self.replicate(
             "import_snapshot",
             ShardCommand::ImportCatalogSnapshot(snapshot),

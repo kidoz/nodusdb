@@ -549,7 +549,6 @@ pub async fn run_server_with_config(
     });
 
     let raft_catalog_writer = Arc::new(crate::raft_catalog::RaftCatalogWriter {
-        local: catalog.clone(),
         reader: catalog.clone(),
         router: raft_router.clone(),
         shard_id: crate::multi_raft::META_SHARD.to_string(),
