@@ -199,12 +199,39 @@ impl BackupRepository for FsBackupRepository {
         body: Bytes,
         _options: PutOptions,
     ) -> Result<ObjectMetadata> {
+        use tokio::io::AsyncWriteExt;
         let path = self.path_for(key);
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
         let size = body.len() as u64;
-        tokio::fs::write(&path, &body).await?;
+
+        // Durable, atomic publish: write the full body to a sibling temp file and
+        // fsync it, then rename into place and fsync the directory. A plain
+        // `fs::write` leaves the bytes (and, for `manifest.json`, the COMPLETE
+        // marker) in the page cache, so a host crash right after a backup is
+        // reported COMPLETE could lose data the operator believes is durably
+        // backed up, or leave a torn manifest. (Object stores like S3 provide this
+        // durability themselves; this only matters for the filesystem backend.)
+        let file_name = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| anyhow::anyhow!("invalid object key {key}"))?;
+        let tmp = path.with_file_name(format!("{file_name}.tmp"));
+        {
+            let mut f = tokio::fs::File::create(&tmp).await?;
+            f.write_all(&body).await?;
+            f.sync_all().await?;
+        }
+        tokio::fs::rename(&tmp, &path).await?;
+        if let Some(parent) = path.parent() {
+            // Directory fsync makes the rename itself durable. Best-effort: not all
+            // platforms allow opening a directory for sync (e.g. Windows).
+            if let Ok(dir) = std::fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
+
         Ok(ObjectMetadata {
             key: key.to_string(),
             size,
@@ -665,6 +692,12 @@ impl BackupOrchestrator {
         completed.status = BackupStatus::Completed;
         self.put_final_manifest(&completed).await?;
         self.verify(&backup_id).await?;
+        // The COMPLETE manifest is the durable commit point; drop the pending
+        // manifest so it can't accumulate or be mistaken for an in-flight backup.
+        let _ = self
+            .repo
+            .delete_object(&pending_manifest_key(&backup_id))
+            .await;
         Ok(completed)
     }
 
@@ -754,6 +787,10 @@ impl BackupOrchestrator {
         completed.status = BackupStatus::Completed;
         self.put_final_manifest(&completed).await?;
         self.verify(&backup_id).await?;
+        let _ = self
+            .repo
+            .delete_object(&pending_manifest_key(&backup_id))
+            .await;
         Ok(completed)
     }
 
@@ -1500,8 +1537,12 @@ mod tests {
             manifest.repository_capabilities,
             RepositoryCapabilities::default()
         );
+        // The pending manifest is removed once the COMPLETE manifest is the
+        // durable commit point, so it cannot accumulate or be mistaken for an
+        // in-flight backup.
         assert!(
-            repo.object_exists(&pending_manifest_key(&manifest.backup_id))
+            !repo
+                .object_exists(&pending_manifest_key(&manifest.backup_id))
                 .await
                 .unwrap()
         );
