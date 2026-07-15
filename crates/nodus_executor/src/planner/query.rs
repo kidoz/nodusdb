@@ -130,6 +130,11 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
             };
             if let Some(val) = expr_to_value(expr, params) {
                 values.push((alias, val));
+            } else if let Some(val) = fold_scalar(expr, params) {
+                // Computed constant expressions: arithmetic, comparisons, CAST,
+                // string concat, and scalar function calls. (Legacy handling
+                // below still covers niladic specials like version().)
+                values.push((alias, val));
             } else if let Expr::Function(func) = expr {
                 let func_name = func.name.to_string();
                 let rendered = if func_name.eq_ignore_ascii_case("version") {
