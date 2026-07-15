@@ -11,3 +11,8 @@ publish = false
 workspace = true
 
 [dependencies]
+
+[dev-dependencies]
+nodus_testkit = { path = "../../crates/nodus_testkit" }
+tokio = { workspace = true }
+tokio-postgres = { workspace = true }

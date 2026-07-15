@@ -2515,6 +2515,11 @@ dependencies = [
 [[package]]
 name = "nodus_sqllogictest"
 version = "0.1.0"
+dependencies = [
+ "nodus_testkit",
+ "tokio",
+ "tokio-postgres",
+]
 
 [[package]]
 name = "nodus_storage_api"

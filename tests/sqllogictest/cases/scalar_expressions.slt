@@ -1,0 +1,166 @@
+# Phase 1 (scalar types): constant scalar expressions in the SELECT list.
+# Derived from PostgreSQL's int4/float8/text/boolean regress tests, restricted
+# to the FROM-less forms. Before the projection constant-folder landed these all
+# returned int4 0 / the function name; PostgreSQL values are asserted here.
+
+# --- integer arithmetic ---
+query I
+SELECT 2 + 3;
+----
+5
+
+query I
+SELECT 10 - 4;
+----
+6
+
+query I
+SELECT 6 * 7;
+----
+42
+
+query I
+SELECT 10 / 3;
+----
+3
+
+query I
+SELECT 17 % 5;
+----
+2
+
+query I
+SELECT -(4);
+----
+-4
+
+query I
+SELECT 2 + 3 * 4;
+----
+14
+
+# --- float arithmetic ---
+query R
+SELECT 1.5 + 2.5;
+----
+4
+
+query R
+SELECT 0.5 * 3;
+----
+1.5
+
+# --- casts ---
+query R
+SELECT 1.5::float8;
+----
+1.5
+
+query R
+SELECT 3.14::numeric;
+----
+3.14
+
+query I
+SELECT 5::int;
+----
+5
+
+query T
+SELECT 42::text;
+----
+42
+
+# --- comparisons yield booleans (rendered t/f) ---
+query B
+SELECT 1 = 1;
+----
+t
+
+query B
+SELECT 1 = 2;
+----
+f
+
+query B
+SELECT 3 > 2;
+----
+t
+
+query B
+SELECT 2 <= 2;
+----
+t
+
+query B
+SELECT 5 <> 6;
+----
+t
+
+# --- boolean logic ---
+query B
+SELECT true AND false;
+----
+f
+
+query B
+SELECT true OR false;
+----
+t
+
+query B
+SELECT NOT true;
+----
+f
+
+# --- string operators & functions ---
+query T
+SELECT 'foo' || 'bar';
+----
+foobar
+
+query T
+SELECT upper('hello');
+----
+HELLO
+
+query T
+SELECT lower('WORLD');
+----
+world
+
+query I
+SELECT length('abcde');
+----
+5
+
+query I
+SELECT abs(-7);
+----
+7
+
+query T
+SELECT coalesce(NULL, 'x');
+----
+x
+
+# --- NULL handling (three-valued logic) ---
+query I
+SELECT NULL::int;
+----
+NULL
+
+query B
+SELECT NULL = 1;
+----
+NULL
+
+query B
+SELECT NULL IS NULL;
+----
+t
+
+query B
+SELECT 5 IS NOT NULL;
+----
+t
