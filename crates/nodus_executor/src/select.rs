@@ -502,6 +502,15 @@ impl MemExecutor {
                         ProjectionItem::Aggregate(op, inner) => {
                             out_row.push(compute_aggregate(op, inner, &group_rows, &col_names));
                         }
+                        ProjectionItem::Expr { expr, .. } => {
+                            // Evaluate over the group's representative row (correct
+                            // for expressions on grouping columns).
+                            let v = group_rows
+                                .first()
+                                .map(|r| eval_scalar_expr(expr, r, &col_names))
+                                .unwrap_or(Value::Null);
+                            out_row.push(v);
+                        }
                     }
                 }
                 out_rows.push(out_row);
@@ -545,6 +554,9 @@ impl MemExecutor {
                         }
                         ProjectionItem::Aggregate(op, inner) => {
                             format!("{:?}({})", op, inner)
+                        }
+                        ProjectionItem::Expr { alias, .. } => {
+                            alias.clone().unwrap_or_else(|| "?column?".to_string())
                         }
                     })
                     .collect()
@@ -590,13 +602,16 @@ impl MemExecutor {
                                 .unwrap_or(else_column)
                                 .to_string()
                         })),
+                        ProjectionItem::Expr { alias, .. } => {
+                            Some(alias.clone().unwrap_or_else(|| "?column?".to_string()))
+                        }
                         _ => None,
                     })
                     .collect()
             };
 
             // Evaluate Window Functions and Scalar Expressions before projecting
-            for proj_item in projection.iter() {
+            for (proj_idx, proj_item) in projection.iter().enumerate() {
                 match proj_item {
                     ProjectionItem::WindowFunction {
                         func_name,
@@ -869,6 +884,19 @@ impl MemExecutor {
                             .unwrap_or_else(|| format!("{}{}{}", left, operator, right));
                         col_names.push(w_col_name);
                     }
+                    ProjectionItem::Expr { expr, .. } => {
+                        // Compute the expression per row and append it as a
+                        // virtual column keyed by projection position, which the
+                        // `indices` step resolves back by name below.
+                        let vals: Vec<Value> = stored_rows
+                            .iter()
+                            .map(|row| eval_scalar_expr(expr, row, &col_names))
+                            .collect();
+                        for (row, v) in stored_rows.iter_mut().zip(vals) {
+                            row.push(v);
+                        }
+                        col_names.push(format!("__expr_{proj_idx}"));
+                    }
                     _ => {}
                 }
             }
@@ -905,6 +933,7 @@ impl MemExecutor {
                             ProjectionItem::CaseWhenEq {
                                 else_column, alias, ..
                             } => alias.clone().unwrap_or_else(|| else_column.clone()),
+                            ProjectionItem::Expr { .. } => format!("__expr_{}", pi),
                             _ => c.clone(),
                         };
                         col_names.iter().position(|tc| {

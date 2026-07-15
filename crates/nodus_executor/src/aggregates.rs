@@ -91,6 +91,30 @@ pub(crate) fn compute_aggregate(
             }
             acc.unwrap_or(Value::Null)
         }
+        AggregateOp::Avg => {
+            let mut sum = 0f64;
+            let mut count = 0i64;
+            for r in group_rows {
+                if let Some(v) = idx.and_then(|i| r.get(i)) {
+                    match v {
+                        Value::Int(n) => {
+                            sum += *n as f64;
+                            count += 1;
+                        }
+                        Value::Float(f) => {
+                            sum += *f;
+                            count += 1;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if count == 0 {
+                Value::Null
+            } else {
+                Value::Float(sum / count as f64)
+            }
+        }
     }
 }
 

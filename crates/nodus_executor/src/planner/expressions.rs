@@ -388,7 +388,7 @@ fn fold_binary(op: &sqlparser::ast::BinaryOperator, l: Value, r: Value) -> Optio
 
 /// Casts a value to the logical category of `data_type` (INT/FLOAT/BOOL/TEXT).
 /// NodusDB has no distinct NUMERIC type, so NUMERIC/DECIMAL fold to float.
-fn cast_value(v: Value, data_type: &str) -> Value {
+pub(crate) fn cast_value(v: Value, data_type: &str) -> Value {
     use crate::value::ColumnType;
     if matches!(v, Value::Null) {
         return Value::Null;
@@ -476,6 +476,236 @@ fn is_foldable_scalar_fn(name: &str) -> bool {
             | "SUBSTR"
             | "SUBSTRING"
     )
+}
+
+/// Lowers a SQL scalar expression into a serializable [`ScalarExpr`] for
+/// per-row evaluation in a table projection. Returns `None` for forms not yet
+/// supported, so the planner can fall back to its existing handling.
+pub(crate) fn lower_scalar(
+    expr: &sqlparser::ast::Expr,
+    params: &[Value],
+) -> Option<ScalarExpr> {
+    use sqlparser::ast::{BinaryOperator as B, Expr, UnaryOperator as U};
+    match expr {
+        Expr::Value(_) | Expr::Array(_) => expr_to_value(expr, params).map(ScalarExpr::Literal),
+        Expr::Identifier(id) => Some(ScalarExpr::Column(id.value.clone())),
+        Expr::CompoundIdentifier(ids) => Some(ScalarExpr::Column(
+            ids.iter().map(|id| id.value.clone()).collect::<Vec<_>>().join("."),
+        )),
+        Expr::Nested(inner) => lower_scalar(inner, params),
+        Expr::UnaryOp { op, expr: inner } => {
+            let e = lower_scalar(inner, params)?;
+            let op = match op {
+                U::Minus => ScalarUnaryOp::Neg,
+                U::Not => ScalarUnaryOp::Not,
+                U::Plus => return Some(e),
+                _ => return None,
+            };
+            Some(ScalarExpr::Unary {
+                op,
+                expr: Box::new(e),
+            })
+        }
+        Expr::BinaryOp { left, op, right } => {
+            let op = match op {
+                B::Plus => ScalarBinaryOp::Add,
+                B::Minus => ScalarBinaryOp::Sub,
+                B::Multiply => ScalarBinaryOp::Mul,
+                B::Divide => ScalarBinaryOp::Div,
+                B::Modulo => ScalarBinaryOp::Mod,
+                B::Eq => ScalarBinaryOp::Eq,
+                B::NotEq => ScalarBinaryOp::NotEq,
+                B::Lt => ScalarBinaryOp::Lt,
+                B::LtEq => ScalarBinaryOp::LtEq,
+                B::Gt => ScalarBinaryOp::Gt,
+                B::GtEq => ScalarBinaryOp::GtEq,
+                B::And => ScalarBinaryOp::And,
+                B::Or => ScalarBinaryOp::Or,
+                B::StringConcat => ScalarBinaryOp::Concat,
+                // JSON arrows and everything else stay on their existing paths.
+                _ => return None,
+            };
+            Some(ScalarExpr::Binary {
+                op,
+                left: Box::new(lower_scalar(left, params)?),
+                right: Box::new(lower_scalar(right, params)?),
+            })
+        }
+        Expr::Cast {
+            expr: inner,
+            data_type,
+            ..
+        } => Some(ScalarExpr::Cast {
+            expr: Box::new(lower_scalar(inner, params)?),
+            target: data_type.to_string(),
+        }),
+        Expr::IsNull(inner) => Some(ScalarExpr::IsNull {
+            expr: Box::new(lower_scalar(inner, params)?),
+            negated: false,
+        }),
+        Expr::IsNotNull(inner) => Some(ScalarExpr::IsNull {
+            expr: Box::new(lower_scalar(inner, params)?),
+            negated: true,
+        }),
+        Expr::Function(func) => {
+            use sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArguments};
+            let name = func.name.to_string().to_uppercase();
+            if !is_foldable_scalar_fn(&name) {
+                return None;
+            }
+            let FunctionArguments::List(list) = &func.args else {
+                return None;
+            };
+            let mut args = Vec::with_capacity(list.args.len());
+            for a in &list.args {
+                match a {
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => {
+                        args.push(lower_scalar(e, params)?)
+                    }
+                    _ => return None,
+                }
+            }
+            Some(ScalarExpr::Function { name, args })
+        }
+        _ => None,
+    }
+}
+
+/// Evaluates a [`ScalarExpr`] against one row (column values in `col_names`
+/// order). Unresolvable columns and type-invalid operations yield `Null`.
+pub(crate) fn eval_scalar_expr(expr: &ScalarExpr, row: &[Value], col_names: &[String]) -> Value {
+    match expr {
+        ScalarExpr::Literal(v) => v.clone(),
+        ScalarExpr::Column(name) => col_names
+            .iter()
+            .position(|c| c == name || c.ends_with(&format!(".{name}")))
+            .and_then(|i| row.get(i))
+            .cloned()
+            .unwrap_or(Value::Null),
+        ScalarExpr::Unary { op, expr } => apply_unary_op(*op, eval_scalar_expr(expr, row, col_names)),
+        ScalarExpr::Binary { op, left, right } => apply_binary_op(
+            *op,
+            eval_scalar_expr(left, row, col_names),
+            eval_scalar_expr(right, row, col_names),
+        ),
+        ScalarExpr::Cast { expr, target } => {
+            cast_value(eval_scalar_expr(expr, row, col_names), target)
+        }
+        ScalarExpr::Function { name, args } => {
+            let vals: Vec<Value> = args
+                .iter()
+                .map(|a| eval_scalar_expr(a, row, col_names))
+                .collect();
+            eval_scalar_function(name, &vals)
+        }
+        ScalarExpr::IsNull { expr, negated } => {
+            let is_null = matches!(eval_scalar_expr(expr, row, col_names), Value::Null);
+            Value::Bool(if *negated { !is_null } else { is_null })
+        }
+    }
+}
+
+/// Applies a unary operator to a value; type-invalid combinations yield `Null`.
+pub(crate) fn apply_unary_op(op: ScalarUnaryOp, v: Value) -> Value {
+    match (op, v) {
+        (ScalarUnaryOp::Neg, Value::Int(i)) => Value::Int(-i),
+        (ScalarUnaryOp::Neg, Value::Float(f)) => Value::Float(-f),
+        (ScalarUnaryOp::Not, Value::Bool(b)) => Value::Bool(!b),
+        (_, Value::Null) => Value::Null,
+        _ => Value::Null,
+    }
+}
+
+/// Applies a binary operator to two values with SQL NULL propagation and
+/// three-valued logic; type-invalid combinations yield `Null`.
+pub(crate) fn apply_binary_op(op: ScalarBinaryOp, l: Value, r: Value) -> Value {
+    use ScalarBinaryOp as Op;
+    let as_f64 = |v: &Value| -> Option<f64> {
+        match v {
+            Value::Int(i) => Some(*i as f64),
+            Value::Float(f) => Some(*f),
+            _ => None,
+        }
+    };
+    match op {
+        Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Mod => {
+            if matches!(l, Value::Null) || matches!(r, Value::Null) {
+                return Value::Null;
+            }
+            if let (Value::Int(a), Value::Int(b)) = (&l, &r) {
+                let out = match op {
+                    Op::Add => a.checked_add(*b),
+                    Op::Sub => a.checked_sub(*b),
+                    Op::Mul => a.checked_mul(*b),
+                    Op::Div if *b != 0 => Some(a / b),
+                    Op::Mod if *b != 0 => Some(a % b),
+                    Op::Div | Op::Mod => return Value::Null, // division by zero
+                    _ => return Value::Null,
+                };
+                out.map(Value::Int).unwrap_or(Value::Null)
+            } else {
+                let (Some(a), Some(b)) = (as_f64(&l), as_f64(&r)) else {
+                    return Value::Null;
+                };
+                match op {
+                    Op::Add => Value::Float(a + b),
+                    Op::Sub => Value::Float(a - b),
+                    Op::Mul => Value::Float(a * b),
+                    Op::Div if b != 0.0 => Value::Float(a / b),
+                    Op::Mod if b != 0.0 => Value::Float(a % b),
+                    _ => Value::Null,
+                }
+            }
+        }
+        Op::Eq | Op::NotEq | Op::Lt | Op::LtEq | Op::Gt | Op::GtEq => {
+            if matches!(l, Value::Null) || matches!(r, Value::Null) {
+                return Value::Null;
+            }
+            use std::cmp::Ordering::{Greater, Less};
+            let ord = compare(&l, &r);
+            Value::Bool(match op {
+                Op::Eq => values_equal(&l, &r),
+                Op::NotEq => !values_equal(&l, &r),
+                Op::Lt => ord == Less,
+                Op::LtEq => ord != Greater,
+                Op::Gt => ord == Greater,
+                Op::GtEq => ord != Less,
+                _ => return Value::Null,
+            })
+        }
+        Op::Concat => {
+            if matches!(l, Value::Null) || matches!(r, Value::Null) {
+                Value::Null
+            } else {
+                Value::Text(format!("{}{}", render(&l), render(&r)))
+            }
+        }
+        Op::And | Op::Or => {
+            let lb = match l {
+                Value::Bool(b) => Some(b),
+                Value::Null => None,
+                _ => return Value::Null,
+            };
+            let rb = match r {
+                Value::Bool(b) => Some(b),
+                Value::Null => None,
+                _ => return Value::Null,
+            };
+            match op {
+                Op::And => match (lb, rb) {
+                    (Some(false), _) | (_, Some(false)) => Value::Bool(false),
+                    (Some(true), Some(true)) => Value::Bool(true),
+                    _ => Value::Null,
+                },
+                Op::Or => match (lb, rb) {
+                    (Some(true), _) | (_, Some(true)) => Value::Bool(true),
+                    (Some(false), Some(false)) => Value::Bool(false),
+                    _ => Value::Null,
+                },
+                _ => Value::Null,
+            }
+        }
+    }
 }
 
 /// Extracts a window/scalar function's arguments as strings: column names via

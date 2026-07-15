@@ -113,6 +113,65 @@ pub enum AggregateOp {
     Sum,
     Min,
     Max,
+    // New variants are appended so older serialized plans still decode.
+    Avg,
+}
+
+/// A general scalar expression tree for computed SELECT-list items. Kept
+/// serializable (it rides on the replicated `LogicalPlan`); new variants are
+/// appended so older encodings still decode.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum ScalarExpr {
+    Literal(Value),
+    /// A column reference, resolved by name against the row at evaluation time.
+    Column(String),
+    Unary {
+        op: ScalarUnaryOp,
+        expr: Box<ScalarExpr>,
+    },
+    Binary {
+        op: ScalarBinaryOp,
+        left: Box<ScalarExpr>,
+        right: Box<ScalarExpr>,
+    },
+    /// `expr::target` — `target` is the SQL type name (e.g. `FLOAT8`).
+    Cast {
+        expr: Box<ScalarExpr>,
+        target: String,
+    },
+    /// A scalar function call; `name` is upper-cased.
+    Function {
+        name: String,
+        args: Vec<ScalarExpr>,
+    },
+    IsNull {
+        expr: Box<ScalarExpr>,
+        negated: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum ScalarUnaryOp {
+    Neg,
+    Not,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum ScalarBinaryOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+    Eq,
+    NotEq,
+    Lt,
+    LtEq,
+    Gt,
+    GtEq,
+    And,
+    Or,
+    Concat,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -160,6 +219,13 @@ pub enum ProjectionItem {
     },
     Literal(crate::Value),
     AliasedLiteral(crate::Value, String),
+    /// A computed scalar expression over the row (arithmetic, comparisons,
+    /// casts, string ops, nested function calls). Appended last so older
+    /// serialized plans still decode.
+    Expr {
+        expr: ScalarExpr,
+        alias: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

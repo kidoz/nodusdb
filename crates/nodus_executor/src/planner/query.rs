@@ -359,12 +359,13 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
                         projection.push(ProjectionItem::Column(fname));
                     } else {
                         match fname.as_str() {
-                            "COUNT" | "SUM" | "MIN" | "MAX" => {
+                            "COUNT" | "SUM" | "MIN" | "MAX" | "AVG" => {
                                 let op = match fname.as_str() {
                                     "COUNT" => AggregateOp::Count,
                                     "SUM" => AggregateOp::Sum,
                                     "MIN" => AggregateOp::Min,
                                     "MAX" => AggregateOp::Max,
+                                    "AVG" => AggregateOp::Avg,
                                     _ => unreachable!(),
                                 };
                                 let first_arg = match &func.args {
@@ -471,6 +472,22 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
                         args: substring_args(inner, substring_from, substring_for, params),
                         alias: None,
                     });
+                } else if matches!(
+                    expr,
+                    Expr::Cast { .. }
+                        | Expr::BinaryOp { .. }
+                        | Expr::UnaryOp { .. }
+                        | Expr::IsNull(_)
+                        | Expr::IsNotNull(_)
+                ) && let Some(scalar) = lower_scalar(expr, params)
+                {
+                    // Computed target-list expression over the row (arithmetic,
+                    // comparisons, casts, string concat). Placed before the
+                    // column check so `col::type` keeps its cast.
+                    projection.push(ProjectionItem::Expr {
+                        expr: scalar,
+                        alias: None,
+                    });
                 } else if let Some(col) = extract_col_name(expr) {
                     projection.push(ProjectionItem::Column(col));
                 } else if let Some(val) = expr_to_value(expr, params) {
@@ -518,12 +535,13 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
                         projection.push(ProjectionItem::AliasedColumn(fname, alias.value.clone()));
                     } else {
                         match fname.as_str() {
-                            "COUNT" | "SUM" | "MIN" | "MAX" => {
+                            "COUNT" | "SUM" | "MIN" | "MAX" | "AVG" => {
                                 let op = match fname.as_str() {
                                     "COUNT" => AggregateOp::Count,
                                     "SUM" => AggregateOp::Sum,
                                     "MIN" => AggregateOp::Min,
                                     "MAX" => AggregateOp::Max,
+                                    "AVG" => AggregateOp::Avg,
                                     _ => unreachable!(),
                                 };
                                 let first_arg = match &func.args {
@@ -631,6 +649,19 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
                     projection.push(ProjectionItem::ScalarFunction {
                         func_name: "SUBSTR".to_string(),
                         args: substring_args(inner, substring_from, substring_for, params),
+                        alias: Some(alias.value.clone()),
+                    });
+                } else if matches!(
+                    expr,
+                    Expr::Cast { .. }
+                        | Expr::BinaryOp { .. }
+                        | Expr::UnaryOp { .. }
+                        | Expr::IsNull(_)
+                        | Expr::IsNotNull(_)
+                ) && let Some(scalar) = lower_scalar(expr, params)
+                {
+                    projection.push(ProjectionItem::Expr {
+                        expr: scalar,
                         alias: Some(alias.value.clone()),
                     });
                 } else if let Some(col) = extract_col_name(expr) {

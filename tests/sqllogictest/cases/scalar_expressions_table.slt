@@ -1,0 +1,95 @@
+# Phase 1 (Increment 2): computed expressions in the SELECT list OVER A TABLE.
+# Before the ScalarExpr projection path, `a+b`/`a=b` errored and `a::float8`
+# silently dropped the cast. PostgreSQL results are asserted here.
+
+statement ok
+CREATE TABLE nums (a INT, b INT, name TEXT);
+
+statement ok
+INSERT INTO nums VALUES (2, 2, 'alice'), (4, 1, 'bob'), (6, 3, 'carol');
+
+# --- arithmetic over columns ---
+query I
+SELECT a + b FROM nums ORDER BY a;
+----
+4
+5
+9
+
+query I
+SELECT a * b FROM nums ORDER BY a;
+----
+4
+4
+18
+
+query I
+SELECT a - b FROM nums ORDER BY a;
+----
+0
+3
+3
+
+query I
+SELECT a + 1 AS s FROM nums ORDER BY a;
+----
+3
+5
+7
+
+# --- comparisons over columns yield booleans ---
+query B
+SELECT a = b FROM nums ORDER BY a;
+----
+t
+f
+f
+
+query B
+SELECT a > b FROM nums ORDER BY a;
+----
+f
+t
+t
+
+# --- cast over a column is applied (was silently dropped) ---
+query R
+SELECT a::float8 FROM nums ORDER BY a;
+----
+2
+4
+6
+
+# --- functions & string concat over columns ---
+query T
+SELECT upper(name) FROM nums ORDER BY a;
+----
+ALICE
+BOB
+CAROL
+
+query T
+SELECT name || '!' FROM nums ORDER BY a;
+----
+alice!
+bob!
+carol!
+
+# --- nested: function inside arithmetic/concat ---
+query T
+SELECT upper(name) || '?' FROM nums ORDER BY a;
+----
+ALICE?
+BOB?
+CAROL?
+
+# --- avg() (previously returned NULL) plus other aggregates ---
+query R
+SELECT avg(a) FROM nums;
+----
+4
+
+query II
+SELECT sum(a), count(*) FROM nums;
+----
+12	3
