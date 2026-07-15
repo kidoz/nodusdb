@@ -1,0 +1,185 @@
+# Phase 1 (broadened): more scalar-type edge cases, all FROM-less and matching
+# PostgreSQL. Deliberately excludes NodusDB<->PG divergences (bigint overflow,
+# division by zero, integer->boolean casts, half-to-even rounding, bool::text).
+
+# --- mixed int/float arithmetic promotes to float ---
+query R
+SELECT 1 + 2.5;
+----
+3.5
+
+query R
+SELECT 3 * 1.5;
+----
+4.5
+
+query R
+SELECT 10 / 4.0;
+----
+2.5
+
+query I
+SELECT 7 / 2;
+----
+3
+
+query I
+SELECT 7 % 3;
+----
+1
+
+# --- precedence & nesting ---
+query I
+SELECT (2 + 3) * 4;
+----
+20
+
+query I
+SELECT 2 + 3 * 4;
+----
+14
+
+query I
+SELECT 2 * 3 + 4 * 5;
+----
+26
+
+query I
+SELECT -(-5);
+----
+5
+
+# --- mixed-type numeric comparison ---
+query B
+SELECT 2.0 = 2;
+----
+t
+
+query B
+SELECT 1 < 2.0;
+----
+t
+
+query B
+SELECT 1 < 2 AND 2 < 3;
+----
+t
+
+# --- three-valued boolean logic with NULL ---
+query B
+SELECT true AND NULL;
+----
+NULL
+
+query B
+SELECT false AND NULL;
+----
+f
+
+query B
+SELECT true OR NULL;
+----
+t
+
+query B
+SELECT false OR NULL;
+----
+NULL
+
+query B
+SELECT NOT (1 = 1);
+----
+f
+
+# --- string functions ---
+query I
+SELECT length('database');
+----
+8
+
+# NOTE: trim()/substr() are intentionally omitted here — sqlparser parses them
+# as dedicated Expr::Trim/Expr::Substring nodes (not Expr::Function), which the
+# FROM-less constant-folder does not yet handle (returns int4 0). Tracked as a
+# follow-up gap.
+
+query T
+SELECT replace('aaa', 'a', 'b');
+----
+bbb
+
+query R
+SELECT round(3.14159, 2);
+----
+3.14
+
+query T
+SELECT concat('a', 'b', 'c');
+----
+abc
+
+query T
+SELECT lower('ABC') || upper('xyz');
+----
+abcXYZ
+
+query T
+SELECT coalesce(NULL, NULL, 'z');
+----
+z
+
+query I
+SELECT nullif(5, 6);
+----
+5
+
+query I
+SELECT nullif(5, 5);
+----
+NULL
+
+# --- casts (PG-compatible directions only) ---
+query I
+SELECT '42'::int;
+----
+42
+
+query R
+SELECT '3.14'::float8;
+----
+3.14
+
+query B
+SELECT 't'::bool;
+----
+t
+
+query B
+SELECT 'false'::bool;
+----
+f
+
+query I
+SELECT 3.7::int;
+----
+4
+
+query T
+SELECT 100::text;
+----
+100
+
+# --- IS [NOT] NULL ---
+query B
+SELECT NULL IS NULL;
+----
+t
+
+query B
+SELECT 'x' IS NOT NULL;
+----
+t
+
+query B
+SELECT NULL IS NOT NULL;
+----
+f
