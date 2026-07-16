@@ -125,6 +125,25 @@ impl MemExecutor {
                     .get_table(db_name, schema_name, table_only)?;
                 self.authorize(ctx, Action::Select, ResourceRef::Table(tbl.id))?;
 
+                // Reject a bare reference to a non-existent column on a single
+                // user table (rather than silently projecting NULL). Scoped
+                // narrowly on purpose: virtual/catalog schemas (which driver
+                // introspection relies on) took the branch above, and joins /
+                // computed expressions are left lenient to avoid false positives.
+                if joins.is_empty() {
+                    let known: std::collections::HashSet<&str> =
+                        tbl.columns.iter().map(|c| c.name.as_str()).collect();
+                    for item in &projection {
+                        if let ProjectionItem::Column(c) | ProjectionItem::AliasedColumn(c, _) = item
+                        {
+                            let bare = c.rsplit('.').next().unwrap_or(c);
+                            if !known.contains(bare) {
+                                anyhow::bail!("column \"{bare}\" does not exist");
+                            }
+                        }
+                    }
+                }
+
                 let prefix = table_alias.as_deref().unwrap_or(&table_name);
                 let col_names: Vec<String> = tbl
                     .columns

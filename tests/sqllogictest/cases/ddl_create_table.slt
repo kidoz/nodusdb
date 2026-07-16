@@ -11,6 +11,10 @@ SELECT id, name, active, score FROM t1;
 ----
 1	alice	t	9.5
 
+# selecting a column that does not exist errors (rather than projecting NULL)
+statement error
+SELECT missing_col FROM t1;
+
 # CREATE TABLE IF NOT EXISTS is idempotent (does not clobber t1)
 statement ok
 CREATE TABLE IF NOT EXISTS t1 (id INT);

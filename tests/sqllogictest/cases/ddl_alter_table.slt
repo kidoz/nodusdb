@@ -32,8 +32,10 @@ SELECT renamed_a FROM t WHERE id = 1;
 statement ok
 ALTER TABLE t DROP COLUMN b;
 
-# NodusDB does not error on selecting an unknown/dropped column (lenient
-# projection yields NULL), so verify the drop via the surviving columns.
+# the dropped column is no longer selectable
+statement error
+SELECT b FROM t;
+
 query II
 SELECT id, renamed_a FROM t ORDER BY id;
 ----
