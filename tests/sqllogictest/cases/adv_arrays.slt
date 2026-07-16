@@ -1,0 +1,25 @@
+# Phase 6 (advanced): arrays.
+
+# array literal
+query T
+SELECT ARRAY[1, 2, 3];
+----
+{1,2,3}
+
+statement ok
+CREATE TABLE arr (id INT PRIMARY KEY, tags TEXT[]);
+
+statement ok
+INSERT INTO arr VALUES (1, '{a,b,c}'), (2, '{x,y}');
+
+# round-trip an array column
+query T
+SELECT tags FROM arr WHERE id = 1;
+----
+{a,b,c}
+
+# array containment (@>)
+query I rowsort
+SELECT id FROM arr WHERE tags @> '{a}';
+----
+1
