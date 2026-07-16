@@ -33,6 +33,13 @@ pub fn expr_to_value(expr: &sqlparser::ast::Expr, params: &[crate::Value]) -> Op
             _ => None,
         },
         Expr::Identifier(id) => Some(crate::Value::Text(id.value.clone())),
+        // Typed string literals like `DATE '2024-06-15'` / `TIMESTAMP '...'`.
+        // NodusDB has no native temporal type, so the value is kept as text
+        // (ISO-8601 text compares/sorts chronologically).
+        Expr::TypedString(ts) => match &ts.value.value {
+            SqlValue::SingleQuotedString(s) => Some(crate::Value::Text(s.clone())),
+            _ => None,
+        },
         Expr::Array(sqlparser::ast::Array { elem, .. }) => {
             let mut arr = Vec::new();
             for e in elem {

@@ -1,0 +1,80 @@
+# Phase 2 (date/time): NodusDB has no native temporal type (values live as text),
+# so this characterizes what works. ISO-8601 dates compare/sort lexically the
+# same as chronologically, so ranges and ordering are expected to work.
+
+statement ok
+CREATE TABLE events (id INT PRIMARY KEY, d DATE, ts TIMESTAMP);
+
+statement ok
+INSERT INTO events VALUES (1, '2024-01-15', '2024-01-15 10:30:00'), (2, '2024-03-20', '2024-03-20 14:00:00'), (3, '2023-12-01', '2023-12-01 08:15:00');
+
+# round-trip a DATE column
+query IT
+SELECT id, d FROM events ORDER BY id;
+----
+1	2024-01-15
+2	2024-03-20
+3	2023-12-01
+
+# round-trip a TIMESTAMP column
+query T
+SELECT ts FROM events WHERE id = 1;
+----
+2024-01-15 10:30:00
+
+# range filter (ISO text compares chronologically)
+query I rowsort
+SELECT id FROM events WHERE d > '2024-01-01';
+----
+1
+2
+
+# ORDER BY a date column
+query I
+SELECT id FROM events ORDER BY d;
+----
+3
+1
+2
+
+# BETWEEN on dates
+query I rowsort
+SELECT id FROM events WHERE d BETWEEN '2024-01-01' AND '2024-02-01';
+----
+1
+
+# NOT BETWEEN
+query I rowsort
+SELECT id FROM events WHERE d NOT BETWEEN '2024-01-01' AND '2024-02-01';
+----
+2
+3
+
+# a DATE literal as a WHERE operand
+query I rowsort
+SELECT id FROM events WHERE d > DATE '2024-01-01';
+----
+1
+2
+
+# MIN / MAX over dates
+query TT
+SELECT min(d), max(d) FROM events;
+----
+2023-12-01	2024-03-20
+
+# cast text -> date
+query T
+SELECT '2024-06-15'::date;
+----
+2024-06-15
+
+# DATE typed literal
+query T
+SELECT DATE '2024-06-15';
+----
+2024-06-15
+
+# NOT covered (no native temporal type): EXTRACT / date_part, date +/- interval
+# arithmetic, INTERVAL literals, and functions like age()/date_trunc(). These
+# need a real date/timestamp Value variant and are out of scope here.
