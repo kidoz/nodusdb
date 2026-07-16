@@ -137,6 +137,53 @@ pub(crate) fn parse_aggregate_key(key: &str) -> Option<(AggregateOp, String)> {
     Some((op, arg))
 }
 
+/// Evaluates a scalar expression over an aggregated group: `Aggregate` nodes
+/// compute over `group_rows`; a `Column` reads the group's representative
+/// (first) row. Enables `sum(a) + 1`, `count(*) * 2`, etc.
+pub(crate) fn eval_scalar_expr_grouped(
+    expr: &ScalarExpr,
+    group_rows: &[Vec<Value>],
+    col_names: &[String],
+) -> Value {
+    use crate::planner::{apply_binary_op, apply_unary_op, cast_value, extract_datetime_field};
+    match expr {
+        ScalarExpr::Aggregate { op, arg } => compute_aggregate(op, arg, group_rows, col_names),
+        ScalarExpr::Literal(v) => v.clone(),
+        ScalarExpr::Column(name) => col_names
+            .iter()
+            .position(|c| c == name || c.ends_with(&format!(".{name}")))
+            .and_then(|i| group_rows.first().and_then(|r| r.get(i)))
+            .cloned()
+            .unwrap_or(Value::Null),
+        ScalarExpr::Unary { op, expr } => {
+            apply_unary_op(*op, eval_scalar_expr_grouped(expr, group_rows, col_names))
+        }
+        ScalarExpr::Binary { op, left, right } => apply_binary_op(
+            *op,
+            eval_scalar_expr_grouped(left, group_rows, col_names),
+            eval_scalar_expr_grouped(right, group_rows, col_names),
+        ),
+        ScalarExpr::Cast { expr, target } => {
+            cast_value(eval_scalar_expr_grouped(expr, group_rows, col_names), target)
+        }
+        ScalarExpr::Function { name, args } => {
+            let vals: Vec<Value> = args
+                .iter()
+                .map(|a| eval_scalar_expr_grouped(a, group_rows, col_names))
+                .collect();
+            crate::eval_scalar_function(name, &vals)
+        }
+        ScalarExpr::IsNull { expr, negated } => {
+            let is_null =
+                matches!(eval_scalar_expr_grouped(expr, group_rows, col_names), Value::Null);
+            Value::Bool(if *negated { !is_null } else { is_null })
+        }
+        ScalarExpr::Extract { field, expr } => {
+            extract_datetime_field(&eval_scalar_expr_grouped(expr, group_rows, col_names), field)
+        }
+    }
+}
+
 /// Resolves a HAVING reference (aggregate key or group column) to a value.
 pub(crate) fn having_value(
     name: &str,

@@ -38,3 +38,21 @@ query T rowsort
 SELECT region FROM sales GROUP BY region HAVING count(*) > 2;
 ----
 east
+
+# expression over an aggregate, grouped
+query TI rowsort
+SELECT region, sum(amount) + 1 FROM sales GROUP BY region;
+----
+east	301
+west	301
+
+# aggregate arithmetic over the whole table
+query I
+SELECT sum(amount) * 2 FROM sales;
+----
+1200
+
+query R
+SELECT avg(amount) + 10 FROM sales;
+----
+130

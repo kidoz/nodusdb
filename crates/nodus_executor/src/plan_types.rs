@@ -159,6 +159,12 @@ pub enum ScalarExpr {
         field: String,
         expr: Box<ScalarExpr>,
     },
+    /// An aggregate call (e.g. `sum(a)`) nested inside a scalar expression such
+    /// as `sum(a) + 1`; evaluated over a group, not a single row.
+    Aggregate {
+        op: AggregateOp,
+        arg: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]

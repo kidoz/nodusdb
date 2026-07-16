@@ -609,6 +609,18 @@ pub(crate) fn lower_scalar(
         Expr::Function(func) => {
             use sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArguments};
             let name = func.name.to_string().to_uppercase();
+            // An aggregate nested in an expression, e.g. `sum(a) + 1`.
+            if let Some(op) = aggregate_op(&name) {
+                let FunctionArguments::List(list) = &func.args else {
+                    return None;
+                };
+                let arg = match list.args.first() {
+                    Some(FunctionArg::Unnamed(FunctionArgExpr::Wildcard)) => "*".to_string(),
+                    Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(e))) => extract_col_name(e)?,
+                    _ => return None,
+                };
+                return Some(ScalarExpr::Aggregate { op, arg });
+            }
             if !is_foldable_scalar_fn(&name) {
                 return None;
             }
@@ -714,6 +726,37 @@ pub(crate) fn eval_scalar_expr(expr: &ScalarExpr, row: &[Value], col_names: &[St
         ScalarExpr::Extract { field, expr } => {
             extract_datetime_field(&eval_scalar_expr(expr, row, col_names), field)
         }
+        // Aggregates are only meaningful over a group; per-row eval yields NULL.
+        ScalarExpr::Aggregate { .. } => Value::Null,
+    }
+}
+
+/// Maps an aggregate function name to its [`AggregateOp`].
+fn aggregate_op(name: &str) -> Option<AggregateOp> {
+    match name {
+        "COUNT" => Some(AggregateOp::Count),
+        "SUM" => Some(AggregateOp::Sum),
+        "MIN" => Some(AggregateOp::Min),
+        "MAX" => Some(AggregateOp::Max),
+        "AVG" => Some(AggregateOp::Avg),
+        _ => None,
+    }
+}
+
+/// True if a scalar expression contains an aggregate call, so a query using it
+/// must go through the grouping/aggregation path.
+pub(crate) fn scalar_has_aggregate(expr: &ScalarExpr) -> bool {
+    match expr {
+        ScalarExpr::Aggregate { .. } => true,
+        ScalarExpr::Unary { expr, .. }
+        | ScalarExpr::Cast { expr, .. }
+        | ScalarExpr::IsNull { expr, .. }
+        | ScalarExpr::Extract { expr, .. } => scalar_has_aggregate(expr),
+        ScalarExpr::Binary { left, right, .. } => {
+            scalar_has_aggregate(left) || scalar_has_aggregate(right)
+        }
+        ScalarExpr::Function { args, .. } => args.iter().any(scalar_has_aggregate),
+        ScalarExpr::Literal(_) | ScalarExpr::Column(_) => false,
     }
 }
 

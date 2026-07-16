@@ -403,9 +403,12 @@ impl MemExecutor {
 
         // GROUP BY & Aggregation
         let is_agg = !group_by.is_empty()
-            || projection
-                .iter()
-                .any(|p| matches!(p, ProjectionItem::Aggregate(_, _)));
+            || projection.iter().any(|p| match p {
+                ProjectionItem::Aggregate(_, _) => true,
+                // An expression like `sum(a) + 1` also forces the grouping path.
+                ProjectionItem::Expr { expr, .. } => scalar_has_aggregate(expr),
+                _ => false,
+            });
 
         if !is_agg {
             if !order_by.is_empty() {
@@ -503,13 +506,9 @@ impl MemExecutor {
                             out_row.push(compute_aggregate(op, inner, &group_rows, &col_names));
                         }
                         ProjectionItem::Expr { expr, .. } => {
-                            // Evaluate over the group's representative row (correct
-                            // for expressions on grouping columns).
-                            let v = group_rows
-                                .first()
-                                .map(|r| eval_scalar_expr(expr, r, &col_names))
-                                .unwrap_or(Value::Null);
-                            out_row.push(v);
+                            // Group-aware eval: aggregates compute over the group,
+                            // plain columns read the group's first row.
+                            out_row.push(eval_scalar_expr_grouped(expr, &group_rows, &col_names));
                         }
                     }
                 }

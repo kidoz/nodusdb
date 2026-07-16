@@ -39,7 +39,7 @@ pub use plan_types::{
     AggregateOp, AlterTableOp, CompareOp, FilterExpr, Join, JoinType, LogicalPlan, Operand,
     Predicate, ProjectionItem, ScalarBinaryOp, ScalarExpr, ScalarUnaryOp, SetOpKind, TableFnSpec,
 };
-pub(crate) use planner::{eval_scalar_expr, parse_filter_expr};
+pub(crate) use planner::{eval_scalar_expr, parse_filter_expr, scalar_has_aggregate};
 pub use planner::{expr_to_value, parse_object_name, plan_statement};
 pub use value::{ColumnDef, Value};
 pub(crate) use value::{
