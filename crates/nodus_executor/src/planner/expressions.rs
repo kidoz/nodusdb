@@ -242,7 +242,7 @@ pub(crate) fn fold_scalar(expr: &sqlparser::ast::Expr, params: &[Value]) -> Opti
     use sqlparser::ast::{BinaryOperator as B, Expr, UnaryOperator as U};
     match expr {
         // True literals only; a bare identifier is not a constant.
-        Expr::Value(_) | Expr::Array(_) => expr_to_value(expr, params),
+        Expr::Value(_) | Expr::Array(_) | Expr::TypedString(_) => expr_to_value(expr, params),
         Expr::Nested(inner) => fold_scalar(inner, params),
         Expr::UnaryOp { op, expr: inner } => {
             let v = fold_scalar(inner, params)?;
@@ -538,6 +538,8 @@ fn is_foldable_scalar_fn(name: &str) -> bool {
             | "REPLACE"
             | "SUBSTR"
             | "SUBSTRING"
+            | "DATE_TRUNC"
+            | "AGE"
     )
 }
 

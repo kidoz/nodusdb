@@ -133,4 +133,36 @@ SELECT d + INTERVAL '1 month' FROM events WHERE id = 1;
 ----
 2024-02-15
 
-# NOT covered: age()/date_trunc() and interval-typed columns.
+# date_trunc
+query T
+SELECT date_trunc('month', TIMESTAMP '2024-03-15 10:30:00');
+----
+2024-03-01 00:00:00
+
+query T
+SELECT date_trunc('year', DATE '2024-06-15');
+----
+2024-01-01 00:00:00
+
+query T
+SELECT date_trunc('hour', TIMESTAMP '2024-03-15 10:30:45');
+----
+2024-03-15 10:00:00
+
+# age (calendar interval, PostgreSQL text form)
+query T
+SELECT age(DATE '2024-03-15', DATE '2024-01-15');
+----
+2 mons
+
+query T
+SELECT age(DATE '2025-01-15', DATE '2024-01-15');
+----
+1 year
+
+query T
+SELECT age(DATE '2024-01-20', DATE '2024-01-15');
+----
+5 days
+
+# NOT covered: interval-typed columns (a column declared INTERVAL).

@@ -259,8 +259,112 @@ pub(crate) fn eval_scalar_function(name: &str, args: &[Value]) -> Value {
             };
             Value::Text(out)
         }
+        "DATE_TRUNC" => {
+            match (args.first().and_then(&as_text), args.get(1).and_then(&as_text)) {
+                (Some(unit), Some(ts)) => date_trunc_text(&unit, &ts),
+                _ => Value::Null,
+            }
+        }
+        "AGE" => match (args.first().and_then(&as_text), args.get(1).and_then(&as_text)) {
+            (Some(a), Some(b)) => age_text(&a, &b),
+            _ => Value::Null,
+        },
         _ => Value::Null,
     }
+}
+
+/// Parses an ISO date or timestamp text into a `NaiveDateTime` (a bare date
+/// becomes midnight).
+fn parse_naive_dt(s: &str) -> Option<chrono::NaiveDateTime> {
+    let s = s.trim();
+    chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
+        .ok()
+        .or_else(|| {
+            chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+                .ok()
+                .and_then(|d| d.and_hms_opt(0, 0, 0))
+        })
+}
+
+/// `date_trunc(unit, ts)` — truncates to year/month/day/hour/minute/second and
+/// returns a timestamp text (PostgreSQL semantics).
+fn date_trunc_text(unit: &str, ts: &str) -> Value {
+    use chrono::{Datelike, NaiveDate, Timelike};
+    let Some(dt) = parse_naive_dt(ts) else {
+        return Value::Null;
+    };
+    let d = dt.date();
+    let out = match unit.to_ascii_lowercase().as_str() {
+        "year" => NaiveDate::from_ymd_opt(d.year(), 1, 1).and_then(|x| x.and_hms_opt(0, 0, 0)),
+        "month" => {
+            NaiveDate::from_ymd_opt(d.year(), d.month(), 1).and_then(|x| x.and_hms_opt(0, 0, 0))
+        }
+        "day" => d.and_hms_opt(0, 0, 0),
+        "hour" => d.and_hms_opt(dt.hour(), 0, 0),
+        "minute" => d.and_hms_opt(dt.hour(), dt.minute(), 0),
+        "second" => d.and_hms_opt(dt.hour(), dt.minute(), dt.second()),
+        _ => return Value::Null,
+    };
+    out.map(|x| Value::Text(x.format("%Y-%m-%d %H:%M:%S").to_string()))
+        .unwrap_or(Value::Null)
+}
+
+fn days_in_month(year: i32, month: u32) -> i64 {
+    let (ny, nm) = if month == 12 {
+        (year + 1, 1)
+    } else {
+        (year, month + 1)
+    };
+    match (
+        chrono::NaiveDate::from_ymd_opt(year, month, 1),
+        chrono::NaiveDate::from_ymd_opt(ny, nm, 1),
+    ) {
+        (Some(a), Some(b)) => (b - a).num_days(),
+        _ => 30,
+    }
+}
+
+/// `age(a, b)` — the calendar interval `a - b`, decomposed into years/months/
+/// days with PostgreSQL-style borrowing, rendered as e.g. `1 year 2 mons`.
+fn age_text(a: &str, b: &str) -> Value {
+    use chrono::Datelike;
+    let (Some(da), Some(db)) = (
+        parse_naive_dt(a).map(|x| x.date()),
+        parse_naive_dt(b).map(|x| x.date()),
+    ) else {
+        return Value::Null;
+    };
+    let mut years = da.year() - db.year();
+    let mut months = da.month() as i32 - db.month() as i32;
+    let mut days = da.day() as i32 - db.day() as i32;
+    if days < 0 {
+        let (py, pm) = if da.month() == 1 {
+            (da.year() - 1, 12)
+        } else {
+            (da.year(), da.month() - 1)
+        };
+        days += days_in_month(py, pm) as i32;
+        months -= 1;
+    }
+    if months < 0 {
+        months += 12;
+        years -= 1;
+    }
+    let mut parts = Vec::new();
+    let unit = |n: i32, s: &str| format!("{n} {s}{}", if n.abs() == 1 { "" } else { "s" });
+    if years != 0 {
+        parts.push(unit(years, "year"));
+    }
+    if months != 0 {
+        parts.push(unit(months, "mon"));
+    }
+    if days != 0 {
+        parts.push(unit(days, "day"));
+    }
+    if parts.is_empty() {
+        return Value::Text("00:00:00".to_string());
+    }
+    Value::Text(parts.join(" "))
 }
 
 /// A fixed ordering rank per value category, so cross-category comparisons are
