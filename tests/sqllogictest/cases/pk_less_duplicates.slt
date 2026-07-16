@@ -1,0 +1,38 @@
+# A PK-less table keys rows by the whole row, so rows that share a value in one
+# column no longer collide on insert (PostgreSQL allows duplicate rows).
+
+statement ok
+CREATE TABLE nopk (region TEXT, amount INT);
+
+statement ok
+INSERT INTO nopk VALUES ('west', 100), ('west', 200), ('east', 50);
+
+query I
+SELECT count(*) FROM nopk;
+----
+3
+
+query I rowsort
+SELECT amount FROM nopk WHERE region = 'west';
+----
+100
+200
+
+# update one of the same-region rows
+statement ok
+UPDATE nopk SET amount = 999 WHERE region = 'west' AND amount = 100;
+
+query I rowsort
+SELECT amount FROM nopk WHERE region = 'west';
+----
+200
+999
+
+# delete one row
+statement ok
+DELETE FROM nopk WHERE amount = 200;
+
+query I
+SELECT count(*) FROM nopk;
+----
+2

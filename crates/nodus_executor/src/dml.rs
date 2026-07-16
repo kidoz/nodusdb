@@ -28,7 +28,13 @@ impl MemExecutor {
         positions.sort_unstable();
         positions.dedup();
         if positions.is_empty() {
-            vec![0]
+            // PK-less table: key by the whole row so rows sharing a first-column
+            // value don't collide (PostgreSQL allows duplicate rows). The key is
+            // content-derived, so it stays deterministic across Raft replicas.
+            // Caveat: exact-duplicate rows still collide (the KV layer has no
+            // physical tuple identity), and pre-existing PK-less data written by
+            // an older binary (first-column keys) must be re-imported.
+            (0..tbl.columns.len()).collect()
         } else {
             positions
         }
