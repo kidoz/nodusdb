@@ -453,6 +453,22 @@ impl MemExecutor {
 
     /// Scans all visible rows of a table, decoding each into typed values.
     pub(crate) fn scan_rows(&self, table_id: TableId, session: &str) -> Result<Vec<Vec<Value>>> {
+        Ok(self
+            .scan_rows_keyed(table_id, session)?
+            .into_iter()
+            .map(|(_, row)| row)
+            .collect())
+    }
+
+    /// Like [`Self::scan_rows`] but returns each row paired with its storage key.
+    /// Mutations (UPDATE/DELETE) use the actual stored key rather than
+    /// re-deriving it from row content, so rows written under any key scheme
+    /// (including data from an older binary) stay addressable.
+    pub(crate) fn scan_rows_keyed(
+        &self,
+        table_id: TableId,
+        session: &str,
+    ) -> Result<Vec<(String, Vec<Value>)>> {
         let read_ts = self.read_ts(session);
         let start = Bytes::from(format!("{}:", table_id));
         let end = Bytes::from(format!("{};", table_id));
@@ -481,7 +497,7 @@ impl MemExecutor {
                 }
             }
         }
-        Ok(keyed_rows.into_values().collect())
+        Ok(keyed_rows.into_iter().collect())
     }
 
     /// Like [`Self::scan_rows`] but stops after `cap` rows, for `LIMIT`/`OFFSET`

@@ -176,16 +176,18 @@ impl MemExecutor {
         let col_names: Vec<&str> = tbl.columns.iter().map(|c| c.name.as_str()).collect();
         let col_names_owned: Vec<String> = tbl.columns.iter().map(|c| c.name.clone()).collect();
         let pk_positions = Self::pk_positions(&tbl);
+        let key_prefix = format!("{}:", tbl.id);
 
         let mut updated = 0;
         let mut returning_rows = Vec::new();
-        for mut row in self.scan_rows(tbl.id, &ctx.session_id)? {
+        for (old_key, mut row) in self.scan_rows_keyed(tbl.id, &ctx.session_id)? {
             if !self.row_matches(ctx, &row, &tbl.columns, filter.as_ref()) {
                 continue;
             }
             let old_row = row.clone();
-            let old_pk_str = Self::row_pk(&pk_positions, &old_row);
-            let old_key = format!("{}:{}", tbl.id, old_pk_str);
+            // The row's actual stored key (any scheme); the new key is derived
+            // from the updated content, migrating old-scheme rows on write.
+            let old_pk_str = old_key.strip_prefix(&key_prefix).unwrap_or(&old_key).to_string();
             for (col, expr) in &assignments {
                 if let Some(idx) = col_names.iter().position(|c| c == col) {
                     // Evaluate the RHS against the row's OLD values.
@@ -288,16 +290,17 @@ impl MemExecutor {
             .get_table(db_name, schema_name, table_only)?;
         self.authorize(ctx, Action::Delete, ResourceRef::Table(tbl.id))?;
 
-        let pk_positions = Self::pk_positions(&tbl);
+        let key_prefix = format!("{}:", tbl.id);
         let mut deleted = 0;
         let mut returning_rows = Vec::new();
-        for row in self.scan_rows(tbl.id, &ctx.session_id)? {
+        for (key, row) in self.scan_rows_keyed(tbl.id, &ctx.session_id)? {
             if !self.row_matches(ctx, &row, &tbl.columns, filter.as_ref()) {
                 continue;
             }
-            let pk_str = Self::row_pk(&pk_positions, &row);
-            let key = format!("{}:{}", tbl.id, pk_str);
-            self.delete_row(&ctx.session_id, key)?;
+            // Use the row's actual stored key (works for any key scheme), and
+            // derive the index-entry suffix from it.
+            let pk_str = key.strip_prefix(&key_prefix).unwrap_or(&key).to_string();
+            self.delete_row(&ctx.session_id, key.clone())?;
 
             // Maintain secondary indexes.
             for idx in &tbl.indexes {
