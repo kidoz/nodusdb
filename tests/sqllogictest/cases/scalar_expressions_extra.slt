@@ -97,10 +97,25 @@ SELECT length('database');
 ----
 8
 
-# NOTE: trim()/substr() are intentionally omitted here — sqlparser parses them
-# as dedicated Expr::Trim/Expr::Substring nodes (not Expr::Function), which the
-# FROM-less constant-folder does not yet handle (returns int4 0). Tracked as a
-# follow-up gap.
+query T
+SELECT trim('  hi  ');
+----
+hi
+
+query T
+SELECT substr('abcdef', 2, 3);
+----
+bcd
+
+query T
+SELECT substring('hello' FROM 2 FOR 3);
+----
+ell
+
+query T
+SELECT substring('hello' FOR 3);
+----
+hel
 
 query T
 SELECT replace('aaa', 'a', 'b');

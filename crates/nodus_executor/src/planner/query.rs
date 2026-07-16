@@ -479,6 +479,7 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
                         | Expr::UnaryOp { .. }
                         | Expr::IsNull(_)
                         | Expr::IsNotNull(_)
+                        | Expr::Trim { .. }
                 ) && let Some(scalar) = lower_scalar(expr, params)
                 {
                     // Computed target-list expression over the row (arithmetic,
@@ -658,6 +659,7 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
                         | Expr::UnaryOp { .. }
                         | Expr::IsNull(_)
                         | Expr::IsNotNull(_)
+                        | Expr::Trim { .. }
                 ) && let Some(scalar) = lower_scalar(expr, params)
                 {
                     projection.push(ProjectionItem::Expr {

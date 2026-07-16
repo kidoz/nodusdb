@@ -284,6 +284,11 @@ pub(crate) fn fold_scalar(expr: &sqlparser::ast::Expr, params: &[Value]) -> Opti
             Value::Null
         ))),
         Expr::Function(func) => fold_function(func, params),
+        // SUBSTRING/TRIM parse to dedicated nodes; reuse the lowering + evaluator
+        // (no columns are referenced in a FROM-less SELECT).
+        Expr::Substring { .. } | Expr::Trim { .. } => {
+            lower_scalar(expr, params).map(|se| eval_scalar_expr(&se, &[], &[]))
+        }
         _ => None,
     }
 }
@@ -566,6 +571,52 @@ pub(crate) fn lower_scalar(
                 }
             }
             Some(ScalarExpr::Function { name, args })
+        }
+        // sqlparser lowers SUBSTRING/SUBSTR and TRIM to dedicated AST nodes
+        // rather than `Expr::Function`; map them onto the scalar functions
+        // `eval_scalar_function` already implements.
+        Expr::Substring {
+            expr: inner,
+            substring_from,
+            substring_for,
+            ..
+        } => {
+            let mut args = vec![lower_scalar(inner, params)?];
+            match (substring_from, substring_for) {
+                (Some(from), Some(len)) => {
+                    args.push(lower_scalar(from, params)?);
+                    args.push(lower_scalar(len, params)?);
+                }
+                (Some(from), None) => args.push(lower_scalar(from, params)?),
+                // `SUBSTRING(x FOR n)` starts at position 1.
+                (None, Some(len)) => {
+                    args.push(ScalarExpr::Literal(Value::Int(1)));
+                    args.push(lower_scalar(len, params)?);
+                }
+                (None, None) => {}
+            }
+            Some(ScalarExpr::Function {
+                name: "SUBSTR".to_string(),
+                args,
+            })
+        }
+        Expr::Trim {
+            expr: inner,
+            trim_where,
+            ..
+        } => {
+            use sqlparser::ast::TrimWhereField;
+            let name = match trim_where {
+                Some(TrimWhereField::Leading) => "LTRIM",
+                Some(TrimWhereField::Trailing) => "RTRIM",
+                // BOTH or unspecified. `trim_what`/`trim_characters` are ignored:
+                // `eval_scalar_function` trims whitespace only.
+                _ => "TRIM",
+            };
+            Some(ScalarExpr::Function {
+                name: name.to_string(),
+                args: vec![lower_scalar(inner, params)?],
+            })
         }
         _ => None,
     }

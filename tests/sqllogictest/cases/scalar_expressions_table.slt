@@ -83,6 +83,21 @@ ALICE?
 BOB?
 CAROL?
 
+# --- substr/trim over a column (sqlparser dedicated AST nodes) ---
+query T
+SELECT substr(name, 1, 3) FROM nums ORDER BY a;
+----
+ali
+bob
+car
+
+query T
+SELECT trim(name) FROM nums ORDER BY a;
+----
+alice
+bob
+carol
+
 # --- avg() (previously returned NULL) plus other aggregates ---
 query R
 SELECT avg(a) FROM nums;
