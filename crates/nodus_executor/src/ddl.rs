@@ -66,11 +66,25 @@ impl MemExecutor {
         name: String,
         columns: Vec<ColumnDef>,
         constraints: Vec<nodus_catalog::TableConstraint>,
+        if_not_exists: bool,
     ) -> Result<QueryOutput> {
         let (db_name, schema_name, table_only) = parse_object_name(&name)?;
         let db = self.catalog_reader.get_database(db_name)?;
         let sch = self.catalog_reader.get_schema(db_name, schema_name)?;
         self.authorize(ctx, Action::CreateTable, ResourceRef::Schema(sch.id))?;
+
+        // Reject a duplicate name cleanly (creating over an existing table
+        // otherwise leaves the catalog inconsistent), honoring IF NOT EXISTS.
+        if self
+            .catalog_reader
+            .get_table(db_name, schema_name, table_only)
+            .is_ok()
+        {
+            if if_not_exists {
+                return Ok(QueryOutput::tag("CREATE TABLE"));
+            }
+            anyhow::bail!("relation \"{}\" already exists", table_only);
+        }
         let descriptors: Vec<_> = columns
             .iter()
             .map(|c| ColumnDescriptor {

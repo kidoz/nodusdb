@@ -40,6 +40,7 @@ fn test_ddl_and_subqueries() {
     exec.execute_logical(
         &ctx,
         LogicalPlan::CreateTable {
+            if_not_exists: false,
             constraints: vec![],
             name: "employees".into(),
             columns: vec![
@@ -142,6 +143,7 @@ fn test_ddl_and_subqueries() {
     exec.execute_logical(
         &ctx,
         LogicalPlan::CreateTable {
+            if_not_exists: false,
             constraints: vec![],
             name: "departments".into(),
             columns: cols(&[("id", "int"), ("name", "text")]),
@@ -235,6 +237,7 @@ fn test_unique_constraints() {
     exec.execute_logical(
         &ctx,
         LogicalPlan::CreateTable {
+            if_not_exists: false,
             constraints: vec![],
             name: "users".into(),
             columns: vec![
@@ -353,6 +356,7 @@ fn test_secondary_indexing() {
     exec.execute_logical(
         &ctx,
         LogicalPlan::CreateTable {
+            if_not_exists: false,
             constraints: vec![],
             name: "products".into(),
             columns: vec![
@@ -586,6 +590,7 @@ fn test_index_value_containing_separator_does_not_overmatch() {
     exec.execute_logical(
         &ctx,
         LogicalPlan::CreateTable {
+            if_not_exists: false,
             constraints: vec![],
             name: "labels".into(),
             columns: vec![
@@ -691,6 +696,7 @@ fn test_alter_table_migrations() {
     exec.execute_logical(
         &ctx,
         LogicalPlan::CreateTable {
+            if_not_exists: false,
             constraints: vec![],
             name: "users".into(),
             columns: vec![

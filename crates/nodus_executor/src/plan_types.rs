@@ -266,6 +266,10 @@ pub enum LogicalPlan {
         name: String,
         columns: Vec<ColumnDef>,
         constraints: Vec<nodus_catalog::TableConstraint>,
+        /// `CREATE TABLE IF NOT EXISTS` — a no-op when the table already exists.
+        /// Defaulted so plans serialized before this field decode.
+        #[serde(default)]
+        if_not_exists: bool,
     },
     DropTable {
         name: String,

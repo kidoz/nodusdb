@@ -1,0 +1,51 @@
+# Phase 5 (DDL): views, indexes, schemas.
+
+statement ok
+CREATE TABLE base (id INT PRIMARY KEY, val INT);
+
+statement ok
+INSERT INTO base VALUES (1, 10), (2, 20), (3, 30);
+
+# --- view ---
+statement ok
+CREATE VIEW high AS SELECT id, val FROM base WHERE val >= 20;
+
+query II rowsort
+SELECT id, val FROM high;
+----
+2	20
+3	30
+
+statement ok
+DROP VIEW high;
+
+statement error
+SELECT * FROM high;
+
+# --- index (transparent to query results) ---
+statement ok
+CREATE INDEX idx_val ON base (val);
+
+query I
+SELECT val FROM base WHERE id = 2;
+----
+20
+
+statement ok
+DROP INDEX idx_val;
+
+# --- schema + schema-qualified table ---
+statement ok
+CREATE SCHEMA myschema;
+
+statement ok
+CREATE TABLE myschema.stuff (id INT PRIMARY KEY, label TEXT);
+
+statement ok
+INSERT INTO myschema.stuff VALUES (1, 'one'), (2, 'two');
+
+query IT rowsort
+SELECT id, label FROM myschema.stuff;
+----
+1	one
+2	two

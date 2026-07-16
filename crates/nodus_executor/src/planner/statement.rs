@@ -128,6 +128,7 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                 name: table_name,
                 columns: cols,
                 constraints: tbl_constraints,
+                if_not_exists: create_table.if_not_exists,
             })
         }
         Statement::CreateView(create_view) => Ok(LogicalPlan::CreateView {

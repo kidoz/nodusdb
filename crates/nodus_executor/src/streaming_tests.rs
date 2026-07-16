@@ -158,6 +158,7 @@ fn exec_with_rows(
     exec.execute_logical(
         &ctx,
         LogicalPlan::CreateTable {
+            if_not_exists: false,
             constraints: vec![],
             name: "t".into(),
             columns: vec![

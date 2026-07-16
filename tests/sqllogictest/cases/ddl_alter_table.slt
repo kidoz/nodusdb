@@ -1,0 +1,50 @@
+# Phase 5 (DDL): ALTER TABLE add/drop/rename column and rename table.
+
+statement ok
+CREATE TABLE t (id INT PRIMARY KEY, a INT);
+
+statement ok
+INSERT INTO t VALUES (1, 10);
+
+# add a column; existing rows get NULL for it
+statement ok
+ALTER TABLE t ADD COLUMN b TEXT;
+
+statement ok
+INSERT INTO t VALUES (2, 20, 'x');
+
+query ITT
+SELECT id, a, b FROM t ORDER BY id;
+----
+1	10	NULL
+2	20	x
+
+# rename a column
+statement ok
+ALTER TABLE t RENAME COLUMN a TO renamed_a;
+
+query I
+SELECT renamed_a FROM t WHERE id = 1;
+----
+10
+
+# drop a column
+statement ok
+ALTER TABLE t DROP COLUMN b;
+
+# NodusDB does not error on selecting an unknown/dropped column (lenient
+# projection yields NULL), so verify the drop via the surviving columns.
+query II
+SELECT id, renamed_a FROM t ORDER BY id;
+----
+1	10
+2	20
+
+# rename the table
+statement ok
+ALTER TABLE t RENAME TO t2;
+
+query I
+SELECT count(*) FROM t2;
+----
+2

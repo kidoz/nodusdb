@@ -38,6 +38,7 @@ fn test_offset_distinct_returning() {
     exec.execute_logical(
         &ctx,
         LogicalPlan::CreateTable {
+            if_not_exists: false,
             constraints: vec![],
             name: "t".into(),
             columns: cols(&[("id", "int"), ("val", "text")]),

@@ -1,0 +1,33 @@
+# Phase 5 (DDL): CREATE TABLE / DROP TABLE, IF [NOT] EXISTS.
+
+statement ok
+CREATE TABLE t1 (id INT PRIMARY KEY, name TEXT NOT NULL, active BOOL, score FLOAT);
+
+statement ok
+INSERT INTO t1 VALUES (1, 'alice', true, 9.5);
+
+query ITBR
+SELECT id, name, active, score FROM t1;
+----
+1	alice	t	9.5
+
+# CREATE TABLE IF NOT EXISTS is idempotent (does not clobber t1)
+statement ok
+CREATE TABLE IF NOT EXISTS t1 (id INT);
+
+query I
+SELECT count(*) FROM t1;
+----
+1
+
+# DROP the table
+statement ok
+DROP TABLE t1;
+
+# querying a dropped table errors
+statement error
+SELECT * FROM t1;
+
+# DROP TABLE IF EXISTS is a no-op when the table is gone
+statement ok
+DROP TABLE IF EXISTS t1;
