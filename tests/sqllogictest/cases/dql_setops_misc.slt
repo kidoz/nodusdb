@@ -1,0 +1,80 @@
+# Phase 3 (DQL): UNION / UNION ALL, CTE, DISTINCT, CASE, ORDER BY, LIMIT/OFFSET.
+
+statement ok
+CREATE TABLE a (x INT);
+
+statement ok
+CREATE TABLE b (x INT);
+
+statement ok
+INSERT INTO a VALUES (1), (2), (3);
+
+statement ok
+INSERT INTO b VALUES (3), (4), (5);
+
+# UNION removes duplicates
+query I rowsort
+SELECT x FROM a UNION SELECT x FROM b;
+----
+1
+2
+3
+4
+5
+
+# UNION ALL keeps duplicates
+query I rowsort
+SELECT x FROM a UNION ALL SELECT x FROM b;
+----
+1
+2
+3
+3
+4
+5
+
+# CTE
+query I rowsort
+WITH c AS (SELECT x FROM a) SELECT x FROM c;
+----
+1
+2
+3
+
+statement ok
+CREATE TABLE m (id INT, val INT, grp TEXT);
+
+statement ok
+INSERT INTO m VALUES (1, 10, 'a'), (2, 20, 'a'), (3, 30, 'b'), (4, 40, 'b');
+
+# searched CASE returning an integer (probe: is the CASE wire error text-specific?)
+query II
+SELECT id, CASE WHEN val > 25 THEN 1 ELSE 0 END FROM m ORDER BY id;
+----
+1	0
+2	0
+3	1
+4	1
+
+# DISTINCT
+query T rowsort
+SELECT DISTINCT grp FROM m;
+----
+a
+b
+
+# ORDER BY + LIMIT + OFFSET
+query I
+SELECT id FROM m ORDER BY id LIMIT 2 OFFSET 1;
+----
+2
+3
+
+# ORDER BY DESC
+query I
+SELECT id FROM m ORDER BY id DESC;
+----
+4
+3
+2
+1

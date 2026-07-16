@@ -1,0 +1,53 @@
+# Phase 3 (DQL): joins. Derived from PostgreSQL's join regress test, restricted
+# to portable inner/left/right/full forms. rowsort is used so results compare as
+# sets (NodusDB orders NULLs first, PostgreSQL last).
+
+statement ok
+CREATE TABLE emp (id INT, name TEXT, dept_id INT);
+
+statement ok
+CREATE TABLE dept (id INT, dname TEXT);
+
+statement ok
+INSERT INTO emp VALUES (1, 'alice', 10), (2, 'bob', 20), (3, 'carol', NULL);
+
+statement ok
+INSERT INTO dept VALUES (10, 'eng'), (20, 'sales'), (30, 'hr');
+
+# inner join
+query TT rowsort
+SELECT emp.name, dept.dname FROM emp JOIN dept ON emp.dept_id = dept.id;
+----
+alice	eng
+bob	sales
+
+# left join keeps the unmatched left row
+query TT rowsort
+SELECT emp.name, dept.dname FROM emp LEFT JOIN dept ON emp.dept_id = dept.id;
+----
+alice	eng
+bob	sales
+carol	NULL
+
+# right join keeps the unmatched right row
+query TT rowsort
+SELECT emp.name, dept.dname FROM emp RIGHT JOIN dept ON emp.dept_id = dept.id;
+----
+alice	eng
+bob	sales
+NULL	hr
+
+# full join keeps both unmatched sides
+query TT rowsort
+SELECT emp.name, dept.dname FROM emp FULL JOIN dept ON emp.dept_id = dept.id;
+----
+alice	eng
+bob	sales
+carol	NULL
+NULL	hr
+
+# join + WHERE
+query TT rowsort
+SELECT emp.name, dept.dname FROM emp JOIN dept ON emp.dept_id = dept.id WHERE dept.dname = 'eng';
+----
+alice	eng

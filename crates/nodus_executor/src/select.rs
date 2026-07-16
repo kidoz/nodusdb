@@ -602,6 +602,12 @@ impl MemExecutor {
                                 .unwrap_or(else_column)
                                 .to_string()
                         })),
+                        // Searched CASE must yield an out-column, or the row
+                        // description and data rows disagree on field count and
+                        // the client fails to parse the response.
+                        ProjectionItem::Case { alias, .. } => {
+                            Some(alias.clone().unwrap_or_else(|| "case".to_string()))
+                        }
                         ProjectionItem::Expr { alias, .. } => {
                             Some(alias.clone().unwrap_or_else(|| "?column?".to_string()))
                         }

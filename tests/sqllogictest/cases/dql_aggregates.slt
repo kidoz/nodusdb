@@ -1,0 +1,40 @@
+# Phase 3 (DQL): GROUP BY, aggregates, HAVING.
+
+statement ok
+CREATE TABLE sales (id INT PRIMARY KEY, region TEXT, amount INT);
+
+statement ok
+INSERT INTO sales VALUES (1, 'west', 100), (2, 'west', 200), (3, 'east', 50), (4, 'east', 100), (5, 'east', 150);
+
+# grouped aggregates
+query TIIII rowsort
+SELECT region, count(*), sum(amount), min(amount), max(amount) FROM sales GROUP BY region;
+----
+east	3	300	50	150
+west	2	300	100	200
+
+# grouped average
+query TR rowsort
+SELECT region, avg(amount) FROM sales GROUP BY region;
+----
+east	100
+west	150
+
+# scalar aggregate over the whole table
+query I
+SELECT count(*) FROM sales;
+----
+5
+
+# WHERE before GROUP BY
+query TI rowsort
+SELECT region, count(*) FROM sales WHERE amount > 75 GROUP BY region;
+----
+east	2
+west	2
+
+# HAVING filters groups
+query T rowsort
+SELECT region FROM sales GROUP BY region HAVING count(*) > 2;
+----
+east
