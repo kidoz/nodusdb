@@ -165,6 +165,14 @@ pub enum ScalarExpr {
         op: AggregateOp,
         arg: String,
     },
+    /// `date/timestamp ± INTERVAL`, resolved to a (months, days, seconds) offset
+    /// applied to the base's ISO text value.
+    DateOffset {
+        base: Box<ScalarExpr>,
+        months: i64,
+        days: i64,
+        seconds: i64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]

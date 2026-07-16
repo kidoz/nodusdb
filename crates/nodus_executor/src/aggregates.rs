@@ -145,9 +145,22 @@ pub(crate) fn eval_scalar_expr_grouped(
     group_rows: &[Vec<Value>],
     col_names: &[String],
 ) -> Value {
-    use crate::planner::{apply_binary_op, apply_unary_op, cast_value, extract_datetime_field};
+    use crate::planner::{
+        apply_binary_op, apply_date_offset, apply_unary_op, cast_value, extract_datetime_field,
+    };
     match expr {
         ScalarExpr::Aggregate { op, arg } => compute_aggregate(op, arg, group_rows, col_names),
+        ScalarExpr::DateOffset {
+            base,
+            months,
+            days,
+            seconds,
+        } => apply_date_offset(
+            &eval_scalar_expr_grouped(base, group_rows, col_names),
+            *months,
+            *days,
+            *seconds,
+        ),
         ScalarExpr::Literal(v) => v.clone(),
         ScalarExpr::Column(name) => col_names
             .iter()

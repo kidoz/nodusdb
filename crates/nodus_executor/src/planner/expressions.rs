@@ -270,6 +270,12 @@ pub(crate) fn fold_scalar(expr: &sqlparser::ast::Expr, params: &[Value]) -> Opti
             ) {
                 return None;
             }
+            // date ± interval: reuse the lowering + evaluator (no columns here).
+            if matches!(op, B::Plus | B::Minus)
+                && (matches!(&**left, Expr::Interval(_)) || matches!(&**right, Expr::Interval(_)))
+            {
+                return lower_scalar(expr, params).map(|se| eval_scalar_expr(&se, &[], &[]));
+            }
             let l = fold_scalar(left, params)?;
             let r = fold_scalar(right, params)?;
             fold_binary(op, l, r)
@@ -566,6 +572,30 @@ pub(crate) fn lower_scalar(
             })
         }
         Expr::BinaryOp { left, op, right } => {
+            // `date/timestamp ± INTERVAL` -> a resolved offset.
+            if matches!(op, B::Plus | B::Minus) {
+                if let Expr::Interval(iv) = &**right {
+                    let (m, d, s) = parse_interval(iv)?;
+                    let sign = if matches!(op, B::Minus) { -1 } else { 1 };
+                    return Some(ScalarExpr::DateOffset {
+                        base: Box::new(lower_scalar(left, params)?),
+                        months: m * sign,
+                        days: d * sign,
+                        seconds: s * sign,
+                    });
+                }
+                if matches!(op, B::Plus)
+                    && let Expr::Interval(iv) = &**left
+                {
+                    let (m, d, s) = parse_interval(iv)?;
+                    return Some(ScalarExpr::DateOffset {
+                        base: Box::new(lower_scalar(right, params)?),
+                        months: m,
+                        days: d,
+                        seconds: s,
+                    });
+                }
+            }
             let op = match op {
                 B::Plus => ScalarBinaryOp::Add,
                 B::Minus => ScalarBinaryOp::Sub,
@@ -728,7 +758,104 @@ pub(crate) fn eval_scalar_expr(expr: &ScalarExpr, row: &[Value], col_names: &[St
         }
         // Aggregates are only meaningful over a group; per-row eval yields NULL.
         ScalarExpr::Aggregate { .. } => Value::Null,
+        ScalarExpr::DateOffset {
+            base,
+            months,
+            days,
+            seconds,
+        } => apply_date_offset(
+            &eval_scalar_expr(base, row, col_names),
+            *months,
+            *days,
+            *seconds,
+        ),
     }
+}
+
+/// Parses an `INTERVAL` expression into a `(months, days, seconds)` offset.
+/// Handles `INTERVAL '1 day'`, `INTERVAL '2 months 3 days'`, and
+/// `INTERVAL '1' DAY` (value + leading field).
+fn parse_interval(iv: &sqlparser::ast::Interval) -> Option<(i64, i64, i64)> {
+    use sqlparser::ast::{Expr, Value as SqlValue};
+    let raw = match &*iv.value {
+        Expr::Value(v) => match &v.value {
+            SqlValue::SingleQuotedString(s) => s.clone(),
+            SqlValue::Number(n, _) => n.clone(),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let (mut months, mut days, mut seconds) = (0i64, 0i64, 0i64);
+    let tokens: Vec<&str> = raw.split_whitespace().collect();
+    if tokens.len() >= 2 {
+        let mut i = 0;
+        while i + 1 < tokens.len() {
+            let amount: i64 = tokens[i].parse().ok()?;
+            apply_interval_unit(&mut months, &mut days, &mut seconds, amount, tokens[i + 1])?;
+            i += 2;
+        }
+        return Some((months, days, seconds));
+    }
+    // Single amount with a leading field, e.g. `INTERVAL '1' DAY`.
+    let amount: i64 = raw.trim().parse().ok()?;
+    let unit = iv.leading_field.as_ref()?.to_string();
+    apply_interval_unit(&mut months, &mut days, &mut seconds, amount, &unit)?;
+    Some((months, days, seconds))
+}
+
+fn apply_interval_unit(
+    months: &mut i64,
+    days: &mut i64,
+    seconds: &mut i64,
+    amount: i64,
+    unit: &str,
+) -> Option<()> {
+    match unit.to_ascii_lowercase().trim_end_matches('s') {
+        "year" => *months += amount * 12,
+        "month" => *months += amount,
+        "week" => *days += amount * 7,
+        "day" => *days += amount,
+        "hour" => *seconds += amount * 3600,
+        "minute" | "min" => *seconds += amount * 60,
+        "second" | "sec" => *seconds += amount,
+        _ => return None,
+    }
+    Some(())
+}
+
+/// Applies a `(months, days, seconds)` offset to an ISO date/timestamp text
+/// value using real calendar math. Returns a date when the input was a date and
+/// no sub-day offset applies, otherwise a timestamp.
+pub(crate) fn apply_date_offset(v: &Value, months: i64, days: i64, seconds: i64) -> Value {
+    use chrono::{Duration, Months, NaiveDate, NaiveDateTime};
+    let add_months = |dt: NaiveDateTime, m: i64| -> NaiveDateTime {
+        if m >= 0 {
+            dt.checked_add_months(Months::new(m as u32)).unwrap_or(dt)
+        } else {
+            dt.checked_sub_months(Months::new((-m) as u32)).unwrap_or(dt)
+        }
+    };
+    let text = match v {
+        Value::Null => return Value::Null,
+        Value::Text(s) => s.trim().to_string(),
+        other => render(other),
+    };
+    if let Ok(dt) = NaiveDateTime::parse_from_str(&text, "%Y-%m-%d %H:%M:%S") {
+        let shifted =
+            add_months(dt, months) + Duration::days(days) + Duration::seconds(seconds);
+        return Value::Text(shifted.format("%Y-%m-%d %H:%M:%S").to_string());
+    }
+    if let Ok(d) = NaiveDate::parse_from_str(&text, "%Y-%m-%d") {
+        let base = d.and_hms_opt(0, 0, 0).unwrap();
+        let shifted =
+            add_months(base, months) + Duration::days(days) + Duration::seconds(seconds);
+        return if seconds != 0 {
+            Value::Text(shifted.format("%Y-%m-%d %H:%M:%S").to_string())
+        } else {
+            Value::Text(shifted.date().format("%Y-%m-%d").to_string())
+        };
+    }
+    Value::Null
 }
 
 /// Maps an aggregate function name to its [`AggregateOp`].
@@ -752,6 +879,7 @@ pub(crate) fn scalar_has_aggregate(expr: &ScalarExpr) -> bool {
         | ScalarExpr::Cast { expr, .. }
         | ScalarExpr::IsNull { expr, .. }
         | ScalarExpr::Extract { expr, .. } => scalar_has_aggregate(expr),
+        ScalarExpr::DateOffset { base, .. } => scalar_has_aggregate(base),
         ScalarExpr::Binary { left, right, .. } => {
             scalar_has_aggregate(left) || scalar_has_aggregate(right)
         }

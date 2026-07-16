@@ -101,6 +101,36 @@ SELECT EXTRACT(HOUR FROM ts) FROM events WHERE id = 1;
 ----
 10
 
-# NOT covered (no native temporal type): date +/- interval arithmetic, INTERVAL
-# literals, and functions like age()/date_trunc(). These need a real
-# date/timestamp Value variant and are out of scope here.
+# date +/- INTERVAL (real calendar math on the ISO text)
+query T
+SELECT DATE '2024-01-31' + INTERVAL '1 day';
+----
+2024-02-01
+
+query T
+SELECT DATE '2024-01-15' + INTERVAL '1 month';
+----
+2024-02-15
+
+query T
+SELECT DATE '2024-06-15' - INTERVAL '10 days';
+----
+2024-06-05
+
+query T
+SELECT DATE '2024-01-01' + INTERVAL '1 year';
+----
+2025-01-01
+
+query T
+SELECT TIMESTAMP '2024-01-15 10:30:00' + INTERVAL '2 hours';
+----
+2024-01-15 12:30:00
+
+# interval offset on a date column
+query T
+SELECT d + INTERVAL '1 month' FROM events WHERE id = 1;
+----
+2024-02-15
+
+# NOT covered: age()/date_trunc() and interval-typed columns.
