@@ -48,13 +48,23 @@ fn render_rows(messages: &[SimpleQueryMessage]) -> Vec<String> {
     rows
 }
 
+/// Fuller error text than the default `db error` — includes SQLSTATE + message.
+fn err_text(e: &tokio_postgres::Error) -> String {
+    if let Some(db) = e.as_db_error() {
+        format!("{}: {}", db.code().code(), db.message())
+    } else {
+        format!("{e}")
+    }
+}
+
 async fn run_record(client: &Client, record: &Record) -> Result<(), String> {
     match &record.expect {
         Expect::StatementOk => client
             .simple_query(&record.sql)
             .await
             .map(|_| ())
-            .map_err(|e| format!("statement failed: {e}\n  SQL: {}", record.sql)),
+            .map_err(|e| format!("statement failed: {}
+  SQL: {}", err_text(&e), record.sql)),
         Expect::StatementError { contains } => match client.simple_query(&record.sql).await {
             Ok(_) => Err(format!(
                 "expected an error but statement succeeded\n  SQL: {}",
@@ -72,7 +82,8 @@ async fn run_record(client: &Client, record: &Record) -> Result<(), String> {
             let messages = client
                 .simple_query(&record.sql)
                 .await
-                .map_err(|e| format!("query failed: {e}\n  SQL: {}", record.sql))?;
+                .map_err(|e| format!("query failed: {}
+  SQL: {}", err_text(&e), record.sql))?;
             let actual = render_rows(&messages);
             compare(*sort, rows, &actual).map_err(|diff| format!("{diff}\n  SQL: {}", record.sql))
         }

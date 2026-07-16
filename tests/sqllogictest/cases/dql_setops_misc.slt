@@ -47,14 +47,14 @@ CREATE TABLE m (id INT, val INT, grp TEXT);
 statement ok
 INSERT INTO m VALUES (1, 10, 'a'), (2, 20, 'a'), (3, 30, 'b'), (4, 40, 'b');
 
-# searched CASE returning an integer (probe: is the CASE wire error text-specific?)
-query II
-SELECT id, CASE WHEN val > 25 THEN 1 ELSE 0 END FROM m ORDER BY id;
+# searched CASE in the target list
+query IT
+SELECT id, CASE WHEN val > 25 THEN 'hi' ELSE 'lo' END FROM m ORDER BY id;
 ----
-1	0
-2	0
-3	1
-4	1
+1	lo
+2	lo
+3	hi
+4	hi
 
 # DISTINCT
 query T rowsort
