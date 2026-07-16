@@ -95,30 +95,86 @@ impl MemExecutor {
                 let left_idx = col_names
                     .iter()
                     .position(|c| c == &p.left || c.ends_with(&format!(".{}", p.left)));
-                let Some(idx) = left_idx else {
+                // The left side is normally a column; it can also be a JSON
+                // access (`col ->> 'k'` / `col -> 'k'`) that the planner encoded
+                // as a synthetic name, which we compute per row here.
+                let (left_cell, expected_type): (Value, String) = if let Some(idx) = left_idx {
+                    (
+                        row.get(idx).cloned().unwrap_or(Value::Null),
+                        columns[idx].data_type.clone(),
+                    )
+                } else if let Some((base, op, key)) = parse_json_ref(&p.left) {
+                    let Some(i) = col_names
+                        .iter()
+                        .position(|c| c == &base || c.ends_with(&format!(".{base}")))
+                    else {
+                        return Some(false);
+                    };
+                    (
+                        json_extract(row.get(i).unwrap_or(&Value::Null), &op, &key),
+                        "TEXT".to_string(),
+                    )
+                } else {
                     return Some(false);
                 };
-                let left_cell = row.get(idx).unwrap_or(&Value::Null);
-                let right_cell =
-                    self.eval_operand(row, col_names, columns, &p.right, &columns[idx].data_type);
 
-                if left_cell == &Value::Null || right_cell == Value::Null {
+                let right_cell = self.eval_operand(row, col_names, columns, &p.right, &expected_type);
+
+                if left_cell == Value::Null || right_cell == Value::Null {
                     return None;
                 }
 
-                let ord = compare(left_cell, &right_cell);
+                let ord = compare(&left_cell, &right_cell);
                 Some(match p.op {
                     // Equality routes through `compare` (via `values_equal`) so it
                     // agrees with ordering — `5 = 5.0` is true, `5 = '5'` is false.
+                    CompareOp::Eq => values_equal(&left_cell, &right_cell),
+                    CompareOp::Ne => !values_equal(&left_cell, &right_cell),
+                    CompareOp::Lt => ord == std::cmp::Ordering::Less,
+                    CompareOp::Le => ord != std::cmp::Ordering::Greater,
+                    CompareOp::Gt => ord == std::cmp::Ordering::Greater,
+                    CompareOp::Ge => ord != std::cmp::Ordering::Less,
+                    // `@>` left contains right; `<@` left contained by right.
+                    CompareOp::Contains => value_contains(&left_cell, &right_cell),
+                    CompareOp::ContainedBy => value_contains(&right_cell, &left_cell),
+                })
+            }
+            FilterExpr::CompareSubquery {
+                left,
+                op,
+                subquery,
+            } => {
+                let Some(idx) = col_names
+                    .iter()
+                    .position(|c| c == left || c.ends_with(&format!(".{}", left)))
+                else {
+                    return Some(false);
+                };
+                let left_cell = row.get(idx).unwrap_or(&Value::Null);
+                if left_cell == &Value::Null {
+                    return None;
+                }
+                // The subquery yields a single scalar; coerce it to the left
+                // column's type so comparison agrees (e.g. text "40" vs int 40).
+                let out = self.execute_logical_inner(ctx, (**subquery).clone()).ok()?;
+                let right_cell = out
+                    .rows
+                    .first()
+                    .and_then(|r| r.values.first())
+                    .map(|v| coerce(&render(v), column_type(&columns[idx].data_type)))
+                    .unwrap_or(Value::Null);
+                if right_cell == Value::Null {
+                    return None;
+                }
+                let ord = compare(left_cell, &right_cell);
+                Some(match op {
                     CompareOp::Eq => values_equal(left_cell, &right_cell),
                     CompareOp::Ne => !values_equal(left_cell, &right_cell),
                     CompareOp::Lt => ord == std::cmp::Ordering::Less,
                     CompareOp::Le => ord != std::cmp::Ordering::Greater,
                     CompareOp::Gt => ord == std::cmp::Ordering::Greater,
                     CompareOp::Ge => ord != std::cmp::Ordering::Less,
-                    // `@>` left contains right; `<@` left contained by right.
-                    CompareOp::Contains => value_contains(left_cell, &right_cell),
-                    CompareOp::ContainedBy => value_contains(&right_cell, left_cell),
+                    _ => false,
                 })
             }
             FilterExpr::Like {
@@ -329,6 +385,45 @@ fn value_to_json(v: &Value) -> Option<serde_json::Value> {
                 Some(J::String(s.clone()))
             }
         }
+    }
+}
+
+/// Splits a synthetic JSON-access name like `data->>'name'` into
+/// `(base_column, operator, key)`. `->>` is checked before `->`.
+fn parse_json_ref(s: &str) -> Option<(String, String, String)> {
+    for op in ["->>", "->"] {
+        if let Some(pos) = s.find(op) {
+            let base = s[..pos].trim().to_string();
+            let key = s[pos + op.len()..].trim().trim_matches('\'').to_string();
+            if !base.is_empty() && !key.is_empty() {
+                return Some((base, op.to_string(), key));
+            }
+        }
+    }
+    None
+}
+
+/// Evaluates `value -> key` / `value ->> key` on a JSON(B) or JSON-text value.
+/// `->>` returns text; `->` returns the sub-document. Missing keys yield NULL.
+fn json_extract(value: &Value, op: &str, key: &str) -> Value {
+    let json: serde_json::Value = match value {
+        Value::Jsonb(j) => j.clone(),
+        Value::Text(s) => match serde_json::from_str(s) {
+            Ok(j) => j,
+            Err(_) => return Value::Null,
+        },
+        _ => return Value::Null,
+    };
+    let Some(sub) = json.get(key) else {
+        return Value::Null;
+    };
+    match op {
+        "->>" => match sub {
+            serde_json::Value::String(s) => Value::Text(s.clone()),
+            serde_json::Value::Null => Value::Null,
+            other => Value::Text(other.to_string()),
+        },
+        _ => Value::Jsonb(sub.clone()),
     }
 }
 

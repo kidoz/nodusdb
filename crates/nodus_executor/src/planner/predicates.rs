@@ -117,16 +117,22 @@ pub(crate) fn parse_filter_expr(
         }
         Expr::BinaryOp { left, op, right } => {
             let left_col = extract_col_name(left)?;
-            let right_op = extract_operand(right, params)?;
-            if let Some(cmp) = compare_op(op) {
-                Some(FilterExpr::Predicate(Predicate {
+            let cmp = compare_op(op)?;
+            // `col <op> (scalar subquery)`.
+            if let Expr::Subquery(query) = &**right {
+                let sub_plan = plan_query(query, params).ok()?;
+                return Some(FilterExpr::CompareSubquery {
                     left: left_col,
                     op: cmp,
-                    right: right_op,
-                }))
-            } else {
-                None
+                    subquery: Box::new(sub_plan),
+                });
             }
+            let right_op = extract_operand(right, params)?;
+            Some(FilterExpr::Predicate(Predicate {
+                left: left_col,
+                op: cmp,
+                right: right_op,
+            }))
         }
         // `x BETWEEN a AND b` -> `x >= a AND x <= b`; NOT BETWEEN -> `x < a OR x > b`.
         Expr::Between {

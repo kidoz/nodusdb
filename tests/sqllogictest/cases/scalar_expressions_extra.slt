@@ -178,6 +178,28 @@ SELECT 3.7::int;
 ----
 4
 
+# half-to-even rounding on float -> int casts (matches PostgreSQL)
+query I
+SELECT 2.5::int;
+----
+2
+
+query I
+SELECT 3.5::int;
+----
+4
+
+# boolean -> text uses the SQL spellings
+query T
+SELECT true::text;
+----
+true
+
+query T
+SELECT false::text;
+----
+false
+
 query T
 SELECT 100::text;
 ----

@@ -56,6 +56,12 @@ pub enum FilterExpr {
         subquery: Box<LogicalPlan>,
         negated: bool,
     },
+    /// `col <op> (<scalar subquery>)` — the subquery yields a single value.
+    CompareSubquery {
+        left: String,
+        op: CompareOp,
+        subquery: Box<LogicalPlan>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -147,6 +153,11 @@ pub enum ScalarExpr {
     IsNull {
         expr: Box<ScalarExpr>,
         negated: bool,
+    },
+    /// `EXTRACT(<field> FROM <expr>)` over an ISO date/time text value.
+    Extract {
+        field: String,
+        expr: Box<ScalarExpr>,
     },
 }
 

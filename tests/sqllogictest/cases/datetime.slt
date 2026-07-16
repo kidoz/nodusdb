@@ -75,6 +75,32 @@ SELECT DATE '2024-06-15';
 ----
 2024-06-15
 
-# NOT covered (no native temporal type): EXTRACT / date_part, date +/- interval
-# arithmetic, INTERVAL literals, and functions like age()/date_trunc(). These
-# need a real date/timestamp Value variant and are out of scope here.
+# EXTRACT from ISO date/timestamp text (year/month/day/hour)
+query I
+SELECT EXTRACT(YEAR FROM DATE '2024-06-15');
+----
+2024
+
+query I
+SELECT EXTRACT(MONTH FROM DATE '2024-06-15');
+----
+6
+
+query I
+SELECT EXTRACT(DAY FROM DATE '2024-06-15');
+----
+15
+
+query I
+SELECT EXTRACT(YEAR FROM d) FROM events WHERE id = 2;
+----
+2024
+
+query I
+SELECT EXTRACT(HOUR FROM ts) FROM events WHERE id = 1;
+----
+10
+
+# NOT covered (no native temporal type): date +/- interval arithmetic, INTERVAL
+# literals, and functions like age()/date_trunc(). These need a real
+# date/timestamp Value variant and are out of scope here.

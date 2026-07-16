@@ -12,11 +12,11 @@ SELECT data ->> 'name' FROM docs WHERE id = 1;
 ----
 alice
 
-# NOTE: `->>`/`->` work in the target list but NOT in a WHERE predicate — the
-# planner turns `data ->> 'name'` into a synthetic column-name string that
-# doesn't resolve at eval time, so `WHERE data ->> 'name' = 'bob'` matches
-# nothing. Tracked as a gap; fixing needs a structured JSON-access predicate
-# operand rather than a name string.
+# ->> in a WHERE predicate
+query I rowsort
+SELECT id FROM docs WHERE data ->> 'name' = 'bob';
+----
+2
 
 # JSON containment (@>)
 query I rowsort

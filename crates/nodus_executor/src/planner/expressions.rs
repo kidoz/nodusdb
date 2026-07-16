@@ -293,7 +293,7 @@ pub(crate) fn fold_scalar(expr: &sqlparser::ast::Expr, params: &[Value]) -> Opti
         Expr::Function(func) => fold_function(func, params),
         // SUBSTRING/TRIM parse to dedicated nodes; reuse the lowering + evaluator
         // (no columns are referenced in a FROM-less SELECT).
-        Expr::Substring { .. } | Expr::Trim { .. } => {
+        Expr::Substring { .. } | Expr::Trim { .. } | Expr::Extract { .. } => {
             lower_scalar(expr, params).map(|se| eval_scalar_expr(&se, &[], &[]))
         }
         _ => None,
@@ -406,15 +406,20 @@ pub(crate) fn cast_value(v: Value, data_type: &str) -> Value {
         return Value::Null;
     }
     match crate::value::column_type(data_type) {
+        // PostgreSQL rounds half-to-even when casting to an integer.
         ColumnType::Int => match &v {
             Value::Int(_) => v,
-            Value::Float(f) => Value::Int(f.round() as i64),
+            Value::Float(f) => Value::Int(f.round_ties_even() as i64),
             Value::Bool(b) => Value::Int(i64::from(*b)),
             Value::Text(s) => s
                 .trim()
                 .parse::<i64>()
                 .map(Value::Int)
-                .or_else(|_| s.trim().parse::<f64>().map(|f| Value::Int(f.round() as i64)))
+                .or_else(|_| {
+                    s.trim()
+                        .parse::<f64>()
+                        .map(|f| Value::Int(f.round_ties_even() as i64))
+                })
                 .unwrap_or(Value::Null),
             _ => Value::Null,
         },
@@ -431,8 +436,48 @@ pub(crate) fn cast_value(v: Value, data_type: &str) -> Value {
             Value::Text(s) => parse_bool_text(s),
             _ => Value::Null,
         },
-        ColumnType::Text => Value::Text(render(&v)),
+        // Booleans cast to the SQL spellings, not the wire `t`/`f` rendering.
+        ColumnType::Text => match &v {
+            Value::Bool(b) => Value::Text(if *b { "true" } else { "false" }.to_string()),
+            _ => Value::Text(render(&v)),
+        },
     }
+}
+
+/// Extracts a datetime field (`YEAR`/`MONTH`/`DAY`/`HOUR`/`MINUTE`/`SECOND`)
+/// from an ISO-8601 date/timestamp text value. Returns NULL when it can't parse.
+pub(crate) fn extract_datetime_field(v: &Value, field: &str) -> Value {
+    let text = match v {
+        Value::Null => return Value::Null,
+        Value::Text(s) => s.clone(),
+        other => render(other),
+    };
+    let (date_part, time_part) = match text.trim().split_once([' ', 'T']) {
+        Some((d, t)) => (d, Some(t)),
+        None => (text.trim(), None),
+    };
+    let date_bits: Vec<&str> = date_part.split('-').collect();
+    let field_up = field.to_ascii_uppercase();
+    let parsed = match field_up.as_str() {
+        "YEAR" => date_bits.first().and_then(|s| s.parse::<i64>().ok()),
+        "MONTH" => date_bits.get(1).and_then(|s| s.parse::<i64>().ok()),
+        "DAY" => date_bits.get(2).and_then(|s| s.parse::<i64>().ok()),
+        "HOUR" | "MINUTE" | "SECOND" => {
+            let time_bits: Vec<&str> = time_part.unwrap_or("").split(':').collect();
+            let idx = match field_up.as_str() {
+                "HOUR" => 0,
+                "MINUTE" => 1,
+                _ => 2,
+            };
+            // A SECOND field may carry a fraction (`08.5`); take the whole part.
+            time_bits
+                .get(idx)
+                .and_then(|s| s.trim().split('.').next())
+                .and_then(|s| s.trim().parse::<i64>().ok())
+        }
+        _ => None,
+    };
+    parsed.map(Value::Int).unwrap_or(Value::Null)
 }
 
 /// PostgreSQL-style textual boolean input; unrecognized text folds to NULL.
@@ -499,7 +544,9 @@ pub(crate) fn lower_scalar(
 ) -> Option<ScalarExpr> {
     use sqlparser::ast::{BinaryOperator as B, Expr, UnaryOperator as U};
     match expr {
-        Expr::Value(_) | Expr::Array(_) => expr_to_value(expr, params).map(ScalarExpr::Literal),
+        Expr::Value(_) | Expr::Array(_) | Expr::TypedString(_) => {
+            expr_to_value(expr, params).map(ScalarExpr::Literal)
+        }
         Expr::Identifier(id) => Some(ScalarExpr::Column(id.value.clone())),
         Expr::CompoundIdentifier(ids) => Some(ScalarExpr::Column(
             ids.iter().map(|id| id.value.clone()).collect::<Vec<_>>().join("."),
@@ -625,6 +672,10 @@ pub(crate) fn lower_scalar(
                 args: vec![lower_scalar(inner, params)?],
             })
         }
+        Expr::Extract { field, expr: inner, .. } => Some(ScalarExpr::Extract {
+            field: field.to_string(),
+            expr: Box::new(lower_scalar(inner, params)?),
+        }),
         _ => None,
     }
 }
@@ -659,6 +710,9 @@ pub(crate) fn eval_scalar_expr(expr: &ScalarExpr, row: &[Value], col_names: &[St
         ScalarExpr::IsNull { expr, negated } => {
             let is_null = matches!(eval_scalar_expr(expr, row, col_names), Value::Null);
             Value::Bool(if *negated { !is_null } else { is_null })
+        }
+        ScalarExpr::Extract { field, expr } => {
+            extract_datetime_field(&eval_scalar_expr(expr, row, col_names), field)
         }
     }
 }

@@ -20,9 +20,18 @@ SELECT id FROM t WHERE val NOT IN (SELECT val FROM t WHERE val > 20);
 1
 2
 
-# NOTE: scalar subquery in WHERE (`val = (SELECT max(val) FROM t)`) is a known
-# gap — NodusDB only evaluates IN-subqueries; a scalar-subquery comparison is
-# treated as always-true and returns every row. Omitted here, tracked as a gap.
+# scalar subquery in WHERE
+query I
+SELECT id FROM t WHERE val = (SELECT max(val) FROM t);
+----
+4
+
+query I rowsort
+SELECT id FROM t WHERE val > (SELECT min(val) FROM t);
+----
+2
+3
+4
 
 # derived table (subquery in FROM)
 query I rowsort
