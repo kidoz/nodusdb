@@ -525,7 +525,7 @@ fn update_and_delete_rows() {
             &ctx,
             LogicalPlan::Update {
                 table_name: "t".into(),
-                assignments: vec![("name".into(), Value::Text("B".into()))],
+                assignments: vec![("name".into(), ScalarExpr::Literal(Value::Text("B".into())))],
                 filter: eq("id", "2"),
 
                 returning: vec![],

@@ -1,0 +1,34 @@
+# Phase 4 (DML): RETURNING on INSERT / UPDATE / DELETE.
+
+statement ok
+CREATE TABLE r (id INT PRIMARY KEY, v INT);
+
+query I
+INSERT INTO r VALUES (1, 10) RETURNING id;
+----
+1
+
+query I
+INSERT INTO r VALUES (2, 20) RETURNING v;
+----
+20
+
+query II
+INSERT INTO r VALUES (3, 30) RETURNING id, v;
+----
+3	30
+
+query I
+UPDATE r SET v = 100 WHERE id = 1 RETURNING v;
+----
+100
+
+query I
+DELETE FROM r WHERE id = 2 RETURNING id;
+----
+2
+
+query I
+SELECT count(*) FROM r;
+----
+2

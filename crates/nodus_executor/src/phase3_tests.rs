@@ -302,7 +302,7 @@ fn test_unique_constraints() {
         &ctx,
         LogicalPlan::Update {
             table_name: "users".into(),
-            assignments: vec![("email".into(), Value::Text("a@a.com".into()))],
+            assignments: vec![("email".into(), ScalarExpr::Literal(Value::Text("a@a.com".into())))],
             filter: Some(FilterExpr::Predicate(Predicate {
                 left: "id".into(),
                 op: CompareOp::Eq,
@@ -317,7 +317,7 @@ fn test_unique_constraints() {
         &ctx,
         LogicalPlan::Update {
             table_name: "users".into(),
-            assignments: vec![("email".into(), Value::Text("b@b.com".into()))],
+            assignments: vec![("email".into(), ScalarExpr::Literal(Value::Text("b@b.com".into())))],
             filter: Some(FilterExpr::Predicate(Predicate {
                 left: "id".into(),
                 op: CompareOp::Eq,
@@ -454,7 +454,7 @@ fn test_secondary_indexing() {
         &ctx,
         LogicalPlan::Update {
             table_name: "products".into(),
-            assignments: vec![("category".into(), Value::Text("B".into()))],
+            assignments: vec![("category".into(), ScalarExpr::Literal(Value::Text("B".into())))],
             filter: Some(FilterExpr::Predicate(Predicate {
                 left: "id".into(),
                 op: CompareOp::Eq,
@@ -766,7 +766,7 @@ fn test_alter_table_migrations() {
         &ctx,
         LogicalPlan::Update {
             table_name: "users".into(),
-            assignments: vec![("age".into(), Value::Int(30))],
+            assignments: vec![("age".into(), ScalarExpr::Literal(Value::Int(30)))],
             filter: None,
             returning: vec![],
         },

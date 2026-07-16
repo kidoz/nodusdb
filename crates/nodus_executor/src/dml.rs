@@ -158,7 +158,7 @@ impl MemExecutor {
         &self,
         ctx: &ExecutionContext,
         table_name: String,
-        assignments: Vec<(String, Value)>,
+        assignments: Vec<(String, ScalarExpr)>,
         filter: Option<FilterExpr>,
         returning: Vec<String>,
     ) -> Result<QueryOutput> {
@@ -168,6 +168,7 @@ impl MemExecutor {
             .get_table(db_name, schema_name, table_only)?;
         self.authorize(ctx, Action::Update, ResourceRef::Table(tbl.id))?;
         let col_names: Vec<&str> = tbl.columns.iter().map(|c| c.name.as_str()).collect();
+        let col_names_owned: Vec<String> = tbl.columns.iter().map(|c| c.name.clone()).collect();
         let pk_positions = Self::pk_positions(&tbl);
 
         let mut updated = 0;
@@ -179,9 +180,12 @@ impl MemExecutor {
             let old_row = row.clone();
             let old_pk_str = Self::row_pk(&pk_positions, &old_row);
             let old_key = format!("{}:{}", tbl.id, old_pk_str);
-            for (col, val) in &assignments {
+            for (col, expr) in &assignments {
                 if let Some(idx) = col_names.iter().position(|c| c == col) {
-                    let coerced = crate::value::coerce_for_column(val, &tbl.columns[idx].data_type);
+                    // Evaluate the RHS against the row's OLD values.
+                    let val = eval_scalar_expr(expr, &old_row, &col_names_owned);
+                    let coerced =
+                        crate::value::coerce_for_column(&val, &tbl.columns[idx].data_type);
                     if !tbl.columns[idx].nullable && coerced == Value::Null {
                         anyhow::bail!("Column {} cannot be NULL", col);
                     }

@@ -1,0 +1,32 @@
+# Phase 4 (constraints): PRIMARY KEY / UNIQUE / NOT NULL / CHECK enforcement.
+
+statement ok
+CREATE TABLE c (id INT PRIMARY KEY, email TEXT UNIQUE, age INT NOT NULL, CHECK (age >= 0));
+
+statement ok
+INSERT INTO c VALUES (1, 'a@x', 30);
+
+# duplicate primary key
+statement error
+INSERT INTO c VALUES (1, 'b@x', 25);
+
+# duplicate unique value
+statement error
+INSERT INTO c VALUES (2, 'a@x', 25);
+
+# NOT NULL violation
+statement error
+INSERT INTO c VALUES (3, 'c@x', NULL);
+
+# CHECK violation
+statement error
+INSERT INTO c VALUES (4, 'd@x', -5);
+
+# a fully valid row still inserts
+statement ok
+INSERT INTO c VALUES (5, 'e@x', 40);
+
+query II
+SELECT count(*), min(age) FROM c;
+----
+2	30

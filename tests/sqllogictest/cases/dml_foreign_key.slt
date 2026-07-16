@@ -1,0 +1,27 @@
+# Phase 4 (constraints): FOREIGN KEY enforcement.
+
+statement ok
+CREATE TABLE parent (id INT PRIMARY KEY, name TEXT);
+
+statement ok
+CREATE TABLE child (id INT PRIMARY KEY, parent_id INT REFERENCES parent(id));
+
+statement ok
+INSERT INTO parent VALUES (1, 'p1'), (2, 'p2');
+
+# valid reference
+statement ok
+INSERT INTO child VALUES (10, 1);
+
+# dangling reference is rejected
+statement error
+INSERT INTO child VALUES (11, 99);
+
+# NULL foreign key is allowed
+statement ok
+INSERT INTO child VALUES (12, NULL);
+
+query I
+SELECT count(*) FROM child;
+----
+2

@@ -121,7 +121,7 @@ fn test_offset_distinct_returning() {
             &ctx,
             LogicalPlan::Update {
                 table_name: "t".into(),
-                assignments: vec![("val".into(), Value::Text("Z".into()))],
+                assignments: vec![("val".into(), ScalarExpr::Literal(Value::Text("Z".into())))],
                 filter: Some(FilterExpr::Predicate(Predicate {
                     left: "id".into(),
                     op: CompareOp::Eq,

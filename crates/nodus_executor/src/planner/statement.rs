@@ -324,7 +324,10 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                         }
                         sqlparser::ast::AssignmentTarget::Tuple(_) => return None,
                     };
-                    let val = expr_to_value(&a.value, params)?;
+                    // Lower the RHS to a scalar expression so `SET n = n + 1`
+                    // and other computed assignments evaluate per row (a bare
+                    // literal lowers to `ScalarExpr::Literal`).
+                    let val = lower_scalar(&a.value, params)?;
                     Some((col, val))
                 })
                 .collect();

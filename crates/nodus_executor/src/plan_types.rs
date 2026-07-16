@@ -337,7 +337,9 @@ pub enum LogicalPlan {
     },
     Update {
         table_name: String,
-        assignments: Vec<(String, Value)>,
+        /// Each `SET col = <expr>`; the expression is evaluated per matched row
+        /// against that row's *old* values.
+        assignments: Vec<(String, ScalarExpr)>,
         filter: Option<FilterExpr>,
         returning: Vec<String>,
     },
