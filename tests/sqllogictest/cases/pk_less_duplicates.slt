@@ -36,3 +36,32 @@ query I
 SELECT count(*) FROM nopk;
 ----
 2
+
+# an index-less table allows exact-duplicate rows (heap semantics)
+statement ok
+CREATE TABLE dup (a INT, b TEXT);
+
+statement ok
+INSERT INTO dup VALUES (1, 'x'), (1, 'x'), (1, 'x');
+
+query I
+SELECT count(*) FROM dup;
+----
+3
+
+# they update and delete like any rows
+statement ok
+UPDATE dup SET b = 'y' WHERE a = 1;
+
+query TI
+SELECT b, count(*) FROM dup GROUP BY b;
+----
+y	3
+
+statement ok
+DELETE FROM dup WHERE a = 1;
+
+query I
+SELECT count(*) FROM dup;
+----
+0

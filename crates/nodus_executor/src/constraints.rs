@@ -16,6 +16,13 @@ impl MemExecutor {
         new_row: &[Value],
         skip_pk: Option<&str>,
     ) -> Result<()> {
+        // An index-less table has no PRIMARY KEY or UNIQUE constraint to enforce,
+        // and its rows carry synthetic rowids — so exact-duplicate rows are
+        // allowed. (The all-column key fallback below would otherwise reject
+        // them as a spurious "primary key" collision.)
+        if Self::uses_synthetic_rowid(tbl) {
+            return Ok(());
+        }
         let mut unique_col_indices = Vec::new();
         for idx in &tbl.indexes {
             if idx.unique {

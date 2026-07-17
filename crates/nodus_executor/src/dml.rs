@@ -9,6 +9,23 @@ use chrono::Utc;
 use nodus_catalog::{ColumnDescriptor, DescriptorState};
 use nodus_storage_api::{KeyRange, KvEngine};
 
+/// A synthetic rowid for index-less tables: a nanosecond timestamp plus a
+/// process-monotonic counter, zero-padded so lexical order equals insertion
+/// order (scans stay in insertion order). Unique within a run via the counter,
+/// and collision-free across restarts because the timestamp advances. Generated
+/// on the leader, whose resulting KV write raft_kv replicates, so it's
+/// deterministic across replicas.
+fn synthetic_rowid() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("{nanos:039}-{seq:020}")
+}
+
 impl MemExecutor {
     /// Positions (in table-column order) of the columns that form the table's
     /// declared `PRIMARY KEY`. Falls back to the first column when no primary
@@ -38,6 +55,16 @@ impl MemExecutor {
         } else {
             positions
         }
+    }
+
+    /// A table with no indexes at all (no PRIMARY KEY, UNIQUE, or secondary
+    /// index) has no natural row identity, so each row gets a synthetic rowid
+    /// key — letting it hold exact-duplicate rows (PostgreSQL heap semantics).
+    /// Tables with any index keep content-derived keys, and the index-scan
+    /// overlay-merge path (which re-derives keys from content) is only reachable
+    /// when an index exists, so it never sees a synthetic-rowid table.
+    pub(crate) fn uses_synthetic_rowid(tbl: &nodus_catalog::TableDescriptor) -> bool {
+        tbl.indexes.is_empty()
     }
 
     /// Renders a row's primary-key string from the given column positions. A
@@ -109,8 +136,15 @@ impl MemExecutor {
                 &col_names.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
             )?;
 
-            // Primary key derived from the table's declared PRIMARY KEY columns.
-            let pk = Self::row_pk(&pk_positions, &row);
+            // Key: declared PRIMARY KEY / full-row content, or a synthetic rowid
+            // for an index-less table (so exact-duplicate rows don't collide).
+            // Exec-time uuid is replication-safe: raft_kv replicates the
+            // resulting KV write, so the leader's key is what every replica sees.
+            let pk = if Self::uses_synthetic_rowid(&tbl) {
+                synthetic_rowid()
+            } else {
+                Self::row_pk(&pk_positions, &row)
+            };
             let key = format!("{}:{}", tbl.id, pk);
             let encoded = serde_json::to_string(&row)?;
             self.write_row(&ctx.session_id, key, encoded)?;
@@ -201,7 +235,13 @@ impl MemExecutor {
                 }
             }
 
-            let pk_str = Self::row_pk(&pk_positions, &row);
+            // A synthetic rowid is the row's stable identity — keep it across the
+            // update rather than re-deriving a key from the (changed) content.
+            let pk_str = if Self::uses_synthetic_rowid(&tbl) {
+                old_pk_str.clone()
+            } else {
+                Self::row_pk(&pk_positions, &row)
+            };
             self.check_unique_constraints(&ctx.session_id, &tbl, &row, Some(&pk_str))?;
             self.check_table_constraints(
                 ctx,
