@@ -5,19 +5,34 @@ use crate::*;
 use anyhow::Result;
 
 impl MemExecutor {
-    pub(crate) fn exec_select_literal(&self, values: Vec<(String, Value)>) -> Result<QueryOutput> {
+    pub(crate) fn exec_select_literal(
+        &self,
+        values: Vec<(String, Value, Option<String>)>,
+    ) -> Result<QueryOutput> {
         let mut columns = Vec::new();
         let mut types = Vec::new();
         let mut row_values = Vec::new();
 
-        for (alias, value) in values {
+        for (alias, value, type_hint) in values {
             columns.push(alias);
-            types.push(match &value {
-                Value::Int(_) => "INTEGER".to_string(),
-                Value::Float(_) => "DOUBLE".to_string(),
-                Value::Bool(_) => "BOOLEAN".to_string(),
-                _ => "VARCHAR".to_string(),
-            });
+            // A CAST's declared type wins (so `NULL::int` is int4); otherwise
+            // infer from the value's variant.
+            let ty = match type_hint {
+                Some(t) => match crate::value::column_type(&t) {
+                    crate::value::ColumnType::Int => "INTEGER",
+                    crate::value::ColumnType::Float => "DOUBLE",
+                    crate::value::ColumnType::Bool => "BOOLEAN",
+                    crate::value::ColumnType::Text => "VARCHAR",
+                }
+                .to_string(),
+                None => match &value {
+                    Value::Int(_) => "INTEGER".to_string(),
+                    Value::Float(_) => "DOUBLE".to_string(),
+                    Value::Bool(_) => "BOOLEAN".to_string(),
+                    _ => "VARCHAR".to_string(),
+                },
+            };
+            types.push(ty);
             row_values.push(value);
         }
 

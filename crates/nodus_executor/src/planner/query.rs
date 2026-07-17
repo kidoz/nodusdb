@@ -128,13 +128,20 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
                 SelectItem::ExprWithAlias { expr, alias } => (expr, alias.value.to_string()),
                 _ => anyhow::bail!("Unsupported scalar select item"),
             };
+            // A CAST fixes the column's type even when the value is NULL, so
+            // `NULL::int` reports int4 rather than defaulting to text.
+            let type_hint = if let Expr::Cast { data_type, .. } = expr {
+                Some(data_type.to_string())
+            } else {
+                None
+            };
             if let Some(val) = expr_to_value(expr, params) {
-                values.push((alias, val));
+                values.push((alias, val, type_hint));
             } else if let Some(val) = fold_scalar(expr, params) {
                 // Computed constant expressions: arithmetic, comparisons, CAST,
                 // string concat, and scalar function calls. (Legacy handling
                 // below still covers niladic specials like version().)
-                values.push((alias, val));
+                values.push((alias, val, type_hint));
             } else if let Expr::Function(func) = expr {
                 let func_name = func.name.to_string();
                 let rendered = if func_name.eq_ignore_ascii_case("version") {
@@ -152,16 +159,16 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
                 } else {
                     func_name
                 };
-                values.push((alias, crate::Value::Text(rendered)));
+                values.push((alias, crate::Value::Text(rendered), type_hint));
             } else if let Expr::Identifier(id) = expr {
                 let rendered = if id.value.eq_ignore_ascii_case("current_user") {
                     "nodus".to_string()
                 } else {
                     id.value.to_string()
                 };
-                values.push((alias, crate::Value::Text(rendered)));
+                values.push((alias, crate::Value::Text(rendered), type_hint));
             } else {
-                values.push((alias, crate::Value::Int(0)));
+                values.push((alias, crate::Value::Int(0), type_hint));
             }
         }
         return Ok(LogicalPlan::SelectLiteral { values });

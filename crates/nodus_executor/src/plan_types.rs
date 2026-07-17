@@ -400,7 +400,9 @@ pub enum LogicalPlan {
         tag: String,
     },
     SelectLiteral {
-        values: Vec<(String, crate::Value)>,
+        /// `(column alias, value, optional SQL type hint)`. The hint (from a
+        /// CAST) types the column even when the value is NULL.
+        values: Vec<(String, crate::Value, Option<String>)>,
     },
     SetOp {
         op: SetOpKind,
