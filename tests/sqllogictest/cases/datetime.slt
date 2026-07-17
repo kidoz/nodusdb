@@ -194,5 +194,35 @@ SELECT id, span FROM durations ORDER BY id;
 1	5 days
 2	1 mon
 
-# NOT covered: interval-on-interval arithmetic (e.g. dur + dur) — needs a
-# first-class interval Value type.
+# interval +/- interval
+query T
+SELECT INTERVAL '1 day' + INTERVAL '2 days';
+----
+3 days
+
+query T
+SELECT INTERVAL '2 months' + INTERVAL '10 days';
+----
+2 mons 10 days
+
+query T
+SELECT INTERVAL '5 days' - INTERVAL '2 days';
+----
+3 days
+
+# interval comparison (by magnitude, not lexically)
+query B
+SELECT INTERVAL '10 days' > INTERVAL '2 days';
+----
+t
+
+query B
+SELECT INTERVAL '1 day' = INTERVAL '1 day';
+----
+t
+
+# interval comparison in a WHERE predicate over a column
+query I rowsort
+SELECT id FROM durations WHERE span > INTERVAL '10 days';
+----
+2

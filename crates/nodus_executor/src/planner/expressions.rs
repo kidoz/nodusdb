@@ -275,10 +275,9 @@ pub(crate) fn fold_scalar(expr: &sqlparser::ast::Expr, params: &[Value]) -> Opti
             ) {
                 return None;
             }
-            // date ± interval: reuse the lowering + evaluator (no columns here).
-            if matches!(op, B::Plus | B::Minus)
-                && (matches!(&**left, Expr::Interval(_)) || matches!(&**right, Expr::Interval(_)))
-            {
+            // Any binary op involving an INTERVAL (arithmetic or comparison) is
+            // evaluated via the interval-aware lowering path, not `fold_binary`.
+            if matches!(&**left, Expr::Interval(_)) || matches!(&**right, Expr::Interval(_)) {
                 return lower_scalar(expr, params).map(|se| eval_scalar_expr(&se, &[], &[]));
             }
             let l = fold_scalar(left, params)?;
@@ -557,7 +556,7 @@ pub(crate) fn lower_scalar(
 ) -> Option<ScalarExpr> {
     use sqlparser::ast::{BinaryOperator as B, Expr, UnaryOperator as U};
     match expr {
-        Expr::Value(_) | Expr::Array(_) | Expr::TypedString(_) => {
+        Expr::Value(_) | Expr::Array(_) | Expr::TypedString(_) | Expr::Interval(_) => {
             expr_to_value(expr, params).map(ScalarExpr::Literal)
         }
         Expr::Identifier(id) => Some(ScalarExpr::Column(id.value.clone())),
@@ -579,9 +578,13 @@ pub(crate) fn lower_scalar(
             })
         }
         Expr::BinaryOp { left, op, right } => {
-            // `date/timestamp ± INTERVAL` -> a resolved offset.
+            // `date/timestamp ± INTERVAL` -> a resolved offset. Only when exactly
+            // one side is an interval; interval ± interval falls through to the
+            // general Binary path (evaluated by `apply_binary_op`).
             if matches!(op, B::Plus | B::Minus) {
-                if let Expr::Interval(iv) = &**right {
+                if let Expr::Interval(iv) = &**right
+                    && !matches!(&**left, Expr::Interval(_))
+                {
                     let (m, d, s) = parse_interval(iv)?;
                     let sign = if matches!(op, B::Minus) { -1 } else { 1 };
                     return Some(ScalarExpr::DateOffset {
@@ -593,6 +596,7 @@ pub(crate) fn lower_scalar(
                 }
                 if matches!(op, B::Plus)
                     && let Expr::Interval(iv) = &**left
+                    && !matches!(&**right, Expr::Interval(_))
                 {
                     let (m, d, s) = parse_interval(iv)?;
                     return Some(ScalarExpr::DateOffset {
@@ -850,8 +854,9 @@ fn apply_interval_unit(
     unit: &str,
 ) -> Option<()> {
     match unit.to_ascii_lowercase().trim_end_matches('s') {
-        "year" => *months += amount * 12,
-        "month" => *months += amount,
+        "year" | "yr" => *months += amount * 12,
+        // `mon`/`mons` is PostgreSQL's own rendering, so round-tripping needs it.
+        "month" | "mon" => *months += amount,
         "week" => *days += amount * 7,
         "day" => *days += amount,
         "hour" => *seconds += amount * 3600,
@@ -860,6 +865,95 @@ fn apply_interval_unit(
         _ => return None,
     }
     Some(())
+}
+
+/// Strictly parses interval *text* (`2 mons 3 days`, `1 year`, `02:00:00`,
+/// `-5 days`) into `(months, days, seconds)`. Returns `None` for anything not
+/// clearly an interval (bare numbers, dates, arbitrary text) so it never
+/// hijacks ordinary text arithmetic or comparison.
+pub(crate) fn parse_interval_text(s: &str) -> Option<(i64, i64, i64)> {
+    let tokens: Vec<&str> = s.trim().split_whitespace().collect();
+    if tokens.is_empty() {
+        return None;
+    }
+    let (mut months, mut days, mut seconds) = (0i64, 0i64, 0i64);
+    let mut i = 0;
+    let mut matched = false;
+    while i < tokens.len() {
+        if let Some(secs) = parse_hms_token(tokens[i]) {
+            seconds += secs;
+            matched = true;
+            i += 1;
+            continue;
+        }
+        if i + 1 < tokens.len()
+            && let Ok(amount) = tokens[i].parse::<i64>()
+            && apply_interval_unit(&mut months, &mut days, &mut seconds, amount, tokens[i + 1])
+                .is_some()
+        {
+            matched = true;
+            i += 2;
+            continue;
+        }
+        return None; // an unrecognized token means this isn't an interval
+    }
+    matched.then_some((months, days, seconds))
+}
+
+/// Parses an `HH:MM:SS` (optionally negative) interval time component to seconds.
+fn parse_hms_token(t: &str) -> Option<i64> {
+    let (neg, body) = t.strip_prefix('-').map_or((false, t), |r| (true, r));
+    let parts: Vec<&str> = body.split(':').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let h: i64 = parts[0].parse().ok()?;
+    let m: i64 = parts[1].parse().ok()?;
+    let s: i64 = parts[2].parse().ok()?;
+    let total = h * 3600 + m * 60 + s;
+    Some(if neg { -total } else { total })
+}
+
+/// A comparable magnitude for an interval (PostgreSQL uses a 30-day month).
+fn interval_total((months, days, seconds): (i64, i64, i64)) -> i64 {
+    months * 30 * 86400 + days * 86400 + seconds
+}
+
+/// Compares two values, treating two interval-formatted texts by magnitude
+/// (so `10 days` > `2 days`); otherwise defers to the generic `compare`.
+pub(crate) fn interval_aware_compare(a: &Value, b: &Value) -> std::cmp::Ordering {
+    if let (Value::Text(ls), Value::Text(rs)) = (a, b)
+        && let (Some(li), Some(ri)) = (parse_interval_text(ls), parse_interval_text(rs))
+    {
+        return interval_total(li).cmp(&interval_total(ri));
+    }
+    compare(a, b)
+}
+
+/// `interval ± interval` and `date/timestamp ± interval` on text operands.
+fn interval_date_arith(op: ScalarBinaryOp, l: &Value, r: &Value) -> Value {
+    if !matches!(op, ScalarBinaryOp::Add | ScalarBinaryOp::Sub) {
+        return Value::Null;
+    }
+    let (Value::Text(ls), Value::Text(rs)) = (l, r) else {
+        return Value::Null;
+    };
+    let sign = if matches!(op, ScalarBinaryOp::Sub) { -1 } else { 1 };
+    // interval ± interval
+    if let (Some((m1, d1, s1)), Some((m2, d2, s2))) =
+        (parse_interval_text(ls), parse_interval_text(rs))
+    {
+        return Value::Text(format_interval(
+            m1 + sign * m2,
+            d1 + sign * d2,
+            s1 + sign * s2,
+        ));
+    }
+    // date/timestamp ± interval (left is the date, right is the interval)
+    if let Some((m, d, s)) = parse_interval_text(rs) {
+        return apply_date_offset(l, sign * m, sign * d, sign * s);
+    }
+    Value::Null
 }
 
 /// Applies a `(months, days, seconds)` offset to an ISO date/timestamp text
@@ -965,10 +1059,7 @@ pub(crate) fn apply_binary_op(op: ScalarBinaryOp, l: Value, r: Value) -> Value {
                     _ => return Value::Null,
                 };
                 out.map(Value::Int).unwrap_or(Value::Null)
-            } else {
-                let (Some(a), Some(b)) = (as_f64(&l), as_f64(&r)) else {
-                    return Value::Null;
-                };
+            } else if let (Some(a), Some(b)) = (as_f64(&l), as_f64(&r)) {
                 match op {
                     Op::Add => Value::Float(a + b),
                     Op::Sub => Value::Float(a - b),
@@ -977,17 +1068,20 @@ pub(crate) fn apply_binary_op(op: ScalarBinaryOp, l: Value, r: Value) -> Value {
                     Op::Mod if b != 0.0 => Value::Float(a % b),
                     _ => Value::Null,
                 }
+            } else {
+                // Non-numeric operands: interval/date arithmetic on text.
+                interval_date_arith(op, &l, &r)
             }
         }
         Op::Eq | Op::NotEq | Op::Lt | Op::LtEq | Op::Gt | Op::GtEq => {
             if matches!(l, Value::Null) || matches!(r, Value::Null) {
                 return Value::Null;
             }
-            use std::cmp::Ordering::{Greater, Less};
-            let ord = compare(&l, &r);
+            use std::cmp::Ordering::{Equal, Greater, Less};
+            let ord = interval_aware_compare(&l, &r);
             Value::Bool(match op {
-                Op::Eq => values_equal(&l, &r),
-                Op::NotEq => !values_equal(&l, &r),
+                Op::Eq => ord == Equal,
+                Op::NotEq => ord != Equal,
                 Op::Lt => ord == Less,
                 Op::LtEq => ord != Greater,
                 Op::Gt => ord == Greater,

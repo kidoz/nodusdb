@@ -124,12 +124,13 @@ impl MemExecutor {
                     return None;
                 }
 
-                let ord = compare(&left_cell, &right_cell);
+                // Interval-aware: two interval texts compare by magnitude
+                // (`10 days` > `2 days`); otherwise this is the generic `compare`,
+                // which agrees with `values_equal` (`5 = 5.0` true, `5 = '5'` false).
+                let ord = crate::planner::interval_aware_compare(&left_cell, &right_cell);
                 Some(match p.op {
-                    // Equality routes through `compare` (via `values_equal`) so it
-                    // agrees with ordering — `5 = 5.0` is true, `5 = '5'` is false.
-                    CompareOp::Eq => values_equal(&left_cell, &right_cell),
-                    CompareOp::Ne => !values_equal(&left_cell, &right_cell),
+                    CompareOp::Eq => ord == std::cmp::Ordering::Equal,
+                    CompareOp::Ne => ord != std::cmp::Ordering::Equal,
                     CompareOp::Lt => ord == std::cmp::Ordering::Less,
                     CompareOp::Le => ord != std::cmp::Ordering::Greater,
                     CompareOp::Gt => ord == std::cmp::Ordering::Greater,
