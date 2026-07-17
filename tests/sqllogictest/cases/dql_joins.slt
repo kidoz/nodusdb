@@ -51,3 +51,7 @@ query TT rowsort
 SELECT emp.name, dept.dname FROM emp JOIN dept ON emp.dept_id = dept.id WHERE dept.dname = 'eng';
 ----
 alice	eng
+
+# a non-existent column in a join errors (validated against all joined columns)
+statement error
+SELECT emp.nonexistent FROM emp JOIN dept ON emp.dept_id = dept.id;

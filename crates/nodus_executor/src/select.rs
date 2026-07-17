@@ -71,6 +71,10 @@ impl MemExecutor {
             _ => None,
         };
 
+        // Whether any FROM/join table is a virtual/catalog table. Column-name
+        // validation is skipped for those, since driver introspection relies on
+        // leniently selecting catalog columns that may not all be materialized.
+        let mut query_has_virtual = false;
         let (tbl_cols, mut col_names, mut stored_rows) = if let Some(cte_out) =
             cte_results.get(&table_name)
         {
@@ -112,6 +116,7 @@ impl MemExecutor {
                 schema_name
             };
             let (tbl_cols, col_names, rows) = if Self::is_virtual_schema(schema_name) {
+                query_has_virtual = true;
                 let (cols, rows) = self.get_virtual_table(db_name, schema_name, table_only)?;
                 let prefix = table_alias.as_deref().unwrap_or(&table_name);
                 let col_names: Vec<String> = cols
@@ -124,25 +129,6 @@ impl MemExecutor {
                     .catalog_reader
                     .get_table(db_name, schema_name, table_only)?;
                 self.authorize(ctx, Action::Select, ResourceRef::Table(tbl.id))?;
-
-                // Reject a bare reference to a non-existent column on a single
-                // user table (rather than silently projecting NULL). Scoped
-                // narrowly on purpose: virtual/catalog schemas (which driver
-                // introspection relies on) took the branch above, and joins /
-                // computed expressions are left lenient to avoid false positives.
-                if joins.is_empty() {
-                    let known: std::collections::HashSet<&str> =
-                        tbl.columns.iter().map(|c| c.name.as_str()).collect();
-                    for item in &projection {
-                        if let ProjectionItem::Column(c) | ProjectionItem::AliasedColumn(c, _) = item
-                        {
-                            let bare = c.rsplit('.').next().unwrap_or(c);
-                            if !known.contains(bare) {
-                                anyhow::bail!("column \"{bare}\" does not exist");
-                            }
-                        }
-                    }
-                }
 
                 let prefix = table_alias.as_deref().unwrap_or(&table_name);
                 let col_names: Vec<String> = tbl
@@ -302,6 +288,7 @@ impl MemExecutor {
                     j_sch
                 };
                 if Self::is_virtual_schema(j_sch) {
+                    query_has_virtual = true;
                     let (cols, rows) = self.get_virtual_table(j_db, j_sch, j_tbl_name)?;
                     (cols, rows)
                 } else {
@@ -412,6 +399,25 @@ impl MemExecutor {
             stored_rows = next_rows;
             col_names = combined_cols;
             joined_columns = combined_desc;
+        }
+
+        // Reject a bare reference to a non-existent column (rather than silently
+        // projecting NULL), validated against the full base+join column set.
+        // Skipped when a virtual/catalog table is involved — driver introspection
+        // relies on leniently selecting catalog columns — and only bare column
+        // refs are checked, so computed expressions stay lenient.
+        if !query_has_virtual {
+            for item in &projection {
+                if let ProjectionItem::Column(c) | ProjectionItem::AliasedColumn(c, _) = item {
+                    let bare = c.rsplit('.').next().unwrap_or(c);
+                    let known = col_names
+                        .iter()
+                        .any(|cn| cn == c || cn == bare || cn.ends_with(&format!(".{bare}")));
+                    if !known {
+                        anyhow::bail!("column \"{bare}\" does not exist");
+                    }
+                }
+            }
         }
 
         // WHERE: conjunction of typed predicates.
