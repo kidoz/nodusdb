@@ -36,7 +36,10 @@ pub(crate) enum ColumnType {
 
 pub(crate) fn column_type(data_type: &str) -> ColumnType {
     let t = data_type.to_uppercase();
-    if t.contains("INT") || t.contains("SERIAL") {
+    // `INTERVAL` contains "INT" but is textual — check it before the INT rule.
+    if t.contains("INTERVAL") {
+        ColumnType::Text
+    } else if t.contains("INT") || t.contains("SERIAL") {
         ColumnType::Int
     } else if t.contains("FLOAT")
         || t.contains("DOUBLE")

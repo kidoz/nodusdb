@@ -40,6 +40,11 @@ pub fn expr_to_value(expr: &sqlparser::ast::Expr, params: &[crate::Value]) -> Op
             SqlValue::SingleQuotedString(s) => Some(crate::Value::Text(s.clone())),
             _ => None,
         },
+        // `INTERVAL '1 day'` — NodusDB has no native interval type, so it's kept
+        // as canonical PostgreSQL text (round-trips through INTERVAL columns).
+        Expr::Interval(iv) => {
+            parse_interval(iv).map(|(m, d, s)| crate::Value::Text(format_interval(m, d, s)))
+        }
         Expr::Array(sqlparser::ast::Array { elem, .. }) => {
             let mut arr = Vec::new();
             for e in elem {
@@ -771,6 +776,38 @@ pub(crate) fn eval_scalar_expr(expr: &ScalarExpr, row: &[Value], col_names: &[St
             *days,
             *seconds,
         ),
+    }
+}
+
+/// Renders a `(months, days, seconds)` interval as canonical PostgreSQL text,
+/// e.g. `1 year 2 mons 3 days` / `02:00:00`.
+fn format_interval(months: i64, days: i64, seconds: i64) -> String {
+    let mut parts = Vec::new();
+    let plural = |n: i64, unit: &str| format!("{n} {unit}{}", if n.abs() == 1 { "" } else { "s" });
+    let (years, mons) = (months / 12, months % 12);
+    if years != 0 {
+        parts.push(plural(years, "year"));
+    }
+    if mons != 0 {
+        parts.push(plural(mons, "mon"));
+    }
+    if days != 0 {
+        parts.push(plural(days, "day"));
+    }
+    if seconds != 0 {
+        let s = seconds.abs();
+        parts.push(format!(
+            "{}{:02}:{:02}:{:02}",
+            if seconds < 0 { "-" } else { "" },
+            s / 3600,
+            (s % 3600) / 60,
+            s % 60
+        ));
+    }
+    if parts.is_empty() {
+        "00:00:00".to_string()
+    } else {
+        parts.join(" ")
     }
 }
 
