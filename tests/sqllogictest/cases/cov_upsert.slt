@@ -1,0 +1,21 @@
+# Coverage GAP: INSERT ... ON CONFLICT (upsert) is NOT supported — the ON
+# CONFLICT clause is ignored and the insert still raises a primary-key violation.
+
+statement ok
+CREATE TABLE k (id INT PRIMARY KEY, name TEXT);
+
+statement ok
+INSERT INTO k VALUES (1, 'a');
+
+# ON CONFLICT DO NOTHING should be a no-op, but currently errors on the PK clash.
+statement error
+INSERT INTO k VALUES (1, 'b') ON CONFLICT (id) DO NOTHING;
+
+# a plain conflicting insert (the current behavior) is a duplicate-key error
+statement error
+INSERT INTO k VALUES (1, 'c');
+
+query T
+SELECT name FROM k WHERE id = 1;
+----
+a

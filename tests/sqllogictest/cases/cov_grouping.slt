@@ -1,0 +1,21 @@
+# Coverage GAP: GROUPING SETS / ROLLUP / CUBE are NOT supported (no grand-total
+# / subtotal rows are added). Plain GROUP BY works and is the substitute.
+
+statement ok
+CREATE TABLE sales (id INT PRIMARY KEY, region TEXT, amt INT);
+
+statement ok
+INSERT INTO sales VALUES (1, 'west', 100), (2, 'west', 200), (3, 'east', 50);
+
+# per-group totals via plain GROUP BY
+query TI rowsort
+SELECT region, sum(amt) FROM sales GROUP BY region;
+----
+east	50
+west	300
+
+# the grand total via a separate scalar aggregate (ROLLUP substitute)
+query I
+SELECT sum(amt) FROM sales;
+----
+350

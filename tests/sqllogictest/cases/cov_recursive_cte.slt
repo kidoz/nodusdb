@@ -1,0 +1,16 @@
+# Coverage GAP: WITH RECURSIVE is NOT supported — a recursive self-reference
+# fails to resolve ("Table not found"). Non-recursive CTEs work.
+
+statement ok
+CREATE TABLE seed (n INT PRIMARY KEY);
+
+statement ok
+INSERT INTO seed VALUES (1), (2), (3), (4), (5);
+
+# non-recursive CTE (the supported form)
+query I rowsort
+WITH c AS (SELECT n FROM seed WHERE n > 2) SELECT n FROM c;
+----
+3
+4
+5

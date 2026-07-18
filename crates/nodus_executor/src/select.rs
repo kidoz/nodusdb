@@ -779,6 +779,26 @@ impl MemExecutor {
                                         .unwrap_or(Value::Null);
                                 }
                             }
+                        } else if func_name == "FIRST_VALUE" {
+                            // The argument's value from the first row of each
+                            // partition (in the window's order).
+                            let groups =
+                                partition_groups(&row_indices, &partition_key_of, &stored_rows);
+                            let arg_idx = args.first().and_then(|c| {
+                                col_names
+                                    .iter()
+                                    .position(|tc| tc == c || tc.ends_with(&format!(".{}", c)))
+                            });
+                            for group in &groups {
+                                let first = group
+                                    .first()
+                                    .and_then(|&fi| arg_idx.and_then(|ai| stored_rows[fi].get(ai)))
+                                    .cloned()
+                                    .unwrap_or(Value::Null);
+                                for &row_idx in group {
+                                    results[row_idx] = first.clone();
+                                }
+                            }
                         } else if matches!(
                             func_name.as_str(),
                             "SUM" | "COUNT" | "AVG" | "MIN" | "MAX"
