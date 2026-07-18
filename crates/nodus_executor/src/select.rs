@@ -23,7 +23,7 @@ impl MemExecutor {
         group_by: Vec<String>,
         filter: Option<FilterExpr>,
         having: Option<FilterExpr>,
-        order_by: Vec<(String, bool)>,
+        order_by: Vec<(String, bool, Option<bool>)>,
         limit: Option<usize>,
         offset: Option<usize>,
         distinct: bool,
@@ -438,22 +438,24 @@ impl MemExecutor {
         if !is_agg {
             if !order_by.is_empty() {
                 let mut order_indices = Vec::new();
-                for (ocol, asc) in &order_by {
+                for (ocol, asc, nf) in &order_by {
                     let idx = col_names
                         .iter()
                         .position(|c| c == ocol || c.ends_with(&format!(".{}", ocol)));
                     if let Some(i) = idx {
-                        order_indices.push((i, *asc));
+                        order_indices.push((i, *asc, *nf));
                     }
                 }
                 stored_rows.sort_by(|a, b| {
-                    for (idx, asc) in &order_indices {
-                        let ord = compare(
+                    for (idx, asc, nf) in &order_indices {
+                        let ord = order_cmp(
                             a.get(*idx).unwrap_or(&crate::Value::Null),
                             b.get(*idx).unwrap_or(&crate::Value::Null),
+                            *asc,
+                            *nf,
                         );
                         if ord != std::cmp::Ordering::Equal {
-                            return if *asc { ord } else { ord.reverse() };
+                            return ord;
                         }
                     }
                     std::cmp::Ordering::Equal
@@ -1130,22 +1132,24 @@ impl MemExecutor {
         if is_agg {
             if !order_by.is_empty() {
                 let mut order_indices = Vec::new();
-                for (ocol, asc) in &order_by {
+                for (ocol, asc, nf) in &order_by {
                     let idx = out_cols
                         .iter()
                         .position(|c| c == ocol || c.ends_with(&format!(".{}", ocol)));
                     if let Some(i) = idx {
-                        order_indices.push((i, *asc));
+                        order_indices.push((i, *asc, *nf));
                     }
                 }
                 out_rows.sort_by(|a, b| {
-                    for (idx, asc) in &order_indices {
-                        let ord = compare(
+                    for (idx, asc, nf) in &order_indices {
+                        let ord = order_cmp(
                             a.get(*idx).unwrap_or(&crate::Value::Null),
                             b.get(*idx).unwrap_or(&crate::Value::Null),
+                            *asc,
+                            *nf,
                         );
                         if ord != std::cmp::Ordering::Equal {
-                            return if *asc { ord } else { ord.reverse() };
+                            return ord;
                         }
                     }
                     std::cmp::Ordering::Equal
@@ -1258,6 +1262,37 @@ impl MemExecutor {
 
 /// Groups partition-then-order-sorted row indices into per-partition runs,
 /// used by LAG/LEAD and aggregate window functions.
+/// Compares two cells for an ORDER BY key, honouring the ascending flag and an
+/// optional explicit `NULLS FIRST`/`NULLS LAST` override. With no override the
+/// default matches PostgreSQL: NULLs sort first on ASC and last on DESC.
+fn order_cmp(
+    a: &Value,
+    b: &Value,
+    asc: bool,
+    nulls_first: Option<bool>,
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let a_null = a == &Value::Null;
+    let b_null = b == &Value::Null;
+    match (a_null, b_null) {
+        (true, true) => Ordering::Equal,
+        (true, false) | (false, true) => {
+            // Default: nulls first on ASC, last on DESC — i.e. nulls_first == asc.
+            let nf = nulls_first.unwrap_or(asc);
+            // "Nulls first" means the NULL side is the lesser (earlier) one.
+            if a_null == nf {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            }
+        }
+        (false, false) => {
+            let ord = compare(a, b);
+            if asc { ord } else { ord.reverse() }
+        }
+    }
+}
+
 /// Computes the inclusive `[start, end]` index range within an ordered
 /// partition group that a window frame covers for the row at `pos`. Returns
 /// `None` when the frame is empty for that row. `order_keys` holds each group

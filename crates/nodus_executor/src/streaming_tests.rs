@@ -347,7 +347,7 @@ fn streaming_falls_back_for_non_streamable_shapes() {
         projection: vec![],
         filter: None,
         having: None,
-        order_by: vec![("id".into(), false)], // DESC
+        order_by: vec![("id".into(), false, None)], // DESC
         limit: Some(3),
         offset: None,
         distinct: false,

@@ -695,7 +695,7 @@ fn test_join_execution() {
             right: Operand::Literal(Value::Text("Herbert".into())),
         })),
         having: None,
-        order_by: vec![("books.id".into(), true)],
+        order_by: vec![("books.id".into(), true, None)],
         limit: None,
 
         offset: None,

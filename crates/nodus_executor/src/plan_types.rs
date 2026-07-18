@@ -406,8 +406,11 @@ pub enum LogicalPlan {
         filter: Option<FilterExpr>,
         /// `HAVING` predicate applied to groups after aggregation.
         having: Option<FilterExpr>,
-        /// Optional `ORDER BY (column, ascending)`.
-        order_by: Vec<(String, bool)>,
+        /// Optional `ORDER BY (column, ascending, nulls_first_override)`. The
+        /// third element is `Some(true)`/`Some(false)` for an explicit `NULLS
+        /// FIRST`/`NULLS LAST`, or `None` to use the default (nulls first on
+        /// ASC, last on DESC).
+        order_by: Vec<(String, bool, Option<bool>)>,
         /// Optional `LIMIT`.
         limit: Option<usize>,
         /// Optional `OFFSET`.
