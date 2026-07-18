@@ -1,0 +1,63 @@
+# Ported from PostgreSQL src/test/regress/sql/insert.sql (curated subset):
+# positional/named column lists, DEFAULT-less partial inserts, multi-row VALUES,
+# and ON CONFLICT interplay.
+
+statement ok
+CREATE TABLE inserttest (col1 INT, col2 INT NOT NULL, col3 TEXT);
+
+# Missing NOT NULL column must fail
+statement error
+INSERT INTO inserttest (col1) VALUES (1);
+
+statement ok
+INSERT INTO inserttest (col2, col3) VALUES (3, 'testing');
+
+statement ok
+INSERT INTO inserttest (col1, col2, col3) VALUES (7, 8, 'testing');
+
+statement ok
+INSERT INTO inserttest VALUES (10, 20, '40');
+
+# Multi-row VALUES
+statement ok
+INSERT INTO inserttest VALUES (30, 50, 'a'), (31, 51, 'b'), (32, 52, 'c');
+
+query IIT rowsort
+SELECT col1, col2, col3 FROM inserttest;
+----
+10	20	40
+30	50	a
+31	51	b
+32	52	c
+7	8	testing
+NULL	3	testing
+
+statement ok
+DROP TABLE inserttest;
+
+# RETURNING
+statement ok
+CREATE TABLE rtest (id INT PRIMARY KEY, v TEXT);
+
+query I
+INSERT INTO rtest VALUES (1, 'x') RETURNING id;
+----
+1
+
+query IT rowsort
+INSERT INTO rtest VALUES (2, 'y'), (3, 'z') RETURNING id, v;
+----
+2	y
+3	z
+
+# duplicate key errors, ON CONFLICT resolves them
+statement error
+INSERT INTO rtest VALUES (1, 'dup');
+
+statement ok
+INSERT INTO rtest VALUES (1, 'dup') ON CONFLICT (id) DO NOTHING;
+
+query T
+SELECT v FROM rtest WHERE id = 1;
+----
+x

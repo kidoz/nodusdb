@@ -9,6 +9,25 @@ use crate::{
 use anyhow::Result;
 use nodus_catalog::ColumnDescriptor;
 
+/// Resolves a column reference against a row's column names: exact match,
+/// `<qual>.<name>` suffix match, then — for a qualified reference against bare
+/// columns (e.g. `t.a` on a single-table scan) — the bare tail of the name.
+pub(crate) fn col_pos(col_names: &[String], name: &str) -> Option<usize> {
+    if let Some(i) = col_names
+        .iter()
+        .position(|c| c == name || c.ends_with(&format!(".{name}")))
+    {
+        return Some(i);
+    }
+    let tail = name.rsplit('.').next()?;
+    if tail == name {
+        return None;
+    }
+    col_names
+        .iter()
+        .position(|c| c == tail || c.ends_with(&format!(".{tail}")))
+}
+
 impl MemExecutor {
     /// Evaluates predicates against a joined or single row.
     pub(crate) fn eval_operand(
@@ -27,9 +46,7 @@ impl MemExecutor {
                 }
             }
             Operand::Ident(col) => {
-                let idx = col_names
-                    .iter()
-                    .position(|c| c == col || c.ends_with(&format!(".{}", col)));
+                let idx = col_pos(col_names, col);
                 idx.and_then(|i| row.get(i))
                     .cloned()
                     .unwrap_or(crate::Value::Null)
@@ -72,9 +89,7 @@ impl MemExecutor {
                 .eval_filter(ctx, row, col_names, columns, Some(inner))
                 .map(|b| !b),
             FilterExpr::IsNull(col) => {
-                let idx = col_names
-                    .iter()
-                    .position(|c| c == col || c.ends_with(&format!(".{}", col)));
+                let idx = col_pos(col_names, col);
                 if let Some(i) = idx {
                     Some(row.get(i).unwrap_or(&Value::Null) == &Value::Null)
                 } else {
@@ -82,9 +97,7 @@ impl MemExecutor {
                 }
             }
             FilterExpr::IsNotNull(col) => {
-                let idx = col_names
-                    .iter()
-                    .position(|c| c == col || c.ends_with(&format!(".{}", col)));
+                let idx = col_pos(col_names, col);
                 if let Some(i) = idx {
                     Some(row.get(i).unwrap_or(&Value::Null) != &Value::Null)
                 } else {
@@ -92,9 +105,7 @@ impl MemExecutor {
                 }
             }
             FilterExpr::Predicate(p) => {
-                let left_idx = col_names
-                    .iter()
-                    .position(|c| c == &p.left || c.ends_with(&format!(".{}", p.left)));
+                let left_idx = col_pos(col_names, &p.left);
                 // The left side is normally a column; it can also be a JSON
                 // access (`col ->> 'k'` / `col -> 'k'`) that the planner encoded
                 // as a synthetic name, which we compute per row here.
@@ -145,10 +156,7 @@ impl MemExecutor {
                 op,
                 subquery,
             } => {
-                let Some(idx) = col_names
-                    .iter()
-                    .position(|c| c == left || c.ends_with(&format!(".{}", left)))
-                else {
+                let Some(idx) = col_pos(col_names, left) else {
                     return Some(false);
                 };
                 let left_cell = row.get(idx).unwrap_or(&Value::Null);
@@ -157,7 +165,9 @@ impl MemExecutor {
                 }
                 // The subquery yields a single scalar; coerce it to the left
                 // column's type so comparison agrees (e.g. text "40" vs int 40).
-                let out = self.execute_logical_inner(ctx, (**subquery).clone()).ok()?;
+                // Outer references are substituted first (correlation).
+                let correlated = self.correlate_subplan(subquery, row, col_names);
+                let out = self.execute_logical_inner(ctx, correlated).ok()?;
                 let right_cell = out
                     .rows
                     .first()
@@ -183,9 +193,7 @@ impl MemExecutor {
                 right,
                 negated,
             } => {
-                let left_idx = col_names
-                    .iter()
-                    .position(|c| c == left || c.ends_with(&format!(".{}", left)));
+                let left_idx = col_pos(col_names, left);
                 let Some(idx) = left_idx else {
                     return Some(false);
                 };
@@ -212,9 +220,7 @@ impl MemExecutor {
                 list,
                 negated,
             } => {
-                let left_idx = col_names
-                    .iter()
-                    .position(|c| c == left || c.ends_with(&format!(".{}", left)));
+                let left_idx = col_pos(col_names, left);
                 let Some(idx) = left_idx else {
                     return Some(false);
                 };
@@ -260,9 +266,7 @@ impl MemExecutor {
                 subquery,
                 negated,
             } => {
-                let left_idx = col_names
-                    .iter()
-                    .position(|c| c == left || c.ends_with(&format!(".{}", left)));
+                let left_idx = col_pos(col_names, left);
                 let Some(idx) = left_idx else {
                     return Some(false);
                 };
@@ -272,8 +276,10 @@ impl MemExecutor {
                     return None;
                 }
 
-                // Blocking execution
-                let exec_res = self.execute_logical_inner(ctx, *subquery.clone());
+                // Blocking execution; outer references in the subquery are
+                // substituted with this row's values first (correlation).
+                let correlated = self.correlate_subplan(subquery, row, col_names);
+                let exec_res = self.execute_logical_inner(ctx, correlated);
                 let out = exec_res.unwrap_or(QueryOutput {
                     columns: vec![],
                     types: vec![],
@@ -365,7 +371,9 @@ impl MemExecutor {
         if let LogicalPlan::Select {
             table_name,
             table_alias,
+            joins,
             filter,
+            projection,
             ..
         } = &mut p
         {
@@ -377,8 +385,25 @@ impl MemExecutor {
             if let Some(last) = table_name.rsplit('.').next() {
                 quals.push(last.to_lowercase());
             }
+            // Joined tables (and their aliases) are inner too.
+            for j in joins.iter() {
+                if let Some(a) = j.table_alias.as_ref() {
+                    quals.push(a.to_lowercase());
+                }
+                quals.push(j.table_name.to_lowercase());
+                if let Some(last) = j.table_name.rsplit('.').next() {
+                    quals.push(last.to_lowercase());
+                }
+            }
             if let Some(f) = filter.as_ref() {
                 *filter = Some(correlate_filter(f, outer_row, outer_cols, &quals));
+            }
+            // Outer references can also appear in the projection
+            // (e.g. `SELECT upper.f1 + f2 FROM t WHERE ...`).
+            for item in projection.iter_mut() {
+                if let crate::ProjectionItem::Expr { expr, .. } = item {
+                    *expr = correlate_scalar(expr, outer_row, outer_cols, &quals);
+                }
             }
         }
         p
@@ -427,6 +452,64 @@ fn outer_lookup(name: &str, outer_cols: &[String], outer_row: &[Value]) -> Optio
         .iter()
         .position(|c| c == bare || c.ends_with(&format!(".{bare}")))?;
     outer_row.get(idx).cloned()
+}
+
+/// Rewrites a scalar expression, replacing correlated outer column references
+/// with the outer row's literal values.
+fn correlate_scalar(
+    expr: &crate::ScalarExpr,
+    outer_row: &[Value],
+    outer_cols: &[String],
+    inner_quals: &[String],
+) -> crate::ScalarExpr {
+    use crate::ScalarExpr as S;
+    let recur = |e: &S| Box::new(correlate_scalar(e, outer_row, outer_cols, inner_quals));
+    match expr {
+        S::Column(n) if is_outer_ref(n, inner_quals) => {
+            match outer_lookup(n, outer_cols, outer_row) {
+                Some(v) => S::Literal(v),
+                None => expr.clone(),
+            }
+        }
+        S::Unary { op, expr } => S::Unary {
+            op: *op,
+            expr: recur(expr),
+        },
+        S::Binary { op, left, right } => S::Binary {
+            op: *op,
+            left: recur(left),
+            right: recur(right),
+        },
+        S::Cast { expr, target } => S::Cast {
+            expr: recur(expr),
+            target: target.clone(),
+        },
+        S::Function { name, args } => S::Function {
+            name: name.clone(),
+            args: args
+                .iter()
+                .map(|a| correlate_scalar(a, outer_row, outer_cols, inner_quals))
+                .collect(),
+        },
+        S::Case {
+            operand,
+            branches,
+            else_result,
+        } => S::Case {
+            operand: operand.as_ref().map(|o| recur(o)),
+            branches: branches
+                .iter()
+                .map(|(c, r)| {
+                    (
+                        correlate_scalar(c, outer_row, outer_cols, inner_quals),
+                        correlate_scalar(r, outer_row, outer_cols, inner_quals),
+                    )
+                })
+                .collect(),
+            else_result: else_result.as_ref().map(|e| recur(e)),
+        },
+        other => other.clone(),
+    }
 }
 
 /// Rewrites a subquery filter, replacing correlated outer references with the
@@ -513,6 +596,11 @@ fn correlate_filter(
                 negated: *negated,
             }
         }
+        FilterExpr::ExprCmp { left, op, right } => FilterExpr::ExprCmp {
+            left: correlate_scalar(left, outer_row, outer_cols, inner_quals),
+            op: op.clone(),
+            right: correlate_scalar(right, outer_row, outer_cols, inner_quals),
+        },
         // Nested subquery predicates and null checks pass through: nested
         // correlation is not resolved here.
         other => other.clone(),
@@ -581,7 +669,7 @@ fn value_to_json(v: &Value) -> Option<serde_json::Value> {
 
 /// Splits a synthetic JSON-access name like `data->>'name'` into
 /// `(base_column, operator, key)`. `->>` is checked before `->`.
-fn parse_json_ref(s: &str) -> Option<(String, String, String)> {
+pub(crate) fn parse_json_ref(s: &str) -> Option<(String, String, String)> {
     for op in ["->>", "->"] {
         if let Some(pos) = s.find(op) {
             let base = s[..pos].trim().to_string();
@@ -596,7 +684,7 @@ fn parse_json_ref(s: &str) -> Option<(String, String, String)> {
 
 /// Evaluates `value -> key` / `value ->> key` on a JSON(B) or JSON-text value.
 /// `->>` returns text; `->` returns the sub-document. Missing keys yield NULL.
-fn json_extract(value: &Value, op: &str, key: &str) -> Value {
+pub(crate) fn json_extract(value: &Value, op: &str, key: &str) -> Value {
     let json: serde_json::Value = match value {
         Value::Jsonb(j) => j.clone(),
         Value::Text(s) => match serde_json::from_str(s) {

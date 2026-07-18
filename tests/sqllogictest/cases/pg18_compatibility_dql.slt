@@ -36,9 +36,9 @@ FROM pg18_dql.employees e
 JOIN pg18_dql.departments d ON e.dept_id = d.dept_id
 ORDER BY e.emp_id;
 ----
-101 Alice Engineering
-102 Bob Engineering
-103 Charlie Sales
+101	Alice	Engineering
+102	Bob	Engineering
+103	Charlie	Sales
 
 # LEFT JOIN
 query ITT
@@ -47,10 +47,10 @@ FROM pg18_dql.employees e
 LEFT JOIN pg18_dql.departments d ON e.dept_id = d.dept_id
 ORDER BY e.emp_id;
 ----
-101 Alice Engineering
-102 Bob Engineering
-103 Charlie Sales
-104 David NULL
+101	Alice	Engineering
+102	Bob	Engineering
+103	Charlie	Sales
+104	David	NULL
 
 # RIGHT JOIN
 query ITT
@@ -59,10 +59,10 @@ FROM pg18_dql.employees e
 RIGHT JOIN pg18_dql.departments d ON e.dept_id = d.dept_id
 ORDER BY d.dept_id, e.emp_id;
 ----
-101 Alice Engineering
-102 Bob Engineering
-103 Charlie Sales
-NULL NULL HR
+101	Alice	Engineering
+102	Bob	Engineering
+103	Charlie	Sales
+NULL	NULL	HR
 
 # FULL OUTER JOIN
 query ITT
@@ -71,11 +71,11 @@ FROM pg18_dql.employees e
 FULL OUTER JOIN pg18_dql.departments d ON e.dept_id = d.dept_id
 ORDER BY e.emp_id NULLS LAST, d.dept_id;
 ----
-101 Alice Engineering
-102 Bob Engineering
-103 Charlie Sales
-104 David NULL
-NULL NULL HR
+101	Alice	Engineering
+102	Bob	Engineering
+103	Charlie	Sales
+104	David	NULL
+NULL	NULL	HR
 
 # 2. CTEs (Common Table Expressions)
 query IT
@@ -84,8 +84,8 @@ WITH eng_emps AS (
 )
 SELECT emp_id, name FROM eng_emps ORDER BY emp_id;
 ----
-101 Alice
-102 Bob
+101	Alice
+102	Bob
 
 # 3. Window Functions
 query ITI
@@ -93,10 +93,10 @@ SELECT emp_id, name, ROW_NUMBER() OVER (PARTITION BY dept_id ORDER BY salary DES
 FROM pg18_dql.employees
 ORDER BY emp_id;
 ----
-101 Alice 1
-102 Bob 2
-103 Charlie 1
-104 David 1
+101	Alice	1
+102	Bob	2
+103	Charlie	1
+104	David	1
 
 # Clean up
 statement ok

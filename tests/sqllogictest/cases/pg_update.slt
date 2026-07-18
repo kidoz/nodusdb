@@ -1,0 +1,81 @@
+# Ported from PostgreSQL src/test/regress/sql/update.sql (curated subset;
+# DEFAULT-valued columns omitted — column defaults are not supported).
+
+statement ok
+CREATE TABLE update_test (a INT, b INT, c TEXT);
+
+statement ok
+INSERT INTO update_test (a, b, c) VALUES (5, 10, 'foo');
+
+statement ok
+INSERT INTO update_test (a, b) VALUES (10, 15);
+
+query IIT rowsort
+SELECT a, b, c FROM update_test;
+----
+10	15	NULL
+5	10	foo
+
+statement ok
+UPDATE update_test SET b = NULL WHERE b = 15;
+
+query IIT rowsort
+SELECT a, b, c FROM update_test;
+----
+10	NULL	NULL
+5	10	foo
+
+# aliased target
+statement ok
+UPDATE update_test AS t SET b = 10 WHERE t.a = 10;
+
+query IIT rowsort
+SELECT a, b, c FROM update_test;
+----
+10	10	NULL
+5	10	foo
+
+# computed SET expressions read the OLD row values
+statement ok
+UPDATE update_test SET a = a + 1, b = b * 2 WHERE c = 'foo';
+
+query IIT rowsort
+SELECT a, b, c FROM update_test;
+----
+10	10	NULL
+6	20	foo
+
+# multi-column swap semantics: both RHS evaluate against the old row
+statement ok
+UPDATE update_test SET a = b, b = a WHERE c = 'foo';
+
+query IIT rowsort
+SELECT a, b, c FROM update_test;
+----
+10	10	NULL
+20	6	foo
+
+# UPDATE with WHERE picking nothing is a no-op
+statement ok
+UPDATE update_test SET c = 'nope' WHERE a = 999;
+
+query I
+SELECT count(*) FROM update_test WHERE c = 'nope';
+----
+0
+
+# RETURNING
+query IIT
+UPDATE update_test SET c = 'bar' WHERE c = 'foo' RETURNING a, b, c;
+----
+20	6	bar
+
+# UPDATE driven by a subquery predicate
+statement ok
+UPDATE update_test SET c = 'max' WHERE a = (SELECT max(a) FROM update_test);
+
+query T rowsort
+SELECT c FROM update_test;
+----
+NULL
+max

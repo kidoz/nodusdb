@@ -56,6 +56,20 @@ pub fn expr_to_value(expr: &sqlparser::ast::Expr, params: &[crate::Value]) -> Op
             }
             Some(crate::Value::Array(arr))
         }
+        // Signed numeric literals: `-5`, `+3.2`.
+        Expr::UnaryOp { op, expr: inner } => {
+            let v = expr_to_value(inner, params)?;
+            match op {
+                sqlparser::ast::UnaryOperator::Minus => match v {
+                    crate::Value::Int(i) => Some(crate::Value::Int(-i)),
+                    crate::Value::Float(f) => Some(crate::Value::Float(-f)),
+                    _ => None,
+                },
+                sqlparser::ast::UnaryOperator::Plus => Some(v),
+                _ => None,
+            }
+        }
+        Expr::Nested(inner) => expr_to_value(inner, params),
         _ => None,
     }
 }
@@ -301,9 +315,9 @@ pub(crate) fn fold_scalar(expr: &sqlparser::ast::Expr, params: &[Value]) -> Opti
             Value::Null
         ))),
         Expr::Function(func) => fold_function(func, params),
-        // SUBSTRING/TRIM parse to dedicated nodes; reuse the lowering + evaluator
-        // (no columns are referenced in a FROM-less SELECT).
-        Expr::Substring { .. } | Expr::Trim { .. } | Expr::Extract { .. } => {
+        // SUBSTRING/TRIM/CASE parse to dedicated nodes; reuse the lowering +
+        // evaluator (no columns are referenced in a FROM-less SELECT).
+        Expr::Substring { .. } | Expr::Trim { .. } | Expr::Extract { .. } | Expr::Case { .. } => {
             lower_scalar(expr, params).map(|se| eval_scalar_expr(&se, &[], &[]))
         }
         _ => None,
@@ -647,6 +661,33 @@ pub(crate) fn lower_scalar(
             expr: Box::new(lower_scalar(inner, params)?),
             negated: true,
         }),
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            let operand = match operand {
+                Some(o) => Some(Box::new(lower_scalar(o, params)?)),
+                None => None,
+            };
+            let mut branches = Vec::with_capacity(conditions.len());
+            for when in conditions {
+                branches.push((
+                    lower_scalar(&when.condition, params)?,
+                    lower_scalar(&when.result, params)?,
+                ));
+            }
+            let else_result = match else_result {
+                Some(e) => Some(Box::new(lower_scalar(e, params)?)),
+                None => None,
+            };
+            Some(ScalarExpr::Case {
+                operand,
+                branches,
+                else_result,
+            })
+        }
         Expr::Function(func) => {
             use sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArguments};
             let name = func.name.to_string().to_uppercase();
@@ -655,12 +696,31 @@ pub(crate) fn lower_scalar(
                 let FunctionArguments::List(list) = &func.args else {
                     return None;
                 };
-                let arg = match list.args.first() {
-                    Some(FunctionArg::Unnamed(FunctionArgExpr::Wildcard)) => "*".to_string(),
-                    Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(e))) => extract_col_name(e)?,
-                    _ => return None,
+                return match list.args.first() {
+                    Some(FunctionArg::Unnamed(FunctionArgExpr::Wildcard)) => {
+                        Some(ScalarExpr::Aggregate {
+                            op,
+                            arg: "*".to_string(),
+                            arg_expr: None,
+                        })
+                    }
+                    Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(e))) => {
+                        match extract_col_name(e) {
+                            Some(col) => Some(ScalarExpr::Aggregate {
+                                op,
+                                arg: col,
+                                arg_expr: None,
+                            }),
+                            // Aggregate over a computed expression, e.g. `sum(a + 1)`.
+                            None => Some(ScalarExpr::Aggregate {
+                                op,
+                                arg: String::new(),
+                                arg_expr: Some(Box::new(lower_scalar(e, params)?)),
+                            }),
+                        }
+                    }
+                    _ => None,
                 };
-                return Some(ScalarExpr::Aggregate { op, arg });
             }
             if !is_foldable_scalar_fn(&name) {
                 return None;
@@ -738,12 +798,27 @@ pub(crate) fn lower_scalar(
 pub(crate) fn eval_scalar_expr(expr: &ScalarExpr, row: &[Value], col_names: &[String]) -> Value {
     match expr {
         ScalarExpr::Literal(v) => v.clone(),
-        ScalarExpr::Column(name) => col_names
-            .iter()
-            .position(|c| c == name || c.ends_with(&format!(".{name}")))
-            .and_then(|i| row.get(i))
-            .cloned()
-            .unwrap_or(Value::Null),
+        ScalarExpr::Column(name) => {
+            let direct = col_names
+                .iter()
+                .position(|c| c == name || c.ends_with(&format!(".{name}")))
+                .and_then(|i| row.get(i))
+                .cloned();
+            match direct {
+                Some(v) => v,
+                // A JSON access (`col->>'k'` / `col->'k'`) encoded as a
+                // synthetic column name: compute it per row.
+                None => match crate::filter_eval::parse_json_ref(name) {
+                    Some((base, op, key)) => col_names
+                        .iter()
+                        .position(|c| c == &base || c.ends_with(&format!(".{base}")))
+                        .and_then(|i| row.get(i))
+                        .map(|v| crate::filter_eval::json_extract(v, &op, &key))
+                        .unwrap_or(Value::Null),
+                    None => Value::Null,
+                },
+            }
+        }
         ScalarExpr::Unary { op, expr } => apply_unary_op(*op, eval_scalar_expr(expr, row, col_names)),
         ScalarExpr::Binary { op, left, right } => apply_binary_op(
             *op,
@@ -780,6 +855,29 @@ pub(crate) fn eval_scalar_expr(expr: &ScalarExpr, row: &[Value], col_names: &[St
             *days,
             *seconds,
         ),
+        ScalarExpr::Case {
+            operand,
+            branches,
+            else_result,
+        } => {
+            let op_val = operand.as_ref().map(|o| eval_scalar_expr(o, row, col_names));
+            for (cond, result) in branches {
+                let cond_val = eval_scalar_expr(cond, row, col_names);
+                let hit = match &op_val {
+                    // Simple CASE: operand = condition value (NULL never matches).
+                    Some(ov) => ov != &Value::Null && crate::values_equal(ov, &cond_val),
+                    // Searched CASE: condition must be boolean true.
+                    None => cond_val == Value::Bool(true),
+                };
+                if hit {
+                    return eval_scalar_expr(result, row, col_names);
+                }
+            }
+            match else_result {
+                Some(e) => eval_scalar_expr(e, row, col_names),
+                None => Value::Null,
+            }
+        }
     }
 }
 
@@ -1017,6 +1115,17 @@ pub(crate) fn scalar_has_aggregate(expr: &ScalarExpr) -> bool {
             scalar_has_aggregate(left) || scalar_has_aggregate(right)
         }
         ScalarExpr::Function { args, .. } => args.iter().any(scalar_has_aggregate),
+        ScalarExpr::Case {
+            operand,
+            branches,
+            else_result,
+        } => {
+            operand.as_deref().is_some_and(scalar_has_aggregate)
+                || branches
+                    .iter()
+                    .any(|(c, r)| scalar_has_aggregate(c) || scalar_has_aggregate(r))
+                || else_result.as_deref().is_some_and(scalar_has_aggregate)
+        }
         ScalarExpr::Literal(_) | ScalarExpr::Column(_) => false,
     }
 }

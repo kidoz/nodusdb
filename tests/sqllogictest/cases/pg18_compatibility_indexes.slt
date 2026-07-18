@@ -18,8 +18,8 @@ CREATE INDEX idx_category ON pg18_indexes.base_table (category);
 query ITT
 SELECT * FROM pg18_indexes.base_table WHERE category = 'CAT1' ORDER BY id;
 ----
-1 A CAT1
-2 B CAT1
+1	A	CAT1
+2	B	CAT1
 
 # Create a unique index
 statement ok

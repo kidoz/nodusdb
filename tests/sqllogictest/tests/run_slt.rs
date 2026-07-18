@@ -184,6 +184,122 @@ async fn probe_protocols() {
     server.shutdown().await;
 }
 
+/// Calibration tool (not a regression gate): executes the `.slt` files named in
+/// the `SLT_BLESS` env var (comma-separated, relative to the crate dir) and
+/// rewrites each query's expected block with the server's actual output.
+/// Statement failures are printed, not hidden — the operator must review every
+/// blessed diff against known-correct semantics before committing it. Run with:
+///   SLT_BLESS=cases/foo.slt cargo test -p nodus_sqllogictest --test run_slt \
+///     bless_cases -- --nocapture --include-ignored
+#[ignore = "calibration tool, run explicitly via SLT_BLESS"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bless_cases() {
+    let Ok(list) = std::env::var("SLT_BLESS") else {
+        println!("SLT_BLESS not set; nothing to bless");
+        return;
+    };
+    for rel in list.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(rel);
+        match bless_file(&path).await {
+            Ok(true) => println!("BLESSED {rel}"),
+            Ok(false) => println!("UNCHANGED {rel}"),
+            Err(e) => println!("ERROR {rel}: {e}"),
+        }
+    }
+}
+
+/// Runs one file, replacing every query record's expected rows with the actual
+/// server output. Returns whether the file changed on disk.
+async fn bless_file(path: &Path) -> Result<bool, String> {
+    let body = std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let records = parse(&body).map_err(|e| format!("parse error: {e}"))?;
+
+    let server = TestServer::start()
+        .await
+        .map_err(|e| format!("server start failed: {e}"))?;
+    let client = connect(&server.pgwire_addr).await;
+
+    // Execute in order; remember each query record's actual rows.
+    let mut actuals: Vec<Option<Vec<String>>> = Vec::with_capacity(records.len());
+    for record in &records {
+        match &record.expect {
+            Expect::Query { .. } => match client.simple_query(&record.sql).await {
+                Ok(m) => actuals.push(Some(render_rows(&m))),
+                Err(e) => {
+                    println!(
+                        "  line {}: query FAILED ({}) — left as-is\n    SQL: {}",
+                        record.line,
+                        err_text(&e),
+                        record.sql
+                    );
+                    actuals.push(None);
+                }
+            },
+            Expect::StatementOk => {
+                if let Err(e) = client.simple_query(&record.sql).await {
+                    println!(
+                        "  line {}: statement FAILED ({})\n    SQL: {}",
+                        record.line,
+                        err_text(&e),
+                        record.sql
+                    );
+                }
+                actuals.push(None);
+            }
+            Expect::StatementError { .. } => {
+                if client.simple_query(&record.sql).await.is_ok() {
+                    println!(
+                        "  line {}: expected error but statement SUCCEEDED\n    SQL: {}",
+                        record.line, record.sql
+                    );
+                }
+                actuals.push(None);
+            }
+        }
+    }
+    drop(client);
+    server.shutdown().await;
+
+    // Rewrite: for each query record, find its `----` and swap the block that
+    // follows (up to a blank line/EOF) for the actual rows.
+    let lines: Vec<&str> = body.lines().collect();
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    let mut i = 0usize;
+    for (record, actual) in records.iter().zip(&actuals) {
+        let Some(rows) = actual else { continue };
+        // Copy through to this record's `----` separator.
+        let mut sep = None;
+        for (j, l) in lines.iter().enumerate().skip(record.line - 1) {
+            if l.trim() == "----" {
+                sep = Some(j);
+                break;
+            }
+        }
+        let Some(sep) = sep else { continue };
+        while i <= sep {
+            out.push(lines[i].to_string());
+            i += 1;
+        }
+        // Skip the old expected block, emit the actual rows.
+        while i < lines.len() && !lines[i].trim().is_empty() {
+            i += 1;
+        }
+        out.extend(rows.iter().cloned());
+    }
+    while i < lines.len() {
+        out.push(lines[i].to_string());
+        i += 1;
+    }
+    let mut new_body = out.join("\n");
+    new_body.push('\n');
+
+    if new_body == body {
+        return Ok(false);
+    }
+    std::fs::write(path, &new_body).map_err(|e| format!("write {}: {e}", path.display()))?;
+    Ok(true)
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn run_all_cases() {
     let dir = format!("{}/cases", env!("CARGO_MANIFEST_DIR"));

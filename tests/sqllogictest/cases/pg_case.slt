@@ -1,0 +1,111 @@
+# Ported from PostgreSQL src/test/regress/sql/case.sql (curated subset).
+# Expected values follow expected/case.out, adapted to this harness's text
+# rendering (TAB-separated columns, NULL spelled NULL).
+
+statement ok
+CREATE TABLE case_tbl (i INT, f DOUBLE PRECISION);
+
+statement ok
+CREATE TABLE case2_tbl (i INT, j INT);
+
+statement ok
+INSERT INTO case_tbl VALUES (1, 10.1), (2, 20.2), (3, -30.3), (4, NULL);
+
+statement ok
+INSERT INTO case2_tbl VALUES (1, -1), (2, -2), (3, -3), (2, -4), (1, NULL), (NULL, -6);
+
+# Simplest examples without tables
+query I
+SELECT CASE WHEN 1 < 2 THEN 3 END;
+----
+3
+
+query I
+SELECT CASE WHEN 1 > 2 THEN 3 END;
+----
+NULL
+
+query I
+SELECT CASE WHEN 1 < 2 THEN 3 ELSE 4 END;
+----
+3
+
+query I
+SELECT CASE WHEN 1 > 2 THEN 3 ELSE 4 END;
+----
+4
+
+query I
+SELECT CASE WHEN 1 > 2 THEN 3 WHEN 4 < 5 THEN 6 ELSE 7 END;
+----
+6
+
+# Untyped literal in the test expression
+query I
+SELECT CASE 'a' WHEN 'a' THEN 1 ELSE 2 END;
+----
+1
+
+# Targets involving tables
+query I rowsort
+SELECT CASE WHEN i >= 3 THEN i END FROM case_tbl;
+----
+3
+4
+NULL
+NULL
+
+query I rowsort
+SELECT CASE WHEN i >= 3 THEN (i + i) ELSE i END FROM case_tbl;
+----
+1
+2
+6
+8
+
+query IT rowsort
+SELECT i,
+  CASE WHEN i < 0 THEN 'small'
+       WHEN i = 0 THEN 'zero'
+       WHEN i = 1 THEN 'one'
+       WHEN i = 2 THEN 'two'
+       ELSE 'big'
+  END
+  FROM case_tbl;
+----
+1	one
+2	two
+3	big
+4	big
+
+# COALESCE / NULLIF (CASE shorthands)
+query IR rowsort
+SELECT i, f FROM case_tbl WHERE COALESCE(f, i) = 4;
+----
+4	NULL
+
+query IR rowsort
+SELECT i, f FROM case_tbl WHERE NULLIF(f, i) = 2;
+----
+
+query I
+SELECT COALESCE(NULL, 2);
+----
+2
+
+query I
+SELECT NULLIF(1, 1);
+----
+NULL
+
+query I
+SELECT NULLIF(2, 1);
+----
+2
+
+# CASE in WHERE
+query I rowsort
+SELECT i FROM case_tbl WHERE CASE WHEN i < 3 THEN 1 ELSE 0 END = 1;
+----
+1
+2

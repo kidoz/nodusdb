@@ -18,7 +18,7 @@ CREATE VIEW pg18_views.my_view AS SELECT id, val FROM pg18_views.base_table WHER
 query IT
 SELECT id, val FROM pg18_views.my_view;
 ----
-1 A
+1	A
 
 # Clean up
 statement ok

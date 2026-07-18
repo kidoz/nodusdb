@@ -137,6 +137,62 @@ pub(crate) fn parse_aggregate_key(key: &str) -> Option<(AggregateOp, String)> {
     Some((op, arg))
 }
 
+/// Aggregates a list of already-computed per-row values (used for aggregates
+/// over expressions, e.g. `sum(a + 1)`). NULLs are skipped, matching SQL
+/// aggregate semantics; an all-NULL/empty input yields NULL (0 for COUNT).
+pub(crate) fn aggregate_values(op: &AggregateOp, vals: &[Value]) -> Value {
+    let non_null: Vec<&Value> = vals.iter().filter(|v| **v != Value::Null).collect();
+    match op {
+        AggregateOp::Count => Value::Int(non_null.len() as i64),
+        AggregateOp::Sum | AggregateOp::Avg => {
+            if non_null.is_empty() {
+                return Value::Null;
+            }
+            let mut int_sum = 0i64;
+            let mut float_sum = 0f64;
+            let mut is_float = false;
+            for v in &non_null {
+                match v {
+                    Value::Int(i) => {
+                        int_sum += i;
+                        float_sum += *i as f64;
+                    }
+                    Value::Float(f) => {
+                        is_float = true;
+                        float_sum += f;
+                    }
+                    _ => return Value::Null,
+                }
+            }
+            if *op == AggregateOp::Avg {
+                Value::Float(float_sum / non_null.len() as f64)
+            } else if is_float {
+                Value::Float(float_sum)
+            } else {
+                Value::Int(int_sum)
+            }
+        }
+        AggregateOp::Min | AggregateOp::Max => {
+            let mut best: Option<&Value> = None;
+            for v in non_null {
+                best = Some(match best {
+                    None => v,
+                    Some(b) => {
+                        let ord = crate::compare(v, b);
+                        let take = if *op == AggregateOp::Min {
+                            ord == std::cmp::Ordering::Less
+                        } else {
+                            ord == std::cmp::Ordering::Greater
+                        };
+                        if take { v } else { b }
+                    }
+                });
+            }
+            best.cloned().unwrap_or(Value::Null)
+        }
+    }
+}
+
 /// Evaluates a scalar expression over an aggregated group: `Aggregate` nodes
 /// compute over `group_rows`; a `Column` reads the group's representative
 /// (first) row. Enables `sum(a) + 1`, `count(*) * 2`, etc.
@@ -149,7 +205,18 @@ pub(crate) fn eval_scalar_expr_grouped(
         apply_binary_op, apply_date_offset, apply_unary_op, cast_value, extract_datetime_field,
     };
     match expr {
-        ScalarExpr::Aggregate { op, arg } => compute_aggregate(op, arg, group_rows, col_names),
+        ScalarExpr::Aggregate { op, arg, arg_expr } => match arg_expr {
+            // Aggregate over a computed expression: evaluate it per row, then
+            // aggregate the resulting values.
+            Some(e) => {
+                let vals: Vec<Value> = group_rows
+                    .iter()
+                    .map(|r| crate::planner::eval_scalar_expr(e, r, col_names))
+                    .collect();
+                aggregate_values(op, &vals)
+            }
+            None => compute_aggregate(op, arg, group_rows, col_names),
+        },
         ScalarExpr::DateOffset {
             base,
             months,
@@ -193,6 +260,29 @@ pub(crate) fn eval_scalar_expr_grouped(
         }
         ScalarExpr::Extract { field, expr } => {
             extract_datetime_field(&eval_scalar_expr_grouped(expr, group_rows, col_names), field)
+        }
+        ScalarExpr::Case {
+            operand,
+            branches,
+            else_result,
+        } => {
+            let op_val = operand
+                .as_ref()
+                .map(|o| eval_scalar_expr_grouped(o, group_rows, col_names));
+            for (cond, result) in branches {
+                let cond_val = eval_scalar_expr_grouped(cond, group_rows, col_names);
+                let hit = match &op_val {
+                    Some(ov) => ov != &Value::Null && crate::values_equal(ov, &cond_val),
+                    None => cond_val == Value::Bool(true),
+                };
+                if hit {
+                    return eval_scalar_expr_grouped(result, group_rows, col_names);
+                }
+            }
+            match else_result {
+                Some(e) => eval_scalar_expr_grouped(e, group_rows, col_names),
+                None => Value::Null,
+            }
         }
     }
 }

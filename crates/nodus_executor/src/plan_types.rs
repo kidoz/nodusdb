@@ -186,10 +186,14 @@ pub enum ScalarExpr {
         expr: Box<ScalarExpr>,
     },
     /// An aggregate call (e.g. `sum(a)`) nested inside a scalar expression such
-    /// as `sum(a) + 1`; evaluated over a group, not a single row.
+    /// as `sum(a) + 1`; evaluated over a group, not a single row. When the
+    /// aggregate's argument is itself an expression (e.g. `sum(a + 1)`),
+    /// `arg_expr` carries it and `arg` is empty.
     Aggregate {
         op: AggregateOp,
         arg: String,
+        #[serde(default)]
+        arg_expr: Option<Box<ScalarExpr>>,
     },
     /// `date/timestamp ± INTERVAL`, resolved to a (months, days, seconds) offset
     /// applied to the base's ISO text value.
@@ -198,6 +202,14 @@ pub enum ScalarExpr {
         months: i64,
         days: i64,
         seconds: i64,
+    },
+    /// `CASE [operand] WHEN cond THEN result ... [ELSE else] END`. With an
+    /// operand this is simple CASE (each condition compares equal to the
+    /// operand); without, each condition must evaluate to boolean true.
+    Case {
+        operand: Option<Box<ScalarExpr>>,
+        branches: Vec<(ScalarExpr, ScalarExpr)>,
+        else_result: Option<Box<ScalarExpr>>,
     },
 }
 

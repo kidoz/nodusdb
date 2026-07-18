@@ -441,16 +441,28 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
                                             sqlparser::ast::FunctionArgExpr::Expr(
                                                 Expr::Identifier(id),
                                             ),
-                                        ) => id.value.clone(),
+                                        ) => Some(id.value.clone()),
                                         sqlparser::ast::FunctionArg::Unnamed(
                                             sqlparser::ast::FunctionArgExpr::Wildcard,
-                                        ) => "*".to_string(),
-                                        _ => anyhow::bail!("Unsupported aggregate argument"),
+                                        ) => Some("*".to_string()),
+                                        _ => None,
                                     }
                                 } else {
                                     anyhow::bail!("Aggregate function requires an argument");
                                 };
-                                projection.push(ProjectionItem::Aggregate(op, inner));
+                                if let Some(inner) = inner {
+                                    projection.push(ProjectionItem::Aggregate(op, inner));
+                                } else if let Some(se) = lower_scalar(expr, params) {
+                                    // Aggregate over a computed argument, e.g.
+                                    // `sum(a + 1)`: evaluate as a grouped
+                                    // scalar expression.
+                                    projection.push(ProjectionItem::Expr {
+                                        expr: se,
+                                        alias: None,
+                                    });
+                                } else {
+                                    anyhow::bail!("Unsupported aggregate argument");
+                                }
                             }
                             _ => {
                                 let mut args = Vec::new();
@@ -516,6 +528,13 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
                 } else if let Expr::Case { .. } = expr {
                     if let Some(case_projection) = parse_case(expr, None, params) {
                         projection.push(case_projection);
+                    } else if let Some(se) = lower_scalar(expr, params) {
+                        // CASE with computed branch results / compound
+                        // conditions: evaluate as a scalar expression.
+                        projection.push(ProjectionItem::Expr {
+                            expr: se,
+                            alias: None,
+                        });
                     } else {
                         projection.push(ProjectionItem::Literal(crate::Value::Null));
                     }
@@ -622,16 +641,28 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
                                             sqlparser::ast::FunctionArgExpr::Expr(
                                                 Expr::Identifier(id),
                                             ),
-                                        ) => id.value.clone(),
+                                        ) => Some(id.value.clone()),
                                         sqlparser::ast::FunctionArg::Unnamed(
                                             sqlparser::ast::FunctionArgExpr::Wildcard,
-                                        ) => "*".to_string(),
-                                        _ => anyhow::bail!("Unsupported aggregate argument"),
+                                        ) => Some("*".to_string()),
+                                        _ => None,
                                     }
                                 } else {
                                     anyhow::bail!("Aggregate function requires an argument");
                                 };
-                                projection.push(ProjectionItem::Aggregate(op, inner));
+                                if let Some(inner) = inner {
+                                    projection.push(ProjectionItem::Aggregate(op, inner));
+                                } else if let Some(se) = lower_scalar(expr, params) {
+                                    // Aggregate over a computed argument, e.g.
+                                    // `sum(a + 1)`: evaluate as a grouped
+                                    // scalar expression.
+                                    projection.push(ProjectionItem::Expr {
+                                        expr: se,
+                                        alias: None,
+                                    });
+                                } else {
+                                    anyhow::bail!("Unsupported aggregate argument");
+                                }
                             }
                             _ => {
                                 let mut args = Vec::new();
@@ -699,6 +730,13 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
                         parse_case(expr, Some(alias.value.clone()), params)
                     {
                         projection.push(case_projection);
+                    } else if let Some(se) = lower_scalar(expr, params) {
+                        // CASE with computed branch results / compound
+                        // conditions: evaluate as a scalar expression.
+                        projection.push(ProjectionItem::Expr {
+                            expr: se,
+                            alias: Some(alias.value.clone()),
+                        });
                     } else {
                         projection.push(ProjectionItem::AliasedLiteral(
                             crate::Value::Text("TABLE".to_string()),

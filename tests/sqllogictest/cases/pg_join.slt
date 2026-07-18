@@ -1,0 +1,100 @@
+# Ported from PostgreSQL src/test/regress/sql/join.sql (curated subset).
+# Fixtures J1_TBL/J2_TBL and expected values follow expected/join.out.
+
+statement ok
+CREATE TABLE j1_tbl (i INT, j INT, t TEXT);
+
+statement ok
+CREATE TABLE j2_tbl (i INT, k INT);
+
+statement ok
+INSERT INTO j1_tbl VALUES
+  (1, 4, 'one'), (2, 3, 'two'), (3, 2, 'three'), (4, 1, 'four'),
+  (5, 0, 'five'), (6, 6, 'six'), (7, 7, 'seven'), (8, 8, 'eight'),
+  (0, NULL, 'zero'), (NULL, NULL, 'null'), (NULL, 0, 'zero');
+
+statement ok
+INSERT INTO j2_tbl VALUES
+  (1, -1), (2, 2), (3, -3), (2, 4), (5, -5), (5, -5),
+  (0, NULL), (NULL, NULL), (NULL, 0);
+
+# Table alias
+query I rowsort
+SELECT tx.i FROM j1_tbl AS tx WHERE tx.i > 6;
+----
+7
+8
+
+# CROSS JOIN cardinality: 11 x 9
+query I
+SELECT count(*) FROM j1_tbl CROSS JOIN j2_tbl;
+----
+99
+
+# Inner join with ON (NULL keys match nothing)
+query IITII rowsort
+SELECT j1_tbl.i, j, t, j2_tbl.i, k
+  FROM j1_tbl JOIN j2_tbl ON (j1_tbl.i = j2_tbl.i);
+----
+0	NULL	zero	0	NULL
+1	4	one	1	-1
+2	3	two	2	2
+2	3	two	2	4
+3	2	three	3	-3
+5	0	five	5	-5
+5	0	five	5	-5
+
+# Inner join on differing columns
+query IITII rowsort
+SELECT j1_tbl.i, j, t, j2_tbl.i, k
+  FROM j1_tbl JOIN j2_tbl ON (j1_tbl.i = j2_tbl.k);
+----
+0	NULL	zero	NULL	0
+2	3	two	2	2
+4	1	four	2	4
+
+# LEFT JOIN keeps every left row
+query IITI rowsort
+SELECT j1_tbl.i, j, t, k
+  FROM j1_tbl LEFT JOIN j2_tbl ON (j1_tbl.i = j2_tbl.i);
+----
+0	NULL	zero	NULL
+1	4	one	-1
+2	3	two	2
+2	3	two	4
+3	2	three	-3
+4	1	four	NULL
+5	0	five	-5
+5	0	five	-5
+6	6	six	NULL
+7	7	seven	NULL
+8	8	eight	NULL
+NULL	NULL	null	NULL
+NULL	0	zero	NULL
+
+# LEFT JOIN + WHERE on the right column drops NULL-extended rows
+query IITI rowsort
+SELECT j1_tbl.i, j, t, k
+  FROM j1_tbl LEFT JOIN j2_tbl ON (j1_tbl.i = j2_tbl.i) WHERE (k = 1);
+----
+
+# RIGHT JOIN keeps every right row
+query IITII rowsort
+SELECT j1_tbl.i, j, t, j2_tbl.i, k
+  FROM j1_tbl RIGHT JOIN j2_tbl ON (j1_tbl.i = j2_tbl.i);
+----
+0	NULL	zero	0	NULL
+1	4	one	1	-1
+2	3	two	2	2
+2	3	two	2	4
+3	2	three	3	-3
+5	0	five	5	-5
+5	0	five	5	-5
+NULL	NULL	NULL	NULL	NULL
+NULL	NULL	NULL	NULL	0
+
+# FULL JOIN keeps both sides
+query I
+SELECT count(*) FROM j1_tbl FULL JOIN j2_tbl ON (j1_tbl.i = j2_tbl.i);
+----
+15

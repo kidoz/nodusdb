@@ -38,14 +38,14 @@ INSERT INTO pg18_test_schema.orders (order_id, user_id, total_amount) VALUES (10
 query ITTT
 SELECT id, username, email, created_at FROM pg18_test_schema.users ORDER BY id;
 ----
-1 alice alice@example.com 2026-01-01 10:00:00
-2 bob bob@example.com 2026-01-02 11:30:00
+1	alice	alice@example.com	2026-01-01 10:00:00
+2	bob	bob@example.com	2026-01-02 11:30:00
 
 query IIF
 SELECT order_id, user_id, total_amount FROM pg18_test_schema.orders ORDER BY order_id;
 ----
-101 1 49.99
-102 2 89.50
+101	1	49.99
+102	2	89.5
 
 # Updates
 statement ok
@@ -75,8 +75,8 @@ UPDATE pg18_test_schema.users SET status = 'active';
 query IT
 SELECT id, status FROM pg18_test_schema.users ORDER BY id;
 ----
-1 active
-2 active
+1	active
+2	active
 
 statement ok
 ALTER TABLE pg18_test_schema.users RENAME COLUMN status TO account_status;
@@ -84,8 +84,8 @@ ALTER TABLE pg18_test_schema.users RENAME COLUMN status TO account_status;
 query IT
 SELECT id, account_status FROM pg18_test_schema.users ORDER BY id;
 ----
-1 active
-2 active
+1	active
+2	active
 
 statement ok
 ALTER TABLE pg18_test_schema.users DROP COLUMN email;
@@ -97,8 +97,8 @@ ALTER TABLE pg18_test_schema.users RENAME TO customers;
 query IT
 SELECT id, username FROM pg18_test_schema.customers ORDER BY id;
 ----
-1 alice
-2 bob
+1	alice
+2	bob
 
 # 5. Drop Table and Schema Operations
 statement ok

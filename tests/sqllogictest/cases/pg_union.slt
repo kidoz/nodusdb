@@ -1,0 +1,102 @@
+# Ported from PostgreSQL src/test/regress/sql/union.sql (curated subset):
+# simple UNION/INTERSECT/EXCEPT constructs plus table-backed set ops on a small
+# stand-in for INT4_TBL.
+
+query I rowsort
+SELECT 1 AS two UNION SELECT 2;
+----
+1
+2
+
+query I rowsort
+SELECT 1 AS one UNION SELECT 1;
+----
+1
+
+query I rowsort
+SELECT 1 AS two UNION ALL SELECT 2;
+----
+1
+2
+
+query I rowsort
+SELECT 1 AS two UNION ALL SELECT 1;
+----
+1
+1
+
+query I rowsort
+SELECT 1 AS three UNION SELECT 2 UNION SELECT 3;
+----
+1
+2
+3
+
+query I rowsort
+SELECT 1 AS two UNION SELECT 2 UNION SELECT 2;
+----
+1
+2
+
+query I rowsort
+SELECT 1 AS three UNION SELECT 2 UNION ALL SELECT 2;
+----
+1
+2
+2
+
+# Set ops over a table
+statement ok
+CREATE TABLE int4_tbl (f1 INT);
+
+statement ok
+INSERT INTO int4_tbl VALUES (0), (123456), (-123456), (2147483647), (-2147483647);
+
+query I rowsort
+SELECT f1 FROM int4_tbl UNION SELECT f1 FROM int4_tbl;
+----
+-123456
+-2147483647
+0
+123456
+2147483647
+
+query I
+SELECT count(*) FROM (SELECT f1 FROM int4_tbl UNION ALL SELECT f1 FROM int4_tbl) t;
+----
+10
+
+query I rowsort
+SELECT f1 FROM int4_tbl WHERE f1 > 0 UNION SELECT f1 FROM int4_tbl WHERE f1 < 0;
+----
+-123456
+-2147483647
+123456
+2147483647
+
+# INTERSECT / EXCEPT
+query I rowsort
+SELECT f1 FROM int4_tbl INTERSECT SELECT f1 FROM int4_tbl WHERE f1 > 0;
+----
+123456
+2147483647
+
+query I rowsort
+SELECT f1 FROM int4_tbl EXCEPT SELECT f1 FROM int4_tbl WHERE f1 > 0;
+----
+-123456
+-2147483647
+0
+
+query I rowsort
+SELECT 1 AS x INTERSECT SELECT 2;
+----
+
+query I rowsort
+SELECT 1 AS x EXCEPT SELECT 1;
+----
+
+query I rowsort
+SELECT 1 AS x EXCEPT SELECT 2;
+----
+1

@@ -21,7 +21,7 @@ mod constraints;
 mod ddl;
 mod dml;
 mod execute;
-mod filter_eval;
+pub(crate) mod filter_eval;
 mod information_schema;
 mod pg_catalog;
 mod plan_types;

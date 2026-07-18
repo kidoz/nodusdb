@@ -149,13 +149,21 @@ pub(crate) fn resolve_scalar_arg(arg: &str, row: &[Value], col_names: &[String])
         Value::Int(i)
     } else if let Ok(f) = arg.parse::<f64>() {
         Value::Float(f)
-    } else {
+    } else if let Some(i) = col_names
+        .iter()
+        .position(|tc| tc == arg || tc.ends_with(&format!(".{arg}")))
+    {
+        row.get(i).cloned().unwrap_or(Value::Null)
+    } else if let Some((base, op, key)) = crate::filter_eval::parse_json_ref(arg) {
+        // A JSON access (`col->>'k'`) encoded as a synthetic arg name.
         col_names
             .iter()
-            .position(|tc| tc == arg || tc.ends_with(&format!(".{arg}")))
+            .position(|tc| tc == &base || tc.ends_with(&format!(".{base}")))
             .and_then(|i| row.get(i))
-            .cloned()
+            .map(|v| crate::filter_eval::json_extract(v, &op, &key))
             .unwrap_or(Value::Null)
+    } else {
+        Value::Null
     }
 }
 

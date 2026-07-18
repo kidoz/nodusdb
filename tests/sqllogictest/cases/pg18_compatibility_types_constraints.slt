@@ -74,7 +74,7 @@ VALUES (1, true, 4.5, 4.555, '2026-06-08 12:00:00', '2026-06-08');
 query IRRFTT
 SELECT id, is_active, score, rating, created_at, start_date FROM pg18_types_schema.all_types WHERE id = 1;
 ----
-1 true 4.5 4.555 2026-06-08 12:00:00 2026-06-08
+1	t	4.5	4.555	2026-06-08 12:00:00	2026-06-08
 
 # Clean up
 statement ok

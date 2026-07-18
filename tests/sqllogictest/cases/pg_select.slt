@@ -1,0 +1,99 @@
+# Ported from PostgreSQL src/test/regress/sql/select.sql (curated subset).
+# pg's file scans onek; this port keeps the construct coverage on a compact
+# fixture: ORDER BY asc/desc over multiple keys, DISTINCT, boolean predicates,
+# and select lists with expressions.
+
+statement ok
+CREATE TABLE onek_mini (unique1 INT, unique2 INT, ten INT, string4 TEXT);
+
+statement ok
+INSERT INTO onek_mini VALUES
+  (147, 0, 7, 'RAAAAA'),
+  (931, 1, 1, 'VJAAAA'),
+  (714, 2, 4, 'SNAAAA'),
+  (711, 3, 1, 'JBBAAA'),
+  (883, 4, 3, 'ZFBAAA'),
+  (439, 5, 9, 'WVAAAA'),
+  (670, 6, 0, 'SJAAAA'),
+  (543, 7, 3, 'XXAAAA'),
+  (425, 8, 5, 'JJAAAA'),
+  (800, 9, 0, 'UUAAAA');
+
+# ORDER BY one key
+query II
+SELECT unique1, unique2 FROM onek_mini ORDER BY unique1 LIMIT 3;
+----
+147	0
+425	8
+439	5
+
+query II
+SELECT unique1, unique2 FROM onek_mini ORDER BY unique1 DESC LIMIT 3;
+----
+931	1
+883	4
+800	9
+
+# ORDER BY two keys, mixed directions
+query IIT
+SELECT ten, unique1, string4 FROM onek_mini ORDER BY ten, unique1 DESC LIMIT 5;
+----
+0	800	UUAAAA
+0	670	SJAAAA
+1	931	VJAAAA
+1	711	JBBAAA
+3	883	ZFBAAA
+
+# DISTINCT
+query I rowsort
+SELECT DISTINCT ten FROM onek_mini WHERE ten < 4;
+----
+0
+1
+3
+
+# Compound predicates
+query I rowsort
+SELECT unique1 FROM onek_mini WHERE unique1 > 700 AND ten = 1;
+----
+711
+931
+
+query I rowsort
+SELECT unique1 FROM onek_mini WHERE unique1 > 800 OR ten = 5;
+----
+425
+883
+931
+
+# Expressions in the select list
+query II
+SELECT unique2, unique1 + 1000 FROM onek_mini WHERE unique2 < 3 ORDER BY unique2;
+----
+0	1147
+1	1931
+2	1714
+
+# BETWEEN
+query I rowsort
+SELECT unique2 FROM onek_mini WHERE unique1 BETWEEN 700 AND 800;
+----
+2
+3
+9
+
+# IN list
+query I rowsort
+SELECT unique1 FROM onek_mini WHERE unique2 IN (0, 5, 9);
+----
+147
+439
+800
+
+# Whole-row ordering sanity: LIMIT + OFFSET paging is stable under ORDER BY
+query I
+SELECT unique2 FROM onek_mini ORDER BY unique1 LIMIT 3 OFFSET 2;
+----
+5
+7
+6

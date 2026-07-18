@@ -1,0 +1,64 @@
+# Ported from PostgreSQL src/test/regress/sql/delete.sql (curated subset).
+
+statement ok
+CREATE TABLE delete_test (id INT PRIMARY KEY, a INT, b TEXT);
+
+statement ok
+INSERT INTO delete_test (id, a) VALUES (1, 10);
+
+statement ok
+INSERT INTO delete_test (id, a, b) VALUES (2, 50, 'xyz');
+
+statement ok
+INSERT INTO delete_test (id, a) VALUES (3, 100);
+
+# Predicate delete
+statement ok
+DELETE FROM delete_test WHERE a > 10 AND b = 'xyz';
+
+query IIT rowsort
+SELECT id, a, b FROM delete_test;
+----
+1	10	NULL
+3	100	NULL
+
+# Aliased target
+statement ok
+DELETE FROM delete_test AS dt WHERE dt.a > 75;
+
+query I rowsort
+SELECT id FROM delete_test;
+----
+1
+
+# DELETE with RETURNING
+statement ok
+INSERT INTO delete_test (id, a, b) VALUES (4, 40, 'keepme');
+
+query IIT
+DELETE FROM delete_test WHERE id = 4 RETURNING id, a, b;
+----
+4	40	keepme
+
+# Subquery predicate
+statement ok
+INSERT INTO delete_test (id, a) VALUES (5, 1), (6, 2), (7, 3);
+
+statement ok
+DELETE FROM delete_test WHERE a = (SELECT max(a) FROM delete_test);
+
+query I rowsort
+SELECT id FROM delete_test;
+----
+5
+6
+7
+
+# Unqualified DELETE empties the table
+statement ok
+DELETE FROM delete_test;
+
+query I
+SELECT count(*) FROM delete_test;
+----
+0

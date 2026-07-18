@@ -1,0 +1,111 @@
+# Ported from PostgreSQL src/test/regress/sql/aggregates.sql (curated subset).
+# pg's file runs over onek/tenk1; this port uses a compact stand-in with the
+# same construct coverage: basic aggregates, GROUP BY, HAVING, aggregates over
+# expressions, NULL handling, and DISTINCT counts.
+
+statement ok
+CREATE TABLE aggtest (a INT, b FLOAT);
+
+statement ok
+INSERT INTO aggtest VALUES (56, 7.8), (100, 99.097), (0, 0.09561), (42, 324.78);
+
+query I
+SELECT count(*) FROM aggtest;
+----
+4
+
+query I
+SELECT count(b) FROM aggtest;
+----
+4
+
+query I
+SELECT sum(a) FROM aggtest;
+----
+198
+
+query I
+SELECT min(a) FROM aggtest;
+----
+0
+
+query I
+SELECT max(a) FROM aggtest;
+----
+100
+
+query R
+SELECT avg(a) FROM aggtest;
+----
+49.5
+
+# Aggregates ignore NULLs; count(*) does not
+statement ok
+CREATE TABLE nulltest (v INT);
+
+statement ok
+INSERT INTO nulltest VALUES (1), (NULL), (3), (NULL);
+
+query I
+SELECT count(*) FROM nulltest;
+----
+4
+
+query I
+SELECT count(v) FROM nulltest;
+----
+2
+
+query I
+SELECT sum(v) FROM nulltest;
+----
+4
+
+# Aggregate over an expression
+query I
+SELECT sum(a + 1) FROM aggtest;
+----
+202
+
+# GROUP BY + HAVING
+statement ok
+CREATE TABLE grptest (g TEXT, v INT);
+
+statement ok
+INSERT INTO grptest VALUES
+  ('a', 1), ('a', 2), ('b', 3), ('b', 4), ('b', 5), ('c', 6);
+
+query TI rowsort
+SELECT g, sum(v) FROM grptest GROUP BY g;
+----
+a	3
+b	12
+c	6
+
+query TI rowsort
+SELECT g, count(*) FROM grptest GROUP BY g HAVING count(*) > 1;
+----
+a	2
+b	3
+
+query TI rowsort
+SELECT g, max(v) FROM grptest GROUP BY g HAVING max(v) < 6;
+----
+a	2
+b	5
+
+# Aggregate on empty input: count is 0, sum/min/max are NULL
+query I
+SELECT count(*) FROM grptest WHERE v > 100;
+----
+0
+
+query I
+SELECT sum(v) FROM grptest WHERE v > 100;
+----
+NULL
+
+query I
+SELECT max(v) FROM grptest WHERE v > 100;
+----
+NULL

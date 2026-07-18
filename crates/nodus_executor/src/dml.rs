@@ -292,10 +292,14 @@ impl MemExecutor {
 
         let mut updated = 0;
         let mut returning_rows = Vec::new();
-        for (old_key, mut row) in self.scan_rows_keyed(tbl.id, &ctx.session_id)? {
-            if !self.row_matches(ctx, &row, &tbl.columns, filter.as_ref()) {
-                continue;
-            }
+        // Two-phase: pick the matching rows before mutating, so a subquery in
+        // the filter evaluates against the pre-statement state.
+        let targets: Vec<(String, Vec<Value>)> = self
+            .scan_rows_keyed(tbl.id, &ctx.session_id)?
+            .into_iter()
+            .filter(|(_, row)| self.row_matches(ctx, row, &tbl.columns, filter.as_ref()))
+            .collect();
+        for (old_key, mut row) in targets {
             let old_row = row.clone();
             // The row's actual stored key (any scheme); the new key is derived
             // from the updated content, migrating old-scheme rows on write.
@@ -411,10 +415,15 @@ impl MemExecutor {
         let key_prefix = format!("{}:", tbl.id);
         let mut deleted = 0;
         let mut returning_rows = Vec::new();
-        for (key, row) in self.scan_rows_keyed(tbl.id, &ctx.session_id)? {
-            if !self.row_matches(ctx, &row, &tbl.columns, filter.as_ref()) {
-                continue;
-            }
+        // Two-phase: decide WHICH rows match before mutating anything, so a
+        // subquery in the filter (e.g. `WHERE a = (SELECT max(a) ...)`) sees
+        // the pre-statement state rather than partially-deleted data.
+        let victims: Vec<(String, Vec<Value>)> = self
+            .scan_rows_keyed(tbl.id, &ctx.session_id)?
+            .into_iter()
+            .filter(|(_, row)| self.row_matches(ctx, row, &tbl.columns, filter.as_ref()))
+            .collect();
+        for (key, row) in victims {
             // Use the row's actual stored key (works for any key scheme), and
             // derive the index-entry suffix from it.
             let pk_str = key.strip_prefix(&key_prefix).unwrap_or(&key).to_string();
