@@ -216,6 +216,7 @@ fn create_insert_select_round_trip() {
                 ]],
 
                 returning: vec![],
+                on_conflict: None,
             },
         )
         .unwrap();
@@ -354,6 +355,7 @@ fn rows_keyed_by_declared_pk_not_first_column() {
                 columns: vec!["label".into(), "id".into()],
                 values_list: vec![vec![Value::Text("dup".into()), Value::Text(id.into())]],
                 returning: vec![],
+                on_conflict: None,
             },
         )
         .unwrap_or_else(|e| panic!("insert id={id} must succeed: {e}"));
@@ -386,6 +388,7 @@ fn rows_keyed_by_declared_pk_not_first_column() {
             columns: vec!["label".into(), "id".into()],
             values_list: vec![vec![Value::Text("other".into()), Value::Text("1".into())]],
             returning: vec![],
+            on_conflict: None,
         },
     );
     assert!(dup.is_err(), "duplicate primary key must be rejected");
@@ -451,6 +454,7 @@ fn typed_values_round_trip_and_filter_by_int() {
             ]],
 
             returning: vec![],
+            on_conflict: None,
         },
     )
     .unwrap();
@@ -520,6 +524,7 @@ fn update_and_delete_rows() {
                 values_list: vec![vec![Value::Text(id.into()), Value::Text(name.into())]],
 
                 returning: vec![],
+                on_conflict: None,
             },
         )
         .unwrap();
@@ -633,6 +638,7 @@ fn test_join_execution() {
                 values_list: vec![vec![Value::Text(id.into()), Value::Text(name.into())]],
 
                 returning: vec![],
+                on_conflict: None,
             },
         )
         .unwrap();
@@ -655,6 +661,7 @@ fn test_join_execution() {
                 ]],
 
                 returning: vec![],
+                on_conflict: None,
             },
         )
         .unwrap();
@@ -757,6 +764,7 @@ fn transactions_are_isolated_per_session() {
             values_list: vec![vec![Value::Text("1".into()), Value::Text("b".into())]],
 
             returning: vec![],
+            on_conflict: None,
         },
     )
     .unwrap();
@@ -872,6 +880,7 @@ fn test_complex_filters() {
                 ]],
 
                 returning: vec![],
+                on_conflict: None,
             },
         )
         .unwrap();
@@ -952,6 +961,7 @@ fn test_left_outer_join() {
                 values_list: vec![vec![Value::Text(id.into()), Value::Text(name.into())]],
 
                 returning: vec![],
+                on_conflict: None,
             },
         )
         .unwrap();
@@ -970,6 +980,7 @@ fn test_left_outer_join() {
                 ]],
 
                 returning: vec![],
+                on_conflict: None,
             },
         )
         .unwrap();

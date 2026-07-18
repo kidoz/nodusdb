@@ -90,6 +90,7 @@ impl MemExecutor {
         columns: Vec<String>,
         values_list: Vec<Vec<Value>>,
         returning: Vec<String>,
+        on_conflict: Option<crate::plan_types::OnConflictClause>,
     ) -> Result<QueryOutput> {
         let (db_name, schema_name, table_only) = parse_object_name(&table_name)?;
         let tbl = self
@@ -98,6 +99,7 @@ impl MemExecutor {
         self.authorize(ctx, Action::Insert, ResourceRef::Table(tbl.id))?;
 
         let col_names: Vec<&str> = tbl.columns.iter().map(|c| c.name.as_str()).collect();
+        let col_names_owned: Vec<String> = tbl.columns.iter().map(|c| c.name.clone()).collect();
         let pk_positions = Self::pk_positions(&tbl);
         let mut inserted_count = 0;
         let mut returning_rows = Vec::new();
@@ -126,6 +128,82 @@ impl MemExecutor {
                     anyhow::bail!("Column {} cannot be NULL", c.name);
                 }
                 row.push(val);
+            }
+
+            // ON CONFLICT: for a keyed table, look up the target key before we
+            // reach the unique-constraint check (which would raise a violation).
+            // A conflict is resolved by skipping the row (DO NOTHING) or updating
+            // the existing row in place (DO UPDATE). Synthetic-rowid tables have
+            // no unique key, so they never conflict.
+            if let Some(clause) = &on_conflict {
+                if !Self::uses_synthetic_rowid(&tbl) {
+                    let target_pk = Self::row_pk(&pk_positions, &row);
+                    let target_key = format!("{}:{}", tbl.id, target_pk);
+                    let existing = self
+                        .scan_rows_keyed(tbl.id, &ctx.session_id)?
+                        .into_iter()
+                        .find(|(k, _)| k == &target_key);
+                    if let Some((existing_key, mut existing_row)) = existing {
+                        match clause {
+                            crate::plan_types::OnConflictClause::DoNothing => continue,
+                            crate::plan_types::OnConflictClause::DoUpdate(assignments) => {
+                                let old_row = existing_row.clone();
+                                for (col, expr) in assignments {
+                                    if let Some(idx) = col_names.iter().position(|c| c == col) {
+                                        let val =
+                                            eval_scalar_expr(expr, &old_row, &col_names_owned);
+                                        let coerced = crate::value::coerce_for_column(
+                                            &val,
+                                            &tbl.columns[idx].data_type,
+                                        );
+                                        if !tbl.columns[idx].nullable && coerced == Value::Null {
+                                            anyhow::bail!("Column {} cannot be NULL", col);
+                                        }
+                                        existing_row[idx] = coerced;
+                                    }
+                                }
+                                self.write_row(
+                                    &ctx.session_id,
+                                    existing_key,
+                                    serde_json::to_string(&existing_row)?,
+                                )?;
+                                // Maintain secondary indexes for changed key columns.
+                                for idx in &tbl.indexes {
+                                    for kcol in &idx.key_columns {
+                                        if let Some(pos) = tbl
+                                            .columns
+                                            .iter()
+                                            .position(|c| c.id == kcol.column_id)
+                                        {
+                                            let old_v = old_row.get(pos).unwrap_or(&Value::Null);
+                                            let new_v =
+                                                existing_row.get(pos).unwrap_or(&Value::Null);
+                                            if old_v != new_v {
+                                                self.delete_index_entry(
+                                                    &ctx.session_id,
+                                                    idx.id,
+                                                    old_v,
+                                                    &target_pk,
+                                                )?;
+                                                self.write_index_entry(
+                                                    &ctx.session_id,
+                                                    idx.id,
+                                                    new_v,
+                                                    &target_pk,
+                                                )?;
+                                            }
+                                        }
+                                    }
+                                }
+                                inserted_count += 1;
+                                if !returning.is_empty() {
+                                    returning_rows.push(existing_row);
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                }
             }
 
             self.check_unique_constraints(&ctx.session_id, &tbl, &row, None)?;

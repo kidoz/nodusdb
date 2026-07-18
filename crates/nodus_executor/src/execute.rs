@@ -50,7 +50,8 @@ impl MemExecutor {
                 columns,
                 values_list,
                 returning,
-            } => self.exec_insert(ctx, table_name, columns, values_list, returning),
+                on_conflict,
+            } => self.exec_insert(ctx, table_name, columns, values_list, returning, on_conflict),
             LogicalPlan::Select {
                 ctes,
                 table_name,

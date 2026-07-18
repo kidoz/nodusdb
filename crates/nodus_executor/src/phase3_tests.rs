@@ -88,6 +88,7 @@ fn test_ddl_and_subqueries() {
                 ],
             ],
             returning: vec![],
+            on_conflict: None,
         },
     )
     .unwrap();
@@ -161,6 +162,7 @@ fn test_ddl_and_subqueries() {
                 Value::Text("Engineering".into()),
             ]],
             returning: vec![],
+            on_conflict: None,
         },
     )
     .unwrap();
@@ -270,6 +272,7 @@ fn test_unique_constraints() {
                 vec![Value::Int(2), Value::Text("b@b.com".into())],
             ],
             returning: vec![],
+            on_conflict: None,
         },
     )
     .unwrap();
@@ -281,6 +284,7 @@ fn test_unique_constraints() {
             columns: vec![],
             values_list: vec![vec![Value::Int(1), Value::Text("c@c.com".into())]],
             returning: vec![],
+            on_conflict: None,
         },
     );
     assert!(res.is_err());
@@ -297,6 +301,7 @@ fn test_unique_constraints() {
             columns: vec![],
             values_list: vec![vec![Value::Int(3), Value::Text("b@b.com".into())]],
             returning: vec![],
+            on_conflict: None,
         },
     );
     assert!(res2.is_err());
@@ -391,6 +396,7 @@ fn test_secondary_indexing() {
                 vec![Value::Int(3), Value::Text("A".into())],
             ],
             returning: vec![],
+            on_conflict: None,
         },
     )
     .unwrap();
@@ -419,6 +425,7 @@ fn test_secondary_indexing() {
                 vec![Value::Int(5), Value::Text("A".into())],
             ],
             returning: vec![],
+            on_conflict: None,
         },
     )
     .unwrap();
@@ -623,6 +630,7 @@ fn test_index_value_containing_separator_does_not_overmatch() {
                 vec![Value::Int(2), Value::Text("a".into())],
             ],
             returning: vec![],
+            on_conflict: None,
         },
     )
     .unwrap();
@@ -726,6 +734,7 @@ fn test_alter_table_migrations() {
             columns: vec![],
             values_list: vec![vec![Value::Int(1), Value::Text("Alice".into())]],
             returning: vec![],
+            on_conflict: None,
         },
     )
     .unwrap();

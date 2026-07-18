@@ -60,6 +60,7 @@ fn test_group_by_aggregates() {
                     Value::Text(amt.into()),
                 ]],
                 returning: vec![],
+                on_conflict: None,
             },
         )
         .unwrap();
@@ -270,6 +271,7 @@ fn test_set_operations() {
                 columns: vec![],
                 values_list: vec![vec![Value::Text(id.to_string()), Value::Text(n.into())]],
                 returning: vec![],
+                on_conflict: None,
             },
         )
         .unwrap();
@@ -357,6 +359,7 @@ fn test_cross_join() {
                 columns: vec![],
                 values_list: vec![vec![Value::Text(id.into()), Value::Text(v.into())]],
                 returning: vec![],
+                on_conflict: None,
             },
         )
         .unwrap();
@@ -416,6 +419,7 @@ fn test_having() {
                     Value::Text(amt.into()),
                 ]],
                 returning: vec![],
+                on_conflict: None,
             },
         )
         .unwrap();
@@ -494,6 +498,7 @@ fn test_window_functions() {
                 columns: vec![],
                 values_list: vec![vec![Value::Text(id.into()), Value::Text(amt.into())]],
                 returning: vec![],
+                on_conflict: None,
             },
         )
         .unwrap();

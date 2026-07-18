@@ -291,11 +291,37 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                     }
                 }
             }
+            let on_conflict = match &insert.on {
+                Some(sqlparser::ast::OnInsert::OnConflict(oc)) => match &oc.action {
+                    sqlparser::ast::OnConflictAction::DoNothing => {
+                        Some(crate::plan_types::OnConflictClause::DoNothing)
+                    }
+                    sqlparser::ast::OnConflictAction::DoUpdate(du) => {
+                        let assigns = du
+                            .assignments
+                            .iter()
+                            .filter_map(|a| {
+                                let col = match &a.target {
+                                    sqlparser::ast::AssignmentTarget::ColumnName(name) => {
+                                        name.0.last()?.as_ident()?.value.clone()
+                                    }
+                                    sqlparser::ast::AssignmentTarget::Tuple(_) => return None,
+                                };
+                                let val = lower_scalar(&a.value, params)?;
+                                Some((col, val))
+                            })
+                            .collect();
+                        Some(crate::plan_types::OnConflictClause::DoUpdate(assigns))
+                    }
+                },
+                _ => None,
+            };
             Ok(LogicalPlan::Insert {
                 table_name,
                 columns: cols,
                 values_list,
                 returning,
+                on_conflict,
             })
         }
         Statement::Query(query) => plan_query(query, params),

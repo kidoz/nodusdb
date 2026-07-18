@@ -113,6 +113,16 @@ pub struct Join {
     pub natural: bool,
 }
 
+/// `ON CONFLICT` action for an INSERT that hits an existing key.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum OnConflictClause {
+    /// `DO NOTHING` — skip the conflicting row.
+    DoNothing,
+    /// `DO UPDATE SET …` — update the existing row with these assignments
+    /// (evaluated against the existing row).
+    DoUpdate(Vec<(String, ScalarExpr)>),
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum AggregateOp {
     Count,
@@ -342,6 +352,10 @@ pub enum LogicalPlan {
         columns: Vec<String>,
         values_list: Vec<Vec<Value>>,
         returning: Vec<String>,
+        /// `ON CONFLICT` behaviour when a row collides with an existing key.
+        /// Defaulted so plans serialized before this field decode.
+        #[serde(default)]
+        on_conflict: Option<OnConflictClause>,
     },
     Select {
         ctes: Vec<(String, Box<LogicalPlan>)>,

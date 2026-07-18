@@ -60,6 +60,7 @@ fn test_offset_distinct_returning() {
                     vec![Value::Text("4".into()), Value::Text("C".into())],
                 ],
                 returning: vec!["id".into(), "val".into()],
+                on_conflict: None,
             },
         )
         .unwrap();

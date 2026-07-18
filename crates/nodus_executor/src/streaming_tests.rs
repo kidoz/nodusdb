@@ -189,6 +189,7 @@ fn exec_with_rows(
                 columns: vec!["id".into(), "name".into()],
                 values_list: vec![vec![Value::Int(i), Value::Text(format!("n{i}"))]],
                 returning: vec![],
+                on_conflict: None,
             },
         )
         .unwrap();
