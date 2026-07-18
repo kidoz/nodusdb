@@ -1,6 +1,7 @@
-# Coverage GAP: EXISTS / NOT EXISTS (correlated subqueries) are NOT evaluated —
-# the predicate is treated as always-true and returns every row. The equivalent
-# IN / NOT IN subquery form works and is the current substitute.
+# EXISTS / NOT EXISTS (including correlated subqueries) are supported: outer
+# column references inside the subquery are substituted with the current row's
+# values before the subquery runs, and the predicate is true iff the subquery
+# yields at least one row.
 
 statement ok
 CREATE TABLE t (id INT PRIMARY KEY, v INT);
@@ -9,20 +10,56 @@ statement ok
 INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);
 
 statement ok
-CREATE TABLE u (tid INT);
+CREATE TABLE u (tid INT, label TEXT);
 
 statement ok
-INSERT INTO u VALUES (1), (3);
+INSERT INTO u VALUES (1, 'a'), (3, 'c'), (3, 'c2');
 
-# IN-subquery substitute for EXISTS
+# correlated EXISTS: keep rows of t that have a matching u row
+query I rowsort
+SELECT id FROM t o WHERE EXISTS (SELECT 1 FROM u i WHERE i.tid = o.id);
+----
+1
+3
+
+# correlated NOT EXISTS: the complement
+query I rowsort
+SELECT id FROM t o WHERE NOT EXISTS (SELECT 1 FROM u i WHERE i.tid = o.id);
+----
+2
+
+# outer reference on the left side of the inner predicate
+query I rowsort
+SELECT id FROM t o WHERE EXISTS (SELECT 1 FROM u i WHERE o.id = i.tid);
+----
+1
+3
+
+# correlated EXISTS combined with an ordinary inner filter
+query I rowsort
+SELECT id FROM t o WHERE EXISTS (SELECT 1 FROM u i WHERE i.tid = o.id AND i.label = 'c');
+----
+3
+
+# uncorrelated EXISTS: true for every row when the subquery is non-empty
+query I rowsort
+SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u);
+----
+1
+2
+3
+
+# uncorrelated NOT EXISTS against an empty result excludes all rows
+query I rowsort
+SELECT id FROM t WHERE NOT EXISTS (SELECT 1 FROM u WHERE tid = 999);
+----
+1
+2
+3
+
+# the IN-subquery form still works alongside EXISTS
 query I rowsort
 SELECT id FROM t WHERE id IN (SELECT tid FROM u);
 ----
 1
 3
-
-# NOT IN substitute for NOT EXISTS
-query I rowsort
-SELECT id FROM t WHERE id NOT IN (SELECT tid FROM u);
-----
-2

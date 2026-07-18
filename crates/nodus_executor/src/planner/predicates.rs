@@ -115,6 +115,13 @@ pub(crate) fn parse_filter_expr(
                 negated: *negated,
             })
         }
+        Expr::Exists { subquery, negated } => {
+            let sub_plan = plan_query(subquery, params).ok()?;
+            Some(FilterExpr::Exists {
+                subquery: Box::new(sub_plan),
+                negated: *negated,
+            })
+        }
         Expr::BinaryOp { left, op, right } => {
             let left_col = extract_col_name(left)?;
             let cmp = compare_op(op)?;

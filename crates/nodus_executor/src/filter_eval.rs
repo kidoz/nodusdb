@@ -3,8 +3,8 @@
 //! `LIKE`, null checks, and JSONB containment), and the `row_matches` gate.
 
 use crate::{
-    CompareOp, ExecutionContext, FilterExpr, MemExecutor, Operand, Predicate, QueryOutput, Value,
-    coerce, column_type, compare, render, values_equal,
+    CompareOp, ExecutionContext, FilterExpr, LogicalPlan, MemExecutor, Operand, Predicate,
+    QueryOutput, Value, coerce, column_type, compare, render, values_equal,
 };
 use anyhow::Result;
 use nodus_catalog::ColumnDescriptor;
@@ -313,7 +313,57 @@ impl MemExecutor {
                     }
                 }
             }
+            FilterExpr::Exists { subquery, negated } => {
+                // Substitute any outer-column references in the subquery with
+                // this row's values (correlation), then execute it. The result
+                // is true iff the subquery yields at least one row.
+                let correlated = self.correlate_subplan(subquery, row, col_names);
+                let out = self
+                    .execute_logical_inner(ctx, correlated)
+                    .unwrap_or(QueryOutput {
+                        columns: vec![],
+                        types: vec![],
+                        rows: vec![],
+                        tag: String::new(),
+                    });
+                let exists = !out.rows.is_empty();
+                Some(if *negated { !exists } else { exists })
+            }
         }
+    }
+
+    /// Clones a subquery plan and rewrites its top-level `WHERE` so that any
+    /// reference qualified by an alias that isn't the subquery's own table
+    /// (i.e. an outer/correlated reference) is replaced with the outer row's
+    /// value. Non-`Select` plans and uncorrelated subqueries pass through
+    /// unchanged.
+    fn correlate_subplan(
+        &self,
+        plan: &LogicalPlan,
+        outer_row: &[Value],
+        outer_cols: &[String],
+    ) -> LogicalPlan {
+        let mut p = plan.clone();
+        if let LogicalPlan::Select {
+            table_name,
+            table_alias,
+            filter,
+            ..
+        } = &mut p
+        {
+            let mut quals: Vec<String> = Vec::new();
+            if let Some(a) = table_alias.as_ref() {
+                quals.push(a.to_lowercase());
+            }
+            quals.push(table_name.to_lowercase());
+            if let Some(last) = table_name.rsplit('.').next() {
+                quals.push(last.to_lowercase());
+            }
+            if let Some(f) = filter.as_ref() {
+                *filter = Some(correlate_filter(f, outer_row, outer_cols, &quals));
+            }
+        }
+        p
     }
 
     pub(crate) fn row_matches(
@@ -326,6 +376,128 @@ impl MemExecutor {
         let col_names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
         self.eval_filter(ctx, row, &col_names, columns, filter)
             .unwrap_or(false)
+    }
+}
+
+/// Flips a comparison operator so `a <op> b` becomes `b <flip(op)> a` — used
+/// when a correlated predicate has the outer reference on its left side.
+fn flip_op(op: &CompareOp) -> CompareOp {
+    match op {
+        CompareOp::Lt => CompareOp::Gt,
+        CompareOp::Le => CompareOp::Ge,
+        CompareOp::Gt => CompareOp::Lt,
+        CompareOp::Ge => CompareOp::Le,
+        other => other.clone(),
+    }
+}
+
+/// True if `name` is qualified by an alias that is NOT the subquery's own
+/// table/alias — i.e. it references an outer (correlated) column. Bare names
+/// are treated as inner references.
+fn is_outer_ref(name: &str, inner_quals: &[String]) -> bool {
+    match name.split_once('.') {
+        Some((qual, _)) => !inner_quals.iter().any(|q| q == &qual.to_lowercase()),
+        None => false,
+    }
+}
+
+/// Resolves a (possibly qualified) outer column reference to its value in the
+/// outer row, matching on the bare column name or a `table.col` suffix.
+fn outer_lookup(name: &str, outer_cols: &[String], outer_row: &[Value]) -> Option<Value> {
+    let bare = name.rsplit('.').next().unwrap_or(name);
+    let idx = outer_cols
+        .iter()
+        .position(|c| c == bare || c.ends_with(&format!(".{bare}")))?;
+    outer_row.get(idx).cloned()
+}
+
+/// Rewrites a subquery filter, replacing correlated outer references with the
+/// outer row's literal values so the subquery can execute standalone.
+fn correlate_filter(
+    f: &FilterExpr,
+    outer_row: &[Value],
+    outer_cols: &[String],
+    inner_quals: &[String],
+) -> FilterExpr {
+    let recur = |g: &FilterExpr| correlate_filter(g, outer_row, outer_cols, inner_quals);
+    match f {
+        FilterExpr::And(a, b) => FilterExpr::And(Box::new(recur(a)), Box::new(recur(b))),
+        FilterExpr::Or(a, b) => FilterExpr::Or(Box::new(recur(a)), Box::new(recur(b))),
+        FilterExpr::Not(a) => FilterExpr::Not(Box::new(recur(a))),
+        FilterExpr::Predicate(p) => {
+            // Outer reference on the right: `inner.col <op> outer.col`.
+            if let Operand::Ident(rn) = &p.right {
+                if is_outer_ref(rn, inner_quals) {
+                    if let Some(v) = outer_lookup(rn, outer_cols, outer_row) {
+                        return FilterExpr::Predicate(Predicate {
+                            left: p.left.clone(),
+                            op: p.op.clone(),
+                            right: Operand::Literal(v),
+                        });
+                    }
+                }
+            }
+            // Outer reference on the left with an inner column on the right:
+            // swap sides so the inner column stays comparable, flipping the op.
+            if is_outer_ref(&p.left, inner_quals) {
+                if let (Some(v), Operand::Ident(rn)) =
+                    (outer_lookup(&p.left, outer_cols, outer_row), &p.right)
+                {
+                    if !is_outer_ref(rn, inner_quals) {
+                        return FilterExpr::Predicate(Predicate {
+                            left: rn.clone(),
+                            op: flip_op(&p.op),
+                            right: Operand::Literal(v),
+                        });
+                    }
+                }
+            }
+            f.clone()
+        }
+        FilterExpr::InList {
+            left,
+            list,
+            negated,
+        } => {
+            let new_list = list
+                .iter()
+                .map(|op| match op {
+                    Operand::Ident(n) if is_outer_ref(n, inner_quals) => {
+                        outer_lookup(n, outer_cols, outer_row)
+                            .map(Operand::Literal)
+                            .unwrap_or_else(|| op.clone())
+                    }
+                    _ => op.clone(),
+                })
+                .collect();
+            FilterExpr::InList {
+                left: left.clone(),
+                list: new_list,
+                negated: *negated,
+            }
+        }
+        FilterExpr::Like {
+            left,
+            right,
+            negated,
+        } => {
+            let new_right = match right {
+                Operand::Ident(n) if is_outer_ref(n, inner_quals) => {
+                    outer_lookup(n, outer_cols, outer_row)
+                        .map(Operand::Literal)
+                        .unwrap_or_else(|| right.clone())
+                }
+                _ => right.clone(),
+            };
+            FilterExpr::Like {
+                left: left.clone(),
+                right: new_right,
+                negated: *negated,
+            }
+        }
+        // Nested subquery predicates and null checks pass through: nested
+        // correlation is not resolved here.
+        other => other.clone(),
     }
 }
 

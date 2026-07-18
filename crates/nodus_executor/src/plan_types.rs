@@ -62,6 +62,14 @@ pub enum FilterExpr {
         op: CompareOp,
         subquery: Box<LogicalPlan>,
     },
+    /// `[NOT] EXISTS (<subquery>)`. The subquery may reference outer columns
+    /// (correlated); those references are substituted with the current row's
+    /// values before the subquery is executed, and the predicate is true iff
+    /// the subquery yields at least one row (negated flips the result).
+    Exists {
+        subquery: Box<LogicalPlan>,
+        negated: bool,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
