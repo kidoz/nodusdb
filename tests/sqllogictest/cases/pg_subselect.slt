@@ -1,8 +1,18 @@
 # Ported from PostgreSQL src/test/regress/sql/subselect.sql (curated subset).
 # Fixture and expected values follow expected/subselect.out.
 
-# (pg also smoke-tests `SELECT 1 WHERE 1 IN (SELECT ...)`; a WHERE clause on a
-# FROM-less SELECT is not evaluated here, so those forms are omitted.)
+query I
+SELECT 1 AS one WHERE 1 IN (SELECT 1);
+----
+1
+
+query I
+SELECT 1 AS zero WHERE 1 NOT IN (SELECT 1);
+----
+
+query I
+SELECT 1 AS zero WHERE 1 IN (SELECT 2);
+----
 
 statement ok
 CREATE TABLE subselect_tbl (f1 INT, f2 INT, f3 FLOAT);

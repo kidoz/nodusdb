@@ -195,6 +195,7 @@ fn test_ddl_and_subqueries() {
         left: "dept_id".into(),
         subquery: Box::new(subquery),
         negated: false,
+        left_value: None,
     };
 
     let out = exec

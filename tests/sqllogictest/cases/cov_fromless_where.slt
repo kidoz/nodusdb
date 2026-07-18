@@ -1,0 +1,70 @@
+# WHERE on a FROM-less SELECT: the predicate is constant and decides whether
+# the single literal row is returned.
+
+query I
+SELECT 1 WHERE true;
+----
+1
+
+query I
+SELECT 1 WHERE false;
+----
+
+query I
+SELECT 1 WHERE 1 = 1;
+----
+1
+
+query I
+SELECT 1 WHERE 1 = 2;
+----
+
+query I
+SELECT 1 WHERE 2 + 2 = 4;
+----
+1
+
+query I
+SELECT 1 WHERE NOT (1 = 1);
+----
+
+query T
+SELECT 'yes' WHERE 'a' = 'a' AND 3 > 2;
+----
+yes
+
+# NULL comparisons are unknown, which excludes the row
+query I
+SELECT 1 WHERE NULL = NULL;
+----
+
+# Subquery predicates on a FROM-less select
+statement ok
+CREATE TABLE flw (v INT);
+
+statement ok
+INSERT INTO flw VALUES (10), (20);
+
+query I
+SELECT 1 WHERE 10 IN (SELECT v FROM flw);
+----
+1
+
+query I
+SELECT 1 WHERE 30 IN (SELECT v FROM flw);
+----
+
+query I
+SELECT 1 WHERE 30 NOT IN (SELECT v FROM flw);
+----
+1
+
+query I
+SELECT 1 WHERE EXISTS (SELECT 1 FROM flw);
+----
+1
+
+query I
+SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM flw WHERE v > 100);
+----
+1

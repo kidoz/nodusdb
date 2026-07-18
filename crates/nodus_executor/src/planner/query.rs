@@ -222,7 +222,10 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
                 values.push((alias, crate::Value::Int(0), type_hint));
             }
         }
-        return Ok(LogicalPlan::SelectLiteral { values });
+        return Ok(LogicalPlan::SelectLiteral {
+            values,
+            filter: parse_predicates(&select.selection, params),
+        });
     }
     let (table_name, table_alias) =
         if let Some(spec) = table_fn_from_factor(&select.from[0].relation, params) {

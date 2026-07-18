@@ -7,7 +7,9 @@ use anyhow::Result;
 impl MemExecutor {
     pub(crate) fn exec_select_literal(
         &self,
+        ctx: &ExecutionContext,
         values: Vec<(String, Value, Option<String>)>,
+        filter: Option<FilterExpr>,
     ) -> Result<QueryOutput> {
         let mut columns = Vec::new();
         let mut types = Vec::new();
@@ -36,11 +38,22 @@ impl MemExecutor {
             row_values.push(value);
         }
 
+        // A WHERE on a FROM-less SELECT is a constant predicate (it can still
+        // contain subqueries): keep the row iff it evaluates true.
+        let keep = self
+            .eval_filter(ctx, &[], &[], &[], filter.as_ref())
+            .unwrap_or(false);
+        let rows = if keep {
+            vec![Row { values: row_values }]
+        } else {
+            Vec::new()
+        };
+        let tag = format!("SELECT {}", rows.len());
         Ok(QueryOutput {
             columns,
             types,
-            rows: vec![Row { values: row_values }],
-            tag: "SELECT 1".into(),
+            rows,
+            tag,
         })
     }
 

@@ -138,7 +138,9 @@ impl MemExecutor {
                 self.exec_set_variable(ctx, variable, value)
             }
             LogicalPlan::Noop { tag } => Ok(QueryOutput::tag(&tag)),
-            LogicalPlan::SelectLiteral { values } => self.exec_select_literal(values),
+            LogicalPlan::SelectLiteral { values, filter } => {
+                self.exec_select_literal(ctx, values, filter)
+            }
             LogicalPlan::SetOp {
                 op,
                 all,

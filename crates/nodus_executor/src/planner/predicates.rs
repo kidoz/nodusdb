@@ -41,6 +41,15 @@ pub(crate) fn parse_filter_expr(
     use sqlparser::ast::{BinaryOperator, Expr};
     match expr {
         Expr::Nested(inner) => parse_filter_expr(inner, params),
+        // A bare boolean literal (`WHERE true` / `WHERE false`).
+        Expr::Value(v) => match &v.value {
+            sqlparser::ast::Value::Boolean(b) => Some(FilterExpr::ExprCmp {
+                left: crate::plan_types::ScalarExpr::Literal(Value::Bool(*b)),
+                op: CompareOp::Eq,
+                right: crate::plan_types::ScalarExpr::Literal(Value::Bool(true)),
+            }),
+            _ => None,
+        },
         Expr::BinaryOp { left, op, right } if *op == BinaryOperator::And => {
             let l = parse_filter_expr(left, params);
             let r = parse_filter_expr(right, params);
@@ -107,12 +116,17 @@ pub(crate) fn parse_filter_expr(
             subquery,
             negated,
         } => {
-            let left_col = extract_col_name(expr)?;
             let sub_plan = plan_query(subquery, params).ok()?;
+            // Column left side, or a literal one (`1 IN (SELECT ...)`).
+            let (left_col, left_value) = match extract_col_name(expr) {
+                Some(col) => (col, None),
+                None => (String::new(), Some(expr_to_value(expr, params)?)),
+            };
             Some(FilterExpr::InSubquery {
                 left: left_col,
                 subquery: Box::new(sub_plan),
                 negated: *negated,
+                left_value,
             })
         }
         Expr::Exists { subquery, negated } => {

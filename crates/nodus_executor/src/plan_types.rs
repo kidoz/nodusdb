@@ -55,6 +55,10 @@ pub enum FilterExpr {
         left: String,
         subquery: Box<LogicalPlan>,
         negated: bool,
+        /// When the left side is a literal rather than a column (e.g.
+        /// `1 IN (SELECT ...)`), its value; `left` is then unused.
+        #[serde(default)]
+        left_value: Option<crate::Value>,
     },
     /// `col <op> (<scalar subquery>)` — the subquery yields a single value.
     CompareSubquery {
@@ -489,6 +493,11 @@ pub enum LogicalPlan {
         /// `(column alias, value, optional SQL type hint)`. The hint (from a
         /// CAST) types the column even when the value is NULL.
         values: Vec<(String, crate::Value, Option<String>)>,
+        /// `WHERE` on a FROM-less SELECT: with no rows to bind, the predicate
+        /// is constant — the row is returned iff it evaluates true. Defaulted
+        /// so plans serialized before this field decode.
+        #[serde(default)]
+        filter: Option<FilterExpr>,
     },
     SetOp {
         op: SetOpKind,

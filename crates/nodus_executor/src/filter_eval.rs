@@ -265,14 +265,23 @@ impl MemExecutor {
                 left,
                 subquery,
                 negated,
+                left_value,
             } => {
-                let left_idx = col_pos(col_names, left);
-                let Some(idx) = left_idx else {
-                    return Some(false);
+                // The left side is a column, or a literal (`1 IN (SELECT ..)`).
+                let (left_cell, coerce_type): (Value, Option<&str>) = match left_value {
+                    Some(v) => (v.clone(), None),
+                    None => {
+                        let Some(idx) = col_pos(col_names, left) else {
+                            return Some(false);
+                        };
+                        (
+                            row.get(idx).cloned().unwrap_or(Value::Null),
+                            Some(columns[idx].data_type.as_str()),
+                        )
+                    }
                 };
-                let left_cell = row.get(idx).unwrap_or(&Value::Null);
 
-                if left_cell == &Value::Null {
+                if left_cell == Value::Null {
                     return None;
                 }
 
@@ -291,10 +300,13 @@ impl MemExecutor {
                 let mut found_null = false;
                 for r in out.rows {
                     if let Some(c) = r.values.first() {
-                        let right_cell = coerce(&render(c), column_type(&columns[idx].data_type));
+                        let right_cell = match coerce_type {
+                            Some(ty) => coerce(&render(c), column_type(ty)),
+                            None => c.clone(),
+                        };
                         if right_cell == Value::Null {
                             found_null = true;
-                        } else if values_equal(left_cell, &right_cell) {
+                        } else if values_equal(&left_cell, &right_cell) {
                             matches = true;
                             break;
                         }
