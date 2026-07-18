@@ -330,6 +330,10 @@ pub enum AlterTableOp {
         name: String,
         data_type: String,
         nullable: bool,
+        /// Lowered `DEFAULT` expression: stored on the column and backfilled
+        /// into existing rows. Defaulted so older serialized plans decode.
+        #[serde(default)]
+        default: Option<ScalarExpr>,
     },
     RenameColumn {
         old_name: String,

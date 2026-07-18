@@ -94,3 +94,54 @@ query II
 SELECT id, k FROM cdef;
 ----
 1	5
+
+# ALTER TABLE ADD COLUMN with DEFAULT: existing rows are backfilled and new
+# inserts take the default.
+statement ok
+CREATE TABLE adddef (id INT PRIMARY KEY, v INT);
+
+statement ok
+INSERT INTO adddef VALUES (1, 100), (2, 200);
+
+statement ok
+ALTER TABLE adddef ADD COLUMN status TEXT DEFAULT 'new';
+
+query IIT rowsort
+SELECT id, v, status FROM adddef;
+----
+1	100	new
+2	200	new
+
+statement ok
+INSERT INTO adddef (id, v) VALUES (3, 300);
+
+query T
+SELECT status FROM adddef WHERE id = 3;
+----
+new
+
+statement ok
+INSERT INTO adddef (id, v, status) VALUES (4, 400, 'old');
+
+query T
+SELECT status FROM adddef WHERE id = 4;
+----
+old
+
+# ADD COLUMN without a default still backfills NULL
+statement ok
+ALTER TABLE adddef ADD COLUMN note TEXT;
+
+query T
+SELECT note FROM adddef WHERE id = 1;
+----
+NULL
+
+# UPDATE SET back to the added column's default
+statement ok
+UPDATE adddef SET status = DEFAULT WHERE id = 4;
+
+query T
+SELECT status FROM adddef WHERE id = 4;
+----
+new

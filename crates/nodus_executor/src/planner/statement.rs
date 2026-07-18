@@ -509,15 +509,26 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
             let alter_op = match op {
                 sqlparser::ast::AlterTableOperation::AddColumn { column_def, .. } => {
                     let mut nullable = true;
+                    let mut default = None;
                     for opt in &column_def.options {
-                        if let sqlparser::ast::ColumnOption::NotNull = &opt.option {
-                            nullable = false;
+                        match &opt.option {
+                            sqlparser::ast::ColumnOption::NotNull => nullable = false,
+                            sqlparser::ast::ColumnOption::Default(e) => {
+                                default = Some(lower_scalar(e, params).ok_or_else(|| {
+                                    anyhow::anyhow!(
+                                        "Unsupported DEFAULT expression for column {}",
+                                        column_def.name.value
+                                    )
+                                })?);
+                            }
+                            _ => {}
                         }
                     }
                     AlterTableOp::AddColumn {
                         name: column_def.name.value.clone(),
                         data_type: column_def.data_type.to_string(),
                         nullable,
+                        default,
                     }
                 }
                 sqlparser::ast::AlterTableOperation::RenameColumn {

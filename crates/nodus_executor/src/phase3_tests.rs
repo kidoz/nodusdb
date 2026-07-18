@@ -105,7 +105,7 @@ fn test_ddl_and_subqueries() {
                 name: "salary".into(),
                 data_type: "INT".into(),
                 nullable: true,
-            },
+                default: None,            },
         },
     )
     .unwrap();
@@ -776,7 +776,7 @@ fn test_alter_table_migrations() {
                 name: "age".into(),
                 data_type: "INT".into(),
                 nullable: true,
-            },
+                default: None,            },
         },
     )
     .unwrap();

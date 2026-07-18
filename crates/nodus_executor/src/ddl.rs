@@ -284,7 +284,19 @@ impl MemExecutor {
                 name,
                 data_type,
                 nullable,
+                default,
             } => {
+                // Backfill value for existing rows: the evaluated DEFAULT, or
+                // NULL when none is declared (PostgreSQL semantics).
+                let backfill = default
+                    .as_ref()
+                    .map(|e| {
+                        crate::value::coerce_for_column(
+                            &crate::planner::eval_scalar_expr(e, &[], &[]),
+                            &data_type,
+                        )
+                    })
+                    .unwrap_or(Value::Null);
                 let column = ColumnDescriptor {
                     id: nodus_catalog::ColumnId::new(),
                     name,
@@ -294,14 +306,15 @@ impl MemExecutor {
                     state: DescriptorState::Public,
                     data_type,
                     nullable,
-                    default_expr: None,
+                    default_expr: default
+                        .as_ref()
+                        .and_then(|e| serde_json::to_string(e).ok()),
                 };
 
-                // Migrate existing data to include the new column (as NULL)
-                for mut row in self.scan_rows(tbl.id, &ctx.session_id)? {
-                    let pk_str = row.first().map(render).unwrap_or_default();
-                    let key = format!("{}:{}", tbl.id, pk_str);
-                    row.push(Value::Null); // Append null for the new column
+                // Migrate existing data to include the new column, addressing
+                // each row by its actual stored key (works for any key scheme).
+                for (key, mut row) in self.scan_rows_keyed(tbl.id, &ctx.session_id)? {
+                    row.push(backfill.clone());
                     self.write_row(&ctx.session_id, key, serde_json::to_string(&row)?)?;
                 }
 
@@ -317,10 +330,10 @@ impl MemExecutor {
                         anyhow::bail!("Cannot drop primary key column");
                     }
 
-                    // Migrate existing data to remove the column
-                    for mut row in self.scan_rows(tbl.id, &ctx.session_id)? {
-                        let pk_str = row.first().map(render).unwrap_or_default();
-                        let key = format!("{}:{}", tbl.id, pk_str);
+                    // Migrate existing data to remove the column, addressing
+                    // each row by its actual stored key (works for any key
+                    // scheme, not just first-column PKs).
+                    for (key, mut row) in self.scan_rows_keyed(tbl.id, &ctx.session_id)? {
                         if col_idx < row.len() {
                             row.remove(col_idx);
                         }
