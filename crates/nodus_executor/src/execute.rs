@@ -137,6 +137,24 @@ impl MemExecutor {
                 right,
             } => self.exec_set_op(ctx, op, all, left, right),
             LogicalPlan::TableFunction(spec) => self.exec_table_function(spec),
+            LogicalPlan::InlineRows {
+                columns,
+                types,
+                rows,
+            } => Ok(QueryOutput {
+                columns,
+                types,
+                rows: rows
+                    .into_iter()
+                    .map(|values| crate::Row { values })
+                    .collect(),
+                tag: String::new(),
+            }),
+            // A recursive CTE is only ever materialized by the CTE loop in
+            // exec_select; it should never be dispatched on its own.
+            LogicalPlan::RecursiveCte { .. } => {
+                anyhow::bail!("WITH RECURSIVE CTE cannot be executed outside a query")
+            }
         }
     }
 

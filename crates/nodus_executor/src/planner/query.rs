@@ -66,6 +66,35 @@ impl Drop for PlanDepthGuard {
     }
 }
 
+/// True if any FROM/join relation in `plan` refers to the table `name` (used to
+/// detect a recursive CTE's self-reference). A CTE that shadows `name` stops the
+/// descent into that sub-plan.
+pub(crate) fn plan_references_table(plan: &LogicalPlan, name: &str) -> bool {
+    match plan {
+        LogicalPlan::Select {
+            table_name,
+            joins,
+            ctes,
+            ..
+        } => {
+            table_name == name
+                || joins.iter().any(|j| j.table_name == name)
+                || ctes
+                    .iter()
+                    .any(|(n, p)| n != name && plan_references_table(p, name))
+        }
+        LogicalPlan::SetOp { left, right, .. } => {
+            plan_references_table(left, name) || plan_references_table(right, name)
+        }
+        LogicalPlan::RecursiveCte {
+            seed,
+            recursive_term,
+            ..
+        } => plan_references_table(seed, name) || plan_references_table(recursive_term, name),
+        _ => false,
+    }
+}
+
 pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Result<LogicalPlan> {
     use sqlparser::ast::*;
 
@@ -75,7 +104,29 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
     if let Some(with) = &query.with {
         for cte in &with.cte_tables {
             let cte_name = cte.alias.name.value.clone();
+            let column_aliases: Vec<String> =
+                cte.alias.columns.iter().map(|c| c.name.value.clone()).collect();
             let cte_plan = plan_query(&cte.query, params)?;
+            // A `WITH RECURSIVE` CTE whose body is `seed UNION[/ALL] term` where
+            // the term self-references the CTE becomes a RecursiveCte so the CTE
+            // loop can run the seed-then-iterate fixpoint. Non-self-referencing
+            // bodies stay as ordinary plans even under WITH RECURSIVE.
+            let cte_plan = match cte_plan {
+                LogicalPlan::SetOp {
+                    op: SetOpKind::Union,
+                    all,
+                    left,
+                    right,
+                } if with.recursive && plan_references_table(&right, &cte_name) => {
+                    LogicalPlan::RecursiveCte {
+                        all,
+                        column_aliases,
+                        seed: left,
+                        recursive_term: right,
+                    }
+                }
+                other => other,
+            };
             ctes.push((cte_name, Box::new(cte_plan)));
         }
     }

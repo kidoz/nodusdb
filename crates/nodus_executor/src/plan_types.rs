@@ -472,6 +472,24 @@ pub enum LogicalPlan {
         left: Box<LogicalPlan>,
         right: Box<LogicalPlan>,
     },
+    /// A `WITH RECURSIVE` CTE: the `seed` runs once, then `recursive_term`
+    /// re-runs against the rows produced by the previous step (the working
+    /// table) until it yields nothing new. `all` selects UNION ALL vs UNION
+    /// (distinct) accumulation; `column_aliases` names the output columns.
+    /// Only ever appears as a CTE body, materialized by the CTE loop.
+    RecursiveCte {
+        all: bool,
+        column_aliases: Vec<String>,
+        seed: Box<LogicalPlan>,
+        recursive_term: Box<LogicalPlan>,
+    },
+    /// A pre-computed relation injected as a CTE (used to feed the working
+    /// table into a recursive term). Executing it just yields these rows.
+    InlineRows {
+        columns: Vec<String>,
+        types: Vec<String>,
+        rows: Vec<Vec<crate::Value>>,
+    },
     /// A standalone (non-lateral) set-returning function in `FROM`, e.g.
     /// `SELECT * FROM generate_series(1, 5)`. Lateral table functions are carried
     /// on [`Join::table_fn`] instead.

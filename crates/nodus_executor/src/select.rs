@@ -11,6 +11,66 @@ use nodus_catalog::{ColumnDescriptor, DescriptorState};
 use nodus_storage_api::{KeyRange, KvEngine};
 
 impl MemExecutor {
+    /// Runs a `WITH RECURSIVE` CTE to a fixpoint: execute the seed once, then
+    /// repeatedly run the recursive term against the previous step's rows (the
+    /// working table, injected under the CTE name) until it yields nothing new.
+    /// UNION dedups against everything accumulated; UNION ALL keeps all rows and
+    /// relies on the term's own predicate to terminate.
+    fn exec_recursive_cte(
+        &self,
+        ctx: &ExecutionContext,
+        name: &str,
+        all: bool,
+        column_aliases: Vec<String>,
+        seed: LogicalPlan,
+        recursive_term: LogicalPlan,
+    ) -> Result<QueryOutput> {
+        let seed_out = self.execute_logical_inner(ctx, seed)?;
+        // Output column names: explicit CTE aliases if given, else the seed's.
+        let columns = if column_aliases.is_empty() {
+            seed_out.columns.clone()
+        } else {
+            column_aliases
+        };
+        let types = seed_out.types.clone();
+
+        let mut result: Vec<Vec<Value>> =
+            seed_out.rows.into_iter().map(|r| r.values).collect();
+        let mut working = result.clone();
+        let mut guard = 0u32;
+        while !working.is_empty() {
+            guard += 1;
+            if guard > 10_000 {
+                anyhow::bail!("WITH RECURSIVE did not terminate within 10000 iterations");
+            }
+            // Feed the working table into the recursive term under the CTE name.
+            let mut term = recursive_term.clone();
+            inject_inline_cte(&mut term, name, columns.clone(), types.clone(), working.clone());
+            let iter = self.execute_logical_inner(ctx, term)?;
+
+            let mut new_rows: Vec<Vec<Value>> = Vec::new();
+            for r in iter.rows {
+                let vals = r.values;
+                if all {
+                    new_rows.push(vals);
+                } else if !result.iter().any(|x| x == &vals)
+                    && !new_rows.iter().any(|x| x == &vals)
+                {
+                    new_rows.push(vals);
+                }
+            }
+            result.extend(new_rows.iter().cloned());
+            working = new_rows;
+        }
+
+        Ok(QueryOutput {
+            columns,
+            types,
+            rows: result.into_iter().map(|values| Row { values }).collect(),
+            tag: String::new(),
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn exec_select(
         &self,
@@ -42,7 +102,22 @@ impl MemExecutor {
 
         let mut cte_results = std::collections::HashMap::new();
         for (name, cte_plan) in ctes {
-            let out = self.execute_logical_inner(ctx, *cte_plan)?;
+            let out = match *cte_plan {
+                LogicalPlan::RecursiveCte {
+                    all,
+                    column_aliases,
+                    seed,
+                    recursive_term,
+                } => self.exec_recursive_cte(
+                    ctx,
+                    &name,
+                    all,
+                    column_aliases,
+                    *seed,
+                    *recursive_term,
+                )?,
+                other => self.execute_logical_inner(ctx, other)?,
+            };
             cte_results.insert(name, out);
         }
 
@@ -1279,6 +1354,32 @@ impl MemExecutor {
 
 /// Groups partition-then-order-sorted row indices into per-partition runs,
 /// used by LAG/LEAD and aggregate window functions.
+/// Injects a pre-computed relation as a CTE named `name` into a Select plan
+/// (replacing any existing CTE of that name), so the plan's FROM/join resolves
+/// the name to these rows. Used to feed a recursive term its working table.
+fn inject_inline_cte(
+    plan: &mut LogicalPlan,
+    name: &str,
+    columns: Vec<String>,
+    types: Vec<String>,
+    rows: Vec<Vec<Value>>,
+) {
+    if let LogicalPlan::Select { ctes, .. } = plan {
+        ctes.retain(|(n, _)| n != name);
+        ctes.insert(
+            0,
+            (
+                name.to_string(),
+                Box::new(LogicalPlan::InlineRows {
+                    columns,
+                    types,
+                    rows,
+                }),
+            ),
+        );
+    }
+}
+
 /// Compares two cells for an ORDER BY key, honouring the ascending flag and an
 /// optional explicit `NULLS FIRST`/`NULLS LAST` override. With no override the
 /// default matches PostgreSQL: NULLs sort first on ASC and last on DESC.

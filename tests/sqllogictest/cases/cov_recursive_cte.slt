@@ -1,5 +1,5 @@
-# Coverage GAP: WITH RECURSIVE is NOT supported — a recursive self-reference
-# fails to resolve ("Table not found"). Non-recursive CTEs work.
+# WITH RECURSIVE: the seed runs once, then the recursive term re-runs against
+# the previous step's rows until it produces nothing new.
 
 statement ok
 CREATE TABLE seed (n INT PRIMARY KEY);
@@ -7,10 +7,57 @@ CREATE TABLE seed (n INT PRIMARY KEY);
 statement ok
 INSERT INTO seed VALUES (1), (2), (3), (4), (5);
 
-# non-recursive CTE (the supported form)
+# non-recursive CTE (still works)
 query I rowsort
 WITH c AS (SELECT n FROM seed WHERE n > 2) SELECT n FROM c;
 ----
 3
 4
 5
+
+# recursive counter with UNION ALL
+query I
+WITH RECURSIVE cnt(n) AS (
+  SELECT 1
+  UNION ALL
+  SELECT n + 1 FROM cnt WHERE n < 5
+)
+SELECT n FROM cnt ORDER BY n;
+----
+1
+2
+3
+4
+5
+
+# a filter applied to the recursive result
+query I
+WITH RECURSIVE cnt(n) AS (
+  SELECT 1
+  UNION ALL
+  SELECT n + 1 FROM cnt WHERE n < 10
+)
+SELECT n FROM cnt WHERE n > 7 ORDER BY n;
+----
+8
+9
+10
+
+# transitive closure over a graph, using UNION to dedup and terminate on cycles
+statement ok
+CREATE TABLE edge (src INT, dst INT);
+
+statement ok
+INSERT INTO edge VALUES (1, 2), (2, 3), (3, 4), (4, 2);
+
+query I rowsort
+WITH RECURSIVE reach(x) AS (
+  SELECT dst FROM edge WHERE src = 1
+  UNION
+  SELECT e.dst FROM edge e JOIN reach r ON e.src = r.x
+)
+SELECT x FROM reach;
+----
+2
+3
+4
