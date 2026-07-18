@@ -259,6 +259,11 @@ pub enum ProjectionItem {
         partition_by: Vec<String>,
         order_by: Vec<(String, bool)>, // (col_name, ascending)
         alias: Option<String>,
+        /// Explicit `ROWS`/`RANGE BETWEEN …` frame, if any. Appended last so
+        /// older serialized plans still decode. When absent, aggregate windows
+        /// span the whole partition.
+        #[serde(default)]
+        frame: Option<WindowFrame>,
     },
     Literal(crate::Value),
     AliasedLiteral(crate::Value, String),
@@ -269,6 +274,30 @@ pub enum ProjectionItem {
         expr: ScalarExpr,
         alias: Option<String>,
     },
+}
+
+/// A window frame clause (`ROWS`/`RANGE BETWEEN <start> AND <end>`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WindowFrame {
+    pub units: WindowFrameUnits,
+    pub start: WindowBound,
+    pub end: WindowBound,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum WindowFrameUnits {
+    Rows,
+    Range,
+}
+
+/// A single frame boundary. Numeric offsets are only honoured for `ROWS`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum WindowBound {
+    UnboundedPreceding,
+    Preceding(i64),
+    CurrentRow,
+    Following(i64),
+    UnboundedFollowing,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

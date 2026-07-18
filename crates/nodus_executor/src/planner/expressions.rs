@@ -1150,3 +1150,52 @@ pub(crate) fn window_args(func: &sqlparser::ast::Function) -> Vec<String> {
         })
         .collect()
 }
+
+/// Lowers a sqlparser window frame (`ROWS`/`RANGE BETWEEN …`) into the plan
+/// representation. A shorthand `ROWS n PRECEDING` (no `BETWEEN`) has an
+/// implicit `AND CURRENT ROW` end bound.
+pub(crate) fn window_frame(
+    spec: &sqlparser::ast::WindowSpec,
+) -> Option<crate::plan_types::WindowFrame> {
+    use crate::plan_types::{WindowBound, WindowFrame, WindowFrameUnits};
+    use sqlparser::ast::WindowFrameUnits as AstUnits;
+    let frame = spec.window_frame.as_ref()?;
+    let units = match frame.units {
+        AstUnits::Rows => WindowFrameUnits::Rows,
+        // GROUPS is treated as RANGE (peer-based) for our purposes.
+        AstUnits::Range | AstUnits::Groups => WindowFrameUnits::Range,
+    };
+    let start = lower_bound(&frame.start_bound);
+    let end = frame
+        .end_bound
+        .as_ref()
+        .map(lower_bound)
+        .unwrap_or(WindowBound::CurrentRow);
+    Some(WindowFrame { units, start, end })
+}
+
+fn lower_bound(b: &sqlparser::ast::WindowFrameBound) -> crate::plan_types::WindowBound {
+    use crate::plan_types::WindowBound;
+    use sqlparser::ast::WindowFrameBound as B;
+    // Extract a small integer literal from a bound offset expression.
+    let as_int = |e: &Option<Box<sqlparser::ast::Expr>>| -> Option<i64> {
+        match e.as_deref()? {
+            sqlparser::ast::Expr::Value(v) => match &v.value {
+                sqlparser::ast::Value::Number(n, _) => n.parse().ok(),
+                _ => None,
+            },
+            _ => None,
+        }
+    };
+    match b {
+        B::CurrentRow => WindowBound::CurrentRow,
+        B::Preceding(e) => match as_int(e) {
+            Some(n) => WindowBound::Preceding(n),
+            None => WindowBound::UnboundedPreceding,
+        },
+        B::Following(e) => match as_int(e) {
+            Some(n) => WindowBound::Following(n),
+            None => WindowBound::UnboundedFollowing,
+        },
+    }
+}

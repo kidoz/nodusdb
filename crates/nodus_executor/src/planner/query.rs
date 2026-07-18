@@ -339,6 +339,7 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
                     if let Some(over) = &func.over {
                         let mut partition_by = Vec::new();
                         let mut order_by = Vec::new();
+                        let mut frame = None;
                         if let sqlparser::ast::WindowType::WindowSpec(spec) = over {
                             for expr in &spec.partition_by {
                                 if let Some(col) = extract_col_name(expr) {
@@ -350,6 +351,7 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
                                     order_by.push((col, expr.options.asc.unwrap_or(true)));
                                 }
                             }
+                            frame = window_frame(spec);
                         }
                         projection.push(ProjectionItem::WindowFunction {
                             func_name: fname,
@@ -357,6 +359,7 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
                             partition_by,
                             order_by,
                             alias: None,
+                            frame,
                         });
                     } else if fname.starts_with("PG_CATALOG.")
                         || fname.starts_with("PG_")
@@ -518,6 +521,7 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
                     if let Some(over) = &func.over {
                         let mut partition_by = Vec::new();
                         let mut order_by = Vec::new();
+                        let mut frame = None;
                         if let sqlparser::ast::WindowType::WindowSpec(spec) = over {
                             for expr in &spec.partition_by {
                                 if let Some(col) = extract_col_name(expr) {
@@ -529,6 +533,7 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
                                     order_by.push((col, expr.options.asc.unwrap_or(true)));
                                 }
                             }
+                            frame = window_frame(spec);
                         }
                         projection.push(ProjectionItem::WindowFunction {
                             func_name: fname,
@@ -536,6 +541,7 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
                             partition_by,
                             order_by,
                             alias: Some(alias.value.clone()),
+                            frame,
                         });
                     } else if fname.starts_with("PG_CATALOG.")
                         || fname.starts_with("PG_")

@@ -1,0 +1,91 @@
+# NTILE, LAST_VALUE, and explicit window frame clauses (ROWS/RANGE BETWEEN ...).
+
+statement ok
+CREATE TABLE w (id INT PRIMARY KEY, grp TEXT, v INT);
+
+statement ok
+INSERT INTO w VALUES
+  (1, 'a', 10),
+  (2, 'a', 20),
+  (3, 'a', 30),
+  (4, 'a', 40),
+  (5, 'b', 100),
+  (6, 'b', 200);
+
+# NTILE(2) splits each partition into two even buckets.
+query ITI
+SELECT id, grp, NTILE(2) OVER (PARTITION BY grp ORDER BY id) FROM w ORDER BY id;
+----
+1	a	1
+2	a	1
+3	a	2
+4	a	2
+5	b	1
+6	b	2
+
+# NTILE(3) over 4 rows: first bucket gets the extra row (2,1,1).
+query II
+SELECT id, NTILE(3) OVER (ORDER BY id) FROM w WHERE grp = 'a' ORDER BY id;
+----
+1	1
+2	1
+3	2
+4	3
+
+# Running total: ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW.
+query III
+SELECT id, v, SUM(v) OVER (PARTITION BY grp ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+FROM w WHERE grp = 'a' ORDER BY id;
+----
+1	10	10
+2	20	30
+3	30	60
+4	40	100
+
+# Moving window of the current and previous row: ROWS BETWEEN 1 PRECEDING AND CURRENT ROW.
+query III
+SELECT id, v, SUM(v) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)
+FROM w WHERE grp = 'a' ORDER BY id;
+----
+1	10	10
+2	20	30
+3	30	50
+4	40	70
+
+# Centered frame: ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING (averages neighbours).
+query III
+SELECT id, v, SUM(v) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING)
+FROM w WHERE grp = 'a' ORDER BY id;
+----
+1	10	30
+2	20	60
+3	30	90
+4	40	70
+
+# LAST_VALUE over an explicit frame to the end of the partition.
+query III
+SELECT id, v, LAST_VALUE(v) OVER (PARTITION BY grp ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING)
+FROM w WHERE grp = 'a' ORDER BY id;
+----
+1	10	40
+2	20	40
+3	30	40
+4	40	40
+
+# RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW: all rows through the end of
+# the current row's ORDER BY peer group. grp 'a' peers sum to 100; grp 'b' rows
+# add the whole 'a' peer group again (cumulative), giving 100 + 300 = 400.
+query III
+SELECT id, v, SUM(v) OVER (ORDER BY grp RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+FROM w ORDER BY id;
+----
+1	10	100
+2	20	100
+3	30	100
+4	40	100
+5	100	400
+6	200	400
+
+# A RANGE frame with a numeric offset is rejected.
+statement error
+SELECT id, SUM(v) OVER (ORDER BY v RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM w;

@@ -649,6 +649,7 @@ impl MemExecutor {
                         partition_by,
                         order_by: w_order_by,
                         alias,
+                        frame,
                     } => {
                         let p_indices: Vec<usize> = partition_by
                             .iter()
@@ -710,6 +711,19 @@ impl MemExecutor {
                                 .map(|&(idx, _)| row.get(idx).unwrap_or(&Value::Null).clone())
                                 .collect()
                         };
+                        // RANGE frames only support unbounded/current-row bounds;
+                        // a numeric offset needs value arithmetic on the order key.
+                        if let Some(f) = frame {
+                            use crate::plan_types::{WindowBound as B, WindowFrameUnits as U};
+                            if f.units == U::Range
+                                && (matches!(f.start, B::Preceding(_) | B::Following(_))
+                                    || matches!(f.end, B::Preceding(_) | B::Following(_)))
+                            {
+                                anyhow::bail!(
+                                    "RANGE frame with a numeric offset is not supported; use ROWS"
+                                );
+                            }
+                        }
                         if func_name == "ROW_NUMBER" {
                             let mut current_partition: Vec<Value> = Vec::new();
                             let mut row_num = 1i64;
@@ -779,9 +793,37 @@ impl MemExecutor {
                                         .unwrap_or(Value::Null);
                                 }
                             }
-                        } else if func_name == "FIRST_VALUE" {
-                            // The argument's value from the first row of each
-                            // partition (in the window's order).
+                        } else if func_name == "NTILE" {
+                            // Distribute each ordered partition into `n` buckets
+                            // as evenly as possible; the first `len % n` buckets
+                            // get one extra row (standard NTILE semantics).
+                            let groups =
+                                partition_groups(&row_indices, &partition_key_of, &stored_rows);
+                            let n: usize = args
+                                .first()
+                                .and_then(|s| s.parse().ok())
+                                .filter(|&n| n > 0)
+                                .unwrap_or(1);
+                            for group in &groups {
+                                let len = group.len();
+                                let base = len / n;
+                                let rem = len % n;
+                                let mut pos = 0usize;
+                                for bucket in 1..=n {
+                                    let take = base + if bucket <= rem { 1 } else { 0 };
+                                    for _ in 0..take {
+                                        if let Some(&row_idx) = group.get(pos) {
+                                            results[row_idx] = Value::Int(bucket as i64);
+                                        }
+                                        pos += 1;
+                                    }
+                                }
+                            }
+                        } else if func_name == "FIRST_VALUE" || func_name == "LAST_VALUE" {
+                            // The argument's value from the first/last row of the
+                            // frame (or the whole ordered partition when there is
+                            // no explicit frame).
+                            let last = func_name == "LAST_VALUE";
                             let groups =
                                 partition_groups(&row_indices, &partition_key_of, &stored_rows);
                             let arg_idx = args.first().and_then(|c| {
@@ -790,73 +832,58 @@ impl MemExecutor {
                                     .position(|tc| tc == c || tc.ends_with(&format!(".{}", c)))
                             });
                             for group in &groups {
-                                let first = group
-                                    .first()
-                                    .and_then(|&fi| arg_idx.and_then(|ai| stored_rows[fi].get(ai)))
-                                    .cloned()
-                                    .unwrap_or(Value::Null);
-                                for &row_idx in group {
-                                    results[row_idx] = first.clone();
+                                let okeys: Vec<Vec<Value>> =
+                                    group.iter().map(|&i| order_key_of(&stored_rows[i])).collect();
+                                for (pos, &row_idx) in group.iter().enumerate() {
+                                    // Frame slice for this row (whole group if none).
+                                    let (s, e) = match frame {
+                                        Some(f) => match frame_bounds(f, group.len(), pos, &okeys) {
+                                            Some(b) => b,
+                                            None => {
+                                                results[row_idx] = Value::Null;
+                                                continue;
+                                            }
+                                        },
+                                        None => (0, group.len() - 1),
+                                    };
+                                    let pick = if last { e } else { s };
+                                    results[row_idx] = group
+                                        .get(pick)
+                                        .and_then(|&gi| arg_idx.and_then(|ai| stored_rows[gi].get(ai)))
+                                        .cloned()
+                                        .unwrap_or(Value::Null);
                                 }
                             }
                         } else if matches!(
                             func_name.as_str(),
                             "SUM" | "COUNT" | "AVG" | "MIN" | "MAX"
                         ) {
-                            // Aggregate window over the whole partition (no frame clause).
                             let groups =
                                 partition_groups(&row_indices, &partition_key_of, &stored_rows);
                             let arg = args.first().cloned().unwrap_or_else(|| "*".to_string());
                             for group in &groups {
-                                let group_rows: Vec<Vec<Value>> =
+                                let grows: Vec<Vec<Value>> =
                                     group.iter().map(|&i| stored_rows[i].clone()).collect();
-                                let agg = match func_name.as_str() {
-                                    "AVG" => {
-                                        let sum = compute_aggregate(
-                                            &AggregateOp::Sum,
-                                            &arg,
-                                            &group_rows,
-                                            &col_names,
-                                        );
-                                        let count = group_rows.len() as f64;
-                                        match sum {
-                                            Value::Int(s) if count > 0.0 => {
-                                                Value::Float(s as f64 / count)
-                                            }
-                                            Value::Float(s) if count > 0.0 => {
-                                                Value::Float(s / count)
-                                            }
-                                            _ => Value::Null,
-                                        }
+                                if let Some(f) = frame {
+                                    // Per-row aggregate over the row's frame slice.
+                                    let okeys: Vec<Vec<Value>> = group
+                                        .iter()
+                                        .map(|&i| order_key_of(&stored_rows[i]))
+                                        .collect();
+                                    for (pos, &row_idx) in group.iter().enumerate() {
+                                        let slice = match frame_bounds(f, group.len(), pos, &okeys) {
+                                            Some((s, e)) => &grows[s..=e],
+                                            None => &[],
+                                        };
+                                        results[row_idx] =
+                                            window_aggregate(func_name, &arg, slice, &col_names);
                                     }
-                                    "SUM" => compute_aggregate(
-                                        &AggregateOp::Sum,
-                                        &arg,
-                                        &group_rows,
-                                        &col_names,
-                                    ),
-                                    "COUNT" => compute_aggregate(
-                                        &AggregateOp::Count,
-                                        &arg,
-                                        &group_rows,
-                                        &col_names,
-                                    ),
-                                    "MIN" => compute_aggregate(
-                                        &AggregateOp::Min,
-                                        &arg,
-                                        &group_rows,
-                                        &col_names,
-                                    ),
-                                    "MAX" => compute_aggregate(
-                                        &AggregateOp::Max,
-                                        &arg,
-                                        &group_rows,
-                                        &col_names,
-                                    ),
-                                    _ => Value::Null,
-                                };
-                                for &row_idx in group {
-                                    results[row_idx] = agg.clone();
+                                } else {
+                                    // No explicit frame: aggregate over the whole partition.
+                                    let agg = window_aggregate(func_name, &arg, &grows, &col_names);
+                                    for &row_idx in group {
+                                        results[row_idx] = agg.clone();
+                                    }
                                 }
                             }
                         } else {
@@ -1231,6 +1258,100 @@ impl MemExecutor {
 
 /// Groups partition-then-order-sorted row indices into per-partition runs,
 /// used by LAG/LEAD and aggregate window functions.
+/// Computes the inclusive `[start, end]` index range within an ordered
+/// partition group that a window frame covers for the row at `pos`. Returns
+/// `None` when the frame is empty for that row. `order_keys` holds each group
+/// position's ORDER BY key (used for peer detection in `RANGE` frames).
+fn frame_bounds(
+    frame: &crate::plan_types::WindowFrame,
+    group_len: usize,
+    pos: usize,
+    order_keys: &[Vec<Value>],
+) -> Option<(usize, usize)> {
+    use crate::plan_types::{WindowBound as B, WindowFrameUnits as U};
+    if group_len == 0 {
+        return None;
+    }
+    let last = (group_len - 1) as i64;
+    let p = pos as i64;
+    let (start, end): (i64, i64) = match frame.units {
+        U::Rows => {
+            let start = match &frame.start {
+                B::UnboundedPreceding => 0,
+                B::Preceding(k) => p - *k,
+                B::CurrentRow => p,
+                B::Following(k) => p + *k,
+                B::UnboundedFollowing => group_len as i64, // empty
+            };
+            let end = match &frame.end {
+                B::UnboundedPreceding => -1, // empty
+                B::Preceding(k) => p - *k,
+                B::CurrentRow => p,
+                B::Following(k) => p + *k,
+                B::UnboundedFollowing => last,
+            };
+            (start, end)
+        }
+        U::Range => {
+            // Only unbounded / current-row bounds reach here (numeric offsets
+            // are rejected earlier). CURRENT ROW spans the row's ORDER BY peers.
+            let peer_start = (0..=pos)
+                .find(|&i| order_keys[i] == order_keys[pos])
+                .unwrap_or(pos) as i64;
+            let peer_end = (pos..group_len)
+                .rev()
+                .find(|&i| order_keys[i] == order_keys[pos])
+                .unwrap_or(pos) as i64;
+            let start = match &frame.start {
+                B::UnboundedPreceding => 0,
+                B::CurrentRow => peer_start,
+                B::UnboundedFollowing => group_len as i64,
+                _ => 0,
+            };
+            let end = match &frame.end {
+                B::UnboundedPreceding => -1,
+                B::CurrentRow => peer_end,
+                B::UnboundedFollowing => last,
+                _ => last,
+            };
+            (start, end)
+        }
+    };
+    let start = start.max(0);
+    let end = end.min(last);
+    if start > end || start > last || end < 0 {
+        None
+    } else {
+        Some((start as usize, end as usize))
+    }
+}
+
+/// Computes a single windowed aggregate (`SUM`/`COUNT`/`AVG`/`MIN`/`MAX`) over
+/// the given rows, matching the grouped-aggregate semantics.
+fn window_aggregate(
+    func_name: &str,
+    arg: &str,
+    rows: &[Vec<Value>],
+    col_names: &[String],
+) -> Value {
+    match func_name {
+        "AVG" => {
+            let sum = compute_aggregate(&AggregateOp::Sum, arg, rows, col_names);
+            let count = rows.len() as f64;
+            match sum {
+                Value::Int(s) if count > 0.0 => Value::Float(s as f64 / count),
+                Value::Float(s) if count > 0.0 => Value::Float(s / count),
+                _ => Value::Null,
+            }
+        }
+        "SUM" => compute_aggregate(&AggregateOp::Sum, arg, rows, col_names),
+        "COUNT" => compute_aggregate(&AggregateOp::Count, arg, rows, col_names),
+        "MIN" => compute_aggregate(&AggregateOp::Min, arg, rows, col_names),
+        "MAX" => compute_aggregate(&AggregateOp::Max, arg, rows, col_names),
+        _ => Value::Null,
+    }
+}
+
 fn partition_groups<F: Fn(&[Value]) -> Vec<Value>>(
     row_indices: &[usize],
     partition_key_of: F,
