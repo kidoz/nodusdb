@@ -168,6 +168,7 @@ fn exec_with_rows(
                     nullable: false,
                     unique: false,
                     primary: true,
+                    default: None,
                 },
                 ColumnDef {
                     name: "name".into(),
@@ -175,6 +176,7 @@ fn exec_with_rows(
                     nullable: true,
                     unique: false,
                     primary: false,
+                    default: None,
                 },
             ],
         },
@@ -190,6 +192,7 @@ fn exec_with_rows(
                 values_list: vec![vec![Value::Int(i), Value::Text(format!("n{i}"))]],
                 returning: vec![],
                 on_conflict: None,
+                default_cells: vec![],
             },
         )
         .unwrap();

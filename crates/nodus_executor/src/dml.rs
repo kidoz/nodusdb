@@ -91,6 +91,7 @@ impl MemExecutor {
         values_list: Vec<Vec<Value>>,
         returning: Vec<String>,
         on_conflict: Option<crate::plan_types::OnConflictClause>,
+        default_cells: Vec<Vec<bool>>,
     ) -> Result<QueryOutput> {
         let (db_name, schema_name, table_only) = parse_object_name(&table_name)?;
         let tbl = self
@@ -104,19 +105,41 @@ impl MemExecutor {
         let mut inserted_count = 0;
         let mut returning_rows = Vec::new();
 
-        for values in values_list {
-            // Build the Values row in table-column order...
+        for (row_idx, values) in values_list.iter().enumerate() {
+            // Build the Values row in table-column order, tracking which
+            // columns actually received a value (an explicit `DEFAULT` cell
+            // counts as not provided).
+            let defaults_mask = default_cells.get(row_idx);
+            let is_default_cell =
+                |j: usize| defaults_mask.is_some_and(|m| m.get(j).copied().unwrap_or(false));
             let mut raw = vec![Value::Null; col_names.len()];
+            let mut provided = vec![false; col_names.len()];
             if columns.is_empty() {
                 for (i, v) in values.iter().enumerate() {
-                    if i < raw.len() {
+                    if i < raw.len() && !is_default_cell(i) {
                         raw[i] = v.clone();
+                        provided[i] = true;
                     }
                 }
             } else {
-                for (cname, val) in columns.iter().zip(values.iter()) {
+                for (j, (cname, val)) in columns.iter().zip(values.iter()).enumerate() {
                     if let Some(idx) = col_names.iter().position(|c| c == cname) {
-                        raw[idx] = val.clone();
+                        if !is_default_cell(j) {
+                            raw[idx] = val.clone();
+                            provided[idx] = true;
+                        }
+                    }
+                }
+            }
+            // Unprovided columns take their declared DEFAULT, if any.
+            for (i, c) in tbl.columns.iter().enumerate() {
+                if !provided[i] {
+                    if let Some(json) = &c.default_expr {
+                        if let Ok(expr) =
+                            serde_json::from_str::<crate::plan_types::ScalarExpr>(json)
+                        {
+                            raw[i] = eval_scalar_expr(&expr, &[], &[]);
+                        }
                     }
                 }
             }
@@ -306,8 +329,23 @@ impl MemExecutor {
             let old_pk_str = old_key.strip_prefix(&key_prefix).unwrap_or(&old_key).to_string();
             for (col, expr) in &assignments {
                 if let Some(idx) = col_names.iter().position(|c| c == col) {
-                    // Evaluate the RHS against the row's OLD values.
-                    let val = eval_scalar_expr(expr, &old_row, &col_names_owned);
+                    // `SET col = DEFAULT` sentinel: resolve to the column's
+                    // declared default (NULL when there is none).
+                    let val = if matches!(expr,
+                        ScalarExpr::Function { name, args } if name == "__COLUMN_DEFAULT__" && args.is_empty())
+                    {
+                        tbl.columns[idx]
+                            .default_expr
+                            .as_ref()
+                            .and_then(|json| {
+                                serde_json::from_str::<ScalarExpr>(json).ok()
+                            })
+                            .map(|e| eval_scalar_expr(&e, &[], &[]))
+                            .unwrap_or(Value::Null)
+                    } else {
+                        // Evaluate the RHS against the row's OLD values.
+                        eval_scalar_expr(expr, &old_row, &col_names_owned)
+                    };
                     let coerced =
                         crate::value::coerce_for_column(&val, &tbl.columns[idx].data_type);
                     if !tbl.columns[idx].nullable && coerced == Value::Null {

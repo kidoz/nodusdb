@@ -42,9 +42,18 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                 let mut nullable = true;
                 let mut unique = false;
                 let mut primary = false;
+                let mut default = None;
                 for opt in &c.options {
                     match &opt.option {
                         sqlparser::ast::ColumnOption::NotNull => nullable = false,
+                        sqlparser::ast::ColumnOption::Default(e) => {
+                            default = Some(lower_scalar(e, params).ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "Unsupported DEFAULT expression for column {}",
+                                    c.name.value
+                                )
+                            })?);
+                        }
                         // `PRIMARY KEY` column option implies unique + not-null.
                         sqlparser::ast::ColumnOption::PrimaryKey(_) => {
                             unique = true;
@@ -81,6 +90,7 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                     nullable,
                     unique,
                     primary,
+                    default,
                 });
             }
 
@@ -279,17 +289,42 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                         .unwrap_or_else(|| c.to_string())
                 })
                 .collect();
+            // An unquoted bare `DEFAULT` in a VALUES row means "use the
+            // column default" (it parses as a plain identifier).
+            let is_default_kw = |e: &sqlparser::ast::Expr| {
+                matches!(e, sqlparser::ast::Expr::Identifier(id)
+                    if id.quote_style.is_none() && id.value.eq_ignore_ascii_case("default"))
+            };
             let mut values_list = Vec::new();
+            let mut default_cells: Vec<Vec<bool>> = Vec::new();
+            let mut any_default = false;
             if let Some(query) = &insert.source {
                 if let SetExpr::Values(vs) = &*query.body {
                     for row in &vs.rows {
                         let mut row_values = Vec::new();
+                        let mut row_defaults = Vec::new();
                         for e in &row.content {
-                            row_values.push(expr_to_value(e, params).unwrap_or(crate::Value::Null));
+                            if is_default_kw(e) {
+                                row_values.push(crate::Value::Null);
+                                row_defaults.push(true);
+                                any_default = true;
+                            } else {
+                                row_values
+                                    .push(expr_to_value(e, params).unwrap_or(crate::Value::Null));
+                                row_defaults.push(false);
+                            }
                         }
                         values_list.push(row_values);
+                        default_cells.push(row_defaults);
                     }
                 }
+            } else {
+                // `INSERT INTO t DEFAULT VALUES` — one row of all defaults.
+                values_list.push(Vec::new());
+                default_cells.push(Vec::new());
+            }
+            if !any_default {
+                default_cells.clear();
             }
             let on_conflict = match &insert.on {
                 Some(sqlparser::ast::OnInsert::OnConflict(oc)) => match &oc.action {
@@ -322,6 +357,7 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                 values_list,
                 returning,
                 on_conflict,
+                default_cells,
             })
         }
         Statement::Query(query) => plan_query(query, params),
@@ -351,6 +387,19 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                         }
                         sqlparser::ast::AssignmentTarget::Tuple(_) => return None,
                     };
+                    // `SET col = DEFAULT` (an unquoted bare identifier) becomes
+                    // a sentinel the executor resolves to the column default.
+                    if let sqlparser::ast::Expr::Identifier(id) = &a.value {
+                        if id.quote_style.is_none() && id.value.eq_ignore_ascii_case("default") {
+                            return Some((
+                                col,
+                                crate::plan_types::ScalarExpr::Function {
+                                    name: "__COLUMN_DEFAULT__".to_string(),
+                                    args: vec![],
+                                },
+                            ));
+                        }
+                    }
                     // Lower the RHS to a scalar expression so `SET n = n + 1`
                     // and other computed assignments evaluate per row (a bare
                     // literal lowers to `ScalarExpr::Literal`).

@@ -413,6 +413,11 @@ pub enum LogicalPlan {
         /// Defaulted so plans serialized before this field decode.
         #[serde(default)]
         on_conflict: Option<OnConflictClause>,
+        /// Per-row mask marking cells written as the `DEFAULT` keyword (parallel
+        /// to `values_list`; empty = no DEFAULT cells anywhere). Such cells take
+        /// the column default as if the column had been omitted.
+        #[serde(default)]
+        default_cells: Vec<Vec<bool>>,
     },
     Select {
         ctes: Vec<(String, Box<LogicalPlan>)>,

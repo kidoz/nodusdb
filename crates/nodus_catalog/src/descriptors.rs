@@ -119,6 +119,11 @@ pub struct ColumnDescriptor {
     pub state: DescriptorState,
     pub data_type: String, // Simplified for MVP
     pub nullable: bool,
+    /// Column `DEFAULT` expression, serialized by the executor (opaque to the
+    /// catalog). `None` means no default. Defaulted so descriptors persisted
+    /// before this field decode.
+    #[serde(default)]
+    pub default_expr: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

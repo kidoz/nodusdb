@@ -11,6 +11,10 @@ pub struct ColumnDef {
     pub nullable: bool,
     pub unique: bool,
     pub primary: bool,
+    /// Lowered `DEFAULT` expression, if declared. Defaulted so plans
+    /// serialized before this field decode.
+    #[serde(default)]
+    pub default: Option<crate::plan_types::ScalarExpr>,
 }
 
 /// A typed cell value. Rows are stored as `Vec<Value>` in table-column order.

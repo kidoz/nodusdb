@@ -1,14 +1,13 @@
-# Ported from PostgreSQL src/test/regress/sql/update.sql (curated subset;
-# DEFAULT-valued columns omitted — column defaults are not supported).
+# Ported from PostgreSQL src/test/regress/sql/update.sql (curated subset).
 
 statement ok
-CREATE TABLE update_test (a INT, b INT, c TEXT);
+CREATE TABLE update_test (a INT DEFAULT 10, b INT, c TEXT);
 
 statement ok
 INSERT INTO update_test (a, b, c) VALUES (5, 10, 'foo');
 
 statement ok
-INSERT INTO update_test (a, b) VALUES (10, 15);
+INSERT INTO update_test (b, a) VALUES (15, 10);
 
 query IIT rowsort
 SELECT a, b, c FROM update_test;
@@ -16,8 +15,27 @@ SELECT a, b, c FROM update_test;
 10	15	NULL
 5	10	foo
 
+# pg's update.sql: SET a = DEFAULT, b = DEFAULT (b has no default -> NULL)
 statement ok
-UPDATE update_test SET b = NULL WHERE b = 15;
+UPDATE update_test SET a = DEFAULT, b = DEFAULT WHERE c IS NULL;
+
+query IIT rowsort
+SELECT a, b, c FROM update_test;
+----
+10	NULL	NULL
+5	10	foo
+
+statement ok
+UPDATE update_test SET b = 10 WHERE b IS NULL;
+
+query IIT rowsort
+SELECT a, b, c FROM update_test;
+----
+10	10	NULL
+5	10	foo
+
+statement ok
+UPDATE update_test SET b = NULL WHERE b = 10 AND a = 10;
 
 query IIT rowsort
 SELECT a, b, c FROM update_test;

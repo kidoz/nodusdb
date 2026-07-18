@@ -26,6 +26,7 @@ pub fn cols(names: &[(&str, &str)]) -> Vec<ColumnDef> {
             nullable: true,
             unique: false,
             primary: false,
+            default: None,
         })
         .collect()
 }
@@ -217,6 +218,7 @@ fn create_insert_select_round_trip() {
 
                 returning: vec![],
                 on_conflict: None,
+                default_cells: vec![],
             },
         )
         .unwrap();
@@ -326,6 +328,7 @@ fn rows_keyed_by_declared_pk_not_first_column() {
             nullable: false,
             unique: false,
             primary: false,
+            default: None,
         },
         ColumnDef {
             name: "id".into(),
@@ -334,6 +337,7 @@ fn rows_keyed_by_declared_pk_not_first_column() {
             // PRIMARY KEY implies UNIQUE, as the SQL planner produces it.
             unique: true,
             primary: true,
+            default: None,
         },
     ];
     exec.execute_logical(
@@ -358,6 +362,7 @@ fn rows_keyed_by_declared_pk_not_first_column() {
                 values_list: vec![vec![Value::Text("dup".into()), Value::Text(id.into())]],
                 returning: vec![],
                 on_conflict: None,
+                default_cells: vec![],
             },
         )
         .unwrap_or_else(|e| panic!("insert id={id} must succeed: {e}"));
@@ -392,6 +397,7 @@ fn rows_keyed_by_declared_pk_not_first_column() {
             values_list: vec![vec![Value::Text("other".into()), Value::Text("1".into())]],
             returning: vec![],
             on_conflict: None,
+            default_cells: vec![],
         },
     );
     assert!(dup.is_err(), "duplicate primary key must be rejected");
@@ -458,6 +464,7 @@ fn typed_values_round_trip_and_filter_by_int() {
 
             returning: vec![],
             on_conflict: None,
+            default_cells: vec![],
         },
     )
     .unwrap();
@@ -529,6 +536,7 @@ fn update_and_delete_rows() {
 
                 returning: vec![],
                 on_conflict: None,
+                default_cells: vec![],
             },
         )
         .unwrap();
@@ -644,6 +652,7 @@ fn test_join_execution() {
 
                 returning: vec![],
                 on_conflict: None,
+                default_cells: vec![],
             },
         )
         .unwrap();
@@ -667,6 +676,7 @@ fn test_join_execution() {
 
                 returning: vec![],
                 on_conflict: None,
+                default_cells: vec![],
             },
         )
         .unwrap();
@@ -771,6 +781,7 @@ fn transactions_are_isolated_per_session() {
 
             returning: vec![],
             on_conflict: None,
+            default_cells: vec![],
         },
     )
     .unwrap();
@@ -888,6 +899,7 @@ fn test_complex_filters() {
 
                 returning: vec![],
                 on_conflict: None,
+                default_cells: vec![],
             },
         )
         .unwrap();
@@ -969,6 +981,7 @@ fn test_left_outer_join() {
 
                 returning: vec![],
                 on_conflict: None,
+                default_cells: vec![],
             },
         )
         .unwrap();
@@ -988,6 +1001,7 @@ fn test_left_outer_join() {
 
                 returning: vec![],
                 on_conflict: None,
+                default_cells: vec![],
             },
         )
         .unwrap();

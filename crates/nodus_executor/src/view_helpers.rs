@@ -16,6 +16,7 @@ impl MemExecutor {
             state: nodus_catalog::DescriptorState::Public,
             data_type: data_type.into(),
             nullable: true,
+            default_expr: None,
         }
     }
 

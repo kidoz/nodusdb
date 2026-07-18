@@ -61,6 +61,7 @@ fn test_group_by_aggregates() {
                 ]],
                 returning: vec![],
                 on_conflict: None,
+                default_cells: vec![],
             },
         )
         .unwrap();
@@ -272,6 +273,7 @@ fn test_set_operations() {
                 values_list: vec![vec![Value::Text(id.to_string()), Value::Text(n.into())]],
                 returning: vec![],
                 on_conflict: None,
+                default_cells: vec![],
             },
         )
         .unwrap();
@@ -360,6 +362,7 @@ fn test_cross_join() {
                 values_list: vec![vec![Value::Text(id.into()), Value::Text(v.into())]],
                 returning: vec![],
                 on_conflict: None,
+                default_cells: vec![],
             },
         )
         .unwrap();
@@ -420,6 +423,7 @@ fn test_having() {
                 ]],
                 returning: vec![],
                 on_conflict: None,
+                default_cells: vec![],
             },
         )
         .unwrap();
@@ -499,6 +503,7 @@ fn test_window_functions() {
                 values_list: vec![vec![Value::Text(id.into()), Value::Text(amt.into())]],
                 returning: vec![],
                 on_conflict: None,
+                default_cells: vec![],
             },
         )
         .unwrap();

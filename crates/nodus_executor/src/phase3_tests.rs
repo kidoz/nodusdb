@@ -50,6 +50,7 @@ fn test_ddl_and_subqueries() {
                     nullable: false,
                     unique: true,
                     primary: true,
+                    default: None,
                 },
                 ColumnDef {
                     name: "name".into(),
@@ -57,6 +58,7 @@ fn test_ddl_and_subqueries() {
                     nullable: false,
                     unique: false,
                     primary: false,
+                    default: None,
                 },
                 ColumnDef {
                     name: "dept_id".into(),
@@ -64,6 +66,7 @@ fn test_ddl_and_subqueries() {
                     nullable: true,
                     unique: false,
                     primary: false,
+                    default: None,
                 },
             ],
         },
@@ -89,6 +92,7 @@ fn test_ddl_and_subqueries() {
             ],
             returning: vec![],
             on_conflict: None,
+            default_cells: vec![],
         },
     )
     .unwrap();
@@ -163,6 +167,7 @@ fn test_ddl_and_subqueries() {
             ]],
             returning: vec![],
             on_conflict: None,
+            default_cells: vec![],
         },
     )
     .unwrap();
@@ -251,6 +256,7 @@ fn test_unique_constraints() {
                     nullable: false,
                     unique: true,
                     primary: true,
+                    default: None,
                 },
                 ColumnDef {
                     name: "email".into(),
@@ -258,6 +264,7 @@ fn test_unique_constraints() {
                     nullable: false,
                     unique: true,
                     primary: false,
+                    default: None,
                 },
             ],
         },
@@ -275,6 +282,7 @@ fn test_unique_constraints() {
             ],
             returning: vec![],
             on_conflict: None,
+            default_cells: vec![],
         },
     )
     .unwrap();
@@ -287,6 +295,7 @@ fn test_unique_constraints() {
             values_list: vec![vec![Value::Int(1), Value::Text("c@c.com".into())]],
             returning: vec![],
             on_conflict: None,
+            default_cells: vec![],
         },
     );
     assert!(res.is_err());
@@ -304,6 +313,7 @@ fn test_unique_constraints() {
             values_list: vec![vec![Value::Int(3), Value::Text("b@b.com".into())]],
             returning: vec![],
             on_conflict: None,
+            default_cells: vec![],
         },
     );
     assert!(res2.is_err());
@@ -373,6 +383,7 @@ fn test_secondary_indexing() {
                     nullable: false,
                     unique: true,
                     primary: true,
+                    default: None,
                 },
                 ColumnDef {
                     name: "category".into(),
@@ -380,6 +391,7 @@ fn test_secondary_indexing() {
                     nullable: false,
                     unique: false,
                     primary: false,
+                    default: None,
                 },
             ],
         },
@@ -399,6 +411,7 @@ fn test_secondary_indexing() {
             ],
             returning: vec![],
             on_conflict: None,
+            default_cells: vec![],
         },
     )
     .unwrap();
@@ -428,6 +441,7 @@ fn test_secondary_indexing() {
             ],
             returning: vec![],
             on_conflict: None,
+            default_cells: vec![],
         },
     )
     .unwrap();
@@ -613,6 +627,7 @@ fn test_index_value_containing_separator_does_not_overmatch() {
                     nullable: false,
                     unique: true,
                     primary: true,
+                    default: None,
                 },
                 ColumnDef {
                     name: "tag".into(),
@@ -620,6 +635,7 @@ fn test_index_value_containing_separator_does_not_overmatch() {
                     nullable: false,
                     unique: false,
                     primary: false,
+                    default: None,
                 },
             ],
         },
@@ -637,6 +653,7 @@ fn test_index_value_containing_separator_does_not_overmatch() {
             ],
             returning: vec![],
             on_conflict: None,
+            default_cells: vec![],
         },
     )
     .unwrap();
@@ -721,6 +738,7 @@ fn test_alter_table_migrations() {
                     nullable: false,
                     unique: true,
                     primary: true,
+                    default: None,
                 },
                 ColumnDef {
                     name: "name".into(),
@@ -728,6 +746,7 @@ fn test_alter_table_migrations() {
                     nullable: false,
                     unique: false,
                     primary: false,
+                    default: None,
                 },
             ],
         },
@@ -742,6 +761,7 @@ fn test_alter_table_migrations() {
             values_list: vec![vec![Value::Int(1), Value::Text("Alice".into())]],
             returning: vec![],
             on_conflict: None,
+            default_cells: vec![],
         },
     )
     .unwrap();

@@ -1,0 +1,96 @@
+# Column DEFAULTs: declared defaults apply to omitted columns, explicit
+# DEFAULT keywords in VALUES/SET, and INSERT ... DEFAULT VALUES.
+
+statement ok
+CREATE TABLE dtest (id INT PRIMARY KEY, n INT DEFAULT 42, s TEXT DEFAULT 'unset', f FLOAT DEFAULT 1.5);
+
+# Omitted columns take their defaults
+statement ok
+INSERT INTO dtest (id) VALUES (1);
+
+query IITR
+SELECT id, n, s, f FROM dtest WHERE id = 1;
+----
+1	42	unset	1.5
+
+# Provided values win over defaults
+statement ok
+INSERT INTO dtest (id, n, s) VALUES (2, 7, 'set');
+
+query IITR
+SELECT id, n, s, f FROM dtest WHERE id = 2;
+----
+2	7	set	1.5
+
+# Explicit NULL overrides the default
+statement ok
+INSERT INTO dtest (id, n) VALUES (3, NULL);
+
+query II
+SELECT id, n FROM dtest WHERE id = 3;
+----
+3	NULL
+
+# Explicit DEFAULT keyword in VALUES
+statement ok
+INSERT INTO dtest (id, n, s) VALUES (4, DEFAULT, 'kw');
+
+query IIT
+SELECT id, n, s FROM dtest WHERE id = 4;
+----
+4	42	kw
+
+# DEFAULT keyword in a positional multi-row insert
+statement ok
+INSERT INTO dtest VALUES (5, DEFAULT, DEFAULT, 9.9), (6, 1, 'x', DEFAULT);
+
+query IITR rowsort
+SELECT id, n, s, f FROM dtest WHERE id IN (5, 6);
+----
+5	42	unset	9.9
+6	1	x	1.5
+
+# UPDATE SET col = DEFAULT restores the declared default
+statement ok
+UPDATE dtest SET n = DEFAULT, s = DEFAULT WHERE id = 2;
+
+query IIT
+SELECT id, n, s FROM dtest WHERE id = 2;
+----
+2	42	unset
+
+# A column without a default: omitted stays NULL, SET DEFAULT yields NULL
+statement ok
+CREATE TABLE nodefault (id INT PRIMARY KEY, v INT);
+
+statement ok
+INSERT INTO nodefault (id) VALUES (1);
+
+query II
+SELECT id, v FROM nodefault;
+----
+1	NULL
+
+# INSERT ... DEFAULT VALUES (all columns defaulted)
+statement ok
+CREATE TABLE alldef (a INT DEFAULT 10, b TEXT DEFAULT 'd');
+
+statement ok
+INSERT INTO alldef DEFAULT VALUES;
+
+query IT
+SELECT a, b FROM alldef;
+----
+10	d
+
+# A computed constant default expression
+statement ok
+CREATE TABLE cdef (id INT PRIMARY KEY, k INT DEFAULT 2 + 3);
+
+statement ok
+INSERT INTO cdef (id) VALUES (1);
+
+query II
+SELECT id, k FROM cdef;
+----
+1	5

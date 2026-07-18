@@ -170,6 +170,7 @@ impl MemExecutor {
                     state: nodus_catalog::DescriptorState::Public,
                     data_type: ty,
                     nullable: true,
+                    default_expr: None,
                 });
             }
             let prefix = table_alias.as_deref().unwrap_or(&table_name);
@@ -300,6 +301,7 @@ impl MemExecutor {
                         state: DescriptorState::Public,
                         data_type: ty.clone(),
                         nullable: true,
+                        default_expr: None,
                     })
                     .collect();
                 let mut combined_cols = col_names.clone();
@@ -348,6 +350,7 @@ impl MemExecutor {
                         state: nodus_catalog::DescriptorState::Public,
                         data_type: ty,
                         nullable: true,
+                        default_expr: None,
                     });
                 }
                 (
