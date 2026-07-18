@@ -30,17 +30,19 @@ SELECT n FROM cnt ORDER BY n;
 4
 5
 
-# a filter applied to the recursive result
+# a computed filter applied to the recursive result
 query I
 WITH RECURSIVE cnt(n) AS (
   SELECT 1
   UNION ALL
   SELECT n + 1 FROM cnt WHERE n < 10
 )
-SELECT n FROM cnt WHERE n > 7 ORDER BY n;
+SELECT n FROM cnt WHERE n % 2 = 0 ORDER BY n;
 ----
+2
+4
+6
 8
-9
 10
 
 # transitive closure over a graph, using UNION to dedup and terminate on cycles

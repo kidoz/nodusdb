@@ -123,23 +123,34 @@ pub(crate) fn parse_filter_expr(
             })
         }
         Expr::BinaryOp { left, op, right } => {
-            let left_col = extract_col_name(left)?;
             let cmp = compare_op(op)?;
-            // `col <op> (scalar subquery)`.
-            if let Expr::Subquery(query) = &**right {
-                let sub_plan = plan_query(query, params).ok()?;
-                return Some(FilterExpr::CompareSubquery {
-                    left: left_col,
-                    op: cmp,
-                    subquery: Box::new(sub_plan),
-                });
+            if let Some(left_col) = extract_col_name(left) {
+                // `col <op> (scalar subquery)`.
+                if let Expr::Subquery(query) = &**right {
+                    let sub_plan = plan_query(query, params).ok()?;
+                    return Some(FilterExpr::CompareSubquery {
+                        left: left_col,
+                        op: cmp,
+                        subquery: Box::new(sub_plan),
+                    });
+                }
+                if let Some(right_op) = extract_operand(right, params) {
+                    return Some(FilterExpr::Predicate(Predicate {
+                        left: left_col,
+                        op: cmp,
+                        right: right_op,
+                    }));
+                }
             }
-            let right_op = extract_operand(right, params)?;
-            Some(FilterExpr::Predicate(Predicate {
-                left: left_col,
+            // A computed side (e.g. `n % 2 = 0`, `a = b + 1`): lower both to
+            // scalar expressions and compare per row.
+            let l = lower_scalar(left, params)?;
+            let r = lower_scalar(right, params)?;
+            Some(FilterExpr::ExprCmp {
+                left: l,
                 op: cmp,
-                right: right_op,
-            }))
+                right: r,
+            })
         }
         // `x BETWEEN a AND b` -> `x >= a AND x <= b`; NOT BETWEEN -> `x < a OR x > b`.
         Expr::Between {

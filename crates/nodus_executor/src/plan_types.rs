@@ -62,6 +62,14 @@ pub enum FilterExpr {
         op: CompareOp,
         subquery: Box<LogicalPlan>,
     },
+    /// `<expr> <op> <expr>` where at least one side is a computed scalar
+    /// expression rather than a bare column/literal (e.g. `n % 2 = 0`,
+    /// `a = b + 1`). Both sides evaluate per row via `eval_scalar_expr`.
+    ExprCmp {
+        left: ScalarExpr,
+        op: CompareOp,
+        right: ScalarExpr,
+    },
     /// `[NOT] EXISTS (<subquery>)`. The subquery may reference outer columns
     /// (correlated); those references are substituted with the current row's
     /// values before the subquery is executed, and the predicate is true iff

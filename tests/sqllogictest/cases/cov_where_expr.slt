@@ -1,0 +1,68 @@
+# Computed expressions in WHERE: an arithmetic/function left side (or a
+# computed right side) is evaluated per row instead of being silently dropped.
+
+statement ok
+CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT, name TEXT);
+
+statement ok
+INSERT INTO t VALUES
+  (1, 2, 1, 'alpha'),
+  (2, 4, 4, 'beta'),
+  (3, 6, 5, 'gamma'),
+  (4, 7, 7, 'delta'),
+  (5, 9, NULL, 'omega');
+
+# modulo on the left side
+query I rowsort
+SELECT id FROM t WHERE a % 2 = 0;
+----
+1
+2
+3
+
+# arithmetic combining two columns on the left
+query I rowsort
+SELECT id FROM t WHERE a + b > 10;
+----
+3
+4
+
+# column compared to a computed right side
+query I rowsort
+SELECT id FROM t WHERE a = b + 1;
+----
+1
+3
+
+# both sides computed
+query I rowsort
+SELECT id FROM t WHERE a * 2 = b * 2;
+----
+2
+4
+
+# scalar function on the left side
+query I rowsort
+SELECT id FROM t WHERE upper(name) = 'BETA';
+----
+2
+
+# NULL in a computed side excludes the row (three-valued logic), including via NOT
+query I rowsort
+SELECT id FROM t WHERE NOT (a + b > 10);
+----
+1
+2
+
+# computed predicate combined with a plain one via AND/OR
+query I rowsort
+SELECT id FROM t WHERE a % 2 = 1 AND id < 5;
+----
+4
+
+query I rowsort
+SELECT id FROM t WHERE a % 3 = 0 OR id = 1;
+----
+1
+3
+5

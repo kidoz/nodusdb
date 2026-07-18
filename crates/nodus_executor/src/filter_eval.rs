@@ -313,6 +313,24 @@ impl MemExecutor {
                     }
                 }
             }
+            FilterExpr::ExprCmp { left, op, right } => {
+                let l = crate::eval_scalar_expr(left, row, col_names);
+                let r = crate::eval_scalar_expr(right, row, col_names);
+                if l == Value::Null || r == Value::Null {
+                    return None;
+                }
+                let ord = crate::planner::interval_aware_compare(&l, &r);
+                Some(match op {
+                    CompareOp::Eq => ord == std::cmp::Ordering::Equal,
+                    CompareOp::Ne => ord != std::cmp::Ordering::Equal,
+                    CompareOp::Lt => ord == std::cmp::Ordering::Less,
+                    CompareOp::Le => ord != std::cmp::Ordering::Greater,
+                    CompareOp::Gt => ord == std::cmp::Ordering::Greater,
+                    CompareOp::Ge => ord != std::cmp::Ordering::Less,
+                    CompareOp::Contains => value_contains(&l, &r),
+                    CompareOp::ContainedBy => value_contains(&r, &l),
+                })
+            }
             FilterExpr::Exists { subquery, negated } => {
                 // Substitute any outer-column references in the subquery with
                 // this row's values (correlation), then execute it. The result
