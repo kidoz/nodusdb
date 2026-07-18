@@ -406,6 +406,13 @@ pub enum LogicalPlan {
         filter: Option<FilterExpr>,
         /// `HAVING` predicate applied to groups after aggregation.
         having: Option<FilterExpr>,
+        /// Expanded `ROLLUP`/`CUBE`/`GROUPING SETS` — the list of grouping
+        /// column-sets to aggregate by. `group_by` holds the union of all
+        /// columns mentioned (for output resolution); a column absent from a
+        /// given set is emitted as NULL for that set's rows. `None` means plain
+        /// aggregation over `group_by`. Appended last so older plans decode.
+        #[serde(default)]
+        grouping_sets: Option<Vec<Vec<String>>>,
         /// Optional `ORDER BY (column, ascending, nulls_first_override)`. The
         /// third element is `Some(true)`/`Some(false)` for an explicit `NULLS
         /// FIRST`/`NULLS LAST`, or `None` to use the default (nulls first on

@@ -86,6 +86,7 @@ fn test_offset_distinct_returning() {
                         .collect(),
                     filter: None,
                     having: None,
+                    grouping_sets: None,
                     order_by: vec![],
                     limit,
                     offset,

@@ -212,6 +212,7 @@ fn select_plan(
         projection: vec![],
         filter,
         having: None,
+        grouping_sets: None,
         order_by: vec![],
         limit,
         offset,
@@ -300,6 +301,7 @@ fn streaming_projects_columns_with_where_and_limit() {
         projection: vec![ProjectionItem::Column("name".into())],
         filter,
         having: None,
+        grouping_sets: None,
         order_by: vec![],
         limit: Some(5),
         offset: None,
@@ -347,6 +349,7 @@ fn streaming_falls_back_for_non_streamable_shapes() {
         projection: vec![],
         filter: None,
         having: None,
+        grouping_sets: None,
         order_by: vec![("id".into(), false, None)], // DESC
         limit: Some(3),
         offset: None,

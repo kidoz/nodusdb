@@ -707,11 +707,63 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
     }
 
     let mut group_by = Vec::new();
+    let mut grouping_sets: Option<Vec<Vec<String>>> = None;
     match &select.group_by {
         sqlparser::ast::GroupByExpr::Expressions(exprs, _) => {
+            use sqlparser::ast::Expr;
+            // Flattens a grouping element's expressions into column names.
+            let cols_of = |es: &[Expr]| -> Vec<String> {
+                es.iter().filter_map(extract_col_name).collect()
+            };
             for expr in exprs {
-                if let sqlparser::ast::Expr::Identifier(id) = expr {
-                    group_by.push(id.value.clone());
+                match expr {
+                    Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
+                        if let Some(c) = extract_col_name(expr) {
+                            group_by.push(c);
+                        }
+                    }
+                    // `ROLLUP(e1, e2, …)` → prefixes: {e1..en}, …, {e1}, {}.
+                    Expr::Rollup(elements) => {
+                        let elems: Vec<Vec<String>> =
+                            elements.iter().map(|e| cols_of(e)).collect();
+                        let mut sets = Vec::new();
+                        for i in (0..=elems.len()).rev() {
+                            sets.push(elems[..i].concat());
+                        }
+                        grouping_sets = Some(sets);
+                    }
+                    // `CUBE(e1, …, en)` → every subset of the elements.
+                    Expr::Cube(elements) => {
+                        let elems: Vec<Vec<String>> =
+                            elements.iter().map(|e| cols_of(e)).collect();
+                        let mut sets = Vec::new();
+                        for mask in (0..(1u32 << elems.len())).rev() {
+                            let mut set = Vec::new();
+                            for (bit, e) in elems.iter().enumerate() {
+                                if mask & (1 << bit) != 0 {
+                                    set.extend(e.iter().cloned());
+                                }
+                            }
+                            sets.push(set);
+                        }
+                        grouping_sets = Some(sets);
+                    }
+                    // `GROUPING SETS((a,b), (a), ())` → each inner list is one set.
+                    Expr::GroupingSets(list) => {
+                        grouping_sets = Some(list.iter().map(|e| cols_of(e)).collect());
+                    }
+                    _ => {}
+                }
+            }
+            // `group_by` carries the union of every column mentioned (in first
+            // appearance) so the output/NULL-rollup logic can resolve them.
+            if let Some(sets) = &grouping_sets {
+                for set in sets {
+                    for c in set {
+                        if !group_by.contains(c) {
+                            group_by.push(c.clone());
+                        }
+                    }
                 }
             }
         }
@@ -766,6 +818,7 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
         group_by,
         filter: parse_predicates(&select.selection, params),
         having,
+        grouping_sets,
         order_by,
         limit,
         offset,

@@ -47,6 +47,7 @@ impl MemExecutor {
             group_by,
             filter,
             having,
+            grouping_sets,
             order_by,
             limit,
             offset,
@@ -55,6 +56,7 @@ impl MemExecutor {
             && ctes.is_empty()
             && joins.is_empty()
             && group_by.is_empty()
+            && grouping_sets.is_none()
             && having.is_none()
             && order_by.is_empty()
             && !*distinct

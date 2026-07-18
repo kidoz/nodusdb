@@ -23,6 +23,7 @@ impl MemExecutor {
         group_by: Vec<String>,
         filter: Option<FilterExpr>,
         having: Option<FilterExpr>,
+        grouping_sets: Option<Vec<Vec<String>>>,
         order_by: Vec<(String, bool, Option<bool>)>,
         limit: Option<usize>,
         offset: Option<usize>,
@@ -467,79 +468,95 @@ impl MemExecutor {
         let mut out_cols = Vec::new();
 
         if is_agg {
-            let mut groups: std::collections::BTreeMap<Vec<Vec<u8>>, Vec<Vec<Value>>> =
-                std::collections::BTreeMap::new();
+            // The grouping sets to bucket by. Without ROLLUP/CUBE/GROUPING SETS
+            // this is a single set equal to the GROUP BY columns.
+            let sets: Vec<Vec<String>> = match &grouping_sets {
+                Some(s) if !s.is_empty() => s.clone(),
+                _ => vec![group_by.clone()],
+            };
 
-            let group_by_indices: Vec<Option<usize>> = group_by
-                .iter()
-                .map(|c| {
-                    col_names
-                        .iter()
-                        .position(|tc| tc == c || tc.ends_with(&format!(".{}", c)))
-                })
-                .collect();
+            for set in &sets {
+                let set_indices: Vec<Option<usize>> = set
+                    .iter()
+                    .map(|c| {
+                        col_names
+                            .iter()
+                            .position(|tc| tc == c || tc.ends_with(&format!(".{}", c)))
+                    })
+                    .collect();
 
-            if stored_rows.is_empty() && group_by.is_empty() {
-                // Empty set but scalar agg like COUNT(*), yields one row
-                groups.insert(vec![], vec![]);
-            } else {
-                for r in stored_rows {
-                    let key = group_by_indices
-                        .iter()
-                        .map(|i| {
-                            let val = i.and_then(|idx| r.get(idx)).unwrap_or(&Value::Null);
-                            // serialize for BTreeMap key
-                            serde_json::to_vec(val).unwrap_or_default()
-                        })
-                        .collect::<Vec<_>>();
-                    groups.entry(key).or_default().push(r);
-                }
-            }
+                let mut groups: std::collections::BTreeMap<Vec<Vec<u8>>, Vec<Vec<Value>>> =
+                    std::collections::BTreeMap::new();
 
-            for (_k, group_rows) in groups {
-                // HAVING filters whole groups after aggregation.
-                if let Some(h) = having.as_ref() {
-                    if !eval_having(h, &group_rows, &col_names) {
-                        continue;
+                if stored_rows.is_empty() && set.is_empty() {
+                    // Empty set but scalar agg like COUNT(*), yields one row.
+                    groups.insert(vec![], vec![]);
+                } else {
+                    for r in &stored_rows {
+                        let key = set_indices
+                            .iter()
+                            .map(|i| {
+                                let val = i.and_then(|idx| r.get(idx)).unwrap_or(&Value::Null);
+                                serde_json::to_vec(val).unwrap_or_default()
+                            })
+                            .collect::<Vec<_>>();
+                        groups.entry(key).or_default().push(r.clone());
                     }
                 }
-                let mut out_row = Vec::new();
-                for proj_item in &projection {
-                    match proj_item {
-                        ProjectionItem::Literal(v) | ProjectionItem::AliasedLiteral(v, _) => {
-                            out_row.push(v.clone());
-                        }
-                        ProjectionItem::Column(c) | ProjectionItem::AliasedColumn(c, _) => {
-                            let idx = col_names
-                                .iter()
-                                .position(|tc| tc == c || tc.ends_with(&format!(".{}", c)));
-                            // Take from first row of group
-                            out_row.push(
-                                group_rows
-                                    .first()
-                                    .and_then(|r| idx.and_then(|i| r.get(i)))
-                                    .map(|v| v.clone())
-                                    .unwrap_or(crate::Value::Null),
-                            );
-                        }
-                        ProjectionItem::WindowFunction { .. }
-                        | ProjectionItem::ScalarFunction { .. }
-                        | ProjectionItem::JsonAccess { .. }
-                        | ProjectionItem::CaseWhenEq { .. }
-                        | ProjectionItem::Case { .. } => {
-                            out_row.push(Value::Null); // MVP fallback
-                        }
-                        ProjectionItem::Aggregate(op, inner) => {
-                            out_row.push(compute_aggregate(op, inner, &group_rows, &col_names));
-                        }
-                        ProjectionItem::Expr { expr, .. } => {
-                            // Group-aware eval: aggregates compute over the group,
-                            // plain columns read the group's first row.
-                            out_row.push(eval_scalar_expr_grouped(expr, &group_rows, &col_names));
+
+                for (_k, group_rows) in groups {
+                    // HAVING filters whole groups after aggregation.
+                    if let Some(h) = having.as_ref() {
+                        if !eval_having(h, &group_rows, &col_names) {
+                            continue;
                         }
                     }
+                    let mut out_row = Vec::new();
+                    for proj_item in &projection {
+                        match proj_item {
+                            ProjectionItem::Literal(v) | ProjectionItem::AliasedLiteral(v, _) => {
+                                out_row.push(v.clone());
+                            }
+                            ProjectionItem::Column(c) | ProjectionItem::AliasedColumn(c, _) => {
+                                // A grouping column not present in this set is
+                                // rolled up to NULL (subtotal / grand-total row).
+                                let is_grouping = group_by.iter().any(|g| g == c);
+                                let is_active = set.iter().any(|s| s == c);
+                                if is_grouping && !is_active {
+                                    out_row.push(crate::Value::Null);
+                                } else {
+                                    let idx = col_names.iter().position(|tc| {
+                                        tc == c || tc.ends_with(&format!(".{}", c))
+                                    });
+                                    out_row.push(
+                                        group_rows
+                                            .first()
+                                            .and_then(|r| idx.and_then(|i| r.get(i)))
+                                            .map(|v| v.clone())
+                                            .unwrap_or(crate::Value::Null),
+                                    );
+                                }
+                            }
+                            ProjectionItem::WindowFunction { .. }
+                            | ProjectionItem::ScalarFunction { .. }
+                            | ProjectionItem::JsonAccess { .. }
+                            | ProjectionItem::CaseWhenEq { .. }
+                            | ProjectionItem::Case { .. } => {
+                                out_row.push(Value::Null); // MVP fallback
+                            }
+                            ProjectionItem::Aggregate(op, inner) => {
+                                out_row.push(compute_aggregate(op, inner, &group_rows, &col_names));
+                            }
+                            ProjectionItem::Expr { expr, .. } => {
+                                // Group-aware eval: aggregates compute over the group,
+                                // plain columns read the group's first row.
+                                out_row
+                                    .push(eval_scalar_expr_grouped(expr, &group_rows, &col_names));
+                            }
+                        }
+                    }
+                    out_rows.push(out_row);
                 }
-                out_rows.push(out_row);
             }
 
             out_cols = if projection.is_empty() {

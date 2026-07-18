@@ -235,6 +235,7 @@ fn create_insert_select_round_trip() {
                 projection: vec![],
                 filter: None,
                 having: None,
+                grouping_sets: None,
                 order_by: vec![],
                 limit: None,
 
@@ -262,6 +263,7 @@ fn create_insert_select_round_trip() {
                 ],
                 filter: eq("id", "2"),
                 having: None,
+                grouping_sets: None,
                 order_by: vec![],
                 limit: None,
 
@@ -370,6 +372,7 @@ fn rows_keyed_by_declared_pk_not_first_column() {
         projection: vec![],
         filter: None,
         having: None,
+        grouping_sets: None,
         order_by: vec![],
         limit: None,
         offset: None,
@@ -472,6 +475,7 @@ fn typed_values_round_trip_and_filter_by_int() {
                 projection: vec![],
                 filter: eq("id", "7"),
                 having: None,
+                grouping_sets: None,
                 order_by: vec![],
                 limit: None,
 
@@ -557,6 +561,7 @@ fn update_and_delete_rows() {
                 projection: vec![ProjectionItem::Column("name".into())],
                 filter,
                 having: None,
+                grouping_sets: None,
                 order_by: vec![],
                 limit: None,
 
@@ -695,6 +700,7 @@ fn test_join_execution() {
             right: Operand::Literal(Value::Text("Herbert".into())),
         })),
         having: None,
+        grouping_sets: None,
         order_by: vec![("books.id".into(), true, None)],
         limit: None,
 
@@ -782,6 +788,7 @@ fn transactions_are_isolated_per_session() {
                 projection: vec![],
                 filter: None,
                 having: None,
+                grouping_sets: None,
                 order_by: vec![],
                 limit: None,
 

@@ -1,21 +1,60 @@
-# Coverage GAP: GROUPING SETS / ROLLUP / CUBE are NOT supported (no grand-total
-# / subtotal rows are added). Plain GROUP BY works and is the substitute.
+# GROUP BY ROLLUP / CUBE / GROUPING SETS: extra subtotal / grand-total rows,
+# with rolled-up grouping columns emitted as NULL.
 
 statement ok
-CREATE TABLE sales (id INT PRIMARY KEY, region TEXT, amt INT);
+CREATE TABLE sales (id INT PRIMARY KEY, region TEXT, product TEXT, amt INT);
 
 statement ok
-INSERT INTO sales VALUES (1, 'west', 100), (2, 'west', 200), (3, 'east', 50);
+INSERT INTO sales VALUES
+  (1, 'west', 'a', 100),
+  (2, 'west', 'b', 200),
+  (3, 'east', 'a', 50);
 
-# per-group totals via plain GROUP BY
+# Plain GROUP BY still works (single set).
 query TI rowsort
 SELECT region, sum(amt) FROM sales GROUP BY region;
 ----
 east	50
 west	300
 
-# the grand total via a separate scalar aggregate (ROLLUP substitute)
-query I
-SELECT sum(amt) FROM sales;
+# ROLLUP(region): per-region rows plus a grand-total row (region NULL).
+query TI rowsort
+SELECT region, sum(amt) FROM sales GROUP BY ROLLUP(region);
 ----
-350
+west	300
+east	50
+NULL	350
+
+# ROLLUP(region, product): full detail, per-region subtotals, grand total.
+query TTI rowsort
+SELECT region, product, sum(amt) FROM sales GROUP BY ROLLUP(region, product);
+----
+west	a	100
+west	b	200
+east	a	50
+west	NULL	300
+east	NULL	50
+NULL	NULL	350
+
+# CUBE(region, product): every combination of grouped/rolled-up columns.
+query TTI rowsort
+SELECT region, product, sum(amt) FROM sales GROUP BY CUBE(region, product);
+----
+west	a	100
+west	b	200
+east	a	50
+west	NULL	300
+east	NULL	50
+NULL	a	150
+NULL	b	200
+NULL	NULL	350
+
+# GROUPING SETS with explicit sets, including the empty (grand-total) set.
+query TTI rowsort
+SELECT region, product, sum(amt) FROM sales GROUP BY GROUPING SETS ((region), (product), ());
+----
+west	NULL	300
+east	NULL	50
+NULL	a	150
+NULL	b	200
+NULL	NULL	350
