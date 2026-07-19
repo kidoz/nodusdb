@@ -1,0 +1,109 @@
+# Ported from PostgreSQL src/test/regress/sql/text.sql and a curated subset of
+# strings.sql: concatenation, length, case functions, SUBSTRING/TRIM, LIKE.
+
+statement ok
+CREATE TABLE text_tbl (f1 TEXT);
+
+statement ok
+INSERT INTO text_tbl VALUES ('doh!'), ('hi de ho neighbor');
+
+query T rowsort
+SELECT f1 FROM text_tbl;
+----
+doh!
+hi de ho neighbor
+
+query T
+SELECT 'this is a text string' = 'this is a text string' AS true;
+----
+t
+
+query T
+SELECT 'this is a text string' = 'this is a text strin' AS false;
+----
+f
+
+# concatenation
+query T
+SELECT 'text' || 'string';
+----
+textstring
+
+query T rowsort
+SELECT f1 || ' and more' FROM text_tbl;
+----
+doh! and more
+hi de ho neighbor and more
+
+# non-text argument concatenates via implicit cast
+query T
+SELECT 'four: ' || 2 + 2;
+----
+four: 4
+
+# length / character functions
+query I
+SELECT length('abcdef');
+----
+6
+
+query I rowsort
+SELECT length(f1) FROM text_tbl;
+----
+17
+4
+
+query T
+SELECT upper('doh!');
+----
+DOH!
+
+query T
+SELECT lower('DOH!');
+----
+doh!
+
+# SUBSTRING / TRIM
+query T
+SELECT substring('1234567890' FROM 3 FOR 4);
+----
+3456
+
+query T
+SELECT trim('  trim me  ');
+----
+trim me
+
+# LIKE over the fixture
+query T rowsort
+SELECT f1 FROM text_tbl WHERE f1 LIKE '%ho%';
+----
+hi de ho neighbor
+
+query T rowsort
+SELECT f1 FROM text_tbl WHERE f1 LIKE 'doh%';
+----
+doh!
+
+query T rowsort
+SELECT f1 FROM text_tbl WHERE f1 NOT LIKE '%ho%';
+----
+doh!
+
+query T rowsort
+SELECT f1 FROM text_tbl WHERE f1 LIKE '_i%';
+----
+hi de ho neighbor
+
+# text ordering is lexicographic
+query T
+SELECT f1 FROM text_tbl ORDER BY f1;
+----
+doh!
+hi de ho neighbor
+
+query T
+SELECT f1 FROM text_tbl ORDER BY f1 DESC;
+----
+hi de ho neighbor
+doh!

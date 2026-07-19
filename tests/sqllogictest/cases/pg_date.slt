@@ -1,0 +1,93 @@
+# Ported from PostgreSQL src/test/regress/sql/date.sql (curated subset).
+# NodusDB stores dates as ISO text, which compares and orders chronologically;
+# BC dates are omitted. Expected values follow expected/date.out.
+
+statement ok
+CREATE TABLE date_tbl (f1 DATE);
+
+statement ok
+INSERT INTO date_tbl VALUES
+  ('1957-04-09'), ('1957-06-13'), ('1996-02-28'), ('1996-02-29'),
+  ('1996-03-01'), ('1996-03-02'), ('1997-02-28'), ('1997-03-01'),
+  ('1997-03-02'), ('2000-04-01'), ('2000-04-02'), ('2000-04-03'),
+  ('2038-04-08'), ('2039-04-09'), ('2040-04-10');
+
+query T rowsort
+SELECT f1 FROM date_tbl WHERE f1 < '2000-01-01';
+----
+1957-04-09
+1957-06-13
+1996-02-28
+1996-02-29
+1996-03-01
+1996-03-02
+1997-02-28
+1997-03-01
+1997-03-02
+
+query T rowsort
+SELECT f1 FROM date_tbl
+  WHERE f1 BETWEEN '2000-01-01' AND '2001-01-01';
+----
+2000-04-01
+2000-04-02
+2000-04-03
+
+query T
+SELECT f1 FROM date_tbl WHERE f1 = '1996-02-29';
+----
+1996-02-29
+
+query T
+SELECT f1 FROM date_tbl ORDER BY f1 DESC LIMIT 3;
+----
+2040-04-10
+2039-04-09
+2038-04-08
+
+query I
+SELECT count(*) FROM date_tbl WHERE f1 > '1997-01-01' AND f1 < '2001-01-01';
+----
+6
+
+# EXTRACT fields
+query I
+SELECT EXTRACT(YEAR FROM DATE '1970-03-20');
+----
+1970
+
+query I
+SELECT EXTRACT(MONTH FROM DATE '1970-03-20');
+----
+3
+
+query I
+SELECT EXTRACT(DAY FROM DATE '1970-03-20');
+----
+20
+
+# date + interval arithmetic (text-backed). Divergence from pg: the result
+# stays a plain date; pg promotes to timestamp ('2001-10-05 00:00:00').
+query T
+SELECT DATE '2001-09-28' + INTERVAL '7 days';
+----
+2001-10-05
+
+query T
+SELECT DATE '2001-09-28' - INTERVAL '1 month';
+----
+2001-08-28
+
+# leap-year handling in ordering around Feb 29
+query T
+SELECT min(f1) FROM date_tbl WHERE f1 > '1996-02-28';
+----
+1996-02-29
+
+# GROUP BY on the year via EXTRACT in a projection over rows
+query I rowsort
+SELECT EXTRACT(YEAR FROM f1) FROM date_tbl WHERE f1 >= '2038-01-01';
+----
+2038
+2039
+2040

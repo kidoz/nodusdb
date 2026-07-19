@@ -1,0 +1,122 @@
+# Ported from PostgreSQL src/test/regress/sql/int4.sql (curated subset).
+# Overflow-raising cases are omitted (NodusDB computes in 64-bit); the
+# non-overflow arithmetic follows pg's own abs(f1) < 1073741824 variants.
+
+statement ok
+CREATE TABLE int4_tbl (f1 INT);
+
+statement ok
+INSERT INTO int4_tbl VALUES (0), (123456), (-123456), (2147483647), (-2147483647);
+
+query I rowsort
+SELECT f1 FROM int4_tbl;
+----
+-123456
+-2147483647
+0
+123456
+2147483647
+
+# comparisons
+query I rowsort
+SELECT f1 FROM int4_tbl WHERE f1 <> 0;
+----
+-123456
+-2147483647
+123456
+2147483647
+
+query I rowsort
+SELECT f1 FROM int4_tbl WHERE f1 = 0;
+----
+0
+
+query I rowsort
+SELECT f1 FROM int4_tbl WHERE f1 < 0;
+----
+-123456
+-2147483647
+
+query I rowsort
+SELECT f1 FROM int4_tbl WHERE f1 <= 0;
+----
+-123456
+-2147483647
+0
+
+query I rowsort
+SELECT f1 FROM int4_tbl WHERE f1 > 0;
+----
+123456
+2147483647
+
+query I rowsort
+SELECT f1 FROM int4_tbl WHERE f1 >= 0;
+----
+0
+123456
+2147483647
+
+# odd numbers via modulo
+query I rowsort
+SELECT f1 FROM int4_tbl WHERE f1 % 2 = 1;
+----
+2147483647
+
+query I rowsort
+SELECT f1 FROM int4_tbl WHERE f1 % 2 = 0;
+----
+-123456
+0
+123456
+
+# non-overflow arithmetic (pg's abs(f1) < 1073741824 guard)
+query II rowsort
+SELECT f1, f1 * 2 FROM int4_tbl WHERE abs(f1) < 1073741824;
+----
+-123456	-246912
+0	0
+123456	246912
+
+query II rowsort
+SELECT f1, f1 + 2 FROM int4_tbl WHERE f1 < 2147483646;
+----
+-123456	-123454
+-2147483647	-2147483645
+0	2
+123456	123458
+
+query II rowsort
+SELECT f1, f1 - 2 FROM int4_tbl WHERE f1 > -2147483647;
+----
+-123456	-123458
+0	-2
+123456	123454
+2147483647	2147483645
+
+query II rowsort
+SELECT f1, f1 / 2 FROM int4_tbl;
+----
+-123456	-61728
+-2147483647	-1073741823
+0	0
+123456	61728
+2147483647	1073741823
+
+# integer division truncates toward zero; modulo takes the dividend's sign
+query I
+SELECT -5 / 2;
+----
+-2
+
+query I
+SELECT -5 % 2;
+----
+-1
+
+# Divergence from pg: int4 overflow does not error — NodusDB computes all
+# integers in 64-bit, so this yields 2147483648 where pg raises "out of range".
+query I
+SELECT (-2147483648)::int4 * (-1)::int4;
+----
+2147483648

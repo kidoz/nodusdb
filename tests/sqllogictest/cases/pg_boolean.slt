@@ -1,0 +1,112 @@
+# Ported from PostgreSQL src/test/regress/sql/boolean.sql (curated subset).
+# Booleans render as t/f on the wire, matching psql.
+
+query I
+SELECT 1 AS one;
+----
+1
+
+query T
+SELECT true AS true;
+----
+t
+
+query T
+SELECT false AS false;
+----
+f
+
+# and / or / not over literals
+query T
+SELECT true OR false AS true;
+----
+t
+
+query T
+SELECT true AND false AS false;
+----
+f
+
+query T
+SELECT NOT false AS true;
+----
+t
+
+query T
+SELECT true = false AS false;
+----
+f
+
+query T
+SELECT true <> false AS true;
+----
+t
+
+# Fixtures mirroring BOOLTBL1/BOOLTBL2
+statement ok
+CREATE TABLE booltbl1 (f1 BOOL);
+
+statement ok
+INSERT INTO booltbl1 VALUES (true), (true), (true);
+
+statement ok
+CREATE TABLE booltbl2 (f1 BOOL);
+
+statement ok
+INSERT INTO booltbl2 VALUES (false), (false), (false), (false);
+
+query T rowsort
+SELECT f1 FROM booltbl1;
+----
+t
+t
+t
+
+query I
+SELECT count(*) FROM booltbl1 WHERE f1 = true;
+----
+3
+
+query I
+SELECT count(*) FROM booltbl1 WHERE f1 = false;
+----
+0
+
+query T rowsort
+SELECT f1 FROM booltbl2;
+----
+f
+f
+f
+f
+
+query I
+SELECT count(*) FROM booltbl2 WHERE f1 <> true;
+----
+4
+
+# cross-table comparison via join
+query I
+SELECT count(*) FROM booltbl1 b1 JOIN booltbl2 b2 ON b1.f1 = b2.f1;
+----
+0
+
+query I
+SELECT count(*) FROM booltbl1 b1 JOIN booltbl2 b2 ON b1.f1 <> b2.f1;
+----
+12
+
+# boolean expressions in the select list over rows
+query T rowsort
+SELECT f1 AND false FROM booltbl1;
+----
+f
+f
+f
+
+query T rowsort
+SELECT f1 OR false FROM booltbl1;
+----
+t
+t
+t

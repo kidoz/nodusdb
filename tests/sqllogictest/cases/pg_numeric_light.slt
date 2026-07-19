@@ -1,0 +1,101 @@
+# Light port of PostgreSQL src/test/regress/sql/numeric.sql. NodusDB computes
+# NUMERIC as 64-bit float, so pg's scale-preserving rendering (e.g. 4.5000) and
+# arbitrary precision are out of scope; this covers clean-value arithmetic,
+# comparisons, aggregates, and rounding.
+
+statement ok
+CREATE TABLE num_tbl (id INT PRIMARY KEY, val NUMERIC);
+
+statement ok
+INSERT INTO num_tbl VALUES
+  (1, 0), (2, 4.5), (3, -4.5), (4, 10.25), (5, -10.25), (6, 100);
+
+query R rowsort
+SELECT val FROM num_tbl WHERE val > 0;
+----
+100
+10.25
+4.5
+
+query R rowsort
+SELECT val FROM num_tbl WHERE val < 0;
+----
+-10.25
+-4.5
+
+query R
+SELECT val FROM num_tbl WHERE val = 4.5;
+----
+4.5
+
+# arithmetic
+query R rowsort
+SELECT val + 1.5 FROM num_tbl WHERE id <= 3;
+----
+-3
+1.5
+6
+
+query R rowsort
+SELECT val * 2 FROM num_tbl WHERE id IN (2, 4);
+----
+20.5
+9
+
+query R
+SELECT 10.25 - 4.5;
+----
+5.75
+
+query R
+SELECT 4.5 / 1.5;
+----
+3
+
+# abs / round
+query R
+SELECT abs(-10.25);
+----
+10.25
+
+query R
+SELECT round(4.4);
+----
+4
+
+query R
+SELECT round(4.5);
+----
+5
+
+# aggregates
+query R
+SELECT sum(val) FROM num_tbl;
+----
+100
+
+query R
+SELECT avg(val) FROM num_tbl WHERE id IN (2, 3);
+----
+0
+
+query R
+SELECT max(val) FROM num_tbl;
+----
+100
+
+query R
+SELECT min(val) FROM num_tbl;
+----
+-10.25
+
+# mixed int/float comparison is numeric, not textual
+query T
+SELECT 5 = 5.0 AS true;
+----
+t
+
+query R rowsort
+SELECT val FROM num_tbl WHERE val = 100;
+----
+100
