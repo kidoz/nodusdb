@@ -518,9 +518,9 @@ impl MemExecutor {
             if !order_by.is_empty() {
                 let mut order_indices = Vec::new();
                 for (ocol, asc, nf) in &order_by {
-                    let idx = col_names
-                        .iter()
-                        .position(|c| c == ocol || c.ends_with(&format!(".{}", ocol)));
+                    // col_pos also resolves a qualified ref (`t.col`) against
+                    // bare column names.
+                    let idx = crate::filter_eval::col_pos(&col_names, ocol);
                     if let Some(i) = idx {
                         order_indices.push((i, *asc, *nf));
                     }
@@ -1228,9 +1228,9 @@ impl MemExecutor {
             if !order_by.is_empty() {
                 let mut order_indices = Vec::new();
                 for (ocol, asc, nf) in &order_by {
-                    let idx = out_cols
-                        .iter()
-                        .position(|c| c == ocol || c.ends_with(&format!(".{}", ocol)));
+                    // col_pos also resolves a qualified ref (`t.col`) against
+                    // bare column names.
+                    let idx = crate::filter_eval::col_pos(&out_cols, ocol);
                     if let Some(i) = idx {
                         order_indices.push((i, *asc, *nf));
                     }

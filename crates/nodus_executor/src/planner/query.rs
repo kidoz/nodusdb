@@ -870,11 +870,12 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
         }) => exprs
             .iter()
             .filter_map(|o| match &o.expr {
-                Expr::Identifier(id) => Some((
-                    id.value.clone(),
-                    o.options.asc.unwrap_or(true),
-                    o.options.nulls_first,
-                )),
+                // Bare or qualified (`t.col`) column reference.
+                Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
+                    extract_col_name(&o.expr).map(|col| {
+                        (col, o.options.asc.unwrap_or(true), o.options.nulls_first)
+                    })
+                }
                 _ => None,
             })
             .collect(),
