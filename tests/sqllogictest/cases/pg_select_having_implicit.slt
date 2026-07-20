@@ -1,0 +1,133 @@
+# Ported from PostgreSQL src/test/regress/sql/select_having.sql and
+# select_implicit.sql (curated subsets). char(8) columns become TEXT (no pad
+# semantics); expected values follow the corresponding expected/*.out.
+
+statement ok
+CREATE TABLE test_having (a INT, b INT, c TEXT, d TEXT);
+
+statement ok
+INSERT INTO test_having VALUES
+  (0, 1, 'XXXX', 'A'), (1, 2, 'AAAA', 'b'), (2, 2, 'AAAA', 'c'),
+  (3, 3, 'BBBB', 'D'), (4, 3, 'BBBB', 'e'), (5, 3, 'bbbb', 'F'),
+  (6, 4, 'cccc', 'g'), (7, 4, 'cccc', 'h'), (8, 4, 'CCCC', 'I'),
+  (9, 4, 'CCCC', 'j');
+
+query IT
+SELECT b, c FROM test_having
+  GROUP BY b, c HAVING count(*) = 1 ORDER BY b, c;
+----
+1	XXXX
+3	bbbb
+
+# HAVING on a grouping column is effectively WHERE
+query IT
+SELECT b, c FROM test_having
+  GROUP BY b, c HAVING b = 3 ORDER BY b, c;
+----
+3	BBBB
+3	bbbb
+
+# degenerate: HAVING without GROUP BY yields 0 or 1 row
+query II
+SELECT min(a), max(a) FROM test_having HAVING min(a) = max(a);
+----
+
+query II
+SELECT min(a), max(a) FROM test_having HAVING min(a) < max(a);
+----
+0	9
+
+# the really degenerate case: constant HAVING over the whole input
+query I
+SELECT 1 AS one FROM test_having HAVING 1 > 2;
+----
+
+query I
+SELECT 1 AS one FROM test_having HAVING 1 < 2;
+----
+1
+
+statement ok
+DROP TABLE test_having;
+
+# ---- select_implicit.sql: ordering/grouping terms missing from target list
+
+statement ok
+CREATE TABLE test_missing_target (a INT, b INT, c TEXT, d TEXT);
+
+statement ok
+INSERT INTO test_missing_target VALUES
+  (0, 1, 'XXXX', 'A'), (1, 2, 'ABAB', 'b'), (2, 2, 'ABAB', 'c'),
+  (3, 3, 'BBBB', 'D'), (4, 3, 'BBBB', 'e'), (5, 3, 'bbbb', 'F'),
+  (6, 4, 'cccc', 'g'), (7, 4, 'cccc', 'h'), (8, 4, 'CCCC', 'I'),
+  (9, 4, 'CCCC', 'j');
+
+# w/ existing GROUP BY target, relation-qualified GROUP BY
+query TI
+SELECT c, count(*) FROM test_missing_target GROUP BY test_missing_target.c ORDER BY c;
+----
+ABAB	2
+BBBB	2
+CCCC	2
+XXXX	1
+bbbb	1
+cccc	2
+
+# w/o existing GROUP BY target and same ORDER BY target
+query I
+SELECT count(*) FROM test_missing_target GROUP BY b ORDER BY b;
+----
+1
+2
+3
+4
+
+# w/ existing GROUP BY target using a relation name in target
+query II
+SELECT test_missing_target.b, count(*)
+  FROM test_missing_target GROUP BY b ORDER BY b;
+----
+1	1
+2	2
+3	3
+4	4
+
+# ORDER BY a column not in the target list
+query T
+SELECT c FROM test_missing_target ORDER BY a;
+----
+XXXX
+ABAB
+ABAB
+BBBB
+BBBB
+bbbb
+cccc
+cccc
+CCCC
+CCCC
+
+# ORDER BY desc on a grouped-out column
+query I
+SELECT count(*) FROM test_missing_target GROUP BY b ORDER BY b DESC;
+----
+4
+3
+2
+1
+
+# group and order using ordinal references
+query TI
+SELECT c, count(*) FROM test_missing_target GROUP BY 1 ORDER BY 1;
+----
+ABAB	2
+BBBB	2
+CCCC	2
+XXXX	1
+bbbb	1
+cccc	2
+
+query I
+SELECT count(*) FROM test_missing_target ORDER BY 1 DESC;
+----
+10

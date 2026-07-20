@@ -1286,3 +1286,72 @@ SELECT hundred, count(*) FROM onek WHERE unique1 < 100 GROUP BY hundred HAVING c
 3	10
 4	10
 
+# aggregates.sql: DISTINCT aggregates
+query I
+SELECT count(DISTINCT four) AS cnt_4 FROM onek;
+----
+4
+
+query I
+SELECT count(DISTINCT two) AS cnt_2 FROM onek;
+----
+2
+
+query I
+SELECT sum(DISTINCT four) AS sum_6 FROM onek;
+----
+6
+
+query R
+SELECT avg(DISTINCT four) AS avg_1_5 FROM onek;
+----
+1.5
+
+# DISTINCT aggregate per group: every ten-group covers exactly two four-values
+query II rowsort
+SELECT ten, count(DISTINCT four) FROM onek GROUP BY ten;
+----
+0	2
+1	2
+2	2
+3	2
+4	2
+5	2
+6	2
+7	2
+8	2
+9	2
+
+# select_distinct.sql
+query I
+SELECT DISTINCT two FROM onek ORDER BY 1;
+----
+0
+1
+
+query I
+SELECT DISTINCT ten FROM onek ORDER BY 1;
+----
+0
+1
+2
+3
+4
+5
+6
+7
+8
+9
+
+query T
+SELECT DISTINCT string4 FROM onek ORDER BY 1;
+----
+AAAAxx
+HHHHxx
+OOOOxx
+VVVVxx
+
+query I
+SELECT count(*) FROM (SELECT DISTINCT two, four, ten FROM onek) ss;
+----
+20

@@ -205,18 +205,43 @@ pub(crate) fn eval_scalar_expr_grouped(
         apply_binary_op, apply_date_offset, apply_unary_op, cast_value, extract_datetime_field,
     };
     match expr {
-        ScalarExpr::Aggregate { op, arg, arg_expr } => match arg_expr {
-            // Aggregate over a computed expression: evaluate it per row, then
-            // aggregate the resulting values.
-            Some(e) => {
-                let vals: Vec<Value> = group_rows
-                    .iter()
-                    .map(|r| crate::planner::eval_scalar_expr(e, r, col_names))
-                    .collect();
-                aggregate_values(op, &vals)
+        ScalarExpr::Aggregate {
+            op,
+            arg,
+            arg_expr,
+            distinct,
+        } => {
+            if *distinct {
+                // `agg(DISTINCT x)`: gather the per-row argument values,
+                // drop duplicates, then aggregate the distinct set.
+                let mut vals: Vec<Value> = Vec::new();
+                for r in group_rows {
+                    let v = match arg_expr {
+                        Some(e) => crate::planner::eval_scalar_expr(e, r, col_names),
+                        None => crate::filter_eval::col_pos(col_names, arg)
+                            .and_then(|i| r.get(i))
+                            .cloned()
+                            .unwrap_or(Value::Null),
+                    };
+                    if !vals.iter().any(|x| crate::values_equal(x, &v)) {
+                        vals.push(v);
+                    }
+                }
+                return aggregate_values(op, &vals);
             }
-            None => compute_aggregate(op, arg, group_rows, col_names),
-        },
+            match arg_expr {
+                // Aggregate over a computed expression: evaluate it per row,
+                // then aggregate the resulting values.
+                Some(e) => {
+                    let vals: Vec<Value> = group_rows
+                        .iter()
+                        .map(|r| crate::planner::eval_scalar_expr(e, r, col_names))
+                        .collect();
+                    aggregate_values(op, &vals)
+                }
+                None => compute_aggregate(op, arg, group_rows, col_names),
+            }
+        }
         ScalarExpr::DateOffset {
             base,
             months,
@@ -348,6 +373,25 @@ pub(crate) fn eval_having(
             match p.op {
                 CompareOp::Eq => left == right,
                 CompareOp::Ne => left != right,
+                CompareOp::Lt => ord == std::cmp::Ordering::Less,
+                CompareOp::Le => ord != std::cmp::Ordering::Greater,
+                CompareOp::Gt => ord == std::cmp::Ordering::Greater,
+                CompareOp::Ge => ord != std::cmp::Ordering::Less,
+                _ => false,
+            }
+        }
+        // A computed comparison, e.g. `HAVING min(a) = max(a)`: both sides
+        // evaluate over the group (aggregates included).
+        FilterExpr::ExprCmp { left, op, right } => {
+            let l = eval_scalar_expr_grouped(left, group_rows, col_names);
+            let r = eval_scalar_expr_grouped(right, group_rows, col_names);
+            if l == Value::Null || r == Value::Null {
+                return false;
+            }
+            let ord = compare(&l, &r);
+            match op {
+                CompareOp::Eq => crate::values_equal(&l, &r),
+                CompareOp::Ne => !crate::values_equal(&l, &r),
                 CompareOp::Lt => ord == std::cmp::Ordering::Less,
                 CompareOp::Le => ord != std::cmp::Ordering::Greater,
                 CompareOp::Gt => ord == std::cmp::Ordering::Greater,

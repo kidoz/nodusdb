@@ -505,8 +505,11 @@ impl MemExecutor {
                 .unwrap_or(false)
         });
 
-        // GROUP BY & Aggregation
+        // GROUP BY & Aggregation. A HAVING clause forces the grouping path even
+        // without GROUP BY or aggregates: per SQL it treats the whole input as
+        // one group (`SELECT 1 FROM t HAVING true` yields at most one row).
         let is_agg = !group_by.is_empty()
+            || having.is_some()
             || projection.iter().any(|p| match p {
                 ProjectionItem::Aggregate(_, _) => true,
                 // An expression like `sum(a) + 1` also forces the grouping path.
@@ -544,6 +547,10 @@ impl MemExecutor {
 
         let mut out_rows = Vec::new();
         let mut out_cols = Vec::new();
+        // Each output group's representative (first) source row, so ORDER BY
+        // can sort by a grouped-out column that isn't in the projection
+        // (e.g. `SELECT count(*) .. GROUP BY b ORDER BY b DESC`).
+        let mut out_reps: Vec<Vec<Value>> = Vec::new();
 
         if is_agg {
             // The grouping sets to bucket by. Without ROLLUP/CUBE/GROUPING SETS
@@ -554,13 +561,11 @@ impl MemExecutor {
             };
 
             for set in &sets {
+                // col_pos also resolves qualified refs (`t.col`) against bare
+                // column names.
                 let set_indices: Vec<Option<usize>> = set
                     .iter()
-                    .map(|c| {
-                        col_names
-                            .iter()
-                            .position(|tc| tc == c || tc.ends_with(&format!(".{}", c)))
-                    })
+                    .map(|c| crate::filter_eval::col_pos(&col_names, c))
                     .collect();
 
                 let mut groups: std::collections::BTreeMap<Vec<Vec<u8>>, Vec<Vec<Value>>> =
@@ -634,6 +639,7 @@ impl MemExecutor {
                         }
                     }
                     out_rows.push(out_row);
+                    out_reps.push(group_rows.first().cloned().unwrap_or_default());
                 }
             }
 
@@ -1226,17 +1232,25 @@ impl MemExecutor {
         // ORDER BY for aggregates (uses out_cols). For non-aggregates, it was already sorted.
         if is_agg {
             if !order_by.is_empty() {
-                let mut order_indices = Vec::new();
+                // Resolve each key against the output columns first; a key not
+                // in the projection (a grouped-out source column) falls back to
+                // the group's representative row. `true` marks an output key.
+                let mut order_indices: Vec<(bool, usize, bool, Option<bool>)> = Vec::new();
                 for (ocol, asc, nf) in &order_by {
-                    // col_pos also resolves a qualified ref (`t.col`) against
-                    // bare column names.
-                    let idx = crate::filter_eval::col_pos(&out_cols, ocol);
-                    if let Some(i) = idx {
-                        order_indices.push((i, *asc, *nf));
+                    if let Some(i) = crate::filter_eval::col_pos(&out_cols, ocol) {
+                        order_indices.push((true, i, *asc, *nf));
+                    } else if let Some(i) = crate::filter_eval::col_pos(&col_names, ocol) {
+                        order_indices.push((false, i, *asc, *nf));
                     }
                 }
-                out_rows.sort_by(|a, b| {
-                    for (idx, asc, nf) in &order_indices {
+                let mut perm: Vec<usize> = (0..out_rows.len()).collect();
+                perm.sort_by(|&x, &y| {
+                    for (is_out, idx, asc, nf) in &order_indices {
+                        let (a, b) = if *is_out {
+                            (&out_rows[x], &out_rows[y])
+                        } else {
+                            (&out_reps[x], &out_reps[y])
+                        };
                         let ord = order_cmp(
                             a.get(*idx).unwrap_or(&crate::Value::Null),
                             b.get(*idx).unwrap_or(&crate::Value::Null),
@@ -1249,6 +1263,7 @@ impl MemExecutor {
                     }
                     std::cmp::Ordering::Equal
                 });
+                out_rows = perm.iter().map(|&i| out_rows[i].clone()).collect();
             }
         }
 

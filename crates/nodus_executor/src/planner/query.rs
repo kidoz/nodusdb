@@ -95,6 +95,26 @@ pub(crate) fn plan_references_table(plan: &LogicalPlan, name: &str) -> bool {
     }
 }
 
+/// Resolves a 1-based ordinal (`ORDER BY 1` / `GROUP BY 1`) to the referenced
+/// projection item's output column name, mirroring the executor's out-column
+/// naming so the sort/group lookup finds it.
+fn ordinal_target(projection: &[ProjectionItem], n: usize) -> Option<String> {
+    match projection.get(n.checked_sub(1)?)? {
+        ProjectionItem::Column(c) => Some(c.clone()),
+        ProjectionItem::AliasedColumn(_, a)
+        | ProjectionItem::AliasedLiteral(_, a) => Some(a.clone()),
+        ProjectionItem::Aggregate(op, inner) => Some(format!("{op:?}({inner})")),
+        ProjectionItem::Expr { alias, .. } => alias.clone(),
+        ProjectionItem::ScalarFunction {
+            func_name, alias, ..
+        }
+        | ProjectionItem::WindowFunction {
+            func_name, alias, ..
+        } => Some(alias.clone().unwrap_or_else(|| func_name.clone())),
+        _ => None,
+    }
+}
+
 pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Result<LogicalPlan> {
     use sqlparser::ast::*;
 
@@ -432,8 +452,20 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
                                     "AVG" => AggregateOp::Avg,
                                     _ => unreachable!(),
                                 };
+                                // `agg(DISTINCT ...)` goes through the scalar
+                                // expression path, which implements DISTINCT.
+                                let is_distinct = matches!(
+                                    &func.args,
+                                    sqlparser::ast::FunctionArguments::List(l)
+                                        if matches!(
+                                            l.duplicate_treatment,
+                                            Some(sqlparser::ast::DuplicateTreatment::Distinct)
+                                        )
+                                );
                                 let first_arg = match &func.args {
-                                    sqlparser::ast::FunctionArguments::List(list) => {
+                                    sqlparser::ast::FunctionArguments::List(list)
+                                        if !is_distinct =>
+                                    {
                                         list.args.first()
                                     }
                                     _ => None,
@@ -450,6 +482,9 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
                                         ) => Some("*".to_string()),
                                         _ => None,
                                     }
+                                } else if is_distinct {
+                                    // Handled by the scalar-expression fallback.
+                                    None
                                 } else {
                                     anyhow::bail!("Aggregate function requires an argument");
                                 };
@@ -632,8 +667,20 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
                                     "AVG" => AggregateOp::Avg,
                                     _ => unreachable!(),
                                 };
+                                // `agg(DISTINCT ...)` goes through the scalar
+                                // expression path, which implements DISTINCT.
+                                let is_distinct = matches!(
+                                    &func.args,
+                                    sqlparser::ast::FunctionArguments::List(l)
+                                        if matches!(
+                                            l.duplicate_treatment,
+                                            Some(sqlparser::ast::DuplicateTreatment::Distinct)
+                                        )
+                                );
                                 let first_arg = match &func.args {
-                                    sqlparser::ast::FunctionArguments::List(list) => {
+                                    sqlparser::ast::FunctionArguments::List(list)
+                                        if !is_distinct =>
+                                    {
                                         list.args.first()
                                     }
                                     _ => None,
@@ -650,6 +697,9 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
                                         ) => Some("*".to_string()),
                                         _ => None,
                                     }
+                                } else if is_distinct {
+                                    // Handled by the scalar-expression fallback.
+                                    None
                                 } else {
                                     anyhow::bail!("Aggregate function requires an argument");
                                 };
@@ -814,6 +864,18 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
                             group_by.push(c);
                         }
                     }
+                    // Ordinal reference (`GROUP BY 1`).
+                    Expr::Value(v) => {
+                        if let sqlparser::ast::Value::Number(n, _) = &v.value {
+                            if let Some(c) = n
+                                .parse::<usize>()
+                                .ok()
+                                .and_then(|n| ordinal_target(&projection, n))
+                            {
+                                group_by.push(c);
+                            }
+                        }
+                    }
                     // `ROLLUP(e1, e2, …)` → prefixes: {e1..en}, …, {e1}, {}.
                     Expr::Rollup(elements) => {
                         let elems: Vec<Vec<String>> =
@@ -876,6 +938,17 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
                         (col, o.options.asc.unwrap_or(true), o.options.nulls_first)
                     })
                 }
+                // Ordinal reference (`ORDER BY 1`).
+                Expr::Value(v) => match &v.value {
+                    sqlparser::ast::Value::Number(n, _) => n
+                        .parse::<usize>()
+                        .ok()
+                        .and_then(|n| ordinal_target(&projection, n))
+                        .map(|col| {
+                            (col, o.options.asc.unwrap_or(true), o.options.nulls_first)
+                        }),
+                    _ => None,
+                },
                 _ => None,
             })
             .collect(),

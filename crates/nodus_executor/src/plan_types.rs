@@ -198,6 +198,9 @@ pub enum ScalarExpr {
         arg: String,
         #[serde(default)]
         arg_expr: Option<Box<ScalarExpr>>,
+        /// `agg(DISTINCT ...)` — aggregate over the distinct argument values.
+        #[serde(default)]
+        distinct: bool,
     },
     /// `date/timestamp ± INTERVAL`, resolved to a (months, days, seconds) offset
     /// applied to the base's ISO text value.

@@ -696,12 +696,17 @@ pub(crate) fn lower_scalar(
                 let FunctionArguments::List(list) = &func.args else {
                     return None;
                 };
+                let distinct = matches!(
+                    list.duplicate_treatment,
+                    Some(sqlparser::ast::DuplicateTreatment::Distinct)
+                );
                 return match list.args.first() {
                     Some(FunctionArg::Unnamed(FunctionArgExpr::Wildcard)) => {
                         Some(ScalarExpr::Aggregate {
                             op,
                             arg: "*".to_string(),
                             arg_expr: None,
+                            distinct,
                         })
                     }
                     Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(e))) => {
@@ -710,12 +715,14 @@ pub(crate) fn lower_scalar(
                                 op,
                                 arg: col,
                                 arg_expr: None,
+                                distinct,
                             }),
                             // Aggregate over a computed expression, e.g. `sum(a + 1)`.
                             None => Some(ScalarExpr::Aggregate {
                                 op,
                                 arg: String::new(),
                                 arg_expr: Some(Box::new(lower_scalar(e, params)?)),
+                                distinct,
                             }),
                         }
                     }
