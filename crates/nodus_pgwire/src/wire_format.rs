@@ -22,8 +22,15 @@ use crate::type_map::map_declared_type;
 /// back to `XX000` (`internal_error`), which is the signal that a new class
 /// should be added here rather than silently mislabeled.
 pub(crate) fn sqlstate_for_execution_error(err_str: &str) -> &'static str {
+    // Routing retries and unsupported consistency modes.
+    if err_str.starts_with("shard unavailable:") || err_str.starts_with("shard routing changed") {
+        "40001" // serialization_failure: retry against a current, available route
+    } else if err_str.starts_with("unsupported linearizable cross-shard range read")
+        || err_str.starts_with("unsupported row scan spanning multiple tables")
+    {
+        "0A000" // feature_not_supported
     // Integrity-constraint violations (class 23).
-    if err_str.contains("Unique constraint violation") {
+    } else if err_str.contains("Unique constraint violation") {
         "23505" // unique_violation
     } else if err_str.contains("cannot be NULL") {
         "23502" // not_null_violation
@@ -335,6 +342,26 @@ mod tests {
         assert_eq!(
             sqlstate_for_execution_error("invalid input syntax for type integer: \"abc\""),
             "22P02"
+        );
+    }
+
+    #[test]
+    fn maps_shard_routing_failures() {
+        for message in [
+            "shard unavailable: shard-123 is not hosted on this node; retry after replica reconciliation",
+            "shard routing changed for table 123; retry the transaction",
+        ] {
+            assert_eq!(sqlstate_for_execution_error(message), "40001");
+        }
+        for message in [
+            "unsupported linearizable cross-shard range read: shared snapshot coordination is not implemented",
+            "unsupported row scan spanning multiple tables; scan each table separately",
+        ] {
+            assert_eq!(sqlstate_for_execution_error(message), "0A000");
+        }
+        assert_eq!(
+            sqlstate_for_execution_error("invalid shard map: gap or overlap"),
+            "XX000"
         );
     }
 
