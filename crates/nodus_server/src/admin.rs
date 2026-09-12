@@ -713,6 +713,10 @@ async fn create_backup(
     State(state): State<AdminState>,
     Query(query): Query<CreateBackupQuery>,
 ) -> Json<Value> {
+    let generation = match state.backup.capture_generation() {
+        Ok(generation) => generation,
+        Err(error) => return Json(json!({ "error": error.to_string() })),
+    };
     let version = state
         .catalog
         .get_cluster_version()
@@ -759,6 +763,11 @@ async fn create_backup(
                 for version_res in iter {
                     match version_res {
                         Ok(version) => {
+                            if version.key.as_ref()
+                                == nodus_storage_api::recovery::RECOVERY_GENERATION_KEY
+                            {
+                                continue;
+                            }
                             // The HLC watermark is a clock *reservation* committed
                             // ahead of wall time (up to RESERVATION_WINDOW), so it
                             // must be backed up but must not define the snapshot's
@@ -803,6 +812,11 @@ async fn create_backup(
                 for version_res in iter {
                     match version_res {
                         Ok(version) => {
+                            if version.key.as_ref()
+                                == nodus_storage_api::recovery::RECOVERY_GENERATION_KEY
+                            {
+                                continue;
+                            }
                             let key = version.key.to_vec();
                             let value = version.value.as_ref().map(|value| value.to_vec());
                             let slot = latest.entry(key).or_insert((0, None));
@@ -841,7 +855,7 @@ async fn create_backup(
         Err(e) => return Json(json!({ "error": format!("Failed to serialize KV dump: {e}") })),
     };
 
-    let objects = vec![
+    let mut objects = vec![
         BackupObject {
             name: "catalog.json".into(),
             bytes: Bytes::from(catalog_bytes),
@@ -855,6 +869,9 @@ async fn create_backup(
             bytes: Bytes::from(kv_bytes),
         },
     ];
+    if let Err(error) = state.backup.seal_export(generation, &mut objects) {
+        return Json(json!({ "error": error.to_string() }));
+    }
     let backup_ts = parent_snapshot_ts
         .map(|parent_ts| max_kv_version.max(parent_ts.saturating_add(1)))
         .unwrap_or(max_kv_version);

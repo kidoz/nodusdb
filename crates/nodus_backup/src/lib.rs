@@ -1,3 +1,4 @@
+mod recovery;
 mod s3;
 pub use s3::{S3BackupRepository, S3Config};
 
@@ -522,6 +523,7 @@ fn json_bytes_field(value: &serde_json::Value, field: &str) -> Option<Bytes> {
 
 /// A unit of data to back up: a logical name and its bytes (e.g. a shard export
 /// or the serialized catalog).
+#[derive(Clone)]
 pub struct BackupObject {
     pub name: String,
     pub bytes: Bytes,
@@ -549,11 +551,17 @@ struct ManifestTemplate {
 /// COMPLETE is restorable.
 pub struct BackupOrchestrator {
     repo: Arc<dyn BackupRepository>,
+    recovery_source: Option<Arc<dyn KvEngine>>,
+    recovery_publication: tokio::sync::Mutex<()>,
 }
 
 impl BackupOrchestrator {
     pub fn new(repo: Arc<dyn BackupRepository>) -> Self {
-        Self { repo }
+        Self {
+            repo,
+            recovery_source: None,
+            recovery_publication: tokio::sync::Mutex::new(()),
+        }
     }
 
     fn manifest_template(&self, input: ManifestTemplate) -> BackupManifest {
@@ -664,6 +672,7 @@ impl BackupOrchestrator {
         cluster_version: u64,
         objects: Vec<BackupObject>,
     ) -> Result<BackupManifest> {
+        self.validate_export_generation(&objects).await?;
         let backup_id = Uuid::new_v4().to_string();
         let started_at = Utc::now();
         let (files, checksums) = self.upload_objects(&backup_id, &objects).await?;
@@ -721,7 +730,9 @@ impl BackupOrchestrator {
         if manifest.status != BackupStatus::Completed {
             anyhow::bail!("backup {backup_id} is not COMPLETE: {:?}", manifest.status);
         }
-        self.verify_manifest_files(&manifest).await
+        self.verify_manifest_files(&manifest).await?;
+        self.manifest_generation(&manifest).await?;
+        Ok(())
     }
 
     pub async fn create_incremental_backup(
@@ -757,6 +768,8 @@ impl BackupOrchestrator {
                 parent.snapshot_ts
             );
         }
+        self.validate_incremental_generation(&parent, &objects)
+            .await?;
         let (files, checksums) = self.upload_objects(&backup_id, &objects).await?;
 
         let pending = self.manifest_template(ManifestTemplate {
@@ -807,6 +820,9 @@ impl BackupOrchestrator {
 
             if manifest.backup_type == BackupType::Incremental {
                 if let Some(parent) = manifest.parent_backup_id.as_ref() {
+                    let parent_manifest = self.load_manifest(parent).await?;
+                    self.validate_chain_generation(&parent_manifest, &manifest)
+                        .await?;
                     let mut objects = self.restore(parent).await?;
                     objects.extend(self.restore_manifest_objects(&manifest).await?);
                     return Ok(objects);
@@ -855,6 +871,7 @@ impl BackupOrchestrator {
             })?;
 
         self.verify(&base.backup_id).await?;
+        self.validate_pitr_generation(&base, target_ts).await?;
         let base_backup_chain = self.backup_chain_for_restore(&base).await?;
         let wal_segments = if target_ts == base.snapshot_ts {
             Vec::new()
@@ -885,7 +902,9 @@ impl BackupOrchestrator {
             let Some(parent_id) = current.parent_backup_id.clone() else {
                 break;
             };
-            current = self.load_manifest(&parent_id).await?;
+            let parent = self.load_manifest(&parent_id).await?;
+            self.validate_chain_generation(&parent, &current).await?;
+            current = parent;
             if current.status != BackupStatus::Completed {
                 anyhow::bail!("backup chain parent {parent_id} is not COMPLETE");
             }
@@ -899,6 +918,10 @@ impl BackupOrchestrator {
         base: &BackupManifest,
         target_ts: u64,
     ) -> Result<Vec<PitrRestoreWalSegment>> {
+        let wal_floor = self
+            .manifest_generation(base)
+            .await?
+            .map_or(0, |g| g.wal_floor);
         let mut indexes = Vec::new();
         for index in self.load_wal_archive_indexes().await? {
             if index.index_version != CURRENT_WAL_ARCHIVE_INDEX_VERSION {
@@ -907,6 +930,9 @@ impl BackupOrchestrator {
                     index.index_version,
                     index.index_object_key
                 );
+            }
+            if wal_segment_sequence(&index.segment_id)? < wal_floor {
+                continue;
             }
             if index.timeline_id == base.timeline_id
                 && index.upload_state == WalArchiveUploadState::Completed
@@ -1043,6 +1069,8 @@ impl BackupOrchestrator {
             );
         }
 
+        let base = self.load_manifest(&plan.base_backup_id).await?;
+        self.validate_pitr_generation(&base, plan.target_ts).await?;
         let mut segments = Vec::new();
         for planned in &plan.wal_segments {
             let bytes = self.repo.get_object(&planned.wal_object_key, None).await?;
@@ -1320,6 +1348,7 @@ impl BackupOrchestrator {
 
     /// Archives a WAL segment.
     pub async fn archive_wal(&self, filename: &str, data: Bytes) -> Result<()> {
+        self.sync_recovery_generation().await?;
         let key = wal_key(filename);
         self.repo
             .put_object(&key, data, PutOptions::default())
@@ -1335,6 +1364,7 @@ impl BackupOrchestrator {
         committed_txns: Vec<WalCommittedTxn>,
         predecessor: Option<u64>,
     ) -> Result<WalArchiveIndex> {
+        self.sync_recovery_generation().await?;
         let mut record_txn_ids = record_txn_ids;
         record_txn_ids.sort();
         record_txn_ids.dedup();

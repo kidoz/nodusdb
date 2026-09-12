@@ -764,7 +764,7 @@ pub async fn run_server_with_config(
     let repo = Arc::new(FsBackupRepository::new(backup_dir(
         &config.backup.repository_uri,
     )));
-    let backup = Arc::new(BackupOrchestrator::new(repo));
+    let backup = Arc::new(BackupOrchestrator::new(repo).with_recovery_source(local_kv.clone()));
 
     // Graceful Raft shutdown: when the server is told to stop, shut down its
     // Raft groups so it stops participating in consensus (a node that keeps
