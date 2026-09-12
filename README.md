@@ -71,3 +71,5 @@ just check
 ```
 
 For nonmutating formatting verification, use `cargo fmt --all --check`.
+`just test-partition` runs the real-TCP Raft partition regression and propagates
+failures; `just test-sim` is a compatibility alias, not a deterministic simulator.

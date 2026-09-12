@@ -35,9 +35,13 @@ test-fault:
 # Run all normal cross-crate test suites
 test-cross: test-integration test-compat test-sql
 
-# Run deterministic simulation tests
-test-sim:
-    RUSTFLAGS="--cfg madsim" cargo test -p nodus_distributed_tests --test sim_test -- --ignored
+# Run the Raft partition regression over real TCP (ordinary Tokio runtime)
+test-partition:
+    cargo test -p nodus_distributed_tests --test sim_test --locked -- --list | grep -Fx 'test_cluster_partition_linearizability: test'
+    cargo test -p nodus_distributed_tests --test sim_test --locked
+
+# Compatibility alias; this harness is not a deterministic simulation
+test-sim: test-partition
 
 # Run loom model-checked concurrency tests for the transaction manager
 test-loom:

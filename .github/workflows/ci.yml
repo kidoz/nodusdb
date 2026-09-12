@@ -24,8 +24,11 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
-      - name: Deterministic Simulation Test (Madsim)
-        run: RUSTFLAGS="--cfg madsim" cargo test -p nodus_testkit --test sim_test -- --ignored || echo "Ignored tests may fail, but ensuring they compile."
+      - name: Raft partition regression (real TCP)
+        shell: bash
+        run: |
+          cargo test -p nodus_distributed_tests --test sim_test --locked -- --list | grep -Fx 'test_cluster_partition_linearizability: test'
+          cargo test -p nodus_distributed_tests --test sim_test --locked
       - name: Loom Concurrency Proof (txn/MVCC)
         run: RUSTFLAGS="--cfg loom" LOOM_MAX_PREEMPTIONS=3 cargo test -p nodus_txn --release loom_
       - name: Compile Storage Engine Benchmarks
