@@ -217,17 +217,24 @@ impl MemExecutor {
 
         // Barrier before committing to the stream, so a failed linearizable read
         // surfaces as an error rather than a half-emitted result set.
-        self.maybe_read_barrier(&ctx.session_id, format!("{}:", tbl.id).as_bytes())?;
-
-        // Committed to streaming: emit the schema, then the rows.
-        sink.schema(out_cols, out_types);
-
         let start = Bytes::from(format!("{}:", tbl.id));
         let end = Bytes::from(format!("{};", tbl.id));
+        self.maybe_read_range_barrier(
+            &ctx.session_id,
+            KeyRange {
+                start: start.clone(),
+                end: end.clone(),
+            },
+        )?;
+        let scan = self.kv.scan(KeyRange { start, end }, read_ts)?;
+
+        // Routing and group availability are checked before emitting the schema.
+        sink.schema(out_cols, out_types);
+
         let mut produced = 0usize;
         let mut to_skip = offset.unwrap_or(0);
 
-        for pair in self.kv.scan(KeyRange { start, end }, read_ts)? {
+        for pair in scan {
             if let Some(lim) = limit
                 && produced >= lim
             {

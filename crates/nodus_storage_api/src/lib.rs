@@ -133,6 +133,13 @@ pub trait KvEngine: Send + Sync {
         Ok(())
     }
 
+    /// Establishes the read-barrier contract for a whole half-open range. Routed
+    /// engines must cover all owners or reject unsupported consistency modes;
+    /// checking only the start key is insufficient for a multi-shard scan.
+    fn read_range_barrier(&self, range: KeyRange) -> KvResult<()> {
+        self.read_barrier(&range.start)
+    }
+
     /// Reclaims MVCC versions that no active reader can observe: for each key,
     /// committed versions strictly older than the newest version at or below
     /// `watermark` are removed. `watermark` must be ≤ the oldest active read

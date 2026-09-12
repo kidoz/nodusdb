@@ -443,6 +443,13 @@ impl MemExecutor {
         Ok(())
     }
 
+    pub(crate) fn maybe_read_range_barrier(&self, session: &str, range: KeyRange) -> Result<()> {
+        if self.linearizable_reads(session) {
+            self.kv.read_range_barrier(range)?;
+        }
+        Ok(())
+    }
+
     /// Returns the session's active txn id. Expects a transaction to be active.
     fn txn_for(&self, session: &str) -> Result<TxnId> {
         match self.active_txns.read().get(session) {
@@ -472,7 +479,13 @@ impl MemExecutor {
         let read_ts = self.read_ts(session);
         let start = Bytes::from(format!("{}:", table_id));
         let end = Bytes::from(format!("{};", table_id));
-        self.maybe_read_barrier(session, &start)?;
+        self.maybe_read_range_barrier(
+            session,
+            KeyRange {
+                start: start.clone(),
+                end: end.clone(),
+            },
+        )?;
         let mut keyed_rows = std::collections::BTreeMap::new();
         for pair in self.kv.scan(KeyRange { start, end }, read_ts)? {
             let pair = pair?;
@@ -526,7 +539,13 @@ impl MemExecutor {
         let read_ts = self.read_ts(session);
         let start = Bytes::from(format!("{}:", table_id));
         let end = Bytes::from(format!("{};", table_id));
-        self.maybe_read_barrier(session, &start)?;
+        self.maybe_read_range_barrier(
+            session,
+            KeyRange {
+                start: start.clone(),
+                end: end.clone(),
+            },
+        )?;
         let mut rows = Vec::with_capacity(cap.min(1024));
         for pair in self.kv.scan(KeyRange { start, end }, read_ts)?.take(cap) {
             let pair = pair?;
@@ -545,7 +564,13 @@ impl MemExecutor {
     ) -> Result<Vec<Vec<Value>>> {
         let read_ts = self.read_ts(session);
         // Barrier the table group whose rows this index lookup will fetch.
-        self.maybe_read_barrier(session, format!("{}:", table_id).as_bytes())?;
+        self.maybe_read_range_barrier(
+            session,
+            KeyRange {
+                start: Bytes::from(format!("{}:", table_id)),
+                end: Bytes::from(format!("{};", table_id)),
+            },
+        )?;
         let escaped = Self::escape_index_value(&render(index_val));
         let prefix = format!("i:{}:{}:", index_id, escaped);
         let start = Bytes::from(prefix.clone());
@@ -559,7 +584,7 @@ impl MemExecutor {
             if let Some(pk) = key_str.strip_prefix(&prefix) {
                 // Fetch the actual row
                 let row_key = Bytes::from(format!("{}:{}", table_id, pk));
-                if let Ok(Some(row_val)) = self.kv.get(&row_key, read_ts) {
+                if let Some(row_val) = self.kv.get(&row_key, read_ts)? {
                     rows.push(serde_json::from_slice::<Vec<Value>>(&row_val)?);
                 }
             }
