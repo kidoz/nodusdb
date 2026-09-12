@@ -33,3 +33,20 @@ jobs:
         run: RUSTFLAGS="--cfg loom" LOOM_MAX_PREEMPTIONS=3 cargo test -p nodus_txn --release loom_
       - name: Compile Storage Engine Benchmarks
         run: cargo bench --no-run -p nodus_storage_lsm
+
+  frontend:
+    name: Frontend build and lint
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npm run build
+      - run: npm run lint
