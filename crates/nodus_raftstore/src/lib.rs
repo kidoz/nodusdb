@@ -1,3 +1,8 @@
+// `openraft` fixes `StorageError<u64>` (224 bytes) as the error type of every
+// storage callback, and the snapshot helpers below feed those callbacks
+// directly, so boxing it here would only move the cost to each trait boundary.
+#![allow(clippy::result_large_err)]
+
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::io::SeekFrom;
