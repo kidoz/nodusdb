@@ -3,6 +3,11 @@ use crate::*;
 use anyhow::Result;
 
 pub trait CatalogReader: Send + Sync {
+    /// Full existing durable catalog representation, including authorization.
+    fn export_raft_catalog(&self) -> Result<Vec<u8>> {
+        anyhow::bail!("Raft catalog export unsupported")
+    }
+
     fn get_database(&self, name: &str) -> Result<DatabaseDescriptor>;
     fn get_database_by_id(&self, id: DatabaseId) -> Result<DatabaseDescriptor>;
     fn get_schema(&self, database: &str, schema: &str) -> Result<SchemaDescriptor>;
@@ -43,6 +48,20 @@ pub trait CatalogReader: Send + Sync {
 }
 
 pub trait CatalogWriter: Send + Sync {
+    /// Validate before publishing storage, then replace the local projection
+    /// under the catalog operation lock. The callback must atomically persist
+    /// the catalog bytes alongside the rest of the checkpoint.
+    fn install_raft_catalog(
+        &self,
+        _bytes: &[u8],
+        _publish: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<()> {
+        anyhow::bail!("atomic Raft catalog install unsupported")
+    }
+    fn prepare_legacy_raft_catalog(&self, _snapshot: CatalogSnapshot) -> Result<Vec<u8>> {
+        anyhow::bail!("legacy Raft catalog conversion unsupported")
+    }
+
     fn create_database(&self, request: CreateDatabaseRequest) -> Result<DatabaseDescriptor>;
     fn create_schema(&self, request: CreateSchemaRequest) -> Result<SchemaDescriptor>;
     fn create_table(&self, request: CreateTableRequest) -> Result<TableDescriptor>;
