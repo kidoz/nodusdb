@@ -135,6 +135,13 @@ async fn write(
     headers: HeaderMap,
     Json(cmd): Json<ShardCommand>,
 ) -> impl axum::response::IntoResponse {
+    if cmd.requires_migration_protocol() {
+        return (
+            axum::http::StatusCode::NOT_IMPLEMENTED,
+            "migration protocol activation requires verified cluster-wide compatibility",
+        )
+            .into_response();
+    }
     let Some(raft) = get_raft(&state, &shard_id).await else {
         return (axum::http::StatusCode::NOT_FOUND, "Shard not found").into_response();
     };
@@ -155,12 +162,19 @@ async fn write(
         && let Some(id) = &request_id
         && state.dedup.lock().unwrap().contains(id)
     {
-        return axum::Json(ShardResponse { success: true }).into_response();
+        return axum::Json(ShardResponse {
+            success: true,
+            error: None,
+        })
+        .into_response();
     }
 
     match raft.client_write(cmd).await {
         Ok(resp) => {
-            if !is_prepare && let Some(id) = request_id {
+            if resp.data.success
+                && !is_prepare
+                && let Some(id) = request_id
+            {
                 state.dedup.lock().unwrap().record(id);
             }
             // Return the applied response so a forwarded prepare's vote (and any

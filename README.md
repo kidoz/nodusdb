@@ -34,6 +34,12 @@ concurrent writes. Read-only shard inspection and replication of existing shard
 placements remain available. This safeguard does not repair data made unreachable
 by earlier shard operations.
 
+A dormant [migration protocol foundation](docs/explanation/shard-migration-protocol.md)
+now persists operation journals and participant epochs, rejects stale writes at
+Raft apply, and refuses to fence participants with pending transactions. It is
+tested through direct Raft submissions. Network activation and the migration
+coordinator remain unavailable, so public shard mutations stay disabled.
+
 For existing sharded tables, row scans visit every intersecting shard in key
 order at the transaction's fixed MVCC read timestamp. Version scans include
 tombstones. An assigned shard without a local replica returns SQLSTATE `40001`

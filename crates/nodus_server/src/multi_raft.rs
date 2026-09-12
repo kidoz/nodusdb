@@ -42,6 +42,10 @@ impl ClockAdvancingKvEngine {
 }
 
 impl KvEngine for ClockAdvancingKvEngine {
+    fn has_pending_intents(&self, prefix: &[u8]) -> Result<bool> {
+        self.inner.has_pending_intents(prefix)
+    }
+
     fn get(&self, key: &[u8], read_ts: Timestamp) -> Result<Option<Bytes>> {
         self.inner.get(key, read_ts)
     }

@@ -1,5 +1,7 @@
 #![allow(clippy::collapsible_if)]
 mod admin;
+#[cfg(test)]
+mod migration_tests;
 mod multi_raft;
 mod raft_catalog;
 mod raft_kv;

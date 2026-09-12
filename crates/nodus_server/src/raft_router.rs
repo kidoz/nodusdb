@@ -112,7 +112,15 @@ impl RaftRouter {
     /// a subsequent local read observes the write (read-your-writes); a non-leader
     /// fails here with `ForwardToLeader`.
     pub fn submit(&self, shard_id: &str, cmd: ShardCommand) -> Result<()> {
-        self.submit_inner(shard_id, cmd).map(|_| ())
+        let response = self.submit_inner(shard_id, cmd)?;
+        anyhow::ensure!(
+            response.success,
+            "{}",
+            response
+                .error
+                .unwrap_or_else(|| "Raft command rejected by participant".into())
+        );
+        Ok(())
     }
 
     /// Like [`Self::submit`] but returns the applied [`ShardResponse`], so the
@@ -122,6 +130,10 @@ impl RaftRouter {
     }
 
     fn submit_inner(&self, shard_id: &str, cmd: ShardCommand) -> Result<ShardResponse> {
+        anyhow::ensure!(
+            !cmd.requires_migration_protocol(),
+            "migration protocol activation requires verified cluster-wide compatibility"
+        );
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(RouterRequest::Write {

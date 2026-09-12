@@ -25,6 +25,7 @@ use openraft::{
 };
 use serde::{Deserialize, Serialize};
 
+pub mod migration;
 pub mod network;
 pub mod server;
 
@@ -140,11 +141,26 @@ pub enum ShardCommand {
     },
     UpgradeFinalize,
     UpgradeRollback,
+    /// Dormant R3 protocol; client ingress rejects activation until every member
+    /// can enforce the versioned format. Appended to preserve legacy variants.
+    MigrationV1(migration::MigrationCommandV1),
+    EpochWriteV1 {
+        epoch: u64,
+        mutation: migration::EpochMutationV1,
+    },
+}
+
+impl ShardCommand {
+    pub fn requires_migration_protocol(&self) -> bool {
+        matches!(self, Self::MigrationV1(_) | Self::EpochWriteV1 { .. })
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ShardResponse {
     pub success: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// The leader's read log index, returned by the `/raft/{group}/read_index`
@@ -704,6 +720,8 @@ fn snapshot_user_range() -> nodus_storage_api::KeyRange {
 // Records are written in key order (the scan is sorted), and never materialize
 // the whole snapshot in memory on either end.
 
+// Preserve OpenRaft's required storage-error type at the snapshot boundary.
+#[allow(clippy::result_large_err)]
 async fn write_snapshot_header<W: tokio::io::AsyncWrite + Unpin>(
     w: &mut W,
     catalog: Option<&[u8]>,
@@ -734,6 +752,8 @@ async fn write_snapshot_header<W: tokio::io::AsyncWrite + Unpin>(
     Ok(())
 }
 
+// Preserve OpenRaft's required storage-error type at the snapshot boundary.
+#[allow(clippy::result_large_err)]
 async fn write_kv_record<W: tokio::io::AsyncWrite + Unpin>(
     w: &mut W,
     key: &[u8],
@@ -758,6 +778,8 @@ async fn write_kv_record<W: tokio::io::AsyncWrite + Unpin>(
     Ok(())
 }
 
+// Preserve OpenRaft's required storage-error type at the snapshot boundary.
+#[allow(clippy::result_large_err)]
 async fn read_snapshot_catalog<R: tokio::io::AsyncRead + Unpin>(
     r: &mut R,
 ) -> Result<Option<Vec<u8>>, StorageError<u64>> {
@@ -798,6 +820,8 @@ async fn read_snapshot_catalog<R: tokio::io::AsyncRead + Unpin>(
 }
 
 /// Reads the next KV record, or `None` at a clean end of stream.
+// Preserve OpenRaft's required storage-error type at the snapshot boundary.
+#[allow(clippy::result_large_err)]
 async fn read_kv_record<R: tokio::io::AsyncRead + Unpin>(
     r: &mut R,
 ) -> Result<Option<(Vec<u8>, Vec<u8>, u64)>, StorageError<u64>> {
@@ -827,6 +851,8 @@ async fn read_kv_record<R: tokio::io::AsyncRead + Unpin>(
 
 impl NodusRaftStore {
     /// Opens the current snapshot file seeked to the start, if it exists.
+    // Called directly by the OpenRaft snapshot trait implementation.
+    #[allow(clippy::result_large_err)]
     async fn open_current_snapshot(&self) -> Result<Option<tokio::fs::File>, StorageError<u64>> {
         let path = self.snapshot_dir.join(CURRENT_SNAPSHOT_FILE);
         match tokio::fs::File::open(&path).await {
@@ -844,11 +870,11 @@ impl NodusRaftStore {
 
 impl RaftSnapshotBuilder<NodusTypeConfig> for NodusRaftStore {
     async fn build_snapshot(&mut self) -> Result<Snapshot<NodusTypeConfig>, StorageError<u64>> {
-        // Capture the consistent header under the lock, then stream the KV data
-        // without holding it (the scan returns a materialized, point-in-time
-        // iterator, so applies are not blocked for the whole build).
+        // Keep this group's applies blocked until the snapshot is complete.
+        // A lazy iterator is not itself a frozen state-machine snapshot: a fence
+        // must agree with the applied index carried by its snapshot header.
+        let sm = self.state_machine.read().await;
         let (last_log_id, last_membership, catalog, kv) = {
-            let sm = self.state_machine.read().await;
             (
                 sm.last_applied_log,
                 sm.last_membership.clone(),
@@ -872,10 +898,19 @@ impl RaftSnapshotBuilder<NodusTypeConfig> for NodusRaftStore {
                 .map_err(|e| snapshot_io_err("create build tmp", e))?;
             let mut w = BufWriter::new(file);
             write_snapshot_header(&mut w, catalog_bytes.as_deref()).await?;
-            if let Some(kv) = kv
-                && let Ok(iter) = kv.scan(snapshot_user_range(), u64::MAX)
-            {
-                for pair in iter.flatten() {
+            if let Some(kv) = kv {
+                let iter = kv
+                    .scan(snapshot_user_range(), u64::MAX)
+                    .map_err(|e| snapshot_io_err("open snapshot scan", e))?;
+                for pair in iter {
+                    let pair = pair.map_err(|e| snapshot_io_err("read snapshot row", e))?;
+                    migration::validate_snapshot_record(
+                        kv.as_ref(),
+                        &pair.key,
+                        &pair.value,
+                        pair.version,
+                    )
+                    .map_err(|e| snapshot_io_err("validate snapshot control record", e))?;
                     write_kv_record(&mut w, &pair.key, &pair.value, pair.version).await?;
                 }
             }
@@ -1015,10 +1050,31 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
         let mut sm = self.state_machine.write().await;
         let mut res = Vec::with_capacity(entries.len());
         for entry in entries {
-            sm.last_applied_log = Some(entry.log_id);
             match &entry.payload {
                 EntryPayload::Normal(cmd) => {
                     tracing::info!("Raft applying command: {:?}", cmd);
+                    if let Some(kv) = &sm.kv {
+                        if let Some(response) = migration::apply(
+                            kv.as_ref(),
+                            cmd,
+                            entry.log_id.index,
+                            sm.meta_store.is_some(),
+                        )
+                        .map_err(|e| {
+                            StorageIOError::write_state_machine(AnyError::error(format!(
+                                "migration apply: {e}"
+                            )))
+                        })? {
+                            sm.last_applied_log = Some(entry.log_id);
+                            res.push(response);
+                            continue;
+                        }
+                    } else if cmd.requires_migration_protocol() {
+                        return Err(StorageIOError::write_state_machine(AnyError::error(
+                            "migration requires a storage engine",
+                        ))
+                        .into());
+                    }
                     // 2PC prepare vote for this entry; only `PrepareTxn` can clear it.
                     let mut success = true;
                     if let Some(kv) = &sm.kv {
@@ -1232,14 +1288,24 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
                             _ => {}
                         }
                     }
-                    res.push(ShardResponse { success });
+                    res.push(ShardResponse {
+                        success,
+                        error: None,
+                    });
                 }
                 EntryPayload::Membership(mem) => {
                     sm.last_membership = StoredMembership::new(Some(entry.log_id), mem.clone());
-                    res.push(ShardResponse { success: true });
+                    res.push(ShardResponse {
+                        success: true,
+                        error: None,
+                    });
                 }
-                EntryPayload::Blank => res.push(ShardResponse { success: true }),
+                EntryPayload::Blank => res.push(ShardResponse {
+                    success: true,
+                    error: None,
+                }),
             }
+            sm.last_applied_log = Some(entry.log_id);
         }
         // Persist how far we've applied (and the membership at that point) so a
         // restart resumes from here instead of re-applying the whole log.
@@ -1288,10 +1354,6 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
         let catalog_bytes = read_snapshot_catalog(&mut reader).await?;
 
         let mut sm = self.state_machine.write().await;
-        sm.last_applied_log = meta.last_log_id;
-        sm.last_membership = meta.last_membership.clone();
-        self.persist_applied(&sm);
-
         if let (Some(bytes), Some(cat)) = (&catalog_bytes, &sm.catalog_writer)
             && let Ok(snap) = serde_json::from_slice::<nodus_catalog::CatalogSnapshot>(bytes)
         {
@@ -1306,24 +1368,33 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
                 std::collections::HashSet::new();
             let mut max_version = 0u64;
             while let Some((k, v, version)) = read_kv_record(&mut reader).await? {
+                migration::validate_snapshot_record(kv.as_ref(), &k, &v, version)
+                    .map_err(|e| snapshot_io_err("validate received control record", e))?;
                 max_version = max_version.max(version);
                 let tid = TxnId::new();
                 // A fresh txn per key, so any error is a genuine restore failure
                 // (not a benign replay duplicate) — surface it.
-                if let Err(e) = kv
-                    .write_intent(tid, Bytes::from(k.clone()), Bytes::from(v))
+                kv.write_intent(tid, Bytes::from(k.clone()), Bytes::from(v))
                     .and_then(|_| kv.commit(tid, version))
-                {
-                    tracing::error!("snapshot install KV write failed at version {version}: {e}");
-                }
+                    .map_err(|e| snapshot_io_err("install snapshot row", e))?;
                 snapshot_keys.insert(k);
             }
 
             let mut orphans = Vec::new();
-            if let Ok(iter) = kv.scan(snapshot_user_range(), u64::MAX) {
-                for pair in iter.flatten() {
+            {
+                let iter = kv
+                    .scan(snapshot_user_range(), u64::MAX)
+                    .map_err(|e| snapshot_io_err("scan snapshot orphans", e))?;
+                for pair in iter {
+                    let pair = pair.map_err(|e| snapshot_io_err("read snapshot orphan", e))?;
                     max_version = max_version.max(pair.version);
                     if !snapshot_keys.contains(pair.key.as_ref()) {
+                        if migration::is_control_key(&pair.key) {
+                            return Err(snapshot_io_err(
+                                "snapshot missing migration state",
+                                "refusing to remove durable fence or journal",
+                            ));
+                        }
                         orphans.push(pair.key.to_vec());
                     }
                 }
@@ -1332,16 +1403,11 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
             let clear_version = max_version + 1;
             for key in orphans {
                 let tid = TxnId::new();
-                if let Err(e) = kv
-                    .delete_intent(tid, Bytes::from(key))
+                kv.delete_intent(tid, Bytes::from(key))
                     .and_then(|_| kv.commit(tid, clear_version))
-                {
-                    tracing::error!("snapshot install orphan delete failed: {e}");
-                }
+                    .map_err(|e| snapshot_io_err("delete snapshot orphan", e))?;
             }
         }
-        drop(sm);
-
         // Publish the received snapshot as the durable current one by streaming
         // it to a temp file and atomically renaming — independent of where the
         // received file lives — then persist its metadata so the node can serve
@@ -1373,6 +1439,9 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
             meta_store.save_snapshot_meta(meta);
         }
         *self.current_snapshot_meta.write().await = Some(meta.clone());
+        sm.last_applied_log = meta.last_log_id;
+        sm.last_membership = meta.last_membership.clone();
+        self.persist_applied(&sm);
 
         Ok(())
     }
