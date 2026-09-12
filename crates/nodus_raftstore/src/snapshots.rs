@@ -1,6 +1,7 @@
-//! Version-1 wire compatibility with strict validation and atomic local install.
+//! Legacy and gated MVCC snapshots with strict validation and atomic install.
 #[cfg(test)]
 mod tests;
+pub(crate) mod v2;
 
 use super::*;
 use nodus_storage_api::{SnapshotRow, SnapshotScope, snapshot::SNAPSHOT_MEMORY_LIMIT};
@@ -33,6 +34,26 @@ fn sync_dir(path: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn validate_control(kv: &dyn KvEngine, row: &SnapshotRow) -> anyhow::Result<()> {
+    if migration::is_control_key(&row.key) || row.key.as_ref() == CATALOG_KEY {
+        anyhow::ensure!(
+            !row.versions.iter().any(|v| v.is_intent),
+            "snapshot contains unfinished control/catalog state"
+        );
+        let latest = row
+            .versions
+            .iter()
+            .max_by_key(|v| v.version)
+            .ok_or_else(|| anyhow::anyhow!("empty control snapshot row"))?;
+        let bytes = latest
+            .value
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("deleted control/catalog snapshot state"))?;
+        migration::validate_snapshot_record(kv, &row.key, bytes, latest.version)?;
+    }
+    Ok(())
+}
+
 impl NodusRaftStore {
     /// Invalidate the descriptor before touching `current.snap`. A crash in the
     /// publication gap leaves no servable snapshot, never a mismatched file and
@@ -57,9 +78,23 @@ impl NodusRaftStore {
         } else {
             Vec::new()
         };
+        // An aborted intent can leave an empty in-memory chain. It carries no
+        // state and is omitted, while wire readers still reject empty chains.
+        rows.retain(|row| !row.versions.is_empty());
+        let use_v2 = v2::permitted(self, &sm)?;
+        if !use_v2 {
+            anyhow::ensure!(
+                !rows.iter().flat_map(|r| &r.versions).any(|v| v.is_intent),
+                "legacy snapshot cannot represent pending intents; finalized MVCC snapshot support is required"
+            );
+        }
         anyhow::ensure!(
-            !rows.iter().flat_map(|r| &r.versions).any(|v| v.is_intent),
-            "legacy snapshot cannot represent pending intents; drain transactions first"
+            !rows
+                .iter()
+                .filter(|r| r.key.as_ref() == CATALOG_KEY || migration::is_control_key(&r.key))
+                .flat_map(|r| &r.versions)
+                .any(|v| v.is_intent),
+            "snapshot contains an unfinished catalog/control mutation"
         );
         let catalog = sm.catalog_reader.as_ref().map(|c| c.export_snapshot());
         if let Some(catalog) = &sm.catalog_reader {
@@ -81,6 +116,9 @@ impl NodusRaftStore {
         // V1 cannot encode intents, tombstones, or retained user history. Refuse
         // before publishing/purging a log whose effects it cannot represent.
         for row in &rows {
+            if use_v2 {
+                continue;
+            }
             anyhow::ensure!(
                 !row.versions.iter().any(|v| v.is_intent),
                 "legacy snapshot cannot represent pending intents; drain transactions first"
@@ -92,31 +130,45 @@ impl NodusRaftStore {
                 );
             }
         }
+        let meta = SnapshotMeta {
+            last_log_id: sm.last_applied_log,
+            last_membership: sm.last_membership.clone(),
+            snapshot_id: format!("snapshot-{}", uuid::Uuid::new_v4()),
+        };
         let tmp = self
             .snapshot_dir
             .join(format!("build-{}.tmp", uuid::Uuid::new_v4()));
         let _cleanup = StagedSnapshot(tmp.clone());
         let file = tokio::fs::File::create(&tmp).await?;
         let mut writer = BufWriter::new(file);
-        let catalog_bytes = catalog.map(|c| serde_json::to_vec(&c)).transpose()?;
-        write_snapshot_header(&mut writer, catalog_bytes.as_deref()).await?;
-        for row in rows {
-            if let Some(v) = row.versions.iter().max_by_key(|v| v.version)
-                && let Some(value) = &v.value
-            {
-                if let Some(kv) = &sm.kv {
-                    migration::validate_snapshot_record(kv.as_ref(), &row.key, value, v.version)?;
+        for row in &rows {
+            if let Some(kv) = &sm.kv {
+                validate_control(kv.as_ref(), row)?;
+            }
+        }
+        if use_v2 {
+            v2::canonicalize(&mut rows)?;
+            writer
+                .write_all(&v2::encode(
+                    &self.snapshot_group,
+                    &meta,
+                    catalog.is_some(),
+                    &rows,
+                )?)
+                .await?;
+        } else {
+            let catalog_bytes = catalog.map(|c| serde_json::to_vec(&c)).transpose()?;
+            write_snapshot_header(&mut writer, catalog_bytes.as_deref()).await?;
+            for row in rows {
+                if let Some(v) = row.versions.iter().max_by_key(|v| v.version)
+                    && let Some(value) = &v.value
+                {
+                    write_kv_record(&mut writer, &row.key, value, v.version).await?;
                 }
-                write_kv_record(&mut writer, &row.key, value, v.version).await?;
             }
         }
         writer.flush().await?;
         writer.into_inner().sync_all().await?;
-        let meta = SnapshotMeta {
-            last_log_id: sm.last_applied_log,
-            last_membership: sm.last_membership.clone(),
-            snapshot_id: format!("snapshot-{}", uuid::Uuid::new_v4()),
-        };
         let mut current = self.current_snapshot_meta.write().await;
         *current = None;
         self.invalidate_snapshot_file()?;
@@ -129,7 +181,7 @@ impl NodusRaftStore {
             )?;
         }
         *current = Some(meta.clone());
-        tracing::info!(snapshot = %meta.snapshot_id, "validated snapshot published");
+        tracing::info!(snapshot = %meta.snapshot_id, format_version = if use_v2 { 2 } else { 1 }, "validated snapshot published");
         Ok(Snapshot {
             meta,
             snapshot: Box::new(
@@ -164,11 +216,34 @@ impl NodusRaftStore {
         );
         staged.sync_all().await?;
         let mut reader = BufReader::new(tokio::fs::File::open(&tmp).await?);
-        let catalog_bytes = read_snapshot_catalog(&mut reader).await?;
-        let catalog_header: Option<nodus_catalog::CatalogSnapshot> = catalog_bytes
-            .as_deref()
-            .map(serde_json::from_slice)
-            .transpose()?;
+        let mut prefix = [0; 6];
+        reader.read_exact(&mut prefix).await?;
+        reader.seek(SeekFrom::Start(0)).await?;
+        let use_v2 = &prefix == b"NSNP\0\x02";
+        let (catalog_header, incoming) = if use_v2 {
+            let mut bytes = Vec::new();
+            reader.read_to_end(&mut bytes).await?;
+            let (catalog, rows) = v2::decode(&bytes, &self.snapshot_group, meta)?;
+            (catalog.then(nodus_catalog::CatalogSnapshot::default), rows)
+        } else {
+            let catalog_bytes = read_snapshot_catalog(&mut reader).await?;
+            let catalog = catalog_bytes
+                .as_deref()
+                .map(serde_json::from_slice)
+                .transpose()?;
+            let mut rows = Vec::new();
+            let mut size = 0usize;
+            while let Some((key, value, version)) = read_kv_record(&mut reader).await? {
+                let row = SnapshotRow::committed(Bytes::from(key), Bytes::from(value), version);
+                size = size.saturating_add(row.memory_size());
+                anyhow::ensure!(
+                    size <= SNAPSHOT_MEMORY_LIMIT,
+                    "snapshot exceeds checkpoint memory limit"
+                );
+                rows.push(row);
+            }
+            (catalog, rows)
+        };
         let mut sm = self.state_machine.write().await;
         anyhow::ensure!(
             meta.last_log_id >= sm.last_applied_log
@@ -181,32 +256,26 @@ impl NodusRaftStore {
         );
         let scope = scope(&sm);
         let mut rows = BTreeMap::<Bytes, SnapshotRow>::new();
-        let mut total = 0usize;
-        let mut last: Option<Vec<u8>> = None;
-        while let Some((key, value, version)) = read_kv_record(&mut reader).await? {
+        let mut last: Option<Bytes> = None;
+        for row in incoming {
             anyhow::ensure!(
-                scope.owns(&key),
+                scope.owns(&row.key),
                 "snapshot contains another group's or node-local state"
             );
             anyhow::ensure!(
-                last.as_ref().is_none_or(|last| last < &key),
+                last.as_ref().is_none_or(|last| last < &row.key),
                 "snapshot keys are duplicated or out of order"
             );
-            last = Some(key.clone());
-            total = total
-                .checked_add(key.len() + value.len() + 64)
-                .ok_or_else(|| anyhow::anyhow!("snapshot size overflow"))?;
-            anyhow::ensure!(
-                total <= SNAPSHOT_MEMORY_LIMIT,
-                "snapshot exceeds checkpoint memory limit"
-            );
+            last = Some(row.key.clone());
             if let Some(kv) = &sm.kv {
-                migration::validate_snapshot_record(kv.as_ref(), &key, &value, version)?;
+                validate_control(kv.as_ref(), &row)?;
             }
-            let key = Bytes::from(key);
-            rows.insert(
-                key.clone(),
-                SnapshotRow::committed(key, Bytes::from(value), version),
+            rows.insert(row.key.clone(), row);
+        }
+        if use_v2 && catalog_header.is_some() {
+            anyhow::ensure!(
+                rows.contains_key(CATALOG_KEY),
+                "MVCC snapshot is missing durable catalog"
             );
         }
         let kv = sm
@@ -223,7 +292,13 @@ impl NodusRaftStore {
             if let (Some(cat), Some(header)) = (&sm.catalog_writer, catalog_header) {
                 match rows
                     .get(CATALOG_KEY)
-                    .and_then(|r| r.versions[0].value.clone())
+                    .and_then(|r| {
+                        r.versions
+                            .iter()
+                            .filter(|v| !v.is_intent)
+                            .max_by_key(|v| v.version)
+                    })
+                    .and_then(|v| v.value.clone())
                 {
                     Some(bytes) => Some(bytes),
                     None => {
@@ -280,7 +355,7 @@ impl NodusRaftStore {
         std::fs::rename(&tmp, self.snapshot_dir.join(CURRENT_SNAPSHOT_FILE))?;
         sync_dir(&self.snapshot_dir)?;
         *current = Some(meta.clone());
-        tracing::info!(snapshot = %meta.snapshot_id, "atomic snapshot installed");
+        tracing::info!(snapshot = %meta.snapshot_id, format_version = if use_v2 { 2 } else { 1 }, "atomic snapshot installed");
         Ok(())
     }
 }

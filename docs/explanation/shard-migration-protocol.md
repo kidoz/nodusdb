@@ -133,10 +133,10 @@ uncertain storage-manifest publication disables engine reads/writes until reopen
 - The NSNP version 1 wire format is unchanged. It cannot encode pending intents,
   user tombstones, or retained user MVCC history. Builds **refuse those states** before
   replacing a snapshot or authorizing log purging. Latest internal metadata values
-  remain representable. A negotiated richer format is still required for general
-  workloads. OpenRaft treats a snapshot-build error as fatal to the group, so
+  remain representable. The new NSNP v2 codec handles these states, but its production writer
+  awaits durable capability authority and admission checks. OpenRaft treats a snapshot-build error as fatal to the group, so
   encountering one of these states during an automatic build can stop that group.
-  General snapshot operation therefore still requires the negotiated format.
+  General production snapshot operation therefore still requires that rollout.
 - Wire input is limited to 128 MiB. Checkpoint construction materializes bounded
   state, including unrelated groups in a shared LSM, and rejects a checkpoint above
   the 128 MiB accounting limit. Temporary copies and allocation overhead make actual
@@ -144,11 +144,12 @@ uncertain storage-manifest publication disables engine reads/writes until reopen
 - Superseded storage files are retained; cleanup needs a retention policy. Process-crash
   tests assume an intact authoritative manifest. Recovery by scanning files after
   losing/corrupting that manifest is not safe with superseded checkpoint files.
-- Installation starts a new WAL lineage. Take a new full backup before using subsequent
-  incremental backups or PITR. Cross-checkpoint recovery is unsupported: the current
-  PITR planner does not reliably reject every crossing. Reader/backup retention,
-  durable backup-boundary tracking, and enforced recovery rejection remain prerequisites
-  for migration activation.
+- Installation starts a new WAL lineage and atomically records a local recovery
+  generation and WAL floor. Source-bound backup operations reject incremental
+  ancestry and PITR extension across generations, requiring a new full backup.
+  Offline planners enforce the boundary once it is published to the repository;
+  publication is not atomic with the storage checkpoint. See the
+  [recovery contract](mvcc-snapshots.md#backup-recovery-boundary) for this limit.
 - Version 1 carries no data-group identity. Correct group routing still depends on the
   existing Raft transport boundary. This change does not certify a mixed-binary
   transfer, live-reader continuity through installation, or power-loss behavior.
@@ -173,7 +174,8 @@ Snapshot compatibility is separate from migration activation:
 | Reader | Snapshot/checkpoint behavior |
 | --- | --- |
 | New binary, old NSNP v1 file | Reads representable payloads; rejects old meta files containing data namespaces; retains legacy catalog-import semantics when the durable catalog row is absent. |
-| New binary, newly built file | Same NSNP v1 framing; strict validation and atomic installation as described above. |
+| New binary, production writer | Same NSNP v1 framing; strict validation and atomic installation as described above. |
+| New binary with trusted compatibility provider | NSNP v2 only after finalization at version 2 or later and v2 support reported for every voter and learner. Production supplies no provider yet. |
 | Previous binary, new checkpoint on disk | No new SST/WAL/manifest/catalog envelope is emitted; existing readers understand the formats. |
 | Previous binary receiving a new snapshot | Wire framing is readable, but its old destructive installer is not made safe by this change. Mixed-version installation is not certified. |
 
@@ -199,8 +201,12 @@ The server suite exercises:
   Raft storage checkpoint; reopen verifies old or complete rows/indexes and pointers.
 - Meta snapshot transfer/reopen with catalog role membership, routing/decision bytes,
   another shard's pending index write, and local clock preservation.
-- A real-TCP lagging learner forced through snapshot transfer after log purge, followed
-  by LSM/Raft reopen; malformed-input rejection and metadata-failure retry.
+- Real-TCP lagging learners forced through v1 and v2 snapshot transfer after log purge,
+  followed by LSM/Raft reopen; v2 retains historical reads and an intent subsequently
+  committed through Raft. Checksum, group and metadata mismatches fail before install.
+- V2 installation interrupted before/after checkpoint, retaining history, intent identity
+  and the recovery generation on reopen; cross-generation backup rejection and a new
+  full backup restored into a fresh persistent store.
 
 These are real Raft/TCP, subprocess, and injected-boundary tests, not a
 linearizability proof or deterministic simulation. See
@@ -210,8 +216,9 @@ linearizability proof or deterministic simulation. See
 
 Verified member capability negotiation and writer/forwarding activation,
 automatic journal discovery, orphan/uncertain 2PC recovery, reader and backup
-retention, general MVCC snapshot support, and enforced backup checkpoint boundaries
-remain prerequisites. Destination
+retention, production MVCC snapshot activation, and repository boundary publication
+coordination remain prerequisites. The [v2 codec and recovery boundary](mvcc-snapshots.md)
+are implemented with the documented limits. Destination
 readiness, durable copy checkpoints, data validation, conditional map/placement
 publication, and source cleanup are not implemented by this pre-copy slice.
 Public shard mutations stay disabled until those conditions are satisfied.

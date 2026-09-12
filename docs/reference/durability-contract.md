@@ -58,15 +58,21 @@ until reopen. These guarantees assume the authoritative manifest remains readabl
 | Exit after checkpoint but before snapshot file publication | `nodus_server`: `abrupt_install_restart_never_serves_mixed_snapshot_and_applied_state` |
 | Catalog/role membership and another shard survive meta install/reopen | `nodus_server`: `meta_snapshot_preserves_local_shards_and_recovers_catalog_authorization` |
 | Purged-log learner receives a real HTTP snapshot and reopens | `nodus_server`: `lagging_learner_receives_snapshot_over_tcp_and_reopens_on_lsm` |
+| V2 history and pending intent survive TCP transfer and a subsequent replicated commit | `nodus_server`: `mvcc_learner_preserves_history_and_resolves_snapshotted_intent_over_tcp` |
+| V2 abrupt checkpoint interruption retains history, intent and recovery generation | `nodus_server`: `mvcc_install_crash_recovers_history_intents_and_backup_generation` |
+| Restart enforces backup boundary; fresh full restores rows/indexes and excludes older WAL | `nodus_server`: `durable_checkpoint_backup_boundary_survives_restart_and_new_full_restores_rows` |
 | Local clock remains above installed timestamps after restart | `nodus_server`: `snapshot_reserves_clock_above_incoming_versions_across_restart` |
 
-The legacy wire cannot represent pending intents, tombstones or retained user
-history; builds refuse them, and OpenRaft treats that error as fatal to the group.
-Installation currently materializes a bounded
-checkpoint and pauses the shared engine. It starts a new WAL lineage, requiring
-a new full backup before subsequent incremental/PITR use. Automatic rejection of
-all cross-checkpoint recovery paths, live-reader retention through installation,
-and superseded-file cleanup remain open. See the [snapshot limits and compatibility
+NSNP v2 preserves retained user history, tombstones and pending intent identities.
+Its writer requires a trusted compatibility provider; production still uses v1,
+which refuses those states and can stop the group because OpenRaft treats build
+errors as fatal. Installation materializes a bounded checkpoint and pauses the
+shared engine. The same checkpoint publishes a local recovery generation and WAL
+floor. Source-bound backup operations reject cross-generation incremental ancestry
+and PITR extension until a new full backup; offline enforcement requires the
+repository to have observed the boundary. Live-reader retention, coordinated
+repository publication and superseded-file cleanup remain open. See the
+[MVCC snapshot and backup contract](../explanation/mvcc-snapshots.md). See the [snapshot limits and compatibility
 matrix](../explanation/shard-migration-protocol.md#snapshot-limits).
 
 ## Dormant migration recovery

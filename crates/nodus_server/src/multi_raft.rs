@@ -341,6 +341,7 @@ impl MultiRaftManager {
     /// returns the handle. The network factory carries `shard_id` so RPCs are
     /// routed to `/raft/{shard_id}/...` on peers.
     async fn spawn_group(&self, shard_id: &str, store: NodusRaftStore) -> Result<NodusRaft> {
+        let store = store.with_snapshot_group(shard_id);
         let machine = store.state_machine.clone();
         let (log_store, state_machine) = openraft::storage::Adaptor::new(store);
         let network = NodusNetworkFactory::new(shard_id.to_string(), self.transport.clone());

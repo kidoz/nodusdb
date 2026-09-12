@@ -9,6 +9,14 @@ yet satisfy all of them — the gaps are named in
 [backup architecture](../explanation/backup-architecture.md), which is also
 where the reasoning behind each rule lives.
 
+Storage snapshot installation now creates an atomic local recovery generation
+and WAL floor. Source-bound backup operations enforce matching generations for
+incremental ancestry and PITR extension; a new full backup is required after a
+checkpoint. Offline enforcement starts when the source publishes the boundary
+to the repository. See the [implemented boundary and its limits](../explanation/mvcc-snapshots.md#backup-recovery-boundary).
+The optional checksummed generation object and mutable repository boundary do
+not implement the collection layout or distributed retention design below.
+
 ## Repository layout
 
 Append-only object paths, so a repository can be made immutable:

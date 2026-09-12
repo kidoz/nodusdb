@@ -29,6 +29,7 @@ pub mod migration;
 pub mod network;
 pub mod server;
 mod snapshots;
+pub use snapshots::v2::SnapshotCompatibility;
 
 openraft::declare_raft_types!(
     /// Declare the type configuration for `openraft`.
@@ -570,6 +571,8 @@ pub struct StateMachine {
 
 #[derive(Clone)]
 pub struct NodusRaftStore {
+    snapshot_group: String,
+    snapshot_compatibility: Option<Arc<dyn SnapshotCompatibility>>,
     pub log: Arc<RwLock<BTreeMap<u64, Entry<NodusTypeConfig>>>>,
     pub vote: Arc<RwLock<Option<Vote<u64>>>>,
     pub state_machine: Arc<RwLock<StateMachine>>,
@@ -619,6 +622,8 @@ impl NodusRaftStore {
                 meta_store: None,
             })),
             meta: None,
+            snapshot_group: "unscoped".into(),
+            snapshot_compatibility: None,
             snapshot_dir: temp_snapshot_dir(),
             current_snapshot_meta: Arc::new(RwLock::new(None)),
         }
@@ -665,6 +670,8 @@ impl NodusRaftStore {
                 meta_store,
             })),
             meta: Some(meta),
+            snapshot_group: "unscoped".into(),
+            snapshot_compatibility: None,
             snapshot_dir,
             current_snapshot_meta: Arc::new(RwLock::new(snapshot_meta)),
         }
@@ -718,6 +725,19 @@ impl NodusRaftStore {
             Some(meta_store),
             snapshot_dir,
         )
+    }
+
+    /// Bind snapshots to the physical Raft group. Configure before starting Raft.
+    pub fn with_snapshot_group(mut self, group: impl Into<String>) -> Self {
+        self.snapshot_group = group.into();
+        self
+    }
+
+    /// Attach an authoritative compatibility provider. No runtime server route
+    /// currently supplies one; merely understanding v2 never enables its writer.
+    pub fn with_snapshot_compatibility(mut self, provider: Arc<dyn SnapshotCompatibility>) -> Self {
+        self.snapshot_compatibility = Some(provider);
+        self
     }
 
     /// Persists the current applied-state pointer (durable when backed by a
