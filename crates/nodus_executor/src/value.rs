@@ -275,12 +275,18 @@ pub(crate) fn eval_scalar_function(name: &str, args: &[Value]) -> Value {
             Value::Text(out)
         }
         "DATE_TRUNC" => {
-            match (args.first().and_then(&as_text), args.get(1).and_then(&as_text)) {
+            match (
+                args.first().and_then(&as_text),
+                args.get(1).and_then(&as_text),
+            ) {
                 (Some(unit), Some(ts)) => date_trunc_text(&unit, &ts),
                 _ => Value::Null,
             }
         }
-        "AGE" => match (args.first().and_then(&as_text), args.get(1).and_then(&as_text)) {
+        "AGE" => match (
+            args.first().and_then(&as_text),
+            args.get(1).and_then(&as_text),
+        ) {
             (Some(a), Some(b)) => age_text(&a, &b),
             _ => Value::Null,
         },

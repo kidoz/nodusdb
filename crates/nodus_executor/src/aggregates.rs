@@ -268,9 +268,10 @@ pub(crate) fn eval_scalar_expr_grouped(
             eval_scalar_expr_grouped(left, group_rows, col_names),
             eval_scalar_expr_grouped(right, group_rows, col_names),
         ),
-        ScalarExpr::Cast { expr, target } => {
-            cast_value(eval_scalar_expr_grouped(expr, group_rows, col_names), target)
-        }
+        ScalarExpr::Cast { expr, target } => cast_value(
+            eval_scalar_expr_grouped(expr, group_rows, col_names),
+            target,
+        ),
         ScalarExpr::Function { name, args } => {
             let vals: Vec<Value> = args
                 .iter()
@@ -279,13 +280,16 @@ pub(crate) fn eval_scalar_expr_grouped(
             crate::eval_scalar_function(name, &vals)
         }
         ScalarExpr::IsNull { expr, negated } => {
-            let is_null =
-                matches!(eval_scalar_expr_grouped(expr, group_rows, col_names), Value::Null);
+            let is_null = matches!(
+                eval_scalar_expr_grouped(expr, group_rows, col_names),
+                Value::Null
+            );
             Value::Bool(if *negated { !is_null } else { is_null })
         }
-        ScalarExpr::Extract { field, expr } => {
-            extract_datetime_field(&eval_scalar_expr_grouped(expr, group_rows, col_names), field)
-        }
+        ScalarExpr::Extract { field, expr } => extract_datetime_field(
+            &eval_scalar_expr_grouped(expr, group_rows, col_names),
+            field,
+        ),
         ScalarExpr::Case {
             operand,
             branches,

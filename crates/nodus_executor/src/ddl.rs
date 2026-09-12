@@ -306,9 +306,7 @@ impl MemExecutor {
                     state: DescriptorState::Public,
                     data_type,
                     nullable,
-                    default_expr: default
-                        .as_ref()
-                        .and_then(|e| serde_json::to_string(e).ok()),
+                    default_expr: default.as_ref().and_then(|e| serde_json::to_string(e).ok()),
                 };
 
                 // Migrate existing data to include the new column, addressing

@@ -63,8 +63,14 @@ async fn run_record(client: &Client, record: &Record) -> Result<(), String> {
             .simple_query(&record.sql)
             .await
             .map(|_| ())
-            .map_err(|e| format!("statement failed: {}
-  SQL: {}", err_text(&e), record.sql)),
+            .map_err(|e| {
+                format!(
+                    "statement failed: {}
+  SQL: {}",
+                    err_text(&e),
+                    record.sql
+                )
+            }),
         Expect::StatementError { contains } => match client.simple_query(&record.sql).await {
             Ok(_) => Err(format!(
                 "expected an error but statement succeeded\n  SQL: {}",
@@ -79,11 +85,14 @@ async fn run_record(client: &Client, record: &Record) -> Result<(), String> {
             },
         },
         Expect::Query { sort, rows } => {
-            let messages = client
-                .simple_query(&record.sql)
-                .await
-                .map_err(|e| format!("query failed: {}
-  SQL: {}", err_text(&e), record.sql))?;
+            let messages = client.simple_query(&record.sql).await.map_err(|e| {
+                format!(
+                    "query failed: {}
+  SQL: {}",
+                    err_text(&e),
+                    record.sql
+                )
+            })?;
             let actual = render_rows(&messages);
             compare(*sort, rows, &actual).map_err(|diff| format!("{diff}\n  SQL: {}", record.sql))
         }
@@ -91,7 +100,8 @@ async fn run_record(client: &Client, record: &Record) -> Result<(), String> {
 }
 
 async fn run_file(path: &Path) -> Result<(), String> {
-    let body = std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let body =
+        std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
     let records = parse(&body).map_err(|e| format!("{}: parse error: {e}", path.display()))?;
 
     let server = TestServer::start()
@@ -140,7 +150,11 @@ async fn probe_protocols() {
         let val = match client.simple_query(sql).await {
             Ok(m) => {
                 let rows = render_rows(&m);
-                if rows.is_empty() { "<no rows>".to_string() } else { rows.join(" ; ") }
+                if rows.is_empty() {
+                    "<no rows>".to_string()
+                } else {
+                    rows.join(" ; ")
+                }
             }
             Err(e) => format!("ERR({e})"),
         };
@@ -211,7 +225,8 @@ async fn bless_cases() {
 /// Runs one file, replacing every query record's expected rows with the actual
 /// server output. Returns whether the file changed on disk.
 async fn bless_file(path: &Path) -> Result<bool, String> {
-    let body = std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let body =
+        std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
     let records = parse(&body).map_err(|e| format!("parse error: {e}"))?;
 
     let server = TestServer::start()

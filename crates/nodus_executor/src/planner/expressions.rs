@@ -451,7 +451,11 @@ pub(crate) fn cast_value(v: Value, data_type: &str) -> Value {
             Value::Float(_) => v,
             Value::Int(i) => Value::Float(*i as f64),
             Value::Bool(b) => Value::Float(if *b { 1.0 } else { 0.0 }),
-            Value::Text(s) => s.trim().parse::<f64>().map(Value::Float).unwrap_or(Value::Null),
+            Value::Text(s) => s
+                .trim()
+                .parse::<f64>()
+                .map(Value::Float)
+                .unwrap_or(Value::Null),
             _ => Value::Null,
         },
         ColumnType::Bool => match &v {
@@ -564,10 +568,7 @@ fn is_foldable_scalar_fn(name: &str) -> bool {
 /// Lowers a SQL scalar expression into a serializable [`ScalarExpr`] for
 /// per-row evaluation in a table projection. Returns `None` for forms not yet
 /// supported, so the planner can fall back to its existing handling.
-pub(crate) fn lower_scalar(
-    expr: &sqlparser::ast::Expr,
-    params: &[Value],
-) -> Option<ScalarExpr> {
+pub(crate) fn lower_scalar(expr: &sqlparser::ast::Expr, params: &[Value]) -> Option<ScalarExpr> {
     use sqlparser::ast::{BinaryOperator as B, Expr, UnaryOperator as U};
     match expr {
         Expr::Value(_) | Expr::Array(_) | Expr::TypedString(_) | Expr::Interval(_) => {
@@ -575,7 +576,10 @@ pub(crate) fn lower_scalar(
         }
         Expr::Identifier(id) => Some(ScalarExpr::Column(id.value.clone())),
         Expr::CompoundIdentifier(ids) => Some(ScalarExpr::Column(
-            ids.iter().map(|id| id.value.clone()).collect::<Vec<_>>().join("."),
+            ids.iter()
+                .map(|id| id.value.clone())
+                .collect::<Vec<_>>()
+                .join("."),
         )),
         Expr::Nested(inner) => lower_scalar(inner, params),
         Expr::UnaryOp { op, expr: inner } => {
@@ -792,7 +796,9 @@ pub(crate) fn lower_scalar(
                 args: vec![lower_scalar(inner, params)?],
             })
         }
-        Expr::Extract { field, expr: inner, .. } => Some(ScalarExpr::Extract {
+        Expr::Extract {
+            field, expr: inner, ..
+        } => Some(ScalarExpr::Extract {
             field: field.to_string(),
             expr: Box::new(lower_scalar(inner, params)?),
         }),
@@ -826,7 +832,9 @@ pub(crate) fn eval_scalar_expr(expr: &ScalarExpr, row: &[Value], col_names: &[St
                 },
             }
         }
-        ScalarExpr::Unary { op, expr } => apply_unary_op(*op, eval_scalar_expr(expr, row, col_names)),
+        ScalarExpr::Unary { op, expr } => {
+            apply_unary_op(*op, eval_scalar_expr(expr, row, col_names))
+        }
         ScalarExpr::Binary { op, left, right } => apply_binary_op(
             *op,
             eval_scalar_expr(left, row, col_names),
@@ -867,7 +875,9 @@ pub(crate) fn eval_scalar_expr(expr: &ScalarExpr, row: &[Value], col_names: &[St
             branches,
             else_result,
         } => {
-            let op_val = operand.as_ref().map(|o| eval_scalar_expr(o, row, col_names));
+            let op_val = operand
+                .as_ref()
+                .map(|o| eval_scalar_expr(o, row, col_names));
             for (cond, result) in branches {
                 let cond_val = eval_scalar_expr(cond, row, col_names);
                 let hit = match &op_val {
@@ -1043,7 +1053,11 @@ fn interval_date_arith(op: ScalarBinaryOp, l: &Value, r: &Value) -> Value {
     let (Value::Text(ls), Value::Text(rs)) = (l, r) else {
         return Value::Null;
     };
-    let sign = if matches!(op, ScalarBinaryOp::Sub) { -1 } else { 1 };
+    let sign = if matches!(op, ScalarBinaryOp::Sub) {
+        -1
+    } else {
+        1
+    };
     // interval ± interval
     if let (Some((m1, d1, s1)), Some((m2, d2, s2))) =
         (parse_interval_text(ls), parse_interval_text(rs))
@@ -1070,7 +1084,8 @@ pub(crate) fn apply_date_offset(v: &Value, months: i64, days: i64, seconds: i64)
         if m >= 0 {
             dt.checked_add_months(Months::new(m as u32)).unwrap_or(dt)
         } else {
-            dt.checked_sub_months(Months::new((-m) as u32)).unwrap_or(dt)
+            dt.checked_sub_months(Months::new((-m) as u32))
+                .unwrap_or(dt)
         }
     };
     let text = match v {
@@ -1079,14 +1094,12 @@ pub(crate) fn apply_date_offset(v: &Value, months: i64, days: i64, seconds: i64)
         other => render(other),
     };
     if let Ok(dt) = NaiveDateTime::parse_from_str(&text, "%Y-%m-%d %H:%M:%S") {
-        let shifted =
-            add_months(dt, months) + Duration::days(days) + Duration::seconds(seconds);
+        let shifted = add_months(dt, months) + Duration::days(days) + Duration::seconds(seconds);
         return Value::Text(shifted.format("%Y-%m-%d %H:%M:%S").to_string());
     }
     if let Ok(d) = NaiveDate::parse_from_str(&text, "%Y-%m-%d") {
         let base = d.and_hms_opt(0, 0, 0).unwrap();
-        let shifted =
-            add_months(base, months) + Duration::days(days) + Duration::seconds(seconds);
+        let shifted = add_months(base, months) + Duration::days(days) + Duration::seconds(seconds);
         return if seconds != 0 {
             Value::Text(shifted.format("%Y-%m-%d %H:%M:%S").to_string())
         } else {

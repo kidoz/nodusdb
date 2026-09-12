@@ -34,8 +34,7 @@ impl MemExecutor {
         };
         let types = seed_out.types.clone();
 
-        let mut result: Vec<Vec<Value>> =
-            seed_out.rows.into_iter().map(|r| r.values).collect();
+        let mut result: Vec<Vec<Value>> = seed_out.rows.into_iter().map(|r| r.values).collect();
         let mut working = result.clone();
         let mut guard = 0u32;
         while !working.is_empty() {
@@ -45,7 +44,13 @@ impl MemExecutor {
             }
             // Feed the working table into the recursive term under the CTE name.
             let mut term = recursive_term.clone();
-            inject_inline_cte(&mut term, name, columns.clone(), types.clone(), working.clone());
+            inject_inline_cte(
+                &mut term,
+                name,
+                columns.clone(),
+                types.clone(),
+                working.clone(),
+            );
             let iter = self.execute_logical_inner(ctx, term)?;
 
             let mut new_rows: Vec<Vec<Value>> = Vec::new();
@@ -53,8 +58,7 @@ impl MemExecutor {
                 let vals = r.values;
                 if all {
                     new_rows.push(vals);
-                } else if !result.iter().any(|x| x == &vals)
-                    && !new_rows.iter().any(|x| x == &vals)
+                } else if !result.iter().any(|x| x == &vals) && !new_rows.iter().any(|x| x == &vals)
                 {
                     new_rows.push(vals);
                 }
@@ -608,9 +612,9 @@ impl MemExecutor {
                                 if is_grouping && !is_active {
                                     out_row.push(crate::Value::Null);
                                 } else {
-                                    let idx = col_names.iter().position(|tc| {
-                                        tc == c || tc.ends_with(&format!(".{}", c))
-                                    });
+                                    let idx = col_names
+                                        .iter()
+                                        .position(|tc| tc == c || tc.ends_with(&format!(".{}", c)));
                                     out_row.push(
                                         group_rows
                                             .first()
@@ -633,8 +637,11 @@ impl MemExecutor {
                             ProjectionItem::Expr { expr, .. } => {
                                 // Group-aware eval: aggregates compute over the group,
                                 // plain columns read the group's first row.
-                                out_row
-                                    .push(eval_scalar_expr_grouped(expr, &group_rows, &col_names));
+                                out_row.push(eval_scalar_expr_grouped(
+                                    expr,
+                                    &group_rows,
+                                    &col_names,
+                                ));
                             }
                         }
                     }
@@ -935,24 +942,30 @@ impl MemExecutor {
                                     .position(|tc| tc == c || tc.ends_with(&format!(".{}", c)))
                             });
                             for group in &groups {
-                                let okeys: Vec<Vec<Value>> =
-                                    group.iter().map(|&i| order_key_of(&stored_rows[i])).collect();
+                                let okeys: Vec<Vec<Value>> = group
+                                    .iter()
+                                    .map(|&i| order_key_of(&stored_rows[i]))
+                                    .collect();
                                 for (pos, &row_idx) in group.iter().enumerate() {
                                     // Frame slice for this row (whole group if none).
                                     let (s, e) = match frame {
-                                        Some(f) => match frame_bounds(f, group.len(), pos, &okeys) {
-                                            Some(b) => b,
-                                            None => {
-                                                results[row_idx] = Value::Null;
-                                                continue;
+                                        Some(f) => {
+                                            match frame_bounds(f, group.len(), pos, &okeys) {
+                                                Some(b) => b,
+                                                None => {
+                                                    results[row_idx] = Value::Null;
+                                                    continue;
+                                                }
                                             }
-                                        },
+                                        }
                                         None => (0, group.len() - 1),
                                     };
                                     let pick = if last { e } else { s };
                                     results[row_idx] = group
                                         .get(pick)
-                                        .and_then(|&gi| arg_idx.and_then(|ai| stored_rows[gi].get(ai)))
+                                        .and_then(|&gi| {
+                                            arg_idx.and_then(|ai| stored_rows[gi].get(ai))
+                                        })
                                         .cloned()
                                         .unwrap_or(Value::Null);
                                 }
@@ -974,7 +987,8 @@ impl MemExecutor {
                                         .map(|&i| order_key_of(&stored_rows[i]))
                                         .collect();
                                     for (pos, &row_idx) in group.iter().enumerate() {
-                                        let slice = match frame_bounds(f, group.len(), pos, &okeys) {
+                                        let slice = match frame_bounds(f, group.len(), pos, &okeys)
+                                        {
                                             Some((s, e)) => &grows[s..=e],
                                             None => &[],
                                         };
@@ -1401,12 +1415,7 @@ fn inject_inline_cte(
 /// Compares two cells for an ORDER BY key, honouring the ascending flag and an
 /// optional explicit `NULLS FIRST`/`NULLS LAST` override. With no override the
 /// default matches PostgreSQL: NULLs sort first on ASC and last on DESC.
-fn order_cmp(
-    a: &Value,
-    b: &Value,
-    asc: bool,
-    nulls_first: Option<bool>,
-) -> std::cmp::Ordering {
+fn order_cmp(a: &Value, b: &Value, asc: bool, nulls_first: Option<bool>) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     let a_null = a == &Value::Null;
     let b_null = b == &Value::Null;

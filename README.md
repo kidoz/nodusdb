@@ -59,3 +59,5 @@ To format, lint, and run all tests:
 ```bash
 just check
 ```
+
+For nonmutating formatting verification, use `cargo fmt --all --check`.

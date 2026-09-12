@@ -101,8 +101,9 @@ pub(crate) fn plan_references_table(plan: &LogicalPlan, name: &str) -> bool {
 fn ordinal_target(projection: &[ProjectionItem], n: usize) -> Option<String> {
     match projection.get(n.checked_sub(1)?)? {
         ProjectionItem::Column(c) => Some(c.clone()),
-        ProjectionItem::AliasedColumn(_, a)
-        | ProjectionItem::AliasedLiteral(_, a) => Some(a.clone()),
+        ProjectionItem::AliasedColumn(_, a) | ProjectionItem::AliasedLiteral(_, a) => {
+            Some(a.clone())
+        }
         ProjectionItem::Aggregate(op, inner) => Some(format!("{op:?}({inner})")),
         ProjectionItem::Expr { alias, .. } => alias.clone(),
         ProjectionItem::ScalarFunction {
@@ -124,8 +125,12 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
     if let Some(with) = &query.with {
         for cte in &with.cte_tables {
             let cte_name = cte.alias.name.value.clone();
-            let column_aliases: Vec<String> =
-                cte.alias.columns.iter().map(|c| c.name.value.clone()).collect();
+            let column_aliases: Vec<String> = cte
+                .alias
+                .columns
+                .iter()
+                .map(|c| c.name.value.clone())
+                .collect();
             let cte_plan = plan_query(&cte.query, params)?;
             // A `WITH RECURSIVE` CTE whose body is `seed UNION[/ALL] term` where
             // the term self-references the CTE becomes a RecursiveCte so the CTE
@@ -854,9 +859,8 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
         sqlparser::ast::GroupByExpr::Expressions(exprs, _) => {
             use sqlparser::ast::Expr;
             // Flattens a grouping element's expressions into column names.
-            let cols_of = |es: &[Expr]| -> Vec<String> {
-                es.iter().filter_map(extract_col_name).collect()
-            };
+            let cols_of =
+                |es: &[Expr]| -> Vec<String> { es.iter().filter_map(extract_col_name).collect() };
             for expr in exprs {
                 match expr {
                     Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
@@ -878,8 +882,7 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
                     }
                     // `ROLLUP(e1, e2, …)` → prefixes: {e1..en}, …, {e1}, {}.
                     Expr::Rollup(elements) => {
-                        let elems: Vec<Vec<String>> =
-                            elements.iter().map(|e| cols_of(e)).collect();
+                        let elems: Vec<Vec<String>> = elements.iter().map(|e| cols_of(e)).collect();
                         let mut sets = Vec::new();
                         for i in (0..=elems.len()).rev() {
                             sets.push(elems[..i].concat());
@@ -888,8 +891,7 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
                     }
                     // `CUBE(e1, …, en)` → every subset of the elements.
                     Expr::Cube(elements) => {
-                        let elems: Vec<Vec<String>> =
-                            elements.iter().map(|e| cols_of(e)).collect();
+                        let elems: Vec<Vec<String>> = elements.iter().map(|e| cols_of(e)).collect();
                         let mut sets = Vec::new();
                         for mask in (0..(1u32 << elems.len())).rev() {
                             let mut set = Vec::new();
@@ -933,20 +935,15 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
             .iter()
             .filter_map(|o| match &o.expr {
                 // Bare or qualified (`t.col`) column reference.
-                Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
-                    extract_col_name(&o.expr).map(|col| {
-                        (col, o.options.asc.unwrap_or(true), o.options.nulls_first)
-                    })
-                }
+                Expr::Identifier(_) | Expr::CompoundIdentifier(_) => extract_col_name(&o.expr)
+                    .map(|col| (col, o.options.asc.unwrap_or(true), o.options.nulls_first)),
                 // Ordinal reference (`ORDER BY 1`).
                 Expr::Value(v) => match &v.value {
                     sqlparser::ast::Value::Number(n, _) => n
                         .parse::<usize>()
                         .ok()
                         .and_then(|n| ordinal_target(&projection, n))
-                        .map(|col| {
-                            (col, o.options.asc.unwrap_or(true), o.options.nulls_first)
-                        }),
+                        .map(|col| (col, o.options.asc.unwrap_or(true), o.options.nulls_first)),
                     _ => None,
                 },
                 _ => None,

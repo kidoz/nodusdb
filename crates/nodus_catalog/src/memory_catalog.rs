@@ -658,7 +658,7 @@ impl CatalogWriter for MemoryCatalog {
         state: IndexState,
     ) -> Result<()> {
         let mut tables = self.tables.write();
-        for (_, tbl) in tables.iter_mut() {
+        for tbl in tables.values_mut() {
             for idx in tbl.indexes.iter_mut() {
                 if idx.id == index_id {
                     idx.index_state = state;

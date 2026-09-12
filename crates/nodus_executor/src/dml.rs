@@ -193,10 +193,8 @@ impl MemExecutor {
                                 // Maintain secondary indexes for changed key columns.
                                 for idx in &tbl.indexes {
                                     for kcol in &idx.key_columns {
-                                        if let Some(pos) = tbl
-                                            .columns
-                                            .iter()
-                                            .position(|c| c.id == kcol.column_id)
+                                        if let Some(pos) =
+                                            tbl.columns.iter().position(|c| c.id == kcol.column_id)
                                         {
                                             let old_v = old_row.get(pos).unwrap_or(&Value::Null);
                                             let new_v =
@@ -326,7 +324,10 @@ impl MemExecutor {
             let old_row = row.clone();
             // The row's actual stored key (any scheme); the new key is derived
             // from the updated content, migrating old-scheme rows on write.
-            let old_pk_str = old_key.strip_prefix(&key_prefix).unwrap_or(&old_key).to_string();
+            let old_pk_str = old_key
+                .strip_prefix(&key_prefix)
+                .unwrap_or(&old_key)
+                .to_string();
             for (col, expr) in &assignments {
                 if let Some(idx) = col_names.iter().position(|c| c == col) {
                     // `SET col = DEFAULT` sentinel: resolve to the column's
@@ -337,9 +338,7 @@ impl MemExecutor {
                         tbl.columns[idx]
                             .default_expr
                             .as_ref()
-                            .and_then(|json| {
-                                serde_json::from_str::<ScalarExpr>(json).ok()
-                            })
+                            .and_then(|json| serde_json::from_str::<ScalarExpr>(json).ok())
                             .map(|e| eval_scalar_expr(&e, &[], &[]))
                             .unwrap_or(Value::Null)
                     } else {

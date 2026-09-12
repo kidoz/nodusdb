@@ -105,7 +105,8 @@ fn test_ddl_and_subqueries() {
                 name: "salary".into(),
                 data_type: "INT".into(),
                 nullable: true,
-                default: None,            },
+                default: None,
+            },
         },
     )
     .unwrap();
@@ -323,7 +324,10 @@ fn test_unique_constraints() {
         &ctx,
         LogicalPlan::Update {
             table_name: "users".into(),
-            assignments: vec![("email".into(), ScalarExpr::Literal(Value::Text("a@a.com".into())))],
+            assignments: vec![(
+                "email".into(),
+                ScalarExpr::Literal(Value::Text("a@a.com".into())),
+            )],
             filter: Some(FilterExpr::Predicate(Predicate {
                 left: "id".into(),
                 op: CompareOp::Eq,
@@ -338,7 +342,10 @@ fn test_unique_constraints() {
         &ctx,
         LogicalPlan::Update {
             table_name: "users".into(),
-            assignments: vec![("email".into(), ScalarExpr::Literal(Value::Text("b@b.com".into())))],
+            assignments: vec![(
+                "email".into(),
+                ScalarExpr::Literal(Value::Text("b@b.com".into())),
+            )],
             filter: Some(FilterExpr::Predicate(Predicate {
                 left: "id".into(),
                 op: CompareOp::Eq,
@@ -483,7 +490,10 @@ fn test_secondary_indexing() {
         &ctx,
         LogicalPlan::Update {
             table_name: "products".into(),
-            assignments: vec![("category".into(), ScalarExpr::Literal(Value::Text("B".into())))],
+            assignments: vec![(
+                "category".into(),
+                ScalarExpr::Literal(Value::Text("B".into())),
+            )],
             filter: Some(FilterExpr::Predicate(Predicate {
                 left: "id".into(),
                 op: CompareOp::Eq,
@@ -776,7 +786,8 @@ fn test_alter_table_migrations() {
                 name: "age".into(),
                 data_type: "INT".into(),
                 nullable: true,
-                default: None,            },
+                default: None,
+            },
         },
     )
     .unwrap();

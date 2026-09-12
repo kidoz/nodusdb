@@ -178,12 +178,20 @@ pub(crate) fn parse_filter_expr(
             let high_op = extract_operand(high, params)?;
             let lo = FilterExpr::Predicate(Predicate {
                 left: col.clone(),
-                op: if *negated { CompareOp::Lt } else { CompareOp::Ge },
+                op: if *negated {
+                    CompareOp::Lt
+                } else {
+                    CompareOp::Ge
+                },
                 right: low_op,
             });
             let hi = FilterExpr::Predicate(Predicate {
                 left: col,
-                op: if *negated { CompareOp::Gt } else { CompareOp::Le },
+                op: if *negated {
+                    CompareOp::Gt
+                } else {
+                    CompareOp::Le
+                },
                 right: high_op,
             });
             if *negated {

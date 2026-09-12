@@ -129,7 +129,8 @@ impl MemExecutor {
                     return Some(false);
                 };
 
-                let right_cell = self.eval_operand(row, col_names, columns, &p.right, &expected_type);
+                let right_cell =
+                    self.eval_operand(row, col_names, columns, &p.right, &expected_type);
 
                 if left_cell == Value::Null || right_cell == Value::Null {
                     return None;
@@ -151,11 +152,7 @@ impl MemExecutor {
                     CompareOp::ContainedBy => value_contains(&right_cell, &left_cell),
                 })
             }
-            FilterExpr::CompareSubquery {
-                left,
-                op,
-                subquery,
-            } => {
+            FilterExpr::CompareSubquery { left, op, subquery } => {
                 let Some(idx) = col_pos(col_names, left) else {
                     return Some(false);
                 };
