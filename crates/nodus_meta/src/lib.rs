@@ -12,6 +12,12 @@ pub struct ShardMap {
     pub shards: Vec<ShardDescriptor>,
 }
 
+/// A table without a shard map uses the unsharded storage path. This must be
+/// distinguishable from corrupt metadata or an I/O failure.
+#[derive(Debug, thiserror::Error)]
+#[error("Shard map not found for table {0}")]
+pub struct ShardMapNotFound(pub TableId);
+
 /// On-disk format version of persisted meta-store records (shard maps,
 /// placements).
 const META_RECORD_VERSION: u16 = 1;
@@ -74,7 +80,7 @@ impl MetaStore for MemMetaStore {
         guard
             .get(&table_id)
             .cloned()
-            .ok_or_else(|| anyhow::anyhow!("Shard map not found for table {}", table_id))
+            .ok_or_else(|| ShardMapNotFound(table_id).into())
     }
 
     fn update_shard_map(&self, shard_map: ShardMap) -> Result<()> {
@@ -122,7 +128,7 @@ impl MetaStore for PersistentMetaStore {
             let map: ShardMap = serde_json::from_slice(decode_meta(&bytes)?)?;
             Ok(map)
         } else {
-            anyhow::bail!("Shard map not found for table {}", table_id)
+            Err(ShardMapNotFound(table_id).into())
         }
     }
 

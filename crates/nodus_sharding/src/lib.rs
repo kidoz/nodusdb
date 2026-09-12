@@ -1,14 +1,13 @@
 use anyhow::Result;
 use nodus_catalog::{DescriptorState, ShardDescriptor, ShardId, TableId};
 use nodus_meta::{MetaStore, ShardMap};
+#[cfg(test)]
 use nodus_storage_api::KeyRange;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-pub trait ShardRouter: Send + Sync {
-    fn locate_key(&self, table_id: TableId, key: &[u8]) -> Result<ShardId>;
-    fn locate_range(&self, table_id: TableId, range: KeyRange) -> Result<Vec<ShardId>>;
-}
+mod routing;
+pub use routing::{CatalogShardRouter, RoutingSnapshot, ShardRouter};
 
 /// A planned-but-uncommitted shard split. A data migrator creates the children,
 /// relocates `source_id`'s bytes into them (partitioned at `split_key`), then
@@ -39,46 +38,6 @@ pub struct MergePlan {
     pub merged: ShardDescriptor,
     /// The table's shard map after the merge (sources removed, merged added).
     pub new_map: ShardMap,
-}
-
-pub struct CatalogShardRouter {
-    meta_store: Arc<dyn MetaStore>,
-}
-
-impl CatalogShardRouter {
-    pub fn new(meta_store: Arc<dyn MetaStore>) -> Self {
-        Self { meta_store }
-    }
-}
-
-impl ShardRouter for CatalogShardRouter {
-    fn locate_key(&self, table_id: TableId, key: &[u8]) -> Result<ShardId> {
-        let map = self.meta_store.get_shard_map(table_id)?;
-        for shard in &map.shards {
-            // Empty start_key means -infinity, empty end_key means +infinity for this MVP
-            let start_ok = shard.start_key.is_empty() || key >= shard.start_key.as_slice();
-            let end_ok = shard.end_key.is_empty() || key < shard.end_key.as_slice();
-            if start_ok && end_ok {
-                return Ok(shard.id);
-            }
-        }
-        anyhow::bail!("No shard found for key in table {}", table_id);
-    }
-
-    fn locate_range(&self, table_id: TableId, range: KeyRange) -> Result<Vec<ShardId>> {
-        let map = self.meta_store.get_shard_map(table_id)?;
-        let mut result = Vec::new();
-        for shard in &map.shards {
-            let start_ok =
-                shard.end_key.is_empty() || range.start.as_ref() < shard.end_key.as_slice();
-            let end_ok =
-                shard.start_key.is_empty() || range.end.as_ref() > shard.start_key.as_slice();
-            if start_ok && end_ok {
-                result.push(shard.id);
-            }
-        }
-        Ok(result)
-    }
 }
 
 // Shard administration: split, merge, move, and rebalance. These operations
