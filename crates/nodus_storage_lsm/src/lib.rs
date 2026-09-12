@@ -601,7 +601,7 @@ impl KvEngine for LsmKvEngine {
         // Search through sstables from newest to oldest
         let sst_guard = self.sstables.read().unwrap();
         for sst in sst_guard.iter().rev() {
-            if let Ok(Some(chain)) = sst.get(key)
+            if let Some(chain) = sst.get(key)?
                 && let Some(val) = chain.read(read_ts)
             {
                 return Ok(Some(Bytes::from(val.to_vec())));
@@ -634,18 +634,17 @@ impl KvEngine for LsmKvEngine {
         // the highest-precedence chain for a key wins the merge (matching `get`).
         let mut sources: Vec<ScanSource> = Vec::with_capacity(sst_guard.len() + 1);
         for sst in sst_guard.iter() {
-            // An unreadable SSTable contributes nothing, matching the previous
-            // `iter().flatten()` behavior of skipping it.
-            if let Ok(iter) = sst.range_iter(&start, end.clone()) {
-                let lower = start.clone();
-                // `range_iter` may emit a few keys below `start` from the first
-                // block; drop them here.
-                let bounded = iter.filter(move |item| match item {
-                    Ok((k, _)) => k.as_ref() >= lower.as_ref(),
-                    Err(_) => true,
-                });
-                sources.push(ScanSource::new(Box::new(bounded)));
-            }
+            // An unavailable source may contain committed rows. Failing to
+            // open it must fail the scan, never silently shorten the result.
+            let iter = sst.range_iter(&start, end.clone())?;
+            let lower = start.clone();
+            // `range_iter` may emit a few keys below `start` from the first
+            // block; drop them here while preserving iterator errors.
+            let bounded = iter.filter(move |item| match item {
+                Ok((k, _)) => k.as_ref() >= lower.as_ref(),
+                Err(_) => true,
+            });
+            sources.push(ScanSource::new(Box::new(bounded)));
         }
         drop(sst_guard);
         drop(mem_guard);
@@ -671,16 +670,14 @@ impl KvEngine for LsmKvEngine {
         let mem_guard = self.memtable.read().unwrap();
         let sst_guard = self.sstables.read().unwrap();
         for sst in sst_guard.iter() {
-            if let Ok(iter) = sst.iter() {
-                for item in iter.flatten() {
-                    let (key, chain) = item;
-                    if key >= start && key < end {
-                        merged
-                            .entry(key)
-                            .or_default()
-                            .versions
-                            .extend(chain.versions);
-                    }
+            for item in sst.iter()? {
+                let (key, chain) = item?;
+                if key >= start && key < end {
+                    merged
+                        .entry(key)
+                        .or_default()
+                        .versions
+                        .extend(chain.versions);
                 }
             }
         }
@@ -1117,6 +1114,41 @@ mod tests {
         assert_eq!(res2.value, Bytes::from("v2"));
 
         assert!(scan.next().is_none()); // a3 is exclusive
+    }
+
+    #[test]
+    fn unavailable_sstable_fails_reads_instead_of_hiding_committed_rows() {
+        let dir = TempDir::new().unwrap();
+        let engine = LsmKvEngine::with_wal(dir.path(), None).unwrap();
+        let txn = TxnId::new();
+        engine
+            .write_intent(txn, Bytes::from("k"), Bytes::from("v"))
+            .unwrap();
+        engine.commit(txn, 10).unwrap();
+        engine.flush().unwrap();
+        let path = engine.sstables.read().unwrap()[0].path.clone();
+        let mut contents = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let range = || KeyRange {
+            start: Bytes::from("a"),
+            end: Bytes::from("z"),
+        };
+        assert!(engine.get(b"k", 20).is_err());
+        assert!(engine.scan(range(), 20).is_err());
+        assert!(engine.scan_versions(range(), 0, 20).is_err());
+        // A valid footer with an invalid data entry fails during iteration.
+        contents[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+        std::fs::write(&path, contents).unwrap();
+        assert!(engine.get(b"k", 20).is_err());
+        let mut scan = engine.scan(range(), 20).unwrap();
+        assert!(scan.next().unwrap().is_err());
+        assert!(scan.next().is_none());
+        assert!(engine.scan_versions(range(), 0, 20).is_err());
+        // A truncated published file is corruption, not a valid empty table.
+        std::fs::write(&path, b"truncated").unwrap();
+        assert!(engine.get(b"k", 20).is_err());
+        assert!(engine.scan(range(), 20).is_err());
+        assert!(engine.scan_versions(range(), 0, 20).is_err());
     }
 
     #[test]

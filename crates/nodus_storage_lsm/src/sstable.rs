@@ -274,10 +274,10 @@ impl Sstable {
         }
     }
 
-    fn read_footer(file: &mut File) -> Result<Option<Footer>> {
+    fn read_footer(file: &mut File) -> Result<Footer> {
         let file_len = file.seek(SeekFrom::End(0))?;
         if file_len < FOOTER_LEN {
-            return Ok(None);
+            bail!("truncated sstable footer: {file_len} bytes");
         }
         let buf = read_range(file, file_len - FOOTER_LEN, FOOTER_LEN as usize)?;
         let magic = u32::from_le_bytes(buf[24..28].try_into().unwrap());
@@ -285,12 +285,12 @@ impl Sstable {
         if magic != MAGIC || version != FORMAT_VERSION {
             bail!("unrecognized sstable format (magic={magic:#x}, version={version})");
         }
-        Ok(Some(Footer {
+        Ok(Footer {
             index_offset: u64::from_le_bytes(buf[0..8].try_into().unwrap()),
             index_len: u32::from_le_bytes(buf[8..12].try_into().unwrap()),
             bloom_offset: u64::from_le_bytes(buf[12..20].try_into().unwrap()),
             bloom_len: u32::from_le_bytes(buf[20..24].try_into().unwrap()),
-        }))
+        })
     }
 
     fn read_index(file: &mut File, footer: &Footer) -> Result<Vec<BlockHandle>> {
@@ -322,13 +322,8 @@ impl Sstable {
     }
 
     pub fn get(&self, key: &[u8]) -> Result<Option<VersionChain>> {
-        let mut file = match File::open(&self.path) {
-            Ok(f) => f,
-            Err(_) => return Ok(None),
-        };
-        let Some(footer) = Self::read_footer(&mut file)? else {
-            return Ok(None);
-        };
+        let mut file = File::open(&self.path)?;
+        let footer = Self::read_footer(&mut file)?;
 
         // Bloom: skip the whole file if the key is definitely not present.
         let bloom_buf = read_range(&mut file, footer.bloom_offset, footer.bloom_len as usize)?;
@@ -364,10 +359,7 @@ impl Sstable {
 
     pub fn iter(&self) -> Result<SstableIterator> {
         let mut file = File::open(&self.path)?;
-        let data_end = match Self::read_footer(&mut file)? {
-            Some(footer) => footer.index_offset,
-            None => 0,
-        };
+        let data_end = Self::read_footer(&mut file)?.index_offset;
         file.seek(SeekFrom::Start(0))?;
         Ok(SstableIterator {
             file,
@@ -384,14 +376,7 @@ impl Sstable {
     /// This keeps a ranged scan's I/O proportional to the range, not the file.
     pub fn range_iter(&self, start: &[u8], end: Bytes) -> Result<SstableIterator> {
         let mut file = File::open(&self.path)?;
-        let Some(footer) = Self::read_footer(&mut file)? else {
-            return Ok(SstableIterator {
-                file,
-                position: 0,
-                data_end: 0,
-                end: Some(end),
-            });
-        };
+        let footer = Self::read_footer(&mut file)?;
         let index = Self::read_index(&mut file, &footer)?;
         // The last block whose first key is <= `start` is the one that could hold
         // `start`; if `start` precedes every block, begin at the first.
