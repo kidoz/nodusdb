@@ -123,6 +123,13 @@ pub trait KvEngine: Send + Sync {
         Vec::new()
     }
 
+    /// Whether any transaction has intents under `prefix`. Fence acquisition
+    /// calls this under the owning Raft group's apply lock. Unsupported engines
+    /// must fail closed; an empty answer would allow fencing accepted writes.
+    fn has_pending_intents(&self, _prefix: &[u8]) -> Result<bool> {
+        anyhow::bail!("pending-intent inspection is unsupported by this engine")
+    }
+
     /// Ensures this engine reflects every write committed before the call for the
     /// group that owns `key` — a linearizable-read barrier. A reader that runs
     /// this before scanning observes all earlier committed writes, closing the
@@ -204,6 +211,10 @@ impl NamespacedKvEngine {
 }
 
 impl KvEngine for NamespacedKvEngine {
+    fn has_pending_intents(&self, prefix: &[u8]) -> Result<bool> {
+        self.inner.has_pending_intents(&self.physical_key(prefix))
+    }
+
     fn get(&self, key: &[u8], read_ts: Timestamp) -> Result<Option<Bytes>> {
         self.inner.get(&self.physical_key(key), read_ts)
     }

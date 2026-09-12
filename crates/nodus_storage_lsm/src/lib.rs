@@ -586,6 +586,16 @@ impl Default for LsmKvEngine {
 }
 
 impl KvEngine for LsmKvEngine {
+    fn has_pending_intents(&self, prefix: &[u8]) -> Result<bool> {
+        Ok(self
+            .intents
+            .read()
+            .unwrap()
+            .values()
+            .flatten()
+            .any(|key| key.starts_with(prefix)))
+    }
+
     fn flush(&self) -> Result<()> {
         self.flush()
     }

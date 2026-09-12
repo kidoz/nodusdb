@@ -29,6 +29,16 @@ impl Default for MemKvEngine {
 }
 
 impl KvEngine for MemKvEngine {
+    fn has_pending_intents(&self, prefix: &[u8]) -> Result<bool> {
+        Ok(self
+            .intents
+            .read()
+            .unwrap()
+            .values()
+            .flatten()
+            .any(|key| key.starts_with(prefix)))
+    }
+
     fn get(&self, key: &[u8], read_ts: Timestamp) -> Result<Option<Bytes>> {
         let guard = self.store.read().unwrap();
         if let Some(chain) = guard.get(key)
