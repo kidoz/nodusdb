@@ -54,7 +54,31 @@ LSM reads also report missing or unreadable SSTables, truncated footers, and
 decoding failures instead of silently omitting those sources. This change does
 not alter persisted formats or repair damaged files.
 
+## Documentation
+
+Full documentation lives in [`docs/`](docs/README.md) and is organised with
+[Diátaxis](https://diataxis.fr/), so each page answers one kind of question:
+
+- **[Tutorials](docs/tutorials/)** — learning. Start with
+  [Getting started](docs/tutorials/getting-started.md): run a server, connect
+  with `psql`, and watch the data survive a restart.
+- **[How-to guides](docs/how-to/)** — tasks.
+  [Import a PostgreSQL dump](docs/how-to/import-a-postgresql-dump.md),
+  [back up and restore](docs/how-to/back-up-and-restore.md),
+  [run the test suites](docs/how-to/run-the-test-suites.md).
+- **[Reference](docs/reference/)** — facts. The
+  [durability contract](docs/reference/durability-contract.md),
+  [admin API authorization](docs/reference/admin-api-authorization.md),
+  [PostgreSQL dump compatibility](docs/reference/postgres-dump-compatibility.md),
+  the [crate map](docs/reference/crate-map.md).
+- **[Explanation](docs/explanation/)** — design and research.
+  [How durability works](docs/explanation/durability.md),
+  [backup architecture](docs/explanation/backup-architecture.md),
+  [shard migration protocol](docs/explanation/shard-migration-protocol.md).
+
 ## Getting Started
+
+The quickest path is the [Getting started tutorial](docs/tutorials/getting-started.md).
 To run the server locally with durable storage and explicit dev credentials:
 
 ```bash
@@ -94,3 +118,7 @@ For nonmutating formatting verification, use `cargo fmt --all --check`.
 `just test-partition` runs the real-TCP Raft partition regression and propagates
 failures; `just test-sim` is a compatibility alias, not a deterministic simulator.
 CI also builds and lints the frontend using Node.js 24.
+
+See [run the test suites](docs/how-to/run-the-test-suites.md) for which suite to
+run when, and [prepare a change for review](docs/how-to/prepare-a-change-for-review.md)
+before handing work over.
