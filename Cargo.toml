@@ -45,30 +45,30 @@ license = "MIT"
 repository = "https://github.com/kidoz/nodusdb"
 
 [workspace.dependencies]
-tokio = { version = "1.52.3", features = ["full"] }
+tokio = { version = "1.53.1", features = ["full"] }
 axum = "0.8.9"
-tower-http = { version = "0.7.0", features = ["cors", "fs"] }
+tower-http = { version = "0.7.1", features = ["cors", "fs"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-thiserror = "2.0.18"
-anyhow = "1.0.103"
-clap = { version = "4.6.1", features = ["derive"] }
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.150"
-prometheus-client = "0.25.0"
-reqwest = { version = "0.13.4", features = ["json", "query"] }
+thiserror = "2.0.20"
+anyhow = "1.0.104"
+clap = { version = "4.6.6", features = ["derive"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+prometheus-client = "0.25.1"
+reqwest = { version = "0.13.5", features = ["json", "query"] }
 figment = { version = "0.10.19", features = ["toml", "env"] }
-pgwire = "0.40.3"
+pgwire = "0.41.0"
 sqlparser = "0.62.0"
 postgres-types = { version = "0.2.14", features = ["array-impls", "derive", "with-chrono-0_4", "with-serde_json-1", "with-uuid-1"] }
 tokio-postgres = "0.7.18"
-async-trait = "0.1.89"
-futures-util = "0.3.32"
-uuid = { version = "1.23.4", features = ["v4", "v5", "serde"] }
+async-trait = "0.1.92"
+futures-util = "0.3.34"
+uuid = { version = "1.26.1", features = ["v4", "v5", "serde"] }
 chrono = { version = "0.4.45", features = ["serde"] }
-bytes = "1.12.0"
+bytes = "1.12.1"
 parking_lot = "0.12.5"
-openraft = { version = "0.9.24", features = ["serde"] }
+openraft = { version = "0.9.25", features = ["serde"] }
 sha2 = "0.11.0"
 proptest = "1.11.0"
 criterion = "0.8.2"

@@ -93,7 +93,7 @@ impl FileWalEngine {
             .read(true)
             .open(&path)?;
 
-        let cipher = key.map(|k| Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&k)));
+        let cipher = key.map(|k| Aes256Gcm::new(&Key::<Aes256Gcm>::from(k)));
 
         Ok(Self {
             file: Arc::new(Mutex::new(file)),
@@ -114,9 +114,9 @@ impl WalEngine for FileWalEngine {
         if let Some(cipher) = &self.cipher {
             let mut nonce_bytes = [0u8; 12];
             rand::rng().fill_bytes(&mut nonce_bytes);
-            let nonce = Nonce::from_slice(&nonce_bytes);
+            let nonce = Nonce::from(nonce_bytes);
             data = cipher
-                .encrypt(nonce, data.as_ref())
+                .encrypt(&nonce, data.as_ref())
                 .map_err(|e| anyhow::anyhow!("encryption failed: {}", e))?;
             // Prepend nonce to data
             let mut final_data = nonce_bytes.to_vec();
@@ -177,7 +177,8 @@ impl WalEngine for FileWalEngine {
                 if buf.len() < 12 {
                     break;
                 }
-                let nonce = Nonce::from_slice(&buf[..12]);
+                let nonce = <&Nonce<_>>::try_from(&buf[..12])
+                    .map_err(|e| anyhow::anyhow!("invalid WAL nonce: {e}"))?;
                 match cipher.decrypt(nonce, &buf[12..]) {
                     Ok(data) => data,
                     Err(_) => break,
@@ -241,6 +242,30 @@ mod tests {
         } else {
             panic!("Wrong record type recovered");
         }
+    }
+
+    #[test]
+    fn recovers_encrypted_record_from_aes_gcm_0_10() {
+        // Generated with aes-gcm 0.10.3: key [42; 32], nonce [7; 12],
+        // plaintext NDBv + version 1 (u16 LE) + {"V1":{"Checkpoint":{"ts":99}}}.
+        // Fixed old-codec bytes catch compatibility breaks that a round trip
+        // using only the new codec would miss. Payload is nonce + ciphertext + tag.
+        let payload = [
+            7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 113, 187, 189, 211, 84, 148, 94, 19, 175, 123, 82,
+            154, 241, 222, 244, 83, 95, 229, 6, 3, 241, 84, 14, 65, 136, 0, 249, 181, 40, 79, 32,
+            40, 199, 149, 137, 102, 3, 178, 179, 112, 225, 52, 220, 106, 18, 36, 106, 44, 192, 233,
+            88, 47, 152,
+        ];
+        let file = NamedTempFile::new().unwrap();
+        write_legacy_frame(file.path(), &payload);
+
+        let engine = FileWalEngine::with_encryption(file.path(), Some([42; 32])).unwrap();
+        let recovered = engine.recover().unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert!(matches!(
+            recovered[0],
+            WalRecord::V1(WalRecordV1::Checkpoint { ts: 99 })
+        ));
     }
 
     /// Writes one frame (`[len][crc][payload]`) of raw bytes, as a pre-envelope

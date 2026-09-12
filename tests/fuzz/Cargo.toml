@@ -7,7 +7,7 @@ edition = "2024"
 [workspace]
 
 [dependencies]
-afl = "0.15"
+afl = "0.18.2"
 
 [dependencies.nodus_server]
 path = "../../crates/nodus_server"
@@ -22,7 +22,7 @@ path = "../../crates/nodus_raftstore"
 path = "../../crates/nodus_storage_wal"
 
 [dependencies.serde_json]
-version = "1.0.115"
+version = "1.0.151"
 
 [[bin]]
 name = "fuzz_sql_parser"

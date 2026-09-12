@@ -27,7 +27,7 @@ parking_lot.workspace = true
 chrono.workspace = true
 sqlparser.workspace = true
 serde_json.workspace = true
-regex = "1.12.4"
+regex = "1.13.1"
 async-trait.workspace = true
 
 [lints]

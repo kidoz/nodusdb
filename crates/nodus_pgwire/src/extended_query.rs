@@ -349,7 +349,11 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         let statement_name = message.statement_name.as_deref().unwrap_or(DEFAULT_NAME);
-        let Some(statement) = client.portal_store().get_statement(statement_name) else {
+        let Some(statement) = client
+            .portal_store()
+            .get_statement(statement_name)
+            .and_then(|entry| entry.value().cloned())
+        else {
             return Err(PgWireError::StatementNotFound(statement_name.to_owned()));
         };
         let portal = Portal::try_new(&message, statement)?;
@@ -406,7 +410,11 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
             return Ok(());
         }
 
-        let Some(portal) = client.portal_store().get_portal(portal_name) else {
+        let Some(portal) = client
+            .portal_store()
+            .get_portal(portal_name)
+            .and_then(|entry| entry.value().cloned())
+        else {
             return Err(PgWireError::PortalNotFound(portal_name.to_owned()));
         };
 
@@ -617,7 +625,11 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
         let name = message.name.as_deref().unwrap_or(DEFAULT_NAME);
         match message.target_type {
             TARGET_TYPE_BYTE_STATEMENT => {
-                if let Some(stmt) = client.portal_store().get_statement(name) {
+                if let Some(stmt) = client
+                    .portal_store()
+                    .get_statement(name)
+                    .and_then(|entry| entry.value().cloned())
+                {
                     client
                         .metadata_mut()
                         .insert(described_statement_key(&stmt.statement), "1".to_owned());
@@ -658,7 +670,11 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
                 }
             }
             TARGET_TYPE_BYTE_PORTAL => {
-                if let Some(portal) = client.portal_store().get_portal(name) {
+                if let Some(portal) = client
+                    .portal_store()
+                    .get_portal(name)
+                    .and_then(|entry| entry.value().cloned())
+                {
                     client
                         .metadata_mut()
                         .insert(described_portal_key(name), "1".to_owned());
