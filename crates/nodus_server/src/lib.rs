@@ -9,6 +9,8 @@ mod raft_kv;
 mod raft_router;
 mod raft_shard_meta;
 mod raft_upgrade;
+#[cfg(test)]
+mod snapshot_tests;
 mod tls;
 
 use admin::{AdminState, admin_routes};

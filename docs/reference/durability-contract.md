@@ -42,6 +42,33 @@ on-disk state a crash would leave.
 | Rolled-back writes never visible, before or after restart | `tests/fault`: `rolled_back_writes_are_never_visible` |
 | Point-in-time restore replays archived WAL to a target time | `tests/integration`: `admin_backup_pitr_restore` |
 
+## Atomic Raft snapshot installation
+
+With persistent LSM storage, a validated snapshot replaces its group's rows and
+applied pointer in one manifest publication. Other groups' state and pending
+transactions remain intact. An interrupted file-publication step leaves complete
+KV state that can rebuild the snapshot; it never intentionally serves a new
+snapshot descriptor with the previous file. Uncertain manifest I/O fails closed
+until reopen. These guarantees assume the authoritative manifest remains readable.
+
+| Scenario | Evidence |
+| --- | --- |
+| Abrupt exit on either side of the manifest swap | `nodus_storage_lsm`: `abrupt_exit_at_manifest_boundary_recovers_old_or_complete_checkpoint` |
+| Shared-engine history, intents and node-local records survive, including encrypted WAL reopen | `nodus_storage_lsm`: `checkpoint_preserves_other_group_history_intents_and_local_records` |
+| Exit after checkpoint but before snapshot file publication | `nodus_server`: `abrupt_install_restart_never_serves_mixed_snapshot_and_applied_state` |
+| Catalog/role membership and another shard survive meta install/reopen | `nodus_server`: `meta_snapshot_preserves_local_shards_and_recovers_catalog_authorization` |
+| Purged-log learner receives a real HTTP snapshot and reopens | `nodus_server`: `lagging_learner_receives_snapshot_over_tcp_and_reopens_on_lsm` |
+| Local clock remains above installed timestamps after restart | `nodus_server`: `snapshot_reserves_clock_above_incoming_versions_across_restart` |
+
+The legacy wire cannot represent pending intents, tombstones or retained user
+history; builds refuse them, and OpenRaft treats that error as fatal to the group.
+Installation currently materializes a bounded
+checkpoint and pauses the shared engine. It starts a new WAL lineage, requiring
+a new full backup before subsequent incremental/PITR use. Automatic rejection of
+all cross-checkpoint recovery paths, live-reader retention through installation,
+and superseded-file cleanup remain open. See the [snapshot limits and compatibility
+matrix](../explanation/shard-migration-protocol.md#snapshot-limits).
+
 ## Dormant migration recovery
 
 The disabled migration protocol has separate Raft/LSM evidence:
@@ -60,5 +87,5 @@ prove power-loss durability. See the [protocol and compatibility limits](../expl
 | On-disk formats are not backward compatible across the hardening changes (WAL CRC frame, SSTable v2, catalog-in-KV) | Upgrading across those changes requires a clean restart. There is no cross-version on-disk compatibility guarantee yet. |
 | Catalog persistence writes a full-state blob per DDL | Catalog writes are not incremental per entry. |
 | WAL segment retention is not automatic | Superseded segments are retained for point-in-time recovery; reclaiming them is manual. |
-| Runtime fault injection is not wired into the storage engines | `nodus_testkit::FaultInjector` exists, but the low-level storage crates cannot depend on it; the matrix above simulates crash residue on disk instead. |
+| General runtime fault injection is not wired into the storage engines | Snapshot tests have targeted test-only subprocess exit hooks; these and existing disk-residue tests do not establish power-loss durability. |
 | Single-node scope | This contract covers local durability. Replication and cross-node durability are properties of the Raft layer, not of this contract. |

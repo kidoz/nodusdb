@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 pub mod migration;
 pub mod network;
 pub mod server;
+mod snapshots;
 
 openraft::declare_raft_types!(
     /// Declare the type configuration for `openraft`.
@@ -276,7 +277,7 @@ fn table_create_already_applied(
 
 // Reserved keys under which a group's Raft consensus state is persisted into its
 // `KvEngine`. The leading `\0` sorts them before any user/catalog/2PC key, and
-// `build_snapshot` excludes the whole `\0`-prefixed range from the data snapshot.
+// Snapshots exclude node-local Raft records while retaining replicated metadata.
 const RAFT_VOTE_KEY: &[u8] = b"\x00raft\x00vote";
 const RAFT_APPLIED_KEY: &[u8] = b"\x00raft\x00applied";
 const RAFT_LOG_PREFIX: &[u8] = b"\x00raft\x00log\x00";
@@ -341,7 +342,9 @@ fn reconcile_torn_recovery(
     let purged_idx = applied.last_purged.map(|l| l.index).unwrap_or(0);
     let expected = applied_id.index.saturating_sub(purged_idx);
     let present = log.range(purged_idx + 1..=applied_id.index).count() as u64;
-    if present == expected {
+    if present == expected
+        && (expected == 0 || log.get(&applied_id.index).map(|e| e.log_id) == Some(applied_id))
+    {
         return false; // Applied prefix intact — healthy recovery.
     }
     applied.last_purged = Some(applied_id);
@@ -382,6 +385,33 @@ impl RaftMetaStore {
                 return next;
             }
         }
+    }
+
+    fn put_checked(&self, key: &[u8], value: Vec<u8>) -> anyhow::Result<()> {
+        let txn = TxnId::new();
+        let result = (|| {
+            self.kv
+                .write_intent(txn, Bytes::copy_from_slice(key), Bytes::from(value))?;
+            self.kv.commit(txn, self.next_ts())?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = self.kv.abort(txn);
+        }
+        result
+    }
+
+    fn delete_checked(&self, key: &[u8]) -> anyhow::Result<()> {
+        let txn = TxnId::new();
+        let result = (|| {
+            self.kv.delete_intent(txn, Bytes::copy_from_slice(key))?;
+            self.kv.commit(txn, self.next_ts())?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = self.kv.abort(txn);
+        }
+        result
     }
 
     fn put(&self, key: &[u8], value: Vec<u8>) {
@@ -490,12 +520,6 @@ impl RaftMetaStore {
             .flatten()
             .and_then(|b| decode_raft(&b).and_then(|p| serde_json::from_slice(p).ok()))
             .unwrap_or_default()
-    }
-
-    fn save_snapshot_meta(&self, meta: &NodusSnapshotMeta) {
-        if let Ok(bytes) = serde_json::to_vec(meta) {
-            self.put(RAFT_SNAPSHOT_META_KEY, encode_raft(bytes));
-        }
     }
 
     fn load_snapshot_meta(&self) -> Option<NodusSnapshotMeta> {
@@ -723,21 +747,11 @@ impl RaftLogReader<NodusTypeConfig> for NodusRaftStore {
     }
 }
 
-/// The user-data key range a snapshot covers: everything from `0x01` up, i.e.
-/// excluding the `\0`-prefixed reserved keys (Raft log/vote/applied, catalog
-/// state, 2PC records), which are restored by their own mechanisms.
-fn snapshot_user_range() -> nodus_storage_api::KeyRange {
-    nodus_storage_api::KeyRange {
-        start: Bytes::from_static(&[1]),
-        end: Bytes::from(vec![255u8; 1024]),
-    }
-}
-
 // --- Streamed snapshot record format ---------------------------------------
 // [magic "NSNP"][u16 version][u8 has_catalog][u64 len + catalog bytes?]
 // then repeated KV records to EOF: [u64 key_len][key][u64 val_len][val][u64 ver]
-// Records are written in key order (the scan is sorted), and never materialize
-// the whole snapshot in memory on either end.
+// Records are written in key order. The wire is streamed; validation and the
+// atomic storage checkpoint currently materialize bounded state.
 
 // Preserve OpenRaft's required storage-error type at the snapshot boundary.
 #[allow(clippy::result_large_err)]
@@ -828,13 +842,21 @@ async fn read_snapshot_catalog<R: tokio::io::AsyncRead + Unpin>(
             .read_u64()
             .await
             .map_err(|e| snapshot_io_err("catalog len", e))? as usize;
+        if len > nodus_storage_api::snapshot::SNAPSHOT_MEMORY_LIMIT {
+            return Err(snapshot_io_err(
+                "catalog length",
+                "snapshot record too large",
+            ));
+        }
         let mut buf = vec![0u8; len];
         r.read_exact(&mut buf)
             .await
             .map_err(|e| snapshot_io_err("catalog body", e))?;
         Ok(Some(buf))
-    } else {
+    } else if has_catalog == 0 {
         Ok(None)
+    } else {
+        Err(snapshot_io_err("catalog flag", "must be zero or one"))
     }
 }
 
@@ -844,11 +866,21 @@ async fn read_snapshot_catalog<R: tokio::io::AsyncRead + Unpin>(
 async fn read_kv_record<R: tokio::io::AsyncRead + Unpin>(
     r: &mut R,
 ) -> Result<Option<(Vec<u8>, Vec<u8>, u64)>, StorageError<u64>> {
-    let key_len = match r.read_u64().await {
-        Ok(n) => n as usize,
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(snapshot_io_err("read key len", e)),
-    };
+    let mut len_bytes = [0u8; 8];
+    let n = r
+        .read(&mut len_bytes[..1])
+        .await
+        .map_err(|e| snapshot_io_err("read key length", e))?;
+    if n == 0 {
+        return Ok(None);
+    }
+    r.read_exact(&mut len_bytes[1..])
+        .await
+        .map_err(|e| snapshot_io_err("truncated key length", e))?;
+    let key_len = u64::from_be_bytes(len_bytes) as usize;
+    if key_len > nodus_storage_api::snapshot::SNAPSHOT_MEMORY_LIMIT {
+        return Err(snapshot_io_err("key length", "snapshot record too large"));
+    }
     let mut key = vec![0u8; key_len];
     r.read_exact(&mut key)
         .await
@@ -857,6 +889,9 @@ async fn read_kv_record<R: tokio::io::AsyncRead + Unpin>(
         .read_u64()
         .await
         .map_err(|e| snapshot_io_err("read val len", e))? as usize;
+    if val_len > nodus_storage_api::snapshot::SNAPSHOT_MEMORY_LIMIT {
+        return Err(snapshot_io_err("value length", "snapshot record too large"));
+    }
     let mut value = vec![0u8; val_len];
     r.read_exact(&mut value)
         .await
@@ -889,82 +924,9 @@ impl NodusRaftStore {
 
 impl RaftSnapshotBuilder<NodusTypeConfig> for NodusRaftStore {
     async fn build_snapshot(&mut self) -> Result<Snapshot<NodusTypeConfig>, StorageError<u64>> {
-        // Keep this group's applies blocked until the snapshot is complete.
-        // A lazy iterator is not itself a frozen state-machine snapshot: a fence
-        // must agree with the applied index carried by its snapshot header.
-        let sm = self.state_machine.read().await;
-        let (last_log_id, last_membership, catalog, kv) = {
-            (
-                sm.last_applied_log,
-                sm.last_membership.clone(),
-                sm.catalog_reader.as_ref().map(|c| c.export_snapshot()),
-                sm.kv.clone(),
-            )
-        };
-        let catalog_bytes = match catalog {
-            Some(c) => {
-                Some(serde_json::to_vec(&c).map_err(|e| snapshot_io_err("serialize catalog", e))?)
-            }
-            None => None,
-        };
-
-        let tmp = self
-            .snapshot_dir
-            .join(format!("build-{}.tmp", uuid::Uuid::new_v4()));
-        {
-            let file = tokio::fs::File::create(&tmp)
-                .await
-                .map_err(|e| snapshot_io_err("create build tmp", e))?;
-            let mut w = BufWriter::new(file);
-            write_snapshot_header(&mut w, catalog_bytes.as_deref()).await?;
-            if let Some(kv) = kv {
-                let iter = kv
-                    .scan(snapshot_user_range(), u64::MAX)
-                    .map_err(|e| snapshot_io_err("open snapshot scan", e))?;
-                for pair in iter {
-                    let pair = pair.map_err(|e| snapshot_io_err("read snapshot row", e))?;
-                    migration::validate_snapshot_record(
-                        kv.as_ref(),
-                        &pair.key,
-                        &pair.value,
-                        pair.version,
-                    )
-                    .map_err(|e| snapshot_io_err("validate snapshot control record", e))?;
-                    write_kv_record(&mut w, &pair.key, &pair.value, pair.version).await?;
-                }
-            }
-            w.flush()
-                .await
-                .map_err(|e| snapshot_io_err("flush build", e))?;
-            w.into_inner()
-                .sync_all()
-                .await
-                .map_err(|e| snapshot_io_err("fsync build", e))?;
-        }
-
-        // Atomically install as the current snapshot and persist its metadata.
-        let current = self.snapshot_dir.join(CURRENT_SNAPSHOT_FILE);
-        tokio::fs::rename(&tmp, &current)
+        self.build_atomic_snapshot()
             .await
-            .map_err(|e| snapshot_io_err("publish snapshot", e))?;
-        let meta = SnapshotMeta {
-            last_log_id,
-            last_membership,
-            snapshot_id: format!("snapshot-{}", uuid::Uuid::new_v4()),
-        };
-        if let Some(meta_store) = &self.meta {
-            meta_store.save_snapshot_meta(&meta);
-        }
-        *self.current_snapshot_meta.write().await = Some(meta.clone());
-
-        let file = self
-            .open_current_snapshot()
-            .await?
-            .ok_or_else(|| snapshot_io_err("reopen snapshot", "missing after publish"))?;
-        Ok(Snapshot {
-            meta,
-            snapshot: Box::new(file),
-        })
+            .map_err(|e| snapshot_io_err("build snapshot", e))
     }
 }
 
@@ -1340,7 +1302,7 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
         &mut self,
     ) -> Result<Box<tokio::fs::File>, StorageError<u64>> {
         // openraft streams the incoming snapshot's chunks into this file, so the
-        // whole snapshot never lives in memory on the receiving side. Open it
+        // wire transfer is streamed. Installation validates bounded state. Open it
         // read+write: openraft writes the chunks, then `install_snapshot` reads
         // them back.
         let path = self.snapshot_dir.join(RECV_SNAPSHOT_FILE);
@@ -1360,115 +1322,16 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
         meta: &SnapshotMeta<u64, openraft::BasicNode>,
         snapshot: Box<tokio::fs::File>,
     ) -> Result<(), StorageError<u64>> {
-        use bytes::Bytes;
-        use nodus_storage_api::TxnId;
-
-        // Stream-read the received snapshot file, applying records one at a time
-        // so the whole state is never materialized in memory.
-        let mut file = *snapshot;
-        file.seek(SeekFrom::Start(0))
+        self.install_atomic_snapshot(meta, *snapshot)
             .await
-            .map_err(|e| snapshot_io_err("seek receive file", e))?;
-        let mut reader = BufReader::new(file);
-        let catalog_bytes = read_snapshot_catalog(&mut reader).await?;
-
-        let mut sm = self.state_machine.write().await;
-        if let (Some(bytes), Some(cat)) = (&catalog_bytes, &sm.catalog_writer)
-            && let Ok(snap) = serde_json::from_slice::<nodus_catalog::CatalogSnapshot>(bytes)
-        {
-            let _ = cat.import_snapshot(snap);
-        }
-
-        if let Some(kv) = sm.kv.clone() {
-            // Apply the snapshot's keys as they stream in, tracking the key set so
-            // orphans (local keys the snapshot doesn't contain) can be dropped —
-            // an install *replaces* state, it does not merge into a superset.
-            let mut snapshot_keys: std::collections::HashSet<Vec<u8>> =
-                std::collections::HashSet::new();
-            let mut max_version = 0u64;
-            while let Some((k, v, version)) = read_kv_record(&mut reader).await? {
-                migration::validate_snapshot_record(kv.as_ref(), &k, &v, version)
-                    .map_err(|e| snapshot_io_err("validate received control record", e))?;
-                max_version = max_version.max(version);
-                let tid = TxnId::new();
-                // A fresh txn per key, so any error is a genuine restore failure
-                // (not a benign replay duplicate) — surface it.
-                kv.write_intent(tid, Bytes::from(k.clone()), Bytes::from(v))
-                    .and_then(|_| kv.commit(tid, version))
-                    .map_err(|e| snapshot_io_err("install snapshot row", e))?;
-                snapshot_keys.insert(k);
-            }
-
-            let mut orphans = Vec::new();
-            {
-                let iter = kv
-                    .scan(snapshot_user_range(), u64::MAX)
-                    .map_err(|e| snapshot_io_err("scan snapshot orphans", e))?;
-                for pair in iter {
-                    let pair = pair.map_err(|e| snapshot_io_err("read snapshot orphan", e))?;
-                    max_version = max_version.max(pair.version);
-                    if !snapshot_keys.contains(pair.key.as_ref()) {
-                        if migration::is_control_key(&pair.key) {
-                            return Err(snapshot_io_err(
-                                "snapshot missing migration state",
-                                "refusing to remove durable fence or journal",
-                            ));
-                        }
-                        orphans.push(pair.key.to_vec());
-                    }
-                }
-            }
-            // Tombstone orphans above every retained version so they read absent.
-            let clear_version = max_version + 1;
-            for key in orphans {
-                let tid = TxnId::new();
-                kv.delete_intent(tid, Bytes::from(key))
-                    .and_then(|_| kv.commit(tid, clear_version))
-                    .map_err(|e| snapshot_io_err("delete snapshot orphan", e))?;
-            }
-        }
-        // Publish the received snapshot as the durable current one by streaming
-        // it to a temp file and atomically renaming — independent of where the
-        // received file lives — then persist its metadata so the node can serve
-        // it and resume from it after restart.
-        let mut received = reader.into_inner();
-        received
-            .seek(SeekFrom::Start(0))
-            .await
-            .map_err(|e| snapshot_io_err("rewind received snapshot", e))?;
-        let tmp = self
-            .snapshot_dir
-            .join(format!("install-{}.tmp", uuid::Uuid::new_v4()));
-        {
-            let mut out = tokio::fs::File::create(&tmp)
-                .await
-                .map_err(|e| snapshot_io_err("create install tmp", e))?;
-            tokio::io::copy(&mut received, &mut out)
-                .await
-                .map_err(|e| snapshot_io_err("copy received snapshot", e))?;
-            out.sync_all()
-                .await
-                .map_err(|e| snapshot_io_err("fsync install tmp", e))?;
-        }
-        let current = self.snapshot_dir.join(CURRENT_SNAPSHOT_FILE);
-        tokio::fs::rename(&tmp, &current)
-            .await
-            .map_err(|e| snapshot_io_err("publish received snapshot", e))?;
-        if let Some(meta_store) = &self.meta {
-            meta_store.save_snapshot_meta(meta);
-        }
-        *self.current_snapshot_meta.write().await = Some(meta.clone());
-        sm.last_applied_log = meta.last_log_id;
-        sm.last_membership = meta.last_membership.clone();
-        self.persist_applied(&sm);
-
-        Ok(())
+            .map_err(|e| snapshot_io_err("install snapshot", e))
     }
 
     async fn get_current_snapshot(
         &mut self,
     ) -> Result<Option<Snapshot<NodusTypeConfig>>, StorageError<u64>> {
-        let meta = match self.current_snapshot_meta.read().await.clone() {
+        let current = self.current_snapshot_meta.read().await;
+        let meta = match current.clone() {
             Some(meta) => meta,
             None => return Ok(None),
         };

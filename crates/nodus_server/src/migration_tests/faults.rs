@@ -20,6 +20,29 @@ impl FaultEngine {
 }
 
 impl KvEngine for FaultEngine {
+    fn snapshot_rows(
+        &self,
+        scope: &nodus_storage_api::SnapshotScope,
+    ) -> Result<Vec<nodus_storage_api::SnapshotRow>> {
+        anyhow::ensure!(
+            !self.fail_scan.load(Ordering::SeqCst),
+            "injected snapshot read failure"
+        );
+        self.inner.snapshot_rows(scope)
+    }
+    fn replace_snapshot(
+        &self,
+        scope: &nodus_storage_api::SnapshotScope,
+        rows: Vec<nodus_storage_api::SnapshotRow>,
+        pointers: Vec<nodus_storage_api::SnapshotRow>,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            !self.fail_commit.load(Ordering::SeqCst),
+            "injected checkpoint failure"
+        );
+        self.inner.replace_snapshot(scope, rows, pointers)
+    }
+
     fn replace_intent(
         &self,
         txn: TxnId,
@@ -154,6 +177,18 @@ async fn snapshots_fail_instead_of_omitting_or_losing_a_fence() {
             .unwrap()
             .is_none()
     );
+    assert!(
+        !receiver_kv.has_pending_intents(b"\0raft\0").unwrap(),
+        "failed descriptor commit must release its intent for retry"
+    );
+    receiver_kv.fail_commit.store(false, Ordering::SeqCst);
+    let retry = h.store.build_snapshot().await.unwrap();
+    receiver
+        .store
+        .install_snapshot(&retry.meta, retry.snapshot)
+        .await
+        .unwrap();
+    assert!(read_fence(receiver_kv.as_ref()).unwrap().unwrap().closed);
 }
 
 #[tokio::test]

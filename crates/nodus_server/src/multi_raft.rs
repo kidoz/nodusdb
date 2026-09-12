@@ -42,6 +42,33 @@ impl ClockAdvancingKvEngine {
 }
 
 impl KvEngine for ClockAdvancingKvEngine {
+    fn snapshot_rows(
+        &self,
+        scope: &nodus_storage_api::SnapshotScope,
+    ) -> Result<Vec<nodus_storage_api::SnapshotRow>> {
+        self.inner.snapshot_rows(scope)
+    }
+    fn replace_snapshot(
+        &self,
+        scope: &nodus_storage_api::SnapshotScope,
+        rows: Vec<nodus_storage_api::SnapshotRow>,
+        pointers: Vec<nodus_storage_api::SnapshotRow>,
+    ) -> Result<()> {
+        let max_ts = rows
+            .iter()
+            .flat_map(|r| {
+                r.versions
+                    .iter()
+                    .filter(|v| !v.is_intent)
+                    .map(|v| v.version)
+            })
+            .max()
+            .unwrap_or(0);
+        // Reserve the clock before replacement, so a crash cannot restore data
+        // above the durable clock. Advancing it on a failed install is harmless.
+        self.clock.observe_durable(max_ts)?;
+        self.inner.replace_snapshot(scope, rows, pointers)
+    }
     fn has_pending_intents(&self, prefix: &[u8]) -> Result<bool> {
         self.inner.has_pending_intents(prefix)
     }
@@ -770,6 +797,46 @@ mod tests {
     use bytes::Bytes;
     use nodus_storage_api::{KeyRange, TxnId};
     use std::collections::BTreeMap;
+
+    #[test]
+    fn snapshot_reserves_clock_above_incoming_versions_across_restart() {
+        use nodus_storage_api::{SnapshotRow, SnapshotScope};
+        use nodus_txn::TxnManager;
+        let dir = tempfile::tempdir().unwrap();
+        let observed = u64::MAX / 2;
+        {
+            let kv = Arc::new(nodus_storage_lsm::LsmKvEngine::with_wal(dir.path(), None).unwrap());
+            let clock = Arc::new(
+                nodus_txn::MemTxnManager::with_timestamp_store(Arc::new(
+                    crate::KvTimestampStore::new(kv.clone()),
+                ))
+                .unwrap(),
+            );
+            let engine = ClockAdvancingKvEngine::wrap(kv, clock.clone());
+            engine
+                .replace_snapshot(
+                    &SnapshotScope {
+                        exclude_raft: true,
+                        ..Default::default()
+                    },
+                    vec![SnapshotRow::committed(
+                        Bytes::from_static(b"row"),
+                        Bytes::from_static(b"new"),
+                        observed,
+                    )],
+                    vec![],
+                )
+                .unwrap();
+            assert!(clock.begin_txn().unwrap().read_ts > observed);
+        }
+        let kv = Arc::new(nodus_storage_lsm::LsmKvEngine::with_wal(dir.path(), None).unwrap());
+        assert_eq!(kv.get(b"row", observed).unwrap().unwrap().as_ref(), b"new");
+        let clock = nodus_txn::MemTxnManager::with_timestamp_store(Arc::new(
+            crate::KvTimestampStore::new(kv),
+        ))
+        .unwrap();
+        assert!(clock.begin_txn().unwrap().read_ts > observed);
+    }
 
     fn manager() -> MultiRaftManager {
         let config = Arc::new(openraft::Config::default().validate().unwrap());
