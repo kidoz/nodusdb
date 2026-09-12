@@ -1,3 +1,4 @@
+mod epochs;
 mod routing;
 #[cfg(test)]
 mod routing_tests;
@@ -11,7 +12,7 @@ use nodus_storage_api::{
     IntentReplacement, KeyRange, KvEngine, KvPair, KvResult, NamespacedKvEngine, Timestamp, TxnId,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
@@ -29,6 +30,8 @@ const TXN2PC_PREFIX: &[u8] = b"\x00txn2pc\x00";
 struct PendingTxn {
     participants: Vec<String>,
     commit_ts: Timestamp,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    epochs: BTreeMap<String, u64>,
 }
 
 fn record_key(txn_id: &str) -> Vec<u8> {
@@ -56,9 +59,18 @@ pub struct RaftKvEngine {
     pub manager: Arc<MultiRaftManager>,
     /// Groups each in-flight transaction has written to, so `commit`/`abort`
     /// target exactly those groups.
-    pub txn_groups: Mutex<HashMap<TxnId, HashSet<String>>>,
+    pub txn_groups: Mutex<HashMap<TxnId, BTreeMap<String, TxnParticipant>>>,
     /// Observability for the cross-shard commit/recovery paths.
     pub metrics: nodus_monitoring::Metrics,
+}
+
+/// In-memory write set: only acknowledged mutations change `intents`. A
+/// successfully replicated Clear can make a participant empty without losing
+/// the epoch that the still-live transaction must present at prepare/commit.
+#[derive(Clone, Default)]
+pub struct TxnParticipant {
+    epoch: u64,
+    intents: HashSet<Vec<u8>>,
 }
 
 /// Parses the leading `{table_id}` of a row key. Returns `None` for non-row keys
@@ -87,59 +99,92 @@ impl RaftKvEngine {
         (group_id != META_SHARD).then(|| group_id.to_string())
     }
 
-    fn record_txn_group(&self, txn_id: TxnId, group_id: &str) {
-        self.txn_groups
-            .lock()
-            .unwrap()
-            .entry(txn_id)
-            .or_default()
-            .insert(group_id.to_string());
+    /// Capture once, even if a savepoint later clears every intent. A stale
+    /// transaction must fail instead of adopting a newly opened epoch.
+    fn record_txn_group(&self, txn_id: TxnId, group_id: &str) -> Result<u64> {
+        let mut txns = self.txn_groups.lock().unwrap();
+        let groups = txns.entry(txn_id).or_default();
+        if let Some(participant) = groups.get(group_id) {
+            return Ok(participant.epoch);
+        }
+        let epoch = self.current_epoch(group_id)?;
+        groups.insert(
+            group_id.to_string(),
+            TxnParticipant {
+                epoch,
+                intents: HashSet::new(),
+            },
+        );
+        Ok(epoch)
     }
 
-    /// Groups to finalize for `txn_id`: those it wrote to, or the meta group if
-    /// it wrote nothing through this engine (e.g. read-only or overlay-only).
-    fn finalize_targets(&self, txn_id: TxnId) -> Vec<String> {
-        let groups = self
+    fn record_intent(&self, txn: TxnId, group: &str, key: &[u8], live: bool) {
+        if let Some(participant) = self
             .txn_groups
             .lock()
             .unwrap()
-            .remove(&txn_id)
-            .unwrap_or_default();
-        if groups.is_empty() {
-            vec![META_SHARD.to_string()]
-        } else {
-            groups.into_iter().collect()
+            .get_mut(&txn)
+            .and_then(|groups| groups.get_mut(group))
+        {
+            if live {
+                participant.intents.insert(key.to_vec());
+            } else {
+                participant.intents.remove(key);
+            }
         }
     }
 
-    /// Two-phase commit across `participants`. Atomicity rests on a single
-    /// durable decision record in the meta group: the transaction's intents are
-    /// already replicated, so the commit is "all-or-nothing" around that write —
-    /// a crash before it leaves every intent uncommitted (invisible, i.e.
-    /// effectively aborted); a crash after it is repaired by [`Self::recover_pending_txns`],
-    /// which re-drives the commit to every participant.
+    fn finalize_targets(&self, txn_id: TxnId) -> BTreeMap<String, TxnParticipant> {
+        self.txn_groups
+            .lock()
+            .unwrap()
+            .remove(&txn_id)
+            .unwrap_or_default()
+    }
+
+    /// Prepare participants, persist the meta decision, then drive commits.
+    /// Recovery retains the decision's recorded epochs. Uncertain decisions and
+    /// orphan intents still need further recovery work; migration quiescence
+    /// remains blocked while such intents or decisions exist.
     fn commit_cross_shard(
         &self,
         txn_id: TxnId,
-        participants: &[String],
+        targets: &BTreeMap<String, TxnParticipant>,
         commit_ts: Timestamp,
     ) -> Result<()> {
+        let epochs: BTreeMap<String, u64> = targets
+            .iter()
+            .map(|(group, target)| (group.clone(), target.epoch))
+            .collect();
+        let participants: Vec<String> = epochs.keys().cloned().collect();
         let txn = txn_id.0.to_string();
         let _span = tracing::info_span!("txn.cross_shard_commit", txn = %txn, participants = participants.len()).entered();
 
-        // Phase 1 — prepare. Each participant votes whether it can commit: it must
-        // still hold this transaction's intents. Any NO vote — or a participant we
+        // Phase 1 — prepare. Participants verify expected live intents or an
+        // acknowledged savepoint clear. Any NO vote — or a participant we
         // can't reach to ask — aborts the whole transaction before any commit
         // decision is recorded, so a lost intent can never produce a torn commit.
         let mut prepared = true;
-        for group_id in participants {
-            match self.router.submit_voting(
-                group_id,
-                ShardCommand::PrepareTxn {
-                    txn_id: txn.clone(),
-                    shard_id: Self::shard_field(group_id),
-                },
-            ) {
+        for group_id in &participants {
+            let target = &targets[group_id];
+            let cmd = if self.router.migration_enabled() || target.epoch != 0 {
+                ShardCommand::EpochPrepareV2 {
+                    epoch: target.epoch,
+                    txn_id: txn_id.0,
+                    expect_intents: !target.intents.is_empty(),
+                }
+            } else {
+                // Legacy Clear is local; its completed write set is known here.
+                if target.intents.is_empty() {
+                    continue;
+                }
+                self.epoch_command(
+                    group_id,
+                    target.epoch,
+                    nodus_raftstore::migration::EpochMutationV1::Prepare { txn_id: txn_id.0 },
+                )
+            };
+            match self.router.submit_voting(group_id, cmd) {
                 Ok(resp) if resp.success => {}
                 Ok(_) => {
                     tracing::warn!("cross-shard prepare: {group_id} voted NO for txn {txn}");
@@ -158,22 +203,27 @@ impl RaftKvEngine {
         if !prepared {
             // No decision was recorded, so the intents are simply discarded: the
             // transaction commits nowhere. Abort every participant to release them.
-            self.abort_participants(&txn, participants);
+            self.abort_participants(&txn, &participants);
             self.metrics.cross_shard_aborts_total.inc();
             anyhow::bail!("cross-shard transaction aborted: a participant could not prepare");
         }
 
         // Decision point — durably record COMMIT before any participant commits.
-        let record = serde_json::to_vec(&PendingTxn {
+        let record = PendingTxn {
             participants: participants.to_vec(),
             commit_ts,
-        })
-        .map_err(|e| anyhow::anyhow!("encode 2pc record: {e}"))?;
+            epochs: if self.router.migration_enabled() || epochs.values().any(|e| *e != 0) {
+                epochs.clone()
+            } else {
+                BTreeMap::new()
+            },
+        }
+        .encode()?;
         self.meta_put_committed(&record_key(&txn), &record, commit_ts)?;
 
         // Phase 2 — commit every participant, then clear the record. If the
         // clear is lost to a crash, recovery re-commits idempotently and clears.
-        self.drive_commit(&txn, participants, commit_ts)?;
+        self.drive_commit(&txn, &participants, commit_ts, &epochs)?;
         self.meta_delete_committed(&record_key(&txn), commit_ts + 1)?;
         self.metrics.cross_shard_commits_total.inc();
         Ok(())
@@ -195,15 +245,22 @@ impl RaftKvEngine {
         }
     }
 
-    fn drive_commit(&self, txn: &str, participants: &[String], commit_ts: Timestamp) -> Result<()> {
+    fn drive_commit(
+        &self,
+        txn: &str,
+        participants: &[String],
+        commit_ts: Timestamp,
+        epochs: &BTreeMap<String, u64>,
+    ) -> Result<()> {
+        let txn_id = Uuid::parse_str(txn)?;
         for group_id in participants {
             self.router.submit(
                 group_id,
-                ShardCommand::CommitTxn {
-                    txn_id: txn.to_string(),
-                    commit_ts,
-                    shard_id: Self::shard_field(group_id),
-                },
+                self.epoch_command(
+                    group_id,
+                    epochs.get(group_id).copied().unwrap_or(0),
+                    nodus_raftstore::migration::EpochMutationV1::Commit { txn_id, commit_ts },
+                ),
             )?;
         }
         Ok(())
@@ -212,44 +269,57 @@ impl RaftKvEngine {
     /// Writes a committed key/value into the meta group via a synthetic
     /// transaction (used for coordinator records).
     fn meta_put_committed(&self, key: &[u8], value: &[u8], version: Timestamp) -> Result<()> {
-        let coord = TxnId::new().0.to_string();
+        let coord = TxnId::new().0;
+        let epoch = self.current_epoch(META_SHARD)?;
         self.router.submit(
             META_SHARD,
-            ShardCommand::PutIntent {
-                txn_id: coord.clone(),
-                key: key.to_vec(),
-                value: value.to_vec(),
-                shard_id: None,
-            },
+            self.epoch_command(
+                META_SHARD,
+                epoch,
+                nodus_raftstore::migration::EpochMutationV1::Put {
+                    txn_id: coord,
+                    key: key.to_vec(),
+                    value: value.to_vec(),
+                },
+            ),
         )?;
         self.router.submit(
             META_SHARD,
-            ShardCommand::CommitTxn {
-                txn_id: coord,
-                commit_ts: version,
-                shard_id: None,
-            },
+            self.epoch_command(
+                META_SHARD,
+                epoch,
+                nodus_raftstore::migration::EpochMutationV1::Commit {
+                    txn_id: coord,
+                    commit_ts: version,
+                },
+            ),
         )
     }
 
-    /// Tombstones a committed key in the meta group (clears a coordinator record).
     fn meta_delete_committed(&self, key: &[u8], version: Timestamp) -> Result<()> {
-        let coord = TxnId::new().0.to_string();
+        let coord = TxnId::new().0;
+        let epoch = self.current_epoch(META_SHARD)?;
         self.router.submit(
             META_SHARD,
-            ShardCommand::DeleteIntent {
-                txn_id: coord.clone(),
-                key: key.to_vec(),
-                shard_id: None,
-            },
+            self.epoch_command(
+                META_SHARD,
+                epoch,
+                nodus_raftstore::migration::EpochMutationV1::Delete {
+                    txn_id: coord,
+                    key: key.to_vec(),
+                },
+            ),
         )?;
         self.router.submit(
             META_SHARD,
-            ShardCommand::CommitTxn {
-                txn_id: coord,
-                commit_ts: version,
-                shard_id: None,
-            },
+            self.epoch_command(
+                META_SHARD,
+                epoch,
+                nodus_raftstore::migration::EpochMutationV1::Commit {
+                    txn_id: coord,
+                    commit_ts: version,
+                },
+            ),
         )
     }
 
@@ -266,25 +336,18 @@ impl RaftKvEngine {
             end: Bytes::from(end),
         };
 
-        let pending: Vec<(Vec<u8>, PendingTxn)> = self
-            .local
-            .scan(range, u64::MAX)?
-            .filter_map(|r| r.ok())
-            .filter_map(|pair| {
-                serde_json::from_slice::<PendingTxn>(&pair.value)
-                    .ok()
-                    .map(|rec| (pair.key.to_vec(), rec))
-            })
-            .collect();
-
         let mut repaired = 0;
-        for (key, rec) in pending {
-            let Some(txn) = key.strip_prefix(TXN2PC_PREFIX) else {
-                continue;
-            };
-            let txn = String::from_utf8_lossy(txn).into_owned();
-            self.drive_commit(&txn, &rec.participants, rec.commit_ts)?;
-            self.meta_delete_committed(&key, rec.commit_ts + 1)?;
+        for pair in self.local.scan(range, u64::MAX)? {
+            let pair = pair?;
+            let rec = PendingTxn::decode(&pair.value)?;
+            let txn = std::str::from_utf8(&pair.key[TXN2PC_PREFIX.len()..])?;
+            self.drive_commit(txn, &rec.participants, rec.commit_ts, &rec.epochs)?;
+            self.meta_delete_committed(
+                &pair.key,
+                rec.commit_ts
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("2PC timestamp exhausted"))?,
+            )?;
             repaired += 1;
         }
         self.metrics.txn_recoveries_total.inc_by(repaired as u64);
@@ -319,25 +382,35 @@ impl KvEngine for RaftKvEngine {
 
     fn write_intent(&self, txn_id: TxnId, key: Bytes, value: Bytes) -> KvResult<()> {
         let group_id = self.route(&key)?;
-        self.record_txn_group(txn_id, &group_id);
-        let cmd = ShardCommand::PutIntent {
-            txn_id: txn_id.0.to_string(),
-            key: key.to_vec(),
-            value: value.to_vec(),
-            shard_id: Self::shard_field(&group_id),
-        };
-        Ok(self.router.submit(&group_id, cmd)?)
+        let epoch = self.record_txn_group(txn_id, &group_id)?;
+        let cmd = self.epoch_command(
+            &group_id,
+            epoch,
+            nodus_raftstore::migration::EpochMutationV1::Put {
+                txn_id: txn_id.0,
+                key: key.to_vec(),
+                value: value.to_vec(),
+            },
+        );
+        self.router.submit(&group_id, cmd)?;
+        self.record_intent(txn_id, &group_id, &key, true);
+        Ok(())
     }
 
     fn delete_intent(&self, txn_id: TxnId, key: Bytes) -> KvResult<()> {
         let group_id = self.route(&key)?;
-        self.record_txn_group(txn_id, &group_id);
-        let cmd = ShardCommand::DeleteIntent {
-            txn_id: txn_id.0.to_string(),
-            key: key.to_vec(),
-            shard_id: Self::shard_field(&group_id),
-        };
-        Ok(self.router.submit(&group_id, cmd)?)
+        let epoch = self.record_txn_group(txn_id, &group_id)?;
+        let cmd = self.epoch_command(
+            &group_id,
+            epoch,
+            nodus_raftstore::migration::EpochMutationV1::Delete {
+                txn_id: txn_id.0,
+                key: key.to_vec(),
+            },
+        );
+        self.router.submit(&group_id, cmd)?;
+        self.record_intent(txn_id, &group_id, &key, true);
+        Ok(())
     }
 
     fn replace_intent(
@@ -346,42 +419,58 @@ impl KvEngine for RaftKvEngine {
         key: Bytes,
         replacement: IntentReplacement,
     ) -> KvResult<()> {
-        // Savepoint overlay fix-up is applied locally (not replicated), against
-        // the same engine view the key's writes target.
         let group_id = self.route(&key)?;
-        self.engine_for(&group_id)
-            .replace_intent(txn_id, key, replacement)
+        let epoch = self.record_txn_group(txn_id, &group_id)?;
+        let live = !matches!(replacement, IntentReplacement::Clear);
+        if self.router.migration_enabled() || epoch != 0 {
+            self.router.submit(
+                &group_id,
+                ShardCommand::EpochRepairV2 {
+                    epoch,
+                    txn_id: txn_id.0,
+                    key: key.to_vec(),
+                    replacement: replacement.into(),
+                },
+            )?;
+        } else {
+            self.router
+                .repair_legacy(&group_id, txn_id, key.clone(), replacement)?;
+        }
+        self.record_intent(txn_id, &group_id, &key, live);
+        Ok(())
     }
 
     fn commit(&self, txn_id: TxnId, commit_ts: Timestamp) -> KvResult<()> {
         let targets = self.finalize_targets(txn_id);
-        let result = if targets.len() <= 1 {
-            // Single-shard (incl. meta fallback): one atomic group commit.
-            let group_id = targets
-                .into_iter()
-                .next()
-                .unwrap_or_else(|| META_SHARD.to_string());
-            self.router.submit(
-                &group_id,
-                ShardCommand::CommitTxn {
-                    txn_id: txn_id.0.to_string(),
-                    commit_ts,
-                    shard_id: Self::shard_field(&group_id),
-                },
-            )
+        if targets.len() <= 1 {
+            for (group, target) in &targets {
+                self.router.submit(
+                    group,
+                    self.epoch_command(
+                        group,
+                        target.epoch,
+                        nodus_raftstore::migration::EpochMutationV1::Commit {
+                            txn_id: txn_id.0,
+                            commit_ts,
+                        },
+                    ),
+                )?;
+            }
         } else {
-            self.commit_cross_shard(txn_id, &targets, commit_ts)
-        };
-        Ok(result?)
+            self.commit_cross_shard(txn_id, &targets, commit_ts)?;
+        }
+        Ok(())
     }
 
     fn abort(&self, txn_id: TxnId) -> KvResult<()> {
-        for group_id in self.finalize_targets(txn_id) {
-            let cmd = ShardCommand::AbortTxn {
-                txn_id: txn_id.0.to_string(),
-                shard_id: Self::shard_field(&group_id),
-            };
-            self.router.submit(&group_id, cmd)?;
+        for group_id in self.finalize_targets(txn_id).keys() {
+            self.router.submit(
+                group_id,
+                ShardCommand::AbortTxn {
+                    txn_id: txn_id.0.to_string(),
+                    shard_id: Self::shard_field(group_id),
+                },
+            )?;
         }
         Ok(())
     }
@@ -752,12 +841,18 @@ mod tests {
             let record = serde_json::to_vec(&PendingTxn {
                 participants: vec![group_t.clone(), group_u.clone()],
                 commit_ts: 10,
+                epochs: BTreeMap::new(),
             })
             .unwrap();
             e.meta_put_committed(&record_key(&txn_str), &record, 10)
                 .unwrap();
-            e.drive_commit(&txn_str, std::slice::from_ref(&group_t), 10)
-                .unwrap(); // only T commits
+            e.drive_commit(
+                &txn_str,
+                std::slice::from_ref(&group_t),
+                10,
+                &BTreeMap::new(),
+            )
+            .unwrap(); // only T commits
             txn_str
         })
         .await
@@ -787,5 +882,116 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(again, 0, "txn {txn_str} record should be cleared");
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn epoch_decisions_recover_without_restamping_participants() {
+        let mut fx = setup_two_shards().await;
+        Arc::get_mut(&mut fx.engine)
+            .unwrap()
+            .router
+            .enable_migration_for_test();
+        for group in [&fx.group_t, &fx.group_u] {
+            let raft = fx.engine.manager.get(group).await.unwrap();
+            let operation_id = Uuid::new_v4();
+            for command in [
+                nodus_raftstore::migration::MigrationCommandV1::Acquire {
+                    operation_id,
+                    expected_epoch: 0,
+                },
+                nodus_raftstore::migration::MigrationCommandV1::Release {
+                    operation_id,
+                    epoch: 1,
+                },
+            ] {
+                assert!(
+                    raft.client_write(ShardCommand::MigrationV1(command))
+                        .await
+                        .unwrap()
+                        .data
+                        .success
+                );
+            }
+        }
+        let row_t = Bytes::from(format!("{}:pk", fx.table_t));
+        let row_u = Bytes::from(format!("{}:pk", fx.table_u));
+        let e = fx.engine.clone();
+        let groups = vec![fx.group_t, fx.group_u];
+        tokio::task::spawn_blocking(move || {
+            let txn = TxnId::new();
+            e.write_intent(txn, row_t.clone(), Bytes::from_static(b"t"))
+                .unwrap();
+            e.write_intent(txn, row_u.clone(), Bytes::from_static(b"u"))
+                .unwrap();
+            let epochs = groups.iter().map(|group| (group.clone(), 1)).collect();
+            let record = PendingTxn {
+                participants: groups.clone(),
+                commit_ts: 100,
+                epochs,
+            };
+            let bytes = record.encode().unwrap();
+            assert!(matches!(
+                nodus_common::versioned::decode(&bytes),
+                nodus_common::versioned::Envelope::Versioned { version: 2, .. }
+            ));
+            e.meta_put_committed(&record_key(&txn.0.to_string()), &bytes, 100)
+                .unwrap();
+            e.drive_commit(&txn.0.to_string(), &groups[..1], 100, &record.epochs)
+                .unwrap();
+            let recovered = RaftKvEngine {
+                local: e.local.clone(),
+                router: e.router.clone(),
+                shard_router: e.shard_router.clone(),
+                manager: e.manager.clone(),
+                txn_groups: Mutex::new(HashMap::new()),
+                metrics: Default::default(),
+            };
+            assert_eq!(recovered.recover_pending_txns().unwrap(), 1);
+            assert_eq!(
+                recovered.get(&row_t, 100).unwrap(),
+                Some(Bytes::from_static(b"t"))
+            );
+            assert_eq!(
+                recovered.get(&row_u, 100).unwrap(),
+                Some(Bytes::from_static(b"u"))
+            );
+            assert_eq!(recovered.recover_pending_txns().unwrap(), 0);
+            // An old decision must fail, not be silently restamped to epoch 1.
+            let stale = TxnId::new();
+            e.write_intent(stale, row_t.clone(), Bytes::from_static(b"bad"))
+                .unwrap();
+            let record = PendingTxn {
+                participants: groups[..1].to_vec(),
+                commit_ts: 200,
+                epochs: BTreeMap::from([(groups[0].clone(), 0)]),
+            };
+            e.meta_put_committed(
+                &record_key(&stale.0.to_string()),
+                &record.encode().unwrap(),
+                200,
+            )
+            .unwrap();
+            assert!(recovered.recover_pending_txns().is_err());
+            assert_eq!(
+                recovered.get(&row_t, 200).unwrap(),
+                Some(Bytes::from_static(b"t"))
+            );
+            e.abort(stale).unwrap();
+        })
+        .await
+        .unwrap();
+        fx.engine.manager.shutdown_all().await;
+    }
+
+    #[test]
+    fn decision_formats_preserve_legacy_bytes_and_reject_unknown_epochs() {
+        let legacy = br#"{"participants":["a"],"commit_ts":7}"#;
+        let record = PendingTxn::decode(legacy).unwrap();
+        assert_eq!(record.encode().unwrap(), legacy);
+        assert!(PendingTxn::decode(&nodus_common::versioned::encode(99, legacy)).is_err());
+        assert!(PendingTxn::decode(&nodus_common::versioned::encode(2, legacy)).is_err());
+        assert!(
+            PendingTxn::decode(br#"{"participants":["a"],"commit_ts":7,"epochs":{"a":1}}"#)
+                .is_err()
+        );
     }
 }

@@ -125,6 +125,9 @@ pub struct MultiRaftManager {
     /// KV write/read path can check group membership without awaiting the
     /// async `RaftState` lock. Always updated alongside `state`.
     hosted: Arc<RwLock<HashSet<String>>>,
+    machines: tokio::sync::RwLock<
+        std::collections::HashMap<String, Arc<tokio::sync::RwLock<nodus_raftstore::StateMachine>>>,
+    >,
     /// Bearer token presented when asking a peer to instantiate a replica of a
     /// data group (the `/api/v1/shards/{group}/replica` admin endpoint).
     admin_token: Option<String>,
@@ -167,12 +170,53 @@ impl MultiRaftManager {
             state,
             base_kv,
             hosted: Arc::new(RwLock::new(HashSet::new())),
+            machines: tokio::sync::RwLock::new(std::collections::HashMap::new()),
             admin_token,
             http: std::sync::OnceLock::new(),
             clock,
             data_dir,
             transport,
         }
+    }
+
+    pub(crate) async fn machine(
+        &self,
+        group: &str,
+    ) -> Result<Arc<tokio::sync::RwLock<nodus_raftstore::StateMachine>>> {
+        self.machines
+            .read()
+            .await
+            .get(group)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("raft group '{group}' not found"))
+    }
+
+    /// Pre-activation savepoint behavior remains local, but now shares the
+    /// participant apply lock with fence acquisition. Active protocol repairs
+    /// must instead be replicated with EpochRepairV2.
+    pub(crate) async fn repair_legacy(
+        &self,
+        group: &str,
+        txn: nodus_storage_api::TxnId,
+        key: bytes::Bytes,
+        replacement: nodus_storage_api::IntentReplacement,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            !key.starts_with(b"\x01migration/"),
+            "reserved migration key"
+        );
+        let machine = self.machine(group).await?;
+        let sm = machine.write().await;
+        let kv = sm
+            .kv
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("participant storage is absent"))?;
+        anyhow::ensure!(
+            nodus_raftstore::migration::read_fence(kv.as_ref())?.is_none(),
+            "shard routing changed: epoch required for savepoint repair"
+        );
+        kv.replace_intent(txn, key, replacement)?;
+        Ok(())
     }
 
     /// This node's cluster id. It is the value shard placements are keyed by:
@@ -264,6 +308,7 @@ impl MultiRaftManager {
     /// returns the handle. The network factory carries `shard_id` so RPCs are
     /// routed to `/raft/{shard_id}/...` on peers.
     async fn spawn_group(&self, shard_id: &str, store: NodusRaftStore) -> Result<NodusRaft> {
+        let machine = store.state_machine.clone();
         let (log_store, state_machine) = openraft::storage::Adaptor::new(store);
         let network = NodusNetworkFactory::new(shard_id.to_string(), self.transport.clone());
         let raft = NodusRaft::new(
@@ -280,6 +325,10 @@ impl MultiRaftManager {
             .write()
             .await
             .insert(shard_id.to_string(), raft.clone());
+        self.machines
+            .write()
+            .await
+            .insert(shard_id.to_string(), machine);
         self.hosted.write().unwrap().insert(shard_id.to_string());
         Ok(raft)
     }
@@ -512,6 +561,7 @@ impl MultiRaftManager {
             .map(|(_, r)| r)
             .collect();
         self.hosted.write().unwrap().clear();
+        self.machines.write().await.clear();
         for raft in groups {
             let _ = raft.shutdown().await;
         }
@@ -524,6 +574,7 @@ impl MultiRaftManager {
     pub async fn remove_group(&self, group_id: &str) -> Result<()> {
         let raft = self.state.rafts.write().await.remove(group_id);
         self.hosted.write().unwrap().remove(group_id);
+        self.machines.write().await.remove(group_id);
         if let Some(raft) = raft {
             let _ = raft.shutdown().await;
         }

@@ -42,6 +42,16 @@ on-disk state a crash would leave.
 | Rolled-back writes never visible, before or after restart | `tests/fault`: `rolled_back_writes_are_never_visible` |
 | Point-in-time restore replays archived WAL to a target time | `tests/integration`: `admin_backup_pitr_restore` |
 
+## Dormant migration recovery
+
+The disabled migration protocol has separate Raft/LSM evidence:
+`coordinator_resumes_after_abrupt_process_exit_before_ack` exits a subprocess
+without shutdown after acquire acknowledgement, then reopens the same LSM
+storage and resumes the coordinator from its journal. The real-TCP test
+`coordinator_journal_resumes_on_new_tcp_leader_without_acquire_ack` exercises
+leader loss at that boundary. These tests do not enable online migration or
+prove power-loss durability. See the [protocol and compatibility limits](../explanation/shard-migration-protocol.md).
+
 ## Limitations
 
 | Limitation | Consequence |

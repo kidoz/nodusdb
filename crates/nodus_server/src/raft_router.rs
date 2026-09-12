@@ -42,6 +42,13 @@ enum RouterRequest {
         cmd: ShardCommand,
         resp: oneshot::Sender<WriteResult>,
     },
+    RepairLegacy {
+        shard_id: String,
+        txn: nodus_storage_api::TxnId,
+        key: bytes::Bytes,
+        replacement: nodus_storage_api::IntentReplacement,
+        resp: oneshot::Sender<Result<()>>,
+    },
     Barrier {
         shard_id: String,
         resp: oneshot::Sender<Result<()>>,
@@ -53,6 +60,8 @@ enum RouterRequest {
 #[derive(Clone)]
 pub struct RaftRouter {
     tx: mpsc::UnboundedSender<RouterRequest>,
+    #[cfg(test)]
+    migration_enabled: bool,
 }
 
 impl RaftRouter {
@@ -73,13 +82,33 @@ impl RaftRouter {
             while let Some(req) = rx.recv().await {
                 let shard_id = match &req {
                     RouterRequest::Write { shard_id, .. } => shard_id.clone(),
-                    RouterRequest::Barrier { shard_id, .. } => shard_id.clone(),
+                    RouterRequest::Barrier { shard_id, .. }
+                    | RouterRequest::RepairLegacy { shard_id, .. } => shard_id.clone(),
                 };
                 let raft = manager.get(&shard_id).await;
                 let http = http.clone();
                 // Drive each request concurrently so independent submissions do
                 // not serialize behind one another.
                 match (raft, req) {
+                    (
+                        _,
+                        RouterRequest::RepairLegacy {
+                            txn,
+                            key,
+                            replacement,
+                            resp,
+                            ..
+                        },
+                    ) => {
+                        let manager = manager.clone();
+                        tokio::spawn(async move {
+                            let _ = resp.send(
+                                manager
+                                    .repair_legacy(&shard_id, txn, key, replacement)
+                                    .await,
+                            );
+                        });
+                    }
                     (Some(raft), RouterRequest::Write { cmd, resp, .. }) => {
                         tokio::spawn(async move {
                             let res = replicate(raft, &shard_id, cmd, &http).await;
@@ -101,7 +130,49 @@ impl RaftRouter {
                 }
             }
         });
-        Self { tx }
+        Self {
+            tx,
+            #[cfg(test)]
+            migration_enabled: false,
+        }
+    }
+
+    pub(crate) fn migration_enabled(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.migration_enabled
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    }
+
+    /// Isolated fixtures only: no config flag or production activation bypass.
+    #[cfg(test)]
+    pub(crate) fn enable_migration_for_test(&mut self) {
+        self.migration_enabled = true;
+    }
+
+    pub(crate) fn repair_legacy(
+        &self,
+        shard_id: &str,
+        txn: nodus_storage_api::TxnId,
+        key: bytes::Bytes,
+        replacement: nodus_storage_api::IntentReplacement,
+    ) -> Result<()> {
+        let (resp, rx) = oneshot::channel();
+        self.tx
+            .send(RouterRequest::RepairLegacy {
+                shard_id: shard_id.to_string(),
+                txn,
+                key,
+                replacement,
+                resp,
+            })
+            .map_err(|_| anyhow!("raft router dispatcher stopped"))?;
+        rx.blocking_recv()
+            .map_err(|_| anyhow!("raft router dropped repair response"))?
     }
 
     /// Replicate `cmd` to `shard_id` and block until it is applied on the leader.
@@ -131,7 +202,7 @@ impl RaftRouter {
 
     fn submit_inner(&self, shard_id: &str, cmd: ShardCommand) -> Result<ShardResponse> {
         anyhow::ensure!(
-            !cmd.requires_migration_protocol(),
+            !cmd.requires_migration_protocol() || self.migration_enabled(),
             "migration protocol activation requires verified cluster-wide compatibility"
         );
         let (resp_tx, resp_rx) = oneshot::channel();

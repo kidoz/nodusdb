@@ -1,6 +1,9 @@
 //! R3 protocol foundation. All transitions run under the owning group's Raft
 //! apply lock. Network activation is deliberately disabled until cluster-wide
-//! format negotiation and the migration coordinator are implemented.
+//! format negotiation and the remaining copy/cutover protocol are implemented.
+
+pub mod coordinator;
+pub mod writes;
 
 use anyhow::{Result, bail};
 use bytes::Bytes;
@@ -116,7 +119,7 @@ fn decode_record<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
 }
 
 pub(crate) fn is_control_key(key: &[u8]) -> bool {
-    key.starts_with(PREFIX)
+    key.starts_with(PREFIX) || key.starts_with(coordinator::JOURNAL_PREFIX)
 }
 
 /// Snapshots cannot delete or roll back durable migration state.
@@ -141,6 +144,12 @@ pub(crate) fn validate_snapshot_record(
                 "snapshot fence owner conflicts at the same epoch"
             );
         }
+    } else if key.starts_with(coordinator::JOURNAL_PREFIX) {
+        let record = coordinator::decode(value)?;
+        anyhow::ensure!(
+            coordinator::key(record.plan.migration.table_id) == key,
+            "snapshot coordinator key does not match table"
+        );
     } else {
         let _: MigrationRecord = decode_record(value)?;
     }
@@ -165,8 +174,18 @@ pub(crate) fn validate_snapshot_record(
 }
 
 fn write(kv: &dyn KvEngine, key: &[u8], record: &impl Serialize, index: u64) -> Result<()> {
+    write_version(kv, key, record, index, RECORD_VERSION)
+}
+
+fn write_version(
+    kv: &dyn KvEngine,
+    key: &[u8],
+    record: &impl Serialize,
+    index: u64,
+    version: u16,
+) -> Result<()> {
     let value = Bytes::from(nodus_common::versioned::encode(
-        RECORD_VERSION,
+        version,
         &serde_json::to_vec(record)?,
     ));
     // Raft replay above the applied watermark uses the same intent identity.
@@ -204,6 +223,58 @@ fn accepted() -> ShardResponse {
     }
 }
 
+fn clean_control_intent(kv: &dyn KvEngine, key: &[u8], index: u64) -> Result<()> {
+    let mut identity = key.to_vec();
+    identity.extend_from_slice(&index.to_be_bytes());
+    let txn = TxnId(Uuid::new_v5(&Uuid::NAMESPACE_OID, &identity));
+    if !kv.pending_intent_keys(txn).is_empty() {
+        kv.abort(txn)?;
+    }
+    Ok(())
+}
+
+fn valid_plan(plan: &MigrationPlan) -> bool {
+    let valid_groups = |groups: &[String]| {
+        !groups.is_empty()
+            && groups.len() <= 128
+            && groups.iter().all(|s| !s.is_empty() && s.len() <= 128)
+            && groups
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+                == groups.len()
+    };
+    !(!valid_groups(&plan.sources)
+        || !valid_groups(&plan.destinations)
+        || plan.sources.iter().any(|s| plan.destinations.contains(s))
+        || plan.source_epochs.len() != plan.sources.len()
+        || plan
+            .sources
+            .iter()
+            .any(|source| !plan.source_epochs.contains_key(source))
+        || plan.source_epochs.values().any(|epoch| *epoch == u64::MAX))
+}
+
+/// The meta group is fenced first. A durable 2PC decision must be recovered
+/// before fencing: a participant with no remaining intents may still need an
+/// idempotent commit acknowledgement at its original epoch.
+fn quiescent(kv: &dyn KvEngine, is_meta: bool) -> Result<bool> {
+    if kv.has_pending_intents(b"")? {
+        return Ok(false);
+    }
+    if is_meta {
+        let range = nodus_storage_api::KeyRange {
+            start: Bytes::from_static(b"\x00txn2pc\x00"),
+            end: Bytes::from_static(b"\x00txn2pc\x01"),
+        };
+        if let Some(pair) = kv.scan(range, u64::MAX)?.next() {
+            pair?;
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 fn apply_control(
     kv: &dyn KvEngine,
     cmd: &MigrationCommandV1,
@@ -219,38 +290,17 @@ fn apply_control(
         | MigrationCommandV1::RequestCancel { table_id, .. } => journal_key(*table_id),
         _ => FENCE_KEY.to_vec(),
     };
-    let mut identity = key;
-    identity.extend_from_slice(&index.to_be_bytes());
-    let txn = TxnId(Uuid::new_v5(&Uuid::NAMESPACE_OID, &identity));
-    if !kv.pending_intent_keys(txn).is_empty() {
-        kv.abort(txn)?;
-    }
+    clean_control_intent(kv, &key, index)?;
     match cmd {
         MigrationCommandV1::Plan(plan) => {
             if !is_meta {
                 return Ok(reject("migration journal belongs to the meta group"));
             }
-            let valid_groups = |groups: &[String]| {
-                !groups.is_empty()
-                    && groups.len() <= 128
-                    && groups.iter().all(|s| !s.is_empty() && s.len() <= 128)
-                    && groups
-                        .iter()
-                        .collect::<std::collections::HashSet<_>>()
-                        .len()
-                        == groups.len()
-            };
-            if !valid_groups(&plan.sources)
-                || !valid_groups(&plan.destinations)
-                || plan.sources.iter().any(|s| plan.destinations.contains(s))
-                || plan.source_epochs.len() != plan.sources.len()
-                || plan
-                    .sources
-                    .iter()
-                    .any(|source| !plan.source_epochs.contains_key(source))
-                || plan.source_epochs.values().any(|epoch| *epoch == u64::MAX)
-            {
+            if !valid_plan(plan) {
                 return Ok(reject("invalid migration plan"));
+            }
+            if coordinator::read_record_v2(kv, plan.table_id)?.is_some() {
+                return Ok(reject("V2 journal prevents legacy coordinator planning"));
             }
             if let Some(current) = read_record(kv, plan.table_id)? {
                 return Ok(if current.plan == *plan {
@@ -323,9 +373,9 @@ fn apply_control(
             if current.as_ref().map_or(0, |f| f.epoch) != *expected_epoch {
                 return Ok(reject("stale participant epoch"));
             }
-            if kv.has_pending_intents(b"")? {
+            if !quiescent(kv, is_meta)? {
                 return Ok(reject(
-                    "participant has pending intents; drain transactions before fencing",
+                    "participant has pending intents or decisions; recover/drain transactions before fencing",
                 ));
             }
             write(
@@ -366,12 +416,36 @@ pub(crate) fn apply(
     kv: &dyn KvEngine,
     cmd: &ShardCommand,
     index: u64,
-    is_meta: bool,
+    meta: Option<&std::sync::Arc<dyn nodus_meta::MetaStore>>,
 ) -> Result<Option<ShardResponse>> {
     match cmd {
         ShardCommand::MigrationV1(command) => {
-            return apply_control(kv, command, index, is_meta).map(Some);
+            return apply_control(kv, command, index, meta.is_some()).map(Some);
         }
+        ShardCommand::EpochPrepareV2 {
+            epoch,
+            txn_id,
+            expect_intents,
+        } => {
+            let fence = read_fence(kv)?;
+            let valid =
+                fence.as_ref().map_or(0, |f| f.epoch) == *epoch && !fence.is_some_and(|f| f.closed);
+            let live = !kv.pending_intent_keys(TxnId(*txn_id)).is_empty();
+            return Ok(Some(if valid && live == *expect_intents {
+                accepted()
+            } else {
+                reject("stale epoch or unexpected participant intents")
+            }));
+        }
+        ShardCommand::MigrationV2(command) => {
+            return coordinator::apply_v2(kv, command, index, meta).map(Some);
+        }
+        ShardCommand::EpochRepairV2 {
+            epoch,
+            txn_id,
+            key,
+            replacement,
+        } => return writes::apply_repair(kv, *epoch, *txn_id, key, replacement).map(Some),
         ShardCommand::EpochWriteV1 { epoch, mutation } => {
             let fence = read_fence(kv)?;
             if fence.as_ref().map_or(0, |f| f.epoch) != *epoch
@@ -383,7 +457,7 @@ pub(crate) fn apply(
             }
             let result = match mutation {
                 EpochMutationV1::Put { txn_id, key, value } => {
-                    if key.starts_with(PREFIX) {
+                    if is_control_key(key) {
                         return Ok(Some(reject("reserved migration key")));
                     }
                     kv.write_intent(
@@ -393,7 +467,7 @@ pub(crate) fn apply(
                     )
                 }
                 EpochMutationV1::Delete { txn_id, key } => {
-                    if key.starts_with(PREFIX) {
+                    if is_control_key(key) {
                         return Ok(Some(reject("reserved migration key")));
                     }
                     kv.delete_intent(TxnId(*txn_id), Bytes::copy_from_slice(key))
@@ -424,11 +498,25 @@ pub(crate) fn apply(
         | ShardCommand::DeleteIntent { key, .. }
         | ShardCommand::IndexPutIntent { key, .. }
         | ShardCommand::IndexDeleteIntent { key, .. } => {
-            if key.starts_with(PREFIX) {
+            if is_control_key(key) {
                 return Ok(Some(reject("reserved migration key")));
             }
         }
         ShardCommand::PrepareTxn { .. } | ShardCommand::CommitTxn { .. } => {}
+        ShardCommand::CreateDatabase(_)
+        | ShardCommand::CreateSchema(_)
+        | ShardCommand::CreateTable(_)
+        | ShardCommand::DropTable(_)
+        | ShardCommand::DropSchema(_)
+        | ShardCommand::UpdateTableDescriptor(_)
+        | ShardCommand::UpdateIndexState { .. }
+        | ShardCommand::ImportCatalogSnapshot(_)
+        | ShardCommand::UpdateShardMap(_)
+        | ShardCommand::UpdateShardPlacements(_) => {
+            return Ok(read_fence(kv)?
+                .filter(|f| f.closed)
+                .map(|_| reject("schema/routing changes are fenced")));
+        }
         _ => return Ok(None), // Abort remains available to drain old transactions.
     }
     Ok(read_fence(kv)?.map(|_| reject("epoch is required on this participant; retry transaction")))

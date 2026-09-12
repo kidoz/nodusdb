@@ -1,4 +1,5 @@
 mod cluster;
+mod coordinator;
 mod faults;
 use bytes::Bytes;
 use nodus_catalog::TableId;

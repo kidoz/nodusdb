@@ -148,11 +148,30 @@ pub enum ShardCommand {
         epoch: u64,
         mutation: migration::EpochMutationV1,
     },
+    MigrationV2(migration::coordinator::CommandV2),
+    EpochPrepareV2 {
+        epoch: u64,
+        txn_id: uuid::Uuid,
+        expect_intents: bool,
+    },
+    EpochRepairV2 {
+        epoch: u64,
+        txn_id: uuid::Uuid,
+        key: Vec<u8>,
+        replacement: migration::writes::ReplacementV2,
+    },
 }
 
 impl ShardCommand {
     pub fn requires_migration_protocol(&self) -> bool {
-        matches!(self, Self::MigrationV1(_) | Self::EpochWriteV1 { .. })
+        matches!(
+            self,
+            Self::MigrationV1(_)
+                | Self::EpochWriteV1 { .. }
+                | Self::MigrationV2(_)
+                | Self::EpochRepairV2 { .. }
+                | Self::EpochPrepareV2 { .. }
+        )
     }
 }
 
@@ -1058,7 +1077,7 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
                             kv.as_ref(),
                             cmd,
                             entry.log_id.index,
-                            sm.meta_store.is_some(),
+                            sm.meta_store.as_ref(),
                         )
                         .map_err(|e| {
                             StorageIOError::write_state_machine(AnyError::error(format!(

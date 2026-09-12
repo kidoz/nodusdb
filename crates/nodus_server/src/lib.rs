@@ -1,5 +1,6 @@
 #![allow(clippy::collapsible_if)]
 mod admin;
+pub mod migration_coordinator;
 #[cfg(test)]
 mod migration_tests;
 mod multi_raft;
