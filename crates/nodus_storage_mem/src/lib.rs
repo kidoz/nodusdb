@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::RwLock;
 
 pub struct MemKvEngine {
+    snapshot_gate: RwLock<()>,
     // simplified: key -> version chain
     store: RwLock<BTreeMap<Bytes, VersionChain>>,
     intents: RwLock<HashMap<TxnId, Vec<Bytes>>>,
@@ -16,6 +17,7 @@ pub struct MemKvEngine {
 impl MemKvEngine {
     pub fn new() -> Self {
         Self {
+            snapshot_gate: RwLock::new(()),
             store: RwLock::new(BTreeMap::new()),
             intents: RwLock::new(HashMap::new()),
         }
@@ -29,7 +31,79 @@ impl Default for MemKvEngine {
 }
 
 impl KvEngine for MemKvEngine {
+    fn snapshot_rows(
+        &self,
+        scope: &nodus_storage_api::SnapshotScope,
+    ) -> Result<Vec<nodus_storage_api::SnapshotRow>> {
+        let _snapshot = self.snapshot_gate.read().unwrap();
+        let store = self.store.read().unwrap();
+        let mut rows = Vec::new();
+        let mut size = 0usize;
+        for (key, chain) in store.iter().filter(|(k, _)| scope.owns(k)) {
+            size += key.len()
+                + chain
+                    .versions
+                    .iter()
+                    .map(|v| v.value.as_ref().map_or(0, Vec::len) + 64)
+                    .sum::<usize>();
+            anyhow::ensure!(
+                size <= nodus_storage_api::snapshot::SNAPSHOT_MEMORY_LIMIT,
+                "snapshot exceeds checkpoint memory limit"
+            );
+            rows.push(nodus_storage_api::SnapshotRow {
+                key: key.clone(),
+                versions: chain.versions.clone().into_iter().map(Into::into).collect(),
+            });
+        }
+        Ok(rows)
+    }
+
+    fn replace_snapshot(
+        &self,
+        scope: &nodus_storage_api::SnapshotScope,
+        rows: Vec<nodus_storage_api::SnapshotRow>,
+        pointers: Vec<nodus_storage_api::SnapshotRow>,
+    ) -> Result<()> {
+        nodus_storage_api::snapshot::check_snapshot_size(&rows)?;
+        nodus_storage_api::snapshot::check_snapshot_size(&pointers)?;
+        anyhow::ensure!(
+            rows.iter()
+                .chain(&pointers)
+                .flat_map(|r| &r.versions)
+                .all(|v| !v.is_intent || v.txn_id.is_some()),
+            "snapshot intent has no transaction"
+        );
+        anyhow::ensure!(
+            rows.iter().all(|r| scope.owns(&r.key)),
+            "snapshot escaped scope"
+        );
+        let _snapshot = self.snapshot_gate.write().unwrap();
+        let mut store = self.store.write().unwrap();
+        let mut intents = self.intents.write().unwrap();
+        store.retain(|key, _| !scope.owns(key));
+        for row in rows.into_iter().chain(pointers) {
+            store.insert(
+                row.key,
+                VersionChain {
+                    versions: row.versions.into_iter().map(Into::into).collect(),
+                },
+            );
+        }
+        intents.clear();
+        for (key, chain) in store.iter() {
+            for v in &chain.versions {
+                if v.is_intent
+                    && let Some(txn) = v.txn_id
+                {
+                    intents.entry(txn).or_default().push(key.clone());
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn has_pending_intents(&self, prefix: &[u8]) -> Result<bool> {
+        let _snapshot = self.snapshot_gate.read().unwrap();
         Ok(self
             .intents
             .read()
@@ -40,6 +114,7 @@ impl KvEngine for MemKvEngine {
     }
 
     fn get(&self, key: &[u8], read_ts: Timestamp) -> Result<Option<Bytes>> {
+        let _snapshot = self.snapshot_gate.read().unwrap();
         let guard = self.store.read().unwrap();
         if let Some(chain) = guard.get(key)
             && let Some(val) = chain.read(read_ts)
@@ -54,6 +129,7 @@ impl KvEngine for MemKvEngine {
         range: KeyRange,
         read_ts: Timestamp,
     ) -> Result<Box<dyn Iterator<Item = Result<KvPair>> + Send>> {
+        let _snapshot = self.snapshot_gate.read().unwrap();
         let guard = self.store.read().unwrap();
         let mut results = Vec::new();
 
@@ -86,6 +162,7 @@ impl KvEngine for MemKvEngine {
         since_ts: Timestamp,
         read_ts: Timestamp,
     ) -> Result<Box<dyn Iterator<Item = Result<KvVersion>> + Send>> {
+        let _snapshot = self.snapshot_gate.read().unwrap();
         let guard = self.store.read().unwrap();
         let mut results = Vec::new();
 
@@ -117,6 +194,7 @@ impl KvEngine for MemKvEngine {
     }
 
     fn write_intent(&self, txn_id: TxnId, key: Bytes, value: Bytes) -> KvResult<()> {
+        let _snapshot = self.snapshot_gate.read().unwrap();
         let mut store_guard = self.store.write().unwrap();
         let mut intents_guard = self.intents.write().unwrap();
 
@@ -128,6 +206,7 @@ impl KvEngine for MemKvEngine {
     }
 
     fn delete_intent(&self, txn_id: TxnId, key: Bytes) -> KvResult<()> {
+        let _snapshot = self.snapshot_gate.read().unwrap();
         let mut store_guard = self.store.write().unwrap();
         let mut intents_guard = self.intents.write().unwrap();
 
@@ -144,6 +223,7 @@ impl KvEngine for MemKvEngine {
         key: Bytes,
         replacement: IntentReplacement,
     ) -> KvResult<()> {
+        let _snapshot = self.snapshot_gate.read().unwrap();
         let mut store_guard = self.store.write().unwrap();
         let mut intents_guard = self.intents.write().unwrap();
         let chain = store_guard.entry(key.clone()).or_default();
@@ -172,6 +252,7 @@ impl KvEngine for MemKvEngine {
     }
 
     fn pending_intent_keys(&self, txn_id: TxnId) -> Vec<Bytes> {
+        let _snapshot = self.snapshot_gate.read().unwrap();
         self.intents
             .read()
             .unwrap()
@@ -181,6 +262,7 @@ impl KvEngine for MemKvEngine {
     }
 
     fn commit(&self, txn_id: TxnId, commit_ts: Timestamp) -> KvResult<()> {
+        let _snapshot = self.snapshot_gate.read().unwrap();
         let mut store_guard = self.store.write().unwrap();
         let mut intents_guard = self.intents.write().unwrap();
 
@@ -195,6 +277,7 @@ impl KvEngine for MemKvEngine {
     }
 
     fn abort(&self, txn_id: TxnId) -> KvResult<()> {
+        let _snapshot = self.snapshot_gate.read().unwrap();
         let mut store_guard = self.store.write().unwrap();
         let mut intents_guard = self.intents.write().unwrap();
 
@@ -209,6 +292,7 @@ impl KvEngine for MemKvEngine {
     }
 
     fn garbage_collect(&self, watermark: Timestamp) -> Result<usize> {
+        let _snapshot = self.snapshot_gate.read().unwrap();
         let mut store = self.store.write().unwrap();
         let mut removed = 0usize;
         let mut dead_keys = Vec::new();

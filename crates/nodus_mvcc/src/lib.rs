@@ -202,6 +202,27 @@ impl VersionChain {
     }
 }
 
+impl From<MvccValue> for nodus_storage_api::SnapshotValue {
+    fn from(v: MvccValue) -> Self {
+        Self {
+            value: v.value,
+            version: v.version,
+            txn_id: v.txn_id,
+            is_intent: v.is_intent,
+        }
+    }
+}
+impl From<nodus_storage_api::SnapshotValue> for MvccValue {
+    fn from(v: nodus_storage_api::SnapshotValue) -> Self {
+        Self {
+            value: v.value,
+            version: v.version,
+            txn_id: v.txn_id,
+            is_intent: v.is_intent,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

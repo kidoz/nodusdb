@@ -1,7 +1,9 @@
+pub mod snapshot;
 use anyhow::Result;
 use bytes::Bytes;
 use nodus_catalog::{IndexId, TableId};
 use serde::{Deserialize, Serialize};
+pub use snapshot::{SnapshotRow, SnapshotScope, SnapshotValue};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -69,6 +71,23 @@ pub enum IntentReplacement {
 }
 
 pub trait KvEngine: Send + Sync {
+    /// Full version chains, including intents, bounded by SNAPSHOT_MEMORY_LIMIT.
+    fn snapshot_rows(&self, _scope: &SnapshotScope) -> Result<Vec<SnapshotRow>> {
+        anyhow::bail!("snapshot export is unsupported by this engine")
+    }
+
+    /// Atomically replaces the scope, plus explicit consensus pointer records.
+    /// Failure before publication leaves old state; a publication I/O ambiguity
+    /// must fail closed until reopen. Other groups and their intents survive.
+    fn replace_snapshot(
+        &self,
+        _scope: &SnapshotScope,
+        _rows: Vec<SnapshotRow>,
+        _pointers: Vec<SnapshotRow>,
+    ) -> Result<()> {
+        anyhow::bail!("atomic snapshot replacement is unsupported by this engine")
+    }
+
     fn get(&self, key: &[u8], read_ts: Timestamp) -> Result<Option<Bytes>>;
     fn scan(
         &self,
@@ -211,6 +230,31 @@ impl NamespacedKvEngine {
 }
 
 impl KvEngine for NamespacedKvEngine {
+    fn snapshot_rows(&self, scope: &SnapshotScope) -> Result<Vec<SnapshotRow>> {
+        let mut rows = self.inner.snapshot_rows(&scope.namespaced(&self.prefix))?;
+        for row in &mut rows {
+            let key = row
+                .key
+                .strip_prefix(self.prefix.as_ref())
+                .ok_or_else(|| anyhow::anyhow!("snapshot escaped namespace"))?;
+            row.key = Bytes::copy_from_slice(key);
+        }
+        Ok(rows)
+    }
+
+    fn replace_snapshot(
+        &self,
+        scope: &SnapshotScope,
+        mut rows: Vec<SnapshotRow>,
+        mut pointers: Vec<SnapshotRow>,
+    ) -> Result<()> {
+        for row in rows.iter_mut().chain(pointers.iter_mut()) {
+            row.key = self.physical_key(&row.key);
+        }
+        self.inner
+            .replace_snapshot(&scope.namespaced(&self.prefix), rows, pointers)
+    }
+
     fn has_pending_intents(&self, prefix: &[u8]) -> Result<bool> {
         self.inner.has_pending_intents(&self.physical_key(prefix))
     }

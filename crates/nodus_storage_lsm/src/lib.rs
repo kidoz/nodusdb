@@ -1,5 +1,6 @@
 use anyhow::Result;
 use bytes::Bytes;
+mod snapshot;
 pub mod sstable;
 
 use nodus_mvcc::VersionChain;
@@ -40,6 +41,8 @@ struct Manifest {
 }
 
 pub struct LsmKvEngine {
+    snapshot_gate: RwLock<()>,
+    snapshot_failed: std::sync::atomic::AtomicBool,
     data_dir: Option<PathBuf>,
     memtable: RwLock<BTreeMap<Bytes, VersionChain>>,
     intents: RwLock<HashMap<TxnId, Vec<Bytes>>>,
@@ -178,6 +181,8 @@ impl Iterator for LazyMergeScan {
 impl LsmKvEngine {
     pub fn new() -> Self {
         Self {
+            snapshot_gate: RwLock::new(()),
+            snapshot_failed: std::sync::atomic::AtomicBool::new(false),
             data_dir: None,
             memtable: RwLock::new(BTreeMap::new()),
             intents: RwLock::new(HashMap::new()),
@@ -248,6 +253,8 @@ impl LsmKvEngine {
         let wal = Arc::new(FileWalEngine::with_encryption(&wal_path, key)?);
 
         let engine = Self {
+            snapshot_gate: RwLock::new(()),
+            snapshot_failed: std::sync::atomic::AtomicBool::new(false),
             data_dir: Some(path.to_path_buf()),
             memtable: RwLock::new(BTreeMap::new()),
             intents: RwLock::new(HashMap::new()),
@@ -316,6 +323,12 @@ impl LsmKvEngine {
     }
 
     pub fn flush(&self) -> Result<()> {
+        let _snapshot = self.snapshot_gate.read().unwrap();
+        self.snapshot_available()?;
+        self.flush_inner()
+    }
+
+    fn flush_inner(&self) -> Result<()> {
         let dir = match &self.data_dir {
             Some(d) => d.clone(),
             None => return Ok(()), // no-op for in-memory only
@@ -395,7 +408,7 @@ impl LsmKvEngine {
 
         // Bound read amplification once enough SSTables have accumulated.
         if self.sstables.read().unwrap().len() >= COMPACTION_TRIGGER {
-            self.compact()?;
+            self.compact_inner()?;
         }
         Ok(())
     }
@@ -406,6 +419,12 @@ impl LsmKvEngine {
     /// it alone (the commit point — a crash before this leaves the old set in the
     /// manifest, orphaning the new file), then the old files are deleted.
     pub fn compact(&self) -> Result<()> {
+        let _snapshot = self.snapshot_gate.read().unwrap();
+        self.snapshot_available()?;
+        self.compact_inner()
+    }
+
+    fn compact_inner(&self) -> Result<()> {
         let dir = match &self.data_dir {
             Some(d) => d.clone(),
             None => return Ok(()),
@@ -477,7 +496,7 @@ impl LsmKvEngine {
             && self.memtable_bytes.load(Ordering::Relaxed)
                 >= self.flush_threshold.load(Ordering::Relaxed)
         {
-            self.flush()?;
+            self.flush_inner()?;
         }
         Ok(())
     }
@@ -586,7 +605,25 @@ impl Default for LsmKvEngine {
 }
 
 impl KvEngine for LsmKvEngine {
+    fn snapshot_rows(
+        &self,
+        scope: &nodus_storage_api::SnapshotScope,
+    ) -> Result<Vec<nodus_storage_api::SnapshotRow>> {
+        self.export_snapshot_rows(scope)
+    }
+
+    fn replace_snapshot(
+        &self,
+        scope: &nodus_storage_api::SnapshotScope,
+        rows: Vec<nodus_storage_api::SnapshotRow>,
+        pointers: Vec<nodus_storage_api::SnapshotRow>,
+    ) -> Result<()> {
+        self.replace_snapshot_rows(scope, rows, pointers)
+    }
+
     fn has_pending_intents(&self, prefix: &[u8]) -> Result<bool> {
+        let _snapshot = self.snapshot_gate.read().unwrap();
+        self.snapshot_available()?;
         Ok(self
             .intents
             .read()
@@ -601,6 +638,8 @@ impl KvEngine for LsmKvEngine {
     }
 
     fn get(&self, key: &[u8], read_ts: Timestamp) -> Result<Option<Bytes>> {
+        let _snapshot = self.snapshot_gate.read().unwrap();
+        self.snapshot_available()?;
         let guard = self.memtable.read().unwrap();
         if let Some(chain) = guard.get(key)
             && let Some(val) = chain.read(read_ts)
@@ -626,6 +665,8 @@ impl KvEngine for LsmKvEngine {
         range: KeyRange,
         read_ts: Timestamp,
     ) -> Result<Box<dyn Iterator<Item = Result<KvPair>> + Send>> {
+        let _snapshot = self.snapshot_gate.read().unwrap();
+        self.snapshot_available()?;
         let start = Bytes::from(range.start.as_ref().to_vec());
         let end = Bytes::from(range.end.as_ref().to_vec());
 
@@ -673,6 +714,8 @@ impl KvEngine for LsmKvEngine {
         since_ts: Timestamp,
         read_ts: Timestamp,
     ) -> Result<Box<dyn Iterator<Item = Result<KvVersion>> + Send>> {
+        let _snapshot = self.snapshot_gate.read().unwrap();
+        self.snapshot_available()?;
         let start = Bytes::from(range.start.as_ref().to_vec());
         let end = Bytes::from(range.end.as_ref().to_vec());
         let mut merged: BTreeMap<Bytes, VersionChain> = BTreeMap::new();
@@ -732,6 +775,8 @@ impl KvEngine for LsmKvEngine {
     }
 
     fn write_intent(&self, txn_id: TxnId, key: Bytes, value: Bytes) -> KvResult<()> {
+        let _snapshot = self.snapshot_gate.read().unwrap();
+        self.snapshot_available()?;
         // Append to the WAL and release the WAL lock *before* taking the memtable
         // lock, so this never holds wal+memtable in the opposite order from
         // `flush` (which holds memtable then rotates the WAL) — avoiding deadlock.
@@ -761,6 +806,8 @@ impl KvEngine for LsmKvEngine {
     }
 
     fn delete_intent(&self, txn_id: TxnId, key: Bytes) -> KvResult<()> {
+        let _snapshot = self.snapshot_gate.read().unwrap();
+        self.snapshot_available()?;
         {
             let wal_guard = self.wal.read().unwrap();
             if let Some(wal) = wal_guard.as_ref() {
@@ -791,6 +838,8 @@ impl KvEngine for LsmKvEngine {
         key: Bytes,
         replacement: IntentReplacement,
     ) -> KvResult<()> {
+        let _snapshot = self.snapshot_gate.read().unwrap();
+        self.snapshot_available()?;
         let mut store_guard = self.memtable.write().unwrap();
         let mut intents_guard = self.intents.write().unwrap();
         let chain = store_guard.entry(key.clone()).or_default();
@@ -819,6 +868,7 @@ impl KvEngine for LsmKvEngine {
     }
 
     fn pending_intent_keys(&self, txn_id: TxnId) -> Vec<Bytes> {
+        let _snapshot = self.snapshot_gate.read().unwrap();
         self.intents
             .read()
             .unwrap()
@@ -828,6 +878,8 @@ impl KvEngine for LsmKvEngine {
     }
 
     fn commit(&self, txn_id: TxnId, commit_ts: Timestamp) -> KvResult<()> {
+        let _snapshot = self.snapshot_gate.read().unwrap();
+        self.snapshot_available()?;
         {
             let wal_guard = self.wal.read().unwrap();
             if let Some(wal) = wal_guard.as_ref() {
@@ -850,6 +902,8 @@ impl KvEngine for LsmKvEngine {
     }
 
     fn abort(&self, txn_id: TxnId) -> KvResult<()> {
+        let _snapshot = self.snapshot_gate.read().unwrap();
+        self.snapshot_available()?;
         {
             let wal_guard = self.wal.read().unwrap();
             if let Some(wal) = wal_guard.as_ref() {
@@ -872,6 +926,8 @@ impl KvEngine for LsmKvEngine {
     }
 
     fn garbage_collect(&self, watermark: Timestamp) -> Result<usize> {
+        let _snapshot = self.snapshot_gate.read().unwrap();
+        self.snapshot_available()?;
         // Remember the watermark so the next compaction can reclaim superseded
         // versions from SSTables too, not just the memtable.
         self.gc_watermark.store(watermark, Ordering::Relaxed);
