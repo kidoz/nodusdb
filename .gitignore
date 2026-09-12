@@ -1,0 +1,70 @@
+# NodusDB ignore list.
+# Maintained by hand; see .agents/contexts/PROJECT_GLOBAL_CONTEXT.md ("Version control").
+
+# ---------------------------------------------------------------------------
+# Rust / Cargo
+# ---------------------------------------------------------------------------
+# Workspace root plus the standalone tests/fuzz workspace.
+target/
+*.rs.bk
+# Coverage and profiling output
+*.profraw
+*.profdata
+lcov.info
+/coverage/
+perf.data
+perf.data.old
+flamegraph.svg
+# cargo-fuzz state (corpora and crash reproducers are kept out of the repo)
+/tests/fuzz/corpus/
+/tests/fuzz/artifacts/
+/tests/fuzz/coverage/
+
+# ---------------------------------------------------------------------------
+# Frontend (Vite + React + Storybook)
+# ---------------------------------------------------------------------------
+node_modules/
+/frontend/dist/
+/frontend/storybook-static/
+*.tsbuildinfo
+.eslintcache
+.vite/
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ---------------------------------------------------------------------------
+# JDBC compatibility suite (Gradle)
+# ---------------------------------------------------------------------------
+/tests/compatibility/jdbc/.gradle/
+/tests/compatibility/jdbc/build/
+
+# ---------------------------------------------------------------------------
+# Npgsql compatibility suite (.NET)
+# ---------------------------------------------------------------------------
+/tests/compatibility/npgsql/bin/
+/tests/compatibility/npgsql/obj/
+
+# ---------------------------------------------------------------------------
+# Local runtime state and secrets
+# ---------------------------------------------------------------------------
+# nodus.toml.example and deploy/nodus.example.toml are tracked; local configs are not.
+/nodus.toml
+/data/
+*.log
+.env
+.env.*
+!.env.example
+
+# ---------------------------------------------------------------------------
+# Editors and OS
+# ---------------------------------------------------------------------------
+.idea/
+*.iml
+.vscode/
+*.swp
+*~
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
