@@ -24,6 +24,16 @@ NodusDB targets high-load OLTP workloads by combining the familiar PostgreSQL in
 - **Online Backup & Restore**: Streamlined physical snapshotting and Point-In-Time-Recovery (PITR) mechanisms.
 - **Observability First**: Built-in Prometheus metrics (`/metrics`), `/healthz`, and `/readyz` endpoints out-of-the-box.
 
+### Shard administration limitation
+
+Shard initialization, split, merge, and rebalance currently return HTTP `501`
+with code `shard_migration_unavailable`. These operations are disabled until
+durable migration and cluster-wide fencing can preserve committed data during
+routing changes. This includes initialization of an empty table, which can race
+concurrent writes. Read-only shard inspection and replication of existing shard
+placements remain available. This safeguard does not repair data made unreachable
+by earlier shard operations.
+
 ## Getting Started
 To run the server locally with durable storage and explicit dev credentials:
 

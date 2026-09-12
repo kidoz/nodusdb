@@ -6,7 +6,7 @@ use axum::{
     extract::{Path, Query, Request, State},
     http::{StatusCode, header::AUTHORIZATION},
     middleware::{Next, from_fn_with_state},
-    response::Response,
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
 use base64::Engine;
@@ -213,7 +213,28 @@ async fn require_token(
     // caller's behalf.
     req.extensions_mut().insert(AuthPrincipal(principal_id));
 
-    let response = next.run(req).await;
+    // Containment until shard transitions have a durable, cluster-wide fence.
+    // Even initializing an empty table races concurrent INSERTs; never change
+    // routing based on a process-local lock or an emptiness check. Keep this
+    // after authentication/authorization and inside the normal audit path.
+    // Replica hosting stays available so existing placements can recover.
+    let unsafe_shard_mutation = method == axum::http::Method::POST
+        && path.starts_with("/api/v1/shards/")
+        && matches!(
+            path.rsplit('/').next(),
+            Some("init" | "split" | "merge" | "rebalance")
+        );
+    let response = if unsafe_shard_mutation {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(json!({
+                "code": "shard_migration_unavailable",
+                "error": "Shard initialization, split, merge, and rebalance are disabled until durable migration and cluster-wide fencing are implemented. Existing shard maps are unchanged; inspect them with GET /api/v1/shards/{table}."
+            })),
+        ).into_response()
+    } else {
+        next.run(req).await
+    };
     let status = response.status();
     if status.is_success() {
         record_audit("Success", None);

@@ -597,7 +597,17 @@ async fn main() -> anyhow::Result<()> {
             if !query.is_empty() {
                 req = req.query(&query);
             }
-            let v: serde_json::Value = req.send().await?.error_for_status()?.json().await?;
+            let response = req.send().await?;
+            let status = response.status();
+            let body = response.text().await?;
+            if !status.is_success() {
+                let detail = serde_json::from_str::<serde_json::Value>(&body)
+                    .ok()
+                    .and_then(|v| v["error"].as_str().map(str::to_owned))
+                    .unwrap_or(body);
+                anyhow::bail!("shard request failed ({status}): {detail}");
+            }
+            let v: serde_json::Value = serde_json::from_str(&body)?;
             println!("{}", serde_json::to_string_pretty(&v)?);
         }
         Commands::Queries { addr } => {

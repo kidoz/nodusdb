@@ -7,6 +7,48 @@ use nodus_testkit::cluster::ClusterFixture;
 use serial_test::serial;
 use std::time::Duration;
 
+/// Installs a pre-existing shard fixture through the internal Raft protocol.
+/// Public shard mutations are intentionally disabled until migration is safe.
+/// Call only on a fresh fixture, before inserting any SQL rows; this is not a
+/// test of online initialization and must never become a server bypass option.
+async fn seed_shard_fixture(cluster: &ClusterFixture, table: &str) {
+    let http = reqwest::Client::new();
+    let url = format!(
+        "http://{}/raft/shard-meta/write",
+        cluster.nodes[0].http_addr()
+    );
+    let shard = serde_json::json!({
+        "id": table,
+        "name": "fixture-shard",
+        "version": 1,
+        "created_at": "2026-09-12T00:00:00Z",
+        "updated_at": "2026-09-12T00:00:00Z",
+        "state": "Public",
+        "table_id": table,
+        "start_key": [],
+        "end_key": []
+    });
+    // No clients write to these tables during setup. The periodic production
+    // reconciler creates replicas from the replicated placement below.
+    for command in [
+        serde_json::json!({"UpdateShardMap": {"table_id": table, "shards": [shard]}}),
+        serde_json::json!({"UpdateShardPlacements": {table: "1"}}),
+    ] {
+        let response: serde_json::Value = http
+            .post(&url)
+            .json(&command)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(response["success"], true);
+    }
+}
+
 /// Three nodes form a cluster and a write on the leader replicates to a follower.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial(cluster)]
@@ -243,13 +285,7 @@ async fn shard_map_replicates_across_the_cluster() {
     // A fixed table id (no catalog row needed — the shard map is keyed by id).
     let table = "11111111-1111-1111-1111-111111111111";
 
-    // Initialize a shard on the meta leader (node 0). This write replicates
-    // through the meta group to every node's local store.
-    let init = cluster
-        .admin_post(0, &format!("/api/v1/shards/{table}/init"))
-        .await
-        .expect("shard init succeeds on the leader");
-    assert!(init.get("shard_id").is_some(), "shard created: {init:?}");
+    seed_shard_fixture(&cluster, table).await;
 
     // A different node now sees the same shard map (allow time for the apply).
     let mut shards_seen = 0;
@@ -288,18 +324,7 @@ async fn data_shard_forms_a_multi_node_group() {
 
     let table = "22222222-2222-2222-2222-222222222222";
 
-    // Create the shard map on the meta leader (node 0 = node_id 1), then place
-    // the single shard on that node so it becomes the group's primary. The
-    // rebalance triggers an immediate reconcile that forms the group across the
-    // cluster.
-    cluster
-        .admin_post(0, &format!("/api/v1/shards/{table}/init"))
-        .await
-        .expect("shard init succeeds");
-    cluster
-        .admin_post(0, &format!("/api/v1/shards/{table}/rebalance?nodes=1"))
-        .await
-        .expect("placing the shard on node 1 succeeds");
+    seed_shard_fixture(&cluster, table).await;
 
     // The primary (node 0) should report the data group with all three nodes as
     // voters once formation completes.
@@ -375,103 +400,69 @@ fn voters_of(groups: &serde_json::Value, group_id: &str) -> usize {
         .unwrap_or(0)
 }
 
-/// Splitting a shard that is replicated across the cluster forms **both child
-/// groups across the cluster too**: relocation runs through each child's Raft,
-/// so the children come up as multi-node groups (not single-node copies on the
-/// splitting node). Before Phase 3 split children were single-node and their
-/// data never reached followers.
+/// Every replica rejects unsafe public topology changes, including repeated
+/// initialization of an existing shard. The existing replicated group stays live.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial(cluster)]
-async fn split_forms_child_groups_across_the_cluster() {
+async fn shard_mutations_are_rejected_on_every_replica() {
     let cluster = ClusterFixture::start(3)
         .await
         .expect("3-node cluster forms");
-    assert!(cluster.wait_nodes_live(3, Duration::from_secs(45)).await);
-
     let table = "33333333-3333-3333-3333-333333333333";
-    let init = cluster
-        .admin_post(0, &format!("/api/v1/shards/{table}/init"))
-        .await
-        .expect("shard init succeeds");
-    let source = init
-        .get("shard_id")
-        .and_then(|s| s.as_str())
-        .expect("init returns a shard id")
-        .to_string();
-    cluster
-        .admin_post(0, &format!("/api/v1/shards/{table}/rebalance?nodes=1"))
-        .await
-        .expect("placing the source shard on node 1 succeeds");
-
-    // Wait for the source group to form across all three nodes before splitting.
-    let source_group = format!("shard-{source}");
+    seed_shard_fixture(&cluster, table).await;
+    let source_group = format!("shard-{table}");
     let mut formed = false;
-    for _ in 0..75 {
-        if let Ok(groups) = cluster.admin_get(0, "/api/v1/cluster/groups").await
-            && voters_of(&groups, &source_group) == 3
-        {
+    for _ in 0..100 {
+        let mut all = true;
+        for node in 0..3 {
+            let groups = cluster
+                .admin_get(node, "/api/v1/cluster/groups")
+                .await
+                .unwrap();
+            all &= voters_of(&groups, &source_group) == 3;
+        }
+        if all {
             formed = true;
             break;
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    assert!(formed, "the source group should form across the cluster");
-
-    // Split the source shard at key 128.
-    let split = cluster
-        .admin_post(
-            0,
-            &format!("/api/v1/shards/{table}/split?shard={source}&key=128"),
-        )
-        .await
-        .expect("split succeeds");
-    let left_group = format!(
-        "shard-{}",
-        split.get("left").and_then(|s| s.as_str()).expect("left id")
-    );
-    let right_group = format!(
-        "shard-{}",
-        split
-            .get("right")
-            .and_then(|s| s.as_str())
-            .expect("right id")
-    );
-
-    // The primary (node 0) hosts both children as three-voter groups and has
-    // decommissioned the source.
-    let mut children_formed = false;
-    for _ in 0..75 {
-        if let Ok(groups) = cluster.admin_get(0, "/api/v1/cluster/groups").await
-            && voters_of(&groups, &left_group) == 3
-            && voters_of(&groups, &right_group) == 3
-            && voters_of(&groups, &source_group) == 0
-        {
-            children_formed = true;
-            break;
+    assert!(formed, "fixture source group must form on all replicas");
+    let http = reqwest::Client::new();
+    for node in 0..3 {
+        let before = cluster
+            .admin_get(node, &format!("/api/v1/shards/{table}"))
+            .await
+            .unwrap();
+        for operation in [
+            "init".to_string(),
+            format!("split?shard={table}&key=128"),
+            format!("merge?left={table}&right={table}"),
+            "rebalance?nodes=2,3".to_string(),
+        ] {
+            let response = http
+                .post(format!(
+                    "http://{}/api/v1/shards/{table}/{operation}",
+                    cluster.nodes[node].http_addr()
+                ))
+                .basic_auth("nodus", Some("nodus"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::NOT_IMPLEMENTED);
         }
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        let after = cluster
+            .admin_get(node, &format!("/api/v1/shards/{table}"))
+            .await
+            .unwrap();
+        assert_eq!(before, after, "rejected mutations must preserve the map");
+        let groups = cluster
+            .admin_get(node, "/api/v1/cluster/groups")
+            .await
+            .unwrap();
+        assert_eq!(groups["groups"].as_array().unwrap().len(), 1);
+        assert_eq!(voters_of(&groups, &source_group), 3);
     }
-    assert!(
-        children_formed,
-        "both child groups should form across the cluster and the source be gone on the primary"
-    );
-
-    // A follower hosts replicas of both children too.
-    let mut follower_has_children = false;
-    for _ in 0..75 {
-        if let Ok(groups) = cluster.admin_get(2, "/api/v1/cluster/groups").await
-            && voters_of(&groups, &left_group) == 3
-            && voters_of(&groups, &right_group) == 3
-        {
-            follower_has_children = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-    assert!(
-        follower_has_children,
-        "a follower should host both child group replicas"
-    );
 }
 
 /// The full multi-replica payoff: a real SQL table is sharded onto a multi-node
@@ -506,14 +497,7 @@ async fn sharded_table_replicates_and_survives_leader_failure() {
         .and_then(|v| v.as_str())
         .expect("table id")
         .to_string();
-    cluster
-        .admin_post(0, &format!("/api/v1/shards/{table}/init"))
-        .await
-        .expect("shard init");
-    cluster
-        .admin_post(0, &format!("/api/v1/shards/{table}/rebalance?nodes=1"))
-        .await
-        .expect("place shard on node 1");
+    seed_shard_fixture(&cluster, &table).await;
 
     // Wait until the data group is replicated across all three nodes — node 0
     // leads it, and the followers host replicas (so their reads route to the
