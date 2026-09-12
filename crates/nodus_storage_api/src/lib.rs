@@ -1,3 +1,4 @@
+pub mod recovery;
 pub mod snapshot;
 use anyhow::Result;
 use bytes::Bytes;
@@ -71,6 +72,14 @@ pub enum IntentReplacement {
 }
 
 pub trait KvEngine: Send + Sync {
+    /// Node-local checkpoint identity. Namespace adapters must delegate to the
+    /// physical engine; it is never transferred in a Raft snapshot.
+    fn recovery_generation(&self) -> Result<Option<recovery::RecoveryGeneration>> {
+        self.get(recovery::RECOVERY_GENERATION_KEY, u64::MAX)?
+            .map(|b| recovery::RecoveryGeneration::decode(&b))
+            .transpose()
+    }
+
     /// Full version chains, including intents, bounded by SNAPSHOT_MEMORY_LIMIT.
     fn snapshot_rows(&self, _scope: &SnapshotScope) -> Result<Vec<SnapshotRow>> {
         anyhow::bail!("snapshot export is unsupported by this engine")
@@ -230,6 +239,10 @@ impl NamespacedKvEngine {
 }
 
 impl KvEngine for NamespacedKvEngine {
+    fn recovery_generation(&self) -> Result<Option<recovery::RecoveryGeneration>> {
+        self.inner.recovery_generation()
+    }
+
     fn snapshot_rows(&self, scope: &SnapshotScope) -> Result<Vec<SnapshotRow>> {
         let mut rows = self.inner.snapshot_rows(&scope.namespaced(&self.prefix))?;
         for row in &mut rows {

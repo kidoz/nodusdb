@@ -19,7 +19,10 @@ impl SnapshotScope {
         let Some(key) = key.strip_prefix(self.prefix.as_slice()) else {
             return false;
         };
-        !(self.exclude_raft && (key.starts_with(b"\0raft\0") || key.starts_with(b"\0hlc\0"))
+        !(self.exclude_raft
+            && (key.starts_with(b"\0raft\0")
+                || key.starts_with(b"\0hlc\0")
+                || key.starts_with(b"\0recovery\0"))
             || self.exclude_data_groups && key.starts_with(b"shard-") && key.contains(&0))
     }
 
@@ -30,7 +33,7 @@ impl SnapshotScope {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SnapshotValue {
     pub value: Option<Vec<u8>>,
     pub version: Timestamp,

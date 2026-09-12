@@ -58,6 +58,7 @@ fn replace(kv: Arc<LsmKvEngine>) {
 
 fn verify(dir: &Path, encryption: Option<[u8; 32]>, installed: bool, txn: TxnId) {
     let kv = Arc::new(LsmKvEngine::with_wal(dir, encryption).unwrap());
+    assert_eq!(kv.recovery_generation().unwrap().is_some(), installed);
     let a = NamespacedKvEngine::new(kv.clone(), "shard-a");
     let b = NamespacedKvEngine::new(kv.clone(), "shard-b");
     assert_eq!(

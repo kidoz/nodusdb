@@ -42,6 +42,12 @@ impl ClockAdvancingKvEngine {
 }
 
 impl KvEngine for ClockAdvancingKvEngine {
+    fn recovery_generation(
+        &self,
+    ) -> Result<Option<nodus_storage_api::recovery::RecoveryGeneration>> {
+        self.inner.recovery_generation()
+    }
+
     fn snapshot_rows(
         &self,
         scope: &nodus_storage_api::SnapshotScope,

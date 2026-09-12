@@ -89,6 +89,13 @@ impl KvEngine for MemKvEngine {
                 },
             );
         }
+        let generation = nodus_storage_api::recovery::RecoveryGeneration::checkpoint_row(0);
+        store.insert(
+            generation.key,
+            VersionChain {
+                versions: generation.versions.into_iter().map(Into::into).collect(),
+            },
+        );
         intents.clear();
         for (key, chain) in store.iter() {
             for v in &chain.versions {

@@ -96,6 +96,13 @@ impl LsmKvEngine {
                 },
             );
         }
+        let generation = nodus_storage_api::recovery::RecoveryGeneration::checkpoint_row(0);
+        merged.insert(
+            generation.key,
+            VersionChain {
+                versions: generation.versions.into_iter().map(Into::into).collect(),
+            },
+        );
         let size: usize = merged
             .iter()
             .map(|(key, chain)| chain_bytes(key, chain) + 64 * chain.versions.len())
@@ -134,6 +141,13 @@ impl LsmKvEngine {
         // Existing SSTable and WAL formats: old readers can reopen either side
         // of publication. Intents are checkpointed into a fresh WAL, never
         // stranded in immutable SSTables.
+        let generation = nodus_storage_api::recovery::RecoveryGeneration::checkpoint_row(wal_id);
+        merged.insert(
+            generation.key,
+            VersionChain {
+                versions: generation.versions.into_iter().map(Into::into).collect(),
+            },
+        );
         let mut committed = merged;
         committed.retain(|_, chain| {
             chain.versions.retain(|v| !v.is_intent);
