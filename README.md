@@ -34,6 +34,26 @@ concurrent writes. Read-only shard inspection and replication of existing shard
 placements remain available. This safeguard does not repair data made unreachable
 by earlier shard operations.
 
+For existing sharded tables, row scans visit every intersecting shard in key
+order at the transaction's fixed MVCC read timestamp. Version scans include
+tombstones. An assigned shard without a local replica returns SQLSTATE `40001`
+(retry the transaction after replica reconciliation); it never falls back to
+unsharded storage. Metadata decoding and invalid range coverage also fail
+explicitly. A routing descriptor change observed while consuming a scan aborts
+that scan with `40001`.
+
+With `SET nodus.linearizable_reads = on`, a range spanning multiple shards
+returns SQLSTATE `0A000`: shared snapshot coordination is not implemented.
+Independent per-shard Raft barriers would not establish that guarantee. Ordinary
+MVCC scans remain available; remote KV reads and durable migration epochs are
+still pending. The router opens one shard iterator at a time and adds no row
+buffering; underlying in-memory scans and LSM version scans still materialize
+their selected shard data. Secondary index keys retain their existing metadata
+namespace, with base-row lookup errors now propagated to the query.
+LSM reads also report missing or unreadable SSTables, truncated footers, and
+decoding failures instead of silently omitting those sources. This change does
+not alter persisted formats or repair damaged files.
+
 ## Getting Started
 To run the server locally with durable storage and explicit dev credentials:
 

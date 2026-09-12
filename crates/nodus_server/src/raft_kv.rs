@@ -1,3 +1,7 @@
+mod routing;
+#[cfg(test)]
+mod routing_tests;
+
 use anyhow::Result;
 use bytes::Bytes;
 use nodus_catalog::TableId;
@@ -35,11 +39,10 @@ fn record_key(txn_id: &str) -> Vec<u8> {
 
 /// `KvEngine` that replicates mutations through Raft and routes each key to the
 /// group that owns its shard. A key `"{table_id}:{pk}"` is mapped via the
-/// [`ShardRouter`] to a `ShardId`; if this node hosts that data group, the
-/// write/read is directed there (over a namespaced view of the local store).
-/// Otherwise — unsharded tables, non-row keys (e.g. `i:` index keys), or a shard
-/// not hosted here — it falls back to the meta group and the raw store, which is
-/// the pre-routing behaviour.
+/// [`ShardRouter`] to a `ShardId`; reads and writes use a namespaced view of the
+/// local store for that group.
+/// Missing assigned replicas and metadata errors fail explicitly. Only tables
+/// with no shard map and non-row keys (e.g. `i:` index keys) use the meta group.
 ///
 /// `commit`/`abort` carry only a `txn_id`, so the engine remembers which groups
 /// each transaction wrote to and finalizes on exactly those groups.
@@ -61,26 +64,14 @@ pub struct RaftKvEngine {
 /// Parses the leading `{table_id}` of a row key. Returns `None` for non-row keys
 /// (index keys, scalars) or malformed input — those stay on the meta group.
 fn parse_table_id(key: &[u8]) -> Option<TableId> {
-    let text = std::str::from_utf8(key).ok()?;
-    let prefix = text.split(':').next()?;
+    if key.get(36) != Some(&b':') {
+        return None;
+    }
+    let prefix = std::str::from_utf8(key.get(..36)?).ok()?;
     Uuid::parse_str(prefix).ok().map(TableId)
 }
 
 impl RaftKvEngine {
-    /// Resolves the Raft group that owns `key`. Falls back to the meta group
-    /// unless the key belongs to a sharded table whose data group is hosted here.
-    fn route(&self, key: &[u8]) -> String {
-        if let Some(table_id) = parse_table_id(key)
-            && let Ok(shard_id) = self.shard_router.locate_key(table_id, key)
-        {
-            let group_id = MultiRaftManager::data_group_id(shard_id);
-            if self.manager.hosts(&group_id) {
-                return group_id;
-            }
-        }
-        META_SHARD.to_string()
-    }
-
     /// The local engine view for a group: the raw store for the meta group, a
     /// namespaced view for a data group (matching that group's own engine).
     fn engine_for(&self, group_id: &str) -> Arc<dyn KvEngine> {
@@ -303,7 +294,7 @@ impl RaftKvEngine {
 
 impl KvEngine for RaftKvEngine {
     fn get(&self, key: &[u8], read_ts: Timestamp) -> Result<Option<Bytes>> {
-        let group_id = self.route(key);
+        let group_id = self.route(key)?;
         self.engine_for(&group_id).get(key, read_ts)
     }
 
@@ -312,10 +303,7 @@ impl KvEngine for RaftKvEngine {
         range: KeyRange,
         read_ts: Timestamp,
     ) -> Result<Box<dyn Iterator<Item = Result<KvPair>> + Send>> {
-        // Routed by the range start; a single-shard table resolves to one group.
-        // Multi-shard scatter/gather is deferred to a later phase.
-        let group_id = self.route(range.start.as_ref());
-        self.engine_for(&group_id).scan(range, read_ts)
+        self.routed_scan(range, move |engine, range| engine.scan(range, read_ts))
     }
 
     fn scan_versions(
@@ -324,13 +312,13 @@ impl KvEngine for RaftKvEngine {
         since_ts: Timestamp,
         read_ts: Timestamp,
     ) -> Result<Box<dyn Iterator<Item = Result<nodus_storage_api::KvVersion>> + Send>> {
-        let group_id = self.route(range.start.as_ref());
-        self.engine_for(&group_id)
-            .scan_versions(range, since_ts, read_ts)
+        self.routed_scan(range, move |engine, range| {
+            engine.scan_versions(range, since_ts, read_ts)
+        })
     }
 
     fn write_intent(&self, txn_id: TxnId, key: Bytes, value: Bytes) -> KvResult<()> {
-        let group_id = self.route(&key);
+        let group_id = self.route(&key)?;
         self.record_txn_group(txn_id, &group_id);
         let cmd = ShardCommand::PutIntent {
             txn_id: txn_id.0.to_string(),
@@ -342,7 +330,7 @@ impl KvEngine for RaftKvEngine {
     }
 
     fn delete_intent(&self, txn_id: TxnId, key: Bytes) -> KvResult<()> {
-        let group_id = self.route(&key);
+        let group_id = self.route(&key)?;
         self.record_txn_group(txn_id, &group_id);
         let cmd = ShardCommand::DeleteIntent {
             txn_id: txn_id.0.to_string(),
@@ -360,7 +348,7 @@ impl KvEngine for RaftKvEngine {
     ) -> KvResult<()> {
         // Savepoint overlay fix-up is applied locally (not replicated), against
         // the same engine view the key's writes target.
-        let group_id = self.route(&key);
+        let group_id = self.route(&key)?;
         self.engine_for(&group_id)
             .replace_intent(txn_id, key, replacement)
     }
@@ -400,9 +388,14 @@ impl KvEngine for RaftKvEngine {
 
     fn read_barrier(&self, key: &[u8]) -> KvResult<()> {
         // Barrier the group that owns the key, exactly where its reads route.
-        let group_id = self.route(key);
+        let group_id = self.route(key)?;
         self.router.read_barrier(&group_id)?;
         self.metrics.linearizable_reads_total.inc();
+        Ok(())
+    }
+
+    fn read_range_barrier(&self, range: KeyRange) -> KvResult<()> {
+        self.range_barrier(range)?;
         Ok(())
     }
 
