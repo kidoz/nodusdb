@@ -1149,11 +1149,17 @@ impl BackupOrchestrator {
                         active_txns.insert(txn_id);
                     }
                     WalRecordV1::WriteIntent { txn_id, key, value } => {
+                        if key.starts_with(b"\x01upgrade/") {
+                            continue;
+                        }
                         kv.write_intent(txn_id, Bytes::from(key), Bytes::from(value))?;
                         active_txns.insert(txn_id);
                         report.writes_applied += 1;
                     }
                     WalRecordV1::DeleteIntent { txn_id, key } => {
+                        if key.starts_with(b"\x01upgrade/") {
+                            continue;
+                        }
                         kv.delete_intent(txn_id, Bytes::from(key))?;
                         active_txns.insert(txn_id);
                         report.deletes_applied += 1;
@@ -1203,6 +1209,9 @@ impl BackupOrchestrator {
                 let Some(key) = json_bytes_field(&pair, "key") else {
                     continue;
                 };
+                if key.starts_with(b"\x01upgrade/") {
+                    continue;
+                }
                 let Some(version) = pair.get("version").and_then(|value| value.as_u64()) else {
                     continue;
                 };
@@ -2312,7 +2321,7 @@ mod tests {
     async fn test_pitr_replay_restores_base_and_replays_to_target_ts() {
         let repo: Arc<dyn BackupRepository> = Arc::new(MemBackupRepository::new());
         let orch = BackupOrchestrator::new(repo);
-        let base_dump = serde_json::json!([
+        let mut base_dump = serde_json::json!([
             {
                 "key": [98],
                 "value": [48],
@@ -2320,6 +2329,9 @@ mod tests {
                 "version": 10
             }
         ]);
+        base_dump.as_array_mut().unwrap().push(serde_json::json!({
+            "key": b"\x01upgrade/v1/state".to_vec(), "value": b"foreign policy".to_vec(), "version": 10
+        }));
         orch.create_full_backup(
             "cluster-1",
             10,
@@ -2343,6 +2355,11 @@ mod tests {
                 txn_id: committed,
                 key: b"a".to_vec(),
                 value: b"15".to_vec(),
+            }),
+            WalRecord::V1(WalRecordV1::WriteIntent {
+                txn_id: committed,
+                key: b"\x01upgrade/v1/state".to_vec(),
+                value: b"foreign policy".to_vec(),
             }),
             WalRecord::V1(WalRecordV1::CommitTxn {
                 txn_id: committed,
@@ -2417,6 +2434,10 @@ mod tests {
         assert_eq!(kv.get(b"e", 20).unwrap(), Some(Bytes::from_static(b"20")));
         assert_eq!(kv.get(b"l", 30).unwrap(), None);
         assert_eq!(kv.get(b"p", 30).unwrap(), None);
+        assert!(
+            kv.get(b"\x01upgrade/v1/state", 30).unwrap().is_none(),
+            "logical/PITR restore must not import source membership policy"
+        );
         assert_eq!(report.base_kv_versions_restored, 1);
         assert_eq!(report.wal_segments_replayed, 1);
         assert_eq!(report.commits_applied, 2);

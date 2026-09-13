@@ -17,6 +17,11 @@ to the repository. See the [implemented boundary and its limits](../explanation/
 The optional checksummed generation object and mutable repository boundary do
 not implement the collection layout or distributed retention design below.
 
+Logical backup and PITR replay retain the destination cluster's upgrade policy:
+source upgrade-authority records are excluded from export and skipped during
+replay. They transfer through meta Raft snapshots instead. See the
+[upgrade authority contract](../explanation/upgrade-authority.md).
+
 ## Repository layout
 
 Append-only object paths, so a repository can be made immutable:
