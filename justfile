@@ -90,5 +90,9 @@ compose-rerun:
     docker compose -f compose.yaml up --build --force-recreate
 
 # Build pinned old/new servers and run the process rolling-upgrade matrix
-test-mixed-binary:
-    python3 tools/testing/mixed_binary.py
+test-mixed-binary: test-mixed-binary-tools
+    python3 -B tools/testing/mixed_binary.py
+
+# Verify source pins and backport reconstruction without building servers
+test-mixed-binary-tools:
+    python3 -B -m unittest discover -s tools/testing -v

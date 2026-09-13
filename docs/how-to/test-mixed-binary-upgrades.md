@@ -1,94 +1,109 @@
 # Test a rolling upgrade with two binaries
 
-The pinned historical pair has not passed uninterrupted rolling-upgrade acceptance:
-snapshot installation replaces the bootstrap principal ID, leaving the historical
-password authenticator bound to the old ID. The working-tree candidate fixes this
-for upgraded readers. Diagnostic runs retain failures on historical recipients
-and use explicit restarts to continue the compatibility checks.
+The gate compares an authority-only maintenance reader with an admission-capable
+newer reader. Both contain the bootstrap-authentication and local WAL-retention
+fixes. The older reader still lacks admission commands; patching these defects
+must not erase the protocol boundary being tested.
 
-The final September 13, 2026 candidate run completed **all thirteen checkpoints in
-339.09 seconds**, including both snapshot directions, both executable rollback
-boundaries before admission, admission refusals, four-node admission and crash
-recovery with all five committed rows present and the aborted row absent. Neither
-new-reader snapshot recipient needed a login restart. The sole recorded blocker
-was the unchanged R6a recipient's snapshot-login failure, handled by one explicit
-diagnostic restart. Thus `matrix_completed` is true but `passed` remains false;
-this is diagnostic compatibility evidence, not a clean acceptance result.
+The September 14, 2026 run **passed all thirteen checkpoints in 360.45 seconds**
+with `passed: true`, `matrix_completed: true` and an empty blocker list. It used
+the pinned pair below, with neither `--candidate` nor `--diagnose`. Both snapshot
+directions, executable rollback before admission, admission refusals, four-node
+admission and crash/restart recovery passed. All five committed rows survived;
+the aborted row remained absent. No snapshot-login restart was needed.
 
-Run the slow compatibility gate with:
+Run the compatibility gate with:
 
 ```bash
 just test-mixed-binary
 ```
 
-It requires Cargo/Rust, Python 3, Git, tar and OpenSSL on a Unix host. It builds
-unmodified production `nodus_server` executables from these full Git revisions:
+It first runs the source-pin tests, then builds and runs both servers. Cargo/Rust,
+Python 3, Git, tar and OpenSSL are required on a Unix host. The default run uses
+neither a working-tree candidate nor diagnostic restart workarounds. Acceptance
+requires `matrix_completed: true`, `passed: true`, thirteen checks and no blockers.
 
-- Authority-only reader: `31897cd7d7bbbf7b51cc3d522a2a77f4e7ec908a` (R6a).
-- Admission-v1 reader: `3b4cca438485c7a1b0f1a6c43c4cc2cfba51ea1c` (R6b).
+## Pinned sources
 
-Both report package version `0.1.0`; that string alone cannot identify the reader.
-The gate records revision, lockfile SHA-256, toolchain and binary SHA-256 in
-`builds.json`, then checks actual capability responses. It rejects identical
-binary hashes. Each revision has a separate Cargo target directory: a shared
-target can incorrectly reuse path-package artifacts from relocated Git archives
-whose timestamps were preserved. No production source or configuration default
-is patched to make the historical binaries pass.
-The builds use Cargo's dev profile with debug information disabled. They execute
-production code paths; their timings are not release-build performance measurements.
+| Reader | Revision | Admission reader |
+| --- | --- | --- |
+| R6a maintenance | `65313a236ce54adb510dde1835e4a652ece3a0e8` | Absent; unknown commands are rejected |
+| Newer reader | `d1989d3c0d21d22f60507b681d1eb288a8f42dce` | Admission v1 |
 
-The command prints an evidence directory containing binaries, source archives,
-build/test logs, per-process logs and `results.json`. Keep it with the result when
-reviewing an upgrade. These directories contain test-only certificates and data.
-The runner creates a new process group and kills it on timeout or interruption;
-the Rust fixture also kills/reaps its child servers on return or panic. A hard
-kill of the runner itself cannot execute cleanup. The ordinary workspace test
-suite deliberately ignores this test; the wrapper explicitly selects it and
-requires a fresh successful result with all thirteen checkpoints.
+R6a maintenance backports only commits `225a5dc` (bootstrap authentication) and
+`f82094c` (local WAL retention) onto
+`31897cd7d7bbbf7b51cc3d522a2a77f4e7ec908a`. The reviewed
+[backport patch](../../tools/testing/fixtures/r6a-maintenance.patch) reconstructs
+Git tree `9dd2beafcee4ae17bde6be0acc74d70d249d4d6d`. The runner verifies both the
+patch SHA-256 and this tree before building. It uses a temporary Git index, so
+staged changes and working files stay intact. This works in a fresh main-branch
+checkout without the local maintenance branch or its commit object. See
+[source provenance](../../tools/testing/fixtures/README.md) for regeneration.
+The newer reader is archived directly from its reachable Git revision.
 
-The pinned pair currently fails SQL authorization after snapshot installation:
-the catalog's bootstrap principal changes, while the password authenticator keeps
-the recipient's original principal ID. `readyz` can already be successful at this
-point. Restarting the recipient reloads its credential against the installed
-catalog. The default gate stops at this regression. To gather the remaining
-compatibility evidence, use explicit diagnostic mode:
+These are production server sources with explicit maintenance fixes, not a claim
+that the original historical binaries contain those fixes or that a maintenance
+release has been published. No command decoder, capability response, feature gate
+or production configuration default is rewritten by the runner.
 
-```bash
-python3 tools/testing/mixed_binary.py --output /tmp/nodus-mixed-evidence --reuse-builds --diagnose
-```
+Both report package version `0.1.0`; that string alone cannot identify a reader.
+`builds.json` schema 2 records the revisions, old base/tree/patch identity, lockfile
+SHA-256, toolchain and binary hashes. Runtime capability responses and the
+admission-command rejection test establish the actual reader boundary. Identical
+binary hashes are rejected. Each revision has a separate Cargo target directory
+to prevent accidental reuse between archived source roots.
 
-Diagnostic mode records the failure, restarts that recipient and continues. It
-still exits unsuccessfully: `matrix_completed: true` means all checkpoints ran,
-whereas `passed: false` and `blockers` prevent treating the workaround as a clean
-upgrade. The current fix treats the configured bootstrap password as an explicit
-operator credential for an existing, privileged global administrator. Ordinary
-user passwords remain bound to immutable IDs. See
-[authentication rules](../reference/admin-api-authorization.md#authentication-schemes).
+The builds use Cargo's dev profile with debug information disabled. Their timings
+are not release-build performance measurements. The output directory contains
+binaries, source archives, build/test logs, per-process logs and `results.json`.
+Keep that directory with the result when reviewing an upgrade. Its certificates
+and databases are disposable test fixtures. The wrapper owns the process group and kills it on
+failure, timeout or interruption; the Rust fixture kills/reaps child servers on
+return or panic. A hard kill of the wrapper itself cannot execute cleanup.
+The ordinary workspace test suite deliberately ignores this slow process test.
 
-To test the current working tree as the new reader against the unchanged R6a
-binary, use:
-
-```bash
-python3 tools/testing/mixed_binary.py --output /tmp/nodus-mixed-evidence --reuse-builds --candidate --diagnose
-```
-
-`--candidate` builds the working tree in an isolated Cargo target and records its
-HEAD, tracked source patch, untracked crate sources, lockfile/toolchain and binary
-hash in `candidate.json`, `candidate.patch` and `candidate-untracked/`. It leaves
-the historical binaries and `builds.json` intact. This is a candidate evaluation,
-not a claim that the pinned R6b executable contains the fix. The historical R6a
-recipient still needs the diagnostic login restart after receiving v2.
-
-To choose a retained output directory, or rerun the same verified binaries:
+## Reuse and candidate evaluation
 
 ```bash
-python3 tools/testing/mixed_binary.py --output /tmp/nodus-mixed-evidence
-python3 tools/testing/mixed_binary.py --output /tmp/nodus-mixed-evidence --reuse-builds
+python3 -B tools/testing/mixed_binary.py --output /tmp/nodus-mixed-maintenance
+python3 -B tools/testing/mixed_binary.py --output /tmp/nodus-mixed-maintenance --reuse-builds
 ```
 
-A fresh build requires a new output directory. `--build-only` prepares binaries
-without starting the matrix. Target artifacts live under `target/mixed-binary-build`.
-Reuse verifies the recorded hashes, revisions, lockfile hashes and toolchain.
+A fresh build requires a new output directory. Directories from the original
+historical pins cannot be reused for this pair: their identities differ.
+`--build-only` prepares binaries without running the matrix. Target artifacts
+live under `target/mixed-binary-build`. Reuse verifies the recorded identities.
+
+To evaluate future changes, add `--candidate` to build the current working tree
+as the newer reader, while retaining the pinned R6a maintenance reader:
+
+```bash
+python3 -B tools/testing/mixed_binary.py --output /tmp/nodus-mixed-maintenance --reuse-builds --candidate
+```
+
+Candidate HEAD, source patch, untracked crate sources, lockfile/toolchain and
+binary hashes are recorded separately in `candidate.json`, `candidate.patch` and
+`candidate-untracked/`. The pinned binaries and `builds.json` remain intact.
+`--diagnose` is an investigation-only option: it records snapshot-login failures
+and restarts recipients to continue. Any recorded blocker still fails the gate.
+It is not part of the acceptance command above.
+
+## Historical baseline
+
+The original pair (`31897cd` / `3b4cca4`) exposed stale bootstrap identity after
+snapshot installation and premature deletion of WAL still needed for recovery.
+The September 13 candidate run completed thirteen checkpoints in 339.09 seconds,
+but required one old-recipient login restart and therefore failed acceptance.
+Those original executables remain unfixed. The maintenance backport addresses
+both defects without changing durable formats or admission capabilities. It does
+not automatically repair already-missing local WAL. See
+[authentication rules](../reference/admin-api-authorization.md#authentication-schemes)
+and [local WAL cleanup](../reference/durability-contract.md#local-wal-archive-cleanup).
+
+The fixture also corrected two independent issues: one-second forced elections
+preempted an up-to-date peer while a stale candidate could not win, and the seed
+list omitted the newly admitted node when it became leader. Election retries now
+allow ten seconds to settle, and every known admin seed is configured.
 
 ## Workload and failure boundaries
 
@@ -118,29 +133,12 @@ executable replacement reuses the existing directory to exercise WAL, snapshot
 and authority reopen. Erasing an existing voter's history is deliberately excluded:
 OpenRaft forbids follower log reversion. Only a newly admitted identity starts empty.
 
-The earlier 534.67-second diagnostic run reached only four checkpoints because
-the fixture forced elections every second on a node with a stale log. The other
-live voter correctly rejected those votes. Copies of the same saved stores
-recovered a leader through normal elections in about four seconds. Election
-retries now allow ten seconds for an up-to-date node to win and replicate first.
-This fixture correction is separate from the confirmed synchronous purge pause.
-
-A subsequent candidate run reached five checkpoints in 326.54 seconds, then
-found a separate recovery defect during executable rollback. The local manifest
-still required WAL segment 370, but the archiver had removed it; its archived
-copy contained the committed term-7 vote. The remaining store reopened with a
-term-6 vote and term-7 log entries, which OpenRaft rejected. The candidate now
-delegates local WAL deletion to the storage engine, which checks the published
-replay floor under the checkpoint lock. Backup retention approval alone cannot
-authorize deletion. This repair changes no durable format and does not repair
-already-missing local WAL automatically.
-
 The workload covers acknowledged inserts and updates, an explicitly aborted row,
 reader changes, feature rollback, old/new leader elections, v1 transfer from old
 to new, v2 transfer from new to old, candidate refusal with two and then one old
 voter, refusal of an old candidate, and successful admission once every reader is
 new. It also sends a valid admission-command envelope to both readers: R6a
-rejects its unknown variant (HTTP 422), while R6b recognizes it and rejects generic
+rejects its unknown variant (HTTP 422), while the newer reader recognizes it and rejects generic
 ingress (HTTP 403). Finally, it kills the current leader after an acknowledged write, writes on
 the elected replacement, restarts the killed process and checks all rows on all
 four members. It is an ordered regression scenario, not a concurrent-workload
@@ -148,10 +146,10 @@ linearizability proof or a performance benchmark.
 
 ## Rollback boundaries for this pair
 
-| Cluster state | Feature rollback to level 1 | New executable replaced by R6a |
+| Cluster state | Feature rollback to level 1 | New executable replaced by R6a maintenance |
 | --- | --- | --- |
 | Before snapshot-v2 finalization | Permitted by the upgrade API | Exercised against the same persistent directory after feature rollback |
-| Finalized v2, before any admission | Rejected; finalization is irreversible | Exercised with the candidate against the same persistent directory |
+| Finalized v2, before any admission | Rejected; finalization is irreversible | Exercised against the same persistent directory |
 | An admission approval has entered the log | Rejected | Unsupported; R6a cannot interpret admission commands or enforce the ledger |
 
 Before adding a member, replace every existing voter and learner with an

@@ -11,8 +11,12 @@ import subprocess
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
-OLD = "31897cd7d7bbbf7b51cc3d522a2a77f4e7ec908a"
-NEW = "3b4cca438485c7a1b0f1a6c43c4cc2cfba51ea1c"
+OLD = "65313a236ce54adb510dde1835e4a652ece3a0e8"
+OLD_BASE = "31897cd7d7bbbf7b51cc3d522a2a77f4e7ec908a"
+OLD_TREE = "9dd2beafcee4ae17bde6be0acc74d70d249d4d6d"
+OLD_PATCH = ROOT / "tools/testing/fixtures/r6a-maintenance.patch"
+OLD_PATCH_SHA = "8a459221ac0fbf7eb32fd5fb8ded3b3e7f351f61f90f2d034794b2aae5dc1244"
+NEW = "d1989d3c0d21d22f60507b681d1eb288a8f42dce"
 
 
 def run(args, **kwargs):
@@ -46,6 +50,25 @@ def require(condition, message):
         raise SystemExit(message)
 
 
+def patched_tree(base, patch, patch_sha, expected_tree, repo=ROOT):
+    """Reconstruct the reviewed maintenance tree without touching the user's index.
+
+    The backport commit may be absent in a fresh main-branch checkout. Its source
+    is still reproducible from the reachable base, checked-in patch and tree pin.
+    No capability or production configuration is rewritten by the build.
+    """
+    require(sha(patch) == patch_sha, "maintenance patch hash changed")
+    with tempfile.TemporaryDirectory(prefix="nodus-backport-index-") as temporary:
+        env = dict(os.environ, GIT_INDEX_FILE=str(Path(temporary) / "index"))
+        def git(*args):
+            return subprocess.check_output(["git", *args], cwd=repo, env=env)
+        git("read-tree", base)
+        git("apply", "--cached", "--binary", str(patch.resolve()))
+        tree = git("write-tree").decode().strip()
+    require(tree == expected_tree, "maintenance source tree changed")
+    return tree
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path)
@@ -64,7 +87,10 @@ def main():
     env["CARGO_TARGET_DIR"] = str(ROOT / "target/mixed-binary-build/harness")
     env["CARGO_PROFILE_DEV_DEBUG"] = "0"
     env["CARGO_PROFILE_TEST_DEBUG"] = "0"
-    manifest = {"schema_version": 1, "old_revision": OLD, "new_revision": NEW,
+    old_tree = patched_tree(OLD_BASE, OLD_PATCH, OLD_PATCH_SHA, OLD_TREE)
+    manifest = {"schema_version": 2, "old_revision": OLD, "new_revision": NEW,
+                "old_base_revision": OLD_BASE, "old_tree": old_tree,
+                "old_patch_sha256": OLD_PATCH_SHA,
                 "rustc": subprocess.check_output(["rustc", "--version"], text=True).strip(),
                 "binaries": {}}
     for label, revision in [("old", OLD), ("new", NEW)]:
@@ -73,7 +99,8 @@ def main():
             source = out / ("source-" + label)
             source.mkdir(exist_ok=False)
             archive = out / (label + ".tar")
-            run(["git", "archive", "--format=tar", "--output", str(archive), revision])
+            source_ref = old_tree if label == "old" else revision
+            run(["git", "archive", "--format=tar", "--output", str(archive), source_ref])
             run(["tar", "-xf", str(archive), "-C", str(source)])
             build_env = dict(env, CARGO_TARGET_DIR=str(ROOT / "target/mixed-binary-build" / revision))
             with (out / ("build-" + label + ".log")).open("w") as log:

@@ -1,0 +1,722 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index ceef700d7e9ccf5f6276e13f9f6fde4f94e12b2f..cc4ccdf1c1eeb86cbc26920a595a69ef58a8f4ea 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2466,6 +2466,7 @@ dependencies = [
+  "sqlparser",
+  "tempfile",
+  "tokio",
++ "tokio-postgres",
+  "tokio-rustls",
+  "tower-http 0.7.1",
+  "tracing",
+diff --git a/crates/nodus_security/src/lib.rs b/crates/nodus_security/src/lib.rs
+index 05aadf3315444eb9da13c451546c48f3184be9f4..73401b9a81f2600af168aaae314bac62352150ca 100644
+--- a/crates/nodus_security/src/lib.rs
++++ b/crates/nodus_security/src/lib.rs
+@@ -1,6 +1,8 @@
+ use chrono::{DateTime, Utc};
+ use hmac::{Hmac, KeyInit, Mac};
+-use nodus_catalog::{CatalogReader, DatabaseId, PrincipalId, RoleId};
++use nodus_catalog::{
++    CatalogReader, DatabaseId, DescriptorState, PrincipalId, PrincipalType, ResourceRef, RoleId,
++};
+ use serde::{Deserialize, Serialize};
+ use sha2::Sha256;
+ use std::collections::HashMap;
+@@ -200,10 +202,18 @@ pub enum AuthError {
+ /// invalidating existing credentials. Plaintext passwords are never retained.
+ #[derive(Debug, Clone)]
+ struct StoredCredential {
+-    principal_id: PrincipalId,
++    identity: CredentialIdentity,
+     keys: ScramKeys,
+ }
+ 
++#[derive(Debug, Clone, Copy)]
++enum CredentialIdentity {
++    Principal(PrincipalId),
++    /// An operator-configured credential, not a password belonging to a catalog
++    /// user. Only the active global `nodus` user with direct System ALL qualifies.
++    BootstrapAdministrator,
++}
++
+ /// PBKDF2-HMAC-SHA256 work factor. A deliberate cost (vs. a single SHA-256) so an
+ /// attacker who exfiltrates the credential store can't brute-force at hash speed.
+ ///
+@@ -275,12 +285,33 @@ impl PasswordAuthenticator {
+     /// generated here and the SCRAM keys are derived, so callers never deal with
+     /// hashing or the password beyond this call.
+     pub fn set_password(&self, username: &str, principal_id: PrincipalId, password: &str) {
++        self.register_password(
++            username,
++            CredentialIdentity::Principal(principal_id),
++            password,
++        );
++    }
++
++    /// Registers the explicitly configured bootstrap operator password. Snapshot
++    /// installation can replace node-local bootstrap IDs with the cluster's ID.
++    /// Each new session resolves the already-privileged global administrator;
++    /// this never creates principals or restores revoked grants. Ordinary user
++    /// credentials registered with `set_password` never follow a name replacement.
++    pub fn set_bootstrap_password(&self, password: &str) {
++        self.register_password(
++            "nodus",
++            CredentialIdentity::BootstrapAdministrator,
++            password,
++        );
++    }
++
++    fn register_password(&self, username: &str, identity: CredentialIdentity, password: &str) {
+         let salt = Uuid::new_v4().as_bytes().to_vec();
+         let keys = ScramKeys::derive(password, salt, PBKDF2_ITERATIONS);
+-        self.credentials.write().unwrap().insert(
+-            username.to_string(),
+-            StoredCredential { principal_id, keys },
+-        );
++        self.credentials
++            .write()
++            .unwrap()
++            .insert(username.to_string(), StoredCredential { identity, keys });
+     }
+ 
+     /// Returns the stored SCRAM verifier material for `username`, if known. Used
+@@ -295,30 +326,68 @@ impl PasswordAuthenticator {
+     }
+ 
+     /// Issues a session for an already-authenticated user (e.g. after a SCRAM
+-    /// exchange has verified the client's proof). Fails only if the user is
+-    /// unknown.
++    /// exchange has verified the client's proof). Rechecks identity and current
++    /// bootstrap eligibility after the exchange, including snapshot replacement.
+     pub fn issue_session(&self, username: &str) -> Result<Session, AuthError> {
+-        let principal_id = self
++        let identity = self
+             .credentials
+             .read()
+             .unwrap()
+             .get(username)
+-            .map(|c| c.principal_id)
++            .map(|c| c.identity)
+             .ok_or_else(|| AuthError::UnknownUser(username.to_string()))?;
+-        Ok(self.build_session(principal_id))
++        self.build_session(username, identity)
+     }
+ 
+-    fn build_session(&self, principal_id: PrincipalId) -> Session {
++    fn build_session(
++        &self,
++        username: &str,
++        identity: CredentialIdentity,
++    ) -> Result<Session, AuthError> {
++        let denied = || AuthError::InvalidCredentials(username.to_owned());
++        let principal = match identity {
++            CredentialIdentity::Principal(id) => self.catalog.get_principal_by_id(id),
++            CredentialIdentity::BootstrapAdministrator => {
++                self.catalog.get_principal_by_name("nodus")
++            }
++        }
++        .map_err(|_| denied())?;
++        if principal.name != username
++            || principal.state != DescriptorState::Public
++            || !matches!(
++                principal.principal_type,
++                PrincipalType::User | PrincipalType::ServiceAccount
++            )
++        {
++            return Err(denied());
++        }
++        if matches!(identity, CredentialIdentity::BootstrapAdministrator) {
++            let grants = self
++                .catalog
++                .get_grants_for_resource(ResourceRef::System)
++                .map_err(|_| denied())?;
++            if principal.principal_type != PrincipalType::User
++                || principal.database_id.is_some()
++                || !grants.iter().any(|g| {
++                    g.principal_id == principal.id
++                        && g.state == DescriptorState::Public
++                        && g.privilege.eq_ignore_ascii_case("ALL")
++                })
++            {
++                return Err(denied());
++            }
++        }
++        let principal_id = principal.id;
+         let active_roles = self
+             .catalog
+             .get_effective_roles(principal_id)
+-            .unwrap_or_default();
+-        Session {
++            .map_err(|_| denied())?;
++        Ok(Session {
+             session_id: Uuid::new_v4().to_string(),
+             principal_id,
+             active_roles,
+             database_id: None,
+-        }
++        })
+     }
+ }
+ 
+@@ -340,7 +409,7 @@ impl Authenticator for PasswordAuthenticator {
+             return Err(AuthError::InvalidCredentials(username.to_string()));
+         }
+ 
+-        Ok(self.build_session(cred.principal_id))
++        self.build_session(username, cred.identity)
+     }
+ }
+ 
+@@ -384,6 +453,117 @@ mod tests {
+     use super::*;
+     use nodus_catalog::{CatalogWriter, CreateRoleRequest, MemoryCatalog, PrincipalType};
+ 
++    fn user(catalog: &MemoryCatalog, name: &str) -> PrincipalId {
++        catalog
++            .create_role(CreateRoleRequest {
++                id: PrincipalId::new(),
++                name: name.into(),
++                principal_type: PrincipalType::User,
++                database_id: None,
++            })
++            .unwrap()
++            .id
++    }
++
++    #[test]
++    fn ordinary_credentials_never_follow_replaced_principals() {
++        let local = Arc::new(MemoryCatalog::new());
++        let old_id = user(&local, "alice");
++        let auth = PasswordAuthenticator::new(local.clone());
++        auth.set_password("alice", old_id, "alice-secret");
++        assert_eq!(auth.issue_session("alice").unwrap().principal_id, old_id);
++        let incoming = MemoryCatalog::new();
++        let new_id = user(&incoming, "alice");
++        assert_ne!(old_id, new_id);
++        local
++            .install_raft_catalog(&incoming.export_raft_catalog().unwrap(), &mut || Ok(()))
++            .unwrap();
++        assert!(auth.authenticate("alice", "alice-secret").is_err());
++        assert!(auth.issue_session("alice").is_err());
++    }
++
++    #[test]
++    fn bootstrap_password_rejects_roles_service_accounts_and_database_scoped_users() {
++        use nodus_catalog::{GrantId, GrantPrivilegeRequest};
++        for (principal_type, database_id) in [
++            (PrincipalType::Role, None),
++            (PrincipalType::ServiceAccount, None),
++            (PrincipalType::User, Some(DatabaseId::new())),
++        ] {
++            let catalog = Arc::new(MemoryCatalog::new());
++            let id = PrincipalId::new();
++            catalog
++                .create_role(CreateRoleRequest {
++                    id,
++                    name: "nodus".into(),
++                    principal_type,
++                    database_id,
++                })
++                .unwrap();
++            catalog
++                .grant_privilege(GrantPrivilegeRequest {
++                    id: GrantId::new(),
++                    principal_id: id,
++                    resource: ResourceRef::System,
++                    privilege: "ALL".into(),
++                })
++                .unwrap();
++            let auth = PasswordAuthenticator::new(catalog);
++            auth.set_bootstrap_password("operator-secret");
++            assert!(auth.authenticate("nodus", "operator-secret").is_err());
++            assert!(auth.issue_session("nodus").is_err());
++        }
++    }
++
++    #[test]
++    fn bootstrap_operator_credential_requires_an_existing_global_administrator() {
++        use nodus_catalog::{GrantId, GrantPrivilegeRequest, RevokePrivilegeRequest};
++        let local = Arc::new(MemoryCatalog::new());
++        user(&local, "nodus");
++        let auth = PasswordAuthenticator::new(local.clone());
++        auth.set_bootstrap_password("operator-secret");
++        // A same-name user without explicit administrator authority cannot log in.
++        assert!(auth.authenticate("nodus", "operator-secret").is_err());
++        assert!(auth.issue_session("nodus").is_err());
++        let incoming = MemoryCatalog::new();
++        let id = user(&incoming, "nodus");
++        incoming
++            .grant_privilege(GrantPrivilegeRequest {
++                id: GrantId::new(),
++                principal_id: id,
++                resource: ResourceRef::System,
++                privilege: "ALL".into(),
++            })
++            .unwrap();
++        local
++            .install_raft_catalog(&incoming.export_raft_catalog().unwrap(), &mut || Ok(()))
++            .unwrap();
++        assert_eq!(
++            auth.authenticate("nodus", "operator-secret")
++                .unwrap()
++                .principal_id,
++            id
++        );
++        assert_eq!(auth.issue_session("nodus").unwrap().principal_id, id);
++        assert!(auth.authenticate("nodus", "wrong").is_err());
++        local
++            .revoke_privilege(RevokePrivilegeRequest {
++                principal_id: id,
++                resource: ResourceRef::System,
++                privilege: "ALL".into(),
++            })
++            .unwrap();
++        assert!(auth.issue_session("nodus").is_err());
++        assert!(auth.authenticate("nodus", "operator-secret").is_err());
++        local
++            .install_raft_catalog(
++                &MemoryCatalog::new().export_raft_catalog().unwrap(),
++                &mut || Ok(()),
++            )
++            .unwrap();
++        assert!(auth.issue_session("nodus").is_err());
++    }
++
+     #[test]
+     fn authenticate_success_and_failure() {
+         let catalog = Arc::new(MemoryCatalog::new());
+diff --git a/crates/nodus_server/Cargo.toml b/crates/nodus_server/Cargo.toml
+index cdab56a68e1ae15897cfacd156d587124efcb11a..8a9b577fd5bf0072dca8b31d332655c6eb05dedd 100644
+--- a/crates/nodus_server/Cargo.toml
++++ b/crates/nodus_server/Cargo.toml
+@@ -53,6 +53,7 @@ axum-server = { version = "0.8.0", features = ["tls-rustls"] }
+ sqlparser.workspace = true
+ 
+ [dev-dependencies]
++tokio-postgres.workspace = true
+ tempfile = "3.27.0"
+ rcgen = "0.14.10"
+ 
+diff --git a/crates/nodus_server/src/lib.rs b/crates/nodus_server/src/lib.rs
+index f40ff9f52eff105b22730cc87b385e24fe9a1b84..ae2f82d3c81f69975c433e13e21f73171f42dfee 100644
+--- a/crates/nodus_server/src/lib.rs
++++ b/crates/nodus_server/src/lib.rs
+@@ -10,6 +10,8 @@ mod raft_router;
+ mod raft_shard_meta;
+ mod raft_upgrade;
+ #[cfg(test)]
++mod snapshot_auth_tests;
++#[cfg(test)]
+ mod snapshot_tests;
+ mod tls;
+ #[cfg(test)]
+@@ -38,6 +40,8 @@ use tokio_rustls::rustls::server::WebPkiClientVerifier;
+ use tower_http::cors::{Any, CorsLayer};
+ 
+ pub struct ServerHandle {
++    #[cfg(test)]
++    catalog: Arc<nodus_catalog::MemoryCatalog>,
+     pub pgwire_addr: SocketAddr,
+     pub http_addr: SocketAddr,
+     pub pgwire_task: JoinHandle<anyhow::Result<()>>,
+@@ -742,7 +746,7 @@ pub async fn run_server_with_config(
+         );
+         generated
+     });
+-    authenticator.set_password("nodus", admin.id, &admin_password);
++    authenticator.set_bootstrap_password(&admin_password);
+ 
+     // The pgwire and HTTP listeners share one TLS config and its reloadable
+     // certificate resolver (rotated together on SIGHUP).
+@@ -881,7 +885,9 @@ pub async fn run_server_with_config(
+                                                         .await
+                                                         .unwrap_or(false)
+                                                 {
+-                                                    let _ = std::fs::remove_file(&path);
++                                                    if let Err(error) = local_kv_clone.reclaim_archived_wal_segment(id) {
++                                                        tracing::warn!(segment_id = id, %error, "archived WAL cleanup failed; retaining local segment");
++                                                    }
+                                                 }
+                                             } else {
+                                                 let _ = backup_clone
+@@ -1155,6 +1161,8 @@ pub async fn run_server_with_config(
+     });
+ 
+     Ok(ServerHandle {
++        #[cfg(test)]
++        catalog,
+         pgwire_addr,
+         http_addr,
+         pgwire_task,
+diff --git a/crates/nodus_server/src/snapshot_auth_tests.rs b/crates/nodus_server/src/snapshot_auth_tests.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..923e7fab1c43b5e4463a19ffa1e94603e1c19658
+--- /dev/null
++++ b/crates/nodus_server/src/snapshot_auth_tests.rs
+@@ -0,0 +1,180 @@
++//! Real pgwire/SCRAM and admin Basic-auth checks across catalog checkpoint install.
++use super::*;
++use nodus_catalog::{MemoryCatalog, PrincipalId, RevokePrivilegeRequest};
++use std::time::Duration;
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
++async fn snapshot_catalog_replacement_keeps_bootstrap_login_and_respects_revocation() {
++    let mut config = NodusConfig::default();
++    config.admin.password = Some("snapshot-test-password".into());
++    config.admin.token = Some("snapshot-test-token".into());
++    let (stop, shutdown) = tokio::sync::watch::channel(());
++    let server = run_server_with_config(
++        TcpListener::bind("127.0.0.1:0").await.unwrap(),
++        TcpListener::bind("127.0.0.1:0").await.unwrap(),
++        config,
++        shutdown,
++    )
++    .await
++    .unwrap();
++    let http = reqwest::Client::new();
++    let base = format!("http://{}", server.http_addr);
++    tokio::time::timeout(Duration::from_secs(15), async {
++        while !http
++            .get(format!("{base}/readyz"))
++            .send()
++            .await
++            .unwrap()
++            .status()
++            .is_success()
++        {
++            tokio::time::sleep(Duration::from_millis(20)).await;
++        }
++    })
++    .await
++    .unwrap();
++    let url = format!(
++        "host=127.0.0.1 port={} user=nodus password=snapshot-test-password dbname=nodus",
++        server.pgwire_addr.port()
++    );
++    let (old_client, old_connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
++        .await
++        .unwrap();
++    let old_task = tokio::spawn(old_connection);
++    let old_id = server.catalog.get_principal_by_name("nodus").unwrap().id;
++
++    let incoming = MemoryCatalog::new();
++    incoming
++        .import_snapshot(server.catalog.export_snapshot())
++        .unwrap();
++    let id = PrincipalId::new();
++    incoming
++        .create_role(CreateRoleRequest {
++            id,
++            name: "nodus".into(),
++            principal_type: PrincipalType::User,
++            database_id: None,
++        })
++        .unwrap();
++    incoming
++        .grant_privilege(GrantPrivilegeRequest {
++            id: nodus_catalog::GrantId::new(),
++            principal_id: id,
++            resource: ResourceRef::System,
++            privilege: "ALL".into(),
++        })
++        .unwrap();
++    // Exercise the same atomic catalog projection replacement used by Raft
++    // snapshots. Durability/transport are covered by the process matrix.
++    server
++        .catalog
++        .install_raft_catalog(&incoming.export_raft_catalog().unwrap(), &mut || Ok(()))
++        .unwrap();
++    assert_ne!(old_id, id);
++    let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
++        .await
++        .unwrap();
++    let task = tokio::spawn(connection);
++    client.simple_query("SELECT 42").await.unwrap();
++    assert!(server.registry.list().iter().any(|s| s.principal_id == id));
++    assert!(
++        server
++            .registry
++            .list()
++            .iter()
++            .any(|s| s.principal_id == old_id),
++        "existing sessions must not be rebound"
++    );
++    assert!(
++        old_client
++            .simple_query("CREATE TABLE stale_session (id INT)")
++            .await
++            .is_err()
++    );
++    assert_eq!(
++        http.get(format!("{base}/api/v1/grants"))
++            .basic_auth("nodus", Some("snapshot-test-password"))
++            .send()
++            .await
++            .unwrap()
++            .status(),
++        200
++    );
++    assert_eq!(
++        http.get(format!("{base}/api/v1/grants"))
++            .basic_auth("nodus", Some("wrong-password"))
++            .send()
++            .await
++            .unwrap()
++            .status(),
++        401
++    );
++
++    assert_eq!(
++        http.post(format!("{base}/api/v1/node/take-leadership/missing"))
++            .basic_auth("nodus", Some("snapshot-test-password"))
++            .send()
++            .await
++            .unwrap()
++            .status(),
++        404
++    );
++    let events: serde_json::Value = http
++        .get(format!("{base}/api/v1/audit"))
++        .basic_auth("nodus", Some("snapshot-test-password"))
++        .send()
++        .await
++        .unwrap()
++        .json()
++        .await
++        .unwrap();
++    assert!(
++        events
++            .as_array()
++            .unwrap()
++            .iter()
++            .any(|event| event["actor"] == serde_json::json!(id)
++                && event["action"] == "ManageNode"
++                && event["result"] == "Failure"
++                && event["resource"] == serde_json::json!(ResourceRef::System)
++                && event["reason"] == "POST /api/v1/node/take-leadership/missing")
++    );
++
++    server
++        .catalog
++        .revoke_privilege(RevokePrivilegeRequest {
++            principal_id: id,
++            resource: ResourceRef::System,
++            privilege: "ALL".into(),
++        })
++        .unwrap();
++    assert!(
++        tokio_postgres::connect(&url, tokio_postgres::NoTls)
++            .await
++            .is_err()
++    );
++    assert_eq!(
++        http.get(format!("{base}/api/v1/grants"))
++            .basic_auth("nodus", Some("snapshot-test-password"))
++            .send()
++            .await
++            .unwrap()
++            .status(),
++        401
++    );
++    assert!(
++        client
++            .simple_query("CREATE TABLE revoked_session (id INT)")
++            .await
++            .is_err()
++    );
++    drop((client, old_client));
++    task.abort();
++    old_task.abort();
++    let _ = stop.send(());
++    let _ = server.pgwire_task.await;
++    let _ = server.http_task.await;
++    for task in server.background_tasks {
++        let _ = task.await;
++    }
++}
+diff --git a/crates/nodus_storage_api/src/lib.rs b/crates/nodus_storage_api/src/lib.rs
+index 90356ae8c931b0cf9ef96f44c236451f4d2f6570..2ac5c5d58588faf05e9db157daada16be7f31370 100644
+--- a/crates/nodus_storage_api/src/lib.rs
++++ b/crates/nodus_storage_api/src/lib.rs
+@@ -72,6 +72,14 @@ pub enum IntentReplacement {
+ }
+ 
+ pub trait KvEngine: Send + Sync {
++    /// Removes an already-archived local WAL segment only when the durable
++    /// checkpoint no longer needs it for crash recovery. The caller must first
++    /// satisfy archive/backup retention policy. Unsupported engines retain it.
++    /// Implementations serialize the check and removal with checkpoint publication.
++    fn reclaim_archived_wal_segment(&self, _segment_id: u64) -> Result<bool> {
++        Ok(false)
++    }
++
+     /// Node-local checkpoint identity. Namespace adapters must delegate to the
+     /// physical engine; it is never transferred in a Raft snapshot.
+     fn recovery_generation(&self) -> Result<Option<recovery::RecoveryGeneration>> {
+diff --git a/crates/nodus_storage_lsm/src/lib.rs b/crates/nodus_storage_lsm/src/lib.rs
+index 4c1a61df7e2a3ad6abcb8a4bb06ed512e4703d58..4bec672d413880864168e0f4ee1c8a207d634112 100644
+--- a/crates/nodus_storage_lsm/src/lib.rs
++++ b/crates/nodus_storage_lsm/src/lib.rs
+@@ -605,6 +605,26 @@ impl Default for LsmKvEngine {
+ }
+ 
+ impl KvEngine for LsmKvEngine {
++    fn reclaim_archived_wal_segment(&self, segment_id: u64) -> Result<bool> {
++        let _snapshot = self.snapshot_gate.read().unwrap();
++        self.snapshot_available()?;
++        let _checkpoint = self.flush_compact_lock.lock().unwrap();
++        let Some(dir) = &self.data_dir else {
++            return Ok(false);
++        };
++        // Consult the published manifest, not in-memory counters: a failed
++        // manifest publication may have already advanced those counters.
++        let manifest: Manifest = serde_json::from_slice(&std::fs::read(dir.join(MANIFEST_FILE))?)?;
++        if segment_id >= manifest.min_replay_wal || segment_id == manifest.active_wal {
++            return Ok(false);
++        }
++        match std::fs::remove_file(dir.join(format!("{segment_id}.log"))) {
++            Ok(()) => Ok(true),
++            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
++            Err(error) => Err(error.into()),
++        }
++    }
++
+     fn snapshot_rows(
+         &self,
+         scope: &nodus_storage_api::SnapshotScope,
+@@ -1751,6 +1771,68 @@ mod sst_tests {
+         );
+     }
+ 
++    #[test]
++    fn archived_wal_reclamation_preserves_cross_segment_commits() {
++        let dir = tempfile::tempdir().unwrap();
++        let engine = LsmKvEngine::with_wal(dir.path(), None).unwrap();
++        let first = engine.active_wal_id.load(Ordering::Relaxed);
++        let txn = TxnId::new();
++        engine
++            .write_intent(
++                txn,
++                Bytes::from_static(b"vote"),
++                Bytes::from_static(b"term-7"),
++            )
++            .unwrap();
++        engine.flush().unwrap(); // Retain the intent and its predecessor WAL.
++        engine.commit(txn, 7).unwrap(); // Commit lands in the successor segment.
++        assert!(!engine.reclaim_archived_wal_segment(first).unwrap());
++        drop(engine);
++
++        let engine = LsmKvEngine::with_wal(dir.path(), None).unwrap();
++        assert_eq!(
++            engine.get(b"vote", u64::MAX).unwrap(),
++            Some(Bytes::from_static(b"term-7"))
++        );
++        engine.flush().unwrap(); // A complete checkpoint now covers the commit.
++        assert!(engine.reclaim_archived_wal_segment(first).unwrap());
++        assert!(
++            !engine
++                .reclaim_archived_wal_segment(engine.active_wal_id.load(Ordering::Relaxed))
++                .unwrap()
++        );
++        drop(engine);
++        let engine = LsmKvEngine::with_wal(dir.path(), None).unwrap();
++        assert_eq!(
++            engine.get(b"vote", u64::MAX).unwrap(),
++            Some(Bytes::from_static(b"term-7"))
++        );
++    }
++
++    #[test]
++    fn wal_reclamation_uses_published_manifest_and_fails_closed() {
++        let dir = tempfile::tempdir().unwrap();
++        let engine = LsmKvEngine::with_wal(dir.path(), None).unwrap();
++        let first = engine.active_wal_id.load(Ordering::Relaxed);
++        engine
++            .write_intent(
++                TxnId::new(),
++                Bytes::from_static(b"pending"),
++                Bytes::from_static(b"value"),
++            )
++            .unwrap();
++        engine.flush().unwrap();
++        assert_ne!(first, engine.active_wal_id.load(Ordering::Relaxed));
++        // Model counters advancing ahead of a failed manifest publication.
++        engine.min_replay_wal.store(first + 10, Ordering::Relaxed);
++        assert!(!engine.reclaim_archived_wal_segment(first).unwrap());
++        let path = dir.path().join(format!("{first}.log"));
++        assert!(path.exists());
++        std::fs::write(dir.path().join(MANIFEST_FILE), b"invalid").unwrap();
++        assert!(engine.reclaim_archived_wal_segment(first).is_err());
++        assert!(path.exists());
++    }
++
+     #[test]
+     fn replay_floor_advances_when_no_intent_is_retained() {
+         // A clean flush (no retained intents) should advance the replay floor so
+diff --git a/docs/reference/admin-api-authorization.md b/docs/reference/admin-api-authorization.md
+index fd0df3ebed5b6a2d0ce2b4fd7ca9d451a9f0c428..3a2e17091605d7827fccd32297543c88a7135a65 100644
+--- a/docs/reference/admin-api-authorization.md
++++ b/docs/reference/admin-api-authorization.md
+@@ -20,6 +20,22 @@ rejected at startup unless `allow_insecure` is set explicitly.
+ An invalid token, an undecodable Basic header, or credentials that fail
+ authentication all return `401 Unauthorized`.
+ 
++The configured bootstrap password (`admin.password`) is an operator credential
++for `nodus`, shared by SQL SCRAM authentication and HTTP Basic authentication.
++New logins resolve the current catalog identity only if it is an active global
++user named `nodus` with a direct `ALL` grant on `System`. This allows a node to
++keep accepting bootstrap logins after a Raft snapshot replaces its locally
++created administrator ID with the cluster's ID. Login never creates that user
++or restores its grants. Removing the user or revoking that grant disables new
++bootstrap password logins while the server is running; the existing startup
++bootstrap still creates/grants the administrator when the server restarts.
++
++Ordinary passwords remain bound to immutable principal IDs. Deleting a user or
++replacing it with a same-name user does not transfer its password. Existing SQL
++sessions also keep their original IDs and subsequent privileged operations must
++pass authorization against the current catalog. Reconnect after snapshot identity
++replacement. These rules do not change the separate admin-token mechanism.
++
+ ## Route privileges
+ 
+ | Route prefix | Required action |
+diff --git a/docs/reference/durability-contract.md b/docs/reference/durability-contract.md
+index ff01ea607eb8e0c0eab80d5594f5ed8376e99a28..6e26471cdbdd6ec4f0593a2616be8d2865d772b9 100644
+--- a/docs/reference/durability-contract.md
++++ b/docs/reference/durability-contract.md
+@@ -35,6 +35,8 @@ on-disk state a crash would leave.
+ | Orphan SSTable absent from the manifest (crash before swap) | `nodus_storage_lsm`: `orphan_sstable_not_in_manifest_is_ignored` |
+ | Corrupt or torn manifest | `nodus_storage_lsm`: `corrupt_manifest_recovers_via_directory_scan` |
+ | Flush mid-transaction strands an intent | `nodus_storage_lsm`: `flush_retains_uncommitted_intents` |
++| Archive cleanup while a commit spans WAL segments | `nodus_storage_lsm`: `archived_wal_reclamation_preserves_cross_segment_commits` |
++| Cleanup after an unpublished or corrupt manifest | `nodus_storage_lsm`: `wal_reclamation_uses_published_manifest_and_fails_closed` |
+ | Compaction merges accumulated SSTables | `nodus_storage_lsm`: `compaction_merges_accumulated_sstables` |
+ | Recovery across flush and compaction (manifest-driven) | `nodus_storage_lsm`: `manifest_recovery_after_flush_and_compaction` |
+ | Unreadable or missing SSTable during a read | `nodus_storage_lsm`: `unavailable_sstable_fails_reads_instead_of_hiding_committed_rows` |
+@@ -42,6 +44,16 @@ on-disk state a crash would leave.
+ | Rolled-back writes never visible, before or after restart | `tests/fault`: `rolled_back_writes_are_never_visible` |
+ | Point-in-time restore replays archived WAL to a target time | `tests/integration`: `admin_backup_pitr_restore` |
+ 
++## Local WAL archive cleanup
++
++The server may remove an archived local WAL segment only after backup retention
++permits cleanup **and** the LSM's published manifest places it below the local
++replay floor. The storage engine checks and removes it while serialized with
++checkpoint publication. Archiving alone does not make a segment dispensable:
++an intent retained during a flush can still require an earlier segment on restart.
++Invalid or unavailable checkpoint metadata prevents cleanup. This uses the
++existing manifest format and does not require upgrade finalization.
++
+ ## Atomic Raft snapshot installation
+ 
+ With persistent LSM storage, a validated snapshot replaces its group's rows and
+@@ -92,6 +104,6 @@ prove power-loss durability. See the [protocol and compatibility limits](../expl
+ | In-memory by default | Durability requires `[storage] data_dir`. |
+ | On-disk formats are not backward compatible across the hardening changes (WAL CRC frame, SSTable v2, catalog-in-KV) | Upgrading across those changes requires a clean restart. There is no cross-version on-disk compatibility guarantee yet. |
+ | Catalog persistence writes a full-state blob per DDL | Catalog writes are not incremental per entry. |
+-| WAL segment retention is not automatic | Superseded segments are retained for point-in-time recovery; reclaiming them is manual. |
++| WAL retention has two boundaries | Local cleanup waits for both backup retention and the durable local replay floor; retained intents or restore points can delay reclamation. |
+ | General runtime fault injection is not wired into the storage engines | Snapshot tests have targeted test-only subprocess exit hooks; these and existing disk-residue tests do not establish power-loss durability. |
+ | Single-node scope | This contract covers local durability. Replication and cross-node durability are properties of the Raft layer, not of this contract. |

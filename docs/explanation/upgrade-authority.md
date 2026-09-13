@@ -171,13 +171,15 @@ used as writer or backup authority.
   treats a build error as fatal. This availability limit ends for eligible v2 groups
   after finalization, subject to the existing snapshot size and installation limits.
 - Binary `c138079` and earlier do not read `UpgradeControlV1`. Deploy this authority
-  reader to every member before starting the protocol. The pinned R6a/R6b
+  reader to every member before starting the protocol. The pinned maintenance
   [two-binary gate](../how-to/test-mixed-binary-upgrades.md) exercises same-directory
-  executable rollback before admission, but found snapshot login failures,
-  premature local WAL cleanup and long log-purge pauses. The working-tree
-  candidate repairs bootstrap credential resolution and local WAL reclamation;
-  the unchanged historical readers still have those defects. This pair is not
-  certified for uninterrupted upgrades.
+  executable rollback before admission. Both pinned readers include bootstrap
+  authentication and local WAL-retention fixes; the older maintenance reader still
+  rejects admission commands. The original historical binaries retain those
+  defects and are not covered by maintenance-pair acceptance. The September 14
+  maintenance-pair run passed all thirteen checkpoints without diagnostic restarts.
+  Long synchronous
+  log-purge pauses remain, so passing the matrix is not a latency guarantee.
   Feature rollback does **not** establish arbitrary executable compatibility.
 - Tests cover full voter/learner reports, duplicate/unknown/stale reports, premature
   finalization, rollback, malformed records, actual mTLS/Raft leader loss and reopen,
