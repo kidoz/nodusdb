@@ -11,6 +11,7 @@ publish = false
 workspace = true
 
 [dependencies]
+nodus_import = { path = "../../crates/nodus_import" }
 nodus_testkit = { path = "../../crates/nodus_testkit" }
 nodus_config = { path = "../../crates/nodus_config" }
 bytes.workspace = true

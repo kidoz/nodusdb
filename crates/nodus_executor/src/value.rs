@@ -60,11 +60,8 @@ pub(crate) fn column_type(data_type: &str) -> ColumnType {
 }
 
 /// Coerces a literal string into a typed value for the given column type.
-/// Empty strings and unparseable numerics become `Null`.
+/// Empty text is preserved; unparseable numerics become `Null`.
 pub(crate) fn coerce(raw: &str, ty: ColumnType) -> Value {
-    if raw.is_empty() {
-        return Value::Null;
-    }
     match ty {
         ColumnType::Int => raw.parse::<i64>().map(Value::Int).unwrap_or(Value::Null),
         ColumnType::Float => raw.parse::<f64>().map(Value::Float).unwrap_or(Value::Null),
@@ -471,6 +468,11 @@ mod tests {
         assert_eq!(coerce_for_column(&j, "JSONB"), j);
         let arr = Value::Array(vec![Value::Int(1), Value::Int(2)]);
         assert_eq!(coerce_for_column(&arr, "INT[]"), arr);
+        assert_eq!(
+            coerce_for_column(&Value::Text(String::new()), "TEXT"),
+            Value::Text(String::new())
+        );
+        assert_eq!(coerce_for_column(&Value::Null, "TEXT"), Value::Null);
         // NULL is preserved.
         assert_eq!(coerce_for_column(&Value::Null, "INT"), Value::Null);
     }

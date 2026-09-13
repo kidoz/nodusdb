@@ -23,9 +23,11 @@ mod dml;
 mod execute;
 pub(crate) mod filter_eval;
 mod information_schema;
+mod parameters;
 mod pg_catalog;
 mod plan_types;
 mod planner;
+mod result_types;
 mod select;
 mod session_vars;
 mod set_ops;
@@ -39,8 +41,10 @@ pub use plan_types::{
     AggregateOp, AlterTableOp, CompareOp, FilterExpr, Join, JoinType, LogicalPlan, Operand,
     Predicate, ProjectionItem, ScalarBinaryOp, ScalarExpr, ScalarUnaryOp, SetOpKind, TableFnSpec,
 };
+pub use planner::{
+    CopyOutputFormat, expr_to_value, parse_object_name, plan_copy_out, plan_statement,
+};
 pub(crate) use planner::{eval_scalar_expr, parse_filter_expr, scalar_has_aggregate};
-pub use planner::{expr_to_value, parse_object_name, plan_statement};
 pub use value::{ColumnDef, Value};
 pub(crate) use value::{
     coerce, column_type, compare, eval_scalar_function, literal_arg, render, resolve_scalar_arg,
@@ -152,6 +156,16 @@ pub struct Row {
 }
 
 pub trait Executor: Send + Sync {
+    /// Infers parameter SQL types without executing the statement. Unknown
+    /// contexts remain `None`; caller-specified types take precedence.
+    fn infer_parameter_types(
+        &self,
+        _ctx: &ExecutionContext,
+        _sql: &str,
+    ) -> Result<Vec<Option<String>>> {
+        Ok(vec![])
+    }
+
     fn execute_logical(&self, ctx: &ExecutionContext, plan: LogicalPlan) -> Result<QueryOutput>;
     fn execute_physical(&self, ctx: &ExecutionContext, plan: PhysicalPlan) -> Result<Vec<Row>>;
 
@@ -767,6 +781,14 @@ impl Default for MemExecutor {
 }
 
 impl Executor for MemExecutor {
+    fn infer_parameter_types(
+        &self,
+        ctx: &ExecutionContext,
+        sql: &str,
+    ) -> Result<Vec<Option<String>>> {
+        self.infer_sql_parameters(ctx, sql)
+    }
+
     fn execute_logical(&self, ctx: &ExecutionContext, plan: LogicalPlan) -> Result<QueryOutput> {
         // Fence query execution during a restore: reject new statements, and
         // hold a drain guard for the rest of this call so a concurrently

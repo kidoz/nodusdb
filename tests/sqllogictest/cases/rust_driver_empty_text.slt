@@ -1,0 +1,24 @@
+# Empty text must remain distinct from NULL in writes, predicates, and subqueries.
+statement ok
+CREATE TABLE empty_text (id INTEGER PRIMARY KEY, label TEXT);
+
+statement ok
+INSERT INTO empty_text VALUES (1, ''), (2, NULL), (3, 'value');
+
+query I
+SELECT id FROM empty_text WHERE label = '';
+----
+1
+
+query I
+SELECT id FROM empty_text WHERE label IS NULL;
+----
+2
+
+query I
+SELECT id FROM empty_text WHERE label NOT IN (SELECT label FROM empty_text WHERE id = 2);
+----
+
+query I
+SELECT id FROM empty_text WHERE label = (SELECT label FROM empty_text WHERE id = 2);
+----

@@ -218,6 +218,7 @@ pub async fn start_pgwire_server(
                             let session_id = conn.session_id.lock().unwrap().take();
                             if let Some(session_id) = session_id {
                                 shared.registry.deregister(&session_id);
+                                shared.extended_query_handler.end_session(&session_id);
                                 let executor = shared.executor.clone();
                                 let _ = tokio::task::spawn_blocking(move || {
                                     executor.end_session(&session_id)

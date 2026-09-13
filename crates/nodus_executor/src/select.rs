@@ -1341,6 +1341,18 @@ impl MemExecutor {
                 }
             }
 
+            if let Some(inferred) = projection.get(i).and_then(|item| {
+                crate::result_types::projection_type(item, |source| {
+                    col_names
+                        .iter()
+                        .position(|name| name == source || name.ends_with(&format!(".{source}")))
+                        .and_then(|index| joined_columns.get(index))
+                        .map(|column| column.data_type.clone())
+                })
+            }) {
+                types.push(inferred);
+                continue;
+            }
             if ty == "VARCHAR" && !rows.is_empty() {
                 if let Some(val) = rows[0].values.get(i) {
                     match val {

@@ -29,7 +29,7 @@ just test-compat-rust
 
 This uses the workspace-locked `tokio-postgres` (tested with 0.7.18), starts
 isolated local NodusDB servers, and runs all selected targets even if one fails.
-It includes 54 SQL golden files, the `pg18_*` suites, wire/auth/TLS tests, and
+It includes 55 SQL golden files, the `pg18_*` suites, wire/auth/TLS tests, and
 `rust_driver_sql.rs`. Stored procedures, `CALL`, user-defined routine bodies,
 and PL/pgSQL execution are outside this audit; built-in functions and catalog
 metadata remain included.
@@ -37,11 +37,11 @@ metadata remain included.
 The added driver cases check inferred and explicit parameter types, DML
 `RETURNING`, Rust transaction/savepoint and cursor APIs, typed relational
 results, NULL predicates, and COPY streams. Each case has a 30-second deadline.
-**The audit currently fails on confirmed NodusDB compatibility gaps.** The
-assertions are neither ignored nor adjusted to accept those differences. See
-[the results and reproducers](rust-sql-compatibility-results.md).
+The six failures from the initial audit are fixed. All 14 driver cases pass on
+NodusDB and PostgreSQL 18.4 with the same assertions. See
+[the results, fixes, and remaining limits](rust-sql-compatibility-results.md).
 
-To validate the same nine driver cases against an explicitly supplied,
+To validate the same 14 driver cases against an explicitly supplied,
 disposable PostgreSQL reference:
 
 ```bash

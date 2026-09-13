@@ -169,7 +169,13 @@ impl MemExecutor {
                     .rows
                     .first()
                     .and_then(|r| r.values.first())
-                    .map(|v| coerce(&render(v), column_type(&columns[idx].data_type)))
+                    .map(|v| {
+                        if *v == Value::Null {
+                            Value::Null
+                        } else {
+                            coerce(&render(v), column_type(&columns[idx].data_type))
+                        }
+                    })
                     .unwrap_or(Value::Null);
                 if right_cell == Value::Null {
                     return None;
@@ -298,6 +304,7 @@ impl MemExecutor {
                 for r in out.rows {
                     if let Some(c) = r.values.first() {
                         let right_cell = match coerce_type {
+                            Some(_) if *c == Value::Null => Value::Null,
                             Some(ty) => coerce(&render(c), column_type(ty)),
                             None => c.clone(),
                         };

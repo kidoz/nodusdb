@@ -23,7 +23,6 @@ use pgwire::api::store::PortalStore;
 use pgwire::api::{ClientInfo, ClientPortalStore, DEFAULT_NAME, PgWireConnectionState, Type};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::PgWireBackendMessage;
-use pgwire::messages::copy::CopyDone;
 use pgwire::messages::data::{DataRow, NoData, ParameterDescription};
 use pgwire::messages::extendedquery::{
     Bind, BindComplete, Close, CloseComplete, Describe, Execute, Parse, ParseComplete,
@@ -79,6 +78,14 @@ fn cursor_key(session_id: &str, portal_name: &str) -> String {
 }
 
 impl NodusExtendedQueryHandler {
+    pub(crate) fn end_session(&self, session_id: &str) {
+        let prefix = format!("{session_id}:");
+        self.cursors
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|key, _| !key.starts_with(&prefix));
+    }
+
     /// Resolves the result-column field descriptors for `query_str` by executing
     /// a side-effect-free [`describe_probe_plan`] of it. Returns an empty vector
     /// for a statement that yields no row set (the caller then answers `Describe`
@@ -157,7 +164,7 @@ impl NodusExtendedQueryHandler {
     }
 
     /// Streams a fetch-all (`max_rows == 0`) parameterless single `SELECT` straight
-    /// to the socket, returning `true` when it handled the execute. Parameterized
+    /// to the socket, returning the row count when it handled the execute. Parameterized
     /// portals and everything else return `false` for the buffered cursor path —
     /// this targets the unbounded-scan case (e.g. `SELECT * FROM big`) that the
     /// cursor would otherwise materialize in full. The schema is delivered by a
@@ -166,7 +173,7 @@ impl NodusExtendedQueryHandler {
         &self,
         client: &mut C,
         portal: &Portal<String>,
-    ) -> PgWireResult<bool>
+    ) -> PgWireResult<Option<usize>>
     where
         C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
         C::Error: Debug,
@@ -175,16 +182,18 @@ impl NodusExtendedQueryHandler {
         // Parameterized queries keep the buffered path (decoding params lives in
         // `do_query`); they are usually filtered and small anyway.
         if portal.parameter_len() != 0 {
-            return Ok(false);
+            return Ok(None);
         }
         let raw_sql = &portal.statement.statement;
         let plan = match nodus_sql::parse_sql(raw_sql) {
             Ok(stmts) if stmts.len() == 1 => match nodus_executor::plan_statement(&stmts[0], &[]) {
                 Ok(plan @ nodus_executor::LogicalPlan::Select { .. }) => plan,
-                _ => return Ok(false),
+                _ => return Ok(None),
             },
-            _ => return Ok(false),
+            _ => return Ok(None),
         };
+
+        let plan = transaction_plan(client, plan)?;
 
         // Mirror `do_query`'s preamble (cancel/terminate, current-query tracking,
         // timing) for the statements it would otherwise run.
@@ -227,15 +236,16 @@ impl NodusExtendedQueryHandler {
             authz_catalog_version: 1,
         };
 
-        self.stream_execute(
-            client,
-            ctx,
-            plan,
-            &session_id,
-            portal.result_column_format.clone(),
-        )
-        .await?;
-        Ok(true)
+        let count = self
+            .stream_execute(
+                client,
+                ctx,
+                plan,
+                &session_id,
+                portal.result_column_format.clone(),
+            )
+            .await?;
+        Ok(Some(count))
     }
 
     /// Streams a SELECT's rows directly to the socket: the (blocking) executor
@@ -249,7 +259,7 @@ impl NodusExtendedQueryHandler {
         plan: nodus_executor::LogicalPlan,
         session_id: &str,
         format: pgwire::api::portal::Format,
-    ) -> PgWireResult<()>
+    ) -> PgWireResult<usize>
     where
         C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
         C::Error: Debug,
@@ -291,7 +301,7 @@ impl NodusExtendedQueryHandler {
                         Tag::new("SELECT").with_rows(count).into(),
                     ))
                     .await?;
-                Ok(())
+                Ok(count)
             }
             Err(e) => {
                 self.metrics.query_errors_total.inc();
@@ -324,11 +334,44 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        let types = message
+        let mut types = message
             .type_oids
             .iter()
             .map(|oid| Type::from_oid(*oid))
             .collect::<Vec<Option<Type>>>();
+        if types.is_empty()
+            || types
+                .iter()
+                .any(|ty| ty.is_none() || *ty == Some(Type::UNKNOWN))
+        {
+            let ctx = nodus_executor::ExecutionContext {
+                session_id: session_id_from_client(client),
+                principal_id: principal_id_from_client(client),
+                active_roles: vec![],
+                authz_catalog_version: 1,
+            };
+            let executor = self.executor.clone();
+            let sql = message.query.clone();
+            let inferred =
+                tokio::task::spawn_blocking(move || executor.infer_parameter_types(&ctx, &sql))
+                    .await
+                    .map_err(|e| user_error("ERROR", "XX000", e.to_string()))?
+                    .map_err(|e| {
+                        user_error(
+                            "ERROR",
+                            sqlstate_for_execution_error(&e.to_string()),
+                            e.to_string(),
+                        )
+                    })?;
+            if inferred.len() > types.len() {
+                types.resize(inferred.len(), None);
+            }
+            for (slot, inferred) in types.iter_mut().zip(inferred) {
+                if slot.is_none() || *slot == Some(Type::UNKNOWN) {
+                    *slot = inferred.as_deref().map(map_type);
+                }
+            }
+        }
         let stmt = StoredStatement::new(
             message.name.unwrap_or_else(|| DEFAULT_NAME.to_owned()),
             message.query,
@@ -358,7 +401,10 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
         };
         let portal = Portal::try_new(&message, statement)?;
         let key = cursor_key(&session_id_from_client(client), &portal.name);
-        self.cursors.write().unwrap().remove(&key);
+        self.cursors
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&key);
         client.portal_store().put_portal(Arc::new(portal));
         client
             .send(PgWireBackendMessage::BindComplete(BindComplete::new()))
@@ -376,15 +422,33 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
         let portal_name = message.name.as_deref().unwrap_or(DEFAULT_NAME);
         let key = cursor_key(&session_id_from_client(client), portal_name);
         let max_rows = message.max_rows as usize;
+        if tx_status_from_client(client) == pgwire::messages::response::TransactionStatus::Error {
+            let portal = client
+                .portal_store()
+                .get_portal(portal_name)
+                .and_then(|entry| entry.value().cloned())
+                .ok_or_else(|| PgWireError::PortalNotFound(portal_name.to_owned()))?;
+            let statements = nodus_sql::parse_sql(&portal.statement.statement)
+                .map_err(|e| user_error("ERROR", "42601", e.to_string()))?;
+            if let Some(statement) = statements.first() {
+                let plan = nodus_executor::plan_statement(statement, &[])
+                    .map_err(|_| user_error("ERROR", "25P02", "current transaction is aborted, commands ignored until end of transaction block"))?;
+                transaction_plan(client, plan)?;
+            }
+        }
         let existing = {
-            let mut cursors = self.cursors.write().unwrap();
+            let mut cursors = self
+                .cursors
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(cursor) = cursors.get_mut(&key) {
                 let (rows, suspended) = cursor.next_chunk(max_rows);
                 let done = !suspended;
                 let fields = cursor.fields.clone();
                 let total_rows = cursor.total_rows;
                 if done {
-                    cursors.remove(&key);
+                    cursor.rows = Vec::new();
+                    cursor.position = 0;
                 }
                 Some((fields, rows, suspended, total_rows))
             } else {
@@ -447,30 +511,21 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
             return Ok(());
         }
         if is_copy_to_stdout(&portal.statement.statement) {
-            let session_id = session_id_from_client(client);
-            self.registry
-                .set_current_query(&session_id, &portal.statement.statement);
-            self.registry.finish_current_query(&session_id);
-            client
-                .send(PgWireBackendMessage::CopyOutResponse(
-                    pgwire::messages::copy::CopyOutResponse::new(
-                        copy_format_code(&portal.statement.statement),
-                        copy_column_count(&portal.statement.statement),
-                        vec![
-                            copy_format_code(&portal.statement.statement) as i16;
-                            copy_column_count(&portal.statement.statement) as usize
-                        ],
-                    ),
-                ))
-                .await?;
-            client
-                .send(PgWireBackendMessage::CopyDone(CopyDone::new()))
-                .await?;
-            client
-                .send(PgWireBackendMessage::CommandComplete(CommandComplete::new(
-                    "COPY 0".to_owned(),
-                )))
-                .await?;
+            self.metrics.queries_total.inc();
+            let result = crate::copy_out::stream_copy_out(
+                client,
+                self.executor.clone(),
+                &self.registry,
+                &portal.statement.statement,
+                &self.metrics,
+                &self.slow_log,
+            )
+            .await;
+            if result.is_err() {
+                self.metrics.query_errors_total.inc();
+                mark_error_status(client);
+            }
+            result?;
             return Ok(());
         }
 
@@ -492,7 +547,21 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
 
         // Fetch-all of a single SELECT streams straight to the socket; everything
         // else (chunked fetches, non-SELECT, batches) takes the buffered path.
-        if max_rows == 0 && self.try_stream_execute(client, portal.as_ref()).await? {
+        if max_rows == 0
+            && let Some(count) = self.try_stream_execute(client, portal.as_ref()).await?
+        {
+            self.cursors
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(
+                    key,
+                    PortalCursor {
+                        fields: Arc::new(vec![]),
+                        rows: vec![],
+                        position: 0,
+                        total_rows: count,
+                    },
+                );
             return Ok(());
         }
 
@@ -530,14 +599,24 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
                     client.send(PgWireBackendMessage::DataRow(row)).await?;
                 }
                 if suspended {
-                    self.cursors.write().unwrap().insert(key, cursor);
+                    self.cursors
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(key, cursor);
                     client
                         .send(PgWireBackendMessage::PortalSuspended(PortalSuspended::new()))
                         .await?;
                 } else {
+                    let total_rows = cursor.total_rows;
+                    cursor.rows = Vec::new();
+                    cursor.position = 0;
+                    self.cursors
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(key, cursor);
                     client
                         .send(PgWireBackendMessage::CommandComplete(
-                            Tag::new("SELECT").with_rows(cursor.position).into(),
+                            Tag::new("SELECT").with_rows(total_rows).into(),
                         ))
                         .await?;
                 }
@@ -546,7 +625,6 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
             | Response::TransactionStart(tag)
             | Response::TransactionEnd(tag) => {
                 let command: CommandComplete = tag.into();
-                apply_command_tag_to_tx_status(client, &command.tag);
                 client
                     .send(PgWireBackendMessage::CommandComplete(command))
                     .await?;
@@ -574,6 +652,9 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        if tx_status_from_client(client) == pgwire::messages::response::TransactionStatus::Idle {
+            self.end_session(&session_id_from_client(client));
+        }
         client
             .send(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
                 tx_status_from_client(client),
@@ -599,7 +680,10 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
             TARGET_TYPE_BYTE_PORTAL => {
                 client.portal_store().rm_portal(name);
                 let key = cursor_key(&session_id_from_client(client), name);
-                self.cursors.write().unwrap().remove(&key);
+                self.cursors
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&key);
             }
             _ => {}
         }
@@ -1022,6 +1106,8 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
             }
         };
 
+        let plan = transaction_plan(client, plan)?;
+        let executed_plan = plan.clone();
         let out = match execute_off_reactor(self.executor.clone(), ctx.clone(), plan).await {
             Ok(out) => out,
             Err(e) => {
@@ -1043,8 +1129,8 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
             ));
         }
 
+        apply_plan_tx_status(client, &executed_plan);
         if out.columns.is_empty() {
-            apply_command_tag_to_tx_status(client, &out.tag);
             let tag = command_tag_from_output_tag(&out.tag);
             return Ok(Response::Execution(tag));
         }
@@ -1072,24 +1158,11 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        let mut param_types: Vec<Type> = stmt
+        let param_types: Vec<Type> = stmt
             .parameter_types
             .iter()
-            .map(|t| t.clone().unwrap_or(Type::UNKNOWN))
+            .map(|ty| ty.clone().unwrap_or(Type::UNKNOWN))
             .collect();
-        if param_types.is_empty() {
-            let mut max_param = 0;
-            let query = &stmt.statement;
-            for i in 1..=100 {
-                let placeholder = format!("${}", i);
-                if query.contains(&placeholder) {
-                    max_param = i;
-                }
-            }
-            if max_param > 0 {
-                param_types = vec![Type::UNKNOWN; max_param];
-            }
-        }
 
         let session_id = client
             .metadata()
@@ -1189,13 +1262,39 @@ fn describe_probe_plan(plan: &nodus_executor::LogicalPlan) -> Option<nodus_execu
             Some(probe)
         }
         LogicalPlan::ShowVariable { .. } | LogicalPlan::SelectLiteral { .. } => Some(plan.clone()),
-        LogicalPlan::Insert { returning, .. } if !returning.is_empty() => {
-            let mut probe = plan.clone();
-            if let LogicalPlan::Insert { values_list, .. } = &mut probe {
-                values_list.clear();
-            }
-            Some(probe)
+        LogicalPlan::Insert {
+            table_name,
+            returning,
+            ..
         }
+        | LogicalPlan::Update {
+            table_name,
+            returning,
+            ..
+        }
+        | LogicalPlan::Delete {
+            table_name,
+            returning,
+            ..
+        } if !returning.is_empty() => Some(LogicalPlan::Select {
+            ctes: vec![],
+            table_name: table_name.clone(),
+            table_alias: None,
+            joins: vec![],
+            projection: returning
+                .iter()
+                .filter(|c| c.as_str() != "*")
+                .map(|c| nodus_executor::ProjectionItem::Column(c.clone()))
+                .collect(),
+            group_by: vec![],
+            filter: None,
+            having: None,
+            grouping_sets: None,
+            order_by: vec![],
+            limit: Some(0),
+            offset: None,
+            distinct: false,
+        }),
         LogicalPlan::SetOp { left, .. } => describe_probe_plan(left),
         _ => None,
     }

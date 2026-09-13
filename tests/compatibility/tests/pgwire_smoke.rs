@@ -419,7 +419,14 @@ async fn test_copy_protocol_in_and_out_complete_cleanly() {
     assert_eq!(label, "alpha");
 
     let mut out = Box::pin(client.copy_out("COPY copy_sink TO STDOUT").await.unwrap());
-    assert!(out.next().await.is_none());
+    let mut bytes = Vec::new();
+    while let Some(chunk) = out.next().await {
+        bytes.extend_from_slice(&chunk.unwrap());
+    }
+    let text = String::from_utf8(bytes).unwrap();
+    let mut rows: Vec<_> = text.lines().collect();
+    rows.sort_unstable();
+    assert_eq!(rows, ["1\talpha", "2\tbeta"]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1012,4 +1019,41 @@ async fn test_reportable_set_emits_parameter_status() {
             break;
         }
     }
+}
+
+/// COPY OUT must send actual rows between CopyOutResponse and CopyDone, and
+/// report the data count before ReadyForQuery (also on the simple protocol).
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wire_copy_out_data_and_command_count() {
+    let server = TestServer::start().await.unwrap();
+    let client = connect(&server).await;
+    client.batch_execute("CREATE TABLE wire_export (id INTEGER, label TEXT); INSERT INTO wire_export VALUES (1, 'one')").await.unwrap();
+    let mut stream = open_raw_pgwire(&server).await;
+    write_frontend_message(&mut stream, b'Q', b"COPY wire_export TO STDOUT\0").await;
+    let (kind, response) = read_backend_message(&mut stream).await;
+    assert_eq!(kind, b'H');
+    assert_eq!(response, [0, 0, 2, 0, 0, 0, 0]);
+    let (kind, row) = read_backend_message(&mut stream).await;
+    assert_eq!(kind, b'd');
+    assert_eq!(row, b"1\tone\n");
+    assert_eq!(read_backend_message(&mut stream).await.0, b'c');
+    let (kind, complete) = read_backend_message(&mut stream).await;
+    assert_eq!(kind, b'C');
+    assert_eq!(complete, b"COPY 1\0");
+    let (kind, ready) = read_backend_message(&mut stream).await;
+    assert_eq!(kind, b'Z');
+    assert_eq!(ready, b"I");
+    write_frontend_message(&mut stream, b'Q', b"BEGIN\0").await;
+    assert_eq!(read_backend_message(&mut stream).await.0, b'C');
+    assert_eq!(read_backend_message(&mut stream).await.1, b"T");
+    write_frontend_message(&mut stream, b'Q', b"COPY missing_export TO STDOUT\0").await;
+    let (kind, error) = read_backend_message(&mut stream).await;
+    assert_eq!(kind, b'E');
+    assert!(error.windows(5).any(|code| code == b"42P01"));
+    assert_eq!(read_backend_message(&mut stream).await.1, b"E");
+    write_frontend_message(&mut stream, b'Q', b"ROLLBACK\0").await;
+    let (kind, complete) = read_backend_message(&mut stream).await;
+    assert_eq!(kind, b'C');
+    assert_eq!(complete, b"ROLLBACK\0");
+    assert_eq!(read_backend_message(&mut stream).await.1, b"I");
 }

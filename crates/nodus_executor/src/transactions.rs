@@ -29,7 +29,7 @@ impl MemExecutor {
             self.txn.abort_txn(txn.txn_id)?;
             self.kv.abort(txn.txn_id)?;
         }
-        Ok(QueryOutput::tag("SAVEPOINT"))
+        Ok(QueryOutput::tag("ROLLBACK"))
     }
 
     pub(crate) fn exec_savepoint(

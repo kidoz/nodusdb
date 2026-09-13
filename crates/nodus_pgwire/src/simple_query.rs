@@ -13,7 +13,6 @@ use pgwire::api::store::PortalStore;
 use pgwire::api::{ClientInfo, ClientPortalStore, PgWireConnectionState};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::PgWireBackendMessage;
-use pgwire::messages::copy::CopyDone;
 use pgwire::messages::response::{CommandComplete, EmptyQueryResponse, ReadyForQuery};
 use pgwire::messages::startup::ParameterStatus;
 use tracing::{error, info};
@@ -47,6 +46,7 @@ impl SimpleQueryHandler for NodusQueryHandler {
                 ))
                 .await?;
         } else if is_copy_from_stdin(&query_string) {
+            ensure_transaction_usable(client)?;
             let session_id = session_id_from_client(client);
             self.registry.set_current_query(&session_id, &query_string);
             client.metadata_mut().extend([
@@ -70,29 +70,21 @@ impl SimpleQueryHandler for NodusQueryHandler {
             client.set_state(PgWireConnectionState::CopyInProgress(false));
             return Ok(());
         } else if is_copy_to_stdout(&query_string) {
-            let session_id = session_id_from_client(client);
-            self.registry.set_current_query(&session_id, &query_string);
-            self.registry.finish_current_query(&session_id);
-            client
-                .send(PgWireBackendMessage::CopyOutResponse(
-                    pgwire::messages::copy::CopyOutResponse::new(
-                        copy_format_code(&query_string),
-                        copy_column_count(&query_string),
-                        vec![
-                            copy_format_code(&query_string) as i16;
-                            copy_column_count(&query_string) as usize
-                        ],
-                    ),
-                ))
-                .await?;
-            client
-                .send(PgWireBackendMessage::CopyDone(CopyDone::new()))
-                .await?;
-            client
-                .send(PgWireBackendMessage::CommandComplete(CommandComplete::new(
-                    "COPY 0".to_owned(),
-                )))
-                .await?;
+            self.metrics.queries_total.inc();
+            let result = crate::copy_out::stream_copy_out(
+                client,
+                self.executor.clone(),
+                &self.registry,
+                &query_string,
+                &self.metrics,
+                &self.slow_log,
+            )
+            .await;
+            if result.is_err() {
+                self.metrics.query_errors_total.inc();
+                mark_error_status(client);
+            }
+            result?;
         } else if self.try_stream_select(client, &query_string).await? {
             // A single-statement SELECT was streamed straight to the socket.
         } else {
@@ -128,7 +120,6 @@ impl SimpleQueryHandler for NodusQueryHandler {
                     | Response::TransactionStart(tag)
                     | Response::TransactionEnd(tag) => {
                         let command: CommandComplete = tag.into();
-                        apply_command_tag_to_tx_status(client, &command.tag);
                         client
                             .send(PgWireBackendMessage::CommandComplete(command))
                             .await?;
@@ -270,6 +261,8 @@ impl SimpleQueryHandler for NodusQueryHandler {
                 }
             };
 
+            let plan = transaction_plan(client, plan)?;
+            let executed_plan = plan.clone();
             let out = match execute_off_reactor(self.executor.clone(), ctx.clone(), plan).await {
                 Ok(out) => out,
                 Err(e) => {
@@ -307,8 +300,8 @@ impl SimpleQueryHandler for NodusQueryHandler {
             }
 
             // No projected columns => a command tag (CREATE TABLE, INSERT, BEGIN...).
+            apply_plan_tx_status(client, &executed_plan);
             if out.columns.is_empty() {
-                apply_command_tag_to_tx_status(client, &out.tag);
                 let tag = command_tag_from_output_tag(&out.tag);
                 responses.push(Response::Execution(tag));
                 continue;
@@ -356,6 +349,8 @@ impl NodusQueryHandler {
             },
             _ => return Ok(false),
         };
+
+        let plan = transaction_plan(client, plan)?;
 
         self.metrics.queries_total.inc();
         let session_id = {

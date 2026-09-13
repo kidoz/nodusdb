@@ -1,78 +1,92 @@
 # Rust PostgreSQL SQL compatibility results
 
-Audit date: 2026-09-13. Driver: `tokio-postgres` 0.7.18 from the workspace lockfile.
-NodusDB: local working tree, ephemeral `nodus_testkit::TestServer` servers.
-Reference: PostgreSQL 18.4, local `postgres:18-alpine` container, verified with
-`SELECT version()`. Each reference case used an isolated schema. No stored
-procedures or PL/pgSQL execution were tested.
+Verified: 2026-09-14. Driver: workspace-locked `tokio-postgres` 0.7.18.
+Target: the local NodusDB working tree using isolated `nodus_testkit::TestServer`
+instances. Reference: PostgreSQL 18.4 in a disposable local `postgres:18-alpine`
+container, with a separate schema for each case. Stored procedures, `CALL`,
+user-defined routine bodies, and PL/pgSQL execution remain outside this work.
 
 ## Results
 
 | Suite | NodusDB | PostgreSQL 18.4 |
 | --- | --- | --- |
-| Existing Rust compatibility targets (`pg18_*`, pgwire, SCRAM, TLS) | 51 passed | Not run |
-| Existing Rust client integration target | 1 passed | Not run |
-| SQL golden runner | Passed: 54 files, 810 records | Not run |
-| New `rust_driver_sql` target | 3 passed, 6 failed | 9 passed |
+| Rust SQL driver cases (`rust_driver_sql`) | 14 passed | 14 passed |
+| Other Rust compatibility targets (`pg18_*`, pgwire, SCRAM, TLS) | 52 passed | Not run |
+| Rust client integration target | 1 passed | Not run |
+| SQL golden runner | Passed: 55 files, 816 records | Not run |
+| SQL, executor, and pgwire unit tests | 61 passed | Not applicable |
 
 The golden runner's two calibration/diagnostic helpers were intentionally not
-run. Java and .NET suites were outside this Rust-only audit. Passing the existing
-suites does not establish full PostgreSQL SQL compatibility: the new cases expose
-behavior they do not cover. The reference comparison applies to the nine new
-cases only, not to the repository's golden expectations.
+run. Java and .NET runtime tests were outside this Rust-driver task. The reference
+comparison covers the 14 driver cases; it does not certify the complete SQL
+language or all existing golden expectations as PostgreSQL-compatible.
 
-## Confirmed differences
+## Fixes since the initial audit
 
-All nine new cases are ordinary, non-ignored tests. Run an individual reproducer
-with `cargo test -p nodus_compatibility_tests --test rust_driver_sql TEST_NAME -- --nocapture`.
-Their assertions pass unchanged on PostgreSQL 18.4.
+The 2026-09-13 audit found six failures among nine new cases. All six are now
+fixed, and five additional driver cases cover adjacent state transitions.
 
-| Test / operation | PostgreSQL expectation | NodusDB observation |
+| Area | Previous failure | Current behavior |
 | --- | --- | --- |
-| `inferred_parameter_types`: prepare `INSERT INTO items (id, name, enabled) VALUES ($1, $2, $3)` | Parameter types `INT4`, `TEXT`, `BOOL` inferred from the table | Three `UNKNOWN` types; normal Rust typed bindings cannot use them |
-| `typed_parameters_and_dml_returning`: explicitly typed `UPDATE items SET name = $1 WHERE id = $2 RETURNING id, name` | Two typed result columns and one updated row | Driver rejects response: `DataRow field count does not match the number of columns` |
-| `transaction_api_savepoints_and_error_recovery`: CHECK violation inside a savepoint, followed by SELECT | CHECK reports `23514`; subsequent SELECT reports `25P02` until rollback | CHECK reports `23514`, but SELECT succeeds in the failed transaction |
-| `cursor_api_resumes_without_lost_or_duplicate_rows`: fetch four matching rows in batches of two, then fetch again | Batch lengths `2, 2, 0` | Batch lengths `2, 2, 2`: exhausted portal starts returning rows again |
-| `extended_group_by_and_having`: grouped `COUNT(*)` and `SUM(INTEGER)` | Integer group key and two decodable `INT8` aggregate values | Rust cannot deserialize the COUNT result as `i64` |
-| `copy_stream_api_round_trip`: COPY FROM followed by COPY TO through driver streams | COPY IN inserts three rows; COPY OUT exports those rows | Insert count and SELECT confirm all three rows; COPY OUT returns no data |
+| Parameter inference | An untyped INSERT prepared three UNKNOWN parameters | Common INSERT VALUES, UPDATE, DELETE, and SELECT expression contexts infer types from the AST and authorized catalog columns; inferred types are stored for Bind as well as Describe |
+| DML RETURNING | UPDATE returned rows without matching Describe metadata | INSERT/UPDATE/DELETE returning columns use a side-effect-free zero-row read probe |
+| Failed transactions | SELECT succeeded after a CHECK violation | Both query protocols reject subsequent commands with `25P02`; rollback-to-savepoint recovers the transaction, and COMMIT in a failed transaction aborts its writes |
+| Cursor exhaustion | A completed portal re-executed its query | Completed portals retain an empty result state, including fetch-all execution; row buffers are freed and session cleanup releases cursor state |
+| Aggregate types | Rust could not decode COUNT/SUM because Describe and Execute disagreed | Aggregate result types come from expressions and declared input types, including before any row exists |
+| COPY OUT | COPY returned no data and reported COPY 0 | Table and query output uses the bounded executor stream, with text, CSV, and binary encoding, actual column metadata, and actual row counts |
 
-Passing new cases: parameterized CTE execution with explicitly supplied types,
-NULL/NOT IN semantics, and typed LEFT JOIN results in the final run. A preliminary
-run also observed a LEFT JOIN decode failure; it did not recur in the final run,
-so that path warrants additional investigation rather than a reliability claim.
-The DML case successfully checks INSERT RETURNING with Unicode, quoted text, and
-NULL before failing on UPDATE. Later assertions within a failed case are not
-claimed as verified on NodusDB (for example, DELETE RETURNING and post-error
-savepoint recovery).
+Expanded COPY checks also exposed empty text being coerced to NULL during
+writes. Empty text now remains distinct from NULL, including text comparisons
+and scalar/IN subqueries. A missing COPY table now reports `42P01`; failed COPY
+updates the transaction state. Raw-wire coverage verifies the data messages,
+command count, and ReadyForQuery transaction status. The former smoke assertion
+that expected an empty COPY OUT stream now checks the exported values.
 
-## Follow-up work
+Aggregate type expectations follow the
+[PostgreSQL 18 aggregate documentation](https://www.postgresql.org/docs/18/functions-aggregate.html).
+Portal and COPY response ordering follows the
+[PostgreSQL 18 protocol flow](https://www.postgresql.org/docs/18/protocol-flow.html),
+with the driver behavior also checked against the reference server.
 
-- Infer parameter types from parsed statements and catalog types, including the
-  Bind path. `extended_query.rs::do_describe_statement` currently supplies
-  `UNKNOWN` when the client omits type OIDs.
-- Keep Describe metadata consistent with Execute row shape and binary encoding
-  for UPDATE RETURNING and aggregate results; investigate the intermittent join
-  decoding observation alongside these paths.
-- Enforce the failed-transaction state on extended queries and preserve the
-  completed state of an exhausted portal.
-- Implement COPY OUT data streaming. The extended-query COPY OUT branch currently
-  sends CopyOutResponse, CopyDone, and `COPY 0` without any CopyData messages.
+## Running the checks
 
-This change adds tests, a runner command, and evidence; it does not repair the
-server behaviors above or implement stored procedures. `just test-compat-rust`
-and the general compatibility suite will remain red until those gaps are fixed.
+```bash
+just test-compat-rust
+cargo test --no-fail-fast -p nodus_executor -p nodus_pgwire -p nodus_sql
+cargo fmt --all -- --check
+just clippy
+```
 
-## Validation commands
+All commands above passed. The Rust-only command includes `--no-fail-fast`, so a
+future regression does not prevent the other selected targets from running.
+Formatting, workspace Clippy (all targets, warnings denied), and
+`git diff --check` passed. The full workspace runtime suite was not run; runtime
+checks focused on SQL, executor, wire protocol, and client compatibility.
 
-- `just test-compat-rust`: existing selected suites pass; the six new NodusDB
-  failures above cause a nonzero exit. `--no-fail-fast` lets the SQL corpus run
-  despite those failures.
-- `NODUS_SQL_REFERENCE_URL=... cargo test -p nodus_compatibility_tests --test rust_driver_sql -- --nocapture`:
-  all nine cases pass on the disposable PostgreSQL 18.4 reference.
-- `cargo fmt --all -- --check`: passed.
-- `just clippy` (workspace, all targets, warnings denied): passed.
-- `git diff --check`: passed.
+To repeat an individual driver case:
 
-The full workspace runtime test suite was not run: this audit changes only
-compatibility tests, their command, and documentation. The temporary reference
-container was stopped and removed after validation.
+```bash
+cargo test -p nodus_compatibility_tests --test rust_driver_sql TEST_NAME -- --nocapture
+```
+
+To run all 14 cases against a disposable PostgreSQL reference, set
+`NODUS_SQL_REFERENCE_URL` as described in [the driver README](README.md).
+The local reference container used for verification was stopped and removed.
+
+## Scope and remaining limitations
+
+- This proves the tested subset, not complete PostgreSQL compatibility.
+- Parameter inference is conservative. More complex expressions and query scopes
+  can still require explicitly supplied types with `prepare_typed` or
+  `query_typed`; this is not a complete PostgreSQL type resolver.
+- COPY OUT supports default text/CSV settings, binary format for supported wire
+  codecs, and CSV HEADER. Custom delimiters, other options, and legacy option
+  syntax are rejected explicitly. Server-side files/programs are not executed.
+- Plain table COPY streams with bounded buffering. Complex query sources inherit
+  the executor's existing materialization behavior for joins, grouping, sorting,
+  and other operators.
+- No durable record or storage format changed; no migration is required. The
+  empty-text fix applies to new writes and cannot reconstruct values previously
+  stored as NULL.
+- Stored procedures remain deferred. Java/.NET driver matrices and broad
+  concurrency, restart, and performance testing remain separate verification.

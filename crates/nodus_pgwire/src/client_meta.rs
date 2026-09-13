@@ -30,18 +30,13 @@ pub(crate) fn principal_id_from_client<C: ClientInfo>(client: &C) -> PrincipalId
 }
 
 pub(crate) fn tx_status_from_client<C: ClientInfo>(client: &C) -> TransactionStatus {
-    match client
-        .metadata()
-        .get(METADATA_TX_STATUS)
-        .map(String::as_str)
-    {
-        Some("T") => TransactionStatus::Transaction,
-        Some("E") => TransactionStatus::Error,
-        _ => TransactionStatus::Idle,
-    }
+    // pgwire also updates this state on protocol/parse errors, so use its
+    // authoritative value rather than a metadata copy that could become stale.
+    client.transaction_status()
 }
 
 pub(crate) fn set_tx_status<C: ClientInfo>(client: &mut C, status: TransactionStatus) {
+    client.set_transaction_status(status);
     let encoded = match status {
         TransactionStatus::Idle => "I",
         TransactionStatus::Transaction => "T",
@@ -55,16 +50,6 @@ pub(crate) fn set_tx_status<C: ClientInfo>(client: &mut C, status: TransactionSt
 pub(crate) fn mark_error_status<C: ClientInfo>(client: &mut C) {
     if tx_status_from_client(client) == TransactionStatus::Transaction {
         set_tx_status(client, TransactionStatus::Error);
-    }
-}
-
-pub(crate) fn apply_command_tag_to_tx_status<C: ClientInfo>(client: &mut C, tag: &str) {
-    let command = tag.split_whitespace().next().unwrap_or(tag);
-    if command.eq_ignore_ascii_case("BEGIN") {
-        set_tx_status(client, TransactionStatus::Transaction);
-    } else if command.eq_ignore_ascii_case("COMMIT") || tag.trim().eq_ignore_ascii_case("ROLLBACK")
-    {
-        set_tx_status(client, TransactionStatus::Idle);
     }
 }
 
@@ -141,4 +126,54 @@ pub(crate) fn command_tag_from_output_tag(output_tag: &str) -> Tag {
     } else {
         Tag::new(output_tag)
     }
+}
+
+/// Reject statements in a failed transaction, and make COMMIT abort its writes.
+pub(crate) fn transaction_plan<C: ClientInfo>(
+    client: &C,
+    plan: nodus_executor::LogicalPlan,
+) -> pgwire::error::PgWireResult<nodus_executor::LogicalPlan> {
+    use nodus_executor::LogicalPlan;
+    if tx_status_from_client(client) != TransactionStatus::Error {
+        return Ok(plan);
+    }
+    match plan {
+        LogicalPlan::Commit => Ok(LogicalPlan::Rollback),
+        LogicalPlan::Rollback | LogicalPlan::RollbackToSavepoint { .. } => Ok(plan),
+        _ => Err(crate::wire_format::user_error(
+            "ERROR",
+            "25P02",
+            "current transaction is aborted, commands ignored until end of transaction block",
+        )),
+    }
+}
+
+pub(crate) fn apply_plan_tx_status<C: ClientInfo>(
+    client: &mut C,
+    plan: &nodus_executor::LogicalPlan,
+) {
+    use nodus_executor::LogicalPlan;
+    match plan {
+        LogicalPlan::Begin | LogicalPlan::RollbackToSavepoint { .. } => {
+            set_tx_status(client, TransactionStatus::Transaction)
+        }
+        LogicalPlan::Commit | LogicalPlan::Rollback => {
+            set_tx_status(client, TransactionStatus::Idle)
+        }
+        _ => {}
+    }
+}
+
+/// COPY input must not enter its subprotocol while the transaction is failed.
+pub(crate) fn ensure_transaction_usable<C: ClientInfo>(
+    client: &C,
+) -> pgwire::error::PgWireResult<()> {
+    if tx_status_from_client(client) == TransactionStatus::Error {
+        return Err(crate::wire_format::user_error(
+            "ERROR",
+            "25P02",
+            "current transaction is aborted, commands ignored until end of transaction block",
+        ));
+    }
+    Ok(())
 }

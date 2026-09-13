@@ -15,3 +15,6 @@ pub(crate) use statement::*;
 pub use expressions::expr_to_value;
 pub use query::parse_object_name;
 pub use statement::plan_statement;
+
+mod copy;
+pub use copy::{CopyOutputFormat, plan_copy_out};

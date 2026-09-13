@@ -4,6 +4,7 @@ use nodus_security::SessionRegistry;
 
 mod client_meta;
 mod copy;
+mod copy_out;
 mod encoding;
 mod extended_query;
 mod server;

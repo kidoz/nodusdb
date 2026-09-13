@@ -58,7 +58,9 @@ pub(crate) fn sqlstate_for_execution_error(err_str: &str) -> &'static str {
         "3B001" // invalid_savepoint_specification
     } else if err_str.contains("column") && err_str.contains("does not exist") {
         "42703" // undefined_column
-    } else if err_str.contains("does not exist") {
+    } else if err_str.contains("does not exist")
+        || (err_str.starts_with("Table ") && err_str.ends_with(" not found"))
+    {
         "42P01" // undefined_table (relation / index "x" does not exist)
     } else {
         "XX000" // internal_error
@@ -319,6 +321,10 @@ mod tests {
 
     #[test]
     fn maps_missing_objects() {
+        assert_eq!(
+            sqlstate_for_execution_error("Table missing_copy_table not found"),
+            "42P01"
+        );
         assert_eq!(
             sqlstate_for_execution_error("relation \"pg_catalog.nope\" does not exist"),
             "42P01"

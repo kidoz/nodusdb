@@ -315,3 +315,206 @@ async fn copy_stream_api_round_trip() {
     })
     .await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn inferred_bindings_execute_and_ignore_quoted_placeholders() {
+    with_client(async |client| {
+        client
+            .batch_execute("CREATE TABLE inferred (id INTEGER PRIMARY KEY, label TEXT)")
+            .await
+            .unwrap();
+        let insert = client
+            .prepare("INSERT INTO inferred VALUES ($1, $2)")
+            .await
+            .unwrap();
+        assert_eq!(insert.params(), &[Type::INT4, Type::TEXT]);
+        assert_eq!(
+            client
+                .execute(&insert, &[&1_i32, &"literal $99"])
+                .await
+                .unwrap(),
+            1
+        );
+        let select = client
+            .prepare("SELECT label FROM inferred WHERE id = $1 /* $200 */")
+            .await
+            .unwrap();
+        assert_eq!(select.params(), &[Type::INT4]);
+        assert_eq!(
+            client
+                .query_one(&select, &[&1_i32])
+                .await
+                .unwrap()
+                .get::<_, String>(0),
+            "literal $99"
+        );
+        assert!(
+            client
+                .prepare("SELECT '$123'")
+                .await
+                .unwrap()
+                .params()
+                .is_empty()
+        );
+        let update = client
+            .prepare("UPDATE inferred SET label = $1 WHERE id = $2")
+            .await
+            .unwrap();
+        assert_eq!(update.params(), &[Type::TEXT, Type::INT4]);
+        assert_eq!(
+            client
+                .execute(&update, &[&"updated", &1_i32])
+                .await
+                .unwrap(),
+            1
+        );
+        let delete = client
+            .prepare("DELETE FROM inferred WHERE id = $1")
+            .await
+            .unwrap();
+        assert_eq!(client.execute(&delete, &[&1_i32]).await.unwrap(), 1);
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_transaction_commit_aborts_writes_in_both_protocols() {
+    with_client(async |client| {
+        client
+            .batch_execute("CREATE TABLE aborted (id INTEGER PRIMARY KEY)")
+            .await
+            .unwrap();
+        client.batch_execute("BEGIN").await.unwrap();
+        let error = client
+            .copy_out("COPY missing_copy_table TO STDOUT")
+            .await
+            .err()
+            .expect("missing COPY table fails");
+        assert_eq!(error.code(), Some(&SqlState::UNDEFINED_TABLE));
+        let error = client
+            .query("SELECT id FROM aborted", &[])
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Some(&SqlState::IN_FAILED_SQL_TRANSACTION));
+        client.batch_execute("ROLLBACK").await.unwrap();
+        for simple in [false, true] {
+            client
+                .batch_execute("BEGIN; INSERT INTO aborted VALUES (1)")
+                .await
+                .unwrap();
+            let error = client
+                .execute("INSERT INTO aborted VALUES (1)", &[])
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), Some(&SqlState::UNIQUE_VIOLATION));
+            if simple {
+                let error = client
+                    .simple_query("SELECT id FROM aborted")
+                    .await
+                    .unwrap_err();
+                assert_eq!(error.code(), Some(&SqlState::IN_FAILED_SQL_TRANSACTION));
+                client.batch_execute("COMMIT").await.unwrap();
+            } else {
+                let error = client
+                    .query("SELECT id FROM aborted", &[])
+                    .await
+                    .unwrap_err();
+                assert_eq!(error.code(), Some(&SqlState::IN_FAILED_SQL_TRANSACTION));
+                client.execute("COMMIT", &[]).await.unwrap();
+            }
+            assert!(
+                client
+                    .query("SELECT id FROM aborted", &[])
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fetch_all_portal_stays_exhausted() {
+    with_client(async |client| {
+        client
+            .batch_execute(
+                "CREATE TABLE fetch_all (id INTEGER); INSERT INTO fetch_all VALUES (1), (2)",
+            )
+            .await
+            .unwrap();
+        let tx = client.transaction().await.unwrap();
+        let statement = tx
+            .prepare("SELECT id FROM fetch_all ORDER BY id")
+            .await
+            .unwrap();
+        let portal = tx.bind(&statement, &[]).await.unwrap();
+        assert_eq!(tx.query_portal(&portal, 0).await.unwrap().len(), 2);
+        assert!(tx.query_portal(&portal, 0).await.unwrap().is_empty());
+        tx.commit().await.unwrap();
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn empty_aggregate_result_metadata_is_stable() {
+    with_client(async |client| {
+        client
+            .batch_execute("CREATE TABLE aggregates (n INTEGER)")
+            .await
+            .unwrap();
+        let statement = client
+            .prepare("SELECT COUNT(*), SUM(n) FROM aggregates")
+            .await
+            .unwrap();
+        assert_eq!(
+            statement
+                .columns()
+                .iter()
+                .map(|c| c.type_().clone())
+                .collect::<Vec<_>>(),
+            [Type::INT8, Type::INT8]
+        );
+        let row = client.query_one(&statement, &[]).await.unwrap();
+        assert_eq!(row.get::<_, i64>(0), 0);
+        assert_eq!(row.get::<_, Option<i64>>(1), None);
+        client
+            .execute("INSERT INTO aggregates VALUES (20), (30)", &[])
+            .await
+            .unwrap();
+        let row = client.query_one(&statement, &[]).await.unwrap();
+        assert_eq!(row.get::<_, i64>(0), 2);
+        assert_eq!(row.get::<_, i64>(1), 50);
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn binary_and_csv_copy_out_preserve_nulls_and_empty_strings() {
+    with_client(async |client| {
+        client.batch_execute("CREATE TABLE exports (id INTEGER PRIMARY KEY, label TEXT); INSERT INTO exports VALUES (1, 'quoted'), (2, ''), (3, NULL)").await.unwrap();
+        let stream = client.copy_out("COPY (SELECT id, label FROM exports ORDER BY id) TO STDOUT (FORMAT BINARY)").await.unwrap();
+        let stream = tokio_postgres::binary_copy::BinaryCopyOutStream::new(stream, &[Type::INT4, Type::TEXT]);
+        tokio::pin!(stream);
+        let mut rows = Vec::new();
+        while let Some(row) = stream.try_next().await.unwrap() {
+            rows.push((row.get::<i32>(0), row.get::<Option<String>>(1)));
+        }
+        assert_eq!(rows, [(1, Some("quoted".into())), (2, Some("".into())), (3, None)]);
+        let empty = client.copy_out("COPY (SELECT id, label FROM exports WHERE id < 0) TO STDOUT (FORMAT BINARY)").await.unwrap();
+        let empty = tokio_postgres::binary_copy::BinaryCopyOutStream::new(empty, &[Type::INT4, Type::TEXT]);
+        tokio::pin!(empty);
+        assert!(empty.try_next().await.unwrap().is_none());
+        let stream = client.copy_out("COPY (SELECT id, label FROM exports ORDER BY id) TO STDOUT (FORMAT CSV, HEADER)").await.unwrap();
+        let chunks: Vec<Bytes> = stream.try_collect().await.unwrap();
+        let output: Vec<_> = chunks.into_iter().flatten().collect();
+        // CSV permits both quoted and unquoted ordinary values. Decode it
+        // rather than requiring PostgreSQL and NodusDB to choose identical quoting.
+        let text = String::from_utf8(output).unwrap();
+        let cells = nodus_import::decode_rows(&text, nodus_import::CopyFormat::Csv).unwrap();
+        assert_eq!(cells.len(), 4);
+        assert_eq!(cells[0], [nodus_import::Cell::Text("id".into()), nodus_import::Cell::Text("label".into())]);
+        assert_eq!(cells[2][1], nodus_import::Cell::Text("".into()));
+        assert_eq!(cells[3][1], nodus_import::Cell::Null);
+    }).await;
+}
