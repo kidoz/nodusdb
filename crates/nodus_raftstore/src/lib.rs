@@ -3,6 +3,8 @@
 // directly, so boxing it here would only move the cost to each trait boundary.
 #![allow(clippy::result_large_err)]
 
+pub mod upgrade;
+
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::io::SeekFrom;
@@ -162,9 +164,21 @@ pub enum ShardCommand {
         key: Vec<u8>,
         replacement: migration::writes::ReplacementV2,
     },
+    UpgradeControlV1(upgrade::CommandV1),
 }
 
 impl ShardCommand {
+    pub fn is_upgrade_command(&self) -> bool {
+        matches!(
+            self,
+            Self::UpgradeControlV1(_)
+                | Self::UpgradeStart { .. }
+                | Self::UpgradeNodeUpgraded { .. }
+                | Self::UpgradeFinalize
+                | Self::UpgradeRollback
+        )
+    }
+
     pub fn requires_migration_protocol(&self) -> bool {
         matches!(
             self,
@@ -563,7 +577,6 @@ pub struct StateMachine {
     pub kv: Option<Arc<dyn nodus_storage_api::KvEngine>>,
     pub catalog_writer: Option<Arc<dyn nodus_catalog::CatalogWriter>>,
     pub catalog_reader: Option<Arc<dyn nodus_catalog::CatalogReader>>,
-    pub upgrade: Option<Arc<dyn nodus_upgrade::UpgradeCoordinator>>,
     /// Local cluster-metadata store the meta group applies shard-map/placement
     /// commands to, so every node converges on the same routing state.
     pub meta_store: Option<Arc<dyn nodus_meta::MetaStore>>,
@@ -618,7 +631,6 @@ impl NodusRaftStore {
                 kv: None,
                 catalog_writer: None,
                 catalog_reader: None,
-                upgrade: None,
                 meta_store: None,
             })),
             meta: None,
@@ -636,7 +648,6 @@ impl NodusRaftStore {
         kv: Arc<dyn nodus_storage_api::KvEngine>,
         catalog_writer: Option<Arc<dyn nodus_catalog::CatalogWriter>>,
         catalog_reader: Option<Arc<dyn nodus_catalog::CatalogReader>>,
-        upgrade: Option<Arc<dyn nodus_upgrade::UpgradeCoordinator>>,
         meta_store: Option<Arc<dyn nodus_meta::MetaStore>>,
         snapshot_dir: PathBuf,
     ) -> Self {
@@ -666,7 +677,6 @@ impl NodusRaftStore {
                 kv: Some(kv),
                 catalog_writer,
                 catalog_reader,
-                upgrade,
                 meta_store,
             })),
             meta: Some(meta),
@@ -687,7 +697,6 @@ impl NodusRaftStore {
             Some(catalog_writer),
             Some(catalog_reader),
             None,
-            None,
             temp_snapshot_dir(),
         )
     }
@@ -696,14 +705,14 @@ impl NodusRaftStore {
     /// inert groups). Use [`Self::with_kv_at`] to back snapshots with a durable
     /// directory.
     pub fn with_kv(kv: Arc<dyn nodus_storage_api::KvEngine>) -> Self {
-        Self::with(kv, None, None, None, None, temp_snapshot_dir())
+        Self::with(kv, None, None, None, temp_snapshot_dir())
     }
 
     /// Builds a data-shard store whose snapshots are streamed to/from durable
     /// files under `snapshot_dir`. Catalog/RBAC and upgrade commands are no-ops
     /// on a data group — those are owned by the meta group.
     pub fn with_kv_at(kv: Arc<dyn nodus_storage_api::KvEngine>, snapshot_dir: PathBuf) -> Self {
-        Self::with(kv, None, None, None, None, snapshot_dir)
+        Self::with(kv, None, None, None, snapshot_dir)
     }
 
     /// Builds the meta-group store with full catalog/RBAC/upgrade components plus
@@ -713,7 +722,6 @@ impl NodusRaftStore {
         kv: Arc<dyn nodus_storage_api::KvEngine>,
         catalog_writer: Arc<dyn nodus_catalog::CatalogWriter>,
         catalog_reader: Arc<dyn nodus_catalog::CatalogReader>,
-        upgrade: Arc<dyn nodus_upgrade::UpgradeCoordinator>,
         meta_store: Arc<dyn nodus_meta::MetaStore>,
         snapshot_dir: PathBuf,
     ) -> Self {
@@ -721,7 +729,6 @@ impl NodusRaftStore {
             kv,
             Some(catalog_writer),
             Some(catalog_reader),
-            Some(upgrade),
             Some(meta_store),
             snapshot_dir,
         )
@@ -1054,6 +1061,44 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
             match &entry.payload {
                 EntryPayload::Normal(cmd) => {
                     tracing::info!("Raft applying command: {:?}", cmd);
+                    if cmd.is_upgrade_command() {
+                        let response = if let ShardCommand::UpgradeControlV1(command) = cmd {
+                            let kv = sm.kv.as_ref().ok_or_else(|| {
+                                StorageIOError::write_state_machine(AnyError::error(
+                                    "upgrade requires storage",
+                                ))
+                            })?;
+                            upgrade::apply(kv.as_ref(), &sm, command, entry.log_id.index).map_err(
+                                |e| {
+                                    StorageIOError::write_state_machine(AnyError::error(format!(
+                                        "upgrade apply: {e}"
+                                    )))
+                                },
+                            )?
+                        } else {
+                            ShardResponse { success: false, error: Some("legacy upgrade reports are not capability evidence; use the verified upgrade service".into()) }
+                        };
+                        sm.last_applied_log = Some(entry.log_id);
+                        res.push(response);
+                        continue;
+                    }
+                    let reserved_upgrade_write = match cmd {
+                        ShardCommand::PutIntent { key, .. }
+                        | ShardCommand::DeleteIntent { key, .. }
+                        | ShardCommand::IndexPutIntent { key, .. }
+                        | ShardCommand::IndexDeleteIntent { key, .. } => {
+                            key.starts_with(b"\x01upgrade/")
+                        }
+                        _ => false,
+                    };
+                    if reserved_upgrade_write {
+                        sm.last_applied_log = Some(entry.log_id);
+                        res.push(ShardResponse {
+                            success: false,
+                            error: Some("reserved upgrade authority key".into()),
+                        });
+                        continue;
+                    }
                     if let Some(kv) = &sm.kv {
                         if let Some(response) = migration::apply(
                             kv.as_ref(),
@@ -1259,31 +1304,6 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
                             ShardCommand::UpdateShardPlacements(placements) => {
                                 if let Err(e) = meta_store.update_shard_placements(placements) {
                                     tracing::error!("UpdateShardPlacements apply failed: {e}");
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                    if let Some(upgrade) = &sm.upgrade {
-                        match cmd {
-                            ShardCommand::UpgradeStart { target_version } => {
-                                if let Err(e) = upgrade.start_upgrade(target_version.clone()) {
-                                    tracing::error!("UpgradeStart error: {}", e);
-                                }
-                            }
-                            ShardCommand::UpgradeNodeUpgraded { node_id } => {
-                                if let Err(e) = upgrade.report_node_upgraded(node_id) {
-                                    tracing::error!("UpgradeNodeUpgraded error: {}", e);
-                                }
-                            }
-                            ShardCommand::UpgradeFinalize => {
-                                if let Err(e) = upgrade.finalize_upgrade() {
-                                    tracing::error!("UpgradeFinalize error: {}", e);
-                                }
-                            }
-                            ShardCommand::UpgradeRollback => {
-                                if let Err(e) = upgrade.rollback() {
-                                    tracing::error!("UpgradeRollback error: {}", e);
                                 }
                             }
                             _ => {}

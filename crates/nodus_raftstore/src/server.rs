@@ -55,13 +55,23 @@ pub struct RaftState {
     pub rafts: Arc<RwLock<HashMap<String, NodusRaft>>>,
     /// Recently-applied forwarded-write request ids (see [`RequestDedup`]).
     dedup: Arc<Mutex<RequestDedup>>,
+    node_id: Arc<std::sync::atomic::AtomicU64>,
+    capability_kv: Arc<std::sync::OnceLock<Arc<dyn nodus_storage_api::KvEngine>>>,
 }
 
 impl RaftState {
+    pub fn set_capability_storage(&self, kv: Arc<dyn nodus_storage_api::KvEngine>) {
+        let _ = self.capability_kv.set(kv);
+    }
+    pub fn set_node_id(&self, id: u64) {
+        self.node_id.store(id, std::sync::atomic::Ordering::Release);
+    }
     pub fn new() -> Self {
         Self {
             rafts: Arc::new(RwLock::new(HashMap::new())),
             dedup: Arc::new(Mutex::new(RequestDedup::default())),
+            node_id: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            capability_kv: Arc::new(std::sync::OnceLock::new()),
         }
     }
 }
@@ -74,11 +84,43 @@ impl Default for RaftState {
 
 pub fn raft_routes() -> Router<RaftState> {
     Router::new()
+        .route("/raft/capabilities/v1", post(capabilities))
         .route("/raft/{shard_id}/vote", post(vote))
         .route("/raft/{shard_id}/append", post(append))
         .route("/raft/{shard_id}/snapshot", post(snapshot))
         .route("/raft/{shard_id}/write", post(write))
         .route("/raft/{shard_id}/read_index", post(read_index))
+}
+
+async fn capabilities(
+    State(state): State<RaftState>,
+    Json(request): Json<crate::upgrade::ProbeV1>,
+) -> impl IntoResponse {
+    let mut report = crate::upgrade::CapabilityV1::local(
+        state.node_id.load(std::sync::atomic::Ordering::Acquire),
+        request.challenge,
+    );
+    if !request.preflight {
+        return Json(report).into_response();
+    }
+    let Some(kv) = state.capability_kv.get().cloned() else {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "capability storage unavailable",
+        )
+            .into_response();
+    };
+    match tokio::task::spawn_blocking(move || crate::upgrade::preflight(kv.as_ref())).await {
+        Ok(Ok(ready)) => {
+            report.ready_for_finalize = ready;
+            Json(report).into_response()
+        }
+        error => (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            format!("capability preflight failed: {error:?}"),
+        )
+            .into_response(),
+    }
 }
 
 async fn get_raft(state: &RaftState, shard_id: &str) -> Option<NodusRaft> {
@@ -135,6 +177,13 @@ async fn write(
     headers: HeaderMap,
     Json(cmd): Json<ShardCommand>,
 ) -> impl axum::response::IntoResponse {
+    if cmd.is_upgrade_command() {
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            "upgrade commands require direct authenticated leader verification",
+        )
+            .into_response();
+    }
     if cmd.requires_migration_protocol() {
         return (
             axum::http::StatusCode::NOT_IMPLEMENTED,

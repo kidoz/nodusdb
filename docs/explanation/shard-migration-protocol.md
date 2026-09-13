@@ -133,10 +133,10 @@ uncertain storage-manifest publication disables engine reads/writes until reopen
 - The NSNP version 1 wire format is unchanged. It cannot encode pending intents,
   user tombstones, or retained user MVCC history. Builds **refuse those states** before
   replacing a snapshot or authorizing log purging. Latest internal metadata values
-  remain representable. The new NSNP v2 codec handles these states, but its production writer
-  awaits durable capability authority and admission checks. OpenRaft treats a snapshot-build error as fatal to the group, so
+  remain representable. The new NSNP v2 codec handles these states. Its production writer requires
+  explicit verified finalization through the [upgrade authority](upgrade-authority.md). OpenRaft treats a snapshot-build error as fatal to the group, so
   encountering one of these states during an automatic build can stop that group.
-  General production snapshot operation therefore still requires that rollout.
+  General production snapshot operation therefore requires that finalization.
 - Wire input is limited to 128 MiB. Checkpoint construction materializes bounded
   state, including unrelated groups in a shared LSM, and rejects a checkpoint above
   the 128 MiB accounting limit. Temporary copies and allocation overhead make actual
@@ -175,7 +175,7 @@ Snapshot compatibility is separate from migration activation:
 | --- | --- |
 | New binary, old NSNP v1 file | Reads representable payloads; rejects old meta files containing data namespaces; retains legacy catalog-import semantics when the durable catalog row is absent. |
 | New binary, production writer | Same NSNP v1 framing; strict validation and atomic installation as described above. |
-| New binary with trusted compatibility provider | NSNP v2 only after finalization at version 2 or later and v2 support reported for every voter and learner. Production supplies no provider yet. |
+| New binary with trusted compatibility provider | NSNP v2 only after finalization at version 2 or later and v2 support reported for every voter and learner. Production supplies the durable meta authority; membership is frozen during and after activation. |
 | Previous binary, new checkpoint on disk | No new SST/WAL/manifest/catalog envelope is emitted; existing readers understand the formats. |
 | Previous binary receiving a new snapshot | Wire framing is readable, but its old destructive installer is not made safe by this change. Mixed-version installation is not certified. |
 
@@ -216,7 +216,7 @@ linearizability proof or deterministic simulation. See
 
 Verified member capability negotiation and writer/forwarding activation,
 automatic journal discovery, orphan/uncertain 2PC recovery, reader and backup
-retention, production MVCC snapshot activation, and repository boundary publication
+retention, post-finalization membership admission, and repository boundary publication
 coordination remain prerequisites. The [v2 codec and recovery boundary](mvcc-snapshots.md)
 are implemented with the documented limits. Destination
 readiness, durable copy checkpoints, data validation, conditional map/placement

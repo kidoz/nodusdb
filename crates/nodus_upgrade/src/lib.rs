@@ -1,3 +1,6 @@
+//! Legacy in-memory upgrade model retained for library examples/tests. Production
+//! snapshot compatibility uses `nodus_raftstore::upgrade` and its durable authority;
+//! this coordinator must never authorize persisted or network format changes.
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

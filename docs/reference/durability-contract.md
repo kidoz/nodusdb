@@ -64,9 +64,9 @@ until reopen. These guarantees assume the authoritative manifest remains readabl
 | Local clock remains above installed timestamps after restart | `nodus_server`: `snapshot_reserves_clock_above_incoming_versions_across_restart` |
 
 NSNP v2 preserves retained user history, tombstones and pending intent identities.
-Its writer requires a trusted compatibility provider; production still uses v1,
-which refuses those states and can stop the group because OpenRaft treats build
-errors as fatal. Installation materializes a bounded checkpoint and pauses the
+The production writer enables v2 only after [verified durable finalization](../explanation/upgrade-authority.md).
+Before finalization it uses v1, which refuses those states and can stop the group
+because OpenRaft treats build errors as fatal. Installation materializes a bounded checkpoint and pauses the
 shared engine. The same checkpoint publishes a local recovery generation and WAL
 floor. Source-bound backup operations reject cross-generation incremental ancestry
 and PITR extension until a new full backup; offline enforcement requires the

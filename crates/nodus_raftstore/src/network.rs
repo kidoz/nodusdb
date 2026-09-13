@@ -15,6 +15,7 @@ use std::sync::{Arc, OnceLock};
 pub struct RaftTransport {
     client: RaftClient,
     scheme: Arc<str>,
+    check_snapshots: bool,
 }
 
 /// The outbound HTTP client behind a [`RaftTransport`].
@@ -34,11 +35,54 @@ enum RaftClient {
 }
 
 impl RaftTransport {
+    /// Production transports re-probe the recipient before every v2 chunk,
+    /// including cached snapshots and resumed transfers.
+    pub fn with_snapshot_checks(mut self) -> Self {
+        self.check_snapshots = true;
+        self
+    }
+
+    pub async fn probe(
+        &self,
+        node: u64,
+        addr: &str,
+        challenge: uuid::Uuid,
+        preflight: bool,
+    ) -> anyhow::Result<crate::upgrade::CapabilityV1> {
+        anyhow::ensure!(
+            self.scheme() == "https",
+            "remote upgrade verification requires peer mTLS"
+        );
+        let mut response = self
+            .client()
+            .post(format!("https://{addr}/raft/capabilities/v1"))
+            .timeout(std::time::Duration::from_secs(3))
+            .json(&crate::upgrade::ProbeV1 {
+                challenge,
+                preflight,
+            })
+            .send()
+            .await?
+            .error_for_status()?;
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await? {
+            anyhow::ensure!(
+                bytes.len() + chunk.len() <= 8192,
+                "capability response too large"
+            );
+            bytes.extend_from_slice(&chunk);
+        }
+        let report: crate::upgrade::CapabilityV1 = serde_json::from_slice(&bytes)?;
+        report.validate(node, challenge)?;
+        Ok(report)
+    }
+
     /// Plain-HTTP transport (no peer TLS). The HTTP client is built on first use.
     pub fn plain() -> Self {
         Self {
             client: RaftClient::Lazy(Arc::new(OnceLock::new())),
             scheme: Arc::from("http"),
+            check_snapshots: false,
         }
     }
 
@@ -48,6 +92,7 @@ impl RaftTransport {
         Self {
             client: RaftClient::Ready(client),
             scheme: scheme.into(),
+            check_snapshots: false,
         }
     }
 
@@ -73,6 +118,8 @@ impl Default for RaftTransport {
 }
 
 pub struct NodusNetwork {
+    transport: RaftTransport,
+    snapshot_format: Option<(String, bool)>,
     shard_id: String,
     target: u64,
     target_node: BasicNode,
@@ -114,6 +161,33 @@ impl RaftNetwork<NodusTypeConfig> for NodusNetwork {
         InstallSnapshotResponse<u64>,
         RPCError<u64, BasicNode, RaftError<u64, InstallSnapshotError>>,
     > {
+        if self.transport.check_snapshots {
+            if rpc.offset == 0 {
+                self.snapshot_format = Some((
+                    rpc.meta.snapshot_id.clone(),
+                    !rpc.data.starts_with(b"NSNP\0\x01"),
+                ));
+            }
+            // An unknown resumed stream is conservatively treated as v2.
+            let needs_probe = self
+                .snapshot_format
+                .as_ref()
+                .filter(|(id, _)| id == &rpc.meta.snapshot_id)
+                .is_none_or(|(_, v2)| *v2);
+            if needs_probe {
+                self.transport
+                    .probe(
+                        self.target,
+                        &self.target_node.addr,
+                        uuid::Uuid::new_v4(),
+                        false,
+                    )
+                    .await
+                    .map_err(|e| {
+                        RPCError::Network(NetworkError::new(&std::io::Error::other(e.to_string())))
+                    })?;
+            }
+        }
         let url = format!(
             "{}://{}/raft/{}/snapshot",
             self.scheme, self.target_node.addr, self.shard_id
@@ -180,6 +254,8 @@ impl RaftNetworkFactory<NodusTypeConfig> for NodusNetworkFactory {
 
     async fn new_client(&mut self, target: u64, node: &BasicNode) -> Self::Network {
         NodusNetwork {
+            transport: self.transport.clone(),
+            snapshot_format: None,
             shard_id: self.shard_id.clone(),
             target,
             target_node: node.clone(),

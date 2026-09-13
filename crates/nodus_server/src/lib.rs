@@ -12,6 +12,8 @@ mod raft_upgrade;
 #[cfg(test)]
 mod snapshot_tests;
 mod tls;
+#[cfg(test)]
+mod upgrade_tests;
 
 use admin::{AdminState, admin_routes};
 use axum::Router;
@@ -323,6 +325,8 @@ fn build_raft_transport(
         // Trust only the cluster CA, not the system root store. reqwest 0.13's
         // `tls_certs_only` both disables the built-in roots and adds our CA.
         .tls_certs_only([ca])
+        .https_only(true)
+        .redirect(reqwest::redirect::Policy::none())
         .identity(identity)
         .build()?;
     Ok(nodus_raftstore::network::RaftTransport::new(
@@ -431,16 +435,6 @@ pub async fn run_server_with_config(
     ))?);
     tracing::debug!("Loaded KV and catalog");
 
-    let cluster_version = catalog
-        .get_cluster_version()
-        .map(|v| v.active_version)
-        .unwrap_or(1);
-    let local_upgrade = Arc::new(nodus_upgrade::DefaultUpgradeCoordinator::new(
-        1,
-        vec!["new_storage_format".into()],
-        cluster_version,
-    ));
-
     tracing::debug!("Initializing raft network and state");
     // Make snapshotting/compaction intentional rather than relying on
     // undocumented openraft defaults. `snapshot_max_chunk_size` bounds the
@@ -483,7 +477,8 @@ pub async fn run_server_with_config(
 
     // Outbound Raft transport: plain HTTP, or an mTLS `https` client when
     // inter-node TLS is configured.
-    let raft_transport = build_raft_transport(&config.cluster)?;
+    let raft_transport = build_raft_transport(&config.cluster)?.with_snapshot_checks();
+    nodus_raftstore::upgrade::read(local_kv.as_ref())?;
 
     // Owns this node's Raft groups. The meta group is created now; data-shard
     // groups are created on demand (routing lands in Phase 2).
@@ -500,7 +495,7 @@ pub async fn run_server_with_config(
             .data_dir
             .clone()
             .map(std::path::PathBuf::from),
-        raft_transport,
+        raft_transport.clone(),
     ));
 
     // Local cluster-metadata store (shard maps + placements), KV-backed so it
@@ -513,7 +508,6 @@ pub async fn run_server_with_config(
             local_kv.clone(),
             catalog.clone(),
             catalog.clone(),
-            local_upgrade.clone(),
             local_meta.clone(),
         )
         .await
@@ -913,10 +907,12 @@ pub async fn run_server_with_config(
 
     let shards = Arc::new(nodus_sharding::ShardOrchestrator::new(meta.clone()));
 
+    let membership_lock = Arc::new(tokio::sync::Mutex::new(()));
     let raft_upgrade_coordinator = Arc::new(crate::raft_upgrade::RaftUpgradeCoordinator {
-        local: local_upgrade.clone(),
-        router: raft_router.clone(),
-        shard_id: crate::multi_raft::META_SHARD.to_string(),
+        kv: local_kv.clone(),
+        manager: multi_raft.clone(),
+        transport: raft_transport,
+        membership_lock: membership_lock.clone(),
     });
 
     let admin_state = AdminState {
@@ -939,7 +935,7 @@ pub async fn run_server_with_config(
         admin_token: config.admin.token.clone(),
         allow_insecure: config.admin.allow_insecure,
         raft_state: raft_state.clone(),
-        membership_lock: Arc::new(tokio::sync::Mutex::new(())),
+        membership_lock,
         restore_lock: Arc::new(tokio::sync::Mutex::new(())),
         restoring: executor.restoring_flag(),
         restore_gate: executor.restore_gate(),
@@ -1202,7 +1198,7 @@ mod tests {
     /// both server and client auth, with a `127.0.0.1` IP SAN) — and writes the
     /// leaf cert, leaf key, and CA cert PEMs into `dir`. The one leaf doubles as
     /// every node's identity, which is all a one-host mTLS handshake test needs.
-    fn write_test_certs(dir: &std::path::Path) -> (String, String, String) {
+    pub(crate) fn write_test_certs(dir: &std::path::Path) -> (String, String, String) {
         let ca_key = rcgen::KeyPair::generate().unwrap();
         let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
         ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);

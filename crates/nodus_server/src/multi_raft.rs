@@ -196,6 +196,8 @@ impl MultiRaftManager {
         data_dir: Option<std::path::PathBuf>,
         transport: RaftTransport,
     ) -> Self {
+        state.set_node_id(node_id);
+        state.set_capability_storage(base_kv.clone());
         Self {
             node_id,
             advertise_addr,
@@ -235,7 +237,7 @@ impl MultiRaftManager {
         replacement: nodus_storage_api::IntentReplacement,
     ) -> Result<()> {
         anyhow::ensure!(
-            !key.starts_with(b"\x01migration/"),
+            !key.starts_with(b"\x01migration/") && !key.starts_with(b"\x01upgrade/"),
             "reserved migration key"
         );
         let machine = self.machine(group).await?;
@@ -308,7 +310,6 @@ impl MultiRaftManager {
         kv: Arc<dyn KvEngine>,
         catalog_writer: Arc<dyn nodus_catalog::CatalogWriter>,
         catalog_reader: Arc<dyn nodus_catalog::CatalogReader>,
-        upgrade: Arc<dyn nodus_upgrade::UpgradeCoordinator>,
         meta_store: Arc<dyn nodus_meta::MetaStore>,
     ) -> Result<NodusRaft> {
         let kv = ClockAdvancingKvEngine::wrap(kv, self.clock.clone());
@@ -316,7 +317,6 @@ impl MultiRaftManager {
             kv,
             catalog_writer,
             catalog_reader,
-            upgrade,
             meta_store,
             self.group_snapshot_dir(META_SHARD),
         );
@@ -341,7 +341,11 @@ impl MultiRaftManager {
     /// returns the handle. The network factory carries `shard_id` so RPCs are
     /// routed to `/raft/{shard_id}/...` on peers.
     async fn spawn_group(&self, shard_id: &str, store: NodusRaftStore) -> Result<NodusRaft> {
-        let store = store.with_snapshot_group(shard_id);
+        let store = store
+            .with_snapshot_group(shard_id)
+            .with_snapshot_compatibility(Arc::new(
+                nodus_raftstore::upgrade::DurableSnapshotCompatibility(self.base_kv.clone()),
+            ));
         let machine = store.state_machine.clone();
         let (log_store, state_machine) = openraft::storage::Adaptor::new(store);
         let network = NodusNetworkFactory::new(shard_id.to_string(), self.transport.clone());
@@ -554,6 +558,14 @@ impl MultiRaftManager {
         }
 
         let members = self.cluster_members().await;
+        let authority = nodus_raftstore::upgrade::read(self.base_kv.as_ref())?;
+        if authority.phase != nodus_raftstore::upgrade::Phase::Idle {
+            let verified = nodus_raftstore::upgrade::members(&authority.membership)?;
+            anyhow::ensure!(
+                members == verified,
+                "cluster membership differs from frozen upgrade roster"
+            );
+        }
         let mut target = current.clone();
         for (id, addr) in &members {
             if *id == self.node_id {
@@ -878,18 +890,12 @@ mod tests {
     async fn meta_and_data_groups_are_independent_and_idempotent() {
         let mgr = manager();
         let catalog = Arc::new(nodus_catalog::MemoryCatalog::new());
-        let upgrade = Arc::new(nodus_upgrade::DefaultUpgradeCoordinator::new(
-            1,
-            vec!["new_storage_format".into()],
-            1,
-        ));
 
         let meta = mgr
             .create_meta(
                 Arc::new(nodus_storage_mem::MemKvEngine::new()),
                 catalog.clone(),
                 catalog.clone(),
-                upgrade,
                 Arc::new(nodus_meta::MemMetaStore::new()),
             )
             .await

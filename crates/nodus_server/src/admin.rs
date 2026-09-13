@@ -43,7 +43,7 @@ pub struct AdminState {
     pub catalog: Arc<dyn CatalogReader>,
     pub catalog_writer: Arc<dyn CatalogWriter>,
     pub backup: Arc<BackupOrchestrator>,
-    pub upgrade: Arc<dyn nodus_upgrade::UpgradeCoordinator>,
+    pub upgrade: Arc<crate::raft_upgrade::RaftUpgradeCoordinator>,
     pub shards: Arc<ShardOrchestrator>,
     /// Hosts this node's Raft groups; reconciled after placement changes so a
     /// newly placed shard is activated without waiting for a restart.
@@ -338,6 +338,12 @@ async fn cluster_join(
         );
     }
 
+    if let Err(error) = state.upgrade.check_membership_change() {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error": error.to_string()})),
+        );
+    }
     let node = openraft::BasicNode::new(&req.raft_advertise_addr);
     if let Err(e) = raft.add_learner(req.node_id, node, true).await {
         // Transient (e.g. leadership changed mid-call) — retryable.
@@ -722,6 +728,10 @@ async fn create_backup(
         .get_cluster_version()
         .map(|v| v.active_version)
         .unwrap_or(0);
+    let cluster_version = match nodus_raftstore::upgrade::read(state.upgrade.kv.as_ref()) {
+        Ok(record) => record.cluster_version,
+        Err(error) => return Json(json!({"error": error.to_string()})),
+    };
     let parent_snapshot_ts = if let Some(parent_id) = query.parent_backup_id.as_ref() {
         match state.backup.load_manifest(parent_id).await {
             Ok(manifest) => Some(manifest.snapshot_ts),
@@ -765,6 +775,7 @@ async fn create_backup(
                         Ok(version) => {
                             if version.key.as_ref()
                                 == nodus_storage_api::recovery::RECOVERY_GENERATION_KEY
+                                || version.key.as_ref() == nodus_raftstore::upgrade::KEY
                             {
                                 continue;
                             }
@@ -814,6 +825,7 @@ async fn create_backup(
                         Ok(version) => {
                             if version.key.as_ref()
                                 == nodus_storage_api::recovery::RECOVERY_GENERATION_KEY
+                                || version.key.as_ref() == nodus_raftstore::upgrade::KEY
                             {
                                 continue;
                             }
@@ -878,7 +890,14 @@ async fn create_backup(
     if let Some(parent_id) = query.parent_backup_id {
         match state
             .backup
-            .create_incremental_backup("local", &parent_id, backup_ts, version, version, objects)
+            .create_incremental_backup(
+                "local",
+                &parent_id,
+                backup_ts,
+                version,
+                cluster_version,
+                objects,
+            )
             .await
         {
             Ok(manifest) => Json(json!({
@@ -891,7 +910,7 @@ async fn create_backup(
     } else {
         match state
             .backup
-            .create_full_backup("local", backup_ts, version, version, objects)
+            .create_full_backup("local", backup_ts, version, cluster_version, objects)
             .await
         {
             Ok(manifest) => Json(json!({
@@ -1099,28 +1118,17 @@ async fn restore_backup(
     }
 }
 
-/// Runs a synchronous upgrade-coordinator write on the blocking pool. The
-/// coordinator routes through the async `RaftRouter` (waiting via `blocking_recv`),
-/// so the call must not run on a reactor worker thread.
-async fn run_upgrade_op<F>(op: F) -> Result<(), anyhow::Error>
-where
-    F: FnOnce() -> Result<(), anyhow::Error> + Send + 'static,
-{
-    match tokio::task::spawn_blocking(op).await {
-        Ok(res) => res,
-        Err(join_err) => Err(anyhow::anyhow!("upgrade task failed: {join_err}")),
-    }
-}
-
 /// Serializes the current upgrade state, or wraps an operation error alongside
 /// the (unchanged) state so clients always get a consistent shape.
-fn upgrade_response(state: &AdminState, op: Result<(), anyhow::Error>) -> Json<Value> {
-    let current = state
-        .upgrade
-        .get_state()
-        .ok()
-        .and_then(|s| serde_json::to_value(s).ok())
-        .unwrap_or_else(|| json!({}));
+async fn upgrade_response(state: &AdminState, op: Result<(), anyhow::Error>) -> Json<Value> {
+    let current = match state.upgrade.get_state().await {
+        Ok(value) => value,
+        Err(error) => {
+            return Json(
+                json!({"error": op.err().map_or_else(|| error.to_string(), |e| e.to_string())}),
+            );
+        }
+    };
     match op {
         Ok(()) => Json(current),
         Err(e) => Json(json!({ "error": e.to_string(), "state": current })),
@@ -1128,7 +1136,7 @@ fn upgrade_response(state: &AdminState, op: Result<(), anyhow::Error>) -> Json<V
 }
 
 async fn upgrade_state(State(state): State<AdminState>) -> Json<Value> {
-    upgrade_response(&state, Ok(()))
+    upgrade_response(&state, Ok(())).await
 }
 
 async fn upgrade_start(
@@ -1140,8 +1148,8 @@ async fn upgrade_start(
         .cloned()
         .unwrap_or_else(|| "next".to_string());
     let upgrade = state.upgrade.clone();
-    let op = run_upgrade_op(move || upgrade.start_upgrade(target)).await;
-    upgrade_response(&state, op)
+    let op = upgrade.start_upgrade(target).await;
+    upgrade_response(&state, op).await
 }
 
 async fn upgrade_node_upgraded(
@@ -1150,20 +1158,20 @@ async fn upgrade_node_upgraded(
 ) -> Json<Value> {
     let node = params.get("node").cloned().unwrap_or_else(|| "node".into());
     let upgrade = state.upgrade.clone();
-    let op = run_upgrade_op(move || upgrade.report_node_upgraded(&node)).await;
-    upgrade_response(&state, op)
+    let op = upgrade.report_node_upgraded(&node).await;
+    upgrade_response(&state, op).await
 }
 
 async fn upgrade_finalize(State(state): State<AdminState>) -> Json<Value> {
     let upgrade = state.upgrade.clone();
-    let op = run_upgrade_op(move || upgrade.finalize_upgrade()).await;
-    upgrade_response(&state, op)
+    let op = upgrade.finalize_upgrade().await;
+    upgrade_response(&state, op).await
 }
 
 async fn upgrade_rollback(State(state): State<AdminState>) -> Json<Value> {
     let upgrade = state.upgrade.clone();
-    let op = run_upgrade_op(move || upgrade.rollback()).await;
-    upgrade_response(&state, op)
+    let op = upgrade.rollback().await;
+    upgrade_response(&state, op).await
 }
 
 fn parse_table(id: &str) -> Option<TableId> {

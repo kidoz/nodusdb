@@ -241,14 +241,14 @@ async fn admin_upgrade_api_drives_lifecycle() {
     assert_eq!(st["phase"], "Idle");
 
     let r = http
-        .post(format!("{base}/api/v1/upgrade/start?target=0.2.0"))
+        .post(format!("{base}/api/v1/upgrade/start?target=snapshot-v2"))
         .send()
         .await
         .unwrap();
     println!("UPGRADE START RESPONSE: {:?}", r.text().await);
     // Single node: report it upgraded to reach ReadyToFinalize.
     let res = http
-        .post(format!("{base}/api/v1/upgrade/node-upgraded?node=n1"))
+        .post(format!("{base}/api/v1/upgrade/node-upgraded?node=1"))
         .send()
         .await
         .unwrap();
@@ -266,7 +266,30 @@ async fn admin_upgrade_api_drives_lifecycle() {
         .unwrap();
     assert_eq!(st["phase"], "Finalized");
     // The gated feature is enabled only after finalization.
-    assert_eq!(st["feature_gates"]["new_storage_format"], true);
+    assert_eq!(st["feature_gates"]["mvcc_snapshots"], true);
+    let rejected: serde_json::Value = http
+        .post(format!("{base}/api/v1/upgrade/rollback"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(rejected["error"].as_str().unwrap().contains("finalized"));
+    let join = http
+        .post(format!("{base}/api/v1/cluster/join"))
+        .json(&serde_json::json!({"node_id":99,"raft_advertise_addr":"127.0.0.1:1"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(join.status(), reqwest::StatusCode::CONFLICT);
+    let rejected = http
+        .post(format!("{base}/raft/shard-meta/write"))
+        .json(&serde_json::json!("UpgradeFinalize"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), reqwest::StatusCode::FORBIDDEN);
 }
 
 #[tokio::test(flavor = "multi_thread")]

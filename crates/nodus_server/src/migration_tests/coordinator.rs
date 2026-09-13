@@ -38,13 +38,7 @@ impl Fixture {
         let catalog = Arc::new(nodus_catalog::MemoryCatalog::new());
         let meta = Arc::new(nodus_meta::MemMetaStore::new());
         let raft = manager
-            .create_meta(
-                kv.clone(),
-                catalog.clone(),
-                catalog.clone(),
-                Arc::new(nodus_upgrade::DefaultUpgradeCoordinator::new(1, vec![], 1)),
-                meta.clone(),
-            )
+            .create_meta(kv.clone(), catalog.clone(), catalog.clone(), meta.clone())
             .await
             .unwrap();
         let _ = raft

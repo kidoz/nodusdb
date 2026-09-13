@@ -544,11 +544,6 @@ mod tests {
         ));
 
         let catalog = Arc::new(nodus_catalog::MemoryCatalog::new());
-        let upgrade = Arc::new(nodus_upgrade::DefaultUpgradeCoordinator::new(
-            1,
-            vec!["new_storage_format".into()],
-            1,
-        ));
         // The meta group shares the base store, exactly as `run_server` wires it
         // (the meta group's engine == `RaftKvEngine.local`).
         let meta_raft = manager
@@ -556,7 +551,6 @@ mod tests {
                 base.clone(),
                 catalog.clone(),
                 catalog.clone(),
-                upgrade,
                 Arc::new(nodus_meta::MemMetaStore::new()),
             )
             .await
@@ -653,18 +647,12 @@ mod tests {
         ));
 
         let catalog = Arc::new(nodus_catalog::MemoryCatalog::new());
-        let upgrade = Arc::new(nodus_upgrade::DefaultUpgradeCoordinator::new(
-            1,
-            vec!["new_storage_format".into()],
-            1,
-        ));
         elect(
             &manager
                 .create_meta(
                     base.clone(),
                     catalog.clone(),
                     catalog,
-                    upgrade,
                     Arc::new(nodus_meta::MemMetaStore::new()),
                 )
                 .await

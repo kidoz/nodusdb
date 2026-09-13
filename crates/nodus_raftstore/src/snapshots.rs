@@ -26,7 +26,10 @@ fn scope(sm: &StateMachine) -> SnapshotScope {
 }
 
 fn internal(key: &[u8]) -> bool {
-    key.starts_with(b"\0") || key.starts_with(b"meta:") || migration::is_control_key(key)
+    key.starts_with(b"\0")
+        || key.starts_with(b"meta:")
+        || migration::is_control_key(key)
+        || key == upgrade::KEY
 }
 
 fn sync_dir(path: &std::path::Path) -> anyhow::Result<()> {
@@ -35,7 +38,10 @@ fn sync_dir(path: &std::path::Path) -> anyhow::Result<()> {
 }
 
 fn validate_control(kv: &dyn KvEngine, row: &SnapshotRow) -> anyhow::Result<()> {
-    if migration::is_control_key(&row.key) || row.key.as_ref() == CATALOG_KEY {
+    if migration::is_control_key(&row.key)
+        || row.key.as_ref() == CATALOG_KEY
+        || row.key.as_ref() == upgrade::KEY
+    {
         anyhow::ensure!(
             !row.versions.iter().any(|v| v.is_intent),
             "snapshot contains unfinished control/catalog state"
@@ -49,7 +55,11 @@ fn validate_control(kv: &dyn KvEngine, row: &SnapshotRow) -> anyhow::Result<()> 
             .value
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("deleted control/catalog snapshot state"))?;
-        migration::validate_snapshot_record(kv, &row.key, bytes, latest.version)?;
+        if row.key.as_ref() == upgrade::KEY {
+            upgrade::validate_snapshot(kv, bytes, None)?;
+        } else {
+            migration::validate_snapshot_record(kv, &row.key, bytes, latest.version)?;
+        }
     }
     Ok(())
 }
@@ -284,9 +294,19 @@ impl NodusRaftStore {
             .ok_or_else(|| anyhow::anyhow!("snapshot requires storage"))?;
         for row in kv.snapshot_rows(&scope)? {
             anyhow::ensure!(
-                !migration::is_control_key(&row.key) || rows.contains_key(&row.key),
+                !(migration::is_control_key(&row.key) || row.key.as_ref() == upgrade::KEY)
+                    || rows.contains_key(&row.key),
                 "snapshot missing migration state"
             );
+        }
+        if let Some(row) = rows.get(upgrade::KEY)
+            && let Some(bytes) = row
+                .versions
+                .iter()
+                .max_by_key(|v| v.version)
+                .and_then(|v| v.value.as_ref())
+        {
+            upgrade::validate_snapshot(kv.as_ref(), bytes, Some(meta))?;
         }
         let durable_catalog =
             if let (Some(cat), Some(header)) = (&sm.catalog_writer, catalog_header) {

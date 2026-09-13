@@ -6,7 +6,8 @@ use sha2::{Digest, Sha256};
 use std::io::{Cursor, Read};
 
 /// Supplied by a trusted, durable cluster-version/capability authority. The
-/// current server does not install a provider; production writers stay on v1.
+/// server uses the replicated meta authority; v1 remains the default until
+/// explicit verified finalization.
 /// Reports must cover every current voter and learner, including joint membership.
 pub trait SnapshotCompatibility: Send + Sync {
     fn finalized_cluster_version(&self) -> anyhow::Result<u64>;

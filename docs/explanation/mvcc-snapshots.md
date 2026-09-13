@@ -2,8 +2,9 @@
 
 NSNP v2 can transfer complete retained user MVCC chains, including tombstones,
 pending puts/deletes and their physical transaction IDs. Readers accept v1 and
-v2. **Production writers remain on v1** until durable cluster compatibility and
-membership admission are implemented. Public shard migration remains disabled.
+v2. Production writers use v1 by default and can enable v2 through the
+[durable snapshot upgrade authority](upgrade-authority.md). Public shard migration
+remains disabled.
 
 ## Writer eligibility and compatibility
 
@@ -15,23 +16,22 @@ in the applied membership reports snapshot support at least 2. This includes
 learners and both sides of joint membership. Missing or old reports retain v1;
 provider errors fail the build. Empty membership cannot enable v2.
 
-The interface checks evidence supplied by its caller; it does not authenticate
-reports, persist finalization, or coordinate membership changes. The server's
-current in-memory upgrade coordinator is insufficient authority and is not
-connected to this writer. Tests supply an explicit fixture provider. Production
-activation needs authoritative reports, durable finalization, admission checks
-for new learners and voters, and protection against serving cached v2 files to
-incompatible members. V2 readers do not require writer eligibility to decode.
+The server supplies the durable meta authority. Its leader verifies all members
+using fresh capability challenges (peer mTLS for remote nodes) and persists
+finalization through Raft. Meta membership freezes during and after activation;
+production snapshot transport rechecks each v2 recipient before every chunk.
+V2 readers do not require writer eligibility to decode. See the
+[authority contract and rollout limits](upgrade-authority.md).
 
 | State | Read | Write / rollback |
 | --- | --- | --- |
 | Earlier binary | Existing v1 | Cannot receive v2; old installer safety is not certified |
 | New binary, no provider or gate off | v1 and v2 | Existing v1 bytes; refuses unrepresentable user state |
-| New binary, eligible fixture provider | v1 and v2 | v2; rollback to a v1-only snapshot reader unsupported |
+| New binary, verified finalized authority | v1 and v2 | v2; rollback to a v1-only snapshot reader unsupported |
 | Existing storage-format reader | Existing SST/WAL/MANIFEST envelopes | Checkpoint adds a versioned local KV record, without changing those envelopes; older backup code does not enforce its recovery rules |
 
 This is format and state-machine evidence using one binary, not a demonstrated
-mixed-binary upgrade. Production's v1 refusal remains an availability limit:
+mixed-binary upgrade. Before finalization, v1 refusal remains an availability limit:
 OpenRaft treats a build error for history, tombstones or intents as fatal.
 
 ## NSNP v2 layout and validation
