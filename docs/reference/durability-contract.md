@@ -35,12 +35,24 @@ on-disk state a crash would leave.
 | Orphan SSTable absent from the manifest (crash before swap) | `nodus_storage_lsm`: `orphan_sstable_not_in_manifest_is_ignored` |
 | Corrupt or torn manifest | `nodus_storage_lsm`: `corrupt_manifest_recovers_via_directory_scan` |
 | Flush mid-transaction strands an intent | `nodus_storage_lsm`: `flush_retains_uncommitted_intents` |
+| Archive cleanup while a commit spans WAL segments | `nodus_storage_lsm`: `archived_wal_reclamation_preserves_cross_segment_commits` |
+| Cleanup after an unpublished or corrupt manifest | `nodus_storage_lsm`: `wal_reclamation_uses_published_manifest_and_fails_closed` |
 | Compaction merges accumulated SSTables | `nodus_storage_lsm`: `compaction_merges_accumulated_sstables` |
 | Recovery across flush and compaction (manifest-driven) | `nodus_storage_lsm`: `manifest_recovery_after_flush_and_compaction` |
 | Unreadable or missing SSTable during a read | `nodus_storage_lsm`: `unavailable_sstable_fails_reads_instead_of_hiding_committed_rows` |
 | Committed row and catalog survive a full restart | `tests/fault`: `committed_data_survives_a_restart` |
 | Rolled-back writes never visible, before or after restart | `tests/fault`: `rolled_back_writes_are_never_visible` |
 | Point-in-time restore replays archived WAL to a target time | `tests/integration`: `admin_backup_pitr_restore` |
+
+## Local WAL archive cleanup
+
+The server may remove an archived local WAL segment only after backup retention
+permits cleanup **and** the LSM's published manifest places it below the local
+replay floor. The storage engine checks and removes it while serialized with
+checkpoint publication. Archiving alone does not make a segment dispensable:
+an intent retained during a flush can still require an earlier segment on restart.
+Invalid or unavailable checkpoint metadata prevents cleanup. This uses the
+existing manifest format and does not require upgrade finalization.
 
 ## Atomic Raft snapshot installation
 
@@ -92,6 +104,6 @@ prove power-loss durability. See the [protocol and compatibility limits](../expl
 | In-memory by default | Durability requires `[storage] data_dir`. |
 | On-disk formats are not backward compatible across the hardening changes (WAL CRC frame, SSTable v2, catalog-in-KV) | Upgrading across those changes requires a clean restart. There is no cross-version on-disk compatibility guarantee yet. |
 | Catalog persistence writes a full-state blob per DDL | Catalog writes are not incremental per entry. |
-| WAL segment retention is not automatic | Superseded segments are retained for point-in-time recovery; reclaiming them is manual. |
+| WAL retention has two boundaries | Local cleanup waits for both backup retention and the durable local replay floor; retained intents or restore points can delay reclamation. |
 | General runtime fault injection is not wired into the storage engines | Snapshot tests have targeted test-only subprocess exit hooks; these and existing disk-residue tests do not establish power-loss durability. |
 | Single-node scope | This contract covers local durability. Replication and cross-node durability are properties of the Raft layer, not of this contract. |

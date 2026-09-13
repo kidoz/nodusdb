@@ -889,7 +889,9 @@ pub async fn run_server_with_config(
                                                         .await
                                                         .unwrap_or(false)
                                                 {
-                                                    let _ = std::fs::remove_file(&path);
+                                                    if let Err(error) = local_kv_clone.reclaim_archived_wal_segment(id) {
+                                                        tracing::warn!(segment_id = id, %error, "archived WAL cleanup failed; retaining local segment");
+                                                    }
                                                 }
                                             } else {
                                                 let _ = backup_clone

@@ -72,6 +72,14 @@ pub enum IntentReplacement {
 }
 
 pub trait KvEngine: Send + Sync {
+    /// Removes an already-archived local WAL segment only when the durable
+    /// checkpoint no longer needs it for crash recovery. The caller must first
+    /// satisfy archive/backup retention policy. Unsupported engines retain it.
+    /// Implementations serialize the check and removal with checkpoint publication.
+    fn reclaim_archived_wal_segment(&self, _segment_id: u64) -> Result<bool> {
+        Ok(false)
+    }
+
     /// Node-local checkpoint identity. Namespace adapters must delegate to the
     /// physical engine; it is never transferred in a Raft snapshot.
     fn recovery_generation(&self) -> Result<Option<recovery::RecoveryGeneration>> {

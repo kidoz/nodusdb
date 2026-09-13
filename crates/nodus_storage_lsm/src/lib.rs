@@ -605,6 +605,26 @@ impl Default for LsmKvEngine {
 }
 
 impl KvEngine for LsmKvEngine {
+    fn reclaim_archived_wal_segment(&self, segment_id: u64) -> Result<bool> {
+        let _snapshot = self.snapshot_gate.read().unwrap();
+        self.snapshot_available()?;
+        let _checkpoint = self.flush_compact_lock.lock().unwrap();
+        let Some(dir) = &self.data_dir else {
+            return Ok(false);
+        };
+        // Consult the published manifest, not in-memory counters: a failed
+        // manifest publication may have already advanced those counters.
+        let manifest: Manifest = serde_json::from_slice(&std::fs::read(dir.join(MANIFEST_FILE))?)?;
+        if segment_id >= manifest.min_replay_wal || segment_id == manifest.active_wal {
+            return Ok(false);
+        }
+        match std::fs::remove_file(dir.join(format!("{segment_id}.log"))) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     fn snapshot_rows(
         &self,
         scope: &nodus_storage_api::SnapshotScope,
@@ -1749,6 +1769,68 @@ mod sst_tests {
             Some(Bytes::from("v1")),
             "committed value lost: recovery did not replay the predecessor segment"
         );
+    }
+
+    #[test]
+    fn archived_wal_reclamation_preserves_cross_segment_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = LsmKvEngine::with_wal(dir.path(), None).unwrap();
+        let first = engine.active_wal_id.load(Ordering::Relaxed);
+        let txn = TxnId::new();
+        engine
+            .write_intent(
+                txn,
+                Bytes::from_static(b"vote"),
+                Bytes::from_static(b"term-7"),
+            )
+            .unwrap();
+        engine.flush().unwrap(); // Retain the intent and its predecessor WAL.
+        engine.commit(txn, 7).unwrap(); // Commit lands in the successor segment.
+        assert!(!engine.reclaim_archived_wal_segment(first).unwrap());
+        drop(engine);
+
+        let engine = LsmKvEngine::with_wal(dir.path(), None).unwrap();
+        assert_eq!(
+            engine.get(b"vote", u64::MAX).unwrap(),
+            Some(Bytes::from_static(b"term-7"))
+        );
+        engine.flush().unwrap(); // A complete checkpoint now covers the commit.
+        assert!(engine.reclaim_archived_wal_segment(first).unwrap());
+        assert!(
+            !engine
+                .reclaim_archived_wal_segment(engine.active_wal_id.load(Ordering::Relaxed))
+                .unwrap()
+        );
+        drop(engine);
+        let engine = LsmKvEngine::with_wal(dir.path(), None).unwrap();
+        assert_eq!(
+            engine.get(b"vote", u64::MAX).unwrap(),
+            Some(Bytes::from_static(b"term-7"))
+        );
+    }
+
+    #[test]
+    fn wal_reclamation_uses_published_manifest_and_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = LsmKvEngine::with_wal(dir.path(), None).unwrap();
+        let first = engine.active_wal_id.load(Ordering::Relaxed);
+        engine
+            .write_intent(
+                TxnId::new(),
+                Bytes::from_static(b"pending"),
+                Bytes::from_static(b"value"),
+            )
+            .unwrap();
+        engine.flush().unwrap();
+        assert_ne!(first, engine.active_wal_id.load(Ordering::Relaxed));
+        // Model counters advancing ahead of a failed manifest publication.
+        engine.min_replay_wal.store(first + 10, Ordering::Relaxed);
+        assert!(!engine.reclaim_archived_wal_segment(first).unwrap());
+        let path = dir.path().join(format!("{first}.log"));
+        assert!(path.exists());
+        std::fs::write(dir.path().join(MANIFEST_FILE), b"invalid").unwrap();
+        assert!(engine.reclaim_archived_wal_segment(first).is_err());
+        assert!(path.exists());
     }
 
     #[test]
