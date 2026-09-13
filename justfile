@@ -24,6 +24,16 @@ test-integration:
 test-compat:
     cargo test -p nodus_compatibility_tests
 
+# Audit SQL compatibility using only the Rust PostgreSQL driver (no Java/.NET)
+test-compat-rust:
+    cargo test --locked --no-fail-fast \
+        -p nodus_compatibility_tests -p nodus_integration_tests -p nodus_sqllogictest \
+        --test pg18_admin --test pg18_adv_types --test pg18_catalog \
+        --test pg18_dql --test pg18_indexes --test pg18_schema_table \
+        --test pg18_types_constraints --test pg18_views --test pgwire_smoke \
+        --test scram_auth --test tls_handshake --test pg_client_coverage \
+        --test run_slt --test rust_driver_sql
+
 # Run SQL golden tests
 test-sql:
     cargo test -p nodus_sqllogictest
