@@ -171,18 +171,19 @@ used as writer or backup authority.
   treats a build error as fatal. This availability limit ends for eligible v2 groups
   after finalization, subject to the existing snapshot size and installation limits.
 - Binary `c138079` and earlier do not read `UpgradeControlV1`. Deploy this authority
-  reader to every member before starting the protocol. No actual historical/new
-  binary pair has been certified. Rolling back the feature before finalization
-  does **not** prove rollback to an older executable once authority records/logs
-  exist. A supported two-binary baseline is still required for the R6 rolling-upgrade
-  acceptance gate.
+  reader to every member before starting the protocol. The pinned R6a/R6b
+  [two-binary gate](../how-to/test-mixed-binary-upgrades.md) exercises same-directory
+  executable rollback before admission, but found snapshot login failures and
+  long log-purge pauses. This pair is not certified for uninterrupted upgrades.
+  Feature rollback does **not** establish arbitrary executable compatibility.
 - Tests cover full voter/learner reports, duplicate/unknown/stale reports, premature
   finalization, rollback, malformed records, actual mTLS/Raft leader loss and reopen,
   an unavailable member blocking finalization, abrupt subprocess exit after an
   acknowledged finalization, subsequent v2 snapshot transfer, incompatible recipient
   rejection before first/resumed chunks, admin admission/ingress, and destination
   policy preservation during backup/PITR replay. They do not establish Byzantine
-  safety, power-loss behavior, S3 recovery or a mixed-binary rolling upgrade.
+  safety, power-loss behavior or S3 recovery. Mixed-binary observations and their
+  blockers are recorded separately by the process gate.
 - Admission tests use real LSM and mTLS Raft nodes: leader changes after approval
   and after learner/promotion intent, purged-log v2 catch-up, historical reads,
   transferred intent resolution, persistent reopen, and abrupt subprocess exit
@@ -190,8 +191,9 @@ used as writer or backup authority.
   readers before append/snapshot bytes, stale reports, competing IDs/addresses,
   premature voter completion, missing/misanchored snapshot metadata, and source
   admission records in logical backup/PITR replay. Joint-state validation is tested
-  directly; a forced process failure between the two joint-consensus commits and
-  a two-binary deployment test remain follow-up evidence.
+  directly; a forced process failure between the two joint-consensus commits
+  remains follow-up evidence. Completing diagnostic two-binary checkpoints with
+  recipient restarts does not close the snapshot authorization defect.
 
 See [MVCC snapshots](mvcc-snapshots.md) and the
 [durability contract](../reference/durability-contract.md).

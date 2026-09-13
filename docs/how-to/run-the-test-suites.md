@@ -56,6 +56,7 @@ These are slower and target specific failure classes:
 just test-fault        # crash and fault-injection tests
 just test-partition    # Raft partition regression over real TCP
 just test-loom         # loom model-checked concurrency for the transaction manager
+just test-mixed-binary # pinned historical/current-reader processes (slow, opt-in)
 ```
 
 `just test-sim` is an alias for `just test-partition`. Despite the historical
@@ -64,6 +65,11 @@ deterministic simulation, and its hand-written operation history does not prove
 linearizability under concurrent traffic. The recipe first asserts the expected
 test exists, then runs it, so a silently renamed or skipped test fails the job
 rather than passing vacuously.
+
+The [mixed-binary gate](test-mixed-binary-upgrades.md) builds two pinned production
+revisions and checks upgrade, snapshot, admission and rollback behavior. It is
+ignored by ordinary workspace tests. Its diagnostic mode records known blockers
+and continues with explicit workarounds; blockers still make the gate fail.
 
 ## Fuzz targets
 

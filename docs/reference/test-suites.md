@@ -24,6 +24,13 @@ the name is historical: it runs on an ordinary Tokio runtime over real TCP, not
 under a deterministic simulator. Its operation history is hand-written and does
 not constitute a linearizability proof under concurrent traffic.
 
+`mixed_binary.rs` is a separate opt-in process test driven by
+`just test-mixed-binary`. It builds two full Git revisions and retains binary hashes,
+process logs and machine-readable results. See the
+[mixed-binary guide](../how-to/test-mixed-binary-upgrades.md). A diagnostic run can
+complete its checkpoints with explicit restarts while still failing the gate for
+snapshot authorization blockers; this is not an uninterrupted-upgrade certificate.
+
 **`tests/fuzz`.** A separate Cargo workspace with its own lockfile, so
 `cargo test --workspace` does not build it. Corpora and crash artefacts are not
 checked in.
