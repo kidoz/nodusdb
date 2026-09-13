@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build pinned, unmodified server revisions and run the process compatibility gate."""
+"""Run the process compatibility gate with pinned readers or an explicit candidate."""
 import argparse
 import hashlib
 import json
@@ -51,6 +51,8 @@ def main():
     parser.add_argument("--output", type=Path)
     parser.add_argument("--build-only", action="store_true")
     parser.add_argument("--reuse-builds", action="store_true")
+    parser.add_argument("--candidate", action="store_true",
+                        help="build the current working tree as the new reader; retain source hashes and patch separately")
     parser.add_argument("--diagnose", action="store_true",
                         help="continue after known snapshot-login failures using explicit restarts; gate still fails")
     args = parser.parse_args()
@@ -89,10 +91,34 @@ def main():
     else:
         manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
     print(f"Pinned binaries and evidence: {out}", flush=True)
+    new_binary = out / "nodusd-new"
+    if args.candidate:
+        # Keep historical artifacts intact. A candidate is explicitly identified
+        # by HEAD, the tracked patch, untracked crate sources and binary hash.
+        patch = subprocess.check_output(["git", "diff", "--binary", "HEAD", "--", "Cargo.toml", "Cargo.lock", "crates"], cwd=ROOT)
+        (out / "candidate.patch").write_bytes(patch)
+        untracked = subprocess.check_output(["git", "ls-files", "--others", "--exclude-standard", "-z", "crates"], cwd=ROOT).decode().split("\0")
+        sources = {}
+        for name in filter(None, untracked):
+            destination = out / "candidate-untracked" / name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(ROOT / name, destination)
+            sources[name] = sha(destination)
+        identity = {"base_revision": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
+                    "patch_sha256": sha(out / "candidate.patch"), "untracked_sources": sources}
+        fingerprint = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+        build_env = dict(env, CARGO_TARGET_DIR=str(ROOT / "target/mixed-binary-build" / ("candidate-" + fingerprint)))
+        with (out / "build-candidate.log").open("w") as log:
+            run(["cargo", "build", "--locked", "-p", "nodus_server", "--bin", "nodus_server"],
+                env=build_env, stdout=log, stderr=subprocess.STDOUT)
+        new_binary = out / "nodusd-candidate"
+        shutil.copy2(Path(build_env["CARGO_TARGET_DIR"]) / "debug/nodus_server", new_binary)
+        identity.update(binary_sha256=sha(new_binary), lock_sha256=sha(ROOT / "Cargo.lock"), rustc=manifest["rustc"])
+        (out / "candidate.json").write_text(json.dumps(identity, indent=2) + "\n")
     if args.build_only:
         return
     env.update(NODUS_MIXED_OLD=str(out / "nodusd-old"),
-               NODUS_MIXED_NEW=str(out / "nodusd-new"), NODUS_MIXED_OUTPUT=str(out))
+               NODUS_MIXED_NEW=str(new_binary), NODUS_MIXED_OUTPUT=str(out))
     env["NODUS_MIXED_DIAGNOSE"] = "1" if args.diagnose else "0"
     (out / "results.json").unlink(missing_ok=True)
     try:

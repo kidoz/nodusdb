@@ -173,8 +173,11 @@ used as writer or backup authority.
 - Binary `c138079` and earlier do not read `UpgradeControlV1`. Deploy this authority
   reader to every member before starting the protocol. The pinned R6a/R6b
   [two-binary gate](../how-to/test-mixed-binary-upgrades.md) exercises same-directory
-  executable rollback before admission, but found snapshot login failures and
-  long log-purge pauses. This pair is not certified for uninterrupted upgrades.
+  executable rollback before admission, but found snapshot login failures,
+  premature local WAL cleanup and long log-purge pauses. The working-tree
+  candidate repairs bootstrap credential resolution and local WAL reclamation;
+  the unchanged historical readers still have those defects. This pair is not
+  certified for uninterrupted upgrades.
   Feature rollback does **not** establish arbitrary executable compatibility.
 - Tests cover full voter/learner reports, duplicate/unknown/stale reports, premature
   finalization, rollback, malformed records, actual mTLS/Raft leader loss and reopen,
@@ -193,7 +196,8 @@ used as writer or backup authority.
   admission records in logical backup/PITR replay. Joint-state validation is tested
   directly; a forced process failure between the two joint-consensus commits
   remains follow-up evidence. Completing diagnostic two-binary checkpoints with
-  recipient restarts does not close the snapshot authorization defect.
+  recipient restarts does not establish uninterrupted compatibility for the
+  historical binaries.
 
 See [MVCC snapshots](mvcc-snapshots.md) and the
 [durability contract](../reference/durability-contract.md).

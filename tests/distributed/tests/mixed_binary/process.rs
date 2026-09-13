@@ -233,7 +233,9 @@ impl Matrix {
             self.nodes
                 .iter()
                 .enumerate()
-                .filter(|(i, _)| *i != index && *i < 3)
+                // The admitted fourth member can become leader after a crash.
+                // Join currently needs a leader seed; retain every known address.
+                .filter(|(i, _)| *i != index)
                 .map(|(_, n)| n.http.clone())
                 .collect()
         } else {
@@ -302,7 +304,15 @@ impl Matrix {
                         .0,
                     200
                 );
-                sleep(Duration::from_secs(1)).await;
+                // A candidate with an older log cannot win. Let the up-to-date
+                // peer win naturally and replicate before requesting another
+                // election; a one-second loop can indefinitely preempt it.
+                for _ in 0..100 {
+                    sleep(Duration::from_millis(100)).await;
+                    if self.state(index).await.get("phase").is_some() {
+                        return;
+                    }
+                }
             }
         })
         .await
