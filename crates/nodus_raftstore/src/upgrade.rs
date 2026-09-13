@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, sync::Arc};
 use uuid::Uuid;
 
+pub mod admission;
+
 pub const KEY: &[u8] = b"\x01upgrade/v1/state";
 pub const MAX_MEMBERS: usize = 256;
 pub const TARGET: &str = "snapshot-v2";
@@ -28,7 +30,13 @@ pub struct CapabilityV1 {
     pub authority_version: u16,
     pub snapshot_version: u16,
     pub ready_for_finalize: bool,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub admission_version: u16,
 }
+fn is_zero(value: &u16) -> bool {
+    *value == 0
+}
+
 impl CapabilityV1 {
     pub fn local(node_id: u64, challenge: Uuid) -> Self {
         Self {
@@ -39,6 +47,7 @@ impl CapabilityV1 {
             authority_version: 1,
             snapshot_version: 2,
             ready_for_finalize: false,
+            admission_version: 1,
         }
     }
     pub fn validate(&self, node: u64, challenge: Uuid) -> Result<()> {
@@ -225,8 +234,12 @@ fn transition(
             "unknown capability node"
         );
         report.validate(report.node_id, cmd.session)?;
+        // R6a readers discard this optional field. Keep the immutable base
+        // authority identical across both readers; admission has its own ledger.
+        let mut report = report.clone();
+        report.admission_version = 0;
         ensure!(
-            reports.insert(report.node_id, report.clone()).is_none(),
+            reports.insert(report.node_id, report).is_none(),
             "duplicate capability report"
         );
     }
@@ -327,11 +340,23 @@ impl SnapshotCompatibility for DurableSnapshotCompatibility {
         Ok(read(self.0.as_ref())?.cluster_version)
     }
     fn member_snapshot_versions(&self) -> Result<BTreeMap<u64, u16>> {
-        Ok(read(self.0.as_ref())?
+        let authority = read(self.0.as_ref())?;
+        let ledger = admission::read(self.0.as_ref())?;
+        admission::approved(&authority, ledger.as_ref())?;
+        let mut versions: BTreeMap<_, _> = authority
             .reports
             .into_iter()
             .map(|(id, r)| (id, r.snapshot_version))
-            .collect())
+            .collect();
+        if let Some(ledger) = ledger {
+            versions.extend(
+                ledger
+                    .admitted
+                    .into_iter()
+                    .map(|(id, m)| (id, m.report.snapshot_version)),
+            );
+        }
+        Ok(versions)
     }
 }
 

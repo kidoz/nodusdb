@@ -165,6 +165,7 @@ pub enum ShardCommand {
         replacement: migration::writes::ReplacementV2,
     },
     UpgradeControlV1(upgrade::CommandV1),
+    UpgradeAdmissionV1(upgrade::admission::CommandV1),
 }
 
 impl ShardCommand {
@@ -172,6 +173,7 @@ impl ShardCommand {
         matches!(
             self,
             Self::UpgradeControlV1(_)
+                | Self::UpgradeAdmissionV1(_)
                 | Self::UpgradeStart { .. }
                 | Self::UpgradeNodeUpgraded { .. }
                 | Self::UpgradeFinalize
@@ -1075,6 +1077,18 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
                                     )))
                                 },
                             )?
+                        } else if let ShardCommand::UpgradeAdmissionV1(command) = cmd {
+                            let kv = sm.kv.as_ref().ok_or_else(|| {
+                                StorageIOError::write_state_machine(AnyError::error(
+                                    "admission requires storage",
+                                ))
+                            })?;
+                            upgrade::admission::apply(kv.as_ref(), &sm, command, entry.log_id.index)
+                                .map_err(|e| {
+                                    StorageIOError::write_state_machine(AnyError::error(format!(
+                                        "admission apply: {e}"
+                                    )))
+                                })?
                         } else {
                             ShardResponse { success: false, error: Some("legacy upgrade reports are not capability evidence; use the verified upgrade service".into()) }
                         };

@@ -29,7 +29,7 @@ fn internal(key: &[u8]) -> bool {
     key.starts_with(b"\0")
         || key.starts_with(b"meta:")
         || migration::is_control_key(key)
-        || key == upgrade::KEY
+        || key.starts_with(b"\x01upgrade/")
 }
 
 fn sync_dir(path: &std::path::Path) -> anyhow::Result<()> {
@@ -40,7 +40,7 @@ fn sync_dir(path: &std::path::Path) -> anyhow::Result<()> {
 fn validate_control(kv: &dyn KvEngine, row: &SnapshotRow) -> anyhow::Result<()> {
     if migration::is_control_key(&row.key)
         || row.key.as_ref() == CATALOG_KEY
-        || row.key.as_ref() == upgrade::KEY
+        || row.key.starts_with(b"\x01upgrade/")
     {
         anyhow::ensure!(
             !row.versions.iter().any(|v| v.is_intent),
@@ -57,7 +57,13 @@ fn validate_control(kv: &dyn KvEngine, row: &SnapshotRow) -> anyhow::Result<()> 
             .ok_or_else(|| anyhow::anyhow!("deleted control/catalog snapshot state"))?;
         if row.key.as_ref() == upgrade::KEY {
             upgrade::validate_snapshot(kv, bytes, None)?;
+        } else if row.key.as_ref() == upgrade::admission::KEY {
+            upgrade::admission::validate_snapshot(kv, bytes)?;
         } else {
+            anyhow::ensure!(
+                !row.key.starts_with(b"\x01upgrade/"),
+                "unknown upgrade snapshot record"
+            );
             migration::validate_snapshot_record(kv, &row.key, bytes, latest.version)?;
         }
     }
@@ -101,7 +107,9 @@ impl NodusRaftStore {
         anyhow::ensure!(
             !rows
                 .iter()
-                .filter(|r| r.key.as_ref() == CATALOG_KEY || migration::is_control_key(&r.key))
+                .filter(|r| r.key.as_ref() == CATALOG_KEY
+                    || migration::is_control_key(&r.key)
+                    || r.key.starts_with(b"\x01upgrade/"))
                 .flat_map(|r| &r.versions)
                 .any(|v| v.is_intent),
             "snapshot contains an unfinished catalog/control mutation"
@@ -294,9 +302,9 @@ impl NodusRaftStore {
             .ok_or_else(|| anyhow::anyhow!("snapshot requires storage"))?;
         for row in kv.snapshot_rows(&scope)? {
             anyhow::ensure!(
-                !(migration::is_control_key(&row.key) || row.key.as_ref() == upgrade::KEY)
+                !(migration::is_control_key(&row.key) || row.key.starts_with(b"\x01upgrade/"))
                     || rows.contains_key(&row.key),
-                "snapshot missing migration state"
+                "snapshot missing migration or upgrade state"
             );
         }
         if let Some(row) = rows.get(upgrade::KEY)
@@ -307,6 +315,35 @@ impl NodusRaftStore {
                 .and_then(|v| v.value.as_ref())
         {
             upgrade::validate_snapshot(kv.as_ref(), bytes, Some(meta))?;
+        }
+        if let Some(row) = rows.get(upgrade::admission::KEY) {
+            let latest = row
+                .versions
+                .iter()
+                .max_by_key(|v| v.version)
+                .and_then(|v| v.value.as_ref())
+                .ok_or_else(|| anyhow::anyhow!("missing admission state"))?;
+            let ledger = upgrade::admission::decode(latest)?;
+            let base = rows
+                .get(upgrade::KEY)
+                .and_then(|r| r.versions.iter().max_by_key(|v| v.version))
+                .and_then(|v| v.value.as_ref())
+                .ok_or_else(|| anyhow::anyhow!("admission snapshot lacks upgrade authority"))?;
+            let authority = upgrade::decode(base)?;
+            upgrade::admission::approved(&authority, Some(&ledger))?;
+            anyhow::ensure!(
+                meta.last_log_id.is_some_and(|l| l.index >= ledger.revision),
+                "admission revision exceeds snapshot applied pointer"
+            );
+            if ledger.pending.is_some() {
+                upgrade::admission::validate_progress(&ledger, &meta.last_membership)?;
+            } else {
+                upgrade::admission::validate_stable(
+                    &authority,
+                    Some(&ledger),
+                    &meta.last_membership,
+                )?;
+            }
         }
         let durable_catalog =
             if let (Some(cat), Some(header)) = (&sm.catalog_writer, catalog_header) {

@@ -321,14 +321,6 @@ async fn cluster_join(
     let voters: std::collections::BTreeSet<u64> =
         metrics.membership_config.membership().voter_ids().collect();
 
-    // Idempotent: already a member — succeed without touching membership.
-    if voters.contains(&req.node_id) {
-        return (
-            StatusCode::OK,
-            Json(json!({ "joined": true, "node_id": req.node_id, "already_member": true })),
-        );
-    }
-
     // Membership changes must run on the leader. If we're not it, tell the
     // caller to retry (it will cycle to another peer / back off).
     if metrics.current_leader != Some(metrics.id) {
@@ -338,10 +330,52 @@ async fn cluster_join(
         );
     }
 
+    if nodus_raftstore::upgrade::read(state.upgrade.kv.as_ref())
+        .is_ok_and(|r| r.phase == nodus_raftstore::upgrade::Phase::Finalized)
+    {
+        return match state
+            .upgrade
+            .admit_member_locked(req.node_id, &req.raft_advertise_addr)
+            .await
+        {
+            Ok(()) => (
+                StatusCode::OK,
+                Json(json!({"joined": true, "node_id": req.node_id})),
+            ),
+            Err(error) => (
+                StatusCode::CONFLICT,
+                Json(json!({"error": error.to_string()})),
+            ),
+        };
+    }
     if let Err(error) = state.upgrade.check_membership_change() {
         return (
             StatusCode::CONFLICT,
             Json(json!({"error": error.to_string()})),
+        );
+    }
+    if let Err(error) =
+        nodus_raftstore::upgrade::admission::validate_address(&req.raft_advertise_addr)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": error.to_string()})),
+        );
+    }
+    let roster = metrics.membership_config.membership();
+    if roster.nodes().any(|(id, node)| {
+        (*id == req.node_id && node.addr != req.raft_advertise_addr)
+            || (*id != req.node_id && node.addr == req.raft_advertise_addr)
+    }) {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "node ID/address conflict"})),
+        );
+    }
+    if voters.contains(&req.node_id) {
+        return (
+            StatusCode::OK,
+            Json(json!({"joined": true, "node_id": req.node_id, "already_member": true})),
         );
     }
     let node = openraft::BasicNode::new(&req.raft_advertise_addr);
@@ -775,7 +809,7 @@ async fn create_backup(
                         Ok(version) => {
                             if version.key.as_ref()
                                 == nodus_storage_api::recovery::RECOVERY_GENERATION_KEY
-                                || version.key.as_ref() == nodus_raftstore::upgrade::KEY
+                                || version.key.starts_with(b"\x01upgrade/")
                             {
                                 continue;
                             }
@@ -825,7 +859,7 @@ async fn create_backup(
                         Ok(version) => {
                             if version.key.as_ref()
                                 == nodus_storage_api::recovery::RECOVERY_GENERATION_KEY
-                                || version.key.as_ref() == nodus_raftstore::upgrade::KEY
+                                || version.key.starts_with(b"\x01upgrade/")
                             {
                                 continue;
                             }

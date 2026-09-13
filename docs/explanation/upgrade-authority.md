@@ -2,8 +2,9 @@
 
 The production server can enable NSNP v2 after explicit, verified finalization.
 It starts at compatibility level 1 and writes v1 snapshots until then. This
-first authority protocol supports the target **`snapshot-v2`** and freezes meta
-membership during the upgrade and after finalization. It does not enable shard
+authority protocol supports the target **`snapshot-v2`** and freezes meta
+membership during the upgrade. After finalization, verified additive admission
+can introduce new voters. It does not enable shard
 migration, a new SST/WAL format, or general rolling binary upgrades.
 
 ## Authority and evidence
@@ -69,13 +70,71 @@ cannot reset the phase or reuse an old challenge. A timed-out operation has an
 uncertain outcome; inspect status before retrying. Membership changes during
 probing invalidate the operation at apply. Joint membership cannot start/finalize.
 
-Meta join admission shares the leader's upgrade lock and rejects new learners or
-voters while the authority is active or finalized. Existing voters may retry
-join without changing membership. Data-group reconciliation can converge only
-to the frozen verified meta roster. Adding or removing meta members after
-finalization is deliberately unsupported in this slice; do not edit authority
-records to bypass it. A future replicated admission protocol must preserve the
-minimum reader requirement across new members, restarts and address changes.
+## Adding members after finalization
+
+Deploy the admission-v1 reader to **every existing voter and learner** before
+joining a new node. Send the existing authenticated `POST /api/v1/cluster/join`
+request to the meta leader, with `node_id` and `raft_advertise_addr` (`host:port`).
+The candidate must already serve its configured ID over peer mTLS. The endpoint
+returns success only after stable voter membership and durable completion.
+`GET /api/v1/upgrade` includes `member_admission`, which is null before the first
+admission and otherwise contains the revision, admitted members and pending plan.
+
+The finalized base authority stays immutable. A separate version 1 ledger at
+`\x01upgrade/admission/v1/state`, anchored to its revision, records this sequence:
+
+1. **Approved:** probe every current voter, learner and candidate with a fresh
+   challenge; require snapshot v2 and admission v1 support; replicate the reserved
+   ID/address, candidate report, operation UUID and original membership.
+2. Add the candidate as a learner and wait for catch-up. Re-probe all members with
+   another challenge and replicate **Promoting** before changing voter membership.
+3. Complete joint consensus, verify the resulting stable voter membership, and
+   replicate completion. The admitted identity remains in the ledger permanently.
+
+Each command compares the exact applied membership and expected ledger revision.
+One pending operation serializes admissions across retries and leader changes.
+A timeout has an uncertain outcome: inspect `member_admission` and retry the same
+ID/address on the current leader. Retries resume approval, learner catch-up,
+promotion or completion; they do not allocate another identity. An already joined
+voter succeeds only if its approved address matches and fresh capability checks
+pass. Conflicting IDs/addresses, concurrent different candidates, missing readers,
+and unexpected membership changes are rejected before continuing.
+
+The shared leader lock covers join/upgrade operations; consensus checks guard
+against leadership changes beyond that process-local lock. Admission has a
+30-second execution bound after acquiring the admin membership lock, in addition
+to the per-probe and ReadIndex bounds. Large or slow clusters may need retries.
+There is no automatic coordinator recovery worker; the joining node's existing
+join loop or an operator retry drives the recorded operation forward.
+
+Removal, address replacement, promotion of a pre-existing base learner, and
+cancellation of an approved candidate remain unsupported. Cancellation needs a
+fence against a late learner RPC; editing the ledger is unsafe. Restore the
+candidate at the reserved address to resume. Data groups reconcile against the
+base roster plus approved additions, including the pending candidate once it
+appears in applied meta membership. Reconciliation reads membership and authority
+under the same apply lock and validates voter sets as well as addresses. The writer
+gate includes its verified reader before
+learner creation, so catch-up can use v2 snapshots with history and intents.
+
+## Reader compatibility
+
+| Binary capability | Existing authority / NSNP v1 and v2 | Admission commands and ledger | Can participate in admission |
+| --- | --- | --- | --- |
+| Authority reader without `admission_version` (R6a) | Reads | Unsupported | No |
+| Admission-v1 reader before first admission | Reads; existing base stays unchanged | Reads | Yes, after all-member verification |
+| Admission-v1 reader after admission | Reads | Reads and writes anchored ledger | Yes |
+
+A missing capability field decodes as admission version 0; it does not authorize
+admission. Base-authority commands and transitions clear that optional field,
+so old and new authority readers persist identical base records; the immutable
+base does not acquire admission-only evidence. Before the first new admission
+command, the service probes all current members.
+The sender also probes before transmitting an admission command. Once a ledger
+exists, it requires admission-v1 support before every append RPC and every v2
+snapshot chunk, including cached/resumed transfers. This adds one capability RPC
+to append traffic after admission; failure blocks replication to that peer.
+This is a fail-closed reader guard, not a supported executable downgrade procedure.
 
 ## Snapshot serving and recovery
 
@@ -87,8 +146,10 @@ identity mismatch, insecure transport or incompatible response prevents that chu
 from being sent. Readers retain v1 support. Existing v1 files remain readable and
 servable; a new build after finalization emits v2.
 
-The authority is included in meta Raft snapshots and survives persistent reopen.
-It is excluded from logical backup data and skipped during logical/PITR replay:
+The authority and admission ledger are included in meta Raft snapshots and survive
+persistent reopen. Installation rejects omitted, regressed, unanchored or replaced
+admission identities and checks the snapshot membership and applied pointer.
+Both records are excluded from logical backup data and skipped during logical/PITR replay:
 a restore must use the destination cluster's membership and independently verified
 upgrade policy. Backup manifests report the durable compatibility level. The old
 catalog `get_cluster_version` descriptor remains a legacy placeholder and is not
@@ -97,7 +158,8 @@ used as writer or backup authority.
 ## Limits and evidence
 
 - At most 256 members; addresses at most 512 bytes, binary strings at most 128,
-  capability responses at most 8 KiB and authority records at most 256 KiB.
+  capability responses at most 8 KiB, authority records at most 256 KiB and
+  admission ledgers at most 512 KiB.
   Probe requests have a three-second timeout; admin mutations have a fifteen-second
   overall timeout including lock/probe/consensus waits. Status has a five-second
   ReadIndex timeout. Sequential probes may require retries in a slow large cluster.
@@ -121,6 +183,15 @@ used as writer or backup authority.
   rejection before first/resumed chunks, admin admission/ingress, and destination
   policy preservation during backup/PITR replay. They do not establish Byzantine
   safety, power-loss behavior, S3 recovery or a mixed-binary rolling upgrade.
+- Admission tests use real LSM and mTLS Raft nodes: leader changes after approval
+  and after learner/promotion intent, purged-log v2 catch-up, historical reads,
+  transferred intent resolution, persistent reopen, and abrupt subprocess exit
+  after acknowledged approval followed by retry. Rejection tests cover older
+  readers before append/snapshot bytes, stale reports, competing IDs/addresses,
+  premature voter completion, missing/misanchored snapshot metadata, and source
+  admission records in logical backup/PITR replay. Joint-state validation is tested
+  directly; a forced process failure between the two joint-consensus commits and
+  a two-binary deployment test remain follow-up evidence.
 
 See [MVCC snapshots](mvcc-snapshots.md) and the
 [durability contract](../reference/durability-contract.md).

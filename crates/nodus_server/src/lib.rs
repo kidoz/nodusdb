@@ -477,8 +477,12 @@ pub async fn run_server_with_config(
 
     // Outbound Raft transport: plain HTTP, or an mTLS `https` client when
     // inter-node TLS is configured.
-    let raft_transport = build_raft_transport(&config.cluster)?.with_snapshot_checks();
-    nodus_raftstore::upgrade::read(local_kv.as_ref())?;
+    let raft_transport = build_raft_transport(&config.cluster)?
+        .with_snapshot_checks()
+        .with_admission_source(local_kv.clone());
+    let authority = nodus_raftstore::upgrade::read(local_kv.as_ref())?;
+    let admissions = nodus_raftstore::upgrade::admission::read(local_kv.as_ref())?;
+    nodus_raftstore::upgrade::admission::approved(&authority, admissions.as_ref())?;
 
     // Owns this node's Raft groups. The meta group is created now; data-shard
     // groups are created on demand (routing lands in Phase 2).

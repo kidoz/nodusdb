@@ -16,6 +16,7 @@ pub struct RaftTransport {
     client: RaftClient,
     scheme: Arc<str>,
     check_snapshots: bool,
+    admission_source: Option<Arc<dyn nodus_storage_api::KvEngine>>,
 }
 
 /// The outbound HTTP client behind a [`RaftTransport`].
@@ -40,6 +41,23 @@ impl RaftTransport {
     pub fn with_snapshot_checks(mut self) -> Self {
         self.check_snapshots = true;
         self
+    }
+
+    /// Physical storage carries the cluster admission floor for every group.
+    pub fn with_admission_source(mut self, kv: Arc<dyn nodus_storage_api::KvEngine>) -> Self {
+        self.admission_source = Some(kv);
+        self
+    }
+    fn requires_admission_reader(&self) -> anyhow::Result<bool> {
+        self.admission_source.as_ref().map_or(Ok(false), |kv| {
+            Ok(crate::upgrade::admission::read(kv.as_ref())?.is_some())
+        })
+    }
+    async fn probe_admission(&self, node: u64, address: &str) -> anyhow::Result<()> {
+        let report = self
+            .probe(node, address, uuid::Uuid::new_v4(), false)
+            .await?;
+        crate::upgrade::admission::require_reader(&report)
     }
 
     pub async fn probe(
@@ -83,6 +101,7 @@ impl RaftTransport {
             client: RaftClient::Lazy(Arc::new(OnceLock::new())),
             scheme: Arc::from("http"),
             check_snapshots: false,
+            admission_source: None,
         }
     }
 
@@ -93,6 +112,7 @@ impl RaftTransport {
             client: RaftClient::Ready(client),
             scheme: scheme.into(),
             check_snapshots: false,
+            admission_source: None,
         }
     }
 
@@ -133,6 +153,23 @@ impl RaftNetwork<NodusTypeConfig> for NodusNetwork {
         rpc: AppendEntriesRequest<NodusTypeConfig>,
         _option: RPCOption,
     ) -> Result<AppendEntriesResponse<u64>, RPCError<u64, BasicNode, RaftError<u64>>> {
+        let admission_command = rpc.entries.iter().any(|entry| {
+            matches!(
+                &entry.payload,
+                openraft::EntryPayload::Normal(crate::ShardCommand::UpgradeAdmissionV1(_))
+            )
+        });
+        let needs_admission = self.transport.requires_admission_reader().map_err(|e| {
+            RPCError::Network(NetworkError::new(&std::io::Error::other(e.to_string())))
+        })?;
+        if admission_command || needs_admission {
+            self.transport
+                .probe_admission(self.target, &self.target_node.addr)
+                .await
+                .map_err(|e| {
+                    RPCError::Network(NetworkError::new(&std::io::Error::other(e.to_string())))
+                })?;
+        }
         let url = format!(
             "{}://{}/raft/{}/append",
             self.scheme, self.target_node.addr, self.shard_id
@@ -175,7 +212,8 @@ impl RaftNetwork<NodusTypeConfig> for NodusNetwork {
                 .filter(|(id, _)| id == &rpc.meta.snapshot_id)
                 .is_none_or(|(_, v2)| *v2);
             if needs_probe {
-                self.transport
+                let report = self
+                    .transport
                     .probe(
                         self.target,
                         &self.target_node.addr,
@@ -186,6 +224,14 @@ impl RaftNetwork<NodusTypeConfig> for NodusNetwork {
                     .map_err(|e| {
                         RPCError::Network(NetworkError::new(&std::io::Error::other(e.to_string())))
                     })?;
+                let required = self.transport.requires_admission_reader().map_err(|e| {
+                    RPCError::Network(NetworkError::new(&std::io::Error::other(e.to_string())))
+                })?;
+                if required {
+                    crate::upgrade::admission::require_reader(&report).map_err(|e| {
+                        RPCError::Network(NetworkError::new(&std::io::Error::other(e.to_string())))
+                    })?;
+                }
             }
         }
         let url = format!(

@@ -2332,6 +2332,9 @@ mod tests {
         base_dump.as_array_mut().unwrap().push(serde_json::json!({
             "key": b"\x01upgrade/v1/state".to_vec(), "value": b"foreign policy".to_vec(), "version": 10
         }));
+        base_dump.as_array_mut().unwrap().push(serde_json::json!({
+            "key": b"\x01upgrade/admission/v1/state".to_vec(), "value": b"foreign admission".to_vec(), "version": 10
+        }));
         orch.create_full_backup(
             "cluster-1",
             10,
@@ -2360,6 +2363,11 @@ mod tests {
                 txn_id: committed,
                 key: b"\x01upgrade/v1/state".to_vec(),
                 value: b"foreign policy".to_vec(),
+            }),
+            WalRecord::V1(WalRecordV1::WriteIntent {
+                txn_id: committed,
+                key: b"\x01upgrade/admission/v1/state".to_vec(),
+                value: b"foreign admission".to_vec(),
             }),
             WalRecord::V1(WalRecordV1::CommitTxn {
                 txn_id: committed,
@@ -2424,6 +2432,14 @@ mod tests {
         let objects = orch.restore(&plan.base_backup_id).await.unwrap();
         let wal_segments = orch.load_pitr_wal_segments(&plan).await.unwrap();
         let kv = MemKvEngine::new();
+        let local = TxnId::new();
+        kv.write_intent(
+            local,
+            Bytes::from_static(b"\x01upgrade/admission/v1/state"),
+            Bytes::from_static(b"destination admission"),
+        )
+        .unwrap();
+        kv.commit(local, 5).unwrap();
         let base_report = BackupOrchestrator::restore_backup_objects_to_kv(&objects, &kv).unwrap();
         let wal_report =
             BackupOrchestrator::replay_pitr_wal_segments(&plan, &wal_segments, &kv, None).unwrap();
@@ -2437,6 +2453,10 @@ mod tests {
         assert!(
             kv.get(b"\x01upgrade/v1/state", 30).unwrap().is_none(),
             "logical/PITR restore must not import source membership policy"
+        );
+        assert_eq!(
+            kv.get(b"\x01upgrade/admission/v1/state", 30).unwrap(),
+            Some(Bytes::from_static(b"destination admission"))
         );
         assert_eq!(report.base_kv_versions_restored, 1);
         assert_eq!(report.wal_segments_replayed, 1);

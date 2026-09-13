@@ -188,3 +188,31 @@ fn preflight_ignores_local_raft_intents_but_reports_user_and_decision_state() {
     kv.commit(decision, 10).unwrap();
     assert!(!preflight(&kv).unwrap());
 }
+
+#[test]
+fn base_authority_bytes_match_reader_that_discards_admission_capability() {
+    let mut old = RecordV1::default();
+    for (index, action) in [
+        (2, OperationV1::Start),
+        (3, OperationV1::Refresh),
+        (4, OperationV1::Finalize),
+    ] {
+        let cmd = command(&old, action);
+        assert!(cmd.reports.iter().all(|r| r.admission_version == 1));
+        let mut legacy_json = serde_json::to_value(&cmd).unwrap();
+        for report in legacy_json["reports"].as_array_mut().unwrap() {
+            report.as_object_mut().unwrap().remove("admission_version");
+        }
+        let legacy: CommandV1 = serde_json::from_value(legacy_json).unwrap();
+        let new = transition(&old, &cmd, &roster(), index).unwrap();
+        let old_reader = transition(&old, &legacy, &roster(), index).unwrap();
+        let bytes = serde_json::to_vec(&new).unwrap();
+        assert_eq!(bytes, serde_json::to_vec(&old_reader).unwrap());
+        assert!(
+            !String::from_utf8(bytes)
+                .unwrap()
+                .contains("admission_version")
+        );
+        old = new;
+    }
+}

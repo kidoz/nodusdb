@@ -1,4 +1,6 @@
 //! Real LSM, mTLS/Raft failover and abrupt restart evidence for upgrade authority.
+mod admission;
+
 use crate::{
     multi_raft::{META_SHARD, MultiRaftManager},
     raft_upgrade::RaftUpgradeCoordinator,
@@ -38,10 +40,13 @@ async fn node(
     let state = RaftState::new();
     let transport = crate::build_raft_transport(cluster)
         .unwrap()
-        .with_snapshot_checks();
+        .with_snapshot_checks()
+        .with_admission_source(kv.clone());
     let config = Arc::new(
         openraft::Config {
             heartbeat_interval: 200,
+            max_in_snapshot_log_to_keep: 0,
+            purge_batch_size: 1,
             election_timeout_min: 700,
             election_timeout_max: 1100,
             ..Default::default()

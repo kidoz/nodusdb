@@ -1,5 +1,7 @@
 //! Leader-only upgrade service; status uses ReadIndex and every mutation reads
 //! durable authority. Client-supplied names never count as capability evidence.
+mod admission;
+
 use crate::multi_raft::{META_SHARD, MultiRaftManager};
 use anyhow::{Result, ensure};
 use nodus_raftstore::{
@@ -41,12 +43,14 @@ impl RaftUpgradeCoordinator {
             upgrade::TARGET.into()
         };
         value["feature_gates"] = serde_json::json!({"mvcc_snapshots": record.cluster_version >= 2});
+        value["member_admission"] =
+            serde_json::to_value(upgrade::admission::read(self.kv.as_ref())?)?;
         Ok(value)
     }
     pub fn check_membership_change(&self) -> Result<()> {
         ensure!(
             upgrade::read(self.kv.as_ref())?.phase == Phase::Idle,
-            "meta membership is frozen during and after snapshot-v2 finalization"
+            "unverified membership changes require Idle; use verified admission after finalization"
         );
         Ok(())
     }
@@ -103,6 +107,9 @@ impl RaftUpgradeCoordinator {
                 } else {
                     self.transport.probe(*id, addr, session, true).await?
                 };
+                // Preserve the established authority command representation.
+                let mut report = report;
+                report.admission_version = 0;
                 reports.push(report);
             }
         }

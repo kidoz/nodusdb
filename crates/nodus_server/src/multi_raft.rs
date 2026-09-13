@@ -557,15 +557,45 @@ impl MultiRaftManager {
             return Ok(());
         }
 
-        let members = self.cluster_members().await;
-        let authority = nodus_raftstore::upgrade::read(self.base_kv.as_ref())?;
-        if authority.phase != nodus_raftstore::upgrade::Phase::Idle {
-            let verified = nodus_raftstore::upgrade::members(&authority.membership)?;
+        // A data-only/bootstrap manager has no peers to reconcile. Durable
+        // upgrade policy must never use that bootstrap fallback.
+        if self.get(META_SHARD).await.is_none() {
             anyhow::ensure!(
-                members == verified,
+                nodus_raftstore::upgrade::read(self.base_kv.as_ref())?.phase
+                    == nodus_raftstore::upgrade::Phase::Idle
+                    && nodus_raftstore::upgrade::admission::read(self.base_kv.as_ref())?.is_none(),
+                "upgrade-controlled reconciliation requires the meta group"
+            );
+            return Ok(());
+        }
+        // Hold the apply read lock while reading membership and its durable
+        // authority, so reconciliation never mixes observations across apply.
+        let machine = self.machine(META_SHARD).await?;
+        let meta = machine.read().await;
+        let members = nodus_raftstore::upgrade::members(&meta.last_membership)?;
+        let authority = nodus_raftstore::upgrade::read(self.base_kv.as_ref())?;
+        if authority.phase == nodus_raftstore::upgrade::Phase::Finalized {
+            let ledger = nodus_raftstore::upgrade::admission::read(self.base_kv.as_ref())?;
+            nodus_raftstore::upgrade::admission::approved(&authority, ledger.as_ref())?;
+            if let Some(record) = ledger.as_ref().filter(|r| r.pending.is_some()) {
+                nodus_raftstore::upgrade::admission::validate_progress(
+                    record,
+                    &meta.last_membership,
+                )?;
+            } else {
+                nodus_raftstore::upgrade::admission::validate_stable(
+                    &authority,
+                    ledger.as_ref(),
+                    &meta.last_membership,
+                )?;
+            }
+        } else if authority.phase != nodus_raftstore::upgrade::Phase::Idle {
+            anyhow::ensure!(
+                members == nodus_raftstore::upgrade::members(&authority.membership)?,
                 "cluster membership differs from frozen upgrade roster"
             );
         }
+        drop(meta);
         let mut target = current.clone();
         for (id, addr) in &members {
             if *id == self.node_id {
