@@ -53,6 +53,7 @@ axum-server = { version = "0.8.0", features = ["tls-rustls"] }
 sqlparser.workspace = true
 
 [dev-dependencies]
+tokio-postgres.workspace = true
 tempfile = "3.27.0"
 rcgen = "0.14.10"
 

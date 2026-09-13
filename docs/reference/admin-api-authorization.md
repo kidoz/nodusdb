@@ -20,6 +20,22 @@ rejected at startup unless `allow_insecure` is set explicitly.
 An invalid token, an undecodable Basic header, or credentials that fail
 authentication all return `401 Unauthorized`.
 
+The configured bootstrap password (`admin.password`) is an operator credential
+for `nodus`, shared by SQL SCRAM authentication and HTTP Basic authentication.
+New logins resolve the current catalog identity only if it is an active global
+user named `nodus` with a direct `ALL` grant on `System`. This allows a node to
+keep accepting bootstrap logins after a Raft snapshot replaces its locally
+created administrator ID with the cluster's ID. Login never creates that user
+or restores its grants. Removing the user or revoking that grant disables new
+bootstrap password logins while the server is running; the existing startup
+bootstrap still creates/grants the administrator when the server restarts.
+
+Ordinary passwords remain bound to immutable principal IDs. Deleting a user or
+replacing it with a same-name user does not transfer its password. Existing SQL
+sessions also keep their original IDs and subsequent privileged operations must
+pass authorization against the current catalog. Reconnect after snapshot identity
+replacement. These rules do not change the separate admin-token mechanism.
+
 ## Route privileges
 
 | Route prefix | Required action |

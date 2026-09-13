@@ -2467,6 +2467,7 @@ dependencies = [
  "sqlparser",
  "tempfile",
  "tokio",
+ "tokio-postgres",
  "tokio-rustls",
  "tower-http 0.7.1",
  "tracing",

@@ -10,6 +10,8 @@ mod raft_router;
 mod raft_shard_meta;
 mod raft_upgrade;
 #[cfg(test)]
+mod snapshot_auth_tests;
+#[cfg(test)]
 mod snapshot_tests;
 mod tls;
 #[cfg(test)]
@@ -38,6 +40,8 @@ use tokio_rustls::rustls::server::WebPkiClientVerifier;
 use tower_http::cors::{Any, CorsLayer};
 
 pub struct ServerHandle {
+    #[cfg(test)]
+    catalog: Arc<nodus_catalog::MemoryCatalog>,
     pub pgwire_addr: SocketAddr,
     pub http_addr: SocketAddr,
     pub pgwire_task: JoinHandle<anyhow::Result<()>>,
@@ -746,7 +750,7 @@ pub async fn run_server_with_config(
         );
         generated
     });
-    authenticator.set_password("nodus", admin.id, &admin_password);
+    authenticator.set_bootstrap_password(&admin_password);
 
     // The pgwire and HTTP listeners share one TLS config and its reloadable
     // certificate resolver (rotated together on SIGHUP).
@@ -1159,6 +1163,8 @@ pub async fn run_server_with_config(
     });
 
     Ok(ServerHandle {
+        #[cfg(test)]
+        catalog,
         pgwire_addr,
         http_addr,
         pgwire_task,

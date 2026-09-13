@@ -1,6 +1,8 @@
 use chrono::{DateTime, Utc};
 use hmac::{Hmac, KeyInit, Mac};
-use nodus_catalog::{CatalogReader, DatabaseId, PrincipalId, RoleId};
+use nodus_catalog::{
+    CatalogReader, DatabaseId, DescriptorState, PrincipalId, PrincipalType, ResourceRef, RoleId,
+};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::collections::HashMap;
@@ -200,8 +202,16 @@ pub enum AuthError {
 /// invalidating existing credentials. Plaintext passwords are never retained.
 #[derive(Debug, Clone)]
 struct StoredCredential {
-    principal_id: PrincipalId,
+    identity: CredentialIdentity,
     keys: ScramKeys,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CredentialIdentity {
+    Principal(PrincipalId),
+    /// An operator-configured credential, not a password belonging to a catalog
+    /// user. Only the active global `nodus` user with direct System ALL qualifies.
+    BootstrapAdministrator,
 }
 
 /// PBKDF2-HMAC-SHA256 work factor. A deliberate cost (vs. a single SHA-256) so an
@@ -275,12 +285,33 @@ impl PasswordAuthenticator {
     /// generated here and the SCRAM keys are derived, so callers never deal with
     /// hashing or the password beyond this call.
     pub fn set_password(&self, username: &str, principal_id: PrincipalId, password: &str) {
+        self.register_password(
+            username,
+            CredentialIdentity::Principal(principal_id),
+            password,
+        );
+    }
+
+    /// Registers the explicitly configured bootstrap operator password. Snapshot
+    /// installation can replace node-local bootstrap IDs with the cluster's ID.
+    /// Each new session resolves the already-privileged global administrator;
+    /// this never creates principals or restores revoked grants. Ordinary user
+    /// credentials registered with `set_password` never follow a name replacement.
+    pub fn set_bootstrap_password(&self, password: &str) {
+        self.register_password(
+            "nodus",
+            CredentialIdentity::BootstrapAdministrator,
+            password,
+        );
+    }
+
+    fn register_password(&self, username: &str, identity: CredentialIdentity, password: &str) {
         let salt = Uuid::new_v4().as_bytes().to_vec();
         let keys = ScramKeys::derive(password, salt, PBKDF2_ITERATIONS);
-        self.credentials.write().unwrap().insert(
-            username.to_string(),
-            StoredCredential { principal_id, keys },
-        );
+        self.credentials
+            .write()
+            .unwrap()
+            .insert(username.to_string(), StoredCredential { identity, keys });
     }
 
     /// Returns the stored SCRAM verifier material for `username`, if known. Used
@@ -295,30 +326,68 @@ impl PasswordAuthenticator {
     }
 
     /// Issues a session for an already-authenticated user (e.g. after a SCRAM
-    /// exchange has verified the client's proof). Fails only if the user is
-    /// unknown.
+    /// exchange has verified the client's proof). Rechecks identity and current
+    /// bootstrap eligibility after the exchange, including snapshot replacement.
     pub fn issue_session(&self, username: &str) -> Result<Session, AuthError> {
-        let principal_id = self
+        let identity = self
             .credentials
             .read()
             .unwrap()
             .get(username)
-            .map(|c| c.principal_id)
+            .map(|c| c.identity)
             .ok_or_else(|| AuthError::UnknownUser(username.to_string()))?;
-        Ok(self.build_session(principal_id))
+        self.build_session(username, identity)
     }
 
-    fn build_session(&self, principal_id: PrincipalId) -> Session {
+    fn build_session(
+        &self,
+        username: &str,
+        identity: CredentialIdentity,
+    ) -> Result<Session, AuthError> {
+        let denied = || AuthError::InvalidCredentials(username.to_owned());
+        let principal = match identity {
+            CredentialIdentity::Principal(id) => self.catalog.get_principal_by_id(id),
+            CredentialIdentity::BootstrapAdministrator => {
+                self.catalog.get_principal_by_name("nodus")
+            }
+        }
+        .map_err(|_| denied())?;
+        if principal.name != username
+            || principal.state != DescriptorState::Public
+            || !matches!(
+                principal.principal_type,
+                PrincipalType::User | PrincipalType::ServiceAccount
+            )
+        {
+            return Err(denied());
+        }
+        if matches!(identity, CredentialIdentity::BootstrapAdministrator) {
+            let grants = self
+                .catalog
+                .get_grants_for_resource(ResourceRef::System)
+                .map_err(|_| denied())?;
+            if principal.principal_type != PrincipalType::User
+                || principal.database_id.is_some()
+                || !grants.iter().any(|g| {
+                    g.principal_id == principal.id
+                        && g.state == DescriptorState::Public
+                        && g.privilege.eq_ignore_ascii_case("ALL")
+                })
+            {
+                return Err(denied());
+            }
+        }
+        let principal_id = principal.id;
         let active_roles = self
             .catalog
             .get_effective_roles(principal_id)
-            .unwrap_or_default();
-        Session {
+            .map_err(|_| denied())?;
+        Ok(Session {
             session_id: Uuid::new_v4().to_string(),
             principal_id,
             active_roles,
             database_id: None,
-        }
+        })
     }
 }
 
@@ -340,7 +409,7 @@ impl Authenticator for PasswordAuthenticator {
             return Err(AuthError::InvalidCredentials(username.to_string()));
         }
 
-        Ok(self.build_session(cred.principal_id))
+        self.build_session(username, cred.identity)
     }
 }
 
@@ -383,6 +452,117 @@ impl TlsConfig {
 mod tests {
     use super::*;
     use nodus_catalog::{CatalogWriter, CreateRoleRequest, MemoryCatalog, PrincipalType};
+
+    fn user(catalog: &MemoryCatalog, name: &str) -> PrincipalId {
+        catalog
+            .create_role(CreateRoleRequest {
+                id: PrincipalId::new(),
+                name: name.into(),
+                principal_type: PrincipalType::User,
+                database_id: None,
+            })
+            .unwrap()
+            .id
+    }
+
+    #[test]
+    fn ordinary_credentials_never_follow_replaced_principals() {
+        let local = Arc::new(MemoryCatalog::new());
+        let old_id = user(&local, "alice");
+        let auth = PasswordAuthenticator::new(local.clone());
+        auth.set_password("alice", old_id, "alice-secret");
+        assert_eq!(auth.issue_session("alice").unwrap().principal_id, old_id);
+        let incoming = MemoryCatalog::new();
+        let new_id = user(&incoming, "alice");
+        assert_ne!(old_id, new_id);
+        local
+            .install_raft_catalog(&incoming.export_raft_catalog().unwrap(), &mut || Ok(()))
+            .unwrap();
+        assert!(auth.authenticate("alice", "alice-secret").is_err());
+        assert!(auth.issue_session("alice").is_err());
+    }
+
+    #[test]
+    fn bootstrap_password_rejects_roles_service_accounts_and_database_scoped_users() {
+        use nodus_catalog::{GrantId, GrantPrivilegeRequest};
+        for (principal_type, database_id) in [
+            (PrincipalType::Role, None),
+            (PrincipalType::ServiceAccount, None),
+            (PrincipalType::User, Some(DatabaseId::new())),
+        ] {
+            let catalog = Arc::new(MemoryCatalog::new());
+            let id = PrincipalId::new();
+            catalog
+                .create_role(CreateRoleRequest {
+                    id,
+                    name: "nodus".into(),
+                    principal_type,
+                    database_id,
+                })
+                .unwrap();
+            catalog
+                .grant_privilege(GrantPrivilegeRequest {
+                    id: GrantId::new(),
+                    principal_id: id,
+                    resource: ResourceRef::System,
+                    privilege: "ALL".into(),
+                })
+                .unwrap();
+            let auth = PasswordAuthenticator::new(catalog);
+            auth.set_bootstrap_password("operator-secret");
+            assert!(auth.authenticate("nodus", "operator-secret").is_err());
+            assert!(auth.issue_session("nodus").is_err());
+        }
+    }
+
+    #[test]
+    fn bootstrap_operator_credential_requires_an_existing_global_administrator() {
+        use nodus_catalog::{GrantId, GrantPrivilegeRequest, RevokePrivilegeRequest};
+        let local = Arc::new(MemoryCatalog::new());
+        user(&local, "nodus");
+        let auth = PasswordAuthenticator::new(local.clone());
+        auth.set_bootstrap_password("operator-secret");
+        // A same-name user without explicit administrator authority cannot log in.
+        assert!(auth.authenticate("nodus", "operator-secret").is_err());
+        assert!(auth.issue_session("nodus").is_err());
+        let incoming = MemoryCatalog::new();
+        let id = user(&incoming, "nodus");
+        incoming
+            .grant_privilege(GrantPrivilegeRequest {
+                id: GrantId::new(),
+                principal_id: id,
+                resource: ResourceRef::System,
+                privilege: "ALL".into(),
+            })
+            .unwrap();
+        local
+            .install_raft_catalog(&incoming.export_raft_catalog().unwrap(), &mut || Ok(()))
+            .unwrap();
+        assert_eq!(
+            auth.authenticate("nodus", "operator-secret")
+                .unwrap()
+                .principal_id,
+            id
+        );
+        assert_eq!(auth.issue_session("nodus").unwrap().principal_id, id);
+        assert!(auth.authenticate("nodus", "wrong").is_err());
+        local
+            .revoke_privilege(RevokePrivilegeRequest {
+                principal_id: id,
+                resource: ResourceRef::System,
+                privilege: "ALL".into(),
+            })
+            .unwrap();
+        assert!(auth.issue_session("nodus").is_err());
+        assert!(auth.authenticate("nodus", "operator-secret").is_err());
+        local
+            .install_raft_catalog(
+                &MemoryCatalog::new().export_raft_catalog().unwrap(),
+                &mut || Ok(()),
+            )
+            .unwrap();
+        assert!(auth.issue_session("nodus").is_err());
+    }
 
     #[test]
     fn authenticate_success_and_failure() {
