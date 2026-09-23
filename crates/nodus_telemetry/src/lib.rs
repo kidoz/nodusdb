@@ -21,8 +21,8 @@ pub fn init_otlp(endpoint: &str) -> Result<SdkTracerProvider> {
         .with_http()
         .with_endpoint(endpoint)
         .build()?;
-    // opentelemetry_sdk 0.32: the batch processor is thread-based and no longer
-    // takes a runtime argument.
+    // opentelemetry_sdk's batch processor is thread-based and takes no runtime
+    // argument.
     let provider = SdkTracerProvider::builder()
         .with_batch_exporter(exporter)
         .build();

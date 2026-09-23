@@ -29,6 +29,19 @@ pub fn parse_object_name(name: &str) -> Result<(&str, &str, &str)> {
     }
 }
 
+/// Resolves an `ORDER BY` item's direction: `true` for ascending, the default.
+/// `USING <operator>` has no executor support, so it is rejected rather than
+/// silently sorted ascending.
+fn sort_ascending(options: &sqlparser::ast::OrderByOptions) -> Result<bool> {
+    match &options.sort {
+        None | Some(sqlparser::ast::OrderBySort::Asc) => Ok(true),
+        Some(sqlparser::ast::OrderBySort::Desc) => Ok(false),
+        Some(sqlparser::ast::OrderBySort::Using(op)) => {
+            anyhow::bail!("Unsupported ORDER BY USING operator: {op}")
+        }
+    }
+}
+
 /// Hard ceiling on nested-query planning depth (CTEs, set operations, and
 /// subqueries each recurse through [`plan_query`]). sqlparser already caps
 /// expression depth at parse time, but nested query structures recurse here too;
@@ -426,8 +439,9 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
                                 }
                             }
                             for expr in &spec.order_by {
+                                let asc = sort_ascending(&expr.options)?;
                                 if let Some(col) = extract_col_name(&expr.expr) {
-                                    order_by.push((col, expr.options.asc.unwrap_or(true)));
+                                    order_by.push((col, asc));
                                 }
                             }
                             frame = window_frame(spec);
@@ -588,7 +602,7 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
                     ..
                 } = expr
                 {
-                    // sqlparser 0.62 parses `SUBSTR(x, a, b)` as a dedicated
+                    // sqlparser parses `SUBSTR(x, a, b)` as a dedicated
                     // `Substring` node; map it back to the SUBSTR scalar function.
                     projection.push(ProjectionItem::ScalarFunction {
                         func_name: "SUBSTR".to_string(),
@@ -642,8 +656,9 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
                                 }
                             }
                             for expr in &spec.order_by {
+                                let asc = sort_ascending(&expr.options)?;
                                 if let Some(col) = extract_col_name(&expr.expr) {
-                                    order_by.push((col, expr.options.asc.unwrap_or(true)));
+                                    order_by.push((col, asc));
                                 }
                             }
                             frame = window_frame(spec);
@@ -931,24 +946,32 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
         Some(OrderBy {
             kind: OrderByKind::Expressions(exprs),
             ..
-        }) => exprs
-            .iter()
-            .filter_map(|o| match &o.expr {
-                // Bare or qualified (`t.col`) column reference.
-                Expr::Identifier(_) | Expr::CompoundIdentifier(_) => extract_col_name(&o.expr)
-                    .map(|col| (col, o.options.asc.unwrap_or(true), o.options.nulls_first)),
-                // Ordinal reference (`ORDER BY 1`).
-                Expr::Value(v) => match &v.value {
-                    sqlparser::ast::Value::Number(n, _) => n
-                        .parse::<usize>()
-                        .ok()
-                        .and_then(|n| ordinal_target(&projection, n))
-                        .map(|col| (col, o.options.asc.unwrap_or(true), o.options.nulls_first)),
+        }) => {
+            let directions = exprs
+                .iter()
+                .map(|o| sort_ascending(&o.options))
+                .collect::<Result<Vec<_>>>()?;
+            exprs
+                .iter()
+                .zip(directions)
+                .filter_map(|(o, asc)| match &o.expr {
+                    // Bare or qualified (`t.col`) column reference.
+                    Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
+                        extract_col_name(&o.expr).map(|col| (col, asc, o.options.nulls_first))
+                    }
+                    // Ordinal reference (`ORDER BY 1`).
+                    Expr::Value(v) => match &v.value {
+                        sqlparser::ast::Value::Number(n, _) => n
+                            .parse::<usize>()
+                            .ok()
+                            .and_then(|n| ordinal_target(&projection, n))
+                            .map(|col| (col, asc, o.options.nulls_first)),
+                        _ => None,
+                    },
                     _ => None,
-                },
-                _ => None,
-            })
-            .collect(),
+                })
+                .collect()
+        }
         _ => Vec::new(),
     };
 

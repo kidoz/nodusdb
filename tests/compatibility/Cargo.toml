@@ -28,5 +28,5 @@ base64 = "0.23.1"
 # TLS end-to-end coverage: generate a throwaway server cert and drive a real
 # rustls-backed client handshake through tokio-postgres.
 rcgen = "0.14.10"
-rustls = { version = "0.23.44", default-features = false, features = ["aws_lc_rs"] }
+rustls = { version = "0.23.45", default-features = false, features = ["aws_lc_rs"] }
 tokio-postgres-rustls = "0.14.0"
