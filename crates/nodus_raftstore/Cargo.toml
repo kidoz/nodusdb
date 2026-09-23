@@ -28,6 +28,8 @@ nodus_upgrade = { version = "0.1.0", path = "../nodus_upgrade" }
 
 [dev-dependencies]
 nodus_storage_mem = { path = "../nodus_storage_mem" }
+nodus_storage_lsm = { path = "../nodus_storage_lsm" }
+tempfile = "3.27.0"
 
 [lints]
 workspace = true

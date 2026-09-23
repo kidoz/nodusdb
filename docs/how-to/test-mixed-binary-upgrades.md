@@ -5,12 +5,23 @@ newer reader. Both contain the bootstrap-authentication and local WAL-retention
 fixes. The older reader still lacks admission commands; patching these defects
 must not erase the protocol boundary being tested.
 
-The September 14, 2026 run **passed all thirteen checkpoints in 360.45 seconds**
+The September 14, 2026 pinned-pair run **passed all thirteen checkpoints in 360.45 seconds**
 with `passed: true`, `matrix_completed: true` and an empty blocker list. It used
 the pinned pair below, with neither `--candidate` nor `--diagnose`. Both snapshot
 directions, executable rollback before admission, admission refusals, four-node
 admission and crash/restart recovery passed. All five committed rows survived;
 the aborted row remained absent. No snapshot-login restart was needed.
+
+The subsequent purge-batching **candidate run failed after four checkpoints**
+(373.75 seconds). During the v2 catch-up step, the pinned older node 2 panicked
+on restart: its recovered purge watermark was term 4/index 5019, beyond its saved
+term 1/index 5001 snapshot. The receiver failed before installing the candidate's
+snapshot. The older executable still uses separate per-entry purge commits and
+recovery that can advance the watermark past the saved snapshot after an interrupted
+purge. The candidate's atomic purge batches have separate fault-test coverage, but
+this failed matrix does **not** qualify the candidate for mixed-binary acceptance.
+Backport the purge/recovery fix to the maintenance reader and rerun the gate before
+making that claim. The pins below remain unchanged.
 
 Run the compatibility gate with:
 
@@ -124,8 +135,13 @@ of retained Raft entries can pause these binaries for tens of seconds. The gate
 allows uncertain responses only for filler aborts after the expected snapshot file
 is published, then waits up to four minutes for Raft RPCs to respond. SQL commit
 acknowledgements and row assertions are never relaxed. This pause is a known
-availability limitation of the pinned pair, not a latency guarantee. Filler aborts
-avoid pending user intents during v1 snapshot creation. The fixture stops one
+availability limitation of the pinned pair, not a latency guarantee. The gate
+uses the same deadlines when testing a candidate. The current source
+implementation [batches purge transactions](../reference/durability-contract.md#raft-log-purge)
+and runs their disk work on a blocking thread; the pinned executables retain
+the older per-entry purge implementation.
+
+Filler aborts avoid pending user intents during v1 snapshot creation. The fixture stops one
 replica before compaction and restarts it against the same persistent directory,
 forcing snapshot catch-up from beyond its retained log position. It checks the
 installed `NSNP` wire header and reads the catalog and rows through SQL. Every

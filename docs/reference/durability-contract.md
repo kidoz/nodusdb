@@ -54,6 +54,39 @@ an intent retained during a flush can still require an earlier segment on restar
 Invalid or unavailable checkpoint metadata prevents cleanup. This uses the
 existing manifest format and does not require upgrade finalization.
 
+## Raft log purge
+
+Prefix purge writes at most 256 log tombstones and the corresponding applied-state
+record (including `last_purged`) in one KV transaction per batch. The WAL commit
+is synced before that batch updates the cached log and watermark. A crash between
+batches therefore leaves a shorter, consistent purged prefix; surviving applied
+entries, membership, vote and the unpurged tail remain recoverable. The existing
+v1 record encoding is unchanged, so this needs no upgrade finalization.
+
+Deletion, watermark-write and commit errors reach Raft as storage errors. An
+uncertain commit outcome requires recovery; it is never reported as successful.
+The blocking task owns the log and state-machine locks through publication and
+cache updates, even if its async caller is cancelled. Other Tokio tasks can run,
+but this group's apply/log operations still wait for the purge to finish. The
+`Raft log prefix purged` trace records group, target, entry/batch counts and elapsed
+milliseconds; failures include the target and storage error.
+
+`nodus_raftstore::purge::tests` covers persistent reopen, partial progress after
+injected errors, ambiguous commit results, cancellation on a single-worker runtime,
+and subprocess exit before/after the second batch's commit without running
+destructors. It inspects persisted records before constructor reconciliation.
+These subprocess tests demonstrate process-exit recovery, not power-loss behavior.
+Run the local persistent comparison with:
+
+```sh
+cargo test -p nodus_raftstore purge::tests::benchmark_purge_commits --locked -- --ignored --nocapture
+```
+
+Two local macOS debug-build runs on September 14, 2026 purged 4,000 entries in
+128–137 ms with batching (16 commits), versus 16.30–16.36 seconds with per-entry
+commits. Setup is excluded; both paths verify the recovered prefix and tail.
+These are local comparisons, not a release-build or cluster latency guarantee.
+
 ## Atomic Raft snapshot installation
 
 With persistent LSM storage, a validated snapshot replaces its group's rows and

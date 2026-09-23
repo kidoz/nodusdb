@@ -178,8 +178,13 @@ used as writer or backup authority.
   rejects admission commands. The original historical binaries retain those
   defects and are not covered by maintenance-pair acceptance. The September 14
   maintenance-pair run passed all thirteen checkpoints without diagnostic restarts.
-  Long synchronous
-  log-purge pauses remain, so passing the matrix is not a latency guarantee.
+  The pinned executables retain long synchronous log-purge pauses. Current source
+  [batches and offloads purge](../reference/durability-contract.md#raft-log-purge),
+  but passing the matrix is not a latency guarantee.
+  A subsequent batching-candidate run stopped after four checkpoints because the
+  older receiver's restart reported a purge watermark beyond its saved snapshot.
+  Candidate mixed-binary acceptance remains unqualified pending a maintenance
+  purge/recovery backport and another complete run.
   Feature rollback does **not** establish arbitrary executable compatibility.
 - Tests cover full voter/learner reports, duplicate/unknown/stale reports, premature
   finalization, rollback, malformed records, actual mTLS/Raft leader loss and reopen,

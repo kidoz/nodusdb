@@ -29,6 +29,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod migration;
 pub mod network;
+mod purge;
 pub mod server;
 mod snapshots;
 pub use snapshots::v2::SnapshotCompatibility;
@@ -358,10 +359,11 @@ fn reconcile_torn_recovery(
     };
     let purged_idx = applied.last_purged.map(|l| l.index).unwrap_or(0);
     let expected = applied_id.index.saturating_sub(purged_idx);
+    if expected == 0 {
+        return false; // No retained applied prefix to validate.
+    }
     let present = log.range(purged_idx + 1..=applied_id.index).count() as u64;
-    if present == expected
-        && (expected == 0 || log.get(&applied_id.index).map(|e| e.log_id) == Some(applied_id))
-    {
+    if present == expected && log.get(&applied_id.index).map(|e| e.log_id) == Some(applied_id) {
         return false; // Applied prefix intact — healthy recovery.
     }
     applied.last_purged = Some(applied_id);
@@ -1024,20 +1026,7 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
     }
 
     async fn purge_logs_upto(&mut self, log_id: LogId<u64>) -> Result<(), StorageError<u64>> {
-        {
-            let mut log = self.log.write().await;
-            let keys: Vec<u64> = log.range(..=log_id.index).map(|(k, _)| *k).collect();
-            for key in keys {
-                log.remove(&key);
-                if let Some(meta) = &self.meta {
-                    meta.delete_entry(key);
-                }
-            }
-        }
-        let mut sm = self.state_machine.write().await;
-        sm.last_purged = Some(log_id);
-        self.persist_applied(&sm);
-        Ok(())
+        self.purge_log_prefix(log_id).await
     }
 
     async fn last_applied_state(
