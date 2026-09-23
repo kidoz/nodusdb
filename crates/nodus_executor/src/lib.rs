@@ -832,7 +832,7 @@ impl Executor for MemExecutor {
             self.active_txns.write().remove(&ctx.session_id);
             match &result {
                 Ok(_) => {
-                    let commit_ts = self.txn.commit_txn(txn_id)?;
+                    let commit_ts = self.commit_or_release(txn_id)?;
                     if !is_read_only {
                         self.kv.commit(txn_id, commit_ts)?;
                     }

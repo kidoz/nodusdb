@@ -25,6 +25,12 @@ pub(crate) fn sqlstate_for_execution_error(err_str: &str) -> &'static str {
     // Routing retries and unsupported consistency modes.
     if err_str.starts_with("shard unavailable:") || err_str.starts_with("shard routing changed") {
         "40001" // serialization_failure: retry against a current, available route
+    } else if err_str.to_ascii_lowercase().contains("write conflict")
+        || err_str.ends_with("; retry transaction")
+    {
+        // A lost write-write race (at write or commit time) or a stale participant
+        // epoch rolled the transaction back; drivers and ORMs retry on this class.
+        "40001" // serialization_failure
     } else if err_str.starts_with("unsupported linearizable cross-shard range read")
         || err_str.starts_with("unsupported row scan spanning multiple tables")
     {
@@ -369,6 +375,18 @@ mod tests {
             sqlstate_for_execution_error("invalid shard map: gap or overlap"),
             "XX000"
         );
+    }
+
+    #[test]
+    fn maps_write_conflicts_to_serialization_failure() {
+        for message in [
+            "Write-write conflict detected on key. Transaction aborted.",
+            "write conflict; retry transaction",
+            "write-write conflict for transaction TxnId(0)",
+            "stale epoch or fenced participant; retry transaction",
+        ] {
+            assert_eq!(sqlstate_for_execution_error(message), "40001");
+        }
     }
 
     #[test]

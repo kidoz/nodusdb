@@ -216,12 +216,21 @@ pub struct ReadIndexResponse {
 /// durability hazard: the entry sits below the applied watermark yet isn't
 /// reflected in the store.
 ///
-/// `IntentNotFound`/`WriteConflict` are the *benign, idempotent* outcomes that
-/// legitimately occur when post-crash log replay re-applies an entry above the
-/// last durably-persisted applied index (the intent was already consumed) — they
-/// are logged at debug and tolerated. Any other (storage/I/O) failure is
-/// **fatal**: it is returned as a `StorageError` so openraft halts apply rather
-/// than advancing the applied watermark past an entry whose effect was lost.
+/// `IntentNotFound` is the *benign, idempotent* outcome of re-applying a commit
+/// or abort whose intents were already consumed (post-crash log replay above the
+/// last durably-persisted applied index, or a re-driven 2PC commit); it is
+/// logged at debug and tolerated.
+///
+/// `WriteConflict` means another transaction holds the key's intent, so the write
+/// was **not** applied. It is returned as a rejection reason for the entry's
+/// response: acknowledging it would silently lose the write, and every later
+/// writer of the key could be lost the same way. The store is unchanged either
+/// way, so replay stays deterministic, and a replayed entry's response is
+/// discarded.
+///
+/// Any other (storage/I/O) failure is **fatal**: it is returned as a
+/// `StorageError` so openraft halts apply rather than advancing the applied
+/// watermark past an entry whose effect was lost.
 // `StorageError` is openraft's own (large) error that the whole `RaftStorage`
 // trait returns; this helper feeds straight into those methods via `?`, so
 // boxing it here would just force an unbox at every call site.
@@ -230,14 +239,18 @@ fn apply_kv_result(
     command: &str,
     txn_id: &str,
     result: KvResult<()>,
-) -> Result<(), StorageError<u64>> {
+) -> Result<Option<String>, StorageError<u64>> {
     match result {
-        Ok(()) => Ok(()),
-        Err(e @ (KvError::IntentNotFound(_) | KvError::WriteConflict(_))) => {
+        Ok(()) => Ok(None),
+        Err(e @ KvError::IntentNotFound(_)) => {
             tracing::debug!(
                 "Raft apply {command} (txn {txn_id}): benign idempotent outcome (likely replay): {e}"
             );
-            Ok(())
+            Ok(None)
+        }
+        Err(e @ KvError::WriteConflict(_)) => {
+            tracing::debug!("Raft apply {command} (txn {txn_id}) rejected: {e}");
+            Ok(Some("write conflict; retry transaction".into()))
         }
         Err(e) => {
             tracing::error!("Raft apply {command} (txn {txn_id}) KV op failed fatally: {e}");
@@ -1124,8 +1137,9 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
                         ))
                         .into());
                     }
-                    // 2PC prepare vote for this entry; only `PrepareTxn` can clear it.
+                    // Entry outcome: a `PrepareTxn` NO vote or a rejected intent write clears it.
                     let mut success = true;
+                    let mut error = None;
                     if let Some(kv) = &sm.kv {
                         use bytes::Bytes;
                         use nodus_storage_api::TxnId;
@@ -1136,7 +1150,7 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
                                 txn_id, key, value, ..
                             } => {
                                 if let Ok(tid) = uuid::Uuid::from_str(txn_id) {
-                                    apply_kv_result(
+                                    error = apply_kv_result(
                                         "PutIntent",
                                         txn_id,
                                         kv.write_intent(
@@ -1149,7 +1163,7 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
                             }
                             ShardCommand::DeleteIntent { txn_id, key, .. } => {
                                 if let Ok(tid) = uuid::Uuid::from_str(txn_id) {
-                                    apply_kv_result(
+                                    error = apply_kv_result(
                                         "DeleteIntent",
                                         txn_id,
                                         kv.delete_intent(TxnId(tid), Bytes::from(key.clone())),
@@ -1160,7 +1174,7 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
                                 txn_id, commit_ts, ..
                             } => {
                                 if let Ok(tid) = uuid::Uuid::from_str(txn_id) {
-                                    apply_kv_result(
+                                    error = apply_kv_result(
                                         "CommitTxn",
                                         txn_id,
                                         kv.commit(TxnId(tid), *commit_ts),
@@ -1169,7 +1183,8 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
                             }
                             ShardCommand::AbortTxn { txn_id, .. } => {
                                 if let Ok(tid) = uuid::Uuid::from_str(txn_id) {
-                                    apply_kv_result("AbortTxn", txn_id, kv.abort(TxnId(tid)))?;
+                                    error =
+                                        apply_kv_result("AbortTxn", txn_id, kv.abort(TxnId(tid)))?;
                                 }
                             }
                             ShardCommand::PrepareTxn { txn_id, .. } => {
@@ -1195,7 +1210,7 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
                                 txn_id, key, value, ..
                             } => {
                                 if let Ok(tid) = uuid::Uuid::from_str(txn_id) {
-                                    apply_kv_result(
+                                    error = apply_kv_result(
                                         "IndexPutIntent",
                                         txn_id,
                                         kv.write_intent(
@@ -1208,7 +1223,7 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
                             }
                             ShardCommand::IndexDeleteIntent { txn_id, key, .. } => {
                                 if let Ok(tid) = uuid::Uuid::from_str(txn_id) {
-                                    apply_kv_result(
+                                    error = apply_kv_result(
                                         "IndexDeleteIntent",
                                         txn_id,
                                         kv.delete_intent(TxnId(tid), Bytes::from(key.clone())),
@@ -1313,8 +1328,8 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
                         }
                     }
                     res.push(ShardResponse {
-                        success,
-                        error: None,
+                        success: success && error.is_none(),
+                        error,
                     });
                 }
                 EntryPayload::Membership(mem) => {
@@ -1460,10 +1475,19 @@ mod tests {
     #[test]
     fn apply_kv_result_tolerates_replay_but_fails_on_real_errors() {
         let tid = TxnId::new();
-        // Success and the benign idempotent-replay outcomes are tolerated.
-        assert!(apply_kv_result("CommitTxn", "t", Ok(())).is_ok());
-        assert!(apply_kv_result("CommitTxn", "t", Err(KvError::IntentNotFound(tid))).is_ok());
-        assert!(apply_kv_result("PutIntent", "t", Err(KvError::WriteConflict(tid))).is_ok());
+        // Success and the benign idempotent-replay outcome are tolerated.
+        assert_eq!(apply_kv_result("CommitTxn", "t", Ok(())).unwrap(), None);
+        assert_eq!(
+            apply_kv_result("CommitTxn", "t", Err(KvError::IntentNotFound(tid))).unwrap(),
+            None
+        );
+        // A write blocked by another transaction's intent was not applied, so it
+        // is reported to the proposer instead of acknowledged.
+        assert!(
+            apply_kv_result("PutIntent", "t", Err(KvError::WriteConflict(tid)))
+                .unwrap()
+                .is_some()
+        );
         // A real storage/I/O failure is fatal so openraft halts apply.
         assert!(
             apply_kv_result(

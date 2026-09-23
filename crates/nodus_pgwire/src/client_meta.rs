@@ -53,6 +53,22 @@ pub(crate) fn mark_error_status<C: ClientInfo>(client: &mut C) {
     }
 }
 
+/// Records a statement that failed during execution. A failed COMMIT or ROLLBACK
+/// still ends the transaction (the executor has already discarded it), so the
+/// session returns to idle as in PostgreSQL; any other failure inside a
+/// transaction block aborts the block.
+pub(crate) fn mark_execution_failed<C: ClientInfo>(
+    client: &mut C,
+    plan: &nodus_executor::LogicalPlan,
+) {
+    use nodus_executor::LogicalPlan;
+    if matches!(plan, LogicalPlan::Commit | LogicalPlan::Rollback) {
+        set_tx_status(client, TransactionStatus::Idle);
+    } else {
+        mark_error_status(client);
+    }
+}
+
 pub(crate) fn parse_statement_timeout_ms(query: &str) -> Option<u64> {
     let normalized = query
         .trim()

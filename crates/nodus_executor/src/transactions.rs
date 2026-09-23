@@ -18,10 +18,19 @@ impl MemExecutor {
 
     pub(crate) fn exec_commit(&self, ctx: &ExecutionContext) -> Result<QueryOutput> {
         if let Some(txn) = self.active_txns.write().remove(&ctx.session_id) {
-            let commit_ts = self.txn.commit_txn(txn.txn_id)?;
+            let commit_ts = self.commit_or_release(txn.txn_id)?;
             self.kv.commit(txn.txn_id, commit_ts)?;
         }
         Ok(QueryOutput::tag("COMMIT"))
+    }
+
+    /// Runs the commit-time conflict check. A losing transaction is dropped by
+    /// the manager, so its storage intents must be released here: left behind,
+    /// they would block every later write to those keys.
+    pub(crate) fn commit_or_release(&self, txn_id: TxnId) -> Result<Timestamp> {
+        self.txn.commit_txn(txn_id).inspect_err(|_| {
+            let _ = self.kv.abort(txn_id);
+        })
     }
 
     pub(crate) fn exec_rollback(&self, ctx: &ExecutionContext) -> Result<QueryOutput> {

@@ -1114,7 +1114,7 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
                 let err_str = e.to_string();
                 let code = sqlstate_for_execution_error(&err_str);
                 let err = ErrorInfo::new("ERROR".to_owned(), code.to_owned(), err_str);
-                mark_error_status(client);
+                mark_execution_failed(client, &executed_plan);
                 return Err(PgWireError::UserError(Box::new(err)));
             }
         };
