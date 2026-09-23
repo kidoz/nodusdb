@@ -38,9 +38,9 @@ mod transactions;
 mod value;
 mod view_helpers;
 pub use plan_types::{
-    AggregateOp, AlterTableOp, CompareOp, FilterExpr, Join, JoinType, LogicalPlan, Operand,
-    PatternKind, Predicate, ProjectionItem, ScalarBinaryOp, ScalarExpr, ScalarUnaryOp, SetOpKind,
-    TableFnSpec,
+    AggregateOp, AlterTableOp, CompareOp, ConflictTarget, FilterExpr, Join, JoinType, LogicalPlan,
+    OnConflictClause, Operand, PatternKind, Predicate, ProjectionItem, ScalarBinaryOp, ScalarExpr,
+    ScalarUnaryOp, SetOpKind, TableFnSpec,
 };
 pub use planner::{
     CopyOutputFormat, expr_to_value, parse_object_name, plan_copy_out, plan_statement,

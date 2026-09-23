@@ -1,0 +1,181 @@
+# DML either does what PostgreSQL does or fails; it never silently inserts,
+# updates, or deletes the wrong rows. Expected results come from PostgreSQL 18.
+statement ok
+CREATE TABLE ds (id INT PRIMARY KEY, v TEXT, n INT DEFAULT 7);
+
+statement ok
+CREATE TABLE ds_src (id INT, v TEXT);
+
+statement ok
+INSERT INTO ds_src VALUES (1, 'a'), (2, 'b'), (3, 'c');
+
+# INSERT ... SELECT and computed VALUES.
+statement ok
+INSERT INTO ds SELECT id, v, id * 10 FROM ds_src WHERE id <= 2;
+
+statement ok
+INSERT INTO ds (id, v) SELECT id + 10, upper(v) FROM ds_src;
+
+statement ok
+WITH s AS (SELECT 20 AS id, 'cte' AS v) INSERT INTO ds (id, v) SELECT id, v FROM s;
+
+statement ok
+INSERT INTO ds VALUES (30, 'x' || 'y', 1 + 2), (31, lower('Q'), DEFAULT);
+
+query TTT
+SELECT id, v, n FROM ds ORDER BY id;
+----
+1	a	10
+2	b	20
+11	A	7
+12	B	7
+13	C	7
+20	cte	7
+30	xy	3
+31	q	7
+
+statement error
+INSERT INTO ds VALUES (40, 'a', 1, 'extra');
+
+statement error
+INSERT INTO ds (id, nope) VALUES (41, 1);
+
+statement error
+INSERT INTO ds (id, id) VALUES (42, 42);
+
+statement error
+INSERT INTO ds (id, v, n) VALUES (43, 'a');
+
+query T
+SELECT count(*) FROM ds;
+----
+8
+
+# CREATE TABLE AS and SELECT INTO copy the rows.
+statement ok
+CREATE TABLE ds_copy AS SELECT id, v FROM ds WHERE id < 10;
+
+query TT
+SELECT id, v FROM ds_copy ORDER BY id;
+----
+1	a
+2	b
+
+statement ok
+CREATE TABLE ds_lit AS SELECT 1 AS a, 'x' AS b;
+
+query TT
+SELECT a, b FROM ds_lit;
+----
+1	x
+
+statement ok
+SELECT id, v INTO ds_into FROM ds WHERE id > 20;
+
+query TT
+SELECT id, v FROM ds_into ORDER BY id;
+----
+30	xy
+31	q
+
+# UPDATE: tuple targets, qualified references, unknown columns.
+statement ok
+UPDATE ds SET (v, n) = ('multi', 77) WHERE id = 1;
+
+statement ok
+UPDATE ds t SET n = t.n + 1 WHERE t.id = 2;
+
+query TTT
+SELECT id, v, n FROM ds WHERE id <= 2 ORDER BY id;
+----
+1	multi	77
+2	b	21
+
+statement error
+UPDATE ds SET nope = 1;
+
+statement error
+UPDATE ds SET v = s.v FROM ds_src s WHERE s.id = ds.id;
+
+statement error
+DELETE FROM ds USING ds_src s WHERE ds.id = s.id + 10;
+
+query T
+SELECT count(*) FROM ds;
+----
+8
+
+# ON CONFLICT: EXCLUDED, table-qualified references, WHERE, targets.
+statement ok
+INSERT INTO ds VALUES (1, 'new', 5) ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v, n = ds.n + EXCLUDED.n;
+
+query TTT
+SELECT id, v, n FROM ds WHERE id = 1;
+----
+1	new	82
+
+statement ok
+INSERT INTO ds VALUES (1, 'cond', 5) ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v WHERE ds.n > 1000;
+
+query TTT
+SELECT id, v, n FROM ds WHERE id = 1;
+----
+1	new	82
+
+statement ok
+INSERT INTO ds VALUES (2, 'skip', 0) ON CONFLICT DO NOTHING;
+
+statement ok
+INSERT INTO ds VALUES (2, 'x', 0) ON CONFLICT ON CONSTRAINT ds_pkey DO NOTHING;
+
+query TT
+SELECT id, v FROM ds WHERE id = 2;
+----
+2	b
+
+statement error
+INSERT INTO ds VALUES (50, 'a', 0), (50, 'b', 0) ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v;
+
+statement error
+INSERT INTO ds VALUES (1, 'a', 0) ON CONFLICT (v) DO NOTHING;
+
+statement ok
+CREATE TABLE ds_u (a INT, b INT UNIQUE, c INT);
+
+statement ok
+INSERT INTO ds_u VALUES (1, 1, 1);
+
+statement ok
+INSERT INTO ds_u VALUES (2, 1, 2) ON CONFLICT (b) DO UPDATE SET c = EXCLUDED.c + 100;
+
+query TTT
+SELECT a, b, c FROM ds_u;
+----
+1	1	102
+
+# RETURNING.
+query TTT
+INSERT INTO ds VALUES (60, 'r', 6) RETURNING *;
+----
+60	r	6
+
+query TT
+UPDATE ds SET n = 61 WHERE id = 60 RETURNING id, new.n;
+----
+60	61
+
+query TTT
+DELETE FROM ds WHERE id = 60 RETURNING *;
+----
+60	r	61
+
+statement error
+INSERT INTO ds VALUES (62, 'r', 6) RETURNING nope;
+
+statement error
+INSERT INTO ds VALUES (63, 'r', 6) RETURNING id * 2;
+
+query T
+SELECT count(*) FROM ds WHERE id >= 60;
+----
+0

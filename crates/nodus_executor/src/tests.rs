@@ -211,6 +211,7 @@ fn create_insert_select_round_trip() {
         exec.execute_logical(
             &ctx,
             LogicalPlan::Insert {
+                source: None,
                 table_name: "books".into(),
                 columns: vec!["id".into(), "title".into(), "author".into()],
                 values_list: vec![vec![
@@ -361,6 +362,7 @@ fn rows_keyed_by_declared_pk_not_first_column() {
         exec.execute_logical(
             &ctx,
             LogicalPlan::Insert {
+                source: None,
                 table_name: "t".into(),
                 columns: vec!["label".into(), "id".into()],
                 values_list: vec![vec![Value::Text("dup".into()), Value::Text(id.into())]],
@@ -396,6 +398,7 @@ fn rows_keyed_by_declared_pk_not_first_column() {
     let dup = exec.execute_logical(
         &ctx,
         LogicalPlan::Insert {
+            source: None,
             table_name: "t".into(),
             columns: vec!["label".into(), "id".into()],
             values_list: vec![vec![Value::Text("other".into()), Value::Text("1".into())]],
@@ -459,6 +462,7 @@ fn typed_values_round_trip_and_filter_by_int() {
     exec.execute_logical(
         &ctx,
         LogicalPlan::Insert {
+            source: None,
             table_name: "items".into(),
             columns: vec!["id".into(), "name".into(), "active".into()],
             values_list: vec![vec![
@@ -536,6 +540,7 @@ fn update_and_delete_rows() {
         exec.execute_logical(
             &ctx,
             LogicalPlan::Insert {
+                source: None,
                 table_name: "t".into(),
                 columns: vec!["id".into(), "name".into()],
                 values_list: vec![vec![Value::Text(id.into()), Value::Text(name.into())]],
@@ -654,6 +659,7 @@ fn test_join_execution() {
         exec.execute_logical(
             &ctx,
             LogicalPlan::Insert {
+                source: None,
                 table_name: "authors".into(),
                 columns: vec!["id".into(), "name".into()],
                 values_list: vec![vec![Value::Text(id.into()), Value::Text(name.into())]],
@@ -674,6 +680,7 @@ fn test_join_execution() {
         exec.execute_logical(
             &ctx,
             LogicalPlan::Insert {
+                source: None,
                 table_name: "books".into(),
                 columns: vec!["id".into(), "title".into(), "author_id".into()],
                 values_list: vec![vec![
@@ -784,6 +791,7 @@ fn transactions_are_isolated_per_session() {
     exec.execute_logical(
         &ctx_b,
         LogicalPlan::Insert {
+            source: None,
             table_name: "t".into(),
             columns: vec!["id".into(), "name".into()],
             values_list: vec![vec![Value::Text("1".into()), Value::Text("b".into())]],
@@ -899,6 +907,7 @@ fn test_complex_filters() {
         exec.execute_logical(
             &ctx,
             LogicalPlan::Insert {
+                source: None,
                 table_name: "t".into(),
                 columns: vec![],
                 values_list: vec![vec![
@@ -987,6 +996,7 @@ fn test_left_outer_join() {
         exec.execute_logical(
             &ctx,
             LogicalPlan::Insert {
+                source: None,
                 table_name: "users".into(),
                 columns: vec![],
                 values_list: vec![vec![Value::Text(id.into()), Value::Text(name.into())]],
@@ -1003,6 +1013,7 @@ fn test_left_outer_join() {
         exec.execute_logical(
             &ctx,
             LogicalPlan::Insert {
+                source: None,
                 table_name: "orders".into(),
                 columns: vec![],
                 values_list: vec![vec![

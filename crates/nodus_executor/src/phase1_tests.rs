@@ -52,6 +52,7 @@ fn test_offset_distinct_returning() {
         .execute_logical(
             &ctx,
             LogicalPlan::Insert {
+                source: None,
                 table_name: "t".into(),
                 columns: vec!["id".into(), "val".into()],
                 values_list: vec![

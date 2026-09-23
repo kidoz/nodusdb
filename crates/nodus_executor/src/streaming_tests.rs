@@ -188,6 +188,7 @@ fn exec_with_rows(
         exec.execute_logical(
             &ctx,
             LogicalPlan::Insert {
+                source: None,
                 table_name: "t".into(),
                 columns: vec!["id".into(), "name".into()],
                 values_list: vec![vec![Value::Int(i), Value::Text(format!("n{i}"))]],

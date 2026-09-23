@@ -139,14 +139,39 @@ pub struct Join {
     pub natural: bool,
 }
 
-/// `ON CONFLICT` action for an INSERT that hits an existing key.
+/// The unique key an `ON CONFLICT` clause arbitrates on.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ConflictTarget {
+    /// `ON CONFLICT (a, b)`: the unique key over exactly these columns.
+    Columns(Vec<String>),
+    /// `ON CONFLICT ON CONSTRAINT name`.
+    Constraint(String),
+}
+
+/// `ON CONFLICT` action for an INSERT that hits an existing key. Without a
+/// target, a collision on the primary key or any unique index counts.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum OnConflictClause {
     /// `DO NOTHING` — skip the conflicting row.
-    DoNothing,
-    /// `DO UPDATE SET …` — update the existing row with these assignments
-    /// (evaluated against the existing row).
-    DoUpdate(Vec<(String, ScalarExpr)>),
+    DoNothing { target: Option<ConflictTarget> },
+    /// `DO UPDATE SET … [WHERE …]` — update the existing row. Expressions see
+    /// the existing row's columns and the proposed row as `excluded.<col>`;
+    /// the update applies only where `condition` holds.
+    DoUpdate {
+        target: Option<ConflictTarget>,
+        assignments: Vec<(String, ScalarExpr)>,
+        condition: Option<ScalarExpr>,
+    },
+}
+
+impl OnConflictClause {
+    pub fn target(&self) -> Option<&ConflictTarget> {
+        match self {
+            OnConflictClause::DoNothing { target } | OnConflictClause::DoUpdate { target, .. } => {
+                target.as_ref()
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -658,6 +683,17 @@ pub enum LogicalPlan {
         /// the column default as if the column had been omitted.
         #[serde(default)]
         default_cells: Vec<Vec<bool>>,
+        /// `INSERT ... SELECT`: a query whose rows are inserted instead of
+        /// `values_list`.
+        #[serde(default)]
+        source: Option<Box<LogicalPlan>>,
+    },
+    /// `CREATE TABLE ... AS <query>` / `SELECT ... INTO`: a table shaped like
+    /// the query's output, filled with its rows.
+    CreateTableAs {
+        name: String,
+        query: Box<LogicalPlan>,
+        if_not_exists: bool,
     },
     Select {
         ctes: Vec<(String, Box<LogicalPlan>)>,

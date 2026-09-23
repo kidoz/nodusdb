@@ -31,6 +31,20 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                 if_not_exists: *if_not_exists,
             })
         }
+        Statement::CreateTable(create_table) if create_table.query.is_some() => {
+            let query = create_table
+                .query
+                .as_ref()
+                .expect("guarded by the match arm");
+            if !create_table.columns.is_empty() {
+                anyhow::bail!("CREATE TABLE AS with a column list is not supported");
+            }
+            Ok(LogicalPlan::CreateTableAs {
+                name: create_table.name.to_string(),
+                query: Box::new(plan_query(query, params)?),
+                if_not_exists: create_table.if_not_exists,
+            })
+        }
         Statement::CreateTable(create_table) => {
             let name = &create_table.name;
             let columns = &create_table.columns;
@@ -267,18 +281,7 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
             }
         }
         Statement::Insert(insert) => {
-            let returning = if let Some(r) = &insert.returning {
-                r.iter()
-                    .filter_map(|item| match item {
-                        sqlparser::ast::SelectItem::UnnamedExpr(
-                            sqlparser::ast::Expr::Identifier(id),
-                        ) => Some(id.value.clone()),
-                        _ => None,
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            };
+            let returning = plan_returning(&insert.returning)?;
             let table_name = match &insert.table {
                 sqlparser::ast::TableObject::TableName(name) => name.to_string(),
                 other => anyhow::bail!("Unsupported INSERT target: {:?}", other),
@@ -306,8 +309,14 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
             let mut values_list = Vec::new();
             let mut default_cells: Vec<Vec<bool>> = Vec::new();
             let mut any_default = false;
-            if let Some(query) = &insert.source {
-                if let SetExpr::Values(vs) = &*query.body {
+            let mut source = None;
+            match &insert.source {
+                Some(query)
+                    if query.with.is_none() && matches!(&*query.body, SetExpr::Values(_)) =>
+                {
+                    let SetExpr::Values(vs) = &*query.body else {
+                        unreachable!("guarded by the match arm");
+                    };
                     for row in &vs.rows {
                         let mut row_values = Vec::new();
                         let mut row_defaults = Vec::new();
@@ -317,8 +326,7 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                                 row_defaults.push(true);
                                 any_default = true;
                             } else {
-                                row_values
-                                    .push(expr_to_value(e, params).unwrap_or(crate::Value::Null));
+                                row_values.push(values_cell(e, params)?);
                                 row_defaults.push(false);
                             }
                         }
@@ -326,38 +334,66 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                         default_cells.push(row_defaults);
                     }
                 }
-            } else {
+                // `INSERT ... SELECT` (or any other query body).
+                Some(query) => source = Some(Box::new(plan_query(query, params)?)),
                 // `INSERT INTO t DEFAULT VALUES` — one row of all defaults.
-                values_list.push(Vec::new());
-                default_cells.push(Vec::new());
+                None => {
+                    values_list.push(Vec::new());
+                    default_cells.push(Vec::new());
+                }
             }
             if !any_default {
                 default_cells.clear();
             }
             let on_conflict = match &insert.on {
-                Some(sqlparser::ast::OnInsert::OnConflict(oc)) => match &oc.action {
-                    sqlparser::ast::OnConflictAction::DoNothing => {
-                        Some(crate::plan_types::OnConflictClause::DoNothing)
-                    }
-                    sqlparser::ast::OnConflictAction::DoUpdate(du) => {
-                        let assigns = du
-                            .assignments
-                            .iter()
-                            .filter_map(|a| {
-                                let col = match &a.target {
-                                    sqlparser::ast::AssignmentTarget::ColumnName(name) => {
-                                        name.0.last()?.as_ident()?.value.clone()
-                                    }
-                                    sqlparser::ast::AssignmentTarget::Tuple(_) => return None,
-                                };
-                                let val = lower_scalar(&a.value, params)?;
-                                Some((col, val))
-                            })
-                            .collect();
-                        Some(crate::plan_types::OnConflictClause::DoUpdate(assigns))
-                    }
-                },
-                _ => None,
+                Some(sqlparser::ast::OnInsert::OnConflict(oc)) => {
+                    use crate::plan_types::{ConflictTarget, OnConflictClause};
+                    let target = oc.conflict_target.as_ref().map(|t| match t {
+                        sqlparser::ast::ConflictTarget::Columns(cols) => {
+                            ConflictTarget::Columns(cols.iter().map(|c| c.value.clone()).collect())
+                        }
+                        sqlparser::ast::ConflictTarget::OnConstraint(name) => {
+                            ConflictTarget::Constraint(
+                                name.0
+                                    .last()
+                                    .and_then(|p| p.as_ident())
+                                    .map(|i| i.value.clone())
+                                    .unwrap_or_else(|| name.to_string()),
+                            )
+                        }
+                    });
+                    Some(match &oc.action {
+                        sqlparser::ast::OnConflictAction::DoNothing => {
+                            OnConflictClause::DoNothing { target }
+                        }
+                        sqlparser::ast::OnConflictAction::DoUpdate(du) => {
+                            let assignments = plan_assignments(&du.assignments, params)?
+                                .into_iter()
+                                .map(|(col, e)| (col, bind_excluded(&e)))
+                                .collect();
+                            let condition = du
+                                .selection
+                                .as_ref()
+                                .map(|e| {
+                                    lower_scalar(e, params)
+                                        .map(|c| bind_excluded(&c))
+                                        .ok_or_else(|| {
+                                            anyhow::anyhow!(
+                                                "Unsupported ON CONFLICT condition: {e}"
+                                            )
+                                        })
+                                })
+                                .transpose()?;
+                            OnConflictClause::DoUpdate {
+                                target,
+                                assignments,
+                                condition,
+                            }
+                        }
+                    })
+                }
+                Some(other) => anyhow::bail!("Unsupported INSERT clause: {other}"),
+                None => None,
             };
             Ok(LogicalPlan::Insert {
                 table_name,
@@ -366,78 +402,65 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                 returning,
                 on_conflict,
                 default_cells,
+                source,
+            })
+        }
+        // `WITH ... INSERT`: the CTEs scope the insert's source query.
+        Statement::Query(query) if matches!(&*query.body, SetExpr::Insert(_)) => {
+            let SetExpr::Insert(insert) = &*query.body else {
+                unreachable!("guarded by the match arm");
+            };
+            let mut insert = insert.clone();
+            if let (Some(with), Statement::Insert(ins)) = (&query.with, &mut insert) {
+                match ins.source.as_mut() {
+                    Some(source) if source.with.is_none() => source.with = Some(with.clone()),
+                    _ => anyhow::bail!("WITH before this INSERT is not supported"),
+                }
+            }
+            plan_statement(&insert, params)
+        }
+        Statement::Query(query)
+            if matches!(
+                &*query.body,
+                SetExpr::Update(_) | SetExpr::Delete(_) | SetExpr::Merge(_)
+            ) =>
+        {
+            anyhow::bail!("WITH before UPDATE, DELETE, or MERGE is not supported")
+        }
+        Statement::Query(query) if select_into(query).is_some() => {
+            // `SELECT ... INTO t` creates `t` from the query without its INTO.
+            let (name, query) = select_into(query).expect("guarded by the match arm");
+            Ok(LogicalPlan::CreateTableAs {
+                name,
+                query: Box::new(plan_query(&query, params)?),
+                if_not_exists: false,
             })
         }
         Statement::Query(query) => plan_query(query, params),
         Statement::Update(update) => {
-            let returning = if let Some(r) = &update.returning {
-                r.iter()
-                    .filter_map(|item| match item {
-                        sqlparser::ast::SelectItem::UnnamedExpr(
-                            sqlparser::ast::Expr::Identifier(id),
-                        ) => Some(id.value.clone()),
-                        _ => None,
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            };
-            let table_name = table_name_of(&update.table.relation)?;
-            let assigns = update
-                .assignments
-                .iter()
-                .filter_map(|a| {
-                    // Take the last identifier of the assignment target, e.g.
-                    // `t.col = ...` -> `col`.
-                    let col = match &a.target {
-                        sqlparser::ast::AssignmentTarget::ColumnName(name) => {
-                            name.0.last()?.as_ident()?.value.clone()
-                        }
-                        sqlparser::ast::AssignmentTarget::Tuple(_) => return None,
-                    };
-                    // `SET col = DEFAULT` (an unquoted bare identifier) becomes
-                    // a sentinel the executor resolves to the column default.
-                    if let sqlparser::ast::Expr::Identifier(id) = &a.value {
-                        if id.quote_style.is_none() && id.value.eq_ignore_ascii_case("default") {
-                            return Some((
-                                col,
-                                crate::plan_types::ScalarExpr::Function {
-                                    name: "__COLUMN_DEFAULT__".to_string(),
-                                    args: vec![],
-                                },
-                            ));
-                        }
-                    }
-                    // Lower the RHS to a scalar expression so `SET n = n + 1`
-                    // and other computed assignments evaluate per row (a bare
-                    // literal lowers to `ScalarExpr::Literal`).
-                    let val = lower_scalar(&a.value, params)?;
-                    Some((col, val))
-                })
-                .collect();
+            if update.from.is_some() {
+                anyhow::bail!("UPDATE ... FROM is not supported");
+            }
+            if !update.table.joins.is_empty() {
+                anyhow::bail!("UPDATE of a joined relation is not supported");
+            }
             Ok(LogicalPlan::Update {
-                table_name,
-                assignments: assigns,
+                table_name: table_name_of(&update.table.relation)?,
+                assignments: plan_assignments(&update.assignments, params)?,
                 filter: parse_predicates(&update.selection, params)?,
-                returning,
+                returning: plan_returning(&update.returning)?,
             })
         }
         Statement::Delete(delete) => {
-            let returning = if let Some(r) = &delete.returning {
-                r.iter()
-                    .filter_map(|item| match item {
-                        sqlparser::ast::SelectItem::UnnamedExpr(
-                            sqlparser::ast::Expr::Identifier(id),
-                        ) => Some(id.value.clone()),
-                        _ => None,
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            };
+            if delete.using.is_some() {
+                anyhow::bail!("DELETE ... USING is not supported");
+            }
             let tables = match &delete.from {
                 FromTable::WithFromKeyword(t) | FromTable::WithoutKeyword(t) => t,
             };
+            if tables.len() > 1 || tables.iter().any(|t| !t.joins.is_empty()) {
+                anyhow::bail!("DELETE from several relations is not supported");
+            }
             let relation = &tables
                 .first()
                 .ok_or_else(|| anyhow::anyhow!("DELETE without a table"))?
@@ -445,7 +468,7 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
             Ok(LogicalPlan::Delete {
                 table_name: table_name_of(relation)?,
                 filter: parse_predicates(&delete.selection, params)?,
-                returning,
+                returning: plan_returning(&delete.returning)?,
             })
         }
         Statement::StartTransaction { .. } => Ok(LogicalPlan::Begin),
@@ -585,4 +608,157 @@ fn check_constraint_is_supported(expr: &sqlparser::ast::Expr, params: &[Value]) 
     parse_filter_expr(expr, params)
         .map(|_| ())
         .map_err(|e| anyhow::anyhow!("Unsupported CHECK constraint `{expr}`: {e}"))
+}
+
+/// Plans a `RETURNING` list as column names; `*` (and `new.*`) expands to every
+/// column at execution, and `new.col` is `col`. Expressions and `old.`
+/// references are rejected rather than silently omitted.
+fn plan_returning(items: &Option<Vec<sqlparser::ast::SelectItem>>) -> Result<Vec<String>> {
+    use sqlparser::ast::{Expr, SelectItem, SelectItemQualifiedWildcardKind};
+    let Some(items) = items else {
+        return Ok(Vec::new());
+    };
+    let is_old = |qualifier: &str| qualifier.eq_ignore_ascii_case("old");
+    items
+        .iter()
+        .map(|item| match item {
+            SelectItem::Wildcard(_) => Ok("*".to_string()),
+            SelectItem::QualifiedWildcard(SelectItemQualifiedWildcardKind::ObjectName(name), _)
+                if !is_old(&name.to_string()) =>
+            {
+                Ok("*".to_string())
+            }
+            SelectItem::UnnamedExpr(Expr::Identifier(id)) => Ok(id.value.clone()),
+            SelectItem::UnnamedExpr(Expr::CompoundIdentifier(parts))
+                if parts.len() == 2 && !is_old(&parts[0].value) =>
+            {
+                Ok(parts[1].value.clone())
+            }
+            other => anyhow::bail!("Unsupported RETURNING item: {other}"),
+        })
+        .collect()
+}
+
+/// Plans `SET` assignments. A tuple target `(a, b) = (x, y)` expands to one
+/// assignment per column. An assignment that cannot be evaluated is an error
+/// rather than silently dropped.
+fn plan_assignments(
+    assignments: &[sqlparser::ast::Assignment],
+    params: &[Value],
+) -> Result<Vec<(String, ScalarExpr)>> {
+    use sqlparser::ast::{AssignmentTarget, Expr};
+    // Take the last identifier of the target, e.g. `t.col = ...` -> `col`.
+    let column = |name: &sqlparser::ast::ObjectName| {
+        name.0
+            .last()
+            .and_then(|p| p.as_ident())
+            .map(|i| i.value.clone())
+            .ok_or_else(|| anyhow::anyhow!("Unsupported assignment target: {name}"))
+    };
+    let mut out = Vec::new();
+    for a in assignments {
+        match &a.target {
+            AssignmentTarget::ColumnName(name) => {
+                out.push((column(name)?, assignment_value(&a.value, params)?));
+            }
+            AssignmentTarget::Tuple(names) => {
+                let values: Vec<&Expr> = match &a.value {
+                    Expr::Tuple(items) => items.iter().collect(),
+                    Expr::Function(f) if f.name.to_string().eq_ignore_ascii_case("row") => match &f
+                        .args
+                    {
+                        sqlparser::ast::FunctionArguments::List(list) => list
+                            .args
+                            .iter()
+                            .map(|arg| match arg {
+                                sqlparser::ast::FunctionArg::Unnamed(
+                                    sqlparser::ast::FunctionArgExpr::Expr(e),
+                                ) => Ok(e),
+                                other => Err(anyhow::anyhow!("Unsupported ROW argument: {other}")),
+                            })
+                            .collect::<Result<_>>()?,
+                        _ => Vec::new(),
+                    },
+                    other => anyhow::bail!("Unsupported multi-column assignment source: {other}"),
+                };
+                if values.len() != names.len() {
+                    anyhow::bail!("number of columns does not match number of values");
+                }
+                for (name, value) in names.iter().zip(values) {
+                    out.push((column(name)?, assignment_value(value, params)?));
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// One assignment value; `DEFAULT` becomes a sentinel the executor resolves
+/// to the column default.
+fn assignment_value(value: &sqlparser::ast::Expr, params: &[Value]) -> Result<ScalarExpr> {
+    if let sqlparser::ast::Expr::Identifier(id) = value
+        && id.quote_style.is_none()
+        && id.value.eq_ignore_ascii_case("default")
+    {
+        return Ok(ScalarExpr::Function {
+            name: "__COLUMN_DEFAULT__".to_string(),
+            args: vec![],
+        });
+    }
+    // Lower the RHS so `SET n = n + 1` evaluates per row against its old values.
+    lower_scalar(value, params)
+        .ok_or_else(|| anyhow::anyhow!("Unsupported assignment value: {value}"))
+}
+
+/// Evaluates one `VALUES` cell: a literal or parameter, or else a constant
+/// scalar expression (`1 + 1`, `'a' || 'b'`). A cell that cannot be evaluated,
+/// or that names a column, is an error rather than NULL.
+fn values_cell(e: &sqlparser::ast::Expr, params: &[Value]) -> Result<Value> {
+    use sqlparser::ast::Expr;
+    if !matches!(e, Expr::Identifier(_) | Expr::CompoundIdentifier(_))
+        && let Some(v) = expr_to_value(e, params)
+    {
+        return Ok(v);
+    }
+    let expr = lower_scalar(e, params)
+        .ok_or_else(|| anyhow::anyhow!("Unsupported VALUES expression: {e}"))?;
+    if references_column(&expr) {
+        anyhow::bail!("column \"{e}\" does not exist");
+    }
+    Ok(eval_scalar_expr(&expr, &[], &[]))
+}
+
+fn references_column(expr: &ScalarExpr) -> bool {
+    matches!(expr, ScalarExpr::Column(_)) || expr.children().into_iter().any(references_column)
+}
+
+/// Resolves `EXCLUDED.<col>` (any case) to the `excluded.<col>` name under
+/// which the proposed row is bound during `ON CONFLICT DO UPDATE`.
+fn bind_excluded(expr: &ScalarExpr) -> ScalarExpr {
+    match expr {
+        ScalarExpr::Column(name) => match name.split_once('.') {
+            Some((qualifier, col)) if qualifier.eq_ignore_ascii_case("excluded") => {
+                ScalarExpr::Column(format!("excluded.{col}"))
+            }
+            _ => expr.clone(),
+        },
+        _ => expr.map_children(&mut |e| bind_excluded(e)),
+    }
+}
+
+/// `SELECT ... INTO t`: the target table name and the query without `INTO`.
+fn select_into(query: &sqlparser::ast::Query) -> Option<(String, sqlparser::ast::Query)> {
+    use sqlparser::ast::SetExpr;
+    let SetExpr::Select(select) = &*query.body else {
+        return None;
+    };
+    let target = match select.into.as_ref()?.targets.as_slice() {
+        [target] => target.to_string(),
+        _ => return None,
+    };
+    let mut select = select.clone();
+    select.into = None;
+    let mut query = query.clone();
+    query.body = Box::new(SetExpr::Select(select));
+    Some((target, query))
 }

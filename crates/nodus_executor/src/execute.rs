@@ -60,15 +60,35 @@ impl MemExecutor {
                 returning,
                 on_conflict,
                 default_cells,
-            } => self.exec_insert(
-                ctx,
-                table_name,
-                columns,
-                values_list,
-                returning,
-                on_conflict,
-                default_cells,
-            ),
+                source,
+            } => {
+                // `INSERT ... SELECT`: the source query's rows are the values.
+                let (values_list, default_cells) = match source {
+                    Some(query) => (
+                        self.execute_logical_inner(ctx, *query)?
+                            .rows
+                            .into_iter()
+                            .map(|r| r.values)
+                            .collect(),
+                        Vec::new(),
+                    ),
+                    None => (values_list, default_cells),
+                };
+                self.exec_insert(
+                    ctx,
+                    table_name,
+                    columns,
+                    values_list,
+                    returning,
+                    on_conflict,
+                    default_cells,
+                )
+            }
+            LogicalPlan::CreateTableAs {
+                name,
+                query,
+                if_not_exists,
+            } => self.exec_create_table_as(ctx, name, *query, if_not_exists),
             LogicalPlan::Select {
                 ctes,
                 table_name,

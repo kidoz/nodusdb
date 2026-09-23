@@ -112,7 +112,6 @@ impl MemExecutor {
                 unique_cols.push((d.clone(), c.primary));
             }
         }
-
         // Multi-column UNIQUE constraints, resolved to column ids up front so an
         // unknown column fails before the table is created.
         let unique_groups = unique_constraints
@@ -179,7 +178,6 @@ impl MemExecutor {
                 },
             )?;
         }
-
         for (suffix, column_ids) in unique_groups {
             let index = nodus_catalog::IndexDescriptor {
                 id: nodus_catalog::IndexId::new(),
@@ -212,6 +210,50 @@ impl MemExecutor {
         }
 
         Ok(QueryOutput::tag("CREATE TABLE"))
+    }
+    /// `CREATE TABLE ... AS <query>` / `SELECT ... INTO`: runs the query, then
+    /// creates a table with its output columns and types and inserts its rows.
+    /// The command tag is `SELECT <n>`, as in PostgreSQL.
+    pub(crate) fn exec_create_table_as(
+        &self,
+        ctx: &ExecutionContext,
+        name: String,
+        query: LogicalPlan,
+        if_not_exists: bool,
+    ) -> Result<QueryOutput> {
+        let (db_name, schema_name, table_only) = parse_object_name(&name)?;
+        if self
+            .catalog_reader
+            .get_table(db_name, schema_name, table_only)
+            .is_ok()
+        {
+            if if_not_exists {
+                return Ok(QueryOutput::tag("CREATE TABLE AS"));
+            }
+            anyhow::bail!("relation \"{}\" already exists", table_only);
+        }
+        let out = self.execute_logical_inner(ctx, query)?;
+        let mut columns: Vec<ColumnDef> = Vec::with_capacity(out.columns.len());
+        for (col, ty) in out.columns.iter().zip(&out.types) {
+            if columns.iter().any(|c| &c.name == col) {
+                anyhow::bail!("column \"{col}\" specified more than once");
+            }
+            columns.push(ColumnDef {
+                name: col.clone(),
+                data_type: ty.clone(),
+                nullable: true,
+                unique: false,
+                primary: false,
+                default: None,
+            });
+        }
+        self.exec_create_table(ctx, name.clone(), columns, vec![], false, vec![])?;
+        let rows: Vec<Vec<Value>> = out.rows.into_iter().map(|r| r.values).collect();
+        let count = rows.len();
+        if count > 0 {
+            self.exec_insert(ctx, name, vec![], rows, vec![], None, vec![])?;
+        }
+        Ok(QueryOutput::tag(&format!("SELECT {count}")))
     }
     pub(crate) fn exec_create_view(
         &self,

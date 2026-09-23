@@ -53,6 +53,7 @@ fn test_group_by_aggregates() {
         exec.execute_logical(
             &ctx,
             LogicalPlan::Insert {
+                source: None,
                 table_name: "sales".into(),
                 columns: vec![],
                 values_list: vec![vec![
@@ -270,6 +271,7 @@ fn test_set_operations() {
         exec.execute_logical(
             &ctx,
             LogicalPlan::Insert {
+                source: None,
                 table_name: t.into(),
                 columns: vec![],
                 values_list: vec![vec![Value::Text(id.to_string()), Value::Text(n.into())]],
@@ -360,6 +362,7 @@ fn test_cross_join() {
         exec.execute_logical(
             &ctx,
             LogicalPlan::Insert {
+                source: None,
                 table_name: t.into(),
                 columns: vec![],
                 values_list: vec![vec![Value::Text(id.into()), Value::Text(v.into())]],
@@ -418,6 +421,7 @@ fn test_having() {
         exec.execute_logical(
             &ctx,
             LogicalPlan::Insert {
+                source: None,
                 table_name: "sales".into(),
                 columns: vec![],
                 values_list: vec![vec![
@@ -503,6 +507,7 @@ fn test_window_functions() {
         exec.execute_logical(
             &ctx,
             LogicalPlan::Insert {
+                source: None,
                 table_name: "emp".into(),
                 columns: vec![],
                 values_list: vec![vec![Value::Text(id.into()), Value::Text(amt.into())]],

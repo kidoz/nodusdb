@@ -93,58 +93,65 @@ impl MemExecutor {
         on_conflict: Option<crate::plan_types::OnConflictClause>,
         default_cells: Vec<Vec<bool>>,
     ) -> Result<QueryOutput> {
+        use crate::plan_types::OnConflictClause;
         let (db_name, schema_name, table_only) = parse_object_name(&table_name)?;
         let tbl = self
             .catalog_reader
             .get_table(db_name, schema_name, table_only)?;
         self.authorize(ctx, Action::Insert, ResourceRef::Table(tbl.id))?;
+        let returning = Self::expand_returning(&tbl, returning)?;
 
-        let col_names: Vec<&str> = tbl.columns.iter().map(|c| c.name.as_str()).collect();
-        let col_names_owned: Vec<String> = tbl.columns.iter().map(|c| c.name.clone()).collect();
+        // Target column positions, in the order values are supplied.
+        let targets: Vec<usize> = if columns.is_empty() {
+            (0..tbl.columns.len()).collect()
+        } else {
+            let mut targets = Vec::with_capacity(columns.len());
+            for name in &columns {
+                let pos = Self::column_position(&tbl, name)?;
+                if targets.contains(&pos) {
+                    anyhow::bail!("column \"{name}\" specified more than once");
+                }
+                targets.push(pos);
+            }
+            targets
+        };
+        let col_names: Vec<String> = tbl.columns.iter().map(|c| c.name.clone()).collect();
         let pk_positions = Self::pk_positions(&tbl);
         let mut inserted_count = 0;
         let mut returning_rows = Vec::new();
+        // Keys this statement inserted or updated: ON CONFLICT DO UPDATE may not
+        // affect the same row twice.
+        let mut touched = std::collections::HashSet::new();
 
         for (row_idx, values) in values_list.iter().enumerate() {
-            // Build the Values row in table-column order, tracking which
-            // columns actually received a value (an explicit `DEFAULT` cell
-            // counts as not provided).
+            if values.len() > targets.len() {
+                anyhow::bail!("INSERT has more expressions than target columns");
+            }
+            if !columns.is_empty() && values.len() < targets.len() {
+                anyhow::bail!("INSERT has more target columns than expressions");
+            }
+            // Build the row in table-column order, tracking which columns
+            // received a value (an explicit `DEFAULT` cell counts as omitted).
             let defaults_mask = default_cells.get(row_idx);
             let is_default_cell =
                 |j: usize| defaults_mask.is_some_and(|m| m.get(j).copied().unwrap_or(false));
-            let mut raw = vec![Value::Null; col_names.len()];
-            let mut provided = vec![false; col_names.len()];
-            if columns.is_empty() {
-                for (i, v) in values.iter().enumerate() {
-                    if i < raw.len() && !is_default_cell(i) {
-                        raw[i] = v.clone();
-                        provided[i] = true;
-                    }
-                }
-            } else {
-                for (j, (cname, val)) in columns.iter().zip(values.iter()).enumerate() {
-                    if let Some(idx) = col_names.iter().position(|c| c == cname) {
-                        if !is_default_cell(j) {
-                            raw[idx] = val.clone();
-                            provided[idx] = true;
-                        }
-                    }
+            let mut raw = vec![Value::Null; tbl.columns.len()];
+            let mut provided = vec![false; tbl.columns.len()];
+            for (j, (&pos, val)) in targets.iter().zip(values).enumerate() {
+                if !is_default_cell(j) {
+                    raw[pos] = val.clone();
+                    provided[pos] = true;
                 }
             }
             // Unprovided columns take their declared DEFAULT, if any.
             for (i, c) in tbl.columns.iter().enumerate() {
-                if !provided[i] {
-                    if let Some(json) = &c.default_expr {
-                        if let Ok(expr) =
-                            serde_json::from_str::<crate::plan_types::ScalarExpr>(json)
-                        {
-                            raw[i] = eval_scalar_expr(&expr, &[], &[]);
-                        }
-                    }
+                if !provided[i]
+                    && let Some(expr) = Self::column_default(c)
+                {
+                    raw[i] = eval_scalar_expr(&expr, &[], &[]);
                 }
             }
-            // ...then coerce each cell to its column's type if it's Text, otherwise assume it's correctly bound.
-            let mut row = Vec::new();
+            let mut row = Vec::with_capacity(tbl.columns.len());
             for (i, c) in tbl.columns.iter().enumerate() {
                 let val = crate::value::coerce_for_column(&raw[i], &c.data_type);
                 if !c.nullable && val == Value::Null {
@@ -153,87 +160,53 @@ impl MemExecutor {
                 row.push(val);
             }
 
-            // ON CONFLICT: for a keyed table, look up the target key before we
-            // reach the unique-constraint check (which would raise a violation).
-            // A conflict is resolved by skipping the row (DO NOTHING) or updating
-            // the existing row in place (DO UPDATE). Synthetic-rowid tables have
-            // no unique key, so they never conflict.
-            if let Some(clause) = &on_conflict {
-                if !Self::uses_synthetic_rowid(&tbl) {
-                    let target_pk = Self::row_pk(&pk_positions, &row);
-                    let target_key = format!("{}:{}", tbl.id, target_pk);
-                    let existing = self
-                        .scan_rows_keyed(tbl.id, &ctx.session_id)?
-                        .into_iter()
-                        .find(|(k, _)| k == &target_key);
-                    if let Some((existing_key, mut existing_row)) = existing {
-                        match clause {
-                            crate::plan_types::OnConflictClause::DoNothing => continue,
-                            crate::plan_types::OnConflictClause::DoUpdate(assignments) => {
-                                let old_row = existing_row.clone();
-                                for (col, expr) in assignments {
-                                    if let Some(idx) = col_names.iter().position(|c| c == col) {
-                                        let val =
-                                            eval_scalar_expr(expr, &old_row, &col_names_owned);
-                                        let coerced = crate::value::coerce_for_column(
-                                            &val,
-                                            &tbl.columns[idx].data_type,
-                                        );
-                                        if !tbl.columns[idx].nullable && coerced == Value::Null {
-                                            anyhow::bail!("Column {} cannot be NULL", col);
-                                        }
-                                        existing_row[idx] = coerced;
-                                    }
-                                }
-                                self.write_row(
-                                    &ctx.session_id,
-                                    existing_key,
-                                    serde_json::to_string(&existing_row)?,
-                                )?;
-                                // Maintain secondary indexes for changed key columns.
-                                for idx in &tbl.indexes {
-                                    for kcol in &idx.key_columns {
-                                        if let Some(pos) =
-                                            tbl.columns.iter().position(|c| c.id == kcol.column_id)
-                                        {
-                                            let old_v = old_row.get(pos).unwrap_or(&Value::Null);
-                                            let new_v =
-                                                existing_row.get(pos).unwrap_or(&Value::Null);
-                                            if old_v != new_v {
-                                                self.delete_index_entry(
-                                                    &ctx.session_id,
-                                                    idx.id,
-                                                    old_v,
-                                                    &target_pk,
-                                                )?;
-                                                self.write_index_entry(
-                                                    &ctx.session_id,
-                                                    idx.id,
-                                                    new_v,
-                                                    &target_pk,
-                                                )?;
-                                            }
-                                        }
-                                    }
-                                }
-                                inserted_count += 1;
-                                if !returning.is_empty() {
-                                    returning_rows.push(existing_row);
-                                }
-                                continue;
-                            }
+            if let Some(clause) = &on_conflict
+                && let Some((existing_key, existing_row)) =
+                    self.find_conflict(&ctx.session_id, &tbl, &row, clause.target())?
+            {
+                match clause {
+                    OnConflictClause::DoNothing { .. } => continue,
+                    OnConflictClause::DoUpdate {
+                        assignments,
+                        condition,
+                        ..
+                    } => {
+                        if touched.contains(&existing_key) {
+                            anyhow::bail!(
+                                "ON CONFLICT DO UPDATE command cannot affect row a second time"
+                            );
                         }
+                        // Expressions see the existing row, plus the proposed
+                        // row as `excluded.<col>`.
+                        let mut scope_row = existing_row.clone();
+                        scope_row.extend(row.iter().cloned());
+                        let mut scope_cols = col_names.clone();
+                        scope_cols.extend(col_names.iter().map(|c| format!("excluded.{c}")));
+                        if let Some(cond) = condition
+                            && eval_scalar_expr(cond, &scope_row, &scope_cols) != Value::Bool(true)
+                        {
+                            continue;
+                        }
+                        let updated = self.apply_assignments(
+                            &tbl,
+                            assignments,
+                            &existing_row,
+                            (&scope_row, &scope_cols),
+                        )?;
+                        let key =
+                            self.replace_row(ctx, &tbl, &existing_key, &existing_row, &updated)?;
+                        touched.insert(key);
+                        inserted_count += 1;
+                        if !returning.is_empty() {
+                            returning_rows.push(updated);
+                        }
+                        continue;
                     }
                 }
             }
 
             self.check_unique_constraints(&ctx.session_id, &tbl, &row, None)?;
-            self.check_table_constraints(
-                ctx,
-                &tbl,
-                &row,
-                &col_names.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
-            )?;
+            self.check_table_constraints(ctx, &tbl, &row, &col_names)?;
 
             // Key: declared PRIMARY KEY / full-row content, or a synthetic rowid
             // for an index-less table (so exact-duplicate rows don't collide).
@@ -245,8 +218,8 @@ impl MemExecutor {
                 Self::row_pk(&pk_positions, &row)
             };
             let key = format!("{}:{}", tbl.id, pk);
-            let encoded = serde_json::to_string(&row)?;
-            self.write_row(&ctx.session_id, key, encoded)?;
+            self.write_row(&ctx.session_id, key.clone(), serde_json::to_string(&row)?)?;
+            touched.insert(key);
 
             // Maintain secondary indexes.
             for idx in &tbl.indexes {
@@ -263,36 +236,14 @@ impl MemExecutor {
                 returning_rows.push(row);
             }
         }
-
-        if returning.is_empty() {
-            Ok(QueryOutput::tag(&format!("INSERT 0 {}", inserted_count)))
-        } else {
-            let col_names: Vec<&str> = tbl.columns.iter().map(|c| c.name.as_str()).collect();
-            let indices: Vec<Option<usize>> = returning
-                .iter()
-                .map(|c| {
-                    col_names
-                        .iter()
-                        .position(|&tc| tc == c || tc.ends_with(&format!(".{}", c)))
-                })
-                .collect();
-            let rows = returning_rows
-                .into_iter()
-                .map(|r| Row {
-                    values: indices
-                        .iter()
-                        .map(|i| i.and_then(|idx| r.get(idx)).cloned().unwrap_or(Value::Null))
-                        .collect(),
-                })
-                .collect();
-            Ok(QueryOutput {
-                tag: format!("INSERT 0 {}", inserted_count),
-                columns: returning.clone(),
-                types: Self::returning_types(&tbl.columns, &returning),
-                rows,
-            })
-        }
+        Self::returning_output(
+            &tbl,
+            &returning,
+            returning_rows,
+            format!("INSERT 0 {inserted_count}"),
+        )
     }
+
     pub(crate) fn exec_update(
         &self,
         ctx: &ExecutionContext,
@@ -306,10 +257,11 @@ impl MemExecutor {
             .catalog_reader
             .get_table(db_name, schema_name, table_only)?;
         self.authorize(ctx, Action::Update, ResourceRef::Table(tbl.id))?;
-        let col_names: Vec<&str> = tbl.columns.iter().map(|c| c.name.as_str()).collect();
-        let col_names_owned: Vec<String> = tbl.columns.iter().map(|c| c.name.clone()).collect();
-        let pk_positions = Self::pk_positions(&tbl);
-        let key_prefix = format!("{}:", tbl.id);
+        let returning = Self::expand_returning(&tbl, returning)?;
+        for (col, _) in &assignments {
+            Self::column_position(&tbl, col)?;
+        }
+        let col_names: Vec<String> = tbl.columns.iter().map(|c| c.name.clone()).collect();
 
         let mut updated = 0;
         let mut returning_rows = Vec::new();
@@ -320,124 +272,24 @@ impl MemExecutor {
             .into_iter()
             .filter(|(_, row)| self.row_matches(ctx, row, &tbl.columns, filter.as_ref()))
             .collect();
-        for (old_key, mut row) in targets {
-            let old_row = row.clone();
-            // The row's actual stored key (any scheme); the new key is derived
-            // from the updated content, migrating old-scheme rows on write.
-            let old_pk_str = old_key
-                .strip_prefix(&key_prefix)
-                .unwrap_or(&old_key)
-                .to_string();
-            for (col, expr) in &assignments {
-                if let Some(idx) = col_names.iter().position(|c| c == col) {
-                    // `SET col = DEFAULT` sentinel: resolve to the column's
-                    // declared default (NULL when there is none).
-                    let val = if matches!(expr,
-                        ScalarExpr::Function { name, args } if name == "__COLUMN_DEFAULT__" && args.is_empty())
-                    {
-                        tbl.columns[idx]
-                            .default_expr
-                            .as_ref()
-                            .and_then(|json| serde_json::from_str::<ScalarExpr>(json).ok())
-                            .map(|e| eval_scalar_expr(&e, &[], &[]))
-                            .unwrap_or(Value::Null)
-                    } else {
-                        // Evaluate the RHS against the row's OLD values.
-                        eval_scalar_expr(expr, &old_row, &col_names_owned)
-                    };
-                    let coerced =
-                        crate::value::coerce_for_column(&val, &tbl.columns[idx].data_type);
-                    if !tbl.columns[idx].nullable && coerced == Value::Null {
-                        anyhow::bail!("Column {} cannot be NULL", col);
-                    }
-                    row[idx] = coerced;
-                }
-            }
-
-            // A synthetic rowid is the row's stable identity — keep it across the
-            // update rather than re-deriving a key from the (changed) content.
-            let pk_str = if Self::uses_synthetic_rowid(&tbl) {
-                old_pk_str.clone()
-            } else {
-                Self::row_pk(&pk_positions, &row)
-            };
-            // Skip only the row being updated (its old key): a new key that
-            // lands on another existing row is a violation, not an overwrite.
-            self.check_unique_constraints(&ctx.session_id, &tbl, &row, Some(&old_pk_str))?;
-            self.check_table_constraints(
-                ctx,
-                &tbl,
-                &row,
-                &col_names.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
-            )?;
-
-            let new_key = format!("{}:{}", tbl.id, pk_str);
-            self.write_row(
-                &ctx.session_id,
-                new_key.clone(),
-                serde_json::to_string(&row)?,
-            )?;
-            if new_key != old_key {
-                self.delete_row(&ctx.session_id, old_key)?;
-            }
-
-            // Maintain secondary indexes.
-            for idx in &tbl.indexes {
-                for kcol in &idx.key_columns {
-                    if let Some(pos) = tbl.columns.iter().position(|c| c.id == kcol.column_id) {
-                        let old_index_val = old_row.get(pos).unwrap_or(&Value::Null);
-                        let new_index_val = row.get(pos).unwrap_or(&Value::Null);
-                        if old_index_val != new_index_val || old_pk_str != pk_str {
-                            self.delete_index_entry(
-                                &ctx.session_id,
-                                idx.id,
-                                old_index_val,
-                                &old_pk_str,
-                            )?;
-                            self.write_index_entry(
-                                &ctx.session_id,
-                                idx.id,
-                                new_index_val,
-                                &pk_str,
-                            )?;
-                        }
-                    }
-                }
-            }
-
+        for (old_key, old_row) in targets {
+            // Assignments evaluate against the row's OLD values.
+            let row =
+                self.apply_assignments(&tbl, &assignments, &old_row, (&old_row, &col_names))?;
+            self.replace_row(ctx, &tbl, &old_key, &old_row, &row)?;
             updated += 1;
             if !returning.is_empty() {
                 returning_rows.push(row);
             }
         }
-        if returning.is_empty() {
-            Ok(QueryOutput::tag(&format!("UPDATE {updated}")))
-        } else {
-            let indices: Vec<Option<usize>> = returning
-                .iter()
-                .map(|c| {
-                    col_names
-                        .iter()
-                        .position(|&tc| tc == c || tc.ends_with(&format!(".{}", c)))
-                })
-                .collect();
-            let rows = returning_rows
-                .into_iter()
-                .map(|r| Row {
-                    values: indices
-                        .iter()
-                        .map(|i| i.and_then(|idx| r.get(idx)).cloned().unwrap_or(Value::Null))
-                        .collect(),
-                })
-                .collect();
-            Ok(QueryOutput {
-                tag: format!("UPDATE {updated}"),
-                columns: returning.clone(),
-                types: Self::returning_types(&tbl.columns, &returning),
-                rows,
-            })
-        }
+        Self::returning_output(
+            &tbl,
+            &returning,
+            returning_rows,
+            format!("UPDATE {updated}"),
+        )
     }
+
     pub(crate) fn exec_delete(
         &self,
         ctx: &ExecutionContext,
@@ -450,6 +302,7 @@ impl MemExecutor {
             .catalog_reader
             .get_table(db_name, schema_name, table_only)?;
         self.authorize(ctx, Action::Delete, ResourceRef::Table(tbl.id))?;
+        let returning = Self::expand_returning(&tbl, returning)?;
 
         let key_prefix = format!("{}:", tbl.id);
         let mut deleted = 0;
@@ -483,33 +336,233 @@ impl MemExecutor {
                 returning_rows.push(row);
             }
         }
-        if returning.is_empty() {
-            Ok(QueryOutput::tag(&format!("DELETE {deleted}")))
-        } else {
-            let col_names: Vec<&str> = tbl.columns.iter().map(|c| c.name.as_str()).collect();
-            let indices: Vec<Option<usize>> = returning
-                .iter()
-                .map(|c| {
-                    col_names
-                        .iter()
-                        .position(|&tc| tc == c || tc.ends_with(&format!(".{}", c)))
-                })
-                .collect();
-            let rows = returning_rows
-                .into_iter()
-                .map(|r| Row {
-                    values: indices
-                        .iter()
-                        .map(|i| i.and_then(|idx| r.get(idx)).cloned().unwrap_or(Value::Null))
-                        .collect(),
-                })
-                .collect();
-            Ok(QueryOutput {
-                tag: format!("DELETE {deleted}"),
-                columns: returning.clone(),
-                types: Self::returning_types(&tbl.columns, &returning),
-                rows,
+        Self::returning_output(
+            &tbl,
+            &returning,
+            returning_rows,
+            format!("DELETE {deleted}"),
+        )
+    }
+
+    /// A column's position in `tbl`, or the PostgreSQL error for an unknown one.
+    fn column_position(tbl: &nodus_catalog::TableDescriptor, name: &str) -> Result<usize> {
+        tbl.columns
+            .iter()
+            .position(|c| c.name == name)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "column \"{name}\" of relation \"{}\" does not exist",
+                    tbl.name
+                )
             })
+    }
+
+    /// A column's declared DEFAULT expression, if any.
+    fn column_default(column: &ColumnDescriptor) -> Option<ScalarExpr> {
+        column
+            .default_expr
+            .as_ref()
+            .and_then(|json| serde_json::from_str::<ScalarExpr>(json).ok())
+    }
+
+    /// Applies `SET` assignments to a copy of `old_row`. Each expression is
+    /// evaluated against `scope` (the old row, plus `excluded.*` for ON
+    /// CONFLICT), and the result is coerced to the column type.
+    fn apply_assignments(
+        &self,
+        tbl: &nodus_catalog::TableDescriptor,
+        assignments: &[(String, ScalarExpr)],
+        old_row: &[Value],
+        (scope_row, scope_cols): (&[Value], &[String]),
+    ) -> Result<Vec<Value>> {
+        let mut row = old_row.to_vec();
+        for (col, expr) in assignments {
+            let idx = Self::column_position(tbl, col)?;
+            // `SET col = DEFAULT` sentinel: the declared default, else NULL.
+            let val = if matches!(expr,
+                ScalarExpr::Function { name, args } if name == "__COLUMN_DEFAULT__" && args.is_empty())
+            {
+                Self::column_default(&tbl.columns[idx])
+                    .map(|e| eval_scalar_expr(&e, &[], &[]))
+                    .unwrap_or(Value::Null)
+            } else {
+                eval_scalar_expr(expr, scope_row, scope_cols)
+            };
+            let coerced = crate::value::coerce_for_column(&val, &tbl.columns[idx].data_type);
+            if !tbl.columns[idx].nullable && coerced == Value::Null {
+                anyhow::bail!("Column {} cannot be NULL", col);
+            }
+            row[idx] = coerced;
         }
+        Ok(row)
+    }
+
+    /// Replaces the stored row at `old_key` with `row`: re-checks uniqueness
+    /// (excluding the row itself) and table constraints, moves the row when its
+    /// key changes, and maintains every index. Returns the row's new key.
+    fn replace_row(
+        &self,
+        ctx: &ExecutionContext,
+        tbl: &nodus_catalog::TableDescriptor,
+        old_key: &str,
+        old_row: &[Value],
+        row: &[Value],
+    ) -> Result<String> {
+        let key_prefix = format!("{}:", tbl.id);
+        let old_pk = old_key
+            .strip_prefix(&key_prefix)
+            .unwrap_or(old_key)
+            .to_string();
+        // A synthetic rowid is the row's stable identity — keep it across the
+        // update rather than re-deriving a key from the (changed) content.
+        let pk = if Self::uses_synthetic_rowid(tbl) {
+            old_pk.clone()
+        } else {
+            Self::row_pk(&Self::pk_positions(tbl), row)
+        };
+        // Skip only the row being replaced: a new key that lands on another
+        // existing row is a violation, not an overwrite.
+        self.check_unique_constraints(&ctx.session_id, tbl, row, Some(&old_pk))?;
+        let col_names: Vec<String> = tbl.columns.iter().map(|c| c.name.clone()).collect();
+        self.check_table_constraints(ctx, tbl, row, &col_names)?;
+
+        let new_key = format!("{}:{}", tbl.id, pk);
+        self.write_row(
+            &ctx.session_id,
+            new_key.clone(),
+            serde_json::to_string(row)?,
+        )?;
+        if new_key != old_key {
+            self.delete_row(&ctx.session_id, old_key.to_string())?;
+        }
+        for idx in &tbl.indexes {
+            for kcol in &idx.key_columns {
+                if let Some(pos) = tbl.columns.iter().position(|c| c.id == kcol.column_id) {
+                    let old_val = old_row.get(pos).unwrap_or(&Value::Null);
+                    let new_val = row.get(pos).unwrap_or(&Value::Null);
+                    if old_val != new_val || old_pk != pk {
+                        self.delete_index_entry(&ctx.session_id, idx.id, old_val, &old_pk)?;
+                        self.write_index_entry(&ctx.session_id, idx.id, new_val, &pk)?;
+                    }
+                }
+            }
+        }
+        Ok(new_key)
+    }
+
+    /// Finds the existing row an `ON CONFLICT` insert collides with: one equal
+    /// on the primary key or on any unique index, or only on the key `target`
+    /// names. A key containing NULL never conflicts.
+    fn find_conflict(
+        &self,
+        session: &str,
+        tbl: &nodus_catalog::TableDescriptor,
+        row: &[Value],
+        target: Option<&crate::plan_types::ConflictTarget>,
+    ) -> Result<Option<(String, Vec<Value>)>> {
+        use crate::plan_types::ConflictTarget;
+        let primary = tbl
+            .indexes
+            .iter()
+            .find(|i| i.index_type == nodus_catalog::IndexType::Primary);
+        let mut keys: Vec<(&str, Vec<usize>)> = Vec::new();
+        if let Some(primary) = primary {
+            keys.push((primary.name.as_str(), Self::pk_positions(tbl)));
+        }
+        for idx in &tbl.indexes {
+            if idx.unique && idx.index_type != nodus_catalog::IndexType::Primary {
+                let positions = idx
+                    .key_columns
+                    .iter()
+                    .filter_map(|kc| tbl.columns.iter().position(|c| c.id == kc.column_id))
+                    .collect();
+                keys.push((idx.name.as_str(), positions));
+            }
+        }
+        match target {
+            None => {}
+            Some(ConflictTarget::Columns(cols)) => {
+                let mut wanted = cols
+                    .iter()
+                    .map(|c| Self::column_position(tbl, c))
+                    .collect::<Result<Vec<_>>>()?;
+                wanted.sort_unstable();
+                keys.retain(|(_, positions)| {
+                    let mut p = positions.clone();
+                    p.sort_unstable();
+                    p == wanted
+                });
+            }
+            Some(ConflictTarget::Constraint(name)) => keys.retain(|(n, _)| n == name),
+        }
+        if target.is_some() && keys.is_empty() {
+            anyhow::bail!(
+                "there is no unique or exclusion constraint matching the ON CONFLICT specification"
+            );
+        }
+        let proposed: Vec<Option<Vec<Value>>> = keys
+            .iter()
+            .map(|(_, positions)| crate::constraints::key_tuple(row, positions))
+            .collect();
+        for (key, existing) in self.scan_rows_keyed(tbl.id, session)? {
+            for ((_, positions), wanted) in keys.iter().zip(&proposed) {
+                if let (Some(wanted), Some(have)) =
+                    (wanted, crate::constraints::key_tuple(&existing, positions))
+                    && wanted.iter().zip(&have).all(|(a, b)| values_equal(a, b))
+                {
+                    return Ok(Some((key, existing)));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Expands `*` in a RETURNING list to every column, and rejects a name
+    /// that is not a column of the table.
+    fn expand_returning(
+        tbl: &nodus_catalog::TableDescriptor,
+        returning: Vec<String>,
+    ) -> Result<Vec<String>> {
+        let mut out = Vec::with_capacity(returning.len());
+        for name in returning {
+            if name == "*" {
+                out.extend(tbl.columns.iter().map(|c| c.name.clone()));
+            } else {
+                Self::column_position(tbl, &name)?;
+                out.push(name);
+            }
+        }
+        Ok(out)
+    }
+
+    /// The statement's result: just the command tag, or the RETURNING rows.
+    fn returning_output(
+        tbl: &nodus_catalog::TableDescriptor,
+        returning: &[String],
+        rows: Vec<Vec<Value>>,
+        tag: String,
+    ) -> Result<QueryOutput> {
+        if returning.is_empty() {
+            return Ok(QueryOutput::tag(&tag));
+        }
+        let positions = returning
+            .iter()
+            .map(|c| Self::column_position(tbl, c))
+            .collect::<Result<Vec<_>>>()?;
+        let rows = rows
+            .into_iter()
+            .map(|r| Row {
+                values: positions
+                    .iter()
+                    .map(|&i| r.get(i).cloned().unwrap_or(Value::Null))
+                    .collect(),
+            })
+            .collect();
+        Ok(QueryOutput {
+            tag,
+            columns: returning.to_vec(),
+            types: Self::returning_types(&tbl.columns, returning),
+            rows,
+        })
     }
 }

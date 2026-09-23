@@ -35,6 +35,17 @@ pub(crate) fn sqlstate_for_execution_error(err_str: &str) -> &'static str {
         || err_str.starts_with("unsupported row scan spanning multiple tables")
     {
         "0A000" // feature_not_supported
+    // Statement shape errors raised while executing DML.
+    } else if err_str.contains("more expressions than target columns")
+        || err_str.contains("more target columns than expressions")
+    {
+        "42601" // syntax_error
+    } else if err_str.contains("specified more than once") {
+        "42701" // duplicate_column
+    } else if err_str.contains("no unique or exclusion constraint matching the ON CONFLICT") {
+        "42P10" // invalid_column_reference
+    } else if err_str.contains("cannot affect row a second time") {
+        "21000" // cardinality_violation
     // Integrity-constraint violations (class 23).
     } else if err_str.contains("Unique constraint violation") {
         "23505" // unique_violation
@@ -375,6 +386,26 @@ mod tests {
             sqlstate_for_execution_error("invalid shard map: gap or overlap"),
             "XX000"
         );
+    }
+
+    #[test]
+    fn maps_dml_shape_errors() {
+        for (message, code) in [
+            ("INSERT has more expressions than target columns", "42601"),
+            ("INSERT has more target columns than expressions", "42601"),
+            ("column \"a\" specified more than once", "42701"),
+            (
+                "there is no unique or exclusion constraint matching the ON CONFLICT specification",
+                "42P10",
+            ),
+            (
+                "ON CONFLICT DO UPDATE command cannot affect row a second time",
+                "21000",
+            ),
+            ("column \"nope\" of relation \"t\" does not exist", "42703"),
+        ] {
+            assert_eq!(sqlstate_for_execution_error(message), code, "{message}");
+        }
     }
 
     #[test]
