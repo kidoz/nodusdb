@@ -598,6 +598,10 @@ pub enum LogicalPlan {
         /// Defaulted so plans serialized before this field decode.
         #[serde(default)]
         if_not_exists: bool,
+        /// Table-level `UNIQUE (a, b, ...)` constraints over two or more
+        /// columns; each becomes one unique index over the whole column tuple.
+        #[serde(default)]
+        unique_constraints: Vec<Vec<String>>,
     },
     DropTable {
         name: String,

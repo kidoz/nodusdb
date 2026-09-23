@@ -67,6 +67,7 @@ impl MemExecutor {
         columns: Vec<ColumnDef>,
         constraints: Vec<nodus_catalog::TableConstraint>,
         if_not_exists: bool,
+        unique_constraints: Vec<Vec<String>>,
     ) -> Result<QueryOutput> {
         let (db_name, schema_name, table_only) = parse_object_name(&name)?;
         let db = self.catalog_reader.get_database(db_name)?;
@@ -112,6 +113,27 @@ impl MemExecutor {
             }
         }
 
+        // Multi-column UNIQUE constraints, resolved to column ids up front so an
+        // unknown column fails before the table is created.
+        let unique_groups = unique_constraints
+            .iter()
+            .map(|names| {
+                names
+                    .iter()
+                    .map(|n| {
+                        descriptors
+                            .iter()
+                            .find(|d| &d.name == n)
+                            .map(|d| d.id)
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("column \"{n}\" named in key does not exist")
+                            })
+                    })
+                    .collect::<Result<Vec<_>>>()
+                    .map(|ids| (names.join("_"), ids))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
         let tbl = self.catalog_writer.create_table(CreateTableRequest {
             id: nodus_catalog::TableId::new(),
             database_id: db.id,
@@ -144,6 +166,37 @@ impl MemExecutor {
                     column_id: col.id,
                     descending: false,
                 }],
+                include_columns: vec![],
+                unique: true,
+                global: false,
+                predicate: None,
+                expressions: vec![],
+            };
+            self.catalog_writer.update_table_descriptor(
+                nodus_catalog::TableDescriptorChange::AddIndex {
+                    table_id: tbl.id,
+                    index,
+                },
+            )?;
+        }
+
+        for (suffix, column_ids) in unique_groups {
+            let index = nodus_catalog::IndexDescriptor {
+                id: nodus_catalog::IndexId::new(),
+                name: format!("{table_only}_{suffix}_key"),
+                version: 1,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+                state: DescriptorState::Public,
+                index_type: nodus_catalog::IndexType::Unique,
+                index_state: nodus_catalog::IndexState::Ready,
+                key_columns: column_ids
+                    .into_iter()
+                    .map(|column_id| nodus_catalog::IndexColumn {
+                        column_id,
+                        descending: false,
+                    })
+                    .collect(),
                 include_columns: vec![],
                 unique: true,
                 global: false,

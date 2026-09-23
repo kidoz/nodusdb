@@ -361,7 +361,9 @@ impl MemExecutor {
             } else {
                 Self::row_pk(&pk_positions, &row)
             };
-            self.check_unique_constraints(&ctx.session_id, &tbl, &row, Some(&pk_str))?;
+            // Skip only the row being updated (its old key): a new key that
+            // lands on another existing row is a violation, not an overwrite.
+            self.check_unique_constraints(&ctx.session_id, &tbl, &row, Some(&old_pk_str))?;
             self.check_table_constraints(
                 ctx,
                 &tbl,

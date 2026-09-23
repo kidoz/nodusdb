@@ -39,7 +39,15 @@ impl MemExecutor {
                 columns,
                 constraints,
                 if_not_exists,
-            } => self.exec_create_table(ctx, name, columns, constraints, if_not_exists),
+                unique_constraints,
+            } => self.exec_create_table(
+                ctx,
+                name,
+                columns,
+                constraints,
+                if_not_exists,
+                unique_constraints,
+            ),
             LogicalPlan::CreateView { name, query } => self.exec_create_view(ctx, name, query),
             LogicalPlan::DropView { name, if_exists } => self.exec_drop_view(ctx, name, if_exists),
             LogicalPlan::DropTable { name, if_exists } => {

@@ -64,6 +64,7 @@ fn create_role_and_grant_require_grant_management() {
     exec.execute_logical(
         &admin_ctx,
         LogicalPlan::CreateTable {
+            unique_constraints: vec![],
             if_not_exists: false,
             constraints: vec![],
             name: "t".into(),
@@ -142,6 +143,7 @@ fn create_table_denied_then_allowed_by_grant() {
         .unwrap();
     let ctx = ctx_for(user.id);
     let plan = || LogicalPlan::CreateTable {
+        unique_constraints: vec![],
         if_not_exists: false,
         constraints: vec![],
         name: "t1".into(),
@@ -196,6 +198,7 @@ fn create_insert_select_round_trip() {
     exec.execute_logical(
         &ctx,
         LogicalPlan::CreateTable {
+            unique_constraints: vec![],
             if_not_exists: false,
             constraints: vec![],
             name: "books".into(),
@@ -343,6 +346,7 @@ fn rows_keyed_by_declared_pk_not_first_column() {
     exec.execute_logical(
         &ctx,
         LogicalPlan::CreateTable {
+            unique_constraints: vec![],
             if_not_exists: false,
             constraints: vec![],
             name: "t".into(),
@@ -444,6 +448,7 @@ fn typed_values_round_trip_and_filter_by_int() {
     exec.execute_logical(
         &ctx,
         LogicalPlan::CreateTable {
+            unique_constraints: vec![],
             if_not_exists: false,
             constraints: vec![],
             name: "items".into(),
@@ -519,6 +524,7 @@ fn update_and_delete_rows() {
     exec.execute_logical(
         &ctx,
         LogicalPlan::CreateTable {
+            unique_constraints: vec![],
             if_not_exists: false,
             constraints: vec![],
             name: "t".into(),
@@ -622,6 +628,7 @@ fn test_join_execution() {
     exec.execute_logical(
         &ctx,
         LogicalPlan::CreateTable {
+            unique_constraints: vec![],
             if_not_exists: false,
             constraints: vec![],
             name: "authors".into(),
@@ -634,6 +641,7 @@ fn test_join_execution() {
     exec.execute_logical(
         &ctx,
         LogicalPlan::CreateTable {
+            unique_constraints: vec![],
             if_not_exists: false,
             constraints: vec![],
             name: "books".into(),
@@ -760,6 +768,7 @@ fn transactions_are_isolated_per_session() {
     exec.execute_logical(
         &ctx_a,
         LogicalPlan::CreateTable {
+            unique_constraints: vec![],
             if_not_exists: false,
             constraints: vec![],
             name: "t".into(),
@@ -877,6 +886,7 @@ fn test_complex_filters() {
     exec.execute_logical(
         &ctx,
         LogicalPlan::CreateTable {
+            unique_constraints: vec![],
             if_not_exists: false,
             constraints: vec![],
             name: "t".into(),
@@ -952,6 +962,7 @@ fn test_left_outer_join() {
     exec.execute_logical(
         &ctx,
         LogicalPlan::CreateTable {
+            unique_constraints: vec![],
             if_not_exists: false,
             constraints: vec![],
             name: "users".into(),
@@ -963,6 +974,7 @@ fn test_left_outer_join() {
     exec.execute_logical(
         &ctx,
         LogicalPlan::CreateTable {
+            unique_constraints: vec![],
             if_not_exists: false,
             constraints: vec![],
             name: "orders".into(),

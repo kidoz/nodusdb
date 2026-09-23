@@ -95,13 +95,18 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                 });
             }
 
+            let mut unique_constraints = Vec::new();
             for tc in constraints {
                 match tc {
                     sqlparser::ast::TableConstraint::Unique(uc) => {
-                        for col in index_column_names(&uc.columns) {
-                            if let Some(c) = cols.iter_mut().find(|c| c.name == col) {
+                        let names = index_column_names(&uc.columns);
+                        if let [col] = names.as_slice() {
+                            if let Some(c) = cols.iter_mut().find(|c| &c.name == col) {
                                 c.unique = true;
                             }
+                        } else {
+                            // Unique over the tuple, not over each column alone.
+                            unique_constraints.push(names);
                         }
                     }
                     sqlparser::ast::TableConstraint::PrimaryKey(pk) => {
@@ -141,6 +146,7 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                 columns: cols,
                 constraints: tbl_constraints,
                 if_not_exists: create_table.if_not_exists,
+                unique_constraints,
             })
         }
         Statement::CreateView(create_view) => Ok(LogicalPlan::CreateView {

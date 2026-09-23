@@ -23,17 +23,22 @@ impl MemExecutor {
         if Self::uses_synthetic_rowid(tbl) {
             return Ok(());
         }
-        let mut unique_col_indices = Vec::new();
-        for idx in &tbl.indexes {
-            if idx.unique {
-                for kcol in &idx.key_columns {
-                    if let Some(pos) = tbl.columns.iter().position(|c| c.id == kcol.column_id) {
-                        unique_col_indices.push((idx.name.clone(), pos));
-                    }
-                }
-            }
-        }
-
+        // Each UNIQUE index constrains its whole key tuple. Primary indexes are
+        // covered by the composite primary-key comparison below (a composite
+        // PRIMARY KEY is stored as one primary index per column).
+        let unique_keys: Vec<(&str, Vec<usize>)> = tbl
+            .indexes
+            .iter()
+            .filter(|idx| idx.unique && idx.index_type != nodus_catalog::IndexType::Primary)
+            .map(|idx| {
+                let positions = idx
+                    .key_columns
+                    .iter()
+                    .filter_map(|kc| tbl.columns.iter().position(|c| c.id == kc.column_id))
+                    .collect();
+                (idx.name.as_str(), positions)
+            })
+            .collect();
         let pk_positions = Self::pk_positions(tbl);
         let new_pk = Self::row_pk(&pk_positions, new_row);
 
@@ -45,10 +50,12 @@ impl MemExecutor {
             if pk == new_pk {
                 anyhow::bail!("Unique constraint violation on primary key");
             }
-            for (idx_name, col_idx) in &unique_col_indices {
-                let existing_val = existing.get(*col_idx).unwrap_or(&Value::Null);
-                let new_val = new_row.get(*col_idx).unwrap_or(&Value::Null);
-                if existing_val != &Value::Null && values_equal(existing_val, new_val) {
+            for (idx_name, positions) in &unique_keys {
+                if let (Some(a), Some(b)) = (
+                    key_tuple(&existing, positions),
+                    key_tuple(new_row, positions),
+                ) && a.iter().zip(&b).all(|(x, y)| values_equal(x, y))
+                {
                     anyhow::bail!("Unique constraint violation on index '{}'", idx_name);
                 }
             }
@@ -163,4 +170,16 @@ impl MemExecutor {
         }
         Ok(())
     }
+}
+
+/// A row's values at `positions`, or `None` if any is NULL: a key containing
+/// NULL never equals another (NULLs are distinct).
+pub(crate) fn key_tuple(row: &[Value], positions: &[usize]) -> Option<Vec<Value>> {
+    positions
+        .iter()
+        .map(|&p| match row.get(p) {
+            None | Some(Value::Null) => None,
+            Some(v) => Some(v.clone()),
+        })
+        .collect()
 }

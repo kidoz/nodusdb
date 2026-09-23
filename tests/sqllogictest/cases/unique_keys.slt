@@ -1,0 +1,93 @@
+# Uniqueness applies to the whole key tuple, and a key-changing UPDATE never
+# overwrites another row. Expected results come from PostgreSQL 18.
+statement ok
+CREATE TABLE uk_pk (a INT, b INT, v TEXT, PRIMARY KEY (a, b));
+
+statement ok
+INSERT INTO uk_pk VALUES (1, 1, 'x'), (1, 2, 'y'), (2, 1, 'z');
+
+statement error
+INSERT INTO uk_pk VALUES (1, 2, 'dup');
+
+query TTT
+SELECT a, b, v FROM uk_pk ORDER BY a, b;
+----
+1	1	x
+1	2	y
+2	1	z
+
+statement ok
+CREATE TABLE uk_u (id INT PRIMARY KEY, b INT, c INT, UNIQUE (b, c));
+
+statement ok
+INSERT INTO uk_u VALUES (1, 1, 1), (2, 1, 2), (3, 2, 1), (4, NULL, 1), (5, NULL, 1);
+
+statement error
+INSERT INTO uk_u VALUES (6, 1, 2);
+
+query TTT
+SELECT id, b, c FROM uk_u ORDER BY id;
+----
+1	1	1
+2	1	2
+3	2	1
+4	NULL	1
+5	NULL	1
+
+# A key update that lands on an existing row fails and changes nothing.
+statement ok
+CREATE TABLE uk_s (id INT PRIMARY KEY, v TEXT);
+
+statement ok
+INSERT INTO uk_s VALUES (1, 'a'), (2, 'b');
+
+statement error
+UPDATE uk_s SET id = id + 1;
+
+query TT
+SELECT id, v FROM uk_s ORDER BY id;
+----
+1	a
+2	b
+
+statement ok
+UPDATE uk_s SET id = id + 10;
+
+query TT
+SELECT id, v FROM uk_s ORDER BY id;
+----
+11	a
+12	b
+
+statement error
+UPDATE uk_s SET id = 12 WHERE id = 11;
+
+query TT
+SELECT id, v FROM uk_s ORDER BY id;
+----
+11	a
+12	b
+
+statement ok
+CREATE TABLE uk_c (a INT UNIQUE, v TEXT);
+
+statement ok
+INSERT INTO uk_c VALUES (1, 'a'), (2, 'b');
+
+statement error
+UPDATE uk_c SET a = a + 1;
+
+query TT
+SELECT a, v FROM uk_c ORDER BY a;
+----
+1	a
+2	b
+
+statement ok
+UPDATE uk_c SET a = 5 WHERE a = 2;
+
+query TT
+SELECT a, v FROM uk_c ORDER BY a;
+----
+1	a
+5	b

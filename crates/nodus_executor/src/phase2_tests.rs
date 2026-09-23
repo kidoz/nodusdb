@@ -40,6 +40,7 @@ fn test_group_by_aggregates() {
     exec.execute_logical(
         &ctx,
         LogicalPlan::CreateTable {
+            unique_constraints: vec![],
             if_not_exists: false,
             constraints: vec![],
             name: "sales".into(),
@@ -256,6 +257,7 @@ fn test_set_operations() {
         exec.execute_logical(
             &ctx,
             LogicalPlan::CreateTable {
+                unique_constraints: vec![],
                 if_not_exists: false,
                 constraints: vec![],
                 name: t.into(),
@@ -345,6 +347,7 @@ fn test_cross_join() {
         exec.execute_logical(
             &ctx,
             LogicalPlan::CreateTable {
+                unique_constraints: vec![],
                 if_not_exists: false,
                 constraints: vec![],
                 name: t.into(),
@@ -403,6 +406,7 @@ fn test_having() {
     exec.execute_logical(
         &ctx,
         LogicalPlan::CreateTable {
+            unique_constraints: vec![],
             if_not_exists: false,
             constraints: vec![],
             name: "sales".into(),
@@ -487,6 +491,7 @@ fn test_window_functions() {
     exec.execute_logical(
         &ctx,
         LogicalPlan::CreateTable {
+            unique_constraints: vec![],
             if_not_exists: false,
             constraints: vec![],
             name: "emp".into(),
