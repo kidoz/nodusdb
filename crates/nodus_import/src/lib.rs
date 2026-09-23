@@ -421,7 +421,7 @@ fn emit_copy_block(
             return false;
         }
     };
-    let rows = match copy_decoder::decode_rows(body, spec.format) {
+    let rows = match copy_decoder::decode_rows(body, &spec) {
         Ok(rows) => rows,
         Err(e) => {
             skip(report, format!("undecodable COPY body: {e}"), header);

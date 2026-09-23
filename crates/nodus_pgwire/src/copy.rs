@@ -70,7 +70,7 @@ impl NodusCopyHandler {
             _ => {
                 // Wire COPY data is the row stream only (no psql `\.` terminator).
                 let body = String::from_utf8_lossy(&bytes);
-                nodus_import::decode_rows(&body, spec.format)?
+                nodus_import::decode_rows(&body, &spec)?
             }
         };
         let total = rows.len();

@@ -317,6 +317,34 @@ async fn copy_stream_api_round_trip() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn copy_in_honours_header_delimiter_and_null_options() {
+    // Unsupported options are rejected; see the nodus_import decoder tests.
+    with_client(async |client| {
+        client
+            .batch_execute("CREATE TABLE copy_opts (id INTEGER PRIMARY KEY, label TEXT)")
+            .await
+            .unwrap();
+        let sink = client
+            .copy_in("COPY copy_opts (id, label) FROM STDIN WITH (FORMAT csv, HEADER true, DELIMITER ';', NULL 'NA')")
+            .await
+            .unwrap();
+        tokio::pin!(sink);
+        sink.send(Bytes::from_static(b"id;label\n1;\"a;b\"\n2;NA\n3;\"\"\n"))
+            .await
+            .unwrap();
+        assert_eq!(sink.finish().await.unwrap(), 3);
+        let rows = client
+            .query("SELECT id, label FROM copy_opts ORDER BY id", &[])
+            .await
+            .unwrap();
+        let labels: Vec<Option<String>> = rows.iter().map(|r| r.get(1)).collect();
+        assert_eq!(labels, [Some("a;b".to_string()), None, Some(String::new())]);
+
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn inferred_bindings_execute_and_ignore_quoted_placeholders() {
     with_client(async |client| {
         client
@@ -511,7 +539,8 @@ async fn binary_and_csv_copy_out_preserve_nulls_and_empty_strings() {
         // CSV permits both quoted and unquoted ordinary values. Decode it
         // rather than requiring PostgreSQL and NodusDB to choose identical quoting.
         let text = String::from_utf8(output).unwrap();
-        let cells = nodus_import::decode_rows(&text, nodus_import::CopyFormat::Csv).unwrap();
+        let csv = nodus_import::CopySpec::new("exports", vec![], nodus_import::CopyFormat::Csv);
+        let cells = nodus_import::decode_rows(&text, &csv).unwrap();
         assert_eq!(cells.len(), 4);
         assert_eq!(cells[0], [nodus_import::Cell::Text("id".into()), nodus_import::Cell::Text("label".into())]);
         assert_eq!(cells[2][1], nodus_import::Cell::Text("".into()));

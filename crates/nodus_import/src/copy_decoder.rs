@@ -31,49 +31,80 @@ pub struct CopySpec {
     pub table: String,
     pub columns: Vec<String>,
     pub format: CopyFormat,
+    /// The first line (text) or record (CSV) is a header and is skipped.
+    pub header: bool,
+    /// Field separator: tab for text and comma for CSV unless overridden.
+    pub delimiter: char,
+    /// The unquoted field that denotes NULL: `\N` for text, empty for CSV.
+    pub null: String,
+    /// CSV quoting character (`"` unless overridden).
+    pub quote: char,
+    /// CSV escape character inside quotes (the quote character by default).
+    pub escape: char,
 }
 
-/// Parses a `COPY <table> [(col, ...)] FROM stdin [WITH] [(options)]` header.
-pub fn parse_copy_header(header: &str) -> Result<CopySpec> {
-    let trimmed = header.trim();
-    let rest = trimmed
-        .get(4..)
-        .filter(|_| trimmed.len() >= 4 && trimmed[..4].eq_ignore_ascii_case("COPY"))
-        .ok_or_else(|| anyhow::anyhow!("not a COPY statement: {header}"))?
-        .trim_start();
-
-    // Table name runs up to the column-list `(` or the FROM keyword.
-    let paren = rest.find('(');
-    let from = find_keyword(rest, "FROM");
-    let (table_part, after_table) = match (paren, from) {
-        (Some(p), Some(f)) if p < f => (&rest[..p], &rest[p..]),
-        (_, Some(f)) => (&rest[..f], &rest[f..]),
-        _ => bail!("COPY header missing FROM: {header}"),
-    };
-    let table = strip_identifier(table_part.trim());
-
-    let mut columns = Vec::new();
-    let mut tail = after_table;
-    if after_table.starts_with('(') {
-        let close = after_table
-            .find(')')
-            .ok_or_else(|| anyhow::anyhow!("unterminated COPY column list: {header}"))?;
-        columns = after_table[1..close]
-            .split(',')
-            .map(|c| strip_identifier(c.trim()))
-            .filter(|c| !c.is_empty())
-            .collect();
-        tail = &after_table[close + 1..];
+impl CopySpec {
+    /// The PostgreSQL defaults for `format`.
+    pub fn new(table: impl Into<String>, columns: Vec<String>, format: CopyFormat) -> Self {
+        let csv = format == CopyFormat::Csv;
+        Self {
+            table: table.into(),
+            columns,
+            format,
+            header: false,
+            delimiter: if csv { ',' } else { '\t' },
+            null: if csv {
+                String::new()
+            } else {
+                "\\N".to_string()
+            },
+            quote: '"',
+            escape: '"',
+        }
     }
+}
 
-    let upper = tail.to_ascii_uppercase();
-    let format = if upper.contains("BINARY") {
-        CopyFormat::Binary
-    } else if upper.contains("FORMAT CSV") || upper.contains("CSV") {
-        CopyFormat::Csv
-    } else {
-        CopyFormat::Text
+/// Parses a `COPY <table> [(col, ...)] FROM stdin [[WITH] (options)]` header.
+/// Supported options are honoured (`FORMAT`, `HEADER`, `DELIMITER`, `NULL`,
+/// `QUOTE`, `ESCAPE`, `ENCODING 'UTF8'`, `FREEZE`, and their legacy
+/// spellings); any other option is an error rather than silently ignored.
+pub fn parse_copy_header(header: &str) -> Result<CopySpec> {
+    use sqlparser::ast::{
+        CopyLegacyCsvOption, CopyLegacyOption, CopyOption, CopySource, CopyTarget, Statement,
     };
+    let statements = sqlparser::parser::Parser::parse_sql(
+        &sqlparser::dialect::PostgreSqlDialect {},
+        header.trim(),
+    )
+    .map_err(|e| anyhow::anyhow!("unparsable COPY header: {e}"))?;
+    let [
+        Statement::Copy {
+            source:
+                CopySource::Table {
+                    table_name,
+                    columns,
+                },
+            to: false,
+            target: CopyTarget::Stdin,
+            options,
+            legacy_options,
+            ..
+        },
+    ] = statements.as_slice()
+    else {
+        bail!("only COPY <table> FROM STDIN is supported: {header}");
+    };
+    let table = table_name
+        .0
+        .iter()
+        .map(|part| {
+            part.as_ident()
+                .map(|i| i.value.clone())
+                .unwrap_or_else(|| part.to_string())
+        })
+        .collect::<Vec<_>>()
+        .join(".");
+    let columns: Vec<String> = columns.iter().map(|c| c.value.clone()).collect();
 
     // The table and column names are interpolated into a synthesized INSERT
     // (and on the wire COPY path the header is client-controlled), so reject any
@@ -88,11 +119,73 @@ pub fn parse_copy_header(header: &str) -> Result<CopySpec> {
         }
     }
 
-    Ok(CopySpec {
-        table,
-        columns,
-        format,
-    })
+    // First the format (it decides the defaults), then the other options.
+    let mut format = CopyFormat::Text;
+    for option in options {
+        if let CopyOption::Format(name) = option {
+            format = match name.value.to_ascii_lowercase().as_str() {
+                "text" => CopyFormat::Text,
+                "csv" => CopyFormat::Csv,
+                "binary" => CopyFormat::Binary,
+                _ => bail!("unsupported COPY format: {name}"),
+            };
+        }
+    }
+    for option in legacy_options {
+        match option {
+            CopyLegacyOption::Binary => format = CopyFormat::Binary,
+            CopyLegacyOption::Csv(_) => format = CopyFormat::Csv,
+            _ => {}
+        }
+    }
+    let mut spec = CopySpec::new(table, columns, format);
+    let mut csv_only_option = false;
+    for option in options {
+        match option {
+            CopyOption::Format(_) | CopyOption::Freeze(_) => {}
+            CopyOption::Header(on) => spec.header = *on,
+            CopyOption::Delimiter(c) => spec.delimiter = *c,
+            CopyOption::Null(null) => spec.null = null.clone(),
+            CopyOption::Quote(c) => {
+                spec.quote = *c;
+                csv_only_option = true;
+            }
+            CopyOption::Escape(c) => {
+                spec.escape = *c;
+                csv_only_option = true;
+            }
+            CopyOption::Encoding(enc)
+                if enc.eq_ignore_ascii_case("utf8") || enc.eq_ignore_ascii_case("utf-8") => {}
+            other => bail!("unsupported COPY option: {other}"),
+        }
+    }
+    for option in legacy_options {
+        match option {
+            CopyLegacyOption::Binary => {}
+            CopyLegacyOption::Header => spec.header = true,
+            CopyLegacyOption::Delimiter(c) => spec.delimiter = *c,
+            CopyLegacyOption::Null(null) => spec.null = null.clone(),
+            CopyLegacyOption::Csv(csv) => {
+                for option in csv {
+                    match option {
+                        CopyLegacyCsvOption::Header => spec.header = true,
+                        CopyLegacyCsvOption::Quote(c) => spec.quote = *c,
+                        CopyLegacyCsvOption::Escape(c) => spec.escape = *c,
+                        other => bail!("unsupported COPY option: {other}"),
+                    }
+                }
+            }
+            other => bail!("unsupported COPY option: {other}"),
+        }
+    }
+    if format != CopyFormat::Csv && csv_only_option {
+        bail!("COPY QUOTE and ESCAPE are available only in CSV mode");
+    }
+    if format == CopyFormat::Binary && (spec.header || spec.delimiter != '\t' || spec.null != "\\N")
+    {
+        bail!("COPY HEADER, DELIMITER, and NULL are not available in BINARY mode");
+    }
+    Ok(spec)
 }
 
 /// A bare SQL identifier safe to interpolate unquoted: non-empty, ASCII
@@ -115,10 +208,10 @@ fn is_safe_qualified_name(name: &str) -> bool {
 /// Decodes a text/CSV COPY data body into rows of cells. Binary bodies are not
 /// self-describing (the wire carries no type tags), so they go through
 /// [`decode_binary_rows`] with the column types instead.
-pub fn decode_rows(body: &str, format: CopyFormat) -> Result<Vec<Vec<Cell>>> {
-    match format {
-        CopyFormat::Text => Ok(decode_text(body)),
-        CopyFormat::Csv => decode_csv(body),
+pub fn decode_rows(body: &str, spec: &CopySpec) -> Result<Vec<Vec<Cell>>> {
+    match spec.format {
+        CopyFormat::Text => Ok(decode_text(body, spec)),
+        CopyFormat::Csv => decode_csv(body, spec),
         CopyFormat::Binary => {
             bail!("binary COPY must be decoded via decode_binary_rows with column types")
         }
@@ -280,18 +373,17 @@ impl<'a> ByteReader<'a> {
     }
 }
 
-fn decode_text(body: &str) -> Vec<Vec<Cell>> {
+fn decode_text(body: &str, spec: &CopySpec) -> Vec<Vec<Cell>> {
     let mut rows = Vec::new();
-    for line in body.split('\n') {
-        // The body excludes the `\.` terminator; a trailing newline yields a
-        // final empty segment that is not a row.
-        if line.is_empty() {
-            continue;
-        }
+    // The body excludes the `\.` terminator; a trailing newline yields a
+    // final empty segment that is not a row.
+    let lines = body.split('\n').filter(|line| !line.is_empty());
+    for line in lines.skip(usize::from(spec.header)) {
         let line = line.strip_suffix('\r').unwrap_or(line);
         let mut row = Vec::new();
-        for field in line.split('\t') {
-            if field == "\\N" {
+        for field in line.split(spec.delimiter) {
+            // The NULL marker is matched before backslash processing.
+            if field == spec.null {
                 row.push(Cell::Null);
             } else {
                 row.push(Cell::Text(unescape_text(field)));
@@ -388,7 +480,16 @@ fn unescape_text(field: &str) -> String {
     out
 }
 
-fn decode_csv(body: &str) -> Result<Vec<Vec<Cell>>> {
+fn decode_csv(body: &str, spec: &CopySpec) -> Result<Vec<Vec<Cell>>> {
+    // An unquoted field equal to the NULL string (empty by default) is NULL; a
+    // quoted field never is (PostgreSQL's CSV NULL handling).
+    let cell = |value: String, quoted: bool| {
+        if !quoted && value == spec.null {
+            Cell::Null
+        } else {
+            Cell::Text(value)
+        }
+    };
     let mut rows = Vec::new();
     let mut chars = body.chars().peekable();
     let mut row: Vec<Cell> = Vec::new();
@@ -400,34 +501,32 @@ fn decode_csv(body: &str) -> Result<Vec<Vec<Cell>>> {
     while let Some(c) = chars.next() {
         started = true;
         if in_quotes {
-            if c == '"' {
-                if chars.peek() == Some(&'"') {
-                    field.push('"');
-                    chars.next();
-                } else {
-                    in_quotes = false;
-                }
+            // The escape character makes a following quote (or escape) literal;
+            // with the default escape this is the doubled-quote rule.
+            let escapes_next = chars.peek().is_some_and(|&next| {
+                next == spec.quote || (next == spec.escape && spec.escape != spec.quote)
+            });
+            if c == spec.escape && escapes_next {
+                field.extend(chars.next());
+            } else if c == spec.quote {
+                in_quotes = false;
             } else {
                 field.push(c);
             }
             continue;
         }
-        match c {
-            '"' => {
-                in_quotes = true;
-                field_quoted = true;
-            }
-            ',' => {
-                row.push(csv_cell(std::mem::take(&mut field), field_quoted));
-                field_quoted = false;
-            }
-            '\n' => {
-                row.push(csv_cell(std::mem::take(&mut field), field_quoted));
-                field_quoted = false;
-                rows.push(std::mem::take(&mut row));
-            }
-            '\r' => {}
-            _ => field.push(c),
+        if c == spec.quote {
+            in_quotes = true;
+            field_quoted = true;
+        } else if c == spec.delimiter {
+            row.push(cell(std::mem::take(&mut field), field_quoted));
+            field_quoted = false;
+        } else if c == '\n' {
+            row.push(cell(std::mem::take(&mut field), field_quoted));
+            field_quoted = false;
+            rows.push(std::mem::take(&mut row));
+        } else if c != '\r' {
+            field.push(c);
         }
     }
     if in_quotes {
@@ -435,48 +534,60 @@ fn decode_csv(body: &str) -> Result<Vec<Vec<Cell>>> {
     }
     // Flush a final row that did not end in a newline.
     if started && (!field.is_empty() || !row.is_empty() || field_quoted) {
-        row.push(csv_cell(field, field_quoted));
+        row.push(cell(field, field_quoted));
         rows.push(row);
     }
+    if spec.header && !rows.is_empty() {
+        rows.remove(0);
+    }
     Ok(rows)
-}
-
-/// In CSV, an unquoted empty field is NULL; a quoted empty field is the empty
-/// string (PostgreSQL's default CSV NULL handling).
-fn csv_cell(value: String, quoted: bool) -> Cell {
-    if !quoted && value.is_empty() {
-        Cell::Null
-    } else {
-        Cell::Text(value)
-    }
-}
-
-/// Finds a whole-word keyword (case-insensitive) and returns its byte offset.
-fn find_keyword(haystack: &str, keyword: &str) -> Option<usize> {
-    let upper = haystack.to_ascii_uppercase();
-    let mut from = 0;
-    while let Some(rel) = upper[from..].find(keyword) {
-        let idx = from + rel;
-        let before_ok = idx == 0 || !upper.as_bytes()[idx - 1].is_ascii_alphanumeric();
-        let after = idx + keyword.len();
-        let after_ok = after >= upper.len() || !upper.as_bytes()[after].is_ascii_alphanumeric();
-        if before_ok && after_ok {
-            return Some(idx);
-        }
-        from = idx + keyword.len();
-    }
-    None
-}
-
-/// Strips surrounding double-quotes and any schema qualifier from an
-/// identifier, returning the bare (optionally schema-qualified) name.
-fn strip_identifier(ident: &str) -> String {
-    ident.trim().trim_matches('"').to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn text_spec() -> CopySpec {
+        CopySpec::new("t", vec![], CopyFormat::Text)
+    }
+
+    fn csv_spec() -> CopySpec {
+        CopySpec::new("t", vec![], CopyFormat::Csv)
+    }
+
+    #[test]
+    fn honours_header_delimiter_null_and_quoting_options() {
+        let spec = parse_copy_header(
+            "COPY t (a, b) FROM STDIN WITH (FORMAT csv, HEADER true, DELIMITER ';', NULL 'NA', QUOTE '''', ESCAPE '\\')",
+        )
+        .unwrap();
+        assert!(spec.header);
+        let rows = decode_rows("a;b\n1;'x;\\'y'\nNA;''\n", &spec).unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                vec![Cell::Text("1".into()), Cell::Text("x;'y".into())],
+                vec![Cell::Null, Cell::Text(String::new())],
+            ]
+        );
+
+        let legacy = parse_copy_header("COPY t FROM STDIN DELIMITER '|' NULL 'x'").unwrap();
+        let rows = decode_rows("1|x\n", &legacy).unwrap();
+        assert_eq!(rows, vec![vec![Cell::Text("1".into()), Cell::Null]]);
+    }
+
+    #[test]
+    fn rejects_unsupported_options_instead_of_ignoring_them() {
+        for header in [
+            "COPY t FROM STDIN WITH (FORMAT csv, FORCE_NULL (a))",
+            "COPY t FROM STDIN WITH (ENCODING 'LATIN1')",
+            "COPY t FROM STDIN WITH (FORMAT text, QUOTE '\"')",
+            "COPY t FROM STDIN WITH (FORMAT csv, ON_ERROR ignore)",
+            "COPY t FROM '/etc/passwd'",
+        ] {
+            assert!(parse_copy_header(header).is_err(), "{header}");
+        }
+    }
 
     #[test]
     fn parses_header_with_columns() {
@@ -575,7 +686,7 @@ mod tests {
 
     #[test]
     fn decodes_text_rows_with_null_and_escapes() {
-        let rows = decode_rows("1\talpha\t\\N\n2\ta\\tb\\nc\t\\\\\n", CopyFormat::Text).unwrap();
+        let rows = decode_rows("1\talpha\t\\N\n2\ta\\tb\\nc\t\\\\\n", &text_spec()).unwrap();
         assert_eq!(
             rows,
             vec![
@@ -595,7 +706,7 @@ mod tests {
 
     #[test]
     fn decodes_octal_and_hex_escapes() {
-        let rows = decode_rows("\\101\t\\x42\n", CopyFormat::Text).unwrap();
+        let rows = decode_rows("\\101\t\\x42\n", &text_spec()).unwrap();
         assert_eq!(
             rows,
             vec![vec![Cell::Text("A".into()), Cell::Text("B".into())]]
@@ -604,7 +715,7 @@ mod tests {
 
     #[test]
     fn decodes_csv_rows_with_quotes_and_nulls() {
-        let rows = decode_rows("1,\"a,b\",\n2,\"\",x\n", CopyFormat::Csv).unwrap();
+        let rows = decode_rows("1,\"a,b\",\n2,\"\",x\n", &csv_spec()).unwrap();
         assert_eq!(
             rows,
             vec![
