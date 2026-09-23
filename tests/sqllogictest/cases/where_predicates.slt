@@ -1,0 +1,297 @@
+# WHERE/HAVING/CHECK conditions must be evaluated or rejected, never dropped:
+# a dropped condition widens a SELECT and makes UPDATE/DELETE hit every row.
+# Expected results come from PostgreSQL 18.
+statement ok
+CREATE TABLE wp (id INT PRIMARY KEY, name TEXT, dept TEXT, salary INT, tags TEXT[], doc JSONB);
+
+statement ok
+INSERT INTO wp VALUES (1, 'Ann', 'eng', 120, '{a,b}', '{"n": 5, "nested": {"deep": true}}'), (2, 'Bob', 'eng', 100, '{c}', '{"n": 15}'), (3, 'Cid', 'ops', 90, '{a}', '{"n": 1}'), (4, 'Dee', NULL, 95, '{}', '{}');
+
+# Pattern matching: LIKE escapes regex metacharacters, ILIKE, SIMILAR TO, POSIX regex.
+query T
+SELECT name FROM wp WHERE name ILIKE 'a%' ORDER BY id;
+----
+Ann
+
+query T
+SELECT name FROM wp WHERE name LIKE 'A_n' ORDER BY id;
+----
+Ann
+
+query T
+SELECT name FROM wp WHERE name LIKE 'A.n' ORDER BY id;
+----
+
+query T
+SELECT name FROM wp WHERE name || '%' LIKE 'Ann\%' ORDER BY id;
+----
+Ann
+
+query T
+SELECT name FROM wp WHERE name || '%' LIKE 'Ann!%' ESCAPE '!' ORDER BY id;
+----
+Ann
+
+query T
+SELECT name FROM wp WHERE dept NOT LIKE 'e%' ORDER BY id;
+----
+Cid
+
+query T
+SELECT name FROM wp WHERE name ~ '^[AB]' ORDER BY id;
+----
+Ann
+Bob
+
+query T
+SELECT name FROM wp WHERE name ~* '^c' OR name !~ 'e|a|o|y|i' ORDER BY id;
+----
+Ann
+Cid
+
+query T
+SELECT name FROM wp WHERE name SIMILAR TO '(A|B)%' ORDER BY id;
+----
+Ann
+Bob
+
+query T
+SELECT name FROM wp WHERE name NOT SIMILAR TO '_i_' ORDER BY id;
+----
+Ann
+Bob
+Dee
+
+query T
+SELECT name FROM wp WHERE name LIKE 'A%' OR name ILIKE 'b%' ORDER BY id;
+----
+Ann
+Bob
+
+query T
+SELECT name FROM wp WHERE NOT name ILIKE 'a%' ORDER BY id;
+----
+Bob
+Cid
+Dee
+
+# NULL-safe and boolean tests.
+query T
+SELECT name FROM wp WHERE dept IS DISTINCT FROM 'eng' ORDER BY id;
+----
+Cid
+Dee
+
+query T
+SELECT name FROM wp WHERE dept IS NOT DISTINCT FROM NULL ORDER BY id;
+----
+Dee
+
+query T
+SELECT name FROM wp WHERE (salary > 100) IS TRUE ORDER BY id;
+----
+Ann
+
+query T
+SELECT name FROM wp WHERE (dept = 'eng') IS UNKNOWN ORDER BY id;
+----
+Dee
+
+query T
+SELECT name FROM wp WHERE (dept = 'eng') IS NOT FALSE ORDER BY id;
+----
+Ann
+Bob
+Dee
+
+# Row values, IN lists of expressions, BETWEEN over expressions.
+query T
+SELECT name FROM wp WHERE (dept, salary) = ('eng', 100) ORDER BY id;
+----
+Bob
+
+query T
+SELECT name FROM wp WHERE (dept, salary) IN (('eng', 100), ('ops', 90)) ORDER BY id;
+----
+Bob
+Cid
+
+query T
+SELECT name FROM wp WHERE (id, salary) > (2, 0) ORDER BY id;
+----
+Bob
+Cid
+Dee
+
+query T
+SELECT name FROM wp WHERE salary + 0 IN (90, 95) ORDER BY id;
+----
+Cid
+Dee
+
+query T
+SELECT name FROM wp WHERE salary BETWEEN 90 + 5 AND 100 ORDER BY id;
+----
+Bob
+Dee
+
+query T
+SELECT name FROM wp WHERE salary NOT BETWEEN 91 AND 119 ORDER BY id;
+----
+Ann
+Cid
+
+# ANY/ALL over arrays and subqueries.
+query T
+SELECT name FROM wp WHERE salary > ANY (ARRAY[95, 110]) ORDER BY id;
+----
+Ann
+Bob
+
+query T
+SELECT name FROM wp WHERE id = ANY ('{1,2}'::int[]) ORDER BY id;
+----
+Ann
+Bob
+
+query T
+SELECT name FROM wp WHERE 'a' = ANY (tags) ORDER BY id;
+----
+Ann
+Cid
+
+query T
+SELECT name FROM wp WHERE salary >= ALL (SELECT salary FROM wp) ORDER BY id;
+----
+Ann
+
+query T
+SELECT name FROM wp WHERE id <> ALL (SELECT id FROM wp WHERE dept = 'eng') ORDER BY id;
+----
+Cid
+Dee
+
+query T
+SELECT name FROM wp WHERE id + 0 = ANY (SELECT id FROM wp WHERE salary > 100) ORDER BY id;
+----
+Ann
+
+query T
+SELECT name FROM wp w WHERE salary >= ALL (SELECT salary FROM wp x WHERE x.dept = w.dept) ORDER BY id;
+----
+Ann
+Cid
+Dee
+
+# JSON access and existence.
+query T
+SELECT name FROM wp WHERE doc ? 'nested' ORDER BY id;
+----
+Ann
+
+query T
+SELECT name FROM wp WHERE (doc->>'n')::int > 10 ORDER BY id;
+----
+Bob
+
+query T
+SELECT name FROM wp WHERE doc->'nested'->>'deep' = 'true' ORDER BY id;
+----
+Ann
+
+query T
+SELECT name FROM wp WHERE doc @> '{"n": 15}' ORDER BY id;
+----
+Bob
+
+query TT
+SELECT id, doc->'nested'->>'deep' FROM wp ORDER BY id;
+----
+1	true
+2	NULL
+3	NULL
+4	NULL
+
+# UPDATE and DELETE affect only the matching rows.
+statement ok
+CREATE TABLE wd (id INT PRIMARY KEY, name TEXT);
+
+statement ok
+INSERT INTO wd VALUES (1, 'Ann'), (2, 'Bob'), (3, 'Cid');
+
+statement ok
+DELETE FROM wd WHERE name ILIKE 'a%';
+
+statement ok
+UPDATE wd SET name = 'X' WHERE name ~ '^B';
+
+query TT
+SELECT id, name FROM wd ORDER BY id;
+----
+2	X
+3	Cid
+
+# Conditions that cannot be evaluated are errors, and change nothing.
+statement error
+DELETE FROM wd WHERE no_such_function(name);
+
+statement error
+SELECT id FROM wd WHERE to_tsvector('english', name) @@ to_tsquery('english', 'x');
+
+query T
+SELECT count(*) FROM wd;
+----
+2
+
+# HAVING over group keys and aggregates.
+query TT
+SELECT dept, count(*) FROM wp GROUP BY dept HAVING dept IN ('eng', 'ops') ORDER BY dept;
+----
+eng	2
+ops	1
+
+query TT
+SELECT dept, count(*) FROM wp GROUP BY dept HAVING count(*) > 1 ORDER BY dept;
+----
+eng	2
+
+query TT
+SELECT dept, sum(salary) FROM wp GROUP BY dept HAVING dept LIKE 'o%' AND sum(salary) < 100 ORDER BY dept;
+----
+ops	90
+
+# CHECK passes on NULL (unknown), fails only when false.
+statement ok
+CREATE TABLE wc (a INT CHECK (a > 0), b TEXT CHECK (b LIKE 'x%'));
+
+statement ok
+INSERT INTO wc VALUES (NULL, NULL), (1, 'xy');
+
+statement error
+INSERT INTO wc VALUES (0, 'xy');
+
+statement error
+INSERT INTO wc VALUES (1, 'yy');
+
+query T
+SELECT count(*) FROM wc;
+----
+2
+
+# Array text into an array column is a typed array.
+statement ok
+CREATE TABLE wa (id INT PRIMARY KEY, nums INT[]);
+
+statement ok
+INSERT INTO wa VALUES (1, '{1,2,3}'), (2, '{4}');
+
+query TT
+SELECT id, nums FROM wa ORDER BY id;
+----
+1	{1,2,3}
+2	{4}
+
+query T
+SELECT id FROM wa WHERE 2 = ANY (nums) ORDER BY id;
+----
+1

@@ -84,7 +84,8 @@ pub(crate) fn extract_col_name(expr: &sqlparser::ast::Expr) -> Option<String> {
                 .collect::<Vec<_>>()
                 .join("."),
         ),
-        // PostgreSQL JSON access (`->`/`->>`/`#>`/`#>>`) parses as a binary op.
+        // PostgreSQL JSON access (`->`/`->>`/`#>`/`#>>`) on a column parses as a
+        // binary op. Nested access is left to the scalar evaluator.
         Expr::BinaryOp { left, op, right }
             if matches!(
                 op,
@@ -92,7 +93,7 @@ pub(crate) fn extract_col_name(expr: &sqlparser::ast::Expr) -> Option<String> {
                     | sqlparser::ast::BinaryOperator::LongArrow
                     | sqlparser::ast::BinaryOperator::HashArrow
                     | sqlparser::ast::BinaryOperator::HashLongArrow
-            ) =>
+            ) && matches!(&**left, Expr::Identifier(_) | Expr::CompoundIdentifier(_)) =>
         {
             let left_col = extract_col_name(left)?;
             let right_val = match &**right {
@@ -210,7 +211,7 @@ pub(crate) fn parse_case(
                 right: extract_operand(cond, params)?,
             },
             // Searched CASE: `cond` is a single-comparison predicate.
-            None => match parse_filter_expr(cond, params)? {
+            None => match parse_filter_expr(cond, params).ok()? {
                 FilterExpr::Predicate(p) => p,
                 _ => return None,
             },
@@ -429,6 +430,21 @@ pub(crate) fn cast_value(v: Value, data_type: &str) -> Value {
     if matches!(v, Value::Null) {
         return Value::Null;
     }
+    if let Some(element_type) = crate::value::array_element_type(data_type) {
+        return match v {
+            Value::Array(items) => Value::Array(
+                items
+                    .into_iter()
+                    .map(|item| match item {
+                        Value::Array(_) => cast_value(item, data_type),
+                        item => cast_value(item, element_type),
+                    })
+                    .collect(),
+            ),
+            Value::Text(s) => crate::value::coerce_array_text(&s, data_type).unwrap_or(Value::Null),
+            _ => Value::Null,
+        };
+    }
     match crate::value::column_type(data_type) {
         // PostgreSQL rounds half-to-even when casting to an integer.
         ColumnType::Int => match &v {
@@ -542,27 +558,135 @@ fn fold_function(func: &sqlparser::ast::Function, params: &[Value]) -> Option<Va
 /// The scalar functions `eval_scalar_function` evaluates. Kept in sync with it
 /// so unknown names fall through to the legacy niladic-function path.
 fn is_foldable_scalar_fn(name: &str) -> bool {
-    matches!(
-        name,
-        "CONCAT"
-            | "UPPER"
-            | "LOWER"
-            | "LENGTH"
-            | "CHAR_LENGTH"
-            | "CHARACTER_LENGTH"
-            | "TRIM"
-            | "LTRIM"
-            | "RTRIM"
-            | "COALESCE"
-            | "NULLIF"
-            | "ABS"
-            | "ROUND"
-            | "REPLACE"
-            | "SUBSTR"
-            | "SUBSTRING"
-            | "DATE_TRUNC"
-            | "AGE"
-    )
+    crate::value::is_visibility_fn(name)
+        || matches!(
+            name,
+            "CONCAT"
+                | "UPPER"
+                | "LOWER"
+                | "LENGTH"
+                | "CHAR_LENGTH"
+                | "CHARACTER_LENGTH"
+                | "TRIM"
+                | "LTRIM"
+                | "RTRIM"
+                | "COALESCE"
+                | "NULLIF"
+                | "ABS"
+                | "ROUND"
+                | "REPLACE"
+                | "SUBSTR"
+                | "SUBSTRING"
+                | "DATE_TRUNC"
+                | "AGE"
+        )
+}
+
+/// Maps a SQL binary operator to the scalar evaluator's operator, including the
+/// schema-qualified `OPERATOR(pg_catalog.=)` spelling; `None` if unsupported.
+fn scalar_binary_op(op: &sqlparser::ast::BinaryOperator) -> Option<ScalarBinaryOp> {
+    use sqlparser::ast::BinaryOperator as B;
+    Some(match op {
+        B::Plus => ScalarBinaryOp::Add,
+        B::Minus => ScalarBinaryOp::Sub,
+        B::Multiply => ScalarBinaryOp::Mul,
+        B::Divide => ScalarBinaryOp::Div,
+        B::Modulo => ScalarBinaryOp::Mod,
+        B::Eq => ScalarBinaryOp::Eq,
+        B::NotEq => ScalarBinaryOp::NotEq,
+        B::Lt => ScalarBinaryOp::Lt,
+        B::LtEq => ScalarBinaryOp::LtEq,
+        B::Gt => ScalarBinaryOp::Gt,
+        B::GtEq => ScalarBinaryOp::GtEq,
+        B::And => ScalarBinaryOp::And,
+        B::Or => ScalarBinaryOp::Or,
+        B::StringConcat => ScalarBinaryOp::Concat,
+        B::Arrow => ScalarBinaryOp::JsonGet,
+        B::LongArrow => ScalarBinaryOp::JsonGetText,
+        B::HashArrow => ScalarBinaryOp::JsonPath,
+        B::HashLongArrow => ScalarBinaryOp::JsonPathText,
+        B::Question => ScalarBinaryOp::JsonHasKey,
+        B::QuestionPipe => ScalarBinaryOp::JsonHasAnyKey,
+        B::QuestionAnd => ScalarBinaryOp::JsonHasAllKeys,
+        B::AtArrow => ScalarBinaryOp::Contains,
+        B::ArrowAt => ScalarBinaryOp::ContainedBy,
+        B::PGOverlap => ScalarBinaryOp::Overlap,
+        B::PGCustomBinaryOperator(parts) => match parts.last().map(String::as_str) {
+            Some("=") => ScalarBinaryOp::Eq,
+            Some("<>") => ScalarBinaryOp::NotEq,
+            Some("<") => ScalarBinaryOp::Lt,
+            Some("<=") => ScalarBinaryOp::LtEq,
+            Some(">") => ScalarBinaryOp::Gt,
+            Some(">=") => ScalarBinaryOp::GtEq,
+            _ => return None,
+        },
+        B::Custom(s) if s == "@>" => ScalarBinaryOp::Contains,
+        B::Custom(s) if s == "<@" => ScalarBinaryOp::ContainedBy,
+        _ => return None,
+    })
+}
+
+/// Recognizes the pattern-matching operators: POSIX regex (`~`, `~*`, `!~`,
+/// `!~*`) and LIKE (`~~`, `~~*`, `!~~`, `!~~*`), bare or schema-qualified.
+/// Returns `(kind, case_insensitive, negated)`.
+fn pattern_operator(op: &sqlparser::ast::BinaryOperator) -> Option<(PatternKind, bool, bool)> {
+    use sqlparser::ast::BinaryOperator as B;
+    let symbol = match op {
+        B::PGRegexMatch => "~",
+        B::PGRegexIMatch => "~*",
+        B::PGRegexNotMatch => "!~",
+        B::PGRegexNotIMatch => "!~*",
+        B::PGLikeMatch => "~~",
+        B::PGILikeMatch => "~~*",
+        B::PGNotLikeMatch => "!~~",
+        B::PGNotILikeMatch => "!~~*",
+        B::PGCustomBinaryOperator(parts) => parts.last()?.as_str(),
+        _ => return None,
+    };
+    Some(match symbol {
+        "~" => (PatternKind::Regex, false, false),
+        "~*" => (PatternKind::Regex, true, false),
+        "!~" => (PatternKind::Regex, false, true),
+        "!~*" => (PatternKind::Regex, true, true),
+        "~~" => (PatternKind::Like, false, false),
+        "~~*" => (PatternKind::Like, true, false),
+        "!~~" => (PatternKind::Like, false, true),
+        "!~~*" => (PatternKind::Like, true, true),
+        _ => return None,
+    })
+}
+
+/// Lowers `expr [NOT] LIKE|ILIKE|SIMILAR TO pattern [ESCAPE e]`. The escape
+/// defaults to backslash; `ESCAPE ''` disables it.
+fn lower_pattern(
+    expr: &sqlparser::ast::Expr,
+    pattern: &sqlparser::ast::Expr,
+    escape: Option<&sqlparser::ast::Expr>,
+    (kind, case_insensitive, negated): (PatternKind, bool, bool),
+    params: &[Value],
+) -> Option<ScalarExpr> {
+    let escape = match escape {
+        None => Some('\\'),
+        Some(e) => match expr_to_value(e, params)? {
+            Value::Text(t) => {
+                let mut chars = t.chars();
+                match (chars.next(), chars.next()) {
+                    (None, _) => None,
+                    (Some(c), None) => Some(c),
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        },
+    };
+    Some(ScalarExpr::PatternMatch {
+        expr: Box::new(lower_scalar(expr, params)?),
+        pattern: Box::new(lower_scalar(pattern, params)?),
+        kind,
+        case_insensitive,
+        negated,
+        escape,
+    })
 }
 
 /// Lowers a SQL scalar expression into a serializable [`ScalarExpr`] for
@@ -571,6 +695,11 @@ fn is_foldable_scalar_fn(name: &str) -> bool {
 pub(crate) fn lower_scalar(expr: &sqlparser::ast::Expr, params: &[Value]) -> Option<ScalarExpr> {
     use sqlparser::ast::{BinaryOperator as B, Expr, UnaryOperator as U};
     match expr {
+        // A placeholder is unbound while a statement is planned for Describe,
+        // which only needs the plan's shape; Execute binds the real value.
+        Expr::Value(v) if matches!(v.value, sqlparser::ast::Value::Placeholder(_)) => Some(
+            ScalarExpr::Literal(expr_to_value(expr, params).unwrap_or(Value::Null)),
+        ),
         Expr::Value(_) | Expr::Array(_) | Expr::TypedString(_) | Expr::Interval(_) => {
             expr_to_value(expr, params).map(ScalarExpr::Literal)
         }
@@ -625,24 +754,18 @@ pub(crate) fn lower_scalar(expr: &sqlparser::ast::Expr, params: &[Value]) -> Opt
                     });
                 }
             }
-            let op = match op {
-                B::Plus => ScalarBinaryOp::Add,
-                B::Minus => ScalarBinaryOp::Sub,
-                B::Multiply => ScalarBinaryOp::Mul,
-                B::Divide => ScalarBinaryOp::Div,
-                B::Modulo => ScalarBinaryOp::Mod,
-                B::Eq => ScalarBinaryOp::Eq,
-                B::NotEq => ScalarBinaryOp::NotEq,
-                B::Lt => ScalarBinaryOp::Lt,
-                B::LtEq => ScalarBinaryOp::LtEq,
-                B::Gt => ScalarBinaryOp::Gt,
-                B::GtEq => ScalarBinaryOp::GtEq,
-                B::And => ScalarBinaryOp::And,
-                B::Or => ScalarBinaryOp::Or,
-                B::StringConcat => ScalarBinaryOp::Concat,
-                // JSON arrows and everything else stay on their existing paths.
-                _ => return None,
-            };
+            if let Some((kind, case_insensitive, negated)) = pattern_operator(op) {
+                return Some(ScalarExpr::PatternMatch {
+                    expr: Box::new(lower_scalar(left, params)?),
+                    pattern: Box::new(lower_scalar(right, params)?),
+                    kind,
+                    case_insensitive,
+                    negated,
+                    // `~~` (LIKE) uses LIKE's default backslash escape.
+                    escape: (kind == PatternKind::Like).then_some('\\'),
+                });
+            }
+            let op = scalar_binary_op(op)?;
             Some(ScalarExpr::Binary {
                 op,
                 left: Box::new(lower_scalar(left, params)?),
@@ -692,9 +815,173 @@ pub(crate) fn lower_scalar(expr: &sqlparser::ast::Expr, params: &[Value]) -> Opt
                 else_result,
             })
         }
+        Expr::Collate { expr: inner, .. } => lower_scalar(inner, params),
+        Expr::Like {
+            negated,
+            any: false,
+            expr: inner,
+            pattern,
+            escape_char,
+        } => lower_pattern(
+            inner,
+            pattern,
+            escape_char.as_deref(),
+            (PatternKind::Like, false, *negated),
+            params,
+        ),
+        Expr::ILike {
+            negated,
+            any: false,
+            expr: inner,
+            pattern,
+            escape_char,
+        } => lower_pattern(
+            inner,
+            pattern,
+            escape_char.as_deref(),
+            (PatternKind::Like, true, *negated),
+            params,
+        ),
+        Expr::SimilarTo {
+            negated,
+            expr: inner,
+            pattern,
+            escape_char,
+        } => lower_pattern(
+            inner,
+            pattern,
+            escape_char.as_deref(),
+            (PatternKind::SimilarTo, false, *negated),
+            params,
+        ),
+        Expr::IsDistinctFrom(l, r) | Expr::IsNotDistinctFrom(l, r) => {
+            Some(ScalarExpr::IsDistinctFrom {
+                left: Box::new(lower_scalar(l, params)?),
+                right: Box::new(lower_scalar(r, params)?),
+                negated: matches!(expr, Expr::IsNotDistinctFrom(..)),
+            })
+        }
+        Expr::IsTrue(inner)
+        | Expr::IsNotTrue(inner)
+        | Expr::IsFalse(inner)
+        | Expr::IsNotFalse(inner)
+        | Expr::IsUnknown(inner)
+        | Expr::IsNotUnknown(inner) => {
+            let (value, negated) = match expr {
+                Expr::IsTrue(_) => (Some(true), false),
+                Expr::IsNotTrue(_) => (Some(true), true),
+                Expr::IsFalse(_) => (Some(false), false),
+                Expr::IsNotFalse(_) => (Some(false), true),
+                Expr::IsUnknown(_) => (None, false),
+                _ => (None, true),
+            };
+            Some(ScalarExpr::IsBool {
+                expr: Box::new(lower_scalar(inner, params)?),
+                value,
+                negated,
+            })
+        }
+        Expr::InList {
+            expr: inner,
+            list,
+            negated,
+        } => Some(ScalarExpr::InList {
+            expr: Box::new(lower_scalar(inner, params)?),
+            list: list
+                .iter()
+                .map(|e| lower_scalar(e, params))
+                .collect::<Option<_>>()?,
+            negated: *negated,
+        }),
+        // `x BETWEEN a AND b` is `x >= a AND x <= b`; NOT BETWEEN is `x < a OR x > b`.
+        Expr::Between {
+            expr: inner,
+            negated,
+            low,
+            high,
+        } => {
+            let x = lower_scalar(inner, params)?;
+            let (lo_op, hi_op, join) = if *negated {
+                (ScalarBinaryOp::Lt, ScalarBinaryOp::Gt, ScalarBinaryOp::Or)
+            } else {
+                (
+                    ScalarBinaryOp::GtEq,
+                    ScalarBinaryOp::LtEq,
+                    ScalarBinaryOp::And,
+                )
+            };
+            let bound = |op, e: &Expr| {
+                Some(ScalarExpr::Binary {
+                    op,
+                    left: Box::new(x.clone()),
+                    right: Box::new(lower_scalar(e, params)?),
+                })
+            };
+            Some(ScalarExpr::Binary {
+                op: join,
+                left: Box::new(bound(lo_op, low)?),
+                right: Box::new(bound(hi_op, high)?),
+            })
+        }
+        // `x <op> ANY|ALL (array)`; the subquery forms are filters, not scalars.
+        Expr::AnyOp {
+            left,
+            compare_op,
+            right,
+            ..
+        }
+        | Expr::AllOp {
+            left,
+            compare_op,
+            right,
+        } if !matches!(&**right, Expr::Subquery(_)) => {
+            let op = scalar_binary_op(compare_op)?;
+            if !matches!(
+                op,
+                ScalarBinaryOp::Eq
+                    | ScalarBinaryOp::NotEq
+                    | ScalarBinaryOp::Lt
+                    | ScalarBinaryOp::LtEq
+                    | ScalarBinaryOp::Gt
+                    | ScalarBinaryOp::GtEq
+            ) {
+                return None;
+            }
+            Some(ScalarExpr::Quantified {
+                left: Box::new(lower_scalar(left, params)?),
+                op,
+                right: Box::new(lower_scalar(right, params)?),
+                all: matches!(expr, Expr::AllOp { .. }),
+            })
+        }
+        Expr::Tuple(items) => Some(ScalarExpr::Row(
+            items
+                .iter()
+                .map(|e| lower_scalar(e, params))
+                .collect::<Option<_>>()?,
+        )),
         Expr::Function(func) => {
             use sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArguments};
             let name = func.name.to_string().to_uppercase();
+            // Built-ins may be schema-qualified (`pg_catalog.lower(x)`).
+            let name = name
+                .strip_prefix("PG_CATALOG.")
+                .map_or(name.clone(), str::to_string);
+            // `ROW(a, b, ...)` is a row constructor, like a bare `(a, b, ...)`.
+            if name == "ROW"
+                && let FunctionArguments::List(list) = &func.args
+            {
+                let mut items = Vec::with_capacity(list.args.len());
+                for a in &list.args {
+                    match a {
+                        FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => {
+                            items.push(lower_scalar(e, params)?)
+                        }
+                        _ => return None,
+                    }
+                }
+                return Some(ScalarExpr::Row(items));
+            }
             // An aggregate nested in an expression, e.g. `sum(a) + 1`.
             if let Some(op) = aggregate_op(&name) {
                 let FunctionArguments::List(list) = &func.args else {
@@ -806,80 +1093,85 @@ pub(crate) fn lower_scalar(expr: &sqlparser::ast::Expr, params: &[Value]) -> Opt
     }
 }
 
+/// Resolves the leaves of a [`ScalarExpr`] whose value depends on where it is
+/// evaluated: column references and aggregate calls.
+pub(crate) trait ScalarScope {
+    fn column(&self, name: &str) -> Value;
+    /// An aggregate over the scope's rows; a single row has none, so NULL.
+    fn aggregate(&self, _expr: &ScalarExpr) -> Value {
+        Value::Null
+    }
+}
+
+/// One row, with column values in `col_names` order.
+struct RowScope<'a> {
+    row: &'a [Value],
+    col_names: &'a [String],
+}
+
+impl ScalarScope for RowScope<'_> {
+    fn column(&self, name: &str) -> Value {
+        let direct = crate::filter_eval::col_pos(self.col_names, name)
+            .and_then(|i| self.row.get(i))
+            .cloned();
+        match direct {
+            Some(v) => v,
+            // A JSON access (`col->>'k'` / `col->'k'`) encoded as a
+            // synthetic column name: compute it per row.
+            None => match crate::filter_eval::parse_json_ref(name) {
+                Some((base, op, key)) => self
+                    .col_names
+                    .iter()
+                    .position(|c| c == &base || c.ends_with(&format!(".{base}")))
+                    .and_then(|i| self.row.get(i))
+                    .map(|v| crate::filter_eval::json_extract(v, &op, &key))
+                    .unwrap_or(Value::Null),
+                None => Value::Null,
+            },
+        }
+    }
+}
+
 /// Evaluates a [`ScalarExpr`] against one row (column values in `col_names`
 /// order). Unresolvable columns and type-invalid operations yield `Null`.
 pub(crate) fn eval_scalar_expr(expr: &ScalarExpr, row: &[Value], col_names: &[String]) -> Value {
+    eval_scalar_in(expr, &RowScope { row, col_names })
+}
+
+/// Evaluates a [`ScalarExpr`] with SQL NULL propagation and three-valued logic,
+/// resolving columns and aggregates through `scope`.
+pub(crate) fn eval_scalar_in(expr: &ScalarExpr, scope: &dyn ScalarScope) -> Value {
+    let eval = |e: &ScalarExpr| eval_scalar_in(e, scope);
     match expr {
         ScalarExpr::Literal(v) => v.clone(),
-        ScalarExpr::Column(name) => {
-            let direct = col_names
-                .iter()
-                .position(|c| c == name || c.ends_with(&format!(".{name}")))
-                .and_then(|i| row.get(i))
-                .cloned();
-            match direct {
-                Some(v) => v,
-                // A JSON access (`col->>'k'` / `col->'k'`) encoded as a
-                // synthetic column name: compute it per row.
-                None => match crate::filter_eval::parse_json_ref(name) {
-                    Some((base, op, key)) => col_names
-                        .iter()
-                        .position(|c| c == &base || c.ends_with(&format!(".{base}")))
-                        .and_then(|i| row.get(i))
-                        .map(|v| crate::filter_eval::json_extract(v, &op, &key))
-                        .unwrap_or(Value::Null),
-                    None => Value::Null,
-                },
-            }
-        }
-        ScalarExpr::Unary { op, expr } => {
-            apply_unary_op(*op, eval_scalar_expr(expr, row, col_names))
-        }
-        ScalarExpr::Binary { op, left, right } => apply_binary_op(
-            *op,
-            eval_scalar_expr(left, row, col_names),
-            eval_scalar_expr(right, row, col_names),
-        ),
-        ScalarExpr::Cast { expr, target } => {
-            cast_value(eval_scalar_expr(expr, row, col_names), target)
-        }
+        ScalarExpr::Column(name) => scope.column(name),
+        ScalarExpr::Aggregate { .. } => scope.aggregate(expr),
+        ScalarExpr::Unary { op, expr } => apply_unary_op(*op, eval(expr)),
+        ScalarExpr::Binary { op, left, right } => eval_comparison(*op, left, right, scope),
+        ScalarExpr::Cast { expr, target } => cast_value(eval(expr), target),
         ScalarExpr::Function { name, args } => {
-            let vals: Vec<Value> = args
-                .iter()
-                .map(|a| eval_scalar_expr(a, row, col_names))
-                .collect();
+            let vals: Vec<Value> = args.iter().map(eval).collect();
             eval_scalar_function(name, &vals)
         }
         ScalarExpr::IsNull { expr, negated } => {
-            let is_null = matches!(eval_scalar_expr(expr, row, col_names), Value::Null);
+            let is_null = matches!(eval(expr), Value::Null);
             Value::Bool(if *negated { !is_null } else { is_null })
         }
-        ScalarExpr::Extract { field, expr } => {
-            extract_datetime_field(&eval_scalar_expr(expr, row, col_names), field)
-        }
-        // Aggregates are only meaningful over a group; per-row eval yields NULL.
-        ScalarExpr::Aggregate { .. } => Value::Null,
+        ScalarExpr::Extract { field, expr } => extract_datetime_field(&eval(expr), field),
         ScalarExpr::DateOffset {
             base,
             months,
             days,
             seconds,
-        } => apply_date_offset(
-            &eval_scalar_expr(base, row, col_names),
-            *months,
-            *days,
-            *seconds,
-        ),
+        } => apply_date_offset(&eval(base), *months, *days, *seconds),
         ScalarExpr::Case {
             operand,
             branches,
             else_result,
         } => {
-            let op_val = operand
-                .as_ref()
-                .map(|o| eval_scalar_expr(o, row, col_names));
+            let op_val = operand.as_ref().map(|o| eval(o));
             for (cond, result) in branches {
-                let cond_val = eval_scalar_expr(cond, row, col_names);
+                let cond_val = eval(cond);
                 let hit = match &op_val {
                     // Simple CASE: operand = condition value (NULL never matches).
                     Some(ov) => ov != &Value::Null && crate::values_equal(ov, &cond_val),
@@ -887,15 +1179,309 @@ pub(crate) fn eval_scalar_expr(expr: &ScalarExpr, row: &[Value], col_names: &[St
                     None => cond_val == Value::Bool(true),
                 };
                 if hit {
-                    return eval_scalar_expr(result, row, col_names);
+                    return eval(result);
                 }
             }
             match else_result {
-                Some(e) => eval_scalar_expr(e, row, col_names),
+                Some(e) => eval(e),
                 None => Value::Null,
             }
         }
+        ScalarExpr::PatternMatch {
+            expr,
+            pattern,
+            kind,
+            case_insensitive,
+            negated,
+            escape,
+        } => pattern_match(
+            &eval(expr),
+            &eval(pattern),
+            *kind,
+            *case_insensitive,
+            *escape,
+        )
+        .map_or(Value::Null, |hit| Value::Bool(hit != *negated)),
+        ScalarExpr::IsDistinctFrom {
+            left,
+            right,
+            negated,
+        } => {
+            let distinct = match eval_comparison(ScalarBinaryOp::NotEq, left, right, scope) {
+                Value::Bool(b) => b,
+                // NULL vs NULL is not distinct; NULL vs a value is.
+                _ => !(matches!(eval(left), Value::Null) && matches!(eval(right), Value::Null)),
+            };
+            Value::Bool(distinct != *negated)
+        }
+        ScalarExpr::IsBool {
+            expr,
+            value,
+            negated,
+        } => {
+            let v = eval(expr);
+            let hit = match value {
+                Some(b) => v == Value::Bool(*b),
+                None => v == Value::Null,
+            };
+            Value::Bool(hit != *negated)
+        }
+        ScalarExpr::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            // True on any match; otherwise NULL if any comparison was unknown.
+            let mut unknown = false;
+            let mut found = false;
+            for item in list {
+                match eval_comparison(ScalarBinaryOp::Eq, expr, item, scope) {
+                    Value::Bool(true) => {
+                        found = true;
+                        break;
+                    }
+                    Value::Bool(false) => {}
+                    _ => unknown = true,
+                }
+            }
+            let result = if found {
+                Value::Bool(true)
+            } else if unknown {
+                Value::Null
+            } else {
+                Value::Bool(false)
+            };
+            if *negated {
+                apply_unary_op(ScalarUnaryOp::Not, result)
+            } else {
+                result
+            }
+        }
+        ScalarExpr::Quantified {
+            left,
+            op,
+            right,
+            all,
+        } => quantified_compare(*op, eval(left), eval(right), *all),
+        ScalarExpr::Row(items) => {
+            let rendered: Vec<String> = items.iter().map(|e| render(&eval(e))).collect();
+            Value::Text(format!("({})", rendered.join(",")))
+        }
     }
+}
+
+/// Applies a binary operator, comparing row constructors element-wise.
+fn eval_comparison(
+    op: ScalarBinaryOp,
+    left: &ScalarExpr,
+    right: &ScalarExpr,
+    scope: &dyn ScalarScope,
+) -> Value {
+    if let (ScalarExpr::Row(l), ScalarExpr::Row(r)) = (left, right)
+        && is_comparison(op)
+    {
+        return compare_rows(op, l, r, scope);
+    }
+    apply_binary_op(
+        op,
+        eval_scalar_in(left, scope),
+        eval_scalar_in(right, scope),
+    )
+}
+
+fn is_comparison(op: ScalarBinaryOp) -> bool {
+    use ScalarBinaryOp as Op;
+    matches!(
+        op,
+        Op::Eq | Op::NotEq | Op::Lt | Op::LtEq | Op::Gt | Op::GtEq
+    )
+}
+
+/// PostgreSQL row comparison: `=`/`<>` hold only if every pair decides it, and
+/// ordering is decided by the first unequal pair; a NULL on the way is unknown.
+fn compare_rows(
+    op: ScalarBinaryOp,
+    left: &[ScalarExpr],
+    right: &[ScalarExpr],
+    scope: &dyn ScalarScope,
+) -> Value {
+    use ScalarBinaryOp as Op;
+    if left.len() != right.len() {
+        return Value::Null;
+    }
+    if matches!(op, Op::Eq | Op::NotEq) {
+        let mut unknown = false;
+        for (l, r) in left.iter().zip(right) {
+            match eval_comparison(Op::Eq, l, r, scope) {
+                Value::Bool(true) => {}
+                Value::Bool(false) => return Value::Bool(op == Op::NotEq),
+                _ => unknown = true,
+            }
+        }
+        return if unknown {
+            Value::Null
+        } else {
+            Value::Bool(op == Op::Eq)
+        };
+    }
+    for (l, r) in left.iter().zip(right) {
+        match eval_comparison(Op::Eq, l, r, scope) {
+            Value::Bool(true) => continue,
+            Value::Bool(false) => {
+                let strict = match op {
+                    Op::LtEq => Op::Lt,
+                    Op::GtEq => Op::Gt,
+                    other => other,
+                };
+                return eval_comparison(strict, l, r, scope);
+            }
+            _ => return Value::Null,
+        }
+    }
+    Value::Bool(matches!(op, Op::LtEq | Op::GtEq))
+}
+
+/// `left <op> ANY|ALL (array)`: ANY is true on any true comparison, ALL false
+/// on any false one; otherwise an unknown comparison makes the result NULL.
+/// Array text (`'{1,2}'`) is accepted as the array operand.
+pub(crate) fn quantified_compare(
+    op: ScalarBinaryOp,
+    left: Value,
+    right: Value,
+    all: bool,
+) -> Value {
+    let items = match right {
+        Value::Array(items) => items,
+        Value::Text(s) => match crate::value::parse_array_literal(&s) {
+            Some(items) => items,
+            None => return Value::Null,
+        },
+        _ => return Value::Null,
+    };
+    fn flatten(items: Vec<Value>, out: &mut Vec<Value>) {
+        for item in items {
+            match item {
+                Value::Array(inner) => flatten(inner, out),
+                v => out.push(v),
+            }
+        }
+    }
+    let mut flat = Vec::new();
+    flatten(items, &mut flat);
+    let mut unknown = false;
+    for item in flat {
+        match apply_binary_op(op, left.clone(), item) {
+            Value::Bool(b) if b != all => return Value::Bool(b),
+            Value::Bool(_) => {}
+            _ => unknown = true,
+        }
+    }
+    if unknown {
+        Value::Null
+    } else {
+        Value::Bool(all)
+    }
+}
+
+/// Matches `value` against a LIKE, SIMILAR TO, or POSIX regex pattern; `None`
+/// when either side is NULL or the pattern is invalid.
+fn pattern_match(
+    value: &Value,
+    pattern: &Value,
+    kind: PatternKind,
+    case_insensitive: bool,
+    escape: Option<char>,
+) -> Option<bool> {
+    if matches!(value, Value::Null) || matches!(pattern, Value::Null) {
+        return None;
+    }
+    let pattern = render(pattern);
+    let source = match kind {
+        PatternKind::Like => like_to_regex(&pattern, escape)?,
+        PatternKind::SimilarTo => similar_to_regex(&pattern, escape)?,
+        PatternKind::Regex => pattern,
+    };
+    let source = if case_insensitive {
+        format!("(?i){source}")
+    } else {
+        source
+    };
+    cached_regex(&source).map(|re| re.is_match(&render(value)))
+}
+
+/// Translates a LIKE pattern into an anchored regex: `%` is any run, `_` one
+/// character, and the escape character makes the next character literal.
+fn like_to_regex(pattern: &str, escape: Option<char>) -> Option<String> {
+    let mut out = String::from("(?s)^");
+    let mut chars = pattern.chars();
+    while let Some(c) = chars.next() {
+        if Some(c) == escape {
+            // A trailing escape character is invalid, as in PostgreSQL.
+            out.push_str(&regex::escape(&chars.next()?.to_string()));
+            continue;
+        }
+        match c {
+            '%' => out.push_str(".*"),
+            '_' => out.push('.'),
+            c => out.push_str(&regex::escape(&c.to_string())),
+        }
+    }
+    out.push('$');
+    Some(out)
+}
+
+/// Translates a SQL `SIMILAR TO` pattern into an anchored regex: LIKE's `%` and
+/// `_`, plus the SQL regex operators `| * + ? {m,n} ( ) [...]`; any other
+/// character (including `.`) is literal.
+fn similar_to_regex(pattern: &str, escape: Option<char>) -> Option<String> {
+    let mut out = String::from("(?s)^(?:");
+    let mut chars = pattern.chars();
+    let mut in_class = false;
+    while let Some(c) = chars.next() {
+        if Some(c) == escape {
+            out.push_str(&regex::escape(&chars.next()?.to_string()));
+            continue;
+        }
+        if in_class {
+            in_class = c != ']';
+            out.push(c);
+            continue;
+        }
+        match c {
+            '%' => out.push_str(".*"),
+            '_' => out.push('.'),
+            '[' => {
+                in_class = true;
+                out.push(c);
+            }
+            '|' | '*' | '+' | '?' | '{' | '}' | '(' | ')' => out.push(c),
+            c => out.push_str(&regex::escape(&c.to_string())),
+        }
+    }
+    out.push_str(")$");
+    Some(out)
+}
+
+/// Compiles `source` once per thread; patterns are usually per-statement
+/// constants, so rows reuse the compiled regex. `None` for an invalid pattern.
+fn cached_regex(source: &str) -> Option<regex::Regex> {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    thread_local! {
+        static CACHE: RefCell<HashMap<String, Option<regex::Regex>>> = RefCell::new(HashMap::new());
+    }
+    CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(re) = cache.get(source) {
+            return re.clone();
+        }
+        if cache.len() >= 256 {
+            cache.clear();
+        }
+        let re = regex::Regex::new(source).ok();
+        cache.insert(source.to_string(), re.clone());
+        re
+    })
 }
 
 /// Renders a `(months, days, seconds)` interval as canonical PostgreSQL text,
@@ -1124,30 +1710,8 @@ fn aggregate_op(name: &str) -> Option<AggregateOp> {
 /// True if a scalar expression contains an aggregate call, so a query using it
 /// must go through the grouping/aggregation path.
 pub(crate) fn scalar_has_aggregate(expr: &ScalarExpr) -> bool {
-    match expr {
-        ScalarExpr::Aggregate { .. } => true,
-        ScalarExpr::Unary { expr, .. }
-        | ScalarExpr::Cast { expr, .. }
-        | ScalarExpr::IsNull { expr, .. }
-        | ScalarExpr::Extract { expr, .. } => scalar_has_aggregate(expr),
-        ScalarExpr::DateOffset { base, .. } => scalar_has_aggregate(base),
-        ScalarExpr::Binary { left, right, .. } => {
-            scalar_has_aggregate(left) || scalar_has_aggregate(right)
-        }
-        ScalarExpr::Function { args, .. } => args.iter().any(scalar_has_aggregate),
-        ScalarExpr::Case {
-            operand,
-            branches,
-            else_result,
-        } => {
-            operand.as_deref().is_some_and(scalar_has_aggregate)
-                || branches
-                    .iter()
-                    .any(|(c, r)| scalar_has_aggregate(c) || scalar_has_aggregate(r))
-                || else_result.as_deref().is_some_and(scalar_has_aggregate)
-        }
-        ScalarExpr::Literal(_) | ScalarExpr::Column(_) => false,
-    }
+    matches!(expr, ScalarExpr::Aggregate { .. })
+        || expr.children().into_iter().any(scalar_has_aggregate)
 }
 
 /// Applies a unary operator to a value; type-invalid combinations yield `Null`.
@@ -1207,6 +1771,7 @@ pub(crate) fn apply_binary_op(op: ScalarBinaryOp, l: Value, r: Value) -> Value {
                 return Value::Null;
             }
             use std::cmp::Ordering::{Equal, Greater, Less};
+            let (l, r) = unify_for_comparison(l, r);
             let ord = interval_aware_compare(&l, &r);
             Value::Bool(match op {
                 Op::Eq => ord == Equal,
@@ -1224,6 +1789,21 @@ pub(crate) fn apply_binary_op(op: ScalarBinaryOp, l: Value, r: Value) -> Value {
             } else {
                 Value::Text(format!("{}{}", render(&l), render(&r)))
             }
+        }
+        Op::JsonGet
+        | Op::JsonGetText
+        | Op::JsonPath
+        | Op::JsonPathText
+        | Op::JsonHasKey
+        | Op::JsonHasAnyKey
+        | Op::JsonHasAllKeys
+        | Op::Contains
+        | Op::ContainedBy
+        | Op::Overlap => {
+            if matches!(l, Value::Null) || matches!(r, Value::Null) {
+                return Value::Null;
+            }
+            apply_json_array_op(op, &l, &r)
         }
         Op::And | Op::Or => {
             let lb = match l {
@@ -1250,6 +1830,130 @@ pub(crate) fn apply_binary_op(op: ScalarBinaryOp, l: Value, r: Value) -> Value {
                 _ => Value::Null,
             }
         }
+    }
+}
+
+/// Resolves an untyped text operand against a typed one, the way PostgreSQL
+/// resolves an unknown-typed literal to the other operand's type (`5 = '5'`,
+/// `flag = 't'`, `doc = '{"a":1}'`). Text that doesn't parse is left as is.
+fn unify_for_comparison(l: Value, r: Value) -> (Value, Value) {
+    fn resolve(text: &str, typed: &Value) -> Option<Value> {
+        let t = text.trim();
+        match typed {
+            Value::Int(_) | Value::Float(_) => t
+                .parse::<i64>()
+                .map(Value::Int)
+                .ok()
+                .or_else(|| t.parse::<f64>().ok().map(Value::Float)),
+            Value::Bool(_) => match parse_bool_text(t) {
+                Value::Bool(b) => Some(Value::Bool(b)),
+                _ => None,
+            },
+            Value::Jsonb(_) => serde_json::from_str(t).ok().map(Value::Jsonb),
+            _ => None,
+        }
+    }
+    match (&l, &r) {
+        (Value::Text(t), typed) => match resolve(t, typed) {
+            Some(v) => (v, r),
+            None => (l, r),
+        },
+        (typed, Value::Text(t)) => match resolve(t, typed) {
+            Some(v) => (l, v),
+            None => (l, r),
+        },
+        _ => (l, r),
+    }
+}
+
+/// JSON access/existence and JSONB/array containment operators over non-NULL
+/// operands. A missing field, element, or path yields NULL.
+fn apply_json_array_op(op: ScalarBinaryOp, l: &Value, r: &Value) -> Value {
+    use ScalarBinaryOp as Op;
+    use serde_json::Value as J;
+    let as_value = |j: Option<J>, as_text: bool| match j {
+        None => Value::Null,
+        Some(J::Null) if as_text => Value::Null,
+        Some(J::String(s)) if as_text => Value::Text(s),
+        Some(j) if as_text => Value::Text(j.to_string()),
+        Some(j) => Value::Jsonb(j),
+    };
+    let texts = |v: &Value| -> Vec<String> {
+        let items = match v {
+            Value::Array(items) => items.clone(),
+            Value::Text(s) => crate::value::parse_array_literal(s).unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        items
+            .iter()
+            .filter(|i| !matches!(i, Value::Null))
+            .map(render)
+            .collect()
+    };
+    match op {
+        Op::Contains => Value::Bool(crate::filter_eval::value_contains(l, r)),
+        Op::ContainedBy => Value::Bool(crate::filter_eval::value_contains(r, l)),
+        Op::Overlap => {
+            let (a, b) = (texts(l), texts(r));
+            Value::Bool(a.iter().any(|x| b.contains(x)))
+        }
+        _ => {
+            let Some(json) = crate::filter_eval::value_to_json(l) else {
+                return Value::Null;
+            };
+            match op {
+                Op::JsonGet | Op::JsonGetText => {
+                    as_value(json_step(&json, r), op == Op::JsonGetText)
+                }
+                Op::JsonPath | Op::JsonPathText => {
+                    let mut cur = Some(json);
+                    for key in texts(r) {
+                        cur = cur.and_then(|j| json_step(&j, &Value::Text(key)));
+                    }
+                    as_value(cur, op == Op::JsonPathText)
+                }
+                Op::JsonHasKey | Op::JsonHasAnyKey | Op::JsonHasAllKeys => {
+                    let has = |key: &str| match &json {
+                        J::Object(map) => map.contains_key(key),
+                        J::Array(items) => items.iter().any(|i| i.as_str() == Some(key)),
+                        J::String(s) => s == key,
+                        _ => false,
+                    };
+                    Value::Bool(match op {
+                        Op::JsonHasKey => has(&render(r)),
+                        Op::JsonHasAnyKey => texts(r).iter().any(|k| has(k)),
+                        _ => texts(r).iter().all(|k| has(k)),
+                    })
+                }
+                _ => Value::Null,
+            }
+        }
+    }
+}
+
+/// One JSON access step: an object field by name, or an array element by
+/// (possibly negative) integer index, given as an integer or numeric text.
+fn json_step(json: &serde_json::Value, key: &Value) -> Option<serde_json::Value> {
+    use serde_json::Value as J;
+    match json {
+        J::Object(map) => map.get(&render(key)).cloned(),
+        J::Array(items) => {
+            let idx = match key {
+                Value::Int(i) => *i,
+                Value::Text(t) => t.trim().parse::<i64>().ok()?,
+                _ => return None,
+            };
+            let idx = if idx < 0 {
+                items.len() as i64 + idx
+            } else {
+                idx
+            };
+            usize::try_from(idx)
+                .ok()
+                .and_then(|i| items.get(i))
+                .cloned()
+        }
+        _ => None,
     }
 }
 

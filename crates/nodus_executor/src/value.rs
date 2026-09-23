@@ -84,6 +84,11 @@ pub(crate) fn coerce_for_column(value: &Value, data_type: &str) -> Value {
         // which the coarse `column_type` may misclassify (e.g. `INT[]` contains
         // "INT"), so coercing them would corrupt the value.
         Value::Array(_) | Value::Jsonb(_) => value.clone(),
+        // Array text (`'{1,2,3}'`) into an array column becomes a typed array.
+        // Malformed text is kept verbatim rather than silently nulled.
+        Value::Text(s) if array_element_type(data_type).is_some() => {
+            coerce_array_text(s, data_type).unwrap_or_else(|| value.clone())
+        }
         Value::Text(s) => coerce(s, column_type(data_type)),
         scalar => match column_type(data_type) {
             ColumnType::Int => match scalar {
@@ -104,6 +109,124 @@ pub(crate) fn coerce_for_column(value: &Value, data_type: &str) -> Value {
             ColumnType::Text => scalar.clone(),
         },
     }
+}
+
+/// Element type of an array type name (`INT[]`, `text[][]`), or `None` for a
+/// scalar type.
+pub(crate) fn array_element_type(data_type: &str) -> Option<&str> {
+    let base = data_type.trim().strip_suffix("[]")?;
+    Some(base.trim_end_matches("[]").trim_end())
+}
+
+/// Parses PostgreSQL's array text format (`{1,2,NULL}`, `{"a b",c}`,
+/// `{{1,2},{3,4}}`, optionally prefixed by bounds such as `[0:1]=`). An
+/// unquoted `NULL` is SQL NULL; quoted and backslash-escaped characters are
+/// literal. Elements stay `Text` for the caller to type. `None` if malformed.
+pub(crate) fn parse_array_literal(text: &str) -> Option<Vec<Value>> {
+    let chars: Vec<char> = text.trim().chars().collect();
+    let mut pos = 0;
+    if chars.first() == Some(&'[') {
+        pos = chars.iter().position(|&c| c == '=')? + 1;
+    }
+    let items = parse_array_items(&chars, &mut pos)?;
+    chars[pos..]
+        .iter()
+        .all(|c| c.is_whitespace())
+        .then_some(items)
+}
+
+fn parse_array_items(chars: &[char], pos: &mut usize) -> Option<Vec<Value>> {
+    let skip_ws = |pos: &mut usize| {
+        while chars.get(*pos).is_some_and(|c| c.is_whitespace()) {
+            *pos += 1;
+        }
+    };
+    skip_ws(pos);
+    if chars.get(*pos) != Some(&'{') {
+        return None;
+    }
+    *pos += 1;
+    let mut items = Vec::new();
+    skip_ws(pos);
+    if chars.get(*pos) == Some(&'}') {
+        *pos += 1;
+        return Some(items);
+    }
+    loop {
+        skip_ws(pos);
+        match chars.get(*pos)? {
+            '{' => items.push(Value::Array(parse_array_items(chars, pos)?)),
+            '"' => {
+                *pos += 1;
+                let mut item = String::new();
+                loop {
+                    match chars.get(*pos)? {
+                        '"' => break,
+                        '\\' => {
+                            *pos += 1;
+                            item.push(*chars.get(*pos)?);
+                        }
+                        c => item.push(*c),
+                    }
+                    *pos += 1;
+                }
+                *pos += 1;
+                items.push(Value::Text(item));
+            }
+            _ => {
+                let mut item = String::new();
+                while let Some(&c) = chars.get(*pos) {
+                    match c {
+                        ',' | '}' => break,
+                        '\\' => {
+                            *pos += 1;
+                            item.push(*chars.get(*pos)?);
+                        }
+                        c => item.push(c),
+                    }
+                    *pos += 1;
+                }
+                let item = item.trim();
+                if item.is_empty() {
+                    return None;
+                }
+                items.push(if item.eq_ignore_ascii_case("NULL") {
+                    Value::Null
+                } else {
+                    Value::Text(item.to_string())
+                });
+            }
+        }
+        skip_ws(pos);
+        match chars.get(*pos)? {
+            ',' => *pos += 1,
+            '}' => {
+                *pos += 1;
+                return Some(items);
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// Converts array text to an array typed by `array_type`'s element type.
+/// `None` if the text is malformed or an element does not parse.
+pub(crate) fn coerce_array_text(text: &str, array_type: &str) -> Option<Value> {
+    let element_type = array_element_type(array_type)?;
+    fn typed(items: Vec<Value>, element_type: &str) -> Option<Vec<Value>> {
+        items
+            .into_iter()
+            .map(|item| match item {
+                Value::Array(inner) => typed(inner, element_type).map(Value::Array),
+                Value::Text(t) => match crate::planner::cast_value(Value::Text(t), element_type) {
+                    Value::Null => None,
+                    v => Some(v),
+                },
+                other => Some(other),
+            })
+            .collect()
+    }
+    typed(parse_array_literal(text)?, element_type).map(Value::Array)
 }
 
 pub(crate) fn render(value: &Value) -> String {
@@ -287,8 +410,34 @@ pub(crate) fn eval_scalar_function(name: &str, args: &[Value]) -> Value {
             (Some(a), Some(b)) => age_text(&a, &b),
             _ => Value::Null,
         },
+        // Catalog visibility (used by psql's `\d` family). Every schema is
+        // searched without shadowing, so an existing object is visible.
+        name if is_visibility_fn(name) => match args.first() {
+            Some(Value::Null) | None => Value::Null,
+            Some(_) => Value::Bool(true),
+        },
         _ => Value::Null,
     }
+}
+
+/// The `pg_*_is_visible(oid)` catalog functions.
+pub(crate) fn is_visibility_fn(name: &str) -> bool {
+    matches!(
+        name,
+        "PG_TABLE_IS_VISIBLE"
+            | "PG_TYPE_IS_VISIBLE"
+            | "PG_FUNCTION_IS_VISIBLE"
+            | "PG_OPERATOR_IS_VISIBLE"
+            | "PG_OPCLASS_IS_VISIBLE"
+            | "PG_OPFAMILY_IS_VISIBLE"
+            | "PG_COLLATION_IS_VISIBLE"
+            | "PG_CONVERSION_IS_VISIBLE"
+            | "PG_STATISTICS_OBJ_IS_VISIBLE"
+            | "PG_TS_CONFIG_IS_VISIBLE"
+            | "PG_TS_DICT_IS_VISIBLE"
+            | "PG_TS_PARSER_IS_VISIBLE"
+            | "PG_TS_TEMPLATE_IS_VISIBLE"
+    )
 }
 
 /// Parses an ISO date or timestamp text into a `NaiveDateTime` (a bare date

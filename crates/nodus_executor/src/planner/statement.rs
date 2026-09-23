@@ -64,6 +64,7 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                             unique = true;
                         }
                         sqlparser::ast::ColumnOption::Check(check) => {
+                            check_constraint_is_supported(&check.expr, params)?;
                             tbl_constraints.push(nodus_catalog::TableConstraint::Check {
                                 name: opt.name.as_ref().map(|n| n.value.clone()),
                                 expr: check.expr.to_string(),
@@ -113,6 +114,7 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                         }
                     }
                     sqlparser::ast::TableConstraint::Check(check) => {
+                        check_constraint_is_supported(&check.expr, params)?;
                         tbl_constraints.push(nodus_catalog::TableConstraint::Check {
                             name: check.name.as_ref().map(|n| n.value.clone()),
                             expr: check.expr.to_string(),
@@ -410,7 +412,7 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
             Ok(LogicalPlan::Update {
                 table_name,
                 assignments: assigns,
-                filter: parse_predicates(&update.selection, params),
+                filter: parse_predicates(&update.selection, params)?,
                 returning,
             })
         }
@@ -436,7 +438,7 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                 .relation;
             Ok(LogicalPlan::Delete {
                 table_name: table_name_of(relation)?,
-                filter: parse_predicates(&delete.selection, params),
+                filter: parse_predicates(&delete.selection, params)?,
                 returning,
             })
         }
@@ -569,4 +571,12 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
         }
         _ => anyhow::bail!("Unsupported SQL statement: {:?}", stmt),
     }
+}
+
+/// Rejects a CHECK constraint the executor cannot evaluate, so it is never
+/// stored and then silently left unenforced.
+fn check_constraint_is_supported(expr: &sqlparser::ast::Expr, params: &[Value]) -> Result<()> {
+    parse_filter_expr(expr, params)
+        .map(|_| ())
+        .map_err(|e| anyhow::anyhow!("Unsupported CHECK constraint `{expr}`: {e}"))
 }

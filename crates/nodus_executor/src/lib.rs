@@ -39,7 +39,8 @@ mod value;
 mod view_helpers;
 pub use plan_types::{
     AggregateOp, AlterTableOp, CompareOp, FilterExpr, Join, JoinType, LogicalPlan, Operand,
-    Predicate, ProjectionItem, ScalarBinaryOp, ScalarExpr, ScalarUnaryOp, SetOpKind, TableFnSpec,
+    PatternKind, Predicate, ProjectionItem, ScalarBinaryOp, ScalarExpr, ScalarUnaryOp, SetOpKind,
+    TableFnSpec,
 };
 pub use planner::{
     CopyOutputFormat, expr_to_value, parse_object_name, plan_copy_out, plan_statement,

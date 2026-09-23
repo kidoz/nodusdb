@@ -1,8 +1,7 @@
-//! WHERE/ON predicate parsing into FilterExpr.
+//! WHERE/ON/HAVING predicate parsing into FilterExpr.
 use super::*;
 use crate::*;
 use anyhow::Result;
-use nodus_catalog::TableConstraint;
 
 pub(crate) fn compare_op(op: &sqlparser::ast::BinaryOperator) -> Option<CompareOp> {
     use sqlparser::ast::BinaryOperator::*;
@@ -21,185 +20,220 @@ pub(crate) fn compare_op(op: &sqlparser::ast::BinaryOperator) -> Option<CompareO
     }
 }
 
-/// Parses a `WHERE` clause into a conjunction of `column <op> literal`
-/// predicates (AND only; other expressions are ignored).
+/// Plans an optional `WHERE` clause. Every condition must be understood: an
+/// unsupported one is an error rather than dropped, since a dropped condition
+/// widens a query and makes UPDATE/DELETE touch every row.
 pub(crate) fn parse_predicates(
     selection: &Option<sqlparser::ast::Expr>,
     params: &[Value],
-) -> Option<FilterExpr> {
-    if let Some(expr) = selection {
-        parse_filter_expr(expr, params)
-    } else {
-        None
-    }
+) -> Result<Option<FilterExpr>> {
+    selection
+        .as_ref()
+        .map(|expr| parse_filter_expr(expr, params))
+        .transpose()
 }
 
+/// Plans a `HAVING` clause as one boolean expression over each group, so any
+/// operator the scalar evaluator supports works on aggregates and group keys.
+pub(crate) fn parse_having(expr: &sqlparser::ast::Expr, params: &[Value]) -> Result<FilterExpr> {
+    lower_scalar(expr, params)
+        .map(FilterExpr::Scalar)
+        .ok_or_else(|| anyhow::anyhow!("Unsupported HAVING condition: {expr}"))
+}
+
+/// Plans a boolean condition. Column comparisons against literals keep their
+/// typed fast paths (literals are coerced to the column type, and indexes can
+/// use them); subqueries become subquery filters; anything else is evaluated as
+/// a scalar expression. A condition none of these can express is an error.
 pub(crate) fn parse_filter_expr(
     expr: &sqlparser::ast::Expr,
     params: &[Value],
-) -> Option<FilterExpr> {
+) -> Result<FilterExpr> {
     use sqlparser::ast::{BinaryOperator, Expr};
-    match expr {
-        Expr::Nested(inner) => parse_filter_expr(inner, params),
-        // A bare boolean literal (`WHERE true` / `WHERE false`).
-        Expr::Value(v) => match &v.value {
-            sqlparser::ast::Value::Boolean(b) => Some(FilterExpr::ExprCmp {
-                left: crate::plan_types::ScalarExpr::Literal(Value::Bool(*b)),
-                op: CompareOp::Eq,
-                right: crate::plan_types::ScalarExpr::Literal(Value::Bool(true)),
-            }),
-            _ => None,
-        },
+    let planned = match expr {
+        Expr::Nested(inner) => return parse_filter_expr(inner, params),
         Expr::BinaryOp { left, op, right } if *op == BinaryOperator::And => {
-            let l = parse_filter_expr(left, params);
-            let r = parse_filter_expr(right, params);
-            match (l, r) {
-                (Some(l), Some(r)) => Some(FilterExpr::And(Box::new(l), Box::new(r))),
-                (Some(l), None) => Some(l),
-                (None, Some(r)) => Some(r),
-                (None, None) => None,
-            }
+            return Ok(FilterExpr::And(
+                Box::new(parse_filter_expr(left, params)?),
+                Box::new(parse_filter_expr(right, params)?),
+            ));
         }
         Expr::BinaryOp { left, op, right } if *op == BinaryOperator::Or => {
-            let l = parse_filter_expr(left, params);
-            let r = parse_filter_expr(right, params);
-            match (l, r) {
-                (Some(l), Some(r)) => Some(FilterExpr::Or(Box::new(l), Box::new(r))),
-                _ => None,
-            }
+            return Ok(FilterExpr::Or(
+                Box::new(parse_filter_expr(left, params)?),
+                Box::new(parse_filter_expr(right, params)?),
+            ));
         }
-        Expr::UnaryOp { op, expr } if *op == sqlparser::ast::UnaryOperator::Not => {
-            if let Some(inner) = parse_filter_expr(expr, params) {
-                Some(FilterExpr::Not(Box::new(inner)))
-            } else {
-                None
-            }
+        Expr::UnaryOp { op, expr: inner } if *op == sqlparser::ast::UnaryOperator::Not => {
+            return Ok(FilterExpr::Not(Box::new(parse_filter_expr(inner, params)?)));
         }
-        Expr::IsNull(expr) => extract_col_name(expr).map(FilterExpr::IsNull),
-        Expr::IsNotNull(expr) => extract_col_name(expr).map(FilterExpr::IsNotNull),
-        Expr::Like {
-            negated,
-            expr,
-            pattern,
-            ..
-        } => {
-            let left_col = extract_col_name(expr)?;
-            let right_op = extract_operand(pattern, params)?;
-            Some(FilterExpr::Like {
-                left: left_col,
-                right: right_op,
-                negated: *negated,
-            })
-        }
+        Expr::IsNull(inner) => plain_column(inner).map(FilterExpr::IsNull),
+        Expr::IsNotNull(inner) => plain_column(inner).map(FilterExpr::IsNotNull),
         Expr::InList {
-            expr,
+            expr: inner,
             list,
             negated,
-        } => {
-            let left_col = extract_col_name(expr)?;
-            let mut ops = Vec::new();
-            for item in list {
-                if let Some(op) = extract_operand(item, params) {
-                    ops.push(op);
-                } else {
-                    return None;
-                }
-            }
+        } => plain_column(inner).and_then(|left| {
+            let list = list
+                .iter()
+                .map(|item| extract_operand(item, params))
+                .collect::<Option<Vec<_>>>()?;
             Some(FilterExpr::InList {
-                left: left_col,
-                list: ops,
+                left,
+                list,
                 negated: *negated,
             })
-        }
+        }),
         Expr::InSubquery {
-            expr,
+            expr: inner,
             subquery,
             negated,
         } => {
-            let sub_plan = plan_query(subquery, params).ok()?;
+            let subquery = Box::new(plan_query(subquery, params)?);
             // Column left side, or a literal one (`1 IN (SELECT ...)`).
-            let (left_col, left_value) = match extract_col_name(expr) {
-                Some(col) => (col, None),
-                None => (String::new(), Some(expr_to_value(expr, params)?)),
-            };
-            Some(FilterExpr::InSubquery {
-                left: left_col,
-                subquery: Box::new(sub_plan),
-                negated: *negated,
-                left_value,
-            })
-        }
-        Expr::Exists { subquery, negated } => {
-            let sub_plan = plan_query(subquery, params).ok()?;
-            Some(FilterExpr::Exists {
-                subquery: Box::new(sub_plan),
-                negated: *negated,
-            })
-        }
-        Expr::BinaryOp { left, op, right } => {
-            let cmp = compare_op(op)?;
-            if let Some(left_col) = extract_col_name(left) {
-                // `col <op> (scalar subquery)`.
-                if let Expr::Subquery(query) = &**right {
-                    let sub_plan = plan_query(query, params).ok()?;
-                    return Some(FilterExpr::CompareSubquery {
-                        left: left_col,
-                        op: cmp,
-                        subquery: Box::new(sub_plan),
-                    });
-                }
-                if let Some(right_op) = extract_operand(right, params) {
-                    return Some(FilterExpr::Predicate(Predicate {
-                        left: left_col,
-                        op: cmp,
-                        right: right_op,
-                    }));
+            match (extract_col_name(inner), expr_to_value(inner, params)) {
+                (Some(left), _) => Some(FilterExpr::InSubquery {
+                    left,
+                    subquery,
+                    negated: *negated,
+                    left_value: None,
+                }),
+                (None, Some(value)) => Some(FilterExpr::InSubquery {
+                    left: String::new(),
+                    subquery,
+                    negated: *negated,
+                    left_value: Some(value),
+                }),
+                (None, None) => {
+                    let left = lower_scalar(inner, params).ok_or_else(|| {
+                        anyhow::anyhow!("Unsupported IN (subquery) operand: {inner}")
+                    })?;
+                    let quantified = FilterExpr::QuantifiedSubquery {
+                        left,
+                        op: ScalarBinaryOp::Eq,
+                        subquery,
+                        all: false,
+                    };
+                    Some(if *negated {
+                        FilterExpr::Not(Box::new(quantified))
+                    } else {
+                        quantified
+                    })
                 }
             }
-            // A computed side (e.g. `n % 2 = 0`, `a = b + 1`): lower both to
-            // scalar expressions and compare per row.
-            let l = lower_scalar(left, params)?;
-            let r = lower_scalar(right, params)?;
-            Some(FilterExpr::ExprCmp {
-                left: l,
-                op: cmp,
-                right: r,
+        }
+        Expr::Exists { subquery, negated } => Some(FilterExpr::Exists {
+            subquery: Box::new(plan_query(subquery, params)?),
+            negated: *negated,
+        }),
+        // `x <op> ANY|ALL (SELECT ...)`.
+        Expr::AnyOp {
+            left,
+            compare_op,
+            right,
+            ..
+        }
+        | Expr::AllOp {
+            left,
+            compare_op,
+            right,
+        } if matches!(&**right, Expr::Subquery(_)) => {
+            let Expr::Subquery(query) = &**right else {
+                unreachable!("guarded by the match arm");
+            };
+            let op = compare_op_scalar(compare_op)
+                .ok_or_else(|| anyhow::anyhow!("Unsupported quantified operator: {compare_op}"))?;
+            let left = lower_scalar(left, params)
+                .ok_or_else(|| anyhow::anyhow!("Unsupported quantified operand: {left}"))?;
+            Some(FilterExpr::QuantifiedSubquery {
+                left,
+                op,
+                subquery: Box::new(plan_query(query, params)?),
+                all: matches!(expr, Expr::AllOp { .. }),
             })
         }
+        Expr::BinaryOp { left, op, right } => match (compare_op(op), extract_col_name(left)) {
+            (Some(cmp), Some(left_col)) => match &**right {
+                // `col <op> (scalar subquery)`.
+                Expr::Subquery(query) => Some(FilterExpr::CompareSubquery {
+                    left: left_col,
+                    op: cmp,
+                    subquery: Box::new(plan_query(query, params)?),
+                }),
+                _ => extract_operand(right, params).map(|right| {
+                    FilterExpr::Predicate(Predicate {
+                        left: left_col,
+                        op: cmp,
+                        right,
+                    })
+                }),
+            },
+            _ => None,
+        },
         // `x BETWEEN a AND b` -> `x >= a AND x <= b`; NOT BETWEEN -> `x < a OR x > b`.
         Expr::Between {
-            expr,
+            expr: inner,
             negated,
             low,
             high,
-        } => {
-            let col = extract_col_name(expr)?;
-            let low_op = extract_operand(low, params)?;
-            let high_op = extract_operand(high, params)?;
-            let lo = FilterExpr::Predicate(Predicate {
-                left: col.clone(),
-                op: if *negated {
-                    CompareOp::Lt
+        } => match (
+            plain_column(inner),
+            extract_operand(low, params),
+            extract_operand(high, params),
+        ) {
+            (Some(col), Some(low), Some(high)) => {
+                let (lo_op, hi_op) = if *negated {
+                    (CompareOp::Lt, CompareOp::Gt)
                 } else {
-                    CompareOp::Ge
-                },
-                right: low_op,
-            });
-            let hi = FilterExpr::Predicate(Predicate {
-                left: col,
-                op: if *negated {
-                    CompareOp::Gt
+                    (CompareOp::Ge, CompareOp::Le)
+                };
+                let lo = Box::new(FilterExpr::Predicate(Predicate {
+                    left: col.clone(),
+                    op: lo_op,
+                    right: low,
+                }));
+                let hi = Box::new(FilterExpr::Predicate(Predicate {
+                    left: col,
+                    op: hi_op,
+                    right: high,
+                }));
+                Some(if *negated {
+                    FilterExpr::Or(lo, hi)
                 } else {
-                    CompareOp::Le
-                },
-                right: high_op,
-            });
-            if *negated {
-                Some(FilterExpr::Or(Box::new(lo), Box::new(hi)))
-            } else {
-                Some(FilterExpr::And(Box::new(lo), Box::new(hi)))
+                    FilterExpr::And(lo, hi)
+                })
             }
-        }
+            _ => None,
+        },
+        _ => None,
+    };
+    if let Some(filter) = planned {
+        return Ok(filter);
+    }
+    lower_scalar(expr, params)
+        .map(FilterExpr::Scalar)
+        .ok_or_else(|| anyhow::anyhow!("Unsupported WHERE condition: {expr}"))
+}
+
+/// A bare or qualified column reference (not a JSON access or cast).
+fn plain_column(expr: &sqlparser::ast::Expr) -> Option<String> {
+    use sqlparser::ast::Expr;
+    match expr {
+        Expr::Identifier(_) | Expr::CompoundIdentifier(_) => extract_col_name(expr),
         _ => None,
     }
+}
+
+/// The comparison operators usable with `ANY`/`ALL`.
+fn compare_op_scalar(op: &sqlparser::ast::BinaryOperator) -> Option<ScalarBinaryOp> {
+    use sqlparser::ast::BinaryOperator as B;
+    Some(match op {
+        B::Eq => ScalarBinaryOp::Eq,
+        B::NotEq => ScalarBinaryOp::NotEq,
+        B::Lt => ScalarBinaryOp::Lt,
+        B::LtEq => ScalarBinaryOp::LtEq,
+        B::Gt => ScalarBinaryOp::Gt,
+        B::GtEq => ScalarBinaryOp::GtEq,
+        _ => return None,
+    })
 }

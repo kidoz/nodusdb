@@ -41,11 +41,6 @@ pub enum FilterExpr {
     Not(Box<FilterExpr>),
     IsNull(String),
     IsNotNull(String),
-    Like {
-        left: String,
-        right: Operand,
-        negated: bool,
-    },
     InList {
         left: String,
         list: Vec<Operand>,
@@ -81,6 +76,17 @@ pub enum FilterExpr {
     Exists {
         subquery: Box<LogicalPlan>,
         negated: bool,
+    },
+    /// Any other boolean condition, evaluated per row as a scalar expression;
+    /// the row passes only when it yields `true` (NULL and false filter it out).
+    Scalar(ScalarExpr),
+    /// `left <op> ANY|ALL (<subquery>)`, comparing against every value of the
+    /// subquery's single column; the subquery may be correlated.
+    QuantifiedSubquery {
+        left: ScalarExpr,
+        op: ScalarBinaryOp,
+        subquery: Box<LogicalPlan>,
+        all: bool,
     },
 }
 
@@ -218,6 +224,210 @@ pub enum ScalarExpr {
         branches: Vec<(ScalarExpr, ScalarExpr)>,
         else_result: Option<Box<ScalarExpr>>,
     },
+    /// A text pattern match: `[NOT] LIKE`/`ILIKE` or `[NOT] SIMILAR TO` (with
+    /// an optional `ESCAPE`), or a POSIX regex operator (`~`, `~*`, `!~`, `!~*`).
+    PatternMatch {
+        expr: Box<ScalarExpr>,
+        pattern: Box<ScalarExpr>,
+        kind: PatternKind,
+        case_insensitive: bool,
+        negated: bool,
+        #[serde(default)]
+        escape: Option<char>,
+    },
+    /// `left IS [NOT] DISTINCT FROM right`: NULL-safe (in)equality.
+    IsDistinctFrom {
+        left: Box<ScalarExpr>,
+        right: Box<ScalarExpr>,
+        negated: bool,
+    },
+    /// `expr IS [NOT] TRUE | FALSE | UNKNOWN`; `value` is `None` for UNKNOWN.
+    IsBool {
+        expr: Box<ScalarExpr>,
+        value: Option<bool>,
+        negated: bool,
+    },
+    /// `expr [NOT] IN (e1, e2, ...)`.
+    InList {
+        expr: Box<ScalarExpr>,
+        list: Vec<ScalarExpr>,
+        negated: bool,
+    },
+    /// `left <op> ANY (array)` or `left <op> ALL (array)`.
+    Quantified {
+        left: Box<ScalarExpr>,
+        op: ScalarBinaryOp,
+        right: Box<ScalarExpr>,
+        all: bool,
+    },
+    /// A row constructor `(a, b, ...)` / `ROW(a, b, ...)`, compared
+    /// element-wise by the comparison operators.
+    Row(Vec<ScalarExpr>),
+}
+
+impl ScalarExpr {
+    /// The immediate sub-expressions, in evaluation order.
+    pub fn children(&self) -> Vec<&ScalarExpr> {
+        match self {
+            ScalarExpr::Literal(_) | ScalarExpr::Column(_) => Vec::new(),
+            ScalarExpr::Unary { expr, .. }
+            | ScalarExpr::Cast { expr, .. }
+            | ScalarExpr::IsNull { expr, .. }
+            | ScalarExpr::Extract { expr, .. }
+            | ScalarExpr::IsBool { expr, .. } => vec![expr],
+            ScalarExpr::DateOffset { base, .. } => vec![base],
+            ScalarExpr::Aggregate { arg_expr, .. } => arg_expr.iter().map(|e| &**e).collect(),
+            ScalarExpr::Binary { left, right, .. }
+            | ScalarExpr::IsDistinctFrom { left, right, .. }
+            | ScalarExpr::Quantified { left, right, .. } => vec![left, right],
+            ScalarExpr::PatternMatch { expr, pattern, .. } => vec![expr, pattern],
+            ScalarExpr::Function { args: items, .. } | ScalarExpr::Row(items) => {
+                items.iter().collect()
+            }
+            ScalarExpr::InList { expr, list, .. } => {
+                std::iter::once(&**expr).chain(list.iter()).collect()
+            }
+            ScalarExpr::Case {
+                operand,
+                branches,
+                else_result,
+            } => operand
+                .iter()
+                .map(|e| &**e)
+                .chain(branches.iter().flat_map(|(c, r)| [c, r]))
+                .chain(else_result.iter().map(|e| &**e))
+                .collect(),
+        }
+    }
+
+    /// Rebuilds this node with every immediate sub-expression replaced by
+    /// `f(child)`; leaves are returned unchanged.
+    pub fn map_children(&self, f: &mut dyn FnMut(&ScalarExpr) -> ScalarExpr) -> ScalarExpr {
+        let mut boxed = |e: &ScalarExpr| Box::new(f(e));
+        match self {
+            ScalarExpr::Literal(_) | ScalarExpr::Column(_) => self.clone(),
+            ScalarExpr::Unary { op, expr } => ScalarExpr::Unary {
+                op: *op,
+                expr: boxed(expr),
+            },
+            ScalarExpr::Binary { op, left, right } => ScalarExpr::Binary {
+                op: *op,
+                left: boxed(left),
+                right: boxed(right),
+            },
+            ScalarExpr::Cast { expr, target } => ScalarExpr::Cast {
+                expr: boxed(expr),
+                target: target.clone(),
+            },
+            ScalarExpr::Function { name, args } => ScalarExpr::Function {
+                name: name.clone(),
+                args: args.iter().map(|a| *boxed(a)).collect(),
+            },
+            ScalarExpr::IsNull { expr, negated } => ScalarExpr::IsNull {
+                expr: boxed(expr),
+                negated: *negated,
+            },
+            ScalarExpr::Extract { field, expr } => ScalarExpr::Extract {
+                field: field.clone(),
+                expr: boxed(expr),
+            },
+            ScalarExpr::Aggregate {
+                op,
+                arg,
+                arg_expr,
+                distinct,
+            } => ScalarExpr::Aggregate {
+                op: op.clone(),
+                arg: arg.clone(),
+                arg_expr: arg_expr.as_ref().map(|e| boxed(e)),
+                distinct: *distinct,
+            },
+            ScalarExpr::DateOffset {
+                base,
+                months,
+                days,
+                seconds,
+            } => ScalarExpr::DateOffset {
+                base: boxed(base),
+                months: *months,
+                days: *days,
+                seconds: *seconds,
+            },
+            ScalarExpr::Case {
+                operand,
+                branches,
+                else_result,
+            } => ScalarExpr::Case {
+                operand: operand.as_ref().map(|e| boxed(e)),
+                branches: branches
+                    .iter()
+                    .map(|(c, r)| (*boxed(c), *boxed(r)))
+                    .collect(),
+                else_result: else_result.as_ref().map(|e| boxed(e)),
+            },
+            ScalarExpr::PatternMatch {
+                expr,
+                pattern,
+                kind,
+                case_insensitive,
+                negated,
+                escape,
+            } => ScalarExpr::PatternMatch {
+                expr: boxed(expr),
+                pattern: boxed(pattern),
+                kind: *kind,
+                case_insensitive: *case_insensitive,
+                negated: *negated,
+                escape: *escape,
+            },
+            ScalarExpr::IsDistinctFrom {
+                left,
+                right,
+                negated,
+            } => ScalarExpr::IsDistinctFrom {
+                left: boxed(left),
+                right: boxed(right),
+                negated: *negated,
+            },
+            ScalarExpr::IsBool {
+                expr,
+                value,
+                negated,
+            } => ScalarExpr::IsBool {
+                expr: boxed(expr),
+                value: *value,
+                negated: *negated,
+            },
+            ScalarExpr::InList {
+                expr,
+                list,
+                negated,
+            } => ScalarExpr::InList {
+                expr: boxed(expr),
+                list: list.iter().map(|e| *boxed(e)).collect(),
+                negated: *negated,
+            },
+            ScalarExpr::Quantified {
+                left,
+                op,
+                right,
+                all,
+            } => ScalarExpr::Quantified {
+                left: boxed(left),
+                op: *op,
+                right: boxed(right),
+                all: *all,
+            },
+            ScalarExpr::Row(items) => ScalarExpr::Row(items.iter().map(|e| *boxed(e)).collect()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum PatternKind {
+    Like,
+    SimilarTo,
+    Regex,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -242,6 +452,21 @@ pub enum ScalarBinaryOp {
     And,
     Or,
     Concat,
+    /// `->` / `->>`: JSON object field or array element, as JSON / as text.
+    JsonGet,
+    JsonGetText,
+    /// `#>` / `#>>`: JSON value at a key path, as JSON / as text.
+    JsonPath,
+    JsonPathText,
+    /// `?` / `?|` / `?&`: the JSON value has the key (one, any, all).
+    JsonHasKey,
+    JsonHasAnyKey,
+    JsonHasAllKeys,
+    /// `@>` / `<@`: JSONB or array containment.
+    Contains,
+    ContainedBy,
+    /// `&&`: the arrays share an element.
+    Overlap,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

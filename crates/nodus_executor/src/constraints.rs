@@ -65,7 +65,7 @@ impl MemExecutor {
     ) -> Result<()> {
         for tc in &tbl.constraints {
             match tc {
-                nodus_catalog::TableConstraint::Check { name: _, expr } => {
+                nodus_catalog::TableConstraint::Check { name, expr } => {
                     let ast_expr = match sqlparser::parser::Parser::new(
                         &sqlparser::dialect::PostgreSqlDialect {},
                     )
@@ -77,11 +77,23 @@ impl MemExecutor {
                         },
                         Err(e) => anyhow::bail!("Failed to init parser: {}", e),
                     };
-                    if let Some(filter) = parse_filter_expr(&ast_expr, &[]) {
-                        let result =
-                            self.eval_filter(ctx, new_row, col_names, &tbl.columns, Some(&filter));
-                        if result != Some(true) {
-                            anyhow::bail!("violates check constraint");
+                    let filter = parse_filter_expr(&ast_expr, &[]).map_err(|e| {
+                        anyhow::anyhow!("CHECK constraint `{expr}` cannot be evaluated: {e}")
+                    })?;
+                    // As in PostgreSQL, only a false result rejects the row; a
+                    // NULL (unknown) result satisfies the constraint.
+                    let result =
+                        self.eval_filter(ctx, new_row, col_names, &tbl.columns, Some(&filter));
+                    if result == Some(false) {
+                        match name {
+                            Some(name) => anyhow::bail!(
+                                "new row for relation \"{}\" violates check constraint \"{name}\"",
+                                tbl.name
+                            ),
+                            None => anyhow::bail!(
+                                "new row for relation \"{}\" violates check constraint",
+                                tbl.name
+                            ),
                         }
                     }
                 }

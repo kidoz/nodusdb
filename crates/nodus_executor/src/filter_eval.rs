@@ -1,6 +1,7 @@
 //! Predicate and filter-expression evaluation against in-memory rows: operand
-//! resolution, `WHERE`/`ON` conjunction evaluation (including `IN (subquery)`,
-//! `LIKE`, null checks, and JSONB containment), and the `row_matches` gate.
+//! resolution, `WHERE`/`ON` conjunction evaluation (including `IN`/`ANY`/`ALL`
+//! subqueries, `EXISTS`, null checks, JSONB containment, and general boolean
+//! scalar conditions), and the `row_matches` gate.
 
 use crate::{
     CompareOp, ExecutionContext, FilterExpr, LogicalPlan, MemExecutor, Operand, Predicate,
@@ -191,33 +192,6 @@ impl MemExecutor {
                     _ => false,
                 })
             }
-            FilterExpr::Like {
-                left,
-                right,
-                negated,
-            } => {
-                let left_idx = col_pos(col_names, left);
-                let Some(idx) = left_idx else {
-                    return Some(false);
-                };
-                let left_cell = row.get(idx).unwrap_or(&Value::Null);
-                let right_cell =
-                    self.eval_operand(row, col_names, columns, right, &columns[idx].data_type);
-
-                if left_cell == &Value::Null || right_cell == Value::Null {
-                    return None;
-                }
-
-                if let (Value::Text(l), Value::Text(r)) = (left_cell, right_cell) {
-                    let regex_str = format!("^{}$", r.replace('%', ".*").replace('_', "."));
-                    let is_match = regex::Regex::new(&regex_str)
-                        .map(|re| re.is_match(l))
-                        .unwrap_or(false);
-                    Some(if *negated { !is_match } else { is_match })
-                } else {
-                    Some(false)
-                }
-            }
             FilterExpr::InList {
                 left,
                 list,
@@ -369,6 +343,29 @@ impl MemExecutor {
                 let exists = !out.rows.is_empty();
                 Some(if *negated { !exists } else { exists })
             }
+            FilterExpr::Scalar(e) => match crate::eval_scalar_expr(e, row, col_names) {
+                Value::Bool(b) => Some(b),
+                _ => None,
+            },
+            FilterExpr::QuantifiedSubquery {
+                left,
+                op,
+                subquery,
+                all,
+            } => {
+                let left = crate::eval_scalar_expr(left, row, col_names);
+                let correlated = self.correlate_subplan(subquery, row, col_names);
+                let out = self.execute_logical_inner(ctx, correlated).ok()?;
+                let values = out
+                    .rows
+                    .into_iter()
+                    .map(|r| r.values.into_iter().next().unwrap_or(Value::Null))
+                    .collect();
+                match crate::planner::quantified_compare(*op, left, Value::Array(values), *all) {
+                    Value::Bool(b) => Some(b),
+                    _ => None,
+                }
+            }
         }
     }
 
@@ -478,53 +475,14 @@ fn correlate_scalar(
     outer_cols: &[String],
     inner_quals: &[String],
 ) -> crate::ScalarExpr {
-    use crate::ScalarExpr as S;
-    let recur = |e: &S| Box::new(correlate_scalar(e, outer_row, outer_cols, inner_quals));
     match expr {
-        S::Column(n) if is_outer_ref(n, inner_quals) => {
+        crate::ScalarExpr::Column(n) if is_outer_ref(n, inner_quals) => {
             match outer_lookup(n, outer_cols, outer_row) {
-                Some(v) => S::Literal(v),
+                Some(v) => crate::ScalarExpr::Literal(v),
                 None => expr.clone(),
             }
         }
-        S::Unary { op, expr } => S::Unary {
-            op: *op,
-            expr: recur(expr),
-        },
-        S::Binary { op, left, right } => S::Binary {
-            op: *op,
-            left: recur(left),
-            right: recur(right),
-        },
-        S::Cast { expr, target } => S::Cast {
-            expr: recur(expr),
-            target: target.clone(),
-        },
-        S::Function { name, args } => S::Function {
-            name: name.clone(),
-            args: args
-                .iter()
-                .map(|a| correlate_scalar(a, outer_row, outer_cols, inner_quals))
-                .collect(),
-        },
-        S::Case {
-            operand,
-            branches,
-            else_result,
-        } => S::Case {
-            operand: operand.as_ref().map(|o| recur(o)),
-            branches: branches
-                .iter()
-                .map(|(c, r)| {
-                    (
-                        correlate_scalar(c, outer_row, outer_cols, inner_quals),
-                        correlate_scalar(r, outer_row, outer_cols, inner_quals),
-                    )
-                })
-                .collect(),
-            else_result: else_result.as_ref().map(|e| recur(e)),
-        },
-        other => other.clone(),
+        _ => expr.map_children(&mut |e| correlate_scalar(e, outer_row, outer_cols, inner_quals)),
     }
 }
 
@@ -593,29 +551,24 @@ fn correlate_filter(
                 negated: *negated,
             }
         }
-        FilterExpr::Like {
-            left,
-            right,
-            negated,
-        } => {
-            let new_right = match right {
-                Operand::Ident(n) if is_outer_ref(n, inner_quals) => {
-                    outer_lookup(n, outer_cols, outer_row)
-                        .map(Operand::Literal)
-                        .unwrap_or_else(|| right.clone())
-                }
-                _ => right.clone(),
-            };
-            FilterExpr::Like {
-                left: left.clone(),
-                right: new_right,
-                negated: *negated,
-            }
-        }
         FilterExpr::ExprCmp { left, op, right } => FilterExpr::ExprCmp {
             left: correlate_scalar(left, outer_row, outer_cols, inner_quals),
             op: op.clone(),
             right: correlate_scalar(right, outer_row, outer_cols, inner_quals),
+        },
+        FilterExpr::Scalar(e) => {
+            FilterExpr::Scalar(correlate_scalar(e, outer_row, outer_cols, inner_quals))
+        }
+        FilterExpr::QuantifiedSubquery {
+            left,
+            op,
+            subquery,
+            all,
+        } => FilterExpr::QuantifiedSubquery {
+            left: correlate_scalar(left, outer_row, outer_cols, inner_quals),
+            op: *op,
+            subquery: subquery.clone(),
+            all: *all,
         },
         // Nested subquery predicates and null checks pass through: nested
         // correlation is not resolved here.
@@ -643,7 +596,7 @@ fn json_contains(a: &serde_json::Value, b: &serde_json::Value) -> bool {
 /// Coerces a cell value into a JSON document for containment checks. Text that
 /// parses as JSON is treated as JSON; a PostgreSQL array text literal (`{a,b}`)
 /// becomes a JSON string array; other text becomes a JSON string scalar.
-fn value_to_json(v: &Value) -> Option<serde_json::Value> {
+pub(crate) fn value_to_json(v: &Value) -> Option<serde_json::Value> {
     use serde_json::Value as J;
     match v {
         Value::Jsonb(j) => Some(j.clone()),
@@ -723,7 +676,7 @@ pub(crate) fn json_extract(value: &Value, op: &str, key: &str) -> Value {
 }
 
 /// True if `left` contains `right` under JSONB/array containment semantics.
-fn value_contains(left: &Value, right: &Value) -> bool {
+pub(crate) fn value_contains(left: &Value, right: &Value) -> bool {
     match (value_to_json(left), value_to_json(right)) {
         (Some(l), Some(r)) => json_contains(&l, &r),
         _ => false,

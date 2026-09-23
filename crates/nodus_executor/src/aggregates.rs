@@ -201,117 +201,68 @@ pub(crate) fn eval_scalar_expr_grouped(
     group_rows: &[Vec<Value>],
     col_names: &[String],
 ) -> Value {
-    use crate::planner::{
-        apply_binary_op, apply_date_offset, apply_unary_op, cast_value, extract_datetime_field,
-    };
-    match expr {
-        ScalarExpr::Aggregate {
+    crate::planner::eval_scalar_in(
+        expr,
+        &GroupScope {
+            group_rows,
+            col_names,
+        },
+    )
+}
+
+struct GroupScope<'a> {
+    group_rows: &'a [Vec<Value>],
+    col_names: &'a [String],
+}
+
+impl crate::planner::ScalarScope for GroupScope<'_> {
+    fn column(&self, name: &str) -> Value {
+        crate::filter_eval::col_pos(self.col_names, name)
+            .and_then(|i| self.group_rows.first().and_then(|r| r.get(i)))
+            .cloned()
+            .unwrap_or(Value::Null)
+    }
+
+    fn aggregate(&self, expr: &ScalarExpr) -> Value {
+        let ScalarExpr::Aggregate {
             op,
             arg,
             arg_expr,
             distinct,
-        } => {
-            if *distinct {
-                // `agg(DISTINCT x)`: gather the per-row argument values,
-                // drop duplicates, then aggregate the distinct set.
-                let mut vals: Vec<Value> = Vec::new();
-                for r in group_rows {
-                    let v = match arg_expr {
-                        Some(e) => crate::planner::eval_scalar_expr(e, r, col_names),
-                        None => crate::filter_eval::col_pos(col_names, arg)
-                            .and_then(|i| r.get(i))
-                            .cloned()
-                            .unwrap_or(Value::Null),
-                    };
-                    if !vals.iter().any(|x| crate::values_equal(x, &v)) {
-                        vals.push(v);
-                    }
-                }
-                return aggregate_values(op, &vals);
-            }
-            match arg_expr {
-                // Aggregate over a computed expression: evaluate it per row,
-                // then aggregate the resulting values.
-                Some(e) => {
-                    let vals: Vec<Value> = group_rows
-                        .iter()
-                        .map(|r| crate::planner::eval_scalar_expr(e, r, col_names))
-                        .collect();
-                    aggregate_values(op, &vals)
-                }
-                None => compute_aggregate(op, arg, group_rows, col_names),
-            }
-        }
-        ScalarExpr::DateOffset {
-            base,
-            months,
-            days,
-            seconds,
-        } => apply_date_offset(
-            &eval_scalar_expr_grouped(base, group_rows, col_names),
-            *months,
-            *days,
-            *seconds,
-        ),
-        ScalarExpr::Literal(v) => v.clone(),
-        ScalarExpr::Column(name) => col_names
-            .iter()
-            .position(|c| c == name || c.ends_with(&format!(".{name}")))
-            .and_then(|i| group_rows.first().and_then(|r| r.get(i)))
-            .cloned()
-            .unwrap_or(Value::Null),
-        ScalarExpr::Unary { op, expr } => {
-            apply_unary_op(*op, eval_scalar_expr_grouped(expr, group_rows, col_names))
-        }
-        ScalarExpr::Binary { op, left, right } => apply_binary_op(
-            *op,
-            eval_scalar_expr_grouped(left, group_rows, col_names),
-            eval_scalar_expr_grouped(right, group_rows, col_names),
-        ),
-        ScalarExpr::Cast { expr, target } => cast_value(
-            eval_scalar_expr_grouped(expr, group_rows, col_names),
-            target,
-        ),
-        ScalarExpr::Function { name, args } => {
-            let vals: Vec<Value> = args
-                .iter()
-                .map(|a| eval_scalar_expr_grouped(a, group_rows, col_names))
-                .collect();
-            crate::eval_scalar_function(name, &vals)
-        }
-        ScalarExpr::IsNull { expr, negated } => {
-            let is_null = matches!(
-                eval_scalar_expr_grouped(expr, group_rows, col_names),
-                Value::Null
-            );
-            Value::Bool(if *negated { !is_null } else { is_null })
-        }
-        ScalarExpr::Extract { field, expr } => extract_datetime_field(
-            &eval_scalar_expr_grouped(expr, group_rows, col_names),
-            field,
-        ),
-        ScalarExpr::Case {
-            operand,
-            branches,
-            else_result,
-        } => {
-            let op_val = operand
-                .as_ref()
-                .map(|o| eval_scalar_expr_grouped(o, group_rows, col_names));
-            for (cond, result) in branches {
-                let cond_val = eval_scalar_expr_grouped(cond, group_rows, col_names);
-                let hit = match &op_val {
-                    Some(ov) => ov != &Value::Null && crate::values_equal(ov, &cond_val),
-                    None => cond_val == Value::Bool(true),
+        } = expr
+        else {
+            return Value::Null;
+        };
+        let (group_rows, col_names) = (self.group_rows, self.col_names);
+        if *distinct {
+            // `agg(DISTINCT x)`: gather the per-row argument values,
+            // drop duplicates, then aggregate the distinct set.
+            let mut vals: Vec<Value> = Vec::new();
+            for r in group_rows {
+                let v = match arg_expr {
+                    Some(e) => crate::planner::eval_scalar_expr(e, r, col_names),
+                    None => crate::filter_eval::col_pos(col_names, arg)
+                        .and_then(|i| r.get(i))
+                        .cloned()
+                        .unwrap_or(Value::Null),
                 };
-                if hit {
-                    return eval_scalar_expr_grouped(result, group_rows, col_names);
+                if !vals.iter().any(|x| crate::values_equal(x, &v)) {
+                    vals.push(v);
                 }
             }
-            match else_result {
-                Some(e) => eval_scalar_expr_grouped(e, group_rows, col_names),
-                None => Value::Null,
+            return aggregate_values(op, &vals);
+        }
+        match arg_expr {
+            // Aggregate over a computed expression: evaluate it per row,
+            // then aggregate the resulting values.
+            Some(e) => {
+                let vals: Vec<Value> = group_rows
+                    .iter()
+                    .map(|r| crate::planner::eval_scalar_expr(e, r, col_names))
+                    .collect();
+                aggregate_values(op, &vals)
             }
+            None => compute_aggregate(op, arg, group_rows, col_names),
         }
     }
 }
@@ -403,7 +354,11 @@ pub(crate) fn eval_having(
                 _ => false,
             }
         }
-        // Other shapes (LIKE/IN/subquery) are not meaningful in HAVING here.
-        _ => true,
+        // The planner lowers HAVING to one scalar condition over the group.
+        FilterExpr::Scalar(e) => {
+            eval_scalar_expr_grouped(e, group_rows, col_names) == Value::Bool(true)
+        }
+        // Shapes the planner never produces for HAVING must not admit groups.
+        _ => false,
     }
 }

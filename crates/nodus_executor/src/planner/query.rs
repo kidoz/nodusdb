@@ -262,7 +262,7 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
         }
         return Ok(LogicalPlan::SelectLiteral {
             values,
-            filter: parse_predicates(&select.selection, params),
+            filter: parse_predicates(&select.selection, params)?,
         });
     }
     let (table_name, table_alias) =
@@ -342,15 +342,15 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
             // `RIGHT JOIN`) from the explicit `... OUTER JOIN` spellings; both map
             // to the same join type.
             JoinOperator::Join(c) | JoinOperator::Inner(c) => {
-                join_constraint(JoinType::Inner, c, params)
+                join_constraint(JoinType::Inner, c, params)?
             }
             JoinOperator::Left(c) | JoinOperator::LeftOuter(c) => {
-                join_constraint(JoinType::LeftOuter, c, params)
+                join_constraint(JoinType::LeftOuter, c, params)?
             }
             JoinOperator::Right(c) | JoinOperator::RightOuter(c) => {
-                join_constraint(JoinType::RightOuter, c, params)
+                join_constraint(JoinType::RightOuter, c, params)?
             }
-            JoinOperator::FullOuter(c) => join_constraint(JoinType::FullOuter, c, params),
+            JoinOperator::FullOuter(c) => join_constraint(JoinType::FullOuter, c, params)?,
             JoinOperator::CrossJoin(_) => (JoinType::Cross, None, Vec::new(), false),
             other => anyhow::bail!("Unsupported join operator: {:?}", other),
         };
@@ -558,6 +558,8 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
                             | BinaryOperator::HashArrow
                             | BinaryOperator::HashLongArrow
                     )
+                    // Nested access (`doc->'a'->>'b'`) is a scalar expression.
+                    && matches!(&**left, Expr::Identifier(_) | Expr::CompoundIdentifier(_))
                 {
                     let left_col = extract_col_name(left)
                         .ok_or_else(|| anyhow::anyhow!("Invalid JSON left"))?;
@@ -774,6 +776,8 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
                             | BinaryOperator::HashArrow
                             | BinaryOperator::HashLongArrow
                     )
+                    // Nested access (`doc->'a'->>'b'`) is a scalar expression.
+                    && matches!(&**left, Expr::Identifier(_) | Expr::CompoundIdentifier(_))
                 {
                     let left_col = extract_col_name(left)
                         .ok_or_else(|| anyhow::anyhow!("Invalid JSON left"))?;
@@ -993,7 +997,8 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
     let having = select
         .having
         .as_ref()
-        .and_then(|expr| parse_filter_expr(expr, params));
+        .map(|expr| parse_having(expr, params))
+        .transpose()?;
 
     Ok(LogicalPlan::Select {
         ctes,
@@ -1002,7 +1007,7 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
         joins,
         projection,
         group_by,
-        filter: parse_predicates(&select.selection, params),
+        filter: parse_predicates(&select.selection, params)?,
         having,
         grouping_sets,
         order_by,
@@ -1047,12 +1052,12 @@ fn join_constraint(
     join_type: JoinType,
     constraint: &sqlparser::ast::JoinConstraint,
     params: &[Value],
-) -> (JoinType, Option<FilterExpr>, Vec<String>, bool) {
+) -> Result<(JoinType, Option<FilterExpr>, Vec<String>, bool)> {
     use sqlparser::ast::JoinConstraint;
-    match constraint {
+    Ok(match constraint {
         JoinConstraint::On(expr) => (
             join_type,
-            parse_filter_expr(expr, params),
+            Some(parse_filter_expr(expr, params)?),
             Vec::new(),
             false,
         ),
@@ -1064,7 +1069,7 @@ fn join_constraint(
         ),
         JoinConstraint::Natural => (join_type, None, Vec::new(), true),
         JoinConstraint::None => (join_type, None, Vec::new(), false),
-    }
+    })
 }
 
 /// Recognizes a set-returning function used as a `FROM`/join relation —
