@@ -6,8 +6,9 @@ use anyhow::{Result, bail};
 use nodus_authz::Action;
 use nodus_catalog::ResourceRef;
 use sqlparser::ast::{
-    AssignmentTarget, BinaryOperator, Expr, FromTable, Query, SelectItem, SetExpr, Statement,
-    TableFactor, TableObject, Value,
+    AssignmentTarget, BinaryOperator, Expr, FromTable, MergeAction, MergeInsertKind,
+    MergeUpdateKind, Query, SelectItem, SetExpr, Statement, TableFactor, TableObject,
+    TableWithJoins, UpdateTableFromKind, Value,
 };
 use sqlparser::{
     dialect::PostgreSqlDialect,
@@ -76,6 +77,27 @@ impl Inference {
         }
         Ok(())
     }
+}
+
+/// Adds `more` to `columns`; a name both have becomes untyped.
+fn add_columns(columns: &mut Columns, more: Columns) {
+    for (name, ty) in more {
+        if columns.contains_key(&name) {
+            columns.insert(name, None);
+        } else {
+            columns.insert(name, ty);
+        }
+    }
+}
+
+/// The type of the target column an assignment or insert names.
+fn column_type(name: &sqlparser::ast::ObjectName, target: &Columns) -> Option<String> {
+    name.0
+        .last()
+        .and_then(|n| n.as_ident())
+        .and_then(|n| target.get(&n.value))
+        .cloned()
+        .flatten()
 }
 
 fn parameter_index(name: &str) -> Result<usize> {
@@ -154,6 +176,32 @@ impl MemExecutor {
         }
     }
 
+    /// The columns of the relations in a FROM list; a name more than one
+    /// relation has is untyped. Parameters inside its subqueries are
+    /// inferred too.
+    fn from_parameters(
+        &self,
+        ctx: &ExecutionContext,
+        from: &[TableWithJoins],
+        inference: &mut Inference,
+    ) -> Result<Columns> {
+        let mut columns = Columns::new();
+        for item in from {
+            for relation in
+                std::iter::once(&item.relation).chain(item.joins.iter().map(|j| &j.relation))
+            {
+                if let TableFactor::Derived { subquery, .. } = relation {
+                    self.query_parameters(ctx, subquery, inference)?;
+                }
+                add_columns(
+                    &mut columns,
+                    self.relation_parameters(ctx, relation, Action::Select)?,
+                );
+            }
+        }
+        Ok(columns)
+    }
+
     fn query_parameters(
         &self,
         ctx: &ExecutionContext,
@@ -169,20 +217,7 @@ impl MemExecutor {
             return Ok(());
         }
         if let SetExpr::Select(select) = query.body.as_ref() {
-            let mut columns = Columns::new();
-            for from in &select.from {
-                for relation in
-                    std::iter::once(&from.relation).chain(from.joins.iter().map(|j| &j.relation))
-                {
-                    for (name, ty) in self.relation_parameters(ctx, relation, Action::Select)? {
-                        if columns.contains_key(&name) {
-                            columns.insert(name, None);
-                        } else {
-                            columns.insert(name, ty);
-                        }
-                    }
-                }
-            }
+            let columns = self.from_parameters(ctx, &select.from, inference)?;
             if let Some(expr) = &select.selection {
                 inference.expression(expr, Some("BOOLEAN".into()), &columns)?;
             }
@@ -246,17 +281,21 @@ impl MemExecutor {
                 }
             }
             Statement::Update(update) => {
-                let columns =
+                let target =
                     self.relation_parameters(ctx, &update.table.relation, Action::Update)?;
+                let mut columns = target.clone();
+                if let Some(
+                    UpdateTableFromKind::AfterSet(from) | UpdateTableFromKind::BeforeSet(from),
+                ) = &update.from
+                {
+                    add_columns(
+                        &mut columns,
+                        self.from_parameters(ctx, from, &mut inference)?,
+                    );
+                }
                 for assignment in &update.assignments {
                     let ty = match &assignment.target {
-                        AssignmentTarget::ColumnName(name) => name
-                            .0
-                            .last()
-                            .and_then(|n| n.as_ident())
-                            .and_then(|n| columns.get(&n.value))
-                            .cloned()
-                            .flatten(),
+                        AssignmentTarget::ColumnName(name) => column_type(name, &target),
                         _ => None,
                     };
                     inference.expression(&assignment.value, ty, &columns)?;
@@ -269,9 +308,74 @@ impl MemExecutor {
                 let (FromTable::WithFromKeyword(tables) | FromTable::WithoutKeyword(tables)) =
                     &delete.from;
                 if let Some(table) = tables.first() {
-                    let columns = self.relation_parameters(ctx, &table.relation, Action::Delete)?;
+                    let mut columns =
+                        self.relation_parameters(ctx, &table.relation, Action::Delete)?;
+                    if let Some(using) = &delete.using {
+                        add_columns(
+                            &mut columns,
+                            self.from_parameters(ctx, using, &mut inference)?,
+                        );
+                    }
                     if let Some(expr) = &delete.selection {
                         inference.expression(expr, Some("BOOLEAN".into()), &columns)?;
+                    }
+                }
+            }
+            Statement::Merge(merge) => {
+                let TableFactor::Table { name, alias, .. } = &merge.table else {
+                    return Ok(inference.types);
+                };
+                let (target, ordered) = self.parameter_columns(
+                    ctx,
+                    &name.to_string(),
+                    alias.as_ref().map(|a| a.name.value.as_str()),
+                    Action::Select,
+                )?;
+                let mut columns = target.clone();
+                let source = TableWithJoins {
+                    relation: merge.source.clone(),
+                    joins: Vec::new(),
+                };
+                add_columns(
+                    &mut columns,
+                    self.from_parameters(ctx, &[source], &mut inference)?,
+                );
+                inference.expression(&merge.on, Some("BOOLEAN".into()), &columns)?;
+                for clause in &merge.clauses {
+                    if let Some(predicate) = &clause.predicate {
+                        inference.expression(predicate, Some("BOOLEAN".into()), &columns)?;
+                    }
+                    match &clause.action {
+                        MergeAction::Update(update) => {
+                            if let MergeUpdateKind::Set(assignments) = &update.kind {
+                                for assignment in assignments {
+                                    let ty = match &assignment.target {
+                                        AssignmentTarget::ColumnName(name) => {
+                                            column_type(name, &target)
+                                        }
+                                        _ => None,
+                                    };
+                                    inference.expression(&assignment.value, ty, &columns)?;
+                                }
+                            }
+                        }
+                        MergeAction::Insert(insert) => {
+                            if let MergeInsertKind::Values(values) = &insert.kind {
+                                for row in &values.rows {
+                                    for (i, expr) in row.content.iter().enumerate() {
+                                        let ty = match insert.columns.get(i) {
+                                            Some(name) => column_type(name, &target),
+                                            None if insert.columns.is_empty() => {
+                                                ordered.get(i).cloned()
+                                            }
+                                            None => None,
+                                        };
+                                        inference.expression(expr, ty, &columns)?;
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }

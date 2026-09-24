@@ -1100,3 +1100,56 @@ async fn test_extended_returning_reports_its_command_tag() {
     assert_eq!(sequence, [b'1', b'2', b'T', b'D', b'C', b'Z']);
     assert_eq!(tag, "UPDATE 1");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_parameters_compared_with_joined_relations_are_typed() {
+    let server = TestServer::start().await.expect("server starts");
+    let client = connect(&server).await;
+    client
+        .batch_execute(
+            "CREATE TABLE param_t (id INT PRIMARY KEY, v TEXT); \
+             CREATE TABLE param_s (id INT, w TEXT); \
+             INSERT INTO param_t VALUES (1, 'a'), (2, 'b'); \
+             INSERT INTO param_s VALUES (1, 'x'), (2, 'y');",
+        )
+        .await
+        .unwrap();
+
+    let rows = client
+        .query(
+            "UPDATE param_t SET v = $1 FROM param_s WHERE param_s.id = param_t.id \
+             AND param_s.w = $2 RETURNING param_t.id, param_s.w",
+            &[&"new", &"y"],
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    let (id, w): (i32, &str) = (rows[0].get(0), rows[0].get(1));
+    assert_eq!((id, w), (2, "y"));
+
+    let deleted = client
+        .execute(
+            "DELETE FROM param_t USING param_s WHERE param_s.id = param_t.id AND param_s.id = $1",
+            &[&1_i32],
+        )
+        .await
+        .unwrap();
+    assert_eq!(deleted, 1);
+
+    let merged = client
+        .execute(
+            "MERGE INTO param_t t USING param_s s ON t.id = s.id \
+             WHEN MATCHED THEN UPDATE SET v = $1 \
+             WHEN NOT MATCHED AND s.id = $2 THEN INSERT (id, v) VALUES (s.id, $1)",
+            &[&"merged", &1_i32],
+        )
+        .await
+        .unwrap();
+    assert_eq!(merged, 2);
+    let rows = client
+        .query("SELECT id, v FROM param_t ORDER BY id", &[])
+        .await
+        .unwrap();
+    let got: Vec<(i32, String)> = rows.iter().map(|r| (r.get(0), r.get(1))).collect();
+    assert_eq!(got, [(1, "merged".to_string()), (2, "merged".to_string())]);
+}
