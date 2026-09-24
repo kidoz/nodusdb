@@ -55,6 +55,9 @@ pub(crate) struct PortalCursor {
     rows: Vec<DataRow>,
     position: usize,
     total_rows: usize,
+    /// The command its completion tag reports (`SELECT`, or `UPDATE` and
+    /// the like for a statement with RETURNING).
+    command: String,
 }
 
 impl PortalCursor {
@@ -451,12 +454,17 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
                     cursor.rows = Vec::new();
                     cursor.position = 0;
                 }
-                Some((fields, rows, suspended, total_rows))
+                Some((
+                    fields,
+                    rows,
+                    suspended,
+                    (cursor.command.clone(), total_rows),
+                ))
             } else {
                 None
             }
         };
-        if let Some((fields, rows, suspended, total_rows)) = existing {
+        if let Some((fields, rows, suspended, (command, total_rows))) = existing {
             for row in rows {
                 client.send(PgWireBackendMessage::DataRow(row)).await?;
             }
@@ -467,7 +475,7 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
             } else {
                 client
                     .send(PgWireBackendMessage::CommandComplete(
-                        Tag::new("SELECT").with_rows(total_rows).into(),
+                        Tag::new(&command).with_rows(total_rows).into(),
                     ))
                     .await?;
             }
@@ -561,6 +569,7 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
                         rows: vec![],
                         position: 0,
                         total_rows: count,
+                        command: "SELECT".to_string(),
                     },
                 );
             return Ok(());
@@ -593,6 +602,7 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
                     rows,
                     position: 0,
                     total_rows: 0,
+                    command: results.command_tag().to_string(),
                 };
                 cursor.total_rows = cursor.rows.len();
                 let (chunk, suspended) = cursor.next_chunk(max_rows);
@@ -609,6 +619,7 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
                         .await?;
                 } else {
                     let total_rows = cursor.total_rows;
+                    let command = Tag::new(&cursor.command).with_rows(total_rows);
                     cursor.rows = Vec::new();
                     cursor.position = 0;
                     self.cursors
@@ -616,9 +627,7 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .insert(key, cursor);
                     client
-                        .send(PgWireBackendMessage::CommandComplete(
-                            Tag::new("SELECT").with_rows(total_rows).into(),
-                        ))
+                        .send(PgWireBackendMessage::CommandComplete(command.into()))
                         .await?;
                 }
             }

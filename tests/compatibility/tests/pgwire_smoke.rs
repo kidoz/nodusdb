@@ -1057,3 +1057,46 @@ async fn test_wire_copy_out_data_and_command_count() {
     assert_eq!(complete, b"ROLLBACK\0");
     assert_eq!(read_backend_message(&mut stream).await.1, b"I");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_extended_returning_reports_its_command_tag() {
+    let server = TestServer::start().await.expect("server starts");
+    let mut stream = open_raw_pgwire(&server).await;
+    write_frontend_message(
+        &mut stream,
+        b'Q',
+        b"CREATE TABLE tag_t (id INT PRIMARY KEY, v TEXT); \
+          CREATE TABLE tag_s (id INT, w TEXT); \
+          INSERT INTO tag_t VALUES (1, 'a'), (2, 'b'); \
+          INSERT INTO tag_s VALUES (2, 'x');\0",
+    )
+    .await;
+    while read_backend_message(&mut stream).await.0 != b'Z' {}
+
+    let sql = b"UPDATE tag_t SET v = tag_s.w FROM tag_s WHERE tag_s.id = tag_t.id RETURNING tag_t.id, tag_s.w\0";
+    let mut parse = b"\0".to_vec();
+    parse.extend_from_slice(sql);
+    parse.extend_from_slice(&0_i16.to_be_bytes());
+    write_frontend_message(&mut stream, b'P', &parse).await;
+    let mut bind = b"\0\0".to_vec();
+    bind.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+    write_frontend_message(&mut stream, b'B', &bind).await;
+    write_frontend_message(&mut stream, b'D', b"P\0").await;
+    write_frontend_message(&mut stream, b'E', b"\0\0\0\0\0").await;
+    write_frontend_message(&mut stream, b'S', &[]).await;
+
+    let mut sequence = Vec::new();
+    let mut tag = String::new();
+    loop {
+        let (message_type, body) = read_backend_message(&mut stream).await;
+        sequence.push(message_type);
+        if message_type == b'C' {
+            tag = String::from_utf8_lossy(body.strip_suffix(b"\0").unwrap_or(&body)).into();
+        }
+        if message_type == b'Z' {
+            break;
+        }
+    }
+    assert_eq!(sequence, [b'1', b'2', b'T', b'D', b'C', b'Z']);
+    assert_eq!(tag, "UPDATE 1");
+}
