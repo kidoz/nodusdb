@@ -10,27 +10,43 @@ impl MemExecutor {
         ctx: &ExecutionContext,
         values: Vec<(String, Value, Option<String>)>,
         filter: Option<FilterExpr>,
+        deferred: Vec<Option<DeferredItem>>,
     ) -> Result<QueryOutput> {
         let mut columns = Vec::new();
         let mut types = Vec::new();
         let mut row_values = Vec::new();
 
+        let mut deferred = deferred.into_iter();
         for (alias, value, type_hint) in values {
-            columns.push(alias);
-            // A CAST's declared type wins (so `NULL::int` is int4); otherwise
-            // infer from the value's variant.
-            let ty = match type_hint {
-                Some(t) => match crate::value::column_type(&t) {
-                    crate::value::ColumnType::Int => "INTEGER",
-                    crate::value::ColumnType::Float => "DOUBLE",
-                    crate::value::ColumnType::Bool => "BOOLEAN",
-                    crate::value::ColumnType::Text => "VARCHAR",
+            let mut type_hint = type_hint;
+            let value = match deferred.next().flatten() {
+                Some(DeferredItem::Scalar(expr)) => {
+                    type_hint =
+                        type_hint.or_else(|| crate::result_types::constant_expr_type(&expr));
+                    let value = eval_scalar_expr(&expr, &[], &[]);
+                    crate::eval_error::check()?;
+                    value
                 }
-                .to_string(),
+                Some(DeferredItem::Subquery(plan)) => self.scalar_subquery_value(ctx, *plan)?,
+                Some(DeferredItem::Exists { plan, negated }) => {
+                    let found = !self.execute_logical_inner(ctx, *plan)?.rows.is_empty();
+                    Value::Bool(found != negated)
+                }
+                None => value,
+            };
+            columns.push(alias);
+            // A cast's or function's declared type wins (so `NULL::int` is
+            // int4 and `now()` is timestamptz); otherwise infer from the value.
+            let ty = match type_hint {
+                Some(t) => t,
                 None => match &value {
-                    Value::Int(_) => "INTEGER".to_string(),
+                    Value::Int(i) if i32::try_from(*i).is_ok() => "INTEGER".to_string(),
+                    Value::Int(_) => "BIGINT".to_string(),
                     Value::Float(_) => "DOUBLE".to_string(),
                     Value::Bool(_) => "BOOLEAN".to_string(),
+                    Value::Jsonb(_) => "JSONB".to_string(),
+                    // An untyped string literal resolves to text.
+                    Value::Text(_) => "TEXT".to_string(),
                     _ => "VARCHAR".to_string(),
                 },
             };
@@ -55,6 +71,29 @@ impl MemExecutor {
             rows,
             tag,
         })
+    }
+
+    /// Runs a scalar subquery used as a value: its single column from at most
+    /// one row, NULL when it returns none.
+    pub(crate) fn scalar_subquery_value(
+        &self,
+        ctx: &ExecutionContext,
+        plan: LogicalPlan,
+    ) -> Result<Value> {
+        let out = self.execute_logical_inner(ctx, plan)?;
+        if out.columns.len() != 1 {
+            anyhow::bail!("subquery must return only one column");
+        }
+        match out.rows.len() {
+            0 => Ok(Value::Null),
+            1 => Ok(out
+                .rows
+                .into_iter()
+                .next()
+                .and_then(|row| row.values.into_iter().next())
+                .unwrap_or(Value::Null)),
+            _ => anyhow::bail!("more than one row returned by a subquery used as an expression"),
+        }
     }
 
     pub(crate) fn exec_set_op(

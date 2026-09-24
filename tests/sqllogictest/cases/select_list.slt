@@ -1,0 +1,237 @@
+# Select-list expressions, the function library, casts, and runtime errors.
+# Expected results come from PostgreSQL 18.
+statement ok
+CREATE TABLE sl (id INT PRIMARY KEY, a INT, s TEXT, ts TIMESTAMP, d DATE);
+
+statement ok
+INSERT INTO sl VALUES (1, 10, 'x', '2024-01-01 10:00', '2024-02-03'), (2, NULL, 'yy', NULL, NULL), (3, 0, ' pad ', '2024-03-01T08:30:15.5', '2024-12-31');
+
+# Constant items are computed per item, not reused.
+query TTTTT
+SELECT upper('a'), upper('b'), lower('ABC'), length('héllo'), octet_length('héllo');
+----
+A	B	abc	5	6
+
+query TTTTT
+SELECT substr('hello', 2, 3), substring('hello' from 2 for 3), substring('hello', 2), position('l' in 'hello'), strpos('hello', 'l');
+----
+ell	ell	ello	3	3
+
+query TTTTT
+SELECT overlay('hello' placing 'XX' from 2 for 3), trim('  a  '), trim(leading 'x' from 'xxaxx'), trim(trailing 'x' from 'xxaxx'), btrim('xxaxx', 'x');
+----
+hXXo	a	axx	xxa	a
+
+query TTTTT
+SELECT replace('abcabc', 'b', 'X'), reverse('abc'), repeat('ab', 3), lpad('7', 3, '0'), rpad('7', 3, '*');
+----
+aXcaXc	cba	ababab	007	7**
+
+query TTTT
+SELECT concat('a', NULL, 'b', 1), concat_ws('-', 'a', NULL, 'b'), 'a' || 'b', ('a' || NULL) IS NULL;
+----
+ab1	a-b	ab	t
+
+query TTTTT
+SELECT left('hello', 2), right('hello', 2), left('hello', -2), initcap('hello world'), split_part('a,b,c', ',', 2);
+----
+he	lo	hel	Hello World	b
+
+query TTTTT
+SELECT md5('abc'), format('%s-%s', 'a', 1), format('%I', 'my col'), quote_ident('a b'), quote_literal('it''s');
+----
+900150983cd24fb0d6963f7d28e17f72	a-1	"my col"	"a b"	'it''s'
+
+query TTTTTT
+SELECT regexp_replace('abc123', '[0-9]+', 'N'), 'abc' ~ 'b', 'ABC' ~* 'b', ascii('A'), chr(66), to_hex(255);
+----
+abcN	t	t	65	B	ff
+
+query TTTTT
+SELECT coalesce(NULL, 2, 3), nullif(1, 1) IS NULL, nullif(1, 2), greatest(1, 5, 3), least(4, 2, 8);
+----
+2	t	1	5	2
+
+query TTTTTTTT
+SELECT abs(-5), ceil(1.2), floor(-1.2), round(2.567, 2), trunc(2.567, 1), mod(10, 3), power(2, 10), sqrt(16);
+----
+5	2	-2	2.57	2.5	1	1024	4
+
+query TTTTT
+SELECT sign(-3), exp(0), ln(1), log(100), pi() > 3.14;
+----
+-1	1	0	2	t
+
+query TTTTT
+SELECT 'yes'::boolean, 'off'::boolean, '42'::int + 1, 1::text || 'x', '{1,2}'::int[];
+----
+t	f	43	1x	{1,2}
+
+query TTTT
+SELECT current_user, session_user, current_role, user;
+----
+nodus	nodus	nodus	nodus
+
+query TT
+SELECT current_database(), current_schema();
+----
+default	public
+
+query TT
+SELECT now() = current_timestamp, now() = transaction_timestamp();
+----
+t	t
+
+query TT
+SELECT current_setting('DateStyle'), current_setting('no.such', true) IS NULL;
+----
+ISO, MDY	t
+
+query TT
+SELECT length(gen_random_uuid()::text), uuid_extract_version(gen_random_uuid());
+----
+36	4
+
+query TTTT
+SELECT pg_typeof(1), pg_typeof('a'::text), pg_typeof(true), pg_size_pretty(10485760::bigint);
+----
+integer	text	boolean	10 MB
+
+query TTTT
+SELECT pg_is_in_recovery(), format_type(23, -1), format_type(1043, 24), format_type(1700, 655366);
+----
+f	integer	character varying(20)	numeric(10,2)
+
+query TTTT
+SELECT to_json('a'::text), to_jsonb(1), jsonb_typeof('{"a":1}'::jsonb), jsonb_array_length('[1,2,3]'::jsonb);
+----
+"a"	1	object	3
+
+query TTTT
+SELECT array_length(ARRAY[1,2,3], 1), cardinality(ARRAY[1,2]), array_append(ARRAY[1,2], 3), array_cat(ARRAY[1], ARRAY[2,3]);
+----
+3	2	{1,2,3}	{1,2,3}
+
+query TTT
+SELECT array_to_string(ARRAY['a','b'], ','), string_to_array('a,b,c', ','), array_position(ARRAY['a','b'], 'b');
+----
+a,b	{a,b,c}	2
+
+query TTTT
+SELECT (SELECT 1), (SELECT 2) AS two, EXISTS (SELECT 1), NOT EXISTS (SELECT 1 WHERE false);
+----
+1	2	t	t
+
+query T
+SELECT (SELECT a FROM sl WHERE id = 99);
+----
+NULL
+
+query TTT
+SELECT CASE WHEN true THEN 'a' ELSE 'b' END, ARRAY[1,2], ROW(1, 2);
+----
+a	{1,2}	(1,2)
+
+query TTTT
+SELECT CAST(1 AS bigint), 1::text, '1'::numeric, NULL::int IS NULL;
+----
+1	1	1	t
+
+# Over a table: every expression is evaluated per row.
+query TTTTTTT
+SELECT id, upper(s), length(s), a + 1, -a, a * 2, s || '!' FROM sl ORDER BY id;
+----
+1	X	1	11	-10	20	x!
+2	YY	2	NULL	NULL	NULL	yy!
+3	 PAD 	5	1	0	0	 pad !
+
+query TTTTTTTT
+SELECT id, coalesce(a, 0), nullif(a, 10), greatest(a, 5), a IS NULL, s LIKE 'x%', a BETWEEN 1 AND 20, a IN (10, 20) FROM sl ORDER BY id;
+----
+1	10	NULL	10	f	t	t	t
+2	0	NULL	5	t	f	NULL	NULL
+3	0	0	5	f	f	f	f
+
+query TTTTT
+SELECT id, substr(s, 1, 1), position('y' in s), trim(s), md5(s) FROM sl ORDER BY id;
+----
+1	x	0	x	9dd4e461268c8034f5c8564e155c67a6
+2	y	1	yy	2fb1c5cf58867b5bbc9a1b145a86f3a0
+3	 	0	pad	4b78c5467403d129dcccb76a03562053
+
+query TTT
+SELECT id, (SELECT max(a) FROM sl) AS top, (SELECT s FROM sl i WHERE i.id = sl.id) FROM sl ORDER BY id;
+----
+1	10	x
+2	10	yy
+3	10	 pad 
+
+query TTTT
+SELECT id, ARRAY[id, id * 10], ROW(a, id), CASE WHEN a > 5 THEN 'big' WHEN a IS NULL THEN 'none' ELSE 'small' END FROM sl ORDER BY id;
+----
+1	{1,10}	(10,1)	big
+2	{2,20}	(,2)	none
+3	{3,30}	(0,3)	small
+
+query TTT
+SELECT count(*) AS n, sum(a) AS total, max(s) AS top FROM sl;
+----
+3	10	yy
+
+# Runtime errors fail the statement instead of yielding NULL.
+statement error
+SELECT 1/0;
+
+statement error
+SELECT 5 % 0;
+
+statement error
+SELECT 10 / a FROM sl;
+
+statement error
+SELECT id FROM sl WHERE 10 / a > 1;
+
+statement error
+SELECT sqrt(-1);
+
+statement error
+SELECT ln(0);
+
+statement error
+SELECT 'abc'::int;
+
+statement error
+SELECT '1.5'::int;
+
+statement error
+SELECT 'maybe'::boolean;
+
+statement error
+SELECT 9223372036854775807 + 1;
+
+statement error
+SELECT no_such_function(1);
+
+statement error
+SELECT no_such_function(a) FROM sl;
+
+statement error
+SELECT length();
+
+statement error
+SELECT foo;
+
+statement error
+SELECT (SELECT a FROM sl);
+
+statement error
+SELECT id, (SELECT a FROM sl) FROM sl;
+
+statement error
+SELECT current_setting('no.such');
+
+statement error
+SELECT id FROM sl WHERE a = (SELECT a FROM sl);
+
+statement ok
+DROP TABLE sl;

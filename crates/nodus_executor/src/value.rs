@@ -89,7 +89,11 @@ pub(crate) fn coerce_for_column(value: &Value, data_type: &str) -> Value {
         Value::Text(s) if array_element_type(data_type).is_some() => {
             coerce_array_text(s, data_type).unwrap_or_else(|| value.clone())
         }
-        Value::Text(s) => coerce(s, column_type(data_type)),
+        // Text into a numeric or boolean column must parse as that type.
+        Value::Text(_) if column_type(data_type) != ColumnType::Text => {
+            crate::planner::cast_value(value.clone(), data_type)
+        }
+        Value::Text(s) => coerce(s, ColumnType::Text),
         scalar => match column_type(data_type) {
             ColumnType::Int => match scalar {
                 Value::Int(_) => scalar.clone(),
@@ -108,6 +112,42 @@ pub(crate) fn coerce_for_column(value: &Value, data_type: &str) -> Value {
             // TEXT/VARCHAR and the catch-all: keep the scalar's representation.
             ColumnType::Text => scalar.clone(),
         },
+    }
+}
+
+/// PostgreSQL's name for a declared type, as used in error messages.
+pub(crate) fn sql_type_name(data_type: &str) -> String {
+    let t = data_type.trim().to_ascii_uppercase();
+    let name = if t.contains("BIGINT") || t == "INT8" || t.contains("BIGSERIAL") {
+        "bigint"
+    } else if t.contains("SMALLINT") || t == "INT2" || t.contains("SMALLSERIAL") {
+        "smallint"
+    } else if t.contains("INT") || t.contains("SERIAL") {
+        "integer"
+    } else if t.contains("REAL") || t == "FLOAT4" {
+        "real"
+    } else if t.contains("DOUBLE") || t.contains("FLOAT") {
+        "double precision"
+    } else if t.contains("NUMERIC") || t.contains("DECIMAL") {
+        "numeric"
+    } else if t.contains("BOOL") {
+        "boolean"
+    } else {
+        return data_type.trim().to_ascii_lowercase();
+    };
+    name.to_string()
+}
+
+/// A value's SQL type category, for error messages.
+pub(crate) fn value_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Int(_) => "integer",
+        Value::Float(_) => "double precision",
+        Value::Text(_) => "text",
+        Value::Bool(_) => "boolean",
+        Value::Array(_) => "array",
+        Value::Jsonb(_) => "jsonb",
+        Value::Null => "unknown",
     }
 }
 
@@ -218,10 +258,7 @@ pub(crate) fn coerce_array_text(text: &str, array_type: &str) -> Option<Value> {
             .into_iter()
             .map(|item| match item {
                 Value::Array(inner) => typed(inner, element_type).map(Value::Array),
-                Value::Text(t) => match crate::planner::cast_value(Value::Text(t), element_type) {
-                    Value::Null => None,
-                    v => Some(v),
-                },
+                Value::Text(t) => crate::planner::try_cast(Value::Text(t), element_type).ok(),
                 other => Some(other),
             })
             .collect()
@@ -291,132 +328,14 @@ pub(crate) fn resolve_scalar_arg(arg: &str, row: &[Value], col_names: &[String])
     }
 }
 
-/// Evaluates a scalar SQL function over already-resolved argument values.
-/// Unknown functions yield `Null` (the prior behaviour). NULL propagation
-/// follows SQL: most functions return NULL on a NULL primary argument.
+/// Evaluates a built-in scalar function for the legacy string-argument
+/// projection path. A name the library does not implement yields NULL here;
+/// the planner and executor reject such calls outside catalog introspection.
 pub(crate) fn eval_scalar_function(name: &str, args: &[Value]) -> Value {
-    let as_text = |v: &Value| -> Option<String> {
-        match v {
-            Value::Null => None,
-            Value::Text(s) => Some(s.clone()),
-            other => Some(render(other)),
-        }
-    };
-    let as_num = |v: &Value| -> Option<f64> {
-        match v {
-            Value::Int(i) => Some(*i as f64),
-            Value::Float(f) => Some(*f),
-            Value::Text(s) => s.parse().ok(),
-            _ => None,
-        }
-    };
-    match name {
-        "CONCAT" => Value::Text(
-            args.iter()
-                .filter(|v| **v != Value::Null)
-                .map(render)
-                .collect(),
-        ),
-        "UPPER" => args
-            .first()
-            .and_then(&as_text)
-            .map_or(Value::Null, |s| Value::Text(s.to_uppercase())),
-        "LOWER" => args
-            .first()
-            .and_then(&as_text)
-            .map_or(Value::Null, |s| Value::Text(s.to_lowercase())),
-        "LENGTH" | "CHAR_LENGTH" | "CHARACTER_LENGTH" => args
-            .first()
-            .and_then(&as_text)
-            .map_or(Value::Null, |s| Value::Int(s.chars().count() as i64)),
-        "TRIM" => args
-            .first()
-            .and_then(&as_text)
-            .map_or(Value::Null, |s| Value::Text(s.trim().to_string())),
-        "LTRIM" => args
-            .first()
-            .and_then(&as_text)
-            .map_or(Value::Null, |s| Value::Text(s.trim_start().to_string())),
-        "RTRIM" => args
-            .first()
-            .and_then(&as_text)
-            .map_or(Value::Null, |s| Value::Text(s.trim_end().to_string())),
-        "COALESCE" => args
-            .iter()
-            .find(|v| **v != Value::Null)
-            .cloned()
-            .unwrap_or(Value::Null),
-        "NULLIF" => {
-            if args.len() == 2 && values_equal(&args[0], &args[1]) {
-                Value::Null
-            } else {
-                args.first().cloned().unwrap_or(Value::Null)
-            }
-        }
-        "ABS" => match args.first() {
-            Some(Value::Int(i)) => Value::Int(i.abs()),
-            Some(Value::Float(f)) => Value::Float(f.abs()),
-            _ => Value::Null,
-        },
-        "ROUND" => match args.first().and_then(&as_num) {
-            Some(x) => {
-                let digits = args.get(1).and_then(&as_num).unwrap_or(0.0) as i32;
-                let factor = 10f64.powi(digits);
-                Value::Float((x * factor).round() / factor)
-            }
-            None => Value::Null,
-        },
-        "REPLACE" => {
-            if let (Some(s), Some(from), Some(to)) = (
-                args.first().and_then(&as_text),
-                args.get(1).and_then(&as_text),
-                args.get(2).and_then(&as_text),
-            ) {
-                Value::Text(s.replace(&from, &to))
-            } else {
-                Value::Null
-            }
-        }
-        "SUBSTR" | "SUBSTRING" => {
-            let Some(s) = args.first().and_then(&as_text) else {
-                return Value::Null;
-            };
-            let chars: Vec<char> = s.chars().collect();
-            let start = args.get(1).and_then(&as_num).unwrap_or(1.0) as i64; // 1-based
-            let start_idx = (start.max(1) - 1) as usize;
-            let out: String = match args.get(2).and_then(&as_num) {
-                Some(len) => chars
-                    .iter()
-                    .skip(start_idx)
-                    .take(len.max(0.0) as usize)
-                    .collect(),
-                None => chars.iter().skip(start_idx).collect(),
-            };
-            Value::Text(out)
-        }
-        "DATE_TRUNC" => {
-            match (
-                args.first().and_then(&as_text),
-                args.get(1).and_then(&as_text),
-            ) {
-                (Some(unit), Some(ts)) => date_trunc_text(&unit, &ts),
-                _ => Value::Null,
-            }
-        }
-        "AGE" => match (
-            args.first().and_then(&as_text),
-            args.get(1).and_then(&as_text),
-        ) {
-            (Some(a), Some(b)) => age_text(&a, &b),
-            _ => Value::Null,
-        },
-        // Catalog visibility (used by psql's `\d` family). Every schema is
-        // searched without shadowing, so an existing object is visible.
-        name if is_visibility_fn(name) => match args.first() {
-            Some(Value::Null) | None => Value::Null,
-            Some(_) => Value::Bool(true),
-        },
-        _ => Value::Null,
+    if crate::functions::is_known(name) {
+        crate::functions::call(name, args)
+    } else {
+        Value::Null
     }
 }
 
@@ -455,7 +374,7 @@ fn parse_naive_dt(s: &str) -> Option<chrono::NaiveDateTime> {
 
 /// `date_trunc(unit, ts)` — truncates to year/month/day/hour/minute/second and
 /// returns a timestamp text (PostgreSQL semantics).
-fn date_trunc_text(unit: &str, ts: &str) -> Value {
+pub(crate) fn date_trunc_text(unit: &str, ts: &str) -> Value {
     use chrono::{Datelike, NaiveDate, Timelike};
     let Some(dt) = parse_naive_dt(ts) else {
         return Value::Null;
@@ -493,7 +412,7 @@ fn days_in_month(year: i32, month: u32) -> i64 {
 
 /// `age(a, b)` — the calendar interval `a - b`, decomposed into years/months/
 /// days with PostgreSQL-style borrowing, rendered as e.g. `1 year 2 mons`.
-fn age_text(a: &str, b: &str) -> Value {
+pub(crate) fn age_text(a: &str, b: &str) -> Value {
     use chrono::Datelike;
     let (Some(da), Some(db)) = (
         parse_naive_dt(a).map(|x| x.date()),

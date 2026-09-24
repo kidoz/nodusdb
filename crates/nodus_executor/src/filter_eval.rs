@@ -165,7 +165,13 @@ impl MemExecutor {
                 // column's type so comparison agrees (e.g. text "40" vs int 40).
                 // Outer references are substituted first (correlation).
                 let correlated = self.correlate_subplan(subquery, row, col_names);
-                let out = self.execute_logical_inner(ctx, correlated).ok()?;
+                let out = self.run_subquery(ctx, correlated)?;
+                if out.rows.len() > 1 {
+                    crate::eval_error::raise(
+                        "more than one row returned by a subquery used as an expression",
+                    );
+                    return None;
+                }
                 let right_cell = out
                     .rows
                     .first()
@@ -265,13 +271,7 @@ impl MemExecutor {
                 // Blocking execution; outer references in the subquery are
                 // substituted with this row's values first (correlation).
                 let correlated = self.correlate_subplan(subquery, row, col_names);
-                let exec_res = self.execute_logical_inner(ctx, correlated);
-                let out = exec_res.unwrap_or(QueryOutput {
-                    columns: vec![],
-                    types: vec![],
-                    rows: vec![],
-                    tag: String::new(),
-                });
+                let out = self.run_subquery(ctx, correlated)?;
 
                 let mut matches = false;
                 let mut found_null = false;
@@ -332,15 +332,7 @@ impl MemExecutor {
                 // this row's values (correlation), then execute it. The result
                 // is true iff the subquery yields at least one row.
                 let correlated = self.correlate_subplan(subquery, row, col_names);
-                let out = self
-                    .execute_logical_inner(ctx, correlated)
-                    .unwrap_or(QueryOutput {
-                        columns: vec![],
-                        types: vec![],
-                        rows: vec![],
-                        tag: String::new(),
-                    });
-                let exists = !out.rows.is_empty();
+                let exists = !self.run_subquery(ctx, correlated)?.rows.is_empty();
                 Some(if *negated { !exists } else { exists })
             }
             FilterExpr::Scalar(e) => match crate::eval_scalar_expr(e, row, col_names) {
@@ -355,7 +347,7 @@ impl MemExecutor {
             } => {
                 let left = crate::eval_scalar_expr(left, row, col_names);
                 let correlated = self.correlate_subplan(subquery, row, col_names);
-                let out = self.execute_logical_inner(ctx, correlated).ok()?;
+                let out = self.run_subquery(ctx, correlated)?;
                 let values = out
                     .rows
                     .into_iter()
@@ -369,12 +361,39 @@ impl MemExecutor {
         }
     }
 
+    /// A scalar subquery's value for one outer row. Errors (more than one
+    /// row, a failing subquery) fail the statement through
+    /// [`crate::eval_error`].
+    pub(crate) fn correlated_scalar_subquery(
+        &self,
+        ctx: &ExecutionContext,
+        plan: &LogicalPlan,
+        row: &[Value],
+        col_names: &[String],
+    ) -> Value {
+        let correlated = self.correlate_subplan(plan, row, col_names);
+        self.scalar_subquery_value(ctx, correlated)
+            .unwrap_or_else(|e| crate::eval_error::raise(e.to_string()))
+    }
+
+    /// Runs a subquery inside a condition. A failure fails the statement
+    /// (through [`crate::eval_error`]) instead of reading as "no rows".
+    fn run_subquery(&self, ctx: &ExecutionContext, plan: LogicalPlan) -> Option<QueryOutput> {
+        match self.execute_logical_inner(ctx, plan) {
+            Ok(out) => Some(out),
+            Err(e) => {
+                crate::eval_error::raise(e.to_string());
+                None
+            }
+        }
+    }
+
     /// Clones a subquery plan and rewrites its top-level `WHERE` so that any
     /// reference qualified by an alias that isn't the subquery's own table
     /// (i.e. an outer/correlated reference) is replaced with the outer row's
     /// value. Non-`Select` plans and uncorrelated subqueries pass through
     /// unchanged.
-    fn correlate_subplan(
+    pub(crate) fn correlate_subplan(
         &self,
         plan: &LogicalPlan,
         outer_row: &[Value],

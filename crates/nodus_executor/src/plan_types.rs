@@ -448,6 +448,19 @@ impl ScalarExpr {
     }
 }
 
+/// A FROM-less select item evaluated at execution time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum DeferredItem {
+    Scalar(ScalarExpr),
+    /// A scalar subquery: one column, at most one row (none is NULL).
+    Subquery(Box<LogicalPlan>),
+    /// `[NOT] EXISTS (subquery)`.
+    Exists {
+        plan: Box<LogicalPlan>,
+        negated: bool,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum PatternKind {
     Like,
@@ -494,7 +507,7 @@ pub enum ScalarBinaryOp {
     Overlap,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ProjectionItem {
     Column(String),
     AliasedColumn(String, String),
@@ -549,6 +562,12 @@ pub enum ProjectionItem {
     /// serialized plans still decode.
     Expr {
         expr: ScalarExpr,
+        alias: Option<String>,
+    },
+    /// A scalar subquery, run for each output row with the row's values
+    /// substituted for its outer references.
+    Subquery {
+        plan: Box<LogicalPlan>,
         alias: Option<String>,
     },
 }
@@ -770,6 +789,11 @@ pub enum LogicalPlan {
         /// so plans serialized before this field decode.
         #[serde(default)]
         filter: Option<FilterExpr>,
+        /// Items computed when the statement runs (parallel to `values`, whose
+        /// entry is a placeholder): session functions, volatile functions, and
+        /// scalar subqueries.
+        #[serde(default)]
+        deferred: Vec<Option<DeferredItem>>,
     },
     SetOp {
         op: SetOpKind,

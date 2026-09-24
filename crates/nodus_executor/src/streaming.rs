@@ -38,6 +38,8 @@ impl MemExecutor {
         plan: LogicalPlan,
         sink: &mut dyn RowSink,
     ) -> Result<String> {
+        let _env = crate::session_env::install(self.session_env(ctx));
+        crate::eval_error::reset();
         if let LogicalPlan::Select {
             ctes,
             table_name,
@@ -77,6 +79,8 @@ impl MemExecutor {
                 sink,
             )?
         {
+            // A filter that failed to evaluate on a streamed row fails the query.
+            crate::eval_error::check()?;
             return Ok(tag);
         }
 

@@ -210,9 +210,16 @@ pub(crate) fn parse_filter_expr(
     if let Some(filter) = planned {
         return Ok(filter);
     }
-    lower_scalar(expr, params)
-        .map(FilterExpr::Scalar)
-        .ok_or_else(|| anyhow::anyhow!("Unsupported WHERE condition: {expr}"))
+    let condition = lower_scalar(expr, params).ok_or_else(|| {
+        anyhow::anyhow!(
+            unknown_function_error(expr)
+                .unwrap_or_else(|| format!("Unsupported WHERE condition: {expr}"))
+        )
+    })?;
+    if scalar_has_aggregate(&condition) {
+        anyhow::bail!("aggregate functions are not allowed in WHERE");
+    }
+    Ok(FilterExpr::Scalar(condition))
 }
 
 /// A bare or qualified column reference (not a JSON access or cast).

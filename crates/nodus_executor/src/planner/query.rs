@@ -211,9 +211,10 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
 
     if select.from.is_empty() {
         let mut values = Vec::new();
+        let mut deferred = Vec::new();
         for item in &select.projection {
             let (expr, alias) = match item {
-                SelectItem::UnnamedExpr(expr) => (expr, "?column?".to_string()),
+                SelectItem::UnnamedExpr(expr) => (expr, default_output_name(expr)),
                 SelectItem::ExprWithAlias { expr, alias } => (expr, alias.value.to_string()),
                 _ => anyhow::bail!("Unsupported scalar select item"),
             };
@@ -224,45 +225,42 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
             } else {
                 None
             };
-            if let Some(val) = expr_to_value(expr, params) {
-                values.push((alias, val, type_hint));
-            } else if let Some(val) = fold_scalar(expr, params) {
-                // Computed constant expressions: arithmetic, comparisons, CAST,
-                // string concat, and scalar function calls. (Legacy handling
-                // below still covers niladic specials like version().)
-                values.push((alias, val, type_hint));
-            } else if let Expr::Function(func) = expr {
-                let func_name = func.name.to_string();
-                let rendered = if func_name.eq_ignore_ascii_case("version") {
-                    "PostgreSQL 18.0 (NodusDB)".to_string()
-                } else if func_name.eq_ignore_ascii_case("current_database") {
-                    "default".to_string()
-                } else if func_name.eq_ignore_ascii_case("current_schema") {
-                    "public".to_string()
-                } else if func_name.eq_ignore_ascii_case("current_user") {
-                    "nodus".to_string()
-                } else if func_name.eq_ignore_ascii_case("current_schemas") {
-                    "{public}".to_string()
-                } else if func_name.eq_ignore_ascii_case("round") {
-                    "0".to_string()
-                } else {
-                    func_name
-                };
-                values.push((alias, crate::Value::Text(rendered), type_hint));
-            } else if let Expr::Identifier(id) = expr {
-                let rendered = if id.value.eq_ignore_ascii_case("current_user") {
-                    "nodus".to_string()
-                } else {
-                    id.value.to_string()
-                };
-                values.push((alias, crate::Value::Text(rendered), type_hint));
-            } else {
-                values.push((alias, crate::Value::Int(0), type_hint));
-            }
+            let item = match expr {
+                Expr::Subquery(query) => {
+                    DeferredItem::Subquery(Box::new(plan_query(query, params)?))
+                }
+                Expr::Exists { subquery, negated } => DeferredItem::Exists {
+                    plan: Box::new(plan_query(subquery, params)?),
+                    negated: *negated,
+                },
+                _ if !matches!(expr, Expr::Identifier(_) | Expr::CompoundIdentifier(_))
+                    && expr_to_value(expr, params).is_some() =>
+                {
+                    let value = expr_to_value(expr, params).expect("checked above");
+                    values.push((alias, value, type_hint));
+                    deferred.push(None);
+                    continue;
+                }
+                _ => {
+                    let scalar =
+                        lower_scalar(expr, params).ok_or_else(|| {
+                            anyhow::anyhow!(unknown_function_error(expr).unwrap_or_else(
+                                || format!("Unsupported expression in SELECT: {expr}")
+                            ))
+                        })?;
+                    if let Some(column) = first_column_reference(&scalar) {
+                        anyhow::bail!("column \"{column}\" does not exist");
+                    }
+                    DeferredItem::Scalar(scalar)
+                }
+            };
+            values.push((alias, crate::Value::Null, type_hint));
+            deferred.push(Some(item));
         }
         return Ok(LogicalPlan::SelectLiteral {
             values,
             filter: parse_predicates(&select.selection, params)?,
+            deferred,
         });
     }
     let (table_name, table_alias) =
@@ -426,437 +424,10 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
                 break;
             }
             SelectItem::UnnamedExpr(expr) => {
-                if let Expr::Function(func) = expr {
-                    let fname = func.name.to_string().to_uppercase();
-                    if let Some(over) = &func.over {
-                        let mut partition_by = Vec::new();
-                        let mut order_by = Vec::new();
-                        let mut frame = None;
-                        if let sqlparser::ast::WindowType::WindowSpec(spec) = over {
-                            for expr in &spec.partition_by {
-                                if let Some(col) = extract_col_name(expr) {
-                                    partition_by.push(col);
-                                }
-                            }
-                            for expr in &spec.order_by {
-                                let asc = sort_ascending(&expr.options)?;
-                                if let Some(col) = extract_col_name(&expr.expr) {
-                                    order_by.push((col, asc));
-                                }
-                            }
-                            frame = window_frame(spec);
-                        }
-                        projection.push(ProjectionItem::WindowFunction {
-                            func_name: fname,
-                            args: window_args(func),
-                            partition_by,
-                            order_by,
-                            alias: None,
-                            frame,
-                        });
-                    } else if fname.starts_with("PG_CATALOG.")
-                        || fname.starts_with("PG_")
-                        || fname.eq_ignore_ascii_case("FORMAT_TYPE")
-                    {
-                        // Dummy handling for system functions during introspection, just treat it as a string literal
-                        projection.push(ProjectionItem::Column(fname));
-                    } else {
-                        match fname.as_str() {
-                            "COUNT" | "SUM" | "MIN" | "MAX" | "AVG" => {
-                                let op = match fname.as_str() {
-                                    "COUNT" => AggregateOp::Count,
-                                    "SUM" => AggregateOp::Sum,
-                                    "MIN" => AggregateOp::Min,
-                                    "MAX" => AggregateOp::Max,
-                                    "AVG" => AggregateOp::Avg,
-                                    _ => unreachable!(),
-                                };
-                                // `agg(DISTINCT ...)` goes through the scalar
-                                // expression path, which implements DISTINCT.
-                                let is_distinct = matches!(
-                                    &func.args,
-                                    sqlparser::ast::FunctionArguments::List(l)
-                                        if matches!(
-                                            l.duplicate_treatment,
-                                            Some(sqlparser::ast::DuplicateTreatment::Distinct)
-                                        )
-                                );
-                                let first_arg = match &func.args {
-                                    sqlparser::ast::FunctionArguments::List(list)
-                                        if !is_distinct =>
-                                    {
-                                        list.args.first()
-                                    }
-                                    _ => None,
-                                };
-                                let inner = if let Some(arg) = first_arg {
-                                    match arg {
-                                        sqlparser::ast::FunctionArg::Unnamed(
-                                            sqlparser::ast::FunctionArgExpr::Expr(
-                                                Expr::Identifier(id),
-                                            ),
-                                        ) => Some(id.value.clone()),
-                                        sqlparser::ast::FunctionArg::Unnamed(
-                                            sqlparser::ast::FunctionArgExpr::Wildcard,
-                                        ) => Some("*".to_string()),
-                                        _ => None,
-                                    }
-                                } else if is_distinct {
-                                    // Handled by the scalar-expression fallback.
-                                    None
-                                } else {
-                                    anyhow::bail!("Aggregate function requires an argument");
-                                };
-                                if let Some(inner) = inner {
-                                    projection.push(ProjectionItem::Aggregate(op, inner));
-                                } else if let Some(se) = lower_scalar(expr, params) {
-                                    // Aggregate over a computed argument, e.g.
-                                    // `sum(a + 1)`: evaluate as a grouped
-                                    // scalar expression.
-                                    projection.push(ProjectionItem::Expr {
-                                        expr: se,
-                                        alias: None,
-                                    });
-                                } else {
-                                    anyhow::bail!("Unsupported aggregate argument");
-                                }
-                            }
-                            _ => {
-                                let mut args = Vec::new();
-                                let func_arg_list: &[sqlparser::ast::FunctionArg] = match &func.args
-                                {
-                                    sqlparser::ast::FunctionArguments::List(list) => {
-                                        list.args.as_slice()
-                                    }
-                                    _ => &[],
-                                };
-                                for arg in func_arg_list {
-                                    if let sqlparser::ast::FunctionArg::Unnamed(
-                                        sqlparser::ast::FunctionArgExpr::Expr(e),
-                                    ) = arg
-                                    {
-                                        if let Some(col) = extract_col_name(e) {
-                                            args.push(col);
-                                        } else if let Some(val) = expr_to_value(e, params) {
-                                            args.push(literal_arg(&val));
-                                        }
-                                    }
-                                }
-                                projection.push(ProjectionItem::ScalarFunction {
-                                    func_name: fname.clone(),
-                                    args,
-                                    alias: None, // Will fix later for ExprWithAlias
-                                });
-                            }
-                        }
-                    }
-                } else if let Expr::BinaryOp { left, op, right } = expr
-                    && matches!(
-                        op,
-                        BinaryOperator::Arrow
-                            | BinaryOperator::LongArrow
-                            | BinaryOperator::HashArrow
-                            | BinaryOperator::HashLongArrow
-                    )
-                    // Nested access (`doc->'a'->>'b'`) is a scalar expression.
-                    && matches!(&**left, Expr::Identifier(_) | Expr::CompoundIdentifier(_))
-                {
-                    let left_col = extract_col_name(left)
-                        .ok_or_else(|| anyhow::anyhow!("Invalid JSON left"))?;
-                    let right_val = match &**right {
-                        Expr::Value(v) => match &v.value {
-                            sqlparser::ast::Value::SingleQuotedString(s) => s.clone(),
-                            sqlparser::ast::Value::Number(n, _) => n.clone(),
-                            _ => anyhow::bail!("Unsupported JSON path"),
-                        },
-                        _ => anyhow::bail!("Unsupported JSON path"),
-                    };
-                    let op_str = match op {
-                        BinaryOperator::LongArrow => "->>",
-                        BinaryOperator::Arrow => "->",
-                        BinaryOperator::HashArrow => "#>",
-                        BinaryOperator::HashLongArrow => "#>>",
-                        _ => anyhow::bail!("Unsupported JSON operator"),
-                    };
-                    projection.push(ProjectionItem::JsonAccess {
-                        left: left_col,
-                        operator: op_str.to_string(),
-                        right: right_val,
-                        alias: None,
-                    });
-                } else if let Expr::Case { .. } = expr {
-                    if let Some(case_projection) = parse_case(expr, None, params) {
-                        projection.push(case_projection);
-                    } else if let Some(se) = lower_scalar(expr, params) {
-                        // CASE with computed branch results / compound
-                        // conditions: evaluate as a scalar expression.
-                        projection.push(ProjectionItem::Expr {
-                            expr: se,
-                            alias: None,
-                        });
-                    } else {
-                        projection.push(ProjectionItem::Literal(crate::Value::Null));
-                    }
-                } else if let Expr::Substring {
-                    expr: inner,
-                    substring_from,
-                    substring_for,
-                    ..
-                } = expr
-                {
-                    // sqlparser parses `SUBSTR(x, a, b)` as a dedicated
-                    // `Substring` node; map it back to the SUBSTR scalar function.
-                    projection.push(ProjectionItem::ScalarFunction {
-                        func_name: "SUBSTR".to_string(),
-                        args: substring_args(inner, substring_from, substring_for, params),
-                        alias: None,
-                    });
-                } else if matches!(
-                    expr,
-                    Expr::Cast { .. }
-                        | Expr::BinaryOp { .. }
-                        | Expr::UnaryOp { .. }
-                        | Expr::IsNull(_)
-                        | Expr::IsNotNull(_)
-                        | Expr::Trim { .. }
-                        | Expr::Extract { .. }
-                ) && let Some(scalar) = lower_scalar(expr, params)
-                {
-                    // Computed target-list expression over the row (arithmetic,
-                    // comparisons, casts, string concat). Placed before the
-                    // column check so `col::type` keeps its cast.
-                    projection.push(ProjectionItem::Expr {
-                        expr: scalar,
-                        alias: None,
-                    });
-                } else if let Some(col) = extract_col_name(expr) {
-                    projection.push(ProjectionItem::Column(col));
-                } else if let Some(val) = expr_to_value(expr, params) {
-                    projection.push(ProjectionItem::Literal(val));
-                } else if matches!(expr, Expr::Array(_)) {
-                    // An `ARRAY[...]` of literals folds to a constant; one with
-                    // column refs (e.g. `ARRAY[d.objsubid]` in pg_depend
-                    // introspection) can't be folded here, so surface NULL rather
-                    // than failing the statement.
-                    let val = expr_to_value(expr, params).unwrap_or(crate::Value::Null);
-                    projection.push(ProjectionItem::Literal(val));
-                } else {
-                    anyhow::bail!("Unsupported projection item: {:?}", item);
-                }
+                projection.push(plan_select_expr(expr, None, params)?);
             }
             SelectItem::ExprWithAlias { expr, alias } => {
-                if let Expr::Function(func) = expr {
-                    let fname = func.name.to_string().to_uppercase();
-                    if let Some(over) = &func.over {
-                        let mut partition_by = Vec::new();
-                        let mut order_by = Vec::new();
-                        let mut frame = None;
-                        if let sqlparser::ast::WindowType::WindowSpec(spec) = over {
-                            for expr in &spec.partition_by {
-                                if let Some(col) = extract_col_name(expr) {
-                                    partition_by.push(col);
-                                }
-                            }
-                            for expr in &spec.order_by {
-                                let asc = sort_ascending(&expr.options)?;
-                                if let Some(col) = extract_col_name(&expr.expr) {
-                                    order_by.push((col, asc));
-                                }
-                            }
-                            frame = window_frame(spec);
-                        }
-                        projection.push(ProjectionItem::WindowFunction {
-                            func_name: fname,
-                            args: window_args(func),
-                            partition_by,
-                            order_by,
-                            alias: Some(alias.value.clone()),
-                            frame,
-                        });
-                    } else if fname.starts_with("PG_CATALOG.")
-                        || fname.starts_with("PG_")
-                        || fname.eq_ignore_ascii_case("FORMAT_TYPE")
-                    {
-                        projection.push(ProjectionItem::AliasedColumn(fname, alias.value.clone()));
-                    } else {
-                        match fname.as_str() {
-                            "COUNT" | "SUM" | "MIN" | "MAX" | "AVG" => {
-                                let op = match fname.as_str() {
-                                    "COUNT" => AggregateOp::Count,
-                                    "SUM" => AggregateOp::Sum,
-                                    "MIN" => AggregateOp::Min,
-                                    "MAX" => AggregateOp::Max,
-                                    "AVG" => AggregateOp::Avg,
-                                    _ => unreachable!(),
-                                };
-                                // `agg(DISTINCT ...)` goes through the scalar
-                                // expression path, which implements DISTINCT.
-                                let is_distinct = matches!(
-                                    &func.args,
-                                    sqlparser::ast::FunctionArguments::List(l)
-                                        if matches!(
-                                            l.duplicate_treatment,
-                                            Some(sqlparser::ast::DuplicateTreatment::Distinct)
-                                        )
-                                );
-                                let first_arg = match &func.args {
-                                    sqlparser::ast::FunctionArguments::List(list)
-                                        if !is_distinct =>
-                                    {
-                                        list.args.first()
-                                    }
-                                    _ => None,
-                                };
-                                let inner = if let Some(arg) = first_arg {
-                                    match arg {
-                                        sqlparser::ast::FunctionArg::Unnamed(
-                                            sqlparser::ast::FunctionArgExpr::Expr(
-                                                Expr::Identifier(id),
-                                            ),
-                                        ) => Some(id.value.clone()),
-                                        sqlparser::ast::FunctionArg::Unnamed(
-                                            sqlparser::ast::FunctionArgExpr::Wildcard,
-                                        ) => Some("*".to_string()),
-                                        _ => None,
-                                    }
-                                } else if is_distinct {
-                                    // Handled by the scalar-expression fallback.
-                                    None
-                                } else {
-                                    anyhow::bail!("Aggregate function requires an argument");
-                                };
-                                if let Some(inner) = inner {
-                                    projection.push(ProjectionItem::Aggregate(op, inner));
-                                } else if let Some(se) = lower_scalar(expr, params) {
-                                    // Aggregate over a computed argument, e.g.
-                                    // `sum(a + 1)`: evaluate as a grouped
-                                    // scalar expression.
-                                    projection.push(ProjectionItem::Expr {
-                                        expr: se,
-                                        alias: None,
-                                    });
-                                } else {
-                                    anyhow::bail!("Unsupported aggregate argument");
-                                }
-                            }
-                            _ => {
-                                let mut args = Vec::new();
-                                let func_arg_list: &[sqlparser::ast::FunctionArg] = match &func.args
-                                {
-                                    sqlparser::ast::FunctionArguments::List(list) => {
-                                        list.args.as_slice()
-                                    }
-                                    _ => &[],
-                                };
-                                for arg in func_arg_list {
-                                    if let sqlparser::ast::FunctionArg::Unnamed(
-                                        sqlparser::ast::FunctionArgExpr::Expr(e),
-                                    ) = arg
-                                    {
-                                        if let Some(col) = extract_col_name(e) {
-                                            args.push(col);
-                                        } else if let Some(val) = expr_to_value(e, params) {
-                                            args.push(literal_arg(&val));
-                                        }
-                                    }
-                                }
-                                projection.push(ProjectionItem::ScalarFunction {
-                                    func_name: fname.clone(),
-                                    args,
-                                    alias: Some(alias.value.clone()),
-                                });
-                            }
-                        }
-                    }
-                } else if let Expr::BinaryOp { left, op, right } = expr
-                    && matches!(
-                        op,
-                        BinaryOperator::Arrow
-                            | BinaryOperator::LongArrow
-                            | BinaryOperator::HashArrow
-                            | BinaryOperator::HashLongArrow
-                    )
-                    // Nested access (`doc->'a'->>'b'`) is a scalar expression.
-                    && matches!(&**left, Expr::Identifier(_) | Expr::CompoundIdentifier(_))
-                {
-                    let left_col = extract_col_name(left)
-                        .ok_or_else(|| anyhow::anyhow!("Invalid JSON left"))?;
-                    let right_val = match &**right {
-                        Expr::Value(v) => match &v.value {
-                            sqlparser::ast::Value::SingleQuotedString(s) => s.clone(),
-                            sqlparser::ast::Value::Number(n, _) => n.clone(),
-                            _ => anyhow::bail!("Unsupported JSON path"),
-                        },
-                        _ => anyhow::bail!("Unsupported JSON path"),
-                    };
-                    let op_str = match op {
-                        BinaryOperator::LongArrow => "->>",
-                        BinaryOperator::Arrow => "->",
-                        BinaryOperator::HashArrow => "#>",
-                        BinaryOperator::HashLongArrow => "#>>",
-                        _ => anyhow::bail!("Unsupported JSON operator"),
-                    };
-                    projection.push(ProjectionItem::JsonAccess {
-                        left: left_col,
-                        operator: op_str.to_string(),
-                        right: right_val,
-                        alias: Some(alias.value.clone()),
-                    });
-                } else if let Expr::Case { .. } = expr {
-                    if let Some(case_projection) =
-                        parse_case(expr, Some(alias.value.clone()), params)
-                    {
-                        projection.push(case_projection);
-                    } else if let Some(se) = lower_scalar(expr, params) {
-                        // CASE with computed branch results / compound
-                        // conditions: evaluate as a scalar expression.
-                        projection.push(ProjectionItem::Expr {
-                            expr: se,
-                            alias: Some(alias.value.clone()),
-                        });
-                    } else {
-                        projection.push(ProjectionItem::AliasedLiteral(
-                            crate::Value::Text("TABLE".to_string()),
-                            alias.value.clone(),
-                        ));
-                    }
-                } else if let Expr::Substring {
-                    expr: inner,
-                    substring_from,
-                    substring_for,
-                    ..
-                } = expr
-                {
-                    projection.push(ProjectionItem::ScalarFunction {
-                        func_name: "SUBSTR".to_string(),
-                        args: substring_args(inner, substring_from, substring_for, params),
-                        alias: Some(alias.value.clone()),
-                    });
-                } else if matches!(
-                    expr,
-                    Expr::Cast { .. }
-                        | Expr::BinaryOp { .. }
-                        | Expr::UnaryOp { .. }
-                        | Expr::IsNull(_)
-                        | Expr::IsNotNull(_)
-                        | Expr::Trim { .. }
-                        | Expr::Extract { .. }
-                ) && let Some(scalar) = lower_scalar(expr, params)
-                {
-                    projection.push(ProjectionItem::Expr {
-                        expr: scalar,
-                        alias: Some(alias.value.clone()),
-                    });
-                } else if let Some(col) = extract_col_name(expr) {
-                    projection.push(ProjectionItem::AliasedColumn(col, alias.value.clone()));
-                } else if let Some(val) = expr_to_value(expr, params) {
-                    projection.push(ProjectionItem::AliasedLiteral(val, alias.value.clone()));
-                } else {
-                    projection.push(ProjectionItem::AliasedLiteral(
-                        crate::Value::Null,
-                        alias.value.clone(),
-                    ));
-                }
+                projection.push(plan_select_expr(expr, Some(alias.value.clone()), params)?);
             }
             SelectItem::QualifiedWildcard(_, _) => {
                 // `t.*` ideally projects only table `t`'s columns; NodusDB models
@@ -1017,32 +588,6 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
     })
 }
 
-/// Builds the SUBSTR scalar-function argument strings from a parsed `Substring`
-/// node (`SUBSTR(expr, from, for)`): each present operand resolves to a column
-/// name or a rendered literal, matching how the planner captures other scalar
-/// function arguments.
-fn substring_args(
-    inner: &sqlparser::ast::Expr,
-    substring_from: &Option<Box<sqlparser::ast::Expr>>,
-    substring_for: &Option<Box<sqlparser::ast::Expr>>,
-    params: &[Value],
-) -> Vec<String> {
-    let mut args = Vec::new();
-    let operands = [
-        Some(inner),
-        substring_from.as_deref(),
-        substring_for.as_deref(),
-    ];
-    for e in operands.into_iter().flatten() {
-        if let Some(col) = extract_col_name(e) {
-            args.push(col);
-        } else if let Some(val) = expr_to_value(e, params) {
-            args.push(literal_arg(&val));
-        }
-    }
-    args
-}
-
 /// Translates a parsed JOIN constraint into NodusDB's join representation:
 /// `(join_type, ON-condition, USING-columns, natural)`. `ON` becomes a filter
 /// condition; `USING (cols)` and `NATURAL` carry their column intent for the
@@ -1178,5 +723,241 @@ mod recursion_tests {
             result.is_err(),
             "deeply nested query should be rejected, not planned"
         );
+    }
+}
+
+/// A call to a built-in non-aggregate function, lowered to a scalar
+/// expression; `None` for aggregates and functions the library lacks.
+fn known_function_call(
+    expr: &sqlparser::ast::Expr,
+    upper_name: &str,
+    params: &[Value],
+) -> Option<ScalarExpr> {
+    let name = upper_name.strip_prefix("PG_CATALOG.").unwrap_or(upper_name);
+    if aggregate_op(name).is_some() || !crate::functions::is_known(name) {
+        return None;
+    }
+    lower_scalar(expr, params)
+}
+
+/// The first column a scalar expression references, if any.
+fn first_column_reference(expr: &ScalarExpr) -> Option<&str> {
+    match expr {
+        ScalarExpr::Column(name) => Some(name.as_str()),
+        _ => expr.children().into_iter().find_map(first_column_reference),
+    }
+}
+
+/// PostgreSQL's default name for an unaliased select item (`FigureColname`):
+/// a column's name, a function's name, a cast's type when it casts a constant,
+/// a keyword for CASE/ARRAY/ROW/EXISTS, and `?column?` otherwise.
+pub(crate) fn default_output_name(expr: &sqlparser::ast::Expr) -> String {
+    figure_colname(expr).unwrap_or_else(|| "?column?".to_string())
+}
+
+fn figure_colname(expr: &sqlparser::ast::Expr) -> Option<String> {
+    use sqlparser::ast::{AccessExpr, Expr, ObjectNamePart, TrimWhereField};
+    Some(match expr {
+        Expr::Identifier(ident) => ident.value.clone(),
+        Expr::CompoundIdentifier(parts) => parts.last()?.value.clone(),
+        Expr::CompoundFieldAccess { root, access_chain } => {
+            match access_chain.iter().rev().find_map(|access| match access {
+                AccessExpr::Dot(Expr::Identifier(field)) => Some(field.value.clone()),
+                _ => None,
+            }) {
+                Some(field) => field,
+                None => return figure_colname(root),
+            }
+        }
+        Expr::Nested(inner) | Expr::Collate { expr: inner, .. } => return figure_colname(inner),
+        Expr::Function(function) => {
+            let ObjectNamePart::Identifier(ident) = function.name.0.last()? else {
+                return None;
+            };
+            if ident.quote_style.is_some() {
+                ident.value.clone()
+            } else {
+                ident.value.to_ascii_lowercase()
+            }
+        }
+        Expr::Cast {
+            expr: inner,
+            data_type,
+            ..
+        } => figure_colname(inner)
+            .filter(|name| name != "case")
+            .unwrap_or_else(|| cast_type_name(&data_type.to_string())),
+        Expr::TypedString(typed) => cast_type_name(&typed.data_type.to_string()),
+        Expr::Interval(_) => "interval".to_string(),
+        Expr::Case { .. } => "case".to_string(),
+        Expr::Array(_) => "array".to_string(),
+        Expr::Tuple(_) => "row".to_string(),
+        Expr::Exists { .. } => "exists".to_string(),
+        Expr::Subquery(query) => return query_output_name(query),
+        Expr::Extract { .. } => "extract".to_string(),
+        Expr::Position { .. } => "position".to_string(),
+        Expr::Substring { shorthand, .. } => {
+            if *shorthand { "substr" } else { "substring" }.to_string()
+        }
+        Expr::Overlay { .. } => "overlay".to_string(),
+        Expr::Ceil { .. } => "ceil".to_string(),
+        Expr::Floor { .. } => "floor".to_string(),
+        Expr::Trim { trim_where, .. } => match trim_where {
+            Some(TrimWhereField::Leading) => "ltrim",
+            Some(TrimWhereField::Trailing) => "rtrim",
+            _ => "btrim",
+        }
+        .to_string(),
+        _ => return None,
+    })
+}
+
+/// The name of a subquery's first output column, as a scalar subquery item
+/// takes it.
+fn query_output_name(query: &sqlparser::ast::Query) -> Option<String> {
+    use sqlparser::ast::{SelectItem, SetExpr};
+    let mut body = &*query.body;
+    loop {
+        match body {
+            SetExpr::Select(select) => {
+                return match select.projection.first()? {
+                    SelectItem::UnnamedExpr(expr) => Some(default_output_name(expr)),
+                    SelectItem::ExprWithAlias { alias, .. } => Some(alias.value.clone()),
+                    _ => None,
+                };
+            }
+            SetExpr::Query(inner) => body = &inner.body,
+            SetExpr::SetOperation { left, .. } => body = left,
+            _ => return None,
+        }
+    }
+}
+
+/// PostgreSQL's internal name for a type as written in a cast (`int4` for
+/// `integer`, `float8` for `double precision`).
+fn cast_type_name(data_type: &str) -> String {
+    let upper = data_type.trim().to_ascii_uppercase();
+    let base = upper
+        .trim_end_matches("[]")
+        .split('(')
+        .next()
+        .unwrap_or_default()
+        .trim();
+    match base {
+        "INT" | "INTEGER" | "INT4" => "int4",
+        "BIGINT" | "INT8" => "int8",
+        "SMALLINT" | "INT2" => "int2",
+        "BOOL" | "BOOLEAN" => "bool",
+        "REAL" | "FLOAT4" => "float4",
+        "FLOAT" | "FLOAT8" | "DOUBLE" | "DOUBLE PRECISION" => "float8",
+        "DECIMAL" | "DEC" | "NUMERIC" => "numeric",
+        "VARCHAR" | "CHARACTER VARYING" => "varchar",
+        "CHAR" | "CHARACTER" | "BPCHAR" => "bpchar",
+        "TIMESTAMP" | "TIMESTAMP WITHOUT TIME ZONE" => "timestamp",
+        "TIMESTAMPTZ" | "TIMESTAMP WITH TIME ZONE" => "timestamptz",
+        "TIME" | "TIME WITHOUT TIME ZONE" => "time",
+        "TIMETZ" | "TIME WITH TIME ZONE" => "timetz",
+        other => return other.to_ascii_lowercase().trim_matches('"').to_string(),
+    }
+    .to_string()
+}
+
+/// Plans one select-list expression; `alias` is its `AS` name. Plain columns,
+/// literals, and plain aggregates keep their dedicated items; everything else
+/// is a scalar expression named as PostgreSQL names it.
+fn plan_select_expr(
+    expr: &sqlparser::ast::Expr,
+    alias: Option<String>,
+    params: &[Value],
+) -> Result<ProjectionItem> {
+    use sqlparser::ast::Expr;
+    let name = || alias.clone().unwrap_or_else(|| default_output_name(expr));
+    if let Expr::Function(func) = expr
+        && let Some(over) = &func.over
+    {
+        let mut partition_by = Vec::new();
+        let mut order_by = Vec::new();
+        let mut frame = None;
+        if let sqlparser::ast::WindowType::WindowSpec(spec) = over {
+            for expr in &spec.partition_by {
+                if let Some(col) = extract_col_name(expr) {
+                    partition_by.push(col);
+                }
+            }
+            for expr in &spec.order_by {
+                let asc = sort_ascending(&expr.options)?;
+                if let Some(col) = extract_col_name(&expr.expr) {
+                    order_by.push((col, asc));
+                }
+            }
+            frame = window_frame(spec);
+        }
+        return Ok(ProjectionItem::WindowFunction {
+            func_name: func.name.to_string().to_uppercase(),
+            args: window_args(func),
+            partition_by,
+            order_by,
+            alias: Some(name()),
+            frame,
+        });
+    }
+    if let Expr::Subquery(query) = expr {
+        return Ok(ProjectionItem::Subquery {
+            plan: Box::new(plan_query(query, params)?),
+            alias: Some(name()),
+        });
+    }
+    match lower_scalar(expr, params) {
+        Some(ScalarExpr::Column(column)) => Ok(match alias {
+            Some(alias) => ProjectionItem::AliasedColumn(column, alias),
+            None => ProjectionItem::Column(column),
+        }),
+        Some(ScalarExpr::Literal(value)) if matches!(expr, Expr::Value(_)) => Ok(match alias {
+            Some(alias) => ProjectionItem::AliasedLiteral(value, alias),
+            None => ProjectionItem::Literal(value),
+        }),
+        Some(ScalarExpr::Aggregate {
+            op,
+            arg,
+            arg_expr: None,
+            distinct: false,
+        }) if alias.is_none() => Ok(ProjectionItem::Aggregate(op, arg)),
+        Some(scalar) => Ok(ProjectionItem::Expr {
+            expr: scalar,
+            alias: Some(name()),
+        }),
+        None => {
+            // Catalog introspection calls functions NodusDB does not provide
+            // over virtual tables; the executor resolves (or rejects) them.
+            if let Expr::Function(func) = expr
+                && unknown_function_error(expr).is_some()
+            {
+                let fname = func.name.to_string().to_uppercase();
+                let mut args = Vec::new();
+                if let sqlparser::ast::FunctionArguments::List(list) = &func.args {
+                    for arg in &list.args {
+                        if let sqlparser::ast::FunctionArg::Unnamed(
+                            sqlparser::ast::FunctionArgExpr::Expr(e),
+                        ) = arg
+                        {
+                            if let Some(col) = extract_col_name(e) {
+                                args.push(col);
+                            } else if let Some(val) = expr_to_value(e, params) {
+                                args.push(literal_arg(&val));
+                            }
+                        }
+                    }
+                }
+                return Ok(ProjectionItem::ScalarFunction {
+                    func_name: fname,
+                    args,
+                    alias: Some(name()),
+                });
+            }
+            Err(anyhow::anyhow!(
+                unknown_function_error(expr)
+                    .unwrap_or_else(|| format!("Unsupported expression in SELECT: {expr}"))
+            ))
+        }
     }
 }

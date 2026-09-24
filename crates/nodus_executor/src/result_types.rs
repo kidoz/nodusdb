@@ -1,7 +1,7 @@
 //! Result types determined from expressions and declared columns, independent
 //! of result rows. Describe (LIMIT 0) and Execute must publish the same types.
 
-use crate::{AggregateOp, ProjectionItem, ScalarExpr, Value};
+use crate::{AggregateOp, ProjectionItem, ScalarBinaryOp, ScalarExpr, ScalarUnaryOp, Value};
 
 fn aggregate_type(op: &AggregateOp, input: Option<String>) -> Option<String> {
     match op {
@@ -24,11 +24,18 @@ fn aggregate_type(op: &AggregateOp, input: Option<String>) -> Option<String> {
 fn literal_type(value: &Value) -> Option<String> {
     Some(
         match value {
-            Value::Int(_) => "INTEGER",
+            Value::Int(i) if i32::try_from(*i).is_ok() => "INTEGER",
+            Value::Int(_) => "BIGINT",
             Value::Float(_) => "DOUBLE PRECISION",
             Value::Bool(_) => "BOOLEAN",
             Value::Text(_) => "TEXT",
             Value::Jsonb(_) => "JSONB",
+            Value::Array(items) => {
+                return items
+                    .iter()
+                    .find_map(literal_type)
+                    .map(|element| format!("{element}[]"));
+            }
             _ => return None,
         }
         .into(),
@@ -40,6 +47,40 @@ fn scalar_type(expr: &ScalarExpr, column: &impl Fn(&str) -> Option<String>) -> O
         ScalarExpr::Column(name) => column(name),
         ScalarExpr::Literal(value) => literal_type(value),
         ScalarExpr::Cast { target, .. } => Some(target.clone()),
+        ScalarExpr::Binary { op, left, right } => {
+            binary_type(*op, scalar_type(left, column), scalar_type(right, column))
+        }
+        ScalarExpr::Unary {
+            op: ScalarUnaryOp::Neg,
+            expr,
+        } => scalar_type(expr, column),
+        ScalarExpr::Unary {
+            op: ScalarUnaryOp::Not,
+            ..
+        }
+        | ScalarExpr::IsNull { .. }
+        | ScalarExpr::IsBool { .. }
+        | ScalarExpr::IsDistinctFrom { .. }
+        | ScalarExpr::PatternMatch { .. }
+        | ScalarExpr::InList { .. }
+        | ScalarExpr::Quantified { .. } => Some("BOOLEAN".into()),
+        ScalarExpr::Case {
+            branches,
+            else_result,
+            ..
+        } => branches
+            .iter()
+            .map(|(_, result)| result)
+            .chain(else_result.as_deref())
+            .find_map(|result| scalar_type(result, column)),
+        ScalarExpr::Extract { .. } => Some("NUMERIC".into()),
+        ScalarExpr::Function { name, args } => crate::functions::return_type(
+            name,
+            &args
+                .iter()
+                .map(|arg| scalar_type(arg, column))
+                .collect::<Vec<_>>(),
+        ),
         ScalarExpr::Aggregate {
             op, arg, arg_expr, ..
         } => aggregate_type(
@@ -53,6 +94,100 @@ fn scalar_type(expr: &ScalarExpr, column: &impl Fn(&str) -> Option<String>) -> O
     }
 }
 
+/// Integer types by width, for arithmetic result types.
+fn integer_rank(ty: &str) -> Option<u8> {
+    match ty.to_ascii_uppercase().as_str() {
+        "SMALLINT" | "INT2" => Some(1),
+        "INT" | "INTEGER" | "INT4" | "SERIAL" => Some(2),
+        "BIGINT" | "INT8" | "BIGSERIAL" => Some(3),
+        _ => None,
+    }
+}
+
+fn is_float(ty: &str) -> bool {
+    matches!(
+        ty.to_ascii_uppercase().as_str(),
+        "REAL" | "FLOAT4" | "DOUBLE" | "DOUBLE PRECISION" | "FLOAT8" | "FLOAT"
+    )
+}
+
+fn is_numeric(ty: &str) -> bool {
+    let upper = ty.to_ascii_uppercase();
+    upper.starts_with("NUMERIC") || upper.starts_with("DECIMAL")
+}
+
+/// The result type of a binary operator, where the operand types decide it.
+fn binary_type(op: ScalarBinaryOp, left: Option<String>, right: Option<String>) -> Option<String> {
+    use ScalarBinaryOp as Op;
+    match op {
+        Op::Eq
+        | Op::NotEq
+        | Op::Lt
+        | Op::LtEq
+        | Op::Gt
+        | Op::GtEq
+        | Op::And
+        | Op::Or
+        | Op::JsonHasKey
+        | Op::JsonHasAnyKey
+        | Op::JsonHasAllKeys
+        | Op::Contains
+        | Op::ContainedBy
+        | Op::Overlap => Some("BOOLEAN".into()),
+        Op::JsonGetText | Op::JsonPathText => Some("TEXT".into()),
+        Op::JsonGet | Op::JsonPath => left,
+        Op::Concat => match (&left, &right) {
+            (Some(l), _) if l.ends_with("[]") => left,
+            (_, Some(r)) if r.ends_with("[]") => right,
+            _ => Some("TEXT".into()),
+        },
+        Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Mod => {
+            let (left, right) = (left?, right?);
+            if let (Some(l), Some(r)) = (integer_rank(&left), integer_rank(&right)) {
+                // Integer arithmetic promotes to the wider operand, and to at
+                // least integer.
+                Some(
+                    match l.max(r).max(2) {
+                        2 => "INTEGER",
+                        _ => "BIGINT",
+                    }
+                    .into(),
+                )
+            } else if is_float(&left) || is_float(&right) {
+                Some("DOUBLE PRECISION".into())
+            } else if (is_numeric(&left) || integer_rank(&left).is_some())
+                && (is_numeric(&right) || integer_rank(&right).is_some())
+            {
+                Some("NUMERIC".into())
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// The type of a window function's result.
+fn window_type(
+    func_name: &str,
+    args: &[String],
+    column: &impl Fn(&str) -> Option<String>,
+) -> Option<String> {
+    let input = || args.first().and_then(|arg| column(arg));
+    match func_name.to_ascii_uppercase().as_str() {
+        "ROW_NUMBER" | "RANK" | "DENSE_RANK" | "NTILE" | "COUNT" => Some("BIGINT".into()),
+        "PERCENT_RANK" | "CUME_DIST" => Some("DOUBLE PRECISION".into()),
+        "SUM" => aggregate_type(&AggregateOp::Sum, input()),
+        "AVG" => aggregate_type(&AggregateOp::Avg, input()),
+        "MIN" | "MAX" | "LAG" | "LEAD" | "FIRST_VALUE" | "LAST_VALUE" | "NTH_VALUE" => input(),
+        _ => None,
+    }
+}
+
+/// The type of a scalar expression that references no columns.
+pub(crate) fn constant_expr_type(expr: &ScalarExpr) -> Option<String> {
+    scalar_type(expr, &|_: &str| None)
+}
+
 pub(crate) fn projection_type(
     item: &ProjectionItem,
     column: impl Fn(&str) -> Option<String>,
@@ -64,6 +199,9 @@ pub(crate) fn projection_type(
             literal_type(value)
         }
         ProjectionItem::Column(name) | ProjectionItem::AliasedColumn(name, _) => column(name),
+        ProjectionItem::WindowFunction {
+            func_name, args, ..
+        } => window_type(func_name, args, &column),
         _ => None,
     }
 }

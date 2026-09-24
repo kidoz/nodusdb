@@ -2237,6 +2237,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "chrono",
+ "md-5",
  "nodus_audit",
  "nodus_authz",
  "nodus_catalog",

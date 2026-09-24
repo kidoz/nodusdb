@@ -20,8 +20,10 @@ mod aggregates;
 mod constraints;
 mod ddl;
 mod dml;
+mod eval_error;
 mod execute;
 pub(crate) mod filter_eval;
+mod functions;
 mod information_schema;
 mod parameters;
 mod pg_catalog;
@@ -29,6 +31,7 @@ mod plan_types;
 mod planner;
 mod result_types;
 mod select;
+mod session_env;
 mod session_vars;
 mod set_ops;
 mod streaming;
@@ -38,9 +41,9 @@ mod transactions;
 mod value;
 mod view_helpers;
 pub use plan_types::{
-    AggregateOp, AlterTableOp, CompareOp, ConflictTarget, FilterExpr, Join, JoinType, LogicalPlan,
-    OnConflictClause, Operand, PatternKind, Predicate, ProjectionItem, ScalarBinaryOp, ScalarExpr,
-    ScalarUnaryOp, SetOpKind, TableFnSpec,
+    AggregateOp, AlterTableOp, CompareOp, ConflictTarget, DeferredItem, FilterExpr, Join, JoinType,
+    LogicalPlan, OnConflictClause, Operand, PatternKind, Predicate, ProjectionItem, ScalarBinaryOp,
+    ScalarExpr, ScalarUnaryOp, SetOpKind, TableFnSpec,
 };
 pub use planner::{
     CopyOutputFormat, expr_to_value, parse_object_name, plan_copy_out, plan_statement,
@@ -426,6 +429,38 @@ impl MemExecutor {
 
     /// Read timestamp for a session: its active transaction's snapshot, or the
     /// latest committed state when the session has no open transaction.
+    /// The session context scalar functions see while a statement runs.
+    pub(crate) fn session_env(&self, ctx: &ExecutionContext) -> session_env::SessionEnv {
+        let statement_micros = session_env::wall_micros();
+        let transaction_micros = self
+            .active_txns
+            .read()
+            .get(&ctx.session_id)
+            .map_or(statement_micros, |txn| txn.read_ts as i64);
+        let backend_pid = ctx
+            .session_id
+            .bytes()
+            .fold(17_i64, |h, b| (h * 31 + i64::from(b)) % 2_000_000_000)
+            .abs()
+            + 1;
+        session_env::SessionEnv {
+            user: self
+                .catalog_reader
+                .get_principal_by_id(ctx.principal_id)
+                .map(|p| p.name)
+                .unwrap_or_else(|_| "unknown".to_string()),
+            settings: self
+                .session_vars
+                .read()
+                .get(&ctx.session_id)
+                .cloned()
+                .unwrap_or_default(),
+            transaction_micros,
+            statement_micros,
+            backend_pid,
+        }
+    }
+
     pub(crate) fn read_ts(&self, session: &str) -> Timestamp {
         match self.active_txns.read().get(session) {
             Some(txn) => txn.read_ts,
@@ -827,7 +862,13 @@ impl Executor for MemExecutor {
             implicit_txn = Some(txn_record.txn_id);
         }
 
-        let result = self.execute_logical_inner(ctx, plan);
+        // A runtime evaluation error anywhere in the statement fails it before
+        // the implicit transaction can commit.
+        let _env = session_env::install(self.session_env(ctx));
+        eval_error::reset();
+        let result = self
+            .execute_logical_inner(ctx, plan)
+            .and_then(|out| eval_error::check().map(|()| out));
 
         if let Some(txn_id) = implicit_txn {
             self.active_txns.write().remove(&ctx.session_id);

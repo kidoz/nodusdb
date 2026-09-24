@@ -547,3 +547,170 @@ async fn binary_and_csv_copy_out_preserve_nulls_and_empty_strings() {
         assert_eq!(cells[3][1], nodus_import::Cell::Null);
     }).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn select_list_names_and_types_follow_postgres() {
+    with_client(async |client| {
+        client
+            .batch_execute(
+                "CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT, price NUMERIC(10,2)); \
+                 INSERT INTO items VALUES (1, 'a', 1.50), (2, NULL, 2.00)",
+            )
+            .await
+            .unwrap();
+        let cases: &[(&str, &[(&str, Type)])] = &[
+            (
+                "SELECT 1, 2147483648, 'a', true",
+                &[
+                    ("?column?", Type::INT4),
+                    ("?column?", Type::INT8),
+                    ("?column?", Type::TEXT),
+                    ("?column?", Type::BOOL),
+                ],
+            ),
+            (
+                "SELECT now(), current_date, current_user, version(), gen_random_uuid()",
+                &[
+                    ("now", Type::TIMESTAMPTZ),
+                    ("current_date", Type::DATE),
+                    ("current_user", Type::NAME),
+                    ("version", Type::TEXT),
+                    ("gen_random_uuid", Type::UUID),
+                ],
+            ),
+            (
+                "SELECT 1::bigint, 'x'::text, '2024-01-01'::date, '{}'::jsonb",
+                &[
+                    ("int8", Type::INT8),
+                    ("text", Type::TEXT),
+                    ("date", Type::DATE),
+                    ("jsonb", Type::JSONB),
+                ],
+            ),
+            (
+                "SELECT length('a'), upper('a'), md5('a'), random(), (SELECT 1) AS one",
+                &[
+                    ("length", Type::INT4),
+                    ("upper", Type::TEXT),
+                    ("md5", Type::TEXT),
+                    ("random", Type::FLOAT8),
+                    ("one", Type::INT4),
+                ],
+            ),
+            (
+                "SELECT id, upper(label), id + 1, label AS l, count(*) OVER () FROM items",
+                &[
+                    ("id", Type::INT4),
+                    ("upper", Type::TEXT),
+                    ("?column?", Type::INT4),
+                    ("l", Type::TEXT),
+                    ("count", Type::INT8),
+                ],
+            ),
+            (
+                "SELECT count(*), sum(id) AS total, max(label) FROM items",
+                &[
+                    ("count", Type::INT8),
+                    ("total", Type::INT8),
+                    ("max", Type::TEXT),
+                ],
+            ),
+        ];
+        for (sql, expected) in cases {
+            let statement = client.prepare(sql).await.unwrap();
+            let described: Vec<(String, Type)> = statement
+                .columns()
+                .iter()
+                .map(|c| (c.name().to_string(), c.type_().clone()))
+                .collect();
+            let expected: Vec<(String, Type)> = expected
+                .iter()
+                .map(|(name, ty)| (name.to_string(), ty.clone()))
+                .collect();
+            assert_eq!(described, expected, "{sql}");
+            client.query(&statement, &[]).await.unwrap();
+        }
+
+        // Session functions see the session, and each item is computed on its own.
+        let row = client
+            .query_one(
+                "SELECT current_user, now() = transaction_timestamp(), \
+                 current_setting('DateStyle'), upper('a'), upper('b')",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(row.get::<_, &str>(0), "nodus");
+        assert!(row.get::<_, bool>(1));
+        assert_eq!(row.get::<_, &str>(2), "ISO, MDY");
+        assert_eq!((row.get::<_, &str>(3), row.get::<_, &str>(4)), ("A", "B"));
+        let rows = client
+            .query(
+                "SELECT id, (SELECT max(price) FROM items) AS top, ARRAY[id, id * 10] \
+                 FROM items ORDER BY id",
+                &[],
+            )
+            .await
+            .unwrap();
+        let arrays: Vec<Vec<i32>> = rows.iter().map(|r| r.get(2)).collect();
+        assert_eq!(arrays, [vec![1, 10], vec![2, 20]]);
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn expression_errors_carry_postgres_sqlstates() {
+    with_client(async |client| {
+        client
+            .batch_execute("CREATE TABLE nums (n INTEGER); INSERT INTO nums VALUES (1), (0)")
+            .await
+            .unwrap();
+        let cases = [
+            ("SELECT 1/0", SqlState::DIVISION_BY_ZERO),
+            ("SELECT 10/n FROM nums", SqlState::DIVISION_BY_ZERO),
+            (
+                "SELECT n FROM nums WHERE 10/n > 1",
+                SqlState::DIVISION_BY_ZERO,
+            ),
+            ("SELECT 'abc'::int", SqlState::INVALID_TEXT_REPRESENTATION),
+            (
+                "SELECT 'maybe'::boolean",
+                SqlState::INVALID_TEXT_REPRESENTATION,
+            ),
+            (
+                "SELECT sqrt(-1)",
+                SqlState::INVALID_ARGUMENT_FOR_POWER_FUNCTION,
+            ),
+            ("SELECT ln(0)", SqlState::INVALID_ARGUMENT_FOR_LOG),
+            ("SELECT no_such_function(1)", SqlState::UNDEFINED_FUNCTION),
+            (
+                "SELECT no_such_function(n) FROM nums",
+                SqlState::UNDEFINED_FUNCTION,
+            ),
+            ("SELECT no_such_column", SqlState::UNDEFINED_COLUMN),
+            (
+                "SELECT (SELECT n FROM nums)",
+                SqlState::CARDINALITY_VIOLATION,
+            ),
+            (
+                "SELECT current_setting('no_such.setting')",
+                SqlState::UNDEFINED_OBJECT,
+            ),
+        ];
+        for (sql, state) in cases {
+            let simple = client.batch_execute(sql).await.unwrap_err();
+            assert_eq!(
+                simple.code(),
+                Some(&state),
+                "simple protocol: {sql}: {simple:?}"
+            );
+            let extended = client.query(sql, &[]).await.unwrap_err();
+            assert_eq!(
+                extended.code(),
+                Some(&state),
+                "extended protocol: {sql}: {extended:?}"
+            );
+        }
+    })
+    .await;
+}

@@ -8,7 +8,11 @@ pub fn expr_to_value(expr: &sqlparser::ast::Expr, params: &[crate::Value]) -> Op
     use sqlparser::ast::{Expr, Value as SqlValue};
     match expr {
         Expr::Value(v) => match &v.value {
-            SqlValue::SingleQuotedString(s) => Some(crate::Value::Text(s.clone())),
+            SqlValue::SingleQuotedString(s)
+            | SqlValue::EscapedStringLiteral(s)
+            | SqlValue::UnicodeStringLiteral(s)
+            | SqlValue::NationalStringLiteral(s) => Some(crate::Value::Text(s.clone())),
+            SqlValue::DollarQuotedString(s) => Some(crate::Value::Text(s.value.clone())),
             SqlValue::Number(n, _) => {
                 if let Ok(i) = n.parse::<i64>() {
                     Some(crate::Value::Int(i))
@@ -180,59 +184,6 @@ pub(crate) fn parse_simple_case_when_eq(
     })
 }
 
-/// Parses a searched or simple `CASE` into a general multi-branch projection.
-/// Simple `CASE x WHEN v` becomes the predicate `x = v`; searched `CASE WHEN
-/// <pred>` parses the predicate directly. Branches whose predicate can't be
-/// parsed are skipped.
-pub(crate) fn parse_case(
-    expr: &sqlparser::ast::Expr,
-    alias: Option<String>,
-    params: &[Value],
-) -> Option<ProjectionItem> {
-    use sqlparser::ast::Expr;
-    let Expr::Case {
-        operand,
-        conditions,
-        else_result,
-        ..
-    } = expr
-    else {
-        return None;
-    };
-    let mut branches = Vec::new();
-    for when in conditions.iter() {
-        let cond = &when.condition;
-        let res = &when.result;
-        let pred = match operand {
-            // Simple CASE: `operand = cond`.
-            Some(op_expr) => Predicate {
-                left: extract_col_name(op_expr)?,
-                op: CompareOp::Eq,
-                right: extract_operand(cond, params)?,
-            },
-            // Searched CASE: `cond` is a single-comparison predicate.
-            None => match parse_filter_expr(cond, params).ok()? {
-                FilterExpr::Predicate(p) => p,
-                _ => return None,
-            },
-        };
-        let then = extract_operand(res, params)?;
-        branches.push((pred, then));
-    }
-    if branches.is_empty() {
-        return None;
-    }
-    let else_result = match else_result {
-        Some(e) => extract_operand(e, params),
-        None => None,
-    };
-    Some(ProjectionItem::Case {
-        branches,
-        else_result,
-        alias,
-    })
-}
-
 pub(crate) fn extract_operand(expr: &sqlparser::ast::Expr, params: &[Value]) -> Option<Operand> {
     use sqlparser::ast::Expr;
     match expr {
@@ -250,78 +201,6 @@ pub(crate) fn extract_operand(expr: &sqlparser::ast::Expr, params: &[Value]) -> 
                 None
             }
         }
-    }
-}
-
-/// Constant-folds a column-free scalar expression to a [`Value`] (for
-/// FROM-less `SELECT <expr>`). Returns `None` for forms we don't evaluate, so
-/// the caller can fall back to legacy handling. Handles literals, arithmetic,
-/// comparisons, logical AND/OR, string `||`, unary `-`/`NOT`, `CAST`, `IS
-/// [NOT] NULL`, and the scalar functions `eval_scalar_function` implements.
-pub(crate) fn fold_scalar(expr: &sqlparser::ast::Expr, params: &[Value]) -> Option<Value> {
-    use sqlparser::ast::{BinaryOperator as B, Expr, UnaryOperator as U};
-    match expr {
-        // True literals only; a bare identifier is not a constant.
-        Expr::Value(_) | Expr::Array(_) | Expr::TypedString(_) => expr_to_value(expr, params),
-        Expr::Nested(inner) => fold_scalar(inner, params),
-        Expr::UnaryOp { op, expr: inner } => {
-            let v = fold_scalar(inner, params)?;
-            match op {
-                U::Minus => match v {
-                    Value::Int(i) => Some(Value::Int(-i)),
-                    Value::Float(f) => Some(Value::Float(-f)),
-                    Value::Null => Some(Value::Null),
-                    _ => None,
-                },
-                U::Plus => Some(v),
-                U::Not => match v {
-                    Value::Bool(b) => Some(Value::Bool(!b)),
-                    Value::Null => Some(Value::Null),
-                    _ => None,
-                },
-                _ => None,
-            }
-        }
-        Expr::BinaryOp { left, op, right } => {
-            // JSON arrow operators are handled by the JsonAccess projection path.
-            if matches!(
-                op,
-                B::Arrow | B::LongArrow | B::HashArrow | B::HashLongArrow
-            ) {
-                return None;
-            }
-            // Any binary op involving an INTERVAL (arithmetic or comparison) is
-            // evaluated via the interval-aware lowering path, not `fold_binary`.
-            if matches!(&**left, Expr::Interval(_)) || matches!(&**right, Expr::Interval(_)) {
-                return lower_scalar(expr, params).map(|se| eval_scalar_expr(&se, &[], &[]));
-            }
-            let l = fold_scalar(left, params)?;
-            let r = fold_scalar(right, params)?;
-            fold_binary(op, l, r)
-        }
-        Expr::Cast {
-            expr: inner,
-            data_type,
-            ..
-        } => {
-            let v = fold_scalar(inner, params)?;
-            Some(cast_value(v, &data_type.to_string()))
-        }
-        Expr::IsNull(inner) => Some(Value::Bool(matches!(
-            fold_scalar(inner, params)?,
-            Value::Null
-        ))),
-        Expr::IsNotNull(inner) => Some(Value::Bool(!matches!(
-            fold_scalar(inner, params)?,
-            Value::Null
-        ))),
-        Expr::Function(func) => fold_function(func, params),
-        // SUBSTRING/TRIM/CASE parse to dedicated nodes; reuse the lowering +
-        // evaluator (no columns are referenced in a FROM-less SELECT).
-        Expr::Substring { .. } | Expr::Trim { .. } | Expr::Extract { .. } | Expr::Case { .. } => {
-            lower_scalar(expr, params).map(|se| eval_scalar_expr(&se, &[], &[]))
-        }
-        _ => None,
     }
 }
 
@@ -425,43 +304,76 @@ fn fold_binary(op: &sqlparser::ast::BinaryOperator, l: Value, r: Value) -> Optio
 
 /// Casts a value to the logical category of `data_type` (INT/FLOAT/BOOL/TEXT).
 /// NodusDB has no distinct NUMERIC type, so NUMERIC/DECIMAL fold to float.
+/// Input that is invalid for the target type fails the statement.
 pub(crate) fn cast_value(v: Value, data_type: &str) -> Value {
+    try_cast(v, data_type).unwrap_or_else(crate::eval_error::raise)
+}
+
+/// [`cast_value`] without failing the statement: `Err` describes the invalid
+/// input, for callers that fall back to keeping the original value.
+pub(crate) fn try_cast(v: Value, data_type: &str) -> std::result::Result<Value, String> {
     use crate::value::ColumnType;
     if matches!(v, Value::Null) {
-        return Value::Null;
+        return Ok(Value::Null);
     }
     if let Some(element_type) = crate::value::array_element_type(data_type) {
         return match v {
-            Value::Array(items) => Value::Array(
-                items
-                    .into_iter()
-                    .map(|item| match item {
-                        Value::Array(_) => cast_value(item, data_type),
-                        item => cast_value(item, element_type),
-                    })
-                    .collect(),
-            ),
-            Value::Text(s) => crate::value::coerce_array_text(&s, data_type).unwrap_or(Value::Null),
-            _ => Value::Null,
+            Value::Array(items) => items
+                .into_iter()
+                .map(|item| match item {
+                    Value::Array(_) => try_cast(item, data_type),
+                    item => try_cast(item, element_type),
+                })
+                .collect::<std::result::Result<_, _>>()
+                .map(Value::Array),
+            Value::Text(s) => crate::value::coerce_array_text(&s, data_type)
+                .ok_or_else(|| format!("malformed array literal: \"{s}\"")),
+            other => Err(format!(
+                "cannot cast {} to {data_type}",
+                crate::value::value_type_name(&other)
+            )),
         };
     }
-    match crate::value::column_type(data_type) {
-        // PostgreSQL rounds half-to-even when casting to an integer.
+    let invalid = |text: &str| {
+        format!(
+            "invalid input syntax for type {}: \"{text}\"",
+            crate::value::sql_type_name(data_type)
+        )
+    };
+    // PostgreSQL 18 casts a JSON scalar to a number or boolean; JSON null is NULL.
+    let v = match v {
+        Value::Jsonb(serde_json::Value::Null) => return Ok(Value::Null),
+        Value::Jsonb(serde_json::Value::Number(n))
+            if !matches!(crate::value::column_type(data_type), ColumnType::Text) =>
+        {
+            Value::Text(n.to_string())
+        }
+        Value::Jsonb(serde_json::Value::Bool(b))
+            if matches!(crate::value::column_type(data_type), ColumnType::Bool) =>
+        {
+            Value::Bool(b)
+        }
+        other => other,
+    };
+    Ok(match crate::value::column_type(data_type) {
+        // PostgreSQL rounds half-to-even when casting a number to an integer;
+        // integer text must be a whole number.
         ColumnType::Int => match &v {
             Value::Int(_) => v,
-            Value::Float(f) => Value::Int(f.round_ties_even() as i64),
+            Value::Float(f) if f.is_finite() => Value::Int(f.round_ties_even() as i64),
+            Value::Float(_) => {
+                return Err(format!(
+                    "{} out of range",
+                    crate::value::sql_type_name(data_type)
+                ));
+            }
             Value::Bool(b) => Value::Int(i64::from(*b)),
             Value::Text(s) => s
                 .trim()
                 .parse::<i64>()
                 .map(Value::Int)
-                .or_else(|_| {
-                    s.trim()
-                        .parse::<f64>()
-                        .map(|f| Value::Int(f.round_ties_even() as i64))
-                })
-                .unwrap_or(Value::Null),
-            _ => Value::Null,
+                .map_err(|_| invalid(s))?,
+            other => return Err(invalid(&render(other))),
         },
         ColumnType::Float => match &v {
             Value::Float(_) => v,
@@ -471,21 +383,37 @@ pub(crate) fn cast_value(v: Value, data_type: &str) -> Value {
                 .trim()
                 .parse::<f64>()
                 .map(Value::Float)
-                .unwrap_or(Value::Null),
-            _ => Value::Null,
+                .map_err(|_| invalid(s))?,
+            other => return Err(invalid(&render(other))),
         },
         ColumnType::Bool => match &v {
             Value::Bool(_) => v,
             Value::Int(i) => Value::Bool(*i != 0),
-            Value::Text(s) => parse_bool_text(s),
-            _ => Value::Null,
+            Value::Text(s) => match parse_bool_text(s) {
+                Value::Null => return Err(invalid(s)),
+                b => b,
+            },
+            other => return Err(invalid(&render(other))),
         },
-        // Booleans cast to the SQL spellings, not the wire `t`/`f` rendering.
-        ColumnType::Text => match &v {
-            Value::Bool(b) => Value::Text(if *b { "true" } else { "false" }.to_string()),
-            _ => Value::Text(render(&v)),
-        },
-    }
+        ColumnType::Text => {
+            let upper = data_type.trim().to_ascii_uppercase();
+            match &v {
+                // Booleans cast to the SQL spellings, not the wire `t`/`f` rendering.
+                Value::Bool(b) => Value::Text(if *b { "true" } else { "false" }.to_string()),
+                Value::Text(s) if upper == "JSON" || upper == "JSONB" => {
+                    serde_json::from_str::<serde_json::Value>(s).map_err(|_| invalid(s))?;
+                    v
+                }
+                Value::Text(s) if upper == "UUID" => Value::Text(
+                    uuid::Uuid::parse_str(s.trim())
+                        .map_err(|_| invalid(s))?
+                        .hyphenated()
+                        .to_string(),
+                ),
+                _ => Value::Text(render(&v)),
+            }
+        }
+    })
 }
 
 /// Extracts a datetime field (`YEAR`/`MONTH`/`DAY`/`HOUR`/`MINUTE`/`SECOND`)
@@ -525,61 +453,12 @@ pub(crate) fn extract_datetime_field(v: &Value, field: &str) -> Value {
 }
 
 /// PostgreSQL-style textual boolean input; unrecognized text folds to NULL.
-fn parse_bool_text(s: &str) -> Value {
+pub(crate) fn parse_bool_text(s: &str) -> Value {
     match s.trim().to_ascii_lowercase().as_str() {
         "t" | "true" | "y" | "yes" | "on" | "1" => Value::Bool(true),
         "f" | "false" | "n" | "no" | "off" | "0" => Value::Bool(false),
         _ => Value::Null,
     }
-}
-
-/// Folds a scalar function call whose arguments are all constant-foldable and
-/// whose name `eval_scalar_function` implements; otherwise `None` (so niladic
-/// specials like `version()` fall through to legacy handling).
-fn fold_function(func: &sqlparser::ast::Function, params: &[Value]) -> Option<Value> {
-    use sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArguments};
-    let name = func.name.to_string().to_uppercase();
-    if !is_foldable_scalar_fn(&name) {
-        return None;
-    }
-    let FunctionArguments::List(list) = &func.args else {
-        return None;
-    };
-    let mut args = Vec::with_capacity(list.args.len());
-    for a in &list.args {
-        match a {
-            FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => args.push(fold_scalar(e, params)?),
-            _ => return None,
-        }
-    }
-    Some(eval_scalar_function(&name, &args))
-}
-
-/// The scalar functions `eval_scalar_function` evaluates. Kept in sync with it
-/// so unknown names fall through to the legacy niladic-function path.
-fn is_foldable_scalar_fn(name: &str) -> bool {
-    crate::value::is_visibility_fn(name)
-        || matches!(
-            name,
-            "CONCAT"
-                | "UPPER"
-                | "LOWER"
-                | "LENGTH"
-                | "CHAR_LENGTH"
-                | "CHARACTER_LENGTH"
-                | "TRIM"
-                | "LTRIM"
-                | "RTRIM"
-                | "COALESCE"
-                | "NULLIF"
-                | "ABS"
-                | "ROUND"
-                | "REPLACE"
-                | "SUBSTR"
-                | "SUBSTRING"
-                | "DATE_TRUNC"
-                | "AGE"
-        )
 }
 
 /// Maps a SQL binary operator to the scalar evaluator's operator, including the
@@ -700,8 +579,39 @@ pub(crate) fn lower_scalar(expr: &sqlparser::ast::Expr, params: &[Value]) -> Opt
         Expr::Value(v) if matches!(v.value, sqlparser::ast::Value::Placeholder(_)) => Some(
             ScalarExpr::Literal(expr_to_value(expr, params).unwrap_or(Value::Null)),
         ),
-        Expr::Value(_) | Expr::Array(_) | Expr::TypedString(_) | Expr::Interval(_) => {
+        Expr::Value(_) | Expr::TypedString(_) | Expr::Interval(_) => {
             expr_to_value(expr, params).map(ScalarExpr::Literal)
+        }
+        // `ARRAY[...]`: a constant when every element is, else built per row.
+        Expr::Array(array) => {
+            let items = array
+                .elem
+                .iter()
+                .map(|e| lower_scalar(e, params))
+                .collect::<Option<Vec<_>>>()?;
+            let constants = items
+                .iter()
+                .map(|item| match item {
+                    ScalarExpr::Literal(value) => Some(value.clone()),
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>();
+            Some(match constants {
+                Some(values) => ScalarExpr::Literal(Value::Array(values)),
+                None => ScalarExpr::Function {
+                    name: "ARRAY".to_string(),
+                    args: items,
+                },
+            })
+        }
+        // SQL keywords that read like identifiers but call a function.
+        Expr::Identifier(id)
+            if id.quote_style.is_none() && is_keyword_function(&id.value.to_ascii_uppercase()) =>
+        {
+            Some(ScalarExpr::Function {
+                name: id.value.to_ascii_uppercase(),
+                args: Vec::new(),
+            })
         }
         Expr::Identifier(id) => Some(ScalarExpr::Column(id.value.clone())),
         Expr::CompoundIdentifier(ids) => Some(ScalarExpr::Column(
@@ -982,8 +892,15 @@ pub(crate) fn lower_scalar(expr: &sqlparser::ast::Expr, params: &[Value]) -> Opt
                 }
                 return Some(ScalarExpr::Row(items));
             }
+            // Window calls and aggregate modifiers have their own paths.
+            if func.over.is_some() || func.filter.is_some() || !func.within_group.is_empty() {
+                return None;
+            }
             // An aggregate nested in an expression, e.g. `sum(a) + 1`.
             if let Some(op) = aggregate_op(&name) {
+                if matches!(&func.args, FunctionArguments::List(list) if !list.clauses.is_empty()) {
+                    return None;
+                }
                 let FunctionArguments::List(list) = &func.args else {
                     return None;
                 };
@@ -1020,21 +937,26 @@ pub(crate) fn lower_scalar(expr: &sqlparser::ast::Expr, params: &[Value]) -> Opt
                     _ => None,
                 };
             }
-            if !is_foldable_scalar_fn(&name) {
+            if !crate::functions::is_known(&name) {
                 return None;
             }
-            let FunctionArguments::List(list) = &func.args else {
-                return None;
-            };
-            let mut args = Vec::with_capacity(list.args.len());
-            for a in &list.args {
-                match a {
-                    FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => {
-                        args.push(lower_scalar(e, params)?)
+            let args = match &func.args {
+                // Keyword functions such as `current_user` take no parentheses.
+                FunctionArguments::None => Vec::new(),
+                FunctionArguments::List(list) if list.clauses.is_empty() => {
+                    let mut args = Vec::with_capacity(list.args.len());
+                    for a in &list.args {
+                        match a {
+                            FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => {
+                                args.push(lower_scalar(e, params)?)
+                            }
+                            _ => return None,
+                        }
                     }
-                    _ => return None,
+                    args
                 }
-            }
+                _ => return None,
+            };
             Some(ScalarExpr::Function { name, args })
         }
         // sqlparser lowers SUBSTRING/SUBSTR and TRIM to dedicated AST nodes
@@ -1068,18 +990,66 @@ pub(crate) fn lower_scalar(expr: &sqlparser::ast::Expr, params: &[Value]) -> Opt
         Expr::Trim {
             expr: inner,
             trim_where,
-            ..
+            trim_what,
+            trim_characters,
         } => {
             use sqlparser::ast::TrimWhereField;
             let name = match trim_where {
                 Some(TrimWhereField::Leading) => "LTRIM",
                 Some(TrimWhereField::Trailing) => "RTRIM",
-                // BOTH or unspecified. `trim_what`/`trim_characters` are ignored:
-                // `eval_scalar_function` trims whitespace only.
-                _ => "TRIM",
+                _ => "BTRIM",
             };
+            let mut args = vec![lower_scalar(inner, params)?];
+            // `TRIM(chars FROM s)` or `TRIM(s, chars)`: the set of characters.
+            match (trim_what, trim_characters.as_deref()) {
+                (Some(chars), _) => args.push(lower_scalar(chars, params)?),
+                (None, Some([chars])) => args.push(lower_scalar(chars, params)?),
+                (None, None) => {}
+                (None, Some(_)) => return None,
+            }
             Some(ScalarExpr::Function {
                 name: name.to_string(),
+                args,
+            })
+        }
+        Expr::Position { expr: sub, r#in } => Some(ScalarExpr::Function {
+            name: "STRPOS".to_string(),
+            args: vec![lower_scalar(r#in, params)?, lower_scalar(sub, params)?],
+        }),
+        Expr::Overlay {
+            expr: inner,
+            overlay_what,
+            overlay_from,
+            overlay_for,
+        } => {
+            let mut args = vec![
+                lower_scalar(inner, params)?,
+                lower_scalar(overlay_what, params)?,
+                lower_scalar(overlay_from, params)?,
+            ];
+            if let Some(len) = overlay_for {
+                args.push(lower_scalar(len, params)?);
+            }
+            Some(ScalarExpr::Function {
+                name: "OVERLAY".to_string(),
+                args,
+            })
+        }
+        Expr::Ceil { expr: inner, field } | Expr::Floor { expr: inner, field }
+            if matches!(
+                field,
+                sqlparser::ast::CeilFloorKind::DateTimeField(
+                    sqlparser::ast::DateTimeField::NoDateTime
+                )
+            ) =>
+        {
+            Some(ScalarExpr::Function {
+                name: if matches!(expr, Expr::Ceil { .. }) {
+                    "CEIL"
+                } else {
+                    "FLOOR"
+                }
+                .to_string(),
                 args: vec![lower_scalar(inner, params)?],
             })
         }
@@ -1151,7 +1121,7 @@ pub(crate) fn eval_scalar_in(expr: &ScalarExpr, scope: &dyn ScalarScope) -> Valu
         ScalarExpr::Cast { expr, target } => cast_value(eval(expr), target),
         ScalarExpr::Function { name, args } => {
             let vals: Vec<Value> = args.iter().map(eval).collect();
-            eval_scalar_function(name, &vals)
+            crate::functions::call(name, &vals)
         }
         ScalarExpr::IsNull { expr, negated } => {
             let is_null = matches!(eval(expr), Value::Null);
@@ -1695,8 +1665,128 @@ pub(crate) fn apply_date_offset(v: &Value, months: i64, days: i64, seconds: i64)
     Value::Null
 }
 
+/// Keywords PostgreSQL evaluates as functions without parentheses.
+fn is_keyword_function(upper: &str) -> bool {
+    matches!(
+        upper,
+        "CURRENT_ROLE"
+            | "CURRENT_USER"
+            | "SESSION_USER"
+            | "USER"
+            | "CURRENT_CATALOG"
+            | "CURRENT_SCHEMA"
+            | "CURRENT_DATE"
+            | "CURRENT_TIME"
+            | "CURRENT_TIMESTAMP"
+            | "LOCALTIME"
+            | "LOCALTIMESTAMP"
+    )
+}
+
+/// The error for the first call to a function NodusDB does not provide, if
+/// an expression makes one: PostgreSQL's `function f(types) does not exist`.
+pub(crate) fn unknown_function_error(expr: &sqlparser::ast::Expr) -> Option<String> {
+    use sqlparser::ast::Expr;
+    fn arg_exprs(func: &sqlparser::ast::Function) -> Vec<&sqlparser::ast::Expr> {
+        use sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArguments};
+        match &func.args {
+            FunctionArguments::List(list) => list
+                .args
+                .iter()
+                .filter_map(|arg| match arg {
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(e))
+                    | FunctionArg::Named {
+                        arg: FunctionArgExpr::Expr(e),
+                        ..
+                    } => Some(e),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+    let children: Vec<&Expr> = match expr {
+        Expr::Function(func) => {
+            let name = func.name.to_string().to_uppercase();
+            let name = name.strip_prefix("PG_CATALOG.").unwrap_or(&name);
+            let args = arg_exprs(func);
+            if name != "ROW"
+                && aggregate_op(name).is_none()
+                && func.over.is_none()
+                && !crate::functions::is_known(name)
+            {
+                let types = args
+                    .iter()
+                    .map(|arg| literal_type_name(arg))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Some(format!(
+                    "function {}({types}) does not exist",
+                    func.name.to_string().to_ascii_lowercase()
+                ));
+            }
+            args
+        }
+        Expr::Nested(e)
+        | Expr::UnaryOp { expr: e, .. }
+        | Expr::Cast { expr: e, .. }
+        | Expr::IsNull(e)
+        | Expr::IsNotNull(e)
+        | Expr::IsTrue(e)
+        | Expr::IsFalse(e)
+        | Expr::IsNotTrue(e)
+        | Expr::IsNotFalse(e)
+        | Expr::Collate { expr: e, .. } => vec![e],
+        Expr::BinaryOp { left, right, .. }
+        | Expr::IsDistinctFrom(left, right)
+        | Expr::IsNotDistinctFrom(left, right)
+        | Expr::AnyOp { left, right, .. }
+        | Expr::AllOp { left, right, .. } => vec![left, right],
+        Expr::Like { expr, pattern, .. }
+        | Expr::ILike { expr, pattern, .. }
+        | Expr::SimilarTo { expr, pattern, .. }
+        | Expr::RLike { expr, pattern, .. } => vec![expr, pattern],
+        Expr::Between {
+            expr, low, high, ..
+        } => vec![expr, low, high],
+        Expr::InList { expr, list, .. } => std::iter::once(&**expr).chain(list).collect(),
+        Expr::Tuple(items) => items.iter().collect(),
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => operand
+            .iter()
+            .map(|e| &**e)
+            .chain(conditions.iter().flat_map(|w| [&w.condition, &w.result]))
+            .chain(else_result.iter().map(|e| &**e))
+            .collect(),
+        _ => Vec::new(),
+    };
+    children.into_iter().find_map(unknown_function_error)
+}
+
+/// A best-effort PostgreSQL type name for a function argument in an error.
+fn literal_type_name(expr: &sqlparser::ast::Expr) -> String {
+    use sqlparser::ast::{Expr, Value as V};
+    match expr {
+        Expr::Value(v) => match &v.value {
+            V::Number(n, _) if n.contains(['.', 'e', 'E']) => "numeric",
+            V::Number(n, _) if n.parse::<i32>().is_ok() => "integer",
+            V::Number(..) => "bigint",
+            V::Boolean(_) => "boolean",
+            _ => "unknown",
+        }
+        .to_string(),
+        Expr::Cast { data_type, .. } => crate::value::sql_type_name(&data_type.to_string()),
+        Expr::Nested(inner) => literal_type_name(inner),
+        _ => "unknown".to_string(),
+    }
+}
+
 /// Maps an aggregate function name to its [`AggregateOp`].
-fn aggregate_op(name: &str) -> Option<AggregateOp> {
+pub(crate) fn aggregate_op(name: &str) -> Option<AggregateOp> {
     match name {
         "COUNT" => Some(AggregateOp::Count),
         "SUM" => Some(AggregateOp::Sum),
@@ -1743,24 +1833,34 @@ pub(crate) fn apply_binary_op(op: ScalarBinaryOp, l: Value, r: Value) -> Value {
             }
             if let (Value::Int(a), Value::Int(b)) = (&l, &r) {
                 let out = match op {
+                    Op::Div | Op::Mod if *b == 0 => {
+                        return crate::eval_error::raise("division by zero");
+                    }
                     Op::Add => a.checked_add(*b),
                     Op::Sub => a.checked_sub(*b),
                     Op::Mul => a.checked_mul(*b),
-                    Op::Div if *b != 0 => Some(a / b),
-                    Op::Mod if *b != 0 => Some(a % b),
-                    Op::Div | Op::Mod => return Value::Null, // division by zero
+                    Op::Div => a.checked_div(*b),
+                    Op::Mod => a.checked_rem(*b),
                     _ => return Value::Null,
                 };
-                out.map(Value::Int).unwrap_or(Value::Null)
+                out.map(Value::Int)
+                    .unwrap_or_else(|| crate::eval_error::raise("bigint out of range"))
             } else if let (Some(a), Some(b)) = (as_f64(&l), as_f64(&r)) {
-                match op {
-                    Op::Add => Value::Float(a + b),
-                    Op::Sub => Value::Float(a - b),
-                    Op::Mul => Value::Float(a * b),
-                    Op::Div if b != 0.0 => Value::Float(a / b),
-                    Op::Mod if b != 0.0 => Value::Float(a % b),
-                    _ => Value::Null,
+                let out = match op {
+                    Op::Div | Op::Mod if b == 0.0 => {
+                        return crate::eval_error::raise("division by zero");
+                    }
+                    Op::Add => a + b,
+                    Op::Sub => a - b,
+                    Op::Mul => a * b,
+                    Op::Div => a / b,
+                    Op::Mod => a % b,
+                    _ => return Value::Null,
+                };
+                if out.is_infinite() && a.is_finite() && b.is_finite() {
+                    return crate::eval_error::raise("value out of range: overflow");
                 }
+                Value::Float(out)
             } else {
                 // Non-numeric operands: interval/date arithmetic on text.
                 interval_date_arith(op, &l, &r)
@@ -1784,6 +1884,24 @@ pub(crate) fn apply_binary_op(op: ScalarBinaryOp, l: Value, r: Value) -> Value {
             })
         }
         Op::Concat => {
+            match (&l, &r) {
+                // Array concatenation: array || array, array || element, element || array.
+                (Value::Array(a), Value::Array(b)) => {
+                    return Value::Array(a.iter().chain(b).cloned().collect());
+                }
+                (Value::Array(a), elem) => {
+                    return Value::Array(a.iter().cloned().chain([elem.clone()]).collect());
+                }
+                (elem, Value::Array(b)) => {
+                    return Value::Array(
+                        [elem.clone()]
+                            .into_iter()
+                            .chain(b.iter().cloned())
+                            .collect(),
+                    );
+                }
+                _ => {}
+            }
             if matches!(l, Value::Null) || matches!(r, Value::Null) {
                 Value::Null
             } else {

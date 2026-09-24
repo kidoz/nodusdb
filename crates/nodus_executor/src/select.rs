@@ -139,11 +139,12 @@ impl MemExecutor {
                     && having.is_none()
                     && filter.is_none()
                     && !distinct
-                    && projection.iter().all(|p| {
-                        !matches!(
-                            p,
-                            ProjectionItem::Aggregate(..) | ProjectionItem::WindowFunction { .. }
-                        )
+                    && projection.iter().all(|p| match p {
+                        ProjectionItem::Aggregate(..) | ProjectionItem::WindowFunction { .. } => {
+                            false
+                        }
+                        ProjectionItem::Expr { expr, .. } => !scalar_has_aggregate(expr),
+                        _ => true,
                     }) =>
             {
                 Some(offset.unwrap_or(0).saturating_add(lim))
@@ -491,6 +492,14 @@ impl MemExecutor {
         // refs are checked, so computed expressions stay lenient.
         if !query_has_virtual {
             for item in &projection {
+                // A function the library lacks is planned as a legacy item; it
+                // would otherwise evaluate to NULL.
+                if let ProjectionItem::ScalarFunction { func_name, .. } = item {
+                    let name = func_name.strip_prefix("PG_CATALOG.").unwrap_or(func_name);
+                    if !crate::functions::is_known(name) {
+                        anyhow::bail!("function {}() does not exist", name.to_ascii_lowercase());
+                    }
+                }
                 if let ProjectionItem::Column(c) | ProjectionItem::AliasedColumn(c, _) = item {
                     let bare = c.rsplit('.').next().unwrap_or(c);
                     let known = col_names
@@ -642,6 +651,13 @@ impl MemExecutor {
                             ProjectionItem::Aggregate(op, inner) => {
                                 out_row.push(compute_aggregate(op, inner, &group_rows, &col_names));
                             }
+                            ProjectionItem::Subquery { plan, .. } => {
+                                // Outer references read the group's first row.
+                                let rep = group_rows.first().map(Vec::as_slice).unwrap_or(&[]);
+                                out_row.push(
+                                    self.correlated_scalar_subquery(ctx, plan, rep, &col_names),
+                                );
+                            }
                             ProjectionItem::Expr { expr, .. } => {
                                 // Group-aware eval: aggregates compute over the group,
                                 // plain columns read the group's first row.
@@ -694,10 +710,9 @@ impl MemExecutor {
                         ProjectionItem::Case { alias, .. } => {
                             alias.clone().unwrap_or_else(|| "case".to_string())
                         }
-                        ProjectionItem::Aggregate(op, inner) => {
-                            format!("{:?}({})", op, inner)
-                        }
-                        ProjectionItem::Expr { alias, .. } => {
+                        ProjectionItem::Aggregate(op, _) => format!("{op:?}").to_ascii_lowercase(),
+                        ProjectionItem::Expr { alias, .. }
+                        | ProjectionItem::Subquery { alias, .. } => {
                             alias.clone().unwrap_or_else(|| "?column?".to_string())
                         }
                     })
@@ -750,7 +765,8 @@ impl MemExecutor {
                         ProjectionItem::Case { alias, .. } => {
                             Some(alias.clone().unwrap_or_else(|| "case".to_string()))
                         }
-                        ProjectionItem::Expr { alias, .. } => {
+                        ProjectionItem::Expr { alias, .. }
+                        | ProjectionItem::Subquery { alias, .. } => {
                             Some(alias.clone().unwrap_or_else(|| "?column?".to_string()))
                         }
                         _ => None,
@@ -1099,6 +1115,16 @@ impl MemExecutor {
                         }
                         col_names.push(format!("__expr_{proj_idx}"));
                     }
+                    ProjectionItem::Subquery { plan, .. } => {
+                        let vals: Vec<Value> = stored_rows
+                            .iter()
+                            .map(|row| self.correlated_scalar_subquery(ctx, plan, row, &col_names))
+                            .collect();
+                        for (row, v) in stored_rows.iter_mut().zip(vals) {
+                            row.push(v);
+                        }
+                        col_names.push(format!("__expr_{proj_idx}"));
+                    }
                     _ => {}
                 }
             }
@@ -1135,7 +1161,9 @@ impl MemExecutor {
                             ProjectionItem::CaseWhenEq {
                                 else_column, alias, ..
                             } => alias.clone().unwrap_or_else(|| else_column.clone()),
-                            ProjectionItem::Expr { .. } => format!("__expr_{}", pi),
+                            ProjectionItem::Expr { .. } | ProjectionItem::Subquery { .. } => {
+                                format!("__expr_{}", pi)
+                            }
                             _ => c.clone(),
                         };
                         col_names.iter().position(|tc| {
