@@ -43,7 +43,7 @@ SELECT 2 + 3 * 4;
 query R
 SELECT 1.5 + 2.5;
 ----
-4
+4.0
 
 query R
 SELECT 0.5 * 3;

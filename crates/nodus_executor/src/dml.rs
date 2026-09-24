@@ -233,7 +233,11 @@ impl MemExecutor {
                 Self::row_pk(&pk_positions, &row)
             };
             let key = format!("{}:{}", tbl.id, pk);
-            self.write_row(&ctx.session_id, key.clone(), serde_json::to_string(&row)?)?;
+            self.write_row(
+                &ctx.session_id,
+                key.clone(),
+                crate::value::encode_row(&row)?,
+            )?;
             touched.insert(key);
 
             // Maintain secondary indexes.
@@ -492,7 +496,7 @@ impl MemExecutor {
         self.write_row(
             &ctx.session_id,
             new_key.clone(),
-            serde_json::to_string(row)?,
+            crate::value::encode_row(row)?,
         )?;
         if new_key != old_key {
             self.delete_row(&ctx.session_id, old_key.to_string())?;

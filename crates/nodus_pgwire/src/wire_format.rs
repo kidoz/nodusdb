@@ -66,7 +66,11 @@ pub(crate) fn sqlstate_for_execution_error(err_str: &str) -> &'static str {
         || err_str == "timestamp out of range"
     {
         "22008" // datetime_field_overflow
-    } else if err_str.ends_with("out of range") || err_str.starts_with("value out of range") {
+    } else if err_str.ends_with("out of range")
+        || err_str.starts_with("value out of range")
+        || err_str == "numeric field overflow"
+        || err_str == "value overflows numeric format"
+    {
         "22003" // numeric_value_out_of_range
     } else if err_str.starts_with("cannot take logarithm") {
         "2201E" // invalid_argument_for_logarithm
@@ -312,7 +316,6 @@ pub(crate) fn supports_binary_result(ty: &Type) -> bool {
         *ty,
         Type::CHAR
             | Type::CHAR_ARRAY
-            | Type::NUMERIC
             | Type::NUMERIC_ARRAY
             | Type::REGCLASS
             | Type::REGCONFIG

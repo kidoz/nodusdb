@@ -26,6 +26,7 @@ nodus_catalog = { path = "../nodus_catalog" }
 nodus_telemetry = { path = "../nodus_telemetry" }
 serde_json.workspace = true
 uuid.workspace = true
+rust_decimal = { workspace = true, features = ["db-postgres"] }
 tokio-rustls = "0.26.5"
 tokio-util = "0.7.19"
 

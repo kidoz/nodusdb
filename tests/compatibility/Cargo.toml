@@ -21,6 +21,8 @@ serde_json.workspace = true
 tokio.workspace = true
 tokio-postgres.workspace = true
 uuid.workspace = true
+# Exact `numeric` values through the Rust driver.
+rust_decimal = { workspace = true, features = ["db-tokio-postgres"] }
 # Raw-socket SCRAM-SHA-256 client handshake for the wire-level smoke tests.
 hmac = "0.13.0"
 sha2 = "0.11.0"

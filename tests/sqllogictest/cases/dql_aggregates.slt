@@ -17,8 +17,8 @@ west	2	300	100	200
 query TR rowsort
 SELECT region, avg(amount) FROM sales GROUP BY region;
 ----
-east	100
-west	150
+east	100.0000000000000000
+west	150.0000000000000000
 
 # scalar aggregate over the whole table
 query I
@@ -55,4 +55,4 @@ SELECT sum(amount) * 2 FROM sales;
 query R
 SELECT avg(amount) + 10 FROM sales;
 ----
-130
+130.0000000000000000

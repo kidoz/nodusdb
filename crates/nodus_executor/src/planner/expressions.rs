@@ -13,9 +13,13 @@ pub fn expr_to_value(expr: &sqlparser::ast::Expr, params: &[crate::Value]) -> Op
             | SqlValue::UnicodeStringLiteral(s)
             | SqlValue::NationalStringLiteral(s) => Some(crate::Value::Text(s.clone())),
             SqlValue::DollarQuotedString(s) => Some(crate::Value::Text(s.value.clone())),
+            // An integer literal is an integer; one with a point or exponent (or
+            // too large for bigint) is an exact numeric, as in PostgreSQL.
             SqlValue::Number(n, _) => {
                 if let Ok(i) = n.parse::<i64>() {
                     Some(crate::Value::Int(i))
+                } else if let Some(d) = crate::value::parse_decimal(n) {
+                    Some(crate::Value::Numeric(d))
                 } else if let Ok(f) = n.parse::<f64>() {
                     Some(crate::Value::Float(f))
                 } else {
@@ -70,6 +74,7 @@ pub fn expr_to_value(expr: &sqlparser::ast::Expr, params: &[crate::Value]) -> Op
                 sqlparser::ast::UnaryOperator::Minus => match v {
                     crate::Value::Int(i) => Some(crate::Value::Int(-i)),
                     crate::Value::Float(f) => Some(crate::Value::Float(-f)),
+                    crate::Value::Numeric(d) => Some(crate::Value::Numeric(-d)),
                     _ => None,
                 },
                 sqlparser::ast::UnaryOperator::Plus => Some(v),
@@ -206,104 +211,6 @@ pub(crate) fn extract_operand(expr: &sqlparser::ast::Expr, params: &[Value]) -> 
     }
 }
 
-fn fold_binary(op: &sqlparser::ast::BinaryOperator, l: Value, r: Value) -> Option<Value> {
-    use sqlparser::ast::BinaryOperator as B;
-    let as_f64 = |v: &Value| -> Option<f64> {
-        match v {
-            Value::Int(i) => Some(*i as f64),
-            Value::Float(f) => Some(*f),
-            _ => None,
-        }
-    };
-    match op {
-        B::Plus | B::Minus | B::Multiply | B::Divide | B::Modulo => {
-            if matches!(l, Value::Null) || matches!(r, Value::Null) {
-                return Some(Value::Null);
-            }
-            if let (Value::Int(a), Value::Int(b)) = (&l, &r) {
-                let out = match op {
-                    B::Plus => a.checked_add(*b),
-                    B::Minus => a.checked_sub(*b),
-                    B::Multiply => a.checked_mul(*b),
-                    // PostgreSQL integer division truncates toward zero (Rust `/`).
-                    B::Divide if *b != 0 => Some(a / b),
-                    B::Modulo if *b != 0 => Some(a % b),
-                    // Division/modulo by zero: PostgreSQL errors; surface NULL
-                    // rather than panicking or returning a wrong number.
-                    B::Divide | B::Modulo => return Some(Value::Null),
-                    _ => return None,
-                };
-                // Overflow -> NULL (avoid a panic in a query path).
-                Some(out.map(Value::Int).unwrap_or(Value::Null))
-            } else {
-                let (a, b) = (as_f64(&l)?, as_f64(&r)?);
-                let out = match op {
-                    B::Plus => a + b,
-                    B::Minus => a - b,
-                    B::Multiply => a * b,
-                    B::Divide if b != 0.0 => a / b,
-                    B::Modulo if b != 0.0 => a % b,
-                    B::Divide | B::Modulo => return Some(Value::Null),
-                    _ => return None,
-                };
-                Some(Value::Float(out))
-            }
-        }
-        B::Eq | B::NotEq | B::Lt | B::LtEq | B::Gt | B::GtEq => {
-            if matches!(l, Value::Null) || matches!(r, Value::Null) {
-                return Some(Value::Null);
-            }
-            use std::cmp::Ordering::{Greater, Less};
-            let ord = compare(&l, &r);
-            let b = match op {
-                B::Eq => values_equal(&l, &r),
-                B::NotEq => !values_equal(&l, &r),
-                B::Lt => ord == Less,
-                B::LtEq => ord != Greater,
-                B::Gt => ord == Greater,
-                B::GtEq => ord != Less,
-                _ => return None,
-            };
-            Some(Value::Bool(b))
-        }
-        B::StringConcat => {
-            if matches!(l, Value::Null) || matches!(r, Value::Null) {
-                Some(Value::Null)
-            } else {
-                Some(Value::Text(format!("{}{}", render(&l), render(&r))))
-            }
-        }
-        B::And | B::Or => {
-            // Three-valued logic; operands must be Bool or Null.
-            let lb = match l {
-                Value::Bool(b) => Some(b),
-                Value::Null => None,
-                _ => return None,
-            };
-            let rb = match r {
-                Value::Bool(b) => Some(b),
-                Value::Null => None,
-                _ => return None,
-            };
-            let out = match op {
-                B::And => match (lb, rb) {
-                    (Some(false), _) | (_, Some(false)) => Value::Bool(false),
-                    (Some(true), Some(true)) => Value::Bool(true),
-                    _ => Value::Null,
-                },
-                B::Or => match (lb, rb) {
-                    (Some(true), _) | (_, Some(true)) => Value::Bool(true),
-                    (Some(false), Some(false)) => Value::Bool(false),
-                    _ => Value::Null,
-                },
-                _ => return None,
-            };
-            Some(out)
-        }
-        _ => None,
-    }
-}
-
 /// Casts a value to the logical category of `data_type` (INT/FLOAT/BOOL/TEXT).
 /// NodusDB has no distinct NUMERIC type, so NUMERIC/DECIMAL fold to float.
 /// Input that is invalid for the target type fails the statement.
@@ -360,25 +267,49 @@ pub(crate) fn try_cast(v: Value, data_type: &str) -> std::result::Result<Value, 
     Ok(match crate::value::column_type(data_type) {
         // PostgreSQL rounds half-to-even when casting a number to an integer;
         // integer text must be a whole number.
-        ColumnType::Int => match &v {
-            Value::Int(_) => v,
-            Value::Float(f) if f.is_finite() => Value::Int(f.round_ties_even() as i64),
-            Value::Float(_) => {
-                return Err(format!(
-                    "{} out of range",
-                    crate::value::sql_type_name(data_type)
-                ));
+        // PostgreSQL rounds a float to an integer half-to-even and a numeric
+        // half away from zero; the result must fit the integer's width.
+        ColumnType::Int => {
+            let out_of_range =
+                || format!("{} out of range", crate::value::sql_type_name(data_type));
+            let n = match &v {
+                Value::Int(i) => *i,
+                Value::Float(f) if f.is_finite() && f.abs() < 9.3e18 => f.round_ties_even() as i64,
+                Value::Float(_) => return Err(out_of_range()),
+                Value::Numeric(d) => {
+                    use rust_decimal::prelude::ToPrimitive;
+                    d.round_dp_with_strategy(
+                        0,
+                        rust_decimal::RoundingStrategy::MidpointAwayFromZero,
+                    )
+                    .to_i64()
+                    .ok_or_else(out_of_range)?
+                }
+                Value::Bool(b) => i64::from(*b),
+                Value::Text(s) => s.trim().parse::<i64>().map_err(|_| invalid(s))?,
+                other => return Err(invalid(&render(other))),
+            };
+            let (min, max) = crate::value::integer_range(data_type);
+            if !(min..=max).contains(&n) {
+                return Err(out_of_range());
             }
-            Value::Bool(b) => Value::Int(i64::from(*b)),
-            Value::Text(s) => s
-                .trim()
-                .parse::<i64>()
-                .map(Value::Int)
-                .map_err(|_| invalid(s))?,
-            other => return Err(invalid(&render(other))),
-        },
+            Value::Int(n)
+        }
+        ColumnType::Numeric => {
+            let d = match &v {
+                Value::Numeric(d) => *d,
+                Value::Int(i) => rust_decimal::Decimal::from(*i),
+                Value::Float(f) if f.is_finite() => crate::value::parse_decimal(&f.to_string())
+                    .ok_or_else(|| "value overflows numeric format".to_string())?,
+                Value::Float(_) => return Err("cannot convert infinity or NaN to numeric".into()),
+                Value::Text(s) => crate::value::parse_decimal(s).ok_or_else(|| invalid(s))?,
+                other => return Err(invalid(&render(other))),
+            };
+            Value::Numeric(crate::value::apply_numeric_typmod(d, data_type)?)
+        }
         ColumnType::Float => match &v {
             Value::Float(_) => v,
+            Value::Numeric(d) => Value::Float(crate::value::decimal_to_f64(d)),
             Value::Int(i) => Value::Float(*i as f64),
             Value::Bool(b) => Value::Float(if *b { 1.0 } else { 0.0 }),
             Value::Text(s) => s
@@ -1915,11 +1846,82 @@ pub(crate) fn scalar_has_aggregate(expr: &ScalarExpr) -> bool {
         || expr.children().into_iter().any(scalar_has_aggregate)
 }
 
+/// Exact `numeric` arithmetic. Division takes PostgreSQL's result scale (at
+/// least 16 significant digits); overflow and division by zero fail.
+fn numeric_arith(op: ScalarBinaryOp, a: rust_decimal::Decimal, b: rust_decimal::Decimal) -> Value {
+    use ScalarBinaryOp as Op;
+    let result = match op {
+        Op::Add => a.checked_add(b),
+        Op::Sub => a.checked_sub(b),
+        Op::Mul => a.checked_mul(b),
+        Op::Div | Op::Mod if b.is_zero() => return crate::eval_error::raise("division by zero"),
+        Op::Div => return numeric_div(a, b),
+        Op::Mod => a.checked_rem(b),
+        _ => return Value::Null,
+    };
+    result.map_or_else(
+        || crate::eval_error::raise("value overflows numeric format"),
+        Value::Numeric,
+    )
+}
+
+/// `numeric` division with PostgreSQL's result scale (`select_div_scale`):
+/// enough fractional digits for 16 significant ones, and at least either
+/// operand's scale.
+pub(crate) fn numeric_div(a: rust_decimal::Decimal, b: rust_decimal::Decimal) -> Value {
+    if b.is_zero() {
+        return crate::eval_error::raise("division by zero");
+    }
+    // The weight (position of the first base-10000 digit) and that digit.
+    fn weight_and_first(d: rust_decimal::Decimal) -> (i32, u32) {
+        if d.is_zero() {
+            return (0, 0);
+        }
+        let text = d.abs().normalize().to_string();
+        let (int_part, frac_part) = text.split_once('.').unwrap_or((&text, ""));
+        if int_part != "0" {
+            let n = int_part.len();
+            let first_len = (n - 1) % 4 + 1;
+            (
+                (n as i32 - 1) / 4,
+                int_part[..first_len].parse().unwrap_or(0),
+            )
+        } else {
+            let zeros = frac_part.len() - frac_part.trim_start_matches('0').len();
+            let group = zeros / 4;
+            let padded = format!("{frac_part:0<width$}", width = (group + 1) * 4);
+            (
+                -(group as i32) - 1,
+                padded[group * 4..group * 4 + 4].parse().unwrap_or(0),
+            )
+        }
+    }
+    let (w1, f1) = weight_and_first(a);
+    let (w2, f2) = weight_and_first(b);
+    let qweight = w1 - w2 - i32::from(f1 <= f2);
+    let rscale = (16 - qweight * 4)
+        .max(a.scale() as i32)
+        .max(b.scale() as i32)
+        .clamp(0, 28) as u32;
+    match a.checked_div(b) {
+        Some(q) => {
+            let mut q = q.round_dp_with_strategy(
+                rscale,
+                rust_decimal::RoundingStrategy::MidpointAwayFromZero,
+            );
+            q.rescale(rscale);
+            Value::Numeric(q)
+        }
+        None => crate::eval_error::raise("value overflows numeric format"),
+    }
+}
+
 /// Applies a unary operator to a value; type-invalid combinations yield `Null`.
 pub(crate) fn apply_unary_op(op: ScalarUnaryOp, v: Value) -> Value {
     match (op, v) {
         (ScalarUnaryOp::Neg, Value::Int(i)) => Value::Int(-i),
         (ScalarUnaryOp::Neg, Value::Float(f)) => Value::Float(-f),
+        (ScalarUnaryOp::Neg, Value::Numeric(d)) => Value::Numeric(-d),
         (ScalarUnaryOp::Not, Value::Bool(b)) => Value::Bool(!b),
         (_, Value::Null) => Value::Null,
         _ => Value::Null,
@@ -1934,6 +1936,7 @@ pub(crate) fn apply_binary_op(op: ScalarBinaryOp, l: Value, r: Value) -> Value {
         match v {
             Value::Int(i) => Some(*i as f64),
             Value::Float(f) => Some(*f),
+            Value::Numeric(d) => Some(crate::value::decimal_to_f64(d)),
             _ => None,
         }
     };
@@ -1941,6 +1944,18 @@ pub(crate) fn apply_binary_op(op: ScalarBinaryOp, l: Value, r: Value) -> Value {
         Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Mod => {
             if matches!(l, Value::Null) || matches!(r, Value::Null) {
                 return Value::Null;
+            }
+            // Exact decimal arithmetic when a numeric meets an integer or a
+            // numeric (a float operand makes the result a float).
+            if matches!(l, Value::Numeric(_)) || matches!(r, Value::Numeric(_)) {
+                let decimal = |v: &Value| match v {
+                    Value::Numeric(d) => Some(*d),
+                    Value::Int(i) => Some(rust_decimal::Decimal::from(*i)),
+                    _ => None,
+                };
+                if let (Some(a), Some(b)) = (decimal(&l), decimal(&r)) {
+                    return numeric_arith(op, a, b);
+                }
             }
             if let (Value::Int(a), Value::Int(b)) = (&l, &r) {
                 let out = match op {

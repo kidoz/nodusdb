@@ -251,7 +251,8 @@ impl MemExecutor {
                 break;
             }
             let pair = pair?;
-            let values: Vec<Value> = serde_json::from_slice(&pair.value)?;
+            let mut values: Vec<Value> = serde_json::from_slice(&pair.value)?;
+            crate::value::restore_row(&mut values, &tbl.columns);
 
             let keep = self
                 .eval_filter(ctx, &values, &col_names, &joined_columns, filter)

@@ -718,3 +718,68 @@ async fn expression_errors_carry_postgres_sqlstates() {
     })
     .await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn numeric_values_and_serial_keys_round_trip() {
+    use rust_decimal::Decimal;
+    use std::str::FromStr;
+    with_client(async |client| {
+        client
+            .batch_execute(
+                "CREATE TABLE prices (id SERIAL PRIMARY KEY, amount NUMERIC(10,2), \
+                 qty INT, total NUMERIC GENERATED ALWAYS AS (amount * qty) STORED)",
+            )
+            .await
+            .unwrap();
+        // Exact decimals in both directions, binary on the wire.
+        let insert = client
+            .prepare("INSERT INTO prices (amount, qty) VALUES ($1, $2) RETURNING id, amount, total")
+            .await
+            .unwrap();
+        assert_eq!(insert.params(), [Type::NUMERIC, Type::INT4]);
+        let first = client
+            .query_one(&insert, &[&Decimal::from_str("19.995").unwrap(), &3i32])
+            .await
+            .unwrap();
+        assert_eq!(first.get::<_, i32>(0), 1);
+        assert_eq!(first.get::<_, Decimal>(1).to_string(), "20.00");
+        assert_eq!(first.get::<_, Decimal>(2).to_string(), "60.00");
+        let second = client
+            .query_one(&insert, &[&Decimal::from_str("0.10").unwrap(), &2i32])
+            .await
+            .unwrap();
+        assert_eq!(second.get::<_, i32>(0), 2);
+        let row = client
+            .query_one(
+                "SELECT sum(amount), avg(amount), 0.1 + 0.2, 10 / 4.0 FROM prices",
+                &[],
+            )
+            .await
+            .unwrap();
+        let decimals: Vec<String> = (0..4)
+            .map(|i| row.get::<_, Decimal>(i).to_string())
+            .collect();
+        assert_eq!(
+            decimals,
+            ["20.10", "10.0500000000000000", "0.3", "2.5000000000000000"]
+        );
+        // Out-of-range values are rejected rather than stored.
+        let overflow = client
+            .execute(
+                "INSERT INTO prices (amount, qty) VALUES (123456789.1, 1)",
+                &[],
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(overflow.code(), Some(&SqlState::NUMERIC_VALUE_OUT_OF_RANGE));
+        let too_wide = client
+            .execute(
+                "INSERT INTO prices (amount, qty) VALUES (1, 2147483648)",
+                &[],
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(too_wide.code(), Some(&SqlState::NUMERIC_VALUE_OUT_OF_RANGE));
+    })
+    .await;
+}

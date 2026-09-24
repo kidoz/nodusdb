@@ -16,7 +16,7 @@ SELECT 3 * 1.5;
 query R
 SELECT 10 / 4.0;
 ----
-2.5
+2.5000000000000000
 
 query I
 SELECT 7 / 2;
@@ -178,16 +178,28 @@ SELECT 3.7::int;
 ----
 4
 
-# half-to-even rounding on float -> int casts (matches PostgreSQL)
+# A numeric literal rounds half away from zero when cast to an integer
+# (matches PostgreSQL)
 query I
 SELECT 2.5::int;
 ----
-2
+3
 
 query I
 SELECT 3.5::int;
 ----
 4
+
+query I
+SELECT (-2.5)::int;
+----
+-3
+
+# a float rounds half to even when cast to an integer (matches PostgreSQL)
+query III
+SELECT 2.5::float8::int, 3.5::float8::int, (-2.5)::float8::int;
+----
+2	4	-2
 
 # boolean -> text uses the SQL spellings
 query T

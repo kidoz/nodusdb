@@ -896,9 +896,10 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
                         nodus_executor::Value::Float(v)
                     }
                     Type::NUMERIC => {
-                        let bytes = portal.parameters.get(i).unwrap().as_ref().unwrap();
-                        let s = String::from_utf8_lossy(bytes).into_owned();
-                        text_parameter_value(param_type, s)
+                        match portal.parameter::<rust_decimal::Decimal>(i, param_type)? {
+                            Some(d) => nodus_executor::Value::Numeric(d),
+                            None => nodus_executor::Value::Null,
+                        }
                     }
                     Type::OID => {
                         let v = portal.parameter::<u32>(i, param_type)?.unwrap_or_default();

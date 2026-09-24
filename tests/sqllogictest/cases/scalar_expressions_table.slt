@@ -102,7 +102,7 @@ carol
 query R
 SELECT avg(a) FROM nums;
 ----
-4
+4.0000000000000000
 
 query II
 SELECT sum(a), count(*) FROM nums;

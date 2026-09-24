@@ -37,6 +37,7 @@ fn literal_type(value: &Value) -> Option<String> {
             Value::Int(i) if i32::try_from(*i).is_ok() => "INTEGER",
             Value::Int(_) => "BIGINT",
             Value::Float(_) => "DOUBLE PRECISION",
+            Value::Numeric(_) => "NUMERIC",
             Value::Bool(_) => "BOOLEAN",
             Value::Text(_) => "TEXT",
             Value::Jsonb(_) => "JSONB",

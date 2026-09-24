@@ -219,6 +219,35 @@ fn aggregate_numeric(op: &AggregateOp, vals: &[Value]) -> Value {
             if non_null.is_empty() {
                 return Value::Null;
             }
+            // Integers and numerics sum exactly; `avg` of them is a numeric
+            // with PostgreSQL's division scale. A float makes both floats.
+            if !non_null.iter().any(|v| matches!(v, Value::Float(_))) {
+                let mut sum = rust_decimal::Decimal::ZERO;
+                let mut any_numeric = false;
+                for v in &non_null {
+                    let d = match v {
+                        Value::Int(i) => rust_decimal::Decimal::from(*i),
+                        Value::Numeric(d) => {
+                            any_numeric = true;
+                            *d
+                        }
+                        _ => return Value::Null,
+                    };
+                    sum = match sum.checked_add(d) {
+                        Some(s) => s,
+                        None => return crate::eval_error::raise("value overflows numeric format"),
+                    };
+                }
+                return if *op == AggregateOp::Avg {
+                    crate::planner::numeric_div(sum, rust_decimal::Decimal::from(non_null.len()))
+                } else if any_numeric {
+                    Value::Numeric(sum)
+                } else {
+                    use rust_decimal::prelude::ToPrimitive;
+                    // An integer sum too large for bigint is a numeric.
+                    sum.to_i64().map_or(Value::Numeric(sum), Value::Int)
+                };
+            }
             let mut int_sum = 0i64;
             let mut float_sum = 0f64;
             let mut is_float = false;
@@ -234,6 +263,10 @@ fn aggregate_numeric(op: &AggregateOp, vals: &[Value]) -> Value {
                     Value::Float(f) => {
                         is_float = true;
                         float_sum += f;
+                    }
+                    Value::Numeric(d) => {
+                        is_float = true;
+                        float_sum += crate::value::decimal_to_f64(d);
                     }
                     _ => return Value::Null,
                 }

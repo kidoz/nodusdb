@@ -32,15 +32,15 @@ SELECT val FROM num_tbl WHERE val = 4.5;
 query R rowsort
 SELECT val + 1.5 FROM num_tbl WHERE id <= 3;
 ----
--3
+-3.0
 1.5
-6
+6.0
 
 query R rowsort
 SELECT val * 2 FROM num_tbl WHERE id IN (2, 4);
 ----
-20.5
-9
+20.50
+9.0
 
 query R
 SELECT 10.25 - 4.5;
@@ -50,7 +50,7 @@ SELECT 10.25 - 4.5;
 query R
 SELECT 4.5 / 1.5;
 ----
-3
+3.0000000000000000
 
 # abs / round
 query R
@@ -77,7 +77,7 @@ SELECT sum(val) FROM num_tbl;
 query R
 SELECT avg(val) FROM num_tbl WHERE id IN (2, 3);
 ----
-0
+0.00000000000000000000
 
 query R
 SELECT max(val) FROM num_tbl;

@@ -521,6 +521,22 @@ impl MemExecutor {
         }
     }
 
+    /// A table's columns, for restoring decoded rows' types; empty for a
+    /// relation the catalog does not know.
+    fn table_columns(&self, table_id: TableId) -> Vec<ColumnDescriptor> {
+        self.catalog_reader
+            .get_table_by_id(table_id)
+            .map(|t| t.columns)
+            .unwrap_or_default()
+    }
+
+    /// Decodes a stored row into typed values (see [`crate::value::restore_row`]).
+    fn decode_row(bytes: &[u8], columns: &[ColumnDescriptor]) -> Result<Vec<Value>> {
+        let mut row: Vec<Value> = serde_json::from_slice(bytes)?;
+        crate::value::restore_row(&mut row, columns);
+        Ok(row)
+    }
+
     /// Scans all visible rows of a table, decoding each into typed values.
     pub(crate) fn scan_rows(&self, table_id: TableId, session: &str) -> Result<Vec<Vec<Value>>> {
         Ok(self
@@ -549,12 +565,13 @@ impl MemExecutor {
                 end: end.clone(),
             },
         )?;
+        let columns = self.table_columns(table_id);
         let mut keyed_rows = std::collections::BTreeMap::new();
         for pair in self.kv.scan(KeyRange { start, end }, read_ts)? {
             let pair = pair?;
             keyed_rows.insert(
                 String::from_utf8_lossy(&pair.key).to_string(),
-                serde_json::from_slice::<Vec<Value>>(&pair.value)?,
+                Self::decode_row(&pair.value, &columns)?,
             );
         }
         if let Some(txn) = self.active_txns.read().get(session) {
@@ -564,7 +581,10 @@ impl MemExecutor {
                 if key >= &start && key < &end {
                     match value {
                         Some(encoded) => {
-                            keyed_rows.insert(key.clone(), serde_json::from_str(encoded)?);
+                            keyed_rows.insert(
+                                key.clone(),
+                                Self::decode_row(encoded.as_bytes(), &columns)?,
+                            );
                         }
                         None => {
                             keyed_rows.remove(key);
@@ -609,10 +629,11 @@ impl MemExecutor {
                 end: end.clone(),
             },
         )?;
+        let columns = self.table_columns(table_id);
         let mut rows = Vec::with_capacity(cap.min(1024));
         for pair in self.kv.scan(KeyRange { start, end }, read_ts)?.take(cap) {
             let pair = pair?;
-            rows.push(serde_json::from_slice::<Vec<Value>>(&pair.value)?);
+            rows.push(Self::decode_row(&pair.value, &columns)?);
         }
         Ok(Some(rows))
     }
@@ -634,12 +655,13 @@ impl MemExecutor {
                 end: Bytes::from(format!("{};", table_id)),
             },
         )?;
-        let escaped = Self::escape_index_value(&render(index_val));
+        let escaped = Self::escape_index_value(&render(&crate::value::key_form(index_val)));
         let prefix = format!("i:{}:{}:", index_id, escaped);
         let start = Bytes::from(prefix.clone());
         let end_prefix = format!("i:{}:{};", index_id, escaped);
         let end = Bytes::from(end_prefix);
 
+        let columns = self.table_columns(table_id);
         let mut rows = Vec::new();
         for pair in self.kv.scan(KeyRange { start, end }, read_ts)? {
             let pair = pair?;
@@ -648,7 +670,7 @@ impl MemExecutor {
                 // Fetch the actual row
                 let row_key = Bytes::from(format!("{}:{}", table_id, pk));
                 if let Some(row_val) = self.kv.get(&row_key, read_ts)? {
-                    rows.push(serde_json::from_slice::<Vec<Value>>(&row_val)?);
+                    rows.push(Self::decode_row(&row_val, &columns)?);
                 }
             }
         }
@@ -674,6 +696,7 @@ impl MemExecutor {
             .into_iter()
             .map(|r| (Self::row_pk(pk_positions, &r), r))
             .collect();
+        let columns = self.table_columns(table_id);
         if let Some(txn) = self.active_txns.read().get(session) {
             let start = format!("{}:", table_id);
             let end = format!("{};", table_id);
@@ -687,7 +710,7 @@ impl MemExecutor {
                         map.remove(&pk);
                     }
                     Some(encoded) => {
-                        if let Ok(row) = serde_json::from_str::<Vec<Value>>(encoded) {
+                        if let Ok(row) = Self::decode_row(encoded.as_bytes(), &columns) {
                             let matches = col_pos
                                 .and_then(|p| row.get(p))
                                 .map(|cv| compare(cv, val) == std::cmp::Ordering::Equal)
@@ -742,7 +765,7 @@ impl MemExecutor {
         format!(
             "i:{}:{}:{}",
             index_id,
-            Self::escape_index_value(&render(index_val)),
+            Self::escape_index_value(&render(&crate::value::key_form(index_val))),
             pk
         )
     }

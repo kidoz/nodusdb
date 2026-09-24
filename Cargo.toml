@@ -71,6 +71,7 @@ parking_lot = "0.12.5"
 openraft = { version = "0.9.25", features = ["serde"] }
 sha2 = "0.11.0"
 md-5 = "0.11.0"
+rust_decimal = "1.43.0"
 proptest = "1.11.0"
 criterion = "0.8.2"
 

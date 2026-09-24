@@ -527,7 +527,7 @@ impl MemExecutor {
                 // each row by its actual stored key (works for any key scheme).
                 for (key, mut row) in self.scan_rows_keyed(tbl.id, &ctx.session_id)? {
                     row.push(backfill.clone());
-                    self.write_row(&ctx.session_id, key, serde_json::to_string(&row)?)?;
+                    self.write_row(&ctx.session_id, key, crate::value::encode_row(&row)?)?;
                 }
 
                 nodus_catalog::TableDescriptorChange::AddColumn {
@@ -549,7 +549,7 @@ impl MemExecutor {
                         if col_idx < row.len() {
                             row.remove(col_idx);
                         }
-                        self.write_row(&ctx.session_id, key, serde_json::to_string(&row)?)?;
+                        self.write_row(&ctx.session_id, key, crate::value::encode_row(&row)?)?;
                     }
                 } else {
                     anyhow::bail!("Column {} not found", name);

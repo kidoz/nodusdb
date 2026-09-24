@@ -1221,7 +1221,7 @@ SELECT unique1, unique2, stringu1 FROM onek
 query R
 SELECT avg(four) AS avg_1 FROM onek;
 ----
-1.5
+1.5000000000000000
 
 query I
 SELECT sum(four) AS sum_1500 FROM onek;
@@ -1305,7 +1305,7 @@ SELECT sum(DISTINCT four) AS sum_6 FROM onek;
 query R
 SELECT avg(DISTINCT four) AS avg_1_5 FROM onek;
 ----
-1.5
+1.5000000000000000
 
 # DISTINCT aggregate per group: every ten-group covers exactly two four-values
 query II rowsort

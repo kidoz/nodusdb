@@ -607,7 +607,7 @@ impl MemExecutor {
                             .iter()
                             .map(|i| {
                                 let val = i.and_then(|idx| r.get(idx)).unwrap_or(&Value::Null);
-                                serde_json::to_vec(val).unwrap_or_default()
+                                serde_json::to_vec(&crate::value::key_form(val)).unwrap_or_default()
                             })
                             .collect::<Vec<_>>();
                         groups.entry(key).or_default().push(r.clone());
@@ -1393,7 +1393,7 @@ impl MemExecutor {
                 perm.retain(|&row| {
                     let key: Vec<Vec<u8>> = keys[row][sort.len()..]
                         .iter()
-                        .map(|v| serde_json::to_vec(v).unwrap_or_default())
+                        .map(|v| serde_json::to_vec(&crate::value::key_form(v)).unwrap_or_default())
                         .collect();
                     seen.insert(key)
                 });
@@ -1479,6 +1479,7 @@ impl MemExecutor {
                     match val {
                         Value::Int(_) => ty = "INTEGER".to_string(),
                         Value::Float(_) => ty = "DOUBLE".to_string(),
+                        Value::Numeric(_) => ty = "NUMERIC".to_string(),
                         Value::Bool(_) => ty = "BOOLEAN".to_string(),
                         Value::Text(_) => ty = "VARCHAR".to_string(),
                         Value::Null => ty = "VARCHAR".to_string(),

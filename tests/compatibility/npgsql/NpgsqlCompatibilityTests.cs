@@ -1,5 +1,6 @@
 using System.Data;
 using System.Globalization;
+using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
 using Npgsql;
 using NpgsqlTypes;
@@ -110,13 +111,17 @@ public sealed class NpgsqlCompatibilityTests
         Assert.True(await reader.ReadAsync());
         Assert.Equal(uid, reader.GetFieldValue<Guid>(0));
         Assert.Equal(["alpha", "beta"], reader.GetFieldValue<string[]>(1));
-        Assert.Contains("\"ok\":true", reader.GetFieldValue<string>(2), StringComparison.Ordinal);
+        using (var payload = JsonDocument.Parse(reader.GetFieldValue<string>(2)))
+        {
+            Assert.True(payload.RootElement.GetProperty("ok").GetBoolean());
+            Assert.Equal(7, payload.RootElement.GetProperty("n").GetInt32());
+        }
         Assert.Equal(eventDate, reader.GetFieldValue<DateOnly>(3));
         Assert.Equal(eventTime, reader.GetFieldValue<TimeOnly>(4));
         Assert.Equal(eventTimestamp, reader.GetFieldValue<DateTime>(5));
         Assert.Equal(eventTimestampTz, reader.GetFieldValue<DateTime>(6).ToUniversalTime());
         Assert.Equal(raw, reader.GetFieldValue<byte[]>(7));
-        Assert.True(reader.IsDBNull(8) || decimal.Parse(reader.GetFieldValue<string>(8), CultureInfo.InvariantCulture) == 12345.67m);
+        Assert.Equal(12345.67m, reader.GetFieldValue<decimal>(8));
     }
 
     [Fact]

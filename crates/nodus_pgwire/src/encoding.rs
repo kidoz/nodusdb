@@ -16,6 +16,7 @@ pub(crate) fn render_scalar_text(value: &nodus_executor::Value, declared: &Type)
     match value {
         nodus_executor::Value::Int(i) => i.to_string(),
         nodus_executor::Value::Float(f) => f.to_string(),
+        nodus_executor::Value::Numeric(d) => d.to_string(),
         nodus_executor::Value::Text(s) if *declared == Type::BYTEA => render_bytea_text(s),
         nodus_executor::Value::Text(s) => s.clone(),
         nodus_executor::Value::Bool(b) => {
@@ -72,9 +73,32 @@ pub(crate) fn parse_i64(value: &nodus_executor::Value) -> std::io::Result<i64> {
     match value {
         nodus_executor::Value::Int(i) => Ok(*i),
         nodus_executor::Value::Float(f) => Ok(*f as i64),
+        nodus_executor::Value::Numeric(d) => {
+            use rust_decimal::prelude::ToPrimitive;
+            d.round().to_i64().ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "numeric out of range")
+            })
+        }
         _ => value_to_string(value)
             .parse::<i64>()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+    }
+}
+
+/// A value as an exact decimal, for a binary `numeric` field.
+pub(crate) fn parse_decimal(
+    value: &nodus_executor::Value,
+) -> std::io::Result<rust_decimal::Decimal> {
+    use std::str::FromStr;
+    match value {
+        nodus_executor::Value::Numeric(d) => Ok(*d),
+        nodus_executor::Value::Int(i) => Ok(rust_decimal::Decimal::from(*i)),
+        other => {
+            let text = value_to_string(other);
+            rust_decimal::Decimal::from_str(text.trim())
+                .or_else(|_| rust_decimal::Decimal::from_scientific(text.trim()))
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        }
     }
 }
 
@@ -82,6 +106,10 @@ pub(crate) fn parse_f64(value: &nodus_executor::Value) -> std::io::Result<f64> {
     match value {
         nodus_executor::Value::Int(i) => Ok(*i as f64),
         nodus_executor::Value::Float(f) => Ok(*f),
+        nodus_executor::Value::Numeric(d) => {
+            use rust_decimal::prelude::ToPrimitive;
+            Ok(d.to_f64().unwrap_or(f64::NAN))
+        }
         _ => value_to_string(value)
             .parse::<f64>()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
@@ -482,6 +510,7 @@ pub(crate) fn append_value(
         Type::INT2 => append_tosql(row, declared, &(parse_i64(value)? as i16)),
         Type::INT4 => append_tosql(row, declared, &(parse_i64(value)? as i32)),
         Type::INT8 => append_tosql(row, declared, &parse_i64(value)?),
+        Type::NUMERIC => append_tosql(row, declared, &parse_decimal(value)?),
         Type::JSON | Type::JSONB => append_tosql(row, declared, &Json(parse_json(value)?)),
         Type::CHAR | Type::NAME | Type::TEXT | Type::VARCHAR | Type::BPCHAR => {
             append_tosql(row, declared, &value_to_string(value))
@@ -551,9 +580,12 @@ pub(crate) fn text_parameter_value(param_type: &Type, raw: String) -> nodus_exec
             .parse::<i64>()
             .map(nodus_executor::Value::Int)
             .unwrap_or(nodus_executor::Value::Null),
-        Type::FLOAT4 | Type::FLOAT8 | Type::NUMERIC => raw
+        Type::FLOAT4 | Type::FLOAT8 => raw
             .parse::<f64>()
             .map(nodus_executor::Value::Float)
+            .unwrap_or(nodus_executor::Value::Null),
+        Type::NUMERIC => parse_decimal(&nodus_executor::Value::Text(raw))
+            .map(nodus_executor::Value::Numeric)
             .unwrap_or(nodus_executor::Value::Null),
         Type::JSON | Type::JSONB => serde_json::from_str(&raw)
             .map(nodus_executor::Value::Jsonb)

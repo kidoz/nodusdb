@@ -43,6 +43,7 @@ impl MemExecutor {
                     Value::Int(i) if i32::try_from(*i).is_ok() => "INTEGER".to_string(),
                     Value::Int(_) => "BIGINT".to_string(),
                     Value::Float(_) => "DOUBLE".to_string(),
+                    Value::Numeric(_) => "NUMERIC".to_string(),
                     Value::Bool(_) => "BOOLEAN".to_string(),
                     Value::Jsonb(_) => "JSONB".to_string(),
                     // An untyped string literal resolves to text.
@@ -115,7 +116,7 @@ impl MemExecutor {
 fn row_key(row: &Row) -> String {
     row.values
         .iter()
-        .map(render)
+        .map(|v| render(&crate::value::key_form(v)))
         .collect::<Vec<_>>()
         .join("\u{1}")
 }

@@ -31,6 +31,122 @@ pub enum Value {
     Array(Vec<Value>),
     Jsonb(serde_json::Value),
     Null,
+    /// An exact decimal (`numeric`/`decimal`), keeping its scale (`1.10`).
+    /// Appended so older encodings decode. Rows store it as its decimal text
+    /// (see [`encode_row`]), which every reader decodes; [`restore_row`] turns
+    /// it back into a number from the column's type.
+    Numeric(rust_decimal::Decimal),
+}
+
+/// Encodes a row for storage. A numeric is written as its decimal text, so
+/// the stored row stays readable by binaries that predate [`Value::Numeric`].
+pub(crate) fn encode_row(row: &[Value]) -> serde_json::Result<String> {
+    let stored: Vec<Value> = row
+        .iter()
+        .map(|v| match v {
+            Value::Numeric(d) => Value::Text(d.to_string()),
+            other => other.clone(),
+        })
+        .collect();
+    serde_json::to_string(&stored)
+}
+
+/// Restores the numbers in a decoded row from its columns' declared types: a
+/// `numeric` column holds decimal text (or a float, if written before exact
+/// decimals).
+pub(crate) fn restore_row(row: &mut [Value], columns: &[nodus_catalog::ColumnDescriptor]) {
+    for (value, column) in row.iter_mut().zip(columns) {
+        if column_type(&column.data_type) != ColumnType::Numeric {
+            continue;
+        }
+        let restored = match &*value {
+            Value::Text(t) => parse_decimal(t),
+            Value::Float(f) => rust_decimal::Decimal::from_f64_retain(*f)
+                .and_then(|d| parse_decimal(&(d.normalize().to_string()))),
+            Value::Int(i) => Some(rust_decimal::Decimal::from(*i)),
+            _ => None,
+        };
+        if let Some(d) = restored {
+            *value = Value::Numeric(d);
+        }
+    }
+}
+
+/// The range of an integer type: `smallint`, `integer` (also `serial`), or
+/// `bigint`.
+pub(crate) fn integer_range(data_type: &str) -> (i64, i64) {
+    let t = data_type.trim().to_ascii_uppercase();
+    if t.contains("BIG") || t == "INT8" || t == "SERIAL8" {
+        (i64::MIN, i64::MAX)
+    } else if t.contains("SMALL") || t == "INT2" || t == "SERIAL2" {
+        (i16::MIN as i64, i16::MAX as i64)
+    } else if matches!(
+        t.as_str(),
+        "INT" | "INTEGER" | "INT4" | "SERIAL" | "SERIAL4"
+    ) {
+        (i32::MIN as i64, i32::MAX as i64)
+    } else {
+        (i64::MIN, i64::MAX)
+    }
+}
+
+/// Applies a `numeric(p, s)` type modifier: rounds to scale `s` (half away
+/// from zero) and rejects a value needing more than `p - s` integer digits.
+/// A bare `numeric` keeps the value as it is.
+pub(crate) fn apply_numeric_typmod(
+    d: rust_decimal::Decimal,
+    data_type: &str,
+) -> Result<rust_decimal::Decimal, String> {
+    let Some(args) = data_type
+        .split_once('(')
+        .and_then(|(_, rest)| rest.split_once(')'))
+        .map(|(args, _)| args)
+    else {
+        return Ok(d);
+    };
+    let mut parts = args.split(',').map(|p| p.trim().parse::<u32>());
+    let precision = match parts.next() {
+        Some(Ok(p)) => p,
+        _ => return Ok(d),
+    };
+    let scale = match parts.next() {
+        Some(Ok(s)) => s,
+        _ => 0,
+    };
+    // Exact decimals carry at most 28 fractional digits.
+    let scale = scale.min(28);
+    let mut rounded =
+        d.round_dp_with_strategy(scale, rust_decimal::RoundingStrategy::MidpointAwayFromZero);
+    rounded.rescale(scale);
+    let integer_digits = rounded
+        .trunc()
+        .abs()
+        .to_string()
+        .trim_start_matches('0')
+        .len() as u32;
+    if integer_digits > precision.saturating_sub(scale) {
+        return Err("numeric field overflow".to_string());
+    }
+    Ok(rounded)
+}
+
+/// Parses decimal text (`1.50`, `-3`, `1e3`), keeping its scale.
+pub(crate) fn parse_decimal(text: &str) -> Option<rust_decimal::Decimal> {
+    use std::str::FromStr;
+    let t = text.trim();
+    rust_decimal::Decimal::from_str(t)
+        .ok()
+        .or_else(|| rust_decimal::Decimal::from_scientific(t).ok())
+}
+
+/// A value in the form used for grouping and deduplication keys: numerically
+/// equal numerics (`1.10`, `1.1`) share one form, as PostgreSQL treats them.
+pub(crate) fn key_form(value: &Value) -> Value {
+    match value {
+        Value::Numeric(d) => Value::Numeric(d.normalize()),
+        Value::Array(items) => Value::Array(items.iter().map(key_form).collect()),
+        other => other.clone(),
+    }
 }
 
 /// Logical column type derived from a SQL type name.
@@ -38,6 +154,8 @@ pub enum Value {
 pub(crate) enum ColumnType {
     Int,
     Float,
+    /// `numeric` / `decimal`: exact decimals.
+    Numeric,
     Bool,
     Text,
 }
@@ -49,12 +167,9 @@ pub(crate) fn column_type(data_type: &str) -> ColumnType {
         ColumnType::Text
     } else if t.contains("INT") || t.contains("SERIAL") || matches!(t.trim(), "OID" | "XID") {
         ColumnType::Int
-    } else if t.contains("FLOAT")
-        || t.contains("DOUBLE")
-        || t.contains("REAL")
-        || t.contains("NUMERIC")
-        || t.contains("DECIMAL")
-    {
+    } else if t.contains("NUMERIC") || t.contains("DECIMAL") {
+        ColumnType::Numeric
+    } else if t.contains("FLOAT") || t.contains("DOUBLE") || t.contains("REAL") {
         ColumnType::Float
     } else if t.contains("BOOL") {
         ColumnType::Bool
@@ -69,6 +184,7 @@ pub(crate) fn coerce(raw: &str, ty: ColumnType) -> Value {
     match ty {
         ColumnType::Int => raw.parse::<i64>().map(Value::Int).unwrap_or(Value::Null),
         ColumnType::Float => raw.parse::<f64>().map(Value::Float).unwrap_or(Value::Null),
+        ColumnType::Numeric => parse_decimal(raw).map_or(Value::Null, Value::Numeric),
         ColumnType::Bool => raw.parse::<bool>().map(Value::Bool).unwrap_or(Value::Null),
         ColumnType::Text => Value::Text(raw.to_string()),
     }
@@ -102,22 +218,27 @@ pub(crate) fn coerce_for_column(value: &Value, data_type: &str) -> Value {
         }
         Value::Text(s) => coerce(s, ColumnType::Text),
         scalar => match column_type(data_type) {
-            ColumnType::Int => match scalar {
-                Value::Int(_) => scalar.clone(),
-                Value::Float(f) => Value::Int(f.round() as i64),
-                _ => coerce(&render(scalar), ColumnType::Int),
-            },
+            // A number into an integer or numeric column is cast, so it is
+            // checked against the column's width, precision, and scale.
+            ColumnType::Int | ColumnType::Numeric => {
+                crate::planner::cast_value(scalar.clone(), data_type)
+            }
             ColumnType::Float => match scalar {
                 Value::Float(_) => scalar.clone(),
                 Value::Int(n) => Value::Float(*n as f64),
+                Value::Numeric(d) => Value::Float(decimal_to_f64(d)),
                 _ => coerce(&render(scalar), ColumnType::Float),
             },
             ColumnType::Bool => match scalar {
                 Value::Bool(_) => scalar.clone(),
                 _ => coerce(&render(scalar), ColumnType::Bool),
             },
-            // TEXT/VARCHAR and the catch-all: keep the scalar's representation.
-            ColumnType::Text => scalar.clone(),
+            // TEXT/VARCHAR and the catch-all: keep the scalar's representation
+            // (a numeric becomes its text, as a text column holds text).
+            ColumnType::Text => match scalar {
+                Value::Numeric(d) => Value::Text(d.to_string()),
+                _ => scalar.clone(),
+            },
         },
     }
 }
@@ -152,6 +273,7 @@ pub(crate) fn value_type_name(value: &Value) -> &'static str {
     match value {
         Value::Int(_) => "integer",
         Value::Float(_) => "double precision",
+        Value::Numeric(_) => "numeric",
         Value::Text(_) => "text",
         Value::Bool(_) => "boolean",
         Value::Array(_) => "array",
@@ -279,6 +401,7 @@ pub(crate) fn render(value: &Value) -> String {
     match value {
         Value::Int(n) => n.to_string(),
         Value::Float(f) => f.to_string(),
+        Value::Numeric(d) => d.to_string(),
         Value::Text(s) => s.clone(),
         Value::Bool(b) => {
             if *b {
@@ -643,7 +766,7 @@ fn type_rank(v: &Value) -> u8 {
     match v {
         Value::Null => 0,
         Value::Bool(_) => 1,
-        Value::Int(_) | Value::Float(_) => 2,
+        Value::Int(_) | Value::Float(_) | Value::Numeric(_) => 2,
         Value::Text(_) => 3,
         Value::Array(_) => 4,
         Value::Jsonb(_) => 5,
@@ -667,6 +790,15 @@ pub(crate) fn compare(a: &Value, b: &Value) -> std::cmp::Ordering {
         (Value::Float(x), Value::Float(y)) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
         (Value::Int(x), Value::Float(y)) => (*x as f64).partial_cmp(y).unwrap_or(Ordering::Equal),
         (Value::Float(x), Value::Int(y)) => x.partial_cmp(&(*y as f64)).unwrap_or(Ordering::Equal),
+        (Value::Numeric(x), Value::Numeric(y)) => x.cmp(y),
+        (Value::Numeric(x), Value::Int(y)) => x.cmp(&rust_decimal::Decimal::from(*y)),
+        (Value::Int(x), Value::Numeric(y)) => rust_decimal::Decimal::from(*x).cmp(y),
+        (Value::Numeric(x), Value::Float(y)) => {
+            decimal_to_f64(x).partial_cmp(y).unwrap_or(Ordering::Equal)
+        }
+        (Value::Float(x), Value::Numeric(y)) => {
+            x.partial_cmp(&decimal_to_f64(y)).unwrap_or(Ordering::Equal)
+        }
         (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
         (Value::Text(x), Value::Text(y)) => x.cmp(y),
         (Value::Null, Value::Null) => Ordering::Equal,
@@ -683,6 +815,12 @@ pub(crate) fn compare(a: &Value, b: &Value) -> std::cmp::Ordering {
         // Different categories: order by rank, never by rendered text.
         _ => type_rank(a).cmp(&type_rank(b)),
     }
+}
+
+/// A decimal as the nearest float.
+pub(crate) fn decimal_to_f64(d: &rust_decimal::Decimal) -> f64 {
+    use rust_decimal::prelude::ToPrimitive;
+    d.to_f64().unwrap_or(f64::NAN)
 }
 
 /// SQL value equality, defined as `compare(a, b) == Equal` so ordering and

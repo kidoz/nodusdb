@@ -247,6 +247,11 @@ fn int(v: &Value) -> Option<i64> {
     match v {
         Value::Int(i) => Some(*i),
         Value::Float(f) => Some(f.round_ties_even() as i64),
+        Value::Numeric(d) => {
+            use rust_decimal::prelude::ToPrimitive;
+            d.round_dp_with_strategy(0, rust_decimal::RoundingStrategy::MidpointAwayFromZero)
+                .to_i64()
+        }
         Value::Text(s) => s.trim().parse().ok(),
         _ => None,
     }
@@ -256,6 +261,7 @@ fn num(v: &Value) -> Option<f64> {
     match v {
         Value::Int(i) => Some(*i as f64),
         Value::Float(f) => Some(*f),
+        Value::Numeric(d) => Some(crate::value::decimal_to_f64(d)),
         Value::Text(s) => s.trim().parse().ok(),
         _ => None,
     }
@@ -279,6 +285,31 @@ fn float(x: f64) -> Value {
 }
 
 /// Keeps integer results integral when every numeric input was an integer.
+/// `round`/`trunc` of a numeric to `digits` places (negative: to tens,
+/// hundreds, ...); rounding takes halves away from zero, and a non-negative
+/// `digits` is the result's scale.
+fn round_decimal(d: rust_decimal::Decimal, digits: i64, round: bool) -> Value {
+    use rust_decimal::RoundingStrategy::{MidpointAwayFromZero, ToZero};
+    let strategy = if round { MidpointAwayFromZero } else { ToZero };
+    if digits >= 0 {
+        let scale = digits.min(28) as u32;
+        let mut r = d.round_dp_with_strategy(scale, strategy);
+        r.rescale(scale);
+        return Value::Numeric(r);
+    }
+    let factor = match 10i64.checked_pow((-digits).min(18) as u32) {
+        Some(f) => rust_decimal::Decimal::from(f),
+        None => return Value::Numeric(rust_decimal::Decimal::ZERO),
+    };
+    match (d / factor)
+        .round_dp_with_strategy(0, strategy)
+        .checked_mul(factor)
+    {
+        Some(r) => Value::Numeric(r),
+        None => raise("value overflows numeric format"),
+    }
+}
+
 fn numeric_like(args: &[Value], x: f64) -> Value {
     if args.iter().all(|a| matches!(a, Value::Int(_))) && x.fract() == 0.0 && x.abs() < 9.2e18 {
         Value::Int(x as i64)
@@ -645,8 +676,44 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
             Value::Int(i) => i
                 .checked_abs()
                 .map_or_else(|| raise("bigint out of range"), Value::Int),
+            Value::Numeric(d) => Value::Numeric(d.abs()),
             v => Value::Float(num(v)?.abs()),
         },
+        // On a numeric these keep exact decimals, as PostgreSQL's numeric
+        // variants do.
+        "SIGN" if arity(1) && matches!(arg(0), Value::Numeric(_)) => {
+            let Value::Numeric(d) = arg(0) else {
+                return None;
+            };
+            Value::Numeric(if d.is_zero() {
+                rust_decimal::Decimal::ZERO
+            } else if d.is_sign_negative() {
+                rust_decimal::Decimal::NEGATIVE_ONE
+            } else {
+                rust_decimal::Decimal::ONE
+            })
+        }
+        "CEIL" | "CEILING" | "FLOOR" if arity(1) && matches!(arg(0), Value::Numeric(_)) => {
+            let Value::Numeric(d) = arg(0) else {
+                return None;
+            };
+            Value::Numeric(if name == "FLOOR" { d.floor() } else { d.ceil() })
+        }
+        "ROUND" | "TRUNC"
+            if (arity(1) || arity(2))
+                && (matches!(arg(0), Value::Numeric(_))
+                    || (arity(2) && matches!(arg(0), Value::Int(_)))) =>
+        {
+            let d = match arg(0) {
+                Value::Numeric(d) => *d,
+                other => rust_decimal::Decimal::from(int(other)?),
+            };
+            let digits = match args.get(1) {
+                Some(n) => int(n)?,
+                None => 0,
+            };
+            round_decimal(d, digits, name == "ROUND")
+        }
         "SIGN" if arity(1) => {
             numeric_like(args, num(arg(0))?.signum() * f64::from(num(arg(0))? != 0.0))
         }
@@ -660,9 +727,9 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
             };
             let factor = 10f64.powi(digits.clamp(-300, 300) as i32);
             let scaled = x * factor;
-            // Numeric rounding: halves round away from zero.
+            // A float rounds half to even, as PostgreSQL's round(float8).
             let r = if name == "ROUND" {
-                scaled.round()
+                scaled.round_ties_even()
             } else {
                 scaled.trunc()
             } / factor;
@@ -920,7 +987,8 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
             match arg(0) {
                 Value::Int(i) if i32::try_from(*i).is_ok() => "integer",
                 Value::Int(_) => "bigint",
-                Value::Float(_) => "numeric",
+                Value::Float(_) => "double precision",
+                Value::Numeric(_) => "numeric",
                 Value::Text(_) => "text",
                 Value::Bool(_) => "boolean",
                 Value::Jsonb(_) => "jsonb",
@@ -1512,6 +1580,9 @@ pub(crate) fn to_json(v: &Value) -> serde_json::Value {
         Value::Null => J::Null,
         Value::Int(i) => J::from(*i),
         Value::Float(f) => serde_json::Number::from_f64(*f).map_or(J::Null, J::Number),
+        Value::Numeric(d) => {
+            serde_json::Number::from_f64(crate::value::decimal_to_f64(d)).map_or(J::Null, J::Number)
+        }
         Value::Bool(b) => J::Bool(*b),
         Value::Text(s) => J::String(s.clone()),
         Value::Array(items) => J::Array(items.iter().map(to_json).collect()),
