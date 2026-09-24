@@ -120,7 +120,6 @@ pub(crate) fn extract_col_name(expr: &sqlparser::ast::Expr) -> Option<String> {
             };
             Some(format!("{}{}'{}'", left_col, op_str, right_val))
         }
-        Expr::Cast { expr, .. } => extract_col_name(expr),
         // Aggregate function calls render to a canonical `FUNC(arg)` key so a
         // `HAVING` predicate can name them. Non-aggregate functions stay `None`
         // so they don't silently match in a `WHERE` clause.
