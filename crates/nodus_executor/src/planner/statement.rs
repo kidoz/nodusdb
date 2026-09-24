@@ -45,6 +45,27 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                 if_not_exists: create_table.if_not_exists,
             })
         }
+        Statement::CreateSequence {
+            temporary,
+            if_not_exists,
+            name,
+            data_type,
+            sequence_options,
+            ..
+        } => {
+            if *temporary {
+                anyhow::bail!("temporary sequences are not supported");
+            }
+            Ok(LogicalPlan::CreateSequence {
+                name: name.to_string(),
+                if_not_exists: *if_not_exists,
+                spec: sequence_spec(
+                    data_type.as_ref().map(|t| t.to_string()),
+                    sequence_options,
+                    params,
+                )?,
+            })
+        }
         Statement::CreateTable(create_table) => {
             let name = &create_table.name;
             let columns = &create_table.columns;
@@ -57,9 +78,121 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                 let mut unique = false;
                 let mut primary = false;
                 let mut default = None;
+                let mut sequence = None;
+                let mut data_type = c.data_type.to_string();
+                // The sequence lives in the table's schema; a name that is not
+                // all lower case is quoted so `nextval` resolves it exactly.
+                let quote = |name: &str| {
+                    if name.chars().any(|ch| ch.is_ascii_uppercase()) {
+                        format!("\"{name}\"")
+                    } else {
+                        name.to_string()
+                    }
+                };
+                let sequence_name = || match table_name.rsplit_once('.') {
+                    Some((schema, table)) => format!(
+                        "{schema}.{}",
+                        quote(&crate::sequences::owned_sequence_name(
+                            table.trim_matches('"'),
+                            &c.name.value
+                        ))
+                    ),
+                    None => quote(&crate::sequences::owned_sequence_name(
+                        table_name.trim_matches('"'),
+                        &c.name.value,
+                    )),
+                };
+                // `serial` types are integers drawing from a sequence.
+                let serial_type = match data_type.to_ascii_lowercase().as_str() {
+                    "serial" | "serial4" => Some("integer"),
+                    "bigserial" | "serial8" => Some("bigint"),
+                    "smallserial" | "serial2" => Some("smallint"),
+                    _ => None,
+                };
+                if let Some(integer_type) = serial_type {
+                    data_type = integer_type.to_ascii_uppercase();
+                    nullable = false;
+                    sequence = Some(crate::sequences::SequenceSpec {
+                        data_type: Some(integer_type.to_string()),
+                        ..Default::default()
+                    });
+                    default = Some(ScalarExpr::Function {
+                        name: "NEXTVAL".to_string(),
+                        args: vec![ScalarExpr::Literal(crate::Value::Text(sequence_name()))],
+                    });
+                }
                 for opt in &c.options {
                     match &opt.option {
+                        // `GENERATED {ALWAYS | BY DEFAULT} AS IDENTITY [(options)]`.
+                        sqlparser::ast::ColumnOption::Generated {
+                            generated_as:
+                                generated_as @ (sqlparser::ast::GeneratedAs::Always
+                                | sqlparser::ast::GeneratedAs::ByDefault),
+                            sequence_options,
+                            generation_expr: None,
+                            ..
+                        } => {
+                            let integer_type = match data_type.to_ascii_lowercase().as_str() {
+                                "smallint" | "int2" => "smallint",
+                                "int" | "integer" | "int4" => "integer",
+                                "bigint" | "int8" => "bigint",
+                                other => anyhow::bail!(
+                                    "identity column type must be smallint, integer, or bigint, not {other}"
+                                ),
+                            };
+                            nullable = false;
+                            sequence = Some(sequence_spec(
+                                Some(integer_type.to_string()),
+                                sequence_options.as_deref().unwrap_or(&[]),
+                                params,
+                            )?);
+                            let always =
+                                matches!(generated_as, sqlparser::ast::GeneratedAs::Always);
+                            default = Some(ScalarExpr::Function {
+                                name: "__IDENTITY__".to_string(),
+                                args: vec![
+                                    ScalarExpr::Literal(crate::Value::Text(sequence_name())),
+                                    ScalarExpr::Literal(crate::Value::Bool(always)),
+                                ],
+                            });
+                        }
+                        // `GENERATED ALWAYS AS (expr) [STORED | VIRTUAL]`: computed
+                        // from the row whenever it is written.
+                        sqlparser::ast::ColumnOption::Generated {
+                            generation_expr: Some(expr),
+                            ..
+                        } => {
+                            let computed = lower_scalar(expr, params).ok_or_else(|| {
+                                anyhow::anyhow!(unknown_function_error(expr).unwrap_or_else(|| {
+                                    format!(
+                                        "Unsupported generation expression for column {}",
+                                        c.name.value
+                                    )
+                                }))
+                            })?;
+                            if scalar_has_aggregate(&computed) {
+                                anyhow::bail!(
+                                    "aggregate functions are not allowed in column generation expressions"
+                                );
+                            }
+                            default = Some(ScalarExpr::Function {
+                                name: "__GENERATED__".to_string(),
+                                args: vec![computed],
+                            });
+                        }
+                        sqlparser::ast::ColumnOption::Generated { .. } => {
+                            anyhow::bail!(
+                                "Unsupported GENERATED column option for column {}",
+                                c.name.value
+                            )
+                        }
                         sqlparser::ast::ColumnOption::NotNull => nullable = false,
+                        sqlparser::ast::ColumnOption::Default(_) if sequence.is_some() => {
+                            anyhow::bail!(
+                                "multiple default values specified for column \"{}\"",
+                                c.name.value
+                            )
+                        }
                         sqlparser::ast::ColumnOption::Default(e) => {
                             default = Some(lower_scalar(e, params).ok_or_else(|| {
                                 anyhow::anyhow!(
@@ -101,11 +234,12 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                 }
                 cols.push(crate::ColumnDef {
                     name: c.name.value.clone(),
-                    data_type: c.data_type.to_string(),
+                    data_type,
                     nullable,
                     unique,
                     primary,
                     default,
+                    sequence,
                 });
             }
 
@@ -179,6 +313,15 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                 .ok_or_else(|| anyhow::anyhow!("DROP without a name"))?
                 .to_string();
             match object_type {
+                sqlparser::ast::ObjectType::Sequence => Ok(LogicalPlan::DropSequence {
+                    names: names.iter().map(|n| n.to_string()).collect(),
+                    if_exists: *if_exists,
+                }),
+                // Dropping only the first of several names would report the
+                // others dropped too.
+                _ if names.len() > 1 => {
+                    anyhow::bail!("DROP of several objects in one statement is not supported")
+                }
                 sqlparser::ast::ObjectType::Table => Ok(LogicalPlan::DropTable {
                     name,
                     if_exists: *if_exists,
@@ -762,4 +905,36 @@ fn select_into(query: &sqlparser::ast::Query) -> Option<(String, sqlparser::ast:
     let mut query = query.clone();
     query.body = Box::new(SetExpr::Select(select));
     Some((target, query))
+}
+
+/// Reads `CREATE SEQUENCE` (or identity column) options. Values must be
+/// integer constants.
+fn sequence_spec(
+    data_type: Option<String>,
+    options: &[sqlparser::ast::SequenceOptions],
+    params: &[Value],
+) -> Result<crate::sequences::SequenceSpec> {
+    use sqlparser::ast::SequenceOptions as O;
+    let integer = |e: &sqlparser::ast::Expr| -> Result<i64> {
+        match expr_to_value(e, params) {
+            Some(Value::Int(n)) => Ok(n),
+            _ => anyhow::bail!("sequence option must be an integer constant: {e}"),
+        }
+    };
+    let mut spec = crate::sequences::SequenceSpec {
+        data_type,
+        ..Default::default()
+    };
+    for option in options {
+        match option {
+            O::IncrementBy(e, _) => spec.increment = Some(integer(e)?),
+            O::MinValue(e) => spec.min_value = e.as_ref().map(&integer).transpose()?,
+            O::MaxValue(e) => spec.max_value = e.as_ref().map(&integer).transpose()?,
+            O::StartWith(e, _) => spec.start = Some(integer(e)?),
+            O::Cache(e) => spec.cache = Some(integer(e)?),
+            // sqlparser's flag is set for `NO CYCLE`.
+            O::Cycle(no_cycle) => spec.cycle = !no_cycle,
+        }
+    }
+    Ok(spec)
 }

@@ -15,6 +15,10 @@ pub struct ColumnDef {
     /// serialized before this field decode.
     #[serde(default)]
     pub default: Option<crate::plan_types::ScalarExpr>,
+    /// For a `serial` or identity column: the sequence to create for it
+    /// (named `<table>_<column>_seq`), which its default draws from.
+    #[serde(default)]
+    pub sequence: Option<crate::sequences::SequenceSpec>,
 }
 
 /// A typed cell value. Rows are stored as `Vec<Value>` in table-column order.

@@ -91,7 +91,20 @@ pub(crate) fn sqlstate_for_execution_error(err_str: &str) -> &'static str {
         || err_str.contains("must not contain variables")
     {
         "42P10" // invalid_column_reference
-    } else if err_str.starts_with("FILTER specified, but") {
+    } else if err_str.starts_with("cannot insert a non-DEFAULT value into column")
+        || err_str.ends_with("can only be updated to DEFAULT")
+    {
+        "428C9" // generated_always
+    } else if err_str.starts_with("nextval: reached") || err_str.starts_with("setval: value") {
+        "2200H" // sequence_generator_limit_exceeded
+    } else if err_str.starts_with("currval of sequence")
+        || err_str == "lastval is not yet defined in this session"
+    {
+        "55000" // object_not_in_prerequisite_state
+    } else if err_str.ends_with("is not a sequence")
+        || err_str.ends_with("is not a table")
+        || err_str.starts_with("FILTER specified, but")
+    {
         "42809" // wrong_object_type
     } else if err_str.starts_with("non-integer constant in") {
         "42601" // syntax_error

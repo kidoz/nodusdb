@@ -52,6 +52,7 @@ fn test_ddl_and_subqueries() {
                     unique: true,
                     primary: true,
                     default: None,
+                    sequence: None,
                 },
                 ColumnDef {
                     name: "name".into(),
@@ -60,6 +61,7 @@ fn test_ddl_and_subqueries() {
                     unique: false,
                     primary: false,
                     default: None,
+                    sequence: None,
                 },
                 ColumnDef {
                     name: "dept_id".into(),
@@ -68,6 +70,7 @@ fn test_ddl_and_subqueries() {
                     unique: false,
                     primary: false,
                     default: None,
+                    sequence: None,
                 },
             ],
         },
@@ -270,6 +273,7 @@ fn test_unique_constraints() {
                     unique: true,
                     primary: true,
                     default: None,
+                    sequence: None,
                 },
                 ColumnDef {
                     name: "email".into(),
@@ -278,6 +282,7 @@ fn test_unique_constraints() {
                     unique: true,
                     primary: false,
                     default: None,
+                    sequence: None,
                 },
             ],
         },
@@ -407,6 +412,7 @@ fn test_secondary_indexing() {
                     unique: true,
                     primary: true,
                     default: None,
+                    sequence: None,
                 },
                 ColumnDef {
                     name: "category".into(),
@@ -415,6 +421,7 @@ fn test_secondary_indexing() {
                     unique: false,
                     primary: false,
                     default: None,
+                    sequence: None,
                 },
             ],
         },
@@ -669,6 +676,7 @@ fn test_index_value_containing_separator_does_not_overmatch() {
                     unique: true,
                     primary: true,
                     default: None,
+                    sequence: None,
                 },
                 ColumnDef {
                     name: "tag".into(),
@@ -677,6 +685,7 @@ fn test_index_value_containing_separator_does_not_overmatch() {
                     unique: false,
                     primary: false,
                     default: None,
+                    sequence: None,
                 },
             ],
         },
@@ -785,6 +794,7 @@ fn test_alter_table_migrations() {
                     unique: true,
                     primary: true,
                     default: None,
+                    sequence: None,
                 },
                 ColumnDef {
                     name: "name".into(),
@@ -793,6 +803,7 @@ fn test_alter_table_migrations() {
                     unique: false,
                     primary: false,
                     default: None,
+                    sequence: None,
                 },
             ],
         },

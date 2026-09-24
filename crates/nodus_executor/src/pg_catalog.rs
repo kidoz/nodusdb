@@ -141,7 +141,16 @@ impl MemExecutor {
                         Value::Bool(!table.indexes.is_empty()),
                         Value::Bool(false),
                         Value::Text("p".into()),
-                        Value::Text(if table.view_query.is_some() { "v" } else { "r" }.into()),
+                        Value::Text(
+                            if table.view_query.is_some() {
+                                "v"
+                            } else if crate::sequences::is_sequence(table) {
+                                "S"
+                            } else {
+                                "r"
+                            }
+                            .into(),
+                        ),
                         Value::Int(table.columns.len() as i64),
                         Value::Int(
                             table

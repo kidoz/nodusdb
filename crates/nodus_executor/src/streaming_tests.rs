@@ -170,6 +170,7 @@ fn exec_with_rows(
                     unique: false,
                     primary: true,
                     default: None,
+                    sequence: None,
                 },
                 ColumnDef {
                     name: "name".into(),
@@ -178,6 +179,7 @@ fn exec_with_rows(
                     unique: false,
                     primary: false,
                     default: None,
+                    sequence: None,
                 },
             ],
         },

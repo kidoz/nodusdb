@@ -143,21 +143,36 @@ impl MemExecutor {
                     provided[pos] = true;
                 }
             }
-            // Unprovided columns take their declared DEFAULT, if any.
+            // Unprovided columns take their declared DEFAULT, if any; a
+            // generated column or a `GENERATED ALWAYS` identity takes no value.
             for (i, c) in tbl.columns.iter().enumerate() {
+                let default = Self::column_default(c);
+                if provided[i]
+                    && let Some(kind) = default.as_ref().and_then(Self::write_protection)
+                {
+                    anyhow::bail!(
+                        "cannot insert a non-DEFAULT value into column \"{}\": {kind}",
+                        c.name
+                    );
+                }
                 if !provided[i]
-                    && let Some(expr) = Self::column_default(c)
+                    && let Some(expr) = default
+                    && Self::generation_expr(&expr).is_none()
                 {
                     raw[i] = eval_scalar_expr(&expr, &[], &[]);
                 }
             }
-            let mut row = Vec::with_capacity(tbl.columns.len());
-            for (i, c) in tbl.columns.iter().enumerate() {
-                let val = crate::value::coerce_for_column(&raw[i], &c.data_type);
-                if !c.nullable && val == Value::Null {
+            let mut row: Vec<Value> = tbl
+                .columns
+                .iter()
+                .enumerate()
+                .map(|(i, c)| crate::value::coerce_for_column(&raw[i], &c.data_type))
+                .collect();
+            Self::compute_generated(&tbl, &mut row, &col_names);
+            for (c, val) in tbl.columns.iter().zip(&row) {
+                if !c.nullable && *val == Value::Null {
                     anyhow::bail!("Column {} cannot be NULL", c.name);
                 }
-                row.push(val);
             }
 
             if let Some(clause) = &on_conflict
@@ -365,6 +380,44 @@ impl MemExecutor {
             .and_then(|json| serde_json::from_str::<ScalarExpr>(json).ok())
     }
 
+    /// A generated column's expression: its default is `__GENERATED__(expr)`.
+    fn generation_expr(default: &ScalarExpr) -> Option<&ScalarExpr> {
+        match default {
+            ScalarExpr::Function { name, args } if name == "__GENERATED__" && args.len() == 1 => {
+                args.first()
+            }
+            _ => None,
+        }
+    }
+
+    /// Why a column rejects explicit values, if it does: it is generated, or
+    /// a `GENERATED ALWAYS` identity.
+    fn write_protection(default: &ScalarExpr) -> Option<&'static str> {
+        if Self::generation_expr(default).is_some() {
+            Some("it is a generated column")
+        } else if crate::sequences::identity_kind(default) == Some(true) {
+            Some("it is an identity column defined as GENERATED ALWAYS")
+        } else {
+            None
+        }
+    }
+
+    /// Computes every generated column of `row` from its other columns.
+    fn compute_generated(
+        tbl: &nodus_catalog::TableDescriptor,
+        row: &mut [Value],
+        col_names: &[String],
+    ) {
+        for (i, c) in tbl.columns.iter().enumerate() {
+            if let Some(default) = Self::column_default(c)
+                && let Some(expr) = Self::generation_expr(&default)
+            {
+                let value = eval_scalar_expr(expr, row, col_names);
+                row[i] = crate::value::coerce_for_column(&value, &c.data_type);
+            }
+        }
+    }
+
     /// Applies `SET` assignments to a copy of `old_row`. Each expression is
     /// evaluated against `scope` (the old row, plus `excluded.*` for ON
     /// CONFLICT), and the result is coerced to the column type.
@@ -378,21 +431,30 @@ impl MemExecutor {
         let mut row = old_row.to_vec();
         for (col, expr) in assignments {
             let idx = Self::column_position(tbl, col)?;
-            // `SET col = DEFAULT` sentinel: the declared default, else NULL.
-            let val = if matches!(expr,
-                ScalarExpr::Function { name, args } if name == "__COLUMN_DEFAULT__" && args.is_empty())
-            {
-                Self::column_default(&tbl.columns[idx])
+            let default = Self::column_default(&tbl.columns[idx]);
+            let is_default = matches!(expr,
+                ScalarExpr::Function { name, args } if name == "__COLUMN_DEFAULT__" && args.is_empty());
+            if !is_default && default.as_ref().and_then(Self::write_protection).is_some() {
+                anyhow::bail!("column \"{col}\" can only be updated to DEFAULT");
+            }
+            // `SET col = DEFAULT` sentinel: the declared default, else NULL. A
+            // generated column is recomputed below.
+            let val = if is_default {
+                default
+                    .filter(|d| Self::generation_expr(d).is_none())
                     .map(|e| eval_scalar_expr(&e, &[], &[]))
                     .unwrap_or(Value::Null)
             } else {
                 eval_scalar_expr(expr, scope_row, scope_cols)
             };
-            let coerced = crate::value::coerce_for_column(&val, &tbl.columns[idx].data_type);
-            if !tbl.columns[idx].nullable && coerced == Value::Null {
-                anyhow::bail!("Column {} cannot be NULL", col);
+            row[idx] = crate::value::coerce_for_column(&val, &tbl.columns[idx].data_type);
+        }
+        let col_names: Vec<String> = tbl.columns.iter().map(|c| c.name.clone()).collect();
+        Self::compute_generated(tbl, &mut row, &col_names);
+        for (c, val) in tbl.columns.iter().zip(&row) {
+            if !c.nullable && *val == Value::Null {
+                anyhow::bail!("Column {} cannot be NULL", c.name);
             }
-            row[idx] = coerced;
         }
         Ok(row)
     }

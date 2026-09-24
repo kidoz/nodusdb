@@ -53,6 +53,14 @@ impl MemExecutor {
             LogicalPlan::DropTable { name, if_exists } => {
                 self.exec_drop_table(ctx, name, if_exists)
             }
+            LogicalPlan::CreateSequence {
+                name,
+                if_not_exists,
+                spec,
+            } => self.exec_create_sequence(ctx, name, if_not_exists, spec),
+            LogicalPlan::DropSequence { names, if_exists } => {
+                self.exec_drop_sequence(ctx, names, if_exists)
+            }
             LogicalPlan::Insert {
                 table_name,
                 columns,

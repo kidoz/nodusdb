@@ -954,6 +954,17 @@ pub enum LogicalPlan {
     /// `SELECT * FROM generate_series(1, 5)`. Lateral table functions are carried
     /// on [`Join::table_fn`] instead.
     TableFunction(TableFnSpec),
+    /// `CREATE SEQUENCE`.
+    CreateSequence {
+        name: String,
+        if_not_exists: bool,
+        spec: crate::sequences::SequenceSpec,
+    },
+    /// `DROP SEQUENCE`.
+    DropSequence {
+        names: Vec<String>,
+        if_exists: bool,
+    },
 }
 
 /// The kind of set operation combining two query results.

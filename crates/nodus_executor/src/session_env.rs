@@ -22,6 +22,10 @@ pub(crate) struct SessionEnv {
     pub(crate) statement_micros: i64,
     /// A stable per-session process id for `pg_backend_pid()`.
     pub(crate) backend_pid: i64,
+    /// The session's id, which keys per-session state such as `currval`.
+    pub(crate) session_id: String,
+    /// Sequence access for `nextval`, `setval`, `currval`, and `lastval`.
+    pub(crate) sequences: Option<std::sync::Arc<crate::sequences::SequenceStore>>,
 }
 
 thread_local! {

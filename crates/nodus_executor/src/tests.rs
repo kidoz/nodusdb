@@ -27,6 +27,7 @@ pub fn cols(names: &[(&str, &str)]) -> Vec<ColumnDef> {
             unique: false,
             primary: false,
             default: None,
+            sequence: None,
         })
         .collect()
 }
@@ -339,6 +340,7 @@ fn rows_keyed_by_declared_pk_not_first_column() {
             unique: false,
             primary: false,
             default: None,
+            sequence: None,
         },
         ColumnDef {
             name: "id".into(),
@@ -348,6 +350,7 @@ fn rows_keyed_by_declared_pk_not_first_column() {
             unique: true,
             primary: true,
             default: None,
+            sequence: None,
         },
     ];
     exec.execute_logical(

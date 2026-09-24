@@ -81,6 +81,9 @@ pub(crate) fn is_known(name: &str) -> bool {
                 | "INET_SERVER_ADDR" | "INET_SERVER_PORT" | "INET_CLIENT_ADDR"
                 | "INET_CLIENT_PORT" | "OBJ_DESCRIPTION" | "COL_DESCRIPTION"
                 | "SHOBJ_DESCRIPTION" | "FORMAT_TYPE" | "PG_GET_EXPR"
+                // Sequences.
+                | "NEXTVAL" | "CURRVAL" | "LASTVAL" | "SETVAL" | "PG_GET_SERIAL_SEQUENCE"
+                | "__IDENTITY__"
                 // UUIDs.
                 | "GEN_RANDOM_UUID" | "UUIDV4" | "UUIDV7" | "UUID_EXTRACT_VERSION"
                 // JSON.
@@ -125,7 +128,9 @@ pub(crate) fn return_type(name: &str, arg_types: &[Option<String>]) -> Option<St
             | "NUM_NONNULLS"
             | "INET_SERVER_PORT"
             | "INET_CLIENT_PORT" => "INTEGER",
-            "TXID_CURRENT" | "PG_CURRENT_XACT_ID" => "BIGINT",
+            "TXID_CURRENT" | "PG_CURRENT_XACT_ID" | "NEXTVAL" | "CURRVAL" | "LASTVAL"
+            | "SETVAL" => "BIGINT",
+            "PG_GET_SERIAL_SEQUENCE" => "TEXT",
             "RANDOM" | "PI" | "DATE_PART" => "DOUBLE PRECISION",
             "NOW"
             | "CURRENT_TIMESTAMP"
@@ -930,6 +935,35 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
         }
         "PG_CLIENT_ENCODING" if arity(0) => Value::Text("UTF8".to_string()),
         "PG_IS_IN_RECOVERY" if arity(0) => Value::Bool(false),
+        // ---- Sequences ---------------------------------------------------------
+        // `__IDENTITY__(sequence, always)` is an identity column's default.
+        "NEXTVAL" if arity(1) => {
+            sequence_op(|store, session| store.nextval(session, &text(arg(0))))
+        }
+        "__IDENTITY__" if arity(2) => {
+            sequence_op(|store, session| store.nextval(session, &text(arg(0))))
+        }
+        "CURRVAL" if arity(1) => {
+            sequence_op(|store, session| store.currval(session, &text(arg(0))))
+        }
+        "LASTVAL" if arity(0) => sequence_op(|store, session| store.lastval(session)),
+        "SETVAL" if arity(2) || arity(3) => {
+            let value = int(arg(1))?;
+            let is_called = !matches!(arg(2), Value::Bool(false));
+            sequence_op(|store, session| store.setval(session, &text(arg(0)), value, is_called))
+        }
+        "PG_GET_SERIAL_SEQUENCE" if arity(2) => {
+            let table = text(arg(0));
+            let column = text(arg(1)).to_ascii_lowercase();
+            match session_env::with(|e| e.and_then(|e| e.sequences.clone())) {
+                Some(store) => match store.owned_sequence(&table, &column) {
+                    Ok(Some(name)) => Value::Text(name),
+                    Ok(None) => Value::Null,
+                    Err(e) => raise(e.to_string()),
+                },
+                None => session_unavailable(name),
+            }
+        }
         "PG_SLEEP" if arity(1) => {
             let seconds = num(arg(0))?;
             if seconds > 0.0 {
@@ -1216,6 +1250,23 @@ fn session_unavailable(name: &str) -> Value {
         "{}() cannot be evaluated here",
         name.to_ascii_lowercase()
     ))
+}
+
+/// Runs a sequence operation for the statement's session; its errors fail
+/// the statement.
+fn sequence_op(
+    op: impl FnOnce(&crate::sequences::SequenceStore, &str) -> anyhow::Result<i64>,
+) -> Value {
+    let env = session_env::with(|e| {
+        e.and_then(|e| e.sequences.clone().map(|s| (s, e.session_id.clone())))
+    });
+    match env {
+        Some((store, session)) => match op(&store, &session) {
+            Ok(value) => Value::Int(value),
+            Err(e) => raise(e.to_string()),
+        },
+        None => raise("sequence functions cannot be evaluated here"),
+    }
 }
 
 fn session_time(pick: impl Fn(&session_env::SessionEnv) -> i64) -> Option<i64> {

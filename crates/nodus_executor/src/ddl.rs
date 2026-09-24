@@ -86,6 +86,19 @@ impl MemExecutor {
             }
             anyhow::bail!("relation \"{}\" already exists", table_only);
         }
+        // A `serial` or identity column's sequence, validated before anything
+        // is created.
+        let owned_sequences = columns
+            .iter()
+            .filter_map(|c| {
+                let spec = c.sequence.as_ref()?;
+                let sequence = c
+                    .default
+                    .as_ref()
+                    .and_then(crate::sequences::default_sequence)?;
+                Some(crate::sequences::SequenceState::new(spec).map(|state| (sequence, state)))
+            })
+            .collect::<Result<Vec<_>>>()?;
         let descriptors: Vec<_> = columns
             .iter()
             .map(|c| ColumnDescriptor {
@@ -208,8 +221,88 @@ impl MemExecutor {
                 },
             )?;
         }
+        for (sequence, state) in owned_sequences {
+            self.create_sequence(ctx, &sequence, state)?;
+        }
 
         Ok(QueryOutput::tag("CREATE TABLE"))
+    }
+
+    /// `CREATE SEQUENCE`.
+    pub(crate) fn exec_create_sequence(
+        &self,
+        ctx: &ExecutionContext,
+        name: String,
+        if_not_exists: bool,
+        spec: crate::sequences::SequenceSpec,
+    ) -> Result<QueryOutput> {
+        let state = crate::sequences::SequenceState::new(&spec)?;
+        let (db_name, schema_name, table_only) = parse_object_name(&name)?;
+        if self
+            .catalog_reader
+            .get_table(db_name, schema_name, table_only)
+            .is_ok()
+        {
+            if if_not_exists {
+                return Ok(QueryOutput::tag("CREATE SEQUENCE"));
+            }
+            anyhow::bail!("relation \"{table_only}\" already exists");
+        }
+        self.create_sequence(ctx, &name, state)?;
+        Ok(QueryOutput::tag("CREATE SEQUENCE"))
+    }
+
+    /// Creates a sequence relation holding `state`. Its state is committed at
+    /// once, like the catalog entry, so the two never disagree.
+    fn create_sequence(
+        &self,
+        ctx: &ExecutionContext,
+        name: &str,
+        state: crate::sequences::SequenceState,
+    ) -> Result<()> {
+        let columns = crate::sequences::SEQUENCE_COLUMNS
+            .iter()
+            .map(|(column, data_type)| ColumnDef {
+                name: column.to_string(),
+                data_type: data_type.to_string(),
+                nullable: false,
+                unique: false,
+                primary: false,
+                default: None,
+                sequence: None,
+            })
+            .collect();
+        self.exec_create_table(ctx, name.to_string(), columns, vec![], false, vec![])?;
+        let (db_name, schema_name, table_only) = parse_object_name(name)?;
+        let tbl = self
+            .catalog_reader
+            .get_table(db_name, schema_name, table_only)?;
+        self.sequences.initialize(&tbl, &state)
+    }
+
+    /// `DROP SEQUENCE`.
+    pub(crate) fn exec_drop_sequence(
+        &self,
+        ctx: &ExecutionContext,
+        names: Vec<String>,
+        if_exists: bool,
+    ) -> Result<QueryOutput> {
+        for name in &names {
+            let (db_name, schema_name, table_only) = parse_object_name(name)?;
+            match self
+                .catalog_reader
+                .get_table(db_name, schema_name, table_only)
+            {
+                Ok(tbl) if crate::sequences::is_sequence(&tbl) => {
+                    self.authorize(ctx, Action::CreateTable, ResourceRef::Table(tbl.id))?;
+                    self.catalog_writer.drop_table(tbl.id)?;
+                }
+                Ok(_) => anyhow::bail!("\"{table_only}\" is not a sequence"),
+                Err(_) if if_exists => {}
+                Err(_) => anyhow::bail!("sequence \"{table_only}\" does not exist"),
+            }
+        }
+        Ok(QueryOutput::tag("DROP SEQUENCE"))
     }
     /// `CREATE TABLE ... AS <query>` / `SELECT ... INTO`: runs the query, then
     /// creates a table with its output columns and types and inserts its rows.
@@ -245,6 +338,7 @@ impl MemExecutor {
                 unique: false,
                 primary: false,
                 default: None,
+                sequence: None,
             });
         }
         self.exec_create_table(ctx, name.clone(), columns, vec![], false, vec![])?;
@@ -348,9 +442,34 @@ impl MemExecutor {
             .catalog_reader
             .get_table(db_name, schema_name, table_only)
         {
+            Ok(tbl) if crate::sequences::is_sequence(&tbl) => {
+                anyhow::bail!("\"{table_only}\" is not a table")
+            }
             Ok(tbl) => {
                 self.authorize(ctx, Action::CreateTable, ResourceRef::Table(tbl.id))?;
                 self.catalog_writer.drop_table(tbl.id)?;
+                // A `serial` or identity column's sequence goes with its table.
+                for column in &tbl.columns {
+                    let Some(sequence) = column
+                        .default_expr
+                        .as_deref()
+                        .and_then(|json| serde_json::from_str::<ScalarExpr>(json).ok())
+                        .and_then(|default| crate::sequences::default_sequence(&default))
+                    else {
+                        continue;
+                    };
+                    let owned = crate::sequences::owned_sequence_name(&tbl.name, &column.name);
+                    if sequence.rsplit('.').next().map(|s| s.trim_matches('"'))
+                        == Some(owned.as_str())
+                    {
+                        let (db, schema, seq) = parse_object_name(&sequence)?;
+                        if let Ok(seq_tbl) = self.catalog_reader.get_table(db, schema, seq)
+                            && crate::sequences::is_sequence(&seq_tbl)
+                        {
+                            self.catalog_writer.drop_table(seq_tbl.id)?;
+                        }
+                    }
+                }
                 Ok(QueryOutput::tag("DROP TABLE"))
             }
             Err(e) => {

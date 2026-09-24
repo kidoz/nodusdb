@@ -31,6 +31,7 @@ mod plan_types;
 mod planner;
 mod result_types;
 mod select;
+mod sequences;
 mod session_env;
 mod session_vars;
 mod set_ops;
@@ -49,6 +50,7 @@ pub use planner::{
     CopyOutputFormat, expr_to_value, parse_object_name, plan_copy_out, plan_statement,
 };
 pub(crate) use planner::{eval_scalar_expr, parse_filter_expr, scalar_has_aggregate};
+pub use sequences::SequenceSpec;
 pub use session_vars::canonical_setting_value;
 pub use value::{ColumnDef, Value};
 pub(crate) use value::{
@@ -286,6 +288,8 @@ pub struct MemExecutor {
     /// its duration; a restore takes the write guard, which blocks until every
     /// in-flight statement has drained and then runs with exclusive access.
     pub(crate) restore_gate: Arc<parking_lot::RwLock<()>>,
+    /// Sequence state access for `nextval` and friends.
+    pub(crate) sequences: Arc<sequences::SequenceStore>,
 }
 
 impl MemExecutor {
@@ -297,6 +301,11 @@ impl MemExecutor {
         kv: Arc<dyn KvEngine>,
         txn: Arc<dyn TxnManager>,
     ) -> Self {
+        let sequences = Arc::new(sequences::SequenceStore::new(
+            catalog_reader.clone(),
+            kv.clone(),
+            txn.clone(),
+        ));
         Self {
             catalog_reader,
             catalog_writer,
@@ -304,6 +313,7 @@ impl MemExecutor {
             audit,
             kv,
             txn,
+            sequences,
             active_txns: parking_lot::RwLock::new(HashMap::new()),
             session_vars: parking_lot::RwLock::new(HashMap::new()),
             restoring: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -459,6 +469,8 @@ impl MemExecutor {
             transaction_micros,
             statement_micros,
             backend_pid,
+            session_id: ctx.session_id.clone(),
+            sequences: Some(self.sequences.clone()),
         }
     }
 
@@ -906,6 +918,7 @@ impl Executor for MemExecutor {
 
     fn end_session(&self, session_id: &str) {
         self.session_vars.write().remove(session_id);
+        self.sequences.end_session(session_id);
         if let Some(txn) = self.active_txns.write().remove(session_id) {
             // A client that drops mid-transaction must not leave the write intent
             // dangling; abort so the row locks/intents are released.

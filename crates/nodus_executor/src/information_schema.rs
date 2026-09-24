@@ -55,8 +55,10 @@ impl MemExecutor {
             ("is_typed", "TEXT"),
             ("commit_action", "TEXT"),
         ]);
+        // Like PostgreSQL, `information_schema.tables` lists no sequences.
         let rows = tables
             .iter()
+            .filter(|table| !crate::sequences::is_sequence(table))
             .map(|table| {
                 vec![
                     Value::Text(db_name.into()),
