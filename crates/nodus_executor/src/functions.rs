@@ -1455,7 +1455,7 @@ fn pg_replacement(replacement: &str) -> String {
 }
 
 /// A value as JSON, as `to_jsonb` renders it.
-fn to_json(v: &Value) -> serde_json::Value {
+pub(crate) fn to_json(v: &Value) -> serde_json::Value {
     use serde_json::Value as J;
     match v {
         Value::Null => J::Null,

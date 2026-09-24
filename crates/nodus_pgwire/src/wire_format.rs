@@ -91,6 +91,8 @@ pub(crate) fn sqlstate_for_execution_error(err_str: &str) -> &'static str {
         || err_str.contains("must not contain variables")
     {
         "42P10" // invalid_column_reference
+    } else if err_str.starts_with("FILTER specified, but") {
+        "42809" // wrong_object_type
     } else if err_str.starts_with("non-integer constant in") {
         "42601" // syntax_error
     } else if err_str == "LIMIT must not be negative" || err_str == "FETCH must not be negative" {

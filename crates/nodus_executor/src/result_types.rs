@@ -12,12 +12,22 @@ fn aggregate_type(op: &AggregateOp, input: Option<String>) -> Option<String> {
             "BIGINT" | "INT8" => "NUMERIC".into(),
             _ => ty,
         }),
-        AggregateOp::Avg => input.map(|ty| match ty.to_ascii_uppercase().as_str() {
+        AggregateOp::Avg
+        | AggregateOp::StddevSamp
+        | AggregateOp::StddevPop
+        | AggregateOp::VarSamp
+        | AggregateOp::VarPop => input.map(|ty| match ty.to_ascii_uppercase().as_str() {
             "REAL" | "FLOAT4" | "DOUBLE" | "DOUBLE PRECISION" | "FLOAT8" => {
                 "DOUBLE PRECISION".into()
             }
             _ => "NUMERIC".into(),
         }),
+        AggregateOp::StringAgg => Some("TEXT".into()),
+        AggregateOp::ArrayAgg => input.map(|ty| format!("{ty}[]")),
+        AggregateOp::BoolAnd | AggregateOp::BoolOr => Some("BOOLEAN".into()),
+        AggregateOp::JsonAgg | AggregateOp::JsonObjectAgg => Some("JSON".into()),
+        AggregateOp::JsonbAgg | AggregateOp::JsonbObjectAgg => Some("JSONB".into()),
+        AggregateOp::BitAnd | AggregateOp::BitOr => input,
     }
 }
 

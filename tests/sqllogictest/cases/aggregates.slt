@@ -1,0 +1,203 @@
+# Aggregates: string_agg, array_agg, bool_and/bool_or/every, JSON and
+# statistical aggregates, FILTER, ORDER BY and DISTINCT inside the call, and
+# windowed aggregates. Expected results come from PostgreSQL 18.
+statement ok
+CREATE TABLE ag (id INT PRIMARY KEY, g TEXT, a INT, s TEXT, b BOOLEAN);
+
+statement ok
+INSERT INTO ag VALUES (1, 'x', 3, 'b', true), (2, 'y', NULL, 'a', false), (3, 'x', 1, 'c', true), (4, 'y', 5, NULL, NULL), (5, 'x', 3, 'a', true);
+
+query T
+SELECT string_agg(s, ',' ORDER BY id) FROM ag;
+----
+b,a,c,a
+
+query T
+SELECT string_agg(s, ',' ORDER BY s) FROM ag;
+----
+a,a,b,c
+
+query T
+SELECT string_agg(s, ',' ORDER BY s DESC NULLS LAST) FROM ag;
+----
+c,b,a,a
+
+query T
+SELECT string_agg(s, '' ORDER BY id DESC) FROM ag;
+----
+acab
+
+query TT
+SELECT g, string_agg(s, '|' ORDER BY id) FROM ag GROUP BY g ORDER BY g;
+----
+x	b|c|a
+y	a
+
+query T
+SELECT string_agg(DISTINCT s, ',' ORDER BY s) FROM ag;
+----
+a,b,c
+
+query T
+SELECT string_agg(a::text, '+' ORDER BY a NULLS FIRST, id) FROM ag;
+----
+1+3+3+5
+
+query T
+SELECT string_agg(s, NULL ORDER BY id) FROM ag;
+----
+baca
+
+query T
+SELECT array_agg(a ORDER BY id) FROM ag;
+----
+{3,NULL,1,5,3}
+
+query T
+SELECT array_agg(DISTINCT a ORDER BY a) FROM ag;
+----
+{1,3,5,NULL}
+
+query TT
+SELECT g, array_agg(s ORDER BY s) FROM ag GROUP BY g ORDER BY g;
+----
+x	{a,b,c}
+y	{a,NULL}
+
+query TT
+SELECT array_length(array_agg(id), 1), cardinality(array_agg(a)) FROM ag;
+----
+5	5
+
+query TTT
+SELECT bool_and(b), bool_or(b), every(b) FROM ag;
+----
+f	t	f
+
+query TTT
+SELECT g, bool_and(a > 2), bool_or(a > 4) FROM ag GROUP BY g ORDER BY g;
+----
+x	f	f
+y	t	t
+
+query TT
+SELECT count(*) FILTER (WHERE a > 1), sum(a) FILTER (WHERE g = 'x') FROM ag;
+----
+3	7
+
+query TTT
+SELECT g, count(*) FILTER (WHERE b), max(s) FILTER (WHERE a IS NOT NULL) FROM ag GROUP BY g ORDER BY g;
+----
+x	3	c
+y	0	NULL
+
+query TT
+SELECT g, count(*) FROM ag GROUP BY g HAVING count(*) FILTER (WHERE b) > 1 ORDER BY g;
+----
+x	3
+
+query TT
+SELECT sum(a) FILTER (WHERE a > 2) + 1, count(a) FILTER (WHERE false) FROM ag;
+----
+12	0
+
+query TTT
+SELECT count(DISTINCT g), count(DISTINCT a), sum(DISTINCT a) FROM ag;
+----
+2	3	9
+
+query TTTTTTTT
+SELECT string_agg(s, ','), array_agg(a), bool_and(b), bool_or(b), sum(a), avg(a), count(a), count(*) FROM ag WHERE false;
+----
+NULL	NULL	NULL	NULL	NULL	NULL	0	0
+
+query TTT
+SELECT json_agg(a ORDER BY id) ->> 0, jsonb_agg(s ORDER BY id) ->> 1, json_array_length(json_agg(id)) FROM ag;
+----
+3	a	5
+
+query TT
+SELECT json_object_agg(id, s ORDER BY id) ->> '3', jsonb_object_agg(s, id) FILTER (WHERE s = 'c') ->> 'c' FROM ag;
+----
+c	3
+
+query TT
+SELECT jsonb_typeof(jsonb_agg(a)), json_agg(a) IS NULL FROM ag WHERE id > 99;
+----
+NULL	t
+
+query TTT
+SELECT stddev(a) > 1.63 AND stddev(a) < 1.64, variance(a) > 2.66 AND variance(a) < 2.67, var_pop(a) = 2 FROM ag;
+----
+t	t	t
+
+query TT
+SELECT stddev(a), variance(a) FROM ag WHERE id = 1;
+----
+NULL	NULL
+
+query TT
+SELECT bit_and(a), bit_or(a) FROM ag;
+----
+1	7
+
+query TTT
+SELECT id, sum(a) OVER (PARTITION BY g), string_agg(s, ',') OVER (PARTITION BY g ORDER BY id) FROM ag ORDER BY id;
+----
+1	7	b
+2	5	a
+3	7	b,c
+4	5	a
+5	7	b,c,a
+
+query TTTT
+SELECT id, count(*) OVER (), count(a) OVER (), count(s) OVER (PARTITION BY g) FROM ag ORDER BY id;
+----
+1	5	4	3
+2	5	4	1
+3	5	4	3
+4	5	4	1
+5	5	4	3
+
+query TTT
+SELECT id, bool_and(b) OVER (PARTITION BY g), array_agg(id) OVER (PARTITION BY g ORDER BY id) FROM ag ORDER BY id;
+----
+1	t	{1}
+2	f	{2}
+3	t	{1,3}
+4	f	{2,4}
+5	t	{1,3,5}
+
+query TTT
+SELECT id, row_number() OVER () AS id2, a AS id3 FROM ag ORDER BY id;
+----
+1	1	3
+2	2	NULL
+3	3	1
+4	4	5
+5	5	3
+
+query TT
+SELECT g, (SELECT string_agg(s, ',' ORDER BY s) FROM ag i WHERE i.g = o.g) FROM ag o GROUP BY g ORDER BY g;
+----
+x	a,b,c
+y	a
+
+# Invalid aggregate calls fail.
+statement error
+SELECT string_agg(s) FROM ag;
+
+statement error
+SELECT bool_and(a) FROM ag;
+
+statement error
+SELECT upper(s) FILTER (WHERE a > 1) FROM ag;
+
+statement error
+SELECT count(*) FILTER (WHERE a > 1) OVER () FROM ag;
+
+statement error
+SELECT json_object_agg(s, a) FROM ag;
+
+statement ok
+DROP TABLE ag;

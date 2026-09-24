@@ -66,6 +66,152 @@ pub(crate) fn parse_aggregate_key(key: &str) -> Option<(AggregateOp, String)> {
 /// over expressions, e.g. `sum(a + 1)`). NULLs are skipped, matching SQL
 /// aggregate semantics; an all-NULL/empty input yields NULL (0 for COUNT).
 pub(crate) fn aggregate_values(op: &AggregateOp, vals: &[Value]) -> Value {
+    let inputs: Vec<(Value, Vec<Value>)> = vals.iter().map(|v| (v.clone(), Vec::new())).collect();
+    aggregate_inputs(op, &inputs)
+}
+
+/// Aggregates per-row inputs, in order: each row's argument value and its
+/// further arguments (a delimiter, an object value). Every aggregate but
+/// `array_agg` and the JSON aggregates skips NULL values; over no values each
+/// is NULL except `count`, which is 0.
+pub(crate) fn aggregate_inputs(op: &AggregateOp, inputs: &[(Value, Vec<Value>)]) -> Value {
+    let values = || inputs.iter().map(|(v, _)| v);
+    let non_null = || values().filter(|v| **v != Value::Null);
+    match op {
+        AggregateOp::Count
+        | AggregateOp::Sum
+        | AggregateOp::Avg
+        | AggregateOp::Min
+        | AggregateOp::Max => {
+            let vals: Vec<Value> = values().cloned().collect();
+            aggregate_numeric(op, &vals)
+        }
+        AggregateOp::StringAgg => {
+            let mut out: Option<String> = None;
+            for (value, extra) in inputs {
+                if *value == Value::Null {
+                    continue;
+                }
+                let text = crate::render(value);
+                out = Some(match out {
+                    // Each value after the first is preceded by its own row's
+                    // delimiter; a NULL delimiter adds nothing.
+                    Some(mut acc) => {
+                        if let Some(d) = extra.first().filter(|d| **d != Value::Null) {
+                            acc.push_str(&crate::render(d));
+                        }
+                        acc.push_str(&text);
+                        acc
+                    }
+                    None => text,
+                });
+            }
+            out.map_or(Value::Null, Value::Text)
+        }
+        AggregateOp::ArrayAgg => {
+            if inputs.is_empty() {
+                Value::Null
+            } else {
+                Value::Array(values().cloned().collect())
+            }
+        }
+        AggregateOp::BoolAnd | AggregateOp::BoolOr => {
+            let mut result: Option<bool> = None;
+            for value in non_null() {
+                let Value::Bool(b) = value else {
+                    return crate::eval_error::raise(format!(
+                        "function {}({}) does not exist",
+                        op.sql_name(),
+                        crate::value::value_type_name(value)
+                    ));
+                };
+                result = Some(match (op, result) {
+                    (AggregateOp::BoolAnd, Some(acc)) => acc && *b,
+                    (_, Some(acc)) => acc || *b,
+                    (_, None) => *b,
+                });
+            }
+            result.map_or(Value::Null, Value::Bool)
+        }
+        AggregateOp::JsonAgg | AggregateOp::JsonbAgg => {
+            if inputs.is_empty() {
+                Value::Null
+            } else {
+                Value::Jsonb(serde_json::Value::Array(
+                    values().map(crate::functions::to_json).collect(),
+                ))
+            }
+        }
+        AggregateOp::JsonObjectAgg | AggregateOp::JsonbObjectAgg => {
+            if inputs.is_empty() {
+                return Value::Null;
+            }
+            let mut object = serde_json::Map::new();
+            for (key, extra) in inputs {
+                if *key == Value::Null {
+                    return crate::eval_error::raise("null value not allowed for object key");
+                }
+                let value = extra
+                    .first()
+                    .map_or(serde_json::Value::Null, crate::functions::to_json);
+                object.insert(crate::render(key), value);
+            }
+            Value::Jsonb(serde_json::Value::Object(object))
+        }
+        AggregateOp::StddevSamp
+        | AggregateOp::StddevPop
+        | AggregateOp::VarSamp
+        | AggregateOp::VarPop => {
+            let mut nums = Vec::new();
+            for value in non_null() {
+                match value {
+                    Value::Int(i) => nums.push(*i as f64),
+                    Value::Float(f) => nums.push(*f),
+                    other => {
+                        return crate::eval_error::raise(format!(
+                            "function {}({}) does not exist",
+                            op.sql_name(),
+                            crate::value::value_type_name(other)
+                        ));
+                    }
+                }
+            }
+            let sample = matches!(op, AggregateOp::StddevSamp | AggregateOp::VarSamp);
+            let n = nums.len() as f64;
+            if nums.is_empty() || (sample && nums.len() < 2) {
+                return Value::Null;
+            }
+            let mean = nums.iter().sum::<f64>() / n;
+            let squares = nums.iter().map(|x| (x - mean) * (x - mean)).sum::<f64>();
+            let variance = squares / if sample { n - 1.0 } else { n };
+            Value::Float(match op {
+                AggregateOp::StddevSamp | AggregateOp::StddevPop => variance.sqrt(),
+                _ => variance,
+            })
+        }
+        AggregateOp::BitAnd | AggregateOp::BitOr => {
+            let mut result: Option<i64> = None;
+            for value in non_null() {
+                let Value::Int(i) = value else {
+                    return crate::eval_error::raise(format!(
+                        "function {}({}) does not exist",
+                        op.sql_name(),
+                        crate::value::value_type_name(value)
+                    ));
+                };
+                result = Some(match (op, result) {
+                    (AggregateOp::BitAnd, Some(acc)) => acc & i,
+                    (_, Some(acc)) => acc | i,
+                    (_, None) => *i,
+                });
+            }
+            result.map_or(Value::Null, Value::Int)
+        }
+    }
+}
+
+/// `count`, `sum`, `avg`, `min`, and `max` over values.
+fn aggregate_numeric(op: &AggregateOp, vals: &[Value]) -> Value {
     let non_null: Vec<&Value> = vals.iter().filter(|v| **v != Value::Null).collect();
     match op {
         AggregateOp::Count => Value::Int(non_null.len() as i64),
@@ -118,6 +264,8 @@ pub(crate) fn aggregate_values(op: &AggregateOp, vals: &[Value]) -> Value {
             }
             best.cloned().unwrap_or(Value::Null)
         }
+        // Routed by `aggregate_inputs`.
+        _ => Value::Null,
     }
 }
 
@@ -157,41 +305,67 @@ impl crate::planner::ScalarScope for GroupScope<'_> {
             arg,
             arg_expr,
             distinct,
+            extra_args,
+            filter,
+            order_by,
         } = expr
         else {
             return Value::Null;
         };
         let (group_rows, col_names) = (self.group_rows, self.col_names);
-        if *distinct {
-            // `agg(DISTINCT x)`: gather the per-row argument values,
-            // drop duplicates, then aggregate the distinct set.
-            let mut vals: Vec<Value> = Vec::new();
-            for r in group_rows {
-                let v = match arg_expr {
-                    Some(e) => crate::planner::eval_scalar_expr(e, r, col_names),
-                    None => crate::filter_eval::col_pos(col_names, arg)
+        let eval = |e: &ScalarExpr, r: &[Value]| crate::planner::eval_scalar_expr(e, r, col_names);
+        // Only rows where FILTER is true are aggregated.
+        let rows: Vec<&Vec<Value>> = group_rows
+            .iter()
+            .filter(|r| {
+                filter
+                    .as_ref()
+                    .is_none_or(|f| eval(f, r) == Value::Bool(true))
+            })
+            .collect();
+        // `count(*)` counts rows rather than values.
+        if arg == "*" && arg_expr.is_none() {
+            return Value::Int(rows.len() as i64);
+        }
+        let column = crate::filter_eval::col_pos(col_names, arg);
+        let mut inputs: Vec<(Vec<Value>, (Value, Vec<Value>))> = rows
+            .iter()
+            .map(|r| {
+                let value = match arg_expr {
+                    Some(e) => eval(e, r),
+                    None => column
                         .and_then(|i| r.get(i))
                         .cloned()
                         .unwrap_or(Value::Null),
                 };
-                if !vals.iter().any(|x| crate::values_equal(x, &v)) {
-                    vals.push(v);
+                let extra = extra_args.iter().map(|e| eval(e, r)).collect();
+                let keys = order_by.iter().map(|(e, _, _)| eval(e, r)).collect();
+                (keys, (value, extra))
+            })
+            .collect();
+        if !order_by.is_empty() {
+            inputs.sort_by(|(a, _), (b, _)| {
+                for (i, (_, ascending, nulls_first)) in order_by.iter().enumerate() {
+                    let ord = crate::select::order_cmp(&a[i], &b[i], *ascending, *nulls_first);
+                    if ord != std::cmp::Ordering::Equal {
+                        return ord;
+                    }
+                }
+                std::cmp::Ordering::Equal
+            });
+        }
+        let mut inputs: Vec<(Value, Vec<Value>)> = inputs.into_iter().map(|(_, i)| i).collect();
+        if *distinct {
+            // `agg(DISTINCT x)`: the first of each distinct value, in order.
+            let mut kept: Vec<(Value, Vec<Value>)> = Vec::with_capacity(inputs.len());
+            for input in inputs {
+                if !kept.iter().any(|(v, _)| crate::values_equal(v, &input.0)) {
+                    kept.push(input);
                 }
             }
-            return aggregate_values(op, &vals);
+            inputs = kept;
         }
-        match arg_expr {
-            // Aggregate over a computed expression: evaluate it per row,
-            // then aggregate the resulting values.
-            Some(e) => {
-                let vals: Vec<Value> = group_rows
-                    .iter()
-                    .map(|r| crate::planner::eval_scalar_expr(e, r, col_names))
-                    .collect();
-                aggregate_values(op, &vals)
-            }
-            None => compute_aggregate(op, arg, group_rows, col_names),
-        }
+        aggregate_inputs(op, &inputs)
     }
 }
 

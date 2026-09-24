@@ -727,7 +727,7 @@ impl MemExecutor {
                         ProjectionItem::Case { alias, .. } => {
                             alias.clone().unwrap_or_else(|| "case".to_string())
                         }
-                        ProjectionItem::Aggregate(op, _) => format!("{op:?}").to_ascii_lowercase(),
+                        ProjectionItem::Aggregate(op, _) => op.sql_name().to_string(),
                         ProjectionItem::Expr { alias, .. }
                         | ProjectionItem::Subquery { alias, .. } => {
                             alias.clone().unwrap_or_else(|| "?column?".to_string())
@@ -1022,10 +1022,7 @@ impl MemExecutor {
                                         .unwrap_or(Value::Null);
                                 }
                             }
-                        } else if matches!(
-                            func_name.as_str(),
-                            "SUM" | "COUNT" | "AVG" | "MIN" | "MAX"
-                        ) {
+                        } else if crate::planner::aggregate_op(func_name).is_some() {
                             let groups =
                                 partition_groups(&row_indices, &partition_key_of, &stored_rows);
                             let arg = args.first().cloned().unwrap_or_else(|| "*".to_string());
@@ -1044,12 +1041,23 @@ impl MemExecutor {
                                             Some((s, e)) => &grows[s..=e],
                                             None => &[],
                                         };
-                                        results[row_idx] =
-                                            window_aggregate(func_name, &arg, slice, &col_names);
+                                        results[row_idx] = window_aggregate(
+                                            func_name,
+                                            &arg,
+                                            args.get(1..).unwrap_or(&[]),
+                                            slice,
+                                            &col_names,
+                                        );
                                     }
                                 } else {
                                     // No frame and no ORDER BY: the whole partition.
-                                    let agg = window_aggregate(func_name, &arg, &grows, &col_names);
+                                    let agg = window_aggregate(
+                                        func_name,
+                                        &arg,
+                                        args.get(1..).unwrap_or(&[]),
+                                        &grows,
+                                        &col_names,
+                                    );
                                     for &row_idx in group {
                                         results[row_idx] = agg.clone();
                                     }
@@ -1540,7 +1548,12 @@ fn inject_inline_cte(
 /// Compares two cells for an ORDER BY key, honouring the ascending flag and an
 /// optional explicit `NULLS FIRST`/`NULLS LAST` override. With no override the
 /// default matches PostgreSQL: NULLs sort first on ASC and last on DESC.
-fn order_cmp(a: &Value, b: &Value, asc: bool, nulls_first: Option<bool>) -> std::cmp::Ordering {
+pub(crate) fn order_cmp(
+    a: &Value,
+    b: &Value,
+    asc: bool,
+    nulls_first: Option<bool>,
+) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     let a_null = a == &Value::Null;
     let b_null = b == &Value::Null;
@@ -1637,17 +1650,33 @@ fn frame_bounds(
 fn window_aggregate(
     func_name: &str,
     arg: &str,
+    extra: &[String],
     rows: &[Vec<Value>],
     col_names: &[String],
 ) -> Value {
-    match func_name {
-        "AVG" => compute_aggregate(&AggregateOp::Avg, arg, rows, col_names),
-        "SUM" => compute_aggregate(&AggregateOp::Sum, arg, rows, col_names),
-        "COUNT" => compute_aggregate(&AggregateOp::Count, arg, rows, col_names),
-        "MIN" => compute_aggregate(&AggregateOp::Min, arg, rows, col_names),
-        "MAX" => compute_aggregate(&AggregateOp::Max, arg, rows, col_names),
-        _ => Value::Null,
+    let Some(op) = crate::planner::aggregate_op(func_name) else {
+        return Value::Null;
+    };
+    if arg == "*" {
+        return Value::Int(rows.len() as i64);
     }
+    // A further argument is a column of the row, or else a constant
+    // (`string_agg(s, ',')`).
+    let resolve = |name: &str, row: &[Value]| match crate::filter_eval::col_pos(col_names, name) {
+        Some(i) => row.get(i).cloned().unwrap_or(Value::Null),
+        None => Value::Text(name.to_string()),
+    };
+    let inputs: Vec<(Value, Vec<Value>)> = rows
+        .iter()
+        .map(|row| {
+            let value = crate::filter_eval::col_pos(col_names, arg)
+                .and_then(|i| row.get(i))
+                .cloned()
+                .unwrap_or(Value::Null);
+            (value, extra.iter().map(|e| resolve(e, row)).collect())
+        })
+        .collect();
+    crate::aggregates::aggregate_inputs(&op, &inputs)
 }
 
 fn partition_groups<F: Fn(&[Value]) -> Vec<Value>>(

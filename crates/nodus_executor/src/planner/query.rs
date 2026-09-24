@@ -526,6 +526,9 @@ fn item_expr(item: &ProjectionItem) -> Option<ScalarExpr> {
             arg: arg.clone(),
             arg_expr: None,
             distinct: false,
+            extra_args: Vec::new(),
+            filter: None,
+            order_by: Vec::new(),
         }),
         ProjectionItem::Expr { expr, .. } => Some(expr.clone()),
         _ => None,
@@ -1168,6 +1171,17 @@ fn plan_select_expr(
     if let Expr::Function(func) = expr
         && let Some(over) = &func.over
     {
+        if func.filter.is_some() {
+            anyhow::bail!("FILTER is not supported for window functions");
+        }
+        if let sqlparser::ast::FunctionArguments::List(list) = &func.args
+            && (matches!(
+                list.duplicate_treatment,
+                Some(sqlparser::ast::DuplicateTreatment::Distinct)
+            ) || !list.clauses.is_empty())
+        {
+            anyhow::bail!("DISTINCT and ORDER BY are not implemented for window functions");
+        }
         let mut partition_by = Vec::new();
         let mut order_by = Vec::new();
         let sqlparser::ast::WindowType::WindowSpec(spec) = over else {
@@ -1216,12 +1230,29 @@ fn plan_select_expr(
             Some(alias) => ProjectionItem::AliasedLiteral(value, alias),
             None => ProjectionItem::Literal(value),
         }),
+        // A plain aggregate over a column keeps its dedicated item.
         Some(ScalarExpr::Aggregate {
             op,
             arg,
             arg_expr: None,
             distinct: false,
-        }) if alias.is_none() => Ok(ProjectionItem::Aggregate(op, arg)),
+            extra_args,
+            filter: None,
+            order_by,
+        }) if alias.is_none()
+            && extra_args.is_empty()
+            && order_by.is_empty()
+            && matches!(
+                op,
+                AggregateOp::Count
+                    | AggregateOp::Sum
+                    | AggregateOp::Min
+                    | AggregateOp::Max
+                    | AggregateOp::Avg
+            ) =>
+        {
+            Ok(ProjectionItem::Aggregate(op, arg))
+        }
         Some(scalar) => Ok(ProjectionItem::Expr {
             expr: scalar,
             alias: Some(name()),
@@ -1230,6 +1261,14 @@ fn plan_select_expr(
             // Catalog introspection calls functions NodusDB does not provide
             // over virtual tables; the executor resolves (or rejects) them.
             if let Expr::Function(func) = expr
+                && func.filter.is_none()
+                && aggregate_op(
+                    func.name
+                        .to_string()
+                        .to_uppercase()
+                        .trim_start_matches("PG_CATALOG."),
+                )
+                .is_none()
                 && unknown_function_error(expr).is_some()
             {
                 let fname = func.name.to_string().to_uppercase();

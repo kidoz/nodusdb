@@ -182,6 +182,55 @@ pub enum AggregateOp {
     Max,
     // New variants are appended so older serialized plans still decode.
     Avg,
+    StringAgg,
+    ArrayAgg,
+    BoolAnd,
+    BoolOr,
+    JsonAgg,
+    JsonbAgg,
+    JsonObjectAgg,
+    JsonbObjectAgg,
+    StddevSamp,
+    StddevPop,
+    VarSamp,
+    VarPop,
+    BitAnd,
+    BitOr,
+}
+
+impl AggregateOp {
+    /// The function's SQL name, which is also its default output column name.
+    pub fn sql_name(&self) -> &'static str {
+        match self {
+            AggregateOp::Count => "count",
+            AggregateOp::Sum => "sum",
+            AggregateOp::Min => "min",
+            AggregateOp::Max => "max",
+            AggregateOp::Avg => "avg",
+            AggregateOp::StringAgg => "string_agg",
+            AggregateOp::ArrayAgg => "array_agg",
+            AggregateOp::BoolAnd => "bool_and",
+            AggregateOp::BoolOr => "bool_or",
+            AggregateOp::JsonAgg => "json_agg",
+            AggregateOp::JsonbAgg => "jsonb_agg",
+            AggregateOp::JsonObjectAgg => "json_object_agg",
+            AggregateOp::JsonbObjectAgg => "jsonb_object_agg",
+            AggregateOp::StddevSamp => "stddev_samp",
+            AggregateOp::StddevPop => "stddev_pop",
+            AggregateOp::VarSamp => "var_samp",
+            AggregateOp::VarPop => "var_pop",
+            AggregateOp::BitAnd => "bit_and",
+            AggregateOp::BitOr => "bit_or",
+        }
+    }
+
+    /// How many arguments the aggregate takes (`count(*)` counts as one).
+    pub fn arity(&self) -> usize {
+        match self {
+            AggregateOp::StringAgg | AggregateOp::JsonObjectAgg | AggregateOp::JsonbObjectAgg => 2,
+            _ => 1,
+        }
+    }
 }
 
 /// A general scalar expression tree for computed SELECT-list items. Kept
@@ -232,6 +281,17 @@ pub enum ScalarExpr {
         /// `agg(DISTINCT ...)` — aggregate over the distinct argument values.
         #[serde(default)]
         distinct: bool,
+        /// Arguments after the first: `string_agg`'s delimiter,
+        /// `json_object_agg`'s value.
+        #[serde(default)]
+        extra_args: Vec<ScalarExpr>,
+        /// `FILTER (WHERE ...)`: only rows where it is true are aggregated.
+        #[serde(default)]
+        filter: Option<Box<ScalarExpr>>,
+        /// `agg(x ORDER BY key [DESC] [NULLS FIRST|LAST], ...)`: the order in
+        /// which values are fed to an order-sensitive aggregate.
+        #[serde(default)]
+        order_by: Vec<(ScalarExpr, bool, Option<bool>)>,
     },
     /// `date/timestamp ± INTERVAL`, resolved to a (months, days, seconds) offset
     /// applied to the base's ISO text value.
@@ -301,7 +361,19 @@ impl ScalarExpr {
             | ScalarExpr::Extract { expr, .. }
             | ScalarExpr::IsBool { expr, .. } => vec![expr],
             ScalarExpr::DateOffset { base, .. } => vec![base],
-            ScalarExpr::Aggregate { arg_expr, .. } => arg_expr.iter().map(|e| &**e).collect(),
+            ScalarExpr::Aggregate {
+                arg_expr,
+                extra_args,
+                filter,
+                order_by,
+                ..
+            } => arg_expr
+                .iter()
+                .map(|e| &**e)
+                .chain(extra_args.iter())
+                .chain(filter.iter().map(|e| &**e))
+                .chain(order_by.iter().map(|(e, _, _)| e))
+                .collect(),
             ScalarExpr::Binary { left, right, .. }
             | ScalarExpr::IsDistinctFrom { left, right, .. }
             | ScalarExpr::Quantified { left, right, .. } => vec![left, right],
@@ -361,11 +433,20 @@ impl ScalarExpr {
                 arg,
                 arg_expr,
                 distinct,
+                extra_args,
+                filter,
+                order_by,
             } => ScalarExpr::Aggregate {
                 op: op.clone(),
                 arg: arg.clone(),
-                arg_expr: arg_expr.as_ref().map(|e| boxed(e)),
+                arg_expr: arg_expr.as_ref().map(|e| Box::new(f(e))),
                 distinct: *distinct,
+                extra_args: extra_args.iter().map(&mut *f).collect(),
+                filter: filter.as_ref().map(|e| Box::new(f(e))),
+                order_by: order_by
+                    .iter()
+                    .map(|(e, asc, nulls_first)| (f(e), *asc, *nulls_first))
+                    .collect(),
             },
             ScalarExpr::DateOffset {
                 base,

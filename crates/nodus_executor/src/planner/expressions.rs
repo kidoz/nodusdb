@@ -912,15 +912,15 @@ pub(crate) fn lower_scalar(expr: &sqlparser::ast::Expr, params: &[Value]) -> Opt
                 }
                 return Some(ScalarExpr::Row(items));
             }
-            // Window calls and aggregate modifiers have their own paths.
-            if func.over.is_some() || func.filter.is_some() || !func.within_group.is_empty() {
+            // Window calls have their own path; ordered-set aggregates
+            // (`WITHIN GROUP`) and `IGNORE NULLS` are not supported.
+            if func.over.is_some() || !func.within_group.is_empty() || func.null_treatment.is_some()
+            {
                 return None;
             }
-            // An aggregate nested in an expression, e.g. `sum(a) + 1`.
+            // An aggregate call, possibly nested in an expression (`sum(a) + 1`),
+            // with optional DISTINCT, ORDER BY, and FILTER.
             if let Some(op) = aggregate_op(&name) {
-                if matches!(&func.args, FunctionArguments::List(list) if !list.clauses.is_empty()) {
-                    return None;
-                }
                 let FunctionArguments::List(list) = &func.args else {
                     return None;
                 };
@@ -928,36 +928,68 @@ pub(crate) fn lower_scalar(expr: &sqlparser::ast::Expr, params: &[Value]) -> Opt
                     list.duplicate_treatment,
                     Some(sqlparser::ast::DuplicateTreatment::Distinct)
                 );
-                return match list.args.first() {
-                    Some(FunctionArg::Unnamed(FunctionArgExpr::Wildcard)) => {
-                        Some(ScalarExpr::Aggregate {
-                            op,
-                            arg: "*".to_string(),
-                            arg_expr: None,
-                            distinct,
-                        })
+                let mut order_by = Vec::new();
+                for clause in &list.clauses {
+                    let sqlparser::ast::FunctionArgumentClause::OrderBy(keys) = clause else {
+                        return None;
+                    };
+                    for key in keys {
+                        let ascending = match &key.options.sort {
+                            None | Some(sqlparser::ast::OrderBySort::Asc) => true,
+                            Some(sqlparser::ast::OrderBySort::Desc) => false,
+                            Some(_) => return None,
+                        };
+                        if key.with_fill.is_some() {
+                            return None;
+                        }
+                        order_by.push((
+                            lower_scalar(&key.expr, params)?,
+                            ascending,
+                            key.options.nulls_first,
+                        ));
+                    }
+                }
+                let filter = match &func.filter {
+                    Some(condition) => Some(Box::new(lower_scalar(condition, params)?)),
+                    None => None,
+                };
+                let mut args = list.args.iter();
+                let (arg, arg_expr) = match args.next() {
+                    Some(FunctionArg::Unnamed(FunctionArgExpr::Wildcard))
+                        if op == AggregateOp::Count =>
+                    {
+                        ("*".to_string(), None)
                     }
                     Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(e))) => {
-                        match extract_col_name(e) {
-                            Some(col) => Some(ScalarExpr::Aggregate {
-                                op,
-                                arg: col,
-                                arg_expr: None,
-                                distinct,
-                            }),
+                        match lower_scalar(e, params)? {
+                            ScalarExpr::Column(col) => (col, None),
                             // Aggregate over a computed expression, e.g. `sum(a + 1)`.
-                            None => Some(ScalarExpr::Aggregate {
-                                op,
-                                arg: String::new(),
-                                arg_expr: Some(Box::new(lower_scalar(e, params)?)),
-                                distinct,
-                            }),
+                            other => (String::new(), Some(Box::new(other))),
                         }
                     }
-                    _ => None,
+                    _ => return None,
                 };
+                let extra_args = args
+                    .map(|a| match a {
+                        FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => lower_scalar(e, params),
+                        _ => None,
+                    })
+                    .collect::<Option<Vec<_>>>()?;
+                if extra_args.len() + 1 != op.arity() {
+                    return None;
+                }
+                return Some(ScalarExpr::Aggregate {
+                    op,
+                    arg,
+                    arg_expr,
+                    distinct,
+                    extra_args,
+                    filter,
+                    order_by,
+                });
             }
-            if !crate::functions::is_known(&name) {
+            // FILTER applies only to aggregates.
+            if func.filter.is_some() || !crate::functions::is_known(&name) {
                 return None;
             }
             let args = match &func.args {
@@ -1762,10 +1794,23 @@ pub(crate) fn unknown_function_error(expr: &sqlparser::ast::Expr) -> Option<Stri
             let name = func.name.to_string().to_uppercase();
             let name = name.strip_prefix("PG_CATALOG.").unwrap_or(&name);
             let args = arg_exprs(func);
+            let arg_count = match &func.args {
+                sqlparser::ast::FunctionArguments::List(list) => list.args.len(),
+                _ => 0,
+            };
+            if func.filter.is_some() && aggregate_op(name).is_none() && func.over.is_none() {
+                return Some(format!(
+                    "FILTER specified, but {} is not an aggregate function",
+                    func.name.to_string().to_ascii_lowercase()
+                ));
+            }
+            let wrong_aggregate_arity =
+                aggregate_op(name).is_some_and(|op| op.arity() != arg_count);
             if name != "ROW"
-                && aggregate_op(name).is_none()
-                && func.over.is_none()
-                && !crate::functions::is_known(name)
+                && (wrong_aggregate_arity
+                    || (aggregate_op(name).is_none()
+                        && func.over.is_none()
+                        && !crate::functions::is_known(name)))
             {
                 let types = args
                     .iter()
@@ -1845,6 +1890,20 @@ pub(crate) fn aggregate_op(name: &str) -> Option<AggregateOp> {
         "MIN" => Some(AggregateOp::Min),
         "MAX" => Some(AggregateOp::Max),
         "AVG" => Some(AggregateOp::Avg),
+        "STRING_AGG" => Some(AggregateOp::StringAgg),
+        "ARRAY_AGG" => Some(AggregateOp::ArrayAgg),
+        "BOOL_AND" | "EVERY" => Some(AggregateOp::BoolAnd),
+        "BOOL_OR" => Some(AggregateOp::BoolOr),
+        "JSON_AGG" => Some(AggregateOp::JsonAgg),
+        "JSONB_AGG" => Some(AggregateOp::JsonbAgg),
+        "JSON_OBJECT_AGG" => Some(AggregateOp::JsonObjectAgg),
+        "JSONB_OBJECT_AGG" => Some(AggregateOp::JsonbObjectAgg),
+        "STDDEV" | "STDDEV_SAMP" => Some(AggregateOp::StddevSamp),
+        "STDDEV_POP" => Some(AggregateOp::StddevPop),
+        "VARIANCE" | "VAR_SAMP" => Some(AggregateOp::VarSamp),
+        "VAR_POP" => Some(AggregateOp::VarPop),
+        "BIT_AND" => Some(AggregateOp::BitAnd),
+        "BIT_OR" => Some(AggregateOp::BitOr),
         _ => None,
     }
 }
