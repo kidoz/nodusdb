@@ -146,6 +146,19 @@ pub(crate) fn sqlstate_for_execution_error(err_str: &str) -> &'static str {
     }
 }
 
+/// The command a row-returning response completes with, before its row
+/// count: `INSERT 0` / `UPDATE` / `DELETE` for DML with `RETURNING` (so drivers
+/// read the affected-row count), else `SELECT`.
+pub(crate) fn row_response_command(tag: &str) -> String {
+    let command = tag
+        .trim_end_matches(|c: char| c.is_ascii_digit())
+        .trim_end();
+    match command.split_whitespace().next() {
+        Some("INSERT" | "UPDATE" | "DELETE" | "MERGE") => command.to_string(),
+        _ => "SELECT".to_string(),
+    }
+}
+
 /// The error for a statement that could not be planned. Errors PostgreSQL
 /// also raises at this stage (an unknown column or function) keep their own
 /// SQLSTATE; anything else is a construct NodusDB does not support.
@@ -364,6 +377,16 @@ pub(crate) fn field_info_for_output(
 #[cfg(test)]
 mod tests {
     use super::sqlstate_for_execution_error;
+
+    #[test]
+    fn row_responses_keep_their_dml_command() {
+        use super::row_response_command;
+        assert_eq!(row_response_command("INSERT 0 2"), "INSERT 0");
+        assert_eq!(row_response_command("UPDATE 3"), "UPDATE");
+        assert_eq!(row_response_command("DELETE 1"), "DELETE");
+        assert_eq!(row_response_command("SELECT 5"), "SELECT");
+        assert_eq!(row_response_command(""), "SELECT");
+    }
 
     #[test]
     fn maps_constraint_violations() {

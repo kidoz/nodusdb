@@ -1139,7 +1139,8 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
             data_rows
                 .push(encode_row(&row.values, field_info.clone()).map_err(PgWireError::IoError));
         }
-        let response = QueryResponse::new(field_info, stream::iter(data_rows));
+        let mut response = QueryResponse::new(field_info, stream::iter(data_rows));
+        response.set_command_tag(&row_response_command(&out.tag));
         Ok(Response::Query(response))
     }
 
