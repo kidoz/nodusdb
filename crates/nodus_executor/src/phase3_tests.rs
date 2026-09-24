@@ -353,6 +353,8 @@ fn test_unique_constraints() {
                 right: Operand::Literal(Value::Int(2)),
             })),
             returning: vec![],
+            table_alias: None,
+            from: None,
         },
     );
     assert!(res3.is_err());
@@ -371,6 +373,8 @@ fn test_unique_constraints() {
                 right: Operand::Literal(Value::Int(2)),
             })),
             returning: vec![],
+            table_alias: None,
+            from: None,
         },
     );
     assert!(res4.is_ok());
@@ -527,6 +531,8 @@ fn test_secondary_indexing() {
                 right: Operand::Literal(Value::Int(1)),
             })),
             returning: vec![],
+            table_alias: None,
+            from: None,
         },
     )
     .unwrap();
@@ -602,6 +608,8 @@ fn test_secondary_indexing() {
                 right: Operand::Literal(Value::Int(2)),
             })),
             returning: vec![],
+            table_alias: None,
+            using: None,
         },
     )
     .unwrap();
@@ -874,6 +882,8 @@ fn test_alter_table_migrations() {
             assignments: vec![("age".into(), ScalarExpr::Literal(Value::Int(30)))],
             filter: None,
             returning: vec![],
+            table_alias: None,
+            from: None,
         },
     )
     .unwrap();

@@ -11,6 +11,18 @@ pub(crate) fn table_name_of(relation: &sqlparser::ast::TableFactor) -> Result<St
     }
 }
 
+/// The table a data-modifying statement writes, and the alias it goes by.
+pub(crate) fn target_table(
+    relation: &sqlparser::ast::TableFactor,
+) -> Result<(String, Option<String>)> {
+    match relation {
+        sqlparser::ast::TableFactor::Table { name, alias, .. } => {
+            Ok((name.to_string(), table_alias_name(alias.as_ref())?))
+        }
+        other => anyhow::bail!("Unsupported table relation: {other}"),
+    }
+}
+
 pub fn parse_object_name(name: &str) -> Result<(&str, &str, &str)> {
     let parts: Vec<&str> = name.split('.').collect();
     match parts.len() {
@@ -113,45 +125,10 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
 
     let _depth_guard = PlanDepthGuard::enter()?;
 
-    let mut ctes = Vec::new();
-    if let Some(with) = &query.with {
-        for cte in &with.cte_tables {
-            let cte_name = cte.alias.name.value.clone();
-            let column_aliases: Vec<String> = cte
-                .alias
-                .columns
-                .iter()
-                .map(|c| c.name.value.clone())
-                .collect();
-            let cte_plan = plan_query(&cte.query, params)?;
-            // A `WITH RECURSIVE` CTE whose body is `seed UNION[/ALL] term` where
-            // the term self-references the CTE becomes a RecursiveCte so the CTE
-            // loop can run the seed-then-iterate fixpoint. Non-self-referencing
-            // bodies stay as ordinary plans even under WITH RECURSIVE.
-            let cte_plan = match cte_plan {
-                LogicalPlan::SetOp {
-                    op: SetOpKind::Union,
-                    all,
-                    left,
-                    right,
-                } if with.recursive && plan_references_table(&right, &cte_name) => {
-                    LogicalPlan::RecursiveCte {
-                        all,
-                        column_aliases,
-                        seed: left,
-                        recursive_term: right,
-                    }
-                }
-                // `WITH x(a, b) AS (...)` names the CTE's columns.
-                other if !column_aliases.is_empty() => LogicalPlan::Renamed {
-                    input: Box::new(other),
-                    columns: column_aliases,
-                },
-                other => other,
-            };
-            ctes.push((cte_name, Box::new(cte_plan)));
-        }
-    }
+    let mut ctes = match &query.with {
+        Some(with) => plan_ctes(with, params)?,
+        None => Vec::new(),
+    };
 
     if let SetExpr::SetOperation {
         op,
@@ -270,65 +247,7 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
         };
         return select_from_result(literal, ctes, query, params);
     }
-    let (table_name, table_alias) =
-        if let Some(spec) = table_fn_from_factor(&select.from[0].relation, params) {
-            // A set-returning function as the sole driving relation (e.g.
-            // `FROM generate_series(1, 5)`): materialize it like a CTE and reference
-            // it by alias.
-            let alias = spec.alias.clone().unwrap_or_else(|| spec.name.clone());
-            ctes.push((alias.clone(), Box::new(LogicalPlan::TableFunction(spec))));
-            (alias, None)
-        } else {
-            match &select.from[0].relation {
-                TableFactor::Table { name, alias, .. } => {
-                    (name.to_string(), table_alias_name(alias.as_ref())?)
-                }
-                // The first relation has nothing to its left, so LATERAL means
-                // nothing there.
-                TableFactor::Derived {
-                    subquery, alias, ..
-                } => {
-                    let (alias, plan) = derived_plan(subquery, alias.as_ref(), params)?;
-                    ctes.push((alias.clone(), Box::new(plan)));
-                    (alias, None)
-                }
-                other => anyhow::bail!("Unsupported FROM relation: {other}"),
-            }
-        };
-
-    // Every relation after the first joins the ones before it: a comma-separated
-    // `FROM a, b` item is a cross join, and each item's own `JOIN`s follow it.
-    let mut joins = Vec::new();
-    for (position, item) in select.from.iter().enumerate() {
-        if position > 0 {
-            joins.push(plan_join(
-                &item.relation,
-                (JoinType::Cross, None, Vec::new(), false),
-                &mut ctes,
-                params,
-            )?);
-        }
-        for j in &item.joins {
-            let constraint = match &j.join_operator {
-                // 0.62 distinguishes the bare keyword forms (`JOIN`, `LEFT JOIN`,
-                // `RIGHT JOIN`) from the explicit `... OUTER JOIN` spellings; both
-                // map to the same join type.
-                JoinOperator::Join(c) | JoinOperator::Inner(c) => {
-                    join_constraint(JoinType::Inner, c, params)?
-                }
-                JoinOperator::Left(c) | JoinOperator::LeftOuter(c) => {
-                    join_constraint(JoinType::LeftOuter, c, params)?
-                }
-                JoinOperator::Right(c) | JoinOperator::RightOuter(c) => {
-                    join_constraint(JoinType::RightOuter, c, params)?
-                }
-                JoinOperator::FullOuter(c) => join_constraint(JoinType::FullOuter, c, params)?,
-                JoinOperator::CrossJoin(_) => (JoinType::Cross, None, Vec::new(), false),
-                other => anyhow::bail!("Unsupported join operator: {:?}", other),
-            };
-            joins.push(plan_join(&j.relation, constraint, &mut ctes, params)?);
-        }
-    }
+    let (table_name, table_alias, joins) = plan_from(&select.from, &mut ctes, params)?;
 
     // Projection: `*` -> empty (all); otherwise plain column identifiers.
     let mut projection = Vec::new();
@@ -407,6 +326,149 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
         sort,
         group_exprs,
         distinct_on,
+    })
+}
+
+/// Plans a `WITH` list: each CTE's query, recursive or renamed as declared.
+pub(crate) fn plan_ctes(
+    with: &sqlparser::ast::With,
+    params: &[Value],
+) -> Result<Vec<(String, Box<LogicalPlan>)>> {
+    let mut ctes = Vec::new();
+    for cte in &with.cte_tables {
+        let cte_name = cte.alias.name.value.clone();
+        let column_aliases: Vec<String> = cte
+            .alias
+            .columns
+            .iter()
+            .map(|c| c.name.value.clone())
+            .collect();
+        let cte_plan = plan_query(&cte.query, params)?;
+        // A `WITH RECURSIVE` CTE whose body is `seed UNION[/ALL] term` where
+        // the term self-references the CTE becomes a RecursiveCte so the CTE
+        // loop can run the seed-then-iterate fixpoint. Non-self-referencing
+        // bodies stay as ordinary plans even under WITH RECURSIVE.
+        let cte_plan = match cte_plan {
+            LogicalPlan::SetOp {
+                op: SetOpKind::Union,
+                all,
+                left,
+                right,
+            } if with.recursive && plan_references_table(&right, &cte_name) => {
+                LogicalPlan::RecursiveCte {
+                    all,
+                    column_aliases,
+                    seed: left,
+                    recursive_term: right,
+                }
+            }
+            // `WITH x(a, b) AS (...)` names the CTE's columns.
+            other if !column_aliases.is_empty() => LogicalPlan::Renamed {
+                input: Box::new(other),
+                columns: column_aliases,
+            },
+            other => other,
+        };
+        ctes.push((cte_name, Box::new(cte_plan)));
+    }
+    Ok(ctes)
+}
+
+/// Plans a FROM list: its first relation, and a join for each relation after
+/// it. Derived tables and set-returning functions are added to `ctes`.
+fn plan_from(
+    from: &[sqlparser::ast::TableWithJoins],
+    ctes: &mut Vec<(String, Box<LogicalPlan>)>,
+    params: &[Value],
+) -> Result<(String, Option<String>, Vec<crate::Join>)> {
+    use sqlparser::ast::*;
+    let (table_name, table_alias) =
+        if let Some(spec) = table_fn_from_factor(&from[0].relation, params) {
+            // A set-returning function as the sole driving relation (e.g.
+            // `FROM generate_series(1, 5)`): materialize it like a CTE and reference
+            // it by alias.
+            let alias = spec.alias.clone().unwrap_or_else(|| spec.name.clone());
+            ctes.push((alias.clone(), Box::new(LogicalPlan::TableFunction(spec))));
+            (alias, None)
+        } else {
+            match &from[0].relation {
+                TableFactor::Table { name, alias, .. } => {
+                    (name.to_string(), table_alias_name(alias.as_ref())?)
+                }
+                // The first relation has nothing to its left, so LATERAL means
+                // nothing there.
+                TableFactor::Derived {
+                    subquery, alias, ..
+                } => {
+                    let (alias, plan) = derived_plan(subquery, alias.as_ref(), params)?;
+                    ctes.push((alias.clone(), Box::new(plan)));
+                    (alias, None)
+                }
+                other => anyhow::bail!("Unsupported FROM relation: {other}"),
+            }
+        };
+
+    // Every relation after the first joins the ones before it: a comma-separated
+    // `FROM a, b` item is a cross join, and each item's own `JOIN`s follow it.
+    let mut joins = Vec::new();
+    for (position, item) in from.iter().enumerate() {
+        if position > 0 {
+            joins.push(plan_join(
+                &item.relation,
+                (JoinType::Cross, None, Vec::new(), false),
+                ctes,
+                params,
+            )?);
+        }
+        for j in &item.joins {
+            let constraint = match &j.join_operator {
+                // 0.62 distinguishes the bare keyword forms (`JOIN`, `LEFT JOIN`,
+                // `RIGHT JOIN`) from the explicit `... OUTER JOIN` spellings; both
+                // map to the same join type.
+                JoinOperator::Join(c) | JoinOperator::Inner(c) => {
+                    join_constraint(JoinType::Inner, c, params)?
+                }
+                JoinOperator::Left(c) | JoinOperator::LeftOuter(c) => {
+                    join_constraint(JoinType::LeftOuter, c, params)?
+                }
+                JoinOperator::Right(c) | JoinOperator::RightOuter(c) => {
+                    join_constraint(JoinType::RightOuter, c, params)?
+                }
+                JoinOperator::FullOuter(c) => join_constraint(JoinType::FullOuter, c, params)?,
+                JoinOperator::CrossJoin(_) => (JoinType::Cross, None, Vec::new(), false),
+                other => anyhow::bail!("Unsupported join operator: {:?}", other),
+            };
+            joins.push(plan_join(&j.relation, constraint, ctes, params)?);
+        }
+    }
+    Ok((table_name, table_alias, joins))
+}
+
+/// A FROM list as a query of all its joined rows: the relations an
+/// `UPDATE ... FROM`, `DELETE ... USING`, or `MERGE ... USING` reads.
+pub(crate) fn plan_relations(
+    from: &[sqlparser::ast::TableWithJoins],
+    params: &[Value],
+) -> Result<LogicalPlan> {
+    let mut ctes = Vec::new();
+    let (table_name, table_alias, joins) = plan_from(from, &mut ctes, params)?;
+    Ok(LogicalPlan::Select {
+        ctes,
+        table_name,
+        table_alias,
+        joins,
+        projection: Vec::new(),
+        group_by: Vec::new(),
+        filter: None,
+        having: None,
+        grouping_sets: None,
+        order_by: Vec::new(),
+        limit: None,
+        offset: None,
+        distinct: false,
+        sort: Vec::new(),
+        group_exprs: Vec::new(),
+        distinct_on: Vec::new(),
     })
 }
 

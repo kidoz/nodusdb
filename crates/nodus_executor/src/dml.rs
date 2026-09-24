@@ -26,6 +26,174 @@ fn synthetic_rowid() -> String {
     format!("{nanos:039}-{seq:020}")
 }
 
+/// What a data-modifying statement's conditions and expressions read: a
+/// target row followed by a row of the relations the statement reads.
+pub(crate) struct TargetScope {
+    /// The target's columns then the relations' columns, qualified.
+    pub(crate) names: Vec<String>,
+    pub(crate) columns: Vec<ColumnDescriptor>,
+    /// The relations' joined rows; a single empty row when the statement
+    /// reads none, so each target row joins exactly once.
+    pub(crate) source_rows: Vec<Vec<Value>>,
+    /// How many of the columns are the target's.
+    pub(crate) width: usize,
+    /// The target table's own name when an alias hides it.
+    pub(crate) hidden: Option<String>,
+}
+
+impl TargetScope {
+    /// The column names with the target's columns (`target`) or the
+    /// relations' columns made unnameable, for the parts of a `MERGE` that
+    /// see only the other side.
+    pub(crate) fn names_without(&self, target: bool) -> Vec<String> {
+        self.names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                if (i < self.width) == target {
+                    "\u{0}".to_string()
+                } else {
+                    name.clone()
+                }
+            })
+            .collect()
+    }
+
+    /// The positions of the `RETURNING` items in a returned row: the target
+    /// row as written, the relations' row, then the target row as it was
+    /// (`old.`). `*` is every column, the target's first unless
+    /// `source_first` (as `MERGE` orders them), and `x.*` every column of
+    /// relation `x`.
+    pub(crate) fn returning_positions(
+        &self,
+        items: &[String],
+        source_first: bool,
+    ) -> Result<Vec<usize>> {
+        let old = self.names.len();
+        let mut positions = Vec::new();
+        for item in items {
+            if item == "*" {
+                let (target, source) = (0..self.width, self.width..old);
+                if source_first {
+                    positions.extend(source.chain(target));
+                } else {
+                    positions.extend(target.chain(source));
+                }
+            } else if item == "old.*" {
+                positions.extend(old..old + self.width);
+            } else if let Some(column) = item.strip_prefix("old.") {
+                let suffix = format!(".{column}");
+                let i = (0..self.width)
+                    .find(|&i| self.names[i].ends_with(&suffix))
+                    .ok_or_else(|| anyhow::anyhow!("column {item} does not exist"))?;
+                positions.push(old + i);
+            } else if let Some(relation) = item.strip_suffix(".*") {
+                let inner = format!(".{relation}");
+                let before = positions.len();
+                positions.extend((0..old).filter(|&i| {
+                    self.names[i]
+                        .rsplit_once('.')
+                        .is_some_and(|(q, _)| q == relation || q.ends_with(&inner))
+                }));
+                if positions.len() == before {
+                    anyhow::bail!("missing FROM-clause entry for table \"{relation}\"");
+                }
+            } else {
+                self.check_refs(vec![item.clone()], &self.names)?;
+                positions.extend(crate::filter_eval::col_pos(&self.names, item));
+            }
+        }
+        Ok(positions)
+    }
+
+    /// The `RETURNING` rows: each returned row's values at `positions`,
+    /// under their column names.
+    pub(crate) fn returning_output(
+        &self,
+        positions: &[usize],
+        rows: Vec<Vec<Value>>,
+        tag: String,
+    ) -> QueryOutput {
+        if positions.is_empty() {
+            return QueryOutput::tag(&tag);
+        }
+        // An `old.` position reads the target's column.
+        let column = |i: usize| {
+            if i < self.names.len() {
+                i
+            } else {
+                i - self.names.len()
+            }
+        };
+        let name = |i: usize| {
+            let name = &self.names[column(i)];
+            name.rsplit('.').next().unwrap_or(name).to_string()
+        };
+        QueryOutput {
+            columns: positions.iter().map(|&i| name(i)).collect(),
+            types: positions
+                .iter()
+                .map(|&i| self.columns[column(i)].data_type.clone())
+                .collect(),
+            rows: rows
+                .into_iter()
+                .map(|row| Row {
+                    values: positions
+                        .iter()
+                        .map(|&i| row.get(i).cloned().unwrap_or(Value::Null))
+                        .collect(),
+                })
+                .collect(),
+            tag,
+        }
+    }
+
+    /// Checks that every column reference resolves against `visible` (the
+    /// scope's names, some perhaps made unnameable), and that an unqualified
+    /// one does not name both a target column and a column of the relations.
+    pub(crate) fn check_refs(&self, refs: Vec<String>, visible: &[String]) -> Result<()> {
+        let refs: Vec<String> = refs
+            .into_iter()
+            .map(|name| match crate::filter_eval::parse_json_ref(&name) {
+                Some((base, _, _)) => base,
+                None => name,
+            })
+            .collect();
+        for name in &refs {
+            let Some((qualifier, _)) = name.rsplit_once('.') else {
+                continue;
+            };
+            if crate::filter_eval::col_pos(visible, name).is_some() {
+                continue;
+            }
+            // A relation the statement has, but that this part cannot see: the
+            // target hidden by its alias, or a side of a MERGE join.
+            let inner = format!(".{qualifier}.");
+            let prefix = format!("{qualifier}.");
+            let in_scope = |names: &[String]| {
+                names
+                    .iter()
+                    .any(|c| c.starts_with(&prefix) || c.contains(&inner))
+            };
+            if self.hidden.as_deref() == Some(qualifier)
+                || (in_scope(&self.names) && !in_scope(visible))
+            {
+                anyhow::bail!("invalid reference to FROM-clause entry for table \"{qualifier}\"");
+            }
+        }
+        crate::filter_eval::check_column_refs(refs.iter().cloned(), visible)?;
+        let (target, source) = visible.split_at(self.width);
+        for name in refs.iter().filter(|name| !name.contains('.')) {
+            let suffix = format!(".{name}");
+            let names = |columns: &[String]| columns.iter().any(|c| c.ends_with(&suffix));
+            if names(target) && names(source) {
+                anyhow::bail!("column reference \"{name}\" is ambiguous");
+            }
+        }
+        Ok(())
+    }
+}
+
 impl MemExecutor {
     /// Positions (in table-column order) of the columns that form the table's
     /// declared `PRIMARY KEY`. Falls back to the first column when no primary
@@ -268,8 +436,9 @@ impl MemExecutor {
     pub(crate) fn exec_update(
         &self,
         ctx: &ExecutionContext,
-        table_name: String,
+        (table_name, table_alias): (String, Option<String>),
         assignments: Vec<(String, ScalarExpr)>,
+        from: Option<LogicalPlan>,
         filter: Option<FilterExpr>,
         returning: Vec<String>,
     ) -> Result<QueryOutput> {
@@ -278,43 +447,54 @@ impl MemExecutor {
             .catalog_reader
             .get_table(db_name, schema_name, table_only)?;
         self.authorize(ctx, Action::Update, ResourceRef::Table(tbl.id))?;
-        let returning = Self::expand_returning(&tbl, returning)?;
         for (col, _) in &assignments {
             Self::column_position(&tbl, col)?;
         }
-        let col_names: Vec<String> = tbl.columns.iter().map(|c| c.name.clone()).collect();
+        let scope = self.target_scope(
+            ctx,
+            &tbl,
+            (&table_name, table_alias.as_deref()),
+            from,
+            false,
+        )?;
+        let returning = scope.returning_positions(&returning, false)?;
+        let mut refs = Vec::new();
+        for (_, expr) in &assignments {
+            crate::filter_eval::scalar_column_refs(expr, &mut refs);
+        }
+        if let Some(filter) = &filter {
+            crate::filter_eval::filter_column_refs(filter, &mut refs);
+        }
+        scope.check_refs(refs, &scope.names)?;
 
         let mut updated = 0;
         let mut returning_rows = Vec::new();
         // Two-phase: pick the matching rows before mutating, so a subquery in
         // the filter evaluates against the pre-statement state.
-        let targets: Vec<(String, Vec<Value>)> = self
-            .scan_rows_keyed(tbl.id, &ctx.session_id)?
-            .into_iter()
-            .filter(|(_, row)| self.row_matches(ctx, row, &tbl.columns, filter.as_ref()))
-            .collect();
-        for (old_key, old_row) in targets {
-            // Assignments evaluate against the row's OLD values.
+        for (old_key, old_row, joined) in
+            self.matching_targets(ctx, &tbl, &scope, filter.as_ref())?
+        {
+            // Assignments evaluate against the row's OLD values, joined to
+            // the first FROM row that matches it.
             let row =
-                self.apply_assignments(ctx, &tbl, &assignments, &old_row, (&old_row, &col_names))?;
+                self.apply_assignments(ctx, &tbl, &assignments, &old_row, (&joined, &scope.names))?;
             self.replace_row(ctx, &tbl, &old_key, &old_row, &row)?;
             updated += 1;
             if !returning.is_empty() {
-                returning_rows.push(row);
+                let mut returned = joined;
+                returned.splice(..row.len(), row);
+                returned.extend(old_row);
+                returning_rows.push(returned);
             }
         }
-        Self::returning_output(
-            &tbl,
-            &returning,
-            returning_rows,
-            format!("UPDATE {updated}"),
-        )
+        Ok(scope.returning_output(&returning, returning_rows, format!("UPDATE {updated}")))
     }
 
     pub(crate) fn exec_delete(
         &self,
         ctx: &ExecutionContext,
-        table_name: String,
+        (table_name, table_alias): (String, Option<String>),
+        using: Option<LogicalPlan>,
         filter: Option<FilterExpr>,
         returning: Vec<String>,
     ) -> Result<QueryOutput> {
@@ -323,50 +503,166 @@ impl MemExecutor {
             .catalog_reader
             .get_table(db_name, schema_name, table_only)?;
         self.authorize(ctx, Action::Delete, ResourceRef::Table(tbl.id))?;
-        let returning = Self::expand_returning(&tbl, returning)?;
+        let scope = self.target_scope(
+            ctx,
+            &tbl,
+            (&table_name, table_alias.as_deref()),
+            using,
+            false,
+        )?;
+        let returning = scope.returning_positions(&returning, false)?;
+        if let Some(filter) = &filter {
+            let mut refs = Vec::new();
+            crate::filter_eval::filter_column_refs(filter, &mut refs);
+            scope.check_refs(refs, &scope.names)?;
+        }
 
-        let key_prefix = format!("{}:", tbl.id);
         let mut deleted = 0;
         let mut returning_rows = Vec::new();
         // Two-phase: decide WHICH rows match before mutating anything, so a
         // subquery in the filter (e.g. `WHERE a = (SELECT max(a) ...)`) sees
         // the pre-statement state rather than partially-deleted data.
-        let victims: Vec<(String, Vec<Value>)> = self
-            .scan_rows_keyed(tbl.id, &ctx.session_id)?
-            .into_iter()
-            .filter(|(_, row)| self.row_matches(ctx, row, &tbl.columns, filter.as_ref()))
-            .collect();
-        for (key, row) in victims {
-            // Use the row's actual stored key (works for any key scheme), and
-            // derive the index-entry suffix from it.
-            let pk_str = key.strip_prefix(&key_prefix).unwrap_or(&key).to_string();
-            self.delete_row(&ctx.session_id, key.clone())?;
-
-            // Maintain secondary indexes.
-            for idx in &tbl.indexes {
-                for kcol in &idx.key_columns {
-                    if let Some(pos) = tbl.columns.iter().position(|c| c.id == kcol.column_id) {
-                        let index_val = row.get(pos).unwrap_or(&Value::Null);
-                        self.delete_index_entry(&ctx.session_id, idx.id, index_val, &pk_str)?;
-                    }
-                }
-            }
-
+        for (key, row, joined) in self.matching_targets(ctx, &tbl, &scope, filter.as_ref())? {
+            self.remove_row(ctx, &tbl, &key, &row)?;
             deleted += 1;
             if !returning.is_empty() {
-                returning_rows.push(row);
+                returning_rows.push([joined, row].concat());
             }
         }
-        Self::returning_output(
-            &tbl,
-            &returning,
-            returning_rows,
-            format!("DELETE {deleted}"),
-        )
+        Ok(scope.returning_output(&returning, returning_rows, format!("DELETE {deleted}")))
+    }
+
+    /// The columns and rows a data-modifying statement's conditions and
+    /// expressions see: each row of the target table (named by its alias, if
+    /// any) joined to the rows of the relations it reads, if any.
+    pub(crate) fn target_scope(
+        &self,
+        ctx: &ExecutionContext,
+        tbl: &nodus_catalog::TableDescriptor,
+        (table_name, table_alias): (&str, Option<&str>),
+        source: Option<LogicalPlan>,
+        merge: bool,
+    ) -> Result<TargetScope> {
+        let refname = |qualified: &str| {
+            qualified
+                .rsplit('.')
+                .next()
+                .unwrap_or(qualified)
+                .to_string()
+        };
+        let prefix = table_alias.unwrap_or(table_name);
+        let mut names: Vec<String> = tbl
+            .columns
+            .iter()
+            .map(|c| format!("{prefix}.{}", c.name))
+            .collect();
+        let mut columns = tbl.columns.clone();
+        let hidden = table_alias.map(|_| refname(table_name));
+        let Some(source) = source else {
+            return Ok(TargetScope {
+                names,
+                columns,
+                source_rows: vec![Vec::new()],
+                width: tbl.columns.len(),
+                hidden,
+            });
+        };
+        let out = self.relation_rows(ctx, source)?;
+        // The target's name may not name one of the relations too.
+        let target = refname(prefix);
+        if out
+            .columns
+            .iter()
+            .filter_map(|c| c.rsplit_once('.'))
+            .any(|(qualifier, _)| refname(qualifier) == target)
+        {
+            if merge {
+                anyhow::bail!("name \"{target}\" specified more than once");
+            }
+            anyhow::bail!("table name \"{target}\" specified more than once");
+        }
+        let now = Utc::now();
+        columns.extend(
+            out.columns
+                .iter()
+                .zip(&out.types)
+                .map(|(name, ty)| ColumnDescriptor {
+                    id: nodus_catalog::ColumnId::new(),
+                    name: name.clone(),
+                    version: 1,
+                    created_at: now,
+                    updated_at: now,
+                    state: DescriptorState::Public,
+                    data_type: ty.clone(),
+                    nullable: true,
+                    default_expr: None,
+                }),
+        );
+        names.extend(out.columns);
+        Ok(TargetScope {
+            names,
+            columns,
+            source_rows: out.rows.into_iter().map(|r| r.values).collect(),
+            width: tbl.columns.len(),
+            hidden,
+        })
+    }
+
+    /// Each target row `filter` matches, as `(key, row, joined row)`: the
+    /// joined row is the target row followed by the first source row with
+    /// which it matches.
+    fn matching_targets(
+        &self,
+        ctx: &ExecutionContext,
+        tbl: &nodus_catalog::TableDescriptor,
+        scope: &TargetScope,
+        filter: Option<&FilterExpr>,
+    ) -> Result<Vec<(String, Vec<Value>, Vec<Value>)>> {
+        let mut matches = Vec::new();
+        for (key, row) in self.scan_rows_keyed(tbl.id, &ctx.session_id)? {
+            let joined = scope.source_rows.iter().find_map(|source| {
+                let mut joined = row.clone();
+                joined.extend(source.iter().cloned());
+                self.eval_filter(ctx, &joined, &scope.names, &scope.columns, filter)
+                    .unwrap_or(false)
+                    .then_some(joined)
+            });
+            if let Some(joined) = joined {
+                matches.push((key, row, joined));
+            }
+        }
+        Ok(matches)
+    }
+
+    /// Deletes the stored row at `key` and its secondary index entries.
+    pub(crate) fn remove_row(
+        &self,
+        ctx: &ExecutionContext,
+        tbl: &nodus_catalog::TableDescriptor,
+        key: &str,
+        row: &[Value],
+    ) -> Result<()> {
+        // Use the row's actual stored key (works for any key scheme), and
+        // derive the index-entry suffix from it.
+        let key_prefix = format!("{}:", tbl.id);
+        let pk_str = key.strip_prefix(&key_prefix).unwrap_or(key).to_string();
+        self.delete_row(&ctx.session_id, key.to_string())?;
+        for idx in &tbl.indexes {
+            for kcol in &idx.key_columns {
+                if let Some(pos) = tbl.columns.iter().position(|c| c.id == kcol.column_id) {
+                    let index_val = row.get(pos).unwrap_or(&Value::Null);
+                    self.delete_index_entry(&ctx.session_id, idx.id, index_val, &pk_str)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// A column's position in `tbl`, or the PostgreSQL error for an unknown one.
-    fn column_position(tbl: &nodus_catalog::TableDescriptor, name: &str) -> Result<usize> {
+    pub(crate) fn column_position(
+        tbl: &nodus_catalog::TableDescriptor,
+        name: &str,
+    ) -> Result<usize> {
         tbl.columns
             .iter()
             .position(|c| c.name == name)
@@ -427,7 +723,7 @@ impl MemExecutor {
     /// Applies `SET` assignments to a copy of `old_row`. Each expression is
     /// evaluated against `scope` (the old row, plus `excluded.*` for ON
     /// CONFLICT), and the result is coerced to the column type.
-    fn apply_assignments(
+    pub(crate) fn apply_assignments(
         &self,
         ctx: &ExecutionContext,
         tbl: &nodus_catalog::TableDescriptor,
@@ -469,7 +765,7 @@ impl MemExecutor {
     /// Replaces the stored row at `old_key` with `row`: re-checks uniqueness
     /// (excluding the row itself) and table constraints, moves the row when its
     /// key changes, and maintains every index. Returns the row's new key.
-    fn replace_row(
+    pub(crate) fn replace_row(
         &self,
         ctx: &ExecutionContext,
         tbl: &nodus_catalog::TableDescriptor,
@@ -588,12 +884,14 @@ impl MemExecutor {
 
     /// Expands `*` in a RETURNING list to every column, and rejects a name
     /// that is not a column of the table.
-    fn expand_returning(
+    pub(crate) fn expand_returning(
         tbl: &nodus_catalog::TableDescriptor,
         returning: Vec<String>,
     ) -> Result<Vec<String>> {
         let mut out = Vec::with_capacity(returning.len());
         for name in returning {
+            // An INSERT reads only its table, so a qualifier names it.
+            let name = name.rsplit('.').next().unwrap_or(&name).to_string();
             if name == "*" {
                 out.extend(tbl.columns.iter().map(|c| c.name.clone()));
             } else {
@@ -605,7 +903,7 @@ impl MemExecutor {
     }
 
     /// The statement's result: just the command tag, or the RETURNING rows.
-    fn returning_output(
+    pub(crate) fn returning_output(
         tbl: &nodus_catalog::TableDescriptor,
         returning: &[String],
         rows: Vec<Vec<Value>>,

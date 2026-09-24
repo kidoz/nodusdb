@@ -434,7 +434,7 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
             }
         }
         Statement::Insert(insert) => {
-            let returning = plan_returning(&insert.returning)?;
+            let returning = plan_returning(&insert.returning, "")?;
             let table_name = match &insert.table {
                 sqlparser::ast::TableObject::TableName(name) => name.to_string(),
                 other => anyhow::bail!("Unsupported INSERT target: {:?}", other),
@@ -572,13 +572,28 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
             }
             plan_statement(&insert, params)
         }
+        // `WITH ... UPDATE / DELETE / MERGE`: the CTEs are readable anywhere
+        // in the statement.
         Statement::Query(query)
             if matches!(
                 &*query.body,
                 SetExpr::Update(_) | SetExpr::Delete(_) | SetExpr::Merge(_)
             ) =>
         {
-            anyhow::bail!("WITH before UPDATE, DELETE, or MERGE is not supported")
+            let (SetExpr::Update(statement)
+            | SetExpr::Delete(statement)
+            | SetExpr::Merge(statement)) = &*query.body
+            else {
+                unreachable!("guarded by the match arm");
+            };
+            let body = plan_statement(statement, params)?;
+            match &query.with {
+                Some(with) => Ok(LogicalPlan::With {
+                    ctes: plan_ctes(with, params)?,
+                    body: Box::new(body),
+                }),
+                None => Ok(body),
+            }
         }
         Statement::Query(query) if select_into(query).is_some() => {
             // `SELECT ... INTO t` creates `t` from the query without its INTO.
@@ -591,39 +606,61 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
         }
         Statement::Query(query) => plan_query(query, params),
         Statement::Update(update) => {
-            if update.from.is_some() {
-                anyhow::bail!("UPDATE ... FROM is not supported");
-            }
             if !update.table.joins.is_empty() {
                 anyhow::bail!("UPDATE of a joined relation is not supported");
             }
+            let (table_name, table_alias) = target_table(&update.table.relation)?;
+            let from = match &update.from {
+                Some(
+                    UpdateTableFromKind::AfterSet(from) | UpdateTableFromKind::BeforeSet(from),
+                ) => Some(Box::new(plan_relations(from, params)?)),
+                None => None,
+            };
+            let returning = plan_returning(
+                &update.returning,
+                table_alias.as_ref().unwrap_or(&table_name),
+            )?;
             Ok(LogicalPlan::Update {
-                table_name: table_name_of(&update.table.relation)?,
                 assignments: plan_assignments(&update.assignments, params)?,
                 filter: parse_predicates(&update.selection, params)?,
-                returning: plan_returning(&update.returning)?,
+                returning,
+                table_name,
+                table_alias,
+                from,
             })
         }
         Statement::Delete(delete) => {
-            if delete.using.is_some() {
-                anyhow::bail!("DELETE ... USING is not supported");
-            }
             let tables = match &delete.from {
                 FromTable::WithFromKeyword(t) | FromTable::WithoutKeyword(t) => t,
             };
-            if tables.len() > 1 || tables.iter().any(|t| !t.joins.is_empty()) {
+            if !delete.tables.is_empty()
+                || tables.len() > 1
+                || tables.iter().any(|t| !t.joins.is_empty())
+            {
                 anyhow::bail!("DELETE from several relations is not supported");
             }
             let relation = &tables
                 .first()
                 .ok_or_else(|| anyhow::anyhow!("DELETE without a table"))?
                 .relation;
+            let (table_name, table_alias) = target_table(relation)?;
+            let using = match &delete.using {
+                Some(using) => Some(Box::new(plan_relations(using, params)?)),
+                None => None,
+            };
+            let returning = plan_returning(
+                &delete.returning,
+                table_alias.as_ref().unwrap_or(&table_name),
+            )?;
             Ok(LogicalPlan::Delete {
-                table_name: table_name_of(relation)?,
+                table_name,
                 filter: parse_predicates(&delete.selection, params)?,
-                returning: plan_returning(&delete.returning)?,
+                returning,
+                table_alias,
+                using,
             })
         }
+        Statement::Merge(merge) => plan_merge(merge, params),
         Statement::StartTransaction { .. } => Ok(LogicalPlan::Begin),
         Statement::Commit { .. } => Ok(LogicalPlan::Commit),
         Statement::Rollback { savepoint, .. } => {
@@ -787,15 +824,30 @@ fn filter_has_subquery(filter: &FilterExpr) -> bool {
     }
 }
 
-/// Plans a `RETURNING` list as column names; `*` (and `new.*`) expands to every
-/// column at execution, and `new.col` is `col`. Expressions and `old.`
-/// references are rejected rather than silently omitted.
-fn plan_returning(items: &Option<Vec<sqlparser::ast::SelectItem>>) -> Result<Vec<String>> {
+/// Plans a `RETURNING` list as column names, qualified as written: `*` and
+/// `x.*` expand at execution, `new.` names the written row, so it stands for
+/// `target`, the name the table goes by, and `old.` the row as it was.
+/// Expressions, and `old.` in an INSERT, are rejected rather than silently
+/// omitted.
+fn plan_returning(
+    items: &Option<Vec<sqlparser::ast::SelectItem>>,
+    target: &str,
+) -> Result<Vec<String>> {
     use sqlparser::ast::{Expr, SelectItem, SelectItemQualifiedWildcardKind};
     let Some(items) = items else {
         return Ok(Vec::new());
     };
-    let is_old = |qualifier: &str| qualifier.eq_ignore_ascii_case("old");
+    // `old.` reads the row as it was, which an INSERT (no `target`) lacks.
+    let is_old = |qualifier: &str| target.is_empty() && qualifier.eq_ignore_ascii_case("old");
+    let qualify = |qualifier: &str| {
+        if qualifier.eq_ignore_ascii_case("new") {
+            target.to_string()
+        } else if qualifier.eq_ignore_ascii_case("old") {
+            "old".to_string()
+        } else {
+            qualifier.to_string()
+        }
+    };
     items
         .iter()
         .map(|item| match item {
@@ -803,17 +855,119 @@ fn plan_returning(items: &Option<Vec<sqlparser::ast::SelectItem>>) -> Result<Vec
             SelectItem::QualifiedWildcard(SelectItemQualifiedWildcardKind::ObjectName(name), _)
                 if !is_old(&name.to_string()) =>
             {
-                Ok("*".to_string())
+                Ok(format!("{}.*", qualify(&name.to_string())))
             }
             SelectItem::UnnamedExpr(Expr::Identifier(id)) => Ok(id.value.clone()),
             SelectItem::UnnamedExpr(Expr::CompoundIdentifier(parts))
                 if parts.len() == 2 && !is_old(&parts[0].value) =>
             {
-                Ok(parts[1].value.clone())
+                Ok(format!("{}.{}", qualify(&parts[0].value), parts[1].value))
             }
             other => anyhow::bail!("Unsupported RETURNING item: {other}"),
         })
         .collect()
+}
+
+/// Plans `MERGE INTO target USING source ON condition WHEN ...`.
+fn plan_merge(merge: &sqlparser::ast::Merge, params: &[Value]) -> Result<LogicalPlan> {
+    use sqlparser::ast::{
+        MergeAction as Action, MergeClauseKind, MergeInsertKind, MergeUpdateKind, OutputClause,
+        TableWithJoins,
+    };
+    let (table_name, table_alias) = target_table(&merge.table)?;
+    let returning = match &merge.output {
+        Some(OutputClause::Returning { select_items, .. }) => plan_returning(
+            &Some(select_items.clone()),
+            table_alias.as_ref().unwrap_or(&table_name),
+        )?,
+        Some(other) => anyhow::bail!("Unsupported MERGE clause: {other}"),
+        None => Vec::new(),
+    };
+    let source = plan_relations(
+        &[TableWithJoins {
+            relation: merge.source.clone(),
+            joins: Vec::new(),
+        }],
+        params,
+    )?;
+    let mut clauses: Vec<MergeClause> = Vec::with_capacity(merge.clauses.len());
+    for clause in &merge.clauses {
+        let kind = match clause.clause_kind {
+            MergeClauseKind::Matched => MergeKind::Matched,
+            MergeClauseKind::NotMatchedBySource => MergeKind::NotMatchedBySource,
+            MergeClauseKind::NotMatched | MergeClauseKind::NotMatchedByTarget => {
+                MergeKind::NotMatchedByTarget
+            }
+        };
+        if clauses
+            .iter()
+            .any(|c| c.kind == kind && c.condition.is_none())
+        {
+            anyhow::bail!("unreachable WHEN clause specified after unconditional WHEN clause");
+        }
+        let action = match &clause.action {
+            Action::Update(update) => match &update.kind {
+                MergeUpdateKind::Set(assignments)
+                    if update.update_predicate.is_none() && update.delete_predicate.is_none() =>
+                {
+                    MergeAction::Update(plan_assignments(assignments, params)?)
+                }
+                _ => anyhow::bail!("Unsupported MERGE action: {}", clause.action),
+            },
+            Action::Delete { .. } => MergeAction::Delete,
+            Action::DoNothing { .. } => MergeAction::Nothing,
+            Action::Insert(insert) => {
+                let MergeInsertKind::Values(values) = &insert.kind else {
+                    anyhow::bail!("Unsupported MERGE action: {}", clause.action);
+                };
+                if insert.insert_predicate.is_some() {
+                    anyhow::bail!("Unsupported MERGE action: {}", clause.action);
+                }
+                let [row] = values.rows.as_slice() else {
+                    anyhow::bail!("MERGE INSERT must have exactly one VALUES row");
+                };
+                let values = row
+                    .content
+                    .iter()
+                    .map(|e| match e {
+                        sqlparser::ast::Expr::Identifier(id)
+                            if id.quote_style.is_none()
+                                && id.value.eq_ignore_ascii_case("default") =>
+                        {
+                            Ok(None)
+                        }
+                        _ => lower_scalar(e, params).map(Some).ok_or_else(|| {
+                            expression_error(e, || format!("Unsupported expression in VALUES: {e}"))
+                        }),
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let columns: Vec<String> = insert
+                    .columns
+                    .iter()
+                    .map(|c| {
+                        c.0.last()
+                            .and_then(|part| part.as_ident())
+                            .map(|ident| ident.value.clone())
+                            .unwrap_or_else(|| c.to_string())
+                    })
+                    .collect();
+                MergeAction::Insert { columns, values }
+            }
+        };
+        clauses.push(MergeClause {
+            kind,
+            condition: parse_predicates(&clause.predicate, params)?,
+            action,
+        });
+    }
+    Ok(LogicalPlan::Merge {
+        table_name,
+        table_alias,
+        source: Box::new(source),
+        on: parse_predicates(&Some((*merge.on).clone()), params)?,
+        clauses,
+        returning,
+    })
 }
 
 /// Plans `SET` assignments. A tuple target `(a, b) = (x, y)` expands to one

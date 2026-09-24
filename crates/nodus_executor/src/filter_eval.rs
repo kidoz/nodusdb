@@ -59,7 +59,8 @@ pub(crate) fn check_column_refs(
             Some((qualifier, _)) if !qualifier_in_scope(col_names, qualifier) => {
                 anyhow::bail!("missing FROM-clause entry for table \"{qualifier}\"")
             }
-            _ => anyhow::bail!("column \"{name}\" does not exist"),
+            Some(_) => anyhow::bail!("column {name} does not exist"),
+            None => anyhow::bail!("column \"{name}\" does not exist"),
         }
     }
     Ok(())

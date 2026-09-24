@@ -428,6 +428,8 @@ fn rows_keyed_by_declared_pk_not_first_column() {
             table_name: "t".into(),
             filter: eq("id", "1"),
             returning: vec![],
+            table_alias: None,
+            using: None,
         },
     )
     .unwrap();
@@ -578,6 +580,8 @@ fn update_and_delete_rows() {
                 filter: eq("id", "2"),
 
                 returning: vec![],
+                table_alias: None,
+                from: None,
             },
         )
         .unwrap();
@@ -619,6 +623,8 @@ fn update_and_delete_rows() {
                 filter: eq("id", "1"),
 
                 returning: vec![],
+                table_alias: None,
+                using: None,
             },
         )
         .unwrap();

@@ -26,6 +26,7 @@ mod execute;
 pub(crate) mod filter_eval;
 mod functions;
 mod information_schema;
+mod merge;
 mod parameters;
 mod pg_catalog;
 mod plan_types;
@@ -45,8 +46,9 @@ mod value;
 mod view_helpers;
 pub use plan_types::{
     AggregateOp, AlterTableOp, CompareOp, ConflictTarget, DeferredItem, FilterExpr, Join, JoinType,
-    LogicalPlan, OnConflictClause, Operand, PatternKind, Predicate, ProjectionItem, ScalarBinaryOp,
-    ScalarExpr, ScalarUnaryOp, SetOpKind, SortKey, SortTarget, SubPlan, SubqueryKind, TableFnSpec,
+    LogicalPlan, MergeAction, MergeClause, MergeKind, OnConflictClause, Operand, PatternKind,
+    Predicate, ProjectionItem, ScalarBinaryOp, ScalarExpr, ScalarUnaryOp, SetOpKind, SortKey,
+    SortTarget, SubPlan, SubqueryKind, TableFnSpec,
 };
 pub use planner::{
     CopyOutputFormat, expr_to_value, parse_object_name, plan_copy_out, plan_statement,
@@ -954,6 +956,8 @@ impl Executor for MemExecutor {
     }
 }
 
+#[cfg(test)]
+mod dml_join_tests;
 #[cfg(test)]
 mod phase1_tests;
 #[cfg(test)]

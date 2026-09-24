@@ -1262,6 +1262,37 @@ fn describe_probe_plan(plan: &nodus_executor::LogicalPlan) -> Option<nodus_execu
         LogicalPlan::ShowVariable { .. }
         | LogicalPlan::SelectLiteral { .. }
         | LogicalPlan::Values { .. } => Some(plan.clone()),
+        // RETURNING may name the columns of the relations the statement
+        // joins, so run the statement itself over no rows.
+        LogicalPlan::Update {
+            from: Some(_),
+            returning,
+            ..
+        }
+        | LogicalPlan::Delete {
+            using: Some(_),
+            returning,
+            ..
+        }
+        | LogicalPlan::Merge { returning, .. }
+            if !returning.is_empty() =>
+        {
+            let never = Some(nodus_executor::FilterExpr::Scalar(
+                nodus_executor::ScalarExpr::Literal(nodus_executor::Value::Bool(false)),
+            ));
+            let mut probe = plan.clone();
+            match &mut probe {
+                LogicalPlan::Update { filter, .. } | LogicalPlan::Delete { filter, .. } => {
+                    *filter = never;
+                }
+                LogicalPlan::Merge { on, clauses, .. } => {
+                    *on = never;
+                    clauses.clear();
+                }
+                _ => {}
+            }
+            Some(probe)
+        }
         LogicalPlan::Insert {
             table_name,
             returning,
@@ -1283,8 +1314,11 @@ fn describe_probe_plan(plan: &nodus_executor::LogicalPlan) -> Option<nodus_execu
             joins: vec![],
             projection: returning
                 .iter()
-                .filter(|c| c.as_str() != "*")
-                .map(|c| nodus_executor::ProjectionItem::Column(c.clone()))
+                .filter(|c| !c.ends_with('*'))
+                .map(|c| {
+                    let column = c.rsplit('.').next().unwrap_or(c);
+                    nodus_executor::ProjectionItem::Column(column.to_string())
+                })
                 .collect(),
             group_by: vec![],
             filter: None,
@@ -1299,6 +1333,7 @@ fn describe_probe_plan(plan: &nodus_executor::LogicalPlan) -> Option<nodus_execu
             distinct: false,
         }),
         LogicalPlan::SetOp { left, .. } => describe_probe_plan(left),
+        LogicalPlan::With { body, .. } => describe_probe_plan(body),
         _ => None,
     }
 }

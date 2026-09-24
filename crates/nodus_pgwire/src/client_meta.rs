@@ -139,6 +139,9 @@ pub(crate) fn command_tag_from_output_tag(output_tag: &str) -> Tag {
     } else if let Some(rest) = output_tag.strip_prefix("DELETE ") {
         let rows = rest.parse::<usize>().unwrap_or(0);
         Tag::new("DELETE").with_rows(rows)
+    } else if let Some(rest) = output_tag.strip_prefix("MERGE ") {
+        let rows = rest.parse::<usize>().unwrap_or(0);
+        Tag::new("MERGE").with_rows(rows)
     } else {
         Tag::new(output_tag)
     }

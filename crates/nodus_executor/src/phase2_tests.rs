@@ -111,6 +111,8 @@ fn test_group_by_aggregates() {
             table_name: "sales".into(),
             filter: None,
             returning: vec![],
+            table_alias: None,
+            using: None,
         },
     )
     .unwrap();

@@ -36,10 +36,15 @@ pub(crate) fn sqlstate_for_execution_error(err_str: &str) -> &'static str {
     {
         "0A000" // feature_not_supported
     // Statement shape errors raised while executing DML.
-    } else if err_str.contains("more expressions than target columns")
+    } else if err_str.starts_with("unreachable WHEN clause")
+        || err_str.contains("more expressions than target columns")
         || err_str.contains("more target columns than expressions")
     {
         "42601" // syntax_error
+    } else if (err_str.starts_with("table name") || err_str.starts_with("name \""))
+        && err_str.ends_with("specified more than once")
+    {
+        "42712" // duplicate_alias
     } else if err_str.contains("specified more than once") {
         "42701" // duplicate_column
     } else if err_str.contains("no unique or exclusion constraint matching the ON CONFLICT") {
@@ -137,7 +142,11 @@ pub(crate) fn sqlstate_for_execution_error(err_str: &str) -> &'static str {
     // Missing object (class 42 / 3B).
     } else if err_str.contains("savepoint \"") && err_str.contains("does not exist") {
         "3B001" // invalid_savepoint_specification
-    } else if err_str.starts_with("missing FROM-clause entry for table") {
+    } else if err_str.starts_with("column reference") && err_str.ends_with("is ambiguous") {
+        "42702" // ambiguous_column
+    } else if err_str.starts_with("missing FROM-clause entry for table")
+        || err_str.starts_with("invalid reference to FROM-clause entry for table")
+    {
         "42P01" // undefined_table
     } else if err_str.starts_with("function ") && err_str.ends_with(" does not exist") {
         "42883" // undefined_function

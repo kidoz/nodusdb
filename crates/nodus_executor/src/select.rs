@@ -82,6 +82,75 @@ impl MemExecutor {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// Computes each CTE and makes it visible to the rest of the statement,
+    /// including later CTEs and nested subqueries, until the guards drop.
+    pub(crate) fn bind_ctes(
+        &self,
+        ctx: &ExecutionContext,
+        ctes: Vec<(String, Box<LogicalPlan>)>,
+    ) -> Result<Vec<crate::cte_scope::ScopeGuard>> {
+        let mut bindings = Vec::with_capacity(ctes.len());
+        for (name, cte_plan) in ctes {
+            let out = match *cte_plan {
+                LogicalPlan::RecursiveCte {
+                    all,
+                    column_aliases,
+                    seed,
+                    recursive_term,
+                } => self.exec_recursive_cte(
+                    ctx,
+                    &name,
+                    all,
+                    column_aliases,
+                    *seed,
+                    *recursive_term,
+                )?,
+                other => self.execute_logical_inner(ctx, other)?,
+            };
+            bindings.push(crate::cte_scope::bind(&name, out));
+        }
+        Ok(bindings)
+    }
+
+    /// The joined rows of the relations a data-modifying statement reads
+    /// (planned as a `SELECT *` over them), under their qualified names.
+    pub(crate) fn relation_rows(
+        &self,
+        ctx: &ExecutionContext,
+        plan: LogicalPlan,
+    ) -> Result<QueryOutput> {
+        let LogicalPlan::Select {
+            ctes,
+            table_name,
+            table_alias,
+            joins,
+            filter,
+            ..
+        } = plan
+        else {
+            anyhow::bail!("unsupported relation");
+        };
+        self.exec_select(
+            ctx,
+            ctes,
+            table_name,
+            table_alias,
+            joins,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            filter,
+            None,
+            None,
+            Vec::new(),
+            None,
+            None,
+            false,
+            Vec::new(),
+            true,
+        )
+    }
+
     pub(crate) fn exec_select(
         &self,
         ctx: &ExecutionContext,
@@ -100,6 +169,7 @@ impl MemExecutor {
         offset: Option<usize>,
         distinct: bool,
         distinct_on: Vec<SortTarget>,
+        raw: bool,
     ) -> Result<QueryOutput> {
         // The keys each output row is sorted by, then deduplicated on.
         let key_targets: Vec<SortTarget> = sort
@@ -118,28 +188,7 @@ impl MemExecutor {
             });
         }
 
-        // Each CTE is visible to the rest of this query, including later CTEs
-        // and nested subqueries, until the query finishes.
-        let mut _cte_bindings = Vec::with_capacity(ctes.len());
-        for (name, cte_plan) in ctes {
-            let out = match *cte_plan {
-                LogicalPlan::RecursiveCte {
-                    all,
-                    column_aliases,
-                    seed,
-                    recursive_term,
-                } => self.exec_recursive_cte(
-                    ctx,
-                    &name,
-                    all,
-                    column_aliases,
-                    *seed,
-                    *recursive_term,
-                )?,
-                other => self.execute_logical_inner(ctx, other)?,
-            };
-            _cte_bindings.push(crate::cte_scope::bind(&name, out));
-        }
+        let _cte_bindings = self.bind_ctes(ctx, ctes)?;
 
         // LIMIT/OFFSET push-down: when the pipeline is a plain row-by-row scan of
         // a single base table — no join, grouping, ordering, DISTINCT, HAVING,
@@ -662,6 +711,20 @@ impl MemExecutor {
             self.eval_filter(ctx, r, &col_names, &joined_columns, filter.as_ref())
                 .unwrap_or(false)
         });
+
+        // Read as the relations of a data-modifying statement: the joined
+        // rows, under their qualified column names.
+        if raw {
+            return Ok(QueryOutput {
+                types: joined_columns.iter().map(|c| c.data_type.clone()).collect(),
+                columns: col_names,
+                rows: stored_rows
+                    .into_iter()
+                    .map(|values| Row { values })
+                    .collect(),
+                tag: String::new(),
+            });
+        }
 
         // Grouping expressions become columns of each input row. A name that
         // is already an input column keeps that column.

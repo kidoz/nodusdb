@@ -94,16 +94,16 @@ SELECT id, v, n FROM ds WHERE id <= 2 ORDER BY id;
 statement error
 UPDATE ds SET nope = 1;
 
-statement error
+statement ok
 UPDATE ds SET v = s.v FROM ds_src s WHERE s.id = ds.id;
 
-statement error
+statement ok
 DELETE FROM ds USING ds_src s WHERE ds.id = s.id + 10;
 
 query T
 SELECT count(*) FROM ds;
 ----
-8
+5
 
 # ON CONFLICT: EXCLUDED, table-qualified references, WHERE, targets.
 statement ok

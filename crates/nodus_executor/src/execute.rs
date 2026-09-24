@@ -138,6 +138,7 @@ impl MemExecutor {
                     offset,
                     distinct,
                     distinct_on,
+                    false,
                 )
             }
             LogicalPlan::Update {
@@ -145,12 +146,48 @@ impl MemExecutor {
                 assignments,
                 filter,
                 returning,
-            } => self.exec_update(ctx, table_name, assignments, filter, returning),
+                table_alias,
+                from,
+            } => self.exec_update(
+                ctx,
+                (table_name, table_alias),
+                assignments,
+                from.map(|from| *from),
+                filter,
+                returning,
+            ),
             LogicalPlan::Delete {
                 table_name,
                 filter,
                 returning,
-            } => self.exec_delete(ctx, table_name, filter, returning),
+                table_alias,
+                using,
+            } => self.exec_delete(
+                ctx,
+                (table_name, table_alias),
+                using.map(|using| *using),
+                filter,
+                returning,
+            ),
+            LogicalPlan::Merge {
+                table_name,
+                table_alias,
+                source,
+                on,
+                clauses,
+                returning,
+            } => self.exec_merge(
+                ctx,
+                (table_name, table_alias),
+                *source,
+                on,
+                clauses,
+                returning,
+            ),
+            LogicalPlan::With { ctes, body } => {
+                let _bindings = self.bind_ctes(ctx, ctes)?;
+                self.execute_logical_inner(ctx, *body)
+            }
             LogicalPlan::AlterTable {
                 table_name,
                 operation,

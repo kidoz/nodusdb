@@ -1,0 +1,287 @@
+# UPDATE ... FROM, DELETE ... USING, and MERGE: data-modifying statements
+# that join the target table to other relations. Expected results come from
+# PostgreSQL 18.
+statement ok
+CREATE TABLE acct (id INT PRIMARY KEY, owner TEXT, balance INT DEFAULT 0);
+
+statement ok
+CREATE TABLE pay (id INT PRIMARY KEY, acct_id INT, amount INT, note TEXT);
+
+statement ok
+CREATE TABLE tags (acct_id INT, tag TEXT);
+
+statement ok
+INSERT INTO acct VALUES (1, 'ann', 100), (2, 'bob', 200), (3, 'cid', 300), (4, 'dee', 400);
+
+statement ok
+INSERT INTO pay VALUES (1, 1, 10, 'a'), (2, 2, 20, 'b'), (3, 2, 5, 'c'), (4, 9, 99, 'orphan');
+
+statement ok
+INSERT INTO tags VALUES (1, 'vip'), (3, 'new');
+
+# UPDATE ... FROM: each target row is updated once, from a row it joins.
+query TT rowsort
+UPDATE acct SET balance = balance + pay.amount FROM pay WHERE pay.acct_id = acct.id AND pay.id = 1 RETURNING acct.id, balance;
+----
+1	110
+
+query TTT rowsort
+UPDATE acct AS a SET owner = upper(t.tag) FROM tags t WHERE t.acct_id = a.id RETURNING a.id, a.owner, t.tag;
+----
+1	VIP	vip
+3	NEW	new
+
+query TTTT rowsort
+UPDATE acct SET balance = acct.balance - p.amount FROM pay p JOIN tags t ON t.acct_id = p.acct_id WHERE p.acct_id = acct.id RETURNING acct.id, acct.balance, p.note, t.tag;
+----
+1	100	a	vip
+
+query TTTTT rowsort
+UPDATE acct SET owner = v.name FROM (VALUES (3, 'carl'), (4, 'dora')) AS v(id, name) WHERE v.id = acct.id RETURNING *;
+----
+3	carl	300	3	carl
+4	dora	400	4	dora
+
+query TTT rowsort
+UPDATE acct SET balance = s.total FROM (SELECT acct_id, sum(amount) AS total FROM pay GROUP BY acct_id) s WHERE s.acct_id = acct.id RETURNING acct.id, balance, total;
+----
+2	25	25
+1	10	10
+
+query TTT rowsort
+UPDATE acct SET balance = acct.balance + 1 FROM acct AS other WHERE other.id = acct.id + 1 RETURNING acct.id, acct.balance, other.id;
+----
+3	301	4
+2	26	3
+1	11	2
+
+query TTT rowsort
+UPDATE acct SET balance = 0 FROM generate_series(1, 2) AS g(i) WHERE g.i = acct.id RETURNING id, balance, i;
+----
+1	0	1
+2	0	2
+
+query T rowsort
+UPDATE acct SET owner = 'x' FROM pay WHERE false RETURNING acct.id;
+----
+
+query TTT
+SELECT * FROM acct ORDER BY id;
+----
+1	VIP	0
+2	bob	0
+3	carl	301
+4	dora	400
+
+query TTT rowsort
+UPDATE acct SET balance = 7 FROM pay, tags WHERE pay.acct_id = acct.id AND tags.acct_id = acct.id RETURNING acct.id, pay.id, tag;
+----
+1	1	vip
+
+query TT
+WITH src AS (SELECT 4 AS id, 44 AS b) UPDATE acct SET balance = src.b FROM src WHERE src.id = acct.id RETURNING acct.id, balance;
+----
+4	44
+
+query TTT rowsort
+UPDATE acct SET balance = balance * 2 WHERE id IN (SELECT acct_id FROM pay) RETURNING id, old.balance, new.balance;
+----
+2	0	0
+1	7	14
+
+query TTT
+SELECT * FROM acct ORDER BY id;
+----
+1	VIP	14
+2	bob	0
+3	carl	301
+4	dora	44
+
+# Names: an alias hides its table, a bare name both sides have is
+# ambiguous, and the target may not also be a source.
+statement error
+UPDATE acct SET balance = 0 FROM acct WHERE acct.id = 1;
+
+statement error
+UPDATE acct AS a SET balance = 0 WHERE acct.id = 1;
+
+statement error
+UPDATE acct SET balance = 0 FROM pay WHERE id = 1;
+
+statement error
+UPDATE acct SET balance = 0 FROM pay WHERE nosuch.id = 1;
+
+statement error
+UPDATE acct SET balance = 0 FROM pay WHERE pay.nosuch = 1;
+
+statement error
+UPDATE acct SET balance = 0 FROM pay WHERE pay.acct_id = acct.id RETURNING id;
+
+# DELETE ... USING: a target row is deleted if it joins any row.
+query TT rowsort
+DELETE FROM pay USING acct WHERE acct.id = pay.acct_id AND acct.owner = 'VIP' RETURNING pay.id, acct.owner;
+----
+1	VIP
+
+query TTTTTTT rowsort
+DELETE FROM pay p USING (SELECT 2 AS id) s, tags WHERE s.id = p.acct_id AND tags.tag = 'new' RETURNING *;
+----
+2	2	20	b	2	3	new
+3	2	5	c	2	3	new
+
+query T
+WITH gone AS (SELECT 99 AS n) DELETE FROM pay USING gone WHERE pay.amount = gone.n RETURNING id;
+----
+4
+
+query T
+SELECT * FROM pay ORDER BY id;
+----
+
+statement error
+DELETE FROM pay USING pay WHERE true;
+
+statement error
+DELETE FROM pay AS p WHERE pay.id = 1;
+
+statement ok
+INSERT INTO pay VALUES (5, 3, 1, 'e'), (6, 3, 2, 'f');
+
+query T
+DELETE FROM tags USING pay WHERE pay.acct_id = tags.acct_id RETURNING tags.tag;
+----
+new
+
+query T
+SELECT count(*) FROM tags;
+----
+1
+
+# MERGE: the first WHEN clause that applies to each joined row acts.
+statement ok
+CREATE TABLE stock (item TEXT PRIMARY KEY, qty INT, note TEXT DEFAULT 'none');
+
+statement ok
+CREATE TABLE delivery (item TEXT, qty INT);
+
+statement ok
+INSERT INTO stock VALUES ('apple', 5, 'a'), ('pear', 0, 'p'), ('plum', 3, 'q');
+
+statement ok
+INSERT INTO delivery VALUES ('apple', 10), ('kiwi', 7), ('pear', 1);
+
+query TTTTT rowsort
+MERGE INTO stock s USING delivery d ON s.item = d.item WHEN MATCHED THEN UPDATE SET qty = s.qty + d.qty WHEN NOT MATCHED THEN INSERT VALUES (d.item, d.qty) RETURNING *;
+----
+apple	10	apple	15	a
+kiwi	7	kiwi	7	none
+pear	1	pear	1	p
+
+query TTT
+SELECT * FROM stock ORDER BY item;
+----
+apple	15	a
+kiwi	7	none
+pear	1	p
+plum	3	q
+
+query TTTT rowsort
+MERGE INTO stock s USING delivery d ON s.item = d.item WHEN MATCHED AND s.qty > 10 THEN UPDATE SET note = 'many' WHEN MATCHED THEN DELETE WHEN NOT MATCHED BY SOURCE THEN UPDATE SET note = 'no delivery' RETURNING s.item, s.qty, s.note, d.qty;
+----
+apple	15	many	10
+kiwi	7	none	7
+pear	1	p	1
+plum	3	no delivery	NULL
+
+query TTT
+SELECT * FROM stock ORDER BY item;
+----
+apple	15	many
+plum	3	no delivery
+
+query TT
+MERGE INTO stock USING (VALUES ('fig', 2), ('apple', 1)) AS v(item, n) ON stock.item = v.item WHEN NOT MATCHED THEN INSERT (item, qty, note) VALUES (v.item, v.n, DEFAULT) WHEN MATCHED THEN DO NOTHING RETURNING stock.item, stock.note;
+----
+fig	none
+
+query TT
+MERGE INTO stock USING (SELECT 'plum' AS item) src ON stock.item = src.item WHEN NOT MATCHED BY SOURCE AND stock.qty > 100 THEN DELETE WHEN NOT MATCHED BY SOURCE THEN DO NOTHING WHEN MATCHED THEN UPDATE SET qty = 30 RETURNING old.qty, new.qty;
+----
+3	30
+
+query TT
+MERGE INTO stock USING (SELECT 'fig' AS item) src ON stock.item = src.item WHEN MATCHED THEN DELETE RETURNING old.item, old.qty;
+----
+fig	2
+
+statement ok
+WITH d AS (SELECT 'lime' AS item, 4 AS qty) MERGE INTO stock USING d ON stock.item = d.item WHEN NOT MATCHED THEN INSERT (item, qty) VALUES (d.item, d.qty);
+
+statement ok
+MERGE INTO stock s USING delivery d ON false WHEN NOT MATCHED AND d.qty > 5 THEN DO NOTHING WHEN NOT MATCHED THEN INSERT (item, qty) VALUES (d.item || '2', d.qty);
+
+statement ok
+MERGE INTO stock USING (SELECT item FROM stock WHERE item LIKE '%2') dup ON stock.item = dup.item WHEN MATCHED THEN DELETE;
+
+query TTT
+SELECT * FROM stock ORDER BY item;
+----
+apple	15	many
+lime	4	none
+plum	30	no delivery
+
+statement ok
+INSERT INTO delivery VALUES ('apple', 1);
+
+statement error
+MERGE INTO stock s USING delivery d ON s.item = d.item WHEN MATCHED THEN UPDATE SET qty = d.qty;
+
+statement ok
+MERGE INTO stock s USING delivery d ON s.item = d.item WHEN MATCHED THEN DO NOTHING;
+
+statement ok
+MERGE INTO stock s USING (SELECT item, sum(qty) AS qty FROM delivery GROUP BY item) d ON s.item = d.item WHEN MATCHED THEN UPDATE SET qty = d.qty;
+
+query TTT
+SELECT * FROM stock ORDER BY item;
+----
+apple	11	many
+lime	4	none
+plum	30	no delivery
+
+statement error
+MERGE INTO stock USING stock ON true WHEN MATCHED THEN DELETE;
+
+statement error
+MERGE INTO stock s USING delivery d ON s.item = d.nosuch WHEN MATCHED THEN DELETE;
+
+statement error
+MERGE INTO stock s USING delivery d ON s.item = d.item WHEN MATCHED THEN UPDATE SET nosuch = 1;
+
+statement error
+MERGE INTO stock s USING delivery d ON s.item = d.item WHEN NOT MATCHED THEN INSERT (item, qty) VALUES (d.item);
+
+statement error
+MERGE INTO stock s USING delivery d ON s.item = d.item WHEN NOT MATCHED THEN INSERT VALUES (d.item, d.qty, 'n', 1);
+
+statement error
+MERGE INTO stock s USING delivery d ON s.item = d.item WHEN NOT MATCHED THEN INSERT (item) VALUES (s.item);
+
+statement error
+MERGE INTO stock s USING delivery d ON s.item = d.item WHEN NOT MATCHED BY SOURCE THEN UPDATE SET qty = d.qty;
+
+statement error
+MERGE INTO stock s USING delivery d ON s.item = d.item WHEN MATCHED THEN DELETE WHEN MATCHED THEN DO NOTHING;
+
+statement error
+MERGE INTO stock s USING delivery d ON s.item = d.item WHEN MATCHED THEN UPDATE SET qty = qty;
+
+statement error
+MERGE INTO stock s USING delivery d ON s.item = d.item WHEN MATCHED THEN INSERT VALUES ('x', 1);
+
+query TTT
+SELECT * FROM stock ORDER BY item;
+----
+apple	11	many
+lime	4	none
+plum	30	no delivery

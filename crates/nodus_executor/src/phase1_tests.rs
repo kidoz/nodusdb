@@ -137,6 +137,8 @@ fn test_offset_distinct_returning() {
                     right: Operand::Literal(Value::Text("2".into())),
                 })),
                 returning: vec!["id".into(), "val".into()],
+                table_alias: None,
+                from: None,
             },
         )
         .unwrap();

@@ -921,11 +921,26 @@ pub enum LogicalPlan {
         assignments: Vec<(String, ScalarExpr)>,
         filter: Option<FilterExpr>,
         returning: Vec<String>,
+        /// The name the target table goes by (`UPDATE t AS x`). Defaulted so
+        /// older plans decode.
+        #[serde(default)]
+        table_alias: Option<String>,
+        /// `FROM`: the relations joined to each target row, whose columns the
+        /// filter and assignments may read.
+        #[serde(default)]
+        from: Option<Box<LogicalPlan>>,
     },
     Delete {
         table_name: String,
         filter: Option<FilterExpr>,
         returning: Vec<String>,
+        /// The name the target table goes by (`DELETE FROM t AS x`).
+        #[serde(default)]
+        table_alias: Option<String>,
+        /// `USING`: the relations joined to each target row, whose columns
+        /// the filter may read.
+        #[serde(default)]
+        using: Option<Box<LogicalPlan>>,
     },
     Begin,
     Commit,
@@ -1015,6 +1030,61 @@ pub enum LogicalPlan {
         input: Box<LogicalPlan>,
         columns: Vec<String>,
     },
+    /// `MERGE INTO table USING source ON on WHEN ...`: each target row is
+    /// joined to the source rows `on` matches, and the first clause that
+    /// applies to each joined, unmatched source, or unmatched target row acts.
+    Merge {
+        table_name: String,
+        table_alias: Option<String>,
+        /// The source relation, read with its columns qualified.
+        source: Box<LogicalPlan>,
+        on: Option<FilterExpr>,
+        clauses: Vec<MergeClause>,
+        /// `RETURNING` columns of the inserted, updated, or deleted rows.
+        returning: Vec<String>,
+    },
+    /// A data-modifying statement (`body`) with a `WITH` list whose queries
+    /// it can read.
+    With {
+        ctes: Vec<(String, Box<LogicalPlan>)>,
+        body: Box<LogicalPlan>,
+    },
+}
+
+/// One `WHEN` clause of a `MERGE`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MergeClause {
+    pub kind: MergeKind,
+    /// `AND <condition>`, over the joined target and source columns.
+    pub condition: Option<FilterExpr>,
+    pub action: MergeAction,
+}
+
+/// Which rows of a `MERGE` join a `WHEN` clause applies to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MergeKind {
+    /// A target row joined to a source row.
+    Matched,
+    /// A target row no source row joins.
+    NotMatchedBySource,
+    /// A source row no target row joins.
+    NotMatchedByTarget,
+}
+
+/// What a `MERGE` clause does to its row.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum MergeAction {
+    /// `UPDATE SET ...`, evaluated against the joined row.
+    Update(Vec<(String, ScalarExpr)>),
+    Delete,
+    /// `INSERT [(columns)] VALUES (...)` of values computed from the source
+    /// row; a `None` value is `DEFAULT`. No columns and no values is
+    /// `INSERT DEFAULT VALUES`.
+    Insert {
+        columns: Vec<String>,
+        values: Vec<Option<ScalarExpr>>,
+    },
+    Nothing,
 }
 
 /// The kind of set operation combining two query results.
