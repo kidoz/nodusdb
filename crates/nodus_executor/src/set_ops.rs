@@ -23,7 +23,7 @@ impl MemExecutor {
                 Some(DeferredItem::Scalar(expr)) => {
                     type_hint =
                         type_hint.or_else(|| crate::result_types::constant_expr_type(&expr));
-                    let value = eval_scalar_expr(&expr, &[], &[]);
+                    let value = self.eval_expr(ctx, &expr, &[], &[]);
                     crate::eval_error::check()?;
                     value
                 }

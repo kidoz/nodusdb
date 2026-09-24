@@ -105,12 +105,16 @@ pub(crate) fn sqlstate_for_execution_error(err_str: &str) -> &'static str {
         || err_str == "lastval is not yet defined in this session"
     {
         "55000" // object_not_in_prerequisite_state
+    } else if err_str.starts_with("cannot use subquery in") {
+        "0A000" // feature_not_supported, worded as PostgreSQL words it
     } else if err_str.ends_with("is not a sequence")
         || err_str.ends_with("is not a table")
         || err_str.starts_with("FILTER specified, but")
     {
         "42809" // wrong_object_type
-    } else if err_str.starts_with("non-integer constant in") {
+    } else if err_str.starts_with("non-integer constant in")
+        || err_str == "VALUES lists must all be the same length"
+    {
         "42601" // syntax_error
     } else if err_str == "LIMIT must not be negative" || err_str == "FETCH must not be negative" {
         "2201W" // invalid_row_count_in_limit_clause

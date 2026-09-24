@@ -199,6 +199,21 @@ impl MemExecutor {
                 right,
             } => self.exec_set_op(ctx, op, all, left, right),
             LogicalPlan::TableFunction(spec) => self.exec_table_function(spec),
+            LogicalPlan::Values { rows } => self.exec_values(ctx, rows),
+            LogicalPlan::Renamed { input, columns } => {
+                let mut out = self.execute_logical_inner(ctx, *input)?;
+                if columns.len() > out.columns.len() {
+                    anyhow::bail!(
+                        "table has {} columns available but {} columns specified",
+                        out.columns.len(),
+                        columns.len()
+                    );
+                }
+                for (slot, name) in out.columns.iter_mut().zip(columns) {
+                    *slot = name;
+                }
+                Ok(out)
+            }
             LogicalPlan::InlineRows {
                 columns,
                 types,

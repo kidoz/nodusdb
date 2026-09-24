@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 mod aggregates;
 mod constraints;
+mod cte_scope;
 mod ddl;
 mod dml;
 mod eval_error;
@@ -36,6 +37,7 @@ mod session_env;
 mod session_vars;
 mod set_ops;
 mod streaming;
+mod subqueries;
 mod system_views;
 mod table_functions;
 mod transactions;
@@ -44,7 +46,7 @@ mod view_helpers;
 pub use plan_types::{
     AggregateOp, AlterTableOp, CompareOp, ConflictTarget, DeferredItem, FilterExpr, Join, JoinType,
     LogicalPlan, OnConflictClause, Operand, PatternKind, Predicate, ProjectionItem, ScalarBinaryOp,
-    ScalarExpr, ScalarUnaryOp, SetOpKind, SortKey, SortTarget, TableFnSpec,
+    ScalarExpr, ScalarUnaryOp, SetOpKind, SortKey, SortTarget, SubPlan, SubqueryKind, TableFnSpec,
 };
 pub use planner::{
     CopyOutputFormat, expr_to_value, parse_object_name, plan_copy_out, plan_statement,
@@ -886,6 +888,7 @@ impl Executor for MemExecutor {
             LogicalPlan::Select { .. }
                 | LogicalPlan::SelectLiteral { .. }
                 | LogicalPlan::SetOp { .. }
+                | LogicalPlan::Values { .. }
         );
         let mut implicit_txn = None;
 

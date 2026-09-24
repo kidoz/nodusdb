@@ -314,8 +314,8 @@ impl MemExecutor {
                 }
             }
             FilterExpr::ExprCmp { left, op, right } => {
-                let l = crate::eval_scalar_expr(left, row, col_names);
-                let r = crate::eval_scalar_expr(right, row, col_names);
+                let l = self.eval_expr(ctx, left, row, col_names);
+                let r = self.eval_expr(ctx, right, row, col_names);
                 if l == Value::Null || r == Value::Null {
                     return None;
                 }
@@ -339,7 +339,7 @@ impl MemExecutor {
                 let exists = !self.run_subquery(ctx, correlated)?.rows.is_empty();
                 Some(if *negated { !exists } else { exists })
             }
-            FilterExpr::Scalar(e) => match crate::eval_scalar_expr(e, row, col_names) {
+            FilterExpr::Scalar(e) => match self.eval_expr(ctx, e, row, col_names) {
                 Value::Bool(b) => Some(b),
                 _ => None,
             },
@@ -349,7 +349,7 @@ impl MemExecutor {
                 subquery,
                 all,
             } => {
-                let left = crate::eval_scalar_expr(left, row, col_names);
+                let left = self.eval_expr(ctx, left, row, col_names);
                 let correlated = self.correlate_subplan(subquery, row, col_names);
                 let out = self.run_subquery(ctx, correlated)?;
                 let values = out
@@ -403,46 +403,7 @@ impl MemExecutor {
         outer_row: &[Value],
         outer_cols: &[String],
     ) -> LogicalPlan {
-        let mut p = plan.clone();
-        if let LogicalPlan::Select {
-            table_name,
-            table_alias,
-            joins,
-            filter,
-            projection,
-            ..
-        } = &mut p
-        {
-            // The subquery's own tables, by the names that reach them: an alias
-            // hides the table name, so `FROM t i WHERE i.id = t.id` reads
-            // `t.id` from the outer query.
-            let mut quals: Vec<String> = Vec::new();
-            let mut add_inner = |name: &str, alias: Option<&String>| match alias {
-                Some(a) => quals.push(a.to_lowercase()),
-                None => {
-                    quals.push(name.to_lowercase());
-                    if let Some(last) = name.rsplit('.').next() {
-                        quals.push(last.to_lowercase());
-                    }
-                }
-            };
-            add_inner(table_name, table_alias.as_ref());
-            // Joined tables (and their aliases) are inner too.
-            for j in joins.iter() {
-                add_inner(&j.table_name, j.table_alias.as_ref());
-            }
-            if let Some(f) = filter.as_ref() {
-                *filter = Some(correlate_filter(f, outer_row, outer_cols, &quals));
-            }
-            // Outer references can also appear in the projection
-            // (e.g. `SELECT upper.f1 + f2 FROM t WHERE ...`).
-            for item in projection.iter_mut() {
-                if let crate::ProjectionItem::Expr { expr, .. } = item {
-                    *expr = correlate_scalar(expr, outer_row, outer_cols, &quals);
-                }
-            }
-        }
-        p
+        correlate_plan(plan, outer_row, outer_cols, &[])
     }
 
     pub(crate) fn row_matches(
@@ -474,20 +435,136 @@ fn flip_op(op: &CompareOp) -> CompareOp {
 /// table/alias — i.e. it references an outer (correlated) column. Bare names
 /// are treated as inner references.
 fn is_outer_ref(name: &str, inner_quals: &[String]) -> bool {
-    match name.split_once('.') {
-        Some((qual, _)) => !inner_quals.iter().any(|q| q == &qual.to_lowercase()),
+    match name.rsplit_once('.') {
+        Some((qual, _)) => {
+            let qual = qual.to_lowercase();
+            let table = qual.rsplit('.').next().unwrap_or(&qual);
+            !inner_quals.iter().any(|q| *q == qual || q == table)
+        }
         None => false,
     }
 }
 
-/// Resolves a (possibly qualified) outer column reference to its value in the
-/// outer row, matching on the bare column name or a `table.col` suffix.
+/// Resolves a qualified outer column reference to its value in the outer row.
 fn outer_lookup(name: &str, outer_cols: &[String], outer_row: &[Value]) -> Option<Value> {
-    let bare = name.rsplit('.').next().unwrap_or(name);
-    let idx = outer_cols
-        .iter()
-        .position(|c| c == bare || c.ends_with(&format!(".{bare}")))?;
-    outer_row.get(idx).cloned()
+    col_pos(outer_cols, name).and_then(|idx| outer_row.get(idx).cloned())
+}
+
+/// Rewrites a subquery's plan for one outer row: every reference to a column
+/// of an enclosing query (a qualifier none of the subquery's own relations —
+/// or those of the queries between — answers to) becomes that row's value,
+/// in its conditions, select list, joins, grouping, ordering, and nested
+/// subqueries.
+fn correlate_plan(
+    plan: &LogicalPlan,
+    outer_row: &[Value],
+    outer_cols: &[String],
+    enclosing_quals: &[String],
+) -> LogicalPlan {
+    let mut p = plan.clone();
+    match &mut p {
+        LogicalPlan::Select {
+            ctes,
+            table_name,
+            table_alias,
+            joins,
+            filter,
+            projection,
+            having,
+            sort,
+            group_exprs,
+            ..
+        } => {
+            // The subquery's own relations, by the names that reach them: an
+            // alias hides the table name, so `FROM t i WHERE i.id = t.id` reads
+            // `t.id` from the outer query.
+            let mut quals: Vec<String> = enclosing_quals.to_vec();
+            let mut add_inner = |name: &str, alias: Option<&String>| match alias {
+                Some(a) => quals.push(a.to_lowercase()),
+                None => {
+                    quals.push(name.to_lowercase());
+                    if let Some(last) = name.rsplit('.').next() {
+                        quals.push(last.to_lowercase());
+                    }
+                }
+            };
+            add_inner(table_name, table_alias.as_ref());
+            for j in joins.iter() {
+                add_inner(&j.table_name, j.table_alias.as_ref());
+            }
+            let scalar = |e: &crate::ScalarExpr| correlate_scalar(e, outer_row, outer_cols, &quals);
+            let cond = |f: &FilterExpr| correlate_filter(f, outer_row, outer_cols, &quals);
+            for (_, cte) in ctes.iter_mut() {
+                **cte = correlate_plan(cte, outer_row, outer_cols, &quals);
+            }
+            if let Some(f) = filter.as_mut() {
+                *f = cond(f);
+            }
+            if let Some(h) = having.as_mut() {
+                *h = cond(h);
+            }
+            for j in joins.iter_mut() {
+                if let Some(c) = j.condition.as_mut() {
+                    *c = cond(c);
+                }
+                if let Some(lateral) = j.lateral.as_mut() {
+                    **lateral = correlate_plan(lateral, outer_row, outer_cols, &quals);
+                }
+            }
+            for item in projection.iter_mut() {
+                // `SELECT outer.col ...`: the outer row's value.
+                let outer_column = match &*item {
+                    crate::ProjectionItem::Column(c) if is_outer_ref(c, &quals) => {
+                        Some((c.clone(), c.rsplit('.').next().unwrap_or(c).to_string()))
+                    }
+                    crate::ProjectionItem::AliasedColumn(c, a) if is_outer_ref(c, &quals) => {
+                        Some((c.clone(), a.clone()))
+                    }
+                    _ => None,
+                };
+                if let Some((column, name)) = outer_column {
+                    if let Some(v) = outer_lookup(&column, outer_cols, outer_row) {
+                        *item = crate::ProjectionItem::Expr {
+                            expr: crate::ScalarExpr::Literal(v),
+                            alias: Some(name),
+                        };
+                    }
+                    continue;
+                }
+                match item {
+                    crate::ProjectionItem::Expr { expr, .. } => *expr = scalar(expr),
+                    crate::ProjectionItem::Subquery { plan, .. } => {
+                        **plan = correlate_plan(plan, outer_row, outer_cols, &quals);
+                    }
+                    _ => {}
+                }
+            }
+            for key in sort.iter_mut() {
+                if let crate::SortTarget::Expr(e) = &mut key.target {
+                    *e = scalar(e);
+                }
+            }
+            for (_, e) in group_exprs.iter_mut() {
+                *e = scalar(e);
+            }
+        }
+        LogicalPlan::SetOp { left, right, .. } => {
+            **left = correlate_plan(left, outer_row, outer_cols, enclosing_quals);
+            **right = correlate_plan(right, outer_row, outer_cols, enclosing_quals);
+        }
+        LogicalPlan::Renamed { input, .. } => {
+            **input = correlate_plan(input, outer_row, outer_cols, enclosing_quals);
+        }
+        LogicalPlan::Values { rows } => {
+            for row in rows.iter_mut() {
+                for e in row.iter_mut() {
+                    *e = correlate_scalar(e, outer_row, outer_cols, enclosing_quals);
+                }
+            }
+        }
+        _ => {}
+    }
+    p
 }
 
 /// Rewrites a scalar expression, replacing correlated outer column references
@@ -505,6 +582,15 @@ fn correlate_scalar(
                 None => expr.clone(),
             }
         }
+        crate::ScalarExpr::Subquery { plan, kind } => crate::ScalarExpr::Subquery {
+            plan: crate::SubPlan(Box::new(correlate_plan(
+                &plan.0,
+                outer_row,
+                outer_cols,
+                inner_quals,
+            ))),
+            kind: *kind,
+        },
         _ => expr.map_children(&mut |e| correlate_scalar(e, outer_row, outer_cols, inner_quals)),
     }
 }
@@ -537,21 +623,68 @@ fn correlate_filter(
             }
             // Outer reference on the left with an inner column on the right:
             // swap sides so the inner column stays comparable, flipping the op.
-            if is_outer_ref(&p.left, inner_quals) {
-                if let (Some(v), Operand::Ident(rn)) =
-                    (outer_lookup(&p.left, outer_cols, outer_row), &p.right)
-                {
-                    if !is_outer_ref(rn, inner_quals) {
+            if is_outer_ref(&p.left, inner_quals)
+                && let Some(v) = outer_lookup(&p.left, outer_cols, outer_row)
+            {
+                match &p.right {
+                    Operand::Ident(rn) if !is_outer_ref(rn, inner_quals) => {
                         return FilterExpr::Predicate(Predicate {
                             left: rn.clone(),
                             op: flip_op(&p.op),
                             right: Operand::Literal(v),
                         });
                     }
+                    // `outer.col <op> constant`: the same for every inner row.
+                    Operand::Literal(right) => {
+                        return FilterExpr::ExprCmp {
+                            left: crate::ScalarExpr::Literal(v),
+                            op: p.op.clone(),
+                            right: crate::ScalarExpr::Literal(right.clone()),
+                        };
+                    }
+                    _ => {}
                 }
             }
             f.clone()
         }
+        FilterExpr::IsNull(c) | FilterExpr::IsNotNull(c) if is_outer_ref(c, inner_quals) => {
+            match outer_lookup(c, outer_cols, outer_row) {
+                Some(v) => FilterExpr::Scalar(crate::ScalarExpr::IsNull {
+                    expr: Box::new(crate::ScalarExpr::Literal(v)),
+                    negated: matches!(f, FilterExpr::IsNotNull(_)),
+                }),
+                None => f.clone(),
+            }
+        }
+        FilterExpr::InSubquery {
+            left,
+            subquery,
+            negated,
+            left_value,
+        } => {
+            let outer_left = (!left.is_empty() && is_outer_ref(left, inner_quals))
+                .then(|| outer_lookup(left, outer_cols, outer_row))
+                .flatten();
+            FilterExpr::InSubquery {
+                left: if outer_left.is_some() {
+                    String::new()
+                } else {
+                    left.clone()
+                },
+                subquery: Box::new(correlate_plan(subquery, outer_row, outer_cols, inner_quals)),
+                negated: *negated,
+                left_value: outer_left.or_else(|| left_value.clone()),
+            }
+        }
+        FilterExpr::Exists { subquery, negated } => FilterExpr::Exists {
+            subquery: Box::new(correlate_plan(subquery, outer_row, outer_cols, inner_quals)),
+            negated: *negated,
+        },
+        FilterExpr::CompareSubquery { left, op, subquery } => FilterExpr::CompareSubquery {
+            left: left.clone(),
+            op: op.clone(),
+            subquery: Box::new(correlate_plan(subquery, outer_row, outer_cols, inner_quals)),
+        },
         FilterExpr::InList {
             left,
             list,
@@ -590,11 +723,9 @@ fn correlate_filter(
         } => FilterExpr::QuantifiedSubquery {
             left: correlate_scalar(left, outer_row, outer_cols, inner_quals),
             op: *op,
-            subquery: subquery.clone(),
+            subquery: Box::new(correlate_plan(subquery, outer_row, outer_cols, inner_quals)),
             all: *all,
         },
-        // Nested subquery predicates and null checks pass through: nested
-        // correlation is not resolved here.
         other => other.clone(),
     }
 }

@@ -42,16 +42,22 @@ impl MemExecutor {
             if guard > 10_000 {
                 anyhow::bail!("WITH RECURSIVE did not terminate within 10000 iterations");
             }
-            // Feed the working table into the recursive term under the CTE name.
-            let mut term = recursive_term.clone();
-            inject_inline_cte(
-                &mut term,
+            // The recursive term reads the working table under the CTE name,
+            // wherever in the term it refers to it.
+            let _working = crate::cte_scope::bind(
                 name,
-                columns.clone(),
-                types.clone(),
-                working.clone(),
+                QueryOutput {
+                    columns: columns.clone(),
+                    types: types.clone(),
+                    rows: working
+                        .iter()
+                        .cloned()
+                        .map(|values| Row { values })
+                        .collect(),
+                    tag: String::new(),
+                },
             );
-            let iter = self.execute_logical_inner(ctx, term)?;
+            let iter = self.execute_logical_inner(ctx, recursive_term.clone())?;
 
             let mut new_rows: Vec<Vec<Value>> = Vec::new();
             for r in iter.rows {
@@ -112,7 +118,9 @@ impl MemExecutor {
             });
         }
 
-        let mut cte_results = std::collections::HashMap::new();
+        // Each CTE is visible to the rest of this query, including later CTEs
+        // and nested subqueries, until the query finishes.
+        let mut _cte_bindings = Vec::with_capacity(ctes.len());
         for (name, cte_plan) in ctes {
             let out = match *cte_plan {
                 LogicalPlan::RecursiveCte {
@@ -130,7 +138,7 @@ impl MemExecutor {
                 )?,
                 other => self.execute_logical_inner(ctx, other)?,
             };
-            cte_results.insert(name, out);
+            _cte_bindings.push(crate::cte_scope::bind(&name, out));
         }
 
         // LIMIT/OFFSET push-down: when the pipeline is a plain row-by-row scan of
@@ -165,7 +173,7 @@ impl MemExecutor {
         // leniently selecting catalog columns that may not all be materialized.
         let mut query_has_virtual = false;
         let (tbl_cols, mut col_names, mut stored_rows) = if let Some(cte_out) =
-            cte_results.get(&table_name)
+            crate::cte_scope::lookup(&table_name)
         {
             let mut cols = Vec::new();
             for (i, c) in cte_out.columns.iter().enumerate() {
@@ -265,7 +273,9 @@ impl MemExecutor {
                     None => {
                         if let Some(vq) = &tbl.view_query {
                             let plan: LogicalPlan = serde_json::from_str(vq)?;
-                            let out = self.execute_logical_inner(ctx, plan)?;
+                            let out = crate::cte_scope::isolated(|| {
+                                self.execute_logical_inner(ctx, plan)
+                            })?;
                             out.rows.iter().map(|r| r.values.clone()).collect()
                         } else if let Some(cap) = scan_cap {
                             // Bounded prefix scan; falls back to a full scan if the
@@ -288,6 +298,93 @@ impl MemExecutor {
         let mut stored_rows = stored_rows.unwrap();
 
         for join in &joins {
+            // A LATERAL subquery runs for each left row, with that row's values
+            // for its outer references; its rows join that row.
+            if let Some(plan) = &join.lateral {
+                let prefix = join
+                    .table_alias
+                    .clone()
+                    .unwrap_or_else(|| join.table_name.clone());
+                let per_row: Vec<QueryOutput> = stored_rows
+                    .iter()
+                    .map(|r1| {
+                        self.execute_logical_inner(
+                            ctx,
+                            self.correlate_subplan(plan, r1, &col_names),
+                        )
+                    })
+                    .collect::<Result<_>>()?;
+                // The subquery's columns, even when there is no left row.
+                let header = match per_row.first() {
+                    Some(out) => (out.columns.clone(), out.types.clone()),
+                    None => {
+                        let nulls = vec![Value::Null; col_names.len()];
+                        let out = self.execute_logical_inner(
+                            ctx,
+                            self.correlate_subplan(plan, &nulls, &col_names),
+                        )?;
+                        (out.columns, out.types)
+                    }
+                };
+                let now = Utc::now();
+                let lateral_cols: Vec<ColumnDescriptor> = header
+                    .0
+                    .iter()
+                    .zip(
+                        header
+                            .1
+                            .iter()
+                            .chain(std::iter::repeat(&"VARCHAR".to_string())),
+                    )
+                    .map(|(name, ty)| ColumnDescriptor {
+                        id: nodus_catalog::ColumnId::new(),
+                        name: name.clone(),
+                        version: 1,
+                        created_at: now,
+                        updated_at: now,
+                        state: DescriptorState::Public,
+                        data_type: ty.clone(),
+                        nullable: true,
+                        default_expr: None,
+                    })
+                    .collect();
+                let mut combined_cols = col_names.clone();
+                combined_cols.extend(header.0.iter().map(|n| format!("{prefix}.{n}")));
+                let mut combined_desc = joined_columns.clone();
+                combined_desc.extend(lateral_cols);
+                let width = header.0.len();
+                let keep_unmatched = matches!(join.join_type, JoinType::LeftOuter);
+                let mut next_rows = Vec::new();
+                for (r1, out) in stored_rows.iter().zip(per_row) {
+                    let mut matched = false;
+                    for r2 in out.rows {
+                        let mut combined = r1.clone();
+                        combined.extend(r2.values);
+                        let is_match = self
+                            .eval_filter(
+                                ctx,
+                                &combined,
+                                &combined_cols,
+                                &combined_desc,
+                                join.condition.as_ref(),
+                            )
+                            .unwrap_or(false);
+                        if is_match {
+                            next_rows.push(combined);
+                            matched = true;
+                        }
+                    }
+                    if !matched && keep_unmatched {
+                        let mut combined = r1.clone();
+                        combined.extend(std::iter::repeat_n(Value::Null, width));
+                        next_rows.push(combined);
+                    }
+                }
+                stored_rows = next_rows;
+                col_names = combined_cols;
+                joined_columns = combined_desc;
+                continue;
+            }
             // Lateral (or standalone) table function: its rows are produced per
             // driving row, so they can't be materialized once. Evaluate against
             // each left row and append the function's columns. A driving row whose
@@ -346,7 +443,8 @@ impl MemExecutor {
                 continue;
             }
 
-            let (j_cols, j_rows) = if let Some(cte_out) = cte_results.get(&join.table_name) {
+            let (j_cols, j_rows) = if let Some(cte_out) = crate::cte_scope::lookup(&join.table_name)
+            {
                 let mut cols = Vec::new();
                 for (i, c) in cte_out.columns.iter().enumerate() {
                     let ty = cte_out
@@ -388,7 +486,8 @@ impl MemExecutor {
                     self.authorize(ctx, Action::Select, ResourceRef::Table(j_tbl.id))?;
                     let j_rows = if let Some(vq) = &j_tbl.view_query {
                         let plan: LogicalPlan = serde_json::from_str(vq)?;
-                        let out = self.execute_logical_inner(ctx, plan)?;
+                        let out =
+                            crate::cte_scope::isolated(|| self.execute_logical_inner(ctx, plan))?;
                         out.rows.iter().map(|r| r.values.clone()).collect()
                     } else {
                         self.scan_rows(j_tbl.id, &ctx.session_id)?
@@ -541,7 +640,7 @@ impl MemExecutor {
                 continue;
             }
             for row in stored_rows.iter_mut() {
-                let value = eval_scalar_expr(expr, row, &col_names);
+                let value = self.eval_expr(ctx, expr, row, &col_names);
                 row.push(value);
             }
             col_names.push(name.clone());
@@ -617,7 +716,15 @@ impl MemExecutor {
                 for (_k, group_rows) in groups {
                     // HAVING filters whole groups after aggregation.
                     if let Some(h) = having.as_ref() {
-                        if !eval_having(h, &group_rows, &col_names) {
+                        // A subquery in HAVING reads the group's first row.
+                        let rep = group_rows.first().map(Vec::as_slice).unwrap_or(&[]);
+                        let resolved = match h {
+                            FilterExpr::Scalar(e) if crate::subqueries::contains_subquery(e) => {
+                                FilterExpr::Scalar(self.resolve_subqueries(ctx, e, rep, &col_names))
+                            }
+                            other => other.clone(),
+                        };
+                        if !eval_having(&resolved, &group_rows, &col_names) {
                             continue;
                         }
                     }
@@ -667,11 +774,7 @@ impl MemExecutor {
                             ProjectionItem::Expr { expr, .. } => {
                                 // Group-aware eval: aggregates compute over the group,
                                 // plain columns read the group's first row.
-                                out_row.push(eval_scalar_expr_grouped(
-                                    expr,
-                                    &group_rows,
-                                    &col_names,
-                                ));
+                                out_row.push(self.eval_grouped(ctx, expr, &group_rows, &col_names));
                             }
                         }
                     }
@@ -681,7 +784,7 @@ impl MemExecutor {
                             .iter()
                             .map(|target| match target {
                                 SortTarget::Expr(e) => {
-                                    eval_scalar_expr_grouped(e, &group_rows, &col_names)
+                                    self.eval_grouped(ctx, e, &group_rows, &col_names)
                                 }
                                 _ => Value::Null,
                             })
@@ -1139,7 +1242,7 @@ impl MemExecutor {
                         // `indices` step resolves back by name below.
                         let vals: Vec<Value> = stored_rows
                             .iter()
-                            .map(|row| eval_scalar_expr(expr, row, &col_names))
+                            .map(|row| self.eval_expr(ctx, expr, row, &col_names))
                             .collect();
                         for (row, v) in stored_rows.iter_mut().zip(vals) {
                             row.push(v);
@@ -1203,7 +1306,7 @@ impl MemExecutor {
                         key_targets
                             .iter()
                             .map(|target| match target {
-                                SortTarget::Expr(e) => eval_scalar_expr(e, row, &col_names),
+                                SortTarget::Expr(e) => self.eval_expr(ctx, e, row, &col_names),
                                 _ => Value::Null,
                             })
                             .collect()
@@ -1518,37 +1621,9 @@ impl MemExecutor {
     }
 }
 
-/// Groups partition-then-order-sorted row indices into per-partition runs,
-/// used by LAG/LEAD and aggregate window functions.
-/// Injects a pre-computed relation as a CTE named `name` into a Select plan
-/// (replacing any existing CTE of that name), so the plan's FROM/join resolves
-/// the name to these rows. Used to feed a recursive term its working table.
-fn inject_inline_cte(
-    plan: &mut LogicalPlan,
-    name: &str,
-    columns: Vec<String>,
-    types: Vec<String>,
-    rows: Vec<Vec<Value>>,
-) {
-    if let LogicalPlan::Select { ctes, .. } = plan {
-        ctes.retain(|(n, _)| n != name);
-        ctes.insert(
-            0,
-            (
-                name.to_string(),
-                Box::new(LogicalPlan::InlineRows {
-                    columns,
-                    types,
-                    rows,
-                }),
-            ),
-        );
-    }
-}
-
 /// Compares two cells for an ORDER BY key, honouring the ascending flag and an
 /// optional explicit `NULLS FIRST`/`NULLS LAST` override. With no override the
-/// default matches PostgreSQL: NULLs sort first on ASC and last on DESC.
+/// default matches PostgreSQL: NULLs sort last on ASC and first on DESC.
 pub(crate) fn order_cmp(
     a: &Value,
     b: &Value,

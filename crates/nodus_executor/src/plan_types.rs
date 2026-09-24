@@ -137,6 +137,11 @@ pub struct Join {
     /// both inputs, also resolved at execution time.
     #[serde(default)]
     pub natural: bool,
+    /// A `LATERAL` subquery: run once for each row of the left side, with that
+    /// row's values for its outer references. Its rows are this join's right
+    /// side for that left row.
+    #[serde(default)]
+    pub lateral: Option<Box<LogicalPlan>>,
 }
 
 /// The unique key an `ON CONFLICT` clause arbitrates on.
@@ -348,13 +353,45 @@ pub enum ScalarExpr {
     /// A row constructor `(a, b, ...)` / `ROW(a, b, ...)`, compared
     /// element-wise by the comparison operators.
     Row(Vec<ScalarExpr>),
+    /// A subquery used as a value. The executor runs it for each row (with the
+    /// row's values for its outer references) before the expression is
+    /// evaluated; see [`SubqueryKind`].
+    Subquery {
+        plan: SubPlan,
+        kind: SubqueryKind,
+    },
+}
+
+/// What a subquery in an expression yields.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum SubqueryKind {
+    /// `(SELECT ...)`: its one value; NULL for no row, an error for several.
+    Scalar,
+    /// `EXISTS (SELECT ...)`: whether it returns a row.
+    Exists,
+    /// Its first column's values, as an array: `x IN (SELECT ...)`,
+    /// `x = ANY (SELECT ...)`, and `ARRAY(SELECT ...)`.
+    Array,
+}
+
+/// A subquery's plan inside an expression. Plans have no equality of their
+/// own; two are equal when they serialize alike.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubPlan(pub Box<LogicalPlan>);
+
+impl PartialEq for SubPlan {
+    fn eq(&self, other: &Self) -> bool {
+        serde_json::to_string(&self.0).ok() == serde_json::to_string(&other.0).ok()
+    }
 }
 
 impl ScalarExpr {
     /// The immediate sub-expressions, in evaluation order.
     pub fn children(&self) -> Vec<&ScalarExpr> {
         match self {
-            ScalarExpr::Literal(_) | ScalarExpr::Column(_) => Vec::new(),
+            ScalarExpr::Literal(_) | ScalarExpr::Column(_) | ScalarExpr::Subquery { .. } => {
+                Vec::new()
+            }
             ScalarExpr::Unary { expr, .. }
             | ScalarExpr::Cast { expr, .. }
             | ScalarExpr::IsNull { expr, .. }
@@ -402,7 +439,9 @@ impl ScalarExpr {
     pub fn map_children(&self, f: &mut dyn FnMut(&ScalarExpr) -> ScalarExpr) -> ScalarExpr {
         let mut boxed = |e: &ScalarExpr| Box::new(f(e));
         match self {
-            ScalarExpr::Literal(_) | ScalarExpr::Column(_) => self.clone(),
+            ScalarExpr::Literal(_) | ScalarExpr::Column(_) | ScalarExpr::Subquery { .. } => {
+                self.clone()
+            }
             ScalarExpr::Unary { op, expr } => ScalarExpr::Unary {
                 op: *op,
                 expr: boxed(expr),
@@ -964,6 +1003,17 @@ pub enum LogicalPlan {
     DropSequence {
         names: Vec<String>,
         if_exists: bool,
+    },
+    /// A `VALUES` list used as a query: its rows' expressions are evaluated
+    /// when it runs, into columns `column1`, `column2`, ...
+    Values {
+        rows: Vec<Vec<ScalarExpr>>,
+    },
+    /// `input` with its leading columns renamed, for a column alias list
+    /// (`FROM (...) AS t(a, b)`, `WITH x(a, b) AS (...)`).
+    Renamed {
+        input: Box<LogicalPlan>,
+        columns: Vec<String>,
     },
 }
 

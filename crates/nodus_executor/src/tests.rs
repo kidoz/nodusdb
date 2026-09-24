@@ -729,6 +729,7 @@ fn test_join_execution() {
                 right: Operand::Ident("authors.id".into()),
             })),
             join_type: JoinType::Inner,
+            lateral: None,
             using_columns: vec![],
             natural: false,
             table_fn: None,

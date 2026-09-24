@@ -1,0 +1,280 @@
+# Subqueries in expressions, CTE scope, VALUES lists, LATERAL joins, and
+# column references. Expected results come from PostgreSQL 18.
+statement ok
+CREATE TABLE a4 (id INT PRIMARY KEY, v TEXT, n INT);
+
+statement ok
+CREATE TABLE b4 (id INT PRIMARY KEY, a_id INT, w TEXT);
+
+statement ok
+CREATE TABLE c4 (id INT PRIMARY KEY, b_id INT, tag TEXT);
+
+statement ok
+INSERT INTO a4 VALUES (1, 'x', 10), (2, 'y', 20), (3, 'z', 30);
+
+statement ok
+INSERT INTO b4 VALUES (1, 1, 'p'), (2, 2, 'q'), (3, 1, 'r');
+
+statement ok
+INSERT INTO c4 VALUES (1, 1, 't1'), (2, 3, 't3');
+
+# VALUES lists as queries and as relations, with column aliases.
+query TT
+VALUES (1, 'one'), (2, 'two');
+----
+1	one
+2	two
+
+query T
+VALUES (1), (2.5), (NULL) ORDER BY 1;
+----
+1
+2.5
+NULL
+
+query TT
+SELECT * FROM (VALUES (1, 'a'), (2, 'b')) t(id, v) ORDER BY id;
+----
+1	a
+2	b
+
+query TT
+SELECT column1, column2 FROM (VALUES (1, 'a'), (2, 'b')) t ORDER BY 1;
+----
+1	a
+2	b
+
+query TT
+SELECT a4.id, t.label FROM a4 JOIN (VALUES (1, 'one'), (2, 'two')) t(id, label) ON t.id = a4.id ORDER BY 1;
+----
+1	one
+2	two
+
+query TT
+SELECT x, y FROM (SELECT 1, 2) s(x, y);
+----
+1	2
+
+query TT
+SELECT * FROM (VALUES (1 + 1, upper('a'))) t(n, s);
+----
+2	A
+
+# CTEs are visible to every part of their query.
+query T
+WITH x(k) AS (SELECT 1) SELECT k FROM x UNION ALL SELECT 2 ORDER BY 1;
+----
+1
+2
+
+query TTT
+WITH x AS (SELECT id FROM a4 WHERE n > 10) SELECT * FROM b4 WHERE a_id IN (SELECT id FROM x) ORDER BY id;
+----
+2	2	q
+
+query T
+WITH x AS (SELECT id FROM a4), y AS (SELECT id * 10 AS t FROM x) SELECT t FROM y ORDER BY t;
+----
+10
+20
+30
+
+query T
+WITH x AS (SELECT 1 AS k) SELECT (SELECT k FROM x) + 1;
+----
+2
+
+query TT
+WITH RECURSIVE r(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM r WHERE i < 3) SELECT (SELECT count(*) FROM r), (SELECT max(i) FROM r WHERE i IN (SELECT i FROM r));
+----
+3	3
+
+query T
+WITH a4 AS (SELECT 99 AS id) SELECT id FROM a4;
+----
+99
+
+query T
+WITH x AS (SELECT 1 AS k) SELECT k FROM x ORDER BY k LIMIT 1;
+----
+1
+
+# LATERAL subqueries run once per left row.
+query TTTT
+SELECT * FROM a4, LATERAL (SELECT count(*) FROM b4 WHERE b4.a_id = a4.id) c ORDER BY a4.id;
+----
+1	x	10	2
+2	y	20	1
+3	z	30	0
+
+query TT
+SELECT a4.id, c.w FROM a4 LEFT JOIN LATERAL (SELECT w FROM b4 WHERE b4.a_id = a4.id ORDER BY w LIMIT 1) c ON true ORDER BY a4.id;
+----
+1	p
+2	q
+3	NULL
+
+query TT
+SELECT a4.id, c.w FROM a4 CROSS JOIN LATERAL (SELECT w FROM b4 WHERE b4.a_id = a4.id) c ORDER BY 1, 2;
+----
+1	p
+1	r
+2	q
+
+query TT
+SELECT a4.id, c.w FROM a4 JOIN LATERAL (SELECT w FROM b4 WHERE b4.a_id = a4.id) c ON c.w > 'p' ORDER BY 1, 2;
+----
+1	r
+2	q
+
+# Subqueries anywhere a value can go, correlated or not.
+query TT
+SELECT a4.id, (SELECT string_agg(w, ',' ORDER BY w) FROM b4 WHERE b4.a_id = a4.id) FROM a4 ORDER BY 1;
+----
+1	p,r
+2	q
+3	NULL
+
+query T
+SELECT coalesce((SELECT max(n) FROM a4), 0) + 1;
+----
+31
+
+query T
+SELECT EXISTS (SELECT 1 FROM b4 WHERE b4.a_id = a4.id) FROM a4 ORDER BY id;
+----
+t
+t
+f
+
+query TTTT
+SELECT id, n > ALL (SELECT n FROM a4 WHERE id < 3), id IN (SELECT a_id FROM b4), id NOT IN (SELECT a_id FROM b4) FROM a4 ORDER BY id;
+----
+1	f	t	f
+2	f	t	f
+3	t	f	t
+
+query T
+SELECT id FROM a4 WHERE coalesce((SELECT max(id) FROM b4 WHERE b4.a_id = a4.id), 0) > 1 ORDER BY id;
+----
+1
+2
+
+query T
+SELECT id FROM a4 WHERE EXISTS (SELECT 1 FROM b4 WHERE b4.a_id = a4.id) AND n > (SELECT min(n) FROM a4) ORDER BY id;
+----
+2
+
+query TT
+SELECT ARRAY(SELECT w FROM b4 ORDER BY w), ARRAY(SELECT id FROM b4 WHERE false);
+----
+{p,q,r}	{}
+
+query TT
+SELECT a4.id, count(*) FROM a4 JOIN b4 ON b4.a_id = a4.id GROUP BY a4.id HAVING count(*) > (SELECT count(*) FROM b4 WHERE w = 'q') ORDER BY 1;
+----
+1	2
+
+query T
+SELECT id FROM a4 ORDER BY (SELECT count(*) FROM b4 WHERE b4.a_id = a4.id) DESC, id;
+----
+1
+2
+3
+
+query T
+SELECT id FROM a4 WHERE id IN (SELECT a4.id FROM b4 WHERE b4.a_id = a4.id) ORDER BY id;
+----
+1
+2
+
+query TT
+SELECT id, (SELECT a4.v FROM b4 WHERE b4.id = 1) FROM a4 ORDER BY id;
+----
+1	x
+2	y
+3	z
+
+query T
+SELECT id FROM a4 WHERE EXISTS (SELECT 1 FROM b4 WHERE b4.a_id = a4.id AND EXISTS (SELECT 1 FROM c4 WHERE c4.b_id = b4.id AND a4.n = 10)) ORDER BY id;
+----
+1
+
+query T
+SELECT id FROM a4 WHERE (SELECT count(*) FROM b4 WHERE b4.a_id = a4.id AND a4.n > 15) > 0 ORDER BY id;
+----
+2
+
+query T
+SELECT id FROM a4 WHERE EXISTS (SELECT 1 FROM b4 WHERE a4.n = 20) ORDER BY id;
+----
+2
+
+statement ok
+UPDATE a4 SET n = (SELECT count(*) FROM b4 WHERE b4.a_id = a4.id);
+
+query TT
+SELECT id, n FROM a4 ORDER BY id;
+----
+1	2
+2	1
+3	0
+
+query TT
+UPDATE a4 SET n = n + (SELECT max(id) FROM b4) WHERE id = 1 RETURNING id, n;
+----
+1	5
+
+query T
+INSERT INTO a4 SELECT id + 100, w, 0 FROM b4 WHERE id = 1 RETURNING id;
+----
+101
+
+query T
+DELETE FROM a4 WHERE id > 100 RETURNING id;
+----
+101
+
+# Every FROM item's joins apply.
+query TTT
+SELECT a4.id, b4.id, c4.tag FROM a4, b4 JOIN c4 ON c4.b_id = b4.id WHERE b4.a_id = a4.id ORDER BY 1, 2;
+----
+1	1	t1
+1	3	t3
+
+# Subquery errors.
+statement error
+SELECT (SELECT id FROM b4);
+
+statement error
+SELECT (SELECT id, w FROM b4 LIMIT 1);
+
+statement error
+SELECT id FROM a4 WHERE n = (SELECT n FROM a4);
+
+statement error
+SELECT * FROM (SELECT 1, 2) s(x, y, z);
+
+query T
+SELECT * FROM (SELECT 1) UNION ALL SELECT * FROM (SELECT 2) ORDER BY 1;
+----
+1
+2
+
+statement error
+VALUES (1), (1, 2);
+
+statement error
+CREATE TABLE ch (x INT CHECK (x > (SELECT 1)));
+
+statement error
+CREATE TABLE dv (x INT DEFAULT (SELECT 1));
+
+statement ok
+DROP TABLE a4;
+
+statement ok
+DROP TABLE b4;
+
+statement ok
+DROP TABLE c4;

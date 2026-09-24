@@ -16,6 +16,7 @@ fn index_column_names(columns: &[sqlparser::ast::IndexColumn]) -> Vec<String> {
 
 pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Result<LogicalPlan> {
     use sqlparser::ast::*;
+    reset_expression_errors();
     match stmt {
         Statement::CreateSchema {
             schema_name,
@@ -163,13 +164,18 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                             ..
                         } => {
                             let computed = lower_scalar(expr, params).ok_or_else(|| {
-                                anyhow::anyhow!(unknown_function_error(expr).unwrap_or_else(|| {
+                                expression_error(expr, || {
                                     format!(
                                         "Unsupported generation expression for column {}",
                                         c.name.value
                                     )
-                                }))
+                                })
                             })?;
+                            if crate::subqueries::contains_subquery(&computed) {
+                                anyhow::bail!(
+                                    "cannot use subquery in column generation expression"
+                                );
+                            }
                             if scalar_has_aggregate(&computed) {
                                 anyhow::bail!(
                                     "aggregate functions are not allowed in column generation expressions"
@@ -194,12 +200,16 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                             )
                         }
                         sqlparser::ast::ColumnOption::Default(e) => {
-                            default = Some(lower_scalar(e, params).ok_or_else(|| {
+                            let lowered = lower_scalar(e, params).ok_or_else(|| {
                                 anyhow::anyhow!(
                                     "Unsupported DEFAULT expression for column {}",
                                     c.name.value
                                 )
-                            })?);
+                            })?;
+                            if crate::subqueries::contains_subquery(&lowered) {
+                                anyhow::bail!("cannot use subquery in DEFAULT expression");
+                            }
+                            default = Some(lowered);
                         }
                         // `PRIMARY KEY` column option implies unique + not-null.
                         sqlparser::ast::ColumnOption::PrimaryKey(_) => {
@@ -749,9 +759,32 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
 /// Rejects a CHECK constraint the executor cannot evaluate, so it is never
 /// stored and then silently left unenforced.
 fn check_constraint_is_supported(expr: &sqlparser::ast::Expr, params: &[Value]) -> Result<()> {
-    parse_filter_expr(expr, params)
-        .map(|_| ())
-        .map_err(|e| anyhow::anyhow!("Unsupported CHECK constraint `{expr}`: {e}"))
+    let filter = parse_filter_expr(expr, params)
+        .map_err(|e| anyhow::anyhow!("Unsupported CHECK constraint `{expr}`: {e}"))?;
+    if filter_has_subquery(&filter) {
+        anyhow::bail!("cannot use subquery in check constraint");
+    }
+    Ok(())
+}
+
+/// Whether a condition runs a subquery anywhere.
+fn filter_has_subquery(filter: &FilterExpr) -> bool {
+    match filter {
+        FilterExpr::InSubquery { .. }
+        | FilterExpr::CompareSubquery { .. }
+        | FilterExpr::Exists { .. }
+        | FilterExpr::QuantifiedSubquery { .. } => true,
+        FilterExpr::And(a, b) | FilterExpr::Or(a, b) => {
+            filter_has_subquery(a) || filter_has_subquery(b)
+        }
+        FilterExpr::Not(a) => filter_has_subquery(a),
+        FilterExpr::Scalar(e) => crate::subqueries::contains_subquery(e),
+        FilterExpr::ExprCmp { left, right, .. } => {
+            crate::subqueries::contains_subquery(left)
+                || crate::subqueries::contains_subquery(right)
+        }
+        _ => false,
+    }
 }
 
 /// Plans a `RETURNING` list as column names; `*` (and `new.*`) expands to every

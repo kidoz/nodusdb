@@ -142,6 +142,11 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
                         recursive_term: right,
                     }
                 }
+                // `WITH x(a, b) AS (...)` names the CTE's columns.
+                other if !column_aliases.is_empty() => LogicalPlan::Renamed {
+                    input: Box::new(other),
+                    columns: column_aliases,
+                },
                 other => other,
             };
             ctes.push((cte_name, Box::new(cte_plan)));
@@ -182,37 +187,29 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
             left: Box::new(left_plan),
             right: Box::new(right_plan),
         };
-        if query.order_by.is_none() && query.limit_clause.is_none() && query.fetch.is_none() {
-            return Ok(set_op);
+        return select_from_result(set_op, ctes, query, params);
+    }
+
+    // A `VALUES` list as the query: `VALUES (1, 'a'), (2, 'b')`.
+    if let SetExpr::Values(values) = &*query.body {
+        let rows = values
+            .rows
+            .iter()
+            .map(|row| {
+                row.content
+                    .iter()
+                    .map(|e| {
+                        lower_scalar(e, params).ok_or_else(|| {
+                            expression_error(e, || format!("Unsupported expression in VALUES: {e}"))
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if rows.iter().any(|row| row.len() != rows[0].len()) {
+            anyhow::bail!("VALUES lists must all be the same length");
         }
-        // `ORDER BY`/`LIMIT` apply to the combined rows: select from the set
-        // operation as a CTE. Its sort keys can only name result columns.
-        let sort = plan_sort(query.order_by.as_ref(), &[], false, params)?;
-        if sort.iter().any(|k| matches!(k.target, SortTarget::Expr(_))) {
-            anyhow::bail!(
-                "invalid UNION/INTERSECT/EXCEPT ORDER BY clause: only result column names or positions can be used"
-            );
-        }
-        let (limit, offset) = plan_limit(query, params)?;
-        let name = "\u{0}set".to_string();
-        return Ok(LogicalPlan::Select {
-            ctes: vec![(name.clone(), Box::new(set_op))],
-            table_name: name,
-            table_alias: None,
-            joins: Vec::new(),
-            projection: Vec::new(),
-            group_by: Vec::new(),
-            filter: None,
-            having: None,
-            grouping_sets: None,
-            order_by: Vec::new(),
-            limit,
-            offset,
-            distinct: false,
-            sort,
-            group_exprs: Vec::new(),
-            distinct_on: Vec::new(),
-        });
+        return select_from_result(LogicalPlan::Values { rows }, ctes, query, params);
     }
 
     let SetExpr::Select(select) = &*query.body else {
@@ -252,12 +249,11 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
                     continue;
                 }
                 _ => {
-                    let scalar =
-                        lower_scalar(expr, params).ok_or_else(|| {
-                            anyhow::anyhow!(unknown_function_error(expr).unwrap_or_else(
-                                || format!("Unsupported expression in SELECT: {expr}")
-                            ))
-                        })?;
+                    let scalar = lower_scalar(expr, params).ok_or_else(|| {
+                        expression_error(expr, || {
+                            format!("Unsupported expression in SELECT: {expr}")
+                        })
+                    })?;
                     if let Some(column) = first_column_reference(&scalar) {
                         anyhow::bail!("column \"{column}\" does not exist");
                     }
@@ -267,11 +263,13 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
             values.push((alias, crate::Value::Null, type_hint));
             deferred.push(Some(item));
         }
-        return Ok(LogicalPlan::SelectLiteral {
+        // Its WITH, ORDER BY, and LIMIT apply as for any other query.
+        let literal = LogicalPlan::SelectLiteral {
             values,
             filter: parse_predicates(&select.selection, params)?,
             deferred,
-        });
+        };
+        return select_from_result(literal, ctes, query, params);
     }
     let (table_name, table_alias) =
         if let Some(spec) = table_fn_from_factor(&select.from[0].relation, params) {
@@ -283,145 +281,53 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
             (alias, None)
         } else {
             match &select.from[0].relation {
-                TableFactor::Table { name, alias, .. } => (
-                    name.to_string(),
-                    alias.as_ref().map(|a| a.name.value.clone()),
-                ),
+                TableFactor::Table { name, alias, .. } => {
+                    (name.to_string(), table_alias_name(alias.as_ref())?)
+                }
+                // The first relation has nothing to its left, so LATERAL means
+                // nothing there.
                 TableFactor::Derived {
                     subquery, alias, ..
                 } => {
-                    let alias = alias
-                        .as_ref()
-                        .ok_or_else(|| anyhow::anyhow!("Derived table requires an alias"))?
-                        .name
-                        .value
-                        .clone();
-                    let sub_plan = plan_query(subquery, params)?;
-                    ctes.push((alias.clone(), Box::new(sub_plan)));
+                    let (alias, plan) = derived_plan(subquery, alias.as_ref(), params)?;
+                    ctes.push((alias.clone(), Box::new(plan)));
                     (alias, None)
                 }
-                other => anyhow::bail!("Unsupported FROM relation: {:?}", other),
+                other => anyhow::bail!("Unsupported FROM relation: {other}"),
             }
         };
 
+    // Every relation after the first joins the ones before it: a comma-separated
+    // `FROM a, b` item is a cross join, and each item's own `JOIN`s follow it.
     let mut joins = Vec::new();
-    for j in &select.from[0].joins {
-        // A table function on the right of a join (incl. `CROSS JOIN LATERAL`) is
-        // evaluated per driving row by the executor.
-        if let Some(spec) = table_fn_from_factor(&j.relation, params) {
-            let join_type = match &j.join_operator {
-                JoinOperator::LeftOuter(_) | JoinOperator::Left(_) => JoinType::LeftOuter,
-                _ => JoinType::Inner,
+    for (position, item) in select.from.iter().enumerate() {
+        if position > 0 {
+            joins.push(plan_join(
+                &item.relation,
+                (JoinType::Cross, None, Vec::new(), false),
+                &mut ctes,
+                params,
+            )?);
+        }
+        for j in &item.joins {
+            let constraint = match &j.join_operator {
+                // 0.62 distinguishes the bare keyword forms (`JOIN`, `LEFT JOIN`,
+                // `RIGHT JOIN`) from the explicit `... OUTER JOIN` spellings; both
+                // map to the same join type.
+                JoinOperator::Join(c) | JoinOperator::Inner(c) => {
+                    join_constraint(JoinType::Inner, c, params)?
+                }
+                JoinOperator::Left(c) | JoinOperator::LeftOuter(c) => {
+                    join_constraint(JoinType::LeftOuter, c, params)?
+                }
+                JoinOperator::Right(c) | JoinOperator::RightOuter(c) => {
+                    join_constraint(JoinType::RightOuter, c, params)?
+                }
+                JoinOperator::FullOuter(c) => join_constraint(JoinType::FullOuter, c, params)?,
+                JoinOperator::CrossJoin(_) => (JoinType::Cross, None, Vec::new(), false),
+                other => anyhow::bail!("Unsupported join operator: {:?}", other),
             };
-            let alias = spec.alias.clone().unwrap_or_else(|| spec.name.clone());
-            joins.push(crate::Join {
-                table_name: alias.clone(),
-                table_alias: Some(alias),
-                condition: None,
-                join_type,
-                using_columns: Vec::new(),
-                natural: false,
-                table_fn: Some(spec),
-            });
-            continue;
-        }
-        let (join_table_name, join_table_alias) = match &j.relation {
-            TableFactor::Table { name, alias, .. } => (
-                name.to_string(),
-                alias.as_ref().map(|a| a.name.value.clone()),
-            ),
-            TableFactor::Derived {
-                subquery, alias, ..
-            } => {
-                let alias = alias
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("Derived join requires an alias"))?
-                    .name
-                    .value
-                    .clone();
-                let sub_plan = plan_query(subquery, params)?;
-                ctes.push((alias.clone(), Box::new(sub_plan)));
-                (alias, None)
-            }
-            other => anyhow::bail!("Unsupported join relation: {:?}", other),
-        };
-        let (join_type, condition, using_columns, natural) = match &j.join_operator {
-            // 0.62 distinguishes the bare keyword forms (`JOIN`, `LEFT JOIN`,
-            // `RIGHT JOIN`) from the explicit `... OUTER JOIN` spellings; both map
-            // to the same join type.
-            JoinOperator::Join(c) | JoinOperator::Inner(c) => {
-                join_constraint(JoinType::Inner, c, params)?
-            }
-            JoinOperator::Left(c) | JoinOperator::LeftOuter(c) => {
-                join_constraint(JoinType::LeftOuter, c, params)?
-            }
-            JoinOperator::Right(c) | JoinOperator::RightOuter(c) => {
-                join_constraint(JoinType::RightOuter, c, params)?
-            }
-            JoinOperator::FullOuter(c) => join_constraint(JoinType::FullOuter, c, params)?,
-            JoinOperator::CrossJoin(_) => (JoinType::Cross, None, Vec::new(), false),
-            other => anyhow::bail!("Unsupported join operator: {:?}", other),
-        };
-        joins.push(crate::Join {
-            table_name: join_table_name,
-            table_alias: join_table_alias,
-            condition,
-            join_type,
-            using_columns,
-            natural,
-            table_fn: None,
-        });
-    }
-
-    // Comma-separated `FROM a, b, ...` items become cross joins. This is how
-    // PostgreSQL clients (and introspection) write a lateral table function, e.g.
-    // `FROM pg_index i, unnest(i.indkey) WITH ORDINALITY`.
-    for twj in &select.from[1..] {
-        if let Some(spec) = table_fn_from_factor(&twj.relation, params) {
-            let alias = spec.alias.clone().unwrap_or_else(|| spec.name.clone());
-            joins.push(crate::Join {
-                table_name: alias.clone(),
-                table_alias: Some(alias),
-                condition: None,
-                join_type: JoinType::Cross,
-                using_columns: Vec::new(),
-                natural: false,
-                table_fn: Some(spec),
-            });
-            continue;
-        }
-        match &twj.relation {
-            TableFactor::Table { name, alias, .. } => joins.push(crate::Join {
-                table_name: name.to_string(),
-                table_alias: alias.as_ref().map(|a| a.name.value.clone()),
-                condition: None,
-                join_type: JoinType::Cross,
-                using_columns: Vec::new(),
-                natural: false,
-                table_fn: None,
-            }),
-            TableFactor::Derived {
-                subquery, alias, ..
-            } => {
-                let alias = alias
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("Derived table requires an alias"))?
-                    .name
-                    .value
-                    .clone();
-                let sub_plan = plan_query(subquery, params)?;
-                ctes.push((alias.clone(), Box::new(sub_plan)));
-                joins.push(crate::Join {
-                    table_name: alias.clone(),
-                    table_alias: Some(alias),
-                    condition: None,
-                    join_type: JoinType::Cross,
-                    using_columns: Vec::new(),
-                    natural: false,
-                    table_fn: None,
-                });
-            }
-            other => anyhow::bail!("Unsupported FROM relation: {:?}", other),
+            joins.push(plan_join(&j.relation, constraint, &mut ctes, params)?);
         }
     }
 
@@ -642,10 +548,9 @@ fn plan_group_by(
                 Ok(())
             }
             Some(other) => computed(other, keys),
-            None => Err(anyhow::anyhow!(
-                unknown_function_error(expr)
-                    .unwrap_or_else(|| format!("Unsupported GROUP BY expression: {expr}"))
-            )),
+            None => Err(expression_error(expr, || {
+                format!("Unsupported GROUP BY expression: {expr}")
+            })),
         }
     };
     // `ROLLUP`, `CUBE`, and `GROUPING SETS` elements must be plain columns:
@@ -804,10 +709,9 @@ fn sort_target(
                 None => SortTarget::Expr(expr),
             },
         ),
-        None => Err(anyhow::anyhow!(
-            unknown_function_error(expr)
-                .unwrap_or_else(|| format!("Unsupported ORDER BY expression: {expr}"))
-        )),
+        None => Err(expression_error(expr, || {
+            format!("Unsupported ORDER BY expression: {expr}")
+        })),
     }
 }
 
@@ -1293,10 +1197,160 @@ fn plan_select_expr(
                     alias: Some(name()),
                 });
             }
-            Err(anyhow::anyhow!(
-                unknown_function_error(expr)
-                    .unwrap_or_else(|| format!("Unsupported expression in SELECT: {expr}"))
-            ))
+            Err(expression_error(expr, || {
+                format!("Unsupported expression in SELECT: {expr}")
+            }))
         }
     }
+}
+
+/// A relation's alias; a column alias list (`t AS x(a, b)`) on a table is not
+/// supported.
+fn table_alias_name(alias: Option<&sqlparser::ast::TableAlias>) -> Result<Option<String>> {
+    match alias {
+        Some(alias) if !alias.columns.is_empty() => {
+            anyhow::bail!("column aliases on a table are not supported")
+        }
+        Some(alias) => Ok(Some(alias.name.value.clone())),
+        None => Ok(None),
+    }
+}
+
+/// Plans a derived table (`(subquery) AS alias [(columns)]`): its query,
+/// renamed by any column alias list.
+fn derived_plan(
+    subquery: &sqlparser::ast::Query,
+    alias: Option<&sqlparser::ast::TableAlias>,
+    params: &[Value],
+) -> Result<(String, LogicalPlan)> {
+    let plan = plan_query(subquery, params)?;
+    // Without an alias (allowed since PostgreSQL 16) the subquery gets a name
+    // of its own that no query can spell, so two of them never collide.
+    let Some(alias) = alias else {
+        let name = format!("\u{0}subquery{:p}", subquery);
+        return Ok((name, plan));
+    };
+    let plan = if alias.columns.is_empty() {
+        plan
+    } else {
+        LogicalPlan::Renamed {
+            input: Box::new(plan),
+            columns: alias.columns.iter().map(|c| c.name.value.clone()).collect(),
+        }
+    };
+    Ok((alias.name.value.clone(), plan))
+}
+
+/// Plans the relation on the right of a join, with the join's type and
+/// condition. A table function or `LATERAL` subquery runs for each left row;
+/// any other derived table is computed once, as a CTE.
+fn plan_join(
+    relation: &sqlparser::ast::TableFactor,
+    (join_type, condition, using_columns, natural): (
+        JoinType,
+        Option<FilterExpr>,
+        Vec<String>,
+        bool,
+    ),
+    ctes: &mut Vec<(String, Box<LogicalPlan>)>,
+    params: &[Value],
+) -> Result<crate::Join> {
+    use sqlparser::ast::TableFactor;
+    let join = |table_name: String, table_alias: Option<String>| crate::Join {
+        table_name,
+        table_alias,
+        condition: condition.clone(),
+        join_type: join_type.clone(),
+        using_columns: using_columns.clone(),
+        natural,
+        table_fn: None,
+        lateral: None,
+    };
+    if let Some(spec) = table_fn_from_factor(relation, params) {
+        let alias = spec.alias.clone().unwrap_or_else(|| spec.name.clone());
+        // A table function joins every left row (a cross join), or keeps the
+        // left row with NULLs when it yields nothing (a left join).
+        let join_type = match join_type {
+            JoinType::LeftOuter => JoinType::LeftOuter,
+            JoinType::Cross => JoinType::Cross,
+            _ => JoinType::Inner,
+        };
+        return Ok(crate::Join {
+            join_type,
+            table_fn: Some(spec),
+            ..join(alias.clone(), Some(alias))
+        });
+    }
+    match relation {
+        TableFactor::Table { name, alias, .. } => {
+            Ok(join(name.to_string(), table_alias_name(alias.as_ref())?))
+        }
+        TableFactor::Derived {
+            lateral,
+            subquery,
+            alias,
+            ..
+        } => {
+            let (alias, plan) = derived_plan(subquery, alias.as_ref(), params)?;
+            if *lateral {
+                if matches!(join_type, JoinType::RightOuter | JoinType::FullOuter) {
+                    anyhow::bail!("RIGHT and FULL joins with a LATERAL subquery are not supported");
+                }
+                Ok(crate::Join {
+                    lateral: Some(Box::new(plan)),
+                    ..join(alias.clone(), Some(alias))
+                })
+            } else {
+                ctes.push((alias.clone(), Box::new(plan)));
+                Ok(join(alias.clone(), Some(alias)))
+            }
+        }
+        other => anyhow::bail!("Unsupported join relation: {other}"),
+    }
+}
+
+/// A query over an already-planned result (a set operation, a `VALUES` list,
+/// or a SELECT without FROM): the result itself when the query adds nothing, else a select from it
+/// as a CTE, which applies the query's `WITH`, `ORDER BY` (result column names
+/// or positions only), and `LIMIT`.
+fn select_from_result(
+    result: LogicalPlan,
+    mut ctes: Vec<(String, Box<LogicalPlan>)>,
+    query: &sqlparser::ast::Query,
+    params: &[Value],
+) -> Result<LogicalPlan> {
+    if ctes.is_empty()
+        && query.order_by.is_none()
+        && query.limit_clause.is_none()
+        && query.fetch.is_none()
+    {
+        return Ok(result);
+    }
+    let sort = plan_sort(query.order_by.as_ref(), &[], false, params)?;
+    if sort.iter().any(|k| matches!(k.target, SortTarget::Expr(_))) {
+        anyhow::bail!(
+            "invalid UNION/INTERSECT/EXCEPT ORDER BY clause: only result column names or positions can be used"
+        );
+    }
+    let (limit, offset) = plan_limit(query, params)?;
+    let name = "\u{0}result".to_string();
+    ctes.push((name.clone(), Box::new(result)));
+    Ok(LogicalPlan::Select {
+        ctes,
+        table_name: name,
+        table_alias: None,
+        joins: Vec::new(),
+        projection: Vec::new(),
+        group_by: Vec::new(),
+        filter: None,
+        having: None,
+        grouping_sets: None,
+        order_by: Vec::new(),
+        limit,
+        offset,
+        distinct: false,
+        sort,
+        group_exprs: Vec::new(),
+        distinct_on: Vec::new(),
+    })
 }

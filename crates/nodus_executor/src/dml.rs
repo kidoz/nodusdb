@@ -198,11 +198,13 @@ impl MemExecutor {
                         let mut scope_cols = col_names.clone();
                         scope_cols.extend(col_names.iter().map(|c| format!("excluded.{c}")));
                         if let Some(cond) = condition
-                            && eval_scalar_expr(cond, &scope_row, &scope_cols) != Value::Bool(true)
+                            && self.eval_expr(ctx, cond, &scope_row, &scope_cols)
+                                != Value::Bool(true)
                         {
                             continue;
                         }
                         let updated = self.apply_assignments(
+                            ctx,
                             &tbl,
                             assignments,
                             &existing_row,
@@ -294,7 +296,7 @@ impl MemExecutor {
         for (old_key, old_row) in targets {
             // Assignments evaluate against the row's OLD values.
             let row =
-                self.apply_assignments(&tbl, &assignments, &old_row, (&old_row, &col_names))?;
+                self.apply_assignments(ctx, &tbl, &assignments, &old_row, (&old_row, &col_names))?;
             self.replace_row(ctx, &tbl, &old_key, &old_row, &row)?;
             updated += 1;
             if !returning.is_empty() {
@@ -427,6 +429,7 @@ impl MemExecutor {
     /// CONFLICT), and the result is coerced to the column type.
     fn apply_assignments(
         &self,
+        ctx: &ExecutionContext,
         tbl: &nodus_catalog::TableDescriptor,
         assignments: &[(String, ScalarExpr)],
         old_row: &[Value],
@@ -449,7 +452,7 @@ impl MemExecutor {
                     .map(|e| eval_scalar_expr(&e, &[], &[]))
                     .unwrap_or(Value::Null)
             } else {
-                eval_scalar_expr(expr, scope_row, scope_cols)
+                self.eval_expr(ctx, expr, scope_row, scope_cols)
             };
             row[idx] = crate::value::coerce_for_column(&val, &tbl.columns[idx].data_type);
         }

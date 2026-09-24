@@ -150,7 +150,8 @@ impl NodusExtendedQueryHandler {
                 true
             }
             nodus_executor::LogicalPlan::ShowVariable { .. }
-            | nodus_executor::LogicalPlan::SelectLiteral { .. } => true,
+            | nodus_executor::LogicalPlan::SelectLiteral { .. }
+            | nodus_executor::LogicalPlan::Values { .. } => true,
             _ => false,
         };
         if !can_execute {
@@ -1258,7 +1259,9 @@ fn describe_probe_plan(plan: &nodus_executor::LogicalPlan) -> Option<nodus_execu
             }
             Some(probe)
         }
-        LogicalPlan::ShowVariable { .. } | LogicalPlan::SelectLiteral { .. } => Some(plan.clone()),
+        LogicalPlan::ShowVariable { .. }
+        | LogicalPlan::SelectLiteral { .. }
+        | LogicalPlan::Values { .. } => Some(plan.clone()),
         LogicalPlan::Insert {
             table_name,
             returning,

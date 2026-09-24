@@ -784,7 +784,7 @@ pub(crate) fn lower_scalar(expr: &sqlparser::ast::Expr, params: &[Value]) -> Opt
                 right: Box::new(bound(hi_op, high)?),
             })
         }
-        // `x <op> ANY|ALL (array)`; the subquery forms are filters, not scalars.
+        // `x <op> ANY|ALL (array)` and `x <op> ANY|ALL (SELECT ...)`.
         Expr::AnyOp {
             left,
             compare_op,
@@ -795,7 +795,7 @@ pub(crate) fn lower_scalar(expr: &sqlparser::ast::Expr, params: &[Value]) -> Opt
             left,
             compare_op,
             right,
-        } if !matches!(&**right, Expr::Subquery(_)) => {
+        } => {
             let op = scalar_binary_op(compare_op)?;
             if !matches!(
                 op,
@@ -808,11 +808,48 @@ pub(crate) fn lower_scalar(expr: &sqlparser::ast::Expr, params: &[Value]) -> Opt
             ) {
                 return None;
             }
+            let right = match &**right {
+                Expr::Subquery(query) => subquery_expr(query, SubqueryKind::Array, params)?,
+                other => lower_scalar(other, params)?,
+            };
             Some(ScalarExpr::Quantified {
                 left: Box::new(lower_scalar(left, params)?),
                 op,
-                right: Box::new(lower_scalar(right, params)?),
+                right: Box::new(right),
                 all: matches!(expr, Expr::AllOp { .. }),
+            })
+        }
+        // Subqueries used as values, run by the executor for each row.
+        Expr::Subquery(query) => subquery_expr(query, SubqueryKind::Scalar, params),
+        Expr::Exists { subquery, negated } => {
+            let exists = subquery_expr(subquery, SubqueryKind::Exists, params)?;
+            Some(if *negated {
+                ScalarExpr::Unary {
+                    op: ScalarUnaryOp::Not,
+                    expr: Box::new(exists),
+                }
+            } else {
+                exists
+            })
+        }
+        Expr::InSubquery {
+            expr: inner,
+            subquery,
+            negated,
+        } => {
+            let any = ScalarExpr::Quantified {
+                left: Box::new(lower_scalar(inner, params)?),
+                op: ScalarBinaryOp::Eq,
+                right: Box::new(subquery_expr(subquery, SubqueryKind::Array, params)?),
+                all: false,
+            };
+            Some(if *negated {
+                ScalarExpr::Unary {
+                    op: ScalarUnaryOp::Not,
+                    expr: Box::new(any),
+                }
+            } else {
+                any
             })
         }
         Expr::Tuple(items) => Some(ScalarExpr::Row(
@@ -828,6 +865,12 @@ pub(crate) fn lower_scalar(expr: &sqlparser::ast::Expr, params: &[Value]) -> Opt
             let name = name
                 .strip_prefix("PG_CATALOG.")
                 .map_or(name.clone(), str::to_string);
+            // `ARRAY(SELECT ...)`: the subquery's first column as an array.
+            if name == "ARRAY"
+                && let FunctionArguments::Subquery(query) = &func.args
+            {
+                return subquery_expr(query, SubqueryKind::Array, params);
+            }
             // `ROW(a, b, ...)` is a row constructor, like a bare `(a, b, ...)`.
             if name == "ROW"
                 && let FunctionArguments::List(list) = &func.args
@@ -1098,6 +1141,11 @@ pub(crate) fn eval_scalar_in(expr: &ScalarExpr, scope: &dyn ScalarScope) -> Valu
     match expr {
         ScalarExpr::Literal(v) => v.clone(),
         ScalarExpr::Column(name) => scope.column(name),
+        // The executor replaces subqueries with their values before
+        // evaluating; one left here is in a place that cannot run it.
+        ScalarExpr::Subquery { .. } => {
+            crate::eval_error::raise("a subquery is not supported in this position")
+        }
         ScalarExpr::Aggregate { .. } => scope.aggregate(expr),
         ScalarExpr::Unary { op, expr } => apply_unary_op(*op, eval(expr)),
         ScalarExpr::Binary { op, left, right } => eval_comparison(*op, left, right, scope),
@@ -1678,6 +1726,48 @@ pub(crate) fn apply_date_offset(v: &Value, months: i64, days: i64, seconds: i64)
             parsed.offset.is_some(),
         ))
     }
+}
+
+thread_local! {
+    /// Why the last subquery in an expression could not be planned, so the
+    /// statement reports that instead of a generic "unsupported expression".
+    static SUBQUERY_ERROR: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Plans a subquery used inside an expression; `None` (with the reason kept
+/// for [`expression_error`]) if it cannot be planned.
+fn subquery_expr(
+    query: &sqlparser::ast::Query,
+    kind: SubqueryKind,
+    params: &[Value],
+) -> Option<ScalarExpr> {
+    match plan_query(query, params) {
+        Ok(plan) => Some(ScalarExpr::Subquery {
+            plan: SubPlan(Box::new(plan)),
+            kind,
+        }),
+        Err(e) => {
+            SUBQUERY_ERROR.with(|slot| *slot.borrow_mut() = Some(e.to_string()));
+            None
+        }
+    }
+}
+
+/// The error for an expression that could not be planned: a failing
+/// subquery's own error, an unknown function, or else `fallback`.
+pub(crate) fn expression_error(
+    expr: &sqlparser::ast::Expr,
+    fallback: impl FnOnce() -> String,
+) -> anyhow::Error {
+    if let Some(message) = SUBQUERY_ERROR.with(|slot| slot.borrow_mut().take()) {
+        return anyhow::anyhow!(message);
+    }
+    anyhow::anyhow!(unknown_function_error(expr).unwrap_or_else(fallback))
+}
+
+/// Forgets a subquery error left by an earlier statement.
+pub(crate) fn reset_expression_errors() {
+    SUBQUERY_ERROR.with(|slot| slot.borrow_mut().take());
 }
 
 /// Keywords PostgreSQL evaluates as functions without parentheses.
