@@ -32,88 +32,13 @@ pub(crate) fn compute_aggregate(
             };
             Value::Int(count)
         }
-        AggregateOp::Sum => {
-            let mut sum_int = 0i64;
-            let mut sum_float = 0f64;
-            let mut is_float = false;
-            for r in group_rows {
-                if let Some(v) = idx.and_then(|i| r.get(i)) {
-                    match v {
-                        Value::Int(n) => {
-                            if is_float {
-                                sum_float += (*n) as f64
-                            } else {
-                                sum_int += n
-                            }
-                        }
-                        Value::Float(f) => {
-                            if !is_float {
-                                sum_float = sum_int as f64;
-                                is_float = true;
-                            }
-                            sum_float += f;
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            if group_rows.is_empty() {
-                Value::Null
-            } else if is_float {
-                Value::Float(sum_float)
-            } else {
-                Value::Int(sum_int)
-            }
-        }
-        AggregateOp::Min | AggregateOp::Max => {
-            let want_less = matches!(op, AggregateOp::Min);
-            let mut acc: Option<Value> = None;
-            for r in group_rows {
-                if let Some(v) = idx.and_then(|i| r.get(i)) {
-                    if matches!(v, Value::Null) {
-                        continue;
-                    }
-                    let replace = match &acc {
-                        Some(cur) => {
-                            let ord = compare(v, cur);
-                            if want_less {
-                                ord == std::cmp::Ordering::Less
-                            } else {
-                                ord == std::cmp::Ordering::Greater
-                            }
-                        }
-                        None => true,
-                    };
-                    if replace {
-                        acc = Some(v.clone());
-                    }
-                }
-            }
-            acc.unwrap_or(Value::Null)
-        }
-        AggregateOp::Avg => {
-            let mut sum = 0f64;
-            let mut count = 0i64;
-            for r in group_rows {
-                if let Some(v) = idx.and_then(|i| r.get(i)) {
-                    match v {
-                        Value::Int(n) => {
-                            sum += *n as f64;
-                            count += 1;
-                        }
-                        Value::Float(f) => {
-                            sum += *f;
-                            count += 1;
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            if count == 0 {
-                Value::Null
-            } else {
-                Value::Float(sum / count as f64)
-            }
+        // Every other aggregate skips NULLs, and is NULL over no values.
+        _ => {
+            let values: Vec<Value> = group_rows
+                .iter()
+                .map(|r| idx.and_then(|i| r.get(i)).cloned().unwrap_or(Value::Null))
+                .collect();
+            aggregate_values(op, &values)
         }
     }
 }
@@ -154,7 +79,10 @@ pub(crate) fn aggregate_values(op: &AggregateOp, vals: &[Value]) -> Value {
             for v in &non_null {
                 match v {
                     Value::Int(i) => {
-                        int_sum += i;
+                        int_sum = match int_sum.checked_add(*i) {
+                            Some(sum) => sum,
+                            None => return crate::eval_error::raise("bigint out of range"),
+                        };
                         float_sum += *i as f64;
                     }
                     Value::Float(f) => {

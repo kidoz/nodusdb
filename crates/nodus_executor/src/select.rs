@@ -1563,15 +1563,7 @@ fn window_aggregate(
     col_names: &[String],
 ) -> Value {
     match func_name {
-        "AVG" => {
-            let sum = compute_aggregate(&AggregateOp::Sum, arg, rows, col_names);
-            let count = rows.len() as f64;
-            match sum {
-                Value::Int(s) if count > 0.0 => Value::Float(s as f64 / count),
-                Value::Float(s) if count > 0.0 => Value::Float(s / count),
-                _ => Value::Null,
-            }
-        }
+        "AVG" => compute_aggregate(&AggregateOp::Avg, arg, rows, col_names),
         "SUM" => compute_aggregate(&AggregateOp::Sum, arg, rows, col_names),
         "COUNT" => compute_aggregate(&AggregateOp::Count, arg, rows, col_names),
         "MIN" => compute_aggregate(&AggregateOp::Min, arg, rows, col_names),
