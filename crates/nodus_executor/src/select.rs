@@ -1063,8 +1063,7 @@ impl MemExecutor {
                         for (row_idx, row) in stored_rows.iter_mut().enumerate() {
                             row.push(results[row_idx].clone());
                         }
-                        let w_col_name = alias.clone().unwrap_or_else(|| func_name.clone());
-                        col_names.push(w_col_name);
+                        col_names.push(format!("__expr_{proj_idx}"));
                     }
                     ProjectionItem::ScalarFunction {
                         func_name,
@@ -1082,8 +1081,7 @@ impl MemExecutor {
                         for (row_idx, row) in stored_rows.iter_mut().enumerate() {
                             row.push(results[row_idx].clone());
                         }
-                        let w_col_name = alias.clone().unwrap_or_else(|| func_name.clone());
-                        col_names.push(w_col_name);
+                        col_names.push(format!("__expr_{proj_idx}"));
                     }
                     ProjectionItem::JsonAccess {
                         left,
@@ -1125,10 +1123,7 @@ impl MemExecutor {
                         for (row_idx, row) in stored_rows.iter_mut().enumerate() {
                             row.push(results[row_idx].clone());
                         }
-                        let w_col_name = alias
-                            .clone()
-                            .unwrap_or_else(|| format!("{}{}{}", left, operator, right));
-                        col_names.push(w_col_name);
+                        col_names.push(format!("__expr_{proj_idx}"));
                     }
                     ProjectionItem::Expr { expr, .. } => {
                         // Compute the expression per row and append it as a
@@ -1172,20 +1167,12 @@ impl MemExecutor {
                             ProjectionItem::Literal(_) | ProjectionItem::AliasedLiteral(_, _) => {
                                 "".to_string()
                             }
-                            ProjectionItem::WindowFunction {
-                                func_name, alias, ..
-                            } => alias.clone().unwrap_or_else(|| func_name.clone()),
-                            ProjectionItem::ScalarFunction {
-                                func_name, alias, ..
-                            } => alias.clone().unwrap_or_else(|| func_name.clone()),
-                            ProjectionItem::JsonAccess {
-                                left,
-                                operator,
-                                right,
-                                alias,
-                            } => alias
-                                .clone()
-                                .unwrap_or_else(|| format!("{}{}{}", left, operator, right)),
+                            // Computed items are stored under their position, so
+                            // two items with the same output name (or one named
+                            // like an input column) stay distinct.
+                            ProjectionItem::WindowFunction { .. }
+                            | ProjectionItem::ScalarFunction { .. }
+                            | ProjectionItem::JsonAccess { .. } => format!("__expr_{pi}"),
                             ProjectionItem::CaseWhenEq {
                                 else_column, alias, ..
                             } => alias.clone().unwrap_or_else(|| else_column.clone()),
