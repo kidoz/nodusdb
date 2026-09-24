@@ -448,6 +448,41 @@ impl ScalarExpr {
     }
 }
 
+/// One `ORDER BY` key.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SortKey {
+    pub target: SortTarget,
+    pub ascending: bool,
+    /// An explicit `NULLS FIRST` (`Some(true)`) or `NULLS LAST`; `None` uses
+    /// PostgreSQL's default: NULLs sort as larger than any value, so last when
+    /// ascending and first when descending.
+    pub nulls_first: Option<bool>,
+}
+
+/// What an `ORDER BY` (or `DISTINCT ON`) key sorts by.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum SortTarget {
+    /// The output column at this 0-based position (`ORDER BY 2`).
+    Output(usize),
+    /// A bare name: an output column of that name, else an input column.
+    /// A qualified name (`t.a`) always means the input column.
+    Name(String),
+    /// An expression over the input row, or over the group when grouping
+    /// (so it may contain aggregates).
+    Expr(ScalarExpr),
+}
+
+impl SortKey {
+    /// Reads a key as older plans encode it in `order_by`.
+    pub fn from_legacy((name, ascending, nulls_first): (String, bool, Option<bool>)) -> Self {
+        SortKey {
+            target: SortTarget::Name(name),
+            ascending,
+            nulls_first,
+        }
+    }
+}
+
 /// A FROM-less select item evaluated at execution time.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum DeferredItem {
@@ -733,10 +768,9 @@ pub enum LogicalPlan {
         /// aggregation over `group_by`. Appended last so older plans decode.
         #[serde(default)]
         grouping_sets: Option<Vec<Vec<String>>>,
-        /// Optional `ORDER BY (column, ascending, nulls_first_override)`. The
-        /// third element is `Some(true)`/`Some(false)` for an explicit `NULLS
-        /// FIRST`/`NULLS LAST`, or `None` to use the default (nulls first on
-        /// ASC, last on DESC).
+        /// `ORDER BY (column, ascending, nulls_first_override)` as older plans
+        /// encode it; the planner now writes [`SortKey`]s to `sort` instead,
+        /// and this is read only when `sort` is empty.
         order_by: Vec<(String, bool, Option<bool>)>,
         /// Optional `LIMIT`.
         limit: Option<usize>,
@@ -744,6 +778,21 @@ pub enum LogicalPlan {
         offset: Option<usize>,
         /// DISTINCT
         distinct: bool,
+        /// `ORDER BY` keys, applied to the output rows. Defaulted so older
+        /// plans (which use `order_by`) decode.
+        #[serde(default)]
+        sort: Vec<SortKey>,
+        /// Grouping keys that are expressions: each `(name, expr)` is computed
+        /// per input row before grouping, as a column `name` that `group_by`
+        /// refers to. A name that is also an input column stays that column,
+        /// since a `GROUP BY` name means the input column before an output
+        /// alias. Defaulted so older plans decode.
+        #[serde(default)]
+        group_exprs: Vec<(String, ScalarExpr)>,
+        /// `DISTINCT ON` keys: after sorting, only the first row of each
+        /// distinct key is kept. Defaulted so older plans decode.
+        #[serde(default)]
+        distinct_on: Vec<SortTarget>,
     },
     Update {
         table_name: String,

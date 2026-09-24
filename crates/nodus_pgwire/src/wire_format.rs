@@ -84,6 +84,19 @@ pub(crate) fn sqlstate_for_execution_error(err_str: &str) -> &'static str {
         "21000" // cardinality_violation
     } else if err_str.starts_with("aggregate functions are not allowed") {
         "42803" // grouping_error
+    // Clause shape errors in ORDER BY / GROUP BY / DISTINCT / LIMIT.
+    } else if err_str.ends_with("is not in select list")
+        || err_str.starts_with("for SELECT DISTINCT, ORDER BY expressions")
+        || err_str.starts_with("SELECT DISTINCT ON expressions must match")
+        || err_str.contains("must not contain variables")
+    {
+        "42P10" // invalid_column_reference
+    } else if err_str.starts_with("non-integer constant in") {
+        "42601" // syntax_error
+    } else if err_str == "LIMIT must not be negative" || err_str == "FETCH must not be negative" {
+        "2201W" // invalid_row_count_in_limit_clause
+    } else if err_str == "OFFSET must not be negative" {
+        "2201X" // invalid_row_count_in_result_offset_clause
     } else if err_str.starts_with("unrecognized configuration parameter") {
         "42704" // undefined_object
     // Duplicate object on CREATE without IF NOT EXISTS (class 42). Catalog and

@@ -85,14 +85,22 @@ impl MemExecutor {
         joins: Vec<Join>,
         projection: Vec<ProjectionItem>,
         group_by: Vec<String>,
+        group_exprs: Vec<(String, ScalarExpr)>,
         filter: Option<FilterExpr>,
         having: Option<FilterExpr>,
         grouping_sets: Option<Vec<Vec<String>>>,
-        order_by: Vec<(String, bool, Option<bool>)>,
+        sort: Vec<SortKey>,
         limit: Option<usize>,
         offset: Option<usize>,
         distinct: bool,
+        distinct_on: Vec<SortTarget>,
     ) -> Result<QueryOutput> {
+        // The keys each output row is sorted by, then deduplicated on.
+        let key_targets: Vec<SortTarget> = sort
+            .iter()
+            .map(|k| k.target.clone())
+            .chain(distinct_on.iter().cloned())
+            .collect();
         if table_name.eq_ignore_ascii_case("pg_stat_ssl") {
             return Ok(QueryOutput {
                 columns: vec!["ssl".to_string()],
@@ -135,7 +143,7 @@ impl MemExecutor {
             Some(lim)
                 if joins.is_empty()
                     && group_by.is_empty()
-                    && order_by.is_empty()
+                    && key_targets.is_empty()
                     && having.is_none()
                     && filter.is_none()
                     && !distinct
@@ -526,6 +534,26 @@ impl MemExecutor {
                 .unwrap_or(false)
         });
 
+        // Grouping expressions become columns of each input row. A name that
+        // is already an input column keeps that column.
+        for (name, expr) in &group_exprs {
+            if crate::filter_eval::col_pos(&col_names, name).is_some() {
+                continue;
+            }
+            for row in stored_rows.iter_mut() {
+                let value = eval_scalar_expr(expr, row, &col_names);
+                row.push(value);
+            }
+            col_names.push(name.clone());
+        }
+        if !query_has_virtual
+            && let Some(missing) = group_by
+                .iter()
+                .find(|g| crate::filter_eval::col_pos(&col_names, g).is_none())
+        {
+            anyhow::bail!("column \"{missing}\" does not exist");
+        }
+
         // GROUP BY & Aggregation. A HAVING clause forces the grouping path even
         // without GROUP BY or aggregates: per SQL it treats the whole input as
         // one group (`SELECT 1 FROM t HAVING true` yields at most one row).
@@ -536,42 +564,20 @@ impl MemExecutor {
                 // An expression like `sum(a) + 1` also forces the grouping path.
                 ProjectionItem::Expr { expr, .. } => scalar_has_aggregate(expr),
                 _ => false,
-            });
-
-        if !is_agg {
-            if !order_by.is_empty() {
-                let mut order_indices = Vec::new();
-                for (ocol, asc, nf) in &order_by {
-                    // col_pos also resolves a qualified ref (`t.col`) against
-                    // bare column names.
-                    let idx = crate::filter_eval::col_pos(&col_names, ocol);
-                    if let Some(i) = idx {
-                        order_indices.push((i, *asc, *nf));
-                    }
-                }
-                stored_rows.sort_by(|a, b| {
-                    for (idx, asc, nf) in &order_indices {
-                        let ord = order_cmp(
-                            a.get(*idx).unwrap_or(&crate::Value::Null),
-                            b.get(*idx).unwrap_or(&crate::Value::Null),
-                            *asc,
-                            *nf,
-                        );
-                        if ord != std::cmp::Ordering::Equal {
-                            return ord;
-                        }
-                    }
-                    std::cmp::Ordering::Equal
-                });
-            }
-        }
+            })
+            || key_targets
+                .iter()
+                .any(|t| matches!(t, SortTarget::Expr(e) if scalar_has_aggregate(e)));
 
         let mut out_rows = Vec::new();
         let mut out_cols = Vec::new();
-        // Each output group's representative (first) source row, so ORDER BY
-        // can sort by a grouped-out column that isn't in the projection
-        // (e.g. `SELECT count(*) .. GROUP BY b ORDER BY b DESC`).
+        // Each output row's source row (for a group, its first row), so ORDER
+        // BY can sort by a column that isn't in the projection (e.g. `SELECT
+        // count(*) .. GROUP BY b ORDER BY b DESC`).
         let mut out_reps: Vec<Vec<Value>> = Vec::new();
+        // Each output row's values of the expression sort keys (NULL for the
+        // other keys), computed over its source row or group.
+        let mut out_sort_values: Vec<Vec<Value>> = Vec::new();
 
         if is_agg {
             // The grouping sets to bucket by. Without ROLLUP/CUBE/GROUPING SETS
@@ -670,6 +676,17 @@ impl MemExecutor {
                         }
                     }
                     out_rows.push(out_row);
+                    out_sort_values.push(
+                        key_targets
+                            .iter()
+                            .map(|target| match target {
+                                SortTarget::Expr(e) => {
+                                    eval_scalar_expr_grouped(e, &group_rows, &col_names)
+                                }
+                                _ => Value::Null,
+                            })
+                            .collect(),
+                    );
                     out_reps.push(group_rows.first().cloned().unwrap_or_default());
                 }
             }
@@ -1184,8 +1201,22 @@ impl MemExecutor {
                 })
                 .collect();
 
+            if !key_targets.is_empty() {
+                out_sort_values = stored_rows
+                    .iter()
+                    .map(|row| {
+                        key_targets
+                            .iter()
+                            .map(|target| match target {
+                                SortTarget::Expr(e) => eval_scalar_expr(e, row, &col_names),
+                                _ => Value::Null,
+                            })
+                            .collect()
+                    })
+                    .collect();
+            }
             out_rows = stored_rows
-                .into_iter()
+                .iter()
                 .map(|r| {
                     if projection.is_empty() {
                         indices
@@ -1288,44 +1319,92 @@ impl MemExecutor {
                     }
                 })
                 .collect::<Vec<_>>();
+            if !key_targets.is_empty() {
+                out_reps = stored_rows;
+            }
         }
 
-        // ORDER BY for aggregates (uses out_cols). For non-aggregates, it was already sorted.
-        if is_agg {
-            if !order_by.is_empty() {
-                // Resolve each key against the output columns first; a key not
-                // in the projection (a grouped-out source column) falls back to
-                // the group's representative row. `true` marks an output key.
-                let mut order_indices: Vec<(bool, usize, bool, Option<bool>)> = Vec::new();
-                for (ocol, asc, nf) in &order_by {
-                    if let Some(i) = crate::filter_eval::col_pos(&out_cols, ocol) {
-                        order_indices.push((true, i, *asc, *nf));
-                    } else if let Some(i) = crate::filter_eval::col_pos(&col_names, ocol) {
-                        order_indices.push((false, i, *asc, *nf));
+        // ORDER BY and DISTINCT ON, over the output rows. A name means an
+        // output column before an input column (a qualified name only an input
+        // column); an input column reads the row's source row, or its group's
+        // first row.
+        if !key_targets.is_empty() {
+            enum KeySource {
+                Output(usize),
+                Source(usize),
+                /// The key's own computed value, by key position.
+                Computed(usize),
+                /// An unresolved key of a catalog query: NULL for every row.
+                Missing,
+            }
+            let mut sources = Vec::with_capacity(key_targets.len());
+            for (key_index, target) in key_targets.iter().enumerate() {
+                let source = match target {
+                    SortTarget::Output(i) if *i < out_cols.len() => KeySource::Output(*i),
+                    SortTarget::Output(i) => {
+                        anyhow::bail!("ORDER BY position {} is not in select list", i + 1)
                     }
-                }
-                let mut perm: Vec<usize> = (0..out_rows.len()).collect();
-                perm.sort_by(|&x, &y| {
-                    for (is_out, idx, asc, nf) in &order_indices {
-                        let (a, b) = if *is_out {
-                            (&out_rows[x], &out_rows[y])
+                    SortTarget::Name(name) => {
+                        let output = if name.contains('.') {
+                            None
                         } else {
-                            (&out_reps[x], &out_reps[y])
+                            out_cols.iter().position(|c| c == name)
                         };
-                        let ord = order_cmp(
-                            a.get(*idx).unwrap_or(&crate::Value::Null),
-                            b.get(*idx).unwrap_or(&crate::Value::Null),
-                            *asc,
-                            *nf,
-                        );
-                        if ord != std::cmp::Ordering::Equal {
-                            return ord;
+                        match output {
+                            Some(i) => KeySource::Output(i),
+                            None => match crate::filter_eval::col_pos(&col_names, name) {
+                                Some(i) => KeySource::Source(i),
+                                // Catalog queries resolve columns leniently.
+                                None if query_has_virtual => KeySource::Missing,
+                                None => anyhow::bail!("column \"{name}\" does not exist"),
+                            },
                         }
                     }
-                    std::cmp::Ordering::Equal
-                });
-                out_rows = perm.iter().map(|&i| out_rows[i].clone()).collect();
+                    SortTarget::Expr(_) => KeySource::Computed(key_index),
+                };
+                sources.push(source);
             }
+            let keys: Vec<Vec<Value>> = (0..out_rows.len())
+                .map(|row| {
+                    sources
+                        .iter()
+                        .map(|source| {
+                            let cell = match source {
+                                KeySource::Output(i) => out_rows[row].get(*i),
+                                KeySource::Source(i) => out_reps.get(row).and_then(|r| r.get(*i)),
+                                KeySource::Computed(k) => {
+                                    out_sort_values.get(row).and_then(|values| values.get(*k))
+                                }
+                                KeySource::Missing => None,
+                            };
+                            cell.cloned().unwrap_or(Value::Null)
+                        })
+                        .collect()
+                })
+                .collect();
+            let mut perm: Vec<usize> = (0..out_rows.len()).collect();
+            perm.sort_by(|&x, &y| {
+                for (i, key) in sort.iter().enumerate() {
+                    let ord = order_cmp(&keys[x][i], &keys[y][i], key.ascending, key.nulls_first);
+                    if ord != std::cmp::Ordering::Equal {
+                        return ord;
+                    }
+                }
+                std::cmp::Ordering::Equal
+            });
+            // DISTINCT ON keeps the first row (in sort order) of each key.
+            if !distinct_on.is_empty() {
+                let mut seen = std::collections::HashSet::new();
+                perm.retain(|&row| {
+                    let key: Vec<Vec<u8>> = keys[row][sort.len()..]
+                        .iter()
+                        .map(|v| serde_json::to_vec(v).unwrap_or_default())
+                        .collect();
+                    seen.insert(key)
+                });
+            }
+            let mut rows: Vec<Option<Vec<Value>>> = out_rows.into_iter().map(Some).collect();
+            out_rows = perm.iter().filter_map(|&i| rows[i].take()).collect();
         }
 
         // DISTINCT

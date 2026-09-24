@@ -43,7 +43,7 @@ mod view_helpers;
 pub use plan_types::{
     AggregateOp, AlterTableOp, CompareOp, ConflictTarget, DeferredItem, FilterExpr, Join, JoinType,
     LogicalPlan, OnConflictClause, Operand, PatternKind, Predicate, ProjectionItem, ScalarBinaryOp,
-    ScalarExpr, ScalarUnaryOp, SetOpKind, TableFnSpec,
+    ScalarExpr, ScalarUnaryOp, SetOpKind, SortKey, SortTarget, TableFnSpec,
 };
 pub use planner::{
     CopyOutputFormat, expr_to_value, parse_object_name, plan_copy_out, plan_statement,

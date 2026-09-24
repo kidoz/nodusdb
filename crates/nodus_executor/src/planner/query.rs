@@ -108,27 +108,6 @@ pub(crate) fn plan_references_table(plan: &LogicalPlan, name: &str) -> bool {
     }
 }
 
-/// Resolves a 1-based ordinal (`ORDER BY 1` / `GROUP BY 1`) to the referenced
-/// projection item's output column name, mirroring the executor's out-column
-/// naming so the sort/group lookup finds it.
-fn ordinal_target(projection: &[ProjectionItem], n: usize) -> Option<String> {
-    match projection.get(n.checked_sub(1)?)? {
-        ProjectionItem::Column(c) => Some(c.clone()),
-        ProjectionItem::AliasedColumn(_, a) | ProjectionItem::AliasedLiteral(_, a) => {
-            Some(a.clone())
-        }
-        ProjectionItem::Aggregate(op, inner) => Some(format!("{op:?}({inner})")),
-        ProjectionItem::Expr { alias, .. } => alias.clone(),
-        ProjectionItem::ScalarFunction {
-            func_name, alias, ..
-        }
-        | ProjectionItem::WindowFunction {
-            func_name, alias, ..
-        } => Some(alias.clone().unwrap_or_else(|| func_name.clone())),
-        _ => None,
-    }
-}
-
 pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Result<LogicalPlan> {
     use sqlparser::ast::*;
 
@@ -197,11 +176,42 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
         };
         let left_plan = plan_query(&wrap(left), params)?;
         let right_plan = plan_query(&wrap(right), params)?;
-        return Ok(LogicalPlan::SetOp {
+        let set_op = LogicalPlan::SetOp {
             op: kind,
             all,
             left: Box::new(left_plan),
             right: Box::new(right_plan),
+        };
+        if query.order_by.is_none() && query.limit_clause.is_none() && query.fetch.is_none() {
+            return Ok(set_op);
+        }
+        // `ORDER BY`/`LIMIT` apply to the combined rows: select from the set
+        // operation as a CTE. Its sort keys can only name result columns.
+        let sort = plan_sort(query.order_by.as_ref(), &[], false, params)?;
+        if sort.iter().any(|k| matches!(k.target, SortTarget::Expr(_))) {
+            anyhow::bail!(
+                "invalid UNION/INTERSECT/EXCEPT ORDER BY clause: only result column names or positions can be used"
+            );
+        }
+        let (limit, offset) = plan_limit(query, params)?;
+        let name = "\u{0}set".to_string();
+        return Ok(LogicalPlan::Select {
+            ctes: vec![(name.clone(), Box::new(set_op))],
+            table_name: name,
+            table_alias: None,
+            joins: Vec::new(),
+            projection: Vec::new(),
+            group_by: Vec::new(),
+            filter: None,
+            having: None,
+            grouping_sets: None,
+            order_by: Vec::new(),
+            limit,
+            offset,
+            distinct: false,
+            sort,
+            group_exprs: Vec::new(),
+            distinct_on: Vec::new(),
         });
     }
 
@@ -443,127 +453,31 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
         }
     }
 
-    let mut group_by = Vec::new();
-    let mut grouping_sets: Option<Vec<Vec<String>>> = None;
-    match &select.group_by {
-        sqlparser::ast::GroupByExpr::Expressions(exprs, _) => {
-            use sqlparser::ast::Expr;
-            // Flattens a grouping element's expressions into column names.
-            let cols_of =
-                |es: &[Expr]| -> Vec<String> { es.iter().filter_map(extract_col_name).collect() };
-            for expr in exprs {
-                match expr {
-                    Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
-                        if let Some(c) = extract_col_name(expr) {
-                            group_by.push(c);
-                        }
-                    }
-                    // Ordinal reference (`GROUP BY 1`).
-                    Expr::Value(v) => {
-                        if let sqlparser::ast::Value::Number(n, _) = &v.value {
-                            if let Some(c) = n
-                                .parse::<usize>()
-                                .ok()
-                                .and_then(|n| ordinal_target(&projection, n))
-                            {
-                                group_by.push(c);
-                            }
-                        }
-                    }
-                    // `ROLLUP(e1, e2, …)` → prefixes: {e1..en}, …, {e1}, {}.
-                    Expr::Rollup(elements) => {
-                        let elems: Vec<Vec<String>> = elements.iter().map(|e| cols_of(e)).collect();
-                        let mut sets = Vec::new();
-                        for i in (0..=elems.len()).rev() {
-                            sets.push(elems[..i].concat());
-                        }
-                        grouping_sets = Some(sets);
-                    }
-                    // `CUBE(e1, …, en)` → every subset of the elements.
-                    Expr::Cube(elements) => {
-                        let elems: Vec<Vec<String>> = elements.iter().map(|e| cols_of(e)).collect();
-                        let mut sets = Vec::new();
-                        for mask in (0..(1u32 << elems.len())).rev() {
-                            let mut set = Vec::new();
-                            for (bit, e) in elems.iter().enumerate() {
-                                if mask & (1 << bit) != 0 {
-                                    set.extend(e.iter().cloned());
-                                }
-                            }
-                            sets.push(set);
-                        }
-                        grouping_sets = Some(sets);
-                    }
-                    // `GROUPING SETS((a,b), (a), ())` → each inner list is one set.
-                    Expr::GroupingSets(list) => {
-                        grouping_sets = Some(list.iter().map(|e| cols_of(e)).collect());
-                    }
-                    _ => {}
-                }
-            }
-            // `group_by` carries the union of every column mentioned (in first
-            // appearance) so the output/NULL-rollup logic can resolve them.
-            if let Some(sets) = &grouping_sets {
-                for set in sets {
-                    for c in set {
-                        if !group_by.contains(c) {
-                            group_by.push(c.clone());
-                        }
-                    }
-                }
-            }
-        }
-        _ => {}
+    let (distinct, distinct_on_exprs) = match &select.distinct {
+        None | Some(sqlparser::ast::Distinct::All) => (false, &[][..]),
+        Some(sqlparser::ast::Distinct::Distinct) => (true, &[][..]),
+        Some(sqlparser::ast::Distinct::On(exprs)) => (false, exprs.as_slice()),
+    };
+    let (group_by, grouping_sets, group_exprs) =
+        plan_group_by(&select.group_by, &projection, params)?;
+    let sort = plan_sort(query.order_by.as_ref(), &projection, distinct, params)?;
+    let distinct_on = distinct_on_exprs
+        .iter()
+        .map(|e| sort_target(e, &projection, params))
+        .collect::<Result<Vec<_>>>()?;
+    // As in PostgreSQL, the leading ORDER BY keys must be DISTINCT ON keys,
+    // so "the first row of each key" is well defined.
+    let same = |a: &SortTarget, b: &SortTarget| {
+        canonical_target(a, &projection) == canonical_target(b, &projection)
+    };
+    if sort
+        .iter()
+        .take(distinct_on.len())
+        .any(|key| !distinct_on.iter().any(|d| same(d, &key.target)))
+    {
+        anyhow::bail!("SELECT DISTINCT ON expressions must match initial ORDER BY expressions");
     }
-
-    // ORDER BY first column, if present.
-    let order_by = match &query.order_by {
-        Some(OrderBy {
-            kind: OrderByKind::Expressions(exprs),
-            ..
-        }) => {
-            let directions = exprs
-                .iter()
-                .map(|o| sort_ascending(&o.options))
-                .collect::<Result<Vec<_>>>()?;
-            exprs
-                .iter()
-                .zip(directions)
-                .filter_map(|(o, asc)| match &o.expr {
-                    // Bare or qualified (`t.col`) column reference.
-                    Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
-                        extract_col_name(&o.expr).map(|col| (col, asc, o.options.nulls_first))
-                    }
-                    // Ordinal reference (`ORDER BY 1`).
-                    Expr::Value(v) => match &v.value {
-                        sqlparser::ast::Value::Number(n, _) => n
-                            .parse::<usize>()
-                            .ok()
-                            .and_then(|n| ordinal_target(&projection, n))
-                            .map(|col| (col, asc, o.options.nulls_first)),
-                        _ => None,
-                    },
-                    _ => None,
-                })
-                .collect()
-        }
-        _ => Vec::new(),
-    };
-
-    // LIMIT <n> / OFFSET <n>, both carried by the `LimitClause`.
-    let (limit_expr, offset_expr) = match &query.limit_clause {
-        Some(LimitClause::LimitOffset { limit, offset, .. }) => {
-            (limit.as_ref(), offset.as_ref().map(|o| &o.value))
-        }
-        Some(LimitClause::OffsetCommaLimit { offset, limit }) => (Some(limit), Some(offset)),
-        None => (None, None),
-    };
-    let limit = limit_expr
-        .and_then(|e| expr_to_value(e, params).and_then(|v| render(&v).parse::<usize>().ok()));
-    let offset = offset_expr
-        .and_then(|e| expr_to_value(e, params).and_then(|v| render(&v).parse::<usize>().ok()));
-
-    let distinct = select.distinct.is_some();
+    let (limit, offset) = plan_limit(query, params)?;
 
     let having = select
         .having
@@ -581,11 +495,390 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
         filter: parse_predicates(&select.selection, params)?,
         having,
         grouping_sets,
-        order_by,
+        order_by: Vec::new(),
         limit,
         offset,
         distinct,
+        sort,
+        group_exprs,
+        distinct_on,
     })
+}
+
+/// The name of the column a grouping expression is computed into. It starts
+/// with NUL, which no SQL identifier contains, so it never shadows a column.
+fn group_column_name(index: usize) -> String {
+    format!("\u{0}group{index}")
+}
+
+/// The value a select item computes, as an expression over the input row (or
+/// the group); `None` for window calls, subqueries, and catalog placeholders.
+fn item_expr(item: &ProjectionItem) -> Option<ScalarExpr> {
+    match item {
+        ProjectionItem::Column(c) | ProjectionItem::AliasedColumn(c, _) => {
+            Some(ScalarExpr::Column(c.clone()))
+        }
+        ProjectionItem::Literal(v) | ProjectionItem::AliasedLiteral(v, _) => {
+            Some(ScalarExpr::Literal(v.clone()))
+        }
+        ProjectionItem::Aggregate(op, arg) => Some(ScalarExpr::Aggregate {
+            op: op.clone(),
+            arg: arg.clone(),
+            arg_expr: None,
+            distinct: false,
+        }),
+        ProjectionItem::Expr { expr, .. } => Some(expr.clone()),
+        _ => None,
+    }
+}
+
+/// A select item's `AS` name, if it has one.
+fn item_alias(item: &ProjectionItem) -> Option<&str> {
+    match item {
+        ProjectionItem::AliasedColumn(_, a) | ProjectionItem::AliasedLiteral(_, a) => Some(a),
+        ProjectionItem::Expr { alias, .. }
+        | ProjectionItem::Subquery { alias, .. }
+        | ProjectionItem::WindowFunction { alias, .. }
+        | ProjectionItem::ScalarFunction { alias, .. } => alias.as_deref(),
+        _ => None,
+    }
+}
+
+/// A positive integer literal (`GROUP BY 2`, `ORDER BY 1`): the 1-based
+/// position of a select item. Any other constant is rejected, as PostgreSQL
+/// does, rather than grouping or sorting by a constant.
+fn select_position(expr: &sqlparser::ast::Expr, clause: &str) -> Result<Option<usize>> {
+    use sqlparser::ast::{Expr, Value as V};
+    let Expr::Value(value) = expr else {
+        return Ok(None);
+    };
+    match &value.value {
+        V::Number(n, _) => match n.parse::<usize>() {
+            Ok(position) if position >= 1 => Ok(Some(position)),
+            _ => anyhow::bail!("{clause} position {n} is not in select list"),
+        },
+        V::Placeholder(_) => Ok(None),
+        _ => anyhow::bail!("non-integer constant in {clause}"),
+    }
+}
+
+/// Plans `GROUP BY`: plain columns by name, and select-list positions, output
+/// aliases, and expressions as computed grouping columns. Returns the grouping
+/// column names, the `ROLLUP`/`CUBE`/`GROUPING SETS` expansion, and the
+/// computed grouping columns.
+#[allow(clippy::type_complexity)]
+fn plan_group_by(
+    group_by: &sqlparser::ast::GroupByExpr,
+    projection: &[ProjectionItem],
+    params: &[Value],
+) -> Result<(
+    Vec<String>,
+    Option<Vec<Vec<String>>>,
+    Vec<(String, ScalarExpr)>,
+)> {
+    use sqlparser::ast::{Expr, GroupByExpr};
+    let GroupByExpr::Expressions(exprs, modifiers) = group_by else {
+        anyhow::bail!("GROUP BY ALL is not supported");
+    };
+    if !modifiers.is_empty() {
+        anyhow::bail!("Unsupported GROUP BY modifier");
+    }
+    let mut group_exprs: Vec<(String, ScalarExpr)> = Vec::new();
+    // Plans one grouping element into grouping column names.
+    let mut plan_key = |expr: &Expr, keys: &mut Vec<String>| -> Result<()> {
+        let mut computed = |expr: ScalarExpr, keys: &mut Vec<String>| -> Result<()> {
+            if scalar_has_aggregate(&expr) {
+                anyhow::bail!("aggregate functions are not allowed in GROUP BY");
+            }
+            let name = group_column_name(group_exprs.len());
+            group_exprs.push((name.clone(), expr));
+            keys.push(name);
+            Ok(())
+        };
+        if let Some(position) = select_position(expr, "GROUP BY")? {
+            let item = projection.get(position - 1).ok_or_else(|| {
+                anyhow::anyhow!("GROUP BY position {position} is not in select list")
+            })?;
+            return match item {
+                ProjectionItem::Column(c) | ProjectionItem::AliasedColumn(c, _) => {
+                    keys.push(c.clone());
+                    Ok(())
+                }
+                _ => match item_expr(item) {
+                    Some(expr) => computed(expr, keys),
+                    None => anyhow::bail!(
+                        "GROUP BY position {position} refers to an unsupported select item"
+                    ),
+                },
+            };
+        }
+        match lower_scalar(expr, params) {
+            Some(ScalarExpr::Column(name)) => {
+                // A name that is not an input column may name an output column
+                // (`SELECT upper(s) AS u ... GROUP BY u`).
+                if !name.contains('.')
+                    && let Some(item) = projection.iter().find(|i| item_alias(i) == Some(&name))
+                {
+                    match item_expr(item) {
+                        Some(expr) if scalar_has_aggregate(&expr) => {}
+                        Some(expr) => group_exprs.push((name.clone(), expr)),
+                        None => {}
+                    }
+                }
+                keys.push(name);
+                Ok(())
+            }
+            Some(ScalarExpr::Row(items)) => {
+                // `GROUP BY (a, b)` groups by each element; `()` by nothing.
+                for item in items {
+                    match item {
+                        ScalarExpr::Column(name) => keys.push(name),
+                        other => computed(other, keys)?,
+                    }
+                }
+                Ok(())
+            }
+            Some(other) => computed(other, keys),
+            None => Err(anyhow::anyhow!(
+                unknown_function_error(expr)
+                    .unwrap_or_else(|| format!("Unsupported GROUP BY expression: {expr}"))
+            )),
+        }
+    };
+    // `ROLLUP`, `CUBE`, and `GROUPING SETS` elements must be plain columns:
+    // a rolled-up expression would need its select item nulled per set.
+    let columns_of = |elements: &[Expr]| -> Result<Vec<String>> {
+        elements
+            .iter()
+            .map(|e| match lower_scalar(e, params) {
+                Some(ScalarExpr::Column(name)) => Ok(name),
+                _ => {
+                    anyhow::bail!("ROLLUP, CUBE, and GROUPING SETS support only column references")
+                }
+            })
+            .collect()
+    };
+    let mut group_by = Vec::new();
+    let mut grouping_sets: Option<Vec<Vec<String>>> = None;
+    for expr in exprs {
+        match expr {
+            // `ROLLUP(e1, e2, …)` → prefixes: {e1..en}, …, {e1}, {}.
+            Expr::Rollup(elements) => {
+                let elems = elements
+                    .iter()
+                    .map(|e| columns_of(e))
+                    .collect::<Result<Vec<_>>>()?;
+                grouping_sets = Some(
+                    (0..=elems.len())
+                        .rev()
+                        .map(|i| elems[..i].concat())
+                        .collect(),
+                );
+            }
+            // `CUBE(e1, …, en)` → every subset of the elements.
+            Expr::Cube(elements) => {
+                let elems = elements
+                    .iter()
+                    .map(|e| columns_of(e))
+                    .collect::<Result<Vec<_>>>()?;
+                let mut sets = Vec::new();
+                for mask in (0..(1u32 << elems.len())).rev() {
+                    let mut set = Vec::new();
+                    for (bit, e) in elems.iter().enumerate() {
+                        if mask & (1 << bit) != 0 {
+                            set.extend(e.iter().cloned());
+                        }
+                    }
+                    sets.push(set);
+                }
+                grouping_sets = Some(sets);
+            }
+            // `GROUPING SETS((a,b), (a), ())` → each inner list is one set.
+            Expr::GroupingSets(list) => {
+                grouping_sets = Some(
+                    list.iter()
+                        .map(|e| columns_of(e))
+                        .collect::<Result<Vec<_>>>()?,
+                );
+            }
+            _ => plan_key(expr, &mut group_by)?,
+        }
+    }
+    if grouping_sets.is_some() && !group_by.is_empty() {
+        anyhow::bail!(
+            "GROUP BY mixing plain keys with ROLLUP, CUBE, or GROUPING SETS is not supported"
+        );
+    }
+    // `group_by` carries the union of every column mentioned (in first
+    // appearance) so the output/NULL-rollup logic can resolve them.
+    if let Some(sets) = &grouping_sets {
+        for set in sets {
+            for c in set {
+                if !group_by.contains(c) {
+                    group_by.push(c.clone());
+                }
+            }
+        }
+    }
+    Ok((group_by, grouping_sets, group_exprs))
+}
+
+/// Plans `ORDER BY` keys. A key naming a select item by position, or
+/// repeating a select item's expression, sorts by that output column; a bare
+/// name is resolved when the statement runs (output column first, then input
+/// column); any other expression is computed per row (or group).
+fn plan_sort(
+    order_by: Option<&sqlparser::ast::OrderBy>,
+    projection: &[ProjectionItem],
+    distinct: bool,
+    params: &[Value],
+) -> Result<Vec<SortKey>> {
+    use sqlparser::ast::OrderByKind;
+    let Some(order_by) = order_by else {
+        return Ok(Vec::new());
+    };
+    let OrderByKind::Expressions(exprs) = &order_by.kind else {
+        anyhow::bail!("ORDER BY ALL is not supported");
+    };
+    if order_by.interpolate.is_some() {
+        anyhow::bail!("Unsupported ORDER BY INTERPOLATE");
+    }
+    let mut keys = Vec::with_capacity(exprs.len());
+    for o in exprs {
+        if o.with_fill.is_some() {
+            anyhow::bail!("Unsupported ORDER BY WITH FILL");
+        }
+        let target = sort_target(&o.expr, projection, params)?;
+        if distinct {
+            let selected = match &target {
+                SortTarget::Output(_) => true,
+                SortTarget::Name(name) => {
+                    projection.is_empty()
+                        || matches!(canonical_target(&target, projection), SortTarget::Output(_))
+                        || projection.iter().any(|item| {
+                            matches!(item, ProjectionItem::Column(c) if c.rsplit('.').next() == Some(name))
+                        })
+                }
+                SortTarget::Expr(_) => false,
+            };
+            if !selected {
+                anyhow::bail!(
+                    "for SELECT DISTINCT, ORDER BY expressions must appear in select list"
+                );
+            }
+        }
+        keys.push(SortKey {
+            target,
+            ascending: sort_ascending(&o.options)?,
+            nulls_first: o.options.nulls_first,
+        });
+    }
+    Ok(keys)
+}
+
+/// Resolves an `ORDER BY` or `DISTINCT ON` key: a select-list position, a
+/// repeat of a select item's expression (that output column), a bare or
+/// qualified name, or an expression computed per row (or group).
+fn sort_target(
+    expr: &sqlparser::ast::Expr,
+    projection: &[ProjectionItem],
+    params: &[Value],
+) -> Result<SortTarget> {
+    if let Some(position) = select_position(expr, "ORDER BY")? {
+        if !projection.is_empty() && position > projection.len() {
+            anyhow::bail!("ORDER BY position {position} is not in select list");
+        }
+        return Ok(SortTarget::Output(position - 1));
+    }
+    match lower_scalar(expr, params) {
+        Some(ScalarExpr::Column(name)) => Ok(SortTarget::Name(name)),
+        Some(expr) => Ok(
+            match projection
+                .iter()
+                .position(|item| item_expr(item).as_ref() == Some(&expr))
+            {
+                Some(i) => SortTarget::Output(i),
+                None => SortTarget::Expr(expr),
+            },
+        ),
+        None => Err(anyhow::anyhow!(
+            unknown_function_error(expr)
+                .unwrap_or_else(|| format!("Unsupported ORDER BY expression: {expr}"))
+        )),
+    }
+}
+
+/// A key in the form used to compare keys: a name that a select item
+/// outputs (by alias or as its column) becomes that output position.
+fn canonical_target(target: &SortTarget, projection: &[ProjectionItem]) -> SortTarget {
+    if let SortTarget::Name(name) = target
+        && let Some(i) = projection.iter().position(|item| {
+            item_alias(item) == Some(name.as_str())
+                || matches!(item, ProjectionItem::Column(c) if c == name)
+        })
+    {
+        return SortTarget::Output(i);
+    }
+    target.clone()
+}
+
+/// Plans `LIMIT`/`OFFSET` and `FETCH FIRST n ROWS ONLY`. A NULL count means no
+/// limit (or no offset); a negative or non-integer count is an error. A
+/// placeholder not yet bound (while describing) leaves the clause open.
+fn plan_limit(
+    query: &sqlparser::ast::Query,
+    params: &[Value],
+) -> Result<(Option<usize>, Option<usize>)> {
+    use sqlparser::ast::LimitClause;
+    let count = |expr: &sqlparser::ast::Expr, clause: &str| -> Result<Option<usize>> {
+        let value = match lower_scalar(expr, params) {
+            Some(scalar) if first_column_reference(&scalar).is_none() => {
+                let value = eval_scalar_expr(&scalar, &[], &[]);
+                crate::eval_error::check()?;
+                value
+            }
+            _ => anyhow::bail!("argument of {clause} must not contain variables"),
+        };
+        let n = match value {
+            Value::Null => return Ok(None),
+            Value::Int(n) => n,
+            Value::Float(f) if f.is_finite() => f.round_ties_even() as i64,
+            Value::Text(ref t) => t
+                .trim()
+                .parse::<i64>()
+                .map_err(|_| anyhow::anyhow!("invalid input syntax for type bigint: \"{t}\""))?,
+            _ => anyhow::bail!("argument of {clause} must be type bigint"),
+        };
+        if n < 0 {
+            anyhow::bail!("{clause} must not be negative");
+        }
+        Ok(Some(n as usize))
+    };
+    let (limit_expr, offset_expr) = match &query.limit_clause {
+        Some(LimitClause::LimitOffset { limit, offset, .. }) => {
+            (limit.as_ref(), offset.as_ref().map(|o| &o.value))
+        }
+        Some(LimitClause::OffsetCommaLimit { offset, limit }) => (Some(limit), Some(offset)),
+        None => (None, None),
+    };
+    let mut limit = limit_expr.map(|e| count(e, "LIMIT")).transpose()?.flatten();
+    if let Some(fetch) = &query.fetch {
+        if fetch.with_ties || fetch.percent {
+            anyhow::bail!("FETCH ... WITH TIES and PERCENT are not supported");
+        }
+        if limit_expr.is_some() {
+            anyhow::bail!("LIMIT and FETCH cannot both be used");
+        }
+        limit = match &fetch.quantity {
+            Some(e) => count(e, "FETCH")?,
+            None => Some(1),
+        };
+    }
+    let offset = offset_expr
+        .map(|e| count(e, "OFFSET"))
+        .transpose()?
+        .flatten();
+    Ok((limit, offset))
 }
 
 /// Translates a parsed JOIN constraint into NodusDB's join representation:
@@ -877,21 +1170,28 @@ fn plan_select_expr(
     {
         let mut partition_by = Vec::new();
         let mut order_by = Vec::new();
-        let mut frame = None;
-        if let sqlparser::ast::WindowType::WindowSpec(spec) = over {
-            for expr in &spec.partition_by {
-                if let Some(col) = extract_col_name(expr) {
-                    partition_by.push(col);
-                }
+        let sqlparser::ast::WindowType::WindowSpec(spec) = over else {
+            anyhow::bail!("Named windows are not supported");
+        };
+        // Windows partition and sort by plain columns; anything else is an
+        // error rather than silently ignored.
+        for expr in &spec.partition_by {
+            match lower_scalar(expr, params) {
+                Some(ScalarExpr::Column(col)) => partition_by.push(col),
+                _ => anyhow::bail!("Unsupported window PARTITION BY expression: {expr}"),
             }
-            for expr in &spec.order_by {
-                let asc = sort_ascending(&expr.options)?;
-                if let Some(col) = extract_col_name(&expr.expr) {
-                    order_by.push((col, asc));
-                }
-            }
-            frame = window_frame(spec);
         }
+        for expr in &spec.order_by {
+            if expr.options.nulls_first.is_some() {
+                anyhow::bail!("NULLS FIRST/LAST in a window ORDER BY is not supported");
+            }
+            let asc = sort_ascending(&expr.options)?;
+            match lower_scalar(&expr.expr, params) {
+                Some(ScalarExpr::Column(col)) => order_by.push((col, asc)),
+                _ => anyhow::bail!("Unsupported window ORDER BY expression: {}", expr.expr),
+            }
+        }
+        let frame = window_frame(spec);
         return Ok(ProjectionItem::WindowFunction {
             func_name: func.name.to_string().to_uppercase(),
             args: window_args(func),

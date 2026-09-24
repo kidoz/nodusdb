@@ -103,22 +103,35 @@ impl MemExecutor {
                 limit,
                 offset,
                 distinct,
-            } => self.exec_select(
-                ctx,
-                ctes,
-                table_name,
-                table_alias,
-                joins,
-                projection,
-                group_by,
-                filter,
-                having,
-                grouping_sets,
-                order_by,
-                limit,
-                offset,
-                distinct,
-            ),
+                sort,
+                group_exprs,
+                distinct_on,
+            } => {
+                // Older plans carry their keys in `order_by`.
+                let sort = if sort.is_empty() {
+                    order_by.into_iter().map(SortKey::from_legacy).collect()
+                } else {
+                    sort
+                };
+                self.exec_select(
+                    ctx,
+                    ctes,
+                    table_name,
+                    table_alias,
+                    joins,
+                    projection,
+                    group_by,
+                    group_exprs,
+                    filter,
+                    having,
+                    grouping_sets,
+                    sort,
+                    limit,
+                    offset,
+                    distinct,
+                    distinct_on,
+                )
+            }
             LogicalPlan::Update {
                 table_name,
                 assignments,

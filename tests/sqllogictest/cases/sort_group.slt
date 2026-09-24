@@ -1,0 +1,498 @@
+# ORDER BY, GROUP BY, DISTINCT [ON], LIMIT/OFFSET/FETCH, and window ordering.
+# Expected results come from PostgreSQL 18 with the C collation.
+statement ok
+CREATE TABLE so (id INT PRIMARY KEY, a INT, s TEXT, ts TIMESTAMP, g TEXT);
+
+statement ok
+INSERT INTO so VALUES (1, 3, 'b', '2024-01-01 10:00', 'x'), (2, NULL, 'A', '2024-01-02 09:00', 'y'), (3, 1, 'c', NULL, 'x'), (4, 3, 'a', '2024-01-01 23:59', 'y'), (5, NULL, 'B', '2024-01-03 00:00', 'x');
+
+# NULLs sort as larger than any value by default.
+query T
+SELECT id FROM so ORDER BY a, id;
+----
+3
+1
+4
+2
+5
+
+query T
+SELECT id FROM so ORDER BY a DESC, id;
+----
+2
+5
+1
+4
+3
+
+query T
+SELECT id FROM so ORDER BY a NULLS FIRST, id;
+----
+2
+5
+3
+1
+4
+
+query T
+SELECT id FROM so ORDER BY a DESC NULLS LAST, id;
+----
+1
+4
+3
+2
+5
+
+query TT
+SELECT id, ts FROM so ORDER BY ts DESC;
+----
+3	NULL
+5	2024-01-03 00:00:00
+2	2024-01-02 09:00:00
+4	2024-01-01 23:59:00
+1	2024-01-01 10:00:00
+
+# Keys may be expressions, output names, positions, or input columns.
+query T
+SELECT id FROM so ORDER BY -a, id;
+----
+1
+4
+3
+2
+5
+
+query TT
+SELECT id, a * 2 AS d FROM so ORDER BY d DESC, id;
+----
+2	NULL
+5	NULL
+1	6
+4	6
+3	2
+
+query TT
+SELECT id, a AS s FROM so ORDER BY s, id;
+----
+3	1
+1	3
+4	3
+2	NULL
+5	NULL
+
+query T
+SELECT id FROM so ORDER BY 1 DESC;
+----
+5
+4
+3
+2
+1
+
+query TT
+SELECT id, s FROM so ORDER BY 2;
+----
+2	A
+5	B
+4	a
+1	b
+3	c
+
+query T
+SELECT id FROM so ORDER BY upper(s), id;
+----
+2
+4
+1
+5
+3
+
+query T
+SELECT id FROM so ORDER BY coalesce(a, 0), id DESC;
+----
+5
+2
+3
+4
+1
+
+query T
+SELECT id FROM so ORDER BY g DESC, s;
+----
+2
+4
+5
+1
+3
+
+query T
+SELECT so.id FROM so ORDER BY so.a, so.id;
+----
+3
+1
+4
+2
+5
+
+query TT
+SELECT id, length(s) || s AS k FROM so ORDER BY k;
+----
+2	1A
+5	1B
+4	1a
+1	1b
+3	1c
+
+query T
+SELECT id FROM so ORDER BY CASE WHEN a IS NULL THEN 0 ELSE 1 END, id;
+----
+2
+5
+1
+3
+4
+
+# Grouping keys may be expressions, output names, or positions.
+query TT
+SELECT g, count(*) FROM so GROUP BY g ORDER BY count(*) DESC, g;
+----
+x	3
+y	2
+
+query TT
+SELECT g, count(*) AS c FROM so GROUP BY g ORDER BY c, g;
+----
+y	2
+x	3
+
+query T
+SELECT g FROM so GROUP BY g ORDER BY sum(a) DESC;
+----
+x
+y
+
+query TT
+SELECT upper(s), count(*) FROM so GROUP BY upper(s) ORDER BY 1;
+----
+A	2
+B	2
+C	1
+
+query TT
+SELECT upper(s) AS u, count(*) FROM so GROUP BY u ORDER BY u;
+----
+A	2
+B	2
+C	1
+
+query TT
+SELECT a IS NULL, count(*) FROM so GROUP BY 1 ORDER BY 1;
+----
+f	3
+t	2
+
+query TT
+SELECT ts::date, count(*) FROM so GROUP BY ts::date ORDER BY 1;
+----
+2024-01-01	2
+2024-01-02	1
+2024-01-03	1
+NULL	1
+
+query TTT
+SELECT g, a, count(*) FROM so GROUP BY g, a ORDER BY g, a;
+----
+x	1	1
+x	3	1
+x	NULL	1
+y	3	1
+y	NULL	1
+
+query TT
+SELECT (a > 1), count(*) FROM so GROUP BY (a > 1) ORDER BY 1;
+----
+f	1
+t	2
+NULL	2
+
+query TT
+SELECT g, count(*) FROM so GROUP BY (g) ORDER BY g;
+----
+x	3
+y	2
+
+query T
+SELECT count(*) FROM so GROUP BY () ;
+----
+5
+
+query TT
+SELECT length(s), count(*) FROM so GROUP BY length(s), g ORDER BY 1, 2;
+----
+1	2
+1	3
+
+# Casts in WHERE keep their meaning.
+query T
+SELECT id FROM so WHERE ts::date = '2024-01-01' ORDER BY id;
+----
+1
+4
+
+query T
+SELECT id FROM so WHERE a::text = '3' ORDER BY id;
+----
+1
+4
+
+query T
+SELECT id FROM so WHERE ts::date > DATE '2024-01-01' ORDER BY id;
+----
+2
+5
+
+# DISTINCT, ALL, and DISTINCT ON.
+query T
+SELECT DISTINCT g FROM so ORDER BY g DESC;
+----
+y
+x
+
+query T
+SELECT DISTINCT a FROM so ORDER BY a;
+----
+1
+3
+NULL
+
+query T
+SELECT ALL g FROM so ORDER BY g;
+----
+x
+x
+x
+y
+y
+
+query TT
+SELECT DISTINCT ON (g) g, id FROM so ORDER BY g, id;
+----
+x	1
+y	2
+
+query TTT
+SELECT DISTINCT ON (g) g, id, a FROM so ORDER BY g, a DESC NULLS LAST, id;
+----
+x	1	3
+y	4	3
+
+query TT
+SELECT DISTINCT ON (a) a, s FROM so ORDER BY a, s;
+----
+1	c
+3	a
+NULL	A
+
+query T rowsort
+SELECT DISTINCT ON (g) g FROM so;
+----
+x
+y
+
+# LIMIT, OFFSET, and FETCH.
+query T
+SELECT id FROM so ORDER BY id LIMIT 2 OFFSET 1;
+----
+2
+3
+
+query T
+SELECT id FROM so ORDER BY id FETCH FIRST 2 ROWS ONLY;
+----
+1
+2
+
+query T
+SELECT id FROM so ORDER BY id OFFSET 3 ROWS FETCH NEXT 1 ROW ONLY;
+----
+4
+
+query T
+SELECT id FROM so ORDER BY id FETCH FIRST ROW ONLY;
+----
+1
+
+query T
+SELECT id FROM so ORDER BY id LIMIT NULL;
+----
+1
+2
+3
+4
+5
+
+query T
+SELECT id FROM so ORDER BY id LIMIT 1 + 1;
+----
+1
+2
+
+query T
+SELECT id FROM so ORDER BY id LIMIT ALL OFFSET 4;
+----
+5
+
+# Set operations sort and limit the combined rows.
+query T
+SELECT a FROM so UNION SELECT id FROM so ORDER BY 1;
+----
+1
+2
+3
+4
+5
+NULL
+
+query T
+SELECT a FROM so UNION ALL SELECT id FROM so ORDER BY a DESC LIMIT 3;
+----
+NULL
+NULL
+5
+
+query T
+SELECT s FROM so UNION SELECT g FROM so ORDER BY s LIMIT 4 OFFSET 1;
+----
+B
+a
+b
+c
+
+query T
+SELECT id FROM so EXCEPT SELECT a FROM so ORDER BY id DESC;
+----
+5
+4
+2
+
+# Window ORDER BY uses the same NULL order; an ordered window's default
+# frame runs from the partition start to the current row's last peer.
+query TT
+SELECT id, rank() OVER (ORDER BY a) FROM so ORDER BY id;
+----
+1	2
+2	4
+3	1
+4	2
+5	4
+
+query TT
+SELECT id, row_number() OVER (ORDER BY a DESC) FROM so ORDER BY id;
+----
+1	3
+2	1
+3	5
+4	4
+5	2
+
+query TT
+SELECT id, sum(a) OVER (PARTITION BY g ORDER BY id) FROM so ORDER BY id;
+----
+1	3
+2	NULL
+3	4
+4	3
+5	4
+
+query TT
+SELECT id, sum(a) OVER (ORDER BY a) FROM so ORDER BY id;
+----
+1	7
+2	7
+3	1
+4	7
+5	7
+
+query TT
+SELECT id, count(*) OVER (PARTITION BY g) FROM so ORDER BY id;
+----
+1	3
+2	2
+3	3
+4	2
+5	3
+
+query TT
+SELECT id, last_value(id) OVER (ORDER BY a) FROM so ORDER BY id;
+----
+1	4
+2	5
+3	3
+4	4
+5	5
+
+# Aggregates skip NULLs and are NULL over no values.
+query TTTTTT
+SELECT sum(a), avg(a), min(a), max(a), count(a), count(*) FROM so WHERE a IS NULL;
+----
+NULL	NULL	NULL	NULL	0	2
+
+query TT
+SELECT g, sum(a) FROM so GROUP BY g ORDER BY g;
+----
+x	4
+y	3
+
+query T
+SELECT count(*) FROM so ORDER BY count(*);
+----
+5
+
+# Invalid clauses fail instead of being ignored.
+statement error
+SELECT id FROM so ORDER BY nosuchcol;
+
+statement error
+SELECT id FROM so ORDER BY 5;
+
+statement error
+SELECT id FROM so ORDER BY 0;
+
+statement error
+SELECT id FROM so ORDER BY 'x';
+
+statement error
+SELECT id FROM so GROUP BY nosuchcol;
+
+statement error
+SELECT g FROM so GROUP BY 2;
+
+statement error
+SELECT id FROM so GROUP BY 'x';
+
+statement error
+SELECT count(*) FROM so GROUP BY count(*);
+
+statement error
+SELECT DISTINCT g FROM so ORDER BY id;
+
+statement error
+SELECT DISTINCT ON (g) g, id FROM so ORDER BY id;
+
+statement error
+SELECT id FROM so LIMIT -1;
+
+statement error
+SELECT id FROM so OFFSET -1;
+
+statement error
+SELECT id FROM so LIMIT id;
+
+statement error
+SELECT a FROM so UNION SELECT id FROM so ORDER BY a + 1;
+
+statement error
+SELECT a FROM so UNION SELECT id FROM so ORDER BY 2;
+
+statement ok
+DROP TABLE so;

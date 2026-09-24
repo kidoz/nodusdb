@@ -54,14 +54,20 @@ impl MemExecutor {
             limit,
             offset,
             distinct,
+            sort,
+            group_exprs,
+            distinct_on,
         } = &plan
             && ctes.is_empty()
             && joins.is_empty()
             && group_by.is_empty()
+            && group_exprs.is_empty()
             && grouping_sets.is_none()
             && having.is_none()
             && order_by.is_empty()
+            && sort.is_empty()
             && !*distinct
+            && distinct_on.is_empty()
             && projection.iter().all(|p| {
                 matches!(
                     p,
