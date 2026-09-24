@@ -861,7 +861,7 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
             match chrono::NaiveDate::from_ymd_opt(y as i32, mo as u32, d as u32).and_then(|date| {
                 date.and_hms_micro_opt(h as u32, mi as u32, secs.trunc() as u32, micros)
             }) {
-                Some(ts) => Value::Text(format_timestamp(ts, false)),
+                Some(ts) => Value::Text(crate::value::format_timestamp(ts, false)),
                 None => raise("date/time field value out of range"),
             }
         }
@@ -1225,7 +1225,7 @@ fn session_time(pick: impl Fn(&session_env::SessionEnv) -> i64) -> Option<i64> {
 /// Renders microseconds since the epoch as PostgreSQL timestamp text in UTC.
 fn timestamp(micros: i64, with_zone: bool) -> Value {
     match chrono::DateTime::from_timestamp_micros(micros) {
-        Some(dt) => Value::Text(format_timestamp(dt.naive_utc(), with_zone)),
+        Some(dt) => Value::Text(crate::value::format_timestamp(dt.naive_utc(), with_zone)),
         None => raise("timestamp out of range"),
     }
 }
@@ -1293,20 +1293,6 @@ fn format_type(oid: i64, typmod: Option<i64>) -> String {
         _ => "???",
     };
     base.to_string()
-}
-
-fn format_timestamp(ts: chrono::NaiveDateTime, with_zone: bool) -> String {
-    let mut out = ts.format("%Y-%m-%d %H:%M:%S").to_string();
-    let micros = ts.and_utc().timestamp_subsec_micros();
-    if micros != 0 {
-        let frac = format!("{micros:06}");
-        out.push('.');
-        out.push_str(frac.trim_end_matches('0'));
-    }
-    if with_zone {
-        out.push_str("+00");
-    }
-    out
 }
 
 fn search_path() -> Vec<String> {

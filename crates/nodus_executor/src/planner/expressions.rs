@@ -37,11 +37,14 @@ pub fn expr_to_value(expr: &sqlparser::ast::Expr, params: &[crate::Value]) -> Op
             _ => None,
         },
         Expr::Identifier(id) => Some(crate::Value::Text(id.value.clone())),
-        // Typed string literals like `DATE '2024-06-15'` / `TIMESTAMP '...'`.
-        // NodusDB has no native temporal type, so the value is kept as text
-        // (ISO-8601 text compares/sorts chronologically).
+        // Typed string literals like `DATE '2024-06-15'` / `TIMESTAMP '...'`,
+        // in the type's canonical text. NodusDB has no native temporal type, so
+        // dates stay ISO-8601 text (which compares and sorts chronologically).
+        // Invalid input is `None`; the scalar path reports it when evaluated.
         Expr::TypedString(ts) => match &ts.value.value {
-            SqlValue::SingleQuotedString(s) => Some(crate::Value::Text(s.clone())),
+            SqlValue::SingleQuotedString(s) => {
+                try_cast(crate::Value::Text(s.clone()), &ts.data_type.to_string()).ok()
+            }
             _ => None,
         },
         // `INTERVAL '1 day'` — NodusDB has no native interval type, so it's kept
@@ -404,6 +407,16 @@ pub(crate) fn try_cast(v: Value, data_type: &str) -> std::result::Result<Value, 
                     serde_json::from_str::<serde_json::Value>(s).map_err(|_| invalid(s))?;
                     v
                 }
+                Value::Text(s) if let Some(kind) = crate::value::temporal_type(data_type) => {
+                    match crate::value::normalize_temporal(s, kind) {
+                        Some(text) => Value::Text(text),
+                        // Well-formed but impossible (`2024-02-30`, `25:00`).
+                        None if crate::value::looks_temporal(s) => {
+                            return Err(format!("date/time field value out of range: \"{s}\""));
+                        }
+                        None => return Err(invalid(s)),
+                    }
+                }
                 Value::Text(s) if upper == "UUID" => Value::Text(
                     uuid::Uuid::parse_str(s.trim())
                         .map_err(|_| invalid(s))?
@@ -579,9 +592,17 @@ pub(crate) fn lower_scalar(expr: &sqlparser::ast::Expr, params: &[Value]) -> Opt
         Expr::Value(v) if matches!(v.value, sqlparser::ast::Value::Placeholder(_)) => Some(
             ScalarExpr::Literal(expr_to_value(expr, params).unwrap_or(Value::Null)),
         ),
-        Expr::Value(_) | Expr::TypedString(_) | Expr::Interval(_) => {
-            expr_to_value(expr, params).map(ScalarExpr::Literal)
-        }
+        Expr::Value(_) | Expr::Interval(_) => expr_to_value(expr, params).map(ScalarExpr::Literal),
+        // A typed literal is a cast of its text, so invalid input fails when
+        // the statement runs, with the cast's error.
+        Expr::TypedString(ts) => match (&ts.value.value, expr_to_value(expr, params)) {
+            (_, Some(value)) => Some(ScalarExpr::Literal(value)),
+            (sqlparser::ast::Value::SingleQuotedString(s), None) => Some(ScalarExpr::Cast {
+                expr: Box::new(ScalarExpr::Literal(Value::Text(s.clone()))),
+                target: ts.data_type.to_string(),
+            }),
+            _ => None,
+        },
         // `ARRAY[...]`: a constant when every element is, else built per row.
         Expr::Array(array) => {
             let items = array
@@ -1606,6 +1627,34 @@ fn interval_date_arith(op: ScalarBinaryOp, l: &Value, r: &Value) -> Value {
     if !matches!(op, ScalarBinaryOp::Add | ScalarBinaryOp::Sub) {
         return Value::Null;
     }
+    let bare_date = |text: &str| {
+        crate::value::parse_temporal(text)
+            .filter(|t| t.time.is_none())
+            .map(|t| t.date)
+    };
+    // date ± integer days, integer + date, and date - date (whole days).
+    match (l, r) {
+        (Value::Text(date), Value::Int(days)) | (Value::Int(days), Value::Text(date))
+            if bare_date(date).is_some()
+                && (matches!(l, Value::Text(_)) || matches!(op, ScalarBinaryOp::Add)) =>
+        {
+            let days = if matches!(op, ScalarBinaryOp::Sub) {
+                -days
+            } else {
+                *days
+            };
+            return bare_date(date)
+                .and_then(|d| d.checked_add_signed(chrono::Duration::days(days)))
+                .map(|d| Value::Text(d.format("%Y-%m-%d").to_string()))
+                .unwrap_or_else(|| crate::eval_error::raise("date out of range"));
+        }
+        (Value::Text(a), Value::Text(b)) if matches!(op, ScalarBinaryOp::Sub) => {
+            if let (Some(a), Some(b)) = (bare_date(a), bare_date(b)) {
+                return Value::Int((a - b).num_days());
+            }
+        }
+        _ => {}
+    }
     let (Value::Text(ls), Value::Text(rs)) = (l, r) else {
         return Value::Null;
     };
@@ -1649,20 +1698,24 @@ pub(crate) fn apply_date_offset(v: &Value, months: i64, days: i64, seconds: i64)
         Value::Text(s) => s.trim().to_string(),
         other => render(other),
     };
-    if let Ok(dt) = NaiveDateTime::parse_from_str(&text, "%Y-%m-%d %H:%M:%S") {
-        let shifted = add_months(dt, months) + Duration::days(days) + Duration::seconds(seconds);
-        return Value::Text(shifted.format("%Y-%m-%d %H:%M:%S").to_string());
+    let Some(parsed) = crate::value::parse_temporal(&text) else {
+        return Value::Null;
+    };
+    let base = match parsed.offset {
+        Some(_) => parsed.utc(),
+        None => parsed.date.and_time(parsed.time.unwrap_or_default()),
+    };
+    let shifted = add_months(base, months) + Duration::days(days) + Duration::seconds(seconds);
+    // A date shifted by whole days stays a date; otherwise the result is a
+    // timestamp, zoned if the input was.
+    if parsed.time.is_none() && seconds == 0 {
+        Value::Text(shifted.date().format("%Y-%m-%d").to_string())
+    } else {
+        Value::Text(crate::value::format_timestamp(
+            shifted,
+            parsed.offset.is_some(),
+        ))
     }
-    if let Ok(d) = NaiveDate::parse_from_str(&text, "%Y-%m-%d") {
-        let base = d.and_hms_opt(0, 0, 0).unwrap();
-        let shifted = add_months(base, months) + Duration::days(days) + Duration::seconds(seconds);
-        return if seconds != 0 {
-            Value::Text(shifted.format("%Y-%m-%d %H:%M:%S").to_string())
-        } else {
-            Value::Text(shifted.date().format("%Y-%m-%d").to_string())
-        };
-    }
-    Value::Null
 }
 
 /// Keywords PostgreSQL evaluates as functions without parentheses.

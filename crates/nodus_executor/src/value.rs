@@ -89,8 +89,11 @@ pub(crate) fn coerce_for_column(value: &Value, data_type: &str) -> Value {
         Value::Text(s) if array_element_type(data_type).is_some() => {
             coerce_array_text(s, data_type).unwrap_or_else(|| value.clone())
         }
-        // Text into a numeric or boolean column must parse as that type.
-        Value::Text(_) if column_type(data_type) != ColumnType::Text => {
+        // Text into a numeric, boolean, or date/time column must parse as
+        // that type (date/time text is stored in its canonical form).
+        Value::Text(_)
+            if column_type(data_type) != ColumnType::Text || temporal_type(data_type).is_some() =>
+        {
             crate::planner::cast_value(value.clone(), data_type)
         }
         Value::Text(s) => coerce(s, ColumnType::Text),
@@ -132,6 +135,8 @@ pub(crate) fn sql_type_name(data_type: &str) -> String {
         "numeric"
     } else if t.contains("BOOL") {
         "boolean"
+    } else if temporal_type(&t) == Some(Temporal::TimestampTz) {
+        "timestamp with time zone"
     } else {
         return data_type.trim().to_ascii_lowercase();
     };
@@ -360,16 +365,190 @@ pub(crate) fn is_visibility_fn(name: &str) -> bool {
 }
 
 /// Parses an ISO date or timestamp text into a `NaiveDateTime` (a bare date
-/// becomes midnight).
+/// becomes midnight; a zoned timestamp is converted to UTC).
 fn parse_naive_dt(s: &str) -> Option<chrono::NaiveDateTime> {
-    let s = s.trim();
-    chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
+    parse_temporal(s).map(|t| t.utc())
+}
+
+/// The date/time types, which NodusDB stores as ISO text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Temporal {
+    Date,
+    Time,
+    Timestamp,
+    TimestampTz,
+}
+
+/// The date/time type a declared type names, if any (`TIMESTAMP(3) WITH TIME
+/// ZONE` is `TimestampTz`).
+pub(crate) fn temporal_type(data_type: &str) -> Option<Temporal> {
+    let upper = data_type.trim().to_ascii_uppercase();
+    let without_precision = match (upper.find('('), upper.find(')')) {
+        (Some(open), Some(close)) if open < close => {
+            format!("{}{}", &upper[..open], &upper[close + 1..])
+        }
+        _ => upper,
+    };
+    let words = without_precision
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    Some(match words.as_str() {
+        "DATE" => Temporal::Date,
+        "TIME" | "TIME WITHOUT TIME ZONE" => Temporal::Time,
+        "TIMESTAMP" | "TIMESTAMP WITHOUT TIME ZONE" => Temporal::Timestamp,
+        "TIMESTAMPTZ" | "TIMESTAMP WITH TIME ZONE" => Temporal::TimestampTz,
+        _ => return None,
+    })
+}
+
+/// A parsed date/time literal: a date, an optional time of day, and an
+/// optional UTC offset in seconds.
+pub(crate) struct ParsedTemporal {
+    pub(crate) date: chrono::NaiveDate,
+    pub(crate) time: Option<chrono::NaiveTime>,
+    pub(crate) offset: Option<i64>,
+}
+
+impl ParsedTemporal {
+    fn local(&self) -> chrono::NaiveDateTime {
+        self.date.and_time(self.time.unwrap_or_default())
+    }
+
+    /// The instant in UTC (a value without a zone is taken as UTC).
+    pub(crate) fn utc(&self) -> chrono::NaiveDateTime {
+        self.local() - chrono::Duration::seconds(self.offset.unwrap_or(0))
+    }
+}
+
+/// Parses ISO date/timestamp text: `YYYY-MM-DD`, optionally followed (after a
+/// space or `T`) by `HH:MM[:SS[.fraction]]` and a zone (`Z`, `UTC`, `+HH`,
+/// `+HH:MM`, `-HHMM`).
+pub(crate) fn parse_temporal(text: &str) -> Option<ParsedTemporal> {
+    let text = text.trim();
+    let (date_text, rest) = match text.find([' ', 'T']) {
+        Some(at) => (&text[..at], text[at + 1..].trim()),
+        None => (text, ""),
+    };
+    let date = chrono::NaiveDate::parse_from_str(date_text, "%Y-%m-%d").ok()?;
+    if rest.is_empty() {
+        return Some(ParsedTemporal {
+            date,
+            time: None,
+            offset: None,
+        });
+    }
+    let zone_at = rest
+        .find(|c: char| c == '+' || c == '-' || c == ' ' || c.is_ascii_alphabetic())
+        .unwrap_or(rest.len());
+    let time = parse_time_of_day(&rest[..zone_at])?;
+    let offset = parse_utc_offset(rest[zone_at..].trim())?;
+    Some(ParsedTemporal {
+        date,
+        time: Some(time),
+        offset,
+    })
+}
+
+/// `HH:MM[:SS[.fraction]]`.
+fn parse_time_of_day(text: &str) -> Option<chrono::NaiveTime> {
+    let text = text.trim();
+    chrono::NaiveTime::parse_from_str(text, "%H:%M:%S%.f")
+        .or_else(|_| chrono::NaiveTime::parse_from_str(text, "%H:%M"))
         .ok()
-        .or_else(|| {
-            chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
-                .ok()
-                .and_then(|d| d.and_hms_opt(0, 0, 0))
-        })
+}
+
+/// A zone suffix as seconds east of UTC: `None` when absent, and a parse
+/// failure (`None` outer) when malformed.
+fn parse_utc_offset(zone: &str) -> Option<Option<i64>> {
+    if zone.is_empty() {
+        return Some(None);
+    }
+    if ["Z", "UTC", "GMT"]
+        .iter()
+        .any(|z| zone.eq_ignore_ascii_case(z))
+    {
+        return Some(Some(0));
+    }
+    let sign = match zone.as_bytes().first()? {
+        b'+' => 1,
+        b'-' => -1,
+        _ => return None,
+    };
+    let digits: String = zone[1..].chars().filter(|c| *c != ':').collect();
+    if !digits.bytes().all(|b| b.is_ascii_digit()) || !matches!(digits.len(), 1 | 2 | 4) {
+        return None;
+    }
+    let (hours, minutes) = if digits.len() == 4 {
+        (
+            digits[..2].parse::<i64>().ok()?,
+            digits[2..].parse::<i64>().ok()?,
+        )
+    } else {
+        (digits.parse::<i64>().ok()?, 0)
+    };
+    Some(Some(sign * (hours * 3600 + minutes * 60)))
+}
+
+/// Canonical PostgreSQL text for a date/time value of type `ty`, or `None` if
+/// `text` is not valid input for it. A zoned timestamp is shown in UTC.
+pub(crate) fn normalize_temporal(text: &str, ty: Temporal) -> Option<String> {
+    let trimmed = text.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if ty != Temporal::Time && matches!(lower.as_str(), "infinity" | "-infinity") {
+        return Some(lower);
+    }
+    if lower == "epoch" && ty != Temporal::Time {
+        return normalize_temporal("1970-01-01 00:00:00+00", ty);
+    }
+    if ty == Temporal::Time {
+        let time =
+            parse_time_of_day(trimmed).or_else(|| parse_temporal(trimmed).and_then(|t| t.time))?;
+        return Some(
+            format_timestamp(chrono::NaiveDate::default().and_time(time), false)[11..].to_string(),
+        );
+    }
+    let parsed = parse_temporal(trimmed)?;
+    Some(match ty {
+        Temporal::Date => parsed.date.format("%Y-%m-%d").to_string(),
+        // A timestamp without time zone ignores any zone in its input.
+        Temporal::Timestamp => format_timestamp(parsed.local(), false),
+        Temporal::TimestampTz => format_timestamp(parsed.utc(), true),
+        Temporal::Time => unreachable!("handled above"),
+    })
+}
+
+/// Whether text has the shape of a date or time (digits separated by `-` or
+/// `:`), so a failed parse means an out-of-range field rather than bad syntax.
+pub(crate) fn looks_temporal(text: &str) -> bool {
+    let text = text.trim();
+    let date = text.split([' ', 'T']).next().unwrap_or_default();
+    let is_numeric_parts = |part: &str, sep: char, count: usize| {
+        let parts: Vec<&str> = part.split(sep).collect();
+        parts.len() == count
+            && parts
+                .iter()
+                .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+    };
+    is_numeric_parts(date, '-', 3)
+        || is_numeric_parts(text, ':', 2)
+        || is_numeric_parts(text.split('.').next().unwrap_or_default(), ':', 3)
+}
+
+/// PostgreSQL's timestamp text: seconds always shown, a fraction only when
+/// non-zero, and `+00` for a timestamp with time zone (shown in UTC).
+pub(crate) fn format_timestamp(ts: chrono::NaiveDateTime, with_zone: bool) -> String {
+    let mut out = ts.format("%Y-%m-%d %H:%M:%S").to_string();
+    let micros = ts.and_utc().timestamp_subsec_micros();
+    if micros != 0 {
+        let frac = format!("{micros:06}");
+        out.push('.');
+        out.push_str(frac.trim_end_matches('0'));
+    }
+    if with_zone {
+        out.push_str("+00");
+    }
+    out
 }
 
 /// `date_trunc(unit, ts)` — truncates to year/month/day/hour/minute/second and

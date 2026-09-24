@@ -42,6 +42,10 @@ impl MemExecutor {
         match op {
             Operand::Literal(val) => {
                 match val {
+                    // Date/time text compares in its canonical form.
+                    Value::Text(_) if crate::value::temporal_type(expected_type).is_some() => {
+                        crate::value::coerce_for_column(val, expected_type)
+                    }
                     Value::Text(s) => coerce(s, column_type(expected_type)),
                     _ => val.clone(), // already typed correctly if it was binary bound
                 }

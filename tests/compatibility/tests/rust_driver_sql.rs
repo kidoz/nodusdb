@@ -678,6 +678,10 @@ async fn expression_errors_carry_postgres_sqlstates() {
                 SqlState::INVALID_TEXT_REPRESENTATION,
             ),
             (
+                "SELECT DATE '2024-02-30'",
+                SqlState::DATETIME_FIELD_OVERFLOW,
+            ),
+            (
                 "SELECT sqrt(-1)",
                 SqlState::INVALID_ARGUMENT_FOR_POWER_FUNCTION,
             ),
