@@ -21,6 +21,11 @@ impl MemExecutor {
             let mut type_hint = type_hint;
             let value = match deferred.next().flatten() {
                 Some(DeferredItem::Scalar(expr)) => {
+                    // With no relation of its own, any column it still names
+                    // (an enclosing query's are bound by now) does not exist.
+                    let mut refs = Vec::new();
+                    crate::filter_eval::scalar_column_refs(&expr, &mut refs);
+                    crate::filter_eval::check_column_refs(refs, &[])?;
                     type_hint =
                         type_hint.or_else(|| crate::result_types::constant_expr_type(&expr));
                     let value = self.eval_expr(ctx, &expr, &[], &[]);

@@ -590,8 +590,9 @@ fn correlate_plan(
             }
             let scalar = |e: &crate::ScalarExpr| correlate_scalar(e, outer_row, outer_cols, &quals);
             let cond = |f: &FilterExpr| correlate_filter(f, outer_row, outer_cols, &quals);
+            // A CTE or derived table cannot see the relations beside it.
             for (_, cte) in ctes.iter_mut() {
-                **cte = correlate_plan(cte, outer_row, outer_cols, &quals);
+                **cte = correlate_plan(cte, outer_row, outer_cols, enclosing_quals);
             }
             if let Some(f) = filter.as_mut() {
                 *f = cond(f);
@@ -658,9 +659,57 @@ fn correlate_plan(
                 }
             }
         }
+        // A SELECT without FROM has no columns of its own, so even an
+        // unqualified name is the outer row's — unless a query in between
+        // may have it.
+        LogicalPlan::SelectLiteral {
+            filter, deferred, ..
+        } => {
+            for item in deferred.iter_mut().flatten() {
+                match item {
+                    crate::DeferredItem::Scalar(e) if enclosing_quals.is_empty() => {
+                        *e = bind_outer_columns(e, outer_row, outer_cols);
+                    }
+                    crate::DeferredItem::Scalar(e) => {
+                        *e = correlate_scalar(e, outer_row, outer_cols, enclosing_quals);
+                    }
+                    crate::DeferredItem::Subquery(plan)
+                    | crate::DeferredItem::Exists { plan, .. } => {
+                        **plan = correlate_plan(plan, outer_row, outer_cols, enclosing_quals);
+                    }
+                }
+            }
+            if let Some(f) = filter.as_mut() {
+                *f = correlate_filter(f, outer_row, outer_cols, enclosing_quals);
+            }
+        }
         _ => {}
     }
     p
+}
+
+/// Replaces every column reference the outer row has with its value.
+fn bind_outer_columns(
+    expr: &crate::ScalarExpr,
+    outer_row: &[Value],
+    outer_cols: &[String],
+) -> crate::ScalarExpr {
+    match expr {
+        crate::ScalarExpr::Column(n) => match outer_lookup(n, outer_cols, outer_row) {
+            Some(v) => crate::ScalarExpr::Literal(v),
+            None => expr.clone(),
+        },
+        crate::ScalarExpr::Subquery { plan, kind } => crate::ScalarExpr::Subquery {
+            plan: crate::SubPlan(Box::new(correlate_plan(
+                &plan.0,
+                outer_row,
+                outer_cols,
+                &[],
+            ))),
+            kind: *kind,
+        },
+        _ => expr.map_children(&mut |e| bind_outer_columns(e, outer_row, outer_cols)),
+    }
 }
 
 /// Rewrites a scalar expression, replacing correlated outer column references

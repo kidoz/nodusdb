@@ -303,3 +303,54 @@ DROP TABLE b4;
 
 statement ok
 DROP TABLE c4;
+
+# A subquery without FROM reads the columns of the query around it.
+statement ok
+CREATE TABLE fl5 (k INT, v TEXT);
+
+statement ok
+INSERT INTO fl5 VALUES (1, 'a'), (2, 'b');
+
+query TT
+SELECT k, (SELECT k + 1) FROM fl5 ORDER BY k;
+----
+1	2
+2	3
+
+query TT
+SELECT k, (SELECT fl5.k * 10) AS x FROM fl5 ORDER BY k;
+----
+1	10
+2	20
+
+query TTTT
+SELECT * FROM fl5 f, LATERAL (SELECT f.k * 2 AS kk, v || '!' AS vv) l ORDER BY k;
+----
+1	a	2	a!
+2	b	4	b!
+
+query T
+SELECT k FROM fl5 WHERE (SELECT fl5.k) = 2;
+----
+2
+
+query TT
+SELECT k, (SELECT max(z) FROM (SELECT k) q(z)) FROM fl5 ORDER BY k;
+----
+1	1
+2	2
+
+query TT
+SELECT k, ARRAY(SELECT k UNION SELECT k + 5 ORDER BY 1) FROM fl5 ORDER BY k;
+----
+1	{1,6}
+2	{2,7}
+
+statement error
+SELECT x;
+
+statement error
+SELECT fl5.k;
+
+statement error
+SELECT (SELECT nosuch) FROM fl5;

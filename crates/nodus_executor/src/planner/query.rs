@@ -254,9 +254,8 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
                             format!("Unsupported expression in SELECT: {expr}")
                         })
                     })?;
-                    if let Some(column) = first_column_reference(&scalar) {
-                        anyhow::bail!("column \"{column}\" does not exist");
-                    }
+                    // A column reference is an enclosing query's (checked
+                    // when the query runs, once those are bound).
                     DeferredItem::Scalar(scalar)
                 }
             };
