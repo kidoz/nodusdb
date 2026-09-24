@@ -270,6 +270,31 @@ CREATE TABLE ch (x INT CHECK (x > (SELECT 1)));
 statement error
 CREATE TABLE dv (x INT DEFAULT (SELECT 1));
 
+# A column must belong to a relation of the query.
+statement error
+SELECT * FROM b4 WHERE b4.a_id = a4.id;
+
+statement error
+SELECT a4.id FROM b4;
+
+statement error
+SELECT x.id FROM a4;
+
+statement error
+SELECT * FROM a4 t WHERE a4.id = 1;
+
+statement error
+SELECT * FROM b4 JOIN a4 ON b4.a_id = a4.id WHERE zz.id = 1;
+
+statement error
+SELECT * FROM b4 JOIN a4 ON b4.a_id = zz.id;
+
+statement error
+SELECT * FROM a4 WHERE nosuch = 1;
+
+statement error
+SELECT a4.nosuch FROM a4;
+
 statement ok
 DROP TABLE a4;
 

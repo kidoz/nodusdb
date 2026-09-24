@@ -169,6 +169,12 @@ impl MemExecutor {
             .map(|c| format!("{}.{}", prefix, c.name))
             .collect();
         let joined_columns = tbl.columns.clone();
+        // Every column the condition names must be one of the table's.
+        if let Some(condition) = filter {
+            let mut refs = Vec::new();
+            crate::filter_eval::filter_column_refs(condition, &mut refs);
+            crate::filter_eval::check_column_refs(refs, &col_names)?;
+        }
 
         // Resolve output columns, types, and source indices up front. Types come
         // straight from the catalog descriptors, so the schema is known before any

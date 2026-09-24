@@ -10,9 +10,11 @@ use crate::{
 use anyhow::Result;
 use nodus_catalog::ColumnDescriptor;
 
-/// Resolves a column reference against a row's column names: exact match,
-/// `<qual>.<name>` suffix match, then — for a qualified reference against bare
-/// columns (e.g. `t.a` on a single-table scan) — the bare tail of the name.
+/// Resolves a column reference against a row's column names: an exact match or
+/// a `<qualifier>.<name>` suffix match. A qualified reference never matches
+/// another relation's column: it falls back only to an unqualified column name
+/// (the rows of a single table, e.g. `t.a` in `UPDATE t ... WHERE t.a = 1`), or
+/// drops a leading schema (`public.t.a` is `t.a`).
 pub(crate) fn col_pos(col_names: &[String], name: &str) -> Option<usize> {
     if let Some(i) = col_names
         .iter()
@@ -20,13 +22,107 @@ pub(crate) fn col_pos(col_names: &[String], name: &str) -> Option<usize> {
     {
         return Some(i);
     }
-    let tail = name.rsplit('.').next()?;
-    if tail == name {
-        return None;
+    let (qualifier, tail) = name.rsplit_once('.')?;
+    if let Some(i) = col_names.iter().position(|c| c == tail) {
+        return Some(i);
     }
+    let (_, table) = qualifier.split_once('.')?;
+    col_pos(col_names, &format!("{table}.{tail}"))
+}
+
+/// Whether some column is qualified by `qualifier` (a table name or alias).
+fn qualifier_in_scope(col_names: &[String], qualifier: &str) -> bool {
+    let prefix = format!("{qualifier}.");
+    let inner = format!(".{qualifier}.");
     col_names
         .iter()
-        .position(|c| c == tail || c.ends_with(&format!(".{tail}")))
+        .any(|c| c.starts_with(&prefix) || c.contains(&inner))
+}
+
+/// Checks that every column reference in `names` resolves against the row's
+/// columns, with PostgreSQL's errors: a qualifier naming no relation of the
+/// query, or a column the relations lack. JSON-access names check their base
+/// column.
+pub(crate) fn check_column_refs(
+    names: impl IntoIterator<Item = String>,
+    col_names: &[String],
+) -> Result<()> {
+    for name in names {
+        let name = match parse_json_ref(&name) {
+            Some((base, _, _)) => base,
+            None => name,
+        };
+        if col_pos(col_names, &name).is_some() {
+            continue;
+        }
+        match name.rsplit_once('.') {
+            Some((qualifier, _)) if !qualifier_in_scope(col_names, qualifier) => {
+                anyhow::bail!("missing FROM-clause entry for table \"{qualifier}\"")
+            }
+            _ => anyhow::bail!("column \"{name}\" does not exist"),
+        }
+    }
+    Ok(())
+}
+
+/// The column references in a condition (not inside its subqueries, which
+/// are checked when they run).
+pub(crate) fn filter_column_refs(filter: &FilterExpr, out: &mut Vec<String>) {
+    match filter {
+        FilterExpr::Predicate(p) => {
+            out.push(p.left.clone());
+            if let Operand::Ident(right) = &p.right {
+                out.push(right.clone());
+            }
+        }
+        FilterExpr::And(a, b) | FilterExpr::Or(a, b) => {
+            filter_column_refs(a, out);
+            filter_column_refs(b, out);
+        }
+        FilterExpr::Not(a) => filter_column_refs(a, out),
+        FilterExpr::IsNull(c) | FilterExpr::IsNotNull(c) => out.push(c.clone()),
+        FilterExpr::InList { left, list, .. } => {
+            out.push(left.clone());
+            out.extend(list.iter().filter_map(|o| match o {
+                Operand::Ident(n) => Some(n.clone()),
+                _ => None,
+            }));
+        }
+        FilterExpr::InSubquery { left, .. } | FilterExpr::CompareSubquery { left, .. } => {
+            if !left.is_empty() {
+                out.push(left.clone());
+            }
+        }
+        FilterExpr::ExprCmp { left, right, .. } => {
+            scalar_column_refs(left, out);
+            scalar_column_refs(right, out);
+        }
+        FilterExpr::Scalar(e) => scalar_column_refs(e, out),
+        FilterExpr::QuantifiedSubquery { left, .. } => scalar_column_refs(left, out),
+        FilterExpr::Exists { .. } => {}
+    }
+}
+
+/// The column references in an expression (not inside its subqueries).
+pub(crate) fn scalar_column_refs(expr: &crate::ScalarExpr, out: &mut Vec<String>) {
+    match expr {
+        crate::ScalarExpr::Column(name) => out.push(name.clone()),
+        crate::ScalarExpr::Aggregate {
+            arg,
+            arg_expr: None,
+            ..
+        } if arg != "*" && !arg.is_empty() => {
+            out.push(arg.clone());
+            for child in expr.children() {
+                scalar_column_refs(child, out);
+            }
+        }
+        _ => {
+            for child in expr.children() {
+                scalar_column_refs(child, out);
+            }
+        }
+    }
 }
 
 impl MemExecutor {

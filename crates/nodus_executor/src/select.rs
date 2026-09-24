@@ -353,6 +353,11 @@ impl MemExecutor {
                 let mut combined_desc = joined_columns.clone();
                 combined_desc.extend(lateral_cols);
                 let width = header.0.len();
+                if !query_has_virtual && let Some(condition) = join.condition.as_ref() {
+                    let mut refs = Vec::new();
+                    crate::filter_eval::filter_column_refs(condition, &mut refs);
+                    crate::filter_eval::check_column_refs(refs, &combined_cols)?;
+                }
                 let keep_unmatched = matches!(join.join_type, JoinType::LeftOuter);
                 let mut next_rows = Vec::new();
                 for (r1, out) in stored_rows.iter().zip(per_row) {
@@ -542,6 +547,11 @@ impl MemExecutor {
                     None
                 };
 
+            if !query_has_virtual && let Some(condition) = join.condition.as_ref() {
+                let mut refs = Vec::new();
+                crate::filter_eval::filter_column_refs(condition, &mut refs);
+                crate::filter_eval::check_column_refs(refs, &combined_cols)?;
+            }
             let mut next_rows = Vec::new();
             let mut right_matched = vec![false; j_rows.len()];
             for r1 in &stored_rows {
@@ -607,16 +617,36 @@ impl MemExecutor {
                         anyhow::bail!("function {}() does not exist", name.to_ascii_lowercase());
                     }
                 }
-                if let ProjectionItem::Column(c) | ProjectionItem::AliasedColumn(c, _) = item {
-                    let bare = c.rsplit('.').next().unwrap_or(c);
-                    let known = col_names
-                        .iter()
-                        .any(|cn| cn == c || cn == bare || cn.ends_with(&format!(".{bare}")));
-                    if !known {
-                        anyhow::bail!("column \"{bare}\" does not exist");
+            }
+            // Every column the query names must be one of its relations'
+            // columns; a qualified name must name one of its relations.
+            let mut refs = Vec::new();
+            for item in &projection {
+                match item {
+                    ProjectionItem::Column(c) | ProjectionItem::AliasedColumn(c, _) => {
+                        refs.push(c.clone())
                     }
+                    ProjectionItem::Expr { expr, .. } => {
+                        crate::filter_eval::scalar_column_refs(expr, &mut refs)
+                    }
+                    _ => {}
                 }
             }
+            if let Some(f) = filter.as_ref() {
+                crate::filter_eval::filter_column_refs(f, &mut refs);
+            }
+            for (_, expr) in &group_exprs {
+                crate::filter_eval::scalar_column_refs(expr, &mut refs);
+            }
+            for target in &key_targets {
+                match target {
+                    SortTarget::Expr(e) => crate::filter_eval::scalar_column_refs(e, &mut refs),
+                    // A bare name may name an output column instead.
+                    SortTarget::Name(n) if n.contains('.') => refs.push(n.clone()),
+                    _ => {}
+                }
+            }
+            crate::filter_eval::check_column_refs(refs, &col_names)?;
         }
 
         // `LIMIT 0` returns no rows, so no row is evaluated (as in

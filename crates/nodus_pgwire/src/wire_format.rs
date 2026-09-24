@@ -137,6 +137,8 @@ pub(crate) fn sqlstate_for_execution_error(err_str: &str) -> &'static str {
     // Missing object (class 42 / 3B).
     } else if err_str.contains("savepoint \"") && err_str.contains("does not exist") {
         "3B001" // invalid_savepoint_specification
+    } else if err_str.starts_with("missing FROM-clause entry for table") {
+        "42P01" // undefined_table
     } else if err_str.starts_with("function ") && err_str.ends_with(" does not exist") {
         "42883" // undefined_function
     } else if err_str.contains("column") && err_str.contains("does not exist") {
