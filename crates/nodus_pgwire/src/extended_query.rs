@@ -1097,12 +1097,7 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
             Err(e) => {
                 error!("Failed to plan SQL: {}", e);
                 self.metrics.query_errors_total.inc();
-                let err = ErrorInfo::new(
-                    "ERROR".to_owned(),
-                    "0A000".to_owned(),
-                    format!("Unsupported feature: {}", e),
-                );
-                return Err(PgWireError::UserError(Box::new(err)));
+                return Err(planning_error(&e.to_string()));
             }
         };
 

@@ -58,6 +58,34 @@ pub(crate) fn sqlstate_for_execution_error(err_str: &str) -> &'static str {
     // Invalid text representation for a typed value (class 22).
     } else if err_str.contains("invalid input syntax") {
         "22P02" // invalid_text_representation
+    // Runtime errors from evaluating expressions (class 22 / 21).
+    } else if err_str == "division by zero" {
+        "22012" // division_by_zero
+    } else if err_str.starts_with("date/time field value out of range")
+        || err_str.starts_with("date field value out of range")
+        || err_str == "timestamp out of range"
+    {
+        "22008" // datetime_field_overflow
+    } else if err_str.ends_with("out of range") || err_str.starts_with("value out of range") {
+        "22003" // numeric_value_out_of_range
+    } else if err_str.starts_with("cannot take logarithm") {
+        "2201E" // invalid_argument_for_logarithm
+    } else if err_str == "cannot take square root of a negative number"
+        || err_str == "zero raised to a negative power is undefined"
+    {
+        "2201F" // invalid_argument_for_power_function
+    } else if err_str.starts_with("invalid regular expression") {
+        "2201B" // invalid_regular_expression
+    } else if err_str == "negative substring length not allowed" {
+        "22011" // substring_error
+    } else if err_str == "null value not allowed for object key" {
+        "22004" // null_value_not_allowed
+    } else if err_str == "more than one row returned by a subquery used as an expression" {
+        "21000" // cardinality_violation
+    } else if err_str.starts_with("aggregate functions are not allowed") {
+        "42803" // grouping_error
+    } else if err_str.starts_with("unrecognized configuration parameter") {
+        "42704" // undefined_object
     // Duplicate object on CREATE without IF NOT EXISTS (class 42). Catalog and
     // DDL paths phrase this differently ("Database X already exists" vs
     // "relation \"x\" already exists"), so classify case-insensitively.
@@ -73,6 +101,8 @@ pub(crate) fn sqlstate_for_execution_error(err_str: &str) -> &'static str {
     // Missing object (class 42 / 3B).
     } else if err_str.contains("savepoint \"") && err_str.contains("does not exist") {
         "3B001" // invalid_savepoint_specification
+    } else if err_str.starts_with("function ") && err_str.ends_with(" does not exist") {
+        "42883" // undefined_function
     } else if err_str.contains("column") && err_str.contains("does not exist") {
         "42703" // undefined_column
     } else if err_str.contains("does not exist")
@@ -81,6 +111,16 @@ pub(crate) fn sqlstate_for_execution_error(err_str: &str) -> &'static str {
         "42P01" // undefined_table (relation / index "x" does not exist)
     } else {
         "XX000" // internal_error
+    }
+}
+
+/// The error for a statement that could not be planned. Errors PostgreSQL
+/// also raises at this stage (an unknown column or function) keep their own
+/// SQLSTATE; anything else is a construct NodusDB does not support.
+pub(crate) fn planning_error(message: &str) -> PgWireError {
+    match sqlstate_for_execution_error(message) {
+        "XX000" => user_error("ERROR", "0A000", format!("Unsupported feature: {message}")),
+        code => user_error("ERROR", code, message),
     }
 }
 
