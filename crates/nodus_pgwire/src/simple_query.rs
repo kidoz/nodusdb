@@ -289,7 +289,10 @@ impl SimpleQueryHandler for NodusQueryHandler {
                 client
                     .send(PgWireBackendMessage::ParameterStatus(ParameterStatus::new(
                         canonical.to_owned(),
-                        normalize_guc_value(&value),
+                        nodus_executor::canonical_setting_value(
+                            canonical,
+                            &normalize_guc_value(&value),
+                        ),
                     )))
                     .await?;
             }

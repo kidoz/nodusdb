@@ -142,7 +142,7 @@ impl MemExecutor {
             .or_else(|| crate::session_vars::default_session_var(&key).map(str::to_owned))
             .unwrap_or_default();
         Ok(QueryOutput {
-            columns: vec![variable],
+            columns: vec![crate::session_vars::setting_display_name(&variable)],
             types: vec!["VARCHAR".to_string()],
             rows: vec![Row {
                 values: vec![Value::Text(value)],
@@ -163,7 +163,10 @@ impl MemExecutor {
         value: String,
     ) -> Result<QueryOutput> {
         let key = variable.trim().to_ascii_lowercase();
-        let normalized = crate::session_vars::normalize_var_value(&value);
+        let normalized = crate::session_vars::canonical_setting_value(
+            &key,
+            &crate::session_vars::normalize_var_value(&value),
+        );
         let mut guard = self.session_vars.write();
         let vars = guard.entry(ctx.session_id.clone()).or_default();
         if normalized.eq_ignore_ascii_case("default") {

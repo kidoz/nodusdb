@@ -502,11 +502,12 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                 variable, values, ..
             } => {
                 let var_name = variable.to_string();
+                // A list value (`SET search_path = a, b`) keeps its commas.
                 let var_val = values
                     .iter()
                     .map(|v| v.to_string())
                     .collect::<Vec<_>>()
-                    .join(" ");
+                    .join(", ");
                 Ok(LogicalPlan::SetVariable {
                     variable: var_name,
                     value: var_val,

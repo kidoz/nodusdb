@@ -59,9 +59,73 @@ pub(crate) fn normalize_var_value(raw: &str) -> String {
     trimmed.to_string()
 }
 
+/// The name `SHOW` reports a setting under: PostgreSQL's spelling of the few
+/// mixed-case settings, else the lower-case name.
+pub(crate) fn setting_display_name(name: &str) -> String {
+    let key = name.trim().to_ascii_lowercase();
+    match key.as_str() {
+        "datestyle" => "DateStyle".to_string(),
+        "intervalstyle" => "IntervalStyle".to_string(),
+        "timezone" => "TimeZone".to_string(),
+        _ => key,
+    }
+}
+
+/// PostgreSQL's canonical spelling of a setting's value, as `SHOW` and the
+/// ParameterStatus echo report it: `DateStyle` becomes `<style>, <order>`
+/// (`set datestyle = iso` shows `ISO, MDY`) and the UTC/GMT zone names are
+/// upper-cased. Other values are returned unchanged.
+pub fn canonical_setting_value(name: &str, value: &str) -> String {
+    match name.to_ascii_lowercase().as_str() {
+        "datestyle" => {
+            let (mut style, mut order) = (None, None);
+            for word in value
+                .split([',', ' '])
+                .map(str::trim)
+                .filter(|w| !w.is_empty())
+            {
+                match word.to_ascii_lowercase().as_str() {
+                    "iso" => style = Some("ISO"),
+                    "sql" => style = Some("SQL"),
+                    "postgres" => style = Some("Postgres"),
+                    "german" => style = Some("German"),
+                    "ymd" => order = Some("YMD"),
+                    "dmy" | "euro" | "european" => order = Some("DMY"),
+                    "mdy" | "us" | "noneuro" | "noneuropean" => order = Some("MDY"),
+                    _ => return value.to_string(),
+                }
+            }
+            format!("{}, {}", style.unwrap_or("ISO"), order.unwrap_or("MDY"))
+        }
+        "timezone" if value.eq_ignore_ascii_case("utc") || value.eq_ignore_ascii_case("gmt") => {
+            value.to_ascii_uppercase()
+        }
+        _ => value.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn setting_values_take_canonical_spelling() {
+        assert_eq!(canonical_setting_value("DateStyle", "iso"), "ISO, MDY");
+        assert_eq!(canonical_setting_value("datestyle", "iso, dmy"), "ISO, DMY");
+        assert_eq!(
+            canonical_setting_value("datestyle", "German"),
+            "German, MDY"
+        );
+        assert_eq!(canonical_setting_value("timezone", "utc"), "UTC");
+        assert_eq!(
+            canonical_setting_value("timezone", "Europe/Paris"),
+            "Europe/Paris"
+        );
+        assert_eq!(
+            canonical_setting_value("search_path", "myschema"),
+            "myschema"
+        );
+    }
 
     #[test]
     fn known_defaults_resolve() {
