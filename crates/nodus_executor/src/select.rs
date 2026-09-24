@@ -844,6 +844,18 @@ impl MemExecutor {
                                 .map(|&(idx, _)| row.get(idx).unwrap_or(&Value::Null).clone())
                                 .collect()
                         };
+                        // Without a frame clause, an ordered window ends at the
+                        // current row's last peer (PostgreSQL's default `RANGE
+                        // UNBOUNDED PRECEDING`); an unordered one is the whole
+                        // partition.
+                        let default_frame = crate::plan_types::WindowFrame {
+                            units: crate::plan_types::WindowFrameUnits::Range,
+                            start: crate::plan_types::WindowBound::UnboundedPreceding,
+                            end: crate::plan_types::WindowBound::CurrentRow,
+                        };
+                        let frame = frame
+                            .as_ref()
+                            .or((!w_order_by.is_empty()).then_some(&default_frame));
                         // RANGE frames only support unbounded/current-row bounds;
                         // a numeric offset needs value arithmetic on the order key.
                         if let Some(f) = frame {
@@ -1019,7 +1031,7 @@ impl MemExecutor {
                                             window_aggregate(func_name, &arg, slice, &col_names);
                                     }
                                 } else {
-                                    // No explicit frame: aggregate over the whole partition.
+                                    // No frame and no ORDER BY: the whole partition.
                                     let agg = window_aggregate(func_name, &arg, &grows, &col_names);
                                     for &row_idx in group {
                                         results[row_idx] = agg.clone();
