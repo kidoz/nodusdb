@@ -26,11 +26,27 @@ impl Default for SessionState {
     }
 }
 
+/// Parses SQL text into statements. As in PostgreSQL, an unquoted identifier
+/// is folded to lower case (ASCII letters only) before parsing, so `Users`,
+/// `USERS`, and `users` name the same object while `"Users"` names another.
 pub fn parse_sql(
     sql: &str,
 ) -> Result<Vec<sqlparser::ast::Statement>, sqlparser::parser::ParserError> {
+    use sqlparser::tokenizer::{Token, Tokenizer};
     let dialect = PostgreSqlDialect {};
-    Parser::parse_sql(&dialect, sql)
+    let mut tokens = Tokenizer::new(&dialect, sql)
+        .with_unescape(true)
+        .tokenize_with_location()?;
+    for token in &mut tokens {
+        if let Token::Word(word) = &mut token.token
+            && word.quote_style.is_none()
+        {
+            word.value.make_ascii_lowercase();
+        }
+    }
+    Parser::new(&dialect)
+        .with_tokens_with_locations(tokens)
+        .parse_statements()
 }
 
 /// Extracts `(name, value)` from a parsed `SET <name> = <value>` statement when
@@ -72,6 +88,15 @@ mod tests {
         // Debugging output removed
     }
     use proptest::prelude::*;
+
+    #[test]
+    fn unquoted_identifiers_fold_to_lower_case() {
+        let stmts = parse_sql(r#"SELECT Name, "Name" FROM Users WHERE ÄB = 'Keep'"#).unwrap();
+        assert_eq!(
+            stmts[0].to_string(),
+            r#"SELECT name, "Name" FROM users WHERE Äb = 'Keep'"#
+        );
+    }
 
     #[test]
     fn test_parse_simple() {

@@ -1,0 +1,110 @@
+# Identifier case: as in PostgreSQL, unquoted identifiers fold to lower case
+# and quoted ones keep their case; setting values take PostgreSQL's spelling.
+# Expected results come from PostgreSQL 18.
+statement ok
+CREATE TABLE "MixedCase" (Id INT PRIMARY KEY, "Name" TEXT, Value INT);
+
+statement ok
+INSERT INTO "MixedCase" (ID, "Name", VALUE) VALUES (1, 'a', 10);
+
+query TTT
+SELECT ID, "Name", VALUE FROM "MixedCase";
+----
+1	a	10
+
+query TT
+SELECT m.Id, M.value FROM "MixedCase" M;
+----
+1	10
+
+query TT
+SELECT Count(*), SUM(Value) AS Total FROM "MixedCase";
+----
+1	10
+
+query T
+SELECT total FROM (SELECT sum(value) AS Total FROM "MixedCase") sub;
+----
+10
+
+statement ok
+CREATE TABLE Lower_T (ColA INT, "ColB" INT);
+
+statement ok
+INSERT INTO LOWER_T VALUES (1, 2);
+
+query TTT
+SELECT cola, "ColB", COLA FROM lower_t;
+----
+1	2	1
+
+query T
+SELECT column_name FROM information_schema.columns WHERE table_name = 'lower_t' ORDER BY 1;
+----
+ColB
+cola
+
+statement error
+SELECT id, name FROM "MixedCase";
+
+statement error
+SELECT * FROM mixedcase;
+
+statement error
+SELECT colb FROM lower_t;
+
+query TT
+SELECT upper('x') AS Shout, 1 AS "Keep";
+----
+X	1
+
+query T
+SELECT t.Shout FROM (SELECT 'y' AS SHOUT) T;
+----
+y
+
+# Setting values persist for the session; these expectations were taken from a
+# single PostgreSQL 18 session.
+statement ok
+SET DateStyle = iso;
+
+query T
+SHOW DateStyle;
+----
+ISO, MDY
+
+statement ok
+SET datestyle = German, dmy;
+
+query T
+SHOW datestyle;
+----
+German, DMY
+
+statement ok
+SET DATESTYLE = ISO, MDY;
+
+statement ok
+SET TIME ZONE utc;
+
+query T
+SHOW TimeZone;
+----
+UTC
+
+statement ok
+SET search_path = MySchema, public;
+
+query T
+SHOW search_path;
+----
+myschema, public
+
+statement ok
+SET search_path = public;
+
+statement ok
+DROP TABLE lower_t;
+
+statement ok
+DROP TABLE "MixedCase";

@@ -453,10 +453,10 @@ fn emit_copy_block(
 /// Shared with the wire-protocol `COPY FROM STDIN` path.
 pub fn synthesize_insert(spec: &CopySpec, rows: &[Vec<Cell>]) -> String {
     let mut sql = String::from("INSERT INTO ");
-    sql.push_str(&spec.table);
+    sql.push_str(&spec.quoted_table());
     if !spec.columns.is_empty() {
         sql.push_str(" (");
-        sql.push_str(&spec.columns.join(", "));
+        sql.push_str(&spec.quoted_columns());
         sql.push(')');
     }
     sql.push_str(" VALUES ");
@@ -665,7 +665,7 @@ CREATE INDEX t_name_idx ON t (name);
         assert_eq!(report.rows_inserted, 2);
         assert_eq!(report.indexes_created, 1);
         assert!(sink.executed[0].starts_with("CREATE TABLE"));
-        assert!(sink.executed[1].starts_with("INSERT INTO t"));
+        assert!(sink.executed[1].starts_with("INSERT INTO \"t\""));
         assert!(sink.executed.last().unwrap().starts_with("CREATE INDEX"));
         assert!(report.is_clean());
     }

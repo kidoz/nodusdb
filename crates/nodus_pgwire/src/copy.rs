@@ -97,9 +97,9 @@ impl NodusCopyHandler {
         let cols = if spec.columns.is_empty() {
             "*".to_string()
         } else {
-            spec.columns.join(", ")
+            spec.quoted_columns()
         };
-        let probe = format!("SELECT {cols} FROM {} LIMIT 0", spec.table);
+        let probe = format!("SELECT {cols} FROM {} LIMIT 0", spec.quoted_table());
         let mut output = None;
         for stmt in nodus_sql::parse_sql(&probe)? {
             let plan = nodus_executor::plan_statement(&stmt, &[])?;

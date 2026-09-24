@@ -44,6 +44,25 @@ pub struct CopySpec {
 }
 
 impl CopySpec {
+    /// The target table as a quoted SQL name (`"schema"."table"`), so a
+    /// mixed-case name survives being written into generated SQL.
+    pub fn quoted_table(&self) -> String {
+        self.table
+            .split('.')
+            .map(|part| format!("\"{part}\""))
+            .collect::<Vec<_>>()
+            .join(".")
+    }
+
+    /// The column list as quoted SQL names, comma-separated.
+    pub fn quoted_columns(&self) -> String {
+        self.columns
+            .iter()
+            .map(|c| format!("\"{c}\""))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
     /// The PostgreSQL defaults for `format`.
     pub fn new(table: impl Into<String>, columns: Vec<String>, format: CopyFormat) -> Self {
         let csv = format == CopyFormat::Csv;
@@ -94,17 +113,22 @@ pub fn parse_copy_header(header: &str) -> Result<CopySpec> {
     else {
         bail!("only COPY <table> FROM STDIN is supported: {header}");
     };
+    // As in PostgreSQL, an unquoted identifier names the lower-cased object.
+    let name_of = |ident: &sqlparser::ast::Ident| match ident.quote_style {
+        None => ident.value.to_ascii_lowercase(),
+        Some(_) => ident.value.clone(),
+    };
     let table = table_name
         .0
         .iter()
         .map(|part| {
             part.as_ident()
-                .map(|i| i.value.clone())
+                .map(name_of)
                 .unwrap_or_else(|| part.to_string())
         })
         .collect::<Vec<_>>()
         .join(".");
-    let columns: Vec<String> = columns.iter().map(|c| c.value.clone()).collect();
+    let columns: Vec<String> = columns.iter().map(name_of).collect();
 
     // The table and column names are interpolated into a synthesized INSERT
     // (and on the wire COPY path the header is client-controlled), so reject any
