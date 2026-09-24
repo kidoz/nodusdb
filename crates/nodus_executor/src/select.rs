@@ -503,6 +503,14 @@ impl MemExecutor {
             }
         }
 
+        // `LIMIT 0` returns no rows, so no row is evaluated (as in
+        // PostgreSQL, where the limit never pulls from its input). Describe
+        // probes rely on this to learn the result shape without running the
+        // statement's expressions.
+        if limit == Some(0) {
+            stored_rows.clear();
+        }
+
         // WHERE: conjunction of typed predicates.
         stored_rows.retain(|r| {
             self.eval_filter(ctx, r, &col_names, &joined_columns, filter.as_ref())
