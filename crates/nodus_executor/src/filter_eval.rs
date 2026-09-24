@@ -390,23 +390,23 @@ impl MemExecutor {
             ..
         } = &mut p
         {
+            // The subquery's own tables, by the names that reach them: an alias
+            // hides the table name, so `FROM t i WHERE i.id = t.id` reads
+            // `t.id` from the outer query.
             let mut quals: Vec<String> = Vec::new();
-            if let Some(a) = table_alias.as_ref() {
-                quals.push(a.to_lowercase());
-            }
-            quals.push(table_name.to_lowercase());
-            if let Some(last) = table_name.rsplit('.').next() {
-                quals.push(last.to_lowercase());
-            }
+            let mut add_inner = |name: &str, alias: Option<&String>| match alias {
+                Some(a) => quals.push(a.to_lowercase()),
+                None => {
+                    quals.push(name.to_lowercase());
+                    if let Some(last) = name.rsplit('.').next() {
+                        quals.push(last.to_lowercase());
+                    }
+                }
+            };
+            add_inner(table_name, table_alias.as_ref());
             // Joined tables (and their aliases) are inner too.
             for j in joins.iter() {
-                if let Some(a) = j.table_alias.as_ref() {
-                    quals.push(a.to_lowercase());
-                }
-                quals.push(j.table_name.to_lowercase());
-                if let Some(last) = j.table_name.rsplit('.').next() {
-                    quals.push(last.to_lowercase());
-                }
+                add_inner(&j.table_name, j.table_alias.as_ref());
             }
             if let Some(f) = filter.as_ref() {
                 *filter = Some(correlate_filter(f, outer_row, outer_cols, &quals));
