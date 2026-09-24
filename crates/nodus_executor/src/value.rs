@@ -43,7 +43,7 @@ pub(crate) fn column_type(data_type: &str) -> ColumnType {
     // `INTERVAL` contains "INT" but is textual — check it before the INT rule.
     if t.contains("INTERVAL") {
         ColumnType::Text
-    } else if t.contains("INT") || t.contains("SERIAL") {
+    } else if t.contains("INT") || t.contains("SERIAL") || matches!(t.trim(), "OID" | "XID") {
         ColumnType::Int
     } else if t.contains("FLOAT")
         || t.contains("DOUBLE")
