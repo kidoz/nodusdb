@@ -1,5 +1,6 @@
-# Explicit NULLS FIRST / NULLS LAST overrides on ORDER BY. The default is nulls
-# first on ASC and nulls last on DESC; an explicit clause overrides that.
+# Explicit NULLS FIRST / NULLS LAST overrides on ORDER BY. As in PostgreSQL, the
+# default sorts NULL as larger than any value: last on ASC and first on DESC; an
+# explicit clause overrides that.
 
 statement ok
 CREATE TABLE n (id INT PRIMARY KEY, v INT);
@@ -7,15 +8,15 @@ CREATE TABLE n (id INT PRIMARY KEY, v INT);
 statement ok
 INSERT INTO n VALUES (1, 10), (2, NULL), (3, 30), (4, NULL), (5, 20);
 
-# Default ASC: nulls first.
+# Default ASC: nulls last.
 query I
 SELECT v FROM n ORDER BY v ASC;
 ----
-NULL
-NULL
 10
 20
 30
+NULL
+NULL
 
 # ASC NULLS LAST: override pushes nulls to the end.
 query I
@@ -27,15 +28,15 @@ SELECT v FROM n ORDER BY v ASC NULLS LAST;
 NULL
 NULL
 
-# Default DESC: nulls last.
+# Default DESC: nulls first.
 query I
 SELECT v FROM n ORDER BY v DESC;
 ----
+NULL
+NULL
 30
 20
 10
-NULL
-NULL
 
 # DESC NULLS FIRST: override pulls nulls to the front.
 query I

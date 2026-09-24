@@ -818,13 +818,12 @@ impl MemExecutor {
                                 }
                             }
                             for &(o_idx, asc) in &o_indices {
-                                let mut cmp = compare(
+                                let cmp = order_cmp(
                                     a.get(o_idx).unwrap_or(&Value::Null),
                                     b.get(o_idx).unwrap_or(&Value::Null),
+                                    asc,
+                                    None,
                                 );
-                                if !asc {
-                                    cmp = cmp.reverse();
-                                }
                                 if cmp != std::cmp::Ordering::Equal {
                                     return cmp;
                                 }
@@ -1470,8 +1469,9 @@ fn order_cmp(a: &Value, b: &Value, asc: bool, nulls_first: Option<bool>) -> std:
     match (a_null, b_null) {
         (true, true) => Ordering::Equal,
         (true, false) | (false, true) => {
-            // Default: nulls first on ASC, last on DESC — i.e. nulls_first == asc.
-            let nf = nulls_first.unwrap_or(asc);
+            // PostgreSQL's default treats NULL as larger than every value:
+            // last when ascending, first when descending.
+            let nf = nulls_first.unwrap_or(!asc);
             // "Nulls first" means the NULL side is the lesser (earlier) one.
             if a_null == nf {
                 Ordering::Less
