@@ -86,6 +86,11 @@ SELECT '{"a":1}'::jsonb = '{ "a" : 1 }'::jsonb, '{"a":1.0}'::jsonb = '{"a":1}'::
 ----
 t	t	t
 
+query TT
+SELECT ('{"a": [1, 2]}'::jsonb)['a'][1], ('{"a": {"b": "c"}}'::jsonb)['a']['b'];
+----
+2	"c"
+
 statement error
 SELECT '{bad'::jsonb;
 
@@ -126,6 +131,14 @@ SELECT id, d -> 'a', d ->> 'new', d #>> '{a,b}' FROM jdocs ORDER BY id;
 ----
 1	{"b": 3, "y": 2}	true	3
 2	NULL	NULL	NULL
+
+query T
+SELECT jsonb_array_elements('["x", 1, null, {"b": 2, "a": 1}]');
+----
+"x"
+1
+null
+{"a": 1, "b": 2}
 
 query T
 SELECT x FROM jsonb_array_elements_text('["x", 1, null]') x;

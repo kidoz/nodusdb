@@ -82,3 +82,13 @@ fn unsupported_statements_are_named_briefly() {
     let err = sql("EXPLAIN CREATE TABLE x (a int)").unwrap_err();
     assert_eq!(err.to_string(), "EXPLAIN of CREATE TABLE is not supported");
 }
+
+#[test]
+fn subscripts_and_select_list_set_functions() {
+    let sql = session();
+    let out = sql("SELECT (ARRAY[1,2,3])[2], (ARRAY[1,2,3])[2:3], (ARRAY[1,2])[9]").unwrap();
+    assert_eq!(rows(&out), ["2|{2,3}|"]);
+    let out = sql("SELECT generate_series(1, 3) AS n").unwrap();
+    assert_eq!(out.columns, ["n"]);
+    assert_eq!(rows(&out), ["1", "2", "3"]);
+}

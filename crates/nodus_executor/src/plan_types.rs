@@ -116,6 +116,11 @@ pub struct TableFnSpec {
     pub alias: Option<String>,
     /// Explicit column names from `AS alias(col[, ord])`.
     pub column_aliases: Vec<String>,
+    /// The arguments as expressions (`generate_series(1, n + 1)`), evaluated
+    /// against the driving row; when present they replace `args`. Defaulted
+    /// so older plans decode.
+    #[serde(default)]
+    pub arg_exprs: Vec<ScalarExpr>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

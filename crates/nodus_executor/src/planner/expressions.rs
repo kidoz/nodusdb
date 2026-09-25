@@ -535,6 +535,53 @@ pub(crate) fn lower_scalar(expr: &sqlparser::ast::Expr, params: &[Value]) -> Opt
             }),
             _ => None,
         },
+        // `base[i]`, `base[lo:hi]`, after any field names that complete a
+        // column reference (`t.col[1]`).
+        Expr::CompoundFieldAccess { root, access_chain } => {
+            use sqlparser::ast::{AccessExpr, Subscript};
+            let mut names: Vec<String> = match &**root {
+                Expr::Identifier(id) => vec![id.value.clone()],
+                Expr::CompoundIdentifier(ids) => ids.iter().map(|i| i.value.clone()).collect(),
+                _ => Vec::new(),
+            };
+            let mut chain = access_chain.iter().peekable();
+            while let (false, Some(AccessExpr::Dot(Expr::Identifier(field)))) =
+                (names.is_empty(), chain.peek())
+            {
+                names.push(field.value.clone());
+                chain.next();
+            }
+            let mut base = if names.is_empty() {
+                lower_scalar(root, params)?
+            } else {
+                ScalarExpr::Column(names.join("."))
+            };
+            let bound = |e: &Option<Expr>| match e {
+                Some(e) => lower_scalar(e, params),
+                None => Some(ScalarExpr::Literal(Value::Null)),
+            };
+            for access in chain {
+                let (name, args) = match access {
+                    AccessExpr::Subscript(Subscript::Index { index }) => {
+                        ("__SUBSCRIPT__", vec![base, lower_scalar(index, params)?])
+                    }
+                    AccessExpr::Subscript(Subscript::Slice {
+                        lower_bound,
+                        upper_bound,
+                        stride: None,
+                    }) => (
+                        "__SLICE__",
+                        vec![base, bound(lower_bound)?, bound(upper_bound)?],
+                    ),
+                    _ => return None,
+                };
+                base = ScalarExpr::Function {
+                    name: name.to_string(),
+                    args,
+                };
+            }
+            Some(base)
+        }
         // `ARRAY[...]`: a constant when every element is, else built per row.
         Expr::Array(array) => {
             let items = array

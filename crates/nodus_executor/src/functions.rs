@@ -12,6 +12,7 @@ use crate::value::{Value, render, values_equal};
 
 /// Functions that receive NULL arguments instead of short-circuiting to NULL.
 const NON_STRICT: &[&str] = &[
+    "__SLICE__",
     "ARRAY",
     "COALESCE",
     "NULLIF",
@@ -97,6 +98,8 @@ pub(crate) fn is_known(name: &str) -> bool {
                 | "ARRAY_CAT" | "ARRAY_POSITION" | "ARRAY_POSITIONS" | "ARRAY_REMOVE"
                 | "ARRAY_REPLACE" | "ARRAY_UPPER" | "ARRAY_LOWER" | "ARRAY_NDIMS"
                 | "TRIM_ARRAY" | "ARRAY_SORT" | "ARRAY_REVERSE"
+                // Subscripts: `a[i]`, `a[lo:hi]`, `doc['key']`.
+                | "__SUBSCRIPT__" | "__SLICE__"
         )
 }
 
@@ -105,6 +108,15 @@ pub(crate) fn is_known(name: &str) -> bool {
 /// NodusDB tracks. `arg_types` are the arguments' types where known.
 pub(crate) fn return_type(name: &str, arg_types: &[Option<String>]) -> Option<String> {
     let first_known = || arg_types.iter().flatten().next().cloned();
+    // An element of an array is of its element type; a slice of the array's.
+    let subscripted = arg_types.first().cloned().flatten();
+    match name {
+        "__SUBSCRIPT__" => {
+            return subscripted.map(|t| t.strip_suffix("[]").map(str::to_string).unwrap_or(t));
+        }
+        "__SLICE__" => return subscripted,
+        _ => {}
+    }
     Some(
         match name {
             "LENGTH"
@@ -1144,6 +1156,48 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
         }
         "JSONB_PRETTY" if arity(1) => {
             Value::Text(crate::json_text::jsonb_pretty(&json_arg(arg(0))?))
+        }
+
+        // ---- Subscripts ---------------------------------------------------------------
+        "__SUBSCRIPT__" if arity(2) => match arg(0) {
+            // `jsonb` subscripting: an object field or an array element.
+            Value::Jsonb(json) => {
+                let step = match (json, arg(1)) {
+                    (serde_json::Value::Object(map), key) => map.get(&text(key)).cloned(),
+                    (serde_json::Value::Array(items), index) => int(index).and_then(|i| {
+                        let i = if i < 0 { items.len() as i64 + i } else { i };
+                        usize::try_from(i).ok().and_then(|i| items.get(i).cloned())
+                    }),
+                    _ => None,
+                };
+                step.map_or(Value::Null, Value::Jsonb)
+            }
+            base => {
+                let items = array(base)?;
+                let index = int(arg(1))?;
+                usize::try_from(index)
+                    .ok()
+                    .filter(|&i| i >= 1)
+                    .and_then(|i| items.get(i - 1).cloned())
+                    .unwrap_or(Value::Null)
+            }
+        },
+        "__SLICE__" if arity(3) => {
+            if matches!(arg(0), Value::Null) {
+                return Some(Value::Null);
+            }
+            let items = array(arg(0))?;
+            let bound = |v: &Value, default: i64| match v {
+                Value::Null => Some(default),
+                v => int(v),
+            };
+            let low = bound(arg(1), 1)?.max(1);
+            let high = bound(arg(2), items.len() as i64)?.min(items.len() as i64);
+            Value::Array(if low > high {
+                Vec::new()
+            } else {
+                items[(low - 1) as usize..high as usize].to_vec()
+            })
         }
 
         // ---- Arrays -------------------------------------------------------------------

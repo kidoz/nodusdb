@@ -18,11 +18,17 @@ impl MemExecutor {
         row: &[Value],
         col_names: &[String],
     ) -> Result<(Vec<String>, Vec<String>, Vec<Vec<Value>>)> {
-        let args: Vec<Value> = spec
-            .args
-            .iter()
-            .map(|op| self.eval_operand(row, col_names, &[], op, "TEXT"))
-            .collect();
+        let args: Vec<Value> = if spec.arg_exprs.is_empty() {
+            spec.args
+                .iter()
+                .map(|op| self.eval_operand(row, col_names, &[], op, "TEXT"))
+                .collect()
+        } else {
+            spec.arg_exprs
+                .iter()
+                .map(|e| crate::eval_scalar_expr(e, row, col_names))
+                .collect()
+        };
 
         // Each function returns its value-column types and rows (a row may carry
         // several values, e.g. multi-argument `unnest`).

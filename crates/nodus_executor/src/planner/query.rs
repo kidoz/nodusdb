@@ -193,6 +193,16 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
         anyhow::bail!("Unsupported query body");
     };
 
+    // A set-returning function as the whole select list (`SELECT
+    // generate_series(1, 3)`) yields its rows, as from `FROM` would.
+    if select.from.is_empty()
+        && select.selection.is_none()
+        && let [item] = select.projection.as_slice()
+        && let Some(spec) = select_list_table_function(item, params)
+    {
+        return select_from_result(LogicalPlan::TableFunction(spec), ctes, query, params);
+    }
+
     if select.from.is_empty() {
         let mut values = Vec::new();
         let mut deferred = Vec::new();
@@ -890,7 +900,7 @@ fn table_fn_from_factor(
     factor: &sqlparser::ast::TableFactor,
     params: &[Value],
 ) -> Option<TableFnSpec> {
-    use sqlparser::ast::TableFactor;
+    use sqlparser::ast::{FunctionArg, FunctionArgExpr, TableFactor};
     match factor {
         TableFactor::Table {
             name,
@@ -899,17 +909,22 @@ fn table_fn_from_factor(
             alias,
             ..
         } => {
-            let args = table_args
+            let exprs: Vec<&sqlparser::ast::Expr> = table_args
                 .args
                 .iter()
-                .filter_map(|a| function_arg_to_operand(a, params))
-                .collect();
-            Some(build_table_fn_spec(
+                .map(|a| match a {
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
+                    _ => None,
+                })
+                .collect::<Option<_>>()?;
+            let mut spec = build_table_fn_spec(
                 name.to_string().to_lowercase(),
-                args,
+                Vec::new(),
                 *with_ordinality,
                 alias.as_ref(),
-            ))
+            );
+            set_table_fn_args(&mut spec, &exprs, params)?;
+            Some(spec)
         }
         TableFactor::UNNEST {
             array_exprs,
@@ -917,19 +932,100 @@ fn table_fn_from_factor(
             alias,
             ..
         } => {
-            let args = array_exprs
-                .iter()
-                .filter_map(|e| expr_to_operand(e, params))
-                .collect();
-            Some(build_table_fn_spec(
+            let mut spec = build_table_fn_spec(
                 "unnest".to_string(),
-                args,
+                Vec::new(),
                 *with_ordinality,
                 alias.as_ref(),
-            ))
+            );
+            set_table_fn_args(&mut spec, &array_exprs.iter().collect::<Vec<_>>(), params)?;
+            Some(spec)
         }
         _ => None,
     }
+}
+
+/// A table function's arguments: constants and column references as
+/// operands, or, when any is an expression, all as expressions. `None` for
+/// an argument that cannot be evaluated, so it is never silently dropped.
+fn set_table_fn_args(
+    spec: &mut TableFnSpec,
+    exprs: &[&sqlparser::ast::Expr],
+    params: &[Value],
+) -> Option<()> {
+    match exprs
+        .iter()
+        .map(|e| expr_to_operand(e, params))
+        .collect::<Option<Vec<_>>>()
+    {
+        Some(args) => spec.args = args,
+        None => {
+            spec.arg_exprs = exprs
+                .iter()
+                .map(|e| lower_scalar(e, params))
+                .collect::<Option<_>>()?;
+        }
+    }
+    Some(())
+}
+
+/// The table functions a select list may call for their rows.
+const SELECT_LIST_TABLE_FUNCTIONS: &[&str] = &[
+    "unnest",
+    "generate_series",
+    "jsonb_array_elements",
+    "json_array_elements",
+    "jsonb_array_elements_text",
+    "json_array_elements_text",
+    "regexp_split_to_table",
+    "pg_partition_ancestors",
+];
+
+/// A select-list item that calls a set-returning function with plain
+/// arguments, as a table function named for its output column.
+fn select_list_table_function(
+    item: &sqlparser::ast::SelectItem,
+    params: &[Value],
+) -> Option<TableFnSpec> {
+    use sqlparser::ast::{Expr, FunctionArguments, SelectItem};
+    let (Expr::Function(function), alias) = (match item {
+        SelectItem::UnnamedExpr(expr) => (expr, None),
+        SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias.value.clone())),
+        _ => return None,
+    }) else {
+        return None;
+    };
+    let name = function.name.to_string().to_ascii_lowercase();
+    let name = name
+        .strip_prefix("pg_catalog.")
+        .unwrap_or(&name)
+        .to_string();
+    if !SELECT_LIST_TABLE_FUNCTIONS.contains(&name.as_str()) || function.over.is_some() {
+        return None;
+    }
+    let FunctionArguments::List(list) = &function.args else {
+        return None;
+    };
+    let exprs: Vec<&Expr> = list
+        .args
+        .iter()
+        .map(|a| match a {
+            sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(e)) => {
+                Some(e)
+            }
+            _ => None,
+        })
+        .collect::<Option<_>>()?;
+    let mut spec = TableFnSpec {
+        alias: Some(alias.unwrap_or_else(|| name.clone())),
+        name,
+        args: Vec::new(),
+        with_ordinality: false,
+        column_aliases: Vec::new(),
+        arg_exprs: Vec::new(),
+    };
+    set_table_fn_args(&mut spec, &exprs, params)?;
+    Some(spec)
 }
 
 fn build_table_fn_spec(
@@ -939,13 +1035,17 @@ fn build_table_fn_spec(
     alias: Option<&sqlparser::ast::TableAlias>,
 ) -> TableFnSpec {
     TableFnSpec {
-        name,
+        name: name
+            .strip_prefix("pg_catalog.")
+            .map(str::to_string)
+            .unwrap_or(name),
         args,
         with_ordinality,
         alias: alias.map(|a| a.name.value.clone()),
         column_aliases: alias
             .map(|a| a.columns.iter().map(|c| c.name.value.clone()).collect())
             .unwrap_or_default(),
+        arg_exprs: Vec::new(),
     }
 }
 
