@@ -346,7 +346,12 @@ impl MemExecutor {
         let mut joined_columns = tbl_cols;
         let mut stored_rows = stored_rows.unwrap();
 
+        // The columns `*` stands for, as positions in the row: each relation's
+        // in turn, except that a join's USING (or NATURAL) columns come first,
+        // once, in place of the columns they merge.
+        let mut star: Vec<usize> = (0..col_names.len()).collect();
         for join in &joins {
+            let left_width = col_names.len();
             // A LATERAL subquery runs for each left row, with that row's values
             // for its outer references; its rows join that row.
             if let Some(plan) = &join.lateral {
@@ -437,6 +442,7 @@ impl MemExecutor {
                 stored_rows = next_rows;
                 col_names = combined_cols;
                 joined_columns = combined_desc;
+                star.extend(left_width..col_names.len());
                 continue;
             }
             // Lateral (or standalone) table function: its rows are produced per
@@ -494,6 +500,7 @@ impl MemExecutor {
                 stored_rows = next_rows;
                 col_names = combined_cols;
                 joined_columns = combined_desc;
+                star.extend(left_width..col_names.len());
                 continue;
             }
 
@@ -567,34 +574,46 @@ impl MemExecutor {
             // schemas, into pairs of combined-row indices to compare for equality
             // — so they compose with chained joins where the left input already
             // spans several tables. `None` means use the `ON` condition instead.
-            let named_eq_pairs: Option<Vec<(usize, usize)>> =
-                if join.natural || !join.using_columns.is_empty() {
-                    let left_len = col_names.len();
-                    let unqual = |s: &str| s.rsplit('.').next().unwrap_or(s).to_ascii_lowercase();
-                    let names: Vec<String> = if join.natural {
-                        col_names
-                            .iter()
-                            .map(|c| unqual(c))
-                            .filter(|n| j_col_names.iter().any(|jc| unqual(jc) == *n))
-                            .collect()
-                    } else {
-                        join.using_columns
-                            .iter()
-                            .map(|c| c.to_ascii_lowercase())
-                            .collect()
-                    };
-                    let pairs = names
-                        .iter()
-                        .filter_map(|n| {
-                            let li = col_names.iter().position(|c| unqual(c) == *n)?;
-                            let ri = j_col_names.iter().position(|c| unqual(c) == *n)?;
-                            Some((li, left_len + ri))
-                        })
-                        .collect();
-                    Some(pairs)
+            // The left side's columns are those `*` shows of it, so a column
+            // an earlier USING merged is matched as the merged one.
+            let named_eq_pairs: Option<Vec<(String, usize, usize)>> = if join.natural
+                || !join.using_columns.is_empty()
+            {
+                let left_len = col_names.len();
+                let unqual = |s: &str| s.rsplit('.').next().unwrap_or(s).to_ascii_lowercase();
+                let names: Vec<String> = if join.natural {
+                    let mut names: Vec<String> = Vec::new();
+                    for n in star.iter().map(|&i| unqual(&col_names[i])) {
+                        if j_col_names.iter().any(|jc| unqual(jc) == n) && !names.contains(&n) {
+                            names.push(n);
+                        }
+                    }
+                    names
                 } else {
-                    None
+                    join.using_columns
+                        .iter()
+                        .map(|c| c.to_ascii_lowercase())
+                        .collect()
                 };
+                let mut pairs = Vec::with_capacity(names.len());
+                for n in names {
+                    let Some(li) = star.iter().copied().find(|&i| unqual(&col_names[i]) == n)
+                    else {
+                        anyhow::bail!(
+                            "column \"{n}\" specified in USING clause does not exist in left table"
+                        );
+                    };
+                    let Some(ri) = j_col_names.iter().position(|c| unqual(c) == n) else {
+                        anyhow::bail!(
+                            "column \"{n}\" specified in USING clause does not exist in right table"
+                        );
+                    };
+                    pairs.push((n, li, left_len + ri));
+                }
+                Some(pairs)
+            } else {
+                None
+            };
 
             if !query_has_virtual && let Some(condition) = join.condition.as_ref() {
                 let mut refs = Vec::new();
@@ -609,7 +628,7 @@ impl MemExecutor {
                     let mut combined_row = r1.clone();
                     combined_row.extend(r2.clone());
                     let is_match = match &named_eq_pairs {
-                        Some(pairs) => pairs.iter().all(|(l, r)| {
+                        Some(pairs) => pairs.iter().all(|(_, l, r)| {
                             crate::value::values_equal(&combined_row[*l], &combined_row[*r])
                         }),
                         None => self
@@ -646,10 +665,87 @@ impl MemExecutor {
                     }
                 }
             }
+            let right_width = combined_cols.len() - left_width;
+            match &named_eq_pairs {
+                // Each USING column becomes one column, named by itself: the
+                // left side's value, the right side's for a RIGHT join, and
+                // whichever is not NULL for a FULL join.
+                Some(pairs) => {
+                    let merged_from = combined_cols.len();
+                    for row in next_rows.iter_mut() {
+                        for (_, l, r) in pairs {
+                            let value = match (&join.join_type, &row[*l]) {
+                                (JoinType::RightOuter, _) | (JoinType::FullOuter, Value::Null) => {
+                                    row[*r].clone()
+                                }
+                                (_, left) => left.clone(),
+                            };
+                            row.push(value);
+                        }
+                    }
+                    for (name, l, _) in pairs {
+                        // An outer join's merged column is the one its name
+                        // reaches; an inner one's is no longer nameable.
+                        for existing in combined_cols.iter_mut().filter(|c| *c == name) {
+                            *existing = format!("\u{0}{existing}");
+                        }
+                        combined_cols.push(name.clone());
+                        combined_desc.push(combined_desc[*l].clone());
+                    }
+                    let merged_left: Vec<usize> = pairs.iter().map(|(_, l, _)| *l).collect();
+                    let merged_right: Vec<usize> = pairs.iter().map(|(_, _, r)| *r).collect();
+                    star = (merged_from..merged_from + pairs.len())
+                        .chain(star.into_iter().filter(|i| !merged_left.contains(i)))
+                        .chain(
+                            (left_width..left_width + right_width)
+                                .filter(|i| !merged_right.contains(i)),
+                        )
+                        .collect();
+                }
+                None => star.extend(left_width..left_width + right_width),
+            }
             stored_rows = next_rows;
             col_names = combined_cols;
             joined_columns = combined_desc;
         }
+
+        // `*` and `t.*` in the select list stand for columns by position; a
+        // plain `*` without merged columns keeps the whole row.
+        let merged = star.len() != col_names.len() || star.iter().enumerate().any(|(i, &c)| i != c);
+        let projection: Vec<ProjectionItem> = if projection.is_empty() && merged {
+            star.iter()
+                .map(|&i| ProjectionItem::Column(col_names[i].clone()))
+                .collect()
+        } else {
+            let mut expanded = Vec::with_capacity(projection.len());
+            for item in projection {
+                match item {
+                    ProjectionItem::Column(c) if c == "*" => expanded.extend(
+                        star.iter()
+                            .map(|&i| ProjectionItem::Column(col_names[i].clone())),
+                    ),
+                    ProjectionItem::Column(c) if c.ends_with(".*") => {
+                        let relation = &c[..c.len() - 2];
+                        let inner = format!(".{relation}");
+                        let before = expanded.len();
+                        expanded.extend(
+                            col_names
+                                .iter()
+                                .filter(|name| {
+                                    name.rsplit_once('.')
+                                        .is_some_and(|(q, _)| q == relation || q.ends_with(&inner))
+                                })
+                                .map(|name| ProjectionItem::Column(name.clone())),
+                        );
+                        if expanded.len() == before {
+                            anyhow::bail!("missing FROM-clause entry for table \"{relation}\"");
+                        }
+                    }
+                    other => expanded.push(other),
+                }
+            }
+            expanded
+        };
 
         // Integer arithmetic is computed in its operands' type, so overflowing
         // `integer` or `smallint` is an error, as in PostgreSQL.
@@ -729,6 +825,7 @@ impl MemExecutor {
                     _ => {}
                 }
             }
+            crate::filter_eval::check_unambiguous(&refs, &col_names)?;
             crate::filter_eval::check_column_refs(refs, &col_names)?;
         }
 
@@ -869,9 +966,7 @@ impl MemExecutor {
                                 if is_grouping && !is_active {
                                     out_row.push(crate::Value::Null);
                                 } else {
-                                    let idx = col_names
-                                        .iter()
-                                        .position(|tc| tc == c || tc.ends_with(&format!(".{}", c)));
+                                    let idx = crate::filter_eval::col_pos(&col_names, c);
                                     out_row.push(
                                         group_rows
                                             .first()
@@ -1034,20 +1129,13 @@ impl MemExecutor {
                     } => {
                         let p_indices: Vec<usize> = partition_by
                             .iter()
-                            .filter_map(|c| {
-                                col_names
-                                    .iter()
-                                    .position(|tc| tc == c || tc.ends_with(&format!(".{}", c)))
-                            })
+                            .filter_map(|c| crate::filter_eval::col_pos(&col_names, c))
                             .collect();
 
                         let o_indices: Vec<(usize, bool)> = w_order_by
                             .iter()
                             .filter_map(|(c, asc)| {
-                                col_names
-                                    .iter()
-                                    .position(|tc| tc == c || tc.ends_with(&format!(".{}", c)))
-                                    .map(|idx| (idx, *asc))
+                                crate::filter_eval::col_pos(&col_names, c).map(|idx| (idx, *asc))
                             })
                             .collect();
 
@@ -1161,11 +1249,9 @@ impl MemExecutor {
                             // Group the partition-then-order-sorted rows by partition.
                             let groups =
                                 partition_groups(&row_indices, &partition_key_of, &stored_rows);
-                            let arg_idx = args.first().and_then(|c| {
-                                col_names
-                                    .iter()
-                                    .position(|tc| tc == c || tc.ends_with(&format!(".{}", c)))
-                            });
+                            let arg_idx = args
+                                .first()
+                                .and_then(|c| crate::filter_eval::col_pos(&col_names, c));
                             let offset: usize =
                                 args.get(1).and_then(|s| s.parse().ok()).unwrap_or(1);
                             let lead = func_name == "LEAD";
@@ -1218,11 +1304,9 @@ impl MemExecutor {
                             let last = func_name == "LAST_VALUE";
                             let groups =
                                 partition_groups(&row_indices, &partition_key_of, &stored_rows);
-                            let arg_idx = args.first().and_then(|c| {
-                                col_names
-                                    .iter()
-                                    .position(|tc| tc == c || tc.ends_with(&format!(".{}", c)))
-                            });
+                            let arg_idx = args
+                                .first()
+                                .and_then(|c| crate::filter_eval::col_pos(&col_names, c));
                             for group in &groups {
                                 let okeys: Vec<Vec<Value>> = group
                                     .iter()
@@ -1329,9 +1413,7 @@ impl MemExecutor {
                     } => {
                         let mut results = vec![Value::Null; stored_rows.len()];
                         for (row_idx, row) in stored_rows.iter().enumerate() {
-                            let c_idx = col_names
-                                .iter()
-                                .position(|tc| tc == left || tc.ends_with(&format!(".{}", left)));
+                            let c_idx = crate::filter_eval::col_pos(&col_names, left);
                             if let Some(i) = c_idx {
                                 if let Some(v) = row.get(i) {
                                     if operator == "->>" {
@@ -1419,9 +1501,7 @@ impl MemExecutor {
                             }
                             _ => c.clone(),
                         };
-                        col_names.iter().position(|tc| {
-                            tc == &actual_col || tc.ends_with(&format!(".{}", actual_col))
-                        })
+                        crate::filter_eval::col_pos(&col_names, &actual_col)
                     }
                 })
                 .collect();
@@ -1467,9 +1547,7 @@ impl MemExecutor {
                                     else_column,
                                     ..
                                 } => {
-                                    let left_idx = col_names.iter().position(|tc| {
-                                        tc == left || tc.ends_with(&format!(".{}", left))
-                                    });
+                                    let left_idx = crate::filter_eval::col_pos(&col_names, left);
                                     let else_idx = col_names.iter().position(|tc| {
                                         tc == else_column
                                             || tc.ends_with(&format!(".{}", else_column))
@@ -1683,9 +1761,7 @@ impl MemExecutor {
                 ProjectionItem::Column(col) | ProjectionItem::AliasedColumn(col, _) => Some(col),
                 _ => None,
             }) {
-                if let Some(source_idx) = col_names.iter().position(|candidate| {
-                    candidate == source_col || candidate.ends_with(&format!(".{}", source_col))
-                }) {
+                if let Some(source_idx) = crate::filter_eval::col_pos(&col_names, source_col) {
                     if let Some(col_desc) = joined_columns.get(source_idx) {
                         ty = col_desc.data_type.clone();
                     }
@@ -1694,9 +1770,7 @@ impl MemExecutor {
 
             if let Some(inferred) = projection.get(i).and_then(|item| {
                 crate::result_types::projection_type(item, |source| {
-                    col_names
-                        .iter()
-                        .position(|name| name == source || name.ends_with(&format!(".{source}")))
+                    crate::filter_eval::col_pos(&col_names, source)
                         .and_then(|index| joined_columns.get(index))
                         .map(|column| column.data_type.clone())
                 })

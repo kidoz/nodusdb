@@ -91,9 +91,23 @@ impl TargetScope {
         let mut positions = Vec::new();
         for item in items {
             if item == "*" {
-                let (target, source) = (0..self.width, self.width..old);
+                // The relations' columns as `*` shows them: a USING join's
+                // merged columns (named without a qualifier) once, first.
+                let merged: Vec<usize> = (self.width..old)
+                    .filter(|&i| !self.names[i].contains('.'))
+                    .collect();
+                let unqualified = |i: usize| self.names[i].rsplit('.').next().unwrap_or_default();
+                let source: Vec<usize> = merged
+                    .iter()
+                    .copied()
+                    .chain((self.width..old).filter(|&i| {
+                        self.names[i].contains('.')
+                            && !merged.iter().any(|&m| self.names[m] == unqualified(i))
+                    }))
+                    .collect();
+                let target = 0..self.width;
                 if source_first {
-                    positions.extend(source.chain(target));
+                    positions.extend(source.into_iter().chain(target));
                 } else {
                     positions.extend(target.chain(source));
                 }

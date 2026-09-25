@@ -16,10 +16,13 @@ use nodus_catalog::ColumnDescriptor;
 /// (the rows of a single table, e.g. `t.a` in `UPDATE t ... WHERE t.a = 1`), or
 /// drops a leading schema (`public.t.a` is `t.a`).
 pub(crate) fn col_pos(col_names: &[String], name: &str) -> Option<usize> {
-    if let Some(i) = col_names
-        .iter()
-        .position(|c| c == name || c.ends_with(&format!(".{name}")))
-    {
+    // An exact name (a USING join's merged column, a computed column) wins
+    // over a column it merely ends.
+    if let Some(i) = col_names.iter().position(|c| c == name) {
+        return Some(i);
+    }
+    let suffix = format!(".{name}");
+    if let Some(i) = col_names.iter().position(|c| c.ends_with(&suffix)) {
         return Some(i);
     }
     let (qualifier, tail) = name.rsplit_once('.')?;
@@ -61,6 +64,26 @@ pub(crate) fn check_column_refs(
             }
             Some(_) => anyhow::bail!("column {name} does not exist"),
             None => anyhow::bail!("column \"{name}\" does not exist"),
+        }
+    }
+    Ok(())
+}
+
+/// Checks that no unqualified reference names columns of two relations (or
+/// two columns of one): `a` in `x JOIN y ON ...` when both have `a`. A USING
+/// join's merged column is named exactly, so it is not ambiguous.
+pub(crate) fn check_unambiguous(names: &[String], col_names: &[String]) -> Result<()> {
+    for name in names {
+        let name = match parse_json_ref(name) {
+            Some((base, _, _)) => base,
+            None => name.clone(),
+        };
+        if name.contains('.') || col_names.iter().any(|c| *c == name) {
+            continue;
+        }
+        let suffix = format!(".{name}");
+        if col_names.iter().filter(|c| c.ends_with(&suffix)).count() > 1 {
+            anyhow::bail!("column reference \"{name}\" is ambiguous");
         }
     }
     Ok(())

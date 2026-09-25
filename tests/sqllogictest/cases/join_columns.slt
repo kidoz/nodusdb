@@ -1,0 +1,121 @@
+# SELECT * over JOIN ... USING and NATURAL JOIN shows each merged column
+# once, first; t.* is only t's columns; * mixes with other items; and an
+# unqualified name two relations have is ambiguous. Expected results come
+# from PostgreSQL 18.
+statement ok
+CREATE TABLE ja (id INT PRIMARY KEY, x TEXT, i INT);
+
+statement ok
+CREATE TABLE jb (id INT, x TEXT, y INT);
+
+statement ok
+CREATE TABLE jc (id INT, z TEXT);
+
+statement ok
+INSERT INTO ja VALUES (1, 'p', 10), (2, 'q', 20);
+
+statement ok
+INSERT INTO jb VALUES (1, 'p', 100), (3, 'r', 300);
+
+statement ok
+INSERT INTO jc VALUES (1, 'c1'), (3, 'c3'), (4, 'c4');
+
+query TTTTT
+SELECT * FROM ja JOIN jb USING (id);
+----
+1	p	10	p	100
+
+query TTTT
+SELECT * FROM ja NATURAL JOIN jb;
+----
+1	p	10	100
+
+query TTTT
+SELECT * FROM ja LEFT JOIN jb USING (id, x) ORDER BY id;
+----
+1	p	10	100
+2	q	20	NULL
+
+query TTTTT
+SELECT * FROM ja FULL JOIN jb USING (id) ORDER BY id;
+----
+1	p	10	p	100
+2	q	20	NULL	NULL
+3	NULL	NULL	r	300
+
+query TTTTT
+SELECT * FROM ja RIGHT JOIN jb USING (id) ORDER BY id;
+----
+1	p	10	p	100
+3	NULL	NULL	r	300
+
+query T
+SELECT id FROM ja FULL JOIN jb USING (id) ORDER BY 1;
+----
+1
+2
+3
+
+query TTT
+SELECT id, ja.id, jb.id FROM ja RIGHT JOIN jb USING (id) ORDER BY 1;
+----
+1	1	1
+3	NULL	3
+
+query TTTTTT
+SELECT * FROM ja JOIN jb USING (id) JOIN jc USING (id);
+----
+1	p	10	p	100	c1
+
+query TTTTTT
+SELECT * FROM ja FULL JOIN jb USING (id) FULL JOIN jc USING (id) ORDER BY id;
+----
+1	p	10	p	100	c1
+2	q	20	NULL	NULL	NULL
+3	NULL	NULL	r	300	c3
+4	NULL	NULL	NULL	NULL	c4
+
+query TTTT
+SELECT jb.*, ja.id FROM ja JOIN jb ON ja.id = jb.id;
+----
+1	p	100	1
+
+query TTTT
+SELECT ja.id, jb.* FROM ja JOIN jb USING (id);
+----
+1	1	p	100
+
+query TTTT
+SELECT *, 1 AS one FROM jb ORDER BY id;
+----
+1	p	100	1
+3	r	300	1
+
+query TTT
+SELECT 0 AS zero, * FROM jc ORDER BY id;
+----
+0	1	c1
+0	3	c3
+0	4	c4
+
+query TTTTT
+SELECT ja.*, jc.* FROM ja, jc WHERE ja.id = jc.id;
+----
+1	p	10	1	c1
+
+statement error
+SELECT x FROM ja JOIN jb USING (id);
+
+statement error
+SELECT id FROM ja JOIN jb ON ja.id = jb.id;
+
+statement error
+SELECT * FROM ja JOIN jb USING (nosuch);
+
+statement error
+SELECT jd.* FROM ja;
+
+query T
+SELECT count(*) FROM ja JOIN jb USING (id) WHERE id > 0;
+----
+1

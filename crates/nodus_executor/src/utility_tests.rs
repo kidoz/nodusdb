@@ -126,3 +126,21 @@ fn integer_arithmetic_overflows_in_its_type() {
         ["smallint"]
     );
 }
+
+#[test]
+fn using_joins_merge_their_columns() {
+    let sql = session();
+    sql("CREATE TABLE a (id INT, x TEXT)").unwrap();
+    sql("CREATE TABLE b (id INT, y TEXT)").unwrap();
+    sql("INSERT INTO a VALUES (1, 'p'), (2, 'q')").unwrap();
+    sql("INSERT INTO b VALUES (1, 'r'), (3, 's')").unwrap();
+    let out = sql("SELECT * FROM a FULL JOIN b USING (id)").unwrap();
+    assert_eq!(out.columns, ["id", "x", "y"]);
+    assert_eq!(rows(&out), ["1|p|r", "2|q|", "3||s"]);
+    let out = sql("SELECT b.*, 0 AS z FROM a JOIN b ON a.id = b.id").unwrap();
+    assert_eq!(out.columns, ["id", "y", "z"]);
+    let out = sql("SELECT a.x, b.y FROM a, b WHERE a.id = b.id").unwrap();
+    assert_eq!(rows(&out), ["p|r"]);
+    let err = sql("SELECT id FROM a JOIN b ON a.id = b.id").unwrap_err();
+    assert_eq!(err.to_string(), "column reference \"id\" is ambiguous");
+}

@@ -259,30 +259,33 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
     }
     let (table_name, table_alias, joins) = plan_from(&select.from, &mut ctes, params)?;
 
-    // Projection: `*` -> empty (all); otherwise plain column identifiers.
+    // Projection: a lone `*` is empty (all columns); `*` among other items,
+    // and `t.*`, stand for columns the executor expands once the relations'
+    // columns are known.
     let mut projection = Vec::new();
-    for item in &select.projection {
-        match item {
-            SelectItem::Wildcard(_) => {
-                projection.clear();
-                break;
-            }
-            SelectItem::UnnamedExpr(expr) => {
-                projection.push(plan_select_expr(expr, None, params)?);
-            }
-            SelectItem::ExprWithAlias { expr, alias } => {
-                projection.push(plan_select_expr(expr, Some(alias.value.clone()), params)?);
-            }
-            SelectItem::QualifiedWildcard(_, _) => {
-                // `t.*` ideally projects only table `t`'s columns; NodusDB models
-                // "all columns" as an empty projection, so treat it like `*`
-                // rather than erroring. Correct for the common single-`t.*` case;
-                // a mixed `t.*, expr` projection widens to all columns.
-                projection.clear();
-                break;
-            }
-            SelectItem::ExprWithAliases { .. } => {
-                anyhow::bail!("Unsupported multi-alias select item")
+    if !matches!(select.projection.as_slice(), [SelectItem::Wildcard(_)]) {
+        for item in &select.projection {
+            match item {
+                SelectItem::Wildcard(_) => projection.push(ProjectionItem::Column("*".to_string())),
+                SelectItem::UnnamedExpr(expr) => {
+                    projection.push(plan_select_expr(expr, None, params)?);
+                }
+                SelectItem::ExprWithAlias { expr, alias } => {
+                    projection.push(plan_select_expr(expr, Some(alias.value.clone()), params)?);
+                }
+                SelectItem::QualifiedWildcard(
+                    sqlparser::ast::SelectItemQualifiedWildcardKind::ObjectName(name),
+                    _,
+                ) => {
+                    let relation = name
+                        .0
+                        .iter()
+                        .map(|part| part.to_string().trim_matches('"').to_string())
+                        .collect::<Vec<_>>()
+                        .join(".");
+                    projection.push(ProjectionItem::Column(format!("{relation}.*")));
+                }
+                other => anyhow::bail!("Unsupported select item: {other}"),
             }
         }
     }
@@ -768,7 +771,11 @@ fn sort_target(
     params: &[Value],
 ) -> Result<SortTarget> {
     if let Some(position) = select_position(expr, "ORDER BY")? {
-        if !projection.is_empty() && position > projection.len() {
+        // A `*` in the list stands for columns not yet known.
+        let wildcard = projection
+            .iter()
+            .any(|p| matches!(p, ProjectionItem::Column(c) if c.ends_with('*')));
+        if !projection.is_empty() && !wildcard && position > projection.len() {
             anyhow::bail!("ORDER BY position {position} is not in select list");
         }
         return Ok(SortTarget::Output(position - 1));
