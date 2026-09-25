@@ -1055,6 +1055,11 @@ pub enum LogicalPlan {
         tables: Vec<String>,
         restart_identity: bool,
     },
+    /// `EXPLAIN [ANALYZE] statement`.
+    Explain {
+        plan: Box<LogicalPlan>,
+        options: crate::explain::ExplainOptions,
+    },
 }
 
 /// One `WHEN` clause of a `MERGE`.

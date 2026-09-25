@@ -1343,6 +1343,14 @@ fn describe_probe_plan(plan: &nodus_executor::LogicalPlan) -> Option<nodus_execu
         }),
         LogicalPlan::SetOp { left, .. } => describe_probe_plan(left),
         LogicalPlan::With { body, .. } => describe_probe_plan(body),
+        // The plan's shape without running the statement.
+        LogicalPlan::Explain { plan, options } => Some(LogicalPlan::Explain {
+            plan: plan.clone(),
+            options: nodus_executor::ExplainOptions {
+                analyze: false,
+                ..options.clone()
+            },
+        }),
         _ => None,
     }
 }

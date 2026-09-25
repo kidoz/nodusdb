@@ -23,6 +23,7 @@ mod ddl;
 mod dml;
 mod eval_error;
 mod execute;
+mod explain;
 pub(crate) mod filter_eval;
 mod functions;
 mod information_schema;
@@ -45,6 +46,7 @@ mod table_functions;
 mod transactions;
 mod value;
 mod view_helpers;
+pub use explain::ExplainOptions;
 pub use json_text::{json_text, jsonb_text};
 pub use plan_types::{
     AggregateOp, AlterTableOp, CompareOp, ConflictTarget, DeferredItem, FilterExpr, Join, JoinType,

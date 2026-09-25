@@ -1,0 +1,105 @@
+# EXPLAIN describes a statement in PostgreSQL's plan vocabulary. Only
+# COSTS OFF plans are compared, as estimates differ. Expected results come
+# from PostgreSQL 18.
+statement ok
+CREATE TABLE ex1 (id INT PRIMARY KEY, name TEXT, n INT);
+
+statement ok
+CREATE TABLE ex2 (id INT, ex1_id INT, v TEXT);
+
+query T
+EXPLAIN (COSTS OFF) SELECT * FROM ex1;
+----
+Seq Scan on ex1
+
+query T
+EXPLAIN (COSTS OFF) SELECT * FROM ex1 WHERE n > 1 AND name = 'x';
+----
+Seq Scan on ex1
+  Filter: ((n > 1) AND (name = 'x'::text))
+
+query T
+EXPLAIN (COSTS OFF) SELECT * FROM ex1 WHERE id = 5;
+----
+Index Scan using ex1_pkey on ex1
+  Index Cond: (id = 5)
+
+query T
+EXPLAIN (COSTS OFF) SELECT name, count(*) FROM ex1 GROUP BY name ORDER BY 2 DESC LIMIT 3;
+----
+Limit
+  ->  Sort
+        Sort Key: (count(*)) DESC
+        ->  HashAggregate
+              Group Key: name
+              ->  Seq Scan on ex1
+
+query T
+EXPLAIN (COSTS OFF) SELECT count(*) FROM ex1;
+----
+Aggregate
+  ->  Seq Scan on ex1
+
+query T
+EXPLAIN (COSTS OFF) SELECT DISTINCT name FROM ex1;
+----
+HashAggregate
+  Group Key: name
+  ->  Seq Scan on ex1
+
+query T
+EXPLAIN (COSTS OFF) SELECT id FROM ex1 UNION ALL SELECT id FROM ex2;
+----
+Append
+  ->  Seq Scan on ex1
+  ->  Seq Scan on ex2
+
+query T
+EXPLAIN (COSTS OFF) SELECT 1;
+----
+Result
+
+query T
+EXPLAIN (COSTS OFF) INSERT INTO ex1 VALUES (1, 'a', 1);
+----
+Insert on ex1
+  ->  Result
+
+query T
+EXPLAIN (COSTS OFF) DELETE FROM ex1 WHERE n IS NULL;
+----
+Delete on ex1
+  ->  Seq Scan on ex1
+        Filter: (n IS NULL)
+
+query T
+EXPLAIN (COSTS OFF) UPDATE ex2 SET v = 'x' WHERE ex1_id = 3;
+----
+Update on ex2
+  ->  Seq Scan on ex2
+        Filter: (ex1_id = 3)
+
+query T
+EXPLAIN (COSTS OFF) SELECT * FROM ex1 ORDER BY name DESC NULLS LAST;
+----
+Sort
+  Sort Key: name DESC NULLS LAST
+  ->  Seq Scan on ex1
+
+# EXPLAIN ANALYZE runs the statement.
+statement ok
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) INSERT INTO ex1 VALUES (7, 'q', 1);
+
+query TTT
+SELECT * FROM ex1;
+----
+7	q	1
+
+statement error
+EXPLAIN CREATE TABLE zz (a int);
+
+statement error
+EXPLAIN (NOSUCH) SELECT 1;
+
+statement error
+EXPLAIN (FORMAT XML) SELECT 1;

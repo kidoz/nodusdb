@@ -661,6 +661,38 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
             })
         }
         Statement::Merge(merge) => plan_merge(merge, params),
+        Statement::Explain {
+            analyze,
+            verbose: _,
+            statement,
+            format,
+            options,
+            ..
+        } => {
+            let plan = plan_statement(statement, params)?;
+            if !matches!(
+                plan,
+                LogicalPlan::Select { .. }
+                    | LogicalPlan::SetOp { .. }
+                    | LogicalPlan::Values { .. }
+                    | LogicalPlan::SelectLiteral { .. }
+                    | LogicalPlan::Insert { .. }
+                    | LogicalPlan::Update { .. }
+                    | LogicalPlan::Delete { .. }
+                    | LogicalPlan::Merge { .. }
+                    | LogicalPlan::With { .. }
+                    | LogicalPlan::CreateTableAs { .. }
+            ) {
+                anyhow::bail!(
+                    "EXPLAIN of {} is not supported",
+                    leading_keywords(&statement.to_string())
+                );
+            }
+            Ok(LogicalPlan::Explain {
+                plan: Box::new(plan),
+                options: explain_options(*analyze, format.as_ref(), options.as_deref())?,
+            })
+        }
         Statement::Truncate(truncate) => Ok(LogicalPlan::Truncate {
             tables: truncate
                 .table_names
@@ -812,6 +844,68 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
         }
         _ => anyhow::bail!("{} is not supported", leading_keywords(&stmt.to_string())),
     }
+}
+
+/// The options of an `EXPLAIN`: `ANALYZE` and `FORMAT` as keywords, or any
+/// of `(ANALYZE, COSTS, TIMING, SUMMARY, FORMAT, ...)` in parentheses.
+fn explain_options(
+    analyze: bool,
+    format: Option<&sqlparser::ast::AnalyzeFormatKind>,
+    options: Option<&[sqlparser::ast::UtilityOption]>,
+) -> Result<crate::explain::ExplainOptions> {
+    use sqlparser::ast::{AnalyzeFormat, AnalyzeFormatKind};
+    let mut out = crate::explain::ExplainOptions {
+        analyze,
+        ..Default::default()
+    };
+    let set_format = |out: &mut crate::explain::ExplainOptions, name: &str| -> Result<()> {
+        match name.to_ascii_lowercase().as_str() {
+            "text" => out.json = false,
+            "json" => out.json = true,
+            other => anyhow::bail!(
+                "EXPLAIN format {} is not supported",
+                other.to_ascii_uppercase()
+            ),
+        }
+        Ok(())
+    };
+    if let Some(AnalyzeFormatKind::Keyword(f) | AnalyzeFormatKind::Assignment(f)) = format {
+        let name = match f {
+            AnalyzeFormat::JSON => "json",
+            AnalyzeFormat::TEXT => "text",
+            other => &other.to_string(),
+        };
+        set_format(&mut out, name)?;
+    }
+    for option in options.unwrap_or_default() {
+        let arg = option.arg.as_ref().map(|a| {
+            a.to_string()
+                .trim_matches(|c| c == '\'' || c == '"')
+                .to_ascii_lowercase()
+        });
+        let flag = || -> Result<bool> {
+            match arg.as_deref() {
+                None | Some("true" | "on" | "1") => Ok(true),
+                Some("false" | "off" | "0") => Ok(false),
+                Some(_) => anyhow::bail!(
+                    "{} requires a Boolean value",
+                    option.name.value.to_ascii_lowercase()
+                ),
+            }
+        };
+        match option.name.value.to_ascii_lowercase().as_str() {
+            "analyze" => out.analyze = flag()?,
+            "costs" => out.costs = flag()?,
+            "timing" => out.timing = flag()?,
+            "summary" => out.summary = Some(flag()?),
+            "format" => set_format(&mut out, arg.as_deref().unwrap_or(""))?,
+            // Details the executor has no counterpart for.
+            "verbose" | "buffers" | "settings" | "wal" | "generic_plan" | "memory"
+            | "serialize" => {}
+            other => anyhow::bail!("unrecognized EXPLAIN option \"{other}\""),
+        }
+    }
+    Ok(out)
 }
 
 /// The keywords a statement or clause starts with (`CREATE FUNCTION`,
