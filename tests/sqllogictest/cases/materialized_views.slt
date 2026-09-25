@@ -1,0 +1,143 @@
+# Materialized views store their query's rows until REFRESH; CREATE TABLE AS
+# ... WITH NO DATA creates an empty table; views take column names and OR
+# REPLACE. Expected results come from PostgreSQL 18.
+statement ok
+CREATE TABLE mvsrc (a INT, b TEXT);
+
+statement ok
+INSERT INTO mvsrc VALUES (1, 'x'), (2, 'y');
+
+statement ok
+CREATE MATERIALIZED VIEW mv1 AS SELECT a, b FROM mvsrc WHERE a > 0;
+
+statement ok
+CREATE MATERIALIZED VIEW mv2 (n, t) AS SELECT a, b FROM mvsrc WITH NO DATA;
+
+query TT
+SELECT * FROM mv1 ORDER BY a;
+----
+1	x
+2	y
+
+statement ok
+INSERT INTO mvsrc VALUES (3, 'z');
+
+query T
+SELECT count(*) FROM mv1;
+----
+2
+
+statement ok
+REFRESH MATERIALIZED VIEW mv1;
+
+query T
+SELECT count(*) FROM mv1;
+----
+3
+
+statement ok
+REFRESH MATERIALIZED VIEW mv2 WITH DATA;
+
+query TT
+SELECT * FROM mv2 ORDER BY n;
+----
+1	x
+2	y
+3	z
+
+statement ok
+REFRESH MATERIALIZED VIEW mv1 WITH NO DATA;
+
+statement ok
+REFRESH MATERIALIZED VIEW mv1;
+
+query T
+SELECT count(*) FROM mv1;
+----
+3
+
+statement error
+INSERT INTO mv2 VALUES (9, 'q');
+
+statement error
+UPDATE mv2 SET t = 'w';
+
+statement error
+DELETE FROM mv2;
+
+statement error
+TRUNCATE mv2;
+
+statement error
+REFRESH MATERIALIZED VIEW mvsrc;
+
+statement error
+DROP TABLE mv2;
+
+statement error
+DROP MATERIALIZED VIEW mvsrc;
+
+query TT
+SELECT relname, relkind FROM pg_class WHERE relname IN ('mv1', 'mv2', 'mvsrc') ORDER BY 1;
+----
+mv1	m
+mv2	m
+mvsrc	r
+
+query T
+SELECT table_name FROM information_schema.tables WHERE table_name LIKE 'mv%' ORDER BY 1;
+----
+mvsrc
+
+query T
+SELECT replace(pg_get_viewdef('mv2'::regclass), chr(10), '/');
+----
+ SELECT a AS n,/    b AS t/   FROM mvsrc;
+
+statement ok
+DROP MATERIALIZED VIEW mv2;
+
+query T
+SELECT count(*) FROM pg_class WHERE relname = 'mv2';
+----
+0
+
+statement ok
+CREATE TABLE ctas1 AS SELECT a FROM mvsrc WITH NO DATA;
+
+query T
+SELECT count(*) FROM ctas1;
+----
+0
+
+statement ok
+CREATE TABLE ctas2 AS SELECT a FROM mvsrc WITH DATA;
+
+statement ok
+CREATE VIEW vcols (x, y) AS SELECT a, b FROM mvsrc;
+
+query TT
+SELECT * FROM vcols ORDER BY x;
+----
+1	x
+2	y
+3	z
+
+statement ok
+CREATE OR REPLACE VIEW vcols AS SELECT a AS x, b AS y, 1 AS z FROM mvsrc;
+
+query TTT
+SELECT * FROM vcols ORDER BY x;
+----
+1	x	1
+2	y	1
+3	z	1
+
+statement error
+CREATE VIEW vcols AS SELECT 1;
+
+statement error
+CREATE OR REPLACE VIEW mvsrc AS SELECT 1;
+
+statement error
+DROP TABLE vcols;

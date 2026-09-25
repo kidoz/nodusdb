@@ -44,6 +44,8 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                 name: create_table.name.to_string(),
                 query: Box::new(plan_query(query, params)?),
                 if_not_exists: create_table.if_not_exists,
+                no_data: has_no_data_marker(&create_table.table_options),
+                materialized: false,
             })
         }
         Statement::CreateSequence {
@@ -307,10 +309,34 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                 unique_constraints,
             })
         }
-        Statement::CreateView(create_view) => Ok(LogicalPlan::CreateView {
-            name: create_view.name.to_string(),
-            query: Box::new(plan_query(&create_view.query, params)?),
-        }),
+        Statement::CreateView(create_view) => {
+            let mut query = plan_query(&create_view.query, params)?;
+            // `CREATE VIEW v (a, b) AS ...` names the view's columns.
+            if !create_view.columns.is_empty() {
+                query = LogicalPlan::Renamed {
+                    input: Box::new(query),
+                    columns: create_view
+                        .columns
+                        .iter()
+                        .map(|c| c.name.value.clone())
+                        .collect(),
+                };
+            }
+            if create_view.materialized {
+                return Ok(LogicalPlan::CreateTableAs {
+                    name: create_view.name.to_string(),
+                    query: Box::new(query),
+                    if_not_exists: create_view.if_not_exists,
+                    no_data: has_no_data_marker(&create_view.options),
+                    materialized: true,
+                });
+            }
+            Ok(LogicalPlan::CreateView {
+                name: create_view.name.to_string(),
+                query: Box::new(query),
+                or_replace: create_view.or_replace,
+            })
+        }
         Statement::Drop {
             object_type,
             if_exists,
@@ -335,6 +361,12 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                 sqlparser::ast::ObjectType::Table => Ok(LogicalPlan::DropTable {
                     name,
                     if_exists: *if_exists,
+                    materialized: false,
+                }),
+                sqlparser::ast::ObjectType::MaterializedView => Ok(LogicalPlan::DropTable {
+                    name,
+                    if_exists: *if_exists,
+                    materialized: true,
                 }),
                 sqlparser::ast::ObjectType::View => Ok(LogicalPlan::DropView {
                     name,
@@ -602,7 +634,13 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                 name,
                 query: Box::new(plan_query(&query, params)?),
                 if_not_exists: false,
+                no_data: false,
+                materialized: false,
             })
+        }
+        Statement::Query(query) if refresh_target(query).is_some() => {
+            let (name, with_data) = refresh_target(query).expect("guarded by the match arm");
+            Ok(LogicalPlan::RefreshMaterializedView { name, with_data })
         }
         Statement::Query(query) => plan_query(query, params),
         Statement::Update(update) => {
@@ -906,6 +944,53 @@ fn explain_options(
         }
     }
     Ok(out)
+}
+
+/// Whether `WITH [NO] DATA` said `NO DATA`; the SQL front end records it as
+/// the storage parameter [`nodus_sql::NO_DATA_OPTION`].
+fn has_no_data_marker(options: &sqlparser::ast::CreateTableOptions) -> bool {
+    match options {
+        sqlparser::ast::CreateTableOptions::With(options) => options.iter().any(|option| {
+            matches!(option, sqlparser::ast::SqlOption::KeyValue { key, .. }
+                if key.value == nodus_sql::NO_DATA_OPTION)
+        }),
+        _ => false,
+    }
+}
+
+/// The view a `REFRESH MATERIALIZED VIEW` names, and whether `WITH DATA`;
+/// the SQL front end writes the statement as a call of
+/// [`nodus_sql::REFRESH_FUNCTION`].
+fn refresh_target(query: &sqlparser::ast::Query) -> Option<(String, bool)> {
+    use sqlparser::ast::{
+        Expr, FunctionArg, FunctionArgExpr, FunctionArguments, SelectItem, SetExpr,
+    };
+    let SetExpr::Select(select) = &*query.body else {
+        return None;
+    };
+    let [SelectItem::UnnamedExpr(Expr::Function(function))] = select.projection.as_slice() else {
+        return None;
+    };
+    if function.name.to_string() != nodus_sql::REFRESH_FUNCTION || !select.from.is_empty() {
+        return None;
+    }
+    let FunctionArguments::List(list) = &function.args else {
+        return None;
+    };
+    let args: Vec<crate::Value> = list
+        .args
+        .iter()
+        .map(|arg| match arg {
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => expr_to_value(e, &[]),
+            _ => None,
+        })
+        .collect::<Option<_>>()?;
+    match args.as_slice() {
+        [crate::Value::Text(name), crate::Value::Bool(with_data)] => {
+            Some((name.clone(), *with_data))
+        }
+        _ => None,
+    }
 }
 
 /// The keywords a statement or clause starts with (`CREATE FUNCTION`,

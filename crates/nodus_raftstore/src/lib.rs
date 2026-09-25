@@ -1819,6 +1819,7 @@ mod tests {
             columns: Vec::new(),
             constraints: Vec::new(),
             view_query: None,
+            materialized_query: None,
         };
 
         catalog.create_table(req.clone()).unwrap();
@@ -1833,6 +1834,7 @@ mod tests {
             columns: Vec::new(),
             constraints: Vec::new(),
             view_query: None,
+            materialized_query: None,
         };
         assert!(!table_create_already_applied(
             Some(&reader),

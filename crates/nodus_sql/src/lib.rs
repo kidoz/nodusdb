@@ -44,10 +44,145 @@ pub fn parse_sql(
             word.value.make_ascii_lowercase();
         }
     }
-    let tokens = reorder_identity_options(reorder_sequence_options(tokens));
+    let tokens = reorder_identity_options(reorder_sequence_options(rewrite_data_clauses(tokens)));
     Parser::new(&dialect)
         .with_tokens_with_locations(tokens)
         .parse_statements()
+}
+
+/// The storage parameter that records `WITH NO DATA` on `CREATE TABLE ...
+/// AS` and `CREATE MATERIALIZED VIEW`, which the parser does not accept.
+pub const NO_DATA_OPTION: &str = "nodus_with_no_data";
+
+/// The function call `REFRESH MATERIALIZED VIEW name [WITH [NO] DATA]` is
+/// written as — `pg_catalog.nodus_refresh_materialized_view('name', true)`
+/// — since the parser has no such statement.
+pub const REFRESH_FUNCTION: &str = "pg_catalog.nodus_refresh_materialized_view";
+
+/// Rewrites what the parser lacks: a trailing `WITH [NO] DATA` on `CREATE
+/// TABLE ... AS` or `CREATE MATERIALIZED VIEW` becomes the storage
+/// parameter [`NO_DATA_OPTION`] (for `NO DATA`), and `REFRESH MATERIALIZED
+/// VIEW` a call of [`REFRESH_FUNCTION`].
+fn rewrite_data_clauses(
+    tokens: Vec<sqlparser::tokenizer::TokenWithSpan>,
+) -> Vec<sqlparser::tokenizer::TokenWithSpan> {
+    use sqlparser::tokenizer::Token;
+    let mut out = Vec::with_capacity(tokens.len());
+    let mut statement = Vec::new();
+    for token in tokens {
+        let end = token.token == Token::SemiColon || token.token == Token::EOF;
+        statement.push(token);
+        if end {
+            out.extend(rewrite_data_clause(std::mem::take(&mut statement)));
+        }
+    }
+    out.extend(rewrite_data_clause(statement));
+    out
+}
+
+fn rewrite_data_clause(
+    statement: Vec<sqlparser::tokenizer::TokenWithSpan>,
+) -> Vec<sqlparser::tokenizer::TokenWithSpan> {
+    use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer};
+    let word = |t: &TokenWithSpan| match &t.token {
+        Token::Word(w) if w.quote_style.is_none() => Some(w.value.clone()),
+        _ => None,
+    };
+    let significant: Vec<usize> = statement
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| {
+            !matches!(
+                t.token,
+                Token::Whitespace(_) | Token::SemiColon | Token::EOF
+            )
+        })
+        .map(|(i, _)| i)
+        .collect();
+    let words: Vec<Option<String>> = significant.iter().map(|&i| word(&statement[i])).collect();
+    let is = |at: usize, w: &str| words.get(at).and_then(|x| x.as_deref()) == Some(w);
+    let tail: Vec<TokenWithSpan> = statement
+        .iter()
+        .skip(significant.last().map_or(0, |&i| i + 1))
+        .cloned()
+        .collect();
+    // A trailing `WITH DATA` / `WITH NO DATA`.
+    let n = significant.len();
+    let data_clause = if n >= 3 && is(n - 3, "with") && is(n - 2, "no") && is(n - 1, "data") {
+        Some((n - 3, false))
+    } else if n >= 2 && is(n - 2, "with") && is(n - 1, "data") {
+        Some((n - 2, true))
+    } else {
+        None
+    };
+
+    if is(0, "refresh") && is(1, "materialized") && is(2, "view") {
+        let mut at = 3;
+        if is(at, "concurrently") {
+            at += 1;
+        }
+        let name_end = data_clause.map_or(n, |(start, _)| start);
+        let name: String = significant[at..name_end]
+            .iter()
+            .map(|&i| match &statement[i].token {
+                Token::Word(w) if w.quote_style == Some('"') => {
+                    format!("\"{}\"", w.value.replace('"', "\"\""))
+                }
+                Token::Word(w) => w.value.clone(),
+                other => other.to_string(),
+            })
+            .collect();
+        let with_data = data_clause.is_none_or(|(_, with)| with);
+        let sql = format!(
+            "SELECT {REFRESH_FUNCTION}('{}', {with_data})",
+            name.replace('\'', "''")
+        );
+        let dialect = PostgreSqlDialect {};
+        return match Tokenizer::new(&dialect, &sql).tokenize_with_location() {
+            Ok(mut tokens) => {
+                tokens.retain(|t| t.token != Token::EOF);
+                tokens.extend(tail);
+                tokens
+            }
+            Err(_) => statement,
+        };
+    }
+
+    let creates = is(0, "create")
+        && ((is(1, "materialized") && is(2, "view"))
+            || (1..4).any(|at| is(at, "table"))
+                && words.iter().any(|w| w.as_deref() == Some("as")));
+    let Some((clause_start, with_data)) = data_clause.filter(|_| creates) else {
+        return statement;
+    };
+    let mut out: Vec<TokenWithSpan> = statement[..significant[clause_start]].to_vec();
+    if !with_data {
+        // `WITH (nodus_with_no_data = true)` before the top-level `AS`.
+        let mut depth = 0i32;
+        let as_at = out.iter().position(|t| {
+            match &t.token {
+                Token::LParen => depth += 1,
+                Token::RParen => depth -= 1,
+                _ => {}
+            }
+            depth == 0 && word(t).as_deref() == Some("as")
+        });
+        let has_with = out[..as_at.unwrap_or(0)]
+            .iter()
+            .any(|t| word(t).as_deref() == Some("with"));
+        if let (Some(as_at), false) = (as_at, has_with) {
+            let dialect = PostgreSqlDialect {};
+            if let Ok(mut option) =
+                Tokenizer::new(&dialect, &format!("WITH ({NO_DATA_OPTION} = true) "))
+                    .tokenize_with_location()
+            {
+                option.retain(|t| t.token != Token::EOF);
+                out.splice(as_at..as_at, option);
+            }
+        }
+    }
+    out.extend(tail);
+    out
 }
 
 /// PostgreSQL accepts `CREATE SEQUENCE` options in any order (pg_dump writes
@@ -318,6 +453,23 @@ mod tests {
         )
         .unwrap();
         assert!(identity[0].to_string().contains("INCREMENT BY 5"));
+    }
+
+    #[test]
+    fn data_clauses_and_refresh_parse() {
+        let statements = parse_sql(
+            "CREATE MATERIALIZED VIEW mv AS SELECT 1 WITH NO DATA; \
+             CREATE TABLE t AS SELECT 1 WITH DATA; \
+             REFRESH MATERIALIZED VIEW CONCURRENTLY \"My\".mv WITH NO DATA",
+        )
+        .unwrap();
+        assert_eq!(statements.len(), 3);
+        assert!(statements[0].to_string().contains(NO_DATA_OPTION));
+        assert!(!statements[1].to_string().contains(NO_DATA_OPTION));
+        assert_eq!(
+            statements[2].to_string(),
+            format!("SELECT {REFRESH_FUNCTION}('\"My\".mv', false)")
+        );
     }
 
     #[test]

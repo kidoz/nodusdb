@@ -47,12 +47,19 @@ impl MemExecutor {
                 constraints,
                 if_not_exists,
                 unique_constraints,
+                None,
             ),
-            LogicalPlan::CreateView { name, query } => self.exec_create_view(ctx, name, query),
+            LogicalPlan::CreateView {
+                name,
+                query,
+                or_replace,
+            } => self.exec_create_view(ctx, name, query, or_replace),
             LogicalPlan::DropView { name, if_exists } => self.exec_drop_view(ctx, name, if_exists),
-            LogicalPlan::DropTable { name, if_exists } => {
-                self.exec_drop_table(ctx, name, if_exists)
-            }
+            LogicalPlan::DropTable {
+                name,
+                if_exists,
+                materialized,
+            } => self.exec_drop_table(ctx, name, if_exists, materialized),
             LogicalPlan::CreateSequence {
                 name,
                 if_not_exists,
@@ -70,6 +77,14 @@ impl MemExecutor {
                 default_cells,
                 source,
             } => {
+                // A materialized view's rows change only by REFRESH.
+                let (db_name, schema_name, table_only) = parse_object_name(&table_name)?;
+                if let Ok(tbl) = self
+                    .catalog_reader
+                    .get_table(db_name, schema_name, table_only)
+                {
+                    Self::reject_materialized_view(&tbl)?;
+                }
                 // `INSERT ... SELECT`: the source query's rows are the values.
                 let (values_list, default_cells) = match source {
                     Some(query) => (
@@ -96,7 +111,18 @@ impl MemExecutor {
                 name,
                 query,
                 if_not_exists,
-            } => self.exec_create_table_as(ctx, name, *query, if_not_exists),
+                no_data,
+                materialized,
+            } => self.exec_create_table_as(
+                ctx,
+                name,
+                *query,
+                if_not_exists,
+                (!no_data, materialized),
+            ),
+            LogicalPlan::RefreshMaterializedView { name, with_data } => {
+                self.exec_refresh_materialized_view(ctx, name, with_data)
+            }
             LogicalPlan::Select {
                 ctes,
                 table_name,

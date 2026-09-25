@@ -55,10 +55,13 @@ impl MemExecutor {
             ("is_typed", "TEXT"),
             ("commit_action", "TEXT"),
         ]);
-        // Like PostgreSQL, `information_schema.tables` lists no sequences.
+        // Like PostgreSQL, `information_schema.tables` lists no sequences or
+        // materialized views.
         let rows = tables
             .iter()
-            .filter(|table| !crate::sequences::is_sequence(table))
+            .filter(|table| {
+                !crate::sequences::is_sequence(table) && table.materialized_query.is_none()
+            })
             .map(|table| {
                 vec![
                     Value::Text(db_name.into()),

@@ -93,6 +93,10 @@ pub struct TableDescriptor {
     pub constraints: Vec<TableConstraint>,
     #[serde(default)]
     pub view_query: Option<String>,
+    /// For a materialized view, the query that `REFRESH` recomputes its
+    /// stored rows from.
+    #[serde(default)]
+    pub materialized_query: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

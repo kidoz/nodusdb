@@ -144,3 +144,27 @@ fn using_joins_merge_their_columns() {
     let err = sql("SELECT id FROM a JOIN b ON a.id = b.id").unwrap_err();
     assert_eq!(err.to_string(), "column reference \"id\" is ambiguous");
 }
+
+#[test]
+fn materialized_views_keep_rows_until_refreshed() {
+    let sql = session();
+    sql("CREATE TABLE src (a INT)").unwrap();
+    sql("INSERT INTO src VALUES (1), (2)").unwrap();
+    assert_eq!(
+        sql("CREATE MATERIALIZED VIEW mv AS SELECT a FROM src")
+            .unwrap()
+            .tag,
+        "SELECT 2"
+    );
+    sql("INSERT INTO src VALUES (3)").unwrap();
+    assert_eq!(rows(&sql("SELECT count(*) FROM mv").unwrap()), ["2"]);
+    assert_eq!(
+        sql("REFRESH MATERIALIZED VIEW mv").unwrap().tag,
+        "REFRESH MATERIALIZED VIEW"
+    );
+    assert_eq!(rows(&sql("SELECT count(*) FROM mv").unwrap()), ["3"]);
+    let err = sql("DELETE FROM mv").unwrap_err();
+    assert_eq!(err.to_string(), "cannot change materialized view \"mv\"");
+    sql("CREATE TABLE empty AS SELECT a FROM src WITH NO DATA").unwrap();
+    assert_eq!(rows(&sql("SELECT count(*) FROM empty").unwrap()), ["0"]);
+}

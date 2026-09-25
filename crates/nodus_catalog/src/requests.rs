@@ -44,6 +44,9 @@ pub struct CreateTableRequest {
     pub constraints: Vec<TableConstraint>,
     #[serde(default)]
     pub view_query: Option<String>,
+    /// For a materialized view, the query its rows are computed from.
+    #[serde(default)]
+    pub materialized_query: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

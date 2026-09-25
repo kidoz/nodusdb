@@ -490,6 +490,7 @@ impl MemExecutor {
             .catalog_reader
             .get_table(db_name, schema_name, table_only)?;
         self.authorize(ctx, Action::Update, ResourceRef::Table(tbl.id))?;
+        Self::reject_materialized_view(&tbl)?;
         for (col, _) in &assignments {
             Self::column_position(&tbl, col)?;
         }
@@ -551,6 +552,7 @@ impl MemExecutor {
             .catalog_reader
             .get_table(db_name, schema_name, table_only)?;
         self.authorize(ctx, Action::Delete, ResourceRef::Table(tbl.id))?;
+        Self::reject_materialized_view(&tbl)?;
         let scope = self.target_scope(
             ctx,
             &tbl,
@@ -595,7 +597,10 @@ impl MemExecutor {
             let tbl = self
                 .catalog_reader
                 .get_table(db_name, schema_name, table_only)?;
-            if tbl.view_query.is_some() || crate::sequences::is_sequence(&tbl) {
+            if tbl.view_query.is_some()
+                || tbl.materialized_query.is_some()
+                || crate::sequences::is_sequence(&tbl)
+            {
                 anyhow::bail!("\"{table_only}\" is not a table");
             }
             sequences.extend(

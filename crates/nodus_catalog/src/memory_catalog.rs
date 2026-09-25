@@ -525,6 +525,7 @@ impl CatalogWriter for MemoryCatalog {
             indexes: vec![],
             constraints: request.constraints,
             view_query: request.view_query,
+            materialized_query: request.materialized_query,
         };
         guard.insert(key, desc.clone());
         drop(guard);
@@ -1034,6 +1035,7 @@ mod tests {
                 columns: vec![],
                 constraints: vec![],
                 view_query: None,
+                materialized_query: None,
             })
             .unwrap();
         assert_eq!(tbl.name, "users");

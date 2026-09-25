@@ -810,10 +810,16 @@ pub enum LogicalPlan {
     DropTable {
         name: String,
         if_exists: bool,
+        /// `DROP MATERIALIZED VIEW`. Defaulted so older plans decode.
+        #[serde(default)]
+        materialized: bool,
     },
     CreateView {
         name: String,
         query: Box<LogicalPlan>,
+        /// `CREATE OR REPLACE VIEW`. Defaulted so older plans decode.
+        #[serde(default)]
+        or_replace: bool,
     },
     DropView {
         name: String,
@@ -873,6 +879,14 @@ pub enum LogicalPlan {
         name: String,
         query: Box<LogicalPlan>,
         if_not_exists: bool,
+        /// `WITH NO DATA`: the table is created empty. Defaulted so older
+        /// plans decode.
+        #[serde(default)]
+        no_data: bool,
+        /// `CREATE MATERIALIZED VIEW`: the table keeps the query for
+        /// `REFRESH`.
+        #[serde(default)]
+        materialized: bool,
     },
     Select {
         ctes: Vec<(String, Box<LogicalPlan>)>,
@@ -1059,6 +1073,11 @@ pub enum LogicalPlan {
     Truncate {
         tables: Vec<String>,
         restart_identity: bool,
+    },
+    /// `REFRESH MATERIALIZED VIEW name [WITH [NO] DATA]`.
+    RefreshMaterializedView {
+        name: String,
+        with_data: bool,
     },
     /// `EXPLAIN [ANALYZE] statement`.
     Explain {

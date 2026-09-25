@@ -20,6 +20,7 @@ impl MemExecutor {
         let tbl = self
             .catalog_reader
             .get_table(db_name, schema_name, table_only)?;
+        Self::reject_materialized_view(&tbl)?;
         for clause in &clauses {
             let action = match clause.action {
                 MergeAction::Update(_) => Action::Update,

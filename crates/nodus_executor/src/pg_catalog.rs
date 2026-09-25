@@ -146,6 +146,8 @@ impl MemExecutor {
                         Value::Text(
                             if table.view_query.is_some() {
                                 "v"
+                            } else if table.materialized_query.is_some() {
+                                "m"
                             } else if crate::sequences::is_sequence(table) {
                                 "S"
                             } else {
@@ -1954,9 +1956,14 @@ impl MemExecutor {
         let schemas = catalog.list_schemas(db).ok()?;
         let view = catalog.list_all_tables(db).ok()?.into_iter().find(|t| {
             let schema = Self::schema_name_by_id(db, &schemas, t.schema_id);
-            t.view_query.is_some() && Self::table_oid(db, &schema, &t.name) == oid
+            (t.view_query.is_some() || t.materialized_query.is_some())
+                && Self::table_oid(db, &schema, &t.name) == oid
         })?;
-        let plan: crate::LogicalPlan = serde_json::from_str(view.view_query.as_deref()?).ok()?;
+        let query = view
+            .view_query
+            .as_deref()
+            .or(view.materialized_query.as_deref())?;
+        let plan: crate::LogicalPlan = serde_json::from_str(query).ok()?;
         crate::explain::deparse_query(&plan).map(|sql| format!("{sql};"))
     }
 

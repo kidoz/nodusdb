@@ -60,6 +60,9 @@ impl MemExecutor {
             }
         }
     }
+    /// `CREATE TABLE`; with `materialized_query`, the table a materialized
+    /// view stores its rows in.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn exec_create_table(
         &self,
         ctx: &ExecutionContext,
@@ -68,6 +71,7 @@ impl MemExecutor {
         constraints: Vec<nodus_catalog::TableConstraint>,
         if_not_exists: bool,
         unique_constraints: Vec<Vec<String>>,
+        materialized_query: Option<String>,
     ) -> Result<QueryOutput> {
         let (db_name, schema_name, table_only) = parse_object_name(&name)?;
         let db = self.catalog_reader.get_database(db_name)?;
@@ -155,6 +159,7 @@ impl MemExecutor {
             columns: descriptors,
             constraints,
             view_query: None,
+            materialized_query,
         })?;
 
         for (col, primary) in unique_cols {
@@ -273,7 +278,7 @@ impl MemExecutor {
                 sequence: None,
             })
             .collect();
-        self.exec_create_table(ctx, name.to_string(), columns, vec![], false, vec![])?;
+        self.exec_create_table(ctx, name.to_string(), columns, vec![], false, vec![], None)?;
         let (db_name, schema_name, table_only) = parse_object_name(name)?;
         let tbl = self
             .catalog_reader
@@ -305,27 +310,42 @@ impl MemExecutor {
         }
         Ok(QueryOutput::tag("DROP SEQUENCE"))
     }
-    /// `CREATE TABLE ... AS <query>` / `SELECT ... INTO`: runs the query, then
-    /// creates a table with its output columns and types and inserts its rows.
-    /// The command tag is `SELECT <n>`, as in PostgreSQL.
+    /// `CREATE TABLE ... AS <query>` / `SELECT ... INTO` / `CREATE
+    /// MATERIALIZED VIEW`: runs the query, then creates a table with its
+    /// output columns and types and, unless `WITH NO DATA`, inserts its rows.
+    /// The command tag is `SELECT <n>`, as in PostgreSQL. A materialized view
+    /// keeps its query for `REFRESH`.
     pub(crate) fn exec_create_table_as(
         &self,
         ctx: &ExecutionContext,
         name: String,
         query: LogicalPlan,
         if_not_exists: bool,
+        (with_data, materialized): (bool, bool),
     ) -> Result<QueryOutput> {
         let (db_name, schema_name, table_only) = parse_object_name(&name)?;
+        let command = if materialized {
+            "CREATE MATERIALIZED VIEW"
+        } else {
+            "CREATE TABLE AS"
+        };
         if self
             .catalog_reader
             .get_table(db_name, schema_name, table_only)
             .is_ok()
         {
             if if_not_exists {
-                return Ok(QueryOutput::tag("CREATE TABLE AS"));
+                return Ok(QueryOutput::tag(command));
             }
             anyhow::bail!("relation \"{}\" already exists", table_only);
         }
+        let materialized_query = if materialized {
+            Some(serde_json::to_string(&query)?)
+        } else {
+            None
+        };
+        // Without data, only the query's shape is needed.
+        let query = if with_data { query } else { shape_only(query) };
         let out = self.execute_logical_inner(ctx, query)?;
         let mut columns: Vec<ColumnDef> = Vec::with_capacity(out.columns.len());
         for (col, ty) in out.columns.iter().zip(&out.types) {
@@ -342,7 +362,18 @@ impl MemExecutor {
                 sequence: None,
             });
         }
-        self.exec_create_table(ctx, name.clone(), columns, vec![], false, vec![])?;
+        self.exec_create_table(
+            ctx,
+            name.clone(),
+            columns,
+            vec![],
+            false,
+            vec![],
+            materialized_query,
+        )?;
+        if !with_data {
+            return Ok(QueryOutput::tag(command));
+        }
         let rows: Vec<Vec<Value>> = out.rows.into_iter().map(|r| r.values).collect();
         let count = rows.len();
         if count > 0 {
@@ -350,48 +381,101 @@ impl MemExecutor {
         }
         Ok(QueryOutput::tag(&format!("SELECT {count}")))
     }
+
+    /// `REFRESH MATERIALIZED VIEW`: replaces the view's rows with its query's
+    /// (or with none, `WITH NO DATA`).
+    pub(crate) fn exec_refresh_materialized_view(
+        &self,
+        ctx: &ExecutionContext,
+        name: String,
+        with_data: bool,
+    ) -> Result<QueryOutput> {
+        let (db_name, schema_name, table_only) = parse_object_name(&name)?;
+        let tbl = self
+            .catalog_reader
+            .get_table(db_name, schema_name, table_only)?;
+        let Some(query) = &tbl.materialized_query else {
+            anyhow::bail!("\"{table_only}\" is not a materialized view");
+        };
+        self.authorize(ctx, Action::Insert, ResourceRef::Table(tbl.id))?;
+        let rows: Vec<Vec<Value>> = if with_data {
+            let plan: LogicalPlan = serde_json::from_str(query)?;
+            crate::cte_scope::isolated(|| self.execute_logical_inner(ctx, plan))?
+                .rows
+                .into_iter()
+                .map(|r| r.values)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        for (key, row) in self.scan_rows_keyed(tbl.id, &ctx.session_id)? {
+            self.remove_row(ctx, &tbl, &key, &row)?;
+        }
+        if !rows.is_empty() {
+            self.exec_insert(ctx, name, vec![], rows, vec![], None, vec![])?;
+        }
+        Ok(QueryOutput::tag("REFRESH MATERIALIZED VIEW"))
+    }
+
+    /// The error for changing a materialized view's rows directly.
+    pub(crate) fn reject_materialized_view(tbl: &nodus_catalog::TableDescriptor) -> Result<()> {
+        if tbl.materialized_query.is_some() {
+            anyhow::bail!("cannot change materialized view \"{}\"", tbl.name);
+        }
+        Ok(())
+    }
     pub(crate) fn exec_create_view(
         &self,
         ctx: &ExecutionContext,
         name: String,
         query: Box<LogicalPlan>,
+        or_replace: bool,
     ) -> Result<QueryOutput> {
         let (db_name, schema_name, view_only) = parse_object_name(&name)?;
         let db = self.catalog_reader.get_database(db_name)?;
         let sch = self.catalog_reader.get_schema(db_name, schema_name)?;
         self.authorize(ctx, Action::CreateTable, ResourceRef::Schema(sch.id))?;
-
-        // Resolve the schema of the view by planning/executing a dummy pass or just full execute
-        // For MVP, we can just execute the query and take its output columns.
-        let mut is_valid = false;
-        let mut view_cols = Vec::new();
-
-        // Hack: serialize the logical plan to store it
-        let view_query_json = serde_json::to_string(&*query)?;
-
-        // Run query to get shape
-        if let Ok(out) = self.execute_logical_inner(ctx, *query) {
-            for (i, cname) in out.columns.iter().enumerate() {
-                let ty = out.types.get(i).unwrap_or(&"VARCHAR".to_string()).clone();
-                view_cols.push(ColumnDescriptor {
-                    id: nodus_catalog::ColumnId::new(),
-                    name: cname.clone(),
-                    version: 1,
-                    created_at: Utc::now(),
-                    updated_at: Utc::now(),
-                    state: DescriptorState::Public,
-                    data_type: ty,
-                    nullable: true,
-                    default_expr: None,
-                });
+        let existing = self
+            .catalog_reader
+            .get_table(db_name, schema_name, view_only)
+            .ok();
+        match &existing {
+            Some(tbl) if !or_replace => {
+                anyhow::bail!("relation \"{}\" already exists", tbl.name)
             }
-            is_valid = true;
+            Some(tbl) if tbl.view_query.is_none() => {
+                anyhow::bail!("\"{}\" is not a view", tbl.name)
+            }
+            _ => {}
         }
 
-        if !is_valid {
-            anyhow::bail!("Failed to resolve view query schema");
+        // The view's columns are its query's; stored, the query runs on
+        // every read.
+        let view_query_json = serde_json::to_string(&*query)?;
+        let out = self.execute_logical_inner(ctx, shape_only(*query))?;
+        let view_cols = out
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(i, cname)| ColumnDescriptor {
+                id: nodus_catalog::ColumnId::new(),
+                name: cname.clone(),
+                version: 1,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+                state: DescriptorState::Public,
+                data_type: out
+                    .types
+                    .get(i)
+                    .cloned()
+                    .unwrap_or_else(|| "VARCHAR".to_string()),
+                nullable: true,
+                default_expr: None,
+            })
+            .collect();
+        if let Some(tbl) = existing {
+            self.catalog_writer.drop_table(tbl.id)?;
         }
-
         self.catalog_writer.create_table(CreateTableRequest {
             id: nodus_catalog::TableId::new(),
             database_id: db.id,
@@ -400,6 +484,7 @@ impl MemExecutor {
             columns: view_cols,
             constraints: vec![],
             view_query: Some(view_query_json),
+            materialized_query: None,
         })?;
 
         Ok(QueryOutput::tag("CREATE VIEW"))
@@ -432,18 +517,33 @@ impl MemExecutor {
             }
         }
     }
+    /// `DROP TABLE`, or with `materialized` `DROP MATERIALIZED VIEW`; each
+    /// drops only its own kind of relation.
     pub(crate) fn exec_drop_table(
         &self,
         ctx: &ExecutionContext,
         name: String,
         if_exists: bool,
+        materialized: bool,
     ) -> Result<QueryOutput> {
         let (db_name, schema_name, table_only) = parse_object_name(&name)?;
+        let tag = if materialized {
+            "DROP MATERIALIZED VIEW"
+        } else {
+            "DROP TABLE"
+        };
         match self
             .catalog_reader
             .get_table(db_name, schema_name, table_only)
         {
-            Ok(tbl) if crate::sequences::is_sequence(&tbl) => {
+            Ok(tbl)
+                if crate::sequences::is_sequence(&tbl)
+                    || tbl.view_query.is_some()
+                    || (tbl.materialized_query.is_some() != materialized) =>
+            {
+                if materialized {
+                    anyhow::bail!("\"{table_only}\" is not a materialized view")
+                }
                 anyhow::bail!("\"{table_only}\" is not a table")
             }
             Ok(tbl) => {
@@ -471,11 +571,11 @@ impl MemExecutor {
                         }
                     }
                 }
-                Ok(QueryOutput::tag("DROP TABLE"))
+                Ok(QueryOutput::tag(tag))
             }
             Err(e) => {
                 if if_exists {
-                    Ok(QueryOutput::tag("DROP TABLE"))
+                    Ok(QueryOutput::tag(tag))
                 } else {
                     Err(anyhow::anyhow!(e))
                 }
@@ -832,4 +932,47 @@ fn name_check_constraints(
             other => other,
         })
         .collect()
+}
+
+/// A query that yields its result's columns and types but no rows, when it
+/// is a SELECT (other queries run in full).
+fn shape_only(query: LogicalPlan) -> LogicalPlan {
+    match query {
+        LogicalPlan::Select {
+            ctes,
+            table_name,
+            table_alias,
+            joins,
+            projection,
+            group_by,
+            filter,
+            having,
+            grouping_sets,
+            order_by,
+            offset,
+            distinct,
+            sort,
+            group_exprs,
+            distinct_on,
+            ..
+        } => LogicalPlan::Select {
+            ctes,
+            table_name,
+            table_alias,
+            joins,
+            projection,
+            group_by,
+            filter,
+            having,
+            grouping_sets,
+            order_by,
+            limit: Some(0),
+            offset,
+            distinct,
+            sort,
+            group_exprs,
+            distinct_on,
+        },
+        other => other,
+    }
 }

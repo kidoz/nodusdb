@@ -1207,6 +1207,11 @@ pub(crate) fn deparse_scalar(expr: &ScalarExpr, qualified: bool) -> String {
 /// ` SELECT a,\n    b\n   FROM t\n  WHERE a > 0`. `None` for a plan it
 /// cannot write back as SQL.
 pub(crate) fn deparse_query(plan: &LogicalPlan) -> Option<String> {
+    // A column alias list names the leading output columns.
+    let (plan, renames): (&LogicalPlan, &[String]) = match plan {
+        LogicalPlan::Renamed { input, columns } => (input, columns),
+        other => (other, &[]),
+    };
     let LogicalPlan::Select {
         table_name,
         table_alias,
@@ -1234,15 +1239,21 @@ pub(crate) fn deparse_query(plan: &LogicalPlan) -> Option<String> {
     } else {
         projection
             .iter()
-            .map(|item| match item {
-                ProjectionItem::AliasedColumn(c, alias) => {
-                    format!("{} AS {alias}", column(c, qualified))
+            .enumerate()
+            .map(|(i, item)| {
+                let (value, alias) = match item {
+                    ProjectionItem::AliasedColumn(c, alias) => {
+                        (column(c, qualified), Some(alias.clone()))
+                    }
+                    ProjectionItem::Expr { expr, alias } => {
+                        (unwrap(deparse_scalar(expr, qualified)), alias.clone())
+                    }
+                    other => (unwrap(projection_text(other, qualified)), None),
+                };
+                match renames.get(i).cloned().or(alias) {
+                    Some(alias) if alias != value => format!("{value} AS {alias}"),
+                    _ => value,
                 }
-                ProjectionItem::Expr {
-                    expr,
-                    alias: Some(alias),
-                } => format!("{} AS {alias}", unwrap(deparse_scalar(expr, qualified))),
-                other => unwrap(projection_text(other, qualified)),
             })
             .collect()
     };
