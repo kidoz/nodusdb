@@ -168,3 +168,11 @@ fn materialized_views_keep_rows_until_refreshed() {
     sql("CREATE TABLE empty AS SELECT a FROM src WITH NO DATA").unwrap();
     assert_eq!(rows(&sql("SELECT count(*) FROM empty").unwrap()), ["0"]);
 }
+
+#[test]
+fn jsonb_numbers_keep_their_scale() {
+    let sql = session();
+    let out = sql(r#"SELECT '[1.50, 1e3, -0.0]'::jsonb, to_jsonb(2.50), '{"a": 1.0}'::jsonb = '{"a": 1}'::jsonb"#)
+        .unwrap();
+    assert_eq!(rows(&out), ["[1.50, 1000, 0.0]|2.50|t"]);
+}

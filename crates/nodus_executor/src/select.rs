@@ -1418,7 +1418,7 @@ impl MemExecutor {
                                 if let Some(v) = row.get(i) {
                                     if operator == "->>" {
                                         let json_str = match v {
-                                            Value::Jsonb(j) => j.to_string(),
+                                            Value::Jsonb(j) => crate::json_text::jsonb_text(j),
                                             Value::Text(s) => s.clone(),
                                             _ => "".to_string(),
                                         };
@@ -1431,7 +1431,9 @@ impl MemExecutor {
                                                         serde_json::Value::String(s) => {
                                                             Value::Text(s.clone())
                                                         }
-                                                        _ => Value::Text(val.to_string()),
+                                                        _ => Value::Text(
+                                                            crate::json_text::jsonb_text(val),
+                                                        ),
                                                     };
                                                 }
                                             }

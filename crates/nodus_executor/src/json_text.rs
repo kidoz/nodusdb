@@ -147,14 +147,19 @@ fn write_scalar(value: &J, out: &mut String) {
     }
 }
 
-/// A JSON number as `numeric` prints it: never in exponent notation.
+/// A JSON number as `numeric` prints it: as written but never in exponent
+/// notation (`1e3` is `1000`, `1.50` stays `1.50`).
 fn number_text(n: &serde_json::Number) -> String {
     let text = n.to_string();
-    if n.is_f64() {
-        plain_decimal(&text).unwrap_or(text)
-    } else {
-        text
-    }
+    plain_decimal(&text).unwrap_or(text)
+}
+
+/// A JSON number's value, exactly where it fits a decimal.
+fn number_value(n: &serde_json::Number) -> Option<rust_decimal::Decimal> {
+    let text = n.to_string();
+    text.parse::<rust_decimal::Decimal>()
+        .ok()
+        .or_else(|| rust_decimal::Decimal::from_scientific(&text).ok())
 }
 
 /// Rewrites a decimal number in exponent notation (`1.5e-7`) in plain
@@ -239,10 +244,13 @@ pub(crate) fn jsonb_cmp(a: &J, b: &J) -> Ordering {
         }
     }
     match (a, b) {
-        (J::Number(x), J::Number(y)) => {
-            let (x, y) = (x.as_f64().unwrap_or(0.0), y.as_f64().unwrap_or(0.0));
-            x.partial_cmp(&y).unwrap_or(Ordering::Equal)
-        }
+        (J::Number(x), J::Number(y)) => match (number_value(x), number_value(y)) {
+            (Some(x), Some(y)) => x.cmp(&y),
+            _ => {
+                let (x, y) = (x.as_f64().unwrap_or(0.0), y.as_f64().unwrap_or(0.0));
+                x.partial_cmp(&y).unwrap_or(Ordering::Equal)
+            }
+        },
         (J::String(x), J::String(y)) => x.as_bytes().cmp(y.as_bytes()),
         (J::Bool(x), J::Bool(y)) => x.cmp(y),
         (J::Array(x), J::Array(y)) => x.len().cmp(&y.len()).then_with(|| {

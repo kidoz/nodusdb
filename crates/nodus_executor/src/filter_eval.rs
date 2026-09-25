@@ -916,6 +916,10 @@ fn json_contains(a: &serde_json::Value, b: &serde_json::Value) -> bool {
             .iter()
             .all(|be| av.iter().any(|ae| json_contains(ae, be))),
         (J::Array(av), be) => av.iter().any(|ae| json_contains(ae, be)),
+        // Numbers are equal by value (`1.0` is `1`).
+        (J::Number(_), J::Number(_)) => {
+            crate::json_text::jsonb_cmp(a, b) == std::cmp::Ordering::Equal
+        }
         _ => a == b,
     }
 }
@@ -929,9 +933,11 @@ pub(crate) fn value_to_json(v: &Value) -> Option<serde_json::Value> {
         Value::Jsonb(j) => Some(j.clone()),
         Value::Int(i) => Some(J::from(*i)),
         Value::Float(f) => serde_json::Number::from_f64(*f).map(J::Number),
-        Value::Numeric(d) => {
-            serde_json::Number::from_f64(crate::value::decimal_to_f64(d)).map(J::Number)
-        }
+        Value::Numeric(d) => d
+            .to_string()
+            .parse::<serde_json::Number>()
+            .ok()
+            .map(J::Number),
         Value::Bool(b) => Some(J::Bool(*b)),
         Value::Null => Some(J::Null),
         Value::Array(items) => items
@@ -999,7 +1005,7 @@ pub(crate) fn json_extract(value: &Value, op: &str, key: &str) -> Value {
         "->>" => match sub {
             serde_json::Value::String(s) => Value::Text(s.clone()),
             serde_json::Value::Null => Value::Null,
-            other => Value::Text(other.to_string()),
+            other => Value::Text(crate::json_text::jsonb_text(other)),
         },
         _ => Value::Jsonb(sub.clone()),
     }

@@ -1729,9 +1729,11 @@ pub(crate) fn to_json(v: &Value) -> serde_json::Value {
         Value::Null => J::Null,
         Value::Int(i) => J::from(*i),
         Value::Float(f) => serde_json::Number::from_f64(*f).map_or(J::Null, J::Number),
-        Value::Numeric(d) => {
-            serde_json::Number::from_f64(crate::value::decimal_to_f64(d)).map_or(J::Null, J::Number)
-        }
+        // Exactly, as `numeric` prints it (`1.50`).
+        Value::Numeric(d) => d
+            .to_string()
+            .parse::<serde_json::Number>()
+            .map_or(J::Null, J::Number),
         Value::Bool(b) => J::Bool(*b),
         Value::Text(s) => J::String(s.clone()),
         Value::Array(items) => J::Array(items.iter().map(to_json).collect()),

@@ -3,7 +3,6 @@ use bytes::Bytes;
 use nodus_catalog::{CatalogReader, CatalogWriter, IndexState};
 use nodus_storage_api::{IndexKvCodec, KeyRange, KvEngine};
 use nodus_txn::TxnManager;
-use serde::Deserialize;
 use std::sync::Arc;
 
 pub struct IndexBackfiller {
@@ -14,8 +13,7 @@ pub struct IndexBackfiller {
     codec: Arc<dyn IndexKvCodec>,
 }
 
-#[derive(Deserialize)]
-#[serde(untagged)]
+/// A row cell as the backfill encodes it into an index key.
 enum ParsedValue {
     Null,
     Bool(bool),
@@ -24,6 +22,19 @@ enum ParsedValue {
 }
 
 impl ParsedValue {
+    /// A JSON scalar as a cell; `None` for an array or object. (Parsed from
+    /// `serde_json::Value` rather than as an untagged enum, which cannot
+    /// take numbers when serde_json keeps their exact text.)
+    fn from_json(value: serde_json::Value) -> Option<Self> {
+        Some(match value {
+            serde_json::Value::Null => ParsedValue::Null,
+            serde_json::Value::Bool(b) => ParsedValue::Bool(b),
+            serde_json::Value::Number(n) => ParsedValue::Number(n.as_f64()?),
+            serde_json::Value::String(s) => ParsedValue::String(s),
+            _ => return None,
+        })
+    }
+
     fn to_bytes(&self) -> Bytes {
         match self {
             ParsedValue::Null => Bytes::new(),
@@ -108,7 +119,15 @@ impl IndexBackfiller {
                 let pair = res?;
 
                 // Parse base row JSON
-                if let Ok(row_values) = serde_json::from_slice::<Vec<ParsedValue>>(&pair.value) {
+                let parsed = serde_json::from_slice::<Vec<serde_json::Value>>(&pair.value)
+                    .ok()
+                    .and_then(|cells| {
+                        cells
+                            .into_iter()
+                            .map(ParsedValue::from_json)
+                            .collect::<Option<Vec<_>>>()
+                    });
+                if let Some(row_values) = parsed {
                     // Map index keys
                     let mut datum_values = Vec::new();
                     for key_col in &index_desc.key_columns {

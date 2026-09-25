@@ -1,0 +1,38 @@
+# jsonb numbers keep the value and scale they were written with, printed
+# without exponents. Expected results come from PostgreSQL 18.
+query T
+SELECT '[1.50, 1e3, -0.0, 100000000000000000000, 1.5e-7, 2.0]'::jsonb;
+----
+[1.50, 1000, 0.0, 100000000000000000000, 0.00000015, 2.0]
+
+query TTT
+SELECT '{"a": 1.50}'::jsonb -> 'a', '{"a": 1.50}'::jsonb ->> 'a', '{"a": 1e2}'::jsonb ->> 'a';
+----
+1.50	1.50	100
+
+query TTT
+SELECT to_jsonb(1.50), jsonb_build_object('n', 1.50, 'm', 2e3), jsonb_build_array(1.0, 12345678901234567890123);
+----
+1.50	{"m": 2000, "n": 1.50}	[1.0, 12345678901234567890123]
+
+query TT
+SELECT '{"a": 1.0}'::jsonb = '{"a": 1}'::jsonb, '{"a": [1.0]}'::jsonb @> '{"a": [1]}';
+----
+t	t
+
+query TT
+SELECT '1.50'::jsonb < '1.6'::jsonb, '10'::jsonb > '9.99'::jsonb;
+----
+t	t
+
+statement ok
+CREATE TABLE jn (d JSONB);
+
+statement ok
+INSERT INTO jn VALUES ('{"price": 10.50, "qty": 3}'), ('{"price": 1e1}');
+
+query TT
+SELECT d, d ->> 'price' FROM jn ORDER BY d;
+----
+{"price": 10}	10
+{"qty": 3, "price": 10.50}	10.50

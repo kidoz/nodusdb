@@ -2298,7 +2298,7 @@ fn apply_json_array_op(op: ScalarBinaryOp, l: &Value, r: &Value) -> Value {
         None => Value::Null,
         Some(J::Null) if as_text => Value::Null,
         Some(J::String(s)) if as_text => Value::Text(s),
-        Some(j) if as_text => Value::Text(j.to_string()),
+        Some(j) if as_text => Value::Text(crate::json_text::jsonb_text(&j)),
         Some(j) => Value::Jsonb(j),
     };
     let texts = |v: &Value| -> Vec<String> {
