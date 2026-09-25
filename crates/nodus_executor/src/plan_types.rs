@@ -1049,6 +1049,12 @@ pub enum LogicalPlan {
         ctes: Vec<(String, Box<LogicalPlan>)>,
         body: Box<LogicalPlan>,
     },
+    /// `TRUNCATE`: empties each table, and with `RESTART IDENTITY` restarts
+    /// the sequences its columns draw from.
+    Truncate {
+        tables: Vec<String>,
+        restart_identity: bool,
+    },
 }
 
 /// One `WHEN` clause of a `MERGE`.

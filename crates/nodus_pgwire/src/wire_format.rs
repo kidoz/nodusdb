@@ -179,6 +179,9 @@ pub(crate) fn row_response_command(tag: &str) -> String {
 /// SQLSTATE; anything else is a construct NodusDB does not support.
 pub(crate) fn planning_error(message: &str) -> PgWireError {
     match sqlstate_for_execution_error(message) {
+        "XX000" if message.starts_with("Unsupported") || message.contains("not supported") => {
+            user_error("ERROR", "0A000", message)
+        }
         "XX000" => user_error("ERROR", "0A000", format!("Unsupported feature: {message}")),
         code => user_error("ERROR", code, message),
     }
@@ -527,6 +530,37 @@ mod tests {
         ] {
             assert_eq!(sqlstate_for_execution_error(message), "40001");
         }
+    }
+
+    #[test]
+    fn classifies_name_and_statement_errors() {
+        for (message, code) in [
+            ("column reference \"id\" is ambiguous", "42702"),
+            ("table name \"t\" specified more than once", "42712"),
+            ("name \"t\" specified more than once", "42712"),
+            (
+                "invalid reference to FROM-clause entry for table \"t\"",
+                "42P01",
+            ),
+            (
+                "unreachable WHEN clause specified after unconditional WHEN clause",
+                "42601",
+            ),
+            ("MERGE command cannot affect row a second time", "21000"),
+        ] {
+            assert_eq!(sqlstate_for_execution_error(message), code, "{message}");
+        }
+    }
+
+    #[test]
+    fn unsupported_statements_are_reported_once() {
+        let pgwire::error::PgWireError::UserError(info) =
+            super::planning_error("CREATE FUNCTION is not supported")
+        else {
+            panic!("expected a user error");
+        };
+        assert_eq!(info.code, "0A000");
+        assert_eq!(info.message, "CREATE FUNCTION is not supported");
     }
 
     #[test]

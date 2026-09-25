@@ -532,6 +532,41 @@ impl MemExecutor {
         Ok(scope.returning_output(&returning, returning_rows, format!("DELETE {deleted}")))
     }
 
+    /// `TRUNCATE`: deletes every row of each table, then restarts the
+    /// sequences their columns draw from if asked.
+    pub(crate) fn exec_truncate(
+        &self,
+        ctx: &ExecutionContext,
+        tables: Vec<String>,
+        restart_identity: bool,
+    ) -> Result<QueryOutput> {
+        let mut sequences = Vec::new();
+        for table_name in &tables {
+            let (db_name, schema_name, table_only) = parse_object_name(table_name)?;
+            let tbl = self
+                .catalog_reader
+                .get_table(db_name, schema_name, table_only)?;
+            if tbl.view_query.is_some() || crate::sequences::is_sequence(&tbl) {
+                anyhow::bail!("\"{table_only}\" is not a table");
+            }
+            sequences.extend(
+                tbl.columns
+                    .iter()
+                    .filter_map(Self::column_default)
+                    .filter_map(|d| crate::sequences::default_sequence(&d)),
+            );
+        }
+        for table_name in tables {
+            self.exec_delete(ctx, (table_name, None), None, None, Vec::new())?;
+        }
+        if restart_identity {
+            for sequence in sequences {
+                self.sequences.restart(&sequence)?;
+            }
+        }
+        Ok(QueryOutput::tag("TRUNCATE TABLE"))
+    }
+
     /// The columns and rows a data-modifying statement's conditions and
     /// expressions see: each row of the target table (named by its alias, if
     /// any) joined to the rows of the relations it reads, if any.

@@ -408,6 +408,20 @@ impl SequenceStore {
         Ok(value)
     }
 
+    /// Restarts a sequence at its start value (`TRUNCATE ... RESTART
+    /// IDENTITY`).
+    pub(crate) fn restart(&self, name: &str) -> Result<()> {
+        let tbl = self.resolve(name)?;
+        self.update(&tbl, |state| {
+            Ok(SequenceState {
+                last_value: state.start,
+                is_called: false,
+                ..state.clone()
+            })
+        })?;
+        Ok(())
+    }
+
     /// `currval(name)`: this session's last `nextval` of the sequence.
     pub(crate) fn currval(&self, session: &str, name: &str) -> Result<i64> {
         let tbl = self.resolve(name)?;

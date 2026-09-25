@@ -7,7 +7,7 @@ use nodus_catalog::TableConstraint;
 pub(crate) fn table_name_of(relation: &sqlparser::ast::TableFactor) -> Result<String> {
     match relation {
         sqlparser::ast::TableFactor::Table { name, .. } => Ok(name.to_string()),
-        other => anyhow::bail!("Unsupported table relation: {:?}", other),
+        other => anyhow::bail!("Unsupported table relation: {other}"),
     }
 }
 
@@ -436,7 +436,11 @@ fn plan_from(
                 }
                 JoinOperator::FullOuter(c) => join_constraint(JoinType::FullOuter, c, params)?,
                 JoinOperator::CrossJoin(_) => (JoinType::Cross, None, Vec::new(), false),
-                other => anyhow::bail!("Unsupported join operator: {:?}", other),
+                other => {
+                    let kind = format!("{other:?}");
+                    let kind = kind.split('(').next().unwrap_or(&kind);
+                    anyhow::bail!("{kind} joins are not supported")
+                }
             };
             joins.push(plan_join(&j.relation, constraint, ctes, params)?);
         }

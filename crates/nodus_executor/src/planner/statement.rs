@@ -349,7 +349,7 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                     name,
                     if_exists: *if_exists,
                 }),
-                _ => anyhow::bail!("Unsupported DROP object type: {:?}", object_type),
+                _ => anyhow::bail!("DROP {object_type} is not supported"),
             }
         }
         Statement::CreateIndex(create_index) => {
@@ -437,7 +437,7 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
             let returning = plan_returning(&insert.returning, "")?;
             let table_name = match &insert.table {
                 sqlparser::ast::TableObject::TableName(name) => name.to_string(),
-                other => anyhow::bail!("Unsupported INSERT target: {:?}", other),
+                other => anyhow::bail!("Unsupported INSERT target: {other}"),
             };
             // Use the bare identifier, not `to_string()` (which re-quotes a quoted
             // ident like `"Id"`). CREATE TABLE stores unquoted names, so a quoted
@@ -661,6 +661,24 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
             })
         }
         Statement::Merge(merge) => plan_merge(merge, params),
+        Statement::Truncate(truncate) => Ok(LogicalPlan::Truncate {
+            tables: truncate
+                .table_names
+                .iter()
+                .map(|t| t.name.to_string())
+                .collect(),
+            restart_identity: matches!(
+                truncate.identity,
+                Some(sqlparser::ast::TruncateIdentityOption::Restart)
+            ),
+        }),
+        // Statistics and space are managed by the storage engine.
+        Statement::Analyze(_) => Ok(LogicalPlan::Noop {
+            tag: "ANALYZE".to_string(),
+        }),
+        Statement::Vacuum(_) => Ok(LogicalPlan::Noop {
+            tag: "VACUUM".to_string(),
+        }),
         Statement::StartTransaction { .. } => Ok(LogicalPlan::Begin),
         Statement::Commit { .. } => Ok(LogicalPlan::Commit),
         Statement::Rollback { savepoint, .. } => {
@@ -714,7 +732,7 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                 variable: "timezone".to_string(),
                 value: value.to_string(),
             }),
-            other => anyhow::bail!("Unsupported SET statement: {:?}", other),
+            other => anyhow::bail!("{} is not supported", leading_keywords(&other.to_string())),
         },
         Statement::Discard { .. } => Ok(LogicalPlan::Noop {
             tag: "DISCARD ALL".to_string(),
@@ -782,14 +800,32 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                     };
                     AlterTableOp::RenameTable { new_name }
                 }
-                _ => anyhow::bail!("Unsupported ALTER TABLE operation: {:?}", op),
+                _ => anyhow::bail!(
+                    "ALTER TABLE ... {} is not supported",
+                    leading_keywords(&op.to_string())
+                ),
             };
             Ok(LogicalPlan::AlterTable {
                 table_name,
                 operation: alter_op,
             })
         }
-        _ => anyhow::bail!("Unsupported SQL statement: {:?}", stmt),
+        _ => anyhow::bail!("{} is not supported", leading_keywords(&stmt.to_string())),
+    }
+}
+
+/// The keywords a statement or clause starts with (`CREATE FUNCTION`,
+/// `VACUUM`), which name it in an error without echoing the rest.
+fn leading_keywords(sql: &str) -> String {
+    let words: Vec<&str> = sql
+        .split_whitespace()
+        .take_while(|w| w.chars().all(|c| c.is_ascii_uppercase() || c == '_'))
+        .take(4)
+        .collect();
+    if words.is_empty() {
+        "this statement".to_string()
+    } else {
+        words.join(" ")
     }
 }
 

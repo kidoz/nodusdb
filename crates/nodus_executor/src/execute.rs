@@ -184,6 +184,10 @@ impl MemExecutor {
                 clauses,
                 returning,
             ),
+            LogicalPlan::Truncate {
+                tables,
+                restart_identity,
+            } => self.exec_truncate(ctx, tables, restart_identity),
             LogicalPlan::With { ctes, body } => {
                 let _bindings = self.bind_ctes(ctx, ctes)?;
                 self.execute_logical_inner(ctx, *body)
