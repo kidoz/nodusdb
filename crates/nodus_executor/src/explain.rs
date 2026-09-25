@@ -677,7 +677,7 @@ impl MemExecutor {
         if let Some(FilterExpr::Predicate(Predicate {
             left,
             op: CompareOp::Eq,
-            ..
+            right: Operand::Literal(_),
         })) = filter
         {
             let name = left.rsplit('.').next().unwrap_or(left);

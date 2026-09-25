@@ -291,7 +291,7 @@ impl MemExecutor {
                 if let Some(FilterExpr::Predicate(Predicate {
                     left,
                     op: CompareOp::Eq,
-                    right,
+                    right: right @ Operand::Literal(_),
                 })) = filter.as_ref()
                 {
                     let col_name = left.split('.').last().unwrap_or(left);
