@@ -155,10 +155,10 @@ fn binary_type(op: ScalarBinaryOp, left: Option<String>, right: Option<String>) 
         Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Mod => {
             let (left, right) = (left?, right?);
             if let (Some(l), Some(r)) = (integer_rank(&left), integer_rank(&right)) {
-                // Integer arithmetic promotes to the wider operand, and to at
-                // least integer.
+                // Integer arithmetic is in the wider operand's type.
                 Some(
-                    match l.max(r).max(2) {
+                    match l.max(r) {
+                        1 => "SMALLINT",
                         2 => "INTEGER",
                         _ => "BIGINT",
                     }
@@ -191,6 +191,92 @@ fn window_type(
         "AVG" => aggregate_type(&AggregateOp::Avg, input()),
         "MIN" | "MAX" | "LAG" | "LEAD" | "FIRST_VALUE" | "LAST_VALUE" | "NTH_VALUE" => input(),
         _ => None,
+    }
+}
+
+/// `expr` with each integer arithmetic whose result is `integer` or
+/// `smallint` checked against that type's range, as PostgreSQL computes it
+/// in that type (`2147483647 + 1` fails rather than widening). `column`
+/// gives the declared types of the columns it names.
+pub(crate) fn check_integer_ranges(
+    expr: &ScalarExpr,
+    column: &impl Fn(&str) -> Option<String>,
+) -> ScalarExpr {
+    let checked = expr.map_children(&mut |e| check_integer_ranges(e, column));
+    // `pg_typeof` reports the argument's declared type, which a value alone
+    // cannot tell (a `smallint` column holds integers too); an untyped
+    // string literal is `unknown`.
+    if let ScalarExpr::Function { name, args } = &checked
+        && name == "PG_TYPEOF"
+        && let [arg] = args.as_slice()
+    {
+        if matches!(arg, ScalarExpr::Literal(Value::Text(_))) {
+            return ScalarExpr::Literal(Value::Text("unknown".to_string()));
+        }
+        if let Some(ty) = scalar_type(arg, column) {
+            let name = crate::functions::format_type_name(crate::MemExecutor::pg_type_oid(&ty));
+            if name != "???" {
+                return ScalarExpr::Literal(Value::Text(name));
+            }
+        }
+    }
+    let arithmetic = matches!(
+        expr,
+        ScalarExpr::Binary {
+            op: ScalarBinaryOp::Add
+                | ScalarBinaryOp::Sub
+                | ScalarBinaryOp::Mul
+                | ScalarBinaryOp::Div
+                | ScalarBinaryOp::Mod,
+            ..
+        } | ScalarExpr::Unary {
+            op: ScalarUnaryOp::Neg,
+            ..
+        }
+    );
+    match scalar_type(&checked, column).as_deref() {
+        Some(ty @ ("INTEGER" | "SMALLINT")) if arithmetic => ScalarExpr::Function {
+            name: INTEGER_RANGE.to_string(),
+            args: vec![checked, ScalarExpr::Literal(Value::Text(ty.to_string()))],
+        },
+        _ => checked,
+    }
+}
+
+/// The function [`check_integer_ranges`] wraps a result in: its first
+/// argument, or an error when that is outside the type named by the second.
+pub(crate) const INTEGER_RANGE: &str = "__INTEGER_RANGE__";
+
+/// A condition with [`check_integer_ranges`] applied to its expressions.
+pub(crate) fn check_filter_integer_ranges(
+    filter: &crate::FilterExpr,
+    column: &impl Fn(&str) -> Option<String>,
+) -> crate::FilterExpr {
+    use crate::FilterExpr as F;
+    let check = |e: &ScalarExpr| check_integer_ranges(e, column);
+    let recur = |f: &F| Box::new(check_filter_integer_ranges(f, column));
+    match filter {
+        F::And(a, b) => F::And(recur(a), recur(b)),
+        F::Or(a, b) => F::Or(recur(a), recur(b)),
+        F::Not(a) => F::Not(recur(a)),
+        F::ExprCmp { left, op, right } => F::ExprCmp {
+            left: check(left),
+            op: op.clone(),
+            right: check(right),
+        },
+        F::Scalar(e) => F::Scalar(check(e)),
+        F::QuantifiedSubquery {
+            left,
+            op,
+            subquery,
+            all,
+        } => F::QuantifiedSubquery {
+            left: check(left),
+            op: *op,
+            subquery: subquery.clone(),
+            all: *all,
+        },
+        other => other.clone(),
     }
 }
 

@@ -42,6 +42,24 @@ pub(crate) struct TargetScope {
 }
 
 impl TargetScope {
+    /// The declared type of a column the statement names.
+    fn column_type(&self, name: &str) -> Option<String> {
+        crate::filter_eval::col_pos(&self.names, name)
+            .and_then(|i| self.columns.get(i))
+            .map(|c| c.data_type.clone())
+    }
+
+    /// An expression with its integer arithmetic range-checked in the
+    /// operands' types.
+    pub(crate) fn check_ranges(&self, expr: &ScalarExpr) -> ScalarExpr {
+        crate::result_types::check_integer_ranges(expr, &|name| self.column_type(name))
+    }
+
+    /// A condition with its integer arithmetic range-checked.
+    pub(crate) fn check_filter_ranges(&self, filter: &FilterExpr) -> FilterExpr {
+        crate::result_types::check_filter_integer_ranges(filter, &|name| self.column_type(name))
+    }
+
     /// The column names with the target's columns (`target`) or the
     /// relations' columns made unnameable, for the parts of a `MERGE` that
     /// see only the other side.
@@ -365,16 +383,27 @@ impl MemExecutor {
                         scope_row.extend(row.iter().cloned());
                         let mut scope_cols = col_names.clone();
                         scope_cols.extend(col_names.iter().map(|c| format!("excluded.{c}")));
+                        let column_type = |name: &str| {
+                            crate::filter_eval::col_pos(&scope_cols, name)
+                                .map(|i| tbl.columns[i % tbl.columns.len()].data_type.clone())
+                        };
+                        let check = |e: &ScalarExpr| {
+                            crate::result_types::check_integer_ranges(e, &column_type)
+                        };
                         if let Some(cond) = condition
-                            && self.eval_expr(ctx, cond, &scope_row, &scope_cols)
+                            && self.eval_expr(ctx, &check(cond), &scope_row, &scope_cols)
                                 != Value::Bool(true)
                         {
                             continue;
                         }
+                        let assignments: Vec<(String, ScalarExpr)> = assignments
+                            .iter()
+                            .map(|(column, expr)| (column.clone(), check(expr)))
+                            .collect();
                         let updated = self.apply_assignments(
                             ctx,
                             &tbl,
-                            assignments,
+                            &assignments,
                             &existing_row,
                             (&scope_row, &scope_cols),
                         )?;
@@ -466,6 +495,11 @@ impl MemExecutor {
             crate::filter_eval::filter_column_refs(filter, &mut refs);
         }
         scope.check_refs(refs, &scope.names)?;
+        let assignments: Vec<(String, ScalarExpr)> = assignments
+            .iter()
+            .map(|(column, expr)| (column.clone(), scope.check_ranges(expr)))
+            .collect();
+        let filter = filter.as_ref().map(|f| scope.check_filter_ranges(f));
 
         let mut updated = 0;
         let mut returning_rows = Vec::new();
@@ -516,6 +550,7 @@ impl MemExecutor {
             crate::filter_eval::filter_column_refs(filter, &mut refs);
             scope.check_refs(refs, &scope.names)?;
         }
+        let filter = filter.as_ref().map(|f| scope.check_filter_ranges(f));
 
         let mut deleted = 0;
         let mut returning_rows = Vec::new();

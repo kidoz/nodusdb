@@ -85,6 +85,35 @@ impl MemExecutor {
             scope.check_refs(refs, visible(clause.kind))?;
         }
 
+        // Integer arithmetic is computed in its operands' types.
+        let on = on.as_ref().map(|f| scope.check_filter_ranges(f));
+        let clauses: Vec<MergeClause> = clauses
+            .iter()
+            .map(|clause| MergeClause {
+                kind: clause.kind,
+                condition: clause
+                    .condition
+                    .as_ref()
+                    .map(|f| scope.check_filter_ranges(f)),
+                action: match &clause.action {
+                    MergeAction::Update(assignments) => MergeAction::Update(
+                        assignments
+                            .iter()
+                            .map(|(column, e)| (column.clone(), scope.check_ranges(e)))
+                            .collect(),
+                    ),
+                    MergeAction::Insert { columns, values } => MergeAction::Insert {
+                        columns: columns.clone(),
+                        values: values
+                            .iter()
+                            .map(|v| v.as_ref().map(|e| scope.check_ranges(e)))
+                            .collect(),
+                    },
+                    other => other.clone(),
+                },
+            })
+            .collect();
+
         // The join, as pairs of target and source row indexes: each source
         // row with the target rows `on` matches it to, or alone when there are
         // none, then each target row no source row matches. It is computed in

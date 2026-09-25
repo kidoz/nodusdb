@@ -104,3 +104,25 @@ fn subscripts_and_select_list_set_functions() {
     assert_eq!(out.columns, ["n"]);
     assert_eq!(rows(&out), ["1", "2", "3"]);
 }
+
+#[test]
+fn integer_arithmetic_overflows_in_its_type() {
+    let sql = session();
+    sql("CREATE TABLE t (id INT PRIMARY KEY, i INT, s SMALLINT)").unwrap();
+    sql("INSERT INTO t VALUES (1, 2147483647, 32767)").unwrap();
+    let err = sql("SELECT i + 1 FROM t").unwrap_err();
+    assert_eq!(err.to_string(), "integer out of range");
+    let err = sql("SELECT s + s FROM t").unwrap_err();
+    assert_eq!(err.to_string(), "smallint out of range");
+    let err = sql("SELECT 2147483647 + 1").unwrap_err();
+    assert_eq!(err.to_string(), "integer out of range");
+    // A bigint operand widens the arithmetic.
+    assert_eq!(
+        rows(&sql("SELECT i + 1::bigint, s + 1 FROM t").unwrap()),
+        ["2147483648|32768"]
+    );
+    assert_eq!(
+        rows(&sql("SELECT pg_typeof(s + s) FROM t").unwrap()),
+        ["smallint"]
+    );
+}

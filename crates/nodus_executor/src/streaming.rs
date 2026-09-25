@@ -175,6 +175,14 @@ impl MemExecutor {
             crate::filter_eval::filter_column_refs(condition, &mut refs);
             crate::filter_eval::check_column_refs(refs, &col_names)?;
         }
+        // Integer arithmetic is computed in its operands' types.
+        let filter = filter.map(|f| {
+            crate::result_types::check_filter_integer_ranges(f, &|name: &str| {
+                crate::filter_eval::col_pos(&col_names, name)
+                    .map(|i| joined_columns[i].data_type.clone())
+            })
+        });
+        let filter = filter.as_ref();
 
         // Resolve output columns, types, and source indices up front. Types come
         // straight from the catalog descriptors, so the schema is known before any

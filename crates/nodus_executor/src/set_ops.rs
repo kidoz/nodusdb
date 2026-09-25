@@ -26,6 +26,7 @@ impl MemExecutor {
                     let mut refs = Vec::new();
                     crate::filter_eval::scalar_column_refs(&expr, &mut refs);
                     crate::filter_eval::check_column_refs(refs, &[])?;
+                    let expr = crate::result_types::check_integer_ranges(&expr, &|_: &str| None);
                     type_hint =
                         type_hint.or_else(|| crate::result_types::constant_expr_type(&expr));
                     let value = self.eval_expr(ctx, &expr, &[], &[]);

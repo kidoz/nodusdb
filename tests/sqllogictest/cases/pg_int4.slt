@@ -114,9 +114,6 @@ SELECT -5 % 2;
 ----
 -1
 
-# Divergence from pg: int4 overflow does not error — NodusDB computes all
-# integers in 64-bit, so this yields 2147483648 where pg raises "out of range".
-query I
+# int4 arithmetic that overflows raises "integer out of range", as in pg.
+statement error
 SELECT (-2147483648)::int4 * (-1)::int4;
-----
-2147483648

@@ -651,6 +651,40 @@ impl MemExecutor {
             joined_columns = combined_desc;
         }
 
+        // Integer arithmetic is computed in its operands' type, so overflowing
+        // `integer` or `smallint` is an error, as in PostgreSQL.
+        let column_type = |name: &str| {
+            crate::filter_eval::col_pos(&col_names, name)
+                .and_then(|i| joined_columns.get(i))
+                .map(|c| c.data_type.clone())
+        };
+        let check = |e: &ScalarExpr| crate::result_types::check_integer_ranges(e, &column_type);
+        let check_filter =
+            |f: &FilterExpr| crate::result_types::check_filter_integer_ranges(f, &column_type);
+        let projection: Vec<ProjectionItem> = projection
+            .into_iter()
+            .map(|item| match item {
+                ProjectionItem::Expr { expr, alias } => ProjectionItem::Expr {
+                    expr: check(&expr),
+                    alias,
+                },
+                other => other,
+            })
+            .collect();
+        let filter = filter.as_ref().map(check_filter);
+        let having = having.as_ref().map(check_filter);
+        let group_exprs: Vec<(String, ScalarExpr)> = group_exprs
+            .into_iter()
+            .map(|(name, e)| (name, check(&e)))
+            .collect();
+        let key_targets: Vec<SortTarget> = key_targets
+            .into_iter()
+            .map(|target| match target {
+                SortTarget::Expr(e) => SortTarget::Expr(check(&e)),
+                other => other,
+            })
+            .collect();
+
         // Reject a bare reference to a non-existent column (rather than silently
         // projecting NULL), validated against the full base+join column set.
         // Skipped when a virtual/catalog table is involved — driver introspection

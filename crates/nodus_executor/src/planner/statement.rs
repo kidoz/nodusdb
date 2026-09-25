@@ -1186,7 +1186,10 @@ fn values_cell(e: &sqlparser::ast::Expr, params: &[Value]) -> Result<Value> {
     if references_column(&expr) {
         anyhow::bail!("column \"{e}\" does not exist");
     }
-    Ok(eval_scalar_expr(&expr, &[], &[]))
+    let expr = crate::result_types::check_integer_ranges(&expr, &|_: &str| None);
+    let value = eval_scalar_expr(&expr, &[], &[]);
+    crate::eval_error::check()?;
+    Ok(value)
 }
 
 fn references_column(expr: &ScalarExpr) -> bool {

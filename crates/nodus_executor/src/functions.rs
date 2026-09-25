@@ -103,6 +103,7 @@ pub(crate) fn is_known(name: &str) -> bool {
                 | "TRIM_ARRAY" | "ARRAY_SORT" | "ARRAY_REVERSE"
                 // Subscripts: `a[i]`, `a[lo:hi]`, `doc['key']`.
                 | "__SUBSCRIPT__" | "__SLICE__"
+                | crate::result_types::INTEGER_RANGE
         )
 }
 
@@ -114,6 +115,7 @@ pub(crate) fn return_type(name: &str, arg_types: &[Option<String>]) -> Option<St
     // An element of an array is of its element type; a slice of the array's.
     let subscripted = arg_types.first().cloned().flatten();
     match name {
+        crate::result_types::INTEGER_RANGE => return subscripted,
         "__SUBSCRIPT__" => {
             return subscripted.map(|t| t.strip_suffix("[]").map(str::to_string).unwrap_or(t));
         }
@@ -1235,6 +1237,20 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
         "JSONB_PRETTY" if arity(1) => {
             Value::Text(crate::json_text::jsonb_pretty(&json_arg(arg(0))?))
         }
+
+        // An integer result checked against its type's range.
+        crate::result_types::INTEGER_RANGE if arity(2) => match arg(0) {
+            Value::Int(v) => {
+                let ty = text(arg(1));
+                let (min, max) = crate::value::integer_range(&ty);
+                if (min..=max).contains(v) {
+                    Value::Int(*v)
+                } else {
+                    raise(format!("{} out of range", crate::value::sql_type_name(&ty)))
+                }
+            }
+            other => other.clone(),
+        },
 
         // ---- Subscripts ---------------------------------------------------------------
         "__SUBSCRIPT__" if arity(2) => match arg(0) {

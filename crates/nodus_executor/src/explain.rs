@@ -1041,6 +1041,12 @@ pub(crate) fn deparse_scalar(expr: &ScalarExpr, qualified: bool) -> String {
         ScalarExpr::Cast { expr, target } => {
             format!("({})::{}", d(expr), target.to_ascii_lowercase())
         }
+        // A range check shows as the expression it checks.
+        ScalarExpr::Function { name, args }
+            if name == crate::result_types::INTEGER_RANGE && !args.is_empty() =>
+        {
+            d(&args[0])
+        }
         // A sequence argument is a `regclass`.
         ScalarExpr::Function { name, args } if name == "NEXTVAL" && args.len() == 1 => {
             match crate::sequences::default_sequence(expr) {

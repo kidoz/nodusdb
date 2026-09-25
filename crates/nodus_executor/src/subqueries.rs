@@ -112,11 +112,15 @@ impl MemExecutor {
         rows: Vec<Vec<ScalarExpr>>,
     ) -> Result<QueryOutput> {
         let width = rows.first().map_or(0, Vec::len);
+        let no_columns = |_: &str| None;
         let mut values: Vec<Vec<Value>> = rows
             .iter()
             .map(|row| {
                 row.iter()
-                    .map(|e| self.eval_expr(ctx, e, &[], &[]))
+                    .map(|e| {
+                        let e = crate::result_types::check_integer_ranges(e, &no_columns);
+                        self.eval_expr(ctx, &e, &[], &[])
+                    })
                     .collect()
             })
             .collect();
