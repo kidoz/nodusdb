@@ -26,6 +26,7 @@ mod execute;
 pub(crate) mod filter_eval;
 mod functions;
 mod information_schema;
+mod json_text;
 mod merge;
 mod parameters;
 mod pg_catalog;
@@ -44,6 +45,7 @@ mod table_functions;
 mod transactions;
 mod value;
 mod view_helpers;
+pub use json_text::{json_text, jsonb_text};
 pub use plan_types::{
     AggregateOp, AlterTableOp, CompareOp, ConflictTarget, DeferredItem, FilterExpr, Join, JoinType,
     LogicalPlan, MergeAction, MergeClause, MergeKind, OnConflictClause, Operand, PatternKind,
@@ -968,3 +970,5 @@ mod phase3_tests;
 mod streaming_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod utility_tests;

@@ -51,11 +51,20 @@ pub(crate) fn encode_row(row: &[Value]) -> serde_json::Result<String> {
     serde_json::to_string(&stored)
 }
 
-/// Restores the numbers in a decoded row from its columns' declared types: a
+/// Restores the values in a decoded row from its columns' declared types: a
 /// `numeric` column holds decimal text (or a float, if written before exact
-/// decimals).
+/// decimals), and a `jsonb` column text written before documents were stored
+/// parsed.
 pub(crate) fn restore_row(row: &mut [Value], columns: &[nodus_catalog::ColumnDescriptor]) {
     for (value, column) in row.iter_mut().zip(columns) {
+        if is_jsonb_type(&column.data_type) {
+            if let Value::Text(t) = &*value
+                && let Ok(json) = crate::json_text::parse(t)
+            {
+                *value = Value::Jsonb(json);
+            }
+            continue;
+        }
         if column_type(&column.data_type) != ColumnType::Numeric {
             continue;
         }
@@ -70,6 +79,16 @@ pub(crate) fn restore_row(row: &mut [Value], columns: &[nodus_catalog::ColumnDes
             *value = Value::Numeric(d);
         }
     }
+}
+
+/// Whether a declared type is `jsonb`.
+pub(crate) fn is_jsonb_type(data_type: &str) -> bool {
+    data_type.trim().eq_ignore_ascii_case("jsonb")
+}
+
+/// Whether a declared type is `json` or `jsonb`.
+pub(crate) fn is_json_type(data_type: &str) -> bool {
+    is_jsonb_type(data_type) || data_type.trim().eq_ignore_ascii_case("json")
 }
 
 /// The range of an integer type: `smallint`, `integer` (also `serial`), or
@@ -200,6 +219,10 @@ pub(crate) fn coerce(raw: &str, ty: ColumnType) -> Value {
 pub(crate) fn coerce_for_column(value: &Value, data_type: &str) -> Value {
     match value {
         Value::Null => Value::Null,
+        // JSON text must parse; a `jsonb` column stores the parsed document.
+        Value::Text(_) if is_json_type(data_type) => {
+            crate::planner::cast_value(value.clone(), data_type)
+        }
         // Complex values are never re-typed: they belong to JSONB/ARRAY columns,
         // which the coarse `column_type` may misclassify (e.g. `INT[]` contains
         // "INT"), so coercing them would corrupt the value.
@@ -414,7 +437,7 @@ pub(crate) fn render(value: &Value) -> String {
             let rendered: Vec<String> = a.iter().map(render).collect();
             format!("{{{}}}", rendered.join(","))
         }
-        Value::Jsonb(j) => j.to_string(),
+        Value::Jsonb(j) => crate::json_text::jsonb_text(j),
         Value::Null => String::new(),
     }
 }
@@ -811,7 +834,7 @@ pub(crate) fn compare(a: &Value, b: &Value) -> std::cmp::Ordering {
             }
             x.len().cmp(&y.len())
         }
-        (Value::Jsonb(x), Value::Jsonb(y)) => x.to_string().cmp(&y.to_string()),
+        (Value::Jsonb(x), Value::Jsonb(y)) => crate::json_text::jsonb_cmp(x, y),
         // Different categories: order by rank, never by rendered text.
         _ => type_rank(a).cmp(&type_rank(b)),
     }

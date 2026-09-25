@@ -1098,7 +1098,7 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
             Value::Jsonb(serde_json::Value::Array(args.iter().map(to_json).collect()))
         }
         "JSON_TYPEOF" | "JSONB_TYPEOF" if arity(1) => {
-            let json = crate::filter_eval::value_to_json(arg(0))?;
+            let json = json_arg(arg(0))?;
             Value::Text(
                 match json {
                     serde_json::Value::Object(_) => "object",
@@ -1111,12 +1111,10 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
                 .to_string(),
             )
         }
-        "JSON_ARRAY_LENGTH" | "JSONB_ARRAY_LENGTH" if arity(1) => {
-            match crate::filter_eval::value_to_json(arg(0))? {
-                serde_json::Value::Array(items) => Value::Int(items.len() as i64),
-                _ => raise("cannot get array length of a non-array"),
-            }
-        }
+        "JSON_ARRAY_LENGTH" | "JSONB_ARRAY_LENGTH" if arity(1) => match json_arg(arg(0))? {
+            serde_json::Value::Array(items) => Value::Int(items.len() as i64),
+            _ => raise("cannot get array length of a non-array"),
+        },
         "JSON_EXTRACT_PATH"
         | "JSONB_EXTRACT_PATH"
         | "JSON_EXTRACT_PATH_TEXT"
@@ -1132,7 +1130,7 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
             crate::planner::apply_binary_op(op, arg(0).clone(), path)
         }
         "JSONB_SET" if arity(3) || arity(4) => {
-            let mut json = crate::filter_eval::value_to_json(arg(0))?;
+            let mut json = json_arg(arg(0))?;
             let path: Vec<String> = array(arg(1))?.iter().map(text).collect();
             let create = !matches!(args.get(3), Some(Value::Bool(false)));
             let new_value = to_json(&parse_json_arg(arg(2)));
@@ -1140,15 +1138,13 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
             Value::Jsonb(json)
         }
         "JSONB_STRIP_NULLS" | "JSON_STRIP_NULLS" if arity(1) || arity(2) => {
-            let mut json = crate::filter_eval::value_to_json(arg(0))?;
+            let mut json = json_arg(arg(0))?;
             strip_nulls(&mut json, matches!(args.get(1), Some(Value::Bool(true))));
             Value::Jsonb(json)
         }
-        "JSONB_PRETTY" if arity(1) => Value::Text(
-            serde_json::to_string_pretty(&crate::filter_eval::value_to_json(arg(0))?)
-                .unwrap_or_default()
-                .replace("  ", "    "),
-        ),
+        "JSONB_PRETTY" if arity(1) => {
+            Value::Text(crate::json_text::jsonb_pretty(&json_arg(arg(0))?))
+        }
 
         // ---- Arrays -------------------------------------------------------------------
         "ARRAY_LENGTH" if arity(2) => {
@@ -1587,6 +1583,17 @@ pub(crate) fn to_json(v: &Value) -> serde_json::Value {
         Value::Text(s) => J::String(s.clone()),
         Value::Array(items) => J::Array(items.iter().map(to_json).collect()),
         Value::Jsonb(j) => j.clone(),
+    }
+}
+
+/// A `json`/`jsonb` argument as a document: text is JSON input (so `'1'` is
+/// the number 1, as an untyped literal would be).
+fn json_arg(v: &Value) -> Option<serde_json::Value> {
+    match v {
+        Value::Text(s) => crate::json_text::parse(s)
+            .ok()
+            .or_else(|| crate::filter_eval::value_to_json(v)),
+        other => crate::filter_eval::value_to_json(other),
     }
 }
 

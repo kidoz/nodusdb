@@ -139,8 +139,12 @@ impl MemExecutor {
         match op {
             Operand::Literal(val) => {
                 match val {
-                    // Date/time text compares in its canonical form.
-                    Value::Text(_) if crate::value::temporal_type(expected_type).is_some() => {
+                    // Date/time text compares in its canonical form, and
+                    // `jsonb` text as the document.
+                    Value::Text(_)
+                        if crate::value::temporal_type(expected_type).is_some()
+                            || crate::value::is_jsonb_type(expected_type) =>
+                    {
                         crate::value::coerce_for_column(val, expected_type)
                     }
                     Value::Text(s) => coerce(s, column_type(expected_type)),

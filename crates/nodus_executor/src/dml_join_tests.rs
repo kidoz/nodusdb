@@ -5,7 +5,7 @@ use nodus_audit::MemoryAuditSink;
 
 /// An executor with an all-privileged session, and a function running one
 /// SQL statement in it.
-fn session() -> impl Fn(&str) -> Result<QueryOutput> {
+pub(crate) fn session() -> impl Fn(&str) -> Result<QueryOutput> {
     let (exec, cat) = MemExecutor::shared(Arc::new(MemoryAuditSink::new()));
     let admin = cat
         .create_role(nodus_catalog::CreateRoleRequest {
@@ -36,7 +36,7 @@ fn session() -> impl Fn(&str) -> Result<QueryOutput> {
 }
 
 /// The rows of `out`, rendered and sorted.
-fn rows(out: &QueryOutput) -> Vec<String> {
+pub(crate) fn rows(out: &QueryOutput) -> Vec<String> {
     let mut rows: Vec<String> = out
         .rows
         .iter()

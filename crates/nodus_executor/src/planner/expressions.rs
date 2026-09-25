@@ -333,10 +333,12 @@ pub(crate) fn try_cast(v: Value, data_type: &str) -> std::result::Result<Value, 
             match &v {
                 // Booleans cast to the SQL spellings, not the wire `t`/`f` rendering.
                 Value::Bool(b) => Value::Text(if *b { "true" } else { "false" }.to_string()),
-                Value::Text(s) if upper == "JSON" || upper == "JSONB" => {
-                    serde_json::from_str::<serde_json::Value>(s).map_err(|_| invalid(s))?;
+                // `json` keeps its text; `jsonb` is the parsed document.
+                Value::Text(s) if upper == "JSON" => {
+                    crate::json_text::parse(s)?;
                     v
                 }
+                Value::Text(s) if upper == "JSONB" => Value::Jsonb(crate::json_text::parse(s)?),
                 Value::Text(s) if let Some(kind) = crate::value::temporal_type(data_type) => {
                     match crate::value::normalize_temporal(s, kind) {
                         Some(text) => Value::Text(text),
@@ -2035,6 +2037,12 @@ pub(crate) fn apply_binary_op(op: ScalarBinaryOp, l: Value, r: Value) -> Value {
             if matches!(l, Value::Null) || matches!(r, Value::Null) {
                 return Value::Null;
             }
+            // `jsonb - key`, `jsonb - index`, `jsonb - keys`.
+            if let (Op::Sub, Value::Jsonb(json)) = (op, &l) {
+                return crate::json_text::jsonb_delete(json.clone(), &r)
+                    .map(Value::Jsonb)
+                    .unwrap_or_else(crate::eval_error::raise);
+            }
             // Exact decimal arithmetic when a numeric meets an integer or a
             // numeric (a float operand makes the result a float).
             if matches!(l, Value::Numeric(_)) || matches!(r, Value::Numeric(_)) {
@@ -2100,6 +2108,17 @@ pub(crate) fn apply_binary_op(op: ScalarBinaryOp, l: Value, r: Value) -> Value {
             })
         }
         Op::Concat => {
+            // `jsonb || jsonb`, where an untyped literal side reads as jsonb.
+            let as_jsonb = |v: &Value| match v {
+                Value::Jsonb(j) => Some(j.clone()),
+                Value::Text(t) => crate::json_text::parse(t).ok(),
+                _ => None,
+            };
+            if matches!(l, Value::Jsonb(_)) || matches!(r, Value::Jsonb(_)) {
+                if let (Some(a), Some(b)) = (as_jsonb(&l), as_jsonb(&r)) {
+                    return Value::Jsonb(crate::json_text::jsonb_concat(a, b));
+                }
+            }
             match (&l, &r) {
                 // Array concatenation: array || array, array || element, element || array.
                 (Value::Array(a), Value::Array(b)) => {

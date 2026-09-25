@@ -142,17 +142,37 @@ fn generate_series_rows(args: &[Value]) -> (Vec<String>, Vec<Vec<Value>>) {
 /// `jsonb_array_elements(arr)` / `jsonb_array_elements_text(arr)`: one row per
 /// element, as JSONB or as text.
 fn json_array_elements_rows(args: &[Value], as_text: bool) -> (Vec<String>, Vec<Vec<Value>>) {
-    let elems = as_elements(args.first());
+    // The array as a document: parsed from text, as an untyped literal is.
+    let items = match args.first() {
+        Some(Value::Jsonb(serde_json::Value::Array(items))) => items.clone(),
+        Some(Value::Text(t)) => match crate::json_text::parse(t) {
+            Ok(serde_json::Value::Array(items)) => items,
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    };
     let (ty, rows) = if as_text {
         (
-            "VARCHAR",
-            elems
+            "TEXT",
+            items
                 .into_iter()
-                .map(|v| vec![Value::Text(crate::render(&v))])
+                .map(|item| {
+                    vec![match item {
+                        serde_json::Value::Null => Value::Null,
+                        serde_json::Value::String(s) => Value::Text(s),
+                        other => Value::Text(crate::json_text::jsonb_text(&other)),
+                    }]
+                })
                 .collect(),
         )
     } else {
-        ("JSONB", elems.into_iter().map(|v| vec![v]).collect())
+        (
+            "JSONB",
+            items
+                .into_iter()
+                .map(|item| vec![Value::Jsonb(item)])
+                .collect(),
+        )
     };
     (vec![ty.to_string()], rows)
 }
