@@ -1145,13 +1145,22 @@ fn figure_colname(expr: &sqlparser::ast::Expr) -> Option<String> {
                 ident.value.to_ascii_lowercase()
             }
         }
+        // A cast names its column by the value cast, unless that is only
+        // named by a type itself (`'t'::regclass::text` is `text`).
         Expr::Cast {
             expr: inner,
             data_type,
             ..
-        } => figure_colname(inner)
-            .filter(|name| name != "case")
-            .unwrap_or_else(|| cast_type_name(&data_type.to_string())),
+        } => {
+            let mut value = &**inner;
+            while let Expr::Nested(nested) = value {
+                value = nested;
+            }
+            let typed = matches!(value, Expr::Cast { .. } | Expr::TypedString(_));
+            figure_colname(inner)
+                .filter(|name| name != "case" && !typed)
+                .unwrap_or_else(|| cast_type_name(&data_type.to_string()))
+        }
         Expr::TypedString(typed) => cast_type_name(&typed.data_type.to_string()),
         Expr::Interval(_) => "interval".to_string(),
         Expr::Case { .. } => "case".to_string(),

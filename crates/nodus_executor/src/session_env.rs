@@ -26,6 +26,9 @@ pub(crate) struct SessionEnv {
     pub(crate) session_id: String,
     /// Sequence access for `nextval`, `setval`, `currval`, and `lastval`.
     pub(crate) sequences: Option<std::sync::Arc<crate::sequences::SequenceStore>>,
+    /// The catalog, for functions that describe objects by OID
+    /// (`pg_get_indexdef`, `pg_get_constraintdef`).
+    pub(crate) catalog: Option<std::sync::Arc<dyn nodus_catalog::CatalogReader>>,
 }
 
 thread_local! {

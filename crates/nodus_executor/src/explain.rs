@@ -1196,3 +1196,131 @@ pub(crate) fn deparse_scalar(expr: &ScalarExpr, qualified: bool) -> String {
         },
     }
 }
+
+/// A query as PostgreSQL pretty-prints a view's definition:
+/// ` SELECT a,\n    b\n   FROM t\n  WHERE a > 0`. `None` for a plan it
+/// cannot write back as SQL.
+pub(crate) fn deparse_query(plan: &LogicalPlan) -> Option<String> {
+    let LogicalPlan::Select {
+        table_name,
+        table_alias,
+        joins,
+        projection,
+        group_by,
+        filter,
+        having,
+        sort,
+        limit,
+        offset,
+        distinct,
+        ..
+    } = plan
+    else {
+        return None;
+    };
+    let qualified = !joins.is_empty();
+    let unwrap = |text: String| match text.strip_prefix('(').and_then(|t| t.strip_suffix(')')) {
+        Some(inner) if balanced(inner) => inner.to_string(),
+        _ => text,
+    };
+    let items: Vec<String> = if projection.is_empty() {
+        vec!["*".to_string()]
+    } else {
+        projection
+            .iter()
+            .map(|item| match item {
+                ProjectionItem::AliasedColumn(c, alias) => {
+                    format!("{} AS {alias}", column(c, qualified))
+                }
+                ProjectionItem::Expr {
+                    expr,
+                    alias: Some(alias),
+                } => format!("{} AS {alias}", unwrap(deparse_scalar(expr, qualified))),
+                other => unwrap(projection_text(other, qualified)),
+            })
+            .collect()
+    };
+    let mut sql = format!(
+        " SELECT {}{}",
+        if *distinct { "DISTINCT " } else { "" },
+        items.join(",\n    ")
+    );
+    sql.push_str(&format!(
+        "\n   FROM {}",
+        scan_label_name_qualified(table_name, table_alias.as_deref())
+    ));
+    for join in joins {
+        let kind = match join.join_type {
+            JoinType::Inner => "JOIN",
+            JoinType::LeftOuter => "LEFT JOIN",
+            JoinType::RightOuter => "RIGHT JOIN",
+            JoinType::FullOuter => "FULL JOIN",
+            JoinType::Cross => "CROSS JOIN",
+        };
+        sql.push_str(&format!(
+            "\n     {kind} {}",
+            scan_label_name_qualified(&join.table_name, join.table_alias.as_deref())
+        ));
+        if let Some(condition) = &join.condition {
+            sql.push_str(&format!(" ON {}", deparse_filter(condition, true)));
+        }
+    }
+    if let Some(filter) = filter {
+        sql.push_str(&format!(
+            "\n  WHERE {}",
+            unwrap(deparse_filter(filter, qualified))
+        ));
+    }
+    if !group_by.is_empty() {
+        let keys: Vec<String> = group_by.iter().map(|g| column(g, qualified)).collect();
+        sql.push_str(&format!("\n  GROUP BY {}", keys.join(", ")));
+    }
+    if let Some(having) = having {
+        sql.push_str(&format!(
+            "\n HAVING {}",
+            unwrap(deparse_filter(having, qualified))
+        ));
+    }
+    if !sort.is_empty() {
+        let keys: Vec<String> = sort
+            .iter()
+            .map(|k| sort_key_text(k, projection, qualified))
+            .collect();
+        sql.push_str(&format!("\n  ORDER BY {}", keys.join(", ")));
+    }
+    if let Some(offset) = offset {
+        sql.push_str(&format!("\n OFFSET {offset}"));
+    }
+    if let Some(limit) = limit {
+        sql.push_str(&format!("\n LIMIT {limit}"));
+    }
+    Some(sql)
+}
+
+/// Whether `text` has balanced parentheses outside quotes.
+fn balanced(text: &str) -> bool {
+    let mut depth = 0i32;
+    let mut quoted = false;
+    for c in text.chars() {
+        match c {
+            '\'' => quoted = !quoted,
+            '(' if !quoted => depth += 1,
+            ')' if !quoted => {
+                depth -= 1;
+                if depth < 0 {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    depth == 0
+}
+
+/// `schema.t` or `schema.t a`, as a query names a relation.
+fn scan_label_name_qualified(table_name: &str, alias: Option<&str>) -> String {
+    match alias {
+        Some(alias) if alias != relation_name(table_name) => format!("{table_name} {alias}"),
+        _ => table_name.to_string(),
+    }
+}

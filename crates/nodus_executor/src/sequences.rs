@@ -157,7 +157,7 @@ impl SequenceState {
         ]
     }
 
-    fn from_row(row: &[Value]) -> Result<Self> {
+    pub(crate) fn from_row(row: &[Value]) -> Result<Self> {
         let int = |i: usize| match row.get(i) {
             Some(Value::Int(v)) => Ok(*v),
             _ => bail!("sequence row is malformed"),

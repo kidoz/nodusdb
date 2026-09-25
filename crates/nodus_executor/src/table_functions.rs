@@ -42,6 +42,17 @@ impl MemExecutor {
                 json_array_elements_rows(&args, true)
             }
             "regexp_split_to_table" => regexp_split_rows(&args),
+            // No table is a partition, so none has ancestors.
+            "pg_partition_ancestors" => (vec!["REGCLASS".to_string()], Vec::new()),
+            // The function behind the `pg_available_extensions` view.
+            "pg_available_extensions" => (
+                vec!["NAME".to_string(), "TEXT".to_string(), "TEXT".to_string()],
+                vec![vec![
+                    Value::Text("plpgsql".into()),
+                    Value::Text("1.0".into()),
+                    Value::Text("PL/pgSQL procedural language".into()),
+                ]],
+            ),
             other => anyhow::bail!("Unsupported table function: {other}()"),
         };
 

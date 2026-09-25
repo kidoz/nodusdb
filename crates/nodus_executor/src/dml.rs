@@ -710,7 +710,7 @@ impl MemExecutor {
     }
 
     /// A column's declared DEFAULT expression, if any.
-    fn column_default(column: &ColumnDescriptor) -> Option<ScalarExpr> {
+    pub(crate) fn column_default(column: &ColumnDescriptor) -> Option<ScalarExpr> {
         column
             .default_expr
             .as_ref()
@@ -718,7 +718,7 @@ impl MemExecutor {
     }
 
     /// A generated column's expression: its default is `__GENERATED__(expr)`.
-    fn generation_expr(default: &ScalarExpr) -> Option<&ScalarExpr> {
+    pub(crate) fn generation_expr(default: &ScalarExpr) -> Option<&ScalarExpr> {
         match default {
             ScalarExpr::Function { name, args } if name == "__GENERATED__" && args.len() == 1 => {
                 args.first()

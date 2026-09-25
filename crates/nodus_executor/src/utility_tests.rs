@@ -58,6 +58,18 @@ fn truncate_empties_tables_and_restarts_identity() {
 }
 
 #[test]
+fn object_identifiers_read_and_print_as_names() {
+    let sql = session();
+    sql("CREATE TABLE t (id INT PRIMARY KEY)").unwrap();
+    let out = sql("SELECT 't'::regclass, 't_pkey'::regclass::text, 'int4'::regtype").unwrap();
+    assert_eq!(rows(&out), ["t|t_pkey|integer"]);
+    let out = sql("SELECT relname FROM pg_catalog.pg_class WHERE oid = 't'::regclass").unwrap();
+    assert_eq!(rows(&out), ["t"]);
+    let err = sql("SELECT 'nosuch'::regclass").unwrap_err();
+    assert_eq!(err.to_string(), "relation \"nosuch\" does not exist");
+}
+
+#[test]
 fn jsonb_is_stored_and_printed_normalized() {
     let sql = session();
     sql("CREATE TABLE t (id INT PRIMARY KEY, d JSONB, j JSON)").unwrap();

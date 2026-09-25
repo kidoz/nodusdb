@@ -124,6 +124,7 @@ impl MemExecutor {
                 for table in &tables {
                     let schema_name = Self::schema_name_by_id(db_name, &schemas, table.schema_id);
                     let oid = Self::table_oid(db_name, &schema_name, &table.name);
+                    let heap = table.view_query.is_none() && !crate::sequences::is_sequence(table);
                     rows.push(vec![
                         Value::Int(oid),
                         Value::Text(table.name.clone()),
@@ -131,7 +132,8 @@ impl MemExecutor {
                         Value::Int(0),
                         Value::Int(0),
                         Value::Int(10),
-                        Value::Int(0),
+                        // A table's access method is heap.
+                        Value::Int(if heap { 2 } else { 0 }),
                         Value::Int(oid),
                         Value::Int(0),
                         Value::Int(0),
@@ -248,6 +250,7 @@ impl MemExecutor {
                     ("attoptions", "TEXT[]"),
                     ("attfdwoptions", "TEXT[]"),
                     ("attmissingval", "TEXT"),
+                    ("attcompression", "PG_CHAR"),
                 ]);
                 let mut rows = Vec::new();
                 for table in &tables {
@@ -255,6 +258,19 @@ impl MemExecutor {
                     let relid = Self::table_oid(db_name, &schema_name, &table.name);
                     for (idx, column) in table.columns.iter().enumerate() {
                         let type_oid = Self::pg_type_oid(&column.data_type);
+                        let default = crate::MemExecutor::column_default(column);
+                        let identity = default
+                            .as_ref()
+                            .and_then(crate::sequences::identity_kind)
+                            .map_or("", |always| if always { "a" } else { "d" });
+                        let generated = if default
+                            .as_ref()
+                            .is_some_and(|d| Self::generation_expr(d).is_some())
+                        {
+                            "s"
+                        } else {
+                            ""
+                        };
                         rows.push(vec![
                             Value::Int(relid),
                             Value::Text(column.name.clone()),
@@ -268,15 +284,15 @@ impl MemExecutor {
                                 0
                             }),
                             Value::Int(-1),
-                            Value::Int(-1),
+                            Value::Int(Self::pg_type_modifier(&column.data_type)),
                             Value::Bool(matches!(type_oid, 16 | 20 | 21 | 23 | 26 | 700 | 701)),
-                            Value::Text("x".into()),
+                            Value::Text(Self::pg_type_storage(&column.data_type).into()),
                             Value::Text("i".into()),
                             Value::Bool(!column.nullable),
+                            Value::Bool(default.is_some() && identity.is_empty()),
                             Value::Bool(false),
-                            Value::Bool(false),
-                            Value::Text(String::new()),
-                            Value::Text(String::new()),
+                            Value::Text(identity.into()),
+                            Value::Text(generated.into()),
                             Value::Bool(false),
                             Value::Bool(true),
                             Value::Int(0),
@@ -285,7 +301,48 @@ impl MemExecutor {
                             Value::Null,
                             Value::Null,
                             Value::Null,
+                            Value::Text(String::new()),
                         ]);
+                    }
+                    // An index's attributes are its key columns.
+                    for index in &table.indexes {
+                        let index_oid =
+                            Self::index_oid(db_name, &schema_name, &table.name, &index.name);
+                        let keys = index
+                            .key_columns
+                            .iter()
+                            .filter_map(|key| table.columns.iter().find(|c| c.id == key.column_id));
+                        for (idx, column) in keys.enumerate() {
+                            let type_oid = Self::pg_type_oid(&column.data_type);
+                            rows.push(vec![
+                                Value::Int(index_oid),
+                                Value::Text(column.name.clone()),
+                                Value::Int(type_oid),
+                                Value::Int(-1),
+                                Value::Int(Self::pg_type_length(&column.data_type)),
+                                Value::Int((idx + 1) as i64),
+                                Value::Int(0),
+                                Value::Int(-1),
+                                Value::Int(Self::pg_type_modifier(&column.data_type)),
+                                Value::Bool(matches!(type_oid, 16 | 20 | 21 | 23 | 26 | 700 | 701)),
+                                Value::Text(Self::pg_type_storage(&column.data_type).into()),
+                                Value::Text("i".into()),
+                                Value::Bool(false),
+                                Value::Bool(false),
+                                Value::Bool(false),
+                                Value::Text(String::new()),
+                                Value::Text(String::new()),
+                                Value::Bool(false),
+                                Value::Bool(true),
+                                Value::Int(0),
+                                Value::Int(0),
+                                Value::Null,
+                                Value::Null,
+                                Value::Null,
+                                Value::Null,
+                                Value::Text(String::new()),
+                            ]);
+                        }
                     }
                 }
                 Some((cols, rows))
@@ -481,15 +538,42 @@ impl MemExecutor {
             "pg_user" => Some(self.pg_user_virtual_table()),
             "pg_tables" => Some(self.pg_tables_virtual_table(db_name, &schemas, &tables)),
             "pg_indexes" => Some(self.pg_indexes_virtual_table(db_name, &schemas, &tables)),
-            "pg_attrdef" => Some((
-                Self::virtual_columns(&[
-                    ("oid", "OID"),
-                    ("adrelid", "OID"),
-                    ("adnum", "INT"),
-                    ("adbin", "TEXT"),
-                ]),
-                Vec::new(),
-            )),
+            "pg_attrdef" => {
+                let mut rows = Vec::new();
+                for table in &tables {
+                    let schema_name = Self::schema_name_by_id(db_name, &schemas, table.schema_id);
+                    let relid = Self::table_oid(db_name, &schema_name, &table.name);
+                    for (idx, column) in table.columns.iter().enumerate() {
+                        // An identity column's generator is not a default.
+                        let Some(default) = crate::MemExecutor::column_default(column)
+                            .filter(|d| crate::sequences::identity_kind(d).is_none())
+                        else {
+                            continue;
+                        };
+                        rows.push(vec![
+                            Value::Int(Self::stable_oid(
+                                &format!(
+                                    "attrdef:{db_name}.{schema_name}.{}.{}",
+                                    table.name, column.name
+                                ),
+                                1_500_000_000,
+                            )),
+                            Value::Int(relid),
+                            Value::Int((idx + 1) as i64),
+                            Value::Text(Self::default_text(&default, &column.data_type)),
+                        ]);
+                    }
+                }
+                Some((
+                    Self::virtual_columns(&[
+                        ("oid", "OID"),
+                        ("adrelid", "OID"),
+                        ("adnum", "INT"),
+                        ("adbin", "TEXT"),
+                    ]),
+                    rows,
+                ))
+            }
             "pg_description" => Some((
                 Self::virtual_columns(&[
                     ("objoid", "OID"),
@@ -531,12 +615,20 @@ impl MemExecutor {
                     ("amhandler", "REGPROC"),
                     ("amtype", "PG_CHAR"),
                 ]),
-                vec![vec![
-                    Value::Int(403),
-                    Value::Text("btree".into()),
-                    Value::Text("-".into()),
-                    Value::Text("i".into()),
-                ]],
+                vec![
+                    vec![
+                        Value::Int(2),
+                        Value::Text("heap".into()),
+                        Value::Text("heap_tableam_handler".into()),
+                        Value::Text("t".into()),
+                    ],
+                    vec![
+                        Value::Int(403),
+                        Value::Text("btree".into()),
+                        Value::Text("bthandler".into()),
+                        Value::Text("i".into()),
+                    ],
+                ],
             )),
             "pg_operator" => Some(self.pg_operator_virtual_table(db_name)),
             "pg_cast" => Some(self.pg_cast_virtual_table()),
@@ -724,18 +816,74 @@ impl MemExecutor {
             )),
             // Dependency graph: NodusDB does not track inter-object dependencies,
             // so the relation exists but is empty (tools tolerate no dependencies).
-            "pg_depend" => Some((
-                Self::virtual_columns(&[
-                    ("classid", "OID"),
-                    ("objid", "OID"),
-                    ("objsubid", "INT4"),
-                    ("refclassid", "OID"),
-                    ("refobjid", "OID"),
-                    ("refobjsubid", "INT4"),
-                    ("deptype", "PG_CHAR"),
-                ]),
-                Vec::new(),
-            )),
+            // A `serial` column's sequence depends on the column
+            // automatically, an identity column's internally.
+            "pg_depend" => {
+                let mut rows = Vec::new();
+                for table in &tables {
+                    let schema_name = Self::schema_name_by_id(db_name, &schemas, table.schema_id);
+                    let relid = Self::table_oid(db_name, &schema_name, &table.name);
+                    for (idx, column) in table.columns.iter().enumerate() {
+                        let Some(default) = crate::MemExecutor::column_default(column) else {
+                            continue;
+                        };
+                        let Some(sequence) = crate::sequences::default_sequence(&default) else {
+                            continue;
+                        };
+                        let (seq_schema, seq_name) = match sequence.split_once('.') {
+                            Some((schema, name)) => (schema.to_string(), name.to_string()),
+                            None => (schema_name.clone(), sequence.clone()),
+                        };
+                        let deptype = if crate::sequences::identity_kind(&default).is_some() {
+                            "i"
+                        } else {
+                            "a"
+                        };
+                        rows.push(vec![
+                            Value::Int(PG_CLASS_OID),
+                            Value::Int(Self::table_oid(db_name, &seq_schema, &seq_name)),
+                            Value::Int(0),
+                            Value::Int(PG_CLASS_OID),
+                            Value::Int(relid),
+                            Value::Int((idx + 1) as i64),
+                            Value::Text(deptype.into()),
+                        ]);
+                    }
+                    // An index depends on its columns (a unique one, like a
+                    // constraint's, on the constraint instead).
+                    for index in table.indexes.iter().filter(|i| !i.unique) {
+                        let index_oid =
+                            Self::index_oid(db_name, &schema_name, &table.name, &index.name);
+                        for key in &index.key_columns {
+                            if let Some(pos) =
+                                table.columns.iter().position(|c| c.id == key.column_id)
+                            {
+                                rows.push(vec![
+                                    Value::Int(PG_CLASS_OID),
+                                    Value::Int(index_oid),
+                                    Value::Int(0),
+                                    Value::Int(PG_CLASS_OID),
+                                    Value::Int(relid),
+                                    Value::Int((pos + 1) as i64),
+                                    Value::Text("a".into()),
+                                ]);
+                            }
+                        }
+                    }
+                }
+                Some((
+                    Self::virtual_columns(&[
+                        ("classid", "OID"),
+                        ("objid", "OID"),
+                        ("objsubid", "INT4"),
+                        ("refclassid", "OID"),
+                        ("refobjid", "OID"),
+                        ("refobjsubid", "INT4"),
+                        ("deptype", "PG_CHAR"),
+                    ]),
+                    rows,
+                ))
+            }
             // Foreign-data infrastructure: NodusDB has no FDWs, servers, or user
             // mappings, but IDE introspection lists these relations; present them
             // with their real shape and no rows.
@@ -883,19 +1031,44 @@ impl MemExecutor {
             )),
             // Sequences: NodusDB allocates identity values without a catalogued
             // sequence relation, so this is empty.
-            "pg_sequence" => Some((
-                Self::virtual_columns(&[
-                    ("seqrelid", "OID"),
-                    ("seqtypid", "OID"),
-                    ("seqstart", "INT8"),
-                    ("seqincrement", "INT8"),
-                    ("seqmax", "INT8"),
-                    ("seqmin", "INT8"),
-                    ("seqcache", "INT8"),
-                    ("seqcycle", "BOOL"),
-                ]),
-                Vec::new(),
-            )),
+            "pg_sequence" => {
+                let mut rows = Vec::new();
+                for table in tables.iter().filter(|t| crate::sequences::is_sequence(t)) {
+                    let schema_name = Self::schema_name_by_id(db_name, &schemas, table.schema_id);
+                    // The committed options, whoever asks.
+                    let Some(state) = self
+                        .scan_rows(table.id, "")
+                        .ok()
+                        .and_then(|rows| rows.into_iter().next())
+                        .and_then(|row| crate::sequences::SequenceState::from_row(&row).ok())
+                    else {
+                        continue;
+                    };
+                    rows.push(vec![
+                        Value::Int(Self::table_oid(db_name, &schema_name, &table.name)),
+                        Value::Int(Self::pg_type_oid(&state.data_type)),
+                        Value::Int(state.start),
+                        Value::Int(state.increment),
+                        Value::Int(state.max),
+                        Value::Int(state.min),
+                        Value::Int(state.cache),
+                        Value::Bool(state.cycle),
+                    ]);
+                }
+                Some((
+                    Self::virtual_columns(&[
+                        ("seqrelid", "OID"),
+                        ("seqtypid", "OID"),
+                        ("seqstart", "INT8"),
+                        ("seqincrement", "INT8"),
+                        ("seqmax", "INT8"),
+                        ("seqmin", "INT8"),
+                        ("seqcache", "INT8"),
+                        ("seqcycle", "BOOL"),
+                    ]),
+                    rows,
+                ))
+            }
             // Foreign tables: none (NodusDB has no FDWs).
             "pg_foreign_table" => Some((
                 Self::virtual_columns(&[
@@ -949,6 +1122,59 @@ impl MemExecutor {
                     ("tgnargs", "INT2"),
                     ("tgargs", "TEXT"),
                     ("tgqual", "TEXT"),
+                ]),
+                Vec::new(),
+            )),
+            // No extended statistics, publications, or table inheritance.
+            "pg_statistic_ext" => Some((
+                Self::virtual_columns(&[
+                    ("oid", "OID"),
+                    ("stxrelid", "OID"),
+                    ("stxname", "NAME"),
+                    ("stxnamespace", "OID"),
+                    ("stxowner", "OID"),
+                    ("stxkeys", "INT2[]"),
+                    ("stxstattarget", "INT2"),
+                    ("stxkind", "TEXT[]"),
+                    ("stxexprs", "TEXT"),
+                ]),
+                Vec::new(),
+            )),
+            "pg_publication" => Some((
+                Self::virtual_columns(&[
+                    ("oid", "OID"),
+                    ("pubname", "NAME"),
+                    ("pubowner", "OID"),
+                    ("puballtables", "BOOL"),
+                    ("pubinsert", "BOOL"),
+                    ("pubupdate", "BOOL"),
+                    ("pubdelete", "BOOL"),
+                    ("pubtruncate", "BOOL"),
+                    ("pubviaroot", "BOOL"),
+                    ("pubgencols", "PG_CHAR"),
+                ]),
+                Vec::new(),
+            )),
+            "pg_publication_namespace" => Some((
+                Self::virtual_columns(&[("oid", "OID"), ("pnpubid", "OID"), ("pnnspid", "OID")]),
+                Vec::new(),
+            )),
+            "pg_publication_rel" => Some((
+                Self::virtual_columns(&[
+                    ("oid", "OID"),
+                    ("prpubid", "OID"),
+                    ("prrelid", "OID"),
+                    ("prqual", "TEXT"),
+                    ("prattrs", "INT2[]"),
+                ]),
+                Vec::new(),
+            )),
+            "pg_inherits" => Some((
+                Self::virtual_columns(&[
+                    ("inhrelid", "OID"),
+                    ("inhparent", "OID"),
+                    ("inhseqno", "INT"),
+                    ("inhdetachpending", "BOOL"),
                 ]),
                 Vec::new(),
             )),
@@ -1415,6 +1641,46 @@ impl MemExecutor {
                     Value::Null,
                 ]);
             }
+            // PostgreSQL 18 records each NOT NULL column as a constraint.
+            for (idx, column) in table.columns.iter().enumerate() {
+                if column.nullable || table.view_query.is_some() {
+                    continue;
+                }
+                let conname = format!("{}_{}_not_null", table.name, column.name);
+                rows.push(vec![
+                    Value::Int(Self::constraint_oid(
+                        db_name,
+                        &schema_name,
+                        &table.name,
+                        &conname,
+                    )),
+                    Value::Text(conname),
+                    Value::Int(namespace),
+                    Value::Text("n".into()),
+                    Value::Bool(false),
+                    Value::Bool(false),
+                    Value::Bool(true),
+                    Value::Int(relid),
+                    Value::Int(0),
+                    Value::Int(0),
+                    Value::Int(0),
+                    Value::Int(0),
+                    Value::Text(" ".into()),
+                    Value::Text(" ".into()),
+                    Value::Text(" ".into()),
+                    Value::Bool(true),
+                    Value::Int(0),
+                    Value::Bool(false),
+                    Value::Array(vec![Value::Int((idx + 1) as i64)]),
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                ]);
+            }
             for (idx, constraint) in table.constraints.iter().enumerate() {
                 match constraint {
                     nodus_catalog::TableConstraint::Check { name, expr } => {
@@ -1520,6 +1786,306 @@ impl MemExecutor {
             }
         }
         rows
+    }
+
+    /// A value cast to an object-identifier type: its OID, found by name
+    /// for text (`'t'::regclass`), with PostgreSQL's error when there is no
+    /// such object.
+    pub(crate) fn object_identifier(value: Value, kind: &str) -> Result<Value, String> {
+        let name = match value {
+            Value::Int(oid) => return Ok(Value::Int(oid)),
+            Value::Text(s) => s,
+            other => {
+                return Err(format!(
+                    "cannot cast {} to {}",
+                    crate::value::value_type_name(&other),
+                    kind.to_ascii_lowercase()
+                ));
+            }
+        };
+        if let Ok(oid) = name.trim().parse::<i64>() {
+            return Ok(Value::Int(oid));
+        }
+        let catalog = crate::session_env::with(|env| env.and_then(|e| e.catalog.clone()));
+        let found = match kind {
+            "REGCLASS" => catalog.and_then(|c| Self::relation_oid(c.as_ref(), &name)),
+            "REGNAMESPACE" => catalog
+                .and_then(|c| c.get_schema("default", name.trim().trim_matches('"')).ok())
+                .map(|s| Self::schema_oid("default", &s.name)),
+            _ => Some(Self::pg_type_oid(&name)),
+        };
+        found.map(Value::Int).ok_or_else(|| match kind {
+            "REGCLASS" => format!("relation \"{name}\" does not exist"),
+            "REGNAMESPACE" => format!("schema \"{name}\" does not exist"),
+            _ => format!("type \"{name}\" does not exist"),
+        })
+    }
+
+    /// The OID of a relation (table, view, sequence, or index) by its
+    /// possibly schema-qualified name; an unqualified one is looked up in
+    /// `public`, then among the system catalogs.
+    pub(crate) fn relation_oid(
+        catalog: &dyn nodus_catalog::CatalogReader,
+        name: &str,
+    ) -> Option<i64> {
+        let db = "default";
+        let unquote = |s: &str| s.trim().trim_matches('"').to_string();
+        let (schema, relation) = match name.trim().split_once('.') {
+            Some((schema, relation)) => (unquote(schema), unquote(relation)),
+            None => ("public".to_string(), unquote(name)),
+        };
+        if let Some(&(_, oid)) = SYSTEM_CATALOG_OIDS
+            .iter()
+            .find(|(catalog, _)| *catalog == relation)
+            && (schema == "pg_catalog" || catalog.get_table(db, &schema, &relation).is_err())
+        {
+            return Some(oid);
+        }
+        if let Ok(table) = catalog.get_table(db, &schema, &relation) {
+            return Some(Self::table_oid(db, &schema, &table.name));
+        }
+        let schemas = catalog.list_schemas(db).ok()?;
+        catalog
+            .list_all_tables(db)
+            .ok()?
+            .into_iter()
+            .find_map(|table| {
+                let table_schema = Self::schema_name_by_id(db, &schemas, table.schema_id);
+                (table_schema == schema)
+                    .then(|| table.indexes.iter().find(|i| i.name == relation))
+                    .flatten()
+                    .map(|index| Self::index_oid(db, &table_schema, &table.name, &index.name))
+            })
+    }
+
+    /// An object identifier as its type prints it: a relation, type, or
+    /// schema name (schema-qualified outside `public`), or the number when
+    /// there is no such object.
+    pub(crate) fn object_name(
+        catalog: &dyn nodus_catalog::CatalogReader,
+        kind: &str,
+        oid: i64,
+    ) -> Option<String> {
+        let db = "default";
+        let schemas = catalog.list_schemas(db).ok()?;
+        match kind {
+            "REGTYPE" => Some(crate::functions::format_type_name(oid)),
+            "REGNAMESPACE" => schemas
+                .iter()
+                .find(|s| Self::schema_oid(db, &s.name) == oid)
+                .map(|s| quote_ident(&s.name)),
+            _ if let Some(&(name, _)) = SYSTEM_CATALOG_OIDS.iter().find(|(_, o)| *o == oid) => {
+                Some(name.to_string())
+            }
+            _ => catalog
+                .list_all_tables(db)
+                .ok()?
+                .into_iter()
+                .find_map(|table| {
+                    let schema = Self::schema_name_by_id(db, &schemas, table.schema_id);
+                    let qualify = |name: &str| {
+                        if schema == "public" {
+                            quote_ident(name)
+                        } else {
+                            format!("{}.{}", quote_ident(&schema), quote_ident(name))
+                        }
+                    };
+                    if Self::table_oid(db, &schema, &table.name) == oid {
+                        return Some(qualify(&table.name));
+                    }
+                    table
+                        .indexes
+                        .iter()
+                        .find(|i| Self::index_oid(db, &schema, &table.name, &i.name) == oid)
+                        .map(|i| qualify(&i.name))
+                }),
+        }
+    }
+
+    /// A statement's result with its object-identifier columns (`regclass`,
+    /// `regtype`, `regnamespace`) showing names rather than OIDs.
+    pub(crate) fn name_object_identifiers(
+        &self,
+        mut out: crate::QueryOutput,
+    ) -> crate::QueryOutput {
+        let columns: Vec<(usize, &'static str)> = out
+            .types
+            .iter()
+            .enumerate()
+            .filter_map(|(i, t)| crate::value::object_identifier_type(t).map(|kind| (i, kind)))
+            .collect();
+        if columns.is_empty() {
+            return out;
+        }
+        for row in &mut out.rows {
+            for &(i, kind) in &columns {
+                if let Some(Value::Int(oid)) = row.values.get(i)
+                    && let Some(name) = Self::object_name(self.catalog_reader.as_ref(), kind, *oid)
+                {
+                    row.values[i] = Value::Text(name);
+                }
+            }
+        }
+        out
+    }
+
+    /// A column default as `pg_get_expr(adbin, ...)` shows it; a generated
+    /// column's default is its generation expression.
+    pub(crate) fn default_text(default: &crate::ScalarExpr, data_type: &str) -> String {
+        let expr = Self::generation_expr(default).unwrap_or(default);
+        match expr {
+            // A literal default is stored as a value of the column's type.
+            crate::ScalarExpr::Literal(Value::Text(s)) => format!(
+                "'{}'::{}",
+                s.replace('\'', "''"),
+                crate::functions::format_type_name(Self::pg_type_oid(data_type))
+            ),
+            _ => crate::explain::deparse_scalar(expr, false),
+        }
+    }
+
+    /// `pg_get_viewdef(view)`: the view's query, laid out as PostgreSQL
+    /// pretty-prints it.
+    pub(crate) fn view_definition(
+        catalog: &dyn nodus_catalog::CatalogReader,
+        oid: i64,
+    ) -> Option<String> {
+        let db = "default";
+        let schemas = catalog.list_schemas(db).ok()?;
+        let view = catalog.list_all_tables(db).ok()?.into_iter().find(|t| {
+            let schema = Self::schema_name_by_id(db, &schemas, t.schema_id);
+            t.view_query.is_some() && Self::table_oid(db, &schema, &t.name) == oid
+        })?;
+        let plan: crate::LogicalPlan = serde_json::from_str(view.view_query.as_deref()?).ok()?;
+        crate::explain::deparse_query(&plan).map(|sql| format!("{sql};"))
+    }
+
+    /// `pg_get_indexdef(oid [, column, pretty])`: the index's `CREATE INDEX`
+    /// statement, or with a column number that key column.
+    pub(crate) fn index_definition(
+        catalog: &dyn nodus_catalog::CatalogReader,
+        oid: i64,
+        column: i64,
+        pretty: bool,
+    ) -> Option<String> {
+        let db = "default";
+        let schemas = catalog.list_schemas(db).ok()?;
+        for table in catalog.list_all_tables(db).ok()? {
+            let schema = Self::schema_name_by_id(db, &schemas, table.schema_id);
+            let Some(index) = table
+                .indexes
+                .iter()
+                .find(|i| Self::index_oid(db, &schema, &table.name, &i.name) == oid)
+            else {
+                continue;
+            };
+            let keys: Vec<String> = index
+                .key_columns
+                .iter()
+                .filter_map(|key| {
+                    let c = table.columns.iter().find(|c| c.id == key.column_id)?;
+                    Some(format!(
+                        "{}{}",
+                        quote_ident(&c.name),
+                        if key.descending { " DESC" } else { "" }
+                    ))
+                })
+                .collect();
+            if column > 0 {
+                return keys.get(column as usize - 1).cloned();
+            }
+            let relation = if pretty && schema == "public" {
+                quote_ident(&table.name)
+            } else {
+                format!("{}.{}", quote_ident(&schema), quote_ident(&table.name))
+            };
+            return Some(format!(
+                "CREATE {}INDEX {} ON {relation} USING btree ({})",
+                if index.unique { "UNIQUE " } else { "" },
+                quote_ident(&index.name),
+                keys.join(", ")
+            ));
+        }
+        None
+    }
+
+    /// `pg_get_constraintdef(oid)`: the constraint's definition as `ALTER
+    /// TABLE ... ADD CONSTRAINT` would take it.
+    pub(crate) fn constraint_definition(
+        catalog: &dyn nodus_catalog::CatalogReader,
+        oid: i64,
+        pretty: bool,
+    ) -> Option<String> {
+        let db = "default";
+        let schemas = catalog.list_schemas(db).ok()?;
+        for table in catalog.list_all_tables(db).ok()? {
+            let schema = Self::schema_name_by_id(db, &schemas, table.schema_id);
+            let is = |name: &str| Self::constraint_oid(db, &schema, &table.name, name) == oid;
+            let column_list = |ids: &mut dyn Iterator<Item = nodus_catalog::ColumnId>| {
+                ids.filter_map(|id| table.columns.iter().find(|c| c.id == id))
+                    .map(|c| quote_ident(&c.name))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            for index in table.indexes.iter().filter(|i| i.unique) {
+                if is(&index.name) {
+                    let kind = if matches!(index.index_type, nodus_catalog::IndexType::Primary) {
+                        "PRIMARY KEY"
+                    } else {
+                        "UNIQUE"
+                    };
+                    let columns = column_list(&mut index.key_columns.iter().map(|k| k.column_id));
+                    return Some(format!("{kind} ({columns})"));
+                }
+            }
+            for column in table.columns.iter().filter(|c| !c.nullable) {
+                if is(&format!("{}_{}_not_null", table.name, column.name)) {
+                    return Some(format!("NOT NULL {}", quote_ident(&column.name)));
+                }
+            }
+            for (idx, constraint) in table.constraints.iter().enumerate() {
+                match constraint {
+                    nodus_catalog::TableConstraint::Check { name, expr } => {
+                        let name = name
+                            .clone()
+                            .unwrap_or_else(|| format!("{}_check_{}", table.name, idx + 1));
+                        if is(&name) {
+                            return Some(if pretty {
+                                format!("CHECK ({expr})")
+                            } else {
+                                format!("CHECK (({expr}))")
+                            });
+                        }
+                    }
+                    nodus_catalog::TableConstraint::ForeignKey {
+                        name,
+                        columns,
+                        foreign_table,
+                        referred_columns,
+                    } => {
+                        let name = name.clone().unwrap_or_else(|| {
+                            format!("{}_{}_fkey", table.name, columns.join("_"))
+                        });
+                        if is(&name) {
+                            let quote = |names: &[String]| {
+                                names
+                                    .iter()
+                                    .map(|n| quote_ident(n))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            };
+                            return Some(format!(
+                                "FOREIGN KEY ({}) REFERENCES {}({})",
+                                quote(columns),
+                                foreign_table,
+                                quote(referred_columns)
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        None
     }
 
     pub(crate) fn pg_collation_virtual_table(
@@ -1659,3 +2225,54 @@ impl MemExecutor {
         (cols, rows)
     }
 }
+
+/// An identifier as PostgreSQL prints it: quoted unless it is a plain
+/// lower-case name.
+fn quote_ident(name: &str) -> String {
+    let plain = name
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_lowercase() || c == '_')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+    if plain {
+        name.to_string()
+    } else {
+        format!("\"{}\"", name.replace('"', "\"\""))
+    }
+}
+
+/// `pg_class`'s own OID, the class of relations in `pg_depend`.
+const PG_CLASS_OID: i64 = 1259;
+
+/// The system catalogs' fixed OIDs, as `'pg_class'::regclass` gives them.
+const SYSTEM_CATALOG_OIDS: &[(&str, i64)] = &[
+    ("pg_class", PG_CLASS_OID),
+    ("pg_type", 1247),
+    ("pg_attribute", 1249),
+    ("pg_proc", 1255),
+    ("pg_database", 1262),
+    ("pg_tablespace", 1213),
+    ("pg_authid", 1260),
+    ("pg_namespace", 2615),
+    ("pg_constraint", 2606),
+    ("pg_index", 2610),
+    ("pg_inherits", 2611),
+    ("pg_language", 2612),
+    ("pg_opclass", 2616),
+    ("pg_operator", 2617),
+    ("pg_rewrite", 2618),
+    ("pg_trigger", 2620),
+    ("pg_am", 2601),
+    ("pg_attrdef", 2604),
+    ("pg_cast", 2605),
+    ("pg_depend", 2608),
+    ("pg_description", 2609),
+    ("pg_sequence", 2224),
+    ("pg_policy", 3256),
+    ("pg_statistic_ext", 3381),
+    ("pg_collation", 3456),
+    ("pg_extension", 3079),
+    ("pg_publication", 6104),
+];

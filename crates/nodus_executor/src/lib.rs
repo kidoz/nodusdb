@@ -479,6 +479,7 @@ impl MemExecutor {
             backend_pid,
             session_id: ctx.session_id.clone(),
             sequences: Some(self.sequences.clone()),
+            catalog: Some(self.catalog_reader.clone()),
         }
     }
 
@@ -913,7 +914,8 @@ impl Executor for MemExecutor {
         eval_error::reset();
         let result = self
             .execute_logical_inner(ctx, plan)
-            .and_then(|out| eval_error::check().map(|()| out));
+            .and_then(|out| eval_error::check().map(|()| out))
+            .map(|out| self.name_object_identifiers(out));
 
         if let Some(txn_id) = implicit_txn {
             self.active_txns.write().remove(&ctx.session_id);

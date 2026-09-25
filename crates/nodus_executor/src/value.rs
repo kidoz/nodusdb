@@ -81,6 +81,18 @@ pub(crate) fn restore_row(row: &mut [Value], columns: &[nodus_catalog::ColumnDes
     }
 }
 
+/// The object-identifier type (`regclass`, `regtype`, `regnamespace`) a
+/// declared type names, upper-cased without its schema.
+pub(crate) fn object_identifier_type(data_type: &str) -> Option<&'static str> {
+    let upper = data_type.trim().to_ascii_uppercase();
+    match upper.strip_prefix("PG_CATALOG.").unwrap_or(&upper) {
+        "REGCLASS" => Some("REGCLASS"),
+        "REGTYPE" => Some("REGTYPE"),
+        "REGNAMESPACE" => Some("REGNAMESPACE"),
+        _ => None,
+    }
+}
+
 /// Whether a declared type is `jsonb`.
 pub(crate) fn is_jsonb_type(data_type: &str) -> bool {
     data_type.trim().eq_ignore_ascii_case("jsonb")

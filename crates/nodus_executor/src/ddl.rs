@@ -86,6 +86,7 @@ impl MemExecutor {
             }
             anyhow::bail!("relation \"{}\" already exists", table_only);
         }
+        let constraints = name_check_constraints(table_only, &columns, constraints);
         // A `serial` or identity column's sequence, validated before anything
         // is created.
         let owned_sequences = columns
@@ -162,7 +163,7 @@ impl MemExecutor {
                 name: if primary {
                     format!("{}_pkey", table_only)
                 } else {
-                    format!("{}_{}_idx", name, col.name)
+                    format!("{table_only}_{}_key", col.name)
                 },
                 version: 1,
                 created_at: Utc::now(),
@@ -783,4 +784,52 @@ impl MemExecutor {
             })?;
         Ok(QueryOutput::tag("REVOKE"))
     }
+}
+
+/// Names each unnamed CHECK constraint as PostgreSQL does:
+/// `<table>_<column>_check` when it names one column, else `<table>_check`,
+/// numbered when the name is taken.
+fn name_check_constraints(
+    table: &str,
+    columns: &[ColumnDef],
+    constraints: Vec<nodus_catalog::TableConstraint>,
+) -> Vec<nodus_catalog::TableConstraint> {
+    use nodus_catalog::TableConstraint;
+    let mut taken: Vec<String> = constraints
+        .iter()
+        .filter_map(|c| match c {
+            TableConstraint::Check { name, .. } | TableConstraint::ForeignKey { name, .. } => {
+                name.clone()
+            }
+        })
+        .collect();
+    constraints
+        .into_iter()
+        .map(|constraint| match constraint {
+            TableConstraint::Check { name: None, expr } => {
+                let mut named: Vec<&str> = expr
+                    .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                    .filter(|word| columns.iter().any(|c| c.name == *word))
+                    .collect();
+                named.sort_unstable();
+                named.dedup();
+                let base = match named.as_slice() {
+                    [column] => format!("{table}_{column}_check"),
+                    _ => format!("{table}_check"),
+                };
+                let mut name = base.clone();
+                let mut n = 0;
+                while taken.contains(&name) {
+                    n += 1;
+                    name = format!("{base}{n}");
+                }
+                taken.push(name.clone());
+                TableConstraint::Check {
+                    name: Some(name),
+                    expr,
+                }
+            }
+            other => other,
+        })
+        .collect()
 }

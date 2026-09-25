@@ -82,6 +82,9 @@ pub(crate) fn is_known(name: &str) -> bool {
                 | "INET_SERVER_ADDR" | "INET_SERVER_PORT" | "INET_CLIENT_ADDR"
                 | "INET_CLIENT_PORT" | "OBJ_DESCRIPTION" | "COL_DESCRIPTION"
                 | "SHOBJ_DESCRIPTION" | "FORMAT_TYPE" | "PG_GET_EXPR"
+                | "PG_RELATION_IS_PUBLISHABLE" | "PG_GET_STATISTICSOBJDEF_COLUMNS"
+                | "PG_GET_INDEXDEF" | "PG_GET_CONSTRAINTDEF" | "__OBJECT_NAME__"
+                | "PG_GET_VIEWDEF"
                 // Sequences.
                 | "NEXTVAL" | "CURRVAL" | "LASTVAL" | "SETVAL" | "PG_GET_SERIAL_SEQUENCE"
                 | "__IDENTITY__"
@@ -246,6 +249,36 @@ pub(crate) fn call(name: &str, args: &[Value]) -> Value {
                 .join(", ")
         )),
     }
+}
+
+/// `(expr)` without the parentheses when they enclose all of it.
+fn unwrap_parens(expr: &str) -> Option<&str> {
+    let inner = expr.strip_prefix('(')?.strip_suffix(')')?;
+    let mut depth = 0i32;
+    let mut quoted = false;
+    for c in inner.chars() {
+        match c {
+            '\'' => quoted = !quoted,
+            '(' if !quoted => depth += 1,
+            ')' if !quoted => {
+                depth -= 1;
+                if depth < 0 {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+    }
+    (depth == 0).then_some(inner)
+}
+
+/// Text the catalog gives for an object, or NULL when there is none.
+fn catalog_text(
+    describe: impl FnOnce(&dyn nodus_catalog::CatalogReader) -> Option<String>,
+) -> Value {
+    session_env::with(|env| env.and_then(|e| e.catalog.clone()))
+        .and_then(|catalog| describe(catalog.as_ref()))
+        .map_or(Value::Null, Value::Text)
 }
 
 fn text(v: &Value) -> String {
@@ -1070,8 +1103,53 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
             Value::Null => Value::Null,
             oid => Value::Text(format_type(int(oid)?, int(arg(1)).filter(|m| *m >= 0))),
         },
-        // Expressions are stored as their SQL text.
-        "PG_GET_EXPR" if arity(2) || arity(3) => Value::Text(text(arg(0))),
+        // Expressions are stored as their SQL text; pretty-printed, without
+        // the parentheses around the whole of it.
+        "PG_GET_EXPR" if arity(2) || arity(3) => {
+            let expr = text(arg(0));
+            match (
+                arity(3) && matches!(arg(2), Value::Bool(true)),
+                unwrap_parens(&expr),
+            ) {
+                (true, Some(inner)) => Value::Text(inner.to_string()),
+                _ => Value::Text(expr),
+            }
+        }
+        "PG_GET_INDEXDEF" if arity(1) || arity(3) => {
+            let column = if arity(3) { int(arg(1))? } else { 0 };
+            let pretty = arity(3) && matches!(arg(2), Value::Bool(true));
+            catalog_text(|catalog| {
+                crate::MemExecutor::index_definition(catalog, int(arg(0))?, column, pretty)
+            })
+        }
+        // By OID or by (possibly qualified) name.
+        "PG_GET_VIEWDEF" if arity(1) || arity(2) => catalog_text(|catalog| {
+            let oid = match arg(0) {
+                Value::Text(name) if name.trim().parse::<i64>().is_err() => {
+                    crate::MemExecutor::relation_oid(catalog, name)?
+                }
+                other => int(other)?,
+            };
+            crate::MemExecutor::view_definition(catalog, oid)
+        }),
+        "__OBJECT_NAME__" if arity(2) => {
+            let oid = int(arg(0))?;
+            let kind = text(arg(1));
+            match catalog_text(|catalog| crate::MemExecutor::object_name(catalog, &kind, oid)) {
+                Value::Null => Value::Text(oid.to_string()),
+                name => name,
+            }
+        }
+        "PG_GET_CONSTRAINTDEF" if arity(1) || arity(2) => {
+            let pretty = arity(2) && matches!(arg(1), Value::Bool(true));
+            catalog_text(|catalog| {
+                crate::MemExecutor::constraint_definition(catalog, int(arg(0))?, pretty)
+            })
+        }
+        // Any table could be published (there are no publications).
+        "PG_RELATION_IS_PUBLISHABLE" if arity(1) => Value::Bool(true),
+        // There are no extended statistics objects.
+        "PG_GET_STATISTICSOBJDEF_COLUMNS" if arity(1) => Value::Null,
         name if crate::value::is_visibility_fn(name) && arity(1) => Value::Bool(true),
 
         // ---- UUIDs ------------------------------------------------------------------
@@ -1400,6 +1478,11 @@ fn timestamp(micros: i64, with_zone: bool) -> Value {
 }
 
 /// `format_type(oid, typmod)`: the SQL name of a type, with its modifier.
+/// A type's name by OID, as `regtype` prints it.
+pub(crate) fn format_type_name(oid: i64) -> String {
+    format_type(oid, None)
+}
+
 fn format_type(oid: i64, typmod: Option<i64>) -> String {
     let base = match oid {
         16 => "boolean",

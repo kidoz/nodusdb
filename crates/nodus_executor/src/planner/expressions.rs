@@ -225,6 +225,9 @@ pub(crate) fn try_cast(v: Value, data_type: &str) -> std::result::Result<Value, 
     if matches!(v, Value::Null) {
         return Ok(Value::Null);
     }
+    if let Some(kind) = crate::value::object_identifier_type(data_type) {
+        return crate::MemExecutor::object_identifier(v, kind);
+    }
     if let Some(element_type) = crate::value::array_element_type(data_type) {
         return match v {
             Value::Array(items) => items
@@ -686,10 +689,30 @@ pub(crate) fn lower_scalar(expr: &sqlparser::ast::Expr, params: &[Value]) -> Opt
             expr: inner,
             data_type,
             ..
-        } => Some(ScalarExpr::Cast {
-            expr: Box::new(lower_scalar(inner, params)?),
-            target: data_type.to_string(),
-        }),
+        } => {
+            let inner = lower_scalar(inner, params)?;
+            let target = data_type.to_string();
+            // An object identifier as text is the object's name
+            // (`c.oid::regclass::text`).
+            if let ScalarExpr::Cast { target: kind, .. } = &inner
+                && let Some(kind) = crate::value::object_identifier_type(kind)
+                && matches!(
+                    target
+                        .to_ascii_uppercase()
+                        .trim_start_matches("PG_CATALOG."),
+                    "TEXT" | "VARCHAR" | "NAME"
+                )
+            {
+                return Some(ScalarExpr::Function {
+                    name: "__OBJECT_NAME__".to_string(),
+                    args: vec![inner, ScalarExpr::Literal(Value::Text(kind.to_string()))],
+                });
+            }
+            Some(ScalarExpr::Cast {
+                expr: Box::new(inner),
+                target,
+            })
+        }
         Expr::IsNull(inner) => Some(ScalarExpr::IsNull {
             expr: Box::new(lower_scalar(inner, params)?),
             negated: false,

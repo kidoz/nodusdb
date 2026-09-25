@@ -185,6 +185,41 @@ impl MemExecutor {
         .to_string()
     }
 
+    /// A declared type's modifier as `pg_attribute.atttypmod` stores it:
+    /// `numeric(p,s)` packs precision and scale, `varchar(n)`/`char(n)` the
+    /// length, each offset by 4; -1 without one.
+    pub(crate) fn pg_type_modifier(data_type: &str) -> i64 {
+        let upper = data_type.trim().to_ascii_uppercase();
+        if upper.ends_with("[]") {
+            return -1;
+        }
+        let Some((base, rest)) = upper.split_once('(') else {
+            return -1;
+        };
+        let numbers: Vec<i64> = rest
+            .trim_end_matches(')')
+            .split(',')
+            .filter_map(|n| n.trim().parse().ok())
+            .collect();
+        match (base.trim(), numbers.as_slice()) {
+            ("NUMERIC" | "DECIMAL", [p]) => (p << 16) + 4,
+            ("NUMERIC" | "DECIMAL", [p, s]) => ((p << 16) | s) + 4,
+            ("VARCHAR" | "CHARACTER VARYING" | "CHAR" | "CHARACTER" | "BPCHAR", [n]) => n + 4,
+            _ => -1,
+        }
+    }
+
+    /// `pg_attribute.attstorage` for a declared type: fixed-width types are
+    /// stored plain, numeric in the main tuple, and varlena types extended.
+    pub(crate) fn pg_type_storage(data_type: &str) -> &'static str {
+        match Self::pg_type_oid(data_type) {
+            16 | 18 | 20 | 21 | 23 | 26 | 700 | 701 | 1082 | 1083 | 1114 | 1184 | 1186 | 1266
+            | 2950 => "p",
+            1700 => "m",
+            _ => "x",
+        }
+    }
+
     pub(crate) fn pg_type_length(data_type: &str) -> i64 {
         match Self::pg_type_oid(data_type) {
             16 => 1,
@@ -251,6 +286,11 @@ impl MemExecutor {
                 | "pg_rewrite"
                 | "pg_policy"
                 | "pg_trigger"
+                | "pg_statistic_ext"
+                | "pg_publication"
+                | "pg_publication_namespace"
+                | "pg_publication_rel"
+                | "pg_inherits"
         )
     }
 
