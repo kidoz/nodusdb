@@ -660,6 +660,7 @@ impl MemExecutor {
             "pg_operator" => Some(self.pg_operator_virtual_table(db_name)),
             "pg_cast" => Some(self.pg_cast_virtual_table()),
             "pg_locks" => Some(self.pg_locks_virtual_table(db_name)),
+            "pg_prepared_statements" => Some(self.pg_prepared_statements_virtual_table()),
             // The relations below exist so IDE/driver introspection
             // (DataGrip/pgjdbc) can join them without erroring. NodusDB does not
             // model these concepts yet, so they are presented with their real
@@ -1253,6 +1254,65 @@ impl MemExecutor {
                 ]
             })
             .collect();
+        (cols, rows)
+    }
+
+    /// `pg_prepared_statements`: the session's statements SQL `PREPARE` named.
+    pub(crate) fn pg_prepared_statements_virtual_table(
+        &self,
+    ) -> (Vec<ColumnDescriptor>, Vec<Vec<Value>>) {
+        let cols = Self::virtual_columns(&[
+            ("name", "TEXT"),
+            ("statement", "TEXT"),
+            ("prepare_time", "TIMESTAMPTZ"),
+            ("parameter_types", "TEXT[]"),
+            ("result_types", "TEXT[]"),
+            ("from_sql", "BOOL"),
+            ("generic_plans", "INT8"),
+            ("custom_plans", "INT8"),
+        ]);
+        let session = crate::session_env::with(|env| env.map(|e| e.session_id.clone()));
+        let prepared = self.prepared.lock();
+        let rows = session
+            .and_then(|s| prepared.get(&s))
+            .map(|statements| {
+                statements
+                    .iter()
+                    .map(|(name, p)| {
+                        let types = if p.declared_types.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" ({})", p.declared_types.join(", "))
+                        };
+                        vec![
+                            Value::Text(name.clone()),
+                            Value::Text(format!("PREPARE {name}{types} AS {};", p.statement)),
+                            chrono::DateTime::from_timestamp_micros(p.prepared_at).map_or(
+                                Value::Null,
+                                |dt| {
+                                    crate::datetime::Temporal::TimestampTz(dt.naive_utc())
+                                        .to_value()
+                                },
+                            ),
+                            Value::Array(
+                                p.param_types
+                                    .iter()
+                                    .map(|t| {
+                                        Value::Text(crate::functions::format_type_name(
+                                            crate::MemExecutor::pg_type_oid(t),
+                                        ))
+                                    })
+                                    .collect(),
+                            ),
+                            Value::Null,
+                            Value::Bool(true),
+                            Value::Int(0),
+                            Value::Int(p.executions),
+                        ]
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         (cols, rows)
     }
 

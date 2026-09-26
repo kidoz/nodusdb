@@ -353,6 +353,21 @@ pub struct MemExecutor {
     pub(crate) parameter_changes: parking_lot::Mutex<HashMap<String, Vec<(String, String)>>>,
     /// Per session, its temporary relations. See [`crate::temp_tables`].
     pub(crate) temp_relations: parking_lot::Mutex<HashMap<String, temp_tables::TempRelations>>,
+    /// Per session, the statements SQL `PREPARE` named.
+    pub(crate) prepared:
+        parking_lot::Mutex<HashMap<String, std::collections::BTreeMap<String, PreparedStatement>>>,
+}
+
+/// A statement SQL `PREPARE` keeps for its session.
+pub(crate) struct PreparedStatement {
+    pub(crate) statement: String,
+    /// The parameters' types, as declared or else as their use shows them,
+    /// and as declared (for the statement's text).
+    pub(crate) param_types: Vec<String>,
+    pub(crate) declared_types: Vec<String>,
+    /// When it was prepared, microseconds since the epoch.
+    pub(crate) prepared_at: i64,
+    pub(crate) executions: i64,
 }
 
 impl MemExecutor {
@@ -385,7 +400,14 @@ impl MemExecutor {
             session_resets: parking_lot::RwLock::new(HashMap::new()),
             parameter_changes: parking_lot::Mutex::new(HashMap::new()),
             temp_relations: parking_lot::Mutex::new(HashMap::new()),
+            prepared: parking_lot::Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Forgets the session state `DISCARD ALL` clears besides settings,
+    /// temporary relations, and sequence values: its prepared statements.
+    pub(crate) fn discard_session_state(&self, session_id: &str) {
+        self.prepared.lock().remove(session_id);
     }
 
     /// Raises a notice to the session running `ctx`'s statement.
@@ -1133,6 +1155,7 @@ impl Executor for MemExecutor {
         self.session_vars.write().remove(session_id);
         self.session_resets.write().remove(session_id);
         self.parameter_changes.lock().remove(session_id);
+        self.discard_session_state(session_id);
         self.notices.lock().remove(session_id);
         self.sequences.end_session(session_id);
     }
@@ -1180,6 +1203,8 @@ fn is_session_statement(plan: &LogicalPlan) -> bool {
             | LogicalPlan::ResetVariable { .. }
             | LogicalPlan::SetTransaction { .. }
             | LogicalPlan::Noop { .. }
+            | LogicalPlan::Prepare { .. }
+            | LogicalPlan::Deallocate { .. }
             | LogicalPlan::Discard { .. }
     )
 }

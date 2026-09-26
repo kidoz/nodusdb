@@ -912,8 +912,33 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
         Statement::Discard { object_type } => Ok(LogicalPlan::Discard {
             what: object_type.to_string().to_ascii_uppercase(),
         }),
-        Statement::Deallocate { .. } => Ok(LogicalPlan::Noop {
-            tag: "DEALLOCATE".to_string(),
+        Statement::Deallocate { name, .. } => Ok(LogicalPlan::Deallocate {
+            name: (!name.value.eq_ignore_ascii_case("all") || name.quote_style.is_some())
+                .then(|| name.value.clone()),
+        }),
+        Statement::Prepare {
+            name,
+            data_types,
+            statement,
+        } => Ok(LogicalPlan::Prepare {
+            name: name.value.clone(),
+            param_types: data_types.iter().map(|t| t.to_string()).collect(),
+            statement: statement.to_string(),
+        }),
+        Statement::Execute {
+            name: Some(name),
+            parameters,
+            immediate: false,
+            ..
+        } => Ok(LogicalPlan::Execute {
+            name: name.to_string(),
+            params: parameters
+                .iter()
+                .map(|p| {
+                    lower_scalar(p, params)
+                        .ok_or_else(|| anyhow::anyhow!("Unsupported expression in EXECUTE: {p}"))
+                })
+                .collect::<Result<_>>()?,
         }),
         Statement::AlterTable(alter_table) => {
             let table_name = alter_table.name.to_string();

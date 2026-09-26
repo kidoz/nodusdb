@@ -1137,6 +1137,22 @@ pub enum LogicalPlan {
     Discard {
         what: String,
     },
+    /// `PREPARE name [(types)] AS statement`: the statement's text, planned
+    /// when it is executed.
+    Prepare {
+        name: String,
+        param_types: Vec<String>,
+        statement: String,
+    },
+    /// `EXECUTE name [(parameters)]`.
+    Execute {
+        name: String,
+        params: Vec<ScalarExpr>,
+    },
+    /// `DEALLOCATE [PREPARE] name`, or `DEALLOCATE ALL` without one.
+    Deallocate {
+        name: Option<String>,
+    },
     SelectLiteral {
         /// `(column alias, value, optional SQL type hint)`. The hint (from a
         /// CAST) types the column even when the value is NULL.

@@ -1,0 +1,87 @@
+# SQL PREPARE, EXECUTE, and DEALLOCATE.
+statement ok
+CREATE TABLE ps (id int PRIMARY KEY, v text);
+
+statement ok
+INSERT INTO ps VALUES (1, 'a'), (2, 'b');
+
+statement ok
+PREPARE p1 (int) AS SELECT $1 + 1;
+
+query T
+EXECUTE p1(41);
+----
+42
+
+statement ok
+PREPARE p2 AS SELECT v FROM ps WHERE id = $1;
+
+query T
+EXECUTE p2(2);
+----
+b
+
+statement ok
+PREPARE p3 (int, text) AS INSERT INTO ps VALUES ($1, $2) RETURNING id, v;
+
+query TT
+EXECUTE p3(3, 'c');
+----
+3	c
+
+query T
+SELECT count(*) FROM ps;
+----
+3
+
+query TTT
+SELECT name, parameter_types, from_sql FROM pg_prepared_statements ORDER BY name;
+----
+p1	{integer}	t
+p2	{integer}	t
+p3	{integer,text}	t
+
+statement error
+PREPARE p1 AS SELECT 2;
+
+statement error
+EXECUTE nosuch;
+
+statement error
+EXECUTE p1(1, 2);
+
+statement ok
+DEALLOCATE p1;
+
+statement error
+EXECUTE p1(1);
+
+statement error
+DEALLOCATE nosuch;
+
+statement ok
+DEALLOCATE PREPARE p2;
+
+query T
+SELECT name FROM pg_prepared_statements ORDER BY name;
+----
+p3
+
+statement ok
+DEALLOCATE ALL;
+
+query T
+SELECT count(*) FROM pg_prepared_statements;
+----
+0
+
+statement ok
+PREPARE p4 AS SELECT 4;
+
+statement ok
+DISCARD ALL;
+
+query T
+SELECT count(*) FROM pg_prepared_statements;
+----
+0

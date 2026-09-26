@@ -375,6 +375,107 @@ impl MemExecutor {
         Ok(QueryOutput::tag("RELEASE"))
     }
 
+    /// `PREPARE`: keeps the statement for the session, by name.
+    pub(crate) fn exec_prepare(
+        &self,
+        ctx: &ExecutionContext,
+        name: String,
+        param_types: Vec<String>,
+        statement: String,
+    ) -> Result<QueryOutput> {
+        // Parameters without a declared type take the type their use shows.
+        let inferred = self
+            .infer_sql_parameters(ctx, &statement)
+            .unwrap_or_default();
+        let declared_types = param_types.clone();
+        let param_types: Vec<String> = (0..param_types.len().max(inferred.len()))
+            .map(|i| {
+                param_types
+                    .get(i)
+                    .cloned()
+                    .or_else(|| inferred.get(i).cloned().flatten())
+                    .unwrap_or_else(|| "text".to_string())
+            })
+            .collect();
+        let mut prepared = self.prepared.lock();
+        let session = prepared.entry(ctx.session_id.clone()).or_default();
+        if session.contains_key(&name) {
+            anyhow::bail!("prepared statement \"{name}\" already exists");
+        }
+        session.insert(
+            name,
+            crate::PreparedStatement {
+                statement,
+                param_types,
+                declared_types,
+                prepared_at: session_env::wall_micros(),
+                executions: 0,
+            },
+        );
+        Ok(QueryOutput::tag("PREPARE"))
+    }
+
+    /// `EXECUTE`: plans a prepared statement with the parameters (of its
+    /// declared types) and runs it.
+    pub(crate) fn exec_execute(
+        &self,
+        ctx: &ExecutionContext,
+        name: String,
+        params: Vec<ScalarExpr>,
+    ) -> Result<QueryOutput> {
+        let (statement, param_types) = {
+            let mut prepared = self.prepared.lock();
+            let found = prepared
+                .get_mut(&ctx.session_id)
+                .and_then(|session| session.get_mut(&name))
+                .ok_or_else(|| anyhow::anyhow!("prepared statement \"{name}\" does not exist"))?;
+            found.executions += 1;
+            (found.statement.clone(), found.param_types.clone())
+        };
+        if !param_types.is_empty() && params.len() != param_types.len() {
+            anyhow::bail!("wrong number of parameters for prepared statement \"{name}\"");
+        }
+        let mut values = Vec::with_capacity(params.len());
+        for (i, param) in params.iter().enumerate() {
+            let value = self.eval_expr(ctx, param, &[], &[]);
+            crate::eval_error::check()?;
+            values.push(match param_types.get(i) {
+                Some(ty) => crate::planner::try_cast(value, ty).map_err(|e| anyhow::anyhow!(e))?,
+                None => value,
+            });
+        }
+        let statements = nodus_sql::parse_sql(&statement)?;
+        let stmt = statements
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("prepared statement \"{name}\" is empty"))?;
+        let plan = crate::planner::plan_statement(stmt, &values)?;
+        self.execute_logical_inner(ctx, plan)
+    }
+
+    /// `DEALLOCATE name` / `DEALLOCATE ALL`.
+    pub(crate) fn exec_deallocate(
+        &self,
+        ctx: &ExecutionContext,
+        name: Option<String>,
+    ) -> Result<QueryOutput> {
+        let mut prepared = self.prepared.lock();
+        match name {
+            Some(name) => {
+                let removed = prepared
+                    .get_mut(&ctx.session_id)
+                    .and_then(|session| session.remove(&name));
+                if removed.is_none() {
+                    anyhow::bail!("prepared statement \"{name}\" does not exist");
+                }
+                Ok(QueryOutput::tag("DEALLOCATE"))
+            }
+            None => {
+                prepared.remove(&ctx.session_id);
+                Ok(QueryOutput::tag("DEALLOCATE ALL"))
+            }
+        }
+    }
+
     /// `SHOW name` (and `SHOW ALL`): the session's value, else the default;
     /// the transaction's access mode and isolation level from it.
     pub(crate) fn exec_show_variable(

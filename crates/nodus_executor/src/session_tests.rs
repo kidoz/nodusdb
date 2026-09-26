@@ -1,5 +1,6 @@
 //! Session state across statements and between sessions: transaction
-//! modes, settings, temporary tables, and the time zone, driven through SQL.
+//! modes, settings, temporary tables, prepared statements, and the time
+//! zone, driven through SQL.
 
 use super::*;
 use crate::dml_join_tests::rows;
@@ -96,6 +97,24 @@ fn settings_follow_their_transaction() {
         changes.last(),
         Some(&("application_name".to_string(), "psql".to_string()))
     );
+}
+
+#[test]
+fn prepared_statements_run_with_their_parameters() {
+    let (exec, sql) = sessions();
+    sql("a", "CREATE TABLE t (id INT, v TEXT)").unwrap();
+    sql(
+        "a",
+        "PREPARE ins (int, text) AS INSERT INTO t VALUES ($1, $2)",
+    )
+    .unwrap();
+    sql("a", "EXECUTE ins(1, 'one')").unwrap();
+    sql("a", "PREPARE get AS SELECT v FROM t WHERE id = $1").unwrap();
+    assert_eq!(rows(&sql("a", "EXECUTE get(1)").unwrap()), vec!["one"]);
+    // Another session has its own statements.
+    assert!(sql("b", "EXECUTE get(1)").is_err());
+    exec.end_session("a");
+    assert!(sql("a", "EXECUTE get(1)").is_err());
 }
 
 #[test]

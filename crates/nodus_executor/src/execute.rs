@@ -59,6 +59,13 @@ impl MemExecutor {
                 Ok(out)
             }
             LogicalPlan::Discard { what } => self.exec_discard(ctx, what),
+            LogicalPlan::Prepare {
+                name,
+                param_types,
+                statement,
+            } => self.exec_prepare(ctx, name, param_types, statement),
+            LogicalPlan::Execute { name, params } => self.exec_execute(ctx, name, params),
+            LogicalPlan::Deallocate { name } => self.exec_deallocate(ctx, name),
             LogicalPlan::CreateView {
                 name,
                 query,

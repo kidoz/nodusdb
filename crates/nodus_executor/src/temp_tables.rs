@@ -164,6 +164,7 @@ impl MemExecutor {
                 self.exec_reset_variable(ctx, None)?;
                 self.drop_temp_relations(&ctx.session_id);
                 self.sequences.end_session(&ctx.session_id);
+                self.discard_session_state(&ctx.session_id);
             }
             "TEMP" => self.drop_temp_relations(&ctx.session_id),
             "SEQUENCES" => self.sequences.end_session(&ctx.session_id),
