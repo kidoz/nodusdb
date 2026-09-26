@@ -2,6 +2,7 @@
 //! table-level CHECK and foreign-key validation, evaluated against the table's
 //! current rows.
 
+use crate::error_fields::DbError;
 use crate::{
     ExecutionContext, MemExecutor, Value, parse_filter_expr, parse_object_name, render,
     values_equal,
@@ -48,7 +49,12 @@ impl MemExecutor {
                 continue;
             }
             if pk == new_pk {
-                anyhow::bail!("Unique constraint violation on primary key");
+                let name = tbl
+                    .indexes
+                    .iter()
+                    .find(|i| i.index_type == nodus_catalog::IndexType::Primary)
+                    .map_or_else(|| format!("{}_pkey", tbl.name), |i| i.name.clone());
+                return Err(self.duplicate_key(tbl, &name, &pk_positions, new_row));
             }
             for (idx_name, positions) in &unique_keys {
                 if let (Some(a), Some(b)) = (
@@ -56,7 +62,7 @@ impl MemExecutor {
                     key_tuple(new_row, positions),
                 ) && a.iter().zip(&b).all(|(x, y)| values_equal(x, y))
                 {
-                    anyhow::bail!("Unique constraint violation on index '{}'", idx_name);
+                    return Err(self.duplicate_key(tbl, idx_name, positions, new_row));
                 }
             }
         }
@@ -92,16 +98,18 @@ impl MemExecutor {
                     let result =
                         self.eval_filter(ctx, new_row, col_names, &tbl.columns, Some(&filter));
                     if result == Some(false) {
-                        match name {
-                            Some(name) => anyhow::bail!(
-                                "new row for relation \"{}\" violates check constraint \"{name}\"",
-                                tbl.name
-                            ),
-                            None => anyhow::bail!(
-                                "new row for relation \"{}\" violates check constraint",
-                                tbl.name
-                            ),
-                        }
+                        let name = name
+                            .clone()
+                            .unwrap_or_else(|| format!("{}_check", tbl.name));
+                        return Err(DbError::new(format!(
+                            "new row for relation \"{}\" violates check constraint \"{name}\"",
+                            tbl.name
+                        ))
+                        .detail(failing_row(new_row))
+                        .schema(self.schema_name_of(tbl))
+                        .table(&tbl.name)
+                        .constraint(&name)
+                        .into());
                     }
                 }
                 nodus_catalog::TableConstraint::ForeignKey {
@@ -170,6 +178,85 @@ impl MemExecutor {
         }
         Ok(())
     }
+}
+
+impl MemExecutor {
+    /// The error for a row whose key `positions` duplicates another's under
+    /// unique constraint `name`.
+    fn duplicate_key(
+        &self,
+        tbl: &nodus_catalog::TableDescriptor,
+        name: &str,
+        positions: &[usize],
+        row: &[Value],
+    ) -> anyhow::Error {
+        let columns: Vec<&str> = positions
+            .iter()
+            .map(|&p| tbl.columns[p].name.as_str())
+            .collect();
+        let values: Vec<String> = positions
+            .iter()
+            .map(|&p| row.get(p).map(render).unwrap_or_default())
+            .collect();
+        DbError::new(format!(
+            "duplicate key value violates unique constraint \"{name}\""
+        ))
+        .detail(format!(
+            "Key ({})=({}) already exists.",
+            columns.join(", "),
+            values.join(", ")
+        ))
+        .schema(self.schema_name_of(tbl))
+        .table(&tbl.name)
+        .constraint(name)
+        .into()
+    }
+
+    /// Rejects `row` when it has NULL in a NOT NULL column of `tbl`.
+    pub(crate) fn check_not_null(
+        &self,
+        tbl: &nodus_catalog::TableDescriptor,
+        row: &[Value],
+    ) -> Result<()> {
+        match tbl
+            .columns
+            .iter()
+            .zip(row)
+            .find(|(c, v)| !c.nullable && **v == Value::Null)
+        {
+            Some((column, _)) => Err(DbError::new(format!(
+                "null value in column \"{}\" of relation \"{}\" violates not-null constraint",
+                column.name, tbl.name
+            ))
+            .detail(failing_row(row))
+            .schema(self.schema_name_of(tbl))
+            .table(&tbl.name)
+            .column(&column.name)
+            .into()),
+            None => Ok(()),
+        }
+    }
+
+    /// The name of the schema `table` is in.
+    pub(crate) fn schema_name_of(&self, table: &nodus_catalog::TableDescriptor) -> String {
+        self.catalog_reader
+            .get_schema_by_id(table.schema_id)
+            .map(|s| s.name)
+            .unwrap_or_else(|_| "public".to_string())
+    }
+}
+
+/// A rejected row as PostgreSQL's DETAIL shows it: `Failing row contains
+/// (1, null, x).`
+fn failing_row(row: &[Value]) -> String {
+    let values: Vec<String> = row
+        .iter()
+        .map(|v| match v {
+            Value::Null => "null".to_string(),
+            v => render(v),
+        })
+        .collect();
+    format!("Failing row contains ({}).", values.join(", "))
 }
 
 /// A row's values at `positions`, or `None` if any is NULL: a key containing

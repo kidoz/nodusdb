@@ -56,7 +56,7 @@ async fn test_pg18_not_null_unique() {
         .unwrap_err();
     let db_err = err.as_db_error().expect("Expected DbError");
     assert!(
-        db_err.message().contains("cannot be NULL") || db_err.message().contains("NOT NULL"),
+        db_err.message().contains("violates not-null constraint"),
         "Expected NOT NULL error, got: {}",
         db_err.message()
     );
@@ -68,10 +68,9 @@ async fn test_pg18_not_null_unique() {
         .unwrap_err();
     let db_err = err.as_db_error().expect("Expected DbError");
     assert!(
-        db_err.message().contains("Unique constraint violation")
-            || db_err.message().contains("UNIQUE")
-            || db_err.message().contains("Duplicate")
-            || db_err.message().contains("conflict"),
+        db_err
+            .message()
+            .starts_with("duplicate key value violates unique constraint"),
         "Expected UNIQUE error, got: {}",
         db_err.message()
     );

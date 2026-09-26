@@ -36,6 +36,26 @@ impl DbError {
     pub(crate) fn into_text(self) -> String {
         self.text
     }
+
+    pub(crate) fn detail(self, detail: impl AsRef<str>) -> Self {
+        self.field("detail", detail)
+    }
+
+    pub(crate) fn schema(self, schema: impl AsRef<str>) -> Self {
+        self.field("schema", schema)
+    }
+
+    pub(crate) fn table(self, table: impl AsRef<str>) -> Self {
+        self.field("table", table)
+    }
+
+    pub(crate) fn column(self, column: impl AsRef<str>) -> Self {
+        self.field("column", column)
+    }
+
+    pub(crate) fn constraint(self, constraint: impl AsRef<str>) -> Self {
+        self.field("constraint", constraint)
+    }
 }
 
 impl From<DbError> for anyhow::Error {
@@ -65,14 +85,21 @@ mod tests {
 
     #[test]
     fn fields_travel_after_the_message() {
-        let notice = DbError::new("relation \"t\" already exists, skipping")
-            .code("42P07")
-            .into_text();
+        let error: anyhow::Error = DbError::new("duplicate key")
+            .detail("Key (id)=(1) already exists.")
+            .table("t")
+            .constraint("t_pkey")
+            .into();
+        let text = error.to_string();
+        assert_eq!(error_message(&text), "duplicate key");
         assert_eq!(
-            error_message(&notice),
-            "relation \"t\" already exists, skipping"
+            error_fields(&text),
+            [
+                ("detail", "Key (id)=(1) already exists."),
+                ("table", "t"),
+                ("constraint", "t_pkey")
+            ]
         );
-        assert_eq!(error_fields(&notice), [("code", "42P07")]);
         assert_eq!(error_message("plain"), "plain");
         assert!(error_fields("plain").is_empty());
     }

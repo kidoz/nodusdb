@@ -56,9 +56,13 @@ pub(crate) fn sqlstate_for_execution_error(err_str: &str) -> &'static str {
     } else if err_str.contains("cannot affect row a second time") {
         "21000" // cardinality_violation
     // Integrity-constraint violations (class 23).
-    } else if err_str.contains("Unique constraint violation") {
+    } else if err_str.contains("Unique constraint violation")
+        || err_str.starts_with("duplicate key value violates unique constraint")
+    {
         "23505" // unique_violation
-    } else if err_str.contains("cannot be NULL") {
+    } else if err_str.contains("cannot be NULL")
+        || err_str.ends_with("violates not-null constraint")
+    {
         "23502" // not_null_violation
     } else if err_str.contains("violates foreign key constraint") {
         "23503" // foreign_key_violation

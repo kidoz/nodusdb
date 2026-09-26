@@ -116,7 +116,7 @@ database reports the conflicts rather than duplicating data:
    "error":"relation \"city\" already exists",
    "statement":"CREATE TABLE public.city (id INTEGER NOT NULL, name TEXT NOT NULL, country TEXT, CONSTRAINT city_pkey PRIMARY KEY (id))"},
   {"kind":"insert","table":"public.city",
-   "error":"Unique constraint violation on primary key",
+   "error":"duplicate key value violates unique constraint \"city_pkey\"",
    "statement":"INSERT INTO public.city VALUES (1, 'Berlin', 'DE')"}
 ]}
 ```

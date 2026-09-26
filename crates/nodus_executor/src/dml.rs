@@ -508,11 +508,7 @@ impl MemExecutor {
                 .map(|(i, c)| crate::value::coerce_for_column(&raw[i], &c.data_type))
                 .collect();
             Self::compute_generated(&tbl, &mut row, &col_names);
-            for (c, val) in tbl.columns.iter().zip(&row) {
-                if !c.nullable && *val == Value::Null {
-                    anyhow::bail!("Column {} cannot be NULL", c.name);
-                }
-            }
+            self.check_not_null(&tbl, &row)?;
 
             if let Some(clause) = &on_conflict
                 && let Some((existing_key, existing_row)) =
@@ -1002,11 +998,7 @@ impl MemExecutor {
         }
         let col_names: Vec<String> = tbl.columns.iter().map(|c| c.name.clone()).collect();
         Self::compute_generated(tbl, &mut row, &col_names);
-        for (c, val) in tbl.columns.iter().zip(&row) {
-            if !c.nullable && *val == Value::Null {
-                anyhow::bail!("Column {} cannot be NULL", c.name);
-            }
-        }
+        self.check_not_null(tbl, &row)?;
         Ok(row)
     }
 

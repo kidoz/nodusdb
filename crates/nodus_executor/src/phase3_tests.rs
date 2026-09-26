@@ -326,7 +326,7 @@ fn test_unique_constraints() {
     assert!(
         res.unwrap_err()
             .to_string()
-            .contains("Unique constraint violation")
+            .starts_with("duplicate key value violates unique constraint")
     );
 
     let res2 = exec.execute_logical(
