@@ -43,6 +43,162 @@ pub(crate) fn compute_aggregate(
     }
 }
 
+/// A value as a `double precision`, for the statistics aggregates.
+fn float_of(value: &Value) -> Option<f64> {
+    match value {
+        Value::Int(i) => Some(*i as f64),
+        Value::Float(f) => Some(*f),
+        Value::Numeric(d) => Some(crate::value::decimal_to_f64(d)),
+        _ => None,
+    }
+}
+
+fn no_such_function(op: &AggregateOp, values: &[&Value]) -> Value {
+    crate::eval_error::raise(format!(
+        "function {}({}) does not exist",
+        op.sql_name(),
+        values
+            .iter()
+            .map(|v| crate::value::value_type_name(v))
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
+}
+
+/// `stddev`/`variance` and their population forms. Integers and numerics
+/// are exact, with PostgreSQL's result scale; floats accumulate as
+/// PostgreSQL's do (Youngs-Cramer), so the last digits agree.
+fn spread(op: &AggregateOp, values: Vec<&Value>) -> Value {
+    use rust_decimal::Decimal;
+    let sample = matches!(op, AggregateOp::StddevSamp | AggregateOp::VarSamp);
+    let root = matches!(op, AggregateOp::StddevSamp | AggregateOp::StddevPop);
+    let n = values.len();
+    if n == 0 || (sample && n < 2) {
+        return Value::Null;
+    }
+    if values.iter().any(|v| matches!(v, Value::Float(_))) {
+        let (mut count, mut sum, mut squares) = (0f64, 0f64, 0f64);
+        for value in &values {
+            let Some(x) = float_of(value) else {
+                return no_such_function(op, &[value]);
+            };
+            count += 1.0;
+            sum += x;
+            if count > 1.0 {
+                let t = x * count - sum;
+                squares += t * t / (count * (count - 1.0));
+            }
+        }
+        let variance = squares / if sample { count - 1.0 } else { count };
+        return Value::Float(if root { variance.sqrt() } else { variance });
+    }
+    let (mut sum, mut squares) = (Decimal::ZERO, Decimal::ZERO);
+    for value in &values {
+        let x = match value {
+            Value::Int(i) => Decimal::from(*i),
+            Value::Numeric(d) => *d,
+            other => return no_such_function(op, &[other]),
+        };
+        match (
+            sum.checked_add(x),
+            x.checked_mul(x).and_then(|sq| squares.checked_add(sq)),
+        ) {
+            (Some(s), Some(q)) => (sum, squares) = (s, q),
+            _ => return crate::eval_error::raise("value overflows numeric format"),
+        }
+    }
+    let count = Decimal::from(n as i64);
+    // No spread at all (or rounding below it) is an exact zero.
+    let numerator = match count
+        .checked_mul(squares)
+        .and_then(|a| a.checked_sub(sum * sum))
+    {
+        Some(v) if v.is_sign_negative() || v.is_zero() => return Value::Numeric(Decimal::ZERO),
+        Some(v) => v,
+        None => return crate::eval_error::raise("value overflows numeric format"),
+    };
+    let denominator = count * if sample { count - Decimal::ONE } else { count };
+    match crate::planner::numeric_div(numerator, denominator) {
+        Value::Numeric(variance) if root => {
+            decimal_sqrt(variance, variance.scale()).map_or(Value::Null, Value::Numeric)
+        }
+        other => other,
+    }
+}
+
+/// The square root of a non-negative numeric, rounded to `scale` digits.
+fn decimal_sqrt(value: rust_decimal::Decimal, scale: u32) -> Option<rust_decimal::Decimal> {
+    use rust_decimal::Decimal;
+    use rust_decimal::prelude::ToPrimitive;
+    if value.is_zero() {
+        return Some(Decimal::new(0, scale));
+    }
+    let mut x = Decimal::from_f64_retain(value.to_f64()?.sqrt())?;
+    for _ in 0..64 {
+        let next = (x + value.checked_div(x)?) / Decimal::TWO;
+        if next == x {
+            break;
+        }
+        x = next;
+    }
+    let mut root =
+        x.round_dp_with_strategy(scale, rust_decimal::RoundingStrategy::MidpointAwayFromZero);
+    root.rescale(scale);
+    Some(root)
+}
+
+/// `corr`, `covar_*`, and `regr_*` over (y, x) pairs, accumulated as
+/// PostgreSQL does (Youngs-Cramer), so the results agree to the last digit.
+fn regression(op: &AggregateOp, inputs: &[(Value, Vec<Value>)]) -> Value {
+    let (mut n, mut sx, mut sy, mut sxx, mut syy, mut sxy) = (0f64, 0f64, 0f64, 0f64, 0f64, 0f64);
+    for (y, extra) in inputs {
+        let x = extra.first().unwrap_or(&Value::Null);
+        if matches!(y, Value::Null) || matches!(x, Value::Null) {
+            continue;
+        }
+        let (Some(y), Some(x)) = (float_of(y), float_of(x)) else {
+            return no_such_function(op, &[y, x]);
+        };
+        n += 1.0;
+        sx += x;
+        sy += y;
+        if n > 1.0 {
+            let (tx, ty) = (x * n - sx, y * n - sy);
+            let scale = 1.0 / (n * (n - 1.0));
+            sxx += tx * tx * scale;
+            syy += ty * ty * scale;
+            sxy += tx * ty * scale;
+        }
+    }
+    if *op == AggregateOp::RegrCount {
+        return Value::Int(n as i64);
+    }
+    if n < 1.0 {
+        return Value::Null;
+    }
+    let float = |v: f64| Value::Float(v);
+    match op {
+        AggregateOp::RegrSxx => float(sxx),
+        AggregateOp::RegrSyy => float(syy),
+        AggregateOp::RegrSxy => float(sxy),
+        AggregateOp::RegrAvgX => float(sx / n),
+        AggregateOp::RegrAvgY => float(sy / n),
+        AggregateOp::CovarPop => float(sxy / n),
+        AggregateOp::CovarSamp if n < 2.0 => Value::Null,
+        AggregateOp::CovarSamp => float(sxy / (n - 1.0)),
+        AggregateOp::Corr if sxx == 0.0 || syy == 0.0 => Value::Null,
+        AggregateOp::Corr => float(sxy / (sxx * syy).sqrt()),
+        AggregateOp::RegrR2 if sxx == 0.0 => Value::Null,
+        AggregateOp::RegrR2 if syy == 0.0 => float(1.0),
+        AggregateOp::RegrR2 => float((sxy * sxy) / (sxx * syy)),
+        AggregateOp::RegrSlope if sxx == 0.0 => Value::Null,
+        AggregateOp::RegrSlope => float(sxy / sxx),
+        AggregateOp::RegrIntercept if sxx == 0.0 => Value::Null,
+        AggregateOp::RegrIntercept => float((sy - sx * sxy / sxx) / n),
+        _ => Value::Null,
+    }
+}
+
 /// Parses a HAVING predicate left-hand side: an aggregate key like `SUM(amount)`
 /// or `COUNT(*)`, otherwise `None` (a plain group column).
 pub(crate) fn parse_aggregate_key(key: &str) -> Option<(AggregateOp, String)> {
@@ -202,35 +358,21 @@ pub(crate) fn aggregate_inputs(op: &AggregateOp, inputs: &[(Value, Vec<Value>)])
         AggregateOp::StddevSamp
         | AggregateOp::StddevPop
         | AggregateOp::VarSamp
-        | AggregateOp::VarPop => {
-            let mut nums = Vec::new();
-            for value in non_null() {
-                match value {
-                    Value::Int(i) => nums.push(*i as f64),
-                    Value::Float(f) => nums.push(*f),
-                    other => {
-                        return crate::eval_error::raise(format!(
-                            "function {}({}) does not exist",
-                            op.sql_name(),
-                            crate::value::value_type_name(other)
-                        ));
-                    }
-                }
-            }
-            let sample = matches!(op, AggregateOp::StddevSamp | AggregateOp::VarSamp);
-            let n = nums.len() as f64;
-            if nums.is_empty() || (sample && nums.len() < 2) {
-                return Value::Null;
-            }
-            let mean = nums.iter().sum::<f64>() / n;
-            let squares = nums.iter().map(|x| (x - mean) * (x - mean)).sum::<f64>();
-            let variance = squares / if sample { n - 1.0 } else { n };
-            Value::Float(match op {
-                AggregateOp::StddevSamp | AggregateOp::StddevPop => variance.sqrt(),
-                _ => variance,
-            })
-        }
-        AggregateOp::BitAnd | AggregateOp::BitOr => {
+        | AggregateOp::VarPop => spread(op, non_null().collect()),
+        AggregateOp::Corr
+        | AggregateOp::CovarPop
+        | AggregateOp::CovarSamp
+        | AggregateOp::RegrSlope
+        | AggregateOp::RegrIntercept
+        | AggregateOp::RegrCount
+        | AggregateOp::RegrR2
+        | AggregateOp::RegrAvgX
+        | AggregateOp::RegrAvgY
+        | AggregateOp::RegrSxx
+        | AggregateOp::RegrSyy
+        | AggregateOp::RegrSxy => regression(op, inputs),
+        AggregateOp::AnyValue => non_null().next().cloned().unwrap_or(Value::Null),
+        AggregateOp::BitAnd | AggregateOp::BitOr | AggregateOp::BitXor => {
             let mut result: Option<i64> = None;
             for value in non_null() {
                 let Value::Int(i) = value else {
@@ -242,6 +384,7 @@ pub(crate) fn aggregate_inputs(op: &AggregateOp, inputs: &[(Value, Vec<Value>)])
                 };
                 result = Some(match (op, result) {
                     (AggregateOp::BitAnd, Some(acc)) => acc & i,
+                    (AggregateOp::BitXor, Some(acc)) => acc ^ i,
                     (_, Some(acc)) => acc | i,
                     (_, None) => *i,
                 });
@@ -590,5 +733,64 @@ pub(crate) fn eval_having(
         }
         // Shapes the planner never produces for HAVING must not admit groups.
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ints(values: &[i64]) -> Vec<Value> {
+        values.iter().map(|v| Value::Int(*v)).collect()
+    }
+
+    fn numeric(text: &str) -> Value {
+        Value::Numeric(text.parse().unwrap())
+    }
+
+    #[test]
+    fn spread_is_exact_for_integers_and_numerics() {
+        let qty = ints(&[10, 5, 7, 3, 7, 1, 2]);
+        let refs: Vec<&Value> = qty.iter().collect();
+        assert_eq!(
+            spread(&AggregateOp::VarPop, refs.clone()),
+            numeric("8.8571428571428571")
+        );
+        assert_eq!(
+            spread(&AggregateOp::StddevSamp, refs),
+            numeric("3.2145502536643183")
+        );
+        // A single value has no spread: an exact zero, or none for a sample.
+        let one = [Value::Int(4)];
+        assert_eq!(
+            spread(&AggregateOp::VarPop, one.iter().collect()),
+            numeric("0")
+        );
+        assert_eq!(
+            spread(&AggregateOp::VarSamp, one.iter().collect()),
+            Value::Null
+        );
+        assert_eq!(
+            decimal_sqrt("2".parse().unwrap(), 10),
+            Some("1.4142135624".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn regressions_follow_youngs_cramer() {
+        let pairs: Vec<(Value, Vec<Value>)> = [(1, 2), (2, 4), (3, 6)]
+            .iter()
+            .map(|(y, x)| (Value::Int(*y), vec![Value::Int(*x)]))
+            .collect();
+        assert_eq!(
+            regression(&AggregateOp::RegrSlope, &pairs),
+            Value::Float(0.5)
+        );
+        assert_eq!(regression(&AggregateOp::Corr, &pairs), Value::Float(1.0));
+        assert_eq!(regression(&AggregateOp::RegrCount, &pairs), Value::Int(3));
+        assert_eq!(
+            regression(&AggregateOp::CovarSamp, &pairs[..1]),
+            Value::Null
+        );
     }
 }

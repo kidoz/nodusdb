@@ -231,6 +231,21 @@ pub enum AggregateOp {
     VarPop,
     BitAnd,
     BitOr,
+    /// `corr(y, x)` and the other statistics of (y, x) pairs.
+    Corr,
+    CovarPop,
+    CovarSamp,
+    RegrSlope,
+    RegrIntercept,
+    RegrCount,
+    RegrR2,
+    RegrAvgX,
+    RegrAvgY,
+    RegrSxx,
+    RegrSyy,
+    RegrSxy,
+    BitXor,
+    AnyValue,
 }
 
 impl AggregateOp {
@@ -256,13 +271,41 @@ impl AggregateOp {
             AggregateOp::VarPop => "var_pop",
             AggregateOp::BitAnd => "bit_and",
             AggregateOp::BitOr => "bit_or",
+            AggregateOp::Corr => "corr",
+            AggregateOp::CovarPop => "covar_pop",
+            AggregateOp::CovarSamp => "covar_samp",
+            AggregateOp::RegrSlope => "regr_slope",
+            AggregateOp::RegrIntercept => "regr_intercept",
+            AggregateOp::RegrCount => "regr_count",
+            AggregateOp::RegrR2 => "regr_r2",
+            AggregateOp::RegrAvgX => "regr_avgx",
+            AggregateOp::RegrAvgY => "regr_avgy",
+            AggregateOp::RegrSxx => "regr_sxx",
+            AggregateOp::RegrSyy => "regr_syy",
+            AggregateOp::RegrSxy => "regr_sxy",
+            AggregateOp::BitXor => "bit_xor",
+            AggregateOp::AnyValue => "any_value",
         }
     }
 
     /// How many arguments the aggregate takes (`count(*)` counts as one).
     pub fn arity(&self) -> usize {
         match self {
-            AggregateOp::StringAgg | AggregateOp::JsonObjectAgg | AggregateOp::JsonbObjectAgg => 2,
+            AggregateOp::StringAgg
+            | AggregateOp::JsonObjectAgg
+            | AggregateOp::JsonbObjectAgg
+            | AggregateOp::Corr
+            | AggregateOp::CovarPop
+            | AggregateOp::CovarSamp
+            | AggregateOp::RegrSlope
+            | AggregateOp::RegrIntercept
+            | AggregateOp::RegrCount
+            | AggregateOp::RegrR2
+            | AggregateOp::RegrAvgX
+            | AggregateOp::RegrAvgY
+            | AggregateOp::RegrSxx
+            | AggregateOp::RegrSyy
+            | AggregateOp::RegrSxy => 2,
             _ => 1,
         }
     }

@@ -1024,8 +1024,9 @@ pub(crate) fn compare(a: &Value, b: &Value) -> std::cmp::Ordering {
 
 /// A decimal as the nearest float.
 pub(crate) fn decimal_to_f64(d: &rust_decimal::Decimal) -> f64 {
-    use rust_decimal::prelude::ToPrimitive;
-    d.to_f64().unwrap_or(f64::NAN)
+    // Read from the digits, as PostgreSQL converts: the nearest double
+    // (arithmetic on the parts can be a unit in the last place off).
+    d.to_string().parse().unwrap_or(f64::NAN)
 }
 
 /// SQL value equality, defined as `compare(a, b) == Equal` so ordering and

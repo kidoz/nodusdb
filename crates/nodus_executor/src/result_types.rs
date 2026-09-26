@@ -28,7 +28,20 @@ fn aggregate_type(op: &AggregateOp, input: Option<String>) -> Option<String> {
         AggregateOp::BoolAnd | AggregateOp::BoolOr => Some("BOOLEAN".into()),
         AggregateOp::JsonAgg | AggregateOp::JsonObjectAgg => Some("JSON".into()),
         AggregateOp::JsonbAgg | AggregateOp::JsonbObjectAgg => Some("JSONB".into()),
-        AggregateOp::BitAnd | AggregateOp::BitOr => input,
+        AggregateOp::BitAnd | AggregateOp::BitOr | AggregateOp::BitXor => input,
+        AggregateOp::AnyValue => input,
+        AggregateOp::RegrCount => Some("BIGINT".into()),
+        AggregateOp::Corr
+        | AggregateOp::CovarPop
+        | AggregateOp::CovarSamp
+        | AggregateOp::RegrSlope
+        | AggregateOp::RegrIntercept
+        | AggregateOp::RegrR2
+        | AggregateOp::RegrAvgX
+        | AggregateOp::RegrAvgY
+        | AggregateOp::RegrSxx
+        | AggregateOp::RegrSyy
+        | AggregateOp::RegrSxy => Some("DOUBLE PRECISION".into()),
     }
 }
 
