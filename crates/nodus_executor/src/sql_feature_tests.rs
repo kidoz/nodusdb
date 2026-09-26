@@ -1,6 +1,6 @@
 //! Set-returning functions in select lists, RETURNING expressions, JSON layouts
 //! and whole-row references, `COMMENT ON`, column renames, grants to `PUBLIC`,
-//! and relation sizes, driven through SQL.
+//! relation sizes, and window `FILTER`, driven through SQL.
 
 use super::*;
 use crate::dml_join_tests::{rows, session};
@@ -236,4 +236,20 @@ fn relation_sizes_count_stored_pages() {
     assert_eq!(value(&sql("SELECT pg_relation_size(0)").unwrap()), "");
     let err = sql("SELECT pg_table_size('nope')").unwrap_err();
     assert_eq!(err.to_string(), "relation \"nope\" does not exist");
+}
+
+#[test]
+fn window_filter_aggregates_the_rows_it_accepts() {
+    let sql = session();
+    sql("CREATE TABLE t (id INT PRIMARY KEY, n INT)").unwrap();
+    sql("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)").unwrap();
+    let out = sql("SELECT id, count(*) FILTER (WHERE n > 15) OVER (), \
+         sum(n) FILTER (WHERE id <> 2) OVER (ORDER BY id) FROM t")
+    .unwrap();
+    assert_eq!(rows(&out), ["1|2|10", "2|2|10", "3|2|40"]);
+    let err = sql("SELECT row_number() FILTER (WHERE n > 1) OVER () FROM t").unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "FILTER is not implemented for non-aggregate window functions"
+    );
 }

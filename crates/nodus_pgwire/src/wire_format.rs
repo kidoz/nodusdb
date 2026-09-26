@@ -112,7 +112,9 @@ pub(crate) fn sqlstate_for_execution_error(err_str: &str) -> &'static str {
         || err_str == "lastval is not yet defined in this session"
     {
         "55000" // object_not_in_prerequisite_state
-    } else if err_str.starts_with("cannot use subquery in") {
+    } else if err_str.starts_with("cannot use subquery in")
+        || err_str.contains(" not implemented for ")
+    {
         "0A000" // feature_not_supported, worded as PostgreSQL words it
     } else if err_str.ends_with("is not a sequence")
         || err_str.ends_with("is not a table")

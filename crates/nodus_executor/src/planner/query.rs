@@ -1417,9 +1417,18 @@ fn plan_select_expr(
     if let Expr::Function(func) = expr
         && let Some(over) = &func.over
     {
-        if func.filter.is_some() {
-            anyhow::bail!("FILTER is not supported for window functions");
-        }
+        let func_name = func.name.to_string().to_uppercase();
+        let filter = match &func.filter {
+            None => None,
+            Some(_) if aggregate_op(&func_name).is_none() => {
+                anyhow::bail!("FILTER is not implemented for non-aggregate window functions")
+            }
+            Some(condition) => Some(lower_scalar(condition, params).ok_or_else(|| {
+                expression_error(condition, || {
+                    format!("Unsupported FILTER condition: {condition}")
+                })
+            })?),
+        };
         if let sqlparser::ast::FunctionArguments::List(list) = &func.args
             && (matches!(
                 list.duplicate_treatment,
@@ -1453,12 +1462,13 @@ fn plan_select_expr(
         }
         let frame = window_frame(spec);
         return Ok(ProjectionItem::WindowFunction {
-            func_name: func.name.to_string().to_uppercase(),
+            func_name,
             args: window_args(func),
             partition_by,
             order_by,
             alias: Some(name()),
             frame,
+            filter,
         });
     }
     if let Expr::Subquery(query) = expr {

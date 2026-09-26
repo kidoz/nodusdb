@@ -183,6 +183,16 @@ SELECT g, (SELECT string_agg(s, ',' ORDER BY s) FROM ag i WHERE i.g = o.g) FROM 
 x	a,b,c
 y	a
 
+# FILTER on an aggregate window.
+query TT
+SELECT id, count(*) FILTER (WHERE a > 1) OVER () FROM ag ORDER BY id;
+----
+1	3
+2	3
+3	3
+4	3
+5	3
+
 # Invalid aggregate calls fail.
 statement error
 SELECT string_agg(s) FROM ag;
@@ -194,7 +204,7 @@ statement error
 SELECT upper(s) FILTER (WHERE a > 1) FROM ag;
 
 statement error
-SELECT count(*) FILTER (WHERE a > 1) OVER () FROM ag;
+SELECT row_number() FILTER (WHERE a > 1) OVER () FROM ag;
 
 statement error
 SELECT json_object_agg(s, a) FROM ag;

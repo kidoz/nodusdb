@@ -832,9 +832,10 @@ impl MemExecutor {
                     ProjectionItem::Column(c) | ProjectionItem::AliasedColumn(c, _) => {
                         refs.push(c.clone())
                     }
-                    ProjectionItem::Expr { expr, .. } => {
-                        crate::filter_eval::scalar_column_refs(expr, &mut refs)
-                    }
+                    ProjectionItem::Expr { expr, .. }
+                    | ProjectionItem::WindowFunction {
+                        filter: Some(expr), ..
+                    } => crate::filter_eval::scalar_column_refs(expr, &mut refs),
                     _ => {}
                 }
             }
@@ -1153,6 +1154,7 @@ impl MemExecutor {
                         order_by: w_order_by,
                         alias,
                         frame,
+                        filter,
                     } => {
                         let p_indices: Vec<usize> = partition_by
                             .iter()
@@ -1367,6 +1369,18 @@ impl MemExecutor {
                             let groups =
                                 partition_groups(&row_indices, &partition_key_of, &stored_rows);
                             let arg = args.first().cloned().unwrap_or_else(|| "*".to_string());
+                            // FILTER leaves out the frame's other rows.
+                            let kept = |rows: &[Vec<Value>]| -> Vec<Vec<Value>> {
+                                rows.iter()
+                                    .filter(|row| {
+                                        filter.as_ref().is_none_or(|f| {
+                                            self.eval_expr(ctx, f, row, &col_names)
+                                                == Value::Bool(true)
+                                        })
+                                    })
+                                    .cloned()
+                                    .collect()
+                            };
                             for group in &groups {
                                 let grows: Vec<Vec<Value>> =
                                     group.iter().map(|&i| stored_rows[i].clone()).collect();
@@ -1386,7 +1400,7 @@ impl MemExecutor {
                                             func_name,
                                             &arg,
                                             args.get(1..).unwrap_or(&[]),
-                                            slice,
+                                            &kept(slice),
                                             &col_names,
                                         );
                                     }
@@ -1396,7 +1410,7 @@ impl MemExecutor {
                                         func_name,
                                         &arg,
                                         args.get(1..).unwrap_or(&[]),
-                                        &grows,
+                                        &kept(&grows),
                                         &col_names,
                                     );
                                     for &row_idx in group {

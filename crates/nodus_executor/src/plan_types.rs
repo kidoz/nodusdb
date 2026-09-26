@@ -739,6 +739,10 @@ pub enum ProjectionItem {
         /// span the whole partition.
         #[serde(default)]
         frame: Option<WindowFrame>,
+        /// `FILTER (WHERE ...)` of an aggregate window: only the frame's rows
+        /// where it is true are aggregated.
+        #[serde(default)]
+        filter: Option<ScalarExpr>,
     },
     Literal(crate::Value),
     AliasedLiteral(crate::Value, String),

@@ -1,0 +1,48 @@
+# FILTER on an aggregate window aggregates only the frame rows it accepts.
+statement ok
+CREATE TABLE wf8 (id INT PRIMARY KEY, g TEXT, n INT);
+
+statement ok
+INSERT INTO wf8 VALUES (1, 'a', 10), (2, 'a', 20), (3, 'b', 30), (4, 'b', NULL), (5, 'a', 5);
+
+query TTT
+SELECT id, count(*) FILTER (WHERE n > 15) OVER (), sum(n) FILTER (WHERE id < 3) OVER (ORDER BY id) FROM wf8 ORDER BY id;
+----
+1	2	10
+2	2	30
+3	2	30
+4	2	30
+5	2	30
+
+query TTT
+SELECT id, g, sum(n) FILTER (WHERE n >= 10) OVER (PARTITION BY g ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS s FROM wf8 ORDER BY id;
+----
+1	a	10
+2	a	30
+3	b	30
+4	b	30
+5	a	20
+
+query TT
+SELECT id, max(n) FILTER (WHERE g = 'a') OVER (PARTITION BY g) FROM wf8 ORDER BY id;
+----
+1	20
+2	20
+3	NULL
+4	NULL
+5	20
+
+query TT
+SELECT id, avg(n) FILTER (WHERE n IS NOT NULL) OVER (PARTITION BY g) FROM wf8 ORDER BY id;
+----
+1	11.6666666666666667
+2	11.6666666666666667
+3	30.0000000000000000
+4	30.0000000000000000
+5	11.6666666666666667
+
+statement error
+SELECT id, row_number() FILTER (WHERE n > 1) OVER () FROM wf8;
+
+statement error
+SELECT id, count(n) FILTER (WHERE nosuch > 1) OVER () FROM wf8;
