@@ -57,8 +57,14 @@ pub fn parse_sql(
 /// `pg_catalog.__exclude__('ties')`, since the parser has no `EXCLUDE`.
 pub const EXCLUDE_MARKER: &str = "__EXCLUDE__";
 
-/// Query syntax the parser lacks: a window frame's `EXCLUDE`
-/// ([`EXCLUDE_MARKER`]).
+/// The function `x BETWEEN SYMMETRIC a AND b` marks its low bound with
+/// (upper-cased as planned): `x BETWEEN pg_catalog.__symmetric__(a) AND b`,
+/// since the parser has no `SYMMETRIC`.
+pub const SYMMETRIC_MARKER: &str = "__SYMMETRIC__";
+
+/// Query syntax the parser lacks: `TABLE name` as a query (`SELECT * FROM
+/// name`), `BETWEEN [A]SYMMETRIC` ([`SYMMETRIC_MARKER`]), and a window
+/// frame's `EXCLUDE` ([`EXCLUDE_MARKER`]).
 fn rewrite_query_syntax(
     mut tokens: Vec<sqlparser::tokenizer::TokenWithSpan>,
 ) -> Vec<sqlparser::tokenizer::TokenWithSpan> {
@@ -80,6 +86,73 @@ fn rewrite_query_syntax(
     let significant = |tokens: &[TokenWithSpan], from: usize| {
         (from..tokens.len()).find(|&i| !matches!(tokens[i].token, Token::Whitespace(_)))
     };
+    // `TABLE name` where a query may start.
+    let mut i = 0;
+    let mut previous: Option<usize> = None;
+    while i < tokens.len() {
+        if matches!(tokens[i].token, Token::Whitespace(_)) {
+            i += 1;
+            continue;
+        }
+        let starts_query = match previous {
+            None => true,
+            Some(p) => {
+                matches!(tokens[p].token, Token::SemiColon | Token::LParen)
+                    || matches!(
+                        word(&tokens[p]).as_deref(),
+                        Some("union" | "intersect" | "except" | "all" | "distinct")
+                    )
+            }
+        };
+        if starts_query && word(&tokens[i]).as_deref() == Some("table") {
+            let replacement = snippet("SELECT * FROM");
+            let len = replacement.len();
+            tokens.splice(i..=i, replacement);
+            previous = Some(i + len - 1);
+            i += len;
+            continue;
+        }
+        previous = Some(i);
+        i += 1;
+    }
+    // `BETWEEN [A]SYMMETRIC low AND high`.
+    let mut i = 0;
+    while i < tokens.len() {
+        if word(&tokens[i]).as_deref() == Some("between")
+            && let Some(next) = significant(&tokens, i + 1)
+            && let Some(kind @ ("symmetric" | "asymmetric")) = word(&tokens[next]).as_deref()
+        {
+            let symmetric = kind == "symmetric";
+            tokens.remove(next);
+            if symmetric {
+                // The low bound runs to the next `AND` at its depth.
+                let mut depth = 0i32;
+                let mut end = None;
+                for (j, token) in tokens.iter().enumerate().skip(next) {
+                    match token.token {
+                        Token::LParen => depth += 1,
+                        Token::RParen => depth -= 1,
+                        _ => {}
+                    }
+                    if depth == 0 && word(token).as_deref() == Some("and") {
+                        end = Some(j);
+                        break;
+                    }
+                }
+                if let Some(end) = end {
+                    tokens.splice(end..end, snippet(")"));
+                    tokens.splice(
+                        next..next,
+                        snippet(&format!(
+                            "pg_catalog.{}(",
+                            SYMMETRIC_MARKER.to_ascii_lowercase()
+                        )),
+                    );
+                }
+            }
+        }
+        i += 1;
+    }
     // A window frame's `EXCLUDE ...`, from the last one back so earlier
     // positions stay put.
     let excludes: Vec<usize> = (0..tokens.len())
@@ -576,6 +649,19 @@ mod tests {
     #[test]
     fn missing_query_syntax_is_rewritten() {
         let one = |sql: &str| parse_sql(sql).unwrap().remove(0).to_string();
+        assert_eq!(one("TABLE t ORDER BY a"), "SELECT * FROM t ORDER BY a");
+        assert_eq!(
+            one("SELECT 1 UNION TABLE t"),
+            "SELECT 1 UNION SELECT * FROM t"
+        );
+        assert_eq!(
+            one("SELECT a BETWEEN SYMMETRIC 5 + 1 AND 2 FROM t"),
+            "SELECT a BETWEEN pg_catalog.__symmetric__(5 + 1) AND 2 FROM t"
+        );
+        assert_eq!(
+            one("SELECT a BETWEEN ASYMMETRIC 1 AND 2"),
+            "SELECT a BETWEEN 1 AND 2"
+        );
         assert_eq!(
             one("SELECT sum(a) OVER (ORDER BY a ROWS UNBOUNDED PRECEDING EXCLUDE TIES) FROM t"),
             "SELECT sum(a) OVER (PARTITION BY pg_catalog.__exclude__('ties') ORDER BY a ROWS UNBOUNDED PRECEDING) FROM t"
@@ -584,6 +670,8 @@ mod tests {
             one("SELECT sum(a) OVER (PARTITION BY b ROWS CURRENT ROW EXCLUDE CURRENT ROW) FROM t"),
             "SELECT sum(a) OVER (PARTITION BY pg_catalog.__exclude__('current row'), b ROWS CURRENT ROW) FROM t"
         );
+        // Tables keep their own TABLE keyword.
+        assert_eq!(one("CREATE TABLE t (a INT)"), "CREATE TABLE t (a INT)");
     }
 
     #[test]

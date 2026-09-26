@@ -176,7 +176,7 @@ pub(crate) fn parse_filter_expr(
             negated,
             low,
             high,
-        } => match (
+        } if symmetric_bound(low).is_none() => match (
             plain_column(inner),
             extract_operand(low, params),
             extract_operand(high, params),

@@ -839,17 +839,33 @@ pub(crate) fn lower_scalar(expr: &sqlparser::ast::Expr, params: &[Value]) -> Opt
                     ScalarBinaryOp::And,
                 )
             };
-            let bound = |op, e: &Expr| {
-                Some(ScalarExpr::Binary {
-                    op,
-                    left: Box::new(x.clone()),
-                    right: Box::new(lower_scalar(e, params)?),
-                })
+            // `BETWEEN SYMMETRIC` (its low bound marked, see nodus_sql) takes
+            // the bounds in either order.
+            let (low, symmetric) = match symmetric_bound(low) {
+                Some(bound) => (bound, true),
+                None => (&**low, false),
+            };
+            let (mut lo, mut hi) = (lower_scalar(low, params)?, lower_scalar(high, params)?);
+            if symmetric {
+                let pair = vec![lo, hi];
+                lo = ScalarExpr::Function {
+                    name: "__SYMMETRIC_LOW__".to_string(),
+                    args: pair.clone(),
+                };
+                hi = ScalarExpr::Function {
+                    name: "__SYMMETRIC_HIGH__".to_string(),
+                    args: pair,
+                };
+            }
+            let bound = |op, e: ScalarExpr| ScalarExpr::Binary {
+                op,
+                left: Box::new(x.clone()),
+                right: Box::new(e),
             };
             Some(ScalarExpr::Binary {
                 op: join,
-                left: Box::new(bound(lo_op, low)?),
-                right: Box::new(bound(hi_op, high)?),
+                left: Box::new(bound(lo_op, lo)),
+                right: Box::new(bound(hi_op, hi)),
             })
         }
         // `x <op> ANY|ALL (array)` and `x <op> ANY|ALL (SELECT ...)`.
@@ -1677,6 +1693,12 @@ pub(crate) fn expression_error(
         return anyhow::anyhow!(message);
     }
     anyhow::anyhow!(unknown_function_error(expr).unwrap_or_else(fallback))
+}
+
+/// The low bound of `x BETWEEN SYMMETRIC low AND high`, which nodus_sql
+/// marks; `None` for another bound.
+pub(crate) fn symmetric_bound(low: &sqlparser::ast::Expr) -> Option<&sqlparser::ast::Expr> {
+    marker_argument(low, nodus_sql::SYMMETRIC_MARKER)
 }
 
 /// The argument of a call of the marker function `marker` (nodus_sql's

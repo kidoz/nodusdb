@@ -78,9 +78,8 @@ pub(crate) fn is_known(name: &str) -> bool {
                 | "TO_NUMBER" | "MAKE_INTERVAL" | "MAKE_TIME" | "MAKE_TIMESTAMPTZ"
                 | "JUSTIFY_DAYS" | "JUSTIFY_HOURS" | "JUSTIFY_INTERVAL" | "ISFINITE" | "DATE_BIN"
                 | "TIMEZONE" | "OVERLAPS" | "__DATETIME__" | "__TZ_TEXT__" | "__JSON_TIME__"
-                | "__EXCLUDE__" | "__INTERVAL_SPAN__"
-                | "PERCENTILE_CONT" | "PERCENTILE_DISC" | "MODE"
-                | "GROUPING"
+                | "__EXCLUDE__" | "__SYMMETRIC_LOW__" | "__SYMMETRIC_HIGH__" | "GROUPING"
+                | "__INTERVAL_SPAN__" | "PERCENTILE_CONT" | "PERCENTILE_DISC" | "MODE"
                 // Locks, notifications, privileges, and backends.
                 | "PG_ADVISORY_LOCK" | "PG_ADVISORY_LOCK_SHARED" | "PG_ADVISORY_XACT_LOCK"
                 | "PG_ADVISORY_XACT_LOCK_SHARED" | "PG_TRY_ADVISORY_LOCK"
@@ -291,7 +290,8 @@ pub(crate) fn return_type(name: &str, arg_types: &[Option<String>]) -> Option<St
             | "COL_DESCRIPTION"
             | "SHOBJ_DESCRIPTION" => "TEXT",
             "CURRENT_USER" | "SESSION_USER" | "CURRENT_ROLE" | "USER" | "CURRENT_CATALOG" => "NAME",
-            "COALESCE" | "NULLIF" | "GREATEST" | "LEAST" => return first_known(),
+            "COALESCE" | "NULLIF" | "GREATEST" | "LEAST" | "__SYMMETRIC_LOW__"
+            | "__SYMMETRIC_HIGH__" => return first_known(),
             "ARRAY" => return first_known().map(|element| format!("{element}[]")),
             _ => return None,
         }
@@ -1088,6 +1088,15 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
         "GROUPING" => raise(
             "arguments to GROUPING must be grouping expressions of the associated query level",
         ),
+        // `BETWEEN SYMMETRIC`'s bounds: the lesser and the greater.
+        "__SYMMETRIC_LOW__" | "__SYMMETRIC_HIGH__" if arity(2) => {
+            let less = crate::compare(arg(0), arg(1)) != std::cmp::Ordering::Greater;
+            if (name == "__SYMMETRIC_LOW__") == less {
+                arg(0).clone()
+            } else {
+                arg(1).clone()
+            }
+        }
         "OVERLAPS" if arity(4) => crate::datetime::overlaps(args, &[]).unwrap_or_else(raise),
         // With the arguments' static types, as the planner passes them.
         "OVERLAPS" if arity(8) => {

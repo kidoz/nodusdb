@@ -1759,6 +1759,9 @@ impl MemExecutor {
             }
         }
 
+        // Each sorted output row's sort keys, for `FETCH ... WITH TIES`.
+        let mut tie_keys: Option<Vec<Vec<Value>>> = None;
+
         // ORDER BY and DISTINCT ON, over the output rows. A name means an
         // output column before an input column (a qualified name only an input
         // column); an input column reads the row's source row, or its group's
@@ -1879,6 +1882,14 @@ impl MemExecutor {
                     seen.insert(key)
                 });
             }
+            // `FETCH ... WITH TIES` compares the rows' sort keys past the limit.
+            if sort.first().is_some_and(|k| k.with_ties) {
+                tie_keys = Some(
+                    perm.iter()
+                        .map(|&i| keys[i][..sort.len()].to_vec())
+                        .collect(),
+                );
+            }
             let mut rows: Vec<Option<Vec<Value>>> = out_rows.into_iter().map(Some).collect();
             out_rows = perm.iter().filter_map(|&i| rows[i].take()).collect();
         }
@@ -1915,34 +1926,57 @@ impl MemExecutor {
                 compare(a, b) == std::cmp::Ordering::Equal
             };
             let mut seen = Vec::new();
-            out_rows.retain(|r| {
-                let is_seen = seen.iter().any(|s: &Vec<Value>| {
-                    s.iter()
-                        .zip(r.iter())
-                        .enumerate()
-                        .all(|(i, (va, vb))| same(i, va, vb))
-                });
-                if is_seen {
-                    false
-                } else {
-                    seen.push(r.clone());
-                    true
-                }
-            });
+            let keep: Vec<bool> = out_rows
+                .iter()
+                .map(|r| {
+                    let is_seen = seen.iter().any(|s: &Vec<Value>| {
+                        s.iter()
+                            .zip(r.iter())
+                            .enumerate()
+                            .all(|(i, (va, vb))| same(i, va, vb))
+                    });
+                    if !is_seen {
+                        seen.push(r.clone());
+                    }
+                    !is_seen
+                })
+                .collect();
+            let mut kept = keep.iter();
+            out_rows.retain(|_| *kept.next().unwrap_or(&true));
+            if let Some(keys) = tie_keys.as_mut() {
+                let mut kept = keep.iter();
+                keys.retain(|_| *kept.next().unwrap_or(&true));
+            }
         }
 
         // OFFSET
         if let Some(o) = offset {
             if o < out_rows.len() {
                 out_rows.drain(0..o);
+                if let Some(keys) = tie_keys.as_mut() {
+                    keys.drain(0..o);
+                }
             } else {
                 out_rows.clear();
             }
         }
 
-        // LIMIT
+        // LIMIT, or with ties also the rows tied with the last one kept.
         if let Some(n) = limit {
-            out_rows.truncate(n);
+            let end = match &tie_keys {
+                Some(keys) if n > 0 && n < out_rows.len() => {
+                    let same = |a: &[Value], b: &[Value]| {
+                        a.iter()
+                            .zip(b)
+                            .all(|(x, y)| compare(x, y) == std::cmp::Ordering::Equal)
+                    };
+                    (n..out_rows.len())
+                        .find(|&i| !same(&keys[i], &keys[n - 1]))
+                        .unwrap_or(out_rows.len())
+                }
+                _ => n,
+            };
+            out_rows.truncate(end);
         }
 
         let rows = out_rows

@@ -781,6 +781,10 @@ pub struct SortKey {
     /// PostgreSQL's default: NULLs sort as larger than any value, so last when
     /// ascending and first when descending.
     pub nulls_first: Option<bool>,
+    /// Set on the keys of a query whose `FETCH ... WITH TIES` also returns
+    /// the rows that tie with its last row on them.
+    #[serde(default)]
+    pub with_ties: bool,
 }
 
 /// What an `ORDER BY` (or `DISTINCT ON`) key sorts by.
@@ -803,6 +807,7 @@ impl SortKey {
             target: SortTarget::Name(name),
             ascending,
             nulls_first,
+            with_ties: false,
         }
     }
 }

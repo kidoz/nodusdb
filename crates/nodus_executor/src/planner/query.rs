@@ -233,7 +233,7 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
             SRF_RELATION.to_string(),
             Box::new(LogicalPlan::TableFunction(spec)),
         ));
-        let (limit, offset) = plan_limit(query, params)?;
+        let (limit, offset) = plan_limit(query, params, &mut sort)?;
         return Ok(LogicalPlan::Select {
             ctes,
             table_name: SRF_RELATION.to_string(),
@@ -349,7 +349,7 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
     };
     let (group_by, grouping_sets, group_exprs) =
         plan_group_by(&select.group_by, &projection, params)?;
-    let sort = plan_sort(query.order_by.as_ref(), &projection, distinct, params)?;
+    let mut sort = plan_sort(query.order_by.as_ref(), &projection, distinct, params)?;
     let distinct_on = distinct_on_exprs
         .iter()
         .map(|e| sort_target(e, &projection, params))
@@ -366,7 +366,7 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
     {
         anyhow::bail!("SELECT DISTINCT ON expressions must match initial ORDER BY expressions");
     }
-    let (limit, offset) = plan_limit(query, params)?;
+    let (limit, offset) = plan_limit(query, params, &mut sort)?;
 
     let having = select
         .having
@@ -854,6 +854,7 @@ fn plan_sort(
             target,
             ascending: sort_ascending(&o.options)?,
             nulls_first: o.options.nulls_first,
+            with_ties: false,
         });
     }
     Ok(keys)
@@ -914,6 +915,7 @@ fn canonical_target(target: &SortTarget, projection: &[ProjectionItem]) -> SortT
 fn plan_limit(
     query: &sqlparser::ast::Query,
     params: &[Value],
+    sort: &mut [SortKey],
 ) -> Result<(Option<usize>, Option<usize>)> {
     use sqlparser::ast::LimitClause;
     let count = |expr: &sqlparser::ast::Expr, clause: &str| -> Result<Option<usize>> {
@@ -949,8 +951,16 @@ fn plan_limit(
     };
     let mut limit = limit_expr.map(|e| count(e, "LIMIT")).transpose()?.flatten();
     if let Some(fetch) = &query.fetch {
-        if fetch.with_ties || fetch.percent {
-            anyhow::bail!("FETCH ... WITH TIES and PERCENT are not supported");
+        if fetch.percent {
+            anyhow::bail!("FETCH ... PERCENT is not supported");
+        }
+        if fetch.with_ties {
+            if sort.is_empty() {
+                anyhow::bail!("WITH TIES cannot be specified without ORDER BY clause");
+            }
+            for key in sort.iter_mut() {
+                key.with_ties = true;
+            }
         }
         if limit_expr.is_some() {
             anyhow::bail!("LIMIT and FETCH cannot both be used");
@@ -1015,6 +1025,30 @@ fn table_fn_from_factor(
         } => {
             let exprs: Vec<&sqlparser::ast::Expr> = table_args
                 .args
+                .iter()
+                .map(|a| match a {
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
+                    _ => None,
+                })
+                .collect::<Option<_>>()?;
+            let mut spec = build_table_fn_spec(
+                name.to_string().to_lowercase(),
+                Vec::new(),
+                *with_ordinality,
+                alias.as_ref(),
+            );
+            set_table_fn_args(&mut spec, &exprs, params)?;
+            Some(spec)
+        }
+        // `LATERAL f(...)`: its arguments may read the preceding relations.
+        TableFactor::Function {
+            name,
+            args,
+            with_ordinality,
+            alias,
+            ..
+        } => {
+            let exprs: Vec<&sqlparser::ast::Expr> = args
                 .iter()
                 .map(|a| match a {
                     FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
@@ -1654,13 +1688,13 @@ fn select_from_result(
     {
         return Ok(result);
     }
-    let sort = plan_sort(query.order_by.as_ref(), &[], false, params)?;
+    let mut sort = plan_sort(query.order_by.as_ref(), &[], false, params)?;
     if sort.iter().any(|k| matches!(k.target, SortTarget::Expr(_))) {
         anyhow::bail!(
             "invalid UNION/INTERSECT/EXCEPT ORDER BY clause: only result column names or positions can be used"
         );
     }
-    let (limit, offset) = plan_limit(query, params)?;
+    let (limit, offset) = plan_limit(query, params, &mut sort)?;
     let name = "\u{0}result".to_string();
     ctes.push((name.clone(), Box::new(result)));
     Ok(LogicalPlan::Select {

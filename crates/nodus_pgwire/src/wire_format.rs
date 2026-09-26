@@ -114,7 +114,11 @@ pub(crate) fn sqlstate_for_execution_error(err_str: &str) -> &'static str {
         "57014" // query_canceled
     } else if err_str == "canceling statement due to lock timeout" {
         "55P03" // lock_not_available
-    } else if err_str.contains("must be ahead of \"PR\"") {
+    } else if err_str.contains("must be ahead of \"PR\"")
+        || err_str == "WITH TIES cannot be specified without ORDER BY clause"
+        || (err_str.starts_with("each ")
+            && err_str.ends_with(" query must have the same number of columns"))
+    {
         "42601" // syntax_error
     } else if err_str.starts_with("OVER specified, but") {
         "42809" // wrong_object_type

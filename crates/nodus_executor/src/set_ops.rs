@@ -118,6 +118,14 @@ impl MemExecutor {
     ) -> Result<QueryOutput> {
         let mut left_out = self.execute_logical_inner(ctx, *left)?;
         let right_out = self.execute_logical_inner(ctx, *right)?;
+        if left_out.columns.len() != right_out.columns.len() {
+            let name = match op {
+                SetOpKind::Union => "UNION",
+                SetOpKind::Intersect => "INTERSECT",
+                SetOpKind::Except => "EXCEPT",
+            };
+            anyhow::bail!("each {name} query must have the same number of columns");
+        }
         // Column names/types come from the left input (SQL semantics).
         left_out.rows = set_op_rows(op, all, left_out.rows, right_out.rows);
         Ok(left_out)

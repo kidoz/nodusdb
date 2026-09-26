@@ -1,0 +1,102 @@
+# FETCH WITH TIES, LATERAL function calls, TABLE, and BETWEEN SYMMETRIC.
+statement ok
+CREATE TABLE sales (id int PRIMARY KEY, region text, product text, qty int, price numeric(8,2), sold date);
+
+statement ok
+INSERT INTO sales VALUES (1,'east','apple',10,1.50,'2024-01-01'),(2,'east','pear',5,2.00,'2024-01-02'),(3,'west','apple',7,1.50,'2024-01-02'),(4,'west','pear',3,2.00,'2024-01-05'),(5,'west','apple',7,1.60,'2024-01-09'),(6,'north','plum',1,3.00,'2024-01-10'),(7,'east','apple',2,1.55,'2024-01-10');
+
+query TT
+SELECT * FROM (SELECT id, qty FROM sales ORDER BY qty DESC FETCH FIRST 2 ROWS WITH TIES) t ORDER BY id;
+----
+1	10
+3	7
+5	7
+
+query TT
+SELECT * FROM (SELECT id, qty FROM sales ORDER BY qty DESC OFFSET 1 ROWS FETCH NEXT 3 ROWS WITH TIES) t ORDER BY id;
+----
+2	5
+3	7
+5	7
+
+query T
+SELECT id FROM sales ORDER BY qty FETCH FIRST ROW WITH TIES;
+----
+6
+
+statement error
+SELECT id FROM sales FETCH FIRST 2 ROWS WITH TIES;
+
+query TT
+SELECT s.id, g FROM sales s CROSS JOIN LATERAL generate_series(1, s.qty % 3) g WHERE s.id < 4 ORDER BY 1, 2;
+----
+1	1
+2	1
+2	2
+3	1
+
+query TT
+SELECT s.id, u FROM sales s, LATERAL unnest(ARRAY[s.qty, s.qty * 10]) u WHERE s.id < 3 ORDER BY 1, 2;
+----
+1	10
+1	100
+2	5
+2	50
+
+query TT
+SELECT s.id, g.n FROM sales s LEFT JOIN LATERAL generate_series(1, s.qty - 8) AS g(n) ON true WHERE s.id < 3 ORDER BY 1, 2;
+----
+1	1
+1	2
+2	NULL
+
+query TT
+SELECT s.id, x FROM sales s CROSS JOIN LATERAL (VALUES (s.qty), (s.qty + 1)) v(x) WHERE s.id = 1 ORDER BY 2;
+----
+1	10
+1	11
+
+query TTTTTT
+TABLE sales ORDER BY qty DESC, id LIMIT 2;
+----
+1	east	apple	10	1.50	2024-01-01
+3	west	apple	7	1.50	2024-01-02
+
+query TTTTTT
+SELECT * FROM (TABLE sales) t WHERE id = 2;
+----
+2	east	pear	5	2.00	2024-01-02
+
+statement error
+SELECT id FROM sales WHERE id = 1 UNION ALL TABLE sales;
+
+query T
+SELECT id FROM sales WHERE qty BETWEEN SYMMETRIC 7 AND 3 ORDER BY id;
+----
+2
+3
+4
+5
+
+query T
+SELECT id FROM sales WHERE qty NOT BETWEEN SYMMETRIC 7 AND 3 ORDER BY id;
+----
+1
+6
+7
+
+query TTT
+SELECT 5 BETWEEN SYMMETRIC 10 AND 1, 5 BETWEEN ASYMMETRIC 10 AND 1, 5 BETWEEN 1 AND 10;
+----
+t	f	t
+
+query T
+SELECT CASE WHEN qty BETWEEN SYMMETRIC 10 AND 5 THEN 'hi' ELSE 'lo' END FROM sales ORDER BY id;
+----
+hi
+hi
+hi
+lo
+hi
+lo
+lo
