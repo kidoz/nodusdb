@@ -97,6 +97,9 @@ pub struct TableDescriptor {
     /// stored rows from.
     #[serde(default)]
     pub materialized_query: Option<String>,
+    /// The table's `COMMENT ON` text.
+    #[serde(default)]
+    pub comment: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -128,6 +131,9 @@ pub struct ColumnDescriptor {
     /// before this field decode.
     #[serde(default)]
     pub default_expr: Option<String>,
+    /// The column's `COMMENT ON` text.
+    #[serde(default)]
+    pub comment: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

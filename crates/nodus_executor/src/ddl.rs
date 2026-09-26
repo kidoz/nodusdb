@@ -121,6 +121,7 @@ impl MemExecutor {
                     .default
                     .as_ref()
                     .and_then(|e| serde_json::to_string(e).ok()),
+                comment: None,
             })
             .collect();
 
@@ -384,6 +385,50 @@ impl MemExecutor {
 
     /// `REFRESH MATERIALIZED VIEW`: replaces the view's rows with its query's
     /// (or with none, `WITH NO DATA`).
+    /// `COMMENT ON`: sets or removes the comment on a relation of `kind`,
+    /// or on its column.
+    pub(crate) fn exec_comment(
+        &self,
+        ctx: &ExecutionContext,
+        kind: &str,
+        relation: &str,
+        column: Option<String>,
+        comment: Option<String>,
+    ) -> Result<QueryOutput> {
+        let (db_name, schema_name, table_only) = parse_object_name(relation)?;
+        let tbl = self
+            .catalog_reader
+            .get_table(db_name, schema_name, table_only)
+            .map_err(|_| anyhow::anyhow!("relation \"{table_only}\" does not exist"))?;
+        let sequence = crate::sequences::is_sequence(&tbl);
+        let view = tbl.view_query.is_some();
+        let materialized = tbl.materialized_query.is_some();
+        let (fits, noun) = match kind {
+            "VIEW" => (view, "a view"),
+            "MATERIALIZED VIEW" => (materialized, "a materialized view"),
+            "SEQUENCE" => (sequence, "a sequence"),
+            "COLUMN" => (!sequence, "a table"),
+            _ => (!view && !materialized && !sequence, "a table"),
+        };
+        if !fits {
+            anyhow::bail!("\"{table_only}\" is not {noun}");
+        }
+        self.authorize(ctx, Action::CreateTable, ResourceRef::Table(tbl.id))?;
+        if let Some(column) = &column
+            && !tbl.columns.iter().any(|c| &c.name == column)
+        {
+            anyhow::bail!("column \"{column}\" of relation \"{table_only}\" does not exist");
+        }
+        self.catalog_writer.update_table_descriptor(
+            nodus_catalog::TableDescriptorChange::SetComment {
+                table_id: tbl.id,
+                column,
+                comment: comment.filter(|c| !c.is_empty()),
+            },
+        )?;
+        Ok(QueryOutput::tag("COMMENT"))
+    }
+
     pub(crate) fn exec_refresh_materialized_view(
         &self,
         ctx: &ExecutionContext,
@@ -471,6 +516,7 @@ impl MemExecutor {
                     .unwrap_or_else(|| "VARCHAR".to_string()),
                 nullable: true,
                 default_expr: None,
+                comment: None,
             })
             .collect();
         if let Some(tbl) = existing {
@@ -622,6 +668,7 @@ impl MemExecutor {
                     data_type,
                     nullable,
                     default_expr: default.as_ref().and_then(|e| serde_json::to_string(e).ok()),
+                    comment: None,
                 };
 
                 // Migrate existing data to include the new column, addressing

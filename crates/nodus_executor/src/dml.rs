@@ -839,6 +839,7 @@ impl MemExecutor {
                     data_type: ty.clone(),
                     nullable: true,
                     default_expr: None,
+                    comment: None,
                 }),
         );
         names.extend(out.columns);

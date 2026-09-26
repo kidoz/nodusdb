@@ -526,6 +526,7 @@ impl CatalogWriter for MemoryCatalog {
             constraints: request.constraints,
             view_query: request.view_query,
             materialized_query: request.materialized_query,
+            comment: None,
         };
         guard.insert(key, desc.clone());
         drop(guard);
@@ -612,6 +613,7 @@ impl CatalogWriter for MemoryCatalog {
             TableDescriptorChange::DropColumn { table_id, .. } => *table_id,
             TableDescriptorChange::AddIndex { table_id, .. } => *table_id,
             TableDescriptorChange::DropIndex { table_id, .. } => *table_id,
+            TableDescriptorChange::SetComment { table_id, .. } => *table_id,
         };
 
         let mut target_key = None;
@@ -669,6 +671,15 @@ impl CatalogWriter for MemoryCatalog {
             TableDescriptorChange::DropIndex { index_name, .. } => {
                 table.indexes.retain(|i| i.name != index_name);
             }
+            TableDescriptorChange::SetComment {
+                column, comment, ..
+            } => match column {
+                None => table.comment = comment,
+                Some(name) => match table.columns.iter_mut().find(|c| c.name == name) {
+                    Some(col) => col.comment = comment,
+                    None => anyhow::bail!("Column {} not found", name),
+                },
+            },
         }
 
         let out = table.clone();

@@ -1,0 +1,94 @@
+# COMMENT ON tables, views, sequences, and columns, read back through
+# obj_description, col_description, and pg_description.
+statement ok
+CREATE TABLE cm8 (id INT PRIMARY KEY, n INT);
+
+statement ok
+CREATE VIEW cm8v AS SELECT 1 AS x;
+
+statement ok
+CREATE SEQUENCE cm8s;
+
+statement error
+COMMENT ON TABLE cm8v IS 'x';
+
+statement error
+COMMENT ON VIEW cm8 IS 'x';
+
+statement error
+COMMENT ON MATERIALIZED VIEW cm8 IS 'x';
+
+statement error
+COMMENT ON SEQUENCE cm8 IS 'x';
+
+statement error
+COMMENT ON TABLE cm8s IS 'x';
+
+statement error
+COMMENT ON COLUMN cm8.nosuch IS 'x';
+
+statement error
+COMMENT ON TABLE nosuch IS 'x';
+
+statement error
+COMMENT ON COLUMN n IS 'x';
+
+statement ok
+COMMENT ON TABLE cm8 IS 'the table';
+
+statement ok
+COMMENT ON COLUMN public.cm8.n IS 'num';
+
+statement ok
+COMMENT ON COLUMN cm8v.x IS 'vx';
+
+statement ok
+COMMENT ON VIEW cm8v IS 'a view';
+
+statement ok
+COMMENT ON SEQUENCE cm8s IS 'a seq';
+
+query TTT
+SELECT obj_description('cm8'::regclass, 'pg_class'), obj_description('cm8v'::regclass, 'pg_class'), obj_description('cm8s'::regclass, 'pg_class');
+----
+the table	a view	a seq
+
+query TTTT
+SELECT col_description('cm8'::regclass, 2), col_description('cm8'::regclass, 5), col_description('cm8'::regclass, 0), col_description('cm8v'::regclass, 1);
+----
+num	NULL	the table	vx
+
+query T
+SELECT obj_description('cm8'::regclass, 'pg_namespace');
+----
+NULL
+
+query TT
+SELECT objsubid, description FROM pg_description WHERE objoid = 'cm8'::regclass ORDER BY 1;
+----
+0	the table
+2	num
+
+statement ok
+COMMENT ON TABLE cm8 IS '';
+
+statement ok
+COMMENT ON COLUMN cm8.n IS NULL;
+
+query TT
+SELECT obj_description('cm8'::regclass, 'pg_class'), col_description('cm8'::regclass, 2);
+----
+NULL	NULL
+
+query T
+SELECT count(*) FROM pg_description WHERE objoid = 'cm8'::regclass;
+----
+0
+
+statement error
+ALTER TABLE cm8 RENAME COLUMN nosuch TO x;
+
+query T
+SELECT count(*) FROM cm8;
+----
+0

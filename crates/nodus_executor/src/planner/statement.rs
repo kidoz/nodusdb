@@ -731,6 +731,37 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                 options: explain_options(*analyze, format.as_ref(), options.as_deref())?,
             })
         }
+        Statement::Comment {
+            object_type,
+            object_name,
+            comment,
+            ..
+        } => {
+            use sqlparser::ast::CommentObject as O;
+            let kind = match object_type {
+                O::Table => "TABLE",
+                O::View => "VIEW",
+                O::MaterializedView => "MATERIALIZED VIEW",
+                O::Sequence => "SEQUENCE",
+                O::Column => "COLUMN",
+                other => anyhow::bail!("COMMENT ON {other} is not supported"),
+            };
+            let mut parts: Vec<String> = object_name.0.iter().map(|p| p.to_string()).collect();
+            let column = if kind == "COLUMN" {
+                if parts.len() < 2 {
+                    anyhow::bail!("column name must be qualified");
+                }
+                parts.pop()
+            } else {
+                None
+            };
+            Ok(LogicalPlan::Comment {
+                kind: kind.to_string(),
+                relation: parts.join("."),
+                column,
+                comment: comment.clone(),
+            })
+        }
         Statement::Truncate(truncate) => Ok(LogicalPlan::Truncate {
             tables: truncate
                 .table_names

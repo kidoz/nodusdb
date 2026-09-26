@@ -576,18 +576,43 @@ impl MemExecutor {
                     rows,
                 ))
             }
-            "pg_description" => Some((
-                Self::virtual_columns(&[
-                    ("objoid", "OID"),
-                    ("classoid", "OID"),
-                    ("objsubid", "INT"),
-                    ("description", "TEXT"),
-                ]),
-                Vec::new(),
-            )),
-            // Shared-object comments. NodusDB has no COMMENT ON support, so this
-            // is synthesized empty like pg_description; pgjdbc/DataGrip join it
-            // during introspection and tolerate zero rows.
+            // The comments on relations and their columns.
+            "pg_description" => {
+                let mut rows = Vec::new();
+                for table in &tables {
+                    let schema_name = Self::schema_name_by_id(db_name, &schemas, table.schema_id);
+                    let relid = Self::table_oid(db_name, &schema_name, &table.name);
+                    let comments = std::iter::once((0, &table.comment)).chain(
+                        table
+                            .columns
+                            .iter()
+                            .enumerate()
+                            .map(|(i, c)| (i as i64 + 1, &c.comment)),
+                    );
+                    for (subid, comment) in comments {
+                        if let Some(comment) = comment {
+                            rows.push(vec![
+                                Value::Int(relid),
+                                Value::Int(1259),
+                                Value::Int(subid),
+                                Value::Text(comment.clone()),
+                            ]);
+                        }
+                    }
+                }
+                Some((
+                    Self::virtual_columns(&[
+                        ("objoid", "OID"),
+                        ("classoid", "OID"),
+                        ("objsubid", "INT"),
+                        ("description", "TEXT"),
+                    ]),
+                    rows,
+                ))
+            }
+            // Shared-object comments. Databases and roles take no comments,
+            // so this is empty; pgjdbc/DataGrip join it during introspection
+            // and tolerate zero rows.
             "pg_shdescription" => Some((
                 Self::virtual_columns(&[
                     ("objoid", "OID"),
@@ -1948,6 +1973,20 @@ impl MemExecutor {
 
     /// `pg_get_viewdef(view)`: the view's query, laid out as PostgreSQL
     /// pretty-prints it.
+    /// The relation (table, view, or sequence) whose `pg_class` OID is
+    /// `oid`.
+    pub(crate) fn relation_by_oid(
+        catalog: &dyn nodus_catalog::CatalogReader,
+        oid: i64,
+    ) -> Option<nodus_catalog::TableDescriptor> {
+        let db = "default";
+        let schemas = catalog.list_schemas(db).ok()?;
+        catalog.list_all_tables(db).ok()?.into_iter().find(|t| {
+            let schema = Self::schema_name_by_id(db, &schemas, t.schema_id);
+            Self::table_oid(db, &schema, &t.name) == oid
+        })
+    }
+
     pub(crate) fn view_definition(
         catalog: &dyn nodus_catalog::CatalogReader,
         oid: i64,

@@ -124,6 +124,12 @@ impl MemExecutor {
             LogicalPlan::RefreshMaterializedView { name, with_data } => {
                 self.exec_refresh_materialized_view(ctx, name, with_data)
             }
+            LogicalPlan::Comment {
+                kind,
+                relation,
+                column,
+                comment,
+            } => self.exec_comment(ctx, &kind, &relation, column, comment),
             LogicalPlan::Select {
                 ctes,
                 table_name,

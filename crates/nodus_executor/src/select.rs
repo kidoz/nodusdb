@@ -257,6 +257,7 @@ impl MemExecutor {
                     data_type: ty,
                     nullable: true,
                     default_expr: None,
+                    comment: None,
                 });
             }
             let prefix = table_alias.as_deref().unwrap_or(&table_name);
@@ -416,6 +417,7 @@ impl MemExecutor {
                         data_type: ty.clone(),
                         nullable: true,
                         default_expr: None,
+                        comment: None,
                     })
                     .collect();
                 let mut combined_cols = col_names.clone();
@@ -488,6 +490,7 @@ impl MemExecutor {
                         data_type: ty.clone(),
                         nullable: true,
                         default_expr: None,
+                        comment: None,
                     })
                     .collect();
                 let mut combined_cols = col_names.clone();
@@ -542,6 +545,7 @@ impl MemExecutor {
                         data_type: ty,
                         nullable: true,
                         default_expr: None,
+                        comment: None,
                     });
                 }
                 (

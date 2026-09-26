@@ -99,6 +99,13 @@ pub enum TableDescriptorChange {
         table_id: TableId,
         index_name: String,
     },
+    /// `COMMENT ON`: sets the comment on the table, or on its column
+    /// `column`; `None` removes it.
+    SetComment {
+        table_id: TableId,
+        column: Option<String>,
+        comment: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

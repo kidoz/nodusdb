@@ -1,5 +1,6 @@
 //! Set-returning functions in select lists, RETURNING expressions, JSON layouts
-//! and whole-row references, and column renames, driven through SQL.
+//! and whole-row references, `COMMENT ON`, and column renames, driven through
+//! SQL.
 
 use super::*;
 use crate::dml_join_tests::{rows, session};
@@ -109,6 +110,50 @@ fn a_relation_name_stands_for_its_row() {
     let out = sql("SELECT * FROM json_array_elements('[1, {\"a\" :  2}]')").unwrap();
     assert_eq!(out.columns, ["value"]);
     assert_eq!(rows(&out), ["1", "{\"a\" :  2}"]);
+}
+
+#[test]
+fn comments_describe_relations_and_columns() {
+    let sql = session();
+    sql("CREATE TABLE t (id INT PRIMARY KEY, n INT)").unwrap();
+    sql("CREATE VIEW v AS SELECT 1 AS x").unwrap();
+    assert_eq!(sql("COMMENT ON TABLE t IS 'rows'").unwrap().tag, "COMMENT");
+    sql("COMMENT ON COLUMN t.n IS 'a number'").unwrap();
+    sql("COMMENT ON VIEW v IS 'a view'").unwrap();
+    let out = sql("SELECT obj_description('t'::regclass, 'pg_class'), \
+         col_description('t'::regclass, 2), obj_description('v'::regclass, 'pg_class')")
+    .unwrap();
+    assert_eq!(rows(&out), ["rows|a number|a view"]);
+    let out = sql("SELECT objsubid, description FROM pg_description").unwrap();
+    assert_eq!(rows(&out), ["0|a view", "0|rows", "2|a number"]);
+    sql("COMMENT ON TABLE t IS NULL").unwrap();
+    sql("COMMENT ON COLUMN t.n IS ''").unwrap();
+    let out = sql("SELECT obj_description('t'::regclass, 'pg_class'), \
+         col_description('t'::regclass, 2)")
+    .unwrap();
+    assert_eq!(rows(&out), ["|"]);
+    for (statement, error) in [
+        ("COMMENT ON TABLE v IS 'x'", "\"v\" is not a table"),
+        ("COMMENT ON VIEW t IS 'x'", "\"t\" is not a view"),
+        (
+            "COMMENT ON COLUMN t.nope IS 'x'",
+            "column \"nope\" of relation \"t\" does not exist",
+        ),
+        (
+            "COMMENT ON TABLE nope IS 'x'",
+            "relation \"nope\" does not exist",
+        ),
+        (
+            "COMMENT ON COLUMN n IS 'x'",
+            "column name must be qualified",
+        ),
+    ] {
+        assert_eq!(
+            sql(statement).unwrap_err().to_string(),
+            error,
+            "{statement}"
+        );
+    }
 }
 
 #[test]

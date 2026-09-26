@@ -1129,6 +1129,15 @@ pub enum LogicalPlan {
         plan: Box<LogicalPlan>,
         options: crate::explain::ExplainOptions,
     },
+    /// `COMMENT ON kind relation[.column] IS comment`; a `NULL` or empty
+    /// comment removes it.
+    Comment {
+        /// `TABLE`, `VIEW`, `MATERIALIZED VIEW`, `SEQUENCE`, or `COLUMN`.
+        kind: String,
+        relation: String,
+        column: Option<String>,
+        comment: Option<String>,
+    },
 }
 
 /// An expression in a `RETURNING` list, evaluated over each returned row.

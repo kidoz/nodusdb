@@ -17,6 +17,7 @@ impl MemExecutor {
             data_type: data_type.into(),
             nullable: true,
             default_expr: None,
+            comment: None,
         }
     }
 

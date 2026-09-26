@@ -1146,8 +1146,24 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
             Value::Null
         }
         // NodusDB has no COMMENT ON, so no object has a description.
-        "OBJ_DESCRIPTION" if arity(1) || arity(2) => Value::Null,
-        "COL_DESCRIPTION" | "SHOBJ_DESCRIPTION" if arity(2) => Value::Null,
+        // Only relations and their columns take comments.
+        "OBJ_DESCRIPTION" if arity(1) || arity(2) => {
+            if arity(2) && text(arg(1)) != "pg_class" {
+                return Some(Value::Null);
+            }
+            catalog_text(|catalog| {
+                crate::MemExecutor::relation_by_oid(catalog, int(arg(0))?)?.comment
+            })
+        }
+        // Column 0 is the relation itself.
+        "COL_DESCRIPTION" if arity(2) => catalog_text(|catalog| {
+            let relation = crate::MemExecutor::relation_by_oid(catalog, int(arg(0))?)?;
+            match usize::try_from(int(arg(1))?).ok()? {
+                0 => relation.comment,
+                n => relation.columns.get(n - 1)?.comment.clone(),
+            }
+        }),
+        "SHOBJ_DESCRIPTION" if arity(2) => Value::Null,
         "FORMAT_TYPE" if arity(2) => match arg(0) {
             Value::Null => Value::Null,
             oid => Value::Text(format_type(int(oid)?, int(arg(1)).filter(|m| *m >= 0))),
