@@ -80,6 +80,11 @@ SELECT date_trunc('hour', interval '1 day 5 hours 30 minutes'), date_trunc('mont
 1 day 05:00:00	2024-02-01 00:00:00	2024-01-01 00:00:00+00
 
 query TT
+SELECT date_trunc('day', timestamptz '2024-05-17 23:30:00+00', 'Asia/Tokyo'), date_trunc('month', timestamptz '2024-05-31 23:30:00+00', 'America/New_York');
+----
+2024-05-17 15:00:00+00	2024-05-01 04:00:00+00
+
+query TT
 SELECT pg_typeof(date_trunc('day', date '2024-01-01')), pg_typeof(date_trunc('day', timestamp '2024-01-01'));
 ----
 timestamp with time zone	timestamp without time zone
@@ -120,6 +125,11 @@ query TT
 SELECT (time '10:00', time '11:00') OVERLAPS (time '11:00', time '12:00'), (timestamp '2024-01-01', timestamp '2024-01-01') OVERLAPS (timestamp '2024-01-01', timestamp '2024-01-02');
 ----
 f	t
+
+query TTTT
+SELECT make_date(2024, 2, 29), make_time(10, 20, 30.5), make_timestamp(2024, 1, 2, 3, 4, 5.25), make_timestamptz(2024, 1, 2, 3, 4, 5, 'America/New_York');
+----
+2024-02-29	10:20:30.5	2024-01-02 03:04:05.25	2024-01-02 08:04:05+00
 
 statement error
 SELECT make_date(2024, 2, 30);

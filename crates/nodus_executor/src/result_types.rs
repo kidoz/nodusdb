@@ -283,11 +283,11 @@ pub(crate) fn check_integer_ranges(
         }
         _ => {}
     }
-    // OVERLAPS reads its arguments by their types: its ends may be times
-    // or intervals.
+    // `timezone(zone, value)` reads its arguments by their types: an
+    // interval zone is east of UTC, and a time becomes a zoned time.
+    // So does OVERLAPS, whose ends may be times or intervals.
     if let ScalarExpr::Function { name, args } = &checked
-        && name == "OVERLAPS"
-        && args.len() == 4
+        && ((name == "TIMEZONE" && args.len() == 2) || (name == "OVERLAPS" && args.len() == 4))
     {
         // An unknown type is empty, as a NULL argument would make the
         // call NULL.

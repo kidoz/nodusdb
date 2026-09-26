@@ -528,6 +528,17 @@ pub(crate) fn lower_scalar(expr: &sqlparser::ast::Expr, params: &[Value]) -> Opt
             }),
             _ => expr_to_value(expr, params).map(ScalarExpr::Literal),
         },
+        // `ts AT TIME ZONE zone` is `timezone(zone, ts)`.
+        Expr::AtTimeZone {
+            timestamp,
+            time_zone,
+        } => Some(ScalarExpr::Function {
+            name: "TIMEZONE".to_string(),
+            args: vec![
+                lower_scalar(time_zone, params)?,
+                lower_scalar(timestamp, params)?,
+            ],
+        }),
         // `base[i]`, `base[lo:hi]`, after any field names that complete a
         // column reference (`t.col[1]`).
         Expr::CompoundFieldAccess { root, access_chain } => {

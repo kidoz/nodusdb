@@ -75,8 +75,8 @@ pub(crate) fn is_known(name: &str) -> bool {
                 | "STATEMENT_TIMESTAMP" | "CLOCK_TIMESTAMP" | "CURRENT_DATE" | "CURRENT_TIME"
                 | "LOCALTIMESTAMP" | "LOCALTIME" | "DATE_TRUNC" | "AGE" | "DATE_PART"
                 | "MAKE_DATE" | "MAKE_TIMESTAMP" | "TO_TIMESTAMP" | "MAKE_INTERVAL" | "MAKE_TIME"
-                | "JUSTIFY_DAYS" | "JUSTIFY_HOURS" | "JUSTIFY_INTERVAL" | "ISFINITE" | "DATE_BIN"
-                | "OVERLAPS" | "__DATETIME__"
+                | "MAKE_TIMESTAMPTZ" | "JUSTIFY_DAYS" | "JUSTIFY_HOURS" | "JUSTIFY_INTERVAL"
+                | "ISFINITE" | "DATE_BIN" | "TIMEZONE" | "OVERLAPS" | "__DATETIME__"
                 // Session and system.
                 | "VERSION" | "CURRENT_USER" | "SESSION_USER" | "CURRENT_ROLE" | "USER"
                 | "CURRENT_DATABASE" | "CURRENT_CATALOG" | "CURRENT_SCHEMA" | "CURRENT_SCHEMAS"
@@ -173,9 +173,30 @@ pub(crate) fn return_type(name: &str, arg_types: &[Option<String>]) -> Option<St
             "AGE" | "MAKE_INTERVAL" | "JUSTIFY_DAYS" | "JUSTIFY_HOURS" | "JUSTIFY_INTERVAL" => {
                 "INTERVAL"
             }
+            "MAKE_TIMESTAMPTZ" => "TIMESTAMPTZ",
             "ISFINITE" | "OVERLAPS" => "BOOLEAN",
             "DATE_BIN" => return arg_types.get(1).cloned().flatten(),
-            // A date truncates as a zoned timestamp.
+            // Zoned time becomes local time, and local time zoned.
+            "TIMEZONE" => {
+                let value_type = arg_types.get(1).cloned().flatten();
+                if value_type
+                    .as_deref()
+                    .is_some_and(crate::timezone::is_zoned_time_type)
+                {
+                    return Some("TIMETZ".into());
+                }
+                return match value_type.and_then(|t| crate::datetime::Kind::of_type(&t)) {
+                    Some(crate::datetime::Kind::TimestampTz | crate::datetime::Kind::Date) => {
+                        Some("TIMESTAMP".into())
+                    }
+                    Some(crate::datetime::Kind::Timestamp) => Some("TIMESTAMPTZ".into()),
+                    Some(crate::datetime::Kind::Time) => Some("TIMETZ".into()),
+                    _ => None,
+                };
+            }
+            // A date truncates as a zoned timestamp, and so does a
+            // truncation in a named zone.
+            "DATE_TRUNC" if arg_types.len() == 3 => "TIMESTAMPTZ",
             "DATE_TRUNC" => {
                 return Some(match arg_types.get(1).cloned().flatten() {
                     Some(t)
@@ -1020,6 +1041,17 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
         "DATE_TRUNC" if arity(2) => {
             crate::datetime::trunc(&text(arg(0)), arg(1), None).unwrap_or_else(raise)
         }
+        // Truncates the local time in the zone, then reads it back there.
+        "DATE_TRUNC" if arity(3) => crate::timezone::at_time_zone(arg(2), arg(1), None, None)
+            .and_then(|local| {
+                crate::datetime::trunc(
+                    &text(arg(0)),
+                    &local,
+                    Some(crate::datetime::Kind::Timestamp),
+                )
+            })
+            .and_then(|truncated| crate::timezone::at_time_zone(arg(2), &truncated, None, None))
+            .unwrap_or_else(raise),
         "AGE" if arity(2) => crate::datetime::age(arg(0), arg(1)).unwrap_or_else(raise),
         "AGE" if arity(1) => {
             let today = text(&timestamp(session_time(|e| e.transaction_micros)?, false));
@@ -1052,6 +1084,37 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
             crate::datetime::make_time(int(arg(0))?, int(arg(1))?, num(arg(2))?)
                 .unwrap_or_else(raise)
         }
+        "MAKE_TIMESTAMPTZ" if arity(6) || arity(7) => {
+            let (y, mo, d, h, mi) = (
+                int(arg(0))?,
+                int(arg(1))?,
+                int(arg(2))?,
+                int(arg(3))?,
+                int(arg(4))?,
+            );
+            let secs = num(arg(5))?;
+            let local =
+                chrono::NaiveDate::from_ymd_opt(y as i32, mo as u32, d as u32).and_then(|date| {
+                    date.and_hms_micro_opt(
+                        h as u32,
+                        mi as u32,
+                        secs.trunc() as u32,
+                        (secs.fract() * 1e6).round() as u32,
+                    )
+                });
+            let Some(local) = local else {
+                return Some(raise("date/time field value out of range"));
+            };
+            let zone = match args.get(6) {
+                Some(zone) => match crate::timezone::Zone::resolve(&text(zone)) {
+                    Ok(zone) => zone,
+                    Err(e) => return Some(raise(e)),
+                },
+                None => crate::timezone::Zone::Fixed(0),
+            };
+            let utc = local - chrono::Duration::seconds(zone.offset_at_local(local));
+            crate::datetime::Temporal::TimestampTz(utc).to_value()
+        }
         "JUSTIFY_DAYS" | "JUSTIFY_HOURS" | "JUSTIFY_INTERVAL" if arity(1) => {
             match crate::datetime::Interval::parse(&text(arg(0))) {
                 Some(interval) => Value::Text(
@@ -1071,6 +1134,20 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
         "ISFINITE" if arity(1) => Value::Bool(crate::datetime::is_finite(arg(0))?),
         "DATE_BIN" if arity(3) => {
             crate::datetime::date_bin(arg(0), arg(1), arg(2)).unwrap_or_else(raise)
+        }
+        "TIMEZONE" if arity(2) => {
+            crate::timezone::at_time_zone(arg(0), arg(1), None, None).unwrap_or_else(raise)
+        }
+        // With the arguments' static types, as the planner passes them.
+        "TIMEZONE" if arity(4) => {
+            let (zone_type, value_type) = (text(arg(2)), text(arg(3)));
+            crate::timezone::at_time_zone(
+                arg(0),
+                arg(1),
+                Some(zone_type.as_str()).filter(|t| !t.is_empty()),
+                Some(value_type.as_str()).filter(|t| !t.is_empty()),
+            )
+            .unwrap_or_else(raise)
         }
         "MAKE_DATE" if arity(3) => {
             let (y, m, d) = (int(arg(0))?, int(arg(1))?, int(arg(2))?);

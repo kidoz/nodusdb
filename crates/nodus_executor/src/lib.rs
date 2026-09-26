@@ -47,6 +47,7 @@ mod streaming;
 mod subqueries;
 mod system_views;
 mod table_functions;
+mod timezone;
 mod transactions;
 mod value;
 mod view_helpers;

@@ -1338,6 +1338,7 @@ fn figure_colname(expr: &sqlparser::ast::Expr) -> Option<String> {
         Expr::Exists { .. } => "exists".to_string(),
         Expr::Subquery(query) => return query_output_name(query),
         Expr::Extract { .. } => "extract".to_string(),
+        Expr::AtTimeZone { .. } => "timezone".to_string(),
         Expr::Position { .. } => "position".to_string(),
         Expr::Substring { shorthand, .. } => {
             if *shorthand { "substr" } else { "substring" }.to_string()
