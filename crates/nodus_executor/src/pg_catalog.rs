@@ -660,6 +660,7 @@ impl MemExecutor {
             "pg_operator" => Some(self.pg_operator_virtual_table(db_name)),
             "pg_cast" => Some(self.pg_cast_virtual_table()),
             "pg_locks" => Some(self.pg_locks_virtual_table(db_name)),
+            "pg_stat_activity" => Some(self.pg_stat_activity_virtual_table(db_name)),
             "pg_prepared_statements" => Some(self.pg_prepared_statements_virtual_table()),
             // The relations below exist so IDE/driver introspection
             // (DataGrip/pgjdbc) can join them without erroring. NodusDB does not
@@ -1251,6 +1252,92 @@ impl MemExecutor {
                     Value::Null,
                     Value::Text("ExclusiveLock".into()),
                     Value::Bool(true),
+                ]
+            })
+            .collect();
+        (cols, rows)
+    }
+
+    /// `pg_stat_activity`: each session, what it runs, and since when.
+    pub(crate) fn pg_stat_activity_virtual_table(
+        &self,
+        db_name: &str,
+    ) -> (Vec<ColumnDescriptor>, Vec<Vec<Value>>) {
+        let cols = Self::virtual_columns(&[
+            ("datid", "OID"),
+            ("datname", "NAME"),
+            ("pid", "INT"),
+            ("leader_pid", "INT"),
+            ("usesysid", "OID"),
+            ("usename", "NAME"),
+            ("application_name", "TEXT"),
+            ("client_addr", "TEXT"),
+            ("client_hostname", "TEXT"),
+            ("client_port", "INT"),
+            ("backend_start", "TIMESTAMPTZ"),
+            ("xact_start", "TIMESTAMPTZ"),
+            ("query_start", "TIMESTAMPTZ"),
+            ("state_change", "TIMESTAMPTZ"),
+            ("wait_event_type", "TEXT"),
+            ("wait_event", "TEXT"),
+            ("state", "TEXT"),
+            ("backend_xid", "INT8"),
+            ("backend_xmin", "INT8"),
+            ("query_id", "INT8"),
+            ("query", "TEXT"),
+            ("backend_type", "TEXT"),
+        ]);
+        let stamp = |micros: i64| {
+            chrono::DateTime::from_timestamp_micros(micros).map_or(Value::Null, |dt| {
+                crate::datetime::Temporal::TimestampTz(dt.naive_utc()).to_value()
+            })
+        };
+        let txns = self.active_txns.read();
+        let vars = self.session_vars.read();
+        let rows = self
+            .activity
+            .read()
+            .iter()
+            .map(|(session, activity)| {
+                let txn = txns.get(session);
+                let state = match (activity.active, txn.is_some_and(|t| t.explicit)) {
+                    (true, _) => "active",
+                    (false, true) => "idle in transaction",
+                    (false, false) => "idle",
+                };
+                let user = self
+                    .catalog_reader
+                    .get_principal_by_id(activity.principal)
+                    .map(|p| p.name)
+                    .unwrap_or_default();
+                let application = vars
+                    .get(session)
+                    .and_then(|v| v.get("application_name"))
+                    .cloned()
+                    .unwrap_or_default();
+                vec![
+                    Value::Int(Self::database_oid(db_name)),
+                    Value::Text(db_name.to_string()),
+                    Value::Int(crate::temp_tables::backend_pid(session)),
+                    Value::Null,
+                    Value::Int(10),
+                    Value::Text(user),
+                    Value::Text(application),
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    stamp(activity.backend_start),
+                    txn.map_or(Value::Null, |t| stamp(t.read_ts as i64)),
+                    stamp(activity.query_start),
+                    stamp(activity.state_change),
+                    Value::Null,
+                    Value::Null,
+                    Value::Text(state.to_string()),
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    Value::Text(String::new()),
+                    Value::Text("client backend".to_string()),
                 ]
             })
             .collect();

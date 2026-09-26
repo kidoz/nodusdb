@@ -144,6 +144,7 @@ impl MemExecutor {
             "TIMESTAMPTZ" => 1184,
             "INTERVAL" => 1186,
             "TIMETZ" => 1266,
+            "VOID" => 2278,
             "NUMERIC" | "DECIMAL" => 1700,
             "UUID" => 2950,
             "JSON" => 114,
@@ -268,6 +269,7 @@ impl MemExecutor {
                 | "pg_operator"
                 | "pg_cast"
                 | "pg_locks"
+                | "pg_stat_activity"
                 | "pg_prepared_statements"
                 | "pg_timezone_names"
                 | "pg_timezone_abbrevs"

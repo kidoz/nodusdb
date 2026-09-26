@@ -916,6 +916,19 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
             name: (!name.value.eq_ignore_ascii_case("all") || name.quote_style.is_some())
                 .then(|| name.value.clone()),
         }),
+        Statement::Lock(lock) => Ok(LogicalPlan::LockTable {
+            tables: lock.tables.iter().map(|t| t.name.to_string()).collect(),
+        }),
+        Statement::LISTEN { channel } => Ok(LogicalPlan::Listen {
+            channel: channel.value.clone(),
+        }),
+        Statement::UNLISTEN { channel } => Ok(LogicalPlan::Unlisten {
+            channel: (channel.value != "*").then(|| channel.value.clone()),
+        }),
+        Statement::NOTIFY { channel, payload } => Ok(LogicalPlan::Notify {
+            channel: channel.value.clone(),
+            payload: payload.clone().unwrap_or_default(),
+        }),
         Statement::Prepare {
             name,
             data_types,

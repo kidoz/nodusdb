@@ -1,0 +1,136 @@
+# Advisory locks, LOCK TABLE, notifications, privilege inquiries, and object lookups.
+query TTTTT
+SELECT pg_try_advisory_lock(1), pg_try_advisory_lock(1), pg_advisory_unlock(1), pg_advisory_unlock(1), pg_advisory_unlock(1);
+----
+t	t	t	t	f
+
+query TTT
+SELECT pg_try_advisory_lock(1, 2), pg_advisory_unlock(1, 2), pg_advisory_unlock(1, 2);
+----
+t	t	f
+
+statement ok
+SELECT pg_advisory_lock(7);
+
+query T
+SELECT pg_advisory_unlock(7);
+----
+t
+
+query TTTT
+SELECT pg_try_advisory_lock_shared(8), pg_try_advisory_lock_shared(8), pg_advisory_unlock_shared(8), pg_advisory_unlock(8);
+----
+t	t	t	f
+
+statement ok
+BEGIN;
+
+query T
+SELECT pg_try_advisory_xact_lock(5);
+----
+t
+
+statement ok
+COMMIT;
+
+query T
+SELECT pg_advisory_unlock(5);
+----
+f
+
+statement ok
+SELECT pg_advisory_unlock_all();
+
+statement ok
+CREATE TABLE sf (id int PRIMARY KEY, v text);
+
+statement error
+LOCK TABLE sf;
+
+statement ok
+BEGIN;
+
+statement ok
+LOCK TABLE sf IN ACCESS EXCLUSIVE MODE;
+
+statement ok
+LOCK sf IN SHARE MODE;
+
+statement ok
+LOCK TABLE sf, sf IN ROW EXCLUSIVE MODE NOWAIT;
+
+statement ok
+COMMIT;
+
+statement ok
+BEGIN;
+
+statement error
+LOCK TABLE nosuch;
+
+statement ok
+ROLLBACK;
+
+statement ok
+LISTEN chan1;
+
+statement ok
+NOTIFY chan1, 'hello';
+
+statement ok
+SELECT pg_notify('chan1', 'again');
+
+statement ok
+UNLISTEN chan1;
+
+statement ok
+UNLISTEN *;
+
+query TTT
+SELECT has_table_privilege('sf', 'SELECT'), has_table_privilege('nodus', 'sf', 'INSERT'), has_table_privilege('sf', 'SELECT, UPDATE');
+----
+t	t	t
+
+query TTTT
+SELECT has_schema_privilege('public', 'USAGE'), has_schema_privilege('public', 'CREATE'), has_database_privilege('default', 'CONNECT'), has_database_privilege('default', 'TEMP');
+----
+t	t	t	t
+
+query TTT
+SELECT has_column_privilege('sf', 'v', 'SELECT'), pg_has_role('nodus', 'USAGE'), has_function_privilege('now()', 'EXECUTE');
+----
+t	t	t
+
+statement error
+SELECT has_table_privilege('nosuch', 'SELECT');
+
+statement error
+SELECT has_table_privilege('sf', 'FLY');
+
+statement error
+SELECT has_column_privilege('sf', 'nosuch', 'SELECT');
+
+query TTTTTT
+SELECT to_regclass('sf'), to_regclass('nosuch'), to_regtype('integer'), to_regtype('nosuch'), to_regnamespace('public'), to_regrole('nodus');
+----
+sf	NULL	integer	NULL	public	nodus
+
+query TTT
+SELECT to_regproc('now'), to_regprocedure('now()'), to_regproc('nosuch_function');
+----
+now	now()	NULL
+
+query T
+SELECT count(*) FROM pg_stat_activity WHERE pid = pg_backend_pid() AND state = 'active' AND usename = 'nodus';
+----
+1
+
+query TT
+SELECT pg_cancel_backend(0), pg_terminate_backend(0);
+----
+f	f
+
+query TTT
+SELECT pg_postmaster_start_time() < now(), pg_conf_load_time() < now(), pg_trigger_depth();
+----
+t	t	0

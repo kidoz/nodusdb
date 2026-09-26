@@ -78,6 +78,18 @@ pub(crate) fn is_known(name: &str) -> bool {
                 | "TO_NUMBER" | "MAKE_INTERVAL" | "MAKE_TIME" | "MAKE_TIMESTAMPTZ"
                 | "JUSTIFY_DAYS" | "JUSTIFY_HOURS" | "JUSTIFY_INTERVAL" | "ISFINITE" | "DATE_BIN"
                 | "TIMEZONE" | "OVERLAPS" | "__DATETIME__" | "__TZ_TEXT__" | "__JSON_TIME__"
+                // Locks, notifications, privileges, and backends.
+                | "PG_ADVISORY_LOCK" | "PG_ADVISORY_LOCK_SHARED" | "PG_ADVISORY_XACT_LOCK"
+                | "PG_ADVISORY_XACT_LOCK_SHARED" | "PG_TRY_ADVISORY_LOCK"
+                | "PG_TRY_ADVISORY_LOCK_SHARED" | "PG_TRY_ADVISORY_XACT_LOCK"
+                | "PG_TRY_ADVISORY_XACT_LOCK_SHARED" | "PG_ADVISORY_UNLOCK"
+                | "PG_ADVISORY_UNLOCK_SHARED" | "PG_ADVISORY_UNLOCK_ALL" | "PG_NOTIFY"
+                | "HAS_TABLE_PRIVILEGE" | "HAS_SCHEMA_PRIVILEGE" | "HAS_DATABASE_PRIVILEGE"
+                | "HAS_COLUMN_PRIVILEGE" | "HAS_ANY_COLUMN_PRIVILEGE" | "HAS_SEQUENCE_PRIVILEGE"
+                | "HAS_FUNCTION_PRIVILEGE" | "PG_HAS_ROLE" | "TO_REGCLASS" | "TO_REGTYPE"
+                | "TO_REGNAMESPACE" | "TO_REGROLE" | "TO_REGPROC" | "TO_REGPROCEDURE"
+                | "PG_CANCEL_BACKEND" | "PG_TERMINATE_BACKEND" | "PG_POSTMASTER_START_TIME"
+                | "PG_CONF_LOAD_TIME" | "PG_TRIGGER_DEPTH" | "PG_CURRENT_XACT_ID_IF_ASSIGNED"
                 // Session and system.
                 | "VERSION" | "CURRENT_USER" | "SESSION_USER" | "CURRENT_ROLE" | "USER"
                 | "CURRENT_DATABASE" | "CURRENT_CATALOG" | "CURRENT_SCHEMA" | "CURRENT_SCHEMAS"
@@ -133,6 +145,9 @@ pub(crate) fn return_type(name: &str, arg_types: &[Option<String>]) -> Option<St
         }
         "__SLICE__" => return subscripted,
         _ => {}
+    }
+    if let Some(ty) = crate::session_functions::return_type(name) {
+        return Some(ty.to_string());
     }
     Some(
         match name {
@@ -448,6 +463,9 @@ fn numeric_like(args: &[Value], x: f64) -> Value {
 }
 
 fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
+    if let Some(value) = crate::session_functions::dispatch(name, args) {
+        return Some(value);
+    }
     let arity = |n: usize| args.len() == n;
     let arg = |i: usize| args.get(i).unwrap_or(&Value::Null);
     Some(match name {
@@ -1373,7 +1391,7 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
                     if seconds > 0.0 {
                         std::thread::sleep(std::time::Duration::from_secs_f64(seconds));
                     }
-                    Value::Null
+                    crate::session_functions::void()
                 }
             }
         }
@@ -1987,6 +2005,7 @@ fn format_type(oid: i64, typmod: Option<i64>) -> String {
         1184 => "timestamp with time zone",
         1186 => "interval",
         1266 => "time with time zone",
+        2278 => "void",
         1700 => match typmod {
             Some(m) => {
                 let m = m - 4;

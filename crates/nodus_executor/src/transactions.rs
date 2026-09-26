@@ -67,10 +67,13 @@ impl MemExecutor {
             self.notice(ctx, warning("there is no transaction in progress", "25P01"));
             return Ok(QueryOutput::tag("COMMIT"));
         };
-        // A `SET LOCAL` ends with the transaction.
+        // A `SET LOCAL` and transaction-level advisory locks end with the
+        // transaction.
         self.restore_settings(ctx, txn.local_settings.clone());
+        self.advisory.end_transaction(&ctx.session_id);
         let commit_ts = self.commit_or_release(txn.txn_id)?;
         self.kv.commit(txn.txn_id, commit_ts)?;
+        self.deliver_notifications(&ctx.session_id, txn.pending_notifications.clone());
         self.after_commit(ctx);
         Ok(QueryOutput::tag("COMMIT"))
     }
@@ -184,6 +187,7 @@ impl MemExecutor {
         };
         // Settings changed in the transaction go back.
         self.restore_settings(ctx, txn.settings_before.clone());
+        self.advisory.end_transaction(&ctx.session_id);
         self.txn.abort_txn(txn.txn_id)?;
         self.kv.abort(txn.txn_id)?;
         Ok(QueryOutput::tag("ROLLBACK"))
@@ -373,6 +377,73 @@ impl MemExecutor {
             .ok_or_else(|| anyhow::anyhow!("savepoint \"{}\" does not exist", name))?;
         txn.savepoints.truncate(savepoint_idx);
         Ok(QueryOutput::tag("RELEASE"))
+    }
+
+    /// `LOCK TABLE`: NodusDB's transactions need no table locks, so it only
+    /// checks that it runs in a transaction block and the tables exist.
+    pub(crate) fn exec_lock_table(
+        &self,
+        ctx: &ExecutionContext,
+        tables: Vec<String>,
+    ) -> Result<QueryOutput> {
+        if !self.in_explicit_txn(&ctx.session_id) {
+            anyhow::bail!("LOCK TABLE can only be used in transaction blocks");
+        }
+        for table in &tables {
+            let (db, schema, name) = crate::planner::parse_object_name(table)?;
+            if self.catalog_reader.get_table(db, schema, name).is_err() {
+                anyhow::bail!("relation \"{name}\" does not exist");
+            }
+        }
+        Ok(QueryOutput::tag("LOCK TABLE"))
+    }
+
+    /// `LISTEN channel`.
+    pub(crate) fn exec_listen(
+        &self,
+        ctx: &ExecutionContext,
+        channel: String,
+    ) -> Result<QueryOutput> {
+        self.listeners
+            .write()
+            .entry(ctx.session_id.clone())
+            .or_default()
+            .insert(channel);
+        Ok(QueryOutput::tag("LISTEN"))
+    }
+
+    /// `UNLISTEN channel` / `UNLISTEN *`.
+    pub(crate) fn exec_unlisten(
+        &self,
+        ctx: &ExecutionContext,
+        channel: Option<String>,
+    ) -> Result<QueryOutput> {
+        let mut listeners = self.listeners.write();
+        match channel {
+            Some(channel) => {
+                if let Some(channels) = listeners.get_mut(&ctx.session_id) {
+                    channels.remove(&channel);
+                }
+            }
+            None => {
+                listeners.remove(&ctx.session_id);
+            }
+        }
+        Ok(QueryOutput::tag("UNLISTEN"))
+    }
+
+    /// `NOTIFY channel, payload`.
+    pub(crate) fn exec_notify(
+        &self,
+        ctx: &ExecutionContext,
+        channel: String,
+        payload: String,
+    ) -> Result<QueryOutput> {
+        if payload.len() >= 8000 {
+            anyhow::bail!("payload string too long");
+        }
+        self.queue_notifications(ctx, vec![(channel, payload)]);
+        Ok(QueryOutput::tag("NOTIFY"))
     }
 
     /// `PREPARE`: keeps the statement for the session, by name.

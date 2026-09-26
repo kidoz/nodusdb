@@ -1153,6 +1153,23 @@ pub enum LogicalPlan {
     Deallocate {
         name: Option<String>,
     },
+    /// `LOCK [TABLE] names [IN mode MODE] [NOWAIT]`.
+    LockTable {
+        tables: Vec<String>,
+    },
+    /// `LISTEN channel`.
+    Listen {
+        channel: String,
+    },
+    /// `UNLISTEN channel`, or `UNLISTEN *` without one.
+    Unlisten {
+        channel: Option<String>,
+    },
+    /// `NOTIFY channel [, payload]`.
+    Notify {
+        channel: String,
+        payload: String,
+    },
     SelectLiteral {
         /// `(column alias, value, optional SQL type hint)`. The hint (from a
         /// CAST) types the column even when the value is NULL.

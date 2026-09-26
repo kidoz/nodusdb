@@ -108,8 +108,12 @@ pub(crate) fn sqlstate_for_execution_error(err_str: &str) -> &'static str {
         || err_str.ends_with("not supported for input")
     {
         "0A000" // feature_not_supported
-    } else if err_str == "canceling statement due to statement timeout" {
+    } else if err_str == "canceling statement due to statement timeout"
+        || err_str == "canceling statement due to user request"
+    {
         "57014" // query_canceled
+    } else if err_str == "canceling statement due to lock timeout" {
+        "55P03" // lock_not_available
     } else if err_str.contains("must be ahead of \"PR\"") {
         "42601" // syntax_error
     } else if err_str.starts_with("operator does not exist:") {

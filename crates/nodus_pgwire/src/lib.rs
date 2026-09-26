@@ -73,6 +73,16 @@ where
             ))
             .await?;
     }
+    // Notifications on the channels the session listens on.
+    for (pid, channel, payload) in executor.take_notifications(session_id) {
+        client
+            .send(
+                pgwire::messages::PgWireBackendMessage::NotificationResponse(
+                    pgwire::messages::response::NotificationResponse::new(pid, channel, payload),
+                ),
+            )
+            .await?;
+    }
     Ok(())
 }
 

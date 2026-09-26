@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+mod advisory;
 mod aggregates;
 mod alter_table;
 mod constraints;
@@ -43,6 +44,7 @@ mod search_path;
 mod select;
 mod sequences;
 mod session_env;
+mod session_functions;
 mod session_vars;
 mod set_ops;
 mod streaming;
@@ -172,6 +174,9 @@ pub(crate) struct ActiveTxn {
     /// Settings a `SET LOCAL` changed, with the values restored when it
     /// commits.
     pub(crate) local_settings: HashMap<String, Option<String>>,
+    /// Notifications (`NOTIFY`) sent in it, delivered when it commits:
+    /// channel and payload.
+    pub(crate) pending_notifications: Vec<(String, String)>,
 }
 
 impl ActiveTxn {
@@ -188,6 +193,7 @@ impl ActiveTxn {
             queried: false,
             settings_before: HashMap::new(),
             local_settings: HashMap::new(),
+            pending_notifications: Vec::new(),
         }
     }
 }
@@ -230,6 +236,12 @@ pub trait Executor: Send + Sync {
     /// session's statements changed since the last call, with their new
     /// values, for the client's `ParameterStatus` messages.
     fn take_parameter_changes(&self, _session_id: &str) -> Vec<(String, String)> {
+        Vec::new()
+    }
+
+    /// Takes the notifications (`NOTIFY`) for the session's channels since
+    /// the last call: the sender's process id, the channel, and the payload.
+    fn take_notifications(&self, _session_id: &str) -> Vec<(i32, String, String)> {
         Vec::new()
     }
 
@@ -356,6 +368,27 @@ pub struct MemExecutor {
     /// Per session, the statements SQL `PREPARE` named.
     pub(crate) prepared:
         parking_lot::Mutex<HashMap<String, std::collections::BTreeMap<String, PreparedStatement>>>,
+    /// The node's advisory locks.
+    pub(crate) advisory: Arc<advisory::AdvisoryLocks>,
+    /// Per session, the channels it listens on (`LISTEN`).
+    pub(crate) listeners: parking_lot::RwLock<HashMap<String, std::collections::BTreeSet<String>>>,
+    /// Per session, notifications for it not yet taken by the wire layer:
+    /// the sender's process id, the channel, and the payload.
+    pub(crate) notifications: parking_lot::Mutex<HashMap<String, Vec<(i32, String, String)>>>,
+    /// Per session, what it is doing, for `pg_stat_activity`.
+    pub(crate) activity: parking_lot::RwLock<HashMap<String, SessionActivity>>,
+}
+
+/// What a session is doing, as `pg_stat_activity` shows it.
+pub(crate) struct SessionActivity {
+    pub(crate) principal: PrincipalId,
+    /// When it connected, its current (or last) statement started, and its
+    /// state last changed, microseconds since the epoch.
+    pub(crate) backend_start: i64,
+    pub(crate) query_start: i64,
+    pub(crate) state_change: i64,
+    /// Whether a statement is running.
+    pub(crate) active: bool,
 }
 
 /// A statement SQL `PREPARE` keeps for its session.
@@ -379,6 +412,7 @@ impl MemExecutor {
         kv: Arc<dyn KvEngine>,
         txn: Arc<dyn TxnManager>,
     ) -> Self {
+        session_functions::server_started();
         let sequences = Arc::new(sequences::SequenceStore::new(
             catalog_reader.clone(),
             kv.clone(),
@@ -401,13 +435,77 @@ impl MemExecutor {
             parameter_changes: parking_lot::Mutex::new(HashMap::new()),
             temp_relations: parking_lot::Mutex::new(HashMap::new()),
             prepared: parking_lot::Mutex::new(HashMap::new()),
+            advisory: Arc::new(advisory::AdvisoryLocks::default()),
+            listeners: parking_lot::RwLock::new(HashMap::new()),
+            notifications: parking_lot::Mutex::new(HashMap::new()),
+            activity: parking_lot::RwLock::new(HashMap::new()),
         }
     }
 
+    /// Notes that the session's statement starts (`active`) or ends.
+    fn note_activity(&self, ctx: &ExecutionContext, active: bool) {
+        let now = session_env::wall_micros();
+        let mut activity = self.activity.write();
+        let entry = activity
+            .entry(ctx.session_id.clone())
+            .or_insert_with(|| SessionActivity {
+                principal: ctx.principal_id,
+                backend_start: now,
+                query_start: now,
+                state_change: now,
+                active,
+            });
+        entry.principal = ctx.principal_id;
+        if active {
+            entry.query_start = now;
+        }
+        entry.active = active;
+        entry.state_change = now;
+    }
+
     /// Forgets the session state `DISCARD ALL` clears besides settings,
-    /// temporary relations, and sequence values: its prepared statements.
+    /// temporary relations, and sequence values: its prepared statements,
+    /// channels, and advisory locks.
     pub(crate) fn discard_session_state(&self, session_id: &str) {
         self.prepared.lock().remove(session_id);
+        self.listeners.write().remove(session_id);
+        self.advisory.unlock_all(session_id);
+    }
+
+    /// Sends notifications from the session: when its transaction commits,
+    /// or at once outside one.
+    pub(crate) fn queue_notifications(&self, ctx: &ExecutionContext, notes: Vec<(String, String)>) {
+        if notes.is_empty() {
+            return;
+        }
+        if let Some(txn) = self
+            .active_txns
+            .write()
+            .get_mut(&ctx.session_id)
+            .filter(|t| t.explicit)
+        {
+            txn.pending_notifications.extend(notes);
+            return;
+        }
+        self.deliver_notifications(&ctx.session_id, notes);
+    }
+
+    /// Hands notifications to the sessions listening on their channels.
+    pub(crate) fn deliver_notifications(&self, sender: &str, notes: Vec<(String, String)>) {
+        let pid = temp_tables::backend_pid(sender) as i32;
+        let listeners = self.listeners.read();
+        let mut inbox = self.notifications.lock();
+        for (channel, payload) in notes {
+            for (session, channels) in listeners.iter() {
+                if channels.contains(&channel) {
+                    inbox.entry(session.clone()).or_default().push((
+                        pid,
+                        channel.clone(),
+                        payload.clone(),
+                    ));
+                }
+            }
+        }
     }
 
     /// Raises a notice to the session running `ctx`'s statement.
@@ -568,6 +666,10 @@ impl MemExecutor {
                 settings
             },
             staged_settings: Vec::new(),
+            staged_notices: Vec::new(),
+            staged_notifications: Vec::new(),
+            advisory: Some(self.advisory.clone()),
+            authz: Some((self.authz.clone(), ctx.principal_id)),
             in_explicit_txn: self
                 .active_txns
                 .read()
@@ -1041,10 +1143,12 @@ impl MemExecutor {
                 }
             })
             .map(|out| {
-                // Settings `set_config` changed take effect with the statement.
+                // Settings `set_config` changed take effect with the statement,
+                // and notifications `pg_notify` sent are sent.
                 for (name, value, local) in session_env::take_staged_settings() {
                     self.change_setting(ctx, &name, value, local);
                 }
+                self.queue_notifications(ctx, session_env::take_staged_notifications());
                 out
             })
             .map(|out| self.name_object_identifiers(out))
@@ -1058,8 +1162,18 @@ impl MemExecutor {
                 out
             });
 
+        // Warnings functions raised go to the client even when the statement
+        // fails.
+        for notice in session_env::take_staged_notices() {
+            self.notices
+                .lock()
+                .entry(ctx.session_id.clone())
+                .or_default()
+                .push(notice);
+        }
         if let Some(txn_id) = implicit_txn {
             self.active_txns.write().remove(&ctx.session_id);
+            self.advisory.end_transaction(&ctx.session_id);
             match &result {
                 Ok(_) => {
                     let commit_ts = self.commit_or_release(txn_id)?;
@@ -1099,7 +1213,10 @@ impl Executor for MemExecutor {
             anyhow::bail!("restore in progress; retry shortly");
         }
         let _drain_guard = self.restore_gate.read();
-        self.execute_logical_tracked(ctx, plan)
+        self.note_activity(ctx, true);
+        let result = self.execute_logical_tracked(ctx, plan);
+        self.note_activity(ctx, false);
+        result
     }
 
     fn execute_physical(&self, ctx: &ExecutionContext, plan: PhysicalPlan) -> Result<Vec<Row>> {
@@ -1143,6 +1260,13 @@ impl Executor for MemExecutor {
             .unwrap_or_default()
     }
 
+    fn take_notifications(&self, session_id: &str) -> Vec<(i32, String, String)> {
+        self.notifications
+            .lock()
+            .remove(session_id)
+            .unwrap_or_default()
+    }
+
     fn end_session(&self, session_id: &str) {
         if let Some(txn) = self.active_txns.write().remove(session_id) {
             // A client that drops mid-transaction must not leave the write intent
@@ -1156,6 +1280,8 @@ impl Executor for MemExecutor {
         self.session_resets.write().remove(session_id);
         self.parameter_changes.lock().remove(session_id);
         self.discard_session_state(session_id);
+        self.notifications.lock().remove(session_id);
+        self.activity.write().remove(session_id);
         self.notices.lock().remove(session_id);
         self.sequences.end_session(session_id);
     }

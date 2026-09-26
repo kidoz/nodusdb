@@ -66,6 +66,10 @@ impl MemExecutor {
             } => self.exec_prepare(ctx, name, param_types, statement),
             LogicalPlan::Execute { name, params } => self.exec_execute(ctx, name, params),
             LogicalPlan::Deallocate { name } => self.exec_deallocate(ctx, name),
+            LogicalPlan::LockTable { tables } => self.exec_lock_table(ctx, tables),
+            LogicalPlan::Listen { channel } => self.exec_listen(ctx, channel),
+            LogicalPlan::Unlisten { channel } => self.exec_unlisten(ctx, channel),
+            LogicalPlan::Notify { channel, payload } => self.exec_notify(ctx, channel, payload),
             LogicalPlan::CreateView {
                 name,
                 query,

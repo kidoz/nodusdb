@@ -1,6 +1,6 @@
 //! Session state across statements and between sessions: transaction
-//! modes, settings, temporary tables, prepared statements, and the time
-//! zone, driven through SQL.
+//! modes, settings, temporary tables, prepared statements, advisory locks,
+//! notifications, and the time zone, driven through SQL.
 
 use super::*;
 use crate::dml_join_tests::rows;
@@ -115,6 +115,42 @@ fn prepared_statements_run_with_their_parameters() {
     assert!(sql("b", "EXECUTE get(1)").is_err());
     exec.end_session("a");
     assert!(sql("a", "EXECUTE get(1)").is_err());
+}
+
+#[test]
+fn advisory_locks_conflict_between_sessions() {
+    let (_, sql) = sessions();
+    let one = |session: &str, query: &str| rows(&sql(session, query).unwrap()).join(",");
+    assert_eq!(one("a", "SELECT pg_try_advisory_lock(1)"), "t");
+    assert_eq!(one("b", "SELECT pg_try_advisory_lock(1)"), "f");
+    assert_eq!(one("b", "SELECT pg_try_advisory_lock_shared(2)"), "t");
+    assert_eq!(one("a", "SELECT pg_try_advisory_lock_shared(2)"), "t");
+    assert_eq!(one("a", "SELECT pg_advisory_unlock(1)"), "t");
+    assert_eq!(one("b", "SELECT pg_try_advisory_lock(1)"), "t");
+    // A transaction's lock goes when it ends.
+    sql("a", "BEGIN").unwrap();
+    assert_eq!(one("a", "SELECT pg_try_advisory_xact_lock(3)"), "t");
+    assert_eq!(one("b", "SELECT pg_try_advisory_lock(3)"), "f");
+    sql("a", "COMMIT").unwrap();
+    assert_eq!(one("b", "SELECT pg_try_advisory_lock(3)"), "t");
+}
+
+#[test]
+fn notifications_reach_listeners_when_sent() {
+    let (exec, sql) = sessions();
+    sql("b", "LISTEN jobs").unwrap();
+    sql("a", "BEGIN").unwrap();
+    sql("a", "NOTIFY jobs, 'queued'").unwrap();
+    assert!(exec.take_notifications("b").is_empty());
+    sql("a", "COMMIT").unwrap();
+    let delivered = exec.take_notifications("b");
+    assert_eq!(delivered.len(), 1);
+    assert_eq!(
+        (delivered[0].1.as_str(), delivered[0].2.as_str()),
+        ("jobs", "queued")
+    );
+    sql("a", "SELECT pg_notify('jobs', 'now')").unwrap();
+    assert_eq!(exec.take_notifications("b").len(), 1);
 }
 
 #[test]

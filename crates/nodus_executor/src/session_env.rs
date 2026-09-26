@@ -21,6 +21,18 @@ pub(crate) struct SessionEnv {
     pub(crate) staged_settings: Vec<(String, Option<String>, bool)>,
     /// Whether the statement runs in an explicit transaction.
     pub(crate) in_explicit_txn: bool,
+    /// Notices (warnings) functions raised in this statement.
+    pub(crate) staged_notices: Vec<String>,
+    /// Notifications `pg_notify` sent in this statement: channel, payload.
+    pub(crate) staged_notifications: Vec<(String, String)>,
+    /// The node's advisory locks.
+    pub(crate) advisory: Option<std::sync::Arc<crate::advisory::AdvisoryLocks>>,
+    /// The authorization engine and the session's principal, for the
+    /// privilege-inquiry functions (`has_table_privilege`).
+    pub(crate) authz: Option<(
+        std::sync::Arc<dyn nodus_authz::AuthzEngine>,
+        nodus_catalog::PrincipalId,
+    )>,
     /// Start of the current transaction (`now()`), microseconds since the epoch.
     pub(crate) transaction_micros: i64,
     /// Start of the current statement (`statement_timestamp()`).
@@ -93,6 +105,44 @@ pub(crate) fn stage_setting(name: &str, value: Option<String>, local: bool) {
             }
         }
     });
+}
+
+/// Raises a notice (a warning) from a function to the statement's client.
+pub(crate) fn notice(notice: crate::error_fields::DbError) {
+    ENV.with(|slot| {
+        if let Some(env) = slot.borrow_mut().as_mut() {
+            env.staged_notices.push(notice.into_text());
+        }
+    });
+}
+
+/// Takes the notices functions raised in this statement.
+pub(crate) fn take_staged_notices() -> Vec<String> {
+    ENV.with(|slot| {
+        slot.borrow_mut()
+            .as_mut()
+            .map(|env| std::mem::take(&mut env.staged_notices))
+            .unwrap_or_default()
+    })
+}
+
+/// `pg_notify(channel, payload)`: sent with the statement.
+pub(crate) fn stage_notification(channel: String, payload: String) {
+    ENV.with(|slot| {
+        if let Some(env) = slot.borrow_mut().as_mut() {
+            env.staged_notifications.push((channel, payload));
+        }
+    });
+}
+
+/// Takes the notifications `pg_notify` sent in this statement.
+pub(crate) fn take_staged_notifications() -> Vec<(String, String)> {
+    ENV.with(|slot| {
+        slot.borrow_mut()
+            .as_mut()
+            .map(|env| std::mem::take(&mut env.staged_notifications))
+            .unwrap_or_default()
+    })
 }
 
 /// Takes the settings `set_config` staged in this statement.
