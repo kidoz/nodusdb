@@ -64,6 +64,15 @@ pub(crate) fn sqlstate_for_execution_error(err_str: &str) -> &'static str {
         || err_str.ends_with("violates not-null constraint")
     {
         "23502" // not_null_violation
+    } else if err_str == "cannot truncate a table referenced in a foreign key constraint" {
+        "0A000" // feature_not_supported, as PostgreSQL reports it
+    } else if err_str.starts_with("there is no unique constraint matching given keys")
+        || err_str.starts_with("there is no primary key for referenced table")
+        || err_str.starts_with("number of referencing and referenced columns")
+    {
+        "42830" // invalid_foreign_key
+    } else if err_str.contains("violates RESTRICT setting of foreign key constraint") {
+        "23001" // restrict_violation
     } else if err_str.contains("violates foreign key constraint") {
         "23503" // foreign_key_violation
     } else if err_str.contains("violates check constraint") {

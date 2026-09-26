@@ -223,7 +223,8 @@ impl MemExecutor {
             LogicalPlan::Truncate {
                 tables,
                 restart_identity,
-            } => self.exec_truncate(ctx, tables, restart_identity),
+                cascade,
+            } => self.exec_truncate(ctx, tables, restart_identity, cascade),
             LogicalPlan::Explain { plan, options } => self.exec_explain(ctx, *plan, options),
             LogicalPlan::With { ctes, body } => {
                 let _bindings = self.bind_ctes(ctx, ctes)?;

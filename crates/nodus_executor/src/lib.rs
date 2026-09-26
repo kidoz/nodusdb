@@ -34,6 +34,7 @@ mod parameters;
 mod pg_catalog;
 mod plan_types;
 mod planner;
+mod referential;
 mod result_types;
 mod select;
 mod sequences;
@@ -989,6 +990,8 @@ impl Executor for MemExecutor {
     }
 }
 
+#[cfg(test)]
+mod constraint_tests;
 #[cfg(test)]
 mod dml_join_tests;
 #[cfg(test)]

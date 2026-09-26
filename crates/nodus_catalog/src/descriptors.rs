@@ -113,7 +113,30 @@ pub enum TableConstraint {
         columns: Vec<String>,
         foreign_table: String,
         referred_columns: Vec<String>,
+        /// What deleting a referenced row does to the rows referencing it.
+        /// Defaulted so descriptors persisted before it decode.
+        #[serde(default)]
+        on_delete: ReferentialAction,
+        /// What changing a referenced key does to the rows referencing it.
+        #[serde(default)]
+        on_update: ReferentialAction,
     },
+}
+
+/// A foreign key's `ON DELETE` / `ON UPDATE` action.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReferentialAction {
+    /// Reject the change if a reference remains at the end of the statement.
+    #[default]
+    NoAction,
+    /// Reject the change as soon as it would leave a reference.
+    Restrict,
+    /// Delete the referencing rows, or change their keys along.
+    Cascade,
+    /// Set the referencing columns to NULL.
+    SetNull,
+    /// Set the referencing columns to their defaults.
+    SetDefault,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

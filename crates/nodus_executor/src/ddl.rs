@@ -105,6 +105,28 @@ impl MemExecutor {
             anyhow::bail!("relation \"{}\" already exists", table_only);
         }
         let constraints = name_check_constraints(table_only, &columns, constraints);
+        // Foreign keys get their names and referenced columns, checked
+        // against the referenced table's keys (the new table's own, for one
+        // referencing itself).
+        let keys = crate::referential::Keys {
+            name: table_only.to_string(),
+            columns: columns.iter().map(|c| c.name.clone()).collect(),
+            primary: columns
+                .iter()
+                .filter(|c| c.primary)
+                .map(|c| c.name.clone())
+                .collect(),
+            unique: columns
+                .iter()
+                .filter(|c| c.unique && !c.primary)
+                .map(|c| vec![c.name.clone()])
+                .chain(unique_constraints.iter().cloned())
+                .collect(),
+        };
+        let constraints = constraints
+            .into_iter()
+            .map(|c| self.prepare_foreign_key(&keys, schema_name, c))
+            .collect::<Result<Vec<_>>>()?;
         // A `serial` or identity column's sequence, validated before anything
         // is created.
         let owned_sequences = columns

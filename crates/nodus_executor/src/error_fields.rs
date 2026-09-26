@@ -41,6 +41,10 @@ impl DbError {
         self.field("detail", detail)
     }
 
+    pub(crate) fn hint(self, hint: impl AsRef<str>) -> Self {
+        self.field("hint", hint)
+    }
+
     pub(crate) fn schema(self, schema: impl AsRef<str>) -> Self {
         self.field("schema", schema)
     }

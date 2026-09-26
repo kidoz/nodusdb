@@ -1122,6 +1122,10 @@ pub enum LogicalPlan {
     Truncate {
         tables: Vec<String>,
         restart_identity: bool,
+        /// `CASCADE`: also empties the tables whose foreign keys reference
+        /// these. Defaulted so older plans decode.
+        #[serde(default)]
+        cascade: bool,
     },
     /// `REFRESH MATERIALIZED VIEW name [WITH [NO] DATA]`.
     RefreshMaterializedView {

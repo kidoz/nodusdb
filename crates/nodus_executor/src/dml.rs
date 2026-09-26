@@ -370,6 +370,23 @@ impl MemExecutor {
     /// index is present (e.g. a PK-less table), preserving the legacy rowid so
     /// existing data stays addressable.
     pub(crate) fn pk_positions(tbl: &nodus_catalog::TableDescriptor) -> Vec<usize> {
+        let positions = Self::pk_positions_declared(tbl);
+        if positions.is_empty() {
+            // PK-less table: key by the whole row so rows sharing a first-column
+            // value don't collide (PostgreSQL allows duplicate rows). The key is
+            // content-derived, so it stays deterministic across Raft replicas.
+            // Caveat: exact-duplicate rows still collide (the KV layer has no
+            // physical tuple identity), and pre-existing PK-less data written by
+            // an older binary (first-column keys) must be re-imported.
+            (0..tbl.columns.len()).collect()
+        } else {
+            positions
+        }
+    }
+
+    /// The positions of the declared PRIMARY KEY's columns; empty when the
+    /// table has none.
+    pub(crate) fn pk_positions_declared(tbl: &nodus_catalog::TableDescriptor) -> Vec<usize> {
         // A composite PRIMARY KEY is modeled as one Primary index per column, so
         // gather key columns from every primary index, then order them by their
         // table-column position for a deterministic composite key.
@@ -382,17 +399,7 @@ impl MemExecutor {
             .collect();
         positions.sort_unstable();
         positions.dedup();
-        if positions.is_empty() {
-            // PK-less table: key by the whole row so rows sharing a first-column
-            // value don't collide (PostgreSQL allows duplicate rows). The key is
-            // content-derived, so it stays deterministic across Raft replicas.
-            // Caveat: exact-duplicate rows still collide (the KV layer has no
-            // physical tuple identity), and pre-existing PK-less data written by
-            // an older binary (first-column keys) must be re-imported.
-            (0..tbl.columns.len()).collect()
-        } else {
-            positions
-        }
+        positions
     }
 
     /// A table with no indexes at all (no PRIMARY KEY, UNIQUE, or secondary
@@ -461,6 +468,10 @@ impl MemExecutor {
         // Keys this statement inserted or updated: ON CONFLICT DO UPDATE may not
         // affect the same row twice.
         let mut touched = std::collections::HashSet::new();
+        // Rows ON CONFLICT DO UPDATE changed, for the foreign keys that
+        // reference the table.
+        let referenced = on_conflict.is_some() && self.is_referenced(&tbl)?;
+        let mut changed = Vec::new();
 
         for (row_idx, values) in values_list.iter().enumerate() {
             if values.len() > targets.len() {
@@ -560,6 +571,9 @@ impl MemExecutor {
                             self.replace_row(ctx, &tbl, &existing_key, &existing_row, &updated)?;
                         touched.insert(key);
                         inserted_count += 1;
+                        if referenced {
+                            changed.push((existing_row.clone(), updated.clone()));
+                        }
                         if !returning.is_empty() {
                             returning_rows.push([updated, existing_row].concat());
                         }
@@ -569,7 +583,7 @@ impl MemExecutor {
             }
 
             self.check_unique_constraints(&ctx.session_id, &tbl, &row, None)?;
-            self.check_table_constraints(ctx, &tbl, &row, &col_names)?;
+            self.check_table_constraints(ctx, &tbl, &row, None, &col_names)?;
 
             // Key: declared PRIMARY KEY / full-row content, or a synthetic rowid
             // for an index-less table (so exact-duplicate rows don't collide).
@@ -603,6 +617,7 @@ impl MemExecutor {
                 returning_rows.push(row);
             }
         }
+        self.enforce_references(ctx, &tbl, &[], &changed)?;
         Ok(scope.returning_output(
             self,
             ctx,
@@ -654,6 +669,9 @@ impl MemExecutor {
 
         let mut updated = 0;
         let mut returning_rows = Vec::new();
+        // The changed rows, for the foreign keys that reference the table.
+        let referenced = self.is_referenced(&tbl)?;
+        let mut changed = Vec::new();
         // Two-phase: pick the matching rows before mutating, so a subquery in
         // the filter evaluates against the pre-statement state.
         for (old_key, old_row, joined) in
@@ -665,6 +683,9 @@ impl MemExecutor {
                 self.apply_assignments(ctx, &tbl, &assignments, &old_row, (&joined, &scope.names))?;
             self.replace_row(ctx, &tbl, &old_key, &old_row, &row)?;
             updated += 1;
+            if referenced {
+                changed.push((old_row.clone(), row.clone()));
+            }
             if !returning.is_empty() {
                 let mut returned = joined;
                 returned.splice(..row.len(), row);
@@ -672,6 +693,7 @@ impl MemExecutor {
                 returning_rows.push(returned);
             }
         }
+        self.enforce_references(ctx, &tbl, &[], &changed)?;
         Ok(scope.returning_output(
             self,
             ctx,
@@ -712,18 +734,25 @@ impl MemExecutor {
 
         let mut deleted = 0;
         let mut returning_rows = Vec::new();
+        // The removed rows, for the foreign keys that reference the table.
+        let referenced = self.is_referenced(&tbl)?;
+        let mut removed = Vec::new();
         // Two-phase: decide WHICH rows match before mutating anything, so a
         // subquery in the filter (e.g. `WHERE a = (SELECT max(a) ...)`) sees
         // the pre-statement state rather than partially-deleted data.
         for (key, row, joined) in self.matching_targets(ctx, &tbl, &scope, filter.as_ref())? {
             self.remove_row(ctx, &tbl, &key, &row)?;
             deleted += 1;
+            if referenced {
+                removed.push(row.clone());
+            }
             if !returning.is_empty() {
                 // A deleted row has no values as written.
                 let written = vec![Value::Null; row.len() + 1];
                 returning_rows.push([joined, row, written].concat());
             }
         }
+        self.enforce_references(ctx, &tbl, &removed, &[])?;
         Ok(scope.returning_output(
             self,
             ctx,
@@ -740,8 +769,9 @@ impl MemExecutor {
         ctx: &ExecutionContext,
         tables: Vec<String>,
         restart_identity: bool,
+        cascade: bool,
     ) -> Result<QueryOutput> {
-        let mut sequences = Vec::new();
+        let mut targets: Vec<nodus_catalog::TableDescriptor> = Vec::new();
         for table_name in &tables {
             let (db_name, schema_name, table_only) = parse_object_name(table_name)?;
             let tbl = self
@@ -753,6 +783,46 @@ impl MemExecutor {
             {
                 anyhow::bail!("\"{table_only}\" is not a table");
             }
+            if !targets.iter().any(|t| t.id == tbl.id) {
+                targets.push(tbl);
+            }
+        }
+        // A table a foreign key references is emptied only with the tables
+        // referencing it.
+        let mut next = 0;
+        while next < targets.len() {
+            for reference in self.references_to(&targets[next])? {
+                if targets.iter().any(|t| t.id == reference.child.id) {
+                    continue;
+                }
+                if !cascade {
+                    return Err(crate::error_fields::DbError::new(
+                        "cannot truncate a table referenced in a foreign key constraint",
+                    )
+                    .detail(format!(
+                        "Table \"{}\" references \"{}\".",
+                        reference.child.name, targets[next].name
+                    ))
+                    .hint(format!(
+                        "Truncate table \"{}\" at the same time, or use TRUNCATE ... CASCADE.",
+                        reference.child.name
+                    ))
+                    .into());
+                }
+                self.notice(
+                    ctx,
+                    crate::error_fields::DbError::new(format!(
+                        "truncate cascades to table \"{}\"",
+                        reference.child.name
+                    )),
+                );
+                targets.push(reference.child);
+            }
+            next += 1;
+        }
+        let mut sequences = Vec::new();
+        for tbl in &targets {
+            self.authorize(ctx, Action::Delete, ResourceRef::Table(tbl.id))?;
             sequences.extend(
                 tbl.columns
                     .iter()
@@ -760,8 +830,10 @@ impl MemExecutor {
                     .filter_map(|d| crate::sequences::default_sequence(&d)),
             );
         }
-        for table_name in tables {
-            self.exec_delete(ctx, (table_name, None), None, None, Returning::default())?;
+        for tbl in &targets {
+            for (key, row) in self.scan_rows_keyed(tbl.id, &ctx.session_id)? {
+                self.remove_row(ctx, tbl, &key, &row)?;
+            }
         }
         if restart_identity {
             for sequence in sequences {
@@ -1029,7 +1101,7 @@ impl MemExecutor {
         // existing row is a violation, not an overwrite.
         self.check_unique_constraints(&ctx.session_id, tbl, row, Some(&old_pk))?;
         let col_names: Vec<String> = tbl.columns.iter().map(|c| c.name.clone()).collect();
-        self.check_table_constraints(ctx, tbl, row, &col_names)?;
+        self.check_table_constraints(ctx, tbl, row, Some(old_row), &col_names)?;
 
         let new_key = format!("{}:{}", tbl.id, pk);
         self.write_row(

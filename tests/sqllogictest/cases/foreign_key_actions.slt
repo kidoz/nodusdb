@@ -1,0 +1,194 @@
+# Foreign keys: a reference must exist, and removing or changing a
+# referenced key applies the key's ON DELETE / ON UPDATE action.
+statement ok
+CREATE TABLE fk9p (id int PRIMARY KEY, code text UNIQUE);
+
+statement ok
+CREATE TABLE fk9c (id int PRIMARY KEY, p_id int REFERENCES fk9p ON DELETE CASCADE ON UPDATE CASCADE);
+
+statement ok
+CREATE TABLE fk9gc (id int PRIMARY KEY, c_id int REFERENCES fk9c (id) ON DELETE CASCADE);
+
+statement ok
+CREATE TABLE fk9n (id int PRIMARY KEY, p_code text REFERENCES fk9p (code) ON DELETE SET NULL ON UPDATE SET NULL, d int DEFAULT 1 REFERENCES fk9p ON DELETE SET DEFAULT);
+
+statement ok
+CREATE TABLE fk9r (id int PRIMARY KEY, p_id int REFERENCES fk9p ON DELETE RESTRICT);
+
+statement ok
+CREATE TABLE fk9a (id int PRIMARY KEY, p_id int REFERENCES fk9p);
+
+statement ok
+INSERT INTO fk9p VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e');
+
+statement ok
+INSERT INTO fk9c VALUES (10, 1), (11, 1), (12, 2);
+
+statement ok
+INSERT INTO fk9gc VALUES (100, 10), (101, 12);
+
+statement ok
+INSERT INTO fk9n VALUES (20, 'b', 3), (21, 'c', 3);
+
+statement ok
+INSERT INTO fk9r VALUES (30, 4);
+
+statement ok
+INSERT INTO fk9a VALUES (40, 5);
+
+statement error
+INSERT INTO fk9c VALUES (13, 99);
+
+statement error
+UPDATE fk9c SET p_id = 99 WHERE id = 10;
+
+statement ok
+INSERT INTO fk9c VALUES (14, NULL);
+
+statement ok
+DELETE FROM fk9p WHERE id = 1;
+
+query TT
+SELECT * FROM fk9c ORDER BY id;
+----
+12	2
+14	NULL
+
+query TT
+SELECT * FROM fk9gc ORDER BY id;
+----
+101	12
+
+statement ok
+UPDATE fk9p SET id = 22 WHERE id = 2;
+
+query TT
+SELECT * FROM fk9c ORDER BY id;
+----
+12	22
+14	NULL
+
+statement ok
+UPDATE fk9p SET code = 'bb' WHERE id = 22;
+
+query TTT
+SELECT * FROM fk9n ORDER BY id;
+----
+20	NULL	3
+21	c	3
+
+statement error
+DELETE FROM fk9p WHERE id = 3;
+
+statement error
+DELETE FROM fk9p WHERE id = 4;
+
+statement error
+UPDATE fk9p SET id = 44 WHERE id = 4;
+
+statement error
+DELETE FROM fk9p WHERE id = 5;
+
+statement error
+UPDATE fk9p SET id = 55 WHERE id = 5;
+
+statement ok
+DELETE FROM fk9a;
+
+statement ok
+DELETE FROM fk9p WHERE id = 5;
+
+query T
+SELECT id FROM fk9p ORDER BY id;
+----
+3
+4
+22
+
+statement error
+TRUNCATE fk9p;
+
+statement ok
+TRUNCATE fk9gc, fk9c;
+
+query T
+SELECT count(*) FROM fk9c;
+----
+0
+
+statement ok
+TRUNCATE fk9p CASCADE;
+
+query TTT
+SELECT (SELECT count(*) FROM fk9p), (SELECT count(*) FROM fk9n), (SELECT count(*) FROM fk9r);
+----
+0	0	0
+
+# A table referencing itself.
+statement ok
+CREATE TABLE fk9t (id int PRIMARY KEY, parent int REFERENCES fk9t ON DELETE CASCADE);
+
+statement ok
+INSERT INTO fk9t VALUES (1, NULL), (2, 1), (3, 2), (4, 1), (5, 5);
+
+statement ok
+DELETE FROM fk9t WHERE id = 1;
+
+query TT
+SELECT * FROM fk9t ORDER BY id;
+----
+5	5
+
+statement ok
+CREATE TABLE fk9s (id int PRIMARY KEY, parent int REFERENCES fk9s);
+
+statement ok
+INSERT INTO fk9s VALUES (1, NULL), (2, 1);
+
+statement error
+DELETE FROM fk9s WHERE id = 1;
+
+statement ok
+DELETE FROM fk9s;
+
+# A key over two columns references them together.
+statement ok
+CREATE TABLE fk9m (a int, b int, UNIQUE (a, b));
+
+statement ok
+INSERT INTO fk9m VALUES (1, 1), (2, 2);
+
+statement ok
+CREATE TABLE fk9mc (a int, b int, FOREIGN KEY (a, b) REFERENCES fk9m (a, b));
+
+statement ok
+INSERT INTO fk9mc VALUES (1, 1), (2, NULL);
+
+statement error
+INSERT INTO fk9mc VALUES (1, 2);
+
+# Keys must reference a unique key of an existing table.
+statement error
+CREATE TABLE fk9x (id int REFERENCES fk9p (nosuch));
+
+statement error
+CREATE TABLE fk9x (id int REFERENCES fk9nosuch);
+
+statement error
+CREATE TABLE fk9x (id int REFERENCES fk9t (parent));
+
+statement error
+CREATE TABLE fk9x (a int, b int, FOREIGN KEY (a, b) REFERENCES fk9p (id));
+
+query TTTT
+SELECT conname, confupdtype, confdeltype, pg_get_constraintdef(oid) FROM pg_constraint WHERE contype = 'f' AND conrelid::regclass::text LIKE 'fk9%' ORDER BY 1;
+----
+fk9a_p_id_fkey	a	a	FOREIGN KEY (p_id) REFERENCES fk9p(id)
+fk9c_p_id_fkey	c	c	FOREIGN KEY (p_id) REFERENCES fk9p(id) ON UPDATE CASCADE ON DELETE CASCADE
+fk9gc_c_id_fkey	a	c	FOREIGN KEY (c_id) REFERENCES fk9c(id) ON DELETE CASCADE
+fk9mc_a_b_fkey	a	a	FOREIGN KEY (a, b) REFERENCES fk9m(a, b)
+fk9n_d_fkey	a	d	FOREIGN KEY (d) REFERENCES fk9p(id) ON DELETE SET DEFAULT
+fk9n_p_code_fkey	n	n	FOREIGN KEY (p_code) REFERENCES fk9p(code) ON UPDATE SET NULL ON DELETE SET NULL
+fk9r_p_id_fkey	a	r	FOREIGN KEY (p_id) REFERENCES fk9p(id) ON DELETE RESTRICT
+fk9s_parent_fkey	a	a	FOREIGN KEY (parent) REFERENCES fk9s(id)
+fk9t_parent_fkey	a	c	FOREIGN KEY (parent) REFERENCES fk9t(id) ON DELETE CASCADE

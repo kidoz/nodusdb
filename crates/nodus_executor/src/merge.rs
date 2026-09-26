@@ -147,7 +147,11 @@ impl MemExecutor {
         let target_nulls = vec![Value::Null; tbl.columns.len()];
         let source_nulls = vec![Value::Null; scope.names.len() - tbl.columns.len()];
         let mut modified = vec![false; targets.len()];
-        let mut changed = 0;
+        // The rows removed and changed, for the foreign keys that reference
+        // the table.
+        let referenced = self.is_referenced(&tbl)?;
+        let (mut removed, mut changed) = (Vec::new(), Vec::new());
+        let mut count = 0;
         let mut returning_rows = Vec::new();
         for (t, s) in join {
             let target = t.map_or(target_nulls.as_slice(), |t| targets[t].1.as_slice());
@@ -211,12 +215,18 @@ impl MemExecutor {
                             (&joined, names),
                         )?;
                         self.replace_row(ctx, &tbl, key, target, &row)?;
+                        if referenced {
+                            changed.push((target.to_vec(), row.clone()));
+                        }
                         if !returning.is_empty() {
                             let action = [Value::Text("UPDATE".to_string())];
                             returning_rows.push([row.as_slice(), source, target, &action].concat());
                         }
                     } else {
                         self.remove_row(ctx, &tbl, key, target)?;
+                        if referenced {
+                            removed.push(target.to_vec());
+                        }
                         if !returning.is_empty() {
                             let action = [Value::Text("DELETE".to_string())];
                             returning_rows
@@ -226,14 +236,15 @@ impl MemExecutor {
                 }
                 _ => anyhow::bail!("MERGE action does not apply to its clause"),
             }
-            changed += 1;
+            count += 1;
         }
+        self.enforce_references(ctx, &tbl, &removed, &changed)?;
         Ok(scope.returning_output(
             self,
             ctx,
             &returning,
             returning_rows,
-            format!("MERGE {changed}"),
+            format!("MERGE {count}"),
         ))
     }
 

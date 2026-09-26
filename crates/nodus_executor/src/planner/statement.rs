@@ -230,16 +230,11 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                             });
                         }
                         sqlparser::ast::ColumnOption::ForeignKey(fk) => {
-                            tbl_constraints.push(nodus_catalog::TableConstraint::ForeignKey {
-                                name: opt.name.as_ref().map(|n| n.value.clone()),
-                                columns: vec![c.name.value.clone()],
-                                foreign_table: fk.foreign_table.to_string(),
-                                referred_columns: fk
-                                    .referred_columns
-                                    .iter()
-                                    .map(|i| i.value.clone())
-                                    .collect(),
-                            });
+                            tbl_constraints.push(foreign_key(
+                                opt.name.as_ref().or(fk.name.as_ref()),
+                                vec![c.name.value.clone()],
+                                fk,
+                            )?);
                         }
                         _ => {}
                     }
@@ -286,16 +281,11 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                         });
                     }
                     sqlparser::ast::TableConstraint::ForeignKey(fk) => {
-                        tbl_constraints.push(nodus_catalog::TableConstraint::ForeignKey {
-                            name: fk.name.as_ref().map(|n| n.value.clone()),
-                            columns: fk.columns.iter().map(|c| c.value.clone()).collect(),
-                            foreign_table: fk.foreign_table.to_string(),
-                            referred_columns: fk
-                                .referred_columns
-                                .iter()
-                                .map(|i| i.value.clone())
-                                .collect(),
-                        });
+                        tbl_constraints.push(foreign_key(
+                            fk.name.as_ref(),
+                            fk.columns.iter().map(|c| c.value.clone()).collect(),
+                            fk,
+                        )?);
                     }
                     _ => {}
                 }
@@ -772,6 +762,10 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                 truncate.identity,
                 Some(sqlparser::ast::TruncateIdentityOption::Restart)
             ),
+            cascade: matches!(
+                truncate.cascade,
+                Some(sqlparser::ast::CascadeOption::Cascade)
+            ),
         }),
         // Statistics and space are managed by the storage engine.
         Statement::Analyze(_) => Ok(LogicalPlan::Noop {
@@ -1068,6 +1062,40 @@ fn filter_has_subquery(filter: &FilterExpr) -> bool {
         }
         _ => false,
     }
+}
+
+/// A `FOREIGN KEY` / `REFERENCES` constraint over `columns`. A key that
+/// names no referenced columns references the primary key, resolved when
+/// the constraint is created.
+fn foreign_key(
+    name: Option<&sqlparser::ast::Ident>,
+    columns: Vec<String>,
+    fk: &sqlparser::ast::ForeignKeyConstraint,
+) -> Result<nodus_catalog::TableConstraint> {
+    use nodus_catalog::ReferentialAction as A;
+    use sqlparser::ast::ConstraintReferenceMatchKind as M;
+    if matches!(fk.match_kind, Some(M::Full | M::Partial)) {
+        anyhow::bail!("MATCH FULL and MATCH PARTIAL foreign keys are not supported");
+    }
+    let action = |action: Option<sqlparser::ast::ReferentialAction>| match action {
+        None | Some(sqlparser::ast::ReferentialAction::NoAction) => A::NoAction,
+        Some(sqlparser::ast::ReferentialAction::Restrict) => A::Restrict,
+        Some(sqlparser::ast::ReferentialAction::Cascade) => A::Cascade,
+        Some(sqlparser::ast::ReferentialAction::SetNull) => A::SetNull,
+        Some(sqlparser::ast::ReferentialAction::SetDefault) => A::SetDefault,
+    };
+    Ok(nodus_catalog::TableConstraint::ForeignKey {
+        name: name.map(|n| n.value.clone()),
+        columns,
+        foreign_table: fk.foreign_table.to_string(),
+        referred_columns: fk
+            .referred_columns
+            .iter()
+            .map(|i| i.value.clone())
+            .collect(),
+        on_delete: action(fk.on_delete),
+        on_update: action(fk.on_update),
+    })
 }
 
 /// Which statement a `RETURNING` list belongs to.

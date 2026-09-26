@@ -1753,6 +1753,8 @@ impl MemExecutor {
                         columns,
                         foreign_table,
                         referred_columns,
+                        on_delete,
+                        on_update,
                     } => {
                         let conname = name.clone().unwrap_or_else(|| {
                             format!("{}_{}_fkey", table.name, columns.join("_"))
@@ -1793,8 +1795,8 @@ impl MemExecutor {
                             Value::Int(0),
                             Value::Int(0),
                             Value::Int(confrelid),
-                            Value::Text("a".into()),
-                            Value::Text("a".into()),
+                            Value::Text(referential_action_code(*on_update).into()),
+                            Value::Text(referential_action_code(*on_delete).into()),
                             Value::Text("s".into()),
                             Value::Bool(true),
                             Value::Int(0),
@@ -2129,11 +2131,22 @@ impl MemExecutor {
                         columns,
                         foreign_table,
                         referred_columns,
+                        on_delete,
+                        on_update,
                     } => {
                         let name = name.clone().unwrap_or_else(|| {
                             format!("{}_{}_fkey", table.name, columns.join("_"))
                         });
                         if is(&name) {
+                            // PostgreSQL lists ON UPDATE first, and leaves out
+                            // NO ACTION.
+                            let actions: String = [("UPDATE", on_update), ("DELETE", on_delete)]
+                                .into_iter()
+                                .filter_map(|(event, action)| {
+                                    referential_action_sql(*action)
+                                        .map(|sql| format!(" ON {event} {sql}"))
+                                })
+                                .collect();
                             let quote = |names: &[String]| {
                                 names
                                     .iter()
@@ -2142,7 +2155,7 @@ impl MemExecutor {
                                     .join(", ")
                             };
                             return Some(format!(
-                                "FOREIGN KEY ({}) REFERENCES {}({})",
+                                "FOREIGN KEY ({}) REFERENCES {}({}){actions}",
                                 quote(columns),
                                 foreign_table,
                                 quote(referred_columns)
@@ -2343,3 +2356,27 @@ const SYSTEM_CATALOG_OIDS: &[(&str, i64)] = &[
     ("pg_extension", 3079),
     ("pg_publication", 6104),
 ];
+
+/// `pg_constraint`'s letter for a foreign key action.
+fn referential_action_code(action: nodus_catalog::ReferentialAction) -> &'static str {
+    use nodus_catalog::ReferentialAction as A;
+    match action {
+        A::NoAction => "a",
+        A::Restrict => "r",
+        A::Cascade => "c",
+        A::SetNull => "n",
+        A::SetDefault => "d",
+    }
+}
+
+/// A foreign key action as SQL, or `None` for the default NO ACTION.
+fn referential_action_sql(action: nodus_catalog::ReferentialAction) -> Option<&'static str> {
+    use nodus_catalog::ReferentialAction as A;
+    match action {
+        A::NoAction => None,
+        A::Restrict => Some("RESTRICT"),
+        A::Cascade => Some("CASCADE"),
+        A::SetNull => Some("SET NULL"),
+        A::SetDefault => Some("SET DEFAULT"),
+    }
+}

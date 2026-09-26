@@ -3,10 +3,7 @@
 //! current rows.
 
 use crate::error_fields::DbError;
-use crate::{
-    ExecutionContext, MemExecutor, Value, parse_filter_expr, parse_object_name, render,
-    values_equal,
-};
+use crate::{ExecutionContext, MemExecutor, Value, parse_filter_expr, render, values_equal};
 use anyhow::Result;
 
 impl MemExecutor {
@@ -69,11 +66,14 @@ impl MemExecutor {
         Ok(())
     }
 
+    /// Checks `new_row` of `tbl` against its CHECK constraints and foreign
+    /// keys; `old_row` is the row it replaces, if any.
     pub(crate) fn check_table_constraints(
         &self,
         ctx: &ExecutionContext,
         tbl: &nodus_catalog::TableDescriptor,
         new_row: &[Value],
+        old_row: Option<&[Value]>,
         col_names: &[String],
     ) -> Result<()> {
         for tc in &tbl.constraints {
@@ -112,70 +112,10 @@ impl MemExecutor {
                         .into());
                     }
                 }
-                nodus_catalog::TableConstraint::ForeignKey {
-                    columns,
-                    foreign_table,
-                    referred_columns,
-                    ..
-                } => {
-                    // Simple FK check
-                    let (db_name, schema_name, table_only) = parse_object_name(foreign_table)
-                        .unwrap_or(("default", "public", foreign_table));
-                    let f_tbl = self
-                        .catalog_reader
-                        .get_table(db_name, schema_name, table_only)?;
-
-                    // A malformed FK (mismatched arity, or naming a column that is
-                    // not on the local/foreign table) must surface a SQL error,
-                    // never panic — these are reachable from ordinary INSERT/UPDATE
-                    // and a panic here would poison shared locks (whole-server DoS).
-                    if columns.len() != referred_columns.len() {
-                        anyhow::bail!(
-                            "foreign key constraint references {} columns but {} referenced columns",
-                            columns.len(),
-                            referred_columns.len()
-                        );
-                    }
-
-                    let mut all_match = true;
-                    for (i, c) in columns.iter().enumerate() {
-                        let ref_c = &referred_columns[i];
-                        let val_idx =
-                            col_names.iter().position(|name| name == c).ok_or_else(|| {
-                                anyhow::anyhow!("foreign key column {c} not found in table")
-                            })?;
-                        let val = &new_row[val_idx];
-                        if val == &Value::Null {
-                            continue;
-                        } // Nulls skip FK checks
-
-                        let ref_idx = f_tbl
-                            .columns
-                            .iter()
-                            .position(|name| &name.name == ref_c)
-                            .ok_or_else(|| {
-                                anyhow::anyhow!(
-                                    "foreign key references column {ref_c} not present in {foreign_table}"
-                                )
-                            })?;
-                        let mut found = false;
-                        for f_row in self.scan_rows(f_tbl.id, &ctx.session_id)? {
-                            if values_equal(&f_row[ref_idx], val) {
-                                found = true;
-                                break;
-                            }
-                        }
-                        if !found {
-                            all_match = false;
-                            break;
-                        }
-                    }
-                    if !all_match {
-                        anyhow::bail!("violates foreign key constraint");
-                    }
-                }
+                nodus_catalog::TableConstraint::ForeignKey { .. } => {}
             }
         }
+        self.check_references_from(ctx, tbl, new_row, old_row)?;
         Ok(())
     }
 }
@@ -235,14 +175,6 @@ impl MemExecutor {
             .into()),
             None => Ok(()),
         }
-    }
-
-    /// The name of the schema `table` is in.
-    pub(crate) fn schema_name_of(&self, table: &nodus_catalog::TableDescriptor) -> String {
-        self.catalog_reader
-            .get_schema_by_id(table.schema_id)
-            .map(|s| s.name)
-            .unwrap_or_else(|_| "public".to_string())
     }
 }
 
