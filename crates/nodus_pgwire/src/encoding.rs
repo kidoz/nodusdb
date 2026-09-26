@@ -15,7 +15,10 @@ use uuid::Uuid;
 pub(crate) fn render_scalar_text(value: &nodus_executor::Value, declared: &Type) -> String {
     match value {
         nodus_executor::Value::Int(i) => i.to_string(),
-        nodus_executor::Value::Float(f) => f.to_string(),
+        nodus_executor::Value::Float(f) if *declared == Type::FLOAT4 => {
+            nodus_executor::float4_text(*f as f32)
+        }
+        nodus_executor::Value::Float(f) => nodus_executor::float_text(*f),
         nodus_executor::Value::Numeric(d) => d.to_string(),
         nodus_executor::Value::Text(s) if *declared == Type::BYTEA => render_bytea_text(s),
         nodus_executor::Value::Text(s) => s.clone(),

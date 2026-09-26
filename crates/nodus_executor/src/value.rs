@@ -459,11 +459,41 @@ pub(crate) fn coerce_array_text(text: &str, array_type: &str) -> Option<Value> {
     typed(parse_array_literal(text)?, element_type).map(Value::Array)
 }
 
+/// A `double precision` as PostgreSQL writes it: the shortest digits that
+/// read back exactly, in exponent form below 1e-4 or from 1e15, and
+/// `Infinity`, `-Infinity`, and `NaN` spelled out.
+pub fn float_text(f: f64) -> String {
+    shortest_float_text(f, format!("{f:e}"), f.to_string(), 15)
+}
+
+/// A `real` as PostgreSQL writes it: as [`float_text`], in exponent form
+/// from 1e6.
+pub fn float4_text(f: f32) -> String {
+    shortest_float_text(f as f64, format!("{f:e}"), f.to_string(), 6)
+}
+
+fn shortest_float_text(f: f64, scientific: String, fixed: String, digits: i32) -> String {
+    if f.is_nan() {
+        return "NaN".to_string();
+    }
+    if f.is_infinite() {
+        return if f < 0.0 { "-Infinity" } else { "Infinity" }.to_string();
+    }
+    let (mantissa, exponent) = scientific.split_once('e').unwrap_or((&scientific, "0"));
+    let exponent: i32 = exponent.parse().unwrap_or(0);
+    if f != 0.0 && !(-4..digits).contains(&exponent) {
+        let sign = if exponent < 0 { '-' } else { '+' };
+        format!("{mantissa}e{sign}{:02}", exponent.abs())
+    } else {
+        fixed
+    }
+}
+
 /// A value as text, as PostgreSQL writes it.
 pub fn render(value: &Value) -> String {
     match value {
         Value::Int(n) => n.to_string(),
-        Value::Float(f) => f.to_string(),
+        Value::Float(f) => float_text(*f),
         Value::Numeric(d) => d.to_string(),
         Value::Text(s) => s.clone(),
         Value::Bool(b) => {
@@ -945,6 +975,21 @@ pub(crate) fn values_equal(a: &Value, b: &Value) -> bool {
 mod tests {
     use super::*;
     use std::cmp::Ordering;
+
+    #[test]
+    fn floats_print_as_postgresql_prints_them() {
+        assert_eq!(float_text(1.5), "1.5");
+        assert_eq!(float_text(1e20), "1e+20");
+        assert_eq!(float_text(1e-7), "1e-07");
+        assert_eq!(float_text(1e14), "100000000000000");
+        assert_eq!(float_text(0.0001), "0.0001");
+        assert_eq!(float_text(f64::INFINITY), "Infinity");
+        assert_eq!(float_text(f64::NEG_INFINITY), "-Infinity");
+        assert_eq!(float_text(f64::NAN), "NaN");
+        assert_eq!(float4_text(1e6), "1e+06");
+        assert_eq!(float4_text(1234567.0), "1.234567e+06");
+        assert_eq!(float4_text(100000.0), "100000");
+    }
 
     #[test]
     fn coerce_for_column_normalizes_scalars_but_preserves_complex_values() {
