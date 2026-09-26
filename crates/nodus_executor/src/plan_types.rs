@@ -121,6 +121,11 @@ pub struct TableFnSpec {
     /// so older plans decode.
     #[serde(default)]
     pub arg_exprs: Vec<ScalarExpr>,
+    /// `ROWS FROM (f(), g())`: these functions run together, their rows
+    /// paired up in order and the shorter padded with NULL; when present,
+    /// `name` and the arguments are unused. Defaulted so older plans decode.
+    #[serde(default)]
+    pub rows_from: Vec<TableFnSpec>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

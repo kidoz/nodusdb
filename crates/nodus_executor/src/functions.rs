@@ -104,6 +104,11 @@ pub(crate) fn is_known(name: &str) -> bool {
                 // Subscripts: `a[i]`, `a[lo:hi]`, `doc['key']`.
                 | "__SUBSCRIPT__" | "__SLICE__"
                 | crate::result_types::INTEGER_RANGE
+                // Set-returning functions: a select list runs them as a lateral
+                // table function, anywhere else they are an error.
+                | "UNNEST" | "GENERATE_SERIES" | "JSONB_ARRAY_ELEMENTS" | "JSON_ARRAY_ELEMENTS"
+                | "JSONB_ARRAY_ELEMENTS_TEXT" | "JSON_ARRAY_ELEMENTS_TEXT" | "REGEXP_SPLIT_TO_TABLE"
+                | "PG_PARTITION_ANCESTORS"
         )
 }
 
@@ -1238,6 +1243,17 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
             Value::Text(crate::json_text::jsonb_pretty(&json_arg(arg(0))?))
         }
 
+        "UNNEST"
+        | "GENERATE_SERIES"
+        | "JSONB_ARRAY_ELEMENTS"
+        | "JSON_ARRAY_ELEMENTS"
+        | "JSONB_ARRAY_ELEMENTS_TEXT"
+        | "JSON_ARRAY_ELEMENTS_TEXT"
+        | "REGEXP_SPLIT_TO_TABLE"
+        | "PG_PARTITION_ANCESTORS" => raise(format!(
+            "set-returning function {}() is not allowed here",
+            name.to_ascii_lowercase()
+        )),
         // An integer result checked against its type's range.
         crate::result_types::INTEGER_RANGE if arity(2) => match arg(0) {
             Value::Int(v) => {

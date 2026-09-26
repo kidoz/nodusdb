@@ -18,6 +18,9 @@ impl MemExecutor {
         row: &[Value],
         col_names: &[String],
     ) -> Result<(Vec<String>, Vec<String>, Vec<Vec<Value>>)> {
+        if !spec.rows_from.is_empty() {
+            return self.eval_rows_from(spec, row, col_names);
+        }
         let args: Vec<Value> = if spec.arg_exprs.is_empty() {
             spec.args
                 .iter()
@@ -80,6 +83,45 @@ impl MemExecutor {
                 r.push(Value::Int((i + 1) as i64));
             }
         }
+        Ok((names, types, rows))
+    }
+
+    /// `ROWS FROM (f(), g())`: each function's rows, paired up in order;
+    /// the shorter's missing values are NULL.
+    fn eval_rows_from(
+        &self,
+        spec: &TableFnSpec,
+        row: &[Value],
+        col_names: &[String],
+    ) -> Result<(Vec<String>, Vec<String>, Vec<Vec<Value>>)> {
+        let mut names = Vec::new();
+        let mut outputs = Vec::new();
+        for member in &spec.rows_from {
+            let (member_names, member_types, member_rows) =
+                self.eval_table_function(member, row, col_names)?;
+            names.extend(member_names);
+            outputs.push((member_types, member_rows));
+        }
+        let height = outputs
+            .iter()
+            .map(|(_, rows)| rows.len())
+            .max()
+            .unwrap_or(0);
+        let mut rows = vec![Vec::new(); height];
+        for (member_types, member_rows) in &outputs {
+            for (i, out) in rows.iter_mut().enumerate() {
+                match member_rows.get(i) {
+                    Some(values) => out.extend(values.iter().cloned()),
+                    None => out.extend(std::iter::repeat_n(Value::Null, member_types.len())),
+                }
+            }
+        }
+        let names = names
+            .into_iter()
+            .enumerate()
+            .map(|(i, name)| spec.column_aliases.get(i).cloned().unwrap_or(name))
+            .collect();
+        let types = outputs.into_iter().flat_map(|(t, _)| t).collect();
         Ok((names, types, rows))
     }
 

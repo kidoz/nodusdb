@@ -203,6 +203,47 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
         return select_from_result(LogicalPlan::TableFunction(spec), ctes, query, params);
     }
 
+    // Set-returning functions elsewhere in a FROM-less select list: the
+    // query reads their rows.
+    if select.from.is_empty() && select.projection.iter().any(select_item_has_srf) {
+        let mut projection = Vec::new();
+        for item in &select.projection {
+            projection.push(match item {
+                SelectItem::UnnamedExpr(expr) => plan_select_expr(expr, None, params)?,
+                SelectItem::ExprWithAlias { expr, alias } => {
+                    plan_select_expr(expr, Some(alias.value.clone()), params)?
+                }
+                other => anyhow::bail!("Unsupported select item: {other}"),
+            });
+        }
+        let mut sort = plan_sort(query.order_by.as_ref(), &projection, false, params)?;
+        let spec = lift_set_returning_functions(&mut projection, &mut sort)
+            .expect("the select list calls a set-returning function");
+        ctes.push((
+            SRF_RELATION.to_string(),
+            Box::new(LogicalPlan::TableFunction(spec)),
+        ));
+        let (limit, offset) = plan_limit(query, params)?;
+        return Ok(LogicalPlan::Select {
+            ctes,
+            table_name: SRF_RELATION.to_string(),
+            table_alias: None,
+            joins: Vec::new(),
+            projection,
+            group_by: Vec::new(),
+            filter: parse_predicates(&select.selection, params)?,
+            having: None,
+            grouping_sets: None,
+            order_by: Vec::new(),
+            limit,
+            offset,
+            distinct: false,
+            sort,
+            group_exprs: Vec::new(),
+            distinct_on: Vec::new(),
+        });
+    }
+
     if select.from.is_empty() {
         let mut values = Vec::new();
         let mut deferred = Vec::new();
@@ -257,7 +298,7 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
         };
         return select_from_result(literal, ctes, query, params);
     }
-    let (table_name, table_alias, joins) = plan_from(&select.from, &mut ctes, params)?;
+    let (table_name, table_alias, mut joins) = plan_from(&select.from, &mut ctes, params)?;
 
     // Projection: a lone `*` is empty (all columns); `*` among other items,
     // and `t.*`, stand for columns the executor expands once the relations'
@@ -321,6 +362,35 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
         .as_ref()
         .map(|expr| parse_having(expr, params))
         .transpose()?;
+
+    // Set-returning functions in the select list run per input row, as a
+    // lateral join whose columns stand in for the calls. Grouping and
+    // window functions would have to run before them.
+    let mut sort = sort;
+    if let Some(spec) = lift_set_returning_functions(&mut projection, &mut sort) {
+        let aggregated = !group_by.is_empty()
+            || having.is_some()
+            || projection.iter().any(|p| match p {
+                ProjectionItem::Aggregate(..) | ProjectionItem::WindowFunction { .. } => true,
+                ProjectionItem::Expr { expr, .. } => scalar_has_aggregate(expr),
+                _ => false,
+            });
+        if aggregated {
+            anyhow::bail!(
+                "set-returning functions in a select list with aggregates or window functions are not supported"
+            );
+        }
+        joins.push(crate::Join {
+            table_name: SRF_RELATION.to_string(),
+            table_alias: Some(SRF_RELATION.to_string()),
+            condition: None,
+            join_type: JoinType::Cross,
+            table_fn: Some(spec),
+            using_columns: Vec::new(),
+            natural: false,
+            lateral: None,
+        });
+    }
 
     Ok(LogicalPlan::Select {
         ctes,
@@ -976,6 +1046,95 @@ fn set_table_fn_args(
     Some(())
 }
 
+/// The relation whose columns stand in for a select list's set-returning
+/// function calls. Its name starts with NUL, so no query can spell it.
+pub(crate) const SRF_RELATION: &str = "\u{0}srf";
+
+/// Whether a function (by its upper-case name) returns a set of rows.
+fn is_set_returning(name: &str) -> bool {
+    let name = name.strip_prefix("PG_CATALOG.").unwrap_or(name);
+    SELECT_LIST_TABLE_FUNCTIONS
+        .iter()
+        .any(|f| f.eq_ignore_ascii_case(name))
+}
+
+fn scalar_has_srf(expr: &ScalarExpr) -> bool {
+    matches!(expr, ScalarExpr::Function { name, .. } if is_set_returning(name))
+        || expr.children().into_iter().any(scalar_has_srf)
+}
+
+fn select_item_has_srf(item: &sqlparser::ast::SelectItem) -> bool {
+    use sqlparser::ast::SelectItem;
+    let expr = match item {
+        SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => expr,
+        _ => return false,
+    };
+    lower_scalar(expr, &[]).is_some_and(|e| scalar_has_srf(&e))
+}
+
+/// Replaces the set-returning function calls in the select list (and in
+/// ORDER BY expressions) with columns of one table function that runs them
+/// together, in lockstep; `None` when there are none.
+fn lift_set_returning_functions(
+    projection: &mut [ProjectionItem],
+    sort: &mut [SortKey],
+) -> Option<TableFnSpec> {
+    fn lift(expr: &ScalarExpr, calls: &mut Vec<(ScalarExpr, String)>) -> ScalarExpr {
+        if let ScalarExpr::Function { name, .. } = expr
+            && is_set_returning(name)
+        {
+            if let Some((_, column)) = calls.iter().find(|(call, _)| call == expr) {
+                return ScalarExpr::Column(column.clone());
+            }
+            let column = format!("{SRF_RELATION}.c{}", calls.len() + 1);
+            calls.push((expr.clone(), column.clone()));
+            return ScalarExpr::Column(column);
+        }
+        expr.map_children(&mut |e| lift(e, calls))
+    }
+    let mut calls = Vec::new();
+    for item in projection.iter_mut() {
+        if let ProjectionItem::Expr { expr, .. } = item {
+            *expr = lift(expr, &mut calls);
+        }
+    }
+    for key in sort.iter_mut() {
+        if let SortTarget::Expr(e) = &mut key.target {
+            *e = lift(e, &mut calls);
+        }
+    }
+    if calls.is_empty() {
+        return None;
+    }
+    let member = |call: &ScalarExpr| {
+        let ScalarExpr::Function { name, args } = call else {
+            unreachable!("only function calls are lifted");
+        };
+        let name = name.to_ascii_lowercase();
+        TableFnSpec {
+            name: name
+                .strip_prefix("pg_catalog.")
+                .unwrap_or(&name)
+                .to_string(),
+            args: Vec::new(),
+            with_ordinality: false,
+            alias: None,
+            column_aliases: Vec::new(),
+            arg_exprs: args.clone(),
+            rows_from: Vec::new(),
+        }
+    };
+    Some(TableFnSpec {
+        name: "rows from".to_string(),
+        args: Vec::new(),
+        with_ordinality: false,
+        alias: Some(SRF_RELATION.to_string()),
+        column_aliases: (1..=calls.len()).map(|i| format!("c{i}")).collect(),
+        arg_exprs: Vec::new(),
+        rows_from: calls.iter().map(|(call, _)| member(call)).collect(),
+    })
+}
+
 /// The table functions a select list may call for their rows.
 const SELECT_LIST_TABLE_FUNCTIONS: &[&str] = &[
     "unnest",
@@ -1030,6 +1189,7 @@ fn select_list_table_function(
         with_ordinality: false,
         column_aliases: Vec::new(),
         arg_exprs: Vec::new(),
+        rows_from: Vec::new(),
     };
     set_table_fn_args(&mut spec, &exprs, params)?;
     Some(spec)
@@ -1053,6 +1213,7 @@ fn build_table_fn_spec(
             .map(|a| a.columns.iter().map(|c| c.name.value.clone()).collect())
             .unwrap_or_default(),
         arg_exprs: Vec::new(),
+        rows_from: Vec::new(),
     }
 }
 

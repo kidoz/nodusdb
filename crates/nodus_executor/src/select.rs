@@ -500,7 +500,10 @@ impl MemExecutor {
                 stored_rows = next_rows;
                 col_names = combined_cols;
                 joined_columns = combined_desc;
-                star.extend(left_width..col_names.len());
+                // A select list's set-returning functions are not part of `*`.
+                if join.table_alias.as_deref() != Some(crate::planner::SRF_RELATION) {
+                    star.extend(left_width..col_names.len());
+                }
                 continue;
             }
 

@@ -1,0 +1,90 @@
+# Set-returning functions in a select list with FROM: each row repeats per
+# value, several functions run in lockstep (the shorter padded with NULL).
+statement ok
+CREATE TABLE srf8 (id INT PRIMARY KEY, tags TEXT[], n INT, d JSONB);
+
+statement ok
+INSERT INTO srf8 VALUES (1, '{a,b}', 10, '[1, 2]'), (2, '{}', 20, '[]'), (3, NULL, 30, '[3]');
+
+query TT
+SELECT id, unnest(tags) FROM srf8 ORDER BY 1, 2;
+----
+1	a
+1	b
+
+query TTT
+SELECT id, unnest(tags) AS t, n FROM srf8 ORDER BY 1, 2;
+----
+1	a	10
+1	b	10
+
+query TT
+SELECT id, generate_series(1, n / 10) AS g FROM srf8 ORDER BY 1, 2;
+----
+1	1
+2	1
+2	2
+3	1
+3	2
+3	3
+
+query TT
+SELECT id, jsonb_array_elements(d) FROM srf8 ORDER BY 1, 2;
+----
+1	1
+1	2
+3	3
+
+query TTT
+SELECT id, unnest(tags), generate_series(1, 3) FROM srf8 WHERE id = 1 ORDER BY 3;
+----
+1	a	1
+1	b	2
+1	NULL	3
+
+query T
+SELECT unnest(ARRAY[1,2]) + 1;
+----
+2
+3
+
+query TT
+SELECT generate_series(1, 2), generate_series(1, 3);
+----
+1	1
+2	2
+NULL	3
+
+query T
+SELECT count(*) FROM (SELECT id, unnest(tags) FROM srf8) x;
+----
+2
+
+query TTTTT
+SELECT *, unnest(tags) FROM srf8 ORDER BY 1, 5;
+----
+1	{a,b}	10	[1, 2]	a
+1	{a,b}	10	[1, 2]	b
+
+query TT
+SELECT id, unnest(tags) AS t FROM srf8 ORDER BY t DESC;
+----
+1	b
+1	a
+
+query T
+SELECT DISTINCT unnest(tags) FROM srf8 ORDER BY 1;
+----
+a
+b
+
+query TT
+SELECT id, upper(unnest(tags)) FROM srf8 ORDER BY 1, 2;
+----
+1	A
+1	B
+
+query TT
+SELECT id, unnest(tags) FROM srf8 ORDER BY 1, 2 LIMIT 1;
+----
+1	a

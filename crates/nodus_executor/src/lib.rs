@@ -971,6 +971,8 @@ mod phase2_tests;
 #[cfg(test)]
 mod phase3_tests;
 #[cfg(test)]
+mod sql_feature_tests;
+#[cfg(test)]
 mod streaming_tests;
 #[cfg(test)]
 mod tests;
