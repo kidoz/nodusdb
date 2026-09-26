@@ -29,6 +29,12 @@ pub(crate) struct SessionEnv {
     /// The catalog, for functions that describe objects by OID
     /// (`pg_get_indexdef`, `pg_get_constraintdef`).
     pub(crate) catalog: Option<std::sync::Arc<dyn nodus_catalog::CatalogReader>>,
+    /// The stored data as the statement reads it, for the functions that
+    /// measure relations (`pg_table_size`).
+    pub(crate) storage: Option<(
+        std::sync::Arc<dyn nodus_storage_api::KvEngine>,
+        nodus_storage_api::Timestamp,
+    )>,
 }
 
 thread_local! {

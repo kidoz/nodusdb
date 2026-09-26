@@ -480,6 +480,7 @@ impl MemExecutor {
             session_id: ctx.session_id.clone(),
             sequences: Some(self.sequences.clone()),
             catalog: Some(self.catalog_reader.clone()),
+            storage: Some((self.kv.clone(), self.read_ts(&ctx.session_id))),
         }
     }
 

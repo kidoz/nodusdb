@@ -1987,6 +1987,27 @@ impl MemExecutor {
         })
     }
 
+    /// The index whose `pg_class` OID is `oid`, with its table.
+    pub(crate) fn index_by_oid(
+        catalog: &dyn nodus_catalog::CatalogReader,
+        oid: i64,
+    ) -> Option<(
+        nodus_catalog::TableDescriptor,
+        nodus_catalog::IndexDescriptor,
+    )> {
+        let db = "default";
+        let schemas = catalog.list_schemas(db).ok()?;
+        catalog.list_all_tables(db).ok()?.into_iter().find_map(|t| {
+            let schema = Self::schema_name_by_id(db, &schemas, t.schema_id);
+            let index = t
+                .indexes
+                .iter()
+                .find(|i| Self::index_oid(db, &schema, &t.name, &i.name) == oid)?
+                .clone();
+            Some((t, index))
+        })
+    }
+
     pub(crate) fn view_definition(
         catalog: &dyn nodus_catalog::CatalogReader,
         oid: i64,

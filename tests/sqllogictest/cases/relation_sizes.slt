@@ -1,0 +1,42 @@
+# Relation sizes are whole pages of what a table and its indexes store.
+statement ok
+CREATE TABLE sz8 (id INT PRIMARY KEY, t TEXT);
+
+statement ok
+CREATE INDEX sz8_t ON sz8 (t);
+
+query TT
+SELECT pg_relation_size('sz8'), pg_relation_size('sz8', 'fsm');
+----
+0	0
+
+statement ok
+INSERT INTO sz8 SELECT g, repeat('x', 100) FROM generate_series(1, 1000) g;
+
+query TTT
+SELECT pg_relation_size('sz8') > 0, pg_table_size('sz8') >= pg_relation_size('sz8'), pg_indexes_size('sz8') > 0;
+----
+t	t	t
+
+query T
+SELECT pg_total_relation_size('sz8') = pg_table_size('sz8') + pg_indexes_size('sz8');
+----
+t
+
+query TTT
+SELECT pg_relation_size('sz8_t') > 0, pg_indexes_size('sz8_t'), pg_relation_size('sz8') % 8192;
+----
+t	0	0
+
+query TT
+SELECT pg_size_pretty(pg_relation_size('sz8')) LIKE '%kB', pg_database_size('default') > 0;
+----
+t	t
+
+query TT
+SELECT pg_relation_size(0), pg_table_size('sz8'::regclass) > 0;
+----
+NULL	t
+
+statement error
+SELECT pg_relation_size('nosuch');

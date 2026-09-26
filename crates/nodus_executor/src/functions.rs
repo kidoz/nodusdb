@@ -85,7 +85,8 @@ pub(crate) fn is_known(name: &str) -> bool {
                 | "SHOBJ_DESCRIPTION" | "FORMAT_TYPE" | "PG_GET_EXPR"
                 | "PG_RELATION_IS_PUBLISHABLE" | "PG_GET_STATISTICSOBJDEF_COLUMNS"
                 | "PG_GET_INDEXDEF" | "PG_GET_CONSTRAINTDEF" | "__OBJECT_NAME__"
-                | "PG_GET_VIEWDEF"
+                | "PG_GET_VIEWDEF" | "PG_RELATION_SIZE" | "PG_TABLE_SIZE" | "PG_INDEXES_SIZE"
+                | "PG_TOTAL_RELATION_SIZE" | "PG_DATABASE_SIZE"
                 // Sequences.
                 | "NEXTVAL" | "CURRVAL" | "LASTVAL" | "SETVAL" | "PG_GET_SERIAL_SEQUENCE"
                 | "__IDENTITY__"
@@ -1092,6 +1093,29 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
             .to_string(),
         ),
         "PG_SIZE_PRETTY" if arity(1) => Value::Text(size_pretty(int(arg(0))?)),
+        // A relation's forks other than its main one are empty.
+        "PG_RELATION_SIZE" if arity(2) && text(arg(1)) != "main" => relation_size(arg(0), |_, _| 0),
+        "PG_RELATION_SIZE" | "PG_TABLE_SIZE" if arity(1) || arity(2) => {
+            relation_size(arg(0), |table, _| table)
+        }
+        "PG_INDEXES_SIZE" if arity(1) => relation_size(arg(0), |_, indexes| indexes),
+        "PG_TOTAL_RELATION_SIZE" if arity(1) => {
+            relation_size(arg(0), |table, indexes| table + indexes)
+        }
+        "PG_DATABASE_SIZE" if arity(1) => session_env::with(|env| {
+            let env = env?;
+            let (catalog, (kv, read_ts)) = (env.catalog.as_ref()?, env.storage.as_ref()?);
+            let tables = catalog.list_all_tables("default").ok()?;
+            Some(Value::Int(
+                tables
+                    .iter()
+                    .map(|t| {
+                        let (table, indexes) = stored_size(kv.as_ref(), *read_ts, t);
+                        table + indexes
+                    })
+                    .sum(),
+            ))
+        })?,
         "PG_ENCODING_TO_CHAR" if arity(1) => {
             Value::Text(if int(arg(0))? == 6 { "UTF8" } else { "" }.to_string())
         }
@@ -2038,6 +2062,82 @@ fn strip_nulls(json: &mut serde_json::Value, in_arrays: bool) {
         }
         _ => {}
     }
+}
+
+/// A size function over relation `rel` (an OID or a name): `measure` gets
+/// the bytes of a table's rows and of its indexes; an index measures as a
+/// table of its entries, with no indexes. NULL when no relation has the OID.
+fn relation_size(rel: &Value, measure: impl Fn(i64, i64) -> i64) -> Value {
+    let found = session_env::with(|env| {
+        let env = env?;
+        let (catalog, (kv, read_ts)) = (env.catalog.as_ref()?, env.storage.as_ref()?);
+        let oid = match rel {
+            Value::Text(name) if name.trim().parse::<i64>().is_err() => {
+                match crate::MemExecutor::relation_oid(catalog.as_ref(), name) {
+                    Some(oid) => oid,
+                    None => return Some(Err(format!("relation \"{name}\" does not exist"))),
+                }
+            }
+            other => int(other)?,
+        };
+        if let Some(table) = crate::MemExecutor::relation_by_oid(catalog.as_ref(), oid) {
+            let (rows, indexes) = stored_size(kv.as_ref(), *read_ts, &table);
+            return Some(Ok(measure(rows, indexes)));
+        }
+        let (_, index) = crate::MemExecutor::index_by_oid(catalog.as_ref(), oid)?;
+        let bytes = pages(range_bytes(
+            kv.as_ref(),
+            *read_ts,
+            &format!("i:{}", index.id),
+        ));
+        Some(Ok(measure(bytes, 0)))
+    });
+    match found {
+        Some(Ok(bytes)) => Value::Int(bytes),
+        Some(Err(message)) => raise(message),
+        None => Value::Null,
+    }
+}
+
+/// The bytes a table's rows and its indexes take, each in whole 8 kB pages
+/// as PostgreSQL measures them.
+fn stored_size(
+    kv: &dyn nodus_storage_api::KvEngine,
+    read_ts: nodus_storage_api::Timestamp,
+    table: &nodus_catalog::TableDescriptor,
+) -> (i64, i64) {
+    let rows = pages(range_bytes(kv, read_ts, &table.id.to_string()));
+    let indexes = table
+        .indexes
+        .iter()
+        .map(|index| pages(range_bytes(kv, read_ts, &format!("i:{}", index.id))))
+        .sum();
+    (rows, indexes)
+}
+
+/// The bytes of the keys and values stored under `prefix:`.
+fn range_bytes(
+    kv: &dyn nodus_storage_api::KvEngine,
+    read_ts: nodus_storage_api::Timestamp,
+    prefix: &str,
+) -> i64 {
+    let range = nodus_storage_api::KeyRange {
+        start: bytes::Bytes::from(format!("{prefix}:")),
+        end: bytes::Bytes::from(format!("{prefix};")),
+    };
+    kv.scan(range, read_ts)
+        .map(|pairs| {
+            pairs
+                .filter_map(Result::ok)
+                .map(|pair| (pair.key.len() + pair.value.len()) as i64)
+                .sum()
+        })
+        .unwrap_or(0)
+}
+
+/// `bytes` rounded up to whole 8 kB pages.
+fn pages(bytes: i64) -> i64 {
+    (bytes + 8191) / 8192 * 8192
 }
 
 fn size_pretty(bytes: i64) -> String {

@@ -1,6 +1,6 @@
 //! Set-returning functions in select lists, RETURNING expressions, JSON layouts
-//! and whole-row references, `COMMENT ON`, column renames, and grants to
-//! `PUBLIC`, driven through SQL.
+//! and whole-row references, `COMMENT ON`, column renames, grants to `PUBLIC`,
+//! and relation sizes, driven through SQL.
 
 use super::*;
 use crate::dml_join_tests::{rows, session};
@@ -212,4 +212,28 @@ fn grants_to_public_reach_every_principal() {
     run(admin.id, "REVOKE UPDATE ON t FROM PUBLIC").unwrap();
     let err = run(admin.id, "CREATE ROLE public").unwrap_err();
     assert_eq!(err.to_string(), "role name \"public\" is reserved");
+}
+
+#[test]
+fn relation_sizes_count_stored_pages() {
+    let sql = session();
+    sql("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").unwrap();
+    sql("CREATE INDEX t_v ON t (v)").unwrap();
+    let sizes = "SELECT pg_relation_size('t'), pg_indexes_size('t'), \
+                 pg_total_relation_size('t'), pg_relation_size('t_v')";
+    assert_eq!(rows(&sql(sizes).unwrap()), ["0|0|0|0"]);
+    sql("INSERT INTO t SELECT g, repeat('x', 100) FROM generate_series(1, 200) g").unwrap();
+    let out = sql(sizes).unwrap();
+    let sizes: Vec<i64> = out.rows[0]
+        .values
+        .iter()
+        .map(|v| crate::render(v).parse().unwrap())
+        .collect();
+    assert!(sizes[0] > 0 && sizes[0] % 8192 == 0, "{sizes:?}");
+    // The indexes are the primary key's and `t_v`.
+    assert!(sizes[3] > 0 && sizes[1] > sizes[3], "{sizes:?}");
+    assert_eq!(sizes[2], sizes[0] + sizes[1]);
+    assert_eq!(value(&sql("SELECT pg_relation_size(0)").unwrap()), "");
+    let err = sql("SELECT pg_table_size('nope')").unwrap_err();
+    assert_eq!(err.to_string(), "relation \"nope\" does not exist");
 }
