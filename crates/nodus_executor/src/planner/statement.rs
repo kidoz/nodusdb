@@ -869,72 +869,19 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
         }),
         Statement::AlterTable(alter_table) => {
             let table_name = alter_table.name.to_string();
-            let op = alter_table
-                .operations
-                .first()
-                .ok_or_else(|| anyhow::anyhow!("ALTER TABLE without operations"))?;
-            let alter_op = match op {
-                sqlparser::ast::AlterTableOperation::AddColumn { column_def, .. } => {
-                    let mut nullable = true;
-                    let mut default = None;
-                    for opt in &column_def.options {
-                        match &opt.option {
-                            sqlparser::ast::ColumnOption::NotNull => nullable = false,
-                            sqlparser::ast::ColumnOption::Default(e) => {
-                                default = Some(lower_scalar(e, params).ok_or_else(|| {
-                                    anyhow::anyhow!(
-                                        "Unsupported DEFAULT expression for column {}",
-                                        column_def.name.value
-                                    )
-                                })?);
-                            }
-                            _ => {}
-                        }
-                    }
-                    AlterTableOp::AddColumn {
-                        name: column_def.name.value.clone(),
-                        data_type: column_def.data_type.to_string(),
-                        nullable,
-                        default,
-                    }
-                }
-                sqlparser::ast::AlterTableOperation::RenameColumn {
-                    old_column_name,
-                    new_column_name,
-                } => AlterTableOp::RenameColumn {
-                    old_name: old_column_name.value.clone(),
-                    new_name: new_column_name.value.clone(),
-                },
-                sqlparser::ast::AlterTableOperation::DropColumn { column_names, .. } => {
-                    let name = column_names
-                        .first()
-                        .ok_or_else(|| anyhow::anyhow!("DROP COLUMN without a column name"))?
-                        .value
-                        .clone();
-                    AlterTableOp::DropColumn { name }
-                }
-                sqlparser::ast::AlterTableOperation::AlterColumn {
-                    column_name,
-                    op: sqlparser::ast::AlterColumnOperation::SetDataType { data_type, .. },
-                } => AlterTableOp::AlterColumnType {
-                    name: column_name.value.clone(),
-                    data_type: data_type.to_string(),
-                },
-                sqlparser::ast::AlterTableOperation::RenameTable { table_name } => {
-                    let new_name = match table_name {
-                        sqlparser::ast::RenameTableNameKind::As(name)
-                        | sqlparser::ast::RenameTableNameKind::To(name) => name.to_string(),
-                    };
-                    AlterTableOp::RenameTable { new_name }
-                }
-                _ => anyhow::bail!(
-                    "ALTER TABLE ... {} is not supported",
-                    leading_keywords(&op.to_string())
-                ),
-            };
+            if alter_table.operations.is_empty() {
+                anyhow::bail!("ALTER TABLE without operations");
+            }
+            // Every operation is planned before any runs, so one NodusDB
+            // cannot carry out stops the statement before it changes anything.
+            let mut operations = Vec::new();
+            for op in &alter_table.operations {
+                operations.extend(plan_alter_table_op(op, params)?);
+            }
             Ok(LogicalPlan::AlterTable {
                 table_name,
-                operation: alter_op,
+                operations,
+                if_exists: alter_table.if_exists,
             })
         }
         _ => anyhow::bail!("{} is not supported", leading_keywords(&stmt.to_string())),
@@ -1094,6 +1041,217 @@ fn filter_has_subquery(filter: &FilterExpr) -> bool {
         }
         _ => false,
     }
+}
+
+/// One `ALTER TABLE` operation, as the operations that carry it out: `ADD
+/// COLUMN` with constraints adds the column, then each constraint.
+fn plan_alter_table_op(
+    op: &sqlparser::ast::AlterTableOperation,
+    params: &[Value],
+) -> Result<Vec<AlterTableOp>> {
+    use sqlparser::ast::{AlterColumnOperation, AlterTableOperation as Op, ColumnOption};
+    let cascade = |behavior: &Option<sqlparser::ast::DropBehavior>| {
+        matches!(behavior, Some(sqlparser::ast::DropBehavior::Cascade))
+    };
+    Ok(match op {
+        Op::AddColumn {
+            column_def,
+            if_not_exists,
+            ..
+        } => {
+            let column = column_def.name.value.clone();
+            let data_type = column_def.data_type.to_string();
+            if matches!(
+                data_type.to_ascii_uppercase().as_str(),
+                "SERIAL" | "BIGSERIAL" | "SMALLSERIAL" | "SERIAL4" | "SERIAL8" | "SERIAL2"
+            ) {
+                anyhow::bail!("ALTER TABLE ... ADD COLUMN of a serial column is not supported");
+            }
+            let mut nullable = true;
+            let mut default = None;
+            let mut constraints = Vec::new();
+            for opt in &column_def.options {
+                let name = opt.name.as_ref().map(|n| n.value.clone());
+                match &opt.option {
+                    ColumnOption::Null => {}
+                    ColumnOption::NotNull => nullable = false,
+                    ColumnOption::Default(e) => {
+                        default = Some(lower_scalar(e, params).ok_or_else(|| {
+                            anyhow::anyhow!("Unsupported DEFAULT expression for column {column}")
+                        })?);
+                    }
+                    ColumnOption::Unique(_) => constraints.push(NewConstraint::Unique {
+                        name,
+                        columns: vec![column.clone()],
+                    }),
+                    ColumnOption::PrimaryKey(_) => {
+                        nullable = false;
+                        constraints.push(NewConstraint::PrimaryKey {
+                            name,
+                            columns: vec![column.clone()],
+                        });
+                    }
+                    ColumnOption::Check(check) => {
+                        check_constraint_is_supported(&check.expr, params)?;
+                        constraints.push(NewConstraint::Check {
+                            name,
+                            expr: check.expr.to_string(),
+                        });
+                    }
+                    ColumnOption::ForeignKey(fk) => {
+                        constraints.push(NewConstraint::ForeignKey(foreign_key(
+                            opt.name.as_ref().or(fk.name.as_ref()),
+                            vec![column.clone()],
+                            fk,
+                        )?))
+                    }
+                    other => anyhow::bail!(
+                        "ALTER TABLE ... ADD COLUMN with {} is not supported",
+                        leading_keywords(&other.to_string())
+                    ),
+                }
+            }
+            std::iter::once(AlterTableOp::AddColumn {
+                name: column,
+                data_type,
+                nullable,
+                default,
+                if_not_exists: *if_not_exists,
+            })
+            .chain(
+                constraints
+                    .into_iter()
+                    .map(|constraint| AlterTableOp::AddConstraint {
+                        constraint,
+                        not_valid: false,
+                    }),
+            )
+            .collect()
+        }
+        Op::RenameColumn {
+            old_column_name,
+            new_column_name,
+        } => vec![AlterTableOp::RenameColumn {
+            old_name: old_column_name.value.clone(),
+            new_name: new_column_name.value.clone(),
+        }],
+        Op::DropColumn {
+            column_names,
+            if_exists,
+            drop_behavior,
+            ..
+        } => column_names
+            .iter()
+            .map(|name| AlterTableOp::DropColumn {
+                name: name.value.clone(),
+                if_exists: *if_exists,
+                cascade: cascade(drop_behavior),
+            })
+            .collect(),
+        Op::AlterColumn { column_name, op } => {
+            let column = column_name.value.clone();
+            vec![match op {
+                AlterColumnOperation::SetDataType { data_type, .. } => {
+                    AlterTableOp::AlterColumnType {
+                        name: column,
+                        data_type: data_type.to_string(),
+                    }
+                }
+                AlterColumnOperation::SetNotNull => AlterTableOp::SetNotNull {
+                    column,
+                    not_null: true,
+                },
+                AlterColumnOperation::DropNotNull => AlterTableOp::SetNotNull {
+                    column,
+                    not_null: false,
+                },
+                AlterColumnOperation::SetDefault { value } => {
+                    let lowered = lower_scalar(value, params).ok_or_else(|| {
+                        anyhow::anyhow!("Unsupported DEFAULT expression for column {column}")
+                    })?;
+                    if crate::subqueries::contains_subquery(&lowered) {
+                        anyhow::bail!("cannot use subquery in DEFAULT expression");
+                    }
+                    AlterTableOp::SetDefault {
+                        column,
+                        default: Some(lowered),
+                    }
+                }
+                AlterColumnOperation::DropDefault => AlterTableOp::SetDefault {
+                    column,
+                    default: None,
+                },
+                other => anyhow::bail!(
+                    "ALTER TABLE ... ALTER COLUMN ... {} is not supported",
+                    leading_keywords(&other.to_string())
+                ),
+            }]
+        }
+        Op::AddConstraint {
+            constraint,
+            not_valid,
+        } => {
+            use sqlparser::ast::TableConstraint as C;
+            let constraint = match constraint {
+                C::Check(check) => {
+                    check_constraint_is_supported(&check.expr, params)?;
+                    NewConstraint::Check {
+                        name: check.name.as_ref().map(|n| n.value.clone()),
+                        expr: check.expr.to_string(),
+                    }
+                }
+                C::Unique(unique) => NewConstraint::Unique {
+                    name: unique.name.as_ref().map(|n| n.value.clone()),
+                    columns: index_column_names(&unique.columns),
+                },
+                C::PrimaryKey(pk) => NewConstraint::PrimaryKey {
+                    name: pk.name.as_ref().map(|n| n.value.clone()),
+                    columns: index_column_names(&pk.columns),
+                },
+                C::ForeignKey(fk) => NewConstraint::ForeignKey(foreign_key(
+                    fk.name.as_ref(),
+                    fk.columns.iter().map(|c| c.value.clone()).collect(),
+                    fk,
+                )?),
+                other => anyhow::bail!(
+                    "ALTER TABLE ... ADD {} is not supported",
+                    leading_keywords(&other.to_string())
+                ),
+            };
+            vec![AlterTableOp::AddConstraint {
+                constraint,
+                not_valid: *not_valid,
+            }]
+        }
+        Op::DropConstraint {
+            if_exists,
+            name,
+            drop_behavior,
+        } => vec![AlterTableOp::DropConstraint {
+            name: name.value.clone(),
+            if_exists: *if_exists,
+            cascade: cascade(drop_behavior),
+        }],
+        Op::RenameConstraint { old_name, new_name } => vec![AlterTableOp::RenameConstraint {
+            old_name: old_name.value.clone(),
+            new_name: new_name.value.clone(),
+        }],
+        Op::ValidateConstraint { name } => vec![AlterTableOp::ValidateConstraint {
+            name: name.value.clone(),
+        }],
+        Op::RenameTable { table_name: new } => {
+            let new_name = match new {
+                sqlparser::ast::RenameTableNameKind::As(name)
+                | sqlparser::ast::RenameTableNameKind::To(name) => name.to_string(),
+            };
+            vec![AlterTableOp::RenameTable { new_name }]
+        }
+        Op::OwnerTo { .. } => vec![AlterTableOp::OwnerTo],
+        _ => anyhow::bail!(
+            "ALTER TABLE ... {} is not supported",
+            leading_keywords(&op.to_string())
+        ),
+    })
 }
 
 /// A `FOREIGN KEY` / `REFERENCES` constraint over `columns`. A key that

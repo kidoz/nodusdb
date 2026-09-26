@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 mod aggregates;
+mod alter_table;
 mod constraints;
 mod cte_scope;
 mod ddl;
@@ -53,9 +54,9 @@ pub use explain::ExplainOptions;
 pub use json_text::{json_text, jsonb_text};
 pub use plan_types::{
     AggregateOp, AlterTableOp, CompareOp, ConflictTarget, DeferredItem, FilterExpr, Join, JoinType,
-    LogicalPlan, MergeAction, MergeClause, MergeKind, OnConflictClause, Operand, PatternKind,
-    Predicate, ProjectionItem, ReturningExpr, ScalarBinaryOp, ScalarExpr, ScalarUnaryOp, SetOpKind,
-    SortKey, SortTarget, SubPlan, SubqueryKind, TableFnSpec,
+    LogicalPlan, MergeAction, MergeClause, MergeKind, NewConstraint, OnConflictClause, Operand,
+    PatternKind, Predicate, ProjectionItem, ReturningExpr, ScalarBinaryOp, ScalarExpr,
+    ScalarUnaryOp, SetOpKind, SortKey, SortTarget, SubPlan, SubqueryKind, TableFnSpec,
 };
 pub use planner::{
     CopyOutputFormat, expr_to_value, parse_object_name, plan_copy_out, plan_statement,

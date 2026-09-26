@@ -795,6 +795,9 @@ pub enum AlterTableOp {
         /// into existing rows. Defaulted so older serialized plans decode.
         #[serde(default)]
         default: Option<ScalarExpr>,
+        /// `ADD COLUMN IF NOT EXISTS`.
+        #[serde(default)]
+        if_not_exists: bool,
     },
     RenameColumn {
         old_name: String,
@@ -806,9 +809,66 @@ pub enum AlterTableOp {
     },
     DropColumn {
         name: String,
+        #[serde(default)]
+        if_exists: bool,
+        /// `CASCADE`: the foreign keys referencing the column go too.
+        #[serde(default)]
+        cascade: bool,
     },
     RenameTable {
         new_name: String,
+    },
+    /// `ALTER COLUMN column SET DEFAULT expr` / `DROP DEFAULT`.
+    SetDefault {
+        column: String,
+        default: Option<ScalarExpr>,
+    },
+    /// `ALTER COLUMN column SET NOT NULL` / `DROP NOT NULL`.
+    SetNotNull {
+        column: String,
+        not_null: bool,
+    },
+    /// `ADD [CONSTRAINT name] ...`; with `not_valid`, existing rows are not
+    /// checked.
+    AddConstraint {
+        constraint: NewConstraint,
+        not_valid: bool,
+    },
+    /// `DROP CONSTRAINT [IF EXISTS] name [CASCADE]`.
+    DropConstraint {
+        name: String,
+        if_exists: bool,
+        cascade: bool,
+    },
+    /// `RENAME CONSTRAINT old_name TO new_name`.
+    RenameConstraint {
+        old_name: String,
+        new_name: String,
+    },
+    /// `VALIDATE CONSTRAINT name`: checks the existing rows.
+    ValidateConstraint {
+        name: String,
+    },
+    /// `OWNER TO role`: NodusDB tracks no owners, so this changes nothing.
+    OwnerTo,
+}
+
+/// A constraint `ALTER TABLE ... ADD` creates.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum NewConstraint {
+    Check {
+        name: Option<String>,
+        expr: String,
+    },
+    /// A foreign key, completed when it is added.
+    ForeignKey(nodus_catalog::TableConstraint),
+    Unique {
+        name: Option<String>,
+        columns: Vec<String>,
+    },
+    PrimaryKey {
+        name: Option<String>,
+        columns: Vec<String>,
     },
 }
 
@@ -863,9 +923,12 @@ pub enum LogicalPlan {
         #[serde(default)]
         cascade: bool,
     },
+    /// `ALTER TABLE [IF EXISTS] name op, ...`: the operations apply in turn.
     AlterTable {
         table_name: String,
-        operation: AlterTableOp,
+        operations: Vec<AlterTableOp>,
+        #[serde(default)]
+        if_exists: bool,
     },
     CreateIndex {
         /// Empty for an unnamed index, which gets PostgreSQL's name for it.

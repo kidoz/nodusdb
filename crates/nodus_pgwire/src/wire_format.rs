@@ -154,6 +154,21 @@ pub(crate) fn sqlstate_for_execution_error(err_str: &str) -> &'static str {
         "2201X" // invalid_row_count_in_result_offset_clause
     } else if err_str.starts_with("unrecognized configuration parameter") {
         "42704" // undefined_object
+    // ALTER TABLE on columns and constraints.
+    } else if err_str.starts_with("column \"") && err_str.contains("\" already exists") {
+        "42701" // duplicate_column
+    } else if err_str.starts_with("constraint \"") && err_str.ends_with("already exists") {
+        "42710" // duplicate_object
+    } else if err_str.starts_with("constraint \"") && err_str.ends_with("does not exist") {
+        "42704" // undefined_object
+    } else if err_str.ends_with("contains null values") {
+        "23502" // not_null_violation
+    } else if err_str.ends_with("is in a primary key")
+        || err_str.starts_with("multiple primary keys for table")
+    {
+        "42P16" // invalid_table_definition
+    } else if err_str.ends_with("is violated by some row") {
+        "23514" // check_violation
     } else if err_str.starts_with("could not create unique index") {
         "23505" // unique_violation
     // Duplicate object on CREATE without IF NOT EXISTS (class 42). Catalog and

@@ -78,6 +78,8 @@ impl CatalogWriter for RaftCatalogWriter {
             TableDescriptorChange::AddIndex { table_id, .. } => *table_id,
             TableDescriptorChange::DropIndex { table_id, .. } => *table_id,
             TableDescriptorChange::SetComment { table_id, .. }
+            | TableDescriptorChange::ReplaceColumn { table_id, .. }
+            | TableDescriptorChange::AddConstraint { table_id, .. }
             | TableDescriptorChange::DropConstraint { table_id, .. } => *table_id,
         };
         self.replicate(

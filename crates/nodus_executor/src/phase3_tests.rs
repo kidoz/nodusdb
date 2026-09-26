@@ -108,12 +108,14 @@ fn test_ddl_and_subqueries() {
         &ctx,
         LogicalPlan::AlterTable {
             table_name: "employees".into(),
-            operation: AlterTableOp::AddColumn {
+            operations: vec![AlterTableOp::AddColumn {
                 name: "salary".into(),
                 data_type: "INT".into(),
                 nullable: true,
                 default: None,
-            },
+                if_not_exists: false,
+            }],
+            if_exists: false,
         },
     )
     .unwrap();
@@ -144,9 +146,10 @@ fn test_ddl_and_subqueries() {
         &ctx,
         LogicalPlan::AlterTable {
             table_name: "employees".into(),
-            operation: AlterTableOp::RenameTable {
+            operations: vec![AlterTableOp::RenameTable {
                 new_name: "staff".into(),
-            },
+            }],
+            if_exists: false,
         },
     )
     .unwrap();
@@ -859,12 +862,14 @@ fn test_alter_table_migrations() {
         &ctx,
         LogicalPlan::AlterTable {
             table_name: "users".into(),
-            operation: AlterTableOp::AddColumn {
+            operations: vec![AlterTableOp::AddColumn {
                 name: "age".into(),
                 data_type: "INT".into(),
                 nullable: true,
                 default: None,
-            },
+                if_not_exists: false,
+            }],
+            if_exists: false,
         },
     )
     .unwrap();
@@ -941,7 +946,12 @@ fn test_alter_table_migrations() {
         &ctx,
         LogicalPlan::AlterTable {
             table_name: "users".into(),
-            operation: AlterTableOp::DropColumn { name: "age".into() },
+            operations: vec![AlterTableOp::DropColumn {
+                name: "age".into(),
+                if_exists: false,
+                cascade: false,
+            }],
+            if_exists: false,
         },
     )
     .unwrap();

@@ -798,120 +798,6 @@ impl MemExecutor {
         Ok(found)
     }
 
-    pub(crate) fn exec_alter_table(
-        &self,
-        ctx: &ExecutionContext,
-        table_name: String,
-        operation: AlterTableOp,
-    ) -> Result<QueryOutput> {
-        let (db_name, schema_name, table_only) = parse_object_name(&table_name)?;
-        let tbl = self
-            .catalog_reader
-            .get_table(db_name, schema_name, table_only)?;
-        self.authorize(ctx, Action::CreateTable, ResourceRef::Table(tbl.id))?;
-
-        let change = match operation {
-            AlterTableOp::AddColumn {
-                name,
-                data_type,
-                nullable,
-                default,
-            } => {
-                // Backfill value for existing rows: the evaluated DEFAULT, or
-                // NULL when none is declared (PostgreSQL semantics).
-                let backfill = default
-                    .as_ref()
-                    .map(|e| {
-                        crate::value::coerce_for_column(
-                            &crate::planner::eval_scalar_expr(e, &[], &[]),
-                            &data_type,
-                        )
-                    })
-                    .unwrap_or(Value::Null);
-                let column = ColumnDescriptor {
-                    id: nodus_catalog::ColumnId::new(),
-                    name,
-                    version: 1,
-                    created_at: Utc::now(),
-                    updated_at: Utc::now(),
-                    state: DescriptorState::Public,
-                    data_type,
-                    nullable,
-                    default_expr: default.as_ref().and_then(|e| serde_json::to_string(e).ok()),
-                    comment: None,
-                };
-
-                // Migrate existing data to include the new column, addressing
-                // each row by its actual stored key (works for any key scheme).
-                for (key, mut row) in self.scan_rows_keyed(tbl.id, &ctx.session_id)? {
-                    row.push(backfill.clone());
-                    self.write_row(&ctx.session_id, key, crate::value::encode_row(&row)?)?;
-                }
-
-                nodus_catalog::TableDescriptorChange::AddColumn {
-                    table_id: tbl.id,
-                    column,
-                }
-            }
-            AlterTableOp::DropColumn { name } => {
-                if let Some(col_idx) = tbl.columns.iter().position(|c| c.name == name) {
-                    // Cannot drop primary key (assuming first column is PK for now)
-                    if col_idx == 0 {
-                        anyhow::bail!("Cannot drop primary key column");
-                    }
-
-                    // Migrate existing data to remove the column, addressing
-                    // each row by its actual stored key (works for any key
-                    // scheme, not just first-column PKs).
-                    for (key, mut row) in self.scan_rows_keyed(tbl.id, &ctx.session_id)? {
-                        if col_idx < row.len() {
-                            row.remove(col_idx);
-                        }
-                        self.write_row(&ctx.session_id, key, crate::value::encode_row(&row)?)?;
-                    }
-                } else {
-                    anyhow::bail!("Column {} not found", name);
-                }
-
-                nodus_catalog::TableDescriptorChange::DropColumn {
-                    table_id: tbl.id,
-                    column_name: name,
-                }
-            }
-            AlterTableOp::RenameColumn { old_name, new_name } => {
-                if !tbl.columns.iter().any(|c| c.name == old_name) {
-                    anyhow::bail!("column \"{old_name}\" does not exist");
-                }
-                nodus_catalog::TableDescriptorChange::RenameColumn {
-                    table_id: tbl.id,
-                    old_name,
-                    new_name,
-                }
-            }
-            AlterTableOp::AlterColumnType { name, data_type } => {
-                if !tbl.columns.iter().any(|c| c.name == name) {
-                    anyhow::bail!("Column {} not found", name);
-                }
-                // Catalog-only retype: existing rows keep their stored values and
-                // the type system coerces them on later reads/writes. The parsed
-                // `USING <cast>` expression is not applied as a bulk rewrite.
-                nodus_catalog::TableDescriptorChange::AlterColumnType {
-                    table_id: tbl.id,
-                    column_name: name,
-                    data_type,
-                }
-            }
-            AlterTableOp::RenameTable { new_name } => {
-                nodus_catalog::TableDescriptorChange::RenameTable {
-                    table_id: tbl.id,
-                    new_name,
-                }
-            }
-        };
-        self.catalog_writer.update_table_descriptor(change)?;
-        Ok(QueryOutput::tag("ALTER TABLE"))
-    }
-
     /// `CREATE [UNIQUE] INDEX [name] ON table (columns) [WHERE predicate]`.
     pub(crate) fn exec_create_index(
         &self,
@@ -1358,22 +1244,8 @@ fn name_check_constraints(
         .into_iter()
         .map(|constraint| match constraint {
             TableConstraint::Check { name: None, expr } => {
-                let mut named: Vec<&str> = expr
-                    .split(|c: char| !(c.is_alphanumeric() || c == '_'))
-                    .filter(|word| columns.iter().any(|c| c.name == *word))
-                    .collect();
-                named.sort_unstable();
-                named.dedup();
-                let base = match named.as_slice() {
-                    [column] => format!("{table}_{column}_check"),
-                    _ => format!("{table}_check"),
-                };
-                let mut name = base.clone();
-                let mut n = 0;
-                while taken.contains(&name) {
-                    n += 1;
-                    name = format!("{base}{n}");
-                }
+                let column_names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
+                let name = check_constraint_name(table, &column_names, &expr, &taken);
                 taken.push(name.clone());
                 TableConstraint::Check {
                     name: Some(name),
@@ -1388,6 +1260,34 @@ fn name_check_constraints(
 /// A relation name without its schema.
 fn table_name_of(name: &str) -> &str {
     name.rsplit('.').next().unwrap_or(name).trim_matches('"')
+}
+
+/// The name PostgreSQL gives an unnamed CHECK constraint `expr` of `table`:
+/// `<table>_<column>_check` when it names one of `columns`, else
+/// `<table>_check`, numbered when the name is `taken`.
+pub(crate) fn check_constraint_name(
+    table: &str,
+    columns: &[String],
+    expr: &str,
+    taken: &[String],
+) -> String {
+    let mut named: Vec<&str> = expr
+        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .filter(|word| columns.iter().any(|c| c == word))
+        .collect();
+    named.sort_unstable();
+    named.dedup();
+    let base = match named.as_slice() {
+        [column] => format!("{table}_{column}_check"),
+        _ => format!("{table}_check"),
+    };
+    let mut name = base.clone();
+    let mut n = 0;
+    while taken.contains(&name) {
+        n += 1;
+        name = format!("{base}{n}");
+    }
+    name
 }
 
 /// A query that yields its result's columns and types but no rows, when it

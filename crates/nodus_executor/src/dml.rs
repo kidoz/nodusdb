@@ -15,7 +15,7 @@ use nodus_storage_api::{KeyRange, KvEngine};
 /// and collision-free across restarts because the timestamp advances. Generated
 /// on the leader, whose resulting KV write raft_kv replicates, so it's
 /// deterministic across replicas.
-fn synthetic_rowid() -> String {
+pub(crate) fn synthetic_rowid() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let nanos = std::time::SystemTime::now()

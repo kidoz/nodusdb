@@ -1,0 +1,220 @@
+# ALTER TABLE adds and drops columns and constraints, changes defaults and
+# NOT NULL, and renames, checking the rows the table has.
+statement ok
+CREATE TABLE at9p (id int PRIMARY KEY, code text, n int);
+
+statement ok
+CREATE TABLE at9c (id int, p int REFERENCES at9p);
+
+statement ok
+INSERT INTO at9p VALUES (1, 'a', NULL), (2, 'a', 5);
+
+statement ok
+INSERT INTO at9c VALUES (1, 1);
+
+statement error
+ALTER TABLE at9p ADD COLUMN code text;
+
+statement ok
+ALTER TABLE at9p ADD COLUMN IF NOT EXISTS code text;
+
+statement error
+ALTER TABLE at9p ADD COLUMN z int NOT NULL;
+
+statement error
+ALTER TABLE at9p DROP COLUMN nosuch;
+
+statement ok
+ALTER TABLE at9p DROP COLUMN IF EXISTS nosuch;
+
+statement error
+ALTER TABLE at9p ALTER COLUMN n SET NOT NULL;
+
+statement error
+ALTER TABLE at9p ALTER COLUMN id DROP NOT NULL;
+
+statement error
+ALTER TABLE at9p ADD CONSTRAINT at9p_n_check CHECK (n > 10);
+
+statement error
+ALTER TABLE at9p ADD CONSTRAINT at9p_code_key UNIQUE (code);
+
+statement error
+ALTER TABLE at9p ADD PRIMARY KEY (code);
+
+statement ok
+ALTER TABLE at9p ADD CONSTRAINT at9p_n_check CHECK (n > 0);
+
+statement error
+ALTER TABLE at9p ADD CONSTRAINT at9p_n_check CHECK (n > 0);
+
+statement error
+INSERT INTO at9p VALUES (3, 'c', -1);
+
+statement error
+ALTER TABLE at9p DROP CONSTRAINT nosuch;
+
+statement ok
+ALTER TABLE at9p DROP CONSTRAINT IF EXISTS nosuch;
+
+statement error
+ALTER TABLE at9p DROP CONSTRAINT at9p_pkey;
+
+statement error
+ALTER TABLE at9p DROP COLUMN id;
+
+statement error
+ALTER TABLE at9p RENAME COLUMN n TO code;
+
+statement error
+ALTER TABLE at9c ADD CONSTRAINT at9c_fk2 FOREIGN KEY (id) REFERENCES at9p (n);
+
+statement ok
+ALTER TABLE at9c DROP CONSTRAINT at9c_p_fkey;
+
+statement ok
+INSERT INTO at9c VALUES (2, 99);
+
+statement error
+ALTER TABLE at9c ADD CONSTRAINT at9c_p_fkey FOREIGN KEY (p) REFERENCES at9p;
+
+statement ok
+ALTER TABLE at9c ADD CONSTRAINT at9c_p_fkey FOREIGN KEY (p) REFERENCES at9p NOT VALID;
+
+statement error
+ALTER TABLE at9c VALIDATE CONSTRAINT at9c_p_fkey;
+
+statement ok
+DELETE FROM at9c WHERE p = 99;
+
+statement ok
+ALTER TABLE at9c VALIDATE CONSTRAINT at9c_p_fkey;
+
+statement ok
+ALTER TABLE at9p DROP CONSTRAINT at9p_pkey CASCADE;
+
+query TT
+SELECT attname, attnotnull FROM pg_attribute WHERE attrelid = 'at9p'::regclass AND attnum > 0 ORDER BY attnum;
+----
+id	t
+code	f
+n	f
+
+statement error
+ALTER TABLE at9nosuch ADD COLUMN x int;
+
+statement ok
+ALTER TABLE IF EXISTS at9nosuch ADD COLUMN x int;
+
+# A primary key added to a table with rows; several operations at once.
+statement ok
+CREATE TABLE at9k (a int, b text, c int CHECK (c > 0));
+
+statement ok
+INSERT INTO at9k VALUES (1, 'x', 1), (2, 'y', 2), (2, 'z', 3);
+
+statement error
+ALTER TABLE at9k ADD PRIMARY KEY (a);
+
+statement ok
+ALTER TABLE at9k ADD PRIMARY KEY (a, b);
+
+query TTT
+SELECT * FROM at9k WHERE a = 2 AND b = 'z';
+----
+2	z	3
+
+statement error
+INSERT INTO at9k VALUES (2, 'z', 4);
+
+statement ok
+UPDATE at9k SET c = 10 WHERE a = 2 AND b = 'y';
+
+query TTT
+SELECT * FROM at9k ORDER BY a, b;
+----
+1	x	1
+2	y	10
+2	z	3
+
+statement ok
+ALTER TABLE at9k ADD COLUMN d int DEFAULT 7 NOT NULL, ADD COLUMN e text UNIQUE, ALTER COLUMN b SET DEFAULT 'q';
+
+query TTTTT
+INSERT INTO at9k (a, c) VALUES (3, 1) RETURNING *;
+----
+3	q	1	7	NULL
+
+statement ok
+ALTER TABLE at9k ALTER COLUMN b DROP DEFAULT;
+
+statement error
+ALTER TABLE at9k ALTER COLUMN e SET NOT NULL;
+
+statement ok
+ALTER TABLE at9k RENAME COLUMN c TO cc;
+
+statement error
+INSERT INTO at9k (a, b, cc) VALUES (9, 'w', -1);
+
+query TT
+SELECT conname, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'at9k'::regclass ORDER BY 1;
+----
+at9k_a_not_null	NOT NULL a
+at9k_b_not_null	NOT NULL b
+at9k_c_check	CHECK ((cc > 0))
+at9k_d_not_null	NOT NULL d
+at9k_e_key	UNIQUE (e)
+at9k_pkey	PRIMARY KEY (a, b)
+
+statement ok
+ALTER TABLE at9k DROP COLUMN cc;
+
+query T
+SELECT conname FROM pg_constraint WHERE conrelid = 'at9k'::regclass ORDER BY 1;
+----
+at9k_a_not_null
+at9k_b_not_null
+at9k_d_not_null
+at9k_e_key
+at9k_pkey
+
+statement ok
+ALTER TABLE at9k DROP COLUMN b;
+
+query TTT
+SELECT * FROM at9k ORDER BY a;
+----
+1	7	NULL
+2	7	NULL
+2	7	NULL
+3	7	NULL
+
+statement ok
+INSERT INTO at9k (a, d) VALUES (1, 1), (1, 2);
+
+query T
+SELECT count(*) FROM at9k WHERE a = 1;
+----
+3
+
+statement ok
+ALTER TABLE at9k RENAME CONSTRAINT at9k_e_key TO at9k_e_uq;
+
+query T
+SELECT conname FROM pg_constraint WHERE conrelid = 'at9k'::regclass ORDER BY 1;
+----
+at9k_a_not_null
+at9k_d_not_null
+at9k_e_uq
+
+statement ok
+ALTER TABLE at9k RENAME TO at9kk;
+
+query T
+SELECT count(*) FROM at9kk;
+----
+6
+
+statement ok
+ALTER TABLE at9kk OWNER TO CURRENT_USER;

@@ -614,6 +614,8 @@ impl CatalogWriter for MemoryCatalog {
             TableDescriptorChange::AddIndex { table_id, .. } => *table_id,
             TableDescriptorChange::DropIndex { table_id, .. } => *table_id,
             TableDescriptorChange::SetComment { table_id, .. }
+            | TableDescriptorChange::ReplaceColumn { table_id, .. }
+            | TableDescriptorChange::AddConstraint { table_id, .. }
             | TableDescriptorChange::DropConstraint { table_id, .. } => *table_id,
         };
 
@@ -681,6 +683,15 @@ impl CatalogWriter for MemoryCatalog {
                     None => anyhow::bail!("Column {} not found", name),
                 },
             },
+            TableDescriptorChange::ReplaceColumn { column, .. } => {
+                match table.columns.iter_mut().find(|c| c.id == column.id) {
+                    Some(existing) => *existing = column,
+                    None => anyhow::bail!("Column {} not found", column.name),
+                }
+            }
+            TableDescriptorChange::AddConstraint { constraint, .. } => {
+                table.constraints.push(constraint);
+            }
             TableDescriptorChange::DropConstraint { name, .. } => {
                 let before = table.constraints.len();
                 let table_name = table.name.clone();

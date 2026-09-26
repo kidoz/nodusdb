@@ -246,8 +246,9 @@ impl MemExecutor {
             }
             LogicalPlan::AlterTable {
                 table_name,
-                operation,
-            } => self.exec_alter_table(ctx, table_name, operation),
+                operations,
+                if_exists,
+            } => self.exec_alter_table(ctx, table_name, operations, if_exists),
             LogicalPlan::CreateIndex {
                 name,
                 table_name,

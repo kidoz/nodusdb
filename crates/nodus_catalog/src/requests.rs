@@ -106,6 +106,16 @@ pub enum TableDescriptorChange {
         column: Option<String>,
         comment: Option<String>,
     },
+    /// Replaces the column with the same id (its default, nullability).
+    ReplaceColumn {
+        table_id: TableId,
+        column: ColumnDescriptor,
+    },
+    /// Adds a CHECK or FOREIGN KEY constraint.
+    AddConstraint {
+        table_id: TableId,
+        constraint: TableConstraint,
+    },
     /// Removes the CHECK or FOREIGN KEY constraint named `name` (see
     /// [`crate::TableConstraint::effective_name`]).
     DropConstraint {

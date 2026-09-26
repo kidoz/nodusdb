@@ -1,5 +1,6 @@
 //! Constraint violations as PostgreSQL reports them, foreign key actions,
-//! `DROP` dependencies, unique indexes, and notices, driven through SQL.
+//! `DROP` dependencies, `ALTER TABLE`, unique indexes, and notices, driven
+//! through SQL.
 
 use super::*;
 use crate::dml_join_tests::rows;
@@ -218,6 +219,85 @@ fn drop_refuses_or_cascades_to_dependents() {
     sql("INSERT INTO c VALUES (1, 99)").unwrap();
     sql("DROP TABLE IF EXISTS c, nosuch").unwrap();
     assert_eq!(notices(), ["table \"nosuch\" does not exist, skipping"]);
+}
+
+#[test]
+fn alter_table_changes_columns_and_constraints() {
+    let (sql, notices) = session();
+    sql("CREATE TABLE t (a int, b text, c int)").unwrap();
+    sql("INSERT INTO t VALUES (1, 'x', NULL), (2, 'y', 5), (2, 'z', 6)").unwrap();
+    let (message, _) = fields(sql("ALTER TABLE t ADD PRIMARY KEY (a)").unwrap_err());
+    assert_eq!(message, "could not create unique index \"t_pkey\"");
+    sql("ALTER TABLE t ADD PRIMARY KEY (a, b), ADD COLUMN d int DEFAULT 7 NOT NULL").unwrap();
+    assert_eq!(
+        rows(&sql("SELECT d FROM t WHERE a = 2 AND b = 'z'").unwrap()),
+        ["7"]
+    );
+    assert!(sql("INSERT INTO t VALUES (2, 'z', 1, 1)").is_err());
+
+    let (message, _) = fields(sql("ALTER TABLE t ALTER COLUMN c SET NOT NULL").unwrap_err());
+    assert_eq!(
+        message,
+        "column \"c\" of relation \"t\" contains null values"
+    );
+    let (message, _) = fields(sql("ALTER TABLE t ADD CHECK (c > 5)").unwrap_err());
+    assert_eq!(
+        message,
+        "check constraint \"t_c_check\" of relation \"t\" is violated by some row"
+    );
+    sql("ALTER TABLE t ADD CHECK (c > 0), ALTER COLUMN c SET DEFAULT 9").unwrap();
+    sql("INSERT INTO t (a, b) VALUES (3, 'w')").unwrap();
+    assert_eq!(rows(&sql("SELECT c FROM t WHERE a = 3").unwrap()), ["9"]);
+
+    sql("ALTER TABLE t RENAME COLUMN c TO cc").unwrap();
+    assert!(sql("INSERT INTO t VALUES (4, 'v', -1)").is_err());
+    sql("ALTER TABLE t DROP COLUMN cc").unwrap();
+    let out = sql("SELECT conname FROM pg_constraint WHERE conrelid = 't'::regclass").unwrap();
+    assert!(
+        !rows(&out).iter().any(|name| name.contains("check")),
+        "{:?}",
+        rows(&out)
+    );
+    sql("ALTER TABLE t DROP CONSTRAINT t_pkey").unwrap();
+    sql("INSERT INTO t VALUES (1, 'x', 7), (1, 'x', 7)").unwrap();
+    assert_eq!(
+        rows(&sql("SELECT count(*) FROM t WHERE a = 1").unwrap()),
+        ["3"]
+    );
+
+    sql("ALTER TABLE t ADD COLUMN IF NOT EXISTS a int").unwrap();
+    assert_eq!(
+        notices(),
+        ["column \"a\" of relation \"t\" already exists, skipping"]
+    );
+    let (message, _) = fields(sql("ALTER TABLE t DROP CONSTRAINT nosuch").unwrap_err());
+    assert_eq!(
+        message,
+        "constraint \"nosuch\" of relation \"t\" does not exist"
+    );
+}
+
+#[test]
+fn a_referenced_key_or_column_drops_only_with_cascade() {
+    let (sql, _) = session();
+    sql("CREATE TABLE p (id int PRIMARY KEY)").unwrap();
+    sql("CREATE TABLE c (p_id int REFERENCES p)").unwrap();
+    let (message, f) = fields(sql("ALTER TABLE p DROP CONSTRAINT p_pkey").unwrap_err());
+    assert_eq!(
+        message,
+        "cannot drop constraint p_pkey on table p because other objects depend on it"
+    );
+    assert_eq!(
+        field(&f, "detail").unwrap(),
+        "constraint c_p_id_fkey on table c depends on index p_pkey"
+    );
+    let (message, _) = fields(sql("ALTER TABLE p DROP COLUMN id").unwrap_err());
+    assert_eq!(
+        message,
+        "cannot drop column id of table p because other objects depend on it"
+    );
+    sql("ALTER TABLE p DROP COLUMN id CASCADE").unwrap();
+    sql("INSERT INTO c VALUES (5)").unwrap();
 }
 
 #[test]
