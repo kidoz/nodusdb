@@ -605,103 +605,197 @@ impl MemExecutor {
 
         Ok(QueryOutput::tag("CREATE VIEW"))
     }
-    pub(crate) fn exec_drop_view(
+    /// `DROP TABLE`, `DROP VIEW`, or `DROP MATERIALIZED VIEW` of `names`,
+    /// each only of its own kind. The foreign keys referencing a dropped
+    /// relation and the views reading it depend on it: they must be dropped
+    /// with it, and with `cascade` they are.
+    pub(crate) fn exec_drop_relations(
         &self,
         ctx: &ExecutionContext,
-        name: String,
+        kind: RelationKind,
+        names: Vec<String>,
         if_exists: bool,
+        cascade: bool,
     ) -> Result<QueryOutput> {
-        let (db_name, schema_name, view_only) = parse_object_name(&name)?;
-        match self
-            .catalog_reader
-            .get_table(db_name, schema_name, view_only)
-        {
-            Ok(tbl) => {
-                self.authorize(ctx, Action::CreateTable, ResourceRef::Table(tbl.id))?;
-                if tbl.view_query.is_none() {
-                    anyhow::bail!("{} is not a view", name);
-                }
-                self.catalog_writer.drop_table(tbl.id)?;
-                Ok(QueryOutput::tag("DROP VIEW"))
-            }
-            Err(e) => {
+        let mut targets: Vec<nodus_catalog::TableDescriptor> = Vec::new();
+        for name in &names {
+            let (db_name, schema_name, relation) = parse_object_name(name)?;
+            let Ok(tbl) = self
+                .catalog_reader
+                .get_table(db_name, schema_name, relation)
+            else {
                 if if_exists {
-                    Ok(QueryOutput::tag("DROP VIEW"))
-                } else {
-                    Err(anyhow::anyhow!(e))
+                    self.notice(
+                        ctx,
+                        DbError::new(format!(
+                            "{} \"{relation}\" does not exist, skipping",
+                            kind.noun()
+                        )),
+                    );
+                    continue;
                 }
+                anyhow::bail!("{} \"{relation}\" does not exist", kind.noun());
+            };
+            if RelationKind::of(&tbl) != Some(kind) {
+                anyhow::bail!("\"{relation}\" is not {}", kind.article_noun());
+            }
+            self.authorize(ctx, Action::CreateTable, ResourceRef::Table(tbl.id))?;
+            if !targets.iter().any(|t| t.id == tbl.id) {
+                targets.push(tbl);
             }
         }
-    }
-    /// `DROP TABLE`, or with `materialized` `DROP MATERIALIZED VIEW`; each
-    /// drops only its own kind of relation.
-    pub(crate) fn exec_drop_table(
-        &self,
-        ctx: &ExecutionContext,
-        name: String,
-        if_exists: bool,
-        materialized: bool,
-    ) -> Result<QueryOutput> {
-        let (db_name, schema_name, table_only) = parse_object_name(&name)?;
-        let tag = if materialized {
-            "DROP MATERIALIZED VIEW"
-        } else {
-            "DROP TABLE"
-        };
-        match self
-            .catalog_reader
-            .get_table(db_name, schema_name, table_only)
-        {
-            Ok(tbl)
-                if crate::sequences::is_sequence(&tbl)
-                    || tbl.view_query.is_some()
-                    || (tbl.materialized_query.is_some() != materialized) =>
-            {
-                if materialized {
-                    anyhow::bail!("\"{table_only}\" is not a materialized view")
+        let dependents = self.dependents(&targets)?;
+        if !dependents.is_empty() && !cascade {
+            let message = match targets.as_slice() {
+                [only] => format!(
+                    "cannot drop {} {} because other objects depend on it",
+                    kind.noun(),
+                    only.name
+                ),
+                _ => {
+                    "cannot drop desired object(s) because other objects depend on them".to_string()
                 }
-                anyhow::bail!("\"{table_only}\" is not a table")
-            }
-            Ok(tbl) => {
-                self.authorize(ctx, Action::CreateTable, ResourceRef::Table(tbl.id))?;
-                self.catalog_writer.drop_table(tbl.id)?;
-                // A `serial` or identity column's sequence goes with its table.
-                for column in &tbl.columns {
-                    let Some(sequence) = column
-                        .default_expr
-                        .as_deref()
-                        .and_then(|json| serde_json::from_str::<ScalarExpr>(json).ok())
-                        .and_then(|default| crate::sequences::default_sequence(&default))
-                    else {
-                        continue;
-                    };
-                    let owned = crate::sequences::owned_sequence_name(&tbl.name, &column.name);
-                    if sequence.rsplit('.').next().map(|s| s.trim_matches('"'))
-                        == Some(owned.as_str())
-                    {
-                        let (db, schema, seq) = parse_object_name(&sequence)?;
-                        if let Ok(seq_tbl) = self.catalog_reader.get_table(db, schema, seq)
-                            && crate::sequences::is_sequence(&seq_tbl)
-                        {
-                            self.catalog_writer.drop_table(seq_tbl.id)?;
-                        }
-                    }
+            };
+            let detail: Vec<String> = dependents.iter().map(|d| d.description.clone()).collect();
+            return Err(crate::error_fields::DbError::new(message)
+                .detail(detail.join("\n"))
+                .hint("Use DROP ... CASCADE to drop the dependent objects too.")
+                .into());
+        }
+        match dependents.as_slice() {
+            [] => {}
+            [only] => self.notice(
+                ctx,
+                DbError::new(format!("drop cascades to {}", only.object_description())),
+            ),
+            many => self.notice(
+                ctx,
+                DbError::new(format!("drop cascades to {} other objects", many.len())).detail(
+                    many.iter()
+                        .map(|d| format!("drop cascades to {}", d.object_description()))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                ),
+            ),
+        }
+        for dependent in &dependents {
+            match &dependent.object {
+                Dependent::Constraint { table, name } => {
+                    self.catalog_writer.update_table_descriptor(
+                        nodus_catalog::TableDescriptorChange::DropConstraint {
+                            table_id: *table,
+                            name: name.clone(),
+                        },
+                    )?;
                 }
-                Ok(QueryOutput::tag(tag))
-            }
-            Err(e) => {
-                if if_exists {
-                    Ok(QueryOutput::tag(tag))
-                } else {
-                    Err(anyhow::anyhow!(e))
-                }
+                Dependent::View(view) => self.drop_relation(view)?,
             }
         }
+        for tbl in &targets {
+            self.drop_relation(tbl)?;
+        }
+        Ok(QueryOutput::tag(kind.tag()))
     }
 
     /// The notice for `CREATE ... IF NOT EXISTS` of a relation that exists.
     fn exists_skipping(relation: &str) -> DbError {
         DbError::new(format!("relation \"{relation}\" already exists, skipping")).code("42P07")
+    }
+
+    /// Drops `tbl` from the catalog, with the sequence a `serial` or
+    /// identity column of it owns.
+    fn drop_relation(&self, tbl: &nodus_catalog::TableDescriptor) -> Result<()> {
+        self.catalog_writer.drop_table(tbl.id)?;
+        for column in &tbl.columns {
+            let Some(sequence) = column
+                .default_expr
+                .as_deref()
+                .and_then(|json| serde_json::from_str::<ScalarExpr>(json).ok())
+                .and_then(|default| crate::sequences::default_sequence(&default))
+            else {
+                continue;
+            };
+            let owned = crate::sequences::owned_sequence_name(&tbl.name, &column.name);
+            if sequence.rsplit('.').next().map(|s| s.trim_matches('"')) == Some(owned.as_str()) {
+                let (db, schema, seq) = parse_object_name(&sequence)?;
+                if let Ok(seq_tbl) = self.catalog_reader.get_table(db, schema, seq)
+                    && crate::sequences::is_sequence(&seq_tbl)
+                {
+                    self.catalog_writer.drop_table(seq_tbl.id)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The objects depending on `targets` that are not among them, as
+    /// PostgreSQL lists them: the foreign keys referencing each target and
+    /// the views reading it, each such view followed by those reading it.
+    fn dependents(
+        &self,
+        targets: &[nodus_catalog::TableDescriptor],
+    ) -> Result<Vec<DependentObject>> {
+        let mut tables = self.catalog_reader.list_all_tables("default")?;
+        tables.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.name.cmp(&b.name)));
+        let mut found: Vec<DependentObject> = Vec::new();
+        let mut seen: Vec<nodus_catalog::TableId> = targets.iter().map(|t| t.id).collect();
+        fn views_of(
+            relation: &nodus_catalog::TableDescriptor,
+            tables: &[nodus_catalog::TableDescriptor],
+            seen: &mut Vec<nodus_catalog::TableId>,
+            found: &mut Vec<DependentObject>,
+        ) {
+            for view in tables {
+                let Some(query) = view
+                    .view_query
+                    .as_ref()
+                    .or(view.materialized_query.as_ref())
+                else {
+                    continue;
+                };
+                if seen.contains(&view.id) || !plan_reads(query, &relation.name) {
+                    continue;
+                }
+                seen.push(view.id);
+                let kind = RelationKind::of(view).unwrap_or(RelationKind::View);
+                let relation_kind = RelationKind::of(relation).unwrap_or(RelationKind::Table);
+                found.push(DependentObject {
+                    description: format!(
+                        "{} {} depends on {} {}",
+                        kind.noun(),
+                        view.name,
+                        relation_kind.noun(),
+                        relation.name
+                    ),
+                    object: Dependent::View(view.clone()),
+                });
+                views_of(view, tables, seen, found);
+            }
+        }
+        for target in targets {
+            for reference in self.references_to(target)? {
+                if targets.iter().any(|t| t.id == reference.child.id) {
+                    continue;
+                }
+                found.push(DependentObject {
+                    description: format!(
+                        "constraint {} on table {} depends on {} {}",
+                        reference.name,
+                        reference.child.name,
+                        RelationKind::of(target)
+                            .unwrap_or(RelationKind::Table)
+                            .noun(),
+                        target.name
+                    ),
+                    object: Dependent::Constraint {
+                        table: reference.child.id,
+                        name: reference.name.clone(),
+                    },
+                });
+            }
+            views_of(target, &tables, &mut seen, &mut found);
+        }
+        Ok(found)
     }
 
     pub(crate) fn exec_alter_table(
@@ -1149,6 +1243,98 @@ impl MemExecutor {
             })?;
         Ok(QueryOutput::tag("REVOKE"))
     }
+}
+
+/// The kinds of relation `DROP` removes, each only by its own statement.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RelationKind {
+    Table,
+    View,
+    MaterializedView,
+}
+
+impl RelationKind {
+    /// The kind of `tbl`; `None` for a sequence.
+    fn of(tbl: &nodus_catalog::TableDescriptor) -> Option<RelationKind> {
+        if crate::sequences::is_sequence(tbl) {
+            None
+        } else if tbl.view_query.is_some() {
+            Some(RelationKind::View)
+        } else if tbl.materialized_query.is_some() {
+            Some(RelationKind::MaterializedView)
+        } else {
+            Some(RelationKind::Table)
+        }
+    }
+
+    fn noun(self) -> &'static str {
+        match self {
+            RelationKind::Table => "table",
+            RelationKind::View => "view",
+            RelationKind::MaterializedView => "materialized view",
+        }
+    }
+
+    fn article_noun(self) -> &'static str {
+        match self {
+            RelationKind::Table => "a table",
+            RelationKind::View => "a view",
+            RelationKind::MaterializedView => "a materialized view",
+        }
+    }
+
+    fn tag(self) -> &'static str {
+        match self {
+            RelationKind::Table => "DROP TABLE",
+            RelationKind::View => "DROP VIEW",
+            RelationKind::MaterializedView => "DROP MATERIALIZED VIEW",
+        }
+    }
+}
+
+/// An object that depends on a relation being dropped.
+struct DependentObject {
+    /// As PostgreSQL's DETAIL lists it: `view v depends on table t`.
+    description: String,
+    object: Dependent,
+}
+
+impl DependentObject {
+    /// The object as a notice names it: `view v`, `constraint c on table t`.
+    fn object_description(&self) -> String {
+        self.description
+            .split(" depends on ")
+            .next()
+            .unwrap_or(&self.description)
+            .to_string()
+    }
+}
+
+enum Dependent {
+    /// A foreign key of another table.
+    Constraint {
+        table: nodus_catalog::TableId,
+        name: String,
+    },
+    View(nodus_catalog::TableDescriptor),
+}
+
+/// Whether the stored plan `query` of a view reads relation `name`.
+pub(crate) fn plan_reads(query: &str, name: &str) -> bool {
+    fn walk(value: &serde_json::Value, name: &str) -> bool {
+        match value {
+            serde_json::Value::Object(map) => map.iter().any(|(key, v)| {
+                let reads = key == "table_name"
+                    && v.as_str().is_some_and(|t| {
+                        t.rsplit('.').next().map(|t| t.trim_matches('"')) == Some(name)
+                    });
+                reads || walk(v, name)
+            }),
+            serde_json::Value::Array(items) => items.iter().any(|v| walk(v, name)),
+            _ => false,
+        }
+    }
+    serde_json::from_str::<serde_json::Value>(query).is_ok_and(|plan| walk(&plan, name))
 }
 
 /// Names each unnamed CHECK constraint as PostgreSQL does:

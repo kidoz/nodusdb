@@ -613,7 +613,8 @@ impl CatalogWriter for MemoryCatalog {
             TableDescriptorChange::DropColumn { table_id, .. } => *table_id,
             TableDescriptorChange::AddIndex { table_id, .. } => *table_id,
             TableDescriptorChange::DropIndex { table_id, .. } => *table_id,
-            TableDescriptorChange::SetComment { table_id, .. } => *table_id,
+            TableDescriptorChange::SetComment { table_id, .. }
+            | TableDescriptorChange::DropConstraint { table_id, .. } => *table_id,
         };
 
         let mut target_key = None;
@@ -680,6 +681,16 @@ impl CatalogWriter for MemoryCatalog {
                     None => anyhow::bail!("Column {} not found", name),
                 },
             },
+            TableDescriptorChange::DropConstraint { name, .. } => {
+                let before = table.constraints.len();
+                let table_name = table.name.clone();
+                table
+                    .constraints
+                    .retain(|c| c.effective_name(&table_name) != name);
+                if table.constraints.len() == before {
+                    anyhow::bail!("Constraint {} not found", name);
+                }
+            }
         }
 
         let out = table.clone();

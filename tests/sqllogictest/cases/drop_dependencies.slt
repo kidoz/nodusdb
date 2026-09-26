@@ -1,0 +1,65 @@
+# DROP refuses to leave foreign keys or views without the relation they
+# depend on, unless CASCADE drops them too; one DROP may name several.
+statement ok
+CREATE TABLE dd9p (id int PRIMARY KEY, n int);
+
+statement ok
+CREATE TABLE dd9c (id int PRIMARY KEY, p_id int REFERENCES dd9p);
+
+statement ok
+CREATE VIEW dd9v AS SELECT id, n FROM dd9p;
+
+statement ok
+CREATE VIEW dd9w AS SELECT id FROM dd9v WHERE n > 0;
+
+statement error
+DROP TABLE dd9p;
+
+statement error
+DROP VIEW dd9v;
+
+statement error
+DROP TABLE dd9p, dd9c;
+
+statement ok
+DROP VIEW dd9w, dd9v;
+
+statement ok
+CREATE VIEW dd9v AS SELECT id, n FROM dd9p;
+
+statement ok
+DROP TABLE dd9p CASCADE;
+
+query T
+SELECT count(*) FROM pg_constraint WHERE conrelid = 'dd9c'::regclass AND contype = 'f';
+----
+0
+
+query T
+SELECT count(*) FROM pg_class WHERE relname IN ('dd9p', 'dd9v');
+----
+0
+
+statement ok
+INSERT INTO dd9c VALUES (1, 99);
+
+statement ok
+CREATE TABLE dd9q (id int PRIMARY KEY);
+
+statement ok
+DROP TABLE dd9c, dd9q;
+
+statement ok
+DROP TABLE IF EXISTS dd9c, dd9nosuch;
+
+statement error
+DROP TABLE dd9nosuch, dd9nosuch2;
+
+statement ok
+CREATE TABLE dd9a (id int PRIMARY KEY);
+
+statement ok
+CREATE TABLE dd9b (a_id int REFERENCES dd9a);
+
+statement ok
+DROP TABLE dd9a, dd9b;

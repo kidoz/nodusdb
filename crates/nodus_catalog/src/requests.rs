@@ -106,6 +106,12 @@ pub enum TableDescriptorChange {
         column: Option<String>,
         comment: Option<String>,
     },
+    /// Removes the CHECK or FOREIGN KEY constraint named `name` (see
+    /// [`crate::TableConstraint::effective_name`]).
+    DropConstraint {
+        table_id: TableId,
+        name: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

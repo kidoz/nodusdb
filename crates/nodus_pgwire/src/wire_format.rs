@@ -71,6 +71,10 @@ pub(crate) fn sqlstate_for_execution_error(err_str: &str) -> &'static str {
         || err_str.starts_with("number of referencing and referenced columns")
     {
         "42830" // invalid_foreign_key
+    } else if err_str.ends_with("because other objects depend on it")
+        || err_str.ends_with("because other objects depend on them")
+    {
+        "2BP01" // dependent_objects_still_exist
     } else if err_str.contains("violates RESTRICT setting of foreign key constraint") {
         "23001" // restrict_violation
     } else if err_str.contains("violates foreign key constraint") {

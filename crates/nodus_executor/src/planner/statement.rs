@@ -358,25 +358,28 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                     names: names.iter().map(|n| n.to_string()).collect(),
                     if_exists: *if_exists,
                 }),
+                sqlparser::ast::ObjectType::Table => Ok(LogicalPlan::DropTable {
+                    names: names.iter().map(|n| n.to_string()).collect(),
+                    if_exists: *if_exists,
+                    materialized: false,
+                    cascade: *cascade,
+                }),
+                sqlparser::ast::ObjectType::MaterializedView => Ok(LogicalPlan::DropTable {
+                    names: names.iter().map(|n| n.to_string()).collect(),
+                    if_exists: *if_exists,
+                    materialized: true,
+                    cascade: *cascade,
+                }),
+                sqlparser::ast::ObjectType::View => Ok(LogicalPlan::DropView {
+                    names: names.iter().map(|n| n.to_string()).collect(),
+                    if_exists: *if_exists,
+                    cascade: *cascade,
+                }),
                 // Dropping only the first of several names would report the
                 // others dropped too.
                 _ if names.len() > 1 => {
                     anyhow::bail!("DROP of several objects in one statement is not supported")
                 }
-                sqlparser::ast::ObjectType::Table => Ok(LogicalPlan::DropTable {
-                    name,
-                    if_exists: *if_exists,
-                    materialized: false,
-                }),
-                sqlparser::ast::ObjectType::MaterializedView => Ok(LogicalPlan::DropTable {
-                    name,
-                    if_exists: *if_exists,
-                    materialized: true,
-                }),
-                sqlparser::ast::ObjectType::View => Ok(LogicalPlan::DropView {
-                    name,
-                    if_exists: *if_exists,
-                }),
                 sqlparser::ast::ObjectType::Schema => Ok(LogicalPlan::DropSchema {
                     schema_name: name,
                     if_exists: *if_exists,

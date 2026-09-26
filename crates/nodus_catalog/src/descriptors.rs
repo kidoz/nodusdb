@@ -123,6 +123,30 @@ pub enum TableConstraint {
     },
 }
 
+impl TableConstraint {
+    /// The constraint's name on `table`: its own, or for one created
+    /// without (by an older binary) the name PostgreSQL would give it.
+    pub fn effective_name(&self, table: &str) -> String {
+        match self {
+            TableConstraint::Check { name, .. } => {
+                name.clone().unwrap_or_else(|| format!("{table}_check"))
+            }
+            TableConstraint::ForeignKey { name, columns, .. } => name
+                .clone()
+                .unwrap_or_else(|| format!("{table}_{}_fkey", columns.join("_"))),
+        }
+    }
+
+    /// The constraint's name, when it has one.
+    pub fn name(&self) -> Option<&str> {
+        match self {
+            TableConstraint::Check { name, .. } | TableConstraint::ForeignKey { name, .. } => {
+                name.as_deref()
+            }
+        }
+    }
+}
+
 /// A foreign key's `ON DELETE` / `ON UPDATE` action.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReferentialAction {

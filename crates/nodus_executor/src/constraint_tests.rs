@@ -1,5 +1,5 @@
 //! Constraint violations as PostgreSQL reports them, foreign key actions,
-//! unique indexes, and notices, driven through SQL.
+//! `DROP` dependencies, unique indexes, and notices, driven through SQL.
 
 use super::*;
 use crate::dml_join_tests::rows;
@@ -192,6 +192,32 @@ fn truncate_empties_referenced_tables_only_with_their_references() {
     sql("TRUNCATE p CASCADE").unwrap();
     assert_eq!(notices(), ["truncate cascades to table \"c\""]);
     assert_eq!(rows(&sql("SELECT count(*) FROM c").unwrap()), ["0"]);
+}
+
+#[test]
+fn drop_refuses_or_cascades_to_dependents() {
+    let (sql, notices) = session();
+    sql("CREATE TABLE p (id int PRIMARY KEY, n int)").unwrap();
+    sql("CREATE TABLE c (id int, p_id int REFERENCES p)").unwrap();
+    sql("CREATE VIEW v AS SELECT id, n FROM p").unwrap();
+    sql("CREATE VIEW w AS SELECT id FROM v").unwrap();
+    let (message, f) = fields(sql("DROP TABLE p").unwrap_err());
+    assert_eq!(
+        message,
+        "cannot drop table p because other objects depend on it"
+    );
+    assert_eq!(
+        field(&f, "detail").unwrap(),
+        "constraint c_p_id_fkey on table c depends on table p\n\
+         view v depends on table p\n\
+         view w depends on view v"
+    );
+    sql("DROP TABLE p CASCADE").unwrap();
+    assert_eq!(notices(), ["drop cascades to 3 other objects"]);
+    // The foreign key went; its table stays.
+    sql("INSERT INTO c VALUES (1, 99)").unwrap();
+    sql("DROP TABLE IF EXISTS c, nosuch").unwrap();
+    assert_eq!(notices(), ["table \"nosuch\" does not exist, skipping"]);
 }
 
 #[test]

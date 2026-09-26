@@ -3,6 +3,7 @@
 //! catalog reads) and the physical row pipeline (`execute_physical_inner`).
 
 use crate::aggregates::*;
+use crate::ddl::RelationKind;
 use crate::*;
 use anyhow::Result;
 use bytes::Bytes;
@@ -55,12 +56,24 @@ impl MemExecutor {
                 query,
                 or_replace,
             } => self.exec_create_view(ctx, name, query, or_replace),
-            LogicalPlan::DropView { name, if_exists } => self.exec_drop_view(ctx, name, if_exists),
+            LogicalPlan::DropView {
+                names,
+                if_exists,
+                cascade,
+            } => self.exec_drop_relations(ctx, RelationKind::View, names, if_exists, cascade),
             LogicalPlan::DropTable {
-                name,
+                names,
                 if_exists,
                 materialized,
-            } => self.exec_drop_table(ctx, name, if_exists, materialized),
+                cascade,
+            } => {
+                let kind = if materialized {
+                    RelationKind::MaterializedView
+                } else {
+                    RelationKind::Table
+                };
+                self.exec_drop_relations(ctx, kind, names, if_exists, cascade)
+            }
             LogicalPlan::CreateSequence {
                 name,
                 if_not_exists,

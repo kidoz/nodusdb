@@ -840,12 +840,15 @@ pub enum LogicalPlan {
         #[serde(default)]
         key_names: Vec<(Vec<String>, String)>,
     },
+    /// `DROP TABLE names` or, with `materialized`, `DROP MATERIALIZED
+    /// VIEW names`; with `cascade`, the objects depending on them go too.
     DropTable {
-        name: String,
+        names: Vec<String>,
         if_exists: bool,
-        /// `DROP MATERIALIZED VIEW`. Defaulted so older plans decode.
         #[serde(default)]
         materialized: bool,
+        #[serde(default)]
+        cascade: bool,
     },
     CreateView {
         name: String,
@@ -855,8 +858,10 @@ pub enum LogicalPlan {
         or_replace: bool,
     },
     DropView {
-        name: String,
+        names: Vec<String>,
         if_exists: bool,
+        #[serde(default)]
+        cascade: bool,
     },
     AlterTable {
         table_name: String,
