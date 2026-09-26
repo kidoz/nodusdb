@@ -878,6 +878,9 @@ impl MemExecutor {
         // (a superuser holds ALL on System, so this still passes for them) so an
         // ordinary user can't mint roles as a privilege-escalation primitive.
         self.authorize(ctx, Action::ManageGrants, ResourceRef::System)?;
+        if name.eq_ignore_ascii_case(nodus_catalog::PUBLIC_ROLE) {
+            anyhow::bail!("role name \"{name}\" is reserved");
+        }
         self.catalog_writer
             .create_role(nodus_catalog::CreateRoleRequest {
                 id: nodus_catalog::PrincipalId::new(),
@@ -894,7 +897,12 @@ impl MemExecutor {
         object_name: String,
         grantee: String,
     ) -> Result<QueryOutput> {
-        let role = self.catalog_reader.get_principal_by_name(&grantee)?;
+        let public = grantee.eq_ignore_ascii_case(nodus_catalog::PUBLIC_ROLE);
+        let role = self.catalog_reader.get_principal_by_name(if public {
+            nodus_catalog::PUBLIC_ROLE
+        } else {
+            &grantee
+        });
         let (db_name, schema_name, table_only) = parse_object_name(&object_name)?;
         let tbl = self
             .catalog_reader
@@ -904,6 +912,19 @@ impl MemExecutor {
         // could hand its privileges to any principal. (Superuser passes via
         // ALL-on-System.)
         self.authorize(ctx, Action::ManageGrants, ResourceRef::Table(tbl.id))?;
+        // The role behind PUBLIC comes with the first grant to it.
+        let role = match role {
+            Err(_) if public => {
+                self.catalog_writer
+                    .create_role(nodus_catalog::CreateRoleRequest {
+                        id: nodus_catalog::PrincipalId::new(),
+                        name: nodus_catalog::PUBLIC_ROLE.to_string(),
+                        principal_type: nodus_catalog::PrincipalType::Public,
+                        database_id: None,
+                    })?
+            }
+            role => role?,
+        };
         self.catalog_writer
             .grant_privileges(nodus_catalog::GrantPrivilegesRequest {
                 id: nodus_catalog::GrantId::new(),
@@ -920,12 +941,24 @@ impl MemExecutor {
         object_name: String,
         revokee: String,
     ) -> Result<QueryOutput> {
-        let role = self.catalog_reader.get_principal_by_name(&revokee)?;
+        let public = revokee.eq_ignore_ascii_case(nodus_catalog::PUBLIC_ROLE);
+        let role = match self.catalog_reader.get_principal_by_name(if public {
+            nodus_catalog::PUBLIC_ROLE
+        } else {
+            &revokee
+        }) {
+            // Nothing was ever granted to PUBLIC.
+            Err(_) if public => None,
+            role => Some(role?),
+        };
         let (db_name, schema_name, table_only) = parse_object_name(&object_name)?;
         let tbl = self
             .catalog_reader
             .get_table(db_name, schema_name, table_only)?;
         self.authorize(ctx, Action::ManageGrants, ResourceRef::Table(tbl.id))?;
+        let Some(role) = role else {
+            return Ok(QueryOutput::tag("REVOKE"));
+        };
         self.catalog_writer
             .revoke_privileges(nodus_catalog::RevokePrivilegesRequest {
                 principal_id: role.id,

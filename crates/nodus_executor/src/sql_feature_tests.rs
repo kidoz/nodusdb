@@ -1,9 +1,10 @@
 //! Set-returning functions in select lists, RETURNING expressions, JSON layouts
-//! and whole-row references, `COMMENT ON`, and column renames, driven through
-//! SQL.
+//! and whole-row references, `COMMENT ON`, column renames, and grants to
+//! `PUBLIC`, driven through SQL.
 
 use super::*;
 use crate::dml_join_tests::{rows, session};
+use nodus_audit::MemoryAuditSink;
 
 /// The first value of the first row of `out`, rendered.
 fn value(out: &QueryOutput) -> String {
@@ -164,4 +165,51 @@ fn renaming_a_missing_column_keeps_the_table() {
     let err = sql("ALTER TABLE t RENAME COLUMN nope TO m").unwrap_err();
     assert_eq!(err.to_string(), "column \"nope\" does not exist");
     assert_eq!(rows(&sql("SELECT n FROM t").unwrap()), ["2"]);
+}
+
+#[test]
+fn grants_to_public_reach_every_principal() {
+    let (exec, cat) = MemExecutor::shared(Arc::new(MemoryAuditSink::new()));
+    let principal = |name: &str| {
+        cat.create_role(nodus_catalog::CreateRoleRequest {
+            id: nodus_catalog::PrincipalId::new(),
+            name: name.into(),
+            principal_type: nodus_catalog::PrincipalType::User,
+            database_id: None,
+        })
+        .unwrap()
+    };
+    let admin = principal("admin");
+    cat.grant_privilege(nodus_catalog::GrantPrivilegeRequest {
+        id: nodus_catalog::GrantId::new(),
+        principal_id: admin.id,
+        resource: nodus_catalog::ResourceRef::System,
+        privilege: "ALL".into(),
+    })
+    .unwrap();
+    let user = principal("alice");
+    let run = |principal_id, statement: &str| {
+        let ctx = ExecutionContext {
+            session_id: format!("{principal_id:?}"),
+            principal_id,
+            active_roles: vec![],
+            authz_catalog_version: 1,
+        };
+        let mut statements = nodus_sql::parse_sql(statement)?;
+        exec.execute_logical(&ctx, plan_statement(&statements.remove(0), &[])?)
+    };
+    run(admin.id, "CREATE TABLE t (id INT PRIMARY KEY)").unwrap();
+    assert!(run(user.id, "SELECT * FROM t").is_err());
+    run(admin.id, "GRANT SELECT ON t TO PUBLIC").unwrap();
+    assert_eq!(
+        run(user.id, "SELECT count(*) FROM t").unwrap().rows.len(),
+        1
+    );
+    assert!(run(user.id, "INSERT INTO t VALUES (1)").is_err());
+    run(admin.id, "REVOKE SELECT ON t FROM PUBLIC").unwrap();
+    assert!(run(user.id, "SELECT * FROM t").is_err());
+    // Revoking what PUBLIC never had is no error.
+    run(admin.id, "REVOKE UPDATE ON t FROM PUBLIC").unwrap();
+    let err = run(admin.id, "CREATE ROLE public").unwrap_err();
+    assert_eq!(err.to_string(), "role name \"public\" is reserved");
 }

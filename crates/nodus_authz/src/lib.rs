@@ -129,9 +129,17 @@ impl DefaultAuthzEngine {
         request: &AuthzRequest,
     ) -> Result<(Option<GrantDescriptor>, Vec<PrincipalId>, u64)> {
         let catalog_version = self.catalog.get_cluster_version()?.active_version;
-        let effective = self
+        let mut effective = self
             .catalog
             .get_effective_principals(request.principal_id)?;
+        // Every principal holds what is granted to PUBLIC.
+        if let Ok(public) = self
+            .catalog
+            .get_principal_by_name(nodus_catalog::PUBLIC_ROLE)
+            && !effective.contains(&public.id)
+        {
+            effective.push(public.id);
+        }
         let wanted = request.action.to_privilege();
         let grants = self
             .catalog

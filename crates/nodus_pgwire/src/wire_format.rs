@@ -121,6 +121,8 @@ pub(crate) fn sqlstate_for_execution_error(err_str: &str) -> &'static str {
         || err_str.starts_with("FILTER specified, but")
     {
         "42809" // wrong_object_type
+    } else if err_str.starts_with("role name \"") && err_str.ends_with("\" is reserved") {
+        "42939" // reserved_name
     } else if err_str.starts_with("non-integer constant in")
         || err_str == "VALUES lists must all be the same length"
     {

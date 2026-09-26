@@ -1,0 +1,26 @@
+# Privileges granted to PUBLIC are every role's.
+statement ok
+CREATE TABLE gp8 (id INT PRIMARY KEY);
+
+statement ok
+GRANT SELECT ON gp8 TO PUBLIC;
+
+statement ok
+GRANT INSERT ON gp8 TO public;
+
+statement ok
+REVOKE SELECT ON gp8 FROM PUBLIC;
+
+statement ok
+REVOKE INSERT ON gp8 FROM PUBLIC;
+
+statement ok
+REVOKE UPDATE ON gp8 FROM PUBLIC;
+
+statement error
+CREATE ROLE public;
+
+query T
+SELECT count(*) FROM gp8;
+----
+0

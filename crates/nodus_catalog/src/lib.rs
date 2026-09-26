@@ -13,3 +13,7 @@ pub use memory_catalog::MemoryCatalog;
 pub use rbac_descriptors::*;
 pub use requests::*;
 pub use traits::*;
+
+/// The role behind `PUBLIC`: what is granted to it is granted to every
+/// principal. It is created by the first grant to `PUBLIC`.
+pub const PUBLIC_ROLE: &str = "public";
