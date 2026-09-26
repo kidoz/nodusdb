@@ -962,6 +962,26 @@ impl MemExecutor {
 
             // The groups HAVING keeps, each with its grouping set.
             let mut kept: Vec<(usize, Vec<Vec<Value>>)> = Vec::new();
+            // An expression as a grouping set's rows see it: `GROUPING(...)`
+            // as its bits, and with grouping sets a grouping column the set
+            // leaves out as NULL (outside aggregates).
+            let rollup = grouping_sets.as_ref().is_some_and(|s| !s.is_empty());
+            let grouping_view = |e: &ScalarExpr, set: &[String]| {
+                let position = |c: &str| crate::filter_eval::col_pos(&col_names, c);
+                let active = |c: &str| {
+                    position(c).is_some_and(|i| set.iter().any(|s| position(s) == Some(i)))
+                };
+                let grouping = |c: &str| {
+                    position(c).is_some_and(|i| group_by.iter().any(|g| position(g) == Some(i)))
+                };
+                // Grouping expressions the set leaves out, wherever they appear.
+                let inactive: Vec<&ScalarExpr> = group_exprs
+                    .iter()
+                    .filter(|(name, _)| rollup && grouping(name) && !active(name))
+                    .map(|(_, e)| e)
+                    .collect();
+                for_grouping_set(e, &active, &grouping, rollup, &inactive)
+            };
             for (set_index, set) in sets.iter().enumerate() {
                 // col_pos also resolves qualified refs (`t.col`) against bare
                 // column names.
@@ -1002,9 +1022,10 @@ impl MemExecutor {
                 for (_k, group_rows) in groups {
                     // HAVING filters whole groups after aggregation.
                     if let Some(h) = having.as_ref() {
+                        let h = filter_for_grouping_set(h, &|e| grouping_view(e, set));
                         // A subquery in HAVING reads the group's first row.
                         let rep = group_rows.first().map(Vec::as_slice).unwrap_or(&[]);
-                        let resolved = match h {
+                        let resolved = match &h {
                             FilterExpr::Scalar(e) if crate::subqueries::contains_subquery(e) => {
                                 FilterExpr::Scalar(self.resolve_subqueries(ctx, e, rep, &col_names))
                             }
@@ -1023,15 +1044,17 @@ impl MemExecutor {
                 Vec::new()
             } else {
                 crate::windows::compute(&windows, kept.len(), &|e, g| {
-                    let (_, rows) = &kept[g];
-                    self.eval_grouped(ctx, e, rows, &col_names)
+                    let (set_index, rows) = &kept[g];
+                    let e = grouping_view(e, &sets[*set_index]);
+                    self.eval_grouped(ctx, &e, rows, &col_names)
                 })?
             };
             for (g, (set_index, group_rows)) in kept.iter().enumerate() {
                 let set = &sets[*set_index];
-                // The group's view of an expression: with its window values in
-                // place of their hidden columns.
-                let view = |e: &ScalarExpr| substitute_windows(e, &window_values, g);
+                // The group's view of an expression: its grouping set's, with
+                // its window values in place of their hidden columns.
+                let view =
+                    |e: &ScalarExpr| substitute_windows(&grouping_view(e, set), &window_values, g);
                 let mut out_row = Vec::new();
                 for proj_item in &projection {
                     match proj_item {
@@ -2003,6 +2026,75 @@ impl MemExecutor {
             rows,
             tag,
         })
+    }
+}
+
+/// An expression as one grouping set's rows see it: `GROUPING(args)` as its
+/// bits (1 for each argument the set leaves out), and with `rollup` a
+/// grouping column the set leaves out as NULL, except inside aggregates,
+/// which read every row's real values.
+fn for_grouping_set(
+    expr: &ScalarExpr,
+    active: &dyn Fn(&str) -> bool,
+    grouping: &dyn Fn(&str) -> bool,
+    rollup: bool,
+    inactive: &[&ScalarExpr],
+) -> ScalarExpr {
+    if inactive.contains(&expr) {
+        return ScalarExpr::Literal(Value::Null);
+    }
+    match expr {
+        ScalarExpr::Function { name, args } if name == "GROUPING" => {
+            let mut bits = 0i64;
+            for arg in args {
+                bits <<= 1;
+                match arg {
+                    ScalarExpr::Column(c) if grouping(c) => {
+                        if !active(c) {
+                            bits |= 1;
+                        }
+                    }
+                    _ => {
+                        return ScalarExpr::Literal(crate::eval_error::raise(
+                            "arguments to GROUPING must be grouping expressions of the associated query level",
+                        ));
+                    }
+                }
+            }
+            ScalarExpr::Literal(Value::Int(bits))
+        }
+        ScalarExpr::Column(c) if rollup && grouping(c) && !active(c) => {
+            ScalarExpr::Literal(Value::Null)
+        }
+        ScalarExpr::Aggregate { .. } => expr.clone(),
+        other => {
+            other.map_children(&mut |e| for_grouping_set(e, active, grouping, rollup, inactive))
+        }
+    }
+}
+
+/// A HAVING condition with its expressions as `view` shows them.
+fn filter_for_grouping_set(
+    filter: &FilterExpr,
+    view: &dyn Fn(&ScalarExpr) -> ScalarExpr,
+) -> FilterExpr {
+    match filter {
+        FilterExpr::Scalar(e) => FilterExpr::Scalar(view(e)),
+        FilterExpr::ExprCmp { left, op, right } => FilterExpr::ExprCmp {
+            left: view(left),
+            op: op.clone(),
+            right: view(right),
+        },
+        FilterExpr::And(a, b) => FilterExpr::And(
+            Box::new(filter_for_grouping_set(a, view)),
+            Box::new(filter_for_grouping_set(b, view)),
+        ),
+        FilterExpr::Or(a, b) => FilterExpr::Or(
+            Box::new(filter_for_grouping_set(a, view)),
+            Box::new(filter_for_grouping_set(b, view)),
+        ),
+        FilterExpr::Not(a) => FilterExpr::Not(Box::new(filter_for_grouping_set(a, view))),
+        other => other.clone(),
     }
 }
 

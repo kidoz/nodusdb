@@ -715,81 +715,94 @@ fn plan_group_by(
             })),
         }
     };
-    // `ROLLUP`, `CUBE`, and `GROUPING SETS` elements must be plain columns:
-    // a rolled-up expression would need its select item nulled per set.
-    let columns_of = |elements: &[Expr]| -> Result<Vec<String>> {
-        elements
-            .iter()
-            .map(|e| match lower_scalar(e, params) {
-                Some(ScalarExpr::Column(name)) => Ok(name),
-                _ => {
-                    anyhow::bail!("ROLLUP, CUBE, and GROUPING SETS support only column references")
-                }
+    // Every element of the GROUP BY is a list of grouping sets; the query's
+    // sets are their cross product (`GROUP BY a, ROLLUP (b)` is
+    // `GROUPING SETS ((a, b), (a))`).
+    let mut sets: Vec<Vec<String>> = vec![Vec::new()];
+    let mut uses_sets = false;
+    let product = |sets: Vec<Vec<String>>, element: Vec<Vec<String>>| -> Vec<Vec<String>> {
+        sets.iter()
+            .flat_map(|set| {
+                element.iter().map(move |e| {
+                    let mut combined = set.clone();
+                    combined.extend(e.iter().cloned());
+                    combined
+                })
             })
             .collect()
     };
-    let mut group_by = Vec::new();
-    let mut grouping_sets: Option<Vec<Vec<String>>> = None;
     for expr in exprs {
-        match expr {
+        let element: Vec<Vec<String>> = match expr {
             // `ROLLUP(e1, e2, …)` → prefixes: {e1..en}, …, {e1}, {}.
             Expr::Rollup(elements) => {
-                let elems = elements
-                    .iter()
-                    .map(|e| columns_of(e))
-                    .collect::<Result<Vec<_>>>()?;
-                grouping_sets = Some(
-                    (0..=elems.len())
-                        .rev()
-                        .map(|i| elems[..i].concat())
-                        .collect(),
-                );
+                let mut elems = Vec::new();
+                for e in elements {
+                    let mut keys = Vec::new();
+                    for part in e {
+                        plan_key(part, &mut keys)?;
+                    }
+                    elems.push(keys);
+                }
+                (0..=elems.len())
+                    .rev()
+                    .map(|i| elems[..i].concat())
+                    .collect()
             }
             // `CUBE(e1, …, en)` → every subset of the elements.
             Expr::Cube(elements) => {
-                let elems = elements
-                    .iter()
-                    .map(|e| columns_of(e))
-                    .collect::<Result<Vec<_>>>()?;
-                let mut sets = Vec::new();
-                for mask in (0..(1u32 << elems.len())).rev() {
-                    let mut set = Vec::new();
-                    for (bit, e) in elems.iter().enumerate() {
-                        if mask & (1 << bit) != 0 {
-                            set.extend(e.iter().cloned());
-                        }
+                let mut elems = Vec::new();
+                for e in elements {
+                    let mut keys = Vec::new();
+                    for part in e {
+                        plan_key(part, &mut keys)?;
                     }
-                    sets.push(set);
+                    elems.push(keys);
                 }
-                grouping_sets = Some(sets);
+                (0..(1u32 << elems.len()))
+                    .rev()
+                    .map(|mask| {
+                        elems
+                            .iter()
+                            .enumerate()
+                            .filter(|(bit, _)| mask & (1 << bit) != 0)
+                            .flat_map(|(_, e)| e.iter().cloned())
+                            .collect()
+                    })
+                    .collect()
             }
             // `GROUPING SETS((a,b), (a), ())` → each inner list is one set.
             Expr::GroupingSets(list) => {
-                grouping_sets = Some(
-                    list.iter()
-                        .map(|e| columns_of(e))
-                        .collect::<Result<Vec<_>>>()?,
-                );
+                let mut element = Vec::new();
+                for e in list {
+                    let mut keys = Vec::new();
+                    for part in e {
+                        plan_key(part, &mut keys)?;
+                    }
+                    element.push(keys);
+                }
+                element
             }
-            _ => plan_key(expr, &mut group_by)?,
-        }
-    }
-    if grouping_sets.is_some() && !group_by.is_empty() {
-        anyhow::bail!(
-            "GROUP BY mixing plain keys with ROLLUP, CUBE, or GROUPING SETS is not supported"
-        );
+            _ => {
+                let mut keys = Vec::new();
+                plan_key(expr, &mut keys)?;
+                sets = product(sets, vec![keys]);
+                continue;
+            }
+        };
+        uses_sets = true;
+        sets = product(sets, element);
     }
     // `group_by` carries the union of every column mentioned (in first
     // appearance) so the output/NULL-rollup logic can resolve them.
-    if let Some(sets) = &grouping_sets {
-        for set in sets {
-            for c in set {
-                if !group_by.contains(c) {
-                    group_by.push(c.clone());
-                }
+    let mut group_by: Vec<String> = Vec::new();
+    for set in &sets {
+        for c in set {
+            if !group_by.contains(c) {
+                group_by.push(c.clone());
             }
         }
     }
+    let grouping_sets = uses_sets.then_some(sets);
     Ok((group_by, grouping_sets, group_exprs))
 }
 

@@ -80,6 +80,7 @@ pub(crate) fn is_known(name: &str) -> bool {
                 | "TIMEZONE" | "OVERLAPS" | "__DATETIME__" | "__TZ_TEXT__" | "__JSON_TIME__"
                 | "__EXCLUDE__" | "__INTERVAL_SPAN__"
                 | "PERCENTILE_CONT" | "PERCENTILE_DISC" | "MODE"
+                | "GROUPING"
                 // Locks, notifications, privileges, and backends.
                 | "PG_ADVISORY_LOCK" | "PG_ADVISORY_LOCK_SHARED" | "PG_ADVISORY_XACT_LOCK"
                 | "PG_ADVISORY_XACT_LOCK_SHARED" | "PG_TRY_ADVISORY_LOCK"
@@ -193,6 +194,7 @@ pub(crate) fn return_type(name: &str, arg_types: &[Option<String>]) -> Option<St
             }
             "MAKE_TIMESTAMPTZ" => "TIMESTAMPTZ",
             "TO_CHAR" | "__TZ_TEXT__" | "__JSON_TIME__" => "TEXT",
+            "GROUPING" => "INTEGER",
             "__INTERVAL_SPAN__" => "NUMERIC",
             "TO_NUMBER" => "NUMERIC",
             "ISFINITE" | "OVERLAPS" => "BOOLEAN",
@@ -1082,6 +1084,10 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
             Some(iv) => Value::Numeric(rust_decimal::Decimal::from_i128_with_scale(iv.span(), 0)),
             None => arg(0).clone(),
         },
+        // A grouped query resolves `GROUPING(...)` per grouping set first.
+        "GROUPING" => raise(
+            "arguments to GROUPING must be grouping expressions of the associated query level",
+        ),
         "OVERLAPS" if arity(4) => crate::datetime::overlaps(args, &[]).unwrap_or_else(raise),
         // With the arguments' static types, as the planner passes them.
         "OVERLAPS" if arity(8) => {

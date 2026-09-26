@@ -118,6 +118,8 @@ pub(crate) fn sqlstate_for_execution_error(err_str: &str) -> &'static str {
         "42601" // syntax_error
     } else if err_str.starts_with("OVER specified, but") {
         "42809" // wrong_object_type
+    } else if err_str.starts_with("arguments to GROUPING must be") {
+        "42803" // grouping_error
     } else if err_str.starts_with("window functions are not allowed in")
         || err_str.starts_with("RANGE with offset PRECEDING/FOLLOWING")
         || err_str.starts_with("frame start cannot")
