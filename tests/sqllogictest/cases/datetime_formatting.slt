@@ -1,0 +1,101 @@
+# to_char of dates, timestamps, and intervals.
+query TT
+SELECT to_char(timestamp '2024-05-06 07:08:09', 'YYYY-MM-DD HH24:MI:SS'), to_char(timestamp '2024-05-06 19:08:09', 'Day, DD Month YYYY HH12:MI AM');
+----
+2024-05-06 07:08:09	Monday   , 06 May       2024 07:08 PM
+
+query TT
+SELECT to_char(timestamp '2024-05-06 19:08:09', 'FMDay FMMonth FMDD'), to_char(date '2024-05-06', 'DDth "of" Mon, YY Q WW IW D ID J');
+----
+Monday May 6	06th of May, 24 2 19 19 2 1 2460437
+
+query TT
+SELECT to_char(date '2024-05-06', 'Month|month|MONTH|Mon|mon|MON|Day|day|DY|dy'), to_char(timestamp '2024-05-06 00:08:09', 'HH HH12 AM am A.M. p.m.');
+----
+May      |may      |MAY      |May|may|MAY|Monday   |monday   |MON|mon	12 12 AM am A.M. a.m.
+
+query TT
+SELECT to_char(timestamp '2024-05-06 07:08:09.123456', 'HH24:MI:SS.MS.US FF3'), to_char(timestamp '2024-05-06 07:08:09', 'SSSS SSSSS');
+----
+07:08:09.123.123456 123	25689 25689
+
+query TTT
+SELECT to_char(date '0044-03-15', 'YYYY BC'), to_char(date '2024-03-15', 'CC Y,YYY YYY YY Y'), to_char(timestamp '2024-12-30', 'IYYY-IW-ID');
+----
+0044 AD	21 2,024 024 24 4	2025-01-1
+
+query TTT
+SELECT to_char(timestamptz '2024-05-06 07:08:09+00', 'YYYY-MM-DD HH24:MI:SS TZ OF'), to_char(date '2024-05-06', '"Year:" YYYY "Month:" MM'), to_char(date '2024-05-06', 'YYYY\MM');
+----
+2024-05-06 07:08:09 UTC +00	Year: 2024 Month: 05	2024\05
+
+query TTT
+SELECT to_char(interval '1 day 02:03:04', 'DD HH24:MI:SS'), to_char(interval '25 hours 3 minutes', 'HH24:MI'), to_char(interval '-1 day -2 hours', 'DD HH24');
+----
+01 02:03:04	25:03	-1 -02
+
+# to_char of numbers.
+query TTTTT
+SELECT to_char(1234567.891, '9,999,999.99'), to_char(-12.5, '999D99S'), to_char(42, '00000'), to_char(0.5, 'FM990.00'), to_char(1234, 'FM9,999');
+----
+ 1,234,567.89	 12.50-	 00042	0.50	1,234
+
+query TTTTT
+SELECT to_char(-5, 'MI999'), to_char(5, 'MI999'), to_char(-5, '999MI'), to_char(-5, '999PR'), to_char(5, '999PR');
+----
+-  5	   5	  5-	  <5>	   5 
+
+query TTTTTT
+SELECT to_char(5, 'PL999'), to_char(-5, 'PL999'), to_char(5, '999PL'), to_char(5, 'SG999'), to_char(-5, 'SG999'), to_char(5, '999SG');
+----
++   5	   -5	   5+	+  5	-  5	  5+
+
+query TTTTTT
+SELECT to_char(5, 'S999'), to_char(-5, 'S999'), to_char(5, '999S'), to_char(5, 'FMS999'), to_char(-12.5, 'S999D9'), to_char(5, 'S099');
+----
+  +5	  -5	  5+	+5	 -12.5	+005
+
+query TTTTT
+SELECT to_char(12345, '9.99EEEE'), to_char(1e10, '999'), to_char(1234, '9G999D99'), to_char(-0.1, '9.9'), to_char(-0.1, 'FM9.9');
+----
+ 1.23e+04	 ###	 1,234.00	 -.1	-.1
+
+query TTTTT
+SELECT to_char(123, 'RN'), to_char(1994, 'FMRN'), to_char(4, 'rn'), to_char(0, 'RN'), to_char(12.7, 'RN');
+----
+         CXXIII	MCMXCIV	             iv	###############	           XIII
+
+statement error
+SELECT to_char(-5, 'PR999');
+
+# to_date, to_timestamp, and to_number.
+query TTTT
+SELECT to_date('2024-05-06', 'YYYY-MM-DD'), to_date('06 May 2024', 'DD Mon YYYY'), to_date('20240506', 'YYYYMMDD'), to_date('2024-136', 'YYYY-DDD');
+----
+2024-05-06	2024-05-06	2024-05-06	2024-05-15
+
+query TTT
+SELECT to_timestamp('2024-05-06 07:08:09', 'YYYY-MM-DD HH24:MI:SS'), to_timestamp('2024-05-06 07:08:09 PM', 'YYYY-MM-DD HH12:MI:SS AM'), to_timestamp('05/06/2024 07:08', 'MM/DD/YYYY HH24:MI');
+----
+2024-05-06 07:08:09+00	2024-05-06 19:08:09+00	2024-05-06 07:08:00+00
+
+query TTTT
+SELECT to_timestamp('2024-05-06 07:08:09.5+02', 'YYYY-MM-DD HH24:MI:SS.MS TZH'), to_timestamp(1700000000), to_timestamp(1.5), to_timestamp('infinity'::float8);
+----
+2024-05-06 05:08:09.5+00	2023-11-14 22:13:20+00	1970-01-01 00:00:01.5+00	infinity
+
+statement error
+SELECT to_date('2024-13-01', 'YYYY-MM-DD');
+
+query TTTTT
+SELECT to_number('1,234.56', '9,999.99'), to_number('-42', 'S99'), to_number('$1,000', 'L9,999'), to_number('12.5-', '99.9S'), to_number('  123  ', '999');
+----
+1234.56	-42	1000	-12.5	12
+
+statement error
+SELECT to_number('1.2e3', '9.9EEEE');
+
+query TTTTTTTT
+SELECT 'infinity'::float8, '-infinity'::float8, 1e20::float8, 1e-7::float8, 1e15::float8, 1e14::float8, 1e6::real, 1234567::real;
+----
+Infinity	-Infinity	1e+20	1e-07	1e+15	100000000000000	1e+06	1.234567e+06

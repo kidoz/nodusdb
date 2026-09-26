@@ -74,9 +74,10 @@ pub(crate) fn is_known(name: &str) -> bool {
                 | "NOW" | "CURRENT_TIMESTAMP" | "TRANSACTION_TIMESTAMP"
                 | "STATEMENT_TIMESTAMP" | "CLOCK_TIMESTAMP" | "CURRENT_DATE" | "CURRENT_TIME"
                 | "LOCALTIMESTAMP" | "LOCALTIME" | "DATE_TRUNC" | "AGE" | "DATE_PART"
-                | "MAKE_DATE" | "MAKE_TIMESTAMP" | "TO_TIMESTAMP" | "MAKE_INTERVAL" | "MAKE_TIME"
-                | "MAKE_TIMESTAMPTZ" | "JUSTIFY_DAYS" | "JUSTIFY_HOURS" | "JUSTIFY_INTERVAL"
-                | "ISFINITE" | "DATE_BIN" | "TIMEZONE" | "OVERLAPS" | "__DATETIME__"
+                | "MAKE_DATE" | "MAKE_TIMESTAMP" | "TO_TIMESTAMP" | "TO_CHAR" | "TO_DATE"
+                | "TO_NUMBER" | "MAKE_INTERVAL" | "MAKE_TIME" | "MAKE_TIMESTAMPTZ"
+                | "JUSTIFY_DAYS" | "JUSTIFY_HOURS" | "JUSTIFY_INTERVAL" | "ISFINITE" | "DATE_BIN"
+                | "TIMEZONE" | "OVERLAPS" | "__DATETIME__"
                 // Session and system.
                 | "VERSION" | "CURRENT_USER" | "SESSION_USER" | "CURRENT_ROLE" | "USER"
                 | "CURRENT_DATABASE" | "CURRENT_CATALOG" | "CURRENT_SCHEMA" | "CURRENT_SCHEMAS"
@@ -167,13 +168,15 @@ pub(crate) fn return_type(name: &str, arg_types: &[Option<String>]) -> Option<St
             | "CLOCK_TIMESTAMP"
             | "TO_TIMESTAMP" => "TIMESTAMPTZ",
             "LOCALTIMESTAMP" | "MAKE_TIMESTAMP" => "TIMESTAMP",
-            "CURRENT_DATE" | "MAKE_DATE" => "DATE",
+            "CURRENT_DATE" | "MAKE_DATE" | "TO_DATE" => "DATE",
             "LOCALTIME" | "MAKE_TIME" => "TIME",
             "CURRENT_TIME" => "TIMETZ",
             "AGE" | "MAKE_INTERVAL" | "JUSTIFY_DAYS" | "JUSTIFY_HOURS" | "JUSTIFY_INTERVAL" => {
                 "INTERVAL"
             }
             "MAKE_TIMESTAMPTZ" => "TIMESTAMPTZ",
+            "TO_CHAR" => "TEXT",
+            "TO_NUMBER" => "NUMERIC",
             "ISFINITE" | "OVERLAPS" => "BOOLEAN",
             "DATE_BIN" => return arg_types.get(1).cloned().flatten(),
             // Zoned time becomes local time, and local time zoned.
@@ -1067,6 +1070,20 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
             let kind = |v: &Value| crate::datetime::Kind::of_type(&text(v));
             crate::datetime::arith(&text(arg(0)), arg(1), kind(arg(3)), arg(2), kind(arg(4)))
                 .unwrap_or_else(raise)
+        }
+        "TO_CHAR" if arity(2) => {
+            crate::datetime_format::to_char(arg(0), &text(arg(1)), None).unwrap_or_else(raise)
+        }
+        "TO_DATE" if arity(2) => {
+            crate::datetime_format::parse_by_template(&text(arg(0)), &text(arg(1)), true)
+                .unwrap_or_else(raise)
+        }
+        "TO_TIMESTAMP" if arity(2) => {
+            crate::datetime_format::parse_by_template(&text(arg(0)), &text(arg(1)), false)
+                .unwrap_or_else(raise)
+        }
+        "TO_NUMBER" if arity(2) => {
+            crate::datetime_format::parse_number(&text(arg(0)), &text(arg(1))).unwrap_or_else(raise)
         }
         // `make_interval(years, months, weeks, days, hours, mins, secs)`.
         "MAKE_INTERVAL" if args.len() <= 7 => {
