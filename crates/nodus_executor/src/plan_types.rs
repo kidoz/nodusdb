@@ -1154,6 +1154,12 @@ pub enum LogicalPlan {
         if_not_exists: bool,
         spec: crate::sequences::SequenceSpec,
     },
+    /// `ALTER SEQUENCE [IF EXISTS] name options`.
+    AlterSequence {
+        name: String,
+        if_exists: bool,
+        change: crate::sequences::SequenceChange,
+    },
     /// `DROP SEQUENCE`.
     DropSequence {
         names: Vec<String>,

@@ -79,6 +79,11 @@ impl MemExecutor {
                 if_not_exists,
                 spec,
             } => self.exec_create_sequence(ctx, name, if_not_exists, spec),
+            LogicalPlan::AlterSequence {
+                name,
+                if_exists,
+                change,
+            } => self.exec_alter_sequence(ctx, name, if_exists, change),
             LogicalPlan::DropSequence { names, if_exists } => {
                 self.exec_drop_sequence(ctx, names, if_exists)
             }

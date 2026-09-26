@@ -62,7 +62,7 @@ pub use planner::{
     CopyOutputFormat, expr_to_value, parse_object_name, plan_copy_out, plan_statement,
 };
 pub(crate) use planner::{eval_scalar_expr, parse_filter_expr, scalar_has_aggregate};
-pub use sequences::SequenceSpec;
+pub use sequences::{SequenceChange, SequenceSpec};
 pub use session_vars::canonical_setting_value;
 pub use value::{ColumnDef, Value, render};
 pub(crate) use value::{

@@ -59,6 +59,11 @@ pub const NO_DATA_OPTION: &str = "nodus_with_no_data";
 /// — since the parser has no such statement.
 pub const REFRESH_FUNCTION: &str = "pg_catalog.nodus_refresh_materialized_view";
 
+/// The function call `ALTER SEQUENCE [IF EXISTS] name options` is written
+/// as — `pg_catalog.nodus_alter_sequence('name', false, 'options')` — since
+/// the parser has no such statement.
+pub const ALTER_SEQUENCE_FUNCTION: &str = "pg_catalog.nodus_alter_sequence";
+
 /// Rewrites what the parser lacks: a trailing `WITH [NO] DATA` on `CREATE
 /// TABLE ... AS` or `CREATE MATERIALIZED VIEW` becomes the storage
 /// parameter [`NO_DATA_OPTION`] (for `NO DATA`), and `REFRESH MATERIALIZED
@@ -136,6 +141,49 @@ fn rewrite_data_clause(
         let sql = format!(
             "SELECT {REFRESH_FUNCTION}('{}', {with_data})",
             name.replace('\'', "''")
+        );
+        let dialect = PostgreSqlDialect {};
+        return match Tokenizer::new(&dialect, &sql).tokenize_with_location() {
+            Ok(mut tokens) => {
+                tokens.retain(|t| t.token != Token::EOF);
+                tokens.extend(tail);
+                tokens
+            }
+            Err(_) => statement,
+        };
+    }
+
+    if is(0, "alter") && is(1, "sequence") {
+        let if_exists = is(2, "if") && is(3, "exists");
+        let at = if if_exists { 4 } else { 2 };
+        // The name: words joined by periods.
+        let mut name_end = at + 1;
+        while name_end + 1 < n
+            && statement
+                .get(significant[name_end])
+                .is_some_and(|t| t.token == Token::Period)
+        {
+            name_end += 2;
+        }
+        let render = |t: &TokenWithSpan| match &t.token {
+            Token::Word(w) if w.quote_style == Some('"') => {
+                format!("\"{}\"", w.value.replace('"', "\"\""))
+            }
+            Token::Word(w) => w.value.clone(),
+            other => other.to_string(),
+        };
+        let name: String = significant[at..name_end.min(n)]
+            .iter()
+            .map(|&i| render(&statement[i]))
+            .collect();
+        let options: String = match (significant.get(name_end), significant.last()) {
+            (Some(&first), Some(&last)) => statement[first..=last].iter().map(render).collect(),
+            _ => String::new(),
+        };
+        let sql = format!(
+            "SELECT {ALTER_SEQUENCE_FUNCTION}('{}', {if_exists}, '{}')",
+            name.replace('\'', "''"),
+            options.replace('\'', "''")
         );
         let dialect = PostgreSqlDialect {};
         return match Tokenizer::new(&dialect, &sql).tokenize_with_location() {

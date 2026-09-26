@@ -662,6 +662,25 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                 materialized: false,
             })
         }
+        Statement::Query(query)
+            if rewritten_call(query, nodus_sql::ALTER_SEQUENCE_FUNCTION).is_some() =>
+        {
+            let args = rewritten_call(query, nodus_sql::ALTER_SEQUENCE_FUNCTION)
+                .expect("guarded by the match arm");
+            let [
+                crate::Value::Text(name),
+                crate::Value::Bool(if_exists),
+                crate::Value::Text(options),
+            ] = args.as_slice()
+            else {
+                anyhow::bail!("malformed ALTER SEQUENCE");
+            };
+            Ok(LogicalPlan::AlterSequence {
+                name: name.clone(),
+                if_exists: *if_exists,
+                change: sequence_change(options, params)?,
+            })
+        }
         Statement::Query(query) if refresh_target(query).is_some() => {
             let (name, with_data) = refresh_target(query).expect("guarded by the match arm");
             Ok(LogicalPlan::RefreshMaterializedView { name, with_data })
@@ -995,6 +1014,132 @@ fn refresh_target(query: &sqlparser::ast::Query) -> Option<(String, bool)> {
         }
         _ => None,
     }
+}
+
+/// The constant arguments of a query that is only a call of `function`, as
+/// `nodus_sql` writes the statements the parser lacks.
+fn rewritten_call(query: &sqlparser::ast::Query, function: &str) -> Option<Vec<Value>> {
+    use sqlparser::ast::{
+        Expr, FunctionArg, FunctionArgExpr, FunctionArguments, SelectItem, SetExpr,
+    };
+    let SetExpr::Select(select) = &*query.body else {
+        return None;
+    };
+    let [SelectItem::UnnamedExpr(Expr::Function(call))] = select.projection.as_slice() else {
+        return None;
+    };
+    if call.name.to_string() != function || !select.from.is_empty() {
+        return None;
+    }
+    let FunctionArguments::List(list) = &call.args else {
+        return None;
+    };
+    list.args
+        .iter()
+        .map(|arg| match arg {
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => expr_to_value(e, &[]),
+            _ => None,
+        })
+        .collect()
+}
+
+/// What the options of `ALTER SEQUENCE` change. `RESTART`, `RENAME TO`,
+/// `OWNER TO`, and `OWNED BY` are read here; the rest as `CREATE SEQUENCE`
+/// takes them.
+fn sequence_change(options: &str, params: &[Value]) -> Result<crate::sequences::SequenceChange> {
+    use sqlparser::ast::SequenceOptions as O;
+    use sqlparser::tokenizer::{Token, Tokenizer};
+    let tokens: Vec<Token> = Tokenizer::new(&sqlparser::dialect::PostgreSqlDialect {}, options)
+        .tokenize()?
+        .into_iter()
+        .filter(|t| !matches!(t, Token::Whitespace(_)))
+        .collect();
+    let word = |i: usize| match tokens.get(i) {
+        Some(Token::Word(w)) if w.quote_style.is_none() => Some(w.value.as_str()),
+        _ => None,
+    };
+    let number = |i: usize| match tokens.get(i) {
+        Some(Token::Number(n, _)) => n.parse::<i64>().ok(),
+        _ => None,
+    };
+    let mut change = crate::sequences::SequenceChange::default();
+    let mut rest: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < tokens.len() {
+        match (word(i), word(i + 1)) {
+            (Some("restart"), _) => {
+                i += 1;
+                if word(i) == Some("with") {
+                    i += 1;
+                }
+                // A signed restart value.
+                let negative = tokens.get(i) == Some(&Token::Minus);
+                let at = if negative { i + 1 } else { i };
+                match number(at) {
+                    Some(n) => {
+                        change.restart = Some(Some(if negative { -n } else { n }));
+                        i = at + 1;
+                    }
+                    None => change.restart = Some(None),
+                }
+            }
+            (Some("rename"), Some("to")) => {
+                change.rename = match tokens.get(i + 2) {
+                    Some(Token::Word(w)) => Some(w.value.clone()),
+                    _ => anyhow::bail!("ALTER SEQUENCE ... RENAME TO needs a name"),
+                };
+                i += 3;
+            }
+            // NodusDB tracks no owners, and a serial column's sequence goes
+            // with its table by name.
+            (Some("owner"), Some("to")) => i += 3,
+            (Some("owned"), Some("by")) => {
+                i += 3;
+                while tokens.get(i) == Some(&Token::Period) {
+                    i += 2;
+                }
+            }
+            (Some("set"), Some("logged" | "unlogged")) => i += 2,
+            (Some("set"), Some("schema")) => {
+                anyhow::bail!("ALTER SEQUENCE ... SET SCHEMA is not supported")
+            }
+            _ => {
+                rest.push(tokens[i].to_string());
+                i += 1;
+            }
+        }
+    }
+    if !rest.is_empty() {
+        let sql = format!("CREATE SEQUENCE nodus_sequence_options {}", rest.join(" "));
+        let mut statements = nodus_sql::parse_sql(&sql)?;
+        let Some(sqlparser::ast::Statement::CreateSequence {
+            data_type,
+            sequence_options,
+            ..
+        }) = statements.pop()
+        else {
+            anyhow::bail!("malformed ALTER SEQUENCE options: {options}");
+        };
+        let integer = |e: &sqlparser::ast::Expr| -> Result<i64> {
+            match expr_to_value(e, params) {
+                Some(Value::Int(n)) => Ok(n),
+                _ => anyhow::bail!("sequence option must be an integer constant: {e}"),
+            }
+        };
+        change.data_type = data_type.map(|t| t.to_string());
+        for option in &sequence_options {
+            match option {
+                O::IncrementBy(e, _) => change.increment = Some(integer(e)?),
+                O::MinValue(e) => change.min_value = Some(e.as_ref().map(&integer).transpose()?),
+                O::MaxValue(e) => change.max_value = Some(e.as_ref().map(&integer).transpose()?),
+                O::StartWith(e, _) => change.start = Some(integer(e)?),
+                O::Cache(e) => change.cache = Some(integer(e)?),
+                // sqlparser's flag is set for `NO CYCLE`.
+                O::Cycle(no_cycle) => change.cycle = Some(!no_cycle),
+            }
+        }
+    }
+    Ok(change)
 }
 
 /// The keywords a statement or clause starts with (`CREATE FUNCTION`,

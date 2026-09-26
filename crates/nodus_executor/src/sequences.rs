@@ -67,6 +67,22 @@ pub struct SequenceSpec {
     pub cycle: bool,
 }
 
+/// What `ALTER SEQUENCE` changes: each option it sets (`Some(None)` for
+/// `NO MINVALUE` / `NO MAXVALUE`, and for a `RESTART` without a value).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SequenceChange {
+    pub data_type: Option<String>,
+    pub increment: Option<i64>,
+    pub min_value: Option<Option<i64>>,
+    pub max_value: Option<Option<i64>>,
+    pub start: Option<i64>,
+    pub cache: Option<i64>,
+    pub cycle: Option<bool>,
+    pub restart: Option<Option<i64>>,
+    /// `RENAME TO`.
+    pub rename: Option<String>,
+}
+
 /// A sequence's stored state and options.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct SequenceState {
@@ -406,6 +422,59 @@ impl SequenceStore {
             values.last = Some(value);
         }
         Ok(value)
+    }
+
+    /// `ALTER SEQUENCE name options`: the options it does not set keep
+    /// their values, and without `RESTART` so does the sequence's position.
+    pub(crate) fn alter(&self, name: &str, change: &SequenceChange) -> Result<()> {
+        let tbl = self.resolve(name)?;
+        self.update(&tbl, |state| {
+            let type_range = |t: &str| match t {
+                "smallint" => (i16::MIN as i64, i16::MAX as i64),
+                "integer" => (i32::MIN as i64, i32::MAX as i64),
+                _ => (i64::MIN, i64::MAX),
+            };
+            let (old_min, old_max) = type_range(&state.data_type);
+            let retyped = change.data_type.is_some();
+            // A bound that was its type's limit follows a new type's.
+            let keep = |value: i64, limit: i64| (!retyped || value != limit).then_some(value);
+            let spec = SequenceSpec {
+                data_type: Some(
+                    change
+                        .data_type
+                        .clone()
+                        .unwrap_or_else(|| state.data_type.clone()),
+                ),
+                increment: Some(change.increment.unwrap_or(state.increment)),
+                min_value: change.min_value.unwrap_or_else(|| keep(state.min, old_min)),
+                max_value: change.max_value.unwrap_or_else(|| keep(state.max, old_max)),
+                start: Some(change.start.unwrap_or(state.start)),
+                cache: Some(change.cache.unwrap_or(state.cache)),
+                cycle: change.cycle.unwrap_or(state.cycle),
+            };
+            let mut altered = SequenceState::new(&spec)?;
+            // Without RESTART, the sequence's position must fit the new
+            // bounds all the same.
+            let value = change
+                .restart
+                .map_or(state.last_value, |restart| restart.unwrap_or(altered.start));
+            if value < altered.min {
+                bail!(
+                    "RESTART value ({value}) cannot be less than MINVALUE ({})",
+                    altered.min
+                );
+            }
+            if value > altered.max {
+                bail!(
+                    "RESTART value ({value}) cannot be greater than MAXVALUE ({})",
+                    altered.max
+                );
+            }
+            altered.last_value = value;
+            altered.is_called = change.restart.is_none() && state.is_called;
+            Ok(altered)
+        })?;
+        Ok(())
     }
 
     /// Restarts a sequence at its start value (`TRUNCATE ... RESTART

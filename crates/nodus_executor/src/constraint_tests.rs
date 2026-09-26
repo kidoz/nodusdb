@@ -1,6 +1,6 @@
 //! Constraint violations as PostgreSQL reports them, foreign key actions,
-//! `DROP` dependencies, `ALTER TABLE`, unique indexes, and notices, driven
-//! through SQL.
+//! `DROP` dependencies, `ALTER TABLE` and `ALTER SEQUENCE`, unique indexes,
+//! and notices, driven through SQL.
 
 use super::*;
 use crate::dml_join_tests::rows;
@@ -298,6 +298,28 @@ fn a_referenced_key_or_column_drops_only_with_cascade() {
     );
     sql("ALTER TABLE p DROP COLUMN id CASCADE").unwrap();
     sql("INSERT INTO c VALUES (5)").unwrap();
+}
+
+#[test]
+fn alter_sequence_changes_options_and_position() {
+    let (sql, _) = session();
+    sql("CREATE SEQUENCE s START 10 INCREMENT 5").unwrap();
+    assert_eq!(rows(&sql("SELECT nextval('s')").unwrap()), ["10"]);
+    sql("ALTER SEQUENCE s RESTART WITH 1 INCREMENT BY 2").unwrap();
+    assert_eq!(rows(&sql("SELECT nextval('s')").unwrap()), ["1"]);
+    assert_eq!(rows(&sql("SELECT nextval('s')").unwrap()), ["3"]);
+    let (message, _) = fields(sql("ALTER SEQUENCE s MINVALUE 50").unwrap_err());
+    assert_eq!(
+        message,
+        "START value (10) cannot be less than MINVALUE (50)"
+    );
+    let (message, _) = fields(sql("ALTER SEQUENCE s MINVALUE 5 START 5").unwrap_err());
+    assert_eq!(
+        message,
+        "RESTART value (3) cannot be less than MINVALUE (5)"
+    );
+    sql("ALTER SEQUENCE s RENAME TO s2").unwrap();
+    assert_eq!(rows(&sql("SELECT nextval('s2')").unwrap()), ["5"]);
 }
 
 #[test]

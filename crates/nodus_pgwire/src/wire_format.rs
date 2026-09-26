@@ -154,6 +154,14 @@ pub(crate) fn sqlstate_for_execution_error(err_str: &str) -> &'static str {
         "2201X" // invalid_row_count_in_result_offset_clause
     } else if err_str.starts_with("unrecognized configuration parameter") {
         "42704" // undefined_object
+    // A sequence's options out of range.
+    } else if err_str.starts_with("START value (")
+        || err_str.starts_with("RESTART value (")
+        || (err_str.starts_with("MINVALUE (") && err_str.contains("must be less than MAXVALUE"))
+        || err_str == "INCREMENT must not be zero"
+        || (err_str.starts_with("CACHE (") && err_str.ends_with("must be greater than zero"))
+    {
+        "22023" // invalid_parameter_value
     // ALTER TABLE on columns and constraints.
     } else if err_str.starts_with("column \"") && err_str.contains("\" already exists") {
         "42701" // duplicate_column

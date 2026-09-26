@@ -380,6 +380,50 @@ impl MemExecutor {
         }
         Ok(QueryOutput::tag("DROP SEQUENCE"))
     }
+    /// `ALTER SEQUENCE [IF EXISTS] name options`.
+    pub(crate) fn exec_alter_sequence(
+        &self,
+        ctx: &ExecutionContext,
+        name: String,
+        if_exists: bool,
+        change: crate::sequences::SequenceChange,
+    ) -> Result<QueryOutput> {
+        let (db_name, schema_name, sequence) = parse_object_name(&name)?;
+        let tbl = match self
+            .catalog_reader
+            .get_table(db_name, schema_name, sequence)
+        {
+            Ok(tbl) if crate::sequences::is_sequence(&tbl) => tbl,
+            Ok(_) => anyhow::bail!("\"{sequence}\" is not a sequence"),
+            Err(_) if if_exists => {
+                self.notice(
+                    ctx,
+                    DbError::new(format!("relation \"{sequence}\" does not exist, skipping")),
+                );
+                return Ok(QueryOutput::tag("ALTER SEQUENCE"));
+            }
+            Err(_) => anyhow::bail!("relation \"{sequence}\" does not exist"),
+        };
+        self.authorize(ctx, Action::CreateTable, ResourceRef::Table(tbl.id))?;
+        self.sequences.alter(&name, &change)?;
+        if let Some(new_name) = change.rename {
+            if self
+                .catalog_reader
+                .get_table(db_name, schema_name, &new_name)
+                .is_ok()
+            {
+                anyhow::bail!("relation \"{new_name}\" already exists");
+            }
+            self.catalog_writer.update_table_descriptor(
+                nodus_catalog::TableDescriptorChange::RenameTable {
+                    table_id: tbl.id,
+                    new_name,
+                },
+            )?;
+        }
+        Ok(QueryOutput::tag("ALTER SEQUENCE"))
+    }
+
     /// `CREATE TABLE ... AS <query>` / `SELECT ... INTO` / `CREATE
     /// MATERIALIZED VIEW`: runs the query, then creates a table with its
     /// output columns and types and, unless `WITH NO DATA`, inserts its rows.
