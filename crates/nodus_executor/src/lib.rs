@@ -20,6 +20,7 @@ mod aggregates;
 mod alter_table;
 mod constraints;
 mod cte_scope;
+mod datetime;
 mod ddl;
 mod dml;
 mod error_fields;

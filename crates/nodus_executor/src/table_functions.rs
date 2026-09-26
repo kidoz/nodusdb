@@ -37,6 +37,15 @@ impl MemExecutor {
         // several values, e.g. multi-argument `unnest`).
         let (mut types, mut rows) = match spec.name.as_str() {
             "unnest" => unnest_rows(&args),
+            // Timestamps (or dates) stepped by an interval.
+            "generate_series"
+                if args.len() == 3
+                    && matches!(&args[0], Value::Text(t) if crate::value::parse_temporal(t).is_some()) =>
+            {
+                let (ty, values) = crate::datetime::series(&args[0], &args[1], &args[2])
+                    .map_err(|e| anyhow::anyhow!(e))?;
+                (vec![ty], values.into_iter().map(|v| vec![v]).collect())
+            }
             "generate_series" => generate_series_rows(&args),
             "jsonb_array_elements" => json_array_elements_rows(&args, false),
             "jsonb_array_elements_text" => json_array_elements_rows(&args, true),

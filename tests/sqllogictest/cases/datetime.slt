@@ -101,26 +101,26 @@ SELECT EXTRACT(HOUR FROM ts) FROM events WHERE id = 1;
 ----
 10
 
-# date +/- INTERVAL (real calendar math on the ISO text)
+# date +/- INTERVAL is a timestamp (calendar math on the date's midnight)
 query T
 SELECT DATE '2024-01-31' + INTERVAL '1 day';
 ----
-2024-02-01
+2024-02-01 00:00:00
 
 query T
 SELECT DATE '2024-01-15' + INTERVAL '1 month';
 ----
-2024-02-15
+2024-02-15 00:00:00
 
 query T
 SELECT DATE '2024-06-15' - INTERVAL '10 days';
 ----
-2024-06-05
+2024-06-05 00:00:00
 
 query T
 SELECT DATE '2024-01-01' + INTERVAL '1 year';
 ----
-2025-01-01
+2025-01-01 00:00:00
 
 query T
 SELECT TIMESTAMP '2024-01-15 10:30:00' + INTERVAL '2 hours';
@@ -131,7 +131,7 @@ SELECT TIMESTAMP '2024-01-15 10:30:00' + INTERVAL '2 hours';
 query T
 SELECT d + INTERVAL '1 month' FROM events WHERE id = 1;
 ----
-2024-02-15
+2024-02-15 00:00:00
 
 # date_trunc
 query T
@@ -139,10 +139,11 @@ SELECT date_trunc('month', TIMESTAMP '2024-03-15 10:30:00');
 ----
 2024-03-01 00:00:00
 
+# a date truncates as a timestamp with time zone
 query T
 SELECT date_trunc('year', DATE '2024-06-15');
 ----
-2024-01-01 00:00:00
+2024-01-01 00:00:00+00
 
 query T
 SELECT date_trunc('hour', TIMESTAMP '2024-03-15 10:30:45');

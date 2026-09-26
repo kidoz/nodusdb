@@ -255,10 +255,11 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
             };
             // A CAST fixes the column's type even when the value is NULL, so
             // `NULL::int` reports int4 rather than defaulting to text.
-            let type_hint = if let Expr::Cast { data_type, .. } = expr {
-                Some(data_type.to_string())
-            } else {
-                None
+            let type_hint = match expr {
+                Expr::Cast { data_type, .. } => Some(data_type.to_string()),
+                Expr::TypedString(ts) => Some(ts.data_type.to_string()),
+                Expr::Interval(_) => Some("INTERVAL".to_string()),
+                _ => None,
             };
             let item = match expr {
                 Expr::Subquery(query) => {

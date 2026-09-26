@@ -962,6 +962,16 @@ impl MemExecutor {
                             .iter()
                             .map(|i| {
                                 let val = i.and_then(|idx| r.get(idx)).unwrap_or(&Value::Null);
+                                // Equal intervals (`1 day`, `24 hours`) group together.
+                                let interval = i
+                                    .and_then(|idx| joined_columns.get(idx))
+                                    .is_some_and(|c| is_interval_type(&c.data_type));
+                                if interval
+                                    && let Value::Text(text) = val
+                                    && let Some(iv) = crate::datetime::Interval::parse(text)
+                                {
+                                    return format!("interval {}", iv.span()).into_bytes();
+                                }
                                 serde_json::to_vec(&crate::value::key_form(val)).unwrap_or_default()
                             })
                             .collect::<Vec<_>>();
@@ -1714,6 +1724,47 @@ impl MemExecutor {
                 };
                 sources.push(source);
             }
+            // Interval keys order by their length of time, not their text.
+            let declared = |name: &str| {
+                crate::filter_eval::col_pos(&col_names, name)
+                    .and_then(|i| joined_columns.get(i))
+                    .map(|c| c.data_type.clone())
+            };
+            let interval_keys: Vec<bool> = sources
+                .iter()
+                .zip(&key_targets)
+                .map(|(source, target)| {
+                    let data_type = match (source, target) {
+                        (KeySource::Output(i), _) if projection.is_empty() => {
+                            joined_columns.get(*i).map(|c| c.data_type.clone())
+                        }
+                        (KeySource::Output(i), _) => projection
+                            .get(*i)
+                            .and_then(|item| crate::result_types::projection_type(item, declared)),
+                        (KeySource::Source(i), _) => {
+                            joined_columns.get(*i).map(|c| c.data_type.clone())
+                        }
+                        (KeySource::Computed(_), SortTarget::Expr(expr)) => {
+                            crate::result_types::expr_type(expr, &declared)
+                        }
+                        _ => None,
+                    };
+                    data_type.is_some_and(|t| is_interval_type(&t))
+                })
+                .collect();
+            let key_cmp = |i: usize, a: &Value, b: &Value, asc: bool, nulls_first: Option<bool>| {
+                if interval_keys[i]
+                    && let (Value::Text(l), Value::Text(r)) = (a, b)
+                    && let (Some(l), Some(r)) = (
+                        crate::datetime::Interval::parse(l),
+                        crate::datetime::Interval::parse(r),
+                    )
+                {
+                    let ord = l.span().cmp(&r.span());
+                    return if asc { ord } else { ord.reverse() };
+                }
+                order_cmp(a, b, asc, nulls_first)
+            };
             let keys: Vec<Vec<Value>> = (0..out_rows.len())
                 .map(|row| {
                     sources
@@ -1735,7 +1786,7 @@ impl MemExecutor {
             let mut perm: Vec<usize> = (0..out_rows.len()).collect();
             perm.sort_by(|&x, &y| {
                 for (i, key) in sort.iter().enumerate() {
-                    let ord = order_cmp(&keys[x][i], &keys[y][i], key.ascending, key.nulls_first);
+                    let ord = key_cmp(i, &keys[x][i], &keys[y][i], key.ascending, key.nulls_first);
                     if ord != std::cmp::Ordering::Equal {
                         return ord;
                     }
@@ -1757,14 +1808,44 @@ impl MemExecutor {
             out_rows = perm.iter().filter_map(|&i| rows[i].take()).collect();
         }
 
-        // DISTINCT
+        // DISTINCT: equal intervals (`1 day`, `24 hours`) are one value.
         if distinct {
+            let declared = |name: &str| {
+                crate::filter_eval::col_pos(&col_names, name)
+                    .and_then(|i| joined_columns.get(i))
+                    .map(|c| c.data_type.clone())
+            };
+            let interval_columns: Vec<bool> = (0..out_cols.len())
+                .map(|i| {
+                    let data_type = if projection.is_empty() {
+                        joined_columns.get(i).map(|c| c.data_type.clone())
+                    } else {
+                        projection
+                            .get(i)
+                            .and_then(|item| crate::result_types::projection_type(item, declared))
+                    };
+                    data_type.is_some_and(|t| is_interval_type(&t))
+                })
+                .collect();
+            let same = |i: usize, a: &Value, b: &Value| {
+                if interval_columns.get(i) == Some(&true)
+                    && let (Value::Text(l), Value::Text(r)) = (a, b)
+                    && let (Some(l), Some(r)) = (
+                        crate::datetime::Interval::parse(l),
+                        crate::datetime::Interval::parse(r),
+                    )
+                {
+                    return l.span() == r.span();
+                }
+                compare(a, b) == std::cmp::Ordering::Equal
+            };
             let mut seen = Vec::new();
             out_rows.retain(|r| {
                 let is_seen = seen.iter().any(|s: &Vec<Value>| {
                     s.iter()
                         .zip(r.iter())
-                        .all(|(va, vb)| compare(va, vb) == std::cmp::Ordering::Equal)
+                        .enumerate()
+                        .all(|(i, (va, vb))| same(i, va, vb))
                 });
                 if is_seen {
                     false
@@ -1869,6 +1950,11 @@ impl MemExecutor {
             tag,
         })
     }
+}
+
+/// Whether a declared type is `interval`.
+fn is_interval_type(data_type: &str) -> bool {
+    crate::datetime::Kind::of_type(data_type) == Some(crate::datetime::Kind::Interval)
 }
 
 /// Compares two cells for an ORDER BY key, honouring the ascending flag and an

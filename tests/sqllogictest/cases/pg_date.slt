@@ -66,17 +66,16 @@ SELECT EXTRACT(DAY FROM DATE '1970-03-20');
 ----
 20
 
-# date + interval arithmetic (text-backed). Divergence from pg: the result
-# stays a plain date; pg promotes to timestamp ('2001-10-05 00:00:00').
+# date + interval arithmetic: the result is a timestamp.
 query T
 SELECT DATE '2001-09-28' + INTERVAL '7 days';
 ----
-2001-10-05
+2001-10-05 00:00:00
 
 query T
 SELECT DATE '2001-09-28' - INTERVAL '1 month';
 ----
-2001-08-28
+2001-08-28 00:00:00
 
 # leap-year handling in ordering around Feb 29
 query T

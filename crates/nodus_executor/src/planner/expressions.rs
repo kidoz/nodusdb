@@ -53,9 +53,7 @@ pub fn expr_to_value(expr: &sqlparser::ast::Expr, params: &[crate::Value]) -> Op
         },
         // `INTERVAL '1 day'` — NodusDB has no native interval type, so it's kept
         // as canonical PostgreSQL text (round-trips through INTERVAL columns).
-        Expr::Interval(iv) => {
-            parse_interval(iv).map(|(m, d, s)| crate::Value::Text(format_interval(m, d, s)))
-        }
+        Expr::Interval(iv) => parse_interval(iv).map(|iv| crate::Value::Text(iv.format())),
         Expr::Array(sqlparser::ast::Array { elem, .. }) => {
             let mut arr = Vec::new();
             for e in elem {
@@ -353,6 +351,17 @@ pub(crate) fn try_cast(v: Value, data_type: &str) -> std::result::Result<Value, 
                     Value::Json(s.clone())
                 }
                 Value::Text(s) if upper == "JSONB" => Value::Jsonb(crate::json_text::parse(s)?),
+                Value::Text(s)
+                    if crate::datetime::Kind::of_type(data_type)
+                        == Some(crate::datetime::Kind::Interval) =>
+                {
+                    match crate::datetime::Interval::parse(s) {
+                        Some(interval) => Value::Text(interval.format()),
+                        None => {
+                            return Err(format!("invalid input syntax for type interval: \"{s}\""));
+                        }
+                    }
+                }
                 Value::Text(s) if let Some(kind) = crate::value::temporal_type(data_type) => {
                     match crate::value::normalize_temporal(s, kind) {
                         Some(text) => Value::Text(text),
@@ -373,42 +382,6 @@ pub(crate) fn try_cast(v: Value, data_type: &str) -> std::result::Result<Value, 
             }
         }
     })
-}
-
-/// Extracts a datetime field (`YEAR`/`MONTH`/`DAY`/`HOUR`/`MINUTE`/`SECOND`)
-/// from an ISO-8601 date/timestamp text value. Returns NULL when it can't parse.
-pub(crate) fn extract_datetime_field(v: &Value, field: &str) -> Value {
-    let text = match v {
-        Value::Null => return Value::Null,
-        Value::Text(s) => s.clone(),
-        other => render(other),
-    };
-    let (date_part, time_part) = match text.trim().split_once([' ', 'T']) {
-        Some((d, t)) => (d, Some(t)),
-        None => (text.trim(), None),
-    };
-    let date_bits: Vec<&str> = date_part.split('-').collect();
-    let field_up = field.to_ascii_uppercase();
-    let parsed = match field_up.as_str() {
-        "YEAR" => date_bits.first().and_then(|s| s.parse::<i64>().ok()),
-        "MONTH" => date_bits.get(1).and_then(|s| s.parse::<i64>().ok()),
-        "DAY" => date_bits.get(2).and_then(|s| s.parse::<i64>().ok()),
-        "HOUR" | "MINUTE" | "SECOND" => {
-            let time_bits: Vec<&str> = time_part.unwrap_or("").split(':').collect();
-            let idx = match field_up.as_str() {
-                "HOUR" => 0,
-                "MINUTE" => 1,
-                _ => 2,
-            };
-            // A SECOND field may carry a fraction (`08.5`); take the whole part.
-            time_bits
-                .get(idx)
-                .and_then(|s| s.trim().split('.').next())
-                .and_then(|s| s.trim().parse::<i64>().ok())
-        }
-        _ => None,
-    };
-    parsed.map(Value::Int).unwrap_or(Value::Null)
 }
 
 /// PostgreSQL-style textual boolean input; unrecognized text folds to NULL.
@@ -538,16 +511,22 @@ pub(crate) fn lower_scalar(expr: &sqlparser::ast::Expr, params: &[Value]) -> Opt
         Expr::Value(v) if matches!(v.value, sqlparser::ast::Value::Placeholder(_)) => Some(
             ScalarExpr::Literal(expr_to_value(expr, params).unwrap_or(Value::Null)),
         ),
-        Expr::Value(_) | Expr::Interval(_) => expr_to_value(expr, params).map(ScalarExpr::Literal),
-        // A typed literal is a cast of its text, so invalid input fails when
-        // the statement runs, with the cast's error.
-        Expr::TypedString(ts) => match (&ts.value.value, expr_to_value(expr, params)) {
-            (_, Some(value)) => Some(ScalarExpr::Literal(value)),
-            (sqlparser::ast::Value::SingleQuotedString(s), None) => Some(ScalarExpr::Cast {
+        Expr::Value(_) => expr_to_value(expr, params).map(ScalarExpr::Literal),
+        // An interval literal keeps its type, so operators on it know it.
+        Expr::Interval(iv) => Some(ScalarExpr::Cast {
+            expr: Box::new(ScalarExpr::Literal(Value::Text(
+                parse_interval(iv)?.format(),
+            ))),
+            target: "INTERVAL".to_string(),
+        }),
+        // A typed literal is a cast of its text: it keeps its type, and
+        // invalid input fails when the statement runs, with the cast's error.
+        Expr::TypedString(ts) => match &ts.value.value {
+            sqlparser::ast::Value::SingleQuotedString(s) => Some(ScalarExpr::Cast {
                 expr: Box::new(ScalarExpr::Literal(Value::Text(s.clone()))),
                 target: ts.data_type.to_string(),
             }),
-            _ => None,
+            _ => expr_to_value(expr, params).map(ScalarExpr::Literal),
         },
         // `base[i]`, `base[lo:hi]`, after any field names that complete a
         // column reference (`t.col[1]`).
@@ -649,34 +628,21 @@ pub(crate) fn lower_scalar(expr: &sqlparser::ast::Expr, params: &[Value]) -> Opt
             })
         }
         Expr::BinaryOp { left, op, right } => {
-            // `date/timestamp ± INTERVAL` -> a resolved offset. Only when exactly
-            // one side is an interval; interval ± interval falls through to the
-            // general Binary path (evaluated by `apply_binary_op`).
-            if matches!(op, B::Plus | B::Minus) {
-                if let Expr::Interval(iv) = &**right
-                    && !matches!(&**left, Expr::Interval(_))
-                {
-                    let (m, d, s) = parse_interval(iv)?;
-                    let sign = if matches!(op, B::Minus) { -1 } else { 1 };
-                    return Some(ScalarExpr::DateOffset {
-                        base: Box::new(lower_scalar(left, params)?),
-                        months: m * sign,
-                        days: d * sign,
-                        seconds: s * sign,
-                    });
-                }
-                if matches!(op, B::Plus)
-                    && let Expr::Interval(iv) = &**left
-                    && !matches!(&**right, Expr::Interval(_))
-                {
-                    let (m, d, s) = parse_interval(iv)?;
-                    return Some(ScalarExpr::DateOffset {
-                        base: Box::new(lower_scalar(right, params)?),
-                        months: m,
-                        days: d,
-                        seconds: s,
-                    });
-                }
+            // `(start, end) OVERLAPS (start, end)`.
+            if *op == sqlparser::ast::BinaryOperator::Overlaps
+                && let (Expr::Tuple(l), Expr::Tuple(r)) = (left.as_ref(), right.as_ref())
+                && l.len() == 2
+                && r.len() == 2
+            {
+                let args = l
+                    .iter()
+                    .chain(r)
+                    .map(|e| lower_scalar(e, params))
+                    .collect::<Option<Vec<_>>>()?;
+                return Some(ScalarExpr::Function {
+                    name: "OVERLAPS".to_string(),
+                    args,
+                });
             }
             if let Some((kind, case_insensitive, negated)) = pattern_operator(op) {
                 return Some(ScalarExpr::PatternMatch {
@@ -1061,6 +1027,31 @@ pub(crate) fn lower_scalar(expr: &sqlparser::ast::Expr, params: &[Value]) -> Opt
                             FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => {
                                 args.push(lower_scalar(e, params)?)
                             }
+                            // `make_interval(days => 3)`: a named argument in
+                            // its place, the ones left out zero.
+                            FunctionArg::Named {
+                                arg: FunctionArgExpr::Expr(e),
+                                ..
+                            }
+                            | FunctionArg::ExprNamed {
+                                arg: FunctionArgExpr::Expr(e),
+                                ..
+                            } if name == "MAKE_INTERVAL" => {
+                                const NAMES: [&str; 7] =
+                                    ["years", "months", "weeks", "days", "hours", "mins", "secs"];
+                                let arg_name = match a {
+                                    FunctionArg::Named { name, .. } => name.value.clone(),
+                                    FunctionArg::ExprNamed { name, .. } => extract_col_name(name)?,
+                                    _ => return None,
+                                };
+                                let at = NAMES
+                                    .iter()
+                                    .position(|n| n.eq_ignore_ascii_case(&arg_name))?;
+                                while args.len() <= at {
+                                    args.push(ScalarExpr::Literal(Value::Int(0)));
+                                }
+                                args[at] = lower_scalar(e, params)?;
+                            }
                             _ => return None,
                         }
                     }
@@ -1244,13 +1235,30 @@ pub(crate) fn eval_scalar_in(expr: &ScalarExpr, scope: &dyn ScalarScope) -> Valu
             let is_null = matches!(eval(expr), Value::Null);
             Value::Bool(if *negated { !is_null } else { is_null })
         }
-        ScalarExpr::Extract { field, expr } => extract_datetime_field(&eval(expr), field),
+        ScalarExpr::Extract { field, expr } => {
+            crate::datetime::extract(field, &eval(expr), None, false)
+                .unwrap_or_else(crate::eval_error::raise)
+        }
         ScalarExpr::DateOffset {
             base,
             months,
             days,
             seconds,
-        } => apply_date_offset(&eval(base), *months, *days, *seconds),
+        } => {
+            let offset = crate::datetime::Interval::new(
+                *months,
+                *days,
+                seconds * crate::datetime::MICROS_PER_SECOND,
+            );
+            crate::datetime::arith(
+                "+",
+                &eval(base),
+                None,
+                &Value::Text(offset.format()),
+                Some(crate::datetime::Kind::Interval),
+            )
+            .unwrap_or_else(crate::eval_error::raise)
+        }
         ScalarExpr::Case {
             operand,
             branches,
@@ -1571,42 +1579,9 @@ fn cached_regex(source: &str) -> Option<regex::Regex> {
     })
 }
 
-/// Renders a `(months, days, seconds)` interval as canonical PostgreSQL text,
-/// e.g. `1 year 2 mons 3 days` / `02:00:00`.
-fn format_interval(months: i64, days: i64, seconds: i64) -> String {
-    let mut parts = Vec::new();
-    let plural = |n: i64, unit: &str| format!("{n} {unit}{}", if n.abs() == 1 { "" } else { "s" });
-    let (years, mons) = (months / 12, months % 12);
-    if years != 0 {
-        parts.push(plural(years, "year"));
-    }
-    if mons != 0 {
-        parts.push(plural(mons, "mon"));
-    }
-    if days != 0 {
-        parts.push(plural(days, "day"));
-    }
-    if seconds != 0 {
-        let s = seconds.abs();
-        parts.push(format!(
-            "{}{:02}:{:02}:{:02}",
-            if seconds < 0 { "-" } else { "" },
-            s / 3600,
-            (s % 3600) / 60,
-            s % 60
-        ));
-    }
-    if parts.is_empty() {
-        "00:00:00".to_string()
-    } else {
-        parts.join(" ")
-    }
-}
-
-/// Parses an `INTERVAL` expression into a `(months, days, seconds)` offset.
-/// Handles `INTERVAL '1 day'`, `INTERVAL '2 months 3 days'`, and
-/// `INTERVAL '1' DAY` (value + leading field).
-fn parse_interval(iv: &sqlparser::ast::Interval) -> Option<(i64, i64, i64)> {
+/// An `INTERVAL` literal: `INTERVAL '1 day'`, `INTERVAL '2 months 3
+/// days'`, or a number with its unit after (`INTERVAL '1' DAY`).
+fn parse_interval(iv: &sqlparser::ast::Interval) -> Option<crate::datetime::Interval> {
     use sqlparser::ast::{Expr, Value as SqlValue};
     let raw = match &*iv.value {
         Expr::Value(v) => match &v.value {
@@ -1616,202 +1591,28 @@ fn parse_interval(iv: &sqlparser::ast::Interval) -> Option<(i64, i64, i64)> {
         },
         _ => return None,
     };
-    let (mut months, mut days, mut seconds) = (0i64, 0i64, 0i64);
-    let tokens: Vec<&str> = raw.split_whitespace().collect();
-    if tokens.len() >= 2 {
-        let mut i = 0;
-        while i + 1 < tokens.len() {
-            let amount: i64 = tokens[i].parse().ok()?;
-            apply_interval_unit(&mut months, &mut days, &mut seconds, amount, tokens[i + 1])?;
-            i += 2;
-        }
-        return Some((months, days, seconds));
+    match (&iv.leading_field, raw.trim().parse::<f64>()) {
+        (Some(unit), Ok(_)) => crate::datetime::Interval::parse(&format!("{raw} {unit}")),
+        _ => crate::datetime::Interval::parse(&raw),
     }
-    // Single amount with a leading field, e.g. `INTERVAL '1' DAY`.
-    let amount: i64 = raw.trim().parse().ok()?;
-    let unit = iv.leading_field.as_ref()?.to_string();
-    apply_interval_unit(&mut months, &mut days, &mut seconds, amount, &unit)?;
-    Some((months, days, seconds))
 }
 
-fn apply_interval_unit(
-    months: &mut i64,
-    days: &mut i64,
-    seconds: &mut i64,
-    amount: i64,
-    unit: &str,
-) -> Option<()> {
-    match unit.to_ascii_lowercase().trim_end_matches('s') {
-        "year" | "yr" => *months += amount * 12,
-        // `mon`/`mons` is PostgreSQL's own rendering, so round-tripping needs it.
-        "month" | "mon" => *months += amount,
-        "week" => *days += amount * 7,
-        "day" => *days += amount,
-        "hour" => *seconds += amount * 3600,
-        "minute" | "min" => *seconds += amount * 60,
-        "second" | "sec" => *seconds += amount,
-        _ => return None,
-    }
-    Some(())
-}
-
-/// Strictly parses interval *text* (`2 mons 3 days`, `1 year`, `02:00:00`,
-/// `-5 days`) into `(months, days, seconds)`. Returns `None` for anything not
-/// clearly an interval (bare numbers, dates, arbitrary text) so it never
-/// hijacks ordinary text arithmetic or comparison.
-pub(crate) fn parse_interval_text(s: &str) -> Option<(i64, i64, i64)> {
-    let tokens: Vec<&str> = s.trim().split_whitespace().collect();
-    if tokens.is_empty() {
-        return None;
-    }
-    let (mut months, mut days, mut seconds) = (0i64, 0i64, 0i64);
-    let mut i = 0;
-    let mut matched = false;
-    while i < tokens.len() {
-        if let Some(secs) = parse_hms_token(tokens[i]) {
-            seconds += secs;
-            matched = true;
-            i += 1;
-            continue;
-        }
-        if i + 1 < tokens.len()
-            && let Ok(amount) = tokens[i].parse::<i64>()
-            && apply_interval_unit(&mut months, &mut days, &mut seconds, amount, tokens[i + 1])
-                .is_some()
-        {
-            matched = true;
-            i += 2;
-            continue;
-        }
-        return None; // an unrecognized token means this isn't an interval
-    }
-    matched.then_some((months, days, seconds))
-}
-
-/// Parses an `HH:MM:SS` (optionally negative) interval time component to seconds.
-fn parse_hms_token(t: &str) -> Option<i64> {
-    let (neg, body) = t.strip_prefix('-').map_or((false, t), |r| (true, r));
-    let parts: Vec<&str> = body.split(':').collect();
-    if parts.len() != 3 {
-        return None;
-    }
-    let h: i64 = parts[0].parse().ok()?;
-    let m: i64 = parts[1].parse().ok()?;
-    let s: i64 = parts[2].parse().ok()?;
-    let total = h * 3600 + m * 60 + s;
-    Some(if neg { -total } else { total })
-}
-
-/// A comparable magnitude for an interval (PostgreSQL uses a 30-day month).
-fn interval_total((months, days, seconds): (i64, i64, i64)) -> i64 {
-    months * 30 * 86400 + days * 86400 + seconds
-}
-
-/// Compares two values, treating two interval-formatted texts by magnitude
-/// (so `10 days` > `2 days`); otherwise defers to the generic `compare`.
+/// Compares two values, texts that both read as intervals (`10 days`,
+/// `02:00:00`) by their length; otherwise defers to the generic `compare`.
 pub(crate) fn interval_aware_compare(a: &Value, b: &Value) -> std::cmp::Ordering {
+    let interval = |text: &str| {
+        // A bare number is text, not seconds.
+        (text.contains(':') || text.chars().any(|c| c.is_ascii_alphabetic()))
+            .then(|| crate::datetime::Interval::parse(text))
+            .flatten()
+            .filter(|_| crate::value::parse_temporal(text).is_none())
+    };
     if let (Value::Text(ls), Value::Text(rs)) = (a, b)
-        && let (Some(li), Some(ri)) = (parse_interval_text(ls), parse_interval_text(rs))
+        && let (Some(li), Some(ri)) = (interval(ls), interval(rs))
     {
-        return interval_total(li).cmp(&interval_total(ri));
+        return li.span().cmp(&ri.span());
     }
     compare(a, b)
-}
-
-/// `interval ± interval` and `date/timestamp ± interval` on text operands.
-fn interval_date_arith(op: ScalarBinaryOp, l: &Value, r: &Value) -> Value {
-    if !matches!(op, ScalarBinaryOp::Add | ScalarBinaryOp::Sub) {
-        return Value::Null;
-    }
-    let bare_date = |text: &str| {
-        crate::value::parse_temporal(text)
-            .filter(|t| t.time.is_none())
-            .map(|t| t.date)
-    };
-    // date ± integer days, integer + date, and date - date (whole days).
-    match (l, r) {
-        (Value::Text(date), Value::Int(days)) | (Value::Int(days), Value::Text(date))
-            if bare_date(date).is_some()
-                && (matches!(l, Value::Text(_)) || matches!(op, ScalarBinaryOp::Add)) =>
-        {
-            let days = if matches!(op, ScalarBinaryOp::Sub) {
-                -days
-            } else {
-                *days
-            };
-            return bare_date(date)
-                .and_then(|d| d.checked_add_signed(chrono::Duration::days(days)))
-                .map(|d| Value::Text(d.format("%Y-%m-%d").to_string()))
-                .unwrap_or_else(|| crate::eval_error::raise("date out of range"));
-        }
-        (Value::Text(a), Value::Text(b)) if matches!(op, ScalarBinaryOp::Sub) => {
-            if let (Some(a), Some(b)) = (bare_date(a), bare_date(b)) {
-                return Value::Int((a - b).num_days());
-            }
-        }
-        _ => {}
-    }
-    let (Value::Text(ls), Value::Text(rs)) = (l, r) else {
-        return Value::Null;
-    };
-    let sign = if matches!(op, ScalarBinaryOp::Sub) {
-        -1
-    } else {
-        1
-    };
-    // interval ± interval
-    if let (Some((m1, d1, s1)), Some((m2, d2, s2))) =
-        (parse_interval_text(ls), parse_interval_text(rs))
-    {
-        return Value::Text(format_interval(
-            m1 + sign * m2,
-            d1 + sign * d2,
-            s1 + sign * s2,
-        ));
-    }
-    // date/timestamp ± interval (left is the date, right is the interval)
-    if let Some((m, d, s)) = parse_interval_text(rs) {
-        return apply_date_offset(l, sign * m, sign * d, sign * s);
-    }
-    Value::Null
-}
-
-/// Applies a `(months, days, seconds)` offset to an ISO date/timestamp text
-/// value using real calendar math. Returns a date when the input was a date and
-/// no sub-day offset applies, otherwise a timestamp.
-pub(crate) fn apply_date_offset(v: &Value, months: i64, days: i64, seconds: i64) -> Value {
-    use chrono::{Duration, Months, NaiveDate, NaiveDateTime};
-    let add_months = |dt: NaiveDateTime, m: i64| -> NaiveDateTime {
-        if m >= 0 {
-            dt.checked_add_months(Months::new(m as u32)).unwrap_or(dt)
-        } else {
-            dt.checked_sub_months(Months::new((-m) as u32))
-                .unwrap_or(dt)
-        }
-    };
-    let text = match v {
-        Value::Null => return Value::Null,
-        Value::Text(s) => s.trim().to_string(),
-        other => render(other),
-    };
-    let Some(parsed) = crate::value::parse_temporal(&text) else {
-        return Value::Null;
-    };
-    let base = match parsed.offset {
-        Some(_) => parsed.utc(),
-        None => parsed.date.and_time(parsed.time.unwrap_or_default()),
-    };
-    let shifted = add_months(base, months) + Duration::days(days) + Duration::seconds(seconds);
-    // A date shifted by whole days stays a date; otherwise the result is a
-    // timestamp, zoned if the input was.
-    if parsed.time.is_none() && seconds == 0 {
-        Value::Text(shifted.date().format("%Y-%m-%d").to_string())
-    } else {
-        Value::Text(crate::value::format_timestamp(
-            shifted,
-            parsed.offset.is_some(),
-        ))
-    }
 }
 
 thread_local! {
@@ -2199,9 +2000,20 @@ pub(crate) fn apply_binary_op(op: ScalarBinaryOp, l: Value, r: Value) -> Value {
                     return crate::eval_error::raise("value out of range: overflow");
                 }
                 Value::Float(out)
+            } else if let Some((a, b)) = numeric_text_operands(&l, &r) {
+                // A number's text, as an untyped literal is read.
+                apply_binary_op(op, a, b)
             } else {
-                // Non-numeric operands: interval/date arithmetic on text.
-                interval_date_arith(op, &l, &r)
+                // Date/time arithmetic, by the operands' text.
+                let symbol = match op {
+                    Op::Add => "+",
+                    Op::Sub => "-",
+                    Op::Mul => "*",
+                    Op::Div => "/",
+                    _ => "%",
+                };
+                crate::datetime::arith(symbol, &l, None, &r, None)
+                    .unwrap_or_else(crate::eval_error::raise)
             }
         }
         Op::Eq | Op::NotEq | Op::Lt | Op::LtEq | Op::Gt | Op::GtEq => {
@@ -2297,6 +2109,23 @@ pub(crate) fn apply_binary_op(op: ScalarBinaryOp, l: Value, r: Value) -> Value {
                 _ => Value::Null,
             }
         }
+    }
+}
+
+/// A number and a number's text as two numbers (`'5' + 1`).
+fn numeric_text_operands(l: &Value, r: &Value) -> Option<(Value, Value)> {
+    let numeric = |v: &Value| matches!(v, Value::Int(_) | Value::Float(_) | Value::Numeric(_));
+    let parse = |text: &str| -> Option<Value> {
+        let t = text.trim();
+        t.parse::<i64>()
+            .map(Value::Int)
+            .ok()
+            .or_else(|| crate::value::parse_decimal(t).map(Value::Numeric))
+    };
+    match (l, r) {
+        (Value::Text(t), n) if numeric(n) => Some((parse(t)?, n.clone())),
+        (n, Value::Text(t)) if numeric(n) => Some((n.clone(), parse(t)?)),
+        _ => None,
     }
 }
 

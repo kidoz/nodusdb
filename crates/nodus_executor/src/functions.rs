@@ -31,6 +31,7 @@ const NON_STRICT: &[&str] = &[
     "TO_JSON",
     "TO_JSONB",
     "__RECORD__",
+    "__DATETIME__",
     "ARRAY_APPEND",
     "ARRAY_PREPEND",
     "ARRAY_CAT",
@@ -73,7 +74,9 @@ pub(crate) fn is_known(name: &str) -> bool {
                 | "NOW" | "CURRENT_TIMESTAMP" | "TRANSACTION_TIMESTAMP"
                 | "STATEMENT_TIMESTAMP" | "CLOCK_TIMESTAMP" | "CURRENT_DATE" | "CURRENT_TIME"
                 | "LOCALTIMESTAMP" | "LOCALTIME" | "DATE_TRUNC" | "AGE" | "DATE_PART"
-                | "MAKE_DATE" | "MAKE_TIMESTAMP" | "TO_TIMESTAMP"
+                | "MAKE_DATE" | "MAKE_TIMESTAMP" | "TO_TIMESTAMP" | "MAKE_INTERVAL" | "MAKE_TIME"
+                | "JUSTIFY_DAYS" | "JUSTIFY_HOURS" | "JUSTIFY_INTERVAL" | "ISFINITE" | "DATE_BIN"
+                | "OVERLAPS" | "__DATETIME__"
                 // Session and system.
                 | "VERSION" | "CURRENT_USER" | "SESSION_USER" | "CURRENT_ROLE" | "USER"
                 | "CURRENT_DATABASE" | "CURRENT_CATALOG" | "CURRENT_SCHEMA" | "CURRENT_SCHEMAS"
@@ -165,17 +168,25 @@ pub(crate) fn return_type(name: &str, arg_types: &[Option<String>]) -> Option<St
             | "TO_TIMESTAMP" => "TIMESTAMPTZ",
             "LOCALTIMESTAMP" | "MAKE_TIMESTAMP" => "TIMESTAMP",
             "CURRENT_DATE" | "MAKE_DATE" => "DATE",
-            "LOCALTIME" => "TIME",
+            "LOCALTIME" | "MAKE_TIME" => "TIME",
             "CURRENT_TIME" => "TIMETZ",
-            "AGE" => "INTERVAL",
+            "AGE" | "MAKE_INTERVAL" | "JUSTIFY_DAYS" | "JUSTIFY_HOURS" | "JUSTIFY_INTERVAL" => {
+                "INTERVAL"
+            }
+            "ISFINITE" | "OVERLAPS" => "BOOLEAN",
+            "DATE_BIN" => return arg_types.get(1).cloned().flatten(),
+            // A date truncates as a zoned timestamp.
             "DATE_TRUNC" => {
-                return Some(
-                    arg_types
-                        .get(1)
-                        .cloned()
-                        .flatten()
-                        .unwrap_or_else(|| "TIMESTAMP".into()),
-                );
+                return Some(match arg_types.get(1).cloned().flatten() {
+                    Some(t)
+                        if crate::datetime::Kind::of_type(&t)
+                            == Some(crate::datetime::Kind::Date) =>
+                    {
+                        "TIMESTAMPTZ".into()
+                    }
+                    Some(t) => t,
+                    None => "TIMESTAMP".into(),
+                });
             }
             "GEN_RANDOM_UUID" | "UUIDV4" | "UUIDV7" => "UUID",
             "TO_JSONB" | "JSONB_BUILD_OBJECT" | "JSONB_BUILD_ARRAY" | "JSONB_EXTRACT_PATH"
@@ -997,14 +1008,69 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
                 time.to_string()
             })
         }
-        "DATE_TRUNC" if arity(2) => crate::value::date_trunc_text(&text(arg(0)), &text(arg(1))),
-        "AGE" if arity(2) => crate::value::age_text(&text(arg(0)), &text(arg(1))),
+        "OVERLAPS" if arity(4) => crate::datetime::overlaps(args, &[]).unwrap_or_else(raise),
+        // With the arguments' static types, as the planner passes them.
+        "OVERLAPS" if arity(8) => {
+            let kinds: Vec<_> = args[4..]
+                .iter()
+                .map(|t| crate::datetime::Kind::of_type(&text(t)))
+                .collect();
+            crate::datetime::overlaps(&args[..4], &kinds).unwrap_or_else(raise)
+        }
+        "DATE_TRUNC" if arity(2) => {
+            crate::datetime::trunc(&text(arg(0)), arg(1), None).unwrap_or_else(raise)
+        }
+        "AGE" if arity(2) => crate::datetime::age(arg(0), arg(1)).unwrap_or_else(raise),
         "AGE" if arity(1) => {
             let today = text(&timestamp(session_time(|e| e.transaction_micros)?, false));
-            crate::value::age_text(&format!("{} 00:00:00", &today[..10]), &text(arg(0)))
+            let midnight = Value::Text(format!("{} 00:00:00", &today[..10]));
+            crate::datetime::age(&midnight, arg(0)).unwrap_or_else(raise)
         }
         "DATE_PART" if arity(2) => {
-            crate::planner::extract_datetime_field(arg(1), &text(arg(0)).to_ascii_uppercase())
+            crate::datetime::extract(&text(arg(0)), arg(1), None, true).unwrap_or_else(raise)
+        }
+        // `__DATETIME__(op, left, right, left_type, right_type)`: a date/time
+        // operator, by its operands' declared types.
+        "__DATETIME__" if arity(5) => {
+            let kind = |v: &Value| crate::datetime::Kind::of_type(&text(v));
+            crate::datetime::arith(&text(arg(0)), arg(1), kind(arg(3)), arg(2), kind(arg(4)))
+                .unwrap_or_else(raise)
+        }
+        // `make_interval(years, months, weeks, days, hours, mins, secs)`.
+        "MAKE_INTERVAL" if args.len() <= 7 => {
+            let part = |i: usize| args.get(i).map_or(Some(0.0), num);
+            let (years, months, weeks, days) = (part(0)?, part(1)?, part(2)?, part(3)?);
+            let (hours, minutes, seconds) = (part(4)?, part(5)?, part(6)?);
+            let interval = crate::datetime::Interval::new(
+                (years * 12.0 + months) as i64,
+                (weeks * 7.0 + days) as i64,
+                (hours * 3_600e6 + minutes * 60e6 + seconds * 1e6).round() as i64,
+            );
+            Value::Text(interval.format())
+        }
+        "MAKE_TIME" if arity(3) => {
+            crate::datetime::make_time(int(arg(0))?, int(arg(1))?, num(arg(2))?)
+                .unwrap_or_else(raise)
+        }
+        "JUSTIFY_DAYS" | "JUSTIFY_HOURS" | "JUSTIFY_INTERVAL" if arity(1) => {
+            match crate::datetime::Interval::parse(&text(arg(0))) {
+                Some(interval) => Value::Text(
+                    match name {
+                        "JUSTIFY_DAYS" => interval.justify_days(),
+                        "JUSTIFY_HOURS" => interval.justify_hours(),
+                        _ => interval.justify(),
+                    }
+                    .format(),
+                ),
+                None => raise(format!(
+                    "invalid input syntax for type interval: \"{}\"",
+                    text(arg(0))
+                )),
+            }
+        }
+        "ISFINITE" if arity(1) => Value::Bool(crate::datetime::is_finite(arg(0))?),
+        "DATE_BIN" if arity(3) => {
+            crate::datetime::date_bin(arg(0), arg(1), arg(2)).unwrap_or_else(raise)
         }
         "MAKE_DATE" if arity(3) => {
             let (y, m, d) = (int(arg(0))?, int(arg(1))?, int(arg(2))?);
@@ -1032,7 +1098,14 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
         }
         "TO_TIMESTAMP" if arity(1) => {
             let secs = num(arg(0))?;
-            timestamp((secs * 1_000_000.0).round() as i64, true)
+            if secs.is_nan() {
+                raise("timestamp cannot be NaN")
+            } else if secs.is_infinite() {
+                crate::datetime::Temporal::Infinite(crate::datetime::Kind::TimestampTz, secs < 0.0)
+                    .to_value()
+            } else {
+                timestamp((secs * 1_000_000.0).round() as i64, true)
+            }
         }
 
         // ---- Session and system ---------------------------------------------------

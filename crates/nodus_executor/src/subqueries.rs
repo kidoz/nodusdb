@@ -127,7 +127,13 @@ impl MemExecutor {
         crate::eval_error::check()?;
         let mut types = Vec::with_capacity(width);
         for column in 0..width {
-            types.push(unify_column(&mut values, column)?);
+            // A date/time literal gives its column its type.
+            let temporal = rows
+                .iter()
+                .filter_map(|row| row.get(column))
+                .filter_map(crate::result_types::constant_expr_type)
+                .find(|t| crate::datetime::Kind::of_type(t).is_some());
+            types.push(unify_column(&mut values, column, temporal)?);
         }
         let rows_out = values
             .into_iter()
@@ -143,9 +149,14 @@ impl MemExecutor {
 }
 
 /// Resolves one `VALUES` column to a single type, converting its values: text
-/// literals take the column's type, integers widen to numeric or float, and
-/// types that cannot be matched are an error.
-fn unify_column(rows: &mut [Vec<Value>], column: usize) -> Result<String> {
+/// literals take the column's type (`temporal`, of a date/time literal in
+/// it), integers widen to numeric or float, and types that cannot be matched
+/// are an error.
+fn unify_column(
+    rows: &mut [Vec<Value>],
+    column: usize,
+    temporal: Option<String>,
+) -> Result<String> {
     #[derive(PartialEq, PartialOrd, Clone, Copy)]
     enum Kind {
         Int,
@@ -175,6 +186,10 @@ fn unify_column(rows: &mut [Vec<Value>], column: usize) -> Result<String> {
         Some(Kind::Numeric) => "NUMERIC",
         Some(Kind::Float) => "DOUBLE PRECISION",
         None => {
+            if let Some(target) = temporal {
+                convert_all(rows, column, &target)?;
+                return Ok(target);
+            }
             let first = cells().next().cloned();
             return Ok(match first {
                 Some(Value::Bool(_)) => {

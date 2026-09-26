@@ -81,6 +81,39 @@ pub(crate) fn sqlstate_for_execution_error(err_str: &str) -> &'static str {
         "23503" // foreign_key_violation
     } else if err_str.contains("violates check constraint") {
         "23514" // check_violation
+    // Date/time input and templates (class 22).
+    } else if [
+        "invalid input syntax for type date",
+        "invalid input syntax for type time",
+        "invalid input syntax for type interval",
+    ]
+    .iter()
+    .any(|prefix| err_str.starts_with(prefix))
+        || (err_str.starts_with("invalid value \"") && err_str.contains("\" for \""))
+        || err_str.ends_with("is invalid for the 12-hour clock")
+    {
+        "22007" // invalid_datetime_format
+    } else if err_str.starts_with("time field value out of range")
+        || err_str == "date out of range"
+        || err_str == "timestamp cannot be NaN"
+    {
+        "22008" // datetime_field_overflow
+    } else if (err_str.starts_with("unit \"") && err_str.contains("\" not recognized for type "))
+        || (err_str.starts_with("time zone \"") && err_str.ends_with("\" not recognized"))
+        || (err_str.starts_with("interval time zone \"")
+            && err_str.ends_with("must not include months or days"))
+    {
+        "22023" // invalid_parameter_value
+    } else if (err_str.starts_with("unit \"") && err_str.contains("\" not supported for type "))
+        || err_str.ends_with("not supported for input")
+    {
+        "0A000" // feature_not_supported
+    } else if err_str.contains("must be ahead of \"PR\"") {
+        "42601" // syntax_error
+    } else if err_str.starts_with("operator does not exist:") {
+        "42883" // undefined_function
+    } else if err_str.starts_with("operator is not unique:") {
+        "42725" // ambiguous_function
     // Invalid text representation for a typed value (class 22).
     } else if err_str.contains("invalid input syntax") {
         "22P02" // invalid_text_representation

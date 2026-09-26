@@ -251,9 +251,63 @@ pub(crate) fn aggregate_inputs(op: &AggregateOp, inputs: &[(Value, Vec<Value>)])
     }
 }
 
+/// The values as intervals, when every one is interval text as PostgreSQL
+/// shows it (`1 day 02:00:00`, `-03:00:00`).
+fn interval_values(values: &[&Value]) -> Option<Vec<crate::datetime::Interval>> {
+    if values.is_empty() {
+        return None;
+    }
+    values
+        .iter()
+        .map(|value| match value {
+            Value::Text(text) if crate::value::parse_temporal(text).is_none() => {
+                crate::datetime::Interval::parse(text).filter(|iv| iv.format() == *text)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// `sum`, `avg`, `min`, and `max` of intervals, ordered by their length.
+fn aggregate_intervals(
+    op: &AggregateOp,
+    values: &[&Value],
+    intervals: &[crate::datetime::Interval],
+) -> Value {
+    let sum = || {
+        intervals
+            .iter()
+            .fold(crate::datetime::Interval::default(), |acc, iv| acc.add(*iv))
+    };
+    match op {
+        AggregateOp::Count => Value::Int(values.len() as i64),
+        AggregateOp::Sum => Value::Text(sum().format()),
+        AggregateOp::Avg => match sum().div(intervals.len() as f64) {
+            Ok(avg) => Value::Text(avg.format()),
+            Err(error) => crate::eval_error::raise(error),
+        },
+        // Of equal intervals (`1 day`, `24 hours`), the last one wins.
+        _ => {
+            let mut best = 0;
+            for (i, iv) in intervals.iter().enumerate().skip(1) {
+                let ord = iv.span().cmp(&intervals[best].span());
+                if ord == std::cmp::Ordering::Equal
+                    || (ord == std::cmp::Ordering::Less) == (*op == AggregateOp::Min)
+                {
+                    best = i;
+                }
+            }
+            values[best].clone()
+        }
+    }
+}
+
 /// `count`, `sum`, `avg`, `min`, and `max` over values.
 fn aggregate_numeric(op: &AggregateOp, vals: &[Value]) -> Value {
     let non_null: Vec<&Value> = vals.iter().filter(|v| **v != Value::Null).collect();
+    if let Some(intervals) = interval_values(&non_null) {
+        return aggregate_intervals(op, &non_null, &intervals);
+    }
     match op {
         AggregateOp::Count => Value::Int(non_null.len() as i64),
         AggregateOp::Sum | AggregateOp::Avg => {

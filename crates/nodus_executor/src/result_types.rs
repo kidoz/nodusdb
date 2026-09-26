@@ -20,6 +20,7 @@ fn aggregate_type(op: &AggregateOp, input: Option<String>) -> Option<String> {
             "REAL" | "FLOAT4" | "DOUBLE" | "DOUBLE PRECISION" | "FLOAT8" => {
                 "DOUBLE PRECISION".into()
             }
+            "INTERVAL" if *op == AggregateOp::Avg => ty,
             _ => "NUMERIC".into(),
         }),
         AggregateOp::StringAgg => Some("TEXT".into()),
@@ -86,6 +87,22 @@ fn scalar_type(expr: &ScalarExpr, column: &impl Fn(&str) -> Option<String>) -> O
             .chain(else_result.as_deref())
             .find_map(|result| scalar_type(result, column)),
         ScalarExpr::Extract { .. } => Some("NUMERIC".into()),
+        // A date/time operator, by its operands' types.
+        ScalarExpr::Function { name, args } if name == DATETIME_OP => {
+            let text = |i: usize| match args.get(i) {
+                Some(ScalarExpr::Literal(Value::Text(t))) => Some(t.as_str()),
+                _ => None,
+            };
+            let kind = |i: usize| text(i).and_then(crate::datetime::Kind::of_type);
+            crate::datetime::result_kind(text(0)?, kind(3), kind(4)).map(Into::into)
+        }
+        ScalarExpr::DateOffset { base, .. } => {
+            match scalar_type(base, column).and_then(|t| crate::datetime::Kind::of_type(&t)) {
+                Some(crate::datetime::Kind::TimestampTz) => Some("TIMESTAMPTZ".into()),
+                Some(crate::datetime::Kind::Time) => Some("TIME".into()),
+                _ => Some("TIMESTAMP".into()),
+            }
+        }
         ScalarExpr::Function { name, args } => crate::functions::return_type(
             name,
             &args
@@ -154,6 +171,12 @@ fn binary_type(op: ScalarBinaryOp, left: Option<String>, right: Option<String>) 
             _ => Some("TEXT".into()),
         },
         Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Mod => {
+            // Date/time arithmetic has its own result types.
+            let kind = |t: &Option<String>| t.as_deref().and_then(crate::datetime::Kind::of_type);
+            if kind(&left).is_some() || kind(&right).is_some() {
+                return crate::datetime::result_kind(arith_symbol(op), kind(&left), kind(&right))
+                    .map(Into::into);
+            }
             let (left, right) = (left?, right?);
             if let (Some(l), Some(r)) = (integer_rank(&left), integer_rank(&right)) {
                 // Integer arithmetic is in the wider operand's type.
@@ -175,6 +198,17 @@ fn binary_type(op: ScalarBinaryOp, left: Option<String>, right: Option<String>) 
                 None
             }
         }
+    }
+}
+
+/// An arithmetic operator's symbol, as the date/time operators name it.
+fn arith_symbol(op: ScalarBinaryOp) -> &'static str {
+    match op {
+        ScalarBinaryOp::Add => "+",
+        ScalarBinaryOp::Sub => "-",
+        ScalarBinaryOp::Mul => "*",
+        ScalarBinaryOp::Div => "/",
+        _ => "%",
     }
 }
 
@@ -204,6 +238,68 @@ pub(crate) fn check_integer_ranges(
     column: &impl Fn(&str) -> Option<String>,
 ) -> ScalarExpr {
     let checked = expr.map_children(&mut |e| check_integer_ranges(e, column));
+    // Date/time arithmetic takes its operators from its operands' types:
+    // `time + interval` wraps at midnight, `date + interval` is a timestamp.
+    let kind =
+        |e: &ScalarExpr| scalar_type(e, column).and_then(|t| crate::datetime::Kind::of_type(&t));
+    let kind_name = |k: Option<crate::datetime::Kind>| {
+        ScalarExpr::Literal(Value::Text(k.map_or("", |k| k.type_name()).to_string()))
+    };
+    match &checked {
+        ScalarExpr::Binary {
+            op:
+                op @ (ScalarBinaryOp::Add
+                | ScalarBinaryOp::Sub
+                | ScalarBinaryOp::Mul
+                | ScalarBinaryOp::Div),
+            left,
+            right,
+        } if kind(left).is_some() || kind(right).is_some() => {
+            return ScalarExpr::Function {
+                name: DATETIME_OP.to_string(),
+                args: vec![
+                    ScalarExpr::Literal(Value::Text(arith_symbol(*op).to_string())),
+                    (**left).clone(),
+                    (**right).clone(),
+                    kind_name(kind(left)),
+                    kind_name(kind(right)),
+                ],
+            };
+        }
+        ScalarExpr::Unary {
+            op: ScalarUnaryOp::Neg,
+            expr: inner,
+        } if kind(inner) == Some(crate::datetime::Kind::Interval) => {
+            return ScalarExpr::Function {
+                name: DATETIME_OP.to_string(),
+                args: vec![
+                    ScalarExpr::Literal(Value::Text("neg".to_string())),
+                    (**inner).clone(),
+                    ScalarExpr::Literal(Value::Null),
+                    kind_name(kind(inner)),
+                    kind_name(None),
+                ],
+            };
+        }
+        _ => {}
+    }
+    // OVERLAPS reads its arguments by their types: its ends may be times
+    // or intervals.
+    if let ScalarExpr::Function { name, args } = &checked
+        && name == "OVERLAPS"
+        && args.len() == 4
+    {
+        // An unknown type is empty, as a NULL argument would make the
+        // call NULL.
+        let type_name = |e: &ScalarExpr| {
+            ScalarExpr::Literal(Value::Text(scalar_type(e, column).unwrap_or_default()))
+        };
+        let types: Vec<ScalarExpr> = args.iter().map(type_name).collect();
+        return ScalarExpr::Function {
+            name: name.clone(),
+            args: args.iter().cloned().chain(types).collect(),
+        };
+    }
     // `pg_typeof` reports the argument's declared type, which a value alone
     // cannot tell (a `smallint` column holds integers too); an untyped
     // string literal is `unknown`.
@@ -243,6 +339,10 @@ pub(crate) fn check_integer_ranges(
         _ => checked,
     }
 }
+
+/// The function date/time arithmetic is rewritten to:
+/// `__DATETIME__(op, left, right, left_type, right_type)`.
+pub(crate) const DATETIME_OP: &str = "__DATETIME__";
 
 /// The function [`check_integer_ranges`] wraps a result in: its first
 /// argument, or an error when that is outside the type named by the second.

@@ -1,0 +1,152 @@
+# EXTRACT (numeric) and date_part (double precision) of each kind of value.
+query TT
+SELECT extract(year from timestamp '2024-05-06 07:08:09.5'), extract(second from timestamp '2024-05-06 07:08:09.5');
+----
+2024	9.500000
+
+query TTT
+SELECT extract(epoch from timestamptz '2024-01-01 00:00:00+00'), extract(epoch from interval '1 day 2 hours'), extract(epoch from timestamp '2024-01-01 00:00:00.5');
+----
+1704067200.000000	93600.000000	1704067200.500000
+
+query TTTT
+SELECT extract(dow from date '2024-05-05'), extract(isodow from date '2024-05-05'), extract(week from date '2024-12-30'), extract(isoyear from date '2024-12-30');
+----
+0	7	1	2025
+
+query TTT
+SELECT extract(doy from date '2024-12-31'), extract(quarter from date '2024-08-01'), extract(julian from date '2024-01-01');
+----
+366	3	2460311
+
+query TTT
+SELECT extract(century from date '2024-01-01'), extract(millennium from date '2024-01-01'), extract(decade from date '2024-01-01');
+----
+21	3	202
+
+query TTT
+SELECT extract(microseconds from time '10:11:12.345678'), extract(milliseconds from time '10:11:12.345678'), extract(second from time '10:11:12.345678');
+----
+12345678	12345.678	12.345678
+
+query TTT
+SELECT extract(month from interval '14 months'), extract(day from interval '40 days'), extract(hour from interval '30 hours');
+----
+2	40	30
+
+query TTT
+SELECT extract(epoch from interval '1 month'), extract(epoch from interval '1 year'), extract(timezone from timestamptz '2024-01-01 00:00+00');
+----
+2592000.000000	31557600.000000	0
+
+query TTTT
+SELECT extract(years from date '2024-01-01'), extract(mon from date '2024-01-01'), extract(qtr from date '2024-05-01'), extract(msec from time '10:00:01.5');
+----
+2024	1	2	1500.000
+
+query TTT
+SELECT extract(epoch from date 'infinity'), extract(year from timestamp '-infinity'), extract(month from date 'infinity');
+----
+Infinity	-Infinity	NULL
+
+query TTT
+SELECT date_part('hour', timestamp '2024-01-01 13:14:15'), date_part('month', interval '14 months'), date_part('epoch', date '2024-01-01');
+----
+13	2	1704067200
+
+query TT
+SELECT pg_typeof(extract(year from now())), pg_typeof(date_part('year', now()));
+----
+numeric	double precision
+
+statement error
+SELECT extract(foo from date '2024-01-01');
+
+statement error
+SELECT extract(hour from date '2024-01-01');
+
+statement error
+SELECT extract(dow from interval '1 day');
+
+# date_trunc, also in a named zone.
+query TTT
+SELECT date_trunc('month', timestamp '2024-05-17 10:11:12'), date_trunc('week', timestamp '2024-05-17 10:11:12'), date_trunc('quarter', date '2024-05-17');
+----
+2024-05-01 00:00:00	2024-05-13 00:00:00	2024-04-01 00:00:00+00
+
+query TTT
+SELECT date_trunc('hour', interval '1 day 5 hours 30 minutes'), date_trunc('months', timestamp '2024-02-03'), date_trunc('y', date '2024-02-03');
+----
+1 day 05:00:00	2024-02-01 00:00:00	2024-01-01 00:00:00+00
+
+query TT
+SELECT pg_typeof(date_trunc('day', date '2024-01-01')), pg_typeof(date_trunc('day', timestamp '2024-01-01'));
+----
+timestamp with time zone	timestamp without time zone
+
+statement error
+SELECT date_trunc('foo', timestamp '2024-01-01');
+
+statement error
+SELECT date_trunc('week', interval '10 days');
+
+# age, date_bin, isfinite, OVERLAPS, and the make_* constructors.
+query TTT
+SELECT age(timestamp '2024-05-17', timestamp '2023-01-31'), age(date '2024-03-01', date '2024-01-31'), age(timestamp '2024-01-01', timestamp '2024-01-01 10:00');
+----
+1 year 3 mons 17 days	1 mon 1 day	-10:00:00
+
+query TT
+SELECT date_bin('15 minutes', timestamp '2024-01-01 10:37:00', timestamp '2024-01-01 00:00'), date_bin('1 day', timestamptz '2024-01-01 10:00+00', timestamptz '2000-01-01 06:00+00');
+----
+2024-01-01 10:30:00	2024-01-01 06:00:00+00
+
+query TTT
+SELECT isfinite(date 'infinity'), isfinite(timestamp '2024-01-01'), isfinite(interval '1 day');
+----
+f	t	t
+
+query TT
+SELECT date 'infinity' > date '2024-01-01', timestamp '-infinity' < timestamp '1900-01-01';
+----
+t	t
+
+query TT
+SELECT (date '2024-01-01', date '2024-02-01') OVERLAPS (date '2024-01-15', date '2024-03-01'), (date '2024-01-01', interval '1 day') OVERLAPS (date '2024-01-02', date '2024-01-03');
+----
+t	f
+
+query TT
+SELECT (time '10:00', time '11:00') OVERLAPS (time '11:00', time '12:00'), (timestamp '2024-01-01', timestamp '2024-01-01') OVERLAPS (timestamp '2024-01-01', timestamp '2024-01-02');
+----
+f	t
+
+statement error
+SELECT make_date(2024, 2, 30);
+
+statement error
+SELECT make_time(25, 0, 0);
+
+# generate_series over dates and timestamps.
+query T
+SELECT generate_series(timestamp '2024-01-01', timestamp '2024-01-02', interval '8 hours');
+----
+2024-01-01 00:00:00
+2024-01-01 08:00:00
+2024-01-01 16:00:00
+2024-01-02 00:00:00
+
+query T
+SELECT * FROM generate_series(date '2024-01-30', date '2024-04-30', interval '1 month');
+----
+2024-01-30 00:00:00+00
+2024-02-29 00:00:00+00
+2024-03-29 00:00:00+00
+2024-04-29 00:00:00+00
+
+query T
+SELECT generate_series(date '2024-01-01', date '2024-01-03', interval '1 day')::date;
+----
+2024-01-01
+2024-01-02
+2024-01-03

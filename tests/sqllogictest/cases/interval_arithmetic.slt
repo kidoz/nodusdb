@@ -1,0 +1,193 @@
+# Interval input forms, output, and arithmetic with dates, times, and timestamps.
+query TTTT
+SELECT interval '1 day 02:00:00', interval '-1 days +02:00:00', interval '1.5 hours', interval '2 weeks';
+----
+1 day 02:00:00	-1 days +02:00:00	01:30:00	14 days
+
+query TTTTT
+SELECT interval 'P1Y2M3DT4H5M6S', interval '1-2', interval '-1-2', interval '3 4:05:06', interval '1 2:03';
+----
+1 year 2 mons 3 days 04:05:06	1 year 2 mons	-1 years -2 mons	3 days 04:05:06	1 day 02:03:00
+
+query TTTT
+SELECT interval '@ 1 hour ago', interval '1.5 years', interval '1.5 months', interval '1.5 days';
+----
+-01:00:00	1 year 6 mons	1 mon 15 days	1 day 12:00:00
+
+query TTT
+SELECT interval '90 minutes', interval '100000 seconds', interval '1 year -1 mon';
+----
+01:30:00	27:46:40	11 mons
+
+statement error
+SELECT 'nope'::interval;
+
+query TTT
+SELECT interval '1 day' + interval '3 hours', interval '1 month' - interval '1 day', -interval '1 year 2 mons';
+----
+1 day 03:00:00	1 mon -1 days	-1 years -2 mons
+
+query TTTT
+SELECT interval '2 hours' * 3, 2 * interval '90 minutes', interval '1 day' / 4, interval '1 hour' / 7;
+----
+06:00:00	03:00:00	06:00:00	00:08:34.285714
+
+query TTTT
+SELECT interval '10 days' / 3, interval '1 year' * 0.3, interval '1 mon' / 7, interval '1 day' * 1.5;
+----
+3 days 08:00:00	3 mons 18 days	4 days 06:51:25.6896	1 day 12:00:00
+
+statement error
+SELECT interval '1 day' / 0;
+
+statement error
+SELECT interval '1 day' + 1;
+
+query TTT
+SELECT date '2024-01-31' + interval '1 month', date '2024-02-29' + interval '1 year', date '2024-01-31' + interval '1 month' * 2;
+----
+2024-02-29 00:00:00	2025-02-28 00:00:00	2024-03-31 00:00:00
+
+query TTTT
+SELECT date '2024-03-01' - date '2024-02-01', date '2024-03-01' - 5, date '2024-03-01' + 5, date '2024-01-01' + time '10:30';
+----
+29	2024-02-25	2024-03-06	2024-01-01 10:30:00
+
+query TT
+SELECT timestamp '2024-03-10 12:00' - timestamp '2024-03-01 06:30', timestamp '2024-01-01 10:00' + interval '1 day 2 hours';
+----
+9 days 05:30:00	2024-01-02 12:00:00
+
+query TT
+SELECT timestamptz '2024-03-10 12:00+02' - interval '1 hour', timestamp '2024-01-01 00:00' + interval '0.5 days';
+----
+2024-03-10 09:00:00+00	2024-01-01 12:00:00
+
+query TTT
+SELECT time '10:00' + interval '3 hours', time '23:00' + interval '3 hours', time '10:00' - time '08:30';
+----
+13:00:00	02:00:00	01:30:00
+
+statement error
+SELECT date '2024-01-01' + date '2024-01-01';
+
+statement error
+SELECT timestamp '2024-01-01' + timestamp '2024-01-01';
+
+statement error
+SELECT time '10:00' + time '10:00';
+
+query TTT
+SELECT interval '1 day' = interval '24 hours', interval '1 month' = interval '30 days', interval '1 month' > interval '29 days';
+----
+t	t	t
+
+query TTT
+SELECT pg_typeof(date '2024-01-01' + 1), pg_typeof(date '2024-01-01' - date '2024-01-01'), pg_typeof(date '2024-01-01' + interval '1 day');
+----
+date	integer	timestamp without time zone
+
+query TTT
+SELECT pg_typeof(timestamptz '2024-01-01' - timestamptz '2023-01-01'), pg_typeof(time '10:00' + interval '1 hour'), pg_typeof(interval '1 day' * 2);
+----
+interval	time without time zone	interval
+
+query TTT
+SELECT justify_days(interval '65 days'), justify_hours(interval '50 hours'), justify_interval(interval '1 mon -1 hour');
+----
+2 mons 5 days	2 days 02:00:00	29 days 23:00:00
+
+query TT
+SELECT justify_interval(interval '-1 mon 40 days'), justify_days(interval '-35 days');
+----
+10 days	-1 mons -5 days
+
+query TTT
+SELECT make_interval(years => 1, months => 2, days => 3, hours => 4, mins => 5, secs => 6.5), make_interval(weeks => 2), make_interval(0, 0, 0, 0, 0, 0, 1.5);
+----
+1 year 2 mons 3 days 04:05:06.5	14 days	00:00:01.5
+
+# Interval columns store the canonical form, and order, group, and aggregate by length.
+statement ok
+CREATE TABLE iv10 (id int, iv interval);
+
+statement ok
+INSERT INTO iv10 VALUES (1, '1 day'), (2, '24 hours'), (3, '25 hours'), (4, '2 days'), (5, '10 days'), (6, '-3 hours'), (7, NULL);
+
+query TT
+SELECT id, iv FROM iv10 ORDER BY iv, id;
+----
+6	-03:00:00
+1	1 day
+2	24:00:00
+3	25:00:00
+4	2 days
+5	10 days
+7	NULL
+
+query TT
+SELECT id, iv FROM iv10 ORDER BY iv DESC NULLS LAST, id;
+----
+5	10 days
+4	2 days
+3	25:00:00
+1	1 day
+2	24:00:00
+6	-03:00:00
+7	NULL
+
+query TT
+SELECT iv, count(*) FROM iv10 GROUP BY iv ORDER BY iv;
+----
+-03:00:00	1
+1 day	2
+25:00:00	1
+2 days	1
+10 days	1
+NULL	1
+
+query T
+SELECT DISTINCT iv FROM iv10 WHERE id <> 1 ORDER BY iv;
+----
+-03:00:00
+24:00:00
+25:00:00
+2 days
+10 days
+NULL
+
+query TTTT
+SELECT min(iv), max(iv), sum(iv), avg(iv) FROM iv10;
+----
+-03:00:00	10 days	13 days 46:00:00	2 days 11:40:00
+
+query T
+SELECT id FROM iv10 WHERE iv > interval '1 day' ORDER BY id;
+----
+3
+4
+5
+
+query T
+SELECT id FROM iv10 WHERE iv = '1 day' ORDER BY id;
+----
+1
+2
+
+statement ok
+UPDATE iv10 SET iv = iv * 2 WHERE id = 3;
+
+query T
+SELECT iv FROM iv10 WHERE id = 3;
+----
+50:00:00
+
+query TTTT
+SELECT min(x), max(x), sum(x), avg(x) FROM (VALUES (interval '1 day'), (interval '-3 hours'), (interval '25 hours')) t(x);
+----
+-03:00:00	25:00:00	1 day 22:00:00	15:20:00
+
+query T
+SELECT pg_typeof(x) FROM (VALUES (interval '1 day')) t(x);
+----
+interval
