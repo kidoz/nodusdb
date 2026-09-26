@@ -71,6 +71,7 @@ impl MemExecutor {
         self.restore_settings(ctx, txn.local_settings.clone());
         let commit_ts = self.commit_or_release(txn.txn_id)?;
         self.kv.commit(txn.txn_id, commit_ts)?;
+        self.after_commit(ctx);
         Ok(QueryOutput::tag("COMMIT"))
     }
 

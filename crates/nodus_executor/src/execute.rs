@@ -42,15 +42,23 @@ impl MemExecutor {
                 if_not_exists,
                 unique_constraints,
                 key_names,
-            } => self.exec_create_table(
-                ctx,
-                name,
-                columns,
-                constraints,
-                if_not_exists,
-                (unique_constraints, key_names),
-                None,
-            ),
+                on_commit,
+            } => {
+                let out = self.exec_create_table(
+                    ctx,
+                    name.clone(),
+                    columns,
+                    constraints,
+                    if_not_exists,
+                    (unique_constraints, key_names),
+                    None,
+                )?;
+                if let Some(action) = on_commit {
+                    self.note_on_commit(ctx, name, action);
+                }
+                Ok(out)
+            }
+            LogicalPlan::Discard { what } => self.exec_discard(ctx, what),
             LogicalPlan::CreateView {
                 name,
                 query,

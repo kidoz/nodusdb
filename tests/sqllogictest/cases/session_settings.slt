@@ -181,3 +181,50 @@ query T
 SHOW statement_timeout;
 ----
 0
+
+# search_path finds unqualified names.
+statement ok
+CREATE SCHEMA ss_a;
+
+statement ok
+CREATE TABLE ss_a.st (a int);
+
+statement ok
+INSERT INTO ss_a.st VALUES (5);
+
+statement ok
+SET search_path = ss_a, public;
+
+statement ok
+INSERT INTO st VALUES (6);
+
+query T
+SELECT a FROM st ORDER BY a;
+----
+5
+6
+
+query TT
+SELECT current_schema(), current_schemas(false);
+----
+ss_a	{ss_a,public}
+
+statement ok
+SET search_path TO nosuch, public;
+
+query TT
+SELECT current_schemas(false), current_schema();
+----
+{public}	public
+
+statement error
+SELECT a FROM st;
+
+query T
+SELECT a FROM ss_a.st ORDER BY a;
+----
+5
+6
+
+statement ok
+RESET search_path;

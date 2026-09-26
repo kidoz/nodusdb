@@ -101,9 +101,16 @@ impl MemExecutor {
         let primary_name =
             key_name(&primary_columns).unwrap_or_else(|| format!("{}_pkey", table_name_of(&name)));
         let (db_name, schema_name, table_only) = parse_object_name(&name)?;
+        // A temporary relation's schema is made for the session on first use.
+        let temp = crate::search_path::is_temp_schema(schema_name);
+        if temp {
+            self.ensure_temp_schema(ctx)?;
+        }
         let db = self.catalog_reader.get_database(db_name)?;
         let sch = self.catalog_reader.get_schema(db_name, schema_name)?;
-        self.authorize(ctx, Action::CreateTable, ResourceRef::Schema(sch.id))?;
+        if !temp {
+            self.authorize(ctx, Action::CreateTable, ResourceRef::Schema(sch.id))?;
+        }
 
         // Reject a duplicate name cleanly (creating over an existing table
         // otherwise leaves the catalog inconsistent), honoring IF NOT EXISTS.
@@ -300,6 +307,11 @@ impl MemExecutor {
     ) -> Result<QueryOutput> {
         let state = crate::sequences::SequenceState::new(&spec)?;
         let (db_name, schema_name, table_only) = parse_object_name(&name)?;
+        // A temporary relation's schema is made for the session on first use.
+        let temp = crate::search_path::is_temp_schema(schema_name);
+        if temp {
+            self.ensure_temp_schema(ctx)?;
+        }
         if self
             .catalog_reader
             .get_table(db_name, schema_name, table_only)
@@ -438,6 +450,11 @@ impl MemExecutor {
         (with_data, materialized): (bool, bool),
     ) -> Result<QueryOutput> {
         let (db_name, schema_name, table_only) = parse_object_name(&name)?;
+        // A temporary relation's schema is made for the session on first use.
+        let temp = crate::search_path::is_temp_schema(schema_name);
+        if temp {
+            self.ensure_temp_schema(ctx)?;
+        }
         let command = if materialized {
             "CREATE MATERIALIZED VIEW"
         } else {
@@ -591,9 +608,16 @@ impl MemExecutor {
         or_replace: bool,
     ) -> Result<QueryOutput> {
         let (db_name, schema_name, view_only) = parse_object_name(&name)?;
+        // A temporary relation's schema is made for the session on first use.
+        let temp = crate::search_path::is_temp_schema(schema_name);
+        if temp {
+            self.ensure_temp_schema(ctx)?;
+        }
         let db = self.catalog_reader.get_database(db_name)?;
         let sch = self.catalog_reader.get_schema(db_name, schema_name)?;
-        self.authorize(ctx, Action::CreateTable, ResourceRef::Schema(sch.id))?;
+        if !temp {
+            self.authorize(ctx, Action::CreateTable, ResourceRef::Schema(sch.id))?;
+        }
         let existing = self
             .catalog_reader
             .get_table(db_name, schema_name, view_only)

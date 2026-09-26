@@ -1246,12 +1246,17 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
             }
         }
         "CURRENT_DATABASE" | "CURRENT_CATALOG" if arity(0) => Value::Text("default".to_string()),
-        "CURRENT_SCHEMA" if arity(0) => search_path()
+        // The schemas of the search path that exist; the temporary one and
+        // `pg_catalog` are implicit.
+        "CURRENT_SCHEMA" if arity(0) => crate::search_path::existing_search_path()
             .into_iter()
-            .next()
+            .find(|s| !crate::search_path::is_temp_schema(s) && s != "pg_catalog")
             .map_or(Value::Null, Value::Text),
         "CURRENT_SCHEMAS" if arity(1) => {
-            let mut schemas = search_path();
+            let mut schemas: Vec<String> = crate::search_path::existing_search_path()
+                .into_iter()
+                .filter(|s| !crate::search_path::is_temp_schema(s) && s != "pg_catalog")
+                .collect();
             if matches!(arg(0), Value::Bool(true)) {
                 schemas.insert(0, "pg_catalog".to_string());
             }
@@ -2015,15 +2020,6 @@ fn format_type(oid: i64, typmod: Option<i64>) -> String {
         _ => "???",
     };
     base.to_string()
-}
-
-fn search_path() -> Vec<String> {
-    session_env::setting("search_path")
-        .unwrap_or_default()
-        .split(',')
-        .map(|s| s.trim().trim_matches('"').to_string())
-        .filter(|s| !s.is_empty() && s != "$user")
-        .collect()
 }
 
 fn flatten(items: Vec<Value>, out: &mut Vec<Value>) {

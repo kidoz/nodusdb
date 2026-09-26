@@ -899,6 +899,9 @@ pub enum LogicalPlan {
         /// their columns; the others get PostgreSQL's names.
         #[serde(default)]
         key_names: Vec<(Vec<String>, String)>,
+        /// A temporary table's `ON COMMIT` action: `DROP` or `DELETE ROWS`.
+        #[serde(default)]
+        on_commit: Option<String>,
     },
     /// `DROP TABLE names` or, with `materialized`, `DROP MATERIALIZED
     /// VIEW names`; with `cascade`, the objects depending on them go too.
@@ -1129,6 +1132,10 @@ pub enum LogicalPlan {
     },
     Noop {
         tag: String,
+    },
+    /// `DISCARD ALL | PLANS | SEQUENCES | TEMP`.
+    Discard {
+        what: String,
     },
     SelectLiteral {
         /// `(column alias, value, optional SQL type hint)`. The hint (from a

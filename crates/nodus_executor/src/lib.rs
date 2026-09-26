@@ -39,6 +39,7 @@ mod plan_types;
 mod planner;
 mod referential;
 mod result_types;
+mod search_path;
 mod select;
 mod sequences;
 mod session_env;
@@ -48,6 +49,7 @@ mod streaming;
 mod subqueries;
 mod system_views;
 mod table_functions;
+mod temp_tables;
 mod timezone;
 mod transactions;
 mod value;
@@ -349,6 +351,8 @@ pub struct MemExecutor {
     /// Per session, reported settings changed and not yet taken by the wire
     /// layer.
     pub(crate) parameter_changes: parking_lot::Mutex<HashMap<String, Vec<(String, String)>>>,
+    /// Per session, its temporary relations. See [`crate::temp_tables`].
+    pub(crate) temp_relations: parking_lot::Mutex<HashMap<String, temp_tables::TempRelations>>,
 }
 
 impl MemExecutor {
@@ -380,6 +384,7 @@ impl MemExecutor {
             notices: parking_lot::Mutex::new(HashMap::new()),
             session_resets: parking_lot::RwLock::new(HashMap::new()),
             parameter_changes: parking_lot::Mutex::new(HashMap::new()),
+            temp_relations: parking_lot::Mutex::new(HashMap::new()),
         }
     }
 
@@ -519,12 +524,7 @@ impl MemExecutor {
             .read()
             .get(&ctx.session_id)
             .map_or(statement_micros, |txn| txn.read_ts as i64);
-        let backend_pid = ctx
-            .session_id
-            .bytes()
-            .fold(17_i64, |h, b| (h * 31 + i64::from(b)) % 2_000_000_000)
-            .abs()
-            + 1;
+        let backend_pid = temp_tables::backend_pid(&ctx.session_id);
         session_env::SessionEnv {
             user: self
                 .catalog_reader
@@ -979,10 +979,11 @@ impl MemExecutor {
         let _env = session_env::install(self.session_env(ctx));
         eval_error::reset();
 
-        // A read-only transaction refuses statements that write; any other
-        // statement fixes the transaction's isolation level and access mode.
+        // A read-only transaction refuses statements that write (but for
+        // temporary relations); any other statement fixes the transaction's
+        // isolation level and access mode.
         let read_only_error = {
-            let write = write_command(&plan);
+            let write = write_command(&plan).filter(|_| !Self::writes_temp_relation(&plan));
             let mut guard = self.active_txns.write();
             match guard.get_mut(&ctx.session_id) {
                 Some(txn) if txn.read_only && write.is_some() => write,
@@ -1043,6 +1044,7 @@ impl MemExecutor {
                     if !is_read_only {
                         self.kv.commit(txn_id, commit_ts)?;
                     }
+                    self.after_commit(ctx);
                 }
                 Err(_) => {
                     let _ = self.txn.abort_txn(txn_id);
@@ -1120,17 +1122,19 @@ impl Executor for MemExecutor {
     }
 
     fn end_session(&self, session_id: &str) {
-        self.session_vars.write().remove(session_id);
-        self.session_resets.write().remove(session_id);
-        self.parameter_changes.lock().remove(session_id);
-        self.notices.lock().remove(session_id);
-        self.sequences.end_session(session_id);
         if let Some(txn) = self.active_txns.write().remove(session_id) {
             // A client that drops mid-transaction must not leave the write intent
             // dangling; abort so the row locks/intents are released.
             let _ = self.txn.abort_txn(txn.txn_id);
             let _ = self.kv.abort(txn.txn_id);
         }
+        // Its temporary relations go with it.
+        self.drop_temp_relations(session_id);
+        self.session_vars.write().remove(session_id);
+        self.session_resets.write().remove(session_id);
+        self.parameter_changes.lock().remove(session_id);
+        self.notices.lock().remove(session_id);
+        self.sequences.end_session(session_id);
     }
 }
 
@@ -1176,6 +1180,7 @@ fn is_session_statement(plan: &LogicalPlan) -> bool {
             | LogicalPlan::ResetVariable { .. }
             | LogicalPlan::SetTransaction { .. }
             | LogicalPlan::Noop { .. }
+            | LogicalPlan::Discard { .. }
     )
 }
 

@@ -1,0 +1,136 @@
+# Temporary tables belong to the session: found first, shadowing permanent ones, and emptied or dropped on commit.
+statement ok
+CREATE TABLE tt (id int PRIMARY KEY, v text);
+
+statement ok
+INSERT INTO tt VALUES (1, 'permanent');
+
+statement ok
+CREATE TEMP TABLE tt (id int);
+
+statement ok
+INSERT INTO tt VALUES (99);
+
+query T
+SELECT * FROM tt;
+----
+99
+
+query TT
+SELECT * FROM public.tt;
+----
+1	permanent
+
+query T
+SELECT * FROM pg_temp.tt;
+----
+99
+
+statement ok
+CREATE TEMPORARY TABLE tt2 (a int);
+
+query T
+SELECT n.nspname LIKE 'pg_temp%' FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relname = 'tt2';
+----
+t
+
+statement ok
+CREATE TEMP TABLE tt_rows (a int) ON COMMIT DELETE ROWS;
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO tt_rows VALUES (1);
+
+query T
+SELECT count(*) FROM tt_rows;
+----
+1
+
+statement ok
+COMMIT;
+
+query T
+SELECT count(*) FROM tt_rows;
+----
+0
+
+statement ok
+BEGIN;
+
+statement ok
+CREATE TEMP TABLE tt_drop (a int) ON COMMIT DROP;
+
+statement ok
+INSERT INTO tt_drop VALUES (1);
+
+query T
+SELECT count(*) FROM tt_drop;
+----
+1
+
+statement ok
+COMMIT;
+
+statement error
+SELECT * FROM tt_drop;
+
+statement ok
+CREATE TEMP VIEW tt_view AS SELECT 1 AS a;
+
+query T
+SELECT * FROM tt_view;
+----
+1
+
+statement ok
+CREATE TEMP SEQUENCE tt_seq;
+
+query TT
+SELECT nextval('tt_seq'), nextval('tt_seq');
+----
+1	2
+
+statement ok
+CREATE TEMP TABLE tt_ser (id serial, v text);
+
+statement ok
+INSERT INTO tt_ser (v) VALUES ('a'), ('b');
+
+query TT
+SELECT id, v FROM tt_ser ORDER BY id;
+----
+1	a
+2	b
+
+statement error
+CREATE TEMP TABLE public.tt3 (a int);
+
+statement ok
+BEGIN READ ONLY;
+
+statement ok
+INSERT INTO tt2 VALUES (7);
+
+query T
+SELECT a FROM tt2;
+----
+7
+
+statement error
+INSERT INTO public.tt VALUES (2, 'x');
+
+statement ok
+ROLLBACK;
+
+statement ok
+DISCARD TEMP;
+
+query TT
+SELECT * FROM tt;
+----
+1	permanent
+
+statement error
+SELECT * FROM tt2;

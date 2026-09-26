@@ -26,15 +26,23 @@ pub(crate) fn target_table(
 pub fn parse_object_name(name: &str) -> Result<(&str, &str, &str)> {
     let parts: Vec<&str> = name.split('.').collect();
     match parts.len() {
-        1 => Ok(("default", "public", parts[0].trim_matches('"'))),
+        // An unqualified name is found along the session's search path.
+        1 => {
+            let relation = parts[0].trim_matches('"');
+            Ok((
+                "default",
+                crate::search_path::schema_for(relation),
+                relation,
+            ))
+        }
         2 => Ok((
             "default",
-            parts[0].trim_matches('"'),
+            crate::search_path::schema_named(parts[0].trim_matches('"')),
             parts[1].trim_matches('"'),
         )),
         3 => Ok((
             parts[0].trim_matches('"'),
-            parts[1].trim_matches('"'),
+            crate::search_path::schema_named(parts[1].trim_matches('"')),
             parts[2].trim_matches('"'),
         )),
         _ => anyhow::bail!("Invalid object name: {}", name),

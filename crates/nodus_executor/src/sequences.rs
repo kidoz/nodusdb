@@ -305,9 +305,9 @@ impl SequenceStore {
             })
             .collect();
         let (schema, table) = match parts.as_slice() {
-            [table] => ("public", table.as_str()),
-            [schema, table] => (schema.as_str(), table.as_str()),
-            [_, schema, table] => (schema.as_str(), table.as_str()),
+            [table] => (crate::search_path::schema_for(table), table.as_str()),
+            [schema, table] => (crate::search_path::schema_named(schema), table.as_str()),
+            [_, schema, table] => (crate::search_path::schema_named(schema), table.as_str()),
             _ => bail!("improper relation name (too many dotted names): {name}"),
         };
         let tbl = self
@@ -324,15 +324,20 @@ impl SequenceStore {
     /// identity column draws from, schema-qualified; `None` for a column
     /// without one.
     pub(crate) fn owned_sequence(&self, table: &str, column: &str) -> Result<Option<String>> {
-        let (schema, name) = match table.split_once('.') {
-            Some((schema, name)) => (schema.to_string(), name.to_string()),
-            None => ("public".to_string(), table.to_string()),
-        };
         let fold = |s: &str| match s.strip_prefix('"').and_then(|p| p.strip_suffix('"')) {
             Some(quoted) => quoted.to_string(),
             None => s.to_ascii_lowercase(),
         };
-        let (schema, name) = (fold(&schema), fold(&name));
+        let (schema, name) = match table.split_once('.') {
+            Some((schema, name)) => (
+                crate::search_path::schema_named(&fold(schema)).to_string(),
+                fold(name),
+            ),
+            None => {
+                let name = fold(table);
+                (crate::search_path::schema_for(&name).to_string(), name)
+            }
+        };
         let tbl = self
             .catalog
             .get_table("default", &schema, &name)

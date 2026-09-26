@@ -41,7 +41,7 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                 anyhow::bail!("CREATE TABLE AS with a column list is not supported");
             }
             Ok(LogicalPlan::CreateTableAs {
-                name: create_table.name.to_string(),
+                name: temp_relation_name(&create_table.name, create_table.temporary)?,
                 query: Box::new(plan_query(query, params)?),
                 if_not_exists: create_table.if_not_exists,
                 no_data: has_no_data_marker(&create_table.table_options),
@@ -55,25 +55,19 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
             data_type,
             sequence_options,
             ..
-        } => {
-            if *temporary {
-                anyhow::bail!("temporary sequences are not supported");
-            }
-            Ok(LogicalPlan::CreateSequence {
-                name: name.to_string(),
-                if_not_exists: *if_not_exists,
-                spec: sequence_spec(
-                    data_type.as_ref().map(|t| t.to_string()),
-                    sequence_options,
-                    params,
-                )?,
-            })
-        }
+        } => Ok(LogicalPlan::CreateSequence {
+            name: temp_relation_name(name, *temporary)?,
+            if_not_exists: *if_not_exists,
+            spec: sequence_spec(
+                data_type.as_ref().map(|t| t.to_string()),
+                sequence_options,
+                params,
+            )?,
+        }),
         Statement::CreateTable(create_table) => {
-            let name = &create_table.name;
             let columns = &create_table.columns;
             let constraints = &create_table.constraints;
-            let table_name = name.to_string();
+            let table_name = temp_relation_name(&create_table.name, create_table.temporary)?;
             let mut cols = Vec::new();
             let mut tbl_constraints = Vec::new();
             // The names given to key constraints, by their columns.
@@ -312,6 +306,11 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                 if_not_exists: create_table.if_not_exists,
                 unique_constraints,
                 key_names,
+                on_commit: match create_table.on_commit {
+                    Some(sqlparser::ast::OnCommit::Drop) => Some("DROP".to_string()),
+                    Some(sqlparser::ast::OnCommit::DeleteRows) => Some("DELETE ROWS".to_string()),
+                    _ => None,
+                },
             })
         }
         Statement::CreateView(create_view) => {
@@ -337,7 +336,7 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                 });
             }
             Ok(LogicalPlan::CreateView {
-                name: create_view.name.to_string(),
+                name: temp_relation_name(&create_view.name, create_view.temporary)?,
                 query: Box::new(query),
                 or_replace: create_view.or_replace,
             })
@@ -910,8 +909,8 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
             }),
             other => anyhow::bail!("{} is not supported", leading_keywords(&other.to_string())),
         },
-        Statement::Discard { .. } => Ok(LogicalPlan::Noop {
-            tag: "DISCARD ALL".to_string(),
+        Statement::Discard { object_type } => Ok(LogicalPlan::Discard {
+            what: object_type.to_string().to_ascii_uppercase(),
         }),
         Statement::Deallocate { .. } => Ok(LogicalPlan::Noop {
             tag: "DEALLOCATE".to_string(),
@@ -1170,6 +1169,20 @@ fn sequence_change(options: &str, params: &[Value]) -> Result<crate::sequences::
         }
     }
     Ok(change)
+}
+
+/// A relation's name as created: a temporary one lives in the session's
+/// temporary schema (`pg_temp`), which is the only schema it may name.
+fn temp_relation_name(name: &sqlparser::ast::ObjectName, temporary: bool) -> Result<String> {
+    let text = name.to_string();
+    if !temporary {
+        return Ok(text);
+    }
+    match text.rsplit_once('.') {
+        None => Ok(format!("pg_temp.{text}")),
+        Some((schema, _)) if schema.trim_matches('"').eq_ignore_ascii_case("pg_temp") => Ok(text),
+        Some(_) => anyhow::bail!("cannot create temporary relation in non-temporary schema"),
+    }
 }
 
 /// A transaction's access mode (`true` for `READ ONLY`) and isolation level

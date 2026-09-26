@@ -1,5 +1,5 @@
 //! Session state across statements and between sessions: transaction
-//! modes, settings, and the time zone, driven through SQL.
+//! modes, settings, temporary tables, and the time zone, driven through SQL.
 
 use super::*;
 use crate::dml_join_tests::rows;
@@ -39,14 +39,34 @@ fn sessions() -> (Arc<MemExecutor>, impl Fn(&str, &str) -> Result<QueryOutput>) 
 }
 
 #[test]
+fn temporary_tables_belong_to_their_session() {
+    let (exec, sql) = sessions();
+    sql("a", "CREATE TABLE t (id INT)").unwrap();
+    sql("a", "INSERT INTO t VALUES (1)").unwrap();
+    sql("a", "CREATE TEMP TABLE t (id INT)").unwrap();
+    sql("a", "INSERT INTO t VALUES (2)").unwrap();
+    // Session a's temporary table shadows the permanent one only for it.
+    assert_eq!(rows(&sql("a", "SELECT id FROM t").unwrap()), vec!["2"]);
+    assert_eq!(rows(&sql("b", "SELECT id FROM t").unwrap()), vec!["1"]);
+    sql("b", "CREATE TEMP TABLE t (id INT)").unwrap();
+    assert!(rows(&sql("b", "SELECT id FROM t").unwrap()).is_empty());
+    // Its temporary tables go when it ends.
+    exec.end_session("a");
+    assert_eq!(rows(&sql("a", "SELECT id FROM t").unwrap()), vec!["1"]);
+}
+
+#[test]
 fn read_only_transactions_refuse_writes() {
     let (_, sql) = sessions();
     sql("a", "CREATE TABLE t (id INT)").unwrap();
+    sql("a", "CREATE TEMP TABLE scratch (id INT)").unwrap();
     sql("a", "BEGIN READ ONLY").unwrap();
     let err = sql("a", "INSERT INTO t VALUES (1)")
         .unwrap_err()
         .to_string();
     assert_eq!(err, "cannot execute INSERT in a read-only transaction");
+    // Temporary tables may still be written.
+    sql("a", "INSERT INTO scratch VALUES (1)").unwrap();
     sql("a", "ROLLBACK").unwrap();
     sql("a", "SET default_transaction_read_only = on").unwrap();
     assert!(sql("a", "DELETE FROM t").is_err());

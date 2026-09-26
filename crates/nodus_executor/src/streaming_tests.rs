@@ -158,6 +158,7 @@ fn exec_with_rows(
     exec.execute_logical(
         &ctx,
         LogicalPlan::CreateTable {
+            on_commit: None,
             unique_constraints: vec![],
             key_names: vec![],
             if_not_exists: false,

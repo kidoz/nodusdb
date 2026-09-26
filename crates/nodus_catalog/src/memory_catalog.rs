@@ -276,7 +276,7 @@ impl CatalogReader for MemoryCatalog {
             // (e.g. IDE introspection) routinely look up tables that don't exist —
             // so this is debug-level, not an error.
             tracing::debug!(database, schema, table, "get_table: not found");
-            anyhow::bail!("Table {} not found", table)
+            anyhow::bail!("relation \"{}\" does not exist", table)
         }
     }
 
