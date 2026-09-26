@@ -662,6 +662,9 @@ impl MemExecutor {
                 }
             }
             AlterTableOp::RenameColumn { old_name, new_name } => {
+                if !tbl.columns.iter().any(|c| c.name == old_name) {
+                    anyhow::bail!("column \"{old_name}\" does not exist");
+                }
                 nodus_catalog::TableDescriptorChange::RenameColumn {
                     table_id: tbl.id,
                     old_name,

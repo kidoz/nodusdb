@@ -1,5 +1,5 @@
-//! Set-returning functions in select lists, RETURNING expressions, and JSON
-//! layouts and whole-row references, driven through SQL.
+//! Set-returning functions in select lists, RETURNING expressions, JSON layouts
+//! and whole-row references, and column renames, driven through SQL.
 
 use super::*;
 use crate::dml_join_tests::{rows, session};
@@ -109,4 +109,14 @@ fn a_relation_name_stands_for_its_row() {
     let out = sql("SELECT * FROM json_array_elements('[1, {\"a\" :  2}]')").unwrap();
     assert_eq!(out.columns, ["value"]);
     assert_eq!(rows(&out), ["1", "{\"a\" :  2}"]);
+}
+
+#[test]
+fn renaming_a_missing_column_keeps_the_table() {
+    let sql = session();
+    sql("CREATE TABLE t (id INT PRIMARY KEY, n INT)").unwrap();
+    sql("INSERT INTO t VALUES (1, 2)").unwrap();
+    let err = sql("ALTER TABLE t RENAME COLUMN nope TO m").unwrap_err();
+    assert_eq!(err.to_string(), "column \"nope\" does not exist");
+    assert_eq!(rows(&sql("SELECT n FROM t").unwrap()), ["2"]);
 }

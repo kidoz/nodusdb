@@ -623,7 +623,8 @@ impl CatalogWriter for MemoryCatalog {
         }
 
         let key = target_key.ok_or_else(|| anyhow::anyhow!("Table not found"))?;
-        let mut table = guard.remove(&key).unwrap();
+        // Changed on a copy, so a change that fails leaves the table as it was.
+        let mut table = guard[&key].clone();
 
         table.version += 1;
         table.updated_at = Utc::now();
@@ -671,6 +672,7 @@ impl CatalogWriter for MemoryCatalog {
         }
 
         let out = table.clone();
+        guard.remove(&key);
         guard.insert(new_key, table);
         drop(guard);
         self.persist();
