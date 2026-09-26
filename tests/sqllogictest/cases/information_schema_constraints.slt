@@ -1,0 +1,76 @@
+# information_schema describes columns' types and the constraints of tables.
+statement ok
+CREATE TABLE is9p (id integer PRIMARY KEY, name varchar(20) NOT NULL, price numeric(10,2), qty smallint DEFAULT 0, big bigint, flag boolean, t text, ts timestamp, tz timestamptz, d date, f real, dd double precision, j jsonb, u uuid, tags text[], c char(3), CONSTRAINT is9p_qty CHECK (qty >= 0), UNIQUE (name));
+
+statement ok
+CREATE TABLE is9c (id int PRIMARY KEY, p_id int REFERENCES is9p ON DELETE CASCADE, CONSTRAINT is9c_uq UNIQUE (id, p_id));
+
+query TTTTTTTT
+SELECT column_name, data_type, udt_name, character_maximum_length, numeric_precision, numeric_scale, is_nullable, column_default FROM information_schema.columns WHERE table_name = 'is9p' ORDER BY ordinal_position;
+----
+id	integer	int4	NULL	32	0	NO	NULL
+name	character varying	varchar	20	NULL	NULL	NO	NULL
+price	numeric	numeric	NULL	10	2	YES	NULL
+qty	smallint	int2	NULL	16	0	YES	0
+big	bigint	int8	NULL	64	0	YES	NULL
+flag	boolean	bool	NULL	NULL	NULL	YES	NULL
+t	text	text	NULL	NULL	NULL	YES	NULL
+ts	timestamp without time zone	timestamp	NULL	NULL	NULL	YES	NULL
+tz	timestamp with time zone	timestamptz	NULL	NULL	NULL	YES	NULL
+d	date	date	NULL	NULL	NULL	YES	NULL
+f	real	float4	NULL	24	NULL	YES	NULL
+dd	double precision	float8	NULL	53	NULL	YES	NULL
+j	jsonb	jsonb	NULL	NULL	NULL	YES	NULL
+u	uuid	uuid	NULL	NULL	NULL	YES	NULL
+tags	ARRAY	_text	NULL	NULL	NULL	YES	NULL
+c	character	bpchar	3	NULL	NULL	YES	NULL
+
+query TT
+SELECT constraint_name, constraint_type FROM information_schema.table_constraints WHERE table_name IN ('is9p', 'is9c') ORDER BY 1;
+----
+is9c_id_not_null	CHECK
+is9c_p_id_fkey	FOREIGN KEY
+is9c_pkey	PRIMARY KEY
+is9c_uq	UNIQUE
+is9p_id_not_null	CHECK
+is9p_name_key	UNIQUE
+is9p_name_not_null	CHECK
+is9p_pkey	PRIMARY KEY
+is9p_qty	CHECK
+
+query TTTTT
+SELECT constraint_name, table_name, column_name, ordinal_position, position_in_unique_constraint FROM information_schema.key_column_usage WHERE table_name IN ('is9p', 'is9c') ORDER BY 1, 4;
+----
+is9c_p_id_fkey	is9c	p_id	1	1
+is9c_pkey	is9c	id	1	NULL
+is9c_uq	is9c	id	1	NULL
+is9c_uq	is9c	p_id	2	NULL
+is9p_name_key	is9p	name	1	NULL
+is9p_pkey	is9p	id	1	NULL
+
+query TTTTT
+SELECT constraint_name, unique_constraint_name, match_option, update_rule, delete_rule FROM information_schema.referential_constraints WHERE constraint_name LIKE 'is9%' ORDER BY 1;
+----
+is9c_p_id_fkey	is9p_pkey	NONE	NO ACTION	CASCADE
+
+query TT
+SELECT constraint_name, check_clause FROM information_schema.check_constraints WHERE constraint_name LIKE 'is9%' ORDER BY 1;
+----
+is9c_id_not_null	id IS NOT NULL
+is9p_id_not_null	id IS NOT NULL
+is9p_name_not_null	name IS NOT NULL
+is9p_qty	(qty >= 0)
+
+query TTT
+SELECT table_name, column_name, constraint_name FROM information_schema.constraint_column_usage WHERE constraint_name LIKE 'is9%' ORDER BY 3, 1, 2;
+----
+is9c	id	is9c_id_not_null
+is9p	id	is9c_p_id_fkey
+is9c	id	is9c_pkey
+is9c	id	is9c_uq
+is9c	p_id	is9c_uq
+is9p	id	is9p_id_not_null
+is9p	name	is9p_name_key
+is9p	name	is9p_name_not_null
+is9p	id	is9p_pkey
+is9p	qty	is9p_qty
