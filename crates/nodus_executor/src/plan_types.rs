@@ -231,6 +231,18 @@ pub enum AggregateOp {
     VarPop,
     BitAnd,
     BitOr,
+    /// `percentile_cont(fraction) WITHIN GROUP (ORDER BY x)`, and the other
+    /// ordered-set aggregates: their direct argument is the first extra
+    /// argument, their input sorted by the `WITHIN GROUP` order.
+    PercentileCont,
+    PercentileDisc,
+    Mode,
+    /// `rank(h) WITHIN GROUP (ORDER BY x)` and the other hypothetical-set
+    /// aggregates: extra arguments `h`, whether ascending, and `NULLS FIRST`.
+    HypotheticalRank,
+    HypotheticalDenseRank,
+    HypotheticalPercentRank,
+    HypotheticalCumeDist,
     /// `corr(y, x)` and the other statistics of (y, x) pairs.
     Corr,
     CovarPop,
@@ -271,6 +283,13 @@ impl AggregateOp {
             AggregateOp::VarPop => "var_pop",
             AggregateOp::BitAnd => "bit_and",
             AggregateOp::BitOr => "bit_or",
+            AggregateOp::PercentileCont => "percentile_cont",
+            AggregateOp::PercentileDisc => "percentile_disc",
+            AggregateOp::Mode => "mode",
+            AggregateOp::HypotheticalRank => "rank",
+            AggregateOp::HypotheticalDenseRank => "dense_rank",
+            AggregateOp::HypotheticalPercentRank => "percent_rank",
+            AggregateOp::HypotheticalCumeDist => "cume_dist",
             AggregateOp::Corr => "corr",
             AggregateOp::CovarPop => "covar_pop",
             AggregateOp::CovarSamp => "covar_samp",
@@ -294,6 +313,8 @@ impl AggregateOp {
             AggregateOp::StringAgg
             | AggregateOp::JsonObjectAgg
             | AggregateOp::JsonbObjectAgg
+            | AggregateOp::PercentileCont
+            | AggregateOp::PercentileDisc
             | AggregateOp::Corr
             | AggregateOp::CovarPop
             | AggregateOp::CovarSamp
@@ -306,6 +327,10 @@ impl AggregateOp {
             | AggregateOp::RegrSxx
             | AggregateOp::RegrSyy
             | AggregateOp::RegrSxy => 2,
+            AggregateOp::HypotheticalRank
+            | AggregateOp::HypotheticalDenseRank
+            | AggregateOp::HypotheticalPercentRank
+            | AggregateOp::HypotheticalCumeDist => 4,
             _ => 1,
         }
     }

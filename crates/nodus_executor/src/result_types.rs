@@ -29,9 +29,21 @@ fn aggregate_type(op: &AggregateOp, input: Option<String>) -> Option<String> {
         AggregateOp::JsonAgg | AggregateOp::JsonObjectAgg => Some("JSON".into()),
         AggregateOp::JsonbAgg | AggregateOp::JsonbObjectAgg => Some("JSONB".into()),
         AggregateOp::BitAnd | AggregateOp::BitOr | AggregateOp::BitXor => input,
-        AggregateOp::AnyValue => input,
-        AggregateOp::RegrCount => Some("BIGINT".into()),
-        AggregateOp::Corr
+        AggregateOp::PercentileCont => match input {
+            Some(t)
+                if crate::datetime::Kind::of_type(&t) == Some(crate::datetime::Kind::Interval) =>
+            {
+                Some(t)
+            }
+            _ => Some("DOUBLE PRECISION".into()),
+        },
+        AggregateOp::PercentileDisc | AggregateOp::Mode | AggregateOp::AnyValue => input,
+        AggregateOp::HypotheticalRank
+        | AggregateOp::HypotheticalDenseRank
+        | AggregateOp::RegrCount => Some("BIGINT".into()),
+        AggregateOp::HypotheticalPercentRank
+        | AggregateOp::HypotheticalCumeDist
+        | AggregateOp::Corr
         | AggregateOp::CovarPop
         | AggregateOp::CovarSamp
         | AggregateOp::RegrSlope
@@ -309,7 +321,7 @@ pub(crate) fn check_integer_ranges(
         _ => {}
     }
     // Intervals order (and partition) by their length of time, as sort keys
-    // of a window's; their text would not.
+    // of an aggregate's or a window's; their text would not.
     let interval = |e: &ScalarExpr| kind(e) == Some(crate::datetime::Kind::Interval);
     let span = |e: &ScalarExpr| {
         if interval(e) {
@@ -322,6 +334,28 @@ pub(crate) fn check_integer_ranges(
         }
     };
     match &checked {
+        ScalarExpr::Aggregate {
+            op,
+            arg,
+            arg_expr,
+            distinct,
+            extra_args,
+            filter,
+            order_by,
+        } if order_by.iter().any(|(e, _, _)| interval(e)) => {
+            return ScalarExpr::Aggregate {
+                op: op.clone(),
+                arg: arg.clone(),
+                arg_expr: arg_expr.clone(),
+                distinct: *distinct,
+                extra_args: extra_args.clone(),
+                filter: filter.clone(),
+                order_by: order_by
+                    .iter()
+                    .map(|(e, asc, nulls)| (span(e), *asc, *nulls))
+                    .collect(),
+            };
+        }
         // A RANGE frame's offsets measure the key itself.
         ScalarExpr::Window(call)
             if (call.order_by.iter().any(|(e, _, _)| interval(e))

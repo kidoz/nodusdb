@@ -147,6 +147,134 @@ fn decimal_sqrt(value: rust_decimal::Decimal, scale: u32) -> Option<rust_decimal
     Some(root)
 }
 
+/// `percentile_cont`, `percentile_disc`, and `mode` over the inputs, which
+/// arrive sorted by the `WITHIN GROUP` order; the direct argument (the
+/// fraction, or an array of them) is the first extra argument.
+fn ordered_set(op: &AggregateOp, inputs: &[(Value, Vec<Value>)]) -> Value {
+    let values: Vec<&Value> = inputs
+        .iter()
+        .map(|(v, _)| v)
+        .filter(|v| !matches!(v, Value::Null))
+        .collect();
+    if values.is_empty() {
+        return Value::Null;
+    }
+    if *op == AggregateOp::Mode {
+        // The most frequent value; of equally frequent ones, the first.
+        let (mut best, mut best_count, mut run_start) = (0, 0, 0);
+        for i in 1..=values.len() {
+            if i == values.len() || !crate::values_equal(values[i], values[run_start]) {
+                if i - run_start > best_count {
+                    (best, best_count) = (run_start, i - run_start);
+                }
+                run_start = i;
+            }
+        }
+        return values[best].clone();
+    }
+    let fraction = inputs
+        .first()
+        .and_then(|(_, extra)| extra.first())
+        .cloned()
+        .unwrap_or(Value::Null);
+    let one = |fraction: &Value| -> Value {
+        let Some(p) = float_of(fraction) else {
+            return Value::Null;
+        };
+        if !(0.0..=1.0).contains(&p) {
+            return crate::eval_error::raise(format!(
+                "percentile value {} is not between 0 and 1",
+                crate::render(fraction)
+            ));
+        }
+        let n = values.len();
+        if *op == AggregateOp::PercentileDisc {
+            let row = ((p * n as f64).ceil() as usize).clamp(1, n);
+            return values[row - 1].clone();
+        }
+        let position = p * (n - 1) as f64;
+        let (lo, hi) = (position.floor() as usize, position.ceil() as usize);
+        let proportion = position - lo as f64;
+        // Intervals interpolate as intervals; numbers as doubles.
+        if let (Value::Text(a), Value::Text(b)) = (values[lo], values[hi])
+            && let (Some(a), Some(b)) = (
+                crate::datetime::Interval::parse(a),
+                crate::datetime::Interval::parse(b),
+            )
+        {
+            if lo == hi {
+                return Value::Text(a.format());
+            }
+            return match b.add(a.negate()).mul(proportion) {
+                Ok(step) => Value::Text(a.add(step).format()),
+                Err(e) => crate::eval_error::raise(e),
+            };
+        }
+        match (float_of(values[lo]), float_of(values[hi])) {
+            (Some(a), _) if lo == hi => Value::Float(a),
+            (Some(a), Some(b)) => Value::Float(a + (b - a) * proportion),
+            _ => crate::eval_error::raise(format!(
+                "function percentile_cont({}, {}) does not exist",
+                if matches!(fraction, Value::Float(_)) {
+                    "double precision"
+                } else {
+                    "numeric"
+                },
+                crate::datetime::Temporal::read(values[lo], None)
+                    .map_or(crate::value::value_type_name(values[lo]), |t| t
+                        .kind()
+                        .sql_name())
+            )),
+        }
+    };
+    match &fraction {
+        Value::Null => Value::Null,
+        Value::Array(fractions) => Value::Array(fractions.iter().map(one).collect()),
+        f => one(f),
+    }
+}
+
+/// `rank(h) WITHIN GROUP (ORDER BY x)` and the other hypothetical-set
+/// aggregates: where `h` would fall among the inputs. The extra arguments
+/// are `h`, whether the order is ascending, and its `NULLS FIRST`.
+fn hypothetical(op: &AggregateOp, inputs: &[(Value, Vec<Value>)]) -> Value {
+    let extra = inputs.first().map(|(_, e)| e.as_slice()).unwrap_or(&[]);
+    let hypothetical = extra.first().cloned().unwrap_or(Value::Null);
+    let ascending = !matches!(extra.get(1), Some(Value::Bool(false)));
+    let nulls_first = match extra.get(2) {
+        Some(Value::Bool(b)) => Some(*b),
+        _ => None,
+    };
+    let n = inputs.len();
+    let (mut before, mut peers) = (0usize, 0usize);
+    let mut distinct_before: Vec<&Value> = Vec::new();
+    for (value, _) in inputs {
+        match crate::select::order_cmp(value, &hypothetical, ascending, nulls_first) {
+            std::cmp::Ordering::Less => {
+                before += 1;
+                if !distinct_before
+                    .iter()
+                    .any(|v| crate::values_equal(v, value))
+                {
+                    distinct_before.push(value);
+                }
+            }
+            std::cmp::Ordering::Equal => peers += 1,
+            std::cmp::Ordering::Greater => {}
+        }
+    }
+    match op {
+        AggregateOp::HypotheticalRank => Value::Int(before as i64 + 1),
+        AggregateOp::HypotheticalDenseRank => Value::Int(distinct_before.len() as i64 + 1),
+        AggregateOp::HypotheticalPercentRank => Value::Float(if n == 0 {
+            0.0
+        } else {
+            before as f64 / n as f64
+        }),
+        _ => Value::Float((before + peers + 1) as f64 / (n + 1) as f64),
+    }
+}
+
 /// `corr`, `covar_*`, and `regr_*` over (y, x) pairs, accumulated as
 /// PostgreSQL does (Youngs-Cramer), so the results agree to the last digit.
 fn regression(op: &AggregateOp, inputs: &[(Value, Vec<Value>)]) -> Value {
@@ -359,6 +487,13 @@ pub(crate) fn aggregate_inputs(op: &AggregateOp, inputs: &[(Value, Vec<Value>)])
         | AggregateOp::StddevPop
         | AggregateOp::VarSamp
         | AggregateOp::VarPop => spread(op, non_null().collect()),
+        AggregateOp::PercentileCont | AggregateOp::PercentileDisc | AggregateOp::Mode => {
+            ordered_set(op, inputs)
+        }
+        AggregateOp::HypotheticalRank
+        | AggregateOp::HypotheticalDenseRank
+        | AggregateOp::HypotheticalPercentRank
+        | AggregateOp::HypotheticalCumeDist => hypothetical(op, inputs),
         AggregateOp::Corr
         | AggregateOp::CovarPop
         | AggregateOp::CovarSamp
@@ -740,6 +875,10 @@ pub(crate) fn eval_having(
 mod tests {
     use super::*;
 
+    fn inputs(values: &[Value], extra: &[Value]) -> Vec<(Value, Vec<Value>)> {
+        values.iter().map(|v| (v.clone(), extra.to_vec())).collect()
+    }
+
     fn ints(values: &[i64]) -> Vec<Value> {
         values.iter().map(|v| Value::Int(*v)).collect()
     }
@@ -773,6 +912,55 @@ mod tests {
         assert_eq!(
             decimal_sqrt("2".parse().unwrap(), 10),
             Some("1.4142135624".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn ordered_sets_read_their_sorted_input() {
+        let sorted = ints(&[1, 2, 3, 5, 7, 7, 10]);
+        let half = [numeric("0.5")];
+        assert_eq!(
+            ordered_set(&AggregateOp::PercentileCont, &inputs(&sorted, &half)),
+            Value::Float(5.0)
+        );
+        assert_eq!(
+            ordered_set(&AggregateOp::PercentileDisc, &inputs(&sorted, &half)),
+            Value::Int(5)
+        );
+        assert_eq!(
+            ordered_set(&AggregateOp::Mode, &inputs(&sorted, &[])),
+            Value::Int(7)
+        );
+        let quartile = [numeric("0.25")];
+        assert_eq!(
+            ordered_set(&AggregateOp::PercentileCont, &inputs(&sorted, &quartile)),
+            Value::Float(2.5)
+        );
+        let many = [Value::Array(vec![numeric("0.1"), numeric("0.9")])];
+        assert_eq!(
+            ordered_set(&AggregateOp::PercentileDisc, &inputs(&sorted, &many)),
+            Value::Array(ints(&[1, 10]))
+        );
+    }
+
+    #[test]
+    fn hypothetical_rows_rank_among_the_inputs() {
+        let values = ints(&[10, 5, 7, 3, 7, 1, 2]);
+        let seven = [Value::Int(7), Value::Bool(true), Value::Null];
+        assert_eq!(
+            hypothetical(&AggregateOp::HypotheticalRank, &inputs(&values, &seven)),
+            Value::Int(5)
+        );
+        assert_eq!(
+            hypothetical(
+                &AggregateOp::HypotheticalDenseRank,
+                &inputs(&values, &seven)
+            ),
+            Value::Int(5)
+        );
+        assert_eq!(
+            hypothetical(&AggregateOp::HypotheticalCumeDist, &inputs(&values, &seven)),
+            Value::Float(0.875)
         );
     }
 

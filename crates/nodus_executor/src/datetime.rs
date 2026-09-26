@@ -432,7 +432,7 @@ impl Kind {
     }
 
     /// The name PostgreSQL's messages give the kind.
-    fn sql_name(self) -> &'static str {
+    pub(crate) fn sql_name(self) -> &'static str {
         match self {
             Kind::Date => "date",
             Kind::Time => "time without time zone",

@@ -79,6 +79,7 @@ pub(crate) fn is_known(name: &str) -> bool {
                 | "JUSTIFY_DAYS" | "JUSTIFY_HOURS" | "JUSTIFY_INTERVAL" | "ISFINITE" | "DATE_BIN"
                 | "TIMEZONE" | "OVERLAPS" | "__DATETIME__" | "__TZ_TEXT__" | "__JSON_TIME__"
                 | "__EXCLUDE__" | "__INTERVAL_SPAN__"
+                | "PERCENTILE_CONT" | "PERCENTILE_DISC" | "MODE"
                 // Locks, notifications, privileges, and backends.
                 | "PG_ADVISORY_LOCK" | "PG_ADVISORY_LOCK_SHARED" | "PG_ADVISORY_XACT_LOCK"
                 | "PG_ADVISORY_XACT_LOCK_SHARED" | "PG_TRY_ADVISORY_LOCK"

@@ -957,6 +957,9 @@ pub(crate) fn lower_scalar(expr: &sqlparser::ast::Expr, params: &[Value]) -> Opt
             if func.over.is_some() {
                 return lower_window(func, &name, params);
             }
+            if let Some(op) = ordered_set_op(&name, !func.within_group.is_empty()) {
+                return lower_ordered_set(func, &name, op, params);
+            }
             // Ordered-set aggregates (`WITHIN GROUP`) and `IGNORE NULLS` are
             // not supported.
             if !func.within_group.is_empty() || func.null_treatment.is_some() {
@@ -2193,6 +2196,101 @@ pub(crate) fn aggregate_op(name: &str) -> Option<AggregateOp> {
         "REGR_SXY" => Some(AggregateOp::RegrSxy),
         _ => None,
     }
+}
+
+/// The ordered-set aggregate a name means: `percentile_cont`,
+/// `percentile_disc`, `mode`, and (with `WITHIN GROUP`) the hypothetical
+/// `rank`, `dense_rank`, `percent_rank`, and `cume_dist`.
+fn ordered_set_op(name: &str, within_group: bool) -> Option<AggregateOp> {
+    Some(match name {
+        "PERCENTILE_CONT" => AggregateOp::PercentileCont,
+        "PERCENTILE_DISC" => AggregateOp::PercentileDisc,
+        "MODE" => AggregateOp::Mode,
+        "RANK" if within_group => AggregateOp::HypotheticalRank,
+        "DENSE_RANK" if within_group => AggregateOp::HypotheticalDenseRank,
+        "PERCENT_RANK" if within_group => AggregateOp::HypotheticalPercentRank,
+        "CUME_DIST" if within_group => AggregateOp::HypotheticalCumeDist,
+        _ => return None,
+    })
+}
+
+/// Plans an ordered-set aggregate: `f(direct) WITHIN GROUP (ORDER BY x)`.
+fn lower_ordered_set(
+    func: &sqlparser::ast::Function,
+    name: &str,
+    op: AggregateOp,
+    params: &[Value],
+) -> Option<ScalarExpr> {
+    use sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArguments};
+    let lower_name = name.to_ascii_lowercase();
+    let mut direct = Vec::new();
+    if let FunctionArguments::List(list) = &func.args {
+        for arg in &list.args {
+            match arg {
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => {
+                    direct.push(lower_scalar(e, params)?)
+                }
+                _ => return None,
+            }
+        }
+    }
+    // Without WITHIN GROUP there is no such (plain) function.
+    if func.within_group.is_empty() {
+        let types: Vec<String> = direct
+            .iter()
+            .map(|e| {
+                crate::result_types::constant_expr_type(e)
+                    .map_or("unknown".to_string(), |t| crate::value::sql_type_name(&t))
+            })
+            .collect();
+        return plan_error(
+            crate::error_fields::DbError::new(format!(
+                "function {lower_name}({}) does not exist",
+                types.join(", ")
+            ))
+            .hint("No function matches the given name and argument types. You might need to add explicit type casts.")
+            .into_text(),
+        );
+    }
+    let hypothetical = matches!(
+        op,
+        AggregateOp::HypotheticalRank
+            | AggregateOp::HypotheticalDenseRank
+            | AggregateOp::HypotheticalPercentRank
+            | AggregateOp::HypotheticalCumeDist
+    );
+    let expected = if op == AggregateOp::Mode { 0 } else { 1 };
+    if func.within_group.len() != 1 || direct.len() != expected {
+        return plan_error(format!("function {lower_name}() does not exist"));
+    }
+    let key = &func.within_group[0];
+    let ascending = !matches!(key.options.sort, Some(sqlparser::ast::OrderBySort::Desc));
+    let nulls_first = key.options.nulls_first;
+    let value = lower_scalar(&key.expr, params)?;
+    let (arg, arg_expr) = match &value {
+        ScalarExpr::Column(c) => (c.clone(), None),
+        other => (String::new(), Some(Box::new(other.clone()))),
+    };
+    let mut extra_args = direct;
+    if hypothetical {
+        extra_args.push(ScalarExpr::Literal(Value::Bool(ascending)));
+        extra_args.push(ScalarExpr::Literal(
+            nulls_first.map_or(Value::Null, Value::Bool),
+        ));
+    }
+    let filter = match &func.filter {
+        Some(condition) => Some(Box::new(lower_scalar(condition, params)?)),
+        None => None,
+    };
+    Some(ScalarExpr::Aggregate {
+        op,
+        arg,
+        arg_expr,
+        distinct: false,
+        extra_args,
+        filter,
+        order_by: vec![(value, ascending, nulls_first)],
+    })
 }
 
 /// True if a scalar expression contains an aggregate call, so a query using it
