@@ -1,5 +1,5 @@
-//! Session state across statements and between sessions: settings,
-//! driven through SQL.
+//! Session state across statements and between sessions: transaction
+//! modes and settings, driven through SQL.
 
 use super::*;
 use crate::dml_join_tests::rows;
@@ -36,6 +36,20 @@ fn sessions() -> (Arc<MemExecutor>, impl Fn(&str, &str) -> Result<QueryOutput>) 
         runner.execute_logical(&ctx, plan)
     };
     (exec, run)
+}
+
+#[test]
+fn read_only_transactions_refuse_writes() {
+    let (_, sql) = sessions();
+    sql("a", "CREATE TABLE t (id INT)").unwrap();
+    sql("a", "BEGIN READ ONLY").unwrap();
+    let err = sql("a", "INSERT INTO t VALUES (1)")
+        .unwrap_err()
+        .to_string();
+    assert_eq!(err, "cannot execute INSERT in a read-only transaction");
+    sql("a", "ROLLBACK").unwrap();
+    sql("a", "SET default_transaction_read_only = on").unwrap();
+    assert!(sql("a", "DELETE FROM t").is_err());
 }
 
 #[test]

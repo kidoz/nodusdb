@@ -303,7 +303,16 @@ fn execution_is_fenced_while_restoring() {
     // While a restore is in progress, every statement is rejected up front so it
     // cannot observe partially restored state.
     exec.restoring_flag().store(true, Ordering::SeqCst);
-    let err = exec.execute_logical(&ctx, LogicalPlan::Begin).unwrap_err();
+    let err = exec
+        .execute_logical(
+            &ctx,
+            LogicalPlan::Begin {
+                read_only: None,
+                isolation: None,
+                start: false,
+            },
+        )
+        .unwrap_err();
     assert!(
         err.to_string().contains("restore in progress"),
         "expected fence error, got: {err}"
@@ -311,7 +320,17 @@ fn execution_is_fenced_while_restoring() {
 
     // Clearing the flag resumes normal execution.
     exec.restoring_flag().store(false, Ordering::SeqCst);
-    assert!(exec.execute_logical(&ctx, LogicalPlan::Begin).is_ok());
+    assert!(
+        exec.execute_logical(
+            &ctx,
+            LogicalPlan::Begin {
+                read_only: None,
+                isolation: None,
+                start: false
+            }
+        )
+        .is_ok()
+    );
 }
 
 #[test]
@@ -832,7 +851,15 @@ fn transactions_are_isolated_per_session() {
     .unwrap();
 
     // Session A opens a transaction; session B does NOT.
-    exec.execute_logical(&ctx_a, LogicalPlan::Begin).unwrap();
+    exec.execute_logical(
+        &ctx_a,
+        LogicalPlan::Begin {
+            read_only: None,
+            isolation: None,
+            start: false,
+        },
+    )
+    .unwrap();
 
     // Session B auto-commits an insert while A's txn is open.
     exec.execute_logical(

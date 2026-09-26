@@ -148,7 +148,7 @@ pub(crate) fn apply_plan_tx_status<C: ClientInfo>(
 ) {
     use nodus_executor::LogicalPlan;
     match plan {
-        LogicalPlan::Begin | LogicalPlan::RollbackToSavepoint { .. } => {
+        LogicalPlan::Begin { .. } | LogicalPlan::RollbackToSavepoint { .. } => {
             set_tx_status(client, TransactionStatus::Transaction)
         }
         LogicalPlan::Commit | LogicalPlan::Rollback => {

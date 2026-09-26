@@ -14,17 +14,57 @@ fn warning(message: &str, code: &str) -> crate::error_fields::DbError {
 }
 
 impl MemExecutor {
-    pub(crate) fn exec_begin(&self, ctx: &ExecutionContext) -> Result<QueryOutput> {
+    /// A transaction for the session, with its default access mode and
+    /// isolation level (`default_transaction_read_only`, ...).
+    pub(crate) fn new_active_txn(
+        &self,
+        session_id: &str,
+        txn_id: TxnId,
+        read_ts: Timestamp,
+        explicit: bool,
+    ) -> ActiveTxn {
+        let mut txn = ActiveTxn::new(txn_id, read_ts, explicit);
+        let vars = self.session_vars.read();
+        let var = |name: &str| vars.get(session_id).and_then(|v| v.get(name)).cloned();
+        txn.read_only = var("default_transaction_read_only").as_deref() == Some("on");
+        if let Some(isolation) = var("default_transaction_isolation") {
+            txn.isolation = isolation;
+        }
+        txn
+    }
+
+    pub(crate) fn exec_begin(
+        &self,
+        ctx: &ExecutionContext,
+        read_only: Option<bool>,
+        isolation: Option<String>,
+    ) -> Result<QueryOutput> {
+        if self
+            .active_txns
+            .read()
+            .get(&ctx.session_id)
+            .is_some_and(|t| t.explicit)
+        {
+            self.notice(
+                ctx,
+                warning("there is already a transaction in progress", "25001"),
+            );
+            return Ok(QueryOutput::tag("BEGIN"));
+        }
         let txn_record = self.txn.begin_txn()?;
-        self.active_txns.write().insert(
-            ctx.session_id.clone(),
-            ActiveTxn::new(txn_record.txn_id, txn_record.read_ts, true),
-        );
+        let mut txn =
+            self.new_active_txn(&ctx.session_id, txn_record.txn_id, txn_record.read_ts, true);
+        txn.read_only = read_only.unwrap_or(txn.read_only);
+        if let Some(isolation) = isolation {
+            txn.isolation = isolation;
+        }
+        self.active_txns.write().insert(ctx.session_id.clone(), txn);
         Ok(QueryOutput::tag("BEGIN"))
     }
 
     pub(crate) fn exec_commit(&self, ctx: &ExecutionContext) -> Result<QueryOutput> {
         let Some(txn) = self.active_txns.write().remove(&ctx.session_id) else {
+            self.notice(ctx, warning("there is no transaction in progress", "25P01"));
             return Ok(QueryOutput::tag("COMMIT"));
         };
         // A `SET LOCAL` ends with the transaction.
@@ -138,6 +178,7 @@ impl MemExecutor {
 
     pub(crate) fn exec_rollback(&self, ctx: &ExecutionContext) -> Result<QueryOutput> {
         let Some(txn) = self.active_txns.write().remove(&ctx.session_id) else {
+            self.notice(ctx, warning("there is no transaction in progress", "25P01"));
             return Ok(QueryOutput::tag("ROLLBACK"));
         };
         // Settings changed in the transaction go back.
@@ -145,6 +186,79 @@ impl MemExecutor {
         self.txn.abort_txn(txn.txn_id)?;
         self.kv.abort(txn.txn_id)?;
         Ok(QueryOutput::tag("ROLLBACK"))
+    }
+
+    /// `COMMIT AND CHAIN` / `ROLLBACK AND CHAIN`: ends the transaction and
+    /// starts another with its access mode and isolation level.
+    pub(crate) fn exec_chain(&self, ctx: &ExecutionContext, rollback: bool) -> Result<QueryOutput> {
+        let command = if rollback { "ROLLBACK" } else { "COMMIT" };
+        let Some((read_only, isolation)) = self
+            .active_txns
+            .read()
+            .get(&ctx.session_id)
+            .filter(|t| t.explicit)
+            .map(|t| (t.read_only, t.isolation.clone()))
+        else {
+            anyhow::bail!("{command} AND CHAIN can only be used in transaction blocks");
+        };
+        if rollback {
+            self.exec_rollback(ctx)?;
+        } else {
+            self.exec_commit(ctx)?;
+        }
+        self.exec_begin(ctx, Some(read_only), Some(isolation))?;
+        Ok(QueryOutput::tag(command))
+    }
+
+    /// `SET TRANSACTION` (of the current transaction, before its first
+    /// query) and `SET SESSION CHARACTERISTICS AS TRANSACTION` (of later ones).
+    pub(crate) fn exec_set_transaction(
+        &self,
+        ctx: &ExecutionContext,
+        read_only: Option<bool>,
+        isolation: Option<String>,
+        session: bool,
+    ) -> Result<QueryOutput> {
+        if session {
+            if let Some(read_only) = read_only {
+                let value = if read_only { "on" } else { "off" };
+                self.change_setting(
+                    ctx,
+                    "default_transaction_read_only",
+                    Some(value.into()),
+                    false,
+                );
+            }
+            if let Some(isolation) = isolation {
+                self.change_setting(ctx, "default_transaction_isolation", Some(isolation), false);
+            }
+            return Ok(QueryOutput::tag("SET"));
+        }
+        let mut guard = self.active_txns.write();
+        let Some(txn) = guard.get_mut(&ctx.session_id).filter(|t| t.explicit) else {
+            drop(guard);
+            self.notice(
+                ctx,
+                warning(
+                    "SET TRANSACTION can only be used in transaction blocks",
+                    "25P01",
+                ),
+            );
+            return Ok(QueryOutput::tag("SET"));
+        };
+        if txn.queried && isolation.as_ref().is_some_and(|i| *i != txn.isolation) {
+            anyhow::bail!("SET TRANSACTION ISOLATION LEVEL must be called before any query");
+        }
+        if txn.queried && read_only == Some(false) && txn.read_only {
+            anyhow::bail!("transaction read-write mode must be set before any query");
+        }
+        if let Some(read_only) = read_only {
+            txn.read_only = read_only;
+        }
+        if let Some(isolation) = isolation {
+            txn.isolation = isolation;
+        }
+        Ok(QueryOutput::tag("SET"))
     }
 
     /// `RESET name` / `RESET ALL`: back to the session's values at connection.
@@ -289,8 +403,19 @@ impl MemExecutor {
                 tag: "SHOW".into(),
             });
         }
-        let value = self
-            .setting_value(&ctx.session_id, &key)
+        let txn_value = self
+            .active_txns
+            .read()
+            .get(&ctx.session_id)
+            .and_then(|txn| match key.as_str() {
+                "transaction_read_only" => {
+                    Some(if txn.read_only { "on" } else { "off" }.to_string())
+                }
+                "transaction_isolation" => Some(txn.isolation.clone()),
+                _ => None,
+            });
+        let value = txn_value
+            .or_else(|| self.setting_value(&ctx.session_id, &key))
             .ok_or_else(|| anyhow::anyhow!("unrecognized configuration parameter \"{key}\""))?;
         let column = crate::session_vars::setting_info(&key).map_or_else(
             || crate::session_vars::setting_display_name(&variable),
@@ -317,6 +442,19 @@ impl MemExecutor {
         local: bool,
     ) -> Result<QueryOutput> {
         let key = variable.trim().to_ascii_lowercase();
+        // The transaction's own characteristics.
+        match key.as_str() {
+            "transaction_isolation" => {
+                let level = crate::session_vars::normalize_var_value(&value).to_ascii_lowercase();
+                return self.exec_set_transaction(ctx, None, Some(level), false);
+            }
+            "transaction_read_only" => {
+                let value = crate::session_vars::normalize_var_value(&value).to_ascii_lowercase();
+                let read_only = matches!(value.as_str(), "on" | "true" | "yes" | "1");
+                return self.exec_set_transaction(ctx, Some(read_only), None, false);
+            }
+            _ => {}
+        }
         let action =
             crate::session_vars::set_action(&key, &value).map_err(|e| anyhow::anyhow!(e))?;
         if local && !self.in_explicit_txn(&ctx.session_id) {

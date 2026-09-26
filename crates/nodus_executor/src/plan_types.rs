@@ -1082,7 +1082,26 @@ pub enum LogicalPlan {
         #[serde(default)]
         using: Option<Box<LogicalPlan>>,
     },
-    Begin,
+    /// `BEGIN [READ ONLY | READ WRITE] [ISOLATION LEVEL ...]`, or with
+    /// `start` `START TRANSACTION ...`.
+    Begin {
+        read_only: Option<bool>,
+        isolation: Option<String>,
+        #[serde(default)]
+        start: bool,
+    },
+    /// `COMMIT AND CHAIN` (or with `rollback`, `ROLLBACK AND CHAIN`): ends
+    /// the transaction and starts another like it.
+    Chain {
+        rollback: bool,
+    },
+    /// `SET TRANSACTION ...`, or with `session` `SET SESSION CHARACTERISTICS
+    /// AS TRANSACTION ...` (the defaults of later transactions).
+    SetTransaction {
+        read_only: Option<bool>,
+        isolation: Option<String>,
+        session: bool,
+    },
     Commit,
     Rollback,
     Savepoint {

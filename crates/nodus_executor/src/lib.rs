@@ -157,6 +157,13 @@ pub(crate) struct ActiveTxn {
     /// transactions are surfaced in `pg_locks`, so a bare `SELECT FROM pg_locks`
     /// (itself implicitly wrapped) does not report its own throwaway xid.
     pub(crate) explicit: bool,
+    /// `READ ONLY`: statements that write are refused.
+    pub(crate) read_only: bool,
+    /// The isolation level it reports (`read committed`).
+    pub(crate) isolation: String,
+    /// Whether a query has run in it, after which its isolation level and
+    /// read-write mode can no longer change.
+    pub(crate) queried: bool,
     /// Settings changed in it, with their values before (`None`: not set),
     /// restored when it rolls back.
     pub(crate) settings_before: HashMap<String, Option<String>>,
@@ -174,6 +181,9 @@ impl ActiveTxn {
             overlay: HashMap::new(),
             savepoints: Vec::new(),
             explicit,
+            read_only: false,
+            isolation: "read committed".to_string(),
+            queried: false,
             settings_before: HashMap::new(),
             local_settings: HashMap::new(),
         }
@@ -521,12 +531,20 @@ impl MemExecutor {
                 .get_principal_by_id(ctx.principal_id)
                 .map(|p| p.name)
                 .unwrap_or_else(|_| "unknown".to_string()),
-            settings: self
-                .session_vars
-                .read()
-                .get(&ctx.session_id)
-                .cloned()
-                .unwrap_or_default(),
+            settings: {
+                let mut settings = self
+                    .session_vars
+                    .read()
+                    .get(&ctx.session_id)
+                    .cloned()
+                    .unwrap_or_default();
+                if let Some(txn) = self.active_txns.read().get(&ctx.session_id) {
+                    let read_only = if txn.read_only { "on" } else { "off" };
+                    settings.insert("transaction_read_only".into(), read_only.into());
+                    settings.insert("transaction_isolation".into(), txn.isolation.clone());
+                }
+                settings
+            },
             staged_settings: Vec::new(),
             in_explicit_txn: self
                 .active_txns
@@ -927,7 +945,8 @@ impl MemExecutor {
     ) -> Result<QueryOutput> {
         let is_txn_control = matches!(
             plan,
-            LogicalPlan::Begin
+            LogicalPlan::Begin { .. }
+                | LogicalPlan::Chain { .. }
                 | LogicalPlan::Commit
                 | LogicalPlan::Rollback
                 | LogicalPlan::Savepoint { .. }
@@ -945,10 +964,13 @@ impl MemExecutor {
 
         if !is_txn_control && self.active_txns.read().get(&ctx.session_id).is_none() {
             let txn_record = self.txn.begin_txn()?;
-            self.active_txns.write().insert(
-                ctx.session_id.clone(),
-                ActiveTxn::new(txn_record.txn_id, txn_record.read_ts, false),
+            let txn = self.new_active_txn(
+                &ctx.session_id,
+                txn_record.txn_id,
+                txn_record.read_ts,
+                false,
             );
+            self.active_txns.write().insert(ctx.session_id.clone(), txn);
             implicit_txn = Some(txn_record.txn_id);
         }
 
@@ -957,8 +979,27 @@ impl MemExecutor {
         let _env = session_env::install(self.session_env(ctx));
         eval_error::reset();
 
+        // A read-only transaction refuses statements that write; any other
+        // statement fixes the transaction's isolation level and access mode.
+        let read_only_error = {
+            let write = write_command(&plan);
+            let mut guard = self.active_txns.write();
+            match guard.get_mut(&ctx.session_id) {
+                Some(txn) if txn.read_only && write.is_some() => write,
+                Some(txn) if !is_txn_control && !is_session_statement(&plan) => {
+                    txn.queried = true;
+                    None
+                }
+                _ => None,
+            }
+        };
         let started = std::time::Instant::now();
-        let result = self.execute_logical_inner(ctx, plan);
+        let result = match read_only_error {
+            Some(command) => Err(anyhow::anyhow!(
+                "cannot execute {command} in a read-only transaction"
+            )),
+            None => self.execute_logical_inner(ctx, plan),
+        };
         let result = result
             .and_then(|out| eval_error::check().map(|()| out))
             .and_then(|out| {
@@ -1082,6 +1123,51 @@ impl Executor for MemExecutor {
             let _ = self.kv.abort(txn.txn_id);
         }
     }
+}
+
+/// The command a statement that writes names in PostgreSQL's
+/// `cannot execute ... in a read-only transaction`.
+fn write_command(plan: &LogicalPlan) -> Option<&'static str> {
+    Some(match plan {
+        LogicalPlan::Insert { .. } => "INSERT",
+        LogicalPlan::Update { .. } => "UPDATE",
+        LogicalPlan::Delete { .. } => "DELETE",
+        LogicalPlan::Merge { .. } => "MERGE",
+        LogicalPlan::Truncate { .. } => "TRUNCATE TABLE",
+        LogicalPlan::CreateTable { .. } => "CREATE TABLE",
+        LogicalPlan::CreateTableAs { .. } => "CREATE TABLE AS",
+        LogicalPlan::DropTable { .. } => "DROP TABLE",
+        LogicalPlan::AlterTable { .. } => "ALTER TABLE",
+        LogicalPlan::CreateIndex { .. } => "CREATE INDEX",
+        LogicalPlan::DropIndex { .. } => "DROP INDEX",
+        LogicalPlan::CreateView { .. } => "CREATE VIEW",
+        LogicalPlan::DropView { .. } => "DROP VIEW",
+        LogicalPlan::CreateSchema { .. } => "CREATE SCHEMA",
+        LogicalPlan::DropSchema { .. } => "DROP SCHEMA",
+        LogicalPlan::CreateSequence { .. } => "CREATE SEQUENCE",
+        LogicalPlan::AlterSequence { .. } => "ALTER SEQUENCE",
+        LogicalPlan::DropSequence { .. } => "DROP SEQUENCE",
+        LogicalPlan::CreateRole { .. } => "CREATE ROLE",
+        LogicalPlan::Grant { .. } => "GRANT",
+        LogicalPlan::Revoke { .. } => "REVOKE",
+        LogicalPlan::Comment { .. } => "COMMENT",
+        LogicalPlan::RefreshMaterializedView { .. } => "REFRESH MATERIALIZED VIEW",
+        LogicalPlan::With { body, .. } => return write_command(body),
+        _ => return None,
+    })
+}
+
+/// Statements about the session rather than its data, which leave a
+/// transaction's characteristics open.
+fn is_session_statement(plan: &LogicalPlan) -> bool {
+    matches!(
+        plan,
+        LogicalPlan::SetVariable { .. }
+            | LogicalPlan::ShowVariable { .. }
+            | LogicalPlan::ResetVariable { .. }
+            | LogicalPlan::SetTransaction { .. }
+            | LogicalPlan::Noop { .. }
+    )
 }
 
 #[cfg(test)]

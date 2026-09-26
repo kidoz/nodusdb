@@ -283,7 +283,24 @@ impl MemExecutor {
                 object_name,
                 revokee,
             } => self.exec_revoke(ctx, privilege, object_name, revokee),
-            LogicalPlan::Begin => self.exec_begin(ctx),
+            LogicalPlan::Begin {
+                read_only,
+                isolation,
+                start,
+            } => {
+                let out = self.exec_begin(ctx, read_only, isolation)?;
+                Ok(if start {
+                    QueryOutput::tag("START TRANSACTION")
+                } else {
+                    out
+                })
+            }
+            LogicalPlan::Chain { rollback } => self.exec_chain(ctx, rollback),
+            LogicalPlan::SetTransaction {
+                read_only,
+                isolation,
+                session,
+            } => self.exec_set_transaction(ctx, read_only, isolation, session),
             LogicalPlan::ResetVariable { variable } => self.exec_reset_variable(ctx, variable),
             LogicalPlan::Commit => self.exec_commit(ctx),
             LogicalPlan::Rollback => self.exec_rollback(ctx),

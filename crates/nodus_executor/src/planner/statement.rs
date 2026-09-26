@@ -825,7 +825,19 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
         Statement::Vacuum(_) => Ok(LogicalPlan::Noop {
             tag: "VACUUM".to_string(),
         }),
-        Statement::StartTransaction { .. } => Ok(LogicalPlan::Begin),
+        Statement::StartTransaction { modes, begin, .. } => {
+            let (read_only, isolation) = transaction_modes(modes);
+            Ok(LogicalPlan::Begin {
+                read_only,
+                isolation,
+                start: !*begin,
+            })
+        }
+        Statement::Commit { chain: true, .. } => Ok(LogicalPlan::Chain { rollback: false }),
+        Statement::Rollback {
+            chain: true,
+            savepoint: None,
+        } => Ok(LogicalPlan::Chain { rollback: true }),
         Statement::Reset(reset) => Ok(LogicalPlan::ResetVariable {
             variable: match &reset.reset {
                 sqlparser::ast::Reset::ConfigurationParameter(name) => Some(name.to_string()),
@@ -880,11 +892,14 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                     local: matches!(scope, Some(sqlparser::ast::ContextModifier::Local)),
                 })
             }
-            sqlparser::ast::Set::SetTransaction { .. } => Ok(LogicalPlan::SetVariable {
-                variable: "transaction_isolation".to_string(),
-                value: "read committed".to_string(),
-                local: false,
-            }),
+            sqlparser::ast::Set::SetTransaction { modes, session, .. } => {
+                let (read_only, isolation) = transaction_modes(modes);
+                Ok(LogicalPlan::SetTransaction {
+                    read_only,
+                    isolation,
+                    session: *session,
+                })
+            }
             // `SET TIME ZONE <x>` is the SQL-standard spelling of `SET timezone = <x>`;
             // route it to the same per-session variable so it persists and `SHOW
             // TimeZone` reflects it (`DEFAULT`/`LOCAL` clear the override).
@@ -1155,6 +1170,24 @@ fn sequence_change(options: &str, params: &[Value]) -> Result<crate::sequences::
         }
     }
     Ok(change)
+}
+
+/// A transaction's access mode (`true` for `READ ONLY`) and isolation level
+/// (`read committed`), where given.
+fn transaction_modes(modes: &[sqlparser::ast::TransactionMode]) -> (Option<bool>, Option<String>) {
+    use sqlparser::ast::{TransactionAccessMode, TransactionMode};
+    let (mut read_only, mut isolation) = (None, None);
+    for mode in modes {
+        match mode {
+            TransactionMode::AccessMode(access) => {
+                read_only = Some(matches!(access, TransactionAccessMode::ReadOnly));
+            }
+            TransactionMode::IsolationLevel(level) => {
+                isolation = Some(level.to_string().to_ascii_lowercase());
+            }
+        }
+    }
+    (read_only, isolation)
 }
 
 /// The keywords a statement or clause starts with (`CREATE FUNCTION`,

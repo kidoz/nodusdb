@@ -1,0 +1,208 @@
+# Transaction access modes and isolation levels: a read-only transaction refuses writes.
+statement ok
+CREATE TABLE tm (id int PRIMARY KEY, v text);
+
+statement ok
+INSERT INTO tm VALUES (1, 'a');
+
+statement ok
+BEGIN READ ONLY;
+
+query T
+SHOW transaction_read_only;
+----
+on
+
+query T
+SELECT count(*) FROM tm;
+----
+1
+
+statement error
+INSERT INTO tm VALUES (2, 'b');
+
+statement ok
+ROLLBACK;
+
+statement ok
+START TRANSACTION READ ONLY;
+
+statement error
+UPDATE tm SET v = 'x';
+
+statement ok
+ROLLBACK;
+
+statement ok
+BEGIN;
+
+statement ok
+SET TRANSACTION READ ONLY;
+
+statement error
+DELETE FROM tm;
+
+statement ok
+ROLLBACK;
+
+statement ok
+BEGIN READ ONLY;
+
+statement error
+CREATE TABLE tm2 (a int);
+
+statement ok
+ROLLBACK;
+
+statement ok
+BEGIN READ WRITE;
+
+statement ok
+INSERT INTO tm VALUES (2, 'b');
+
+statement ok
+COMMIT;
+
+query T
+SELECT count(*) FROM tm;
+----
+2
+
+statement ok
+BEGIN ISOLATION LEVEL SERIALIZABLE;
+
+query T
+SHOW transaction_isolation;
+----
+serializable
+
+statement ok
+COMMIT;
+
+statement ok
+BEGIN;
+
+statement ok
+SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+
+query T
+SHOW transaction_isolation;
+----
+repeatable read
+
+query T
+SELECT current_setting('transaction_isolation');
+----
+repeatable read
+
+statement ok
+COMMIT;
+
+query T
+SHOW transaction_isolation;
+----
+read committed
+
+statement ok
+BEGIN;
+
+query T
+SELECT 1;
+----
+1
+
+statement error
+SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+
+statement ok
+ROLLBACK;
+
+statement ok
+BEGIN READ ONLY;
+
+query T
+SELECT 1;
+----
+1
+
+statement error
+SET TRANSACTION READ WRITE;
+
+statement ok
+ROLLBACK;
+
+statement ok
+SET default_transaction_read_only = on;
+
+statement error
+INSERT INTO tm VALUES (3, 'c');
+
+query T
+SHOW transaction_read_only;
+----
+on
+
+statement ok
+SET default_transaction_read_only = off;
+
+statement ok
+SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY;
+
+statement error
+INSERT INTO tm VALUES (3, 'c');
+
+statement ok
+SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE;
+
+statement ok
+SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+
+query T
+SHOW default_transaction_isolation;
+----
+serializable
+
+statement ok
+BEGIN;
+
+query T
+SHOW transaction_isolation;
+----
+serializable
+
+statement ok
+COMMIT;
+
+statement ok
+RESET default_transaction_isolation;
+
+statement ok
+BEGIN READ ONLY ISOLATION LEVEL REPEATABLE READ;
+
+statement ok
+COMMIT AND CHAIN;
+
+query TT
+SELECT current_setting('transaction_read_only'), current_setting('transaction_isolation');
+----
+on	repeatable read
+
+statement ok
+ROLLBACK;
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO tm VALUES (3, 'c');
+
+statement ok
+ROLLBACK AND CHAIN;
+
+query T
+SELECT count(*) FROM tm;
+----
+2
+
+statement ok
+COMMIT;
