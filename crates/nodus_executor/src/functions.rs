@@ -77,7 +77,7 @@ pub(crate) fn is_known(name: &str) -> bool {
                 | "MAKE_DATE" | "MAKE_TIMESTAMP" | "TO_TIMESTAMP" | "TO_CHAR" | "TO_DATE"
                 | "TO_NUMBER" | "MAKE_INTERVAL" | "MAKE_TIME" | "MAKE_TIMESTAMPTZ"
                 | "JUSTIFY_DAYS" | "JUSTIFY_HOURS" | "JUSTIFY_INTERVAL" | "ISFINITE" | "DATE_BIN"
-                | "TIMEZONE" | "OVERLAPS" | "__DATETIME__"
+                | "TIMEZONE" | "OVERLAPS" | "__DATETIME__" | "__TZ_TEXT__" | "__JSON_TIME__"
                 // Session and system.
                 | "VERSION" | "CURRENT_USER" | "SESSION_USER" | "CURRENT_ROLE" | "USER"
                 | "CURRENT_DATABASE" | "CURRENT_CATALOG" | "CURRENT_SCHEMA" | "CURRENT_SCHEMAS"
@@ -175,7 +175,7 @@ pub(crate) fn return_type(name: &str, arg_types: &[Option<String>]) -> Option<St
                 "INTERVAL"
             }
             "MAKE_TIMESTAMPTZ" => "TIMESTAMPTZ",
-            "TO_CHAR" => "TEXT",
+            "TO_CHAR" | "__TZ_TEXT__" | "__JSON_TIME__" => "TEXT",
             "TO_NUMBER" => "NUMERIC",
             "ISFINITE" | "OVERLAPS" => "BOOLEAN",
             "DATE_BIN" => return arg_types.get(1).cloned().flatten(),
@@ -1019,19 +1019,43 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
         }
         "STATEMENT_TIMESTAMP" if arity(0) => timestamp(session_time(|e| e.statement_micros)?, true),
         "CLOCK_TIMESTAMP" if arity(0) => timestamp(session_env::wall_micros(), true),
-        "LOCALTIMESTAMP" if arity(0) => timestamp(session_time(|e| e.transaction_micros)?, false),
-        "CURRENT_DATE" if arity(0) => {
-            let ts = timestamp(session_time(|e| e.transaction_micros)?, false);
-            Value::Text(text(&ts)[..10].to_string())
-        }
-        "CURRENT_TIME" | "LOCALTIME" if arity(0) => {
-            let ts = text(&timestamp(session_time(|e| e.transaction_micros)?, false));
-            let time = &ts[11..];
-            Value::Text(if name == "CURRENT_TIME" {
-                format!("{time}+00")
-            } else {
-                time.to_string()
+        // The transaction's start as local time in the session's zone.
+        "LOCALTIMESTAMP" | "CURRENT_DATE" | "CURRENT_TIME" | "LOCALTIME" if arity(0) => {
+            let micros = session_time(|e| e.transaction_micros)?;
+            let Some(now) = chrono::DateTime::from_timestamp_micros(micros) else {
+                return Some(raise("timestamp out of range"));
+            };
+            let (local, offset) = crate::timezone::to_session_local(now.naive_utc());
+            let ts = crate::value::format_timestamp(local, false);
+            Value::Text(match name {
+                "LOCALTIMESTAMP" => ts,
+                "CURRENT_DATE" => ts[..10].to_string(),
+                "LOCALTIME" => ts[11..].to_string(),
+                _ => format!("{}{}", &ts[11..], crate::timezone::offset_text(offset)),
             })
+        }
+        "__TZ_TEXT__" if arity(1) => {
+            Value::Text(crate::timezone::session_timestamptz_text(&text(arg(0))))
+        }
+        // A timestamp's ISO 8601 text, as JSON writes it; a zoned one in the
+        // session's zone, with its offset's minutes.
+        "__JSON_TIME__" if arity(2) => {
+            let value = text(arg(0));
+            let (stamp, offset) = if text(arg(1)) == "TIMESTAMPTZ" {
+                let local = crate::timezone::session_timestamptz_text(&value);
+                match local.rfind(['+', '-']).filter(|at| *at > 10) {
+                    Some(at) => (local[..at].to_string(), local[at..].to_string()),
+                    None => (local, String::new()),
+                }
+            } else {
+                (value, String::new())
+            };
+            let offset = if offset.len() == 3 {
+                format!("{offset}:00")
+            } else {
+                offset
+            };
+            Value::Text(format!("{}{offset}", stamp.replacen(' ', "T", 1)))
         }
         "OVERLAPS" if arity(4) => crate::datetime::overlaps(args, &[]).unwrap_or_else(raise),
         // With the arguments' static types, as the planner passes them.
@@ -1128,7 +1152,14 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
                     Ok(zone) => zone,
                     Err(e) => return Some(raise(e)),
                 },
-                None => crate::timezone::Zone::Fixed(0),
+                None => {
+                    return Some(
+                        crate::datetime::Temporal::TimestampTz(
+                            crate::timezone::from_session_local(local),
+                        )
+                        .to_value(),
+                    );
+                }
             };
             let utc = local - chrono::Duration::seconds(zone.offset_at_local(local));
             crate::datetime::Temporal::TimestampTz(utc).to_value()

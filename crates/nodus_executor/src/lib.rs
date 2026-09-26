@@ -1024,7 +1024,16 @@ impl MemExecutor {
                 }
                 out
             })
-            .map(|out| self.name_object_identifiers(out));
+            .map(|out| self.name_object_identifiers(out))
+            .map(|mut out| {
+                // Zoned timestamps are shown in the session's zone.
+                if let Some(zoned) = timezone::zoned_columns(&out.types) {
+                    for row in &mut out.rows {
+                        timezone::localize_row(&mut row.values, &zoned);
+                    }
+                }
+                out
+            });
 
         if let Some(txn_id) = implicit_txn {
             self.active_txns.write().remove(&ctx.session_id);

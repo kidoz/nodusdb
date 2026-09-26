@@ -605,6 +605,20 @@ pub(crate) fn time_micros_of(time: chrono::NaiveTime) -> i64 {
         + (time.nanosecond() / 1_000) as i64 % MICROS_PER_SECOND
 }
 
+/// A zoned timestamp (UTC) plus an interval: its months and days in the
+/// session's local time, so a day across a daylight-saving change is 23 or
+/// 25 hours, then its time.
+pub(crate) fn add_interval_zoned(utc: NaiveDateTime, iv: Interval) -> Option<NaiveDateTime> {
+    let dated = if iv.months == 0 && iv.days == 0 {
+        utc
+    } else {
+        let (local, _) = crate::timezone::to_session_local(utc);
+        let shifted = add_interval(local, Interval::new(iv.months, iv.days, 0))?;
+        crate::timezone::from_session_local(shifted)
+    };
+    dated.checked_add_signed(Duration::microseconds(iv.micros))
+}
+
 /// `ts + interval`: months first (clamping the day to the month's end),
 /// then days, then time.
 pub(crate) fn add_interval(ts: NaiveDateTime, iv: Interval) -> Option<NaiveDateTime> {
@@ -764,10 +778,11 @@ pub(crate) fn arith(
         ) => {
             let base = ts.as_timestamp().ok_or_else(out_of_range)?;
             let iv = if op == "-" { iv.negate() } else { iv };
-            let shifted = add_interval(base, iv).ok_or_else(out_of_range)?;
             match ts {
-                T::TimestampTz(_) => T::TimestampTz(shifted),
-                _ => T::Timestamp(shifted),
+                T::TimestampTz(_) => {
+                    T::TimestampTz(add_interval_zoned(base, iv).ok_or_else(out_of_range)?)
+                }
+                _ => T::Timestamp(add_interval(base, iv).ok_or_else(out_of_range)?),
             }
         }
         // timestamp - timestamp.
@@ -953,7 +968,11 @@ pub(crate) fn extract(
         },
         date_or_timestamp => {
             let is_date = matches!(date_or_timestamp, Temporal::Date(_));
-            let ts = date_or_timestamp.as_timestamp().unwrap_or_default();
+            // A zoned timestamp's fields are its local time in the session's zone.
+            let (ts, offset) = match date_or_timestamp {
+                Temporal::TimestampTz(utc) => crate::timezone::to_session_local(utc),
+                other => (other.as_timestamp().unwrap_or_default(), 0),
+            };
             let date = ts.date();
             let time = time_of(&ts);
             let year = date.year() as i64;
@@ -1015,17 +1034,21 @@ pub(crate) fn extract(
                 "milliseconds" | "millisecond" => micros(time % MICROS_PER_MINUTE * 1000, 3),
                 "microseconds" | "microsecond" => whole(time % MICROS_PER_MINUTE),
                 "epoch" => {
-                    let epoch = ts.and_utc().timestamp_micros();
+                    let epoch = ts.and_utc().timestamp_micros() - offset * MICROS_PER_SECOND;
                     if is_date {
                         whole(epoch / MICROS_PER_SECOND)
                     } else {
                         micros(epoch, 6)
                     }
                 }
-                "timezone" | "timezone_hour" | "timezone_minute"
-                    if matches!(date_or_timestamp, Temporal::TimestampTz(_)) =>
-                {
-                    whole(0)
+                "timezone" if matches!(date_or_timestamp, Temporal::TimestampTz(_)) => {
+                    whole(offset)
+                }
+                "timezone_hour" if matches!(date_or_timestamp, Temporal::TimestampTz(_)) => {
+                    whole(offset / 3600)
+                }
+                "timezone_minute" if matches!(date_or_timestamp, Temporal::TimestampTz(_)) => {
+                    whole(offset % 3600 / 60)
                 }
                 _ => return Err(unsupported(date_or_timestamp.kind())),
             }
@@ -1095,7 +1118,12 @@ pub(crate) fn trunc(field: &str, value: &Value, kind: Option<Kind>) -> Result<Va
         }
         Temporal::Time(_) => return Err(unit_error(Kind::Time)),
         other => {
-            let ts = other.as_timestamp().unwrap_or_default();
+            // A zoned timestamp truncates in the session's local time, and a
+            // date as its local midnight.
+            let ts = match other {
+                Temporal::TimestampTz(utc) => crate::timezone::to_session_local(utc).0,
+                _ => other.as_timestamp().unwrap_or_default(),
+            };
             let d = ts.date();
             let year = d.year();
             let start = |y: i32, m: u32, day: u32| {
@@ -1127,7 +1155,9 @@ pub(crate) fn trunc(field: &str, value: &Value, kind: Option<Kind>) -> Result<Va
             .ok_or("timestamp out of range")?;
             // A date is truncated as a zoned timestamp, as PostgreSQL casts it.
             match other {
-                Temporal::TimestampTz(_) | Temporal::Date(_) => Temporal::TimestampTz(truncated),
+                Temporal::TimestampTz(_) | Temporal::Date(_) => {
+                    Temporal::TimestampTz(crate::timezone::from_session_local(truncated))
+                }
                 _ => Temporal::Timestamp(truncated),
             }
         }
@@ -1193,9 +1223,13 @@ pub(crate) fn age(a: &Value, b: &Value) -> Result<Value, String> {
     if matches!(a, Value::Null) || matches!(b, Value::Null) {
         return Ok(Value::Null);
     }
+    // Zoned timestamps compare as local times in the session's zone.
     let read = |v: &Value| {
         Temporal::read(v, None)
-            .and_then(|t| t.as_timestamp())
+            .and_then(|t| match t {
+                Temporal::TimestampTz(utc) => Some(crate::timezone::to_session_local(utc).0),
+                other => other.as_timestamp(),
+            })
             .ok_or_else(|| {
                 format!(
                     "invalid input syntax for type timestamp: \"{}\"",
@@ -1293,11 +1327,16 @@ pub(crate) fn series(
 ) -> Result<(String, Vec<Value>), String> {
     let start_t = Temporal::read(start, None).ok_or("invalid input syntax for type timestamp")?;
     let zoned = !matches!(start_t, Temporal::Timestamp(_));
-    let first = start_t
-        .as_timestamp()
-        .ok_or("invalid input syntax for type timestamp")?;
+    // A zoned series steps from instants: a date is its local midnight.
+    let instant = |t: Temporal| match t {
+        Temporal::Date(_) | Temporal::Timestamp(_) if zoned => {
+            t.as_timestamp().map(crate::timezone::from_session_local)
+        }
+        other => other.as_timestamp(),
+    };
+    let first = instant(start_t).ok_or("invalid input syntax for type timestamp")?;
     let last = Temporal::read(stop, None)
-        .and_then(|t| t.as_timestamp())
+        .and_then(instant)
         .ok_or("invalid input syntax for type timestamp")?;
     let Some(Temporal::Interval(step)) = Temporal::read(step, Some(Kind::Interval)) else {
         return Err("invalid input syntax for type interval".to_string());
@@ -1317,7 +1356,12 @@ pub(crate) fn series(
             }
             .to_value(),
         );
-        current = add_interval(current, step).ok_or("timestamp out of range")?;
+        current = if zoned {
+            add_interval_zoned(current, step)
+        } else {
+            add_interval(current, step)
+        }
+        .ok_or("timestamp out of range")?;
         if values.len() > 10_000_000 {
             return Err("generate_series produced too many rows".to_string());
         }

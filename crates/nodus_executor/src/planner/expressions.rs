@@ -45,8 +45,16 @@ pub fn expr_to_value(expr: &sqlparser::ast::Expr, params: &[crate::Value]) -> Op
         // in the type's canonical text. NodusDB has no native temporal type, so
         // dates stay ISO-8601 text (which compares and sorts chronologically).
         // Invalid input is `None`; the scalar path reports it when evaluated.
+        // So is a value that depends on the session (a zoned timestamp is read
+        // in its time zone, `now` and `today` at its transaction's start), as
+        // the session is known only when the statement runs.
         Expr::TypedString(ts) => match &ts.value.value {
-            SqlValue::SingleQuotedString(s) => {
+            SqlValue::SingleQuotedString(s)
+                if crate::datetime::Kind::of_type(&ts.data_type.to_string())
+                    != Some(crate::datetime::Kind::TimestampTz)
+                    && !["now", "today", "tomorrow", "yesterday"]
+                        .contains(&s.trim().to_ascii_lowercase().as_str()) =>
+            {
                 try_cast(crate::Value::Text(s.clone()), &ts.data_type.to_string()).ok()
             }
             _ => None,

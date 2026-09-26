@@ -153,6 +153,9 @@ pub(crate) fn set_action(name: &str, raw: &str) -> Result<SetAction, String> {
         }
         _ => {}
     }
+    if key == "timezone" {
+        return crate::timezone::zone_setting(raw).map(SetAction::Set);
+    }
     let invalid = || format!("invalid value for parameter \"{display}\": \"{value}\"");
     Ok(SetAction::Set(match info.vartype {
         "bool" => match value.to_ascii_lowercase().as_str() {

@@ -1,5 +1,5 @@
 //! Session state across statements and between sessions: transaction
-//! modes and settings, driven through SQL.
+//! modes, settings, and the time zone, driven through SQL.
 
 use super::*;
 use crate::dml_join_tests::rows;
@@ -75,5 +75,31 @@ fn settings_follow_their_transaction() {
     assert_eq!(
         changes.last(),
         Some(&("application_name".to_string(), "psql".to_string()))
+    );
+}
+
+#[test]
+fn zoned_timestamps_show_in_the_session_time_zone() {
+    let (_, sql) = sessions();
+    if crate::timezone::Zone::resolve("America/New_York").is_err() {
+        return; // No tz database here.
+    }
+    sql("a", "CREATE TABLE t (at TIMESTAMPTZ)").unwrap();
+    sql("a", "INSERT INTO t VALUES ('2024-07-01 12:00:00+00')").unwrap();
+    sql("a", "SET TIME ZONE 'America/New_York'").unwrap();
+    assert_eq!(
+        rows(&sql("a", "SELECT at FROM t").unwrap()),
+        vec!["2024-07-01 08:00:00-04"]
+    );
+    assert_eq!(
+        rows(&sql("a", "SELECT at::date FROM t").unwrap()),
+        vec!["2024-07-01"]
+    );
+    // A value without an offset is read in the session's zone.
+    sql("a", "INSERT INTO t VALUES ('2024-01-01 00:00')").unwrap();
+    sql("b", "SET TIME ZONE 'UTC'").unwrap();
+    assert_eq!(
+        rows(&sql("b", "SELECT at FROM t").unwrap()),
+        vec!["2024-01-01 05:00:00+00", "2024-07-01 12:00:00+00"]
     );
 }

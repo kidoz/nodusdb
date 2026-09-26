@@ -108,7 +108,13 @@ where
 
     if let Some(mut parameters) = server_parameter_provider.server_parameters(client) {
         parameters.insert("server_version_num".to_owned(), "180000".to_owned());
-        parameters.insert("TimeZone".to_owned(), "UTC".to_owned());
+        // The client's own time zone, when it asked for one.
+        let zone = client
+            .metadata()
+            .get("TimeZone")
+            .cloned()
+            .unwrap_or_else(|| "UTC".to_owned());
+        parameters.insert("TimeZone".to_owned(), zone);
         parameters.insert("IntervalStyle".to_owned(), "postgres".to_owned());
         parameters.insert("standard_conforming_strings".to_owned(), "on".to_owned());
         parameters.insert("is_superuser".to_owned(), "on".to_owned());

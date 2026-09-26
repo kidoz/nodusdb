@@ -666,9 +666,13 @@ impl ParsedTemporal {
         self.date.and_time(self.time.unwrap_or_default())
     }
 
-    /// The instant in UTC (a value without a zone is taken as UTC).
+    /// The instant in UTC (a value without a zone is local time in the
+    /// session's zone).
     pub(crate) fn utc(&self) -> chrono::NaiveDateTime {
-        self.local() - chrono::Duration::seconds(self.offset.unwrap_or(0))
+        match self.offset {
+            Some(offset) => self.local() - chrono::Duration::seconds(offset),
+            None => crate::timezone::from_session_local(self.local()),
+        }
     }
 }
 
@@ -875,25 +879,37 @@ pub(crate) fn normalize_temporal(text: &str, ty: Temporal) -> Option<String> {
         })?;
         return Some(crate::datetime::format_time(micros));
     }
-    // Words for moments relative to now.
+    // Words for moments relative to now, in the session's zone.
     let now = || {
         let micros = crate::session_env::with(|e| e.map(|e| e.transaction_micros))
             .unwrap_or_else(crate::session_env::wall_micros);
-        chrono::DateTime::from_timestamp_micros(micros).map(|dt| dt.naive_utc())
+        chrono::DateTime::from_timestamp_micros(micros)
+            .map(|dt| crate::timezone::to_session_local(dt.naive_utc()))
+    };
+    let midnight = |days: i64| {
+        now().and_then(|(local, _)| {
+            Some(ParsedTemporal {
+                date: local
+                    .date()
+                    .checked_add_signed(chrono::Duration::days(days))?,
+                time: Some(chrono::NaiveTime::MIN),
+                offset: None,
+            })
+        })
     };
     let relative = match lower.as_str() {
-        "now" => now(),
-        "today" => now().and_then(|n| n.date().and_hms_opt(0, 0, 0)),
-        "tomorrow" => now().and_then(|n| n.date().succ_opt()?.and_hms_opt(0, 0, 0)),
-        "yesterday" => now().and_then(|n| n.date().pred_opt()?.and_hms_opt(0, 0, 0)),
+        "now" => now().map(|(local, offset)| ParsedTemporal {
+            date: local.date(),
+            time: Some(local.time()),
+            offset: Some(offset),
+        }),
+        "today" => midnight(0),
+        "tomorrow" => midnight(1),
+        "yesterday" => midnight(-1),
         _ => None,
     };
     let parsed = match relative {
-        Some(ts) => ParsedTemporal {
-            date: ts.date(),
-            time: Some(ts.time()),
-            offset: Some(0),
-        },
+        Some(parsed) => parsed,
         None => parse_temporal(trimmed).or_else(|| parse_loose_temporal(trimmed))?,
     };
     Some(match ty {

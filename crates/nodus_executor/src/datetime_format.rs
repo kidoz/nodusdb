@@ -183,12 +183,13 @@ struct Fields {
     day: i64,
     hours: i64,
     micros_of_hour: i64,
-    zoned: bool,
+    /// A zoned timestamp's offset and zone abbreviation, in the session's zone.
+    zone: Option<(i64, String)>,
 }
 
 impl Fields {
     fn of(temporal: &Temporal) -> Option<Fields> {
-        let from_timestamp = |ts: NaiveDateTime, zoned: bool| Fields {
+        let from_timestamp = |ts: NaiveDateTime, zone: Option<(i64, String)>| Fields {
             date: Some(ts.date()),
             year: ts.year() as i64,
             month: ts.month() as i64,
@@ -197,12 +198,16 @@ impl Fields {
             micros_of_hour: ts.minute() as i64 * MICROS_PER_MINUTE
                 + ts.second() as i64 * MICROS_PER_SECOND
                 + (ts.nanosecond() / 1000) as i64 % MICROS_PER_SECOND,
-            zoned,
+            zone,
         };
         Some(match temporal {
-            Temporal::Date(d) => from_timestamp(d.and_hms_opt(0, 0, 0)?, false),
-            Temporal::Timestamp(ts) => from_timestamp(*ts, false),
-            Temporal::TimestampTz(ts) => from_timestamp(*ts, true),
+            Temporal::Date(d) => from_timestamp(d.and_hms_opt(0, 0, 0)?, None),
+            Temporal::Timestamp(ts) => from_timestamp(*ts, None),
+            Temporal::TimestampTz(utc) => {
+                let (local, offset) = crate::timezone::to_session_local(*utc);
+                let abbreviation = crate::timezone::session_abbreviation(*utc);
+                from_timestamp(local, Some((offset, abbreviation)))
+            }
             Temporal::Time(t) => Fields {
                 date: None,
                 year: 0,
@@ -210,7 +215,7 @@ impl Fields {
                 day: 0,
                 hours: t / MICROS_PER_HOUR,
                 micros_of_hour: t % MICROS_PER_HOUR,
-                zoned: false,
+                zone: None,
             },
             Temporal::Interval(Interval {
                 months,
@@ -223,7 +228,7 @@ impl Fields {
                 day: *days,
                 hours: micros / MICROS_PER_HOUR,
                 micros_of_hour: micros % MICROS_PER_HOUR,
-                zoned: false,
+                zone: None,
             },
             Temporal::Infinite(..) => return None,
         })
@@ -353,35 +358,28 @@ pub(crate) fn format_temporal(temporal: &Temporal, template: &str) -> String {
             "Q" => num((f.month - 1).max(0) / 3 + 1, 1),
             "RM" if f.month >= 1 => word(ROMAN[f.month as usize - 1].to_string(), 4),
             "TZ" => (
-                if f.zoned {
-                    cased("UTC", case)
-                } else {
-                    String::new()
-                },
+                f.zone
+                    .as_ref()
+                    .map_or(String::new(), |(_, abbreviation)| cased(abbreviation, case)),
                 None,
             ),
             "OF" => (
-                if f.zoned {
-                    "+00".to_string()
-                } else {
-                    String::new()
-                },
+                f.zone.as_ref().map_or(String::new(), |(offset, _)| {
+                    crate::timezone::offset_text(*offset)
+                }),
                 None,
             ),
             "TZH" => (
-                if f.zoned {
-                    "+00".to_string()
-                } else {
-                    String::new()
-                },
+                f.zone.as_ref().map_or(String::new(), |(offset, _)| {
+                    let sign = if *offset < 0 { '-' } else { '+' };
+                    format!("{sign}{:02}", offset.abs() / 3600)
+                }),
                 None,
             ),
             "TZM" => (
-                if f.zoned {
-                    "00".to_string()
-                } else {
-                    String::new()
-                },
+                f.zone.as_ref().map_or(String::new(), |(offset, _)| {
+                    format!("{:02}", offset.abs() % 3600 / 60)
+                }),
                 None,
             ),
             _ => (String::new(), None),
@@ -409,8 +407,8 @@ pub(crate) fn parse_by_template(
     let mut ordinal_day: Option<i64> = None;
     let mut pm: Option<bool> = None;
     let mut hour12 = false;
-    // East of UTC, from `TZH`, `TZM`, or `OF`.
-    let mut offset_seconds = 0i64;
+    // East of UTC, from `TZH`, `TZM`, or `OF`; else the session's zone.
+    let mut offset_seconds: Option<i64> = None;
     let skip_spaces = |at: &mut usize| {
         while *at < chars.len() && chars[*at].is_whitespace() {
             *at += 1;
@@ -562,15 +560,13 @@ pub(crate) fn parse_by_template(
                             minutes = read_digits(&chars, &mut at, 2, pattern)?;
                         }
                         let sign = if negative { -1 } else { 1 };
-                        offset_seconds = hours * 3600 + sign * minutes * 60;
+                        offset_seconds = Some(hours * 3600 + sign * minutes * 60);
                     }
                     "TZM" => {
                         let minutes = read_digits(&chars, &mut at, 2, pattern)?;
-                        offset_seconds += if offset_seconds < 0 {
-                            -minutes
-                        } else {
-                            minutes
-                        } * 60;
+                        let hours = offset_seconds.unwrap_or(0);
+                        let signed = if hours < 0 { -minutes } else { minutes };
+                        offset_seconds = Some(hours + signed * 60);
                     }
                     "TZ" => {
                         while at < chars.len() && !chars[at].is_whitespace() {
@@ -603,7 +599,11 @@ pub(crate) fn parse_by_template(
     let ts = date
         .and_hms_micro_opt(hour as u32, minute as u32, second as u32, micros as u32)
         .ok_or_else(|| format!("date/time field value out of range: \"{text}\""))?;
-    Ok(Temporal::TimestampTz(ts - chrono::Duration::seconds(offset_seconds)).to_value())
+    let utc = match offset_seconds {
+        Some(offset) => ts - chrono::Duration::seconds(offset),
+        None => crate::timezone::from_session_local(ts),
+    };
+    Ok(Temporal::TimestampTz(utc).to_value())
 }
 
 /// Reads a number of at most `width` digits (any number for 0), signed,

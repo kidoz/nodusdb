@@ -82,7 +82,10 @@ impl MemExecutor {
                 filter.as_ref(),
                 *limit,
                 *offset,
-                sink,
+                &mut crate::timezone::LocalizingSink {
+                    inner: &mut *sink,
+                    zoned: None,
+                },
             )?
         {
             // A filter that failed to evaluate on a streamed row fails the query.

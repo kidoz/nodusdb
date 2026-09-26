@@ -1,9 +1,15 @@
-//! Time zones for `AT TIME ZONE` and `timezone()`: UTC, fixed offsets
-//! (POSIX-signed, as PostgreSQL reads `'+02'`), intervals, and named zones
-//! from the system's tz database (TZif files, with their POSIX rule for
-//! times past the last transition).
+//! Time zones for `AT TIME ZONE`, `timezone()`, and the session's
+//! `TimeZone` setting: UTC, fixed offsets (POSIX-signed, as PostgreSQL reads
+//! `'+02'`), intervals, and named zones from the system's tz database (TZif
+//! files, with their POSIX rule for times past the last transition).
+//!
+//! A zoned timestamp is kept in UTC; the session's zone applies where
+//! PostgreSQL's does: reading one without an offset, taking its local fields,
+//! and showing it.
 
 use chrono::{Datelike, NaiveDate, NaiveDateTime};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 /// A time zone: the UTC offset (seconds east) in effect at each instant.
 #[derive(Debug, Clone)]
@@ -31,12 +37,27 @@ impl Zone {
         {
             return Ok(Zone::Fixed(0));
         }
-        if let Some(offset) = posix_offset(trimmed) {
+        // `<-07>+07`: an abbreviation and a POSIX offset, as `SHOW TimeZone`
+        // reports a numeric or interval zone.
+        let offset_text = match trimmed.strip_prefix('<').and_then(|t| t.split_once('>')) {
+            Some((_, offset)) => offset,
+            None => trimmed,
+        };
+        if let Some(offset) = posix_offset(offset_text) {
             return Ok(Zone::Fixed(offset));
         }
         NamedZone::load(trimmed)
-            .map(Zone::Named)
+            .map(|(zone, _)| Zone::Named(zone))
             .ok_or_else(|| format!("time zone \"{trimmed}\" not recognized"))
+    }
+
+    /// The zone's abbreviation at the UTC instant `utc` (`EDT`), when it
+    /// has one.
+    pub(crate) fn abbreviation_at_utc(&self, utc: NaiveDateTime) -> Option<String> {
+        match self {
+            Zone::Fixed(_) => None,
+            Zone::Named(zone) => Some(zone.local_type(utc.and_utc().timestamp()).1),
+        }
     }
 
     /// The offset (seconds east of UTC) in effect at the UTC instant `utc`.
@@ -66,6 +87,163 @@ impl Zone {
             }
         }
     }
+}
+
+/// Resolves a zone once per name; tz database files are read only the
+/// first time.
+pub(crate) fn resolve_cached(name: &str) -> Result<Arc<Zone>, String> {
+    static ZONES: Mutex<Option<HashMap<String, Arc<Zone>>>> = Mutex::new(None);
+    let mut zones = ZONES.lock().unwrap_or_else(|e| e.into_inner());
+    let zones = zones.get_or_insert_with(HashMap::new);
+    if let Some(zone) = zones.get(name) {
+        return Ok(zone.clone());
+    }
+    let zone = Arc::new(Zone::resolve(name)?);
+    zones.insert(name.to_string(), zone.clone());
+    Ok(zone)
+}
+
+/// The session's `TimeZone` setting.
+pub(crate) fn session_zone_name() -> String {
+    crate::session_env::setting("timezone").unwrap_or_else(|| "UTC".to_string())
+}
+
+/// The session's time zone (UTC when its setting cannot be resolved).
+pub(crate) fn session_zone() -> Arc<Zone> {
+    resolve_cached(&session_zone_name()).unwrap_or_else(|_| Arc::new(Zone::Fixed(0)))
+}
+
+/// A UTC instant as local time in the session's zone, with the offset.
+pub(crate) fn to_session_local(utc: NaiveDateTime) -> (NaiveDateTime, i64) {
+    let offset = session_zone().offset_at_utc(utc);
+    (utc + chrono::Duration::seconds(offset), offset)
+}
+
+/// A local time in the session's zone as a UTC instant.
+pub(crate) fn from_session_local(local: NaiveDateTime) -> NaiveDateTime {
+    local - chrono::Duration::seconds(session_zone().offset_at_local(local))
+}
+
+/// The abbreviation `to_char`'s `TZ` shows for the session's zone at `utc`:
+/// the tz database's (`EDT`), `UTC`/`GMT`, a numeric zone's offset, or
+/// nothing for a bare POSIX offset.
+pub(crate) fn session_abbreviation(utc: NaiveDateTime) -> String {
+    let name = session_zone_name();
+    if let Some(abbreviation) = session_zone().abbreviation_at_utc(utc) {
+        return abbreviation;
+    }
+    if let Some((abbreviation, _)) = name.strip_prefix('<').and_then(|t| t.split_once('>')) {
+        return abbreviation.to_string();
+    }
+    match name.to_ascii_uppercase().as_str() {
+        "UTC" | "GMT" => name.to_ascii_uppercase(),
+        _ => String::new(),
+    }
+}
+
+/// A zoned timestamp's text (kept in UTC) as the session shows it: local
+/// time in its zone and that zone's offset. Other text is left as it is.
+pub(crate) fn session_timestamptz_text(text: &str) -> String {
+    match crate::value::parse_temporal(text) {
+        Some(parsed) if parsed.time.is_some() && parsed.offset.is_some() => {
+            let (local, offset) = to_session_local(parsed.utc());
+            format!(
+                "{}{}",
+                crate::value::format_timestamp(local, false),
+                offset_text(offset)
+            )
+        }
+        _ => text.to_string(),
+    }
+}
+
+/// Which result columns hold zoned timestamps (or arrays of them), to show
+/// in the session's zone; `None` when the session's zone is UTC or no
+/// column does.
+pub(crate) fn zoned_columns(types: &[String]) -> Option<Vec<bool>> {
+    if matches!(session_zone().as_ref(), Zone::Fixed(0)) {
+        return None;
+    }
+    let zoned: Vec<bool> = types
+        .iter()
+        .map(|t| {
+            let base = t.trim().trim_end_matches("[]");
+            crate::datetime::Kind::of_type(base) == Some(crate::datetime::Kind::TimestampTz)
+        })
+        .collect();
+    zoned.contains(&true).then_some(zoned)
+}
+
+/// A result row's zoned timestamps as the session shows them.
+pub(crate) fn localize_row(values: &mut [crate::Value], zoned: &[bool]) {
+    fn localize(value: &mut crate::Value) {
+        match value {
+            crate::Value::Text(text) => *text = session_timestamptz_text(text),
+            crate::Value::Array(items) => items.iter_mut().for_each(localize),
+            _ => {}
+        }
+    }
+    for (value, zoned) in values.iter_mut().zip(zoned) {
+        if *zoned {
+            localize(value);
+        }
+    }
+}
+
+/// A sink that shows the zoned timestamps of the rows it passes on in the
+/// session's zone.
+pub(crate) struct LocalizingSink<'a> {
+    pub(crate) inner: &'a mut dyn crate::RowSink,
+    pub(crate) zoned: Option<Vec<bool>>,
+}
+
+impl crate::RowSink for LocalizingSink<'_> {
+    fn schema(&mut self, columns: Vec<String>, types: Vec<String>) {
+        self.zoned = zoned_columns(&types);
+        self.inner.schema(columns, types);
+    }
+
+    fn row(&mut self, mut row: crate::Row) -> anyhow::Result<()> {
+        if let Some(zoned) = &self.zoned {
+            localize_row(&mut row.values, zoned);
+        }
+        self.inner.row(row)
+    }
+}
+
+/// `SET TIME ZONE`'s value as the setting keeps it, or the reason it is
+/// invalid: a zone name (spelled as the tz database spells it), a number of
+/// hours or an interval east of UTC (kept as `<-07>+07`).
+pub(crate) fn zone_setting(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    let invalid = |value: &str| format!("invalid value for parameter \"TimeZone\": \"{value}\"");
+    let east = if let Ok(hours) = trimmed.parse::<f64>() {
+        Some((hours * 3600.0).round() as i64)
+    } else if trimmed.len() > 8 && trimmed[..8].eq_ignore_ascii_case("interval") {
+        let text = trimmed[8..].trim_start();
+        let quoted = text.strip_prefix('\'').and_then(|t| t.split_once('\''));
+        let (value, _) = quoted.ok_or_else(|| invalid(trimmed))?;
+        let iv = crate::datetime::Interval::parse(value).ok_or_else(|| invalid(value))?;
+        if iv.months != 0 || iv.days != 0 {
+            return Err(invalid(value));
+        }
+        Some(iv.micros / crate::datetime::MICROS_PER_SECOND)
+    } else {
+        None
+    };
+    if let Some(east) = east {
+        return Ok(format!("<{}>{}", offset_text(east), offset_text(-east)));
+    }
+    let name = crate::session_vars::normalize_var_value(trimmed);
+    if name.eq_ignore_ascii_case("z") || name.eq_ignore_ascii_case("zulu") {
+        return Err(invalid(&name));
+    }
+    match name.to_ascii_uppercase().as_str() {
+        "UTC" | "GMT" => return Ok(name.to_ascii_uppercase()),
+        _ => {}
+    }
+    Zone::resolve(&name).map_err(|_| invalid(&name))?;
+    Ok(NamedZone::load(&name).map_or(name, |(_, canonical)| canonical))
 }
 
 /// Whether a declared type is `time with time zone`.
@@ -104,19 +282,18 @@ pub(crate) fn at_time_zone(
         Ok(Zone::Fixed(iv.micros / crate::datetime::MICROS_PER_SECOND))
     };
     let zone = if zone_type.and_then(Kind::of_type) == Some(Kind::Interval) {
-        interval_zone(
-            Interval::parse(&name)
-                .ok_or_else(|| format!("invalid input syntax for type interval: \"{name}\""))?,
-        )?
+        Arc::new(interval_zone(Interval::parse(&name).ok_or_else(|| {
+            format!("invalid input syntax for type interval: \"{name}\"")
+        })?)?)
     } else {
-        match Zone::resolve(&name) {
+        match resolve_cached(&name) {
             Ok(zone) => zone,
             Err(error) => match (name.contains(':')
                 || name.chars().any(|c| c.is_ascii_alphabetic()))
             .then(|| Interval::parse(&name))
             .flatten()
             {
-                Some(iv) => interval_zone(iv)?,
+                Some(iv) => Arc::new(interval_zone(iv)?),
                 None => return Err(error),
             },
         }
@@ -173,7 +350,7 @@ pub(crate) fn at_time_zone(
 }
 
 /// A UTC offset as PostgreSQL shows it: `+09`, `-04`, `+05:30`.
-fn offset_text(offset: i64) -> String {
+pub(crate) fn offset_text(offset: i64) -> String {
     let sign = if offset < 0 { '-' } else { '+' };
     let (hours, rest) = (offset.abs() / 3600, offset.abs() % 3600);
     match (rest / 60, rest % 60) {
@@ -222,16 +399,17 @@ fn posix_offset(name: &str) -> Option<i64> {
 /// A zone of the tz database.
 #[derive(Debug, Clone)]
 pub(crate) struct NamedZone {
-    /// Each transition's instant (Unix seconds) and the offset from then on.
-    transitions: Vec<(i64, i64)>,
-    /// The offset before the first transition.
-    initial: i64,
+    /// Each transition's instant (Unix seconds) and the local time type
+    /// (offset and abbreviation) from then on.
+    transitions: Vec<(i64, usize)>,
+    types: Vec<(i64, String)>,
     /// The rule for instants after the last transition.
     rule: Option<PosixRule>,
 }
 
 impl NamedZone {
-    fn load(name: &str) -> Option<NamedZone> {
+    /// The zone of that name and the name as the tz database spells it.
+    fn load(name: &str) -> Option<(NamedZone, String)> {
         if name.is_empty()
             || name.starts_with('/')
             || name.split('/').any(|part| part == ".." || part.is_empty())
@@ -243,28 +421,38 @@ impl NamedZone {
             "/usr/lib/zoneinfo".to_string(),
         ]);
         for directory in directories {
-            let path = std::path::Path::new(&directory).join(name);
-            if let Ok(bytes) = std::fs::read(&path) {
-                return parse_tzif(&bytes);
-            }
-            // Names are matched regardless of case (`europe/berlin`).
-            if let Some(found) = find_case_insensitive(std::path::Path::new(&directory), name)
-                && let Ok(bytes) = std::fs::read(found)
+            let directory = std::path::Path::new(&directory);
+            // Names are matched regardless of case (`europe/berlin`), and
+            // spelled as the tz database spells them.
+            if let Some(found) = find_case_insensitive(directory, name)
+                && let Ok(bytes) = std::fs::read(&found)
             {
-                return parse_tzif(&bytes);
+                let canonical = found
+                    .strip_prefix(directory)
+                    .ok()?
+                    .to_string_lossy()
+                    .into_owned();
+                return Some((parse_tzif(&bytes)?, canonical));
+            }
+            if let Ok(bytes) = std::fs::read(directory.join(name)) {
+                return Some((parse_tzif(&bytes)?, name.to_string()));
             }
         }
         None
     }
 
     fn offset_at(&self, instant: i64) -> i64 {
-        match self.transitions.partition_point(|(at, _)| *at <= instant) {
-            0 => self.initial,
-            n if n == self.transitions.len() => match &self.rule {
-                Some(rule) => rule.offset_at(instant),
-                None => self.transitions[n - 1].1,
-            },
-            n => self.transitions[n - 1].1,
+        self.local_type(instant).0
+    }
+
+    /// The offset and abbreviation in effect at `instant`.
+    fn local_type(&self, instant: i64) -> (i64, String) {
+        let n = self.transitions.partition_point(|(at, _)| *at <= instant);
+        match &self.rule {
+            // Past the last transition, the rule applies.
+            Some(rule) if n == self.transitions.len() => rule.local_type(instant),
+            _ if n == 0 => self.types.first().cloned().unwrap_or_default(),
+            _ => self.types[self.transitions[n - 1].1].clone(),
         }
     }
 }
@@ -308,10 +496,11 @@ fn parse_tzif(bytes: &[u8]) -> Option<NamedZone> {
     } else {
         (44, counts, 4)
     };
-    let [_, _, _, timecnt, typecnt, _] = counts;
+    let [_, _, _, timecnt, typecnt, charcnt] = counts;
     let times_at = start;
     let indexes_at = times_at + timecnt * time_size;
     let types_at = indexes_at + timecnt;
+    let chars_at = types_at + typecnt * 6;
     let read_time = |i: usize| -> Option<i64> {
         let at = times_at + i * time_size;
         Some(if time_size == 8 {
@@ -320,19 +509,24 @@ fn parse_tzif(bytes: &[u8]) -> Option<NamedZone> {
             i32::from_be_bytes(bytes.get(at..at + 4)?.try_into().ok()?) as i64
         })
     };
-    let type_offset = |t: usize| -> Option<i64> {
+    let chars = bytes.get(chars_at..chars_at + charcnt)?;
+    let mut types = Vec::with_capacity(typecnt);
+    for t in 0..typecnt {
         let at = types_at + t * 6;
-        Some(i32::from_be_bytes(bytes.get(at..at + 4)?.try_into().ok()?) as i64)
-    };
+        let offset = i32::from_be_bytes(bytes.get(at..at + 4)?.try_into().ok()?) as i64;
+        let name_at = *bytes.get(at + 5)? as usize;
+        let name = chars.get(name_at..)?;
+        let end = name.iter().position(|b| *b == 0).unwrap_or(name.len());
+        types.push((offset, String::from_utf8_lossy(&name[..end]).into_owned()));
+    }
     let mut transitions = Vec::with_capacity(timecnt);
     for i in 0..timecnt {
         let index = *bytes.get(indexes_at + i)? as usize;
         if index >= typecnt {
             return None;
         }
-        transitions.push((read_time(i)?, type_offset(index)?));
+        transitions.push((read_time(i)?, index));
     }
-    let initial = type_offset(0).unwrap_or(0);
     let rule = if version >= b'2' {
         let footer_at = start + v1_len(counts, time_size);
         let footer = bytes.get(footer_at..)?;
@@ -344,7 +538,7 @@ fn parse_tzif(bytes: &[u8]) -> Option<NamedZone> {
     };
     Some(NamedZone {
         transitions,
-        initial,
+        types,
         rule,
     })
 }
@@ -355,6 +549,8 @@ fn parse_tzif(bytes: &[u8]) -> Option<NamedZone> {
 struct PosixRule {
     standard: i64,
     daylight: Option<(i64, RuleDate, RuleDate)>,
+    /// The standard and daylight abbreviations.
+    names: (String, String),
 }
 
 /// When a daylight period starts or ends: a day of the year and the local
@@ -372,15 +568,16 @@ enum RuleDate {
 impl PosixRule {
     fn parse(text: &str) -> Option<PosixRule> {
         let mut rest = text;
-        skip_name(&mut rest)?;
+        let standard_name = read_name(&mut rest)?;
         let standard = -parse_rule_offset(&mut rest)?;
         if rest.is_empty() {
             return Some(PosixRule {
                 standard,
                 daylight: None,
+                names: (standard_name, String::new()),
             });
         }
-        skip_name(&mut rest)?;
+        let daylight_name = read_name(&mut rest)?;
         let daylight = if rest.starts_with(',') || rest.is_empty() {
             standard + 3600
         } else {
@@ -391,7 +588,19 @@ impl PosixRule {
         Some(PosixRule {
             standard,
             daylight: Some((daylight, RuleDate::parse(start)?, RuleDate::parse(end)?)),
+            names: (standard_name, daylight_name),
         })
+    }
+
+    /// The offset and abbreviation in effect at `instant`.
+    fn local_type(&self, instant: i64) -> (i64, String) {
+        let offset = self.offset_at(instant);
+        let name = if offset == self.standard {
+            &self.names.0
+        } else {
+            &self.names.1
+        };
+        (offset, name.clone())
     }
 
     fn offset_at(&self, instant: i64) -> i64 {
@@ -470,12 +679,13 @@ impl RuleDate {
     }
 }
 
-/// Skips a zone abbreviation: letters, or `<...>`.
-fn skip_name(rest: &mut &str) -> Option<()> {
+/// Reads a zone abbreviation: letters, or `<...>`.
+fn read_name(rest: &mut &str) -> Option<String> {
     if let Some(quoted) = rest.strip_prefix('<') {
         let end = quoted.find('>')?;
+        let name = quoted[..end].to_string();
         *rest = &quoted[end + 1..];
-        return Some(());
+        return Some(name);
     }
     let end = rest
         .find(|c: char| !c.is_ascii_alphabetic())
@@ -483,8 +693,9 @@ fn skip_name(rest: &mut &str) -> Option<()> {
     if end < 3 {
         return None;
     }
+    let name = rest[..end].to_string();
     *rest = &rest[end..];
-    Some(())
+    Some(name)
 }
 
 /// A rule's `[+-]hh[:mm[:ss]]` offset (west positive) as seconds.
@@ -552,6 +763,42 @@ mod tests {
         assert_eq!(zone.offset_at_local(at("2024-03-31 02:30:00")), 3600);
         assert_eq!(zone.offset_at_local(at("2024-10-27 02:30:00")), 3600);
         assert!(Zone::resolve("Nowhere/Nothing").is_err());
+    }
+
+    #[test]
+    fn time_zone_settings_take_postgresql_forms() {
+        assert_eq!(zone_setting("-7").unwrap(), "<-07>+07");
+        assert_eq!(
+            zone_setting("INTERVAL '+05:30' HOUR TO MINUTE").unwrap(),
+            "<+05:30>-05:30"
+        );
+        assert_eq!(zone_setting("'utc'").unwrap(), "UTC");
+        assert_eq!(zone_setting("'+05:30'").unwrap(), "+05:30");
+        assert!(zone_setting("'Mars/Olympus'").is_err());
+        assert!(zone_setting("'Z'").is_err());
+        // The kept forms resolve back to their offsets.
+        assert!(matches!(
+            Zone::resolve("<-07>+07"),
+            Ok(Zone::Fixed(-25_200))
+        ));
+        assert!(matches!(
+            Zone::resolve("<+05:30>-05:30"),
+            Ok(Zone::Fixed(19_800))
+        ));
+        if let Ok(name) = zone_setting("'america/new_york'") {
+            assert_eq!(name, "America/New_York");
+            let zone = Zone::resolve(&name).unwrap();
+            assert_eq!(
+                zone.abbreviation_at_utc(at("2024-07-01 12:00:00"))
+                    .as_deref(),
+                Some("EDT")
+            );
+            assert_eq!(
+                zone.abbreviation_at_utc(at("2024-01-01 12:00:00"))
+                    .as_deref(),
+                Some("EST")
+            );
+        }
     }
 
     #[test]

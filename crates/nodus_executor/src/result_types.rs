@@ -283,6 +283,105 @@ pub(crate) fn check_integer_ranges(
         }
         _ => {}
     }
+    // A zoned timestamp is kept in UTC: its local date, time, or timestamp
+    // is in the session's zone, and so is its text.
+    let zoned = |e: &ScalarExpr| kind(e) == Some(crate::datetime::Kind::TimestampTz);
+    let session_text = |e: &ScalarExpr| ScalarExpr::Function {
+        name: TZ_TEXT.to_string(),
+        args: vec![e.clone()],
+    };
+    match &checked {
+        ScalarExpr::Cast {
+            expr: inner,
+            target,
+        } if zoned(inner) => {
+            use crate::datetime::Kind;
+            if matches!(
+                Kind::of_type(target),
+                Some(Kind::Date | Kind::Timestamp | Kind::Time)
+            ) {
+                let local = ScalarExpr::Function {
+                    name: "TIMEZONE".to_string(),
+                    args: vec![
+                        ScalarExpr::Function {
+                            name: "CURRENT_SETTING".to_string(),
+                            args: vec![ScalarExpr::Literal(Value::Text("TimeZone".to_string()))],
+                        },
+                        (**inner).clone(),
+                        ScalarExpr::Literal(Value::Text(String::new())),
+                        ScalarExpr::Literal(Value::Text("TIMESTAMPTZ".to_string())),
+                    ],
+                };
+                return ScalarExpr::Cast {
+                    expr: Box::new(local),
+                    target: target.clone(),
+                };
+            }
+            if is_text_type(target) {
+                return session_text(inner);
+            }
+        }
+        ScalarExpr::Binary {
+            op: ScalarBinaryOp::Concat,
+            left,
+            right,
+        } if zoned(left) || zoned(right) => {
+            let text = |e: &ScalarExpr| if zoned(e) { session_text(e) } else { e.clone() };
+            return ScalarExpr::Binary {
+                op: ScalarBinaryOp::Concat,
+                left: Box::new(text(left)),
+                right: Box::new(text(right)),
+            };
+        }
+        // Text-building functions take a zoned timestamp's text.
+        ScalarExpr::Function { name, args }
+            if matches!(name.as_str(), "CONCAT" | "CONCAT_WS" | "FORMAT")
+                && args.iter().any(zoned) =>
+        {
+            return ScalarExpr::Function {
+                name: name.clone(),
+                args: args
+                    .iter()
+                    .map(|a| if zoned(a) { session_text(a) } else { a.clone() })
+                    .collect(),
+            };
+        }
+        // A timestamp is JSON in ISO 8601 form (`2024-07-01T12:00:00`).
+        ScalarExpr::Function { name, args }
+            if matches!(
+                name.as_str(),
+                "TO_JSON"
+                    | "TO_JSONB"
+                    | "JSON_BUILD_OBJECT"
+                    | "JSONB_BUILD_OBJECT"
+                    | "JSON_BUILD_ARRAY"
+                    | "JSONB_BUILD_ARRAY"
+            ) && args.iter().any(|a| {
+                matches!(
+                    kind(a),
+                    Some(crate::datetime::Kind::Timestamp | crate::datetime::Kind::TimestampTz)
+                )
+            }) =>
+        {
+            let iso = |a: &ScalarExpr| match kind(a) {
+                Some(
+                    k @ (crate::datetime::Kind::Timestamp | crate::datetime::Kind::TimestampTz),
+                ) => ScalarExpr::Function {
+                    name: JSON_TIME.to_string(),
+                    args: vec![
+                        a.clone(),
+                        ScalarExpr::Literal(Value::Text(k.type_name().to_string())),
+                    ],
+                },
+                _ => a.clone(),
+            };
+            return ScalarExpr::Function {
+                name: name.clone(),
+                args: args.iter().map(iso).collect(),
+            };
+        }
+        _ => {}
+    }
     // `timezone(zone, value)` reads its arguments by their types: an
     // interval zone is east of UTC, and a time becomes a zoned time.
     // So does OVERLAPS, whose ends may be times or intervals.
@@ -338,6 +437,24 @@ pub(crate) fn check_integer_ranges(
         },
         _ => checked,
     }
+}
+
+/// The function a zoned timestamp's text is rewritten to: the value as
+/// the session shows it.
+pub(crate) const TZ_TEXT: &str = "__TZ_TEXT__";
+
+/// The function a timestamp given to `to_json` is rewritten to:
+/// `__JSON_TIME__(value, type)`, its ISO 8601 text.
+pub(crate) const JSON_TIME: &str = "__JSON_TIME__";
+
+/// Whether a declared type is a character string type.
+fn is_text_type(data_type: &str) -> bool {
+    let upper = data_type.trim().to_ascii_uppercase();
+    let base = upper.split('(').next().unwrap_or_default().trim();
+    matches!(
+        base,
+        "TEXT" | "VARCHAR" | "CHARACTER VARYING" | "CHAR" | "CHARACTER" | "BPCHAR" | "NAME"
+    )
 }
 
 /// The function date/time arithmetic is rewritten to:

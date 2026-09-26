@@ -1,0 +1,209 @@
+# The session's TimeZone: zoned timestamps are kept as instants and shown, read, and split into fields in it.
+statement ok
+CREATE TABLE stz (id int PRIMARY KEY, t timestamptz);
+
+statement ok
+INSERT INTO stz VALUES (1, '2024-01-15 10:00:00+00'), (2, '2024-01-15 23:30:00+00'), (3, '2024-07-01 03:00:00+00');
+
+query T
+SHOW TimeZone;
+----
+UTC
+
+statement ok
+SET TIME ZONE 'America/New_York';
+
+query T
+SHOW TimeZone;
+----
+America/New_York
+
+query TT
+SELECT id, t FROM stz ORDER BY id;
+----
+1	2024-01-15 05:00:00-05
+2	2024-01-15 18:30:00-05
+3	2024-06-30 23:00:00-04
+
+query TTT
+SELECT timestamptz '2024-07-01 12:00:00', timestamptz '2024-07-01 12:00:00+00', '2024-01-01 12:00'::timestamptz;
+----
+2024-07-01 12:00:00-04	2024-07-01 08:00:00-04	2024-01-01 12:00:00-05
+
+query TTTTT
+SELECT id, t::date, t::timestamp, t::time, t::text FROM stz ORDER BY id;
+----
+1	2024-01-15	2024-01-15 05:00:00	05:00:00	2024-01-15 05:00:00-05
+2	2024-01-15	2024-01-15 18:30:00	18:30:00	2024-01-15 18:30:00-05
+3	2024-06-30	2024-06-30 23:00:00	23:00:00	2024-06-30 23:00:00-04
+
+query TT
+SELECT timestamp '2024-07-01 12:00:00'::timestamptz, date '2024-07-01'::timestamptz;
+----
+2024-07-01 12:00:00-04	2024-07-01 00:00:00-04
+
+query TTTTT
+SELECT id, extract(hour from t), extract(day from t), extract(timezone from t), extract(epoch from t) FROM stz ORDER BY id;
+----
+1	5	15	-18000	1705312800.000000
+2	18	15	-18000	1705361400.000000
+3	23	30	-14400	1719802800.000000
+
+query TTTT
+SELECT id, date_trunc('day', t), date_trunc('month', t), to_char(t, 'YYYY-MM-DD HH24:MI TZ OF') FROM stz ORDER BY id;
+----
+1	2024-01-15 00:00:00-05	2024-01-01 00:00:00-05	2024-01-15 05:00 EST -05
+2	2024-01-15 00:00:00-05	2024-01-01 00:00:00-05	2024-01-15 18:30 EST -05
+3	2024-06-30 00:00:00-04	2024-06-01 00:00:00-04	2024-06-30 23:00 EDT -04
+
+query T
+SELECT id FROM stz WHERE t < '2024-01-15 06:00:00' ORDER BY id;
+----
+1
+
+query T
+SELECT id FROM stz WHERE t >= '2024-01-15' AND t < '2024-01-16' ORDER BY id;
+----
+1
+2
+
+query TT
+SELECT t::date AS day, count(*) FROM stz GROUP BY 1 ORDER BY 1;
+----
+2024-01-15	2
+2024-06-30	1
+
+query TT
+SELECT timestamptz '2024-03-09 12:00:00' + interval '1 day', timestamptz '2024-03-09 12:00:00' + interval '24 hours';
+----
+2024-03-10 12:00:00-04	2024-03-10 13:00:00-04
+
+query TT
+SELECT timestamptz '2024-03-11 12:00:00' - timestamptz '2024-03-09 12:00:00', age(timestamptz '2024-03-11 12:00:00', timestamptz '2024-03-09 12:00:00');
+----
+1 day 23:00:00	2 days
+
+query T
+SELECT generate_series(timestamptz '2024-03-09 00:00', timestamptz '2024-03-12 00:00', interval '1 day');
+----
+2024-03-09 00:00:00-05
+2024-03-10 00:00:00-05
+2024-03-11 00:00:00-04
+2024-03-12 00:00:00-04
+
+query TTT
+SELECT make_timestamptz(2024, 7, 1, 12, 0, 0), to_timestamp(0), to_timestamp('2024-07-01 10:00', 'YYYY-MM-DD HH24:MI');
+----
+2024-07-01 12:00:00-04	1969-12-31 19:00:00-05	2024-07-01 10:00:00-04
+
+query TTT
+SELECT to_json(timestamptz '2024-07-01 12:00:00+00'), to_json(timestamp '2024-07-01 12:00:00'), json_build_object('t', timestamptz '2024-07-01 12:00:00+00');
+----
+"2024-07-01T08:00:00-04:00"	"2024-07-01T12:00:00"	{"t" : "2024-07-01T08:00:00-04:00"}
+
+query TT
+SELECT timestamptz '2024-07-01 12:00:00+00' || '', concat(timestamptz '2024-07-01 12:00:00+00', '!');
+----
+2024-07-01 08:00:00-04	2024-07-01 08:00:00-04!
+
+query TT
+SELECT timestamptz '2024-07-01 02:00:00+00' AT TIME ZONE 'UTC', timestamp '2024-07-01 02:00:00' AT TIME ZONE 'UTC';
+----
+2024-07-01 02:00:00	2024-06-30 22:00:00-04
+
+statement ok
+SET TIME ZONE 'Asia/Tokyo';
+
+statement ok
+INSERT INTO stz VALUES (4, '2024-02-01 09:00');
+
+statement ok
+SET TIME ZONE 'UTC';
+
+query T
+SELECT t FROM stz WHERE id = 4;
+----
+2024-02-01 00:00:00+00
+
+statement ok
+SET TIME ZONE '+05:30';
+
+query TT
+SELECT current_setting('TimeZone'), timestamptz '2024-07-01 12:00:00+00';
+----
++05:30	2024-07-01 06:30:00-05:30
+
+statement ok
+SET TIME ZONE INTERVAL '+05:30' HOUR TO MINUTE;
+
+query TT
+SELECT current_setting('TimeZone'), timestamptz '2024-07-01 12:00:00+00';
+----
+<+05:30>-05:30	2024-07-01 17:30:00+05:30
+
+statement ok
+SET TIME ZONE -7;
+
+query TT
+SELECT current_setting('TimeZone'), timestamptz '2024-07-01 12:00:00+00';
+----
+<-07>+07	2024-07-01 05:00:00-07
+
+statement error
+SET TIME ZONE 'Mars/Olympus';
+
+statement ok
+SET TIME ZONE 'europe/london';
+
+query TT
+SELECT current_setting('TimeZone'), to_char(timestamptz '2024-07-01 12:00:00+00', 'HH24:MI TZ');
+----
+Europe/London	13:00 BST
+
+statement ok
+SET TIME ZONE LOCAL;
+
+query T
+SHOW TimeZone;
+----
+UTC
+
+statement ok
+SET timezone = 'Asia/Kolkata';
+
+statement ok
+RESET timezone;
+
+query T
+SHOW TimeZone;
+----
+UTC
+
+query TT
+SELECT set_config('timezone', 'Asia/Tokyo', false), timestamptz '2024-07-01 12:00:00+00';
+----
+Asia/Tokyo	2024-07-01 21:00:00+09
+
+query T
+SELECT timestamptz '2024-07-01 12:00:00+00';
+----
+2024-07-01 21:00:00+09
+
+statement ok
+BEGIN;
+
+statement ok
+SET LOCAL TIME ZONE 'America/New_York';
+
+query T
+SELECT timestamptz '2024-07-01 12:00:00+00';
+----
+2024-07-01 08:00:00-04
+
+statement ok
+COMMIT;
+
+query TT
+SELECT current_setting('TimeZone'), timestamptz '2024-07-01 12:00:00+00';
+----
+Asia/Tokyo	2024-07-01 21:00:00+09
