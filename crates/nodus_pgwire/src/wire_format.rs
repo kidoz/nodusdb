@@ -22,6 +22,8 @@ use crate::type_map::map_declared_type;
 /// back to `XX000` (`internal_error`), which is the signal that a new class
 /// should be added here rather than silently mislabeled.
 pub(crate) fn sqlstate_for_execution_error(err_str: &str) -> &'static str {
+    // Only the message classifies an error, not the fields after it.
+    let err_str = nodus_executor::error_message(err_str);
     // Routing retries and unsupported consistency modes.
     if err_str.starts_with("shard unavailable:") || err_str.starts_with("shard routing changed") {
         "40001" // serialization_failure: retry against a current, available route
@@ -229,11 +231,30 @@ pub(crate) fn normalize_guc_value(raw: &str) -> String {
 }
 
 pub(crate) fn user_error(severity: &str, code: &str, message: impl Into<String>) -> PgWireError {
-    PgWireError::UserError(Box::new(ErrorInfo::new(
+    PgWireError::UserError(Box::new(error_info(severity, code, &message.into())))
+}
+
+/// An error response for `error`: its message, and the fields that follow
+/// it (`DETAIL`, `HINT`, and the schema, table, column, and constraint).
+pub(crate) fn error_info(severity: &str, code: &str, error: &str) -> ErrorInfo {
+    let mut info = ErrorInfo::new(
         severity.to_owned(),
         code.to_owned(),
-        message.into(),
-    )))
+        nodus_executor::error_message(error).to_owned(),
+    );
+    for (name, value) in nodus_executor::error_fields(error) {
+        let value = Some(value.to_owned());
+        match name {
+            "detail" => info.detail = value,
+            "hint" => info.hint = value,
+            "schema" => info.schema = value,
+            "table" => info.table = value,
+            "column" => info.column = value,
+            "constraint" => info.constraint = value,
+            _ => {}
+        }
+    }
+    info
 }
 
 pub(crate) fn row_description(fields: &[FieldInfo]) -> RowDescription {

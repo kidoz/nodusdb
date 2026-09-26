@@ -1437,7 +1437,13 @@ impl nodus_import::ImportSink for ExecutorImportSink {
     fn execute(&mut self, stmt: &nodus_import::ImportStatement) -> anyhow::Result<u64> {
         for parsed in nodus_sql::parse_sql(&stmt.sql)? {
             let plan = nodus_executor::plan_statement(&parsed, &[])?;
-            self.executor.execute_logical(&self.ctx, plan)?;
+            // The report shows the error's message, without the fields
+            // (DETAIL, constraint) that travel after it.
+            self.executor
+                .execute_logical(&self.ctx, plan)
+                .map_err(|e| {
+                    anyhow::anyhow!("{}", nodus_executor::error_message(&e.to_string()))
+                })?;
         }
         Ok(stmt.rows)
     }

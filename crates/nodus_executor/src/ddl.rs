@@ -2,6 +2,7 @@
 //! drops, ALTER TABLE, CREATE ROLE, and GRANT/REVOKE.
 
 use crate::aggregates::*;
+use crate::error_fields::DbError;
 use crate::*;
 use anyhow::Result;
 use bytes::Bytes;
@@ -19,24 +20,32 @@ impl MemExecutor {
     ) -> Result<QueryOutput> {
         let db = self.catalog_reader.get_database("default")?;
         self.authorize(ctx, Action::CreateSchema, ResourceRef::Database(db.id))?;
-        match self
-            .catalog_writer
+        // Checked first: a replicated catalog reports a lost race only as a
+        // missing schema.
+        if self
+            .catalog_reader
+            .get_schema("default", &schema_name)
+            .is_ok()
+        {
+            if if_not_exists {
+                self.notice(
+                    ctx,
+                    DbError::new(format!("schema \"{schema_name}\" already exists, skipping"))
+                        .code("42P06"),
+                );
+                return Ok(QueryOutput::tag("CREATE SCHEMA"));
+            }
+            anyhow::bail!("schema \"{schema_name}\" already exists");
+        }
+        self.catalog_writer
             .create_schema(nodus_catalog::CreateSchemaRequest {
                 id: nodus_catalog::SchemaId::new(),
                 database_id: db.id,
                 name: schema_name,
                 owner_role_id: None,
                 managed_access: false,
-            }) {
-            Ok(_) => Ok(QueryOutput::tag("CREATE SCHEMA")),
-            Err(e) => {
-                if if_not_exists && e.to_string().contains("already exists") {
-                    Ok(QueryOutput::tag("CREATE SCHEMA"))
-                } else {
-                    Err(anyhow::anyhow!(e))
-                }
-            }
-        }
+            })?;
+        Ok(QueryOutput::tag("CREATE SCHEMA"))
     }
     pub(crate) fn exec_drop_schema(
         &self,
@@ -53,6 +62,10 @@ impl MemExecutor {
             }
             Err(e) => {
                 if if_exists {
+                    self.notice(
+                        ctx,
+                        DbError::new(format!("schema \"{schema_name}\" does not exist, skipping")),
+                    );
                     Ok(QueryOutput::tag("DROP SCHEMA"))
                 } else {
                     Err(anyhow::anyhow!(e))
@@ -86,6 +99,7 @@ impl MemExecutor {
             .is_ok()
         {
             if if_not_exists {
+                self.notice(ctx, Self::exists_skipping(table_only));
                 return Ok(QueryOutput::tag("CREATE TABLE"));
             }
             anyhow::bail!("relation \"{}\" already exists", table_only);
@@ -251,6 +265,7 @@ impl MemExecutor {
             .is_ok()
         {
             if if_not_exists {
+                self.notice(ctx, Self::exists_skipping(table_only));
                 return Ok(QueryOutput::tag("CREATE SEQUENCE"));
             }
             anyhow::bail!("relation \"{table_only}\" already exists");
@@ -305,7 +320,12 @@ impl MemExecutor {
                     self.catalog_writer.drop_table(tbl.id)?;
                 }
                 Ok(_) => anyhow::bail!("\"{table_only}\" is not a sequence"),
-                Err(_) if if_exists => {}
+                Err(_) if if_exists => self.notice(
+                    ctx,
+                    DbError::new(format!(
+                        "sequence \"{table_only}\" does not exist, skipping"
+                    )),
+                ),
                 Err(_) => anyhow::bail!("sequence \"{table_only}\" does not exist"),
             }
         }
@@ -336,6 +356,7 @@ impl MemExecutor {
             .is_ok()
         {
             if if_not_exists {
+                self.notice(ctx, Self::exists_skipping(table_only));
                 return Ok(QueryOutput::tag(command));
             }
             anyhow::bail!("relation \"{}\" already exists", table_only);
@@ -628,6 +649,12 @@ impl MemExecutor {
             }
         }
     }
+
+    /// The notice for `CREATE ... IF NOT EXISTS` of a relation that exists.
+    fn exists_skipping(relation: &str) -> DbError {
+        DbError::new(format!("relation \"{relation}\" already exists, skipping")).code("42P07")
+    }
+
     pub(crate) fn exec_alter_table(
         &self,
         ctx: &ExecutionContext,
@@ -758,6 +785,7 @@ impl MemExecutor {
 
         if tbl.indexes.iter().any(|i| i.name == name) {
             if if_not_exists {
+                self.notice(ctx, Self::exists_skipping(&name));
                 return Ok(QueryOutput::tag("CREATE INDEX"));
             }
             anyhow::bail!("relation \"{}\" already exists", name);
@@ -863,6 +891,10 @@ impl MemExecutor {
             }
         }
         if if_exists {
+            self.notice(
+                ctx,
+                DbError::new(format!("index \"{name}\" does not exist, skipping")),
+            );
             Ok(QueryOutput::tag("DROP INDEX"))
         } else {
             anyhow::bail!("index \"{}\" does not exist", name)

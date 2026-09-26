@@ -312,10 +312,8 @@ impl NodusExtendedQueryHandler {
                 mark_error_status(client);
                 let msg = e.to_string();
                 let code = sqlstate_for_execution_error(&msg);
-                Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                    "ERROR".to_owned(),
-                    code.to_owned(),
-                    msg,
+                Err(PgWireError::UserError(Box::new(error_info(
+                    "ERROR", code, &msg,
                 ))))
             }
         }
@@ -1114,12 +1112,14 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
 
         let plan = transaction_plan(client, plan)?;
         let executed_plan = plan.clone();
-        let out = match execute_off_reactor(self.executor.clone(), ctx.clone(), plan).await {
+        let result = execute_off_reactor(self.executor.clone(), ctx.clone(), plan).await;
+        crate::send_notices(client, self.executor.as_ref(), &session_id).await?;
+        let out = match result {
             Ok(out) => out,
             Err(e) => {
                 let err_str = e.to_string();
                 let code = sqlstate_for_execution_error(&err_str);
-                let err = ErrorInfo::new("ERROR".to_owned(), code.to_owned(), err_str);
+                let err = error_info("ERROR", code, &err_str);
                 mark_execution_failed(client, &executed_plan);
                 return Err(PgWireError::UserError(Box::new(err)));
             }

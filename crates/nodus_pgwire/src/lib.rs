@@ -34,6 +34,33 @@ pub(crate) const POSTGRES_TYPEMOD_NONE: i32 = -1;
 /// paths route through the async `RaftRouter`, which waits via `blocking_recv`
 /// and would panic (and risk worker-pool starvation) if called on a runtime
 /// worker thread.
+/// Sends the notices the session's statements raised, ahead of the
+/// statement's result or error.
+pub(crate) async fn send_notices<C>(
+    client: &mut C,
+    executor: &dyn nodus_executor::Executor,
+    session_id: &str,
+) -> pgwire::error::PgWireResult<()>
+where
+    C: futures_util::Sink<pgwire::messages::PgWireBackendMessage> + Unpin,
+    pgwire::error::PgWireError: From<C::Error>,
+{
+    use futures_util::SinkExt;
+    for notice in executor.take_notices(session_id) {
+        let code = nodus_executor::error_fields(&notice)
+            .into_iter()
+            .find(|(name, _)| *name == "code")
+            .map_or("00000", |(_, code)| code);
+        let info = wire_format::error_info("NOTICE", code, &notice);
+        client
+            .send(pgwire::messages::PgWireBackendMessage::NoticeResponse(
+                info.into(),
+            ))
+            .await?;
+    }
+    Ok(())
+}
+
 pub(crate) async fn execute_off_reactor(
     executor: Arc<dyn nodus_executor::Executor>,
     ctx: nodus_executor::ExecutionContext,

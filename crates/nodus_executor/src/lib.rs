@@ -21,6 +21,7 @@ mod constraints;
 mod cte_scope;
 mod ddl;
 mod dml;
+mod error_fields;
 mod eval_error;
 mod execute;
 mod explain;
@@ -46,6 +47,7 @@ mod table_functions;
 mod transactions;
 mod value;
 mod view_helpers;
+pub use error_fields::{error_fields, error_message};
 pub use explain::ExplainOptions;
 pub use json_text::{json_text, jsonb_text};
 pub use plan_types::{
@@ -188,6 +190,13 @@ pub trait Executor: Send + Sync {
     /// connection closes. Default is a no-op for executors that hold none.
     fn end_session(&self, _session_id: &str) {}
 
+    /// Takes the notices the session's statements raised since the last
+    /// call (`table "t" does not exist, skipping`), oldest first, each a
+    /// message with fields (see [`error_fields`]).
+    fn take_notices(&self, _session_id: &str) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Executes `plan`, streaming its result to `sink`: the schema first, then
     /// each row. A plain single-table scan streams row-by-row with bounded
     /// memory; every other shape is fully executed and its rows then pushed.
@@ -298,6 +307,8 @@ pub struct MemExecutor {
     pub(crate) restore_gate: Arc<parking_lot::RwLock<()>>,
     /// Sequence state access for `nextval` and friends.
     pub(crate) sequences: Arc<sequences::SequenceStore>,
+    /// Notices raised per session and not yet taken by the wire layer.
+    pub(crate) notices: parking_lot::Mutex<HashMap<String, Vec<String>>>,
 }
 
 impl MemExecutor {
@@ -326,7 +337,17 @@ impl MemExecutor {
             session_vars: parking_lot::RwLock::new(HashMap::new()),
             restoring: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             restore_gate: Arc::new(parking_lot::RwLock::new(())),
+            notices: parking_lot::Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Raises a notice to the session running `ctx`'s statement.
+    pub(crate) fn notice(&self, ctx: &ExecutionContext, notice: error_fields::DbError) {
+        self.notices
+            .lock()
+            .entry(ctx.session_id.clone())
+            .or_default()
+            .push(notice.into_text());
     }
 
     /// Shared handle to the restore-in-progress flag, so the admin restore path
@@ -951,8 +972,13 @@ impl Executor for MemExecutor {
         self.stream_or_fallback(ctx, plan, sink)
     }
 
+    fn take_notices(&self, session_id: &str) -> Vec<String> {
+        self.notices.lock().remove(session_id).unwrap_or_default()
+    }
+
     fn end_session(&self, session_id: &str) {
         self.session_vars.write().remove(session_id);
+        self.notices.lock().remove(session_id);
         self.sequences.end_session(session_id);
         if let Some(txn) = self.active_txns.write().remove(session_id) {
             // A client that drops mid-transaction must not leave the write intent
