@@ -29,6 +29,8 @@ pub(crate) fn render_scalar_text(value: &nodus_executor::Value, declared: &Type)
         nodus_executor::Value::Array(arr) => render_array_text(arr),
         nodus_executor::Value::Jsonb(j) if *declared == Type::JSON => nodus_executor::json_text(j),
         nodus_executor::Value::Jsonb(j) => nodus_executor::jsonb_text(j),
+        nodus_executor::Value::Json(text) => text.clone(),
+        record @ nodus_executor::Value::Record(_) => nodus_executor::render(record),
         nodus_executor::Value::Null => String::new(),
     }
 }

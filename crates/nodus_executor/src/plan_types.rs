@@ -128,6 +128,26 @@ pub struct TableFnSpec {
     pub rows_from: Vec<TableFnSpec>,
 }
 
+impl TableFnSpec {
+    /// Whether the function returns a single value a row, rather than a row
+    /// of several.
+    pub(crate) fn returns_scalar(&self) -> bool {
+        self.rows_from.is_empty()
+            && !self.with_ordinality
+            && match self.name.as_str() {
+                "unnest" => self.args.len().max(self.arg_exprs.len()) == 1,
+                "generate_series"
+                | "jsonb_array_elements"
+                | "jsonb_array_elements_text"
+                | "json_array_elements"
+                | "json_array_elements_text"
+                | "regexp_split_to_table"
+                | "pg_partition_ancestors" => true,
+                _ => false,
+            }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Join {
     pub table_name: String,

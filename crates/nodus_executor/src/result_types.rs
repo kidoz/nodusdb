@@ -41,6 +41,7 @@ fn literal_type(value: &Value) -> Option<String> {
             Value::Bool(_) => "BOOLEAN",
             Value::Text(_) => "TEXT",
             Value::Jsonb(_) => "JSONB",
+            Value::Json(_) => "JSON",
             Value::Array(items) => {
                 return items
                     .iter()

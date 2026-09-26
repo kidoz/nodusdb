@@ -133,7 +133,26 @@ pub(crate) fn aggregate_inputs(op: &AggregateOp, inputs: &[(Value, Vec<Value>)])
             }
             result.map_or(Value::Null, Value::Bool)
         }
-        AggregateOp::JsonAgg | AggregateOp::JsonbAgg => {
+        AggregateOp::JsonAgg => {
+            if inputs.is_empty() {
+                return Value::Null;
+            }
+            // Arrays and rows each start a line after the first.
+            let structured = values().any(|v| matches!(v, Value::Array(_) | Value::Record(_)));
+            let mut out = String::from("[");
+            for (i, value) in values().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                    if structured && *value != Value::Null {
+                        out.push_str("\n ");
+                    }
+                }
+                crate::json_text::value_json(value, false, &mut out);
+            }
+            out.push(']');
+            Value::Json(out)
+        }
+        AggregateOp::JsonbAgg => {
             if inputs.is_empty() {
                 Value::Null
             } else {
@@ -142,7 +161,29 @@ pub(crate) fn aggregate_inputs(op: &AggregateOp, inputs: &[(Value, Vec<Value>)])
                 ))
             }
         }
-        AggregateOp::JsonObjectAgg | AggregateOp::JsonbObjectAgg => {
+        AggregateOp::JsonObjectAgg => {
+            if inputs.is_empty() {
+                return Value::Null;
+            }
+            let mut out = String::from("{ ");
+            for (i, (key, extra)) in inputs.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                if let Err(e) = crate::json_text::key_json(key, &mut out) {
+                    return crate::eval_error::raise(e);
+                }
+                out.push_str(" : ");
+                crate::json_text::value_json(
+                    extra.first().unwrap_or(&Value::Null),
+                    false,
+                    &mut out,
+                );
+            }
+            out.push_str(" }");
+            Value::Json(out)
+        }
+        AggregateOp::JsonbObjectAgg => {
             if inputs.is_empty() {
                 return Value::Null;
             }

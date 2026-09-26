@@ -252,6 +252,17 @@ pub(crate) fn try_cast(v: Value, data_type: &str) -> std::result::Result<Value, 
             crate::value::sql_type_name(data_type)
         )
     };
+    let target = data_type.trim().to_ascii_uppercase();
+    // `json` keeps its text as `json`, and is that text as anything else.
+    let v = match v {
+        Value::Json(text) if target == "JSON" => return Ok(Value::Json(text)),
+        Value::Json(text) => Value::Text(text),
+        Value::Record(_) => Value::Text(render(&v)),
+        Value::Jsonb(j) if target == "JSON" => {
+            return Ok(Value::Json(crate::json_text::jsonb_text(&j)));
+        }
+        other => other,
+    };
     // PostgreSQL 18 casts a JSON scalar to a number or boolean; JSON null is NULL.
     let v = match v {
         Value::Jsonb(serde_json::Value::Null) => return Ok(Value::Null),
@@ -339,7 +350,7 @@ pub(crate) fn try_cast(v: Value, data_type: &str) -> std::result::Result<Value, 
                 // `json` keeps its text; `jsonb` is the parsed document.
                 Value::Text(s) if upper == "JSON" => {
                     crate::json_text::parse(s)?;
-                    v
+                    Value::Json(s.clone())
                 }
                 Value::Text(s) if upper == "JSONB" => Value::Jsonb(crate::json_text::parse(s)?),
                 Value::Text(s) if let Some(kind) = crate::value::temporal_type(data_type) => {
@@ -1010,14 +1021,16 @@ pub(crate) fn lower_scalar(expr: &sqlparser::ast::Expr, params: &[Value]) -> Opt
                         match lower_scalar(e, params)? {
                             ScalarExpr::Column(col) => (col, None),
                             // Aggregate over a computed expression, e.g. `sum(a + 1)`.
-                            other => (String::new(), Some(Box::new(other))),
+                            other => (String::new(), Some(Box::new(json_arg(&name, other)))),
                         }
                     }
                     _ => return None,
                 };
                 let extra_args = args
                     .map(|a| match a {
-                        FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => lower_scalar(e, params),
+                        FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => {
+                            lower_scalar(e, params).map(|e| json_arg(&name, e))
+                        }
                         _ => None,
                     })
                     .collect::<Option<Vec<_>>>()?;
@@ -1055,6 +1068,7 @@ pub(crate) fn lower_scalar(expr: &sqlparser::ast::Expr, params: &[Value]) -> Opt
                 }
                 _ => return None,
             };
+            let args = args.into_iter().map(|a| json_arg(&name, a)).collect();
             Some(ScalarExpr::Function { name, args })
         }
         // sqlparser lowers SUBSTRING/SUBSTR and TRIM to dedicated AST nodes
@@ -1860,6 +1874,30 @@ fn is_keyword_function(upper: &str) -> bool {
     )
 }
 
+/// An argument of function `name`: a row constructor given to a JSON
+/// function is a row with fields `f1`, `f2`, ..., which the function writes
+/// as an object.
+fn json_arg(name: &str, arg: ScalarExpr) -> ScalarExpr {
+    let json =
+        name.starts_with("JSON") || name.starts_with("TO_JSON") || name.ends_with("_TO_JSON");
+    match arg {
+        ScalarExpr::Row(items) if json => ScalarExpr::Function {
+            name: "__RECORD__".to_string(),
+            args: items
+                .into_iter()
+                .enumerate()
+                .flat_map(|(i, item)| {
+                    [
+                        ScalarExpr::Literal(Value::Text(format!("f{}", i + 1))),
+                        item,
+                    ]
+                })
+                .collect(),
+        },
+        other => other,
+    }
+}
+
 /// The error for the first call to a function NodusDB does not provide, if
 /// an expression makes one: PostgreSQL's `function f(types) does not exist`.
 pub(crate) fn unknown_function_error(expr: &sqlparser::ast::Expr) -> Option<String> {
@@ -2325,6 +2363,35 @@ fn apply_json_array_op(op: ScalarBinaryOp, l: &Value, r: &Value) -> Value {
         Op::Overlap => {
             let (a, b) = (texts(l), texts(r));
             Value::Bool(a.iter().any(|x| b.contains(x)))
+        }
+        // `json` gives its members as written.
+        Op::JsonGet | Op::JsonGetText | Op::JsonPath | Op::JsonPathText
+            if let Value::Json(text) = l =>
+        {
+            let member = match op {
+                Op::JsonGet | Op::JsonGetText => crate::json_text::json_member(text, r),
+                _ => {
+                    let mut cur = Some(text.as_str());
+                    for key in texts(r) {
+                        cur = cur.and_then(|doc| {
+                            // A path step into an array is an index.
+                            let step = match key.trim().parse::<i64>() {
+                                Ok(i) if doc.trim_start().starts_with('[') => Value::Int(i),
+                                _ => Value::Text(key.clone()),
+                            };
+                            crate::json_text::json_member(doc, &step)
+                        });
+                    }
+                    cur
+                }
+            };
+            match member {
+                None => Value::Null,
+                Some(m) if matches!(op, Op::JsonGetText | Op::JsonPathText) => {
+                    crate::json_text::json_member_text(m)
+                }
+                Some(m) => Value::Json(m.to_string()),
+            }
         }
         _ => {
             let Some(json) = crate::filter_eval::value_to_json(l) else {

@@ -1,0 +1,178 @@
+# JSON built by functions keeps PostgreSQL's layout; json values keep their
+# text; a relation's name stands for its row.
+query T
+SELECT row_to_json(t) FROM (SELECT 1 AS a, 'x' AS b) t;
+----
+{"a":1,"b":"x"}
+
+query TT
+SELECT row_to_json(row(1, 'x')), to_json(row(1, 'x'));
+----
+{"f1":1,"f2":"x"}	{"f1":1,"f2":"x"}
+
+query TT
+SELECT to_json(t), to_jsonb(t) FROM (SELECT 1 AS a, 'x' AS b) t;
+----
+{"a":1,"b":"x"}	{"a": 1, "b": "x"}
+
+query T
+SELECT json_build_object('r', t) FROM (SELECT 1 AS a) t;
+----
+{"r" : {"a":1}}
+
+query TT
+SELECT json_build_object('a', 1, 'b', ARRAY[1,2]), json_build_array(1, 'x', NULL);
+----
+{"a" : 1, "b" : [1,2]}	[1, "x", null]
+
+query T
+SELECT json_build_object(1, 2, true, 'x', 1.5, NULL);
+----
+{"1" : 2, "true" : "x", "1.5" : null}
+
+query T
+SELECT json_build_array(ARRAY['a','b'], row(1), NULL);
+----
+[["a","b"], {"f1":1}, null]
+
+query TTTT
+SELECT to_json('x'::text), to_json(1.50), to_json(ARRAY['a','b']), to_json(true);
+----
+"x"	1.50	["a","b"]	true
+
+query TT
+SELECT to_json(ARRAY[1,2]), json_strip_nulls('{"a": null, "b": [1, null]}');
+----
+[1,2]	{"b":[1,null]}
+
+query T
+SELECT json_strip_nulls('{"a": null, "b": {"c": null, "d": 1e3}}');
+----
+{"b":{"d":1e3}}
+
+query T
+SELECT array_to_json(ARRAY[[1,2],[3,4]]);
+----
+[[1,2],[3,4]]
+
+query TTT
+SELECT json_object('{a,1,b,2}'), json_object('{a,b}', '{1,NULL}'), json_object('{{a,1},{b,2}}');
+----
+{"a" : "1", "b" : "2"}	{"a" : "1", "b" : null}	{"a" : "1", "b" : "2"}
+
+query T
+SELECT json_agg(x) FROM (VALUES (1), (2), (3)) t(x);
+----
+[1, 2, 3]
+
+query T
+SELECT json_agg(x ORDER BY x DESC) FROM (VALUES (1), (2)) t(x);
+----
+[2, 1]
+
+query T
+SELECT json_agg(t ORDER BY a DESC) FROM (VALUES (1, 'a')) t(a, b);
+----
+[{"a":1,"b":"a"}]
+
+query T
+SELECT jsonb_agg(t) FROM (VALUES (1, 'a'), (2, 'b')) t(a, b);
+----
+[{"a": 1, "b": "a"}, {"a": 2, "b": "b"}]
+
+query T
+SELECT json_object_agg(k, v) FROM (VALUES ('a', 1), ('b', 2)) t(k, v);
+----
+{ "a" : 1, "b" : 2 }
+
+query T
+SELECT jsonb_object_agg(k, v) FROM (VALUES ('a', 1), ('b', 2)) t(k, v);
+----
+{"a": 1, "b": 2}
+
+query TTT
+SELECT json_agg(1+1), json_agg(ARRAY[1,2]), json_agg('{"a":1}'::json);
+----
+[2]	[[1,2]]	[{"a":1}]
+
+query TTT
+SELECT pg_typeof(to_json(1)), pg_typeof(json_agg(1)), pg_typeof(row_to_json(row(1)));
+----
+json	json	json
+
+statement ok
+CREATE TABLE js8 (id INT PRIMARY KEY, j JSON, jb JSONB);
+
+statement ok
+INSERT INTO js8 VALUES (1, '{"b": 1,  "a": [1, 2]}', '{"b": 1,  "a": [1, 2]}'), (2, '[1, "x"]', '[1, "x"]');
+
+query TTT
+SELECT id, j, jb FROM js8 ORDER BY id;
+----
+1	{"b": 1,  "a": [1, 2]}	{"a": [1, 2], "b": 1}
+2	[1, "x"]	[1, "x"]
+
+query TTT
+SELECT j -> 'a', j ->> 'b', jb -> 'a' FROM js8 WHERE id = 1;
+----
+[1, 2]	1	[1, 2]
+
+query TTT
+SELECT j -> 1, j ->> 1, j -> -1 FROM js8 WHERE id = 2;
+----
+"x"	x	"x"
+
+query TT
+SELECT '{"a":1, "a": [2, 3]}'::json -> 'a', '{"a": {"b":  [1, 2]}}'::json #> '{a,b}';
+----
+[2, 3]	[1, 2]
+
+query TT
+SELECT json_extract_path(j, 'a', '1'), json_extract_path_text(j, 'b') FROM js8 WHERE id = 1;
+----
+2	1
+
+query TT
+SELECT json_agg(j ORDER BY id), jsonb_agg(jb ORDER BY id) FROM js8;
+----
+[{"b": 1,  "a": [1, 2]}, [1, "x"]]	[{"a": [1, 2], "b": 1}, [1, "x"]]
+
+query T
+SELECT json_build_object('j', j, 'jb', jb) FROM js8 ORDER BY id;
+----
+{"j" : {"b": 1,  "a": [1, 2]}, "jb" : {"a": [1, 2], "b": 1}}
+{"j" : [1, "x"], "jb" : [1, "x"]}
+
+query T
+SELECT row_to_json(js8) FROM js8 ORDER BY id;
+----
+{"id":1,"j":{"b": 1,  "a": [1, 2]},"jb":{"a": [1, 2], "b": 1}}
+{"id":2,"j":[1, "x"],"jb":[1, "x"]}
+
+query TT
+SELECT j::text, j::jsonb FROM js8 ORDER BY id;
+----
+{"b": 1,  "a": [1, 2]}	{"a": [1, 2], "b": 1}
+[1, "x"]	[1, "x"]
+
+query TTT
+SELECT pg_typeof(j), pg_typeof(j -> 'a'), pg_typeof(j ->> 'a') FROM js8 WHERE id = 1;
+----
+json	json	text
+
+query T
+SELECT value FROM js8, json_array_elements(js8.j) WHERE id = 2;
+----
+1
+"x"
+
+query TT
+UPDATE js8 SET j = json_build_object('k', id) RETURNING id, j;
+----
+1	{"k" : 1}
+2	{"k" : 2}
+
+query T
+SELECT t FROM (SELECT 1 AS a, 'x y' AS b, NULL AS c) t;
+----
+(1,"x y",)

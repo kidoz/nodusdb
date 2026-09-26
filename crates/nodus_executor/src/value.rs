@@ -36,6 +36,15 @@ pub enum Value {
     /// (see [`encode_row`]), which every reader decodes; [`restore_row`] turns
     /// it back into a number from the column's type.
     Numeric(rust_decimal::Decimal),
+    /// A `json` value: its text exactly as written or built, which
+    /// PostgreSQL keeps (whitespace, key order, and duplicate keys). Rows
+    /// store it as text, as they did before; [`restore_row`] turns a `json`
+    /// column's text back into it.
+    Json(String),
+    /// A row value (`ROW(...)`, or a whole-row reference to a relation) as
+    /// its fields' names and values, for the JSON functions that take one.
+    /// Rows store it as its text.
+    Record(Vec<(String, Value)>),
 }
 
 /// Encodes a row for storage. A numeric is written as its decimal text, so
@@ -45,6 +54,8 @@ pub(crate) fn encode_row(row: &[Value]) -> serde_json::Result<String> {
         .iter()
         .map(|v| match v {
             Value::Numeric(d) => Value::Text(d.to_string()),
+            Value::Json(text) => Value::Text(text.clone()),
+            Value::Record(_) => Value::Text(render(v)),
             other => other.clone(),
         })
         .collect();
@@ -57,6 +68,12 @@ pub(crate) fn encode_row(row: &[Value]) -> serde_json::Result<String> {
 /// parsed.
 pub(crate) fn restore_row(row: &mut [Value], columns: &[nodus_catalog::ColumnDescriptor]) {
     for (value, column) in row.iter_mut().zip(columns) {
+        if column.data_type.trim().eq_ignore_ascii_case("json") {
+            if let Value::Text(t) = &*value {
+                *value = Value::Json(t.clone());
+            }
+            continue;
+        }
         if is_jsonb_type(&column.data_type) {
             if let Value::Text(t) = &*value
                 && let Ok(json) = crate::json_text::parse(t)
@@ -231,6 +248,14 @@ pub(crate) fn coerce(raw: &str, ty: ColumnType) -> Value {
 pub(crate) fn coerce_for_column(value: &Value, data_type: &str) -> Value {
     match value {
         Value::Null => Value::Null,
+        // A `json` value is its text anywhere but a JSON column.
+        Value::Json(text) if !is_json_type(data_type) => {
+            coerce_for_column(&Value::Text(text.clone()), data_type)
+        }
+        Value::Json(text) if is_jsonb_type(data_type) => {
+            crate::planner::cast_value(Value::Text(text.clone()), data_type)
+        }
+        Value::Record(_) => coerce_for_column(&Value::Text(render(value)), data_type),
         // JSON text must parse; a `jsonb` column stores the parsed document.
         Value::Text(_) if is_json_type(data_type) => {
             crate::planner::cast_value(value.clone(), data_type)
@@ -313,6 +338,8 @@ pub(crate) fn value_type_name(value: &Value) -> &'static str {
         Value::Bool(_) => "boolean",
         Value::Array(_) => "array",
         Value::Jsonb(_) => "jsonb",
+        Value::Json(_) => "json",
+        Value::Record(_) => "record",
         Value::Null => "unknown",
     }
 }
@@ -432,7 +459,8 @@ pub(crate) fn coerce_array_text(text: &str, array_type: &str) -> Option<Value> {
     typed(parse_array_literal(text)?, element_type).map(Value::Array)
 }
 
-pub(crate) fn render(value: &Value) -> String {
+/// A value as text, as PostgreSQL writes it.
+pub fn render(value: &Value) -> String {
     match value {
         Value::Int(n) => n.to_string(),
         Value::Float(f) => f.to_string(),
@@ -450,8 +478,44 @@ pub(crate) fn render(value: &Value) -> String {
             format!("{{{}}}", rendered.join(","))
         }
         Value::Jsonb(j) => crate::json_text::jsonb_text(j),
+        Value::Json(text) => text.clone(),
+        Value::Record(fields) => record_text(fields),
         Value::Null => String::new(),
     }
+}
+
+/// A row value as PostgreSQL writes one: `(1,"a b",,"")`, a field quoted
+/// when it is empty or holds a quote, backslash, parenthesis, comma, or
+/// space, and a NULL field empty.
+fn record_text(fields: &[(String, Value)]) -> String {
+    let mut out = String::from("(");
+    for (i, (_, value)) in fields.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        if *value == Value::Null {
+            continue;
+        }
+        let text = render(value);
+        let quoted = text.is_empty()
+            || text
+                .chars()
+                .any(|c| matches!(c, '"' | '\\' | '(' | ')' | ',') || c.is_whitespace());
+        if quoted {
+            out.push('"');
+            for c in text.chars() {
+                if matches!(c, '"' | '\\') {
+                    out.push(c);
+                }
+                out.push(c);
+            }
+            out.push('"');
+        } else {
+            out.push_str(&text);
+        }
+    }
+    out.push(')');
+    out
 }
 
 /// Encodes a literal projection-function argument back into the string form the
@@ -802,9 +866,10 @@ fn type_rank(v: &Value) -> u8 {
         Value::Null => 0,
         Value::Bool(_) => 1,
         Value::Int(_) | Value::Float(_) | Value::Numeric(_) => 2,
-        Value::Text(_) => 3,
+        Value::Text(_) | Value::Json(_) => 3,
         Value::Array(_) => 4,
         Value::Jsonb(_) => 5,
+        Value::Record(_) => 6,
     }
 }
 
@@ -835,7 +900,7 @@ pub(crate) fn compare(a: &Value, b: &Value) -> std::cmp::Ordering {
             x.partial_cmp(&decimal_to_f64(y)).unwrap_or(Ordering::Equal)
         }
         (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
-        (Value::Text(x), Value::Text(y)) => x.cmp(y),
+        (Value::Text(x) | Value::Json(x), Value::Text(y) | Value::Json(y)) => x.cmp(y),
         (Value::Null, Value::Null) => Ordering::Equal,
         (Value::Array(x), Value::Array(y)) => {
             for (xe, ye) in x.iter().zip(y.iter()) {
@@ -847,6 +912,15 @@ pub(crate) fn compare(a: &Value, b: &Value) -> std::cmp::Ordering {
             x.len().cmp(&y.len())
         }
         (Value::Jsonb(x), Value::Jsonb(y)) => crate::json_text::jsonb_cmp(x, y),
+        (Value::Record(x), Value::Record(y)) => {
+            for ((_, xe), (_, ye)) in x.iter().zip(y.iter()) {
+                let ord = compare(xe, ye);
+                if ord != Ordering::Equal {
+                    return ord;
+                }
+            }
+            x.len().cmp(&y.len())
+        }
         // Different categories: order by rank, never by rendered text.
         _ => type_rank(a).cmp(&type_rank(b)),
     }

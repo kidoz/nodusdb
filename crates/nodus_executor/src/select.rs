@@ -188,6 +188,22 @@ impl MemExecutor {
             });
         }
 
+        // Relations that are a function returning a single value a row: a
+        // reference to such a relation's row is that value.
+        let scalar_relations: Vec<String> = ctes
+            .iter()
+            .filter_map(|(name, plan)| match &**plan {
+                LogicalPlan::TableFunction(spec) if spec.returns_scalar() => Some(name.clone()),
+                _ => None,
+            })
+            .chain(joins.iter().filter_map(|join| {
+                let spec = join
+                    .table_fn
+                    .as_ref()
+                    .filter(|spec| spec.returns_scalar())?;
+                Some(spec.alias.clone().unwrap_or_else(|| spec.name.clone()))
+            }))
+            .collect();
         let _cte_bindings = self.bind_ctes(ctx, ctes)?;
 
         // LIMIT/OFFSET push-down: when the pipeline is a plain row-by-row scan of
@@ -749,6 +765,10 @@ impl MemExecutor {
             }
             expanded
         };
+
+        // A name that is no column but one of the relations stands for the
+        // relation's row (`row_to_json(t)`, `json_agg(t)`).
+        let projection = expand_whole_rows(projection, &col_names, &scalar_relations);
 
         // Integer arithmetic is computed in its operands' type, so overflowing
         // `integer` or `smallint` is an error, as in PostgreSQL.
@@ -1794,6 +1814,8 @@ impl MemExecutor {
                         Value::Null => ty = "VARCHAR".to_string(),
                         Value::Array(_) => ty = "VARCHAR".to_string(),
                         Value::Jsonb(_) => ty = "VARCHAR".to_string(),
+                        Value::Json(_) => ty = "JSON".to_string(),
+                        Value::Record(_) => ty = "VARCHAR".to_string(),
                     }
                 }
             } else if ty == "VARCHAR" {
@@ -1979,4 +2001,123 @@ fn partition_groups<F: Fn(&[Value]) -> Vec<Value>>(
         groups.last_mut().unwrap().push(row_idx);
     }
     groups
+}
+
+/// The row of relation `name` among `col_names`, as a `__RECORD__` call over
+/// its columns, when `name` is a relation rather than a column (or the
+/// value itself, for a relation in `scalars`).
+fn whole_row(name: &str, col_names: &[String], scalars: &[String]) -> Option<ScalarExpr> {
+    if name.contains('.') || crate::filter_eval::col_pos(col_names, name).is_some() {
+        return None;
+    }
+    let inner = format!(".{name}");
+    if scalars.iter().any(|s| s == name) {
+        return col_names
+            .iter()
+            .find(|c| {
+                c.rsplit_once('.')
+                    .is_some_and(|(relation, _)| relation == name)
+            })
+            .map(|c| ScalarExpr::Column(c.clone()));
+    }
+    let args: Vec<ScalarExpr> = col_names
+        .iter()
+        .filter_map(|c| {
+            let (relation, column) = c.rsplit_once('.')?;
+            (relation == name || relation.ends_with(&inner)).then(|| {
+                [
+                    ScalarExpr::Literal(Value::Text(column.to_string())),
+                    ScalarExpr::Column(c.clone()),
+                ]
+            })
+        })
+        .flatten()
+        .collect();
+    (!args.is_empty()).then(|| ScalarExpr::Function {
+        name: "__RECORD__".to_string(),
+        args,
+    })
+}
+
+/// `expr` with each reference to a relation's row made the row.
+fn expand_whole_row_refs(
+    expr: &ScalarExpr,
+    col_names: &[String],
+    scalars: &[String],
+) -> ScalarExpr {
+    let expand = |e: &ScalarExpr| expand_whole_row_refs(e, col_names, scalars);
+    match expr {
+        ScalarExpr::Column(name) => {
+            whole_row(name, col_names, scalars).unwrap_or_else(|| expr.clone())
+        }
+        ScalarExpr::Aggregate {
+            op,
+            arg,
+            arg_expr: None,
+            distinct,
+            extra_args,
+            filter,
+            order_by,
+        } if let Some(row) = whole_row(arg, col_names, scalars) => ScalarExpr::Aggregate {
+            op: op.clone(),
+            arg: String::new(),
+            arg_expr: Some(Box::new(row)),
+            distinct: *distinct,
+            extra_args: extra_args.iter().map(expand).collect(),
+            filter: filter.as_ref().map(|f| Box::new(expand(f))),
+            order_by: order_by
+                .iter()
+                .map(|(e, asc, nulls)| (expand(e), *asc, *nulls))
+                .collect(),
+        },
+        _ => expr.map_children(&mut |e| expand(e)),
+    }
+}
+
+/// A select list with each reference to a relation's row made the row.
+fn expand_whole_rows(
+    projection: Vec<ProjectionItem>,
+    col_names: &[String],
+    scalars: &[String],
+) -> Vec<ProjectionItem> {
+    let whole_row = |name: &str| whole_row(name, col_names, scalars);
+    projection
+        .into_iter()
+        .map(|item| match item {
+            ProjectionItem::Column(name) => match whole_row(&name) {
+                Some(expr) => ProjectionItem::Expr {
+                    expr,
+                    alias: Some(name),
+                },
+                None => ProjectionItem::Column(name),
+            },
+            ProjectionItem::AliasedColumn(name, alias) => match whole_row(&name) {
+                Some(expr) => ProjectionItem::Expr {
+                    expr,
+                    alias: Some(alias),
+                },
+                None => ProjectionItem::AliasedColumn(name, alias),
+            },
+            ProjectionItem::Aggregate(op, name) => match whole_row(&name) {
+                Some(row) => ProjectionItem::Expr {
+                    alias: Some(op.sql_name().to_string()),
+                    expr: ScalarExpr::Aggregate {
+                        op,
+                        arg: String::new(),
+                        arg_expr: Some(Box::new(row)),
+                        distinct: false,
+                        extra_args: Vec::new(),
+                        filter: None,
+                        order_by: Vec::new(),
+                    },
+                },
+                None => ProjectionItem::Aggregate(op, name),
+            },
+            ProjectionItem::Expr { expr, alias } => ProjectionItem::Expr {
+                expr: expand_whole_row_refs(&expr, col_names, scalars),
+                alias,
+            },
+            other => other,
+        })
+        .collect()
 }

@@ -30,6 +30,7 @@ const NON_STRICT: &[&str] = &[
     "JSONB_BUILD_ARRAY",
     "TO_JSON",
     "TO_JSONB",
+    "__RECORD__",
     "ARRAY_APPEND",
     "ARRAY_PREPEND",
     "ARRAY_CAT",
@@ -96,6 +97,7 @@ pub(crate) fn is_known(name: &str) -> bool {
                 | "JSON_ARRAY_LENGTH" | "JSONB_ARRAY_LENGTH" | "JSON_EXTRACT_PATH"
                 | "JSONB_EXTRACT_PATH" | "JSON_EXTRACT_PATH_TEXT" | "JSONB_EXTRACT_PATH_TEXT"
                 | "JSONB_SET" | "JSONB_STRIP_NULLS" | "JSON_STRIP_NULLS" | "JSONB_PRETTY"
+                | "ROW_TO_JSON" | "ARRAY_TO_JSON" | "JSON_OBJECT" | "__RECORD__"
                 // Arrays.
                 | "ARRAY_LENGTH" | "CARDINALITY" | "ARRAY_APPEND" | "ARRAY_PREPEND"
                 | "ARRAY_CAT" | "ARRAY_POSITION" | "ARRAY_POSITIONS" | "ARRAY_REMOVE"
@@ -178,7 +180,8 @@ pub(crate) fn return_type(name: &str, arg_types: &[Option<String>]) -> Option<St
             "TO_JSONB" | "JSONB_BUILD_OBJECT" | "JSONB_BUILD_ARRAY" | "JSONB_EXTRACT_PATH"
             | "JSONB_SET" | "JSONB_STRIP_NULLS" => "JSONB",
             "TO_JSON" | "JSON_BUILD_OBJECT" | "JSON_BUILD_ARRAY" | "JSON_EXTRACT_PATH"
-            | "JSON_STRIP_NULLS" => "JSON",
+            | "JSON_STRIP_NULLS" | "ROW_TO_JSON" | "ARRAY_TO_JSON" | "JSON_OBJECT" => "JSON",
+            "__RECORD__" => "RECORD",
             "PG_IS_IN_RECOVERY" | "STARTS_WITH" => "BOOLEAN",
             name if crate::value::is_visibility_fn(name) => "BOOLEAN",
             "UPPER"
@@ -245,6 +248,24 @@ pub(crate) fn call(name: &str, args: &[Value]) -> Value {
     if !NON_STRICT.contains(&name) && args.iter().any(|a| matches!(a, Value::Null)) {
         return Value::Null;
     }
+    // A `json` value or a row is its text to a function that takes neither.
+    let converted: Vec<Value>;
+    let args = if !takes_json(name)
+        && args
+            .iter()
+            .any(|a| matches!(a, Value::Json(_) | Value::Record(_)))
+    {
+        converted = args
+            .iter()
+            .map(|a| match a {
+                Value::Json(_) | Value::Record(_) => Value::Text(render(a)),
+                other => other.clone(),
+            })
+            .collect();
+        &converted
+    } else {
+        args
+    };
     match dispatch(name, args) {
         Some(value) => value,
         None => raise(format!(
@@ -256,6 +277,25 @@ pub(crate) fn call(name: &str, args: &[Value]) -> Value {
                 .join(", ")
         )),
     }
+}
+
+/// Whether a function takes `json` values and rows as they are: the JSON
+/// functions, and those that pass a value through.
+fn takes_json(name: &str) -> bool {
+    name.starts_with("JSON")
+        || name.starts_with("TO_JSON")
+        || name.ends_with("_TO_JSON")
+        || matches!(
+            name,
+            "COALESCE"
+                | "NULLIF"
+                | "GREATEST"
+                | "LEAST"
+                | "PG_TYPEOF"
+                | "NUM_NULLS"
+                | "NUM_NONNULLS"
+                | "__RECORD__"
+        )
 }
 
 /// `(expr)` without the parentheses when they enclose all of it.
@@ -1044,6 +1084,8 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
                 Value::Text(_) => "text",
                 Value::Bool(_) => "boolean",
                 Value::Jsonb(_) => "jsonb",
+                Value::Json(_) => "json",
+                Value::Record(_) => "record",
                 Value::Array(_) => "text[]",
                 Value::Null => "unknown",
             }
@@ -1174,11 +1216,111 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
         },
 
         // ---- JSON ---------------------------------------------------------------------
-        "TO_JSON" | "TO_JSONB" if arity(1) => match arg(0) {
+        "TO_JSON" if arity(1) => match arg(0) {
+            Value::Null => Value::Null,
+            v => Value::Json(json_of(v, false)),
+        },
+        "TO_JSONB" if arity(1) => match arg(0) {
             Value::Null => Value::Null,
             v => Value::Jsonb(to_json(v)),
         },
-        "JSON_BUILD_OBJECT" | "JSONB_BUILD_OBJECT" => {
+        "ROW_TO_JSON" if arity(1) || arity(2) => match arg(0) {
+            v @ Value::Record(_) => Value::Json(json_of(v, pretty(args)?)),
+            other => raise(format!(
+                "function row_to_json({}) does not exist",
+                crate::value::value_type_name(other)
+            )),
+        },
+        "ARRAY_TO_JSON" if arity(1) || arity(2) => match arg(0) {
+            v @ Value::Array(_) => Value::Json(json_of(v, pretty(args)?)),
+            other => raise(format!(
+                "function array_to_json({}) does not exist",
+                crate::value::value_type_name(other)
+            )),
+        },
+        // `__RECORD__(name, value, ...)`: a row with those fields.
+        "__RECORD__" => Value::Record(
+            args.chunks(2)
+                .map(|pair| (text(&pair[0]), pair.get(1).cloned().unwrap_or(Value::Null)))
+                .collect(),
+        ),
+        "JSON_BUILD_OBJECT" => {
+            if args.len() % 2 != 0 {
+                return Some(raise("argument list must have even number of elements"));
+            }
+            let mut out = String::from("{");
+            for (i, pair) in args.chunks(2).enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                if let Err(e) = crate::json_text::key_json(&pair[0], &mut out) {
+                    return Some(raise(e));
+                }
+                out.push_str(" : ");
+                crate::json_text::value_json(&pair[1], false, &mut out);
+            }
+            out.push('}');
+            Value::Json(out)
+        }
+        "JSON_BUILD_ARRAY" => {
+            let items: Vec<String> = args.iter().map(|v| json_of(v, false)).collect();
+            Value::Json(format!("[{}]", items.join(", ")))
+        }
+        // `json_object(text[])`, alternating keys and values or as pairs, or
+        // `json_object(keys text[], values text[])`.
+        "JSON_OBJECT" if arity(1) || arity(2) => {
+            let pairs: Vec<(Value, Value)> = if arity(2) {
+                let (keys, values) = (array(arg(0))?, array(arg(1))?);
+                if keys.len() != values.len() {
+                    return Some(raise("mismatched array dimensions"));
+                }
+                keys.into_iter().zip(values).collect()
+            } else {
+                let items = array(arg(0))?;
+                if items
+                    .iter()
+                    .all(|i| matches!(i, Value::Array(pair) if pair.len() == 2))
+                {
+                    items
+                        .into_iter()
+                        .map(|i| match i {
+                            Value::Array(mut pair) => {
+                                let value = pair.pop().unwrap_or(Value::Null);
+                                (pair.pop().unwrap_or(Value::Null), value)
+                            }
+                            other => (other, Value::Null),
+                        })
+                        .collect()
+                } else if items.len() % 2 == 0
+                    && !items.iter().any(|i| matches!(i, Value::Array(_)))
+                {
+                    items
+                        .chunks(2)
+                        .map(|pair| (pair[0].clone(), pair[1].clone()))
+                        .collect()
+                } else {
+                    return Some(raise("array must have even number of elements"));
+                }
+            };
+            let mut out = String::from("{");
+            for (i, (key, value)) in pairs.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                if *key == Value::Null {
+                    return Some(raise("null value not allowed for object key"));
+                }
+                crate::json_text::value_json(&Value::Text(text(key)), false, &mut out);
+                out.push_str(" : ");
+                match value {
+                    Value::Null => out.push_str("null"),
+                    v => crate::json_text::value_json(&Value::Text(text(v)), false, &mut out),
+                }
+            }
+            out.push('}');
+            Value::Json(out)
+        }
+        "JSONB_BUILD_OBJECT" => {
             if args.len() % 2 != 0 {
                 return Some(raise("argument list must have even number of elements"));
             }
@@ -1191,7 +1333,7 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
             }
             Value::Jsonb(serde_json::Value::Object(map))
         }
-        "JSON_BUILD_ARRAY" | "JSONB_BUILD_ARRAY" => {
+        "JSONB_BUILD_ARRAY" => {
             Value::Jsonb(serde_json::Value::Array(args.iter().map(to_json).collect()))
         }
         "JSON_TYPEOF" | "JSONB_TYPEOF" if arity(1) => {
@@ -1224,7 +1366,12 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
             } else {
                 crate::ScalarBinaryOp::JsonPath
             };
-            crate::planner::apply_binary_op(op, arg(0).clone(), path)
+            // An untyped document is `json` to the `json` functions.
+            let document = match arg(0) {
+                Value::Text(s) if name.starts_with("JSON_") => Value::Json(s.clone()),
+                other => other.clone(),
+            };
+            crate::planner::apply_binary_op(op, document, path)
         }
         "JSONB_SET" if arity(3) || arity(4) => {
             let mut json = json_arg(arg(0))?;
@@ -1234,7 +1381,22 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
             json_set(&mut json, &path, new_value, create);
             Value::Jsonb(json)
         }
-        "JSONB_STRIP_NULLS" | "JSON_STRIP_NULLS" if arity(1) || arity(2) => {
+        "JSON_STRIP_NULLS" if arity(1) || arity(2) => {
+            let in_arrays = matches!(args.get(1), Some(Value::Bool(true)));
+            match arg(0) {
+                Value::Json(text) | Value::Text(text) => {
+                    match crate::json_text::strip_nulls_text(text, in_arrays) {
+                        Some(stripped) => Value::Json(stripped),
+                        None => raise("invalid input syntax for type json"),
+                    }
+                }
+                other => Value::Json(crate::json_text::strip_nulls_text(
+                    &json_of(other, false),
+                    in_arrays,
+                )?),
+            }
+        }
+        "JSONB_STRIP_NULLS" if arity(1) || arity(2) => {
             let mut json = json_arg(arg(0))?;
             strip_nulls(&mut json, matches!(args.get(1), Some(Value::Bool(true))));
             Value::Jsonb(json)
@@ -1754,6 +1916,31 @@ pub(crate) fn to_json(v: &Value) -> serde_json::Value {
         Value::Text(s) => J::String(s.clone()),
         Value::Array(items) => J::Array(items.iter().map(to_json).collect()),
         Value::Jsonb(j) => j.clone(),
+        Value::Json(text) => {
+            crate::json_text::parse(text).unwrap_or_else(|_| J::String(text.clone()))
+        }
+        Value::Record(fields) => J::Object(
+            fields
+                .iter()
+                .map(|(name, value)| (name.clone(), to_json(value)))
+                .collect(),
+        ),
+    }
+}
+
+/// A value as `json` text, as `to_json` writes it.
+pub(crate) fn json_of(value: &Value, pretty: bool) -> String {
+    let mut out = String::new();
+    crate::json_text::value_json(value, pretty, &mut out);
+    out
+}
+
+/// The optional `pretty` flag of `row_to_json` and `array_to_json`.
+fn pretty(args: &[Value]) -> Option<bool> {
+    match args.get(1) {
+        None => Some(false),
+        Some(Value::Bool(b)) => Some(*b),
+        Some(_) => None,
     }
 }
 
@@ -1761,7 +1948,7 @@ pub(crate) fn to_json(v: &Value) -> serde_json::Value {
 /// the number 1, as an untyped literal would be).
 fn json_arg(v: &Value) -> Option<serde_json::Value> {
     match v {
-        Value::Text(s) => crate::json_text::parse(s)
+        Value::Text(s) | Value::Json(s) => crate::json_text::parse(s)
             .ok()
             .or_else(|| crate::filter_eval::value_to_json(v)),
         other => crate::filter_eval::value_to_json(other),
@@ -1771,7 +1958,9 @@ fn json_arg(v: &Value) -> Option<serde_json::Value> {
 /// A JSON argument given as text (`'{"a":1}'`) is parsed; other values stay.
 fn parse_json_arg(v: &Value) -> Value {
     match v {
-        Value::Text(s) => serde_json::from_str(s).map_or_else(|_| v.clone(), Value::Jsonb),
+        Value::Text(s) | Value::Json(s) => {
+            serde_json::from_str(s).map_or_else(|_| v.clone(), Value::Jsonb)
+        }
         other => other.clone(),
     }
 }

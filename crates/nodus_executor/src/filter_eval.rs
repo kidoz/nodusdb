@@ -931,6 +931,8 @@ pub(crate) fn value_to_json(v: &Value) -> Option<serde_json::Value> {
     use serde_json::Value as J;
     match v {
         Value::Jsonb(j) => Some(j.clone()),
+        Value::Json(text) => crate::json_text::parse(text).ok(),
+        Value::Record(_) => Some(crate::functions::to_json(v)),
         Value::Int(i) => Some(J::from(*i)),
         Value::Float(f) => serde_json::Number::from_f64(*f).map(J::Number),
         Value::Numeric(d) => d

@@ -60,9 +60,9 @@ pub use planner::{
 pub(crate) use planner::{eval_scalar_expr, parse_filter_expr, scalar_has_aggregate};
 pub use sequences::SequenceSpec;
 pub use session_vars::canonical_setting_value;
-pub use value::{ColumnDef, Value};
+pub use value::{ColumnDef, Value, render};
 pub(crate) use value::{
-    coerce, column_type, compare, eval_scalar_function, literal_arg, render, resolve_scalar_arg,
+    coerce, column_type, compare, eval_scalar_function, literal_arg, resolve_scalar_arg,
     values_equal,
 };
 

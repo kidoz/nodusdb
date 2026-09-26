@@ -96,6 +96,267 @@ fn write_json(value: &J, out: &mut String) {
     }
 }
 
+/// A value as `to_json` writes it: a number or boolean bare, text as a
+/// JSON string, an array as `[1,2]` and a row as `{"a":1,"b":"x"}` (with
+/// `,\n ` between the outer elements when `pretty`), `json` as written,
+/// and `jsonb` as its text.
+pub(crate) fn value_json(value: &crate::Value, pretty: bool, out: &mut String) {
+    use crate::Value;
+    let separator = if pretty { ",\n " } else { "," };
+    match value {
+        Value::Null => out.push_str("null"),
+        Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        Value::Int(i) => out.push_str(&i.to_string()),
+        Value::Numeric(d) => out.push_str(&d.to_string()),
+        Value::Float(f) if f.is_finite() => out.push_str(&crate::render(value)),
+        // Not a JSON number, so a string of `float8`'s text for it.
+        Value::Float(f) => write_string(
+            if f.is_nan() {
+                "NaN"
+            } else if *f > 0.0 {
+                "Infinity"
+            } else {
+                "-Infinity"
+            },
+            out,
+        ),
+        Value::Text(s) => write_string(s, out),
+        Value::Json(text) => out.push_str(text),
+        Value::Jsonb(j) => write_jsonb(j, out),
+        Value::Array(items) => {
+            out.push('[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(separator);
+                }
+                value_json(item, false, out);
+            }
+            out.push(']');
+        }
+        Value::Record(fields) => {
+            out.push('{');
+            for (i, (name, item)) in fields.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(separator);
+                }
+                write_string(name, out);
+                out.push(':');
+                value_json(item, false, out);
+            }
+            out.push('}');
+        }
+    }
+}
+
+/// An object key as the JSON builders write one: the value's text as a
+/// JSON string. It must be a scalar.
+pub(crate) fn key_json(value: &crate::Value, out: &mut String) -> Result<(), String> {
+    use crate::Value;
+    match value {
+        Value::Null => Err("null value not allowed for object key".to_string()),
+        Value::Array(_) | Value::Record(_) | Value::Json(_) | Value::Jsonb(_) => {
+            Err("key value must be scalar, not array, composite, or json".to_string())
+        }
+        Value::Bool(b) => {
+            write_string(if *b { "true" } else { "false" }, out);
+            Ok(())
+        }
+        other => {
+            write_string(&crate::render(other), out);
+            Ok(())
+        }
+    }
+}
+
+/// `json_strip_nulls`: the text without its object fields that are null
+/// (and, when `in_arrays`, its null array elements), rewritten without
+/// whitespace, other values as written.
+pub(crate) fn strip_nulls_text(text: &str, in_arrays: bool) -> Option<String> {
+    let trimmed = text.trim();
+    let is_null = |v: &str| v.trim() == "null";
+    let mut out = String::new();
+    if let Some(members) = object_members(trimmed) {
+        out.push('{');
+        for (i, (key, value)) in members.into_iter().filter(|(_, v)| !is_null(v)).enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            write_string(&key, &mut out);
+            out.push(':');
+            out.push_str(&strip_nulls_text(value, in_arrays)?);
+        }
+        out.push('}');
+    } else if let Some(elements) = array_elements(trimmed) {
+        out.push('[');
+        let kept = elements.into_iter().filter(|v| !in_arrays || !is_null(v));
+        for (i, element) in kept.enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push_str(&strip_nulls_text(element, in_arrays)?);
+        }
+        out.push(']');
+    } else {
+        out.push_str(trimmed);
+    }
+    Some(out)
+}
+
+/// The members of a `json` object's text: each key, decoded, with its value
+/// as written. `None` when the text is not an object.
+pub(crate) fn object_members(text: &str) -> Option<Vec<(String, &str)>> {
+    let b = text.as_bytes();
+    let mut i = skip_space(b, 0);
+    if b.get(i) != Some(&b'{') {
+        return None;
+    }
+    i = skip_space(b, i + 1);
+    let mut members = Vec::new();
+    if b.get(i) == Some(&b'}') {
+        return Some(members);
+    }
+    loop {
+        let key_end = string_end(b, i)?;
+        let key: String = serde_json::from_str(&text[i..key_end]).ok()?;
+        i = skip_space(b, key_end);
+        if b.get(i) != Some(&b':') {
+            return None;
+        }
+        i = skip_space(b, i + 1);
+        let end = value_end(b, i)?;
+        members.push((key, &text[i..end]));
+        i = skip_space(b, end);
+        match b.get(i)? {
+            b',' => i = skip_space(b, i + 1),
+            b'}' => return Some(members),
+            _ => return None,
+        }
+    }
+}
+
+/// The elements of a `json` array's text, as written. `None` when the text
+/// is not an array.
+pub(crate) fn array_elements(text: &str) -> Option<Vec<&str>> {
+    let b = text.as_bytes();
+    let mut i = skip_space(b, 0);
+    if b.get(i) != Some(&b'[') {
+        return None;
+    }
+    i = skip_space(b, i + 1);
+    let mut elements = Vec::new();
+    if b.get(i) == Some(&b']') {
+        return Some(elements);
+    }
+    loop {
+        let end = value_end(b, i)?;
+        elements.push(&text[i..end]);
+        i = skip_space(b, end);
+        match b.get(i)? {
+            b',' => i = skip_space(b, i + 1),
+            b']' => return Some(elements),
+            _ => return None,
+        }
+    }
+}
+
+/// A member of a `json` value's text, as written: an object's field (the
+/// last, when the key repeats) or an array's element (from the end when
+/// negative).
+pub(crate) fn json_member<'a>(text: &'a str, key: &crate::Value) -> Option<&'a str> {
+    match key {
+        crate::Value::Int(i) => {
+            let elements = array_elements(text)?;
+            let index = if *i < 0 {
+                elements.len().checked_sub(i.unsigned_abs() as usize)?
+            } else {
+                *i as usize
+            };
+            elements.get(index).copied()
+        }
+        key => {
+            let key = crate::render(key);
+            object_members(text)?
+                .into_iter()
+                .rev()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| v)
+        }
+    }
+}
+
+/// A `json` member's text as `->>` gives it: a string decoded, `null` as
+/// NULL, anything else as written.
+pub(crate) fn json_member_text(member: &str) -> crate::Value {
+    let trimmed = member.trim();
+    if trimmed == "null" {
+        return crate::Value::Null;
+    }
+    match serde_json::from_str::<String>(trimmed) {
+        Ok(s) if trimmed.starts_with('"') => crate::Value::Text(s),
+        _ => crate::Value::Text(trimmed.to_string()),
+    }
+}
+
+fn skip_space(b: &[u8], mut i: usize) -> usize {
+    while i < b.len() && matches!(b[i], b' ' | b'\t' | b'\n' | b'\r') {
+        i += 1;
+    }
+    i
+}
+
+/// Where the string starting at `i` ends, past its closing quote.
+fn string_end(b: &[u8], i: usize) -> Option<usize> {
+    if b.get(i) != Some(&b'"') {
+        return None;
+    }
+    let mut j = i + 1;
+    while j < b.len() {
+        match b[j] {
+            b'\\' => j += 2,
+            b'"' => return Some(j + 1),
+            _ => j += 1,
+        }
+    }
+    None
+}
+
+/// Where the value starting at `i` ends.
+fn value_end(b: &[u8], i: usize) -> Option<usize> {
+    match *b.get(i)? {
+        b'"' => string_end(b, i),
+        b'{' | b'[' => {
+            let mut depth = 0usize;
+            let mut j = i;
+            while j < b.len() {
+                match b[j] {
+                    b'"' => {
+                        j = string_end(b, j)?;
+                        continue;
+                    }
+                    b'{' | b'[' => depth += 1,
+                    b'}' | b']' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Some(j + 1);
+                        }
+                    }
+                    _ => {}
+                }
+                j += 1;
+            }
+            None
+        }
+        _ => {
+            let mut j = i;
+            while j < b.len() && !matches!(b[j], b',' | b'}' | b']' | b' ' | b'\t' | b'\n' | b'\r')
+            {
+                j += 1;
+            }
+            (j > i).then_some(j)
+        }
+    }
+}
+
 /// `jsonb_pretty`: one element per line, indented four spaces a level.
 pub(crate) fn jsonb_pretty(value: &J) -> String {
     let mut out = String::new();
@@ -354,6 +615,70 @@ mod tests {
             jsonb_text(&json!([1e20, 0.5, -3])),
             "[100000000000000000000, 0.5, -3]"
         );
+    }
+
+    #[test]
+    fn json_members_are_sliced_as_written() {
+        let text = r#" {"a" :  [1, {"x":"}"}], "b": "q\"", "a": 2 } "#;
+        let members = object_members(text).unwrap();
+        let keys: Vec<&str> = members.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, ["a", "b", "a"]);
+        assert_eq!(members[0].1, r#"[1, {"x":"}"}]"#);
+        // A repeated key reads its last value; negative indexes count back.
+        assert_eq!(
+            json_member(text, &crate::Value::Text("a".into())),
+            Some("2")
+        );
+        assert_eq!(
+            array_elements("[1, [2,3] ,\"x\"]").unwrap(),
+            ["1", "[2,3]", "\"x\""]
+        );
+        assert_eq!(json_member("[1, 2]", &crate::Value::Int(-1)), Some("2"));
+        assert_eq!(json_member("[1, 2]", &crate::Value::Int(-3)), None);
+        assert_eq!(object_members("[1]"), None);
+        assert_eq!(
+            json_member_text(r#""a\nb""#),
+            crate::Value::Text("a\nb".into())
+        );
+        assert_eq!(json_member_text("null"), crate::Value::Null);
+        assert_eq!(json_member_text("{ }"), crate::Value::Text("{ }".into()));
+    }
+
+    #[test]
+    fn values_write_as_to_json_does() {
+        use crate::Value;
+        let row = Value::Record(vec![
+            ("a".into(), Value::Int(1)),
+            (
+                "b".into(),
+                Value::Array(vec![Value::Text("x".into()), Value::Null]),
+            ),
+            ("c".into(), Value::Json(r#"{"k" :  1}"#.into())),
+            ("d".into(), Value::Float(f64::NAN)),
+        ]);
+        let mut out = String::new();
+        value_json(&row, false, &mut out);
+        assert_eq!(out, r#"{"a":1,"b":["x",null],"c":{"k" :  1},"d":"NaN"}"#);
+        let mut out = String::new();
+        value_json(
+            &Value::Array(vec![Value::Int(1), Value::Int(2)]),
+            true,
+            &mut out,
+        );
+        assert_eq!(out, "[1,\n 2]");
+        let mut key = String::new();
+        assert!(key_json(&Value::Bool(true), &mut key).is_ok());
+        assert_eq!(key, r#""true""#);
+        assert!(key_json(&Value::Array(vec![]), &mut String::new()).is_err());
+    }
+
+    #[test]
+    fn strip_nulls_keeps_numbers_as_written() {
+        assert_eq!(
+            strip_nulls_text(r#"{"a": null, "b": [1e3, null, {"c": null}]}"#, false).unwrap(),
+            r#"{"b":[1e3,null,{}]}"#
+        );
+        assert_eq!(strip_nulls_text("[1, null]", true).unwrap(), "[1]");
     }
 
     #[test]

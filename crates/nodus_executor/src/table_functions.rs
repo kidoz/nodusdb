@@ -38,12 +38,10 @@ impl MemExecutor {
         let (mut types, mut rows) = match spec.name.as_str() {
             "unnest" => unnest_rows(&args),
             "generate_series" => generate_series_rows(&args),
-            "jsonb_array_elements" | "json_array_elements" => {
-                json_array_elements_rows(&args, false)
-            }
-            "jsonb_array_elements_text" | "json_array_elements_text" => {
-                json_array_elements_rows(&args, true)
-            }
+            "jsonb_array_elements" => json_array_elements_rows(&args, false),
+            "jsonb_array_elements_text" => json_array_elements_rows(&args, true),
+            "json_array_elements" => json_text_elements_rows(&args, false),
+            "json_array_elements_text" => json_text_elements_rows(&args, true),
             "regexp_split_to_table" => regexp_split_rows(&args),
             // No table is a partition, so none has ancestors.
             "pg_partition_ancestors" => (vec!["REGCLASS".to_string()], Vec::new()),
@@ -59,13 +57,22 @@ impl MemExecutor {
             other => anyhow::bail!("Unsupported table function: {other}()"),
         };
 
-        // Value-column names: explicit `AS f(c1, ..)` wins (per column), else the
-        // relation alias for the first column, else the function name.
+        // Value-column names: explicit `AS f(c1, ..)` wins (per column), else
+        // the name the function gives its column, else the relation alias for
+        // the first column, else the function name.
+        let named = match spec.name.as_str() {
+            "jsonb_array_elements"
+            | "jsonb_array_elements_text"
+            | "json_array_elements"
+            | "json_array_elements_text" => Some("value"),
+            _ => None,
+        };
         let mut names: Vec<String> = (0..types.len())
             .map(|i| {
                 spec.column_aliases
                     .get(i)
                     .cloned()
+                    .or_else(|| named.filter(|_| i == 0).map(str::to_string))
                     .or_else(|| (i == 0).then(|| spec.alias.clone()).flatten())
                     .unwrap_or_else(|| spec.name.clone())
             })
@@ -233,6 +240,29 @@ fn json_array_elements_rows(args: &[Value], as_text: bool) -> (Vec<String>, Vec<
                 .collect(),
         )
     };
+    (vec![ty.to_string()], rows)
+}
+
+/// `json_array_elements(arr)` / `json_array_elements_text(arr)`: one row per
+/// element, as written or as text.
+fn json_text_elements_rows(args: &[Value], as_text: bool) -> (Vec<String>, Vec<Vec<Value>>) {
+    let text = match args.first() {
+        Some(Value::Json(t) | Value::Text(t)) => t.clone(),
+        Some(Value::Jsonb(j)) => crate::json_text::jsonb_text(j),
+        _ => String::new(),
+    };
+    let elements = crate::json_text::array_elements(&text).unwrap_or_default();
+    let rows = elements
+        .into_iter()
+        .map(|element| {
+            vec![if as_text {
+                crate::json_text::json_member_text(element)
+            } else {
+                Value::Json(element.to_string())
+            }]
+        })
+        .collect();
+    let ty = if as_text { "TEXT" } else { "JSON" };
     (vec![ty.to_string()], rows)
 }
 
