@@ -1,0 +1,183 @@
+# SET, SHOW, RESET: settings are checked, undone with their transaction, and custom ones allowed.
+query T
+SHOW work_mem;
+----
+4MB
+
+statement ok
+SET work_mem = '64MB';
+
+query T
+SHOW work_mem;
+----
+64MB
+
+statement ok
+RESET work_mem;
+
+query T
+SHOW work_mem;
+----
+4MB
+
+statement ok
+SET enable_seqscan = false;
+
+query T
+SHOW enable_seqscan;
+----
+off
+
+statement ok
+SET client_min_messages = WARNING;
+
+query T
+SHOW client_min_messages;
+----
+warning
+
+statement ok
+SET application_name = 'myapp';
+
+query T
+SHOW application_name;
+----
+myapp
+
+statement ok
+RESET ALL;
+
+query TTT
+SELECT current_setting('work_mem'), current_setting('enable_seqscan'), current_setting('client_min_messages');
+----
+4MB	on	notice
+
+statement error
+SET nosuch_param = 1;
+
+statement error
+SHOW nosuch_param;
+
+statement error
+SET port = 1;
+
+statement error
+SET server_version = '1';
+
+statement error
+SET enable_seqscan = 'maybe';
+
+statement error
+SET client_min_messages = loud;
+
+statement ok
+SET myapp.user_id = '42';
+
+query T
+SHOW myapp.user_id;
+----
+42
+
+query TT
+SELECT current_setting('myapp.user_id'), current_setting('myapp.nosuch', true);
+----
+42	NULL
+
+statement error
+SELECT current_setting('myapp.nosuch2');
+
+query TT
+SELECT set_config('myapp.x', 'v', false), current_setting('myapp.x');
+----
+v	v
+
+statement ok
+BEGIN;
+
+query TT
+SELECT set_config('myapp.y', 'w', true), current_setting('myapp.y');
+----
+w	w
+
+statement ok
+COMMIT;
+
+query TT
+SELECT current_setting('myapp.y', true) = '', current_setting('myapp.y', true) IS NULL;
+----
+t	f
+
+statement ok
+BEGIN;
+
+statement ok
+SET LOCAL work_mem = '1MB';
+
+query T
+SHOW work_mem;
+----
+1MB
+
+statement ok
+COMMIT;
+
+query T
+SHOW work_mem;
+----
+4MB
+
+statement ok
+BEGIN;
+
+statement ok
+SET work_mem = '2MB';
+
+statement ok
+ROLLBACK;
+
+query T
+SHOW work_mem;
+----
+4MB
+
+statement ok
+BEGIN;
+
+statement ok
+SET work_mem = '3MB';
+
+statement ok
+COMMIT;
+
+query T
+SHOW work_mem;
+----
+3MB
+
+statement ok
+SET LOCAL work_mem = '5MB';
+
+query T
+SHOW work_mem;
+----
+3MB
+
+query TTT
+SELECT current_setting('server_version_num')::int >= 180000, current_setting('max_identifier_length'), current_setting('integer_datetimes');
+----
+t	63	on
+
+# statement_timeout cancels a statement that runs too long.
+statement ok
+SET statement_timeout = '100ms';
+
+statement error
+SELECT pg_sleep(1);
+
+statement ok
+SET statement_timeout = 0;
+
+query T
+SHOW statement_timeout;
+----
+0

@@ -16,6 +16,11 @@ pub(crate) struct SessionEnv {
     /// Effective run-time settings: the session's `SET` overrides (lowercase
     /// names). Unset variables fall back to their built-in defaults.
     pub(crate) settings: HashMap<String, String>,
+    /// Settings `set_config` changed in this statement, applied when it
+    /// succeeds: name, value (`None`: the default), and `is_local`.
+    pub(crate) staged_settings: Vec<(String, Option<String>, bool)>,
+    /// Whether the statement runs in an explicit transaction.
+    pub(crate) in_explicit_txn: bool,
     /// Start of the current transaction (`now()`), microseconds since the epoch.
     pub(crate) transaction_micros: i64,
     /// Start of the current statement (`statement_timestamp()`).
@@ -70,6 +75,34 @@ pub(crate) fn setting(name: &str) -> Option<String> {
     let key = name.trim().to_ascii_lowercase();
     with(|env| env.and_then(|e| e.settings.get(&key).cloned()))
         .or_else(|| crate::session_vars::default_session_var(&key).map(str::to_owned))
+}
+
+/// `set_config(name, value, is_local)`: the setting takes the value for the
+/// rest of the statement at once, and in the session when it succeeds (a
+/// local one only inside a transaction block, until it ends).
+pub(crate) fn stage_setting(name: &str, value: Option<String>, local: bool) {
+    ENV.with(|slot| {
+        if let Some(env) = slot.borrow_mut().as_mut() {
+            let key = name.trim().to_ascii_lowercase();
+            match &value {
+                Some(value) => env.settings.insert(key.clone(), value.clone()),
+                None => env.settings.remove(&key),
+            };
+            if !local || env.in_explicit_txn {
+                env.staged_settings.push((key, value, local));
+            }
+        }
+    });
+}
+
+/// Takes the settings `set_config` staged in this statement.
+pub(crate) fn take_staged_settings() -> Vec<(String, Option<String>, bool)> {
+    ENV.with(|slot| {
+        slot.borrow_mut()
+            .as_mut()
+            .map(|env| std::mem::take(&mut env.staged_settings))
+            .unwrap_or_default()
+    })
 }
 
 /// Microseconds since the Unix epoch, now.

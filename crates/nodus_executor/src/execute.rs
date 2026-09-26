@@ -284,15 +284,18 @@ impl MemExecutor {
                 revokee,
             } => self.exec_revoke(ctx, privilege, object_name, revokee),
             LogicalPlan::Begin => self.exec_begin(ctx),
+            LogicalPlan::ResetVariable { variable } => self.exec_reset_variable(ctx, variable),
             LogicalPlan::Commit => self.exec_commit(ctx),
             LogicalPlan::Rollback => self.exec_rollback(ctx),
             LogicalPlan::Savepoint { name } => self.exec_savepoint(ctx, name),
             LogicalPlan::RollbackToSavepoint { name } => self.exec_rollback_to_savepoint(ctx, name),
             LogicalPlan::ReleaseSavepoint { name } => self.exec_release_savepoint(ctx, name),
             LogicalPlan::ShowVariable { variable } => self.exec_show_variable(ctx, variable),
-            LogicalPlan::SetVariable { variable, value } => {
-                self.exec_set_variable(ctx, variable, value)
-            }
+            LogicalPlan::SetVariable {
+                variable,
+                value,
+                local,
+            } => self.exec_set_variable(ctx, variable, value, local),
             LogicalPlan::Noop { tag } => Ok(QueryOutput::tag(&tag)),
             LogicalPlan::SelectLiteral {
                 values,

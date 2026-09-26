@@ -826,6 +826,15 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
             tag: "VACUUM".to_string(),
         }),
         Statement::StartTransaction { .. } => Ok(LogicalPlan::Begin),
+        Statement::Reset(reset) => Ok(LogicalPlan::ResetVariable {
+            variable: match &reset.reset {
+                sqlparser::ast::Reset::ConfigurationParameter(name) => Some(name.to_string()),
+                sqlparser::ast::Reset::ALL => None,
+                sqlparser::ast::Reset::SessionAuthorization => {
+                    anyhow::bail!("RESET SESSION AUTHORIZATION is not supported")
+                }
+            },
+        }),
         Statement::Commit { .. } => Ok(LogicalPlan::Commit),
         Statement::Rollback { savepoint, .. } => {
             if let Some(name) = savepoint {
@@ -853,7 +862,10 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
         // The `SET` family of statements is now wrapped in `Statement::Set(Set)`.
         Statement::Set(set) => match set {
             sqlparser::ast::Set::SingleAssignment {
-                variable, values, ..
+                scope,
+                variable,
+                values,
+                ..
             } => {
                 let var_name = variable.to_string();
                 // A list value (`SET search_path = a, b`) keeps its commas.
@@ -865,18 +877,21 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                 Ok(LogicalPlan::SetVariable {
                     variable: var_name,
                     value: var_val,
+                    local: matches!(scope, Some(sqlparser::ast::ContextModifier::Local)),
                 })
             }
             sqlparser::ast::Set::SetTransaction { .. } => Ok(LogicalPlan::SetVariable {
                 variable: "transaction_isolation".to_string(),
                 value: "read committed".to_string(),
+                local: false,
             }),
             // `SET TIME ZONE <x>` is the SQL-standard spelling of `SET timezone = <x>`;
             // route it to the same per-session variable so it persists and `SHOW
             // TimeZone` reflects it (`DEFAULT`/`LOCAL` clear the override).
-            sqlparser::ast::Set::SetTimeZone { value, .. } => Ok(LogicalPlan::SetVariable {
+            sqlparser::ast::Set::SetTimeZone { value, local } => Ok(LogicalPlan::SetVariable {
                 variable: "timezone".to_string(),
                 value: value.to_string(),
+                local: *local,
             }),
             other => anyhow::bail!("{} is not supported", leading_keywords(&other.to_string())),
         },

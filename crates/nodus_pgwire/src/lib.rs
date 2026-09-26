@@ -25,7 +25,7 @@ pub(crate) const METADATA_COPY_EXTENDED: &str = "nodus_copy_extended";
 /// The `COPY ... FROM STDIN` statement text, stashed when entering copy-in so
 /// the copy handler can resolve the target table, columns, and format.
 pub(crate) const METADATA_COPY_STMT: &str = "nodus_copy_stmt";
-pub(crate) const METADATA_STATEMENT_TIMEOUT_MS: &str = "nodus_statement_timeout_ms";
+pub(crate) const METADATA_SESSION_STARTED: &str = "nodus_session_started";
 
 pub(crate) const POSTGRES_TYPEMOD_NONE: i32 = -1;
 
@@ -47,14 +47,29 @@ where
 {
     use futures_util::SinkExt;
     for notice in executor.take_notices(session_id) {
-        let code = nodus_executor::error_fields(&notice)
-            .into_iter()
-            .find(|(name, _)| *name == "code")
-            .map_or("00000", |(_, code)| code);
-        let info = wire_format::error_info("NOTICE", code, &notice);
+        let fields = nodus_executor::error_fields(&notice);
+        let field = |wanted: &str| {
+            fields
+                .iter()
+                .find(|(name, _)| *name == wanted)
+                .map(|(_, value)| *value)
+        };
+        let info = wire_format::error_info(
+            field("severity").unwrap_or("NOTICE"),
+            field("code").unwrap_or("00000"),
+            &notice,
+        );
         client
             .send(pgwire::messages::PgWireBackendMessage::NoticeResponse(
                 info.into(),
+            ))
+            .await?;
+    }
+    // Reported settings a statement changed, as PostgreSQL reports them.
+    for (name, value) in executor.take_parameter_changes(session_id) {
+        client
+            .send(pgwire::messages::PgWireBackendMessage::ParameterStatus(
+                pgwire::messages::startup::ParameterStatus::new(name, value),
             ))
             .await?;
     }

@@ -32,6 +32,11 @@ impl DbError {
         self.field("code", code)
     }
 
+    /// A notice's severity when it is not `NOTICE` (`WARNING`).
+    pub(crate) fn severity(self, severity: &str) -> Self {
+        self.field("severity", severity)
+    }
+
     /// The message and its fields, as they travel.
     pub(crate) fn into_text(self) -> String {
         self.text

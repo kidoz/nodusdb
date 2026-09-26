@@ -157,6 +157,12 @@ pub(crate) struct ActiveTxn {
     /// transactions are surfaced in `pg_locks`, so a bare `SELECT FROM pg_locks`
     /// (itself implicitly wrapped) does not report its own throwaway xid.
     pub(crate) explicit: bool,
+    /// Settings changed in it, with their values before (`None`: not set),
+    /// restored when it rolls back.
+    pub(crate) settings_before: HashMap<String, Option<String>>,
+    /// Settings a `SET LOCAL` changed, with the values restored when it
+    /// commits.
+    pub(crate) local_settings: HashMap<String, Option<String>>,
 }
 
 impl ActiveTxn {
@@ -168,6 +174,8 @@ impl ActiveTxn {
             overlay: HashMap::new(),
             savepoints: Vec::new(),
             explicit,
+            settings_before: HashMap::new(),
+            local_settings: HashMap::new(),
         }
     }
 }
@@ -199,6 +207,17 @@ pub trait Executor: Send + Sync {
     /// call (`table "t" does not exist, skipping`), oldest first, each a
     /// message with fields (see [`error_fields`]).
     fn take_notices(&self, _session_id: &str) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Starts a session with the settings its client asked for when it
+    /// connected (`application_name`, `TimeZone`), which `RESET` returns to.
+    fn start_session(&self, _session_id: &str, _settings: &[(String, String)]) {}
+
+    /// Takes the reported settings (`TimeZone`, `application_name`) the
+    /// session's statements changed since the last call, with their new
+    /// values, for the client's `ParameterStatus` messages.
+    fn take_parameter_changes(&self, _session_id: &str) -> Vec<(String, String)> {
         Vec::new()
     }
 
@@ -314,6 +333,12 @@ pub struct MemExecutor {
     pub(crate) sequences: Arc<sequences::SequenceStore>,
     /// Notices raised per session and not yet taken by the wire layer.
     pub(crate) notices: parking_lot::Mutex<HashMap<String, Vec<String>>>,
+    /// Per session, the settings its client asked for when it connected:
+    /// what `RESET` returns to.
+    pub(crate) session_resets: parking_lot::RwLock<HashMap<String, HashMap<String, String>>>,
+    /// Per session, reported settings changed and not yet taken by the wire
+    /// layer.
+    pub(crate) parameter_changes: parking_lot::Mutex<HashMap<String, Vec<(String, String)>>>,
 }
 
 impl MemExecutor {
@@ -343,6 +368,8 @@ impl MemExecutor {
             restoring: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             restore_gate: Arc::new(parking_lot::RwLock::new(())),
             notices: parking_lot::Mutex::new(HashMap::new()),
+            session_resets: parking_lot::RwLock::new(HashMap::new()),
+            parameter_changes: parking_lot::Mutex::new(HashMap::new()),
         }
     }
 
@@ -500,6 +527,12 @@ impl MemExecutor {
                 .get(&ctx.session_id)
                 .cloned()
                 .unwrap_or_default(),
+            staged_settings: Vec::new(),
+            in_explicit_txn: self
+                .active_txns
+                .read()
+                .get(&ctx.session_id)
+                .is_some_and(|t| t.explicit),
             transaction_micros,
             statement_micros,
             backend_pid,
@@ -884,26 +917,14 @@ impl Default for MemExecutor {
     }
 }
 
-impl Executor for MemExecutor {
-    fn infer_parameter_types(
+impl MemExecutor {
+    /// [`Executor::execute_logical`] once a statement may run: its implicit
+    /// transaction, session environment, and checks.
+    fn execute_logical_tracked(
         &self,
         ctx: &ExecutionContext,
-        sql: &str,
-    ) -> Result<Vec<Option<String>>> {
-        self.infer_sql_parameters(ctx, sql)
-    }
-
-    fn execute_logical(&self, ctx: &ExecutionContext, plan: LogicalPlan) -> Result<QueryOutput> {
-        // Fence query execution during a restore: reject new statements, and
-        // hold a drain guard for the rest of this call so a concurrently
-        // starting restore waits for us to finish before mutating the engine.
-        // Together this guarantees no statement ever observes a partially
-        // restored state.
-        if self.restoring.load(std::sync::atomic::Ordering::Acquire) {
-            anyhow::bail!("restore in progress; retry shortly");
-        }
-        let _drain_guard = self.restore_gate.read();
-
+        plan: LogicalPlan,
+    ) -> Result<QueryOutput> {
         let is_txn_control = matches!(
             plan,
             LogicalPlan::Begin
@@ -935,9 +956,33 @@ impl Executor for MemExecutor {
         // the implicit transaction can commit.
         let _env = session_env::install(self.session_env(ctx));
         eval_error::reset();
-        let result = self
-            .execute_logical_inner(ctx, plan)
+
+        let started = std::time::Instant::now();
+        let result = self.execute_logical_inner(ctx, plan);
+        let result = result
             .and_then(|out| eval_error::check().map(|()| out))
+            .and_then(|out| {
+                // A statement that ran past `statement_timeout` is canceled.
+                match session_vars::duration_millis(
+                    &session_env::setting("statement_timeout").unwrap_or_default(),
+                ) {
+                    Some(limit)
+                        if limit > 0 && started.elapsed().as_millis() > u128::from(limit) =>
+                    {
+                        Err(anyhow::anyhow!(
+                            "canceling statement due to statement timeout"
+                        ))
+                    }
+                    _ => Ok(out),
+                }
+            })
+            .map(|out| {
+                // Settings `set_config` changed take effect with the statement.
+                for (name, value, local) in session_env::take_staged_settings() {
+                    self.change_setting(ctx, &name, value, local);
+                }
+                out
+            })
             .map(|out| self.name_object_identifiers(out));
 
         if let Some(txn_id) = implicit_txn {
@@ -959,6 +1004,29 @@ impl Executor for MemExecutor {
         }
         result
     }
+}
+
+impl Executor for MemExecutor {
+    fn infer_parameter_types(
+        &self,
+        ctx: &ExecutionContext,
+        sql: &str,
+    ) -> Result<Vec<Option<String>>> {
+        self.infer_sql_parameters(ctx, sql)
+    }
+
+    fn execute_logical(&self, ctx: &ExecutionContext, plan: LogicalPlan) -> Result<QueryOutput> {
+        // Fence query execution during a restore: reject new statements, and
+        // hold a drain guard for the rest of this call so a concurrently
+        // starting restore waits for us to finish before mutating the engine.
+        // Together this guarantees no statement ever observes a partially
+        // restored state.
+        if self.restoring.load(std::sync::atomic::Ordering::Acquire) {
+            anyhow::bail!("restore in progress; retry shortly");
+        }
+        let _drain_guard = self.restore_gate.read();
+        self.execute_logical_tracked(ctx, plan)
+    }
 
     fn execute_physical(&self, ctx: &ExecutionContext, plan: PhysicalPlan) -> Result<Vec<Row>> {
         self.execute_physical_inner(ctx, plan)
@@ -977,8 +1045,34 @@ impl Executor for MemExecutor {
         self.notices.lock().remove(session_id).unwrap_or_default()
     }
 
+    fn start_session(&self, session_id: &str, settings: &[(String, String)]) {
+        let mut resets = HashMap::new();
+        for (name, value) in settings {
+            if let Ok(session_vars::SetAction::Set(value)) = session_vars::set_action(name, value) {
+                resets.insert(name.to_ascii_lowercase(), value);
+            }
+        }
+        self.session_vars
+            .write()
+            .entry(session_id.to_string())
+            .or_default()
+            .extend(resets.clone());
+        self.session_resets
+            .write()
+            .insert(session_id.to_string(), resets);
+    }
+
+    fn take_parameter_changes(&self, session_id: &str) -> Vec<(String, String)> {
+        self.parameter_changes
+            .lock()
+            .remove(session_id)
+            .unwrap_or_default()
+    }
+
     fn end_session(&self, session_id: &str) {
         self.session_vars.write().remove(session_id);
+        self.session_resets.write().remove(session_id);
+        self.parameter_changes.lock().remove(session_id);
         self.notices.lock().remove(session_id);
         self.sequences.end_session(session_id);
         if let Some(txn) = self.active_txns.write().remove(session_id) {
@@ -1000,6 +1094,8 @@ mod phase1_tests;
 mod phase2_tests;
 #[cfg(test)]
 mod phase3_tests;
+#[cfg(test)]
+mod session_tests;
 #[cfg(test)]
 mod sql_feature_tests;
 #[cfg(test)]

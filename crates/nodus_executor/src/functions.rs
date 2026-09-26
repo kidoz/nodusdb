@@ -81,7 +81,7 @@ pub(crate) fn is_known(name: &str) -> bool {
                 // Session and system.
                 | "VERSION" | "CURRENT_USER" | "SESSION_USER" | "CURRENT_ROLE" | "USER"
                 | "CURRENT_DATABASE" | "CURRENT_CATALOG" | "CURRENT_SCHEMA" | "CURRENT_SCHEMAS"
-                | "CURRENT_SETTING" | "PG_BACKEND_PID" | "PG_TYPEOF" | "TXID_CURRENT"
+                | "CURRENT_SETTING" | "SET_CONFIG" | "PG_BACKEND_PID" | "PG_TYPEOF" | "TXID_CURRENT"
                 | "PG_CURRENT_XACT_ID" | "PG_SIZE_PRETTY" | "PG_ENCODING_TO_CHAR"
                 | "PG_CLIENT_ENCODING" | "PG_IS_IN_RECOVERY" | "PG_SLEEP" | "PG_GET_USERBYID"
                 | "INET_SERVER_ADDR" | "INET_SERVER_PORT" | "INET_CLIENT_ADDR"
@@ -253,6 +253,7 @@ pub(crate) fn return_type(name: &str, arg_types: &[Option<String>]) -> Option<St
             | "CURRENT_DATABASE"
             | "CURRENT_SCHEMA"
             | "CURRENT_SETTING"
+            | "SET_CONFIG"
             | "PG_TYPEOF"
             | "PG_SIZE_PRETTY"
             | "PG_ENCODING_TO_CHAR"
@@ -1317,12 +1318,49 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
                 None => session_unavailable(name),
             }
         }
+        // Sleeps no longer than the statement may still run.
         "PG_SLEEP" if arity(1) => {
-            let seconds = num(arg(0))?;
-            if seconds > 0.0 {
-                std::thread::sleep(std::time::Duration::from_secs_f64(seconds.min(1e9)));
+            let seconds = num(arg(0))?.min(1e9);
+            let limit = session_env::setting("statement_timeout")
+                .and_then(|t| crate::session_vars::duration_millis(&t))
+                .filter(|ms| *ms > 0);
+            let started = session_time(|e| e.statement_micros)?;
+            let remaining = limit.map(|ms| {
+                (ms as i64 * 1_000 - (session_env::wall_micros() - started)).max(0) as f64 / 1e6
+            });
+            match remaining {
+                Some(remaining) if remaining < seconds => {
+                    std::thread::sleep(std::time::Duration::from_secs_f64(remaining));
+                    raise("canceling statement due to statement timeout")
+                }
+                _ => {
+                    if seconds > 0.0 {
+                        std::thread::sleep(std::time::Duration::from_secs_f64(seconds));
+                    }
+                    Value::Null
+                }
             }
-            Value::Null
+        }
+        // `set_config(name, value, is_local)`: as `SET [LOCAL]`, returning
+        // the value the setting takes.
+        "SET_CONFIG" if arity(3) => {
+            let name = text(arg(0));
+            let action = crate::session_vars::set_action(&name, &text(arg(1)));
+            match action {
+                Ok(crate::session_vars::SetAction::Set(value)) => {
+                    session_env::stage_setting(
+                        &name,
+                        Some(value.clone()),
+                        matches!(arg(2), Value::Bool(true)),
+                    );
+                    Value::Text(value)
+                }
+                Ok(crate::session_vars::SetAction::Reset) => {
+                    session_env::stage_setting(&name, None, matches!(arg(2), Value::Bool(true)));
+                    session_env::setting(&name).map_or(Value::Null, Value::Text)
+                }
+                Err(e) => raise(e),
+            }
         }
         // The catalog exposes one role, the bootstrap superuser (OID 10).
         "PG_GET_USERBYID" if arity(1) => Value::Text(match int(arg(0))? {

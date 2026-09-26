@@ -3,7 +3,7 @@
 //! and command-tag helpers.
 
 use crate::{
-    METADATA_NODUS_PRINCIPAL_ID, METADATA_NODUS_SESSION_ID, METADATA_STATEMENT_TIMEOUT_MS,
+    METADATA_NODUS_PRINCIPAL_ID, METADATA_NODUS_SESSION_ID, METADATA_SESSION_STARTED,
     METADATA_TX_STATUS,
 };
 use nodus_catalog::PrincipalId;
@@ -69,56 +69,31 @@ pub(crate) fn mark_execution_failed<C: ClientInfo>(
     }
 }
 
-pub(crate) fn parse_statement_timeout_ms(query: &str) -> Option<u64> {
-    let normalized = query
-        .trim()
-        .trim_end_matches(';')
-        .replace('=', " = ")
-        .replace(',', " ");
-    let parts = normalized.split_whitespace().collect::<Vec<_>>();
-    if parts.len() < 3
-        || !parts[0].eq_ignore_ascii_case("SET")
-        || !parts[1].eq_ignore_ascii_case("statement_timeout")
-    {
-        return None;
+/// Hands the executor the settings the client asked for when it connected
+/// (`application_name`, `TimeZone`), once per session.
+pub(crate) fn ensure_session_started<C: ClientInfo>(
+    client: &mut C,
+    executor: &dyn nodus_executor::Executor,
+) {
+    if client.metadata().contains_key(METADATA_SESSION_STARTED) {
+        return;
     }
-    parts
-        .iter()
-        .skip(2)
-        .find_map(|part| part.trim_matches('\'').parse::<u64>().ok())
-}
-
-pub(crate) fn remember_statement_timeout<C: ClientInfo>(client: &mut C, query: &str) {
-    if let Some(timeout_ms) = parse_statement_timeout_ms(query) {
-        client.metadata_mut().insert(
-            METADATA_STATEMENT_TIMEOUT_MS.to_owned(),
-            timeout_ms.to_string(),
-        );
-    }
-}
-
-pub(crate) fn statement_timeout_ms<C: ClientInfo>(client: &C) -> Option<u64> {
-    client
+    let settings: Vec<(String, String)> = client
         .metadata()
-        .get(METADATA_STATEMENT_TIMEOUT_MS)
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|value| *value > 0)
-}
-
-pub(crate) fn pg_sleep_ms(query: &str) -> Option<u64> {
-    let lower = query.to_ascii_lowercase();
-    let start = lower.find("pg_sleep(")? + "pg_sleep(".len();
-    let rest = &lower[start..];
-    let end = rest.find(')')?;
-    let seconds = rest[..end].trim().parse::<f64>().ok()?;
-    Some((seconds * 1000.0).ceil() as u64)
-}
-
-pub(crate) fn statement_would_timeout<C: ClientInfo>(client: &C, query: &str) -> bool {
-    match (statement_timeout_ms(client), pg_sleep_ms(query)) {
-        (Some(timeout_ms), Some(sleep_ms)) => sleep_ms >= timeout_ms,
-        _ => false,
-    }
+        .iter()
+        .filter(|(name, _)| {
+            !name.starts_with("nodus_")
+                && !matches!(
+                    name.as_str(),
+                    "user" | "database" | "options" | "replication"
+                )
+        })
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect();
+    executor.start_session(&session_id_from_client(client), &settings);
+    client
+        .metadata_mut()
+        .insert(METADATA_SESSION_STARTED.to_owned(), "1".to_owned());
 }
 
 pub(crate) fn described_statement_key(statement: &str) -> String {

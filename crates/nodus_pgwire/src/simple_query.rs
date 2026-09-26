@@ -14,7 +14,6 @@ use pgwire::api::{ClientInfo, ClientPortalStore, PgWireConnectionState};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::PgWireBackendMessage;
 use pgwire::messages::response::{CommandComplete, EmptyQueryResponse, ReadyForQuery};
-use pgwire::messages::startup::ParameterStatus;
 use tracing::{error, info};
 
 use crate::client_meta::*;
@@ -217,16 +216,7 @@ impl SimpleQueryHandler for NodusQueryHandler {
         };
 
         let query_str = query;
-        remember_statement_timeout(client, query_str);
-        if statement_would_timeout(client, query_str) {
-            self.metrics.query_errors_total.inc();
-            mark_error_status(client);
-            return Err(user_error(
-                "ERROR",
-                "57014",
-                "canceling statement due to statement timeout",
-            ));
-        }
+        ensure_session_started(client, self.executor.as_ref());
         // Parse SQL and translate every statement in a simple-query batch.
         // Drivers such as Npgsql issue startup metadata batches and expect one
         // protocol result for each statement before ReadyForQuery.
@@ -279,24 +269,6 @@ impl SimpleQueryHandler for NodusQueryHandler {
                     "57014",
                     "canceling statement due to user request",
                 ));
-            }
-
-            // A successful `SET` of a GUC_REPORT variable is echoed back as a
-            // ParameterStatus, the same as PostgreSQL, so drivers can track
-            // session state (e.g. Npgsql's TimeZone, pgjdbc's
-            // standard_conforming_strings) without re-querying.
-            if let Some((name, value)) = nodus_sql::set_variable_parts(&stmt)
-                && let Some(canonical) = reportable_guc_canonical_name(&name.to_ascii_lowercase())
-            {
-                client
-                    .send(PgWireBackendMessage::ParameterStatus(ParameterStatus::new(
-                        canonical.to_owned(),
-                        nodus_executor::canonical_setting_value(
-                            canonical,
-                            &normalize_guc_value(&value),
-                        ),
-                    )))
-                    .await?;
             }
 
             // No projected columns => a command tag (CREATE TABLE, INSERT, BEGIN...).
@@ -391,16 +363,7 @@ impl NodusQueryHandler {
             slow_log: &self.slow_log,
         };
 
-        remember_statement_timeout(client, query);
-        if statement_would_timeout(client, query) {
-            self.metrics.query_errors_total.inc();
-            mark_error_status(client);
-            return Err(user_error(
-                "ERROR",
-                "57014",
-                "canceling statement due to statement timeout",
-            ));
-        }
+        ensure_session_started(client, self.executor.as_ref());
 
         let principal_id = principal_id_from_client(client);
         let ctx = nodus_executor::ExecutionContext {

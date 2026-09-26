@@ -1100,6 +1100,13 @@ pub enum LogicalPlan {
     SetVariable {
         variable: String,
         value: String,
+        /// `SET LOCAL`: until the transaction ends.
+        #[serde(default)]
+        local: bool,
+    },
+    /// `RESET name`, or `RESET ALL` without one.
+    ResetVariable {
+        variable: Option<String>,
     },
     Noop {
         tag: String,

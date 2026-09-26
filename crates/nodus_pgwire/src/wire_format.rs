@@ -108,6 +108,8 @@ pub(crate) fn sqlstate_for_execution_error(err_str: &str) -> &'static str {
         || err_str.ends_with("not supported for input")
     {
         "0A000" // feature_not_supported
+    } else if err_str == "canceling statement due to statement timeout" {
+        "57014" // query_canceled
     } else if err_str.contains("must be ahead of \"PR\"") {
         "42601" // syntax_error
     } else if err_str.starts_with("operator does not exist:") {
@@ -270,39 +272,6 @@ pub(crate) fn planning_error(message: &str) -> PgWireError {
         "XX000" => user_error("ERROR", "0A000", format!("Unsupported feature: {message}")),
         code => user_error("ERROR", code, message),
     }
-}
-
-/// For a settable `GUC_REPORT` variable, returns the canonical name PostgreSQL
-/// uses in `ParameterStatus` messages (correct casing); `None` for variables
-/// that are not reported to clients on change. Drivers (Npgsql's timezone
-/// handling, pgjdbc's `standard_conforming_strings` tracking) rely on these
-/// echoes after a `SET`.
-pub(crate) fn reportable_guc_canonical_name(lower_name: &str) -> Option<&'static str> {
-    Some(match lower_name {
-        "application_name" => "application_name",
-        "client_encoding" => "client_encoding",
-        "datestyle" => "DateStyle",
-        "intervalstyle" => "IntervalStyle",
-        "timezone" => "TimeZone",
-        "standard_conforming_strings" => "standard_conforming_strings",
-        "default_transaction_read_only" => "default_transaction_read_only",
-        _ => return None,
-    })
-}
-
-/// Strips one surrounding layer of single/double quotes from a `SET` value so
-/// the `ParameterStatus` echo carries the bare value (`'UTC'` -> `UTC`).
-pub(crate) fn normalize_guc_value(raw: &str) -> String {
-    let trimmed = raw.trim();
-    let bytes = trimmed.as_bytes();
-    if bytes.len() >= 2 {
-        let first = bytes[0];
-        let last = bytes[bytes.len() - 1];
-        if (first == b'\'' && last == b'\'') || (first == b'"' && last == b'"') {
-            return trimmed[1..trimmed.len() - 1].to_string();
-        }
-    }
-    trimmed.to_string()
 }
 
 pub(crate) fn user_error(severity: &str, code: &str, message: impl Into<String>) -> PgWireError {
