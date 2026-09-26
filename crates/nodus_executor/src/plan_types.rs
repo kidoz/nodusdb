@@ -433,6 +433,110 @@ pub enum ScalarExpr {
         plan: SubPlan,
         kind: SubqueryKind,
     },
+    /// A window function call, computed over the query's rows (or groups)
+    /// before the expression around it is evaluated.
+    Window(Box<WindowCall>),
+}
+
+/// A window function call: `func(args) [FILTER (WHERE filter)] OVER
+/// (PARTITION BY ... ORDER BY ... frame)`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WindowCall {
+    /// The upper-cased function name (`ROW_NUMBER`, `SUM`, `LAG`).
+    pub func: String,
+    pub args: Vec<ScalarExpr>,
+    #[serde(default)]
+    pub filter: Option<ScalarExpr>,
+    pub partition_by: Vec<ScalarExpr>,
+    /// `(key, ascending, nulls_first)`.
+    pub order_by: Vec<(ScalarExpr, bool, Option<bool>)>,
+    /// The frame; without one, an ordered window ends at the current row's
+    /// last peer and an unordered one is the whole partition.
+    #[serde(default)]
+    pub frame: Option<FrameSpec>,
+}
+
+/// A window frame: `ROWS | RANGE | GROUPS BETWEEN start AND end [EXCLUDE ...]`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FrameSpec {
+    pub units: WindowFrameUnits,
+    pub start: FrameBound,
+    pub end: FrameBound,
+    #[serde(default)]
+    pub exclude: FrameExclude,
+}
+
+/// A frame boundary; an offset is an expression (rows or peer groups for
+/// `ROWS`/`GROUPS`, a distance in the ordering key's values for `RANGE`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum FrameBound {
+    UnboundedPreceding,
+    Preceding(ScalarExpr),
+    CurrentRow,
+    Following(ScalarExpr),
+    UnboundedFollowing,
+}
+
+/// The rows a frame leaves out: `EXCLUDE CURRENT ROW | GROUP | TIES`.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+pub enum FrameExclude {
+    #[default]
+    NoOthers,
+    CurrentRow,
+    Group,
+    Ties,
+}
+
+impl WindowCall {
+    /// The expressions the call evaluates per row, in order.
+    pub fn children(&self) -> Vec<&ScalarExpr> {
+        fn bound(b: &FrameBound) -> Option<&ScalarExpr> {
+            match b {
+                FrameBound::Preceding(e) | FrameBound::Following(e) => Some(e),
+                _ => None,
+            }
+        }
+        let frame: Vec<&ScalarExpr> = self
+            .frame
+            .iter()
+            .flat_map(|f| [bound(&f.start), bound(&f.end)])
+            .flatten()
+            .collect();
+        self.args
+            .iter()
+            .chain(self.filter.iter())
+            .chain(self.partition_by.iter())
+            .chain(self.order_by.iter().map(|(e, _, _)| e))
+            .chain(frame)
+            .collect()
+    }
+
+    /// Rebuilds the call with every expression replaced by `f(expr)`.
+    pub fn map_exprs(&self, f: &mut dyn FnMut(&ScalarExpr) -> ScalarExpr) -> WindowCall {
+        let mut bound = |b: &FrameBound| match b {
+            FrameBound::Preceding(e) => FrameBound::Preceding(f(e)),
+            FrameBound::Following(e) => FrameBound::Following(f(e)),
+            other => other.clone(),
+        };
+        let frame = self.frame.as_ref().map(|fr| FrameSpec {
+            units: fr.units.clone(),
+            start: bound(&fr.start),
+            end: bound(&fr.end),
+            exclude: fr.exclude,
+        });
+        WindowCall {
+            func: self.func.clone(),
+            args: self.args.iter().map(&mut *f).collect(),
+            filter: self.filter.as_ref().map(&mut *f),
+            partition_by: self.partition_by.iter().map(&mut *f).collect(),
+            order_by: self
+                .order_by
+                .iter()
+                .map(|(e, asc, nulls)| (f(e), *asc, *nulls))
+                .collect(),
+            frame,
+        }
+    }
 }
 
 /// What a subquery in an expression yields.
@@ -504,6 +608,7 @@ impl ScalarExpr {
                 .chain(branches.iter().flat_map(|(c, r)| [c, r]))
                 .chain(else_result.iter().map(|e| &**e))
                 .collect(),
+            ScalarExpr::Window(call) => call.children(),
         }
     }
 
@@ -637,6 +742,7 @@ impl ScalarExpr {
                 all: *all,
             },
             ScalarExpr::Row(items) => ScalarExpr::Row(items.iter().map(|e| *boxed(e)).collect()),
+            ScalarExpr::Window(call) => ScalarExpr::Window(Box::new(call.map_exprs(&mut |e| f(e)))),
         }
     }
 }
@@ -816,6 +922,8 @@ pub struct WindowFrame {
 pub enum WindowFrameUnits {
     Rows,
     Range,
+    /// Peer groups of the ordering key.
+    Groups,
 }
 
 /// A single frame boundary. Numeric offsets are only honoured for `ROWS`.

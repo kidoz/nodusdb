@@ -1200,6 +1200,11 @@ pub(crate) fn deparse_scalar(expr: &ScalarExpr, qualified: bool) -> String {
             SubqueryKind::Array => "ARRAY(SubPlan 1)".to_string(),
             SubqueryKind::Scalar => "(SubPlan 1)".to_string(),
         },
+        ScalarExpr::Window(call) => format!(
+            "{}({}) OVER (?)",
+            call.func.to_ascii_lowercase(),
+            list(&call.args)
+        ),
     }
 }
 

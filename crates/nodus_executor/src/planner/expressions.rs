@@ -954,10 +954,12 @@ pub(crate) fn lower_scalar(expr: &sqlparser::ast::Expr, params: &[Value]) -> Opt
                 }
                 return Some(ScalarExpr::Row(items));
             }
-            // Window calls have their own path; ordered-set aggregates
-            // (`WITHIN GROUP`) and `IGNORE NULLS` are not supported.
-            if func.over.is_some() || !func.within_group.is_empty() || func.null_treatment.is_some()
-            {
+            if func.over.is_some() {
+                return lower_window(func, &name, params);
+            }
+            // Ordered-set aggregates (`WITHIN GROUP`) and `IGNORE NULLS` are
+            // not supported.
+            if !func.within_group.is_empty() || func.null_treatment.is_some() {
                 return None;
             }
             // An aggregate call, possibly nested in an expression (`sum(a) + 1`),
@@ -1242,6 +1244,9 @@ pub(crate) fn eval_scalar_in(expr: &ScalarExpr, scope: &dyn ScalarScope) -> Valu
         ScalarExpr::Subquery { .. } => {
             crate::eval_error::raise("a subquery is not supported in this position")
         }
+        // The executor computes windows before evaluating; one left here is
+        // in a clause that cannot have them.
+        ScalarExpr::Window(_) => crate::eval_error::raise("window functions are not allowed here"),
         ScalarExpr::Aggregate { .. } => scope.aggregate(expr),
         ScalarExpr::Unary { op, expr } => apply_unary_op(*op, eval(expr)),
         ScalarExpr::Binary { op, left, right } => eval_comparison(*op, left, right, scope),
@@ -1671,6 +1676,317 @@ pub(crate) fn expression_error(
     anyhow::anyhow!(unknown_function_error(expr).unwrap_or_else(fallback))
 }
 
+/// The argument of a call of the marker function `marker` (nodus_sql's
+/// rewrites of syntax the parser lacks).
+fn marker_argument<'a>(
+    e: &'a sqlparser::ast::Expr,
+    marker: &str,
+) -> Option<&'a sqlparser::ast::Expr> {
+    use sqlparser::ast::{Expr, FunctionArg, FunctionArgExpr, FunctionArguments};
+    let Expr::Function(f) = e else { return None };
+    let name = f.name.to_string().to_ascii_uppercase();
+    if name.strip_prefix("PG_CATALOG.") != Some(marker) {
+        return None;
+    }
+    match &f.args {
+        FunctionArguments::List(list) => match list.args.as_slice() {
+            [FunctionArg::Unnamed(FunctionArgExpr::Expr(arg))] => Some(arg),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Keeps the reason an expression cannot be planned, for
+/// [`expression_error`] to report.
+fn plan_error(message: impl Into<String>) -> Option<ScalarExpr> {
+    SUBQUERY_ERROR.with(|slot| *slot.borrow_mut() = Some(message.into()));
+    None
+}
+
+thread_local! {
+    /// The `WINDOW` clause of the select being planned.
+    static NAMED_WINDOWS: std::cell::RefCell<Vec<sqlparser::ast::NamedWindowDefinition>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Restores the enclosing select's named windows when a select's planning ends.
+pub(crate) struct NamedWindowsScope(Vec<sqlparser::ast::NamedWindowDefinition>);
+
+impl Drop for NamedWindowsScope {
+    fn drop(&mut self) {
+        let previous = std::mem::take(&mut self.0);
+        NAMED_WINDOWS.with(|slot| *slot.borrow_mut() = previous);
+    }
+}
+
+/// Makes a select's `WINDOW` clause visible to the window calls planned
+/// until the returned scope ends.
+pub(crate) fn named_windows_scope(
+    definitions: &[sqlparser::ast::NamedWindowDefinition],
+) -> NamedWindowsScope {
+    NamedWindowsScope(NAMED_WINDOWS.with(|slot| slot.replace(definitions.to_vec())))
+}
+
+/// The window a call's `OVER` means: its own specification, a named window,
+/// or a named window refined with an `ORDER BY` and frame of its own.
+fn resolve_window(over: &sqlparser::ast::WindowType) -> Result<sqlparser::ast::WindowSpec, String> {
+    use sqlparser::ast::{NamedWindowExpr, WindowType};
+    fn named(
+        name: &sqlparser::ast::Ident,
+        depth: usize,
+    ) -> Result<sqlparser::ast::WindowSpec, String> {
+        let definition = NAMED_WINDOWS.with(|slot| {
+            slot.borrow()
+                .iter()
+                .find(|d| d.0.value.eq_ignore_ascii_case(&name.value))
+                .map(|d| d.1.clone())
+        });
+        match definition {
+            _ if depth > 16 => Err(format!("window \"{}\" does not exist", name.value)),
+            Some(NamedWindowExpr::WindowSpec(spec)) => refine(spec, depth + 1),
+            Some(NamedWindowExpr::NamedWindow(other)) => named(&other, depth + 1),
+            None => Err(format!("window \"{}\" does not exist", name.value)),
+        }
+    }
+    fn refine(
+        spec: sqlparser::ast::WindowSpec,
+        depth: usize,
+    ) -> Result<sqlparser::ast::WindowSpec, String> {
+        let Some(base_name) = spec.window_name.clone() else {
+            return Ok(spec);
+        };
+        let base = named(&base_name, depth)?;
+        let name = &base_name.value;
+        // An `EXCLUDE` marker (see nodus_sql) is no partition key.
+        let (markers, keys): (Vec<sqlparser::ast::Expr>, Vec<sqlparser::ast::Expr>) = spec
+            .partition_by
+            .iter()
+            .cloned()
+            .partition(|e| marker_argument(e, nodus_sql::EXCLUDE_MARKER).is_some());
+        if !keys.is_empty() {
+            return Err(format!(
+                "cannot override PARTITION BY clause of window \"{name}\""
+            ));
+        }
+        if !spec.order_by.is_empty() && !base.order_by.is_empty() {
+            return Err(format!(
+                "cannot override ORDER BY clause of window \"{name}\""
+            ));
+        }
+        if base.window_frame.is_some() {
+            return Err(format!(
+                "cannot copy window \"{name}\" because it has a frame clause"
+            ));
+        }
+        Ok(sqlparser::ast::WindowSpec {
+            window_name: None,
+            partition_by: base.partition_by.into_iter().chain(markers).collect(),
+            order_by: if spec.order_by.is_empty() {
+                base.order_by
+            } else {
+                spec.order_by
+            },
+            window_frame: spec.window_frame,
+        })
+    }
+    match over {
+        WindowType::WindowSpec(spec) => refine(spec.clone(), 0),
+        WindowType::NamedWindow(name) => named(name, 0),
+    }
+}
+
+/// The functions that are window functions only.
+const WINDOW_FUNCTIONS: &[(&str, std::ops::RangeInclusive<usize>)] = &[
+    ("ROW_NUMBER", 0..=0),
+    ("RANK", 0..=0),
+    ("DENSE_RANK", 0..=0),
+    ("PERCENT_RANK", 0..=0),
+    ("CUME_DIST", 0..=0),
+    ("NTILE", 1..=1),
+    ("LAG", 1..=3),
+    ("LEAD", 1..=3),
+    ("FIRST_VALUE", 1..=1),
+    ("LAST_VALUE", 1..=1),
+    ("NTH_VALUE", 2..=2),
+];
+
+/// Plans a window call: `func(args) [FILTER (WHERE ...)] OVER window`.
+fn lower_window(
+    func: &sqlparser::ast::Function,
+    name: &str,
+    params: &[Value],
+) -> Option<ScalarExpr> {
+    use crate::plan_types::{FrameBound, FrameExclude, FrameSpec, WindowCall, WindowFrameUnits};
+    use sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArguments, WindowFrameBound};
+    let over = func.over.as_ref()?;
+    let spec = match resolve_window(over) {
+        Ok(spec) => spec,
+        Err(message) => return plan_error(message),
+    };
+    let aggregate = aggregate_op(name);
+    let arity = WINDOW_FUNCTIONS
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, a)| a.clone());
+    if aggregate.is_none() && arity.is_none() {
+        return plan_error(format!(
+            "OVER specified, but {} is not a window function nor an aggregate function",
+            name.to_ascii_lowercase()
+        ));
+    }
+    if !func.within_group.is_empty() || func.null_treatment.is_some() {
+        return plan_error(format!("{} is not implemented for window functions", func));
+    }
+    let mut args = Vec::new();
+    match &func.args {
+        FunctionArguments::None => {}
+        FunctionArguments::List(list) => {
+            if matches!(
+                list.duplicate_treatment,
+                Some(sqlparser::ast::DuplicateTreatment::Distinct)
+            ) {
+                return plan_error("DISTINCT is not implemented for window functions");
+            }
+            if !list.clauses.is_empty() {
+                return plan_error("aggregate ORDER BY is not implemented for window functions");
+            }
+            for arg in &list.args {
+                match arg {
+                    FunctionArg::Unnamed(FunctionArgExpr::Wildcard)
+                        if aggregate == Some(AggregateOp::Count) => {}
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => {
+                        args.push(lower_scalar(e, params)?)
+                    }
+                    _ => return None,
+                }
+            }
+        }
+        FunctionArguments::Subquery(_) => return None,
+    }
+    if let Some(arity) = &arity
+        && !arity.contains(&args.len())
+    {
+        return plan_error(format!(
+            "function {}() does not exist",
+            name.to_ascii_lowercase()
+        ));
+    }
+    let filter = match &func.filter {
+        None => None,
+        Some(_) if aggregate.is_none() => {
+            return plan_error("FILTER is not implemented for non-aggregate window functions");
+        }
+        Some(condition) => Some(lower_scalar(condition, params)?),
+    };
+    // `EXCLUDE ...` arrives as a marker in PARTITION BY (see nodus_sql).
+    let mut exclude = FrameExclude::NoOthers;
+    let mut partition_by = Vec::new();
+    for e in &spec.partition_by {
+        match lower_scalar(e, params)? {
+            ScalarExpr::Function { name, args } if name == nodus_sql::EXCLUDE_MARKER => {
+                exclude = match args.first() {
+                    Some(ScalarExpr::Literal(Value::Text(kind))) => match kind.as_str() {
+                        "current row" => FrameExclude::CurrentRow,
+                        "group" => FrameExclude::Group,
+                        "ties" => FrameExclude::Ties,
+                        _ => FrameExclude::NoOthers,
+                    },
+                    _ => FrameExclude::NoOthers,
+                };
+            }
+            other => partition_by.push(other),
+        }
+    }
+    let mut order_by = Vec::new();
+    for key in &spec.order_by {
+        let ascending = match &key.options.sort {
+            None | Some(sqlparser::ast::OrderBySort::Asc) => true,
+            Some(sqlparser::ast::OrderBySort::Desc) => false,
+            Some(_) => return None,
+        };
+        order_by.push((
+            lower_scalar(&key.expr, params)?,
+            ascending,
+            key.options.nulls_first,
+        ));
+    }
+    let frame = match &spec.window_frame {
+        None if exclude == FrameExclude::NoOthers => None,
+        None => Some(FrameSpec {
+            units: WindowFrameUnits::Range,
+            start: FrameBound::UnboundedPreceding,
+            end: FrameBound::CurrentRow,
+            exclude,
+        }),
+        Some(frame) => {
+            let bound = |b: &WindowFrameBound| -> Option<FrameBound> {
+                Some(match b {
+                    WindowFrameBound::CurrentRow => FrameBound::CurrentRow,
+                    WindowFrameBound::Preceding(None) => FrameBound::UnboundedPreceding,
+                    WindowFrameBound::Following(None) => FrameBound::UnboundedFollowing,
+                    WindowFrameBound::Preceding(Some(e)) => {
+                        FrameBound::Preceding(lower_scalar(e, params)?)
+                    }
+                    WindowFrameBound::Following(Some(e)) => {
+                        FrameBound::Following(lower_scalar(e, params)?)
+                    }
+                })
+            };
+            let start = bound(&frame.start_bound)?;
+            let end = match &frame.end_bound {
+                Some(b) => bound(b)?,
+                None => FrameBound::CurrentRow,
+            };
+            let rank = |b: &FrameBound| match b {
+                FrameBound::UnboundedPreceding => 0,
+                FrameBound::Preceding(_) => 1,
+                FrameBound::CurrentRow => 2,
+                FrameBound::Following(_) => 3,
+                FrameBound::UnboundedFollowing => 4,
+            };
+            if matches!(start, FrameBound::UnboundedFollowing) {
+                return plan_error("frame start cannot be UNBOUNDED FOLLOWING");
+            }
+            if matches!(end, FrameBound::UnboundedPreceding) {
+                return plan_error("frame end cannot be UNBOUNDED PRECEDING");
+            }
+            if rank(&start) == 2 && rank(&end) == 1 {
+                return plan_error("frame starting from current row cannot have preceding rows");
+            }
+            if rank(&start) == 3 && rank(&end) <= 2 {
+                return plan_error(if rank(&end) == 2 {
+                    "frame starting from following row cannot end with current row"
+                } else {
+                    "frame starting from following row cannot have preceding rows"
+                });
+            }
+            let units = match frame.units {
+                sqlparser::ast::WindowFrameUnits::Rows => WindowFrameUnits::Rows,
+                sqlparser::ast::WindowFrameUnits::Range => WindowFrameUnits::Range,
+                sqlparser::ast::WindowFrameUnits::Groups => WindowFrameUnits::Groups,
+            };
+            if units == WindowFrameUnits::Groups && order_by.is_empty() {
+                return plan_error("GROUPS mode requires an ORDER BY clause");
+            }
+            Some(FrameSpec {
+                units,
+                start,
+                end,
+                exclude,
+            })
+        }
+    };
+    Some(ScalarExpr::Window(Box::new(WindowCall {
+        func: name.to_string(),
+        args,
+        filter,
+        partition_by,
+        order_by,
+        frame,
+    })))
+}
+
 /// Forgets a subquery error left by an earlier statement.
 pub(crate) fn reset_expression_errors() {
     SUBQUERY_ERROR.with(|slot| slot.borrow_mut().take());
@@ -1884,6 +2200,11 @@ pub(crate) fn aggregate_op(name: &str) -> Option<AggregateOp> {
 pub(crate) fn scalar_has_aggregate(expr: &ScalarExpr) -> bool {
     matches!(expr, ScalarExpr::Aggregate { .. })
         || expr.children().into_iter().any(scalar_has_aggregate)
+}
+
+/// Whether an expression calls a window function.
+pub(crate) fn scalar_has_window(expr: &ScalarExpr) -> bool {
+    matches!(expr, ScalarExpr::Window(_)) || expr.children().into_iter().any(scalar_has_window)
 }
 
 /// Exact `numeric` arithmetic. Division takes PostgreSQL's result scale (at
@@ -2312,81 +2633,5 @@ fn json_step(json: &serde_json::Value, key: &Value) -> Option<serde_json::Value>
                 .cloned()
         }
         _ => None,
-    }
-}
-
-/// Extracts a window/scalar function's arguments as strings: column names via
-/// `extract_col_name`, or numeric/string literals (e.g. the LAG/LEAD offset).
-pub(crate) fn window_args(func: &sqlparser::ast::Function) -> Vec<String> {
-    use sqlparser::ast::{
-        Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Value as SqlValue,
-    };
-    let args = match &func.args {
-        FunctionArguments::List(list) => list.args.as_slice(),
-        _ => &[],
-    };
-    args.iter()
-        .filter_map(|a| match a {
-            FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => {
-                extract_col_name(e).or_else(|| match e {
-                    Expr::Value(v) => match &v.value {
-                        SqlValue::Number(n, _) => Some(n.clone()),
-                        SqlValue::SingleQuotedString(s) => Some(s.clone()),
-                        _ => None,
-                    },
-                    _ => None,
-                })
-            }
-            _ => None,
-        })
-        .collect()
-}
-
-/// Lowers a sqlparser window frame (`ROWS`/`RANGE BETWEEN …`) into the plan
-/// representation. A shorthand `ROWS n PRECEDING` (no `BETWEEN`) has an
-/// implicit `AND CURRENT ROW` end bound.
-pub(crate) fn window_frame(
-    spec: &sqlparser::ast::WindowSpec,
-) -> Option<crate::plan_types::WindowFrame> {
-    use crate::plan_types::{WindowBound, WindowFrame, WindowFrameUnits};
-    use sqlparser::ast::WindowFrameUnits as AstUnits;
-    let frame = spec.window_frame.as_ref()?;
-    let units = match frame.units {
-        AstUnits::Rows => WindowFrameUnits::Rows,
-        // GROUPS is treated as RANGE (peer-based) for our purposes.
-        AstUnits::Range | AstUnits::Groups => WindowFrameUnits::Range,
-    };
-    let start = lower_bound(&frame.start_bound);
-    let end = frame
-        .end_bound
-        .as_ref()
-        .map(lower_bound)
-        .unwrap_or(WindowBound::CurrentRow);
-    Some(WindowFrame { units, start, end })
-}
-
-fn lower_bound(b: &sqlparser::ast::WindowFrameBound) -> crate::plan_types::WindowBound {
-    use crate::plan_types::WindowBound;
-    use sqlparser::ast::WindowFrameBound as B;
-    // Extract a small integer literal from a bound offset expression.
-    let as_int = |e: &Option<Box<sqlparser::ast::Expr>>| -> Option<i64> {
-        match e.as_deref()? {
-            sqlparser::ast::Expr::Value(v) => match &v.value {
-                sqlparser::ast::Value::Number(n, _) => n.parse().ok(),
-                _ => None,
-            },
-            _ => None,
-        }
-    };
-    match b {
-        B::CurrentRow => WindowBound::CurrentRow,
-        B::Preceding(e) => match as_int(e) {
-            Some(n) => WindowBound::Preceding(n),
-            None => WindowBound::UnboundedPreceding,
-        },
-        B::Following(e) => match as_int(e) {
-            Some(n) => WindowBound::Following(n),
-            None => WindowBound::UnboundedFollowing,
-        },
     }
 }

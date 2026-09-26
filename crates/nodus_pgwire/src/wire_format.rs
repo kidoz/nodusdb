@@ -116,6 +116,27 @@ pub(crate) fn sqlstate_for_execution_error(err_str: &str) -> &'static str {
         "55P03" // lock_not_available
     } else if err_str.contains("must be ahead of \"PR\"") {
         "42601" // syntax_error
+    } else if err_str.starts_with("OVER specified, but") {
+        "42809" // wrong_object_type
+    } else if err_str.starts_with("window functions are not allowed in")
+        || err_str.starts_with("RANGE with offset PRECEDING/FOLLOWING")
+        || err_str.starts_with("frame start cannot")
+        || err_str.starts_with("frame end cannot")
+        || err_str.starts_with("frame starting from")
+        || err_str.starts_with("cannot override")
+        || err_str.starts_with("cannot copy window")
+        || err_str.starts_with("GROUPS mode requires")
+    {
+        "42P20" // windowing_error
+    } else if err_str.starts_with("frame starting offset must not be")
+        || err_str.starts_with("frame ending offset must not be")
+        || err_str == "invalid preceding or following size in window function"
+        || err_str.starts_with("argument of ntile must be")
+        || err_str.starts_with("argument of nth_value must be")
+    {
+        "22013" // invalid_preceding_or_following_size
+    } else if err_str.starts_with("window \"") && err_str.ends_with("\" does not exist") {
+        "42704" // undefined_object
     } else if err_str.starts_with("operator does not exist:") {
         "42883" // undefined_function
     } else if err_str.starts_with("operator is not unique:") {

@@ -78,6 +78,7 @@ pub(crate) fn is_known(name: &str) -> bool {
                 | "TO_NUMBER" | "MAKE_INTERVAL" | "MAKE_TIME" | "MAKE_TIMESTAMPTZ"
                 | "JUSTIFY_DAYS" | "JUSTIFY_HOURS" | "JUSTIFY_INTERVAL" | "ISFINITE" | "DATE_BIN"
                 | "TIMEZONE" | "OVERLAPS" | "__DATETIME__" | "__TZ_TEXT__" | "__JSON_TIME__"
+                | "__EXCLUDE__" | "__INTERVAL_SPAN__"
                 // Locks, notifications, privileges, and backends.
                 | "PG_ADVISORY_LOCK" | "PG_ADVISORY_LOCK_SHARED" | "PG_ADVISORY_XACT_LOCK"
                 | "PG_ADVISORY_XACT_LOCK_SHARED" | "PG_TRY_ADVISORY_LOCK"
@@ -191,6 +192,7 @@ pub(crate) fn return_type(name: &str, arg_types: &[Option<String>]) -> Option<St
             }
             "MAKE_TIMESTAMPTZ" => "TIMESTAMPTZ",
             "TO_CHAR" | "__TZ_TEXT__" | "__JSON_TIME__" => "TEXT",
+            "__INTERVAL_SPAN__" => "NUMERIC",
             "TO_NUMBER" => "NUMERIC",
             "ISFINITE" | "OVERLAPS" => "BOOLEAN",
             "DATE_BIN" => return arg_types.get(1).cloned().flatten(),
@@ -1075,6 +1077,10 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
             };
             Value::Text(format!("{}{offset}", stamp.replacen(' ', "T", 1)))
         }
+        "__INTERVAL_SPAN__" if arity(1) => match crate::datetime::Interval::parse(&text(arg(0))) {
+            Some(iv) => Value::Numeric(rust_decimal::Decimal::from_i128_with_scale(iv.span(), 0)),
+            None => arg(0).clone(),
+        },
         "OVERLAPS" if arity(4) => crate::datetime::overlaps(args, &[]).unwrap_or_else(raise),
         // With the arguments' static types, as the planner passes them.
         "OVERLAPS" if arity(8) => {

@@ -56,6 +56,7 @@ mod timezone;
 mod transactions;
 mod value;
 mod view_helpers;
+mod windows;
 pub use error_fields::{error_fields, error_message};
 pub use explain::ExplainOptions;
 pub use json_text::{json_text, jsonb_text};

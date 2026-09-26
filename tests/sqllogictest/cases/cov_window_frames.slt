@@ -86,6 +86,13 @@ FROM w ORDER BY id;
 5	100	400
 6	200	400
 
-# A RANGE frame with a numeric offset is rejected.
-statement error
-SELECT id, SUM(v) OVER (ORDER BY v RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM w;
+# A RANGE frame with a numeric offset spans the rows whose value is within it.
+query II
+SELECT id, SUM(v) OVER (ORDER BY v RANGE BETWEEN 10 PRECEDING AND CURRENT ROW) FROM w ORDER BY id;
+----
+1	10
+2	30
+3	50
+4	70
+5	100
+6	200

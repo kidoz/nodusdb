@@ -861,6 +861,20 @@ impl MemExecutor {
             crate::filter_eval::check_column_refs(refs, &col_names)?;
         }
 
+        // Window calls come out of the select list and sort keys: computed
+        // over the rows (or groups) below, their values are read back as
+        // hidden columns, typed as the calls are.
+        let (projection, key_targets, windows) = crate::windows::extract(projection, key_targets);
+        let window_types: std::collections::HashMap<String, String> = windows
+            .iter()
+            .enumerate()
+            .filter_map(|(k, call)| {
+                let call = ScalarExpr::Window(Box::new(call.clone()));
+                crate::result_types::expr_type(&call, &column_type)
+                    .map(|t| (crate::windows::hidden_column(k), t))
+            })
+            .collect();
+
         // `LIMIT 0` returns no rows, so no row is evaluated (as in
         // PostgreSQL, where the limit never pulls from its input). Describe
         // probes rely on this to learn the result shape without running the
@@ -922,7 +936,11 @@ impl MemExecutor {
             })
             || key_targets
                 .iter()
-                .any(|t| matches!(t, SortTarget::Expr(e) if scalar_has_aggregate(e)));
+                .any(|t| matches!(t, SortTarget::Expr(e) if scalar_has_aggregate(e)))
+            // `sum(sum(a)) OVER ()` windows over groups.
+            || windows
+                .iter()
+                .any(|w| w.children().into_iter().any(scalar_has_aggregate));
 
         let mut out_rows = Vec::new();
         let mut out_cols = Vec::new();
@@ -942,7 +960,9 @@ impl MemExecutor {
                 _ => vec![group_by.clone()],
             };
 
-            for set in &sets {
+            // The groups HAVING keeps, each with its grouping set.
+            let mut kept: Vec<(usize, Vec<Vec<Value>>)> = Vec::new();
+            for (set_index, set) in sets.iter().enumerate() {
                 // col_pos also resolves qualified refs (`t.col`) against bare
                 // column names.
                 let set_indices: Vec<Option<usize>> = set
@@ -994,68 +1014,89 @@ impl MemExecutor {
                             continue;
                         }
                     }
-                    let mut out_row = Vec::new();
-                    for proj_item in &projection {
-                        match proj_item {
-                            ProjectionItem::Literal(v) | ProjectionItem::AliasedLiteral(v, _) => {
-                                out_row.push(v.clone());
-                            }
-                            ProjectionItem::Column(c) | ProjectionItem::AliasedColumn(c, _) => {
-                                // A grouping column not present in this set is
-                                // rolled up to NULL (subtotal / grand-total row).
-                                let is_grouping = group_by.iter().any(|g| g == c);
-                                let is_active = set.iter().any(|s| s == c);
-                                if is_grouping && !is_active {
-                                    out_row.push(crate::Value::Null);
-                                } else {
-                                    let idx = crate::filter_eval::col_pos(&col_names, c);
-                                    out_row.push(
-                                        group_rows
-                                            .first()
-                                            .and_then(|r| idx.and_then(|i| r.get(i)))
-                                            .map(|v| v.clone())
-                                            .unwrap_or(crate::Value::Null),
-                                    );
-                                }
-                            }
-                            ProjectionItem::WindowFunction { .. }
-                            | ProjectionItem::ScalarFunction { .. }
-                            | ProjectionItem::JsonAccess { .. }
-                            | ProjectionItem::CaseWhenEq { .. }
-                            | ProjectionItem::Case { .. } => {
-                                out_row.push(Value::Null); // MVP fallback
-                            }
-                            ProjectionItem::Aggregate(op, inner) => {
-                                out_row.push(compute_aggregate(op, inner, &group_rows, &col_names));
-                            }
-                            ProjectionItem::Subquery { plan, .. } => {
-                                // Outer references read the group's first row.
-                                let rep = group_rows.first().map(Vec::as_slice).unwrap_or(&[]);
+                    kept.push((set_index, group_rows));
+                }
+            }
+
+            // Window calls, over the groups.
+            let window_values = if windows.is_empty() {
+                Vec::new()
+            } else {
+                crate::windows::compute(&windows, kept.len(), &|e, g| {
+                    let (_, rows) = &kept[g];
+                    self.eval_grouped(ctx, e, rows, &col_names)
+                })?
+            };
+            for (g, (set_index, group_rows)) in kept.iter().enumerate() {
+                let set = &sets[*set_index];
+                // The group's view of an expression: with its window values in
+                // place of their hidden columns.
+                let view = |e: &ScalarExpr| substitute_windows(e, &window_values, g);
+                let mut out_row = Vec::new();
+                for proj_item in &projection {
+                    match proj_item {
+                        ProjectionItem::Literal(v) | ProjectionItem::AliasedLiteral(v, _) => {
+                            out_row.push(v.clone());
+                        }
+                        ProjectionItem::Column(c) | ProjectionItem::AliasedColumn(c, _) => {
+                            // A grouping column not present in this set is
+                            // rolled up to NULL (subtotal / grand-total row).
+                            let is_grouping = group_by.iter().any(|g| g == c);
+                            let is_active = set.iter().any(|s| s == c);
+                            if is_grouping && !is_active {
+                                out_row.push(crate::Value::Null);
+                            } else {
+                                let idx = crate::filter_eval::col_pos(&col_names, c);
                                 out_row.push(
-                                    self.correlated_scalar_subquery(ctx, plan, rep, &col_names),
+                                    group_rows
+                                        .first()
+                                        .and_then(|r| idx.and_then(|i| r.get(i)))
+                                        .map(|v| v.clone())
+                                        .unwrap_or(crate::Value::Null),
                                 );
                             }
-                            ProjectionItem::Expr { expr, .. } => {
-                                // Group-aware eval: aggregates compute over the group,
-                                // plain columns read the group's first row.
-                                out_row.push(self.eval_grouped(ctx, expr, &group_rows, &col_names));
-                            }
+                        }
+                        ProjectionItem::WindowFunction { .. }
+                        | ProjectionItem::ScalarFunction { .. }
+                        | ProjectionItem::JsonAccess { .. }
+                        | ProjectionItem::CaseWhenEq { .. }
+                        | ProjectionItem::Case { .. } => {
+                            out_row.push(Value::Null); // MVP fallback
+                        }
+                        ProjectionItem::Aggregate(op, inner) => {
+                            out_row.push(compute_aggregate(op, inner, group_rows, &col_names));
+                        }
+                        ProjectionItem::Subquery { plan, .. } => {
+                            // Outer references read the group's first row.
+                            let rep = group_rows.first().map(Vec::as_slice).unwrap_or(&[]);
+                            out_row
+                                .push(self.correlated_scalar_subquery(ctx, plan, rep, &col_names));
+                        }
+                        ProjectionItem::Expr { expr, .. } => {
+                            // Group-aware eval: aggregates compute over the group,
+                            // plain columns read the group's first row.
+                            out_row.push(self.eval_grouped(
+                                ctx,
+                                &view(expr),
+                                group_rows,
+                                &col_names,
+                            ));
                         }
                     }
-                    out_rows.push(out_row);
-                    out_sort_values.push(
-                        key_targets
-                            .iter()
-                            .map(|target| match target {
-                                SortTarget::Expr(e) => {
-                                    self.eval_grouped(ctx, e, &group_rows, &col_names)
-                                }
-                                _ => Value::Null,
-                            })
-                            .collect(),
-                    );
-                    out_reps.push(group_rows.first().cloned().unwrap_or_default());
                 }
+                out_rows.push(out_row);
+                out_sort_values.push(
+                    key_targets
+                        .iter()
+                        .map(|target| match target {
+                            SortTarget::Expr(e) => {
+                                self.eval_grouped(ctx, &view(e), group_rows, &col_names)
+                            }
+                            _ => Value::Null,
+                        })
+                        .collect(),
+                );
+                out_reps.push(group_rows.first().cloned().unwrap_or_default());
             }
 
             out_cols = if projection.is_empty() {
@@ -1157,6 +1198,17 @@ impl MemExecutor {
                     })
                     .collect()
             };
+
+            // Window calls, over the rows, as hidden columns.
+            if !windows.is_empty() {
+                let values = crate::windows::compute(&windows, stored_rows.len(), &|e, i| {
+                    self.eval_expr(ctx, e, &stored_rows[i], &col_names)
+                })?;
+                for (i, row) in stored_rows.iter_mut().enumerate() {
+                    row.extend(values.iter().map(|column| column[i].clone()));
+                }
+                col_names.extend((0..windows.len()).map(crate::windows::hidden_column));
+            }
 
             // Evaluate Window Functions and Scalar Expressions before projecting
             for (proj_idx, proj_item) in projection.iter().enumerate() {
@@ -1898,9 +1950,11 @@ impl MemExecutor {
 
             if let Some(inferred) = projection.get(i).and_then(|item| {
                 crate::result_types::projection_type(item, |source| {
-                    crate::filter_eval::col_pos(&col_names, source)
-                        .and_then(|index| joined_columns.get(index))
-                        .map(|column| column.data_type.clone())
+                    window_types.get(source).cloned().or_else(|| {
+                        crate::filter_eval::col_pos(&col_names, source)
+                            .and_then(|index| joined_columns.get(index))
+                            .map(|column| column.data_type.clone())
+                    })
                 })
             }) {
                 types.push(inferred);
@@ -1950,6 +2004,20 @@ impl MemExecutor {
             tag,
         })
     }
+}
+
+/// `expr` with each window call's hidden column replaced by its value for
+/// input `row` (a group).
+fn substitute_windows(expr: &ScalarExpr, values: &[Vec<Value>], row: usize) -> ScalarExpr {
+    if values.is_empty() {
+        return expr.clone();
+    }
+    if let ScalarExpr::Column(name) = expr
+        && let Some(k) = crate::windows::hidden_index(name)
+    {
+        return ScalarExpr::Literal(values[k][row].clone());
+    }
+    expr.map_children(&mut |e| substitute_windows(e, values, row))
 }
 
 /// Whether a declared type is `interval`.
@@ -2023,7 +2091,7 @@ fn frame_bounds(
             };
             (start, end)
         }
-        U::Range => {
+        U::Range | U::Groups => {
             // Only unbounded / current-row bounds reach here (numeric offsets
             // are rejected earlier). CURRENT ROW spans the row's ORDER BY peers.
             let peer_start = (0..=pos)

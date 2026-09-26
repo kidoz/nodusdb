@@ -200,6 +200,8 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
     let SetExpr::Select(select) = &*query.body else {
         anyhow::bail!("Unsupported query body");
     };
+    // Its window calls may name the windows of its `WINDOW` clause.
+    let _windows = named_windows_scope(&select.named_window);
 
     // A set-returning function as the whole select list (`SELECT
     // generate_series(1, 3)`) yields its rows, as from `FROM` would.
@@ -655,6 +657,9 @@ fn plan_group_by(
         let mut computed = |expr: ScalarExpr, keys: &mut Vec<String>| -> Result<()> {
             if scalar_has_aggregate(&expr) {
                 anyhow::bail!("aggregate functions are not allowed in GROUP BY");
+            }
+            if scalar_has_window(&expr) {
+                anyhow::bail!("window functions are not allowed in GROUP BY");
             }
             let name = group_column_name(group_exprs.len());
             group_exprs.push((name.clone(), expr));
@@ -1424,63 +1429,6 @@ fn plan_select_expr(
 ) -> Result<ProjectionItem> {
     use sqlparser::ast::Expr;
     let name = || alias.clone().unwrap_or_else(|| default_output_name(expr));
-    if let Expr::Function(func) = expr
-        && let Some(over) = &func.over
-    {
-        let func_name = func.name.to_string().to_uppercase();
-        let filter = match &func.filter {
-            None => None,
-            Some(_) if aggregate_op(&func_name).is_none() => {
-                anyhow::bail!("FILTER is not implemented for non-aggregate window functions")
-            }
-            Some(condition) => Some(lower_scalar(condition, params).ok_or_else(|| {
-                expression_error(condition, || {
-                    format!("Unsupported FILTER condition: {condition}")
-                })
-            })?),
-        };
-        if let sqlparser::ast::FunctionArguments::List(list) = &func.args
-            && (matches!(
-                list.duplicate_treatment,
-                Some(sqlparser::ast::DuplicateTreatment::Distinct)
-            ) || !list.clauses.is_empty())
-        {
-            anyhow::bail!("DISTINCT and ORDER BY are not implemented for window functions");
-        }
-        let mut partition_by = Vec::new();
-        let mut order_by = Vec::new();
-        let sqlparser::ast::WindowType::WindowSpec(spec) = over else {
-            anyhow::bail!("Named windows are not supported");
-        };
-        // Windows partition and sort by plain columns; anything else is an
-        // error rather than silently ignored.
-        for expr in &spec.partition_by {
-            match lower_scalar(expr, params) {
-                Some(ScalarExpr::Column(col)) => partition_by.push(col),
-                _ => anyhow::bail!("Unsupported window PARTITION BY expression: {expr}"),
-            }
-        }
-        for expr in &spec.order_by {
-            if expr.options.nulls_first.is_some() {
-                anyhow::bail!("NULLS FIRST/LAST in a window ORDER BY is not supported");
-            }
-            let asc = sort_ascending(&expr.options)?;
-            match lower_scalar(&expr.expr, params) {
-                Some(ScalarExpr::Column(col)) => order_by.push((col, asc)),
-                _ => anyhow::bail!("Unsupported window ORDER BY expression: {}", expr.expr),
-            }
-        }
-        let frame = window_frame(spec);
-        return Ok(ProjectionItem::WindowFunction {
-            func_name,
-            args: window_args(func),
-            partition_by,
-            order_by,
-            alias: Some(name()),
-            frame,
-            filter,
-        });
-    }
     if let Expr::Subquery(query) = expr {
         return Ok(ProjectionItem::Subquery {
             plan: Box::new(plan_query(query, params)?),

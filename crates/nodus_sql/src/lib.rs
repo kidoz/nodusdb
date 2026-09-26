@@ -44,10 +44,115 @@ pub fn parse_sql(
             word.value.make_ascii_lowercase();
         }
     }
-    let tokens = reorder_identity_options(reorder_sequence_options(rewrite_data_clauses(tokens)));
+    let tokens = reorder_identity_options(reorder_sequence_options(rewrite_data_clauses(
+        rewrite_query_syntax(tokens),
+    )));
     Parser::new(&dialect)
         .with_tokens_with_locations(tokens)
         .parse_statements()
+}
+
+/// The function a window frame's `EXCLUDE CURRENT ROW | GROUP | TIES` is
+/// written as, in the window's `PARTITION BY` (upper-cased as planned):
+/// `pg_catalog.__exclude__('ties')`, since the parser has no `EXCLUDE`.
+pub const EXCLUDE_MARKER: &str = "__EXCLUDE__";
+
+/// Query syntax the parser lacks: a window frame's `EXCLUDE`
+/// ([`EXCLUDE_MARKER`]).
+fn rewrite_query_syntax(
+    mut tokens: Vec<sqlparser::tokenizer::TokenWithSpan>,
+) -> Vec<sqlparser::tokenizer::TokenWithSpan> {
+    use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer};
+    let snippet = |sql: &str| -> Vec<TokenWithSpan> {
+        let dialect = PostgreSqlDialect {};
+        Tokenizer::new(&dialect, sql)
+            .tokenize_with_location()
+            .map(|mut t| {
+                t.retain(|t| t.token != Token::EOF);
+                t
+            })
+            .unwrap_or_default()
+    };
+    let word = |t: &TokenWithSpan| match &t.token {
+        Token::Word(w) if w.quote_style.is_none() => Some(w.value.clone()),
+        _ => None,
+    };
+    let significant = |tokens: &[TokenWithSpan], from: usize| {
+        (from..tokens.len()).find(|&i| !matches!(tokens[i].token, Token::Whitespace(_)))
+    };
+    // A window frame's `EXCLUDE ...`, from the last one back so earlier
+    // positions stay put.
+    let excludes: Vec<usize> = (0..tokens.len())
+        .filter(|&i| word(&tokens[i]).as_deref() == Some("exclude"))
+        .collect();
+    for &at in excludes.iter().rev() {
+        let mut words = Vec::new();
+        let mut j = at;
+        while words.len() < 2 {
+            match significant(&tokens, j + 1) {
+                Some(k) => {
+                    words.push((k, word(&tokens[k]).unwrap_or_default()));
+                    j = k;
+                }
+                None => break,
+            }
+        }
+        let (kind, last) = match words.as_slice() {
+            [(_, a), (k, b)] if a == "current" && b == "row" => ("current row", *k),
+            [(_, a), (k, b)] if a == "no" && b == "others" => ("no others", *k),
+            [(k, a), ..] if a == "group" || a == "ties" => (a.as_str(), *k),
+            _ => continue,
+        };
+        let kind = kind.to_string();
+        tokens.drain(at..=last);
+        if kind == "no others" {
+            continue;
+        }
+        // The window specification's opening parenthesis.
+        let mut depth = 0i32;
+        let Some(open) = (0..at).rev().find(|&k| match tokens[k].token {
+            Token::RParen => {
+                depth += 1;
+                false
+            }
+            Token::LParen if depth == 0 => true,
+            Token::LParen => {
+                depth -= 1;
+                false
+            }
+            _ => false,
+        }) else {
+            continue;
+        };
+        let marker = format!(
+            "pg_catalog.{}('{kind}')",
+            EXCLUDE_MARKER.to_ascii_lowercase()
+        );
+        let first = significant(&tokens, open + 1);
+        let first_word = first.and_then(|k| word(&tokens[k]));
+        match first_word.as_deref() {
+            Some("partition") => {
+                if let Some(by) = first.and_then(|k| significant(&tokens, k + 1)) {
+                    tokens.splice(by + 1..by + 1, snippet(&format!(" {marker},")));
+                }
+            }
+            Some("order" | "rows" | "range" | "groups") | None => {
+                tokens.splice(
+                    open + 1..open + 1,
+                    snippet(&format!("PARTITION BY {marker} ")),
+                );
+            }
+            // A named window being refined: after its name.
+            Some(_) => {
+                let name = first.unwrap_or(open + 1);
+                tokens.splice(
+                    name + 1..name + 1,
+                    snippet(&format!(" PARTITION BY {marker} ")),
+                );
+            }
+        }
+    }
+    tokens
 }
 
 /// The storage parameter that records `WITH NO DATA` on `CREATE TABLE ...
@@ -467,6 +572,19 @@ pub fn set_variable_parts(stmt: &sqlparser::ast::Statement) -> Option<(String, S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_query_syntax_is_rewritten() {
+        let one = |sql: &str| parse_sql(sql).unwrap().remove(0).to_string();
+        assert_eq!(
+            one("SELECT sum(a) OVER (ORDER BY a ROWS UNBOUNDED PRECEDING EXCLUDE TIES) FROM t"),
+            "SELECT sum(a) OVER (PARTITION BY pg_catalog.__exclude__('ties') ORDER BY a ROWS UNBOUNDED PRECEDING) FROM t"
+        );
+        assert_eq!(
+            one("SELECT sum(a) OVER (PARTITION BY b ROWS CURRENT ROW EXCLUDE CURRENT ROW) FROM t"),
+            "SELECT sum(a) OVER (PARTITION BY pg_catalog.__exclude__('current row'), b ROWS CURRENT ROW) FROM t"
+        );
+    }
 
     #[test]
     fn test_placeholder_parsing() {

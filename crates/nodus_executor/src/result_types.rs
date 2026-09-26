@@ -71,6 +71,18 @@ fn literal_type(value: &Value) -> Option<String> {
 fn scalar_type(expr: &ScalarExpr, column: &impl Fn(&str) -> Option<String>) -> Option<String> {
     match expr {
         ScalarExpr::Column(name) => column(name),
+        ScalarExpr::Window(call) => {
+            let input = || call.args.first().and_then(|a| scalar_type(a, column));
+            match call.func.as_str() {
+                "ROW_NUMBER" | "RANK" | "DENSE_RANK" => Some("BIGINT".into()),
+                "NTILE" => Some("INTEGER".into()),
+                "PERCENT_RANK" | "CUME_DIST" => Some("DOUBLE PRECISION".into()),
+                "LAG" | "LEAD" | "FIRST_VALUE" | "LAST_VALUE" | "NTH_VALUE" => input(),
+                name => {
+                    crate::planner::aggregate_op(name).and_then(|op| aggregate_type(&op, input()))
+                }
+            }
+        }
         ScalarExpr::Literal(value) => literal_type(value),
         ScalarExpr::Cast { target, .. } => Some(target.clone()),
         ScalarExpr::Binary { op, left, right } => {
@@ -296,6 +308,46 @@ pub(crate) fn check_integer_ranges(
         }
         _ => {}
     }
+    // Intervals order (and partition) by their length of time, as sort keys
+    // of a window's; their text would not.
+    let interval = |e: &ScalarExpr| kind(e) == Some(crate::datetime::Kind::Interval);
+    let span = |e: &ScalarExpr| {
+        if interval(e) {
+            ScalarExpr::Function {
+                name: INTERVAL_SPAN.to_string(),
+                args: vec![e.clone()],
+            }
+        } else {
+            e.clone()
+        }
+    };
+    match &checked {
+        // A RANGE frame's offsets measure the key itself.
+        ScalarExpr::Window(call)
+            if (call.order_by.iter().any(|(e, _, _)| interval(e))
+                || call.partition_by.iter().any(interval))
+                && !call.frame.as_ref().is_some_and(|f| {
+                    f.units == crate::plan_types::WindowFrameUnits::Range
+                        && [&f.start, &f.end].iter().any(|b| {
+                            matches!(
+                                b,
+                                crate::plan_types::FrameBound::Preceding(_)
+                                    | crate::plan_types::FrameBound::Following(_)
+                            )
+                        })
+                }) =>
+        {
+            let mut call = (**call).clone();
+            call.partition_by = call.partition_by.iter().map(span).collect();
+            call.order_by = call
+                .order_by
+                .iter()
+                .map(|(e, asc, nulls)| (span(e), *asc, *nulls))
+                .collect();
+            return ScalarExpr::Window(Box::new(call));
+        }
+        _ => {}
+    }
     // A zoned timestamp is kept in UTC: its local date, time, or timestamp
     // is in the session's zone, and so is its text.
     let zoned = |e: &ScalarExpr| kind(e) == Some(crate::datetime::Kind::TimestampTz);
@@ -451,6 +503,10 @@ pub(crate) fn check_integer_ranges(
         _ => checked,
     }
 }
+
+/// The function an interval sort key is rewritten to: its length of time,
+/// as a number of microseconds (a month as 30 days).
+pub(crate) const INTERVAL_SPAN: &str = "__INTERVAL_SPAN__";
 
 /// The function a zoned timestamp's text is rewritten to: the value as
 /// the session shows it.

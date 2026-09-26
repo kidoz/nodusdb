@@ -215,6 +215,9 @@ pub(crate) fn parse_filter_expr(
     if scalar_has_aggregate(&condition) {
         anyhow::bail!("aggregate functions are not allowed in WHERE");
     }
+    if scalar_has_window(&condition) {
+        anyhow::bail!("window functions are not allowed in WHERE");
+    }
     Ok(FilterExpr::Scalar(condition))
 }
 

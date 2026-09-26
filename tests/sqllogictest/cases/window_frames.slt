@@ -1,0 +1,286 @@
+# Window functions over expressions, named windows, and every kind of frame.
+statement ok
+CREATE TABLE sales (id int PRIMARY KEY, region text, product text, qty int, price numeric(8,2), sold date);
+
+statement ok
+INSERT INTO sales VALUES (1,'east','apple',10,1.50,'2024-01-01'),(2,'east','pear',5,2.00,'2024-01-02'),(3,'west','apple',7,1.50,'2024-01-02'),(4,'west','pear',3,2.00,'2024-01-05'),(5,'west','apple',7,1.60,'2024-01-09'),(6,'north','plum',1,3.00,'2024-01-10'),(7,'east','apple',2,1.55,'2024-01-10');
+
+query TTTT
+SELECT id, sum(qty * 2) OVER (), lag(qty * 2) OVER (ORDER BY id), 1 + sum(qty) OVER (ORDER BY id) FROM sales ORDER BY id;
+----
+1	70	NULL	11
+2	70	20	16
+3	70	10	23
+4	70	14	26
+5	70	6	33
+6	70	14	34
+7	70	2	36
+
+query TT
+SELECT id, sum(qty) OVER (PARTITION BY upper(region) ORDER BY qty + 0, id) FROM sales ORDER BY id;
+----
+1	17
+2	7
+3	10
+4	3
+5	17
+6	1
+7	2
+
+query TTT
+SELECT id, sum(qty) OVER (ORDER BY id NULLS FIRST), row_number() OVER (ORDER BY qty DESC, id) AS rn FROM sales ORDER BY rn;
+----
+1	10	1
+3	22	2
+5	32	3
+2	15	4
+4	25	5
+7	35	6
+6	33	7
+
+query T
+SELECT id FROM sales ORDER BY row_number() OVER (ORDER BY qty, id) DESC LIMIT 3;
+----
+1
+5
+3
+
+query TTTT
+SELECT region, sum(qty), rank() OVER (ORDER BY region), row_number() OVER (ORDER BY count(*) DESC, region) FROM sales GROUP BY region ORDER BY 1;
+----
+east	17	1	1
+north	1	2	3
+west	17	3	2
+
+query TTTT
+SELECT region, sum(qty), sum(sum(qty)) OVER () AS total, round(100.0 * sum(qty) / sum(sum(qty)) OVER (), 1) AS pct FROM sales GROUP BY region ORDER BY region;
+----
+east	17	35	48.6
+north	1	35	2.9
+west	17	35	48.6
+
+query TTTT
+SELECT region, product, sum(qty), rank() OVER (PARTITION BY region ORDER BY sum(qty) DESC) FROM sales GROUP BY region, product ORDER BY 1, 4, 2;
+----
+east	apple	12	1
+east	pear	5	2
+north	plum	1	1
+west	apple	14	1
+west	pear	3	2
+
+query TTTT
+SELECT id, qty, sum(qty) OVER w, avg(qty) OVER w FROM sales WINDOW w AS (PARTITION BY region ORDER BY id) ORDER BY id;
+----
+1	10	10	10.0000000000000000
+2	5	15	7.5000000000000000
+3	7	7	7.0000000000000000
+4	3	10	5.0000000000000000
+5	7	17	5.6666666666666667
+6	1	1	1.00000000000000000000
+7	2	17	5.6666666666666667
+
+query TTT
+SELECT id, sum(qty) OVER w1, sum(qty) OVER w2 FROM sales WINDOW w1 AS (ORDER BY id), w2 AS (w1 ROWS 1 PRECEDING) ORDER BY id;
+----
+1	10	10
+2	15	15
+3	22	12
+4	25	10
+5	32	10
+6	33	8
+7	35	3
+
+query TT
+SELECT id, sum(qty) OVER (w ORDER BY id) FROM sales WINDOW w AS (PARTITION BY region) ORDER BY id;
+----
+1	10
+2	15
+3	7
+4	10
+5	17
+6	1
+7	17
+
+statement error
+SELECT id, sum(qty) OVER nosuch FROM sales;
+
+query TTTT
+SELECT id, qty, cume_dist() OVER (ORDER BY qty), percent_rank() OVER (ORDER BY qty) FROM sales ORDER BY id;
+----
+1	10	1	1
+2	5	0.5714285714285714	0.5
+3	7	0.8571428571428571	0.6666666666666666
+4	3	0.42857142857142855	0.3333333333333333
+5	7	0.8571428571428571	0.6666666666666666
+6	1	0.14285714285714285	0
+7	2	0.2857142857142857	0.16666666666666666
+
+query TTTT
+SELECT id, nth_value(qty, 2) OVER (ORDER BY id), nth_value(qty, 2) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING), last_value(qty) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM sales ORDER BY id;
+----
+1	NULL	5	2
+2	5	5	2
+3	5	5	2
+4	5	5	2
+5	5	5	2
+6	5	5	2
+7	5	5	2
+
+query TTTT
+SELECT id, lead(qty, 2, 0) OVER (ORDER BY id), lag(qty, 1, -1) OVER (ORDER BY id), ntile(3) OVER (ORDER BY id) FROM sales ORDER BY id;
+----
+1	7	-1	1
+2	3	10	1
+3	7	5	1
+4	1	7	2
+5	2	3	2
+6	0	7	3
+7	0	1	3
+
+query TT
+SELECT id, sum(qty) OVER (ORDER BY qty RANGE BETWEEN 2 PRECEDING AND 2 FOLLOWING) FROM sales ORDER BY id;
+----
+1	10
+2	22
+3	19
+4	11
+5	19
+6	6
+7	6
+
+statement error
+SELECT id, sum(qty) OVER (ORDER BY qty, id RANGE BETWEEN 2 PRECEDING AND 2 FOLLOWING) FROM sales;
+
+query TT
+SELECT id, sum(qty) OVER (ORDER BY sold RANGE BETWEEN INTERVAL '2 days' PRECEDING AND CURRENT ROW) FROM sales ORDER BY id;
+----
+1	10
+2	22
+3	22
+4	3
+5	7
+6	10
+7	10
+
+query TT
+SELECT id, sum(qty) OVER (ORDER BY price RANGE BETWEEN 0.05 PRECEDING AND 0.05 FOLLOWING) FROM sales ORDER BY id;
+----
+1	19
+2	8
+3	19
+4	8
+5	9
+6	1
+7	26
+
+query TT
+SELECT id, count(*) OVER (ORDER BY price DESC RANGE BETWEEN 0.1 PRECEDING AND CURRENT ROW) FROM sales ORDER BY id;
+----
+1	4
+2	2
+3	4
+4	2
+5	1
+6	1
+7	2
+
+query TT
+SELECT id, count(*) OVER (ORDER BY qty GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM sales ORDER BY id;
+----
+1	3
+2	4
+3	4
+4	3
+5	4
+6	2
+7	3
+
+query TT
+SELECT id, sum(qty) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW EXCLUDE CURRENT ROW) FROM sales ORDER BY id;
+----
+1	NULL
+2	10
+3	15
+4	22
+5	25
+6	32
+7	33
+
+query TTT
+SELECT id, sum(qty) OVER (ORDER BY qty ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE TIES), sum(qty) OVER (ORDER BY qty RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE GROUP) FROM sales ORDER BY id;
+----
+1	35	25
+2	35	30
+3	28	21
+4	35	32
+5	28	21
+6	35	34
+7	35	33
+
+query TT
+SELECT id, count(*) OVER (w ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING EXCLUDE CURRENT ROW) FROM sales WINDOW w AS (ORDER BY id) ORDER BY id;
+----
+1	6
+2	5
+3	4
+4	3
+5	2
+6	1
+7	0
+
+query TT
+SELECT id, sum(qty) OVER (ORDER BY id ROWS BETWEEN 2 FOLLOWING AND 1 FOLLOWING) FROM sales ORDER BY id;
+----
+1	NULL
+2	NULL
+3	NULL
+4	NULL
+5	NULL
+6	NULL
+7	NULL
+
+query TTT
+SELECT id, string_agg(product, ',') OVER (ORDER BY id ROWS 1 PRECEDING), count(*) FILTER (WHERE qty > 4) OVER (ORDER BY id) FROM sales ORDER BY id;
+----
+1	apple	1
+2	apple,pear	2
+3	pear,apple	3
+4	apple,pear	3
+5	pear,apple	4
+6	apple,plum	4
+7	plum,apple	4
+
+query TT
+SELECT DISTINCT region, count(*) OVER (PARTITION BY region) FROM sales ORDER BY 1;
+----
+east	3
+north	1
+west	3
+
+query TTT
+SELECT * FROM (SELECT id, region, row_number() OVER (PARTITION BY region ORDER BY qty DESC, id) AS rn FROM sales) t WHERE rn = 1 ORDER BY region;
+----
+1	east	1
+6	north	1
+3	west	1
+
+statement error
+SELECT id, sum(qty) OVER (ORDER BY id ROWS BETWEEN -1 PRECEDING AND CURRENT ROW) FROM sales;
+
+statement error
+SELECT id, ntile(0) OVER () FROM sales;
+
+statement error
+SELECT id, sum(qty) OVER (ORDER BY region RANGE 1 PRECEDING) FROM sales;
+
+statement error
+SELECT id, upper(region) OVER () FROM sales;
+
+statement error
+SELECT id FROM sales WHERE row_number() OVER () > 1;
+
+statement error
+SELECT id, sum(DISTINCT qty) OVER () FROM sales;
+
+statement error
+SELECT id, sum(qty) OVER (ROWS BETWEEN UNBOUNDED FOLLOWING AND CURRENT ROW) FROM sales;
