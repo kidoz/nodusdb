@@ -1,0 +1,117 @@
+# Unique indexes and constraints: partial ones constrain only the rows their
+# predicate holds for, a key with a NULL never collides, and a table
+# without a primary key holds duplicate rows whatever its indexes.
+statement ok
+CREATE TABLE ui9 (id int PRIMARY KEY, email text, deleted boolean);
+
+statement ok
+CREATE UNIQUE INDEX ON ui9 (email) WHERE NOT deleted;
+
+statement ok
+INSERT INTO ui9 VALUES (1, 'a', false), (2, 'a', true), (3, 'a', true);
+
+statement error
+INSERT INTO ui9 VALUES (4, 'a', false);
+
+statement ok
+UPDATE ui9 SET deleted = true WHERE id = 1;
+
+statement ok
+INSERT INTO ui9 VALUES (4, 'a', false);
+
+statement ok
+CREATE INDEX ON ui9 (email);
+
+statement ok
+CREATE INDEX ON ui9 (email);
+
+query TT
+SELECT indexname, indexdef FROM pg_indexes WHERE tablename = 'ui9' ORDER BY 1;
+----
+ui9_email_idx	CREATE UNIQUE INDEX ui9_email_idx ON public.ui9 USING btree (email) WHERE (NOT deleted)
+ui9_email_idx1	CREATE INDEX ui9_email_idx1 ON public.ui9 USING btree (email)
+ui9_email_idx2	CREATE INDEX ui9_email_idx2 ON public.ui9 USING btree (email)
+ui9_pkey	CREATE UNIQUE INDEX ui9_pkey ON public.ui9 USING btree (id)
+
+statement error
+CREATE UNIQUE INDEX ui9_all ON ui9 (email);
+
+statement ok
+CREATE TABLE ui9t (a int, b int);
+
+statement ok
+INSERT INTO ui9t VALUES (1, 1), (1, 2), (NULL, 3), (NULL, 3);
+
+statement ok
+CREATE UNIQUE INDEX ui9t_ab ON ui9t (a, b);
+
+statement error
+INSERT INTO ui9t VALUES (1, 1);
+
+statement ok
+INSERT INTO ui9t VALUES (NULL, 3);
+
+query T
+SELECT count(*) FROM ui9t;
+----
+5
+
+statement ok
+UPDATE ui9t SET b = b + 10 WHERE a = 1;
+
+query TT
+SELECT a, b FROM ui9t WHERE a = 1 ORDER BY b;
+----
+1	11
+1	12
+
+statement ok
+CREATE TABLE ui9n (a int);
+
+statement ok
+INSERT INTO ui9n VALUES (NULL), (NULL);
+
+statement ok
+CREATE UNIQUE INDEX ui9n_a ON ui9n (a);
+
+statement ok
+CREATE TABLE ui9l (a int, b text);
+
+statement ok
+CREATE INDEX ui9l_a ON ui9l (a);
+
+statement ok
+INSERT INTO ui9l VALUES (1, 'x'), (1, 'x');
+
+query T
+SELECT count(*) FROM ui9l WHERE a = 1;
+----
+2
+
+statement ok
+UPDATE ui9l SET b = 'y';
+
+query TT
+SELECT a, b FROM ui9l ORDER BY b;
+----
+1	y
+1	y
+
+statement ok
+DELETE FROM ui9l WHERE a = 1;
+
+query T
+SELECT count(*) FROM ui9l;
+----
+0
+
+# Constraints keep the names they are given.
+statement ok
+CREATE TABLE ui9k (id int CONSTRAINT ui9k_id PRIMARY KEY, a int CONSTRAINT ui9k_a UNIQUE, b int, c int, CONSTRAINT ui9k_bc UNIQUE (b, c));
+
+query TT
+SELECT conname, contype FROM pg_constraint WHERE conrelid = 'ui9k'::regclass AND contype IN ('p', 'u') ORDER BY 1;
+----
+ui9k_a	u
+ui9k_bc	u
+ui9k_id	p

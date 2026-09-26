@@ -677,7 +677,7 @@ impl MemExecutor {
         index_val: &Value,
         table_id: TableId,
         session: &str,
-    ) -> Result<Vec<Vec<Value>>> {
+    ) -> Result<Vec<(String, Vec<Value>)>> {
         let read_ts = self.read_ts(session);
         // Barrier the table group whose rows this index lookup will fetch.
         self.maybe_read_range_barrier(
@@ -702,7 +702,7 @@ impl MemExecutor {
                 // Fetch the actual row
                 let row_key = Bytes::from(format!("{}:{}", table_id, pk));
                 if let Some(row_val) = self.kv.get(&row_key, read_ts)? {
-                    rows.push(Self::decode_row(&row_val, &columns)?);
+                    rows.push((pk.to_string(), Self::decode_row(&row_val, &columns)?));
                 }
             }
         }
@@ -710,24 +710,20 @@ impl MemExecutor {
     }
 
     /// Merges the session's uncommitted overlay into committed equality
-    /// index-scan results, keyed by primary key (the first column). This lets an
+    /// index-scan results, each keyed by the row's stored key. This lets an
     /// equality lookup use the index *inside* a transaction instead of falling
     /// back to a full table scan, while staying consistent with the txn's own
-    /// pending writes. Rows are keyed by their declared primary key (see
-    /// [`Self::row_pk`]), matching the `{table_id}:{pk}` overlay-key convention.
+    /// pending writes, which the overlay keys by the same `{table_id}:{key}`.
     pub(crate) fn merge_overlay_eq(
         &self,
-        committed: Vec<Vec<Value>>,
+        committed: Vec<(String, Vec<Value>)>,
         table_id: TableId,
-        pk_positions: &[usize],
         col_pos: Option<usize>,
         val: &Value,
         session: &str,
     ) -> Vec<Vec<Value>> {
-        let mut map: std::collections::BTreeMap<String, Vec<Value>> = committed
-            .into_iter()
-            .map(|r| (Self::row_pk(pk_positions, &r), r))
-            .collect();
+        let mut map: std::collections::BTreeMap<String, Vec<Value>> =
+            committed.into_iter().collect();
         let columns = self.table_columns(table_id);
         if let Some(txn) = self.active_txns.read().get(session) {
             let start = format!("{}:", table_id);

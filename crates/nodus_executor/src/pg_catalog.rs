@@ -183,7 +183,7 @@ impl MemExecutor {
                         Value::Null,
                         Value::Null,
                     ]);
-                    for index in &table.indexes {
+                    for index in &Self::table_indexes(table) {
                         let index_oid =
                             Self::index_oid(db_name, &schema_name, &table.name, &index.name);
                         rows.push(vec![
@@ -307,7 +307,7 @@ impl MemExecutor {
                         ]);
                     }
                     // An index's attributes are its key columns.
-                    for index in &table.indexes {
+                    for index in &Self::table_indexes(table) {
                         let index_oid =
                             Self::index_oid(db_name, &schema_name, &table.name, &index.name);
                         let keys = index
@@ -376,7 +376,7 @@ impl MemExecutor {
                 for table in &tables {
                     let schema_name = Self::schema_name_by_id(db_name, &schemas, table.schema_id);
                     let relid = Self::table_oid(db_name, &schema_name, &table.name);
-                    for index in &table.indexes {
+                    for index in &Self::table_indexes(table) {
                         // `indkey` is the ordered list of 1-based column positions
                         // (attnums), as a real array so `unnest(i.indkey)`
                         // introspection returns one row per indexed column.
@@ -1563,32 +1563,13 @@ impl MemExecutor {
         let mut rows = Vec::new();
         for table in tables {
             let schema_name = Self::schema_name_by_id(db_name, schemas, table.schema_id);
-            for index in &table.indexes {
-                let key_cols = index
-                    .key_columns
-                    .iter()
-                    .filter_map(|key| {
-                        table
-                            .columns
-                            .iter()
-                            .find(|column| column.id == key.column_id)
-                            .map(|column| column.name.clone())
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ");
+            for index in &Self::table_indexes(table) {
                 rows.push(vec![
                     Value::Text(schema_name.clone()),
                     Value::Text(table.name.clone()),
                     Value::Text(index.name.clone()),
                     Value::Null,
-                    Value::Text(format!(
-                        "CREATE {}INDEX {} ON {}.{} ({})",
-                        if index.unique { "UNIQUE " } else { "" },
-                        index.name,
-                        schema_name,
-                        table.name,
-                        key_cols
-                    )),
+                    Value::Text(Self::index_text(table, &schema_name, index, false)),
                 ]);
             }
         }
@@ -1606,7 +1587,7 @@ impl MemExecutor {
             let schema_name = Self::schema_name_by_id(db_name, schemas, table.schema_id);
             let relid = Self::table_oid(db_name, &schema_name, &table.name);
             let namespace = Self::schema_oid(db_name, &schema_name);
-            for index in &table.indexes {
+            for index in &Self::table_indexes(table) {
                 if !index.unique {
                     continue;
                 }
@@ -2041,8 +2022,8 @@ impl MemExecutor {
         let schemas = catalog.list_schemas(db).ok()?;
         for table in catalog.list_all_tables(db).ok()? {
             let schema = Self::schema_name_by_id(db, &schemas, table.schema_id);
-            let Some(index) = table
-                .indexes
+            let indexes = Self::table_indexes(&table);
+            let Some(index) = indexes
                 .iter()
                 .find(|i| Self::index_oid(db, &schema, &table.name, &i.name) == oid)
             else {
@@ -2063,19 +2044,67 @@ impl MemExecutor {
             if column > 0 {
                 return keys.get(column as usize - 1).cloned();
             }
-            let relation = if pretty && schema == "public" {
-                quote_ident(&table.name)
-            } else {
-                format!("{}.{}", quote_ident(&schema), quote_ident(&table.name))
-            };
-            return Some(format!(
-                "CREATE {}INDEX {} ON {relation} USING btree ({})",
-                if index.unique { "UNIQUE " } else { "" },
-                quote_ident(&index.name),
-                keys.join(", ")
-            ));
+            return Some(Self::index_text(&table, &schema, index, pretty));
         }
         None
+    }
+
+    /// A table's indexes as PostgreSQL has them: a composite primary key,
+    /// stored as one primary index per column, is one index.
+    pub(crate) fn table_indexes(
+        table: &nodus_catalog::TableDescriptor,
+    ) -> Vec<nodus_catalog::IndexDescriptor> {
+        let mut indexes: Vec<nodus_catalog::IndexDescriptor> = Vec::new();
+        for index in &table.indexes {
+            if index.index_type == nodus_catalog::IndexType::Primary
+                && let Some(merged) = indexes.iter_mut().find(|i| {
+                    i.index_type == nodus_catalog::IndexType::Primary && i.name == index.name
+                })
+            {
+                merged.key_columns.extend(index.key_columns.iter().cloned());
+                continue;
+            }
+            indexes.push(index.clone());
+        }
+        indexes
+    }
+
+    /// An index's `CREATE INDEX` statement, as `pg_get_indexdef` gives it;
+    /// `pretty` leaves the `public` schema out.
+    pub(crate) fn index_text(
+        table: &nodus_catalog::TableDescriptor,
+        schema: &str,
+        index: &nodus_catalog::IndexDescriptor,
+        pretty: bool,
+    ) -> String {
+        let keys: Vec<String> = index
+            .key_columns
+            .iter()
+            .filter_map(|key| {
+                let c = table.columns.iter().find(|c| c.id == key.column_id)?;
+                Some(format!(
+                    "{}{}",
+                    quote_ident(&c.name),
+                    if key.descending { " DESC" } else { "" }
+                ))
+            })
+            .collect();
+        let relation = if pretty && schema == "public" {
+            quote_ident(&table.name)
+        } else {
+            format!("{}.{}", quote_ident(schema), quote_ident(&table.name))
+        };
+        let predicate = index
+            .predicate
+            .as_ref()
+            .map(|p| format!(" WHERE ({})", p.sql))
+            .unwrap_or_default();
+        format!(
+            "CREATE {}INDEX {} ON {relation} USING btree ({}){predicate}",
+            if index.unique { "UNIQUE " } else { "" },
+            quote_ident(&index.name),
+            keys.join(", ")
+        )
     }
 
     /// `pg_get_constraintdef(oid)`: the constraint's definition as `ALTER
@@ -2096,7 +2125,7 @@ impl MemExecutor {
                     .collect::<Vec<_>>()
                     .join(", ")
             };
-            for index in table.indexes.iter().filter(|i| i.unique) {
+            for index in Self::table_indexes(&table).iter().filter(|i| i.unique) {
                 if is(&index.name) {
                     let kind = if matches!(index.index_type, nodus_catalog::IndexType::Primary) {
                         "PRIMARY KEY"

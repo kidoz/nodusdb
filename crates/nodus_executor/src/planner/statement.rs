@@ -76,6 +76,8 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
             let table_name = name.to_string();
             let mut cols = Vec::new();
             let mut tbl_constraints = Vec::new();
+            // The names given to key constraints, by their columns.
+            let mut key_names: Vec<(Vec<String>, String)> = Vec::new();
             for c in columns {
                 let mut nullable = true;
                 let mut unique = false;
@@ -215,11 +217,17 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                         }
                         // `PRIMARY KEY` column option implies unique + not-null.
                         sqlparser::ast::ColumnOption::PrimaryKey(_) => {
+                            if let Some(name) = &opt.name {
+                                key_names.push((vec![c.name.value.clone()], name.value.clone()));
+                            }
                             unique = true;
                             nullable = false;
                             primary = true;
                         }
                         sqlparser::ast::ColumnOption::Unique(_) => {
+                            if let Some(name) = &opt.name {
+                                key_names.push((vec![c.name.value.clone()], name.value.clone()));
+                            }
                             unique = true;
                         }
                         sqlparser::ast::ColumnOption::Check(check) => {
@@ -255,6 +263,9 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                 match tc {
                     sqlparser::ast::TableConstraint::Unique(uc) => {
                         let names = index_column_names(&uc.columns);
+                        if let Some(name) = &uc.name {
+                            key_names.push((names.clone(), name.value.clone()));
+                        }
                         if let [col] = names.as_slice() {
                             if let Some(c) = cols.iter_mut().find(|c| &c.name == col) {
                                 c.unique = true;
@@ -265,6 +276,9 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                         }
                     }
                     sqlparser::ast::TableConstraint::PrimaryKey(pk) => {
+                        if let Some(name) = &pk.name {
+                            key_names.push((index_column_names(&pk.columns), name.value.clone()));
+                        }
                         for col in index_column_names(&pk.columns) {
                             if let Some(c) = cols.iter_mut().find(|c| c.name == col) {
                                 c.unique = true;
@@ -297,6 +311,7 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                 constraints: tbl_constraints,
                 if_not_exists: create_table.if_not_exists,
                 unique_constraints,
+                key_names,
             })
         }
         Statement::CreateView(create_view) => {
@@ -379,18 +394,32 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                 .name
                 .as_ref()
                 .map(|n| n.to_string())
-                .unwrap_or_else(|| "unnamed_idx".to_string());
+                .unwrap_or_default();
+            // An index over an expression would index nothing; reject it
+            // rather than create one that enforces or finds nothing.
             let cols = create_index
                 .columns
                 .iter()
-                .filter_map(|c| extract_col_name(&c.column.expr))
-                .collect();
+                .map(|c| {
+                    extract_col_name(&c.column.expr).ok_or_else(|| {
+                        anyhow::anyhow!("index expressions are not supported: {}", c.column.expr)
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let predicate = match &create_index.predicate {
+                Some(condition) => {
+                    parse_filter_expr(condition, params)?;
+                    Some(condition.to_string())
+                }
+                None => None,
+            };
             Ok(LogicalPlan::CreateIndex {
                 name: idx_name,
                 table_name: create_index.table_name.to_string(),
                 columns: cols,
                 unique: create_index.unique,
                 if_not_exists: create_index.if_not_exists,
+                predicate,
             })
         }
         Statement::CreateRole(create_role) => {

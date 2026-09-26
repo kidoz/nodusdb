@@ -7,45 +7,60 @@ use crate::{ExecutionContext, MemExecutor, Value, parse_filter_expr, render, val
 use anyhow::Result;
 
 impl MemExecutor {
+    /// Rejects `new_row` when it has the primary key or a unique index's key
+    /// of another row (the row stored at `skip_pk`, which it replaces, aside).
+    /// A key with a NULL never collides, and a partial unique index only
+    /// constrains the rows its predicate holds for.
     pub(crate) fn check_unique_constraints(
         &self,
-        session: &str,
+        ctx: &ExecutionContext,
         tbl: &nodus_catalog::TableDescriptor,
         new_row: &[Value],
         skip_pk: Option<&str>,
     ) -> Result<()> {
-        // An index-less table has no PRIMARY KEY or UNIQUE constraint to enforce,
-        // and its rows carry synthetic rowids — so exact-duplicate rows are
-        // allowed. (The all-column key fallback below would otherwise reject
-        // them as a spurious "primary key" collision.)
-        if Self::uses_synthetic_rowid(tbl) {
-            return Ok(());
-        }
         // Each UNIQUE index constrains its whole key tuple. Primary indexes are
         // covered by the composite primary-key comparison below (a composite
         // PRIMARY KEY is stored as one primary index per column).
-        let unique_keys: Vec<(&str, Vec<usize>)> = tbl
+        let col_names: Vec<String> = tbl.columns.iter().map(|c| c.name.clone()).collect();
+        let mut unique_keys = Vec::new();
+        for idx in tbl
             .indexes
             .iter()
             .filter(|idx| idx.unique && idx.index_type != nodus_catalog::IndexType::Primary)
-            .map(|idx| {
-                let positions = idx
-                    .key_columns
-                    .iter()
-                    .filter_map(|kc| tbl.columns.iter().position(|c| c.id == kc.column_id))
-                    .collect();
-                (idx.name.as_str(), positions)
-            })
-            .collect();
-        let pk_positions = Self::pk_positions(tbl);
-        let new_pk = Self::row_pk(&pk_positions, new_row);
-
-        for existing in self.scan_rows(tbl.id, session)? {
-            let pk = Self::row_pk(&pk_positions, &existing);
-            if Some(pk.as_str()) == skip_pk {
+        {
+            let positions: Vec<usize> = idx
+                .key_columns
+                .iter()
+                .filter_map(|kc| tbl.columns.iter().position(|c| c.id == kc.column_id))
+                .collect();
+            let predicate = match &idx.predicate {
+                Some(p) => Some(self.index_predicate(&p.sql)?),
+                None => None,
+            };
+            // A row the predicate leaves out is not constrained.
+            if let Some(filter) = &predicate
+                && self.eval_filter(ctx, new_row, &col_names, &tbl.columns, Some(filter))
+                    != Some(true)
+            {
                 continue;
             }
-            if pk == new_pk {
+            unique_keys.push((idx.name.as_str(), positions, predicate));
+        }
+        let pk_positions = Self::pk_positions_declared(tbl);
+        let new_pk = key_tuple(new_row, &pk_positions);
+        if unique_keys.is_empty() && pk_positions.is_empty() {
+            return Ok(());
+        }
+        let prefix = format!("{}:", tbl.id);
+        for (stored_key, existing) in self.scan_rows_keyed(tbl.id, &ctx.session_id)? {
+            let stored_pk = stored_key.strip_prefix(&prefix).unwrap_or(&stored_key);
+            if Some(stored_pk) == skip_pk {
+                continue;
+            }
+            if !pk_positions.is_empty()
+                && let (Some(a), Some(b)) = (key_tuple(&existing, &pk_positions), &new_pk)
+                && a.iter().zip(b).all(|(x, y)| values_equal(x, y))
+            {
                 let name = tbl
                     .indexes
                     .iter()
@@ -53,17 +68,30 @@ impl MemExecutor {
                     .map_or_else(|| format!("{}_pkey", tbl.name), |i| i.name.clone());
                 return Err(self.duplicate_key(tbl, &name, &pk_positions, new_row));
             }
-            for (idx_name, positions) in &unique_keys {
+            for (idx_name, positions, predicate) in &unique_keys {
                 if let (Some(a), Some(b)) = (
                     key_tuple(&existing, positions),
                     key_tuple(new_row, positions),
                 ) && a.iter().zip(&b).all(|(x, y)| values_equal(x, y))
+                    && predicate.as_ref().is_none_or(|filter| {
+                        self.eval_filter(ctx, &existing, &col_names, &tbl.columns, Some(filter))
+                            == Some(true)
+                    })
                 {
                     return Err(self.duplicate_key(tbl, idx_name, positions, new_row));
                 }
             }
         }
         Ok(())
+    }
+
+    /// A partial index's predicate, as a condition over the table's rows.
+    pub(crate) fn index_predicate(&self, sql: &str) -> Result<crate::FilterExpr> {
+        let expr = sqlparser::parser::Parser::new(&sqlparser::dialect::PostgreSqlDialect {})
+            .try_with_sql(sql)
+            .and_then(|mut p| p.parse_expr())
+            .map_err(|e| anyhow::anyhow!("cannot parse index predicate `{sql}`: {e}"))?;
+        parse_filter_expr(&expr, &[])
     }
 
     /// Checks `new_row` of `tbl` against its CHECK constraints and foreign

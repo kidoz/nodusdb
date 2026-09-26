@@ -1,5 +1,5 @@
 //! Constraint violations as PostgreSQL reports them, foreign key actions,
-//! and notices, driven through SQL.
+//! unique indexes, and notices, driven through SQL.
 
 use super::*;
 use crate::dml_join_tests::rows;
@@ -192,4 +192,41 @@ fn truncate_empties_referenced_tables_only_with_their_references() {
     sql("TRUNCATE p CASCADE").unwrap();
     assert_eq!(notices(), ["truncate cascades to table \"c\""]);
     assert_eq!(rows(&sql("SELECT count(*) FROM c").unwrap()), ["0"]);
+}
+
+#[test]
+fn unique_indexes_check_what_they_constrain() {
+    let (sql, _) = session();
+    sql("CREATE TABLE u (id int PRIMARY KEY, email text, deleted boolean)").unwrap();
+    sql("CREATE UNIQUE INDEX ON u (email) WHERE NOT deleted").unwrap();
+    sql("INSERT INTO u VALUES (1, 'a', false), (2, 'a', true)").unwrap();
+    assert!(sql("INSERT INTO u VALUES (3, 'a', false)").is_err());
+    let out = sql("SELECT indexname FROM pg_indexes WHERE tablename = 'u'").unwrap();
+    assert_eq!(rows(&out), ["u_email_idx", "u_pkey"]);
+
+    sql("CREATE TABLE t (a int, b int)").unwrap();
+    sql("INSERT INTO t VALUES (1, 1), (1, 2), (NULL, 3), (NULL, 3)").unwrap();
+    sql("CREATE UNIQUE INDEX t_ab ON t (a, b)").unwrap();
+    let (message, f) = fields(sql("CREATE UNIQUE INDEX t_a ON t (a)").unwrap_err());
+    assert_eq!(message, "could not create unique index \"t_a\"");
+    assert_eq!(field(&f, "detail").unwrap(), "Key (a)=(1) is duplicated.");
+    // No index is left behind by the failed one.
+    assert!(
+        !rows(&sql("SELECT indexname FROM pg_indexes WHERE tablename = 't'").unwrap())
+            .contains(&"t_a".to_string())
+    );
+    let err = sql("CREATE INDEX ON t (lower(b::text))").unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("index expressions are not supported")
+    );
+
+    // A table without a primary key holds duplicate rows whatever its indexes.
+    sql("CREATE TABLE l (a int)").unwrap();
+    sql("CREATE INDEX ON l (a)").unwrap();
+    sql("INSERT INTO l VALUES (1), (1)").unwrap();
+    assert_eq!(
+        rows(&sql("SELECT count(*) FROM l WHERE a = 1").unwrap()),
+        ["2"]
+    );
 }

@@ -315,7 +315,12 @@ impl MemExecutor {
                     if let Some(col) = tbl.columns.iter().find(|c| c.name == *col_name) {
                         let col_pos = tbl.columns.iter().position(|c| c.id == col.id);
                         for idx in &tbl.indexes {
-                            if idx.key_columns.iter().any(|kc| kc.column_id == col.id) {
+                            // Entries are kept for an index's leading column.
+                            if idx
+                                .key_columns
+                                .first()
+                                .is_some_and(|kc| kc.column_id == col.id)
+                            {
                                 let val = self.eval_operand(&[], &[], &[], right, &col.data_type);
                                 if let Ok(indexed_rows) =
                                     self.index_scan(idx.id, &val, tbl.id, &ctx.session_id)
@@ -323,7 +328,6 @@ impl MemExecutor {
                                     rows = Some(self.merge_overlay_eq(
                                         indexed_rows,
                                         tbl.id,
-                                        &Self::pk_positions(&tbl),
                                         col_pos,
                                         &val,
                                         &ctx.session_id,

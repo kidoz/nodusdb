@@ -166,7 +166,7 @@ impl MemExecutor {
         let mut rows = Vec::new();
         for table in tables {
             let schema_name = Self::schema_name_by_id(db_name, schemas, table.schema_id);
-            for index in &table.indexes {
+            for index in &Self::table_indexes(table) {
                 if index.unique {
                     rows.push(vec![
                         Value::Text(db_name.into()),
@@ -238,7 +238,7 @@ impl MemExecutor {
         let mut rows = Vec::new();
         for table in tables {
             let schema_name = Self::schema_name_by_id(db_name, schemas, table.schema_id);
-            for index in &table.indexes {
+            for index in &Self::table_indexes(table) {
                 if !index.unique {
                     continue;
                 }
@@ -297,7 +297,7 @@ impl MemExecutor {
         let mut rows = Vec::new();
         for table in tables {
             let schema_name = Self::schema_name_by_id(db_name, schemas, table.schema_id);
-            for index in &table.indexes {
+            for index in &Self::table_indexes(table) {
                 rows.push(vec![
                     Value::Text(db_name.into()),
                     Value::Text(schema_name.clone()),

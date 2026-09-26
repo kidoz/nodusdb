@@ -150,6 +150,8 @@ pub(crate) fn sqlstate_for_execution_error(err_str: &str) -> &'static str {
         "2201X" // invalid_row_count_in_result_offset_clause
     } else if err_str.starts_with("unrecognized configuration parameter") {
         "42704" // undefined_object
+    } else if err_str.starts_with("could not create unique index") {
+        "23505" // unique_violation
     // Duplicate object on CREATE without IF NOT EXISTS (class 42). Catalog and
     // DDL paths phrase this differently ("Database X already exists" vs
     // "relation \"x\" already exists"), so classify case-insensitively.

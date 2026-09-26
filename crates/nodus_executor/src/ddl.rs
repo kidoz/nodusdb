@@ -83,9 +83,23 @@ impl MemExecutor {
         columns: Vec<ColumnDef>,
         constraints: Vec<nodus_catalog::TableConstraint>,
         if_not_exists: bool,
-        unique_constraints: Vec<Vec<String>>,
+        (unique_constraints, key_names): (Vec<Vec<String>>, Vec<(Vec<String>, String)>),
         materialized_query: Option<String>,
     ) -> Result<QueryOutput> {
+        // The name given to the key over `columns`, if any.
+        let key_name = |columns: &[String]| -> Option<String> {
+            key_names.iter().find_map(|(key, name)| {
+                (key.len() == columns.len() && key.iter().all(|k| columns.contains(k)))
+                    .then(|| name.clone())
+            })
+        };
+        let primary_columns: Vec<String> = columns
+            .iter()
+            .filter(|c| c.primary)
+            .map(|c| c.name.clone())
+            .collect();
+        let primary_name =
+            key_name(&primary_columns).unwrap_or_else(|| format!("{}_pkey", table_name_of(&name)));
         let (db_name, schema_name, table_only) = parse_object_name(&name)?;
         let db = self.catalog_reader.get_database(db_name)?;
         let sch = self.catalog_reader.get_schema(db_name, schema_name)?;
@@ -184,7 +198,11 @@ impl MemExecutor {
                             })
                     })
                     .collect::<Result<Vec<_>>>()
-                    .map(|ids| (names.join("_"), ids))
+                    .map(|ids| {
+                        let name = key_name(names)
+                            .unwrap_or_else(|| format!("{table_only}_{}_key", names.join("_")));
+                        (name, ids)
+                    })
             })
             .collect::<Result<Vec<_>>>()?;
 
@@ -203,9 +221,10 @@ impl MemExecutor {
             let index = nodus_catalog::IndexDescriptor {
                 id: nodus_catalog::IndexId::new(),
                 name: if primary {
-                    format!("{}_pkey", table_only)
+                    primary_name.clone()
                 } else {
-                    format!("{table_only}_{}_key", col.name)
+                    key_name(std::slice::from_ref(&col.name))
+                        .unwrap_or_else(|| format!("{table_only}_{}_key", col.name))
                 },
                 version: 1,
                 created_at: Utc::now(),
@@ -234,10 +253,10 @@ impl MemExecutor {
                 },
             )?;
         }
-        for (suffix, column_ids) in unique_groups {
+        for (name, column_ids) in unique_groups {
             let index = nodus_catalog::IndexDescriptor {
                 id: nodus_catalog::IndexId::new(),
-                name: format!("{table_only}_{suffix}_key"),
+                name,
                 version: 1,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
@@ -316,7 +335,15 @@ impl MemExecutor {
                 sequence: None,
             })
             .collect();
-        self.exec_create_table(ctx, name.to_string(), columns, vec![], false, vec![], None)?;
+        self.exec_create_table(
+            ctx,
+            name.to_string(),
+            columns,
+            vec![],
+            false,
+            Default::default(),
+            None,
+        )?;
         let (db_name, schema_name, table_only) = parse_object_name(name)?;
         let tbl = self
             .catalog_reader
@@ -412,7 +439,7 @@ impl MemExecutor {
             columns,
             vec![],
             false,
-            vec![],
+            Default::default(),
             materialized_query,
         )?;
         if !with_data {
@@ -790,13 +817,15 @@ impl MemExecutor {
         self.catalog_writer.update_table_descriptor(change)?;
         Ok(QueryOutput::tag("ALTER TABLE"))
     }
+
+    /// `CREATE [UNIQUE] INDEX [name] ON table (columns) [WHERE predicate]`.
     pub(crate) fn exec_create_index(
         &self,
         ctx: &ExecutionContext,
         name: String,
         table_name: String,
         columns: Vec<String>,
-        unique: bool,
+        (unique, predicate): (bool, Option<String>),
         if_not_exists: bool,
     ) -> Result<QueryOutput> {
         let (db_name, schema_name, table_only) = parse_object_name(&table_name)?;
@@ -804,92 +833,191 @@ impl MemExecutor {
             .catalog_reader
             .get_table(db_name, schema_name, table_only)?;
         self.authorize(ctx, Action::CreateTable, ResourceRef::Table(tbl.id))?;
-
-        if tbl.indexes.iter().any(|i| i.name == name) {
+        let name = if name.is_empty() {
+            self.unused_relation_name(&format!("{table_only}_{}_idx", columns.join("_")))?
+        } else {
+            name
+        };
+        if self.relation_name_taken(&name)? {
             if if_not_exists {
                 self.notice(ctx, Self::exists_skipping(&name));
                 return Ok(QueryOutput::tag("CREATE INDEX"));
             }
             anyhow::bail!("relation \"{}\" already exists", name);
         }
-
-        let mut index_cols = Vec::new();
-        for c in &columns {
-            if let Some(col) = tbl.columns.iter().find(|tc| tc.name == *c) {
-                index_cols.push(nodus_catalog::IndexColumn {
-                    column_id: col.id,
-                    descending: false,
-                });
-            } else {
-                anyhow::bail!("Column not found for index: {}", c);
-            }
-        }
-
-        let idx_type = if unique {
+        let index_type = if unique {
             nodus_catalog::IndexType::Unique
         } else {
             nodus_catalog::IndexType::LocalSecondary
         };
+        let index = Self::new_index(&tbl, name, index_type, &columns, predicate)?;
+        self.add_index(ctx, &tbl, index)?;
+        Ok(QueryOutput::tag("CREATE INDEX"))
+    }
 
-        let index = nodus_catalog::IndexDescriptor {
+    /// An index of `tbl` named `name` over `columns`.
+    pub(crate) fn new_index(
+        tbl: &nodus_catalog::TableDescriptor,
+        name: String,
+        index_type: nodus_catalog::IndexType,
+        columns: &[String],
+        predicate: Option<String>,
+    ) -> Result<nodus_catalog::IndexDescriptor> {
+        let key_columns = columns
+            .iter()
+            .map(|c| {
+                tbl.columns
+                    .iter()
+                    .find(|tc| &tc.name == c)
+                    .map(|col| nodus_catalog::IndexColumn {
+                        column_id: col.id,
+                        descending: false,
+                    })
+                    .ok_or_else(|| anyhow::anyhow!("column \"{c}\" does not exist"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(nodus_catalog::IndexDescriptor {
             id: nodus_catalog::IndexId::new(),
             name,
             version: 1,
             created_at: Utc::now(),
             updated_at: Utc::now(),
             state: DescriptorState::Public,
-            index_type: idx_type,
+            unique: index_type != nodus_catalog::IndexType::LocalSecondary,
+            index_type,
             index_state: nodus_catalog::IndexState::Creating,
-            key_columns: index_cols,
+            key_columns,
             include_columns: vec![],
-            unique,
             global: false,
-            predicate: None,
+            predicate: predicate.map(|sql| nodus_catalog::Expression { sql }),
             expressions: vec![],
-        };
+        })
+    }
 
-        let change = nodus_catalog::TableDescriptorChange::AddIndex {
-            table_id: tbl.id,
-            index: index.clone(),
-        };
-        self.catalog_writer.update_table_descriptor(change)?;
+    /// Adds `index` to `tbl` and fills it from the rows `tbl` has. A unique
+    /// index is refused when two rows share a key (rows its predicate leaves
+    /// out, and keys with a NULL, aside).
+    pub(crate) fn add_index(
+        &self,
+        ctx: &ExecutionContext,
+        tbl: &nodus_catalog::TableDescriptor,
+        index: nodus_catalog::IndexDescriptor,
+    ) -> Result<()> {
+        if index.unique {
+            let positions: Vec<usize> = index
+                .key_columns
+                .iter()
+                .filter_map(|k| tbl.columns.iter().position(|c| c.id == k.column_id))
+                .collect();
+            let predicate = index.predicate.as_ref().map(|p| p.sql.as_str());
+            self.check_unique_key(ctx, tbl, &index.name, &positions, predicate)?;
+        }
+        self.install_index(ctx, tbl, index)
+    }
 
-        // Backfill existing rows into the new index
-        let pk_positions = Self::pk_positions(&tbl);
-        let mut seen_values = std::collections::HashSet::new();
+    /// Rejects unique key `positions` of `tbl`, for index `name`, when two
+    /// of its rows share it (rows `predicate` leaves out, and keys with a
+    /// NULL, aside).
+    pub(crate) fn check_unique_key(
+        &self,
+        ctx: &ExecutionContext,
+        tbl: &nodus_catalog::TableDescriptor,
+        name: &str,
+        positions: &[usize],
+        predicate: Option<&str>,
+    ) -> Result<()> {
+        let predicate = match predicate {
+            Some(sql) => Some(self.index_predicate(sql)?),
+            None => None,
+        };
+        let names: Vec<String> = tbl.columns.iter().map(|c| c.name.clone()).collect();
+        let mut seen = std::collections::HashSet::new();
         for row in self.scan_rows(tbl.id, &ctx.session_id)? {
-            let pk_str = Self::row_pk(&pk_positions, &row);
-            for kcol in &index.key_columns {
-                if let Some(pos) = tbl.columns.iter().position(|c| c.id == kcol.column_id) {
-                    let index_val = row.get(pos).unwrap_or(&Value::Null);
-
-                    if unique {
-                        let val_str = render(index_val);
-                        if val_str != "NULL" && !seen_values.insert(val_str) {
-                            // Set state to Failed/Dropping or just error out. We'd need to drop it, but we can just error for now.
-                            let _ = self.catalog_writer.update_index_state(
-                                tbl.id,
-                                index.id,
-                                nodus_catalog::IndexState::Dropping,
-                            );
-                            anyhow::bail!(
-                                "Unique constraint violation during index backfill for value: {:?}",
-                                index_val
-                            );
-                        }
-                    }
-
-                    self.write_index_entry(&ctx.session_id, index.id, index_val, &pk_str)?;
-                }
+            if let Some(filter) = &predicate
+                && self.eval_filter(ctx, &row, &names, &tbl.columns, Some(filter)) != Some(true)
+            {
+                continue;
+            }
+            let Some(key) = crate::constraints::key_tuple(&row, positions) else {
+                continue;
+            };
+            let rendered: Vec<String> = key
+                .iter()
+                .map(|v| render(&crate::value::key_form(v)))
+                .collect();
+            if !seen.insert(rendered.join("\u{1}")) {
+                let columns: Vec<&str> = positions
+                    .iter()
+                    .map(|&p| tbl.columns[p].name.as_str())
+                    .collect();
+                let values: Vec<String> = key.iter().map(render).collect();
+                return Err(
+                    DbError::new(format!("could not create unique index \"{name}\""))
+                        .detail(format!(
+                            "Key ({})=({}) is duplicated.",
+                            columns.join(", "),
+                            values.join(", ")
+                        ))
+                        .schema(self.schema_name_of(tbl))
+                        .table(&tbl.name)
+                        .constraint(name)
+                        .into(),
+                );
             }
         }
+        Ok(())
+    }
 
+    /// Adds `index` to `tbl`'s descriptor and writes its entries for the
+    /// rows `tbl` has, under their stored keys.
+    pub(crate) fn install_index(
+        &self,
+        ctx: &ExecutionContext,
+        tbl: &nodus_catalog::TableDescriptor,
+        index: nodus_catalog::IndexDescriptor,
+    ) -> Result<()> {
+        let leading = Self::index_leading_position(tbl, &index);
+        self.catalog_writer.update_table_descriptor(
+            nodus_catalog::TableDescriptorChange::AddIndex {
+                table_id: tbl.id,
+                index: index.clone(),
+            },
+        )?;
+        let prefix = format!("{}:", tbl.id);
+        for (key, row) in self.scan_rows_keyed(tbl.id, &ctx.session_id)? {
+            let pk = key.strip_prefix(&prefix).unwrap_or(&key);
+            if let Some(pos) = leading {
+                let value = row.get(pos).unwrap_or(&Value::Null);
+                self.write_index_entry(&ctx.session_id, index.id, value, pk)?;
+            }
+        }
         self.catalog_writer.update_index_state(
             tbl.id,
             index.id,
             nodus_catalog::IndexState::Ready,
         )?;
-        Ok(QueryOutput::tag("CREATE INDEX"))
+        Ok(())
+    }
+
+    /// Whether a relation (table, view, sequence, or index) is named `name`.
+    pub(crate) fn relation_name_taken(&self, name: &str) -> Result<bool> {
+        Ok(self
+            .catalog_reader
+            .list_all_tables("default")?
+            .iter()
+            .any(|t| t.name == name || t.indexes.iter().any(|i| i.name == name)))
+    }
+
+    /// `base`, or with the first number after it that makes it no
+    /// relation's name, as PostgreSQL names an index.
+    pub(crate) fn unused_relation_name(&self, base: &str) -> Result<String> {
+        let mut name = base.to_string();
+        let mut n = 0;
+        while self.relation_name_taken(&name)? {
+            n += 1;
+            name = format!("{base}{n}");
+        }
+        Ok(name)
     }
 
     pub(crate) fn exec_drop_index(
@@ -1069,6 +1197,11 @@ fn name_check_constraints(
             other => other,
         })
         .collect()
+}
+
+/// A relation name without its schema.
+fn table_name_of(name: &str) -> &str {
+    name.rsplit('.').next().unwrap_or(name).trim_matches('"')
 }
 
 /// A query that yields its result's columns and types but no rows, when it

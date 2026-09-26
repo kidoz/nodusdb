@@ -39,6 +39,7 @@ fn test_offset_distinct_returning() {
         &ctx,
         LogicalPlan::CreateTable {
             unique_constraints: vec![],
+            key_names: vec![],
             if_not_exists: false,
             constraints: vec![],
             name: "t".into(),

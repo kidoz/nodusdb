@@ -402,14 +402,12 @@ impl MemExecutor {
         positions
     }
 
-    /// A table with no indexes at all (no PRIMARY KEY, UNIQUE, or secondary
-    /// index) has no natural row identity, so each row gets a synthetic rowid
-    /// key — letting it hold exact-duplicate rows (PostgreSQL heap semantics).
-    /// Tables with any index keep content-derived keys, and the index-scan
-    /// overlay-merge path (which re-derives keys from content) is only reachable
-    /// when an index exists, so it never sees a synthetic-rowid table.
+    /// A table without a PRIMARY KEY has no natural row identity, so each row
+    /// gets a synthetic rowid key — letting it hold exact-duplicate rows
+    /// (PostgreSQL heap semantics) whatever other indexes it has. Everything
+    /// that finds a row again goes by its stored key.
     pub(crate) fn uses_synthetic_rowid(tbl: &nodus_catalog::TableDescriptor) -> bool {
-        tbl.indexes.is_empty()
+        Self::pk_positions_declared(tbl).is_empty()
     }
 
     /// Renders a row's primary-key string from the given column positions. A
@@ -582,7 +580,7 @@ impl MemExecutor {
                 }
             }
 
-            self.check_unique_constraints(&ctx.session_id, &tbl, &row, None)?;
+            self.check_unique_constraints(ctx, &tbl, &row, None)?;
             self.check_table_constraints(ctx, &tbl, &row, None, &col_names)?;
 
             // Key: declared PRIMARY KEY / full-row content, or a synthetic rowid
@@ -604,11 +602,9 @@ impl MemExecutor {
 
             // Maintain secondary indexes.
             for idx in &tbl.indexes {
-                for kcol in &idx.key_columns {
-                    if let Some(pos) = tbl.columns.iter().position(|c| c.id == kcol.column_id) {
-                        let index_val = row.get(pos).unwrap_or(&Value::Null);
-                        self.write_index_entry(&ctx.session_id, idx.id, index_val, &pk)?;
-                    }
+                if let Some(pos) = Self::index_leading_position(&tbl, idx) {
+                    let index_val = row.get(pos).unwrap_or(&Value::Null);
+                    self.write_index_entry(&ctx.session_id, idx.id, index_val, &pk)?;
                 }
             }
 
@@ -963,6 +959,7 @@ impl MemExecutor {
         let key_prefix = format!("{}:", tbl.id);
         let pk_str = key.strip_prefix(&key_prefix).unwrap_or(key).to_string();
         self.delete_row(&ctx.session_id, key.to_string())?;
+        // Every key column's entry: older binaries kept one for each.
         for idx in &tbl.indexes {
             for kcol in &idx.key_columns {
                 if let Some(pos) = tbl.columns.iter().position(|c| c.id == kcol.column_id) {
@@ -1099,7 +1096,7 @@ impl MemExecutor {
         };
         // Skip only the row being replaced: a new key that lands on another
         // existing row is a violation, not an overwrite.
-        self.check_unique_constraints(&ctx.session_id, tbl, row, Some(&old_pk))?;
+        self.check_unique_constraints(ctx, tbl, row, Some(&old_pk))?;
         let col_names: Vec<String> = tbl.columns.iter().map(|c| c.name.clone()).collect();
         self.check_table_constraints(ctx, tbl, row, Some(old_row), &col_names)?;
 
@@ -1113,18 +1110,27 @@ impl MemExecutor {
             self.delete_row(&ctx.session_id, old_key.to_string())?;
         }
         for idx in &tbl.indexes {
-            for kcol in &idx.key_columns {
-                if let Some(pos) = tbl.columns.iter().position(|c| c.id == kcol.column_id) {
-                    let old_val = old_row.get(pos).unwrap_or(&Value::Null);
-                    let new_val = row.get(pos).unwrap_or(&Value::Null);
-                    if old_val != new_val || old_pk != pk {
-                        self.delete_index_entry(&ctx.session_id, idx.id, old_val, &old_pk)?;
-                        self.write_index_entry(&ctx.session_id, idx.id, new_val, &pk)?;
-                    }
+            if let Some(pos) = Self::index_leading_position(tbl, idx) {
+                let old_val = old_row.get(pos).unwrap_or(&Value::Null);
+                let new_val = row.get(pos).unwrap_or(&Value::Null);
+                if old_val != new_val || old_pk != pk {
+                    self.delete_index_entry(&ctx.session_id, idx.id, old_val, &old_pk)?;
+                    self.write_index_entry(&ctx.session_id, idx.id, new_val, &pk)?;
                 }
             }
         }
         Ok(new_key)
+    }
+
+    /// The position in `tbl` of index `idx`'s leading column, the one its
+    /// entries are kept for: the entries of a column after it could share
+    /// a key with the leading column's, and changing one would lose both.
+    pub(crate) fn index_leading_position(
+        tbl: &nodus_catalog::TableDescriptor,
+        idx: &nodus_catalog::IndexDescriptor,
+    ) -> Option<usize> {
+        let leading = idx.key_columns.first()?;
+        tbl.columns.iter().position(|c| c.id == leading.column_id)
     }
 
     /// Finds the existing row an `ON CONFLICT` insert collides with: one equal

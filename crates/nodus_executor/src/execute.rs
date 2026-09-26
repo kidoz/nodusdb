@@ -40,13 +40,14 @@ impl MemExecutor {
                 constraints,
                 if_not_exists,
                 unique_constraints,
+                key_names,
             } => self.exec_create_table(
                 ctx,
                 name,
                 columns,
                 constraints,
                 if_not_exists,
-                unique_constraints,
+                (unique_constraints, key_names),
                 None,
             ),
             LogicalPlan::CreateView {
@@ -240,7 +241,15 @@ impl MemExecutor {
                 columns,
                 unique,
                 if_not_exists,
-            } => self.exec_create_index(ctx, name, table_name, columns, unique, if_not_exists),
+                predicate,
+            } => self.exec_create_index(
+                ctx,
+                name,
+                table_name,
+                columns,
+                (unique, predicate),
+                if_not_exists,
+            ),
             LogicalPlan::DropIndex { name, if_exists } => {
                 self.exec_drop_index(ctx, name, if_exists)
             }

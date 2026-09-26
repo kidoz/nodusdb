@@ -835,6 +835,10 @@ pub enum LogicalPlan {
         /// columns; each becomes one unique index over the whole column tuple.
         #[serde(default)]
         unique_constraints: Vec<Vec<String>>,
+        /// The names given to the primary key and unique constraints, by
+        /// their columns; the others get PostgreSQL's names.
+        #[serde(default)]
+        key_names: Vec<(Vec<String>, String)>,
     },
     DropTable {
         name: String,
@@ -859,11 +863,16 @@ pub enum LogicalPlan {
         operation: AlterTableOp,
     },
     CreateIndex {
+        /// Empty for an unnamed index, which gets PostgreSQL's name for it.
         name: String,
         table_name: String,
         columns: Vec<String>,
         unique: bool,
         if_not_exists: bool,
+        /// A partial index's `WHERE` condition. Defaulted so older plans
+        /// decode.
+        #[serde(default)]
+        predicate: Option<String>,
     },
     DropIndex {
         name: String,

@@ -41,6 +41,7 @@ fn test_ddl_and_subqueries() {
         &ctx,
         LogicalPlan::CreateTable {
             unique_constraints: vec![],
+            key_names: vec![],
             if_not_exists: false,
             constraints: vec![],
             name: "employees".into(),
@@ -130,6 +131,7 @@ fn test_ddl_and_subqueries() {
             columns: vec!["dept_id".into()],
             unique: false,
             if_not_exists: false,
+            predicate: None,
         },
     )
     .unwrap();
@@ -156,6 +158,7 @@ fn test_ddl_and_subqueries() {
         &ctx,
         LogicalPlan::CreateTable {
             unique_constraints: vec![],
+            key_names: vec![],
             if_not_exists: false,
             constraints: vec![],
             name: "departments".into(),
@@ -264,6 +267,7 @@ fn test_unique_constraints() {
         &ctx,
         LogicalPlan::CreateTable {
             unique_constraints: vec![],
+            key_names: vec![],
             if_not_exists: false,
             constraints: vec![],
             name: "users".into(),
@@ -412,6 +416,7 @@ fn test_secondary_indexing() {
         &ctx,
         LogicalPlan::CreateTable {
             unique_constraints: vec![],
+            key_names: vec![],
             if_not_exists: false,
             constraints: vec![],
             name: "products".into(),
@@ -468,6 +473,7 @@ fn test_secondary_indexing() {
             columns: vec!["category".into()],
             unique: false,
             if_not_exists: false,
+            predicate: None,
         },
     )
     .unwrap();
@@ -684,6 +690,7 @@ fn test_index_value_containing_separator_does_not_overmatch() {
         &ctx,
         LogicalPlan::CreateTable {
             unique_constraints: vec![],
+            key_names: vec![],
             if_not_exists: false,
             constraints: vec![],
             name: "labels".into(),
@@ -736,6 +743,7 @@ fn test_index_value_containing_separator_does_not_overmatch() {
             columns: vec!["tag".into()],
             unique: false,
             if_not_exists: false,
+            predicate: None,
         },
     )
     .unwrap();
@@ -803,6 +811,7 @@ fn test_alter_table_migrations() {
         &ctx,
         LogicalPlan::CreateTable {
             unique_constraints: vec![],
+            key_names: vec![],
             if_not_exists: false,
             constraints: vec![],
             name: "users".into(),
