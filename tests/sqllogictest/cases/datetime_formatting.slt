@@ -95,6 +95,28 @@ SELECT to_number('1,234.56', '9,999.99'), to_number('-42', 'S99'), to_number('$1
 statement error
 SELECT to_number('1.2e3', '9.9EEEE');
 
+# Date/time input forms.
+query TTTT
+SELECT '2024-01-01T10:00:00Z'::timestamptz, '2024-01-01 10:00:00.123456789'::timestamp, '24:00:00'::time, '23:59:60'::time;
+----
+2024-01-01 10:00:00+00	2024-01-01 10:00:00.123457	24:00:00	24:00:00
+
+query TTTTTT
+SELECT 'Jan 5 2024'::date, '5 January 2024'::date, 'January 5, 2024'::date, '2024/01/05'::date, '01/05/2024'::date, '20240105'::date;
+----
+2024-01-05	2024-01-05	2024-01-05	2024-01-05	2024-01-05	2024-01-05
+
+query TTTT
+SELECT 'today'::date = current_date, 'epoch'::timestamp, 'allballs'::time, 'yesterday'::date + 1 = current_date;
+----
+t	1970-01-01 00:00:00	00:00:00	t
+
+statement error
+SELECT '2024-02-30'::date;
+
+statement error
+SELECT '2024-01-01 25:00'::timestamp;
+
 query TTTTTTTT
 SELECT 'infinity'::float8, '-infinity'::float8, 1e20::float8, 1e-7::float8, 1e15::float8, 1e14::float8, 1e6::real, 1234567::real;
 ----

@@ -44,5 +44,10 @@ SELECT pg_typeof(timestamp '2024-01-01' AT TIME ZONE 'UTC'), pg_typeof(timestamp
 ----
 timestamp with time zone	timestamp without time zone
 
+query TT
+SELECT '2024-01-01 10:00 America/New_York'::timestamptz, '2024-07-01 10:00 Europe/Paris'::timestamptz;
+----
+2024-01-01 15:00:00+00	2024-07-01 08:00:00+00
+
 statement error
 SELECT timestamptz '2024-01-01 00:00+00' AT TIME ZONE 'Mars/Olympus';

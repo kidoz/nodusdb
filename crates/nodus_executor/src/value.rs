@@ -674,7 +674,7 @@ impl ParsedTemporal {
 
 /// Parses ISO date/timestamp text: `YYYY-MM-DD`, optionally followed (after a
 /// space or `T`) by `HH:MM[:SS[.fraction]]` and a zone (`Z`, `UTC`, `+HH`,
-/// `+HH:MM`, `-HHMM`).
+/// `+HH:MM`, `-HHMM`, a zone name).
 pub(crate) fn parse_temporal(text: &str) -> Option<ParsedTemporal> {
     let text = text.trim();
     let (date_text, rest) = match text.find([' ', 'T']) {
@@ -682,6 +682,12 @@ pub(crate) fn parse_temporal(text: &str) -> Option<ParsedTemporal> {
         None => (text, ""),
     };
     let date = chrono::NaiveDate::parse_from_str(date_text, "%Y-%m-%d").ok()?;
+    with_time_of_day(date, rest)
+}
+
+/// `date` with the time of day and zone in `rest`, either of which may be
+/// absent; `24:00:00` is the next day's midnight.
+fn with_time_of_day(date: chrono::NaiveDate, rest: &str) -> Option<ParsedTemporal> {
     if rest.is_empty() {
         return Some(ParsedTemporal {
             date,
@@ -692,8 +698,26 @@ pub(crate) fn parse_temporal(text: &str) -> Option<ParsedTemporal> {
     let zone_at = rest
         .find(|c: char| c == '+' || c == '-' || c == ' ' || c.is_ascii_alphabetic())
         .unwrap_or(rest.len());
-    let time = parse_time_of_day(&rest[..zone_at])?;
-    let offset = parse_utc_offset(rest[zone_at..].trim())?;
+    let mut micros = parse_time_of_day(&rest[..zone_at])?;
+    let mut date = date;
+    if micros >= crate::datetime::MICROS_PER_DAY {
+        date = date.succ_opt()?;
+        micros -= crate::datetime::MICROS_PER_DAY;
+    }
+    let time = chrono::NaiveTime::from_num_seconds_from_midnight_opt(
+        (micros / 1_000_000) as u32,
+        (micros % 1_000_000 * 1_000) as u32,
+    )?;
+    let zone = rest[zone_at..].trim();
+    let offset = match parse_utc_offset(zone) {
+        Some(offset) => offset,
+        // A zone name's offset is the one in effect at that local time.
+        None => Some(
+            crate::timezone::Zone::resolve(zone)
+                .ok()?
+                .offset_at_local(date.and_time(time)),
+        ),
+    };
     Some(ParsedTemporal {
         date,
         time: Some(time),
@@ -701,12 +725,100 @@ pub(crate) fn parse_temporal(text: &str) -> Option<ParsedTemporal> {
     })
 }
 
-/// `HH:MM[:SS[.fraction]]`.
-fn parse_time_of_day(text: &str) -> Option<chrono::NaiveTime> {
+/// Date input in the other forms PostgreSQL reads: a month name
+/// (`Jan 5 2024`, `5 January 2024`, `January 5, 2024`), slashes
+/// (`2024/01/05`, or `01/05/2024` as month/day/year), or run-together digits
+/// (`20240105`); a time of day and zone may follow.
+fn parse_loose_temporal(text: &str) -> Option<ParsedTemporal> {
+    let words: Vec<&str> = text
+        .split(|c: char| c.is_whitespace() || c == ',')
+        .filter(|w| !w.is_empty())
+        .collect();
+    let is_time = |w: &str| w.contains(':');
+    let date_words = words.iter().take_while(|w| !is_time(w)).count();
+    let rest = words[date_words..].join(" ");
+    let number = |w: &str| {
+        w.bytes()
+            .all(|b| b.is_ascii_digit())
+            .then(|| w.parse::<i64>().ok())
+            .flatten()
+    };
+    let month = |w: &str| {
+        let lower = w.to_ascii_lowercase();
+        (lower.len() >= 3)
+            .then(|| {
+                crate::datetime_format::MONTHS
+                    .iter()
+                    .position(|m| m.to_ascii_lowercase().starts_with(&lower))
+            })
+            .flatten()
+            .map(|i| i as i64 + 1)
+    };
+    let (year, month, day) = match &words[..date_words] {
+        [one] if one.contains('/') || one.contains('-') => {
+            let parts: Vec<&str> = one.split(['/', '-']).collect();
+            let [a, b, c] = parts[..] else { return None };
+            match (number(a), month(b).or_else(|| number(b)), number(c)) {
+                (Some(y), Some(m), Some(d)) if a.len() >= 3 => (y, m, d),
+                (Some(m), Some(d), Some(y)) if !b.chars().any(|ch| ch.is_ascii_alphabetic()) => {
+                    (y, m, d)
+                }
+                (Some(d), Some(m), Some(y)) => (y, m, d),
+                _ => return None,
+            }
+        }
+        [one] if one.len() == 8 => {
+            let digits = number(one)?;
+            (digits / 10_000, digits / 100 % 100, digits % 100)
+        }
+        // A month name and two numbers: the first is the year when it is
+        // written with three or more digits, else the day.
+        [a, b, c] => {
+            let words = [*a, *b, *c];
+            let m = words.iter().position(|w| month(w).is_some())?;
+            let others: Vec<&str> = (0..3).filter(|i| *i != m).map(|i| words[i]).collect();
+            let (first, second) = (number(others[0])?, number(others[1])?);
+            if others[0].len() >= 3 {
+                (first, month(words[m])?, second)
+            } else {
+                (second, month(words[m])?, first)
+            }
+        }
+        _ => return None,
+    };
+    let date =
+        chrono::NaiveDate::from_ymd_opt(i32::try_from(year).ok()?, month as u32, day as u32)?;
+    with_time_of_day(date, &rest)
+}
+
+/// `HH:MM[:SS[.fraction]]` as microseconds since midnight, the fraction
+/// rounded to microseconds; `24:00:00` is allowed, and a leap second
+/// (`:60`) is the next minute.
+fn parse_time_of_day(text: &str) -> Option<i64> {
     let text = text.trim();
-    chrono::NaiveTime::parse_from_str(text, "%H:%M:%S%.f")
-        .or_else(|_| chrono::NaiveTime::parse_from_str(text, "%H:%M"))
-        .ok()
+    let mut parts = text.split(':');
+    let field = |p: Option<&str>| {
+        p.filter(|p| !p.is_empty() && p.len() <= 2 && p.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|p| p.parse::<i64>().ok())
+    };
+    let hours = field(parts.next())?;
+    let minutes = field(parts.next())?;
+    let seconds = match parts.next() {
+        None => 0.0,
+        Some(s) => {
+            let (whole, fraction) = s.split_once('.').unwrap_or((s, ""));
+            if !fraction.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            let whole = field(Some(whole))? as f64;
+            whole + format!("0.{fraction}0").parse::<f64>().ok()?
+        }
+    };
+    if parts.next().is_some() || hours > 24 || minutes > 59 || seconds >= 61.0 {
+        return None;
+    }
+    let micros = (hours * 3_600 + minutes * 60) * 1_000_000 + (seconds * 1e6).round() as i64;
+    (micros <= crate::datetime::MICROS_PER_DAY).then_some(micros)
 }
 
 /// A zone suffix as seconds east of UTC: `None` when absent, and a parse
@@ -753,13 +865,37 @@ pub(crate) fn normalize_temporal(text: &str, ty: Temporal) -> Option<String> {
         return normalize_temporal("1970-01-01 00:00:00+00", ty);
     }
     if ty == Temporal::Time {
-        let time =
-            parse_time_of_day(trimmed).or_else(|| parse_temporal(trimmed).and_then(|t| t.time))?;
-        return Some(
-            format_timestamp(chrono::NaiveDate::default().and_time(time), false)[11..].to_string(),
-        );
+        if lower == "allballs" {
+            return Some("00:00:00".to_string());
+        }
+        let micros = parse_time_of_day(trimmed).or_else(|| {
+            parse_temporal(trimmed)
+                .and_then(|t| t.time)
+                .map(|time| crate::datetime::time_micros_of(time))
+        })?;
+        return Some(crate::datetime::format_time(micros));
     }
-    let parsed = parse_temporal(trimmed)?;
+    // Words for moments relative to now.
+    let now = || {
+        let micros = crate::session_env::with(|e| e.map(|e| e.transaction_micros))
+            .unwrap_or_else(crate::session_env::wall_micros);
+        chrono::DateTime::from_timestamp_micros(micros).map(|dt| dt.naive_utc())
+    };
+    let relative = match lower.as_str() {
+        "now" => now(),
+        "today" => now().and_then(|n| n.date().and_hms_opt(0, 0, 0)),
+        "tomorrow" => now().and_then(|n| n.date().succ_opt()?.and_hms_opt(0, 0, 0)),
+        "yesterday" => now().and_then(|n| n.date().pred_opt()?.and_hms_opt(0, 0, 0)),
+        _ => None,
+    };
+    let parsed = match relative {
+        Some(ts) => ParsedTemporal {
+            date: ts.date(),
+            time: Some(ts.time()),
+            offset: Some(0),
+        },
+        None => parse_temporal(trimmed).or_else(|| parse_loose_temporal(trimmed))?,
+    };
     Some(match ty {
         Temporal::Date => parsed.date.format("%Y-%m-%d").to_string(),
         // A timestamp without time zone ignores any zone in its input.
@@ -903,6 +1039,39 @@ mod tests {
         assert_eq!(float4_text(1e6), "1e+06");
         assert_eq!(float4_text(1234567.0), "1.234567e+06");
         assert_eq!(float4_text(100000.0), "100000");
+    }
+
+    #[test]
+    fn date_input_takes_postgresql_forms() {
+        let date = |s: &str| normalize_temporal(s, Temporal::Date);
+        for text in [
+            "Jan 5 2024",
+            "5 January 2024",
+            "January 5, 2024",
+            "2024/01/05",
+            "01/05/2024",
+            "20240105",
+        ] {
+            assert_eq!(date(text).as_deref(), Some("2024-01-05"), "{text}");
+        }
+        assert_eq!(
+            normalize_temporal("2024-01-01 10:00:00.1234567", Temporal::Timestamp).as_deref(),
+            Some("2024-01-01 10:00:00.123457")
+        );
+        assert_eq!(
+            normalize_temporal("2024-01-01 24:00:00", Temporal::Timestamp).as_deref(),
+            Some("2024-01-02 00:00:00")
+        );
+        assert_eq!(
+            normalize_temporal("23:59:60", Temporal::Time).as_deref(),
+            Some("24:00:00")
+        );
+        assert_eq!(
+            normalize_temporal("allballs", Temporal::Time).as_deref(),
+            Some("00:00:00")
+        );
+        assert!(normalize_temporal("25:00", Temporal::Time).is_none());
+        assert!(date("2024-02-30").is_none());
     }
 
     #[test]
