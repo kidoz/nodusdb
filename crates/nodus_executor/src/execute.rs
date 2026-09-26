@@ -73,6 +73,7 @@ impl MemExecutor {
                 columns,
                 values_list,
                 returning,
+                returning_exprs,
                 on_conflict,
                 default_cells,
                 source,
@@ -102,7 +103,7 @@ impl MemExecutor {
                     table_name,
                     columns,
                     values_list,
-                    returning,
+                    crate::dml::Returning::new(returning, returning_exprs),
                     on_conflict,
                     default_cells,
                 )
@@ -172,6 +173,7 @@ impl MemExecutor {
                 assignments,
                 filter,
                 returning,
+                returning_exprs,
                 table_alias,
                 from,
             } => self.exec_update(
@@ -180,12 +182,13 @@ impl MemExecutor {
                 assignments,
                 from.map(|from| *from),
                 filter,
-                returning,
+                crate::dml::Returning::new(returning, returning_exprs),
             ),
             LogicalPlan::Delete {
                 table_name,
                 filter,
                 returning,
+                returning_exprs,
                 table_alias,
                 using,
             } => self.exec_delete(
@@ -193,7 +196,7 @@ impl MemExecutor {
                 (table_name, table_alias),
                 using.map(|using| *using),
                 filter,
-                returning,
+                crate::dml::Returning::new(returning, returning_exprs),
             ),
             LogicalPlan::Merge {
                 table_name,
@@ -202,13 +205,14 @@ impl MemExecutor {
                 on,
                 clauses,
                 returning,
+                returning_exprs,
             } => self.exec_merge(
                 ctx,
                 (table_name, table_alias),
                 *source,
                 on,
                 clauses,
-                returning,
+                crate::dml::Returning::new(returning, returning_exprs),
             ),
             LogicalPlan::Truncate {
                 tables,

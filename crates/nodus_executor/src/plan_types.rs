@@ -864,6 +864,11 @@ pub enum LogicalPlan {
         columns: Vec<String>,
         values_list: Vec<Vec<Value>>,
         returning: Vec<String>,
+        /// For each `returning` item that is an expression (its output name
+        /// then in `returning`), the expression; empty when every item is a
+        /// column. Defaulted so older plans decode.
+        #[serde(default)]
+        returning_exprs: Vec<Option<ReturningExpr>>,
         /// `ON CONFLICT` behaviour when a row collides with an existing key.
         /// Defaulted so plans serialized before this field decode.
         #[serde(default)]
@@ -945,6 +950,11 @@ pub enum LogicalPlan {
         assignments: Vec<(String, ScalarExpr)>,
         filter: Option<FilterExpr>,
         returning: Vec<String>,
+        /// For each `returning` item that is an expression (its output name
+        /// then in `returning`), the expression; empty when every item is a
+        /// column. Defaulted so older plans decode.
+        #[serde(default)]
+        returning_exprs: Vec<Option<ReturningExpr>>,
         /// The name the target table goes by (`UPDATE t AS x`). Defaulted so
         /// older plans decode.
         #[serde(default)]
@@ -958,6 +968,11 @@ pub enum LogicalPlan {
         table_name: String,
         filter: Option<FilterExpr>,
         returning: Vec<String>,
+        /// For each `returning` item that is an expression (its output name
+        /// then in `returning`), the expression; empty when every item is a
+        /// column. Defaulted so older plans decode.
+        #[serde(default)]
+        returning_exprs: Vec<Option<ReturningExpr>>,
         /// The name the target table goes by (`DELETE FROM t AS x`).
         #[serde(default)]
         table_alias: Option<String>,
@@ -1066,6 +1081,11 @@ pub enum LogicalPlan {
         clauses: Vec<MergeClause>,
         /// `RETURNING` columns of the inserted, updated, or deleted rows.
         returning: Vec<String>,
+        /// For each `returning` item that is an expression (its output name
+        /// then in `returning`), the expression; empty when every item is a
+        /// column. Defaulted so older plans decode.
+        #[serde(default)]
+        returning_exprs: Vec<Option<ReturningExpr>>,
     },
     /// A data-modifying statement (`body`) with a `WITH` list whose queries
     /// it can read.
@@ -1089,6 +1109,12 @@ pub enum LogicalPlan {
         plan: Box<LogicalPlan>,
         options: crate::explain::ExplainOptions,
     },
+}
+
+/// An expression in a `RETURNING` list, evaluated over each returned row.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReturningExpr {
+    pub expr: ScalarExpr,
 }
 
 /// One `WHEN` clause of a `MERGE`.

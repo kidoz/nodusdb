@@ -466,11 +466,12 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
             }
         }
         Statement::Insert(insert) => {
-            let returning = plan_returning(&insert.returning, "")?;
             let table_name = match &insert.table {
                 sqlparser::ast::TableObject::TableName(name) => name.to_string(),
                 other => anyhow::bail!("Unsupported INSERT target: {other}"),
             };
+            let (returning, returning_exprs) =
+                plan_returning(&insert.returning, ReturningOf::Insert, params)?;
             // Use the bare identifier, not `to_string()` (which re-quotes a quoted
             // ident like `"Id"`). CREATE TABLE stores unquoted names, so a quoted
             // INSERT column list — every client that quotes identifiers, e.g. EF
@@ -585,6 +586,7 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                 columns: cols,
                 values_list,
                 returning,
+                returning_exprs,
                 on_conflict,
                 default_cells,
                 source,
@@ -654,14 +656,13 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                 ) => Some(Box::new(plan_relations(from, params)?)),
                 None => None,
             };
-            let returning = plan_returning(
-                &update.returning,
-                table_alias.as_ref().unwrap_or(&table_name),
-            )?;
+            let (returning, returning_exprs) =
+                plan_returning(&update.returning, ReturningOf::Change, params)?;
             Ok(LogicalPlan::Update {
                 assignments: plan_assignments(&update.assignments, params)?,
                 filter: parse_predicates(&update.selection, params)?,
                 returning,
+                returning_exprs,
                 table_name,
                 table_alias,
                 from,
@@ -686,14 +687,13 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                 Some(using) => Some(Box::new(plan_relations(using, params)?)),
                 None => None,
             };
-            let returning = plan_returning(
-                &delete.returning,
-                table_alias.as_ref().unwrap_or(&table_name),
-            )?;
+            let (returning, returning_exprs) =
+                plan_returning(&delete.returning, ReturningOf::Change, params)?;
             Ok(LogicalPlan::Delete {
                 table_name,
                 filter: parse_predicates(&delete.selection, params)?,
                 returning,
+                returning_exprs,
                 table_alias,
                 using,
             })
@@ -1039,48 +1039,126 @@ fn filter_has_subquery(filter: &FilterExpr) -> bool {
     }
 }
 
-/// Plans a `RETURNING` list as column names, qualified as written: `*` and
-/// `x.*` expand at execution, `new.` names the written row, so it stands for
-/// `target`, the name the table goes by, and `old.` the row as it was.
-/// Expressions, and `old.` in an INSERT, are rejected rather than silently
-/// omitted.
+/// Which statement a `RETURNING` list belongs to.
+#[derive(Clone, Copy, PartialEq)]
+enum ReturningOf {
+    Insert,
+    Change,
+    Merge,
+}
+
+/// Plans a `RETURNING` list: column items as names, qualified as written
+/// (`*` and `x.*` expand at execution; `new.` names the row as written and
+/// `old.` the row as it was, each null when there is none), and any other
+/// item as an expression under its output name, which `returning` then
+/// holds. The expressions come back parallel to the names, or empty when
+/// there are none.
 fn plan_returning(
     items: &Option<Vec<sqlparser::ast::SelectItem>>,
-    target: &str,
-) -> Result<Vec<String>> {
+    of: ReturningOf,
+    params: &[Value],
+) -> Result<(Vec<String>, Vec<Option<crate::ReturningExpr>>)> {
     use sqlparser::ast::{Expr, SelectItem, SelectItemQualifiedWildcardKind};
     let Some(items) = items else {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     };
-    // `old.` reads the row as it was, which an INSERT (no `target`) lacks.
-    let is_old = |qualifier: &str| target.is_empty() && qualifier.eq_ignore_ascii_case("old");
-    let qualify = |qualifier: &str| {
-        if qualifier.eq_ignore_ascii_case("new") {
-            target.to_string()
-        } else if qualifier.eq_ignore_ascii_case("old") {
-            "old".to_string()
+    let qualify = |qualifier: &str| -> Result<String> {
+        if qualifier.eq_ignore_ascii_case("new") || qualifier.eq_ignore_ascii_case("old") {
+            Ok(qualifier.to_ascii_lowercase())
         } else {
-            qualifier.to_string()
+            Ok(qualifier.to_string())
         }
     };
-    items
-        .iter()
-        .map(|item| match item {
-            SelectItem::Wildcard(_) => Ok("*".to_string()),
-            SelectItem::QualifiedWildcard(SelectItemQualifiedWildcardKind::ObjectName(name), _)
-                if !is_old(&name.to_string()) =>
-            {
-                Ok(format!("{}.*", qualify(&name.to_string())))
+    let mut names = Vec::with_capacity(items.len());
+    let mut exprs = Vec::with_capacity(items.len());
+    for item in items {
+        let (expr, alias) = match item {
+            SelectItem::Wildcard(_) => {
+                names.push("*".to_string());
+                exprs.push(None);
+                continue;
             }
-            SelectItem::UnnamedExpr(Expr::Identifier(id)) => Ok(id.value.clone()),
-            SelectItem::UnnamedExpr(Expr::CompoundIdentifier(parts))
-                if parts.len() == 2 && !is_old(&parts[0].value) =>
-            {
-                Ok(format!("{}.{}", qualify(&parts[0].value), parts[1].value))
+            SelectItem::QualifiedWildcard(SelectItemQualifiedWildcardKind::ObjectName(name), _) => {
+                names.push(format!("{}.*", qualify(&name.to_string())?));
+                exprs.push(None);
+                continue;
             }
+            SelectItem::UnnamedExpr(expr) => (expr, None),
+            SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias.value.clone())),
             other => anyhow::bail!("Unsupported RETURNING item: {other}"),
-        })
-        .collect()
+        };
+        match (expr, &alias) {
+            (Expr::Identifier(id), None) => {
+                names.push(id.value.clone());
+                exprs.push(None);
+            }
+            (Expr::CompoundIdentifier(parts), None) if parts.len() == 2 => {
+                names.push(format!("{}.{}", qualify(&parts[0].value)?, parts[1].value));
+                exprs.push(None);
+            }
+            _ => {
+                let lowered = returning_expr(expr, of, params)?;
+                if scalar_has_aggregate(&lowered) {
+                    anyhow::bail!("aggregate functions are not allowed in RETURNING");
+                }
+                let mut failed = None;
+                let lowered = map_columns(&lowered, &mut |name| match name.split_once('.') {
+                    Some((q, column)) if !q.contains('.') => match qualify(q) {
+                        Ok(q) => format!("{q}.{column}"),
+                        Err(e) => {
+                            failed = Some(e);
+                            name.to_string()
+                        }
+                    },
+                    _ => name.to_string(),
+                });
+                if let Some(e) = failed {
+                    return Err(e);
+                }
+                names.push(alias.unwrap_or_else(|| default_output_name(expr)));
+                exprs.push(Some(crate::ReturningExpr { expr: lowered }));
+            }
+        }
+    }
+    if exprs.iter().all(Option::is_none) {
+        exprs.clear();
+    }
+    Ok((names, exprs))
+}
+
+/// The column MERGE's RETURNING list reads `merge_action()` from.
+pub(crate) const MERGE_ACTION_COLUMN: &str = "\u{0}merge_action";
+
+/// A RETURNING expression; `merge_action()` reads the action a MERGE took.
+fn returning_expr(
+    expr: &sqlparser::ast::Expr,
+    of: ReturningOf,
+    params: &[Value],
+) -> Result<ScalarExpr> {
+    if let sqlparser::ast::Expr::Function(function) = expr
+        && function
+            .name
+            .to_string()
+            .trim_start_matches("pg_catalog.")
+            .eq_ignore_ascii_case("merge_action")
+    {
+        if of != ReturningOf::Merge {
+            anyhow::bail!(
+                "MERGE_ACTION() can only be used in the RETURNING list of a MERGE command"
+            );
+        }
+        return Ok(ScalarExpr::Column(MERGE_ACTION_COLUMN.to_string()));
+    }
+    lower_scalar(expr, params)
+        .ok_or_else(|| expression_error(expr, || format!("Unsupported RETURNING item: {expr}")))
+}
+
+/// `expr` with each column name replaced by `rename`'s.
+fn map_columns(expr: &ScalarExpr, rename: &mut dyn FnMut(&str) -> String) -> ScalarExpr {
+    match expr {
+        ScalarExpr::Column(name) => ScalarExpr::Column(rename(name)),
+        _ => expr.map_children(&mut |e| map_columns(e, rename)),
+    }
 }
 
 /// Plans `MERGE INTO target USING source ON condition WHEN ...`.
@@ -1090,13 +1168,12 @@ fn plan_merge(merge: &sqlparser::ast::Merge, params: &[Value]) -> Result<Logical
         TableWithJoins,
     };
     let (table_name, table_alias) = target_table(&merge.table)?;
-    let returning = match &merge.output {
-        Some(OutputClause::Returning { select_items, .. }) => plan_returning(
-            &Some(select_items.clone()),
-            table_alias.as_ref().unwrap_or(&table_name),
-        )?,
+    let (returning, returning_exprs) = match &merge.output {
+        Some(OutputClause::Returning { select_items, .. }) => {
+            plan_returning(&Some(select_items.clone()), ReturningOf::Merge, params)?
+        }
         Some(other) => anyhow::bail!("Unsupported MERGE clause: {other}"),
-        None => Vec::new(),
+        None => (Vec::new(), Vec::new()),
     };
     let source = plan_relations(
         &[TableWithJoins {
@@ -1182,6 +1259,7 @@ fn plan_merge(merge: &sqlparser::ast::Merge, params: &[Value]) -> Result<Logical
         on: parse_predicates(&Some((*merge.on).clone()), params)?,
         clauses,
         returning,
+        returning_exprs,
     })
 }
 

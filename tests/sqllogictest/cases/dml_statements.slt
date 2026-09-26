@@ -172,10 +172,12 @@ DELETE FROM ds WHERE id = 60 RETURNING *;
 statement error
 INSERT INTO ds VALUES (62, 'r', 6) RETURNING nope;
 
-statement error
+query T
 INSERT INTO ds VALUES (63, 'r', 6) RETURNING id * 2;
+----
+126
 
 query T
 SELECT count(*) FROM ds WHERE id >= 60;
 ----
-0
+1

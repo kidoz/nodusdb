@@ -1271,18 +1271,12 @@ fn describe_probe_plan(plan: &nodus_executor::LogicalPlan) -> Option<nodus_execu
         LogicalPlan::ShowVariable { .. }
         | LogicalPlan::SelectLiteral { .. }
         | LogicalPlan::Values { .. } => Some(plan.clone()),
-        // RETURNING may name the columns of the relations the statement
-        // joins, so run the statement itself over no rows.
-        LogicalPlan::Update {
-            from: Some(_),
-            returning,
-            ..
-        }
-        | LogicalPlan::Delete {
-            using: Some(_),
-            returning,
-            ..
-        }
+        // The statement itself over no rows yields its RETURNING columns and
+        // types, whatever the list holds (joined relations' columns, `*`,
+        // expressions), without changing anything.
+        LogicalPlan::Insert { returning, .. }
+        | LogicalPlan::Update { returning, .. }
+        | LogicalPlan::Delete { returning, .. }
         | LogicalPlan::Merge { returning, .. }
             if !returning.is_empty() =>
         {
@@ -1291,6 +1285,18 @@ fn describe_probe_plan(plan: &nodus_executor::LogicalPlan) -> Option<nodus_execu
             ));
             let mut probe = plan.clone();
             match &mut probe {
+                LogicalPlan::Insert {
+                    values_list,
+                    source,
+                    default_cells,
+                    on_conflict,
+                    ..
+                } => {
+                    values_list.clear();
+                    default_cells.clear();
+                    *source = None;
+                    *on_conflict = None;
+                }
                 LogicalPlan::Update { filter, .. } | LogicalPlan::Delete { filter, .. } => {
                     *filter = never;
                 }
@@ -1302,45 +1308,6 @@ fn describe_probe_plan(plan: &nodus_executor::LogicalPlan) -> Option<nodus_execu
             }
             Some(probe)
         }
-        LogicalPlan::Insert {
-            table_name,
-            returning,
-            ..
-        }
-        | LogicalPlan::Update {
-            table_name,
-            returning,
-            ..
-        }
-        | LogicalPlan::Delete {
-            table_name,
-            returning,
-            ..
-        } if !returning.is_empty() => Some(LogicalPlan::Select {
-            ctes: vec![],
-            table_name: table_name.clone(),
-            table_alias: None,
-            joins: vec![],
-            projection: returning
-                .iter()
-                .filter(|c| !c.ends_with('*'))
-                .map(|c| {
-                    let column = c.rsplit('.').next().unwrap_or(c);
-                    nodus_executor::ProjectionItem::Column(column.to_string())
-                })
-                .collect(),
-            group_by: vec![],
-            filter: None,
-            having: None,
-            grouping_sets: None,
-            sort: vec![],
-            group_exprs: vec![],
-            distinct_on: vec![],
-            order_by: vec![],
-            limit: Some(0),
-            offset: None,
-            distinct: false,
-        }),
         LogicalPlan::SetOp { left, .. } => describe_probe_plan(left),
         LogicalPlan::With { body, .. } => describe_probe_plan(body),
         // The plan's shape without running the statement.

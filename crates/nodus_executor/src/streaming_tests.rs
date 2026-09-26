@@ -197,6 +197,7 @@ fn exec_with_rows(
                 returning: vec![],
                 on_conflict: None,
                 default_cells: vec![],
+                returning_exprs: vec![],
             },
         )
         .unwrap();

@@ -26,6 +26,39 @@ fn synthetic_rowid() -> String {
     format!("{nanos:039}-{seq:020}")
 }
 
+/// A `RETURNING` list: its items (column names, `*`, `t.*`, `old.c`, or an
+/// expression's output name) and, parallel to them, any expressions.
+#[derive(Default, Clone)]
+pub(crate) struct Returning {
+    pub(crate) items: Vec<String>,
+    pub(crate) exprs: Vec<Option<crate::ReturningExpr>>,
+}
+
+impl Returning {
+    pub(crate) fn new(items: Vec<String>, exprs: Vec<Option<crate::ReturningExpr>>) -> Self {
+        Returning { items, exprs }
+    }
+
+    /// A list of column items only.
+    pub(crate) fn columns(items: Vec<String>) -> Self {
+        Returning {
+            items,
+            exprs: Vec::new(),
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+}
+
+/// One `RETURNING` output column: a value of the returned row, or an
+/// expression over it.
+pub(crate) enum Returned {
+    Column(usize),
+    Expr { expr: ScalarExpr, name: String },
+}
+
 /// What a data-modifying statement's conditions and expressions read: a
 /// target row followed by a row of the relations the statement reads.
 pub(crate) struct TargetScope {
@@ -77,20 +110,76 @@ impl TargetScope {
             .collect()
     }
 
-    /// The positions of the `RETURNING` items in a returned row: the target
-    /// row as written, the relations' row, then the target row as it was
+    /// The names a returned row's values go by: the target row (as written,
+    /// or as it was when deleted), the relations' row, the target row as it
+    /// was (`old.`), the action a MERGE took, and the target row as written
+    /// (`new.`).
+    fn returned_names(&self) -> Vec<String> {
+        let unqualified = |name: &str| name.rsplit('.').next().unwrap_or(name).to_string();
+        let target = &self.names[..self.width];
+        self.names
+            .iter()
+            .cloned()
+            .chain(target.iter().map(|n| format!("old.{}", unqualified(n))))
+            .chain(std::iter::once(
+                crate::planner::MERGE_ACTION_COLUMN.to_string(),
+            ))
+            .chain(target.iter().map(|n| format!("new.{}", unqualified(n))))
+            .collect()
+    }
+
+    /// Where the `new.` values of a returned row start.
+    fn new_base(&self) -> usize {
+        self.names.len() + self.width + 1
+    }
+
+    /// The declared type of a value of a returned row.
+    fn returned_type(&self, name: &str) -> Option<String> {
+        let names = self.returned_names();
+        let i = crate::filter_eval::col_pos(&names, name)?;
+        if i < self.names.len() {
+            Some(self.columns[i].data_type.clone())
+        } else if i < self.names.len() + self.width {
+            Some(self.columns[i - self.names.len()].data_type.clone())
+        } else if i >= self.new_base() {
+            Some(self.columns[i - self.new_base()].data_type.clone())
+        } else {
+            Some("TEXT".to_string())
+        }
+    }
+
+    /// The `RETURNING` list resolved against a returned row: the target row
+    /// as written, the relations' row, then the target row as it was
     /// (`old.`). `*` is every column, the target's first unless
     /// `source_first` (as `MERGE` orders them), and `x.*` every column of
-    /// relation `x`.
+    /// relation `x`; an expression reads any of them.
     pub(crate) fn returning_positions(
         &self,
-        items: &[String],
+        returning: &Returning,
         source_first: bool,
-    ) -> Result<Vec<usize>> {
+    ) -> Result<Vec<Returned>> {
         let old = self.names.len();
         let mut positions = Vec::new();
-        for item in items {
-            if item == "*" {
+        for (index, item) in returning.items.iter().enumerate() {
+            if let Some(Some(returned)) = returning.exprs.get(index) {
+                let mut refs = Vec::new();
+                crate::filter_eval::scalar_column_refs(&returned.expr, &mut refs);
+                // `old.` and `new.` values and the MERGE action are named
+                // apart from the row's columns, so they make no reference
+                // ambiguous.
+                let (special, plain): (Vec<String>, Vec<String>) =
+                    refs.into_iter().partition(|r| {
+                        r.starts_with("old.")
+                            || r.starts_with("new.")
+                            || r == crate::planner::MERGE_ACTION_COLUMN
+                    });
+                crate::filter_eval::check_column_refs(special, &self.returned_names())?;
+                self.check_refs(plain, &self.names)?;
+                positions.push(Returned::Expr {
+                    expr: returned.expr.clone(),
+                    name: item.clone(),
+                });
+            } else if item == "*" {
                 // The relations' columns as `*` shows them: a USING join's
                 // merged columns (named without a qualifier) once, first.
                 let merged: Vec<usize> = (self.width..old)
@@ -106,76 +195,125 @@ impl TargetScope {
                     }))
                     .collect();
                 let target = 0..self.width;
-                if source_first {
-                    positions.extend(source.into_iter().chain(target));
+                let order: Vec<usize> = if source_first {
+                    source.into_iter().chain(target).collect()
                 } else {
-                    positions.extend(target.chain(source));
+                    target.chain(source).collect()
+                };
+                positions.extend(order.into_iter().map(Returned::Column));
+            } else if let Some((base, column)) = item
+                .strip_prefix("old.")
+                .map(|column| (old, column))
+                .or_else(|| item.strip_prefix("new.").map(|c| (self.new_base(), c)))
+            {
+                if column == "*" {
+                    positions.extend((base..base + self.width).map(Returned::Column));
+                } else {
+                    let suffix = format!(".{column}");
+                    let i = (0..self.width)
+                        .find(|&i| self.names[i].ends_with(&suffix))
+                        .ok_or_else(|| anyhow::anyhow!("column {item} does not exist"))?;
+                    positions.push(Returned::Column(base + i));
                 }
-            } else if item == "old.*" {
-                positions.extend(old..old + self.width);
-            } else if let Some(column) = item.strip_prefix("old.") {
-                let suffix = format!(".{column}");
-                let i = (0..self.width)
-                    .find(|&i| self.names[i].ends_with(&suffix))
-                    .ok_or_else(|| anyhow::anyhow!("column {item} does not exist"))?;
-                positions.push(old + i);
             } else if let Some(relation) = item.strip_suffix(".*") {
                 let inner = format!(".{relation}");
                 let before = positions.len();
-                positions.extend((0..old).filter(|&i| {
-                    self.names[i]
-                        .rsplit_once('.')
-                        .is_some_and(|(q, _)| q == relation || q.ends_with(&inner))
-                }));
+                positions.extend(
+                    (0..old)
+                        .filter(|&i| {
+                            self.names[i]
+                                .rsplit_once('.')
+                                .is_some_and(|(q, _)| q == relation || q.ends_with(&inner))
+                        })
+                        .map(Returned::Column),
+                );
                 if positions.len() == before {
                     anyhow::bail!("missing FROM-clause entry for table \"{relation}\"");
                 }
             } else {
                 self.check_refs(vec![item.clone()], &self.names)?;
-                positions.extend(crate::filter_eval::col_pos(&self.names, item));
+                positions
+                    .extend(crate::filter_eval::col_pos(&self.names, item).map(Returned::Column));
             }
         }
         Ok(positions)
     }
 
-    /// The `RETURNING` rows: each returned row's values at `positions`,
-    /// under their column names.
+    /// The `RETURNING` rows: each returned row's values, or expressions over
+    /// it, under their column names.
     pub(crate) fn returning_output(
         &self,
-        positions: &[usize],
+        executor: &MemExecutor,
+        ctx: &ExecutionContext,
+        returned: &[Returned],
         rows: Vec<Vec<Value>>,
         tag: String,
     ) -> QueryOutput {
-        if positions.is_empty() {
+        if returned.is_empty() {
             return QueryOutput::tag(&tag);
         }
-        // An `old.` position reads the target's column.
+        // An `old.` or `new.` position reads the target's column.
         let column = |i: usize| {
             if i < self.names.len() {
                 i
-            } else {
+            } else if i < self.new_base() {
                 i - self.names.len()
+            } else {
+                i - self.new_base()
             }
         };
-        let name = |i: usize| {
-            let name = &self.names[column(i)];
-            name.rsplit('.').next().unwrap_or(name).to_string()
+        let names = self.returned_names();
+        // A row that stops short leaves out what it has no values for, and
+        // its first values are the row as written.
+        let full = |mut row: Vec<Value>| {
+            if row.len() < self.new_base() + self.width {
+                let new: Vec<Value> = row.iter().take(self.width).cloned().collect();
+                row.resize(self.new_base(), Value::Null);
+                row.extend(new);
+            }
+            row
         };
+        let rows: Vec<Row> = rows
+            .into_iter()
+            .map(full)
+            .map(|row| Row {
+                values: returned
+                    .iter()
+                    .map(|item| match item {
+                        Returned::Column(i) => row.get(*i).cloned().unwrap_or(Value::Null),
+                        Returned::Expr { expr, .. } => executor.eval_expr(ctx, expr, &row, &names),
+                    })
+                    .collect(),
+            })
+            .collect();
         QueryOutput {
-            columns: positions.iter().map(|&i| name(i)).collect(),
-            types: positions
+            columns: returned
                 .iter()
-                .map(|&i| self.columns[column(i)].data_type.clone())
-                .collect(),
-            rows: rows
-                .into_iter()
-                .map(|row| Row {
-                    values: positions
-                        .iter()
-                        .map(|&i| row.get(i).cloned().unwrap_or(Value::Null))
-                        .collect(),
+                .map(|item| match item {
+                    Returned::Column(i) => {
+                        let name = &self.names[column(*i)];
+                        name.rsplit('.').next().unwrap_or(name).to_string()
+                    }
+                    Returned::Expr { name, .. } => name.clone(),
                 })
                 .collect(),
+            types: returned
+                .iter()
+                .enumerate()
+                .map(|(index, item)| match item {
+                    Returned::Column(i) => self.columns[column(*i)].data_type.clone(),
+                    Returned::Expr { expr, .. } => {
+                        crate::result_types::expr_type(expr, &|n| self.returned_type(n))
+                            .or_else(|| {
+                                rows.first()
+                                    .and_then(|r| r.values.get(index))
+                                    .map(crate::result_types::value_type)
+                            })
+                            .unwrap_or_else(|| "TEXT".to_string())
+                    }
+                })
+                .collect(),
+            rows,
             tag,
         }
     }
@@ -289,7 +427,7 @@ impl MemExecutor {
         table_name: String,
         columns: Vec<String>,
         values_list: Vec<Vec<Value>>,
-        returning: Vec<String>,
+        returning: Returning,
         on_conflict: Option<crate::plan_types::OnConflictClause>,
         default_cells: Vec<Vec<bool>>,
     ) -> Result<QueryOutput> {
@@ -299,7 +437,8 @@ impl MemExecutor {
             .catalog_reader
             .get_table(db_name, schema_name, table_only)?;
         self.authorize(ctx, Action::Insert, ResourceRef::Table(tbl.id))?;
-        let returning = Self::expand_returning(&tbl, returning)?;
+        let scope = self.target_scope(ctx, &tbl, (&table_name, None), None, false)?;
+        let returning = scope.returning_positions(&returning, false)?;
 
         // Target column positions, in the order values are supplied.
         let targets: Vec<usize> = if columns.is_empty() {
@@ -426,7 +565,7 @@ impl MemExecutor {
                         touched.insert(key);
                         inserted_count += 1;
                         if !returning.is_empty() {
-                            returning_rows.push(updated);
+                            returning_rows.push([updated, existing_row].concat());
                         }
                         continue;
                     }
@@ -468,12 +607,13 @@ impl MemExecutor {
                 returning_rows.push(row);
             }
         }
-        Self::returning_output(
-            &tbl,
+        Ok(scope.returning_output(
+            self,
+            ctx,
             &returning,
             returning_rows,
             format!("INSERT 0 {inserted_count}"),
-        )
+        ))
     }
 
     pub(crate) fn exec_update(
@@ -483,7 +623,7 @@ impl MemExecutor {
         assignments: Vec<(String, ScalarExpr)>,
         from: Option<LogicalPlan>,
         filter: Option<FilterExpr>,
-        returning: Vec<String>,
+        returning: Returning,
     ) -> Result<QueryOutput> {
         let (db_name, schema_name, table_only) = parse_object_name(&table_name)?;
         let tbl = self
@@ -536,7 +676,13 @@ impl MemExecutor {
                 returning_rows.push(returned);
             }
         }
-        Ok(scope.returning_output(&returning, returning_rows, format!("UPDATE {updated}")))
+        Ok(scope.returning_output(
+            self,
+            ctx,
+            &returning,
+            returning_rows,
+            format!("UPDATE {updated}"),
+        ))
     }
 
     pub(crate) fn exec_delete(
@@ -545,7 +691,7 @@ impl MemExecutor {
         (table_name, table_alias): (String, Option<String>),
         using: Option<LogicalPlan>,
         filter: Option<FilterExpr>,
-        returning: Vec<String>,
+        returning: Returning,
     ) -> Result<QueryOutput> {
         let (db_name, schema_name, table_only) = parse_object_name(&table_name)?;
         let tbl = self
@@ -577,10 +723,18 @@ impl MemExecutor {
             self.remove_row(ctx, &tbl, &key, &row)?;
             deleted += 1;
             if !returning.is_empty() {
-                returning_rows.push([joined, row].concat());
+                // A deleted row has no values as written.
+                let written = vec![Value::Null; row.len() + 1];
+                returning_rows.push([joined, row, written].concat());
             }
         }
-        Ok(scope.returning_output(&returning, returning_rows, format!("DELETE {deleted}")))
+        Ok(scope.returning_output(
+            self,
+            ctx,
+            &returning,
+            returning_rows,
+            format!("DELETE {deleted}"),
+        ))
     }
 
     /// `TRUNCATE`: deletes every row of each table, then restarts the
@@ -611,7 +765,7 @@ impl MemExecutor {
             );
         }
         for table_name in tables {
-            self.exec_delete(ctx, (table_name, None), None, None, Vec::new())?;
+            self.exec_delete(ctx, (table_name, None), None, None, Returning::default())?;
         }
         if restart_identity {
             for sequence in sequences {
@@ -707,6 +861,10 @@ impl MemExecutor {
         scope: &TargetScope,
         filter: Option<&FilterExpr>,
     ) -> Result<Vec<(String, Vec<Value>, Vec<Value>)>> {
+        // A condition that is plainly false (a describe probe's) reads nothing.
+        if let Some(FilterExpr::Scalar(ScalarExpr::Literal(Value::Bool(false)))) = filter {
+            return Ok(Vec::new());
+        }
         let mut matches = Vec::new();
         for (key, row) in self.scan_rows_keyed(tbl.id, &ctx.session_id)? {
             let joined = scope.source_rows.iter().find_map(|source| {
@@ -969,56 +1127,5 @@ impl MemExecutor {
             }
         }
         Ok(None)
-    }
-
-    /// Expands `*` in a RETURNING list to every column, and rejects a name
-    /// that is not a column of the table.
-    pub(crate) fn expand_returning(
-        tbl: &nodus_catalog::TableDescriptor,
-        returning: Vec<String>,
-    ) -> Result<Vec<String>> {
-        let mut out = Vec::with_capacity(returning.len());
-        for name in returning {
-            // An INSERT reads only its table, so a qualifier names it.
-            let name = name.rsplit('.').next().unwrap_or(&name).to_string();
-            if name == "*" {
-                out.extend(tbl.columns.iter().map(|c| c.name.clone()));
-            } else {
-                Self::column_position(tbl, &name)?;
-                out.push(name);
-            }
-        }
-        Ok(out)
-    }
-
-    /// The statement's result: just the command tag, or the RETURNING rows.
-    pub(crate) fn returning_output(
-        tbl: &nodus_catalog::TableDescriptor,
-        returning: &[String],
-        rows: Vec<Vec<Value>>,
-        tag: String,
-    ) -> Result<QueryOutput> {
-        if returning.is_empty() {
-            return Ok(QueryOutput::tag(&tag));
-        }
-        let positions = returning
-            .iter()
-            .map(|c| Self::column_position(tbl, c))
-            .collect::<Result<Vec<_>>>()?;
-        let rows = rows
-            .into_iter()
-            .map(|r| Row {
-                values: positions
-                    .iter()
-                    .map(|&i| r.get(i).cloned().unwrap_or(Value::Null))
-                    .collect(),
-            })
-            .collect();
-        Ok(QueryOutput {
-            tag,
-            columns: returning.to_vec(),
-            types: Self::returning_types(&tbl.columns, returning),
-            rows,
-        })
     }
 }

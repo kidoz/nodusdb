@@ -14,7 +14,7 @@ impl MemExecutor {
         source: LogicalPlan,
         on: Option<FilterExpr>,
         clauses: Vec<MergeClause>,
-        returning: Vec<String>,
+        returning: crate::dml::Returning,
     ) -> Result<QueryOutput> {
         let (db_name, schema_name, table_only) = parse_object_name(&table_name)?;
         let tbl = self
@@ -176,9 +176,9 @@ impl MemExecutor {
                     let defaults: Vec<bool> = values.iter().map(Option::is_none).collect();
                     // The inserted row in full, when RETURNING wants it.
                     let inserted = if returning.is_empty() {
-                        Vec::new()
+                        crate::dml::Returning::default()
                     } else {
-                        vec!["*".to_string()]
+                        crate::dml::Returning::columns(vec!["*".to_string()])
                     };
                     let out = self.exec_insert(
                         ctx,
@@ -189,11 +189,11 @@ impl MemExecutor {
                         None,
                         vec![defaults],
                     )?;
-                    returning_rows.extend(
-                        out.rows
-                            .into_iter()
-                            .map(|row| [row.values.as_slice(), source, &target_nulls].concat()),
-                    );
+                    // The returned row, then the action `merge_action()` reports.
+                    let action = [Value::Text("INSERT".to_string())];
+                    returning_rows.extend(out.rows.into_iter().map(|row| {
+                        [row.values.as_slice(), source, &target_nulls, &action].concat()
+                    }));
                 }
                 (MergeAction::Update(_) | MergeAction::Delete, Some(t)) => {
                     // Only one of a target row's joined rows may change it.
@@ -212,12 +212,15 @@ impl MemExecutor {
                         )?;
                         self.replace_row(ctx, &tbl, key, target, &row)?;
                         if !returning.is_empty() {
-                            returning_rows.push([row.as_slice(), source, target].concat());
+                            let action = [Value::Text("UPDATE".to_string())];
+                            returning_rows.push([row.as_slice(), source, target, &action].concat());
                         }
                     } else {
                         self.remove_row(ctx, &tbl, key, target)?;
                         if !returning.is_empty() {
-                            returning_rows.push([joined.as_slice(), target].concat());
+                            let action = [Value::Text("DELETE".to_string())];
+                            returning_rows
+                                .push([joined.as_slice(), target, &action, &target_nulls].concat());
                         }
                     }
                 }
@@ -225,7 +228,13 @@ impl MemExecutor {
             }
             changed += 1;
         }
-        Ok(scope.returning_output(&returning, returning_rows, format!("MERGE {changed}")))
+        Ok(scope.returning_output(
+            self,
+            ctx,
+            &returning,
+            returning_rows,
+            format!("MERGE {changed}"),
+        ))
     }
 
     /// The action of the first `kind` clause whose condition holds for

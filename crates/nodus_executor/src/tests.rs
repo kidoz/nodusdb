@@ -224,6 +224,7 @@ fn create_insert_select_round_trip() {
                 returning: vec![],
                 on_conflict: None,
                 default_cells: vec![],
+                returning_exprs: vec![],
             },
         )
         .unwrap();
@@ -378,6 +379,7 @@ fn rows_keyed_by_declared_pk_not_first_column() {
                 returning: vec![],
                 on_conflict: None,
                 default_cells: vec![],
+                returning_exprs: vec![],
             },
         )
         .unwrap_or_else(|e| panic!("insert id={id} must succeed: {e}"));
@@ -417,6 +419,7 @@ fn rows_keyed_by_declared_pk_not_first_column() {
             returning: vec![],
             on_conflict: None,
             default_cells: vec![],
+            returning_exprs: vec![],
         },
     );
     assert!(dup.is_err(), "duplicate primary key must be rejected");
@@ -430,6 +433,7 @@ fn rows_keyed_by_declared_pk_not_first_column() {
             returning: vec![],
             table_alias: None,
             using: None,
+            returning_exprs: vec![],
         },
     )
     .unwrap();
@@ -488,6 +492,7 @@ fn typed_values_round_trip_and_filter_by_int() {
             returning: vec![],
             on_conflict: None,
             default_cells: vec![],
+            returning_exprs: vec![],
         },
     )
     .unwrap();
@@ -565,6 +570,7 @@ fn update_and_delete_rows() {
                 returning: vec![],
                 on_conflict: None,
                 default_cells: vec![],
+                returning_exprs: vec![],
             },
         )
         .unwrap();
@@ -582,6 +588,7 @@ fn update_and_delete_rows() {
                 returning: vec![],
                 table_alias: None,
                 from: None,
+                returning_exprs: vec![],
             },
         )
         .unwrap();
@@ -625,6 +632,7 @@ fn update_and_delete_rows() {
                 returning: vec![],
                 table_alias: None,
                 using: None,
+                returning_exprs: vec![],
             },
         )
         .unwrap();
@@ -691,6 +699,7 @@ fn test_join_execution() {
                 returning: vec![],
                 on_conflict: None,
                 default_cells: vec![],
+                returning_exprs: vec![],
             },
         )
         .unwrap();
@@ -716,6 +725,7 @@ fn test_join_execution() {
                 returning: vec![],
                 on_conflict: None,
                 default_cells: vec![],
+                returning_exprs: vec![],
             },
         )
         .unwrap();
@@ -827,6 +837,7 @@ fn transactions_are_isolated_per_session() {
             returning: vec![],
             on_conflict: None,
             default_cells: vec![],
+            returning_exprs: vec![],
         },
     )
     .unwrap();
@@ -950,6 +961,7 @@ fn test_complex_filters() {
                 returning: vec![],
                 on_conflict: None,
                 default_cells: vec![],
+                returning_exprs: vec![],
             },
         )
         .unwrap();
@@ -1035,6 +1047,7 @@ fn test_left_outer_join() {
                 returning: vec![],
                 on_conflict: None,
                 default_cells: vec![],
+                returning_exprs: vec![],
             },
         )
         .unwrap();
@@ -1056,6 +1069,7 @@ fn test_left_outer_join() {
                 returning: vec![],
                 on_conflict: None,
                 default_cells: vec![],
+                returning_exprs: vec![],
             },
         )
         .unwrap();

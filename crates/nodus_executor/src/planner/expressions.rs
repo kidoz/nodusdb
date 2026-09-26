@@ -1897,6 +1897,12 @@ pub(crate) fn unknown_function_error(expr: &sqlparser::ast::Expr) -> Option<Stri
                     func.name.to_string().to_ascii_lowercase()
                 ));
             }
+            if name == "MERGE_ACTION" {
+                return Some(
+                    "MERGE_ACTION() can only be used in the RETURNING list of a MERGE command"
+                        .to_string(),
+                );
+            }
             let wrong_aggregate_arity =
                 aggregate_op(name).is_some_and(|op| op.arity() != arg_count);
             if name != "ROW"

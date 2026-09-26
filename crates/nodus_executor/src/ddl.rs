@@ -377,7 +377,7 @@ impl MemExecutor {
         let rows: Vec<Vec<Value>> = out.rows.into_iter().map(|r| r.values).collect();
         let count = rows.len();
         if count > 0 {
-            self.exec_insert(ctx, name, vec![], rows, vec![], None, vec![])?;
+            self.exec_insert(ctx, name, vec![], rows, Default::default(), None, vec![])?;
         }
         Ok(QueryOutput::tag(&format!("SELECT {count}")))
     }
@@ -412,7 +412,7 @@ impl MemExecutor {
             self.remove_row(ctx, &tbl, &key, &row)?;
         }
         if !rows.is_empty() {
-            self.exec_insert(ctx, name, vec![], rows, vec![], None, vec![])?;
+            self.exec_insert(ctx, name, vec![], rows, Default::default(), None, vec![])?;
         }
         Ok(QueryOutput::tag("REFRESH MATERIALIZED VIEW"))
     }

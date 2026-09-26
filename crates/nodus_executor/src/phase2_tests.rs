@@ -64,6 +64,7 @@ fn test_group_by_aggregates() {
                 returning: vec![],
                 on_conflict: None,
                 default_cells: vec![],
+                returning_exprs: vec![],
             },
         )
         .unwrap();
@@ -113,6 +114,7 @@ fn test_group_by_aggregates() {
             returning: vec![],
             table_alias: None,
             using: None,
+            returning_exprs: vec![],
         },
     )
     .unwrap();
@@ -280,6 +282,7 @@ fn test_set_operations() {
                 returning: vec![],
                 on_conflict: None,
                 default_cells: vec![],
+                returning_exprs: vec![],
             },
         )
         .unwrap();
@@ -371,6 +374,7 @@ fn test_cross_join() {
                 returning: vec![],
                 on_conflict: None,
                 default_cells: vec![],
+                returning_exprs: vec![],
             },
         )
         .unwrap();
@@ -434,6 +438,7 @@ fn test_having() {
                 returning: vec![],
                 on_conflict: None,
                 default_cells: vec![],
+                returning_exprs: vec![],
             },
         )
         .unwrap();
@@ -516,6 +521,7 @@ fn test_window_functions() {
                 returning: vec![],
                 on_conflict: None,
                 default_cells: vec![],
+                returning_exprs: vec![],
             },
         )
         .unwrap();

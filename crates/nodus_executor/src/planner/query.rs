@@ -1504,6 +1504,11 @@ fn plan_select_expr(
             alias: Some(name()),
         }),
         None => {
+            if let Some(message) = unknown_function_error(expr)
+                && message.starts_with("MERGE_ACTION()")
+            {
+                anyhow::bail!(message);
+            }
             // Catalog introspection calls functions NodusDB does not provide
             // over virtual tables; the executor resolves (or rejects) them.
             if let Expr::Function(func) = expr

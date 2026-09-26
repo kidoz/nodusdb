@@ -1,0 +1,81 @@
+# RETURNING lists compute expressions over the written row, and read the row
+# as it was (old.) and as written (new.); merge_action() names what MERGE did.
+statement ok
+CREATE TABLE ret8 (id INT PRIMARY KEY, n INT, tags TEXT[]);
+
+statement ok
+CREATE TABLE ret8s (id INT, w TEXT);
+
+statement ok
+INSERT INTO ret8s VALUES (1, 'x'), (5, 'y');
+
+query TTT
+INSERT INTO ret8 VALUES (1, 10, '{a}') RETURNING id * 2, n + 1 AS m, upper(tags[1]);
+----
+2	11	A
+
+query TTTTT
+INSERT INTO ret8 VALUES (2, 20, NULL) RETURNING *, n * 10 AS tenfold, new.n;
+----
+2	20	NULL	200	20
+
+query TTTTT
+INSERT INTO ret8 VALUES (3, 30, NULL) RETURNING old.*, new.id, old.n IS NULL AS fresh;
+----
+NULL	NULL	NULL	3	t
+
+query TTT
+UPDATE ret8 SET n = n + 1 WHERE id = 1 RETURNING old.n AS before, new.n AS after, n - old.n AS delta;
+----
+10	11	1
+
+query TT
+UPDATE ret8 SET n = 0 FROM ret8s WHERE ret8s.id = ret8.id RETURNING ret8.id, ret8s.w || '!' AS w2;
+----
+1	x!
+
+query TTT
+DELETE FROM ret8 WHERE id = 2 RETURNING id, 'gone' AS status, n IS NULL AS missing;
+----
+2	gone	f
+
+query TTTTTT
+DELETE FROM ret8 WHERE id = 3 RETURNING old.n, new.n, n, new.*;
+----
+30	NULL	30	NULL	NULL	NULL
+
+query TTT
+INSERT INTO ret8 VALUES (1, 5, NULL) ON CONFLICT (id) DO UPDATE SET n = excluded.n RETURNING old.n, new.n, n;
+----
+0	5	5
+
+query TTTTT
+MERGE INTO ret8 USING ret8s ON ret8.id = ret8s.id WHEN MATCHED THEN UPDATE SET n = 7 WHEN NOT MATCHED THEN INSERT VALUES (ret8s.id, 1, NULL) RETURNING merge_action(), ret8.id, ret8s.w, old.n, new.n;
+----
+UPDATE	1	x	5	7
+INSERT	5	y	NULL	1
+
+query TTTT
+MERGE INTO ret8 t USING (VALUES (5)) s(id) ON t.id = s.id WHEN MATCHED THEN DELETE RETURNING merge_action() AS a, old.id, new.id, coalesce(new.n, old.n) AS n;
+----
+DELETE	5	NULL	1
+
+statement error
+SELECT merge_action();
+
+statement error
+SELECT merge_action() FROM ret8 WHERE false;
+
+statement error
+INSERT INTO ret8 VALUES (9, 9, NULL) RETURNING merge_action();
+
+statement error
+INSERT INTO ret8 VALUES (10, 1, NULL) RETURNING nosuch + 1;
+
+statement error
+INSERT INTO ret8 VALUES (11, 1, NULL) RETURNING count(*);
+
+query TTT
+SELECT * FROM ret8 ORDER BY id;
+----
+1	7	{a}

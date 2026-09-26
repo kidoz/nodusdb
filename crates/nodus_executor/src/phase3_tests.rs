@@ -98,6 +98,7 @@ fn test_ddl_and_subqueries() {
             returning: vec![],
             on_conflict: None,
             default_cells: vec![],
+            returning_exprs: vec![],
         },
     )
     .unwrap();
@@ -176,6 +177,7 @@ fn test_ddl_and_subqueries() {
             returning: vec![],
             on_conflict: None,
             default_cells: vec![],
+            returning_exprs: vec![],
         },
     )
     .unwrap();
@@ -302,6 +304,7 @@ fn test_unique_constraints() {
             returning: vec![],
             on_conflict: None,
             default_cells: vec![],
+            returning_exprs: vec![],
         },
     )
     .unwrap();
@@ -316,6 +319,7 @@ fn test_unique_constraints() {
             returning: vec![],
             on_conflict: None,
             default_cells: vec![],
+            returning_exprs: vec![],
         },
     );
     assert!(res.is_err());
@@ -335,6 +339,7 @@ fn test_unique_constraints() {
             returning: vec![],
             on_conflict: None,
             default_cells: vec![],
+            returning_exprs: vec![],
         },
     );
     assert!(res2.is_err());
@@ -355,6 +360,7 @@ fn test_unique_constraints() {
             returning: vec![],
             table_alias: None,
             from: None,
+            returning_exprs: vec![],
         },
     );
     assert!(res3.is_err());
@@ -375,6 +381,7 @@ fn test_unique_constraints() {
             returning: vec![],
             table_alias: None,
             from: None,
+            returning_exprs: vec![],
         },
     );
     assert!(res4.is_ok());
@@ -447,6 +454,7 @@ fn test_secondary_indexing() {
             returning: vec![],
             on_conflict: None,
             default_cells: vec![],
+            returning_exprs: vec![],
         },
     )
     .unwrap();
@@ -478,6 +486,7 @@ fn test_secondary_indexing() {
             returning: vec![],
             on_conflict: None,
             default_cells: vec![],
+            returning_exprs: vec![],
         },
     )
     .unwrap();
@@ -533,6 +542,7 @@ fn test_secondary_indexing() {
             returning: vec![],
             table_alias: None,
             from: None,
+            returning_exprs: vec![],
         },
     )
     .unwrap();
@@ -610,6 +620,7 @@ fn test_secondary_indexing() {
             returning: vec![],
             table_alias: None,
             using: None,
+            returning_exprs: vec![],
         },
     )
     .unwrap();
@@ -713,6 +724,7 @@ fn test_index_value_containing_separator_does_not_overmatch() {
             returning: vec![],
             on_conflict: None,
             default_cells: vec![],
+            returning_exprs: vec![],
         },
     )
     .unwrap();
@@ -828,6 +840,7 @@ fn test_alter_table_migrations() {
             returning: vec![],
             on_conflict: None,
             default_cells: vec![],
+            returning_exprs: vec![],
         },
     )
     .unwrap();
@@ -884,6 +897,7 @@ fn test_alter_table_migrations() {
             returning: vec![],
             table_alias: None,
             from: None,
+            returning_exprs: vec![],
         },
     )
     .unwrap();

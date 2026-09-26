@@ -64,6 +64,7 @@ fn test_offset_distinct_returning() {
                 returning: vec!["id".into(), "val".into()],
                 on_conflict: None,
                 default_cells: vec![],
+                returning_exprs: vec![],
             },
         )
         .unwrap();
@@ -139,6 +140,7 @@ fn test_offset_distinct_returning() {
                 returning: vec!["id".into(), "val".into()],
                 table_alias: None,
                 from: None,
+                returning_exprs: vec![],
             },
         )
         .unwrap();

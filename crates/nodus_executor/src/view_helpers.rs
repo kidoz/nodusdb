@@ -308,20 +308,4 @@ impl MemExecutor {
                 "public".to_string()
             })
     }
-
-    pub(crate) fn returning_types(
-        columns: &[ColumnDescriptor],
-        returning: &[String],
-    ) -> Vec<String> {
-        returning
-            .iter()
-            .map(|name| {
-                columns
-                    .iter()
-                    .find(|column| column.name.eq_ignore_ascii_case(name))
-                    .map(|column| column.data_type.clone())
-                    .unwrap_or_else(|| "VARCHAR".to_string())
-            })
-            .collect()
-    }
 }

@@ -280,6 +280,19 @@ pub(crate) fn check_filter_integer_ranges(
     }
 }
 
+/// The type of a scalar expression, given its columns' declared types.
+pub(crate) fn expr_type(
+    expr: &ScalarExpr,
+    column: &impl Fn(&str) -> Option<String>,
+) -> Option<String> {
+    scalar_type(expr, column)
+}
+
+/// The type a value has, as a literal of it would.
+pub(crate) fn value_type(value: &Value) -> String {
+    literal_type(value).unwrap_or_else(|| "TEXT".to_string())
+}
+
 /// The type of a scalar expression that references no columns.
 pub(crate) fn constant_expr_type(expr: &ScalarExpr) -> Option<String> {
     scalar_type(expr, &|_: &str| None)
