@@ -29,7 +29,12 @@ impl MemExecutor {
                     let expr = crate::result_types::check_integer_ranges(&expr, &|_: &str| None);
                     type_hint =
                         type_hint.or_else(|| crate::result_types::constant_expr_type(&expr));
-                    let value = self.eval_expr(ctx, &expr, &[], &[]);
+                    // An aggregate aggregates the one row there is.
+                    let value = if crate::scalar_has_aggregate(&expr) {
+                        crate::aggregates::eval_scalar_expr_grouped(&expr, &[Vec::new()], &[])
+                    } else {
+                        self.eval_expr(ctx, &expr, &[], &[])
+                    };
                     crate::eval_error::check()?;
                     value
                 }
