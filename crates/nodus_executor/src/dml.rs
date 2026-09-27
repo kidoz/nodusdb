@@ -434,7 +434,7 @@ impl MemExecutor {
         values_list: Vec<Vec<Value>>,
         returning: Returning,
         on_conflict: Option<crate::plan_types::OnConflictClause>,
-        default_cells: Vec<Vec<bool>>,
+        (default_cells, overriding, alias): (Vec<Vec<bool>>, Option<&str>, Option<&str>),
     ) -> Result<QueryOutput> {
         use crate::plan_types::OnConflictClause;
         let (db_name, schema_name, table_only) = parse_object_name(&table_name)?;
@@ -442,7 +442,7 @@ impl MemExecutor {
             .catalog_reader
             .get_table(db_name, schema_name, table_only)?;
         self.authorize(ctx, Action::Insert, ResourceRef::Table(tbl.id))?;
-        let scope = self.target_scope(ctx, &tbl, (&table_name, None), None, false)?;
+        let scope = self.target_scope(ctx, &tbl, (&table_name, alias), None, false)?;
         let returning = scope.returning_positions(&returning, false)?;
 
         // Target column positions, in the order values are supplied.
@@ -493,16 +493,49 @@ impl MemExecutor {
             }
             // Unprovided columns take their declared DEFAULT, if any; a
             // generated column or a `GENERATED ALWAYS` identity takes no value.
+            // Every column is checked before any default runs, so a refused
+            // row draws no identity value.
+            let defaults: Vec<Option<ScalarExpr>> =
+                tbl.columns.iter().map(Self::column_default).collect();
             for (i, c) in tbl.columns.iter().enumerate() {
-                let default = Self::column_default(c);
+                let default = defaults[i].clone();
+                let identity = default.as_ref().and_then(crate::sequences::identity_kind);
+                // OVERRIDING USER VALUE: an identity generates its own value.
+                if identity.is_some() && overriding == Some("USER") {
+                    provided[i] = false;
+                }
+                let overridden = identity == Some(true) && overriding == Some("SYSTEM");
                 if provided[i]
+                    && !overridden
                     && let Some(kind) = default.as_ref().and_then(Self::write_protection)
                 {
-                    anyhow::bail!(
-                        "cannot insert a non-DEFAULT value into column \"{}\": {kind}",
+                    let (detail, hint) = if identity.is_some() {
+                        (
+                            format!(
+                                "Column \"{}\" is an identity column defined as GENERATED ALWAYS.",
+                                c.name
+                            ),
+                            Some("Use OVERRIDING SYSTEM VALUE to override."),
+                        )
+                    } else {
+                        (
+                            format!("Column \"{}\" is a generated column.", c.name),
+                            None,
+                        )
+                    };
+                    let _ = kind;
+                    let mut error = crate::error_fields::DbError::new(format!(
+                        "cannot insert a non-DEFAULT value into column \"{}\"",
                         c.name
-                    );
+                    ))
+                    .detail(detail);
+                    if let Some(hint) = hint {
+                        error = error.hint(hint);
+                    }
+                    return Err(error.into());
                 }
+            }
+            for (i, default) in defaults.into_iter().enumerate() {
                 if !provided[i]
                     && let Some(expr) = default
                     && Self::generation_expr(&expr).is_none()
@@ -539,7 +572,11 @@ impl MemExecutor {
                         // row as `excluded.<col>`.
                         let mut scope_row = existing_row.clone();
                         scope_row.extend(row.iter().cloned());
-                        let mut scope_cols = col_names.clone();
+                        // The target's columns by its alias (or name), then
+                        // the proposed row's as `excluded`.
+                        let prefix = alias.unwrap_or(table_only);
+                        let mut scope_cols: Vec<String> =
+                            col_names.iter().map(|c| format!("{prefix}.{c}")).collect();
                         scope_cols.extend(col_names.iter().map(|c| format!("excluded.{c}")));
                         let column_type = |name: &str| {
                             crate::filter_eval::col_pos(&scope_cols, name)

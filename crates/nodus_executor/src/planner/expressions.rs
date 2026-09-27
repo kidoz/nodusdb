@@ -1438,8 +1438,37 @@ pub(crate) fn eval_scalar_in(expr: &ScalarExpr, scope: &dyn ScalarScope) -> Valu
             let vals: Vec<Value> = args.iter().map(eval).collect();
             crate::functions::call(name, &vals)
         }
+        // A row is NULL when every field is, and NOT NULL when none is.
+        ScalarExpr::IsNull { expr, negated } if matches!(**expr, ScalarExpr::Row(_)) => {
+            let ScalarExpr::Row(items) = &**expr else {
+                return Value::Null;
+            };
+            let nulls: Vec<bool> = items
+                .iter()
+                .map(|e| matches!(eval(e), Value::Null))
+                .collect();
+            Value::Bool(if *negated {
+                nulls.iter().all(|n| !n)
+            } else {
+                nulls.iter().all(|n| *n)
+            })
+        }
         ScalarExpr::IsNull { expr, negated } => {
-            let is_null = matches!(eval(expr), Value::Null);
+            let value = eval(expr);
+            if let Value::Record(fields) = &value
+                && !fields.is_empty()
+            {
+                let nulls = fields
+                    .iter()
+                    .filter(|(_, f)| matches!(f, Value::Null))
+                    .count();
+                return Value::Bool(if *negated {
+                    nulls == 0
+                } else {
+                    nulls == fields.len()
+                });
+            }
+            let is_null = matches!(value, Value::Null);
             Value::Bool(if *negated { !is_null } else { is_null })
         }
         ScalarExpr::Extract { field, expr } => {

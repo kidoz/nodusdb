@@ -121,6 +121,8 @@ impl MemExecutor {
                 on_conflict,
                 default_cells,
                 source,
+                overriding,
+                alias,
             } => {
                 // A materialized view's rows change only by REFRESH.
                 let (db_name, schema_name, table_only) = parse_object_name(&table_name)?;
@@ -149,7 +151,7 @@ impl MemExecutor {
                     values_list,
                     crate::dml::Returning::new(returning, returning_exprs),
                     on_conflict,
-                    default_cells,
+                    (default_cells, overriding.as_deref(), alias.as_deref()),
                 )
             }
             LogicalPlan::CreateTableAs {

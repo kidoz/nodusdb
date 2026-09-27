@@ -1157,13 +1157,14 @@ impl MemExecutor {
                 | LogicalPlan::RollbackToSavepoint { .. }
                 | LogicalPlan::ReleaseSavepoint { .. }
         );
+        // A query whose WITH holds a data-modifying statement writes.
         let is_read_only = matches!(
             plan,
             LogicalPlan::Select { .. }
                 | LogicalPlan::SelectLiteral { .. }
                 | LogicalPlan::SetOp { .. }
                 | LogicalPlan::Values { .. }
-        );
+        ) && data_modifying_cte(&plan).is_none();
         let mut implicit_txn = None;
 
         if !is_txn_control && self.active_txns.read().get(&ctx.session_id).is_none() {
@@ -1372,6 +1373,9 @@ impl Executor for MemExecutor {
 /// The command a statement that writes names in PostgreSQL's
 /// `cannot execute ... in a read-only transaction`.
 fn write_command(plan: &LogicalPlan) -> Option<&'static str> {
+    if let Some(command) = data_modifying_cte(plan) {
+        return Some(command);
+    }
     Some(match plan {
         LogicalPlan::Insert { .. } => "INSERT",
         LogicalPlan::Update { .. } => "UPDATE",
@@ -1400,6 +1404,16 @@ fn write_command(plan: &LogicalPlan) -> Option<&'static str> {
         LogicalPlan::With { body, .. } => return write_command(body),
         _ => return None,
     })
+}
+
+/// The command of a data-modifying statement in a query's WITH clause
+/// (`WITH d AS (DELETE ... RETURNING *) SELECT ...`), if it has one.
+fn data_modifying_cte(plan: &LogicalPlan) -> Option<&'static str> {
+    let ctes = match plan {
+        LogicalPlan::Select { ctes, .. } | LogicalPlan::With { ctes, .. } => ctes,
+        _ => return None,
+    };
+    ctes.iter().find_map(|(_, cte)| write_command(cte))
 }
 
 /// Statements about the session rather than its data, which leave a

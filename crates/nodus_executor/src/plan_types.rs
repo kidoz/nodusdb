@@ -1185,6 +1185,15 @@ pub enum LogicalPlan {
         /// `values_list`.
         #[serde(default)]
         source: Option<Box<LogicalPlan>>,
+        /// `OVERRIDING SYSTEM VALUE` (`SYSTEM`: identity columns take the
+        /// values given) or `OVERRIDING USER VALUE` (`USER`: they generate
+        /// theirs regardless).
+        #[serde(default)]
+        overriding: Option<String>,
+        /// `INSERT INTO t AS alias`: the name RETURNING and ON CONFLICT
+        /// qualify the target's columns by.
+        #[serde(default)]
+        alias: Option<String>,
     },
     /// `CREATE TABLE ... AS <query>` / `SELECT ... INTO`: a table shaped like
     /// the query's output, filled with its rows.

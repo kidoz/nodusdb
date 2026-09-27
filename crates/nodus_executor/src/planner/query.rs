@@ -175,6 +175,30 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
         return select_from_result(set_op, ctes, query, params);
     }
 
+    // A data-modifying statement as a query (a CTE's body): its RETURNING
+    // rows.
+    if let SetExpr::Insert(statement)
+    | SetExpr::Update(statement)
+    | SetExpr::Delete(statement)
+    | SetExpr::Merge(statement) = &*query.body
+    {
+        return super::plan_statement(statement, params);
+    }
+
+    // A parenthesized query, which may have its own ORDER BY and LIMIT
+    // (`(SELECT ... LIMIT 2) UNION ALL (...)`).
+    if let SetExpr::Query(inner) = &*query.body {
+        let inner_plan = plan_query(inner, params)?;
+        if ctes.is_empty()
+            && query.order_by.is_none()
+            && query.limit_clause.is_none()
+            && query.fetch.is_none()
+        {
+            return Ok(inner_plan);
+        }
+        return select_from_result(inner_plan, ctes, query, params);
+    }
+
     // A `VALUES` list as the query: `VALUES (1, 'a'), (2, 'b')`.
     if let SetExpr::Values(values) = &*query.body {
         let rows = values

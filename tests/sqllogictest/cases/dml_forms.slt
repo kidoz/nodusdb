@@ -1,0 +1,114 @@
+# DML forms: data-modifying WITH, multi-column SET from a subquery, INSERT aliases, OVERRIDING, and parenthesized set-operation operands.
+statement ok
+CREATE TABLE w14 (k int PRIMARY KEY, v text, n int);
+
+statement ok
+INSERT INTO w14 VALUES (1, 'a', 1), (2, 'b', 2), (3, 'c', 3);
+
+query TTT
+WITH moved AS (DELETE FROM w14 WHERE k = 3 RETURNING *) INSERT INTO w14 SELECT k + 100, v, n FROM moved RETURNING *;
+----
+103	c	3
+
+query T
+WITH up AS (UPDATE w14 SET n = n + 1 RETURNING k, n) SELECT sum(n) FROM up;
+----
+9
+
+query T
+WITH ins AS (INSERT INTO w14 VALUES (7, 'g', 7) RETURNING k) SELECT k * 2 FROM ins;
+----
+14
+
+query TTT
+SELECT * FROM w14 ORDER BY k;
+----
+1	a	2
+2	b	3
+7	g	7
+103	c	4
+
+query TTT
+UPDATE w14 SET (v, n) = (SELECT 'sub', 99) WHERE k = 1 RETURNING *;
+----
+1	sub	99
+
+query TTT
+UPDATE w14 SET (v, n) = (SELECT v || '!', n * 10 FROM w14 x WHERE x.k = w14.k) WHERE k = 2 RETURNING *;
+----
+2	b!	30
+
+query TT
+INSERT INTO w14 AS t VALUES (8, 'h', 8) RETURNING t.k, t.v;
+----
+8	h
+
+query TTT
+INSERT INTO w14 AS t VALUES (8, 'i', 0) ON CONFLICT (k) DO UPDATE SET v = t.v || excluded.v RETURNING t.*;
+----
+8	hi	8
+
+query TTT
+INSERT INTO w14 VALUES (8, 'j', 0) ON CONFLICT (k) DO UPDATE SET v = w14.v || excluded.v WHERE w14.n > 0 RETURNING *;
+----
+8	hij	8
+
+query T
+(SELECT k FROM w14 ORDER BY k LIMIT 2) UNION ALL (SELECT k FROM w14 ORDER BY k DESC LIMIT 1);
+----
+1
+2
+103
+
+query T
+(SELECT k FROM w14 ORDER BY k LIMIT 3) EXCEPT (SELECT 2) ORDER BY 1;
+----
+1
+7
+
+statement ok
+CREATE TABLE x14 (id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY, name text, doubled int GENERATED ALWAYS AS (id * 2) STORED);
+
+statement ok
+INSERT INTO x14 (name) VALUES ('a'), ('b');
+
+statement error
+INSERT INTO x14 (id, name) VALUES (10, 'z');
+
+query TT
+INSERT INTO x14 (id, name) OVERRIDING SYSTEM VALUE VALUES (10, 'z') RETURNING id, doubled;
+----
+10	20
+
+query T
+INSERT INTO x14 (id, name) OVERRIDING USER VALUE VALUES (99, 'u') RETURNING id;
+----
+3
+
+query T
+INSERT INTO x14 AS t (id, name) OVERRIDING SYSTEM VALUE VALUES (20, 'w') RETURNING t.id;
+----
+20
+
+statement error
+INSERT INTO x14 (name, doubled) VALUES ('g', 5);
+
+query T
+INSERT INTO x14 (name) VALUES ('next') RETURNING id;
+----
+4
+
+query TTTTT
+SELECT ROW(NULL, NULL) IS NULL, ROW(1, NULL) IS NULL, ROW(1, NULL) IS NOT NULL, ROW(1, 2) IS NOT NULL, ROW(NULL, NULL) IS NOT NULL;
+----
+t	f	f	t	f
+
+query T
+SELECT k FROM w14 WHERE k = 1 FOR NO KEY UPDATE;
+----
+1
+
+query T
+SELECT k FROM w14 WHERE k = 1 FOR KEY SHARE;
+----
+1

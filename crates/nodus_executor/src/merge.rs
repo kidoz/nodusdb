@@ -191,7 +191,7 @@ impl MemExecutor {
                         vec![row],
                         inserted,
                         None,
-                        vec![defaults],
+                        (vec![defaults], None, None),
                     )?;
                     // The returned row, then the action `merge_action()` reports.
                     let action = [Value::Text("INSERT".to_string())];

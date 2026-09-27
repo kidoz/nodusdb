@@ -53,15 +53,26 @@ fn copy_row(mut row: DataRow, format: CopyOutputFormat) -> PgWireResult<BytesMut
         }
         let value = row.data.split_to(len as usize);
         if format == CopyOutputFormat::Csv {
-            // Quoting every non-NULL field distinguishes empty strings from NULL.
-            output.put_u8(b'"');
+            // Quoted as PostgreSQL quotes: when it holds the delimiter, a
+            // quote, or a line break, or is empty (an unquoted empty field is
+            // NULL), or is the end-of-data marker alone in its row.
+            let quote = value.is_empty()
+                || value
+                    .iter()
+                    .any(|b| matches!(b, b',' | b'"' | b'\n' | b'\r'))
+                || (row.field_count == 1 && value.as_ref() == b"\\.");
+            if quote {
+                output.put_u8(b'"');
+            }
             for byte in value {
                 if byte == b'"' {
                     output.put_u8(b'"');
                 }
                 output.put_u8(byte);
             }
-            output.put_u8(b'"');
+            if quote {
+                output.put_u8(b'"');
+            }
         } else {
             for byte in value {
                 match byte {
@@ -253,7 +264,7 @@ mod tests {
         );
         assert_eq!(
             &copy_row(DataRow::new(bytes, 3), CopyOutputFormat::Csv).unwrap()[..],
-            b"\"a\t\\\",,\"\"\n"
+            b"a\t\\,,\"\"\n"
         );
     }
 }

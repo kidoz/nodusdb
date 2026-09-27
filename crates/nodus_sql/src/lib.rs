@@ -65,6 +65,12 @@ pub const EXCLUDE_MARKER: &str = "__EXCLUDE__";
 /// since the parser has no `SYMMETRIC`.
 pub const SYMMETRIC_MARKER: &str = "__SYMMETRIC__";
 
+/// The suffix an `INSERT`'s target alias carries for `OVERRIDING SYSTEM
+/// VALUE` (and [`OVERRIDING_USER`] for `OVERRIDING USER VALUE`), which the
+/// parser lacks: `INSERT INTO t AS __overriding_system__ ...`.
+pub const OVERRIDING_SYSTEM: &str = "__overriding_system__";
+pub const OVERRIDING_USER: &str = "__overriding_user__";
+
 /// Query syntax the parser lacks: `TABLE name` as a query (`SELECT * FROM
 /// name`), `BETWEEN [A]SYMMETRIC` ([`SYMMETRIC_MARKER`]), and a window
 /// frame's `EXCLUDE` ([`EXCLUDE_MARKER`]).
@@ -116,6 +122,79 @@ fn rewrite_query_syntax(
             continue;
         }
         previous = Some(i);
+        i += 1;
+    }
+    // `INSERT INTO t [AS a] ... OVERRIDING {SYSTEM|USER} VALUE`: the clause
+    // goes, and the target's alias carries it.
+    let mut i = 0;
+    while i < tokens.len() {
+        if word(&tokens[i]).as_deref() == Some("overriding")
+            && let Some(a) = significant(&tokens, i + 1)
+            && let Some(b) = significant(&tokens, a + 1)
+            && word(&tokens[b]).as_deref() == Some("value")
+            && let Some(kind @ ("system" | "user")) = word(&tokens[a]).as_deref()
+        {
+            let marker = if kind == "system" {
+                OVERRIDING_SYSTEM
+            } else {
+                OVERRIDING_USER
+            };
+            tokens.drain(i..=b);
+            // The target: the name after `INSERT INTO`, dotted parts included.
+            let into = (0..i)
+                .rev()
+                .find(|&k| word(&tokens[k]).as_deref() == Some("into"));
+            if let Some(into) = into
+                && let Some(first) = significant(&tokens, into + 1)
+            {
+                let mut last = first;
+                while let Some(dot) = significant(&tokens, last + 1)
+                    && tokens[dot].token == Token::Period
+                    && let Some(part) = significant(&tokens, dot + 1)
+                {
+                    last = part;
+                }
+                let alias = significant(&tokens, last + 1)
+                    .filter(|&k| word(&tokens[k]).as_deref() == Some("as"))
+                    .and_then(|k| significant(&tokens, k + 1));
+                match alias {
+                    Some(k) => {
+                        if let Token::Word(w) = &mut tokens[k].token {
+                            w.value.push_str(marker);
+                        }
+                    }
+                    None => {
+                        tokens.splice(last + 1..last + 1, snippet(&format!(" AS {marker}")));
+                    }
+                }
+            }
+            continue;
+        }
+        i += 1;
+    }
+    // `FOR NO KEY UPDATE` and `FOR KEY SHARE` lock as `FOR UPDATE` and
+    // `FOR SHARE` do.
+    let mut i = 0;
+    while i < tokens.len() {
+        if word(&tokens[i]).as_deref() == Some("for")
+            && let Some(a) = significant(&tokens, i + 1)
+        {
+            let second = significant(&tokens, a + 1);
+            let third = second.and_then(|b| significant(&tokens, b + 1));
+            match (
+                word(&tokens[a]).as_deref(),
+                second.and_then(|b| word(&tokens[b])).as_deref(),
+                third.and_then(|c| word(&tokens[c])).as_deref(),
+            ) {
+                (Some("no"), Some("key"), Some("update")) => {
+                    tokens.drain(a..third.unwrap_or(a));
+                }
+                (Some("key"), Some("share"), _) => {
+                    tokens.drain(a..second.unwrap_or(a));
+                }
+                _ => {}
+            }
+        }
         i += 1;
     }
     // `BETWEEN [A]SYMMETRIC low AND high`.
@@ -713,7 +792,7 @@ mod tests {
     }
 
     #[test]
-    fn maintenance_statements_are_rewritten() {
+    fn maintenance_locking_and_overriding_forms_are_rewritten() {
         let one = |sql: &str| parse_sql(sql).unwrap().remove(0).to_string();
         assert_eq!(
             one("CHECKPOINT"),
@@ -726,6 +805,22 @@ mod tests {
         assert_eq!(
             one("REINDEX TABLE t"),
             format!("SELECT {UTILITY_FUNCTION}('REINDEX')")
+        );
+        assert_eq!(
+            one("SELECT a FROM t FOR NO KEY UPDATE"),
+            "SELECT a FROM t FOR UPDATE"
+        );
+        assert_eq!(
+            one("SELECT a FROM t FOR KEY SHARE"),
+            "SELECT a FROM t FOR SHARE"
+        );
+        assert_eq!(
+            one("INSERT INTO s.t (a) OVERRIDING SYSTEM VALUE VALUES (1)"),
+            format!("INSERT INTO s.t AS {OVERRIDING_SYSTEM} (a) VALUES (1)")
+        );
+        assert_eq!(
+            one("INSERT INTO t AS x OVERRIDING USER VALUE VALUES (1)"),
+            format!("INSERT INTO t AS x{OVERRIDING_USER} VALUES (1)")
         );
     }
 

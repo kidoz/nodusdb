@@ -84,6 +84,8 @@ fn test_ddl_and_subqueries() {
         &ctx,
         LogicalPlan::Insert {
             source: None,
+            overriding: None,
+            alias: None,
             table_name: "employees".into(),
             columns: vec![],
             values_list: vec![
@@ -180,6 +182,8 @@ fn test_ddl_and_subqueries() {
         &ctx,
         LogicalPlan::Insert {
             source: None,
+            overriding: None,
+            alias: None,
             table_name: "departments".into(),
             columns: vec![],
             values_list: vec![vec![
@@ -310,6 +314,8 @@ fn test_unique_constraints() {
         &ctx,
         LogicalPlan::Insert {
             source: None,
+            overriding: None,
+            alias: None,
             table_name: "users".into(),
             columns: vec![],
             values_list: vec![
@@ -328,6 +334,8 @@ fn test_unique_constraints() {
         &ctx,
         LogicalPlan::Insert {
             source: None,
+            overriding: None,
+            alias: None,
             table_name: "users".into(),
             columns: vec![],
             values_list: vec![vec![Value::Int(1), Value::Text("c@c.com".into())]],
@@ -348,6 +356,8 @@ fn test_unique_constraints() {
         &ctx,
         LogicalPlan::Insert {
             source: None,
+            overriding: None,
+            alias: None,
             table_name: "users".into(),
             columns: vec![],
             values_list: vec![vec![Value::Int(3), Value::Text("b@b.com".into())]],
@@ -462,6 +472,8 @@ fn test_secondary_indexing() {
         &ctx,
         LogicalPlan::Insert {
             source: None,
+            overriding: None,
+            alias: None,
             table_name: "products".into(),
             columns: vec![],
             values_list: vec![
@@ -496,6 +508,8 @@ fn test_secondary_indexing() {
         &ctx,
         LogicalPlan::Insert {
             source: None,
+            overriding: None,
+            alias: None,
             table_name: "products".into(),
             columns: vec![],
             values_list: vec![
@@ -736,6 +750,8 @@ fn test_index_value_containing_separator_does_not_overmatch() {
         &ctx,
         LogicalPlan::Insert {
             source: None,
+            overriding: None,
+            alias: None,
             table_name: "labels".into(),
             columns: vec![],
             // "a:b" would, unescaped, share the `i:{id}:a:` scan prefix of "a".
@@ -860,6 +876,8 @@ fn test_alter_table_migrations() {
         &ctx,
         LogicalPlan::Insert {
             source: None,
+            overriding: None,
+            alias: None,
             table_name: "users".into(),
             columns: vec![],
             values_list: vec![vec![Value::Int(1), Value::Text("Alice".into())]],

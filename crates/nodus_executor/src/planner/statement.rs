@@ -612,6 +612,23 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                 Some(other) => anyhow::bail!("Unsupported INSERT clause: {other}"),
                 None => None,
             };
+            let alias = insert
+                .table_alias
+                .as_ref()
+                .map(|a| a.alias.value.clone())
+                .unwrap_or_default();
+            let overriding = if alias.ends_with(nodus_sql::OVERRIDING_SYSTEM) {
+                Some("SYSTEM".to_string())
+            } else if alias.ends_with(nodus_sql::OVERRIDING_USER) {
+                Some("USER".to_string())
+            } else {
+                None
+            };
+            let alias = alias
+                .strip_suffix(nodus_sql::OVERRIDING_SYSTEM)
+                .or_else(|| alias.strip_suffix(nodus_sql::OVERRIDING_USER))
+                .unwrap_or(&alias)
+                .to_string();
             Ok(LogicalPlan::Insert {
                 table_name,
                 columns: cols,
@@ -621,6 +638,8 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                 on_conflict,
                 default_cells,
                 source,
+                overriding,
+                alias: (!alias.is_empty()).then_some(alias),
             })
         }
         // `WITH ... INSERT`: the CTEs scope the insert's source query.
@@ -1848,6 +1867,30 @@ fn plan_assignments(
         match &a.target {
             AssignmentTarget::ColumnName(name) => {
                 out.push((column(name)?, assignment_value(&a.value, params)?));
+            }
+            // `SET (a, b) = (SELECT x, y ...)`: each column the matching
+            // column of the (scalar) subquery.
+            AssignmentTarget::Tuple(names) if matches!(a.value, Expr::Subquery(_)) => {
+                let Expr::Subquery(query) = &a.value else {
+                    unreachable!("guarded by the match arm");
+                };
+                let aliases: Vec<String> =
+                    (1..=names.len()).map(|i| format!("\"__c{i}\"")).collect();
+                for (i, name) in names.iter().enumerate() {
+                    let sql = format!(
+                        "(SELECT {} FROM ({query}) AS __multi({}))",
+                        aliases[i],
+                        aliases.join(", ")
+                    );
+                    let expr =
+                        sqlparser::parser::Parser::new(&sqlparser::dialect::PostgreSqlDialect {})
+                            .try_with_sql(&sql)
+                            .and_then(|mut p| p.parse_expr())
+                            .map_err(|e| {
+                                anyhow::anyhow!("Unsupported multi-column assignment source: {e}")
+                            })?;
+                    out.push((column(name)?, assignment_value(&expr, params)?));
+                }
             }
             AssignmentTarget::Tuple(names) => {
                 let values: Vec<&Expr> = match &a.value {
