@@ -87,6 +87,28 @@ async fn malformed_payloads_preserve_rows_applied_and_current_snapshot() {
 }
 
 #[tokio::test]
+async fn a_deferred_build_waits_out_the_retry_interval() {
+    let kv = Arc::new(MemKvEngine::new());
+    put(kv.as_ref(), b"row", b"first", 10);
+    let mut store = NodusRaftStore::with_kv(kv.clone());
+    let original = store.build_snapshot().await.unwrap();
+    let txn = TxnId::new();
+    kv.write_intent(txn, Bytes::from_static(b"other"), Bytes::from_static(b"x"))
+        .unwrap();
+    // The pending intent defers the build.
+    let deferred = store.build_snapshot().await.unwrap();
+    assert_eq!(deferred.meta.snapshot_id, original.meta.snapshot_id);
+    // Once it commits, a build right away still reports no progress
+    // without scanning; after the interval it snapshots.
+    kv.commit(txn, 20).unwrap();
+    let throttled = store.build_snapshot().await.unwrap();
+    assert_eq!(throttled.meta.snapshot_id, original.meta.snapshot_id);
+    *store.snapshot_deferred_at.lock().unwrap() = None;
+    let fresh = store.build_snapshot().await.unwrap();
+    assert_ne!(fresh.meta.snapshot_id, original.meta.snapshot_id);
+}
+
+#[tokio::test]
 async fn legacy_build_refuses_intents_history_and_tombstones_without_replacing_snapshot() {
     for state in ["intent", "history", "tombstone"] {
         let kv = Arc::new(MemKvEngine::new());
@@ -107,8 +129,11 @@ async fn legacy_build_refuses_intents_history_and_tombstones_without_replacing_s
         if state != "intent" {
             kv.commit(txn, 20).unwrap();
         }
-        assert!(
-            store.build_snapshot().await.is_err(),
+        // The legacy wire cannot represent it, so the build is deferred: Raft
+        // gets the current snapshot back and keeps its log.
+        let deferred = store.build_snapshot().await.unwrap();
+        assert_eq!(
+            deferred.meta.snapshot_id, original.meta.snapshot_id,
             "legacy wire cannot represent {state}"
         );
         assert_eq!(
@@ -244,14 +269,24 @@ async fn mvcc_source() -> (NodusRaftStore, Arc<MemKvEngine>, Arc<Compatibility>,
 #[tokio::test]
 async fn mvcc_snapshots_require_finalization_and_every_voter_and_learner() {
     let (mut source, _, compatibility, pending) = mvcc_source().await;
-    assert!(source.build_snapshot().await.is_err());
+    // Deferred builds hand back a placeholder at no log position.
+    let deferred = |snapshot: &Snapshot<NodusTypeConfig>| {
+        snapshot.meta.last_log_id.is_none() && snapshot.meta.snapshot_id == "deferred"
+    };
+    let retry_now = |store: &NodusRaftStore| {
+        *store.snapshot_deferred_at.lock().unwrap() = None;
+    };
+    assert!(deferred(&source.build_snapshot().await.unwrap()));
     compatibility.finalized.store(2, Ordering::SeqCst);
+    retry_now(&source);
     assert!(
-        source.build_snapshot().await.is_err(),
+        deferred(&source.build_snapshot().await.unwrap()),
         "old learner blocks v2"
     );
     compatibility.formats.lock().unwrap().insert(2, 2);
+    retry_now(&source);
     let snapshot = source.build_snapshot().await.unwrap();
+    let built = snapshot.meta.snapshot_id.clone();
     let target = Arc::new(MemKvEngine::new());
     let mut receiver = NodusRaftStore::with_kv(target.clone()).with_snapshot_group("shard-a");
     receiver
@@ -272,8 +307,10 @@ async fn mvcc_snapshots_require_finalization_and_every_voter_and_learner() {
     target.commit(pending, 30).unwrap();
     assert!(target.get(b"row", 30).unwrap().is_none());
     compatibility.formats.lock().unwrap().remove(&2);
-    assert!(
-        source.build_snapshot().await.is_err(),
+    // Without v2 the pending intent defers the build: the v2 snapshot stays.
+    assert_eq!(
+        source.build_snapshot().await.unwrap().meta.snapshot_id,
+        built,
         "missing report must not count as support"
     );
 }

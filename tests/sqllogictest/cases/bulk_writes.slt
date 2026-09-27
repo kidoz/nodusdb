@@ -1,0 +1,54 @@
+# Large writes: thousands of rows in one statement (the Raft log compacts while their intents are pending), uniqueness checked by key, and later writes still applied.
+statement ok
+CREATE TABLE bulk (id int PRIMARY KEY, code text UNIQUE, n int);
+
+statement ok
+INSERT INTO bulk SELECT g, 'c' || g, g % 7 FROM generate_series(1, 6000) g;
+
+query TTTTT
+SELECT count(*), sum(n), min(id), max(id), count(DISTINCT code) FROM bulk;
+----
+6000	17998	1	6000	6000
+
+statement error
+INSERT INTO bulk VALUES (6000, 'fresh', 0);
+
+statement error
+INSERT INTO bulk VALUES (6001, 'c42', 0);
+
+statement ok
+INSERT INTO bulk VALUES (6001, 'fresh', 0);
+
+statement ok
+INSERT INTO bulk SELECT g, 'd' || g, 0 FROM generate_series(6002, 9000) g ON CONFLICT (id) DO NOTHING;
+
+query T
+SELECT count(*) FROM bulk;
+----
+9000
+
+statement ok
+UPDATE bulk SET n = n + 1 WHERE id % 2 = 0;
+
+query T
+SELECT sum(n) FROM bulk;
+----
+22498
+
+query TT
+INSERT INTO bulk VALUES (5, 'x', 0) ON CONFLICT (id) DO UPDATE SET n = bulk.n + 100 RETURNING id, n;
+----
+5	105
+
+query TTT
+INSERT INTO bulk VALUES (-1, 'c7', 0) ON CONFLICT (code) DO UPDATE SET n = -7 RETURNING id, code, n;
+----
+7	c7	-7
+
+statement ok
+DELETE FROM bulk WHERE id > 100;
+
+query TT
+SELECT count(*), max(id) FROM bulk;
+----
+100	100

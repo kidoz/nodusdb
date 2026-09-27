@@ -159,7 +159,7 @@ impl MemExecutor {
             if let Some(txn) = guard.get(&ctx.session_id) {
                 let start = format!("{}:", tbl.id);
                 let end = format!("{};", tbl.id);
-                if txn.overlay.keys().any(|k| k >= &start && k < &end) {
+                if txn.overlay.range(start..end).next().is_some() {
                     return Ok(None);
                 }
             }

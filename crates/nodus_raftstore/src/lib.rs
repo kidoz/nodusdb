@@ -603,6 +603,9 @@ pub struct StateMachine {
 pub struct NodusRaftStore {
     snapshot_group: String,
     snapshot_compatibility: Option<Arc<dyn SnapshotCompatibility>>,
+    /// When a snapshot was last deferred, so the next build within
+    /// [`SNAPSHOT_RETRY_INTERVAL`] reports no progress without rescanning.
+    snapshot_deferred_at: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
     pub log: Arc<RwLock<BTreeMap<u64, Entry<NodusTypeConfig>>>>,
     pub vote: Arc<RwLock<Option<Vote<u64>>>>,
     pub state_machine: Arc<RwLock<StateMachine>>,
@@ -653,6 +656,7 @@ impl NodusRaftStore {
             meta: None,
             snapshot_group: "unscoped".into(),
             snapshot_compatibility: None,
+            snapshot_deferred_at: Arc::default(),
             snapshot_dir: temp_snapshot_dir(),
             current_snapshot_meta: Arc::new(RwLock::new(None)),
         }
@@ -699,6 +703,7 @@ impl NodusRaftStore {
             meta: Some(meta),
             snapshot_group: "unscoped".into(),
             snapshot_compatibility: None,
+            snapshot_deferred_at: Arc::default(),
             snapshot_dir,
             current_snapshot_meta: Arc::new(RwLock::new(snapshot_meta)),
         }
@@ -966,11 +971,66 @@ impl NodusRaftStore {
     }
 }
 
+/// How long a deferred snapshot waits before a build scans the state
+/// machine again. Raft asks for one after every applied entry while its log
+/// is past the snapshot policy, and each attempt reads every row.
+const SNAPSHOT_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
 impl RaftSnapshotBuilder<NodusTypeConfig> for NodusRaftStore {
     async fn build_snapshot(&mut self) -> Result<Snapshot<NodusTypeConfig>, StorageError<u64>> {
-        self.build_atomic_snapshot()
+        let recently_deferred = self
+            .snapshot_deferred_at
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some_and(|at| at.elapsed() < SNAPSHOT_RETRY_INTERVAL);
+        if recently_deferred {
+            return self.unchanged_snapshot().await;
+        }
+        match self.build_atomic_snapshot().await {
+            Ok(snapshot) => {
+                *self
+                    .snapshot_deferred_at
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = None;
+                Ok(snapshot)
+            }
+            Err(e) if e.downcast_ref::<snapshots::SnapshotDeferred>().is_some() => {
+                tracing::debug!(reason = %e, "snapshot deferred");
+                *self
+                    .snapshot_deferred_at
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = Some(std::time::Instant::now());
+                self.unchanged_snapshot().await
+            }
+            Err(e) => Err(snapshot_io_err("build snapshot", e)),
+        }
+    }
+}
+
+impl NodusRaftStore {
+    /// The current snapshot again (or, before the first, an empty one at no
+    /// log position): Raft ignores a snapshot no newer than its own, so the
+    /// log stays until a later build succeeds.
+    async fn unchanged_snapshot(&mut self) -> Result<Snapshot<NodusTypeConfig>, StorageError<u64>> {
+        if let Some(current) = self.get_current_snapshot().await? {
+            return Ok(current);
+        }
+        let path = self
+            .snapshot_dir
+            .join(format!("deferred-{}.tmp", uuid::Uuid::new_v4()));
+        let file = tokio::fs::File::create(&path)
             .await
-            .map_err(|e| snapshot_io_err("build snapshot", e))
+            .map_err(|e| snapshot_io_err("create deferred snapshot", e))?;
+        let _ = std::fs::remove_file(&path);
+        let last_membership = self.state_machine.read().await.last_membership.clone();
+        Ok(Snapshot {
+            meta: SnapshotMeta {
+                last_log_id: None,
+                last_membership,
+                snapshot_id: "deferred".to_string(),
+            },
+            snapshot: Box::new(file),
+        })
     }
 }
 

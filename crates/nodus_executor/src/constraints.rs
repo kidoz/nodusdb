@@ -51,6 +51,64 @@ impl MemExecutor {
         if unique_keys.is_empty() && pk_positions.is_empty() {
             return Ok(());
         }
+        let primary_name = || {
+            tbl.indexes
+                .iter()
+                .find(|i| i.index_type == nodus_catalog::IndexType::Primary)
+                .map_or_else(|| format!("{}_pkey", tbl.name), |i| i.name.clone())
+        };
+        // Look the keys up where that is exact; scan the table otherwise.
+        let equal = |existing: &[Value], positions: &[usize]| {
+            matches!(
+                (key_tuple(existing, positions), key_tuple(new_row, positions)),
+                (Some(a), Some(b)) if a.iter().zip(&b).all(|(x, y)| values_equal(x, y))
+            )
+        };
+        let mut looked_up = true;
+        if !pk_positions.is_empty() {
+            match self.key_candidates(&ctx.session_id, tbl, &pk_positions, None, new_row)? {
+                Some(found) => {
+                    for (pk, existing) in found {
+                        if Some(pk.as_str()) != skip_pk && equal(&existing, &pk_positions) {
+                            return Err(self.duplicate_key(
+                                tbl,
+                                &primary_name(),
+                                &pk_positions,
+                                new_row,
+                            ));
+                        }
+                    }
+                }
+                None => looked_up = false,
+            }
+        }
+        for (idx_name, positions, predicate) in &unique_keys {
+            let index = tbl.indexes.iter().find(|i| i.name == *idx_name);
+            match self.key_candidates(&ctx.session_id, tbl, positions, index, new_row)? {
+                Some(found) => {
+                    for (pk, existing) in found {
+                        if Some(pk.as_str()) != skip_pk
+                            && equal(&existing, positions)
+                            && predicate.as_ref().is_none_or(|filter| {
+                                self.eval_filter(
+                                    ctx,
+                                    &existing,
+                                    &col_names,
+                                    &tbl.columns,
+                                    Some(filter),
+                                ) == Some(true)
+                            })
+                        {
+                            return Err(self.duplicate_key(tbl, idx_name, positions, new_row));
+                        }
+                    }
+                }
+                None => looked_up = false,
+            }
+        }
+        if looked_up {
+            return Ok(());
+        }
         let prefix = format!("{}:", tbl.id);
         for (stored_key, existing) in self.scan_rows_keyed(tbl.id, &ctx.session_id)? {
             let stored_pk = stored_key.strip_prefix(&prefix).unwrap_or(&stored_key);
@@ -83,6 +141,60 @@ impl MemExecutor {
             }
         }
         Ok(())
+    }
+
+    /// The stored rows that could equal `row` on the key at `positions`,
+    /// found without scanning the table: the row stored under the primary
+    /// key, or those a unique `index` lists under the key's leading value.
+    /// `None` when no lookup is exact, so the caller scans. A key with a NULL
+    /// equals no row.
+    pub(crate) fn key_candidates(
+        &self,
+        session: &str,
+        tbl: &nodus_catalog::TableDescriptor,
+        positions: &[usize],
+        index: Option<&nodus_catalog::IndexDescriptor>,
+        row: &[Value],
+    ) -> Result<Option<Vec<(String, Vec<Value>)>>> {
+        if positions
+            .iter()
+            .any(|&p| matches!(row.get(p), None | Some(Value::Null)))
+        {
+            return Ok(Some(Vec::new()));
+        }
+        let declared = Self::pk_positions_declared(tbl);
+        if !declared.is_empty() && positions == declared.as_slice() {
+            // A row is stored under its key's text, which only these types
+            // spell one way.
+            let exact = positions
+                .iter()
+                .all(|&p| matches!(row[p], Value::Int(_) | Value::Text(_) | Value::Bool(_)));
+            if !exact {
+                return Ok(None);
+            }
+            let pk = Self::row_pk(positions, row);
+            return Ok(Some(
+                self.get_row(tbl.id, &pk, session)?
+                    .map(|found| vec![(pk, found)])
+                    .unwrap_or_default(),
+            ));
+        }
+        let Some(index) = index else {
+            return Ok(None);
+        };
+        let Some(leading) = Self::index_leading_position(tbl, index) else {
+            return Ok(None);
+        };
+        // A float's text does not decide equality (`-0` is `0`).
+        if matches!(row[leading], Value::Float(_)) {
+            return Ok(None);
+        }
+        Ok(Some(self.index_rows(
+            index.id,
+            &row[leading],
+            tbl.id,
+            session,
+        )?))
     }
 
     /// A partial index's predicate, as a condition over the table's rows.

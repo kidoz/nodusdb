@@ -152,7 +152,7 @@ pub struct ExecutionContext {
 pub(crate) struct SavepointState {
     pub(crate) name: String,
     pub(crate) write_log_len: usize,
-    pub(crate) overlay: HashMap<String, Option<String>>,
+    pub(crate) overlay: std::collections::BTreeMap<String, Option<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -160,7 +160,9 @@ pub(crate) struct ActiveTxn {
     pub(crate) txn_id: TxnId,
     pub(crate) read_ts: Timestamp,
     pub(crate) write_log: Vec<String>,
-    pub(crate) overlay: HashMap<String, Option<String>>,
+    /// The transaction's own writes by key (`None`: deleted), ordered so a
+    /// table's or an index value's range reads without visiting the rest.
+    pub(crate) overlay: std::collections::BTreeMap<String, Option<String>>,
     pub(crate) savepoints: Vec<SavepointState>,
     /// `true` for a user-issued `BEGIN`, `false` for the single-statement
     /// implicit transaction that wraps each autocommit statement. Only explicit
@@ -191,7 +193,7 @@ impl ActiveTxn {
             txn_id,
             read_ts,
             write_log: Vec::new(),
-            overlay: HashMap::new(),
+            overlay: std::collections::BTreeMap::new(),
             savepoints: Vec::new(),
             explicit,
             read_only: false,
@@ -794,18 +796,14 @@ impl MemExecutor {
         if let Some(txn) = self.active_txns.read().get(session) {
             let start = format!("{}:", table_id);
             let end = format!("{};", table_id);
-            for (key, value) in &txn.overlay {
-                if key >= &start && key < &end {
-                    match value {
-                        Some(encoded) => {
-                            keyed_rows.insert(
-                                key.clone(),
-                                Self::decode_row(encoded.as_bytes(), &columns)?,
-                            );
-                        }
-                        None => {
-                            keyed_rows.remove(key);
-                        }
+            for (key, value) in txn.overlay.range(start..end) {
+                match value {
+                    Some(encoded) => {
+                        keyed_rows
+                            .insert(key.clone(), Self::decode_row(encoded.as_bytes(), &columns)?);
+                    }
+                    None => {
+                        keyed_rows.remove(key);
                     }
                 }
             }
@@ -832,7 +830,7 @@ impl MemExecutor {
         if let Some(txn) = self.active_txns.read().get(session) {
             let start = format!("{}:", table_id);
             let end = format!("{};", table_id);
-            if txn.overlay.keys().any(|k| k >= &start && k < &end) {
+            if txn.overlay.range(start..end).next().is_some() {
                 return Ok(None);
             }
         }
@@ -913,10 +911,7 @@ impl MemExecutor {
         if let Some(txn) = self.active_txns.read().get(session) {
             let start = format!("{}:", table_id);
             let end = format!("{};", table_id);
-            for (key, value) in &txn.overlay {
-                if key < &start || key >= &end {
-                    continue;
-                }
+            for (key, value) in txn.overlay.range(start.clone()..end) {
                 let pk = key.strip_prefix(&start).unwrap_or(key).to_string();
                 match value {
                     None => {
@@ -939,6 +934,84 @@ impl MemExecutor {
             }
         }
         map.into_values().collect()
+    }
+
+    /// The row stored under `pk` in a table, as the session sees it (its own
+    /// pending write first).
+    pub(crate) fn get_row(
+        &self,
+        table_id: TableId,
+        pk: &str,
+        session: &str,
+    ) -> Result<Option<Vec<Value>>> {
+        let key = format!("{table_id}:{pk}");
+        let columns = self.table_columns(table_id);
+        if let Some(txn) = self.active_txns.read().get(session)
+            && let Some(pending) = txn.overlay.get(&key)
+        {
+            return pending
+                .as_ref()
+                .map(|encoded| Self::decode_row(encoded.as_bytes(), &columns))
+                .transpose();
+        }
+        let read_ts = self.read_ts(session);
+        self.maybe_read_range_barrier(
+            session,
+            KeyRange {
+                start: Bytes::from(format!("{}:", table_id)),
+                end: Bytes::from(format!("{};", table_id)),
+            },
+        )?;
+        self.kv
+            .get(&Bytes::from(key), read_ts)?
+            .map(|bytes| Self::decode_row(&bytes, &columns))
+            .transpose()
+    }
+
+    /// The rows an index lists under `index_val`, as the session sees them
+    /// (its own pending index entries and rows included), keyed by primary key.
+    pub(crate) fn index_rows(
+        &self,
+        index_id: nodus_catalog::IndexId,
+        index_val: &Value,
+        table_id: TableId,
+        session: &str,
+    ) -> Result<Vec<(String, Vec<Value>)>> {
+        let escaped = Self::escape_index_value(&render(&crate::value::key_form(index_val)));
+        let prefix = format!("i:{}:{}:", index_id, escaped);
+        let end = format!("i:{}:{};", index_id, escaped);
+        let read_ts = self.read_ts(session);
+        let mut pks = std::collections::BTreeSet::new();
+        for pair in self.kv.scan(
+            KeyRange {
+                start: Bytes::from(prefix.clone()),
+                end: Bytes::from(end.clone()),
+            },
+            read_ts,
+        )? {
+            let pair = pair?;
+            if let Some(pk) = String::from_utf8_lossy(&pair.key).strip_prefix(&prefix) {
+                pks.insert(pk.to_string());
+            }
+        }
+        if let Some(txn) = self.active_txns.read().get(session) {
+            for (key, entry) in txn.overlay.range(prefix.clone()..end) {
+                if let Some(pk) = key.strip_prefix(&prefix) {
+                    if entry.is_some() {
+                        pks.insert(pk.to_string());
+                    } else {
+                        pks.remove(pk);
+                    }
+                }
+            }
+        }
+        let mut rows = Vec::new();
+        for pk in pks {
+            if let Some(row) = self.get_row(table_id, &pk, session)? {
+                rows.push((pk, row));
+            }
+        }
+        Ok(rows)
     }
 
     /// Writes a row value at `key`, using the session's txn.

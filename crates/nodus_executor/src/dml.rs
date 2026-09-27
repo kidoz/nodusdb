@@ -1187,6 +1187,28 @@ impl MemExecutor {
             .iter()
             .map(|(_, positions)| crate::constraints::key_tuple(row, positions))
             .collect();
+        // Look each key up where that is exact; scan the table otherwise.
+        let mut looked_up = true;
+        for ((name, positions), wanted) in keys.iter().zip(&proposed) {
+            let index = tbl.indexes.iter().find(|i| i.name == *name);
+            let index = index.filter(|i| i.index_type != nodus_catalog::IndexType::Primary);
+            match self.key_candidates(session, tbl, positions, index, row)? {
+                Some(found) => {
+                    for (pk, existing) in found {
+                        if let (Some(wanted), Some(have)) =
+                            (wanted, crate::constraints::key_tuple(&existing, positions))
+                            && wanted.iter().zip(&have).all(|(a, b)| values_equal(a, b))
+                        {
+                            return Ok(Some((format!("{}:{pk}", tbl.id), existing)));
+                        }
+                    }
+                }
+                None => looked_up = false,
+            }
+        }
+        if looked_up {
+            return Ok(None);
+        }
         for (key, existing) in self.scan_rows_keyed(tbl.id, session)? {
             for ((_, positions), wanted) in keys.iter().zip(&proposed) {
                 if let (Some(wanted), Some(have)) =

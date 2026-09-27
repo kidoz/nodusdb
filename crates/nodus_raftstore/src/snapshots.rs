@@ -17,6 +17,21 @@ impl Drop for StagedSnapshot {
     }
 }
 
+/// A snapshot that cannot be taken yet: the legacy format cannot hold the
+/// state machine's in-flight transactions (pending intents) or retained MVCC
+/// history. The builder reports no progress instead of failing, since a build
+/// error stops the Raft group; the log is compacted by a later build.
+#[derive(Debug)]
+pub(crate) struct SnapshotDeferred(pub(crate) &'static str);
+
+impl std::fmt::Display for SnapshotDeferred {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for SnapshotDeferred {}
+
 fn scope(sm: &StateMachine) -> SnapshotScope {
     SnapshotScope {
         exclude_raft: true,
@@ -98,22 +113,27 @@ impl NodusRaftStore {
         // state and is omitted, while wire readers still reject empty chains.
         rows.retain(|row| !row.versions.is_empty());
         let use_v2 = v2::permitted(self, &sm)?;
-        if !use_v2 {
-            anyhow::ensure!(
-                !rows.iter().flat_map(|r| &r.versions).any(|v| v.is_intent),
-                "legacy snapshot cannot represent pending intents; finalized MVCC snapshot support is required"
-            );
+        if !use_v2 && rows.iter().flat_map(|r| &r.versions).any(|v| v.is_intent) {
+            return Err(SnapshotDeferred(
+                "legacy snapshot cannot represent pending intents; finalized MVCC snapshot support is required",
+            )
+            .into());
         }
-        anyhow::ensure!(
-            !rows
-                .iter()
-                .filter(|r| r.key.as_ref() == CATALOG_KEY
+        if rows
+            .iter()
+            .filter(|r| {
+                r.key.as_ref() == CATALOG_KEY
                     || migration::is_control_key(&r.key)
-                    || r.key.starts_with(b"\x01upgrade/"))
-                .flat_map(|r| &r.versions)
-                .any(|v| v.is_intent),
-            "snapshot contains an unfinished catalog/control mutation"
-        );
+                    || r.key.starts_with(b"\x01upgrade/")
+            })
+            .flat_map(|r| &r.versions)
+            .any(|v| v.is_intent)
+        {
+            return Err(SnapshotDeferred(
+                "snapshot contains an unfinished catalog/control mutation",
+            )
+            .into());
+        }
         let catalog = sm.catalog_reader.as_ref().map(|c| c.export_snapshot());
         if let Some(catalog) = &sm.catalog_reader {
             let durable = catalog.export_raft_catalog()?;
@@ -137,15 +157,19 @@ impl NodusRaftStore {
             if use_v2 {
                 continue;
             }
-            anyhow::ensure!(
-                !row.versions.iter().any(|v| v.is_intent),
-                "legacy snapshot cannot represent pending intents; drain transactions first"
-            );
-            if !internal(&row.key) {
-                anyhow::ensure!(
-                    row.versions.len() <= 1 && row.versions.iter().all(|v| v.value.is_some()),
-                    "legacy snapshot cannot represent retained MVCC history; a negotiated snapshot format is required"
-                );
+            if row.versions.iter().any(|v| v.is_intent) {
+                return Err(SnapshotDeferred(
+                    "legacy snapshot cannot represent pending intents; drain transactions first",
+                )
+                .into());
+            }
+            if !internal(&row.key)
+                && !(row.versions.len() <= 1 && row.versions.iter().all(|v| v.value.is_some()))
+            {
+                return Err(SnapshotDeferred(
+                    "legacy snapshot cannot represent retained MVCC history; a negotiated snapshot format is required",
+                )
+                .into());
             }
         }
         let meta = SnapshotMeta {

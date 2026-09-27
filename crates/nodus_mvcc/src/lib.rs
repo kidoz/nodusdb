@@ -78,7 +78,7 @@ impl VersionChain {
     /// Finds an existing active intent. In standard MVCC, there is usually only
     /// one active intent per key at a time.
     pub fn active_intent(&self) -> Option<&MvccValue> {
-        self.versions.iter().find(|v| v.is_intent)
+        self.versions.iter().rev().find(|v| v.is_intent)
     }
 
     /// Write an intent (either put or delete) for a given transaction.
@@ -119,20 +119,19 @@ impl VersionChain {
     }
 
     pub fn commit(&mut self, txn_id: TxnId, commit_ts: Timestamp) -> Result<(), MvccError> {
+        // Intents are appended, so the search starts from the end.
         let intent_idx = self
             .versions
             .iter()
-            .position(|v| v.is_intent && v.txn_id == Some(txn_id))
+            .rposition(|v| v.is_intent && v.txn_id == Some(txn_id))
             .ok_or(MvccError::IntentNotFound { txn_id })?;
 
-        let mut intent = self.versions.remove(intent_idx);
+        // Committed in place: readers take the newest visible version by
+        // timestamp, so the chain needs no order, and a long chain (a key
+        // rewritten on every Raft apply) costs no sort per commit.
+        let intent = &mut self.versions[intent_idx];
         intent.is_intent = false;
         intent.version = commit_ts;
-
-        self.versions.push(intent);
-        // Sort descending by version so the newest is first if needed, though we use max_by_key in read().
-        // Sorting helps keep the chain ordered for efficient gc or scans.
-        self.versions.sort_by_key(|b| std::cmp::Reverse(b.version));
 
         Ok(())
     }
@@ -170,13 +169,11 @@ impl VersionChain {
         if let Some(keep_idx) = keep_idx {
             // We keep the one at keep_idx, but any older committed versions can be dropped.
             if keep_idx + 1 < committed.len() {
-                let to_drop: Vec<_> = committed[keep_idx + 1..]
-                    .iter()
-                    .map(|v| v.version)
-                    .collect();
-                reclaimed = to_drop.len();
+                // Everything committed before the kept version goes.
+                let keep_version = committed[keep_idx].version;
+                reclaimed = committed.len() - keep_idx - 1;
                 self.versions
-                    .retain(|v| v.is_intent || !to_drop.contains(&v.version));
+                    .retain(|v| v.is_intent || v.version >= keep_version);
 
                 // If the retained element is a tombstone and strictly older than watermark,
                 // and there are no newer versions, we might be able to drop it entirely,
@@ -243,6 +240,29 @@ mod tests {
         assert_eq!(chain.read(9), None);
         assert_eq!(chain.read(10), Some(b"val1".as_slice()));
         assert_eq!(chain.read(20), Some(b"val1".as_slice()));
+    }
+
+    #[test]
+    fn long_chains_commit_in_place_and_collect_to_the_watermark() {
+        let mut chain = VersionChain::new();
+        for ts in 1..=1000u64 {
+            let txn = TxnId::new();
+            chain.write_intent(txn, ts.to_be_bytes().to_vec()).unwrap();
+            chain.commit(txn, ts * 10).unwrap();
+        }
+        assert_eq!(chain.versions.len(), 1000);
+        assert_eq!(chain.read(5005), Some(500u64.to_be_bytes().as_slice()));
+        assert_eq!(chain.read(u64::MAX), Some(1000u64.to_be_bytes().as_slice()));
+        // A pending intent survives collection; everything older than the
+        // version visible at the watermark goes.
+        let pending = TxnId::new();
+        chain.write_intent(pending, b"pending".to_vec()).unwrap();
+        assert_eq!(chain.garbage_collect(5005), 499);
+        assert_eq!(chain.read(5005), Some(500u64.to_be_bytes().as_slice()));
+        assert_eq!(chain.read(4000), None);
+        assert!(chain.active_intent().is_some());
+        chain.commit(pending, 20_000).unwrap();
+        assert_eq!(chain.read(u64::MAX), Some(b"pending".as_slice()));
     }
 
     #[test]
