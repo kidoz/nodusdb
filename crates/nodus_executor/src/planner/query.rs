@@ -1206,6 +1206,7 @@ fn lift_set_returning_functions(
             with_ordinality: false,
             alias: None,
             column_aliases: Vec::new(),
+            column_types: Vec::new(),
             arg_exprs: args.clone(),
             rows_from: Vec::new(),
         }
@@ -1216,6 +1217,7 @@ fn lift_set_returning_functions(
         with_ordinality: false,
         alias: Some(SRF_RELATION.to_string()),
         column_aliases: (1..=calls.len()).map(|i| format!("c{i}")).collect(),
+        column_types: Vec::new(),
         arg_exprs: Vec::new(),
         rows_from: calls.iter().map(|(call, _)| member(call)).collect(),
     })
@@ -1267,6 +1269,9 @@ const SELECT_LIST_TABLE_FUNCTIONS: &[&str] = &[
     "regexp_split_to_table",
     "regexp_matches",
     "string_to_table",
+    "generate_subscripts",
+    "jsonb_object_keys",
+    "json_object_keys",
     "pg_partition_ancestors",
 ];
 
@@ -1311,6 +1316,7 @@ fn select_list_table_function(
         args: Vec::new(),
         with_ordinality: false,
         column_aliases: Vec::new(),
+        column_types: Vec::new(),
         arg_exprs: Vec::new(),
         rows_from: Vec::new(),
     };
@@ -1334,6 +1340,14 @@ fn build_table_fn_spec(
         alias: alias.map(|a| a.name.value.clone()),
         column_aliases: alias
             .map(|a| a.columns.iter().map(|c| c.name.value.clone()).collect())
+            .unwrap_or_default(),
+        column_types: alias
+            .map(|a| {
+                a.columns
+                    .iter()
+                    .map(|c| c.data_type.as_ref().map(|t| t.to_string()))
+                    .collect()
+            })
             .unwrap_or_default(),
         arg_exprs: Vec::new(),
         rows_from: Vec::new(),

@@ -1,0 +1,101 @@
+# Functions: the JSON record and key functions, jsonb_insert and jsonb_set_lax, array_dims/array_fill/generate_subscripts, timestamps with precision, and timeofday.
+query TT
+SELECT key, value FROM jsonb_each('{"a": 1, "b": "x", "c": [1]}') ORDER BY key;
+----
+a	1
+b	"x"
+c	[1]
+
+query TT
+SELECT key, value FROM jsonb_each_text('{"a": 1, "b": "x", "c": null}') ORDER BY key;
+----
+a	1
+b	x
+c	NULL
+
+query TT
+SELECT * FROM json_each('{"b": [1], "a": {"x": 2}}');
+----
+b	[1]
+a	{"x": 2}
+
+query TT
+SELECT * FROM json_each_text('{"b": [1], "a": "s"}');
+----
+b	[1]
+a	s
+
+query T
+SELECT jsonb_object_keys('{"b": 1, "a": 2, "aa": 3}');
+----
+a
+b
+aa
+
+query T
+SELECT json_object_keys('{"b": 1, "a": 2}');
+----
+b
+a
+
+query TT
+SELECT t.id, k FROM (VALUES (1, '{"p": 1, "q": 2}'::jsonb)) t(id, j), jsonb_object_keys(t.j) k ORDER BY 2;
+----
+1	p
+1	q
+
+query TTTTT
+SELECT * FROM jsonb_to_record('{"a": 1, "b": "x", "c": [1,2], "d": 1.5}') AS r(a int, b text, c jsonb, d numeric, e text);
+----
+1	x	[1, 2]	1.5	NULL
+
+query TT
+SELECT * FROM json_to_recordset('[{"a": 1}, {"a": 2, "b": true}]') AS r(a int, b boolean);
+----
+1	NULL
+2	t
+
+query TTT
+SELECT jsonb_insert('{"a": [1, 2]}', '{a, 1}', '9'), jsonb_insert('{"a": [1, 2]}', '{a, 1}', '9', true), jsonb_insert('{"a": 1}', '{b}', '2');
+----
+{"a": [1, 9, 2]}	{"a": [1, 2, 9]}	{"a": 1, "b": 2}
+
+query TTTT
+SELECT jsonb_set_lax('{"a": 1}', '{a}', NULL), jsonb_set_lax('{"a": 1, "b": 2}', '{a}', NULL, true, 'delete_key'), jsonb_set_lax('{"a": 1}', '{a}', NULL, true, 'return_target'), jsonb_set_lax('{"a": 1}', '{a}', '5');
+----
+{"a": null}	{"b": 2}	{"a": 1}	{"a": 5}
+
+statement error
+SELECT jsonb_insert('{"a": 1}', '{a}', '2');
+
+statement error
+SELECT jsonb_set_lax('{"a": 1}', '{a}', NULL, true, 'raise_exception');
+
+query T
+SELECT generate_subscripts(ARRAY['a', 'b', 'c'], 1);
+----
+1
+2
+3
+
+query T
+SELECT generate_subscripts(ARRAY[[1, 2, 3], [4, 5, 6]], 2, true);
+----
+3
+2
+1
+
+query TTTT
+SELECT array_dims(ARRAY[[1, 2], [3, 4]]), array_dims(ARRAY[1, 2, 3]), array_fill(7, ARRAY[2]), array_fill('x'::text, ARRAY[2, 2]);
+----
+[1:2][1:2]	[1:3]	{7,7}	{{x,x},{x,x}}
+
+query TTTTT
+SELECT current_timestamp(0) IS NOT NULL, localtimestamp(2) IS NOT NULL, current_time(1) IS NOT NULL, localtime(3) IS NOT NULL, timeofday() IS NOT NULL;
+----
+t	t	t	t	t
+
+query TTTT
+SELECT length(timeofday()) > 20, pg_typeof(current_timestamp(0)), pg_typeof(localtimestamp(1)), pg_typeof(timeofday());
+----
+t	timestamp with time zone	timestamp without time zone	text

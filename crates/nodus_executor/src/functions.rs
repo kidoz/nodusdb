@@ -45,6 +45,7 @@ const NON_STRICT: &[&str] = &[
     "CURRENT_SETTING",
     "PG_TYPEOF",
     "FORMAT_TYPE",
+    "JSONB_SET_LAX",
 ];
 
 /// Every function name (upper-cased, without a `pg_catalog.` qualifier) the
@@ -75,6 +76,7 @@ pub(crate) fn is_known(name: &str) -> bool {
                 | "ACOSD" | "ATAND" | "ATAN2D" | "SETSEED" | "RANDOM_NORMAL"
                 | crate::result_types::REAL_TEXT | crate::result_types::REAL_NUMERIC | crate::result_types::BPCHAR_PAD
                 | "TO_ASCII" | "UNISTR" | "NORMALIZE" | "__IS_NORMALIZED__"
+                | "TIMEOFDAY" | "ARRAY_DIMS" | "ARRAY_FILL" | "GENERATE_SUBSCRIPTS"
                 | "SHA224" | "SHA256" | "SHA384" | "SHA512" | "ENCODE" | "DECODE" | "CONVERT_TO"
                 | "CONVERT_FROM" | "CONVERT" | "GET_BYTE" | "SET_BYTE" | "GET_BIT" | "SET_BIT"
                 | "CRC32" | "CRC32C" | "PG_COLUMN_SIZE" | crate::result_types::INT_BYTEA
@@ -141,7 +143,10 @@ pub(crate) fn is_known(name: &str) -> bool {
                 // table function, anywhere else they are an error.
                 | "UNNEST" | "GENERATE_SERIES" | "JSONB_ARRAY_ELEMENTS" | "JSON_ARRAY_ELEMENTS"
                 | "JSONB_ARRAY_ELEMENTS_TEXT" | "JSON_ARRAY_ELEMENTS_TEXT" | "REGEXP_SPLIT_TO_TABLE"
-                | "REGEXP_MATCHES" | "STRING_TO_TABLE"
+                | "REGEXP_MATCHES" | "STRING_TO_TABLE" | "JSONB_OBJECT_KEYS" | "JSON_OBJECT_KEYS"
+                | "JSONB_EACH" | "JSONB_EACH_TEXT" | "JSON_EACH" | "JSON_EACH_TEXT"
+                | "JSONB_TO_RECORD" | "JSON_TO_RECORD" | "JSONB_TO_RECORDSET" | "JSON_TO_RECORDSET"
+                | "JSONB_INSERT" | "JSONB_SET_LAX"
                 | "PG_PARTITION_ANCESTORS"
         )
 }
@@ -198,6 +203,18 @@ pub(crate) fn return_type(name: &str, arg_types: &[Option<String>]) -> Option<St
             return Some("INTEGER".into());
         }
         "CRC32" | "CRC32C" | "BIT_COUNT" => return Some("BIGINT".into()),
+        "TIMEOFDAY" | "ARRAY_DIMS" => return Some("TEXT".into()),
+        "ARRAY_FILL" => {
+            return arg_types
+                .first()
+                .cloned()
+                .flatten()
+                .map(|t| format!("{t}[]"));
+        }
+        "CURRENT_TIMESTAMP" if arg_types.len() == 1 => return Some("TIMESTAMPTZ".into()),
+        "LOCALTIMESTAMP" if arg_types.len() == 1 => return Some("TIMESTAMP".into()),
+        "LOCALTIME" if arg_types.len() == 1 => return Some("TIME".into()),
+        "CURRENT_TIME" if arg_types.len() == 1 => return Some("TIMETZ".into()),
         crate::result_types::BITS => {
             return match arg_types.first() {
                 Some(_) => match name {
@@ -298,7 +315,7 @@ pub(crate) fn return_type(name: &str, arg_types: &[Option<String>]) -> Option<St
             }
             "GEN_RANDOM_UUID" | "UUIDV4" | "UUIDV7" => "UUID",
             "TO_JSONB" | "JSONB_BUILD_OBJECT" | "JSONB_BUILD_ARRAY" | "JSONB_EXTRACT_PATH"
-            | "JSONB_SET" | "JSONB_STRIP_NULLS" => "JSONB",
+            | "JSONB_SET" | "JSONB_STRIP_NULLS" | "JSONB_INSERT" | "JSONB_SET_LAX" => "JSONB",
             "TO_JSON" | "JSON_BUILD_OBJECT" | "JSON_BUILD_ARRAY" | "JSON_EXTRACT_PATH"
             | "JSON_STRIP_NULLS" | "ROW_TO_JSON" | "ARRAY_TO_JSON" | "JSON_OBJECT" => "JSON",
             "__RECORD__" => "RECORD",
@@ -1894,6 +1911,71 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
         "NOW" | "CURRENT_TIMESTAMP" | "TRANSACTION_TIMESTAMP" if arity(0) => {
             timestamp(session_time(|e| e.transaction_micros)?, true)
         }
+        // With a precision: rounded to that many fractional digits.
+        "CURRENT_TIMESTAMP" | "LOCALTIMESTAMP" | "CURRENT_TIME" | "LOCALTIME" if arity(1) => {
+            let precision = int(arg(0))?;
+            if precision < 0 {
+                return Some(raise(format!(
+                    "{}({precision}) precision must not be negative",
+                    name.to_ascii_uppercase()
+                )));
+            }
+            let unit = 10i64.pow((6 - precision.min(6)) as u32);
+            let micros = session_time(|e| e.transaction_micros)?;
+            let rounded = (micros + unit / 2).div_euclid(unit) * unit;
+            let Some(now) = chrono::DateTime::from_timestamp_micros(rounded) else {
+                return Some(raise("timestamp out of range"));
+            };
+            if name == "CURRENT_TIMESTAMP" {
+                timestamp(rounded, true)
+            } else {
+                let (local, offset) = crate::timezone::to_session_local(now.naive_utc());
+                let ts = crate::value::format_timestamp(local, false);
+                Value::Text(match name {
+                    "LOCALTIMESTAMP" => ts,
+                    "LOCALTIME" => ts[11..].to_string(),
+                    _ => format!("{}{}", &ts[11..], crate::timezone::offset_text(offset)),
+                })
+            }
+        }
+        // The current time as text, in the Unix `date` form.
+        "TIMEOFDAY" if arity(0) => {
+            let Some(now) = chrono::DateTime::from_timestamp_micros(session_env::wall_micros())
+            else {
+                return Some(raise("timestamp out of range"));
+            };
+            let (local, _) = crate::timezone::to_session_local(now.naive_utc());
+            let zone = crate::timezone::session_abbreviation(now.naive_utc());
+            Value::Text(format!(
+                "{} {zone}",
+                local.format("%a %b %d %H:%M:%S%.6f %Y")
+            ))
+        }
+        "ARRAY_DIMS" if arity(1) => {
+            let items = array(arg(0))?;
+            if items.is_empty() {
+                return Some(Value::Null);
+            }
+            let mut dims = String::new();
+            let mut level = Value::Array(items);
+            while let Value::Array(items) = level {
+                dims.push_str(&format!("[1:{}]", items.len()));
+                level = items.into_iter().next().unwrap_or(Value::Null);
+            }
+            Value::Text(dims)
+        }
+        "ARRAY_FILL" if arity(2) || arity(3) => {
+            let dims = array(arg(1))?;
+            if dims.iter().any(|d| matches!(d, Value::Null)) {
+                return Some(raise("dimension values cannot be null"));
+            }
+            let mut filled = arg(0).clone();
+            for d in dims.iter().rev() {
+                let n = int(d)?.max(0) as usize;
+                filled = Value::Array(vec![filled; n]);
+            }
+            filled
+        }
         "STATEMENT_TIMESTAMP" if arity(0) => timestamp(session_time(|e| e.statement_micros)?, true),
         "CLOCK_TIMESTAMP" if arity(0) => timestamp(session_env::wall_micros(), true),
         // The transaction's start as local time in the session's zone.
@@ -2557,6 +2639,51 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
             json_set(&mut json, &path, new_value, create);
             Value::Jsonb(json)
         }
+        // `jsonb_insert(target, path, value [, insert_after])`: a new array
+        // element before (or after) the path's, or a new object key.
+        "JSONB_INSERT" if arity(3) || arity(4) => {
+            let mut json = json_arg(arg(0))?;
+            let path: Vec<String> = array(arg(1))?.iter().map(text).collect();
+            let after = matches!(args.get(3), Some(Value::Bool(true)));
+            let new_value = to_json(&parse_json_arg(arg(2)));
+            match json_insert(&mut json, &path, new_value, after) {
+                Ok(()) => Value::Jsonb(json),
+                Err(e) => raise(e),
+            }
+        }
+        // `jsonb_set_lax`: as `jsonb_set`, but a NULL value is treated as its
+        // last argument says (`use_json_null` by default).
+        "JSONB_SET_LAX" if (3..=5).contains(&args.len()) => {
+            if matches!(arg(0), Value::Null) || matches!(arg(1), Value::Null) {
+                return Some(Value::Null);
+            }
+            let mut json = json_arg(arg(0))?;
+            let path: Vec<String> = array(arg(1))?.iter().map(text).collect();
+            let create = !matches!(args.get(3), Some(Value::Bool(false)));
+            if matches!(arg(2), Value::Null) {
+                let treatment = args.get(4).map_or("use_json_null".to_string(), text);
+                match treatment.as_str() {
+                    "raise_exception" => return Some(raise("JSON value must not be null")),
+                    "return_target" => return Some(Value::Jsonb(json)),
+                    "delete_key" => {
+                        json_delete_path(&mut json, &path);
+                        return Some(Value::Jsonb(json));
+                    }
+                    "use_json_null" => {
+                        json_set(&mut json, &path, serde_json::Value::Null, create);
+                        return Some(Value::Jsonb(json));
+                    }
+                    _ => {
+                        return Some(raise(
+                            "null_value_treatment must be \"delete_key\", \"return_target\", \"use_json_null\", or \"raise_exception\"",
+                        ));
+                    }
+                }
+            }
+            let new_value = to_json(&parse_json_arg(arg(2)));
+            json_set(&mut json, &path, new_value, create);
+            Value::Jsonb(json)
+        }
         "JSON_STRIP_NULLS" if arity(1) || arity(2) => {
             let in_arrays = matches!(args.get(1), Some(Value::Bool(true)));
             match arg(0) {
@@ -2590,6 +2717,17 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
         | "REGEXP_SPLIT_TO_TABLE"
         | "REGEXP_MATCHES"
         | "STRING_TO_TABLE"
+        | "GENERATE_SUBSCRIPTS"
+        | "JSONB_OBJECT_KEYS"
+        | "JSON_OBJECT_KEYS"
+        | "JSONB_EACH"
+        | "JSONB_EACH_TEXT"
+        | "JSON_EACH"
+        | "JSON_EACH_TEXT"
+        | "JSONB_TO_RECORD"
+        | "JSON_TO_RECORD"
+        | "JSONB_TO_RECORDSET"
+        | "JSON_TO_RECORDSET"
         | "PG_PARTITION_ANCESTORS" => raise(format!(
             "set-returning function {}() is not allowed here",
             name.to_ascii_lowercase()
@@ -3386,6 +3524,97 @@ fn json_set(
                 }
             } else if (0..len).contains(&pos) {
                 json_set(&mut items[pos as usize], rest, new_value, create);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// `jsonb_insert`: `value` inserted at `path` (before the element there,
+/// or after it with `after`); an existing object key is an error.
+fn json_insert(
+    json: &mut serde_json::Value,
+    path: &[String],
+    value: serde_json::Value,
+    after: bool,
+) -> Result<(), String> {
+    let Some((key, rest)) = path.split_first() else {
+        return Ok(());
+    };
+    match json {
+        serde_json::Value::Object(map) => {
+            if rest.is_empty() {
+                if map.contains_key(key) {
+                    return Err(
+                        crate::error_fields::DbError::new("cannot replace existing key")
+                            .hint("Try using the function jsonb_set to replace key value.")
+                            .into_text(),
+                    );
+                }
+                map.insert(key.clone(), value);
+                Ok(())
+            } else if let Some(child) = map.get_mut(key) {
+                json_insert(child, rest, value, after)
+            } else {
+                Ok(())
+            }
+        }
+        serde_json::Value::Array(items) => {
+            let Ok(idx) = key.parse::<i64>() else {
+                return Err(format!(
+                    "path element at position {} is not an integer: \"{key}\"",
+                    path.len() - rest.len()
+                ));
+            };
+            let len = items.len() as i64;
+            let pos = if idx < 0 { len + idx } else { idx };
+            if rest.is_empty() {
+                let at = if pos < 0 {
+                    0
+                } else if pos >= len {
+                    len
+                } else if after {
+                    pos + 1
+                } else {
+                    pos
+                };
+                items.insert(at as usize, value);
+                Ok(())
+            } else if (0..len).contains(&pos) {
+                json_insert(&mut items[pos as usize], rest, value, after)
+            } else {
+                Ok(())
+            }
+        }
+        _ => Ok(()),
+    }
+}
+
+/// The document without the member at `path`, as `#-` removes it.
+fn json_delete_path(json: &mut serde_json::Value, path: &[String]) {
+    let Some((key, rest)) = path.split_first() else {
+        return;
+    };
+    match json {
+        serde_json::Value::Object(map) => {
+            if rest.is_empty() {
+                map.shift_remove(key);
+            } else if let Some(child) = map.get_mut(key) {
+                json_delete_path(child, rest);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            let Ok(idx) = key.parse::<i64>() else {
+                return;
+            };
+            let len = items.len() as i64;
+            let pos = if idx < 0 { len + idx } else { idx };
+            if (0..len).contains(&pos) {
+                if rest.is_empty() {
+                    items.remove(pos as usize);
+                } else {
+                    json_delete_path(&mut items[pos as usize], rest);
+                }
             }
         }
         _ => {}

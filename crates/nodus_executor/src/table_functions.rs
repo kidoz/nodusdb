@@ -54,6 +54,23 @@ impl MemExecutor {
             "regexp_split_to_table" => regexp_split_rows(&args)?,
             "regexp_matches" => regexp_matches_rows(&args)?,
             "string_to_table" => string_to_table_rows(&args),
+            "generate_subscripts" => generate_subscripts_rows(&args),
+            "jsonb_each" | "jsonb_each_text" | "json_each" | "json_each_text" => json_each_rows(
+                &args,
+                spec.name.starts_with("jsonb"),
+                spec.name.ends_with("_text"),
+            ),
+            "jsonb_object_keys" | "json_object_keys" => {
+                let rows = json_each_rows(&args, spec.name.starts_with("jsonb"), true)
+                    .1
+                    .into_iter()
+                    .map(|mut r| vec![r.swap_remove(0)])
+                    .collect();
+                (vec!["TEXT".to_string()], rows)
+            }
+            "jsonb_to_record" | "json_to_record" | "jsonb_to_recordset" | "json_to_recordset" => {
+                json_to_record_rows(&args, spec, spec.name.ends_with("set"))?
+            }
             // No table is a partition, so none has ancestors.
             "pg_partition_ancestors" => (vec!["REGCLASS".to_string()], Vec::new()),
             // The function behind the `pg_available_extensions` view.
@@ -78,11 +95,16 @@ impl MemExecutor {
             | "json_array_elements_text" => Some("value"),
             _ => None,
         };
+        let pair = matches!(
+            spec.name.as_str(),
+            "jsonb_each" | "jsonb_each_text" | "json_each" | "json_each_text"
+        );
         let mut names: Vec<String> = (0..types.len())
             .map(|i| {
                 spec.column_aliases
                     .get(i)
                     .cloned()
+                    .or_else(|| pair.then(|| ["key", "value"][i.min(1)].to_string()))
                     .or_else(|| named.filter(|_| i == 0).map(str::to_string))
                     .or_else(|| (i == 0).then(|| spec.alias.clone()).flatten())
                     .unwrap_or_else(|| spec.name.clone())
@@ -304,6 +326,147 @@ fn regexp_matches_rows(args: &[Value]) -> Result<(Vec<String>, Vec<Vec<Value>>)>
     let found =
         crate::pg_regex::matches(&text, &pattern, &flags).map_err(|e| anyhow::anyhow!(e))?;
     Ok((ty, found.into_iter().map(|m| vec![m]).collect()))
+}
+
+/// `jsonb_each` / `json_each` (and their `_text` forms): a key and value
+/// row per member of the object; `json` keeps its members' order and
+/// duplicates, `jsonb` its keys' order.
+fn json_each_rows(args: &[Value], jsonb: bool, as_text: bool) -> (Vec<String>, Vec<Vec<Value>>) {
+    let value_type = match (as_text, jsonb) {
+        (true, _) => "TEXT",
+        (false, true) => "JSONB",
+        (false, false) => "JSON",
+    };
+    let types = vec!["TEXT".to_string(), value_type.to_string()];
+    let member_text = |value: serde_json::Value| match value {
+        serde_json::Value::Null => Value::Null,
+        serde_json::Value::String(s) => Value::Text(s),
+        other => Value::Text(crate::json_text::jsonb_text(&other)),
+    };
+    let rows = if jsonb {
+        let doc = match args.first() {
+            Some(Value::Jsonb(j)) => Some(j.clone()),
+            Some(Value::Text(t) | Value::Json(t)) => crate::json_text::parse(t).ok(),
+            _ => None,
+        };
+        match doc {
+            Some(serde_json::Value::Object(map)) => {
+                let mut entries: Vec<_> = map.into_iter().collect();
+                entries.sort_by(|a, b| crate::json_text::key_order(&a.0, &b.0));
+                entries
+            }
+            .into_iter()
+            .map(|(k, v)| {
+                vec![
+                    Value::Text(k),
+                    if as_text {
+                        member_text(v)
+                    } else {
+                        Value::Jsonb(v)
+                    },
+                ]
+            })
+            .collect(),
+            _ => Vec::new(),
+        }
+    } else {
+        let text = match args.first() {
+            Some(Value::Json(t) | Value::Text(t)) => t.clone(),
+            Some(Value::Jsonb(j)) => crate::json_text::jsonb_text(j),
+            _ => String::new(),
+        };
+        crate::json_text::object_members(&text)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(k, member)| {
+                vec![
+                    Value::Text(k),
+                    if as_text {
+                        crate::json_text::json_member_text(member)
+                    } else {
+                        Value::Json(member.trim().to_string())
+                    },
+                ]
+            })
+            .collect()
+    };
+    (types, rows)
+}
+
+/// `jsonb_to_record(doc) AS r(a int, ...)` (or `..._recordset` over an
+/// array of objects): each column the member of its name, as its type.
+fn json_to_record_rows(
+    args: &[Value],
+    spec: &TableFnSpec,
+    set: bool,
+) -> Result<(Vec<String>, Vec<Vec<Value>>)> {
+    if spec.column_types.is_empty() || spec.column_types.iter().any(Option::is_none) {
+        anyhow::bail!("a column definition list is required for functions returning \"record\"");
+    }
+    let types: Vec<String> = spec.column_types.iter().flatten().cloned().collect();
+    let doc = match args.first() {
+        Some(Value::Jsonb(j)) => Some(j.clone()),
+        Some(Value::Text(t) | Value::Json(t)) => crate::json_text::parse(t).ok(),
+        _ => None,
+    };
+    let objects = match (doc, set) {
+        (Some(serde_json::Value::Array(items)), true) => items,
+        (Some(obj @ serde_json::Value::Object(_)), false) => vec![obj],
+        (None, _) => Vec::new(),
+        (Some(_), true) => anyhow::bail!("cannot call json_to_recordset on a non-array"),
+        (Some(_), false) => anyhow::bail!("cannot call json_to_record on a non-object"),
+    };
+    let mut rows = Vec::new();
+    for object in objects {
+        let serde_json::Value::Object(map) = object else {
+            anyhow::bail!("argument of json_to_recordset must be an array of objects");
+        };
+        let mut row = Vec::with_capacity(types.len());
+        for (name, ty) in spec.column_aliases.iter().zip(&types) {
+            let value = match map.get(name) {
+                None | Some(serde_json::Value::Null) => Value::Null,
+                Some(v) if crate::value::is_json_type(ty) => {
+                    crate::planner::cast_value(Value::Text(v.to_string()), ty)
+                }
+                Some(serde_json::Value::String(s)) => {
+                    crate::planner::cast_value(Value::Text(s.clone()), ty)
+                }
+                Some(v) => {
+                    crate::planner::cast_value(Value::Text(crate::json_text::jsonb_text(v)), ty)
+                }
+            };
+            row.push(value);
+        }
+        rows.push(row);
+    }
+    Ok((types, rows))
+}
+
+/// `generate_subscripts(array, dim [, reverse])`: the subscripts of the
+/// array's `dim`th dimension, in order or reversed.
+fn generate_subscripts_rows(args: &[Value]) -> (Vec<String>, Vec<Vec<Value>>) {
+    let ty = vec!["INTEGER".to_string()];
+    let Some(Value::Array(items)) = args.first() else {
+        return (ty, Vec::new());
+    };
+    let dim = args.get(1).and_then(value_as_i64).unwrap_or(1);
+    let mut level = items.clone();
+    for _ in 1..dim {
+        level = match level.into_iter().next() {
+            Some(Value::Array(inner)) => inner,
+            _ => return (ty, Vec::new()),
+        };
+    }
+    if dim < 1 {
+        return (ty, Vec::new());
+    }
+    let mut subscripts: Vec<Vec<Value>> = (1..=level.len() as i64)
+        .map(|i| vec![Value::Int(i)])
+        .collect();
+    if matches!(args.get(2), Some(Value::Bool(true))) {
+        subscripts.reverse();
+    }
+    (ty, subscripts)
 }
 
 /// `string_to_table(string, delimiter [, null_string])`: a text row per

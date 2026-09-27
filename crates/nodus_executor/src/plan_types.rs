@@ -116,6 +116,10 @@ pub struct TableFnSpec {
     pub alias: Option<String>,
     /// Explicit column names from `AS alias(col[, ord])`.
     pub column_aliases: Vec<String>,
+    /// The types a column definition list gives them (`AS r(a int, b
+    /// text)`, for `jsonb_to_record`).
+    #[serde(default)]
+    pub column_types: Vec<Option<String>>,
     /// The arguments as expressions (`generate_series(1, n + 1)`), evaluated
     /// against the driving row; when present they replace `args`. Defaulted
     /// so older plans decode.
@@ -144,6 +148,9 @@ impl TableFnSpec {
                 | "regexp_split_to_table"
                 | "regexp_matches"
                 | "string_to_table"
+                | "generate_subscripts"
+                | "jsonb_object_keys"
+                | "json_object_keys"
                 | "pg_partition_ancestors" => true,
                 _ => false,
             }

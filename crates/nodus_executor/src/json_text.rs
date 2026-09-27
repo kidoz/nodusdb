@@ -12,7 +12,7 @@ pub(crate) fn parse(text: &str) -> Result<J, String> {
 }
 
 /// `jsonb`'s order of object keys: shorter keys first, then bytewise.
-fn key_order(a: &str, b: &str) -> Ordering {
+pub(crate) fn key_order(a: &str, b: &str) -> Ordering {
     a.len()
         .cmp(&b.len())
         .then_with(|| a.as_bytes().cmp(b.as_bytes()))
