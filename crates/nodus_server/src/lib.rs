@@ -361,6 +361,12 @@ pub async fn run_server_with_config(
 ) -> anyhow::Result<ServerHandle> {
     let pgwire_addr = pgwire_listener.local_addr()?;
     let http_addr = http_listener.local_addr()?;
+    // Sessions report the server's own port and connection limit.
+    nodus_executor::set_server_setting("port", &pgwire_addr.port().to_string());
+    nodus_executor::set_server_setting(
+        "max_connections",
+        &config.server.max_connections.to_string(),
+    );
 
     let state = Arc::new(AppState::default());
     state

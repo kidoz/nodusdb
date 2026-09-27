@@ -1,0 +1,144 @@
+# Catalog views tools read: pg_settings, pg_proc, pg_type categories, pg_views, pg_matviews, pg_sequences, pg_stat_user_tables, information_schema.views, sequences, and schemata.
+statement ok
+CREATE TABLE cat14 (id int PRIMARY KEY, name text UNIQUE, v numeric(10,2) DEFAULT 0);
+
+statement ok
+CREATE VIEW cat14v AS SELECT id, name FROM cat14;
+
+statement ok
+CREATE MATERIALIZED VIEW cat14m AS SELECT id FROM cat14;
+
+statement ok
+CREATE SEQUENCE cat14s START 3;
+
+statement ok
+CREATE TABLE cat14i (id int GENERATED ALWAYS AS IDENTITY, s serial);
+
+query TT
+SELECT name, setting FROM pg_settings WHERE name IN ('server_encoding', 'DateStyle', 'TimeZone', 'work_mem', 'shared_buffers', 'standard_conforming_strings') ORDER BY 1;
+----
+DateStyle	ISO, MDY
+TimeZone	UTC
+server_encoding	UTF8
+shared_buffers	16384
+standard_conforming_strings	on
+work_mem	4096
+
+query TTT
+SELECT name, vartype, context FROM pg_settings WHERE name IN ('search_path', 'work_mem', 'enable_seqscan') ORDER BY 1;
+----
+enable_seqscan	bool	user
+search_path	string	user
+work_mem	integer	user
+
+query T
+SELECT count(*) > 300 FROM pg_settings;
+----
+t
+
+query TTT
+SELECT current_setting('search_path'), current_schemas(false), current_schemas(true);
+----
+"$user", public	{public}	{pg_catalog,public}
+
+query TTTT
+SELECT proname, pronargs, prokind, proretset FROM pg_proc WHERE proname IN ('now', 'length', 'upper', 'generate_series', 'count') ORDER BY 1, 2, 3;
+----
+count	0	a	f
+count	1	a	f
+generate_series	2	f	t
+generate_series	2	f	t
+generate_series	2	f	t
+generate_series	3	f	t
+generate_series	3	f	t
+generate_series	3	f	t
+generate_series	3	f	t
+generate_series	3	f	t
+generate_series	4	f	t
+length	1	f	f
+length	1	f	f
+length	1	f	f
+length	1	f	f
+length	1	f	f
+length	1	f	f
+length	1	f	f
+length	2	f	f
+now	0	f	f
+upper	1	f	f
+upper	1	f	f
+upper	1	f	f
+
+query T
+SELECT count(*) > 100 FROM pg_proc;
+----
+t
+
+query TTTT
+SELECT typname, typtype, typcategory, typispreferred FROM pg_type WHERE typname IN ('int4', 'text', 'numeric', 'bool', '_int4', 'timestamptz', 'date', 'bytea') ORDER BY 1;
+----
+_int4	b	A	f
+bool	b	B	t
+bytea	b	U	f
+date	b	D	f
+int4	b	N	f
+numeric	b	N	f
+text	b	S	t
+timestamptz	b	D	t
+
+query TT
+SELECT schemaname, viewname FROM pg_views WHERE viewname = 'cat14v';
+----
+public	cat14v
+
+query TTT
+SELECT schemaname, matviewname, ispopulated FROM pg_matviews WHERE matviewname = 'cat14m';
+----
+public	cat14m	t
+
+query TTTTT
+SELECT sequencename, data_type, start_value, increment_by, last_value FROM pg_sequences WHERE sequencename LIKE 'cat14%' ORDER BY 1;
+----
+cat14i_id_seq	integer	1	1	NULL
+cat14i_s_seq	integer	1	1	NULL
+cat14s	bigint	3	1	NULL
+
+query TT
+SELECT nextval('cat14s'), (SELECT last_value FROM pg_sequences WHERE sequencename = 'cat14s');
+----
+3	3
+
+query TTT
+SELECT relname, n_live_tup >= 0, seq_scan >= 0 FROM pg_stat_user_tables WHERE relname LIKE 'cat14%' ORDER BY 1;
+----
+cat14	t	t
+cat14i	t	t
+cat14m	t	t
+
+query TTT
+SELECT table_name, view_definition IS NOT NULL, check_option FROM information_schema.views WHERE table_name = 'cat14v';
+----
+cat14v	t	NONE
+
+query TTTTT
+SELECT sequence_name, data_type, start_value, increment, cycle_option FROM information_schema.sequences WHERE sequence_name LIKE 'cat14%' ORDER BY 1;
+----
+cat14i_s_seq	integer	1	1	NO
+cat14s	bigint	3	1	NO
+
+query T
+SELECT schema_name FROM information_schema.schemata WHERE schema_name IN ('public', 'pg_catalog', 'information_schema') ORDER BY 1;
+----
+information_schema
+pg_catalog
+public
+
+query T
+SELECT tablename FROM pg_tables WHERE tablename LIKE 'cat14%' ORDER BY 1;
+----
+cat14
+cat14i
+
+query T
+SELECT inet_server_port() > 0;
+----
+t

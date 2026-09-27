@@ -85,10 +85,11 @@ pub(crate) fn setting_info(name: &str) -> Option<&'static SettingInfo> {
 /// NodusDB's own for the few it models, else PostgreSQL's. `None` for a
 /// name that is no setting.
 pub(crate) fn default_session_var(lower_name: &str) -> Option<&'static str> {
+    if let Some(value) = server_setting(lower_name) {
+        return Some(value);
+    }
     Some(match lower_name {
-        // NodusDB resolves unqualified names in a single `public` schema today,
-        // so the effective search path is just `public` (not `"$user", public`).
-        "search_path" => "public",
+        "search_path" => "\"$user\", public",
         "application_name" => "",
         "client_encoding" => "UTF8",
         "datestyle" => "ISO, MDY",
@@ -109,6 +110,29 @@ pub(crate) fn default_session_var(lower_name: &str) -> Option<&'static str> {
         "statement_timeout" => "0",
         _ => return setting_info(lower_name).map(|s| s.show),
     })
+}
+
+/// Settings the server itself decides (`port`, `max_connections`), set
+/// once at startup.
+static SERVER_SETTINGS: std::sync::Mutex<Vec<(String, &'static str)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Records a setting the server decides, which every session reports.
+pub fn set_server_setting(name: &str, value: &str) {
+    let key = name.to_ascii_lowercase();
+    let value: &'static str = Box::leak(value.to_string().into_boxed_str());
+    let mut settings = SERVER_SETTINGS.lock().unwrap_or_else(|e| e.into_inner());
+    settings.retain(|(k, _)| *k != key);
+    settings.push((key, value));
+}
+
+fn server_setting(lower_name: &str) -> Option<&'static str> {
+    SERVER_SETTINGS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|(k, _)| k == lower_name)
+        .map(|(_, v)| *v)
 }
 
 /// What a `SET` does to a setting.
@@ -314,7 +338,10 @@ mod tests {
 
     #[test]
     fn known_defaults_resolve() {
-        assert_eq!(default_session_var("search_path"), Some("public"));
+        assert_eq!(
+            default_session_var("search_path"),
+            Some("\"$user\", public")
+        );
         assert_eq!(default_session_var("client_encoding"), Some("UTF8"));
         assert_eq!(
             default_session_var("default_transaction_read_only"),

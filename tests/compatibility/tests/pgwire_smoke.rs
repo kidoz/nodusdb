@@ -437,7 +437,7 @@ async fn test_startup_parameters_and_ready_state_basics() {
     let rows = client.query("SHOW search_path", &[]).await.unwrap();
     assert_eq!(rows.len(), 1);
     let search_path: &str = rows[0].get(0);
-    assert_eq!(search_path, "public");
+    assert_eq!(search_path, "\"$user\", public");
 
     client.simple_query("BEGIN").await.unwrap();
     client.simple_query("SELECT 1").await.unwrap();
@@ -863,7 +863,7 @@ async fn test_pgwire_queries() {
     // SHOW search_path
     let rows = client.simple_query("SHOW search_path;").await.unwrap();
     if let tokio_postgres::SimpleQueryMessage::Row(row) = &rows[1] {
-        assert_eq!(row.get(0).unwrap(), "public");
+        assert_eq!(row.get(0).unwrap(), "\"$user\", public");
     } else {
         panic!("Expected a row");
     }
@@ -912,7 +912,10 @@ async fn test_session_variables_persist_and_reset() {
     let client = connect(&server).await;
 
     // Defaults before any SET.
-    assert_eq!(show_value(&client, "SHOW search_path").await, "public");
+    assert_eq!(
+        show_value(&client, "SHOW search_path").await,
+        "\"$user\", public"
+    );
     assert_eq!(show_value(&client, "SHOW client_encoding").await, "UTF8");
     assert_eq!(show_value(&client, "SHOW application_name").await, "");
 
@@ -937,7 +940,10 @@ async fn test_session_variables_persist_and_reset() {
         .simple_query("SET search_path = DEFAULT")
         .await
         .unwrap();
-    assert_eq!(show_value(&client, "SHOW search_path").await, "public");
+    assert_eq!(
+        show_value(&client, "SHOW search_path").await,
+        "\"$user\", public"
+    );
 
     // The SQL-standard `SET TIME ZONE <x>` spelling persists like `SET timezone`.
     client

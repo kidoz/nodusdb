@@ -38,6 +38,108 @@ impl MemExecutor {
             }
             "indexes" => Some(self.information_schema_indexes(db_name, &schemas, &tables)),
             "schemata" => Some(self.information_schema_schemata(db_name, &schemas)),
+            "views" => {
+                let rows = tables
+                    .iter()
+                    .filter(|t| t.view_query.is_some())
+                    .map(|t| {
+                        let schema = Self::schema_name_by_id(db_name, &schemas, t.schema_id);
+                        vec![
+                            Value::Text(db_name.into()),
+                            Value::Text(schema),
+                            Value::Text(t.name.clone()),
+                            crate::pg_catalog::catalog_view_definition(t)
+                                .map_or(Value::Null, Value::Text),
+                            Value::Text("NONE".into()),
+                            Value::Text("NO".into()),
+                            Value::Text("NO".into()),
+                            Value::Text("NO".into()),
+                            Value::Text("NO".into()),
+                            Value::Text("NO".into()),
+                        ]
+                    })
+                    .collect();
+                Some((
+                    Self::virtual_columns(&[
+                        ("table_catalog", "TEXT"),
+                        ("table_schema", "TEXT"),
+                        ("table_name", "TEXT"),
+                        ("view_definition", "TEXT"),
+                        ("check_option", "TEXT"),
+                        ("is_updatable", "TEXT"),
+                        ("is_insertable_into", "TEXT"),
+                        ("is_trigger_updatable", "TEXT"),
+                        ("is_trigger_deletable", "TEXT"),
+                        ("is_trigger_insertable_into", "TEXT"),
+                    ]),
+                    rows,
+                ))
+            }
+            "sequences" => {
+                // Identity columns' sequences are theirs alone and not listed.
+                let identity: std::collections::HashSet<String> = tables
+                    .iter()
+                    .flat_map(|t| {
+                        t.columns.iter().filter_map(move |c| {
+                            crate::MemExecutor::column_default(c)
+                                .filter(|d| crate::sequences::identity_kind(d).is_some())
+                                .map(|_| crate::sequences::owned_sequence_name(&t.name, &c.name))
+                        })
+                    })
+                    .collect();
+                let mut rows = Vec::new();
+                for table in tables
+                    .iter()
+                    .filter(|t| crate::sequences::is_sequence(t) && !identity.contains(&t.name))
+                {
+                    let Some(state) = self
+                        .scan_rows(table.id, "")
+                        .ok()
+                        .and_then(|rows| rows.into_iter().next())
+                        .and_then(|row| crate::sequences::SequenceState::from_row(&row).ok())
+                    else {
+                        continue;
+                    };
+                    let data_type =
+                        crate::functions::format_type_name(Self::pg_type_oid(&state.data_type));
+                    let precision = match data_type.as_str() {
+                        "smallint" => 16,
+                        "integer" => 32,
+                        _ => 64,
+                    };
+                    rows.push(vec![
+                        Value::Text(db_name.into()),
+                        Value::Text(Self::schema_name_by_id(db_name, &schemas, table.schema_id)),
+                        Value::Text(table.name.clone()),
+                        Value::Text(data_type),
+                        Value::Int(precision),
+                        Value::Int(2),
+                        Value::Int(0),
+                        Value::Text(state.start.to_string()),
+                        Value::Text(state.min.to_string()),
+                        Value::Text(state.max.to_string()),
+                        Value::Text(state.increment.to_string()),
+                        Value::Text(if state.cycle { "YES" } else { "NO" }.into()),
+                    ]);
+                }
+                Some((
+                    Self::virtual_columns(&[
+                        ("sequence_catalog", "TEXT"),
+                        ("sequence_schema", "TEXT"),
+                        ("sequence_name", "TEXT"),
+                        ("data_type", "TEXT"),
+                        ("numeric_precision", "INT"),
+                        ("numeric_precision_radix", "INT"),
+                        ("numeric_scale", "INT"),
+                        ("start_value", "TEXT"),
+                        ("minimum_value", "TEXT"),
+                        ("maximum_value", "TEXT"),
+                        ("increment", "TEXT"),
+                        ("cycle_option", "TEXT"),
+                    ]),
+                    rows,
+                ))
+            }
             _ => None,
         };
         Ok(result)
@@ -556,12 +658,19 @@ impl MemExecutor {
             ("default_character_set_name", "TEXT"),
             ("sql_path", "TEXT"),
         ]);
-        let rows = schemas
-            .iter()
-            .map(|schema| {
+        // The system schemas too, as a superuser sees them.
+        let mut names: Vec<String> = schemas.iter().map(|s| s.name.clone()).collect();
+        for system in ["pg_catalog", "information_schema", "pg_toast"] {
+            if !names.iter().any(|n| n == system) {
+                names.push(system.to_string());
+            }
+        }
+        let rows = names
+            .into_iter()
+            .map(|name| {
                 vec![
                     Value::Text(db_name.into()),
-                    Value::Text(schema.name.clone()),
+                    Value::Text(name),
                     Value::Text("nodus".into()),
                     Value::Null,
                     Value::Null,

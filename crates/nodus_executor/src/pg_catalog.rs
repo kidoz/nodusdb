@@ -490,38 +490,68 @@ impl MemExecutor {
                     ("proconfig", "TEXT[]"),
                     ("proacl", "TEXT[]"),
                 ]),
-                vec![vec![
-                    Value::Int(750),
-                    Value::Text("array_recv".into()),
-                    Value::Int(Self::schema_oid(db_name, "pg_catalog")),
-                    Value::Int(10),
-                    Value::Int(12),
-                    Value::Float(1.0),
-                    Value::Float(0.0),
-                    Value::Int(0),
-                    Value::Int(0),
-                    Value::Text("f".into()),
-                    Value::Bool(false),
-                    Value::Bool(false),
-                    Value::Bool(false),
-                    Value::Bool(false),
-                    Value::Text("i".into()),
-                    Value::Text("s".into()),
-                    Value::Int(0),
-                    Value::Int(0),
-                    Value::Int(0),
-                    Value::Array(Vec::new()),
-                    Value::Null,
-                    Value::Null,
-                    Value::Null,
-                    Value::Null,
-                    Value::Null,
-                    Value::Text("array_recv".into()),
-                    Value::Null,
-                    Value::Null,
-                    Value::Null,
-                    Value::Null,
-                ]],
+                // PostgreSQL's rows for the built-in functions NodusDB
+                // implements (generated from PostgreSQL 18's `pg_proc`).
+                include_str!("pg_proc.tsv")
+                    .lines()
+                    .filter_map(|line| {
+                        let f: Vec<&str> = line.split('\t').collect();
+                        let [
+                            oid,
+                            name,
+                            kind,
+                            nargs,
+                            rettype,
+                            argtypes,
+                            retset,
+                            volatile,
+                            strict,
+                            variadic,
+                            ndefaults,
+                        ] = f[..]
+                        else {
+                            return None;
+                        };
+                        let int = |s: &str| s.parse::<i64>().unwrap_or(0);
+                        let flag = |s: &str| Value::Bool(s == "t");
+                        let argtypes: Vec<Value> = argtypes
+                            .split_whitespace()
+                            .map(|t| Value::Int(int(t)))
+                            .collect();
+                        Some(vec![
+                            Value::Int(int(oid)),
+                            Value::Text(name.into()),
+                            Value::Int(Self::schema_oid(db_name, "pg_catalog")),
+                            Value::Int(10),
+                            Value::Int(12),
+                            Value::Float(1.0),
+                            Value::Float(if retset == "t" { 1000.0 } else { 0.0 }),
+                            Value::Int(int(variadic)),
+                            Value::Int(0),
+                            Value::Text(kind.into()),
+                            Value::Bool(false),
+                            Value::Bool(false),
+                            flag(strict),
+                            flag(retset),
+                            Value::Text(volatile.into()),
+                            Value::Text("s".into()),
+                            Value::Int(int(nargs)),
+                            Value::Int(int(ndefaults)),
+                            Value::Int(int(rettype)),
+                            Value::Array(argtypes),
+                            Value::Null,
+                            Value::Null,
+                            Value::Null,
+                            Value::Null,
+                            Value::Null,
+                            Value::Text(name.into()),
+                            Value::Null,
+                            Value::Null,
+                            Value::Null,
+                            Value::Null,
+                        ])
+                    })
+                    .collect(),
             )),
             "pg_range" => Some((
                 Self::virtual_columns(&[
@@ -539,6 +569,160 @@ impl MemExecutor {
             "pg_roles" => Some(self.pg_roles_virtual_table()),
             "pg_user" => Some(self.pg_user_virtual_table()),
             "pg_tables" => Some(self.pg_tables_virtual_table(db_name, &schemas, &tables)),
+            "pg_views" | "pg_matviews" => {
+                let materialized = table_only.eq_ignore_ascii_case("pg_matviews");
+                let (name_col, owner_col) = if materialized {
+                    ("matviewname", "matviewowner")
+                } else {
+                    ("viewname", "viewowner")
+                };
+                let mut columns = vec![
+                    ("schemaname", "NAME"),
+                    (name_col, "NAME"),
+                    (owner_col, "NAME"),
+                ];
+                if materialized {
+                    columns.extend([
+                        ("tablespace", "NAME"),
+                        ("hasindexes", "BOOL"),
+                        ("ispopulated", "BOOL"),
+                    ]);
+                }
+                columns.push(("definition", "TEXT"));
+                let rows = tables
+                    .iter()
+                    .filter(|t| {
+                        if materialized {
+                            t.materialized_query.is_some()
+                        } else {
+                            t.view_query.is_some()
+                        }
+                    })
+                    .map(|t| {
+                        let schema_name = Self::schema_name_by_id(db_name, &schemas, t.schema_id);
+                        let definition = catalog_view_definition(t);
+                        let mut row = vec![
+                            Value::Text(schema_name),
+                            Value::Text(t.name.clone()),
+                            Value::Text("nodus".into()),
+                        ];
+                        if materialized {
+                            row.extend([
+                                Value::Null,
+                                Value::Bool(!t.indexes.is_empty()),
+                                Value::Bool(true),
+                            ]);
+                        }
+                        row.push(definition.map_or(Value::Null, Value::Text));
+                        row
+                    })
+                    .collect();
+                Some((Self::virtual_columns(&columns), rows))
+            }
+            "pg_sequences" => {
+                let mut rows = Vec::new();
+                for table in tables.iter().filter(|t| crate::sequences::is_sequence(t)) {
+                    let Some(state) = self
+                        .scan_rows(table.id, "")
+                        .ok()
+                        .and_then(|rows| rows.into_iter().next())
+                        .and_then(|row| crate::sequences::SequenceState::from_row(&row).ok())
+                    else {
+                        continue;
+                    };
+                    rows.push(vec![
+                        Value::Text(Self::schema_name_by_id(db_name, &schemas, table.schema_id)),
+                        Value::Text(table.name.clone()),
+                        Value::Text("nodus".into()),
+                        Value::Text(crate::functions::format_type_name(Self::pg_type_oid(
+                            &state.data_type,
+                        ))),
+                        Value::Int(state.start),
+                        Value::Int(state.min),
+                        Value::Int(state.max),
+                        Value::Int(state.increment),
+                        Value::Bool(state.cycle),
+                        Value::Int(state.cache),
+                        if state.is_called {
+                            Value::Int(state.last_value)
+                        } else {
+                            Value::Null
+                        },
+                    ]);
+                }
+                Some((
+                    Self::virtual_columns(&[
+                        ("schemaname", "NAME"),
+                        ("sequencename", "NAME"),
+                        ("sequenceowner", "NAME"),
+                        ("data_type", "REGTYPE"),
+                        ("start_value", "INT8"),
+                        ("min_value", "INT8"),
+                        ("max_value", "INT8"),
+                        ("increment_by", "INT8"),
+                        ("cycle", "BOOL"),
+                        ("cache_size", "INT8"),
+                        ("last_value", "INT8"),
+                    ]),
+                    rows,
+                ))
+            }
+            // Activity counters: NodusDB keeps none, so they read as a table
+            // no one has touched since statistics were reset.
+            "pg_stat_user_tables" | "pg_stat_all_tables" => {
+                let counters = [
+                    "seq_scan",
+                    "seq_tup_read",
+                    "idx_scan",
+                    "idx_tup_fetch",
+                    "n_tup_ins",
+                    "n_tup_upd",
+                    "n_tup_del",
+                    "n_tup_hot_upd",
+                    "n_tup_newpage_upd",
+                    "n_live_tup",
+                    "n_dead_tup",
+                    "n_mod_since_analyze",
+                    "n_ins_since_vacuum",
+                ];
+                let times = [
+                    "last_vacuum",
+                    "last_autovacuum",
+                    "last_analyze",
+                    "last_autoanalyze",
+                ];
+                let counts = [
+                    "vacuum_count",
+                    "autovacuum_count",
+                    "analyze_count",
+                    "autoanalyze_count",
+                ];
+                let mut columns = vec![
+                    ("relid", "OID"),
+                    ("schemaname", "NAME"),
+                    ("relname", "NAME"),
+                ];
+                columns.extend(counters.iter().map(|c| (*c, "INT8")));
+                columns.extend(times.iter().map(|c| (*c, "TIMESTAMPTZ")));
+                columns.extend(counts.iter().map(|c| (*c, "INT8")));
+                let rows = tables
+                    .iter()
+                    .filter(|t| t.view_query.is_none() && !crate::sequences::is_sequence(t))
+                    .map(|t| {
+                        let schema_name = Self::schema_name_by_id(db_name, &schemas, t.schema_id);
+                        let mut row = vec![
+                            Value::Int(Self::table_oid(db_name, &schema_name, &t.name)),
+                            Value::Text(schema_name),
+                            Value::Text(t.name.clone()),
+                        ];
+                        row.extend(counters.iter().map(|_| Value::Int(0)));
+                        row.extend(times.iter().map(|_| Value::Null));
+                        row.extend(counts.iter().map(|_| Value::Int(0)));
+                        row
+                    })
+                    .collect();
+                Some((Self::virtual_columns(&columns), rows))
+            }
             "pg_indexes" => Some(self.pg_indexes_virtual_table(db_name, &schemas, &tables)),
             "pg_attrdef" => {
                 let mut rows = Vec::new();
@@ -1467,6 +1651,17 @@ impl MemExecutor {
             (3802, "jsonb", -1, 3807, "_jsonb"),
         ];
         let mut rows = Vec::new();
+        // PostgreSQL's type categories, and each category's preferred type.
+        let category = |oid: i64| match oid {
+            16 => "B",
+            18 => "Z",
+            19 | 25 | 1042 | 1043 => "S",
+            20 | 21 | 23 | 26 | 700 | 701 | 1700 | 2206 => "N",
+            1082 | 1083 | 1114 | 1184 => "D",
+            1560 | 1562 => "V",
+            _ => "U",
+        };
+        let preferred = |oid: i64| matches!(oid, 16 | 25 | 26 | 701 | 1184 | 1562);
         for (oid, name, len, array, _) in type_specs {
             rows.push(vec![
                 Value::Int(oid),
@@ -1476,8 +1671,8 @@ impl MemExecutor {
                 Value::Int(len),
                 Value::Bool(matches!(len, 1 | 2 | 4 | 8)),
                 Value::Text("b".into()),
-                Value::Text("U".into()),
-                Value::Bool(false),
+                Value::Text(category(oid).into()),
+                Value::Bool(preferred(oid)),
                 Value::Bool(true),
                 Value::Text(",".into()),
                 Value::Int(0),
@@ -1510,7 +1705,7 @@ impl MemExecutor {
                 Value::Int(10),
                 Value::Int(-1),
                 Value::Bool(false),
-                Value::Text("a".into()),
+                Value::Text("b".into()),
                 Value::Text("A".into()),
                 Value::Bool(false),
                 Value::Bool(true),
@@ -1560,38 +1755,45 @@ impl MemExecutor {
             ("sourceline", "INT"),
             ("pending_restart", "BOOL"),
         ]);
-        let settings = [
-            ("application_name", "", "string"),
-            ("client_encoding", "UTF8", "string"),
-            ("DateStyle", "ISO, MDY", "string"),
-            ("integer_datetimes", "on", "bool"),
-            ("IntervalStyle", "postgres", "string"),
-            ("is_superuser", "on", "bool"),
-            ("server_encoding", "UTF8", "string"),
-            ("server_version", "18.0", "string"),
-            ("server_version_num", "180000", "integer"),
-            ("standard_conforming_strings", "on", "bool"),
-            ("statement_timeout", "0", "integer"),
-            ("TimeZone", "UTC", "string"),
-        ];
-        let rows = settings
-            .into_iter()
-            .map(|(name, setting, vartype)| {
+        // Every setting, with the session's value.
+        let text = |s: &str| {
+            if s.is_empty() {
+                Value::Null
+            } else {
+                Value::Text(s.to_string())
+            }
+        };
+        let rows = crate::session_vars::settings_table()
+            .iter()
+            .map(|info| {
+                let key = info.name.to_ascii_lowercase();
+                // In the setting's unit, as `setting` shows it; a changed
+                // one as it was given.
+                let value = match crate::session_env::setting(&key) {
+                    Some(v) if v != info.show => v,
+                    _ => info.setting.to_string(),
+                };
+                let enumvals = if info.enumvals.is_empty() {
+                    Value::Null
+                } else {
+                    crate::value::parse_array_literal(info.enumvals)
+                        .map_or(Value::Null, Value::Array)
+                };
                 vec![
-                    Value::Text(name.into()),
-                    Value::Text(setting.into()),
+                    Value::Text(info.name.into()),
+                    Value::Text(value.clone()),
+                    text(info.unit),
+                    text(info.category),
+                    text(info.short_desc),
                     Value::Null,
-                    Value::Text("Client Connection Defaults".into()),
-                    Value::Text(name.into()),
-                    Value::Null,
-                    Value::Text("user".into()),
-                    Value::Text(vartype.into()),
+                    Value::Text(info.context.into()),
+                    Value::Text(info.vartype.into()),
                     Value::Text("default".into()),
-                    Value::Null,
-                    Value::Null,
-                    Value::Null,
-                    Value::Text(setting.into()),
-                    Value::Text(setting.into()),
+                    text(info.min_val),
+                    text(info.max_val),
+                    enumvals,
+                    text(info.boot_val),
+                    Value::Text(value),
                     Value::Null,
                     Value::Null,
                     Value::Bool(false),
@@ -1677,9 +1879,14 @@ impl MemExecutor {
             ("hastriggers", "BOOL"),
             ("rowsecurity", "BOOL"),
         ]);
+        // Tables only: no views, materialized views, or sequences.
         let rows = tables
             .iter()
-            .filter(|table| table.view_query.is_none())
+            .filter(|table| {
+                table.view_query.is_none()
+                    && table.materialized_query.is_none()
+                    && !crate::sequences::is_sequence(table)
+            })
             .map(|table| {
                 vec![
                     Value::Text(Self::schema_name_by_id(db_name, schemas, table.schema_id)),
@@ -2557,4 +2764,14 @@ fn referential_action_sql(action: nodus_catalog::ReferentialAction) -> Option<&'
         A::SetNull => Some("SET NULL"),
         A::SetDefault => Some("SET DEFAULT"),
     }
+}
+
+/// A view's (or materialized view's) query as `pg_get_viewdef` shows it.
+pub(crate) fn catalog_view_definition(view: &nodus_catalog::TableDescriptor) -> Option<String> {
+    let query = view
+        .view_query
+        .as_deref()
+        .or(view.materialized_query.as_deref())?;
+    let plan: crate::LogicalPlan = serde_json::from_str(query).ok()?;
+    crate::explain::deparse_query(&plan).map(|sql| format!("{sql};"))
 }

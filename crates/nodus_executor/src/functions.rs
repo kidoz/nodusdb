@@ -2298,13 +2298,13 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
             10 => "nodus".to_string(),
             oid => format!("unknown (OID={oid})"),
         }),
+        // The port the server listens on (its `port` setting).
+        "INET_SERVER_PORT" if arity(0) => session_env::setting("port")
+            .and_then(|p| p.parse().ok())
+            .map_or(Value::Null, Value::Int),
         // Connections are not described to the executor; PostgreSQL reports
         // NULL the same way for a Unix-socket connection.
-        "INET_SERVER_ADDR" | "INET_SERVER_PORT" | "INET_CLIENT_ADDR" | "INET_CLIENT_PORT"
-            if arity(0) =>
-        {
-            Value::Null
-        }
+        "INET_SERVER_ADDR" | "INET_CLIENT_ADDR" | "INET_CLIENT_PORT" if arity(0) => Value::Null,
         // NodusDB has no COMMENT ON, so no object has a description.
         // Only relations and their columns take comments.
         "OBJ_DESCRIPTION" if arity(1) || arity(2) => {

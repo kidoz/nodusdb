@@ -211,7 +211,7 @@ async fn test_full_pg_client_coverage() {
     let rows = client.query("SHOW search_path", &[]).await.unwrap();
     assert_eq!(rows.len(), 1);
     let path: &str = rows[0].get(0);
-    assert_eq!(path, "public");
+    assert_eq!(path, "\"$user\", public");
 
     // Clean up (may fail if DROP TABLE is unsupported, which is fine)
     let _ = client.execute("DROP TABLE employees", &[]).await;

@@ -1,0 +1,690 @@
+89	version	f	0	25		f	s	t	0	0
+274	timeofday	f	0	25		f	v	t	0	0
+320	width_bucket	f	4	23	701 701 701 23	f	i	t	0	0
+376	string_to_array	f	3	1009	25 25 25	f	i	f	0	0
+378	array_append	f	2	5078	5078 5077	f	i	f	0	0
+379	array_prepend	f	2	5078	5077 5078	f	i	f	0	0
+383	array_cat	f	2	5078	5078 5078	f	i	f	0	0
+384	array_to_string	f	3	25	2277 25 25	f	s	f	0	0
+394	string_to_array	f	2	1009	25 25	f	i	f	0	0
+395	array_to_string	f	2	25	2277 25	f	s	t	0	0
+438	num_nulls	f	1	23	2276	f	i	f	2276	0
+440	num_nonnulls	f	1	23	2276	f	i	f	2276	0
+720	octet_length	f	1	23	17	f	i	t	0	0
+721	get_byte	f	2	23	17 23	f	i	t	0	0
+722	set_byte	f	3	17	17 23 23	f	i	t	0	0
+723	get_bit	f	2	23	17 20	f	i	t	0	0
+724	set_bit	f	3	17	17 20 23	f	i	t	0	0
+745	current_user	f	0	19		f	s	t	0	0
+746	session_user	f	0	19		f	s	t	0	0
+747	array_dims	f	1	25	2277	f	i	t	0	0
+748	array_ndims	f	1	23	2277	f	i	t	0	0
+749	overlay	f	4	17	17 17 23 23	f	i	t	0	0
+750	array_in	f	3	2277	2275 26 23	f	s	t	0	0
+751	array_out	f	1	2275	2277	f	s	t	0	0
+752	overlay	f	3	17	17 17 23	f	i	t	0	0
+753	trunc	f	1	829	829	f	i	t	0	0
+810	pg_client_encoding	f	0	19		f	s	t	0	0
+861	current_database	f	0	19		f	s	t	0	0
+868	strpos	f	2	23	25 25	f	i	t	0	0
+870	lower	f	1	25	25	f	i	t	0	0
+871	upper	f	1	25	25	f	i	t	0	0
+872	initcap	f	1	25	25	f	i	t	0	0
+873	lpad	f	3	25	25 23 25	f	i	t	0	0
+874	rpad	f	3	25	25 23 25	f	i	t	0	0
+875	ltrim	f	2	25	25 25	f	i	t	0	0
+876	rtrim	f	2	25	25 25	f	i	t	0	0
+877	substr	f	3	25	25 23 23	f	i	t	0	0
+878	translate	f	3	25	25 25 25	f	i	t	0	0
+879	lpad	f	2	25	25 23	f	i	t	0	0
+880	rpad	f	2	25	25 23	f	i	t	0	0
+881	ltrim	f	1	25	25	f	i	t	0	0
+882	rtrim	f	1	25	25	f	i	t	0	0
+883	substr	f	2	25	25 23	f	i	t	0	0
+884	btrim	f	2	25	25 25	f	i	t	0	0
+885	btrim	f	1	25	25	f	i	t	0	0
+936	substring	f	3	25	25 23 23	f	i	t	0	0
+937	substring	f	2	25	25 23	f	i	t	0	0
+938	generate_series	f	3	1114	1114 1114 1186	t	i	t	0	0
+939	generate_series	f	3	1184	1184 1184 1186	t	s	t	0	0
+940	mod	f	2	21	21 21	f	i	t	0	0
+941	mod	f	2	23	23 23	f	i	t	0	0
+947	mod	f	2	20	20 20	f	i	t	0	0
+1026	timezone	f	2	1114	1186 1184	f	i	t	0	0
+1066	generate_series	f	3	23	23 23 23	t	i	t	0	0
+1067	generate_series	f	2	23	23 23	t	i	t	0	0
+1068	generate_series	f	3	20	20 20 20	t	i	t	0	0
+1069	generate_series	f	2	20	20 20	t	i	t	0	0
+1081	format_type	f	2	25	26 23	f	s	f	0	0
+1158	to_timestamp	f	1	1184	701	f	i	t	0	0
+1159	timezone	f	2	1114	25 1184	f	i	t	0	0
+1171	date_part	f	2	701	25 1184	f	s	t	0	0
+1172	date_part	f	2	701	25 1186	f	i	t	0	0
+1175	justify_hours	f	1	1186	1186	f	i	t	0	0
+1181	age	f	1	23	28	f	s	t	0	0
+1191	generate_subscripts	f	3	23	2277 23 16	t	i	t	0	0
+1192	generate_subscripts	f	2	23	2277 23	t	i	t	0	0
+1193	array_fill	f	2	2277	2283 1007	f	i	f	0	0
+1194	log10	f	1	701	701	f	i	t	0	0
+1199	age	f	2	1186	1184 1184	f	i	t	0	0
+1215	obj_description	f	2	25	26 19	f	s	t	0	0
+1216	col_description	f	2	25	26 23	f	s	t	0	0
+1217	date_trunc	f	2	1184	25 1184	f	s	t	0	0
+1218	date_trunc	f	2	1186	25 1186	f	i	t	0	0
+1269	pg_column_size	f	1	23	2276	f	s	t	0	0
+1271	overlaps	f	4	16	1266 1266 1266 1266	f	i	f	0	0
+1273	date_part	f	2	701	25 1266	f	i	t	0	0
+1282	quote_ident	f	1	25	25	f	i	t	0	0
+1283	quote_literal	f	1	25	25	f	i	t	0	0
+1284	date_trunc	f	3	1184	25 1184 25	f	i	t	0	0
+1285	quote_literal	f	1	25	2283	f	s	t	0	0
+1286	array_fill	f	3	2277	2283 1007 1007	f	i	f	0	0
+1289	quote_nullable	f	1	25	25	f	i	f	0	0
+1290	quote_nullable	f	1	25	2283	f	s	f	0	0
+1293	unnest	f	1	3831	4537	t	i	t	0	0
+1295	justify_days	f	1	1186	1186	f	i	t	0	0
+1299	now	f	0	1184		f	s	t	0	0
+1304	overlaps	f	4	16	1184 1184 1184 1184	f	i	f	0	0
+1305	overlaps	f	4	16	1184 1186 1184 1186	f	s	f	0	0
+1306	overlaps	f	4	16	1184 1184 1184 1186	f	s	f	0	0
+1307	overlaps	f	4	16	1184 1186 1184 1184	f	s	f	0	0
+1308	overlaps	f	4	16	1083 1083 1083 1083	f	i	f	0	0
+1309	overlaps	f	4	16	1083 1186 1083 1186	f	i	f	0	0
+1310	overlaps	f	4	16	1083 1083 1083 1186	f	i	f	0	0
+1311	overlaps	f	4	16	1083 1186 1083 1083	f	i	f	0	0
+1317	length	f	1	23	25	f	i	t	0	0
+1318	length	f	1	23	1042	f	i	t	0	0
+1340	log	f	1	701	701	f	i	t	0	0
+1341	ln	f	1	701	701	f	i	t	0	0
+1342	round	f	1	701	701	f	i	t	0	0
+1343	trunc	f	1	701	701	f	i	t	0	0
+1344	sqrt	f	1	701	701	f	i	t	0	0
+1345	cbrt	f	1	701	701	f	i	t	0	0
+1346	pow	f	2	701	701 701	f	i	t	0	0
+1347	exp	f	1	701	701	f	i	t	0	0
+1348	obj_description	f	1	25	26	f	s	t	0	0
+1367	character_length	f	1	23	1042	f	i	t	0	0
+1368	power	f	2	701	701 701	f	i	t	0	0
+1369	character_length	f	1	23	25	f	i	t	0	0
+1372	char_length	f	1	23	1042	f	i	t	0	0
+1373	isfinite	f	1	16	1082	f	i	t	0	0
+1374	octet_length	f	1	23	25	f	i	t	0	0
+1375	octet_length	f	1	23	1042	f	i	t	0	0
+1376	factorial	f	1	1700	20	f	i	t	0	0
+1381	char_length	f	1	23	25	f	i	t	0	0
+1384	date_part	f	2	701	25 1082	f	i	t	0	0
+1385	date_part	f	2	701	25 1083	f	i	t	0	0
+1386	age	f	1	1186	1184	f	s	t	0	0
+1387	pg_get_constraintdef	f	1	25	26	f	s	t	0	0
+1389	isfinite	f	1	16	1184	f	i	t	0	0
+1390	isfinite	f	1	16	1186	f	i	t	0	0
+1394	abs	f	1	700	700	f	i	t	0	0
+1395	abs	f	1	701	701	f	i	t	0	0
+1396	abs	f	1	20	20	f	i	t	0	0
+1397	abs	f	1	23	23	f	i	t	0	0
+1398	abs	f	1	21	21	f	i	t	0	0
+1402	current_schema	f	0	19		f	s	t	0	0
+1403	current_schemas	f	1	1003	16	f	s	t	0	0
+1404	overlay	f	4	25	25 25 23 23	f	i	t	0	0
+1405	overlay	f	3	25	25 25 23	f	i	t	0	0
+1481	log10	f	1	1700	1700	f	i	t	0	0
+1530	length	f	1	701	601	f	i	t	0	0
+1531	length	f	1	701	602	f	i	t	0	0
+1574	nextval	f	1	20	2205	f	v	t	0	0
+1575	currval	f	1	20	2205	f	v	t	0	0
+1576	setval	f	2	20	2205 20	f	v	t	0	0
+1597	pg_encoding_to_char	f	1	19	23	f	s	t	0	0
+1598	random	f	0	701		f	v	t	0	0
+1599	setseed	f	1	2278	701	f	v	t	0	0
+1600	asin	f	1	701	701	f	i	t	0	0
+1601	acos	f	1	701	701	f	i	t	0	0
+1602	atan	f	1	701	701	f	i	t	0	0
+1603	atan2	f	2	701	701 701	f	i	t	0	0
+1604	sin	f	1	701	701	f	i	t	0	0
+1605	cos	f	1	701	701	f	i	t	0	0
+1606	tan	f	1	701	701	f	i	t	0	0
+1607	cot	f	1	701	701	f	i	t	0	0
+1608	degrees	f	1	701	701	f	i	t	0	0
+1609	radians	f	1	701	701	f	i	t	0	0
+1610	pi	f	0	701		f	i	t	0	0
+1619	pg_typeof	f	1	2206	2276	f	s	f	0	0
+1620	ascii	f	1	23	25	f	i	t	0	0
+1621	chr	f	1	25	23	f	i	t	0	0
+1622	repeat	f	2	25	25 23	f	i	t	0	0
+1640	pg_get_viewdef	f	1	25	25	f	s	t	0	0
+1641	pg_get_viewdef	f	1	25	26	f	s	t	0	0
+1642	pg_get_userbyid	f	1	19	26	f	s	t	0	0
+1643	pg_get_indexdef	f	1	25	26	f	s	t	0	0
+1665	pg_get_serial_sequence	f	2	25	25 25	f	s	t	0	0
+1680	substring	f	3	1560	1560 23 23	f	i	t	0	0
+1681	length	f	1	23	1560	f	i	t	0	0
+1682	octet_length	f	1	23	1560	f	i	t	0	0
+1699	substring	f	2	1560	1560 23	f	i	t	0	0
+1705	abs	f	1	1700	1700	f	i	t	0	0
+1706	sign	f	1	1700	1700	f	i	t	0	0
+1707	round	f	2	1700	1700 23	f	i	t	0	0
+1708	round	f	1	1700	1700	f	i	t	0	0
+1709	trunc	f	2	1700	1700 23	f	i	t	0	0
+1710	trunc	f	1	1700	1700	f	i	t	0	0
+1711	ceil	f	1	1700	1700	f	i	t	0	0
+1712	floor	f	1	1700	1700	f	i	t	0	0
+1713	length	f	2	23	17 19	f	s	t	0	0
+1714	convert_from	f	2	25	17 19	f	s	t	0	0
+1716	pg_get_expr	f	2	25	194 26	f	s	t	0	0
+1717	convert_to	f	2	17	25 19	f	s	t	0	0
+1728	mod	f	2	1700	1700 1700	f	i	t	0	0
+1730	sqrt	f	1	1700	1700	f	i	t	0	0
+1732	exp	f	1	1700	1700	f	i	t	0	0
+1734	ln	f	1	1700	1700	f	i	t	0	0
+1736	log	f	2	1700	1700 1700	f	i	t	0	0
+1738	pow	f	2	1700	1700 1700	f	i	t	0	0
+1741	log	f	1	1700	1700	f	i	t	0	0
+1765	setval	f	3	20	2205 20 16	f	v	t	0	0
+1768	to_char	f	2	25	1186 25	f	s	t	0	0
+1770	to_char	f	2	25	1184 25	f	s	t	0	0
+1772	to_char	f	2	25	1700 25	f	s	t	0	0
+1773	to_char	f	2	25	23 25	f	s	t	0	0
+1774	to_char	f	2	25	20 25	f	s	t	0	0
+1775	to_char	f	2	25	700 25	f	s	t	0	0
+1776	to_char	f	2	25	701 25	f	s	t	0	0
+1777	to_number	f	2	1700	25 25	f	s	t	0	0
+1778	to_timestamp	f	2	1184	25 25	f	s	t	0	0
+1780	to_date	f	2	1082	25 25	f	s	t	0	0
+1810	bit_length	f	1	23	17	f	i	t	0	0
+1811	bit_length	f	1	23	25	f	i	t	0	0
+1812	bit_length	f	1	23	1560	f	i	t	0	0
+1813	convert	f	3	17	17 19 19	f	s	t	0	0
+1845	to_ascii	f	1	25	25	f	i	t	0	0
+1846	to_ascii	f	2	25	25 23	f	i	t	0	0
+1847	to_ascii	f	2	25	25 19	f	i	t	0	0
+1922	has_table_privilege	f	3	16	19 25 25	f	s	t	0	0
+1923	has_table_privilege	f	3	16	19 26 25	f	s	t	0	0
+1924	has_table_privilege	f	3	16	26 25 25	f	s	t	0	0
+1925	has_table_privilege	f	3	16	26 26 25	f	s	t	0	0
+1926	has_table_privilege	f	2	16	25 25	f	s	t	0	0
+1927	has_table_privilege	f	2	16	26 25	f	s	t	0	0
+1946	encode	f	2	25	17 25	f	i	t	0	0
+1947	decode	f	2	17	25 25	f	i	t	0	0
+1973	div	f	2	1700	1700 1700	f	i	t	0	0
+1993	shobj_description	f	2	25	26 19	f	s	t	0	0
+2010	length	f	1	23	17	f	i	t	0	0
+2012	substring	f	3	17	17 23 23	f	i	t	0	0
+2013	substring	f	2	17	17 23	f	i	t	0	0
+2015	btrim	f	2	17	17 17	f	i	t	0	0
+2020	date_trunc	f	2	1114	25 1114	f	i	t	0	0
+2021	date_part	f	2	701	25 1114	f	i	t	0	0
+2026	pg_backend_pid	f	0	23		f	s	t	0	0
+2034	pg_conf_load_time	f	0	1184		f	s	t	0	0
+2037	timezone	f	2	1266	25 1266	f	s	t	0	0
+2038	timezone	f	2	1266	1186 1266	f	i	t	0	0
+2041	overlaps	f	4	16	1114 1114 1114 1114	f	i	f	0	0
+2042	overlaps	f	4	16	1114 1186 1114 1186	f	i	f	0	0
+2043	overlaps	f	4	16	1114 1114 1114 1186	f	i	f	0	0
+2044	overlaps	f	4	16	1114 1186 1114 1114	f	i	f	0	0
+2048	isfinite	f	1	16	1114	f	i	t	0	0
+2049	to_char	f	2	25	1114 25	f	s	t	0	0
+2050	max	a	1	2277	2277	f	i	f	0	0
+2051	min	a	1	2277	2277	f	i	f	0	0
+2058	age	f	2	1186	1114 1114	f	i	t	0	0
+2059	age	f	1	1186	1114	f	s	t	0	0
+2069	timezone	f	2	1184	25 1114	f	i	t	0	0
+2070	timezone	f	2	1184	1186 1114	f	i	t	0	0
+2073	substring	f	2	25	25 25	f	i	t	0	0
+2074	substring	f	3	25	25 25 25	f	i	t	0	0
+2077	current_setting	f	1	25	25	f	s	t	0	0
+2078	set_config	f	3	25	25 25 16	f	v	f	0	0
+2085	substr	f	3	17	17 23 23	f	i	t	0	0
+2086	substr	f	2	17	17 23	f	i	t	0	0
+2087	replace	f	3	25	25 25 25	f	i	t	0	0
+2088	split_part	f	3	25	25 25 23	f	i	t	0	0
+2089	to_hex	f	1	25	23	f	i	t	0	0
+2090	to_hex	f	1	25	20	f	i	t	0	0
+2091	array_lower	f	2	23	2277 23	f	i	t	0	0
+2092	array_upper	f	2	23	2277 23	f	i	t	0	0
+2096	pg_terminate_backend	f	2	16	23 20	f	v	t	0	1
+2100	avg	a	1	1700	20	f	i	f	0	0
+2101	avg	a	1	1700	23	f	i	f	0	0
+2102	avg	a	1	1700	21	f	i	f	0	0
+2103	avg	a	1	1700	1700	f	i	f	0	0
+2104	avg	a	1	701	700	f	i	f	0	0
+2105	avg	a	1	701	701	f	i	f	0	0
+2106	avg	a	1	1186	1186	f	i	f	0	0
+2107	sum	a	1	1700	20	f	i	f	0	0
+2108	sum	a	1	20	23	f	i	f	0	0
+2109	sum	a	1	20	21	f	i	f	0	0
+2110	sum	a	1	700	700	f	i	f	0	0
+2111	sum	a	1	701	701	f	i	f	0	0
+2112	sum	a	1	790	790	f	i	f	0	0
+2113	sum	a	1	1186	1186	f	i	f	0	0
+2114	sum	a	1	1700	1700	f	i	f	0	0
+2115	max	a	1	20	20	f	i	f	0	0
+2116	max	a	1	23	23	f	i	f	0	0
+2117	max	a	1	21	21	f	i	f	0	0
+2118	max	a	1	26	26	f	i	f	0	0
+2119	max	a	1	700	700	f	i	f	0	0
+2120	max	a	1	701	701	f	i	f	0	0
+2122	max	a	1	1082	1082	f	i	f	0	0
+2123	max	a	1	1083	1083	f	i	f	0	0
+2124	max	a	1	1266	1266	f	i	f	0	0
+2125	max	a	1	790	790	f	i	f	0	0
+2126	max	a	1	1114	1114	f	i	f	0	0
+2127	max	a	1	1184	1184	f	i	f	0	0
+2128	max	a	1	1186	1186	f	i	f	0	0
+2129	max	a	1	25	25	f	i	f	0	0
+2130	max	a	1	1700	1700	f	i	f	0	0
+2131	min	a	1	20	20	f	i	f	0	0
+2132	min	a	1	23	23	f	i	f	0	0
+2133	min	a	1	21	21	f	i	f	0	0
+2134	min	a	1	26	26	f	i	f	0	0
+2135	min	a	1	700	700	f	i	f	0	0
+2136	min	a	1	701	701	f	i	f	0	0
+2138	min	a	1	1082	1082	f	i	f	0	0
+2139	min	a	1	1083	1083	f	i	f	0	0
+2140	min	a	1	1266	1266	f	i	f	0	0
+2141	min	a	1	790	790	f	i	f	0	0
+2142	min	a	1	1114	1114	f	i	f	0	0
+2143	min	a	1	1184	1184	f	i	f	0	0
+2144	min	a	1	1186	1186	f	i	f	0	0
+2145	min	a	1	25	25	f	i	f	0	0
+2146	min	a	1	1700	1700	f	i	f	0	0
+2147	count	a	1	20	2276	f	i	f	0	0
+2148	variance	a	1	1700	20	f	i	f	0	0
+2149	variance	a	1	1700	23	f	i	f	0	0
+2150	variance	a	1	1700	21	f	i	f	0	0
+2151	variance	a	1	701	700	f	i	f	0	0
+2152	variance	a	1	701	701	f	i	f	0	0
+2153	variance	a	1	1700	1700	f	i	f	0	0
+2154	stddev	a	1	1700	20	f	i	f	0	0
+2155	stddev	a	1	1700	23	f	i	f	0	0
+2156	stddev	a	1	1700	21	f	i	f	0	0
+2157	stddev	a	1	701	700	f	i	f	0	0
+2158	stddev	a	1	701	701	f	i	f	0	0
+2159	stddev	a	1	1700	1700	f	i	f	0	0
+2167	ceiling	f	1	1700	1700	f	i	t	0	0
+2168	pg_database_size	f	1	20	19	f	v	t	0	0
+2169	power	f	2	1700	1700 1700	f	i	t	0	0
+2170	width_bucket	f	4	23	1700 1700 1700 23	f	i	t	0	0
+2171	pg_cancel_backend	f	1	16	23	f	v	t	0	0
+2176	array_length	f	2	23	2277 23	f	i	t	0	0
+2181	has_sequence_privilege	f	3	16	19 25 25	f	s	t	0	0
+2182	has_sequence_privilege	f	3	16	19 26 25	f	s	t	0	0
+2183	has_sequence_privilege	f	3	16	26 25 25	f	s	t	0	0
+2184	has_sequence_privilege	f	3	16	26 26 25	f	s	t	0	0
+2185	has_sequence_privilege	f	2	16	25 25	f	s	t	0	0
+2186	has_sequence_privilege	f	2	16	26 25	f	s	t	0	0
+2196	inet_client_addr	f	0	869		f	s	f	0	0
+2197	inet_client_port	f	0	23		f	s	f	0	0
+2198	inet_server_addr	f	0	869		f	s	f	0	0
+2199	inet_server_port	f	0	23		f	s	f	0	0
+2236	bit_and	a	1	21	21	f	i	f	0	0
+2237	bit_or	a	1	21	21	f	i	f	0	0
+2238	bit_and	a	1	23	23	f	i	f	0	0
+2239	bit_or	a	1	23	23	f	i	f	0	0
+2240	bit_and	a	1	20	20	f	i	f	0	0
+2241	bit_or	a	1	20	20	f	i	f	0	0
+2242	bit_and	a	1	1560	1560	f	i	f	0	0
+2243	bit_or	a	1	1560	1560	f	i	f	0	0
+2244	max	a	1	1042	1042	f	i	f	0	0
+2245	min	a	1	1042	1042	f	i	f	0	0
+2250	has_database_privilege	f	3	16	19 25 25	f	s	t	0	0
+2251	has_database_privilege	f	3	16	19 26 25	f	s	t	0	0
+2252	has_database_privilege	f	3	16	26 25 25	f	s	t	0	0
+2253	has_database_privilege	f	3	16	26 26 25	f	s	t	0	0
+2254	has_database_privilege	f	2	16	25 25	f	s	t	0	0
+2255	has_database_privilege	f	2	16	26 25	f	s	t	0	0
+2256	has_function_privilege	f	3	16	19 25 25	f	s	t	0	0
+2257	has_function_privilege	f	3	16	19 26 25	f	s	t	0	0
+2258	has_function_privilege	f	3	16	26 25 25	f	s	t	0	0
+2259	has_function_privilege	f	3	16	26 26 25	f	s	t	0	0
+2260	has_function_privilege	f	2	16	25 25	f	s	t	0	0
+2261	has_function_privilege	f	2	16	26 25	f	s	t	0	0
+2268	has_schema_privilege	f	3	16	19 25 25	f	s	t	0	0
+2269	has_schema_privilege	f	3	16	19 26 25	f	s	t	0	0
+2270	has_schema_privilege	f	3	16	26 25 25	f	s	t	0	0
+2271	has_schema_privilege	f	3	16	26 26 25	f	s	t	0	0
+2272	has_schema_privilege	f	2	16	25 25	f	s	t	0	0
+2273	has_schema_privilege	f	2	16	26 25	f	s	t	0	0
+2284	regexp_replace	f	3	25	25 25 25	f	i	t	0	0
+2285	regexp_replace	f	4	25	25 25 25 25	f	i	t	0	0
+2286	pg_total_relation_size	f	1	20	2205	f	v	t	0	0
+2288	pg_size_pretty	f	1	25	20	f	i	t	0	0
+2290	record_in	f	3	2249	2275 26 23	f	s	t	0	0
+2291	record_out	f	1	2275	2249	f	s	t	0	0
+2308	ceil	f	1	701	701	f	i	t	0	0
+2309	floor	f	1	701	701	f	i	t	0	0
+2310	sign	f	1	701	701	f	i	t	0	0
+2311	md5	f	1	25	25	f	i	t	0	0
+2320	ceiling	f	1	701	701	f	i	t	0	0
+2321	md5	f	1	25	17	f	i	t	0	0
+2324	pg_database_size	f	1	20	26	f	v	t	0	0
+2325	pg_relation_size	f	1	20	2205	f	v	t	0	0
+2331	unnest	f	1	2283	2277	t	i	t	0	0
+2332	pg_relation_size	f	2	20	2205 25	f	v	t	0	0
+2335	array_agg	a	1	2277	2776	f	i	f	0	0
+2400	array_recv	f	3	2277	2281 26 23	f	s	t	0	0
+2402	record_recv	f	3	2249	2281 26 23	f	s	t	0	0
+2462	sinh	f	1	701	701	f	i	t	0	0
+2463	cosh	f	1	701	701	f	i	t	0	0
+2464	tanh	f	1	701	701	f	i	t	0	0
+2465	asinh	f	1	701	701	f	i	t	0	0
+2466	acosh	f	1	701	701	f	i	t	0	0
+2467	atanh	f	1	701	701	f	i	t	0	0
+2505	pg_get_viewdef	f	2	25	25 16	f	s	t	0	0
+2506	pg_get_viewdef	f	2	25	26 16	f	s	t	0	0
+2507	pg_get_indexdef	f	3	25	26 23 16	f	s	t	0	0
+2508	pg_get_constraintdef	f	2	25	26 16	f	s	t	0	0
+2509	pg_get_expr	f	3	25	194 26 16	f	s	t	0	0
+2517	bool_and	a	1	16	16	f	i	f	0	0
+2518	bool_or	a	1	16	16	f	i	f	0	0
+2519	every	a	1	16	16	f	i	f	0	0
+2559	lastval	f	0	20		f	v	t	0	0
+2560	pg_postmaster_start_time	f	0	1184		f	s	t	0	0
+2626	pg_sleep	f	1	2278	701	f	v	t	0	0
+2641	var_samp	a	1	1700	20	f	i	f	0	0
+2642	var_samp	a	1	1700	23	f	i	f	0	0
+2643	var_samp	a	1	1700	21	f	i	f	0	0
+2644	var_samp	a	1	701	700	f	i	f	0	0
+2645	var_samp	a	1	701	701	f	i	f	0	0
+2646	var_samp	a	1	1700	1700	f	i	f	0	0
+2647	transaction_timestamp	f	0	1184		f	s	t	0	0
+2648	statement_timestamp	f	0	1184		f	s	t	0	0
+2649	clock_timestamp	f	0	1184		f	v	t	0	0
+2705	pg_has_role	f	3	16	19 19 25	f	s	t	0	0
+2706	pg_has_role	f	3	16	19 26 25	f	s	t	0	0
+2707	pg_has_role	f	3	16	26 19 25	f	s	t	0	0
+2708	pg_has_role	f	3	16	26 26 25	f	s	t	0	0
+2709	pg_has_role	f	2	16	19 25	f	s	t	0	0
+2710	pg_has_role	f	2	16	26 25	f	s	t	0	0
+2711	justify_interval	f	1	1186	1186	f	i	t	0	0
+2712	stddev_samp	a	1	1700	20	f	i	f	0	0
+2713	stddev_samp	a	1	1700	23	f	i	f	0	0
+2714	stddev_samp	a	1	1700	21	f	i	f	0	0
+2715	stddev_samp	a	1	701	700	f	i	f	0	0
+2716	stddev_samp	a	1	701	701	f	i	f	0	0
+2717	stddev_samp	a	1	1700	1700	f	i	f	0	0
+2718	var_pop	a	1	1700	20	f	i	f	0	0
+2719	var_pop	a	1	1700	23	f	i	f	0	0
+2720	var_pop	a	1	1700	21	f	i	f	0	0
+2721	var_pop	a	1	701	700	f	i	f	0	0
+2722	var_pop	a	1	701	701	f	i	f	0	0
+2723	var_pop	a	1	1700	1700	f	i	f	0	0
+2724	stddev_pop	a	1	1700	20	f	i	f	0	0
+2725	stddev_pop	a	1	1700	23	f	i	f	0	0
+2726	stddev_pop	a	1	1700	21	f	i	f	0	0
+2727	stddev_pop	a	1	701	700	f	i	f	0	0
+2728	stddev_pop	a	1	701	701	f	i	f	0	0
+2729	stddev_pop	a	1	1700	1700	f	i	f	0	0
+2731	asind	f	1	701	701	f	i	t	0	0
+2732	acosd	f	1	701	701	f	i	t	0	0
+2733	atand	f	1	701	701	f	i	t	0	0
+2734	atan2d	f	2	701	701 701	f	i	t	0	0
+2735	sind	f	1	701	701	f	i	t	0	0
+2736	cosd	f	1	701	701	f	i	t	0	0
+2737	tand	f	1	701	701	f	i	t	0	0
+2738	cotd	f	1	701	701	f	i	t	0	0
+2763	regexp_matches	f	2	1009	25 25	t	i	t	0	0
+2764	regexp_matches	f	3	1009	25 25 25	t	i	t	0	0
+2765	regexp_split_to_table	f	2	25	25 25	t	i	t	0	0
+2766	regexp_split_to_table	f	3	25	25 25 25	t	i	t	0	0
+2767	regexp_split_to_array	f	2	1009	25 25	f	i	t	0	0
+2768	regexp_split_to_array	f	3	1009	25 25 25	f	i	t	0	0
+2797	max	a	1	27	27	f	i	f	0	0
+2798	min	a	1	27	27	f	i	f	0	0
+2803	count	a	0	20		f	i	f	0	0
+2818	regr_count	a	2	20	701 701	f	i	f	0	0
+2819	regr_sxx	a	2	701	701 701	f	i	f	0	0
+2820	regr_syy	a	2	701	701 701	f	i	f	0	0
+2821	regr_sxy	a	2	701	701 701	f	i	f	0	0
+2822	regr_avgx	a	2	701	701 701	f	i	f	0	0
+2823	regr_avgy	a	2	701	701 701	f	i	f	0	0
+2824	regr_r2	a	2	701	701 701	f	i	f	0	0
+2825	regr_slope	a	2	701	701 701	f	i	f	0	0
+2826	regr_intercept	a	2	701	701 701	f	i	f	0	0
+2827	covar_pop	a	2	701	701 701	f	i	f	0	0
+2828	covar_samp	a	2	701	701 701	f	i	f	0	0
+2829	corr	a	2	701	701 701	f	i	f	0	0
+2880	pg_advisory_lock	f	1	2278	20	f	v	t	0	0
+2881	pg_advisory_lock_shared	f	1	2278	20	f	v	t	0	0
+2882	pg_try_advisory_lock	f	1	16	20	f	v	t	0	0
+2883	pg_try_advisory_lock_shared	f	1	16	20	f	v	t	0	0
+2884	pg_advisory_unlock	f	1	16	20	f	v	t	0	0
+2885	pg_advisory_unlock_shared	f	1	16	20	f	v	t	0	0
+2886	pg_advisory_lock	f	2	2278	23 23	f	v	t	0	0
+2887	pg_advisory_lock_shared	f	2	2278	23 23	f	v	t	0	0
+2888	pg_try_advisory_lock	f	2	16	23 23	f	v	t	0	0
+2889	pg_try_advisory_lock_shared	f	2	16	23 23	f	v	t	0	0
+2890	pg_advisory_unlock	f	2	16	23 23	f	v	t	0	0
+2891	pg_advisory_unlock_shared	f	2	16	23 23	f	v	t	0	0
+2892	pg_advisory_unlock_all	f	0	2278		f	v	t	0	0
+2943	txid_current	f	0	20		f	s	t	0	0
+2997	pg_table_size	f	1	20	2205	f	v	t	0	0
+2998	pg_indexes_size	f	1	20	2205	f	v	t	0	0
+3012	has_column_privilege	f	4	16	19 25 25 25	f	s	t	0	0
+3013	has_column_privilege	f	4	16	19 25 21 25	f	s	t	0	0
+3014	has_column_privilege	f	4	16	19 26 25 25	f	s	t	0	0
+3015	has_column_privilege	f	4	16	19 26 21 25	f	s	t	0	0
+3016	has_column_privilege	f	4	16	26 25 25 25	f	s	t	0	0
+3017	has_column_privilege	f	4	16	26 25 21 25	f	s	t	0	0
+3018	has_column_privilege	f	4	16	26 26 25 25	f	s	t	0	0
+3019	has_column_privilege	f	4	16	26 26 21 25	f	s	t	0	0
+3020	has_column_privilege	f	3	16	25 25 25	f	s	t	0	0
+3021	has_column_privilege	f	3	16	25 21 25	f	s	t	0	0
+3022	has_column_privilege	f	3	16	26 25 25	f	s	t	0	0
+3023	has_column_privilege	f	3	16	26 21 25	f	s	t	0	0
+3024	has_any_column_privilege	f	3	16	19 25 25	f	s	t	0	0
+3025	has_any_column_privilege	f	3	16	19 26 25	f	s	t	0	0
+3026	has_any_column_privilege	f	3	16	26 25 25	f	s	t	0	0
+3027	has_any_column_privilege	f	3	16	26 26 25	f	s	t	0	0
+3028	has_any_column_privilege	f	2	16	25 25	f	s	t	0	0
+3029	has_any_column_privilege	f	2	16	26 25	f	s	t	0	0
+3030	overlay	f	4	1560	1560 1560 23 23	f	i	t	0	0
+3031	overlay	f	3	1560	1560 1560 23	f	i	t	0	0
+3032	get_bit	f	2	23	1560 23	f	i	t	0	0
+3033	set_bit	f	3	1560	1560 23 23	f	i	t	0	0
+3036	pg_notify	f	2	2278	25 25	f	v	f	0	0
+3058	concat	f	1	25	2276	f	s	f	2276	0
+3059	concat_ws	f	2	25	25 2276	f	s	f	2276	0
+3060	left	f	2	25	25 23	f	i	t	0	0
+3061	right	f	2	25	25 23	f	i	t	0	0
+3062	reverse	f	1	25	25	f	i	t	0	0
+3089	pg_advisory_xact_lock	f	1	2278	20	f	v	t	0	0
+3090	pg_advisory_xact_lock_shared	f	1	2278	20	f	v	t	0	0
+3091	pg_try_advisory_xact_lock	f	1	16	20	f	v	t	0	0
+3092	pg_try_advisory_xact_lock_shared	f	1	16	20	f	v	t	0	0
+3093	pg_advisory_xact_lock	f	2	2278	23 23	f	v	t	0	0
+3094	pg_advisory_xact_lock_shared	f	2	2278	23 23	f	v	t	0	0
+3095	pg_try_advisory_xact_lock	f	2	16	23 23	f	v	t	0	0
+3096	pg_try_advisory_xact_lock_shared	f	2	16	23 23	f	v	t	0	0
+3100	row_number	w	0	20		f	i	f	0	0
+3101	rank	w	0	20		f	i	f	0	0
+3102	dense_rank	w	0	20		f	i	f	0	0
+3103	percent_rank	w	0	701		f	i	f	0	0
+3104	cume_dist	w	0	701		f	i	f	0	0
+3105	ntile	w	1	23	23	f	i	t	0	0
+3106	lag	w	1	2283	2283	f	i	t	0	0
+3107	lag	w	2	2283	2283 23	f	i	t	0	0
+3108	lag	w	3	5077	5077 23 5077	f	i	t	0	0
+3109	lead	w	1	2283	2283	f	i	t	0	0
+3110	lead	w	2	2283	2283 23	f	i	t	0	0
+3111	lead	w	3	5077	5077 23 5077	f	i	t	0	0
+3112	first_value	w	1	2283	2283	f	i	t	0	0
+3113	last_value	w	1	2283	2283	f	i	t	0	0
+3114	nth_value	w	2	2283	2283 23	f	i	t	0	0
+3153	array_to_json	f	1	114	2277	f	s	t	0	0
+3154	array_to_json	f	2	114	2277 16	f	s	t	0	0
+3155	row_to_json	f	1	114	2249	f	s	t	0	0
+3156	row_to_json	f	2	114	2249 16	f	s	t	0	0
+3159	pg_get_viewdef	f	2	25	26 23	f	s	t	0	0
+3163	pg_trigger_depth	f	0	23		f	s	t	0	0
+3166	pg_size_pretty	f	1	25	1700	f	i	t	0	0
+3167	array_remove	f	2	5078	5078 5077	f	i	f	0	0
+3168	array_replace	f	3	5078	5078 5077 5077	f	i	f	0	0
+3175	json_agg	a	1	114	2283	f	s	f	0	0
+3176	to_json	f	1	114	2283	f	s	t	0	0
+3179	cardinality	f	1	23	2277	f	i	t	0	0
+3197	json_object_agg	a	2	114	2276 2276	f	s	f	0	0
+3198	json_build_array	f	1	114	2276	f	s	f	2276	0
+3199	json_build_array	f	0	114		f	s	f	0	0
+3200	json_build_object	f	1	114	2276	f	s	f	2276	0
+3201	json_build_object	f	0	114		f	s	f	0	0
+3202	json_object	f	1	114	1009	f	i	t	0	0
+3203	json_object	f	2	114	1009 1009	f	i	t	0	0
+3207	jsonb_array_length	f	1	23	3802	f	i	t	0	0
+3210	jsonb_typeof	f	1	25	3802	f	i	t	0	0
+3217	jsonb_extract_path	f	2	3802	3802 1009	f	i	t	25	0
+3218	width_bucket	f	2	23	5077 5078	f	i	t	0	0
+3219	jsonb_array_elements	f	1	3802	3802	t	i	t	0	0
+3259	generate_series	f	3	1700	1700 1700 1700	t	i	t	0	0
+3260	generate_series	f	2	1700	1700 1700	t	i	t	0	0
+3261	json_strip_nulls	f	2	114	114 16	f	i	t	0	1
+3262	jsonb_strip_nulls	f	2	3802	3802 16	f	i	t	0	1
+3267	jsonb_agg	a	1	3802	2283	f	s	f	0	0
+3270	jsonb_object_agg	a	2	3802	2276 2276	f	i	f	0	0
+3271	jsonb_build_array	f	1	3802	2276	f	s	f	2276	0
+3272	jsonb_build_array	f	0	3802		f	s	f	0	0
+3273	jsonb_build_object	f	1	3802	2276	f	s	f	2276	0
+3274	jsonb_build_object	f	0	3802		f	s	f	0	0
+3277	array_position	f	2	23	5078 5077	f	i	f	0	0
+3278	array_position	f	3	23	5078 5077 23	f	i	f	0	0
+3279	array_positions	f	2	1007	5078 5077	f	i	f	0	0
+3281	scale	f	1	23	1700	f	i	t	0	0
+3294	current_setting	f	2	25	25 16	f	s	t	0	0
+3305	jsonb_set	f	4	3802	3802 1009 3802 16	f	i	t	0	1
+3306	jsonb_pretty	f	1	25	3802	f	i	t	0	0
+3322	unnest	f	1	2249	3614	t	i	t	0	0
+3396	regexp_match	f	2	1009	25 25	f	i	t	0	0
+3397	regexp_match	f	3	1009	25 25 25	f	i	t	0	0
+3419	sha224	f	1	17	17	f	i	t	0	0
+3420	sha256	f	1	17	17	f	i	t	0	0
+3421	sha384	f	1	17	17	f	i	t	0	0
+3422	sha512	f	1	17	17	f	i	t	0	0
+3425	pg_partition_ancestors	f	1	2205	2205	t	v	t	0	0
+3432	gen_random_uuid	f	0	2950		f	v	t	0	0
+3461	make_timestamp	f	6	1114	23 23 23 23 23 701	f	i	t	0	0
+3462	make_timestamptz	f	6	1184	23 23 23 23 23 701	f	s	t	0	0
+3463	make_timestamptz	f	7	1184	23 23 23 23 23 701 25	f	s	t	0	0
+3464	make_interval	f	7	1186	23 23 23 23 23 23 701	f	i	t	0	7
+3465	jsonb_array_elements_text	f	1	25	3802	t	i	t	0	0
+3479	to_regprocedure	f	1	2202	25	f	s	t	0	0
+3493	to_regtype	f	1	2206	25	f	s	t	0	0
+3494	to_regproc	f	1	24	25	f	s	t	0	0
+3495	to_regclass	f	1	2205	25	f	s	t	0	0
+3526	max	a	1	3500	3500	f	i	f	0	0
+3527	min	a	1	3500	3500	f	i	f	0	0
+3538	string_agg	a	2	25	25 25	f	i	f	0	0
+3539	format	f	2	25	25 2276	f	s	f	2276	0
+3540	format	f	1	25	25	f	s	f	0	0
+3545	string_agg	a	2	17	17 17	f	i	f	0	0
+3564	max	a	1	869	869	f	i	f	0	0
+3565	min	a	1	869	869	f	i	f	0	0
+3696	starts_with	f	2	16	25 25	f	i	t	0	0
+3711	length	f	1	23	3614	f	i	t	0	0
+3787	to_jsonb	f	1	3802	2283	f	s	t	0	0
+3810	pg_is_in_recovery	f	0	16		f	v	t	0	0
+3846	make_date	f	3	1082	23 23 23	f	i	t	0	0
+3847	make_time	f	3	1083	23 23 701	f	i	t	0	0
+3848	lower	f	1	2283	3831	f	i	t	0	0
+3849	upper	f	1	2283	3831	f	i	t	0	0
+3940	jsonb_extract_path_text	f	2	25	3802 1009	f	i	t	25	0
+3951	json_extract_path	f	2	114	114 1009	f	i	t	25	0
+3953	json_extract_path_text	f	2	25	114 1009	f	i	t	25	0
+3955	json_array_elements	f	1	114	114	t	i	t	0	0
+3956	json_array_length	f	1	23	114	f	i	t	0	0
+3968	json_typeof	f	1	25	114	f	i	t	0	0
+3969	json_array_elements_text	f	1	25	114	t	i	t	0	0
+3972	percentile_disc	a	2	2283	701 2283	f	i	f	0	0
+3974	percentile_cont	a	2	701	701 701	f	i	f	0	0
+3976	percentile_cont	a	2	1186	701 1186	f	i	f	0	0
+3978	percentile_disc	a	2	2277	1022 2283	f	i	f	0	0
+3980	percentile_cont	a	2	1022	1022 701	f	i	f	0	0
+3982	percentile_cont	a	2	1187	1022 1186	f	i	f	0	0
+3984	mode	a	1	2283	2283	f	i	f	0	0
+3986	rank	a	1	20	2276	f	i	f	2276	0
+3988	percent_rank	a	1	701	2276	f	i	f	2276	0
+3990	cume_dist	a	1	701	2276	f	i	f	2276	0
+3992	dense_rank	a	1	20	2276	f	i	f	2276	0
+4053	array_agg	a	1	2277	2277	f	i	f	0	0
+4086	to_regnamespace	f	1	4089	25	f	s	t	0	0
+4093	to_regrole	f	1	4096	25	f	s	t	0	0
+4112	trunc	f	1	774	774	f	i	t	0	0
+4189	max	a	1	3220	3220	f	i	f	0	0
+4190	min	a	1	3220	3220	f	i	f	0	0
+4235	lower	f	1	2283	4537	f	i	t	0	0
+4236	upper	f	1	2283	4537	f	i	t	0	0
+4350	normalize	f	2	25	25 25	f	i	t	0	1
+5042	min_scale	f	1	23	1700	f	i	t	0	0
+5043	trim_scale	f	1	1700	1700	f	i	t	0	0
+5044	gcd	f	2	23	23 23	f	i	t	0	0
+5045	gcd	f	2	20	20 20	f	i	t	0	0
+5046	lcm	f	2	23	23 23	f	i	t	0	0
+5047	lcm	f	2	20	20 20	f	i	t	0	0
+5048	gcd	f	2	1700	1700 1700	f	i	t	0	0
+5049	lcm	f	2	1700	1700 1700	f	i	t	0	0
+5059	pg_current_xact_id	f	0	5069		f	s	t	0	0
+5060	pg_current_xact_id_if_assigned	f	0	5069		f	s	t	0	0
+5099	max	a	1	5069	5069	f	i	f	0	0
+5100	min	a	1	5069	5069	f	i	f	0	0
+6121	pg_relation_is_publishable	f	1	16	2205	f	s	t	0	0
+6160	string_to_table	f	2	25	25 25	t	i	f	0	0
+6161	string_to_table	f	3	25	25 25 25	t	i	f	0	0
+6162	bit_count	f	1	20	1560	f	i	t	0	0
+6163	bit_count	f	1	20	17	f	i	t	0	0
+6164	bit_xor	a	1	21	21	f	i	f	0	0
+6165	bit_xor	a	1	23	23	f	i	f	0	0
+6166	bit_xor	a	1	20	20	f	i	f	0	0
+6167	bit_xor	a	1	1560	1560	f	i	f	0	0
+6172	trim_array	f	2	2277	2277 23	f	i	t	0	0
+6174	pg_get_statisticsobjdef_columns	f	1	25	26	f	s	t	0	0
+6177	date_bin	f	3	1114	1186 1114 1114	f	i	t	0	0
+6178	date_bin	f	3	1184	1186 1184 1184	f	i	t	0	0
+6195	ltrim	f	2	17	17 17	f	i	t	0	0
+6196	rtrim	f	2	17	17 17	f	i	t	0	0
+6198	unistr	f	1	25	25	f	i	t	0	0
+6212	random_normal	f	2	701	701 701	f	v	t	0	2
+6251	regexp_replace	f	6	25	25 25 25 23 23 25	f	i	t	0	0
+6252	regexp_replace	f	5	25	25 25 25 23 23	f	i	t	0	0
+6253	regexp_replace	f	4	25	25 25 25 23	f	i	t	0	0
+6254	regexp_count	f	2	23	25 25	f	i	t	0	0
+6255	regexp_count	f	3	23	25 25 23	f	i	t	0	0
+6256	regexp_count	f	4	23	25 25 23 25	f	i	t	0	0
+6257	regexp_instr	f	2	23	25 25	f	i	t	0	0
+6258	regexp_instr	f	3	23	25 25 23	f	i	t	0	0
+6259	regexp_instr	f	4	23	25 25 23 23	f	i	t	0	0
+6260	regexp_instr	f	5	23	25 25 23 23 23	f	i	t	0	0
+6261	regexp_instr	f	6	23	25 25 23 23 23 25	f	i	t	0	0
+6262	regexp_instr	f	7	23	25 25 23 23 23 25 23	f	i	t	0	0
+6263	regexp_like	f	2	16	25 25	f	i	t	0	0
+6264	regexp_like	f	3	16	25 25 25	f	i	t	0	0
+6265	regexp_substr	f	2	25	25 25	f	i	t	0	0
+6266	regexp_substr	f	3	25	25 25 23	f	i	t	0	0
+6267	regexp_substr	f	4	25	25 25 23 23	f	i	t	0	0
+6268	regexp_substr	f	5	25	25 25 23 23 25	f	i	t	0	0
+6269	regexp_substr	f	6	25	25 25 23 23 25 23	f	i	t	0	0
+6274	generate_series	f	4	1184	1184 1184 1186 25	t	i	t	0	0
+6291	any_value	a	1	2283	2283	f	i	f	0	0
+6330	to_bin	f	1	25	23	f	i	t	0	0
+6331	to_bin	f	1	25	20	f	i	t	0	0
+6332	to_oct	f	1	25	23	f	i	t	0	0
+6333	to_oct	f	1	25	20	f	i	t	0	0
+6334	timezone	f	1	1114	1184	f	s	t	0	0
+6335	timezone	f	1	1184	1114	f	s	t	0	0
+6336	timezone	f	1	1266	1266	f	s	t	0	0
+6339	random	f	2	23	23 23	f	v	t	0	0
+6340	random	f	2	20	20 20	f	v	t	0	0
+6341	random	f	2	1700	1700 1700	f	v	t	0	0
+6343	uuid_extract_version	f	1	21	2950	f	i	t	0	0
+6364	crc32	f	1	20	17	f	i	t	0	0
+6365	crc32c	f	1	20	17	f	i	t	0	0
+6373	max	a	1	2249	2249	f	i	f	0	0
+6374	min	a	1	2249	2249	f	i	f	0	0
+6381	array_reverse	f	1	2277	2277	f	i	t	0	0
+6382	reverse	f	1	17	17	f	i	t	0	0
+6388	array_sort	f	1	2277	2277	f	i	t	0	0
+6389	array_sort	f	2	2277	2277 16	f	i	t	0	0
+6390	array_sort	f	3	2277	2277 16 16	f	i	t	0	0
+6395	max	a	1	17	17	f	i	f	0	0
+6396	min	a	1	17	17	f	i	f	0	0
+6412	casefold	f	1	25	25	f	i	t	0	0
+6428	uuidv4	f	0	2950		f	v	t	0	0
+6429	uuidv7	f	0	2950		f	v	t	0	0
+6430	uuidv7	f	1	2950	1186	f	v	t	0	0

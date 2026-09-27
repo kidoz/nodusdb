@@ -77,6 +77,7 @@ pub use planner::{
 pub(crate) use planner::{eval_scalar_expr, parse_filter_expr, scalar_has_aggregate};
 pub use sequences::{SequenceChange, SequenceSpec};
 pub use session_vars::canonical_setting_value;
+pub use session_vars::set_server_setting;
 pub use value::{ColumnDef, Value, float_text, float4_text, render};
 pub(crate) use value::{
     coerce, column_type, compare, eval_scalar_function, literal_arg, resolve_scalar_arg,
