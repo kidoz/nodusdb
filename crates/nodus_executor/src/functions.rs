@@ -74,6 +74,7 @@ pub(crate) fn is_known(name: &str) -> bool {
                 | "ASINH" | "ACOSH" | "ATANH" | "SIND" | "COSD" | "TAND" | "COTD" | "ASIND"
                 | "ACOSD" | "ATAND" | "ATAN2D" | "SETSEED" | "RANDOM_NORMAL"
                 | crate::result_types::REAL_TEXT | crate::result_types::REAL_NUMERIC
+                | "GET_BIT" | "SET_BIT" | "BIT_COUNT" | crate::result_types::BITS
                 | crate::result_types::BIT_AND | crate::result_types::BIT_OR
                 | crate::result_types::BIT_XOR | crate::result_types::SHIFT_LEFT
                 | crate::result_types::SHIFT_RIGHT | crate::result_types::BIT_NOT
@@ -163,6 +164,15 @@ pub(crate) fn return_type(name: &str, arg_types: &[Option<String>]) -> Option<St
     }
     if let Some(ty) = math_return_type(name, arg_types) {
         return ty;
+    }
+    if name == crate::result_types::BITS {
+        return match arg_types.first() {
+            Some(_) => match name {
+                _ if arg_types.len() == 4 => arg_types.get(1).cloned().flatten(),
+                _ => Some("INTEGER".into()),
+            },
+            None => None,
+        };
     }
     Some(
         match name {
@@ -524,6 +534,18 @@ fn bitwise(name: &str, args: &[Value]) -> Result<Value, String> {
         SHIFT_RIGHT => ">>",
         _ => "~",
     };
+    // Bit strings, by their type.
+    if crate::bits::bit_type(&ty).is_some() {
+        let bits = |v: &Value| crate::bits::parse(&text(v));
+        let a = bits(&operands[0])?;
+        return Ok(Value::Text(match name {
+            BIT_NOT => crate::bits::not(&a),
+            SHIFT_LEFT | SHIFT_RIGHT => {
+                crate::bits::shift(&a, int(&operands[1]).unwrap_or(0), name == SHIFT_LEFT)
+            }
+            _ => crate::bits::binary(symbol, &a, &bits(&operands[1])?)?,
+        }));
+    }
     let ints: Option<Vec<i64>> = operands
         .iter()
         .map(|v| match v {
@@ -1130,6 +1152,42 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
         }
 
         // ---- Math -------------------------------------------------------------
+        // Bit string operations: `__BITS__(operation, bits, ...)`.
+        crate::result_types::BITS if args.len() >= 2 => {
+            let bits = match crate::bits::parse(&text(arg(1))) {
+                Ok(bits) => bits,
+                Err(e) => return Some(raise(e)),
+            };
+            let index = |i: usize| -> Result<usize, String> {
+                let n = args.get(i).and_then(int).unwrap_or(-1);
+                if n < 0 || n as usize >= bits.len() {
+                    Err(format!(
+                        "bit index {n} out of valid range (0..{})",
+                        bits.len().saturating_sub(1)
+                    ))
+                } else {
+                    Ok(n as usize)
+                }
+            };
+            let result: Result<Value, String> = match text(arg(0)).as_str() {
+                "int" => crate::bits::to_int(&bits, int(arg(2))? as usize).map(Value::Int),
+                "get_bit" => index(2).map(|i| Value::Int(i64::from(bits.as_bytes()[i] == b'1'))),
+                "set_bit" => index(2).and_then(|i| match args.get(3).and_then(int) {
+                    Some(v @ 0..=1) => {
+                        let mut out = bits.clone().into_bytes();
+                        out[i] = if v == 1 { b'1' } else { b'0' };
+                        Ok(Value::Text(String::from_utf8(out).unwrap_or_default()))
+                    }
+                    _ => Err("new bit must be 0 or 1".into()),
+                }),
+                "bit_count" => Ok(Value::Int(
+                    bits.bytes().filter(|b| *b == b'1').count() as i64
+                )),
+                "octet_length" => Ok(Value::Int(bits.len().div_ceil(8) as i64)),
+                _ => Ok(Value::Int(bits.len() as i64)),
+            };
+            result.unwrap_or_else(raise)
+        }
         crate::result_types::REAL_TEXT if arity(1) => match arg(0) {
             Value::Float(f) => Value::Text(crate::value::float4_text(*f as f32)),
             other => Value::Text(text(other)),
@@ -2466,6 +2524,14 @@ fn format_type(oid: i64, typmod: Option<i64>) -> String {
         1042 => match typmod {
             Some(m) => return format!("character({})", m - 4),
             None => "bpchar",
+        },
+        1560 => match typmod {
+            Some(m) if m >= 0 => return format!("bit({m})"),
+            _ => "bit",
+        },
+        1562 => match typmod {
+            Some(m) if m >= 0 => return format!("bit varying({m})"),
+            _ => "bit varying",
         },
         1043 => match typmod {
             Some(m) => return format!("character varying({})", m - 4),

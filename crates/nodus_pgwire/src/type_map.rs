@@ -16,6 +16,7 @@ fn normalize_type_name(data_type: &str) -> String {
         .trim_matches('"')
         .to_ascii_uppercase()
         .replace("CHARACTER VARYING", "VARCHAR")
+        .replace("BIT VARYING", "VARBIT")
         .replace("DOUBLE PRECISION", "DOUBLE")
         .replace("TIMESTAMP WITH TIME ZONE", "TIMESTAMPTZ")
         .replace("TIMESTAMP WITHOUT TIME ZONE", "TIMESTAMP")
@@ -102,6 +103,8 @@ pub(crate) fn map_declared_type(data_type: &str) -> PgDeclaredType {
     let ty = match base {
         "BOOL" | "BOOLEAN" => Type::BOOL,
         "BYTEA" => Type::BYTEA,
+        "BIT" => Type::BIT,
+        "VARBIT" => Type::VARBIT,
         "PG_CHAR" => Type::CHAR,
         "CHAR" | "CHARACTER" | "BPCHAR" => Type::BPCHAR,
         "DATE" => Type::DATE,

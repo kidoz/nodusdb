@@ -353,6 +353,19 @@ pub(crate) fn try_cast(v: Value, data_type: &str) -> std::result::Result<Value, 
         ColumnType::Text => {
             let upper = data_type.trim().to_ascii_uppercase();
             match &v {
+                // A bit string from its text, or an integer's low bits.
+                _ if crate::bits::bit_type(data_type).is_some() => {
+                    let bits = match &v {
+                        Value::Int(i) => crate::bits::from_int(
+                            *i,
+                            crate::bits::bit_type(data_type)
+                                .and_then(|(length, _)| length)
+                                .unwrap_or(32),
+                        ),
+                        other => crate::bits::parse(&render(other))?,
+                    };
+                    Value::Text(crate::bits::fit(&bits, data_type, true)?)
+                }
                 // Booleans cast to the SQL spellings, not the wire `t`/`f` rendering.
                 Value::Bool(b) => Value::Text(if *b { "true" } else { "false" }.to_string()),
                 // `json` keeps its text; `jsonb` is the parsed document.
@@ -569,6 +582,24 @@ pub(crate) fn lower_scalar(expr: &sqlparser::ast::Expr, params: &[Value]) -> Opt
         Expr::Value(v) if matches!(v.value, sqlparser::ast::Value::Placeholder(_)) => Some(
             ScalarExpr::Literal(expr_to_value(expr, params).unwrap_or(Value::Null)),
         ),
+        // `B'1010'` and `X'1F'` are bit strings as long as their digits.
+        Expr::Value(v)
+            if matches!(
+                v.value,
+                sqlparser::ast::Value::SingleQuotedByteStringLiteral(_)
+                    | sqlparser::ast::Value::HexStringLiteral(_)
+            ) =>
+        {
+            let bits = match &v.value {
+                sqlparser::ast::Value::SingleQuotedByteStringLiteral(s) => s.clone(),
+                sqlparser::ast::Value::HexStringLiteral(s) => crate::bits::hex_bits(s)?,
+                _ => return None,
+            };
+            Some(ScalarExpr::Cast {
+                target: format!("BIT({})", bits.len().max(1)),
+                expr: Box::new(ScalarExpr::Literal(Value::Text(bits))),
+            })
+        }
         Expr::Value(_) => expr_to_value(expr, params).map(ScalarExpr::Literal),
         // An interval literal keeps its type, so operators on it know it.
         Expr::Interval(iv) => Some(ScalarExpr::Cast {

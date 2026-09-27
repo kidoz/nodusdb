@@ -19,6 +19,7 @@ use std::sync::Arc;
 mod advisory;
 mod aggregates;
 mod alter_table;
+mod bits;
 mod constraints;
 mod cte_scope;
 mod datetime;

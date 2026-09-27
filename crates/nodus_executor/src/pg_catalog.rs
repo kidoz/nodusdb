@@ -1455,6 +1455,8 @@ impl MemExecutor {
             (701, "float8", 8, 1022, "_float8"),
             (1042, "bpchar", -1, 1014, "_bpchar"),
             (1043, "varchar", -1, 1015, "_varchar"),
+            (1560, "bit", -1, 1561, "_bit"),
+            (1562, "varbit", -1, 1563, "_varbit"),
             (1082, "date", 4, 1182, "_date"),
             (1083, "time", 8, 1183, "_time"),
             (1114, "timestamp", 8, 1115, "_timestamp"),

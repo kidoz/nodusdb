@@ -315,6 +315,13 @@ pub(crate) fn coerce_for_column(value: &Value, data_type: &str) -> Value {
             crate::planner::cast_value(Value::Text(text.clone()), data_type)
         }
         Value::Record(_) => coerce_for_column(&Value::Text(render(value)), data_type),
+        // Text into a bit string column must fit its length.
+        Value::Text(s) if crate::bits::bit_type(data_type).is_some() => {
+            match crate::bits::parse(s).and_then(|bits| crate::bits::fit(&bits, data_type, false)) {
+                Ok(bits) => Value::Text(bits),
+                Err(e) => crate::eval_error::raise(e),
+            }
+        }
         // JSON text must parse; a `jsonb` column stores the parsed document.
         Value::Text(_) if is_json_type(data_type) => {
             crate::planner::cast_value(value.clone(), data_type)

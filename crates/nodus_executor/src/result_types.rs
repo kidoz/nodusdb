@@ -205,6 +205,11 @@ fn binary_type(op: ScalarBinaryOp, left: Option<String>, right: Option<String>) 
         Op::Concat => match (&left, &right) {
             (Some(l), _) if l.ends_with("[]") => left,
             (_, Some(r)) if r.ends_with("[]") => right,
+            (Some(l), Some(r))
+                if crate::bits::bit_type(l).is_some() && crate::bits::bit_type(r).is_some() =>
+            {
+                Some("VARBIT".into())
+            }
             _ => Some("TEXT".into()),
         },
         Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Mod => {
@@ -407,6 +412,45 @@ pub(crate) fn check_integer_ranges(
             e.clone()
         }
     };
+    // A bit string as an integer is its bits, and the bit string
+    // functions read bits rather than text.
+    let bit_typed = |e: &ScalarExpr| {
+        scalar_type(e, column).is_some_and(|t| crate::bits::bit_type(&t).is_some())
+    };
+    if let ScalarExpr::Cast {
+        expr: inner,
+        target,
+    } = &checked
+        && bit_typed(inner)
+        && let Some(rank) = integer_rank(target)
+    {
+        return ScalarExpr::Cast {
+            expr: Box::new(ScalarExpr::Function {
+                name: BITS.to_string(),
+                args: vec![
+                    ScalarExpr::Literal(Value::Text("int".into())),
+                    (**inner).clone(),
+                    ScalarExpr::Literal(Value::Int(if rank == 3 { 64 } else { 32 })),
+                ],
+            }),
+            target: target.clone(),
+        };
+    }
+    if let ScalarExpr::Function { name, args } = &checked
+        && matches!(
+            name.as_str(),
+            "GET_BIT" | "SET_BIT" | "BIT_COUNT" | "OCTET_LENGTH" | "BIT_LENGTH"
+        )
+        && args.first().is_some_and(bit_typed)
+    {
+        return ScalarExpr::Function {
+            name: BITS.to_string(),
+            args: [ScalarExpr::Literal(Value::Text(name.to_ascii_lowercase()))]
+                .into_iter()
+                .chain(args.iter().cloned())
+                .collect(),
+        };
+    }
     if let ScalarExpr::Cast {
         expr: inner,
         target,
@@ -637,6 +681,10 @@ pub(crate) fn bitwise_type(name: &str, arg_types: &[Option<String>]) -> Option<S
 /// The function an interval sort key is rewritten to: its length of time,
 /// as a number of microseconds (a month as 30 days).
 pub(crate) const INTERVAL_SPAN: &str = "__INTERVAL_SPAN__";
+
+/// The function the bit string operations that differ from text's are
+/// rewritten to: `__BITS__(operation, bits, ...)`.
+pub(crate) const BITS: &str = "__BITS__";
 
 /// The functions a `real`'s text and numeric value are rewritten to.
 pub(crate) const REAL_TEXT: &str = "__REAL_TEXT__";

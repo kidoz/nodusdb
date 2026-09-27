@@ -1,0 +1,62 @@
+# Bit strings: B'' and X'' literals, bit(n) and varbit(n), casts to and from integers, and the bitwise operators.
+query TTTTTTTTT
+SELECT B'1010', B'1010' & B'0110', B'1010' | B'0101', B'1010' # B'0110', ~B'1010', B'1010' << 1, B'1010' >> 2, X'1F', X'a0';
+----
+1010	0010	1111	1100	0101	0100	0010	00011111	10100000
+
+query TTTTTTTT
+SELECT B'101'::int, 5::bit(4), 5::bit(40), (-1)::bit(8), 300::bit(8), 1::bit, B'11111111111111111111111111111111'::int4, B'101'::int8;
+----
+5	0101	0000000000000000000000000000000000000101	11111111	00101100	1	-1	5
+
+query TTTTTT
+SELECT length(B'10101'), bit_count(B'1011'), bit_length(B'10101'), octet_length(B'101010101'), pg_typeof(B'101'), pg_typeof(B'1'::varbit);
+----
+5	3	5	2	bit	bit varying
+
+query TTTTTTT
+SELECT '1010'::bit(4), '101'::varbit, B'1' || B'01', substring(B'110010' from 2 for 3), get_bit(B'1010', 1), set_bit(B'1010', 0, 0), position(B'01' in B'1101');
+----
+1010	101	101	100	0	0010	3
+
+query TTTTTT
+SELECT '101'::bit(4), '10101'::bit(4), '1010'::bit, '10101'::varbit(3), B'10'::bit(4), 'x1F'::bit(8);
+----
+1010	1010	1	101	1000	00011111
+
+statement error
+SELECT '102'::bit(3);
+
+statement error
+SELECT B'10' & B'101';
+
+query TTTTT
+SELECT B'101' < B'110', B'10' < B'100', B'101' = B'101', B'1'::bit(2) = B'10', B'1010'::text;
+----
+t	t	t	t	1010
+
+statement ok
+CREATE TABLE bt (b bit(4), v varbit(5));
+
+statement ok
+INSERT INTO bt VALUES (B'1010', B'101');
+
+statement error
+INSERT INTO bt VALUES (B'101', B'1');
+
+statement error
+INSERT INTO bt VALUES (B'1010', B'101010');
+
+statement ok
+INSERT INTO bt VALUES ('0011', '11');
+
+query TTTTTTT
+SELECT b, v, b & B'1100', v || B'0', length(v), pg_typeof(b), pg_typeof(v) FROM bt ORDER BY b;
+----
+0011	11	0000	110	2	bit	bit varying
+1010	101	1000	1010	3	bit	bit varying
+
+query TTTT
+SELECT format_type('bit'::regtype, 8), format_type('varbit'::regtype, 5), format_type(1560, NULL), format_type(1562, NULL);
+----
+bit(8)	bit varying(5)	bit	bit varying
