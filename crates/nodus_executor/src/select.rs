@@ -2030,6 +2030,7 @@ impl MemExecutor {
                         Value::Jsonb(_) => ty = "VARCHAR".to_string(),
                         Value::Json(_) => ty = "JSON".to_string(),
                         Value::Record(_) => ty = "VARCHAR".to_string(),
+                        Value::Bytea(_) => ty = "BYTEA".to_string(),
                     }
                 }
             } else if ty == "VARCHAR" {

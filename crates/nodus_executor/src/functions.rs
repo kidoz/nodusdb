@@ -74,7 +74,10 @@ pub(crate) fn is_known(name: &str) -> bool {
                 | "ASINH" | "ACOSH" | "ATANH" | "SIND" | "COSD" | "TAND" | "COTD" | "ASIND"
                 | "ACOSD" | "ATAND" | "ATAN2D" | "SETSEED" | "RANDOM_NORMAL"
                 | crate::result_types::REAL_TEXT | crate::result_types::REAL_NUMERIC
-                | "GET_BIT" | "SET_BIT" | "BIT_COUNT" | crate::result_types::BITS
+                | "SHA224" | "SHA256" | "SHA384" | "SHA512" | "ENCODE" | "DECODE" | "CONVERT_TO"
+                | "CONVERT_FROM" | "CONVERT" | "GET_BYTE" | "SET_BYTE" | "GET_BIT" | "SET_BIT"
+                | "CRC32" | "CRC32C" | "PG_COLUMN_SIZE" | crate::result_types::INT_BYTEA
+                | "BIT_COUNT" | crate::result_types::BITS
                 | crate::result_types::BIT_AND | crate::result_types::BIT_OR
                 | crate::result_types::BIT_XOR | crate::result_types::SHIFT_LEFT
                 | crate::result_types::SHIFT_RIGHT | crate::result_types::BIT_NOT
@@ -165,14 +168,44 @@ pub(crate) fn return_type(name: &str, arg_types: &[Option<String>]) -> Option<St
     if let Some(ty) = math_return_type(name, arg_types) {
         return ty;
     }
-    if name == crate::result_types::BITS {
-        return match arg_types.first() {
-            Some(_) => match name {
-                _ if arg_types.len() == 4 => arg_types.get(1).cloned().flatten(),
-                _ => Some("INTEGER".into()),
-            },
-            None => None,
-        };
+    let bytea_argument = arg_types
+        .first()
+        .cloned()
+        .flatten()
+        .is_some_and(|t| crate::value::is_bytea_type(&t));
+    match name {
+        "SUBSTR" | "SUBSTRING" | "OVERLAY" | "TRIM" | "BTRIM" | "LTRIM" | "RTRIM" | "REVERSE"
+            if bytea_argument =>
+        {
+            return Some("BYTEA".into());
+        }
+        "SHA224"
+        | "SHA256"
+        | "SHA384"
+        | "SHA512"
+        | "DECODE"
+        | "CONVERT_TO"
+        | "CONVERT"
+        | "SET_BYTE"
+        | "SET_BIT"
+        | crate::result_types::INT_BYTEA => return Some("BYTEA".into()),
+        "ENCODE" | "CONVERT_FROM" => {
+            return Some("TEXT".into());
+        }
+        "GET_BYTE" | "GET_BIT" | "PG_COLUMN_SIZE" => {
+            return Some("INTEGER".into());
+        }
+        "CRC32" | "CRC32C" | "BIT_COUNT" => return Some("BIGINT".into()),
+        crate::result_types::BITS => {
+            return match arg_types.first() {
+                Some(_) => match name {
+                    _ if arg_types.len() == 4 => arg_types.get(1).cloned().flatten(),
+                    _ => Some("INTEGER".into()),
+                },
+                None => None,
+            };
+        }
+        _ => {}
     }
     Some(
         match name {
@@ -583,6 +616,197 @@ fn bitwise(name: &str, args: &[Value]) -> Result<Value, String> {
     }))
 }
 
+/// Functions whose (untyped) text arguments are `bytea` input.
+const BYTEA_FUNCTIONS: &[&str] = &[
+    "SHA224",
+    "SHA256",
+    "SHA384",
+    "SHA512",
+    "ENCODE",
+    "DECODE",
+    "CONVERT_TO",
+    "CONVERT_FROM",
+    "CONVERT",
+    "GET_BYTE",
+    "SET_BYTE",
+    "GET_BIT",
+    "SET_BIT",
+    "CRC32",
+    "CRC32C",
+    crate::result_types::INT_BYTEA,
+];
+
+/// The `bytea` functions, and the string functions on `bytea` arguments;
+/// `None` for other calls.
+fn bytea_function(name: &str, args: &[Value]) -> Option<Value> {
+    use sha2::Digest;
+    let arity = |n: usize| args.len() == n;
+    let arg = |i: usize| args.get(i).unwrap_or(&Value::Null);
+    // A `bytea` argument's bytes; text is `bytea` input.
+    let bytes = |v: &Value| -> Result<Vec<u8>, String> {
+        match v {
+            Value::Bytea(b) => Ok(b.clone()),
+            Value::Text(t) => crate::bytea::parse_input(t),
+            other => Ok(render(other).into_bytes()),
+        }
+    };
+    let result = |r: Result<Value, String>| Some(r.unwrap_or_else(raise));
+    let out_of_range = |index: i64, bits: usize| {
+        format!(
+            "index {index} out of valid range, 0..{}",
+            bits.saturating_sub(1)
+        )
+    };
+    match name {
+        "LENGTH" | "OCTET_LENGTH" if arity(1) => {
+            result(bytes(arg(0)).map(|b| Value::Int(b.len() as i64)))
+        }
+        "BIT_LENGTH" if arity(1) => result(bytes(arg(0)).map(|b| Value::Int(b.len() as i64 * 8))),
+        "MD5" if arity(1) => result(bytes(arg(0)).map(|b| {
+            use md5::Digest;
+            Value::Text(
+                md5::Md5::digest(&b)
+                    .iter()
+                    .map(|x| format!("{x:02x}"))
+                    .collect(),
+            )
+        })),
+        "SHA224" | "SHA256" | "SHA384" | "SHA512" if arity(1) => result(bytes(arg(0)).map(|b| {
+            Value::Bytea(match name {
+                "SHA224" => sha2::Sha224::digest(&b).to_vec(),
+                "SHA256" => sha2::Sha256::digest(&b).to_vec(),
+                "SHA384" => sha2::Sha384::digest(&b).to_vec(),
+                _ => sha2::Sha512::digest(&b).to_vec(),
+            })
+        })),
+        "BIT_COUNT" if arity(1) => result(
+            bytes(arg(0)).map(|b| Value::Int(b.iter().map(|x| i64::from(x.count_ones())).sum())),
+        ),
+        "CRC32" | "CRC32C" if arity(1) => result(
+            bytes(arg(0)).map(|b| Value::Int(i64::from(crate::bytea::crc32(&b, name == "CRC32C")))),
+        ),
+        "ENCODE" if arity(2) => result(
+            bytes(arg(0)).and_then(|b| crate::bytea::encode(&b, &text(arg(1))).map(Value::Text)),
+        ),
+        "DECODE" if arity(2) => {
+            result(crate::bytea::decode(&text(arg(0)), &text(arg(1))).map(Value::Bytea))
+        }
+        "CONVERT_TO" if arity(2) => {
+            result(crate::bytea::convert_to(&text(arg(0)), &text(arg(1))).map(Value::Bytea))
+        }
+        "CONVERT_FROM" if arity(2) => result(
+            bytes(arg(0))
+                .and_then(|b| crate::bytea::convert_from(&b, &text(arg(1))).map(Value::Text)),
+        ),
+        "CONVERT" if arity(3) => result(bytes(arg(0)).and_then(|b| {
+            crate::bytea::convert(&b, &text(arg(1)), &text(arg(2))).map(Value::Bytea)
+        })),
+        "GET_BYTE" | "GET_BIT" if arity(2) => result(bytes(arg(0)).and_then(|b| {
+            let n = int(arg(1)).unwrap_or(-1);
+            let bit = name == "GET_BIT";
+            let size = if bit { b.len() * 8 } else { b.len() };
+            if n < 0 || n as usize >= size {
+                return Err(out_of_range(n, size));
+            }
+            let n = n as usize;
+            Ok(Value::Int(if bit {
+                i64::from(b[n / 8] >> (n % 8) & 1)
+            } else {
+                i64::from(b[n])
+            }))
+        })),
+        "SET_BYTE" | "SET_BIT" if arity(3) => result(bytes(arg(0)).and_then(|mut b| {
+            let n = int(arg(1)).unwrap_or(-1);
+            let value = int(arg(2)).unwrap_or(0);
+            let bit = name == "SET_BIT";
+            let size = if bit { b.len() * 8 } else { b.len() };
+            if n < 0 || n as usize >= size {
+                return Err(out_of_range(n, size));
+            }
+            let n = n as usize;
+            if bit {
+                if !(0..=1).contains(&value) {
+                    return Err("new bit must be 0 or 1".into());
+                }
+                let mask = 1u8 << (n % 8);
+                if value == 1 {
+                    b[n / 8] |= mask;
+                } else {
+                    b[n / 8] &= !mask;
+                }
+            } else {
+                b[n] = value as u8;
+            }
+            Ok(Value::Bytea(b))
+        })),
+        crate::result_types::INT_BYTEA if arity(2) => {
+            let n = int(arg(0))?;
+            let width = int(arg(1))? as usize;
+            Some(Value::Bytea(n.to_be_bytes()[8 - width..].to_vec()))
+        }
+        "STRPOS" if arity(2) => result(bytes(arg(0)).and_then(|haystack| {
+            let needle = bytes(arg(1))?;
+            Ok(Value::Int(if needle.is_empty() {
+                1
+            } else {
+                haystack
+                    .windows(needle.len())
+                    .position(|w| w == needle.as_slice())
+                    .map_or(0, |p| p as i64 + 1)
+            }))
+        })),
+        "SUBSTR" | "SUBSTRING" if arity(2) || arity(3) => result(bytes(arg(0)).and_then(|b| {
+            let start = int(arg(1)).unwrap_or(1);
+            let end = match args.get(2) {
+                Some(len) => {
+                    let len = int(len).unwrap_or(0);
+                    if len < 0 {
+                        return Err("negative substring length not allowed".into());
+                    }
+                    start.saturating_add(len)
+                }
+                None => i64::MAX,
+            };
+            let from = (start.max(1) - 1) as usize;
+            let to = (end.max(1) - 1).min(b.len() as i64) as usize;
+            Ok(Value::Bytea(
+                b.get(from..to.max(from)).unwrap_or(&[]).to_vec(),
+            ))
+        })),
+        "OVERLAY" if arity(3) || arity(4) => result(bytes(arg(0)).and_then(|b| {
+            let replacement = bytes(arg(1))?;
+            let from = (int(arg(2)).unwrap_or(1).max(1) - 1) as usize;
+            let len = match args.get(3) {
+                Some(l) => int(l).unwrap_or(0).max(0) as usize,
+                None => replacement.len(),
+            };
+            let mut out: Vec<u8> = b.iter().take(from).copied().collect();
+            out.extend(replacement);
+            out.extend(b.iter().skip(from + len));
+            Ok(Value::Bytea(out))
+        })),
+        "TRIM" | "BTRIM" | "LTRIM" | "RTRIM" if arity(2) => result(bytes(arg(0)).and_then(|b| {
+            let set = bytes(arg(1))?;
+            let (mut from, mut to) = (0, b.len());
+            if name != "RTRIM" {
+                while from < to && set.contains(&b[from]) {
+                    from += 1;
+                }
+            }
+            if name != "LTRIM" {
+                while to > from && set.contains(&b[to - 1]) {
+                    to -= 1;
+                }
+            }
+            Ok(Value::Bytea(b[from..to].to_vec()))
+        })),
+        "REVERSE" if arity(1) => {
+            result(bytes(arg(0)).map(|b| Value::Bytea(b.into_iter().rev().collect())))
+        }
+        _ => None,
+    }
+}
+
 /// A math function's argument as a numeric: an integer or numeric as it is,
 /// a float as PostgreSQL converts it, and text as numeric input.
 fn decimal(v: &Value) -> Option<Numeric> {
@@ -783,6 +1007,11 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
     if let Some(value) = crate::session_functions::dispatch(name, args) {
         return Some(value);
     }
+    if (BYTEA_FUNCTIONS.contains(&name) || args.iter().any(|a| matches!(a, Value::Bytea(_))))
+        && let Some(value) = bytea_function(name, args)
+    {
+        return Some(value);
+    }
     let arity = |n: usize| args.len() == n;
     let arg = |i: usize| args.get(i).unwrap_or(&Value::Null);
     Some(match name {
@@ -811,6 +1040,37 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
                 }
             }
             Value::Text(out)
+        }
+        // The bytes a value takes, as PostgreSQL stores a computed one (the
+        // second argument names its type).
+        "PG_COLUMN_SIZE" if arity(1) || arity(2) => {
+            let ty = args
+                .get(1)
+                .map(text)
+                .unwrap_or_default()
+                .to_ascii_uppercase();
+            let fixed = match ty.as_str() {
+                "BOOLEAN" | "BOOL" | "\"CHAR\"" => Some(1),
+                "SMALLINT" | "INT2" => Some(2),
+                "INTEGER" | "INT" | "INT4" | "REAL" | "FLOAT4" | "DATE" | "OID" => Some(4),
+                "BIGINT" | "INT8" | "DOUBLE PRECISION" | "FLOAT8" | "TIMESTAMP" | "TIMESTAMPTZ"
+                | "TIME" => Some(8),
+                "TIMETZ" => Some(12),
+                "INTERVAL" | "UUID" => Some(16),
+                _ => None,
+            };
+            Value::Int(match (fixed, arg(0)) {
+                (Some(size), _) => size,
+                (None, Value::Int(_)) => 4,
+                (None, Value::Float(_)) => 8,
+                (None, Value::Bool(_)) => 1,
+                (None, Value::Numeric(d)) => {
+                    let groups = d.to_binary().len() as i64 - 8;
+                    4 + 2 + groups
+                }
+                (None, Value::Bytea(b)) => 4 + b.len() as i64,
+                (None, other) => 4 + render(other).len() as i64,
+            })
         }
         "SUBSTR" | "SUBSTRING" if arity(2) || arity(3) => {
             let chars: Vec<char> = text(arg(0)).chars().collect();
@@ -1839,6 +2099,7 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
                 Value::Jsonb(_) => "jsonb",
                 Value::Json(_) => "json",
                 Value::Record(_) => "record",
+                Value::Bytea(_) => "bytea",
                 Value::Array(_) => "text[]",
                 Value::Null => "unknown",
             }
@@ -2744,6 +3005,7 @@ pub(crate) fn to_json(v: &Value) -> serde_json::Value {
             .map_or_else(|_| J::String(d.to_string()), J::Number),
         Value::Bool(b) => J::Bool(*b),
         Value::Text(s) => J::String(s.clone()),
+        Value::Bytea(bytes) => J::String(crate::bytea::hex_text(bytes)),
         Value::Array(items) => J::Array(items.iter().map(to_json).collect()),
         Value::Jsonb(j) => j.clone(),
         Value::Json(text) => {

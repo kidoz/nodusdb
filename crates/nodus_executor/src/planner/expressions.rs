@@ -300,6 +300,23 @@ pub(crate) fn try_cast(v: Value, data_type: &str) -> std::result::Result<Value, 
                     .to_i64()
                     .ok_or_else(|| d.integer_error(&crate::value::sql_type_name(data_type)))?,
                 Value::Bool(b) => i64::from(*b),
+                // Big-endian bytes, as wide as the type at most.
+                Value::Bytea(bytes) => {
+                    let width = match crate::value::integer_range(data_type).1 {
+                        max if max <= i64::from(i16::MAX) => 2,
+                        max if max <= i64::from(i32::MAX) => 4,
+                        _ => 8,
+                    };
+                    if bytes.len() > width {
+                        return Err(out_of_range());
+                    }
+                    let unsigned = bytes.iter().fold(0u64, |n, b| n << 8 | u64::from(*b));
+                    match width {
+                        2 => i64::from(unsigned as u16 as i16),
+                        4 => i64::from(unsigned as u32 as i32),
+                        _ => unsigned as i64,
+                    }
+                }
                 Value::Text(s) => {
                     let n = crate::value::parse_integer_text(s).ok_or_else(|| invalid(s))?;
                     let (min, max) = crate::value::integer_range(data_type);
@@ -366,6 +383,9 @@ pub(crate) fn try_cast(v: Value, data_type: &str) -> std::result::Result<Value, 
                     };
                     Value::Text(crate::bits::fit(&bits, data_type, true)?)
                 }
+                Value::Bytea(_) if upper == "BYTEA" => v.clone(),
+                Value::Text(s) if upper == "BYTEA" => Value::Bytea(crate::bytea::parse_input(s)?),
+                _ if upper == "BYTEA" => Value::Bytea(crate::bytea::parse_input(&render(&v))?),
                 // Booleans cast to the SQL spellings, not the wire `t`/`f` rendering.
                 Value::Bool(b) => Value::Text(if *b { "true" } else { "false" }.to_string()),
                 // `json` keeps its text; `jsonb` is the parsed document.
@@ -1635,7 +1655,10 @@ fn pattern_match(
     if matches!(value, Value::Null) || matches!(pattern, Value::Null) {
         return None;
     }
-    let pattern = render(pattern);
+    let pattern = match pattern {
+        Value::Bytea(bytes) => bytes.iter().map(|&b| char::from(b)).collect(),
+        other => render(other),
+    };
     let source = match kind {
         PatternKind::Like => like_to_regex(&pattern, escape)?,
         PatternKind::SimilarTo => similar_to_regex(&pattern, escape)?,
@@ -1646,7 +1669,12 @@ fn pattern_match(
     } else {
         source
     };
-    cached_regex(&source).map(|re| re.is_match(&render(value)))
+    // `bytea` matches byte by byte.
+    let subject = match value {
+        Value::Bytea(bytes) => bytes.iter().map(|&b| char::from(b)).collect(),
+        other => render(other),
+    };
+    cached_regex(&source).map(|re| re.is_match(&subject))
 }
 
 /// Translates a LIKE pattern into an anchored regex: `%` is any run, `_` one
@@ -2596,6 +2624,24 @@ pub(crate) fn apply_binary_op(op: ScalarBinaryOp, l: Value, r: Value) -> Value {
                 }
                 _ => {}
             }
+            // `bytea || bytea`, where an untyped literal side is `bytea`.
+            if matches!(l, Value::Bytea(_)) || matches!(r, Value::Bytea(_)) {
+                let bytes = |v: &Value| match v {
+                    Value::Bytea(b) => Ok(b.clone()),
+                    Value::Text(t) => crate::bytea::parse_input(t),
+                    other => Ok(render(other).into_bytes()),
+                };
+                if matches!(l, Value::Null) || matches!(r, Value::Null) {
+                    return Value::Null;
+                }
+                return match (bytes(&l), bytes(&r)) {
+                    (Ok(mut a), Ok(b)) => {
+                        a.extend(b);
+                        Value::Bytea(a)
+                    }
+                    (Err(e), _) | (_, Err(e)) => crate::eval_error::raise(e),
+                };
+            }
             if matches!(l, Value::Null) || matches!(r, Value::Null) {
                 Value::Null
             } else {
@@ -2680,6 +2726,8 @@ fn unify_for_comparison(l: Value, r: Value) -> (Value, Value) {
             },
             Value::Jsonb(_) => serde_json::from_str(t).ok().map(Value::Jsonb),
             Value::Numeric(_) => crate::numeric::Numeric::parse(t).ok().map(Value::Numeric),
+            // `bytea` input, untrimmed.
+            Value::Bytea(_) => crate::bytea::parse_input(text).ok().map(Value::Bytea),
             _ => None,
         }
     }

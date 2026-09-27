@@ -20,6 +20,7 @@ mod advisory;
 mod aggregates;
 mod alter_table;
 mod bits;
+pub mod bytea;
 mod constraints;
 mod cte_scope;
 mod datetime;

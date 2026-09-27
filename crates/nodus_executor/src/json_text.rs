@@ -109,6 +109,7 @@ pub(crate) fn value_json(value: &crate::Value, pretty: bool, out: &mut String) {
         Value::Int(i) => out.push_str(&i.to_string()),
         Value::Numeric(d) if d.is_finite() => out.push_str(&d.to_string()),
         Value::Numeric(d) => write_string(&d.to_string(), out),
+        Value::Bytea(bytes) => write_string(&crate::bytea::hex_text(bytes), out),
         Value::Float(f) if f.is_finite() => out.push_str(&crate::render(value)),
         // Not a JSON number, so a string of `float8`'s text for it.
         Value::Float(f) => write_string(

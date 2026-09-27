@@ -194,6 +194,7 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
         if rows.iter().any(|row| row.len() != rows[0].len()) {
             anyhow::bail!("VALUES lists must all be the same length");
         }
+        let rows = typed_values_rows(rows);
         return select_from_result(LogicalPlan::Values { rows }, ctes, query, params);
     }
 
@@ -1194,6 +1195,41 @@ fn lift_set_returning_functions(
         arg_exprs: Vec::new(),
         rows_from: calls.iter().map(|(call, _)| member(call)).collect(),
     })
+}
+
+/// A `VALUES` list with each untyped string literal cast to its column's
+/// type, when another row gives the column a type that is not text
+/// (`VALUES ('\\x01'::bytea), ('\\x0a')` is two `bytea` values).
+fn typed_values_rows(mut rows: Vec<Vec<ScalarExpr>>) -> Vec<Vec<ScalarExpr>> {
+    let untyped = |e: &ScalarExpr| matches!(e, ScalarExpr::Literal(Value::Text(_) | Value::Null));
+    let columns = rows.first().map_or(0, Vec::len);
+    for col in 0..columns {
+        let Some(ty) = rows
+            .iter()
+            .map(|row| &row[col])
+            .find(|e| !untyped(e))
+            .and_then(crate::result_types::constant_expr_type)
+        else {
+            continue;
+        };
+        let upper = ty.to_ascii_uppercase();
+        let textual = ["TEXT", "VARCHAR", "CHARACTER", "CHAR", "BPCHAR", "NAME"]
+            .iter()
+            .any(|t| upper.starts_with(t));
+        if textual {
+            continue;
+        }
+        for row in &mut rows {
+            if matches!(row[col], ScalarExpr::Literal(Value::Text(_))) {
+                let literal = row[col].clone();
+                row[col] = ScalarExpr::Cast {
+                    expr: Box::new(literal),
+                    target: ty.clone(),
+                };
+            }
+        }
+    }
+    rows
 }
 
 /// The table functions a select list may call for their rows.

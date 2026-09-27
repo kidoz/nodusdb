@@ -45,6 +45,9 @@ pub enum Value {
     /// its fields' names and values, for the JSON functions that take one.
     /// Rows store it as its text.
     Record(Vec<(String, Value)>),
+    /// A `bytea` value. Rows store it as its `\x` hex text, which
+    /// [`restore_row`] turns back into bytes from the column's type.
+    Bytea(Vec<u8>),
 }
 
 /// Encodes a row for storage. A numeric is written as its decimal text, so
@@ -56,6 +59,7 @@ pub(crate) fn encode_row(row: &[Value]) -> serde_json::Result<String> {
             Value::Numeric(d) => Value::Text(d.to_string()),
             Value::Json(text) => Value::Text(text.clone()),
             Value::Record(_) => Value::Text(render(v)),
+            Value::Bytea(bytes) => Value::Text(crate::bytea::hex_text(bytes)),
             other => other.clone(),
         })
         .collect();
@@ -71,6 +75,12 @@ pub(crate) fn restore_row(row: &mut [Value], columns: &[nodus_catalog::ColumnDes
         if column.data_type.trim().eq_ignore_ascii_case("json") {
             if let Value::Text(t) = &*value {
                 *value = Value::Json(t.clone());
+            }
+            continue;
+        }
+        if is_bytea_type(&column.data_type) {
+            if let Value::Text(t) = &*value {
+                *value = Value::Bytea(crate::bytea::from_stored(t));
             }
             continue;
         }
@@ -110,6 +120,11 @@ pub(crate) fn object_identifier_type(data_type: &str) -> Option<&'static str> {
 }
 
 /// Whether a declared type is `jsonb`.
+/// Whether a declared type is `bytea`.
+pub(crate) fn is_bytea_type(data_type: &str) -> bool {
+    data_type.trim().eq_ignore_ascii_case("bytea")
+}
+
 pub(crate) fn is_jsonb_type(data_type: &str) -> bool {
     data_type.trim().eq_ignore_ascii_case("jsonb")
 }
@@ -322,6 +337,14 @@ pub(crate) fn coerce_for_column(value: &Value, data_type: &str) -> Value {
                 Err(e) => crate::eval_error::raise(e),
             }
         }
+        // Text into a `bytea` column is `bytea` input; bytes stay bytes.
+        Value::Text(_) if is_bytea_type(data_type) => {
+            crate::planner::cast_value(value.clone(), data_type)
+        }
+        Value::Bytea(_) if is_bytea_type(data_type) => value.clone(),
+        Value::Bytea(bytes) => {
+            coerce_for_column(&Value::Text(crate::bytea::hex_text(bytes)), data_type)
+        }
         // JSON text must parse; a `jsonb` column stores the parsed document.
         Value::Text(_) if is_json_type(data_type) => {
             crate::planner::cast_value(value.clone(), data_type)
@@ -407,6 +430,7 @@ pub(crate) fn value_type_name(value: &Value) -> &'static str {
         Value::Jsonb(_) => "jsonb",
         Value::Json(_) => "json",
         Value::Record(_) => "record",
+        Value::Bytea(_) => "bytea",
         Value::Null => "unknown",
     }
 }
@@ -577,6 +601,7 @@ pub fn render(value: &Value) -> String {
         Value::Jsonb(j) => crate::json_text::jsonb_text(j),
         Value::Json(text) => text.clone(),
         Value::Record(fields) => record_text(fields),
+        Value::Bytea(bytes) => crate::bytea::hex_text(bytes),
         Value::Null => String::new(),
     }
 }
@@ -1032,6 +1057,7 @@ fn type_rank(v: &Value) -> u8 {
         Value::Array(_) => 4,
         Value::Jsonb(_) => 5,
         Value::Record(_) => 6,
+        Value::Bytea(_) => 7,
     }
 }
 
@@ -1070,6 +1096,7 @@ pub(crate) fn compare(a: &Value, b: &Value) -> std::cmp::Ordering {
             x.len().cmp(&y.len())
         }
         (Value::Jsonb(x), Value::Jsonb(y)) => crate::json_text::jsonb_cmp(x, y),
+        (Value::Bytea(x), Value::Bytea(y)) => x.cmp(y),
         (Value::Record(x), Value::Record(y)) => {
             for ((_, xe), (_, ye)) in x.iter().zip(y.iter()) {
                 let ord = compare(xe, ye);

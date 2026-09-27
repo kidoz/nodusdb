@@ -1,0 +1,129 @@
+# bytea: input and output forms, the byte functions, hashes and checksums, encodings, and integer conversions.
+query TTTTTTT
+SELECT 'abc'::bytea, '\x616263'::bytea, '\x61 62'::bytea, E'\\001'::bytea, 'a\101b'::bytea, 'é'::bytea, '\x'::bytea;
+----
+\x616263	\x616263	\x6162	\x01	\x614162	\xc3a9	\x
+
+statement error
+SELECT '\xZZ'::bytea;
+
+statement error
+SELECT '\x6'::bytea;
+
+statement error
+SELECT 'a\9b'::bytea;
+
+query TTTTTTT
+SELECT length('\x0102'::bytea), octet_length('abc'::bytea), bit_length('ab'::bytea), 'ab'::bytea || 'cd'::bytea, 'ab'::bytea || 'c', substring('\x010203'::bytea from 2 for 1), substr('\x01020304'::bytea, 2);
+----
+2	3	16	\x61626364	\x616263	\x02	\x020304
+
+query TTTTT
+SELECT get_byte('\x0102'::bytea, 1), set_byte('\x0102'::bytea, 0, 255), get_bit('\x01'::bytea, 0), set_bit('\x00'::bytea, 7, 1), bit_count('\x0f01'::bytea);
+----
+2	\xff02	1	\x80	5
+
+statement error
+SELECT get_byte('\x01'::bytea, 5);
+
+statement error
+SELECT get_bit('\x01'::bytea, 8);
+
+query TTTTTTT
+SELECT position('\x02'::bytea in '\x010203'::bytea), btrim('\x000100'::bytea, '\x00'::bytea), ltrim('\x0001'::bytea, '\x00'::bytea), rtrim('\x0100'::bytea, '\x00'::bytea), trim('\x00'::bytea from '\x000100'::bytea), overlay('\x010203'::bytea placing '\xff'::bytea from 2 for 1), reverse('\x0102'::bytea);
+----
+2	\x01	\x01	\x01	\x01	\x01ff03	\x0201
+
+query TTTTTT
+SELECT '\x0a'::bytea < '\x0b'::bytea, 'ab'::bytea = 'ab', '\x01'::bytea < '\x0100'::bytea, 'abc'::bytea LIKE 'a%', max(x), min(x) FROM (VALUES ('\x01'::bytea), ('\x0a')) v(x);
+----
+t	t	t	t	\x0a	\x01
+
+query TTTTTTTT
+SELECT md5('abc'::bytea), md5(''), sha224(''), sha256('abc'::bytea), sha384('abc'), sha512(''), crc32('abc'::bytea), crc32c('abc'::bytea);
+----
+900150983cd24fb0d6963f7d28e17f72	d41d8cd98f00b204e9800998ecf8427e	\xd14a028c2a3a2bc9476102bb288234c415a2b01f828ea62ac5b3e42f	\xba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad	\xcb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed8086072ba1e7cc2358baeca134c825a7	\xcf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e	891568578	910901175
+
+query TTTTTTTTT
+SELECT encode('abc'::bytea, 'hex'), encode('abc'::bytea, 'base64'), encode(E'a\\000b'::bytea, 'escape'), encode('\x00ff5c27'::bytea, 'escape'), decode('616263', 'hex'), decode('YWJj', 'base64'), decode('a\000b', 'escape'), decode(' YW Jj ', 'base64'), decode('+/8=', 'base64');
+----
+616263	YWJj	a\000b	\000\377\\'	\x616263	\x616263	\x610062	\x616263	\xfbff
+
+query TT
+SELECT replace(encode(repeat('x', 60)::bytea, 'base64'), E'\n', '|'), position(E'\n' in encode(repeat('x', 60)::bytea, 'base64'));
+----
+eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4|eHh4	77
+
+statement error
+SELECT decode('YW=Jj', 'base64');
+
+statement error
+SELECT decode('abc', 'hex');
+
+statement error
+SELECT encode('a'::bytea, 'base64url');
+
+query TTTTTT
+SELECT convert_to('é', 'UTF8'), convert_from('\xc3a9', 'UTF8'), convert_to('abc', 'LATIN1'), convert_from('\xe9', 'LATIN1'), convert('\xc3a9'::bytea, 'UTF8', 'LATIN1'), convert_to('é', 'latin1');
+----
+\xc3a9	é	\x616263	é	\xe9	\xe9
+
+statement error
+SELECT convert_to('€', 'LATIN1');
+
+statement error
+SELECT convert_from('\xff', 'UTF8');
+
+statement error
+SELECT convert_to('x', 'nope');
+
+query TTTTTTT
+SELECT 1::int4::bytea, 258::int2::bytea, '\x0102'::bytea::int4, (-1)::int8::bytea, '\x'::bytea::int4, '\xffffffff'::bytea::int4, '\x80'::bytea::int8;
+----
+\x00000001	\x0102	258	\xffffffffffffffff	0	-1	128
+
+statement error
+SELECT '\x010203'::bytea::int2;
+
+query TTTTTTTT
+SELECT 'abc'::bytea::text, ('\x0102'::bytea)::varchar, CAST('\x01'::bytea AS text) || 'z', to_json('\x01'::bytea), to_jsonb('\x01ff'::bytea), pg_typeof('\x01'::bytea || '\x02'), pg_typeof(sha256('a')), pg_typeof(crc32('a'));
+----
+\x616263	\x0102	\x01z	"\\x01"	"\\x01ff"	bytea	bytea	bigint
+
+query TT
+SELECT string_agg(x, ', '::bytea), array_agg(x ORDER BY x) FROM (VALUES ('a'::bytea), ('b')) v(x);
+----
+\x612c2062	{"\\x61","\\x62"}
+
+statement ok
+CREATE TABLE blobs (id int PRIMARY KEY, data bytea);
+
+statement ok
+INSERT INTO blobs VALUES (1, '\xdeadbeef'), (2, 'plain'), (3, '\x00ff'), (4, NULL);
+
+query TTTT
+SELECT id, data, length(data), encode(data, 'hex') FROM blobs ORDER BY data NULLS LAST;
+----
+3	\x00ff	2	00ff
+2	\x706c61696e	5	706c61696e
+1	\xdeadbeef	4	deadbeef
+4	NULL	NULL	NULL
+
+query T
+SELECT id FROM blobs WHERE data = '\x00ff' OR data = 'plain'::bytea ORDER BY id;
+----
+2
+3
+
+statement ok
+UPDATE blobs SET data = data || '\x01' WHERE id = 3;
+
+query TT
+SELECT data, get_byte(data, 2) FROM blobs WHERE id = 3;
+----
+\x00ff01	1
+
+query TTTTTTT
+SELECT pg_column_size('abc'::text), pg_column_size(1::int4), pg_column_size(1::int8), pg_column_size(1.5::numeric), pg_column_size(true), pg_column_size(repeat('x', 200)), pg_column_size('\x0102'::bytea);
+----
+7	4	8	10	1	204	6

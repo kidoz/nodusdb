@@ -2256,6 +2256,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "sha2",
  "sqlparser",
  "thiserror 2.0.20",
  "uuid",

@@ -23,7 +23,10 @@ fn aggregate_type(op: &AggregateOp, input: Option<String>) -> Option<String> {
             "INTERVAL" if *op == AggregateOp::Avg => ty,
             _ => "NUMERIC".into(),
         }),
-        AggregateOp::StringAgg => Some("TEXT".into()),
+        AggregateOp::StringAgg => Some(match input {
+            Some(t) if crate::value::is_bytea_type(&t) => "BYTEA".into(),
+            _ => "TEXT".into(),
+        }),
         AggregateOp::ArrayAgg => input.map(|ty| format!("{ty}[]")),
         AggregateOp::BoolAnd | AggregateOp::BoolOr => Some("BOOLEAN".into()),
         AggregateOp::JsonAgg | AggregateOp::JsonObjectAgg => Some("JSON".into()),
@@ -68,6 +71,7 @@ fn literal_type(value: &Value) -> Option<String> {
             Value::Text(_) => "TEXT",
             Value::Jsonb(_) => "JSONB",
             Value::Json(_) => "JSON",
+            Value::Bytea(_) => "BYTEA",
             Value::Array(items) => {
                 return items
                     .iter()
@@ -205,6 +209,7 @@ fn binary_type(op: ScalarBinaryOp, left: Option<String>, right: Option<String>) 
         Op::Concat => match (&left, &right) {
             (Some(l), _) if l.ends_with("[]") => left,
             (_, Some(r)) if r.ends_with("[]") => right,
+            (Some(t), _) | (_, Some(t)) if crate::value::is_bytea_type(t) => Some("BYTEA".into()),
             (Some(l), Some(r))
                 if crate::bits::bit_type(l).is_some() && crate::bits::bit_type(r).is_some() =>
             {
@@ -451,6 +456,26 @@ pub(crate) fn check_integer_ranges(
                 .collect(),
         };
     }
+    // An integer as `bytea` is its bytes at its type's width.
+    if let ScalarExpr::Cast {
+        expr: inner,
+        target,
+    } = &checked
+        && crate::value::is_bytea_type(target)
+        && let Some(rank) = scalar_type(inner, column).as_deref().and_then(integer_rank)
+    {
+        return ScalarExpr::Function {
+            name: INT_BYTEA.to_string(),
+            args: vec![
+                (**inner).clone(),
+                ScalarExpr::Literal(Value::Int(match rank {
+                    1 => 2,
+                    2 => 4,
+                    _ => 8,
+                })),
+            ],
+        };
+    }
     if let ScalarExpr::Cast {
         expr: inner,
         target,
@@ -572,9 +597,13 @@ pub(crate) fn check_integer_ranges(
             args: args.iter().cloned().chain(types).collect(),
         };
     }
-    // `to_hex` of an `integer` shows 32 bits.
+    // `to_hex` of an `integer` shows 32 bits, and `pg_column_size` measures
+    // a value by its type.
     if let ScalarExpr::Function { name, args } = &checked
-        && matches!(name.as_str(), "TO_HEX" | "TO_BIN" | "TO_OCT")
+        && matches!(
+            name.as_str(),
+            "TO_HEX" | "TO_BIN" | "TO_OCT" | "PG_COLUMN_SIZE"
+        )
         && let [arg] = args.as_slice()
     {
         let ty = scalar_type(arg, column)
@@ -685,6 +714,10 @@ pub(crate) const INTERVAL_SPAN: &str = "__INTERVAL_SPAN__";
 /// The function the bit string operations that differ from text's are
 /// rewritten to: `__BITS__(operation, bits, ...)`.
 pub(crate) const BITS: &str = "__BITS__";
+
+/// The function an integer cast to `bytea` is rewritten to:
+/// `__INT_BYTEA__(value, width)`.
+pub(crate) const INT_BYTEA: &str = "__INT_BYTEA__";
 
 /// The functions a `real`'s text and numeric value are rewritten to.
 pub(crate) const REAL_TEXT: &str = "__REAL_TEXT__";

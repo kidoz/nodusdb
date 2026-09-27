@@ -162,11 +162,12 @@ impl MemExecutor {
         match op {
             Operand::Literal(val) => {
                 match val {
-                    // Date/time text compares in its canonical form, and
-                    // `jsonb` text as the document.
+                    // Date/time text compares in its canonical form, `jsonb`
+                    // text as the document, and `bytea` text as its bytes.
                     Value::Text(_)
                         if crate::value::temporal_type(expected_type).is_some()
-                            || crate::value::is_jsonb_type(expected_type) =>
+                            || crate::value::is_jsonb_type(expected_type)
+                            || crate::value::is_bytea_type(expected_type) =>
                     {
                         crate::value::coerce_for_column(val, expected_type)
                     }
@@ -932,7 +933,7 @@ pub(crate) fn value_to_json(v: &Value) -> Option<serde_json::Value> {
     match v {
         Value::Jsonb(j) => Some(j.clone()),
         Value::Json(text) => crate::json_text::parse(text).ok(),
-        Value::Record(_) => Some(crate::functions::to_json(v)),
+        Value::Record(_) | Value::Bytea(_) => Some(crate::functions::to_json(v)),
         Value::Int(i) => Some(J::from(*i)),
         Value::Float(f) => serde_json::Number::from_f64(*f).map(J::Number),
         Value::Numeric(d) => d

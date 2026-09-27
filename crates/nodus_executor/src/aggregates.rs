@@ -350,6 +350,33 @@ pub(crate) fn aggregate_inputs(op: &AggregateOp, inputs: &[(Value, Vec<Value>)])
             let vals: Vec<Value> = values().cloned().collect();
             aggregate_numeric(op, &vals)
         }
+        // `string_agg(bytea, bytea)` joins bytes.
+        AggregateOp::StringAgg if values().any(|v| matches!(v, Value::Bytea(_))) => {
+            let bytes = |v: &Value| match v {
+                Value::Bytea(b) => b.clone(),
+                Value::Text(t) => {
+                    crate::bytea::parse_input(t).unwrap_or_else(|_| t.clone().into_bytes())
+                }
+                other => crate::render(other).into_bytes(),
+            };
+            let mut out: Option<Vec<u8>> = None;
+            for (value, extra) in inputs {
+                if *value == Value::Null {
+                    continue;
+                }
+                out = Some(match out {
+                    Some(mut acc) => {
+                        if let Some(d) = extra.first().filter(|d| **d != Value::Null) {
+                            acc.extend(bytes(d));
+                        }
+                        acc.extend(bytes(value));
+                        acc
+                    }
+                    None => bytes(value),
+                });
+            }
+            out.map_or(Value::Null, Value::Bytea)
+        }
         AggregateOp::StringAgg => {
             let mut out: Option<String> = None;
             for (value, extra) in inputs {

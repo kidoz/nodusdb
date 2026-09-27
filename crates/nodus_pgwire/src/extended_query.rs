@@ -929,7 +929,7 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
                         let v = portal
                             .parameter::<Vec<u8>>(i, param_type)?
                             .unwrap_or_default();
-                        nodus_executor::Value::Text(format!("\\x{}", hex_encode(&v)))
+                        nodus_executor::Value::Bytea(v)
                     }
                     Type::DATE => {
                         let v = portal
@@ -1031,9 +1031,7 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
                         let v = portal
                             .parameter::<Vec<Option<Vec<u8>>>>(i, param_type)?
                             .unwrap_or_default();
-                        values_to_array(v, |bytes| {
-                            nodus_executor::Value::Text(format!("\\x{}", hex_encode(&bytes)))
-                        })
+                        values_to_array(v, nodus_executor::Value::Bytea)
                     }
                     Type::DATE_ARRAY => {
                         let v = portal
