@@ -157,25 +157,39 @@ pub(crate) fn session_timestamptz_text(text: &str) -> String {
     }
 }
 
-/// Which result columns hold zoned timestamps (or arrays of them), to show
-/// in the session's zone; `None` when the session's zone is UTC or no
-/// column does.
-pub(crate) fn zoned_columns(types: &[String]) -> Option<Vec<bool>> {
-    if matches!(session_zone().as_ref(), Zone::Fixed(0)) {
-        return None;
-    }
-    let zoned: Vec<bool> = types
+/// How a result column's values are shown: zoned timestamps in the
+/// session's zone, and `char(n)` values blank-padded to their length.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum Shown {
+    AsIs,
+    Zoned,
+    Padded(usize),
+}
+
+/// How each result column of these types is shown; `None` when every
+/// column is shown as it is.
+pub(crate) fn output_forms(types: &[String]) -> Option<Vec<Shown>> {
+    let utc = matches!(session_zone().as_ref(), Zone::Fixed(0));
+    let forms: Vec<Shown> = types
         .iter()
         .map(|t| {
             let base = t.trim().trim_end_matches("[]");
-            crate::datetime::Kind::of_type(base) == Some(crate::datetime::Kind::TimestampTz)
+            if !utc
+                && crate::datetime::Kind::of_type(base) == Some(crate::datetime::Kind::TimestampTz)
+            {
+                return Shown::Zoned;
+            }
+            match crate::value::character_limit(t) {
+                Some((length, true)) => Shown::Padded(length),
+                _ => Shown::AsIs,
+            }
         })
         .collect();
-    zoned.contains(&true).then_some(zoned)
+    forms.iter().any(|f| *f != Shown::AsIs).then_some(forms)
 }
 
-/// A result row's zoned timestamps as the session shows them.
-pub(crate) fn localize_row(values: &mut [crate::Value], zoned: &[bool]) {
+/// A result row's values as the session shows them.
+pub(crate) fn show_row(values: &mut [crate::Value], forms: &[Shown]) {
     fn localize(value: &mut crate::Value) {
         match value {
             crate::Value::Text(text) => *text = session_timestamptz_text(text),
@@ -183,29 +197,35 @@ pub(crate) fn localize_row(values: &mut [crate::Value], zoned: &[bool]) {
             _ => {}
         }
     }
-    for (value, zoned) in values.iter_mut().zip(zoned) {
-        if *zoned {
-            localize(value);
+    for (value, form) in values.iter_mut().zip(forms) {
+        match form {
+            Shown::Zoned => localize(value),
+            Shown::Padded(length) => {
+                if let crate::Value::Text(text) = value {
+                    *text = crate::value::pad_character(text, *length);
+                }
+            }
+            Shown::AsIs => {}
         }
     }
 }
 
-/// A sink that shows the zoned timestamps of the rows it passes on in the
-/// session's zone.
+/// A sink that shows the rows it passes on as the session shows them (see
+/// [`show_row`]).
 pub(crate) struct LocalizingSink<'a> {
     pub(crate) inner: &'a mut dyn crate::RowSink,
-    pub(crate) zoned: Option<Vec<bool>>,
+    pub(crate) forms: Option<Vec<Shown>>,
 }
 
 impl crate::RowSink for LocalizingSink<'_> {
     fn schema(&mut self, columns: Vec<String>, types: Vec<String>) {
-        self.zoned = zoned_columns(&types);
+        self.forms = output_forms(&types);
         self.inner.schema(columns, types);
     }
 
     fn row(&mut self, mut row: crate::Row) -> anyhow::Result<()> {
-        if let Some(zoned) = &self.zoned {
-            localize_row(&mut row.values, zoned);
+        if let Some(forms) = &self.forms {
+            show_row(&mut row.values, forms);
         }
         self.inner.row(row)
     }

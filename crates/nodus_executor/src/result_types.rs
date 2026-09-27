@@ -614,6 +614,97 @@ pub(crate) fn check_integer_ranges(
             args: vec![arg.clone(), ScalarExpr::Literal(Value::Text(ty))],
         };
     }
+    // A `char(n)` value is kept without its padding, which the functions
+    // that read its output form and LIKE see.
+    let padded = |e: &ScalarExpr| -> ScalarExpr {
+        match scalar_type(e, column).and_then(|t| crate::value::character_limit(&t)) {
+            Some((length, true)) => ScalarExpr::Function {
+                name: BPCHAR_PAD.to_string(),
+                args: vec![e.clone(), ScalarExpr::Literal(Value::Int(length as i64))],
+            },
+            _ => e.clone(),
+        }
+    };
+    match &checked {
+        ScalarExpr::Function { name, args }
+            if matches!(
+                name.as_str(),
+                "CONCAT" | "CONCAT_WS" | "FORMAT" | "OCTET_LENGTH" | "PG_COLUMN_SIZE"
+            ) =>
+        {
+            let padded_args: Vec<ScalarExpr> = args.iter().map(padded).collect();
+            if padded_args
+                .iter()
+                .any(|a| matches!(a, ScalarExpr::Function { name, .. } if name == BPCHAR_PAD))
+            {
+                return ScalarExpr::Function {
+                    name: name.clone(),
+                    args: padded_args,
+                };
+            }
+        }
+        ScalarExpr::PatternMatch {
+            expr,
+            pattern,
+            kind,
+            case_insensitive,
+            negated,
+            escape,
+        } if matches!(padded(expr), ScalarExpr::Function { ref name, .. } if name == BPCHAR_PAD) => {
+            return ScalarExpr::PatternMatch {
+                expr: Box::new(padded(expr)),
+                pattern: pattern.clone(),
+                kind: *kind,
+                case_insensitive: *case_insensitive,
+                negated: *negated,
+                escape: *escape,
+            };
+        }
+        _ => {}
+    }
+    // A `char(n)` value compared with a literal ignores the literal's
+    // trailing blanks, as it does its own.
+    if let ScalarExpr::Binary { op, left, right } = &checked
+        && matches!(
+            op,
+            ScalarBinaryOp::Eq
+                | ScalarBinaryOp::NotEq
+                | ScalarBinaryOp::Lt
+                | ScalarBinaryOp::LtEq
+                | ScalarBinaryOp::Gt
+                | ScalarBinaryOp::GtEq
+        )
+    {
+        let is_padded = |e: &ScalarExpr| {
+            scalar_type(e, column)
+                .and_then(|t| crate::value::character_limit(&t))
+                .is_some_and(|(_, padded)| padded)
+        };
+        let trimmed = |e: &ScalarExpr| match e {
+            ScalarExpr::Literal(Value::Text(t)) if t.ends_with(' ') => Some(ScalarExpr::Literal(
+                Value::Text(t.trim_end_matches(' ').to_string()),
+            )),
+            _ => None,
+        };
+        if is_padded(left)
+            && let Some(r) = trimmed(right)
+        {
+            return ScalarExpr::Binary {
+                op: *op,
+                left: left.clone(),
+                right: Box::new(r),
+            };
+        }
+        if is_padded(right)
+            && let Some(l) = trimmed(left)
+        {
+            return ScalarExpr::Binary {
+                op: *op,
+                left: Box::new(l),
+                right: right.clone(),
+            };
+        }
+    }
     // A bitwise operator computes in its result type (`1 << 31` wraps in
     // `integer`).
     if let ScalarExpr::Function { name, args } = &checked
@@ -711,6 +802,10 @@ pub(crate) fn bitwise_type(name: &str, arg_types: &[Option<String>]) -> Option<S
 /// as a number of microseconds (a month as 30 days).
 pub(crate) const INTERVAL_SPAN: &str = "__INTERVAL_SPAN__";
 
+/// The function a `char(n)` value is padded by where its padding shows:
+/// `__BPCHAR_PAD__(value, n)`.
+pub(crate) const BPCHAR_PAD: &str = "__BPCHAR_PAD__";
+
 /// The function the bit string operations that differ from text's are
 /// rewritten to: `__BITS__(operation, bits, ...)`.
 pub(crate) const BITS: &str = "__BITS__";
@@ -757,7 +852,23 @@ pub(crate) fn check_filter_integer_ranges(
     use crate::FilterExpr as F;
     let check = |e: &ScalarExpr| check_integer_ranges(e, column);
     let recur = |f: &F| Box::new(check_filter_integer_ranges(f, column));
+    // A `char(n)` column compared with a literal ignores the literal's
+    // trailing blanks, as it does its own.
+    let padded = |name: &str| {
+        column(name)
+            .and_then(|t| crate::value::character_limit(&t))
+            .is_some_and(|(_, padded)| padded)
+    };
     match filter {
+        F::Predicate(crate::Predicate {
+            left,
+            op,
+            right: crate::Operand::Literal(Value::Text(text)),
+        }) if padded(left) && text.ends_with(' ') => F::Predicate(crate::Predicate {
+            left: left.clone(),
+            op: *op,
+            right: crate::Operand::Literal(Value::Text(text.trim_end_matches(' ').to_string())),
+        }),
         F::And(a, b) => F::And(recur(a), recur(b)),
         F::Or(a, b) => F::Or(recur(a), recur(b)),
         F::Not(a) => F::Not(recur(a)),

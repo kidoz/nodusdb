@@ -73,7 +73,7 @@ pub(crate) fn is_known(name: &str) -> bool {
                 | "FACTORIAL" | "RANDOM" | "WIDTH_BUCKET" | "SCALE" | "MIN_SCALE" | "TRIM_SCALE"
                 | "ASINH" | "ACOSH" | "ATANH" | "SIND" | "COSD" | "TAND" | "COTD" | "ASIND"
                 | "ACOSD" | "ATAND" | "ATAN2D" | "SETSEED" | "RANDOM_NORMAL"
-                | crate::result_types::REAL_TEXT | crate::result_types::REAL_NUMERIC
+                | crate::result_types::REAL_TEXT | crate::result_types::REAL_NUMERIC | crate::result_types::BPCHAR_PAD
                 | "SHA224" | "SHA256" | "SHA384" | "SHA512" | "ENCODE" | "DECODE" | "CONVERT_TO"
                 | "CONVERT_FROM" | "CONVERT" | "GET_BYTE" | "SET_BYTE" | "GET_BIT" | "SET_BIT"
                 | "CRC32" | "CRC32C" | "PG_COLUMN_SIZE" | crate::result_types::INT_BYTEA
@@ -248,7 +248,11 @@ pub(crate) fn return_type(name: &str, arg_types: &[Option<String>]) -> Option<St
                 "INTERVAL"
             }
             "MAKE_TIMESTAMPTZ" => "TIMESTAMPTZ",
-            "TO_CHAR" | "__TZ_TEXT__" | "__JSON_TIME__" | crate::result_types::REAL_TEXT => "TEXT",
+            "TO_CHAR"
+            | "__TZ_TEXT__"
+            | "__JSON_TIME__"
+            | crate::result_types::REAL_TEXT
+            | crate::result_types::BPCHAR_PAD => "TEXT",
             crate::result_types::REAL_NUMERIC => "NUMERIC",
             "GROUPING" => "INTEGER",
             "__INTERVAL_SPAN__" => "NUMERIC",
@@ -1412,6 +1416,10 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
         }
 
         // ---- Math -------------------------------------------------------------
+        crate::result_types::BPCHAR_PAD if arity(2) => Value::Text(crate::value::pad_character(
+            &text(arg(0)),
+            int(arg(1))? as usize,
+        )),
         // Bit string operations: `__BITS__(operation, bits, ...)`.
         crate::result_types::BITS if args.len() >= 2 => {
             let bits = match crate::bits::parse(&text(arg(1))) {
@@ -2782,9 +2790,12 @@ fn format_type(oid: i64, typmod: Option<i64>) -> String {
         114 => "json",
         700 => "real",
         701 => "double precision",
+        // `bpchar` with no length is not `character`, which means
+        // `character(1)`.
         1042 => match typmod {
-            Some(m) => return format!("character({})", m - 4),
-            None => "bpchar",
+            Some(m) if m >= 4 => return format!("character({})", m - 4),
+            Some(_) => "bpchar",
+            None => "character",
         },
         1560 => match typmod {
             Some(m) if m >= 0 => return format!("bit({m})"),

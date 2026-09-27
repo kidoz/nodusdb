@@ -1,0 +1,55 @@
+# char(n) and varchar(n): length checks on storing, explicit casts that cut or pad, and char(n)'s padding.
+statement ok
+CREATE TABLE sc (v varchar(3), c char(4), t text, cn character, vn varchar);
+
+statement ok
+INSERT INTO sc VALUES ('ab', 'ab', 'ab', 'x', 'free');
+
+statement error
+INSERT INTO sc VALUES ('abcd', 'a', 'a', 'y', 'z');
+
+statement ok
+INSERT INTO sc VALUES ('abc   ', 'abcd  ', 'a', 'y', 'z');
+
+statement error
+INSERT INTO sc (c) VALUES ('abcde');
+
+statement error
+INSERT INTO sc (cn) VALUES ('ab');
+
+statement error
+INSERT INTO sc (v) VALUES (12345);
+
+query TTTTTTTTTT
+SELECT v, c, c || '|', length(c), octet_length(c), c = 'ab', c = 'ab  ', c::text || '|', concat(c, '|'), cn FROM sc ORDER BY v;
+----
+ab	ab  	ab|	2	4	t	t	ab|	ab  |	x
+abc	abcd	abcd|	4	4	f	f	abcd|	abcd|	y
+
+query TTTTTTTTT
+SELECT '|' || c || '|', char_length(c), upper(c), c < 'abc', pg_typeof(c), pg_typeof(v), c LIKE 'ab%', c LIKE 'ab', format('%s|', c) FROM sc WHERE c = 'ab';
+----
+|ab|	2	AB	t	character	character varying	t	f	ab  |
+
+query T
+SELECT count(*) FROM sc WHERE c = 'ab  ';
+----
+1
+
+statement error
+UPDATE sc SET v = 'toolong' WHERE v = 'ab';
+
+query TTTTTTTTTT
+SELECT 'abcdef'::varchar(3), 'ab'::char(4), 'abc'::char(2), 'ab'::char(4)::varchar, 'ab '::varchar(10) || '|', CAST(123 AS varchar(2)), 123::char(5), 'x'::char, 'xyz'::character, true::varchar(3);
+----
+abc	ab  	ab	ab	ab |	12	123  	x	x	tru
+
+query TTTTT
+SELECT 'ab'::char(4) = 'ab'::char(2), 'ab '::text = 'ab'::text, 'ab'::char(4) || 'c'::char(3), length('ab   '::char(5)), 'a'::char(3) < 'a '::char(3);
+----
+t	f	abc	2	f
+
+query TTTT
+SELECT format_type('character'::regtype, 8), format_type('bpchar'::regtype, NULL), format_type('varchar'::regtype, 14), pg_typeof('a'::char(3));
+----
+character(4)	character	character varying(10)	character

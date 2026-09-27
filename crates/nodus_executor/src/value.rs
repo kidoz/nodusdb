@@ -234,6 +234,63 @@ pub(crate) fn parse_float_text(text: &str, real: bool) -> Result<f64, String> {
     Ok(x)
 }
 
+/// The length limit of a character type: `varchar(n)`, or `char(n)`
+/// (blank-padded; `char` alone is `char(1)`).
+pub(crate) fn character_limit(data_type: &str) -> Option<(usize, bool)> {
+    let upper = data_type.trim().to_ascii_uppercase();
+    let (base, length) = match upper.split_once('(') {
+        Some((base, rest)) => (
+            base.trim().to_string(),
+            Some(rest.strip_suffix(')')?.trim().parse::<usize>().ok()?),
+        ),
+        None => (upper.clone(), None),
+    };
+    match (base.as_str(), length) {
+        ("VARCHAR" | "CHARACTER VARYING", Some(n)) => Some((n, false)),
+        ("CHAR" | "CHARACTER" | "BPCHAR", Some(n)) => Some((n, true)),
+        ("CHAR" | "CHARACTER", None) => Some((1, true)),
+        _ => None,
+    }
+}
+
+/// A string fitted to a `varchar(n)` or `char(n)`: an explicit cast cuts it
+/// to `n` characters; storing it may only drop blanks. A `char(n)` value
+/// keeps no trailing blanks, which are its padding (shown on output).
+/// `Err` names the type a string is too long for.
+pub(crate) fn fit_character(text: &str, data_type: &str, explicit: bool) -> Result<String, String> {
+    let Some((limit, padded)) = character_limit(data_type) else {
+        return Ok(text.to_string());
+    };
+    let mut out = match text.char_indices().nth(limit) {
+        Some((cut, _)) => {
+            if !explicit && text[cut..].chars().any(|c| c != ' ') {
+                let name = if padded {
+                    format!("character({limit})")
+                } else {
+                    format!("character varying({limit})")
+                };
+                return Err(format!("value too long for type {name}"));
+            }
+            text[..cut].to_string()
+        }
+        None => text.to_string(),
+    };
+    if padded {
+        out.truncate(out.trim_end_matches(' ').len());
+    }
+    Ok(out)
+}
+
+/// A `char(n)` value blank-padded to its length.
+pub(crate) fn pad_character(text: &str, length: usize) -> String {
+    let count = text.chars().count();
+    if count >= length {
+        text.to_string()
+    } else {
+        format!("{text}{}", " ".repeat(length - count))
+    }
+}
+
 /// Parses integer input text as PostgreSQL does: surrounding whitespace, a
 /// sign, decimal digits or a `0x`, `0o`, or `0b` prefix, and underscores
 /// between digits (`1_000`). `None` if the text is not an integer; one too
@@ -366,7 +423,10 @@ pub(crate) fn coerce_for_column(value: &Value, data_type: &str) -> Value {
         {
             crate::planner::cast_value(value.clone(), data_type)
         }
-        Value::Text(s) => coerce(s, ColumnType::Text),
+        Value::Text(s) => match fit_character(s, data_type, false) {
+            Ok(fitted) => Value::Text(fitted),
+            Err(e) => crate::eval_error::raise(e),
+        },
         scalar => match column_type(data_type) {
             // A number into an integer or numeric column is cast, so it is
             // checked against the column's width, precision, and scale.
@@ -386,6 +446,15 @@ pub(crate) fn coerce_for_column(value: &Value, data_type: &str) -> Value {
             // TEXT/VARCHAR and the catch-all: keep the scalar's representation
             // (a numeric becomes its text, as a text column holds text).
             ColumnType::Text => match scalar {
+                Value::Numeric(_) | Value::Int(_) | Value::Float(_) | Value::Bool(_)
+                    if character_limit(data_type).is_some() =>
+                {
+                    let text = match scalar {
+                        Value::Bool(b) => b.to_string(),
+                        other => render(other),
+                    };
+                    coerce_for_column(&Value::Text(text), data_type)
+                }
                 Value::Numeric(d) => Value::Text(d.to_string()),
                 _ => scalar.clone(),
             },

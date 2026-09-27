@@ -387,7 +387,9 @@ pub(crate) fn try_cast(v: Value, data_type: &str) -> std::result::Result<Value, 
                 Value::Text(s) if upper == "BYTEA" => Value::Bytea(crate::bytea::parse_input(s)?),
                 _ if upper == "BYTEA" => Value::Bytea(crate::bytea::parse_input(&render(&v))?),
                 // Booleans cast to the SQL spellings, not the wire `t`/`f` rendering.
-                Value::Bool(b) => Value::Text(if *b { "true" } else { "false" }.to_string()),
+                Value::Bool(b) if crate::value::character_limit(data_type).is_none() => {
+                    Value::Text(b.to_string())
+                }
                 // `json` keeps its text; `jsonb` is the parsed document.
                 Value::Text(s) if upper == "JSON" => {
                     crate::json_text::parse(s)?;
@@ -421,6 +423,15 @@ pub(crate) fn try_cast(v: Value, data_type: &str) -> std::result::Result<Value, 
                         .hyphenated()
                         .to_string(),
                 ),
+                // An explicit cast to `varchar(n)` or `char(n)` cuts the text.
+                _ if crate::value::character_limit(data_type).is_some() => {
+                    let text = match &v {
+                        Value::Text(s) => s.clone(),
+                        Value::Bool(b) => b.to_string(),
+                        other => render(other),
+                    };
+                    Value::Text(crate::value::fit_character(&text, data_type, true)?)
+                }
                 _ => Value::Text(render(&v)),
             }
         }

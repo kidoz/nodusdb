@@ -1158,10 +1158,11 @@ impl MemExecutor {
             })
             .map(|out| self.name_object_identifiers(out))
             .map(|mut out| {
-                // Zoned timestamps are shown in the session's zone.
-                if let Some(zoned) = timezone::zoned_columns(&out.types) {
+                // Zoned timestamps are shown in the session's zone, and
+                // `char(n)` values padded.
+                if let Some(forms) = timezone::output_forms(&out.types) {
                     for row in &mut out.rows {
-                        timezone::localize_row(&mut row.values, &zoned);
+                        timezone::show_row(&mut row.values, &forms);
                     }
                 }
                 out
