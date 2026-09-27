@@ -51,7 +51,9 @@ impl MemExecutor {
             "jsonb_array_elements_text" => json_array_elements_rows(&args, true),
             "json_array_elements" => json_text_elements_rows(&args, false),
             "json_array_elements_text" => json_text_elements_rows(&args, true),
-            "regexp_split_to_table" => regexp_split_rows(&args),
+            "regexp_split_to_table" => regexp_split_rows(&args)?,
+            "regexp_matches" => regexp_matches_rows(&args)?,
+            "string_to_table" => string_to_table_rows(&args),
             // No table is a partition, so none has ancestors.
             "pg_partition_ancestors" => (vec!["REGCLASS".to_string()], Vec::new()),
             // The function behind the `pg_available_extensions` view.
@@ -275,17 +277,44 @@ fn json_text_elements_rows(args: &[Value], as_text: bool) -> (Vec<String>, Vec<V
     (vec![ty.to_string()], rows)
 }
 
-/// `regexp_split_to_table(string, pattern)`: one text row per split piece. An
-/// invalid pattern yields the whole string as a single row.
-fn regexp_split_rows(args: &[Value]) -> (Vec<String>, Vec<Vec<Value>>) {
+/// `regexp_split_to_table(string, pattern [, flags])`: one text row per
+/// piece between the matches.
+fn regexp_split_rows(args: &[Value]) -> Result<(Vec<String>, Vec<Vec<Value>>)> {
+    if args.iter().any(|a| matches!(a, Value::Null)) {
+        return Ok((vec!["TEXT".to_string()], Vec::new()));
+    }
     let text = args.first().map(crate::render).unwrap_or_default();
     let pattern = args.get(1).map(crate::render).unwrap_or_default();
-    let pieces: Vec<String> = match regex::Regex::new(&pattern) {
-        Ok(re) => re.split(&text).map(|s| s.to_string()).collect(),
-        Err(_) => vec![text],
-    };
+    let flags = args.get(2).map(crate::render).unwrap_or_default();
+    let pieces = crate::pg_regex::split(&text, &pattern, &flags).map_err(|e| anyhow::anyhow!(e))?;
     let rows = pieces.into_iter().map(|s| vec![Value::Text(s)]).collect();
-    (vec!["VARCHAR".to_string()], rows)
+    Ok((vec!["TEXT".to_string()], rows))
+}
+
+/// `regexp_matches(string, pattern [, flags])`: a `text[]` row per match
+/// (every match with the `g` flag, else the first).
+fn regexp_matches_rows(args: &[Value]) -> Result<(Vec<String>, Vec<Vec<Value>>)> {
+    let ty = vec!["TEXT[]".to_string()];
+    if args.iter().any(|a| matches!(a, Value::Null)) {
+        return Ok((ty, Vec::new()));
+    }
+    let text = args.first().map(crate::render).unwrap_or_default();
+    let pattern = args.get(1).map(crate::render).unwrap_or_default();
+    let flags = args.get(2).map(crate::render).unwrap_or_default();
+    let found =
+        crate::pg_regex::matches(&text, &pattern, &flags).map_err(|e| anyhow::anyhow!(e))?;
+    Ok((ty, found.into_iter().map(|m| vec![m]).collect()))
+}
+
+/// `string_to_table(string, delimiter [, null_string])`: a text row per
+/// piece, as `string_to_array` splits.
+fn string_to_table_rows(args: &[Value]) -> (Vec<String>, Vec<Vec<Value>>) {
+    let ty = vec!["TEXT".to_string()];
+    let pieces = match crate::functions::call("STRING_TO_ARRAY", args) {
+        Value::Array(items) => items,
+        _ => Vec::new(),
+    };
+    (ty, pieces.into_iter().map(|v| vec![v]).collect())
 }
 
 fn value_as_i64(v: &Value) -> Option<i64> {

@@ -61,7 +61,7 @@ pub(crate) fn is_known(name: &str) -> bool {
                 | "LEFT" | "RIGHT" | "CONCAT" | "CONCAT_WS" | "FORMAT" | "QUOTE_IDENT"
                 | "QUOTE_LITERAL" | "QUOTE_NULLABLE" | "ASCII" | "CHR" | "TO_HEX" | "TO_BIN"
                 | "TO_OCT" | "STARTS_WITH" | "REGEXP_REPLACE" | "REGEXP_MATCH" | "REGEXP_LIKE"
-                | "REGEXP_COUNT" | "REGEXP_SUBSTR" | "REGEXP_SPLIT_TO_ARRAY"
+                | "REGEXP_COUNT" | "REGEXP_SUBSTR" | "REGEXP_SPLIT_TO_ARRAY" | "REGEXP_INSTR"
                 | "STRING_TO_ARRAY" | "ARRAY_TO_STRING"
                 // Conditionals.
                 | "ARRAY" | "COALESCE" | "NULLIF" | "GREATEST" | "LEAST" | "NUM_NULLS" | "NUM_NONNULLS"
@@ -74,6 +74,7 @@ pub(crate) fn is_known(name: &str) -> bool {
                 | "ASINH" | "ACOSH" | "ATANH" | "SIND" | "COSD" | "TAND" | "COTD" | "ASIND"
                 | "ACOSD" | "ATAND" | "ATAN2D" | "SETSEED" | "RANDOM_NORMAL"
                 | crate::result_types::REAL_TEXT | crate::result_types::REAL_NUMERIC | crate::result_types::BPCHAR_PAD
+                | "TO_ASCII" | "UNISTR" | "NORMALIZE" | "__IS_NORMALIZED__"
                 | "SHA224" | "SHA256" | "SHA384" | "SHA512" | "ENCODE" | "DECODE" | "CONVERT_TO"
                 | "CONVERT_FROM" | "CONVERT" | "GET_BYTE" | "SET_BYTE" | "GET_BIT" | "SET_BIT"
                 | "CRC32" | "CRC32C" | "PG_COLUMN_SIZE" | crate::result_types::INT_BYTEA
@@ -140,6 +141,7 @@ pub(crate) fn is_known(name: &str) -> bool {
                 // table function, anywhere else they are an error.
                 | "UNNEST" | "GENERATE_SERIES" | "JSONB_ARRAY_ELEMENTS" | "JSON_ARRAY_ELEMENTS"
                 | "JSONB_ARRAY_ELEMENTS_TEXT" | "JSON_ARRAY_ELEMENTS_TEXT" | "REGEXP_SPLIT_TO_TABLE"
+                | "REGEXP_MATCHES" | "STRING_TO_TABLE"
                 | "PG_PARTITION_ANCESTORS"
         )
 }
@@ -189,10 +191,10 @@ pub(crate) fn return_type(name: &str, arg_types: &[Option<String>]) -> Option<St
         | "SET_BYTE"
         | "SET_BIT"
         | crate::result_types::INT_BYTEA => return Some("BYTEA".into()),
-        "ENCODE" | "CONVERT_FROM" => {
+        "ENCODE" | "CONVERT_FROM" | "REGEXP_SUBSTR" | "UNISTR" | "NORMALIZE" => {
             return Some("TEXT".into());
         }
-        "GET_BYTE" | "GET_BIT" | "PG_COLUMN_SIZE" => {
+        "GET_BYTE" | "GET_BIT" | "REGEXP_COUNT" | "REGEXP_INSTR" | "PG_COLUMN_SIZE" => {
             return Some("INTEGER".into());
         }
         "CRC32" | "CRC32C" | "BIT_COUNT" => return Some("BIGINT".into()),
@@ -205,6 +207,8 @@ pub(crate) fn return_type(name: &str, arg_types: &[Option<String>]) -> Option<St
                 None => None,
             };
         }
+        "__IS_NORMALIZED__" | "REGEXP_LIKE" => return Some("BOOLEAN".into()),
+        "REGEXP_MATCH" | "REGEXP_SPLIT_TO_ARRAY" => return Some("TEXT[]".into()),
         _ => {}
     }
     Some(
@@ -1025,17 +1029,20 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
         }
         "OCTET_LENGTH" if arity(1) => Value::Int(text(arg(0)).len() as i64),
         "BIT_LENGTH" if arity(1) => Value::Int(text(arg(0)).len() as i64 * 8),
-        "UPPER" if arity(1) => Value::Text(text(arg(0)).to_uppercase()),
-        "LOWER" | "CASEFOLD" if arity(1) => Value::Text(text(arg(0)).to_lowercase()),
+        // Character by character, as the C library maps case: a character
+        // whose upper case is several (`ß`) stays as it is.
+        "UPPER" if arity(1) => Value::Text(text(arg(0)).chars().map(upper_char).collect()),
+        "LOWER" if arity(1) => Value::Text(text(arg(0)).chars().map(lower_char).collect()),
+        "CASEFOLD" if arity(1) => Value::Text(text(arg(0)).to_lowercase()),
         "INITCAP" if arity(1) => {
             let mut out = String::new();
             let mut word_start = true;
             for c in text(arg(0)).chars() {
                 if c.is_alphanumeric() {
-                    out.extend(if word_start {
-                        c.to_uppercase().collect::<Vec<_>>()
+                    out.push(if word_start {
+                        upper_char(c)
                     } else {
-                        c.to_lowercase().collect::<Vec<_>>()
+                        lower_char(c)
                     });
                     word_start = false;
                 } else {
@@ -1044,6 +1051,21 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
                 }
             }
             Value::Text(out)
+        }
+        // `substring(string from pattern)`: the pattern's first
+        // parenthesized part, or the whole match.
+        "SUBSTR" | "SUBSTRING"
+            if arity(2) && matches!(arg(1), Value::Text(t) if t.trim().parse::<i64>().is_err()) =>
+        {
+            match crate::pg_regex::compile(&text(arg(1)), "") {
+                Ok(re) => match re.captures(&text(arg(0))) {
+                    Some(caps) => caps
+                        .get(if caps.len() > 1 { 1 } else { 0 })
+                        .map_or(Value::Null, |m| Value::Text(m.as_str().to_string())),
+                    None => Value::Null,
+                },
+                Err(e) => raise(e),
+            }
         }
         // The bytes a value takes, as PostgreSQL stores a computed one (the
         // second argument names its type).
@@ -1074,6 +1096,31 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
                 }
                 (None, Value::Bytea(b)) => 4 + b.len() as i64,
                 (None, other) => 4 + render(other).len() as i64,
+            })
+        }
+        "TO_ASCII" if arity(1) || arity(2) => {
+            raise("encoding conversion from UTF8 to ASCII not supported")
+        }
+        "UNISTR" if arity(1) => unistr(&text(arg(0))).map_or_else(raise, Value::Text),
+        "NORMALIZE" if arity(1) || arity(2) => {
+            use unicode_normalization::UnicodeNormalization;
+            let s = text(arg(0));
+            match args.get(1).map(text).as_deref().unwrap_or("NFC") {
+                "NFC" => Value::Text(s.nfc().collect()),
+                "NFD" => Value::Text(s.nfd().collect()),
+                "NFKC" => Value::Text(s.nfkc().collect()),
+                "NFKD" => Value::Text(s.nfkd().collect()),
+                form => raise(format!("invalid normalization form: {form}")),
+            }
+        }
+        "__IS_NORMALIZED__" if arity(2) => {
+            use unicode_normalization::{is_nfc, is_nfd, is_nfkc, is_nfkd};
+            let s = text(arg(0));
+            Value::Bool(match text(arg(1)).as_str() {
+                "NFD" => is_nfd(&s),
+                "NFKC" => is_nfkc(&s),
+                "NFKD" => is_nfkd(&s),
+                _ => is_nfc(&s),
             })
         }
         "SUBSTR" | "SUBSTRING" if arity(2) || arity(3) => {
@@ -1237,10 +1284,18 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
             v => quote_literal(&text(v)),
         }),
         "ASCII" if arity(1) => Value::Int(text(arg(0)).chars().next().map_or(0, |c| c as i64)),
-        "CHR" if arity(1) => match u32::try_from(int(arg(0))?).ok().and_then(char::from_u32) {
-            Some(c) if c != '\0' => Value::Text(c.to_string()),
-            _ => raise("requested character is not valid"),
-        },
+        "CHR" if arity(1) => {
+            let n = int(arg(0))?;
+            match u32::try_from(n).ok().map(|u| (u, char::from_u32(u))) {
+                _ if n < 0 => raise("character number must be positive"),
+                Some((0, _)) => raise("null character not permitted"),
+                Some((_, Some(c))) => Value::Text(c.to_string()),
+                Some((u, None)) if u <= 0x10FFFF => {
+                    raise(format!("requested character not valid for encoding: {n}"))
+                }
+                _ => raise(format!("requested character too large for encoding: {n}")),
+            }
+        }
         // A 32-bit integer (the second argument names the type) shows its
         // 32 bits.
         "TO_HEX" | "TO_BIN" | "TO_OCT" if arity(1) || arity(2) => {
@@ -1261,70 +1316,93 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
             })
         }
         "STARTS_WITH" if arity(2) => Value::Bool(text(arg(0)).starts_with(&text(arg(1)))),
-        "REGEXP_REPLACE" if (3..=4).contains(&args.len()) => {
-            let flags = args.get(3).map(text).unwrap_or_default();
-            let Some(re) = regex_with_flags(&text(arg(1)), &flags) else {
-                return Some(raise(format!(
-                    "invalid regular expression: {}",
-                    text(arg(1))
-                )));
-            };
-            let replacement = pg_replacement(&text(arg(2)));
-            let s = text(arg(0));
-            Value::Text(if flags.contains('g') {
-                re.replace_all(&s, replacement.as_str()).into_owned()
+        // `regexp_replace(s, p, r [, start [, n]] [, flags])`: an integer
+        // fourth argument is the start, text the flags.
+        "REGEXP_REPLACE" if (3..=6).contains(&args.len()) => {
+            let positional = matches!(args.get(3), Some(Value::Int(_)));
+            let (start, n, flags) = if positional {
+                (
+                    int(arg(3))?,
+                    match args.get(4) {
+                        Some(v) => Some(int(v)?),
+                        None => None,
+                    },
+                    args.get(5).map(text).unwrap_or_default(),
+                )
             } else {
-                re.replace(&s, replacement.as_str()).into_owned()
-            })
+                (1, None, args.get(3).map(text).unwrap_or_default())
+            };
+            crate::pg_regex::replace(
+                &text(arg(0)),
+                &text(arg(1)),
+                &text(arg(2)),
+                start,
+                n,
+                &flags,
+            )
+            .map_or_else(raise, Value::Text)
         }
         "REGEXP_MATCH" if arity(2) || arity(3) => {
             let flags = args.get(2).map(text).unwrap_or_default();
-            let Some(re) = regex_with_flags(&text(arg(1)), &flags) else {
-                return Some(raise(format!(
-                    "invalid regular expression: {}",
-                    text(arg(1))
-                )));
-            };
-            let s = text(arg(0));
-            match re.captures(&s) {
-                None => Value::Null,
-                Some(caps) if caps.len() == 1 => {
-                    Value::Array(vec![Value::Text(caps[0].to_string())])
-                }
-                Some(caps) => Value::Array(
-                    caps.iter()
-                        .skip(1)
-                        .map(|m| m.map_or(Value::Null, |m| Value::Text(m.as_str().to_string())))
-                        .collect(),
-                ),
+            if flags.contains('g') {
+                return Some(raise(
+                    crate::error_fields::DbError::new(
+                        "regexp_match() does not support the \"global\" option",
+                    )
+                    .hint("Use the regexp_matches function instead.")
+                    .into_text(),
+                ));
+            }
+            match crate::pg_regex::compile(&text(arg(1)), &flags) {
+                Ok(re) => re
+                    .captures(&text(arg(0)))
+                    .map_or(Value::Null, |caps| crate::pg_regex::match_array(&caps)),
+                Err(e) => raise(e),
             }
         }
         "REGEXP_LIKE" if arity(2) || arity(3) => {
             let flags = args.get(2).map(text).unwrap_or_default();
-            match regex_with_flags(&text(arg(1)), &flags) {
-                Some(re) => Value::Bool(re.is_match(&text(arg(0)))),
-                None => raise(format!("invalid regular expression: {}", text(arg(1)))),
+            match crate::pg_regex::compile(&text(arg(1)), &flags) {
+                Ok(re) => Value::Bool(re.is_match(&text(arg(0)))),
+                Err(e) => raise(e),
             }
         }
-        "REGEXP_COUNT" if arity(2) => match regex_with_flags(&text(arg(1)), "") {
-            Some(re) => Value::Int(re.find_iter(&text(arg(0))).count() as i64),
-            None => raise(format!("invalid regular expression: {}", text(arg(1)))),
-        },
-        "REGEXP_SUBSTR" if arity(2) => match regex_with_flags(&text(arg(1)), "") {
-            Some(re) => re
-                .find(&text(arg(0)))
-                .map_or(Value::Null, |m| Value::Text(m.as_str().to_string())),
-            None => raise(format!("invalid regular expression: {}", text(arg(1)))),
-        },
+        "REGEXP_COUNT" if (2..=4).contains(&args.len()) => {
+            let start = args.get(2).map_or(Some(1), int)?;
+            let flags = args.get(3).map(text).unwrap_or_default();
+            crate::pg_regex::count(&text(arg(0)), &text(arg(1)), start, &flags)
+                .map_or_else(raise, Value::Int)
+        }
+        "REGEXP_INSTR" if (2..=7).contains(&args.len()) => {
+            let start = args.get(2).map_or(Some(1), int)?;
+            let n = args.get(3).map_or(Some(1), int)?;
+            let end_option = args.get(4).map_or(Some(0), int)?;
+            let flags = args.get(5).map(text).unwrap_or_default();
+            let subexpr = args.get(6).map_or(Some(0), int)?;
+            crate::pg_regex::instr(
+                &text(arg(0)),
+                &text(arg(1)),
+                start,
+                n,
+                end_option,
+                &flags,
+                subexpr,
+            )
+            .map_or_else(raise, Value::Int)
+        }
+        "REGEXP_SUBSTR" if (2..=6).contains(&args.len()) => {
+            let start = args.get(2).map_or(Some(1), int)?;
+            let n = args.get(3).map_or(Some(1), int)?;
+            let flags = args.get(4).map(text).unwrap_or_default();
+            let subexpr = args.get(5).map_or(Some(0), int)?;
+            crate::pg_regex::substr(&text(arg(0)), &text(arg(1)), start, n, &flags, subexpr)
+                .map_or_else(raise, |m| m.map_or(Value::Null, Value::Text))
+        }
         "REGEXP_SPLIT_TO_ARRAY" if arity(2) || arity(3) => {
             let flags = args.get(2).map(text).unwrap_or_default();
-            match regex_with_flags(&text(arg(1)), &flags) {
-                Some(re) => Value::Array(
-                    re.split(&text(arg(0)))
-                        .map(|p| Value::Text(p.to_string()))
-                        .collect(),
-                ),
-                None => raise(format!("invalid regular expression: {}", text(arg(1)))),
+            match crate::pg_regex::split(&text(arg(0)), &text(arg(1)), &flags) {
+                Ok(pieces) => Value::Array(pieces.into_iter().map(Value::Text).collect()),
+                Err(e) => raise(e.replace("regexp_split_to_table", "regexp_split_to_array")),
             }
         }
         "STRING_TO_ARRAY" if arity(2) || arity(3) => {
@@ -2510,6 +2588,8 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
         | "JSONB_ARRAY_ELEMENTS_TEXT"
         | "JSON_ARRAY_ELEMENTS_TEXT"
         | "REGEXP_SPLIT_TO_TABLE"
+        | "REGEXP_MATCHES"
+        | "STRING_TO_TABLE"
         | "PG_PARTITION_ANCESTORS" => raise(format!(
             "set-returning function {}() is not allowed here",
             name.to_ascii_lowercase()
@@ -2869,13 +2949,253 @@ fn dimension_lengths(items: &[Value]) -> Vec<usize> {
     dims
 }
 
+/// The keywords an identifier must be quoted to be: PostgreSQL's reserved,
+/// column-name, and type-or-function-name keywords.
+const QUOTED_KEYWORDS: &[&str] = &[
+    "all",
+    "analyse",
+    "analyze",
+    "and",
+    "any",
+    "array",
+    "as",
+    "asc",
+    "asymmetric",
+    "authorization",
+    "between",
+    "bigint",
+    "binary",
+    "bit",
+    "boolean",
+    "both",
+    "case",
+    "cast",
+    "char",
+    "character",
+    "check",
+    "coalesce",
+    "collate",
+    "collation",
+    "column",
+    "concurrently",
+    "constraint",
+    "create",
+    "cross",
+    "current_catalog",
+    "current_date",
+    "current_role",
+    "current_schema",
+    "current_time",
+    "current_timestamp",
+    "current_user",
+    "dec",
+    "decimal",
+    "default",
+    "deferrable",
+    "desc",
+    "distinct",
+    "do",
+    "else",
+    "end",
+    "except",
+    "exists",
+    "extract",
+    "false",
+    "fetch",
+    "float",
+    "for",
+    "foreign",
+    "freeze",
+    "from",
+    "full",
+    "grant",
+    "greatest",
+    "group",
+    "grouping",
+    "having",
+    "ilike",
+    "in",
+    "initially",
+    "inner",
+    "inout",
+    "int",
+    "integer",
+    "intersect",
+    "interval",
+    "into",
+    "is",
+    "isnull",
+    "join",
+    "json",
+    "json_array",
+    "json_arrayagg",
+    "json_exists",
+    "json_object",
+    "json_objectagg",
+    "json_query",
+    "json_scalar",
+    "json_serialize",
+    "json_table",
+    "json_value",
+    "lateral",
+    "leading",
+    "least",
+    "left",
+    "like",
+    "limit",
+    "localtime",
+    "localtimestamp",
+    "merge_action",
+    "national",
+    "natural",
+    "nchar",
+    "none",
+    "normalize",
+    "not",
+    "notnull",
+    "null",
+    "nullif",
+    "numeric",
+    "offset",
+    "on",
+    "only",
+    "or",
+    "order",
+    "out",
+    "outer",
+    "overlaps",
+    "overlay",
+    "placing",
+    "position",
+    "precision",
+    "primary",
+    "real",
+    "references",
+    "returning",
+    "right",
+    "row",
+    "select",
+    "session_user",
+    "setof",
+    "similar",
+    "smallint",
+    "some",
+    "substring",
+    "symmetric",
+    "system_user",
+    "table",
+    "tablesample",
+    "then",
+    "time",
+    "timestamp",
+    "to",
+    "trailing",
+    "treat",
+    "trim",
+    "true",
+    "union",
+    "unique",
+    "user",
+    "using",
+    "values",
+    "varchar",
+    "variadic",
+    "verbose",
+    "when",
+    "where",
+    "window",
+    "with",
+    "xmlattributes",
+    "xmlconcat",
+    "xmlelement",
+    "xmlexists",
+    "xmlforest",
+    "xmlnamespaces",
+    "xmlparse",
+    "xmlpi",
+    "xmlroot",
+    "xmlserialize",
+    "xmltable",
+];
+
+/// A character in upper case when that is one character.
+fn upper_char(c: char) -> char {
+    let mut upper = c.to_uppercase();
+    match (upper.next(), upper.next()) {
+        (Some(u), None) => u,
+        _ => c,
+    }
+}
+
+/// A character in lower case (its first character, for the few that
+/// lower-case to several).
+fn lower_char(c: char) -> char {
+    c.to_lowercase().next().unwrap_or(c)
+}
+
+/// `unistr(text)`: the text with its Unicode escapes (`\0041`,
+/// `\+01F600`, `\u0041`, `\U0001F600`) and doubled backslashes read.
+fn unistr(s: &str) -> Result<String, String> {
+    let invalid = || {
+        crate::error_fields::DbError::new("invalid Unicode escape")
+            .hint("Unicode escapes must be \\XXXX, \\+XXXXXX, \\uXXXX, or \\UXXXXXXXX.")
+            .into_text()
+    };
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    let mut high: Option<u32> = None;
+    while i < chars.len() {
+        if chars[i] != '\\' {
+            if high.is_some() {
+                return Err(invalid());
+            }
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        if chars.get(i + 1) == Some(&'\\') {
+            out.push('\\');
+            i += 2;
+            continue;
+        }
+        let (skip, digits) = match chars.get(i + 1) {
+            Some('+') => (2, 6),
+            Some('u') => (2, 4),
+            Some('U') => (2, 8),
+            _ => (1, 4),
+        };
+        let hex: String = chars.iter().skip(i + skip).take(digits).collect();
+        if hex.len() != digits || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(invalid());
+        }
+        let code = u32::from_str_radix(&hex, 16).map_err(|_| invalid())?;
+        i += skip + digits;
+        let code = match (high.take(), code) {
+            (None, 0xD800..=0xDBFF) => {
+                high = Some(code);
+                continue;
+            }
+            (Some(h), 0xDC00..=0xDFFF) => 0x10000 + ((h - 0xD800) << 10) + (code - 0xDC00),
+            (Some(_), _) | (None, 0xDC00..=0xDFFF) => return Err(invalid()),
+            (None, code) => code,
+        };
+        out.push(char::from_u32(code).ok_or_else(invalid)?);
+    }
+    if high.is_some() {
+        return Err(invalid());
+    }
+    Ok(out)
+}
+
 fn quote_ident(s: &str) -> String {
     let plain = s
         .chars()
         .next()
         .is_some_and(|c| c.is_ascii_lowercase() || c == '_')
         && s.chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        && !QUOTED_KEYWORDS.contains(&s);
     if plain {
         s.to_string()
     } else {
@@ -2960,45 +3280,6 @@ fn format_text(fmt: &str, args: &[Value]) -> Value {
         }
     }
     Value::Text(out)
-}
-
-/// Compiles a POSIX-style pattern with PostgreSQL flags (`i` case-insensitive,
-/// `g` handled by the caller, `n`/`m`/`s` line modes).
-fn regex_with_flags(pattern: &str, flags: &str) -> Option<regex::Regex> {
-    let mut prefix = String::new();
-    if flags.contains('i') {
-        prefix.push('i');
-    }
-    if flags.contains('n') || flags.contains('m') {
-        prefix.push('m');
-    }
-    let source = if prefix.is_empty() {
-        pattern.to_string()
-    } else {
-        format!("(?{prefix}){pattern}")
-    };
-    regex::Regex::new(&source).ok()
-}
-
-/// Rewrites a PostgreSQL replacement string (`\1`, `\&`) for the regex crate.
-fn pg_replacement(replacement: &str) -> String {
-    let mut out = String::new();
-    let mut chars = replacement.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '$' => out.push_str("$$"),
-            '\\' => match chars.next() {
-                Some(d) if d.is_ascii_digit() => {
-                    out.push_str(&format!("${{{d}}}"));
-                }
-                Some('&') => out.push_str("${0}"),
-                Some(other) => out.push(other),
-                None => out.push('\\'),
-            },
-            c => out.push(c),
-        }
-    }
-    out
 }
 
 /// A value as JSON, as `to_jsonb` renders it.

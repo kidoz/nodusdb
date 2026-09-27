@@ -1241,6 +1241,8 @@ const SELECT_LIST_TABLE_FUNCTIONS: &[&str] = &[
     "jsonb_array_elements_text",
     "json_array_elements_text",
     "regexp_split_to_table",
+    "regexp_matches",
+    "string_to_table",
     "pg_partition_ancestors",
 ];
 
@@ -1440,6 +1442,7 @@ fn figure_colname(expr: &sqlparser::ast::Expr) -> Option<String> {
             if *shorthand { "substr" } else { "substring" }.to_string()
         }
         Expr::Overlay { .. } => "overlay".to_string(),
+        Expr::IsNormalized { .. } => "is_normalized".to_string(),
         Expr::Ceil { .. } => "ceil".to_string(),
         Expr::Floor { .. } => "floor".to_string(),
         Expr::Trim { trim_where, .. } => match trim_where {

@@ -1232,8 +1232,39 @@ pub(crate) fn lower_scalar(expr: &sqlparser::ast::Expr, params: &[Value]) -> Opt
                 }
                 _ => return None,
             };
-            let args = args.into_iter().map(|a| json_arg(&name, a)).collect();
+            let mut args: Vec<ScalarExpr> = args.into_iter().map(|a| json_arg(&name, a)).collect();
+            // `normalize(text, NFD)`: the form is a keyword.
+            if name == "NORMALIZE"
+                && let Some(ScalarExpr::Column(form)) = args.get(1)
+                && matches!(form.as_str(), "nfc" | "nfd" | "nfkc" | "nfkd")
+            {
+                args[1] = ScalarExpr::Literal(Value::Text(form.to_ascii_uppercase()));
+            }
             Some(ScalarExpr::Function { name, args })
+        }
+        // `x IS [NOT] [form] NORMALIZED`.
+        Expr::IsNormalized {
+            expr: inner,
+            form,
+            negated,
+        } => {
+            let test = ScalarExpr::Function {
+                name: "__IS_NORMALIZED__".to_string(),
+                args: vec![
+                    lower_scalar(inner, params)?,
+                    ScalarExpr::Literal(Value::Text(
+                        form.as_ref().map_or("NFC".to_string(), |f| f.to_string()),
+                    )),
+                ],
+            };
+            Some(if *negated {
+                ScalarExpr::Unary {
+                    op: ScalarUnaryOp::Not,
+                    expr: Box::new(test),
+                }
+            } else {
+                test
+            })
         }
         // sqlparser lowers SUBSTRING/SUBSTR and TRIM to dedicated AST nodes
         // rather than `Expr::Function`; map them onto the scalar functions
@@ -1670,6 +1701,16 @@ fn pattern_match(
         Value::Bytea(bytes) => bytes.iter().map(|&b| char::from(b)).collect(),
         other => render(other),
     };
+    if kind == PatternKind::Regex {
+        let flags = if case_insensitive { "i" } else { "" };
+        return match crate::pg_regex::compile(&pattern, flags) {
+            Ok(re) => Some(re.is_match(&render(value))),
+            Err(e) => {
+                crate::eval_error::raise(e);
+                None
+            }
+        };
+    }
     let source = match kind {
         PatternKind::Like => like_to_regex(&pattern, escape)?,
         PatternKind::SimilarTo => similar_to_regex(&pattern, escape)?,
@@ -2653,10 +2694,15 @@ pub(crate) fn apply_binary_op(op: ScalarBinaryOp, l: Value, r: Value) -> Value {
                     (Err(e), _) | (_, Err(e)) => crate::eval_error::raise(e),
                 };
             }
+            // A boolean is its cast to text (`true`), not its output (`t`).
+            let text = |v: &Value| match v {
+                Value::Bool(b) => b.to_string(),
+                other => render(other),
+            };
             if matches!(l, Value::Null) || matches!(r, Value::Null) {
                 Value::Null
             } else {
-                Value::Text(format!("{}{}", render(&l), render(&r)))
+                Value::Text(format!("{}{}", text(&l), text(&r)))
             }
         }
         Op::JsonGet

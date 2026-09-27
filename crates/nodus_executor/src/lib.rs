@@ -39,6 +39,7 @@ mod merge;
 pub mod numeric;
 mod parameters;
 mod pg_catalog;
+mod pg_regex;
 mod plan_types;
 mod planner;
 mod random;

@@ -1,0 +1,130 @@
+# String functions: the regexp family with PostgreSQL's arguments, string_to_table, unistr, normalize, and quoting.
+query T
+SELECT regexp_matches('foo bar baz', 'ba(.)', 'g');
+----
+{r}
+{z}
+
+query T
+SELECT regexp_matches('abc', '(a)(b)?(x)?');
+----
+{a,b,NULL}
+
+query T
+SELECT regexp_matches('abc', 'z');
+----
+
+query T
+SELECT x FROM regexp_matches('a1b22c333', '\d+', 'g') AS x;
+----
+{1}
+{22}
+{333}
+
+query TTTTT
+SELECT regexp_instr('banana', 'an', 1, 2), regexp_instr('banana', 'an', 1, 1, 1), regexp_instr('abc', 'x'), regexp_instr('ABC', 'b', 1, 1, 0, 'i'), regexp_instr('a1b2', '([a-z])(\d)', 1, 2, 0, '', 2);
+----
+4	4	0	2	4
+
+query TTTTT
+SELECT regexp_substr('banana', 'a.a', 1, 2), regexp_substr('abc123def', '\d+'), regexp_substr('a1b2', '([a-z])(\d)', 1, 2, '', 2), regexp_count('banana', 'a', 3), regexp_count('ABA', 'a', 1, 'i');
+----
+NULL	123	2	2	2
+
+query TTTTTT
+SELECT regexp_replace('banana', 'a', 'X', 1, 2), regexp_replace('banana', 'a', 'X', 3), regexp_replace('banana', 'a', 'X', 1, 0, 'g'), regexp_replace('Hello', 'l+', '<\&>'), regexp_replace('abc', '(b)', '[\1]'), regexp_replace('ABC', 'b', 'x', 'i');
+----
+banXna	banXna	bXnXnX	He<ll>o	a[b]c	AxC
+
+query TTTTTT
+SELECT regexp_match('foo123bar', '\d+'), regexp_match('2024-01-15', '(\d+)-(\d+)-(\d+)'), regexp_like('Hello', 'h', 'i'), 'foo bar' ~ '\ybar\y', E'a\nb' ~ 'a.b', regexp_like(E'a\nb', 'a.b', 'n');
+----
+{123}	{2024,01,15}	t	t	t	f
+
+query TTT
+SELECT regexp_split_to_array('one  two three', '\s+'), regexp_split_to_array('abc', ''), regexp_split_to_array('a,b', ',', 'q');
+----
+{one,two,three}	{a,b,c}	{a,b}
+
+statement error
+SELECT regexp_match('abc', 'b', 'g');
+
+statement error
+SELECT regexp_count('abc', 'b', 0);
+
+statement error
+SELECT regexp_like('abc', 'b', 'z');
+
+query T
+SELECT string_to_table('a|b|c', '|');
+----
+a
+b
+c
+
+query TT
+SELECT string_to_table('a,b,,c', ',', ''), 1;
+----
+a	1
+b	1
+NULL	1
+c	1
+
+query TT
+SELECT * FROM string_to_table('x y', ' ') WITH ORDINALITY;
+----
+x	1
+y	2
+
+query TT
+SELECT regexp_split_to_table('a,b,,c', ','), 1;
+----
+a	1
+b	1
+	1
+c	1
+
+query TTTT
+SELECT substring('abcdef' FROM 'c(.)e'), substring('abcdef' FROM 2 FOR 3), substring('abcdef', 'b.d'), substring('abcdef' FROM 'x');
+----
+d	bcd	bcd	NULL
+
+query TTT
+SELECT upper('straße'), upper('hello wORLD'), initcap('hello wORLD-foo bar_baz');
+----
+STRAßE	HELLO WORLD	Hello World-Foo Bar_Baz
+
+query TTTTTTT
+SELECT unistr('\0041\+01F600'), unistr('a\\b'), normalize('é', NFD) = 'é', 'é' IS NFC NORMALIZED, 'é' IS NOT NFD NORMALIZED, normalize('Å'), length(normalize('é', NFD));
+----
+A😀	a\b	f	t	t	Å	2
+
+statement error
+SELECT unistr('\zz');
+
+query TTTTTTTT
+SELECT quote_ident('Foo'), quote_ident('foo'), quote_ident('select'), quote_ident('user'), quote_ident('name'), quote_literal(E'a\\b'), quote_literal(42), quote_nullable(1.5);
+----
+"Foo"	foo	"select"	"user"	name	E'a\\b'	'42'	'1.5'
+
+query TTTTT
+SELECT ascii('A'), chr(65), chr(233), length(chr(128512)), octet_length(chr(128512));
+----
+65	A	é	1	4
+
+statement error
+SELECT chr(0);
+
+statement error
+SELECT chr(1114112);
+
+statement error
+SELECT chr(-1);
+
+statement error
+SELECT to_ascii('abc');
+
+query TTTTTTT
+SELECT true || 'x', 'x' || false, 1 || 'a', 'a' || 1.5, 1.5::real || 'x', 0.1::real::text, concat('a', NULL, 1, true);
+----
+truex	xfalse	1a	a1.5	1.5x	0.1	a1t

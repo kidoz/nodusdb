@@ -142,6 +142,8 @@ impl TableFnSpec {
                 | "json_array_elements"
                 | "json_array_elements_text"
                 | "regexp_split_to_table"
+                | "regexp_matches"
+                | "string_to_table"
                 | "pg_partition_ancestors" => true,
                 _ => false,
             }
