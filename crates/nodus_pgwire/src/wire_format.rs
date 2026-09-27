@@ -24,6 +24,9 @@ use crate::type_map::map_declared_type;
 pub(crate) fn sqlstate_for_execution_error(err_str: &str) -> &'static str {
     // Only the message classifies an error, not the fields after it.
     let err_str = nodus_executor::error_message(err_str);
+    if err_str == "prepared transactions are disabled" {
+        return "55000"; // object_not_in_prerequisite_state
+    }
     // Routing retries and unsupported consistency modes.
     if err_str.starts_with("shard unavailable:") || err_str.starts_with("shard routing changed") {
         "40001" // serialization_failure: retry against a current, available route

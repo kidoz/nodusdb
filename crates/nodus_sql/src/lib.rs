@@ -245,6 +245,12 @@ pub const REFRESH_FUNCTION: &str = "pg_catalog.nodus_refresh_materialized_view";
 /// the parser has no such statement.
 pub const ALTER_SEQUENCE_FUNCTION: &str = "pg_catalog.nodus_alter_sequence";
 
+/// The function call a maintenance statement the parser lacks is written as
+/// — `pg_catalog.nodus_utility('CHECKPOINT')` — for `CHECKPOINT`,
+/// `REINDEX`, `CLUSTER`, `LOAD`, `VACUUM` with options or tables, and
+/// `PREPARE TRANSACTION`.
+pub const UTILITY_FUNCTION: &str = "pg_catalog.nodus_utility";
+
 /// Rewrites what the parser lacks: a trailing `WITH [NO] DATA` on `CREATE
 /// TABLE ... AS` or `CREATE MATERIALIZED VIEW` becomes the storage
 /// parameter [`NO_DATA_OPTION`] (for `NO DATA`), and `REFRESH MATERIALIZED
@@ -323,6 +329,35 @@ fn rewrite_data_clause(
             "SELECT {REFRESH_FUNCTION}('{}', {with_data})",
             name.replace('\'', "''")
         );
+        let dialect = PostgreSqlDialect {};
+        return match Tokenizer::new(&dialect, &sql).tokenize_with_location() {
+            Ok(mut tokens) => {
+                tokens.retain(|t| t.token != Token::EOF);
+                tokens.extend(tail);
+                tokens
+            }
+            Err(_) => statement,
+        };
+    }
+
+    // Maintenance statements, by their command tag.
+    let utility = if is(0, "checkpoint") {
+        Some("CHECKPOINT")
+    } else if is(0, "reindex") {
+        Some("REINDEX")
+    } else if is(0, "cluster") {
+        Some("CLUSTER")
+    } else if is(0, "load") {
+        Some("LOAD")
+    } else if is(0, "vacuum") && n > 1 {
+        Some("VACUUM")
+    } else if is(0, "prepare") && is(1, "transaction") {
+        Some("PREPARE TRANSACTION")
+    } else {
+        None
+    };
+    if let Some(tag) = utility {
+        let sql = format!("SELECT {UTILITY_FUNCTION}('{tag}')");
         let dialect = PostgreSqlDialect {};
         return match Tokenizer::new(&dialect, &sql).tokenize_with_location() {
             Ok(mut tokens) => {
@@ -675,6 +710,23 @@ mod tests {
         );
         // Tables keep their own TABLE keyword.
         assert_eq!(one("CREATE TABLE t (a INT)"), "CREATE TABLE t (a INT)");
+    }
+
+    #[test]
+    fn maintenance_statements_are_rewritten() {
+        let one = |sql: &str| parse_sql(sql).unwrap().remove(0).to_string();
+        assert_eq!(
+            one("CHECKPOINT"),
+            format!("SELECT {UTILITY_FUNCTION}('CHECKPOINT')")
+        );
+        assert_eq!(
+            one("VACUUM (VERBOSE, ANALYZE) t"),
+            format!("SELECT {UTILITY_FUNCTION}('VACUUM')")
+        );
+        assert_eq!(
+            one("REINDEX TABLE t"),
+            format!("SELECT {UTILITY_FUNCTION}('REINDEX')")
+        );
     }
 
     #[test]

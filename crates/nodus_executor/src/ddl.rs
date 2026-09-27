@@ -329,7 +329,7 @@ impl MemExecutor {
 
     /// Creates a sequence relation holding `state`. Its state is committed at
     /// once, like the catalog entry, so the two never disagree.
-    fn create_sequence(
+    pub(crate) fn create_sequence(
         &self,
         ctx: &ExecutionContext,
         name: &str,
@@ -441,6 +441,32 @@ impl MemExecutor {
     /// output columns and types and, unless `WITH NO DATA`, inserts its rows.
     /// The command tag is `SELECT <n>`, as in PostgreSQL. A materialized view
     /// keeps its query for `REFRESH`.
+    /// The columns `CREATE TABLE ... (LIKE source)` copies: names, types,
+    /// and NOT NULL, and with `INCLUDING DEFAULTS` their defaults (an
+    /// identity column's generator is not one).
+    pub(crate) fn like_columns(&self, source: &str, defaults: bool) -> Result<Vec<ColumnDef>> {
+        let (db_name, schema_name, table_only) = parse_object_name(source)?;
+        let tbl = self
+            .catalog_reader
+            .get_table(db_name, schema_name, table_only)?;
+        Ok(tbl
+            .columns
+            .iter()
+            .map(|c| ColumnDef {
+                name: c.name.clone(),
+                data_type: c.data_type.clone(),
+                nullable: c.nullable,
+                unique: false,
+                primary: false,
+                default: Self::column_default(c).filter(|d| {
+                    defaults
+                        && !matches!(d, ScalarExpr::Function { name, .. } if name == "__IDENTITY__")
+                }),
+                sequence: None,
+            })
+            .collect())
+    }
+
     pub(crate) fn exec_create_table_as(
         &self,
         ctx: &ExecutionContext,

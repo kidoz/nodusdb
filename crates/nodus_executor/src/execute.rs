@@ -43,7 +43,13 @@ impl MemExecutor {
                 unique_constraints,
                 key_names,
                 on_commit,
+                like,
             } => {
+                let mut copied = Vec::new();
+                for (source, defaults) in &like {
+                    copied.extend(self.like_columns(source, *defaults)?);
+                }
+                let columns = copied.into_iter().chain(columns).collect();
                 let out = self.exec_create_table(
                     ctx,
                     name.clone(),
@@ -290,6 +296,9 @@ impl MemExecutor {
             ),
             LogicalPlan::DropIndex { name, if_exists } => {
                 self.exec_drop_index(ctx, name, if_exists)
+            }
+            LogicalPlan::RenameIndex { name, new_name } => {
+                self.exec_rename_index(ctx, &name, &new_name)
             }
             LogicalPlan::CreateRole { name } => self.exec_create_role(ctx, name),
             LogicalPlan::Grant {

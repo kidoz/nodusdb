@@ -41,6 +41,7 @@ fn test_ddl_and_subqueries() {
         &ctx,
         LogicalPlan::CreateTable {
             on_commit: None,
+            like: Vec::new(),
             unique_constraints: vec![],
             key_names: vec![],
             if_not_exists: false,
@@ -115,6 +116,8 @@ fn test_ddl_and_subqueries() {
                 nullable: true,
                 default: None,
                 if_not_exists: false,
+                sequence: None,
+                identity: None,
             }],
             if_exists: false,
         },
@@ -162,6 +165,7 @@ fn test_ddl_and_subqueries() {
         &ctx,
         LogicalPlan::CreateTable {
             on_commit: None,
+            like: Vec::new(),
             unique_constraints: vec![],
             key_names: vec![],
             if_not_exists: false,
@@ -272,6 +276,7 @@ fn test_unique_constraints() {
         &ctx,
         LogicalPlan::CreateTable {
             on_commit: None,
+            like: Vec::new(),
             unique_constraints: vec![],
             key_names: vec![],
             if_not_exists: false,
@@ -422,6 +427,7 @@ fn test_secondary_indexing() {
         &ctx,
         LogicalPlan::CreateTable {
             on_commit: None,
+            like: Vec::new(),
             unique_constraints: vec![],
             key_names: vec![],
             if_not_exists: false,
@@ -697,6 +703,7 @@ fn test_index_value_containing_separator_does_not_overmatch() {
         &ctx,
         LogicalPlan::CreateTable {
             on_commit: None,
+            like: Vec::new(),
             unique_constraints: vec![],
             key_names: vec![],
             if_not_exists: false,
@@ -819,6 +826,7 @@ fn test_alter_table_migrations() {
         &ctx,
         LogicalPlan::CreateTable {
             on_commit: None,
+            like: Vec::new(),
             unique_constraints: vec![],
             key_names: vec![],
             if_not_exists: false,
@@ -874,6 +882,8 @@ fn test_alter_table_migrations() {
                 nullable: true,
                 default: None,
                 if_not_exists: false,
+                sequence: None,
+                identity: None,
             }],
             if_exists: false,
         },

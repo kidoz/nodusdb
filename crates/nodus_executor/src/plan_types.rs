@@ -981,6 +981,13 @@ pub enum AlterTableOp {
         /// `ADD COLUMN IF NOT EXISTS`.
         #[serde(default)]
         if_not_exists: bool,
+        /// A `serial` or identity column's sequence, made with the column
+        /// (named for the table and column), and for an identity whether it
+        /// is `GENERATED ALWAYS`.
+        #[serde(default)]
+        sequence: Option<crate::sequences::SequenceSpec>,
+        #[serde(default)]
+        identity: Option<bool>,
     },
     RenameColumn {
         old_name: String,
@@ -1085,6 +1092,10 @@ pub enum LogicalPlan {
         /// A temporary table's `ON COMMIT` action: `DROP` or `DELETE ROWS`.
         #[serde(default)]
         on_commit: Option<String>,
+        /// `LIKE source [INCLUDING DEFAULTS]`: a table whose columns lead
+        /// the new one's, and whether their defaults come too.
+        #[serde(default)]
+        like: Vec<(String, bool)>,
     },
     /// `DROP TABLE names` or, with `materialized`, `DROP MATERIALIZED
     /// VIEW names`; with `cascade`, the objects depending on them go too.
@@ -1131,6 +1142,11 @@ pub enum LogicalPlan {
     DropIndex {
         name: String,
         if_exists: bool,
+    },
+    /// `ALTER INDEX name RENAME TO new_name`.
+    RenameIndex {
+        name: String,
+        new_name: String,
     },
     CreateRole {
         name: String,

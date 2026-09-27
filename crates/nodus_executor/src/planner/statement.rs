@@ -311,6 +311,16 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                     Some(sqlparser::ast::OnCommit::DeleteRows) => Some("DELETE ROWS".to_string()),
                     _ => None,
                 },
+                like: match &create_table.like {
+                    Some(
+                        sqlparser::ast::CreateTableLikeKind::Parenthesized(like)
+                        | sqlparser::ast::CreateTableLikeKind::Plain(like),
+                    ) => vec![(
+                        like.name.to_string(),
+                        like.defaults == Some(sqlparser::ast::CreateTableLikeDefaults::Including),
+                    )],
+                    None => Vec::new(),
+                },
             })
         }
         Statement::CreateView(create_view) => {
@@ -661,6 +671,18 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                 materialized: false,
             })
         }
+        // Maintenance the storage engine does itself.
+        Statement::Query(query) if rewritten_call(query, nodus_sql::UTILITY_FUNCTION).is_some() => {
+            match rewritten_call(query, nodus_sql::UTILITY_FUNCTION).as_deref() {
+                Some([crate::Value::Text(tag)]) if tag == "PREPARE TRANSACTION" => Err(
+                    crate::error_fields::DbError::new("prepared transactions are disabled")
+                        .hint("Set \"max_prepared_transactions\" to a nonzero value.")
+                        .into(),
+                ),
+                Some([crate::Value::Text(tag)]) => Ok(LogicalPlan::Noop { tag: tag.clone() }),
+                _ => anyhow::bail!("malformed maintenance statement"),
+            }
+        }
         Statement::Query(query)
             if rewritten_call(query, nodus_sql::ALTER_SEQUENCE_FUNCTION).is_some() =>
         {
@@ -970,6 +992,17 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                 if_exists: alter_table.if_exists,
             })
         }
+        Statement::AlterIndex {
+            name,
+            operation: sqlparser::ast::AlterIndexOperation::RenameIndex { index_name },
+        } => Ok(LogicalPlan::RenameIndex {
+            name: name.to_string(),
+            new_name: index_name
+                .0
+                .last()
+                .and_then(|p| p.as_ident())
+                .map_or_else(|| index_name.to_string(), |i| i.value.clone()),
+        }),
         _ => anyhow::bail!("{} is not supported", leading_keywords(&stmt.to_string())),
     }
 }
@@ -1304,19 +1337,55 @@ fn plan_alter_table_op(
             ..
         } => {
             let column = column_def.name.value.clone();
-            let data_type = column_def.data_type.to_string();
-            if matches!(
-                data_type.to_ascii_uppercase().as_str(),
-                "SERIAL" | "BIGSERIAL" | "SMALLSERIAL" | "SERIAL4" | "SERIAL8" | "SERIAL2"
-            ) {
-                anyhow::bail!("ALTER TABLE ... ADD COLUMN of a serial column is not supported");
-            }
+            let mut data_type = column_def.data_type.to_string();
             let mut nullable = true;
             let mut default = None;
             let mut constraints = Vec::new();
+            let mut sequence = None;
+            let mut identity = None;
+            // `serial` types are integers drawing from a sequence.
+            let serial_type = match data_type.to_ascii_lowercase().as_str() {
+                "serial" | "serial4" => Some("integer"),
+                "bigserial" | "serial8" => Some("bigint"),
+                "smallserial" | "serial2" => Some("smallint"),
+                _ => None,
+            };
+            if let Some(integer_type) = serial_type {
+                data_type = integer_type.to_ascii_uppercase();
+                nullable = false;
+                sequence = Some(crate::sequences::SequenceSpec {
+                    data_type: Some(integer_type.to_string()),
+                    ..Default::default()
+                });
+            }
             for opt in &column_def.options {
                 let name = opt.name.as_ref().map(|n| n.value.clone());
                 match &opt.option {
+                    ColumnOption::Generated {
+                        generated_as:
+                            generated_as @ (sqlparser::ast::GeneratedAs::Always
+                            | sqlparser::ast::GeneratedAs::ByDefault),
+                        sequence_options,
+                        generation_expr: None,
+                        ..
+                    } => {
+                        let integer_type = match data_type.to_ascii_lowercase().as_str() {
+                            "smallint" | "int2" => "smallint",
+                            "int" | "integer" | "int4" => "integer",
+                            "bigint" | "int8" => "bigint",
+                            other => anyhow::bail!(
+                                "identity column type must be smallint, integer, or bigint, not {other}"
+                            ),
+                        };
+                        nullable = false;
+                        sequence = Some(sequence_spec(
+                            Some(integer_type.to_string()),
+                            sequence_options.as_deref().unwrap_or(&[]),
+                            params,
+                        )?);
+                        identity =
+                            Some(matches!(generated_as, sqlparser::ast::GeneratedAs::Always));
+                    }
                     ColumnOption::Null => {}
                     ColumnOption::NotNull => nullable = false,
                     ColumnOption::Default(e) => {
@@ -1361,6 +1430,8 @@ fn plan_alter_table_op(
                 nullable,
                 default,
                 if_not_exists: *if_not_exists,
+                sequence,
+                identity,
             })
             .chain(
                 constraints

@@ -1384,6 +1384,7 @@ fn write_command(plan: &LogicalPlan) -> Option<&'static str> {
         LogicalPlan::AlterTable { .. } => "ALTER TABLE",
         LogicalPlan::CreateIndex { .. } => "CREATE INDEX",
         LogicalPlan::DropIndex { .. } => "DROP INDEX",
+        LogicalPlan::RenameIndex { .. } => "ALTER INDEX",
         LogicalPlan::CreateView { .. } => "CREATE VIEW",
         LogicalPlan::DropView { .. } => "DROP VIEW",
         LogicalPlan::CreateSchema { .. } => "CREATE SCHEMA",

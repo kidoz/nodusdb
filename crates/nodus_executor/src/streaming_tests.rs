@@ -159,6 +159,7 @@ fn exec_with_rows(
         &ctx,
         LogicalPlan::CreateTable {
             on_commit: None,
+            like: Vec::new(),
             unique_constraints: vec![],
             key_names: vec![],
             if_not_exists: false,

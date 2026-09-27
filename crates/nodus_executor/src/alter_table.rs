@@ -59,14 +59,54 @@ impl MemExecutor {
                 nullable,
                 default,
                 if_not_exists,
-            } => self.add_column(
-                ctx,
-                tbl,
-                name,
-                data_type,
-                (nullable, default),
-                if_not_exists,
-            ),
+                sequence,
+                identity,
+            } => {
+                // A `serial` or identity column's sequence comes first; its
+                // values fill the rows already there.
+                let default = match sequence {
+                    Some(spec) if !tbl.columns.iter().any(|c| c.name == name) => {
+                        let schema = self
+                            .catalog_reader
+                            .list_schemas("default")?
+                            .into_iter()
+                            .find(|s| s.id == tbl.schema_id)
+                            .map_or_else(|| "public".to_string(), |s| s.name);
+                        let owned = crate::sequences::owned_sequence_name(&tbl.name, &name);
+                        let quoted = if owned.chars().any(|c| c.is_ascii_uppercase()) {
+                            format!("\"{owned}\"")
+                        } else {
+                            owned
+                        };
+                        let sequence_name = format!("{schema}.{quoted}");
+                        self.create_sequence(
+                            ctx,
+                            &sequence_name,
+                            crate::sequences::SequenceState::new(&spec)?,
+                        )?;
+                        let sequence_arg = ScalarExpr::Literal(Value::Text(sequence_name));
+                        Some(match identity {
+                            Some(always) => ScalarExpr::Function {
+                                name: "__IDENTITY__".to_string(),
+                                args: vec![sequence_arg, ScalarExpr::Literal(Value::Bool(always))],
+                            },
+                            None => ScalarExpr::Function {
+                                name: "NEXTVAL".to_string(),
+                                args: vec![sequence_arg],
+                            },
+                        })
+                    }
+                    _ => default,
+                };
+                self.add_column(
+                    ctx,
+                    tbl,
+                    name,
+                    data_type,
+                    (nullable, default),
+                    if_not_exists,
+                )
+            }
             AlterTableOp::DropColumn {
                 name,
                 if_exists,
@@ -157,19 +197,22 @@ impl MemExecutor {
             }
             anyhow::bail!(exists);
         }
-        // Backfill value for existing rows: the evaluated DEFAULT, or NULL
-        // when none is declared (PostgreSQL semantics).
-        let backfill = default
-            .as_ref()
-            .map(|e| {
-                crate::value::coerce_for_column(
-                    &crate::planner::eval_scalar_expr(e, &[], &[]),
-                    &data_type,
-                )
-            })
-            .unwrap_or(Value::Null);
+        // Backfill for existing rows: the DEFAULT evaluated for each (a
+        // `nextval` or `random()` gives each its own), or NULL when none is
+        // declared (PostgreSQL semantics).
+        let backfill = || {
+            default
+                .as_ref()
+                .map(|e| {
+                    crate::value::coerce_for_column(
+                        &crate::planner::eval_scalar_expr(e, &[], &[]),
+                        &data_type,
+                    )
+                })
+                .unwrap_or(Value::Null)
+        };
         let rows = self.scan_rows_keyed(tbl.id, &ctx.session_id)?;
-        if !nullable && backfill == Value::Null && !rows.is_empty() {
+        if !nullable && default.is_none() && !rows.is_empty() {
             return Err(self.contains_nulls(tbl, &name));
         }
         let column = ColumnDescriptor {
@@ -179,14 +222,18 @@ impl MemExecutor {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             state: DescriptorState::Public,
-            data_type,
+            data_type: data_type.clone(),
             nullable,
             default_expr: default.as_ref().and_then(|e| serde_json::to_string(e).ok()),
             comment: None,
         };
         // Existing rows gain the column under their stored keys.
         for (key, mut row) in rows {
-            row.push(backfill.clone());
+            let value = backfill();
+            if !nullable && value == Value::Null {
+                return Err(self.contains_nulls(tbl, &column.name));
+            }
+            row.push(value);
             self.write_row(&ctx.session_id, key, crate::value::encode_row(&row)?)?;
         }
         self.change(TableDescriptorChange::AddColumn {
@@ -1003,6 +1050,41 @@ impl MemExecutor {
             anyhow::bail!("relation \"{new}\" already exists");
         }
         self.replace_index(tbl, old, key)
+    }
+}
+
+impl MemExecutor {
+    /// `ALTER INDEX name RENAME TO new_name`.
+    pub(crate) fn exec_rename_index(
+        &self,
+        ctx: &ExecutionContext,
+        name: &str,
+        new_name: &str,
+    ) -> Result<QueryOutput> {
+        let (_, _, index_name) = parse_object_name(name)?;
+        let tables = self.catalog_reader.list_all_tables("default")?;
+        let Some(tbl) = tables
+            .iter()
+            .find(|t| t.indexes.iter().any(|i| i.name == index_name))
+        else {
+            anyhow::bail!("relation \"{index_name}\" does not exist");
+        };
+        self.authorize(ctx, Action::CreateTable, ResourceRef::Table(tbl.id))?;
+        if self.relation_name_taken(new_name)? {
+            anyhow::bail!("relation \"{new_name}\" already exists");
+        }
+        let renamed: Vec<nodus_catalog::IndexDescriptor> = tbl
+            .indexes
+            .iter()
+            .filter(|i| i.name == index_name)
+            .cloned()
+            .map(|mut i| {
+                i.name = new_name.to_string();
+                i
+            })
+            .collect();
+        self.replace_index(tbl, index_name, renamed)?;
+        Ok(QueryOutput::tag("ALTER INDEX"))
     }
 }
 

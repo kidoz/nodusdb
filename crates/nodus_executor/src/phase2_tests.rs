@@ -41,6 +41,7 @@ fn test_group_by_aggregates() {
         &ctx,
         LogicalPlan::CreateTable {
             on_commit: None,
+            like: Vec::new(),
             unique_constraints: vec![],
             key_names: vec![],
             if_not_exists: false,
@@ -265,6 +266,7 @@ fn test_set_operations() {
             &ctx,
             LogicalPlan::CreateTable {
                 on_commit: None,
+                like: Vec::new(),
                 unique_constraints: vec![],
                 key_names: vec![],
                 if_not_exists: false,
@@ -359,6 +361,7 @@ fn test_cross_join() {
             &ctx,
             LogicalPlan::CreateTable {
                 on_commit: None,
+                like: Vec::new(),
                 unique_constraints: vec![],
                 key_names: vec![],
                 if_not_exists: false,
@@ -422,6 +425,7 @@ fn test_having() {
         &ctx,
         LogicalPlan::CreateTable {
             on_commit: None,
+            like: Vec::new(),
             unique_constraints: vec![],
             key_names: vec![],
             if_not_exists: false,
@@ -511,6 +515,7 @@ fn test_window_functions() {
         &ctx,
         LogicalPlan::CreateTable {
             on_commit: None,
+            like: Vec::new(),
             unique_constraints: vec![],
             key_names: vec![],
             if_not_exists: false,

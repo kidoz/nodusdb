@@ -66,6 +66,7 @@ fn create_role_and_grant_require_grant_management() {
         &admin_ctx,
         LogicalPlan::CreateTable {
             on_commit: None,
+            like: Vec::new(),
             unique_constraints: vec![],
             key_names: vec![],
             if_not_exists: false,
@@ -147,6 +148,7 @@ fn create_table_denied_then_allowed_by_grant() {
     let ctx = ctx_for(user.id);
     let plan = || LogicalPlan::CreateTable {
         on_commit: None,
+        like: Vec::new(),
         unique_constraints: vec![],
         key_names: vec![],
         if_not_exists: false,
@@ -204,6 +206,7 @@ fn create_insert_select_round_trip() {
         &ctx,
         LogicalPlan::CreateTable {
             on_commit: None,
+            like: Vec::new(),
             unique_constraints: vec![],
             key_names: vec![],
             if_not_exists: false,
@@ -383,6 +386,7 @@ fn rows_keyed_by_declared_pk_not_first_column() {
         &ctx,
         LogicalPlan::CreateTable {
             on_commit: None,
+            like: Vec::new(),
             unique_constraints: vec![],
             key_names: vec![],
             if_not_exists: false,
@@ -497,6 +501,7 @@ fn typed_values_round_trip_and_filter_by_int() {
         &ctx,
         LogicalPlan::CreateTable {
             on_commit: None,
+            like: Vec::new(),
             unique_constraints: vec![],
             key_names: vec![],
             if_not_exists: false,
@@ -580,6 +585,7 @@ fn update_and_delete_rows() {
         &ctx,
         LogicalPlan::CreateTable {
             on_commit: None,
+            like: Vec::new(),
             unique_constraints: vec![],
             key_names: vec![],
             if_not_exists: false,
@@ -697,6 +703,7 @@ fn test_join_execution() {
         &ctx,
         LogicalPlan::CreateTable {
             on_commit: None,
+            like: Vec::new(),
             unique_constraints: vec![],
             key_names: vec![],
             if_not_exists: false,
@@ -712,6 +719,7 @@ fn test_join_execution() {
         &ctx,
         LogicalPlan::CreateTable {
             on_commit: None,
+            like: Vec::new(),
             unique_constraints: vec![],
             key_names: vec![],
             if_not_exists: false,
@@ -849,6 +857,7 @@ fn transactions_are_isolated_per_session() {
         &ctx_a,
         LogicalPlan::CreateTable {
             on_commit: None,
+            like: Vec::new(),
             unique_constraints: vec![],
             key_names: vec![],
             if_not_exists: false,
@@ -982,6 +991,7 @@ fn test_complex_filters() {
         &ctx,
         LogicalPlan::CreateTable {
             on_commit: None,
+            like: Vec::new(),
             unique_constraints: vec![],
             key_names: vec![],
             if_not_exists: false,
@@ -1062,6 +1072,7 @@ fn test_left_outer_join() {
         &ctx,
         LogicalPlan::CreateTable {
             on_commit: None,
+            like: Vec::new(),
             unique_constraints: vec![],
             key_names: vec![],
             if_not_exists: false,
@@ -1076,6 +1087,7 @@ fn test_left_outer_join() {
         &ctx,
         LogicalPlan::CreateTable {
             on_commit: None,
+            like: Vec::new(),
             unique_constraints: vec![],
             key_names: vec![],
             if_not_exists: false,
