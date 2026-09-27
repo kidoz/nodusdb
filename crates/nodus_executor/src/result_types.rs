@@ -389,6 +389,40 @@ pub(crate) fn check_integer_ranges(
         name: TZ_TEXT.to_string(),
         args: vec![e.clone()],
     };
+    // A `real` is kept as a double; its text and its numeric value are the
+    // `real`'s (`0.1::real::text` is `0.1`).
+    let real =
+        |e: &ScalarExpr| scalar_type(e, column).is_some_and(|t| crate::value::is_real_type(&t));
+    let call = |name: &str, e: &ScalarExpr| ScalarExpr::Function {
+        name: name.to_string(),
+        args: vec![e.clone()],
+    };
+    let textual = |e: &ScalarExpr| zoned(e) || real(e);
+    let text_form = |e: &ScalarExpr| {
+        if zoned(e) {
+            session_text(e)
+        } else if real(e) {
+            call(REAL_TEXT, e)
+        } else {
+            e.clone()
+        }
+    };
+    if let ScalarExpr::Cast {
+        expr: inner,
+        target,
+    } = &checked
+        && real(inner)
+    {
+        if is_text_type(target) {
+            return call(REAL_TEXT, inner);
+        }
+        if is_numeric(target) {
+            return ScalarExpr::Cast {
+                expr: Box::new(call(REAL_NUMERIC, inner)),
+                target: target.clone(),
+            };
+        }
+    }
     match &checked {
         ScalarExpr::Cast {
             expr: inner,
@@ -424,25 +458,21 @@ pub(crate) fn check_integer_ranges(
             op: ScalarBinaryOp::Concat,
             left,
             right,
-        } if zoned(left) || zoned(right) => {
-            let text = |e: &ScalarExpr| if zoned(e) { session_text(e) } else { e.clone() };
+        } if textual(left) || textual(right) => {
             return ScalarExpr::Binary {
                 op: ScalarBinaryOp::Concat,
-                left: Box::new(text(left)),
-                right: Box::new(text(right)),
+                left: Box::new(text_form(left)),
+                right: Box::new(text_form(right)),
             };
         }
         // Text-building functions take a zoned timestamp's text.
         ScalarExpr::Function { name, args }
             if matches!(name.as_str(), "CONCAT" | "CONCAT_WS" | "FORMAT")
-                && args.iter().any(zoned) =>
+                && args.iter().any(textual) =>
         {
             return ScalarExpr::Function {
                 name: name.clone(),
-                args: args
-                    .iter()
-                    .map(|a| if zoned(a) { session_text(a) } else { a.clone() })
-                    .collect(),
+                args: args.iter().map(text_form).collect(),
             };
         }
         // A timestamp is JSON in ISO 8601 form (`2024-07-01T12:00:00`).
@@ -498,6 +528,34 @@ pub(crate) fn check_integer_ranges(
             args: args.iter().cloned().chain(types).collect(),
         };
     }
+    // `to_hex` of an `integer` shows 32 bits.
+    if let ScalarExpr::Function { name, args } = &checked
+        && matches!(name.as_str(), "TO_HEX" | "TO_BIN" | "TO_OCT")
+        && let [arg] = args.as_slice()
+    {
+        let ty = scalar_type(arg, column)
+            .unwrap_or_default()
+            .to_ascii_uppercase();
+        return ScalarExpr::Function {
+            name: name.clone(),
+            args: vec![arg.clone(), ScalarExpr::Literal(Value::Text(ty))],
+        };
+    }
+    // A bitwise operator computes in its result type (`1 << 31` wraps in
+    // `integer`).
+    if let ScalarExpr::Function { name, args } = &checked
+        && bitwise_arity(name) == Some(args.len())
+    {
+        let ty = scalar_type(&checked, column).unwrap_or_default();
+        return ScalarExpr::Function {
+            name: name.clone(),
+            args: args
+                .iter()
+                .cloned()
+                .chain([ScalarExpr::Literal(Value::Text(ty))])
+                .collect(),
+        };
+    }
     // `pg_typeof` reports the argument's declared type, which a value alone
     // cannot tell (a `smallint` column holds integers too); an untyped
     // string literal is `unknown`.
@@ -538,9 +596,51 @@ pub(crate) fn check_integer_ranges(
     }
 }
 
+/// The functions the bitwise operators are evaluated by: `&`, `|`, `#`,
+/// `<<`, `>>`, and `~`. [`check_integer_ranges`] appends their result type,
+/// which sets the width an integer shift wraps at.
+pub(crate) const BIT_AND: &str = "__BITAND__";
+pub(crate) const BIT_OR: &str = "__BITOR__";
+pub(crate) const BIT_XOR: &str = "__BITXOR__";
+pub(crate) const SHIFT_LEFT: &str = "__SHIFTLEFT__";
+pub(crate) const SHIFT_RIGHT: &str = "__SHIFTRIGHT__";
+pub(crate) const BIT_NOT: &str = "__BITNOT__";
+
+/// Whether a function is one of the bitwise operators, and how many operands
+/// it takes.
+pub(crate) fn bitwise_arity(name: &str) -> Option<usize> {
+    match name {
+        BIT_AND | BIT_OR | BIT_XOR | SHIFT_LEFT | SHIFT_RIGHT => Some(2),
+        BIT_NOT => Some(1),
+        _ => None,
+    }
+}
+
+/// The result type of a bitwise operator on operands of these types: the
+/// wider integer (a shift keeps its left operand's), or a bit string.
+pub(crate) fn bitwise_type(name: &str, arg_types: &[Option<String>]) -> Option<String> {
+    let left = arg_types.first().cloned().flatten();
+    if matches!(name, SHIFT_LEFT | SHIFT_RIGHT | BIT_NOT) {
+        return left;
+    }
+    let right = arg_types.get(1).cloned().flatten();
+    match (&left, &right) {
+        (Some(l), Some(r)) => match (integer_rank(l), integer_rank(r)) {
+            (Some(a), Some(b)) if b > a => right,
+            _ => left,
+        },
+        (None, _) => right,
+        _ => left,
+    }
+}
+
 /// The function an interval sort key is rewritten to: its length of time,
 /// as a number of microseconds (a month as 30 days).
 pub(crate) const INTERVAL_SPAN: &str = "__INTERVAL_SPAN__";
+
+/// The functions a `real`'s text and numeric value are rewritten to.
+pub(crate) const REAL_TEXT: &str = "__REAL_TEXT__";
+pub(crate) const REAL_NUMERIC: &str = "__REAL_NUMERIC__";
 
 /// The function a zoned timestamp's text is rewritten to: the value as
 /// the session shows it.

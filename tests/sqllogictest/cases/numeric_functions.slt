@@ -1,0 +1,102 @@
+# Numeric sqrt, exp, ln, log, and power to PostgreSQL's digits and scales, and the other numeric functions.
+query TTTTTTT
+SELECT sqrt(2::numeric), sqrt(16::numeric), sqrt(1e-10::numeric), sqrt(12345678901234567890::numeric), sqrt(0::numeric), sqrt(2.0), sqrt(1.21);
+----
+1.414213562373095	4.000000000000000	0.000010000000000000000	3513641828.8201443	0.000000000000000	1.414213562373095	1.100000000000000
+
+query TTTTTTTT
+SELECT exp(1::numeric), exp(0.5::numeric), exp(10::numeric), exp(-1::numeric), exp(2.5), exp(0::numeric), exp(100::numeric), exp(-100::numeric);
+----
+2.7182818284590452	1.6487212707001281	22026.465794806717	0.3678794411714423	12.182493960703473	1.0000000000000000	26881171418161354484126255515800135873611119	0.00000000000000000000000000000000000000000003720075976020836
+
+query TTTTTTT
+SELECT ln(10::numeric), ln(2::numeric), ln(0.5), ln(1e10::numeric), ln(1::numeric), ln(1.0000001), ln(1e-100::numeric);
+----
+2.3025850929940457	0.6931471805599453	-0.6931471805599453	23.025850929940457	0.0000000000000000	0.00000009999999500000033	-230.2585092994045684017991454684364207601101488628772976033327900967572609677352480235997205089598298342
+
+query TTTTTTT
+SELECT log(1000::numeric), log(0.001), log(2::numeric, 1024::numeric), log(2.0, 64.0), log(2, 64), log10(1000::numeric), log(10, 2);
+----
+3.0000000000000000	-3.0000000000000000	10.0000000000000000	6.0000000000000000	6.0000000000000000	3.0000000000000000	0.3010299956639812
+
+query TTTTTTTT
+SELECT power(2.5, 2), power(2::numeric, 0.5), power(2::numeric, 10), power(1.1::numeric, 100), power(10::numeric, -3), power(2::numeric, -0.5), 1.5 ^ 3, 0.0 ^ 0.0;
+----
+6.2500000000000000	1.4142135623730950	1024.0000000000000	13780.612339822270	0.0010000000000000000	0.7071067811865475	3.3750000000000000	1.0000000000000000
+
+query TTTTTTTT
+SELECT 2.0 ^ 0.5, 4 ^ 0.5, 27 ^ (1::numeric / 3), 2::numeric ^ 0.5, power(0::numeric, 2.5), power(-2::numeric, 3), power(-2::numeric, -3), (-2::numeric) ^ 2;
+----
+1.4142135623730950	2.0000000000000000	2.99999999999999999997	1.4142135623730950	0.0000000000000000	-8.0000000000000000	-0.1250000000000000	4.0000000000000000
+
+query TTTT
+SELECT power(1.0001::numeric, 10000), length(power(2::numeric, 1000)::text), power(10::numeric, 2.00), power(2::numeric, 3.0);
+----
+2.7181459268252249	302	100.00000000000000	8.0000000000000000
+
+query TTTTT
+SELECT power('NaN'::numeric, 0), power(1::numeric, 'NaN'), power('Infinity'::numeric, -1), power(0.5::numeric, 'Infinity'), power(-1::numeric, 'Infinity');
+----
+1	1	0	0	1
+
+statement error
+SELECT (-8) ^ (1.0 / 3);
+
+statement error
+SELECT 0::numeric ^ -1;
+
+statement error
+SELECT ln(0::numeric);
+
+statement error
+SELECT ln(-1::numeric);
+
+statement error
+SELECT sqrt(-1::numeric);
+
+statement error
+SELECT log(1, 10);
+
+query TTTTTT
+SELECT sqrt('Infinity'::numeric), exp('-Infinity'::numeric), ln('Infinity'::numeric), abs('-Infinity'::numeric), log('Infinity'::numeric, 10), log(10, 'Infinity'::numeric);
+----
+Infinity	0	Infinity	Infinity	0	Infinity
+
+query TTTTTT
+SELECT div(7, 2), div(-7.5, 2), div(7.0, 0.3), mod(7.5, 2), mod(-7, 3), pg_typeof(div(7, 2));
+----
+3	-3	23	1.5	-1	numeric
+
+query TTTT
+SELECT factorial(20), factorial(25), factorial(0), pg_typeof(factorial(3));
+----
+2432902008176640000	15511210043330985984000000	1	numeric
+
+statement error
+SELECT factorial(-1);
+
+query TTTTTTTT
+SELECT gcd(1.5, 2.25), lcm(1.5, 2.25), gcd(12::numeric, 18), lcm(0.0, 5), gcd(-12, 18), lcm(-4, 6), gcd(12, 18), lcm(4, 6);
+----
+0.75	4.50	6	0.0	6	12	6	12
+
+query TTTTTTTT
+SELECT scale(1.230), min_scale(1.230), trim_scale(1.230), scale(5), trim_scale(0.000), scale('NaN'::numeric), trim_scale('NaN'::numeric), min_scale(12.0);
+----
+3	2	1.23	0	0	NULL	NaN	0
+
+query TTTTTTTT
+SELECT width_bucket(5.35, 0.024, 10.06, 5), width_bucket(3, ARRAY[1, 4, 7]), width_bucket(0, ARRAY[1, 4, 7]), width_bucket(10, ARRAY[1, 4, 7]), width_bucket(4, ARRAY[1, 4, 7]), width_bucket(10::float8, 10, 0, 5), width_bucket(1, 0, 10, 10), width_bucket(9.999999999999999999::numeric, 0, 10, 10);
+----
+3	1	0	3	2	1	2	10
+
+statement error
+SELECT width_bucket(1, 0, 0, 5);
+
+statement error
+SELECT width_bucket(1, 0, 10, 0);
+
+query TTTTTTT
+SELECT pg_typeof(sqrt(2)), pg_typeof(sqrt(2::numeric)), pg_typeof(power(2, 3)), pg_typeof(2 ^ 3.0), pg_typeof(round(2.5)), pg_typeof(round(2, 1)), pg_typeof(log(2, 8));
+----
+double precision	numeric	double precision	numeric	numeric	numeric	numeric

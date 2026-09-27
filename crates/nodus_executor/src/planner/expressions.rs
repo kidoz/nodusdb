@@ -296,17 +296,21 @@ pub(crate) fn try_cast(v: Value, data_type: &str) -> std::result::Result<Value, 
                 Value::Int(i) => *i,
                 Value::Float(f) if f.is_finite() && f.abs() < 9.3e18 => f.round_ties_even() as i64,
                 Value::Float(_) => return Err(out_of_range()),
-                Value::Numeric(d) => {
-                    use rust_decimal::prelude::ToPrimitive;
-                    d.round_dp_with_strategy(
-                        0,
-                        rust_decimal::RoundingStrategy::MidpointAwayFromZero,
-                    )
+                Value::Numeric(d) => d
                     .to_i64()
-                    .ok_or_else(out_of_range)?
-                }
+                    .ok_or_else(|| d.integer_error(&crate::value::sql_type_name(data_type)))?,
                 Value::Bool(b) => i64::from(*b),
-                Value::Text(s) => s.trim().parse::<i64>().map_err(|_| invalid(s))?,
+                Value::Text(s) => {
+                    let n = crate::value::parse_integer_text(s).ok_or_else(|| invalid(s))?;
+                    let (min, max) = crate::value::integer_range(data_type);
+                    if !(i128::from(min)..=i128::from(max)).contains(&n) {
+                        return Err(format!(
+                            "value \"{s}\" is out of range for type {}",
+                            crate::value::sql_type_name(data_type)
+                        ));
+                    }
+                    n as i64
+                }
                 other => return Err(invalid(&render(other))),
             };
             let (min, max) = crate::value::integer_range(data_type);
@@ -317,28 +321,26 @@ pub(crate) fn try_cast(v: Value, data_type: &str) -> std::result::Result<Value, 
         }
         ColumnType::Numeric => {
             let d = match &v {
-                Value::Numeric(d) => *d,
-                Value::Int(i) => rust_decimal::Decimal::from(*i),
-                Value::Float(f) if f.is_finite() => crate::value::parse_decimal(&f.to_string())
-                    .ok_or_else(|| "value overflows numeric format".to_string())?,
-                Value::Float(_) => return Err("cannot convert infinity or NaN to numeric".into()),
-                Value::Text(s) => crate::value::parse_decimal(s).ok_or_else(|| invalid(s))?,
+                Value::Numeric(d) => d.clone(),
+                Value::Int(i) => crate::numeric::Numeric::from(*i),
+                Value::Float(f) => crate::numeric::Numeric::from_f64(*f),
+                Value::Text(s) => crate::numeric::Numeric::parse(s)?,
                 other => return Err(invalid(&render(other))),
             };
             Value::Numeric(crate::value::apply_numeric_typmod(d, data_type)?)
         }
-        ColumnType::Float => match &v {
-            Value::Float(_) => v,
-            Value::Numeric(d) => Value::Float(crate::value::decimal_to_f64(d)),
-            Value::Int(i) => Value::Float(*i as f64),
-            Value::Bool(b) => Value::Float(if *b { 1.0 } else { 0.0 }),
-            Value::Text(s) => s
-                .trim()
-                .parse::<f64>()
-                .map(Value::Float)
-                .map_err(|_| invalid(s))?,
-            other => return Err(invalid(&render(other))),
-        },
+        ColumnType::Float => {
+            let real = crate::value::is_real_type(data_type);
+            let x = match &v {
+                Value::Float(f) => *f,
+                Value::Numeric(d) => crate::value::decimal_to_f64(d),
+                Value::Int(i) => *i as f64,
+                Value::Bool(b) => f64::from(u8::from(*b)),
+                Value::Text(s) => return crate::value::parse_float_text(s, real).map(Value::Float),
+                other => return Err(invalid(&render(other))),
+            };
+            Value::Float(if real { crate::value::to_real(x)? } else { x })
+        }
         ColumnType::Bool => match &v {
             Value::Bool(_) => v,
             Value::Int(i) => Value::Bool(*i != 0),
@@ -441,6 +443,54 @@ fn scalar_binary_op(op: &sqlparser::ast::BinaryOperator) -> Option<ScalarBinaryO
         },
         B::Custom(s) if s == "@>" => ScalarBinaryOp::Contains,
         B::Custom(s) if s == "<@" => ScalarBinaryOp::ContainedBy,
+        _ => return None,
+    })
+}
+
+/// `a ^ b` (or a chain of `^`) with its base negated, for a unary minus the
+/// parser applied to the whole power.
+fn negated_power_base(expr: &sqlparser::ast::Expr) -> Option<sqlparser::ast::Expr> {
+    use sqlparser::ast::Expr;
+    match expr {
+        Expr::BinaryOp {
+            left,
+            op: sqlparser::ast::BinaryOperator::PGExp,
+            right,
+        } => Some(Expr::BinaryOp {
+            left: Box::new(negated_power_base(left).unwrap_or_else(|| Expr::UnaryOp {
+                op: sqlparser::ast::UnaryOperator::Minus,
+                expr: left.clone(),
+            })),
+            op: sqlparser::ast::BinaryOperator::PGExp,
+            right: right.clone(),
+        }),
+        _ => None,
+    }
+}
+
+/// The function an operator is evaluated by: `^` is `power`, `^@` is
+/// `starts_with`, and the bitwise operators are internal functions typed by
+/// their operands.
+fn function_operator(op: &sqlparser::ast::BinaryOperator) -> Option<&'static str> {
+    use crate::result_types as types;
+    use sqlparser::ast::BinaryOperator as B;
+    Some(match op {
+        B::PGExp => "POWER",
+        B::PGStartsWith => "STARTS_WITH",
+        B::BitwiseAnd => types::BIT_AND,
+        B::BitwiseOr => types::BIT_OR,
+        B::PGBitwiseXor => types::BIT_XOR,
+        B::PGBitwiseShiftLeft => types::SHIFT_LEFT,
+        B::PGBitwiseShiftRight => types::SHIFT_RIGHT,
+        B::PGCustomBinaryOperator(parts) => match parts.last().map(String::as_str) {
+            Some("^") => "POWER",
+            Some("&") => types::BIT_AND,
+            Some("|") => types::BIT_OR,
+            Some("#") => types::BIT_XOR,
+            Some("<<") => types::SHIFT_LEFT,
+            Some(">>") => types::SHIFT_RIGHT,
+            _ => return None,
+        },
         _ => return None,
     })
 }
@@ -633,12 +683,27 @@ pub(crate) fn lower_scalar(expr: &sqlparser::ast::Expr, params: &[Value]) -> Opt
                 .join("."),
         )),
         Expr::Nested(inner) => lower_scalar(inner, params),
+        // Unary minus binds tighter than `^` (`-2 ^ 2` is 4).
+        Expr::UnaryOp {
+            op: U::Minus,
+            expr: inner,
+        } if negated_power_base(inner).is_some() => {
+            lower_scalar(&negated_power_base(inner)?, params)
+        }
         Expr::UnaryOp { op, expr: inner } => {
             let e = lower_scalar(inner, params)?;
+            let call = |name: &str| ScalarExpr::Function {
+                name: name.to_string(),
+                args: vec![e.clone()],
+            };
             let op = match op {
                 U::Minus => ScalarUnaryOp::Neg,
                 U::Not => ScalarUnaryOp::Not,
                 U::Plus => return Some(e),
+                U::BitwiseNot => return Some(call(crate::result_types::BIT_NOT)),
+                U::PGSquareRoot => return Some(call("SQRT")),
+                U::PGCubeRoot => return Some(call("CBRT")),
+                U::PGAbs => return Some(call("ABS")),
                 _ => return None,
             };
             Some(ScalarExpr::Unary {
@@ -672,6 +737,12 @@ pub(crate) fn lower_scalar(expr: &sqlparser::ast::Expr, params: &[Value]) -> Opt
                     negated,
                     // `~~` (LIKE) uses LIKE's default backslash escape.
                     escape: (kind == PatternKind::Like).then_some('\\'),
+                });
+            }
+            if let Some(name) = function_operator(op) {
+                return Some(ScalarExpr::Function {
+                    name: name.to_string(),
+                    args: vec![lower_scalar(left, params)?, lower_scalar(right, params)?],
                 });
             }
             let op = scalar_binary_op(op)?;
@@ -2329,72 +2400,29 @@ pub(crate) fn scalar_has_window(expr: &ScalarExpr) -> bool {
 
 /// Exact `numeric` arithmetic. Division takes PostgreSQL's result scale (at
 /// least 16 significant digits); overflow and division by zero fail.
-fn numeric_arith(op: ScalarBinaryOp, a: rust_decimal::Decimal, b: rust_decimal::Decimal) -> Value {
+fn numeric_arith(
+    op: ScalarBinaryOp,
+    a: crate::numeric::Numeric,
+    b: crate::numeric::Numeric,
+) -> Value {
     use ScalarBinaryOp as Op;
     let result = match op {
-        Op::Add => a.checked_add(b),
-        Op::Sub => a.checked_sub(b),
-        Op::Mul => a.checked_mul(b),
-        Op::Div | Op::Mod if b.is_zero() => return crate::eval_error::raise("division by zero"),
-        Op::Div => return numeric_div(a, b),
-        Op::Mod => a.checked_rem(b),
+        Op::Add => Ok(&a + &b),
+        Op::Sub => Ok(&a - &b),
+        Op::Mul => Ok(&a * &b),
+        Op::Div => a.checked_div(&b),
+        Op::Mod => a.checked_rem(&b),
         _ => return Value::Null,
     };
-    result.map_or_else(
-        || crate::eval_error::raise("value overflows numeric format"),
-        Value::Numeric,
-    )
+    result.map_or_else(crate::eval_error::raise, Value::Numeric)
 }
 
 /// `numeric` division with PostgreSQL's result scale (`select_div_scale`):
 /// enough fractional digits for 16 significant ones, and at least either
 /// operand's scale.
-pub(crate) fn numeric_div(a: rust_decimal::Decimal, b: rust_decimal::Decimal) -> Value {
-    if b.is_zero() {
-        return crate::eval_error::raise("division by zero");
-    }
-    // The weight (position of the first base-10000 digit) and that digit.
-    fn weight_and_first(d: rust_decimal::Decimal) -> (i32, u32) {
-        if d.is_zero() {
-            return (0, 0);
-        }
-        let text = d.abs().normalize().to_string();
-        let (int_part, frac_part) = text.split_once('.').unwrap_or((&text, ""));
-        if int_part != "0" {
-            let n = int_part.len();
-            let first_len = (n - 1) % 4 + 1;
-            (
-                (n as i32 - 1) / 4,
-                int_part[..first_len].parse().unwrap_or(0),
-            )
-        } else {
-            let zeros = frac_part.len() - frac_part.trim_start_matches('0').len();
-            let group = zeros / 4;
-            let padded = format!("{frac_part:0<width$}", width = (group + 1) * 4);
-            (
-                -(group as i32) - 1,
-                padded[group * 4..group * 4 + 4].parse().unwrap_or(0),
-            )
-        }
-    }
-    let (w1, f1) = weight_and_first(a);
-    let (w2, f2) = weight_and_first(b);
-    let qweight = w1 - w2 - i32::from(f1 <= f2);
-    let rscale = (16 - qweight * 4)
-        .max(a.scale() as i32)
-        .max(b.scale() as i32)
-        .clamp(0, 28) as u32;
-    match a.checked_div(b) {
-        Some(q) => {
-            let mut q = q.round_dp_with_strategy(
-                rscale,
-                rust_decimal::RoundingStrategy::MidpointAwayFromZero,
-            );
-            q.rescale(rscale);
-            Value::Numeric(q)
-        }
-        None => crate::eval_error::raise("value overflows numeric format"),
-    }
+pub(crate) fn numeric_div(a: crate::numeric::Numeric, b: crate::numeric::Numeric) -> Value {
+    a.checked_div(&b)
+        .map_or_else(crate::eval_error::raise, Value::Numeric)
 }
 
 /// Applies a unary operator to a value; type-invalid combinations yield `Null`.
@@ -2436,8 +2464,8 @@ pub(crate) fn apply_binary_op(op: ScalarBinaryOp, l: Value, r: Value) -> Value {
             // numeric (a float operand makes the result a float).
             if matches!(l, Value::Numeric(_)) || matches!(r, Value::Numeric(_)) {
                 let decimal = |v: &Value| match v {
-                    Value::Numeric(d) => Some(*d),
-                    Value::Int(i) => Some(rust_decimal::Decimal::from(*i)),
+                    Value::Numeric(d) => Some(d.clone()),
+                    Value::Int(i) => Some(crate::numeric::Numeric::from(*i)),
                     _ => None,
                 };
                 if let (Some(a), Some(b)) = (decimal(&l), decimal(&r)) {
@@ -2620,6 +2648,7 @@ fn unify_for_comparison(l: Value, r: Value) -> (Value, Value) {
                 _ => None,
             },
             Value::Jsonb(_) => serde_json::from_str(t).ok().map(Value::Jsonb),
+            Value::Numeric(_) => crate::numeric::Numeric::parse(t).ok().map(Value::Numeric),
             _ => None,
         }
     }

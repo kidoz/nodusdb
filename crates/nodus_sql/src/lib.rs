@@ -1,6 +1,8 @@
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
+mod numeric_literals;
+
 #[derive(Debug)]
 pub struct SessionState {
     pub session_id: String,
@@ -34,7 +36,8 @@ pub fn parse_sql(
 ) -> Result<Vec<sqlparser::ast::Statement>, sqlparser::parser::ParserError> {
     use sqlparser::tokenizer::{Token, Tokenizer};
     let dialect = PostgreSqlDialect {};
-    let mut tokens = Tokenizer::new(&dialect, sql)
+    let sql = numeric_literals::normalize(sql);
+    let mut tokens = Tokenizer::new(&dialect, &sql)
         .with_unescape(true)
         .tokenize_with_location()?;
     for token in &mut tokens {

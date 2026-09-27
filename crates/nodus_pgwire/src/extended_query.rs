@@ -904,8 +904,8 @@ impl ExtendedQueryHandler for NodusExtendedQueryHandler {
                         nodus_executor::Value::Float(v)
                     }
                     Type::NUMERIC => {
-                        match portal.parameter::<rust_decimal::Decimal>(i, param_type)? {
-                            Some(d) => nodus_executor::Value::Numeric(d),
+                        match portal.parameter::<crate::encoding::PgNumeric>(i, param_type)? {
+                            Some(d) => nodus_executor::Value::Numeric(d.0),
                             None => nodus_executor::Value::Null,
                         }
                     }

@@ -7,6 +7,7 @@
 //! input errors fail the statement through [`crate::eval_error`].
 
 use crate::eval_error::raise;
+use crate::numeric::Numeric;
 use crate::session_env;
 use crate::value::{Value, render, values_equal};
 
@@ -69,7 +70,13 @@ pub(crate) fn is_known(name: &str) -> bool {
                 | "DIV" | "POWER" | "POW" | "SQRT" | "CBRT" | "EXP" | "LN" | "LOG" | "LOG10"
                 | "PI" | "DEGREES" | "RADIANS" | "SIN" | "COS" | "TAN" | "COT" | "ASIN"
                 | "ACOS" | "ATAN" | "ATAN2" | "SINH" | "COSH" | "TANH" | "GCD" | "LCM"
-                | "FACTORIAL" | "RANDOM" | "WIDTH_BUCKET"
+                | "FACTORIAL" | "RANDOM" | "WIDTH_BUCKET" | "SCALE" | "MIN_SCALE" | "TRIM_SCALE"
+                | "ASINH" | "ACOSH" | "ATANH" | "SIND" | "COSD" | "TAND" | "COTD" | "ASIND"
+                | "ACOSD" | "ATAND" | "ATAN2D" | "SETSEED" | "RANDOM_NORMAL"
+                | crate::result_types::REAL_TEXT | crate::result_types::REAL_NUMERIC
+                | crate::result_types::BIT_AND | crate::result_types::BIT_OR
+                | crate::result_types::BIT_XOR | crate::result_types::SHIFT_LEFT
+                | crate::result_types::SHIFT_RIGHT | crate::result_types::BIT_NOT
                 // Dates and times.
                 | "NOW" | "CURRENT_TIMESTAMP" | "TRANSACTION_TIMESTAMP"
                 | "STATEMENT_TIMESTAMP" | "CLOCK_TIMESTAMP" | "CURRENT_DATE" | "CURRENT_TIME"
@@ -151,6 +158,12 @@ pub(crate) fn return_type(name: &str, arg_types: &[Option<String>]) -> Option<St
     if let Some(ty) = crate::session_functions::return_type(name) {
         return Some(ty.to_string());
     }
+    if crate::result_types::bitwise_arity(name).is_some() {
+        return crate::result_types::bitwise_type(name, arg_types);
+    }
+    if let Some(ty) = math_return_type(name, arg_types) {
+        return ty;
+    }
     Some(
         match name {
             "LENGTH"
@@ -192,7 +205,8 @@ pub(crate) fn return_type(name: &str, arg_types: &[Option<String>]) -> Option<St
                 "INTERVAL"
             }
             "MAKE_TIMESTAMPTZ" => "TIMESTAMPTZ",
-            "TO_CHAR" | "__TZ_TEXT__" | "__JSON_TIME__" => "TEXT",
+            "TO_CHAR" | "__TZ_TEXT__" | "__JSON_TIME__" | crate::result_types::REAL_TEXT => "TEXT",
+            crate::result_types::REAL_NUMERIC => "NUMERIC",
             "GROUPING" => "INTEGER",
             "__INTERVAL_SPAN__" => "NUMERIC",
             "TO_NUMBER" => "NUMERIC",
@@ -299,6 +313,78 @@ pub(crate) fn return_type(name: &str, arg_types: &[Option<String>]) -> Option<St
     )
 }
 
+/// The result type of a math function, by the variant PostgreSQL resolves
+/// its argument types to: `None` for other functions.
+fn math_return_type(name: &str, arg_types: &[Option<String>]) -> Option<Option<String>> {
+    let kind = |t: &Option<String>| {
+        let upper = t.as_deref().unwrap_or_default().to_ascii_uppercase();
+        if upper.starts_with("NUMERIC") || upper.starts_with("DECIMAL") {
+            'n'
+        } else if matches!(
+            upper.as_str(),
+            "REAL" | "FLOAT4" | "DOUBLE PRECISION" | "FLOAT8" | "FLOAT" | "DOUBLE"
+        ) {
+            'f'
+        } else if matches!(
+            upper.as_str(),
+            "SMALLINT" | "INT2" | "INTEGER" | "INT" | "INT4" | "BIGINT" | "INT8"
+        ) {
+            'i'
+        } else {
+            '?'
+        }
+    };
+    let kinds: Vec<char> = arg_types.iter().map(kind).collect();
+    let numeric = kinds.contains(&'n') && !kinds.contains(&'f');
+    let known = !kinds.contains(&'?');
+    let float_or_numeric = || {
+        Some(if numeric {
+            "NUMERIC".to_string()
+        } else {
+            "DOUBLE PRECISION".to_string()
+        })
+    };
+    Some(match name {
+        "POWER" | "POW" | "SQRT" | "EXP" | "LN" | "LOG10" | "CEIL" | "CEILING" | "FLOOR"
+        | "SIGN"
+            if known =>
+        {
+            float_or_numeric()
+        }
+        "LOG" if arg_types.len() == 2 => Some("NUMERIC".into()),
+        "LOG" if known => float_or_numeric(),
+        "ROUND" | "TRUNC" if arg_types.len() == 2 && kinds[0] != 'f' => Some("NUMERIC".into()),
+        "ROUND" | "TRUNC" if known => float_or_numeric(),
+        "DIV" | "FACTORIAL" | "TRIM_SCALE" => Some("NUMERIC".into()),
+        "SCALE" | "MIN_SCALE" | "WIDTH_BUCKET" => Some("INTEGER".into()),
+        "ABS" => arg_types.first().cloned().flatten(),
+        "CBRT" | "PI" | "DEGREES" | "RADIANS" | "SIN" | "COS" | "TAN" | "COT" | "ASIN" | "ACOS"
+        | "ATAN" | "ATAN2" | "SINH" | "COSH" | "TANH" | "ASINH" | "ACOSH" | "ATANH" | "SIND"
+        | "COSD" | "TAND" | "COTD" | "ASIND" | "ACOSD" | "ATAND" | "ATAN2D" | "RANDOM_NORMAL" => {
+            Some("DOUBLE PRECISION".into())
+        }
+        "RANDOM" if arg_types.len() == 2 => Some(
+            if arg_types
+                .iter()
+                .flatten()
+                .any(|t| kind(&Some(t.clone())) == 'n')
+            {
+                "NUMERIC".into()
+            } else if arg_types
+                .iter()
+                .flatten()
+                .any(|t| matches!(t.to_ascii_uppercase().as_str(), "BIGINT" | "INT8"))
+            {
+                "BIGINT".into()
+            } else {
+                "INTEGER".into()
+            },
+        ),
+        "SETSEED" => Some("VOID".into()),
+        _ => return None,
+    })
+}
+
 /// Calls a built-in function. Unknown names and wrong argument counts fail the
 /// statement.
 pub(crate) fn call(name: &str, args: &[Value]) -> Value {
@@ -396,11 +482,7 @@ fn int(v: &Value) -> Option<i64> {
     match v {
         Value::Int(i) => Some(*i),
         Value::Float(f) => Some(f.round_ties_even() as i64),
-        Value::Numeric(d) => {
-            use rust_decimal::prelude::ToPrimitive;
-            d.round_dp_with_strategy(0, rust_decimal::RoundingStrategy::MidpointAwayFromZero)
-                .to_i64()
-        }
+        Value::Numeric(d) => d.to_i64(),
         Value::Text(s) => s.trim().parse().ok(),
         _ => None,
     }
@@ -424,6 +506,239 @@ fn array(v: &Value) -> Option<Vec<Value>> {
     }
 }
 
+/// A bitwise operator on integers, computed in its result type (the last
+/// argument, when known): a shift wraps at that type's width.
+fn bitwise(name: &str, args: &[Value]) -> Result<Value, String> {
+    use crate::result_types::{BIT_AND, BIT_NOT, BIT_OR, BIT_XOR, SHIFT_LEFT, SHIFT_RIGHT};
+    let arity = crate::result_types::bitwise_arity(name).unwrap_or(2);
+    let ty = match args.get(arity) {
+        Some(Value::Text(t)) => t.to_ascii_uppercase(),
+        _ => String::new(),
+    };
+    let operands = &args[..arity.min(args.len())];
+    let symbol = match name {
+        BIT_AND => "&",
+        BIT_OR => "|",
+        BIT_XOR => "#",
+        SHIFT_LEFT => "<<",
+        SHIFT_RIGHT => ">>",
+        _ => "~",
+    };
+    let ints: Option<Vec<i64>> = operands
+        .iter()
+        .map(|v| match v {
+            Value::Int(i) => Some(*i),
+            _ => None,
+        })
+        .collect();
+    let Some(ints) = ints else {
+        let types: Vec<&str> = operands.iter().map(crate::value::value_type_name).collect();
+        return Err(match types.as_slice() {
+            [t] => format!("operator does not exist: {symbol} {t}"),
+            [l, r] => format!("operator does not exist: {l} {symbol} {r}"),
+            _ => format!("operator does not exist: {symbol}"),
+        });
+    };
+    let (a, b) = (ints[0], ints.get(1).copied().unwrap_or(0));
+    let _ = symbol;
+    let width = match ty.as_str() {
+        "SMALLINT" | "INT2" => 16,
+        "INTEGER" | "INT" | "INT4" | "SERIAL" => 32,
+        _ => 64,
+    };
+    Ok(Value::Int(match name {
+        BIT_AND => a & b,
+        BIT_OR => a | b,
+        BIT_XOR => a ^ b,
+        BIT_NOT => !a,
+        // A 16-bit shift computes in 32 bits and keeps the low 16.
+        SHIFT_LEFT if width == 16 => i64::from((a as i32).wrapping_shl(b as u32) as i16),
+        SHIFT_RIGHT if width == 16 => i64::from((a as i32).wrapping_shr(b as u32) as i16),
+        SHIFT_LEFT if width == 32 => i64::from((a as i32).wrapping_shl(b as u32)),
+        SHIFT_RIGHT if width == 32 => i64::from((a as i32).wrapping_shr(b as u32)),
+        SHIFT_LEFT => a.wrapping_shl(b as u32),
+        _ => a.wrapping_shr(b as u32),
+    }))
+}
+
+/// A math function's argument as a numeric: an integer or numeric as it is,
+/// a float as PostgreSQL converts it, and text as numeric input.
+fn decimal(v: &Value) -> Option<Numeric> {
+    match v {
+        Value::Numeric(d) => Some(d.clone()),
+        Value::Int(i) => Some(Numeric::from(*i)),
+        Value::Float(f) => Some(Numeric::from_f64(*f)),
+        Value::Text(s) => Numeric::parse(s).ok(),
+        _ => None,
+    }
+}
+
+/// Whether PostgreSQL resolves a math call with both float and numeric
+/// variants to the numeric one: a numeric argument and no float.
+fn numeric_call(args: &[Value]) -> bool {
+    args.iter().any(|a| matches!(a, Value::Numeric(_)))
+        && !args.iter().any(|a| matches!(a, Value::Float(_)))
+}
+
+fn numeric_result(result: Result<Numeric, String>) -> Value {
+    result.map_or_else(raise, Value::Numeric)
+}
+
+/// PostgreSQL's degrees-to-radians factor.
+const RADIANS_PER_DEGREE: f64 = 0.017_453_292_519_943_295;
+
+/// `x / y` for floats, failing on overflow and underflow as PostgreSQL does.
+fn float_quotient(x: f64, y: f64) -> Value {
+    let r = x / y;
+    if r.is_infinite() && x.is_finite() && y.is_finite() {
+        raise("value out of range: overflow")
+    } else if r == 0.0 && x != 0.0 && y.is_finite() {
+        raise("value out of range: underflow")
+    } else {
+        Value::Float(r)
+    }
+}
+
+/// `power(float8, float8)` and `^` on floats, with PostgreSQL's errors.
+fn float_power(a: f64, b: f64) -> Value {
+    if a.is_nan() {
+        return Value::Float(if b == 0.0 { 1.0 } else { f64::NAN });
+    }
+    if b.is_nan() {
+        return Value::Float(if a == 1.0 { 1.0 } else { f64::NAN });
+    }
+    if a == 0.0 && b < 0.0 {
+        return raise("zero raised to a negative power is undefined");
+    }
+    if a < 0.0 && b.floor() != b {
+        return raise("a negative number raised to a non-integer power yields a complex result");
+    }
+    let r = a.powf(b);
+    if a.is_infinite() || b.is_infinite() {
+        Value::Float(r)
+    } else if r.is_infinite() {
+        raise("value out of range: overflow")
+    } else if r == 0.0 && a != 0.0 {
+        raise("value out of range: underflow")
+    } else {
+        Value::Float(r)
+    }
+}
+
+/// The trigonometric functions in degrees, as PostgreSQL computes them so
+/// that the common angles come out exact (`sind(30)` is `0.5`).
+mod degrees {
+    use super::RADIANS_PER_DEGREE;
+
+    pub(super) struct Constants {
+        sin_30: f64,
+        one_minus_cos_60: f64,
+        asin_0_5: f64,
+        acos_0_5: f64,
+        pub(super) atan_1_0: f64,
+        tan_45: f64,
+        cot_45: f64,
+    }
+
+    pub(super) fn constants() -> &'static Constants {
+        static CONSTANTS: std::sync::OnceLock<Constants> = std::sync::OnceLock::new();
+        CONSTANTS.get_or_init(|| {
+            let mut c = Constants {
+                sin_30: (30.0 * RADIANS_PER_DEGREE).sin(),
+                one_minus_cos_60: 1.0 - (60.0 * RADIANS_PER_DEGREE).cos(),
+                asin_0_5: 0.5f64.asin(),
+                acos_0_5: 0.5f64.acos(),
+                atan_1_0: 1.0f64.atan(),
+                tan_45: 0.0,
+                cot_45: 0.0,
+            };
+            c.tan_45 = sind_q1(&c, 45.0) / cosd_q1(&c, 45.0);
+            c.cot_45 = cosd_q1(&c, 45.0) / sind_q1(&c, 45.0);
+            c
+        })
+    }
+
+    fn sind_0_to_30(c: &Constants, x: f64) -> f64 {
+        ((x * RADIANS_PER_DEGREE).sin() / c.sin_30) / 2.0
+    }
+
+    fn cosd_0_to_60(c: &Constants, x: f64) -> f64 {
+        1.0 - ((1.0 - (x * RADIANS_PER_DEGREE).cos()) / c.one_minus_cos_60) / 2.0
+    }
+
+    fn sind_q1(c: &Constants, x: f64) -> f64 {
+        if x <= 30.0 {
+            sind_0_to_30(c, x)
+        } else {
+            cosd_0_to_60(c, 90.0 - x)
+        }
+    }
+
+    fn cosd_q1(c: &Constants, x: f64) -> f64 {
+        if x <= 60.0 {
+            cosd_0_to_60(c, x)
+        } else {
+            sind_0_to_30(c, 90.0 - x)
+        }
+    }
+
+    pub(super) fn asind_q1(x: f64) -> f64 {
+        let c = constants();
+        if x <= 0.5 {
+            (x.asin() / c.asin_0_5) * 30.0
+        } else {
+            90.0 - (x.acos() / c.acos_0_5) * 60.0
+        }
+    }
+
+    pub(super) fn acosd_q1(x: f64) -> f64 {
+        let c = constants();
+        if x <= 0.5 {
+            90.0 - (x.asin() / c.asin_0_5) * 30.0
+        } else {
+            (x.acos() / c.acos_0_5) * 60.0
+        }
+    }
+
+    /// `sind`, `cosd`, `tand`, or `cotd` of a finite angle (NaN passes).
+    pub(super) fn trig(name: &str, x: f64) -> f64 {
+        if x.is_nan() {
+            return x;
+        }
+        let c = constants();
+        // Reduce to the first quadrant, tracking the sign.
+        let mut x = x % 360.0;
+        let mut sign = 1.0;
+        let cosine = name == "COSD";
+        if x < 0.0 {
+            x = -x;
+            if !cosine {
+                sign = -sign;
+            }
+        }
+        if x > 180.0 {
+            x = 360.0 - x;
+            if !cosine {
+                sign = -sign;
+            }
+        }
+        if x > 90.0 {
+            x = 180.0 - x;
+            if name != "SIND" {
+                sign = -sign;
+            }
+        }
+        let result = match name {
+            "SIND" => sign * sind_q1(c, x),
+            "COSD" => sign * cosd_q1(c, x),
+            "TAND" => sign * (sind_q1(c, x) / cosd_q1(c, x) / c.tan_45),
+            _ => sign * (cosd_q1(c, x) / sind_q1(c, x) / c.cot_45),
+        };
+        // No minus zero (`tand(180)`).
+        if result == 0.0 { 0.0 } else { result }
+    }
+}
+
 /// A float result, or an error for a non-finite result of finite input.
 fn float(x: f64) -> Value {
     if x.is_nan() {
@@ -434,31 +749,6 @@ fn float(x: f64) -> Value {
 }
 
 /// Keeps integer results integral when every numeric input was an integer.
-/// `round`/`trunc` of a numeric to `digits` places (negative: to tens,
-/// hundreds, ...); rounding takes halves away from zero, and a non-negative
-/// `digits` is the result's scale.
-fn round_decimal(d: rust_decimal::Decimal, digits: i64, round: bool) -> Value {
-    use rust_decimal::RoundingStrategy::{MidpointAwayFromZero, ToZero};
-    let strategy = if round { MidpointAwayFromZero } else { ToZero };
-    if digits >= 0 {
-        let scale = digits.min(28) as u32;
-        let mut r = d.round_dp_with_strategy(scale, strategy);
-        r.rescale(scale);
-        return Value::Numeric(r);
-    }
-    let factor = match 10i64.checked_pow((-digits).min(18) as u32) {
-        Some(f) => rust_decimal::Decimal::from(f),
-        None => return Value::Numeric(rust_decimal::Decimal::ZERO),
-    };
-    match (d / factor)
-        .round_dp_with_strategy(0, strategy)
-        .checked_mul(factor)
-    {
-        Some(r) => Value::Numeric(r),
-        None => raise("value overflows numeric format"),
-    }
-}
-
 fn numeric_like(args: &[Value], x: f64) -> Value {
     if args.iter().all(|a| matches!(a, Value::Int(_))) && x.fract() == 0.0 && x.abs() < 9.2e18 {
         Value::Int(x as i64)
@@ -665,9 +955,25 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
             Some(c) if c != '\0' => Value::Text(c.to_string()),
             _ => raise("requested character is not valid"),
         },
-        "TO_HEX" if arity(1) => Value::Text(format!("{:x}", int(arg(0))?)),
-        "TO_BIN" if arity(1) => Value::Text(format!("{:b}", int(arg(0))?)),
-        "TO_OCT" if arity(1) => Value::Text(format!("{:o}", int(arg(0))?)),
+        // A 32-bit integer (the second argument names the type) shows its
+        // 32 bits.
+        "TO_HEX" | "TO_BIN" | "TO_OCT" if arity(1) || arity(2) => {
+            let n = int(arg(0))?;
+            let narrow = matches!(
+                args.get(1),
+                Some(Value::Text(t)) if matches!(t.as_str(), "INTEGER" | "INT" | "INT4" | "SMALLINT" | "INT2")
+            );
+            let bits = if narrow {
+                u64::from(n as u32)
+            } else {
+                n as u64
+            };
+            Value::Text(match name {
+                "TO_HEX" => format!("{bits:x}"),
+                "TO_BIN" => format!("{bits:b}"),
+                _ => format!("{bits:o}"),
+            })
+        }
         "STARTS_WITH" if arity(2) => Value::Bool(text(arg(0)).starts_with(&text(arg(1)))),
         "REGEXP_REPLACE" if (3..=4).contains(&args.len()) => {
             let flags = args.get(3).map(text).unwrap_or_default();
@@ -824,6 +1130,17 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
         }
 
         // ---- Math -------------------------------------------------------------
+        crate::result_types::REAL_TEXT if arity(1) => match arg(0) {
+            Value::Float(f) => Value::Text(crate::value::float4_text(*f as f32)),
+            other => Value::Text(text(other)),
+        },
+        crate::result_types::REAL_NUMERIC if arity(1) => match arg(0) {
+            Value::Float(f) => Value::Numeric(Numeric::from_f32(*f as f32)),
+            other => other.clone(),
+        },
+        name if crate::result_types::bitwise_arity(name).is_some() => {
+            bitwise(name, args).map_or_else(raise, |v| v)
+        }
         "ABS" if arity(1) => match arg(0) {
             Value::Int(i) => i
                 .checked_abs()
@@ -834,21 +1151,15 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
         // On a numeric these keep exact decimals, as PostgreSQL's numeric
         // variants do.
         "SIGN" if arity(1) && matches!(arg(0), Value::Numeric(_)) => {
-            let Value::Numeric(d) = arg(0) else {
-                return None;
-            };
-            Value::Numeric(if d.is_zero() {
-                rust_decimal::Decimal::ZERO
-            } else if d.is_sign_negative() {
-                rust_decimal::Decimal::NEGATIVE_ONE
+            let d = decimal(arg(0))?;
+            Value::Numeric(if d.is_nan() {
+                Numeric::NaN
             } else {
-                rust_decimal::Decimal::ONE
+                Numeric::from(d.signum())
             })
         }
         "CEIL" | "CEILING" | "FLOOR" if arity(1) && matches!(arg(0), Value::Numeric(_)) => {
-            let Value::Numeric(d) = arg(0) else {
-                return None;
-            };
+            let d = decimal(arg(0))?;
             Value::Numeric(if name == "FLOOR" { d.floor() } else { d.ceil() })
         }
         "ROUND" | "TRUNC"
@@ -856,15 +1167,25 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
                 && (matches!(arg(0), Value::Numeric(_))
                     || (arity(2) && matches!(arg(0), Value::Int(_)))) =>
         {
-            let d = match arg(0) {
-                Value::Numeric(d) => *d,
-                other => rust_decimal::Decimal::from(int(other)?),
-            };
+            let d = decimal(arg(0))?;
             let digits = match args.get(1) {
                 Some(n) => int(n)?,
                 None => 0,
             };
-            round_decimal(d, digits, name == "ROUND")
+            Value::Numeric(if name == "ROUND" {
+                d.round(digits)
+            } else {
+                d.trunc(digits)
+            })
+        }
+        "SCALE" | "MIN_SCALE" | "TRIM_SCALE" if arity(1) => {
+            let d = decimal(arg(0))?;
+            match name {
+                "TRIM_SCALE" => Value::Numeric(d.normalize()),
+                _ if !d.is_finite() => Value::Null,
+                "SCALE" => Value::Int(i64::from(d.scale())),
+                _ => Value::Int(i64::from(d.normalize().scale())),
+            }
         }
         "SIGN" if arity(1) => {
             numeric_like(args, num(arg(0))?.signum() * f64::from(num(arg(0))? != 0.0))
@@ -896,26 +1217,20 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
             arg(0).clone(),
             arg(1).clone(),
         ),
-        "DIV" if arity(2) => {
-            let (a, b) = (num(arg(0))?, num(arg(1))?);
-            if b == 0.0 {
-                raise("division by zero")
-            } else {
-                numeric_like(&[Value::Int(0)], (a / b).trunc())
-            }
+        // `div` is numeric only: the quotient truncated to a whole number.
+        "DIV" if arity(2) => numeric_result(decimal(arg(0))?.div_trunc(&decimal(arg(1))?)),
+        "POWER" | "POW" if arity(2) && numeric_call(args) => {
+            numeric_result(decimal(arg(0))?.power(&decimal(arg(1))?))
         }
-        "POWER" | "POW" if arity(2) => {
-            let (a, b) = (num(arg(0))?, num(arg(1))?);
-            if a == 0.0 && b < 0.0 {
-                return Some(raise("zero raised to a negative power is undefined"));
-            }
-            if a < 0.0 && b.fract() != 0.0 {
-                return Some(raise(
-                    "a negative number raised to a non-integer power yields a complex result",
-                ));
-            }
-            Value::Float(a.powf(b))
+        "POWER" | "POW" if arity(2) => float_power(num(arg(0))?, num(arg(1))?),
+        "SQRT" if arity(1) && numeric_call(args) => numeric_result(decimal(arg(0))?.sqrt()),
+        "EXP" if arity(1) && numeric_call(args) => numeric_result(decimal(arg(0))?.exp()),
+        "LN" if arity(1) && numeric_call(args) => numeric_result(decimal(arg(0))?.ln()),
+        "LOG" | "LOG10" if arity(1) && numeric_call(args) => {
+            numeric_result(Numeric::from(10).log(&decimal(arg(0))?))
         }
+        // `log(b, x)` is numeric only.
+        "LOG" if arity(2) => numeric_result(decimal(arg(0))?.log(&decimal(arg(1))?)),
         "SQRT" if arity(1) => {
             let x = num(arg(0))?;
             if x < 0.0 {
@@ -925,7 +1240,17 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
             }
         }
         "CBRT" if arity(1) => Value::Float(num(arg(0))?.cbrt()),
-        "EXP" if arity(1) => float(num(arg(0))?.exp()),
+        "EXP" if arity(1) => {
+            let x = num(arg(0))?;
+            let r = x.exp();
+            if x.is_finite() && r.is_infinite() {
+                raise("value out of range: overflow")
+            } else if x.is_finite() && r == 0.0 {
+                raise("value out of range: underflow")
+            } else {
+                Value::Float(r)
+            }
+        }
         "LN" | "LOG" | "LOG10" if arity(1) => {
             let x = num(arg(0))?;
             if x == 0.0 {
@@ -938,40 +1263,85 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
                 Value::Float(x.log10())
             }
         }
-        "LOG" if arity(2) => {
-            let (base, x) = (num(arg(0))?, num(arg(1))?);
-            if base <= 0.0 || x <= 0.0 {
-                raise("cannot take logarithm of zero or a negative number")
-            } else if base == 1.0 {
-                raise("division by zero")
+        "PI" if arity(0) => Value::Float(std::f64::consts::PI),
+        "DEGREES" if arity(1) => float_quotient(num(arg(0))?, RADIANS_PER_DEGREE),
+        "RADIANS" if arity(1) => {
+            let x = num(arg(0))?;
+            let r = x * RADIANS_PER_DEGREE;
+            if x.is_finite() && r.is_infinite() {
+                raise("value out of range: overflow")
+            } else if x != 0.0 && r == 0.0 {
+                raise("value out of range: underflow")
             } else {
-                Value::Float(x.ln() / base.ln())
+                Value::Float(r)
             }
         }
-        "PI" if arity(0) => Value::Float(std::f64::consts::PI),
-        "DEGREES" if arity(1) => Value::Float(num(arg(0))?.to_degrees()),
-        "RADIANS" if arity(1) => Value::Float(num(arg(0))?.to_radians()),
-        "SIN" | "COS" | "TAN" | "COT" | "ASIN" | "ACOS" | "ATAN" | "SINH" | "COSH" | "TANH"
-            if arity(1) =>
-        {
+        "SIN" | "COS" | "TAN" | "COT" if arity(1) => {
             let x = num(arg(0))?;
-            if matches!(name, "ASIN" | "ACOS") && !(-1.0..=1.0).contains(&x) {
+            if x.is_infinite() {
                 return Some(raise("input is out of range"));
             }
             Value::Float(match name {
                 "SIN" => x.sin(),
                 "COS" => x.cos(),
                 "TAN" => x.tan(),
-                "COT" => 1.0 / x.tan(),
-                "ASIN" => x.asin(),
-                "ACOS" => x.acos(),
-                "ATAN" => x.atan(),
-                "SINH" => x.sinh(),
-                "COSH" => x.cosh(),
-                _ => x.tanh(),
+                _ => 1.0 / x.tan(),
             })
         }
+        "ASIN" | "ACOS" | "ASIND" | "ACOSD" if arity(1) => {
+            let x = num(arg(0))?;
+            if !(-1.0..=1.0).contains(&x) && !x.is_nan() {
+                return Some(raise("input is out of range"));
+            }
+            Value::Float(match name {
+                "ASIN" => x.asin(),
+                "ACOS" => x.acos(),
+                "ASIND" if x >= 0.0 => degrees::asind_q1(x),
+                "ASIND" => -degrees::asind_q1(-x),
+                _ if x >= 0.0 => degrees::acosd_q1(x),
+                _ => 90.0 + degrees::asind_q1(-x),
+            })
+        }
+        "ATAN" if arity(1) => Value::Float(num(arg(0))?.atan()),
         "ATAN2" if arity(2) => Value::Float(num(arg(0))?.atan2(num(arg(1))?)),
+        "ATAND" if arity(1) => {
+            Value::Float(num(arg(0))?.atan() / degrees::constants().atan_1_0 * 45.0)
+        }
+        "ATAN2D" if arity(2) => {
+            Value::Float(num(arg(0))?.atan2(num(arg(1))?) / degrees::constants().atan_1_0 * 45.0)
+        }
+        "SIND" | "COSD" | "TAND" | "COTD" if arity(1) => {
+            let x = num(arg(0))?;
+            if x.is_infinite() {
+                return Some(raise("input is out of range"));
+            }
+            Value::Float(degrees::trig(name, x))
+        }
+        "SINH" if arity(1) => Value::Float(num(arg(0))?.sinh()),
+        "COSH" if arity(1) => Value::Float(num(arg(0))?.cosh()),
+        "TANH" if arity(1) => Value::Float(num(arg(0))?.tanh()),
+        "ASINH" if arity(1) => Value::Float(num(arg(0))?.asinh()),
+        "ACOSH" if arity(1) => {
+            let x = num(arg(0))?;
+            if x < 1.0 {
+                raise("input is out of range")
+            } else {
+                Value::Float(x.acosh())
+            }
+        }
+        "ATANH" if arity(1) => {
+            let x = num(arg(0))?;
+            if !(-1.0..=1.0).contains(&x) && !x.is_nan() {
+                raise("input is out of range")
+            } else if x.abs() == 1.0 {
+                Value::Float(f64::INFINITY.copysign(x))
+            } else {
+                Value::Float(x.atanh())
+            }
+        }
+        "GCD" | "LCM" if arity(2) && numeric_call(args) => {
+            numeric_result(decimal(arg(0))?.gcd_lcm(&decimal(arg(1))?, name == "LCM"))
+        }
         "GCD" | "LCM" if arity(2) => {
             let (a, b) = (int(arg(0))?.unsigned_abs(), int(arg(1))?.unsigned_abs());
             let gcd = {
@@ -990,16 +1360,21 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
             };
             i64::try_from(out).map_or_else(|_| raise("bigint out of range"), Value::Int)
         }
+        // A numeric, however many digits it takes.
         "FACTORIAL" if arity(1) => {
             let n = int(arg(0))?;
             if n < 0 {
                 return Some(raise("factorial of a negative number is undefined"));
             }
-            (1..=n)
-                .try_fold(1_i64, |acc, k| acc.checked_mul(k))
-                .map_or_else(|| raise("bigint out of range"), Value::Int)
+            if n > 32177 {
+                return Some(raise("value overflows numeric format"));
+            }
+            Value::Numeric(Numeric::new(
+                (2..=n).fold(num_bigint::BigInt::from(1), |acc, k| acc * k),
+                0,
+            ))
         }
-        "RANDOM" if arity(0) => Value::Float(random_unit()),
+        "RANDOM" if arity(0) => Value::Float(crate::random::uniform()),
         "RANDOM" if arity(2) => {
             let (lo, hi) = (int(arg(0))?, int(arg(1))?);
             if lo > hi {
@@ -1007,33 +1382,108 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
                     "lower bound must be less than or equal to upper bound",
                 ));
             }
-            let span = (hi - lo) as f64 + 1.0;
-            Value::Int(lo + (random_unit() * span).floor() as i64)
+            Value::Int(crate::random::int_range(lo, hi))
+        }
+        "RANDOM_NORMAL" if args.len() <= 2 => {
+            let mean = args.first().map_or(Some(0.0), num)?;
+            let stddev = args.get(1).map_or(Some(1.0), num)?;
+            if stddev < 0.0 {
+                return Some(raise("standard deviation cannot be negative"));
+            }
+            Value::Float(stddev * crate::random::normal() + mean)
+        }
+        "SETSEED" if arity(1) => {
+            let seed = num(arg(0))?;
+            if !(-1.0..=1.0).contains(&seed) {
+                return Some(raise(format!(
+                    "setseed parameter {} is out of allowed range [-1,1]",
+                    crate::value::render(&Value::Float(seed))
+                )));
+            }
+            crate::random::set_seed(seed);
+            crate::session_functions::void()
+        }
+        "WIDTH_BUCKET" if arity(4) && numeric_call(&args[..3]) => {
+            let bucket = |x: &Numeric, lo: &Numeric, hi: &Numeric, n: i64| -> Result<i64, String> {
+                if x.is_nan() || lo.is_nan() || hi.is_nan() {
+                    return Err("operand, lower bound, and upper bound cannot be NaN".into());
+                }
+                if !lo.is_finite() || !hi.is_finite() {
+                    return Err("lower and upper bounds must be finite".into());
+                }
+                let inside = if lo < hi {
+                    x >= lo && x < hi
+                } else {
+                    x <= lo && x > hi
+                };
+                let below = if lo < hi { x < lo } else { x > lo };
+                if below {
+                    return Ok(0);
+                }
+                if !inside {
+                    return Ok(n + 1);
+                }
+                let scaled = &(x - lo) * &Numeric::from(n);
+                Ok((scaled.div_trunc(&(hi - lo))?.to_i64().unwrap_or(0)) + 1)
+            };
+            let n = int(arg(3))?;
+            if n <= 0 {
+                return Some(raise("count must be greater than zero"));
+            }
+            let (x, lo, hi) = (decimal(arg(0))?, decimal(arg(1))?, decimal(arg(2))?);
+            if lo == hi {
+                return Some(raise("lower bound cannot equal upper bound"));
+            }
+            bucket(&x, &lo, &hi, n).map_or_else(raise, Value::Int)
         }
         "WIDTH_BUCKET" if arity(4) => {
             let (x, lo, hi, n) = (num(arg(0))?, num(arg(1))?, num(arg(2))?, int(arg(3))?);
             if n <= 0 {
                 return Some(raise("count must be greater than zero"));
             }
+            if x.is_nan() || lo.is_nan() || hi.is_nan() {
+                return Some(raise("operand, lower bound, and upper bound cannot be NaN"));
+            }
+            if lo.is_infinite() || hi.is_infinite() {
+                return Some(raise("lower and upper bounds must be finite"));
+            }
             if lo == hi {
                 return Some(raise("lower bound cannot equal upper bound"));
             }
-            let bucket = if lo < hi {
+            let fraction = if lo < hi {
                 if x < lo {
-                    0
+                    return Some(Value::Int(0));
                 } else if x >= hi {
-                    n + 1
-                } else {
-                    ((x - lo) / (hi - lo) * n as f64).floor() as i64 + 1
+                    return Some(Value::Int(n + 1));
                 }
-            } else if x > lo {
-                0
-            } else if x <= hi {
-                n + 1
+                (x - lo) / (hi - lo)
             } else {
-                ((lo - x) / (lo - hi) * n as f64).floor() as i64 + 1
+                if x > lo {
+                    return Some(Value::Int(0));
+                } else if x <= hi {
+                    return Some(Value::Int(n + 1));
+                }
+                (lo - x) / (lo - hi)
             };
-            Value::Int(bucket)
+            // The quotient could round to 1, which would name the next bucket.
+            Value::Int(((n as f64 * fraction) as i64).min(n - 1) + 1)
+        }
+        // The bucket of an array of ascending lower bounds.
+        "WIDTH_BUCKET" if arity(2) => {
+            let thresholds = array(arg(1))?;
+            if thresholds.iter().any(|t| matches!(t, Value::Null)) {
+                return Some(raise("thresholds array must not contain NULLs"));
+            }
+            let (mut lo, mut hi) = (0, thresholds.len());
+            while lo < hi {
+                let mid = (lo + hi) / 2;
+                if crate::value::compare(arg(0), &thresholds[mid]) != std::cmp::Ordering::Less {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            Value::Int(lo as i64)
         }
 
         // ---- Dates and times ----------------------------------------------------
@@ -1081,7 +1531,7 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
             Value::Text(format!("{}{offset}", stamp.replacen(' ', "T", 1)))
         }
         "__INTERVAL_SPAN__" if arity(1) => match crate::datetime::Interval::parse(&text(arg(0))) {
-            Some(iv) => Value::Numeric(rust_decimal::Decimal::from_i128_with_scale(iv.span(), 0)),
+            Some(iv) => Value::Numeric(Numeric::from(iv.span())),
             None => arg(0).clone(),
         },
         // A grouped query resolves `GROUPING(...)` per grouping set first.
@@ -2220,11 +2670,12 @@ pub(crate) fn to_json(v: &Value) -> serde_json::Value {
         Value::Null => J::Null,
         Value::Int(i) => J::from(*i),
         Value::Float(f) => serde_json::Number::from_f64(*f).map_or(J::Null, J::Number),
-        // Exactly, as `numeric` prints it (`1.50`).
+        // Exactly, as `numeric` prints it (`1.50`); NaN and the infinities
+        // as strings.
         Value::Numeric(d) => d
             .to_string()
             .parse::<serde_json::Number>()
-            .map_or(J::Null, J::Number),
+            .map_or_else(|_| J::String(d.to_string()), J::Number),
         Value::Bool(b) => J::Bool(*b),
         Value::Text(s) => J::String(s.clone()),
         Value::Array(items) => J::Array(items.iter().map(to_json).collect()),
@@ -2438,14 +2889,6 @@ fn uuid_v7(ms: i64) -> uuid::Uuid {
 }
 
 /// A uniformly distributed value in `[0, 1)`.
-fn random_unit() -> f64 {
-    let bits = u64::from_le_bytes(
-        uuid::Uuid::new_v4().as_bytes()[..8]
-            .try_into()
-            .unwrap_or([0; 8]),
-    );
-    (bits >> 11) as f64 / (1u64 << 53) as f64
-}
 
 #[cfg(test)]
 mod tests {

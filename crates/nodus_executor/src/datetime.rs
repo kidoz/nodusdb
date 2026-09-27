@@ -895,17 +895,14 @@ pub(crate) fn extract(
         if float {
             Value::Float(v as f64 / 10f64.powi(6))
         } else {
-            let decimal = rust_decimal::Decimal::new(v, 6);
-            let mut rescaled = decimal;
-            rescaled.rescale(scale);
-            Value::Numeric(rescaled)
+            Value::Numeric(crate::numeric::Numeric::new(v, 6).with_scale(scale))
         }
     };
     let whole = |v: i64| -> Value {
         if float {
             Value::Float(v as f64)
         } else {
-            Value::Numeric(rust_decimal::Decimal::from(v))
+            Value::Numeric(crate::numeric::Numeric::from(v))
         }
     };
     Ok(match temporal {
@@ -1018,13 +1015,14 @@ pub(crate) fn extract(
                     if is_date {
                         whole(jd)
                     } else {
-                        let v = jd as f64 + time as f64 / MICROS_PER_DAY as f64;
                         if float {
-                            Value::Float(v)
+                            Value::Float(jd as f64 + time as f64 / MICROS_PER_DAY as f64)
                         } else {
-                            Value::Numeric(
-                                rust_decimal::Decimal::from_f64_retain(v).unwrap_or_default(),
-                            )
+                            use crate::numeric::Numeric;
+                            let fraction = Numeric::from(time)
+                                .checked_div(&Numeric::from(MICROS_PER_DAY))
+                                .unwrap_or_default();
+                            Value::Numeric(&Numeric::from(jd) + &fraction)
                         }
                     }
                 }
@@ -1436,7 +1434,7 @@ mod tests {
     fn units_read_by_any_of_their_names() {
         let t = |s: &str| Value::Text(s.to_string());
         let date = Some(Kind::Date);
-        let n = |v: i64| Value::Numeric(rust_decimal::Decimal::from(v));
+        let n = |v: i64| Value::Numeric(crate::numeric::Numeric::from(v));
         assert_eq!(
             extract("years", &t("2024-05-06"), date, false).unwrap(),
             n(2024)

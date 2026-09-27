@@ -1,0 +1,138 @@
+# Arithmetic operators beyond + - * /: ^, the bitwise operators, |/ ||/ @, integer literal forms, float edge cases, and the degree trigonometry.
+query TTTTTTTTTTTT
+SELECT 2 ^ 10, 2 ^ -1, 0 ^ 0, 2 ^ 3 ^ 2, -2 ^ 2, 2 * 3 ^ 2, |/ 16, ||/ 27, @ -5, @ -5.5, 'abc' ^@ 'ab', 'abc' ^@ 'b';
+----
+1024	0.5	1	64	4	18	4	3	5	5.5	t	f
+
+query TTTTTTTTTTT
+SELECT 5 & 3, 5 | 3, 5 # 3, ~5, 1 << 4, 256 >> 2, 1 << 31, 1::int8 << 40, (-16) >> 2, 1::smallint << 15, 7 & 3::int8;
+----
+1	7	6	-6	16	64	-2147483648	1099511627776	-4	-32768	3
+
+query TTTTTT
+SELECT pg_typeof(1::smallint & 1::int8), pg_typeof(1 << 2), pg_typeof(~1::smallint), pg_typeof(2 ^ 3), pg_typeof(2.0 ^ 3), pg_typeof(2 ^ 3.0);
+----
+bigint	integer	smallint	double precision	numeric	numeric
+
+statement error
+SELECT 1.5 & 2;
+
+query TTTTTTTT
+SELECT 0x1F, 0o17, 0b101, 1_000_000, 0x_1F, 1_000.5, 0x7FFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF;
+----
+31	15	5	1000000	31	1000.5	9223372036854775807	18446744073709551615
+
+query TTTTTT
+SELECT '0x_1F'::int, ' -0b101 '::int, '0o17'::int8, '1_000'::int2, '-0x80000000'::int, '9223372036854775807'::int8;
+----
+31	-5	15	1000	-2147483648	9223372036854775807
+
+statement error
+SELECT '_1'::int;
+
+statement error
+SELECT '2147483648'::int;
+
+statement error
+SELECT '0x80000000'::int;
+
+statement error
+SELECT '1.5'::int;
+
+query TTTTTT
+SELECT to_hex(255), to_hex(-1), to_hex(-1::bigint), to_bin(5), to_oct(8), to_hex(2147483647);
+----
+ff	ffffffff	ffffffffffffffff	101	10	7fffffff
+
+query TTTTTTTTT
+SELECT 'NaN'::float8, 'inf'::float8, '-Infinity'::float8, ' 1.5 '::float8, 'nan'::real, '4.9e-324'::float8, 3.14::real, 3.14::real::float8, 16777217::real;
+----
+NaN	Infinity	-Infinity	1.5	NaN	5e-324	3.14	3.140000104904175	1.6777216e+07
+
+query TTT
+SELECT 'NaN'::float8 = 'NaN'::float8, 'NaN'::float8 > 'Infinity'::float8, 0.0::float8 = -0.0::float8;
+----
+t	t	t
+
+query T
+SELECT x FROM (VALUES (1.0::float8), ('NaN'), (-1), ('Infinity'), ('-Infinity')) v(x) ORDER BY x;
+----
+-Infinity
+-1
+1
+Infinity
+NaN
+
+statement error
+SELECT '1e400'::float8;
+
+statement error
+SELECT '1e-400'::float8;
+
+statement error
+SELECT '1e40'::real;
+
+statement error
+SELECT 1e40::float8::real;
+
+statement error
+SELECT exp(1000::float8);
+
+statement error
+SELECT exp(-1000::float8);
+
+statement error
+SELECT power(2::float8, 1024);
+
+statement error
+SELECT power(-8::float8, 1.0 / 3);
+
+statement error
+SELECT 0::float8 ^ -1;
+
+query TTTTT
+SELECT power('NaN'::float8, 0), power(1::float8, 'NaN'), power(2::float8, 'Infinity'), power(0.5::float8, '-Infinity'), 2::float8 ^ 0.5;
+----
+1	1	Infinity	Infinity	1.4142135623730951
+
+query TTTTTTTTTTTT
+SELECT sind(30), cosd(60), tand(45), cotd(45), asind(0.5), acosd(0.5), atand(1), atan2d(1, 1), sind(-90), cosd(180), tand(180), sind(360);
+----
+0.5	0.5	1	1	30	60	45	45	-1	-1	0	0
+
+query TTTTTTTT
+SELECT asinh(0), acosh(1), atanh(0), atanh(1), atanh(-1), sinh(1000), degrees(pi()), radians(180);
+----
+0	0	0	Infinity	-Infinity	Infinity	180	3.141592653589793
+
+statement error
+SELECT acosh(0.5);
+
+statement error
+SELECT atanh(2);
+
+statement error
+SELECT asin(2);
+
+query TTTTTTTT
+SELECT round(2.5::float8), round(3.5::float8), round(-2.5::float8), round(2.5), trunc(2.7::float8), 2.5::float8::int, 3.5::float8::int, (-2.5)::float8::int;
+----
+2	4	-2	3	2	2	4	-2
+
+query TTTTTTTTTT
+SELECT 7 / 2, -7 / 2, 7 % -2, -7 % 2, 1e100::float8, 1e-5::float8, 123456789012345678::float8, 1.0e15::float8, 1.0e16::float8, 1e-7::float8::text;
+----
+3	-3	1	-1	1e+100	1e-05	1.2345678901234568e+17	1e+15	1e+16	1e-07
+
+query TTTTT
+SELECT setseed(0.5), random(), random(), random(1, 100), random_normal();
+----
+	0.9851677175347999	0.825301858027981	17	0.47821385732824595
+
+query TTT
+SELECT setseed(-0.25), random(), random(-10, 10);
+----
+	0.5553213340039351	-2
+
+statement error
+SELECT setseed(2);

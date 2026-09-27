@@ -1,7 +1,5 @@
-# Light port of PostgreSQL src/test/regress/sql/numeric.sql. NodusDB computes
-# NUMERIC as 64-bit float, so pg's scale-preserving rendering (e.g. 4.5000) and
-# arbitrary precision are out of scope; this covers clean-value arithmetic,
-# comparisons, aggregates, and rounding.
+# Light port of PostgreSQL src/test/regress/sql/numeric.sql: clean-value
+# arithmetic, comparisons, aggregates, and rounding.
 
 statement ok
 CREATE TABLE num_tbl (id INT PRIMARY KEY, val NUMERIC);
@@ -72,7 +70,7 @@ SELECT round(4.5);
 query R
 SELECT sum(val) FROM num_tbl;
 ----
-100
+100.00
 
 query R
 SELECT avg(val) FROM num_tbl WHERE id IN (2, 3);

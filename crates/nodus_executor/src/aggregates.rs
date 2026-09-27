@@ -69,7 +69,7 @@ fn no_such_function(op: &AggregateOp, values: &[&Value]) -> Value {
 /// are exact, with PostgreSQL's result scale; floats accumulate as
 /// PostgreSQL's do (Youngs-Cramer), so the last digits agree.
 fn spread(op: &AggregateOp, values: Vec<&Value>) -> Value {
-    use rust_decimal::Decimal;
+    use crate::numeric::Numeric;
     let sample = matches!(op, AggregateOp::StddevSamp | AggregateOp::VarSamp);
     let root = matches!(op, AggregateOp::StddevSamp | AggregateOp::StddevPop);
     let n = values.len();
@@ -92,59 +92,39 @@ fn spread(op: &AggregateOp, values: Vec<&Value>) -> Value {
         let variance = squares / if sample { count - 1.0 } else { count };
         return Value::Float(if root { variance.sqrt() } else { variance });
     }
-    let (mut sum, mut squares) = (Decimal::ZERO, Decimal::ZERO);
+    let (mut sum, mut squares) = (Numeric::zero(), Numeric::zero());
     for value in &values {
         let x = match value {
-            Value::Int(i) => Decimal::from(*i),
-            Value::Numeric(d) => *d,
+            Value::Int(i) => Numeric::from(*i),
+            Value::Numeric(d) => d.clone(),
             other => return no_such_function(op, &[other]),
         };
-        match (
-            sum.checked_add(x),
-            x.checked_mul(x).and_then(|sq| squares.checked_add(sq)),
-        ) {
-            (Some(s), Some(q)) => (sum, squares) = (s, q),
-            _ => return crate::eval_error::raise("value overflows numeric format"),
-        }
+        squares += &(&x * &x);
+        sum += &x;
     }
-    let count = Decimal::from(n as i64);
+    if !sum.is_finite() || !squares.is_finite() {
+        return Value::Numeric(Numeric::NaN);
+    }
+    let count = Numeric::from(n);
     // No spread at all (or rounding below it) is an exact zero.
-    let numerator = match count
-        .checked_mul(squares)
-        .and_then(|a| a.checked_sub(sum * sum))
-    {
-        Some(v) if v.is_sign_negative() || v.is_zero() => return Value::Numeric(Decimal::ZERO),
-        Some(v) => v,
-        None => return crate::eval_error::raise("value overflows numeric format"),
-    };
-    let denominator = count * if sample { count - Decimal::ONE } else { count };
-    match crate::planner::numeric_div(numerator, denominator) {
-        Value::Numeric(variance) if root => {
-            decimal_sqrt(variance, variance.scale()).map_or(Value::Null, Value::Numeric)
+    let numerator = &(&count * &squares) - &(&sum * &sum);
+    if numerator.signum() <= 0 {
+        return Value::Numeric(Numeric::zero());
+    }
+    let denominator = &count
+        * &if sample {
+            &count - &Numeric::one()
+        } else {
+            count.clone()
+        };
+    match numerator.checked_div(&denominator) {
+        Ok(variance) if root => {
+            let scale = i64::from(variance.scale());
+            Value::Numeric(variance.sqrt_to(scale))
         }
-        other => other,
+        Ok(variance) => Value::Numeric(variance),
+        Err(e) => crate::eval_error::raise(e),
     }
-}
-
-/// The square root of a non-negative numeric, rounded to `scale` digits.
-fn decimal_sqrt(value: rust_decimal::Decimal, scale: u32) -> Option<rust_decimal::Decimal> {
-    use rust_decimal::Decimal;
-    use rust_decimal::prelude::ToPrimitive;
-    if value.is_zero() {
-        return Some(Decimal::new(0, scale));
-    }
-    let mut x = Decimal::from_f64_retain(value.to_f64()?.sqrt())?;
-    for _ in 0..64 {
-        let next = (x + value.checked_div(x)?) / Decimal::TWO;
-        if next == x {
-            break;
-        }
-        x = next;
-    }
-    let mut root =
-        x.round_dp_with_strategy(scale, rust_decimal::RoundingStrategy::MidpointAwayFromZero);
-    root.rescale(scale);
-    Some(root)
 }
 
 /// `percentile_cont`, `percentile_disc`, and `mode` over the inputs, which
@@ -595,28 +575,23 @@ fn aggregate_numeric(op: &AggregateOp, vals: &[Value]) -> Value {
             // Integers and numerics sum exactly; `avg` of them is a numeric
             // with PostgreSQL's division scale. A float makes both floats.
             if !non_null.iter().any(|v| matches!(v, Value::Float(_))) {
-                let mut sum = rust_decimal::Decimal::ZERO;
+                let mut sum = crate::numeric::Numeric::zero();
                 let mut any_numeric = false;
                 for v in &non_null {
-                    let d = match v {
-                        Value::Int(i) => rust_decimal::Decimal::from(*i),
+                    match v {
+                        Value::Int(i) => sum += &crate::numeric::Numeric::from(*i),
                         Value::Numeric(d) => {
                             any_numeric = true;
-                            *d
+                            sum += d;
                         }
                         _ => return Value::Null,
-                    };
-                    sum = match sum.checked_add(d) {
-                        Some(s) => s,
-                        None => return crate::eval_error::raise("value overflows numeric format"),
-                    };
+                    }
                 }
                 return if *op == AggregateOp::Avg {
-                    crate::planner::numeric_div(sum, rust_decimal::Decimal::from(non_null.len()))
+                    crate::planner::numeric_div(sum, crate::numeric::Numeric::from(non_null.len()))
                 } else if any_numeric {
                     Value::Numeric(sum)
                 } else {
-                    use rust_decimal::prelude::ToPrimitive;
                     // An integer sum too large for bigint is a numeric.
                     sum.to_i64().map_or(Value::Numeric(sum), Value::Int)
                 };
@@ -908,10 +883,6 @@ mod tests {
         assert_eq!(
             spread(&AggregateOp::VarSamp, one.iter().collect()),
             Value::Null
-        );
-        assert_eq!(
-            decimal_sqrt("2".parse().unwrap(), 10),
-            Some("1.4142135624".parse().unwrap())
         );
     }
 

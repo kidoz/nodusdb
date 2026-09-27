@@ -35,7 +35,7 @@ pub enum Value {
     /// Appended so older encodings decode. Rows store it as its decimal text
     /// (see [`encode_row`]), which every reader decodes; [`restore_row`] turns
     /// it back into a number from the column's type.
-    Numeric(rust_decimal::Decimal),
+    Numeric(crate::numeric::Numeric),
     /// A `json` value: its text exactly as written or built, which
     /// PostgreSQL keeps (whitespace, key order, and duplicate keys). Rows
     /// store it as text, as they did before; [`restore_row`] turns a `json`
@@ -87,9 +87,8 @@ pub(crate) fn restore_row(row: &mut [Value], columns: &[nodus_catalog::ColumnDes
         }
         let restored = match &*value {
             Value::Text(t) => parse_decimal(t),
-            Value::Float(f) => rust_decimal::Decimal::from_f64_retain(*f)
-                .and_then(|d| parse_decimal(&(d.normalize().to_string()))),
-            Value::Int(i) => Some(rust_decimal::Decimal::from(*i)),
+            Value::Float(f) => crate::numeric::Numeric::from_f64_exact(*f).map(|d| d.normalize()),
+            Value::Int(i) => Some(crate::numeric::Numeric::from(*i)),
             _ => None,
         };
         if let Some(d) = restored {
@@ -142,9 +141,9 @@ pub(crate) fn integer_range(data_type: &str) -> (i64, i64) {
 /// from zero) and rejects a value needing more than `p - s` integer digits.
 /// A bare `numeric` keeps the value as it is.
 pub(crate) fn apply_numeric_typmod(
-    d: rust_decimal::Decimal,
+    d: crate::numeric::Numeric,
     data_type: &str,
-) -> Result<rust_decimal::Decimal, String> {
+) -> Result<crate::numeric::Numeric, String> {
     let Some(args) = data_type
         .split_once('(')
         .and_then(|(_, rest)| rest.split_once(')'))
@@ -152,7 +151,7 @@ pub(crate) fn apply_numeric_typmod(
     else {
         return Ok(d);
     };
-    let mut parts = args.split(',').map(|p| p.trim().parse::<u32>());
+    let mut parts = args.split(',').map(|p| p.trim().parse::<i64>());
     let precision = match parts.next() {
         Some(Ok(p)) => p,
         _ => return Ok(d),
@@ -161,30 +160,90 @@ pub(crate) fn apply_numeric_typmod(
         Some(Ok(s)) => s,
         _ => 0,
     };
-    // Exact decimals carry at most 28 fractional digits.
-    let scale = scale.min(28);
-    let mut rounded =
-        d.round_dp_with_strategy(scale, rust_decimal::RoundingStrategy::MidpointAwayFromZero);
-    rounded.rescale(scale);
-    let integer_digits = rounded
-        .trunc()
-        .abs()
-        .to_string()
-        .trim_start_matches('0')
-        .len() as u32;
-    if integer_digits > precision.saturating_sub(scale) {
-        return Err("numeric field overflow".to_string());
-    }
-    Ok(rounded)
+    d.apply_typmod(precision, scale)
 }
 
-/// Parses decimal text (`1.50`, `-3`, `1e3`), keeping its scale.
-pub(crate) fn parse_decimal(text: &str) -> Option<rust_decimal::Decimal> {
-    use std::str::FromStr;
-    let t = text.trim();
-    rust_decimal::Decimal::from_str(t)
-        .ok()
-        .or_else(|| rust_decimal::Decimal::from_scientific(t).ok())
+/// Whether a declared type is `real` (`float4`, or `float(p)` with at most
+/// 24 bits of precision).
+pub(crate) fn is_real_type(data_type: &str) -> bool {
+    let upper = data_type.trim().to_ascii_uppercase();
+    match upper.as_str() {
+        "REAL" | "FLOAT4" => true,
+        _ => upper
+            .strip_prefix("FLOAT(")
+            .and_then(|rest| rest.strip_suffix(')'))
+            .and_then(|p| p.trim().parse::<u32>().ok())
+            .is_some_and(|p| (1..=24).contains(&p)),
+    }
+}
+
+/// A double rounded to `real`, failing when it overflows or underflows.
+pub(crate) fn to_real(x: f64) -> Result<f64, String> {
+    let r = x as f32;
+    if r.is_infinite() && x.is_finite() {
+        return Err("value out of range: overflow".into());
+    }
+    if r == 0.0 && x != 0.0 {
+        return Err("value out of range: underflow".into());
+    }
+    Ok(f64::from(r))
+}
+
+/// Parses `double precision` (or `real`) input text as PostgreSQL does:
+/// `NaN`, `Infinity`, and `inf` are accepted; a value too large or too
+/// small for the type is an error.
+pub(crate) fn parse_float_text(text: &str, real: bool) -> Result<f64, String> {
+    let type_name = if real { "real" } else { "double precision" };
+    let t = text.trim_matches(|c: char| matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0b' | '\x0c'));
+    let x: f64 = t
+        .parse()
+        .map_err(|_| format!("invalid input syntax for type {type_name}: \"{text}\""))?;
+    let out_of_range = || format!("\"{text}\" is out of range for type {type_name}");
+    let spelled_infinite = t.to_ascii_lowercase().contains("inf");
+    let nonzero_digits = t
+        .split(['e', 'E'])
+        .next()
+        .is_some_and(|m| m.bytes().any(|b| (b'1'..=b'9').contains(&b)));
+    let x = if real {
+        let r = x as f32;
+        if (r.is_infinite() && !spelled_infinite) || (r == 0.0 && nonzero_digits) {
+            return Err(out_of_range());
+        }
+        f64::from(r)
+    } else {
+        x
+    };
+    if (x.is_infinite() && !spelled_infinite) || (x == 0.0 && nonzero_digits) {
+        return Err(out_of_range());
+    }
+    Ok(x)
+}
+
+/// Parses integer input text as PostgreSQL does: surrounding whitespace, a
+/// sign, decimal digits or a `0x`, `0o`, or `0b` prefix, and underscores
+/// between digits (`1_000`). `None` if the text is not an integer; one too
+/// large for any integer type comes back as `i128::MAX`.
+pub(crate) fn parse_integer_text(text: &str) -> Option<i128> {
+    let t = text.trim_matches(|c: char| matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0b' | '\x0c'));
+    let (negative, body) = match t.as_bytes().first() {
+        Some(b'-') => (true, &t[1..]),
+        Some(b'+') => (false, &t[1..]),
+        _ => (false, t),
+    };
+    let (radix, digits) = match body.as_bytes() {
+        [b'0', b'x' | b'X', ..] => (16, &body[2..]),
+        [b'0', b'o' | b'O', ..] => (8, &body[2..]),
+        [b'0', b'b' | b'B', ..] => (2, &body[2..]),
+        _ => (10, body),
+    };
+    let digits = crate::numeric::ungrouped(digits, radix)?;
+    let magnitude = i128::from_str_radix(&digits, radix).unwrap_or(i128::MAX);
+    Some(if negative { -magnitude } else { magnitude })
+}
+
+/// Parses decimal text (`1.50`, `-3`, `1e3`, `NaN`), keeping its scale.
+pub(crate) fn parse_decimal(text: &str) -> Option<crate::numeric::Numeric> {
+    crate::numeric::Numeric::parse(text).ok()
 }
 
 /// A value in the form used for grouping and deduplication keys: numerically
@@ -285,9 +344,9 @@ pub(crate) fn coerce_for_column(value: &Value, data_type: &str) -> Value {
                 crate::planner::cast_value(scalar.clone(), data_type)
             }
             ColumnType::Float => match scalar {
-                Value::Float(_) => scalar.clone(),
-                Value::Int(n) => Value::Float(*n as f64),
-                Value::Numeric(d) => Value::Float(decimal_to_f64(d)),
+                Value::Float(_) | Value::Int(_) | Value::Numeric(_) => {
+                    crate::planner::cast_value(scalar.clone(), data_type)
+                }
                 _ => coerce(&render(scalar), ColumnType::Float),
             },
             ColumnType::Bool => match scalar {
@@ -983,18 +1042,14 @@ pub(crate) fn compare(a: &Value, b: &Value) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     match (a, b) {
         (Value::Int(x), Value::Int(y)) => x.cmp(y),
-        (Value::Float(x), Value::Float(y)) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
-        (Value::Int(x), Value::Float(y)) => (*x as f64).partial_cmp(y).unwrap_or(Ordering::Equal),
-        (Value::Float(x), Value::Int(y)) => x.partial_cmp(&(*y as f64)).unwrap_or(Ordering::Equal),
+        (Value::Float(x), Value::Float(y)) => float_cmp(*x, *y),
+        (Value::Int(x), Value::Float(y)) => float_cmp(*x as f64, *y),
+        (Value::Float(x), Value::Int(y)) => float_cmp(*x, *y as f64),
         (Value::Numeric(x), Value::Numeric(y)) => x.cmp(y),
-        (Value::Numeric(x), Value::Int(y)) => x.cmp(&rust_decimal::Decimal::from(*y)),
-        (Value::Int(x), Value::Numeric(y)) => rust_decimal::Decimal::from(*x).cmp(y),
-        (Value::Numeric(x), Value::Float(y)) => {
-            decimal_to_f64(x).partial_cmp(y).unwrap_or(Ordering::Equal)
-        }
-        (Value::Float(x), Value::Numeric(y)) => {
-            x.partial_cmp(&decimal_to_f64(y)).unwrap_or(Ordering::Equal)
-        }
+        (Value::Numeric(x), Value::Int(y)) => x.cmp(&crate::numeric::Numeric::from(*y)),
+        (Value::Int(x), Value::Numeric(y)) => crate::numeric::Numeric::from(*x).cmp(y),
+        (Value::Numeric(x), Value::Float(y)) => float_cmp(decimal_to_f64(x), *y),
+        (Value::Float(x), Value::Numeric(y)) => float_cmp(*x, decimal_to_f64(y)),
         (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
         (Value::Text(x) | Value::Json(x), Value::Text(y) | Value::Json(y)) => x.cmp(y),
         (Value::Null, Value::Null) => Ordering::Equal,
@@ -1023,10 +1078,19 @@ pub(crate) fn compare(a: &Value, b: &Value) -> std::cmp::Ordering {
 }
 
 /// A decimal as the nearest float.
-pub(crate) fn decimal_to_f64(d: &rust_decimal::Decimal) -> f64 {
-    // Read from the digits, as PostgreSQL converts: the nearest double
-    // (arithmetic on the parts can be a unit in the last place off).
-    d.to_string().parse().unwrap_or(f64::NAN)
+pub(crate) fn decimal_to_f64(d: &crate::numeric::Numeric) -> f64 {
+    d.to_f64()
+}
+
+/// Float order as PostgreSQL's: NaN equals itself and sorts above every
+/// other value, and `-0` equals `0`.
+pub(crate) fn float_cmp(x: f64, y: f64) -> std::cmp::Ordering {
+    match (x.is_nan(), y.is_nan()) {
+        (true, true) => std::cmp::Ordering::Equal,
+        (true, false) => std::cmp::Ordering::Greater,
+        (false, true) => std::cmp::Ordering::Less,
+        _ => x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal),
+    }
 }
 
 /// SQL value equality, defined as `compare(a, b) == Equal` so ordering and

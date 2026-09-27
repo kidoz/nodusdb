@@ -1,0 +1,181 @@
+# Arbitrary-precision numeric: values of any size, NaN and infinities, input forms, and type modifiers.
+query TTT
+SELECT 12345678901234567890123456789012345678901234567890::numeric + 1, 10::numeric ^ 30, 2::numeric ^ 200;
+----
+12345678901234567890123456789012345678901234567891	1000000000000000000000000000000	1606938044258990275541962092341162602522202993782792835301376
+
+query TT
+SELECT 12345678901234567890123456789::numeric * 98765432109876543210, 1::numeric / 98765432109876543210123;
+----
+1219326311370217952249657064223746380111126352690	0.0000000000000000000000101249999988609375
+
+query TTT
+SELECT 1e1000::numeric = 1e1000::numeric, length((1e1000::numeric)::text), 1e-100::numeric * 1e100;
+----
+t	1001	1.0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+
+query TTTTTTTTT
+SELECT '1_000'::numeric, '0x1F'::numeric, ' 1.5e3 '::numeric, '.5'::numeric, '5.'::numeric, '-0'::numeric, '+.5e-3'::numeric, '1.50e1'::numeric, '1e-3'::numeric;
+----
+1000	31	1500	0.5	5	0	0.0005	15.0	0.001
+
+query TTTTTT
+SELECT 'nan'::numeric, 'inf'::numeric, '+inf'::numeric, '-inf'::numeric, 'INFINITY'::numeric, ' NaN '::numeric;
+----
+NaN	Infinity	Infinity	-Infinity	Infinity	NaN
+
+statement error
+SELECT 'abc'::numeric;
+
+statement error
+SELECT '1e-20000'::numeric;
+
+query TTTTTTT
+SELECT 'NaN'::numeric + 1, 'Infinity'::numeric + 1, 'Infinity'::numeric - 'Infinity'::numeric, 'Infinity'::numeric * 0, 1 / 'Infinity'::numeric, 'Infinity'::numeric / 'Infinity'::numeric, -'Infinity'::numeric;
+----
+NaN	Infinity	NaN	NaN	0	NaN	-Infinity
+
+query TTTT
+SELECT 'NaN'::numeric > 'Infinity'::numeric, 'Infinity'::numeric > 1e100, '-Infinity'::numeric < -1e100, 'NaN'::numeric = 'NaN'::numeric;
+----
+t	t	t	t
+
+query TTT
+SELECT 'Infinity'::numeric % 2, 5 % 'Infinity'::numeric, 'NaN'::numeric % 0;
+----
+NaN	5	NaN
+
+statement error
+SELECT 1::numeric % 0;
+
+statement error
+SELECT 'Infinity'::numeric / 0;
+
+query T
+SELECT x FROM (VALUES (1.0::numeric), ('NaN'), (-1), ('Infinity'), ('-Infinity'), (0)) v(x) ORDER BY x DESC;
+----
+NaN
+Infinity
+1.0
+0
+-1
+-Infinity
+
+query T
+SELECT count(DISTINCT x) FROM (VALUES (1.0::numeric), (1.00), (1)) v(x);
+----
+1
+
+query TTTTTTT
+SELECT 'NaN'::numeric(5,2), 0.1::numeric(3,1) + 0.25, 1.005::numeric(10,2), -1.005::numeric(10,2), 123::numeric(2,-1), 0.000123::numeric(3,5), 1e-3::numeric(3,5);
+----
+NaN	0.35	1.01	-1.01	120	0.00012	0.00100
+
+statement error
+SELECT 'Infinity'::numeric(5,2);
+
+statement error
+SELECT 1234567::numeric(5,2);
+
+statement error
+SELECT 0.01::numeric(3,5);
+
+query TTTTTTTT
+SELECT 7.5 % 2, -7.5 % 2, 7 % -2.5, 1.23 * 4.5600, 0.00 * 1.5, -0.0, 0.000, (-1.5)::numeric * 0;
+----
+1.5	-1.5	2.0	5.608800	0.000	0.0	0.000	0.0
+
+query TTTTTTTT
+SELECT 7::numeric / 3, 1::numeric / 7, 22::numeric / 7 * 7, 1.000::numeric / 3, 10::numeric / 4, 1.23 / 0.1, 10 / 0.3, 1::numeric / 3e30;
+----
+2.3333333333333333	0.14285714285714285714	22.0000000000000003	0.33333333333333333333	2.5000000000000000	12.3000000000000000	33.3333333333333333	0.000000000000000000000000000000333333333333333333
+
+query TTTTTTTTTT
+SELECT round(1234.5678, -2), round(1234.5678, 2), trunc(1234.5678, -2), round(-0.5), trunc(-0.5), round('NaN'::numeric), ceil('Infinity'::numeric), floor(-1.5), ceil(1.000), round(1.5, 3);
+----
+1200	1234.57	1200	-1	0	NaN	Infinity	-2	1	1.500
+
+query TTTTTTTTTT
+SELECT round(12.5, -1), round(15::numeric, -1), round(1e20::numeric, -21), trunc(-1.99), ceil(-0.1), floor(0.1), sign(-0.0), abs(-0.0), sign('-Infinity'::numeric), sign('NaN'::numeric);
+----
+10	20	0	-1	0	0	0	0.0	-1	NaN
+
+query TTTTT
+SELECT 0.1::float8::numeric, (1/3::float8)::numeric, 1e20::float8::numeric, 123456789.123456789::float8::numeric, 1e-20::float8::numeric;
+----
+0.1	0.333333333333333	100000000000000000000	123456789.123457	0.00000000000000000001
+
+query TTTTTTT
+SELECT 'NaN'::float8::numeric, 'inf'::float8::numeric, '-inf'::float8::numeric, 'NaN'::numeric::float8, 'inf'::numeric::float8, 0.1::real::numeric, 12.34::float8::numeric(10,1);
+----
+NaN	Infinity	-Infinity	NaN	Infinity	0.1	12.3
+
+query TTTT
+SELECT 2.5::numeric::int, (-2.5)::numeric::int, 12345678901234567890::numeric::float8, 1e30::numeric::float8;
+----
+3	-3	1.2345678901234567e+19	1e+30
+
+statement error
+SELECT 'NaN'::numeric::int;
+
+statement error
+SELECT 99999999999999999999::numeric::bigint;
+
+query TT
+SELECT sum(x), avg(x) FROM (VALUES (1e30::numeric), (1e30)) v(x);
+----
+2000000000000000000000000000000	1000000000000000000000000000000
+
+query TT
+SELECT sum(x), avg(x) FROM (VALUES ('Infinity'::numeric), (1)) v(x);
+----
+Infinity	Infinity
+
+query TT
+SELECT sum(x), avg(x) FROM (VALUES ('Infinity'::numeric), ('-Infinity')) v(x);
+----
+NaN	NaN
+
+query TTTTTT
+SELECT sum(x), avg(x), stddev(x), variance(x), min(x), max(x) FROM (VALUES (1.5::numeric), (2.25), ('NaN'), (3)) v(x);
+----
+NaN	NaN	NaN	NaN	1.5	NaN
+
+query TT
+SELECT sum(x)::text, avg(x) FROM (VALUES (9223372036854775807::bigint), (9223372036854775807)) v(x);
+----
+18446744073709551614	9223372036854775807
+
+query TTTT
+SELECT to_char(12345678901234567890::numeric, '99999999999999999999'), to_char(-0.5, 'S9.9'), to_number('12,345.67', '99G999D99'), to_number('-12.5', 'S99.9');
+----
+ 12345678901234567890	 -.5	12345.67	-12.5
+
+query TTTT
+SELECT to_json(1.50::numeric), to_json('NaN'::numeric), '{"a": 12345678901234567890.123}'::jsonb -> 'a', ('{"a": 1e30}'::jsonb ->> 'a')::numeric;
+----
+1.50	"NaN"	12345678901234567890.123	1000000000000000000000000000000
+
+statement ok
+CREATE TABLE big (id int PRIMARY KEY, amount numeric(78,0), ratio numeric);
+
+statement ok
+INSERT INTO big VALUES (1, 115792089237316195423570985008687907853269984665640564039457584007913129639935, 'NaN'), (2, 1, 'Infinity'), (3, -5, 2.50);
+
+query TTTT
+SELECT id, amount, ratio, amount + 1 FROM big ORDER BY id;
+----
+1	115792089237316195423570985008687907853269984665640564039457584007913129639935	NaN	115792089237316195423570985008687907853269984665640564039457584007913129639936
+2	1	Infinity	2
+3	-5	2.50	-4
+
+query T
+SELECT id FROM big WHERE ratio = 'NaN' OR ratio > 1e100 ORDER BY id;
+----
+1
+2
+
+query TTT
+SELECT sum(amount), max(ratio), min(ratio) FROM big;
+----
+115792089237316195423570985008687907853269984665640564039457584007913129639931	NaN	2.50

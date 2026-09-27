@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use bytes::{BufMut, BytesMut};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
+use nodus_executor::numeric::Numeric;
 use pgwire::api::Type;
 use pgwire::api::results::{FieldFormat, FieldInfo};
 use pgwire::messages::data::DataRow;
@@ -79,12 +80,9 @@ pub(crate) fn parse_i64(value: &nodus_executor::Value) -> std::io::Result<i64> {
     match value {
         nodus_executor::Value::Int(i) => Ok(*i),
         nodus_executor::Value::Float(f) => Ok(*f as i64),
-        nodus_executor::Value::Numeric(d) => {
-            use rust_decimal::prelude::ToPrimitive;
-            d.round().to_i64().ok_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::InvalidData, "numeric out of range")
-            })
-        }
+        nodus_executor::Value::Numeric(d) => d.to_i64().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "numeric out of range")
+        }),
         _ => value_to_string(value)
             .parse::<i64>()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
@@ -92,19 +90,62 @@ pub(crate) fn parse_i64(value: &nodus_executor::Value) -> std::io::Result<i64> {
 }
 
 /// A value as an exact decimal, for a binary `numeric` field.
-pub(crate) fn parse_decimal(
-    value: &nodus_executor::Value,
-) -> std::io::Result<rust_decimal::Decimal> {
-    use std::str::FromStr;
+pub(crate) fn parse_decimal(value: &nodus_executor::Value) -> std::io::Result<PgNumeric> {
     match value {
-        nodus_executor::Value::Numeric(d) => Ok(*d),
-        nodus_executor::Value::Int(i) => Ok(rust_decimal::Decimal::from(*i)),
-        other => {
-            let text = value_to_string(other);
-            rust_decimal::Decimal::from_str(text.trim())
-                .or_else(|_| rust_decimal::Decimal::from_scientific(text.trim()))
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
-        }
+        nodus_executor::Value::Numeric(d) => Ok(PgNumeric(d.clone())),
+        nodus_executor::Value::Int(i) => Ok(PgNumeric(Numeric::from(*i))),
+        nodus_executor::Value::Float(f) => Ok(PgNumeric(Numeric::from_f64(*f))),
+        other => Numeric::parse(&value_to_string(other))
+            .map(PgNumeric)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+    }
+}
+
+/// A `numeric` in PostgreSQL's wire formats.
+#[derive(Debug)]
+pub(crate) struct PgNumeric(pub(crate) Numeric);
+
+impl ToSql for PgNumeric {
+    fn to_sql(
+        &self,
+        _ty: &Type,
+        out: &mut BytesMut,
+    ) -> Result<IsNull, Box<dyn std::error::Error + Sync + Send>> {
+        out.put_slice(&self.0.to_binary());
+        Ok(IsNull::No)
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        *ty == Type::NUMERIC
+    }
+
+    postgres_types::to_sql_checked!();
+}
+
+impl<'a> postgres_types::FromSql<'a> for PgNumeric {
+    fn from_sql(
+        _ty: &Type,
+        raw: &'a [u8],
+    ) -> Result<PgNumeric, Box<dyn std::error::Error + Sync + Send>> {
+        Numeric::from_binary(raw)
+            .map(PgNumeric)
+            .ok_or_else(|| "invalid binary numeric".into())
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        *ty == Type::NUMERIC
+    }
+}
+
+impl<'a> pgwire::types::FromSqlText<'a> for PgNumeric {
+    fn from_sql_text(
+        _ty: &Type,
+        input: &'a [u8],
+        _format_options: &pgwire::types::format::FormatOptions,
+    ) -> Result<PgNumeric, Box<dyn std::error::Error + Sync + Send>> {
+        Numeric::parse(std::str::from_utf8(input)?)
+            .map(PgNumeric)
+            .map_err(Into::into)
     }
 }
 
@@ -112,10 +153,7 @@ pub(crate) fn parse_f64(value: &nodus_executor::Value) -> std::io::Result<f64> {
     match value {
         nodus_executor::Value::Int(i) => Ok(*i as f64),
         nodus_executor::Value::Float(f) => Ok(*f),
-        nodus_executor::Value::Numeric(d) => {
-            use rust_decimal::prelude::ToPrimitive;
-            Ok(d.to_f64().unwrap_or(f64::NAN))
-        }
+        nodus_executor::Value::Numeric(d) => Ok(d.to_f64()),
         _ => value_to_string(value)
             .parse::<f64>()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
@@ -591,7 +629,7 @@ pub(crate) fn text_parameter_value(param_type: &Type, raw: String) -> nodus_exec
             .map(nodus_executor::Value::Float)
             .unwrap_or(nodus_executor::Value::Null),
         Type::NUMERIC => parse_decimal(&nodus_executor::Value::Text(raw))
-            .map(nodus_executor::Value::Numeric)
+            .map(|d| nodus_executor::Value::Numeric(d.0))
             .unwrap_or(nodus_executor::Value::Null),
         Type::JSON | Type::JSONB => serde_json::from_str(&raw)
             .map(nodus_executor::Value::Jsonb)

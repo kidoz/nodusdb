@@ -773,11 +773,11 @@ fn roman(mut n: i64) -> String {
 /// `to_char(number, template)`.
 pub(crate) fn format_number(
     value: f64,
-    exact: Option<rust_decimal::Decimal>,
+    exact: Option<crate::numeric::Numeric>,
     template: &str,
 ) -> Result<String, String> {
     let t = parse_number_template(template)?;
-    let negative = value < 0.0 || exact.is_some_and(|d| d.is_sign_negative() && !d.is_zero());
+    let negative = value < 0.0 || exact.as_ref().is_some_and(|d| d.is_sign_negative());
     if let Some(case) = t.roman {
         let n = value.round() as i64;
         if !(1..=3999).contains(&n) {
@@ -810,10 +810,7 @@ pub(crate) fn format_number(
     }
     // The digits, rounded half away from zero to the template's scale.
     let rounded = match exact {
-        Some(d) => d
-            .abs()
-            .round_dp_with_strategy(scale, rust_decimal::RoundingStrategy::MidpointAwayFromZero)
-            .to_string(),
+        Some(d) => d.abs().round(i64::from(scale)).to_string(),
         None => format!("{:.*}", scale as usize, value.abs()),
     };
     let (int_digits, frac_digits) = rounded.split_once('.').unwrap_or((&rounded, ""));
@@ -1051,8 +1048,7 @@ pub(crate) fn parse_number(text: &str, template: &str) -> Result<Value, String> 
     if !digits.bytes().any(|b| b.is_ascii_digit()) {
         return Err("invalid input syntax for type numeric: \" \"".to_string());
     }
-    let mut number: rust_decimal::Decimal = digits
-        .parse()
+    let mut number = crate::numeric::Numeric::parse(&digits)
         .map_err(|_| format!("invalid input syntax for type numeric: \"{text}\""))?;
     if negative {
         number = -number;
@@ -1067,12 +1063,12 @@ pub(crate) fn to_char(value: &Value, template: &str, kind: Option<Kind>) -> Resu
         Value::Null => Value::Null,
         Value::Int(i) => Value::Text(format_number(
             *i as f64,
-            Some(rust_decimal::Decimal::from(*i)),
+            Some(crate::numeric::Numeric::from(*i)),
             template,
         )?),
         Value::Numeric(d) => Value::Text(format_number(
             crate::value::decimal_to_f64(d),
-            Some(*d),
+            Some(d.clone()),
             template,
         )?),
         Value::Float(f) => Value::Text(format_number(*f, None, template)?),
@@ -1141,7 +1137,7 @@ mod tests {
     #[test]
     fn numbers_format_by_template() {
         let n = |v: f64, t: &str| {
-            format_number(v, rust_decimal::Decimal::from_f64_retain(v), t).unwrap()
+            format_number(v, crate::numeric::Numeric::from_f64_exact(v), t).unwrap()
         };
         assert_eq!(n(1234.5, "9999.99"), " 1234.50");
         assert_eq!(n(42.0, "000"), " 042");

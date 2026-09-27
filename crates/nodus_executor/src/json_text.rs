@@ -107,7 +107,8 @@ pub(crate) fn value_json(value: &crate::Value, pretty: bool, out: &mut String) {
         Value::Null => out.push_str("null"),
         Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
         Value::Int(i) => out.push_str(&i.to_string()),
-        Value::Numeric(d) => out.push_str(&d.to_string()),
+        Value::Numeric(d) if d.is_finite() => out.push_str(&d.to_string()),
+        Value::Numeric(d) => write_string(&d.to_string(), out),
         Value::Float(f) if f.is_finite() => out.push_str(&crate::render(value)),
         // Not a JSON number, so a string of `float8`'s text for it.
         Value::Float(f) => write_string(
@@ -415,12 +416,9 @@ fn number_text(n: &serde_json::Number) -> String {
     plain_decimal(&text).unwrap_or(text)
 }
 
-/// A JSON number's value, exactly where it fits a decimal.
-fn number_value(n: &serde_json::Number) -> Option<rust_decimal::Decimal> {
-    let text = n.to_string();
-    text.parse::<rust_decimal::Decimal>()
-        .ok()
-        .or_else(|| rust_decimal::Decimal::from_scientific(&text).ok())
+/// A JSON number's exact value.
+fn number_value(n: &serde_json::Number) -> Option<crate::numeric::Numeric> {
+    crate::numeric::Numeric::parse(&n.to_string()).ok()
 }
 
 /// Rewrites a decimal number in exponent notation (`1.5e-7`) in plain

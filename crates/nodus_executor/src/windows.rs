@@ -419,10 +419,9 @@ impl<'a> Partition<'a> {
 
 /// A value as an integer, when it is one.
 fn integer(value: &Value) -> Option<i64> {
-    use rust_decimal::prelude::ToPrimitive;
     match value {
         Value::Int(i) => Some(*i),
-        Value::Numeric(d) if d.fract().is_zero() => d.to_i64(),
+        Value::Numeric(d) if d.is_integral() => d.to_i64(),
         Value::Float(f) if f.fract() == 0.0 => Some(*f as i64),
         Value::Text(t) => t.trim().parse().ok(),
         _ => None,
@@ -445,7 +444,7 @@ fn ntile(pos: usize, len: usize, buckets: usize) -> i64 {
 /// An ordering key in the terms a `RANGE` offset is measured in.
 #[derive(Debug, Clone, PartialEq)]
 enum RangeKey {
-    Number(rust_decimal::Decimal),
+    Number(crate::numeric::Numeric),
     Float(f64),
     /// A moment (or time of day, or interval) in microseconds.
     Micros(i128),
@@ -453,16 +452,15 @@ enum RangeKey {
 
 impl RangeKey {
     fn cmp(&self, other: &RangeKey) -> Ordering {
-        use rust_decimal::prelude::ToPrimitive;
         let float = |k: &RangeKey| match k {
-            RangeKey::Number(d) => d.to_f64().unwrap_or(0.0),
+            RangeKey::Number(d) => d.to_f64(),
             RangeKey::Float(f) => *f,
             RangeKey::Micros(m) => *m as f64,
         };
         match (self, other) {
             (RangeKey::Number(a), RangeKey::Number(b)) => a.cmp(b),
             (RangeKey::Micros(a), RangeKey::Micros(b)) => a.cmp(b),
-            (a, b) => float(a).partial_cmp(&float(b)).unwrap_or(Ordering::Equal),
+            (a, b) => crate::value::float_cmp(float(a), float(b)),
         }
     }
 }
@@ -471,7 +469,7 @@ fn range_key(value: &Value) -> Option<RangeKey> {
     use crate::datetime::Temporal;
     Some(match value {
         Value::Int(i) => RangeKey::Number((*i).into()),
-        Value::Numeric(d) => RangeKey::Number(*d),
+        Value::Numeric(d) => RangeKey::Number(d.clone()),
         Value::Float(f) => RangeKey::Float(*f),
         Value::Text(_) => match Temporal::read(value, None)? {
             Temporal::Time(micros) => RangeKey::Micros(micros as i128),
@@ -511,20 +509,20 @@ fn shifted(key: &Value, offset: &Value, subtract: bool) -> Result<RangeKey> {
         return Err(invalid());
     }
     let number = match offset {
-        Value::Int(i) => Some(rust_decimal::Decimal::from(*i)),
-        Value::Numeric(d) => Some(*d),
-        Value::Float(f) => rust_decimal::Decimal::from_f64_retain(*f),
+        Value::Int(i) => Some(crate::numeric::Numeric::from(*i)),
+        Value::Numeric(d) => Some(d.clone()),
+        Value::Float(f) if f.is_nan() => Some(crate::numeric::Numeric::NaN),
+        Value::Float(f) => crate::numeric::Numeric::from_f64_exact(*f),
         _ => None,
     };
     if let Some(n) = number {
-        if n.is_sign_negative() && !n.is_zero() {
+        if n.is_sign_negative() || n.is_nan() {
             return Err(invalid());
         }
         return Ok(match range_key(key) {
-            Some(RangeKey::Number(k)) => RangeKey::Number(if subtract { k - n } else { k + n }),
+            Some(RangeKey::Number(k)) => RangeKey::Number(if subtract { &k - &n } else { &k + &n }),
             Some(RangeKey::Float(k)) => {
-                use rust_decimal::prelude::ToPrimitive;
-                let n = n.to_f64().unwrap_or(0.0);
+                let n = n.to_f64();
                 RangeKey::Float(if subtract { k - n } else { k + n })
             }
             _ => return Err(unsupported()),
