@@ -330,6 +330,11 @@ pub const ALTER_SEQUENCE_FUNCTION: &str = "pg_catalog.nodus_alter_sequence";
 /// `PREPARE TRANSACTION`.
 pub const UTILITY_FUNCTION: &str = "pg_catalog.nodus_utility";
 
+/// The constraint name `ON CONFLICT (expressions)` is written as — `ON
+/// CONFLICT ON CONSTRAINT "nodus_conflict:lower(email)"` — since the
+/// parser takes only column names there.
+pub const CONFLICT_EXPRESSIONS: &str = "nodus_conflict:";
+
 /// Rewrites what the parser lacks: a trailing `WITH [NO] DATA` on `CREATE
 /// TABLE ... AS` or `CREATE MATERIALIZED VIEW` becomes the storage
 /// parameter [`NO_DATA_OPTION`] (for `NO DATA`), and `REFRESH MATERIALIZED
@@ -344,11 +349,101 @@ fn rewrite_data_clauses(
         let end = token.token == Token::SemiColon || token.token == Token::EOF;
         statement.push(token);
         if end {
-            out.extend(rewrite_data_clause(std::mem::take(&mut statement)));
+            out.extend(rewrite_data_clause(rewrite_statement_form(std::mem::take(
+                &mut statement,
+            ))));
         }
     }
-    out.extend(rewrite_data_clause(statement));
+    out.extend(rewrite_data_clause(rewrite_statement_form(statement)));
     out
+}
+
+/// Tokens as SQL text again: strings and quoted names quoted as written
+/// (their quotes doubled), anything else as it is.
+fn render_tokens(tokens: &[sqlparser::tokenizer::TokenWithSpan]) -> String {
+    use sqlparser::tokenizer::Token;
+    tokens
+        .iter()
+        .map(|t| match &t.token {
+            Token::Word(w) if w.quote_style == Some('"') => {
+                format!("\"{}\"", w.value.replace('"', "\"\""))
+            }
+            Token::SingleQuotedString(s) | Token::EscapedStringLiteral(s) => {
+                format!("'{}'", s.replace('\'', "''"))
+            }
+            Token::EOF | Token::SemiColon => String::new(),
+            other => other.to_string(),
+        })
+        .collect()
+}
+
+/// SQL text as tokens, to splice into a statement.
+fn snippet_tokens(sql: &str) -> Option<Vec<sqlparser::tokenizer::TokenWithSpan>> {
+    use sqlparser::tokenizer::{Token, Tokenizer};
+    let mut tokens = Tokenizer::new(&PostgreSqlDialect {}, sql)
+        .tokenize_with_location()
+        .ok()?;
+    tokens.retain(|t| t.token != Token::EOF);
+    Some(tokens)
+}
+
+/// Statements the parser takes only in part: `ON CONFLICT (expressions)`
+/// ([`CONFLICT_EXPRESSIONS`]).
+fn rewrite_statement_form(
+    mut statement: Vec<sqlparser::tokenizer::TokenWithSpan>,
+) -> Vec<sqlparser::tokenizer::TokenWithSpan> {
+    use sqlparser::tokenizer::{Token, TokenWithSpan};
+    let word = |t: &TokenWithSpan| match &t.token {
+        Token::Word(w) if w.quote_style.is_none() => Some(w.value.clone()),
+        _ => None,
+    };
+    let significant: Vec<usize> = statement
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| {
+            !matches!(
+                t.token,
+                Token::Whitespace(_) | Token::SemiColon | Token::EOF
+            )
+        })
+        .map(|(i, _)| i)
+        .collect();
+    let n = significant.len();
+    let is = |at: usize, w: &str| {
+        significant
+            .get(at)
+            .and_then(|&i| word(&statement[i]))
+            .as_deref()
+            == Some(w)
+    };
+
+    // `ON CONFLICT (expressions)`: a target with a parenthesized part.
+    if let Some(k) = (0..n.saturating_sub(2)).find(|&k| {
+        is(k, "on") && is(k + 1, "conflict") && statement[significant[k + 2]].token == Token::LParen
+    }) {
+        let open = significant[k + 2];
+        let mut depth = 0i32;
+        let mut nested = false;
+        let close = (open..statement.len()).find(|&i| {
+            match statement[i].token {
+                Token::LParen => {
+                    depth += 1;
+                    nested |= depth > 1;
+                }
+                Token::RParen => depth -= 1,
+                _ => {}
+            }
+            depth == 0
+        });
+        if let (Some(close), true) = (close, nested) {
+            let text = render_tokens(&statement[open + 1..close]);
+            let name = format!("{CONFLICT_EXPRESSIONS}{}", text.trim()).replace('"', "\"\"");
+            if let Some(target) = snippet_tokens(&format!("ON CONSTRAINT \"{name}\"")) {
+                statement.splice(open..=close, target);
+            }
+        }
+    }
+    statement
 }
 
 fn rewrite_data_clause(
@@ -873,6 +968,15 @@ mod tests {
         assert_eq!(
             statements[2].to_string(),
             format!("SELECT {REFRESH_FUNCTION}('\"My\".mv', false)")
+        );
+    }
+
+    #[test]
+    fn conflict_expression_targets_parse() {
+        let one = |sql: &str| parse_sql(sql).unwrap()[0].to_string();
+        assert!(
+            one("INSERT INTO t VALUES (1) ON CONFLICT (lower(e)) DO NOTHING")
+                .contains(&format!("ON CONSTRAINT \"{CONFLICT_EXPRESSIONS}lower(e)\""))
         );
     }
 

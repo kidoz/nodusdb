@@ -380,10 +380,14 @@ impl MemExecutor {
                         // `indkey` is the ordered list of 1-based column positions
                         // (attnums), as a real array so `unnest(i.indkey)`
                         // introspection returns one row per indexed column.
+                        // A key part that is an expression is 0.
                         let keys: Vec<Value> = index
                             .key_columns
                             .iter()
                             .filter_map(|key| {
+                                if crate::index_keys::is_expression_key(key) {
+                                    return Some(Value::Int(0));
+                                }
                                 table
                                     .columns
                                     .iter()
@@ -1944,7 +1948,8 @@ impl MemExecutor {
             let relid = Self::table_oid(db_name, &schema_name, &table.name);
             let namespace = Self::schema_oid(db_name, &schema_name);
             for index in &Self::table_indexes(table) {
-                if !index.unique {
+                // An index on expressions is no constraint.
+                if !index.unique || crate::index_keys::has_expressions(index) {
                     continue;
                 }
                 let conname = index.name.clone();
@@ -2385,24 +2390,38 @@ impl MemExecutor {
             else {
                 continue;
             };
-            let keys: Vec<String> = index
-                .key_columns
-                .iter()
-                .filter_map(|key| {
-                    let c = table.columns.iter().find(|c| c.id == key.column_id)?;
-                    Some(format!(
-                        "{}{}",
-                        quote_ident(&c.name),
-                        if key.descending { " DESC" } else { "" }
-                    ))
-                })
-                .collect();
+            let keys = Self::index_key_texts(&table, index);
             if column > 0 {
                 return keys.get(column as usize - 1).cloned();
             }
             return Some(Self::index_text(&table, &schema, index, pretty));
         }
         None
+    }
+
+    /// An index's key parts as `pg_get_indexdef` shows them: a column's
+    /// name or an expression, then `DESC` for a descending one.
+    pub(crate) fn index_key_texts(
+        table: &nodus_catalog::TableDescriptor,
+        index: &nodus_catalog::IndexDescriptor,
+    ) -> Vec<String> {
+        let mut expressions = index.expressions.iter();
+        index
+            .key_columns
+            .iter()
+            .filter_map(|key| {
+                let text = if crate::index_keys::is_expression_key(key) {
+                    crate::index_keys::index_expression_text(&expressions.next()?.sql)
+                } else {
+                    let c = table.columns.iter().find(|c| c.id == key.column_id)?;
+                    quote_ident(&c.name)
+                };
+                Some(format!(
+                    "{text}{}",
+                    if key.descending { " DESC" } else { "" }
+                ))
+            })
+            .collect()
     }
 
     /// A table's indexes as PostgreSQL has them: a composite primary key,
@@ -2433,18 +2452,7 @@ impl MemExecutor {
         index: &nodus_catalog::IndexDescriptor,
         pretty: bool,
     ) -> String {
-        let keys: Vec<String> = index
-            .key_columns
-            .iter()
-            .filter_map(|key| {
-                let c = table.columns.iter().find(|c| c.id == key.column_id)?;
-                Some(format!(
-                    "{}{}",
-                    quote_ident(&c.name),
-                    if key.descending { " DESC" } else { "" }
-                ))
-            })
-            .collect();
+        let keys = Self::index_key_texts(table, index);
         let relation = if pretty && schema == "public" {
             quote_ident(&table.name)
         } else {

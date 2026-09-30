@@ -23,11 +23,12 @@ impl MemExecutor {
         // PRIMARY KEY is stored as one primary index per column).
         let col_names: Vec<String> = tbl.columns.iter().map(|c| c.name.clone()).collect();
         let mut unique_keys = Vec::new();
-        for idx in tbl
-            .indexes
-            .iter()
-            .filter(|idx| idx.unique && idx.index_type != nodus_catalog::IndexType::Primary)
-        {
+        self.check_expression_keys(ctx, tbl, new_row, skip_pk)?;
+        for idx in tbl.indexes.iter().filter(|idx| {
+            idx.unique
+                && idx.index_type != nodus_catalog::IndexType::Primary
+                && !crate::index_keys::has_expressions(idx)
+        }) {
             let positions: Vec<usize> = idx
                 .key_columns
                 .iter()
@@ -195,6 +196,98 @@ impl MemExecutor {
             tbl.id,
             session,
         )?))
+    }
+
+    /// Rejects `new_row` when a unique index on expressions of `tbl` has
+    /// its key for another row (the row at `skip_pk` aside). A key with a
+    /// NULL never collides, and a partial index only constrains the rows
+    /// its predicate holds for.
+    fn check_expression_keys(
+        &self,
+        ctx: &ExecutionContext,
+        tbl: &nodus_catalog::TableDescriptor,
+        new_row: &[Value],
+        skip_pk: Option<&str>,
+    ) -> Result<()> {
+        let col_names: Vec<String> = tbl.columns.iter().map(|c| c.name.clone()).collect();
+        for idx in tbl
+            .indexes
+            .iter()
+            .filter(|i| i.unique && crate::index_keys::has_expressions(i))
+        {
+            let predicate = match &idx.predicate {
+                Some(p) => Some(self.index_predicate(&p.sql)?),
+                None => None,
+            };
+            let holds = |row: &[Value]| {
+                predicate.as_ref().is_none_or(|filter| {
+                    self.eval_filter(ctx, row, &col_names, &tbl.columns, Some(filter)) == Some(true)
+                })
+            };
+            if !holds(new_row) {
+                continue;
+            }
+            let found = self.expression_key_matches(&ctx.session_id, tbl, idx, new_row)?;
+            if found
+                .iter()
+                .any(|(pk, existing)| Some(pk.as_str()) != skip_pk && holds(existing))
+            {
+                let parts = crate::index_keys::index_parts(tbl, idx);
+                let values: Vec<String> = crate::index_keys::key_values(tbl, &parts, new_row)
+                    .iter()
+                    .map(render)
+                    .collect();
+                return Err(DbError::new(format!(
+                    "duplicate key value violates unique constraint \"{}\"",
+                    idx.name
+                ))
+                .detail(format!(
+                    "Key ({})=({}) already exists.",
+                    crate::index_keys::key_names(tbl, &parts).join(", "),
+                    values.join(", ")
+                ))
+                .schema(self.schema_name_of(tbl))
+                .table(&tbl.name)
+                .constraint(&idx.name)
+                .into());
+            }
+        }
+        Ok(())
+    }
+
+    /// The rows of `tbl` (by stored key) whose key in `idx`, an index on
+    /// expressions, is `row`'s; none when `row`'s has a NULL.
+    pub(crate) fn expression_key_matches(
+        &self,
+        session: &str,
+        tbl: &nodus_catalog::TableDescriptor,
+        idx: &nodus_catalog::IndexDescriptor,
+        row: &[Value],
+    ) -> Result<Vec<(String, Vec<Value>)>> {
+        let parts = crate::index_keys::index_parts(tbl, idx);
+        let key = crate::index_keys::key_values(tbl, &parts, row);
+        if key.is_empty() || key.iter().any(|v| matches!(v, Value::Null)) {
+            return Ok(Vec::new());
+        }
+        // A float's text does not decide equality (`-0` is `0`).
+        let candidates = if matches!(key[0], Value::Float(_)) {
+            let prefix = format!("{}:", tbl.id);
+            self.scan_rows_keyed(tbl.id, session)?
+                .into_iter()
+                .map(|(k, r)| (k.strip_prefix(&prefix).unwrap_or(&k).to_string(), r))
+                .collect()
+        } else {
+            self.index_rows(idx.id, &key[0], tbl.id, session)?
+        };
+        Ok(candidates
+            .into_iter()
+            .filter(|(_, existing)| {
+                crate::index_keys::key_values(tbl, &parts, existing)
+                    .iter()
+                    .zip(&key)
+                    .all(|(a, b)| values_equal(a, b))
+            })
+            .collect())
     }
 
     /// A partial index's predicate, as a condition over the table's rows.

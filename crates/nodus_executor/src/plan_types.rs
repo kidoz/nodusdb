@@ -1145,6 +1145,14 @@ pub enum LogicalPlan {
         /// decode.
         #[serde(default)]
         predicate: Option<String>,
+        /// Parallel to `columns`: the SQL of each key part that is an
+        /// expression (whose `columns` entry is what the index's default
+        /// name calls it).
+        #[serde(default)]
+        expressions: Vec<Option<String>>,
+        /// Parallel to `columns`: whether each key part sorts descending.
+        #[serde(default)]
+        descending: Vec<bool>,
     },
     DropIndex {
         name: String,

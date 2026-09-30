@@ -140,6 +140,8 @@ fn test_ddl_and_subqueries() {
             unique: false,
             if_not_exists: false,
             predicate: None,
+            expressions: vec![],
+            descending: vec![],
         },
     )
     .unwrap();
@@ -499,6 +501,8 @@ fn test_secondary_indexing() {
             unique: false,
             if_not_exists: false,
             predicate: None,
+            expressions: vec![],
+            descending: vec![],
         },
     )
     .unwrap();
@@ -775,6 +779,8 @@ fn test_index_value_containing_separator_does_not_overmatch() {
             unique: false,
             if_not_exists: false,
             predicate: None,
+            expressions: vec![],
+            descending: vec![],
         },
     )
     .unwrap();

@@ -914,7 +914,7 @@ impl MemExecutor {
         ctx: &ExecutionContext,
         name: String,
         table_name: String,
-        columns: Vec<String>,
+        (columns, expressions, descending): (Vec<String>, Vec<Option<String>>, Vec<bool>),
         (unique, predicate): (bool, Option<String>),
         if_not_exists: bool,
     ) -> Result<QueryOutput> {
@@ -940,7 +940,37 @@ impl MemExecutor {
         } else {
             nodus_catalog::IndexType::LocalSecondary
         };
-        let index = Self::new_index(&tbl, name, index_type, &columns, predicate)?;
+        // Key parts that are expressions have no column; the rest are
+        // looked up by name.
+        let plain: Vec<String> = columns
+            .iter()
+            .zip(expressions.iter().chain(std::iter::repeat(&None)))
+            .filter(|(_, e)| e.is_none())
+            .map(|(c, _)| c.clone())
+            .collect();
+        let mut index = Self::new_index(&tbl, name, index_type, &plain, predicate)?;
+        if expressions.iter().any(Option::is_some) {
+            let mut plain_keys = index.key_columns.into_iter();
+            index.key_columns = expressions
+                .iter()
+                .map(|e| match e {
+                    Some(_) => Some(nodus_catalog::IndexColumn {
+                        column_id: crate::index_keys::EXPRESSION_KEY,
+                        descending: false,
+                    }),
+                    None => plain_keys.next(),
+                })
+                .collect::<Option<Vec<_>>>()
+                .unwrap_or_default();
+            index.expressions = expressions
+                .iter()
+                .flatten()
+                .map(|sql| nodus_catalog::Expression { sql: sql.clone() })
+                .collect();
+        }
+        for (key, descending) in index.key_columns.iter_mut().zip(&descending) {
+            key.descending = *descending;
+        }
         self.add_index(ctx, &tbl, index)?;
         Ok(QueryOutput::tag("CREATE INDEX"))
     }
@@ -994,13 +1024,8 @@ impl MemExecutor {
         index: nodus_catalog::IndexDescriptor,
     ) -> Result<()> {
         if index.unique {
-            let positions: Vec<usize> = index
-                .key_columns
-                .iter()
-                .filter_map(|k| tbl.columns.iter().position(|c| c.id == k.column_id))
-                .collect();
             let predicate = index.predicate.as_ref().map(|p| p.sql.as_str());
-            self.check_unique_key(ctx, tbl, &index.name, &positions, predicate)?;
+            self.check_unique_key(ctx, tbl, &index, predicate)?;
         }
         self.install_index(ctx, tbl, index)
     }
@@ -1012,15 +1037,16 @@ impl MemExecutor {
         &self,
         ctx: &ExecutionContext,
         tbl: &nodus_catalog::TableDescriptor,
-        name: &str,
-        positions: &[usize],
+        index: &nodus_catalog::IndexDescriptor,
         predicate: Option<&str>,
     ) -> Result<()> {
+        let name = &index.name;
         let predicate = match predicate {
             Some(sql) => Some(self.index_predicate(sql)?),
             None => None,
         };
         let names: Vec<String> = tbl.columns.iter().map(|c| c.name.clone()).collect();
+        let parts = crate::index_keys::index_parts(tbl, index);
         let mut seen = std::collections::HashSet::new();
         for row in self.scan_rows(tbl.id, &ctx.session_id)? {
             if let Some(filter) = &predicate
@@ -1028,18 +1054,16 @@ impl MemExecutor {
             {
                 continue;
             }
-            let Some(key) = crate::constraints::key_tuple(&row, positions) else {
+            let key = crate::index_keys::key_values(tbl, &parts, &row);
+            if key.iter().any(|v| matches!(v, Value::Null)) {
                 continue;
-            };
+            }
             let rendered: Vec<String> = key
                 .iter()
                 .map(|v| render(&crate::value::key_form(v)))
                 .collect();
             if !seen.insert(rendered.join("\u{1}")) {
-                let columns: Vec<&str> = positions
-                    .iter()
-                    .map(|&p| tbl.columns[p].name.as_str())
-                    .collect();
+                let columns = crate::index_keys::key_names(tbl, &parts);
                 let values: Vec<String> = key.iter().map(render).collect();
                 return Err(
                     DbError::new(format!("could not create unique index \"{name}\""))
@@ -1066,7 +1090,6 @@ impl MemExecutor {
         tbl: &nodus_catalog::TableDescriptor,
         index: nodus_catalog::IndexDescriptor,
     ) -> Result<()> {
-        let leading = Self::index_leading_position(tbl, &index);
         self.catalog_writer.update_table_descriptor(
             nodus_catalog::TableDescriptorChange::AddIndex {
                 table_id: tbl.id,
@@ -1076,9 +1099,8 @@ impl MemExecutor {
         let prefix = format!("{}:", tbl.id);
         for (key, row) in self.scan_rows_keyed(tbl.id, &ctx.session_id)? {
             let pk = key.strip_prefix(&prefix).unwrap_or(&key);
-            if let Some(pos) = leading {
-                let value = row.get(pos).unwrap_or(&Value::Null);
-                self.write_index_entry(&ctx.session_id, index.id, value, pk)?;
+            if let Some(value) = Self::index_leading_value(tbl, &index, &row) {
+                self.write_index_entry(&ctx.session_id, index.id, &value, pk)?;
             }
         }
         self.catalog_writer.update_index_state(

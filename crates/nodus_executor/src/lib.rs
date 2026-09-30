@@ -33,6 +33,7 @@ mod execute;
 mod explain;
 pub(crate) mod filter_eval;
 mod functions;
+mod index_keys;
 mod information_schema;
 mod json_text;
 mod merge;
@@ -1450,5 +1451,7 @@ mod sql_feature_tests;
 mod streaming_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod user_object_tests;
 #[cfg(test)]
 mod utility_tests;

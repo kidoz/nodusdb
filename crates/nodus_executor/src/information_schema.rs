@@ -304,7 +304,7 @@ impl MemExecutor {
         for table in tables {
             let schema_name = Self::schema_name_by_id(db_name, schemas, table.schema_id);
             for index in &Self::table_indexes(table) {
-                if index.unique {
+                if index.unique && !crate::index_keys::has_expressions(index) {
                     rows.push(vec![
                         Value::Text(db_name.into()),
                         Value::Text(schema_name.clone()),
@@ -376,7 +376,7 @@ impl MemExecutor {
         for table in tables {
             let schema_name = Self::schema_name_by_id(db_name, schemas, table.schema_id);
             for index in &Self::table_indexes(table) {
-                if !index.unique {
+                if !index.unique || crate::index_keys::has_expressions(index) {
                     continue;
                 }
                 for (idx, key) in index.key_columns.iter().enumerate() {
@@ -460,7 +460,10 @@ impl MemExecutor {
                     format!("{}_{}_not_null", table.name, column.name),
                 );
             }
-            for index in Self::table_indexes(table).iter().filter(|i| i.unique) {
+            for index in Self::table_indexes(table)
+                .iter()
+                .filter(|i| i.unique && !crate::index_keys::has_expressions(i))
+            {
                 for key in &index.key_columns {
                     if let Some(column) = table.columns.iter().find(|c| c.id == key.column_id) {
                         usage(&table.name, &column.name, index.name.clone());

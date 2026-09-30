@@ -407,17 +407,42 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                 .as_ref()
                 .map(|n| n.to_string())
                 .unwrap_or_default();
-            // An index over an expression would index nothing; reject it
-            // rather than create one that enforces or finds nothing.
-            let cols = create_index
+            // Each key part is a column, or an expression (named, for the
+            // index's default name, as PostgreSQL names it).
+            let mut cols = Vec::new();
+            let mut expressions = Vec::new();
+            for c in &create_index.columns {
+                let mut expr = &c.column.expr;
+                while let Expr::Nested(inner) = expr {
+                    expr = inner;
+                }
+                match expr {
+                    Expr::Identifier(id) => {
+                        cols.push(id.value.clone());
+                        expressions.push(None);
+                    }
+                    _ => {
+                        lower_scalar(&c.column.expr, params).ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "index expressions are not supported: {}",
+                                c.column.expr
+                            )
+                        })?;
+                        cols.push(crate::index_keys::expression_label(&c.column.expr));
+                        expressions.push(Some(c.column.expr.to_string()));
+                    }
+                }
+            }
+            let descending = create_index
                 .columns
                 .iter()
                 .map(|c| {
-                    extract_col_name(&c.column.expr).ok_or_else(|| {
-                        anyhow::anyhow!("index expressions are not supported: {}", c.column.expr)
-                    })
+                    matches!(
+                        c.column.options.sort,
+                        Some(sqlparser::ast::OrderBySort::Desc)
+                    )
                 })
-                .collect::<Result<Vec<_>>>()?;
+                .collect();
             let predicate = match &create_index.predicate {
                 Some(condition) => {
                     parse_filter_expr(condition, params)?;
@@ -432,6 +457,8 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                 unique: create_index.unique,
                 if_not_exists: create_index.if_not_exists,
                 predicate,
+                expressions,
+                descending,
             })
         }
         Statement::CreateRole(create_role) => {

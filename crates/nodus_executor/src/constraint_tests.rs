@@ -8,7 +8,7 @@ use nodus_audit::MemoryAuditSink;
 
 /// A superuser session: a function running one statement, and one taking
 /// the notices raised since it was last called.
-fn session() -> (
+pub(crate) fn session() -> (
     impl Fn(&str) -> Result<QueryOutput>,
     impl Fn() -> Vec<String>,
 ) {
@@ -52,7 +52,7 @@ fn session() -> (
 }
 
 /// An error's message and its fields, as the wire layer splits them.
-fn fields(error: anyhow::Error) -> (String, Vec<(String, String)>) {
+pub(crate) fn fields(error: anyhow::Error) -> (String, Vec<(String, String)>) {
     let text = error.to_string();
     (
         error_message(&text).to_string(),
@@ -63,7 +63,7 @@ fn fields(error: anyhow::Error) -> (String, Vec<(String, String)>) {
     )
 }
 
-fn field(pairs: &[(String, String)], name: &str) -> Option<String> {
+pub(crate) fn field(pairs: &[(String, String)], name: &str) -> Option<String> {
     pairs
         .iter()
         .find(|(k, _)| k == name)
@@ -343,10 +343,11 @@ fn unique_indexes_check_what_they_constrain() {
         !rows(&sql("SELECT indexname FROM pg_indexes WHERE tablename = 't'").unwrap())
             .contains(&"t_a".to_string())
     );
-    let err = sql("CREATE INDEX ON t (lower(b::text))").unwrap_err();
+    // An index on an expression is named after its function.
+    sql("CREATE INDEX ON t (lower(b::text))").unwrap();
     assert!(
-        err.to_string()
-            .starts_with("index expressions are not supported")
+        rows(&sql("SELECT indexname FROM pg_indexes WHERE tablename = 't'").unwrap())
+            .contains(&"t_lower_idx".to_string())
     );
 
     // A table without a primary key holds duplicate rows whatever its indexes.

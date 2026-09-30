@@ -481,6 +481,11 @@ impl MemExecutor {
                         self.delete_index_entry(&ctx.session_id, index.id, value, pk)?;
                     }
                 }
+                if crate::index_keys::has_expressions(index)
+                    && let Some(value) = Self::index_leading_value(tbl, index, row)
+                {
+                    self.delete_index_entry(&ctx.session_id, index.id, &value, pk)?;
+                }
             }
         }
         self.change(TableDescriptorChange::DropIndex {
@@ -519,10 +524,9 @@ impl MemExecutor {
                 crate::value::encode_row(&row)?,
             )?;
             for index in &tbl.indexes {
-                if let Some(p) = Self::index_leading_position(tbl, index) {
-                    let value = row.get(p).unwrap_or(&Value::Null);
-                    self.delete_index_entry(&ctx.session_id, index.id, value, &old_pk)?;
-                    self.write_index_entry(&ctx.session_id, index.id, value, &new_pk)?;
+                if let Some(value) = Self::index_leading_value(tbl, index, &row) {
+                    self.delete_index_entry(&ctx.session_id, index.id, &value, &old_pk)?;
+                    self.write_index_entry(&ctx.session_id, index.id, &value, &new_pk)?;
                 }
             }
         }
@@ -840,7 +844,8 @@ impl MemExecutor {
                         return Err(self.contains_nulls(tbl, &tbl.columns[p].name));
                     }
                 }
-                self.check_unique_key(ctx, tbl, &name, &positions, None)?;
+                let key = Self::new_index(tbl, name.clone(), IndexType::Unique, &columns, None)?;
+                self.check_unique_key(ctx, tbl, &key, None)?;
                 for &p in &positions {
                     if tbl.columns[p].nullable {
                         let mut column = tbl.columns[p].clone();

@@ -639,9 +639,8 @@ impl MemExecutor {
 
             // Maintain secondary indexes.
             for idx in &tbl.indexes {
-                if let Some(pos) = Self::index_leading_position(&tbl, idx) {
-                    let index_val = row.get(pos).unwrap_or(&Value::Null);
-                    self.write_index_entry(&ctx.session_id, idx.id, index_val, &pk)?;
+                if let Some(index_val) = Self::index_leading_value(&tbl, idx, &row) {
+                    self.write_index_entry(&ctx.session_id, idx.id, &index_val, &pk)?;
                 }
             }
 
@@ -1004,6 +1003,11 @@ impl MemExecutor {
                     self.delete_index_entry(&ctx.session_id, idx.id, index_val, &pk_str)?;
                 }
             }
+            if crate::index_keys::has_expressions(idx)
+                && let Some(value) = Self::index_leading_value(tbl, idx, row)
+            {
+                self.delete_index_entry(&ctx.session_id, idx.id, &value, &pk_str)?;
+            }
         }
         Ok(())
     }
@@ -1147,13 +1151,13 @@ impl MemExecutor {
             self.delete_row(&ctx.session_id, old_key.to_string())?;
         }
         for idx in &tbl.indexes {
-            if let Some(pos) = Self::index_leading_position(tbl, idx) {
-                let old_val = old_row.get(pos).unwrap_or(&Value::Null);
-                let new_val = row.get(pos).unwrap_or(&Value::Null);
-                if old_val != new_val || old_pk != pk {
-                    self.delete_index_entry(&ctx.session_id, idx.id, old_val, &old_pk)?;
-                    self.write_index_entry(&ctx.session_id, idx.id, new_val, &pk)?;
-                }
+            if let (Some(old_val), Some(new_val)) = (
+                Self::index_leading_value(tbl, idx, old_row),
+                Self::index_leading_value(tbl, idx, row),
+            ) && (old_val != new_val || old_pk != pk)
+            {
+                self.delete_index_entry(&ctx.session_id, idx.id, &old_val, &old_pk)?;
+                self.write_index_entry(&ctx.session_id, idx.id, &new_val, &pk)?;
             }
         }
         Ok(new_key)
@@ -1189,8 +1193,16 @@ impl MemExecutor {
         if let Some(primary) = primary {
             keys.push((primary.name.as_str(), Self::pk_positions(tbl)));
         }
+        let mut expression_keys: Vec<&nodus_catalog::IndexDescriptor> = tbl
+            .indexes
+            .iter()
+            .filter(|i| i.unique && crate::index_keys::has_expressions(i))
+            .collect();
         for idx in &tbl.indexes {
-            if idx.unique && idx.index_type != nodus_catalog::IndexType::Primary {
+            if idx.unique
+                && idx.index_type != nodus_catalog::IndexType::Primary
+                && !crate::index_keys::has_expressions(idx)
+            {
                 let positions = idx
                     .key_columns
                     .iter()
@@ -1201,6 +1213,20 @@ impl MemExecutor {
         }
         match target {
             None => {}
+            Some(ConflictTarget::Constraint(name))
+                if name.starts_with(nodus_sql::CONFLICT_EXPRESSIONS) =>
+            {
+                let wanted =
+                    crate::index_keys::key_list(&name[nodus_sql::CONFLICT_EXPRESSIONS.len()..]);
+                keys.clear();
+                expression_keys.retain(|i| crate::index_keys::index_key_list(tbl, i) == wanted);
+            }
+            Some(_) => expression_keys.clear(),
+        }
+        match target {
+            None => {}
+            Some(ConflictTarget::Constraint(name))
+                if name.starts_with(nodus_sql::CONFLICT_EXPRESSIONS) => {}
             Some(ConflictTarget::Columns(cols)) => {
                 let mut wanted = cols
                     .iter()
@@ -1215,10 +1241,19 @@ impl MemExecutor {
             }
             Some(ConflictTarget::Constraint(name)) => keys.retain(|(n, _)| n == name),
         }
-        if target.is_some() && keys.is_empty() {
+        if target.is_some() && keys.is_empty() && expression_keys.is_empty() {
             anyhow::bail!(
                 "there is no unique or exclusion constraint matching the ON CONFLICT specification"
             );
+        }
+        for idx in expression_keys {
+            if let Some((pk, existing)) = self
+                .expression_key_matches(session, tbl, idx, row)?
+                .into_iter()
+                .next()
+            {
+                return Ok(Some((format!("{}:{pk}", tbl.id), existing)));
+            }
         }
         let proposed: Vec<Option<Vec<Value>>> = keys
             .iter()

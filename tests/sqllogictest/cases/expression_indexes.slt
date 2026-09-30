@@ -1,0 +1,113 @@
+# Indexes on expressions: kept for each row's computed key, unique over it (NULL keys aside), usable as an ON CONFLICT target, and shown by pg_get_indexdef.
+statement ok
+CREATE TABLE users (id int PRIMARY KEY, email text, first text, last text);
+
+statement ok
+CREATE UNIQUE INDEX users_email_lower ON users (lower(email));
+
+statement ok
+INSERT INTO users VALUES (1, 'A@x.com', 'Ann', 'Lee');
+
+statement error
+INSERT INTO users VALUES (2, 'a@X.com', 'Bob', 'Kim');
+
+statement ok
+INSERT INTO users VALUES (3, 'b@x.com', 'Cid', 'Lee');
+
+statement error
+UPDATE users SET email = 'B@X.COM' WHERE id = 1;
+
+statement ok
+UPDATE users SET email = 'c@x.com' WHERE id = 1;
+
+statement ok
+INSERT INTO users VALUES (4, 'a@x.com', 'Dee', 'Lee');
+
+statement ok
+CREATE INDEX users_name ON users ((first || ' ' || last), id);
+
+statement ok
+CREATE INDEX users_upper ON users (upper(last) DESC);
+
+statement ok
+CREATE INDEX ON users (lower(first));
+
+query TT
+SELECT indexname, indexdef FROM pg_indexes WHERE tablename = 'users' ORDER BY 1;
+----
+users_email_lower	CREATE UNIQUE INDEX users_email_lower ON public.users USING btree (lower(email))
+users_lower_idx	CREATE INDEX users_lower_idx ON public.users USING btree (lower(first))
+users_name	CREATE INDEX users_name ON public.users USING btree ((((first || ' '::text) || last)), id)
+users_pkey	CREATE UNIQUE INDEX users_pkey ON public.users USING btree (id)
+users_upper	CREATE INDEX users_upper ON public.users USING btree (upper(last) DESC)
+
+query T
+SELECT pg_get_indexdef('users_email_lower'::regclass);
+----
+CREATE UNIQUE INDEX users_email_lower ON public.users USING btree (lower(email))
+
+query T
+SELECT id FROM users WHERE lower(email) = 'a@x.com';
+----
+4
+
+query T
+INSERT INTO users VALUES (5, 'C@X.com', 'Eve', 'Ng') ON CONFLICT (lower(email)) DO NOTHING RETURNING id;
+----
+
+query TTTT
+INSERT INTO users VALUES (5, 'C@X.com', 'Eve', 'Ng') ON CONFLICT (lower(email)) DO UPDATE SET first = excluded.first RETURNING *;
+----
+1	c@x.com	Eve	Lee
+
+statement error
+INSERT INTO users VALUES (5, 'x', 'y', 'z') ON CONFLICT (upper(email)) DO NOTHING;
+
+statement error
+CREATE UNIQUE INDEX users_last ON users (lower(last));
+
+statement ok
+INSERT INTO users VALUES (6, NULL, 'F', 'G'), (7, NULL, 'H', 'I');
+
+statement ok
+DELETE FROM users WHERE id = 3;
+
+statement ok
+INSERT INTO users VALUES (8, 'b@x.com', 'J', 'K');
+
+statement error
+INSERT INTO users VALUES (9, 'B@x.com', 'L', 'M');
+
+statement ok
+DROP INDEX users_email_lower;
+
+statement ok
+INSERT INTO users VALUES (9, 'b@X.com', 'L', 'M');
+
+query T
+SELECT count(*) FROM users;
+----
+6
+
+query T
+SELECT conname FROM pg_constraint WHERE conrelid = 'users'::regclass ORDER BY 1;
+----
+users_id_not_null
+users_pkey
+
+statement ok
+CREATE UNIQUE INDEX users_pair ON users (lower(first), id);
+
+statement ok
+INSERT INTO users VALUES (10, 'q@x.com', 'ann', 'Q');
+
+query TT
+SELECT id, email FROM users ORDER BY id;
+----
+1	c@x.com
+4	a@x.com
+6	NULL
+7	NULL
+8	b@x.com
+9	b@X.com
+10	q@x.com
