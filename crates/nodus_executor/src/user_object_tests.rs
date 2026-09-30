@@ -1,5 +1,5 @@
-//! Enums, domains, indexes on expressions, and updatable views, driven
-//! through SQL.
+//! Enums, domains, indexes on expressions, updatable views, and cursors,
+//! driven through SQL.
 
 use crate::constraint_tests::{field, fields, session};
 use crate::dml_join_tests::rows;
@@ -158,4 +158,29 @@ fn simple_views_write_their_table_within_their_condition() {
         field(&f, "detail").as_deref(),
         Some("Views that return aggregate functions are not automatically updatable.")
     );
+}
+
+#[test]
+fn cursors_fetch_from_their_position() {
+    let (sql, _) = session();
+    sql("CREATE TABLE c (id int PRIMARY KEY)").unwrap();
+    sql("INSERT INTO c SELECT g FROM generate_series(1, 5) g").unwrap();
+    assert!(sql("DECLARE k CURSOR FOR SELECT id FROM c").is_err());
+    sql("BEGIN").unwrap();
+    sql("DECLARE k SCROLL CURSOR FOR SELECT id FROM c ORDER BY id").unwrap();
+    let out = sql("FETCH 2 FROM k").unwrap();
+    assert_eq!(
+        (rows(&out), out.tag.as_str()),
+        (vec!["1".into(), "2".into()], "FETCH 2")
+    );
+    assert_eq!(sql("MOVE LAST IN k").unwrap().tag, "MOVE 1");
+    assert_eq!(rows(&sql("FETCH PRIOR FROM k").unwrap()), ["4"]);
+    assert_eq!(rows(&sql("FETCH RELATIVE -2 FROM k").unwrap()), ["2"]);
+    sql("DECLARE h CURSOR WITH HOLD FOR SELECT id FROM c WHERE id > 3 ORDER BY id").unwrap();
+    sql("COMMIT").unwrap();
+    // Only the held cursor outlives the transaction.
+    assert!(sql("FETCH k").is_err());
+    assert_eq!(rows(&sql("FETCH ALL FROM h").unwrap()), ["4", "5"]);
+    assert_eq!(sql("CLOSE h").unwrap().tag, "CLOSE CURSOR");
+    assert!(sql("CLOSE h").is_err());
 }

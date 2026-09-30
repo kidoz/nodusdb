@@ -330,6 +330,11 @@ pub const ALTER_SEQUENCE_FUNCTION: &str = "pg_catalog.nodus_alter_sequence";
 /// `PREPARE TRANSACTION`.
 pub const UTILITY_FUNCTION: &str = "pg_catalog.nodus_utility";
 
+/// The function call `FETCH` and `MOVE` are written as — `SELECT
+/// pg_catalog.nodus_cursor('FETCH', 'relative -2', 'c')`, with the
+/// direction's words — since the parser takes them only in part.
+pub const CURSOR_FUNCTION: &str = "pg_catalog.nodus_cursor";
+
 /// The function call `ALTER DOMAIN` and `DROP DOMAIN` are written as —
 /// `SELECT pg_catalog.nodus_domain('ALTER DOMAIN d SET NOT NULL')`, with
 /// the statement's text — since the parser has no such statements.
@@ -396,11 +401,11 @@ fn snippet_tokens(sql: &str) -> Option<Vec<sqlparser::tokenizer::TokenWithSpan>>
     Some(tokens)
 }
 
-/// Statements the parser lacks or takes only in part: `ALTER DOMAIN` and
-/// `DROP DOMAIN` ([`DOMAIN_FUNCTION`]), a domain's `NOT NULL`
-/// ([`DOMAIN_NOT_NULL`]), a view's `WITH [CASCADED | LOCAL] CHECK OPTION`
-/// (its `check_option`), and `ON CONFLICT (expressions)`
-/// ([`CONFLICT_EXPRESSIONS`]).
+/// Statements the parser lacks or takes only in part: `FETCH` and `MOVE`
+/// ([`CURSOR_FUNCTION`]), `ALTER DOMAIN` and `DROP DOMAIN`
+/// ([`DOMAIN_FUNCTION`]), a domain's `NOT NULL` ([`DOMAIN_NOT_NULL`]), a
+/// view's `WITH [CASCADED | LOCAL] CHECK OPTION` (its `check_option`), and
+/// `ON CONFLICT (expressions)` ([`CONFLICT_EXPRESSIONS`]).
 fn rewrite_statement_form(
     mut statement: Vec<sqlparser::tokenizer::TokenWithSpan>,
 ) -> Vec<sqlparser::tokenizer::TokenWithSpan> {
@@ -436,6 +441,33 @@ fn rewrite_statement_form(
             .collect()
     };
     let quote = |s: &str| s.replace('\'', "''");
+
+    if (is(0, "fetch") || is(0, "move")) && n >= 2 {
+        let name = match &statement[significant[n - 1]].token {
+            Token::Word(w) => w.value.clone(),
+            other => other.to_string(),
+        };
+        let direction_end = if n >= 3 && (is(n - 2, "from") || is(n - 2, "in")) {
+            n - 2
+        } else {
+            n - 1
+        };
+        let direction: Vec<String> = significant[1..direction_end]
+            .iter()
+            .map(|&i| render_tokens(&statement[i..=i]))
+            .collect();
+        let command = if is(0, "move") { "MOVE" } else { "FETCH" };
+        let sql = format!(
+            "SELECT {CURSOR_FUNCTION}('{command}', '{}', '{}')",
+            quote(&direction.join(" ")),
+            quote(&name)
+        );
+        if let Some(mut tokens) = snippet_tokens(&sql) {
+            tokens.extend(tail(&statement));
+            return tokens;
+        }
+        return statement;
+    }
 
     if (is(0, "alter") || is(0, "drop")) && is(1, "domain") {
         let (Some(&first), Some(&last)) = (significant.first(), significant.last()) else {
@@ -1114,8 +1146,16 @@ mod tests {
     }
 
     #[test]
-    fn domain_view_and_conflict_forms_parse() {
+    fn cursor_domain_view_and_conflict_forms_parse() {
         let one = |sql: &str| parse_sql(sql).unwrap()[0].to_string();
+        assert_eq!(
+            one("FETCH RELATIVE -2 FROM c"),
+            format!("SELECT {CURSOR_FUNCTION}('FETCH', 'relative - 2', 'c')")
+        );
+        assert_eq!(
+            one("MOVE c"),
+            format!("SELECT {CURSOR_FUNCTION}('MOVE', '', 'c')")
+        );
         let domain = format!(
             "{:?}",
             parse_sql("ALTER DOMAIN d ADD CHECK (VALUE <> 'it''s')").unwrap()

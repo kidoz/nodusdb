@@ -761,6 +761,23 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                 _ => anyhow::bail!("malformed domain statement"),
             }
         }
+        Statement::Query(query) if rewritten_call(query, nodus_sql::CURSOR_FUNCTION).is_some() => {
+            let args = rewritten_call(query, nodus_sql::CURSOR_FUNCTION)
+                .expect("guarded by the match arm");
+            let [
+                crate::Value::Text(command),
+                crate::Value::Text(direction),
+                crate::Value::Text(name),
+            ] = args.as_slice()
+            else {
+                anyhow::bail!("malformed FETCH");
+            };
+            Ok(LogicalPlan::FetchCursor {
+                name: name.clone(),
+                direction: crate::cursors::FetchDirection::parse(direction)?,
+                move_only: command == "MOVE",
+            })
+        }
         Statement::Query(query) if refresh_target(query).is_some() => {
             let (name, with_data) = refresh_target(query).expect("guarded by the match arm");
             Ok(LogicalPlan::RefreshMaterializedView { name, with_data })
@@ -1072,6 +1089,32 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                 domain: false,
             })
         }
+        Statement::Declare { stmts } => {
+            let [declare] = stmts.as_slice() else {
+                anyhow::bail!("DECLARE of several cursors is not supported");
+            };
+            let (Some(sqlparser::ast::DeclareType::Cursor), Some(query), [name]) = (
+                &declare.declare_type,
+                &declare.for_query,
+                declare.names.as_slice(),
+            ) else {
+                anyhow::bail!("DECLARE of a variable is not supported");
+            };
+            Ok(LogicalPlan::DeclareCursor {
+                name: name.value.clone(),
+                query: Box::new(plan_query(query, params)?),
+                scroll: declare.scroll,
+                hold: declare.hold == Some(true),
+                binary: declare.binary == Some(true),
+                statement: format!("{stmt};"),
+            })
+        }
+        Statement::Close { cursor } => Ok(LogicalPlan::CloseCursor {
+            name: match cursor {
+                sqlparser::ast::CloseCursor::All => None,
+                sqlparser::ast::CloseCursor::Specific { name } => Some(name.value.clone()),
+            },
+        }),
         Statement::Lock(lock) => Ok(LogicalPlan::LockTable {
             tables: lock.tables.iter().map(|t| t.name.to_string()).collect(),
         }),

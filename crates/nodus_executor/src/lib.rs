@@ -23,6 +23,7 @@ mod bits;
 pub mod bytea;
 mod constraints;
 mod cte_scope;
+mod cursors;
 mod datetime;
 mod datetime_format;
 mod ddl;
@@ -65,6 +66,7 @@ mod user_types;
 mod value;
 mod view_helpers;
 mod windows;
+pub use cursors::FetchDirection;
 pub use error_fields::{error_fields, error_message};
 pub use explain::ExplainOptions;
 pub use json_text::{json_text, jsonb_text};
@@ -384,6 +386,8 @@ pub struct MemExecutor {
     /// Per session, the statements SQL `PREPARE` named.
     pub(crate) prepared:
         parking_lot::Mutex<HashMap<String, std::collections::BTreeMap<String, PreparedStatement>>>,
+    /// Per session, its open cursors. See [`crate::cursors`].
+    pub(crate) cursors: parking_lot::Mutex<HashMap<String, cursors::Cursors>>,
     /// The node's advisory locks.
     pub(crate) advisory: Arc<advisory::AdvisoryLocks>,
     /// Per session, the channels it listens on (`LISTEN`).
@@ -455,6 +459,7 @@ impl MemExecutor {
             parameter_changes: parking_lot::Mutex::new(HashMap::new()),
             temp_relations: parking_lot::Mutex::new(HashMap::new()),
             prepared: parking_lot::Mutex::new(HashMap::new()),
+            cursors: parking_lot::Mutex::new(HashMap::new()),
             advisory: Arc::new(advisory::AdvisoryLocks::default()),
             listeners: parking_lot::RwLock::new(HashMap::new()),
             notifications: parking_lot::Mutex::new(HashMap::new()),
@@ -488,6 +493,7 @@ impl MemExecutor {
     /// channels, and advisory locks.
     pub(crate) fn discard_session_state(&self, session_id: &str) {
         self.prepared.lock().remove(session_id);
+        self.cursors.lock().remove(session_id);
         self.listeners.write().remove(session_id);
         self.advisory.unlock_all(session_id);
     }

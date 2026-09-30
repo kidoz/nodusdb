@@ -1403,6 +1403,26 @@ pub enum LogicalPlan {
         cascade: bool,
         domain: bool,
     },
+    /// `DECLARE name [BINARY] [[NO] SCROLL] CURSOR [WITH HOLD] FOR query`;
+    /// `statement` is its text, as `pg_cursors` shows it.
+    DeclareCursor {
+        name: String,
+        query: Box<LogicalPlan>,
+        scroll: Option<bool>,
+        hold: bool,
+        binary: bool,
+        statement: String,
+    },
+    /// `FETCH direction FROM name`, or `MOVE` with `move_only`.
+    FetchCursor {
+        name: String,
+        direction: crate::cursors::FetchDirection,
+        move_only: bool,
+    },
+    /// `CLOSE name`, or `CLOSE ALL` without one.
+    CloseCursor {
+        name: Option<String>,
+    },
     /// `LOCK [TABLE] names [IN mode MODE] [NOWAIT]`.
     LockTable {
         tables: Vec<String>,

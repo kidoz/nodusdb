@@ -294,7 +294,7 @@ pub(crate) fn row_response_command(tag: &str) -> String {
         .trim_end_matches(|c: char| c.is_ascii_digit())
         .trim_end();
     match command.split_whitespace().next() {
-        Some("INSERT" | "UPDATE" | "DELETE" | "MERGE") => command.to_string(),
+        Some("INSERT" | "UPDATE" | "DELETE" | "MERGE" | "FETCH") => command.to_string(),
         _ => "SELECT".to_string(),
     }
 }

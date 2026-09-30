@@ -354,6 +354,20 @@ impl MemExecutor {
                 local,
             } => self.exec_set_variable(ctx, variable, value, local),
             LogicalPlan::Noop { tag } => Ok(QueryOutput::tag(&tag)),
+            LogicalPlan::DeclareCursor {
+                name,
+                query,
+                scroll,
+                hold,
+                binary,
+                statement,
+            } => self.exec_declare_cursor(ctx, name, *query, scroll, hold, binary, statement),
+            LogicalPlan::FetchCursor {
+                name,
+                direction,
+                move_only,
+            } => self.exec_fetch_cursor(ctx, &name, direction, move_only),
+            LogicalPlan::CloseCursor { name } => self.exec_close_cursor(ctx, name),
             LogicalPlan::CreateType { name, definition } => {
                 self.exec_create_type(ctx, name, definition)
             }

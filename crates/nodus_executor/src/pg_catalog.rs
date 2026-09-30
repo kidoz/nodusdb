@@ -852,6 +852,7 @@ impl MemExecutor {
             "pg_locks" => Some(self.pg_locks_virtual_table(db_name)),
             "pg_stat_activity" => Some(self.pg_stat_activity_virtual_table(db_name)),
             "pg_prepared_statements" => Some(self.pg_prepared_statements_virtual_table()),
+            "pg_cursors" => Some(self.pg_cursors_virtual_table()),
             // The relations below exist so IDE/driver introspection
             // (DataGrip/pgjdbc) can join them without erroring. NodusDB does not
             // model these concepts yet, so they are presented with their real

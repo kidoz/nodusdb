@@ -1,0 +1,266 @@
+# Cursors: DECLARE in a transaction block, FETCH and MOVE in every direction, NO SCROLL, WITH HOLD past COMMIT, CLOSE and CLOSE ALL, and pg_cursors.
+statement ok
+CREATE TABLE cur (id int PRIMARY KEY, v text);
+
+statement ok
+INSERT INTO cur SELECT g, 'v' || g FROM generate_series(1, 10) g;
+
+statement error
+DECLARE c CURSOR FOR SELECT id FROM cur ORDER BY id;
+
+statement ok
+BEGIN;
+
+statement ok
+DECLARE c CURSOR FOR SELECT id, v FROM cur ORDER BY id;
+
+query TT
+FETCH 2 FROM c;
+----
+1	v1
+2	v2
+
+query TT
+FETCH NEXT FROM c;
+----
+3	v3
+
+query TT
+FETCH c;
+----
+4	v4
+
+statement ok
+MOVE 2 IN c;
+
+query TT
+FETCH 2 IN c;
+----
+7	v7
+8	v8
+
+query TT
+FETCH ALL FROM c;
+----
+9	v9
+10	v10
+
+query T
+FETCH c;
+----
+
+statement ok
+CLOSE c;
+
+statement error
+FETCH c;
+
+statement ok
+ROLLBACK;
+
+statement ok
+BEGIN;
+
+statement ok
+DECLARE s SCROLL CURSOR FOR SELECT id FROM cur ORDER BY id;
+
+query T
+FETCH LAST FROM s;
+----
+10
+
+query T
+FETCH PRIOR FROM s;
+----
+9
+
+query T
+FETCH FIRST FROM s;
+----
+1
+
+query T
+FETCH ABSOLUTE 5 FROM s;
+----
+5
+
+query T
+FETCH RELATIVE -2 FROM s;
+----
+3
+
+query T
+FETCH BACKWARD 2 FROM s;
+----
+2
+1
+
+query T
+FETCH FORWARD 3 FROM s;
+----
+2
+3
+4
+
+query T
+FETCH -1 FROM s;
+----
+3
+
+query T
+FETCH RELATIVE 0 FROM s;
+----
+3
+
+query T
+FETCH ABSOLUTE -3 FROM s;
+----
+8
+
+query T
+FETCH BACKWARD ALL FROM s;
+----
+7
+6
+5
+4
+3
+2
+1
+
+statement ok
+MOVE LAST IN s;
+
+query T
+FETCH NEXT FROM s;
+----
+
+query T
+FETCH ABSOLUTE 20 FROM s;
+----
+
+query T
+FETCH PRIOR FROM s;
+----
+10
+
+statement ok
+COMMIT;
+
+statement error
+FETCH NEXT FROM s;
+
+statement ok
+BEGIN;
+
+statement ok
+DECLARE h CURSOR WITH HOLD FOR SELECT id FROM cur WHERE id < 4 ORDER BY id;
+
+statement ok
+COMMIT;
+
+query T
+FETCH ALL FROM h;
+----
+1
+2
+3
+
+statement ok
+CLOSE h;
+
+statement ok
+BEGIN;
+
+statement ok
+DECLARE a CURSOR FOR SELECT 1;
+
+statement ok
+DECLARE b SCROLL CURSOR WITH HOLD FOR SELECT 2;
+
+query TTTT
+SELECT name, statement, is_holdable, is_scrollable FROM pg_cursors ORDER BY name;
+----
+a	DECLARE a CURSOR FOR SELECT 1;	f	f
+b	DECLARE b SCROLL CURSOR WITH HOLD FOR SELECT 2;	t	t
+
+statement ok
+CLOSE ALL;
+
+query T
+SELECT count(*) FROM pg_cursors;
+----
+0
+
+statement ok
+COMMIT;
+
+statement error
+FETCH 1 FROM nope;
+
+statement ok
+BEGIN;
+
+statement error
+FETCH 1 FROM nope;
+
+statement ok
+ROLLBACK;
+
+statement ok
+BEGIN;
+
+statement ok
+DECLARE c CURSOR FOR SELECT id FROM cur;
+
+statement error
+DECLARE c CURSOR FOR SELECT id FROM cur;
+
+statement ok
+ROLLBACK;
+
+statement ok
+BEGIN;
+
+statement ok
+DECLARE c NO SCROLL CURSOR FOR SELECT id FROM cur ORDER BY id;
+
+query T
+FETCH 1 FROM c;
+----
+1
+
+statement error
+FETCH PRIOR FROM c;
+
+statement ok
+ROLLBACK;
+
+statement ok
+BEGIN;
+
+statement ok
+DECLARE c CURSOR FOR SELECT id FROM cur ORDER BY id;
+
+query T
+FETCH 0 FROM c;
+----
+
+query T
+FETCH FORWARD 0 FROM c;
+----
+
+query T
+FETCH 3 FROM c;
+----
+1
+2
+3
+
+query T
+FETCH RELATIVE 0 FROM c;
+----
+3
+
+statement ok
+ROLLBACK;
