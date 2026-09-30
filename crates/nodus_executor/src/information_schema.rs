@@ -44,15 +44,17 @@ impl MemExecutor {
                     .filter(|t| t.view_query.is_some())
                     .map(|t| {
                         let schema = Self::schema_name_by_id(db_name, &schemas, t.schema_id);
+                        let (updatable, check_option) = crate::updatable_views::view_facts(t);
+                        let yes_no = |b: bool| Value::Text(if b { "YES" } else { "NO" }.into());
                         vec![
                             Value::Text(db_name.into()),
                             Value::Text(schema),
                             Value::Text(t.name.clone()),
                             crate::pg_catalog::catalog_view_definition(t)
                                 .map_or(Value::Null, Value::Text),
-                            Value::Text("NONE".into()),
-                            Value::Text("NO".into()),
-                            Value::Text("NO".into()),
+                            Value::Text(check_option.into()),
+                            yes_no(updatable),
+                            yes_no(updatable),
                             Value::Text("NO".into()),
                             Value::Text("NO".into()),
                             Value::Text("NO".into()),
@@ -190,7 +192,15 @@ impl MemExecutor {
                     Value::Null,
                     Value::Null,
                     Value::Null,
-                    Value::Text("YES".into()),
+                    Value::Text(
+                        if table.view_query.is_none() || crate::updatable_views::view_facts(table).0
+                        {
+                            "YES"
+                        } else {
+                            "NO"
+                        }
+                        .into(),
+                    ),
                     Value::Text("NO".into()),
                     Value::Null,
                 ]

@@ -441,6 +441,19 @@ impl MemExecutor {
         let tbl = self
             .catalog_reader
             .get_table(db_name, schema_name, table_only)?;
+        if tbl.view_query.is_some() {
+            let view = self.writable_view(&tbl, crate::updatable_views::ViewCommand::Insert)?;
+            return self.exec_view_insert(
+                ctx,
+                view,
+                (table_name, alias.map(str::to_string)),
+                columns,
+                values_list,
+                returning,
+                on_conflict,
+                (default_cells, overriding),
+            );
+        }
         self.authorize(ctx, Action::Insert, ResourceRef::Table(tbl.id))?;
         let scope = self.target_scope(ctx, &tbl, (&table_name, alias), None, false)?;
         let returning = scope.returning_positions(&returning, false)?;
@@ -690,6 +703,18 @@ impl MemExecutor {
         let tbl = self
             .catalog_reader
             .get_table(db_name, schema_name, table_only)?;
+        if tbl.view_query.is_some() {
+            let view = self.writable_view(&tbl, crate::updatable_views::ViewCommand::Update)?;
+            return self.exec_view_update(
+                ctx,
+                view,
+                (table_name, table_alias),
+                assignments,
+                from,
+                filter,
+                returning,
+            );
+        }
         self.authorize(ctx, Action::Update, ResourceRef::Table(tbl.id))?;
         Self::reject_materialized_view(&tbl)?;
         for (col, _) in &assignments {
@@ -765,6 +790,17 @@ impl MemExecutor {
         let tbl = self
             .catalog_reader
             .get_table(db_name, schema_name, table_only)?;
+        if tbl.view_query.is_some() {
+            let view = self.writable_view(&tbl, crate::updatable_views::ViewCommand::Delete)?;
+            return self.exec_view_delete(
+                ctx,
+                view,
+                (table_name, table_alias),
+                using,
+                filter,
+                returning,
+            );
+        }
         self.authorize(ctx, Action::Delete, ResourceRef::Table(tbl.id))?;
         Self::reject_materialized_view(&tbl)?;
         let scope = self.target_scope(

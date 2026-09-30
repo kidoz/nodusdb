@@ -60,6 +60,7 @@ mod table_functions;
 mod temp_tables;
 mod timezone;
 mod transactions;
+mod updatable_views;
 mod user_types;
 mod value;
 mod view_helpers;

@@ -349,6 +349,7 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                 name: temp_relation_name(&create_view.name, create_view.temporary)?,
                 query: Box::new(query),
                 or_replace: create_view.or_replace,
+                check_option: view_check_option(&create_view.options)?,
             })
         }
         Statement::Drop {
@@ -1294,6 +1295,28 @@ fn expect_end(p: &mut sqlparser::parser::Parser) -> Result<()> {
         anyhow::bail!("syntax error at or near \"{}\"", next.token);
     }
     Ok(())
+}
+
+/// A view's `check_option` (`WITH (check_option = local)`, or `WITH [LOCAL
+/// | CASCADED] CHECK OPTION` as the SQL front end writes it).
+fn view_check_option(options: &sqlparser::ast::CreateTableOptions) -> Result<Option<String>> {
+    let sqlparser::ast::CreateTableOptions::With(options) = options else {
+        return Ok(None);
+    };
+    for option in options {
+        if let sqlparser::ast::SqlOption::KeyValue { key, value } = option
+            && key.value.eq_ignore_ascii_case("check_option")
+        {
+            let value = expr_to_value(value, &[])
+                .map(|v| crate::value::render(&v).to_ascii_lowercase())
+                .unwrap_or_default();
+            if value != "local" && value != "cascaded" {
+                anyhow::bail!("invalid value for enum option \"check_option\": {value}");
+            }
+            return Ok(Some(value));
+        }
+    }
+    Ok(None)
 }
 
 fn has_no_data_marker(options: &sqlparser::ast::CreateTableOptions) -> bool {

@@ -413,7 +413,7 @@ impl MemExecutor {
 
 /// A rejected row as PostgreSQL's DETAIL shows it: `Failing row contains
 /// (1, null, x).`
-fn failing_row(row: &[Value]) -> String {
+pub(crate) fn failing_row(row: &[Value]) -> String {
     let values: Vec<String> = row
         .iter()
         .map(|v| match v {

@@ -455,7 +455,10 @@ impl MemExecutor {
                 }
             }
             LogicalPlan::TableFunction(spec) => function_scan(spec),
-            LogicalPlan::Renamed { input, .. } => self.explain_node(ctx, input, ctes)?,
+            LogicalPlan::Renamed { input, .. }
+            | LogicalPlan::ViewCheckOption { query: input, .. } => {
+                self.explain_node(ctx, input, ctes)?
+            }
             LogicalPlan::RecursiveCte {
                 seed,
                 recursive_term,
@@ -1213,6 +1216,10 @@ pub(crate) fn deparse_scalar(expr: &ScalarExpr, qualified: bool) -> String {
 /// cannot write back as SQL.
 pub(crate) fn deparse_query(plan: &LogicalPlan) -> Option<String> {
     // A column alias list names the leading output columns.
+    let plan = match plan {
+        LogicalPlan::ViewCheckOption { query, .. } => query,
+        other => other,
+    };
     let (plan, renames): (&LogicalPlan, &[String]) = match plan {
         LogicalPlan::Renamed { input, columns } => (input, columns),
         other => (other, &[]),

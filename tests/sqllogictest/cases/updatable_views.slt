@@ -1,0 +1,165 @@
+# Automatically updatable views: INSERT, UPDATE, and DELETE through a view of one table, with its defaults, its condition, WITH [LOCAL | CASCADED] CHECK OPTION, views over views, and the views that cannot be written.
+statement ok
+CREATE TABLE base (id int PRIMARY KEY, name text NOT NULL, score int DEFAULT 0, active bool DEFAULT true);
+
+statement ok
+INSERT INTO base VALUES (1, 'a', 10, true), (2, 'b', 20, false), (3, 'c', 30, true);
+
+statement ok
+CREATE VIEW active_base AS SELECT id, name AS label, score FROM base WHERE active;
+
+query TTT
+INSERT INTO active_base (id, label) VALUES (4, 'd') RETURNING *;
+----
+4	d	0
+
+query T
+INSERT INTO active_base VALUES (5, 'e', 50) RETURNING label || '!' AS x;
+----
+e!
+
+query TTT
+UPDATE active_base SET score = score + 1 WHERE id IN (1, 2) RETURNING *;
+----
+1	a	11
+
+query TTT
+DELETE FROM active_base WHERE id = 3 RETURNING *;
+----
+3	c	30
+
+query TTTT
+SELECT * FROM base ORDER BY id;
+----
+1	a	11	t
+2	b	20	f
+4	d	0	t
+5	e	50	t
+
+statement error
+INSERT INTO active_base (label) VALUES ('x');
+
+statement error
+INSERT INTO active_base VALUES (1, 'dup', 0);
+
+statement ok
+CREATE VIEW checked AS SELECT id, name, score FROM base WHERE score > 15 WITH CHECK OPTION;
+
+statement ok
+INSERT INTO checked VALUES (6, 'f', 50);
+
+statement error
+INSERT INTO checked VALUES (7, 'g', 5);
+
+statement error
+UPDATE checked SET score = 1 WHERE id = 6;
+
+statement ok
+UPDATE checked SET score = 60 WHERE id = 6;
+
+statement ok
+CREATE VIEW local_chk AS SELECT * FROM base WHERE score < 100 WITH LOCAL CHECK OPTION;
+
+statement error
+INSERT INTO local_chk VALUES (8, 'h', 200);
+
+statement ok
+CREATE VIEW over_checked AS SELECT id, name FROM checked WHERE id < 50 WITH CASCADED CHECK OPTION;
+
+statement error
+INSERT INTO over_checked VALUES (60, 'x');
+
+statement error
+INSERT INTO over_checked VALUES (9, 'x');
+
+statement ok
+CREATE VIEW agg AS SELECT count(*) AS n FROM base;
+
+statement error
+INSERT INTO agg VALUES (1);
+
+statement error
+UPDATE agg SET n = 2;
+
+statement ok
+CREATE VIEW dist AS SELECT DISTINCT name FROM base;
+
+statement error
+DELETE FROM dist;
+
+statement ok
+CREATE VIEW lim AS SELECT id FROM base LIMIT 2;
+
+statement error
+UPDATE lim SET id = 1;
+
+statement ok
+CREATE VIEW joined AS SELECT a.id FROM base a JOIN base b ON a.id = b.id;
+
+statement error
+DELETE FROM joined;
+
+statement ok
+CREATE VIEW computed AS SELECT id, score * 2 AS doubled FROM base;
+
+statement error
+UPDATE computed SET doubled = 3;
+
+statement error
+INSERT INTO computed VALUES (10, 20);
+
+query TT
+UPDATE computed SET id = 90 WHERE id = 1 RETURNING *;
+----
+90	22
+
+query TTTT
+SELECT table_name, is_updatable, is_insertable_into, check_option FROM information_schema.views WHERE table_schema = 'public' ORDER BY 1;
+----
+active_base	YES	YES	NONE
+agg	NO	NO	NONE
+checked	YES	YES	CASCADED
+computed	YES	YES	NONE
+dist	NO	NO	NONE
+joined	NO	NO	NONE
+lim	NO	NO	NONE
+local_chk	YES	YES	LOCAL
+over_checked	YES	YES	CASCADED
+
+query TTTT
+SELECT * FROM base ORDER BY id;
+----
+2	b	20	f
+4	d	0	t
+5	e	50	t
+6	f	60	t
+90	a	11	t
+
+statement ok
+CREATE TABLE nb (id int PRIMARY KEY, name text, score int DEFAULT 5);
+
+statement ok
+CREATE VIEW n1 AS SELECT id, name AS label, score FROM nb WHERE score > 0;
+
+statement ok
+CREATE VIEW n2 AS SELECT id, label, score * 2 AS dbl FROM n1 WHERE score < 100 WITH CASCADED CHECK OPTION;
+
+query TTT
+INSERT INTO n2 (id, label) VALUES (1, 'a') RETURNING *;
+----
+1	a	10
+
+query TTT
+UPDATE n2 SET label = 'aa' WHERE id = 1 RETURNING *;
+----
+1	aa	10
+
+query TTT
+DELETE FROM n2 WHERE dbl = 10 RETURNING *;
+----
+1	aa	10
+
+query T
+SELECT count(*) FROM nb;
+----
+0

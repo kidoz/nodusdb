@@ -1120,6 +1120,15 @@ pub enum LogicalPlan {
         /// `CREATE OR REPLACE VIEW`. Defaulted so older plans decode.
         #[serde(default)]
         or_replace: bool,
+        /// `WITH [CASCADED | LOCAL] CHECK OPTION`: `cascaded` or `local`.
+        #[serde(default)]
+        check_option: Option<String>,
+    },
+    /// A view's stored query with its `WITH CHECK OPTION` (`cascaded` or
+    /// `local`); it runs as the query does.
+    ViewCheckOption {
+        query: Box<LogicalPlan>,
+        option: String,
     },
     DropView {
         names: Vec<String>,

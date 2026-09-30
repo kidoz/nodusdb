@@ -1,4 +1,5 @@
-//! Enums, domains, and indexes on expressions, driven through SQL.
+//! Enums, domains, indexes on expressions, and updatable views, driven
+//! through SQL.
 
 use crate::constraint_tests::{field, fields, session};
 use crate::dml_join_tests::rows;
@@ -127,5 +128,34 @@ fn indexes_on_expressions_keep_their_keys_unique() {
     assert_eq!(
         rows(&out),
         ["CREATE UNIQUE INDEX u_email ON public.u USING btree (lower(email))"]
+    );
+}
+
+#[test]
+fn simple_views_write_their_table_within_their_condition() {
+    let (sql, _) = session();
+    sql("CREATE TABLE b (id int PRIMARY KEY, name text, score int DEFAULT 0)").unwrap();
+    sql("CREATE VIEW v AS SELECT id, name AS label FROM b WHERE score >= 0 WITH CHECK OPTION")
+        .unwrap();
+    let out = sql("INSERT INTO v VALUES (1, 'a') RETURNING *").unwrap();
+    assert_eq!(out.columns, ["id", "label"]);
+    sql("UPDATE v SET label = 'z' WHERE id = 1").unwrap();
+    assert_eq!(rows(&sql("SELECT name FROM b").unwrap()), ["z"]);
+    sql("UPDATE b SET score = -1").unwrap();
+    // Rows the view does not show are not its to change.
+    assert_eq!(sql("DELETE FROM v").unwrap().tag, "DELETE 0");
+    sql("CREATE VIEW w AS SELECT id, score FROM b WHERE score < 10 WITH CHECK OPTION").unwrap();
+    let (message, f) = fields(sql("INSERT INTO w VALUES (2, 50)").unwrap_err());
+    assert_eq!(message, "new row violates check option for view \"w\"");
+    assert_eq!(
+        field(&f, "detail").as_deref(),
+        Some("Failing row contains (2, null, 50).")
+    );
+    sql("CREATE VIEW n AS SELECT count(*) AS n FROM b").unwrap();
+    let (message, f) = fields(sql("INSERT INTO n VALUES (1)").unwrap_err());
+    assert_eq!(message, "cannot insert into view \"n\"");
+    assert_eq!(
+        field(&f, "detail").as_deref(),
+        Some("Views that return aggregate functions are not automatically updatable.")
     );
 }

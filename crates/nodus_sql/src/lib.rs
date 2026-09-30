@@ -398,7 +398,8 @@ fn snippet_tokens(sql: &str) -> Option<Vec<sqlparser::tokenizer::TokenWithSpan>>
 
 /// Statements the parser lacks or takes only in part: `ALTER DOMAIN` and
 /// `DROP DOMAIN` ([`DOMAIN_FUNCTION`]), a domain's `NOT NULL`
-/// ([`DOMAIN_NOT_NULL`]), and `ON CONFLICT (expressions)`
+/// ([`DOMAIN_NOT_NULL`]), a view's `WITH [CASCADED | LOCAL] CHECK OPTION`
+/// (its `check_option`), and `ON CONFLICT (expressions)`
 /// ([`CONFLICT_EXPRESSIONS`]).
 fn rewrite_statement_form(
     mut statement: Vec<sqlparser::tokenizer::TokenWithSpan>,
@@ -520,6 +521,42 @@ fn rewrite_statement_form(
         }
         out.extend(rest);
         return out;
+    }
+
+    let creates_view = is(0, "create")
+        && (1..5).any(|at| is(at, "view"))
+        && !(1..5).any(|at| is(at, "materialized"));
+    if creates_view
+        && n >= 4
+        && is(n - 1, "option")
+        && is(n - 2, "check")
+        && (is(n - 3, "with") || (n >= 5 && is(n - 4, "with")))
+    {
+        let (option, clause) = match significant.get(n - 3).and_then(|&i| word(&statement[i])) {
+            Some(w) if w == "local" => ("local", n - 4),
+            Some(w) if w == "cascaded" => ("cascaded", n - 4),
+            _ => ("cascaded", n - 3),
+        };
+        let rest = tail(&statement);
+        statement.truncate(significant[clause]);
+        // Before the view's `AS`, outside its column list.
+        let mut depth = 0i32;
+        let as_at = statement.iter().position(|t| {
+            match &t.token {
+                Token::LParen => depth += 1,
+                Token::RParen => depth -= 1,
+                _ => {}
+            }
+            depth == 0 && word(t).as_deref() == Some("as")
+        });
+        if let (Some(as_at), Some(option)) = (
+            as_at,
+            snippet_tokens(&format!("WITH (check_option = '{option}') ")),
+        ) {
+            statement.splice(as_at..as_at, option);
+        }
+        statement.extend(rest);
+        return statement;
     }
 
     // `ON CONFLICT (expressions)`: a target with a parenthesized part.
@@ -1077,7 +1114,7 @@ mod tests {
     }
 
     #[test]
-    fn domain_and_conflict_forms_parse() {
+    fn domain_view_and_conflict_forms_parse() {
         let one = |sql: &str| parse_sql(sql).unwrap()[0].to_string();
         let domain = format!(
             "{:?}",
@@ -1096,6 +1133,10 @@ mod tests {
             format!(
                 "CREATE DOMAIN d AS VARCHAR(3) DEFAULT 'abc' CHECK (value <> 'x') CHECK ({DOMAIN_NOT_NULL})"
             )
+        );
+        assert!(
+            one("CREATE VIEW v (a) AS SELECT 1 AS a WITH LOCAL CHECK OPTION")
+                .contains("check_option = 'local'")
         );
         assert!(
             one("INSERT INTO t VALUES (1) ON CONFLICT (lower(e)) DO NOTHING")

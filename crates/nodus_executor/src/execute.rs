@@ -80,7 +80,15 @@ impl MemExecutor {
                 name,
                 query,
                 or_replace,
-            } => self.exec_create_view(ctx, name, query, or_replace),
+                check_option,
+            } => {
+                let query = match check_option {
+                    Some(option) => Box::new(LogicalPlan::ViewCheckOption { query, option }),
+                    None => query,
+                };
+                self.exec_create_view(ctx, name, query, or_replace)
+            }
+            LogicalPlan::ViewCheckOption { query, .. } => self.execute_logical_inner(ctx, *query),
             LogicalPlan::DropView {
                 names,
                 if_exists,
