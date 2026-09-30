@@ -795,6 +795,25 @@ impl MemExecutor {
                     expr: check(&expr),
                     alias,
                 },
+                // `min` and `max` of an enum pick by its order.
+                ProjectionItem::Aggregate(op @ (AggregateOp::Min | AggregateOp::Max), arg)
+                    if column_type(&arg)
+                        .is_some_and(|t| crate::user_types::enum_type(&t).is_some()) =>
+                {
+                    let alias = format!("{op:?}").to_ascii_lowercase();
+                    ProjectionItem::Expr {
+                        expr: check(&ScalarExpr::Aggregate {
+                            op,
+                            arg,
+                            arg_expr: None,
+                            distinct: false,
+                            extra_args: Vec::new(),
+                            filter: None,
+                            order_by: Vec::new(),
+                        }),
+                        alias: Some(alias),
+                    }
+                }
                 other => other,
             })
             .collect();
@@ -804,10 +823,39 @@ impl MemExecutor {
             .into_iter()
             .map(|(name, e)| (name, check(&e)))
             .collect();
+        // An enum column sorts in the enum's order.
+        let plain_column = |name: &str| {
+            !projection.iter().any(|item| match item {
+                ProjectionItem::Column(c) => c != name && c.rsplit('.').next() == Some(name),
+                ProjectionItem::AliasedColumn(c, alias) => alias == name && c != name,
+                ProjectionItem::Expr { alias, .. } => alias.as_deref() == Some(name),
+                _ => false,
+            })
+        };
         let key_targets: Vec<SortTarget> = key_targets
             .into_iter()
             .map(|target| match target {
-                SortTarget::Expr(e) => SortTarget::Expr(check(&e)),
+                SortTarget::Expr(e) => {
+                    let e = check(&e);
+                    SortTarget::Expr(
+                        crate::result_types::enum_sort_expr(&e, &column_type).unwrap_or(e),
+                    )
+                }
+                SortTarget::Name(name) if plain_column(&name) => {
+                    match crate::result_types::enum_sort_key(&name, &column_type) {
+                        Some(key) => SortTarget::Expr(key),
+                        None => SortTarget::Name(name),
+                    }
+                }
+                SortTarget::Output(at) => match projection.get(at) {
+                    Some(ProjectionItem::Column(c) | ProjectionItem::AliasedColumn(c, _)) => {
+                        match crate::result_types::enum_sort_key(c, &column_type) {
+                            Some(key) => SortTarget::Expr(key),
+                            None => SortTarget::Output(at),
+                        }
+                    }
+                    _ => SortTarget::Output(at),
+                },
                 other => other,
             })
             .collect();

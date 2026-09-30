@@ -77,6 +77,8 @@ pub(crate) fn is_known(name: &str) -> bool {
                 | crate::result_types::REAL_TEXT | crate::result_types::REAL_NUMERIC | crate::result_types::BPCHAR_PAD
                 | "TO_ASCII" | "UNISTR" | "NORMALIZE" | "__IS_NORMALIZED__"
                 | "TIMEOFDAY" | "ARRAY_DIMS" | "ARRAY_FILL" | "GENERATE_SUBSCRIPTS"
+                | "ENUM_RANGE" | "ENUM_FIRST" | "ENUM_LAST"
+                | crate::user_types::ENUM_SORT | crate::user_types::ENUM_LABEL
                 | "SHA224" | "SHA256" | "SHA384" | "SHA512" | "ENCODE" | "DECODE" | "CONVERT_TO"
                 | "CONVERT_FROM" | "CONVERT" | "GET_BYTE" | "SET_BYTE" | "GET_BIT" | "SET_BIT"
                 | "CRC32" | "CRC32C" | "PG_COLUMN_SIZE" | crate::result_types::INT_BYTEA
@@ -456,6 +458,9 @@ fn math_return_type(name: &str, arg_types: &[Option<String>]) -> Option<Option<S
 /// Calls a built-in function. Unknown names and wrong argument counts fail the
 /// statement.
 pub(crate) fn call(name: &str, args: &[Value]) -> Value {
+    if let Some(value) = crate::user_types::call(name, args) {
+        return value;
+    }
     if !NON_STRICT.contains(&name) && args.iter().any(|a| matches!(a, Value::Null)) {
         return Value::Null;
     }
@@ -3064,7 +3069,13 @@ fn format_type(oid: i64, typmod: Option<i64>) -> String {
         199 => "json[]",
         2951 => "uuid[]",
         3807 => "jsonb[]",
-        _ => "???",
+        _ => {
+            return match crate::user_types::type_of_oid(oid) {
+                Some((t, false)) => t.display_name(),
+                Some((t, true)) => format!("{}[]", t.display_name()),
+                None => "???".to_string(),
+            };
+        }
     };
     base.to_string()
 }

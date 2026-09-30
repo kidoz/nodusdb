@@ -458,7 +458,9 @@ impl MemExecutor {
                     ("conexclop", "OID[]"),
                     ("conbin", "TEXT"),
                 ]);
-                Some((cols, self.pg_constraint_rows(db_name, &schemas, &tables)))
+                let mut rows = self.pg_constraint_rows(db_name, &schemas, &tables);
+                rows.extend(Self::domain_constraint_rows(db_name));
+                Some((cols, rows))
             }
             "pg_type" => Some(self.pg_type_virtual_table(db_name)),
             "pg_proc" => Some((
@@ -820,7 +822,7 @@ impl MemExecutor {
                     ("enumsortorder", "FLOAT4"),
                     ("enumlabel", "NAME"),
                 ]),
-                Vec::new(),
+                Self::pg_enum_rows(),
             )),
             "pg_collation" => Some(self.pg_collation_virtual_table(db_name)),
             "pg_am" => Some((
@@ -1736,6 +1738,7 @@ impl MemExecutor {
                 Value::Null,
             ]);
         }
+        rows.extend(self.user_type_rows(db_name));
         (cols, rows)
     }
 
@@ -2478,6 +2481,9 @@ impl MemExecutor {
         oid: i64,
         pretty: bool,
     ) -> Option<String> {
+        if let Some(definition) = Self::domain_constraint_definition(oid, pretty) {
+            return Some(definition);
+        }
         let db = "default";
         let schemas = catalog.list_schemas(db).ok()?;
         for table in catalog.list_all_tables(db).ok()? {

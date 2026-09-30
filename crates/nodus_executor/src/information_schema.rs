@@ -218,6 +218,9 @@ impl MemExecutor {
             ("numeric_precision", "INT"),
             ("numeric_scale", "INT"),
             ("datetime_precision", "INT"),
+            ("domain_catalog", "TEXT"),
+            ("domain_schema", "TEXT"),
+            ("domain_name", "TEXT"),
             ("udt_catalog", "TEXT"),
             ("udt_schema", "TEXT"),
             ("udt_name", "TEXT"),
@@ -231,7 +234,15 @@ impl MemExecutor {
         for table in tables {
             let schema_name = Self::schema_name_by_id(db_name, schemas, table.schema_id);
             for (idx, column) in table.columns.iter().enumerate() {
-                let info = TypeInfo::of(&column.data_type);
+                // A domain's column is described by the domain's base type.
+                let domain =
+                    crate::user_types::lookup(&column.data_type).filter(|t| t.domain().is_some());
+                let info = TypeInfo::of(
+                    domain
+                        .as_ref()
+                        .and_then(|t| t.domain())
+                        .map_or(column.data_type.as_str(), |d| d.base.as_str()),
+                );
                 let default = Self::column_default(column);
                 let identity = default.as_ref().and_then(crate::sequences::identity_kind);
                 let generated = default
@@ -256,8 +267,17 @@ impl MemExecutor {
                     int(info.numeric_precision),
                     int(info.numeric_scale),
                     int(info.datetime_precision),
+                    domain
+                        .as_ref()
+                        .map_or(Value::Null, |_| Value::Text(db_name.into())),
+                    domain
+                        .as_ref()
+                        .map_or(Value::Null, |t| Value::Text(t.schema.clone())),
+                    domain
+                        .as_ref()
+                        .map_or(Value::Null, |t| Value::Text(t.name.clone())),
                     Value::Text(db_name.into()),
-                    Value::Text("pg_catalog".into()),
+                    Value::Text(info.udt_schema),
                     Value::Text(info.udt_name),
                     Value::Text(if identity.is_some() { "YES" } else { "NO" }.into()),
                     match identity {
@@ -689,6 +709,7 @@ impl MemExecutor {
 /// A declared type as `information_schema.columns` describes it.
 struct TypeInfo {
     data_type: String,
+    udt_schema: String,
     udt_name: String,
     character_maximum_length: Option<i64>,
     numeric_precision: Option<i64>,
@@ -704,8 +725,17 @@ impl TypeInfo {
             let element = TypeInfo::of(element.trim_end_matches("[]"));
             return TypeInfo {
                 data_type: "ARRAY".into(),
+                udt_schema: element.udt_schema,
                 udt_name: format!("_{}", element.udt_name),
                 ..TypeInfo::named("", "")
+            };
+        }
+        // An enum (or a domain a domain is over) is a user-defined type of
+        // its schema.
+        if let Some(t) = crate::user_types::lookup(declared) {
+            return TypeInfo {
+                udt_schema: t.schema.clone(),
+                ..TypeInfo::named("USER-DEFINED", &t.name)
             };
         }
         let (base, args) = match lower.split_once('(') {
@@ -780,6 +810,7 @@ impl TypeInfo {
     fn named(data_type: &str, udt_name: &str) -> TypeInfo {
         TypeInfo {
             data_type: data_type.into(),
+            udt_schema: "pg_catalog".into(),
             udt_name: udt_name.into(),
             character_maximum_length: None,
             numeric_precision: None,

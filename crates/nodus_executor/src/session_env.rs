@@ -46,6 +46,8 @@ pub(crate) struct SessionEnv {
     /// The catalog, for functions that describe objects by OID
     /// (`pg_get_indexdef`, `pg_get_constraintdef`).
     pub(crate) catalog: Option<std::sync::Arc<dyn nodus_catalog::CatalogReader>>,
+    /// The whole catalog, with the relations that hold user types.
+    pub(crate) types: Option<std::sync::Arc<dyn nodus_catalog::CatalogReader>>,
     /// The stored data as the statement reads it, for the functions that
     /// measure relations (`pg_table_size`).
     pub(crate) storage: Option<(
@@ -72,6 +74,7 @@ impl Drop for EnvGuard {
 
 /// Installs `env` for the rest of the current statement.
 pub(crate) fn install(env: SessionEnv) -> EnvGuard {
+    crate::user_types::forget_found();
     EnvGuard {
         previous: ENV.with(|slot| slot.borrow_mut().replace(env)),
     }

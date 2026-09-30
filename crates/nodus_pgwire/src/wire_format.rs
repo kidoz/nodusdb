@@ -54,6 +54,10 @@ pub(crate) fn sqlstate_for_execution_error(err_str: &str) -> &'static str {
         "42712" // duplicate_alias
     } else if err_str.contains("specified more than once") {
         "42701" // duplicate_column
+    } else if err_str.starts_with("value too long for type") {
+        "22001" // string_data_right_truncation
+    } else if err_str.starts_with("invalid input value for enum") {
+        "22P02" // invalid_text_representation
     } else if err_str.contains("no unique or exclusion constraint matching the ON CONFLICT") {
         "42P10" // invalid_column_reference
     } else if err_str.contains("cannot affect row a second time") {
@@ -321,6 +325,11 @@ pub(crate) fn error_info(severity: &str, code: &str, error: &str) -> ErrorInfo {
         nodus_executor::error_message(error).to_owned(),
     );
     for (name, value) in nodus_executor::error_fields(error) {
+        // An error that names its SQLSTATE has it.
+        if name == "code" {
+            info.code = value.to_owned();
+            continue;
+        }
         let value = Some(value.to_owned());
         match name {
             "detail" => info.detail = value,
@@ -328,6 +337,7 @@ pub(crate) fn error_info(severity: &str, code: &str, error: &str) -> ErrorInfo {
             "schema" => info.schema = value,
             "table" => info.table = value,
             "column" => info.column = value,
+            "datatype" => info.datatype = value,
             "constraint" => info.constraint = value,
             _ => {}
         }

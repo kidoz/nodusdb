@@ -125,6 +125,7 @@ impl MemExecutor {
             }
             anyhow::bail!("relation \"{}\" already exists", table_only);
         }
+        self.reject_type_name(schema_name, table_only)?;
         let constraints = name_check_constraints(table_only, &columns, constraints);
         // Foreign keys get their names and referenced columns, checked
         // against the referenced table's keys (the new table's own, for one
@@ -323,6 +324,7 @@ impl MemExecutor {
             }
             anyhow::bail!("relation \"{table_only}\" already exists");
         }
+        self.reject_type_name(schema_name, table_only)?;
         self.create_sequence(ctx, &name, state)?;
         Ok(QueryOutput::tag("CREATE SEQUENCE"))
     }
@@ -497,6 +499,7 @@ impl MemExecutor {
             }
             anyhow::bail!("relation \"{}\" already exists", table_only);
         }
+        self.reject_type_name(schema_name, table_only)?;
         let materialized_query = if materialized {
             Some(serde_json::to_string(&query)?)
         } else {
@@ -671,7 +674,8 @@ impl MemExecutor {
             Some(tbl) if tbl.view_query.is_none() => {
                 anyhow::bail!("\"{}\" is not a view", tbl.name)
             }
-            _ => {}
+            Some(_) => {}
+            None => self.reject_type_name(schema_name, view_only)?,
         }
 
         // The view's columns are its query's; stored, the query runs on

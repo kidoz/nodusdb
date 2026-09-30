@@ -1,0 +1,388 @@
+# Enum types: labels in their declared order, comparisons and sorts by that order, invalid labels refused, ALTER TYPE ADD/RENAME VALUE and RENAME TO, the enum functions, and the catalogs that describe them.
+statement ok
+CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy');
+
+statement error
+CREATE TYPE mood AS ENUM ('x');
+
+statement error
+CREATE TYPE dup AS ENUM ('a', 'a');
+
+statement ok
+CREATE TABLE person (name text, m mood, ms mood[]);
+
+statement ok
+INSERT INTO person VALUES ('a', 'happy', '{sad,ok}'), ('b', 'sad', NULL), ('c', 'ok', NULL), ('d', NULL, NULL);
+
+statement error
+INSERT INTO person VALUES ('e', 'angry');
+
+statement error
+INSERT INTO person VALUES ('e', 'ok', '{ok,angry}');
+
+query TT
+SELECT name, m FROM person ORDER BY m, name;
+----
+b	sad
+c	ok
+a	happy
+d	NULL
+
+query TT
+SELECT name, m FROM person ORDER BY m DESC NULLS LAST, name;
+----
+a	happy
+c	ok
+b	sad
+d	NULL
+
+query T
+SELECT name FROM person WHERE m > 'ok' ORDER BY 1;
+----
+a
+
+query T
+SELECT name FROM person WHERE m BETWEEN 'sad' AND 'ok' ORDER BY 1;
+----
+b
+c
+
+query T
+SELECT name FROM person WHERE m IN ('sad', 'happy') ORDER BY 1;
+----
+a
+b
+
+query TTT
+SELECT min(m), max(m), count(DISTINCT m) FROM person;
+----
+sad	happy	3
+
+query TT
+SELECT m, count(*) FROM person GROUP BY m ORDER BY m;
+----
+sad	1
+ok	1
+happy	1
+NULL	1
+
+query TTTT
+SELECT 'happy'::mood, 'happy'::mood::text, 'ok'::mood < 'happy'::mood, greatest('sad'::mood, 'ok'::mood);
+----
+happy	happy	t	ok
+
+statement error
+SELECT 'nope'::mood;
+
+statement error
+SELECT '{ok,nope}'::mood[];
+
+query TTT
+SELECT pg_typeof(m), pg_typeof(ms), m::text || '!' FROM person WHERE name = 'a';
+----
+mood	mood[]	happy!
+
+query TTTTT
+SELECT enum_range(NULL::mood), enum_first(NULL::mood), enum_last(NULL::mood), enum_range('ok'::mood, NULL), enum_range('sad'::mood, 'ok'::mood);
+----
+{sad,ok,happy}	sad	happy	{ok,happy}	{sad,ok}
+
+statement ok
+UPDATE person SET m = 'ok' WHERE name = 'd';
+
+statement error
+UPDATE person SET m = 'nope' WHERE name = 'd';
+
+statement ok
+ALTER TYPE mood ADD VALUE 'meh' BEFORE 'ok';
+
+statement ok
+ALTER TYPE mood ADD VALUE IF NOT EXISTS 'meh';
+
+statement ok
+ALTER TYPE mood ADD VALUE 'ecstatic' AFTER 'happy';
+
+statement error
+ALTER TYPE mood ADD VALUE 'happy';
+
+statement error
+ALTER TYPE mood ADD VALUE 'x' AFTER 'nope';
+
+query T
+SELECT enum_range(NULL::mood);
+----
+{sad,meh,ok,happy,ecstatic}
+
+statement ok
+ALTER TYPE mood RENAME VALUE 'ok' TO 'fine';
+
+statement error
+ALTER TYPE mood RENAME VALUE 'nope' TO 'x';
+
+statement error
+ALTER TYPE mood RENAME VALUE 'sad' TO 'fine';
+
+query TTT
+SELECT name, m, ms FROM person ORDER BY m NULLS FIRST, name;
+----
+b	sad	NULL
+c	fine	NULL
+d	fine	NULL
+a	happy	{sad,fine}
+
+query TT
+SELECT enumlabel, enumsortorder FROM pg_enum WHERE enumtypid = 'mood'::regtype ORDER BY enumsortorder;
+----
+sad	1
+meh	1.5
+fine	2
+happy	3
+ecstatic	4
+
+query TTT
+SELECT typname, typtype, typcategory FROM pg_type WHERE typname IN ('mood', '_mood') ORDER BY 1;
+----
+_mood	b	A
+mood	e	E
+
+query TTT
+SELECT column_name, data_type, udt_name FROM information_schema.columns WHERE table_name = 'person' ORDER BY ordinal_position;
+----
+name	text	text
+m	USER-DEFINED	mood
+ms	ARRAY	_mood
+
+query TT
+SELECT format_type('mood'::regtype, NULL), format_type(atttypid, atttypmod) FROM pg_attribute WHERE attrelid = 'person'::regclass AND attname = 'ms';
+----
+mood	mood[]
+
+statement error
+CREATE TABLE mood (a int);
+
+statement error
+SELECT * FROM mood;
+
+statement ok
+ALTER TYPE mood RENAME TO feeling;
+
+query TT
+SELECT m, pg_typeof(m) FROM person WHERE name = 'a';
+----
+happy	feeling
+
+statement error
+DROP TYPE feeling;
+
+statement ok
+DROP TYPE feeling CASCADE;
+
+query T
+SELECT * FROM person ORDER BY name;
+----
+a
+b
+c
+d
+
+statement ok
+DROP TYPE IF EXISTS nope;
+
+statement error
+DROP TYPE nope;
+
+statement ok
+CREATE TYPE color AS ENUM ();
+
+query T
+SELECT enum_range(NULL::color);
+----
+{}
+
+statement ok
+CREATE TABLE t2 (c color);
+
+statement error
+INSERT INTO t2 VALUES ('red');
+
+statement ok
+DROP TABLE t2;
+
+statement ok
+DROP TYPE color;
+
+# Domains: a base type with a default, NOT NULL, and CHECK constraints that stored values and casts must meet; ALTER DOMAIN and DROP DOMAIN.
+statement ok
+CREATE DOMAIN pos AS int CHECK (VALUE > 0);
+
+statement ok
+CREATE DOMAIN email AS text CONSTRAINT email_at CHECK (VALUE LIKE '%@%') NOT NULL;
+
+statement ok
+CREATE DOMAIN code AS varchar(3) DEFAULT 'abc';
+
+statement ok
+CREATE DOMAIN small AS pos CHECK (VALUE < 10) DEFAULT 5;
+
+statement ok
+CREATE TABLE acct (id pos PRIMARY KEY, mail email, c code, s small, ps pos[]);
+
+statement ok
+INSERT INTO acct VALUES (1, 'a@b', 'xyz');
+
+query TTTTT
+INSERT INTO acct (id, mail) VALUES (2, 'c@d') RETURNING *;
+----
+2	c@d	abc	5	NULL
+
+statement error
+INSERT INTO acct VALUES (0, 'a@b');
+
+statement error
+INSERT INTO acct VALUES (3, 'nope');
+
+statement error
+INSERT INTO acct VALUES (4, NULL);
+
+statement error
+INSERT INTO acct (id) VALUES (4);
+
+statement error
+INSERT INTO acct VALUES (5, 'e@f', 'toolong');
+
+statement error
+INSERT INTO acct (id, mail, s) VALUES (5, 'e@f', 10);
+
+statement error
+INSERT INTO acct (id, mail, ps) VALUES (5, 'e@f', '{1,-1}');
+
+query TT
+INSERT INTO acct (id, mail, ps) VALUES (6, 'g@h', '{1,2}') RETURNING id, ps;
+----
+6	{1,2}
+
+query TTTTT
+SELECT id + 1, pg_typeof(id), pg_typeof(id + 1), pg_typeof(s), mail || '!' FROM acct ORDER BY id;
+----
+2	pos	integer	small	a@b!
+3	pos	integer	small	c@d!
+7	pos	integer	small	g@h!
+
+query T
+SELECT id FROM acct WHERE id > 1 AND id IN (2, 6) ORDER BY id;
+----
+2
+6
+
+query TTT
+SELECT 5::pos, '7'::small, 'toolong'::code;
+----
+5	7	too
+
+statement error
+SELECT (-1)::pos;
+
+statement error
+SELECT 12::small;
+
+statement error
+SELECT NULL::email;
+
+statement error
+UPDATE acct SET id = -3 WHERE id = 1;
+
+query TT
+UPDATE acct SET c = DEFAULT, s = DEFAULT WHERE id = 1 RETURNING c, s;
+----
+abc	5
+
+query TTTTT
+SELECT typname, typtype, format_type(typbasetype, typtypmod), typnotnull, typdefault FROM pg_type WHERE typname IN ('pos', 'email', 'code', 'small') ORDER BY 1;
+----
+code	d	character varying(3)	f	'abc'::character varying
+email	d	text	t	NULL
+pos	d	integer	f	NULL
+small	d	pos	f	5
+
+query TTTT
+SELECT column_name, data_type, domain_name, udt_name FROM information_schema.columns WHERE table_name = 'acct' ORDER BY ordinal_position;
+----
+id	integer	pos	int4
+mail	text	email	text
+c	character varying	code	varchar
+s	USER-DEFINED	small	pos
+ps	ARRAY	NULL	_pos
+
+query TT
+SELECT conname, pg_get_constraintdef(oid) FROM pg_constraint WHERE contypid IN ('pos'::regtype, 'email'::regtype) ORDER BY 1;
+----
+email_at	CHECK ((VALUE ~~ '%@%'::text))
+email_not_null	NOT NULL
+pos_check	CHECK ((VALUE > 0))
+
+statement error
+ALTER DOMAIN pos ADD CONSTRAINT pos_small CHECK (VALUE < 100);
+
+statement error
+ALTER DOMAIN email ADD CONSTRAINT email_dot CHECK (VALUE LIKE '%.%');
+
+statement ok
+ALTER DOMAIN email ADD CONSTRAINT email_blank CHECK (VALUE NOT LIKE '% %');
+
+statement ok
+ALTER DOMAIN email ADD CONSTRAINT email_long CHECK (length(VALUE) > 2);
+
+statement error
+INSERT INTO acct VALUES (7, 'ab');
+
+statement ok
+ALTER DOMAIN email DROP CONSTRAINT email_long;
+
+statement error
+ALTER DOMAIN email DROP CONSTRAINT nope;
+
+statement ok
+ALTER DOMAIN email DROP CONSTRAINT IF EXISTS nope;
+
+statement ok
+ALTER DOMAIN code SET DEFAULT 'zzz';
+
+statement ok
+ALTER DOMAIN email DROP NOT NULL;
+
+query TTT
+INSERT INTO acct (id, mail) VALUES (7, NULL) RETURNING id, mail, c;
+----
+7	NULL	zzz
+
+statement error
+ALTER DOMAIN email SET NOT NULL;
+
+statement error
+ALTER DOMAIN nope SET NOT NULL;
+
+statement error
+ALTER DOMAIN pos DROP DEFAULT x;
+
+statement error
+DROP DOMAIN pos;
+
+statement error
+DROP DOMAIN mood_nope;
+
+statement ok
+DROP DOMAIN code, small CASCADE;
+
+query TTT
+SELECT * FROM acct ORDER BY id;
+----
+1	a@b	NULL
+2	c@d	NULL
+6	g@h	{1,2}
+7	NULL	NULL
+
+statement ok
+DROP TABLE acct;
+
+statement ok
+DROP DOMAIN pos, email;

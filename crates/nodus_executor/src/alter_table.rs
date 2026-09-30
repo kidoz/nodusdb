@@ -282,7 +282,7 @@ impl MemExecutor {
     /// `DROP COLUMN`: the table's own constraints and indexes on the column
     /// go with it; the foreign keys of other tables referencing it and the
     /// views reading it only with `cascade`.
-    fn drop_column(
+    pub(crate) fn drop_column(
         &self,
         ctx: &ExecutionContext,
         tbl: &TableDescriptor,

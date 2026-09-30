@@ -340,6 +340,13 @@ pub(crate) enum ColumnType {
 }
 
 pub(crate) fn column_type(data_type: &str) -> ColumnType {
+    // An enum's values are its labels; a domain's are its base type's.
+    if let Some(t) = crate::user_types::lookup(data_type) {
+        return match t.domain() {
+            Some(domain) => column_type(&domain.base),
+            None => ColumnType::Text,
+        };
+    }
     let t = data_type.to_uppercase();
     // `INTERVAL` contains "INT" but is textual — check it before the INT rule.
     if t.contains("INTERVAL") {
@@ -377,6 +384,36 @@ pub(crate) fn coerce(raw: &str, ty: ColumnType) -> Value {
 /// also cover JSONB/ARRAY/UUID/timestamps, whose values must be preserved as-is,
 /// so non-`Text` values bound into them are left untouched.
 pub(crate) fn coerce_for_column(value: &Value, data_type: &str) -> Value {
+    // A user type's value must be one of it; so must an array's elements.
+    if let Some(t) = crate::user_types::lookup(data_type) {
+        return crate::user_types::coerce(&t, value, false)
+            .unwrap_or_else(crate::eval_error::raise);
+    }
+    if let Some(element) = array_element_type(data_type)
+        && let Some(t) = crate::user_types::lookup(element)
+    {
+        let items = match value {
+            Value::Array(items) => items.clone(),
+            Value::Text(s) => match coerce_array_text(s, "TEXT[]") {
+                Some(Value::Array(items)) => items,
+                _ => return crate::eval_error::raise(format!("malformed array literal: \"{s}\"")),
+            },
+            other => return other.clone(),
+        };
+        fn each(t: &crate::user_types::UserType, items: Vec<Value>) -> Value {
+            Value::Array(
+                items
+                    .into_iter()
+                    .map(|item| match item {
+                        Value::Array(inner) => each(t, inner),
+                        item => crate::user_types::coerce(t, &item, false)
+                            .unwrap_or_else(crate::eval_error::raise),
+                    })
+                    .collect(),
+            )
+        }
+        return each(&t, items);
+    }
     match value {
         Value::Null => Value::Null,
         // A `json` value is its text anywhere but a JSON column.

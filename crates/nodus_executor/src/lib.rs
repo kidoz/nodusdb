@@ -60,6 +60,7 @@ mod table_functions;
 mod temp_tables;
 mod timezone;
 mod transactions;
+mod user_types;
 mod value;
 mod view_helpers;
 mod windows;
@@ -79,6 +80,7 @@ pub(crate) use planner::{eval_scalar_expr, parse_filter_expr, scalar_has_aggrega
 pub use sequences::{SequenceChange, SequenceSpec};
 pub use session_vars::canonical_setting_value;
 pub use session_vars::set_server_setting;
+pub use user_types::{DomainCheck, DomainDefinition, EnumLabel, TypeChange, TypeDefinition};
 pub use value::{ColumnDef, Value, float_text, float4_text, render};
 pub(crate) use value::{
     coerce, column_type, compare, eval_scalar_function, literal_arg, resolve_scalar_arg,
@@ -343,7 +345,10 @@ impl nodus_catalog::CatalogStore for KvCatalogStore {
 // MVP implementation mapping to required interfaces
 #[allow(dead_code)]
 pub struct MemExecutor {
+    /// The catalog without the relations that hold user types.
     pub(crate) catalog_reader: Arc<dyn CatalogReader>,
+    /// The whole catalog, for user types. See [`crate::user_types`].
+    pub(crate) types_catalog: Arc<dyn CatalogReader>,
     pub(crate) catalog_writer: Arc<dyn CatalogWriter>,
     pub(crate) authz: Arc<dyn AuthzEngine>,
     pub(crate) audit: Arc<dyn AuditSink>,
@@ -428,8 +433,12 @@ impl MemExecutor {
             kv.clone(),
             txn.clone(),
         ));
+        let types_catalog = catalog_reader;
+        let catalog_reader: Arc<dyn CatalogReader> =
+            Arc::new(user_types::RelationCatalog(types_catalog.clone()));
         Self {
             catalog_reader,
+            types_catalog,
             catalog_writer,
             authz,
             audit,
@@ -691,6 +700,7 @@ impl MemExecutor {
             session_id: ctx.session_id.clone(),
             sequences: Some(self.sequences.clone()),
             catalog: Some(self.catalog_reader.clone()),
+            types: Some(self.types_catalog.clone()),
             storage: Some((self.kv.clone(), self.read_ts(&ctx.session_id))),
         }
     }
@@ -1235,6 +1245,15 @@ impl MemExecutor {
             })
             .map(|out| self.name_object_identifiers(out))
             .map(|mut out| {
+                // A domain's values go to the client as its base type's.
+                for ty in &mut out.types {
+                    if crate::user_types::may_be_user_type(ty) {
+                        *ty = crate::user_types::base_type(ty);
+                    }
+                }
+                out
+            })
+            .map(|mut out| {
                 // Zoned timestamps are shown in the session's zone, and
                 // `char(n)` values padded.
                 if let Some(forms) = timezone::output_forms(&out.types) {
@@ -1390,6 +1409,15 @@ fn write_command(plan: &LogicalPlan) -> Option<&'static str> {
         LogicalPlan::CreateIndex { .. } => "CREATE INDEX",
         LogicalPlan::DropIndex { .. } => "DROP INDEX",
         LogicalPlan::RenameIndex { .. } => "ALTER INDEX",
+        LogicalPlan::CreateType {
+            definition: user_types::TypeDefinition::Domain(_),
+            ..
+        } => "CREATE DOMAIN",
+        LogicalPlan::CreateType { .. } => "CREATE TYPE",
+        LogicalPlan::AlterType { domain: true, .. } => "ALTER DOMAIN",
+        LogicalPlan::AlterType { .. } => "ALTER TYPE",
+        LogicalPlan::DropType { domain: true, .. } => "DROP DOMAIN",
+        LogicalPlan::DropType { .. } => "DROP TYPE",
         LogicalPlan::CreateView { .. } => "CREATE VIEW",
         LogicalPlan::DropView { .. } => "DROP VIEW",
         LogicalPlan::CreateSchema { .. } => "CREATE SCHEMA",

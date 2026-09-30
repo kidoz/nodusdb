@@ -330,6 +330,15 @@ pub const ALTER_SEQUENCE_FUNCTION: &str = "pg_catalog.nodus_alter_sequence";
 /// `PREPARE TRANSACTION`.
 pub const UTILITY_FUNCTION: &str = "pg_catalog.nodus_utility";
 
+/// The function call `ALTER DOMAIN` and `DROP DOMAIN` are written as —
+/// `SELECT pg_catalog.nodus_domain('ALTER DOMAIN d SET NOT NULL')`, with
+/// the statement's text — since the parser has no such statements.
+pub const DOMAIN_FUNCTION: &str = "pg_catalog.nodus_domain";
+
+/// The check a domain's `NOT NULL` is written as in `CREATE DOMAIN` —
+/// `CHECK (nodus_domain_not_null)` — which the parser does not accept.
+pub const DOMAIN_NOT_NULL: &str = "nodus_domain_not_null";
+
 /// The constraint name `ON CONFLICT (expressions)` is written as — `ON
 /// CONFLICT ON CONSTRAINT "nodus_conflict:lower(email)"` — since the
 /// parser takes only column names there.
@@ -387,7 +396,9 @@ fn snippet_tokens(sql: &str) -> Option<Vec<sqlparser::tokenizer::TokenWithSpan>>
     Some(tokens)
 }
 
-/// Statements the parser takes only in part: `ON CONFLICT (expressions)`
+/// Statements the parser lacks or takes only in part: `ALTER DOMAIN` and
+/// `DROP DOMAIN` ([`DOMAIN_FUNCTION`]), a domain's `NOT NULL`
+/// ([`DOMAIN_NOT_NULL`]), and `ON CONFLICT (expressions)`
 /// ([`CONFLICT_EXPRESSIONS`]).
 fn rewrite_statement_form(
     mut statement: Vec<sqlparser::tokenizer::TokenWithSpan>,
@@ -416,6 +427,100 @@ fn rewrite_statement_form(
             .as_deref()
             == Some(w)
     };
+    let tail = |statement: &[TokenWithSpan]| -> Vec<TokenWithSpan> {
+        statement
+            .iter()
+            .skip(significant.last().map_or(0, |&i| i + 1))
+            .cloned()
+            .collect()
+    };
+    let quote = |s: &str| s.replace('\'', "''");
+
+    if (is(0, "alter") || is(0, "drop")) && is(1, "domain") {
+        let (Some(&first), Some(&last)) = (significant.first(), significant.last()) else {
+            return statement;
+        };
+        let text = render_tokens(&statement[first..=last]);
+        let sql = format!("SELECT {DOMAIN_FUNCTION}('{}')", quote(&text));
+        if let Some(mut tokens) = snippet_tokens(&sql) {
+            tokens.extend(tail(&statement));
+            return tokens;
+        }
+        return statement;
+    }
+
+    if is(0, "create") && is(1, "domain") {
+        // The parser takes a domain's clauses in one order (`COLLATE`,
+        // `DEFAULT`, then its checks) and no `NOT NULL`: the clauses are
+        // put in that order, `NOT NULL` becomes a check the planner knows,
+        // and `NULL` goes.
+        let starts_clause = |k: usize| {
+            is(k, "collate")
+                || is(k, "default")
+                || is(k, "constraint")
+                || is(k, "check")
+                || is(k, "null")
+                || (is(k, "not") && is(k + 1, "null"))
+        };
+        let mut depth = 0i32;
+        let mut starts = Vec::new();
+        let mut k = 3;
+        while k < n {
+            match statement[significant[k]].token {
+                Token::LParen => depth += 1,
+                Token::RParen => depth -= 1,
+                _ => {}
+            }
+            if depth == 0 && starts_clause(k) {
+                starts.push(k);
+                // A default's first token, and a named constraint's name and
+                // kind, belong to the clause.
+                k += if is(k, "default") {
+                    2
+                } else if is(k, "constraint") {
+                    3
+                } else {
+                    1
+                };
+                continue;
+            }
+            k += 1;
+        }
+        let Some(&first) = starts.first() else {
+            return statement;
+        };
+        let rest = tail(&statement);
+        let end = significant.last().map_or(statement.len(), |&i| i + 1);
+        let clause = |c: usize| {
+            let from = significant[starts[c]];
+            let to = starts.get(c + 1).map_or(end, |&next| significant[next]);
+            (starts[c], statement[from..to].to_vec())
+        };
+        let (mut collate, mut default, mut checks) = (Vec::new(), Vec::new(), Vec::new());
+        let mut not_null = false;
+        for c in 0..starts.len() {
+            let (k, tokens) = clause(c);
+            let kind = if is(k, "constraint") { k + 2 } else { k };
+            if is(kind, "collate") {
+                collate.extend(tokens);
+            } else if is(kind, "default") {
+                default.extend(tokens);
+            } else if is(kind, "not") {
+                not_null = true;
+            } else if is(kind, "check") {
+                checks.extend(tokens);
+            }
+        }
+        let mut out: Vec<TokenWithSpan> = statement[..significant[first]].to_vec();
+        out.extend(collate);
+        out.extend(default);
+        out.extend(checks);
+        if not_null && let Some(check) = snippet_tokens(&format!(" CHECK ({DOMAIN_NOT_NULL})")) {
+            out.extend(check);
+        }
+        out.extend(rest);
+        return out;
+    }
 
     // `ON CONFLICT (expressions)`: a target with a parenthesized part.
     if let Some(k) = (0..n.saturating_sub(2)).find(|&k| {
@@ -972,8 +1077,26 @@ mod tests {
     }
 
     #[test]
-    fn conflict_expression_targets_parse() {
+    fn domain_and_conflict_forms_parse() {
         let one = |sql: &str| parse_sql(sql).unwrap()[0].to_string();
+        let domain = format!(
+            "{:?}",
+            parse_sql("ALTER DOMAIN d ADD CHECK (VALUE <> 'it''s')").unwrap()
+        );
+        assert!(
+            domain.contains(r#"SingleQuotedString("alter domain d add check (value <> 'it''s')")"#),
+            "{domain}"
+        );
+        assert!(
+            one("CREATE DOMAIN d AS text NULL CONSTRAINT c CHECK (VALUE <> '') NOT NULL")
+                .contains(&format!("CHECK ({DOMAIN_NOT_NULL})"))
+        );
+        assert_eq!(
+            one("CREATE DOMAIN d AS varchar(3) NOT NULL CHECK (VALUE <> 'x') DEFAULT 'abc'"),
+            format!(
+                "CREATE DOMAIN d AS VARCHAR(3) DEFAULT 'abc' CHECK (value <> 'x') CHECK ({DOMAIN_NOT_NULL})"
+            )
+        );
         assert!(
             one("INSERT INTO t VALUES (1) ON CONFLICT (lower(e)) DO NOTHING")
                 .contains(&format!("ON CONSTRAINT \"{CONFLICT_EXPRESSIONS}lower(e)\""))

@@ -101,9 +101,12 @@ fn scalar_type(expr: &ScalarExpr, column: &impl Fn(&str) -> Option<String>) -> O
         }
         ScalarExpr::Literal(value) => literal_type(value),
         ScalarExpr::Cast { target, .. } => Some(target.clone()),
-        ScalarExpr::Binary { op, left, right } => {
-            binary_type(*op, scalar_type(left, column), scalar_type(right, column))
-        }
+        // Operators take a domain's values as its base type's.
+        ScalarExpr::Binary { op, left, right } => binary_type(
+            *op,
+            scalar_type(left, column).map(|t| crate::user_types::base_type(&t)),
+            scalar_type(right, column).map(|t| crate::user_types::base_type(&t)),
+        ),
         ScalarExpr::Unary {
             op: ScalarUnaryOp::Neg,
             expr,
@@ -285,6 +288,9 @@ pub(crate) fn check_integer_ranges(
     column: &impl Fn(&str) -> Option<String>,
 ) -> ScalarExpr {
     let checked = expr.map_children(&mut |e| check_integer_ranges(e, column));
+    if let Some(ordered) = enum_order(&checked, column) {
+        return ordered;
+    }
     // Date/time arithmetic takes its operators from its operands' types:
     // `time + interval` wraps at midnight, `date + interval` is a timestamp.
     let kind =
@@ -844,6 +850,118 @@ pub(crate) const DATETIME_OP: &str = "__DATETIME__";
 /// argument, or an error when that is outside the type named by the second.
 pub(crate) const INTEGER_RANGE: &str = "__INTEGER_RANGE__";
 
+/// The enum an expression's value is of, by name.
+fn enum_of(expr: &ScalarExpr, column: &impl Fn(&str) -> Option<String>) -> Option<String> {
+    let ty = scalar_type(expr, column)?;
+    crate::user_types::enum_type(&ty).map(|_| ty)
+}
+
+/// An enum value as its place in the enum's order.
+fn enum_place(expr: &ScalarExpr, ty: &str) -> ScalarExpr {
+    ScalarExpr::Function {
+        name: crate::user_types::ENUM_SORT.to_string(),
+        args: vec![
+            expr.clone(),
+            ScalarExpr::Literal(Value::Text(ty.to_string())),
+        ],
+    }
+}
+
+/// An expression over an enum as its order decides it: a comparison of
+/// its values compares their places, `min` and `max` pick by place, and
+/// `enum_range`, `enum_first`, and `enum_last` learn the enum.
+fn enum_order(expr: &ScalarExpr, column: &impl Fn(&str) -> Option<String>) -> Option<ScalarExpr> {
+    use ScalarBinaryOp as Op;
+    match expr {
+        ScalarExpr::Binary {
+            op: op @ (Op::Eq | Op::NotEq | Op::Lt | Op::LtEq | Op::Gt | Op::GtEq),
+            left,
+            right,
+        } => {
+            let ty = enum_of(left, column).or_else(|| enum_of(right, column))?;
+            Some(ScalarExpr::Binary {
+                op: *op,
+                left: Box::new(enum_place(left, &ty)),
+                right: Box::new(enum_place(right, &ty)),
+            })
+        }
+        ScalarExpr::Function { name, args }
+            if matches!(name.as_str(), "GREATEST" | "LEAST") && !args.is_empty() =>
+        {
+            let ty = args.iter().find_map(|a| enum_of(a, column))?;
+            Some(ScalarExpr::Function {
+                name: crate::user_types::ENUM_LABEL.to_string(),
+                args: vec![
+                    ScalarExpr::Function {
+                        name: name.clone(),
+                        args: args.iter().map(|a| enum_place(a, &ty)).collect(),
+                    },
+                    ScalarExpr::Literal(Value::Text(ty)),
+                ],
+            })
+        }
+        ScalarExpr::Function { name, args }
+            if matches!(name.as_str(), "ENUM_RANGE" | "ENUM_FIRST" | "ENUM_LAST")
+                && (1..=2).contains(&args.len()) =>
+        {
+            let ty = args.iter().find_map(|a| enum_of(a, column))?;
+            let mut args = args.clone();
+            args.push(ScalarExpr::Literal(Value::Text(ty)));
+            Some(ScalarExpr::Function {
+                name: name.clone(),
+                args,
+            })
+        }
+        ScalarExpr::Aggregate {
+            op: op @ (AggregateOp::Min | AggregateOp::Max),
+            arg,
+            arg_expr,
+            distinct,
+            extra_args,
+            filter,
+            order_by,
+        } => {
+            let input = arg_expr
+                .as_deref()
+                .cloned()
+                .unwrap_or_else(|| ScalarExpr::Column(arg.clone()));
+            let ty = enum_of(&input, column)?;
+            Some(ScalarExpr::Function {
+                name: crate::user_types::ENUM_LABEL.to_string(),
+                args: vec![
+                    ScalarExpr::Aggregate {
+                        op: op.clone(),
+                        arg: arg.clone(),
+                        arg_expr: Some(Box::new(enum_place(&input, &ty))),
+                        distinct: *distinct,
+                        extra_args: extra_args.clone(),
+                        filter: filter.clone(),
+                        order_by: order_by.clone(),
+                    },
+                    ScalarExpr::Literal(Value::Text(ty)),
+                ],
+            })
+        }
+        _ => None,
+    }
+}
+
+/// A sort key over an enum column, as its place in the enum's order.
+pub(crate) fn enum_sort_key(
+    name: &str,
+    column: &impl Fn(&str) -> Option<String>,
+) -> Option<ScalarExpr> {
+    enum_sort_expr(&ScalarExpr::Column(name.to_string()), column)
+}
+
+/// A sort key of an enum value, as its place in the enum's order.
+pub(crate) fn enum_sort_expr(
+    key: &ScalarExpr,
+    column: &impl Fn(&str) -> Option<String>,
+) -> Option<ScalarExpr> {
+    enum_of(key, column).map(|ty| enum_place(key, &ty))
+}
+
 /// A condition with [`check_integer_ranges`] applied to its expressions.
 pub(crate) fn check_filter_integer_ranges(
     filter: &crate::FilterExpr,
@@ -860,6 +978,29 @@ pub(crate) fn check_filter_integer_ranges(
             .is_some_and(|(_, padded)| padded)
     };
     match filter {
+        // An enum column compares in the enum's order.
+        F::Predicate(crate::Predicate { left, op, right })
+            if matches!(
+                op,
+                crate::CompareOp::Eq
+                    | crate::CompareOp::Ne
+                    | crate::CompareOp::Lt
+                    | crate::CompareOp::Le
+                    | crate::CompareOp::Gt
+                    | crate::CompareOp::Ge
+            ) && column(left).is_some_and(|t| crate::user_types::enum_type(&t).is_some()) =>
+        {
+            let ty = column(left).unwrap_or_default();
+            let right = match right {
+                crate::Operand::Literal(v) => ScalarExpr::Literal(v.clone()),
+                crate::Operand::Ident(name) => ScalarExpr::Column(name.clone()),
+            };
+            F::ExprCmp {
+                left: enum_place(&ScalarExpr::Column(left.clone()), &ty),
+                op: *op,
+                right: enum_place(&right, &ty),
+            }
+        }
         F::Predicate(crate::Predicate {
             left,
             op,

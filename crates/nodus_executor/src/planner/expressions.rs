@@ -52,6 +52,7 @@ pub fn expr_to_value(expr: &sqlparser::ast::Expr, params: &[crate::Value]) -> Op
             SqlValue::SingleQuotedString(s)
                 if crate::datetime::Kind::of_type(&ts.data_type.to_string())
                     != Some(crate::datetime::Kind::TimestampTz)
+                    && !crate::user_types::may_be_user_type(&ts.data_type.to_string())
                     && !["now", "today", "tomorrow", "yesterday"]
                         .contains(&s.trim().to_ascii_lowercase().as_str()) =>
             {
@@ -228,6 +229,10 @@ pub(crate) fn cast_value(v: Value, data_type: &str) -> Value {
 /// input, for callers that fall back to keeping the original value.
 pub(crate) fn try_cast(v: Value, data_type: &str) -> std::result::Result<Value, String> {
     use crate::value::ColumnType;
+    // A user type checks even a NULL (a `NOT NULL` domain refuses it).
+    if let Some(t) = crate::user_types::lookup(data_type) {
+        return crate::user_types::coerce(&t, &v, true);
+    }
     if matches!(v, Value::Null) {
         return Ok(Value::Null);
     }
@@ -244,6 +249,13 @@ pub(crate) fn try_cast(v: Value, data_type: &str) -> std::result::Result<Value, 
                 })
                 .collect::<std::result::Result<_, _>>()
                 .map(Value::Array),
+            // A user type's elements are checked one by one.
+            Value::Text(s) if crate::user_types::lookup(element_type).is_some() => {
+                match crate::value::parse_array_literal(&s) {
+                    Some(items) => try_cast(Value::Array(items), data_type),
+                    None => Err(format!("malformed array literal: \"{s}\"")),
+                }
+            }
             Value::Text(s) => crate::value::coerce_array_text(&s, data_type)
                 .ok_or_else(|| format!("malformed array literal: \"{s}\"")),
             other => Err(format!(

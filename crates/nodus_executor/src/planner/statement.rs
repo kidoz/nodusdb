@@ -384,6 +384,12 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                     if_exists: *if_exists,
                     cascade: *cascade,
                 }),
+                sqlparser::ast::ObjectType::Type => Ok(LogicalPlan::DropType {
+                    names: names.iter().map(|n| n.to_string()).collect(),
+                    if_exists: *if_exists,
+                    cascade: *cascade,
+                    domain: false,
+                }),
                 // Dropping only the first of several names would report the
                 // others dropped too.
                 _ if names.len() > 1 => {
@@ -748,6 +754,12 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                 change: sequence_change(options, params)?,
             })
         }
+        Statement::Query(query) if rewritten_call(query, nodus_sql::DOMAIN_FUNCTION).is_some() => {
+            match rewritten_call(query, nodus_sql::DOMAIN_FUNCTION).as_deref() {
+                Some([crate::Value::Text(text)]) => plan_domain_statement(text),
+                _ => anyhow::bail!("malformed domain statement"),
+            }
+        }
         Statement::Query(query) if refresh_target(query).is_some() => {
             let (name, with_data) = refresh_target(query).expect("guarded by the match arm");
             Ok(LogicalPlan::RefreshMaterializedView { name, with_data })
@@ -984,6 +996,81 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
             name: (!name.value.eq_ignore_ascii_case("all") || name.quote_style.is_some())
                 .then(|| name.value.clone()),
         }),
+        Statement::CreateType {
+            name,
+            representation: Some(sqlparser::ast::UserDefinedTypeRepresentation::Enum { labels }),
+        } => Ok(LogicalPlan::CreateType {
+            name: name.to_string(),
+            definition: crate::user_types::TypeDefinition::Enum {
+                labels: labels
+                    .iter()
+                    .enumerate()
+                    .map(|(i, label)| crate::user_types::EnumLabel {
+                        label: label.value.clone(),
+                        sort: (i + 1) as f64,
+                    })
+                    .collect(),
+            },
+        }),
+        Statement::CreateType { .. } => {
+            anyhow::bail!("CREATE TYPE is not supported but for enums (AS ENUM)")
+        }
+        Statement::CreateDomain(domain) => {
+            let mut definition = crate::user_types::DomainDefinition {
+                base: domain.data_type.to_string(),
+                default: domain.default.as_ref().map(|e| e.to_string()),
+                ..Default::default()
+            };
+            for constraint in &domain.constraints {
+                match constraint {
+                    sqlparser::ast::TableConstraint::Check(check) => {
+                        if matches!(&*check.expr, Expr::Identifier(id) if id.value == nodus_sql::DOMAIN_NOT_NULL)
+                        {
+                            definition.not_null = true;
+                        } else {
+                            definition.checks.push(crate::user_types::DomainCheck {
+                                name: check
+                                    .name
+                                    .as_ref()
+                                    .map(|n| n.value.clone())
+                                    .unwrap_or_default(),
+                                sql: check.expr.to_string(),
+                            });
+                        }
+                    }
+                    other => anyhow::bail!("domain constraint {other} is not supported"),
+                }
+            }
+            Ok(LogicalPlan::CreateType {
+                name: domain.name.to_string(),
+                definition: crate::user_types::TypeDefinition::Domain(definition),
+            })
+        }
+        Statement::AlterType(alter) => {
+            use sqlparser::ast::{AlterTypeAddValuePosition as Position, AlterTypeOperation as Op};
+            let change = match &alter.operation {
+                Op::Rename(rename) => crate::user_types::TypeChange::Rename {
+                    new_name: rename.new_name.value.clone(),
+                },
+                Op::AddValue(add) => crate::user_types::TypeChange::AddValue {
+                    label: add.value.value.clone(),
+                    if_not_exists: add.if_not_exists,
+                    position: add.position.as_ref().map(|p| match p {
+                        Position::Before(neighbor) => (true, neighbor.value.clone()),
+                        Position::After(neighbor) => (false, neighbor.value.clone()),
+                    }),
+                },
+                Op::RenameValue(rename) => crate::user_types::TypeChange::RenameValue {
+                    from: rename.from.value.clone(),
+                    to: rename.to.value.clone(),
+                },
+            };
+            Ok(LogicalPlan::AlterType {
+                name: alter.name.to_string(),
+                change,
+                domain: false,
+            })
+        }
         Statement::Lock(lock) => Ok(LogicalPlan::LockTable {
             tables: lock.tables.iter().map(|t| t.name.to_string()).collect(),
         }),
@@ -1117,6 +1204,98 @@ fn explain_options(
 
 /// Whether `WITH [NO] DATA` said `NO DATA`; the SQL front end records it as
 /// the storage parameter [`nodus_sql::NO_DATA_OPTION`].
+/// Plans `ALTER DOMAIN` or `DROP DOMAIN`, which the SQL front end passes as
+/// their text ([`nodus_sql::DOMAIN_FUNCTION`]).
+fn plan_domain_statement(text: &str) -> Result<LogicalPlan> {
+    use crate::user_types::TypeChange;
+    use sqlparser::keywords::Keyword as K;
+    use sqlparser::tokenizer::Token;
+    let dialect = sqlparser::dialect::PostgreSqlDialect {};
+    let mut p = sqlparser::parser::Parser::new(&dialect).try_with_sql(text)?;
+    if p.parse_keywords(&[K::DROP, K::DOMAIN]) {
+        let if_exists = p.parse_keywords(&[K::IF, K::EXISTS]);
+        let names = p.parse_comma_separated(|p| p.parse_object_name(false))?;
+        let cascade = p.parse_keyword(K::CASCADE);
+        if !cascade {
+            p.parse_keyword(K::RESTRICT);
+        }
+        expect_end(&mut p)?;
+        return Ok(LogicalPlan::DropType {
+            names: names.iter().map(|n| n.to_string()).collect(),
+            if_exists,
+            cascade,
+            domain: true,
+        });
+    }
+    p.expect_keywords(&[K::ALTER, K::DOMAIN])?;
+    let name = p.parse_object_name(false)?.to_string();
+    let change = if p.parse_keywords(&[K::SET, K::DEFAULT]) {
+        TypeChange::SetDefault(Some(p.parse_expr()?.to_string()))
+    } else if p.parse_keywords(&[K::DROP, K::DEFAULT]) {
+        TypeChange::SetDefault(None)
+    } else if p.parse_keywords(&[K::SET, K::NOT, K::NULL]) {
+        TypeChange::SetNotNull(true)
+    } else if p.parse_keywords(&[K::DROP, K::NOT, K::NULL]) {
+        TypeChange::SetNotNull(false)
+    } else if p.parse_keyword(K::ADD) {
+        let constraint = if p.parse_keyword(K::CONSTRAINT) {
+            Some(p.parse_identifier()?.value)
+        } else {
+            None
+        };
+        if p.parse_keywords(&[K::NOT, K::NULL]) {
+            TypeChange::SetNotNull(true)
+        } else {
+            p.expect_keyword(K::CHECK)?;
+            p.expect_token(&Token::LParen)?;
+            let expr = p.parse_expr()?;
+            p.expect_token(&Token::RParen)?;
+            TypeChange::AddConstraint {
+                name: constraint,
+                sql: expr.to_string(),
+            }
+        }
+    } else if p.parse_keywords(&[K::DROP, K::CONSTRAINT]) {
+        let if_exists = p.parse_keywords(&[K::IF, K::EXISTS]);
+        TypeChange::DropConstraint {
+            name: p.parse_identifier()?.value,
+            if_exists,
+        }
+    } else if p.parse_keywords(&[K::RENAME, K::CONSTRAINT]) {
+        let from = p.parse_identifier()?.value;
+        p.expect_keyword(K::TO)?;
+        TypeChange::RenameConstraint {
+            from,
+            to: p.parse_identifier()?.value,
+        }
+    } else if p.parse_keywords(&[K::RENAME, K::TO]) {
+        TypeChange::Rename {
+            new_name: p.parse_identifier()?.value,
+        }
+    } else if p.parse_keywords(&[K::OWNER, K::TO]) || p.parse_keyword(K::VALIDATE) {
+        TypeChange::Nothing
+    } else {
+        anyhow::bail!("{} is not supported", text.to_ascii_uppercase());
+    };
+    if change != TypeChange::Nothing {
+        expect_end(&mut p)?;
+    }
+    Ok(LogicalPlan::AlterType {
+        name,
+        change,
+        domain: true,
+    })
+}
+
+/// Fails, as the parser would, on anything after a statement's end.
+fn expect_end(p: &mut sqlparser::parser::Parser) -> Result<()> {
+    let next = p.peek_token();
+    if next.token != sqlparser::tokenizer::Token::EOF {
+        anyhow::bail!("syntax error at or near \"{}\"", next.token);
+    }
+    Ok(())
+}
+
 fn has_no_data_marker(options: &sqlparser::ast::CreateTableOptions) -> bool {
     match options {
         sqlparser::ast::CreateTableOptions::With(options) => options.iter().any(|option| {

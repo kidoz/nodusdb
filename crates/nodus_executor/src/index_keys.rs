@@ -169,7 +169,7 @@ pub(crate) fn index_expression_text(sql: &str) -> String {
     while let sqlparser::ast::Expr::Nested(inner) = bare {
         bare = inner;
     }
-    let text = deparse(bare);
+    let text = deparse(bare, false);
     match bare {
         sqlparser::ast::Expr::Function(_) => text,
         _ => format!("({text})"),
@@ -183,16 +183,26 @@ fn parse_sql_expr(sql: &str) -> Option<sqlparser::ast::Expr> {
         .ok()
 }
 
+/// A domain constraint's SQL as PostgreSQL prints it back, its value as
+/// `VALUE`.
+pub(crate) fn deparse_domain_sql(sql: &str) -> String {
+    parse_sql_expr(sql).map_or_else(|| sql.to_string(), |e| deparse(&e, true))
+}
+
 /// An expression's SQL as PostgreSQL prints it back (`pg_get_indexdef`,
 /// `pg_get_constraintdef`): each operation in parentheses, a string
 /// literal with its type.
 pub(crate) fn deparse_sql(sql: &str) -> String {
-    parse_sql_expr(sql).map_or_else(|| sql.to_string(), |e| deparse(&e))
+    parse_sql_expr(sql).map_or_else(|| sql.to_string(), |e| deparse(&e, false))
 }
 
-fn deparse(expr: &sqlparser::ast::Expr) -> String {
+fn deparse(expr: &sqlparser::ast::Expr, domain: bool) -> String {
     use sqlparser::ast::{BinaryOperator as B, Expr, Value as V};
     match expr {
+        // A domain's constraint names its value `VALUE`.
+        Expr::Identifier(id) if domain && id.quote_style.is_none() && id.value == "value" => {
+            "VALUE".to_string()
+        }
         Expr::Identifier(id) => quote_ident(&id.value),
         Expr::CompoundIdentifier(ids) => ids
             .iter()
@@ -203,13 +213,17 @@ fn deparse(expr: &sqlparser::ast::Expr) -> String {
             V::SingleQuotedString(s) => format!("'{}'::text", s.replace('\'', "''")),
             other => other.to_string(),
         },
-        Expr::Nested(inner) => deparse(inner),
+        Expr::Nested(inner) => deparse(inner, domain),
         Expr::BinaryOp { left, op, right } => {
             let op = match op {
                 B::NotEq => "<>".to_string(),
                 other => other.to_string(),
             };
-            format!("({} {op} {})", deparse(left), deparse(right))
+            format!(
+                "({} {op} {})",
+                deparse(left, domain),
+                deparse(right, domain)
+            )
         }
         Expr::Like {
             negated,
@@ -219,9 +233,9 @@ fn deparse(expr: &sqlparser::ast::Expr) -> String {
             any: false,
         } => format!(
             "({} {} {})",
-            deparse(expr),
+            deparse(expr, domain),
             if *negated { "!~~" } else { "~~" },
-            deparse(pattern)
+            deparse(pattern, domain)
         ),
         Expr::ILike {
             negated,
@@ -231,12 +245,12 @@ fn deparse(expr: &sqlparser::ast::Expr) -> String {
             any: false,
         } => format!(
             "({} {} {})",
-            deparse(expr),
+            deparse(expr, domain),
             if *negated { "!~~*" } else { "~~*" },
-            deparse(pattern)
+            deparse(pattern, domain)
         ),
-        Expr::IsNull(inner) => format!("({} IS NULL)", deparse(inner)),
-        Expr::IsNotNull(inner) => format!("({} IS NOT NULL)", deparse(inner)),
+        Expr::IsNull(inner) => format!("({} IS NULL)", deparse(inner, domain)),
+        Expr::IsNotNull(inner) => format!("({} IS NOT NULL)", deparse(inner, domain)),
         Expr::Function(f) => {
             let args = match &f.args {
                 sqlparser::ast::FunctionArguments::List(list) => list
@@ -245,7 +259,7 @@ fn deparse(expr: &sqlparser::ast::Expr) -> String {
                     .map(|arg| match arg {
                         sqlparser::ast::FunctionArg::Unnamed(
                             sqlparser::ast::FunctionArgExpr::Expr(e),
-                        ) => deparse(e),
+                        ) => deparse(e, domain),
                         other => other.to_string(),
                     })
                     .collect::<Vec<_>>()
@@ -306,6 +320,11 @@ mod tests {
         assert_eq!(
             index_expression_text("(first || ' ' || last)"),
             "(((first || ' '::text) || last))"
+        );
+        assert_eq!(deparse_domain_sql("value > 0"), "(VALUE > 0)");
+        assert_eq!(
+            deparse_domain_sql("value LIKE '%@%'"),
+            "(VALUE ~~ '%@%'::text)"
         );
         assert_eq!(deparse_sql("lower(value)"), "lower(value)");
         assert_eq!(

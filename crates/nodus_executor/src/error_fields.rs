@@ -27,7 +27,8 @@ impl DbError {
         self
     }
 
-    /// The SQLSTATE of a notice, when it is not `00000`.
+    /// The SQLSTATE: of an error, when its message does not decide it; of
+    /// a notice, when it is not `00000`.
     pub(crate) fn code(self, code: &str) -> Self {
         self.field("code", code)
     }
@@ -65,6 +66,10 @@ impl DbError {
     pub(crate) fn constraint(self, constraint: impl AsRef<str>) -> Self {
         self.field("constraint", constraint)
     }
+
+    pub(crate) fn datatype(self, datatype: impl AsRef<str>) -> Self {
+        self.field("datatype", datatype)
+    }
 }
 
 impl From<DbError> for anyhow::Error {
@@ -79,7 +84,8 @@ pub fn error_message(error: &str) -> &str {
 }
 
 /// An error's fields, as `(name, value)` pairs: `detail`, `hint`, `schema`,
-/// `table`, `column`, `constraint`, and for a notice `code`.
+/// `table`, `column`, `datatype`, `constraint`, and `code` (its SQLSTATE,
+/// when the message alone does not decide it).
 pub fn error_fields(error: &str) -> Vec<(&str, &str)> {
     error
         .split(SEPARATOR)

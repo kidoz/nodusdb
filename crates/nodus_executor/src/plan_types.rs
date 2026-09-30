@@ -1376,6 +1376,24 @@ pub enum LogicalPlan {
     Deallocate {
         name: Option<String>,
     },
+    /// `CREATE TYPE name AS ENUM (...)` or `CREATE DOMAIN name AS ...`.
+    CreateType {
+        name: String,
+        definition: crate::user_types::TypeDefinition,
+    },
+    /// `ALTER TYPE name ...` or, with `domain`, `ALTER DOMAIN name ...`.
+    AlterType {
+        name: String,
+        change: crate::user_types::TypeChange,
+        domain: bool,
+    },
+    /// `DROP TYPE names` or, with `domain`, `DROP DOMAIN names`.
+    DropType {
+        names: Vec<String>,
+        if_exists: bool,
+        cascade: bool,
+        domain: bool,
+    },
     /// `LOCK [TABLE] names [IN mode MODE] [NOWAIT]`.
     LockTable {
         tables: Vec<String>,

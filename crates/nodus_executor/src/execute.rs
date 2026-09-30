@@ -346,6 +346,20 @@ impl MemExecutor {
                 local,
             } => self.exec_set_variable(ctx, variable, value, local),
             LogicalPlan::Noop { tag } => Ok(QueryOutput::tag(&tag)),
+            LogicalPlan::CreateType { name, definition } => {
+                self.exec_create_type(ctx, name, definition)
+            }
+            LogicalPlan::AlterType {
+                name,
+                change,
+                domain,
+            } => self.exec_alter_type(ctx, name, change, domain),
+            LogicalPlan::DropType {
+                names,
+                if_exists,
+                cascade,
+                domain,
+            } => self.exec_drop_type(ctx, names, if_exists, cascade, domain),
             LogicalPlan::SelectLiteral {
                 values,
                 filter,

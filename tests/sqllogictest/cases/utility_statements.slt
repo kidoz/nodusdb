@@ -149,4 +149,4 @@ statement error
 CREATE EXTENSION pgcrypto;
 
 statement error
-CREATE TYPE mood AS ENUM ('a');
+CREATE TYPE pair AS (a int, b int);

@@ -495,8 +495,16 @@ impl MemExecutor {
             // generated column or a `GENERATED ALWAYS` identity takes no value.
             // Every column is checked before any default runs, so a refused
             // row draws no identity value.
-            let defaults: Vec<Option<ScalarExpr>> =
-                tbl.columns.iter().map(Self::column_default).collect();
+            // A column of a domain without a default of its own takes the
+            // domain's.
+            let defaults: Vec<Option<ScalarExpr>> = tbl
+                .columns
+                .iter()
+                .map(|c| {
+                    Self::column_default(c)
+                        .or_else(|| crate::user_types::domain_default(&c.data_type))
+                })
+                .collect();
             for (i, c) in tbl.columns.iter().enumerate() {
                 let default = defaults[i].clone();
                 let identity = default.as_ref().and_then(crate::sequences::identity_kind);
@@ -535,6 +543,14 @@ impl MemExecutor {
                     return Err(error.into());
                 }
             }
+            // A column left NULL that its type refuses fails before any
+            // default is drawn (as PostgreSQL finds it when planning).
+            for (i, c) in tbl.columns.iter().enumerate() {
+                if !provided[i] && defaults[i].is_none() {
+                    crate::value::coerce_for_column(&Value::Null, &c.data_type);
+                }
+            }
+            crate::eval_error::check()?;
             for (i, default) in defaults.into_iter().enumerate() {
                 if !provided[i]
                     && let Some(expr) = default
@@ -549,6 +565,8 @@ impl MemExecutor {
                 .enumerate()
                 .map(|(i, c)| crate::value::coerce_for_column(&raw[i], &c.data_type))
                 .collect();
+            // A value its column's type refuses fails before any constraint.
+            crate::eval_error::check()?;
             Self::compute_generated(&tbl, &mut row, &col_names);
             self.check_not_null(&tbl, &row)?;
 
@@ -1098,6 +1116,7 @@ impl MemExecutor {
             // generated column is recomputed below.
             let val = if is_default {
                 default
+                    .or_else(|| crate::user_types::domain_default(&tbl.columns[idx].data_type))
                     .filter(|d| Self::generation_expr(d).is_none())
                     .map(|e| eval_scalar_expr(&e, &[], &[]))
                     .unwrap_or(Value::Null)
@@ -1106,6 +1125,8 @@ impl MemExecutor {
             };
             row[idx] = crate::value::coerce_for_column(&val, &tbl.columns[idx].data_type);
         }
+        // A value its column's type refuses fails before any constraint.
+        crate::eval_error::check()?;
         let col_names: Vec<String> = tbl.columns.iter().map(|c| c.name.clone()).collect();
         Self::compute_generated(tbl, &mut row, &col_names);
         self.check_not_null(tbl, &row)?;

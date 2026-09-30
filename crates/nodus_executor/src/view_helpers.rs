@@ -122,7 +122,7 @@ impl MemExecutor {
                 "JSON" => 199,
                 "JSONB" => 3807,
                 "REGTYPE" => 2211,
-                _ => 1009,
+                _ => crate::user_types::type_oid(data_type).unwrap_or(1009),
             };
         }
         match base {
@@ -161,7 +161,7 @@ impl MemExecutor {
             "REGNAMESPACE" => 4089,
             "REGCONFIG" => 3734,
             "REGDICTIONARY" => 3769,
-            _ => 25,
+            _ => crate::user_types::type_oid(data_type).unwrap_or(25),
         }
     }
 

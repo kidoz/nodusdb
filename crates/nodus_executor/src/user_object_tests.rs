@@ -1,7 +1,104 @@
-//! Indexes on expressions, driven through SQL.
+//! Enums, domains, and indexes on expressions, driven through SQL.
 
 use crate::constraint_tests::{field, fields, session};
 use crate::dml_join_tests::rows;
+
+/// A result's rows in their order, each as its values joined by `|`.
+fn ordered(out: &crate::QueryOutput) -> Vec<String> {
+    out.rows
+        .iter()
+        .map(|r| {
+            r.values
+                .iter()
+                .map(crate::render)
+                .collect::<Vec<_>>()
+                .join("|")
+        })
+        .collect()
+}
+
+#[test]
+fn enums_order_by_their_labels_and_refuse_others() {
+    let (sql, notices) = session();
+    sql("CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')").unwrap();
+    sql("CREATE TABLE p (name text, m mood)").unwrap();
+    sql("INSERT INTO p VALUES ('a', 'happy'), ('b', 'sad'), ('c', 'ok')").unwrap();
+    let (message, f) = fields(sql("INSERT INTO p VALUES ('d', 'angry')").unwrap_err());
+    assert_eq!(message, "invalid input value for enum mood: \"angry\"");
+    assert_eq!(field(&f, "code").as_deref(), Some("22P02"));
+    assert_eq!(
+        ordered(&sql("SELECT name FROM p ORDER BY m").unwrap()),
+        ["b", "c", "a"]
+    );
+    assert_eq!(
+        rows(&sql("SELECT name FROM p WHERE m > 'ok'").unwrap()),
+        ["a"]
+    );
+    let out = sql("SELECT min(m), max(m), pg_typeof(min(m)) FROM p").unwrap();
+    assert_eq!(out.rows[0].values[0], crate::Value::Text("sad".into()));
+    assert_eq!(out.rows[0].values[1], crate::Value::Text("happy".into()));
+
+    sql("ALTER TYPE mood ADD VALUE 'meh' BEFORE 'ok'").unwrap();
+    sql("ALTER TYPE mood ADD VALUE IF NOT EXISTS 'meh'").unwrap();
+    assert_eq!(notices(), ["enum label \"meh\" already exists, skipping"]);
+    let out = sql("SELECT enum_range(NULL::mood)::text").unwrap();
+    assert_eq!(rows(&out), ["{sad,meh,ok,happy}"]);
+    sql("ALTER TYPE mood RENAME VALUE 'ok' TO 'fine'").unwrap();
+    assert_eq!(
+        rows(&sql("SELECT m FROM p WHERE name = 'c'").unwrap()),
+        ["fine"]
+    );
+    // A type is no relation.
+    assert!(sql("SELECT * FROM mood").is_err());
+    let (message, f) = fields(sql("DROP TYPE mood").unwrap_err());
+    assert_eq!(
+        message,
+        "cannot drop type mood because other objects depend on it"
+    );
+    assert_eq!(
+        field(&f, "detail").as_deref(),
+        Some("column m of table p depends on type mood")
+    );
+    sql("DROP TYPE mood CASCADE").unwrap();
+    let out = sql("SELECT * FROM p ORDER BY name").unwrap();
+    assert_eq!(out.columns, ["name"]);
+}
+
+#[test]
+fn domains_check_stored_and_cast_values() {
+    let (sql, _) = session();
+    sql("CREATE DOMAIN pos AS int CHECK (VALUE > 0)").unwrap();
+    sql("CREATE DOMAIN email AS text NOT NULL CHECK (VALUE LIKE '%@%')").unwrap();
+    sql("CREATE DOMAIN code AS varchar(3) DEFAULT 'abc'").unwrap();
+    sql("CREATE TABLE acct (id pos PRIMARY KEY, mail email, c code)").unwrap();
+    let out = sql("INSERT INTO acct (id, mail) VALUES (1, 'a@b') RETURNING c").unwrap();
+    assert_eq!(rows(&out), ["abc"]);
+    let (message, f) = fields(sql("INSERT INTO acct VALUES (0, 'a@b')").unwrap_err());
+    assert_eq!(
+        message,
+        "value for domain pos violates check constraint \"pos_check\""
+    );
+    assert_eq!(field(&f, "code").as_deref(), Some("23514"));
+    assert_eq!(field(&f, "datatype").as_deref(), Some("pos"));
+    let (message, _) = fields(sql("INSERT INTO acct VALUES (2, NULL)").unwrap_err());
+    assert_eq!(message, "domain email does not allow null values");
+    assert!(sql("SELECT (-1)::pos").is_err());
+    // Operators take the base type's values.
+    let out = sql("SELECT id + 1, pg_typeof(id), pg_typeof(id + 1) FROM acct").unwrap();
+    assert_eq!(out.rows[0].values[0], crate::Value::Int(2));
+    assert_eq!(out.rows[0].values[1], crate::Value::Text("pos".into()));
+    assert_eq!(out.rows[0].values[2], crate::Value::Text("integer".into()));
+
+    sql("ALTER DOMAIN pos ADD CONSTRAINT pos_small CHECK (VALUE < 100)").unwrap();
+    assert!(sql("INSERT INTO acct VALUES (100, 'x@y')").is_err());
+    sql("ALTER DOMAIN pos DROP CONSTRAINT pos_small").unwrap();
+    sql("INSERT INTO acct VALUES (100, 'x@y')").unwrap();
+    let out =
+        sql("SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE contypid = 'pos'::regtype")
+            .unwrap();
+    assert_eq!(rows(&out), ["CHECK ((VALUE > 0))"]);
+    assert!(sql("DROP DOMAIN pos").is_err());
+}
 
 #[test]
 fn indexes_on_expressions_keep_their_keys_unique() {
