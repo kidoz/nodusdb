@@ -1,0 +1,71 @@
+# Fractional-second precision: temporal columns and casts round to the
+# type's precision, half away from PostgreSQL's 2000-01-01 epoch.
+# Expected results come from PostgreSQL 18.
+statement ok
+CREATE TABLE tp (ts timestamp(3), tz timestamptz(3), tm time(3), ts0 timestamp(0));
+
+statement ok
+INSERT INTO tp VALUES ('2020-01-01 00:00:00.123456', '2020-01-01 00:00:00.1235+00', '12:00:00.9999', '2020-01-01 00:00:00.6');
+
+query TTTT
+SELECT ts, tz, tm, ts0 FROM tp;
+----
+2020-01-01 00:00:00.123	2020-01-01 00:00:00.124+00	12:00:01	2020-01-01 00:00:01
+
+statement ok
+UPDATE tp SET ts = '2021-06-06 06:06:06.6664';
+
+query T
+SELECT ts FROM tp;
+----
+2021-06-06 06:06:06.666
+
+query T
+SELECT '2020-01-01 00:00:00.1235'::timestamp(3);
+----
+2020-01-01 00:00:00.124
+
+query T
+SELECT '1999-01-01 00:00:00.1235'::timestamp(3);
+----
+1999-01-01 00:00:00.123
+
+query T
+SELECT '1999-01-01 00:00:00.1245'::timestamp(3);
+----
+1999-01-01 00:00:00.124
+
+query T
+SELECT '1969-12-31 23:59:59.1235+00'::timestamptz(3);
+----
+1969-12-31 23:59:59.123+00
+
+query T
+SELECT '2020-01-01 00:00:00.123456+00'::timestamptz(3);
+----
+2020-01-01 00:00:00.123+00
+
+query T
+SELECT '23:59:59.6'::time(0);
+----
+24:00:00
+
+query T
+SELECT '12:00:00.9999'::time(3);
+----
+12:00:01
+
+query T
+SELECT '2020-01-01 23:59:59.9999'::timestamp(3);
+----
+2020-01-02 00:00:00
+
+query T
+SELECT to_char('2020-01-01 00:00:00.123456'::timestamp(3), 'HH24:MI:SS.US');
+----
+00:00:00.123000
+
+query T
+SELECT extract(microseconds from '2020-01-01 00:00:00.123456'::timestamp(3));
+----
+123000

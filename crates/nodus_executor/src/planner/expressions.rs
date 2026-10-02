@@ -426,7 +426,9 @@ pub(crate) fn try_cast(v: Value, data_type: &str) -> std::result::Result<Value, 
                 }
                 Value::Text(s) if let Some(kind) = crate::value::temporal_type(data_type) => {
                     match crate::value::normalize_temporal(s, kind) {
-                        Some(text) => Value::Text(text),
+                        Some(text) => {
+                            Value::Text(crate::value::apply_temporal_typmod(&text, data_type))
+                        }
                         // Well-formed but impossible (`2024-02-30`, `25:00`).
                         None if crate::value::looks_temporal(s) => {
                             return Err(format!("date/time field value out of range: \"{s}\""));

@@ -1142,6 +1142,59 @@ pub(crate) fn looks_temporal(text: &str) -> bool {
         || is_numeric_parts(text.split('.').next().unwrap_or_default(), ':', 3)
 }
 
+/// The fractional-second precision a temporal type names (`TIMESTAMP(3)`).
+fn fractional_precision(data_type: &str) -> Option<u32> {
+    let open = data_type.find('(')?;
+    let close = data_type[open..].find(')')? + open;
+    data_type[open + 1..close].trim().parse().ok()
+}
+
+/// `text` (a canonical temporal of the type's kind) rounded to the precision
+/// the type names: `'…00.1235'::timestamp(3)` is `…00.124`, and rounding may
+/// carry into the next second, minute, day, or `24:00:00`.
+pub(crate) fn apply_temporal_typmod(text: &str, data_type: &str) -> String {
+    let Some(precision) = fractional_precision(data_type).map(|p| p.min(6)) else {
+        return text.to_string();
+    };
+    if precision == 6 || matches!(text, "infinity" | "-infinity") {
+        return text.to_string();
+    }
+    let step = 10i64.pow(6 - precision);
+    // PostgreSQL rounds half away from zero relative to its 2000-01-01 epoch,
+    // so a value before it rounds the other way on the wall clock.
+    let round = |micros: i64| {
+        if micros >= 0 {
+            (micros + step / 2) / step * step
+        } else {
+            -((-micros + step / 2) / step * step)
+        }
+    };
+    // Microseconds from 1970-01-01 to PostgreSQL's epoch.
+    const EPOCH_2000: i64 = 946_684_800_000_000;
+    match temporal_type(data_type) {
+        Some(Temporal::Time) => crate::datetime::time_micros(text)
+            .map(|micros| crate::datetime::format_time(round(micros)))
+            .unwrap_or_else(|| text.to_string()),
+        Some(Temporal::TimestampTz) => parse_temporal(text)
+            .map(|parsed| {
+                let micros = parsed.utc().and_utc().timestamp_micros() - EPOCH_2000;
+                chrono::DateTime::from_timestamp_micros(round(micros) + EPOCH_2000)
+                    .map(|dt| format_timestamp(dt.naive_utc(), true))
+                    .unwrap_or_else(|| text.to_string())
+            })
+            .unwrap_or_else(|| text.to_string()),
+        Some(Temporal::Timestamp) => parse_temporal(text)
+            .map(|parsed| {
+                let micros = parsed.local().and_utc().timestamp_micros() - EPOCH_2000;
+                chrono::DateTime::from_timestamp_micros(round(micros) + EPOCH_2000)
+                    .map(|dt| format_timestamp(dt.naive_utc(), false))
+                    .unwrap_or_else(|| text.to_string())
+            })
+            .unwrap_or_else(|| text.to_string()),
+        _ => text.to_string(),
+    }
+}
+
 /// PostgreSQL's timestamp text: seconds always shown, a fraction only when
 /// non-zero, and `+00` for a timestamp with time zone (shown in UTC).
 pub(crate) fn format_timestamp(ts: chrono::NaiveDateTime, with_zone: bool) -> String {
@@ -1267,6 +1320,52 @@ mod tests {
         assert_eq!(float4_text(1e6), "1e+06");
         assert_eq!(float4_text(1234567.0), "1.234567e+06");
         assert_eq!(float4_text(100000.0), "100000");
+    }
+
+    #[test]
+    fn temporal_typmods_round_half_away_from_the_2000_epoch() {
+        let cast = |text: &str, ty: &str| apply_temporal_typmod(text, ty);
+        assert_eq!(
+            cast("2020-01-01 00:00:00.123456", "TIMESTAMP(3)"),
+            "2020-01-01 00:00:00.123"
+        );
+        assert_eq!(
+            cast("2020-01-01 00:00:00.1235", "TIMESTAMP(3)"),
+            "2020-01-01 00:00:00.124"
+        );
+        assert_eq!(
+            cast("2020-01-01 23:59:59.9999", "TIMESTAMP(3)"),
+            "2020-01-02 00:00:00"
+        );
+        // Before PostgreSQL's epoch a tie rounds the other way on the clock.
+        assert_eq!(
+            cast("1999-01-01 00:00:00.1235", "TIMESTAMP(3)"),
+            "1999-01-01 00:00:00.123"
+        );
+        assert_eq!(
+            cast("1999-01-01 00:00:00.1245", "TIMESTAMP(3)"),
+            "1999-01-01 00:00:00.124"
+        );
+        assert_eq!(
+            cast("1969-12-31 23:59:59.1235+00", "TIMESTAMPTZ(3)"),
+            "1969-12-31 23:59:59.123+00"
+        );
+        assert_eq!(
+            cast("2020-01-01 00:00:00.123456+00", "TIMESTAMPTZ(3)"),
+            "2020-01-01 00:00:00.123+00"
+        );
+        assert_eq!(cast("23:59:59.6", "TIME(0)"), "24:00:00");
+        assert_eq!(cast("12:00:00.9999", "TIME(3)"), "12:00:01");
+        // No precision, or one the text already has, leaves it alone.
+        assert_eq!(
+            cast("2020-01-01 00:00:00.123456", "TIMESTAMP"),
+            "2020-01-01 00:00:00.123456"
+        );
+        assert_eq!(
+            cast("2020-01-01 00:00:00.123456", "TIMESTAMP(6)"),
+            "2020-01-01 00:00:00.123456"
+        );
+        assert_eq!(cast("infinity", "TIMESTAMP(3)"), "infinity");
     }
 
     #[test]
