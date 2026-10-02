@@ -317,9 +317,53 @@ fn type_ddl_is_authorized() {
 #[test]
 fn a_cast_to_an_unknown_type_is_refused() {
     let (sql, _) = session();
-    let (message, f) = fields(sql("SELECT 'x'::nosuch").unwrap_err());
-    assert_eq!(message, "type \"nosuch\" does not exist");
-    assert_eq!(field(&f, "code").as_deref(), Some("42704"));
+    // As a cast, a column, an attribute, or a domain's base.
+    for sql_text in [
+        "SELECT 'x'::nosuch",
+        "CREATE TABLE bt (x nosuch)",
+        "CREATE TABLE bt (x nosuch[])",
+        "CREATE TYPE bc AS (x nosuch)",
+        "CREATE DOMAIN bd AS nosuch",
+    ] {
+        let (message, f) = fields(sql(sql_text).unwrap_err());
+        assert!(
+            message.starts_with("type \"nosuch"),
+            "{sql_text}: {message}"
+        );
+        assert_eq!(field(&f, "code").as_deref(), Some("42704"), "{sql_text}");
+    }
+    sql("CREATE TABLE bt (x nosuch)").unwrap_err();
+    // A cast to a user type's value keeps the type (`mood[]` too), even
+    // though the cast is folded while the statement is planned.
+    sql("CREATE TYPE mood AS ENUM ('a', 'b')").unwrap();
+    sql("CREATE TABLE tm (m mood, ms mood[])").unwrap();
+    sql("INSERT INTO tm VALUES ('a'::mood, ARRAY['b']::mood[])").unwrap();
+    assert_eq!(rows(&sql("SELECT m, ms[1] FROM tm").unwrap()), ["a|b"]);
+    let (message, _) = fields(sql("INSERT INTO tm VALUES ('c'::mood, NULL)").unwrap_err());
+    assert_eq!(message, "invalid input value for enum mood: \"c\"");
+    // The interval's word forms name the type too.
+    sql("CREATE TABLE ti (i interval day to second)").unwrap();
+}
+
+#[test]
+fn dropping_a_type_cascades_to_composite_attributes() {
+    let (sql, _) = session();
+    sql("CREATE TYPE mood AS ENUM ('a')").unwrap();
+    sql("CREATE TYPE both AS (n int, m mood)").unwrap();
+    let (message, f) = fields(sql("DROP TYPE mood").unwrap_err());
+    assert_eq!(
+        message,
+        "cannot drop type mood because other objects depend on it"
+    );
+    assert_eq!(
+        field(&f, "detail").as_deref(),
+        Some("column m of composite type both depends on type mood")
+    );
+    sql("DROP TYPE mood CASCADE").unwrap();
+    let out = sql("SELECT attname FROM pg_attribute WHERE attrelid = \
+         (SELECT typrelid FROM pg_type WHERE typname = 'both') ORDER BY attnum")
+    .unwrap();
+    assert_eq!(rows(&out), ["n"]);
 }
 
 #[test]

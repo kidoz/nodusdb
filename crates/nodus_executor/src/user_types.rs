@@ -388,17 +388,42 @@ pub(crate) fn forget_found() {
 /// an object identifier, or an array of one. PostgreSQL refuses a cast to
 /// any other name (`type "x" does not exist`).
 pub(crate) fn is_known_type(data_type: &str) -> bool {
+    // Planning, outside a statement, has no catalog to look in: a name the
+    // statement will resolve must not be judged unknown then (`INSERT INTO t
+    // VALUES ('x'::mood)` is folded while planning).
+    if !crate::session_env::with(|env| env.is_some()) {
+        return true;
+    }
     let mut base = data_type.trim();
     while let Some(stripped) = base.strip_suffix("[]") {
         base = stripped.trim_end();
     }
     let base = base.split('(').next().unwrap_or_default().trim();
+    let upper = base.trim_matches('"').to_ascii_uppercase();
+    // The interval forms (`interval day to second`, `interval(3)`) all name
+    // the interval type, which the words alone don't say.
+    if upper == "INTERVAL" || upper.starts_with("INTERVAL ") {
+        return true;
+    }
     let unqualified = base.rsplit_once('.').map_or(base, |(_, name)| name);
     is_builtin(&unqualified.trim_matches('"').to_ascii_uppercase())
         || lookup(base).is_some()
         // Every relation has a row type, named after it.
         || is_relation(base)
         || crate::value::object_identifier_type(data_type).is_some()
+}
+
+/// Refuses a declared type that does not exist, as PostgreSQL does (an
+/// unknown name would otherwise be stored as text).
+pub(crate) fn check_type_exists(data_type: &str) -> Result<()> {
+    if is_known_type(data_type) {
+        return Ok(());
+    }
+    Err(
+        DbError::new(format!("type \"{}\" does not exist", data_type.trim()))
+            .code("42704")
+            .into(),
+    )
 }
 
 /// Whether a relation of this name exists (`SELECT ROW(1, 2)::rt` casts to
@@ -1038,6 +1063,8 @@ fn names_type(data_type: &str, t: &UserType) -> bool {
 pub(crate) enum Dependent {
     Column(TableDescriptor, String),
     Type(Arc<UserType>),
+    /// An attribute of a composite type.
+    Attribute(Arc<UserType>, String),
 }
 
 pub(crate) fn dependents(
@@ -1051,6 +1078,24 @@ pub(crate) fn dependents(
             Dependent::Column(table.clone(), column.clone()),
             format!("{}[]", t.name),
         ));
+    }
+    // A composite type's attributes that are of this type.
+    for composite in all_types().iter().filter(|c| c.is_composite()) {
+        for attribute in composite.attributes() {
+            let element = crate::value::array_element_type(&attribute.data_type)
+                .unwrap_or(&attribute.data_type);
+            if names_type(element, t) {
+                let kind = if element == attribute.data_type {
+                    t.name.clone()
+                } else {
+                    format!("{}[]", t.name)
+                };
+                out.push((
+                    Dependent::Attribute(composite.clone(), attribute.name.clone()),
+                    kind,
+                ));
+            }
+        }
     }
     let mut domains: Vec<Arc<UserType>> = all_types()
         .iter()
@@ -1075,6 +1120,9 @@ impl Dependent {
         match self {
             Dependent::Column(table, column) => format!("column {column} of table {}", table.name),
             Dependent::Type(t) => format!("type {}", t.name),
+            Dependent::Attribute(t, attribute) => {
+                format!("column {attribute} of composite type {}", t.name)
+            }
         }
     }
 }
@@ -1185,9 +1233,11 @@ impl MemExecutor {
                         .code("42701")
                         .into());
                     }
+                    check_type_exists(&attribute.data_type)?;
                 }
             }
             TypeDefinition::Domain(d) => {
+                check_type_exists(&d.base)?;
                 // Unnamed checks are `<domain>_check`, then numbered.
                 let mut taken: Vec<String> = d
                     .checks
@@ -1547,6 +1597,16 @@ impl MemExecutor {
         Ok(QueryOutput::tag("ALTER TYPE"))
     }
 
+    /// Removes an attribute from a composite type, as `DROP TYPE ... CASCADE`
+    /// does: values keep their fields, which read as the attributes left.
+    pub(crate) fn drop_composite_attribute(&self, t: &UserType, attribute: &str) -> Result<()> {
+        let TypeDefinition::Composite { mut attributes } = t.definition.clone() else {
+            return Ok(());
+        };
+        attributes.retain(|a| a.name != attribute);
+        self.store_definition(t, &TypeDefinition::Composite { attributes })
+    }
+
     /// Removes the field at `at` from the records the columns of a
     /// composite type hold.
     fn drop_record_field(&self, ctx: &ExecutionContext, t: &UserType, at: usize) -> Result<()> {
@@ -1745,6 +1805,7 @@ impl MemExecutor {
         // What is dropped anyway is no dependent.
         found_dependents.retain(|(d, _)| match d {
             Dependent::Type(dt) => !found.iter().any(|f| f.id == dt.id),
+            Dependent::Attribute(composite, _) => !found.iter().any(|f| f.id == composite.id),
             Dependent::Column(..) => true,
         });
         if !found_dependents.is_empty() {
@@ -1786,6 +1847,9 @@ impl MemExecutor {
                         self.drop_column(ctx, &current, column, true, true)?;
                     }
                     Dependent::Type(t) => self.catalog_writer.drop_table(t.id)?,
+                    Dependent::Attribute(composite, attribute) => {
+                        self.drop_composite_attribute(composite, attribute)?;
+                    }
                 }
             }
         }

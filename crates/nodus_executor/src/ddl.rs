@@ -65,6 +65,9 @@ impl MemExecutor {
             anyhow::bail!("relation \"{}\" already exists", table_only);
         }
         self.reject_type_name(schema_name, table_only)?;
+        for column in &columns {
+            crate::user_types::check_type_exists(&column.data_type)?;
+        }
         let constraints = name_check_constraints(table_only, &columns, constraints);
         // Foreign keys get their names and referenced columns, checked
         // against the referenced table's keys (the new table's own, for one

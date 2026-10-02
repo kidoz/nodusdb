@@ -183,6 +183,7 @@ impl MemExecutor {
         (nullable, default): (bool, Option<ScalarExpr>),
         if_not_exists: bool,
     ) -> Result<()> {
+        crate::user_types::check_type_exists(&data_type)?;
         if tbl.columns.iter().any(|c| c.name == name) {
             let exists = format!(
                 "column \"{name}\" of relation \"{}\" already exists",

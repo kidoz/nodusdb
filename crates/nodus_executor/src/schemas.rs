@@ -415,10 +415,18 @@ impl MemExecutor {
                                 user_types::Dependent::Type(d) if member_ids.contains(&d.id) => {
                                     continue;
                                 }
+                                user_types::Dependent::Attribute(composite, _)
+                                    if member_ids.contains(&composite.id) =>
+                                {
+                                    continue;
+                                }
                                 user_types::Dependent::Column(table, column) => {
                                     format!("column {} {column}", table.id)
                                 }
                                 user_types::Dependent::Type(d) => format!("type {}", d.id),
+                                user_types::Dependent::Attribute(composite, attribute) => {
+                                    format!("attribute {attribute} of type {}", composite.id)
+                                }
                             };
                             if seen.insert(key) {
                                 described.push(dependent.description());
@@ -463,6 +471,9 @@ impl MemExecutor {
                     }
                 }
                 user_types::Dependent::Type(d) => self.catalog_writer.drop_table(d.id)?,
+                user_types::Dependent::Attribute(composite, attribute) => {
+                    self.drop_composite_attribute(&composite, &attribute)?;
+                }
             }
         }
         for (_, members, meta) in &held {

@@ -1,0 +1,87 @@
+# Types in composite attributes, arrays of user types, unknown-type columns,
+# and what DROP TYPE lists and cascades to. Expected results come from
+# PostgreSQL 18.
+statement ok
+CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy');
+
+statement ok
+CREATE TYPE pair AS (n int, m mood);
+
+statement ok
+CREATE DOMAIN pos AS int CHECK (VALUE > 0);
+
+statement ok
+CREATE TABLE t2 (id int PRIMARY KEY, p pair, ms mood[], d pos);
+
+statement ok
+INSERT INTO t2 VALUES (1, ROW(5, 'ok'), ARRAY['happy', 'sad']::mood[], 3);
+
+query TTTTTT
+SELECT p, (p).n, (p).m, ms[1], (ms)[1], d FROM t2;
+----
+(5,ok)	5	ok	happy	happy	3
+
+statement error
+INSERT INTO t2 VALUES (2, ROW(1, 'angry'), NULL, 1);
+
+statement error
+INSERT INTO t2 VALUES (3, ROW(1, 'ok'), NULL, -1);
+
+query T
+SELECT (p).m FROM t2 WHERE (p).m > 'sad';
+----
+ok
+
+query T
+SELECT array_agg((p).m) FROM t2;
+----
+{ok}
+
+statement ok
+ALTER TYPE mood ADD VALUE 'meh' BEFORE 'ok';
+
+query T
+SELECT (p).m FROM t2 ORDER BY (p).m;
+----
+ok
+
+statement error
+DROP TYPE mood;
+
+statement ok
+DROP TYPE mood CASCADE;
+
+query TTT
+SELECT * FROM t2 ORDER BY id;
+----
+1	(5)	3
+
+statement error
+CREATE TABLE bad (x nosuchtype);
+
+statement error
+ALTER TABLE t2 ADD COLUMN y nosuchtype;
+
+statement error
+CREATE TYPE bad AS (x nosuchtype);
+
+statement error
+CREATE DOMAIN bad AS nosuchtype;
+
+statement error
+DROP TYPE pair;
+
+statement ok
+DROP TYPE pair CASCADE;
+
+statement ok
+CREATE TYPE pair AS (a int);
+
+statement ok
+DROP TYPE pair;
+
+statement ok
+DROP TABLE t2;
+
+statement ok
+DROP DOMAIN pos;
