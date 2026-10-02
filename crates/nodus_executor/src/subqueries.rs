@@ -127,13 +127,15 @@ impl MemExecutor {
         crate::eval_error::check()?;
         let mut types = Vec::with_capacity(width);
         for column in 0..width {
-            // A date/time literal gives its column its type.
-            let temporal = rows
+            // A date/time or range literal gives its column its type.
+            let declared = rows
                 .iter()
                 .filter_map(|row| row.get(column))
                 .filter_map(crate::result_types::constant_expr_type)
-                .find(|t| crate::datetime::Kind::of_type(t).is_some());
-            types.push(unify_column(&mut values, column, temporal)?);
+                .find(|t| {
+                    crate::datetime::Kind::of_type(t).is_some() || crate::ranges::is_range_type(t)
+                });
+            types.push(unify_column(&mut values, column, declared)?);
         }
         let rows_out = values
             .into_iter()
@@ -155,7 +157,7 @@ impl MemExecutor {
 fn unify_column(
     rows: &mut [Vec<Value>],
     column: usize,
-    temporal: Option<String>,
+    declared: Option<String>,
 ) -> Result<String> {
     #[derive(PartialEq, PartialOrd, Clone, Copy)]
     enum Kind {
@@ -186,7 +188,12 @@ fn unify_column(
         Some(Kind::Numeric) => "NUMERIC",
         Some(Kind::Float) => "DOUBLE PRECISION",
         None => {
-            if let Some(target) = temporal {
+            if let Some(target) = declared {
+                // A range column keeps its declared type; its text is stored
+                // canonical already.
+                if crate::ranges::is_range_type(&target) {
+                    return Ok(target);
+                }
                 convert_all(rows, column, &target)?;
                 return Ok(target);
             }

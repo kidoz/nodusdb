@@ -326,6 +326,17 @@ impl MemExecutor {
                     let filter = parse_filter_expr(&ast_expr, &[]).map_err(|e| {
                         anyhow::anyhow!("CHECK constraint `{expr}` cannot be evaluated: {e}")
                     })?;
+                    // The check reads its columns as their declared types
+                    // (`r @> 0` on a range, enum order, interval spans).
+                    let column_type = |name: &str| {
+                        let bare = name.rsplit('.').next().unwrap_or(name);
+                        tbl.columns
+                            .iter()
+                            .find(|c| c.name == bare)
+                            .map(|c| c.data_type.clone())
+                    };
+                    let filter =
+                        crate::result_types::check_filter_integer_ranges(&filter, &column_type);
                     // As in PostgreSQL, only a false result rejects the row; a
                     // NULL (unknown) result satisfies the constraint.
                     let result =

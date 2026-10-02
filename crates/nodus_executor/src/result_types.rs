@@ -147,6 +147,19 @@ fn scalar_type(expr: &ScalarExpr, column: &impl Fn(&str) -> Option<String>) -> O
                 _ => Some("TIMESTAMP".into()),
             }
         }
+        // A range operator's result: the range for the set operations, and
+        // a boolean for the predicates.
+        ScalarExpr::Function { name, args } if name == RANGE_OP => match args.first() {
+            Some(ScalarExpr::Literal(Value::Text(op)))
+                if matches!(op.as_str(), "+" | "-" | "*") =>
+            {
+                match args.get(3) {
+                    Some(ScalarExpr::Literal(Value::Text(kind))) => Some(kind.clone()),
+                    _ => None,
+                }
+            }
+            _ => Some("BOOLEAN".into()),
+        },
         // A field of a composite value, by the value's type.
         ScalarExpr::Function { name, args } if name == crate::user_types::FIELD => {
             match args.as_slice() {
@@ -314,6 +327,200 @@ pub(crate) fn check_integer_ranges(
                 ScalarExpr::Literal(Value::Text(ty)),
             ],
         };
+    }
+    // A range operator takes its subtype from the operand that has one
+    // (`'[1,5)'::int4range @> 3`), and a cast between two range types is
+    // refused as PostgreSQL refuses it.
+    let range_kind =
+        |e: &ScalarExpr| scalar_type(e, column).and_then(|t| crate::ranges::Kind::of(&t));
+    let range_call = range_operator;
+    // Two different range types have no common operator.
+    let mixed = |l: &ScalarExpr, r: &ScalarExpr, symbol: &str| -> Option<ScalarExpr> {
+        match (range_kind(l), range_kind(r)) {
+            (Some(a), Some(b)) if a != b => Some(bad_operator(a.name(), symbol, b.name())),
+            _ => None,
+        }
+    };
+    match &checked {
+        ScalarExpr::Cast {
+            expr: inner,
+            target,
+        } if let (Some(from), Some(to)) = (range_kind(inner), crate::ranges::Kind::of(target))
+            && from != to =>
+        {
+            return ScalarExpr::Function {
+                name: BAD_RANGE_CAST.to_string(),
+                args: vec![
+                    ScalarExpr::Literal(Value::Text(from.name().to_string())),
+                    ScalarExpr::Literal(Value::Text(to.name().to_string())),
+                ],
+            };
+        }
+        // `range << range` and `range >> range` shadow the bit shifts.
+        ScalarExpr::Function { name, args }
+            if matches!(name.as_str(), SHIFT_LEFT | SHIFT_RIGHT)
+                && let [l, r] = args.as_slice()
+                && let Some(kind) = range_kind(l).or_else(|| range_kind(r)) =>
+        {
+            let op = if name == SHIFT_LEFT { "<<" } else { ">>" };
+            return range_call(op, l, r, kind, false);
+        }
+        // A custom operator (`@>`, `&&`, `<@`, ...) once its subtype is
+        // known; `<@` reads as `@>` with its operands swapped, and with no
+        // range operand the operator keeps its former meaning (`jsonb @>`).
+        ScalarExpr::Function { name, args }
+            if name == RANGE_OP
+                && let [
+                    ScalarExpr::Literal(Value::Text(op)),
+                    l,
+                    r,
+                    ScalarExpr::Literal(Value::Text(kind_name)),
+                    _,
+                ] = args.as_slice()
+                && kind_name.is_empty() =>
+        {
+            let Some(found) = range_kind(l).or_else(|| range_kind(r)) else {
+                let op = match op.as_str() {
+                    "@>" => ScalarBinaryOp::Contains,
+                    "<@" => ScalarBinaryOp::ContainedBy,
+                    "&&" => ScalarBinaryOp::Overlap,
+                    _ => return checked.clone(),
+                };
+                return ScalarExpr::Binary {
+                    op,
+                    left: Box::new(l.clone()),
+                    right: Box::new(r.clone()),
+                };
+            };
+            if let Some(bad) = mixed(l, r, op) {
+                return bad;
+            }
+            if op == "<@" {
+                let element = range_kind(l).is_none();
+                return range_call("@>", r, l, found, element);
+            }
+            let element = op == "@>" && range_kind(r).is_none();
+            return range_call(op, l, r, found, element);
+        }
+        // Only `count`, `array_agg`, and the JSON collectors take a range;
+        // `min`, `sum`, and the like have no overload for one.
+        ScalarExpr::Aggregate {
+            op, arg, arg_expr, ..
+        } if !matches!(
+            op,
+            AggregateOp::Count
+                | AggregateOp::ArrayAgg
+                | AggregateOp::JsonAgg
+                | AggregateOp::JsonbAgg
+        ) && arg_expr
+            .as_deref()
+            .and_then(|e| range_kind(e))
+            .or_else(|| range_kind(&ScalarExpr::Column(arg.clone())))
+            .is_some() =>
+        {
+            let kind = arg_expr
+                .as_deref()
+                .and_then(|e| range_kind(e))
+                .or_else(|| range_kind(&ScalarExpr::Column(arg.clone())))
+                .expect("checked by the guard");
+            return bad_function(&op.sql_name().to_ascii_lowercase(), kind.name());
+        }
+        ScalarExpr::Binary { op, left, right } => {
+            // `range || x` has an operator only where `x` is text, and
+            // `range || range` has none at all.
+            if *op == ScalarBinaryOp::Concat
+                && let Some(kind) = range_kind(left).or_else(|| range_kind(right))
+            {
+                let text_side = |e: &ScalarExpr| {
+                    scalar_type(e, column).is_none_or(|t| {
+                        is_text_type(&t) || t.trim().is_empty() || t.eq_ignore_ascii_case("UNKNOWN")
+                    })
+                };
+                // The other side is the one that decides: text concatenates,
+                // anything else has no operator.
+                let other = if range_kind(left).is_some() {
+                    right
+                } else {
+                    left
+                };
+                if !text_side(other) {
+                    let range_name = kind.name().to_string();
+                    let other_name =
+                        operator_type_name(&scalar_type(other, column).unwrap_or_default());
+                    return if range_kind(left).is_some() {
+                        bad_operator(&range_name, "||", &other_name)
+                    } else {
+                        bad_operator(&other_name, "||", &range_name)
+                    };
+                }
+            }
+            if let Some(kind) = range_kind(left).or_else(|| range_kind(right)) {
+                let symbol = match op {
+                    ScalarBinaryOp::Eq => Some("="),
+                    ScalarBinaryOp::NotEq => Some("<>"),
+                    ScalarBinaryOp::Lt => Some("<"),
+                    ScalarBinaryOp::Gt => Some(">"),
+                    ScalarBinaryOp::LtEq => Some("<="),
+                    ScalarBinaryOp::GtEq => Some(">="),
+                    ScalarBinaryOp::Add => Some("+"),
+                    ScalarBinaryOp::Sub => Some("-"),
+                    ScalarBinaryOp::Mul => Some("*"),
+                    _ => None,
+                };
+                // `+`, `-`, and `*` are for two ranges; with an element on a
+                // side PostgreSQL has no such operator.
+                let both_ranges = range_kind(left).is_some() && range_kind(right).is_some();
+                let set_operation = matches!(
+                    op,
+                    ScalarBinaryOp::Add | ScalarBinaryOp::Sub | ScalarBinaryOp::Mul
+                );
+                if let Some(symbol) = symbol {
+                    if let Some(bad) = mixed(left, right, symbol) {
+                        return bad;
+                    }
+                    if !set_operation || both_ranges {
+                        return range_call(symbol, left, right, kind, false);
+                    }
+                    if set_operation && !both_ranges {
+                        let other = if range_kind(left).is_some() {
+                            right
+                        } else {
+                            left
+                        };
+                        let other_name =
+                            operator_type_name(&scalar_type(other, column).unwrap_or_default());
+                        let range_name = kind.name().to_string();
+                        return if range_kind(left).is_some() {
+                            bad_operator(&range_name, symbol, &other_name)
+                        } else {
+                            bad_operator(&other_name, symbol, &range_name)
+                        };
+                    }
+                }
+            }
+        }
+        // `lower` and `upper` of a range read its bounds, where the string
+        // functions would fold its text's case.
+        ScalarExpr::Function { name, args }
+            if matches!(name.as_str(), "LOWER" | "UPPER")
+                && let [arg] = args.as_slice()
+                && range_kind(arg).is_some() =>
+        {
+            let subtype = range_kind(arg).expect("checked by the guard").subtype();
+            return ScalarExpr::Function {
+                name: if name == "LOWER" {
+                    RANGE_LOWER
+                } else {
+                    RANGE_UPPER
+                }
+                .to_string(),
+                args: vec![
+                    arg.clone(),
+                    ScalarExpr::Literal(Value::Text(subtype.to_string())),
+                ],
+            };
+        }
+        _ => {}
     }
     // Date/time arithmetic takes its operators from its operands' types:
     // `time + interval` wraps at midnight, `date + interval` is a timestamp.
@@ -832,6 +1039,79 @@ pub(crate) fn bitwise_type(name: &str, arg_types: &[Option<String>]) -> Option<S
 /// as a number of microseconds (a month as 30 days).
 pub(crate) const INTERVAL_SPAN: &str = "__INTERVAL_SPAN__";
 
+/// The function a range operator is rewritten to once a subtype is known:
+/// `__RANGE__(operator, left, right, subtype, right-is-an-element)`.
+pub(crate) const RANGE_OP: &str = "__RANGE__";
+
+/// The call a range operator is rewritten to.
+pub(crate) fn range_operator(
+    op: &str,
+    left: &ScalarExpr,
+    right: &ScalarExpr,
+    kind: crate::ranges::Kind,
+    right_is_element: bool,
+) -> ScalarExpr {
+    ScalarExpr::Function {
+        name: RANGE_OP.to_string(),
+        args: vec![
+            ScalarExpr::Literal(Value::Text(op.to_string())),
+            left.clone(),
+            right.clone(),
+            ScalarExpr::Literal(Value::Text(kind.name().to_string())),
+            ScalarExpr::Literal(Value::Bool(right_is_element)),
+        ],
+    }
+}
+
+/// The functions a range's `lower` and `upper` are rewritten to (the string
+/// `lower` would lowercase the text).
+pub(crate) const RANGE_LOWER: &str = "__RANGE_LOWER__";
+pub(crate) const RANGE_UPPER: &str = "__RANGE_UPPER__";
+
+/// The function a cast between two range types is rewritten to: PostgreSQL
+/// has no such cast (`cannot cast type int4range to int8range`).
+pub(crate) const BAD_RANGE_CAST: &str = "__BAD_RANGE_CAST__";
+
+/// The function an operator PostgreSQL has no overload for is rewritten to:
+/// `__BAD_OPERATOR__(left type, operator, right type)`.
+pub(crate) const BAD_OPERATOR: &str = "__BAD_OPERATOR__";
+
+/// The function a call PostgreSQL has no overload for is rewritten to:
+/// `__BAD_FUNCTION__(name, argument type)`.
+pub(crate) const BAD_FUNCTION: &str = "__BAD_FUNCTION__";
+
+/// The call an aggregate with no overload for its argument is rewritten to
+/// (`min(int4range)` does not exist).
+pub(crate) fn bad_function(name: &str, data_type: &str) -> ScalarExpr {
+    ScalarExpr::Function {
+        name: BAD_FUNCTION.to_string(),
+        args: vec![
+            ScalarExpr::Literal(Value::Text(name.to_string())),
+            ScalarExpr::Literal(Value::Text(data_type.to_string())),
+        ],
+    }
+}
+
+/// The error call for an operator PostgreSQL has no overload for.
+fn bad_operator(left: &str, op: &str, right: &str) -> ScalarExpr {
+    ScalarExpr::Function {
+        name: BAD_OPERATOR.to_string(),
+        args: vec![
+            ScalarExpr::Literal(Value::Text(left.to_string())),
+            ScalarExpr::Literal(Value::Text(op.to_string())),
+            ScalarExpr::Literal(Value::Text(right.to_string())),
+        ],
+    }
+}
+
+/// The type name PostgreSQL's operator errors print for a declared type.
+fn operator_type_name(data_type: &str) -> String {
+    if let Some(kind) = crate::ranges::Kind::of(data_type) {
+        return kind.name().to_string();
+    }
+    crate::functions::format_type_name(crate::MemExecutor::pg_type_oid(data_type))
+}
+
 /// The function a `char(n)` value is padded by where its padding shows:
 /// `__BPCHAR_PAD__(value, n)`.
 pub(crate) const BPCHAR_PAD: &str = "__BPCHAR_PAD__";
@@ -1001,6 +1281,58 @@ pub(crate) fn check_filter_integer_ranges(
             .and_then(|t| crate::value::character_limit(&t))
             .is_some_and(|(_, padded)| padded)
     };
+    // A range predicate reads the range, not its text (`r @> 3`).
+    let range_symbol = |op: &crate::CompareOp| -> Option<&'static str> {
+        use crate::CompareOp as C;
+        Some(match op {
+            C::Eq => "=",
+            C::Ne => "<>",
+            C::Lt => "<",
+            C::Le => "<=",
+            C::Gt => ">",
+            C::Ge => ">=",
+            C::Contains => "@>",
+            C::ContainedBy => "<@",
+            _ => return None,
+        })
+    };
+    let range_predicate = |left: &ScalarExpr, op: &crate::CompareOp, right: &ScalarExpr| {
+        let kind = expr_type(left, column).and_then(|t| crate::ranges::Kind::of(&t))?;
+        let symbol = range_symbol(op)?;
+        let right_is_element = expr_type(right, column)
+            .and_then(|t| crate::ranges::Kind::of(&t))
+            .is_none();
+        Some(if symbol == "<@" {
+            range_operator("@>", right, left, kind, !right_is_element)
+        } else {
+            range_operator(
+                symbol,
+                left,
+                right,
+                kind,
+                symbol == "@>" && right_is_element,
+            )
+        })
+    };
+    match filter {
+        F::Predicate(crate::Predicate { left, op, right }) => {
+            let operand = |operand: &crate::Operand| match operand {
+                crate::Operand::Literal(v) => ScalarExpr::Literal(v.clone()),
+                crate::Operand::Ident(name) => ScalarExpr::Column(name.clone()),
+            };
+            if let Some(scalar) =
+                range_predicate(&ScalarExpr::Column(left.clone()), op, &operand(right))
+            {
+                return F::Scalar(scalar);
+            }
+        }
+        F::ExprCmp { left, op, right } => {
+            if let Some(scalar) = range_predicate(left, op, right) {
+                return F::Scalar(scalar);
+            }
+        }
+        _ => {}
+    }
     match filter {
         // An enum column compares in the enum's order.
         F::Predicate(crate::Predicate { left, op, right })

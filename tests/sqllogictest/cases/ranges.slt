@@ -1,0 +1,467 @@
+# Range types: literals and canonicalization, constructors, accessors,
+# operators, storage, casts, and catalogs. Expected results come from
+# PostgreSQL 18.
+query T
+SELECT 'empty'::int4range;
+----
+empty
+
+query T
+SELECT '[1,5)'::int4range;
+----
+[1,5)
+
+query T
+SELECT '[1,5]'::int4range;
+----
+[1,6)
+
+query T
+SELECT '(1,5)'::int4range;
+----
+[2,5)
+
+query T
+SELECT '(1,5]'::int4range;
+----
+[2,6)
+
+query T
+SELECT '[,5)'::int4range;
+----
+(,5)
+
+query T
+SELECT '(,)'::int4range;
+----
+(,)
+
+statement error
+SELECT 'x'::int4range;
+
+statement error
+SELECT '(1,5'::int4range;
+
+statement error
+SELECT '[1,x)'::int4range;
+
+query T
+SELECT int4range(1, 5);
+----
+[1,5)
+
+query T
+SELECT int4range(1, 5, '[]');
+----
+[1,6)
+
+query T
+SELECT int4range(NULL, 5);
+----
+(,5)
+
+query T
+SELECT int4range(1, NULL);
+----
+[1,)
+
+statement error
+SELECT int4range(5, 1);
+
+statement error
+SELECT int4range(1, 5, 'x');
+
+query T
+SELECT int4range(1, 1);
+----
+empty
+
+query T
+SELECT int4range(int4range(1, 5));
+----
+[1,5)
+
+query T
+SELECT int8range(1, 5, '(]');
+----
+[2,6)
+
+query T
+SELECT numrange(1.5, 2.5);
+----
+[1.5,2.5)
+
+query T
+SELECT numrange(1.5, 2.5, '(]');
+----
+(1.5,2.5]
+
+query T
+SELECT numrange(NULL, 2.5, '()');
+----
+(,2.5)
+
+query T
+SELECT numrange(NULL, NULL);
+----
+(,)
+
+query T
+SELECT daterange('2020-01-01', '2020-01-03');
+----
+[2020-01-01,2020-01-03)
+
+query T
+SELECT daterange('2020-01-01', '2020-01-03', '[]');
+----
+[2020-01-01,2020-01-04)
+
+query T
+SELECT daterange('2020-01-01', '2020-01-03', '()');
+----
+[2020-01-02,2020-01-03)
+
+query T
+SELECT daterange('2020-01-01', '2020-01-01');
+----
+empty
+
+statement error
+SELECT daterange('2020-01-03', '2020-01-01');
+
+query T
+SELECT tsrange('2020-01-01 00:00', '2020-01-02 00:00');
+----
+["2020-01-01 00:00:00","2020-01-02 00:00:00")
+
+query T
+SELECT tstzrange('2020-01-01 00:00+00', '2020-01-02 00:00+00');
+----
+["2020-01-01 00:00:00+00","2020-01-02 00:00:00+00")
+
+query T
+SELECT tstzrange('2020-01-01 00:00+00', '2020-01-02 00:00+00', '[]');
+----
+["2020-01-01 00:00:00+00","2020-01-02 00:00:00+00"]
+
+query TT
+SELECT upper('[1,5]'::int4range), upper_inc('[1,5]'::int4range);
+----
+6	f
+
+query TT
+SELECT lower('[1,5)'::int4range), upper('[1,5)'::int4range);
+----
+1	5
+
+query TT
+SELECT lower_inc('[1,5)'::int4range), upper_inc('[1,5)'::int4range);
+----
+t	f
+
+query TT
+SELECT lower_inf('(,5)'::int4range), upper_inf('(,5)'::int4range);
+----
+t	f
+
+query TTTT
+SELECT lower('empty'::int4range), upper('empty'::int4range), lower_inc('empty'::int4range), upper_inc('empty'::int4range);
+----
+NULL	NULL	f	f
+
+query TT
+SELECT lower_inf('empty'::int4range), upper_inf('empty'::int4range);
+----
+f	f
+
+query TT
+SELECT isempty('empty'::int4range), isempty('[1,2)'::int4range);
+----
+t	f
+
+query TT
+SELECT lower(numrange(1.5, 2.5)), upper(numrange(1.5, 2.5));
+----
+1.5	2.5
+
+query T
+SELECT lower(tsrange('2020-01-01 00:00', '2020-01-02 00:00'));
+----
+2020-01-01 00:00:00
+
+query T
+SELECT lower(daterange('2020-01-01', '2020-01-03'));
+----
+2020-01-01
+
+query TT
+SELECT '[1,5]'::int4range = '[1,6)'::int4range, '(1,5)'::int4range = '[2,5)'::int4range;
+----
+t	t
+
+query TT
+SELECT 'empty'::int4range = 'empty'::int4range, 'empty'::int4range < '[1,2)'::int4range;
+----
+t	t
+
+query TT
+SELECT '[1,5)'::int4range < '[2,5)'::int4range, '[2,3)'::int4range > '[1,3)'::int4range;
+----
+t	t
+
+query TT
+SELECT '[1,3)'::int4range <> '[2,3)'::int4range, '[1,3)'::int4range <= '[1,3)'::int4range;
+----
+t	t
+
+query TT
+SELECT '[1,5)'::int4range && '[4,8)'::int4range, '[1,5)'::int4range && '[5,8)'::int4range;
+----
+t	f
+
+query TT
+SELECT '[1,5)'::int4range && 'empty'::int4range, '[1,5)'::int4range @> NULL;
+----
+f	NULL
+
+query TTT
+SELECT '[1,5)'::int4range @> 3, '[1,5)'::int4range @> 5, '[1,5]'::int4range @> 5;
+----
+t	f	t
+
+query TT
+SELECT '[1,5)'::int4range @> '[2,3)'::int4range, '[1,5)'::int4range <@ '[1,5)'::int4range;
+----
+t	t
+
+query T
+SELECT 3 <@ '[1,5)'::int4range;
+----
+t
+
+query TT
+SELECT '[1,5)'::int4range << '[6,8)'::int4range, '[1,5)'::int4range << '[5,8)'::int4range;
+----
+t	t
+
+query T
+SELECT '[1,5)'::int4range -|- '[5,8)'::int4range;
+----
+t
+
+statement error
+SELECT '[1,5)'::int4range && '[1,5]'::numrange;
+
+query TT
+SELECT '[1,5)'::int4range &< '[2,3)'::int4range, '[1,5)'::int4range &< '[5,8)'::int4range;
+----
+f	t
+
+query TT
+SELECT '[1,5)'::int4range &> '[4,9)'::int4range, '[1,5)'::int4range >> '[5,8)'::int4range;
+----
+f	f
+
+query T
+SELECT '[1,5)'::int4range + '[5,8)'::int4range;
+----
+[1,8)
+
+query T
+SELECT '[1,5)'::int4range + 'empty'::int4range;
+----
+[1,5)
+
+query TT
+SELECT '[1,5)'::int4range * '[2,8)'::int4range, '[1,5)'::int4range * '[6,8)'::int4range;
+----
+[2,5)	empty
+
+query TT
+SELECT '[1,5)'::int4range - '[1,2)'::int4range, '[1,5)'::int4range - '[4,5)'::int4range;
+----
+[2,5)	[1,4)
+
+statement error
+SELECT '[1,5)'::int4range + '[8,9)'::int4range;
+
+statement error
+SELECT '[1,5)'::int4range - '[2,3)'::int4range;
+
+query T
+SELECT range_merge('[1,5)'::int4range, '[3,8)'::int4range);
+----
+[1,8)
+
+query T
+SELECT range_merge('[1,2)'::int4range, '[5,6)'::int4range);
+----
+[1,6)
+
+query T
+SELECT numrange(1, 2) + numrange(2, 3);
+----
+[1,3)
+
+query T
+SELECT '[1,5)'::int4range::text;
+----
+[1,5)
+
+query T
+SELECT '[1,5)'::int4range || 'x';
+----
+[1,5)x
+
+statement error
+SELECT '[1,5)'::int4range || 5;
+
+statement error
+SELECT '[1,5)'::int4range || '[6,9)'::int4range;
+
+statement error
+SELECT '[1,5)'::int4range - 3;
+
+statement error
+SELECT '[1,5)'::int4range::int8range;
+
+query T
+SELECT ARRAY['[1,2)'::int4range, '[3,4)'::int4range];
+----
+{"[1,2)","[3,4)"}
+
+query T
+SELECT '{}'::int4range[];
+----
+{}
+
+query T
+SELECT unnest(ARRAY['[1,2)'::int4range]);
+----
+[1,2)
+
+query T rowsort
+SELECT r FROM (VALUES ('[1,2)'::int4range), ('empty'::int4range), ('[3,4)'::int4range)) t(r) ORDER BY r;
+----
+empty
+[1,2)
+[3,4)
+
+query T
+SELECT r FROM (VALUES ('[1,2)'::int4range)) t(r) ORDER BY r;
+----
+[1,2)
+
+statement ok
+CREATE TABLE rt (id int PRIMARY KEY, r int4range, d daterange);
+
+statement ok
+INSERT INTO rt VALUES (1, '[1,5)', '[2020-01-01,2020-01-02)');
+
+statement ok
+INSERT INTO rt VALUES (2, 'empty', NULL);
+
+statement ok
+INSERT INTO rt VALUES (3, '(1,5]', '[2020-01-01,2020-01-03]');
+
+query TTT
+SELECT * FROM rt ORDER BY id;
+----
+1	[1,5)	[2020-01-01,2020-01-02)
+2	empty	NULL
+3	[2,6)	[2020-01-01,2020-01-04)
+
+query T
+SELECT r FROM rt WHERE r @> 3 ORDER BY r;
+----
+[1,5)
+[2,6)
+
+query T
+SELECT r FROM rt WHERE r && '[0,2)'::int4range ORDER BY r;
+----
+[1,5)
+
+query T
+SELECT r FROM rt ORDER BY r;
+----
+empty
+[1,5)
+[2,6)
+
+statement error
+SELECT min(r) FROM rt;
+
+statement error
+SELECT sum(r) FROM rt;
+
+query TT
+SELECT count(r), array_agg(r) FROM rt;
+----
+3	{"[1,5)",empty,"[2,6)"}
+
+statement ok
+CREATE TABLE ck (r int4range CHECK (r @> 0));
+
+statement ok
+INSERT INTO ck VALUES ('[-1,1)');
+
+statement error
+INSERT INTO ck VALUES ('[5,6)');
+
+query T
+SELECT r FROM ck;
+----
+[-1,1)
+
+query T
+SELECT count(*) FROM rt GROUP BY r ORDER BY 1;
+----
+1
+1
+1
+
+query T
+SELECT DISTINCT r FROM rt ORDER BY r;
+----
+empty
+[1,5)
+[2,6)
+
+query TTT
+SELECT column_name, data_type, udt_name FROM information_schema.columns WHERE table_name = 'rt' ORDER BY ordinal_position;
+----
+id	integer	int4
+r	int4range	int4range
+d	daterange	daterange
+
+query TTTTTTT
+SELECT typname, typtype, typcategory, typlen, typbyval, typalign, typstorage FROM pg_type WHERE typname = 'int4range';
+----
+int4range	r	R	-1	f	i	x
+
+query T
+SELECT count(*) FROM pg_range;
+----
+6
+
+query TTTTTT
+SELECT rngtypid, rngsubtype, rngcollation, rngsubopc, rngcanonical, rngsubdiff FROM pg_range WHERE rngtypid = 3904;
+----
+3904	23	0	1978	int4range_canonical	int4range_subdiff
+
+query TTTTTT
+SELECT format_type(3904, NULL), format_type(3906, NULL), format_type(3912, NULL), format_type(3926, NULL), format_type(3908, NULL), format_type(3910, NULL);
+----
+int4range	numrange	daterange	int8range	tsrange	tstzrange
+
+query TTT
+SELECT '_int4range'::regtype::oid, 'int4range'::regtype::oid, 'daterange'::regtype::oid;
+----
+3905	3904	3912
+
+query T
+SELECT oid::regtype FROM pg_type WHERE typname IN ('int4range', '_numrange') ORDER BY oid;
+----
+int4range
+numrange[]

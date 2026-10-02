@@ -571,6 +571,30 @@ fn function_operator(op: &sqlparser::ast::BinaryOperator) -> Option<&'static str
     })
 }
 
+/// The range operators (`@>`, `<@`, `&&`, `&<`, `&>`, `-|-`), as the symbol
+/// [`crate::result_types::RANGE_OP`] carries it.
+fn range_operator_symbol(op: &sqlparser::ast::BinaryOperator) -> Option<&'static str> {
+    use sqlparser::ast::BinaryOperator as B;
+    Some(match op {
+        B::AtArrow => "@>",
+        B::ArrowAt => "<@",
+        B::PGOverlap => "&&",
+        B::AndLt => "&<",
+        B::AndGt => "&>",
+        B::Custom(symbol) if symbol == "-|-" => "-|-",
+        B::PGCustomBinaryOperator(parts) => match parts.last().map(String::as_str) {
+            Some("@>") => "@>",
+            Some("<@") => "<@",
+            Some("&&") => "&&",
+            Some("&<") => "&<",
+            Some("&>") => "&>",
+            Some("-|-") => "-|-",
+            _ => return None,
+        },
+        _ => return None,
+    })
+}
+
 /// Recognizes the pattern-matching operators: POSIX regex (`~`, `~*`, `!~`,
 /// `!~*`) and LIKE (`~~`, `~~*`, `!~~`, `!~~*`), bare or schema-qualified.
 /// Returns `(kind, case_insensitive, negated)`.
@@ -823,6 +847,20 @@ pub(crate) fn lower_scalar(expr: &sqlparser::ast::Expr, params: &[Value]) -> Opt
                 return Some(ScalarExpr::Function {
                     name: "OVERLAPS".to_string(),
                     args,
+                });
+            }
+            // A range operator (`@>`, `&&`, `<@`, ...): its subtype is filled
+            // in once the operands' types are known.
+            if let Some(symbol) = range_operator_symbol(op) {
+                return Some(ScalarExpr::Function {
+                    name: crate::result_types::RANGE_OP.to_string(),
+                    args: vec![
+                        ScalarExpr::Literal(Value::Text(symbol.to_string())),
+                        lower_scalar(left, params)?,
+                        lower_scalar(right, params)?,
+                        ScalarExpr::Literal(Value::Text(String::new())),
+                        ScalarExpr::Literal(Value::Bool(false)),
+                    ],
                 });
             }
             if let Some((kind, case_insensitive, negated)) = pattern_operator(op) {

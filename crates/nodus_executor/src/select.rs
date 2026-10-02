@@ -819,6 +819,28 @@ impl MemExecutor {
                     expr: check(&expr),
                     alias,
                 },
+                // No aggregate over a range takes one but `count` and the
+                // array and JSON collectors (`min(int4range)` does not exist).
+                ProjectionItem::Aggregate(op, arg)
+                    if !matches!(
+                        op,
+                        AggregateOp::Count
+                            | AggregateOp::ArrayAgg
+                            | AggregateOp::JsonAgg
+                            | AggregateOp::JsonbAgg
+                    ) && column_type(&arg).is_some_and(|t| crate::ranges::is_range_type(&t)) =>
+                {
+                    let kind = column_type(&arg)
+                        .and_then(|t| crate::ranges::Kind::of(&t))
+                        .expect("guarded by the match arm");
+                    ProjectionItem::Expr {
+                        expr: crate::result_types::bad_function(
+                            &op.sql_name().to_ascii_lowercase(),
+                            kind.name(),
+                        ),
+                        alias: Some(format!("{op:?}").to_ascii_lowercase()),
+                    }
+                }
                 // `min` and `max` of an enum pick by its order.
                 ProjectionItem::Aggregate(op @ (AggregateOp::Min | AggregateOp::Max), arg)
                     if column_type(&arg)
@@ -1874,33 +1896,39 @@ impl MemExecutor {
                 };
                 sources.push(source);
             }
-            // Interval keys order by their length of time, not their text.
+            // Interval keys order by their length of time and range keys by
+            // their bounds, not their text.
             let declared = |name: &str| {
                 crate::filter_eval::col_pos(&col_names, name)
                     .and_then(|i| joined_columns.get(i))
                     .map(|c| c.data_type.clone())
             };
-            let interval_keys: Vec<bool> = sources
+            let key_types: Vec<Option<String>> = sources
                 .iter()
                 .zip(&key_targets)
-                .map(|(source, target)| {
-                    let data_type = match (source, target) {
-                        (KeySource::Output(i), _) if projection.is_empty() => {
-                            joined_columns.get(*i).map(|c| c.data_type.clone())
-                        }
-                        (KeySource::Output(i), _) => projection
-                            .get(*i)
-                            .and_then(|item| crate::result_types::projection_type(item, declared)),
-                        (KeySource::Source(i), _) => {
-                            joined_columns.get(*i).map(|c| c.data_type.clone())
-                        }
-                        (KeySource::Computed(_), SortTarget::Expr(expr)) => {
-                            crate::result_types::expr_type(expr, &declared)
-                        }
-                        _ => None,
-                    };
-                    data_type.is_some_and(|t| is_interval_type(&t))
+                .map(|(source, target)| match (source, target) {
+                    (KeySource::Output(i), _) if projection.is_empty() => {
+                        joined_columns.get(*i).map(|c| c.data_type.clone())
+                    }
+                    (KeySource::Output(i), _) => projection
+                        .get(*i)
+                        .and_then(|item| crate::result_types::projection_type(item, declared)),
+                    (KeySource::Source(i), _) => {
+                        joined_columns.get(*i).map(|c| c.data_type.clone())
+                    }
+                    (KeySource::Computed(_), SortTarget::Expr(expr)) => {
+                        crate::result_types::expr_type(expr, &declared)
+                    }
+                    _ => None,
                 })
+                .collect();
+            let interval_keys: Vec<bool> = key_types
+                .iter()
+                .map(|t| t.as_deref().is_some_and(is_interval_type))
+                .collect();
+            let range_keys: Vec<Option<crate::ranges::Kind>> = key_types
+                .iter()
+                .map(|t| t.as_deref().and_then(crate::ranges::Kind::of))
                 .collect();
             let key_cmp = |i: usize, a: &Value, b: &Value, asc: bool, nulls_first: Option<bool>| {
                 if interval_keys[i]
@@ -1911,6 +1939,13 @@ impl MemExecutor {
                     )
                 {
                     let ord = l.span().cmp(&r.span());
+                    return if asc { ord } else { ord.reverse() };
+                }
+                if let Some(kind) = range_keys[i]
+                    && let (Value::Text(l), Value::Text(r)) = (a, b)
+                    && let (Ok(l), Ok(r)) = (crate::ranges::parse(l), crate::ranges::parse(r))
+                {
+                    let ord = crate::ranges::cmp_ranges(kind, &l, &r);
                     return if asc { ord } else { ord.reverse() };
                 }
                 order_cmp(a, b, asc, nulls_first)

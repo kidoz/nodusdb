@@ -315,6 +315,51 @@ fn type_ddl_is_authorized() {
 }
 
 #[test]
+fn range_types_read_write_and_operate() {
+    let (sql, _) = session();
+    sql("CREATE TABLE r (id int PRIMARY KEY, span int4range)").unwrap();
+    sql("INSERT INTO r VALUES (1, '[1,5)'), (2, 'empty'), (3, '(5,9]')").unwrap();
+    // Canonicalized on the way in, `empty` first in order.
+    assert_eq!(
+        ordered(&sql("SELECT span FROM r ORDER BY span").unwrap()),
+        ["empty", "[1,5)", "[6,10)"]
+    );
+    assert_eq!(
+        rows(&sql("SELECT id FROM r WHERE span @> 7").unwrap()),
+        ["3"]
+    );
+    assert_eq!(
+        rows(&sql("SELECT id FROM r WHERE span && '[4,6]'::int4range ORDER BY id").unwrap()),
+        ["1", "3"]
+    );
+    assert_eq!(
+        rows(&sql("SELECT '[1,5)'::int4range + '[5,9)'::int4range").unwrap()),
+        ["[1,9)"]
+    );
+    assert_eq!(
+        rows(&sql("SELECT '[1,5)'::int4range - '[4,5)'::int4range").unwrap()),
+        ["[1,4)"]
+    );
+    assert_eq!(
+        rows(&sql("SELECT lower('[1,5)'::int4range), isempty('empty'::int4range)").unwrap()),
+        ["1|t"]
+    );
+    assert_eq!(
+        rows(&sql("SELECT '[1,5)'::int4range::text").unwrap()),
+        ["[1,5)"]
+    );
+    assert_eq!(rows(&sql("SELECT count(*) FROM pg_range").unwrap()), ["6"]);
+    let (message, f) = fields(sql("SELECT '[1,5)'::int4range - '[2,3)'::int4range").unwrap_err());
+    assert!(message.contains("result of range difference would not be contiguous"));
+    assert_eq!(field(&f, "code").as_deref(), Some("22000"));
+    let (message, f) = fields(sql("SELECT 'x'::int4range").unwrap_err());
+    assert!(message.contains("malformed range literal"));
+    assert_eq!(field(&f, "code").as_deref(), Some("22P02"));
+    let (message, _) = fields(sql("SELECT '[1,5)'::int4range - 3").unwrap_err());
+    assert_eq!(message, "operator does not exist: int4range - integer");
+}
+
+#[test]
 fn a_cast_to_an_unknown_type_is_refused() {
     let (sql, _) = session();
     // As a cast, a column, an attribute, or a domain's base.
