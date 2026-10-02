@@ -184,3 +184,11 @@ fn cursors_fetch_from_their_position() {
     assert_eq!(sql("CLOSE h").unwrap().tag, "CLOSE CURSOR");
     assert!(sql("CLOSE h").is_err());
 }
+
+#[test]
+fn a_cast_to_an_unknown_type_is_refused() {
+    let (sql, _) = session();
+    let (message, f) = fields(sql("SELECT 'x'::nosuch").unwrap_err());
+    assert_eq!(message, "type \"nosuch\" does not exist");
+    assert_eq!(field(&f, "code").as_deref(), Some("42704"));
+}

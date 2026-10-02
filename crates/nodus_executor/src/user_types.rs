@@ -320,6 +320,45 @@ pub(crate) fn forget_found() {
     ALL.with(|a| *a.borrow_mut() = None);
 }
 
+/// Whether a type name is one the executor knows: a built-in, a user type,
+/// an object identifier, or an array of one. PostgreSQL refuses a cast to
+/// any other name (`type "x" does not exist`).
+pub(crate) fn is_known_type(data_type: &str) -> bool {
+    let mut base = data_type.trim();
+    while let Some(stripped) = base.strip_suffix("[]") {
+        base = stripped.trim_end();
+    }
+    let base = base.split('(').next().unwrap_or_default().trim();
+    let unqualified = base.rsplit_once('.').map_or(base, |(_, name)| name);
+    is_builtin(&unqualified.trim_matches('"').to_ascii_uppercase())
+        || lookup(base).is_some()
+        // Every relation has a row type, named after it.
+        || is_relation(base)
+        || crate::value::object_identifier_type(data_type).is_some()
+}
+
+/// Whether a relation of this name exists (`SELECT ROW(1, 2)::rt` casts to
+/// a table's row type).
+fn is_relation(name: &str) -> bool {
+    let Some(catalog) = crate::session_env::with(|env| env.and_then(|e| e.catalog.clone())) else {
+        return false;
+    };
+    let (schema, table) = split_name(name);
+    match schema {
+        Some(schema) => catalog.get_table("default", &schema, &table).is_ok(),
+        None => crate::search_path::existing_search_path()
+            .iter()
+            .any(|schema| catalog.get_table("default", schema, &table).is_ok()),
+    }
+}
+
+/// The error a cast to a type that does not exist gives.
+pub(crate) fn missing_type(data_type: &str) -> String {
+    DbError::new(format!("type \"{data_type}\" does not exist"))
+        .code("42704")
+        .into_text()
+}
+
 /// Built-in type names (upper case, without modifiers), never a user
 /// type's.
 fn is_builtin(upper: &str) -> bool {

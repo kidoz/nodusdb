@@ -233,6 +233,11 @@ pub(crate) fn try_cast(v: Value, data_type: &str) -> std::result::Result<Value, 
     if let Some(t) = crate::user_types::lookup(data_type) {
         return crate::user_types::coerce(&t, &v, true);
     }
+    // A cast to a type that is not one, as PostgreSQL: `type "e" does not
+    // exist`.
+    if !crate::user_types::is_known_type(data_type) {
+        return Err(crate::user_types::missing_type(data_type));
+    }
     if matches!(v, Value::Null) {
         return Ok(Value::Null);
     }
