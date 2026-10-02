@@ -147,6 +147,3 @@ CREATE FUNCTION f(a int) RETURNS int AS 'select a' LANGUAGE sql;
 
 statement error
 CREATE EXTENSION pgcrypto;
-
-statement error
-CREATE TYPE pair AS (a int, b int);

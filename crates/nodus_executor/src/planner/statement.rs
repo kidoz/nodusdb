@@ -836,6 +836,40 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                 _ => anyhow::bail!("malformed domain statement"),
             }
         }
+        Statement::Query(query) if rewritten_call(query, nodus_sql::TYPE_FUNCTION).is_some() => {
+            match rewritten_call(query, nodus_sql::TYPE_FUNCTION).as_deref() {
+                Some(
+                    [
+                        crate::Value::Text(operation),
+                        crate::Value::Text(name),
+                        crate::Value::Text(first),
+                        crate::Value::Text(second),
+                    ],
+                ) => {
+                    let change = match operation.as_str() {
+                        "add" => crate::user_types::TypeChange::AddAttribute {
+                            name: first.clone(),
+                            data_type: second.clone(),
+                        },
+                        "drop" => crate::user_types::TypeChange::DropAttribute {
+                            name: first.clone(),
+                            if_exists: second == "true",
+                        },
+                        "rename" => crate::user_types::TypeChange::RenameAttribute {
+                            from: first.clone(),
+                            to: second.clone(),
+                        },
+                        _ => anyhow::bail!("malformed ALTER TYPE"),
+                    };
+                    Ok(LogicalPlan::AlterType {
+                        name: name.clone(),
+                        change,
+                        domain: false,
+                    })
+                }
+                _ => anyhow::bail!("malformed ALTER TYPE"),
+            }
+        }
         Statement::Query(query) if rewritten_call(query, nodus_sql::CURSOR_FUNCTION).is_some() => {
             let args = rewritten_call(query, nodus_sql::CURSOR_FUNCTION)
                 .expect("guarded by the match arm");
@@ -1108,8 +1142,24 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                     .collect(),
             },
         }),
+        Statement::CreateType {
+            name,
+            representation:
+                Some(sqlparser::ast::UserDefinedTypeRepresentation::Composite { attributes }),
+        } => Ok(LogicalPlan::CreateType {
+            name: name.to_string(),
+            definition: crate::user_types::TypeDefinition::Composite {
+                attributes: attributes
+                    .iter()
+                    .map(|a| crate::user_types::Attribute {
+                        name: a.name.value.clone(),
+                        data_type: a.data_type.to_string(),
+                    })
+                    .collect(),
+            },
+        }),
         Statement::CreateType { .. } => {
-            anyhow::bail!("CREATE TYPE is not supported but for enums (AS ENUM)")
+            anyhow::bail!("CREATE TYPE is not supported but for enums and composite types")
         }
         Statement::CreateDomain(domain) => {
             let mut definition = crate::user_types::DomainDefinition {
@@ -2204,12 +2254,15 @@ fn plan_assignments(
     params: &[Value],
 ) -> Result<Vec<(String, ScalarExpr)>> {
     use sqlparser::ast::{AssignmentTarget, Expr};
-    // Take the last identifier of the target, e.g. `t.col = ...` -> `col`.
+    // A dotted target is a column's field (`p.a = ...`) or, for a column
+    // that is not one of a composite type, the column qualified by its
+    // table; the executor tells them apart.
     let column = |name: &sqlparser::ast::ObjectName| {
         name.0
-            .last()
-            .and_then(|p| p.as_ident())
-            .map(|i| i.value.clone())
+            .iter()
+            .map(|p| p.as_ident().map(|i| i.value.clone()))
+            .collect::<Option<Vec<_>>>()
+            .map(|parts| parts.join("."))
             .ok_or_else(|| anyhow::anyhow!("Unsupported assignment target: {name}"))
     };
     let mut out = Vec::new();

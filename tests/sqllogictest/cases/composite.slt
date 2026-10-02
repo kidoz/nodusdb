@@ -1,0 +1,150 @@
+# Composite types: definition, storage, field access, attributes, catalogs.
+# Expected results come from PostgreSQL 18.
+statement ok
+CREATE TYPE pair AS (a int, b text);
+
+statement error
+CREATE TYPE pair AS (x int);
+
+statement ok
+CREATE TABLE ct (id int PRIMARY KEY, p pair);
+
+statement ok
+INSERT INTO ct VALUES (1, ROW(1, 'x')), (2, '(2,y)'), (3, NULL), (4, ROW(NULL, 'q r'));
+
+statement error
+INSERT INTO ct VALUES (5, '(abc,y)');
+
+query TTTT
+SELECT id, p, (p).a, (p).b FROM ct ORDER BY id;
+----
+1	(1,x)	1	x
+2	(2,y)	2	y
+3	NULL	NULL	NULL
+4	(,"q r")	NULL	q r
+
+query TT
+SELECT (ROW(5, 'z')::pair).b, ROW(5, 'z')::pair;
+----
+z	(5,z)
+
+query T
+SELECT ('(7,w)'::pair).a;
+----
+7
+
+query T
+SELECT id FROM ct WHERE (p).a = 2;
+----
+2
+
+query T
+SELECT id FROM ct WHERE p = ROW(1, 'x')::pair;
+----
+1
+
+statement ok
+UPDATE ct SET p.a = 10 WHERE id = 1;
+
+query T
+SELECT p FROM ct WHERE id = 1;
+----
+(10,x)
+
+query T
+UPDATE ct SET p = ROW(20, 'twenty') WHERE id = 2 RETURNING p;
+----
+(20,twenty)
+
+query TT
+SELECT pg_typeof(p), pg_typeof((p).a) FROM ct WHERE id = 1;
+----
+pair	integer
+
+query TTT
+SELECT typname, typtype, typrelid <> 0 FROM pg_type WHERE typname = 'pair';
+----
+pair	c	t
+
+query TT
+SELECT attname, format_type(atttypid, atttypmod) FROM pg_attribute WHERE attrelid = (SELECT typrelid FROM pg_type WHERE typname = 'pair') ORDER BY attnum;
+----
+a	integer
+b	text
+
+query TTT
+SELECT column_name, data_type, udt_name FROM information_schema.columns WHERE table_name = 'ct' ORDER BY ordinal_position;
+----
+id	integer	int4
+p	USER-DEFINED	pair
+
+query TT
+SELECT (p).* FROM ct WHERE id = 2;
+----
+20	twenty
+
+query T
+SELECT row_to_json(p) FROM ct WHERE id = 2;
+----
+{"a":20,"b":"twenty"}
+
+statement ok
+ALTER TYPE pair ADD ATTRIBUTE c int;
+
+query T
+SELECT p FROM ct WHERE id = 2;
+----
+(20,twenty,)
+
+statement ok
+ALTER TYPE pair RENAME ATTRIBUTE c TO cc;
+
+statement ok
+ALTER TYPE pair DROP ATTRIBUTE cc;
+
+query T
+SELECT p FROM ct WHERE id = 2;
+----
+(20,twenty)
+
+statement error
+DROP TYPE pair;
+
+statement ok
+DROP TABLE ct;
+
+statement ok
+DROP TYPE pair;
+
+statement ok
+CREATE TABLE rt (a int, b text);
+
+statement ok
+INSERT INTO rt VALUES (1, 'one');
+
+query T
+SELECT rt FROM rt;
+----
+(1,one)
+
+query T
+SELECT (rt).b FROM rt;
+----
+one
+
+query T
+SELECT ROW(2, 'two')::rt;
+----
+(2,two)
+
+query T
+SELECT pg_typeof(rt) FROM rt;
+----
+rt
+
+query T
+SELECT c.relname, c.relkind, c.relnatts FROM pg_class c WHERE c.relname = 'pair';
+----
+
+statement ok
+DROP TABLE rt;

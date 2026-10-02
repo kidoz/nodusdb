@@ -186,6 +186,78 @@ fn cursors_fetch_from_their_position() {
 }
 
 #[test]
+fn composite_types_read_write_and_change_their_fields() {
+    let (sql, _) = session();
+    sql("CREATE TYPE pair AS (a int, b text)").unwrap();
+    sql("CREATE TABLE ct (id int PRIMARY KEY, p pair)").unwrap();
+    sql("INSERT INTO ct VALUES (1, ROW(1, 'x')), (2, '(2,y)'), (3, NULL)").unwrap();
+    assert_eq!(
+        ordered(&sql("SELECT id, (p).a, (p).b FROM ct ORDER BY id").unwrap()),
+        ["1|1|x", "2|2|y", "3||"]
+    );
+    assert_eq!(
+        rows(&sql("SELECT id FROM ct WHERE (p).a = 2").unwrap()),
+        ["2"]
+    );
+    // A field write changes only that field.
+    sql("UPDATE ct SET p.a = 10 WHERE id = 1").unwrap();
+    assert_eq!(
+        rows(&sql("SELECT p FROM ct WHERE id = 1").unwrap()),
+        ["(10,x)"]
+    );
+    // `(p).*` spreads the fields into columns.
+    let out = sql("SELECT (p).* FROM ct WHERE id = 2").unwrap();
+    assert_eq!(
+        (out.columns.clone(), ordered(&out)),
+        (
+            vec!["a".to_string(), "b".to_string()],
+            vec!["2|y".to_string()]
+        )
+    );
+    // A record of the wrong width is malformed.
+    let (message, f) = fields(sql("INSERT INTO ct VALUES (4, '(1)')").unwrap_err());
+    assert_eq!(message, "malformed record literal: \"(1)\"");
+    assert_eq!(field(&f, "code").as_deref(), Some("22P02"));
+    // The type's relation lists its attributes.
+    let out = sql("SELECT attname FROM pg_attribute WHERE attrelid = \
+         (SELECT typrelid FROM pg_type WHERE typname = 'pair') ORDER BY attnum")
+    .unwrap();
+    assert_eq!(rows(&out), ["a", "b"]);
+    // An attribute added later reads as NULL in rows written before it.
+    sql("ALTER TYPE pair ADD ATTRIBUTE c int").unwrap();
+    assert_eq!(
+        rows(&sql("SELECT p FROM ct WHERE id = 2").unwrap()),
+        ["(2,y,)"]
+    );
+    sql("UPDATE ct SET p.c = 9 WHERE id = 2").unwrap();
+    assert_eq!(
+        rows(&sql("SELECT p FROM ct WHERE id = 2").unwrap()),
+        ["(2,y,9)"]
+    );
+    sql("ALTER TYPE pair RENAME ATTRIBUTE c TO cc").unwrap();
+    assert_eq!(
+        rows(&sql("SELECT (p).cc FROM ct WHERE id = 2").unwrap()),
+        ["9"]
+    );
+    sql("ALTER TYPE pair DROP ATTRIBUTE cc").unwrap();
+    assert_eq!(
+        rows(&sql("SELECT p FROM ct WHERE id = 2").unwrap()),
+        ["(2,y)"]
+    );
+}
+
+#[test]
+fn a_tables_row_type_names_its_row() {
+    let (sql, _) = session();
+    sql("CREATE TABLE rt (a int, b text)").unwrap();
+    sql("INSERT INTO rt VALUES (1, 'one')").unwrap();
+    assert_eq!(rows(&sql("SELECT (rt).b FROM rt").unwrap()), ["one"]);
+    assert_eq!(rows(&sql("SELECT pg_typeof(rt) FROM rt").unwrap()), ["rt"]);
+    assert_eq!(rows(&sql("SELECT ROW(2, 'two')::rt").unwrap()), ["(2,two)"]);
+    assert_eq!(rows(&sql("SELECT (rt).* FROM rt").unwrap()), ["1|one"]);
+}
+
+#[test]
 fn a_cast_to_an_unknown_type_is_refused() {
     let (sql, _) = session();
     let (message, f) = fields(sql("SELECT 'x'::nosuch").unwrap_err());

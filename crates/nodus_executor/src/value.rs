@@ -72,6 +72,13 @@ pub(crate) fn encode_row(row: &[Value]) -> serde_json::Result<String> {
 /// parsed.
 pub(crate) fn restore_row(row: &mut [Value], columns: &[nodus_catalog::ColumnDescriptor]) {
     for (value, column) in row.iter_mut().zip(columns) {
+        // A composite column's text is its record.
+        if let Value::Text(t) = &*value
+            && let Some(record) = crate::user_types::stored_record(&column.data_type, t)
+        {
+            *value = record;
+            continue;
+        }
         if column.data_type.trim().eq_ignore_ascii_case("json") {
             if let Value::Text(t) = &*value {
                 *value = Value::Json(t.clone());

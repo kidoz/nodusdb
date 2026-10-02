@@ -57,6 +57,23 @@ impl MemExecutor {
         )
     }
 
+    /// The OID of a relation's row type (`pg_class.reltype`,
+    /// `pg_type.typrelid`).
+    pub(crate) fn row_type_oid(db_name: &str, schema_name: &str, table_name: &str) -> i64 {
+        Self::stable_oid(
+            &format!("rowtype:{db_name}.{schema_name}.{table_name}"),
+            100_000,
+        )
+    }
+
+    /// The OID of a relation's row type's array type.
+    pub(crate) fn row_type_array_oid(db_name: &str, schema_name: &str, table_name: &str) -> i64 {
+        Self::stable_oid(
+            &format!("rowtypearray:{db_name}.{schema_name}.{table_name}"),
+            100_000,
+        )
+    }
+
     pub(crate) fn index_oid(
         db_name: &str,
         schema_name: &str,

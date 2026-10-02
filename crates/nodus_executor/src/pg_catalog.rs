@@ -129,7 +129,8 @@ impl MemExecutor {
                         Value::Int(oid),
                         Value::Text(table.name.clone()),
                         Value::Int(Self::schema_oid(db_name, &schema_name)),
-                        Value::Int(0),
+                        // reltype: the relation's row type.
+                        Value::Int(Self::row_type_oid(db_name, &schema_name, &table.name)),
                         Value::Int(0),
                         Value::Int(10),
                         // A table's access method is heap.
@@ -222,6 +223,49 @@ impl MemExecutor {
                             Value::Null,
                         ]);
                     }
+                }
+                // A composite type's attributes live in a relation of its own,
+                // which pg_class lists with relkind 'c'.
+                for t in crate::user_types::all_types()
+                    .iter()
+                    .filter(|t| t.is_composite())
+                {
+                    rows.push(vec![
+                        Value::Int(t.relation_oid()),
+                        Value::Text(t.name.clone()),
+                        Value::Int(Self::schema_oid(db_name, &t.schema)),
+                        // reltype: a composite type is its own row type.
+                        Value::Int(t.oid()),
+                        Value::Int(0),
+                        Value::Int(10),
+                        Value::Int(0),
+                        Value::Int(t.relation_oid()),
+                        Value::Int(0),
+                        Value::Int(0),
+                        Value::Float(0.0),
+                        Value::Int(0),
+                        Value::Int(0),
+                        Value::Bool(false),
+                        Value::Bool(false),
+                        Value::Text("p".into()),
+                        Value::Text("c".into()),
+                        Value::Int(t.attributes().len() as i64),
+                        Value::Int(0),
+                        Value::Bool(false),
+                        Value::Bool(false),
+                        Value::Bool(false),
+                        Value::Bool(false),
+                        Value::Bool(false),
+                        Value::Bool(true),
+                        Value::Text("d".into()),
+                        Value::Bool(false),
+                        Value::Int(0),
+                        Value::Int(0),
+                        Value::Int(0),
+                        Value::Null,
+                        Value::Null,
+                        Value::Null,
+                    ]);
                 }
                 Some((cols, rows))
             }
@@ -345,6 +389,44 @@ impl MemExecutor {
                                 Value::Text(String::new()),
                             ]);
                         }
+                    }
+                }
+                // A composite type's attributes are the attributes of its
+                // relation.
+                for t in crate::user_types::all_types()
+                    .iter()
+                    .filter(|t| t.is_composite())
+                {
+                    for (idx, attribute) in t.attributes().iter().enumerate() {
+                        let type_oid = Self::pg_type_oid(&attribute.data_type);
+                        rows.push(vec![
+                            Value::Int(t.relation_oid()),
+                            Value::Text(attribute.name.clone()),
+                            Value::Int(type_oid),
+                            Value::Int(-1),
+                            Value::Int(Self::pg_type_length(&attribute.data_type)),
+                            Value::Int((idx + 1) as i64),
+                            Value::Int(0),
+                            Value::Int(-1),
+                            Value::Int(Self::pg_type_modifier(&attribute.data_type)),
+                            Value::Bool(matches!(type_oid, 16 | 20 | 21 | 23 | 26 | 700 | 701)),
+                            Value::Text(Self::pg_type_storage(&attribute.data_type).into()),
+                            Value::Text("i".into()),
+                            Value::Bool(false),
+                            Value::Bool(false),
+                            Value::Bool(false),
+                            Value::Text(String::new()),
+                            Value::Text(String::new()),
+                            Value::Bool(false),
+                            Value::Bool(true),
+                            Value::Int(0),
+                            Value::Int(100),
+                            Value::Null,
+                            Value::Null,
+                            Value::Null,
+                            Value::Null,
+                            Value::Text(String::new()),
+                        ]);
                     }
                 }
                 Some((cols, rows))
@@ -1744,6 +1826,91 @@ impl MemExecutor {
             ]);
         }
         rows.extend(self.user_type_rows(db_name));
+        // Every relation has a row type, which pg_type lists (typtype 'c')
+        // and whose attributes are the relation's own `pg_attribute` rows.
+        let schemas = self
+            .catalog_reader
+            .list_schemas(db_name)
+            .unwrap_or_default();
+        for table in self
+            .catalog_reader
+            .list_all_tables(db_name)
+            .unwrap_or_default()
+        {
+            if crate::sequences::is_sequence(&table) {
+                continue;
+            }
+            let schema_name = Self::schema_name_by_id(db_name, &schemas, table.schema_id);
+            let namespace = Self::schema_oid(db_name, &schema_name);
+            let relid = Self::table_oid(db_name, &schema_name, &table.name);
+            let row_type = Self::row_type_oid(db_name, &schema_name, &table.name);
+            rows.push(vec![
+                Value::Int(row_type),
+                Value::Text(table.name.clone()),
+                Value::Int(namespace),
+                Value::Int(10),
+                Value::Int(-1),
+                Value::Bool(false),
+                Value::Text("c".into()),
+                Value::Text("C".into()),
+                Value::Bool(false),
+                Value::Bool(true),
+                Value::Text(",".into()),
+                Value::Int(relid),
+                Value::Int(0),
+                Value::Int(Self::row_type_array_oid(db_name, &schema_name, &table.name)),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Text("d".into()),
+                Value::Text("x".into()),
+                Value::Bool(false),
+                Value::Int(0),
+                Value::Int(-1),
+                Value::Int(0),
+                Value::Int(100),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+            ]);
+            rows.push(vec![
+                Value::Int(Self::row_type_array_oid(db_name, &schema_name, &table.name)),
+                Value::Text(format!("_{}", table.name)),
+                Value::Int(namespace),
+                Value::Int(10),
+                Value::Int(-1),
+                Value::Bool(false),
+                Value::Text("b".into()),
+                Value::Text("A".into()),
+                Value::Bool(false),
+                Value::Bool(true),
+                Value::Text(",".into()),
+                Value::Int(0),
+                Value::Int(row_type),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Text("i".into()),
+                Value::Text("x".into()),
+                Value::Bool(false),
+                Value::Int(0),
+                Value::Int(-1),
+                Value::Int(1),
+                Value::Int(100),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+            ]);
+        }
         (cols, rows)
     }
 

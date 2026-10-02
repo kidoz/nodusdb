@@ -58,7 +58,7 @@ impl MemExecutor {
             match &clause.action {
                 MergeAction::Update(assignments) => {
                     for (column, expr) in assignments {
-                        Self::column_position(&tbl, column)?;
+                        Self::assignment_target(&tbl, column)?;
                         crate::filter_eval::scalar_column_refs(expr, &mut refs);
                     }
                 }

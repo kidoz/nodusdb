@@ -147,6 +147,15 @@ fn scalar_type(expr: &ScalarExpr, column: &impl Fn(&str) -> Option<String>) -> O
                 _ => Some("TIMESTAMP".into()),
             }
         }
+        // A field of a composite value, by the value's type.
+        ScalarExpr::Function { name, args } if name == crate::user_types::FIELD => {
+            match args.as_slice() {
+                [value, ScalarExpr::Literal(Value::Text(field)), ..] => {
+                    crate::user_types::field_type(&scalar_type(value, column)?, field)
+                }
+                _ => None,
+            }
+        }
         ScalarExpr::Function { name, args } => crate::functions::return_type(
             name,
             &args
@@ -290,6 +299,21 @@ pub(crate) fn check_integer_ranges(
     let checked = expr.map_children(&mut |e| check_integer_ranges(e, column));
     if let Some(ordered) = enum_order(&checked, column) {
         return ordered;
+    }
+    // A field of a composite value learns the value's type.
+    if let ScalarExpr::Function { name, args } = &checked
+        && name == crate::user_types::FIELD
+        && let [value, field] = args.as_slice()
+        && let Some(ty) = scalar_type(value, column)
+    {
+        return ScalarExpr::Function {
+            name: name.clone(),
+            args: vec![
+                value.clone(),
+                field.clone(),
+                ScalarExpr::Literal(Value::Text(ty)),
+            ],
+        };
     }
     // Date/time arithmetic takes its operators from its operands' types:
     // `time + interval` wraps at midnight, `date + interval` is a timestamp.

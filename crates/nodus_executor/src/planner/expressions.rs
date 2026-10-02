@@ -703,23 +703,26 @@ pub(crate) fn lower_scalar(expr: &sqlparser::ast::Expr, params: &[Value]) -> Opt
             };
             for access in chain {
                 let (name, args) = match access {
-                    AccessExpr::Subscript(Subscript::Index { index }) => {
-                        ("__SUBSCRIPT__", vec![base, lower_scalar(index, params)?])
-                    }
+                    AccessExpr::Subscript(Subscript::Index { index }) => (
+                        "__SUBSCRIPT__".to_string(),
+                        vec![base, lower_scalar(index, params)?],
+                    ),
                     AccessExpr::Subscript(Subscript::Slice {
                         lower_bound,
                         upper_bound,
                         stride: None,
                     }) => (
-                        "__SLICE__",
+                        "__SLICE__".to_string(),
                         vec![base, bound(lower_bound)?, bound(upper_bound)?],
+                    ),
+                    // `(value).field`: a field of a record.
+                    AccessExpr::Dot(Expr::Identifier(field)) => (
+                        crate::user_types::FIELD.to_string(),
+                        vec![base, ScalarExpr::Literal(Value::Text(field.value.clone()))],
                     ),
                     _ => return None,
                 };
-                base = ScalarExpr::Function {
-                    name: name.to_string(),
-                    args,
-                };
+                base = ScalarExpr::Function { name, args };
             }
             Some(base)
         }

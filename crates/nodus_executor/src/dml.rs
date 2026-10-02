@@ -718,7 +718,7 @@ impl MemExecutor {
         self.authorize(ctx, Action::Update, ResourceRef::Table(tbl.id))?;
         Self::reject_materialized_view(&tbl)?;
         for (col, _) in &assignments {
-            Self::column_position(&tbl, col)?;
+            Self::assignment_target(&tbl, col)?;
         }
         let scope = self.target_scope(
             ctx,
@@ -1082,6 +1082,65 @@ impl MemExecutor {
             })
     }
 
+    /// The column a `SET` target assigns — and its field, for a column of a
+    /// composite type (`p.a`). A dotted target naming no such field is the
+    /// column qualified by its table.
+    pub(crate) fn assignment_target(
+        tbl: &nodus_catalog::TableDescriptor,
+        target: &str,
+    ) -> Result<(usize, Option<String>)> {
+        if let Some(position) = tbl.columns.iter().position(|c| c.name == target) {
+            return Ok((position, None));
+        }
+        if let Some((column, field)) = target.split_once('.')
+            && let Some(position) = tbl.columns.iter().position(|c| c.name == column)
+            && crate::user_types::lookup(&tbl.columns[position].data_type)
+                .is_some_and(|t| t.is_composite())
+        {
+            return Ok((position, Some(field.to_string())));
+        }
+        let last = target.rsplit('.').next().unwrap_or(target);
+        Self::column_position(tbl, last).map(|position| (position, None))
+    }
+
+    /// A composite column's record with one field set to `value`.
+    fn with_field(
+        column: &ColumnDescriptor,
+        current: &Value,
+        field: &str,
+        value: &Value,
+    ) -> Result<Value> {
+        let Some(t) = crate::user_types::lookup(&column.data_type) else {
+            return Ok(value.clone());
+        };
+        let mut fields: Vec<(String, Value)> = match current {
+            Value::Record(fields) => fields.clone(),
+            Value::Text(text) => match crate::user_types::stored_record(&column.data_type, text) {
+                Some(Value::Record(fields)) => fields,
+                _ => Vec::new(),
+            },
+            _ => t
+                .attributes()
+                .iter()
+                .map(|a| (a.name.clone(), Value::Null))
+                .collect(),
+        };
+        let Some(at) = t.attributes().iter().position(|a| a.name == field) else {
+            return Err(crate::error_fields::DbError::new(format!(
+                "cannot assign to field \"{field}\" of column \"{}\" because there is no such column in data type {}",
+                column.name, t.name
+            ))
+            .code("42703")
+            .into());
+        };
+        fields.resize(t.attributes().len(), (String::new(), Value::Null));
+        fields[at] = (
+            field.to_string(),
+            crate::value::coerce_for_column(value, &t.attributes()[at].data_type),
+        );
+        Ok(Value::Record(fields))
+    }
+
     /// A column's declared DEFAULT expression, if any.
     pub(crate) fn column_default(column: &ColumnDescriptor) -> Option<ScalarExpr> {
         column
@@ -1141,7 +1200,7 @@ impl MemExecutor {
     ) -> Result<Vec<Value>> {
         let mut row = old_row.to_vec();
         for (col, expr) in assignments {
-            let idx = Self::column_position(tbl, col)?;
+            let (idx, field) = Self::assignment_target(tbl, col)?;
             let default = Self::column_default(&tbl.columns[idx]);
             let is_default = matches!(expr,
                 ScalarExpr::Function { name, args } if name == "__COLUMN_DEFAULT__" && args.is_empty());
@@ -1159,7 +1218,10 @@ impl MemExecutor {
             } else {
                 self.eval_expr(ctx, expr, scope_row, scope_cols)
             };
-            row[idx] = crate::value::coerce_for_column(&val, &tbl.columns[idx].data_type);
+            row[idx] = match &field {
+                Some(field) => Self::with_field(&tbl.columns[idx], &row[idx], field, &val)?,
+                None => crate::value::coerce_for_column(&val, &tbl.columns[idx].data_type),
+            };
         }
         // A value its column's type refuses fails before any constraint.
         crate::eval_error::check()?;

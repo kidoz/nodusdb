@@ -48,7 +48,7 @@ pub fn parse_sql(
         }
     }
     let tokens = reorder_identity_options(reorder_sequence_options(rewrite_data_clauses(
-        rewrite_query_syntax(tokens),
+        rewrite_record_star(rewrite_query_syntax(tokens)),
     )));
     Parser::new(&dialect)
         .with_tokens_with_locations(tokens)
@@ -70,6 +70,49 @@ pub const SYMMETRIC_MARKER: &str = "__SYMMETRIC__";
 /// parser lacks: `INSERT INTO t AS __overriding_system__ ...`.
 pub const OVERRIDING_SYSTEM: &str = "__overriding_system__";
 pub const OVERRIDING_USER: &str = "__overriding_user__";
+
+/// `(value).*`, a record expanded into its fields
+/// ([`EXPAND_RECORD_FUNCTION`]).
+fn rewrite_record_star(
+    mut tokens: Vec<sqlparser::tokenizer::TokenWithSpan>,
+) -> Vec<sqlparser::tokenizer::TokenWithSpan> {
+    use sqlparser::tokenizer::Token;
+    let mut i = 0;
+    while i + 2 < tokens.len() {
+        if matches!(tokens[i].token, Token::RParen)
+            && matches!(tokens[i + 1].token, Token::Period)
+            && matches!(tokens[i + 2].token, Token::Mul)
+        {
+            // The parenthesis the `.*` applies to.
+            let mut depth = 1i32;
+            let mut open = None;
+            for j in (0..i).rev() {
+                match tokens[j].token {
+                    Token::RParen => depth += 1,
+                    Token::LParen => {
+                        depth -= 1;
+                        if depth == 0 {
+                            open = Some(j);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(open) = open {
+                let inner = render_tokens(&tokens[open + 1..i]);
+                if let Some(replacement) =
+                    snippet_tokens(&format!("{EXPAND_RECORD_FUNCTION}({inner})"))
+                {
+                    tokens.splice(open..=i + 2, replacement);
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    tokens
+}
 
 /// Query syntax the parser lacks: `TABLE name` as a query (`SELECT * FROM
 /// name`), `BETWEEN [A]SYMMETRIC` ([`SYMMETRIC_MARKER`]), and a window
@@ -361,6 +404,16 @@ pub const SET_SCHEMA_FUNCTION: &str = "pg_catalog.nodus_set_schema";
 /// parser takes no schema elements.
 pub const CREATE_SCHEMA_FUNCTION: &str = "pg_catalog.nodus_create_schema";
 
+/// The function call `ALTER TYPE ... ADD | DROP | RENAME ATTRIBUTE` is
+/// written as — `SELECT pg_catalog.nodus_alter_type('add', 'pair', 'c',
+/// 'int')` — since the parser takes only enum operations.
+pub const TYPE_FUNCTION: &str = "pg_catalog.nodus_alter_type";
+
+/// The function `(value).*` — a record expanded into its fields — is
+/// written as — `pg_catalog.nodus_expand_record(value)` — since the parser
+/// has no `.*` after a parenthesized expression.
+pub const EXPAND_RECORD_FUNCTION: &str = "pg_catalog.nodus_expand_record";
+
 /// Rewrites what the parser lacks: a trailing `WITH [NO] DATA` on `CREATE
 /// TABLE ... AS` or `CREATE MATERIALIZED VIEW` becomes the storage
 /// parameter [`NO_DATA_OPTION`] (for `NO DATA`), and `REFRESH MATERIALIZED
@@ -512,6 +565,53 @@ fn rewrite_statement_form(
                 "SELECT {SET_SCHEMA_FUNCTION}('{kind}', {if_exists}, '{}', '{}')",
                 quote(name.trim()),
                 quote(&schema)
+            );
+            if let Some(mut tokens) = snippet_tokens(&sql) {
+                tokens.extend(tail(&statement));
+                return tokens;
+            }
+            return statement;
+        }
+    }
+
+    // `ALTER TYPE <name> ADD | DROP | RENAME ATTRIBUTE ...`.
+    if is(0, "alter") && is(1, "type") && n >= 5 {
+        let operation = (3..n).find(|&k| is(k, "attribute")).and_then(|k| {
+            match (is(k - 1, "add"), is(k - 1, "drop"), is(k - 1, "rename")) {
+                (true, _, _) => Some(("add", k)),
+                (_, true, _) => Some(("drop", k)),
+                (_, _, true) => Some(("rename", k)),
+                _ => None,
+            }
+        });
+        if let Some((operation, at)) = operation {
+            let name = render_tokens(&statement[significant[2]..=significant[at - 2]]);
+            let word_at = |k: usize| render_tokens(&statement[significant[k]..=significant[k]]);
+            let (first, second) = match operation {
+                // `ADD ATTRIBUTE <name> <type>`.
+                "add" if at + 2 < n => (
+                    word_at(at + 1),
+                    render_tokens(&statement[significant[at + 2]..=significant[n - 1]])
+                        .trim()
+                        .to_string(),
+                ),
+                // `DROP ATTRIBUTE [IF EXISTS] <name>`.
+                "drop" => {
+                    let if_exists = is(at + 1, "if") && is(at + 2, "exists");
+                    (
+                        word_at(at + if if_exists { 3 } else { 1 }),
+                        if_exists.to_string(),
+                    )
+                }
+                // `RENAME ATTRIBUTE <from> TO <to>`.
+                "rename" if n >= 2 && is(n - 2, "to") => (word_at(at + 1), word_at(n - 1)),
+                _ => return statement,
+            };
+            let sql = format!(
+                "SELECT {TYPE_FUNCTION}('{operation}', '{}', '{}', '{}')",
+                quote(name.trim()),
+                quote(&first),
+                quote(&second)
             );
             if let Some(mut tokens) = snippet_tokens(&sql) {
                 tokens.extend(tail(&statement));
@@ -1290,6 +1390,33 @@ mod tests {
         );
         // A plain one is left to the parser.
         assert!(one("CREATE SCHEMA s AUTHORIZATION nodus").starts_with("CREATE SCHEMA"));
+    }
+
+    #[test]
+    fn record_star_and_type_attributes_parse() {
+        let one = |sql: &str| parse_sql(sql).unwrap()[0].to_string();
+        assert_eq!(
+            one("SELECT (p).* FROM ct"),
+            format!("SELECT {EXPAND_RECORD_FUNCTION}(p) FROM ct")
+        );
+        assert_eq!(
+            one("SELECT ((p)) FROM ct"),
+            "SELECT ((p)) FROM ct".to_string()
+        );
+        assert_eq!(
+            one("ALTER TYPE pair ADD ATTRIBUTE c int"),
+            format!("SELECT {TYPE_FUNCTION}('add', 'pair', 'c', 'int')")
+        );
+        assert_eq!(
+            one("ALTER TYPE pair DROP ATTRIBUTE IF EXISTS c"),
+            format!("SELECT {TYPE_FUNCTION}('drop', 'pair', 'c', 'true')")
+        );
+        assert_eq!(
+            one("ALTER TYPE s.pair RENAME ATTRIBUTE c TO d"),
+            format!("SELECT {TYPE_FUNCTION}('rename', 's.pair', 'c', 'd')")
+        );
+        // A plain enum operation is left to the parser.
+        assert!(one("ALTER TYPE mood ADD VALUE 'x'").starts_with("ALTER TYPE"));
     }
 
     #[test]

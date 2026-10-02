@@ -41,6 +41,14 @@ pub(crate) const ENUM_LABEL: &str = "__ENUM_LABEL__";
 pub enum TypeDefinition {
     Enum { labels: Vec<EnumLabel> },
     Domain(DomainDefinition),
+    Composite { attributes: Vec<Attribute> },
+}
+
+/// A composite type's attribute: its name and declared type.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Attribute {
+    pub name: String,
+    pub data_type: String,
 }
 
 /// An enum's label and its place in the order (`pg_enum.enumsortorder`).
@@ -101,6 +109,26 @@ pub enum TypeChange {
         from: String,
         to: String,
     },
+    /// A composite type's `ADD ATTRIBUTE name type`.
+    AddAttribute {
+        name: String,
+        data_type: String,
+    },
+    /// A composite type's `DROP ATTRIBUTE [IF EXISTS] name`.
+    DropAttribute {
+        name: String,
+        if_exists: bool,
+    },
+    /// A composite type's `RENAME ATTRIBUTE from TO to`.
+    RenameAttribute {
+        from: String,
+        to: String,
+    },
+    /// A composite type's `ALTER ATTRIBUTE name TYPE type`.
+    AlterAttributeType {
+        name: String,
+        data_type: String,
+    },
     /// What changes nothing NodusDB keeps (`OWNER TO`, `VALIDATE
     /// CONSTRAINT`).
     Nothing,
@@ -140,8 +168,26 @@ impl UserType {
     pub(crate) fn domain(&self) -> Option<&DomainDefinition> {
         match &self.definition {
             TypeDefinition::Domain(d) => Some(d),
-            TypeDefinition::Enum { .. } => None,
+            _ => None,
         }
+    }
+
+    /// A composite type's attributes (none for another type).
+    pub(crate) fn attributes(&self) -> &[Attribute] {
+        match &self.definition {
+            TypeDefinition::Composite { attributes } => attributes,
+            _ => &[],
+        }
+    }
+
+    pub(crate) fn is_composite(&self) -> bool {
+        matches!(self.definition, TypeDefinition::Composite { .. })
+    }
+
+    /// The OID of the relation that lists a composite type's attributes
+    /// (`pg_type.typrelid`).
+    pub(crate) fn relation_oid(&self) -> i64 {
+        MemExecutor::stable_oid(&format!("typerel:{}", self.id.0), 100_000)
     }
 
     /// An enum's labels in their order.
@@ -643,6 +689,61 @@ pub(crate) fn coerce(t: &UserType, value: &Value, explicit: bool) -> Result<Valu
                 .into_text())
             }
         }
+        TypeDefinition::Composite { attributes } => {
+            let refuse = |detail: &str| -> String {
+                match value {
+                    Value::Text(text) => {
+                        DbError::new(format!("malformed record literal: \"{text}\""))
+                            .code("22P02")
+                            .detail(detail)
+                            .into_text()
+                    }
+                    _ => DbError::new(format!("cannot cast type record to {}", t.name))
+                        .code("42846")
+                        .detail(format!(
+                            "Input has {}.",
+                            detail.to_ascii_lowercase().trim_end_matches('.')
+                        ))
+                        .into_text(),
+                }
+            };
+            let fields: Vec<Value> = match value {
+                Value::Null => return Ok(Value::Null),
+                Value::Record(fields) => fields.iter().map(|(_, v)| v.clone()).collect(),
+                Value::Text(text) => parse_record_text(text)
+                    .ok_or_else(|| {
+                        DbError::new(format!("malformed record literal: \"{text}\""))
+                            .code("22P02")
+                            .into_text()
+                    })?
+                    .into_iter()
+                    .map(|field| field.map_or(Value::Null, Value::Text))
+                    .collect(),
+                other => {
+                    return Err(format!(
+                        "cannot cast type {} to {}",
+                        crate::value::value_type_name(other),
+                        t.name
+                    ));
+                }
+            };
+            if fields.len() < attributes.len() {
+                return Err(refuse("Too few columns."));
+            }
+            if fields.len() > attributes.len() {
+                return Err(refuse("Too many columns."));
+            }
+            let mut typed = Vec::with_capacity(fields.len());
+            for (attribute, field) in attributes.iter().zip(fields) {
+                let value = if explicit || matches!(field, Value::Text(_)) {
+                    crate::planner::try_cast(field, &attribute.data_type)?
+                } else {
+                    crate::value::coerce_for_column(&field, &attribute.data_type)
+                };
+                typed.push((attribute.name.clone(), value));
+            }
+            Ok(Value::Record(typed))
+        }
         TypeDefinition::Domain(domain) => {
             let value = match value {
                 Value::Null => Value::Null,
@@ -654,6 +755,127 @@ pub(crate) fn coerce(t: &UserType, value: &Value, explicit: bool) -> Result<Valu
             Ok(value)
         }
     }
+}
+
+/// A record literal's fields (`(1,"x y",)`): each field's text, or `None`
+/// for an empty unquoted one (NULL); `None` when it is malformed.
+pub(crate) fn parse_record_text(text: &str) -> Option<Vec<Option<String>>> {
+    let inner = text.trim().strip_prefix('(')?.strip_suffix(')')?;
+    let mut fields = Vec::new();
+    let mut chars = inner.chars().peekable();
+    loop {
+        let mut field = String::new();
+        let mut quoted = false;
+        while let Some(&c) = chars.peek() {
+            match c {
+                ',' => break,
+                '"' => {
+                    quoted = true;
+                    chars.next();
+                    loop {
+                        match chars.next()? {
+                            '"' if chars.peek() == Some(&'"') => {
+                                chars.next();
+                                field.push('"');
+                            }
+                            '"' => break,
+                            '\\' => field.push(chars.next()?),
+                            other => field.push(other),
+                        }
+                    }
+                }
+                '\\' => {
+                    chars.next();
+                    field.push(chars.next()?);
+                    quoted = true;
+                }
+                other => {
+                    chars.next();
+                    field.push(other);
+                }
+            }
+        }
+        fields.push((quoted || !field.is_empty()).then_some(field));
+        if chars.next().is_none() {
+            break;
+        }
+    }
+    Some(fields)
+}
+
+/// A composite column's stored text as its record, its fields typed by
+/// the type's attributes (a field added since is NULL); `None` for a
+/// column of another type.
+pub(crate) fn stored_record(data_type: &str, text: &str) -> Option<Value> {
+    let t = lookup(data_type).filter(|t| t.is_composite())?;
+    let mut fields = parse_record_text(text)?;
+    let attributes = t.attributes();
+    fields.resize(attributes.len(), None);
+    Some(Value::Record(
+        attributes
+            .iter()
+            .zip(fields)
+            .map(|(attribute, field)| {
+                let value = match field {
+                    None => Value::Null,
+                    Some(text) => {
+                        crate::planner::try_cast(Value::Text(text.clone()), &attribute.data_type)
+                            .unwrap_or(Value::Text(text))
+                    }
+                };
+                (attribute.name.clone(), value)
+            })
+            .collect(),
+    ))
+}
+
+/// The function `(value).field` is written as: `__FIELD__(value, field,
+/// type)`, the value's type appended where it is known.
+pub(crate) const FIELD: &str = "__FIELD__";
+
+/// `(value).field`: a field of a record, by name.
+pub(crate) fn field_of(value: &Value, field: &str, type_name: Option<&str>) -> Value {
+    match value {
+        Value::Null => Value::Null,
+        Value::Record(fields) => match fields.iter().find(|(name, _)| name == field) {
+            Some((_, value)) => value.clone(),
+            None => crate::eval_error::raise(
+                DbError::new(format!(
+                    "column \"{field}\" not found in data type {}",
+                    type_name.map_or_else(|| "record".to_string(), |t| split_name(t).1)
+                ))
+                .code("42703")
+                .into_text(),
+            ),
+        },
+        Value::Text(_) if type_name.and_then(lookup).is_some_and(|t| t.is_composite()) => {
+            let t = type_name.and_then(lookup).expect("checked above");
+            match coerce(&t, value, true) {
+                Ok(record) => field_of(&record, field, type_name),
+                Err(e) => crate::eval_error::raise(e),
+            }
+        }
+        other => crate::eval_error::raise(
+            DbError::new(format!(
+                "column notation .{field} applied to type {}, which is not a composite type",
+                type_name.map_or_else(
+                    || crate::value::value_type_name(other).to_string(),
+                    |t| split_name(t).1
+                )
+            ))
+            .code("42809")
+            .into_text(),
+        ),
+    }
+}
+
+/// The declared type of `(value).field` for a value of a composite type.
+pub(crate) fn field_type(type_name: &str, field: &str) -> Option<String> {
+    lookup(type_name)?
+        .attributes()
+        .iter()
+        .find(|a| a.name == field)
+        .map(|a| a.data_type.clone())
 }
 
 /// Rejects a value a domain's constraints refuse.
@@ -694,6 +916,9 @@ pub(crate) fn call(name: &str, args: &[Value]) -> Option<Value> {
     Some(match (name, args) {
         (ENUM_SORT, [value, t]) => enum_sort(value, &type_name(t)),
         (ENUM_LABEL, [value, t]) => enum_label(value, &type_name(t)),
+        (FIELD, [value, field]) => field_of(value, &type_name(field), None),
+        (FIELD, [value, field, Value::Text(t)]) => field_of(value, &type_name(field), Some(t)),
+        (FIELD, [value, field, _]) => field_of(value, &type_name(field), None),
         ("ENUM_RANGE" | "ENUM_FIRST" | "ENUM_LAST", _) => enum_function(name, args),
         _ => return None,
     })
@@ -950,6 +1175,18 @@ impl MemExecutor {
                     }
                 }
             }
+            TypeDefinition::Composite { attributes } => {
+                for (i, attribute) in attributes.iter().enumerate() {
+                    if attributes[..i].iter().any(|a| a.name == attribute.name) {
+                        return Err(DbError::new(format!(
+                            "column \"{}\" specified more than once",
+                            attribute.name
+                        ))
+                        .code("42701")
+                        .into());
+                    }
+                }
+            }
             TypeDefinition::Domain(d) => {
                 // Unnamed checks are `<domain>_check`, then numbered.
                 let mut taken: Vec<String> = d
@@ -1188,6 +1425,12 @@ impl MemExecutor {
                     return Err(DbError::new(missing).code("42704").into());
                 }
             }
+            TypeChange::AddAttribute { .. }
+            | TypeChange::DropAttribute { .. }
+            | TypeChange::RenameAttribute { .. }
+            | TypeChange::AlterAttributeType { .. } => {
+                return self.alter_attributes(ctx, &t, change);
+            }
             TypeChange::RenameConstraint { from, to } => {
                 let TypeDefinition::Domain(d) = &mut definition else {
                     anyhow::bail!("\"{}\" is not a domain", t.name);
@@ -1205,6 +1448,135 @@ impl MemExecutor {
         }
         self.store_definition(&t, &definition)?;
         Ok(QueryOutput::tag(tag))
+    }
+
+    /// `ALTER TYPE` of a composite type's attributes. Values keep their
+    /// fields by position, so a dropped attribute's field leaves the rows
+    /// holding them.
+    fn alter_attributes(
+        &self,
+        ctx: &ExecutionContext,
+        t: &UserType,
+        change: TypeChange,
+    ) -> Result<QueryOutput> {
+        let TypeDefinition::Composite { mut attributes } = t.definition.clone() else {
+            return Err(
+                DbError::new(format!("\"{}\" is not a composite type", t.name))
+                    .code("42809")
+                    .into(),
+            );
+        };
+        let missing = |name: &str| -> anyhow::Error {
+            DbError::new(format!(
+                "column \"{name}\" of relation \"{}\" does not exist",
+                t.name
+            ))
+            .code("42703")
+            .into()
+        };
+        let taken = |name: &str| -> anyhow::Error {
+            DbError::new(format!(
+                "column \"{name}\" of relation \"{}\" already exists",
+                t.name
+            ))
+            .code("42701")
+            .into()
+        };
+        let mut dropped = None;
+        match change {
+            TypeChange::AddAttribute { name, data_type } => {
+                if attributes.iter().any(|a| a.name == name) {
+                    return Err(taken(&name));
+                }
+                attributes.push(Attribute { name, data_type });
+            }
+            TypeChange::DropAttribute { name, if_exists } => {
+                match attributes.iter().position(|a| a.name == name) {
+                    Some(at) => {
+                        attributes.remove(at);
+                        dropped = Some(at);
+                    }
+                    None if if_exists => {
+                        self.notice(
+                            ctx,
+                            DbError::new(format!(
+                                "column \"{name}\" of relation \"{}\" does not exist, skipping",
+                                t.name
+                            )),
+                        );
+                        return Ok(QueryOutput::tag("ALTER TYPE"));
+                    }
+                    None => return Err(missing(&name)),
+                }
+            }
+            TypeChange::RenameAttribute { from, to } => {
+                if attributes.iter().any(|a| a.name == to) {
+                    return Err(taken(&to));
+                }
+                let Some(attribute) = attributes.iter_mut().find(|a| a.name == from) else {
+                    return Err(missing(&from));
+                };
+                attribute.name = to;
+            }
+            TypeChange::AlterAttributeType { name, data_type } => {
+                let tables = self.catalog_reader.list_all_tables("default")?;
+                if let Some((table, column, _)) = dependent_columns(&tables, t).into_iter().next() {
+                    return Err(DbError::new(format!(
+                        "cannot alter type \"{}\" because column \"{}.{column}\" uses it",
+                        t.name, table.name
+                    ))
+                    .code("0A000")
+                    .into());
+                }
+                let Some(attribute) = attributes.iter_mut().find(|a| a.name == name) else {
+                    return Err(missing(&name));
+                };
+                attribute.data_type = data_type;
+            }
+            _ => {}
+        }
+        self.store_definition(t, &TypeDefinition::Composite { attributes })?;
+        if let Some(at) = dropped {
+            self.drop_record_field(ctx, t, at)?;
+        }
+        Ok(QueryOutput::tag("ALTER TYPE"))
+    }
+
+    /// Removes the field at `at` from the records the columns of a
+    /// composite type hold.
+    fn drop_record_field(&self, ctx: &ExecutionContext, t: &UserType, at: usize) -> Result<()> {
+        let tables = self.catalog_reader.list_all_tables("default")?;
+        for (table, column, array) in dependent_columns(&tables, t) {
+            if array || table.view_query.is_some() || table.materialized_query.is_some() {
+                continue;
+            }
+            let Some(position) = table.columns.iter().position(|c| c.name == column) else {
+                continue;
+            };
+            let current = self.catalog_reader.get_table_by_id(table.id)?;
+            for (key, row) in self.scan_rows_keyed(table.id, &ctx.session_id)? {
+                let fields = match row.get(position) {
+                    Some(Value::Record(fields)) => fields.clone(),
+                    Some(Value::Text(text)) => match parse_record_text(text) {
+                        Some(fields) => fields
+                            .into_iter()
+                            .map(|f| (String::new(), f.map_or(Value::Null, Value::Text)))
+                            .collect(),
+                        None => continue,
+                    },
+                    _ => continue,
+                };
+                if at >= fields.len() {
+                    continue;
+                }
+                let mut kept = fields;
+                kept.remove(at);
+                let mut updated = row.clone();
+                updated[position] = Value::Text(crate::value::render(&Value::Record(kept)));
+                self.replace_row(ctx, &current, &key, &row, &updated)?;
+            }
+        }
+        Ok(())
     }
 
     /// The values the columns of a domain hold: each column's table, name,
@@ -1415,29 +1787,36 @@ impl MemExecutor {
     }
 
     /// `pg_type` rows for the user types, in `pg_type`'s columns: each
-    /// enum with its array type, and each domain.
+    /// enum with its array type, each domain, and each composite type with
+    /// its relation and array type.
     pub(crate) fn user_type_rows(&self, db_name: &str) -> Vec<Vec<Value>> {
         let mut rows = Vec::new();
         for t in all_types().iter() {
             let namespace = Self::schema_oid(db_name, &t.schema);
-            let (typtype, category, len, byval, notnull, basetype, typmod, align) = match t.domain()
-            {
-                Some(d) => {
-                    let base_oid = Self::pg_type_oid(&d.base);
-                    let (category, len) = type_category(Self::pg_type_oid(&base_type(&d.base)));
-                    (
-                        "d",
-                        category,
-                        len,
-                        matches!(len, 1 | 2 | 4 | 8),
-                        d.not_null,
-                        base_oid,
-                        Self::pg_type_modifier(&d.base),
-                        if len == 8 { "d" } else { "i" },
-                    )
-                }
-                None => ("e", "E", 4, true, false, 0, -1, "i"),
-            };
+            let (typtype, category, len, byval, notnull, basetype, typmod, align, relid) =
+                match t.domain() {
+                    Some(d) => {
+                        let base_oid = Self::pg_type_oid(&d.base);
+                        let (category, len) = type_category(Self::pg_type_oid(&base_type(&d.base)));
+                        (
+                            "d",
+                            category,
+                            len,
+                            matches!(len, 1 | 2 | 4 | 8),
+                            d.not_null,
+                            base_oid,
+                            Self::pg_type_modifier(&d.base),
+                            if len == 8 { "d" } else { "i" },
+                            0,
+                        )
+                    }
+                    // A composite type's attributes live in a relation of its
+                    // own, which `typrelid` names.
+                    None if t.is_composite() => {
+                        ("c", "C", -1, false, false, 0, -1, "d", t.relation_oid())
+                    }
+                    None => ("e", "E", 4, true, false, 0, -1, "i", 0),
+                };
             rows.push(type_row(TypeRow {
                 oid: t.oid(),
                 name: t.name.clone(),
@@ -1447,16 +1826,21 @@ impl MemExecutor {
                 typtype,
                 category,
                 elem: 0,
-                array: if t.is_enum() { t.array_oid() } else { 0 },
+                array: if t.is_enum() || t.is_composite() {
+                    t.array_oid()
+                } else {
+                    0
+                },
                 align,
                 notnull,
                 basetype,
                 typmod,
+                relid,
                 default: t
                     .domain()
                     .and_then(|d| d.default.as_ref().map(|sql| default_text(sql, &d.base))),
             }));
-            if t.is_enum() {
+            if t.is_enum() || t.is_composite() {
                 rows.push(type_row(TypeRow {
                     oid: t.array_oid(),
                     name: format!("_{}", t.name),
@@ -1471,6 +1855,7 @@ impl MemExecutor {
                     notnull: false,
                     basetype: 0,
                     typmod: -1,
+                    relid: 0,
                     default: None,
                 }));
             }
@@ -1614,6 +1999,9 @@ struct TypeRow {
     notnull: bool,
     basetype: i64,
     typmod: i64,
+    /// The relation holding the type's attributes (`typrelid`), for a
+    /// composite type.
+    relid: i64,
     default: Option<String>,
 }
 
@@ -1630,7 +2018,8 @@ fn type_row(r: TypeRow) -> Vec<Value> {
         Value::Bool(false),
         Value::Bool(true),
         Value::Text(",".into()),
-        Value::Int(0),
+        // typrelid.
+        Value::Int(r.relid),
         Value::Int(r.elem),
         Value::Int(r.array),
         Value::Int(0),

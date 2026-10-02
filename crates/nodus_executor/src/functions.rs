@@ -79,6 +79,7 @@ pub(crate) fn is_known(name: &str) -> bool {
                 | "TIMEOFDAY" | "ARRAY_DIMS" | "ARRAY_FILL" | "GENERATE_SUBSCRIPTS"
                 | "ENUM_RANGE" | "ENUM_FIRST" | "ENUM_LAST"
                 | crate::user_types::ENUM_SORT | crate::user_types::ENUM_LABEL
+                | crate::user_types::FIELD
                 | "SHA224" | "SHA256" | "SHA384" | "SHA512" | "ENCODE" | "DECODE" | "CONVERT_TO"
                 | "CONVERT_FROM" | "CONVERT" | "GET_BYTE" | "SET_BYTE" | "GET_BIT" | "SET_BIT"
                 | "CRC32" | "CRC32C" | "PG_COLUMN_SIZE" | crate::result_types::INT_BYTEA
@@ -134,6 +135,8 @@ pub(crate) fn is_known(name: &str) -> bool {
                 | "JSONB_EXTRACT_PATH" | "JSON_EXTRACT_PATH_TEXT" | "JSONB_EXTRACT_PATH_TEXT"
                 | "JSONB_SET" | "JSONB_STRIP_NULLS" | "JSON_STRIP_NULLS" | "JSONB_PRETTY"
                 | "ROW_TO_JSON" | "ARRAY_TO_JSON" | "JSON_OBJECT" | "__RECORD__"
+                // `(value).*`, a record expanded into the select list.
+                | "NODUS_EXPAND_RECORD"
                 // Arrays.
                 | "ARRAY_LENGTH" | "CARDINALITY" | "ARRAY_APPEND" | "ARRAY_PREPEND"
                 | "ARRAY_CAT" | "ARRAY_POSITION" | "ARRAY_POSITIONS" | "ARRAY_REMOVE"

@@ -747,6 +747,30 @@ impl MemExecutor {
             let mut expanded = Vec::with_capacity(projection.len());
             for item in projection {
                 match item {
+                    // `(value).*`: the record's fields, by name, as columns.
+                    ProjectionItem::Expr {
+                        expr: ScalarExpr::Function { name, args },
+                        ..
+                    } if name == "NODUS_EXPAND_RECORD" => {
+                        let fields = expand_record_fields(&args, &col_names, &joined_columns);
+                        match fields {
+                            Some(fields) => expanded.extend(fields.into_iter().map(|field| {
+                                ProjectionItem::Expr {
+                                    expr: ScalarExpr::Function {
+                                        name: crate::user_types::FIELD.to_string(),
+                                        args: vec![
+                                            args[0].clone(),
+                                            ScalarExpr::Literal(Value::Text(field.clone())),
+                                        ],
+                                    },
+                                    alias: Some(field),
+                                }
+                            })),
+                            None => anyhow::bail!(
+                                "column notation .* applied to an expression that is not a composite value"
+                            ),
+                        }
+                    }
                     ProjectionItem::Column(c) if c == "*" => expanded.extend(
                         star.iter()
                             .map(|&i| ProjectionItem::Column(col_names[i].clone())),
@@ -2390,6 +2414,50 @@ fn whole_row(name: &str, col_names: &[String], scalars: &[String]) -> Option<Sca
     })
 }
 
+/// The fields `(value).*` stands for: the attributes of the value's
+/// composite type, or a relation's columns for a whole-row reference.
+/// `None` when the value is neither.
+fn expand_record_fields(
+    args: &[ScalarExpr],
+    col_names: &[String],
+    columns: &[nodus_catalog::ColumnDescriptor],
+) -> Option<Vec<String>> {
+    let [value] = args else {
+        return None;
+    };
+    let composite = |data_type: &str| {
+        crate::user_types::lookup(data_type)
+            .filter(|t| t.is_composite())
+            .map(|t| {
+                t.attributes()
+                    .iter()
+                    .map(|a| a.name.clone())
+                    .collect::<Vec<_>>()
+            })
+    };
+    match value {
+        ScalarExpr::Column(name) => {
+            let declared = crate::filter_eval::col_pos(col_names, name)
+                .and_then(|at| columns.get(at))
+                .map(|c| c.data_type.clone());
+            if let Some(fields) = declared.as_deref().and_then(composite) {
+                return Some(fields);
+            }
+            // A relation's row stands for its columns.
+            let inner = format!(".{name}");
+            let fields: Vec<String> = col_names
+                .iter()
+                .filter_map(|c| c.rsplit_once('.'))
+                .filter(|(relation, _)| *relation == name || relation.ends_with(&inner))
+                .map(|(_, column)| column.to_string())
+                .collect();
+            (!fields.is_empty()).then_some(fields)
+        }
+        ScalarExpr::Cast { target, .. } => composite(target),
+        _ => None,
+    }
+}
+
 /// `expr` with each reference to a relation's row made the row.
 fn expand_whole_row_refs(
     expr: &ScalarExpr,
@@ -2400,6 +2468,17 @@ fn expand_whole_row_refs(
     match expr {
         ScalarExpr::Column(name) => {
             whole_row(name, col_names, scalars).unwrap_or_else(|| expr.clone())
+        }
+        // The row type of a relation is named after the relation.
+        ScalarExpr::Function { name, args }
+            if name == "PG_TYPEOF"
+                && matches!(args.as_slice(), [ScalarExpr::Column(column)]
+                    if !scalars.contains(column) && whole_row(column, col_names, scalars).is_some()) =>
+        {
+            let [ScalarExpr::Column(column)] = args.as_slice() else {
+                unreachable!("guarded by the match arm");
+            };
+            ScalarExpr::Literal(Value::Text(column.clone()))
         }
         ScalarExpr::Aggregate {
             op,
