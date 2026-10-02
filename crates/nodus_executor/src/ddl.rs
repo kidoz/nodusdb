@@ -12,67 +12,6 @@ use nodus_authz::{Action, AuthzContext, AuthzEngine, AuthzRequest};
 use nodus_catalog::{ColumnDescriptor, CreateTableRequest, DescriptorState};
 
 impl MemExecutor {
-    pub(crate) fn exec_create_schema(
-        &self,
-        ctx: &ExecutionContext,
-        schema_name: String,
-        if_not_exists: bool,
-    ) -> Result<QueryOutput> {
-        let db = self.catalog_reader.get_database("default")?;
-        self.authorize(ctx, Action::CreateSchema, ResourceRef::Database(db.id))?;
-        // Checked first: a replicated catalog reports a lost race only as a
-        // missing schema.
-        if self
-            .catalog_reader
-            .get_schema("default", &schema_name)
-            .is_ok()
-        {
-            if if_not_exists {
-                self.notice(
-                    ctx,
-                    DbError::new(format!("schema \"{schema_name}\" already exists, skipping"))
-                        .code("42P06"),
-                );
-                return Ok(QueryOutput::tag("CREATE SCHEMA"));
-            }
-            anyhow::bail!("schema \"{schema_name}\" already exists");
-        }
-        self.catalog_writer
-            .create_schema(nodus_catalog::CreateSchemaRequest {
-                id: nodus_catalog::SchemaId::new(),
-                database_id: db.id,
-                name: schema_name,
-                owner_role_id: None,
-                managed_access: false,
-            })?;
-        Ok(QueryOutput::tag("CREATE SCHEMA"))
-    }
-    pub(crate) fn exec_drop_schema(
-        &self,
-        ctx: &ExecutionContext,
-        schema_name: String,
-        if_exists: bool,
-    ) -> Result<QueryOutput> {
-        let db_name = "default";
-        match self.catalog_reader.get_schema(db_name, &schema_name) {
-            Ok(sch) => {
-                self.authorize(ctx, Action::CreateSchema, ResourceRef::Schema(sch.id))?;
-                self.catalog_writer.drop_schema(sch.id)?;
-                Ok(QueryOutput::tag("DROP SCHEMA"))
-            }
-            Err(e) => {
-                if if_exists {
-                    self.notice(
-                        ctx,
-                        DbError::new(format!("schema \"{schema_name}\" does not exist, skipping")),
-                    );
-                    Ok(QueryOutput::tag("DROP SCHEMA"))
-                } else {
-                    Err(anyhow::anyhow!(e))
-                }
-            }
-        }
-    }
     /// `CREATE TABLE`; with `materialized_query`, the table a materialized
     /// view stores its rows in.
     #[allow(clippy::too_many_arguments)]
@@ -501,7 +440,7 @@ impl MemExecutor {
         }
         self.reject_type_name(schema_name, table_only)?;
         let materialized_query = if materialized {
-            Some(serde_json::to_string(&query)?)
+            Some(self.bind_view_plan(&serde_json::to_string(&query)?))
         } else {
             None
         };
@@ -563,6 +502,11 @@ impl MemExecutor {
         column: Option<String>,
         comment: Option<String>,
     ) -> Result<QueryOutput> {
+        match kind {
+            "SCHEMA" => return self.exec_comment_schema(ctx, relation, comment),
+            "TYPE" | "DOMAIN" => return self.exec_comment_type(kind, relation, comment),
+            _ => {}
+        }
         let (db_name, schema_name, table_only) = parse_object_name(relation)?;
         let tbl = self
             .catalog_reader
@@ -680,7 +624,7 @@ impl MemExecutor {
 
         // The view's columns are its query's; stored, the query runs on
         // every read.
-        let view_query_json = serde_json::to_string(&*query)?;
+        let view_query_json = self.bind_view_plan(&serde_json::to_string(&*query)?);
         let out = self.execute_logical_inner(ctx, shape_only(*query))?;
         let view_cols = out
             .columns
@@ -818,25 +762,23 @@ impl MemExecutor {
 
     /// Drops `tbl` from the catalog, with the sequence a `serial` or
     /// identity column of it owns.
-    fn drop_relation(&self, tbl: &nodus_catalog::TableDescriptor) -> Result<()> {
+    pub(crate) fn drop_relation(&self, tbl: &nodus_catalog::TableDescriptor) -> Result<()> {
         self.catalog_writer.drop_table(tbl.id)?;
         for column in &tbl.columns {
-            let Some(sequence) = column
-                .default_expr
-                .as_deref()
-                .and_then(|json| serde_json::from_str::<ScalarExpr>(json).ok())
-                .and_then(|default| crate::sequences::default_sequence(&default))
-            else {
+            let Some(sequence) = crate::sequences::owned_by_column(&tbl.name, column) else {
                 continue;
             };
-            let owned = crate::sequences::owned_sequence_name(&tbl.name, &column.name);
-            if sequence.rsplit('.').next().map(|s| s.trim_matches('"')) == Some(owned.as_str()) {
-                let (db, schema, seq) = parse_object_name(&sequence)?;
-                if let Ok(seq_tbl) = self.catalog_reader.get_table(db, schema, seq)
-                    && crate::sequences::is_sequence(&seq_tbl)
-                {
-                    self.catalog_writer.drop_table(seq_tbl.id)?;
-                }
+            // An unqualified name is the table's schema's.
+            let sequence = if sequence.contains('.') {
+                sequence
+            } else {
+                format!("{}.{sequence}", self.schema_name_of(tbl))
+            };
+            let (db, schema, seq) = parse_object_name(&sequence)?;
+            if let Ok(seq_tbl) = self.catalog_reader.get_table(db, schema, seq)
+                && crate::sequences::is_sequence(&seq_tbl)
+            {
+                self.catalog_writer.drop_table(seq_tbl.id)?;
             }
         }
         Ok(())
@@ -845,7 +787,7 @@ impl MemExecutor {
     /// The objects depending on `targets` that are not among them, as
     /// PostgreSQL lists them: the foreign keys referencing each target and
     /// the views reading it, each such view followed by those reading it.
-    fn dependents(
+    pub(crate) fn dependents(
         &self,
         targets: &[nodus_catalog::TableDescriptor],
     ) -> Result<Vec<DependentObject>> {
@@ -1277,7 +1219,7 @@ pub(crate) enum RelationKind {
 
 impl RelationKind {
     /// The kind of `tbl`; `None` for a sequence.
-    fn of(tbl: &nodus_catalog::TableDescriptor) -> Option<RelationKind> {
+    pub(crate) fn of(tbl: &nodus_catalog::TableDescriptor) -> Option<RelationKind> {
         if crate::sequences::is_sequence(tbl) {
             None
         } else if tbl.view_query.is_some() {
@@ -1289,7 +1231,7 @@ impl RelationKind {
         }
     }
 
-    fn noun(self) -> &'static str {
+    pub(crate) fn noun(self) -> &'static str {
         match self {
             RelationKind::Table => "table",
             RelationKind::View => "view",
@@ -1315,15 +1257,15 @@ impl RelationKind {
 }
 
 /// An object that depends on a relation being dropped.
-struct DependentObject {
+pub(crate) struct DependentObject {
     /// As PostgreSQL's DETAIL lists it: `view v depends on table t`.
-    description: String,
-    object: Dependent,
+    pub(crate) description: String,
+    pub(crate) object: Dependent,
 }
 
 impl DependentObject {
     /// The object as a notice names it: `view v`, `constraint c on table t`.
-    fn object_description(&self) -> String {
+    pub(crate) fn object_description(&self) -> String {
         self.description
             .split(" depends on ")
             .next()
@@ -1332,7 +1274,7 @@ impl DependentObject {
     }
 }
 
-enum Dependent {
+pub(crate) enum Dependent {
     /// A foreign key of another table.
     Constraint {
         table: nodus_catalog::TableId,

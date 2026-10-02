@@ -349,6 +349,18 @@ pub const DOMAIN_NOT_NULL: &str = "nodus_domain_not_null";
 /// parser takes only column names there.
 pub const CONFLICT_EXPRESSIONS: &str = "nodus_conflict:";
 
+/// The function call `ALTER {TABLE | VIEW | MATERIALIZED VIEW | SEQUENCE |
+/// TYPE | DOMAIN} [IF EXISTS] name SET SCHEMA schema` is written as —
+/// `SELECT pg_catalog.nodus_set_schema('TABLE', false, 'name', 'schema')` —
+/// since the parser takes it for none of them.
+pub const SET_SCHEMA_FUNCTION: &str = "pg_catalog.nodus_set_schema";
+
+/// The function call `CREATE SCHEMA` with the objects it creates is
+/// written as — `SELECT pg_catalog.nodus_create_schema('create schema s',
+/// 'create table t (a int)', ...)`, with each statement's text — since the
+/// parser takes no schema elements.
+pub const CREATE_SCHEMA_FUNCTION: &str = "pg_catalog.nodus_create_schema";
+
 /// Rewrites what the parser lacks: a trailing `WITH [NO] DATA` on `CREATE
 /// TABLE ... AS` or `CREATE MATERIALIZED VIEW` becomes the storage
 /// parameter [`NO_DATA_OPTION`] (for `NO DATA`), and `REFRESH MATERIALIZED
@@ -467,6 +479,81 @@ fn rewrite_statement_form(
             return tokens;
         }
         return statement;
+    }
+
+    // `ALTER <kind> [IF EXISTS] name SET SCHEMA schema`.
+    if is(0, "alter") && n >= 5 && is(n - 3, "set") && is(n - 2, "schema") {
+        let (kind, mut at) = if is(1, "materialized") && is(2, "view") {
+            ("MATERIALIZED VIEW", 3)
+        } else if is(1, "table") {
+            ("TABLE", 2)
+        } else if is(1, "view") {
+            ("VIEW", 2)
+        } else if is(1, "sequence") {
+            ("SEQUENCE", 2)
+        } else if is(1, "type") {
+            ("TYPE", 2)
+        } else if is(1, "domain") {
+            ("DOMAIN", 2)
+        } else {
+            ("", 0)
+        };
+        if !kind.is_empty() {
+            let if_exists = is(at, "if") && is(at + 1, "exists");
+            if if_exists {
+                at += 2;
+            }
+            let name = render_tokens(&statement[significant[at]..=significant[n - 4]]);
+            let schema = match &statement[significant[n - 1]].token {
+                Token::Word(w) => w.value.clone(),
+                other => other.to_string(),
+            };
+            let sql = format!(
+                "SELECT {SET_SCHEMA_FUNCTION}('{kind}', {if_exists}, '{}', '{}')",
+                quote(name.trim()),
+                quote(&schema)
+            );
+            if let Some(mut tokens) = snippet_tokens(&sql) {
+                tokens.extend(tail(&statement));
+                return tokens;
+            }
+            return statement;
+        }
+    }
+
+    // `CREATE SCHEMA ... CREATE TABLE ... GRANT ...`: the schema, then each
+    // statement creating something in it.
+    if is(0, "create") && is(1, "schema") {
+        let mut depth = 0i32;
+        let mut starts = vec![0];
+        for k in 2..n {
+            match statement[significant[k]].token {
+                Token::LParen => depth += 1,
+                Token::RParen => depth -= 1,
+                _ => {}
+            }
+            if depth == 0 && (is(k, "create") || is(k, "grant")) {
+                starts.push(k);
+            }
+        }
+        if starts.len() > 1 {
+            let end = significant.last().map_or(statement.len(), |&i| i + 1);
+            let parts: Vec<String> = starts
+                .iter()
+                .enumerate()
+                .map(|(c, &k)| {
+                    let from = significant[k];
+                    let to = starts.get(c + 1).map_or(end, |&next| significant[next]);
+                    format!("'{}'", quote(render_tokens(&statement[from..to]).trim()))
+                })
+                .collect();
+            let sql = format!("SELECT {CREATE_SCHEMA_FUNCTION}({})", parts.join(", "));
+            if let Some(mut tokens) = snippet_tokens(&sql) {
+                tokens.extend(tail(&statement));
+                return tokens;
+            }
+            return statement;
+        }
     }
 
     if (is(0, "alter") || is(0, "drop")) && is(1, "domain") {
@@ -1182,6 +1269,27 @@ mod tests {
             one("INSERT INTO t VALUES (1) ON CONFLICT (lower(e)) DO NOTHING")
                 .contains(&format!("ON CONSTRAINT \"{CONFLICT_EXPRESSIONS}lower(e)\""))
         );
+    }
+
+    #[test]
+    fn set_schema_and_schema_elements_parse() {
+        let one = |sql: &str| parse_sql(sql).unwrap()[0].to_string();
+        assert_eq!(
+            one("ALTER MATERIALIZED VIEW IF EXISTS s.\"Mv\" SET SCHEMA t"),
+            format!("SELECT {SET_SCHEMA_FUNCTION}('MATERIALIZED VIEW', true, 's.\"Mv\"', 't')")
+        );
+        assert_eq!(
+            one("ALTER TABLE t SET SCHEMA s"),
+            format!("SELECT {SET_SCHEMA_FUNCTION}('TABLE', false, 't', 's')")
+        );
+        assert_eq!(
+            one("CREATE SCHEMA s CREATE TABLE t (a int) CREATE VIEW v AS SELECT * FROM t"),
+            format!(
+                "SELECT {CREATE_SCHEMA_FUNCTION}('create schema s', 'create table t (a int)', 'create view v as select * from t')"
+            )
+        );
+        // A plain one is left to the parser.
+        assert!(one("CREATE SCHEMA s AUTHORIZATION nodus").starts_with("CREATE SCHEMA"));
     }
 
     #[test]

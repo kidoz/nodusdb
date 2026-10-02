@@ -23,13 +23,38 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
             if_not_exists,
             ..
         } => {
-            let name = match schema_name {
-                sqlparser::ast::SchemaName::Simple(name) => name.to_string(),
-                _ => anyhow::bail!("Unsupported schema name format"),
+            use sqlparser::ast::SchemaName;
+            // Without a name of its own, a schema is named after its owner.
+            let (name, authorization) = match schema_name {
+                SchemaName::Simple(name) => (name.to_string(), None),
+                SchemaName::UnnamedAuthorization(role) => {
+                    (role.value.clone(), Some(role.value.clone()))
+                }
+                SchemaName::NamedAuthorization(name, role) => {
+                    (name.to_string(), Some(role.value.clone()))
+                }
             };
             Ok(LogicalPlan::CreateSchema {
                 schema_name: name,
                 if_not_exists: *if_not_exists,
+                authorization,
+                elements: Vec::new(),
+            })
+        }
+        Statement::AlterSchema(alter) => {
+            use sqlparser::ast::AlterSchemaOperation as Op;
+            let [operation] = alter.operations.as_slice() else {
+                anyhow::bail!("ALTER SCHEMA with several operations is not supported");
+            };
+            let (new_name, owner) = match operation {
+                Op::Rename { name } => (Some(name.to_string()), None),
+                Op::OwnerTo { owner } => (None, Some(owner.to_string())),
+                other => anyhow::bail!("ALTER SCHEMA {other} is not supported"),
+            };
+            Ok(LogicalPlan::AlterSchema {
+                name: alter.name.to_string(),
+                new_name,
+                owner,
             })
         }
         Statement::CreateTable(create_table) if create_table.query.is_some() => {
@@ -116,7 +141,7 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                         ..Default::default()
                     });
                     default = Some(ScalarExpr::Function {
-                        name: "NEXTVAL".to_string(),
+                        name: crate::sequences::SERIAL.to_string(),
                         args: vec![ScalarExpr::Literal(crate::Value::Text(sequence_name()))],
                     });
                 }
@@ -385,6 +410,11 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                     if_exists: *if_exists,
                     cascade: *cascade,
                 }),
+                sqlparser::ast::ObjectType::Schema => Ok(LogicalPlan::DropSchema {
+                    names: names.iter().map(|n| n.to_string()).collect(),
+                    if_exists: *if_exists,
+                    cascade: *cascade,
+                }),
                 sqlparser::ast::ObjectType::Type => Ok(LogicalPlan::DropType {
                     names: names.iter().map(|n| n.to_string()).collect(),
                     if_exists: *if_exists,
@@ -396,11 +426,6 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                 _ if names.len() > 1 => {
                     anyhow::bail!("DROP of several objects in one statement is not supported")
                 }
-                sqlparser::ast::ObjectType::Schema => Ok(LogicalPlan::DropSchema {
-                    schema_name: name,
-                    if_exists: *if_exists,
-                    cascade: *cascade,
-                }),
                 sqlparser::ast::ObjectType::Index => Ok(LogicalPlan::DropIndex {
                     name,
                     if_exists: *if_exists,
@@ -755,6 +780,56 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                 change: sequence_change(options, params)?,
             })
         }
+        Statement::Query(query)
+            if rewritten_call(query, nodus_sql::SET_SCHEMA_FUNCTION).is_some() =>
+        {
+            match rewritten_call(query, nodus_sql::SET_SCHEMA_FUNCTION).as_deref() {
+                Some(
+                    [
+                        crate::Value::Text(kind),
+                        crate::Value::Bool(if_exists),
+                        crate::Value::Text(name),
+                        crate::Value::Text(schema),
+                    ],
+                ) => Ok(LogicalPlan::SetSchema {
+                    kind: kind.clone(),
+                    name: name.clone(),
+                    schema: schema.clone(),
+                    if_exists: *if_exists,
+                }),
+                _ => anyhow::bail!("malformed SET SCHEMA"),
+            }
+        }
+        Statement::Query(query)
+            if rewritten_call(query, nodus_sql::CREATE_SCHEMA_FUNCTION).is_some() =>
+        {
+            let parts = rewritten_call(query, nodus_sql::CREATE_SCHEMA_FUNCTION)
+                .expect("guarded by the match arm");
+            let mut plans = Vec::new();
+            for part in &parts {
+                let crate::Value::Text(text) = part else {
+                    anyhow::bail!("malformed CREATE SCHEMA");
+                };
+                for statement in nodus_sql::parse_sql(text)? {
+                    plans.push(plan_statement(&statement, params)?);
+                }
+            }
+            let mut plans = plans.into_iter();
+            match plans.next() {
+                Some(LogicalPlan::CreateSchema {
+                    schema_name,
+                    if_not_exists,
+                    authorization,
+                    ..
+                }) => Ok(LogicalPlan::CreateSchema {
+                    schema_name,
+                    if_not_exists,
+                    authorization,
+                    elements: plans.collect(),
+                }),
+                _ => anyhow::bail!("malformed CREATE SCHEMA"),
+            }
+        }
         Statement::Query(query) if rewritten_call(query, nodus_sql::DOMAIN_FUNCTION).is_some() => {
             match rewritten_call(query, nodus_sql::DOMAIN_FUNCTION).as_deref() {
                 Some([crate::Value::Text(text)]) => plan_domain_statement(text),
@@ -882,6 +957,9 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                 O::MaterializedView => "MATERIALIZED VIEW",
                 O::Sequence => "SEQUENCE",
                 O::Column => "COLUMN",
+                O::Schema => "SCHEMA",
+                O::Type => "TYPE",
+                O::Domain => "DOMAIN",
                 other => anyhow::bail!("COMMENT ON {other} is not supported"),
             };
             let mut parts: Vec<String> = object_name.0.iter().map(|p| p.to_string()).collect();

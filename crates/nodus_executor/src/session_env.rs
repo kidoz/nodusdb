@@ -85,6 +85,29 @@ pub(crate) fn with<R>(f: impl FnOnce(Option<&SessionEnv>) -> R) -> R {
     ENV.with(|env| f(env.borrow().as_ref()))
 }
 
+/// Runs `f` with a run-time setting taking `value` for its duration (as
+/// `CREATE SCHEMA` runs its elements with the schema on the search path).
+pub(crate) fn with_setting<R>(name: &str, value: String, f: impl FnOnce() -> R) -> R {
+    let key = name.trim().to_ascii_lowercase();
+    let previous = ENV.with(|slot| {
+        slot.borrow_mut()
+            .as_mut()
+            .map(|env| env.settings.insert(key.clone(), value))
+    });
+    crate::user_types::forget_found();
+    let result = f();
+    ENV.with(|slot| {
+        if let (Some(env), Some(previous)) = (slot.borrow_mut().as_mut(), previous) {
+            match previous {
+                Some(value) => env.settings.insert(key.clone(), value),
+                None => env.settings.remove(&key),
+            };
+        }
+    });
+    crate::user_types::forget_found();
+    result
+}
+
 /// The effective value of a run-time setting, or `None` if it is unknown.
 pub(crate) fn setting(name: &str) -> Option<String> {
     let key = name.trim().to_ascii_lowercase();

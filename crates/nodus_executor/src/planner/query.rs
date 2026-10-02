@@ -27,6 +27,11 @@ pub fn parse_object_name(name: &str) -> Result<(&str, &str, &str)> {
     let parts: Vec<&str> = name.split('.').collect();
     match parts.len() {
         // An unqualified name is found along the session's search path.
+        // The system catalogs come first, as pg_catalog is searched before
+        // the path.
+        1 if crate::MemExecutor::is_pg_catalog_virtual_table_name(parts[0].trim_matches('"')) => {
+            Ok(("default", "pg_catalog", parts[0].trim_matches('"')))
+        }
         1 => {
             let relation = parts[0].trim_matches('"');
             Ok((
@@ -1538,7 +1543,21 @@ fn cast_type_name(data_type: &str) -> String {
         "TIMESTAMPTZ" | "TIMESTAMP WITH TIME ZONE" => "timestamptz",
         "TIME" | "TIME WITHOUT TIME ZONE" => "time",
         "TIMETZ" | "TIME WITH TIME ZONE" => "timetz",
-        other => return other.to_ascii_lowercase().trim_matches('"').to_string(),
+        // Any other type is named by its own name, without its schema.
+        _ => {
+            let base = data_type
+                .trim()
+                .trim_end_matches("[]")
+                .split('(')
+                .next()
+                .unwrap_or_default()
+                .trim();
+            let name = base.rsplit('.').next().unwrap_or(base);
+            return match name.strip_prefix('"').and_then(|n| n.strip_suffix('"')) {
+                Some(quoted) => quoted.to_string(),
+                None => name.to_ascii_lowercase(),
+            };
+        }
     }
     .to_string()
 }

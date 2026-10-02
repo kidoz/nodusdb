@@ -1,0 +1,160 @@
+# Schemas: creation, elements, dropping with RESTRICT and CASCADE, renaming,
+# owners, and comments. Expected results come from PostgreSQL 18.
+statement ok
+CREATE SCHEMA s1;
+
+statement error
+CREATE SCHEMA s1;
+
+statement ok
+CREATE SCHEMA IF NOT EXISTS s1;
+
+statement ok
+CREATE TABLE s1.t (id int PRIMARY KEY, v text);
+
+statement ok
+CREATE VIEW s1.v AS SELECT * FROM s1.t;
+
+statement ok
+CREATE SEQUENCE s1.q;
+
+statement ok
+CREATE TYPE s1.e AS ENUM ('a');
+
+statement ok
+CREATE INDEX t_v ON s1.t (v);
+
+statement ok
+INSERT INTO s1.t VALUES (1, 'a');
+
+statement error
+DROP SCHEMA s1;
+
+statement error
+DROP SCHEMA s1 RESTRICT;
+
+query T
+SELECT count(*) FROM s1.t;
+----
+1
+
+statement ok
+CREATE TABLE public.ref (id int REFERENCES s1.t (id));
+
+statement ok
+CREATE VIEW public.pv AS SELECT * FROM s1.t;
+
+statement ok
+DROP SCHEMA s1 CASCADE;
+
+statement error
+SELECT * FROM s1.t;
+
+statement error
+SELECT * FROM pv;
+
+query T
+SELECT count(*) FROM pg_namespace WHERE nspname = 's1';
+----
+0
+
+statement error
+DROP SCHEMA s1;
+
+statement ok
+DROP SCHEMA IF EXISTS s1;
+
+statement ok
+CREATE SCHEMA a;
+
+statement ok
+CREATE SCHEMA b;
+
+statement ok
+CREATE TABLE b.x (i int);
+
+statement error
+DROP SCHEMA a, b;
+
+statement error
+DROP SCHEMA a, nope;
+
+statement ok
+DROP SCHEMA IF EXISTS a, nope;
+
+statement ok
+DROP SCHEMA b CASCADE;
+
+statement error
+ALTER SCHEMA b RENAME TO b2;
+
+statement ok
+CREATE SCHEMA c;
+
+statement ok
+CREATE TABLE c.y (i int);
+
+statement ok
+ALTER SCHEMA c RENAME TO c2;
+
+query T
+SELECT * FROM c2.y;
+----
+
+statement error
+SELECT * FROM c.y;
+
+statement error
+ALTER SCHEMA c2 RENAME TO public;
+
+statement error
+ALTER SCHEMA nope RENAME TO z;
+
+statement ok
+ALTER SCHEMA c2 OWNER TO nodus;
+
+statement ok
+CREATE SCHEMA s2 AUTHORIZATION nodus;
+
+statement ok
+CREATE SCHEMA s3 CREATE TABLE t3 (a int) CREATE VIEW v3 AS SELECT * FROM t3;
+
+statement ok
+INSERT INTO s3.t3 VALUES (1);
+
+query T
+SELECT * FROM s3.v3;
+----
+1
+
+statement ok
+COMMENT ON SCHEMA s2 IS 'second';
+
+query T
+SELECT obj_description('s2'::regnamespace, 'pg_namespace');
+----
+second
+
+query TT
+SELECT schema_name, schema_owner FROM information_schema.schemata WHERE schema_name IN ('s2', 's3', 'c2') ORDER BY 1;
+----
+c2	nodus
+s2	nodus
+s3	nodus
+
+statement error
+DROP SCHEMA pg_catalog;
+
+statement error
+CREATE SCHEMA pg_x;
+
+statement error
+ALTER SCHEMA s2 RENAME TO pg_y;
+
+statement ok
+DROP SCHEMA s2, s3, c2 CASCADE;
+
+query T
+SELECT count(*) FROM pg_namespace WHERE nspname IN ('s2', 's3', 'c2');
+----
+0

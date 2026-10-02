@@ -1074,11 +1074,33 @@ pub enum LogicalPlan {
     CreateSchema {
         schema_name: String,
         if_not_exists: bool,
+        /// `AUTHORIZATION role`: the role that owns it.
+        #[serde(default)]
+        authorization: Option<String>,
+        /// The statements creating objects in it with it (`CREATE SCHEMA s
+        /// CREATE TABLE ...`), run with it first on the search path.
+        #[serde(default)]
+        elements: Vec<LogicalPlan>,
     },
+    /// `DROP SCHEMA names`: with `cascade`, what they hold goes with them.
     DropSchema {
-        schema_name: String,
+        names: Vec<String>,
         if_exists: bool,
         cascade: bool,
+    },
+    /// `ALTER SCHEMA name RENAME TO new_name` or `OWNER TO owner`.
+    AlterSchema {
+        name: String,
+        new_name: Option<String>,
+        owner: Option<String>,
+    },
+    /// `ALTER <kind> [IF EXISTS] name SET SCHEMA schema`, `kind` one of
+    /// `TABLE`, `VIEW`, `MATERIALIZED VIEW`, `SEQUENCE`, `TYPE`, `DOMAIN`.
+    SetSchema {
+        kind: String,
+        name: String,
+        schema: String,
+        if_exists: bool,
     },
     CreateTable {
         name: String,

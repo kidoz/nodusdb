@@ -604,6 +604,13 @@ impl CatalogWriter for MemoryCatalog {
 
     fn update_table_descriptor(&self, change: TableDescriptorChange) -> Result<TableDescriptor> {
         let _snapshot = self.raft_snapshot_gate.lock();
+        // The schema a relation moves to must exist (checked before the
+        // tables are locked, as readers lock schemas first).
+        if let TableDescriptorChange::SetSchema { schema_id, .. } = &change
+            && !self.schemas.read().values().any(|s| s.id == *schema_id)
+        {
+            anyhow::bail!("Schema not found");
+        }
         let mut guard = self.tables.write();
         let table_id = match &change {
             TableDescriptorChange::AddColumn { table_id, .. } => *table_id,
@@ -616,7 +623,9 @@ impl CatalogWriter for MemoryCatalog {
             TableDescriptorChange::SetComment { table_id, .. }
             | TableDescriptorChange::ReplaceColumn { table_id, .. }
             | TableDescriptorChange::AddConstraint { table_id, .. }
-            | TableDescriptorChange::DropConstraint { table_id, .. } => *table_id,
+            | TableDescriptorChange::DropConstraint { table_id, .. }
+            | TableDescriptorChange::SetSchema { table_id, .. }
+            | TableDescriptorChange::SetViewQuery { table_id, .. } => *table_id,
         };
 
         let mut target_key = None;
@@ -700,6 +709,22 @@ impl CatalogWriter for MemoryCatalog {
                     .retain(|c| c.effective_name(&table_name) != name);
                 if table.constraints.len() == before {
                     anyhow::bail!("Constraint {} not found", name);
+                }
+            }
+            TableDescriptorChange::SetSchema { schema_id, .. } => {
+                new_key.1 = schema_id;
+                if guard.contains_key(&new_key) {
+                    anyhow::bail!("relation \"{}\" already exists", table.name);
+                }
+                table.schema_id = schema_id;
+            }
+            TableDescriptorChange::SetViewQuery { query, .. } => {
+                if table.view_query.is_some() {
+                    table.view_query = Some(query);
+                } else if table.materialized_query.is_some() {
+                    table.materialized_query = Some(query);
+                } else {
+                    anyhow::bail!("\"{}\" is not a view", table.name);
                 }
             }
         }

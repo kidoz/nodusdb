@@ -91,7 +91,7 @@ impl MemExecutor {
                                 args: vec![sequence_arg, ScalarExpr::Literal(Value::Bool(always))],
                             },
                             None => ScalarExpr::Function {
-                                name: "NEXTVAL".to_string(),
+                                name: crate::sequences::SERIAL.to_string(),
                                 args: vec![sequence_arg],
                             },
                         })
@@ -733,7 +733,8 @@ impl MemExecutor {
                 }
             }
         }
-        Ok(())
+        // The views reading it follow it.
+        self.retarget_renamed(&self.schema_name_of(tbl), &tbl.name, &new_only)
     }
 
     /// The names the constraints of `tbl` go by: its CHECK and FOREIGN KEY

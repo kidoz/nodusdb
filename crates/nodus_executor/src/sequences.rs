@@ -52,6 +52,36 @@ pub(crate) fn owned_sequence_name(table: &str, column: &str) -> String {
     format!("{table}_{column}_seq")
 }
 
+/// The function a `serial` column's default calls: `nextval` of the
+/// sequence the column owns (a default calling `nextval` itself owns
+/// nothing).
+pub(crate) const SERIAL: &str = "__SERIAL__";
+
+/// The sequence a column owns — its `serial` or identity sequence — as its
+/// default names it. Defaults written before `serial` columns called
+/// [`SERIAL`] own the sequence of the column's conventional name.
+pub(crate) fn owned_by_column(
+    table: &str,
+    column: &nodus_catalog::ColumnDescriptor,
+) -> Option<String> {
+    let default = crate::MemExecutor::column_default(column)?;
+    let sequence = default_sequence(&default)?;
+    let owned = match &default {
+        crate::ScalarExpr::Function { name, .. } if name == SERIAL || name == "__IDENTITY__" => {
+            true
+        }
+        _ => {
+            let bare = sequence
+                .rsplit('.')
+                .next()
+                .unwrap_or(&sequence)
+                .trim_matches('"');
+            bare == owned_sequence_name(table, &column.name)
+        }
+    };
+    owned.then_some(sequence)
+}
+
 /// A sequence's definition, as `CREATE SEQUENCE` (or a `serial`/identity
 /// column) specifies it. Unset bounds take the defaults for the data type and
 /// direction.
@@ -227,7 +257,7 @@ impl SequenceState {
 pub(crate) fn default_sequence(default: &crate::ScalarExpr) -> Option<String> {
     match default {
         crate::ScalarExpr::Function { name, args }
-            if (name == "NEXTVAL" && args.len() == 1)
+            if ((name == "NEXTVAL" || name == SERIAL) && args.len() == 1)
                 || (name == "__IDENTITY__" && args.len() == 2) =>
         {
             match args.first() {
@@ -240,6 +270,43 @@ pub(crate) fn default_sequence(default: &crate::ScalarExpr) -> Option<String> {
             }
         }
         _ => None,
+    }
+}
+
+/// A column default drawing from another sequence, named `sequence`.
+pub(crate) fn with_default_sequence(
+    default: &crate::ScalarExpr,
+    sequence: &str,
+) -> crate::ScalarExpr {
+    let named = |arg: &crate::ScalarExpr| match arg {
+        crate::ScalarExpr::Literal(Value::Text(_)) => {
+            crate::ScalarExpr::Literal(Value::Text(sequence.to_string()))
+        }
+        crate::ScalarExpr::Cast { expr, target }
+            if matches!(**expr, crate::ScalarExpr::Literal(Value::Text(_))) =>
+        {
+            crate::ScalarExpr::Cast {
+                expr: Box::new(crate::ScalarExpr::Literal(Value::Text(
+                    sequence.to_string(),
+                ))),
+                target: target.clone(),
+            }
+        }
+        other => other.clone(),
+    };
+    match default {
+        crate::ScalarExpr::Function { name, args }
+            if ((name == "NEXTVAL" || name == SERIAL) && args.len() == 1)
+                || (name == "__IDENTITY__" && args.len() == 2) =>
+        {
+            let mut args = args.clone();
+            args[0] = named(&args[0]);
+            crate::ScalarExpr::Function {
+                name: name.clone(),
+                args,
+            }
+        }
+        other => other.clone(),
     }
 }
 
@@ -349,12 +416,13 @@ impl SequenceStore {
             .ok_or_else(|| {
                 anyhow::anyhow!("column \"{column}\" of relation \"{name}\" does not exist")
             })?;
-        Ok(col
-            .default_expr
-            .as_deref()
-            .and_then(|json| serde_json::from_str::<crate::ScalarExpr>(json).ok())
-            .and_then(|default| default_sequence(&default))
-            .map(|sequence| format!("{schema}.{sequence}")))
+        Ok(owned_by_column(&tbl.name, col).map(|sequence| {
+            if sequence.contains('.') {
+                sequence
+            } else {
+                format!("{schema}.{sequence}")
+            }
+        }))
     }
 
     /// Stores a new sequence's initial state, committed at once.

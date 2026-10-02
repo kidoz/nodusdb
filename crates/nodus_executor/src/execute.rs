@@ -29,12 +29,25 @@ impl MemExecutor {
             LogicalPlan::CreateSchema {
                 schema_name,
                 if_not_exists,
-            } => self.exec_create_schema(ctx, schema_name, if_not_exists),
+                authorization,
+                elements,
+            } => self.exec_create_schema(ctx, schema_name, if_not_exists, authorization, elements),
             LogicalPlan::DropSchema {
-                schema_name,
+                names,
                 if_exists,
-                cascade: _,
-            } => self.exec_drop_schema(ctx, schema_name, if_exists),
+                cascade,
+            } => self.exec_drop_schemas(ctx, names, if_exists, cascade),
+            LogicalPlan::AlterSchema {
+                name,
+                new_name,
+                owner,
+            } => self.exec_alter_schema(ctx, name, new_name, owner),
+            LogicalPlan::SetSchema {
+                kind,
+                name,
+                schema,
+                if_exists,
+            } => self.exec_set_schema(ctx, &kind, name, schema, if_exists),
             LogicalPlan::CreateTable {
                 name,
                 columns,

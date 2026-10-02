@@ -123,6 +123,7 @@ pub(crate) fn is_known(name: &str) -> bool {
                 | "PG_TOTAL_RELATION_SIZE" | "PG_DATABASE_SIZE"
                 // Sequences.
                 | "NEXTVAL" | "CURRVAL" | "LASTVAL" | "SETVAL" | "PG_GET_SERIAL_SEQUENCE"
+                | crate::sequences::SERIAL
                 | "__IDENTITY__"
                 // UUIDs.
                 | "GEN_RANDOM_UUID" | "UUIDV4" | "UUIDV7" | "UUID_EXTRACT_VERSION"
@@ -253,7 +254,12 @@ pub(crate) fn return_type(name: &str, arg_types: &[Option<String>]) -> Option<St
             | "NUM_NONNULLS"
             | "INET_SERVER_PORT"
             | "INET_CLIENT_PORT" => "INTEGER",
-            "TXID_CURRENT" | "PG_CURRENT_XACT_ID" | "NEXTVAL" | "CURRVAL" | "LASTVAL"
+            "TXID_CURRENT"
+            | "PG_CURRENT_XACT_ID"
+            | "NEXTVAL"
+            | crate::sequences::SERIAL
+            | "CURRVAL"
+            | "LASTVAL"
             | "SETVAL" => "BIGINT",
             "PG_GET_SERIAL_SEQUENCE" => "TEXT",
             "RANDOM" | "PI" | "DATE_PART" => "DOUBLE PRECISION",
@@ -2309,7 +2315,7 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
         "PG_IS_IN_RECOVERY" if arity(0) => Value::Bool(false),
         // ---- Sequences ---------------------------------------------------------
         // `__IDENTITY__(sequence, always)` is an identity column's default.
-        "NEXTVAL" if arity(1) => {
+        "NEXTVAL" | crate::sequences::SERIAL if arity(1) => {
             sequence_op(|store, session| store.nextval(session, &text(arg(0))))
         }
         "__IDENTITY__" if arity(2) => {
@@ -2396,7 +2402,10 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
         // Only relations and their columns take comments.
         "OBJ_DESCRIPTION" if arity(1) || arity(2) => {
             if arity(2) && text(arg(1)) != "pg_class" {
-                return Some(Value::Null);
+                return Some(
+                    crate::schemas::schema_or_type_description(int(arg(0))?, &text(arg(1)))
+                        .map_or(Value::Null, Value::Text),
+                );
             }
             catalog_text(|catalog| {
                 crate::MemExecutor::relation_by_oid(catalog, int(arg(0))?)?.comment

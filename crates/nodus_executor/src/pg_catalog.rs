@@ -790,6 +790,10 @@ impl MemExecutor {
                         }
                     }
                 }
+                rows.extend(crate::schemas::schema_and_type_descriptions(
+                    self.types_catalog.as_ref(),
+                    db_name,
+                ));
                 Some((
                     Self::virtual_columns(&[
                         ("objoid", "OID"),

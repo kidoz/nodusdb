@@ -122,6 +122,17 @@ pub enum TableDescriptorChange {
         table_id: TableId,
         name: String,
     },
+    /// Moves the relation to another schema of its database (`SET SCHEMA`).
+    SetSchema {
+        table_id: TableId,
+        schema_id: SchemaId,
+    },
+    /// Replaces a view's (or materialized view's) stored query, as when a
+    /// relation it reads moves or is renamed.
+    SetViewQuery {
+        table_id: TableId,
+        query: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

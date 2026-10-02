@@ -1,0 +1,150 @@
+# ALTER ... SET SCHEMA moves relations, sequences, types, and domains, and
+# their catalogs follow. Expected results come from PostgreSQL 18.
+statement ok
+CREATE SCHEMA s;
+
+statement ok
+CREATE TABLE t (id int PRIMARY KEY, n serial, v text);
+
+statement ok
+CREATE INDEX t_v_idx ON t (v);
+
+statement ok
+INSERT INTO t (id, v) VALUES (1, 'a');
+
+statement ok
+CREATE VIEW tv AS SELECT id, v FROM t;
+
+statement ok
+ALTER TABLE t SET SCHEMA s;
+
+query TTT
+SELECT * FROM s.t;
+----
+1	1	a
+
+statement error
+SELECT * FROM t;
+
+query TT
+SELECT * FROM tv;
+----
+1	a
+
+query TT
+SELECT schemaname, tablename FROM pg_tables WHERE tablename = 't';
+----
+s	t
+
+query TT
+SELECT schemaname, indexname FROM pg_indexes WHERE tablename = 't' ORDER BY 2;
+----
+s	t_pkey
+s	t_v_idx
+
+query TT
+SELECT schemaname, sequencename FROM pg_sequences WHERE sequencename = 't_n_seq';
+----
+s	t_n_seq
+
+query T
+INSERT INTO s.t (id, v) VALUES (2, 'b') RETURNING n;
+----
+2
+
+statement error
+ALTER TABLE s.t SET SCHEMA nope;
+
+statement error
+ALTER TABLE nope SET SCHEMA s;
+
+statement ok
+ALTER TABLE IF EXISTS nope SET SCHEMA s;
+
+statement ok
+CREATE TABLE s.u (a int);
+
+statement ok
+CREATE TABLE u (a int);
+
+statement error
+ALTER TABLE u SET SCHEMA s;
+
+statement ok
+ALTER TABLE u SET SCHEMA public;
+
+statement ok
+ALTER VIEW tv SET SCHEMA s;
+
+query TT
+SELECT * FROM s.tv;
+----
+1	a
+2	b
+
+statement ok
+CREATE SEQUENCE q START 5;
+
+statement ok
+ALTER SEQUENCE q SET SCHEMA s;
+
+query T
+SELECT nextval('s.q');
+----
+5
+
+statement ok
+CREATE TYPE e AS ENUM ('x');
+
+statement ok
+ALTER TYPE e SET SCHEMA s;
+
+query T
+SELECT 'x'::s.e;
+----
+x
+
+statement error
+SELECT 'x'::e;
+
+statement ok
+CREATE DOMAIN d AS int CHECK (VALUE > 0);
+
+statement ok
+ALTER DOMAIN d SET SCHEMA s;
+
+query T
+SELECT 1::s.d;
+----
+1
+
+statement ok
+CREATE MATERIALIZED VIEW mv AS SELECT 1 AS one;
+
+statement ok
+ALTER MATERIALIZED VIEW mv SET SCHEMA s;
+
+query T
+SELECT * FROM s.mv;
+----
+1
+
+statement ok
+ALTER TABLE s.t RENAME TO t2;
+
+query T
+SELECT count(*) FROM s.t2;
+----
+2
+
+statement ok
+ALTER INDEX s.t_v_idx RENAME TO t_v2;
+
+query T
+SELECT indexname FROM pg_indexes WHERE schemaname = 's' ORDER BY 1;
+----
+t_pkey
+t_v2
+
+statement ok
+DROP SCHEMA s CASCADE;

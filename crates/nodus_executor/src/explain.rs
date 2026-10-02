@@ -1051,7 +1051,9 @@ pub(crate) fn deparse_scalar(expr: &ScalarExpr, qualified: bool) -> String {
             d(&args[0])
         }
         // A sequence argument is a `regclass`.
-        ScalarExpr::Function { name, args } if name == "NEXTVAL" && args.len() == 1 => {
+        ScalarExpr::Function { name, args }
+            if (name == "NEXTVAL" || name == crate::sequences::SERIAL) && args.len() == 1 =>
+        {
             match crate::sequences::default_sequence(expr) {
                 Some(sequence) => format!("nextval('{sequence}'::regclass)"),
                 None => format!("nextval({})", list(args)),
@@ -1348,8 +1350,24 @@ fn balanced(text: &str) -> bool {
 
 /// `schema.t` or `schema.t a`, as a query names a relation.
 fn scan_label_name_qualified(table_name: &str, alias: Option<&str>) -> String {
+    let shown = shown_relation(table_name);
     match alias {
-        Some(alias) if alias != relation_name(table_name) => format!("{table_name} {alias}"),
+        Some(alias) if alias != relation_name(table_name) => format!("{shown} {alias}"),
+        _ => shown,
+    }
+}
+
+/// A relation's name as a view's definition shows it: without its schema
+/// when that is on the search path.
+fn shown_relation(table_name: &str) -> String {
+    match table_name.rsplit_once('.') {
+        Some((schema, name))
+            if crate::search_path::existing_search_path()
+                .iter()
+                .any(|s| *s == schema.trim_matches('"')) =>
+        {
+            name.to_string()
+        }
         _ => table_name.to_string(),
     }
 }

@@ -116,7 +116,7 @@ pub(crate) struct UserType {
 }
 
 impl UserType {
-    fn of(table: &TableDescriptor, schema: String) -> Option<Self> {
+    pub(crate) fn of(table: &TableDescriptor, schema: String) -> Option<Self> {
         Some(UserType {
             id: table.id,
             schema,
@@ -166,7 +166,7 @@ impl UserType {
     }
 }
 
-fn quote(name: &str) -> String {
+pub(crate) fn quote(name: &str) -> String {
     let plain = name
         .chars()
         .next()
@@ -189,6 +189,12 @@ pub(crate) fn is_type_relation(table: &TableDescriptor) -> bool {
         && table.columns[0].name == TYPE_COLUMN
 }
 
+/// Whether a relation holds catalog facts rather than rows (a type's, or a
+/// schema's own), which no query sees.
+pub(crate) fn is_hidden_relation(table: &TableDescriptor) -> bool {
+    is_type_relation(table) || crate::schemas::is_schema_relation(table)
+}
+
 /// A type relation's definition.
 pub(crate) fn definition_of(table: &TableDescriptor) -> Option<TypeDefinition> {
     if !is_type_relation(table) {
@@ -203,7 +209,7 @@ pub(crate) struct RelationCatalog(pub(crate) Arc<dyn CatalogReader>);
 
 impl RelationCatalog {
     fn visible(table: TableDescriptor) -> Result<TableDescriptor> {
-        if is_type_relation(&table) {
+        if is_hidden_relation(&table) {
             anyhow::bail!("relation \"{}\" does not exist", table.name);
         }
         Ok(table)
@@ -224,7 +230,11 @@ impl CatalogReader for RelationCatalog {
         self.0.get_database_by_id(id)
     }
     fn get_schema(&self, database: &str, schema: &str) -> Result<nodus_catalog::SchemaDescriptor> {
-        self.0.get_schema(database, schema)
+        self.0.get_schema(database, schema).map_err(|_| {
+            DbError::new(format!("schema \"{schema}\" does not exist"))
+                .code("3F000")
+                .into()
+        })
     }
     fn get_schema_by_id(
         &self,
@@ -242,6 +252,14 @@ impl CatalogReader for RelationCatalog {
         self.0.resolve_object(request)
     }
     fn get_table(&self, database: &str, schema: &str, table: &str) -> Result<TableDescriptor> {
+        // A relation of a schema there is not does not exist either.
+        if self.0.get_schema(database, schema).is_err() {
+            return Err(
+                DbError::new(format!("relation \"{schema}.{table}\" does not exist"))
+                    .code("42P01")
+                    .into(),
+            );
+        }
         self.0
             .get_table(database, schema, table)
             .and_then(Self::visible)
@@ -251,12 +269,12 @@ impl CatalogReader for RelationCatalog {
     }
     fn list_tables(&self, database: &str, schema: &str) -> Result<Vec<TableDescriptor>> {
         let mut tables = self.0.list_tables(database, schema)?;
-        tables.retain(|t| !is_type_relation(t));
+        tables.retain(|t| !is_hidden_relation(t));
         Ok(tables)
     }
     fn list_all_tables(&self, database: &str) -> Result<Vec<TableDescriptor>> {
         let mut tables = self.0.list_all_tables(database)?;
-        tables.retain(|t| !is_type_relation(t));
+        tables.retain(|t| !is_hidden_relation(t));
         Ok(tables)
     }
     fn get_principal_by_name(&self, name: &str) -> Result<nodus_catalog::PrincipalDescriptor> {
@@ -510,7 +528,7 @@ fn find(data_type: &str) -> Option<Arc<UserType>> {
 }
 
 /// A possibly schema-qualified name's parts, unquoted.
-fn split_name(text: &str) -> (Option<String>, String) {
+pub(crate) fn split_name(text: &str) -> (Option<String>, String) {
     let unquote = |s: &str| s.trim().trim_matches('"').replace("\"\"", "\"");
     match text.rsplit_once('.') {
         Some((schema, name)) if !name.contains('"') || name.starts_with('"') => {
@@ -792,15 +810,18 @@ fn names_type(data_type: &str, t: &UserType) -> bool {
 /// of it, the domains over it (each followed by what depends on it), then
 /// its columns, each group latest first. Each object with the type it
 /// depends on (`posint[]`).
-enum Dependent {
+pub(crate) enum Dependent {
     Column(TableDescriptor, String),
     Type(Arc<UserType>),
 }
 
-fn dependents(tables: &[TableDescriptor], t: &UserType, out: &mut Vec<(Dependent, String)>) {
+pub(crate) fn dependents(
+    tables: &[TableDescriptor],
+    t: &UserType,
+    out: &mut Vec<(Dependent, String)>,
+) {
     let columns = dependent_columns(tables, t);
-    for (table, column, array) in columns.iter().filter(|c| c.2) {
-        let _ = array;
+    for (table, column, _) in columns.iter().filter(|c| c.2) {
         out.push((
             Dependent::Column(table.clone(), column.clone()),
             format!("{}[]", t.name),
@@ -825,7 +846,7 @@ fn dependents(tables: &[TableDescriptor], t: &UserType, out: &mut Vec<(Dependent
 }
 
 impl Dependent {
-    fn description(&self) -> String {
+    pub(crate) fn description(&self) -> String {
         match self {
             Dependent::Column(table, column) => format!("column {column} of table {}", table.name),
             Dependent::Type(t) => format!("type {}", t.name),

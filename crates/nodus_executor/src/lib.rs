@@ -47,6 +47,7 @@ mod planner;
 mod random;
 mod referential;
 mod result_types;
+mod schemas;
 mod search_path;
 mod select;
 mod sequences;
@@ -1429,6 +1430,15 @@ fn write_command(plan: &LogicalPlan) -> Option<&'static str> {
         LogicalPlan::DropView { .. } => "DROP VIEW",
         LogicalPlan::CreateSchema { .. } => "CREATE SCHEMA",
         LogicalPlan::DropSchema { .. } => "DROP SCHEMA",
+        LogicalPlan::AlterSchema { .. } => "ALTER SCHEMA",
+        LogicalPlan::SetSchema { kind, .. } => match kind.as_str() {
+            "VIEW" => "ALTER VIEW",
+            "MATERIALIZED VIEW" => "ALTER MATERIALIZED VIEW",
+            "SEQUENCE" => "ALTER SEQUENCE",
+            "TYPE" => "ALTER TYPE",
+            "DOMAIN" => "ALTER DOMAIN",
+            _ => "ALTER TABLE",
+        },
         LogicalPlan::CreateSequence { .. } => "CREATE SEQUENCE",
         LogicalPlan::AlterSequence { .. } => "ALTER SEQUENCE",
         LogicalPlan::DropSequence { .. } => "DROP SEQUENCE",
