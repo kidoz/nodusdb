@@ -342,7 +342,11 @@ impl MemExecutor {
                             Value::Bool(false),
                             Value::Bool(true),
                             Value::Int(0),
-                            Value::Int(100),
+                            Value::Int(if crate::ranges::is_range_type(&column.data_type) {
+                                0
+                            } else {
+                                100
+                            }),
                             Value::Null,
                             Value::Null,
                             Value::Null,
@@ -651,7 +655,25 @@ impl MemExecutor {
                     ("rngcanonical", "REGPROC"),
                     ("rngsubdiff", "REGPROC"),
                 ]),
-                Vec::new(),
+                crate::ranges::KINDS
+                    .iter()
+                    .map(|kind| {
+                        vec![
+                            Value::Int(kind.oid()),
+                            Value::Int(kind.subtype_oid()),
+                            // Multiranges are not modelled, so no multirange type.
+                            Value::Int(0),
+                            Value::Int(0),
+                            Value::Int(crate::ranges::subopc(*kind)),
+                            // PostgreSQL prints no canonical function as `-`.
+                            match crate::ranges::canonical_function(*kind) {
+                                Some(name) => Value::Text(name.to_string()),
+                                None => Value::Text("-".to_string()),
+                            },
+                            Value::Text(format!("{}_subdiff", kind.name())),
+                        ]
+                    })
+                    .collect(),
             )),
             "pg_settings" => Some(self.pg_settings_virtual_table()),
             "pg_roles" => Some(self.pg_roles_virtual_table()),
@@ -1826,6 +1848,75 @@ impl MemExecutor {
             ]);
         }
         rows.extend(self.user_type_rows(db_name));
+        // The range types and their array types.
+        for kind in crate::ranges::KINDS {
+            rows.push(vec![
+                Value::Int(kind.oid()),
+                Value::Text(kind.name().into()),
+                Value::Int(pg_ns),
+                Value::Int(10),
+                Value::Int(-1),
+                Value::Bool(false),
+                Value::Text("r".into()),
+                Value::Text("R".into()),
+                Value::Bool(false),
+                Value::Bool(true),
+                Value::Text(",".into()),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Int(kind.array_oid()),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Text("i".into()),
+                Value::Text("x".into()),
+                Value::Bool(false),
+                Value::Int(0),
+                Value::Int(-1),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+            ]);
+            rows.push(vec![
+                Value::Int(kind.array_oid()),
+                Value::Text(format!("_{}", kind.name())),
+                Value::Int(pg_ns),
+                Value::Int(10),
+                Value::Int(-1),
+                Value::Bool(false),
+                Value::Text("b".into()),
+                Value::Text("A".into()),
+                Value::Bool(false),
+                Value::Bool(true),
+                Value::Text(",".into()),
+                Value::Int(0),
+                Value::Int(kind.oid()),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Text("i".into()),
+                Value::Text("x".into()),
+                Value::Bool(false),
+                Value::Int(0),
+                Value::Int(-1),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+            ]);
+        }
         // Every relation has a row type, which pg_type lists (typtype 'c')
         // and whose attributes are the relation's own `pg_attribute` rows.
         let schemas = self

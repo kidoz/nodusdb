@@ -45,6 +45,7 @@ mod pg_regex;
 mod plan_types;
 mod planner;
 mod random;
+mod ranges;
 mod referential;
 mod result_types;
 mod schemas;

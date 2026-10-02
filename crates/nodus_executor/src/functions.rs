@@ -13,6 +13,13 @@ use crate::value::{Value, render, values_equal};
 
 /// Functions that receive NULL arguments instead of short-circuiting to NULL.
 const NON_STRICT: &[&str] = &[
+    // Range constructors read a NULL bound as unbounded.
+    "INT4RANGE",
+    "INT8RANGE",
+    "NUMRANGE",
+    "DATERANGE",
+    "TSRANGE",
+    "TSTZRANGE",
     "__SLICE__",
     "ARRAY",
     "COALESCE",
@@ -142,6 +149,12 @@ pub(crate) fn is_known(name: &str) -> bool {
                 | "ARRAY_CAT" | "ARRAY_POSITION" | "ARRAY_POSITIONS" | "ARRAY_REMOVE"
                 | "ARRAY_REPLACE" | "ARRAY_UPPER" | "ARRAY_LOWER" | "ARRAY_NDIMS"
                 | "TRIM_ARRAY" | "ARRAY_SORT" | "ARRAY_REVERSE"
+                // Ranges.
+                | "INT4RANGE" | "INT8RANGE" | "NUMRANGE" | "DATERANGE" | "TSRANGE" | "TSTZRANGE"
+                | "ISEMPTY" | "LOWER_INC" | "UPPER_INC" | "LOWER_INF" | "UPPER_INF"
+                | "RANGE_MERGE"
+                | "__RANGE__" | "__RANGE_LOWER__" | "__RANGE_UPPER__" | "__BAD_RANGE_CAST__"
+                | "__BAD_OPERATOR__" | "__BAD_FUNCTION__"
                 // Subscripts: `a[i]`, `a[lo:hi]`, `doc['key']`.
                 | "__SUBSCRIPT__" | "__SLICE__"
                 | crate::result_types::INTEGER_RANGE
@@ -330,6 +343,18 @@ pub(crate) fn return_type(name: &str, arg_types: &[Option<String>]) -> Option<St
             "TO_JSON" | "JSON_BUILD_OBJECT" | "JSON_BUILD_ARRAY" | "JSON_EXTRACT_PATH"
             | "JSON_STRIP_NULLS" | "ROW_TO_JSON" | "ARRAY_TO_JSON" | "JSON_OBJECT" => "JSON",
             "__RECORD__" => "RECORD",
+            "INT4RANGE" | "INT8RANGE" | "NUMRANGE" | "DATERANGE" | "TSRANGE" | "TSTZRANGE" => {
+                return Some(name.to_string());
+            }
+            "ISEMPTY" | "LOWER_INC" | "UPPER_INC" | "LOWER_INF" | "UPPER_INF" => {
+                return Some("BOOL".into());
+            }
+            // `lower`/`upper` of a range have its subtype's type (appended by
+            // the planner as a literal).
+            "__RANGE_LOWER__" | "__RANGE_UPPER__" => {
+                return arg_types.get(1).cloned().flatten();
+            }
+            "__BAD_RANGE_CAST__" => return None,
             "PG_IS_IN_RECOVERY" | "STARTS_WITH" => "BOOLEAN",
             name if crate::value::is_visibility_fn(name) => "BOOLEAN",
             "UPPER"
@@ -2034,6 +2059,108 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
             Some(iv) => Value::Numeric(Numeric::from(iv.span())),
             None => arg(0).clone(),
         },
+        // Range operators, with their subtype and whether the right operand
+        // is an element, as the planner passes them.
+        "__RANGE__" if arity(5) => {
+            let Some(kind) = crate::ranges::Kind::of(&text(arg(3))) else {
+                return Some(raise(format!(
+                    "operator does not exist: {} {}",
+                    crate::value::value_type_name(arg(1)),
+                    text(arg(0))
+                )));
+            };
+            crate::ranges::operator(
+                &text(arg(0)),
+                kind,
+                &text(arg(1)),
+                &text(arg(2)),
+                matches!(arg(4), Value::Bool(true)),
+            )
+            .unwrap_or_else(raise)
+        }
+        "__RANGE_LOWER__" | "__RANGE_UPPER__" if arity(1) || arity(2) => {
+            crate::ranges::bound_value(&text(arg(0)), name == "__RANGE_LOWER__")
+                .unwrap_or_else(raise)
+        }
+        "__BAD_FUNCTION__" if arity(2) => raise(
+            crate::error_fields::DbError::new(format!(
+                "function {}({}) does not exist",
+                text(arg(0)),
+                text(arg(1))
+            ))
+            .code("42883")
+            .hint("No function matches the given name and argument types. You might need to add explicit type casts.")
+            .into_text(),
+        ),
+        "__BAD_OPERATOR__" if arity(3) => raise(
+            crate::error_fields::DbError::new(format!(
+                "operator does not exist: {} {} {}",
+                text(arg(0)),
+                text(arg(1)),
+                text(arg(2))
+            ))
+            .code("42883")
+            .hint("No operator matches the given name and argument types. You might need to add explicit type casts.")
+            .into_text(),
+        ),
+        "__BAD_RANGE_CAST__" if arity(2) => raise(
+            crate::error_fields::DbError::new(format!(
+                "cannot cast type {} to {}",
+                text(arg(0)),
+                text(arg(1))
+            ))
+            .code("42846")
+            .into_text(),
+        ),
+        "ISEMPTY" if arity(1) => crate::ranges::is_empty(&text(arg(0))).unwrap_or_else(raise),
+        "LOWER_INC" | "UPPER_INC" if arity(1) => {
+            crate::ranges::bound_inc(&text(arg(0)), name == "LOWER_INC").unwrap_or_else(raise)
+        }
+        "LOWER_INF" | "UPPER_INF" if arity(1) => {
+            crate::ranges::bound_inf(&text(arg(0)), name == "LOWER_INF").unwrap_or_else(raise)
+        }
+        "RANGE_MERGE" if arity(2) => {
+            let kind = crate::ranges::infer_kind(&text(arg(0)), &text(arg(1)));
+            match kind {
+                Some(kind) => {
+                    crate::ranges::range_merge(kind, &text(arg(0)), &text(arg(1)))
+                        .unwrap_or_else(raise)
+                }
+                None => raise(format!(
+                    "function range_merge({}, {}) does not exist",
+                    crate::value::value_type_name(arg(0)),
+                    crate::value::value_type_name(arg(1))
+                )),
+            }
+        }
+        // The range constructors: `int4range(lower, upper [, flags])`, and
+        // the copy constructor `int4range(range)`.
+        "INT4RANGE" | "INT8RANGE" | "NUMRANGE" | "DATERANGE" | "TSRANGE" | "TSTZRANGE"
+            if matches!(args.len(), 1 | 2 | 3) =>
+        {
+            let kind = crate::ranges::Kind::of(name).expect("matched by name");
+            if let [value] = args {
+                match value {
+                    Value::Text(text) => crate::ranges::from_literal(kind, text)
+                        .map(Value::Text)
+                        .unwrap_or_else(raise),
+                    other => raise(format!(
+                        "cannot cast type {} to {}",
+                        crate::value::value_type_name(other),
+                        kind.name()
+                    )),
+                }
+            } else {
+                let flags = if args.len() == 3 {
+                    text(arg(2))
+                } else {
+                    "[)".to_string()
+                };
+                crate::ranges::from_bounds(kind, Some(arg(0)), Some(arg(1)), &flags)
+                    .map(Value::Text)
+                    .unwrap_or_else(raise)
+            }
+        }
         // A grouped query resolves `GROUPING(...)` per grouping set first.
         "GROUPING" => raise(
             "arguments to GROUPING must be grouping expressions of the associated query level",
@@ -3081,6 +3208,18 @@ fn format_type(oid: i64, typmod: Option<i64>) -> String {
         199 => "json[]",
         2951 => "uuid[]",
         3807 => "jsonb[]",
+        3904 => "int4range",
+        3926 => "int8range",
+        3906 => "numrange",
+        3912 => "daterange",
+        3908 => "tsrange",
+        3910 => "tstzrange",
+        3905 => "int4range[]",
+        3927 => "int8range[]",
+        3907 => "numrange[]",
+        3913 => "daterange[]",
+        3909 => "tsrange[]",
+        3911 => "tstzrange[]",
         _ => {
             return match crate::user_types::type_of_oid(oid) {
                 Some((t, false)) => t.display_name(),

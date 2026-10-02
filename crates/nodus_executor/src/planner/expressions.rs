@@ -241,6 +241,19 @@ pub(crate) fn try_cast(v: Value, data_type: &str) -> std::result::Result<Value, 
     if matches!(v, Value::Null) {
         return Ok(Value::Null);
     }
+    // A range takes its literal form; any other value is not castable to one.
+    if let Some(kind) = crate::ranges::Kind::of(data_type) {
+        return match v {
+            Value::Text(text) => crate::ranges::from_literal(kind, &text).map(Value::Text),
+            other => Err(crate::error_fields::DbError::new(format!(
+                "cannot cast type {} to {}",
+                crate::value::value_type_name(&other),
+                kind.name()
+            ))
+            .code("42846")
+            .into_text()),
+        };
+    }
     if let Some(kind) = crate::value::object_identifier_type(data_type) {
         return crate::MemExecutor::object_identifier(v, kind);
     }

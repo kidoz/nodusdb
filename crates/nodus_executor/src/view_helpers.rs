@@ -107,6 +107,11 @@ impl MemExecutor {
             .replace("DOUBLE PRECISION", "DOUBLE")
             .replace("TIMESTAMP WITH TIME ZONE", "TIMESTAMPTZ")
             .replace("TIMESTAMP WITHOUT TIME ZONE", "TIMESTAMP");
+        // `_int4` is PostgreSQL's internal name for `int4[]`.
+        let normalized = match normalized.strip_prefix('_') {
+            Some(base) if !normalized.ends_with("[]") => format!("{base}[]"),
+            _ => normalized,
+        };
         let is_array = normalized.ends_with("[]");
         let base = normalized
             .trim_end_matches("[]")
@@ -139,6 +144,12 @@ impl MemExecutor {
                 "JSON" => 199,
                 "JSONB" => 3807,
                 "REGTYPE" => 2211,
+                "INT4RANGE" => 3905,
+                "INT8RANGE" => 3927,
+                "NUMRANGE" => 3907,
+                "DATERANGE" => 3913,
+                "TSRANGE" => 3909,
+                "TSTZRANGE" => 3911,
                 _ => crate::user_types::type_oid(data_type).unwrap_or(1009),
             };
         }
@@ -178,6 +189,12 @@ impl MemExecutor {
             "REGNAMESPACE" => 4089,
             "REGCONFIG" => 3734,
             "REGDICTIONARY" => 3769,
+            "INT4RANGE" => 3904,
+            "INT8RANGE" => 3926,
+            "NUMRANGE" => 3906,
+            "DATERANGE" => 3912,
+            "TSRANGE" => 3908,
+            "TSTZRANGE" => 3910,
             _ => crate::user_types::type_oid(data_type).unwrap_or(25),
         }
     }

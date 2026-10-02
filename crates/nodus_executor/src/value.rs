@@ -459,11 +459,12 @@ pub(crate) fn coerce_for_column(value: &Value, data_type: &str) -> Value {
         Value::Text(s) if array_element_type(data_type).is_some() => {
             coerce_array_text(s, data_type).unwrap_or_else(|| value.clone())
         }
-        // Text into a numeric, boolean, date/time, or interval column must
-        // parse as that type (date/time text is stored in its canonical form).
+        // Text into a numeric, boolean, date/time, interval, or range column
+        // must parse as that type (text is stored in its canonical form).
         Value::Text(_)
             if column_type(data_type) != ColumnType::Text
-                || crate::datetime::Kind::of_type(data_type).is_some() =>
+                || crate::datetime::Kind::of_type(data_type).is_some()
+                || crate::ranges::is_range_type(data_type) =>
         {
             crate::planner::cast_value(value.clone(), data_type)
         }

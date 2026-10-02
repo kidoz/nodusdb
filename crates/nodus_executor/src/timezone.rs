@@ -163,6 +163,8 @@ pub(crate) fn session_timestamptz_text(text: &str) -> String {
 pub(crate) enum Shown {
     AsIs,
     Zoned,
+    /// A `tstzrange`: its bounds move to the session's zone.
+    RangeZoned,
     Padded(usize),
 }
 
@@ -178,6 +180,9 @@ pub(crate) fn output_forms(types: &[String]) -> Option<Vec<Shown>> {
                 && crate::datetime::Kind::of_type(base) == Some(crate::datetime::Kind::TimestampTz)
             {
                 return Shown::Zoned;
+            }
+            if !utc && crate::ranges::Kind::of(base) == Some(crate::ranges::Kind::TimestampTz) {
+                return Shown::RangeZoned;
             }
             match crate::value::character_limit(t) {
                 Some((length, true)) => Shown::Padded(length),
@@ -197,9 +202,17 @@ pub(crate) fn show_row(values: &mut [crate::Value], forms: &[Shown]) {
             _ => {}
         }
     }
+    fn localize_range(value: &mut crate::Value) {
+        match value {
+            crate::Value::Text(text) => *text = crate::ranges::localize(text),
+            crate::Value::Array(items) => items.iter_mut().for_each(localize_range),
+            _ => {}
+        }
+    }
     for (value, form) in values.iter_mut().zip(forms) {
         match form {
             Shown::Zoned => localize(value),
+            Shown::RangeZoned => localize_range(value),
             Shown::Padded(length) => {
                 if let crate::Value::Text(text) = value {
                     *text = crate::value::pad_character(text, *length);
