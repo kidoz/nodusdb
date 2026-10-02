@@ -595,9 +595,15 @@ impl MemExecutor {
                         ..
                     } => {
                         if touched.contains(&existing_key) {
-                            anyhow::bail!(
-                                "ON CONFLICT DO UPDATE command cannot affect row a second time"
-                            );
+                            return Err(crate::error_fields::DbError::new(
+                                "ON CONFLICT DO UPDATE command cannot affect row a second time",
+                            )
+                            .code("21000")
+                            .hint(
+                                "Ensure that no rows proposed for insertion within the same \
+                                 command have duplicate constrained values.",
+                            )
+                            .into());
                         }
                         // Expressions see the existing row, plus the proposed
                         // row as `excluded.<col>`.

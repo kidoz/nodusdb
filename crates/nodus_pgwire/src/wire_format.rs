@@ -60,6 +60,8 @@ pub(crate) fn sqlstate_for_execution_error(err_str: &str) -> &'static str {
         "22P02" // invalid_text_representation
     } else if err_str.contains("no unique or exclusion constraint matching the ON CONFLICT") {
         "42P10" // invalid_column_reference
+    } else if err_str.contains("can only be used in transaction blocks") {
+        "25P01" // no_active_sql_transaction
     } else if err_str.contains("cannot affect row a second time") {
         "21000" // cardinality_violation
     // Integrity-constraint violations (class 23).
