@@ -1,8 +1,10 @@
 //! Enums, domains, indexes on expressions, updatable views, and cursors,
 //! driven through SQL.
 
+use crate::Executor;
 use crate::constraint_tests::{field, fields, session};
 use crate::dml_join_tests::rows;
+use nodus_catalog::CatalogWriter;
 
 /// A result's rows in their order, each as its values joined by `|`.
 fn ordered(out: &crate::QueryOutput) -> Vec<String> {
@@ -255,6 +257,61 @@ fn a_tables_row_type_names_its_row() {
     assert_eq!(rows(&sql("SELECT pg_typeof(rt) FROM rt").unwrap()), ["rt"]);
     assert_eq!(rows(&sql("SELECT ROW(2, 'two')::rt").unwrap()), ["(2,two)"]);
     assert_eq!(rows(&sql("SELECT (rt).* FROM rt").unwrap()), ["1|one"]);
+}
+
+#[test]
+fn type_ddl_is_authorized() {
+    use nodus_audit::MemoryAuditSink;
+    let (exec, cat) = crate::MemExecutor::shared(std::sync::Arc::new(MemoryAuditSink::new()));
+    let role = |name: &str| {
+        cat.create_role(nodus_catalog::CreateRoleRequest {
+            id: nodus_catalog::PrincipalId::new(),
+            name: name.into(),
+            principal_type: nodus_catalog::PrincipalType::User,
+            database_id: None,
+        })
+        .unwrap()
+    };
+    let admin = role("admin");
+    cat.grant_privilege(nodus_catalog::GrantPrivilegeRequest {
+        id: nodus_catalog::GrantId::new(),
+        principal_id: admin.id,
+        resource: nodus_catalog::ResourceRef::System,
+        privilege: "ALL".into(),
+    })
+    .unwrap();
+    let guest = role("guest");
+    let run = |principal: nodus_catalog::PrincipalId, sql: &str| {
+        let ctx = crate::ExecutionContext {
+            session_id: "test".into(),
+            principal_id: principal,
+            active_roles: Vec::new(),
+            authz_catalog_version: 1,
+        };
+        let mut statements = nodus_sql::parse_sql(sql)?;
+        let plan = crate::plan_statement(&statements.remove(0), &[])?;
+        exec.execute_logical(&ctx, plan)
+    };
+    run(admin.id, "CREATE TYPE mood AS ENUM ('a')").unwrap();
+    run(admin.id, "CREATE DOMAIN pos AS int").unwrap();
+    for sql in [
+        "ALTER TYPE mood ADD VALUE 'b'",
+        "ALTER TYPE mood RENAME TO humour",
+        "DROP TYPE mood",
+        "COMMENT ON TYPE mood IS 'x'",
+        "ALTER DOMAIN pos SET NOT NULL",
+        "DROP DOMAIN pos",
+        "ALTER TYPE mood SET SCHEMA pg_catalog",
+    ] {
+        let denied = run(guest.id, sql).unwrap_err();
+        assert!(
+            denied.to_string().contains("permission denied"),
+            "{sql}: {denied}"
+        );
+    }
+    run(admin.id, "ALTER TYPE mood ADD VALUE 'b'").unwrap();
+    run(admin.id, "COMMENT ON TYPE mood IS 'x'").unwrap();
+    run(admin.id, "DROP TYPE mood").unwrap();
 }
 
 #[test]

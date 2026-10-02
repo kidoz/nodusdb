@@ -597,6 +597,7 @@ impl MemExecutor {
             if kind == "DOMAIN" && t.domain().is_none() {
                 anyhow::bail!("\"{}\" is not a domain", t.name);
             }
+            self.authorize(ctx, Action::CreateTable, ResourceRef::Table(t.id))?;
             let target = self
                 .catalog_reader
                 .get_schema("default", &target_name)
@@ -986,6 +987,7 @@ impl MemExecutor {
     /// type's relation.
     pub(crate) fn exec_comment_type(
         &self,
+        ctx: &ExecutionContext,
         kind: &str,
         name: &str,
         comment: Option<String>,
@@ -998,6 +1000,7 @@ impl MemExecutor {
             .code("42704")
             .into());
         };
+        self.authorize(ctx, Action::CreateTable, ResourceRef::Table(t.id))?;
         if kind == "DOMAIN" && t.domain().is_none() {
             anyhow::bail!("\"{}\" is not a domain", t.name);
         }

@@ -504,7 +504,7 @@ impl MemExecutor {
     ) -> Result<QueryOutput> {
         match kind {
             "SCHEMA" => return self.exec_comment_schema(ctx, relation, comment),
-            "TYPE" | "DOMAIN" => return self.exec_comment_type(kind, relation, comment),
+            "TYPE" | "DOMAIN" => return self.exec_comment_type(ctx, kind, relation, comment),
             _ => {}
         }
         let (db_name, schema_name, table_only) = parse_object_name(relation)?;

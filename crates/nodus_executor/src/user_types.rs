@@ -1240,6 +1240,11 @@ impl MemExecutor {
         domain: bool,
     ) -> Result<QueryOutput> {
         let t = self.named_type(&name)?;
+        self.authorize(
+            ctx,
+            nodus_authz::Action::CreateTable,
+            nodus_catalog::ResourceRef::Table(t.id),
+        )?;
         let tag = if domain { "ALTER DOMAIN" } else { "ALTER TYPE" };
         if domain && t.domain().is_none() {
             anyhow::bail!("\"{}\" is not a domain", t.name);
@@ -1705,6 +1710,11 @@ impl MemExecutor {
         for name in &names {
             match lookup(name) {
                 Some(t) => {
+                    self.authorize(
+                        ctx,
+                        nodus_authz::Action::CreateTable,
+                        nodus_catalog::ResourceRef::Table(t.id),
+                    )?;
                     if domain && t.domain().is_none() {
                         anyhow::bail!("\"{}\" is not a domain", t.name);
                     }
