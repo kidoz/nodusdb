@@ -464,6 +464,14 @@ impl MemExecutor {
         }
     }
 
+    /// A view column's base column name; `None` for an expression column
+    /// or an unknown name.
+    fn base_column(wv: &WritableView, name: &str) -> Option<String> {
+        let at = Self::column_position(&wv.view, name).ok()?;
+        let base = wv.columns.get(at).copied().flatten()?;
+        Some(wv.base.columns[base].name.clone())
+    }
+
     /// `INSERT` into a view: into its table, through its columns.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn exec_view_insert(
@@ -478,12 +486,49 @@ impl MemExecutor {
         (default_cells, overriding): (Vec<Vec<bool>>, Option<&str>),
     ) -> Result<QueryOutput> {
         self.authorize(ctx, Action::Insert, ResourceRef::Table(wv.view.id))?;
-        if matches!(
-            on_conflict,
-            Some(crate::plan_types::OnConflictClause::DoUpdate { .. })
-        ) {
-            anyhow::bail!("ON CONFLICT DO UPDATE on a view is not supported");
-        }
+        // `ON CONFLICT DO UPDATE` runs on the view's table: its targets and
+        // the expressions' view columns become the table's columns.
+        let on_conflict = match on_conflict {
+            Some(crate::plan_types::OnConflictClause::DoUpdate {
+                target,
+                assignments,
+                condition,
+            }) => {
+                let rename = |name: &str| -> String {
+                    let (prefix, column) = name
+                        .rsplit_once('.')
+                        .map_or((None, name), |(prefix, column)| (Some(prefix), column));
+                    match Self::base_column(&wv, column) {
+                        Some(base) if prefix == Some("excluded") => format!("excluded.{base}"),
+                        Some(base) => base,
+                        None => name.to_string(),
+                    }
+                };
+                fn map(rename: &dyn Fn(&str) -> String, expr: &ScalarExpr) -> ScalarExpr {
+                    match expr {
+                        ScalarExpr::Column(name) => ScalarExpr::Column(rename(name)),
+                        other => other.map_children(&mut |e| map(rename, e)),
+                    }
+                }
+                let mapped = |expr: &ScalarExpr| map(&rename, expr);
+                Some(crate::plan_types::OnConflictClause::DoUpdate {
+                    target: target.map(|target| match target {
+                        crate::plan_types::ConflictTarget::Columns(cols) => {
+                            crate::plan_types::ConflictTarget::Columns(
+                                cols.iter().map(|c| rename(c)).collect(),
+                            )
+                        }
+                        other => other,
+                    }),
+                    assignments: assignments
+                        .iter()
+                        .map(|(column, expr)| (rename(column), mapped(expr)))
+                        .collect(),
+                    condition: condition.as_ref().map(mapped),
+                })
+            }
+            other => other,
+        };
         // Without a column list, the view's columns that values are given for.
         let named: Vec<String> = if columns.is_empty() {
             let given = values_list.iter().map(Vec::len).max().unwrap_or(0);

@@ -1,0 +1,29 @@
+# INSERT ... ON CONFLICT DO UPDATE through an updatable view: targets and
+# expressions name the view's columns. Expected results come from PostgreSQL 18.
+statement ok
+CREATE TABLE vb (id int PRIMARY KEY, name text, hits int DEFAULT 0);
+
+statement ok
+CREATE VIEW vv AS SELECT id, name AS label, hits FROM vb WHERE hits >= 0;
+
+query TTT
+INSERT INTO vv (id, label) VALUES (1, 'a') ON CONFLICT (id) DO UPDATE SET hits = vv.hits + 1 RETURNING *;
+----
+1	a	0
+
+query TTT
+INSERT INTO vv (id, label) VALUES (1, 'b') ON CONFLICT (id) DO UPDATE SET hits = vv.hits + 1, label = excluded.label RETURNING *;
+----
+1	b	1
+
+query T
+INSERT INTO vv (id, label) VALUES (1, 'c') ON CONFLICT (id) DO UPDATE SET hits = 100 WHERE vv.hits > 5 RETURNING *;
+----
+
+query TTT
+SELECT * FROM vb;
+----
+1	b	1
+
+statement ok
+DROP TABLE vb CASCADE;

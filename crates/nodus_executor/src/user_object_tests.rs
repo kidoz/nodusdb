@@ -264,3 +264,23 @@ fn a_cast_to_an_unknown_type_is_refused() {
     assert_eq!(message, "type \"nosuch\" does not exist");
     assert_eq!(field(&f, "code").as_deref(), Some("42704"));
 }
+
+#[test]
+fn a_view_writes_through_on_conflict() {
+    let (sql, _) = session();
+    sql("CREATE TABLE vb (id int PRIMARY KEY, name text, hits int DEFAULT 0)").unwrap();
+    sql("CREATE VIEW vv AS SELECT id, name AS label, hits FROM vb WHERE hits >= 0").unwrap();
+    let out = sql("INSERT INTO vv (id, label) VALUES (1, 'a') \
+         ON CONFLICT (id) DO UPDATE SET hits = vv.hits + 1 RETURNING *")
+    .unwrap();
+    assert_eq!(ordered(&out), ["1|a|0"]);
+    let out = sql("INSERT INTO vv (id, label) VALUES (1, 'b') \
+         ON CONFLICT (id) DO UPDATE SET hits = vv.hits + 1, label = excluded.label RETURNING *")
+    .unwrap();
+    assert_eq!(ordered(&out), ["1|b|1"]);
+    let out = sql("INSERT INTO vv (id, label) VALUES (1, 'c') \
+         ON CONFLICT (id) DO UPDATE SET hits = 100 WHERE vv.hits > 5 RETURNING *")
+    .unwrap();
+    assert!(out.rows.is_empty());
+    assert_eq!(ordered(&sql("SELECT * FROM vb").unwrap()), ["1|b|1"]);
+}
