@@ -331,6 +331,14 @@ pub(crate) fn try_cast(v: Value, data_type: &str) -> std::result::Result<Value, 
                     None => Err(format!("malformed array literal: \"{s}\"")),
                 }
             }
+            // A structured element (a jsonpath, range, address, geometric
+            // shape) is cast one element at a time, so its own error shows.
+            Value::Text(s) if crate::value::is_structured_element(element_type) => {
+                match crate::value::parse_array_literal(&s) {
+                    Some(items) => try_cast(Value::Array(items), data_type),
+                    None => Err(format!("malformed array literal: \"{s}\"")),
+                }
+            }
             Value::Text(s) => crate::value::coerce_array_text(&s, data_type)
                 .ok_or_else(|| format!("malformed array literal: \"{s}\"")),
             other => Err(format!(
@@ -564,6 +572,8 @@ fn scalar_binary_op(op: &sqlparser::ast::BinaryOperator) -> Option<ScalarBinaryO
         B::QuestionAnd => ScalarBinaryOp::JsonHasAllKeys,
         B::AtArrow => ScalarBinaryOp::Contains,
         B::ArrowAt => ScalarBinaryOp::ContainedBy,
+        B::AtQuestion => ScalarBinaryOp::JsonPathExists,
+        B::AtAt => ScalarBinaryOp::JsonPathMatch,
         B::PGOverlap => ScalarBinaryOp::Overlap,
         B::PGCustomBinaryOperator(parts) => match parts.last().map(String::as_str) {
             Some("=") => ScalarBinaryOp::Eq,
@@ -2836,6 +2846,37 @@ pub(crate) fn apply_binary_op(op: ScalarBinaryOp, l: Value, r: Value) -> Value {
                 Op::GtEq => ord != Less,
                 _ => return Value::Null,
             })
+        }
+        Op::JsonPathExists | Op::JsonPathMatch => {
+            if matches!(l, Value::Null) || matches!(r, Value::Null) {
+                return Value::Null;
+            }
+            let document = match &l {
+                Value::Jsonb(j) => j.clone(),
+                Value::Text(t) | Value::Json(t) => match crate::json_text::parse(t) {
+                    Ok(j) => j,
+                    Err(e) => return crate::eval_error::raise(e),
+                },
+                other => match crate::filter_eval::value_to_json(other) {
+                    Some(j) => j,
+                    None => return crate::eval_error::raise("invalid input syntax for type json"),
+                },
+            };
+            let path = match &r {
+                Value::Text(t) => t.clone(),
+                other => crate::render(other),
+            };
+            // The operators suppress a path failure and return NULL.
+            let result = if op == Op::JsonPathExists {
+                crate::jsonpath::exists(&document, &path, None, true)
+            } else {
+                crate::jsonpath::matches(&document, &path, None, true)
+            };
+            match result {
+                Ok(Some(b)) => Value::Bool(b),
+                Ok(None) => Value::Null,
+                Err(e) => crate::eval_error::raise(e),
+            }
         }
         Op::Concat => {
             // `jsonb || jsonb`, where an untyped literal side reads as jsonb.

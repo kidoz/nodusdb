@@ -337,6 +337,8 @@ fn binary_type(op: ScalarBinaryOp, left: Option<String>, right: Option<String>) 
         | Op::JsonHasAllKeys
         | Op::Contains
         | Op::ContainedBy
+        | Op::JsonPathExists
+        | Op::JsonPathMatch
         | Op::Overlap => Some("BOOLEAN".into()),
         Op::JsonGetText | Op::JsonPathText => Some("TEXT".into()),
         Op::JsonGet | Op::JsonPath => left,
@@ -1161,7 +1163,91 @@ pub(crate) fn check_integer_ranges(
                 .expect("checked by the guard");
             return bad_function(&op.sql_name().to_ascii_lowercase(), &side_name(side));
         }
+        // A jsonpath has no equality, so `IN`, `= ANY`, and `IS DISTINCT
+        // FROM` are all the missing `=` operator.
+        ScalarExpr::IsDistinctFrom { left, right, .. }
+            if is_jsonpath_type(left, column) || is_jsonpath_type(right, column) =>
+        {
+            return bad_operator(
+                &argument_type_name(left, column),
+                "=",
+                &argument_type_name(right, column),
+            );
+        }
+        ScalarExpr::InList { expr, list, .. } if is_jsonpath_type(expr, column) => {
+            let other = list
+                .first()
+                .map(|e| argument_type_name(e, column))
+                .unwrap_or_else(|| "unknown".to_string());
+            return bad_operator(&argument_type_name(expr, column), "=", &other);
+        }
+        ScalarExpr::Quantified { left, .. } if is_jsonpath_type(left, column) => {
+            return bad_operator(&argument_type_name(left, column), "=", "jsonpath");
+        }
         ScalarExpr::Binary { op, left, right } => {
+            // A jsonpath has no comparison operator in PostgreSQL.
+            if is_jsonpath_type(left, column) || is_jsonpath_type(right, column) {
+                let symbol = match op {
+                    ScalarBinaryOp::Eq => Some("="),
+                    ScalarBinaryOp::NotEq => Some("<>"),
+                    ScalarBinaryOp::Lt => Some("<"),
+                    ScalarBinaryOp::LtEq => Some("<="),
+                    ScalarBinaryOp::Gt => Some(">"),
+                    ScalarBinaryOp::GtEq => Some(">="),
+                    _ => None,
+                };
+                if let Some(symbol) = symbol {
+                    return bad_operator(
+                        &argument_type_name(left, column),
+                        symbol,
+                        &argument_type_name(right, column),
+                    );
+                }
+            }
+            // `jsonb @? jsonpath` and `jsonb @@ jsonpath`: left `jsonb`, right
+            // `jsonpath`; an untyped literal is read as either.
+            if matches!(
+                op,
+                ScalarBinaryOp::JsonPathExists | ScalarBinaryOp::JsonPathMatch
+            ) {
+                let untyped = |e: &ScalarExpr| {
+                    matches!(e, ScalarExpr::Literal(Value::Text(_)))
+                        || scalar_type(e, column)
+                            .is_none_or(|t| t.trim().is_empty() || t.eq_ignore_ascii_case("UNKNOWN"))
+                };
+                let is_jsonb = |e: &ScalarExpr| {
+                    untyped(e)
+                        || scalar_type(e, column).is_some_and(|t| crate::value::is_jsonb_type(&t))
+                };
+                let is_path = |e: &ScalarExpr| {
+                    untyped(e)
+                        || scalar_type(e, column).is_some_and(|t| crate::jsonpath::is_type(&t))
+                };
+                if !is_jsonb(left) || !is_path(right) {
+                    let symbol = if *op == ScalarBinaryOp::JsonPathExists {
+                        "@?"
+                    } else {
+                        "@@"
+                    };
+                    return bad_operator(
+                        &argument_type_name(left, column),
+                        symbol,
+                        &argument_type_name(right, column),
+                    );
+                }
+                // A literal path is the jsonpath it names, in canonical form.
+                let right = match right.as_ref() {
+                    ScalarExpr::Literal(Value::Text(text)) => {
+                        Box::new(jsonpath_literal(text))
+                    }
+                    other => Box::new(other.clone()),
+                };
+                return ScalarExpr::Binary {
+                    op: *op,
+                    left: left.clone(),
+                    right,
+                };
+            }
             if *op == ScalarBinaryOp::JsonHasAnyKey
                 && let (Some(left_kind), Some(right_kind)) = (geo_kind(left), geo_kind(right))
             {
@@ -2031,6 +2117,20 @@ pub(crate) const GEO_UNARY: &str = "__GEO_UNARY__";
 /// (`__BAD_COMPARISON__(type)`).
 pub(crate) const BAD_COMPARISON: &str = "__BAD_COMPARISON__";
 
+/// The `jsonb_path_*` functions (their `_tz` spellings included).
+pub(crate) const JSONPATH_FUNCTIONS: &[&str] = &[
+    "JSONB_PATH_EXISTS",
+    "JSONB_PATH_EXISTS_TZ",
+    "JSONB_PATH_MATCH",
+    "JSONB_PATH_MATCH_TZ",
+    "JSONB_PATH_QUERY",
+    "JSONB_PATH_QUERY_TZ",
+    "JSONB_PATH_QUERY_ARRAY",
+    "JSONB_PATH_QUERY_ARRAY_TZ",
+    "JSONB_PATH_QUERY_FIRST",
+    "JSONB_PATH_QUERY_FIRST_TZ",
+];
+
 /// The function `greatest`/`least` over a range or multirange is rewritten
 /// to: `__RANGE_GREATEST__(name, type, value...)`, picking by its order.
 pub(crate) const RANGE_GREATEST: &str = "__RANGE_GREATEST__";
@@ -2125,6 +2225,22 @@ fn bad_operator(left: &str, op: &str, right: &str) -> ScalarExpr {
 }
 
 /// The type name PostgreSQL's operator errors print for a declared type.
+/// A literal jsonpath argument: the text parsed and rewritten in canonical
+/// form, as a cast (an invalid path keeps its text and fails when cast, as
+/// PostgreSQL raises it).
+fn jsonpath_literal(text: &str) -> ScalarExpr {
+    let text = crate::jsonpath::canonical(text).unwrap_or_else(|_| text.to_string());
+    ScalarExpr::Cast {
+        expr: Box::new(ScalarExpr::Literal(Value::Text(text))),
+        target: "jsonpath".to_string(),
+    }
+}
+
+/// Whether an expression's declared type is `jsonpath`.
+fn is_jsonpath_type(expr: &ScalarExpr, column: &impl Fn(&str) -> Option<String>) -> bool {
+    scalar_type(expr, column).is_some_and(|t| crate::jsonpath::is_type(&t))
+}
+
 fn operator_type_name(data_type: &str) -> String {
     if let Some(kind) = crate::ranges::Kind::of(data_type) {
         return kind.name().to_string();

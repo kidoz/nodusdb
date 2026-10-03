@@ -883,6 +883,9 @@ pub enum ScalarBinaryOp {
     /// `@>` / `<@`: JSONB or array containment.
     Contains,
     ContainedBy,
+    /// `@?` / `@@`: does the jsonpath find anything / match as a predicate.
+    JsonPathExists,
+    JsonPathMatch,
     /// `&&`: the arrays share an element.
     Overlap,
 }

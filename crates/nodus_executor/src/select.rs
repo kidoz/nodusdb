@@ -946,6 +946,26 @@ impl MemExecutor {
                         alias: Some(format!("{op:?}").to_ascii_lowercase()),
                     }
                 }
+                // Only `count` and the collectors take a jsonpath.
+                ProjectionItem::Aggregate(op, arg)
+                    if !matches!(
+                        op,
+                        AggregateOp::Count
+                            | AggregateOp::ArrayAgg
+                            | AggregateOp::JsonAgg
+                            | AggregateOp::JsonbAgg
+                            | AggregateOp::JsonObjectAgg
+                            | AggregateOp::JsonbObjectAgg
+                    ) && column_type(&arg).is_some_and(|t| crate::jsonpath::is_type(&t)) =>
+                {
+                    ProjectionItem::Expr {
+                        expr: crate::result_types::bad_function(
+                            &op.sql_name().to_ascii_lowercase(),
+                            "jsonpath",
+                        ),
+                        alias: Some(format!("{op:?}").to_ascii_lowercase()),
+                    }
+                }
                 // Money has no `avg` (nor any variance aggregate); the
                 // collectors take it, and `sum` above.
                 ProjectionItem::Aggregate(op, arg)
@@ -1054,6 +1074,26 @@ impl MemExecutor {
                     "could not identify an equality operator for type {}",
                     kind.name()
                 ))
+                .code("42883")
+                .into_text()
+            );
+        }
+        // A jsonpath has neither equality nor ordering.
+        let jsonpath_grouped = group_by
+            .iter()
+            .filter_map(|name| column_type(name))
+            .any(|t| crate::jsonpath::is_type(&t))
+            || group_exprs.iter().any(|(name, expr)| {
+                crate::result_types::expr_type(expr, &column_type)
+                    .or_else(|| column_type(name))
+                    .is_some_and(|t| crate::jsonpath::is_type(&t))
+            });
+        if jsonpath_grouped {
+            anyhow::bail!(
+                "{}",
+                crate::error_fields::DbError::new(
+                    "could not identify an equality operator for type jsonpath"
+                )
                 .code("42883")
                 .into_text()
             );
@@ -2135,6 +2175,21 @@ impl MemExecutor {
                     .into_text()
                 );
             }
+            // A jsonpath has no default ordering operator class.
+            if key_types
+                .iter()
+                .any(|t| t.as_deref().is_some_and(crate::jsonpath::is_type))
+            {
+                anyhow::bail!(
+                    "{}",
+                    crate::error_fields::DbError::new(
+                        "could not identify an ordering operator for type jsonpath"
+                    )
+                    .code("42883")
+                    .hint("Use an explicit ordering operator or modify the query.")
+                    .into_text()
+                );
+            }
             let multirange_keys: Vec<Option<crate::ranges::Kind>> = key_types
                 .iter()
                 .map(|t| t.as_deref().and_then(crate::multiranges::kind_of))
@@ -2245,6 +2300,19 @@ impl MemExecutor {
                         "could not identify an equality operator for type {}",
                         kind.name()
                     ))
+                    .code("42883")
+                    .into_text()
+                );
+            }
+            if out_cols
+                .iter()
+                .any(|name| declared(name).is_some_and(|t| crate::jsonpath::is_type(&t)))
+            {
+                anyhow::bail!(
+                    "{}",
+                    crate::error_fields::DbError::new(
+                        "could not identify an equality operator for type jsonpath"
+                    )
                     .code("42883")
                     .into_text()
                 );

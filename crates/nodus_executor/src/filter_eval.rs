@@ -127,6 +127,14 @@ pub(crate) fn filter_column_refs(filter: &FilterExpr, out: &mut Vec<String>) {
     }
 }
 
+/// PostgreSQL's error for a jsonpath compared with anything.
+fn jsonpath_equality_error() -> String {
+    crate::error_fields::DbError::new("operator does not exist: jsonpath = jsonpath")
+        .code("42883")
+        .hint("No operator matches the given name and argument types. You might need to add explicit type casts.")
+        .into_text()
+}
+
 /// The column references in an expression (not inside its subqueries).
 pub(crate) fn scalar_column_refs(expr: &crate::ScalarExpr, out: &mut Vec<String>) {
     match expr {
@@ -342,6 +350,11 @@ impl MemExecutor {
                 };
                 let left_cell = row.get(idx).unwrap_or(&Value::Null);
 
+                if crate::jsonpath::is_type(&columns[idx].data_type) {
+                    crate::eval_error::raise(jsonpath_equality_error());
+                    return None;
+                }
+
                 if left_cell == &Value::Null {
                     return None;
                 }
@@ -396,6 +409,11 @@ impl MemExecutor {
                         )
                     }
                 };
+
+                if coerce_type.is_some_and(crate::jsonpath::is_type) {
+                    crate::eval_error::raise(jsonpath_equality_error());
+                    return None;
+                }
 
                 if left_cell == Value::Null {
                     return None;

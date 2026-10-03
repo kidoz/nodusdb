@@ -905,12 +905,15 @@ impl MemExecutor {
                 .find(|c| c.name == *column)
                 .map(|c| c.data_type.clone())
                 .unwrap_or_default();
-            if let Some(kind) = crate::geometric::Kind::of(&data_type) {
+            let no_btree_class = crate::geometric::Kind::of(&data_type)
+                .map(|kind| kind.name().to_string())
+                .or_else(|| crate::jsonpath::is_type(&data_type).then(|| "jsonpath".to_string()));
+            if let Some(name) = no_btree_class {
                 anyhow::bail!(
                     "{}",
                     crate::error_fields::DbError::new(format!(
                         "data type {} has no default operator class for access method \"btree\"",
-                        kind.name()
+                        name
                     ))
                     .code("42704")
                     .hint(
