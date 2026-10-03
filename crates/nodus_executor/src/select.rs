@@ -2198,6 +2198,14 @@ impl MemExecutor {
                 .iter()
                 .map(|t| t.as_deref().and_then(crate::net::Kind::of))
                 .collect();
+            let ts_keys: Vec<Option<&'static str>> = key_types
+                .iter()
+                .map(|t| match t.as_deref() {
+                    Some(t) if crate::textsearch::is_tsvector_type(t) => Some("tsvector"),
+                    Some(t) if crate::textsearch::is_tsquery_type(t) => Some("tsquery"),
+                    _ => None,
+                })
+                .collect();
             let key_cmp = |i: usize, a: &Value, b: &Value, asc: bool, nulls_first: Option<bool>| {
                 if interval_keys[i]
                     && let (Value::Text(l), Value::Text(r)) = (a, b)
@@ -2228,6 +2236,28 @@ impl MemExecutor {
                     && let (Value::Text(l), Value::Text(r)) = (a, b)
                 {
                     let ord = crate::net::cmp(kind, l, r);
+                    return if asc { ord } else { ord.reverse() };
+                }
+                if let Some(kind) = ts_keys[i]
+                    && let (Value::Text(l), Value::Text(r)) = (a, b)
+                {
+                    let ord = if kind == "tsvector" {
+                        match (
+                            crate::textsearch::parse_tsvector(l),
+                            crate::textsearch::parse_tsvector(r),
+                        ) {
+                            (Ok(l), Ok(r)) => crate::textsearch::tsvector_cmp(&l, &r),
+                            _ => std::cmp::Ordering::Equal,
+                        }
+                    } else {
+                        match (
+                            crate::textsearch::parse_tsquery(l),
+                            crate::textsearch::parse_tsquery(r),
+                        ) {
+                            (Ok(l), Ok(r)) => crate::textsearch::tsquery_cmp(&l, &r),
+                            _ => std::cmp::Ordering::Equal,
+                        }
+                    };
                     return if asc { ord } else { ord.reverse() };
                 }
                 order_cmp(a, b, asc, nulls_first)

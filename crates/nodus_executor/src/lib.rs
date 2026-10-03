@@ -65,6 +65,7 @@ mod subqueries;
 mod system_views;
 mod table_functions;
 mod temp_tables;
+mod textsearch;
 mod timezone;
 mod transactions;
 mod updatable_views;

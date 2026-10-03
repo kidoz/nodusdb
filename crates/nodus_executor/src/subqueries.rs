@@ -138,6 +138,8 @@ impl MemExecutor {
                         || crate::multiranges::is_multirange_type(t)
                         || crate::net::is_net_type(t)
                         || crate::geometric::is_geometric_type(t)
+                        || crate::textsearch::is_tsvector_type(t)
+                        || crate::textsearch::is_tsquery_type(t)
                 });
             types.push(unify_column(&mut values, column, declared)?);
         }
@@ -199,6 +201,8 @@ fn unify_column(
                     || crate::multiranges::is_multirange_type(&target)
                     || crate::net::is_net_type(&target)
                     || crate::geometric::is_geometric_type(&target)
+                    || crate::textsearch::is_tsvector_type(&target)
+                    || crate::textsearch::is_tsquery_type(&target)
                 {
                     return Ok(target);
                 }

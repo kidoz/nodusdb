@@ -609,6 +609,28 @@ pub(crate) fn check_integer_ranges(
                 None => {}
             }
         }
+        // A tsvector or tsquery casts to text-family types only, and never
+        // to the other of the pair (`tsvector::tsquery` has no cast).
+        ScalarExpr::Cast { expr: inner, target }
+            if let Some(kind) = ts_kind(inner, column)
+                && !is_text_type(target)
+                && !ts_kind(
+                    &ScalarExpr::Cast {
+                        expr: Box::new((**inner).clone()),
+                        target: target.clone(),
+                    },
+                    column,
+                )
+                .is_some_and(|t| t == kind) =>
+        {
+            return ScalarExpr::Function {
+                name: BAD_RANGE_CAST.to_string(),
+                args: vec![
+                    ScalarExpr::Literal(Value::Text(kind.to_string())),
+                    ScalarExpr::Literal(Value::Text(operator_type_name(target))),
+                ],
+            };
+        }
         // A jsonpath casts to text-family types only; anything else
         // (`jsonpath::jsonb`, `jsonpath::integer`) has no cast.
         ScalarExpr::Cast { expr: inner, target }
@@ -2160,6 +2182,26 @@ pub(crate) const GEO_UNARY: &str = "__GEO_UNARY__";
 /// The error a call needing a comparison function is rewritten to
 /// (`__BAD_COMPARISON__(type)`).
 pub(crate) const BAD_COMPARISON: &str = "__BAD_COMPARISON__";
+
+/// The function a text-search operator is rewritten to:
+/// `__TS__(symbol, left, right, kind)`.
+pub(crate) const TS_OP: &str = "__TS__";
+/// The function a text-search comparison is rewritten to:
+/// `__TSCMP__(symbol, left, right, kind)`.
+pub(crate) const TS_CMP: &str = "__TSCMP__";
+/// `!!query`: the text-search negation.
+pub(crate) const TS_NOT: &str = "__TSNOT__";
+/// `length(tsvector)`, which shares its name with the text length.
+pub(crate) const TS_LENGTH: &str = "__TSLEN__";
+
+/// The text-search type an expression's declared type names.
+fn ts_kind(expr: &ScalarExpr, column: &impl Fn(&str) -> Option<String>) -> Option<&'static str> {
+    match scalar_type(expr, column).as_deref() {
+        Some(t) if crate::textsearch::is_tsvector_type(t) => Some("tsvector"),
+        Some(t) if crate::textsearch::is_tsquery_type(t) => Some("tsquery"),
+        _ => None,
+    }
+}
 
 /// The `jsonb_path_*` functions (their `_tz` spellings included).
 pub(crate) const JSONPATH_FUNCTIONS: &[&str] = &[

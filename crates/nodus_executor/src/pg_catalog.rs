@@ -1855,6 +1855,77 @@ impl MemExecutor {
             ]);
         }
         rows.extend(self.user_type_rows(db_name));
+        // The text-search types and their array types.
+        for (oid, name, array_oid, storage) in
+            [(3614, "tsvector", 3643, "x"), (3615, "tsquery", 3645, "p")]
+        {
+            rows.push(vec![
+                Value::Int(oid),
+                Value::Text(name.into()),
+                Value::Int(pg_ns),
+                Value::Int(10),
+                Value::Int(-1),
+                Value::Bool(false),
+                Value::Text("b".into()),
+                Value::Text("U".into()),
+                Value::Bool(false),
+                Value::Bool(true),
+                Value::Text(",".into()),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Int(array_oid),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Text("i".into()),
+                Value::Text(storage.into()),
+                Value::Bool(false),
+                Value::Int(0),
+                Value::Int(-1),
+                Value::Int(0),
+                Value::Int(100),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+            ]);
+            rows.push(vec![
+                Value::Int(array_oid),
+                Value::Text(format!("_{name}")),
+                Value::Int(pg_ns),
+                Value::Int(10),
+                Value::Int(-1),
+                Value::Bool(false),
+                Value::Text("b".into()),
+                Value::Text("A".into()),
+                Value::Bool(false),
+                Value::Bool(true),
+                Value::Text(",".into()),
+                Value::Int(0),
+                Value::Int(oid),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Int(750),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Text("i".into()),
+                Value::Text("x".into()),
+                Value::Bool(false),
+                Value::Int(0),
+                Value::Int(-1),
+                Value::Int(1),
+                Value::Int(100),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+            ]);
+        }
         // The `jsonpath` type and its array type.
         rows.push(vec![
             Value::Int(4072),
@@ -3346,3 +3417,4 @@ pub(crate) fn catalog_view_definition(view: &nodus_catalog::TableDescriptor) -> 
     let plan: crate::LogicalPlan = serde_json::from_str(query).ok()?;
     crate::explain::deparse_query(&plan).map(|sql| format!("{sql};"))
 }
+

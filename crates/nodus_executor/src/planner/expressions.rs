@@ -281,6 +281,30 @@ pub(crate) fn try_cast(v: Value, data_type: &str) -> std::result::Result<Value, 
             .into_text()),
         };
     }
+    // A tsvector or tsquery takes its literal form, rewritten in canonical
+    // spelling.
+    if crate::textsearch::is_tsvector_type(data_type) {
+        return match v {
+            Value::Text(text) => crate::textsearch::tsvector_canonical(&text).map(Value::Text),
+            other => Err(crate::error_fields::DbError::new(format!(
+                "cannot cast type {} to tsvector",
+                crate::value::value_type_name(&other)
+            ))
+            .code("42846")
+            .into_text()),
+        };
+    }
+    if crate::textsearch::is_tsquery_type(data_type) {
+        return match v {
+            Value::Text(text) => crate::textsearch::tsquery_canonical(&text).map(Value::Text),
+            other => Err(crate::error_fields::DbError::new(format!(
+                "cannot cast type {} to tsquery",
+                crate::value::value_type_name(&other)
+            ))
+            .code("42846")
+            .into_text()),
+        };
+    }
     // A jsonpath takes its literal form: the path is parsed and rewritten in
     // PostgreSQL's canonical spelling.
     if crate::jsonpath::is_type(data_type) {

@@ -361,6 +361,12 @@ pub(crate) fn return_type(name: &str, arg_types: &[Option<String>]) -> Option<St
                 });
             }
             "GEN_RANDOM_UUID" | "UUIDV4" | "UUIDV7" => "UUID",
+            "TSQUERY_PHRASE" | "__TSNOT__" => "TSQUERY",
+            "__TSCMP__" => "BOOLEAN",
+            "__TS__" => match arg_types.first().cloned().flatten().as_deref() {
+                Some("&&") | Some("||") | Some("<->") => "TSQUERY",
+                _ => "BOOLEAN",
+            },
             "TO_JSONB" | "JSONB_BUILD_OBJECT" | "JSONB_BUILD_ARRAY" | "JSONB_EXTRACT_PATH"
             | "JSONB_SET" | "JSONB_STRIP_NULLS" | "JSONB_INSERT" | "JSONB_SET_LAX" => "JSONB",
             "JSONB_PATH_EXISTS"
@@ -1205,6 +1211,22 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
                 .map(text)
                 .unwrap_or_default()
                 .to_ascii_uppercase();
+            // A text-search value is measured by its stored binary form.
+            if matches!(ty.as_str(), "TSVECTOR" | "TSQUERY") {
+                let size = if ty == "TSVECTOR" {
+                    crate::textsearch::parse_tsvector(&text(arg(0)))
+                        .ok()
+                        .map(|v| v.stored_size())
+                } else {
+                    crate::textsearch::parse_tsquery(&text(arg(0)))
+                        .ok()
+                        .map(|q| q.stored_size())
+                };
+                return match size {
+                    Some(size) => Some(Value::Int(size as i64)),
+                    None => Some(raise("invalid input syntax")),
+                };
+            }
             let fixed = match ty.as_str() {
                 "BOOLEAN" | "BOOL" | "\"CHAR\"" => Some(1),
                 "SMALLINT" | "INT2" => Some(2),
@@ -3659,6 +3681,8 @@ fn format_type(oid: i64, typmod: Option<i64>) -> String {
         2950 => "uuid",
         3802 => "jsonb",
         4072 => "jsonpath",
+        3614 => "tsvector",
+        3615 => "tsquery",
         4089 => "regnamespace",
         4096 => "regrole",
         1000 => "boolean[]",
@@ -3679,6 +3703,8 @@ fn format_type(oid: i64, typmod: Option<i64>) -> String {
         2951 => "uuid[]",
         3807 => "jsonb[]",
         4073 => "jsonpath[]",
+        3643 => "tsvector[]",
+        3645 => "tsquery[]",
         3904 => "int4range",
         3926 => "int8range",
         3906 => "numrange",
