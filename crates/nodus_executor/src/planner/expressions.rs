@@ -281,6 +281,19 @@ pub(crate) fn try_cast(v: Value, data_type: &str) -> std::result::Result<Value, 
             .into_text()),
         };
     }
+    // A jsonpath takes its literal form: the path is parsed and rewritten in
+    // PostgreSQL's canonical spelling.
+    if crate::jsonpath::is_type(data_type) {
+        return match v {
+            Value::Text(text) => crate::jsonpath::canonical(&text).map(Value::Text),
+            other => Err(crate::error_fields::DbError::new(format!(
+                "cannot cast type {} to jsonpath",
+                crate::value::value_type_name(&other)
+            ))
+            .code("42846")
+            .into_text()),
+        };
+    }
     // A network-family type takes its literal form; a number is a money
     // amount. Any other value is not castable to one.
     if let Some(kind) = crate::net::Kind::of(data_type) {

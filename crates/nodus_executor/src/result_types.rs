@@ -607,6 +607,21 @@ pub(crate) fn check_integer_ranges(
                 None => {}
             }
         }
+        // A jsonpath casts to text-family types only; anything else
+        // (`jsonpath::jsonb`, `jsonpath::integer`) has no cast.
+        ScalarExpr::Cast { expr: inner, target }
+            if scalar_type(inner, column).is_some_and(|t| crate::jsonpath::is_type(&t))
+                && !is_text_type(target)
+                && !crate::jsonpath::is_type(target) =>
+        {
+            return ScalarExpr::Function {
+                name: BAD_RANGE_CAST.to_string(),
+                args: vec![
+                    ScalarExpr::Literal(Value::Text("jsonpath".to_string())),
+                    ScalarExpr::Literal(Value::Text(operator_type_name(target))),
+                ],
+            };
+        }
         // Casts between geometric types: only PostgreSQL's casts exist.
         ScalarExpr::Cast { expr: inner, target }
             if let (Some(from), Some(to)) = (geo_kind(inner), crate::geometric::Kind::of(target)) =>

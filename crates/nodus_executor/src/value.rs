@@ -474,7 +474,8 @@ pub(crate) fn coerce_for_column(value: &Value, data_type: &str) -> Value {
                 || crate::ranges::is_range_type(data_type)
                 || crate::multiranges::is_multirange_type(data_type)
                 || crate::net::is_net_type(data_type)
-                || crate::geometric::is_geometric_type(data_type) =>
+                || crate::geometric::is_geometric_type(data_type)
+                || crate::jsonpath::is_type(data_type) =>
         {
             crate::planner::cast_value(value.clone(), data_type)
         }
@@ -557,6 +558,17 @@ pub(crate) fn value_type_name(value: &Value) -> &'static str {
         Value::Bytea(_) => "bytea",
         Value::Null => "unknown",
     }
+}
+
+/// Whether a declared type is one whose values are canonical text (a range,
+/// multirange, address, money amount, geometric shape, or jsonpath), so an
+/// array of one casts its elements one by one.
+pub(crate) fn is_structured_element(data_type: &str) -> bool {
+    crate::jsonpath::is_type(data_type)
+        || crate::ranges::is_range_type(data_type)
+        || crate::multiranges::is_multirange_type(data_type)
+        || crate::net::is_net_type(data_type)
+        || crate::geometric::is_geometric_type(data_type)
 }
 
 /// Element type of an array type name (`INT[]`, `text[][]`), or `None` for a

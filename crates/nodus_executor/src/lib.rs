@@ -38,6 +38,7 @@ mod geometric;
 mod index_keys;
 mod information_schema;
 mod json_text;
+mod jsonpath;
 mod merge;
 mod multiranges;
 mod net;
