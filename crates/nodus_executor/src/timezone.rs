@@ -165,6 +165,9 @@ pub(crate) enum Shown {
     Zoned,
     /// A `tstzrange`: its bounds move to the session's zone.
     RangeZoned,
+    /// A network-family type: its display form (`inet` without the longest
+    /// mask, money with its symbol).
+    Net(crate::net::Kind),
     Padded(usize),
 }
 
@@ -183,6 +186,9 @@ pub(crate) fn output_forms(types: &[String]) -> Option<Vec<Shown>> {
             }
             if !utc && crate::ranges::Kind::of(base) == Some(crate::ranges::Kind::TimestampTz) {
                 return Shown::RangeZoned;
+            }
+            if let Some(kind) = crate::net::Kind::of(base) {
+                return Shown::Net(kind);
             }
             match crate::value::character_limit(t) {
                 Some((length, true)) => Shown::Padded(length),
@@ -209,10 +215,18 @@ pub(crate) fn show_row(values: &mut [crate::Value], forms: &[Shown]) {
             _ => {}
         }
     }
+    fn show_net(value: &mut crate::Value, kind: crate::net::Kind) {
+        match value {
+            crate::Value::Text(text) => *text = crate::net::show(kind, text),
+            crate::Value::Array(items) => items.iter_mut().for_each(|v| show_net(v, kind)),
+            _ => {}
+        }
+    }
     for (value, form) in values.iter_mut().zip(forms) {
         match form {
             Shown::Zoned => localize(value),
             Shown::RangeZoned => localize_range(value),
+            Shown::Net(kind) => show_net(value, *kind),
             Shown::Padded(length) => {
                 if let crate::Value::Text(text) = value {
                     *text = crate::value::pad_character(text, *length);

@@ -38,6 +38,7 @@ mod index_keys;
 mod information_schema;
 mod json_text;
 mod merge;
+mod net;
 pub mod numeric;
 mod parameters;
 mod pg_catalog;

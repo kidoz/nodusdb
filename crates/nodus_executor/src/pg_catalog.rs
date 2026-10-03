@@ -1848,6 +1848,81 @@ impl MemExecutor {
             ]);
         }
         rows.extend(self.user_type_rows(db_name));
+        // The network-family types and their array types.
+        for kind in crate::net::KINDS {
+            let (category, len, byval, align, storage) = match kind {
+                crate::net::Kind::Inet | crate::net::Kind::Cidr => ("I", -1, false, "i", "m"),
+                crate::net::Kind::MacAddr => ("U", 6, false, "i", "p"),
+                crate::net::Kind::MacAddr8 => ("U", 8, false, "i", "p"),
+                crate::net::Kind::Money => ("N", 8, true, "d", "p"),
+            };
+            rows.push(vec![
+                Value::Int(kind.oid()),
+                Value::Text(kind.name().into()),
+                Value::Int(pg_ns),
+                Value::Int(10),
+                Value::Int(len),
+                Value::Bool(byval),
+                Value::Text("b".into()),
+                Value::Text(category.into()),
+                Value::Bool(false),
+                Value::Bool(true),
+                Value::Text(",".into()),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Int(kind.array_oid()),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Text(align.into()),
+                Value::Text(storage.into()),
+                Value::Bool(false),
+                Value::Int(0),
+                Value::Int(-1),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+            ]);
+            rows.push(vec![
+                Value::Int(kind.array_oid()),
+                Value::Text(format!("_{}", kind.name())),
+                Value::Int(pg_ns),
+                Value::Int(10),
+                Value::Int(-1),
+                Value::Bool(false),
+                Value::Text("b".into()),
+                Value::Text("A".into()),
+                Value::Bool(false),
+                Value::Bool(true),
+                Value::Text(",".into()),
+                Value::Int(0),
+                Value::Int(kind.oid()),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Text(align.into()),
+                Value::Text("x".into()),
+                Value::Bool(false),
+                Value::Int(0),
+                Value::Int(-1),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+            ]);
+        }
         // The range types and their array types.
         for kind in crate::ranges::KINDS {
             rows.push(vec![

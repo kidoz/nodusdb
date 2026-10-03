@@ -464,7 +464,8 @@ pub(crate) fn coerce_for_column(value: &Value, data_type: &str) -> Value {
         Value::Text(_)
             if column_type(data_type) != ColumnType::Text
                 || crate::datetime::Kind::of_type(data_type).is_some()
-                || crate::ranges::is_range_type(data_type) =>
+                || crate::ranges::is_range_type(data_type)
+                || crate::net::is_net_type(data_type) =>
         {
             crate::planner::cast_value(value.clone(), data_type)
         }
