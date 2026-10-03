@@ -135,6 +135,7 @@ impl MemExecutor {
                 .find(|t| {
                     crate::datetime::Kind::of_type(t).is_some()
                         || crate::ranges::is_range_type(t)
+                        || crate::multiranges::is_multirange_type(t)
                         || crate::net::is_net_type(t)
                 });
             types.push(unify_column(&mut values, column, declared)?);
@@ -193,7 +194,10 @@ fn unify_column(
             if let Some(target) = declared {
                 // A range or network-family column keeps its declared type;
                 // its text is stored canonical already.
-                if crate::ranges::is_range_type(&target) || crate::net::is_net_type(&target) {
+                if crate::ranges::is_range_type(&target)
+                    || crate::multiranges::is_multirange_type(&target)
+                    || crate::net::is_net_type(&target)
+                {
                     return Ok(target);
                 }
                 convert_all(rows, column, &target)?;

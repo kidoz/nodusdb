@@ -187,6 +187,9 @@ pub(crate) fn output_forms(types: &[String]) -> Option<Vec<Shown>> {
             if !utc && crate::ranges::Kind::of(base) == Some(crate::ranges::Kind::TimestampTz) {
                 return Shown::RangeZoned;
             }
+            if !utc && crate::multiranges::kind_of(base) == Some(crate::ranges::Kind::TimestampTz) {
+                return Shown::RangeZoned;
+            }
             if let Some(kind) = crate::net::Kind::of(base) {
                 return Shown::Net(kind);
             }
@@ -208,6 +211,13 @@ pub(crate) fn show_row(values: &mut [crate::Value], forms: &[Shown]) {
             _ => {}
         }
     }
+    fn localize_multirange(value: &mut crate::Value) {
+        match value {
+            crate::Value::Text(text) => *text = crate::multiranges::localize(text),
+            crate::Value::Array(items) => items.iter_mut().for_each(localize_multirange),
+            _ => {}
+        }
+    }
     fn localize_range(value: &mut crate::Value) {
         match value {
             crate::Value::Text(text) => *text = crate::ranges::localize(text),
@@ -225,7 +235,10 @@ pub(crate) fn show_row(values: &mut [crate::Value], forms: &[Shown]) {
     for (value, form) in values.iter_mut().zip(forms) {
         match form {
             Shown::Zoned => localize(value),
-            Shown::RangeZoned => localize_range(value),
+            Shown::RangeZoned => {
+                localize_range(value);
+                localize_multirange(value);
+            }
             Shown::Net(kind) => show_net(value, *kind),
             Shown::Padded(length) => {
                 if let crate::Value::Text(text) = value {

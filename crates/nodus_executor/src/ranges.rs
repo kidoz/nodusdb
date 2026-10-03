@@ -141,6 +141,64 @@ pub(crate) const KINDS: [Kind; 6] = [
     Kind::TimestampTz,
 ];
 
+impl Kind {
+    /// The multirange type over this subtype (`int4multirange`).
+    pub(crate) fn multirange_name(self) -> &'static str {
+        match self {
+            Kind::Int4 => "int4multirange",
+            Kind::Int8 => "int8multirange",
+            Kind::Numeric => "nummultirange",
+            Kind::Date => "datemultirange",
+            Kind::Timestamp => "tsmultirange",
+            Kind::TimestampTz => "tstzmultirange",
+        }
+    }
+
+    pub(crate) fn multirange_oid(self) -> i64 {
+        match self {
+            Kind::Int4 => 4451,
+            Kind::Int8 => 4536,
+            Kind::Numeric => 4532,
+            Kind::Date => 4535,
+            Kind::Timestamp => 4533,
+            Kind::TimestampTz => 4534,
+        }
+    }
+
+    pub(crate) fn multirange_array_oid(self) -> i64 {
+        match self {
+            Kind::Int4 => 6150,
+            Kind::Int8 => 6157,
+            Kind::Numeric => 6151,
+            Kind::Date => 6155,
+            Kind::Timestamp => 6152,
+            Kind::TimestampTz => 6153,
+        }
+    }
+
+    /// `pg_type.typalign` of the multirange type.
+    pub(crate) fn multirange_align(self) -> char {
+        match self {
+            Kind::Int4 | Kind::Numeric | Kind::Date => 'i',
+            Kind::Int8 | Kind::Timestamp | Kind::TimestampTz => 'd',
+        }
+    }
+
+    /// The range subtype a declared multirange type names.
+    pub(crate) fn of_multirange(data_type: &str) -> Option<Kind> {
+        let upper = data_type.trim().to_ascii_uppercase();
+        let name = upper.rsplit_once('.').map_or(upper.as_str(), |(_, n)| n);
+        KINDS
+            .into_iter()
+            .find(|kind| kind.multirange_name().to_ascii_uppercase() == name.trim_matches('"'))
+    }
+
+    /// The multirange type an OID names, for `pg_type` and `format_type`.
+    pub(crate) fn of_multirange_oid(oid: i64) -> Option<Kind> {
+        KINDS.into_iter().find(|kind| kind.multirange_oid() == oid)
+    }
+}
+
 /// A range's bound: its value as canonical subtype text, or none when
 /// unbounded, and whether the bound is included.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -170,7 +228,7 @@ fn not_contiguous(what: &str) -> String {
 
 /// The subtype's own reading of a bound's text (`invalid input syntax for
 /// type integer: "x"` and the like).
-fn typed(kind: Kind, raw: &str) -> Result<String, String> {
+pub(crate) fn typed(kind: Kind, raw: &str) -> Result<String, String> {
     crate::planner::try_cast(Value::Text(raw.to_string()), kind.subtype()).map(
         |value| match value {
             Value::Text(text) => text,
@@ -217,7 +275,7 @@ fn next_value(kind: Kind, value: &str) -> Result<String, String> {
 
 /// The comparison of two bound values of the same subtype: numeric subtypes
 /// compare by value, and canonical date and timestamp text chronologically.
-fn cmp_value(kind: Kind, a: &str, b: &str) -> std::cmp::Ordering {
+pub(crate) fn cmp_value(kind: Kind, a: &str, b: &str) -> std::cmp::Ordering {
     match kind {
         Kind::Int4 | Kind::Int8 => match (a.parse::<i64>(), b.parse::<i64>()) {
             (Ok(x), Ok(y)) => x.cmp(&y),
@@ -564,7 +622,7 @@ pub(crate) fn cmp_ranges(kind: Kind, a: &Range, b: &Range) -> std::cmp::Ordering
 }
 
 /// Whether `outer` contains `inner`.
-fn contains_range(kind: Kind, outer: &Range, inner: &Range) -> bool {
+pub(crate) fn contains_range(kind: Kind, outer: &Range, inner: &Range) -> bool {
     let (
         Range::Bounds {
             lower: l1,
@@ -600,7 +658,7 @@ fn contains_range(kind: Kind, outer: &Range, inner: &Range) -> bool {
 }
 
 /// Whether a range contains an element.
-fn contains_element(kind: Kind, range: &Range, element: &str) -> bool {
+pub(crate) fn contains_element(kind: Kind, range: &Range, element: &str) -> bool {
     let Range::Bounds { lower, upper } = range else {
         return false;
     };
@@ -624,7 +682,7 @@ fn contains_element(kind: Kind, range: &Range, element: &str) -> bool {
 }
 
 /// Whether two ranges share any element.
-fn overlaps(kind: Kind, a: &Range, b: &Range) -> bool {
+pub(crate) fn overlaps(kind: Kind, a: &Range, b: &Range) -> bool {
     let (
         Range::Bounds {
             lower: l1,
@@ -659,7 +717,7 @@ fn bound_below(kind: Kind, a: &Bound, b: &Bound) -> bool {
 
 /// Whether `a` lies strictly left of `b` (its upper bound at or below `b`'s
 /// lower bound).
-fn strictly_left(kind: Kind, a: &Range, b: &Range) -> bool {
+pub(crate) fn strictly_left(kind: Kind, a: &Range, b: &Range) -> bool {
     let (Range::Bounds { upper: u1, .. }, Range::Bounds { lower: l2, .. }) = (a, b) else {
         return false;
     };
@@ -667,7 +725,7 @@ fn strictly_left(kind: Kind, a: &Range, b: &Range) -> bool {
 }
 
 /// Whether `a` lies strictly right of `b`.
-fn strictly_right(kind: Kind, a: &Range, b: &Range) -> bool {
+pub(crate) fn strictly_right(kind: Kind, a: &Range, b: &Range) -> bool {
     let (Range::Bounds { lower: l1, .. }, Range::Bounds { upper: u2, .. }) = (a, b) else {
         return false;
     };
@@ -675,7 +733,7 @@ fn strictly_right(kind: Kind, a: &Range, b: &Range) -> bool {
 }
 
 /// Whether `a` does not extend to the right of `b`.
-fn not_right_of(kind: Kind, a: &Range, b: &Range) -> bool {
+pub(crate) fn not_right_of(kind: Kind, a: &Range, b: &Range) -> bool {
     let (Range::Bounds { upper: u1, .. }, Range::Bounds { upper: u2, .. }) = (a, b) else {
         return false;
     };
@@ -683,7 +741,7 @@ fn not_right_of(kind: Kind, a: &Range, b: &Range) -> bool {
 }
 
 /// Whether `a` does not extend to the left of `b`.
-fn not_left_of(kind: Kind, a: &Range, b: &Range) -> bool {
+pub(crate) fn not_left_of(kind: Kind, a: &Range, b: &Range) -> bool {
     let (Range::Bounds { lower: l1, .. }, Range::Bounds { lower: l2, .. }) = (a, b) else {
         return false;
     };
@@ -692,7 +750,7 @@ fn not_left_of(kind: Kind, a: &Range, b: &Range) -> bool {
 
 /// Whether the ranges touch: an upper bound equal to a lower bound with
 /// exactly one of them inclusive.
-fn adjacent(kind: Kind, a: &Range, b: &Range) -> bool {
+pub(crate) fn adjacent(kind: Kind, a: &Range, b: &Range) -> bool {
     let (Range::Bounds { upper: u1, .. }, Range::Bounds { lower: l2, .. }) = (a, b) else {
         return false;
     };
@@ -705,7 +763,7 @@ fn adjacent(kind: Kind, a: &Range, b: &Range) -> bool {
 }
 
 /// The union of two contiguous ranges.
-fn union(kind: Kind, a: &Range, b: &Range) -> Result<Range, String> {
+pub(crate) fn union(kind: Kind, a: &Range, b: &Range) -> Result<Range, String> {
     match (a, b) {
         (Range::Empty, other) | (other, Range::Empty) => Ok(other.clone()),
         (
@@ -737,7 +795,7 @@ fn union(kind: Kind, a: &Range, b: &Range) -> Result<Range, String> {
 }
 
 /// The intersection of two ranges (`empty` when they do not overlap).
-fn intersection(kind: Kind, a: &Range, b: &Range) -> Range {
+pub(crate) fn intersection(kind: Kind, a: &Range, b: &Range) -> Range {
     if !overlaps(kind, a, b) {
         return Range::Empty;
     }
@@ -773,7 +831,7 @@ fn intersection(kind: Kind, a: &Range, b: &Range) -> Range {
 
 /// The difference of two ranges, which is a range only when a single piece
 /// remains.
-fn difference(kind: Kind, a: &Range, b: &Range) -> Result<Range, String> {
+pub(crate) fn difference(kind: Kind, a: &Range, b: &Range) -> Result<Range, String> {
     match (a, b) {
         (Range::Empty, _) => Ok(Range::Empty),
         (_, Range::Empty) => Ok(a.clone()),
@@ -851,7 +909,7 @@ pub(crate) fn range_merge(kind: Kind, a: &str, b: &str) -> Result<Value, String>
 }
 
 /// A range operand as canonical text read back into its bounds.
-fn canonical_range(kind: Kind, text: &str) -> Result<Range, String> {
+pub(crate) fn canonical_range(kind: Kind, text: &str) -> Result<Range, String> {
     parse(&from_literal(kind, text)?)
 }
 
