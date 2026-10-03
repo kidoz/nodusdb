@@ -920,6 +920,50 @@ pub(crate) fn check_integer_ranges(
                 .collect();
             return bad_function_args(&name.to_ascii_lowercase(), &types);
         }
+        // The jsonpath functions: the document must be `jsonb` and the path
+        // `jsonpath` (an untyped literal reads as either; a typed `text`
+        // value is refused, as PostgreSQL refuses it).
+        ScalarExpr::Function { name, args }
+            if JSONPATH_FUNCTIONS.iter().any(|f| f.eq_ignore_ascii_case(name)) =>
+        {
+            let untyped = |e: &ScalarExpr| {
+                matches!(e, ScalarExpr::Literal(Value::Text(_)))
+                    || scalar_type(e, column)
+                        .is_none_or(|t| t.trim().is_empty() || t.eq_ignore_ascii_case("UNKNOWN"))
+            };
+            let is_jsonb = |e: &ScalarExpr| {
+                untyped(e) || scalar_type(e, column).is_some_and(|t| crate::value::is_jsonb_type(&t))
+            };
+            let is_path = |e: &ScalarExpr| {
+                untyped(e) || scalar_type(e, column).is_some_and(|t| crate::jsonpath::is_type(&t))
+            };
+            let is_silent = |e: &ScalarExpr| {
+                untyped(e)
+                    || scalar_type(e, column)
+                        .is_some_and(|t| t.to_ascii_uppercase().trim() == "BOOLEAN")
+            };
+            let ok = matches!(args.len(), 2..=4)
+                && is_jsonb(&args[0])
+                && is_path(&args[1])
+                && args.get(2).is_none_or(|e| is_jsonb(e))
+                && args.get(3).is_none_or(|e| is_silent(e));
+            if !ok {
+                let types: Vec<String> = args
+                    .iter()
+                    .map(|arg| argument_type_name(arg, column))
+                    .collect();
+                return bad_function_args(&name.to_ascii_lowercase(), &types);
+            }
+            // A literal path is the jsonpath it names, in canonical form.
+            let mut args = args.clone();
+            if let Some(ScalarExpr::Literal(Value::Text(text))) = args.get(1) {
+                args[1] = jsonpath_literal(text);
+            }
+            return ScalarExpr::Function {
+                name: name.clone(),
+                args,
+            };
+        }
         // A custom operator (`@>`, `&&`, `<@`, ...) once its subtype is
         // known; `<@` reads as `@>` with its operands swapped, and with no
         // range operand the operator keeps its former meaning (`jsonb @>`).

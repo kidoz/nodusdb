@@ -61,6 +61,9 @@
 1171	date_part	f	2	701	25 1184	f	s	t	0	0
 1172	date_part	f	2	701	25 1186	f	i	t	0	0
 1175	justify_hours	f	1	1186	1186	f	i	t	0	0
+1177	jsonb_path_exists_tz	f	4	16	3802 4072 3802 16	f	s	t	0	2
+1179	jsonb_path_query_tz	f	4	3802	3802 4072 3802 16	t	s	t	0	2
+1180	jsonb_path_query_array_tz	f	4	3802	3802 4072 3802 16	f	s	t	0	2
 1181	age	f	1	23	28	f	s	t	0	0
 1191	generate_subscripts	f	3	23	2277 23 16	t	i	t	0	0
 1192	generate_subscripts	f	2	23	2277 23	t	i	t	0	0
@@ -213,6 +216,8 @@
 2015	btrim	f	2	17	17 17	f	i	t	0	0
 2020	date_trunc	f	2	1114	25 1114	f	i	t	0	0
 2021	date_part	f	2	701	25 1114	f	i	t	0	0
+2023	jsonb_path_query_first_tz	f	4	3802	3802 4072 3802 16	f	s	t	0	2
+2030	jsonb_path_match_tz	f	4	16	3802 4072 3802 16	f	s	t	0	2
 2026	pg_backend_pid	f	0	23		f	s	t	0	0
 2034	pg_conf_load_time	f	0	1184		f	s	t	0	0
 2037	timezone	f	2	1266	25 1266	f	s	t	0	0
@@ -603,6 +608,13 @@
 3988	percent_rank	a	1	701	2276	f	i	f	2276	0
 3990	cume_dist	a	1	701	2276	f	i	f	2276	0
 3992	dense_rank	a	1	20	2276	f	i	f	2276	0
+4005	jsonb_path_exists	f	4	16	3802 4072 3802 16	f	i	t	0	2
+4006	jsonb_path_query	f	4	3802	3802 4072 3802 16	t	i	t	0	2
+4007	jsonb_path_query_array	f	4	3802	3802 4072 3802 16	f	i	t	0	2
+4008	jsonb_path_query_first	f	4	3802	3802 4072 3802 16	f	i	t	0	2
+4009	jsonb_path_match	f	4	16	3802 4072 3802 16	f	i	t	0	2
+4010	jsonb_path_exists_opr	f	2	16	3802 4072	f	i	t	0	0
+4011	jsonb_path_match_opr	f	2	16	3802 4072	f	i	t	0	0
 4053	array_agg	a	1	2277	2277	f	i	f	0	0
 4086	to_regnamespace	f	1	4089	25	f	s	t	0	0
 4093	to_regrole	f	1	4096	25	f	s	t	0	0

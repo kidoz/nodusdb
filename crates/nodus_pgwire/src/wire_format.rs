@@ -38,6 +38,7 @@ pub(crate) fn sqlstate_for_execution_error(err_str: &str) -> &'static str {
         "40001" // serialization_failure
     } else if err_str.starts_with("unsupported linearizable cross-shard range read")
         || err_str.starts_with("unsupported row scan spanning multiple tables")
+        || err_str.starts_with("set-returning functions are not allowed in")
     {
         "0A000" // feature_not_supported
     // Statement shape errors raised while executing DML.

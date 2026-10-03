@@ -1142,7 +1142,7 @@ fn set_table_fn_args(
 pub(crate) const SRF_RELATION: &str = "\u{0}srf";
 
 /// Whether a function (by its upper-case name) returns a set of rows.
-fn is_set_returning(name: &str) -> bool {
+pub(crate) fn is_set_returning(name: &str) -> bool {
     let name = name.strip_prefix("PG_CATALOG.").unwrap_or(name);
     SELECT_LIST_TABLE_FUNCTIONS
         .iter()
@@ -1271,6 +1271,8 @@ const SELECT_LIST_TABLE_FUNCTIONS: &[&str] = &[
     "json_array_elements",
     "jsonb_array_elements_text",
     "json_array_elements_text",
+    "jsonb_path_query",
+    "jsonb_path_query_tz",
     "regexp_split_to_table",
     "regexp_matches",
     "string_to_table",

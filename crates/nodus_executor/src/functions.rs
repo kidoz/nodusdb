@@ -144,6 +144,11 @@ pub(crate) fn is_known(name: &str) -> bool {
                 | "JSONB_EXTRACT_PATH" | "JSON_EXTRACT_PATH_TEXT" | "JSONB_EXTRACT_PATH_TEXT"
                 | "JSONB_SET" | "JSONB_STRIP_NULLS" | "JSON_STRIP_NULLS" | "JSONB_PRETTY"
                 | "ROW_TO_JSON" | "ARRAY_TO_JSON" | "JSON_OBJECT" | "__RECORD__"
+                // JSON path functions.
+                | "JSONB_PATH_EXISTS" | "JSONB_PATH_EXISTS_TZ" | "JSONB_PATH_MATCH"
+                | "JSONB_PATH_MATCH_TZ" | "JSONB_PATH_QUERY" | "JSONB_PATH_QUERY_TZ"
+                | "JSONB_PATH_QUERY_ARRAY" | "JSONB_PATH_QUERY_ARRAY_TZ"
+                | "JSONB_PATH_QUERY_FIRST" | "JSONB_PATH_QUERY_FIRST_TZ"
                 // `(value).*`, a record expanded into the select list.
                 | "NODUS_EXPAND_RECORD"
                 // Arrays.
@@ -358,6 +363,16 @@ pub(crate) fn return_type(name: &str, arg_types: &[Option<String>]) -> Option<St
             "GEN_RANDOM_UUID" | "UUIDV4" | "UUIDV7" => "UUID",
             "TO_JSONB" | "JSONB_BUILD_OBJECT" | "JSONB_BUILD_ARRAY" | "JSONB_EXTRACT_PATH"
             | "JSONB_SET" | "JSONB_STRIP_NULLS" | "JSONB_INSERT" | "JSONB_SET_LAX" => "JSONB",
+            "JSONB_PATH_EXISTS"
+            | "JSONB_PATH_EXISTS_TZ"
+            | "JSONB_PATH_MATCH"
+            | "JSONB_PATH_MATCH_TZ" => "BOOLEAN",
+            "JSONB_PATH_QUERY"
+            | "JSONB_PATH_QUERY_TZ"
+            | "JSONB_PATH_QUERY_ARRAY"
+            | "JSONB_PATH_QUERY_ARRAY_TZ"
+            | "JSONB_PATH_QUERY_FIRST"
+            | "JSONB_PATH_QUERY_FIRST_TZ" => "JSONB",
             "TO_JSON" | "JSON_BUILD_OBJECT" | "JSON_BUILD_ARRAY" | "JSON_EXTRACT_PATH"
             | "JSON_STRIP_NULLS" | "ROW_TO_JSON" | "ARRAY_TO_JSON" | "JSON_OBJECT" => "JSON",
             "__RECORD__" => "RECORD",
@@ -3216,6 +3231,17 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
             };
             crate::planner::apply_binary_op(op, document, path)
         }
+        // The jsonpath functions: all arguments are strict (a NULL anywhere
+        // gives NULL), and the `_tz` spellings behave as the others do.
+        // `jsonb_path_query` is set-returning and handled below.
+        "JSONB_PATH_EXISTS" | "JSONB_PATH_EXISTS_TZ" | "JSONB_PATH_MATCH"
+        | "JSONB_PATH_MATCH_TZ" | "JSONB_PATH_QUERY_ARRAY"
+        | "JSONB_PATH_QUERY_ARRAY_TZ" | "JSONB_PATH_QUERY_FIRST"
+        | "JSONB_PATH_QUERY_FIRST_TZ"
+            if (2..=4).contains(&args.len()) =>
+        {
+            jsonpath_function(&name, &args)
+        }
         "JSONB_SET" if arity(3) || arity(4) => {
             let mut json = json_arg(arg(0))?;
             let path: Vec<String> = array(arg(1))?.iter().map(text).collect();
@@ -3313,6 +3339,8 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
         | "JSON_TO_RECORD"
         | "JSONB_TO_RECORDSET"
         | "JSON_TO_RECORDSET"
+        | "JSONB_PATH_QUERY"
+        | "JSONB_PATH_QUERY_TZ"
         | "PG_PARTITION_ANCESTORS" => raise(format!(
             "set-returning function {}() is not allowed here",
             name.to_ascii_lowercase()
@@ -3630,6 +3658,7 @@ fn format_type(oid: i64, typmod: Option<i64>) -> String {
         2206 => "regtype",
         2950 => "uuid",
         3802 => "jsonb",
+        4072 => "jsonpath",
         4089 => "regnamespace",
         4096 => "regrole",
         1000 => "boolean[]",
@@ -3649,6 +3678,7 @@ fn format_type(oid: i64, typmod: Option<i64>) -> String {
         199 => "json[]",
         2951 => "uuid[]",
         3807 => "jsonb[]",
+        4073 => "jsonpath[]",
         3904 => "int4range",
         3926 => "int8range",
         3906 => "numrange",
@@ -4107,6 +4137,102 @@ fn pretty(args: &[Value]) -> Option<bool> {
 
 /// A `json`/`jsonb` argument as a document: text is JSON input (so `'1'` is
 /// the number 1, as an untyped literal would be).
+/// A `jsonb_path_*` call: `(target, path [, vars [, silent]])`. The callers
+/// already checked the arity; this evaluates the path and shapes the result.
+fn jsonpath_function(name: &str, args: &[Value]) -> Value {
+    let parsed = match jsonpath_arguments(args) {
+        Ok(Some(parsed)) => parsed,
+        Ok(None) => return Value::Null,
+        Err(message) => return raise(message),
+    };
+    let (target, path, vars, silent) = parsed;
+    let result: std::result::Result<Value, String> = match name {
+        "JSONB_PATH_EXISTS" | "JSONB_PATH_EXISTS_TZ" => {
+            crate::jsonpath::exists(&target, &path, vars.as_ref(), silent)
+                .map(|v| v.map_or(Value::Null, Value::Bool))
+        }
+        "JSONB_PATH_MATCH" | "JSONB_PATH_MATCH_TZ" => {
+            crate::jsonpath::matches(&target, &path, vars.as_ref(), silent)
+                .map(|v| v.map_or(Value::Null, Value::Bool))
+        }
+        "JSONB_PATH_QUERY_ARRAY" | "JSONB_PATH_QUERY_ARRAY_TZ" => {
+            crate::jsonpath::query(&target, &path, vars.as_ref(), silent)
+                .map(|items| Value::Jsonb(serde_json::Value::Array(items)))
+        }
+        _ => {
+            // `jsonb_path_query_first`: the first item, or NULL.
+            crate::jsonpath::query(&target, &path, vars.as_ref(), silent).map(|items| {
+                match items.into_iter().next() {
+                    Some(item) => Value::Jsonb(item),
+                    None => Value::Null,
+                }
+            })
+        }
+    };
+    match result {
+        Ok(value) => value,
+        Err(message) => raise(message),
+    }
+}
+
+/// The evaluated arguments of a `jsonb_path_*` call: the document, the path
+/// text, the `vars` object, and the `silent` flag. `Ok(None)` is a NULL
+/// argument (the strict functions take it as NULL / no rows).
+pub(crate) fn jsonpath_arguments(
+    args: &[Value],
+) -> std::result::Result<Option<(serde_json::Value, String, Option<serde_json::Value>, bool)>, String>
+{
+    if args.iter().take(4).any(|a| matches!(a, Value::Null)) {
+        return Ok(None);
+    }
+    let target = json_document(&args[0])?;
+    let path = text(&args[1]);
+    let vars = match args.get(2) {
+        None => None,
+        Some(Value::Jsonb(j)) => Some(j.clone()),
+        Some(Value::Text(t)) | Some(Value::Json(t)) => Some(crate::json_text::parse(t)?),
+        Some(other) => crate::filter_eval::value_to_json(other),
+    };
+    if let Some(vars) = &vars
+        && !vars.is_object()
+    {
+        return Err(
+            crate::error_fields::DbError::new("\"vars\" argument is not an object")
+                .code("22023")
+                .detail(
+                    "Jsonpath parameters should be encoded as key-value pairs of \"vars\" object.",
+                )
+                .into_text(),
+        );
+    }
+    let silent = matches!(args.get(3), Some(Value::Bool(true)));
+    Ok(Some((target, path, vars, silent)))
+}
+
+/// `jsonb_path_query`'s rows, for the set-returning table-function path.
+pub(crate) fn jsonpath_query_rows(args: &[Value]) -> anyhow::Result<Vec<Value>> {
+    match jsonpath_arguments(args) {
+        Ok(None) => Ok(Vec::new()),
+        Ok(Some((target, path, vars, silent))) => {
+            crate::jsonpath::query(&target, &path, vars.as_ref(), silent)
+                .map(|items| items.into_iter().map(Value::Jsonb).collect())
+                .map_err(|e| anyhow::anyhow!(e))
+        }
+        Err(e) => Err(anyhow::anyhow!(e)),
+    }
+}
+
+/// A `jsonb` document argument: `jsonb`, `json` text, or an untyped literal,
+/// parsed with PostgreSQL's error for malformed JSON.
+fn json_document(v: &Value) -> std::result::Result<serde_json::Value, String> {
+    match v {
+        Value::Jsonb(j) => Ok(j.clone()),
+        Value::Text(s) | Value::Json(s) => crate::json_text::parse(s),
+        other => crate::filter_eval::value_to_json(other)
+            .ok_or_else(|| "invalid input syntax for type json".to_string()),
+    }
+}
+
 fn json_arg(v: &Value) -> Option<serde_json::Value> {
     match v {
         Value::Text(s) | Value::Json(s) => crate::json_text::parse(s)

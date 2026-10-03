@@ -29,16 +29,55 @@ pub(crate) fn parse_predicates(
 ) -> Result<Option<FilterExpr>> {
     selection
         .as_ref()
-        .map(|expr| parse_filter_expr(expr, params))
+        .map(|expr| {
+            let filter = parse_filter_expr(expr, params)?;
+            forbid_set_returning(&filter, "WHERE")?;
+            Ok(filter)
+        })
         .transpose()
+}
+
+/// A set-returning function in a condition is refused, as PostgreSQL refuses
+/// it (`jsonb_path_query(...)` in `WHERE`).
+pub(crate) fn forbid_set_returning(filter: &FilterExpr, clause: &str) -> Result<()> {
+    if filter_has_srf(filter) {
+        return Err(anyhow::anyhow!(
+            "{}",
+            crate::error_fields::DbError::new(format!(
+                "set-returning functions are not allowed in {clause}"
+            ))
+            .code("0A000")
+            .into_text()
+        ));
+    }
+    Ok(())
+}
+
+fn filter_has_srf(filter: &FilterExpr) -> bool {
+    match filter {
+        FilterExpr::Scalar(expr) => scalar_has_srf(expr),
+        FilterExpr::ExprCmp { left, right, .. } => scalar_has_srf(left) || scalar_has_srf(right),
+        FilterExpr::QuantifiedSubquery { left, .. } => scalar_has_srf(left),
+        FilterExpr::And(l, r) | FilterExpr::Or(l, r) => filter_has_srf(l) || filter_has_srf(r),
+        FilterExpr::Not(inner) => filter_has_srf(inner),
+        _ => false,
+    }
+}
+
+fn scalar_has_srf(expr: &crate::ScalarExpr) -> bool {
+    matches!(expr, crate::ScalarExpr::Function { name, .. }
+        if crate::planner::query::is_set_returning(name))
+        || expr.children().into_iter().any(scalar_has_srf)
 }
 
 /// Plans a `HAVING` clause as one boolean expression over each group, so any
 /// operator the scalar evaluator supports works on aggregates and group keys.
 pub(crate) fn parse_having(expr: &sqlparser::ast::Expr, params: &[Value]) -> Result<FilterExpr> {
-    lower_scalar(expr, params)
+    let filter = lower_scalar(expr, params)
         .map(FilterExpr::Scalar)
-        .ok_or_else(|| anyhow::anyhow!("Unsupported HAVING condition: {expr}"))
+        .ok_or_else(|| anyhow::anyhow!("Unsupported HAVING condition: {expr}"))?;
+    forbid_set_returning(&filter, "HAVING")?;
+    Ok(filter)
 }
 
 /// Plans a boolean condition. Column comparisons against literals keep their

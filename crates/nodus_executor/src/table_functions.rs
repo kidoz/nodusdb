@@ -62,6 +62,13 @@ impl MemExecutor {
             }
             "generate_series" => generate_series_rows(&args),
             "jsonb_array_elements" => json_array_elements_rows(&args, false),
+            "jsonb_path_query" | "jsonb_path_query_tz" => {
+                let rows = crate::functions::jsonpath_query_rows(&args)?;
+                (
+                    vec!["JSONB".to_string()],
+                    rows.into_iter().map(|v| vec![v]).collect(),
+                )
+            }
             "jsonb_array_elements_text" => json_array_elements_rows(&args, true),
             "json_array_elements" => json_text_elements_rows(&args, false),
             "json_array_elements_text" => json_text_elements_rows(&args, true),
