@@ -149,6 +149,13 @@ impl MemExecutor {
                 "MACADDR" => 1040,
                 "MACADDR8" => 775,
                 "MONEY" => 791,
+                "POINT" => 1017,
+                "LSEG" => 1018,
+                "PATH" => 1019,
+                "BOX" => 1020,
+                "POLYGON" => 1027,
+                "LINE" => 629,
+                "CIRCLE" => 719,
                 "INT4MULTIRANGE" => 6150,
                 "INT8MULTIRANGE" => 6157,
                 "NUMMULTIRANGE" => 6151,
@@ -211,6 +218,13 @@ impl MemExecutor {
             "DATERANGE" => 3912,
             "TSRANGE" => 3908,
             "TSTZRANGE" => 3910,
+            "POINT" => 600,
+            "LSEG" => 601,
+            "PATH" => 602,
+            "BOX" => 603,
+            "POLYGON" => 604,
+            "LINE" => 628,
+            "CIRCLE" => 718,
             "INT4MULTIRANGE" => 4451,
             "INT8MULTIRANGE" => 4536,
             "NUMMULTIRANGE" => 4532,
@@ -278,6 +292,9 @@ impl MemExecutor {
     /// `pg_attribute.attstorage` for a declared type: fixed-width types are
     /// stored plain, numeric in the main tuple, and varlena types extended.
     pub(crate) fn pg_type_storage(data_type: &str) -> &'static str {
+        if let Some(kind) = crate::geometric::Kind::of(data_type) {
+            return kind.tystorage();
+        }
         match Self::pg_type_oid(data_type) {
             16 | 18 | 20 | 21 | 23 | 26 | 700 | 701 | 1082 | 1083 | 1114 | 1184 | 1186 | 1266
             | 2950 => "p",
@@ -287,6 +304,9 @@ impl MemExecutor {
     }
 
     pub(crate) fn pg_type_length(data_type: &str) -> i64 {
+        if let Some(kind) = crate::geometric::Kind::of(data_type) {
+            return kind.typlen();
+        }
         match Self::pg_type_oid(data_type) {
             16 => 1,
             20 | 701 | 1083 | 1114 | 1184 => 8,
@@ -296,6 +316,14 @@ impl MemExecutor {
             2950 => 16,
             _ => -1,
         }
+    }
+
+    /// `pg_attribute.attalign`: every geometric type aligns on a double.
+    pub(crate) fn pg_attribute_align(data_type: &str) -> &'static str {
+        if crate::geometric::is_geometric_type(data_type) {
+            return "d";
+        }
+        "i"
     }
 
     pub(crate) fn is_virtual_schema(schema_name: &str) -> bool {

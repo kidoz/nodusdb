@@ -34,6 +34,7 @@ mod execute;
 mod explain;
 pub(crate) mod filter_eval;
 mod functions;
+mod geometric;
 mod index_keys;
 mod information_schema;
 mod json_text;

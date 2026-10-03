@@ -254,6 +254,19 @@ pub(crate) fn try_cast(v: Value, data_type: &str) -> std::result::Result<Value, 
             .into_text()),
         };
     }
+    // A geometric type takes its literal form.
+    if let Some(kind) = crate::geometric::Kind::of(data_type) {
+        return match v {
+            Value::Text(text) => crate::geometric::from_literal(kind, &text).map(Value::Text),
+            other => Err(crate::error_fields::DbError::new(format!(
+                "cannot cast type {} to {}",
+                crate::value::value_type_name(&other),
+                kind.name()
+            ))
+            .code("42846")
+            .into_text()),
+        };
+    }
     // A multirange takes its literal form; a range of its subtype is
     // wrapped by the cast the planner rewrites.
     if let Some(kind) = crate::multiranges::kind_of(data_type) {

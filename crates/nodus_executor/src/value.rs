@@ -362,6 +362,7 @@ pub(crate) fn column_type(data_type: &str) -> ColumnType {
         || crate::ranges::is_range_type(data_type)
         || crate::multiranges::is_multirange_type(data_type)
         || crate::net::is_net_type(data_type)
+        || crate::geometric::is_geometric_type(data_type)
     {
         ColumnType::Text
     } else if t.contains("INT") || t.contains("SERIAL") || matches!(t.trim(), "OID" | "XID") {
@@ -472,7 +473,8 @@ pub(crate) fn coerce_for_column(value: &Value, data_type: &str) -> Value {
                 || crate::datetime::Kind::of_type(data_type).is_some()
                 || crate::ranges::is_range_type(data_type)
                 || crate::multiranges::is_multirange_type(data_type)
-                || crate::net::is_net_type(data_type) =>
+                || crate::net::is_net_type(data_type)
+                || crate::geometric::is_geometric_type(data_type) =>
         {
             crate::planner::cast_value(value.clone(), data_type)
         }

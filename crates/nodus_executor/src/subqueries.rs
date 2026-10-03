@@ -137,6 +137,7 @@ impl MemExecutor {
                         || crate::ranges::is_range_type(t)
                         || crate::multiranges::is_multirange_type(t)
                         || crate::net::is_net_type(t)
+                        || crate::geometric::is_geometric_type(t)
                 });
             types.push(unify_column(&mut values, column, declared)?);
         }
@@ -197,6 +198,7 @@ fn unify_column(
                 if crate::ranges::is_range_type(&target)
                     || crate::multiranges::is_multirange_type(&target)
                     || crate::net::is_net_type(&target)
+                    || crate::geometric::is_geometric_type(&target)
                 {
                     return Ok(target);
                 }
