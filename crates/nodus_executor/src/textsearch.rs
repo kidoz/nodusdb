@@ -1610,6 +1610,508 @@ pub(crate) fn vector_delete(vector: &TsVector, words: &[String]) -> TsVector {
     }
 }
 
+// -------------------------------------------------- the to_tsquery family
+
+/// A query node before stop-word cleanup, with the placeholder a stop word
+/// leaves (PostgreSQL's `QI_VALSTOP`).
+enum MNode {
+    Stop,
+    Val {
+        word: String,
+        weight: u8,
+        prefix: bool,
+    },
+    Not(Box<MNode>),
+    And(Box<MNode>, Box<MNode>),
+    Or(Box<MNode>, Box<MNode>),
+    Phrase {
+        distance: i16,
+        left: Box<MNode>,
+        right: Box<MNode>,
+    },
+}
+
+/// The operator a morphed operand puts between its words.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MorphOp {
+    And,
+    Phrase,
+}
+
+/// `pushval_morph`: an operand's dictionary words, one value per position,
+/// joined by the morph's operator, with a placeholder for every position a
+/// stop word left empty.
+fn morph_operand(words: &[(String, usize)], weight: u8, prefix: bool, op: MorphOp) -> MNode {
+    let join = |acc: Option<MNode>, node: MNode| match acc {
+        None => node,
+        Some(left) => match op {
+            MorphOp::And => MNode::And(Box::new(left), Box::new(node)),
+            MorphOp::Phrase => MNode::Phrase {
+                distance: 1,
+                left: Box::new(left),
+                right: Box::new(node),
+            },
+        },
+    };
+    let mut acc: Option<MNode> = None;
+    let mut pos = 0usize;
+    let mut i = 0usize;
+    while i < words.len() {
+        let word_pos = words[i].1;
+        while pos > 0 && pos + 1 < word_pos {
+            acc = Some(join(acc, MNode::Stop));
+            pos += 1;
+        }
+        pos = word_pos;
+        let mut group: Option<MNode> = None;
+        while i < words.len() && words[i].1 == word_pos {
+            let value = MNode::Val {
+                word: words[i].0.clone(),
+                weight,
+                prefix,
+            };
+            group = Some(match group {
+                None => value,
+                Some(g) => MNode::And(Box::new(g), Box::new(value)),
+            });
+            i += 1;
+        }
+        acc = Some(join(acc, group.expect("a group holds a word")));
+    }
+    acc.unwrap_or(MNode::Stop)
+}
+
+/// `clean_stopword_intree`: removes the placeholders, folding the distances
+/// of the phrase nodes they collapse into the surviving parents.
+fn clean_stopwords(node: MNode) -> (Option<MNode>, i32, i32) {
+    match node {
+        MNode::Stop => (None, 0, 0),
+        MNode::Val { .. } => (Some(node), 0, 0),
+        MNode::Not(inner) => {
+            let (child, ladd, radd) = clean_stopwords(*inner);
+            match child {
+                None => (None, 0, 0),
+                Some(child) => (Some(MNode::Not(Box::new(child))), ladd, radd),
+            }
+        }
+        MNode::And(left, right) => {
+            let is_and = true;
+            let (l, lladd, lradd) = clean_stopwords(*left);
+            let (r, rladd, rradd) = clean_stopwords(*right);
+            match (l, r) {
+                (None, None) => {
+                    let add = lladd.max(rladd);
+                    (None, add, add)
+                }
+                (Some(l), None) => (Some(l), lladd, lradd + rradd),
+                (None, Some(r)) => (Some(r), lladd + rladd, rradd),
+                (Some(l), Some(r)) => (
+                    Some(if is_and {
+                        MNode::And(Box::new(l), Box::new(r))
+                    } else {
+                        MNode::Or(Box::new(l), Box::new(r))
+                    }),
+                    0,
+                    0,
+                ),
+            }
+        }
+        MNode::Or(left, right) => {
+            let is_and = false;
+            let (l, lladd, lradd) = clean_stopwords(*left);
+            let (r, rladd, rradd) = clean_stopwords(*right);
+            match (l, r) {
+                (None, None) => {
+                    let add = lladd.max(rladd);
+                    (None, add, add)
+                }
+                (Some(l), None) => (Some(l), lladd, lradd + rradd),
+                (None, Some(r)) => (Some(r), lladd + rladd, rradd),
+                (Some(l), Some(r)) => (
+                    Some(if is_and {
+                        MNode::And(Box::new(l), Box::new(r))
+                    } else {
+                        MNode::Or(Box::new(l), Box::new(r))
+                    }),
+                    0,
+                    0,
+                ),
+            }
+        }
+        MNode::Phrase {
+            distance,
+            left,
+            right,
+        } => {
+            let (l, lladd, lradd) = clean_stopwords(*left);
+            let (r, rladd, rradd) = clean_stopwords(*right);
+            match (l, r) {
+                (None, None) => {
+                    let add = lladd + distance as i32 + rladd;
+                    (None, add, add)
+                }
+                (Some(l), None) => (Some(l), lladd, lradd + distance as i32 + rradd),
+                (None, Some(r)) => (Some(r), lladd + distance as i32 + rladd, rradd),
+                (Some(l), Some(r)) => {
+                    let distance = distance + (lradd + rladd) as i16;
+                    (
+                        Some(MNode::Phrase {
+                            distance,
+                            left: Box::new(l),
+                            right: Box::new(r),
+                        }),
+                        lladd,
+                        rradd,
+                    )
+                }
+            }
+        }
+    }
+}
+
+/// The morphed tree as the query, once no placeholder can remain.
+fn to_qnode(node: MNode) -> QNode {
+    match node {
+        MNode::Stop => QNode::Empty,
+        MNode::Val {
+            word,
+            weight,
+            prefix,
+        } => QNode::Val {
+            word,
+            weight,
+            prefix,
+        },
+        MNode::Not(inner) => QNode::Not(Box::new(to_qnode(*inner))),
+        MNode::And(l, r) => QNode::And(Box::new(to_qnode(*l)), Box::new(to_qnode(*r))),
+        MNode::Or(l, r) => QNode::Or(Box::new(to_qnode(*l)), Box::new(to_qnode(*r))),
+        MNode::Phrase {
+            distance,
+            left,
+            right,
+        } => QNode::Phrase {
+            distance,
+            left: Box::new(to_qnode(*left)),
+            right: Box::new(to_qnode(*right)),
+        },
+    }
+}
+
+/// Replaces every operand of a parsed query with its dictionary words.
+fn morph_tree(node: &QNode, lexize: &impl Fn(&str) -> Vec<(String, usize)>, op: MorphOp) -> MNode {
+    match node {
+        QNode::Empty => MNode::Stop,
+        QNode::Val {
+            word,
+            weight,
+            prefix,
+        } => morph_operand(&lexize(word), *weight, *prefix, op),
+        QNode::Not(inner) => MNode::Not(Box::new(morph_tree(inner, lexize, op))),
+        QNode::And(l, r) => MNode::And(
+            Box::new(morph_tree(l, lexize, op)),
+            Box::new(morph_tree(r, lexize, op)),
+        ),
+        QNode::Or(l, r) => MNode::Or(
+            Box::new(morph_tree(l, lexize, op)),
+            Box::new(morph_tree(r, lexize, op)),
+        ),
+        QNode::Phrase {
+            distance,
+            left,
+            right,
+        } => MNode::Phrase {
+            distance: *distance,
+            left: Box::new(morph_tree(left, lexize, op)),
+            right: Box::new(morph_tree(right, lexize, op)),
+        },
+    }
+}
+
+/// The notice an empty query raises as the parser finds no lexemes.
+fn no_lexemes_notice(buffer: &str) {
+    crate::session_env::notice(crate::error_fields::DbError::new(format!(
+        "text-search query doesn't contain lexemes: \"{buffer}\""
+    )));
+}
+
+/// The notice a query that lost everything to stop words raises.
+fn only_stopwords_notice() {
+    crate::session_env::notice(crate::error_fields::DbError::new(
+        "text-search query contains only stop words or doesn't contain lexemes, ignored",
+    ));
+}
+
+/// Finishes a morphing query: the cleanup, its notice, and the canonical
+/// spelling.
+fn finish_query(tree: MNode) -> String {
+    match clean_stopwords(tree).0 {
+        None => {
+            only_stopwords_notice();
+            String::new()
+        }
+        Some(cleaned) => print_tsquery(&to_qnode(cleaned)),
+    }
+}
+
+/// `to_tsquery(config, text)`: the standard grammar, each operand normalized
+/// by the configuration's dictionary.
+pub(crate) fn to_tsquery(config: crate::ts_dict::Config, text: &str) -> Result<String, String> {
+    let parsed = parse_tsquery(text)?;
+    if parsed == QNode::Empty {
+        no_lexemes_notice(text);
+        return Ok(String::new());
+    }
+    let lexize = |word: &str| crate::ts_dict::lexize_words(config, word);
+    let tree = morph_tree(&parsed, &lexize, MorphOp::Phrase);
+    Ok(finish_query(tree))
+}
+
+/// `plainto_tsquery(config, text)`: every word of the text, ANDed.
+pub(crate) fn plainto_tsquery(
+    config: crate::ts_dict::Config,
+    text: &str,
+) -> Result<String, String> {
+    let lexize = |word: &str| crate::ts_dict::lexize_words(config, word);
+    // The whole input is one operand.
+    let tree = if text.is_empty() {
+        no_lexemes_notice(text);
+        return Ok(String::new());
+    } else {
+        morph_operand(&lexize(text), 0, false, MorphOp::And)
+    };
+    Ok(finish_query(tree))
+}
+
+/// `phraseto_tsquery(config, text)`: every word of the text, in a phrase.
+pub(crate) fn phraseto_tsquery(
+    config: crate::ts_dict::Config,
+    text: &str,
+) -> Result<String, String> {
+    let lexize = |word: &str| crate::ts_dict::lexize_words(config, word);
+    let tree = if text.is_empty() {
+        no_lexemes_notice(text);
+        return Ok(String::new());
+    } else {
+        morph_operand(&lexize(text), 0, false, MorphOp::Phrase)
+    };
+    Ok(finish_query(tree))
+}
+
+/// One token of a web search query.
+enum WebToken {
+    Value(String),
+    And,
+    Or,
+    Not,
+}
+
+/// `gettoken_query_websearch`: `"quoted phrases"`, `-negation`, `or`, and
+/// implicit AND between words, as PostgreSQL's tokenizer reads them. The
+/// second value says whether the tokenizer ended waiting for an operand
+/// (which then takes a stop-word placeholder).
+fn web_tokens(text: &str) -> (Vec<WebToken>, bool) {
+    use WebState::*;
+    #[derive(Clone, Copy, PartialEq)]
+    enum WebState {
+        FirstOperand,
+        Operand,
+        Operator,
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let mut tokens = Vec::new();
+    let mut i = 0usize;
+    let mut state = FirstOperand;
+    let is_operator = |c: char| matches!(c, '!' | '&' | '|' | '(' | ')' | '<');
+    loop {
+        match state {
+            FirstOperand | Operand => {
+                if i >= chars.len() {
+                    // PostgreSQL tries one more token, finds none, and (past
+                    // the first operand) leaves a stop-word placeholder.
+                    return (tokens, state == Operand);
+                }
+                let c = chars[i];
+                if c == '-' {
+                    tokens.push(WebToken::Not);
+                    i += 1;
+                    state = Operand;
+                    continue;
+                }
+                if c == '"' {
+                    i += 1;
+                    let start = i;
+                    while i < chars.len() && chars[i] != '"' {
+                        i += 1;
+                    }
+                    tokens.push(WebToken::Value(chars[start..i].iter().collect()));
+                    if i < chars.len() {
+                        i += 1;
+                    }
+                    state = Operator;
+                    continue;
+                }
+                if is_operator(c) {
+                    i += 1;
+                    continue;
+                }
+                if c.is_whitespace() {
+                    i += 1;
+                    continue;
+                }
+                // A word: `:` ends it (and is consumed) unless the word
+                // starts with one.
+                let start = i;
+                if chars[i] == ':' {
+                    i += 1;
+                }
+                while i < chars.len()
+                    && !chars[i].is_whitespace()
+                    && !is_operator(chars[i])
+                    && chars[i] != '"'
+                    && chars[i] != ':'
+                {
+                    i += 1;
+                }
+                if i < chars.len() && chars[i] == ':' {
+                    i += 1;
+                }
+                tokens.push(WebToken::Value(
+                    chars[start..i.min(chars.len())]
+                        .iter()
+                        .collect::<String>()
+                        .trim_end_matches(':')
+                        .to_string(),
+                ));
+                state = Operator;
+            }
+            Operator => {
+                if i >= chars.len() {
+                    return (tokens, false);
+                }
+                let c = chars[i];
+                if is_or_operator(&chars, i) {
+                    tokens.push(WebToken::Or);
+                    i += 2;
+                    state = Operand;
+                    continue;
+                }
+                if is_operator(c) {
+                    i += 1;
+                    continue;
+                }
+                if !c.is_whitespace() {
+                    tokens.push(WebToken::And);
+                    state = Operand;
+                    continue;
+                }
+                i += 1;
+            }
+        }
+    }
+}
+
+/// `parse_or_operator`: whether an `or` at this position is the operator:
+/// a word of its own with some operand after it.
+fn is_or_operator(chars: &[char], at: usize) -> bool {
+    if !matches!(chars.get(at), Some('o' | 'O')) || !matches!(chars.get(at + 1), Some('r' | 'R')) {
+        return false;
+    }
+    // It must not be part of a word.
+    match chars.get(at + 2) {
+        None => return false,
+        Some('-') => return false,
+        Some('_') => return false,
+        Some(c) if c.is_alphanumeric() => return false,
+        _ => {}
+    }
+    // And some operand must follow.
+    let mut i = at + 2;
+    loop {
+        i += 1;
+        match chars.get(i) {
+            None => return false,
+            Some(c) if !c.is_whitespace() => return true,
+            _ => {}
+        }
+    }
+}
+
+/// `websearch_to_tsquery(config, text)`.
+pub(crate) fn websearch_to_tsquery(
+    config: crate::ts_dict::Config,
+    text: &str,
+) -> Result<String, String> {
+    let lexize = |word: &str| crate::ts_dict::lexize_words(config, word);
+    let (tokens, expects_operand) = web_tokens(text);
+    if tokens.is_empty() {
+        no_lexemes_notice(text);
+        return Ok(String::new());
+    }
+
+    // A shunting-yard over the tokens, with PostgreSQL's priorities
+    // (NOT 4, AND 2, OR 1).
+    let rank = |t: &WebToken| match t {
+        WebToken::Not => 4,
+        WebToken::And => 2,
+        WebToken::Or => 1,
+        WebToken::Value(_) => 0,
+    };
+    let mut output: Vec<MNode> = Vec::new();
+    let mut ops: Vec<WebToken> = Vec::new();
+    // A missing operand is a stop word placeholder, as `pushStop` leaves.
+    let apply = |output: &mut Vec<MNode>, op: &WebToken| match op {
+        WebToken::Not => {
+            let inner = output.pop().unwrap_or(MNode::Stop);
+            output.push(MNode::Not(Box::new(inner)));
+        }
+        WebToken::And | WebToken::Or => {
+            let right = output.pop().unwrap_or(MNode::Stop);
+            let left = output.pop().unwrap_or(MNode::Stop);
+            output.push(if matches!(op, WebToken::And) {
+                MNode::And(Box::new(left), Box::new(right))
+            } else {
+                MNode::Or(Box::new(left), Box::new(right))
+            });
+        }
+        WebToken::Value(_) => {}
+    };
+    for token in tokens {
+        match token {
+            WebToken::Value(value) => {
+                let lowered = value;
+                output.push(morph_operand(&lexize(&lowered), 0, false, MorphOp::Phrase));
+            }
+            op => {
+                // `cleanOpStack`: stop when the incoming operator binds
+                // tighter than the stack top (NOT is right associative).
+                while let Some(top) = ops.last() {
+                    let stop = if matches!(op, WebToken::Not) {
+                        rank(&op) >= rank(top)
+                    } else {
+                        rank(&op) > rank(top)
+                    };
+                    if stop {
+                        break;
+                    }
+                    let top = ops.pop().expect("checked");
+                    apply(&mut output, &top);
+                }
+                ops.push(op);
+            }
+        }
+    }
+    // An operator left waiting for an operand takes a stop-word
+    // placeholder, as `pushStop` gives it.
+    if expects_operand {
+        output.push(MNode::Stop);
+    }
+    while let Some(op) = ops.pop() {
+        apply(&mut output, &op);
+    }
+    let tree = output.pop().unwrap_or(MNode::Stop);
+    Ok(finish_query(tree))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1801,6 +2303,47 @@ mod tests {
         assert!(m("fat:1 cat:2 sat:3", "(fat <-> cat) & sat"));
         assert!(!m("fat cat", "fat <-> !cat"));
         assert!(!m("fat", ""));
+    }
+
+    #[test]
+    fn the_query_family_matches_postgresql() {
+        use crate::ts_dict::Config;
+        let tq = |text: &str| to_tsquery(Config::English, text).expect("parses");
+        assert_eq!(tq("fat & the & cat"), "'fat' & 'cat'");
+        assert_eq!(tq("fat & !the"), "'fat'");
+        assert_eq!(tq("the"), "");
+        assert_eq!(tq("cat:*"), "'cat':*");
+        assert_eq!(tq("cat:A"), "'cat':A");
+        assert_eq!(tq("cats & runs"), "'cat' & 'run'");
+        assert_eq!(tq("fat <-> the <-> cat"), "'fat' <2> 'cat'");
+        assert_eq!(tq("(fat | the) & cat"), "'fat' & 'cat'");
+        assert_eq!(tq(""), "");
+        assert_eq!(
+            plainto_tsquery(Config::English, "The Fat Cats").expect("parses"),
+            "'fat' & 'cat'"
+        );
+        assert_eq!(
+            plainto_tsquery(Config::English, "a-café-x 42").expect("parses"),
+            "'a-café-x' & 'café' & 'x' & '42'"
+        );
+        assert_eq!(
+            phraseto_tsquery(Config::English, "The Fat Cats").expect("parses"),
+            "'fat' <-> 'cat'"
+        );
+        assert_eq!(
+            phraseto_tsquery(Config::English, "fat the cat").expect("parses"),
+            "'fat' <2> 'cat'"
+        );
+        let wq = |text: &str| websearch_to_tsquery(Config::English, text).expect("parses");
+        assert_eq!(wq("fat cat or -dog"), "'fat' & 'cat' | !'dog'");
+        assert_eq!(wq("\"fat cat\" dog"), "'fat' <-> 'cat' & 'dog'");
+        assert_eq!(wq("a & b"), "'b'");
+        assert_eq!(wq("foo -"), "'foo'");
+        assert_eq!(wq("foo &"), "'foo'");
+        assert_eq!(wq("a:b:c"), "'b' & 'c'");
+        assert_eq!(wq("foo | bar"), "'foo' & 'bar'");
+        assert_eq!(wq("the cat"), "'cat'");
+        assert_eq!(wq(""), "");
     }
 
     #[test]

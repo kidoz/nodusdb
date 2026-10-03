@@ -1,0 +1,974 @@
+# Full-text search: the tsvector and tsquery types, their operators and
+# functions, and the to_tsvector / to_tsquery families. Expected results
+# come from PostgreSQL 18.
+# The tsvector type: literals and their canonical form.
+query T
+SELECT 'fat:2 cat:1'::tsvector;
+----
+'cat':1 'fat':2
+
+query T
+SELECT 'fat cat'::tsvector;
+----
+'cat' 'fat'
+
+query T
+SELECT length(''::tsvector), ''::tsvector::text = '';
+----
+0	t
+
+query T
+SELECT 'a:1A'::tsvector;
+----
+'a':1A
+
+query T
+SELECT 'fat:2,4 cat:3 rat:5A'::tsvector;
+----
+'cat':3 'fat':2,4 'rat':5A
+
+query T
+SELECT 'the'::tsvector;
+----
+'the'
+
+statement error
+SELECT 'fat:0'::tsvector;
+
+statement error
+SELECT 'fat:1x'::tsvector;
+
+query T
+SELECT 'a:1A'::tsvector::text;
+----
+'a':1A
+
+query T
+SELECT 'fat cat'::tsvector::text::tsvector;
+----
+'cat' 'fat'
+
+query T
+SELECT pg_typeof('a:1'::tsvector);
+----
+tsvector
+
+query T
+SELECT length(''::tsvector);
+----
+0
+
+query T
+SELECT length('fat:1 rat:2'::tsvector);
+----
+2
+
+# The tsquery type: literals, weights, and prefixes.
+query T
+SELECT 'fat & rat'::tsquery;
+----
+'fat' & 'rat'
+
+query T
+SELECT 'fat | rat'::tsquery;
+----
+'fat' | 'rat'
+
+query T
+SELECT 'fat & !rat'::tsquery;
+----
+'fat' & !'rat'
+
+query T
+SELECT 'fat <-> rat'::tsquery;
+----
+'fat' <-> 'rat'
+
+query T
+SELECT 'fat <2> rat'::tsquery;
+----
+'fat' <2> 'rat'
+
+query T
+SELECT numnode(''::tsquery), ''::tsquery::text = '';
+----
+0	t
+
+query T
+SELECT '!fat'::tsquery;
+----
+!'fat'
+
+query T
+SELECT '(fat & rat) | cat'::tsquery;
+----
+'fat' & 'rat' | 'cat'
+
+query T
+SELECT 'fat:*'::tsquery;
+----
+'fat':*
+
+query T
+SELECT 'fat:*A'::tsquery;
+----
+'fat':*A
+
+query T
+SELECT 'the'::tsquery;
+----
+'the'
+
+query T
+SELECT 'b & a'::tsquery;
+----
+'b' & 'a'
+
+query T
+SELECT 'a & a'::tsquery;
+----
+'a' & 'a'
+
+query T
+SELECT '!(a & b)'::tsquery;
+----
+!( 'a' & 'b' )
+
+query T
+SELECT '!a & b'::tsquery;
+----
+!'a' & 'b'
+
+query T
+SELECT 'a & b <-> c'::tsquery;
+----
+'a' & 'b' <-> 'c'
+
+query T
+SELECT 'a <2> b & c'::tsquery;
+----
+'a' <2> 'b' & 'c'
+
+query T
+SELECT 'c <-> b <-> a'::tsquery;
+----
+'c' <-> 'b' <-> 'a'
+
+query T
+SELECT 'a <-> (b & c)'::tsquery;
+----
+'a' <-> ( 'b' & 'c' )
+
+query T
+SELECT '(a | b) & (c | d)'::tsquery;
+----
+( 'a' | 'b' ) & ( 'c' | 'd' )
+
+statement error
+SELECT 'a b'::tsquery;
+
+statement error
+SELECT 'a &'::tsquery;
+
+statement error
+SELECT '& a'::tsquery;
+
+statement error
+SELECT '()'::tsquery;
+
+statement error
+SELECT 'a)'::tsquery;
+
+statement error
+SELECT '(a))'::tsquery;
+
+query T
+SELECT '!!a'::tsquery;
+----
+!!'a'
+
+query T
+SELECT 'a & !b'::tsquery;
+----
+'a' & !'b'
+
+query T
+SELECT pg_typeof('a'::tsquery);
+----
+tsquery
+
+query T
+SELECT numnode('a & b'::tsquery);
+----
+3
+
+query T
+SELECT numnode('!(a | b) & c'::tsquery);
+----
+6
+
+query T
+SELECT 'a | b'::tsquery::text;
+----
+'a' | 'b'
+
+# Comparisons and ordering, which both types have in full.
+query T
+SELECT 'fat:1'::tsvector < 'fat:2'::tsvector;
+----
+f
+
+query T
+SELECT 'fat'::tsvector < 'fat '::tsvector;
+----
+f
+
+query T
+SELECT 'a'::tsvector < 'aa'::tsvector;
+----
+t
+
+query T
+SELECT 'a:1'::tsvector < 'a'::tsvector;
+----
+f
+
+query T
+SELECT 'a:1A'::tsvector < 'a:1B'::tsvector;
+----
+t
+
+query T
+SELECT 'a'::tsquery < 'b'::tsquery;
+----
+t
+
+query T
+SELECT 'a | b'::tsquery < 'a & b'::tsquery;
+----
+t
+
+query T
+SELECT 'b | a'::tsquery < 'a | b'::tsquery;
+----
+t
+
+query T
+SELECT '!a'::tsquery < 'a'::tsquery;
+----
+f
+
+query T
+SELECT 'a'::tsquery = 'a'::tsquery;
+----
+t
+
+query T
+SELECT 'a & b'::tsquery = 'b & a'::tsquery;
+----
+f
+
+query TT
+SELECT 'a'::tsvector <= 'a'::tsvector, 'a'::tsvector >= 'b'::tsvector;
+----
+t	f
+
+query T
+SELECT 'a'::tsquery <> 'b'::tsquery;
+----
+t
+
+# Concatenation, conjunction, phrase, containment, and negation.
+query T
+SELECT 'fat:2A'::tsvector || 'fat:1B'::tsvector;
+----
+'fat':2A,3B
+
+query T
+SELECT 'fat:1 rat:2'::tsvector || 'ran:1'::tsvector;
+----
+'fat':1 'ran':3 'rat':2
+
+query T
+SELECT 'a'::tsquery && 'b'::tsquery;
+----
+'a' & 'b'
+
+query T
+SELECT 'a'::tsquery || 'b'::tsquery;
+----
+'a' | 'b'
+
+query T
+SELECT 'a'::tsquery && 'b'::tsquery = 'a & b'::tsquery;
+----
+t
+
+query T
+SELECT 'a'::tsquery <-> 'b'::tsquery;
+----
+'a' <-> 'b'
+
+query T
+SELECT 'a'::tsquery <-> 'b'::tsquery <-> 'c'::tsquery;
+----
+'a' <-> 'b' <-> 'c'
+
+query T
+SELECT !!'fat'::tsquery;
+----
+!'fat'
+
+query T
+SELECT 'a & b'::tsquery @> 'a'::tsquery;
+----
+t
+
+query T
+SELECT 'a & b'::tsquery @> 'a | b'::tsquery;
+----
+t
+
+query T
+SELECT 'a'::tsquery <@ 'a & b'::tsquery;
+----
+t
+
+statement error
+SELECT 'a'::tsquery && 'a'::tsvector;
+
+statement error
+SELECT 'a'::tsvector && 'a'::tsvector;
+
+statement error
+SELECT 'a'::tsvector <-> 'b'::tsvector;
+
+statement error
+SELECT 'a'::tsquery @> 'fat'::tsvector;
+
+# Matching: @@ over weights, prefixes, phrases, and negation.
+query T
+SELECT 'fat cat sat'::tsvector @@ 'fat <-> cat'::tsquery;
+----
+f
+
+query T
+SELECT 'fat:1 cat:2 sat:3'::tsvector @@ 'fat <-> cat'::tsquery;
+----
+t
+
+query T
+SELECT 'fat:1 cat:3 sat:4'::tsvector @@ 'fat <2> sat'::tsquery;
+----
+f
+
+query T
+SELECT 'fat:1 cat:3 sat:4'::tsvector @@ 'fat <3> sat'::tsquery;
+----
+t
+
+query T
+SELECT 'fat:1 cat:2 sat:3'::tsvector @@ '(fat <-> cat) & sat'::tsquery;
+----
+t
+
+query T
+SELECT 'fat cat'::tsvector @@ 'fa:*'::tsquery;
+----
+t
+
+query T
+SELECT 'fat cat'::tsvector @@ 'fa'::tsquery;
+----
+f
+
+query T
+SELECT 'fat cat sat'::tsvector @@ '!dog'::tsquery;
+----
+t
+
+query T
+SELECT 'fat cat sat'::tsvector @@ 'fat & !cat'::tsquery;
+----
+f
+
+query T
+SELECT 'a:1A b:2'::tsvector @@ 'a:*'::tsquery;
+----
+t
+
+query T
+SELECT 'a:1A b:2'::tsvector @@ 'a:D'::tsquery;
+----
+f
+
+query T
+SELECT 'ab:1A ac:1'::tsvector @@ 'a:*A'::tsquery;
+----
+t
+
+# The functions.
+query T
+SELECT setweight('fat:1 rat:2'::tsvector, 'A');
+----
+'fat':1A 'rat':2A
+
+query T
+SELECT setweight('fat:1 rat:2'::tsvector, 'B', ARRAY['fat']);
+----
+'fat':1B 'rat':2
+
+query T
+SELECT strip('fat:1A'::tsvector);
+----
+'fat'
+
+query T
+SELECT tsvector_to_array('fat:1 rat:2'::tsvector);
+----
+{fat,rat}
+
+query T
+SELECT array_to_tsvector(ARRAY['fat','rat']);
+----
+'fat' 'rat'
+
+query T
+SELECT array_to_tsvector(ARRAY['fat','fat']);
+----
+'fat'
+
+query T
+SELECT array_to_tsvector(ARRAY['fat bar']);
+----
+'fat bar'
+
+query T
+SELECT ts_delete('fat:1 rat:2'::tsvector, 'rat');
+----
+'fat':1
+
+query T
+SELECT ts_delete('fat:1 rat:2'::tsvector, ARRAY['rat','cat']);
+----
+'fat':1
+
+query T
+SELECT tsquery_phrase('a'::tsquery, 'b'::tsquery);
+----
+'a' <-> 'b'
+
+query T
+SELECT tsquery_phrase('a'::tsquery, 'b'::tsquery, 3);
+----
+'a' <3> 'b'
+
+query T
+SELECT length('fat:1 rat:2'::tsvector);
+----
+2
+
+query TT
+SELECT pg_column_size(''::tsvector), pg_column_size('a:1'::tsvector);
+----
+8	18
+
+query T
+SELECT pg_column_size('a & b'::tsquery);
+----
+48
+
+# to_tsvector: the dictionary layer's vectors.
+query T
+SELECT to_tsvector('english', 'The Fat Cats are eating rats');
+----
+'cat':3 'eat':5 'fat':2 'rat':6
+
+query T
+SELECT to_tsvector('english', 'fat cats ate rats');
+----
+'ate':3 'cat':2 'fat':1 'rat':4
+
+query T
+SELECT to_tsvector('simple', 'The Fat Cats are eating rats');
+----
+'are':4 'cats':3 'eating':5 'fat':2 'rats':6 'the':1
+
+query T
+SELECT to_tsvector('english', 'a-café-x');
+----
+'a-café-x':1 'café':3 'x':4
+
+query T
+SELECT to_tsvector('simple', 'a-café-x');
+----
+'a':2 'a-café-x':1 'café':3 'x':4
+
+query T
+SELECT to_tsvector('english', 'user@example.com');
+----
+'user@example.com':1
+
+query T
+SELECT to_tsvector('simple', 'user@example.com');
+----
+'user@example.com':1
+
+query T
+SELECT to_tsvector('english', 'http://example.com/path?q=1');
+----
+'/path?q=1':3 'example.com':2 'example.com/path?q=1':1
+
+query T
+SELECT to_tsvector('english', '3.5e-2 1.2.3.4 v1.2.3');
+----
+'1.2.3.4':2 '3.5e-2':1 'v1.2.3':3
+
+query T
+SELECT to_tsvector('english', '<b>tag</b> <script>var x</script>after');
+----
+'tag':1
+
+query T
+SELECT to_tsvector('english', '&amp; &#x1f600;') = ''::tsvector;
+----
+t
+
+query T
+SELECT to_tsvector('english', 'e-mail x-ray state-of-the-art');
+----
+'art':11 'e':2 'e-mail':1 'mail':3 'ray':6 'state':8 'state-of-the-art':7 'x':5 'x-ray':4
+
+query T
+SELECT to_tsvector('english', 'The Quick-Brown FOXes jumped-over 42 LAZY dogs');
+----
+'42':9 'brown':4 'dog':11 'fox':5 'jump':7 'jumped-ov':6 'lazi':10 'quick':3 'quick-brown':2
+
+query T
+SELECT to_tsvector('english', 'i386-pc-linux-gnu kernel-6.1.0-13');
+----
+'-13':8 '6.1.0':7 'gnu':5 'i386':2 'i386-pc-linux-gnu':1 'kernel':6 'linux':4 'pc':3
+
+query T
+SELECT to_tsvector('english', 'über café naïve 日本語');
+----
+'café':2 'naïv':3 'über':1 '日本語':4
+
+query T
+SELECT to_tsvector('simple', 'über café naïve 日本語');
+----
+'café':2 'naïve':3 'über':1 '日本語':4
+
+query T
+SELECT to_tsvector('english', '') = ''::tsvector;
+----
+t
+
+query T
+SELECT to_tsvector('english', '   ') = ''::tsvector;
+----
+t
+
+query T
+SELECT to_tsvector('english', 'the the the') = ''::tsvector;
+----
+t
+
+query T
+SELECT to_tsvector('english', 'running runs ran runner');
+----
+'ran':3 'run':1,2 'runner':4
+
+query T
+SELECT to_tsvector('english', 'happiness happily unhappy');
+----
+'happi':1 'happili':2 'unhappi':3
+
+query T
+SELECT to_tsvector('english', 'skis skies idly gently ugly early only singly');
+----
+'earli':6 'gentl':4 'idl':3 'singl':8 'ski':1 'sky':2 'ugli':5
+
+query T
+SELECT to_tsvector('english', 'atlas cosmos bias andes sky news howe');
+----
+'andes':4 'atlas':1 'bias':3 'cosmos':2 'howe':7 'news':6 'sky':5
+
+query T
+SELECT to_tsvector('english', 'inning outing canning herring earring even');
+----
+'canning':3 'earring':5 'even':6 'herring':4 'inning':1 'outing':2
+
+query T
+SELECT to_tsvector('english', 'dying lying tying vying');
+----
+'die':1 'lie':2 'tie':3 'vy':4
+
+query T
+SELECT to_tsvector('english', 'are you there yet');
+----
+'yet':4
+
+query T
+SELECT to_tsvector('english', 'THIS IS ALL UPPERCASE');
+----
+'uppercas':4
+
+query T
+SELECT to_tsvector('english', 'word_with_underscores __dunder__');
+----
+'dunder':4 'underscor':3 'word':1
+
+query T
+SELECT to_tsvector('english', 'C++ C# .NET AT&T R&D');
+----
+'c':1,2 'd':7 'net':3 'r':6
+
+query T
+SELECT to_tsvector('english', 'university universal universe');
+----
+'univers':1,2,3
+
+query T
+SELECT to_tsvector('english', 'e.g. i.e. etc.');
+----
+'e.g':1 'etc':3 'i.e':2
+
+query T
+SELECT to_tsvector('english', 'U.S.A. No. 5 4th 5th');
+----
+'4th':4 '5':3 '5th':5 'u.s.a':1
+
+query T
+SELECT to_tsvector('x');
+----
+'x':1
+
+query T
+SELECT to_tsvector('english'::regconfig, 'The Fat Cats');
+----
+'cat':3 'fat':2
+
+query T
+SELECT pg_typeof(to_tsvector('x'));
+----
+tsvector
+
+query T
+SELECT to_tsvector('x') = 'x:1'::tsvector;
+----
+t
+
+query T
+SELECT 'english'::regconfig;
+----
+english
+
+query T
+SELECT pg_typeof('english'::regconfig);
+----
+regconfig
+
+query T
+SELECT 'english'::regconfig::oid;
+----
+13282
+
+statement error
+SELECT 'nosuch'::regconfig;
+
+statement error
+SELECT to_tsvector('nosuch', 'x');
+
+statement error
+SELECT to_tsvector(123, 'x');
+
+statement error
+SELECT to_tsvector('english'::text, 'x');
+
+statement error
+SELECT to_tsvector('english', 123);
+
+query T
+SELECT to_tsvector(NULL, 'x');
+----
+NULL
+
+query T
+SELECT to_tsvector('english', NULL);
+----
+NULL
+
+# The to_tsquery family.
+query T
+SELECT to_tsquery('english', 'fat & the & cat');
+----
+'fat' & 'cat'
+
+query T
+SELECT to_tsquery('english', 'fat & !the');
+----
+'fat'
+
+query T
+SELECT to_tsquery('english', 'the') = ''::tsquery;
+----
+t
+
+query T
+SELECT to_tsquery('english', 'cat:*');
+----
+'cat':*
+
+query T
+SELECT to_tsquery('english', 'cat:A');
+----
+'cat':A
+
+query T
+SELECT to_tsquery('english', 'cats & runs');
+----
+'cat' & 'run'
+
+query T
+SELECT to_tsquery('english', 'fat <-> the <-> cat');
+----
+'fat' <2> 'cat'
+
+query T
+SELECT to_tsquery('english', '(fat | the) & cat');
+----
+'fat' & 'cat'
+
+statement error
+SELECT to_tsquery('english', 'The Fat Cats');
+
+query T
+SELECT to_tsquery('english', '') = ''::tsquery;
+----
+t
+
+query T
+SELECT to_tsquery('english', '   ') = ''::tsquery;
+----
+t
+
+query T
+SELECT to_tsquery('simple', 'cats');
+----
+'cats'
+
+query T
+SELECT plainto_tsquery('english', 'The Fat Cats');
+----
+'fat' & 'cat'
+
+query T
+SELECT plainto_tsquery('english', 'a-café-x 42');
+----
+'a-café-x' & 'café' & 'x' & '42'
+
+query T
+SELECT plainto_tsquery('english', '') = ''::tsquery;
+----
+t
+
+query T
+SELECT plainto_tsquery('english', '   ') = ''::tsquery;
+----
+t
+
+query T
+SELECT plainto_tsquery('english', 'the are') = ''::tsquery;
+----
+t
+
+query T
+SELECT plainto_tsquery('simple', 'The Fat Cats');
+----
+'the' & 'fat' & 'cats'
+
+query T
+SELECT phraseto_tsquery('english', 'The Fat Cats');
+----
+'fat' <-> 'cat'
+
+query T
+SELECT phraseto_tsquery('english', 'the fat');
+----
+'fat'
+
+query T
+SELECT phraseto_tsquery('english', 'fat the cat');
+----
+'fat' <2> 'cat'
+
+query T
+SELECT phraseto_tsquery('english', '') = ''::tsquery;
+----
+t
+
+query T
+SELECT phraseto_tsquery('english', '   ') = ''::tsquery;
+----
+t
+
+query T
+SELECT websearch_to_tsquery('fat cat or -dog');
+----
+'fat' & 'cat' | !'dog'
+
+query T
+SELECT websearch_to_tsquery('"fat cat" dog');
+----
+'fat' <-> 'cat' & 'dog'
+
+query T
+SELECT websearch_to_tsquery('') = ''::tsquery;
+----
+t
+
+query T
+SELECT websearch_to_tsquery('   ') = ''::tsquery;
+----
+t
+
+query T
+SELECT websearch_to_tsquery('a & b');
+----
+'b'
+
+query T
+SELECT websearch_to_tsquery('"a b" c or -d');
+----
+'b' & 'c' | !'d'
+
+query T
+SELECT websearch_to_tsquery('or') = ''::tsquery;
+----
+t
+
+query T
+SELECT websearch_to_tsquery('-  foo');
+----
+!'foo'
+
+query T
+SELECT websearch_to_tsquery('foo -');
+----
+'foo'
+
+query T
+SELECT websearch_to_tsquery('foo &');
+----
+'foo'
+
+query T
+SELECT websearch_to_tsquery('foo bar or');
+----
+'foo' & 'bar'
+
+query T
+SELECT websearch_to_tsquery('cat:A');
+----
+'cat'
+
+query T
+SELECT websearch_to_tsquery('a:b:c');
+----
+'b' & 'c'
+
+query T
+SELECT websearch_to_tsquery('OR') = ''::tsquery;
+----
+t
+
+query T
+SELECT websearch_to_tsquery('foo OR bar');
+----
+'foo' | 'bar'
+
+query T
+SELECT websearch_to_tsquery('foo | bar');
+----
+'foo' & 'bar'
+
+query T
+SELECT websearch_to_tsquery('or or') = ''::tsquery;
+----
+t
+
+query T
+SELECT websearch_to_tsquery('the cat');
+----
+'cat'
+
+query T
+SELECT websearch_to_tsquery('-the cat');
+----
+'cat'
+
+query T
+SELECT websearch_to_tsquery('"the" cat');
+----
+'cat'
+
+query T
+SELECT websearch_to_tsquery('a b or c -d');
+----
+'b' | 'c' & !'d'
+
+query T
+SELECT websearch_to_tsquery('  "fat cat"  ');
+----
+'fat' <-> 'cat'
+
+query T
+SELECT websearch_to_tsquery('word-other');
+----
+'word-oth' <-> 'word'
+
+query T
+SELECT websearch_to_tsquery('cat:*');
+----
+'cat'
+
+query T
+SELECT websearch_to_tsquery(':a') = ''::tsquery;
+----
+t
+
+query T
+SELECT websearch_to_tsquery('a::b');
+----
+'b'
+
+query T
+SELECT websearch_to_tsquery('x ory');
+----
+'x' & 'ori'
+
+query T
+SELECT websearch_to_tsquery('or x');
+----
+'x'
+
+query T
+SELECT websearch_to_tsquery('-x -y');
+----
+!'x' & !'y'
+
+query T
+SELECT websearch_to_tsquery('café naïve');
+----
+'café' & 'naïv'
+
+query T
+SELECT to_tsquery('english', 'runner & running <-> runs');
+----
+'runner' & 'run' <-> 'run'
+
+query T
+SELECT phraseto_tsquery('simple', 'a-café-x 42');
+----
+'a-café-x' <-> 'a' <-> 'café' <-> 'x' <-> '42'

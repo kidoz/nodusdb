@@ -1029,7 +1029,11 @@ pub(crate) fn check_integer_ranges(
         // untyped literal resolves to one; a `text` value does not), and
         // the text is a string.
         ScalarExpr::Function { name, args }
-            if name == "TO_TSVECTOR" && matches!(args.len(), 1 | 2) =>
+            if matches!(
+                name.as_str(),
+                "TO_TSVECTOR" | "TO_TSQUERY" | "PLAINTO_TSQUERY" | "PHRASETO_TSQUERY"
+                    | "WEBSEARCH_TO_TSQUERY"
+            ) && matches!(args.len(), 1 | 2) =>
         {
             let unknown = |t: &Option<String>| {
                 t.as_deref()

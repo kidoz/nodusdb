@@ -99,6 +99,7 @@ pub(crate) fn is_known(name: &str) -> bool {
                 // Text search.
                 | "SETWEIGHT" | "STRIP" | "NUMNODE" | "TSVECTOR_TO_ARRAY"
                 | "ARRAY_TO_TSVECTOR" | "TSQUERY_PHRASE" | "TS_DELETE" | "TO_TSVECTOR"
+                | "TO_TSQUERY" | "PLAINTO_TSQUERY" | "PHRASETO_TSQUERY" | "WEBSEARCH_TO_TSQUERY"
                 // Dates and times.
                 | "NOW" | "CURRENT_TIMESTAMP" | "TRANSACTION_TIMESTAMP"
                 | "STATEMENT_TIMESTAMP" | "CLOCK_TIMESTAMP" | "CURRENT_DATE" | "CURRENT_TIME"
@@ -369,6 +370,9 @@ pub(crate) fn return_type(name: &str, arg_types: &[Option<String>]) -> Option<St
                 "TSVECTOR"
             }
             "TO_TSVECTOR" => "TSVECTOR",
+            "TO_TSQUERY" | "PLAINTO_TSQUERY" | "PHRASETO_TSQUERY" | "WEBSEARCH_TO_TSQUERY" => {
+                "TSQUERY"
+            }
             "TSQUERY_PHRASE" | "__TSNOT__" => "TSQUERY",
             "__TSCMP__" => "BOOLEAN",
             "__TS__" => match arg_types.first().cloned().flatten().as_deref() {
@@ -3270,6 +3274,30 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
         | "TSQUERY_PHRASE" | "TS_DELETE" =>
         {
             textsearch_function(&name.to_ascii_lowercase(), args)
+        }
+        // `to_tsquery` and its family: the dictionary layer's queries.
+        "TO_TSQUERY" | "PLAINTO_TSQUERY" | "PHRASETO_TSQUERY" | "WEBSEARCH_TO_TSQUERY"
+            if arity(1) || arity(2) =>
+        {
+            if args.iter().any(|a| matches!(a, Value::Null)) {
+                return Some(Value::Null);
+            }
+            let config = if arity(2) {
+                match to_ts_config(arg(0)) {
+                    Ok(config) => config,
+                    Err(error) => return Some(raise(error)),
+                }
+            } else {
+                default_ts_config()
+            };
+            let text = text(args.last().expect("arg"));
+            match &*name {
+                "TO_TSQUERY" => crate::textsearch::to_tsquery(config, &text),
+                "PLAINTO_TSQUERY" => crate::textsearch::plainto_tsquery(config, &text),
+                "PHRASETO_TSQUERY" => crate::textsearch::phraseto_tsquery(config, &text),
+                _ => crate::textsearch::websearch_to_tsquery(config, &text),
+            }
+            .map_or_else(raise, Value::Text)
         }
         // `to_tsvector([config,] text)`: the dictionary layer's vector.
         "TO_TSVECTOR" if arity(1) || arity(2) => {

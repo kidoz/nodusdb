@@ -235,8 +235,10 @@ SELECT id, name FROM wd ORDER BY id;
 statement error
 DELETE FROM wd WHERE no_such_function(name);
 
-statement error
+query T
 SELECT id FROM wd WHERE to_tsvector('english', name) @@ to_tsquery('english', 'x');
+----
+2
 
 query T
 SELECT count(*) FROM wd;
