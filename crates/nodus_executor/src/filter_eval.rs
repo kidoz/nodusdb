@@ -170,7 +170,8 @@ impl MemExecutor {
                             || crate::value::is_bytea_type(expected_type)
                             || crate::ranges::is_range_type(expected_type)
                             || crate::multiranges::is_multirange_type(expected_type)
-                            || crate::net::is_net_type(expected_type) =>
+                            || crate::net::is_net_type(expected_type)
+                            || crate::geometric::is_geometric_type(expected_type) =>
                     {
                         crate::value::coerce_for_column(val, expected_type)
                     }

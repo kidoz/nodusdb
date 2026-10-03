@@ -616,3 +616,105 @@ fn multiranges_read_write_and_operate() {
         ["int4multirange|int4multirange[]"]
     );
 }
+
+#[test]
+fn geometric_types_read_write_and_operate() {
+    let (sql, _) = session();
+    sql("CREATE TABLE geo (id int PRIMARY KEY, p point, b box, c circle)").unwrap();
+    sql("INSERT INTO geo VALUES (1, '(1,2)', '((0,0),(2,2))', '<(0,0),1>')").unwrap();
+    sql("INSERT INTO geo VALUES (2, '(3,4)', '((5,5),(6,6))', '<(1,1),2>')").unwrap();
+    sql("INSERT INTO geo VALUES (3, NULL, NULL, NULL)").unwrap();
+    // Literals canonicalize on the way in: a box keeps its upper corner
+    // first.
+    assert_eq!(
+        ordered(&sql("SELECT p, b, c FROM geo ORDER BY id").unwrap()),
+        [
+            "(1,2)|(2,2),(0,0)|<(0,0),1>",
+            "(3,4)|(6,6),(5,5)|<(1,1),2>",
+            "||",
+        ]
+    );
+    assert_eq!(
+        ordered(&sql("SELECT point(1, 2) <-> point(4, 6)").unwrap()),
+        ["5"]
+    );
+    assert_eq!(
+        ordered(&sql("SELECT '(1,2)'::point + '(3,4)'::point").unwrap()),
+        ["(4,6)"]
+    );
+    assert_eq!(
+        ordered(&sql("SELECT '(3,4)'::point * '(2,3)'::point").unwrap()),
+        ["(-6,17)"]
+    );
+    assert_eq!(
+        ordered(&sql("SELECT id FROM geo WHERE b @> point(1,1) ORDER BY id").unwrap()),
+        ["1"]
+    );
+    assert_eq!(
+        ordered(&sql("SELECT id FROM geo WHERE c && '<(3,0),2>'::circle ORDER BY id").unwrap()),
+        ["1", "2"]
+    );
+    assert_eq!(
+        ordered(
+            &sql("SELECT center('((0,0),(2,2))'::box), radius('< (1,2),3 >'::circle)").unwrap()
+        ),
+        ["(1,1)|3"]
+    );
+    assert_eq!(
+        ordered(
+            &sql("SELECT area('((0,0),(2,2))'::box), npoints('((0,0),(3,4),(3,0))'::polygon)")
+                .unwrap()
+        ),
+        ["4|3"]
+    );
+    assert_eq!(
+        ordered(&sql("SELECT '((0,0),(2,2))'::box::polygon").unwrap()),
+        ["((0,0),(0,2),(2,2),(2,0))"]
+    );
+    assert_eq!(
+        ordered(&sql("SELECT line(point(1,2), point(3,4))").unwrap()),
+        ["{1,-1,1}"]
+    );
+    assert_eq!(
+        ordered(&sql("SELECT lseg('((0,0),(2,3))'::box)").unwrap()),
+        ["[(2,3),(0,0)]"]
+    );
+    // No geometric type has an ordering, equality, or comparison function.
+    let (message, _) = fields(sql("SELECT p FROM geo ORDER BY p").unwrap_err());
+    assert_eq!(
+        message,
+        "could not identify an ordering operator for type point"
+    );
+    let (message, _) = fields(sql("SELECT count(*) FROM geo GROUP BY c").unwrap_err());
+    assert_eq!(
+        message,
+        "could not identify an equality operator for type circle"
+    );
+    let (message, _) = fields(sql("SELECT greatest('(1,2)'::point, '(3,4)'::point)").unwrap_err());
+    assert_eq!(
+        message,
+        "could not identify a comparison function for type point"
+    );
+    let (message, _) = fields(sql("SELECT min(p) FROM geo").unwrap_err());
+    assert_eq!(message, "function min(point) does not exist");
+    let (message, _) = fields(sql("SELECT 'x'::point").unwrap_err());
+    assert_eq!(message, "invalid input syntax for type point: \"x\"");
+    let (message, _) = fields(sql("SELECT '(1,2)'::point::lseg").unwrap_err());
+    assert_eq!(message, "cannot cast type point to lseg");
+    // The catalogs carry the types and their attributes.
+    assert_eq!(
+        ordered(&sql("SELECT typname FROM pg_type WHERE typcategory = 'G' ORDER BY oid").unwrap()),
+        ["point", "lseg", "path", "box", "polygon", "line", "circle"]
+    );
+    assert_eq!(
+        ordered(
+            &sql("SELECT format_type(600, NULL), format_type(718, NULL), format_type(1017, NULL)")
+                .unwrap()
+        ),
+        ["point|circle|point[]"]
+    );
+    assert_eq!(
+        rows(&sql("SELECT attlen, attalign, attstorage FROM pg_attribute WHERE attrelid = 'geo'::regclass AND attname = 'p'").unwrap()),
+        ["16|d|p"]
+    );
+}

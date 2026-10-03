@@ -1,0 +1,1246 @@
+# Geometric types: literals, constructors, accessors, operators, and
+# catalogs. Expected results come from PostgreSQL 18.
+# --- geo1
+query T
+SELECT '(1,2)'::point;
+----
+(1,2)
+
+query T
+SELECT '(1.5,-2.25)'::point;
+----
+(1.5,-2.25)
+
+query T
+SELECT '(1e10,2)'::point;
+----
+(10000000000,2)
+
+query T
+SELECT '(0.1,0.2)'::point;
+----
+(0.1,0.2)
+
+query T
+SELECT point(1,2);
+----
+(1,2)
+
+query T
+SELECT point(3.7, 4.2);
+----
+(3.7,4.2)
+
+query T
+SELECT '[(1,2),(3,4)]'::lseg;
+----
+[(1,2),(3,4)]
+
+query T
+SELECT lseg(point(1,2), point(3,4));
+----
+[(1,2),(3,4)]
+
+query T
+SELECT '[(1,2),(3,4)]'::path;
+----
+[(1,2),(3,4)]
+
+query T
+SELECT '((1,2),(3,4))'::path;
+----
+((1,2),(3,4))
+
+query T
+SELECT '((1,2),(3,4),(5,6))'::polygon;
+----
+((1,2),(3,4),(5,6))
+
+query T
+SELECT '((1,2),(3,4),(5,6),(1,2))'::polygon;
+----
+((1,2),(3,4),(5,6),(1,2))
+
+query T
+SELECT '<(1,2),3>'::circle;
+----
+<(1,2),3>
+
+query T
+SELECT circle(point(1,2), 3);
+----
+<(1,2),3>
+
+query T
+SELECT circle(point(1,2), 0);
+----
+<(1,2),0>
+
+query T
+SELECT '((1,2),(3,4))'::box;
+----
+(3,4),(1,2)
+
+query T
+SELECT '((3,4),(1,2))'::box;
+----
+(3,4),(1,2)
+
+query T
+SELECT box(point(1,2), point(3,4));
+----
+(3,4),(1,2)
+
+query T
+SELECT box(point(3,4), point(1,2));
+----
+(3,4),(1,2)
+
+query T
+SELECT '{1,-2,3}'::line;
+----
+{1,-2,3}
+
+query T
+SELECT line(point(1,2), point(3,4));
+----
+{1,-1,1}
+
+query T
+SELECT '(1,2)'::point::text;
+----
+(1,2)
+
+query T
+SELECT '((1,2),(3,4))'::box::text;
+----
+(3,4),(1,2)
+
+query T
+SELECT '<(1,2),3>'::circle::text;
+----
+<(1,2),3>
+
+query T
+SELECT point(1,2)::box;
+----
+(1,2),(1,2)
+
+query T
+SELECT '((1,2),(3,4))'::box::polygon;
+----
+((1,2),(1,4),(3,4),(3,2))
+
+query T
+SELECT '((1,2),(3,4),(5,6))'::polygon::box;
+----
+(5,6),(1,2)
+
+statement error
+SELECT '(1,2)'::point::lseg;
+
+statement error
+SELECT '[(1,2),(3,4)]'::lseg::path;
+
+query T
+SELECT '((1,2),(3,4))'::path::polygon;
+----
+((1,2),(3,4))
+
+statement error
+SELECT 'x'::point;
+
+statement error
+SELECT '(1)'::point;
+
+statement error
+SELECT '(1,2,3)'::point;
+
+statement error
+SELECT '(1,)'::box;
+
+query T
+SELECT path '[(1,2)]';
+----
+[(1,2)]
+
+query T
+SELECT polygon '((1,2))';
+----
+((1,2))
+
+# --- geo2
+query T
+SELECT point(1,2) + point(3,4);
+----
+(4,6)
+
+query T
+SELECT point(1,2) - point(3,4);
+----
+(-2,-2)
+
+query T
+SELECT point(3,4) * point(2,3);
+----
+(-6,17)
+
+query T
+SELECT point(3,4) / point(2,3);
+----
+(1.3846153846153846,-0.07692307692307693)
+
+statement error
+SELECT point(1,2) * 3;
+
+statement error
+SELECT point(1,2) / 3;
+
+query T
+SELECT point(1,2) <-> point(4,6);
+----
+5
+
+query T
+SELECT point(1,2) <-> '[(0,0),(1,1)]'::lseg;
+----
+1
+
+query T
+SELECT point(1,2) <-> '((0,0),(2,2))'::box;
+----
+0
+
+query T
+SELECT point(1,2) <-> '<(0,0),2>'::circle;
+----
+0.2360679774997898
+
+query T
+SELECT point(1,2) ~= point(1,2);
+----
+t
+
+query T
+SELECT point(1,2) ~= point(1.0000001,2);
+----
+t
+
+query T
+SELECT '((0,0),(2,2))'::box @> point(1,1);
+----
+t
+
+query T
+SELECT '((0,0),(2,2))'::box @> '((1,1),(1.5,1.5))'::box;
+----
+t
+
+query T
+SELECT '<(0,0),2>'::circle @> point(1,1);
+----
+t
+
+query T
+SELECT '<(0,0),2>'::circle @> '<(1,1),0.5>'::circle;
+----
+t
+
+query T
+SELECT '<(0,0),2>'::circle @> '<(5,5),1>'::circle;
+----
+f
+
+query T
+SELECT point(1,1) <@ '((0,0),(2,2))'::box;
+----
+t
+
+query T
+SELECT '((0,0),(2,2))'::box && '((1,1),(3,3))'::box;
+----
+t
+
+query T
+SELECT '<(0,0),2>'::circle && '<(3,0),2>'::circle;
+----
+t
+
+query T
+SELECT '((0,0),(1,1))'::box << '((2,2),(3,3))'::box;
+----
+t
+
+query T
+SELECT '((0,0),(1,1))'::box <<| '((2,2),(3,3))'::box;
+----
+t
+
+query T
+SELECT '((0,0),(1,1))'::box &< '((0,0),(2,2))'::box;
+----
+t
+
+query T
+SELECT '((0,0),(1,1))'::box &<| '((0,0),(2,2))'::box;
+----
+t
+
+statement error
+SELECT '((0,0),(2,2))'::box >> point(3,3);
+
+query T
+SELECT '((0,0),(2,2))'::box >> '((3,3),(4,4))'::box;
+----
+f
+
+statement error
+SELECT '((0,0),(2,2))'::box << point(-1,-1);
+
+query T
+SELECT '("(0,0)" x, y)'::text;
+----
+("(0,0)" x, y)
+
+query T
+SELECT '[(0,0),(1,1)]'::lseg <-> '[(2,2),(3,3)]'::lseg;
+----
+1.4142135623730951
+
+statement error
+SELECT '# ((0,0),(2,2))'::box;
+
+statement error
+SELECT '@@ ((0,0),(2,2))'::box;
+
+statement error
+SELECT '@-@ ((0,0),(3,4),(3,0))'::polygon;
+
+query T
+SELECT '[(0,0),(3,4)]'::lseg ?# '[(0,0),(3,0)]'::lseg;
+----
+t
+
+query T
+SELECT '[(0,0),(3,4)]'::lseg ?-| '[(0,0),(3,0)]'::lseg;
+----
+f
+
+query T
+SELECT point(1,2) ?- point(1,3);
+----
+f
+
+query T
+SELECT point(1,2) ?| point(3,2);
+----
+f
+
+query T
+SELECT '<(0,0),1>'::circle <-> '<(4,0),1>'::circle;
+----
+2
+
+query T
+SELECT '((0,0),(1,0),(1,1))'::polygon <-> '((5,5),(6,5),(6,6))'::polygon;
+----
+5.656854249492381
+
+# --- geo3
+query T
+SELECT center('((0,0),(2,2))'::box);
+----
+(1,1)
+
+query T
+SELECT center('<(1,2),3>'::circle);
+----
+(1,2)
+
+query T
+SELECT @@ '((0,0),(2,2))'::box;
+----
+(1,1)
+
+query T
+SELECT @@ '<(1,2),3>'::circle;
+----
+(1,2)
+
+query T
+SELECT @@ '[(0,0),(3,4)]'::lseg;
+----
+(1.5,2)
+
+query T
+SELECT @@ '((0,0),(3,4),(3,0))'::polygon;
+----
+(2,1.3333333333333333)
+
+statement error
+SELECT # '((0,0),(2,2))'::box;
+
+statement error
+SELECT # '[(0,0),(3,4)]'::lseg;
+
+query T
+SELECT # '((0,0),(1,0),(1,1))'::path;
+----
+3
+
+query T
+SELECT # '((0,0),(1,0),(1,1))'::polygon;
+----
+3
+
+query T
+SELECT @-@ '[(0,0),(3,4)]'::lseg;
+----
+5
+
+query T
+SELECT @-@ '((0,0),(3,4),(3,0))'::path;
+----
+12
+
+statement error
+SELECT @-@ '((0,0),(3,4),(3,0))'::polygon;
+
+query T
+SELECT radius('<(1,2),3>'::circle);
+----
+3
+
+query T
+SELECT diameter('<(1,2),3>'::circle);
+----
+6
+
+query T
+SELECT '<(1,2),3>'::circle * point(2,2);
+----
+<(-2,6),8.485281374238571>
+
+query T
+SELECT '((0,0),(2,2))'::box * point(2,2);
+----
+(0,8),(0,0)
+
+query T
+SELECT '((0,0),(2,2))'::box + point(1,1);
+----
+(3,3),(1,1)
+
+query T
+SELECT path '[(0,0),(3,4)]' + point(1,1);
+----
+[(1,1),(4,5)]
+
+query T
+SELECT path '[(0,0),(3,4)]' - point(1,1);
+----
+[(-1,-1),(2,3)]
+
+query T
+SELECT path '[(0,0),(3,4)]' * point(2,2);
+----
+[(0,0),(-2,14)]
+
+query T
+SELECT path '[(0,0),(3,4)]' / point(2,2);
+----
+[(0,0),(1.75,0.25)]
+
+query T
+SELECT '((0,0),(3,4),(3,0))'::polygon @> point(1,1);
+----
+t
+
+query T
+SELECT '((0,0),(3,4),(3,0))'::polygon @> '((0,0),(3,4),(3,0))'::polygon;
+----
+t
+
+query T
+SELECT npoints('((0,0),(3,4),(3,0))'::polygon);
+----
+3
+
+query T
+SELECT npoints('[(0,0),(3,4)]'::path);
+----
+2
+
+query T
+SELECT isclosed('((0,0),(3,4))'::path);
+----
+t
+
+query T
+SELECT isopen('((0,0),(3,4))'::path);
+----
+f
+
+query T
+SELECT isopen('[(0,0),(3,4)]'::path);
+----
+t
+
+query T
+SELECT pclose('[(0,0),(3,4),(3,0)]'::path);
+----
+((0,0),(3,4),(3,0))
+
+query T
+SELECT popen('((0,0),(3,4),(3,0))'::path);
+----
+[(0,0),(3,4),(3,0)]
+
+query T
+SELECT area('((0,0),(2,2))'::box);
+----
+4
+
+query T
+SELECT area('<(0,0),2>'::circle);
+----
+12.566370614359172
+
+query T
+SELECT area('((0,0),(2,0),(2,2),(0,2))'::path);
+----
+4
+
+query T
+SELECT height('((0,0),(2,3))'::box);
+----
+3
+
+query T
+SELECT width('((0,0),(2,3))'::box);
+----
+2
+
+query T
+SELECT diagonal('((0,0),(2,3))'::box);
+----
+[(2,3),(0,0)]
+
+query T
+SELECT bound_box('((0,0),(2,2))'::box, '((3,3),(4,4))'::box);
+----
+(4,4),(0,0)
+
+query T
+SELECT box('((0,0),(3,4),(3,0))'::polygon);
+----
+(3,4),(0,0)
+
+query T
+SELECT lseg('((0,0),(2,2))'::box);
+----
+[(2,2),(0,0)]
+
+statement error
+SELECT line('((0,0),(2,2))'::box);
+
+query T
+SELECT path('((0,0),(2,2))'::polygon);
+----
+((0,0),(2,2))
+
+query T
+SELECT circle('((0,0),(2,2))'::box);
+----
+<(1,1),1.4142135623730951>
+
+# --- geo4
+statement error
+SELECT '{1,-2,3}'::line, '{-1,2,-3}'::line, '{0,-1,2}'::line, '{0,1,-2}'::line, '{0,0,5}'::line, '{0,0,-5}'::line;
+
+query T
+SELECT line '{-1,1,1}';
+----
+{-1,1,1}
+
+query T
+SELECT point(1,2) ## '[(0,0),(2,2)]'::lseg;
+----
+(1.5,1.5)
+
+query T
+SELECT point(1,2) ## '((0,0),(2,2))'::box;
+----
+(1,2)
+
+query T
+SELECT point(5,5) ## '[(0,0),(2,2)]'::lseg;
+----
+(2,2)
+
+statement error
+SELECT point(1,2) ## point(3,4);
+
+query T
+SELECT point(1,2) <-> point(1,2.0000001);
+----
+9.999999983634211e-08
+
+query T
+SELECT point(1,2) ~= point(1,2.0000001);
+----
+t
+
+query T
+SELECT point(1,2) ~= point(1,2.000001);
+----
+f
+
+statement error
+SELECT '<(0,0),-1>'::circle;
+
+query T
+SELECT '<(0,0),1>'::circle < '<(0,0),2>'::circle;
+----
+t
+
+query T
+SELECT '<(0,0),1>'::circle < '<(2,0),1>'::circle;
+----
+f
+
+query T
+SELECT '((0,0),(1,1))'::box < '((0,0),(2,2))'::box;
+----
+t
+
+query T
+SELECT '((0,0),(1,1))'::box < '((5,5),(6,6))'::box;
+----
+f
+
+query T
+SELECT '[ (0,0),(1,1) ]'::lseg < '[(2,2),(3,3)]'::lseg;
+----
+f
+
+statement error
+SELECT '((0,0),(1,1),(2,2))'::polygon < '((0,0),(3,3),(4,4))'::polygon;
+
+statement error
+SELECT point(1,2) < point(2,1);
+
+statement error
+SELECT 'x'::circle;
+
+statement error
+SELECT '<(0,0),1,2>'::circle;
+
+query T
+SELECT '[(1,2),(3,4),(5,6)]'::path;
+----
+[(1,2),(3,4),(5,6)]
+
+query T
+SELECT '((1,2),(3,4),(5,6))'::path;
+----
+((1,2),(3,4),(5,6))
+
+query T
+SELECT path '((1,2))';
+----
+((1,2))
+
+query T
+SELECT '[(1,2)]'::path;
+----
+[(1,2)]
+
+query T
+SELECT '((0,0),(3,4),(3,0),(0,0))'::polygon;
+----
+((0,0),(3,4),(3,0),(0,0))
+
+query T
+SELECT lseg('((0,0),(2,3))'::box);
+----
+[(2,3),(0,0)]
+
+query T
+SELECT point('((0,0),(2,3))'::box);
+----
+(1,1.5)
+
+query T
+SELECT point('< (0,0),2 >'::circle);
+----
+(0,0)
+
+query T
+SELECT polygon('((0,0),(2,2),(3,0))'::path);
+----
+((0,0),(2,2),(3,0))
+
+query T
+SELECT circle('((0,0),(2,2))'::polygon);
+----
+<(1,1),1.4142135623730951>
+
+query T
+SELECT '((0,0),(2,2))'::box::circle;
+----
+<(1,1),1.4142135623730951>
+
+query T
+SELECT '<(1,1),2>'::circle::box;
+----
+(2.414213562373095,2.414213562373095),(-0.4142135623730949,-0.4142135623730949)
+
+query T
+SELECT '<(1,1),2>'::circle::point;
+----
+(1,1)
+
+query T
+SELECT '((0,0),(1,1))'::box::point;
+----
+(0.5,0.5)
+
+query T
+SELECT '((0,0),(1,1))'::box::lseg;
+----
+[(1,1),(0,0)]
+
+# --- geo5
+query TTTTTTTTT
+SELECT typname, oid, typarray, typlen, typbyval, typalign, typstorage, typcategory, typdelim FROM pg_type WHERE typname IN ('point','lseg','line','box','path','polygon','circle') ORDER BY oid;
+----
+point	600	1017	16	f	d	p	G	,
+lseg	601	1018	32	f	d	p	G	,
+path	602	1019	-1	f	d	x	G	,
+box	603	1020	32	f	d	p	G	;
+polygon	604	1027	-1	f	d	x	G	,
+line	628	629	24	f	d	p	G	,
+circle	718	719	24	f	d	p	G	,
+
+query TTTT
+SELECT format_type(600, NULL), format_type(628, NULL), format_type(718, NULL), format_type(1017, NULL);
+----
+point	line	circle	point[]
+
+query TTT
+SELECT 'point'::regtype::oid, '_box'::regtype::oid, 'circle'::regtype::oid;
+----
+600	1020	718
+
+query T
+SELECT ARRAY['(1,2)'::point, '(3,4)'::point];
+----
+{"(1,2)","(3,4)"}
+
+query TT
+SELECT pg_typeof(point(1,2)), pg_typeof('(1,2)'::point::text);
+----
+point	text
+
+statement ok
+CREATE TABLE gt (id int PRIMARY KEY, p point, b box, c circle, pa path);
+
+statement ok
+INSERT INTO gt VALUES (1, '(1,2)', '((0,0),(2,2))', '<(1,1),1>', '[(0,0),(1,1)]');
+
+statement ok
+INSERT INTO gt VALUES (2, '(3,4)', '((5,5),(6,6))', '<(0,0),3>', '[(2,2),(3,3)]');
+
+statement ok
+INSERT INTO gt VALUES (3, NULL, NULL, NULL, NULL);
+
+query TTTTT
+SELECT * FROM gt ORDER BY id;
+----
+1	(1,2)	(2,2),(0,0)	<(1,1),1>	[(0,0),(1,1)]
+2	(3,4)	(6,6),(5,5)	<(0,0),3>	[(2,2),(3,3)]
+3	NULL	NULL	NULL	NULL
+
+query T
+SELECT id FROM gt WHERE b @> point(1,1) ORDER BY id;
+----
+1
+
+query T rowsort
+SELECT count(*) FROM gt WHERE b && '((1,1),(3,3))'::box;
+----
+1
+
+statement error
+SELECT p FROM gt ORDER BY p;
+
+statement error
+SELECT b FROM gt ORDER BY b;
+
+statement error
+SELECT c FROM gt ORDER BY c;
+
+statement error
+SELECT DISTINCT c FROM gt ORDER BY c;
+
+statement error
+SELECT count(*) FROM gt GROUP BY c ORDER BY 1;
+
+query TTT
+SELECT column_name, data_type, udt_name FROM information_schema.columns WHERE table_name = 'gt' ORDER BY ordinal_position;
+----
+id	integer	int4
+p	point	point
+b	box	box
+c	circle	circle
+pa	path	path
+
+statement error
+CREATE INDEX gt_b_idx ON gt (b);
+
+query T rowsort
+SELECT count(*) FROM gt WHERE b = '((0,0),(2,2))'::box;
+----
+1
+
+statement ok
+CREATE TABLE gck (b box CHECK (b @> point(1,1)));
+
+statement ok
+INSERT INTO gck VALUES ('((0,0),(2,2))');
+
+statement error
+INSERT INTO gck VALUES ('((5,5),(6,6))');
+
+query T rowsort
+SELECT b FROM gck;
+----
+(2,2),(0,0)
+
+query T
+SELECT p <-> point(0,0) AS d FROM gt WHERE p IS NOT NULL ORDER BY d;
+----
+2.23606797749979
+5
+
+statement error
+SELECT abs('x'::point);
+
+# --- geo6
+statement error
+SELECT '[(0,0),(3,0)]'::lseg ?- '[(0,0),(3,0)]'::lseg;
+
+statement error
+SELECT '[(0,0),(3,0)]'::lseg ?| '[(0,0),(0,3)]'::lseg;
+
+query T
+SELECT '[(0,0),(3,4)]'::lseg ?-| '[(0,0),(-4,3)]'::lseg;
+----
+t
+
+query T
+SELECT '[(0,0),(3,4)]'::lseg ?|| '[(1,1),(4,5)]'::lseg;
+----
+t
+
+statement error
+SELECT '{0,-1,2}'::line ?- '{0,-3,1}'::line;
+
+statement error
+SELECT '{0,-1,2}'::line ?| '{-1,-1,1}'::line;
+
+query T
+SELECT '{0,-1,2}'::line ?-| '{1,-1,1}'::line;
+----
+f
+
+query T
+SELECT '{0,-1,2}'::line ?|| '{0,-2,1}'::line;
+----
+t
+
+query T
+SELECT '((0,0),(1,1))'::box <<| '((0,2),(1,3))'::box;
+----
+t
+
+query T
+SELECT '((0,2),(1,3))'::box |>> '((0,0),(1,1))'::box;
+----
+t
+
+query T
+SELECT '((0,0),(1,1))'::box &<| '((0,0),(1,2))'::box;
+----
+t
+
+query T
+SELECT '((0,0),(1,2))'::box |&> '((0,0),(1,1))'::box;
+----
+t
+
+query T
+SELECT '((0,0),(1,1))'::box <^ '((0,2),(1,3))'::box;
+----
+t
+
+query T
+SELECT '((0,2),(1,3))'::box >^ '((0,0),(1,1))'::box;
+----
+t
+
+query T
+SELECT point(0,0) <^ point(0,1);
+----
+t
+
+query T
+SELECT point(0,1) >^ point(0,0);
+----
+t
+
+query T
+SELECT '<(0,0),1>'::circle << '<(5,0),1>'::circle;
+----
+t
+
+query T
+SELECT '<(0,0),1>'::circle <<| '<(0,5),1>'::circle;
+----
+t
+
+query T
+SELECT '<(0,0),1>'::circle &< '<(0.5,0),1>'::circle;
+----
+t
+
+query T
+SELECT '<(0,0),1>'::circle |&> '<(0.5,0),1>'::circle;
+----
+t
+
+query T
+SELECT '((0,0),(1,0),(1,1))'::polygon << '((5,0),(6,0),(6,1))'::polygon;
+----
+t
+
+query T
+SELECT '((0,0),(1,0),(1,1))'::polygon >> '((-5,0),(-6,0),(-6,1))'::polygon;
+----
+t
+
+query T
+SELECT '((0,0),(1,0),(1,1))'::polygon && '((0.5,0.5),(2,2),(3,3))'::polygon;
+----
+t
+
+query T
+SELECT '((0,0),(1,0),(1,1))'::polygon && '((5,5),(6,6),(7,7))'::polygon;
+----
+f
+
+query T
+SELECT '[(0,0),(3,4)]'::lseg ?# '[(0,4),(3,0)]'::lseg;
+----
+t
+
+query T
+SELECT '[(0,0),(3,4)]'::lseg ?# '((0,0),(3,4))'::box;
+----
+t
+
+query T
+SELECT '{0,-1,0}'::line ?# '{0,-1,0}'::line;
+----
+f
+
+query T
+SELECT '{0,-1,0}'::line ?# '((0,0),(3,4))'::box;
+----
+t
+
+query T
+SELECT '[(0,0),(3,4)]'::path ?# '[(0,0),(3,0),(4,4)]'::path;
+----
+t
+
+query T
+SELECT '[(0,0),(3,4)]'::lseg # '[(0,4),(3,0)]'::lseg;
+----
+(1.5,2)
+
+query T
+SELECT '[(0,0),(3,4)]'::lseg # '[(1,1),(4,5)]'::lseg;
+----
+NULL
+
+query T
+SELECT '{0,-1,0}'::line # '{1,0,-1}'::line;
+----
+(1,0)
+
+statement error
+SELECT '# ((0,0),(2,2))'::box # '((1,1),(3,3))'::box;
+
+query T
+SELECT point(5,5) ## '((0,0),(2,2))'::box;
+----
+(2,2)
+
+query T
+SELECT point(3,3) ## '[(0,0),(2,2)]'::lseg;
+----
+(2,2)
+
+query T
+SELECT point(1,2) ## '{1,-1,1}'::line;
+----
+(1,2)
+
+query T
+SELECT @-@ '[(0,0),(3,4),(3,0)]'::path;
+----
+9
+
+statement error
+SELECT '# ((0,0),(3,4),(3,0))'::path;
+
+statement error
+SELECT '# ((0,0),(3,4),(3,0))'::polygon;
+
+statement error
+SELECT area('((0,0),(2,2))'::box), area('<(0,0),2>'::circle), area('((0,0),(2,0),(2,2),(0,2))'::polygon);
+
+query TTTT
+SELECT center('((0,0),(2,2))'::box), center('<(1,2),3>'::circle), radius('<(1,2),3>'::circle), diameter('<(1,2),3>'::circle);
+----
+(1,1)	(1,2)	3	6
+
+query TTT
+SELECT height('((0,0),(2,3))'::box), width('((0,0),(2,3))'::box), diagonal('((0,0),(2,3))'::box);
+----
+3	2	[(2,3),(0,0)]
+
+query TT
+SELECT npoints('((0,0),(3,4),(3,0))'::polygon), npoints('[(0,0),(3,4)]'::path);
+----
+3	2
+
+query TT
+SELECT isclosed('((0,0),(3,4))'::path), isopen('[(0,0),(3,4)]'::path);
+----
+t	t
+
+query TT
+SELECT pclose('[(0,0),(3,4),(3,0)]'::path), popen('((0,0),(3,4),(3,0))'::path);
+----
+((0,0),(3,4),(3,0))	[(0,0),(3,4),(3,0)]
+
+query TTT
+SELECT point(1,2) + point(3,4), point(1,2) * point(3,4), point(4,2) / point(2,1);
+----
+(4,6)	(-5,10)	(2,0)
+
+query TTT
+SELECT '((0,0),(2,2))'::box + point(1,1), '((0,0),(2,2))'::box * point(2,2), '((0,0),(2,2))'::box - point(1,1);
+----
+(3,3),(1,1)	(0,8),(0,0)	(1,1),(-1,-1)
+
+query TT
+SELECT '<(1,1),2>'::circle + point(1,1), '<(1,1),2>'::circle / point(1,0);
+----
+<(2,2),2>	<(1,1),2>
+
+query TT
+SELECT path '[(0,0),(3,4)]' + point(1,1), path '[(0,0),(3,4)]' * point(2,2);
+----
+[(1,1),(4,5)]	[(0,0),(-2,14)]
+
+query TT
+SELECT point(1,2) <-> point(4,6), point(1,2) <-> '[(0,0),(1,1)]'::lseg;
+----
+5	1
+
+query TT
+SELECT point(1,2) ~= point(1,2), '((0,0),(2,2))'::box ~= '((0,0),(2,2))'::box;
+----
+t	t
+
+query TT
+SELECT '((0,0),(3,4))'::lseg < '((0,0),(4,4))'::lseg, '((0,0),(3,4))'::lseg > '((0,0),(2,2))'::lseg;
+----
+t	t
+
+query TT
+SELECT '((0,0),(3,4))'::path < '((0,0),(3,4),(1,1))'::path, '((0,0),(3,4))'::path = '((0,0),(3,4))'::path;
+----
+t	t
+
+query TTT
+SELECT point(1,2)::box, '((0,0),(2,2))'::box::polygon, '((0,0),(3,4),(3,0))'::polygon::box;
+----
+(1,2),(1,2)	((0,0),(0,2),(2,2),(2,0))	(3,4),(0,0)
+
+query TTT
+SELECT '((0,0),(2,2))'::box::point, '((0,0),(2,2))'::box::lseg, '((0,0),(2,2))'::box::circle;
+----
+(1,1)	[(2,2),(0,0)]	<(1,1),1.4142135623730951>
+
+query TTT
+SELECT '<(1,1),2>'::circle::point, '((0,0),(2,2),(3,0))'::polygon::point, '((0,0),(3,4),(3,0))'::polygon::path;
+----
+(1,1)	(1.6666666666666667,0.6666666666666666)	((0,0),(3,4),(3,0))
+
+query TTT
+SELECT '((0,0),(2,2))'::path::polygon, lseg('((0,0),(2,3))'::box), point('((0,0),(2,3))'::box);
+----
+((0,0),(2,2))	[(2,3),(0,0)]	(1,1.5)
+
+query TTT
+SELECT box('((0,0),(3,4),(3,0))'::polygon), circle('((0,0),(2,2))'::box), circle('((0,0),(2,2))'::polygon);
+----
+(3,4),(0,0)	<(1,1),1.4142135623730951>	<(1,1),1.4142135623730951>
+
+query TT
+SELECT path('((0,0),(2,2))'::polygon), polygon('((0,0),(2,2),(3,0))'::path);
+----
+((0,0),(2,2))	((0,0),(2,2),(3,0))
+
+query TTT
+SELECT line(point(1,2), point(3,4)), line(point(1,2), point(1,4)), line(point(1,2), point(3,2));
+----
+{1,-1,1}	{-1,0,1}	{0,-1,2}
+
+query TT
+SELECT '((0,0),(2,2))'::box ~= '((0,0),(2,2))'::box, point(1,1) <@ '((0,0),(2,2))'::box;
+----
+t	t
+
+query TT
+SELECT '[(0,0),(1,1)]'::lseg <@ '((0,0),(2,2))'::box, '[(0,0),(1,1)]'::lseg <@ '{1,-1,0}'::line;
+----
+t	t
+
+# --- geo7
+statement ok
+CREATE TABLE gd (id int PRIMARY KEY, p point, c circle);
+
+statement ok
+INSERT INTO gd VALUES (1, '(1,2)', '<(0,0),1>');
+
+statement ok
+INSERT INTO gd VALUES (2, '(3,4)', '<(1,1),2>');
+
+query TT rowsort
+SELECT count(p), count(*) FROM gd;
+----
+2	2
+
+statement error
+SELECT min(p) FROM gd;
+
+statement error
+SELECT max(c) FROM gd;
+
+query T rowsort
+SELECT array_agg(p) FROM gd;
+----
+{"(1,2)","(3,4)"}
+
+statement error
+SELECT sum(p) FROM gd;
+
+query TTTTT
+SELECT attname, atttypid::regtype, attlen, attalign, attstorage FROM pg_attribute WHERE attrelid = 'gd'::regclass AND attname = 'p';
+----
+p	point	16	d	p
+
+statement ok
+UPDATE gd SET p = '(5,6)' WHERE id = 1;
+
+query T
+SELECT p FROM gd ORDER BY id;
+----
+(5,6)
+(3,4)
+
+statement error
+DELETE FROM gd WHERE p = '(3,4)'::point;
+
+query T rowsort
+SELECT p FROM gd WHERE p ~= '(5,6)'::point;
+----
+(5,6)
+
+statement ok
+INSERT INTO gd VALUES (3, '(7,8)', NULL);
+
+query T rowsort
+SELECT count(*) FILTER (WHERE p IS NOT NULL) FROM gd;
+----
+3
+
+query T rowsort
+SELECT (SELECT p FROM gd WHERE id = 3) AS sub;
+----
+(7,8)
+
+query T rowsort
+SELECT p || 'x' FROM gd WHERE id = 3;
+----
+(7,8)x
+
+query T rowsort
+SELECT 'x' || p FROM gd WHERE id = 3;
+----
+x(7,8)
+
+query TT rowsort
+SELECT p IS NULL, c IS NOT NULL FROM gd WHERE id = 3;
+----
+f	f
+
+query T
+SELECT coalesce(NULL::point, '(1,2)'::point);
+----
+(1,2)
+
+statement error
+SELECT greatest('(1,2)'::point, '(3,4)'::point);
+
+query T
+SELECT CASE WHEN true THEN '(1,2)'::point ELSE '(3,4)'::point END;
+----
+(1,2)
+
+query T rowsort
+SELECT p::text FROM gd WHERE id = 3;
+----
+(7,8)
+
+query T
+SELECT format('%s', '(1,2)'::point);
+----
+(1,2)
+
+query T
+SELECT to_json('(1,2)'::point);
+----
+"(1,2)"
+
+statement error
+SELECT point('x');
+
+query T
+SELECT circle(point(0,0), -1);
+----
+<(0,0),-1>
+
+statement error
+SELECT '(1,2)'::point = '(1,2)'::point;
+
+query T
+SELECT '(1,2)'::point <> '(3,4)'::point;
+----
+t

@@ -922,6 +922,30 @@ impl MemExecutor {
                         alias: Some(op.sql_name().to_string()),
                     }
                 }
+                // Only `count` and the collectors take a geometric value.
+                ProjectionItem::Aggregate(op, arg)
+                    if !matches!(
+                        op,
+                        AggregateOp::Count
+                            | AggregateOp::ArrayAgg
+                            | AggregateOp::JsonAgg
+                            | AggregateOp::JsonbAgg
+                            | AggregateOp::JsonObjectAgg
+                            | AggregateOp::JsonbObjectAgg
+                    ) && column_type(&arg)
+                        .is_some_and(|t| crate::geometric::Kind::of(&t).is_some()) =>
+                {
+                    let kind = column_type(&arg)
+                        .and_then(|t| crate::geometric::Kind::of(&t))
+                        .expect("guarded by the match arm");
+                    ProjectionItem::Expr {
+                        expr: crate::result_types::bad_function(
+                            &op.sql_name().to_ascii_lowercase(),
+                            kind.name(),
+                        ),
+                        alias: Some(format!("{op:?}").to_ascii_lowercase()),
+                    }
+                }
                 // Money has no `avg` (nor any variance aggregate); the
                 // collectors take it, and `sum` above.
                 ProjectionItem::Aggregate(op, arg)
@@ -1011,6 +1035,29 @@ impl MemExecutor {
             .into_iter()
             .map(|(name, e)| (name, check(&e)))
             .collect();
+        // A geometric value has neither default ordering nor equality.
+        if let Some(kind) = group_by
+            .iter()
+            .filter_map(|name| column_type(name))
+            .find_map(|t| crate::geometric::Kind::of(&t))
+            .or_else(|| {
+                group_exprs.iter().find_map(|(name, expr)| {
+                    crate::result_types::expr_type(expr, &column_type)
+                        .or_else(|| column_type(name))
+                        .and_then(|t| crate::geometric::Kind::of(&t))
+                })
+            })
+        {
+            anyhow::bail!(
+                "{}",
+                crate::error_fields::DbError::new(format!(
+                    "could not identify an equality operator for type {}",
+                    kind.name()
+                ))
+                .code("42883")
+                .into_text()
+            );
+        }
         // An enum column sorts in the enum's order.
         let plain_column = |name: &str| {
             !projection.iter().any(|item| match item {
@@ -2071,6 +2118,23 @@ impl MemExecutor {
                 .iter()
                 .map(|t| t.as_deref().and_then(crate::ranges::Kind::of))
                 .collect();
+            // No geometric type has a default ordering operator class.
+            if let Some(kind) = key_types
+                .iter()
+                .filter_map(|t| t.as_deref().and_then(crate::geometric::Kind::of))
+                .next()
+            {
+                anyhow::bail!(
+                    "{}",
+                    crate::error_fields::DbError::new(format!(
+                        "could not identify an ordering operator for type {}",
+                        kind.name()
+                    ))
+                    .code("42883")
+                    .hint("Use an explicit ordering operator or modify the query.")
+                    .into_text()
+                );
+            }
             let multirange_keys: Vec<Option<crate::ranges::Kind>> = key_types
                 .iter()
                 .map(|t| t.as_deref().and_then(crate::multiranges::kind_of))
@@ -2166,6 +2230,25 @@ impl MemExecutor {
 
         // DISTINCT: equal intervals (`1 day`, `24 hours`) are one value.
         if distinct {
+            let declared = |name: &str| {
+                crate::filter_eval::col_pos(&col_names, name)
+                    .and_then(|i| joined_columns.get(i))
+                    .map(|c| c.data_type.clone())
+            };
+            if let Some(kind) = out_cols
+                .iter()
+                .find_map(|name| declared(name).and_then(|t| crate::geometric::Kind::of(&t)))
+            {
+                anyhow::bail!(
+                    "{}",
+                    crate::error_fields::DbError::new(format!(
+                        "could not identify an equality operator for type {}",
+                        kind.name()
+                    ))
+                    .code("42883")
+                    .into_text()
+                );
+            }
             let declared = |name: &str| {
                 crate::filter_eval::col_pos(&col_names, name)
                     .and_then(|i| joined_columns.get(i))

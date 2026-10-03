@@ -628,6 +628,20 @@ fn range_operator_symbol(op: &sqlparser::ast::BinaryOperator) -> Option<&'static
         B::Custom(symbol) if symbol == "-|-" => "-|-",
         B::Custom(symbol) if symbol == "<<=" => "<<=",
         B::Custom(symbol) if symbol == ">>=" => ">>=",
+        // The geometric operators the types share with no other family.
+        B::LtDashGt => "<->",
+        B::QuestionDash => "?-",
+        B::TildeEq => "~=",
+        B::QuestionHash => "?#",
+        B::QuestionDashPipe => "?-|",
+        B::QuestionDoublePipe => "?||",
+        B::DoubleHash => "##",
+        B::LtLtPipe => "<<|",
+        B::PipeGtGt => "|>>",
+        B::AndLtPipe => "&<|",
+        B::PipeAndGt => "|&>",
+        B::LtCaret => "<^",
+        B::GtCaret => ">^",
         B::PGCustomBinaryOperator(parts) => match parts.last().map(String::as_str) {
             Some("@>") => "@>",
             Some("<@") => "<@",
@@ -868,6 +882,19 @@ pub(crate) fn lower_scalar(expr: &sqlparser::ast::Expr, params: &[Value]) -> Opt
                 U::Not => ScalarUnaryOp::Not,
                 U::Plus => return Some(e),
                 U::BitwiseNot => return Some(call(crate::result_types::BIT_NOT)),
+                U::AtDashAt | U::DoubleAt | U::Hash | U::QuestionDash | U::QuestionPipe => {
+                    let symbol = match op {
+                        U::AtDashAt => "@-@",
+                        U::DoubleAt => "@@",
+                        U::Hash => "#",
+                        U::QuestionDash => "?-",
+                        _ => "?|",
+                    };
+                    return Some(ScalarExpr::Function {
+                        name: crate::result_types::GEO_UNARY.to_string(),
+                        args: vec![ScalarExpr::Literal(Value::Text(symbol.to_string())), e],
+                    });
+                }
                 U::PGSquareRoot => return Some(call("SQRT")),
                 U::PGCubeRoot => return Some(call("CBRT")),
                 U::PGAbs => return Some(call("ABS")),

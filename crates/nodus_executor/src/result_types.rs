@@ -205,6 +205,62 @@ fn scalar_type(expr: &ScalarExpr, column: &impl Fn(&str) -> Option<String>) -> O
                 _ => None,
             }
         }
+        // The geometric operators, casts, and functions carry their result
+        // types by name.
+        ScalarExpr::Function { name, args } if name == GEO_OP => {
+            let op = args.first().and_then(|arg| match arg {
+                ScalarExpr::Literal(Value::Text(op)) => Some(op.as_str()),
+                _ => None,
+            })?;
+            return Some(
+                match op {
+                    "<->" | "@-@" => "DOUBLE PRECISION",
+                    "@@" => "POINT",
+                    "#" => {
+                        let left = args.get(1).and_then(|arg| {
+                            scalar_type(arg, column).and_then(|t| crate::geometric::Kind::of(&t))
+                        });
+                        if left == Some(crate::geometric::Kind::Box) {
+                            "BOX"
+                        } else {
+                            "POINT"
+                        }
+                    }
+                    "##" => "POINT",
+                    _ => "BOOLEAN",
+                }
+                .to_string(),
+            );
+        }
+        ScalarExpr::Function { name, args } if name == GEO_CAST => {
+            return args.get(1).and_then(|arg| match arg {
+                ScalarExpr::Literal(Value::Text(kind)) => Some(kind.clone()),
+                _ => None,
+            });
+        }
+        ScalarExpr::Function { name, args } if name == GEO_FN => {
+            let literal = |i: usize| match args.get(i) {
+                Some(ScalarExpr::Literal(Value::Text(text))) => Some(text.as_str()),
+                _ => None,
+            };
+            return crate::geometric::return_type(&literal(0)?.to_ascii_uppercase(), literal(1)?)
+                .or_else(|| Some(literal(1)?.to_string()));
+        }
+        ScalarExpr::Function { name, args } if name == GEO_UNARY => {
+            let op = args.first().and_then(|arg| match arg {
+                ScalarExpr::Literal(Value::Text(op)) => Some(op.as_str()),
+                _ => None,
+            })?;
+            return Some(
+                match op {
+                    "@-@" => "DOUBLE PRECISION",
+                    "@@" => "POINT",
+                    "#" => "INTEGER",
+                    _ => "BOOLEAN",
+                }
+                .to_string(),
+            );
+        }
         // `greatest`/`least` of a range family keep its type.
         ScalarExpr::Function { name, args } if name == RANGE_GREATEST => {
             return args.get(1).and_then(|arg| match arg {
@@ -402,6 +458,24 @@ pub(crate) fn check_integer_ranges(
         }
     };
     let range_kind = |e: &ScalarExpr| range_side(e).map(|(kind, _)| kind);
+    // A geometric type, whose operators and functions take it along.
+    let geo_kind =
+        |e: &ScalarExpr| scalar_type(e, column).and_then(|t| crate::geometric::Kind::of(&t));
+    let geo_call = |op: &str, l: &ScalarExpr, r: &ScalarExpr, kind: crate::geometric::Kind| {
+        let right_kind = geo_kind(r)
+            .map(|kind| kind.name().to_string())
+            .unwrap_or_default();
+        ScalarExpr::Function {
+            name: GEO_OP.to_string(),
+            args: vec![
+                ScalarExpr::Literal(Value::Text(op.to_string())),
+                l.clone(),
+                r.clone(),
+                ScalarExpr::Literal(Value::Text(kind.name().to_string())),
+                ScalarExpr::Literal(Value::Text(right_kind)),
+            ],
+        }
+    };
     // An element bound to a range operator must be of its subtype; an
     // unknown or string literal is read as one.
     let element_fits = |kind: crate::ranges::Kind, e: &ScalarExpr| -> bool {
@@ -533,6 +607,119 @@ pub(crate) fn check_integer_ranges(
                 None => {}
             }
         }
+        // Casts between geometric types: only PostgreSQL's casts exist.
+        ScalarExpr::Cast { expr: inner, target }
+            if let (Some(from), Some(to)) = (geo_kind(inner), crate::geometric::Kind::of(target)) =>
+        {
+            return ScalarExpr::Function {
+                name: GEO_CAST.to_string(),
+                args: vec![
+                    ScalarExpr::Literal(Value::Text(from.name().to_string())),
+                    ScalarExpr::Literal(Value::Text(to.name().to_string())),
+                    (**inner).clone(),
+                ],
+            };
+        }
+        // A geometric function or constructor learns its type, and its
+        // first argument's when that argument is geometric too.
+        ScalarExpr::Function { name, args }
+            if crate::geometric::Kind::of(name).is_some()
+                || (matches!(
+                    name.as_str(),
+                    "CENTER"
+                        | "RADIUS"
+                        | "DIAMETER"
+                        | "HEIGHT"
+                        | "WIDTH"
+                        | "DIAGONAL"
+                        | "AREA"
+                        | "NPOINTS"
+                        | "ISCLOSED"
+                        | "ISOPEN"
+                        | "PCLOSE"
+                        | "POPEN"
+                        | "BOUND_BOX"
+                ) && args.iter().any(|arg| geo_kind(arg).is_some())) =>
+        {
+            // `point('(1,2)')` reads the text as the type's input.
+            if let Some(kind) = crate::geometric::Kind::of(name)
+                && let [only] = args.as_slice()
+                && scalar_type(only, column).is_none_or(|t| {
+                    is_text_type(&t) || t.trim().is_empty() || t.eq_ignore_ascii_case("UNKNOWN")
+                })
+            {
+                let _ = kind;
+                return ScalarExpr::Cast {
+                    expr: Box::new(only.clone()),
+                    target: name.clone(),
+                };
+            }
+            let result_kind = crate::geometric::Kind::of(name)
+                .or_else(|| args.iter().find_map(|arg| geo_kind(arg)));
+            let Some(result_kind) = result_kind else {
+                return checked.clone();
+            };
+            let arg_kinds: Vec<Option<crate::geometric::Kind>> =
+                args.iter().map(geo_kind).collect();
+            if !crate::geometric::function_supported(
+                &name.to_ascii_uppercase(),
+                result_kind,
+                &arg_kinds,
+            ) {
+                let types: Vec<String> = args
+                    .iter()
+                    .map(|arg| {
+                        geo_kind(arg).map_or_else(
+                            || operator_type_name(&scalar_type(arg, column).unwrap_or_default()),
+                            |kind| kind.name().to_string(),
+                        )
+                    })
+                    .collect();
+                return bad_function_args(&name.to_ascii_lowercase(), &types);
+            }
+            let argument_kind = geo_kind(args.first().unwrap_or(&ScalarExpr::Literal(Value::Null)))
+                .map(|kind| kind.name().to_string())
+                .unwrap_or_default();
+            let mut with_kind = vec![
+                ScalarExpr::Literal(Value::Text(name.to_ascii_lowercase())),
+                ScalarExpr::Literal(Value::Text(result_kind.name().to_string())),
+                ScalarExpr::Literal(Value::Text(argument_kind)),
+            ];
+            with_kind.extend(args.iter().cloned());
+            return ScalarExpr::Function {
+                name: GEO_FN.to_string(),
+                args: with_kind,
+            };
+        }
+        // A unary geometric operator.
+        ScalarExpr::Function { name, args }
+            if name == GEO_UNARY
+                && let [ScalarExpr::Literal(Value::Text(op)), value] = args.as_slice() =>
+        {
+            if let Some(kind) = geo_kind(value)
+                && crate::geometric::unary_supported(kind, op)
+            {
+                return ScalarExpr::Function {
+                    name: GEO_UNARY.to_string(),
+                    args: vec![
+                        ScalarExpr::Literal(Value::Text(op.to_string())),
+                        (*value).clone(),
+                        ScalarExpr::Literal(Value::Text(kind.name().to_string())),
+                    ],
+                };
+            }
+            let other = operator_type_name(&scalar_type(value, column).unwrap_or_default());
+            return bad_operator("", op, &other);
+        }
+        // `#` of two geometric shapes is their intersection or point count,
+        // not the bitwise exclusive or.
+        ScalarExpr::Function { name, args }
+            if name == BIT_XOR
+                && let [l, r] = args.as_slice()
+                && let Some(kind) = geo_kind(l).or_else(|| geo_kind(r)) =>
+        {
+            return geo_call("#", l, r, kind);
+        }
         // `&`, `|`, and `~` of addresses are the address operations, not the
         // integer ones.
         ScalarExpr::Function { name, args }
@@ -550,7 +737,19 @@ pub(crate) fn check_integer_ranges(
         {
             return net_call("~", value, value, kind, false);
         }
-        // `range << range` and `range >> range` shadow the bit shifts.
+        // `x << y` and `x >> y` shadow the bit shifts for ranges and the
+        // geometric shapes.
+        ScalarExpr::Function { name, args }
+            if matches!(name.as_str(), SHIFT_LEFT | SHIFT_RIGHT)
+                && let [l, r] = args.as_slice()
+                && let (Some(left_kind), Some(right_kind)) = (geo_kind(l), geo_kind(r)) =>
+        {
+            let op = if name == SHIFT_LEFT { "<<" } else { ">>" };
+            if !crate::geometric::supported(op, left_kind, right_kind) {
+                return bad_operator(left_kind.name(), op, right_kind.name());
+            }
+            return geo_call(op, l, r, left_kind);
+        }
         ScalarExpr::Function { name, args }
             if matches!(name.as_str(), SHIFT_LEFT | SHIFT_RIGHT)
                 && let [l, r] = args.as_slice()
@@ -724,6 +923,23 @@ pub(crate) fn check_integer_ranges(
                 }
                 return net_call(op, l, r, found, false);
             }
+            if let Some(kind) = geo_kind(l).or_else(|| geo_kind(r)) {
+                let (Some(left_kind), Some(right_kind)) = (geo_kind(l), geo_kind(r)) else {
+                    let name = |e: &ScalarExpr| {
+                        geo_kind(e).map_or_else(
+                            || {
+                                operator_type_name(&scalar_type(e, column).unwrap_or_default())
+                            },
+                            |kind| kind.name().to_string(),
+                        )
+                    };
+                    return bad_operator(&name(l), op, &name(r));
+                };
+                if !crate::geometric::supported(op, left_kind, right_kind) {
+                    return bad_operator(left_kind.name(), op, right_kind.name());
+                }
+                return geo_call(op, l, r, kind);
+            }
             let Some(found) = range_kind(l).or_else(|| range_kind(r)) else {
                 let op = match op.as_str() {
                     "@>" => ScalarBinaryOp::Contains,
@@ -867,6 +1083,42 @@ pub(crate) fn check_integer_ranges(
                 order_by: order_by.clone(),
             };
         }
+        // Only `count`, `array_agg`, and the JSON collectors take a
+        // geometric value.
+        ScalarExpr::Aggregate {
+            op, arg, arg_expr, ..
+        } if !matches!(
+            op,
+            AggregateOp::Count
+                | AggregateOp::ArrayAgg
+                | AggregateOp::JsonAgg
+                | AggregateOp::JsonbAgg
+                | AggregateOp::JsonObjectAgg
+                | AggregateOp::JsonbObjectAgg
+        ) && arg_expr
+            .as_deref()
+            .and_then(|e| geo_kind(e))
+            .or_else(|| geo_kind(&ScalarExpr::Column(arg.clone())))
+            .is_some() =>
+        {
+            let kind = arg_expr
+                .as_deref()
+                .and_then(|e| geo_kind(e))
+                .or_else(|| geo_kind(&ScalarExpr::Column(arg.clone())))
+                .expect("checked by the guard");
+            return bad_function(&op.sql_name().to_ascii_lowercase(), kind.name());
+        }
+        // `greatest`/`least` need a comparison function, which no geometric
+        // type has.
+        ScalarExpr::Function { name, args }
+            if matches!(name.as_str(), "GREATEST" | "LEAST")
+                && let Some(kind) = args.iter().find_map(|arg| geo_kind(arg)) =>
+        {
+            return ScalarExpr::Function {
+                name: BAD_COMPARISON.to_string(),
+                args: vec![ScalarExpr::Literal(Value::Text(kind.name().to_string()))],
+            };
+        }
         // Only `count`, the collectors, and the range builders take a range
         // or multirange; `min`, `sum`, and the like have no overload.
         ScalarExpr::Aggregate {
@@ -895,6 +1147,14 @@ pub(crate) fn check_integer_ranges(
             return bad_function(&op.sql_name().to_ascii_lowercase(), &side_name(side));
         }
         ScalarExpr::Binary { op, left, right } => {
+            if *op == ScalarBinaryOp::JsonHasAnyKey
+                && let (Some(left_kind), Some(right_kind)) = (geo_kind(left), geo_kind(right))
+            {
+                if !crate::geometric::supported("?|", left_kind, right_kind) {
+                    return bad_operator(left_kind.name(), "?|", right_kind.name());
+                }
+                return geo_call("?|", left, right, left_kind);
+            }
             // `range || x` has an operator only where `x` is text, and
             // `range || range` has none at all.
             if *op == ScalarBinaryOp::Concat
@@ -921,6 +1181,43 @@ pub(crate) fn check_integer_ranges(
                     } else {
                         bad_operator(&other_name, "||", &range_name)
                     };
+                }
+            }
+            if let Some(kind) = geo_kind(left).or_else(|| geo_kind(right)) {
+                let symbol = match op {
+                    ScalarBinaryOp::Eq => Some("="),
+                    ScalarBinaryOp::NotEq => Some("<>"),
+                    ScalarBinaryOp::Lt => Some("<"),
+                    ScalarBinaryOp::Gt => Some(">"),
+                    ScalarBinaryOp::LtEq => Some("<="),
+                    ScalarBinaryOp::GtEq => Some(">="),
+                    ScalarBinaryOp::Add => Some("+"),
+                    ScalarBinaryOp::Sub => Some("-"),
+                    ScalarBinaryOp::Mul => Some("*"),
+                    ScalarBinaryOp::Div => Some("/"),
+                    _ => None,
+                };
+                if let Some(symbol) = symbol {
+                    // A geometric operand needs the other side's kind for the
+                    // operator to exist.
+                    let (Some(left_kind), Some(right_kind)) = (geo_kind(left), geo_kind(right))
+                    else {
+                        let name = |e: &ScalarExpr| {
+                            geo_kind(e).map_or_else(
+                                || {
+                                    operator_type_name(
+                                        &scalar_type(e, column).unwrap_or_default(),
+                                    )
+                                },
+                                |kind| kind.name().to_string(),
+                            )
+                        };
+                        return bad_operator(&name(left), symbol, &name(right));
+                    };
+                    if !crate::geometric::supported(symbol, left_kind, right_kind) {
+                        return bad_operator(left_kind.name(), symbol, right_kind.name());
+                    }
+                    return geo_call(symbol, left, right, kind);
                 }
             }
             if let Some(kind) = net_kind(left).or_else(|| net_kind(right)) {
@@ -1698,6 +1995,26 @@ pub(crate) const MULTIRANGE_CAST: &str = "__MULTIRANGE_FROM_RANGE__";
 /// The function the multirange constructors are rewritten to:
 /// `__MULTIRANGE_BUILD__(subtype, range...)`.
 pub(crate) const MULTIRANGE_BUILD: &str = "__MULTIRANGE_BUILD__";
+
+/// The function a geometric operator is rewritten to once its types are
+/// known: `__GEO__(operator, left, right, type, right-type)`.
+pub(crate) const GEO_OP: &str = "__GEO__";
+
+/// The function a geometric cast between two of the types is rewritten to:
+/// `__GEO_CAST__(from, to, value)`.
+pub(crate) const GEO_CAST: &str = "__GEO_CAST__";
+
+/// The function a geometric function or constructor is rewritten to:
+/// `__GEO_FN__(name, type, arguments...)`.
+pub(crate) const GEO_FN: &str = "__GEO_FN__";
+
+/// The function a unary geometric operator is rewritten to:
+/// `__GEO_UNARY__(operator, value)`.
+pub(crate) const GEO_UNARY: &str = "__GEO_UNARY__";
+
+/// The error a call needing a comparison function is rewritten to
+/// (`__BAD_COMPARISON__(type)`).
+pub(crate) const BAD_COMPARISON: &str = "__BAD_COMPARISON__";
 
 /// The function `greatest`/`least` over a range or multirange is rewritten
 /// to: `__RANGE_GREATEST__(name, type, value...)`, picking by its order.

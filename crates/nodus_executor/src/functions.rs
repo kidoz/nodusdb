@@ -162,6 +162,13 @@ pub(crate) fn is_known(name: &str) -> bool {
                 | "INT4RANGE" | "INT8RANGE" | "NUMRANGE" | "DATERANGE" | "TSRANGE" | "TSTZRANGE"
                 | "INT4MULTIRANGE" | "INT8MULTIRANGE" | "NUMMULTIRANGE" | "DATEMULTIRANGE"
                 | "TSMULTIRANGE" | "TSTZMULTIRANGE" | "MULTIRANGE"
+                // The geometric types, their operators, and their functions.
+                | "POINT" | "LSEG" | "BOX" | "PATH" | "POLYGON" | "LINE" | "CIRCLE"
+                | "CENTER" | "RADIUS" | "DIAMETER" | "HEIGHT" | "WIDTH" | "DIAGONAL"
+                | "AREA" | "NPOINTS" | "ISCLOSED" | "ISOPEN" | "PCLOSE" | "POPEN"
+                | "BOUND_BOX"
+                | "__GEO__" | "__GEO_CAST__" | "__GEO_FN__" | "__GEO_UNARY__"
+                | "__BAD_COMPARISON__"
                 | "ISEMPTY" | "LOWER_INC" | "UPPER_INC" | "LOWER_INF" | "UPPER_INF"
                 | "RANGE_MERGE"
                 | "__RANGE__" | "__RANGE_LOWER__" | "__RANGE_UPPER__" | "__BAD_RANGE_CAST__"
@@ -2293,15 +2300,35 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
             .hint("No function matches the given name and argument types. You might need to add explicit type casts.")
             .into_text(),
         ),
-        "__BAD_OPERATOR__" if arity(3) => raise(
+        "__BAD_OPERATOR__" if arity(3) => {
+            // A unary operator reads as `op type`, not `type op`; its hint
+            // names one argument type, as PostgreSQL's does.
+            let (left, op, right) = (text(arg(0)), text(arg(1)), text(arg(2)));
+            let unary = left.is_empty() || right.is_empty();
+            let shown = if left.is_empty() {
+                format!("{op} {right}")
+            } else if right.is_empty() {
+                format!("{left} {op}")
+            } else {
+                format!("{left} {op} {right}")
+            };
+            raise(
+                crate::error_fields::DbError::new(format!("operator does not exist: {shown}"))
+                    .code("42883")
+                    .hint(if unary {
+                        "No operator matches the given name and argument type. You might need to add an explicit type cast."
+                    } else {
+                        "No operator matches the given name and argument types. You might need to add explicit type casts."
+                    })
+                    .into_text(),
+            )
+        }
+        "__BAD_COMPARISON__" if arity(1) => raise(
             crate::error_fields::DbError::new(format!(
-                "operator does not exist: {} {} {}",
-                text(arg(0)),
-                text(arg(1)),
-                text(arg(2))
+                "could not identify a comparison function for type {}",
+                text(arg(0))
             ))
             .code("42883")
-            .hint("No operator matches the given name and argument types. You might need to add explicit type casts.")
             .into_text(),
         ),
         "__BAD_RANGE_CAST__" if arity(2) => raise(
@@ -2361,6 +2388,71 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
                     .unwrap_or_else(raise)
             } else {
                 crate::ranges::bound_inf(&text(arg(0)), name == "LOWER_INF").unwrap_or_else(raise)
+            }
+        }
+        // Geometric operators, casts, and functions, with their types
+        // appended by the planner.
+        "__GEO__" if arity(5) => {
+            let Some(kind) = crate::geometric::Kind::of(&text(arg(3))) else {
+                return Some(raise(format!(
+                    "operator does not exist: {} {}",
+                    crate::value::value_type_name(arg(1)),
+                    text(arg(0))
+                )));
+            };
+            let right_kind = if text(arg(4)).is_empty() {
+                None
+            } else {
+                crate::geometric::Kind::of(&text(arg(4)))
+            };
+            crate::geometric::operator(
+                &text(arg(0)),
+                kind,
+                &text(arg(1)),
+                &text(arg(2)),
+                right_kind,
+            )
+            .unwrap_or_else(raise)
+        }
+        "__GEO_CAST__" if arity(3) => {
+            let (from, to) = (
+                crate::geometric::Kind::of(&text(arg(0))),
+                crate::geometric::Kind::of(&text(arg(1))),
+            );
+            match (from, to) {
+                (Some(from), Some(to)) => {
+                    crate::geometric::cast_between(from, to, &text(arg(2))).unwrap_or_else(raise)
+                }
+                _ => raise(format!(
+                    "cannot cast type {} to {}",
+                    text(arg(0)),
+                    text(arg(1))
+                )),
+            }
+        }
+        "__GEO_UNARY__" if arity(3) => {
+            let Some(kind) = crate::geometric::Kind::of(&text(arg(2))) else {
+                return Some(raise(format!(
+                    "operator does not exist: {} {}",
+                    text(arg(0)),
+                    crate::value::value_type_name(arg(1))
+                )));
+            };
+            crate::geometric::unary(&text(arg(0)), kind, &text(arg(1))).unwrap_or_else(raise)
+        }
+        "__GEO_FN__" if args.len() >= 4 => {
+            let name = text(arg(0)).to_ascii_uppercase();
+            let declared = if text(arg(2)).is_empty() {
+                text(arg(1))
+            } else {
+                text(arg(2))
+            };
+            let Some(kind) = crate::geometric::Kind::of(&declared) else {
+                return Some(raise(format!("unsupported geometric type {declared}")));
+            };
+            match crate::geometric::call(&name, kind, &args[3..]) {
+                Some(result) => result.unwrap_or_else(raise),
+                None => raise(format!("function {} does not exist", name.to_ascii_lowercase())),
             }
         }
         // `greatest`/`least` of a range family, with its type appended by

@@ -897,6 +897,29 @@ impl MemExecutor {
             .filter(|(_, e)| e.is_none())
             .map(|(c, _)| c.clone())
             .collect();
+        // A geometric column has no default operator class for btree.
+        for column in &plain {
+            let data_type = tbl
+                .columns
+                .iter()
+                .find(|c| c.name == *column)
+                .map(|c| c.data_type.clone())
+                .unwrap_or_default();
+            if let Some(kind) = crate::geometric::Kind::of(&data_type) {
+                anyhow::bail!(
+                    "{}",
+                    crate::error_fields::DbError::new(format!(
+                        "data type {} has no default operator class for access method \"btree\"",
+                        kind.name()
+                    ))
+                    .code("42704")
+                    .hint(
+                        "You must specify an operator class for the index or define a default operator class for the data type."
+                    )
+                    .into_text()
+                );
+            }
+        }
         let mut index = Self::new_index(&tbl, name, index_type, &plain, predicate)?;
         if expressions.iter().any(Option::is_some) {
             let mut plain_keys = index.key_columns.into_iter();
