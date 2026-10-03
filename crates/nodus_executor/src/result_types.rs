@@ -1025,6 +1025,46 @@ pub(crate) fn check_integer_ranges(
             }
             return checked.clone();
         }
+        // The `to_ts*` functions: the configuration is a regconfig (an
+        // untyped literal resolves to one; a `text` value does not), and
+        // the text is a string.
+        ScalarExpr::Function { name, args }
+            if name == "TO_TSVECTOR" && matches!(args.len(), 1 | 2) =>
+        {
+            let unknown = |t: &Option<String>| {
+                t.as_deref()
+                    .is_none_or(|t| t.trim().is_empty() || t.eq_ignore_ascii_case("UNKNOWN"))
+            };
+            let config_ok = |e: &ScalarExpr| {
+                let t = scalar_type(e, column);
+                unknown(&t)
+                    || t.as_deref()
+                        .is_some_and(|t| t.trim().eq_ignore_ascii_case("regconfig"))
+                    // An untyped literal resolves to a configuration; a
+                    // folded one keeps its text.
+                    || matches!(e, ScalarExpr::Literal(Value::Text(_) | Value::Int(_)))
+            };
+            let text_ok = |e: &ScalarExpr| {
+                let t = scalar_type(e, column);
+                unknown(&t) || t.as_deref().is_some_and(is_text_type)
+            };
+            let ok = if args.len() == 2 {
+                config_ok(&args[0]) && text_ok(&args[1])
+            } else {
+                text_ok(&args[0])
+            };
+            if !ok {
+                let types: Vec<String> = args
+                    .iter()
+                    .map(|arg| argument_type_name(arg, column))
+                    .collect();
+                return bad_function_args(&name.to_ascii_lowercase(), &types);
+            }
+            return ScalarExpr::Function {
+                name: name.clone(),
+                args: args.clone(),
+            };
+        }
         // The jsonpath functions: the document must be `jsonb` and the path
         // `jsonpath` (an untyped literal reads as either; a typed `text`
         // value is refused, as PostgreSQL refuses it).

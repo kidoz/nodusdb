@@ -2809,6 +2809,19 @@ impl MemExecutor {
             return Ok(Value::Int(oid));
         }
         let catalog = crate::session_env::with(|env| env.and_then(|e| e.catalog.clone()));
+        // A text search configuration is one of the shipped ones.
+        if kind == "REGCONFIG" {
+            return text_search_config_oid(&name)
+                .map(Value::Int)
+                .ok_or_else(|| {
+                    crate::error_fields::DbError::new(format!(
+                        "text search configuration \"{}\" does not exist",
+                        name.trim()
+                    ))
+                    .code("42704")
+                    .into_text()
+                });
+        }
         let found = match kind {
             "REGCLASS" => catalog.and_then(|c| Self::relation_oid(c.as_ref(), &name)),
             "REGNAMESPACE" => catalog
@@ -2871,6 +2884,7 @@ impl MemExecutor {
         let db = "default";
         let schemas = catalog.list_schemas(db).ok()?;
         match kind {
+            "REGCONFIG" => text_search_config_name(oid).map(str::to_string),
             "REGTYPE" => Some(crate::functions::format_type_name(oid)),
             "REGNAMESPACE" => schemas
                 .iter()
@@ -3418,3 +3432,29 @@ pub(crate) fn catalog_view_definition(view: &nodus_catalog::TableDescriptor) -> 
     crate::explain::deparse_query(&plan).map(|sql| format!("{sql};"))
 }
 
+/// The OID of a text search configuration name (`english`,
+/// `pg_catalog.simple`, ...): the two configurations NodusDB ships, with
+/// PostgreSQL's OIDs for them.
+pub(crate) fn text_search_config_oid(name: &str) -> Option<i64> {
+    let bare = name.trim();
+    let bare = bare
+        .strip_prefix("pg_catalog.")
+        .or_else(|| bare.strip_prefix("public."))
+        .unwrap_or(bare);
+    if bare.eq_ignore_ascii_case("simple") {
+        return Some(3748);
+    }
+    if bare.eq_ignore_ascii_case("english") {
+        return Some(13282);
+    }
+    None
+}
+
+/// The name of a text search configuration OID.
+pub(crate) fn text_search_config_name(oid: i64) -> Option<&'static str> {
+    match oid {
+        3748 => Some("simple"),
+        13282 => Some("english"),
+        _ => None,
+    }
+}

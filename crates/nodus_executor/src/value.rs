@@ -120,6 +120,7 @@ pub(crate) fn object_identifier_type(data_type: &str) -> Option<&'static str> {
     let upper = data_type.trim().to_ascii_uppercase();
     match upper.strip_prefix("PG_CATALOG.").unwrap_or(&upper) {
         "REGCLASS" => Some("REGCLASS"),
+        "REGCONFIG" => Some("REGCONFIG"),
         "REGTYPE" => Some("REGTYPE"),
         "REGNAMESPACE" => Some("REGNAMESPACE"),
         _ => None,

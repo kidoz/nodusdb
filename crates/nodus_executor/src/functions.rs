@@ -98,7 +98,7 @@ pub(crate) fn is_known(name: &str) -> bool {
                 | crate::result_types::SHIFT_RIGHT | crate::result_types::BIT_NOT
                 // Text search.
                 | "SETWEIGHT" | "STRIP" | "NUMNODE" | "TSVECTOR_TO_ARRAY"
-                | "ARRAY_TO_TSVECTOR" | "TSQUERY_PHRASE" | "TS_DELETE"
+                | "ARRAY_TO_TSVECTOR" | "TSQUERY_PHRASE" | "TS_DELETE" | "TO_TSVECTOR"
                 // Dates and times.
                 | "NOW" | "CURRENT_TIMESTAMP" | "TRANSACTION_TIMESTAMP"
                 | "STATEMENT_TIMESTAMP" | "CLOCK_TIMESTAMP" | "CURRENT_DATE" | "CURRENT_TIME"
@@ -368,6 +368,7 @@ pub(crate) fn return_type(name: &str, arg_types: &[Option<String>]) -> Option<St
             "SETWEIGHT" | "STRIP" | "TSVECTOR_TO_ARRAY" | "ARRAY_TO_TSVECTOR" | "TS_DELETE" => {
                 "TSVECTOR"
             }
+            "TO_TSVECTOR" => "TSVECTOR",
             "TSQUERY_PHRASE" | "__TSNOT__" => "TSQUERY",
             "__TSCMP__" => "BOOLEAN",
             "__TS__" => match arg_types.first().cloned().flatten().as_deref() {
@@ -3270,6 +3271,21 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
         {
             textsearch_function(&name.to_ascii_lowercase(), args)
         }
+        // `to_tsvector([config,] text)`: the dictionary layer's vector.
+        "TO_TSVECTOR" if arity(1) || arity(2) => {
+            if args.iter().any(|a| matches!(a, Value::Null)) {
+                return Some(Value::Null);
+            }
+            let config = if arity(2) {
+                match to_ts_config(arg(0)) {
+                    Ok(config) => config,
+                    Err(error) => return Some(raise(error)),
+                }
+            } else {
+                default_ts_config()
+            };
+            Value::Text(crate::ts_dict::to_tsvector(config, &text(args.last().expect("arg"))))
+        }
         // The jsonpath functions: all arguments are strict (a NULL anywhere
         // gives NULL), and the `_tz` spellings behave as the others do.
         // `jsonb_path_query` is set-returning and handled below.
@@ -3700,6 +3716,7 @@ fn format_type(oid: i64, typmod: Option<i64>) -> String {
         4072 => "jsonpath",
         3614 => "tsvector",
         3615 => "tsquery",
+        3734 => "regconfig",
         4089 => "regnamespace",
         4096 => "regrole",
         1000 => "boolean[]",
@@ -4176,6 +4193,36 @@ fn pretty(args: &[Value]) -> Option<bool> {
         Some(Value::Bool(b)) => Some(*b),
         Some(_) => None,
     }
+}
+
+/// The configuration a `to_tsvector` call names: a `regconfig` value (an
+/// OID), or an untyped literal that resolves like a name.
+fn to_ts_config(value: &Value) -> Result<crate::ts_dict::Config, String> {
+    match value {
+        Value::Int(oid) => crate::pg_catalog::text_search_config_name(*oid)
+            .and_then(crate::ts_dict::Config::of)
+            .ok_or_else(|| format!("cache lookup failed for text search configuration {oid}")),
+        Value::Text(name) => crate::ts_dict::Config::of(name).ok_or_else(|| {
+            crate::error_fields::DbError::new(format!(
+                "text search configuration \"{}\" does not exist",
+                name.trim()
+            ))
+            .code("42704")
+            .into_text()
+        }),
+        other => Err(format!(
+            "cannot cast {} to regconfig",
+            crate::value::value_type_name(other)
+        )),
+    }
+}
+
+/// The session's `default_text_search_config`, as `to_tsvector(text)` reads
+/// it.
+fn default_ts_config() -> crate::ts_dict::Config {
+    let name = crate::session_env::setting("default_text_search_config")
+        .unwrap_or_else(|| "pg_catalog.english".to_string());
+    crate::ts_dict::Config::of(&name).unwrap_or(crate::ts_dict::Config::English)
 }
 
 /// A text-search operator rewritten to a marker once the declared types are

@@ -1,0 +1,205 @@
+The Fat Cats are eating rats	1:The	12: 	1:Fat	12: 	1:Cats	12: 	1:are	12: 	1:eating	12: 	1:rats
+fat cat sat	1:fat	12: 	1:cat	12: 	1:sat
+a-café-x	17:a-café-x	11:a	12:-	10:café	12:-	11:x
+42.5	20:42.5
+3.5e-2	7:3.5e-2
+1.2.3.4	8:1.2.3.4
+user@example.com	4:user@example.com
+http://x.example.com/p?q=1	14:http://	5:x.example.com/p?q=1	6:x.example.com	18:/p?q=1
+https://example.org:8080/a/b/c#frag	14:https://	5:example.org:8080/a/b/c#frag	6:example.org:8080	18:/a/b/c#frag
+<b>tag</b>	13:<b>	1:tag	13:</b>
+<script>var x = 1;</script>after	13:<script>	12:var x = 1;	13:</script>	1:after
+&amp; &unknown; &#123; &#x1F600;	23:&amp;	12: 	23:&unknown;	12: 	23:&#123;	12: 	23:&#x1F600;
+C:\\Windows\\System32\\cmd.exe	1:C	12::\\	1:Windows	12:\\	3:System32	12:\\	6:cmd.exe
+/usr/local/bin/python3.11	19:/usr/local/bin/python3.11
+~/file.txt	19:~/file.txt
+file.tar.gz	6:file.tar.gz
+192.168.0.1:5432	8:192.168.0.1	12::	22:5432
+v1.2.3	19:v1.2.3
+[1.2.3]	12:[	8:1.2.3	12:]
+12:30:45	22:12	12::	22:30	12::	22:45
+10.5.0	8:10.5.0
+3-4-5	22:3	21:-4	21:-5
+1-800-555-0199	22:1	21:-800	21:-555	21:-0199
+e-mail x-ray state-of-the-art	16:e-mail	11:e	12:-	11:mail	12: 	16:x-ray	11:x	12:-	11:ray	12: 	16:state-of-the-art	11:state	12:-	11:of	12:-	11:the	12:-	11:art
+café naïve 日本語 αβγ	2:café	12: 	2:naïve	12: 	2:日本語	12: 	2:αβγ
+co-operate don't	16:co-operate	11:co	12:-	11:operate	12: 	1:don	12:'	1:t
+'quoted' "double" (paren)	12:'	1:quoted	12:' "	1:double	12:" (	1:paren	12:)
+a+b=c 10% $100 #tag @user	1:a	12:+	1:b	12:=	1:c	12: 	22:10	12:% $	22:100	12: #	1:tag	12: @	1:user
+multi   spaces\tand\ttabs\nand newlines	1:multi	12:   	1:spaces	12:\t	1:and	12:\t	1:tabs	12:\n	1:and	12: 	1:newlines
+trailing.dot.	6:trailing.dot	12:.
+.leading	12:.	1:leading
+end-	1:end	12:-
+-start	12:-	1:start
+--	12:-	12:-
+e.g. i.e. etc.	19:e.g	12:. 	19:i.e	12:. 	1:etc	12:.
+3.14.15.92	8:3.14.15.92
+v.1.2	19:v.1.2
+http://host/path	14:http://	19:host/path
+//host.example.com/path	12:/	19:/host.example.com/path
+mailto:user@example.com	1:mailto	12::	4:user@example.com
+ftp://ftp.example.com/pub/file.txt	14:ftp://	5:ftp.example.com/pub/file.txt	6:ftp.example.com	18:/pub/file.txt
+www.example.com	6:www.example.com
+sub.domain.example.co.uk/path	5:sub.domain.example.co.uk/path	6:sub.domain.example.co.uk	18:/path
+abc123def	3:abc123def
+123abc	3:123abc
+0x1F	3:0x1F
+1e10	7:1e10
+2.5e+3	7:2.5e+3
+-42	21:-42
++42	21:+42
+12,345	22:12	12:,	22:345
+1.2.3-rc.1+build.5	8:1.2.3	12:-	19:rc.1	12:+	19:build.5
+XML <Tag attr='v'>text</Tag> more	1:XML	12: 	13:<Tag attr='v'>	1:text	13:</Tag>	12: 	1:more
+<!-- comment -->after	13:<!-- comment -->	1:after
+[[WikiLink]] {{template}}	12:[[	1:WikiLink	12:]] {{	1:template	12:}}
+email: someone@sub.example.com.	1:email	12:: 	4:someone@sub.example.com	12:.
+URL (http://example.com) end	1:URL	12: (	14:http://	6:example.com	12:) 	1:end
+a.b.c	19:a.b.c
+foo-bar-baz-qux	16:foo-bar-baz-qux	11:foo	12:-	11:bar	12:-	11:baz	12:-	11:qux
+foo--bar	1:foo	12:-	12:-	1:bar
+under_score	1:under	12:_	1:score
+UPPER lower MiXeD	1:UPPER	12: 	1:lower	12: 	1:MiXeD
+ünïcödé Wörter	2:ünïcödé	12: 	2:Wörter
+Ñoño	2:Ñoño
+ρσ	2:ρσ
+z0-9_a	3:z0	21:-9	12:_	1:a
+5'5"	22:5	12:'	22:5	12:"
+100%	22:100	12:%
+C++	1:C	12:+	12:+
+C#	1:C	12:#
+.NET	12:.	1:NET
+AT&T	1:AT	12:&	1:T
+R&D	1:R	12:&	1:D
+x86_64	3:x86	12:_	22:64
+i386-pc-linux-gnu	15:i386-pc-linux-gnu	9:i386	12:-	11:pc	12:-	11:linux	12:-	11:gnu
+kernel-6.1.0-13-amd64	1:kernel	12:-	8:6.1.0	21:-13	12:-	3:amd64
+multi   spaces\tand\ttabs\nand newlines	1:multi	12:   	1:spaces	12:\t	1:and	12:\t	1:tabs	12:\n	1:and	12: 	1:newlines
+<a href="http://x.example.com/?a=1&b=2">link</a>	13:<a href="http://x.example.com/?a=1&b=2">	1:link	13:</a>
+<img src=x onerror=alert(1)>	12:<	1:img	12: 	1:src	12:=	1:x	12: 	1:onerror	12:=	1:alert	12:(	22:1	12:)>
+<TAG ATTR='VALUE'>	13:<TAG ATTR='VALUE'>
+<br/>	13:<br/>
+<p class=foo>text	13:<p class=foo>	1:text
+<!-- comment -->	13:<!-- comment -->
+<!-- x -->y	13:<!-- x -->	1:y
+<?php echo 1; ?>	12:<?	1:php	12: 	1:echo	12: 	22:1	12:; ?>
+]]> not a tag	12:]]> 	1:not	12: 	1:a	12: 	1:tag
+a < b > c	1:a	12: 	12:< 	1:b	12: > 	1:c
+AT&T was R&D	1:AT	12:&	1:T	12: 	1:was	12: 	1:R	12:&	1:D
+user.name+tag@sub.example.co.uk	6:user.name	12:+	4:tag@sub.example.co.uk
+first.last@example.com.	4:first.last@example.com	12:.
+x@y	1:x	12:@	1:y
+@handle	12:@	1:handle
+user@@host	1:user	12:@@	1:host
+http://[::1]:8080/path	14:http://	12:[::	22:1	12:]:	19:8080/path
+http://user:pass@host.example.com:99/p	14:http://	1:user	12::	4:pass@host.example.com:99	19:/p
+https://example.com	14:https://	6:example.com
+https://example.com/	14:https://	6:example.com	12:/
+example.com	6:example.com
+example.com:443	6:example.com:443
+localhost:5432	1:localhost	12::	22:5432
+1.2.3.4/24	8:1.2.3.4	19:/24
+255.255.255.255	8:255.255.255.255
+999.999.999.999	8:999.999.999.999
+0.0.0.0:0	8:0.0.0.0	12::	22:0
+v1.2.3.4.5	19:v1.2.3.4.5
+2.0RC1	20:2.0	3:RC1
+release-1.2.3-alpha	1:release	12:-	8:1.2.3	12:-	1:alpha
+v1.2-beta.1	19:v1.2-beta.1
+3.5e10	7:3.5e10
+3.5E-10	7:3.5E-10
+-3.5e-10	7:-3.5e-10
++3.5e-10	7:+3.5e-10
+.5	12:.	22:5
+5.	22:5	12:.
+1_000	22:1	12:_	22:000
+0b1010	3:0b1010
+0o777	3:0o777
+0xFF	3:0xFF
+1e	3:1e
+e10	3:e10
+abc-def-123	16:abc-def	11:abc	12:-	11:def	12:-	22:123
+a-b	16:a-b	11:a	12:-	11:b
+a-	1:a	12:-
+-a	12:-	1:a
+a--b	1:a	12:-	12:-	1:b
+a---b	1:a	12:-	12:-	12:-	1:b
+-'x'-	12:-'	1:x	12:'	12:-
+d'artagnan	1:d	12:'	1:artagnan
+l'école	1:l	12:'	2:école
+x86-64	3:x86	21:-64
+i686	3:i686
+10.1.2.3-alpha1	8:10.1.2.3	12:-	3:alpha1
+1.2.3.4.5.6.7.8.9	8:1.2.3.4.5.6.7.8.9
+word_with_underscores	1:word	12:_	1:with	12:_	1:underscores
+__dunder__	12:__	1:dunder	12:__
+C:\\path\\to\\file	1:C	12::\\	1:path	12:\\	1:to	12:\\	1:file
+C:/path/to/file	1:C	12::	19:/path/to/file
+/	12:/
+//	12:/	12:/
+///a	12:/	12:/	19:/a
+~	12:~
+~/	12:~	12:/
+~user/file	19:~user/file
+../relative/path	19:../relative/path
+./current	19:./current
+http://example.com/path with space	14:http://	5:example.com/path	6:example.com	18:/path	12: 	1:with	12: 	1:space
+café.com	2:café	12:.	1:com
+ünïcödé@example.com	2:ünïcödé	12:@	6:example.com
+日本語.jp	2:日本語	12:.	1:jp
+python3.11	19:python3.11
+gcc-13.2.0	1:gcc	12:-	8:13.2.0
+SHA-256	1:SHA	21:-256
+MD5	3:MD5
+utf-8	1:utf	21:-8
+base64==	3:base64	12:==
+a=b	1:a	12:=	1:b
+a == b	1:a	12: == 	1:b
+a-b_c.d	16:a-b	11:a	12:-	11:b	12:_	19:c.d
+3,5	22:3	12:,	22:5
+1.000,00	20:1.000	12:,	22:00
+12:34:56.789	22:12	12::	22:34	12::	20:56.789
+24:00:00	22:24	12::	22:00	12::	22:00
+99:99	22:99	12::	22:99
+a1b2c3	3:a1b2c3
+123-456	22:123	21:-456
+...	12:...
+!!!	12:!!!
+???	12:???
+a....b	1:a	12:....	1:b
+a. b. c.	1:a	12:. 	1:b	12:. 	1:c	12:.
+U.S.A.	19:U.S.A	12:.
+e.g.	19:e.g	12:.
+No. 5	1:No	12:. 	22:5
+4th 5th 6th	3:4th	12: 	3:5th	12: 	3:6th
+1st	3:1st
+2nd	3:2nd
+X	1:X
+x	1:x
+0	22:0
+-0	21:-0
++0	21:+0
+007	22:007
+3.0.0	8:3.0.0
+1.2.3-4	8:1.2.3	21:-4
+v1	3:v1
+v	1:v
+ve	1:ve
+s	1:s
+'s	12:'	1:s
+don't won't can't	1:don	12:'	1:t	12: 	1:won	12:'	1:t	12: 	1:can	12:'	1:t
+“smart” ‘quotes’	2:“smart”	12: 	2:‘quotes’
+em—dash en–dash	2:em—dash	12: 	2:en–dash
+nbsp sep	2:nbsp sep
+zwj‍joiner	2:zwj‍joiner
+combining é	1:combining	12: 	2:é
+日本語のテキスト	2:日本語のテキスト
+русский текст	2:русский	12: 	2:текст
+Ελληνικά	2:Ελληνικά
+עברית	2:עברית
+العربية	2:العربية
+emoji 😀 test	1:emoji	12: 	2:😀	12: 	1:test
+a😀b	2:a😀b
+<script>alert("x")</script>	13:<script>	12:alert("x")	13:</script>
+</style>done	13:</style>	1:done
+<style>p{}</style>x	13:<style>	12:p{}	13:</style>	1:x
