@@ -267,6 +267,11 @@ pub enum AggregateOp {
     RegrSxy,
     BitXor,
     AnyValue,
+    /// `range_agg(x)`: the values' ranges or multiranges merged into one
+    /// multirange.
+    RangeAgg,
+    /// `range_intersect_agg(x)`: the ranges common to every value.
+    RangeIntersectAgg,
 }
 
 impl AggregateOp {
@@ -313,6 +318,8 @@ impl AggregateOp {
             AggregateOp::RegrSxy => "regr_sxy",
             AggregateOp::BitXor => "bit_xor",
             AggregateOp::AnyValue => "any_value",
+            AggregateOp::RangeAgg => "range_agg",
+            AggregateOp::RangeIntersectAgg => "range_intersect_agg",
         }
     }
 

@@ -584,6 +584,31 @@ pub(crate) fn aggregate_inputs(op: &AggregateOp, inputs: &[(Value, Vec<Value>)])
         | AggregateOp::RegrSyy
         | AggregateOp::RegrSxy => regression(op, inputs),
         AggregateOp::AnyValue => non_null().next().cloned().unwrap_or(Value::Null),
+        // `range_agg` and `range_intersect_agg`: their subtype rides along as
+        // an extra argument, as the address comparisons' type does, and a
+        // flag says whether the inputs are multiranges.
+        AggregateOp::RangeAgg | AggregateOp::RangeIntersectAgg => {
+            let extra = inputs.iter().find_map(|(_, extra)| extra.first());
+            let kind = extra
+                .and_then(|v| match v {
+                    Value::Text(text) => crate::ranges::Kind::of(text),
+                    _ => None,
+                })
+                .unwrap_or(crate::ranges::Kind::Int4);
+            let multirange = inputs
+                .iter()
+                .find_map(|(_, extra)| extra.get(1))
+                .is_some_and(|v| matches!(v, Value::Bool(true)));
+            let texts: Vec<String> = non_null().map(crate::render).collect();
+            if texts.is_empty() {
+                return Value::Null;
+            }
+            if *op == AggregateOp::RangeAgg {
+                Value::Text(crate::multiranges::merge_ranges(kind, &texts))
+            } else {
+                crate::multiranges::intersect_all(kind, &texts, multirange)
+            }
+        }
         AggregateOp::BitAnd | AggregateOp::BitOr | AggregateOp::BitXor => {
             let mut result: Option<i64> = None;
             for value in non_null() {

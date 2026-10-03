@@ -13,7 +13,9 @@ use crate::value::{Value, render, values_equal};
 
 /// Functions that receive NULL arguments instead of short-circuiting to NULL.
 const NON_STRICT: &[&str] = &[
-    // Range constructors read a NULL bound as unbounded.
+    // Range constructors read a NULL bound as unbounded; a multirange
+    // constructor refuses a NULL among its members.
+    "__MULTIRANGE_BUILD__",
     "INT4RANGE",
     "INT8RANGE",
     "NUMRANGE",
@@ -155,8 +157,11 @@ pub(crate) fn is_known(name: &str) -> bool {
                 | "MACADDR8_SET7BIT" | "TEXT" | "CASH_WORDS" | "CASHLARGER" | "CASHSMALLER"
                 | "MONEY"
                 | "__NET__" | "__NET_CAST__" | "__MONEY_TEXT__" | "__MAC_TRUNC__"
+                | "__MULTIRANGE_FROM_RANGE__" | "__RANGE_GREATEST__"
                 // Ranges.
                 | "INT4RANGE" | "INT8RANGE" | "NUMRANGE" | "DATERANGE" | "TSRANGE" | "TSTZRANGE"
+                | "INT4MULTIRANGE" | "INT8MULTIRANGE" | "NUMMULTIRANGE" | "DATEMULTIRANGE"
+                | "TSMULTIRANGE" | "TSTZMULTIRANGE" | "MULTIRANGE"
                 | "ISEMPTY" | "LOWER_INC" | "UPPER_INC" | "LOWER_INF" | "UPPER_INF"
                 | "RANGE_MERGE"
                 | "__RANGE__" | "__RANGE_LOWER__" | "__RANGE_UPPER__" | "__BAD_RANGE_CAST__"
@@ -349,11 +354,33 @@ pub(crate) fn return_type(name: &str, arg_types: &[Option<String>]) -> Option<St
             "TO_JSON" | "JSON_BUILD_OBJECT" | "JSON_BUILD_ARRAY" | "JSON_EXTRACT_PATH"
             | "JSON_STRIP_NULLS" | "ROW_TO_JSON" | "ARRAY_TO_JSON" | "JSON_OBJECT" => "JSON",
             "__RECORD__" => "RECORD",
+            "INT4MULTIRANGE" | "INT8MULTIRANGE" | "NUMMULTIRANGE" | "DATEMULTIRANGE"
+            | "TSMULTIRANGE" | "TSTZMULTIRANGE" => {
+                return crate::ranges::Kind::of_multirange(name)
+                    .map(|kind| kind.multirange_name().to_string());
+            }
+            "__MULTIRANGE_BUILD__" => {
+                // The subtype rides as the first argument; the result is the
+                // multirange over it.
+                return arg_types
+                    .first()
+                    .cloned()
+                    .flatten()
+                    .and_then(|t| crate::ranges::Kind::of(&t))
+                    .map(|kind| kind.multirange_name().to_string());
+            }
             "INT4RANGE" | "INT8RANGE" | "NUMRANGE" | "DATERANGE" | "TSRANGE" | "TSTZRANGE" => {
                 return Some(name.to_string());
             }
             "ISEMPTY" | "LOWER_INC" | "UPPER_INC" | "LOWER_INF" | "UPPER_INF" => {
                 return Some("BOOL".into());
+            }
+            // `range_merge` of a multirange is a range of its subtype.
+            "RANGE_MERGE" => {
+                return arg_types.first().cloned().flatten().map(|t| {
+                    crate::multiranges::kind_of(&t)
+                        .map_or(t.clone(), |kind| kind.name().to_string())
+                });
             }
             // `lower`/`upper` of a range have its subtype's type (appended by
             // the planner as a literal).
@@ -2148,6 +2175,15 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
             crate::net::cast_between(from, to, &text(arg(2))).unwrap_or_else(raise)
         }
         "__MONEY_TEXT__" if arity(1) => Value::Text(crate::net::money_as_text(&text(arg(0)))),
+        // `range::multirange` wraps the range's text in braces.
+        "__MULTIRANGE_FROM_RANGE__" if arity(2) => {
+            let kind = crate::multiranges::kind_of(&text(arg(0)))
+                .unwrap_or(crate::ranges::Kind::Int4);
+            let range = text(arg(1));
+            crate::multiranges::from_literal(kind, &format!("{{{range}}}"))
+                .map(Value::Text)
+                .unwrap_or_else(raise)
+        }
         "CASH_WORDS" if arity(1) => match crate::net::money_cents(&text(arg(0))) {
             Some(cents) => Value::Text(crate::net::cash_words(cents)),
             None => raise(format!("invalid money value: {}", text(arg(0)))),
@@ -2211,16 +2247,35 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
                     text(arg(0))
                 )));
             };
-            crate::ranges::operator(
-                &text(arg(0)),
-                kind,
-                &text(arg(1)),
-                &text(arg(2)),
-                matches!(arg(4), Value::Bool(true)),
-            )
-            .unwrap_or_else(raise)
+            let (left, right) = (text(arg(1)), text(arg(2)));
+            // A braced operand makes it a multirange operation.
+            if crate::multiranges::is_multirange_text(&left)
+                || crate::multiranges::is_multirange_text(&right)
+            {
+                crate::multiranges::operator(
+                    &text(arg(0)),
+                    kind,
+                    &left,
+                    &right,
+                    matches!(arg(4), Value::Bool(true)),
+                )
+                .unwrap_or_else(raise)
+            } else {
+                crate::ranges::operator(
+                    &text(arg(0)),
+                    kind,
+                    &left,
+                    &right,
+                    matches!(arg(4), Value::Bool(true)),
+                )
+                .unwrap_or_else(raise)
+            }
         }
         "__RANGE_LOWER__" | "__RANGE_UPPER__" if arity(1) || arity(2) => {
+            let lower = name == "__RANGE_LOWER__";
+            if crate::multiranges::is_multirange_text(&text(arg(0))) {
+                return Some(crate::multiranges::bound_value(&text(arg(0)), lower).unwrap_or_else(raise));
+            }
             crate::ranges::bound_value(&text(arg(0)), name == "__RANGE_LOWER__")
                 .unwrap_or_else(raise)
         }
@@ -2285,12 +2340,88 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
         }
         // `text(x)` is any value's text.
         "TEXT" if arity(1) => arg(0).clone(),
-        "ISEMPTY" if arity(1) => crate::ranges::is_empty(&text(arg(0))).unwrap_or_else(raise),
+        "ISEMPTY" if arity(1) => {
+            if crate::multiranges::is_multirange_text(&text(arg(0))) {
+                crate::multiranges::is_empty(&text(arg(0))).unwrap_or_else(raise)
+            } else {
+                crate::ranges::is_empty(&text(arg(0))).unwrap_or_else(raise)
+            }
+        }
         "LOWER_INC" | "UPPER_INC" if arity(1) => {
-            crate::ranges::bound_inc(&text(arg(0)), name == "LOWER_INC").unwrap_or_else(raise)
+            if crate::multiranges::is_multirange_text(&text(arg(0))) {
+                crate::multiranges::bound_inc(&text(arg(0)), name == "LOWER_INC")
+                    .unwrap_or_else(raise)
+            } else {
+                crate::ranges::bound_inc(&text(arg(0)), name == "LOWER_INC").unwrap_or_else(raise)
+            }
         }
         "LOWER_INF" | "UPPER_INF" if arity(1) => {
-            crate::ranges::bound_inf(&text(arg(0)), name == "LOWER_INF").unwrap_or_else(raise)
+            if crate::multiranges::is_multirange_text(&text(arg(0))) {
+                crate::multiranges::bound_inf(&text(arg(0)), name == "LOWER_INF")
+                    .unwrap_or_else(raise)
+            } else {
+                crate::ranges::bound_inf(&text(arg(0)), name == "LOWER_INF").unwrap_or_else(raise)
+            }
+        }
+        // `greatest`/`least` of a range family, with its type appended by
+        // the planner: NULLs are skipped, as PostgreSQL skips them.
+        "__RANGE_GREATEST__" if args.len() >= 3 => {
+            let greatest = text(arg(0)) == "greatest";
+            let kind_name = text(arg(1));
+            let multirange = crate::multiranges::kind_of(&kind_name).is_some();
+            let kind = crate::ranges::Kind::of(&kind_name)
+                .or_else(|| crate::multiranges::kind_of(&kind_name))
+                .unwrap_or(crate::ranges::Kind::Int4);
+            let compare = |a: &Value, b: &Value| -> std::cmp::Ordering {
+                let (Value::Text(a), Value::Text(b)) = (a, b) else {
+                    return std::cmp::Ordering::Equal;
+                };
+                if multirange {
+                    let (Ok(a), Ok(b)) =
+                        (crate::multiranges::parse(a), crate::multiranges::parse(b))
+                    else {
+                        return std::cmp::Ordering::Equal;
+                    };
+                    crate::multiranges::cmp(kind, &a, &b)
+                } else {
+                    let (Ok(a), Ok(b)) = (crate::ranges::parse(a), crate::ranges::parse(b)) else {
+                        return std::cmp::Ordering::Equal;
+                    };
+                    crate::ranges::cmp_ranges(kind, &a, &b)
+                }
+            };
+            let mut best: Option<&Value> = None;
+            for value in &args[2..] {
+                if *value == Value::Null {
+                    continue;
+                }
+                best = Some(match best {
+                    None => value,
+                    Some(best) => {
+                        let ord = compare(value, best);
+                        let take = if greatest {
+                            ord == std::cmp::Ordering::Greater
+                        } else {
+                            ord == std::cmp::Ordering::Less
+                        };
+                        if take { value } else { best }
+                    }
+                });
+            }
+            best.cloned().unwrap_or(Value::Null)
+        }
+        // `range_merge` of one multirange spans its elements; PostgreSQL
+        // has no one-range form.
+        "RANGE_MERGE" if arity(1) => {
+            let text = text(arg(0));
+            if crate::multiranges::is_multirange_text(&text) {
+                crate::multiranges::range_merge(&text).unwrap_or_else(raise)
+            } else {
+                raise(format!(
+                    "function range_merge({}) does not exist",
+                    crate::value::value_type_name(arg(0))
+                ))
+            }
         }
         "RANGE_MERGE" if arity(2) => {
             let kind = crate::ranges::infer_kind(&text(arg(0)), &text(arg(1)));
@@ -2304,6 +2435,51 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
                     crate::value::value_type_name(arg(0)),
                     crate::value::value_type_name(arg(1))
                 )),
+            }
+        }
+        // The multirange constructors, with their subtype appended by the
+        // planner: `int4multirange(range...)`, `multirange(range)`.
+        "__MULTIRANGE_BUILD__" if !args.is_empty() => {
+            let kind = crate::ranges::Kind::of(&text(arg(0)))
+                .or_else(|| crate::multiranges::kind_of(&text(arg(0))))
+                .unwrap_or(crate::ranges::Kind::Int4);
+            // No member is the empty multirange; one NULL is NULL; a NULL
+            // among several is refused.
+            if args.len() == 1 {
+                Value::Text("{}".to_string())
+            } else if args[1..].iter().all(|v| *v == Value::Null) {
+                Value::Null
+            } else if args[1..].iter().any(|v| *v == Value::Null) {
+                raise(
+                    crate::error_fields::DbError::new(
+                        "multirange values cannot contain null members",
+                    )
+                    .code("22004")
+                    .into_text(),
+                )
+            } else {
+                let mut elements = Vec::new();
+                for value in &args[1..] {
+                    let value = text(value);
+                    if crate::multiranges::is_multirange_text(&value) {
+                        // A multirange copies (and merges) as it is.
+                        match crate::multiranges::parse(&value) {
+                            Ok(ranges) => elements.extend(ranges),
+                            Err(error) => return Some(raise(error)),
+                        }
+                        continue;
+                    }
+                    match crate::ranges::from_literal(kind, &value)
+                        .and_then(|canonical| crate::ranges::parse(&canonical))
+                    {
+                        Ok(crate::ranges::Range::Empty) => {}
+                        Ok(range) => elements.push(range),
+                        Err(error) => return Some(raise(error)),
+                    }
+                }
+                Value::Text(crate::multiranges::format(
+                    &crate::multiranges::merge(kind, elements),
+                ))
             }
         }
         // The range constructors: `int4range(lower, upper [, flags])`, and

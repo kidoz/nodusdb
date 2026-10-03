@@ -502,3 +502,117 @@ fn network_and_money_types_read_write_and_operate() {
         ["inet|cidr|macaddr|macaddr8|money"]
     );
 }
+
+#[test]
+fn multiranges_read_write_and_operate() {
+    let (sql, _) = session();
+    sql("CREATE TABLE mr (id int PRIMARY KEY, m int4multirange)").unwrap();
+    sql("INSERT INTO mr VALUES (1, '{[1,2)}'), (2, '{}'), (3, '{[5,7),[1,3)}')").unwrap();
+    // Literals sort, merge, and canonicalize on the way in.
+    assert_eq!(
+        ordered(&sql("SELECT m FROM mr ORDER BY m").unwrap()),
+        ["{}", "{[1,2)}", "{[1,3),[5,7)}"]
+    );
+    assert_eq!(
+        ordered(&sql("SELECT m FROM mr WHERE m @> 2").unwrap()),
+        ["{[1,3),[5,7)}"]
+    );
+    assert_eq!(
+        ordered(&sql("SELECT '{[1,3),[2,4)}'::int4multirange").unwrap()),
+        ["{[1,4)}"]
+    );
+    assert_eq!(
+        ordered(&sql("SELECT int4multirange(int4range(1, 2))").unwrap()),
+        ["{[1,2)}"]
+    );
+    assert_eq!(
+        ordered(&sql("SELECT multirange(int4range(1, 2))").unwrap()),
+        ["{[1,2)}"]
+    );
+    assert_eq!(
+        ordered(&sql("SELECT '[1,2)'::int4range::int4multirange").unwrap()),
+        ["{[1,2)}"]
+    );
+    assert_eq!(
+        ordered(&sql("SELECT unnest('{[1,2),[3,5)}'::int4multirange)").unwrap()),
+        ["[1,2)", "[3,5)"]
+    );
+    assert_eq!(
+        ordered(&sql("SELECT range_merge('{[1,2),[3,5)}'::int4multirange)").unwrap()),
+        ["[1,5)"]
+    );
+    assert_eq!(
+        ordered(&sql("SELECT lower('{[1,2),[3,5)}'::int4multirange), upper('{[1,2),[3,5)}'::int4multirange)").unwrap()),
+        ["1|5"]
+    );
+    assert_eq!(
+        ordered(&sql("SELECT '{[1,2)}'::int4multirange + '{[2,3)}'::int4multirange").unwrap()),
+        ["{[1,3)}"]
+    );
+    assert_eq!(
+        ordered(&sql("SELECT '{[1,4)}'::int4multirange - '{[2,3)}'::int4multirange").unwrap()),
+        ["{[1,2),[3,4)}"]
+    );
+    // The aggregates collect ranges into a multirange and back.
+    sql("DELETE FROM mr WHERE id = 3").unwrap();
+    sql("INSERT INTO mr VALUES (3, '{[1,3)}')").unwrap();
+    assert_eq!(
+        ordered(&sql("SELECT range_agg(m) FROM mr").unwrap()),
+        ["{[1,3)}"]
+    );
+    assert_eq!(
+        ordered(&sql("SELECT range_intersect_agg(m) FROM mr").unwrap()),
+        ["{}"]
+    );
+    assert_eq!(
+        ordered(&sql("SELECT range_agg(int4range(1, 3)) FROM mr WHERE id < 3").unwrap()),
+        ["{[1,3)}"]
+    );
+    // An equality lookup on an indexed multirange finds its row.
+    sql("CREATE INDEX mr_m_idx ON mr (m)").unwrap();
+    assert_eq!(
+        rows(&sql("SELECT count(*) FROM mr WHERE m = '{[1,2)}'").unwrap()),
+        ["1"]
+    );
+    // Only `count` and the collectors take a multirange.
+    let (message, _) = fields(sql("SELECT min(m) FROM mr").unwrap_err());
+    assert_eq!(message, "function min(int4multirange) does not exist");
+    let (message, _) = fields(sql("SELECT '{[1,2)}'::int4multirange @> 1.5").unwrap_err());
+    assert_eq!(
+        message,
+        "operator does not exist: int4multirange @> numeric"
+    );
+    let (message, _) =
+        fields(sql("SELECT '{[1,2)}'::int4multirange + '{[1,2)}'::nummultirange").unwrap_err());
+    assert_eq!(
+        message,
+        "operator does not exist: int4multirange + nummultirange"
+    );
+    let (message, _) = fields(sql("SELECT '{[1,2)}'::int4multirange::int4range").unwrap_err());
+    assert_eq!(message, "cannot cast type int4multirange to int4range");
+    // The catalog carries the types, their arrays, and their ranges.
+    assert_eq!(
+        ordered(&sql("SELECT typname FROM pg_type WHERE typtype = 'm' ORDER BY oid").unwrap()),
+        [
+            "int4multirange",
+            "nummultirange",
+            "tsmultirange",
+            "tstzmultirange",
+            "datemultirange",
+            "int8multirange"
+        ]
+    );
+    assert_eq!(
+        rows(
+            &sql(
+                "SELECT rngmultitypid::regtype FROM pg_range WHERE rngtypid = 'int4range'::regtype"
+            )
+            .unwrap()
+        ),
+        ["int4multirange"]
+    );
+    assert_eq!(
+        rows(&sql("SELECT format_type(4451, NULL), format_type(6150, NULL)").unwrap()),
+        ["int4multirange|int4multirange[]"]
+    );
+}

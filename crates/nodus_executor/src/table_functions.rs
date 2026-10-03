@@ -36,7 +36,21 @@ impl MemExecutor {
         // Each function returns its value-column types and rows (a row may carry
         // several values, e.g. multi-argument `unnest`).
         let (mut types, mut rows) = match spec.name.as_str() {
-            "unnest" => unnest_rows(&args),
+            // A multirange unnests into its ranges; the declared type names
+            // the element type for the rows.
+            "unnest" => {
+                let declared = spec
+                    .arg_exprs
+                    .first()
+                    .and_then(crate::result_types::constant_expr_type);
+                match declared.and_then(|t| crate::multiranges::kind_of(&t)) {
+                    Some(kind) => {
+                        let (_, rows) = multirange_unnest_rows(&args);
+                        (vec![kind.name().to_string()], rows)
+                    }
+                    None => unnest_rows(&args),
+                }
+            }
             // Timestamps (or dates) stepped by an interval.
             "generate_series"
                 if args.len() == 3
@@ -218,6 +232,17 @@ fn unnest_rows(args: &[Value]) -> (Vec<String>, Vec<Vec<Value>>) {
         })
         .collect();
     (types, rows)
+}
+
+/// `unnest(multirange)`: one row per element range.
+fn multirange_unnest_rows(args: &[Value]) -> (Vec<String>, Vec<Vec<Value>>) {
+    let text = args.first().map(crate::render).unwrap_or_default();
+    let rows = crate::multiranges::unnest(&text)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|value| vec![value])
+        .collect();
+    (vec!["VARCHAR".to_string()], rows)
 }
 
 /// `generate_series(start, stop[, step])` over integers (step defaults to 1).

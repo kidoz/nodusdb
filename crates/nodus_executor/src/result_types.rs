@@ -57,6 +57,13 @@ fn aggregate_type(op: &AggregateOp, input: Option<String>) -> Option<String> {
         | AggregateOp::RegrSxx
         | AggregateOp::RegrSyy
         | AggregateOp::RegrSxy => Some("DOUBLE PRECISION".into()),
+        // `range_agg` of ranges collects a multirange; of multiranges keeps
+        // it. `range_intersect_agg` keeps the argument's shape.
+        AggregateOp::RangeAgg => input.map(|ty| {
+            crate::ranges::Kind::of(&ty)
+                .map_or(ty.clone(), |kind| kind.multirange_name().to_string())
+        }),
+        AggregateOp::RangeIntersectAgg => input,
     }
 }
 
@@ -197,6 +204,23 @@ fn scalar_type(expr: &ScalarExpr, column: &impl Fn(&str) -> Option<String>) -> O
                 }
                 _ => None,
             }
+        }
+        // `greatest`/`least` of a range family keep its type.
+        ScalarExpr::Function { name, args } if name == RANGE_GREATEST => {
+            return args.get(1).and_then(|arg| match arg {
+                ScalarExpr::Literal(Value::Text(kind)) => Some(kind.clone()),
+                _ => None,
+            });
+        }
+        // The multirange constructors carry their subtype's name as a
+        // literal.
+        ScalarExpr::Function { name, args } if name == MULTIRANGE_BUILD => {
+            return args.first().and_then(|arg| match arg {
+                ScalarExpr::Literal(Value::Text(kind)) => crate::ranges::Kind::of(kind)
+                    .or_else(|| crate::multiranges::kind_of(kind))
+                    .map(|kind| kind.multirange_name().to_string()),
+                _ => None,
+            });
         }
         ScalarExpr::Function { name, args } => crate::functions::return_type(
             name,
@@ -360,8 +384,49 @@ pub(crate) fn check_integer_ranges(
     // A range operator takes its subtype from the operand that has one
     // (`'[1,5)'::int4range @> 3`), and a cast between two range types is
     // refused as PostgreSQL refuses it.
-    let range_kind =
-        |e: &ScalarExpr| scalar_type(e, column).and_then(|t| crate::ranges::Kind::of(&t));
+    // A range family: a range type, or the multirange over one. The flag
+    // marks the multirange, whose type names differ.
+    let range_side = |e: &ScalarExpr| -> Option<(crate::ranges::Kind, bool)> {
+        let data_type = scalar_type(e, column)?;
+        if let Some(kind) = crate::ranges::Kind::of(&data_type) {
+            return Some((kind, false));
+        }
+        crate::multiranges::kind_of(&data_type).map(|kind| (kind, true))
+    };
+    // The type name of a side, as PostgreSQL's messages write it.
+    let side_name = |(kind, multirange): (crate::ranges::Kind, bool)| {
+        if multirange {
+            kind.multirange_name().to_string()
+        } else {
+            kind.name().to_string()
+        }
+    };
+    let range_kind = |e: &ScalarExpr| range_side(e).map(|(kind, _)| kind);
+    // An element bound to a range operator must be of its subtype; an
+    // unknown or string literal is read as one.
+    let element_fits = |kind: crate::ranges::Kind, e: &ScalarExpr| -> bool {
+        let Some(data_type) = scalar_type(e, column) else {
+            return true;
+        };
+        let data_type = data_type.trim().to_ascii_uppercase();
+        if data_type.is_empty() || data_type == "UNKNOWN" || is_text_type(&data_type) {
+            return true;
+        }
+        match kind {
+            crate::ranges::Kind::Int4 | crate::ranges::Kind::Int8 => {
+                integer_rank(&data_type).is_some()
+            }
+            crate::ranges::Kind::Numeric => {
+                integer_rank(&data_type).is_some() || is_float(&data_type) || is_numeric(&data_type)
+            }
+            crate::ranges::Kind::Date => data_type == "DATE",
+            crate::ranges::Kind::Timestamp => data_type.starts_with("TIMESTAMP"),
+            crate::ranges::Kind::TimestampTz => {
+                data_type.starts_with("TIMESTAMPTZ")
+                    || data_type.starts_with("TIMESTAMP WITH TIME ZONE")
+            }
+        }
+    };
     // The same for the network-family types and money.
     let net_kind = |e: &ScalarExpr| scalar_type(e, column).and_then(|t| crate::net::Kind::of(&t));
     let number = |e: &ScalarExpr| {
@@ -380,10 +445,24 @@ pub(crate) fn check_integer_ranges(
         }
     };
     let range_call = range_operator;
-    // Two different range types have no common operator.
+    // Two different range types have no common operator, and the two
+    // families mix only for the positional operators (a range and a
+    // multirange of one subtype compare, but do not compare as a whole or
+    // combine).
     let mixed = |l: &ScalarExpr, r: &ScalarExpr, symbol: &str| -> Option<ScalarExpr> {
-        match (range_kind(l), range_kind(r)) {
-            (Some(a), Some(b)) if a != b => Some(bad_operator(a.name(), symbol, b.name())),
+        match (range_side(l), range_side(r)) {
+            (Some(a), Some(b)) if a.0 != b.0 => {
+                Some(bad_operator(&side_name(a), symbol, &side_name(b)))
+            }
+            (Some(a), Some(b))
+                if a.1 != b.1
+                    && matches!(
+                        symbol,
+                        "=" | "<>" | "<" | ">" | "<=" | ">=" | "+" | "-" | "*"
+                    ) =>
+            {
+                Some(bad_operator(&side_name(a), symbol, &side_name(b)))
+            }
             _ => None,
         }
     };
@@ -419,19 +498,40 @@ pub(crate) fn check_integer_ranges(
                 ],
             };
         }
+        // Casts between the range family: only a range to the multirange
+        // over its subtype exists; any other pairing errors.
         ScalarExpr::Cast {
             expr: inner,
             target,
-        } if let (Some(from), Some(to)) = (range_kind(inner), crate::ranges::Kind::of(target))
-            && from != to =>
-        {
-            return ScalarExpr::Function {
-                name: BAD_RANGE_CAST.to_string(),
-                args: vec![
-                    ScalarExpr::Literal(Value::Text(from.name().to_string())),
-                    ScalarExpr::Literal(Value::Text(to.name().to_string())),
-                ],
-            };
+        } if let Some(from) = range_side(inner) => {
+            let to = crate::ranges::Kind::of(target)
+                .map(|kind| (kind, false))
+                .or_else(|| crate::multiranges::kind_of(target).map(|kind| (kind, true)));
+            match to {
+                Some(to) if to == from => {}
+                Some((to_kind, true)) if to_kind == from.0 && !from.1 => {
+                    // A range wraps into the one-element multirange.
+                    return ScalarExpr::Function {
+                        name: MULTIRANGE_CAST.to_string(),
+                        args: vec![
+                            ScalarExpr::Literal(Value::Text(
+                                from.0.multirange_name().to_string(),
+                            )),
+                            (**inner).clone(),
+                        ],
+                    };
+                }
+                Some(to) => {
+                    return ScalarExpr::Function {
+                        name: BAD_RANGE_CAST.to_string(),
+                        args: vec![
+                            ScalarExpr::Literal(Value::Text(side_name(from))),
+                            ScalarExpr::Literal(Value::Text(side_name(to))),
+                        ],
+                    };
+                }
+                None => {}
+            }
         }
         // `&`, `|`, and `~` of addresses are the address operations, not the
         // integer ones.
@@ -458,6 +558,67 @@ pub(crate) fn check_integer_ranges(
         {
             let op = if name == SHIFT_LEFT { "<<" } else { ">>" };
             return range_call(op, l, r, kind, false);
+        }
+        // The multirange constructors learn their subtype.
+        ScalarExpr::Function { name, args }
+            if let Some(kind) = crate::ranges::Kind::of_multirange(name) =>
+        {
+            let mut with_kind = vec![ScalarExpr::Literal(Value::Text(
+                kind.name().to_string(),
+            ))];
+            with_kind.extend(args.iter().cloned());
+            return ScalarExpr::Function {
+                name: MULTIRANGE_BUILD.to_string(),
+                args: with_kind,
+            };
+        }
+        // `multirange(anyrange)` takes its subtype from its argument.
+        ScalarExpr::Function { name, args }
+            if name == "MULTIRANGE"
+                && let [arg] = args.as_slice()
+                && let Some((kind, false)) = range_side(arg) =>
+        {
+            return ScalarExpr::Function {
+                name: MULTIRANGE_BUILD.to_string(),
+                args: vec![
+                    ScalarExpr::Literal(Value::Text(kind.name().to_string())),
+                    arg.clone(),
+                ],
+            };
+        }
+        // `multirange(x)` takes a range, not a multirange.
+        ScalarExpr::Function { name, args }
+            if name == "MULTIRANGE"
+                && let [arg] = args.as_slice()
+                && let Some((kind, true)) = range_side(arg) =>
+        {
+            return bad_function("multirange", kind.multirange_name());
+        }
+        // `range_merge` of one range does not exist; of a multirange it
+        // spans its elements.
+        ScalarExpr::Function { name, args }
+            if name == "RANGE_MERGE"
+                && let [arg] = args.as_slice()
+                && let Some((kind, multirange)) = range_side(arg)
+                && !multirange =>
+        {
+            return bad_function("range_merge", kind.name());
+        }
+        // `greatest`/`least` of a range family pick by its order, which
+        // compares bounds rather than text.
+        ScalarExpr::Function { name, args }
+            if matches!(name.as_str(), "GREATEST" | "LEAST")
+                && let Some(side) = args.iter().find_map(|a| range_side(a)) =>
+        {
+            let mut with_kind = vec![
+                ScalarExpr::Literal(Value::Text(name.to_ascii_lowercase())),
+                ScalarExpr::Literal(Value::Text(side_name(side))),
+            ];
+            with_kind.extend(args.iter().cloned());
+            return ScalarExpr::Function {
+                name: RANGE_GREATEST.to_string(),
+                args: with_kind,
+            };
         }
         // `money(x)` is the cast into money.
         ScalarExpr::Function { name, args } if name == "MONEY" && args.len() == 1 => {
@@ -579,11 +740,27 @@ pub(crate) fn check_integer_ranges(
             if let Some(bad) = mixed(l, r, op) {
                 return bad;
             }
+            // An untyped literal resolves to the range's own type, as
+            // PostgreSQL resolves it; anything else outside the family is an
+            // element.
+            let untyped = |e: &ScalarExpr| matches!(e, ScalarExpr::Literal(Value::Text(_)));
             if op == "<@" {
-                let element = range_kind(l).is_none();
+                let element = range_kind(l).is_none() && !untyped(l);
+                if element && !element_fits(found, l) {
+                    let element_name =
+                        operator_type_name(&scalar_type(l, column).unwrap_or_default());
+                    let range_name = range_side(r).map(side_name).unwrap_or_default();
+                    return bad_operator(&range_name, "@>", &element_name);
+                }
                 return range_call("@>", r, l, found, element);
             }
-            let element = op == "@>" && range_kind(r).is_none();
+            let element = op == "@>" && range_kind(r).is_none() && !untyped(r);
+            if element && !element_fits(found, r) {
+                let element_name =
+                    operator_type_name(&scalar_type(r, column).unwrap_or_default());
+                let range_name = range_side(l).map(side_name).unwrap_or_default();
+                return bad_operator(&range_name, op, &element_name);
+            }
             return range_call(op, l, r, found, element);
         }
         // A window aggregate over an address or money carries its type the
@@ -634,6 +811,35 @@ pub(crate) fn check_integer_ranges(
                 return ScalarExpr::Window(Box::new(call));
             }
         }
+        // `range_agg` and `range_intersect_agg` carry their subtype and the
+        // input's shape wherever they are nested.
+        ScalarExpr::Aggregate {
+            op: op @ (AggregateOp::RangeAgg | AggregateOp::RangeIntersectAgg),
+            arg,
+            arg_expr,
+            distinct,
+            extra_args,
+            filter,
+            order_by,
+        } if extra_args.is_empty()
+            && let Some((kind, multirange)) = arg_expr
+                .as_deref()
+                .and_then(|e| range_side(e))
+                .or_else(|| range_side(&ScalarExpr::Column(arg.clone()))) =>
+        {
+            return ScalarExpr::Aggregate {
+                op: op.clone(),
+                arg: arg.clone(),
+                arg_expr: arg_expr.clone(),
+                distinct: *distinct,
+                extra_args: vec![
+                    ScalarExpr::Literal(Value::Text(kind.name().to_string())),
+                    ScalarExpr::Literal(Value::Bool(multirange)),
+                ],
+                filter: filter.clone(),
+                order_by: order_by.clone(),
+            };
+        }
         // `sum` of money adds cents wherever it is nested (in `HAVING`, a
         // cast, or arithmetic); the type rides along as an extra argument.
         ScalarExpr::Aggregate {
@@ -661,8 +867,8 @@ pub(crate) fn check_integer_ranges(
                 order_by: order_by.clone(),
             };
         }
-        // Only `count`, `array_agg`, and the JSON collectors take a range;
-        // `min`, `sum`, and the like have no overload for one.
+        // Only `count`, the collectors, and the range builders take a range
+        // or multirange; `min`, `sum`, and the like have no overload.
         ScalarExpr::Aggregate {
             op, arg, arg_expr, ..
         } if !matches!(
@@ -671,18 +877,22 @@ pub(crate) fn check_integer_ranges(
                 | AggregateOp::ArrayAgg
                 | AggregateOp::JsonAgg
                 | AggregateOp::JsonbAgg
+                | AggregateOp::JsonObjectAgg
+                | AggregateOp::JsonbObjectAgg
+                | AggregateOp::RangeAgg
+                | AggregateOp::RangeIntersectAgg
         ) && arg_expr
             .as_deref()
-            .and_then(|e| range_kind(e))
-            .or_else(|| range_kind(&ScalarExpr::Column(arg.clone())))
+            .and_then(|e| range_side(e))
+            .or_else(|| range_side(&ScalarExpr::Column(arg.clone())))
             .is_some() =>
         {
-            let kind = arg_expr
+            let side = arg_expr
                 .as_deref()
-                .and_then(|e| range_kind(e))
-                .or_else(|| range_kind(&ScalarExpr::Column(arg.clone())))
+                .and_then(|e| range_side(e))
+                .or_else(|| range_side(&ScalarExpr::Column(arg.clone())))
                 .expect("checked by the guard");
-            return bad_function(&op.sql_name().to_ascii_lowercase(), kind.name());
+            return bad_function(&op.sql_name().to_ascii_lowercase(), &side_name(side));
         }
         ScalarExpr::Binary { op, left, right } => {
             // `range || x` has an operator only where `x` is text, and
@@ -820,9 +1030,22 @@ pub(crate) fn check_integer_ranges(
                     ScalarBinaryOp::Mul => Some("*"),
                     _ => None,
                 };
-                // `+`, `-`, and `*` are for two ranges; with an element on a
-                // side PostgreSQL has no such operator.
-                let both_ranges = range_kind(left).is_some() && range_kind(right).is_some();
+                // `+`, `-`, `*`, and the comparisons are for two ranges or
+                // two multiranges; with an element (or across the families)
+                // PostgreSQL has no such operator. An untyped literal takes
+                // the other side's type, as PostgreSQL resolves it.
+                let untyped = |e: &ScalarExpr| {
+                    matches!(
+                        e,
+                        ScalarExpr::Literal(Value::Text(_)) | ScalarExpr::Literal(Value::Null)
+                    )
+                };
+                let both_ranges = range_side(left).is_some_and(|(_, m)| !m)
+                    && (range_side(right).is_some_and(|(_, m)| !m) || untyped(right))
+                    || untyped(left) && range_side(right).is_some_and(|(_, m)| !m);
+                let both_multiranges = range_side(left).is_some_and(|(_, m)| m)
+                    && (range_side(right).is_some_and(|(_, m)| m) || untyped(right))
+                    || untyped(left) && range_side(right).is_some_and(|(_, m)| m);
                 let set_operation = matches!(
                     op,
                     ScalarBinaryOp::Add | ScalarBinaryOp::Sub | ScalarBinaryOp::Mul
@@ -831,24 +1054,22 @@ pub(crate) fn check_integer_ranges(
                     if let Some(bad) = mixed(left, right, symbol) {
                         return bad;
                     }
-                    if !set_operation || both_ranges {
-                        return range_call(symbol, left, right, kind, false);
-                    }
-                    if set_operation && !both_ranges {
-                        let other = if range_kind(left).is_some() {
-                            right
-                        } else {
-                            left
+                    if !both_ranges && !both_multiranges {
+                        // One side is an element (or the other family): name
+                        // both as PostgreSQL does.
+                        let name = |e: &ScalarExpr| {
+                            range_side(e).map_or_else(
+                                || {
+                                    operator_type_name(
+                                        &scalar_type(e, column).unwrap_or_default(),
+                                    )
+                                },
+                                side_name,
+                            )
                         };
-                        let other_name =
-                            operator_type_name(&scalar_type(other, column).unwrap_or_default());
-                        let range_name = kind.name().to_string();
-                        return if range_kind(left).is_some() {
-                            bad_operator(&range_name, symbol, &other_name)
-                        } else {
-                            bad_operator(&other_name, symbol, &range_name)
-                        };
+                        return bad_operator(&name(left), symbol, &name(right));
                     }
+                    return range_call(symbol, left, right, kind, false);
                 }
             }
         }
@@ -1470,6 +1691,18 @@ pub(crate) const RANGE_UPPER: &str = "__RANGE_UPPER__";
 /// has no such cast (`cannot cast type int4range to int8range`).
 pub(crate) const BAD_RANGE_CAST: &str = "__BAD_RANGE_CAST__";
 
+/// The function a range's cast to the multirange over its subtype is
+/// rewritten to: `__MULTIRANGE_FROM_RANGE__(type, value)`.
+pub(crate) const MULTIRANGE_CAST: &str = "__MULTIRANGE_FROM_RANGE__";
+
+/// The function the multirange constructors are rewritten to:
+/// `__MULTIRANGE_BUILD__(subtype, range...)`.
+pub(crate) const MULTIRANGE_BUILD: &str = "__MULTIRANGE_BUILD__";
+
+/// The function `greatest`/`least` over a range or multirange is rewritten
+/// to: `__RANGE_GREATEST__(name, type, value...)`, picking by its order.
+pub(crate) const RANGE_GREATEST: &str = "__RANGE_GREATEST__";
+
 /// The function a network-family operator is rewritten to once its type is
 /// known: `__NET__(operator, left, right, type, right-is-compatible)`.
 pub(crate) const NET_OP: &str = "__NET__";
@@ -1752,10 +1985,16 @@ pub(crate) fn check_filter_integer_ranges(
         })
     };
     let range_predicate = |left: &ScalarExpr, op: &crate::CompareOp, right: &ScalarExpr| {
-        let kind = expr_type(left, column).and_then(|t| crate::ranges::Kind::of(&t))?;
+        // A range column, or the multirange over one.
+        let kind = |e: &ScalarExpr| {
+            expr_type(e, column).and_then(|t| {
+                crate::ranges::Kind::of(&t).or_else(|| crate::multiranges::kind_of(&t))
+            })
+        };
+        let kind = kind(left)?;
         let symbol = range_symbol(op)?;
         let right_is_element = expr_type(right, column)
-            .and_then(|t| crate::ranges::Kind::of(&t))
+            .and_then(|t| crate::ranges::Kind::of(&t).or_else(|| crate::multiranges::kind_of(&t)))
             .is_none();
         Some(if symbol == "<@" {
             range_operator("@>", right, left, kind, !right_is_element)

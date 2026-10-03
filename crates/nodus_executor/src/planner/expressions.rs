@@ -2522,6 +2522,8 @@ pub(crate) fn aggregate_op(name: &str) -> Option<AggregateOp> {
         "BIT_OR" => Some(AggregateOp::BitOr),
         "BIT_XOR" => Some(AggregateOp::BitXor),
         "ANY_VALUE" => Some(AggregateOp::AnyValue),
+        "RANGE_AGG" => Some(AggregateOp::RangeAgg),
+        "RANGE_INTERSECT_AGG" => Some(AggregateOp::RangeIntersectAgg),
         "CORR" => Some(AggregateOp::Corr),
         "COVAR_POP" => Some(AggregateOp::CovarPop),
         "COVAR_SAMP" => Some(AggregateOp::CovarSamp),

@@ -888,6 +888,40 @@ impl MemExecutor {
                         alias: Some("sum".to_string()),
                     }
                 }
+                // `range_agg` and `range_intersect_agg` carry their subtype
+                // and whether the input is a multirange, which the collector
+                // needs to merge or intersect the ranges.
+                ProjectionItem::Aggregate(
+                    op @ (AggregateOp::RangeAgg | AggregateOp::RangeIntersectAgg),
+                    arg,
+                ) if column_type(&arg).is_some_and(|t| {
+                    crate::ranges::Kind::of(&t).is_some()
+                        || crate::multiranges::is_multirange_type(&t)
+                }) =>
+                {
+                    let ty = column_type(&arg).expect("guarded by the match arm");
+                    let kind = crate::ranges::Kind::of(&ty)
+                        .or_else(|| crate::multiranges::kind_of(&ty))
+                        .expect("guarded by the match arm");
+                    let multirange = crate::multiranges::is_multirange_type(&ty);
+                    ProjectionItem::Expr {
+                        expr: crate::ScalarExpr::Aggregate {
+                            op: op.clone(),
+                            arg,
+                            arg_expr: None,
+                            distinct: false,
+                            extra_args: vec![
+                                crate::ScalarExpr::Literal(crate::Value::Text(
+                                    kind.name().to_string(),
+                                )),
+                                crate::ScalarExpr::Literal(crate::Value::Bool(multirange)),
+                            ],
+                            filter: None,
+                            order_by: Vec::new(),
+                        },
+                        alias: Some(op.sql_name().to_string()),
+                    }
+                }
                 // Money has no `avg` (nor any variance aggregate); the
                 // collectors take it, and `sum` above.
                 ProjectionItem::Aggregate(op, arg)
@@ -914,8 +948,9 @@ impl MemExecutor {
                         alias: Some(format!("{op:?}").to_ascii_lowercase()),
                     }
                 }
-                // No aggregate over a range takes one but `count` and the
-                // array and JSON collectors (`min(int4range)` does not exist).
+                // No aggregate over a range or multirange takes one but
+                // `count`, the collectors, and the range builders
+                // (`min(int4range)` does not exist).
                 ProjectionItem::Aggregate(op, arg)
                     if !matches!(
                         op,
@@ -923,15 +958,27 @@ impl MemExecutor {
                             | AggregateOp::ArrayAgg
                             | AggregateOp::JsonAgg
                             | AggregateOp::JsonbAgg
-                    ) && column_type(&arg).is_some_and(|t| crate::ranges::is_range_type(&t)) =>
+                            | AggregateOp::JsonObjectAgg
+                            | AggregateOp::JsonbObjectAgg
+                            | AggregateOp::RangeAgg
+                            | AggregateOp::RangeIntersectAgg
+                    ) && column_type(&arg).is_some_and(|t| {
+                        crate::ranges::is_range_type(&t)
+                            || crate::multiranges::is_multirange_type(&t)
+                    }) =>
                 {
-                    let kind = column_type(&arg)
-                        .and_then(|t| crate::ranges::Kind::of(&t))
+                    let ty = column_type(&arg).expect("guarded by the match arm");
+                    let name = crate::ranges::Kind::of(&ty)
+                        .map(|kind| kind.name().to_string())
+                        .or_else(|| {
+                            crate::multiranges::kind_of(&ty)
+                                .map(|kind| kind.multirange_name().to_string())
+                        })
                         .expect("guarded by the match arm");
                     ProjectionItem::Expr {
                         expr: crate::result_types::bad_function(
                             &op.sql_name().to_ascii_lowercase(),
-                            kind.name(),
+                            &name,
                         ),
                         alias: Some(format!("{op:?}").to_ascii_lowercase()),
                     }
@@ -2025,6 +2072,10 @@ impl MemExecutor {
                 .iter()
                 .map(|t| t.as_deref().and_then(crate::ranges::Kind::of))
                 .collect();
+            let multirange_keys: Vec<Option<crate::ranges::Kind>> = key_types
+                .iter()
+                .map(|t| t.as_deref().and_then(crate::multiranges::kind_of))
+                .collect();
             let net_keys: Vec<Option<crate::net::Kind>> = key_types
                 .iter()
                 .map(|t| t.as_deref().and_then(crate::net::Kind::of))
@@ -2045,6 +2096,14 @@ impl MemExecutor {
                     && let (Ok(l), Ok(r)) = (crate::ranges::parse(l), crate::ranges::parse(r))
                 {
                     let ord = crate::ranges::cmp_ranges(kind, &l, &r);
+                    return if asc { ord } else { ord.reverse() };
+                }
+                if let Some(kind) = multirange_keys[i]
+                    && let (Value::Text(l), Value::Text(r)) = (a, b)
+                    && let (Ok(l), Ok(r)) =
+                        (crate::multiranges::parse(l), crate::multiranges::parse(r))
+                {
+                    let ord = crate::multiranges::cmp(kind, &l, &r);
                     return if asc { ord } else { ord.reverse() };
                 }
                 if let Some(kind) = net_keys[i]

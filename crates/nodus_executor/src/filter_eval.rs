@@ -167,7 +167,10 @@ impl MemExecutor {
                     Value::Text(_)
                         if crate::value::temporal_type(expected_type).is_some()
                             || crate::value::is_jsonb_type(expected_type)
-                            || crate::value::is_bytea_type(expected_type) =>
+                            || crate::value::is_bytea_type(expected_type)
+                            || crate::ranges::is_range_type(expected_type)
+                            || crate::multiranges::is_multirange_type(expected_type)
+                            || crate::net::is_net_type(expected_type) =>
                     {
                         crate::value::coerce_for_column(val, expected_type)
                     }
