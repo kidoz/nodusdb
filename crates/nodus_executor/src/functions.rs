@@ -96,6 +96,9 @@ pub(crate) fn is_known(name: &str) -> bool {
                 | crate::result_types::BIT_AND | crate::result_types::BIT_OR
                 | crate::result_types::BIT_XOR | crate::result_types::SHIFT_LEFT
                 | crate::result_types::SHIFT_RIGHT | crate::result_types::BIT_NOT
+                // Text search.
+                | "SETWEIGHT" | "STRIP" | "NUMNODE" | "TSVECTOR_TO_ARRAY"
+                | "ARRAY_TO_TSVECTOR" | "TSQUERY_PHRASE" | "TS_DELETE"
                 // Dates and times.
                 | "NOW" | "CURRENT_TIMESTAMP" | "TRANSACTION_TIMESTAMP"
                 | "STATEMENT_TIMESTAMP" | "CLOCK_TIMESTAMP" | "CURRENT_DATE" | "CURRENT_TIME"
@@ -361,6 +364,10 @@ pub(crate) fn return_type(name: &str, arg_types: &[Option<String>]) -> Option<St
                 });
             }
             "GEN_RANDOM_UUID" | "UUIDV4" | "UUIDV7" => "UUID",
+            "__TSLEN__" | "NUMNODE" => "INTEGER",
+            "SETWEIGHT" | "STRIP" | "TSVECTOR_TO_ARRAY" | "ARRAY_TO_TSVECTOR" | "TS_DELETE" => {
+                "TSVECTOR"
+            }
             "TSQUERY_PHRASE" | "__TSNOT__" => "TSQUERY",
             "__TSCMP__" => "BOOLEAN",
             "__TS__" => match arg_types.first().cloned().flatten().as_deref() {
@@ -3253,6 +3260,16 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
             };
             crate::planner::apply_binary_op(op, document, path)
         }
+        // Text-search markers and functions. Their arguments are strict
+        // (a NULL anywhere gives NULL).
+        "__TSLEN__" if arity(1) => textsearch_function("length", args),
+        "__TSCMP__" | "__TS__" if arity(4) => textsearch_marker(&name, args),
+        "__TSNOT__" if arity(1) => textsearch_function("not", args),
+        "STRIP" | "SETWEIGHT" | "NUMNODE" | "TSVECTOR_TO_ARRAY" | "ARRAY_TO_TSVECTOR"
+        | "TSQUERY_PHRASE" | "TS_DELETE" =>
+        {
+            textsearch_function(&name.to_ascii_lowercase(), args)
+        }
         // The jsonpath functions: all arguments are strict (a NULL anywhere
         // gives NULL), and the `_tz` spellings behave as the others do.
         // `jsonb_path_query` is set-returning and handled below.
@@ -4158,6 +4175,269 @@ fn pretty(args: &[Value]) -> Option<bool> {
         None => Some(false),
         Some(Value::Bool(b)) => Some(*b),
         Some(_) => None,
+    }
+}
+
+/// A text-search operator rewritten to a marker once the declared types are
+/// known: comparisons compare with the type's own ordering, and the others
+/// build or test vectors and queries.
+fn textsearch_marker(name: &str, args: &[Value]) -> Value {
+    if args.iter().any(|a| matches!(a, Value::Null)) {
+        return Value::Null;
+    }
+    let symbol = text(&args[0]);
+    let comparison = name == crate::result_types::TS_CMP;
+    if comparison {
+        let (Some(left), Some(right)) = (text_arg_at(args, 1), text_arg_at(args, 2)) else {
+            return raise("invalid input syntax for type tsvector");
+        };
+        let kind = text(&args[3]);
+        let ord = if kind == "tsvector" {
+            match (
+                crate::textsearch::parse_tsvector(&left),
+                crate::textsearch::parse_tsvector(&right),
+            ) {
+                (Ok(l), Ok(r)) => crate::textsearch::tsvector_cmp(&l, &r),
+                _ => return raise("invalid input syntax for type tsvector"),
+            }
+        } else {
+            match (
+                crate::textsearch::parse_tsquery(&left),
+                crate::textsearch::parse_tsquery(&right),
+            ) {
+                (Ok(l), Ok(r)) => crate::textsearch::tsquery_cmp(&l, &r),
+                _ => return raise("invalid input syntax for type tsquery"),
+            }
+        };
+        let result = match symbol.as_str() {
+            "=" => ord == std::cmp::Ordering::Equal,
+            "<>" => ord != std::cmp::Ordering::Equal,
+            "<" => ord == std::cmp::Ordering::Less,
+            "<=" => ord != std::cmp::Ordering::Greater,
+            ">" => ord == std::cmp::Ordering::Greater,
+            ">=" => ord != std::cmp::Ordering::Less,
+            _ => return raise("unrecognized comparison"),
+        };
+        return Value::Bool(result);
+    }
+    match symbol.as_str() {
+        "||" | "&&" | "<->" | "@>" | "<@" => {
+            let kind = text(&args[3]);
+            if kind == "tsvector" {
+                let (Ok(l), Ok(r)) = (
+                    crate::textsearch::parse_tsvector(&text_arg_at(args, 1).unwrap_or_default()),
+                    crate::textsearch::parse_tsvector(&text_arg_at(args, 2).unwrap_or_default()),
+                ) else {
+                    return raise("invalid input syntax for type tsvector");
+                };
+                return match symbol.as_str() {
+                    "||" => Value::Text(crate::textsearch::print_tsvector(
+                        &crate::textsearch::tsvector_concat(&l, &r),
+                    )),
+                    _ => raise(format!(
+                        "operator does not exist: tsvector {symbol} tsvector"
+                    )),
+                };
+            }
+            let (Ok(l), Ok(r)) = (
+                crate::textsearch::parse_tsquery(&text_arg_at(args, 1).unwrap_or_default()),
+                crate::textsearch::parse_tsquery(&text_arg_at(args, 2).unwrap_or_default()),
+            ) else {
+                return raise("invalid input syntax for type tsquery");
+            };
+            match symbol.as_str() {
+                "||" => Value::Text(crate::textsearch::print_tsquery(
+                    &crate::textsearch::query_or(&l, &r),
+                )),
+                "&&" => Value::Text(crate::textsearch::print_tsquery(
+                    &crate::textsearch::query_and(&l, &r),
+                )),
+                "<->" => Value::Text(crate::textsearch::print_tsquery(
+                    &crate::textsearch::query_phrase(&l, &r, 1),
+                )),
+                "@>" => Value::Bool(crate::textsearch::query_contains(&l, &r)),
+                "<@" => Value::Bool(crate::textsearch::query_contained(&l, &r)),
+                _ => raise(format!("operator does not exist: tsquery {symbol} tsquery")),
+            }
+        }
+        "@@" => {
+            let (Some(vector), Some(query)) = (text_arg_at(args, 1), text_arg_at(args, 2)) else {
+                return raise("invalid input syntax for type tsvector");
+            };
+            let kind = text(&args[3]);
+            let (vector, query) = if kind == "tsvector" {
+                (vector, query)
+            } else {
+                (query, vector)
+            };
+            let (Ok(vector), Ok(query)) = (
+                crate::textsearch::parse_tsvector(&vector),
+                crate::textsearch::parse_tsquery(&query),
+            ) else {
+                return raise("invalid input syntax for type tsvector");
+            };
+            Value::Bool(crate::textsearch::matches(&vector, &query))
+        }
+        _ => raise(format!("unrecognized operator {symbol}")),
+    }
+}
+
+fn text_arg_at(args: &[Value], index: usize) -> Option<String> {
+    match args.get(index) {
+        Some(Value::Text(t)) => Some(t.clone()),
+        _ => None,
+    }
+}
+
+/// A text-search function by name.
+fn textsearch_function(name: &str, args: &[Value]) -> Value {
+    // `array_to_tsvector` tolerates NULL elements; the rest are strict.
+    if name != "array_to_tsvector" && args.iter().any(|a| matches!(a, Value::Null)) {
+        return Value::Null;
+    }
+    let vector = |index: usize| -> Option<crate::textsearch::TsVector> {
+        match args.get(index) {
+            Some(Value::Text(t)) => match crate::textsearch::parse_tsvector(t) {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    crate::eval_error::raise(e);
+                    None
+                }
+            },
+            _ => None,
+        }
+    };
+    let query = |index: usize| -> Option<crate::textsearch::QNode> {
+        match args.get(index) {
+            Some(Value::Text(t)) => match crate::textsearch::parse_tsquery(t) {
+                Ok(q) => Some(q),
+                Err(e) => {
+                    crate::eval_error::raise(e);
+                    None
+                }
+            },
+            _ => None,
+        }
+    };
+    match name {
+        "length" => match vector(0) {
+            Some(vector) => Value::Int(crate::textsearch::vector_length(&vector)),
+            None => Value::Null,
+        },
+        "not" => match query(0) {
+            Some(query) => Value::Text(crate::textsearch::print_tsquery(
+                &crate::textsearch::query_not(&query),
+            )),
+            None => Value::Null,
+        },
+        "strip" => match vector(0) {
+            Some(vector) => Value::Text(crate::textsearch::print_tsvector(
+                &crate::textsearch::vector_strip(&vector),
+            )),
+            None => Value::Null,
+        },
+        "numnode" => match query(0) {
+            Some(query) => Value::Int(crate::textsearch::query_numnode(&query)),
+            None => Value::Null,
+        },
+        "tsvector_to_array" => match vector(0) {
+            Some(vector) => Value::Array(
+                crate::textsearch::vector_to_array(&vector)
+                    .into_iter()
+                    .map(Value::Text)
+                    .collect(),
+            ),
+            None => Value::Null,
+        },
+        "array_to_tsvector" => {
+            let Some(Value::Array(items)) = args.first() else {
+                return raise("array_to_tsvector requires a text array");
+            };
+            let words: Vec<Option<String>> = items
+                .iter()
+                .map(|item| match item {
+                    Value::Null => None,
+                    Value::Text(t) => Some(t.clone()),
+                    other => Some(render(other)),
+                })
+                .collect();
+            match crate::textsearch::array_to_vector(&words) {
+                Ok(vector) => Value::Text(crate::textsearch::print_tsvector(&vector)),
+                Err(e) => crate::eval_error::raise(e),
+            }
+        }
+        "ts_delete" => match (vector(0), args.get(1)) {
+            (Some(vector), Some(Value::Text(word))) => {
+                Value::Text(crate::textsearch::print_tsvector(
+                    &crate::textsearch::vector_delete(&vector, &[word.clone()]),
+                ))
+            }
+            (Some(vector), Some(Value::Array(items))) => {
+                let words: Vec<String> = items
+                    .iter()
+                    .map(|item| match item {
+                        Value::Text(t) => t.clone(),
+                        other => render(other),
+                    })
+                    .collect();
+                Value::Text(crate::textsearch::print_tsvector(
+                    &crate::textsearch::vector_delete(&vector, &words),
+                ))
+            }
+            _ => Value::Null,
+        },
+        "setweight" => {
+            let Some(vector) = vector(0) else {
+                return Value::Null;
+            };
+            let weight_text = match args.get(1) {
+                Some(Value::Text(t)) => t.clone(),
+                _ => return raise("setweight requires a weight character"),
+            };
+            let weight = match crate::textsearch::weight_letter(&weight_text) {
+                Ok(w) => w,
+                Err(e) => return crate::eval_error::raise(e),
+            };
+            let only: Option<Vec<String>> = match args.get(2) {
+                None => None,
+                Some(Value::Array(items)) => Some(
+                    items
+                        .iter()
+                        .map(|item| match item {
+                            Value::Text(t) => t.clone(),
+                            other => render(other),
+                        })
+                        .collect(),
+                ),
+                Some(_) => None,
+            };
+            Value::Text(crate::textsearch::print_tsvector(
+                &crate::textsearch::vector_setweight(&vector, weight, only.as_deref()),
+            ))
+        }
+        "tsquery_phrase" => {
+            let (Some(left), Some(right)) = (query(0), query(1)) else {
+                return Value::Null;
+            };
+            let distance = match args.get(2) {
+                None => 1,
+                Some(Value::Int(n)) => *n as i32,
+                _ => return raise("distance must be an integer"),
+            };
+            if !(0..=16384).contains(&distance) {
+                return raise(
+                    crate::error_fields::DbError::new(
+                        "distance in phrase operator must be an integer value between zero and 16384 inclusive",
+                    )
+                    .code("22023")
+                    .into_text(),
+                );
+            }
+            Value::Text(crate::textsearch::print_tsquery(
+                &crate::textsearch::query_phrase(&left, &right, distance as i16),
+            ))
+        }
+        _ => raise(format!("unrecognized function {name}")),
     }
 }
 

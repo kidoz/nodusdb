@@ -598,6 +598,7 @@ fn scalar_binary_op(op: &sqlparser::ast::BinaryOperator) -> Option<ScalarBinaryO
         B::ArrowAt => ScalarBinaryOp::ContainedBy,
         B::AtQuestion => ScalarBinaryOp::JsonPathExists,
         B::AtAt => ScalarBinaryOp::JsonPathMatch,
+        B::LtDashGt => ScalarBinaryOp::TsPhrase,
         B::PGOverlap => ScalarBinaryOp::Overlap,
         B::PGCustomBinaryOperator(parts) => match parts.last().map(String::as_str) {
             Some("=") => ScalarBinaryOp::Eq,
@@ -927,6 +928,14 @@ pub(crate) fn lower_scalar(expr: &sqlparser::ast::Expr, params: &[Value]) -> Opt
             let op = match op {
                 U::Minus => ScalarUnaryOp::Neg,
                 U::Not => ScalarUnaryOp::Not,
+                // `!!` is the text-search negation (PostgreSQL's old factorial
+                // prefix no longer resolves).
+                U::PGPrefixFactorial => {
+                    return Some(ScalarExpr::Function {
+                        name: crate::result_types::TS_NOT.to_string(),
+                        args: vec![e],
+                    });
+                }
                 U::Plus => return Some(e),
                 U::BitwiseNot => return Some(call(crate::result_types::BIT_NOT)),
                 U::AtDashAt | U::DoubleAt | U::Hash | U::QuestionDash | U::QuestionPipe => {
@@ -2871,6 +2880,10 @@ pub(crate) fn apply_binary_op(op: ScalarBinaryOp, l: Value, r: Value) -> Value {
                 _ => return Value::Null,
             })
         }
+        // The text-search operators are rewritten to marker calls once the
+        // declared types are known; reaching here means the rewrite did not
+        // run (planning outside a schema), so the values cannot be told apart.
+        Op::TsPhrase => Value::Null,
         Op::JsonPathExists | Op::JsonPathMatch => {
             if matches!(l, Value::Null) || matches!(r, Value::Null) {
                 return Value::Null;

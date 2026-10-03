@@ -866,6 +866,28 @@ impl MemExecutor {
                         alias: Some(format!("{op:?}").to_ascii_lowercase()),
                     }
                 }
+                // PostgreSQL defines no `min`/`max` for a tsvector or
+                // tsquery, though both have a full ordering for themselves.
+                ProjectionItem::Aggregate(op @ (AggregateOp::Min | AggregateOp::Max), arg)
+                    if column_type(&arg).is_some_and(|t| {
+                        crate::textsearch::is_tsvector_type(&t)
+                            || crate::textsearch::is_tsquery_type(&t)
+                    }) =>
+                {
+                    let ty = column_type(&arg).expect("guarded by the match arm");
+                    let kind = if crate::textsearch::is_tsvector_type(&ty) {
+                        "tsvector"
+                    } else {
+                        "tsquery"
+                    };
+                    ProjectionItem::Expr {
+                        expr: crate::result_types::bad_function(
+                            &op.sql_name().to_ascii_lowercase(),
+                            kind,
+                        ),
+                        alias: Some(format!("{op:?}").to_ascii_lowercase()),
+                    }
+                }
                 // `sum` of money adds cents; the type rides along as an
                 // extra argument, as it does for address `min`/`max`.
                 ProjectionItem::Aggregate(AggregateOp::Sum, arg)

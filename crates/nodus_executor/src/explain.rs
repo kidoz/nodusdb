@@ -926,6 +926,7 @@ fn binary_op(op: &ScalarBinaryOp) -> &'static str {
         B::ContainedBy => "<@",
         B::JsonPathExists => "@?",
         B::JsonPathMatch => "@@",
+        B::TsPhrase => "<->",
         B::Overlap => "&&",
     }
 }

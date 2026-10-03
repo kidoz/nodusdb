@@ -207,6 +207,29 @@ fn scalar_type(expr: &ScalarExpr, column: &impl Fn(&str) -> Option<String>) -> O
         }
         // The geometric operators, casts, and functions carry their result
         // types by name.
+        // A text-search operator keeps the type its kind and symbol say:
+        // `tsquery || tsquery`, `&&`, and `<->` produce a query; `tsvector
+        // || tsvector` a vector; the matching and containment operators a
+        // boolean.
+        ScalarExpr::Function { name, args } if name == TS_OP => {
+            let literal = |i: usize| match args.get(i) {
+                Some(ScalarExpr::Literal(Value::Text(text))) => Some(text.as_str()),
+                _ => None,
+            };
+            let symbol = literal(0)?;
+            let kind = literal(3)?;
+            return Some(
+                if kind == "tsvector" {
+                    "TSVECTOR"
+                } else {
+                    match symbol {
+                        "&&" | "||" | "<->" => "TSQUERY",
+                        _ => "BOOLEAN",
+                    }
+                }
+                .to_string(),
+            );
+        }
         ScalarExpr::Function { name, args } if name == GEO_OP => {
             let op = args.first().and_then(|arg| match arg {
                 ScalarExpr::Literal(Value::Text(op)) => Some(op.as_str()),
@@ -340,6 +363,7 @@ fn binary_type(op: ScalarBinaryOp, left: Option<String>, right: Option<String>) 
         | Op::JsonPathExists
         | Op::JsonPathMatch
         | Op::Overlap => Some("BOOLEAN".into()),
+        Op::TsPhrase => left,
         Op::JsonGetText | Op::JsonPathText => Some("TEXT".into()),
         Op::JsonGet | Op::JsonPath => left,
         Op::Concat => match (&left, &right) {
@@ -942,6 +966,65 @@ pub(crate) fn check_integer_ranges(
                 .collect();
             return bad_function_args(&name.to_ascii_lowercase(), &types);
         }
+        // `!!query`: only a tsquery has this operator.
+        ScalarExpr::Function { name, args }
+            if name == TS_NOT && args.len() == 1 =>
+        {
+            if ts_kind(&args[0], column) != Some("tsquery") {
+                return bad_operator("", "!!", &argument_type_name(&args[0], column));
+            }
+            return checked.clone();
+        }
+        // The text-search functions: their argument types decide, since
+        // their values are text at run time.
+        ScalarExpr::Function { name, args }
+            if matches!(
+                name.as_str(),
+                "SETWEIGHT"
+                    | "STRIP"
+                    | "NUMNODE"
+                    | "TSVECTOR_TO_ARRAY"
+                    | "ARRAY_TO_TSVECTOR"
+                    | "TSQUERY_PHRASE"
+                    | "TS_DELETE"
+                    | "LENGTH"
+            ) && (args.iter().any(|a| ts_kind(a, column).is_some())
+                || name.eq_ignore_ascii_case("array_to_tsvector")) =>
+        {
+            let first_ok = match name.as_str() {
+                "STRIP" => args.len() == 1 && ts_kind(&args[0], column) == Some("tsvector"),
+                "NUMNODE" => args.len() == 1 && ts_kind(&args[0], column) == Some("tsquery"),
+                "LENGTH" => args.len() == 1 && ts_kind(&args[0], column) == Some("tsvector"),
+                "TSVECTOR_TO_ARRAY" => {
+                    args.len() == 1 && ts_kind(&args[0], column) == Some("tsvector")
+                }
+                "ARRAY_TO_TSVECTOR" => args.len() == 1,
+                "SETWEIGHT" => {
+                    matches!(args.len(), 2 | 3) && ts_kind(&args[0], column) == Some("tsvector")
+                }
+                "TS_DELETE" => args.len() == 2 && ts_kind(&args[0], column) == Some("tsvector"),
+                "TSQUERY_PHRASE" => {
+                    matches!(args.len(), 2 | 3)
+                        && ts_kind(&args[0], column) == Some("tsquery")
+                        && ts_kind(&args[1], column) == Some("tsquery")
+                }
+                _ => false,
+            };
+            if !first_ok {
+                let types: Vec<String> = args
+                    .iter()
+                    .map(|arg| argument_type_name(arg, column))
+                    .collect();
+                return bad_function_args(&name.to_ascii_lowercase(), &types);
+            }
+            if name == "LENGTH" {
+                return ScalarExpr::Function {
+                    name: TS_LENGTH.to_string(),
+                    args: args.clone(),
+                };
+            }
+            return checked.clone();
+        }
         // The jsonpath functions: the document must be `jsonb` and the path
         // `jsonpath` (an untyped literal reads as either; a typed `text`
         // value is refused, as PostgreSQL refuses it).
@@ -1000,6 +1083,29 @@ pub(crate) fn check_integer_ranges(
                 ] = args.as_slice()
                 && kind_name.is_empty() =>
         {
+            // The text-search operators whose symbols the range family
+            // shares (`&&`, `@>`, `<@`) or the geometric family does
+            // (`<->`): both sides must be tsqueries.
+            if (ts_kind(l, column).is_some() || ts_kind(r, column).is_some())
+                && matches!(op.as_str(), "&&" | "@>" | "<@" | "<->")
+            {
+                if ts_kind(l, column) == Some("tsquery") && ts_kind(r, column) == Some("tsquery") {
+                    return ScalarExpr::Function {
+                        name: TS_OP.to_string(),
+                        args: vec![
+                            ScalarExpr::Literal(Value::Text(op.clone())),
+                            l.clone(),
+                            r.clone(),
+                            ScalarExpr::Literal(Value::Text("tsquery".to_string())),
+                        ],
+                    };
+                }
+                return bad_operator(
+                    &argument_type_name(l, column),
+                    op,
+                    &argument_type_name(r, column),
+                );
+            }
             if let Some(found) = net_kind(l).or_else(|| net_kind(r)) {
                 if let Some(bad) = mixed_net(l, r, op) {
                     return bad;
@@ -1251,6 +1357,67 @@ pub(crate) fn check_integer_ranges(
             return bad_operator(&argument_type_name(left, column), "=", "jsonpath");
         }
         ScalarExpr::Binary { op, left, right } => {
+            // The text-search types: comparisons and operators route by the
+            // declared kind, since both are text at run time.
+            if let Some(kind) = ts_kind(left, column).or_else(|| ts_kind(right, column)) {
+                let symbol = match op {
+                    ScalarBinaryOp::Eq => Some("="),
+                    ScalarBinaryOp::NotEq => Some("<>"),
+                    ScalarBinaryOp::Lt => Some("<"),
+                    ScalarBinaryOp::LtEq => Some("<="),
+                    ScalarBinaryOp::Gt => Some(">"),
+                    ScalarBinaryOp::GtEq => Some(">="),
+                    ScalarBinaryOp::Concat => Some("||"),
+                    ScalarBinaryOp::Overlap => Some("&&"),
+                    ScalarBinaryOp::Contains => Some("@>"),
+                    ScalarBinaryOp::ContainedBy => Some("<@"),
+                    ScalarBinaryOp::JsonPathMatch => Some("@@"),
+                    ScalarBinaryOp::TsPhrase => Some("<->"),
+                    _ => None,
+                };
+                if let Some(symbol) = symbol {
+                    let left_kind = ts_kind(left, column);
+                    let right_kind = ts_kind(right, column);
+                    let comparison = matches!(
+                        op,
+                        ScalarBinaryOp::Eq
+                            | ScalarBinaryOp::NotEq
+                            | ScalarBinaryOp::Lt
+                            | ScalarBinaryOp::LtEq
+                            | ScalarBinaryOp::Gt
+                            | ScalarBinaryOp::GtEq
+                    );
+                    let matches_symbol = match symbol {
+                        // `@@` takes a vector and a query, either way around.
+                        "@@" => {
+                            left_kind.is_some()
+                                && right_kind.is_some()
+                                && left_kind != right_kind
+                        }
+                        "<->" | "&&" | "@>" | "<@" => {
+                            left_kind == Some("tsquery") && right_kind == Some("tsquery")
+                        }
+                        _ => left_kind == right_kind,
+                    };
+                    if !matches_symbol {
+                        return bad_operator(
+                            &argument_type_name(left, column),
+                            symbol,
+                            &argument_type_name(right, column),
+                        );
+                    }
+                    let marker = if comparison { TS_CMP } else { TS_OP };
+                    return ScalarExpr::Function {
+                        name: marker.to_string(),
+                        args: vec![
+                            ScalarExpr::Literal(Value::Text(symbol.to_string())),
+                            (**left).clone(),
+                            (**right).clone(),
+                            ScalarExpr::Literal(Value::Text(kind.to_string())),
+                        ],
+                    };
+                }
+            }
             // A jsonpath has no comparison operator in PostgreSQL.
             if is_jsonpath_type(left, column) || is_jsonpath_type(right, column) {
                 let symbol = match op {

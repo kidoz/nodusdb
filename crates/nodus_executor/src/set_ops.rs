@@ -68,6 +68,8 @@ impl MemExecutor {
 
         // A WHERE on a FROM-less SELECT is a constant predicate (it can still
         // contain subqueries): keep the row iff it evaluates true.
+        let filter =
+            filter.map(|f| crate::result_types::check_filter_integer_ranges(&f, &|_: &str| None));
         let keep = self
             .eval_filter(ctx, &[], &[], &[], filter.as_ref())
             .unwrap_or(false);

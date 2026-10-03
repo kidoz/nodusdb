@@ -886,6 +886,8 @@ pub enum ScalarBinaryOp {
     /// `@?` / `@@`: does the jsonpath find anything / match as a predicate.
     JsonPathExists,
     JsonPathMatch,
+    /// `<->`: a text-search phrase (the same symbol as geometric distance).
+    TsPhrase,
     /// `&&`: the arrays share an element.
     Overlap,
 }

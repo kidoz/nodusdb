@@ -1071,6 +1071,545 @@ pub(crate) fn tsquery_canonical(text: &str) -> Result<String, String> {
     Ok(print_tsquery(&query))
 }
 
+// ---------------------------------------------------------------- matching
+
+/// The positions a lexeme query node matches, or `None` when the vector has
+/// no positions for it (PostgreSQL's "maybe").
+fn matched_positions(
+    vector: &TsVector,
+    word: &str,
+    prefix: bool,
+    weight: u8,
+    want_positions: bool,
+) -> MaybePositions {
+    // The entries the word matches: one, or every entry a prefix of it
+    // covers. A definite match on any of them settles the result.
+    let found: Vec<&Entry> = if prefix {
+        vector.find_prefix(word).iter().collect()
+    } else {
+        vector.find(word).into_iter().collect()
+    };
+    let mut positions: Vec<i32> = Vec::new();
+    let mut maybe = false;
+    for entry in found {
+        if entry.positions.is_empty() {
+            // A stripped entry matches regardless of weight.
+            if !want_positions {
+                return MaybePositions::Yes(Vec::new());
+            }
+            maybe = true;
+            continue;
+        }
+        let matching: Vec<i32> = entry
+            .positions
+            .iter()
+            .filter(|p| weight == 0 || weight & (1 << p.weight) != 0)
+            .map(|p| p.value as i32)
+            .collect();
+        if matching.is_empty() {
+            continue;
+        }
+        if !want_positions {
+            return MaybePositions::Yes(Vec::new());
+        }
+        positions.extend(matching);
+    }
+    if !positions.is_empty() {
+        MaybePositions::Yes(positions)
+    } else if maybe {
+        MaybePositions::Maybe
+    } else {
+        MaybePositions::No
+    }
+}
+
+enum MaybePositions {
+    No,
+    Maybe,
+    Yes(Vec<i32>),
+}
+
+/// Match data for phrase evaluation, mirroring PostgreSQL's `ExecPhraseData`.
+#[derive(Default)]
+struct PhraseData {
+    pos: Vec<i32>,
+    width: i32,
+    negate: bool,
+}
+
+const TSPO_BOTH: u8 = 1;
+const TSPO_L_ONLY: u8 = 2;
+const TSPO_R_ONLY: u8 = 4;
+
+/// The merge-join PostgreSQL's `TS_phrase_output` performs.
+fn phrase_output(
+    out: Option<&mut PhraseData>,
+    left: &PhraseData,
+    right: &PhraseData,
+    emit: u8,
+    l_offset: i32,
+    r_offset: i32,
+) -> bool {
+    let mut li = 0usize;
+    let mut ri = 0usize;
+    let mut positions: Vec<i32> = Vec::new();
+    while li < left.pos.len() || ri < right.pos.len() {
+        let l = left.pos.get(li).map(|p| p + l_offset);
+        let r = right.pos.get(ri).map(|p| p + r_offset);
+        let output = match (l, r) {
+            (Some(l), Some(r)) if l < r => {
+                li += 1;
+                (emit & TSPO_L_ONLY != 0).then_some(l)
+            }
+            (Some(l), Some(r)) if l == r => {
+                li += 1;
+                ri += 1;
+                (emit & TSPO_BOTH != 0).then_some(l)
+            }
+            (Some(_), Some(r)) => {
+                ri += 1;
+                (emit & TSPO_R_ONLY != 0).then_some(r)
+            }
+            (Some(l), None) => {
+                if emit & TSPO_L_ONLY == 0 {
+                    break;
+                }
+                li += 1;
+                Some(l)
+            }
+            (None, Some(r)) => {
+                if emit & TSPO_R_ONLY == 0 {
+                    break;
+                }
+                ri += 1;
+                Some(r)
+            }
+            (None, None) => break,
+        };
+        if let Some(position) = output {
+            if out.is_none() {
+                return true;
+            }
+            positions.push(position);
+        }
+    }
+    if let Some(out) = out {
+        out.pos = positions;
+        return !out.pos.is_empty();
+    }
+    false
+}
+
+/// Evaluates a query tree with position tracking for phrases, as
+/// PostgreSQL's `TS_phrase_execute` does.
+fn phrase_execute(node: &QNode, vector: &TsVector, mut out: Option<&mut PhraseData>) -> Ternary {
+    match node {
+        QNode::Empty => Ternary::No,
+        QNode::Val {
+            word,
+            weight,
+            prefix,
+        } => match matched_positions(vector, word, *prefix, *weight, out.is_some()) {
+            MaybePositions::No => Ternary::No,
+            MaybePositions::Maybe => Ternary::Maybe,
+            MaybePositions::Yes(positions) => {
+                if let Some(data) = out {
+                    data.pos = positions;
+                }
+                Ternary::Yes
+            }
+        },
+        QNode::Not(inner) => match phrase_execute(inner, vector, out.as_deref_mut()) {
+            Ternary::No => {
+                if let Some(data) = out {
+                    data.pos.clear();
+                    data.negate = true;
+                }
+                Ternary::Yes
+            }
+            Ternary::Yes => {
+                let Some(data) = out else {
+                    return Ternary::Yes;
+                };
+                if !data.pos.is_empty() {
+                    data.negate = !data.negate;
+                    Ternary::Yes
+                } else if data.negate {
+                    data.negate = false;
+                    Ternary::No
+                } else {
+                    Ternary::No
+                }
+            }
+            Ternary::Maybe => Ternary::Maybe,
+        },
+        QNode::And(l, r) | QNode::Or(l, r) => {
+            let is_and = matches!(node, QNode::And(..));
+            let mut ldata = PhraseData::default();
+            let mut rdata = PhraseData::default();
+            let lmatch = phrase_execute(l, vector, Some(&mut ldata));
+            let rmatch = phrase_execute(r, vector, Some(&mut rdata));
+            if is_and {
+                if lmatch == Ternary::No || rmatch == Ternary::No {
+                    return Ternary::No;
+                }
+                if lmatch == Ternary::Maybe || rmatch == Ternary::Maybe {
+                    return Ternary::Maybe;
+                }
+                let maxwidth = ldata.width.max(rdata.width);
+                let (l_offset, r_offset) = (maxwidth - ldata.width, maxwidth - rdata.width);
+                let emit = match (ldata.negate, rdata.negate) {
+                    (true, true) => TSPO_BOTH | TSPO_L_ONLY | TSPO_R_ONLY,
+                    (true, false) => TSPO_R_ONLY,
+                    (false, true) => TSPO_L_ONLY,
+                    (false, false) => TSPO_BOTH,
+                };
+                let both_negate = ldata.negate && rdata.negate;
+                let matched =
+                    phrase_output(out.as_deref_mut(), &ldata, &rdata, emit, l_offset, r_offset);
+                if let Some(data) = out {
+                    data.width = maxwidth;
+                    if both_negate {
+                        data.negate = true;
+                    }
+                }
+                if both_negate {
+                    return Ternary::Yes;
+                }
+                if matched { Ternary::Yes } else { Ternary::No }
+            } else {
+                if lmatch == Ternary::No && rmatch == Ternary::No {
+                    return Ternary::No;
+                }
+                if lmatch == Ternary::Maybe || rmatch == Ternary::Maybe {
+                    return Ternary::Maybe;
+                }
+                if lmatch == Ternary::No {
+                    ldata.width = 0;
+                }
+                if rmatch == Ternary::No {
+                    rdata.width = 0;
+                }
+                let maxwidth = ldata.width.max(rdata.width);
+                let (l_offset, r_offset) = (maxwidth - ldata.width, maxwidth - rdata.width);
+                let emit = match (ldata.negate, rdata.negate) {
+                    (true, true) => TSPO_BOTH,
+                    (true, false) => TSPO_L_ONLY,
+                    (false, true) => TSPO_R_ONLY,
+                    (false, false) => TSPO_BOTH | TSPO_L_ONLY | TSPO_R_ONLY,
+                };
+                let negated = ldata.negate || rdata.negate;
+                let matched =
+                    phrase_output(out.as_deref_mut(), &ldata, &rdata, emit, l_offset, r_offset);
+                if let Some(data) = out {
+                    data.width = maxwidth;
+                    if negated {
+                        data.negate = true;
+                    }
+                }
+                if negated || matched {
+                    Ternary::Yes
+                } else {
+                    Ternary::No
+                }
+            }
+        }
+        QNode::Phrase {
+            distance,
+            left,
+            right,
+        } => {
+            let mut ldata = PhraseData::default();
+            let mut rdata = PhraseData::default();
+            let lmatch = phrase_execute(left, vector, Some(&mut ldata));
+            if lmatch == Ternary::No {
+                return Ternary::No;
+            }
+            let rmatch = phrase_execute(right, vector, Some(&mut rdata));
+            if rmatch == Ternary::No {
+                return Ternary::No;
+            }
+            if lmatch == Ternary::Maybe || rmatch == Ternary::Maybe {
+                return Ternary::Maybe;
+            }
+            let l_offset = *distance as i32 + rdata.width;
+            let r_offset = 0;
+            let width = *distance as i32 + ldata.width + rdata.width;
+            let emit = match (ldata.negate, rdata.negate) {
+                (true, true) => TSPO_BOTH | TSPO_L_ONLY | TSPO_R_ONLY,
+                (true, false) => TSPO_R_ONLY,
+                (false, true) => TSPO_L_ONLY,
+                (false, false) => TSPO_BOTH,
+            };
+            let both_negate = ldata.negate && rdata.negate;
+            let matched =
+                phrase_output(out.as_deref_mut(), &ldata, &rdata, emit, l_offset, r_offset);
+            if let Some(data) = out {
+                data.width = width;
+                if both_negate {
+                    data.negate = true;
+                }
+            }
+            if both_negate {
+                return Ternary::Yes;
+            }
+            if matched { Ternary::Yes } else { Ternary::No }
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Ternary {
+    No,
+    Yes,
+    Maybe,
+}
+
+/// `tsvector @@ tsquery`: does the vector satisfy the query.
+pub(crate) fn matches(vector: &TsVector, query: &QNode) -> bool {
+    // Only a definite yes matches: PostgreSQL treats a top-level "maybe"
+    // (position data missing) as no match.
+    execute(query, vector, false) == Ternary::Yes
+}
+
+fn execute(node: &QNode, vector: &TsVector, skip_not: bool) -> Ternary {
+    match node {
+        QNode::Empty => Ternary::No,
+        QNode::Val {
+            word,
+            weight,
+            prefix,
+        } => match matched_positions(vector, word, *prefix, *weight, false) {
+            MaybePositions::No => Ternary::No,
+            MaybePositions::Maybe => Ternary::Maybe,
+            MaybePositions::Yes(_) => Ternary::Yes,
+        },
+        QNode::Not(inner) => {
+            if skip_not {
+                return Ternary::Yes;
+            }
+            match execute(inner, vector, skip_not) {
+                Ternary::No => Ternary::Yes,
+                Ternary::Yes => Ternary::No,
+                Ternary::Maybe => Ternary::Maybe,
+            }
+        }
+        QNode::And(l, r) => {
+            let lmatch = execute(l, vector, skip_not);
+            if lmatch == Ternary::No {
+                return Ternary::No;
+            }
+            match execute(r, vector, skip_not) {
+                Ternary::No => Ternary::No,
+                Ternary::Yes => lmatch,
+                Ternary::Maybe => Ternary::Maybe,
+            }
+        }
+        QNode::Or(l, r) => {
+            let lmatch = execute(l, vector, skip_not);
+            if lmatch == Ternary::Yes {
+                return Ternary::Yes;
+            }
+            match execute(r, vector, skip_not) {
+                Ternary::No => lmatch,
+                Ternary::Yes => Ternary::Yes,
+                Ternary::Maybe => Ternary::Maybe,
+            }
+        }
+        QNode::Phrase { .. } => {
+            let mut data = PhraseData::default();
+            // A phrase needs position data; a "maybe" counts as no match at
+            // the top level, as PostgreSQL treats it.
+            match phrase_execute(node, vector, Some(&mut data)) {
+                Ternary::Yes => Ternary::Yes,
+                _ => Ternary::No,
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------- operators
+
+/// `tsquery && tsquery`: AND of the two queries (the empty one is identity).
+pub(crate) fn query_and(a: &QNode, b: &QNode) -> QNode {
+    match (a, b) {
+        (QNode::Empty, other) | (other, QNode::Empty) => other.clone(),
+        _ => QNode::And(Box::new(a.clone()), Box::new(b.clone())),
+    }
+}
+
+/// `tsquery || tsquery`: OR of the two queries.
+pub(crate) fn query_or(a: &QNode, b: &QNode) -> QNode {
+    match (a, b) {
+        (QNode::Empty, other) | (other, QNode::Empty) => other.clone(),
+        _ => QNode::Or(Box::new(a.clone()), Box::new(b.clone())),
+    }
+}
+
+/// `tsquery <-> tsquery` and `tsquery_phrase`: a phrase with a distance.
+pub(crate) fn query_phrase(a: &QNode, b: &QNode, distance: i16) -> QNode {
+    match (a, b) {
+        (QNode::Empty, other) | (other, QNode::Empty) => other.clone(),
+        _ => QNode::Phrase {
+            distance,
+            left: Box::new(a.clone()),
+            right: Box::new(b.clone()),
+        },
+    }
+}
+
+/// `!!tsquery`: a negation (the empty query stays empty).
+pub(crate) fn query_not(a: &QNode) -> QNode {
+    match a {
+        QNode::Empty => QNode::Empty,
+        _ => QNode::Not(Box::new(a.clone())),
+    }
+}
+
+/// The lexemes a query mentions, sorted and deduplicated.
+fn query_lexemes(node: &QNode, out: &mut Vec<String>) {
+    match node {
+        QNode::Empty => {}
+        QNode::Val { word, .. } => out.push(word.clone()),
+        QNode::Not(inner) => query_lexemes(inner, out),
+        QNode::And(l, r) | QNode::Or(l, r) => {
+            query_lexemes(l, out);
+            query_lexemes(r, out);
+        }
+        QNode::Phrase { left, right, .. } => {
+            query_lexemes(left, out);
+            query_lexemes(right, out);
+        }
+    }
+}
+
+/// `tsquery @> tsquery`: every lexeme of the right appears in the left.
+pub(crate) fn query_contains(a: &QNode, b: &QNode) -> bool {
+    let mut left = Vec::new();
+    let mut right = Vec::new();
+    query_lexemes(a, &mut left);
+    query_lexemes(b, &mut right);
+    left.sort();
+    left.dedup();
+    right.sort();
+    right.dedup();
+    if right.len() > left.len() {
+        return false;
+    }
+    // Both sorted: each right lexeme must appear in left.
+    let mut left_index = 0usize;
+    for word in &right {
+        while left_index < left.len() && &left[left_index] != word {
+            left_index += 1;
+        }
+        if left_index == left.len() {
+            return false;
+        }
+    }
+    true
+}
+
+/// `tsquery <@ tsquery`.
+pub(crate) fn query_contained(a: &QNode, b: &QNode) -> bool {
+    query_contains(b, a)
+}
+
+// ---------------------------------------------------------------- functions
+
+/// `length(tsvector)`: the number of lexemes.
+pub(crate) fn vector_length(vector: &TsVector) -> i64 {
+    vector.entries.len() as i64
+}
+
+/// `strip(tsvector)`: the vector without positions.
+pub(crate) fn vector_strip(vector: &TsVector) -> TsVector {
+    TsVector {
+        entries: vector
+            .entries
+            .iter()
+            .map(|entry| Entry {
+                lexeme: entry.lexeme.clone(),
+                positions: Vec::new(),
+            })
+            .collect(),
+    }
+}
+
+/// The weight letter `setweight` accepts.
+pub(crate) fn weight_letter(text: &str) -> Result<u8, String> {
+    // PostgreSQL reads the weight as a `"char"`, whose byte is the first one
+    // of the value as written (the empty string reads as a zero byte).
+    let byte = text.as_bytes().first().copied().unwrap_or(0);
+    match byte {
+        b'A' | b'a' => Ok(3),
+        b'B' | b'b' => Ok(2),
+        b'C' | b'c' => Ok(1),
+        b'D' | b'd' => Ok(0),
+        other => Err(db(
+            format!("unrecognized weight: {other}"),
+            // `elog(ERROR)`, without a specific code.
+            "XX000",
+        )),
+    }
+}
+
+/// `setweight(tsvector, "char" [, text[]])`: assign a weight to all
+/// positions, or only to the listed lexemes.
+pub(crate) fn vector_setweight(vector: &TsVector, weight: u8, only: Option<&[String]>) -> TsVector {
+    let mut out = vector.clone();
+    for entry in &mut out.entries {
+        if let Some(only) = only
+            && !only.iter().any(|word| *word == entry.lexeme)
+        {
+            continue;
+        }
+        for pos in &mut entry.positions {
+            pos.weight = weight;
+        }
+    }
+    out
+}
+
+/// `numnode(tsquery)`: the number of items (lexemes and operators) stored.
+pub(crate) fn query_numnode(query: &QNode) -> i64 {
+    query.items() as i64
+}
+
+/// `tsvector_to_array`.
+pub(crate) fn vector_to_array(vector: &TsVector) -> Vec<String> {
+    vector.entries.iter().map(|e| e.lexeme.clone()).collect()
+}
+
+/// `array_to_tsvector`: one entry per (non-null, non-empty) word, sorted and
+/// deduplicated, with no positions.
+pub(crate) fn array_to_vector(words: &[Option<String>]) -> Result<TsVector, String> {
+    let mut entries: Vec<Entry> = Vec::new();
+    for word in words.iter().flatten() {
+        if word.is_empty() {
+            return Err(db("lexeme array may not contain empty strings", "2200F"));
+        }
+        entries.push(Entry {
+            lexeme: word.clone(),
+            positions: Vec::new(),
+        });
+    }
+    entries.sort_by(|a, b| ts_compare_string(a.lexeme.as_bytes(), b.lexeme.as_bytes(), false));
+    entries.dedup_by(|a, b| a.lexeme == b.lexeme);
+    Ok(TsVector { entries })
+}
+
+/// `ts_delete(tsvector, text | text[])`: drop the named lexemes.
+pub(crate) fn vector_delete(vector: &TsVector, words: &[String]) -> TsVector {
+    TsVector {
+        entries: vector
+            .entries
+            .iter()
+            .filter(|entry| !words.iter().any(|word| *word == entry.lexeme))
+            .cloned()
+            .collect(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1193,10 +1732,115 @@ mod tests {
     }
 
     #[test]
+    fn prefix_matching_scans_every_entry() {
+        let m = |v: &str, q: &str| matches(&vector(v), &query(q));
+        assert!(m("a:1A b:2", "a:*"));
+        assert!(m("a b:2", "a:*"));
+        assert!(m("ab ac b", "a:*"));
+        assert!(m("a:1A", "a:*"));
+        assert!(!m("a:1A b:2", "a:D"));
+        assert!(m("ab:1A ac:1", "a:*A"));
+        assert!(!m("ab:1A ac:1", "a:A"));
+        assert!(m("ab:1A ac:1B", "a:*A"));
+        // A phrase operand never matches by prefix, as in PostgreSQL.
+        assert!(!m("ab:1 ac:2", "a:* <-> c:*"));
+        assert!(m("ab:1 ac:2", "ab <-> ac"));
+        assert!(!m("ab:1 ac:2", "ab <-> c:*"));
+    }
+
+    #[test]
+    fn weight_letters_match_postgresql() {
+        assert_eq!(weight_letter("A"), Ok(3));
+        assert_eq!(weight_letter("d"), Ok(0));
+        // The byte of the value, as `"char"` reads it; an empty string is 0.
+        assert!(
+            weight_letter("E")
+                .unwrap_err()
+                .contains("unrecognized weight: 69")
+        );
+        assert!(
+            weight_letter("")
+                .unwrap_err()
+                .contains("unrecognized weight: 0")
+        );
+        assert!(
+            weight_letter("é")
+                .unwrap_err()
+                .contains("unrecognized weight: 195")
+        );
+    }
+
+    #[test]
     fn empty_query_literal_is_canonical() {
         // An empty query keeps PostgreSQL's canonical spelling (and stages
         // its NOTICE where a session is listening).
         assert_eq!(tsquery_canonical("").expect("parses"), "");
         assert_eq!(tsquery_canonical(" ").expect("parses"), "");
+    }
+
+    #[test]
+    fn matching_follows_tsquery_semantics() {
+        let m = |v: &str, q: &str| matches(&vector(v), &query(q));
+        // A position-less vector cannot satisfy a phrase.
+        assert!(!m("fat cat sat", "fat <-> cat"));
+        assert!(m("fat:1 cat:2 sat:3", "fat <-> cat"));
+        assert!(!m("fat:1 cat:2 sat:3", "cat <-> fat"));
+        assert!(!m("fat:1 cat:2 sat:3", "fat <-> sat"));
+        assert!(m("fat:1 cat:2 sat:3", "fat <-> cat <-> sat"));
+        assert!(!m("fat:1 cat:3 sat:4", "fat <2> sat"));
+        assert!(m("fat:1 cat:3 sat:4", "fat <3> sat"));
+        assert!(m("fat:1 cat:2", "fat <-> cat"));
+        assert!(!m("fat:1 cat:3", "fat <-> cat"));
+        assert!(m("fat:1A cat:2", "fat:A <-> cat"));
+        assert!(m("fat:1A sat:2", "fat:B <-> sat") == false);
+        assert!(m("fat cat", "fa:*"));
+        assert!(!m("fat cat", "fa"));
+        assert!(m("fat cat sat", "!dog"));
+        assert!(m("fat cat sat", "fat & !dog"));
+        assert!(!m("fat cat sat", "fat & !cat"));
+        assert!(m("fat:1 cat:2 sat:3", "(fat <-> cat) & sat"));
+        assert!(!m("fat cat", "fat <-> !cat"));
+        assert!(!m("fat", ""));
+    }
+
+    #[test]
+    fn operators_and_functions() {
+        assert_eq!(canon_query(""), "");
+        assert_eq!(
+            print_tsquery(&query_and(&query("a"), &query("b"))),
+            "'a' & 'b'"
+        );
+        assert_eq!(print_tsquery(&query_and(&query("a"), &query(""))), "'a'");
+        assert_eq!(
+            print_tsquery(&query_phrase(&query("a"), &query("b"), 3)),
+            "'a' <3> 'b'"
+        );
+        assert_eq!(print_tsquery(&query_not(&query("a"))), "!'a'");
+        assert!(query_contains(&query("a & b"), &query("a | b")));
+        assert!(!query_contains(&query("a"), &query("a & b")));
+        assert_eq!(
+            print_tsvector(&tsvector_concat(&vector("fat:2A"), &vector("fat:1B"))),
+            "'fat':2A,3B"
+        );
+        assert_eq!(print_tsvector(&vector_strip(&vector("fat:2A"))), "'fat'");
+        assert_eq!(
+            print_tsvector(&vector_setweight(&vector("fat:1 rat:2"), 3, None)),
+            "'fat':1A 'rat':2A"
+        );
+        assert_eq!(vector_length(&vector("")), 0);
+        assert_eq!(query_numnode(&query("a & b")), 3);
+        assert_eq!(vector_to_array(&vector("fat")), ["fat".to_string()]);
+        assert_eq!(
+            print_tsvector(
+                &array_to_vector(&[Some("fat".into()), Some("fat".into()), Some("rat".into())])
+                    .expect("ok")
+            ),
+            "'fat' 'rat'"
+        );
+        assert!(array_to_vector(&[Some("fat".into()), Some(String::new())]).is_err());
+        assert_eq!(
+            print_tsvector(&vector_delete(&vector("fat:1 rat:2"), &["cat".into()])),
+            "'fat':1 'rat':2"
+        );
     }
 }
