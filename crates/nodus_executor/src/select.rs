@@ -1050,10 +1050,9 @@ impl MemExecutor {
 
         // Reject a bare reference to a non-existent column (rather than silently
         // projecting NULL), validated against the full base+join column set.
-        // Skipped when a virtual/catalog table is involved — driver introspection
-        // relies on leniently selecting catalog columns — and only bare column
-        // refs are checked, so computed expressions stay lenient.
-        if !query_has_virtual {
+        // Only bare column refs are checked, so computed expressions stay
+        // lenient.
+        if true {
             for item in &projection {
                 // A function the library lacks is planned as a legacy item; it
                 // would otherwise evaluate to NULL.

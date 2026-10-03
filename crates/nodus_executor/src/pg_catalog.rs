@@ -35,6 +35,11 @@ impl MemExecutor {
                     ("daticulocale", "TEXT"),
                     ("datcollversion", "TEXT"),
                     ("datacl", "TEXT[]"),
+                    // PostgreSQL 18's columns, after the older layout so the
+                    // rows' positions keep: NULL here, as nodus has one
+                    // locale.
+                    ("datlocale", "TEXT"),
+                    ("daticurules", "TEXT"),
                 ]);
                 let rows = vec![vec![
                     Value::Int(Self::database_oid(db_name)),
@@ -543,6 +548,9 @@ impl MemExecutor {
                     ("confdelsetcols", "INT[]"),
                     ("conexclop", "OID[]"),
                     ("conbin", "TEXT"),
+                    // PostgreSQL 18's column: nodus has no period
+                    // constraints, so the rows leave it NULL.
+                    ("conperiod", "BOOL"),
                 ]);
                 let mut rows = self.pg_constraint_rows(db_name, &schemas, &tables);
                 rows.extend(Self::domain_constraint_rows(db_name));

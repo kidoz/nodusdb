@@ -239,6 +239,29 @@ impl MemExecutor {
             ("is_generated", "TEXT"),
             ("generation_expression", "TEXT"),
             ("numeric_precision_radix", "INT"),
+            // PostgreSQL's remaining columns, after the older layout so the
+            // rows' positions keep: what nodus does not model is NULL.
+            ("character_octet_length", "INT"),
+            ("interval_type", "TEXT"),
+            ("interval_precision", "INT"),
+            ("character_set_catalog", "TEXT"),
+            ("character_set_schema", "TEXT"),
+            ("character_set_name", "TEXT"),
+            ("collation_catalog", "TEXT"),
+            ("collation_schema", "TEXT"),
+            ("collation_name", "TEXT"),
+            ("scope_catalog", "TEXT"),
+            ("scope_schema", "TEXT"),
+            ("scope_name", "TEXT"),
+            ("maximum_cardinality", "INT"),
+            ("dtd_identifier", "TEXT"),
+            ("is_self_referencing", "TEXT"),
+            ("identity_start", "TEXT"),
+            ("identity_increment", "TEXT"),
+            ("identity_maximum", "TEXT"),
+            ("identity_minimum", "TEXT"),
+            ("identity_cycle", "TEXT"),
+            ("is_updatable", "TEXT"),
         ]);
         let mut rows = Vec::new();
         for table in tables {
