@@ -1,0 +1,997 @@
+# Network address types (inet, cidr, macaddr, macaddr8) and money:
+# literals and canonicalization, casts, operators, functions, ordering,
+# aggregates, storage, and catalogs. Expected results come from
+# PostgreSQL 18.
+query T
+SELECT '192.168.1.5'::inet;
+----
+192.168.1.5
+
+query T
+SELECT '192.168.1.5/24'::inet;
+----
+192.168.1.5/24
+
+query T
+SELECT '192.168.1.0/24'::cidr;
+----
+192.168.1.0/24
+
+statement error
+SELECT '192.168.1.5/24'::cidr;
+
+query T
+SELECT '::1'::inet;
+----
+::1
+
+query T
+SELECT '2001:db8::1/64'::inet;
+----
+2001:db8::1/64
+
+query T
+SELECT '2001:db8::/32'::cidr;
+----
+2001:db8::/32
+
+query T
+SELECT '192.168.1.5'::inet::text;
+----
+192.168.1.5/32
+
+query T
+SELECT text('192.168.1.5/24'::inet);
+----
+192.168.1.5/24
+
+query T
+SELECT host('192.168.1.5/24'::inet);
+----
+192.168.1.5
+
+query TTT
+SELECT netmask('192.168.1.5/24'::inet), hostmask('192.168.1.5/24'::inet), broadcast('192.168.1.5/24'::inet);
+----
+255.255.255.0	0.0.0.255	192.168.1.255/24
+
+query TT
+SELECT network('192.168.1.5/24'::inet), masklen('192.168.1.5/24'::inet);
+----
+192.168.1.0/24	24
+
+query T
+SELECT set_masklen('192.168.1.5/24'::inet, 16);
+----
+192.168.1.5/16
+
+query T
+SELECT set_masklen('192.168.1.0/24'::cidr, 16);
+----
+192.168.0.0/16
+
+query TT
+SELECT abbrev('192.168.1.0/24'::cidr), family('::1'::inet);
+----
+192.168.1/24	6
+
+query T
+SELECT inet_same_family('192.168.1.5'::inet, '::1'::inet);
+----
+f
+
+query T
+SELECT inet_merge('192.168.1.0/24'::inet, '192.168.1.128/25'::inet);
+----
+192.168.1.0/24
+
+query T
+SELECT inet_merge('192.168.1.0/24'::inet, '192.168.2.0/24'::inet);
+----
+192.168.0.0/22
+
+query TT
+SELECT hostmask('192.168.1.5'::inet), netmask('::1/64'::inet);
+----
+0.0.0.0	ffff:ffff:ffff:ffff::
+
+query TTT
+SELECT host('2001:db8::1/64'::inet), broadcast('2001:db8::1/64'::inet), network('2001:db8::1/64'::inet);
+----
+2001:db8::1	2001:db8::ffff:ffff:ffff:ffff/64	2001:db8::/64
+
+query T
+SELECT abbrev('192.168.1.5/24'::inet);
+----
+192.168.1.5/24
+
+statement error
+SELECT 'x'::inet;
+
+statement error
+SELECT '192.168.1.256'::inet;
+
+statement error
+SELECT '192.168.1.5/33'::inet;
+
+query T
+SELECT '192.168.1.5/24'::inet = '192.168.1.5/24'::inet;
+----
+t
+
+query T
+SELECT '192.168.1.5/24'::inet < '192.168.1.5/16'::inet;
+----
+f
+
+query T
+SELECT '10.0.0.1'::inet < '9.0.0.1'::inet;
+----
+f
+
+query T
+SELECT '::1'::inet < '0.0.0.1'::inet;
+----
+f
+
+query T
+SELECT '192.168.1.5/24'::inet = '192.168.1.5'::inet;
+----
+f
+
+query T
+SELECT '192.168.1.0/24'::inet <<= '192.168.1.0/16'::inet;
+----
+t
+
+query T
+SELECT '192.168.1.0/24'::cidr && '192.168.1.128/25'::cidr;
+----
+t
+
+query T
+SELECT '192.168.1.5/24'::inet && '192.168.2.1/16'::inet;
+----
+t
+
+query T
+SELECT '192.168.1.5/24'::inet && '10.1.0.1/16'::inet;
+----
+f
+
+query T
+SELECT '192.168.1.0/24'::inet & '255.255.255.0'::inet;
+----
+192.168.1.0
+
+query T
+SELECT '192.168.1.0/24'::inet | '0.0.0.255'::inet;
+----
+192.168.1.255
+
+query T
+SELECT ~ '192.168.1.0/24'::inet;
+----
+63.87.254.255/24
+
+query T
+SELECT '192.168.1.5'::inet + 5;
+----
+192.168.1.10
+
+query T
+SELECT '192.168.1.5'::inet - 5;
+----
+192.168.1.0
+
+query T
+SELECT '2001:db8::1'::inet + 256;
+----
+2001:db8::101
+
+query T
+SELECT '192.168.1.5'::inet - '192.168.1.1'::inet;
+----
+4
+
+query T
+SELECT '2001:db8::2'::inet - '2001:db8::1'::inet;
+----
+1
+
+query T
+SELECT '10.1.2.3'::inet::cidr;
+----
+10.1.2.3/32
+
+query TT
+SELECT '2001:db8::1'::inet::cidr, '2001:db8::/32'::cidr::inet;
+----
+2001:db8::1/128	2001:db8::/32
+
+query T
+SELECT '192.168.1.5/24'::inet::cidr;
+----
+192.168.1.0/24
+
+query T
+SELECT '192.168.1.1'::inet = ANY(ARRAY['10.0.0.1'::inet, '192.168.1.1'::inet]);
+----
+t
+
+query T
+SELECT '{192.168.1.1,10.0.0.0/8}'::inet[];
+----
+{192.168.1.1,10.0.0.0/8}
+
+query T
+SELECT '08:00:2b:01:02:03'::macaddr;
+----
+08:00:2b:01:02:03
+
+query T
+SELECT '08-00-2b-01-02-03'::macaddr;
+----
+08:00:2b:01:02:03
+
+query T
+SELECT '08002b:010203'::macaddr;
+----
+08:00:2b:01:02:03
+
+query T
+SELECT '08002b010203'::macaddr;
+----
+08:00:2b:01:02:03
+
+query T
+SELECT '0800.2b01.0203'::macaddr;
+----
+08:00:2b:01:02:03
+
+query T
+SELECT '08:00:2b:01:02:03'::macaddr::text;
+----
+08:00:2b:01:02:03
+
+query T
+SELECT '08:00:2b:01:02:03'::macaddr = '08-00-2b-01-02-03'::macaddr;
+----
+t
+
+query T
+SELECT '08:00:2b:01:02:03'::macaddr < '08:00:2b:01:02:04'::macaddr;
+----
+t
+
+query T
+SELECT trunc('08:00:2b:aa:bb:cc'::macaddr);
+----
+08:00:2b:00:00:00
+
+query T
+SELECT '08:00:2b:01:02:03'::macaddr::macaddr8;
+----
+08:00:2b:ff:fe:01:02:03
+
+query T
+SELECT '08:00:2b:01:02:03:04:05'::macaddr8;
+----
+08:00:2b:01:02:03:04:05
+
+query T
+SELECT '0800.2b01.0203'::macaddr8;
+----
+08:00:2b:ff:fe:01:02:03
+
+query T
+SELECT '08:00:2b:ff:fe:01:02:03'::macaddr8::macaddr;
+----
+08:00:2b:01:02:03
+
+statement error
+SELECT '08:00:2b:01:02:03:04:05'::macaddr8::macaddr;
+
+query T
+SELECT macaddr8_set7bit('08:00:2b:01:02:03'::macaddr8);
+----
+0a:00:2b:ff:fe:01:02:03
+
+query T
+SELECT '{08:00:2b:01:02:03,08:00:2b:01:02:04}'::macaddr[];
+----
+{08:00:2b:01:02:03,08:00:2b:01:02:04}
+
+statement error
+SELECT '08:00:2b:01:02'::macaddr;
+
+statement error
+SELECT 'zz:00:2b:01:02:03'::macaddr;
+
+query T
+SELECT '1234.56'::money;
+----
+$1,234.56
+
+query T
+SELECT '$1,234.56'::money;
+----
+$1,234.56
+
+query T
+SELECT 1234.56::money;
+----
+$1,234.56
+
+query T
+SELECT 1234::money;
+----
+$1,234.00
+
+query T
+SELECT 1.5::money;
+----
+$1.50
+
+query T
+SELECT '1.005'::money;
+----
+$1.01
+
+query T
+SELECT '1234.567'::money;
+----
+$1,234.57
+
+query T
+SELECT '-1234.56'::money;
+----
+-$1,234.56
+
+query T
+SELECT (1234.56::money)::text;
+----
+$1,234.56
+
+query T
+SELECT '-1234.56'::money::text;
+----
+-$1,234.56
+
+query T
+SELECT '1234.56'::money + '1.00'::money;
+----
+$1,235.56
+
+query T
+SELECT '0.01'::money + '0.02'::money;
+----
+$0.03
+
+query T
+SELECT '1234.56'::money - '1.00'::money;
+----
+$1,233.56
+
+query T
+SELECT '1234.56'::money * 2;
+----
+$2,469.12
+
+query T
+SELECT '1234.56'::money / 2;
+----
+$617.28
+
+query T
+SELECT '1234.56'::money / '2.00'::money;
+----
+617.28
+
+query T
+SELECT '1234.56'::money = '1234.56'::money;
+----
+t
+
+query T
+SELECT '1234.56'::money < '2000.00'::money;
+----
+t
+
+query T
+SELECT '1234.56'::money::numeric;
+----
+1234.56
+
+statement error
+SELECT '1234.56'::money::int;
+
+statement error
+SELECT '1234.56'::money::float8;
+
+query T
+SELECT 1234.56::numeric::money;
+----
+$1,234.56
+
+statement error
+SELECT cash('1234.56'::numeric);
+
+query T
+SELECT cashlarger('1.00'::money, '2.00'::money);
+----
+$2.00
+
+query T
+SELECT cashsmaller('1.00'::money, '2.00'::money);
+----
+$1.00
+
+query T
+SELECT cash_words('0'::money);
+----
+Zero dollars and zero cents
+
+query T
+SELECT cash_words('1'::money);
+----
+One dollar and zero cents
+
+query T
+SELECT cash_words('12.34'::money);
+----
+Twelve dollars and thirty four cents
+
+query T
+SELECT cash_words('-12.34'::money);
+----
+Minus twelve dollars and thirty four cents
+
+query T
+SELECT cash_words('1234567.89'::money);
+----
+One million two hundred thirty four thousand five hundred sixty seven dollars and eighty nine cents
+
+query T
+SELECT cash_words('1000000'::money);
+----
+One million  dollars and zero cents
+
+query T
+SELECT cash_words('100.00'::money);
+----
+One hundred dollars and zero cents
+
+query T
+SELECT cash_words('0.01'::money);
+----
+Zero dollars and one cent
+
+query T
+SELECT cash_words('999999999999.99'::money);
+----
+Nine hundred ninety nine billion nine hundred ninety nine million nine hundred ninety nine thousand nine hundred ninety nine dollars and ninety nine cents
+
+query T
+SELECT cash_words('110'::money);
+----
+One hundred and ten dollars and zero cents
+
+query T
+SELECT cash_words('105'::money);
+----
+One hundred and five dollars and zero cents
+
+query T
+SELECT cash_words('120'::money);
+----
+One hundred twenty dollars and zero cents
+
+query T
+SELECT cash_words('1000'::money);
+----
+One thousand  dollars and zero cents
+
+query T
+SELECT cash_words('21'::money);
+----
+Twenty one dollars and zero cents
+
+query T
+SELECT cash_words('-0.50'::money);
+----
+Minus zero dollars and fifty cents
+
+query T
+SELECT '{1.00,2.00}'::money[];
+----
+{$1.00,$2.00}
+
+query T
+SELECT text('1.00'::money);
+----
+$1.00
+
+statement error
+SELECT 'abc'::money;
+
+statement error
+SELECT '1234.56'::money * '2.00'::money;
+
+statement error
+SELECT '1234.56'::money = 1234.56::numeric;
+
+statement error
+SELECT abs('5.00'::money);
+
+statement error
+SELECT round('1.5'::money);
+
+statement error
+SELECT trunc('1.5'::money);
+
+statement error
+SELECT to_char('1.5'::money, '999');
+
+statement error
+SELECT mod('1.5'::money, '2'::money);
+
+query TTTTTTT
+SELECT typname, typtype, typcategory, typlen, typbyval, typalign, typstorage FROM pg_type WHERE typname IN ('inet','cidr','macaddr','macaddr8','money') ORDER BY typname;
+----
+cidr	b	I	-1	f	i	m
+inet	b	I	-1	f	i	m
+macaddr	b	U	6	f	i	p
+macaddr8	b	U	8	f	i	p
+money	b	N	8	t	d	p
+
+query TTTTT
+SELECT format_type(869, NULL), format_type(650, NULL), format_type(829, NULL), format_type(774, NULL), format_type(790, NULL);
+----
+inet	cidr	macaddr	macaddr8	money
+
+query TTT
+SELECT '_inet'::regtype::oid, 'inet'::regtype::oid, 'money'::regtype::oid;
+----
+1041	869	790
+
+query TTTT
+SELECT '_cidr'::regtype::oid, '_macaddr'::regtype::oid, '_macaddr8'::regtype::oid, '_money'::regtype::oid;
+----
+651	1040	775	791
+
+query T
+SELECT count(*) FROM (VALUES ('192.168.1.1'::inet), ('192.168.1.1/24'::inet)) t(ip) GROUP BY ip;
+----
+1
+1
+
+query T
+SELECT m FROM (VALUES ('09:00:2b:01:02:03'::macaddr), ('08:00:2b:01:02:03'::macaddr)) t(m) ORDER BY m;
+----
+08:00:2b:01:02:03
+09:00:2b:01:02:03
+
+query T rowsort
+SELECT ip FROM (VALUES ('10.0.0.1'::inet), ('9.0.0.1'::inet)) t(ip) ORDER BY ip;
+----
+9.0.0.1
+10.0.0.1
+
+query T rowsort
+SELECT v FROM (VALUES ('100.00'::money), ('9.00'::money)) t(v) ORDER BY v;
+----
+$9.00
+$100.00
+
+query TT
+SELECT min(ip), max(ip) FROM (VALUES ('10.0.0.1'::inet), ('9.0.0.1'::inet)) t(ip);
+----
+9.0.0.1	10.0.0.1
+
+query TT
+SELECT min(v), max(v) FROM (VALUES ('100.00'::money), ('9.00'::money)) t(v);
+----
+$9.00	$100.00
+
+statement error
+SELECT min(m), max(m) FROM (VALUES ('09:00:2b:01:02:03'::macaddr), ('08:00:2b:01:02:03'::macaddr)) t(m);
+
+statement ok
+CREATE TABLE nn (id int PRIMARY KEY, ip inet, c cidr, m macaddr, m8 macaddr8, v money);
+
+statement ok
+INSERT INTO nn VALUES (1, '192.168.1.5/24', '192.168.1.0/24', '08:00:2b:01:02:03', '08:00:2b:01:02:03:04:05', '1234.56');
+
+statement ok
+INSERT INTO nn VALUES (2, '10.0.0.1', '10.0.0.0/8', '09:00:2b:01:02:03', '08:00:2b:01:02:03:04:06', '-5.00');
+
+statement ok
+INSERT INTO nn VALUES (3, NULL, NULL, NULL, NULL, NULL);
+
+query TTTTTT
+SELECT * FROM nn ORDER BY id;
+----
+1	192.168.1.5/24	192.168.1.0/24	08:00:2b:01:02:03	08:00:2b:01:02:03:04:05	$1,234.56
+2	10.0.0.1	10.0.0.0/8	09:00:2b:01:02:03	08:00:2b:01:02:03:04:06	-$5.00
+3	NULL	NULL	NULL	NULL	NULL
+
+query T
+SELECT ip FROM nn WHERE ip <<= '192.168.0.0/16'::inet ORDER BY ip;
+----
+192.168.1.5/24
+
+query T
+SELECT v FROM nn WHERE v > '0.00'::money ORDER BY v;
+----
+$1,234.56
+
+query T
+SELECT ip FROM nn ORDER BY ip;
+----
+10.0.0.1
+192.168.1.5/24
+NULL
+
+query T
+SELECT v FROM nn ORDER BY v;
+----
+-$5.00
+$1,234.56
+NULL
+
+query TT
+SELECT m, m8 FROM nn ORDER BY id;
+----
+08:00:2b:01:02:03	08:00:2b:01:02:03:04:05
+09:00:2b:01:02:03	08:00:2b:01:02:03:04:06
+NULL	NULL
+
+query TT
+SELECT count(ip), count(v) FROM nn;
+----
+2	2
+
+query TT
+SELECT min(ip), max(ip) FROM nn;
+----
+10.0.0.1	192.168.1.5/24
+
+query TT
+SELECT min(v), max(v) FROM nn;
+----
+-$5.00	$1,234.56
+
+query T
+SELECT sum(v) FROM nn;
+----
+$1,229.56
+
+query T
+SELECT sum(DISTINCT v) FROM nn;
+----
+$1,229.56
+
+query T
+SELECT max(v) - min(v) FROM nn;
+----
+$1,239.56
+
+query T
+SELECT v::numeric FROM nn WHERE id = 1;
+----
+1234.56
+
+query T
+SELECT v::text FROM nn WHERE id = 1;
+----
+$1,234.56
+
+statement error
+SELECT v::int FROM nn WHERE id = 1;
+
+query T
+SELECT array_agg(v) FROM nn WHERE id < 3;
+----
+{"$1,234.56",-$5.00}
+
+query TT
+SELECT ip, sum(v) FROM nn WHERE v IS NOT NULL GROUP BY ip ORDER BY ip;
+----
+10.0.0.1	-$5.00
+192.168.1.5/24	$1,234.56
+
+query T
+SELECT count(*) FROM nn GROUP BY ip ORDER BY 1;
+----
+1
+1
+1
+
+query T
+SELECT DISTINCT v FROM nn ORDER BY v;
+----
+-$5.00
+$1,234.56
+NULL
+
+query T
+SELECT ip FROM nn WHERE ip = ANY(ARRAY['10.0.0.1'::inet, '10.0.0.2'::inet]);
+----
+10.0.0.1
+
+query TTT
+SELECT column_name, data_type, udt_name FROM information_schema.columns WHERE table_name = 'nn' ORDER BY ordinal_position;
+----
+id	integer	int4
+ip	inet	inet
+c	cidr	cidr
+m	macaddr	macaddr
+m8	macaddr8	macaddr8
+v	money	money
+
+statement error
+SELECT avg(v) FROM nn;
+
+query T
+SELECT min(c) FROM nn;
+----
+10.0.0.0/8
+
+statement ok
+CREATE TABLE ck2 (ip inet CHECK (ip <<= '10.0.0.0/8'::inet));
+
+statement ok
+INSERT INTO ck2 VALUES ('10.1.2.3');
+
+statement error
+INSERT INTO ck2 VALUES ('192.168.1.1');
+
+query T
+SELECT ip FROM ck2;
+----
+10.1.2.3
+
+statement ok
+CREATE INDEX nn_ip_idx ON nn (ip);
+
+statement ok
+CREATE INDEX nn_v_idx ON nn (v);
+
+statement ok
+UPDATE nn SET v = '2.00'::money WHERE id = 1;
+
+query T
+SELECT v FROM nn ORDER BY id;
+----
+$2.00
+-$5.00
+NULL
+
+query T
+SELECT sum(v) OVER (ORDER BY id) FROM nn ORDER BY id;
+----
+$2.00
+-$3.00
+-$3.00
+
+query T
+SELECT '10.00'::money * '2';
+----
+$20.00
+
+query T
+SELECT '10.00'::money + '2';
+----
+$12.00
+
+query T
+SELECT '2' + '10.00'::money;
+----
+$12.00
+
+query T
+SELECT '10.00'::money - '2';
+----
+$8.00
+
+query T
+SELECT '10.00'::money * 2.5;
+----
+$25.00
+
+query T
+SELECT '10.00'::money / 2.5;
+----
+$4.00
+
+query T
+SELECT '10.00'::money / '2'::numeric;
+----
+$5.00
+
+query T
+SELECT '10.00'::money * '2'::numeric;
+----
+$20.00
+
+query T
+SELECT 2 * '10.00'::money;
+----
+$20.00
+
+query T
+SELECT 2.5 * '10.00'::money;
+----
+$25.00
+
+query T
+SELECT '10'::bigint * '2.00'::money;
+----
+$20.00
+
+query T
+SELECT '10'::smallint * '2.00'::money;
+----
+$20.00
+
+query T
+SELECT '10.00'::money = '2';
+----
+f
+
+query T
+SELECT '10.00'::money < '2';
+----
+f
+
+query T
+SELECT sum(v) FROM (VALUES ('1.00'::money),('2.00'::money)) t(v) HAVING sum(v) > '0'::money;
+----
+$3.00
+
+query T
+SELECT sum(v) FILTER (WHERE v > '0'::money) FROM (VALUES ('1.00'::money),('2.00'::money)) t(v);
+----
+$3.00
+
+query T
+SELECT sum(v)::numeric FROM (VALUES ('1.00'::money),('2.00'::money)) t(v);
+----
+3.00
+
+statement error
+SELECT '10.00'::money + 1;
+
+statement error
+SELECT '10.00'::money - 1;
+
+statement error
+SELECT '10.00'::money + 1.5;
+
+statement error
+SELECT 1 + '10.00'::money;
+
+statement error
+SELECT 2 / '10.00'::money;
+
+statement error
+SELECT '10.00'::money * '2'::money;
+
+statement error
+SELECT sum(v) + 1 FROM (VALUES ('1.00'::money),('2.00'::money)) t(v);
+
+query TT
+SELECT id, sum(v) OVER (ORDER BY id) FROM (VALUES (1, '2.00'::money), (2, '-5.00'::money), (3, NULL)) t(id, v) ORDER BY id;
+----
+1	$2.00
+2	-$3.00
+3	-$3.00
+
+query T
+SELECT min(ip) OVER () FROM (VALUES ('10.0.0.1'::inet), ('9.0.0.1'::inet)) t(ip);
+----
+9.0.0.1
+9.0.0.1
+
+query T
+SELECT max(v) OVER () FROM (VALUES ('2.00'::money), ('5.00'::money)) t(v);
+----
+$5.00
+$5.00
+
+query T
+SELECT count(v) OVER () FROM (VALUES ('2.00'::money)) t(v);
+----
+1
+
+query T
+SELECT lag(v) OVER () FROM (VALUES ('2.00'::money), ('3.00'::money)) t(v);
+----
+NULL
+$2.00
+
+statement error
+SELECT avg(v) OVER () FROM (VALUES ('2.00'::money)) t(v);
+
+statement error
+SELECT min(m) OVER () FROM (VALUES ('08:00:2b:01:02:03'::macaddr)) t(m);
+
+statement error
+SELECT sum(ip) OVER () FROM (VALUES ('10.0.0.1'::inet)) t(ip);
+
+query TT
+SELECT pg_typeof('1.00'::money), pg_column_size('1.00'::money);
+----
+money	8
+
+query T
+SELECT pg_typeof(sum(v)) FROM (VALUES ('1.00'::money)) t(v);
+----
+money
+
+query T
+SELECT 'x' || '1.00'::money;
+----
+x$1.00
+
+query T
+SELECT '1.00'::money || 'x';
+----
+$1.00x
+
+query TT
+SELECT concat('1.00'::money), concat('1.00'::money, 'x');
+----
+$1.00	$1.00x
+
+query T
+SELECT format('%s', '1.00'::money);
+----
+$1.00
+
+query TT
+SELECT to_json('1.00'::money), to_jsonb('1.00'::money);
+----
+"$1.00"	"$1.00"
+
+query TT
+SELECT json_build_array('1.00'::money), jsonb_build_array('1.00'::money);
+----
+["$1.00"]	["$1.00"]
+
+query TT
+SELECT json_build_object('a', '1.00'::money), jsonb_build_object('a', '1.00'::money);
+----
+{"a" : "$1.00"}	{"a": "$1.00"}
+
+query TT
+SELECT quote_literal('1.00'::money), quote_nullable('1.00'::money);
+----
+'$1.00'	'$1.00'
+
+query TT
+SELECT greatest('1.00'::money, '2.00'::money), least('1.00'::money, '2.00'::money);
+----
+$2.00	$1.00
+
+query TT
+SELECT coalesce(NULL::money, '1.00'::money), nullif('1.00'::money, '2.00'::money);
+----
+$1.00	$1.00
+
+query TT
+SELECT money(1234.56::numeric), money(12);
+----
+$1,234.56	$12.00
+
+query T
+SELECT ARRAY['1.00'::money, '2.00'::money];
+----
+{$1.00,$2.00}
+
+statement error
+SELECT mod('1.5'::money, 2);
+
+statement error
+SELECT power('1.5'::money, 2);

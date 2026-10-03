@@ -430,3 +430,75 @@ fn a_view_writes_through_on_conflict() {
     assert!(out.rows.is_empty());
     assert_eq!(ordered(&sql("SELECT * FROM vb").unwrap()), ["1|b|1"]);
 }
+
+#[test]
+fn network_and_money_types_read_write_and_operate() {
+    let (sql, _) = session();
+    sql("CREATE TABLE n (id int PRIMARY KEY, ip inet, m macaddr, v money)").unwrap();
+    sql("INSERT INTO n VALUES (1, '192.168.1.5/24', '08:00:2b:01:02:03', '1234.56')").unwrap();
+    sql("INSERT INTO n VALUES (2, '10.0.0.1', '09:00:2b:01:02:03', '-5.00')").unwrap();
+    sql("INSERT INTO n VALUES (3, NULL, NULL, NULL)").unwrap();
+    // The stored form is canonical; the shown one is PostgreSQL's.
+    assert_eq!(
+        ordered(&sql("SELECT ip, m, v FROM n ORDER BY id").unwrap()),
+        [
+            "192.168.1.5/24|08:00:2b:01:02:03|$1,234.56",
+            "10.0.0.1|09:00:2b:01:02:03|-$5.00",
+            "||",
+        ]
+    );
+    // Containment reads the address prefixes, comparisons the values.
+    assert_eq!(
+        ordered(&sql("SELECT ip FROM n WHERE ip <<= '192.168.0.0/16'::inet ORDER BY ip").unwrap()),
+        ["192.168.1.5/24"]
+    );
+    assert_eq!(
+        ordered(&sql("SELECT v FROM n WHERE v > '0.00'::money ORDER BY v").unwrap()),
+        ["$1,234.56"]
+    );
+    assert_eq!(
+        ordered(&sql("SELECT ip FROM n ORDER BY ip").unwrap()),
+        ["10.0.0.1", "192.168.1.5/24", ""]
+    );
+    assert_eq!(
+        rows(&sql("SELECT min(ip), max(ip), sum(v), pg_typeof(sum(v)) FROM n").unwrap()),
+        ["10.0.0.1|192.168.1.5/24|$1,229.56|money"]
+    );
+    assert_eq!(
+        ordered(&sql("SELECT cash_words('1234567.89'::money)").unwrap()),
+        [
+            "One million two hundred thirty four thousand five hundred sixty seven dollars and eighty nine cents"
+        ]
+    );
+    // Money is not a number, and only its own operations take it.
+    let (message, _) = fields(sql("SELECT '1234.56'::money * '2.00'::money").unwrap_err());
+    assert_eq!(message, "operator does not exist: money * money");
+    let (message, _) = fields(sql("SELECT '1234.56'::money + 1").unwrap_err());
+    assert_eq!(message, "operator does not exist: money + integer");
+    let (message, f) = fields(sql("SELECT avg(v) FROM n").unwrap_err());
+    assert_eq!(message, "function avg(money) does not exist");
+    assert_eq!(field(&f, "code").as_deref(), Some("42883"));
+    let (message, _) = fields(sql("SELECT abs('5.00'::money)").unwrap_err());
+    assert_eq!(message, "function abs(money) does not exist");
+    // A check constraint over an address rejects a row, as PostgreSQL does.
+    sql("CREATE TABLE ck (ip inet CHECK (ip <<= '10.0.0.0/8'::inet))").unwrap();
+    sql("INSERT INTO ck VALUES ('10.1.2.3')").unwrap();
+    let (message, f) = fields(sql("INSERT INTO ck VALUES ('192.168.1.1')").unwrap_err());
+    assert_eq!(
+        message,
+        "new row for relation \"ck\" violates check constraint \"ck_ip_check\""
+    );
+    assert_eq!(
+        field(&f, "detail").as_deref(),
+        Some("Failing row contains (192.168.1.1).")
+    );
+    // The catalog carries the five types, their arrays, and their OIDs.
+    assert_eq!(
+        rows(&sql("SELECT typname FROM pg_type WHERE typname IN ('inet', 'cidr', 'macaddr', 'macaddr8', 'money') ORDER BY typname").unwrap()),
+        ["cidr", "inet", "macaddr", "macaddr8", "money"]
+    );
+    assert_eq!(
+        rows(&sql("SELECT format_type(869, NULL), format_type(650, NULL), format_type(829, NULL), format_type(774, NULL), format_type(790, NULL)").unwrap()),
+        ["inet|cidr|macaddr|macaddr8|money"]
+    );
+}

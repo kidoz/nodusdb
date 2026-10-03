@@ -149,6 +149,12 @@ pub(crate) fn is_known(name: &str) -> bool {
                 | "ARRAY_CAT" | "ARRAY_POSITION" | "ARRAY_POSITIONS" | "ARRAY_REMOVE"
                 | "ARRAY_REPLACE" | "ARRAY_UPPER" | "ARRAY_LOWER" | "ARRAY_NDIMS"
                 | "TRIM_ARRAY" | "ARRAY_SORT" | "ARRAY_REVERSE"
+                // Network addresses and money.
+                | "HOST" | "NETMASK" | "HOSTMASK" | "BROADCAST" | "NETWORK" | "MASKLEN"
+                | "SET_MASKLEN" | "ABBREV" | "FAMILY" | "INET_SAME_FAMILY" | "INET_MERGE"
+                | "MACADDR8_SET7BIT" | "TEXT" | "CASH_WORDS" | "CASHLARGER" | "CASHSMALLER"
+                | "MONEY"
+                | "__NET__" | "__NET_CAST__" | "__MONEY_TEXT__" | "__MAC_TRUNC__"
                 // Ranges.
                 | "INT4RANGE" | "INT8RANGE" | "NUMRANGE" | "DATERANGE" | "TSRANGE" | "TSTZRANGE"
                 | "ISEMPTY" | "LOWER_INC" | "UPPER_INC" | "LOWER_INF" | "UPPER_INF"
@@ -355,6 +361,17 @@ pub(crate) fn return_type(name: &str, arg_types: &[Option<String>]) -> Option<St
                 return arg_types.get(1).cloned().flatten();
             }
             "__BAD_RANGE_CAST__" => return None,
+            "__MONEY_TEXT__" | "CASH_WORDS" => return Some("TEXT".into()),
+            "CASHLARGER" | "CASHSMALLER" => return Some("MONEY".into()),
+            "MACADDR8_SET7BIT" => return Some("MACADDR8".into()),
+            "HOST" => return Some("INET".into()),
+            "NETMASK" | "HOSTMASK" | "BROADCAST" | "NETWORK" | "INET_MERGE" => {
+                return arg_types.first().cloned().flatten().or(Some("INET".into()));
+            }
+            "MASKLEN" | "FAMILY" => return Some("INTEGER".into()),
+            "SET_MASKLEN" | "ABBREV" => return arg_types.first().cloned().flatten(),
+            "INET_SAME_FAMILY" => return Some("BOOL".into()),
+            "__MAC_TRUNC__" => return arg_types.first().cloned().flatten(),
             "PG_IS_IN_RECOVERY" | "STARTS_WITH" => "BOOLEAN",
             name if crate::value::is_visibility_fn(name) => "BOOLEAN",
             "UPPER"
@@ -518,14 +535,22 @@ pub(crate) fn call(name: &str, args: &[Value]) -> Value {
     };
     match dispatch(name, args) {
         Some(value) => value,
-        None => raise(format!(
-            "function {}({}) does not exist",
-            name.to_ascii_lowercase(),
-            args.iter()
-                .map(crate::value::value_type_name)
-                .collect::<Vec<_>>()
-                .join(", ")
-        )),
+        None => raise(
+            crate::error_fields::DbError::new(format!(
+                "function {}({}) does not exist",
+                name.to_ascii_lowercase(),
+                args.iter()
+                    .map(crate::value::value_type_name)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+            .code("42883")
+            .hint(
+                "No function matches the given name and argument types. You might need to add \
+                 explicit type casts.",
+            )
+            .into_text(),
+        ),
     }
 }
 
@@ -2059,6 +2084,123 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
             Some(iv) => Value::Numeric(Numeric::from(iv.span())),
             None => arg(0).clone(),
         },
+        // Network-family operators and casts, with their type, as the
+        // planner passes them.
+        "__NET__" if arity(5) => {
+            let Some(kind) = crate::net::Kind::of(&text(arg(3))) else {
+                return Some(raise(format!(
+                    "operator does not exist: {} {}",
+                    crate::value::value_type_name(arg(1)),
+                    text(arg(0))
+                )));
+            };
+            let number = matches!(arg(4), Value::Bool(true));
+            match kind {
+                crate::net::Kind::Money => crate::net::money_operator(
+                    &text(arg(0)),
+                    &text(arg(1)),
+                    &text(arg(2)),
+                    !number,
+                )
+                .unwrap_or_else(raise),
+                crate::net::Kind::MacAddr | crate::net::Kind::MacAddr8 => {
+                    let op = text(arg(0));
+                    match op.as_str() {
+                        "=" | "<>" | "<" | ">" | "<=" | ">=" => {
+                            let ord = crate::net::cmp_mac(
+                                &text(arg(1)),
+                                &text(arg(2)),
+                                kind == crate::net::Kind::MacAddr8,
+                            );
+                            use std::cmp::Ordering::*;
+                            let holds = match op.as_str() {
+                                "=" => ord == Equal,
+                                "<>" => ord != Equal,
+                                "<" => ord == Less,
+                                ">" => ord == Greater,
+                                "<=" => ord != Greater,
+                                _ => ord != Less,
+                            };
+                            Value::Bool(holds)
+                        }
+                        _ => raise(format!(
+                            "operator does not exist: {} {}",
+                            kind.name(),
+                            op
+                        )),
+                    }
+                }
+                _ => crate::net::inet_operator(&text(arg(0)), &text(arg(1)), &text(arg(2)), number)
+                    .unwrap_or_else(raise),
+            }
+        }
+        "__NET_CAST__" if arity(3) => {
+            let (Some(from), Some(to)) = (
+                crate::net::Kind::of(&text(arg(0))),
+                crate::net::Kind::of(&text(arg(1))),
+            ) else {
+                return Some(raise(format!(
+                    "cannot cast type {} to {}",
+                    text(arg(0)),
+                    text(arg(1))
+                )));
+            };
+            crate::net::cast_between(from, to, &text(arg(2))).unwrap_or_else(raise)
+        }
+        "__MONEY_TEXT__" if arity(1) => Value::Text(crate::net::money_as_text(&text(arg(0)))),
+        "CASH_WORDS" if arity(1) => match crate::net::money_cents(&text(arg(0))) {
+            Some(cents) => Value::Text(crate::net::cash_words(cents)),
+            None => raise(format!("invalid money value: {}", text(arg(0)))),
+        },
+        "CASHLARGER" | "CASHSMALLER" if arity(2) => {
+            let (left, right) = (text(arg(0)), text(arg(1)));
+            let ord = crate::net::cmp(crate::net::Kind::Money, &left, &right);
+            let take_left = if name == "CASHLARGER" {
+                ord != std::cmp::Ordering::Less
+            } else {
+                ord == std::cmp::Ordering::Less
+            };
+            Value::Text(if take_left { left } else { right })
+        }
+        "__MAC_TRUNC__" if arity(1) || arity(2) => {
+            let kind = if arity(2) {
+                crate::net::Kind::of(&text(arg(1)))
+            } else {
+                None
+            };
+            match kind {
+                Some(crate::net::Kind::MacAddr8) => Value::Text(format!(
+                    "{}:00:00:00:00:00",
+                    text(arg(0)).split(':').take(3).collect::<Vec<_>>().join(":")
+                )),
+                _ => Value::Text(format!(
+                    "{}:00:00:00",
+                    text(arg(0)).split(':').take(3).collect::<Vec<_>>().join(":")
+                )),
+            }
+        }
+        "MACADDR8_SET7BIT" if arity(1) || arity(2) => {
+            let bytes: Vec<u8> = text(arg(0))
+                .split(':')
+                .filter_map(|b| u8::from_str_radix(b, 16).ok())
+                .collect();
+            match bytes.len() {
+                6 => {
+                    let mut out = vec![bytes[0] ^ 0x02, bytes[1], bytes[2], 0xff, 0xfe];
+                    out.extend_from_slice(&bytes[3..]);
+                    Value::Text(out.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(":"))
+                }
+                8 => {
+                    let mut out = bytes;
+                    out[0] ^= 0x02;
+                    Value::Text(out.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(":"))
+                }
+                _ => raise(format!(
+                    "invalid input syntax for type macaddr8: \"{}\"",
+                    text(arg(0))
+                )),
+            }
+        }
         // Range operators, with their subtype and whether the right operand
         // is an element, as the planner passes them.
         "__RANGE__" if arity(5) => {
@@ -2082,11 +2224,15 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
             crate::ranges::bound_value(&text(arg(0)), name == "__RANGE_LOWER__")
                 .unwrap_or_else(raise)
         }
-        "__BAD_FUNCTION__" if arity(2) => raise(
+        "__BAD_FUNCTION__" if args.len() >= 2 => raise(
             crate::error_fields::DbError::new(format!(
                 "function {}({}) does not exist",
                 text(arg(0)),
-                text(arg(1))
+                args[1..]
+                    .iter()
+                    .map(crate::render)
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ))
             .code("42883")
             .hint("No function matches the given name and argument types. You might need to add explicit type casts.")
@@ -2112,6 +2258,33 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
             .code("42846")
             .into_text(),
         ),
+        "HOST" | "NETMASK" | "HOSTMASK" | "BROADCAST" | "NETWORK" | "MASKLEN" | "SET_MASKLEN"
+        | "ABBREV" | "FAMILY"
+            if arity(1) || arity(2) =>
+        {
+            let kind = if arity(2) {
+                crate::net::Kind::of(&text(arg(1))).unwrap_or(crate::net::Kind::Inet)
+            } else {
+                crate::net::Kind::Inet
+            };
+            match crate::net::inet_function(kind, name, &text(arg(0)), None) {
+                Some(result) => result.unwrap_or_else(raise),
+                None => raise(format!("function {} does not exist", name.to_ascii_lowercase())),
+            }
+        }
+        "SET_MASKLEN" | "INET_SAME_FAMILY" | "INET_MERGE" if arity(2) || arity(3) => {
+            let kind = if arity(3) {
+                crate::net::Kind::of(&text(arg(2))).unwrap_or(crate::net::Kind::Inet)
+            } else {
+                crate::net::Kind::Inet
+            };
+            match crate::net::inet_function(kind, name, &text(arg(0)), Some(&text(arg(1)))) {
+                Some(result) => result.unwrap_or_else(raise),
+                None => raise(format!("function {} does not exist", name.to_ascii_lowercase())),
+            }
+        }
+        // `text(x)` is any value's text.
+        "TEXT" if arity(1) => arg(0).clone(),
         "ISEMPTY" if arity(1) => crate::ranges::is_empty(&text(arg(0))).unwrap_or_else(raise),
         "LOWER_INC" | "UPPER_INC" if arity(1) => {
             crate::ranges::bound_inc(&text(arg(0)), name == "LOWER_INC").unwrap_or_else(raise)
@@ -3214,6 +3387,16 @@ fn format_type(oid: i64, typmod: Option<i64>) -> String {
         3912 => "daterange",
         3908 => "tsrange",
         3910 => "tstzrange",
+        869 => "inet",
+        650 => "cidr",
+        829 => "macaddr",
+        774 => "macaddr8",
+        790 => "money",
+        1041 => "inet[]",
+        651 => "cidr[]",
+        1040 => "macaddr[]",
+        775 => "macaddr8[]",
+        791 => "money[]",
         3905 => "int4range[]",
         3927 => "int8range[]",
         3907 => "numrange[]",

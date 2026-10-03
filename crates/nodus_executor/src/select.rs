@@ -819,6 +819,101 @@ impl MemExecutor {
                     expr: check(&expr),
                     alias,
                 },
+                // `min`/`max` of an address or money compare by value;
+                // macaddr has no such aggregate, as in PostgreSQL.
+                ProjectionItem::Aggregate(op @ (AggregateOp::Min | AggregateOp::Max), arg)
+                    if column_type(&arg).is_some_and(|t| {
+                        crate::net::Kind::of(&t).is_some_and(|kind| {
+                            !matches!(kind, crate::net::Kind::MacAddr | crate::net::Kind::MacAddr8)
+                        })
+                    }) =>
+                {
+                    let kind = column_type(&arg)
+                        .and_then(|t| crate::net::Kind::of(&t))
+                        .expect("guarded by the match arm");
+                    ProjectionItem::Expr {
+                        expr: crate::ScalarExpr::Aggregate {
+                            op: op.clone(),
+                            arg,
+                            arg_expr: None,
+                            distinct: false,
+                            extra_args: vec![crate::ScalarExpr::Literal(crate::Value::Text(
+                                kind.name().to_string(),
+                            ))],
+                            filter: None,
+                            order_by: Vec::new(),
+                        },
+                        alias: Some(format!("{op:?}").to_ascii_lowercase()),
+                    }
+                }
+                ProjectionItem::Aggregate(op, arg)
+                    if matches!(op, AggregateOp::Min | AggregateOp::Max)
+                        && column_type(&arg).is_some_and(|t| {
+                            matches!(
+                                crate::net::Kind::of(&t),
+                                Some(crate::net::Kind::MacAddr | crate::net::Kind::MacAddr8)
+                            )
+                        }) =>
+                {
+                    let kind = column_type(&arg)
+                        .and_then(|t| crate::net::Kind::of(&t))
+                        .expect("guarded by the match arm");
+                    ProjectionItem::Expr {
+                        expr: crate::result_types::bad_function(
+                            &op.sql_name().to_ascii_lowercase(),
+                            kind.name(),
+                        ),
+                        alias: Some(format!("{op:?}").to_ascii_lowercase()),
+                    }
+                }
+                // `sum` of money adds cents; the type rides along as an
+                // extra argument, as it does for address `min`/`max`.
+                ProjectionItem::Aggregate(AggregateOp::Sum, arg)
+                    if column_type(&arg).is_some_and(|t| {
+                        crate::net::Kind::of(&t) == Some(crate::net::Kind::Money)
+                    }) =>
+                {
+                    ProjectionItem::Expr {
+                        expr: crate::ScalarExpr::Aggregate {
+                            op: AggregateOp::Sum,
+                            arg,
+                            arg_expr: None,
+                            distinct: false,
+                            extra_args: vec![crate::ScalarExpr::Literal(crate::Value::Text(
+                                "money".to_string(),
+                            ))],
+                            filter: None,
+                            order_by: Vec::new(),
+                        },
+                        alias: Some("sum".to_string()),
+                    }
+                }
+                // Money has no `avg` (nor any variance aggregate); the
+                // collectors take it, and `sum` above.
+                ProjectionItem::Aggregate(op, arg)
+                    if !matches!(
+                        op,
+                        AggregateOp::Count
+                            | AggregateOp::Min
+                            | AggregateOp::Max
+                            | AggregateOp::Sum
+                            | AggregateOp::ArrayAgg
+                            | AggregateOp::JsonAgg
+                            | AggregateOp::JsonbAgg
+                            | AggregateOp::JsonObjectAgg
+                            | AggregateOp::JsonbObjectAgg
+                    ) && column_type(&arg).is_some_and(|t| {
+                        crate::net::Kind::of(&t) == Some(crate::net::Kind::Money)
+                    }) =>
+                {
+                    ProjectionItem::Expr {
+                        expr: crate::result_types::bad_function(
+                            &op.sql_name().to_ascii_lowercase(),
+                            "money",
+                        ),
+                        alias: Some(format!("{op:?}").to_ascii_lowercase()),
+                    }
+                }
                 // No aggregate over a range takes one but `count` and the
                 // array and JSON collectors (`min(int4range)` does not exist).
                 ProjectionItem::Aggregate(op, arg)
@@ -1930,6 +2025,10 @@ impl MemExecutor {
                 .iter()
                 .map(|t| t.as_deref().and_then(crate::ranges::Kind::of))
                 .collect();
+            let net_keys: Vec<Option<crate::net::Kind>> = key_types
+                .iter()
+                .map(|t| t.as_deref().and_then(crate::net::Kind::of))
+                .collect();
             let key_cmp = |i: usize, a: &Value, b: &Value, asc: bool, nulls_first: Option<bool>| {
                 if interval_keys[i]
                     && let (Value::Text(l), Value::Text(r)) = (a, b)
@@ -1946,6 +2045,12 @@ impl MemExecutor {
                     && let (Ok(l), Ok(r)) = (crate::ranges::parse(l), crate::ranges::parse(r))
                 {
                     let ord = crate::ranges::cmp_ranges(kind, &l, &r);
+                    return if asc { ord } else { ord.reverse() };
+                }
+                if let Some(kind) = net_keys[i]
+                    && let (Value::Text(l), Value::Text(r)) = (a, b)
+                {
+                    let ord = crate::net::cmp(kind, l, r);
                     return if asc { ord } else { ord.reverse() };
                 }
                 order_cmp(a, b, asc, nulls_first)

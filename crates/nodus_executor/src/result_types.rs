@@ -147,6 +147,35 @@ fn scalar_type(expr: &ScalarExpr, column: &impl Fn(&str) -> Option<String>) -> O
                 _ => Some("TIMESTAMP".into()),
             }
         }
+        // A network-family operator's result: the address or money type for
+        // the set operations, and a boolean for the predicates.
+        ScalarExpr::Function { name, args } if name == NET_OP => {
+            match args.first() {
+                Some(ScalarExpr::Literal(Value::Text(op)))
+                    if matches!(op.as_str(), "+" | "-" | "*" | "/" | "&" | "|" | "~") =>
+                {
+                    // `money / money` is a ratio.
+                    if op == "/"
+                        && matches!(args.get(4), Some(ScalarExpr::Literal(Value::Bool(false))))
+                        && matches!(
+                            args.get(3),
+                            Some(ScalarExpr::Literal(Value::Text(k))) if k == "money"
+                        )
+                    {
+                        return Some("FLOAT8".into());
+                    }
+                    match args.get(3) {
+                        Some(ScalarExpr::Literal(Value::Text(kind))) => Some(kind.clone()),
+                        _ => None,
+                    }
+                }
+                _ => Some("BOOLEAN".into()),
+            }
+        }
+        ScalarExpr::Function { name, args } if name == NET_CAST => match args.get(1) {
+            Some(ScalarExpr::Literal(Value::Text(to))) => Some(to.clone()),
+            _ => None,
+        },
         // A range operator's result: the range for the set operations, and
         // a boolean for the predicates.
         ScalarExpr::Function { name, args } if name == RANGE_OP => match args.first() {
@@ -333,6 +362,23 @@ pub(crate) fn check_integer_ranges(
     // refused as PostgreSQL refuses it.
     let range_kind =
         |e: &ScalarExpr| scalar_type(e, column).and_then(|t| crate::ranges::Kind::of(&t));
+    // The same for the network-family types and money.
+    let net_kind = |e: &ScalarExpr| scalar_type(e, column).and_then(|t| crate::net::Kind::of(&t));
+    let number = |e: &ScalarExpr| {
+        scalar_type(e, column)
+            .is_some_and(|t| integer_rank(&t).is_some() || is_float(&t) || is_numeric(&t))
+    };
+    let net_call =
+        |op: &str, l: &ScalarExpr, r: &ScalarExpr, kind: crate::net::Kind, number: bool| {
+            net_operator(op, l, r, kind, number)
+        };
+    // Two different network families have no common operator either.
+    let mixed_net = |l: &ScalarExpr, r: &ScalarExpr, symbol: &str| -> Option<ScalarExpr> {
+        match (net_kind(l), net_kind(r)) {
+            (Some(a), Some(b)) if a != b => Some(bad_operator(a.name(), symbol, b.name())),
+            _ => None,
+        }
+    };
     let range_call = range_operator;
     // Two different range types have no common operator.
     let mixed = |l: &ScalarExpr, r: &ScalarExpr, symbol: &str| -> Option<ScalarExpr> {
@@ -342,6 +388,37 @@ pub(crate) fn check_integer_ranges(
         }
     };
     match &checked {
+        // A cast between two network-family types converts (`inet` to `cidr`
+        // zeroes the host bits), and money does not cast to a number.
+        ScalarExpr::Cast {
+            expr: inner,
+            target,
+        } if let (Some(from), Some(to)) = (net_kind(inner), crate::net::Kind::of(target))
+            && from != to =>
+        {
+            return ScalarExpr::Function {
+                name: NET_CAST.to_string(),
+                args: vec![
+                    ScalarExpr::Literal(Value::Text(from.name().to_string())),
+                    ScalarExpr::Literal(Value::Text(to.name().to_string())),
+                    (**inner).clone(),
+                ],
+            };
+        }
+        ScalarExpr::Cast {
+            expr: inner,
+            target,
+        } if net_kind(inner) == Some(crate::net::Kind::Money)
+            && (integer_rank(target).is_some() || is_float(target)) =>
+        {
+            return ScalarExpr::Function {
+                name: BAD_RANGE_CAST.to_string(),
+                args: vec![
+                    ScalarExpr::Literal(Value::Text("money".to_string())),
+                    ScalarExpr::Literal(Value::Text(operator_type_name(target))),
+                ],
+            };
+        }
         ScalarExpr::Cast {
             expr: inner,
             target,
@@ -356,6 +433,23 @@ pub(crate) fn check_integer_ranges(
                 ],
             };
         }
+        // `&`, `|`, and `~` of addresses are the address operations, not the
+        // integer ones.
+        ScalarExpr::Function { name, args }
+            if matches!(name.as_str(), BIT_AND | BIT_OR)
+                && let [l, r] = args.as_slice()
+                && let Some(kind) = net_kind(l).or_else(|| net_kind(r)) =>
+        {
+            let op = if name == BIT_AND { "&" } else { "|" };
+            return net_call(op, l, r, kind, false);
+        }
+        ScalarExpr::Function { name, args }
+            if name == BIT_NOT
+                && let [value] = args.as_slice()
+                && let Some(kind) = net_kind(value) =>
+        {
+            return net_call("~", value, value, kind, false);
+        }
         // `range << range` and `range >> range` shadow the bit shifts.
         ScalarExpr::Function { name, args }
             if matches!(name.as_str(), SHIFT_LEFT | SHIFT_RIGHT)
@@ -364,6 +458,90 @@ pub(crate) fn check_integer_ranges(
         {
             let op = if name == SHIFT_LEFT { "<<" } else { ">>" };
             return range_call(op, l, r, kind, false);
+        }
+        // `money(x)` is the cast into money.
+        ScalarExpr::Function { name, args } if name == "MONEY" && args.len() == 1 => {
+            return ScalarExpr::Cast {
+                expr: Box::new(args[0].clone()),
+                target: "MONEY".to_string(),
+            };
+        }
+        // `text(money)` shows it with its symbol.
+        ScalarExpr::Function { name, args }
+            if name == "TEXT"
+                && let [value] = args.as_slice()
+                && net_kind(value) == Some(crate::net::Kind::Money) =>
+        {
+            return ScalarExpr::Function {
+                name: MONEY_TEXT.to_string(),
+                args: vec![value.clone()],
+            };
+        }
+        // An argument of a function that takes any value (`to_json`,
+        // `quote_literal`, ...) is what money shows.
+        ScalarExpr::Function { name, args }
+            if matches!(
+                name.as_str(),
+                "TO_JSON"
+                    | "TO_JSONB"
+                    | "JSON_BUILD_ARRAY"
+                    | "JSONB_BUILD_ARRAY"
+                    | "JSON_BUILD_OBJECT"
+                    | "JSONB_BUILD_OBJECT"
+                    | "QUOTE_LITERAL"
+                    | "QUOTE_NULLABLE"
+                    | "ARRAY"
+            ) && args
+                .iter()
+                .any(|arg| net_kind(arg) == Some(crate::net::Kind::Money)) =>
+        {
+            return ScalarExpr::Function {
+                name: name.clone(),
+                args: args
+                    .iter()
+                    .map(|arg| {
+                        if net_kind(arg) == Some(crate::net::Kind::Money) {
+                            ScalarExpr::Function {
+                                name: MONEY_TEXT.to_string(),
+                                args: vec![arg.clone()],
+                            }
+                        } else {
+                            arg.clone()
+                        }
+                    })
+                    .collect(),
+            };
+        }
+        // No other function takes money: it is not a number (`abs(money)`,
+        // `round(money)`, `to_char(money, ...)` do not exist). The functions
+        // that take any value (`concat`, `format`, ...) keep their argument.
+        ScalarExpr::Function { name, args }
+            if !matches!(
+                name.as_str(),
+                "CASH"
+                    | "CASH_WORDS"
+                    | "CASHLARGER"
+                    | "CASHSMALLER"
+                    | "MONEY"
+                    | "CONCAT"
+                    | "CONCAT_WS"
+                    | "FORMAT"
+                    | "GREATEST"
+                    | "LEAST"
+                    | "COALESCE"
+                    | "NULLIF"
+                    | "PG_TYPEOF"
+                    | "PG_COLUMN_SIZE"
+            ) && !name.starts_with("__")
+                && args
+                    .iter()
+                    .any(|arg| net_kind(arg) == Some(crate::net::Kind::Money)) =>
+        {
+            let types: Vec<String> = args
+                .iter()
+                .map(|arg| argument_type_name(arg, column))
+                .collect();
+            return bad_function_args(&name.to_ascii_lowercase(), &types);
         }
         // A custom operator (`@>`, `&&`, `<@`, ...) once its subtype is
         // known; `<@` reads as `@>` with its operands swapped, and with no
@@ -379,6 +557,12 @@ pub(crate) fn check_integer_ranges(
                 ] = args.as_slice()
                 && kind_name.is_empty() =>
         {
+            if let Some(found) = net_kind(l).or_else(|| net_kind(r)) {
+                if let Some(bad) = mixed_net(l, r, op) {
+                    return bad;
+                }
+                return net_call(op, l, r, found, false);
+            }
             let Some(found) = range_kind(l).or_else(|| range_kind(r)) else {
                 let op = match op.as_str() {
                     "@>" => ScalarBinaryOp::Contains,
@@ -401,6 +585,81 @@ pub(crate) fn check_integer_ranges(
             }
             let element = op == "@>" && range_kind(r).is_none();
             return range_call(op, l, r, found, element);
+        }
+        // A window aggregate over an address or money carries its type the
+        // same way the plain one does; macaddr has no `min`/`max`.
+        ScalarExpr::Window(call) => {
+            let kind = call.args.first().and_then(net_kind);
+            let func = call.func.to_ascii_uppercase();
+            if let (Some(kind), Some(op)) = (kind, crate::planner::aggregate_op(&func)) {
+                // Behind `count`, `min`, and `max`, only money sums.
+                let allowed = match kind {
+                    crate::net::Kind::Money => matches!(
+                        op,
+                        AggregateOp::Count
+                            | AggregateOp::Min
+                            | AggregateOp::Max
+                            | AggregateOp::Sum
+                    ),
+                    _ => matches!(
+                        op,
+                        AggregateOp::Count | AggregateOp::Min | AggregateOp::Max
+                    ),
+                };
+                if !allowed {
+                    return bad_function(&func.to_ascii_lowercase(), kind.name());
+                }
+            }
+            // macaddr has neither `min` nor `max`.
+            if matches!(func.as_str(), "MIN" | "MAX")
+                && matches!(
+                    kind,
+                    Some(crate::net::Kind::MacAddr | crate::net::Kind::MacAddr8)
+                )
+            {
+                let kind = kind.expect("guarded by the match");
+                return bad_function(&func.to_ascii_lowercase(), kind.name());
+            }
+            let extra = match (func.as_str(), kind) {
+                ("SUM", Some(crate::net::Kind::Money)) => Some("money"),
+                ("MIN" | "MAX", Some(kind)) => Some(kind.name()),
+                _ => None,
+            };
+            if let Some(extra) = extra
+                && call.args.len() == 1
+            {
+                let mut call = (**call).clone();
+                call.args
+                    .push(ScalarExpr::Literal(Value::Text(extra.to_string())));
+                return ScalarExpr::Window(Box::new(call));
+            }
+        }
+        // `sum` of money adds cents wherever it is nested (in `HAVING`, a
+        // cast, or arithmetic); the type rides along as an extra argument.
+        ScalarExpr::Aggregate {
+            op: AggregateOp::Sum,
+            arg,
+            arg_expr,
+            distinct,
+            extra_args,
+            filter,
+            order_by,
+        } if extra_args.is_empty()
+            && arg_expr
+                .as_deref()
+                .and_then(net_kind)
+                .or_else(|| net_kind(&ScalarExpr::Column(arg.clone())))
+                == Some(crate::net::Kind::Money) =>
+        {
+            return ScalarExpr::Aggregate {
+                op: AggregateOp::Sum,
+                arg: arg.clone(),
+                arg_expr: arg_expr.clone(),
+                distinct: *distinct,
+                extra_args: vec![ScalarExpr::Literal(Value::Text("money".to_string()))],
+                filter: filter.clone(),
+                order_by: order_by.clone(),
+            };
         }
         // Only `count`, `array_agg`, and the JSON collectors take a range;
         // `min`, `sum`, and the like have no overload for one.
@@ -454,6 +713,100 @@ pub(crate) fn check_integer_ranges(
                     };
                 }
             }
+            if let Some(kind) = net_kind(left).or_else(|| net_kind(right)) {
+                let symbol = match op {
+                    ScalarBinaryOp::Eq => Some("="),
+                    ScalarBinaryOp::NotEq => Some("<>"),
+                    ScalarBinaryOp::Lt => Some("<"),
+                    ScalarBinaryOp::Gt => Some(">"),
+                    ScalarBinaryOp::LtEq => Some("<="),
+                    ScalarBinaryOp::GtEq => Some(">="),
+                    ScalarBinaryOp::Add => Some("+"),
+                    ScalarBinaryOp::Sub => Some("-"),
+                    ScalarBinaryOp::Mul if kind == crate::net::Kind::Money => Some("*"),
+                    ScalarBinaryOp::Div if kind == crate::net::Kind::Money => Some("/"),
+                    _ => None,
+                };
+                let right_number = number(right)
+                    || (kind == crate::net::Kind::Money
+                        && scalar_type(right, column).is_none());
+                if let Some(symbol) = symbol {
+                    // `inet` has `+` with a number and `-` with a number or
+                    // another address; money takes money on either side.
+                    let monetary = kind == crate::net::Kind::Money;
+                    let right_kind = net_kind(right);
+                    // An untyped string literal reads as PostgreSQL's
+                    // `unknown` and resolves to whatever the operator takes.
+                    let unknown = |e: &ScalarExpr| {
+                        scalar_type(e, column).is_none()
+                            || matches!(e, ScalarExpr::Literal(Value::Text(_)))
+                    };
+                    // A number money scales by: an integer, a float, or a
+                    // numeric (which PostgreSQL casts to a float), but not
+                    // another money.
+                    let number_operand = |e: &ScalarExpr| {
+                        scalar_type(e, column).is_some_and(|t| {
+                            integer_rank(&t).is_some() || is_float(&t) || is_numeric(&t)
+                        })
+                    };
+                    let left_money = net_kind(left) == Some(crate::net::Kind::Money);
+                    let right_money = right_kind == Some(crate::net::Kind::Money);
+                    let ok = if monetary {
+                        let other = if left_money { right } else { left };
+                        match symbol {
+                            // Money compares with money (an unknown literal
+                            // resolves to money).
+                            "=" | "<>" | "<" | ">" | "<=" | ">=" => {
+                                left_money && right_money || unknown(other)
+                            }
+                            // Money adds to money, and to an unknown literal.
+                            "+" | "-" => left_money && right_money || unknown(other),
+                            // Money scales by a number on either side, but
+                            // not by money.
+                            "*" => {
+                                (left_money
+                                    && !right_money
+                                    && (number_operand(right) || unknown(right)))
+                                    || (right_money
+                                        && (number_operand(left) || unknown(left)))
+                            }
+                            // `money / money` is a ratio; otherwise money is
+                            // the dividend.
+                            "/" => {
+                                left_money
+                                    && (right_money
+                                        || number_operand(right)
+                                        || unknown(right))
+                            }
+                            _ => false,
+                        }
+                    } else {
+                        match symbol {
+                            "+" => right_number || unknown(right),
+                            "-" => right_kind.is_some() || right_number || unknown(right),
+                            _ => true,
+                        }
+                    };
+                    if ok {
+                        // `money + money` (and `-`) reads an unknown literal
+                        // as money too; `*` and `/` take the number as one.
+                        let number = match (kind, symbol) {
+                            (crate::net::Kind::Money, "+" | "-") => false,
+                            _ => right_kind.is_none(),
+                        };
+                        return net_call(symbol, left, right, kind, number);
+                    }
+                    // No overload: name both types as PostgreSQL does.
+                    let other = if net_kind(left).is_some() { right } else { left };
+                    let other_name =
+                        operator_type_name(&scalar_type(other, column).unwrap_or_default());
+                    return if net_kind(left).is_some() {
+                        bad_operator(kind.name(), symbol, &other_name)
+                    } else {
+                        bad_operator(&other_name, symbol, kind.name())
+                    };
+                }
+            }
             if let Some(kind) = range_kind(left).or_else(|| range_kind(right)) {
                 let symbol = match op {
                     ScalarBinaryOp::Eq => Some("="),
@@ -498,6 +851,39 @@ pub(crate) fn check_integer_ranges(
                     }
                 }
             }
+        }
+        // An address function learns its argument's type
+        // (`set_masklen` masks a `cidr` but keeps an `inet`'s address).
+        ScalarExpr::Function { name, args }
+            if matches!(
+                name.as_str(),
+                "HOST" | "NETMASK" | "HOSTMASK" | "BROADCAST" | "NETWORK" | "MASKLEN"
+                    | "SET_MASKLEN" | "ABBREV" | "FAMILY" | "INET_SAME_FAMILY" | "INET_MERGE"
+                    | "MACADDR8_SET7BIT"
+            ) && let Some(kind) = args.first().and_then(|a| net_kind(a))
+                && args.last().is_none_or(|a| !matches!(a, ScalarExpr::Literal(Value::Text(t)) if crate::net::Kind::of(t).is_some())) =>
+        {
+            let mut args = args.clone();
+            args.push(ScalarExpr::Literal(Value::Text(kind.name().to_string())));
+            return ScalarExpr::Function {
+                name: name.clone(),
+                args,
+            };
+        }
+        // `trunc` of a MAC address zeroes its low bytes.
+        ScalarExpr::Function { name, args }
+            if name == "TRUNC"
+                && let [arg] = args.as_slice()
+                && let Some(kind @ (crate::net::Kind::MacAddr | crate::net::Kind::MacAddr8)) =
+                    net_kind(arg) =>
+        {
+            return ScalarExpr::Function {
+                name: "__MAC_TRUNC__".to_string(),
+                args: vec![
+                    arg.clone(),
+                    ScalarExpr::Literal(Value::Text(kind.name().to_string())),
+                ],
+            };
         }
         // `lower` and `upper` of a range read its bounds, where the string
         // functions would fold its text's case.
@@ -640,16 +1026,19 @@ pub(crate) fn check_integer_ranges(
     // `real`'s (`0.1::real::text` is `0.1`).
     let real =
         |e: &ScalarExpr| scalar_type(e, column).is_some_and(|t| crate::value::is_real_type(&t));
+    let money = |e: &ScalarExpr| net_kind(e) == Some(crate::net::Kind::Money);
     let call = |name: &str, e: &ScalarExpr| ScalarExpr::Function {
         name: name.to_string(),
         args: vec![e.clone()],
     };
-    let textual = |e: &ScalarExpr| zoned(e) || real(e);
+    let textual = |e: &ScalarExpr| zoned(e) || real(e) || money(e);
     let text_form = |e: &ScalarExpr| {
         if zoned(e) {
             session_text(e)
         } else if real(e) {
             call(REAL_TEXT, e)
+        } else if money(e) {
+            call(MONEY_TEXT, e)
         } else {
             e.clone()
         }
@@ -712,6 +1101,15 @@ pub(crate) fn check_integer_ranges(
                 })),
             ],
         };
+    }
+    if let ScalarExpr::Cast {
+        expr: inner,
+        target,
+    } = &checked
+        && money(inner)
+        && is_text_type(target)
+    {
+        return call(MONEY_TEXT, inner);
     }
     if let ScalarExpr::Cast {
         expr: inner,
@@ -1072,6 +1470,38 @@ pub(crate) const RANGE_UPPER: &str = "__RANGE_UPPER__";
 /// has no such cast (`cannot cast type int4range to int8range`).
 pub(crate) const BAD_RANGE_CAST: &str = "__BAD_RANGE_CAST__";
 
+/// The function a network-family operator is rewritten to once its type is
+/// known: `__NET__(operator, left, right, type, right-is-compatible)`.
+pub(crate) const NET_OP: &str = "__NET__";
+
+/// The function a cast between two network-family types is rewritten to:
+/// `__NET_CAST__(from, to, value)`.
+pub(crate) const NET_CAST: &str = "__NET_CAST__";
+
+/// The function money's text is rewritten to: its display text with the
+/// currency symbol and thousands separators.
+pub(crate) const MONEY_TEXT: &str = "__MONEY_TEXT__";
+
+/// The call a network-family operator is rewritten to.
+pub(crate) fn net_operator(
+    op: &str,
+    left: &ScalarExpr,
+    right: &ScalarExpr,
+    kind: crate::net::Kind,
+    right_is_number: bool,
+) -> ScalarExpr {
+    ScalarExpr::Function {
+        name: NET_OP.to_string(),
+        args: vec![
+            ScalarExpr::Literal(Value::Text(op.to_string())),
+            left.clone(),
+            right.clone(),
+            ScalarExpr::Literal(Value::Text(kind.name().to_string())),
+            ScalarExpr::Literal(Value::Bool(right_is_number)),
+        ],
+    }
+}
+
 /// The function an operator PostgreSQL has no overload for is rewritten to:
 /// `__BAD_OPERATOR__(left type, operator, right type)`.
 pub(crate) const BAD_OPERATOR: &str = "__BAD_OPERATOR__";
@@ -1083,12 +1513,37 @@ pub(crate) const BAD_FUNCTION: &str = "__BAD_FUNCTION__";
 /// The call an aggregate with no overload for its argument is rewritten to
 /// (`min(int4range)` does not exist).
 pub(crate) fn bad_function(name: &str, data_type: &str) -> ScalarExpr {
+    bad_function_args(name, std::slice::from_ref(&data_type.to_string()))
+}
+
+/// The same call with a list of argument types, as PostgreSQL names them
+/// (`function mod(money, integer) does not exist`).
+pub(crate) fn bad_function_args(name: &str, types: &[String]) -> ScalarExpr {
+    let mut args = vec![ScalarExpr::Literal(Value::Text(name.to_string()))];
+    args.extend(
+        types
+            .iter()
+            .map(|t| ScalarExpr::Literal(Value::Text(t.clone()))),
+    );
     ScalarExpr::Function {
         name: BAD_FUNCTION.to_string(),
-        args: vec![
-            ScalarExpr::Literal(Value::Text(name.to_string())),
-            ScalarExpr::Literal(Value::Text(data_type.to_string())),
-        ],
+        args,
+    }
+}
+
+/// The name of an argument's type in a "function ... does not exist" message;
+/// an untyped literal is `unknown`, as PostgreSQL reports it.
+fn argument_type_name(expr: &ScalarExpr, column: &impl Fn(&str) -> Option<String>) -> String {
+    if matches!(expr, ScalarExpr::Literal(Value::Text(_)))
+        && scalar_type(expr, column).is_none_or(|t| is_text_type(&t) || t.trim().is_empty())
+    {
+        return "unknown".to_string();
+    }
+    match scalar_type(expr, column) {
+        Some(t) if !t.trim().is_empty() && !t.eq_ignore_ascii_case("UNKNOWN") => {
+            operator_type_name(&t)
+        }
+        _ => "unknown".to_string(),
     }
 }
 

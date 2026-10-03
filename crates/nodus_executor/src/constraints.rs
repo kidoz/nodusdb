@@ -349,7 +349,7 @@ impl MemExecutor {
                             "new row for relation \"{}\" violates check constraint \"{name}\"",
                             tbl.name
                         ))
-                        .detail(failing_row(new_row))
+                        .detail(failing_row_typed(new_row, &tbl.columns))
                         .schema(self.schema_name_of(tbl))
                         .table(&tbl.name)
                         .constraint(&name)
@@ -412,7 +412,7 @@ impl MemExecutor {
                 "null value in column \"{}\" of relation \"{}\" violates not-null constraint",
                 column.name, tbl.name
             ))
-            .detail(failing_row(row))
+            .detail(failing_row_typed(row, &tbl.columns))
             .schema(self.schema_name_of(tbl))
             .table(&tbl.name)
             .column(&column.name)
@@ -430,6 +430,32 @@ pub(crate) fn failing_row(row: &[Value]) -> String {
         .map(|v| match v {
             Value::Null => "null".to_string(),
             v => render(v),
+        })
+        .collect();
+    format!("Failing row contains ({}).", values.join(", "))
+}
+
+/// As [`failing_row`], but with each value shown by its column's type where
+/// PostgreSQL shows it differently from the stored form (an `inet` without
+/// its full mask, money with its symbol).
+pub(crate) fn failing_row_typed(
+    row: &[Value],
+    columns: &[nodus_catalog::ColumnDescriptor],
+) -> String {
+    let values: Vec<String> = row
+        .iter()
+        .enumerate()
+        .map(|(i, v)| match v {
+            Value::Null => "null".to_string(),
+            v => {
+                let kind = columns
+                    .get(i)
+                    .and_then(|c| crate::net::Kind::of(&c.data_type));
+                match (kind, v) {
+                    (Some(kind), Value::Text(text)) => crate::net::show(kind, text),
+                    _ => render(v),
+                }
+            }
         })
         .collect();
     format!("Failing row contains ({}).", values.join(", "))

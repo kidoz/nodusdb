@@ -599,6 +599,8 @@ fn range_operator_symbol(op: &sqlparser::ast::BinaryOperator) -> Option<&'static
         B::AndLt => "&<",
         B::AndGt => "&>",
         B::Custom(symbol) if symbol == "-|-" => "-|-",
+        B::Custom(symbol) if symbol == "<<=" => "<<=",
+        B::Custom(symbol) if symbol == ">>=" => ">>=",
         B::PGCustomBinaryOperator(parts) => match parts.last().map(String::as_str) {
             Some("@>") => "@>",
             Some("<@") => "<@",
@@ -2417,7 +2419,8 @@ pub(crate) fn unknown_function_error(expr: &sqlparser::ast::Expr) -> Option<Stri
                     .collect::<Vec<_>>()
                     .join(", ");
                 return Some(format!(
-                    "function {}({types}) does not exist",
+                    "function {}({types}) does not exist\u{1f}hint=No function matches the given \
+                     name and argument types. You might need to add explicit type casts.",
                     func.name.to_string().to_ascii_lowercase()
                 ));
             }

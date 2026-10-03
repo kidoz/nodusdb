@@ -133,7 +133,9 @@ impl MemExecutor {
                 .filter_map(|row| row.get(column))
                 .filter_map(crate::result_types::constant_expr_type)
                 .find(|t| {
-                    crate::datetime::Kind::of_type(t).is_some() || crate::ranges::is_range_type(t)
+                    crate::datetime::Kind::of_type(t).is_some()
+                        || crate::ranges::is_range_type(t)
+                        || crate::net::is_net_type(t)
                 });
             types.push(unify_column(&mut values, column, declared)?);
         }
@@ -189,9 +191,9 @@ fn unify_column(
         Some(Kind::Float) => "DOUBLE PRECISION",
         None => {
             if let Some(target) = declared {
-                // A range column keeps its declared type; its text is stored
-                // canonical already.
-                if crate::ranges::is_range_type(&target) {
+                // A range or network-family column keeps its declared type;
+                // its text is stored canonical already.
+                if crate::ranges::is_range_type(&target) || crate::net::is_net_type(&target) {
                     return Ok(target);
                 }
                 convert_all(rows, column, &target)?;

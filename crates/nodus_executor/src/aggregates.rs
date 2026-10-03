@@ -342,6 +342,76 @@ pub(crate) fn aggregate_inputs(op: &AggregateOp, inputs: &[(Value, Vec<Value>)])
     let values = || inputs.iter().map(|(v, _)| v);
     let non_null = || values().filter(|v| **v != Value::Null);
     match op {
+        // `min`/`max` of an address or money compare by value, which the
+        // planner marks by passing the type as an extra argument.
+        AggregateOp::Min | AggregateOp::Max
+            if let Some(kind) =
+                inputs
+                    .iter()
+                    .find_map(|(_, extra)| extra.first())
+                    .and_then(|v| match v {
+                        Value::Text(text) => crate::net::Kind::of(text),
+                        _ => None,
+                    }) =>
+        {
+            let mut best: Option<&Value> = None;
+            for (value, _) in inputs {
+                if *value == Value::Null {
+                    continue;
+                }
+                best = Some(match best {
+                    None => value,
+                    Some(b) => match (value, b) {
+                        (Value::Text(l), Value::Text(r)) => {
+                            let ord = crate::net::cmp(kind, l, r);
+                            let take = if *op == AggregateOp::Min {
+                                ord == std::cmp::Ordering::Less
+                            } else {
+                                ord == std::cmp::Ordering::Greater
+                            };
+                            if take { value } else { b }
+                        }
+                        _ => b,
+                    },
+                });
+            }
+            best.cloned().unwrap_or(Value::Null)
+        }
+        // `sum(money)`, marked by the type as an extra argument: cents add
+        // exactly, and no value is NULL.
+        AggregateOp::Sum
+            if inputs
+                .iter()
+                .find_map(|(_, extra)| extra.first())
+                .and_then(|v| match v {
+                    Value::Text(text) => crate::net::Kind::of(text),
+                    _ => None,
+                })
+                == Some(crate::net::Kind::Money) =>
+        {
+            let mut total: Option<i64> = None;
+            for value in values() {
+                if *value == Value::Null {
+                    continue;
+                }
+                let Value::Text(text) = value else {
+                    return Value::Null;
+                };
+                let Some(cents) = crate::net::money_cents(text) else {
+                    return Value::Null;
+                };
+                total = Some(match total {
+                    Some(sum) => match sum.checked_add(cents) {
+                        Some(sum) => sum,
+                        None => return crate::eval_error::raise("money out of range"),
+                    },
+                    None => cents,
+                });
+            }
+            total.map_or(Value::Null, |cents| {
+                Value::Text(crate::net::money_from_cents(cents))
+            })
+        }
         AggregateOp::Count
         | AggregateOp::Sum
         | AggregateOp::Avg
