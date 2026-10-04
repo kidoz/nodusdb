@@ -64,6 +64,7 @@ fn aggregate_type(op: &AggregateOp, input: Option<String>) -> Option<String> {
                 .map_or(ty.clone(), |kind| kind.multirange_name().to_string())
         }),
         AggregateOp::RangeIntersectAgg => input,
+        AggregateOp::XmlAgg => Some("XML".into()),
     }
 }
 
@@ -1808,6 +1809,78 @@ pub(crate) fn check_integer_ranges(
                 args: vec![ScalarExpr::Literal(Value::Text(kind.name().to_string()))],
             };
         }
+        // `greatest`/`least` need a comparison function, which `xml` has
+        // none of either.
+        ScalarExpr::Function { name, args }
+            if matches!(name.as_str(), "GREATEST" | "LEAST")
+                && args.iter().any(|arg| is_xml_type(arg, column)) =>
+        {
+            return ScalarExpr::Function {
+                name: BAD_COMPARISON.to_string(),
+                args: vec![ScalarExpr::Literal(Value::Text("xml".to_string()))],
+            };
+        }
+        // `xmlagg(x)`: the argument is an XML value, and an order by another
+        // XML value has no ordering operator.
+        ScalarExpr::Aggregate {
+            op: AggregateOp::XmlAgg,
+            arg,
+            arg_expr,
+            order_by,
+            ..
+        } => {
+            if order_by.iter().any(|(key, ..)| is_xml_type(key, column)) {
+                return ScalarExpr::Function {
+                    name: BAD_ORDERING.to_string(),
+                    args: vec![ScalarExpr::Literal(Value::Text("xml".to_string()))],
+                };
+            }
+            let value = arg_expr
+                .as_deref()
+                .cloned()
+                .unwrap_or_else(|| ScalarExpr::Column(arg.clone()));
+            if !is_xml_type(&value, column)
+                && !matches!(value, ScalarExpr::Literal(Value::Text(_)))
+            {
+                return bad_function("xmlagg", &argument_type_name(&value, column));
+            }
+            return ScalarExpr::Aggregate {
+                op: AggregateOp::XmlAgg,
+                arg: arg.clone(),
+                arg_expr: Some(Box::new(match value {
+                    ScalarExpr::Literal(Value::Text(_)) => ScalarExpr::Cast {
+                        expr: Box::new(value),
+                        target: "xml".to_string(),
+                    },
+                    other => other,
+                })),
+                distinct: false,
+                extra_args: vec![],
+                filter: None,
+                order_by: order_by.clone(),
+            };
+        }
+        // Only `count`, the collectors, and `xmlagg` take an XML value; the
+        // other aggregates have no overload for it.
+        ScalarExpr::Aggregate {
+            op, arg, arg_expr, ..
+        } if *op != AggregateOp::XmlAgg
+            && !matches!(
+                op,
+                AggregateOp::Count
+                    | AggregateOp::ArrayAgg
+                    | AggregateOp::JsonAgg
+                    | AggregateOp::JsonbAgg
+                    | AggregateOp::JsonObjectAgg
+                    | AggregateOp::JsonbObjectAgg
+            )
+            && arg_expr
+                .as_deref()
+                .map(|e| is_xml_type(e, column))
+                .unwrap_or_else(|| is_xml_type(&ScalarExpr::Column(arg.clone()), column)) =>
+        {
+            return bad_function(op.sql_name(), "xml");
+        }
         // Only `count`, the collectors, and the range builders take a range
         // or multirange; `min`, `sum`, and the like have no overload.
         ScalarExpr::Aggregate {
@@ -3094,6 +3167,10 @@ pub(crate) const BAD_OPERATOR: &str = "__BAD_OPERATOR__";
 /// The function a call PostgreSQL has no overload for is rewritten to:
 /// `__BAD_FUNCTION__(name, argument type)`.
 pub(crate) const BAD_FUNCTION: &str = "__BAD_FUNCTION__";
+
+/// An `ORDER BY` over a value with no ordering operator:
+/// `__BAD_ORDERING__(type)`.
+pub(crate) const BAD_ORDERING: &str = "__BAD_ORDERING__";
 
 /// The call an aggregate with no overload for its argument is rewritten to
 /// (`min(int4range)` does not exist).

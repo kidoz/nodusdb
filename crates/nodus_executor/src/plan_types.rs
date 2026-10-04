@@ -272,6 +272,8 @@ pub enum AggregateOp {
     RangeAgg,
     /// `range_intersect_agg(x)`: the ranges common to every value.
     RangeIntersectAgg,
+    /// `xmlagg(x)`: the values concatenated, their XML declarations merged.
+    XmlAgg,
 }
 
 impl AggregateOp {
@@ -316,6 +318,7 @@ impl AggregateOp {
             AggregateOp::RegrSxx => "regr_sxx",
             AggregateOp::RegrSyy => "regr_syy",
             AggregateOp::RegrSxy => "regr_sxy",
+            AggregateOp::XmlAgg => "xmlagg",
             AggregateOp::BitXor => "bit_xor",
             AggregateOp::AnyValue => "any_value",
             AggregateOp::RangeAgg => "range_agg",

@@ -207,7 +207,7 @@ pub(crate) fn is_known(name: &str) -> bool {
                 | "AREA" | "NPOINTS" | "ISCLOSED" | "ISOPEN" | "PCLOSE" | "POPEN"
                 | "BOUND_BOX"
                 | "__GEO__" | "__GEO_CAST__" | "__GEO_FN__" | "__GEO_UNARY__"
-                | "__BAD_COMPARISON__"
+                | "__BAD_COMPARISON__" | crate::result_types::BAD_ORDERING
                 | "ISEMPTY" | "LOWER_INC" | "UPPER_INC" | "LOWER_INF" | "UPPER_INF"
                 | "RANGE_MERGE"
                 | "__RANGE__" | "__RANGE_LOWER__" | "__RANGE_UPPER__" | "__BAD_RANGE_CAST__"
@@ -2759,6 +2759,16 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
                 text(arg(0))
             ))
             .code("42883")
+            .into_text(),
+        ),
+        // `ORDER BY` of a value with no ordering operator.
+        crate::result_types::BAD_ORDERING if arity(1) => raise(
+            crate::error_fields::DbError::new(format!(
+                "could not identify an ordering operator for type {}",
+                text(arg(0))
+            ))
+            .code("42883")
+            .hint("Use an explicit ordering operator or modify the query.")
             .into_text(),
         ),
         "__BAD_RANGE_CAST__" if arity(2) => raise(

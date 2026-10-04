@@ -2648,6 +2648,7 @@ pub(crate) fn aggregate_op(name: &str) -> Option<AggregateOp> {
         "REGR_SXX" => Some(AggregateOp::RegrSxx),
         "REGR_SYY" => Some(AggregateOp::RegrSyy),
         "REGR_SXY" => Some(AggregateOp::RegrSxy),
+        "XMLAGG" => Some(AggregateOp::XmlAgg),
         _ => None,
     }
 }

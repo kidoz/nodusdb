@@ -609,6 +609,16 @@ pub(crate) fn aggregate_inputs(op: &AggregateOp, inputs: &[(Value, Vec<Value>)])
                 crate::multiranges::intersect_all(kind, &texts, multirange)
             }
         }
+        // `xmlagg(x)`: the values concatenated, their XML declarations
+        // merged in the first one's.
+        AggregateOp::XmlAgg => {
+            let parts: Vec<String> = non_null().map(crate::render).collect();
+            if parts.is_empty() {
+                return Value::Null;
+            }
+            let parts: Vec<&str> = parts.iter().map(String::as_str).collect();
+            Value::Text(crate::xml::concat(&parts))
+        }
         AggregateOp::BitAnd | AggregateOp::BitOr | AggregateOp::BitXor => {
             let mut result: Option<i64> = None;
             for value in non_null() {
