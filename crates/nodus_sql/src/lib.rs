@@ -1385,7 +1385,8 @@ fn rewrite_json_constructors(
 /// Each column becomes `pg_catalog.__jt_col_ordinality__('name')`,
 /// `pg_catalog.__jt_col_exists__('name', 'type', path, on-error)`,
 /// `pg_catalog.__jt_col_scalar__('name', 'type', format, path, wrapper,
-/// quotes, on-empty, on-empty-default, on-error, on-error-default)`.
+/// quotes, on-empty, on-empty-default, on-error, on-error-default)`, or
+/// `pg_catalog.__jt_nested__(path, column...)`.
 fn rewrite_json_table(
     mut tokens: Vec<sqlparser::tokenizer::TokenWithSpan>,
 ) -> Vec<sqlparser::tokenizer::TokenWithSpan> {
@@ -1652,6 +1653,22 @@ fn json_table_columns(
     let significant = |tokens: &[TokenWithSpan], from: usize| {
         (from..tokens.len()).find(|&i| !matches!(tokens[i].token, Token::Whitespace(_)))
     };
+    let matching_paren = |tokens: &[TokenWithSpan], open: usize| {
+        let mut depth = 0i32;
+        for (i, token) in tokens.iter().enumerate().skip(open) {
+            match token.token {
+                Token::LParen => depth += 1,
+                Token::RParen => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    };
     let split = |tokens: &[TokenWithSpan], from: usize, to: usize| {
         let mut items = Vec::new();
         let mut depth = 0i32;
@@ -1698,6 +1715,40 @@ fn json_table_columns(
     let mut parts: Vec<String> = Vec::new();
     for (cf, cto) in split(tokens, from, to) {
         let mut at = significant(tokens, cf).filter(|&i| i < cto)?;
+        // `NESTED [PATH] path [AS name] COLUMNS (...)`.
+        if word(&tokens[at]).as_deref() == Some("nested") {
+            at = significant(tokens, at + 1).filter(|&i| i < cto)?;
+            if word(&tokens[at]).as_deref() == Some("path") {
+                at = significant(tokens, at + 1).filter(|&i| i < cto)?;
+            }
+            let path_from = at;
+            while at < cto {
+                if matches!(word(&tokens[at]).as_deref(), Some("as" | "columns")) {
+                    break;
+                }
+                at += 1;
+            }
+            let path = render_tokens(&tokens[path_from..at]);
+            if path.trim().is_empty() {
+                return None;
+            }
+            let mut at = significant(tokens, at).filter(|&i| i < cto)?;
+            if word(&tokens[at]).as_deref() == Some("as") {
+                at = significant(tokens, at + 1).filter(|&i| i < cto)?;
+                at = significant(tokens, at + 1).unwrap_or(cto);
+            }
+            if word(&tokens[at]).as_deref() != Some("columns") {
+                return None;
+            }
+            let open = significant(tokens, at + 1).filter(|&i| i < cto)?;
+            if tokens[open].token != Token::LParen {
+                return None;
+            }
+            let close = matching_paren(tokens, open).filter(|&i| i < cto)?;
+            let columns = json_table_columns(tokens, open + 1, close)?;
+            parts.push(format!("pg_catalog.__jt_nested__({path}, {columns})"));
+            continue;
+        }
         // `name FOR ORDINALITY`.
         let Token::Word(name) = &tokens[at].token else {
             return None;
@@ -3496,6 +3547,21 @@ mod json_table_rewrite_tests {
         assert!(sql.contains("'default',  0 , '', NULL)"), "{sql}");
         assert!(
             sql.contains("pg_catalog.__jt_col_exists__('e', 'boolean', '$.e', '')"),
+            "{sql}"
+        );
+    }
+
+    #[test]
+    fn json_table_nested_paths_become_their_markers() {
+        let sql = rewritten(
+            "select * from json_table(doc, '$' columns (nested path '$.n[*]' as g \
+             columns (w text)))",
+        );
+        assert!(
+            sql.contains(
+                "pg_catalog.__jt_nested__('$.n[*]' , \
+                 pg_catalog.__jt_col_scalar__('w', 'text', false, false, '$.w',"
+            ),
             "{sql}"
         );
     }

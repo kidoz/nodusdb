@@ -1131,6 +1131,12 @@ fn table_fn_from_factor(
 /// The first column name of a `JSON_TABLE` call that appears more than once.
 fn duplicate_column_name(columns: &[JsonTableColumn], names: &mut Vec<String>) -> Option<String> {
     for column in columns {
+        if let JsonTableColumnKind::Nested { columns, .. } = &column.kind {
+            if let Some(name) = duplicate_column_name(columns, names) {
+                return Some(name);
+            }
+            continue;
+        }
         if names.contains(&column.name) {
             return Some(column.name.clone());
         }
@@ -1149,6 +1155,7 @@ const JSON_TABLE_COLUMN_MARKERS: &[&str] = &[
     "__jt_col_ordinality__",
     "__jt_col_exists__",
     "__jt_col_scalar__",
+    "__jt_nested__",
 ];
 
 /// Plans `JSON_TABLE(...)` from its rewritten call: the context, the row
@@ -1415,7 +1422,18 @@ fn json_table_columns(
                     },
                 }
             }
-            _ => return None,
+            _ => {
+                let [path, rest @ ..] = args.as_slice() else {
+                    return None;
+                };
+                JsonTableColumn {
+                    name: String::new(),
+                    kind: JsonTableColumnKind::Nested {
+                        path: json_table_path(path, params, refuse)?,
+                        columns: json_table_columns(rest, params, refuse)?,
+                    },
+                }
+            }
         };
         columns.push(column);
     }

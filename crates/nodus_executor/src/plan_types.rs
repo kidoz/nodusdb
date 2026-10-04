@@ -204,6 +204,14 @@ pub enum JsonTableColumnKind {
         #[serde(default)]
         on_error_default: Option<ScalarExpr>,
     },
+    /// `NESTED [PATH] path [AS name] COLUMNS (...)`: a nested group, whose
+    /// rows join the parent's.
+    Nested {
+        /// The nested row path.
+        path: ScalarExpr,
+        /// The nested group's columns.
+        columns: Vec<JsonTableColumn>,
+    },
 }
 
 impl TableFnSpec {

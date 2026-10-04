@@ -805,6 +805,11 @@ pub(crate) enum JsonTablePlanColumn {
         on_error: String,
         on_error_default: crate::Value,
     },
+    /// `NESTED [PATH] path COLUMNS (...)`: the group's rows join the parent's.
+    Nested {
+        path: String,
+        columns: Vec<JsonTablePlanColumn>,
+    },
 }
 
 /// `JSON_TABLE(...)`: the context document's row path selects items, and each
@@ -871,26 +876,89 @@ fn column_names(columns: &[JsonTablePlanColumn], names: &mut Vec<String>, types:
                 names.push(name.clone());
                 types.push(column_type.clone());
             }
+            JsonTablePlanColumn::Nested { .. } => {}
+        }
+    }
+    // Then each nested group's columns.
+    for column in columns {
+        if let JsonTablePlanColumn::Nested { columns, .. } = column {
+            column_names(columns, names, types);
         }
     }
 }
-/// The output position of each column of a level.
+
+/// The output position of each column of a level: the plain columns first,
+/// then each nested group's block.
 fn column_offsets(columns: &[JsonTablePlanColumn]) -> Vec<usize> {
-    (0..columns.len()).collect()
+    let plain = columns
+        .iter()
+        .filter(|c| !matches!(c, JsonTablePlanColumn::Nested { .. }))
+        .count();
+    let mut offsets = Vec::with_capacity(columns.len());
+    let mut next_plain = 0;
+    let mut next_nested = plain;
+    for column in columns {
+        if matches!(column, JsonTablePlanColumn::Nested { .. }) {
+            offsets.push(next_nested);
+            next_nested += column_width(column);
+        } else {
+            offsets.push(next_plain);
+            next_plain += 1;
+        }
+    }
+    offsets
 }
 
-/// The rows the columns produce for one row-path item.
+/// The rows the columns produce for one row-path item, in the flattened
+/// column order.
 fn table_item_rows(
     columns: &[JsonTablePlanColumn],
     item: &J,
     ordinal: usize,
     vars: Option<&J>,
 ) -> Result<Vec<Vec<crate::Value>>, String> {
-    let mut row = Vec::with_capacity(columns.len());
-    for column in columns {
-        row.push(column_value(column, item, ordinal, vars)?);
+    // The values of the plain columns, in their places; a nested group's
+    // columns are filled per union row below.
+    let width = columns.iter().map(column_width).sum();
+    let offsets = column_offsets(columns);
+    let mut template = vec![crate::Value::Null; width];
+    for (index, column) in columns.iter().enumerate() {
+        if !matches!(column, JsonTablePlanColumn::Nested { .. }) {
+            template[offsets[index]] = column_value(column, item, ordinal, vars)?;
+        }
     }
-    Ok(vec![row])
+    // The nested groups are siblings: their rows join the parent row with
+    // UNION.
+    let mut rows: Vec<Vec<crate::Value>> = Vec::new();
+    for (index, column) in columns.iter().enumerate() {
+        let JsonTablePlanColumn::Nested { path, columns: sub } = column else {
+            continue;
+        };
+        let at = offsets[index];
+        // A nested path that finds nothing (or fails) leaves the group's
+        // columns NULL.
+        let items = crate::jsonpath::execute(path, item, vars, false).unwrap_or_default();
+        for (position, nested) in items.iter().enumerate() {
+            for sub_row in table_item_rows(sub, nested, position + 1, vars)? {
+                let mut row = template.clone();
+                row[at..at + sub_row.len()].clone_from_slice(&sub_row);
+                rows.push(row);
+            }
+        }
+    }
+    if rows.is_empty() {
+        // No nested group produced a row: one row with all of them NULL.
+        rows.push(template);
+    }
+    Ok(rows)
+}
+
+/// How many output columns a column tree contributes.
+fn column_width(column: &JsonTablePlanColumn) -> usize {
+    match column {
+        JsonTablePlanColumn::Nested { columns, .. } => columns.iter().map(column_width).sum(),
+        _ => 1,
+    }
 }
 
 /// The value one column takes for a row item.
@@ -902,6 +970,7 @@ fn column_value(
 ) -> Result<crate::Value, String> {
     match column {
         JsonTablePlanColumn::Ordinality { .. } => Ok(crate::Value::Int(ordinal as i64)),
+        JsonTablePlanColumn::Nested { .. } => Ok(crate::Value::Null),
         JsonTablePlanColumn::Exists {
             column_type,
             path,
@@ -1559,6 +1628,77 @@ mod tests {
         );
         assert_eq!(rows(&plan, "{\"a\":1}").1, vec![vec![Value::Bool(true)]]);
         assert_eq!(rows(&plan, "{\"b\":1}").1, vec![vec![Value::Bool(false)]]);
+    }
+
+    #[test]
+    fn json_table_nested_groups_match_postgresql() {
+        use crate::Value;
+        let scalar = |name: &str, ty: &str, path: &str| JsonTablePlanColumn::Scalar {
+            name: name.to_string(),
+            column_type: ty.to_string(),
+            format: false,
+            path: path.to_string(),
+            wrapper: String::new(),
+            quotes: String::new(),
+            on_empty: String::new(),
+            on_empty_default: Value::Null,
+            on_error: String::new(),
+            on_error_default: Value::Null,
+        };
+        let table = |path: &str, columns: Vec<JsonTablePlanColumn>| JsonTablePlan {
+            path: path.to_string(),
+            on_error: String::new(),
+            columns,
+        };
+        let doc = |text: &str| Value::Text(text.to_string());
+        let rows = |table: &JsonTablePlan, text: &str| {
+            let (names, _) = json_table_names(&table.columns);
+            let rows = json_table_rows(&doc(text), None, table).expect("rows");
+            (names, rows)
+        };
+        // Nested groups are siblings: their rows join the parent with UNION,
+        // and one that finds nothing leaves its columns NULL.
+        let plan = table(
+            "$",
+            vec![
+                scalar("a", "int", "$.\"a\"[0]"),
+                JsonTablePlanColumn::Nested {
+                    path: "$.\"x\"[*]".to_string(),
+                    columns: vec![
+                        JsonTablePlanColumn::Ordinality {
+                            name: "ord".to_string(),
+                        },
+                        scalar("v", "int", "$"),
+                    ],
+                },
+                JsonTablePlanColumn::Nested {
+                    path: "$.\"q\"[*]".to_string(),
+                    columns: vec![scalar("q", "int", "$")],
+                },
+            ],
+        );
+        // The plain column comes first, then the nested groups' columns; the
+        // group that finds nothing takes NULLs.
+        assert_eq!(
+            rows(&plan, "{\"a\":[1],\"x\":[7,8]}"),
+            (
+                vec![
+                    "a".to_string(),
+                    "ord".to_string(),
+                    "v".to_string(),
+                    "q".to_string()
+                ],
+                vec![
+                    vec![Value::Int(1), Value::Int(1), Value::Int(7), Value::Null],
+                    vec![Value::Int(1), Value::Int(2), Value::Int(8), Value::Null],
+                ]
+            )
+        );
+        // With no nested group matching, one row of NULLs stands for them.
+        assert_eq!(
+            rows(&plan, "{\"a\":[1]}").1,
+            vec![vec![Value::Int(1), Value::Null, Value::Null, Value::Null]]
+        );
     }
 
     #[test]

@@ -684,6 +684,12 @@ fn json_table_type_error(columns: &[JsonTableColumn]) -> Option<String> {
         let ty = match &column.kind {
             JsonTableColumnKind::Scalar { column_type, .. }
             | JsonTableColumnKind::Exists { column_type, .. } => column_type,
+            JsonTableColumnKind::Nested { columns, .. } => {
+                if let Some(ty) = json_table_type_error(columns) {
+                    return Some(ty);
+                }
+                continue;
+            }
             JsonTableColumnKind::Ordinality => continue,
         };
         if !crate::user_types::is_known_type(ty) {
@@ -740,6 +746,10 @@ fn table_column(
             on_empty_default: default(on_empty_default, on_empty),
             on_error: on_error.clone(),
             on_error_default: default(on_error_default, on_error),
+        },
+        Kind::Nested { path, columns } => JsonTablePlanColumn::Nested {
+            path: text(path),
+            columns: columns.iter().map(|c| table_column(c, eval)).collect(),
         },
     }
 }
