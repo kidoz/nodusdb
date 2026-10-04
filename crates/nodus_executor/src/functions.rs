@@ -16,6 +16,9 @@ const NON_STRICT: &[&str] = &[
     // `ts_headline` is strict, but its planner-assigned shape carries a
     // NULL config slot when the call has none; the arm sorts it out.
     crate::result_types::TS_HEADLINE,
+    // `xmlconcat` is not strict: it drops NULL arguments, and is NULL only
+    // when every argument is.
+    "XMLCONCAT",
     // Range constructors read a NULL bound as unbounded; a multirange
     // constructor refuses a NULL among its members.
     "__MULTIRANGE_BUILD__",
@@ -109,7 +112,12 @@ pub(crate) fn is_known(name: &str) -> bool {
                 | "PG_TS_CONFIG_IS_VISIBLE" | "PG_TS_DICT_IS_VISIBLE"
                 | "PG_TS_PARSER_IS_VISIBLE" | "PG_TS_TEMPLATE_IS_VISIBLE"
                 // XML.
-                | crate::result_types::XML_ERROR
+                | "XML_IS_WELL_FORMED" | "XML_IS_WELL_FORMED_DOCUMENT"
+                | "XML_IS_WELL_FORMED_CONTENT" | "XMLCOMMENT" | "XMLTEXT" | "XMLCONCAT"
+                | crate::result_types::XML_PARSE | crate::result_types::XML_SERIALIZE
+                | crate::result_types::XML_IS_DOCUMENT | crate::result_types::XML_ERROR
+                | crate::result_types::XML_OUT
+                | crate::result_types::XML_SERIALIZE_TYPE
                 // Dates and times.
                 | "NOW" | "CURRENT_TIMESTAMP" | "TRANSACTION_TIMESTAMP"
                 | "STATEMENT_TIMESTAMP" | "CLOCK_TIMESTAMP" | "CURRENT_DATE" | "CURRENT_TIME"
@@ -387,6 +395,12 @@ pub(crate) fn return_type(name: &str, arg_types: &[Option<String>]) -> Option<St
             "TS_LEXIZE" => "TEXT[]",
             "TS_REWRITE" => "TSQUERY",
             "GET_CURRENT_TS_CONFIG" => "REGCONFIG",
+            "XML_IS_WELL_FORMED" | "XML_IS_WELL_FORMED_DOCUMENT" | "XML_IS_WELL_FORMED_CONTENT" => {
+                "BOOLEAN"
+            }
+            "XMLCOMMENT" | "XMLTEXT" | "XMLCONCAT" | crate::result_types::XML_PARSE => "XML",
+            crate::result_types::XML_SERIALIZE | crate::result_types::XML_OUT => "TEXT",
+            crate::result_types::XML_SERIALIZE_TYPE => "TEXT",
             "PG_TS_CONFIG_IS_VISIBLE"
             | "PG_TS_DICT_IS_VISIBLE"
             | "PG_TS_PARSER_IS_VISIBLE"
@@ -2390,6 +2404,88 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
                 Ok(headline) => Value::Text(headline),
                 Err(error) => raise(error),
             }
+        }
+        // The XML well-formedness checks: over a document, or (the general
+        // form, and `_content`) over content that a DOCTYPE makes a document.
+        "XML_IS_WELL_FORMED" | "XML_IS_WELL_FORMED_DOCUMENT" | "XML_IS_WELL_FORMED_CONTENT"
+            if arity(1) =>
+        {
+            let mode = if name == "XML_IS_WELL_FORMED_DOCUMENT" {
+                crate::xml::Mode::Document
+            } else {
+                crate::xml::Mode::Content
+            };
+            Value::Bool(crate::xml::is_well_formed(&text(&args[0]), mode))
+        }
+        // `xmlcomment(text)`: the text as a comment.
+        "XMLCOMMENT" if arity(1) => match crate::xml::comment(&text(&args[0])) {
+            Ok(value) => Value::Text(value),
+            Err(error) => raise(crate::xml::error_text(error)),
+        },
+        // `xmltext(text)`: the text with XML's special characters escaped.
+        "XMLTEXT" if arity(1) => Value::Text(crate::xml::escape_special(&text(&args[0]))),
+        // An XML value's output form, where text is built from it.
+        crate::result_types::XML_OUT if arity(1) => {
+            Value::Text(crate::xml::output(&text(&args[0])))
+        }
+        // The serialized text fitted to the target type, as the implicit cast
+        // XMLSERIALIZE applies does: too long a value is refused.
+        crate::result_types::XML_SERIALIZE_TYPE if arity(2) => {
+            let target = text(&args[1]);
+            match crate::value::fit_character(&text(&args[0]), &target, false) {
+                Ok(value) => Value::Text(value),
+                Err(message) => raise(
+                    crate::error_fields::DbError::new(message).code("22001").into_text(),
+                ),
+            }
+        }
+        // `xmlconcat(...)`: the XML declarations merged into one, the rest
+        // concatenated; NULL arguments are dropped, and all of them leave NULL.
+        "XMLCONCAT" => {
+            let parts: Vec<String> = args
+                .iter()
+                .filter_map(|a| match a {
+                    Value::Null => None,
+                    value => Some(text(value)),
+                })
+                .collect();
+            if parts.is_empty() {
+                return Some(Value::Null);
+            }
+            let parts: Vec<&str> = parts.iter().map(String::as_str).collect();
+            Value::Text(crate::xml::concat(&parts))
+        }
+        // `xmlparse(document|content <value>)`, as the parser rewrites it: the
+        // value is checked and kept as it is.
+        crate::result_types::XML_PARSE if arity(2) => {
+            let mode = if matches!(args[1], Value::Bool(true)) {
+                crate::xml::Mode::Document
+            } else {
+                crate::xml::Mode::Content
+            };
+            let value = text(&args[0]);
+            match crate::xml::validate_text(&value, mode) {
+                Ok(()) => Value::Text(value),
+                Err(error) => raise(error),
+            }
+        }
+        // `xmlserialize(content|document <value> AS text [INDENT])`, as the
+        // parser rewrites it; the cast to the target type follows.
+        crate::result_types::XML_SERIALIZE if arity(3) => {
+            let mode = if matches!(args[1], Value::Bool(true)) {
+                crate::xml::Mode::Document
+            } else {
+                crate::xml::Mode::Content
+            };
+            let indent = matches!(args[2], Value::Bool(true));
+            match crate::xml::serialize(&text(&args[0]), mode, indent) {
+                Ok(value) => Value::Text(value),
+                Err(error) => raise(crate::xml::error_text(error)),
+            }
+        }
+        // `IS DOCUMENT`.
+        crate::result_types::XML_IS_DOCUMENT if arity(1) => {
+            Value::Bool(crate::xml::is_document(&text(&args[0])))
         }
         // The XML type errors the planner reports before execution.
         crate::result_types::XML_ERROR if arity(2) => raise(

@@ -1362,6 +1362,147 @@ pub(crate) fn check_integer_ranges(
                 args,
             };
         }
+        // XML: the well-formedness checks and construction functions, and the
+        // shapes `xmlparse`, `xmlserialize`, and `IS DOCUMENT` are rewritten
+        // to. A text argument is taken only where a character type is
+        // implicit (an `xml` argument is not); an `xml` argument accepts an
+        // untyped literal, which the cast checks as content, or an `xml`
+        // value — anything else is 42804, as PostgreSQL refuses it.
+        ScalarExpr::Function { name, args } if is_xml_function(name) => {
+            let untyped = |e: &ScalarExpr| matches!(e, ScalarExpr::Literal(Value::Text(_)));
+            let type_of = |e: &ScalarExpr| scalar_type(e, column);
+            let is_text_arg = |e: &ScalarExpr| {
+                untyped(e) || type_of(e).is_none_or(|t| t.trim().is_empty() || is_text_type(&t))
+            };
+            let is_xml_arg = |e: &ScalarExpr| {
+                untyped(e) || type_of(e).is_some_and(|t| crate::xml::is_type(&t))
+            };
+            let as_xml = |e: &ScalarExpr| ScalarExpr::Cast {
+                expr: Box::new(e.clone()),
+                target: "xml".to_string(),
+            };
+            let bad_xml_argument = |e: &ScalarExpr, construct: &str| {
+                xml_error(
+                    format!(
+                        "argument of {construct} must be type xml, not type {}",
+                        argument_type_name(e, column)
+                    ),
+                    "42804",
+                )
+            };
+            match name.as_str() {
+                // The checks, and `xmlcomment`/`xmltext`, take text.
+                "XML_IS_WELL_FORMED" | "XML_IS_WELL_FORMED_DOCUMENT"
+                | "XML_IS_WELL_FORMED_CONTENT" | "XMLCOMMENT" | "XMLTEXT" => {
+                    if args.len() != 1 || !is_text_arg(&args[0]) {
+                        let types: Vec<String> = args
+                            .iter()
+                            .map(|arg| argument_type_name(arg, column))
+                            .collect();
+                        return bad_function_args(&name.to_ascii_lowercase(), &types);
+                    }
+                    return checked.clone();
+                }
+                // `xmlconcat(...)`: every argument is an XML value.
+                "XMLCONCAT" => {
+                    if args.is_empty() {
+                        // Its grammar takes at least one argument.
+                        return xml_error("syntax error at or near \")\"".to_string(), "42601");
+                    }
+                    for arg in args {
+                        if !is_xml_arg(arg) {
+                            return bad_xml_argument(arg, "XMLCONCAT");
+                        }
+                    }
+                    let args: Vec<ScalarExpr> = args
+                        .iter()
+                        .map(|arg| {
+                            if is_xml_arg(arg) && !untyped(arg) {
+                                arg.clone()
+                            } else {
+                                as_xml(arg)
+                            }
+                        })
+                        .collect();
+                    return ScalarExpr::Function {
+                        name: name.clone(),
+                        args,
+                    };
+                }
+                // `xmlparse(document|content <value>)`: the value is checked
+                // and kept; its argument is assignable to text.
+                XML_PARSE => return checked.clone(),
+                // `xmlserialize(content|document <value> AS <type> [INDENT])`:
+                // the value must be xml, the target is what text casts to
+                // implicitly, and the serialized text is cast to it.
+                XML_SERIALIZE => {
+                    let [value, mode, indent, target] = args.as_slice() else {
+                        return checked.clone();
+                    };
+                    if !is_xml_arg(value) {
+                        return bad_xml_argument(value, "XMLSERIALIZE");
+                    }
+                    let ScalarExpr::Literal(Value::Text(target_type)) = target else {
+                        return checked.clone();
+                    };
+                    if !is_text_type(target_type) {
+                        return xml_error(
+                            format!(
+                                "cannot cast XMLSERIALIZE result to {}",
+                                crate::functions::format_type_name(
+                                    crate::MemExecutor::pg_type_oid(target_type)
+                                )
+                            ),
+                            "42846",
+                        );
+                    }
+                    let inner = ScalarExpr::Function {
+                        name: name.clone(),
+                        args: vec![
+                            if untyped(value) { as_xml(value) } else { value.clone() },
+                            mode.clone(),
+                            indent.clone(),
+                        ],
+                    };
+                    // The result is fitted to the target type the way an
+                    // implicit cast fits it, then cast (a no-op for a
+                    // character type).
+                    let fitted = ScalarExpr::Function {
+                        name: XML_SERIALIZE_TYPE.to_string(),
+                        args: vec![
+                            inner,
+                            ScalarExpr::Literal(Value::Text(target_type.clone())),
+                        ],
+                    };
+                    return ScalarExpr::Cast {
+                        expr: Box::new(fitted),
+                        target: target_type.clone(),
+                    };
+                }
+                // `IS DOCUMENT`: an XML value.
+                XML_IS_DOCUMENT => {
+                    if args.len() != 1 || !is_xml_arg(&args[0]) {
+                        let types: Vec<String> = args
+                            .iter()
+                            .map(|arg| argument_type_name(arg, column))
+                            .collect();
+                        return xml_error(
+                            format!(
+                                "argument of IS DOCUMENT must be type xml, not type {}",
+                                types.first().cloned().unwrap_or_default()
+                            ),
+                            "42804",
+                        );
+                    }
+                    return ScalarExpr::Function {
+                        name: name.clone(),
+                        args: vec![as_xml(&args[0])],
+                    };
+                }
+                // The planner-built error call raises at evaluation time.
+                _ => return checked.clone(),
+            }
+        }
         // A custom operator (`@>`, `&&`, `<@`, ...) once its subtype is
         // known; `<@` reads as `@>` with its operands swapped, and with no
         // range operand the operator keeps its former meaning (`jsonb @>`).
@@ -2367,14 +2508,26 @@ pub(crate) fn check_integer_ranges(
                 right: Box::new(text_form(right)),
             };
         }
-        // Text-building functions take a zoned timestamp's text.
+        // Text-building functions take a zoned timestamp's text, and an XML
+        // value's output form (which the `||` operator does not: it is
+        // binary-compatible with text).
         ScalarExpr::Function { name, args }
             if matches!(name.as_str(), "CONCAT" | "CONCAT_WS" | "FORMAT")
-                && args.iter().any(textual) =>
+                && args.iter().any(|a| textual(a) || is_xml_type(a, column)) =>
         {
+            let form = |a: &ScalarExpr| {
+                if is_xml_type(a, column) {
+                    ScalarExpr::Function {
+                        name: XML_OUT.to_string(),
+                        args: vec![a.clone()],
+                    }
+                } else {
+                    text_form(a)
+                }
+            };
             return ScalarExpr::Function {
                 name: name.clone(),
-                args: args.iter().map(text_form).collect(),
+                args: args.iter().map(form).collect(),
             };
         }
         // A timestamp is JSON in ISO 8601 form (`2024-07-01T12:00:00`).
@@ -2721,10 +2874,49 @@ pub(crate) const TS_HEADLINE: &str = "__TS_HEADLINE__";
 /// `__FUNC_NOT_UNIQUE__(name, argument type...)`.
 pub(crate) const FUNC_NOT_UNIQUE: &str = "__FUNC_NOT_UNIQUE__";
 
+/// `xmlparse(document|content <value>)` rewritten to
+/// `__XMLPARSE__(value, document)`.
+pub(crate) const XML_PARSE: &str = "__XMLPARSE__";
+
+/// `xmlserialize(content|document <value> AS <type> [INDENT])` rewritten to
+/// `__XMLSERIALIZE__(value, document, indent, type)`, whose result is the
+/// serialized text cast to the target type.
+pub(crate) const XML_SERIALIZE: &str = "__XMLSERIALIZE__";
+
+/// `xml IS [NOT] DOCUMENT` rewritten to `__XML_IS_DOCUMENT__(value)`.
+pub(crate) const XML_IS_DOCUMENT: &str = "__XML_IS_DOCUMENT__";
+
 /// An XML call the planner reports before execution:
 /// `__XML_ERROR__(message, sqlstate)`.
 pub(crate) const XML_ERROR: &str = "__XML_ERROR__";
 
+/// An XML value's output form where text is built from it (the type's output
+/// function, as PostgreSQL's `concat`/`format` use): `__XML_OUT__(value)`.
+pub(crate) const XML_OUT: &str = "__XML_OUT__";
+
+/// `XMLSERIALIZE`'s serialized text fitted to the target type as an implicit
+/// cast fits it (which raises "value too long" rather than truncating):
+/// `__XML_SERIALIZE_TYPE__(text, target)`.
+pub(crate) const XML_SERIALIZE_TYPE: &str = "__XML_SERIALIZE_TYPE__";
+
+/// Whether a call is one of the XML functions or rewritten shapes.
+fn is_xml_function(name: &str) -> bool {
+    matches!(
+        name,
+        "XML_IS_WELL_FORMED"
+            | "XML_IS_WELL_FORMED_DOCUMENT"
+            | "XML_IS_WELL_FORMED_CONTENT"
+            | "XMLCOMMENT"
+            | "XMLTEXT"
+            | "XMLCONCAT"
+            | XML_PARSE
+            | XML_SERIALIZE
+            | XML_IS_DOCUMENT
+            | XML_ERROR
+            | XML_OUT
+            | XML_SERIALIZE_TYPE
+    )
+}
 /// The call an XML type error is reported as at evaluation time.
 pub(crate) fn xml_error(message: String, code: &str) -> ScalarExpr {
     ScalarExpr::Function {

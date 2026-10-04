@@ -1451,6 +1451,16 @@ fn figure_colname(expr: &sqlparser::ast::Expr) -> Option<String> {
             let ObjectNamePart::Identifier(ident) = function.name.0.last()? else {
                 return None;
             };
+            // The markers the XML syntax is rewritten to keep the name of the
+            // construct they stand for.
+            if ident.quote_style.is_none() {
+                match ident.value.to_ascii_lowercase().as_str() {
+                    "__xmlparse__" => return Some("xmlparse".to_string()),
+                    "__xmlserialize__" => return Some("xmlserialize".to_string()),
+                    "__xml_is_document__" => return None,
+                    _ => {}
+                }
+            }
             if ident.quote_style.is_some() {
                 ident.value.clone()
             } else {

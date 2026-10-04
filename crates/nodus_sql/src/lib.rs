@@ -48,7 +48,7 @@ pub fn parse_sql(
         }
     }
     let tokens = reorder_identity_options(reorder_sequence_options(rewrite_data_clauses(
-        rewrite_record_star(rewrite_query_syntax(tokens)),
+        rewrite_record_star(rewrite_xml_syntax(rewrite_query_syntax(tokens))),
     )));
     Parser::new(&dialect)
         .with_tokens_with_locations(tokens)
@@ -70,6 +70,277 @@ pub const SYMMETRIC_MARKER: &str = "__SYMMETRIC__";
 /// parser lacks: `INSERT INTO t AS __overriding_system__ ...`.
 pub const OVERRIDING_SYSTEM: &str = "__overriding_system__";
 pub const OVERRIDING_USER: &str = "__overriding_user__";
+
+/// The function `xmlparse(document|content <value>)` is written as
+/// (upper-cased as planned): `pg_catalog.__xmlparse__(value, document)`,
+/// which the parser cannot read as the SQL/XML construct it is.
+pub const XML_PARSE_MARKER: &str = "__xmlparse__";
+
+/// The function `xmlserialize(content|document <value> AS <type> [INDENT])`
+/// is written as: `pg_catalog.__xmlserialize__(value, document, indent,
+/// '<type>')`.
+pub const XML_SERIALIZE_MARKER: &str = "__xmlserialize__";
+
+/// The function `xml IS [NOT] DOCUMENT` is written as:
+/// `pg_catalog.__xml_is_document__(value)`.
+pub const XML_IS_DOCUMENT_MARKER: &str = "__xml_is_document__";
+
+/// The XML syntax the parser lacks: `xmlparse`, `xmlserialize`, and
+/// `IS [NOT] DOCUMENT`, each rewritten to the marker function the planner
+/// knows ([`XML_PARSE_MARKER`], [`XML_SERIALIZE_MARKER`],
+/// [`XML_IS_DOCUMENT_MARKER`]).
+fn rewrite_xml_syntax(
+    mut tokens: Vec<sqlparser::tokenizer::TokenWithSpan>,
+) -> Vec<sqlparser::tokenizer::TokenWithSpan> {
+    use sqlparser::tokenizer::{Token, TokenWithSpan};
+    let word = |t: &TokenWithSpan| match &t.token {
+        Token::Word(w) if w.quote_style.is_none() => Some(w.value.clone()),
+        _ => None,
+    };
+    let significant = |tokens: &[TokenWithSpan], from: usize| {
+        (from..tokens.len()).find(|&i| !matches!(tokens[i].token, Token::Whitespace(_)))
+    };
+    let significant_back = |tokens: &[TokenWithSpan], from: usize| {
+        (0..from)
+            .rev()
+            .find(|&i| !matches!(tokens[i].token, Token::Whitespace(_)))
+    };
+    // The `)` that closes the `(` at `open`.
+    let matching_paren = |tokens: &[TokenWithSpan], open: usize| {
+        let mut depth = 0i32;
+        for (i, token) in tokens.iter().enumerate().skip(open) {
+            match token.token {
+                Token::LParen => depth += 1,
+                Token::RParen => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    };
+    let kind_at = |tokens: &[TokenWithSpan], open: usize| match significant(tokens, open + 1) {
+        Some(at) => match word(&tokens[at]).as_deref() {
+            Some(kind @ ("document" | "content")) => Some((at, kind == "document")),
+            _ => None,
+        },
+        None => None,
+    };
+    // `xmlparse(document|content <value>)`.
+    let mut i = 0;
+    while i < tokens.len() {
+        if word(&tokens[i]).as_deref() == Some("xmlparse")
+            && let Some(open) = significant(&tokens, i + 1)
+            && tokens[open].token == Token::LParen
+            && let Some((at, document)) = kind_at(&tokens, open)
+            && let Some(close) = matching_paren(&tokens, open)
+        {
+            let value = render_tokens(&tokens[at + 1..close]);
+            let replacement = format!("pg_catalog.{XML_PARSE_MARKER}({value}, {document})",);
+            if let Some(snippet) = snippet_tokens(&replacement) {
+                let len = snippet.len();
+                tokens.splice(i..=close, snippet);
+                i += len;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    // `xmlserialize(content|document <value> AS <type> [INDENT])`.
+    let mut i = 0;
+    while i < tokens.len() {
+        if word(&tokens[i]).as_deref() == Some("xmlserialize")
+            && let Some(open) = significant(&tokens, i + 1)
+            && tokens[open].token == Token::LParen
+            && let Some((at, document)) = kind_at(&tokens, open)
+            && let Some(close) = matching_paren(&tokens, open)
+        {
+            // The last `AS` at the top level separates the value from the type.
+            let mut depth = 0i32;
+            let mut as_at = None;
+            for (j, token) in tokens.iter().enumerate().take(close).skip(at + 1) {
+                match token.token {
+                    Token::LParen => depth += 1,
+                    Token::RParen => depth -= 1,
+                    _ => {}
+                }
+                if depth == 0 && word(token).as_deref() == Some("as") {
+                    as_at = Some(j);
+                }
+            }
+            if let Some(as_at) = as_at {
+                // A trailing `INDENT` asks for the formatted form.
+                let mut type_end = close;
+                let mut indent = false;
+                if let Some(last) = significant_back(&tokens, close)
+                    && word(&tokens[last]).as_deref() == Some("indent")
+                {
+                    indent = true;
+                    type_end = last;
+                }
+                let value = render_tokens(&tokens[at + 1..as_at]);
+                let target = render_tokens(&tokens[as_at + 1..type_end]);
+                let target = target.trim();
+                if !target.is_empty() {
+                    let replacement = format!(
+                        "pg_catalog.{XML_SERIALIZE_MARKER}({value}, {document}, {indent}, \
+                         '{target}')"
+                    );
+                    if let Some(snippet) = snippet_tokens(&replacement) {
+                        let len = snippet.len();
+                        tokens.splice(i..=close, snippet);
+                        i += len;
+                        continue;
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    // `xml IS [NOT] DOCUMENT`.
+    let mut i = 0;
+    while i < tokens.len() {
+        if word(&tokens[i]).as_deref() == Some("is") {
+            let mut negated = false;
+            let mut at = i;
+            if let Some(not_at) = significant(&tokens, i + 1)
+                && word(&tokens[not_at]).as_deref() == Some("not")
+            {
+                negated = true;
+                at = not_at;
+            }
+            let document_at = significant(&tokens, at + 1)
+                .filter(|&k| word(&tokens[k]).as_deref() == Some("document"));
+            if let Some(document_at) = document_at
+                && let Some(start) = operand_start(&tokens, i)
+            {
+                let value = render_tokens(&tokens[start..i]);
+                let replacement = format!(
+                    "{}pg_catalog.{XML_IS_DOCUMENT_MARKER}({value})",
+                    if negated { "not " } else { "" }
+                );
+                if let Some(snippet) = snippet_tokens(&replacement) {
+                    let len = snippet.len();
+                    tokens.splice(start..=document_at, snippet);
+                    i = start + len;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    tokens
+}
+
+/// The first token of the expression ending just before `before`: a value
+/// with its `::type` casts, dotted names, and parenthesized or called parts.
+/// `None` when the expression is not one of those shapes, which leaves the
+/// construct to the parser's own error.
+fn operand_start(tokens: &[sqlparser::tokenizer::TokenWithSpan], before: usize) -> Option<usize> {
+    use sqlparser::tokenizer::Token;
+    let significant_back = |from: usize| {
+        (0..from)
+            .rev()
+            .find(|&i| !matches!(tokens[i].token, Token::Whitespace(_)))
+    };
+    let word = |t: &sqlparser::tokenizer::TokenWithSpan| match &t.token {
+        Token::Word(w) if w.quote_style.is_none() => Some(w.value.clone()),
+        _ => None,
+    };
+    let mut pos = significant_back(before)?;
+    loop {
+        // One unit: a value, a parenthesized expression, or a call.
+        match &tokens[pos].token {
+            Token::RParen => {
+                // The `(` that closes it.
+                let mut depth = 0i32;
+                loop {
+                    match tokens[pos].token {
+                        Token::RParen => depth += 1,
+                        Token::LParen => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    if pos == 0 {
+                        return None;
+                    }
+                    pos -= 1;
+                }
+            }
+            Token::Word(_)
+            | Token::SingleQuotedString(_)
+            | Token::DoubleQuotedString(_)
+            | Token::Number(_, _)
+            | Token::Placeholder(_)
+            | Token::EscapedStringLiteral(_) => {}
+            _ => return None,
+        }
+        // A function name or a dotted name may precede a `(`.
+        if tokens[pos].token == Token::LParen
+            && let Some(name) = significant_back(pos)
+            && matches!(tokens[name].token, Token::Word(_))
+        {
+            pos = name;
+        }
+        // A dotted name.
+        while let Some(dot) = significant_back(pos)
+            && tokens[dot].token == Token::Period
+        {
+            let Some(name) = significant_back(dot) else {
+                return Some(pos);
+            };
+            match &tokens[name].token {
+                Token::Word(_) => pos = name,
+                _ => return Some(pos),
+            }
+        }
+        // `value::type`: the unit just consumed was the type name, so the
+        // value precedes it — and may itself be cast or dotted.
+        let Some(colons) = significant_back(pos) else {
+            return Some(pos);
+        };
+        if tokens[colons].token != Token::DoubleColon {
+            return Some(pos);
+        }
+        // The type: a name, optionally with a modifier or dotted parts.
+        let mut ty = significant_back(colons)?;
+        if tokens[ty].token == Token::RParen {
+            let mut depth = 0i32;
+            loop {
+                match tokens[ty].token {
+                    Token::RParen => depth += 1,
+                    Token::LParen => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                ty = significant_back(ty)?;
+            }
+            ty = significant_back(ty)?;
+        }
+        // `character varying` and `double precision` are two words.
+        if let Some(prev) = significant_back(ty)
+            && let (Some(second), Some(first)) = (word(&tokens[ty]), word(&tokens[prev]))
+            && matches!(
+                (first.as_str(), second.as_str()),
+                ("character" | "bit", "varying") | ("double", "precision")
+            )
+        {
+            ty = prev;
+        }
+        pos = ty;
+    }
+}
 
 /// `(value).*`, a record expanded into its fields
 /// ([`EXPAND_RECORD_FUNCTION`]).
