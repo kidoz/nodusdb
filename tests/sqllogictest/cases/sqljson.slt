@@ -1,0 +1,603 @@
+query T
+select json_exists('{"a":1}', '$.a');;
+----
+t
+
+query T
+select json_exists('{"a":1}', '$.b');;
+----
+f
+
+query T
+select json_exists('{"a":1}', '$.b' error on error);;
+----
+f
+
+statement error
+select json_exists('{"a":1}', 'strict $.b' error on error);;
+
+query T
+select json_exists('{"a":1}', 'strict $.b' false on error);;
+----
+f
+
+query T
+select json_exists('{"a":1}', 'strict $.b' unknown on error);;
+----
+NULL
+
+query T
+select json_exists(jsonb '{"a":[1,2]}', '$.a[*] ? (@ > 1)');;
+----
+t
+
+query T
+select json_exists('{"a":1}', '$.a' passing 1 as x);;
+----
+t
+
+query T
+select json_exists('{"a":1}', '$.a' passing '{"b":2}'::jsonb as x);;
+----
+t
+
+statement error
+select json_exists('{a}', '$.a');;
+
+statement error
+select json_exists('{"a":1}', 'not a path');;
+
+query T
+select json_exists('{"a":1}', '$.a' true on error);;
+----
+t
+
+query T
+select json_value('{"a":"x"}', '$.a');;
+----
+x
+
+query T
+select json_value('{"a":1}', '$.a');;
+----
+1
+
+query T
+select json_value('{"a":1}', '$.a' returning int);;
+----
+1
+
+query T
+select json_value('{"a":1.5}', '$.a' returning numeric);;
+----
+1.5
+
+query T
+select json_value('{"a":1}', '$.a' returning text);;
+----
+1
+
+query T
+select json_value('{"a":[1]}', '$.a');;
+----
+NULL
+
+query T
+select json_value('{"a":[1]}', '$.a' returning jsonb);;
+----
+NULL
+
+query T
+select json_value('{"a":1}', '$.a' returning boolean);;
+----
+t
+
+query T
+select json_value('{"a":"x"}', '$.a' returning int);;
+----
+NULL
+
+query T
+select json_value('{"a":"1"}', '$.a' returning int);;
+----
+1
+
+query T
+select json_value('{"b":1}', '$.a');;
+----
+NULL
+
+query T
+select json_value('{"b":1}', '$.a' default 42 on empty);;
+----
+42
+
+query T
+select json_value('{"b":1}', '$.a' null on empty);;
+----
+NULL
+
+statement error
+select json_value('{"b":1}', '$.a' error on empty);;
+
+query T
+select json_value('{"b":1}', '$.a' returning int default -1 on empty);;
+----
+-1
+
+query T
+select json_value('{"a":"x"}', '$.a' returning int null on error);;
+----
+NULL
+
+query T
+select json_value('{"a":"x"}', '$.a' returning int default 0 on error);;
+----
+0
+
+statement error
+select json_value('{"a":"x"}', '$.a' returning int error on error);;
+
+query T
+select json_value('{"a":true}', '$.a' returning boolean);;
+----
+t
+
+query T
+select json_query('{"a":1}', '$.a');;
+----
+1
+
+query T
+select json_query('{"a":[1,2]}', '$.a');;
+----
+[1, 2]
+
+query T
+select json_query('{"a":[1,2]}', '$.a' returning json);;
+----
+[1, 2]
+
+query T
+select json_query('{"a":[1,2]}', '$.a' returning jsonb with wrapper);;
+----
+[[1, 2]]
+
+query T
+select json_query('{"a":[1,2]}', '$.a[*]' with wrapper);;
+----
+[1, 2]
+
+query T
+select json_query('{"a":[1,2]}', '$.a[*]' without wrapper);;
+----
+NULL
+
+query T
+select json_query('{"a":[1,2]}', '$.a[*]' with conditional wrapper);;
+----
+[1, 2]
+
+query T
+select json_query('{"a":"x"}', '$.a');;
+----
+"x"
+
+query T
+select json_query('{"a":"x"}', '$.a' returning text);;
+----
+"x"
+
+query T
+select json_query('{"a":"x"}', '$.a' returning text omit quotes);;
+----
+x
+
+query T
+select json_query('{"a":"a\"b"}', '$.a' returning text omit quotes on scalar string);;
+----
+a"b
+
+query T
+select json_query('{"a":1}', '$.a' returning text format json);;
+----
+1
+
+query T
+select json_query('{"a":[1]}', '$.a[0]' returning text);;
+----
+1
+
+query T
+select json_query('{"a":1}', '$.b');;
+----
+NULL
+
+query T
+select json_query('{"a":1}', '$.b' null on empty);;
+----
+NULL
+
+query T
+select json_query('{"a":1}', '$.b' empty array on empty);;
+----
+[]
+
+query T
+select json_query('{"a":1}', '$.b' empty object on empty);;
+----
+{}
+
+statement error
+select json_query('{"a":1}', '$.b' error on empty);;
+
+statement error
+select json_query('{"a":1}', 'strict $.b' error on error);;
+
+statement error
+select json_query('strict {"a":1}', 'strict $.b');;
+
+query T
+select json_query('{"a":1}', '$.b' empty array on error);;
+----
+NULL
+
+query T
+select json_query('{"a":1}', '$.b' returning json empty object on error);;
+----
+NULL
+
+query T
+select '{"a":1}' is json;;
+----
+t
+
+query T
+select '{"a":1}' is not json;;
+----
+f
+
+query T
+select '1' is json value;;
+----
+t
+
+query T
+select '1' is json scalar;;
+----
+t
+
+query T
+select '1' is json array;;
+----
+f
+
+query T
+select '[1]' is json array;;
+----
+t
+
+query T
+select '[1]' is json scalar;;
+----
+f
+
+query T
+select '{"a":1}' is json object;;
+----
+t
+
+query T
+select '"x"' is json scalar;;
+----
+t
+
+query T
+select 'null' is json scalar;;
+----
+t
+
+query T
+select 'null' is json value;;
+----
+t
+
+query T
+select 'null' is json array;;
+----
+f
+
+query T
+select null is json;;
+----
+NULL
+
+query T
+select '{"a":1}'::jsonb is json;;
+----
+t
+
+query T
+select '{"a":1}'::json is json;;
+----
+t
+
+query T
+select 'abc' is json;;
+----
+f
+
+query T
+select '' is json;;
+----
+f
+
+query T
+select '{"a":1,"a":2}' is json with unique keys;;
+----
+f
+
+query T
+select '{"a":1,"a":2}' is json without unique keys;;
+----
+t
+
+query T
+select '{"a":1}' is json with unique keys;;
+----
+t
+
+query T
+select '{"a":1,"a":2}'::jsonb is json with unique keys;;
+----
+t
+
+query T
+select '1'::jsonb is json scalar;;
+----
+t
+
+statement error
+select 1 is json;;
+
+statement error
+select true is json;;
+
+query T
+select '{"a":1}' is json scalar;;
+----
+f
+
+query T
+select '[]' is json array;;
+----
+t
+
+query T
+select '[]' is json object;;
+----
+f
+
+query T
+select '{"a":1}' is json array;;
+----
+f
+
+query T
+select json_exists('{"a":1}', '$.a' passing 2 as x);;
+----
+t
+
+query T
+select json_value('{"a":{"b":2}}', '$.a.b' returning int);;
+----
+2
+
+query T
+select json_query('{"a":1}', '$.a' returning jsonb);;
+----
+1
+
+query T
+select json_value('{"a":1}', '$.a' returning numeric);;
+----
+1
+
+query T
+select json_value('{"a":null}', '$.a' returning int);;
+----
+NULL
+
+query T
+select json_value('{"a":null}', '$.a');;
+----
+NULL
+
+query T
+select json_value('{"a":"2024-01-01"}', '$.a' returning date);;
+----
+2024-01-01
+
+query T
+select json_value('{"a":"x"}', '$.a' returning date);;
+----
+NULL
+
+statement error
+select json_value('{"a":[1]}', '$.a' returning int error on error);;
+
+statement error
+select json_value('{"a":1}', '$.a, $.b' returning int);;
+
+statement error
+select json_query('{"a":1}', 'bad path' null on error);;
+
+statement error
+select json_exists('{"a":1}', 'bad path' false on error);;
+
+query T
+select json_query('{"a":1}', 'strict $.b' with wrapper null on error);;
+----
+NULL
+
+query T
+select json('{"a":1}');;
+----
+{"a":1}
+
+statement error
+select json(1);;
+
+statement error
+select json('abc');;
+
+statement error
+select json(true);;
+
+query T
+select json(null);;
+----
+NULL
+
+query T
+select json('{"a":1}'::jsonb);;
+----
+{"a": 1}
+
+query T
+select json('[1,2]'::json);;
+----
+[1,2]
+
+statement error
+select json('{"a":1,"a":2}' with unique keys);;
+
+query T
+select json('{"a":1}' with unique keys);;
+----
+{"a":1}
+
+query T
+select json('{"a":1}' without unique keys);;
+----
+{"a":1}
+
+query T
+select json_scalar(1);;
+----
+1
+
+query T
+select json_scalar('abc');;
+----
+"abc"
+
+query T
+select json_scalar('abc'::text);;
+----
+"abc"
+
+query T
+select json_scalar(true);;
+----
+true
+
+query T
+select json_scalar(null);;
+----
+NULL
+
+query T
+select json_scalar('{"a":1}'::jsonb);;
+----
+{"a": 1}
+
+query T
+select json_scalar('{"a":1}'::json);;
+----
+{"a":1}
+
+query T
+select json_serialize('{"a":1}'::json);;
+----
+{"a":1}
+
+query T
+select json_serialize('{"a":1}'::json returning text);;
+----
+{"a":1}
+
+statement error
+select json_serialize('{"a":1}'::json returning varchar(3));;
+
+query T
+select json_serialize('{"a":1}'::json returning bytea);;
+----
+\x7b2261223a317d
+
+statement error
+select json_serialize('{"a":1}'::json returning int);;
+
+query T
+select json_serialize('{"a":1}'::json returning text format json);;
+----
+{"a":1}
+
+statement error
+select json_serialize(1);;
+
+statement error
+select json_serialize('a');;
+
+query T
+select json_serialize(null);;
+----
+NULL
+
+query T
+select json_serialize('{"a":1}' format json returning text);;
+----
+{"a":1}
+
+query T
+select pg_typeof(json('{}'));;
+----
+json
+
+query T
+select pg_typeof(json_scalar(1));;
+----
+json
+
+query T
+select pg_typeof(json_serialize('{}'::json));;
+----
+text
+
+query T
+select '{"a":1}' is json;;
+----
+t
+
+query T
+select '[1]' is json array;;
+----
+t
+
+query T
+select json_exists('{"a":1}', '$x' passing 1 as x);;
+----
+t
+
+query T
+select json_value('{"a":1}', '$.a' passing 2 as x);;
+----
+1
+
+query T
+select json_query('{"a":1}', '$.a' returning jsonb);;
+----
+1
+
+statement error
+select '{a}'::jsonb;;
