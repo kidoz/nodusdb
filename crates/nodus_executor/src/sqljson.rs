@@ -33,6 +33,189 @@ pub(crate) const JSON: &str = "__JSON__";
 pub(crate) const JSON_SCALAR: &str = "__JSON_SCALAR__";
 pub(crate) const JSON_SERIALIZE: &str = "__JSON_SERIALIZE__";
 
+/// The array and object constructors:
+/// `__JSON_ARRAY__(absent, returning, element...)` and
+/// `__JSON_OBJECT__(absent, unique, returning, key, value, ...)`.
+pub(crate) const JSON_ARRAY: &str = "__JSON_ARRAY__";
+pub(crate) const JSON_OBJECT: &str = "__JSON_OBJECT__";
+
+/// A value as it appears as an array element or an object's value: a JSON
+/// value keeps its own form, everything else is written as `to_json` writes
+/// it (a text value becomes a JSON string).
+pub(crate) fn element_text(value: &crate::Value) -> String {
+    match value {
+        crate::Value::Json(text) => text.clone(),
+        crate::Value::Jsonb(value) => crate::json_text::jsonb_text(value),
+        other => {
+            let mut out = String::new();
+            crate::json_text::value_json(other, false, &mut out);
+            out
+        }
+    }
+}
+
+/// An object's key as PostgreSQL writes it: the value's text as a JSON
+/// string. A key that is not a scalar, and a NULL one, are refused.
+pub(crate) fn key_text(value: &crate::Value) -> Result<String, String> {
+    let mut out = String::new();
+    match crate::json_text::key_json(value, &mut out) {
+        Ok(()) => Ok(out),
+        Err(message) if matches!(value, crate::Value::Null) => Err(error(message, "22004")),
+        Err(message) => Err(error(message, "22023")),
+    }
+}
+
+/// `JSON_ARRAY` and `JSON_ARRAYAGG`: the elements as a JSON array. With
+/// `ABSENT ON NULL` (the default) a NULL element is left out.
+pub(crate) fn array_text(absent: bool, values: &[crate::Value]) -> String {
+    let mut out = String::from("[");
+    let mut first = true;
+    for value in values {
+        if absent && matches!(value, crate::Value::Null) {
+            continue;
+        }
+        if !first {
+            out.push_str(", ");
+        }
+        first = false;
+        out.push_str(&element_text(value));
+    }
+    out.push(']');
+    out
+}
+
+/// `JSON_OBJECT` and `JSON_OBJECTAGG`: the pairs as a JSON object. With
+/// `ABSENT ON NULL` a pair whose value is NULL is left out (the object's
+/// default is `NULL ON NULL`, the array's the opposite, as PostgreSQL has
+/// it). `spaced` is the aggregate's form, which writes a space inside the
+/// braces.
+pub(crate) fn object_text(
+    absent: bool,
+    unique: bool,
+    spaced: bool,
+    pairs: &[(crate::Value, crate::Value)],
+) -> Result<String, String> {
+    let mut keys: Vec<String> = Vec::new();
+    let mut parts: Vec<String> = Vec::new();
+    for (key, value) in pairs {
+        let key = key_text(key)?;
+        if matches!(value, crate::Value::Null) && absent {
+            continue;
+        }
+        if unique && keys.iter().any(|seen| *seen == key) {
+            return Err(error(
+                format!("duplicate JSON object key value: {key}"),
+                "22030",
+            ));
+        }
+        keys.push(key.clone());
+        parts.push(format!("{key} : {}", element_text(value)));
+    }
+    // The aggregate's form writes a space inside the braces, empty or not.
+    Ok(if spaced {
+        format!("{{ {} }}", parts.join(", "))
+    } else {
+        format!("{{{}}}", parts.join(", "))
+    })
+}
+
+/// `JSON_ARRAY(...)` and `JSON_ARRAYAGG(...)`: the elements as a JSON value,
+/// as the RETURNING type names it.
+pub(crate) fn json_array(
+    absent: bool,
+    returning: &str,
+    values: &[crate::Value],
+) -> Result<crate::Value, String> {
+    if canonical(returning, values.iter()) {
+        let items: Vec<J> = values
+            .iter()
+            .filter(|value| !(absent && matches!(value, crate::Value::Null)))
+            .map(crate::functions::to_json)
+            .collect();
+        return Ok(crate::Value::Jsonb(J::Array(items)));
+    }
+    assembled(array_text(absent, values), returning)
+}
+
+/// `JSON_OBJECT(...)` and `JSON_OBJECTAGG(...)`: the pairs as a JSON value.
+/// `spaced` is the aggregate's form, which writes a space inside the braces.
+pub(crate) fn json_object(
+    absent: bool,
+    unique: bool,
+    spaced: bool,
+    returning: &str,
+    pairs: &[(crate::Value, crate::Value)],
+) -> Result<crate::Value, String> {
+    if canonical(returning, pairs.iter().map(|(_, value)| value)) {
+        let mut keys: Vec<String> = Vec::new();
+        let mut object = serde_json::Map::new();
+        for (key, value) in pairs {
+            let name = key_name(key)?;
+            if matches!(value, crate::Value::Null) && absent {
+                continue;
+            }
+            if unique && keys.iter().any(|seen| *seen == name) {
+                return Err(error(
+                    format!("duplicate JSON object key value: {}", key_text(key)?),
+                    "22030",
+                ));
+            }
+            keys.push(name.clone());
+            object.insert(name, crate::functions::to_json(value));
+        }
+        return Ok(crate::Value::Jsonb(J::Object(object)));
+    }
+    assembled(object_text(absent, unique, spaced, pairs)?, returning)
+}
+
+/// Whether the result is written in `jsonb`'s canonical spelling: the
+/// RETURNING type is a `jsonb`, or — with no RETURNING clause, as PostgreSQL
+/// decides — one of the values is a `jsonb` already.
+fn canonical<'a>(returning: &str, values: impl Iterator<Item = &'a crate::Value>) -> bool {
+    if crate::value::is_jsonb_type(returning) {
+        return true;
+    }
+    returning.is_empty()
+        && values
+            .into_iter()
+            .any(|v| matches!(v, crate::Value::Jsonb(_)))
+}
+
+/// The assembled text as the RETURNING type: a `bytea` takes its bytes, a
+/// character type fits the text (an explicit cast would cut it silently),
+/// and any other type is `json` (or `jsonb`, through the planner's cast; the
+/// planner has refused the types a `json` does not cast to by then).
+fn assembled(text: String, returning: &str) -> Result<crate::Value, String> {
+    if crate::value::is_bytea_type(returning) {
+        return Ok(crate::Value::Bytea(text.into_bytes()));
+    }
+    if crate::value::character_limit(returning).is_some() {
+        return crate::value::fit_character(&text, returning, false).map(crate::Value::Text);
+    }
+    Ok(crate::Value::Json(text))
+}
+
+/// An object's key as the text it is, without the quotes a JSON string takes.
+/// A key that is not a scalar, and a NULL one, are refused.
+fn key_name(value: &crate::Value) -> Result<String, String> {
+    if matches!(value, crate::Value::Null) {
+        return Err(error("null value not allowed for object key", "22004"));
+    }
+    if matches!(
+        value,
+        crate::Value::Array(_)
+            | crate::Value::Record(_)
+            | crate::Value::Json(_)
+            | crate::Value::Jsonb(_)
+    ) {
+        return Err(error(
+            "key value must be scalar, not array, composite, or json",
+            "22023",
+        ));
+    }
+    Ok(crate::render(value))
+}
+
 /// `JSON(expr [WITH UNIQUE KEYS])`: the value as a `json`, its text kept as
 /// written.
 pub(crate) fn json(value: &crate::Value, unique: &str) -> Result<crate::Value, String> {
@@ -719,6 +902,129 @@ mod tests {
             ))
             .starts_with("error: ")
         );
+    }
+
+    #[test]
+    fn array_and_object_constructors_match_postgresql() {
+        use crate::Value;
+        let array = |absent: bool, values: &[Value]| shown(json_array(absent, "", values));
+        // The array's default is ABSENT ON NULL; the object's NULL ON NULL.
+        assert_eq!(array(true, &[]), "[]");
+        assert_eq!(array(true, &[Value::Int(1), Value::Int(2)]), "[1, 2]");
+        assert_eq!(array(true, &[Value::Int(1), Value::Null]), "[1]");
+        assert_eq!(array(false, &[Value::Int(1), Value::Null]), "[1, null]");
+        assert_eq!(
+            array(true, &[Value::Text("a".into()), Value::Bool(true)]),
+            "[\"a\", true]"
+        );
+        // An array value is `to_json`'s `[1,2]`, a row its object.
+        assert_eq!(
+            array(true, &[Value::Array(vec![Value::Int(1), Value::Int(2)])]),
+            "[[1,2]]"
+        );
+        assert_eq!(
+            array(true, &[Value::Record(vec![("f1".into(), Value::Int(1))])]),
+            "[{\"f1\":1}]"
+        );
+        // A `json` value keeps its text; a `jsonb` one is canonical, and
+        // makes the whole array canonical.
+        assert_eq!(
+            array(
+                true,
+                &[
+                    Value::Json("{\"d\":4}".into()),
+                    Value::Jsonb(parse("{\"e\":5}"))
+                ]
+            ),
+            "[{\"d\": 4}, {\"e\": 5}]"
+        );
+        assert_eq!(
+            array(true, &[Value::Jsonb(parse("{\"e\":5}"))]),
+            "[{\"e\": 5}]"
+        );
+        assert_eq!(
+            shown(json_array(true, "text", &[Value::Json("{\"e\":5}".into())])),
+            "[{\"e\":5}]",
+            "an explicit RETURNING type writes the text form"
+        );
+        assert_eq!(
+            shown(json_array(
+                true,
+                "text",
+                &[Value::Jsonb(parse("{\"e\":5}"))]
+            )),
+            "[{\"e\": 5}]"
+        );
+        assert_eq!(
+            shown(json_array(true, "bytea", &[Value::Int(1)])),
+            "\\x5b315d"
+        );
+        assert!(
+            shown(json_array(true, "varchar(2)", &[Value::Int(1)])).starts_with("error: "),
+            "an explicit cast would cut the text; RETURNING fits it"
+        );
+
+        let object = |absent: bool, unique: bool, pairs: &[(Value, Value)]| {
+            shown(json_object(absent, unique, false, "", pairs))
+        };
+        assert_eq!(object(false, false, &[]), "{}");
+        assert_eq!(
+            object(false, false, &[(Value::Text("a".into()), Value::Int(1))]),
+            "{\"a\" : 1}"
+        );
+        assert_eq!(
+            object(
+                false,
+                false,
+                &[
+                    (Value::Text("a".into()), Value::Null),
+                    (Value::Int(1), Value::Bool(true))
+                ]
+            ),
+            "{\"a\" : null, \"1\" : true}"
+        );
+        assert_eq!(
+            object(true, false, &[(Value::Text("a".into()), Value::Null)]),
+            "{}"
+        );
+        // The aggregate's form writes a space inside the braces, empty too.
+        assert_eq!(shown(json_object(false, false, true, "", &[])), "{  }");
+        // A `jsonb` value makes the object canonical, its keys sorted.
+        assert_eq!(
+            object(
+                false,
+                false,
+                &[
+                    (Value::Text("c".into()), Value::Int(2)),
+                    (Value::Text("a".into()), Value::Jsonb(parse("1")))
+                ]
+            ),
+            "{\"a\": 1, \"c\": 2}"
+        );
+        // Without UNIQUE KEYS a duplicate key is kept, as written.
+        let duplicate = [
+            (Value::Text("a".into()), Value::Int(1)),
+            (Value::Text("a".into()), Value::Int(2)),
+        ];
+        assert_eq!(object(false, false, &duplicate), "{\"a\" : 1, \"a\" : 2}");
+        assert!(
+            object(false, true, &duplicate)
+                .starts_with("error: duplicate JSON object key value: \"a\"\u{1f}code=22030")
+        );
+        assert!(
+            object(true, false, &[(Value::Null, Value::Int(1))])
+                .starts_with("error: null value not allowed for object key\u{1f}code=22004")
+        );
+        assert!(
+            object(true, false, &[(Value::Array(vec![]), Value::Int(1))]).starts_with(
+                "error: key value must be scalar, not array, composite, or json\u{1f}code=22023"
+            )
+        );
+    }
+
+    /// A JSON document as the parser makes it, for the `jsonb` values.
+    fn parse(text: &str) -> serde_json::Value {
+        crate::json_text::parse(text).expect("valid JSON")
     }
 
     #[test]

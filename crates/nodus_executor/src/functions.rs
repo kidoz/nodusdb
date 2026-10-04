@@ -25,6 +25,10 @@ const NON_STRICT: &[&str] = &[
     crate::sqljson::JSON_EXISTS,
     crate::sqljson::JSON_VALUE,
     crate::sqljson::JSON_QUERY,
+    // The array and object constructors: a NULL element or object value is
+    // kept or left out by the null clause.
+    crate::sqljson::JSON_ARRAY,
+    crate::sqljson::JSON_OBJECT,
     // The SQL/XML constructors: a NULL argument is skipped (or, for `xmlpi`,
     // a NULL value), and the target-name and attribute-name checks come
     // before the NULL checks.
@@ -142,6 +146,7 @@ pub(crate) fn is_known(name: &str) -> bool {
                 | crate::sqljson::JSON_QUERY | crate::sqljson::JSON_VARS
                 | crate::sqljson::JSON | crate::sqljson::JSON_SCALAR
                 | crate::sqljson::JSON_SERIALIZE
+                | crate::sqljson::JSON_ARRAY | crate::sqljson::JSON_OBJECT
                 // Dates and times.
                 | "NOW" | "CURRENT_TIMESTAMP" | "TRANSACTION_TIMESTAMP"
                 | "STATEMENT_TIMESTAMP" | "CLOCK_TIMESTAMP" | "CURRENT_DATE" | "CURRENT_TIME"
@@ -437,6 +442,7 @@ pub(crate) fn return_type(name: &str, arg_types: &[Option<String>]) -> Option<St
             crate::sqljson::JSON => "JSON",
             crate::sqljson::JSON_SCALAR => "JSON",
             crate::sqljson::JSON_SERIALIZE => "TEXT",
+            crate::sqljson::JSON_ARRAY | crate::sqljson::JSON_OBJECT => "JSON",
             crate::sqljson::JSON_VALUE | crate::sqljson::JSON_QUERY | crate::sqljson::JSON_VARS => {
                 "TEXT"
             }
@@ -711,6 +717,10 @@ fn takes_json(name: &str) -> bool {
                 | "NUM_NULLS"
                 | "NUM_NONNULLS"
                 | "__RECORD__"
+                // The SQL/JSON constructors read a JSON element as a value,
+                // not as its text.
+                | crate::sqljson::JSON_ARRAY
+                | crate::sqljson::JSON_OBJECT
                 // The vectors a JSON document builds take the document as a
                 // value, not as text.
                 | "TO_TSVECTOR"
@@ -2775,6 +2785,34 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
         // `JSON_SERIALIZE(expr [FORMAT JSON] [RETURNING type])`.
         crate::sqljson::JSON_SERIALIZE if arity(3) => {
             match crate::sqljson::json_serialize(&args[0], &text(&args[2])) {
+                Ok(value) => value,
+                Err(error) => raise(error),
+            }
+        }
+        // `JSON_ARRAY(...)`: the elements as a JSON array (see `sqljson.rs`).
+        crate::sqljson::JSON_ARRAY if args.len() >= 2 => {
+            match crate::sqljson::json_array(
+                matches!(args[0], Value::Bool(true)),
+                &text(&args[1]),
+                &args[2..],
+            ) {
+                Ok(value) => value,
+                Err(error) => raise(error),
+            }
+        }
+        // `JSON_OBJECT(...)`: the key-value pairs as a JSON object.
+        crate::sqljson::JSON_OBJECT if args.len() >= 3 && (args.len() - 3) % 2 == 0 => {
+            let pairs: Vec<(Value, Value)> = args[3..]
+                .chunks(2)
+                .map(|pair| (pair[0].clone(), pair[1].clone()))
+                .collect();
+            match crate::sqljson::json_object(
+                matches!(args[0], Value::Bool(true)),
+                text(&args[1]) == "unique",
+                false,
+                &text(&args[2]),
+                &pairs,
+            ) {
                 Ok(value) => value,
                 Err(error) => raise(error),
             }

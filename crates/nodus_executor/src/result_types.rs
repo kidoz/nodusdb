@@ -1363,6 +1363,33 @@ pub(crate) fn check_integer_ranges(
                 args,
             };
         }
+        // The array and object constructors, as the parser rewrote them:
+        // `__json_array__(absent, returning-type, element...)` and
+        // `__json_object__(absent, unique-keys, returning-type, key, value,
+        // ...)`. The result takes the RETURNING type (`json` by default).
+        ScalarExpr::Function { name, args }
+            if matches!(
+                name.as_str(),
+                crate::sqljson::JSON_ARRAY | crate::sqljson::JSON_OBJECT
+            ) =>
+        {
+            let target = if name == crate::sqljson::JSON_ARRAY {
+                args.get(1)
+            } else {
+                args.get(2)
+            };
+            let returning = match json_returning(target) {
+                Ok(returning) => returning,
+                Err(message) => return sql_json_error(message, "42846"),
+            };
+            return ScalarExpr::Cast {
+                expr: Box::new(ScalarExpr::Function {
+                    name: name.clone(),
+                    args: args.clone(),
+                }),
+                target: returning,
+            };
+        }
         // The JSON value constructors: `JSON(expr [WITH UNIQUE KEYS])`,
         // `JSON_SCALAR(expr)`, and
         // `JSON_SERIALIZE(expr [FORMAT JSON] [RETURNING type])`.
@@ -3301,6 +3328,30 @@ fn xml_call(name: &str, value: &ScalarExpr) -> ScalarExpr {
 /// The call a SQL/JSON type error is reported as at evaluation time.
 pub(crate) fn sql_json_error(message: String, code: &str) -> ScalarExpr {
     sql_json_error_with_hint(message, code, "")
+}
+
+/// The RETURNING type of a SQL/JSON array or object constructor: the type its
+/// marker names, `json` by default. `Err` carries the message PostgreSQL
+/// raises for a type a `json` does not cast to.
+fn json_returning(target: Option<&ScalarExpr>) -> Result<String, String> {
+    let type_name = match target {
+        Some(ScalarExpr::Literal(Value::Text(target))) if !target.trim().is_empty() => {
+            target.trim().to_string()
+        }
+        _ => "json".to_string(),
+    };
+    let upper = type_name.to_ascii_uppercase();
+    if is_text_type(&type_name)
+        || upper == "JSON"
+        || crate::value::is_jsonb_type(&type_name)
+        || crate::value::is_bytea_type(&type_name)
+    {
+        return Ok(type_name);
+    }
+    Err(format!(
+        "cannot cast type json to {}",
+        operator_type_name(&type_name)
+    ))
 }
 
 /// The same with the HINT PostgreSQL adds.

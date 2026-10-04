@@ -2497,8 +2497,12 @@ fn is_keyword_function(upper: &str) -> bool {
 /// function is a row with fields `f1`, `f2`, ..., which the function writes
 /// as an object.
 fn json_arg(name: &str, arg: ScalarExpr) -> ScalarExpr {
-    let json =
-        name.starts_with("JSON") || name.starts_with("TO_JSON") || name.ends_with("_TO_JSON");
+    // The SQL/JSON markers (`__JSON_ARRAY__` and the like) read a row as a
+    // JSON object, as the `json*` functions do.
+    let json = name.starts_with("JSON")
+        || name.starts_with("__JSON")
+        || name.starts_with("TO_JSON")
+        || name.ends_with("_TO_JSON");
     match arg {
         ScalarExpr::Row(items) if json => ScalarExpr::Function {
             name: "__RECORD__".to_string(),

@@ -48,8 +48,8 @@ pub fn parse_sql(
         }
     }
     let tokens = reorder_identity_options(reorder_sequence_options(rewrite_data_clauses(
-        rewrite_record_star(rewrite_sql_json(rewrite_xml_constructors(
-            rewrite_xml_syntax(rewrite_query_syntax(tokens)),
+        rewrite_record_star(rewrite_sql_json(rewrite_json_constructors(
+            rewrite_xml_constructors(rewrite_xml_syntax(rewrite_query_syntax(tokens))),
         ))),
     )));
     Parser::new(&dialect)
@@ -1039,6 +1039,253 @@ fn rewrite_sql_json(
             let len = snippet.len();
             tokens.splice(i..=close, snippet);
             i += len;
+            continue;
+        }
+        i += 1;
+    }
+    tokens
+}
+
+/// The SQL/JSON array and object constructors, which the parser cannot read
+/// with their clauses: `JSON_ARRAY` and `JSON_OBJECT`, each rewritten to the
+/// marker function the planner knows (see `sqljson.rs`). The shapes are
+/// `__json_array__(absent, returning, element...)` and
+/// `__json_object__(absent, unique, returning, key, value, ...)`.
+fn rewrite_json_constructors(
+    mut tokens: Vec<sqlparser::tokenizer::TokenWithSpan>,
+) -> Vec<sqlparser::tokenizer::TokenWithSpan> {
+    use sqlparser::tokenizer::{Token, TokenWithSpan};
+    let word = |t: &TokenWithSpan| match &t.token {
+        Token::Word(w) if w.quote_style.is_none() => Some(w.value.clone()),
+        _ => None,
+    };
+    let significant = |tokens: &[TokenWithSpan], from: usize| {
+        (from..tokens.len()).find(|&i| !matches!(tokens[i].token, Token::Whitespace(_)))
+    };
+    let significant_back = |tokens: &[TokenWithSpan], from: usize| {
+        (0..from)
+            .rev()
+            .find(|&i| !matches!(tokens[i].token, Token::Whitespace(_)))
+    };
+    let matching_paren = |tokens: &[TokenWithSpan], open: usize| {
+        let mut depth = 0i32;
+        for (i, token) in tokens.iter().enumerate().skip(open) {
+            match token.token {
+                Token::LParen => depth += 1,
+                Token::RParen => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    };
+    // The ranges of the top-level `,`-separated items of a token range; a
+    // `[...]` (an array literal or subscript) holds its commas.
+    let split = |tokens: &[TokenWithSpan], from: usize, to: usize| {
+        let mut items = Vec::new();
+        let mut depth = 0i32;
+        let mut start = None;
+        for (i, token) in tokens.iter().enumerate().take(to).skip(from) {
+            match token.token {
+                Token::LParen | Token::LBracket => depth += 1,
+                Token::RParen | Token::RBracket => depth -= 1,
+                Token::Comma if depth == 0 => {
+                    items.push((start.unwrap_or(from), i));
+                    start = None;
+                    continue;
+                }
+                _ => {}
+            }
+            if start.is_none() && !matches!(token.token, Token::Whitespace(_)) {
+                start = Some(i);
+            }
+        }
+        if let Some(start) = start {
+            items.push((start, to));
+        }
+        items
+    };
+    // The `:` or `value` separating an object's key from its value, at the
+    // item's top level. A `:` anywhere is the separator; otherwise the first
+    // `value` keyword is.
+    let pair_at = |tokens: &[TokenWithSpan], from: usize, to: usize| {
+        let mut value_at = None;
+        let mut depth = 0i32;
+        for (at, token) in tokens.iter().enumerate().take(to).skip(from) {
+            match token.token {
+                Token::LParen | Token::LBracket => depth += 1,
+                Token::RParen | Token::RBracket => depth -= 1,
+                Token::Colon if depth == 0 => return Some(at),
+                _ => {}
+            }
+            if value_at.is_none() && depth == 0 && word(token).as_deref() == Some("value") {
+                value_at = Some(at);
+            }
+        }
+        value_at
+    };
+    // A value expression as the marker takes it.
+    let element = |tokens: &[TokenWithSpan], from: usize, to: usize| -> String {
+        render_tokens(&tokens[from..to])
+    };
+    let mut i = 0;
+    while i < tokens.len() {
+        let name = word(&tokens[i]).unwrap_or_default();
+        if !matches!(name.as_str(), "json_array" | "json_object") {
+            i += 1;
+            continue;
+        }
+        let Some(open) = significant(&tokens, i + 1) else {
+            i += 1;
+            continue;
+        };
+        if tokens[open].token != Token::LParen {
+            i += 1;
+            continue;
+        }
+        let object = name == "json_object";
+        let Some(close) = matching_paren(&tokens, open) else {
+            i += 1;
+            continue;
+        };
+        // `DISTINCT` is a syntax error in PostgreSQL for these functions;
+        // leave it to the parser.
+        if significant(&tokens, open + 1)
+            .and_then(|at| word(&tokens[at]))
+            .as_deref()
+            == Some("distinct")
+        {
+            i += 1;
+            continue;
+        }
+        let mut items = split(&tokens, open + 1, close);
+        let mut absent = String::new();
+        let mut unique = String::new();
+        let mut returning = String::new();
+        let mut failed = false;
+        // The clauses that follow the last item, in PostgreSQL's order: the
+        // aggregate's `ORDER BY`, the null clause, the unique-keys clause,
+        // and the RETURNING type.
+        if let Some((last_from, last_to)) = items.last().copied() {
+            let mut end = last_to;
+            let mut returning_at = None;
+            let mut depth = 0i32;
+            for (at, token) in tokens.iter().enumerate().take(last_to).skip(last_from) {
+                match token.token {
+                    Token::LParen | Token::LBracket => depth += 1,
+                    Token::RParen | Token::RBracket => depth -= 1,
+                    _ => {}
+                }
+                if depth == 0 && word(token).as_deref() == Some("returning") {
+                    returning_at = Some(at);
+                }
+            }
+            if let Some(at) = returning_at {
+                let type_end = end;
+                returning = render_tokens(&tokens[at + 1..type_end]).trim().to_string();
+                end = at;
+            }
+            if let Some(last) = significant_back(&tokens, end) {
+                let u = if word(&tokens[last]).as_deref() == Some("keys") {
+                    significant_back(&tokens, last)
+                } else {
+                    Some(last)
+                };
+                if let Some(u) = u.filter(|&u| word(&tokens[u]).as_deref() == Some("unique"))
+                    && let Some(kind_at) = significant_back(&tokens, u)
+                    && matches!(word(&tokens[kind_at]).as_deref(), Some("with" | "without"))
+                {
+                    unique = word(&tokens[kind_at]).unwrap();
+                    end = kind_at;
+                }
+            }
+            if let Some(last) = significant_back(&tokens, end)
+                && word(&tokens[last]).as_deref() == Some("null")
+                && let Some(on_at) = significant_back(&tokens, last)
+                && word(&tokens[on_at]).as_deref() == Some("on")
+                && let Some(kind_at) = significant_back(&tokens, on_at)
+                && matches!(word(&tokens[kind_at]).as_deref(), Some("null" | "absent"))
+            {
+                absent = word(&tokens[kind_at]).unwrap();
+                end = kind_at;
+            }
+            if end > last_from {
+                if let Some(item) = items.last_mut() {
+                    *item = (last_from, end);
+                }
+            } else if returning_at == Some(last_from)
+                && absent.is_empty()
+                && unique.is_empty()
+                && items.len() == 1
+            {
+                // `<constructor>(returning type)`: no elements or pairs, and
+                // no other clause, as PostgreSQL takes it.
+                items.pop();
+            } else {
+                // A clause with no value before it (`, null on null`), which
+                // PostgreSQL takes as a syntax error; leaving it as it is
+                // lets the parser report one.
+                failed = true;
+            }
+        }
+        // The elements or key-value pairs, each with its own `FORMAT JSON`.
+        let mut parts: Vec<String> = Vec::new();
+        if !failed {
+            for (from, to) in items.iter().copied() {
+                let end = to;
+                if object {
+                    let Some(sep) = pair_at(&tokens, from, end) else {
+                        failed = true;
+                        break;
+                    };
+                    let key = render_tokens(&tokens[from..sep]);
+                    parts.push(format!("{key}, {}", element(&tokens, sep + 1, end)));
+                } else {
+                    parts.push(element(&tokens, from, end));
+                }
+            }
+        }
+        if failed {
+            i += 1;
+            continue;
+        }
+        // The null clause defaults: ABSENT ON NULL for the arrays, NULL ON
+        // NULL for the objects.
+        let absent_flag = match absent.as_str() {
+            "absent" => "true",
+            "null" => "false",
+            _ if object => "false",
+            _ => "true",
+        };
+        let unique_flag = if unique == "with" { "unique" } else { "" };
+        // An empty RETURNING type is `json`, and (as PostgreSQL decides) the
+        // canonical spelling when a value is a `jsonb`.
+        let returning = returning.replace('\'', "''");
+        let args = if parts.is_empty() {
+            String::new()
+        } else {
+            format!(", {}", parts.join(", "))
+        };
+        let replacement = match name.as_str() {
+            "json_array" => {
+                format!("pg_catalog.__json_array__({absent_flag}, '{returning}'{args})")
+            }
+            "json_object" => format!(
+                "pg_catalog.__json_object__({absent_flag}, '{unique_flag}', '{returning}'{args})"
+            ),
+            _ => format!(
+                "pg_catalog.__json_object__({absent_flag}, '{unique_flag}', '{returning}'{args})"
+            ),
+        };
+        if let Some(snippet) = snippet_tokens(&replacement) {
+            tokens.splice(i..=close, snippet);
+            // The arguments the call carried may hold further constructors;
+            // scan them from the start again.
+            i = 0;
             continue;
         }
         i += 1;

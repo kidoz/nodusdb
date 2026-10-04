@@ -1470,6 +1470,8 @@ fn figure_colname(expr: &sqlparser::ast::Expr) -> Option<String> {
                     "__json__" => return Some("json".to_string()),
                     "__json_scalar__" => return Some("json_scalar".to_string()),
                     "__json_serialize__" => return Some("json_serialize".to_string()),
+                    "__json_array__" => return Some("json_array".to_string()),
+                    "__json_object__" => return Some("json_object".to_string()),
                     _ => {}
                 }
             }
