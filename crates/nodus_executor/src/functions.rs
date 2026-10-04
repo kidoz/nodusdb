@@ -134,7 +134,7 @@ pub(crate) fn is_known(name: &str) -> bool {
                 // XML.
                 | "XML_IS_WELL_FORMED" | "XML_IS_WELL_FORMED_DOCUMENT"
                 | "XML_IS_WELL_FORMED_CONTENT" | "XMLCOMMENT" | "XMLTEXT" | "XMLCONCAT"
-                | "XPATH" | "XPATH_EXISTS"
+                | "XPATH" | "XPATH_EXISTS" | crate::result_types::XMLEXISTS
                 | crate::result_types::XML_PARSE | crate::result_types::XML_SERIALIZE
                 | crate::result_types::XML_IS_DOCUMENT | crate::result_types::XML_ERROR
                 | crate::result_types::XML_OUT
@@ -429,7 +429,7 @@ pub(crate) fn return_type(name: &str, arg_types: &[Option<String>]) -> Option<St
             "TS_REWRITE" => "TSQUERY",
             "GET_CURRENT_TS_CONFIG" => "REGCONFIG",
             "XPATH" => "XML[]",
-            "XPATH_EXISTS" => "BOOLEAN",
+            "XPATH_EXISTS" | crate::result_types::XMLEXISTS => "BOOLEAN",
             "XML_IS_WELL_FORMED" | "XML_IS_WELL_FORMED_DOCUMENT" | "XML_IS_WELL_FORMED_CONTENT" => {
                 "BOOLEAN"
             }
@@ -2534,8 +2534,9 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
                 Err(error) => raise(error.into_text()),
             }
         }
-        // `xpath_exists(expression, document [, namespaces])`.
-        "XPATH_EXISTS" if arity(2) || arity(3) => {
+        // `xpath_exists(expression, document [, namespaces])`, and its
+        // `XMLEXISTS(...)` spelling.
+        "XPATH_EXISTS" | crate::result_types::XMLEXISTS if arity(2) || arity(3) => {
             let namespaces = match args.get(2).map(xpath_namespaces).transpose() {
                 Ok(namespaces) => namespaces.unwrap_or_default(),
                 Err(error) => return Some(raise(error)),

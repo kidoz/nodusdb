@@ -1681,7 +1681,7 @@ pub(crate) fn check_integer_ranges(
                 // `xpath(expression, document [, namespaces])` and
                 // `xpath_exists(...)`: the expression is text, the document
                 // an XML value, and the namespaces a text array of pairs.
-                "XPATH" | "XPATH_EXISTS" if (2..=3).contains(&args.len()) => {
+                "XPATH" | "XPATH_EXISTS" | XMLEXISTS if (2..=3).contains(&args.len()) => {
                     let text_arg = |e: &ScalarExpr| {
                         matches!(e, ScalarExpr::Literal(Value::Text(_) | Value::Null))
                             || scalar_type(e, column).is_none_or(|t| {
@@ -1710,7 +1710,11 @@ pub(crate) fn check_integer_ranges(
                             ))
                         && args.get(2).is_none_or(namespaces_arg);
                     if !ok {
-                        let spelled = name.to_ascii_lowercase();
+                        let spelled = if name == XMLEXISTS {
+                            "xmlexists".to_string()
+                        } else {
+                            name.to_ascii_lowercase()
+                        };
                         let types: Vec<String> = args
                             .iter()
                             .map(|arg| argument_type_name(arg, column))
@@ -3417,6 +3421,7 @@ fn is_xml_function(name: &str) -> bool {
         "XML_IS_WELL_FORMED"
             | "XPATH"
             | "XPATH_EXISTS"
+            | XMLEXISTS
             | "XML_IS_WELL_FORMED_DOCUMENT"
             | "XML_IS_WELL_FORMED_CONTENT"
             | "XMLCOMMENT"
@@ -3699,6 +3704,10 @@ fn is_text_type(data_type: &str) -> bool {
 /// The function date/time arithmetic is rewritten to:
 /// `__DATETIME__(op, left, right, left_type, right_type)`.
 pub(crate) const DATETIME_OP: &str = "__DATETIME__";
+
+/// The call `XMLEXISTS(...)` is rewritten to (its arguments are
+/// `xpath_exists`'s).
+pub(crate) const XMLEXISTS: &str = "__XMLEXISTS__";
 
 /// The function [`check_integer_ranges`] wraps a result in: its first
 /// argument, or an error when that is outside the type named by the second.

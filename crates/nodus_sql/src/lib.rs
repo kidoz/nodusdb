@@ -49,8 +49,8 @@ pub fn parse_sql(
     }
     let tokens = reorder_identity_options(reorder_sequence_options(rewrite_data_clauses(
         rewrite_record_star(rewrite_json_table(rewrite_sql_json(
-            rewrite_json_constructors(rewrite_xml_constructors(rewrite_xml_syntax(
-                rewrite_query_syntax(tokens),
+            rewrite_json_constructors(rewrite_xmlexists(rewrite_xml_constructors(
+                rewrite_xml_syntax(rewrite_query_syntax(tokens)),
             ))),
         ))),
     )));
@@ -1041,6 +1041,200 @@ fn rewrite_sql_json(
             let len = snippet.len();
             tokens.splice(i..=close, snippet);
             i += len;
+            continue;
+        }
+        i += 1;
+    }
+    tokens
+}
+
+/// `XMLEXISTS(expression PASSING [BY {REF|VALUE}] document [BY {REF|VALUE}])`
+/// — optionally led by an `XMLNAMESPACES(...)` clause — which the parser
+/// cannot read, rewritten to the `xpath_exists` call it means (see
+/// `xpath.rs`): `pg_catalog.xpath_exists(expression, document
+/// [, ARRAY[ARRAY[prefix, uri], ...]])`.
+fn rewrite_xmlexists(
+    mut tokens: Vec<sqlparser::tokenizer::TokenWithSpan>,
+) -> Vec<sqlparser::tokenizer::TokenWithSpan> {
+    use sqlparser::tokenizer::{Token, TokenWithSpan};
+    let word = |t: &TokenWithSpan| match &t.token {
+        Token::Word(w) if w.quote_style.is_none() => Some(w.value.clone()),
+        _ => None,
+    };
+    let significant = |tokens: &[TokenWithSpan], from: usize| {
+        (from..tokens.len()).find(|&i| !matches!(tokens[i].token, Token::Whitespace(_)))
+    };
+    let matching_paren = |tokens: &[TokenWithSpan], open: usize| {
+        let mut depth = 0i32;
+        for (i, token) in tokens.iter().enumerate().skip(open) {
+            match token.token {
+                Token::LParen => depth += 1,
+                Token::RParen => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    };
+    let split = |tokens: &[TokenWithSpan], from: usize, to: usize| {
+        let mut items = Vec::new();
+        let mut depth = 0i32;
+        let mut start = None;
+        for (i, token) in tokens.iter().enumerate().take(to).skip(from) {
+            match token.token {
+                Token::LParen | Token::LBracket => depth += 1,
+                Token::RParen | Token::RBracket => depth -= 1,
+                Token::Comma if depth == 0 => {
+                    items.push((start.unwrap_or(from), i));
+                    start = None;
+                    continue;
+                }
+                _ => {}
+            }
+            if start.is_none() && !matches!(token.token, Token::Whitespace(_)) {
+                start = Some(i);
+            }
+        }
+        if let Some(start) = start {
+            items.push((start, to));
+        }
+        items
+    };
+    let mut i = 0;
+    while i < tokens.len() {
+        if word(&tokens[i]).as_deref() != Some("xmlexists") {
+            i += 1;
+            continue;
+        }
+        let Some(open) = significant(&tokens, i + 1) else {
+            i += 1;
+            continue;
+        };
+        if tokens[open].token != Token::LParen {
+            i += 1;
+            continue;
+        }
+        let Some(close) = matching_paren(&tokens, open) else {
+            i += 1;
+            continue;
+        };
+        let items = split(&tokens, open + 1, close);
+        let mut at = 0;
+        // `XMLNAMESPACES('uri' AS prefix, DEFAULT 'uri', ...)`.
+        let mut namespaces: Vec<(String, String)> = Vec::new();
+        if items
+            .first()
+            .is_some_and(|(from, _)| word(&tokens[*from]).as_deref() == Some("xmlnamespaces"))
+        {
+            let Some((from, _)) = items.first().copied() else {
+                i += 1;
+                continue;
+            };
+            let Some(nopen) = significant(&tokens, from + 1) else {
+                i += 1;
+                continue;
+            };
+            let Some(nclose) = matching_paren(&tokens, nopen) else {
+                i += 1;
+                continue;
+            };
+            let mut ok = true;
+            for (nf, nto) in split(&tokens, nopen + 1, nclose) {
+                let text = render_tokens(&tokens[nf..nto]);
+                let item = text.trim();
+                // `'uri' AS prefix` or `DEFAULT 'uri'`; the URI stays the
+                // SQL literal it was written as.
+                let lower = item.to_ascii_lowercase();
+                let parsed = if let Some(rest) = lower.rfind(" as ") {
+                    let prefix = item[rest + 4..].trim().to_string();
+                    let uri = item[..rest].trim().to_string();
+                    Some((prefix, uri))
+                } else {
+                    lower.strip_prefix("default ").map(|rest| {
+                        (
+                            String::new(),
+                            item[item.len() - rest.len()..].trim().to_string(),
+                        )
+                    })
+                };
+                let Some((prefix, uri)) = parsed.filter(|(_, uri)| !uri.is_empty()) else {
+                    ok = false;
+                    break;
+                };
+                namespaces.push((prefix, uri));
+            }
+            if !ok {
+                i += 1;
+                continue;
+            }
+            at = 1;
+        }
+        let Some((pf, pto)) = items.get(at).copied() else {
+            i += 1;
+            continue;
+        };
+        // The expression runs to the `PASSING` keyword.
+        let mut path_end = pto;
+        for (index, token) in tokens.iter().enumerate().take(pto).skip(pf) {
+            if word(token).as_deref() == Some("passing") {
+                path_end = index;
+                break;
+            }
+        }
+        let path = render_tokens(&tokens[pf..path_end]);
+        if path.trim().is_empty() || path_end == pto {
+            i += 1;
+            continue;
+        }
+        // `PASSING [BY {REF|VALUE}] document [BY {REF|VALUE}]`.
+        let mut document_from = path_end + 1;
+        let by_kind = |at: usize| -> Option<usize> {
+            let by = significant(&tokens, at).filter(|&k| k < pto)?;
+            if word(&tokens[by]).as_deref() != Some("by") {
+                return None;
+            }
+            let kind = significant(&tokens, by + 1).filter(|&k| k < pto)?;
+            matches!(word(&tokens[kind]).as_deref(), Some("ref" | "value")).then_some(kind + 1)
+        };
+        if let Some(after) = by_kind(path_end + 1) {
+            document_from = after;
+        }
+        // A trailing `BY {REF|VALUE}` ends the document.
+        let mut rest = pto;
+        let mut at = document_from;
+        while at < pto {
+            match by_kind(at) {
+                Some(_) => {
+                    rest = at;
+                    break;
+                }
+                None => at += 1,
+            }
+        }
+        let document = render_tokens(&tokens[document_from..rest]);
+        if document.trim().is_empty() {
+            i += 1;
+            continue;
+        }
+        let replacement = if namespaces.is_empty() {
+            format!("pg_catalog.__xmlexists__({path}, {document})")
+        } else {
+            let pairs: Vec<String> = namespaces
+                .iter()
+                .map(|(prefix, uri)| format!("ARRAY['{}', {uri}]", prefix.replace('\'', "''")))
+                .collect();
+            format!(
+                "pg_catalog.__xmlexists__({path}, {document}, ARRAY[{}])",
+                pairs.join(", ")
+            )
+        };
+        if let Some(snippet) = snippet_tokens(&replacement) {
+            tokens.splice(i..=close, snippet);
+            i = 0;
             continue;
         }
         i += 1;
@@ -3505,11 +3699,16 @@ mod tests {
 }
 
 #[cfg(test)]
-mod json_table_rewrite_tests {
+mod rewrite_tests {
     use crate::*;
 
     /// The SQL a statement is tokenized, rewritten, and rendered as.
-    fn rewritten(sql: &str) -> String {
+    fn rewritten_by(
+        sql: &str,
+        rewriter: fn(
+            Vec<sqlparser::tokenizer::TokenWithSpan>,
+        ) -> Vec<sqlparser::tokenizer::TokenWithSpan>,
+    ) -> String {
         let dialect = sqlparser::dialect::PostgreSqlDialect {};
         let mut tokens = sqlparser::tokenizer::Tokenizer::new(&dialect, sql)
             .tokenize_with_location()
@@ -3521,7 +3720,34 @@ mod json_table_rewrite_tests {
                 word.value.make_ascii_lowercase();
             }
         }
-        render_tokens(&rewrite_json_table(tokens))
+        render_tokens(&rewriter(tokens))
+    }
+
+    fn rewritten(sql: &str) -> String {
+        rewritten_by(sql, rewrite_json_table)
+    }
+
+    fn xmlexists_rewritten(sql: &str) -> String {
+        rewritten_by(sql, rewrite_xmlexists)
+    }
+
+    #[test]
+    fn xmlexists_becomes_xpath_exists() {
+        assert_eq!(
+            xmlexists_rewritten("select xmlexists('/a' passing '<a/>')"),
+            "select pg_catalog.__xmlexists__('/a' ,  '<a/>')"
+        );
+        assert_eq!(
+            xmlexists_rewritten("select xmlexists('/a' passing by value '<a/>' by value)"),
+            "select pg_catalog.__xmlexists__('/a' ,  '<a/>')"
+        );
+        assert_eq!(
+            xmlexists_rewritten(
+                "select xmlexists(xmlnamespaces('urn:x' as x), '/x:a' passing '<x:a xmlns:x=\"urn:x\"/>')"
+            ),
+            "select pg_catalog.__xmlexists__('/x:a' ,  '<x:a xmlns:x=\"urn:x\"/>', \
+             ARRAY[ARRAY['x', 'urn:x']])"
+        );
     }
 
     #[test]
