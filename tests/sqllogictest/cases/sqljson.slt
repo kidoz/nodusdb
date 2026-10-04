@@ -601,3 +601,756 @@ select json_query('{"a":1}', '$.a' returning jsonb);;
 
 statement error
 select '{a}'::jsonb;;
+
+# The SQL/JSON array and object constructors, and their aggregates.
+query T
+select json_array();;
+----
+[]
+
+query T
+select json_object();;
+----
+{}
+
+query T
+select json_array(1, 2);;
+----
+[1, 2]
+
+query T
+select json_array(1, null, 2);;
+----
+[1, 2]
+
+query T
+select json_array(1, null, 2 null on null);;
+----
+[1, null, 2]
+
+query T
+select json_array(1, null, 2 absent on null);;
+----
+[1, 2]
+
+query T
+select json_array('a', 'b', true, 1.5);;
+----
+["a", "b", true, 1.5]
+
+query T
+select json_array('{"a": 1}'::json);;
+----
+[{"a": 1}]
+
+query T
+select json_array('{"a": 1}'::jsonb);;
+----
+[{"a": 1}]
+
+query T
+select json_array('{"a": 1}' format json);;
+----
+[{"a": 1}]
+
+query T
+select json_array('[1,2]' format json);;
+----
+[[1,2]]
+
+query T
+select json_array('1' format json);;
+----
+[1]
+
+query T
+select json_array('null' format json);;
+----
+[null]
+
+query T
+select json_array(null format json);;
+----
+[]
+
+query T
+select json_array('null' format json null on null);;
+----
+[null]
+
+query T
+select json_array(null format json null on null);;
+----
+[null]
+
+query T
+select json_array(array[1,2]);;
+----
+[[1,2]]
+
+query T
+select json_array(array['a','b']);;
+----
+[["a","b"]]
+
+query T
+select json_array(row(1,'a'));;
+----
+[{"f1":1,"f2":"a"}]
+
+query T
+select json_array('a' || 'b');;
+----
+["ab"]
+
+query T
+select json_array(1 returning text);;
+----
+[1]
+
+query T
+select json_array(1 returning varchar(4));;
+----
+[1]
+
+statement error
+select json_array(1 returning varchar(2));;
+
+query T
+select json_array(1 returning jsonb);;
+----
+[1]
+
+query T
+select json_array(1, 2 returning jsonb);;
+----
+[1, 2]
+
+query T
+select json_array(1 returning bytea);;
+----
+\x5b315d
+
+query T
+select json_array(1 returning name);;
+----
+[1]
+
+statement error
+select json_array(1 returning int);;
+
+statement error
+select json_array(1 returning numeric);;
+
+statement error
+select json_array(1 returning boolean);;
+
+query T
+select json_array('1' format json returning text);;
+----
+[1]
+
+query T
+select json_array('1' format json returning jsonb);;
+----
+[1]
+
+query T
+select json_array(1) is json array;;
+----
+t
+
+query T
+select pg_typeof(json_array(1));;
+----
+json
+
+query T
+select json_array(array[1,2], json_object('a': 1));;
+----
+[[1,2], {"a" : 1}]
+
+query T
+select json_array(json_array(1, 2), json_object('a': jsonb '{"b": 3}'));;
+----
+[[1, 2], {"a": {"b": 3}}]
+
+query T
+select json_array('{"a":1}'::jsonb, json '{"b": 2}');;
+----
+[{"a": 1}, {"b": 2}]
+
+query T
+select json_array(1e2, -0.5, 'NaN'::float8);;
+----
+[100, -0.5, "NaN"]
+
+query T
+select json_array(interval '1 day');;
+----
+["1 day"]
+
+query T
+select json_array(point(1,2));;
+----
+["(1,2)"]
+
+query T
+select json_array('[1,5)'::int4range);;
+----
+["[1,5)"]
+
+statement error
+select json_array(1 format json);;
+
+statement error
+select json_array(1, 2, null on null);;
+
+query T
+select json_object('a': 1);;
+----
+{"a" : 1}
+
+query T
+select json_object('a': 1, 'b': 2);;
+----
+{"a" : 1, "b" : 2}
+
+query T
+select json_object('a' value 1);;
+----
+{"a" : 1}
+
+query T
+select json_object('a' VALUE 2, 'b' value 3);;
+----
+{"a" : 2, "b" : 3}
+
+query T
+select json_object('a': null, 'b': 2);;
+----
+{"a" : null, "b" : 2}
+
+query T
+select json_object('a': null, 'b': 2 absent on null);;
+----
+{"b" : 2}
+
+query T
+select json_object('a': null, 'b': 2 null on null);;
+----
+{"a" : null, "b" : 2}
+
+query T
+select json_object(1: 2, true: 3, 1.5: 4);;
+----
+{"1" : 2, "true" : 3, "1.5" : 4}
+
+query T
+select json_object('a"b': 1);;
+----
+{"a\"b" : 1}
+
+query T
+select json_object('a'||'b': 1, chr(10)||'x': 2);;
+----
+{"ab" : 1, "\nx" : 2}
+
+query T
+select json_object('a': 1, 'a': 2);;
+----
+{"a" : 1, "a" : 2}
+
+statement error
+select json_object('a': 1, 'a': 2 with unique keys);;
+
+statement error
+select json_object('a': 1, 'a': 2 with unique);;
+
+query T
+select json_object('a': 1, 'a': 2 without unique keys);;
+----
+{"a" : 1, "a" : 2}
+
+query T
+select json_object('a': 1, 'b': null absent on null with unique keys);;
+----
+{"a" : 1}
+
+query T
+select json_object('a': 1 returning jsonb);;
+----
+{"a": 1}
+
+query T
+select json_object('a': 1 returning text);;
+----
+{"a" : 1}
+
+query T
+select json_object('a': 1 returning varchar(20));;
+----
+{"a" : 1}
+
+query T
+select json_object('a': 1 returning bytea);;
+----
+\x7b226122203a20317d
+
+statement error
+select json_object('a': 1 returning int);;
+
+query T
+select json_object('a': 1 returning json);;
+----
+{"a" : 1}
+
+query T
+select json_object('a': array[1,2]);;
+----
+{"a" : [1,2]}
+
+query T
+select json_object('a': row(1,2));;
+----
+{"a" : {"f1":1,"f2":2}}
+
+query T
+select json_object('a': interval '1 day');;
+----
+{"a" : "1 day"}
+
+query T
+select json_object('a': '1' format json);;
+----
+{"a" : 1}
+
+query T
+select json_object('a': 'null' format json);;
+----
+{"a" : null}
+
+query T
+select json_object('a': null format json);;
+----
+{"a" : null}
+
+query T
+select json_object('a': 1, 'b': '{"c": 3}' format json);;
+----
+{"a" : 1, "b" : {"c": 3}}
+
+query T
+select json_object('a': null format json absent on null);;
+----
+{}
+
+query T
+select json_object('a': to_jsonb(1), 'c': 2);;
+----
+{"a": 1, "c": 2}
+
+query T
+select json_object('a': jsonb '{"b": 3}');;
+----
+{"a": {"b": 3}}
+
+query T
+select json_object('a': json '{"b": 3}');;
+----
+{"a" : {"b": 3}}
+
+query T
+select json_object('a': jsonb '1', 'c': json '{"d":4}');;
+----
+{"a": 1, "c": {"d": 4}}
+
+query T
+select json_object('a': '{"b": 3}'::json, 'c': '{"d":4}'::jsonb);;
+----
+{"a": {"b": 3}, "c": {"d": 4}}
+
+statement error
+select json_object(null: 1);;
+
+statement error
+select json_object(array[1]: 1);;
+
+statement error
+select json_object('{"a":1}'::json: 1);;
+
+statement error
+select json_object('a': 1, null: 2);;
+
+statement error
+select json_object('a': 1, null: 2 absent on null);;
+
+statement error
+select json_object('a': 1, row(1): 2);;
+
+query T
+select json_object('a': 1) is json object;;
+----
+t
+
+query T
+select pg_typeof(json_object('a': 1));;
+----
+json
+
+query T
+select json_array(json_object('a': 1), json_object('b': 2));;
+----
+[{"a" : 1}, {"b" : 2}]
+
+query T
+select json_object('a': json_object('b': 1));;
+----
+{"a" : {"b" : 1}}
+
+query T
+select json_object('a': json_array(1, 2));;
+----
+{"a" : [1, 2]}
+
+query T
+select json_arrayagg(x) from (values (1),(2)) t(x);;
+----
+[1, 2]
+
+query T
+select json_arrayagg(x) from (values (1),(null),(2)) t(x);;
+----
+[1, 2]
+
+query T
+select json_arrayagg(x null on null) from (values (1),(null),(2)) t(x);;
+----
+[1, null, 2]
+
+query T
+select json_arrayagg(x absent on null) from (values (1),(null),(2)) t(x);;
+----
+[1, 2]
+
+query T
+select json_arrayagg(x) from (values (null),(null)) t(x);;
+----
+[]
+
+query T
+select json_arrayagg(x) from (values (null)) t(x);;
+----
+[]
+
+query T
+select json_arrayagg(v order by v desc) from (values (2),(1),(null)) t(v);;
+----
+[2, 1]
+
+query T
+select json_arrayagg(v order by v desc nulls first) from (values (2),(1),(null)) t(v);;
+----
+[2, 1]
+
+query T
+select json_arrayagg(v order by v nulls first null on null) from (values (2),(null),(1)) t(v);;
+----
+[null, 1, 2]
+
+query T
+select json_arrayagg(x) from (values (1)) t(x) where x > 10;;
+----
+NULL
+
+query T
+select json_arrayagg(x returning text) from (values (1),(2)) t(x);;
+----
+[1, 2]
+
+query T
+select json_arrayagg(x returning jsonb) from (values (1),(2)) t(x);;
+----
+[1, 2]
+
+statement error
+select json_arrayagg(x returning int) from (values (1)) t(x);;
+
+query T
+select pg_typeof(json_arrayagg(x)) from (values (1)) t(x);;
+----
+json
+
+query T
+select json_arrayagg(x || '!') from (values ('a'),('b')) t(x);;
+----
+["a!", "b!"]
+
+query T
+select json_arrayagg(v order by k) from (values ('a',2),('b',1)) t(v,k);;
+----
+["b", "a"]
+
+query T
+select json_arrayagg(x) filter (where x > 1) from (values (1),(2),(3)) t(x);;
+----
+[2, 3]
+
+query T
+select json_arrayagg(x format json) from (values ('1'),('"a"')) t(x);;
+----
+[1, "a"]
+
+query T
+select json_arrayagg(x) from (values (json '{"d":4}'),(json '{"e":5}')) t(x);;
+----
+[{"d":4}, {"e":5}]
+
+query T
+select json_arrayagg(x) from (values (json '{"d":4}'),(to_jsonb(1)::json)) t(x);;
+----
+[{"d":4}, 1]
+
+query T
+select json_arrayagg(x) over () from (values (1),(2)) t(x);;
+----
+[1, 2]
+[1, 2]
+
+query TT
+select count(*), json_arrayagg(x) from (values (1),(2)) t(x);;
+----
+2	[1, 2]
+
+query T rowsort
+select json_arrayagg(x) from (values (1),(2)) t(x) group by x % 2 order by x % 2;;
+----
+[2]
+[1]
+
+query T
+select json_arrayagg(x)::text from (values (1),(2)) t(x);;
+----
+[1, 2]
+
+query T
+select json_arrayagg(x) || '!' from (values (1)) t(x);;
+----
+[1]!
+
+query T
+select json_arrayagg(x)::jsonb from (values (1)) t(x);;
+----
+[1]
+
+query T
+select json_arrayagg(x) from (values (1)) t(x) having count(*) > 0;;
+----
+[1]
+
+query T
+select json_arrayagg(x) filter (where x > 1) from (values (1),(2)) t(x) group by x % 2 order by x % 2;;
+----
+[2]
+NULL
+
+query T
+select json_arrayagg(x) is json array from (values (1)) t(x);;
+----
+t
+
+query T
+select json_array((select 1));;
+----
+[1]
+
+query T
+select json_objectagg(k value v) from (values ('a',1),('b',2)) t(k,v);;
+----
+{ "a" : 1, "b" : 2 }
+
+query T
+select json_objectagg(k: v) from (values ('a',1),('b',2)) t(k,v);;
+----
+{ "a" : 1, "b" : 2 }
+
+query T
+select json_objectagg(k value v null on null) from (values ('a',1),('b',null)) t(k,v);;
+----
+{ "a" : 1, "b" : null }
+
+query T
+select json_objectagg(k value v absent on null) from (values ('a',1),('b',null)) t(k,v);;
+----
+{ "a" : 1 }
+
+query T
+select json_objectagg(k value v with unique keys) from (values ('a',1),('b',2)) t(k,v);;
+----
+{ "a" : 1, "b" : 2 }
+
+query T
+select json_objectagg(k value v) from (values ('a',1),('a',2)) t(k,v);;
+----
+{ "a" : 1, "a" : 2 }
+
+statement error
+select json_objectagg(k value v with unique keys) from (values ('a',1),('a',2)) t(k,v);;
+
+query T
+select json_objectagg(k value v) from (values ('a',null)) t(k,v);;
+----
+{ "a" : null }
+
+query T
+select json_objectagg(k value v) from (values ('a',1)) t(k,v) where false;;
+----
+NULL
+
+query T
+select json_objectagg(k value v returning text) from (values ('a',1)) t(k,v);;
+----
+{ "a" : 1 }
+
+query T
+select json_objectagg(k value v returning jsonb) from (values ('a',1)) t(k,v);;
+----
+{"a": 1}
+
+statement error
+select json_objectagg(k value v returning int) from (values ('a',1)) t(k,v);;
+
+query T
+select json_objectagg(k value v) from (values ('a',to_jsonb(1))) t(k,v);;
+----
+{"a": 1}
+
+query T
+select json_objectagg(k value v) from (values ('a',json '{"d":4}')) t(k,v);;
+----
+{ "a" : {"d":4} }
+
+statement error
+select json_objectagg(k value v) from (values (null,1)) t(k,v);;
+
+statement error
+select json_objectagg(array[1] value 1) from (values (1)) t(x);;
+
+query T
+select json_objectagg(k value v) from (values (1,2)) t(k,v);;
+----
+{ "1" : 2 }
+
+query T rowsort
+select json_objectagg(k value v) from (values ('a',1),('b',2)) t(k,v) group by k order by k;;
+----
+{ "a" : 1 }
+{ "b" : 2 }
+
+query T
+select json_objectagg(k value '{"c": 3}' format json) from (values ('a')) t(k);;
+----
+{ "a" : {"c": 3} }
+
+query T
+select json_objectagg(k value v) from (values ('a',null)) t(k,v) where false;;
+----
+NULL
+
+query T
+select pg_typeof(json_objectagg(k value v)) from (values ('a',1)) t(k,v);;
+----
+json
+
+query T
+select json_objectagg(k value v)::text from (values ('a',1)) t(k,v);;
+----
+{ "a" : 1 }
+
+query T
+select json_objectagg(k value v) from (values ('a',1)) t(k,v) group by k;;
+----
+{ "a" : 1 }
+
+query T
+select json_arrayagg(x) from (values (1)) t(x) where 1=0 group by x;;
+----
+
+query T
+select json_objectagg(k value v) from (values ('a',1)) t(k,v) where 1=0 group by k;;
+----
+
+query T
+select json_array(returning jsonb);;
+----
+[]
+
+query T
+select json_object(returning text);;
+----
+{}
+
+query T
+select json_object(returning jsonb);;
+----
+{}
+
+query T
+select json_array(bytea '{"a":1}' format json encoding utf8);;
+----
+[{"a":1}]
+
+statement error
+select json_array('{"a":1}' format json encoding utf8);;
+
+statement error
+select json_array(null format json encoding utf8);;
+
+query T
+select json_object('a': bytea '{"b":1}' format json encoding utf8);;
+----
+{"a" : {"b":1}}
+
+statement error
+select json_array(absent on null);;
+
+statement error
+select json_object(null on null);;
+
+query T
+select json_object('c': 2, 'a': to_jsonb(1));;
+----
+{"a": 1, "c": 2}
+
+query T
+select json_arrayagg(to_jsonb(1)) from generate_series(1,1);;
+----
+[1]
+
+query T
+select json_objectagg(k value to_jsonb(1)) from (values ('a')) t(k);;
+----
+{"a": 1}
+
+query T
+select json_array(to_jsonb(1), json '{"d":4}');;
+----
+[1, {"d": 4}]
+
+query T
+select json_array(to_jsonb(1), json '{"d":4}' returning text);;
+----
+[1, {"d":4}]
+
+query T
+select json_object('a': to_jsonb(1) returning text);;
+----
+{"a" : 1}
+
+query T
+select json_object('a': to_jsonb(1) returning json);;
+----
+{"a" : 1}
+
+statement error
+select json_object('{"a":1}'::jsonb: 1);;
