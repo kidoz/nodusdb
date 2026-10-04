@@ -619,6 +619,40 @@ pub(crate) fn aggregate_inputs(op: &AggregateOp, inputs: &[(Value, Vec<Value>)])
             let parts: Vec<&str> = parts.iter().map(String::as_str).collect();
             Value::Text(crate::xml::concat(&parts))
         }
+        // `json_arrayagg(x ...)`: the values as a JSON array, over no rows
+        // NULL. The null clause and the RETURNING type ride in the further
+        // arguments.
+        AggregateOp::SqlJsonArrayAgg => {
+            if inputs.is_empty() {
+                return Value::Null;
+            }
+            let setting = |n: usize| inputs.iter().find_map(|(_, extra)| extra.get(n));
+            let absent = setting(0).is_some_and(|v| matches!(v, Value::Bool(true)));
+            let returning = setting(1).map_or_else(|| "json".to_string(), crate::render);
+            let values: Vec<Value> = values().cloned().collect();
+            match crate::sqljson::json_array(absent, &returning, &values) {
+                Ok(value) => value,
+                Err(error) => return crate::eval_error::raise(error),
+            }
+        }
+        // `json_objectagg(k, v ...)`: the pairs as a JSON object.
+        AggregateOp::SqlJsonObjectAgg => {
+            if inputs.is_empty() {
+                return Value::Null;
+            }
+            let setting = |n: usize| inputs.iter().find_map(|(_, extra)| extra.get(n));
+            let absent = setting(1).is_some_and(|v| matches!(v, Value::Bool(true)));
+            let unique = setting(2).is_some_and(|v| matches!(v, Value::Text(t) if t == "unique"));
+            let returning = setting(3).map_or_else(|| "json".to_string(), crate::render);
+            let pairs: Vec<(Value, Value)> = inputs
+                .iter()
+                .map(|(key, extra)| (key.clone(), extra.first().cloned().unwrap_or(Value::Null)))
+                .collect();
+            match crate::sqljson::json_object(absent, unique, true, &returning, &pairs) {
+                Ok(value) => value,
+                Err(error) => return crate::eval_error::raise(error),
+            }
+        }
         AggregateOp::BitAnd | AggregateOp::BitOr | AggregateOp::BitXor => {
             let mut result: Option<i64> = None;
             for value in non_null() {
@@ -1082,6 +1116,93 @@ mod tests {
         assert_eq!(
             regression(&AggregateOp::CovarSamp, &pairs[..1]),
             Value::Null
+        );
+    }
+
+    #[test]
+    fn sql_json_aggregates_read_their_clauses() {
+        // `json_arrayagg(x [NULL|ABSENT ON NULL] [RETURNING type])`: the null
+        // clause and the RETURNING type ride in the further arguments.
+        let array = |values: &[Value], extra: &[Value]| {
+            aggregate_inputs(&AggregateOp::SqlJsonArrayAgg, &inputs(values, extra))
+        };
+        let json = |returning: &str| [Value::Bool(true), Value::Text(returning.into())];
+        assert_eq!(
+            array(&ints(&[2, 1]), &json("json")),
+            Value::Json("[2, 1]".into())
+        );
+        assert_eq!(
+            array(&ints(&[2, 1]), &json("jsonb")),
+            Value::Jsonb(crate::json_text::parse("[2, 1]").unwrap())
+        );
+        assert_eq!(
+            array(&[Value::Int(1), Value::Null], &json("json")),
+            Value::Json("[1]".into()),
+            "ABSENT ON NULL leaves a NULL element out"
+        );
+        assert_eq!(
+            array(
+                &[Value::Int(1), Value::Null],
+                &[Value::Bool(false), Value::Text("json".into())]
+            ),
+            Value::Json("[1, null]".into())
+        );
+        assert_eq!(
+            aggregate_inputs(&AggregateOp::SqlJsonArrayAgg, &[]),
+            Value::Null,
+            "no rows leave NULL"
+        );
+        assert_eq!(
+            array(&[Value::Null], &json("json")),
+            Value::Json("[]".into()),
+            "an all-NULL group is an empty array"
+        );
+
+        // `json_objectagg(key, value [NULL|ABSENT ON NULL] [WITH UNIQUE KEYS]
+        // [RETURNING type])`.
+        let pair = |key: &str, value: Value| {
+            (
+                Value::Text(key.into()),
+                vec![
+                    value,
+                    Value::Bool(false),
+                    Value::Text(String::new()),
+                    Value::Text(String::new()),
+                ],
+            )
+        };
+        assert_eq!(
+            aggregate_inputs(&AggregateOp::SqlJsonObjectAgg, &[pair("a", Value::Int(1))]),
+            Value::Json("{ \"a\" : 1 }".into())
+        );
+        let duplicate = [pair("a", Value::Int(1)), pair("a", Value::Int(2))];
+        assert_eq!(
+            aggregate_inputs(&AggregateOp::SqlJsonObjectAgg, &duplicate),
+            Value::Json("{ \"a\" : 1, \"a\" : 2 }".into()),
+            "without UNIQUE KEYS a duplicate key is kept"
+        );
+        let mut unique = duplicate.clone();
+        for (_, extra) in &mut unique {
+            extra[2] = Value::Text("unique".into());
+        }
+        crate::eval_error::reset();
+        assert_eq!(
+            aggregate_inputs(&AggregateOp::SqlJsonObjectAgg, &unique),
+            Value::Null
+        );
+        assert!(
+            crate::eval_error::check()
+                .unwrap_err()
+                .to_string()
+                .starts_with("duplicate JSON object key value: \"a\""),
+            "the unique-keys clause refuses a duplicate"
+        );
+        // A `jsonb` value makes the object canonical, its keys sorted.
+        let mut canonical = vec![pair("c", Value::Int(2))];
+        canonical[0].1[0] = Value::Jsonb(crate::json_text::parse("2").unwrap());
+        assert_eq!(
+            aggregate_inputs(&AggregateOp::SqlJsonObjectAgg, &canonical),
+            Value::Jsonb(crate::json_text::parse("{\"c\": 2}").unwrap())
         );
     }
 }

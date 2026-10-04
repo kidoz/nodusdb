@@ -65,6 +65,9 @@ fn aggregate_type(op: &AggregateOp, input: Option<String>) -> Option<String> {
         }),
         AggregateOp::RangeIntersectAgg => input,
         AggregateOp::XmlAgg => Some("XML".into()),
+        // The SQL/JSON aggregates; the RETURNING type replaces this in the
+        // expression typing, which reads it from the call's arguments.
+        AggregateOp::SqlJsonArrayAgg | AggregateOp::SqlJsonObjectAgg => Some("JSON".into()),
     }
 }
 
@@ -2056,6 +2059,8 @@ pub(crate) fn check_integer_ranges(
                 | AggregateOp::JsonbAgg
                 | AggregateOp::JsonObjectAgg
                 | AggregateOp::JsonbObjectAgg
+                | AggregateOp::SqlJsonArrayAgg
+                | AggregateOp::SqlJsonObjectAgg
         ) && arg_expr
             .as_deref()
             .and_then(|e| geo_kind(e))
@@ -2131,6 +2136,40 @@ pub(crate) fn check_integer_ranges(
                 order_by: order_by.clone(),
             };
         }
+        // The SQL/JSON aggregates, as the parser rewrote them: the null
+        // clause and the RETURNING type ride as further arguments, and the
+        // result takes the RETURNING type.
+        ScalarExpr::Aggregate {
+            op: op @ (AggregateOp::SqlJsonArrayAgg | AggregateOp::SqlJsonObjectAgg),
+            arg,
+            arg_expr,
+            distinct,
+            extra_args,
+            filter,
+            order_by,
+        } => {
+            let target = if *op == AggregateOp::SqlJsonArrayAgg {
+                extra_args.get(1)
+            } else {
+                extra_args.get(3)
+            };
+            let returning = match json_returning(target) {
+                Ok(returning) => returning,
+                Err(message) => return sql_json_error(message, "42846"),
+            };
+            return ScalarExpr::Cast {
+                expr: Box::new(ScalarExpr::Aggregate {
+                    op: op.clone(),
+                    arg: arg.clone(),
+                    arg_expr: arg_expr.clone(),
+                    distinct: *distinct,
+                    extra_args: extra_args.clone(),
+                    filter: filter.clone(),
+                    order_by: order_by.clone(),
+                }),
+                target: returning,
+            };
+        }
         // Only `count`, the collectors, and `xmlagg` take an XML value; the
         // other aggregates have no overload for it.
         ScalarExpr::Aggregate {
@@ -2144,6 +2183,8 @@ pub(crate) fn check_integer_ranges(
                     | AggregateOp::JsonbAgg
                     | AggregateOp::JsonObjectAgg
                     | AggregateOp::JsonbObjectAgg
+                    | AggregateOp::SqlJsonArrayAgg
+                    | AggregateOp::SqlJsonObjectAgg
             )
             && arg_expr
                 .as_deref()
@@ -2166,6 +2207,8 @@ pub(crate) fn check_integer_ranges(
                 | AggregateOp::JsonbObjectAgg
                 | AggregateOp::RangeAgg
                 | AggregateOp::RangeIntersectAgg
+                | AggregateOp::SqlJsonArrayAgg
+                | AggregateOp::SqlJsonObjectAgg
         ) && arg_expr
             .as_deref()
             .and_then(|e| range_side(e))

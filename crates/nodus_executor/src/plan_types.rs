@@ -274,6 +274,14 @@ pub enum AggregateOp {
     RangeIntersectAgg,
     /// `xmlagg(x)`: the values concatenated, their XML declarations merged.
     XmlAgg,
+    /// `json_arrayagg(x [ORDER BY ...] [NULL|ABSENT ON NULL] [RETURNING
+    /// type])`: the values as a JSON array, with the null clause and the
+    /// RETURNING type as its further arguments.
+    SqlJsonArrayAgg,
+    /// `json_objectagg(k, v ...)`: the keys and values as a JSON object, with
+    /// the null clause, the unique-keys clause, and the RETURNING type as its
+    /// further arguments.
+    SqlJsonObjectAgg,
 }
 
 impl AggregateOp {
@@ -319,6 +327,8 @@ impl AggregateOp {
             AggregateOp::RegrSyy => "regr_syy",
             AggregateOp::RegrSxy => "regr_sxy",
             AggregateOp::XmlAgg => "xmlagg",
+            AggregateOp::SqlJsonArrayAgg => "json_arrayagg",
+            AggregateOp::SqlJsonObjectAgg => "json_objectagg",
             AggregateOp::BitXor => "bit_xor",
             AggregateOp::AnyValue => "any_value",
             AggregateOp::RangeAgg => "range_agg",
@@ -350,6 +360,11 @@ impl AggregateOp {
             | AggregateOp::HypotheticalDenseRank
             | AggregateOp::HypotheticalPercentRank
             | AggregateOp::HypotheticalCumeDist => 4,
+            // The array aggregate's element, null clause, and RETURNING type.
+            AggregateOp::SqlJsonArrayAgg => 3,
+            // The object aggregate's key, value, null clause, unique-keys
+            // clause, and RETURNING type.
+            AggregateOp::SqlJsonObjectAgg => 5,
             _ => 1,
         }
     }

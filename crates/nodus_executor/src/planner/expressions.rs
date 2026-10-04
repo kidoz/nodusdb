@@ -2682,6 +2682,11 @@ pub(crate) fn aggregate_op(name: &str) -> Option<AggregateOp> {
         "REGR_SYY" => Some(AggregateOp::RegrSyy),
         "REGR_SXY" => Some(AggregateOp::RegrSxy),
         "XMLAGG" => Some(AggregateOp::XmlAgg),
+        // The SQL/JSON aggregates, as the parser rewrites them (see
+        // `sqljson.rs`): the null clause and the RETURNING type ride along
+        // as further arguments.
+        "__JSON_ARRAYAGG__" => Some(AggregateOp::SqlJsonArrayAgg),
+        "__JSON_OBJECTAGG__" => Some(AggregateOp::SqlJsonObjectAgg),
         _ => None,
     }
 }

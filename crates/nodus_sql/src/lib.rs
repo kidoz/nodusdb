@@ -1046,13 +1046,16 @@ fn rewrite_sql_json(
     tokens
 }
 
-/// The SQL/JSON array and object constructors, which the parser cannot read
-/// with their clauses: `JSON_ARRAY` and `JSON_OBJECT`, each rewritten to the
-/// marker function the planner knows (see `sqljson.rs`). The shapes are
-/// `__json_array__(absent, returning, element...)` and
-/// `__json_object__(absent, unique, returning, key, value, ...)`, with an
-/// element under `FORMAT JSON` as `pg_catalog.__json_format__(value,
-/// encoding)`.
+/// The SQL/JSON array and object constructors and their aggregates, which the
+/// parser cannot read with their clauses: `JSON_ARRAY`, `JSON_OBJECT`,
+/// `JSON_ARRAYAGG`, and `JSON_OBJECTAGG`, each rewritten to the marker
+/// function the planner knows (see `sqljson.rs`). The shapes are:
+/// `__json_array__(absent, returning, element...)`,
+/// `__json_object__(absent, unique, returning, key, value, ...)`,
+/// `__json_arrayagg__(element, absent, returning)`,
+/// `__json_objectagg__(key, value, absent, unique, returning)`, with the
+/// aggregate's `ORDER BY` kept inside its call, and an element under
+/// `FORMAT JSON` as `pg_catalog.__json_format__(value)`.
 fn rewrite_json_constructors(
     mut tokens: Vec<sqlparser::tokenizer::TokenWithSpan>,
 ) -> Vec<sqlparser::tokenizer::TokenWithSpan> {
@@ -1168,7 +1171,10 @@ fn rewrite_json_constructors(
     let mut i = 0;
     while i < tokens.len() {
         let name = word(&tokens[i]).unwrap_or_default();
-        if !matches!(name.as_str(), "json_array" | "json_object") {
+        if !matches!(
+            name.as_str(),
+            "json_array" | "json_object" | "json_arrayagg" | "json_objectagg"
+        ) {
             i += 1;
             continue;
         }
@@ -1180,7 +1186,8 @@ fn rewrite_json_constructors(
             i += 1;
             continue;
         }
-        let object = name == "json_object";
+        let aggregate = matches!(name.as_str(), "json_arrayagg" | "json_objectagg");
+        let object = matches!(name.as_str(), "json_object" | "json_objectagg");
         let Some(close) = matching_paren(&tokens, open) else {
             i += 1;
             continue;
@@ -1199,6 +1206,7 @@ fn rewrite_json_constructors(
         let mut absent = String::new();
         let mut unique = String::new();
         let mut returning = String::new();
+        let mut order: Option<String> = None;
         let mut failed = false;
         // The clauses that follow the last item, in PostgreSQL's order: the
         // aggregate's `ORDER BY`, the null clause, the unique-keys clause,
@@ -1246,6 +1254,34 @@ fn rewrite_json_constructors(
                 absent = word(&tokens[kind_at]).unwrap();
                 end = kind_at;
             }
+            // An `ORDER BY` belongs to `json_arrayagg` alone; anywhere else
+            // it is a syntax error in PostgreSQL, which the parser reports
+            // when the call is left as it is.
+            let mut depth = 0i32;
+            let mut order_at = None;
+            for (at, token) in tokens.iter().enumerate().take(end).skip(last_from) {
+                match token.token {
+                    Token::LParen | Token::LBracket => depth += 1,
+                    Token::RParen | Token::RBracket => depth -= 1,
+                    _ => {}
+                }
+                if depth == 0
+                    && word(token).as_deref() == Some("order")
+                    && significant(&tokens, at + 1)
+                        .is_some_and(|n| word(&tokens[n]).as_deref() == Some("by"))
+                {
+                    order_at = Some(at);
+                }
+            }
+            if let Some(at) = order_at {
+                if name == "json_arrayagg" {
+                    let by_at = significant(&tokens, at + 1).expect("checked above");
+                    order = Some(render_tokens(&tokens[by_at + 1..end]));
+                    end = at;
+                } else {
+                    failed = true;
+                }
+            }
             if end > last_from {
                 if let Some(item) = items.last_mut() {
                     *item = (last_from, end);
@@ -1253,6 +1289,7 @@ fn rewrite_json_constructors(
             } else if returning_at == Some(last_from)
                 && absent.is_empty()
                 && unique.is_empty()
+                && !aggregate
                 && items.len() == 1
             {
                 // `<constructor>(returning type)`: no elements or pairs, and
@@ -1264,6 +1301,9 @@ fn rewrite_json_constructors(
                 // lets the parser report one.
                 failed = true;
             }
+        }
+        if aggregate && items.len() != 1 {
+            failed = true;
         }
         // The elements or key-value pairs, each with its own `FORMAT JSON`.
         let mut parts: Vec<String> = Vec::new();
@@ -1311,8 +1351,17 @@ fn rewrite_json_constructors(
             "json_object" => format!(
                 "pg_catalog.__json_object__({absent_flag}, '{unique_flag}', '{returning}'{args})"
             ),
+            "json_arrayagg" => {
+                let order = order.map_or(String::new(), |keys| format!(" order by {keys}"));
+                format!(
+                    "pg_catalog.__json_arrayagg__({}, {absent_flag}, '{returning}'{order})",
+                    parts[0]
+                )
+            }
             _ => format!(
-                "pg_catalog.__json_object__({absent_flag}, '{unique_flag}', '{returning}'{args})"
+                "pg_catalog.__json_objectagg__({}, {absent_flag}, '{unique_flag}', \
+                 '{returning}')",
+                parts[0]
             ),
         };
         if let Some(snippet) = snippet_tokens(&replacement) {

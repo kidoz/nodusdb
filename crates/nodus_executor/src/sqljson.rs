@@ -33,11 +33,15 @@ pub(crate) const JSON: &str = "__JSON__";
 pub(crate) const JSON_SCALAR: &str = "__JSON_SCALAR__";
 pub(crate) const JSON_SERIALIZE: &str = "__JSON_SERIALIZE__";
 
-/// The array and object constructors:
-/// `__JSON_ARRAY__(absent, returning, element...)` and
-/// `__JSON_OBJECT__(absent, unique, returning, key, value, ...)`.
+/// The array and object constructors and their aggregates:
+/// `__JSON_ARRAY__(absent, returning, element...)`,
+/// `__JSON_OBJECT__(absent, unique, returning, key, value, ...)`,
+/// `__JSON_ARRAYAGG__(element, absent, returning)`, and
+/// `__JSON_OBJECTAGG__(key, value, absent, unique, returning)`.
 pub(crate) const JSON_ARRAY: &str = "__JSON_ARRAY__";
+pub(crate) const JSON_ARRAYAGG: &str = "__JSON_ARRAYAGG__";
 pub(crate) const JSON_OBJECT: &str = "__JSON_OBJECT__";
+pub(crate) const JSON_OBJECTAGG: &str = "__JSON_OBJECTAGG__";
 
 /// The `FORMAT JSON [ENCODING name]` clause on an element of a constructor,
 /// as the parser rewrites it: `__JSON_FORMAT__(value, encoding)`.
