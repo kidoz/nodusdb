@@ -1,0 +1,433 @@
+# xpath, xpath_exists, and xmlexists (SQL/XML), PG 18.4.
+query T
+select xpath('/a', '<a>1</a>'::xml);;
+----
+{<a>1</a>}
+
+query T
+select xpath('/a/b', '<a><b>1</b><b>2</b></a>'::xml);;
+----
+{<b>1</b>,<b>2</b>}
+
+query T
+select xpath('//b', '<a><b>1</b><c><b>2</b></c></a>'::xml);;
+----
+{<b>1</b>,<b>2</b>}
+
+query T
+select xpath('//b', '<a><c><b>1</b></c><b>2</b></a>'::xml);;
+----
+{<b>1</b>,<b>2</b>}
+
+query T
+select xpath('/a/b/text()', '<a><b>1</b><c>x</c></a>'::xml);;
+----
+{1}
+
+query T
+select xpath('/a/@id', '<a id="5"/>'::xml);;
+----
+{5}
+
+query T
+select xpath('//@*', '<a x="1" y="2"/>'::xml);;
+----
+{1,2}
+
+query T
+select xpath('//b/@x', '<a><b x="1"/></a>'::xml);;
+----
+{1}
+
+query T
+select xpath('//b/../@id', '<a id="3"><b/></a>'::xml);;
+----
+{3}
+
+query T
+select xpath('/a/*', '<a><b/><c/></a>'::xml);;
+----
+{<b/>,<c/>}
+
+query T
+select xpath('//*', '<a><b/></a>'::xml);;
+----
+{<a><b/></a>,<b/>}
+
+query T
+select xpath('/a/b[1]', '<a><b>1</b><b>2</b></a>'::xml);;
+----
+{<b>1</b>}
+
+query T
+select xpath('/a/b[last()]', '<a><b>1</b><b>2</b></a>'::xml);;
+----
+{<b>2</b>}
+
+query T
+select xpath('/a/b[@x="1"]', '<a><b x="1">y</b><b x="2">z</b></a>'::xml);;
+----
+{"<b x=\"1\">y</b>"}
+
+query T
+select xpath('/a/b[position() > 1]', '<a><b>1</b><b>2</b></a>'::xml);;
+----
+{<b>2</b>}
+
+query T
+select xpath('//b[. = "1"]', '<a><b>1</b><b>2</b></a>'::xml);;
+----
+{<b>1</b>}
+
+query T
+select xpath('//b[contains(., "2")]', '<a><b>1</b><b>2</b></a>'::xml);;
+----
+{<b>2</b>}
+
+query T
+select xpath('//*[@x]', '<a><b x="1"/><c/></a>'::xml);;
+----
+{"<b x=\"1\"/>"}
+
+query T
+select xpath('count(/a/b)', '<a><b>1</b><b>2</b></a>'::xml);;
+----
+{2}
+
+query T
+select xpath('count(//text())', '<a>x<b>y</b></a>'::xml);;
+----
+{2}
+
+query T
+select xpath('string(/a/b)', '<a><b>1</b></a>'::xml);;
+----
+{1}
+
+query T
+select xpath('string(//b)', '<a><b>1<c/>2</b></a>'::xml);;
+----
+{12}
+
+query T
+select xpath('sum(//b)', '<a><b>1</b><b>2</b></a>'::xml);;
+----
+{3}
+
+query T
+select xpath('/a/b | /a/c', '<a><b>1</b><c>2</c></a>'::xml);;
+----
+{<b>1</b>,<c>2</c>}
+
+query T
+select xpath('//b|//a', '<a><b/></a>'::xml);;
+----
+{<a><b/></a>,<b/>}
+
+query T
+select xpath('/a | /a', '<a/>'::xml);;
+----
+{<a/>}
+
+query T
+select array_length(xpath('.', '<a/>'::xml), 1);;
+----
+1
+
+query T
+select replace((xpath('.', '<a/>'::xml))[1]::text, chr(10), '@');;
+----
+<?xml version="1.0" encoding="UTF-8"?>@<a/>@
+
+query T
+select array_length(xpath('/a/..', '<a/>'::xml), 1);;
+----
+1
+
+query T
+select replace((xpath('/a/..', '<a/>'::xml))[1]::text, chr(10), '@');;
+----
+<?xml version="1.0" encoding="UTF-8"?>@<a/>@
+
+query T
+select xpath('/a/descendant::b', '<a><c><b/></c></a>'::xml);;
+----
+{<b/>}
+
+query T
+select xpath('//b/ancestor::a', '<a><c><b/></c></a>'::xml);;
+----
+{<a><c><b/></c></a>}
+
+query T
+select xpath('//b/parent::*', '<a><b/></a>'::xml);;
+----
+{<a><b/></a>}
+
+query T
+select xpath('//b/following-sibling::c', '<a><b/><c/></a>'::xml);;
+----
+{<c/>}
+
+query T
+select xpath('//b/preceding-sibling::*', '<a><c/><b/></a>'::xml);;
+----
+{<c/>}
+
+query T
+select xpath('//b/self::b', '<a><b/></a>'::xml);;
+----
+{<b/>}
+
+query T
+select xpath('/a/comment()', '<a><!-- c --></a>'::xml);;
+----
+{"<!-- c -->"}
+
+query T
+select xpath('/a/processing-instruction()', '<a><?p v?></a>'::xml);;
+----
+{"<?p v?>"}
+
+query T
+select xpath('//text()', '<a>x<b>y</b></a>'::xml);;
+----
+{x,y}
+
+query T
+select xpath('//text()', '<a>a&amp;b</a>'::xml);;
+----
+{a&amp;b}
+
+query T
+select xpath('node()', '<a>x<b/>y</a>'::xml);;
+----
+{<a>x<b/>y</a>}
+
+query T
+select xpath('string-length("abc")', '<a/>'::xml);;
+----
+{3}
+
+query T
+select xpath('substring("12345", 2, 3)', '<a/>'::xml);;
+----
+{234}
+
+query T
+select xpath('normalize-space("  a  b ")', '<a/>'::xml);;
+----
+{"a b"}
+
+query T
+select xpath('name(//b)', '<a><b/></a>'::xml);;
+----
+{b}
+
+query T
+select xpath('local-name(//b)', '<a><b/></a>'::xml);;
+----
+{b}
+
+query T
+select xpath('boolean(//b)', '<a><b/></a>'::xml);;
+----
+{true}
+
+query T
+select xpath('number("12")', '<a/>'::xml);;
+----
+{12}
+
+query T
+select xpath('floor(1.7)', '<a/>'::xml);;
+----
+{1}
+
+query T
+select xpath('not(/a)', '<a/>'::xml);;
+----
+{false}
+
+query T
+select xpath('true()', '<a/>'::xml);;
+----
+{true}
+
+query T
+select xpath('concat("a", "b")', '<a/>'::xml);;
+----
+{ab}
+
+query T
+select xpath('1 + 2', '<a/>'::xml);;
+----
+{3}
+
+query T
+select xpath('1 div 2', '<a/>'::xml);;
+----
+{0.5}
+
+query T
+select xpath('1 = 1', '<a/>'::xml);;
+----
+{true}
+
+query T
+select xpath('"a" = "a"', '<a/>'::xml);;
+----
+{true}
+
+query T
+select xpath('id("x")', '<a id="x"/>'::xml);;
+----
+{}
+
+query T
+select xpath('b', '<a><b>1</b></a>'::xml);;
+----
+{}
+
+query T
+select xpath('@id', '<a id="7"/>'::xml);;
+----
+{}
+
+query T
+select xpath('/q', '<a/>'::xml);;
+----
+{}
+
+query T
+select xpath('/x:a', '<x:a xmlns:x="urn:x"/>'::xml, ARRAY[ARRAY['x','urn:x']]);;
+----
+{"<x:a xmlns:x=\"urn:x\"/>"}
+
+query T
+select xpath('/a', '<a/>'::xml, ARRAY[ARRAY['x','urn:x']]);;
+----
+{<a/>}
+
+query T
+select xpath('//x:a', '<x:a xmlns:x="urn:x"/>'::xml, ARRAY[ARRAY['x','urn:x']]);;
+----
+{"<x:a xmlns:x=\"urn:x\"/>"}
+
+query T
+select xpath('/a', '<a xmlns="urn:u"/>'::xml);;
+----
+{}
+
+statement error
+select xpath('/x:a', '<x:a xmlns:x="urn:x"/>'::xml);;
+
+query T
+select pg_typeof(xpath('/a', '<a/>'::xml));;
+----
+xml[]
+
+query T
+select xpath_exists('/a', '<a/>'::xml);;
+----
+t
+
+query T
+select xpath_exists('/b', '<a/>'::xml);;
+----
+f
+
+query T
+select xpath_exists('/x:a', '<x:a xmlns:x="urn:x"/>'::xml, ARRAY[ARRAY['x','urn:x']]);;
+----
+t
+
+query T
+select xmlexists('/a' passing by value '<a/>');;
+----
+t
+
+query T
+select xmlexists('/b' passing '<a/>');;
+----
+f
+
+query T
+select xmlexists('//b' passing by ref '<a><b/></a>' by ref);;
+----
+t
+
+query T
+select xmlexists('/a' passing by value '<a/>' by value);;
+----
+t
+
+query T
+select (xpath('/a', '<a>1</a>'::xml))[1];;
+----
+<a>1</a>
+
+statement error
+select xpath('', '<a/>'::xml);;
+
+statement error
+select xpath('bad[', '<a/>'::xml);;
+
+statement error
+select xpath('//b/string()', '<a/>'::xml);;
+
+statement error
+select xpath('/a', 'x<a/>y'::xml);;
+
+statement error
+select xpath(1, '<a/>'::xml);;
+
+statement error
+select xpath('/a', 'has zlinia'::text);;
+
+statement error
+select xpath('/a', '<a/>'::xml, 1);;
+
+statement error
+select xpath('/a', '<a/>'::xml, ARRAY['x','u']);;
+
+statement error
+select xpath_exists('/a', '<a/>'::text);;
+
+statement error
+select xpath('/a');;
+
+query T
+select xpath('//@a', '<e a="x&amp;y"/>'::xml);;
+----
+{x&amp;y}
+
+query T
+select xpath('string(//@a)', '<e a="x&amp;y"/>'::xml);;
+----
+{x&amp;y}
+
+query T
+select xpath('"><"', '<a/>'::xml);;
+----
+{&gt;&lt;}
+
+query T
+select xpath('"a&b"', '<a/>'::xml);;
+----
+{a&amp;b}
+
+query T
+select xpath('//@a', '<e a="x y"/>'::xml);;
+----
+{"x y"}
+
+query T
+select xpath('//@a', '<e a="x&lt;y"/>'::xml);;
+----
+{x&lt;y}
+
+query T
+select xpath('string(/a)', '<a>x&amp;y</a>'::xml);;
+----
+{x&amp;y}
