@@ -56,7 +56,7 @@ fn db(message: impl Into<String>, code: &str) -> String {
 
 /// PostgreSQL's `tsCompareString`: bytewise, so that `prefix` reports
 /// whether the left string is a prefix of the right.
-fn ts_compare_string(a: &[u8], b: &[u8], prefix: bool) -> Ordering {
+pub(crate) fn ts_compare_string(a: &[u8], b: &[u8], prefix: bool) -> Ordering {
     let n = a.len().min(b.len());
     let cmp = a[..n].cmp(&b[..n]);
     if prefix {
@@ -108,17 +108,18 @@ impl TsVector {
         size
     }
 
-    fn find(&self, lexeme: &str) -> Option<&Entry> {
+    pub(crate) fn find_index(&self, lexeme: &str) -> Option<usize> {
         self.entries
             .binary_search_by(|e| ts_compare_string(e.lexeme.as_bytes(), lexeme.as_bytes(), false))
             .ok()
-            .map(|i| &self.entries[i])
     }
 
-    /// The entries a lexeme prefix matches, in stored order. As PostgreSQL
-    /// does, the exact term is found by binary search, and the entries that
-    /// have it as a prefix immediately follow it.
-    fn find_prefix(&self, prefix: &str) -> &[Entry] {
+    pub(crate) fn find(&self, lexeme: &str) -> Option<&Entry> {
+        self.find_index(lexeme).map(|i| &self.entries[i])
+    }
+
+    /// The range of entry indexes a lexeme prefix covers.
+    pub(crate) fn prefix_indexes(&self, prefix: &str) -> std::ops::Range<usize> {
         let start = match self
             .entries
             .binary_search_by(|e| ts_compare_string(e.lexeme.as_bytes(), prefix.as_bytes(), false))
@@ -131,7 +132,15 @@ impl TsVector {
                 ts_compare_string(prefix.as_bytes(), e.lexeme.as_bytes(), true) != Ordering::Equal
             })
             .map_or(self.entries.len(), |n| start + n);
-        &self.entries[start..end]
+        start..end
+    }
+
+    /// The entries a lexeme prefix matches, in stored order. As PostgreSQL
+    /// does, the exact term is found by binary search, and the entries that
+    /// have it as a prefix immediately follow it.
+    pub(crate) fn find_prefix(&self, prefix: &str) -> &[Entry] {
+        let range = self.prefix_indexes(prefix);
+        &self.entries[range]
     }
 }
 
@@ -600,13 +609,14 @@ fn qnode_cmp(a: &QNode, b: &QNode) -> Ordering {
             QNode::Phrase { left, right, .. } => vec![right, left],
         }
     }
-    // A value sorts before an operator.
+    // An operator sorts before a value (PostgreSQL's `QI_OPR` outranks
+    // `QI_VAL`, and a larger type sorts first).
     let (a_op, b_op) = (op_rank(a) > 0, op_rank(b) > 0);
     if a_op != b_op {
         return if a_op {
-            Ordering::Greater
-        } else {
             Ordering::Less
+        } else {
+            Ordering::Greater
         };
     }
     if !a_op {
@@ -1073,6 +1083,31 @@ pub(crate) fn tsquery_canonical(text: &str) -> Result<String, String> {
 
 // ---------------------------------------------------------------- matching
 
+/// Where a value node's matches come from: a tsvector, or the positions a
+/// cover scan has collected so far (`ts_rank_cd`).
+pub(crate) trait MatchSource {
+    /// The positions this node matches, or PostgreSQL's "maybe" when the
+    /// source cannot tell.
+    fn positions(&self, node: &QNode, want_positions: bool) -> MaybePositions;
+}
+
+/// A match source over a tsvector.
+pub(crate) struct VectorMatches<'a>(pub(crate) &'a TsVector);
+
+impl MatchSource for VectorMatches<'_> {
+    fn positions(&self, node: &QNode, want_positions: bool) -> MaybePositions {
+        let QNode::Val {
+            word,
+            weight,
+            prefix,
+        } = node
+        else {
+            return MaybePositions::No;
+        };
+        matched_positions(self.0, word, *prefix, *weight, want_positions)
+    }
+}
+
 /// The positions a lexeme query node matches, or `None` when the vector has
 /// no positions for it (PostgreSQL's "maybe").
 fn matched_positions(
@@ -1123,7 +1158,7 @@ fn matched_positions(
     }
 }
 
-enum MaybePositions {
+pub(crate) enum MaybePositions {
     No,
     Maybe,
     Yes(Vec<i32>),
@@ -1131,18 +1166,20 @@ enum MaybePositions {
 
 /// Match data for phrase evaluation, mirroring PostgreSQL's `ExecPhraseData`.
 #[derive(Default)]
-struct PhraseData {
-    pos: Vec<i32>,
-    width: i32,
-    negate: bool,
+pub(crate) struct PhraseData {
+    pub(crate) pos: Vec<i32>,
+    pub(crate) width: i32,
+    pub(crate) negate: bool,
 }
 
-const TSPO_BOTH: u8 = 1;
-const TSPO_L_ONLY: u8 = 2;
-const TSPO_R_ONLY: u8 = 4;
+pub(crate) const TSPO_BOTH: u8 = 1;
+pub(crate) const TSPO_L_ONLY: u8 = 2;
+pub(crate) const TSPO_R_ONLY: u8 = 4;
+/// Every position of either side (`TSPO_BOTH | TSPO_L_ONLY | TSPO_R_ONLY`).
+pub(crate) const TSPO_ALL: u8 = TSPO_BOTH | TSPO_L_ONLY | TSPO_R_ONLY;
 
 /// The merge-join PostgreSQL's `TS_phrase_output` performs.
-fn phrase_output(
+pub(crate) fn phrase_output(
     out: Option<&mut PhraseData>,
     left: &PhraseData,
     right: &PhraseData,
@@ -1202,14 +1239,14 @@ fn phrase_output(
 
 /// Evaluates a query tree with position tracking for phrases, as
 /// PostgreSQL's `TS_phrase_execute` does.
-fn phrase_execute(node: &QNode, vector: &TsVector, mut out: Option<&mut PhraseData>) -> Ternary {
+pub(crate) fn phrase_execute(
+    node: &QNode,
+    source: &dyn MatchSource,
+    mut out: Option<&mut PhraseData>,
+) -> Ternary {
     match node {
         QNode::Empty => Ternary::No,
-        QNode::Val {
-            word,
-            weight,
-            prefix,
-        } => match matched_positions(vector, word, *prefix, *weight, out.is_some()) {
+        QNode::Val { .. } => match source.positions(node, out.is_some()) {
             MaybePositions::No => Ternary::No,
             MaybePositions::Maybe => Ternary::Maybe,
             MaybePositions::Yes(positions) => {
@@ -1219,7 +1256,7 @@ fn phrase_execute(node: &QNode, vector: &TsVector, mut out: Option<&mut PhraseDa
                 Ternary::Yes
             }
         },
-        QNode::Not(inner) => match phrase_execute(inner, vector, out.as_deref_mut()) {
+        QNode::Not(inner) => match phrase_execute(inner, source, out.as_deref_mut()) {
             Ternary::No => {
                 if let Some(data) = out {
                     data.pos.clear();
@@ -1247,8 +1284,8 @@ fn phrase_execute(node: &QNode, vector: &TsVector, mut out: Option<&mut PhraseDa
             let is_and = matches!(node, QNode::And(..));
             let mut ldata = PhraseData::default();
             let mut rdata = PhraseData::default();
-            let lmatch = phrase_execute(l, vector, Some(&mut ldata));
-            let rmatch = phrase_execute(r, vector, Some(&mut rdata));
+            let lmatch = phrase_execute(l, source, Some(&mut ldata));
+            let rmatch = phrase_execute(r, source, Some(&mut rdata));
             if is_and {
                 if lmatch == Ternary::No || rmatch == Ternary::No {
                     return Ternary::No;
@@ -1321,11 +1358,11 @@ fn phrase_execute(node: &QNode, vector: &TsVector, mut out: Option<&mut PhraseDa
         } => {
             let mut ldata = PhraseData::default();
             let mut rdata = PhraseData::default();
-            let lmatch = phrase_execute(left, vector, Some(&mut ldata));
+            let lmatch = phrase_execute(left, source, Some(&mut ldata));
             if lmatch == Ternary::No {
                 return Ternary::No;
             }
-            let rmatch = phrase_execute(right, vector, Some(&mut rdata));
+            let rmatch = phrase_execute(right, source, Some(&mut rdata));
             if rmatch == Ternary::No {
                 return Ternary::No;
             }
@@ -1359,7 +1396,7 @@ fn phrase_execute(node: &QNode, vector: &TsVector, mut out: Option<&mut PhraseDa
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Ternary {
+pub(crate) enum Ternary {
     No,
     Yes,
     Maybe,
@@ -1369,17 +1406,561 @@ enum Ternary {
 pub(crate) fn matches(vector: &TsVector, query: &QNode) -> bool {
     // Only a definite yes matches: PostgreSQL treats a top-level "maybe"
     // (position data missing) as no match.
-    execute(query, vector, false) == Ternary::Yes
+    execute(query, &VectorMatches(vector), false) == Ternary::Yes
 }
 
-fn execute(node: &QNode, vector: &TsVector, skip_not: bool) -> Ternary {
+// ------------------------------------------------------------ ts_rewrite
+
+/// A node of the working tree of `ts_rewrite` (PostgreSQL's `QTNode`): the
+/// children are in storage order, the first of a binary node being the one
+/// the printer shows last.
+#[derive(Clone)]
+enum Qtn {
+    Val {
+        word: String,
+        weight: u8,
+        prefix: bool,
+        crc: i32,
+        /// The bitset of lexeme CRCs the subtree holds (`sign`).
+        sign: u32,
+    },
+    Op {
+        oper: i16,
+        distance: i16,
+        children: Vec<Qtn>,
+        sign: u32,
+        /// `QTN_NOCHANGE`: this node is fresh and is not searched again.
+        nochange: bool,
+    },
+}
+
+fn qtn_sign_crc(crc: i32) -> u32 {
+    1u32 << ((crc as u32) % 32)
+}
+
+impl Qtn {
+    /// `QT2QTN`: the working tree of a parsed query.
+    fn of(node: &QNode) -> Qtn {
+        match node {
+            QNode::Empty => unreachable!("the empty query has no tree"),
+            QNode::Val {
+                word,
+                weight,
+                prefix,
+            } => {
+                let crc = legacy_crc32(word.as_bytes()) as i32;
+                Qtn::Val {
+                    word: word.clone(),
+                    weight: *weight,
+                    prefix: *prefix,
+                    crc,
+                    sign: qtn_sign_crc(crc),
+                }
+            }
+            QNode::Not(inner) => {
+                let child = Qtn::of(inner);
+                let sign = child.sign();
+                Qtn::Op {
+                    oper: QNode::NOT,
+                    distance: 0,
+                    children: vec![child],
+                    sign,
+                    nochange: false,
+                }
+            }
+            QNode::And(l, r) => Qtn::binary(QNode::AND, 0, r, l),
+            QNode::Or(l, r) => Qtn::binary(QNode::OR, 0, r, l),
+            QNode::Phrase {
+                distance,
+                left,
+                right,
+            } => Qtn::binary(QNode::PHRASE, *distance, right, left),
+        }
+    }
+
+    /// A binary node, its children in storage order (the right operand
+    /// first, as `QT2QTN` reads the array).
+    fn binary(oper: i16, distance: i16, first: &QNode, second: &QNode) -> Qtn {
+        let children = vec![Qtn::of(first), Qtn::of(second)];
+        let sign = children.iter().fold(0, |sign, child| sign | child.sign());
+        Qtn::Op {
+            oper,
+            distance,
+            children,
+            sign,
+            nochange: false,
+        }
+    }
+
+    fn oper(&self) -> i16 {
+        match self {
+            Qtn::Val { .. } => 0,
+            Qtn::Op { oper, .. } => *oper,
+        }
+    }
+
+    fn sign(&self) -> u32 {
+        match self {
+            Qtn::Val { sign, .. } | Qtn::Op { sign, .. } => *sign,
+        }
+    }
+
+    fn children(&self) -> &[Qtn] {
+        match self {
+            Qtn::Val { .. } => &[],
+            Qtn::Op { children, .. } => children,
+        }
+    }
+}
+
+/// `QTNodeCompare` on the working tree: larger operators, more children,
+/// larger CRCs, and longer distances sort first; lexemes compare by text
+/// last. Operators sort before values.
+fn qtn_cmp(a: &Qtn, b: &Qtn) -> Ordering {
+    let (a_op, b_op) = (matches!(a, Qtn::Op { .. }), matches!(b, Qtn::Op { .. }));
+    if a_op != b_op {
+        return if a_op {
+            Ordering::Less
+        } else {
+            Ordering::Greater
+        };
+    }
+    match (a, b) {
+        (
+            Qtn::Val {
+                crc: ac, word: aw, ..
+            },
+            Qtn::Val {
+                crc: bc, word: bw, ..
+            },
+        ) => {
+            match ac.cmp(bc) {
+                Ordering::Equal => {}
+                other => return other.reverse(),
+            }
+            ts_compare_string(aw.as_bytes(), bw.as_bytes(), false)
+        }
+        (
+            Qtn::Op {
+                oper: ao,
+                distance: ad,
+                children: ac,
+                ..
+            },
+            Qtn::Op {
+                oper: bo,
+                distance: bd,
+                children: bc,
+                ..
+            },
+        ) => {
+            match ao.cmp(bo) {
+                Ordering::Equal => {}
+                other => return other.reverse(),
+            }
+            match ac.len().cmp(&bc.len()) {
+                Ordering::Equal => {}
+                other => return other.reverse(),
+            }
+            for (x, y) in ac.iter().zip(bc) {
+                match qtn_cmp(x, y) {
+                    Ordering::Equal => {}
+                    other => return other,
+                }
+            }
+            if *ao == QNode::PHRASE {
+                match ad.cmp(bd) {
+                    Ordering::Equal => {}
+                    other => return other.reverse(),
+                }
+            }
+            Ordering::Equal
+        }
+        _ => unreachable!("the kinds were compared"),
+    }
+}
+
+/// `QTNEq`: equal signatures and an equal comparison.
+fn qtn_eq(a: &Qtn, b: &Qtn) -> bool {
+    a.sign() == b.sign() && qtn_cmp(a, b) == Ordering::Equal
+}
+
+/// `QTNTernary`: flatten the same operator's nested children into one node.
+fn qtn_ternary(node: &mut Qtn) {
+    let Qtn::Op { oper, children, .. } = node else {
+        return;
+    };
+    for child in children.iter_mut() {
+        qtn_ternary(child);
+    }
+    if *oper != QNode::AND && *oper != QNode::OR {
+        return;
+    }
+    let mut flat: Vec<Qtn> = Vec::with_capacity(children.len());
+    for child in children.drain(..) {
+        match child {
+            Qtn::Op {
+                oper: child_oper,
+                children: grandchildren,
+                sign,
+                ..
+            } if child_oper == *oper => {
+                let _ = sign;
+                flat.extend(grandchildren);
+            }
+            other => flat.push(other),
+        }
+    }
+    *children = flat;
+}
+
+/// `QTNSort`: sort AND/OR children into their canonical order.
+fn qtn_sort(node: &mut Qtn) {
+    let Qtn::Op { oper, children, .. } = node else {
+        return;
+    };
+    for child in children.iter_mut() {
+        qtn_sort(child);
+    }
+    if children.len() > 1 && *oper != QNode::PHRASE {
+        children.sort_by(qtn_cmp);
+    }
+}
+
+/// `QTNBinary`: rebuild a binary tree by inserting intermediate nodes.
+fn qtn_binary(mut node: Qtn) -> Qtn {
+    if let Qtn::Op { children, .. } = &mut node {
+        for child in children.iter_mut() {
+            let taken = std::mem::replace(
+                child,
+                Qtn::Val {
+                    word: String::new(),
+                    weight: 0,
+                    prefix: false,
+                    crc: 0,
+                    sign: 0,
+                },
+            );
+            *child = qtn_binary(taken);
+        }
+        let Qtn::Op { oper, children, .. } = &mut node else {
+            unreachable!("an operator node");
+        };
+        while children.len() > 2 {
+            // Pair the first two children, then bring the last one in.
+            let first = children.remove(0);
+            let second = children.remove(0);
+            let sign = first.sign() | second.sign();
+            let nn = Qtn::Op {
+                oper: *oper,
+                distance: 0,
+                children: vec![first, second],
+                sign,
+                nochange: false,
+            };
+            let last = children.pop().expect("more than two children");
+            children.insert(0, nn);
+            children.insert(1, last);
+        }
+    }
+    node
+}
+
+/// The query an n-ary working tree serializes to (`QTN2QT`), as the binary
+/// children in the printer's order.
+fn qtn_to_qnode(node: &Qtn) -> QNode {
     match node {
-        QNode::Empty => Ternary::No,
-        QNode::Val {
+        Qtn::Val {
             word,
             weight,
             prefix,
-        } => match matched_positions(vector, word, *prefix, *weight, false) {
+            ..
+        } => QNode::Val {
+            word: word.clone(),
+            weight: *weight,
+            prefix: *prefix,
+        },
+        Qtn::Op { oper, children, .. } => match (*oper, children.as_slice()) {
+            (QNode::NOT, [inner]) => QNode::Not(Box::new(qtn_to_qnode(inner))),
+            (QNode::AND, [first, second]) => {
+                // `first` is the child the printer shows last.
+                QNode::And(
+                    Box::new(qtn_to_qnode(second)),
+                    Box::new(qtn_to_qnode(first)),
+                )
+            }
+            (QNode::OR, [first, second]) => QNode::Or(
+                Box::new(qtn_to_qnode(second)),
+                Box::new(qtn_to_qnode(first)),
+            ),
+            (QNode::PHRASE, [first, second]) => QNode::Phrase {
+                distance: node_distance(node),
+                left: Box::new(qtn_to_qnode(second)),
+                right: Box::new(qtn_to_qnode(first)),
+            },
+            _ => unreachable!("a binary operator node"),
+        },
+    }
+}
+
+fn node_distance(node: &Qtn) -> i16 {
+    match node {
+        Qtn::Op { distance, .. } => *distance,
+        _ => 0,
+    }
+}
+
+/// `findeq`: replace a node equal to the target, or a subset of an AND/OR
+/// node's children matching the target, with the substitute.
+fn qtn_find_eq(node: Qtn, ex: &Qtn, subs: Option<&Qtn>, isfind: &mut bool) -> Option<Qtn> {
+    // The signature must cover the target's, and the node kinds must match.
+    if (node.sign() & ex.sign()) != ex.sign()
+        || matches!(node, Qtn::Op { .. }) != matches!(ex, Qtn::Op { .. })
+    {
+        return Some(node);
+    }
+    if matches!(&node, Qtn::Op { nochange: true, .. }) {
+        return Some(node);
+    }
+    match node {
+        Qtn::Op {
+            oper,
+            distance,
+            mut children,
+            sign,
+            nochange: _,
+        } => {
+            if oper != ex.oper() {
+                return Some(Qtn::Op {
+                    oper,
+                    distance,
+                    children,
+                    sign,
+                    nochange: false,
+                });
+            }
+            if children.len() == ex.children().len() {
+                let candidate = Qtn::Op {
+                    oper,
+                    distance,
+                    children,
+                    sign,
+                    nochange: false,
+                };
+                if qtn_eq(&candidate, ex) {
+                    *isfind = true;
+                    return match subs {
+                        Some(subs) => Some(mark_nochange(subs.clone())),
+                        None => None,
+                    };
+                }
+                // The candidate is consumed; rebuild it.
+                let Qtn::Op { children, .. } = candidate else {
+                    unreachable!("an operator node");
+                };
+                return Some(Qtn::Op {
+                    oper,
+                    distance,
+                    children,
+                    sign,
+                    nochange: false,
+                });
+            }
+            if children.len() > ex.children().len() && !ex.children().is_empty() {
+                // AND and OR are commutative and associative: a subset of
+                // this node's (sorted) children may match the target.
+                let mut matched = vec![false; children.len()];
+                let mut nmatched = 0usize;
+                let (mut i, mut j) = (0usize, 0usize);
+                while i < children.len() && j < ex.children().len() {
+                    match qtn_cmp(&children[i], &ex.children()[j]) {
+                        Ordering::Equal => {
+                            matched[i] = true;
+                            nmatched += 1;
+                            i += 1;
+                            j += 1;
+                        }
+                        Ordering::Less => i += 1,
+                        Ordering::Greater => break,
+                    }
+                }
+                if nmatched == ex.children().len() {
+                    let mut kept = Vec::new();
+                    for (i, child) in children.drain(..).enumerate() {
+                        if !matched[i] {
+                            kept.push(child);
+                        }
+                    }
+                    if let Some(subs) = subs {
+                        kept.push(mark_nochange(subs.clone()));
+                    }
+                    let mut node = Qtn::Op {
+                        oper,
+                        distance,
+                        children: kept,
+                        sign,
+                        nochange: false,
+                    };
+                    // Re-sort to put the new child in its place.
+                    qtn_sort(&mut node);
+                    *isfind = true;
+                    return Some(node);
+                }
+                return Some(Qtn::Op {
+                    oper,
+                    distance,
+                    children,
+                    sign,
+                    nochange: false,
+                });
+            }
+            Some(Qtn::Op {
+                oper,
+                distance,
+                children,
+                sign,
+                nochange: false,
+            })
+        }
+        Qtn::Val {
+            word,
+            weight,
+            prefix,
+            crc,
+            sign,
+        } => {
+            if ex.oper() != 0 || crc != ex_crc(ex) {
+                return Some(Qtn::Val {
+                    word,
+                    weight,
+                    prefix,
+                    crc,
+                    sign,
+                });
+            }
+            let candidate = Qtn::Val {
+                word,
+                weight,
+                prefix,
+                crc,
+                sign,
+            };
+            if qtn_eq(&candidate, ex) {
+                *isfind = true;
+                return match subs {
+                    Some(subs) => Some(mark_nochange(subs.clone())),
+                    None => None,
+                };
+            }
+            Some(candidate)
+        }
+    }
+}
+
+fn ex_crc(ex: &Qtn) -> i32 {
+    match ex {
+        Qtn::Val { crc, .. } => *crc,
+        _ => 0,
+    }
+}
+
+fn mark_nochange(node: Qtn) -> Qtn {
+    match node {
+        Qtn::Op {
+            oper,
+            distance,
+            children,
+            sign,
+            ..
+        } => Qtn::Op {
+            oper,
+            distance,
+            children,
+            sign,
+            nochange: true,
+        },
+        val => val,
+    }
+}
+
+/// `dofindsubquery`: match at the node, then in its children, dropping the
+/// subtrees the substitute erased.
+fn qtn_find_subquery(
+    root: Option<Qtn>,
+    ex: &Qtn,
+    subs: Option<&Qtn>,
+    isfind: &mut bool,
+) -> Option<Qtn> {
+    let root = match root {
+        Some(root) => qtn_find_eq(root, ex, subs, isfind)?,
+        None => return None,
+    };
+    let Qtn::Op {
+        oper,
+        distance,
+        mut children,
+        sign,
+        nochange,
+    } = root
+    else {
+        return Some(root);
+    };
+    if nochange {
+        return Some(Qtn::Op {
+            oper,
+            distance,
+            children,
+            sign,
+            nochange,
+        });
+    }
+    let mut kept = Vec::new();
+    for child in children.drain(..) {
+        if let Some(child) = qtn_find_subquery(Some(child), ex, subs, isfind) {
+            kept.push(child);
+        }
+    }
+    // A node left with no children, or one non-NOT child, is simplified out.
+    if kept.is_empty() {
+        return None;
+    }
+    if kept.len() == 1 && oper != QNode::NOT {
+        return kept.pop();
+    }
+    Some(Qtn::Op {
+        oper,
+        distance,
+        children: kept,
+        sign,
+        nochange: false,
+    })
+}
+
+/// `ts_rewrite(query, target, substitute)`: every occurrence of the target
+/// replaced by the substitute, as PostgreSQL's flatten/sort/rewrite/
+/// re-binarize pipeline.
+pub(crate) fn query_rewrite(query: &QNode, target: &QNode, substitute: &QNode) -> QNode {
+    if query.items() == 0 || target.items() == 0 {
+        return query.clone();
+    }
+    let mut tree = Qtn::of(query);
+    qtn_ternary(&mut tree);
+    qtn_sort(&mut tree);
+    let mut ex = Qtn::of(target);
+    qtn_ternary(&mut ex);
+    qtn_sort(&mut ex);
+    let subs = (substitute.items() > 0).then(|| Qtn::of(substitute));
+    let mut isfind = false;
+    let Some(tree) = qtn_find_subquery(Some(tree), &ex, subs.as_ref(), &mut isfind) else {
+        return QNode::Empty;
+    };
+    qtn_to_qnode(&qtn_binary(tree))
+}
+
+pub(crate) fn execute(node: &QNode, source: &dyn MatchSource, skip_not: bool) -> Ternary {
+    match node {
+        QNode::Empty => Ternary::No,
+        QNode::Val { .. } => match source.positions(node, false) {
             MaybePositions::No => Ternary::No,
             MaybePositions::Maybe => Ternary::Maybe,
             MaybePositions::Yes(_) => Ternary::Yes,
@@ -1388,29 +1969,29 @@ fn execute(node: &QNode, vector: &TsVector, skip_not: bool) -> Ternary {
             if skip_not {
                 return Ternary::Yes;
             }
-            match execute(inner, vector, skip_not) {
+            match execute(inner, source, skip_not) {
                 Ternary::No => Ternary::Yes,
                 Ternary::Yes => Ternary::No,
                 Ternary::Maybe => Ternary::Maybe,
             }
         }
         QNode::And(l, r) => {
-            let lmatch = execute(l, vector, skip_not);
+            let lmatch = execute(l, source, skip_not);
             if lmatch == Ternary::No {
                 return Ternary::No;
             }
-            match execute(r, vector, skip_not) {
+            match execute(r, source, skip_not) {
                 Ternary::No => Ternary::No,
                 Ternary::Yes => lmatch,
                 Ternary::Maybe => Ternary::Maybe,
             }
         }
         QNode::Or(l, r) => {
-            let lmatch = execute(l, vector, skip_not);
+            let lmatch = execute(l, source, skip_not);
             if lmatch == Ternary::Yes {
                 return Ternary::Yes;
             }
-            match execute(r, vector, skip_not) {
+            match execute(r, source, skip_not) {
                 Ternary::No => lmatch,
                 Ternary::Yes => Ternary::Yes,
                 Ternary::Maybe => Ternary::Maybe,
@@ -1420,7 +2001,7 @@ fn execute(node: &QNode, vector: &TsVector, skip_not: bool) -> Ternary {
             let mut data = PhraseData::default();
             // A phrase needs position data; a "maybe" counts as no match at
             // the top level, as PostgreSQL treats it.
-            match phrase_execute(node, vector, Some(&mut data)) {
+            match phrase_execute(node, source, Some(&mut data)) {
                 Ternary::Yes => Ternary::Yes,
                 _ => Ternary::No,
             }
@@ -2385,5 +2966,43 @@ mod tests {
             print_tsvector(&vector_delete(&vector("fat:1 rat:2"), &["cat".into()])),
             "'fat':1 'rat':2"
         );
+    }
+}
+
+#[cfg(test)]
+mod rewrite_tests {
+    use super::*;
+
+    fn rewrite(query: &str, target: &str, substitute: &str) -> String {
+        let query = parse_tsquery(query).expect("a query");
+        let target = parse_tsquery(target).expect("a target");
+        let substitute = parse_tsquery(substitute).expect("a substitute");
+        print_tsquery(&query_rewrite(&query, &target, &substitute))
+    }
+
+    #[test]
+    fn rewrites_match_postgresql() {
+        // The values are PostgreSQL's own outputs.
+        assert_eq!(rewrite("a & b", "a", "c"), "'b' & 'c'");
+        assert_eq!(rewrite("a & b", "x", "c"), "'b' & 'a'");
+        assert_eq!(rewrite("a | b", "a", "c"), "'b' | 'c'");
+        assert_eq!(rewrite("a & b", "a & b", "c"), "'c'");
+        assert_eq!(rewrite("a", "a", "b | c"), "'b' | 'c'");
+        assert_eq!(rewrite("a & b & c", "b", "x & y"), "'x' & 'y' & 'c' & 'a'");
+        assert_eq!(rewrite("a | (b & c)", "b", "x"), "'a' | 'x' & 'c'");
+        assert_eq!(rewrite("!a & b", "b", "c"), "'c' & !'a'");
+        assert_eq!(rewrite("a:* & b", "a:*", "c"), "'b' & 'c'");
+        assert_eq!(rewrite("a <-> b", "a", "c"), "'c' <-> 'b'");
+        assert_eq!(rewrite("a", "b", "c"), "'a'");
+        assert_eq!(rewrite("a <2> b", "a <-> b", "x"), "'a' <2> 'b'");
+        assert_eq!(rewrite("a & a", "a", "b"), "'b' & 'b'");
+        assert_eq!(rewrite("a & (a | c)", "a", "b"), "'b' & ( 'c' | 'b' )");
+        assert_eq!(rewrite("((a & b) & c)", "a & b", "x"), "'c' & 'x'");
+        assert_eq!(rewrite("a", "a", "a & b"), "'a' & 'b'");
+        // A phrase target matches only its own distance.
+        assert_eq!(rewrite("a <-> b <-> c", "a <-> b", "x"), "'x' <-> 'c'");
+        // The empty substitute erases the target.
+        assert_eq!(rewrite("a & b", "a", ""), "'b'");
+        assert_eq!(rewrite("a & b", "a & b", ""), "");
     }
 }

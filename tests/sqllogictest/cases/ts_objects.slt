@@ -1,0 +1,401 @@
+query TT
+select * from ts_parse('default', 'a fat cat 42');
+----
+1	a
+12	 
+1	fat
+12	 
+1	cat
+12	 
+22	42
+
+query TT
+select * from ts_parse('pg_catalog.default', 'e-mail x@y.z');
+----
+16	e-mail
+11	e
+12	-
+11	mail
+12	 
+1	x
+12	@
+19	y.z
+
+query TT
+select * from ts_parse(3722, 'a b');
+----
+1	a
+12	 
+1	b
+
+query TT
+select tokid, token from ts_parse('default', 'The fat cats');
+----
+1	The
+12	 
+1	fat
+12	 
+1	cats
+
+statement error
+select * from ts_parse('nope', 'x');
+
+statement error
+select * from ts_parse('a b', 'x');
+
+statement error
+select * from ts_parse(999, 'x');
+
+query TTT
+select * from ts_token_type('default') where tokid between 10 and 16;
+----
+10	hword_part	Hyphenated word part, all letters
+11	hword_asciipart	Hyphenated word part, all ASCII
+12	blank	Space symbols
+13	tag	XML tag
+14	protocol	Protocol head
+15	numhword	Hyphenated word, letters and digits
+16	asciihword	Hyphenated word, all ASCII
+
+query TTT
+select * from ts_token_type('pg_catalog.default') limit 3;
+----
+1	asciiword	Word, all ASCII
+2	word	Word, all letters
+3	numword	Word, letters and digits
+
+query TTT
+select * from ts_token_type(3722) where tokid > 20;
+----
+21	int	Signed integer
+22	uint	Unsigned integer
+23	entity	XML entity
+
+statement error
+select * from ts_token_type('nope');
+
+query TTTTTT
+select * from ts_debug('english', 'The fat cats ate 42 rats');
+----
+asciiword	Word, all ASCII	The	{english_stem}	english_stem	{}
+blank	Space symbols	 	{}	NULL	NULL
+asciiword	Word, all ASCII	fat	{english_stem}	english_stem	{fat}
+blank	Space symbols	 	{}	NULL	NULL
+asciiword	Word, all ASCII	cats	{english_stem}	english_stem	{cat}
+blank	Space symbols	 	{}	NULL	NULL
+asciiword	Word, all ASCII	ate	{english_stem}	english_stem	{ate}
+blank	Space symbols	 	{}	NULL	NULL
+uint	Unsigned integer	42	{simple}	simple	{42}
+blank	Space symbols	 	{}	NULL	NULL
+asciiword	Word, all ASCII	rats	{english_stem}	english_stem	{rat}
+
+query TTTTTT
+select * from ts_debug('The fat cats ate 42 rats');
+----
+asciiword	Word, all ASCII	The	{english_stem}	english_stem	{}
+blank	Space symbols	 	{}	NULL	NULL
+asciiword	Word, all ASCII	fat	{english_stem}	english_stem	{fat}
+blank	Space symbols	 	{}	NULL	NULL
+asciiword	Word, all ASCII	cats	{english_stem}	english_stem	{cat}
+blank	Space symbols	 	{}	NULL	NULL
+asciiword	Word, all ASCII	ate	{english_stem}	english_stem	{ate}
+blank	Space symbols	 	{}	NULL	NULL
+uint	Unsigned integer	42	{simple}	simple	{42}
+blank	Space symbols	 	{}	NULL	NULL
+asciiword	Word, all ASCII	rats	{english_stem}	english_stem	{rat}
+
+query TTTTTT
+select * from ts_debug('simple', 'FOO bar 3.14 the');
+----
+asciiword	Word, all ASCII	FOO	{simple}	simple	{foo}
+blank	Space symbols	 	{}	NULL	NULL
+asciiword	Word, all ASCII	bar	{simple}	simple	{bar}
+blank	Space symbols	 	{}	NULL	NULL
+float	Decimal notation	3.14	{simple}	simple	{3.14}
+blank	Space symbols	 	{}	NULL	NULL
+asciiword	Word, all ASCII	the	{simple}	simple	{the}
+
+query TTTTTT
+select * from ts_debug('english', 'http://example.com/path');
+----
+protocol	Protocol head	http://	{}	NULL	NULL
+url	URL	example.com/path	{simple}	simple	{example.com/path}
+host	Host	example.com	{simple}	simple	{example.com}
+url_path	URL path	/path	{simple}	simple	{/path}
+
+query TTT
+select alias, token, lexemes from ts_debug('english', 'e-mail: x@y.z');
+----
+asciihword	e-mail	{e-mail}
+hword_asciipart	e	{e}
+blank	-	NULL
+hword_asciipart	mail	{mail}
+blank	: 	NULL
+asciiword	x	{x}
+blank	@	NULL
+file	y.z	{y.z}
+
+query T
+select ts_lexize('simple', 'Cats');
+----
+{cats}
+
+query T
+select ts_lexize('english_stem', 'cats');
+----
+{cat}
+
+query T
+select ts_lexize('english_stem', 'the');
+----
+{}
+
+query T
+select ts_lexize('english_stem', '');
+----
+{}
+
+query T
+select ts_lexize('simple', '');
+----
+{}
+
+query T
+select ts_lexize('simple', 'The A the');
+----
+{"the a the"}
+
+query T
+select ts_lexize('english_stem', '123');
+----
+{123}
+
+query T
+select ts_lexize('english_stem', 'fat-cat');
+----
+{fat-cat}
+
+statement error
+select ts_lexize('nope', 'x');
+
+statement error
+select ts_lexize('a b', 'x');
+
+query T
+select ts_lexize('simple', NULL);
+----
+NULL
+
+query T
+select ts_lexize(NULL, 'x');
+----
+NULL
+
+query T
+select ts_lexize('simple'::regdictionary, 'Cats');
+----
+{cats}
+
+query T
+select 'english_stem'::regdictionary;
+----
+english_stem
+
+query T
+select 'simple'::regdictionary;
+----
+simple
+
+statement error
+select 'nope'::regdictionary;
+
+statement error
+select 'a b'::regdictionary;
+
+query T
+select 'pg_catalog.english_stem'::regdictionary;
+----
+english_stem
+
+query T
+select get_current_ts_config();
+----
+english
+
+query T
+select pg_typeof(get_current_ts_config());
+----
+regconfig
+
+query T
+select 'english'::regconfig = get_current_ts_config();
+----
+t
+
+query T
+select ts_rewrite('a & b'::tsquery, 'a'::tsquery, 'c'::tsquery);
+----
+'b' & 'c'
+
+query T
+select ts_rewrite('a & b'::tsquery, 'x'::tsquery, 'c'::tsquery);
+----
+'b' & 'a'
+
+query T
+select ts_rewrite('a | b'::tsquery, 'a'::tsquery, 'c'::tsquery);
+----
+'b' | 'c'
+
+query T
+select ts_rewrite('a & b'::tsquery, 'a & b'::tsquery, 'c'::tsquery);
+----
+'c'
+
+query T
+select ts_rewrite('a'::tsquery, 'a'::tsquery, 'b | c'::tsquery);
+----
+'b' | 'c'
+
+query T
+select ts_rewrite('a & b & c'::tsquery, 'b'::tsquery, 'x & y'::tsquery);
+----
+'x' & 'y' & 'c' & 'a'
+
+query T
+select ts_rewrite('a | (b & c)'::tsquery, 'b'::tsquery, 'x'::tsquery);
+----
+'a' | 'x' & 'c'
+
+query T
+select ts_rewrite('!a & b'::tsquery, 'b'::tsquery, 'c'::tsquery);
+----
+'c' & !'a'
+
+query T
+select ts_rewrite('a:* & b'::tsquery, 'a:*'::tsquery, 'c'::tsquery);
+----
+'b' & 'c'
+
+query T
+select ts_rewrite('a <-> b'::tsquery, 'a'::tsquery, 'c'::tsquery);
+----
+'c' <-> 'b'
+
+query T
+select ts_rewrite('a'::tsquery, 'b'::tsquery, 'c'::tsquery);
+----
+'a'
+
+query T
+select ts_rewrite('a <2> b'::tsquery, 'a <-> b'::tsquery, 'x'::tsquery);
+----
+'a' <2> 'b'
+
+query T
+select ts_rewrite('a & a'::tsquery, 'a'::tsquery, 'b'::tsquery);
+----
+'b' & 'b'
+
+query T
+select ts_rewrite('a & (a | c)'::tsquery, 'a'::tsquery, 'b'::tsquery);
+----
+'b' & ( 'c' | 'b' )
+
+query T
+select ts_rewrite('((a & b) & c)'::tsquery, 'a & b'::tsquery, 'x'::tsquery);
+----
+'c' & 'x'
+
+query T
+select ts_rewrite('a'::tsquery, 'a'::tsquery, 'a & b'::tsquery);
+----
+'a' & 'b'
+
+query T
+select ts_rewrite(NULL, 'a'::tsquery, 'b'::tsquery);
+----
+NULL
+
+query T
+select ts_rewrite('a'::tsquery, NULL::tsquery, 'b'::tsquery);
+----
+NULL
+
+query TTTTT
+select oid, cfgname, cfgnamespace, cfgowner, cfgparser from pg_ts_config where cfgname in ('simple', 'english') order by oid;
+----
+3748	simple	11	10	3722
+13282	english	11	10	3722
+
+query TTTTTT
+select oid, dictname, dictnamespace, dictowner, dicttemplate, dictinitoption from pg_ts_dict where dictname in ('simple', 'english_stem') order by oid;
+----
+3765	simple	11	10	3727	NULL
+13281	english_stem	11	10	13268	language = 'english', stopwords = 'english'
+
+query TTTTTTTT
+select oid, prsname, prsnamespace, prsstart, prstoken, prsend, prsheadline, prslextype from pg_ts_parser;
+----
+3722	default	11	prsd_start	prsd_nexttoken	prsd_end	prsd_headline	prsd_lextype
+
+query TTTTT
+select oid, tmplname, tmplnamespace, tmplinit, tmpllexize from pg_ts_template where tmplname in ('simple', 'snowball') order by oid;
+----
+3727	simple	11	dsimple_init	dsimple_lexize
+13268	snowball	11	dsnowball_init	dsnowball_lexize
+
+query TTTT
+select mapcfg, maptokentype, mapseqno, mapdict from pg_ts_config_map where mapcfg = 3748 and maptokentype <= 12 order by maptokentype;
+----
+3748	1	1	3765
+3748	2	1	3765
+3748	3	1	3765
+3748	4	1	3765
+3748	5	1	3765
+3748	6	1	3765
+3748	7	1	3765
+3748	8	1	3765
+3748	9	1	3765
+3748	10	1	3765
+3748	11	1	3765
+
+query TTTT
+select mapcfg, maptokentype, mapseqno, mapdict from pg_ts_config_map where mapcfg = 13282 and maptokentype <= 12 order by maptokentype;
+----
+13282	1	1	13281
+13282	2	1	13281
+13282	3	1	3765
+13282	4	1	3765
+13282	5	1	3765
+13282	6	1	3765
+13282	7	1	3765
+13282	8	1	3765
+13282	9	1	3765
+13282	10	1	13281
+13282	11	1	13281
+
+query TTT
+select pg_ts_config_is_visible(3748), pg_ts_dict_is_visible(3765), pg_ts_parser_is_visible(3722);
+----
+t	t	t
+
+query TTTT
+select pg_ts_config_is_visible(999999) is null, pg_ts_dict_is_visible(999999) is null, pg_ts_parser_is_visible(999999) is null, pg_ts_template_is_visible(999999) is null;
+----
+t	t	t	t
+
+query TT
+select obj_description(3748, 'pg_ts_config'), obj_description(13282, 'pg_ts_config');
+----
+simple configuration	configuration for english language
+
+query TT
+select obj_description(3765, 'pg_ts_dict'), obj_description(13281, 'pg_ts_dict');
+----
+simple dictionary: just lower case and check for stopword	snowball stemmer for english language
+
+query TTT
+select obj_description(3722, 'pg_ts_parser'), obj_description(3727, 'pg_ts_template'), obj_description(13268, 'pg_ts_template');
+----
+default word parser	simple dictionary: just lower case and check for stopword	snowball stemmer

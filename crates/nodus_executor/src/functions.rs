@@ -13,6 +13,9 @@ use crate::value::{Value, render, values_equal};
 
 /// Functions that receive NULL arguments instead of short-circuiting to NULL.
 const NON_STRICT: &[&str] = &[
+    // `ts_headline` is strict, but its planner-assigned shape carries a
+    // NULL config slot when the call has none; the arm sorts it out.
+    crate::result_types::TS_HEADLINE,
     // Range constructors read a NULL bound as unbounded; a multirange
     // constructor refuses a NULL among its members.
     "__MULTIRANGE_BUILD__",
@@ -97,9 +100,14 @@ pub(crate) fn is_known(name: &str) -> bool {
                 | crate::result_types::BIT_XOR | crate::result_types::SHIFT_LEFT
                 | crate::result_types::SHIFT_RIGHT | crate::result_types::BIT_NOT
                 // Text search.
+                | crate::result_types::TS_JSON_DOC
                 | "SETWEIGHT" | "STRIP" | "NUMNODE" | "TSVECTOR_TO_ARRAY"
                 | "ARRAY_TO_TSVECTOR" | "TSQUERY_PHRASE" | "TS_DELETE" | "TO_TSVECTOR"
                 | "TO_TSQUERY" | "PLAINTO_TSQUERY" | "PHRASETO_TSQUERY" | "WEBSEARCH_TO_TSQUERY"
+                | "JSON_TO_TSVECTOR" | "JSONB_TO_TSVECTOR" | "TS_RANK" | "TS_RANK_CD"
+                | "TS_HEADLINE" | "TS_LEXIZE" | "TS_REWRITE" | "GET_CURRENT_TS_CONFIG"
+                | "PG_TS_CONFIG_IS_VISIBLE" | "PG_TS_DICT_IS_VISIBLE"
+                | "PG_TS_PARSER_IS_VISIBLE" | "PG_TS_TEMPLATE_IS_VISIBLE"
                 // Dates and times.
                 | "NOW" | "CURRENT_TIMESTAMP" | "TRANSACTION_TIMESTAMP"
                 | "STATEMENT_TIMESTAMP" | "CLOCK_TIMESTAMP" | "CURRENT_DATE" | "CURRENT_TIME"
@@ -182,6 +190,8 @@ pub(crate) fn is_known(name: &str) -> bool {
                 | "RANGE_MERGE"
                 | "__RANGE__" | "__RANGE_LOWER__" | "__RANGE_UPPER__" | "__BAD_RANGE_CAST__"
                 | "__BAD_OPERATOR__" | "__BAD_FUNCTION__"
+                | crate::result_types::FUNC_NOT_UNIQUE
+                | crate::result_types::TS_HEADLINE
                 // Subscripts: `a[i]`, `a[lo:hi]`, `doc['key']`.
                 | "__SUBSCRIPT__" | "__SLICE__"
                 | crate::result_types::INTEGER_RANGE
@@ -369,7 +379,16 @@ pub(crate) fn return_type(name: &str, arg_types: &[Option<String>]) -> Option<St
             "SETWEIGHT" | "STRIP" | "TSVECTOR_TO_ARRAY" | "ARRAY_TO_TSVECTOR" | "TS_DELETE" => {
                 "TSVECTOR"
             }
-            "TO_TSVECTOR" => "TSVECTOR",
+            "TO_TSVECTOR" | "JSON_TO_TSVECTOR" | "JSONB_TO_TSVECTOR" => "TSVECTOR",
+            "TS_RANK" | "TS_RANK_CD" => "REAL",
+            "TS_HEADLINE" | "__TS_HEADLINE__" => "TEXT",
+            "TS_LEXIZE" => "TEXT[]",
+            "TS_REWRITE" => "TSQUERY",
+            "GET_CURRENT_TS_CONFIG" => "REGCONFIG",
+            "PG_TS_CONFIG_IS_VISIBLE"
+            | "PG_TS_DICT_IS_VISIBLE"
+            | "PG_TS_PARSER_IS_VISIBLE"
+            | "PG_TS_TEMPLATE_IS_VISIBLE" => "BOOLEAN",
             "TO_TSQUERY" | "PLAINTO_TSQUERY" | "PHRASETO_TSQUERY" | "WEBSEARCH_TO_TSQUERY" => {
                 "TSQUERY"
             }
@@ -637,6 +656,11 @@ fn takes_json(name: &str) -> bool {
                 | "NUM_NULLS"
                 | "NUM_NONNULLS"
                 | "__RECORD__"
+                // The vectors a JSON document builds take the document as a
+                // value, not as text.
+                | "TO_TSVECTOR"
+                | "JSON_TO_TSVECTOR"
+                | "JSONB_TO_TSVECTOR"
         )
 }
 
@@ -2335,6 +2359,107 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
             crate::ranges::bound_value(&text(arg(0)), name == "__RANGE_LOWER__")
                 .unwrap_or_else(raise)
         }
+        // `ts_headline` with its planner-assigned shape:
+        // `(with-config, config, document, query, options)`. An empty
+        // options text means "not given"; NULL anywhere is NULL, as the
+        // strict function is.
+        "__TS_HEADLINE__" if arity(5) => {
+            let with_config = matches!(args[0], Value::Int(n) if n != 0);
+            if args[2..].iter().any(|a| matches!(a, Value::Null))
+                || (with_config && matches!(args[1], Value::Null))
+            {
+                return Some(Value::Null);
+            }
+            let config = if with_config {
+                match to_ts_config(&args[1]) {
+                    Ok(config) => config,
+                    Err(error) => return Some(raise(error)),
+                }
+            } else {
+                default_ts_config()
+            };
+            let query = match crate::textsearch::parse_tsquery(&text(&args[3])) {
+                Ok(query) => query,
+                Err(error) => return Some(raise(error)),
+            };
+            let options = text(&args[4]);
+            match crate::ts_headline::ts_headline(config, &text(&args[2]), &query, Some(&options))
+            {
+                Ok(headline) => Value::Text(headline),
+                Err(error) => raise(error),
+            }
+        }
+        // `ts_lexize(dictionary, token)`: the dictionary's lexemes for one
+        // token; an empty array for a stop word.
+        "TS_LEXIZE" if arity(2) => {
+            if args.iter().any(|a| matches!(a, Value::Null)) {
+                return Some(Value::Null);
+            }
+            let dictionary = match dictionary_of(&args[0]) {
+                Ok(dictionary) => dictionary,
+                Err(error) => return Some(raise(error)),
+            };
+            Value::Array(
+                crate::ts_dict::lexize_token(dictionary, &text(&args[1]))
+                    .into_iter()
+                    .map(Value::Text)
+                    .collect(),
+            )
+        }
+        // `ts_rewrite(query, target, substitute)`: every occurrence of the
+        // target replaced by the substitute.
+        "TS_REWRITE" if arity(3) => {
+            if args.iter().any(|a| matches!(a, Value::Null)) {
+                return Some(Value::Null);
+            }
+            let (Ok(query), Ok(target), Ok(substitute)) = (
+                crate::textsearch::parse_tsquery(&text(&args[0])),
+                crate::textsearch::parse_tsquery(&text(&args[1])),
+                crate::textsearch::parse_tsquery(&text(&args[2])),
+            ) else {
+                return Some(raise("invalid input syntax for type tsquery"));
+            };
+            Value::Text(crate::textsearch::print_tsquery(
+                &crate::textsearch::query_rewrite(&query, &target, &substitute),
+            ))
+        }
+        // `get_current_ts_config()`: the session's text search configuration.
+        "GET_CURRENT_TS_CONFIG" if arity(0) => Value::Int(default_ts_config().oid()),
+        // The catalog visibility tests of the shipped text search objects:
+        // true for one of them, NULL for anything else.
+        "PG_TS_CONFIG_IS_VISIBLE" | "PG_TS_DICT_IS_VISIBLE" | "PG_TS_PARSER_IS_VISIBLE"
+        | "PG_TS_TEMPLATE_IS_VISIBLE"
+            if arity(1) =>
+        {
+            let known = match name {
+                "PG_TS_CONFIG_IS_VISIBLE" => crate::ts_dict::config_by_oid(int(arg(0))?).is_some(),
+                "PG_TS_DICT_IS_VISIBLE" => {
+                    crate::ts_dict::dictionary_by_oid(int(arg(0))?).is_some()
+                }
+                "PG_TS_PARSER_IS_VISIBLE" => int(arg(0))? == crate::ts_parse::PARSER_OID,
+                _ => matches!(int(arg(0))?, 3727 | 13268),
+            };
+            if known {
+                Value::Bool(true)
+            } else {
+                Value::Null
+            }
+        }
+        // A call whose arguments fit more than one overload.
+        "__FUNC_NOT_UNIQUE__" if args.len() >= 2 => raise(
+            crate::error_fields::DbError::new(format!(
+                "function {}({}) is not unique",
+                text(arg(0)),
+                args[1..]
+                    .iter()
+                    .map(crate::render)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+            .code("42725")
+            .hint("Could not choose a best candidate function. You might need to add explicit type casts.")
+            .into_text(),
+        ),
         "__BAD_FUNCTION__" if args.len() >= 2 => raise(
             crate::error_fields::DbError::new(format!(
                 "function {}({}) does not exist",
@@ -3299,20 +3424,118 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
             }
             .map_or_else(raise, Value::Text)
         }
-        // `to_tsvector([config,] text)`: the dictionary layer's vector.
+        // The JSON document of a `to_tsvector` call, read back from the text
+        // a plan carries.
+        crate::result_types::TS_JSON_DOC if arity(2) => match arg(0) {
+            Value::Null => Value::Null,
+            Value::Json(_) | Value::Jsonb(_) => arg(0).clone(),
+            Value::Text(document) => {
+                let as_json = text(args.get(1).expect("the kind")) == "json";
+                match crate::json_text::parse(document) {
+                    Ok(value) if as_json => Value::Json(document.clone()),
+                    Ok(value) => Value::Jsonb(value),
+                    Err(error) => raise(error),
+                }
+            }
+            other => raise(format!(
+                "cannot cast {} to json",
+                crate::value::value_type_name(other)
+            )),
+        },
+        // `ts_rank`/`ts_rank_cd`([weights,] vector, query [, method])`: the
+        // vector's ranking against the query.
+        "TS_RANK" | "TS_RANK_CD" if (2..=4).contains(&args.len()) => {
+            if args.iter().any(|a| matches!(a, Value::Null)) {
+                return Some(Value::Null);
+            }
+            // The call's shape: the third argument's kind decides between
+            // `(weights, vector, query)` and `(vector, query, method)`.
+            let (weights, at, method_at) = match (args.len(), args.get(2)) {
+                (4, _) => (weights_of(arg(0)), 1, Some(3)),
+                (3, Some(Value::Int(_))) => (crate::tsrank::DEFAULT_WEIGHTS, 0, Some(2)),
+                (3, _) => (weights_of(arg(0)), 1, None),
+                _ => (crate::tsrank::DEFAULT_WEIGHTS, 0, None),
+            };
+            let (Ok(vector), Ok(query)) = (
+                crate::textsearch::parse_tsvector(&text(&args[at])),
+                crate::textsearch::parse_tsquery(&text(&args[at + 1])),
+            ) else {
+                return Some(raise("invalid input syntax"));
+            };
+            let method = match method_at.map(|i| &args[i]) {
+                Some(Value::Int(method)) => *method as i32,
+                _ => crate::tsrank::RANK_NO_NORM,
+            };
+            let rank = if name == "TS_RANK" {
+                crate::tsrank::calc_rank(&weights, &vector, &query, method)
+            } else {
+                crate::tsrank::calc_rank_cd(&weights, &vector, &query, method)
+            };
+            Value::Float(f64::from(rank))
+        }
+        // `to_tsvector([config,] text | json | jsonb)`: the dictionary
+        // layer's vector; a JSON document contributes its strings.
         "TO_TSVECTOR" if arity(1) || arity(2) => {
             if args.iter().any(|a| matches!(a, Value::Null)) {
                 return Some(Value::Null);
             }
-            let config = if arity(2) {
-                match to_ts_config(arg(0)) {
-                    Ok(config) => config,
-                    Err(error) => return Some(raise(error)),
-                }
-            } else {
-                default_ts_config()
+            let config = match ts_config_of(args, arity(2)) {
+                Ok(config) => config,
+                Err(error) => return Some(raise(error)),
             };
-            Value::Text(crate::ts_dict::to_tsvector(config, &text(args.last().expect("arg"))))
+            match args.last().expect("arg") {
+                Value::Jsonb(document) => Value::Text(crate::ts_dict::jsonb_to_tsvector(
+                    config,
+                    document,
+                    crate::ts_dict::JTI_STRING,
+                )),
+                Value::Json(document) => {
+                    match crate::ts_dict::json_to_tsvector(
+                        config,
+                        document,
+                        crate::ts_dict::JTI_STRING,
+                    ) {
+                        Ok(vector) => Value::Text(vector),
+                        Err(error) => raise(error),
+                    }
+                }
+                other => Value::Text(crate::ts_dict::to_tsvector(config, &text(other))),
+            }
+        }
+        // `json_to_tsvector`/`jsonb_to_tsvector`([config,] document, flags)`:
+        // the values the flags name.
+        "JSON_TO_TSVECTOR" | "JSONB_TO_TSVECTOR" if arity(2) || arity(3) => {
+            if args.iter().any(|a| matches!(a, Value::Null)) {
+                return Some(Value::Null);
+            }
+            let config = match ts_config_of(args, arity(3)) {
+                Ok(config) => config,
+                Err(error) => return Some(raise(error)),
+            };
+            let Some(Value::Jsonb(flags_value)) = args.last() else {
+                return Some(raise("wrong flag type, only arrays and scalars are allowed"));
+            };
+            if let Err(error) = crate::ts_dict::check_flags_shape(flags_value) {
+                return Some(raise(error));
+            }
+            let flags = match crate::ts_dict::parse_index_flags(flags_value) {
+                Ok(flags) => flags,
+                Err(error) => return Some(raise(error)),
+            };
+            let document = &args[args.len() - 2];
+            let vector = match (&*name, document) {
+                ("JSONB_TO_TSVECTOR", Value::Jsonb(document)) => {
+                    crate::ts_dict::jsonb_to_tsvector(config, document, flags)
+                }
+                (_, Value::Json(document)) => {
+                    match crate::ts_dict::json_to_tsvector(config, document, flags) {
+                        Ok(vector) => vector,
+                        Err(error) => return Some(raise(error)),
+                    }
+                }
+                _ => return Some(raise("invalid input syntax")),
+            };
+            Value::Text(vector)
         }
         // The jsonpath functions: all arguments are strict (a NULL anywhere
         // gives NULL), and the `_tz` spellings behave as the others do.
@@ -3745,6 +3968,7 @@ fn format_type(oid: i64, typmod: Option<i64>) -> String {
         3614 => "tsvector",
         3615 => "tsquery",
         3734 => "regconfig",
+        3769 => "regdictionary",
         4089 => "regnamespace",
         4096 => "regrole",
         1000 => "boolean[]",
@@ -4223,6 +4447,92 @@ fn pretty(args: &[Value]) -> Option<bool> {
     }
 }
 
+/// The weights of a `ts_rank` call, with PostgreSQL's errors for an array
+/// of the wrong shape, a short one, a NULL element, or an out-of-range
+/// weight. A negative weight takes the default for its slot.
+fn weights_of(value: &Value) -> [f32; 4] {
+    // Each failure stages the error and returns a placeholder for the
+    // caller to discard.
+    let bad = |message: &str, code: &str| -> [f32; 4] {
+        crate::eval_error::raise(
+            crate::error_fields::DbError::new(message)
+                .code(code)
+                .into_text(),
+        );
+        crate::tsrank::DEFAULT_WEIGHTS
+    };
+    // An untyped literal is the array's text, as PostgreSQL resolves it.
+    let parsed;
+    let value = match value {
+        Value::Text(text) => match crate::value::parse_array_literal(text) {
+            Some(items) => {
+                parsed = Value::Array(items);
+                &parsed
+            }
+            None => return bad("array of weight must be one-dimensional", "2202E"),
+        },
+        other => other,
+    };
+    let Value::Array(items) = value else {
+        return bad("array of weight must be one-dimensional", "2202E");
+    };
+    if items
+        .iter()
+        .any(|item| matches!(item, Value::Array(_) | Value::Null))
+    {
+        return if items.iter().any(|item| matches!(item, Value::Null)) {
+            bad("array of weight must not contain nulls", "22004")
+        } else {
+            bad("array of weight must be one-dimensional", "2202E")
+        };
+    }
+    if items.len() < 4 {
+        return bad("array of weight is too short", "2202E");
+    }
+    let mut weights = crate::tsrank::DEFAULT_WEIGHTS;
+    for (i, item) in items.iter().take(4).enumerate() {
+        let weight = match item {
+            Value::Float(f) => *f as f32,
+            Value::Int(n) => *n as f32,
+            Value::Numeric(d) => d.to_string().parse::<f32>().unwrap_or(0.0),
+            // An untyped array literal keeps its elements as text.
+            Value::Text(text) => match text.trim().parse::<f32>() {
+                Ok(weight) => weight,
+                Err(_) => {
+                    crate::eval_error::raise(
+                        crate::error_fields::DbError::new(format!(
+                            "invalid input syntax for type real: \"{text}\""
+                        ))
+                        .code("22P02")
+                        .into_text(),
+                    );
+                    return crate::tsrank::DEFAULT_WEIGHTS;
+                }
+            },
+            _ => return bad("array of weight must be one-dimensional", "2202E"),
+        };
+        weights[i] = if weight >= 0.0 {
+            weight
+        } else {
+            crate::tsrank::DEFAULT_WEIGHTS[i]
+        };
+        if weights[i] > 1.0 {
+            return bad("weight out of range", "22023");
+        }
+    }
+    weights
+}
+
+/// The configuration of a `to_tsvector`-family call: the first argument
+/// when there is one, otherwise the session's default.
+fn ts_config_of(args: &[Value], with_config: bool) -> Result<crate::ts_dict::Config, String> {
+    if with_config {
+        to_ts_config(&args[0])
+    } else {
+        Ok(default_ts_config())
+    }
+}
+
 /// The configuration a `to_tsvector` call names: a `regconfig` value (an
 /// OID), or an untyped literal that resolves like a name.
 fn to_ts_config(value: &Value) -> Result<crate::ts_dict::Config, String> {
@@ -4230,14 +4540,7 @@ fn to_ts_config(value: &Value) -> Result<crate::ts_dict::Config, String> {
         Value::Int(oid) => crate::pg_catalog::text_search_config_name(*oid)
             .and_then(crate::ts_dict::Config::of)
             .ok_or_else(|| format!("cache lookup failed for text search configuration {oid}")),
-        Value::Text(name) => crate::ts_dict::Config::of(name).ok_or_else(|| {
-            crate::error_fields::DbError::new(format!(
-                "text search configuration \"{}\" does not exist",
-                name.trim()
-            ))
-            .code("42704")
-            .into_text()
-        }),
+        Value::Text(name) => crate::ts_dict::config_of_qualified_name(name),
         other => Err(format!(
             "cannot cast {} to regconfig",
             crate::value::value_type_name(other)
@@ -4245,9 +4548,23 @@ fn to_ts_config(value: &Value) -> Result<crate::ts_dict::Config, String> {
     }
 }
 
+/// The dictionary a `regdictionary` value names: an OID, or an untyped
+/// literal that resolves like a name.
+fn dictionary_of(value: &Value) -> Result<crate::ts_dict::Config, String> {
+    match value {
+        Value::Int(oid) => crate::ts_dict::dictionary_by_oid(*oid)
+            .ok_or_else(|| format!("cache lookup failed for text search dictionary {oid}")),
+        Value::Text(name) => crate::ts_dict::config_of_dictionary_name(name),
+        other => Err(format!(
+            "cannot cast {} to regdictionary",
+            crate::value::value_type_name(other)
+        )),
+    }
+}
+
 /// The session's `default_text_search_config`, as `to_tsvector(text)` reads
 /// it.
-fn default_ts_config() -> crate::ts_dict::Config {
+pub(crate) fn default_ts_config() -> crate::ts_dict::Config {
     let name = crate::session_env::setting("default_text_search_config")
         .unwrap_or_else(|| "pg_catalog.english".to_string());
     crate::ts_dict::Config::of(&name).unwrap_or(crate::ts_dict::Config::English)

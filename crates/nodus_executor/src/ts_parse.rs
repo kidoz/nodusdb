@@ -91,6 +91,61 @@ pub(crate) fn token_desc(ty: u8) -> &'static str {
     }
 }
 
+/// The parser's token types in `ts_token_type` order: number, alias,
+/// description.
+pub(crate) fn token_types() -> Vec<(u8, &'static str, &'static str)> {
+    (1..=23u8)
+        .map(|ty| (ty, token_alias(ty), token_desc(ty)))
+        .filter(|(_, alias, _)| !alias.is_empty())
+        .collect()
+}
+
+/// The parser's OID (`default`).
+pub(crate) const PARSER_OID: i64 = 3722;
+
+/// The parser a `ts_parse` or `ts_token_type` argument names: its name (the
+/// shipped `default` parser) or its OID; `Err` is PostgreSQL's error.
+pub(crate) fn check_parser_arg(value: &crate::value::Value) -> Result<(), String> {
+    use crate::value::Value;
+    match value {
+        Value::Int(oid) => {
+            if *oid == PARSER_OID {
+                Ok(())
+            } else {
+                // A failed cache lookup, as PostgreSQL reports a parser OID
+                // that names nothing.
+                Err(crate::error_fields::DbError::new(format!(
+                    "cache lookup failed for text search parser {oid}"
+                ))
+                .code("XX000")
+                .into_text())
+            }
+        }
+        Value::Text(name) => {
+            let Some(parts) = crate::ts_dict::split_identifier_string(name) else {
+                return Err(crate::error_fields::DbError::new("invalid name syntax")
+                    .code("42602")
+                    .into_text());
+            };
+            let joined = parts.join(".");
+            let bare = joined.strip_prefix("pg_catalog.").unwrap_or(&joined);
+            if bare == "default" {
+                Ok(())
+            } else {
+                Err(crate::error_fields::DbError::new(format!(
+                    "text search parser \"{joined}\" does not exist"
+                ))
+                .code("42704")
+                .into_text())
+            }
+        }
+        other => Err(format!(
+            "cannot cast {} to regparser",
+            crate::value::value_type_name(other)
+        )),
+    }
+}
+
 /// The parser states, in the enum's order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum S {

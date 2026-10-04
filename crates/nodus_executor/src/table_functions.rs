@@ -33,6 +33,58 @@ impl MemExecutor {
                 .collect()
         };
 
+        // The text-search table functions are strict: a NULL argument
+        // yields no rows at all.
+        if matches!(
+            spec.name.as_str(),
+            "ts_parse" | "ts_token_type" | "ts_debug"
+        ) && args.iter().any(|a| matches!(a, Value::Null))
+        {
+            let (names, types): (Vec<String>, Vec<String>) = match spec.name.as_str() {
+                "ts_parse" => (
+                    vec!["tokid".to_string(), "token".to_string()],
+                    vec!["INTEGER".to_string(), "TEXT".to_string()],
+                ),
+                "ts_token_type" => (
+                    vec![
+                        "tokid".to_string(),
+                        "alias".to_string(),
+                        "description".to_string(),
+                    ],
+                    vec![
+                        "INTEGER".to_string(),
+                        "TEXT".to_string(),
+                        "TEXT".to_string(),
+                    ],
+                ),
+                _ => (
+                    [
+                        "alias",
+                        "description",
+                        "token",
+                        "dictionaries",
+                        "dictionary",
+                        "lexemes",
+                    ]
+                    .iter()
+                    .map(|n| n.to_string())
+                    .collect(),
+                    [
+                        "TEXT",
+                        "TEXT",
+                        "TEXT",
+                        "REGDICTIONARY[]",
+                        "REGDICTIONARY",
+                        "TEXT[]",
+                    ]
+                    .iter()
+                    .map(|t| t.to_string())
+                    .collect(),
+                ),
+            };
+            return Ok((names, types, Vec::new()));
+        }
+
         // Each function returns its value-column types and rows (a row may carry
         // several values, e.g. multi-argument `unnest`).
         let (mut types, mut rows) = match spec.name.as_str() {
@@ -92,6 +144,90 @@ impl MemExecutor {
             "jsonb_to_record" | "json_to_record" | "jsonb_to_recordset" | "json_to_recordset" => {
                 json_to_record_rows(&args, spec, spec.name.ends_with("set"))?
             }
+            // `ts_parse(parser, document)`: the parser's tokens.
+            "ts_parse" if args.len() == 2 => {
+                crate::ts_parse::check_parser_arg(&args[0]).map_err(|e| anyhow::anyhow!(e))?;
+                let rows = crate::ts_parse::parse(&value_text(&args[1]))
+                    .into_iter()
+                    .map(|token| vec![Value::Int(i64::from(token.ty)), Value::Text(token.text)])
+                    .collect();
+                (vec!["INTEGER".to_string(), "TEXT".to_string()], rows)
+            }
+            // `ts_token_type(parser)`: the parser's token types.
+            "ts_token_type" if args.len() == 1 => {
+                crate::ts_parse::check_parser_arg(&args[0]).map_err(|e| anyhow::anyhow!(e))?;
+                let rows = crate::ts_parse::token_types()
+                    .into_iter()
+                    .map(|(ty, alias, description)| {
+                        vec![
+                            Value::Int(i64::from(ty)),
+                            Value::Text(alias.to_string()),
+                            Value::Text(description.to_string()),
+                        ]
+                    })
+                    .collect();
+                (
+                    vec![
+                        "INTEGER".to_string(),
+                        "TEXT".to_string(),
+                        "TEXT".to_string(),
+                    ],
+                    rows,
+                )
+            }
+            // `ts_debug([config,] document)`: each token with the
+            // configuration's dictionaries and their lexemes.
+            "ts_debug" if matches!(args.len(), 1 | 2) => {
+                let (config, document) = if args.len() == 2 {
+                    let config =
+                        crate::ts_dict::config_value(&args[0]).map_err(|e| anyhow::anyhow!(e))?;
+                    (config, &args[1])
+                } else {
+                    (crate::functions::default_ts_config(), &args[0])
+                };
+                let rows = crate::ts_parse::parse(&value_text(document))
+                    .into_iter()
+                    .map(|token| {
+                        let dictionaries = crate::ts_dict::token_dictionaries(config, token.ty);
+                        let dictionary = dictionaries.first().copied();
+                        let lexemes = dictionary.map(|dictionary| {
+                            crate::ts_dict::lexize_token(dictionary, &token.text)
+                        });
+                        vec![
+                            Value::Text(crate::ts_parse::token_alias(token.ty).to_string()),
+                            Value::Text(crate::ts_parse::token_desc(token.ty).to_string()),
+                            Value::Text(token.text),
+                            Value::Array(
+                                dictionaries
+                                    .iter()
+                                    .map(|d| Value::Text(d.dictionary_name().to_string()))
+                                    .collect(),
+                            ),
+                            match dictionary {
+                                Some(d) => Value::Text(d.dictionary_name().to_string()),
+                                None => Value::Null,
+                            },
+                            match lexemes {
+                                Some(lexemes) => {
+                                    Value::Array(lexemes.into_iter().map(Value::Text).collect())
+                                }
+                                None => Value::Null,
+                            },
+                        ]
+                    })
+                    .collect();
+                (
+                    vec![
+                        "TEXT".to_string(),
+                        "TEXT".to_string(),
+                        "TEXT".to_string(),
+                        "REGDICTIONARY[]".to_string(),
+                        "REGDICTIONARY".to_string(),
+                        "TEXT[]".to_string(),
+                    ],
+                    rows,
+                )
+            }
             // No table is a partition, so none has ancestors.
             "pg_partition_ancestors" => (vec!["REGCLASS".to_string()], Vec::new()),
             // The function behind the `pg_available_extensions` view.
@@ -109,6 +245,19 @@ impl MemExecutor {
         // Value-column names: explicit `AS f(c1, ..)` wins (per column), else
         // the name the function gives its column, else the relation alias for
         // the first column, else the function name.
+        let default_columns: &[&str] = match spec.name.as_str() {
+            "ts_parse" => &["tokid", "token"],
+            "ts_token_type" => &["tokid", "alias", "description"],
+            "ts_debug" => &[
+                "alias",
+                "description",
+                "token",
+                "dictionaries",
+                "dictionary",
+                "lexemes",
+            ],
+            _ => &[],
+        };
         let named = match spec.name.as_str() {
             "jsonb_array_elements"
             | "jsonb_array_elements_text"
@@ -126,6 +275,7 @@ impl MemExecutor {
                     .get(i)
                     .cloned()
                     .or_else(|| pair.then(|| ["key", "value"][i.min(1)].to_string()))
+                    .or_else(|| default_columns.get(i).map(|c| c.to_string()))
                     .or_else(|| named.filter(|_| i == 0).map(str::to_string))
                     .or_else(|| (i == 0).then(|| spec.alias.clone()).flatten())
                     .unwrap_or_else(|| spec.name.clone())
@@ -518,6 +668,14 @@ fn value_as_i64(v: &Value) -> Option<i64> {
         Value::Float(f) => Some(*f as i64),
         Value::Text(s) => s.trim().parse::<i64>().ok(),
         _ => None,
+    }
+}
+
+/// A text argument's value, as the text-search table functions read it.
+fn value_text(v: &Value) -> String {
+    match v {
+        Value::Text(s) => s.clone(),
+        other => crate::render(other),
     }
 }
 

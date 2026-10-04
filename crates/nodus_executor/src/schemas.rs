@@ -1063,6 +1063,29 @@ pub(crate) fn schema_and_type_descriptions(
 /// `obj_description(oid, 'pg_namespace' | 'pg_type')`, in the statement's
 /// catalog.
 pub(crate) fn schema_or_type_description(oid: i64, class: &str) -> Option<String> {
+    // The shipped text search objects carry PostgreSQL's own comments.
+    let shipped = match class {
+        "pg_ts_config" => match oid {
+            3748 => Some("simple configuration"),
+            13282 => Some("configuration for english language"),
+            _ => None,
+        },
+        "pg_ts_dict" => match oid {
+            3765 => Some("simple dictionary: just lower case and check for stopword"),
+            13281 => Some("snowball stemmer for english language"),
+            _ => None,
+        },
+        "pg_ts_parser" => (oid == 3722).then_some("default word parser"),
+        "pg_ts_template" => match oid {
+            3727 => Some("simple dictionary: just lower case and check for stopword"),
+            13268 => Some("snowball stemmer"),
+            _ => None,
+        },
+        _ => None,
+    };
+    if let Some(description) = shipped {
+        return Some(description.to_string());
+    }
     let class = match class {
         "pg_namespace" => 2615,
         "pg_type" => 1247,

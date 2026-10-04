@@ -399,6 +399,11 @@ impl MemExecutor {
                 | "pg_publication_namespace"
                 | "pg_publication_rel"
                 | "pg_inherits"
+                | "pg_ts_config"
+                | "pg_ts_config_map"
+                | "pg_ts_dict"
+                | "pg_ts_parser"
+                | "pg_ts_template"
         )
     }
 

@@ -1,0 +1,686 @@
+query T
+select ts_headline('The fat cats ate rats', 'fat'::tsquery);
+----
+The <b>fat</b> cats ate rats
+
+query T
+select ts_headline('The fat cats ate rats', 'cat'::tsquery);
+----
+The fat <b>cats</b> ate rats
+
+query T
+select ts_headline('The fat cats ate rats', 'fat & rat'::tsquery);
+----
+The <b>fat</b> cats ate <b>rats</b>
+
+query T
+select ts_headline('The fat cats ate rats', 'fat | dog'::tsquery);
+----
+The <b>fat</b> cats ate rats
+
+query T
+select ts_headline('The fat cats ate rats', '!rat'::tsquery);
+----
+The fat cats ate <b>rats</b>
+
+query T
+select ts_headline('The fat cats ate rats', 'fat <-> cats'::tsquery);
+----
+The <b>fat</b> cats ate rats
+
+query T
+select ts_headline('The fat cats ate rats', 'fat <2> rats'::tsquery);
+----
+The <b>fat</b> cats ate rats
+
+query T
+select ts_headline('The fat cats ate rats', 'fat:*'::tsquery);
+----
+The <b>fat</b> cats ate rats
+
+query T
+select ts_headline('The fat cats ate rats', 'f:* & r:*'::tsquery);
+----
+The <b>fat</b> cats ate <b>rats</b>
+
+query T
+select ts_headline('english'::regconfig, 'The fat cats ate rats', 'fat'::tsquery);
+----
+The <b>fat</b> cats ate rats
+
+query T
+select ts_headline('simple'::regconfig, 'The Fat Cats Ate Rats', 'fat'::tsquery);
+----
+The <b>Fat</b> Cats Ate Rats
+
+query T
+select ts_headline('simple'::regconfig, 'The Fat Cats Ate Rats', 'fat & cats'::tsquery);
+----
+The <b>Fat</b> <b>Cats</b> Ate Rats
+
+query T
+select ts_headline('The fat cats ate rats'::text, 'fat'::tsquery, 'StartSel=<<, StopSel=>>'::text);
+----
+The <<fat>> cats ate rats
+
+query T
+select ts_headline('The fat cats ate rats'::text, 'fat'::tsquery, 'StartSel=[, StopSel=]');
+----
+The [fat] cats ate rats
+
+query T
+select ts_headline('The fat cats ate rats'::text, 'fat'::tsquery, 'MaxWords=3, MinWords=1');
+----
+<b>fat</b>
+
+statement error
+select ts_headline('The fat cats ate rats'::text, 'fat'::tsquery, 'MaxWords=3');
+
+query T
+select ts_headline('The fat cats ate rats'::text, 'fat'::tsquery, 'MinWords=2, MaxWords=4');
+----
+<b>fat</b> cats
+
+query T
+select ts_headline('The fat cats ate rats'::text, 'cat'::tsquery, 'ShortWord=5, MinWords=1, MaxWords=4');
+----
+<b>cats</b>
+
+query T
+select ts_headline('The fat cats ate rats'::text, 'cat'::tsquery, 'ShortWord=0, MinWords=1, MaxWords=4');
+----
+<b>cats</b>
+
+query T
+select ts_headline('The fat cats ate rats', 'fat'::tsquery, 'MaxFragments=2');
+----
+<b>fat</b> cats ate rats
+
+query T
+select ts_headline('The fat cats ate rats', 'rat'::tsquery, 'MaxFragments=1, MaxWords=2, MinWords=1');
+----
+<b>rats</b>
+
+query T
+select ts_headline('The fat cats ate rats', 'fat | rat'::tsquery, 'MaxFragments=3, MaxWords=2, MinWords=1');
+----
+<b>fat</b> cats ... <b>rats</b>
+
+query T
+select ts_headline('The fat cats ate rats', 'fat | rat'::tsquery, 'MaxFragments=3, MaxWords=2, MinWords=1, FragmentDelimiter=...');
+----
+<b>fat</b> cats...<b>rats</b>
+
+query T
+select ts_headline('The fat cats ate rats', 'fat'::tsquery, 'HighlightAll=1');
+----
+The <b>fat</b> cats ate rats
+
+query T
+select ts_headline('The fat cats ate rats', 'fat'::tsquery, 'HighlightAll=on');
+----
+The <b>fat</b> cats ate rats
+
+query T
+select ts_headline('The fat cats ate rats', 'fat'::tsquery, 'HighlightAll=true, StartSel=<i>, StopSel=</i>');
+----
+The <i>fat</i> cats ate rats
+
+query T
+select ts_headline('The fat cats ate rats', 'fat'::tsquery, 'HighlightAll=yes');
+----
+The <b>fat</b> cats ate rats
+
+query T
+select ts_headline('The fat cats ate rats', 'fat'::tsquery, 'HighlightAll=y');
+----
+The <b>fat</b> cats ate rats
+
+query T
+select ts_headline('The fat cats ate rats', 'fat'::tsquery, 'HighlightAll=t');
+----
+The <b>fat</b> cats ate rats
+
+query T
+select ts_headline('The fat cats ate rats', 'fat'::tsquery, 'HighlightAll=off');
+----
+The <b>fat</b> cats ate rats
+
+query T
+select ts_headline('The fat cats ate rats', 'fat'::tsquery, 'HighlightAll=1, MinWords=0, MaxWords=0');
+----
+The <b>fat</b> cats ate rats
+
+query T
+select ts_headline('one', 'one'::tsquery);
+----
+<b>one</b>
+
+query T
+select ts_headline('one two', 'two'::tsquery);
+----
+one <b>two</b>
+
+query T
+select ts_headline('one two three four five', 'three'::tsquery);
+----
+one two <b>three</b> four five
+
+query T
+select ts_headline('one two three four five six seven eight nine ten', 'seven'::tsquery);
+----
+one two three four five six <b>seven</b> eight nine ten
+
+query T
+select ts_headline('one two three four five six seven eight nine ten', 'seven'::tsquery, 'MinWords=2, MaxWords=3');
+----
+<b>seven</b> eight
+
+query T
+select ts_headline('one two three four five six seven eight nine ten', 'two | nine'::tsquery, 'MinWords=2, MaxWords=3');
+----
+<b>two</b> three
+
+query T
+select ts_headline('one two three four five six seven eight nine ten', 'two | nine'::tsquery, 'MinWords=3, MaxWords=5, MaxFragments=2');
+----
+<b>two</b> three four five ... seven eight <b>nine</b>
+
+query T
+select ts_headline('a fat cat sat on a mat and ate a fat rat', 'fat & rat'::tsquery);
+----
+a <b>fat</b> cat sat on a mat and ate a <b>fat</b> <b>rat</b>
+
+query T
+select ts_headline('a fat cat sat on a mat and ate a fat rat', 'fat & rat'::tsquery, 'MaxWords=4, MinWords=1');
+----
+<b>fat</b> <b>rat</b>
+
+query T
+select ts_headline('a fat cat sat on a mat and ate a fat rat', 'fat'::tsquery, 'MaxWords=4, MinWords=2');
+----
+<b>fat</b> cat sat on
+
+query T
+select ts_headline('a fat cat sat on a mat and ate a fat rat', 'fat'::tsquery, 'MaxFragments=1, MaxWords=4, MinWords=1');
+----
+<b>fat</b>
+
+query T
+select ts_headline('a fat cat sat on a mat and ate a fat rat', 'fat'::tsquery, 'MaxFragments=2, MaxWords=4, MinWords=1');
+----
+<b>fat</b> ... <b>fat</b>
+
+query T
+select ts_headline('fat cat', 'fat');
+----
+<b>fat</b> cat
+
+query T
+select ts_headline('the quick brown fox jumps over the lazy dog', 'quick & fox'::tsquery);
+----
+the <b>quick</b> brown <b>fox</b> jumps over the lazy dog
+
+query T
+select ts_headline('The fat cats ate rats', 'fat'::tsquery, NULL);
+----
+NULL
+
+query T
+select ts_headline(NULL, 'fat'::tsquery);
+----
+NULL
+
+query T
+select ts_headline('The fat cats ate rats', NULL::tsquery);
+----
+NULL
+
+statement error
+select ts_headline('The fat cats ate rats', 'fat'::tsquery, 'MinWords=5, MaxWords=3');
+
+statement error
+select ts_headline('The fat cats ate rats', 'fat'::tsquery, 'MinWords=0, MaxWords=3');
+
+statement error
+select ts_headline('The fat cats ate rats', 'fat'::tsquery, 'ShortWord=-1, MinWords=1, MaxWords=3');
+
+statement error
+select ts_headline('The fat cats ate rats', 'fat'::tsquery, 'MaxFragments=-1, MinWords=1, MaxWords=3');
+
+statement error
+select ts_headline('The fat cats ate rats', 'fat'::tsquery, 'Nope=3');
+
+statement error
+select ts_headline('The fat cats ate rats', 'fat'::tsquery, 'MaxWords');
+
+statement error
+select ts_headline('The fat cats ate rats', 'fat'::tsquery, 'MaxWords=abc');
+
+statement error
+select ts_headline('The fat cats ate rats', 'fat'::tsquery, 'MaxWords=3.5');
+
+statement error
+select ts_headline('The fat cats ate rats', 'fat'::tsquery, 'MaxWords=');
+
+query T
+select ts_headline('The fat cats ate rats', 'fat'::tsquery, '');
+----
+The <b>fat</b> cats ate rats
+
+statement error
+select ts_headline('english', 'The fat cats ate rats', 'fat');
+
+statement error
+select ts_headline('The fat cats ate rats', 'fat', 'MaxWords=3');
+
+statement error
+select ts_headline('fat', 'The fat cats');
+
+query T
+select ts_headline('<b>fat</b> cats', 'fat'::tsquery);
+----
+ <b>fat</b>  cats
+
+query T
+select ts_headline('<b>fat</b> cats', 'fat'::tsquery, 'HighlightAll=1');
+----
+<b><b>fat</b></b> cats
+
+query T
+select ts_headline('foo http://example.com/fat bar', 'fat'::tsquery);
+----
+foo http://example.com/fat bar
+
+query T
+select ts_headline('foo http://example.com/fat bar', 'bar'::tsquery);
+----
+foo http://example.com/fat <b>bar</b>
+
+query T
+select ts_headline('e-mail: fat@example.com', 'example.com'::tsquery);
+----
+e-mail: fat@example.com
+
+query T
+select ts_headline('The fat cats ate rats', 'fat'::tsquery, '    MaxWords = 3  ,  MinWords = 1   ');
+----
+<b>fat</b>
+
+query T
+select ts_headline('The fat cats ate rats', 'fat'::tsquery, 'StartSel="<", StopSel=">"');
+----
+The <fat> cats ate rats
+
+query T
+select ts_headline('The fat cats ate rats', 'fat'::tsquery, 'StartSel=''<'', StopSel=''>''');
+----
+The <fat> cats ate rats
+
+query T
+select ts_headline('The fat cats ate rats', 'fat'::tsquery, 'StartSel=<< StopSel=>>');
+----
+The <<fat>> cats ate rats
+
+query T
+select ts_headline('The fat cats ate rats', 'fat'::tsquery, 'StartSel=<<, StopSel=>>, StartSel=<i>');
+----
+The <i>fat>> cats ate rats
+
+query T
+select ts_headline('fat cat sat', 'fat & cat & sat'::tsquery, 'MaxFragments=0');
+----
+<b>fat</b> <b>cat</b> <b>sat</b>
+
+query T
+select ts_headline('fat cat sat', 'fat & cat & sat'::tsquery, 'MaxFragments=1');
+----
+<b>fat</b> <b>cat</b> <b>sat</b>
+
+query T
+select ts_headline('El gato gordo comió ratas gordas', 'gordo'::tsquery);
+----
+El gato <b>gordo</b> comió ratas gordas
+
+query T
+select ts_headline('The fat cats ate rats and the fat dogs slept while other fat cats watched the rats again', 'fat'::tsquery);
+----
+<b>fat</b> cats ate rats and the <b>fat</b> dogs slept while other <b>fat</b> cats watched the rats
+
+query T
+select ts_headline('The fat cats ate rats and the fat dogs slept while other fat cats watched the rats again', 'fat & rats'::tsquery);
+----
+The <b>fat</b> cats ate rats and the <b>fat</b> dogs slept while other <b>fat</b> cats watched
+
+query T
+select ts_headline('The fat cats ate rats and the fat dogs slept while other fat cats watched the rats again', 'fat & rats'::tsquery, 'MaxWords=12, MinWords=4');
+----
+The <b>fat</b> cats ate
+
+query T
+select ts_headline('The fat cats ate rats and the fat dogs slept while other fat cats watched the rats again', 'fat & rats'::tsquery, 'MaxWords=12, MinWords=4, MaxFragments=1');
+----
+The <b>fat</b> cats ate
+
+query T
+select ts_headline('The fat cats ate rats and the fat dogs slept while other fat cats watched the rats again', 'fat & rats'::tsquery, 'MaxWords=12, MinWords=4, MaxFragments=2');
+----
+The <b>fat</b> cats ate
+
+query T
+select ts_headline('The fat cats ate rats and the fat dogs slept while other fat cats watched the rats again', 'fat | rats'::tsquery, 'MaxWords=8, MinWords=3, MaxFragments=3');
+----
+<b>fat</b> cats ate rats and the <b>fat</b> dogs ... slept while other <b>fat</b> cats watched the rats
+
+query T
+select ts_headline('The fat cats ate rats and the fat dogs slept while other fat cats watched the rats again', 'fat | rats'::tsquery, 'MaxWords=8, MinWords=3, MaxFragments=3, FragmentDelimiter=|');
+----
+<b>fat</b> cats ate rats and the <b>fat</b> dogs|slept while other <b>fat</b> cats watched the rats
+
+query T
+select ts_headline('The fat cats ate rats and the fat dogs slept while other fat cats watched the rats again', 'cats & dogs'::tsquery, 'MaxWords=6, MinWords=2, MaxFragments=2');
+----
+The fat
+
+query T
+select ts_headline('aaaa bbbb cccc dddd eeee ffff gggg hhhh iiii jjjj kkkk llll mmmm nnnn oooo pppp qqqq rrrr ssss tttt uuuu vvvv wwww xxxx yyyy zzzz', 'zzzz'::tsquery);
+----
+llll mmmm nnnn oooo pppp qqqq rrrr ssss tttt uuuu vvvv wwww xxxx yyyy <b>zzzz</b>
+
+query T
+select ts_headline('aaaa bbbb cccc dddd eeee ffff gggg hhhh iiii jjjj kkkk llll mmmm nnnn oooo pppp qqqq rrrr ssss tttt uuuu vvvv wwww xxxx yyyy zzzz', 'zzzz'::tsquery, 'MaxFragments=1');
+----
+iiii jjjj kkkk llll mmmm nnnn oooo pppp qqqq rrrr ssss tttt uuuu vvvv wwww xxxx yyyy <b>zzzz</b>
+
+query T
+select ts_headline('aaaa bbbb cccc dddd eeee ffff gggg hhhh iiii jjjj kkkk llll mmmm nnnn oooo pppp qqqq rrrr ssss tttt uuuu vvvv wwww xxxx yyyy zzzz', 'aaaa'::tsquery, 'MaxFragments=1, MaxWords=5, MinWords=2');
+----
+<b>aaaa</b> bbbb cccc dddd eeee
+
+query T
+select ts_headline('aaaa bbbb cccc dddd eeee ffff gggg hhhh iiii jjjj kkkk llll mmmm nnnn oooo pppp qqqq rrrr ssss tttt uuuu vvvv wwww xxxx yyyy zzzz', 'aaaa & zzzz'::tsquery, 'MaxFragments=1, MaxWords=5, MinWords=2');
+----
+<b>aaaa</b> bbbb cccc dddd eeee
+
+query T
+select ts_headline('aaaa bbbb cccc dddd eeee ffff gggg hhhh iiii jjjj kkkk llll mmmm nnnn oooo pppp qqqq rrrr ssss tttt uuuu vvvv wwww xxxx yyyy zzzz', 'aaaa & zzzz'::tsquery, 'MaxFragments=2, MaxWords=5, MinWords=2');
+----
+<b>aaaa</b> bbbb cccc dddd eeee ... xxxx yyyy <b>zzzz</b>
+
+query T
+select ts_headline(E'line one\nline two with fat\nline three\nline four\nline five', 'fat'::tsquery) = E'line one\nline two with <b>fat</b>\nline three\nline four\nline five';
+----
+t
+
+query T
+select ts_headline(E'line one\nline two with fat\nline three\nline four\nline five', 'fat'::tsquery, 'MaxFragments=1') = E'line one\nline two with <b>fat</b>\nline three\nline four\nline five';
+----
+t
+
+query T
+select ts_headline('The fat cats ate rats. The fat dogs slept. The fat cats watched.', 'fat'::tsquery, 'MaxFragments=3, MaxWords=4, MinWords=1');
+----
+<b>fat</b> cats ate rats ... <b>fat</b> dogs slept ... <b>fat</b> cats watched
+
+query T
+select ts_headline('The fat cats ate rats. The fat dogs slept. The fat cats watched.', 'fat'::tsquery, 'MaxFragments=3, MaxWords=4, MinWords=1, FragmentDelimiter= / ');
+----
+<b>fat</b> cats ate rats/<b>fat</b> dogs slept/<b>fat</b> cats watched
+
+query T
+select ts_headline('fat cats and fat dogs and fat rats and fat cows and fat pigs and fat hens', 'fat'::tsquery, 'MaxWords=6, MinWords=2, MaxFragments=2');
+----
+<b>fat</b> cats and <b>fat</b> dogs ... <b>fat</b> rats and <b>fat</b> cows
+
+query T
+select ts_headline('fat cats and fat dogs and fat rats and fat cows and fat pigs and fat hens', 'fat'::tsquery, 'MaxWords=6, MinWords=2, MaxFragments=3');
+----
+<b>fat</b> cats and <b>fat</b> dogs ... <b>fat</b> rats and <b>fat</b> cows ... <b>fat</b> pigs and <b>fat</b> hens
+
+query T
+select ts_headline('fat cats and fat dogs and fat rats and fat cows and fat pigs and fat hens', 'fat & hens'::tsquery, 'MaxWords=6, MinWords=2, MaxFragments=3');
+----
+<b>fat</b> cats
+
+query T
+select ts_headline('the fat cat', 'fat'::tsquery, 'MinWords=10, MaxWords=20');
+----
+the <b>fat</b> cat
+
+query T
+select ts_headline('the fat cat', 'fat'::tsquery, 'MinWords=3, MaxWords=20');
+----
+the <b>fat</b> cat
+
+query T
+select ts_headline('fat', 'fat'::tsquery, 'MinWords=1, MaxWords=2');
+----
+<b>fat</b>
+
+query T
+select ts_headline('fat', 'fat'::tsquery, 'MinWords=1, MaxWords=2, MaxFragments=1');
+----
+<b>fat</b>
+
+query T
+select ts_headline('fat', 'fat'::tsquery, 'MinWords=1, MaxWords=2, MaxFragments=2, StartSel=* , StopSel= *');
+----
+*fat*
+
+query T
+select ts_headline('fat cat sat mat', '!fat & cat'::tsquery);
+----
+<b>fat</b> <b>cat</b> sat mat
+
+query T
+select ts_headline('fat cat sat mat', '!cat'::tsquery, 'MinWords=1, MaxWords=2');
+----
+fat
+
+query T
+select ts_headline('fat cat sat mat', 'fat | !cat'::tsquery);
+----
+<b>fat</b> <b>cat</b> sat mat
+
+query T
+select ts_headline('fat cat sat mat', '(fat | cat) & sat'::tsquery);
+----
+<b>fat</b> <b>cat</b> <b>sat</b> mat
+
+query T
+select ts_headline('fat cat sat mat', 'fat <-> cat'::tsquery, 'MinWords=1, MaxWords=4');
+----
+<b>fat</b> <b>cat</b>
+
+query T
+select ts_headline('fat cat sat mat', 'fat <2> sat'::tsquery, 'MinWords=1, MaxWords=4');
+----
+<b>fat</b> cat <b>sat</b>
+
+query T
+select ts_headline('fat cat sat mat', 'fat <-> sat'::tsquery, 'MinWords=1, MaxWords=4');
+----
+<b>fat</b>
+
+query T
+select ts_headline('the fat fat fat cat', 'fat'::tsquery);
+----
+the <b>fat</b> <b>fat</b> <b>fat</b> cat
+
+query T
+select ts_headline('the fat fat fat cat', 'fat'::tsquery, 'MaxFragments=1, MaxWords=3, MinWords=1');
+----
+<b>fat</b> <b>fat</b> <b>fat</b>
+
+query T
+select ts_headline('a b c d e f g h i j k l m n o p q r s t u v w x y z', 'a & z'::tsquery, 'MaxWords=5, MinWords=1');
+----
+a
+
+query T
+select ts_headline('a b c d e f g h i j k l m n o p q r s t u v w x y z', 'm'::tsquery, 'MaxWords=5, MinWords=4');
+----
+<b>m</b> n o p q
+
+query T
+select ts_headline('a b c d e f g h i j k l m n o p q r s t u v w x y z', 'm'::tsquery, 'MaxWords=5, MinWords=4, MaxFragments=1');
+----
+<b>m</b>
+
+query T
+select ts_headline('a b c d e f g h i j k l m n o p q r s t u v w x y z', 'b & y'::tsquery, 'MaxWords=30, MinWords=20');
+----
+<b>b</b> c d e f g h i j k l m n o p q r s t u v w x <b>y</b>
+
+query T
+select ts_headline('The fat cats ate rats', 'fat'::tsquery, 'ShortWord=4, MinWords=1, MaxWords=4');
+----
+<b>fat</b>
+
+query T
+select ts_headline('The fat cats ate rats', 'rats'::tsquery, 'ShortWord=9, MinWords=1, MaxWords=4');
+----
+The
+
+query T
+select ts_headline('The fat cats ate rats', 'rats'::tsquery, 'ShortWord=100, MinWords=1, MaxWords=4');
+----
+The
+
+query T
+select ts_headline('x 42 3.14 fat rats', 'fat'::tsquery);
+----
+x 42 3.14 <b>fat</b> rats
+
+query T
+select ts_headline('x 42 3.14 fat rats', '42'::tsquery);
+----
+x <b>42</b> 3.14 fat rats
+
+query T
+select ts_headline('v1.2.3 fat rats', 'v1.2.3'::tsquery);
+----
+<b>v1.2.3</b> fat rats
+
+query T
+select ts_headline('fat@example.com rats', 'example.com'::tsquery);
+----
+fat@example.com rats
+
+query T
+select 'simple'::regconfig;
+----
+simple
+
+query T
+select 'english'::regconfig;
+----
+english
+
+query T
+select 'SIMPLE'::regconfig;
+----
+simple
+
+query T
+select '"simple"'::regconfig;
+----
+simple
+
+query T
+select 'pg_catalog.simple'::regconfig;
+----
+simple
+
+query T
+select 'pg_catalog.english'::regconfig;
+----
+english
+
+query T
+select '"pg_catalog".simple'::regconfig;
+----
+simple
+
+query T
+select 'pg_catalog."simple"'::regconfig;
+----
+simple
+
+statement error
+select 'public.simple'::regconfig;
+
+statement error
+select 'a fat cat'::regconfig;
+
+statement error
+select 'a b'::regconfig;
+
+statement error
+select '"a b"'::regconfig;
+
+statement error
+select 'a.'::regconfig;
+
+statement error
+select '.a'::regconfig;
+
+statement error
+select 'a..b'::regconfig;
+
+statement error
+select ''::regconfig;
+
+statement error
+select 'nope'::regconfig;
+
+statement error
+select 'NOPE'::regconfig;
+
+statement error
+select 'A_B9'::regconfig;
+
+statement error
+select 'a"b'::regconfig;
+
+statement error
+select 'simple.'::regconfig;
+
+statement error
+select 'simple x'::regconfig;
+
+query T
+select '  simple  '::regconfig;
+----
+simple
+
+statement error
+select to_tsvector('a fat cat', 'x');
+
+query T
+select to_tsvector('SIMPLE', 'The Fat Cats');
+----
+'cats':3 'fat':2 'the':1
+
+query T
+select to_tsvector('"simple"', 'The Fat Cats');
+----
+'cats':3 'fat':2 'the':1
+
+statement error
+select ts_headline('a fat cat', 'X'::regconfig, 'x'::tsquery);
+
+query T
+select ts_headline('simple'::regconfig, 'the fat cats', 'fat'::tsquery);
+----
+the <b>fat</b> cats
+
+query T
+select '3748'::regconfig;
+----
+simple
+
+query T
+select 3748::regconfig;
+----
+simple

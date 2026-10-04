@@ -1025,37 +1025,50 @@ pub(crate) fn check_integer_ranges(
             }
             return checked.clone();
         }
-        // The `to_ts*` functions: the configuration is a regconfig (an
-        // untyped literal resolves to one; a `text` value does not), and
-        // the text is a string.
+        // `ts_rank`/`ts_rank_cd`: the weights are a `real[]`, and the shape
+        // of the call decides which argument is which.
         ScalarExpr::Function { name, args }
-            if matches!(
-                name.as_str(),
-                "TO_TSVECTOR" | "TO_TSQUERY" | "PLAINTO_TSQUERY" | "PHRASETO_TSQUERY"
-                    | "WEBSEARCH_TO_TSQUERY"
-            ) && matches!(args.len(), 1 | 2) =>
+            if matches!(name.as_str(), "TS_RANK" | "TS_RANK_CD")
+                && (2..=4).contains(&args.len()) =>
         {
             let unknown = |t: &Option<String>| {
                 t.as_deref()
                     .is_none_or(|t| t.trim().is_empty() || t.eq_ignore_ascii_case("UNKNOWN"))
             };
-            let config_ok = |e: &ScalarExpr| {
+            let literal = |e: &ScalarExpr| {
+                matches!(
+                    e,
+                    ScalarExpr::Literal(Value::Text(_) | Value::Int(_) | Value::Null)
+                )
+            };
+            let vector = |e: &ScalarExpr| ts_kind(e, column) == Some("tsvector");
+            let query = |e: &ScalarExpr| ts_kind(e, column) == Some("tsquery");
+            let integer = |e: &ScalarExpr| {
                 let t = scalar_type(e, column);
                 unknown(&t)
-                    || t.as_deref()
-                        .is_some_and(|t| t.trim().eq_ignore_ascii_case("regconfig"))
-                    // An untyped literal resolves to a configuration; a
-                    // folded one keeps its text.
-                    || matches!(e, ScalarExpr::Literal(Value::Text(_) | Value::Int(_)))
+                    || literal(e)
+                    || t.as_deref().is_some_and(|t| {
+                        matches!(
+                            t.trim().to_ascii_uppercase().as_str(),
+                            "INTEGER" | "INT" | "INT4" | "SMALLINT" | "BIGINT"
+                        )
+                    })
             };
-            let text_ok = |e: &ScalarExpr| {
-                let t = scalar_type(e, column);
-                unknown(&t) || t.as_deref().is_some_and(is_text_type)
+            let weights = |e: &ScalarExpr| {
+                matches!(e, ScalarExpr::Literal(Value::Array(_))) || literal(e)
             };
-            let ok = if args.len() == 2 {
-                config_ok(&args[0]) && text_ok(&args[1])
-            } else {
-                text_ok(&args[0])
+            let ok = match args.len() {
+                2 => vector(&args[0]) && query(&args[1]),
+                3 => {
+                    (vector(&args[0]) && query(&args[1]) && integer(&args[2]))
+                        || (weights(&args[0]) && vector(&args[1]) && query(&args[2]))
+                }
+                _ => {
+                    weights(&args[0])
+                        && vector(&args[1])
+                        && query(&args[2])
+                        && integer(&args[3])
+                }
             };
             if !ok {
                 let types: Vec<String> = args
@@ -1064,10 +1077,246 @@ pub(crate) fn check_integer_ranges(
                     .collect();
                 return bad_function_args(&name.to_ascii_lowercase(), &types);
             }
+            return checked.clone();
+        }
+        // The `to_ts*` functions: the configuration is a regconfig (an
+        // untyped literal resolves to one; a `text` value does not), the
+        // document is a string (or, for `to_tsvector`, a JSON value), and
+        // the flags of the `*_to_tsvector` spellings are `jsonb`.
+        ScalarExpr::Function { name, args }
+            if matches!(
+                name.as_str(),
+                "TO_TSVECTOR"
+                    | "TO_TSQUERY"
+                    | "PLAINTO_TSQUERY"
+                    | "PHRASETO_TSQUERY"
+                    | "WEBSEARCH_TO_TSQUERY"
+                    | "JSON_TO_TSVECTOR"
+                    | "JSONB_TO_TSVECTOR"
+            ) && (1..=3).contains(&args.len()) =>
+        {
+            let unknown = |t: &Option<String>| {
+                t.as_deref()
+                    .is_none_or(|t| t.trim().is_empty() || t.eq_ignore_ascii_case("UNKNOWN"))
+            };
+            let literal = |e: &ScalarExpr| {
+                matches!(e, ScalarExpr::Literal(Value::Text(_) | Value::Int(_)))
+            };
+            let config_ok = |e: &ScalarExpr| {
+                let t = scalar_type(e, column);
+                unknown(&t)
+                    || t.as_deref()
+                        .is_some_and(|t| t.trim().eq_ignore_ascii_case("regconfig"))
+                    // An untyped literal resolves to a configuration.
+                    || literal(e)
+            };
+            let document_ok = |e: &ScalarExpr, allow_text: bool, allow_json: bool, allow_jsonb: bool| {
+                let t = scalar_type(e, column);
+                unknown(&t)
+                    || t.as_deref().is_some_and(|t| {
+                        (allow_text && is_text_type(t))
+                            || (allow_json && t.trim().eq_ignore_ascii_case("json"))
+                            || (allow_jsonb && crate::value::is_jsonb_type(t))
+                    })
+            };
+            let flags_ok = |e: &ScalarExpr| {
+                let t = scalar_type(e, column);
+                unknown(&t)
+                    || t.as_deref().is_some_and(crate::value::is_jsonb_type)
+                    || literal(e)
+            };
+            let json_spelling = matches!(name.as_str(), "JSON_TO_TSVECTOR" | "JSONB_TO_TSVECTOR");
+            // The document sits last, or just before the flags.
+            let document_at = if json_spelling {
+                args.len() - 2
+            } else {
+                args.len() - 1
+            };
+            // The JSON spellings take 2 or 3 arguments, the others 1 or 2.
+            let arity_ok = if json_spelling {
+                matches!(args.len(), 2 | 3)
+            } else {
+                matches!(args.len(), 1 | 2)
+            };
+            let with_config = if json_spelling {
+                args.len() == 3
+            } else {
+                args.len() == 2
+            };
+            let ok = arity_ok
+                && match name.as_str() {
+                "JSON_TO_TSVECTOR" | "JSONB_TO_TSVECTOR" => {
+                    let document = &args[args.len() - 2];
+                    let json = name == "JSON_TO_TSVECTOR";
+                    (!with_config || config_ok(&args[0]))
+                        && document_ok(document, false, json, !json)
+                        && flags_ok(args.last().expect("the flags"))
+                }
+                "TO_TSVECTOR" => {
+                    (!with_config || config_ok(&args[0]))
+                        && document_ok(args.last().expect("the document"), true, true, true)
+                }
+                _ => {
+                    (!with_config || config_ok(&args[0]))
+                        && document_ok(args.last().expect("the document"), true, false, false)
+                }
+            };
+            if !ok {
+                let types: Vec<String> = args
+                    .iter()
+                    .map(|arg| argument_type_name(arg, column))
+                    .collect();
+                return bad_function_args(&name.to_ascii_lowercase(), &types);
+            }
+            // A JSON document argument is wrapped so that its text is read
+            // back as a JSON value wherever it is evaluated.
+            let mut args = args.clone();
+            if let Some(document) = args.get_mut(document_at) {
+                let kind = scalar_type(document, column).unwrap_or_default();
+                let kind = kind.trim().to_ascii_lowercase();
+                if kind == "json" || crate::value::is_jsonb_type(&kind) {
+                    let canonical = if kind == "json" { "json" } else { "jsonb" };
+                    *document = ScalarExpr::Function {
+                        name: TS_JSON_DOC.to_string(),
+                        args: vec![
+                            document.clone(),
+                            ScalarExpr::Literal(Value::Text(canonical.to_string())),
+                        ],
+                    };
+                }
+            }
             return ScalarExpr::Function {
                 name: name.clone(),
-                args: args.clone(),
+                args,
             };
+        }
+        // `ts_headline([config,] document, query [, options])`: the document
+        // is text, and the call is rewritten to one fixed shape so its
+        // runtime can tell the three- and four-argument forms apart.
+        ScalarExpr::Function { name, args }
+            if name == "TS_HEADLINE" && (2..=4).contains(&args.len()) =>
+        {
+            let untyped = |e: &ScalarExpr| matches!(e, ScalarExpr::Literal(Value::Text(_)));
+            let is_text = |e: &ScalarExpr| {
+                untyped(e)
+                    || scalar_type(e, column)
+                        .is_none_or(|t| t.trim().is_empty() || is_text_type(&t))
+            };
+            let is_config = |e: &ScalarExpr| {
+                untyped(e)
+                    || scalar_type(e, column)
+                        .is_some_and(|t| t.trim().eq_ignore_ascii_case("regconfig"))
+            };
+            let is_query =
+                |e: &ScalarExpr| untyped(e) || ts_kind(e, column) == Some("tsquery");
+            // The configuration comes first in the three- and four-argument
+            // forms; only the three-argument form is ambiguous, and only
+            // when every argument is an untyped literal, which PostgreSQL
+            // refuses as "is not unique".
+            let with_config = match args.len() {
+                2 => false,
+                3 => {
+                    let config_form =
+                        is_config(&args[0]) && is_text(&args[1]) && is_query(&args[2]);
+                    let options_form =
+                        is_text(&args[0]) && is_query(&args[1]) && is_text(&args[2]);
+                    match (config_form, options_form) {
+                        (true, false) => true,
+                        (false, true) => false,
+                        (true, true) => {
+                            let types: Vec<String> = args
+                                .iter()
+                                .map(|arg| argument_type_name(arg, column))
+                                .collect();
+                            return bad_function_not_unique(
+                                &name.to_ascii_lowercase(),
+                                &types,
+                            );
+                        }
+                        (false, false) => {
+                            let types: Vec<String> = args
+                                .iter()
+                                .map(|arg| argument_type_name(arg, column))
+                                .collect();
+                            return bad_function_args(&name.to_ascii_lowercase(), &types);
+                        }
+                    }
+                }
+                _ => true,
+            };
+            let (document, query, options) = if with_config {
+                (1, 2, args.get(3))
+            } else {
+                (0, 1, args.get(2))
+            };
+            let ok = (!with_config || is_config(&args[0]))
+                && is_text(&args[document])
+                && is_query(&args[query])
+                && options.is_none_or(|e| is_text(e));
+            if !ok {
+                let types: Vec<String> = args
+                    .iter()
+                    .map(|arg| argument_type_name(arg, column))
+                    .collect();
+                return bad_function_args(&name.to_ascii_lowercase(), &types);
+            }
+            let args = vec![
+                ScalarExpr::Literal(Value::Int(with_config as i64)),
+                if with_config {
+                    args[0].clone()
+                } else {
+                    ScalarExpr::Literal(Value::Null)
+                },
+                args[document].clone(),
+                args[query].clone(),
+                options
+                    .cloned()
+                    .unwrap_or_else(|| ScalarExpr::Literal(Value::Text(String::new()))),
+            ];
+            return ScalarExpr::Function {
+                name: TS_HEADLINE.to_string(),
+                args,
+            };
+        }
+        // The text-search inspection functions: `ts_lexize(dictionary,
+        // token)`, `ts_rewrite(query, target, substitute)`, and
+        // `get_current_ts_config()`.
+        ScalarExpr::Function { name, args }
+            if matches!(
+                name.as_str(),
+                "TS_LEXIZE" | "TS_REWRITE" | "GET_CURRENT_TS_CONFIG"
+            ) =>
+        {
+            let untyped = |e: &ScalarExpr| {
+                matches!(e, ScalarExpr::Literal(Value::Text(_) | Value::Null))
+            };
+            let is_text = |e: &ScalarExpr| {
+                untyped(e)
+                    || scalar_type(e, column)
+                        .is_none_or(|t| t.trim().is_empty() || is_text_type(&t))
+            };
+            let is_query =
+                |e: &ScalarExpr| untyped(e) || ts_kind(e, column) == Some("tsquery");
+            let is_dictionary = |e: &ScalarExpr| {
+                untyped(e)
+                    || scalar_type(e, column)
+                        .is_some_and(|t| t.trim().eq_ignore_ascii_case("regdictionary"))
+            };
+            let ok = match name.as_str() {
+                "TS_LEXIZE" => {
+                    args.len() == 2 && is_dictionary(&args[0]) && is_text(&args[1])
+                }
+                "TS_REWRITE" => args.len() == 3 && args.iter().all(|e| is_query(e)),
+                _ => args.is_empty(),
+            };
+            if !ok {
+                let types: Vec<String> = args
+                    .iter()
+                    .map(|arg| argument_type_name(arg, column))
+                    .collect();
+                return bad_function_args(&name.to_ascii_lowercase(), &types);
+            }
+            return checked.clone();
         }
         // The jsonpath functions: the document must be `jsonb` and the path
         // `jsonpath` (an untyped literal reads as either; a typed `text`
@@ -2404,6 +2653,20 @@ pub(crate) const TS_CMP: &str = "__TSCMP__";
 pub(crate) const TS_NOT: &str = "__TSNOT__";
 /// `length(tsvector)`, which shares its name with the text length.
 pub(crate) const TS_LENGTH: &str = "__TSLEN__";
+/// A JSON document argument of `to_tsvector` or the `*_to_tsvector`
+/// functions, as the value its declared type names: `__JSONDOC__(value,
+/// kind)`. The value is the document's text at run time (a plan carries a
+/// literal's text), so the wrapper reads it back as a JSON value.
+pub(crate) const TS_JSON_DOC: &str = "__JSONDOC__";
+
+/// `ts_headline` rewritten to one fixed shape, so its runtime can tell the
+/// three- and four-argument forms apart:
+/// `__TS_HEADLINE__(with-config, config, document, query, options)`.
+pub(crate) const TS_HEADLINE: &str = "__TS_HEADLINE__";
+
+/// A call whose arguments fit more than one overload:
+/// `__FUNC_NOT_UNIQUE__(name, argument type...)`.
+pub(crate) const FUNC_NOT_UNIQUE: &str = "__FUNC_NOT_UNIQUE__";
 
 /// The text-search type an expression's declared type names.
 fn ts_kind(expr: &ScalarExpr, column: &impl Fn(&str) -> Option<String>) -> Option<&'static str> {
@@ -2489,6 +2752,21 @@ pub(crate) fn bad_function_args(name: &str, types: &[String]) -> ScalarExpr {
     );
     ScalarExpr::Function {
         name: BAD_FUNCTION.to_string(),
+        args,
+    }
+}
+
+/// The error call for a function whose arguments fit more than one
+/// overload, as PostgreSQL's "is not unique".
+pub(crate) fn bad_function_not_unique(name: &str, types: &[String]) -> ScalarExpr {
+    let mut args = vec![ScalarExpr::Literal(Value::Text(name.to_string()))];
+    args.extend(
+        types
+            .iter()
+            .map(|t| ScalarExpr::Literal(Value::Text(t.clone()))),
+    );
+    ScalarExpr::Function {
+        name: FUNC_NOT_UNIQUE.to_string(),
         args,
     }
 }

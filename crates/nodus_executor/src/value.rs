@@ -121,6 +121,7 @@ pub(crate) fn object_identifier_type(data_type: &str) -> Option<&'static str> {
     match upper.strip_prefix("PG_CATALOG.").unwrap_or(&upper) {
         "REGCLASS" => Some("REGCLASS"),
         "REGCONFIG" => Some("REGCONFIG"),
+        "REGDICTIONARY" => Some("REGDICTIONARY"),
         "REGTYPE" => Some("REGTYPE"),
         "REGNAMESPACE" => Some("REGNAMESPACE"),
         _ => None,

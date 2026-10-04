@@ -962,6 +962,118 @@ impl MemExecutor {
                     ],
                 ],
             )),
+            // The shipped text search objects: the simple and English
+            // configurations and dictionaries, the default parser, and the
+            // templates behind them.
+            "pg_ts_config" => Some((
+                Self::virtual_columns(&[
+                    ("oid", "OID"),
+                    ("cfgname", "NAME"),
+                    ("cfgnamespace", "OID"),
+                    ("cfgowner", "OID"),
+                    ("cfgparser", "OID"),
+                ]),
+                vec![
+                    vec![
+                        Value::Int(3748),
+                        Value::Text("simple".into()),
+                        Value::Int(11),
+                        Value::Int(10),
+                        Value::Int(crate::ts_parse::PARSER_OID),
+                    ],
+                    vec![
+                        Value::Int(13282),
+                        Value::Text("english".into()),
+                        Value::Int(11),
+                        Value::Int(10),
+                        Value::Int(crate::ts_parse::PARSER_OID),
+                    ],
+                ],
+            )),
+            "pg_ts_dict" => Some((
+                Self::virtual_columns(&[
+                    ("oid", "OID"),
+                    ("dictname", "NAME"),
+                    ("dictnamespace", "OID"),
+                    ("dictowner", "OID"),
+                    ("dicttemplate", "OID"),
+                    ("dictinitoption", "TEXT"),
+                ]),
+                vec![
+                    vec![
+                        Value::Int(3765),
+                        Value::Text("simple".into()),
+                        Value::Int(11),
+                        Value::Int(10),
+                        Value::Int(3727),
+                        Value::Null,
+                    ],
+                    vec![
+                        Value::Int(13281),
+                        Value::Text("english_stem".into()),
+                        Value::Int(11),
+                        Value::Int(10),
+                        Value::Int(13268),
+                        Value::Text("language = 'english', stopwords = 'english'".into()),
+                    ],
+                ],
+            )),
+            "pg_ts_parser" => Some((
+                Self::virtual_columns(&[
+                    ("oid", "OID"),
+                    ("prsname", "NAME"),
+                    ("prsnamespace", "OID"),
+                    ("prsstart", "REGPROC"),
+                    ("prstoken", "REGPROC"),
+                    ("prsend", "REGPROC"),
+                    ("prsheadline", "REGPROC"),
+                    ("prslextype", "REGPROC"),
+                ]),
+                vec![vec![
+                    Value::Int(crate::ts_parse::PARSER_OID),
+                    Value::Text("default".into()),
+                    Value::Int(11),
+                    Value::Text("prsd_start".into()),
+                    Value::Text("prsd_nexttoken".into()),
+                    Value::Text("prsd_end".into()),
+                    Value::Text("prsd_headline".into()),
+                    Value::Text("prsd_lextype".into()),
+                ]],
+            )),
+            "pg_ts_template" => Some((
+                Self::virtual_columns(&[
+                    ("oid", "OID"),
+                    ("tmplname", "NAME"),
+                    ("tmplnamespace", "OID"),
+                    ("tmplinit", "REGPROC"),
+                    ("tmpllexize", "REGPROC"),
+                ]),
+                vec![
+                    vec![
+                        Value::Int(3727),
+                        Value::Text("simple".into()),
+                        Value::Int(11),
+                        Value::Text("dsimple_init".into()),
+                        Value::Text("dsimple_lexize".into()),
+                    ],
+                    vec![
+                        Value::Int(13268),
+                        Value::Text("snowball".into()),
+                        Value::Int(11),
+                        Value::Text("dsnowball_init".into()),
+                        Value::Text("dsnowball_lexize".into()),
+                    ],
+                ],
+            )),
+            "pg_ts_config_map" => Some((
+                Self::virtual_columns(&[
+                    ("mapcfg", "OID"),
+                    ("maptokentype", "INT4"),
+                    ("mapseqno", "INT4"),
+                    ("mapdict", "OID"),
+                ]),
+                Self::pg_ts_config_map_rows(),
+            )),
             "pg_operator" => Some(self.pg_operator_virtual_table(db_name)),
             "pg_cast" => Some(self.pg_cast_virtual_table()),
             "pg_locks" => Some(self.pg_locks_virtual_table(db_name)),
@@ -2811,16 +2923,13 @@ impl MemExecutor {
         let catalog = crate::session_env::with(|env| env.and_then(|e| e.catalog.clone()));
         // A text search configuration is one of the shipped ones.
         if kind == "REGCONFIG" {
-            return text_search_config_oid(&name)
-                .map(Value::Int)
-                .ok_or_else(|| {
-                    crate::error_fields::DbError::new(format!(
-                        "text search configuration \"{}\" does not exist",
-                        name.trim()
-                    ))
-                    .code("42704")
-                    .into_text()
-                });
+            return crate::ts_dict::config_of_qualified_name(&name)
+                .map(|config| Value::Int(config.oid()));
+        }
+        // As is a text search dictionary.
+        if kind == "REGDICTIONARY" {
+            return crate::ts_dict::config_of_dictionary_name(&name)
+                .map(|config| Value::Int(config.dictionary_oid()));
         }
         let found = match kind {
             "REGCLASS" => catalog.and_then(|c| Self::relation_oid(c.as_ref(), &name)),
@@ -2885,6 +2994,8 @@ impl MemExecutor {
         let schemas = catalog.list_schemas(db).ok()?;
         match kind {
             "REGCONFIG" => text_search_config_name(oid).map(str::to_string),
+            "REGDICTIONARY" => crate::ts_dict::dictionary_by_oid(oid)
+                .map(|config| config.dictionary_name().to_string()),
             "REGTYPE" => Some(crate::functions::format_type_name(oid)),
             "REGNAMESPACE" => schemas
                 .iter()
@@ -2919,26 +3030,50 @@ impl MemExecutor {
     }
 
     /// A statement's result with its object-identifier columns (`regclass`,
-    /// `regtype`, `regnamespace`) showing names rather than OIDs.
+    /// `regtype`, `regnamespace`) showing names rather than OIDs; an array
+    /// of them renames its elements, too.
     pub(crate) fn name_object_identifiers(
         &self,
         mut out: crate::QueryOutput,
     ) -> crate::QueryOutput {
-        let columns: Vec<(usize, &'static str)> = out
+        let columns: Vec<(usize, &'static str, bool)> = out
             .types
             .iter()
             .enumerate()
-            .filter_map(|(i, t)| crate::value::object_identifier_type(t).map(|kind| (i, kind)))
+            .filter_map(|(i, t)| {
+                let t = t.trim();
+                if let Some(element) = t.strip_suffix("[]") {
+                    return crate::value::object_identifier_type(element)
+                        .map(|kind| (i, kind, true));
+                }
+                crate::value::object_identifier_type(t).map(|kind| (i, kind, false))
+            })
             .collect();
         if columns.is_empty() {
             return out;
         }
+        let catalog = self.catalog_reader.as_ref();
         for row in &mut out.rows {
-            for &(i, kind) in &columns {
-                if let Some(Value::Int(oid)) = row.values.get(i)
-                    && let Some(name) = Self::object_name(self.catalog_reader.as_ref(), kind, *oid)
-                {
-                    row.values[i] = Value::Text(name);
+            for &(i, kind, array) in &columns {
+                let Some(value) = row.values.get_mut(i) else {
+                    continue;
+                };
+                if !array {
+                    if let Value::Int(oid) = value
+                        && let Some(name) = Self::object_name(catalog, kind, *oid)
+                    {
+                        *value = Value::Text(name);
+                    }
+                    continue;
+                }
+                if let Value::Array(items) = value {
+                    for item in items.iter_mut() {
+                        if let Value::Int(oid) = item
+                            && let Some(name) = Self::object_name(catalog, kind, *oid)
+                        {
+                            *item = Value::Text(name);
+                        }
+                    }
                 }
             }
         }
@@ -3209,6 +3344,21 @@ impl MemExecutor {
         None
     }
 
+    /// `pg_ts_config_map`'s rows, the sequence numbers always being one.
+    fn pg_ts_config_map_rows() -> Vec<Vec<Value>> {
+        crate::ts_dict::config_map_rows()
+            .into_iter()
+            .map(|(config, ty, dictionary)| {
+                vec![
+                    Value::Int(config),
+                    Value::Int(i64::from(ty)),
+                    Value::Int(1),
+                    Value::Int(dictionary),
+                ]
+            })
+            .collect()
+    }
+
     pub(crate) fn pg_collation_virtual_table(
         &self,
         db_name: &str,
@@ -3396,6 +3546,11 @@ const SYSTEM_CATALOG_OIDS: &[(&str, i64)] = &[
     ("pg_collation", 3456),
     ("pg_extension", 3079),
     ("pg_publication", 6104),
+    ("pg_ts_dict", 3600),
+    ("pg_ts_parser", 3601),
+    ("pg_ts_config", 3602),
+    ("pg_ts_config_map", 3603),
+    ("pg_ts_template", 3764),
 ];
 
 /// `pg_constraint`'s letter for a foreign key action.
