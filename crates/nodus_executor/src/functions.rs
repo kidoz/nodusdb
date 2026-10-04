@@ -130,6 +130,8 @@ pub(crate) fn is_known(name: &str) -> bool {
                 | crate::result_types::XMLATTRIBUTES
                 | crate::result_types::XML_ESCAPE | crate::result_types::XML_ATTR_VALUE
                 | crate::result_types::XML_SERIALIZE_TYPE
+                // SQL/JSON.
+                | crate::sqljson::IS_JSON | crate::sqljson::SQL_JSON_ERROR
                 // Dates and times.
                 | "NOW" | "CURRENT_TIMESTAMP" | "TRANSACTION_TIMESTAMP"
                 | "STATEMENT_TIMESTAMP" | "CLOCK_TIMESTAMP" | "CURRENT_DATE" | "CURRENT_TIME"
@@ -420,6 +422,7 @@ pub(crate) fn return_type(name: &str, arg_types: &[Option<String>]) -> Option<St
             crate::result_types::XML_ESCAPE
             | crate::result_types::XML_ATTR_VALUE
             | crate::result_types::XML_SERIALIZE_TYPE => "TEXT",
+            crate::sqljson::IS_JSON => "BOOLEAN",
             "PG_TS_CONFIG_IS_VISIBLE"
             | "PG_TS_DICT_IS_VISIBLE"
             | "PG_TS_PARSER_IS_VISIBLE"
@@ -2639,6 +2642,25 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
         crate::result_types::XML_IS_DOCUMENT if arity(1) => {
             Value::Bool(crate::xml::is_document(&text(&args[0])))
         }
+        // `<expr> IS [NOT] JSON [VALUE|SCALAR|ARRAY|OBJECT] [WITH|WITHOUT
+        // UNIQUE [KEYS]]`.
+        crate::sqljson::IS_JSON if arity(4) => Value::Bool(crate::sqljson::is_json(
+            &args[0],
+            &text(&args[1]),
+            &text(&args[2]),
+            matches!(args[3], Value::Bool(true)),
+        )),
+        // `JSON_EXISTS(doc, path [PASSING ...] [behavior ON ERROR])`.
+        // The SQL/JSON type errors the planner reports before execution.
+        crate::sqljson::SQL_JSON_ERROR if arity(2) || arity(3) => {
+            let error = crate::error_fields::DbError::new(text(&args[0])).code(&text(&args[1]));
+            let error = match args.get(2) {
+                Some(Value::Text(hint)) if !hint.is_empty() => error.hint(hint),
+                _ => error,
+            };
+            raise(error.into_text())
+        }
+        // `JSON(expr [WITH UNIQUE KEYS])`.
         // The XML type errors the planner reports before execution.
         crate::result_types::XML_ERROR if arity(2) => raise(
             crate::error_fields::DbError::new(text(&args[0]))

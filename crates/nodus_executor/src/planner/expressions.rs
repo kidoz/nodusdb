@@ -1161,6 +1161,35 @@ pub(crate) fn lower_scalar(expr: &sqlparser::ast::Expr, params: &[Value]) -> Opt
                 negated,
             })
         }
+        // `<expr> IS [NOT] JSON [VALUE|SCALAR|ARRAY|OBJECT] [WITH|WITHOUT
+        // UNIQUE [KEYS]]`.
+        Expr::IsJson {
+            expr: inner,
+            kind,
+            unique_keys,
+            negated,
+        } => {
+            let kind = match kind {
+                None | Some(sqlparser::ast::JsonPredicateType::Value) => "value",
+                Some(sqlparser::ast::JsonPredicateType::Scalar) => "scalar",
+                Some(sqlparser::ast::JsonPredicateType::Array) => "array",
+                Some(sqlparser::ast::JsonPredicateType::Object) => "object",
+            };
+            let unique = match unique_keys {
+                None => "either",
+                Some(sqlparser::ast::JsonKeyUniqueness::WithUniqueKeys) => "unique",
+                Some(sqlparser::ast::JsonKeyUniqueness::WithoutUniqueKeys) => "not-unique",
+            };
+            Some(ScalarExpr::Function {
+                name: crate::sqljson::IS_JSON.to_string(),
+                args: vec![
+                    lower_scalar(inner, params)?,
+                    ScalarExpr::Literal(Value::Text(kind.to_string())),
+                    ScalarExpr::Literal(Value::Text(unique.to_string())),
+                    ScalarExpr::Literal(Value::Bool(*negated)),
+                ],
+            })
+        }
         Expr::InList {
             expr: inner,
             list,

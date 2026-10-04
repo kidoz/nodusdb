@@ -61,6 +61,7 @@ mod session_env;
 mod session_functions;
 mod session_vars;
 mod set_ops;
+mod sqljson;
 mod streaming;
 mod subqueries;
 mod system_views;

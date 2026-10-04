@@ -1363,6 +1363,34 @@ pub(crate) fn check_integer_ranges(
                 args,
             };
         }
+        // `IS [NOT] JSON`: the operand is a string value (bytea included),
+        // `json`, or `jsonb`; anything else PostgreSQL refuses.
+        ScalarExpr::Function { name, args } if name == crate::sqljson::IS_JSON => {
+            let acceptable = |e: &ScalarExpr| {
+                matches!(e, ScalarExpr::Literal(Value::Text(_)))
+                    || scalar_type(e, column).is_none_or(|t| {
+                        let t = t.trim();
+                        t.is_empty()
+                            || t.eq_ignore_ascii_case("UNKNOWN")
+                            || is_text_type(t)
+                            || t.eq_ignore_ascii_case("json")
+                            || crate::value::is_jsonb_type(t)
+                            || crate::value::is_bytea_type(t)
+                    })
+            };
+            if let Some(value) = args.first()
+                && !acceptable(value)
+            {
+                return sql_json_error(
+                    format!(
+                        "cannot use type {} in IS JSON predicate",
+                        argument_type_name(value, column)
+                    ),
+                    "42804",
+                );
+            }
+            return checked.clone();
+        }
         // XML: the well-formedness checks and construction functions, and the
         // shapes `xmlparse`, `xmlserialize`, and `IS DOCUMENT` are rewritten
         // to. A text argument is taken only where a character type is
@@ -3087,6 +3115,23 @@ fn xml_call(name: &str, value: &ScalarExpr) -> ScalarExpr {
     ScalarExpr::Function {
         name: name.to_string(),
         args: vec![value.clone()],
+    }
+}
+
+/// The call a SQL/JSON type error is reported as at evaluation time.
+pub(crate) fn sql_json_error(message: String, code: &str) -> ScalarExpr {
+    sql_json_error_with_hint(message, code, "")
+}
+
+/// The same with the HINT PostgreSQL adds.
+pub(crate) fn sql_json_error_with_hint(message: String, code: &str, hint: &str) -> ScalarExpr {
+    ScalarExpr::Function {
+        name: crate::sqljson::SQL_JSON_ERROR.to_string(),
+        args: vec![
+            ScalarExpr::Literal(Value::Text(message)),
+            ScalarExpr::Literal(Value::Text(code.to_string())),
+            ScalarExpr::Literal(Value::Text(hint.to_string())),
+        ],
     }
 }
 
