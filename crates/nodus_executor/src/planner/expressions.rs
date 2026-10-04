@@ -318,6 +318,22 @@ pub(crate) fn try_cast(v: Value, data_type: &str) -> std::result::Result<Value, 
             .into_text()),
         };
     }
+    // An xml value is kept as written, but must be well-formed content (or a
+    // document, where a DOCTYPE forces the document parse).
+    if crate::xml::is_type(data_type) {
+        return match v {
+            Value::Text(text) => match crate::xml::validate(&text, crate::xml::Mode::Content) {
+                Ok(()) => Ok(Value::Text(text)),
+                Err(error) => Err(crate::xml::error_text(error)),
+            },
+            other => Err(crate::error_fields::DbError::new(format!(
+                "cannot cast type {} to xml",
+                crate::value::value_type_name(&other)
+            ))
+            .code("42846")
+            .into_text()),
+        };
+    }
     // A network-family type takes its literal form; a number is a money
     // amount. Any other value is not castable to one.
     if let Some(kind) = crate::net::Kind::of(data_type) {

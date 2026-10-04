@@ -480,6 +480,7 @@ pub(crate) fn coerce_for_column(value: &Value, data_type: &str) -> Value {
                 || crate::net::is_net_type(data_type)
                 || crate::geometric::is_geometric_type(data_type)
                 || crate::jsonpath::is_type(data_type)
+                || crate::xml::is_type(data_type)
                 || crate::textsearch::is_tsvector_type(data_type)
                 || crate::textsearch::is_tsquery_type(data_type) =>
         {
@@ -571,6 +572,7 @@ pub(crate) fn value_type_name(value: &Value) -> &'static str {
 /// array of one casts its elements one by one.
 pub(crate) fn is_structured_element(data_type: &str) -> bool {
     crate::jsonpath::is_type(data_type)
+        || crate::xml::is_type(data_type)
         || crate::ranges::is_range_type(data_type)
         || crate::multiranges::is_multirange_type(data_type)
         || crate::net::is_net_type(data_type)

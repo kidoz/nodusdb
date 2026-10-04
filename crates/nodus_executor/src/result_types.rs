@@ -1646,10 +1646,48 @@ pub(crate) fn check_integer_ranges(
                 .unwrap_or_else(|| "unknown".to_string());
             return bad_operator(&argument_type_name(expr, column), "=", &other);
         }
+        ScalarExpr::InList { expr, list, .. } if is_xml_type(expr, column) => {
+            let other = list
+                .first()
+                .map(|e| argument_type_name(e, column))
+                .unwrap_or_else(|| "unknown".to_string());
+            return bad_operator(&argument_type_name(expr, column), "=", &other);
+        }
         ScalarExpr::Quantified { left, .. } if is_jsonpath_type(left, column) => {
             return bad_operator(&argument_type_name(left, column), "=", "jsonpath");
         }
         ScalarExpr::Binary { op, left, right } => {
+            // An XML value has no operators at all, except that `||` takes
+            // it as one side of a text concatenation (PostgreSQL's
+            // `anynonarray || text`).
+            if is_xml_type(left, column) || is_xml_type(right, column) {
+                let symbol = match op {
+                    ScalarBinaryOp::Eq => Some("="),
+                    ScalarBinaryOp::NotEq => Some("<>"),
+                    ScalarBinaryOp::Lt => Some("<"),
+                    ScalarBinaryOp::LtEq => Some("<="),
+                    ScalarBinaryOp::Gt => Some(">"),
+                    ScalarBinaryOp::GtEq => Some(">="),
+                    ScalarBinaryOp::Concat => Some("||"),
+                    _ => None,
+                };
+                if let Some(symbol) = symbol {
+                    let text_side = |e: &ScalarExpr| {
+                        matches!(e, ScalarExpr::Literal(Value::Text(_)))
+                            || scalar_type(e, column).is_none_or(|t| {
+                                t.trim().is_empty() || is_text_type(&t)
+                            })
+                    };
+                    let other = if is_xml_type(left, column) { right } else { left };
+                    if symbol != "||" || !text_side(other) {
+                        return bad_operator(
+                            &argument_type_name(left, column),
+                            symbol,
+                            &argument_type_name(right, column),
+                        );
+                    }
+                }
+            }
             // The text-search types: comparisons and operators route by the
             // declared kind, since both are text at run time.
             if let Some(kind) = ts_kind(left, column).or_else(|| ts_kind(right, column)) {
@@ -2272,6 +2310,21 @@ pub(crate) fn check_integer_ranges(
             };
         }
     }
+    // An XML value casts to a character type (or to itself), and to nothing
+    // else, as PostgreSQL has no other cast.
+    if let ScalarExpr::Cast {
+        expr: inner,
+        target,
+    } = &checked
+        && is_xml_type(inner, column)
+        && !is_text_type(target)
+        && !crate::xml::is_type(target)
+    {
+        return xml_error(
+            format!("cannot cast type xml to {}", operator_type_name(target)),
+            "42846",
+        );
+    }
     match &checked {
         ScalarExpr::Cast {
             expr: inner,
@@ -2668,6 +2721,21 @@ pub(crate) const TS_HEADLINE: &str = "__TS_HEADLINE__";
 /// `__FUNC_NOT_UNIQUE__(name, argument type...)`.
 pub(crate) const FUNC_NOT_UNIQUE: &str = "__FUNC_NOT_UNIQUE__";
 
+/// An XML call the planner reports before execution:
+/// `__XML_ERROR__(message, sqlstate)`.
+pub(crate) const XML_ERROR: &str = "__XML_ERROR__";
+
+/// The call an XML type error is reported as at evaluation time.
+pub(crate) fn xml_error(message: String, code: &str) -> ScalarExpr {
+    ScalarExpr::Function {
+        name: XML_ERROR.to_string(),
+        args: vec![
+            ScalarExpr::Literal(Value::Text(message)),
+            ScalarExpr::Literal(Value::Text(code.to_string())),
+        ],
+    }
+}
+
 /// The text-search type an expression's declared type names.
 fn ts_kind(expr: &ScalarExpr, column: &impl Fn(&str) -> Option<String>) -> Option<&'static str> {
     match scalar_type(expr, column).as_deref() {
@@ -2814,6 +2882,10 @@ fn jsonpath_literal(text: &str) -> ScalarExpr {
 /// Whether an expression's declared type is `jsonpath`.
 fn is_jsonpath_type(expr: &ScalarExpr, column: &impl Fn(&str) -> Option<String>) -> bool {
     scalar_type(expr, column).is_some_and(|t| crate::jsonpath::is_type(&t))
+}
+
+fn is_xml_type(expr: &ScalarExpr, column: &impl Fn(&str) -> Option<String>) -> bool {
+    scalar_type(expr, column).is_some_and(|t| crate::xml::is_type(&t))
 }
 
 fn operator_type_name(data_type: &str) -> String {

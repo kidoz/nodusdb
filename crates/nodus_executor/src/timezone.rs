@@ -168,6 +168,9 @@ pub(crate) enum Shown {
     /// A network-family type: its display form (`inet` without the longest
     /// mask, money with its symbol).
     Net(crate::net::Kind),
+    /// An `xml` value: its output form, with an XML declaration's encoding
+    /// left out.
+    Xml,
     Padded(usize),
 }
 
@@ -192,6 +195,9 @@ pub(crate) fn output_forms(types: &[String]) -> Option<Vec<Shown>> {
             }
             if let Some(kind) = crate::net::Kind::of(base) {
                 return Shown::Net(kind);
+            }
+            if crate::xml::is_type(base) {
+                return Shown::Xml;
             }
             match crate::value::character_limit(t) {
                 Some((length, true)) => Shown::Padded(length),
@@ -232,8 +238,16 @@ pub(crate) fn show_row(values: &mut [crate::Value], forms: &[Shown]) {
             _ => {}
         }
     }
+    fn show_xml(value: &mut crate::Value) {
+        match value {
+            crate::Value::Text(text) => *text = crate::xml::output(text),
+            crate::Value::Array(items) => items.iter_mut().for_each(show_xml),
+            _ => {}
+        }
+    }
     for (value, form) in values.iter_mut().zip(forms) {
         match form {
+            Shown::Xml => show_xml(value),
             Shown::Zoned => localize(value),
             Shown::RangeZoned => {
                 localize_range(value);

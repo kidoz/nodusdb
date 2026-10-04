@@ -78,6 +78,7 @@ mod user_types;
 mod value;
 mod view_helpers;
 mod windows;
+mod xml;
 pub use cursors::FetchDirection;
 pub use error_fields::{error_fields, error_message};
 pub use explain::ExplainOptions;

@@ -108,6 +108,8 @@ pub(crate) fn is_known(name: &str) -> bool {
                 | "TS_HEADLINE" | "TS_LEXIZE" | "TS_REWRITE" | "GET_CURRENT_TS_CONFIG"
                 | "PG_TS_CONFIG_IS_VISIBLE" | "PG_TS_DICT_IS_VISIBLE"
                 | "PG_TS_PARSER_IS_VISIBLE" | "PG_TS_TEMPLATE_IS_VISIBLE"
+                // XML.
+                | crate::result_types::XML_ERROR
                 // Dates and times.
                 | "NOW" | "CURRENT_TIMESTAMP" | "TRANSACTION_TIMESTAMP"
                 | "STATEMENT_TIMESTAMP" | "CLOCK_TIMESTAMP" | "CURRENT_DATE" | "CURRENT_TIME"
@@ -2389,6 +2391,12 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
                 Err(error) => raise(error),
             }
         }
+        // The XML type errors the planner reports before execution.
+        crate::result_types::XML_ERROR if arity(2) => raise(
+            crate::error_fields::DbError::new(text(&args[0]))
+                .code(&text(&args[1]))
+                .into_text(),
+        ),
         // `ts_lexize(dictionary, token)`: the dictionary's lexemes for one
         // token; an empty array for a stop word.
         "TS_LEXIZE" if arity(2) => {
@@ -3925,6 +3933,7 @@ fn format_type(oid: i64, typmod: Option<i64>) -> String {
         25 => "text",
         26 => "oid",
         114 => "json",
+        142 => "xml",
         700 => "real",
         701 => "double precision",
         // `bpchar` with no length is not `character`, which means
@@ -3989,6 +3998,7 @@ fn format_type(oid: i64, typmod: Option<i64>) -> String {
         2951 => "uuid[]",
         3807 => "jsonb[]",
         4073 => "jsonpath[]",
+        143 => "xml[]",
         3643 => "tsvector[]",
         3645 => "tsquery[]",
         3904 => "int4range",

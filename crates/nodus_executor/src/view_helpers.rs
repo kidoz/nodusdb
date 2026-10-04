@@ -144,6 +144,7 @@ impl MemExecutor {
                 "JSON" => 199,
                 "JSONB" => 3807,
                 "JSONPATH" => 4073,
+                "XML" => 143,
                 "TSVECTOR" => 3643,
                 "TSQUERY" => 3645,
                 "REGTYPE" => 2211,
@@ -201,6 +202,7 @@ impl MemExecutor {
             "JSON" => 114,
             "JSONB" => 3802,
             "JSONPATH" => 4072,
+            "XML" => 142,
             "TSVECTOR" => 3614,
             "TSQUERY" => 3615,
             "NAME" => 19,
@@ -266,6 +268,7 @@ impl MemExecutor {
             2206 => "regtype",
             2950 => "uuid",
             3802 => "jsonb",
+            142 => "xml",
             _ => "text",
         }
         .to_string()
