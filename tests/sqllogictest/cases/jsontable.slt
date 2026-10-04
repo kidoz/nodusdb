@@ -1,0 +1,471 @@
+# JSON_TABLE (SQL/JSON), PG 18.4.
+query T
+select * from json_table('{"a":1}', '$' columns (a int));;
+----
+1
+
+query T
+select * from json_table('{"a":1}', '$' columns (a int path '$.a'));;
+----
+1
+
+query T
+select a from json_table('{"a":1}', '$' columns (a int path '$.a'));;
+----
+1
+
+query T
+select jt.a from json_table('{"a":1}', '$' columns (a int path '$.a')) jt;;
+----
+1
+
+query T
+select jt.b from json_table('{"a":1}', '$' columns (a int path '$.a')) as jt(b);;
+----
+1
+
+query T
+select * from json_table('[{"a":1},{"a":2}]', '$[*]' columns (a int path '$.a'));;
+----
+1
+2
+
+query T
+select * from json_table('{"a b":1}', '$' columns ("a b" int));;
+----
+1
+
+query T
+select * from json_table('{"ab":1}', '$' columns ("a b" int));;
+----
+NULL
+
+query T
+select * from json_table('{"A":1}', '$' columns (a int));;
+----
+NULL
+
+query TTT
+select * from json_table('{"a":1}', '$' columns (ord for ordinality, a int path '$.a', ex boolean exists path '$.b'));;
+----
+1	1	f
+
+query T
+select * from json_table('{"a":[1,2]}', '$' columns (v int[] path '$.a'));;
+----
+{1,2}
+
+query T
+select * from json_table('{"a":{"b":2}}', '$' columns (v int path '$.a'));;
+----
+NULL
+
+query T
+select * from json_table('{"a":1}', '$' columns (v numeric path '$.a'));;
+----
+1
+
+query TT
+select v, pg_typeof(v) from json_table('{"a":"2024-01-01"}', '$' columns (v date path '$.a'));;
+----
+2024-01-01	date
+
+query TT
+select v, pg_typeof(v) from json_table('{"a":true}', '$' columns (v boolean path '$.a'));;
+----
+t	boolean
+
+query TT
+select v, pg_typeof(v) from json_table('{"a":"x"}', '$' columns (v text path '$.a'));;
+----
+x	text
+
+query TT
+select v, pg_typeof(v) from json_table('{"a":true}', '$' columns (v text path '$.a'));;
+----
+t	text
+
+query T
+select v from json_table('{"a":"1"}', '$' columns (v int path '$.a'));;
+----
+1
+
+query T
+select v from json_table('{"a":1.50}', '$' columns (v text path '$.a'));;
+----
+1.50
+
+query T
+select v from json_table('{"a":null}', '$' columns (v int path '$.a'));;
+----
+NULL
+
+query T
+select v from json_table('{"a":[1,2]}', '$' columns (v jsonb path '$.a'));;
+----
+[1, 2]
+
+query T
+select v from json_table('{"a":1}', '$' columns (v jsonb path '$.a'));;
+----
+1
+
+query T
+select v from json_table('{"a":"x"}', '$' columns (v jsonb path '$.a'));;
+----
+"x"
+
+query T
+select v from json_table('{"a":1}', '$' columns (v json path '$.a'));;
+----
+1
+
+query T
+select v from json_table('{"a":"x"}', '$' columns (v text path '$.a' keep quotes));;
+----
+"x"
+
+query T
+select v from json_table('{"a":"x"}', '$' columns (v text path '$.a' omit quotes));;
+----
+x
+
+query T
+select v from json_table('{"a":1}', '$' columns (v text path '$.a' omit quotes on scalar string));;
+----
+1
+
+query T
+select v from json_table('{"a":[1,2]}', '$' columns (v text path '$.a[*]' with wrapper));;
+----
+[1, 2]
+
+query T
+select v from json_table('{"a":[1,2]}', '$' columns (v text path '$.a' with wrapper));;
+----
+[[1, 2]]
+
+query T
+select v from json_table('{"a":"x"}', '$' columns (v text path '$.a' with conditional wrapper));;
+----
+"x"
+
+query T
+select v from json_table('{"a":"x"}', '$' columns (v text path '$.a' with unconditional wrapper));;
+----
+["x"]
+
+query T
+select v from json_table('{"a":"x"}', '$' columns (v text path '$.a' without wrapper));;
+----
+"x"
+
+query T
+select v from json_table('{"a":"1"}', '$' columns (v text format json path '$.a'));;
+----
+"1"
+
+query T
+select v from json_table('{"a":"1"}' format json, '$' columns (v text format json path '$.a'));;
+----
+"1"
+
+query T
+select v from json_table('{"a":1}', '$' columns (v bytea format json path '$.a'));;
+----
+\x31
+
+statement error
+select v from json_table('{"a":1}', '$' columns (v text format json encoding utf8 path '$.a'));;
+
+query T
+select v from json_table('{"a":1}', '$' columns (v int path '$.a' error on empty));;
+----
+1
+
+query T
+select v from json_table('{"a":1}', '$' columns (v int path '$.b' default -1 on empty));;
+----
+-1
+
+query T
+select v from json_table('{"a":1}', '$' columns (v int path '$.b' null on empty));;
+----
+NULL
+
+query T
+select v from json_table('{"a":1}', '$' columns (v int path '$.b' error on error));;
+----
+NULL
+
+statement error
+select v from json_table('{"a":1}', '$' columns (v int path 'strict $.b' error on error));;
+
+query T
+select v from json_table('{"a":1}', '$' columns (v int path '$.b' default -1 on error));;
+----
+NULL
+
+statement error
+select v from json_table('["x"]', '$[*]' columns (v int path '$' error on error));;
+
+query T
+select v from json_table('["x"]', '$[*]' columns (v int path '$' default 0 on error));;
+----
+0
+
+query T
+select v from json_table('["x"]', '$[*]' columns (v int path '$' null on error));;
+----
+NULL
+
+query T
+select v from json_table('{"a":1}', '$' columns (v jsonb path '$.b' empty array on empty));;
+----
+[]
+
+query T
+select v from json_table('{"a":1}', '$' columns (v jsonb path '$.b' empty object on empty));;
+----
+{}
+
+statement error
+select v from json_table('{"a":1}', '$' columns (v int path '$' error on error));;
+
+statement error
+select v from json_table('{"a":1}', '$' columns (v int path '$.b' error on empty));;
+
+statement error
+select v from json_table('{"a":1}', '$' columns (v int path '$.a' empty array on error));;
+
+statement error
+select v from json_table('{"a":1}', '$' columns (v text path '$.a' empty object on empty));;
+
+query T
+select v from json_table('{"a":1}', '$' columns (v boolean exists path '$.a'));;
+----
+t
+
+query T
+select v from json_table('{"a":1}', '$' columns (v boolean exists path '$.b'));;
+----
+f
+
+query TT
+select v, pg_typeof(v) from json_table('{"a":1}', '$' columns (v text exists));;
+----
+false	text
+
+query T
+select v from json_table('{"a":1}', '$' columns (v boolean exists path '$.a' false on error));;
+----
+t
+
+query T
+select v from json_table('{"a":1}', '$' columns (v boolean exists path '$.a' true on error));;
+----
+t
+
+query T
+select v from json_table('{"a":1}', '$' columns (v boolean exists path '$.a' unknown on error));;
+----
+t
+
+query T
+select * from json_table('{"a":1}', '$' passing 1 as x columns (a int path '$.a'));;
+----
+1
+
+query T
+select * from json_table('{"a":1}', '$' passing '{"b":2}'::jsonb as x columns (b int path '$x'));;
+----
+NULL
+
+query T
+select * from json_table('{"a":1}', '$' passing 2 as n columns (v int path '$.a'));;
+----
+1
+
+query T
+select * from json_table('{"a":1}', '$abc' passing 3 as abc columns (a int path '$abc'));;
+----
+3
+
+query T
+select * from json_table('[1,2]', '$[*]' columns (v int path '$'));;
+----
+1
+2
+
+query T
+select * from json_table('{"x":[1,2]}', '$' columns (nested path '$.x[*]' columns (v int path '$')));;
+----
+1
+2
+
+query T
+select * from json_table('{"x":[{"n":[1,2]},{"n":[3]}]}', '$' columns (nested path '$.x[*]' columns (n int path '$.n[0]')));;
+----
+1
+3
+
+query TTT
+select * from json_table('{"x":[1,2]}', '$' columns (a int path '$.x[0]' null on empty, nested path '$.x[*]' columns (v int path '$'), b int path '$.x[1]'));;
+----
+1	2	1
+1	2	2
+
+query TT
+select * from json_table('{"x":[1,2],"y":[3]}', '$' columns (nested path '$.x[*]' columns (x int path '$'), nested path '$.y[*]' columns (y int path '$')));;
+----
+1	NULL
+2	NULL
+NULL	3
+
+query TTT
+select * from json_table('{"x":[1,2]}', '$' columns (a int path '$.x[0]' null on empty, nested path '$.x[*]' columns (v int path '$'), nested path '$.q[*]' columns (q int path '$')));;
+----
+1	1	NULL
+1	2	NULL
+
+query T
+select * from json_table('{"x":1}', '$' columns (nested path '$.q[*]' columns (q int path '$')));;
+----
+NULL
+
+query TT
+select * from json_table('{"x":1}', '$' columns (nested path '$.q[*]' columns (q int path '$'), nested path '$.r[*]' columns (r int path '$')));;
+----
+NULL	NULL
+
+query TT
+select * from json_table('{"x":[1]}', '$' columns (x int path '$.x[0]', nested path '$.y[*]' columns (y int path '$')));;
+----
+1	NULL
+
+query TTT
+select * from json_table('{"x":[{"n":[1,2]},{"n":[3]}]}', '$' columns (x int path '$.x[0]' null on empty, nested path '$.x[*]' columns (n int path '$.n[0]', nested path '$.n[*]' columns (m int path '$'))));;
+----
+NULL	1	1
+NULL	1	2
+NULL	3	3
+
+query TTT
+select * from json_table('{"a":[1,2]}', '$' columns (a int path '$.a[0]', nested path '$.a[*]' columns (ord for ordinality, v int path '$')));;
+----
+1	1	1
+1	2	2
+
+query T
+select * from json_table('{"a":1}', '$' columns (nested path 'strict $.q[*]' columns (q int path '$')));;
+----
+NULL
+
+query TT
+select t.id, jt.v from (values (1, '{"a":[1,2]}'), (2, '{"a":[3]}')) t(id, doc), json_table(t.doc, '$.a[*]' columns (v int path '$')) jt;;
+----
+1	1
+1	2
+2	3
+
+query TT rowsort
+select t.id, jt.v from (values (1, '{"a":[1,2]}'), (2, '{"a":[3]}')) t(id, doc), json_table(t.doc, '$.a[*]' columns (v int path '$')) jt order by t.id, jt.v;;
+----
+1	1
+1	2
+2	3
+
+query T
+select count(*) from (values (1, '{"a":[1,2]}')) t(id, doc), json_table(t.doc, '$.a[*]' columns (v int path '$')) jt;;
+----
+2
+
+query T
+select sum(jt.v) from (values (1, '{"a":[1,2]}')) t(id, doc), json_table(t.doc, '$.a[*]' columns (v int path '$')) jt;;
+----
+3
+
+query T
+select * from json_table('[1,2]'::json, '$[*]' columns (v int path '$'));;
+----
+1
+2
+
+query T
+select * from json_table(json_build_object('a', 1), '$' columns (a int));;
+----
+1
+
+query T
+select * from json_table(null, '$' columns (a int));;
+----
+
+query T
+select * from json_table('{}', '$' columns (a int));;
+----
+NULL
+
+query T
+select * from json_table('[]', '$[*]' columns (a int));;
+----
+
+query TT
+select jt.* from json_table('{"a":1}', '$' columns (a int, b text path '$.a')) jt;;
+----
+1	1
+
+query T
+select max(v) from json_table('[1,2,3]', '$[*]' columns (v int path '$'));;
+----
+3
+
+query T
+select v from json_table('[1,2]', '$[*]' columns (v int path '$')) where v > 1;;
+----
+2
+
+query TT
+select jt.x, jt2.y from (values (1)) t(n), json_table('{"a":1}', '$' columns (a int)) jt(x), json_table('{"b":2}', '$' columns (b int)) jt2(y) where jt.x = 1 and jt2.y = 2;;
+----
+1	2
+
+query T
+select * from json_table('{"a":1}', '$' columns (a int)) jt order by jt.a;;
+----
+1
+
+query T
+select * from json_table('{"a":1}', '$' columns (a int)) jt limit 1;;
+----
+1
+
+statement error
+select * from json_table('{"a":1}', 'strict $.b' columns (a int) error on error);;
+
+query T
+select * from json_table('{"a":1}', 'strict $.b' columns (a int) empty on error);;
+----
+
+query T
+select * from json_table('{"a":1}', 'strict $.b' columns (a int) empty array on error);;
+----
+
+query T
+select * from json_table('{"a":1}', '$' columns (a int) error on error);;
+----
+1
+
+statement error
+select * from json_table('{"a":1}', '$' columns (a int)) error on error;;
+
+statement error
+select * from json_table('{"a":1}', '$');;
+
+statement error
+select * from json_table('{"a":1}', '$' columns ());;
+
+statement error
+select * from json_table('{"a":1}', '$' columns (a int, a text path '$.b'));;
+
+statement error
+select * from json_table('{"a":1}', '$' columns (v nosuchtype path '$.a'));;
