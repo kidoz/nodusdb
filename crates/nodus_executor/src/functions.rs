@@ -19,6 +19,12 @@ const NON_STRICT: &[&str] = &[
     // `xmlconcat` is not strict: it drops NULL arguments, and is NULL only
     // when every argument is.
     "XMLCONCAT",
+    // The SQL/JSON query functions: a NULL document or path is NULL, while
+    // a NULL `PASSING` variable or DEFAULT expression is a value the arms
+    // handle themselves.
+    crate::sqljson::JSON_EXISTS,
+    crate::sqljson::JSON_VALUE,
+    crate::sqljson::JSON_QUERY,
     // The SQL/XML constructors: a NULL argument is skipped (or, for `xmlpi`,
     // a NULL value), and the target-name and attribute-name checks come
     // before the NULL checks.
@@ -132,6 +138,8 @@ pub(crate) fn is_known(name: &str) -> bool {
                 | crate::result_types::XML_SERIALIZE_TYPE
                 // SQL/JSON.
                 | crate::sqljson::IS_JSON | crate::sqljson::SQL_JSON_ERROR
+                | crate::sqljson::JSON_EXISTS | crate::sqljson::JSON_VALUE
+                | crate::sqljson::JSON_QUERY | crate::sqljson::JSON_VARS
                 | crate::sqljson::JSON | crate::sqljson::JSON_SCALAR
                 | crate::sqljson::JSON_SERIALIZE
                 // Dates and times.
@@ -425,9 +433,13 @@ pub(crate) fn return_type(name: &str, arg_types: &[Option<String>]) -> Option<St
             | crate::result_types::XML_ATTR_VALUE
             | crate::result_types::XML_SERIALIZE_TYPE => "TEXT",
             crate::sqljson::IS_JSON => "BOOLEAN",
+            crate::sqljson::JSON_EXISTS => "BOOLEAN",
             crate::sqljson::JSON => "JSON",
             crate::sqljson::JSON_SCALAR => "JSON",
             crate::sqljson::JSON_SERIALIZE => "TEXT",
+            crate::sqljson::JSON_VALUE | crate::sqljson::JSON_QUERY | crate::sqljson::JSON_VARS => {
+                "TEXT"
+            }
             "PG_TS_CONFIG_IS_VISIBLE"
             | "PG_TS_DICT_IS_VISIBLE"
             | "PG_TS_PARSER_IS_VISIBLE"
@@ -2656,6 +2668,89 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
             matches!(args[3], Value::Bool(true)),
         )),
         // `JSON_EXISTS(doc, path [PASSING ...] [behavior ON ERROR])`.
+        crate::sqljson::JSON_EXISTS if arity(5) => {
+            if args[0] == Value::Null || args[2] == Value::Null {
+                return Some(Value::Null);
+            }
+            let vars = (!matches!(args[3], Value::Null)).then(|| args[3].clone());
+            match crate::sqljson::json_exists(&args[0], &text(&args[2]), vars.as_ref(), &text(&args[4]))
+            {
+                Ok(value) => value,
+                Err(error) => raise(error),
+            }
+        }
+        // `JSON_VALUE(doc, path [PASSING ...] [RETURNING type] [behavior
+        // ON EMPTY|ERROR])`.
+        crate::sqljson::JSON_VALUE if arity(10) => {
+            if args[0] == Value::Null || args[2] == Value::Null {
+                return Some(Value::Null);
+            }
+            let vars = (!matches!(args[3], Value::Null)).then(|| args[3].clone());
+            match crate::sqljson::json_value(
+                &args[0],
+                &text(&args[2]),
+                vars.as_ref(),
+                &text(&args[4]),
+                &text(&args[6]),
+                &args[7],
+                &text(&args[8]),
+                &args[9],
+            ) {
+                Ok(value) => value,
+                Err(error) => raise(error),
+            }
+        }
+        // `JSON_QUERY(doc, path [PASSING ...] [RETURNING type] [wrapper]
+        // [quotes] [behavior ON EMPTY|ERROR])`.
+        crate::sqljson::JSON_QUERY if arity(12) => {
+            if args[0] == Value::Null || args[2] == Value::Null {
+                return Some(Value::Null);
+            }
+            let vars = (!matches!(args[3], Value::Null)).then(|| args[3].clone());
+            match crate::sqljson::json_query(
+                &args[0],
+                &text(&args[2]),
+                vars.as_ref(),
+                &text(&args[4]),
+                &text(&args[6]),
+                &text(&args[7]),
+                &text(&args[8]),
+                &args[9],
+                &text(&args[10]),
+                &args[11],
+            ) {
+                Ok(value) => value,
+                Err(error) => raise(error),
+            }
+        }
+        // The `PASSING` variables, as a JSON object.
+        crate::sqljson::JSON_VARS => {
+            let mut object = serde_json::Map::new();
+            let mut i = 0;
+            while i + 1 < args.len() {
+                let name = text(&args[i]);
+                let value = match &args[i + 1] {
+                    Value::Null => serde_json::Value::Null,
+                    Value::Jsonb(value) => value.clone(),
+                    Value::Json(text) => crate::json_text::parse(text).unwrap_or(serde_json::Value::Null),
+                    Value::Text(text) => serde_json::Value::String(text.clone()),
+                    Value::Bool(b) => serde_json::Value::Bool(*b),
+                    Value::Int(n) => serde_json::Value::Number((*n).into()),
+                    Value::Float(f) => serde_json::Number::from_f64(*f)
+                        .map(serde_json::Value::Number)
+                        .unwrap_or(serde_json::Value::Null),
+                    Value::Numeric(d) => serde_json::Value::String(d.to_string()),
+                    other => {
+                        let mut out = String::new();
+                        crate::json_text::value_json(other, false, &mut out);
+                        crate::json_text::parse(&out).unwrap_or(serde_json::Value::Null)
+                    }
+                };
+                object.insert(name, value);
+                i += 2;
+            }
+            Value::Text(crate::json_text::jsonb_text(&serde_json::Value::Object(object)))
+        }
         // The SQL/JSON type errors the planner reports before execution.
         crate::sqljson::SQL_JSON_ERROR if arity(2) || arity(3) => {
             let error = crate::error_fields::DbError::new(text(&args[0])).code(&text(&args[1]));

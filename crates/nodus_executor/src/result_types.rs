@@ -1484,6 +1484,65 @@ pub(crate) fn check_integer_ranges(
                 target: returning,
             };
         }
+        // The SQL/JSON query functions, as the parser rewrote them: the
+        // document is evaluated as `jsonb` and the path as `jsonpath`, and
+        // the result takes the RETURNING type (`text` for `json_value`,
+        // `jsonb` for `json_query`).
+        ScalarExpr::Function { name, args }
+            if matches!(
+                name.as_str(),
+                crate::sqljson::JSON_EXISTS | crate::sqljson::JSON_VALUE | crate::sqljson::JSON_QUERY
+            ) =>
+        {
+            let mut args = args.clone();
+            let is_jsonb = |e: &ScalarExpr| {
+                matches!(e, ScalarExpr::Literal(Value::Jsonb(_)))
+                    || scalar_type(e, column).is_some_and(|t| crate::value::is_jsonb_type(&t))
+            };
+            if let Some(doc) = args.get_mut(0)
+                && !is_jsonb(doc)
+            {
+                let inner = doc.clone();
+                *doc = ScalarExpr::Cast {
+                    expr: Box::new(inner),
+                    target: "jsonb".to_string(),
+                };
+            }
+            if let Some(path) = args.get_mut(2) {
+                let inner = path.clone();
+                *path = ScalarExpr::Cast {
+                    expr: Box::new(inner),
+                    target: "jsonpath".to_string(),
+                };
+            }
+            if name == crate::sqljson::JSON_EXISTS {
+                return ScalarExpr::Function {
+                    name: name.clone(),
+                    args,
+                };
+            }
+            let default = if name == crate::sqljson::JSON_VALUE {
+                "text"
+            } else {
+                "jsonb"
+            };
+            let target = match args.get(4) {
+                Some(ScalarExpr::Literal(Value::Text(target))) if !target.trim().is_empty() => {
+                    target.clone()
+                }
+                _ => default.to_string(),
+            };
+            if let Some(slot) = args.get_mut(4) {
+                *slot = ScalarExpr::Literal(Value::Text(target.clone()));
+            }
+            return ScalarExpr::Cast {
+                expr: Box::new(ScalarExpr::Function {
+                    name: name.clone(),
+                    args,
+                }),
+                target,
+            };
+        }
         // `IS [NOT] JSON`: the operand is a string value (bytea included),
         // `json`, or `jsonb`; anything else PostgreSQL refuses.
         ScalarExpr::Function { name, args } if name == crate::sqljson::IS_JSON => {

@@ -554,10 +554,17 @@ fn rewrite_xml_syntax(
     tokens
 }
 
-/// The JSON value constructors, which the parser cannot read with their
-/// clauses: `JSON`, `JSON_SCALAR`, and `JSON_SERIALIZE` (see `sqljson.rs`):
-/// `__json__(value, unique-keys)`, `__json_scalar__(value, is-json)`,
-/// `__json_serialize__(value, format, returning-type)`.
+/// The SQL/JSON query functions, which the parser cannot read with their
+/// clauses: `JSON_EXISTS`, `JSON_VALUE`, and `JSON_QUERY`, each rewritten to
+/// the marker function the planner knows (see `sqljson.rs`). The shapes are:
+/// `__json_exists__(doc, format, path, vars, on_error)`,
+/// `__json_value__(doc, format, path, vars, returning, retformat, on_empty,
+/// on_empty_default, on_error, on_error_default)`,
+/// `__json_query__(doc, format, path, vars, returning, retformat, wrapper,
+/// quotes, on_empty, on_empty_default, on_error, on_error_default)`, with
+/// `__json_vars__('name', value, ...)` for a `PASSING` clause.
+const SQL_JSON_FUNCTIONS: &[&str] = &["json_exists", "json_value", "json_query"];
+
 fn rewrite_sql_json(
     mut tokens: Vec<sqlparser::tokenizer::TokenWithSpan>,
 ) -> Vec<sqlparser::tokenizer::TokenWithSpan> {
@@ -584,6 +591,42 @@ fn rewrite_sql_json(
             }
         }
         None
+    };
+    // The ranges of the top-level `,`-separated items of a token range.
+    let split = |tokens: &[TokenWithSpan], from: usize, to: usize| {
+        let mut items = Vec::new();
+        let mut depth = 0i32;
+        let mut start = None;
+        for (i, token) in tokens.iter().enumerate().take(to).skip(from) {
+            match token.token {
+                Token::LParen => depth += 1,
+                Token::RParen => depth -= 1,
+                Token::Comma if depth == 0 => {
+                    items.push((start.unwrap_or(from), i));
+                    start = None;
+                    continue;
+                }
+                _ => {}
+            }
+            if start.is_none() && !matches!(token.token, Token::Whitespace(_)) {
+                start = Some(i);
+            }
+        }
+        if let Some(start) = start {
+            items.push((start, to));
+        }
+        items
+    };
+    // The clause keywords of the path item, at its top level: the clauses
+    // proper, and the behavior words that begin a `... ON EMPTY|ERROR` one.
+    let clause_word = |w: &str| {
+        matches!(
+            w,
+            "passing" | "returning" | "with" | "without" | "keep" | "omit" | "default" | "on"
+        )
+    };
+    let clause_or_behavior = |w: &str| {
+        clause_word(w) || matches!(w, "error" | "null" | "true" | "false" | "unknown" | "empty")
     };
     // The JSON value constructors: `JSON(expr [WITH|WITHOUT UNIQUE [KEYS]])`,
     // `JSON_SCALAR(expr)`, and `JSON_SERIALIZE(expr [FORMAT JSON [ENCODING n]]
@@ -697,8 +740,315 @@ fn rewrite_sql_json(
         }
         i += 1;
     }
+    let mut i = 0;
+    while i < tokens.len() {
+        let name = word(&tokens[i]).unwrap_or_default();
+        if !SQL_JSON_FUNCTIONS.contains(&name.as_str()) {
+            i += 1;
+            continue;
+        }
+        let Some(open) = significant(&tokens, i + 1) else {
+            i += 1;
+            continue;
+        };
+        if tokens[open].token != Token::LParen {
+            i += 1;
+            continue;
+        }
+        let Some(close) = matching_paren(&tokens, open) else {
+            i += 1;
+            continue;
+        };
+        let items = split(&tokens, open + 1, close);
+        if items.len() < 2 {
+            i += 1;
+            continue;
+        }
+        // The document, with its `FORMAT JSON [ENCODING name]` clause.
+        let (df, dto) = items[0];
+        let mut format = String::new();
+        let mut doc_end = dto;
+        for (at, token) in tokens.iter().enumerate().take(dto).skip(df) {
+            if word(token).as_deref() == Some("format") {
+                doc_end = at;
+                let rest: String = render_tokens(&tokens[at..dto]);
+                let rest = rest.trim().to_ascii_lowercase();
+                format = match rest.split_whitespace().nth(2) {
+                    Some(encoding) if rest.contains("encoding") => {
+                        format!(
+                            "json:{}",
+                            encoding.trim_matches(|c: char| !c.is_alphanumeric())
+                        )
+                    }
+                    _ => "json".to_string(),
+                };
+                format = format.replace("utf8", "utf-8");
+                break;
+            }
+        }
+        let doc = render_tokens(&tokens[df..doc_end]);
+        // The path, which runs to the first clause keyword.
+        let (pf, pto) = items[1];
+        let mut path_end = pto;
+        for (at, token) in tokens.iter().enumerate().take(pto).skip(pf) {
+            if let Some(w) = word(token)
+                && clause_or_behavior(&w)
+            {
+                path_end = at;
+                break;
+            }
+        }
+        let path = render_tokens(&tokens[pf..path_end]);
+        // The clauses, left to right.
+        let mut failed = false;
+        let mut vars = "NULL".to_string();
+        let mut returning = String::new();
+        let mut retformat = String::new();
+        let mut wrapper = String::new();
+        let mut quotes = String::new();
+        let mut on_empty = String::new();
+        let mut on_empty_default = "NULL".to_string();
+        let mut on_error = String::new();
+        let mut on_error_default = "NULL".to_string();
+        let mut at = path_end;
+        // The end of a clause expression: the next clause keyword at this
+        // level, or the closing parenthesis.
+        let clause_end = |tokens: &[TokenWithSpan], from: usize| {
+            let mut depth = 0i32;
+            for (at, token) in tokens.iter().enumerate().take(pto).skip(from) {
+                match token.token {
+                    Token::LParen => depth += 1,
+                    Token::RParen => depth -= 1,
+                    _ => {}
+                }
+                if depth == 0
+                    && let Some(w) = word(token)
+                    && clause_or_behavior(&w)
+                {
+                    return at;
+                }
+            }
+            pto
+        };
+        let default_end = |tokens: &[TokenWithSpan], from: usize| {
+            let mut depth = 0i32;
+            for (at, token) in tokens.iter().enumerate().take(pto).skip(from) {
+                match token.token {
+                    Token::LParen => depth += 1,
+                    Token::RParen => depth -= 1,
+                    _ => {}
+                }
+                if depth == 0 && word(token).as_deref() == Some("on") {
+                    return at;
+                }
+            }
+            pto
+        };
+        while at < pto {
+            let Some(key) = significant(&tokens, at) else {
+                break;
+            };
+            match word(&tokens[key]).as_deref() {
+                Some("passing") => {
+                    let end = clause_end(&tokens, key + 1);
+                    let mut parts = vec![format!(
+                        "pg_catalog.{}(",
+                        crate::SQL_JSON_VARS_MARKER.to_ascii_lowercase()
+                    )];
+                    for (index, (vf, vto)) in split(&tokens, key + 1, end).into_iter().enumerate() {
+                        // `<value> AS <name>`.
+                        let mut as_at = None;
+                        let mut depth = 0i32;
+                        for (j, token) in tokens.iter().enumerate().take(vto).skip(vf) {
+                            match token.token {
+                                Token::LParen => depth += 1,
+                                Token::RParen => depth -= 1,
+                                _ => {}
+                            }
+                            if depth == 0 && word(token).as_deref() == Some("as") {
+                                as_at = Some(j);
+                            }
+                        }
+                        if let Some(as_at) = as_at {
+                            let value = render_tokens(&tokens[vf..as_at]);
+                            let _ = &value;
+                            let name = render_tokens(&tokens[as_at + 1..vto]);
+                            if index > 0 {
+                                parts.push(", ".to_string());
+                            }
+                            let name = name.trim().replace('\'', "''");
+                            if name.is_empty() {
+                                failed = true;
+                                break;
+                            }
+                            parts.push(format!("'{name}', {value}"));
+                        }
+                    }
+                    parts.push(")".to_string());
+                    vars = parts.concat();
+                    at = end;
+                }
+                Some("returning") => {
+                    let end = clause_end(&tokens, key + 1);
+                    // A trailing `FORMAT JSON` belongs to the returning clause.
+                    let mut type_end = end;
+                    let mut depth = 0i32;
+                    for (j, token) in tokens.iter().enumerate().take(end).skip(key + 1) {
+                        match token.token {
+                            Token::LParen => depth += 1,
+                            Token::RParen => depth -= 1,
+                            _ => {}
+                        }
+                        if depth == 0 && word(token).as_deref() == Some("format") {
+                            type_end = j;
+                            retformat = "json".to_string();
+                            break;
+                        }
+                    }
+                    returning = render_tokens(&tokens[key + 1..type_end]).trim().to_string();
+                    at = end;
+                }
+                Some(kind @ ("with" | "without")) => {
+                    // `[WITH|WITHOUT] [CONDITIONAL|UNCONDITIONAL] [ARRAY] WRAPPER`.
+                    let mut j = significant(&tokens, key + 1).unwrap_or(pto);
+                    let mut conditional = false;
+                    if matches!(
+                        word(&tokens[j]).as_deref(),
+                        Some("conditional" | "unconditional")
+                    ) {
+                        conditional = word(&tokens[j]).as_deref() == Some("conditional");
+                        j = significant(&tokens, j + 1).unwrap_or(pto);
+                    }
+                    if word(&tokens[j]).as_deref() == Some("array") {
+                        j = significant(&tokens, j + 1).unwrap_or(pto);
+                    }
+                    if word(&tokens[j]).as_deref() == Some("wrapper") {
+                        wrapper = if kind == "without" {
+                            "without".to_string()
+                        } else if conditional {
+                            "conditional".to_string()
+                        } else {
+                            "with".to_string()
+                        };
+                        at = j + 1;
+                    } else {
+                        failed = true;
+                        break;
+                    }
+                }
+                Some(kind @ ("keep" | "omit")) => {
+                    let mut j = significant(&tokens, key + 1).unwrap_or(pto);
+                    if word(&tokens[j]).as_deref() == Some("quotes") {
+                        j = significant(&tokens, j + 1).unwrap_or(pto);
+                        if word(&tokens[j]).as_deref() == Some("on") {
+                            j = significant(&tokens, j + 1).unwrap_or(pto);
+                            if word(&tokens[j]).as_deref() == Some("scalar") {
+                                j = significant(&tokens, j + 1).unwrap_or(pto);
+                            }
+                            if word(&tokens[j]).as_deref() == Some("string") {
+                                j += 1;
+                            }
+                        }
+                        quotes = kind.to_string();
+                        at = j;
+                    } else {
+                        failed = true;
+                        break;
+                    }
+                }
+                Some("default") => {
+                    let end = default_end(&tokens, key + 1);
+                    if end == pto {
+                        failed = true;
+                        break;
+                    }
+                    let value = render_tokens(&tokens[key + 1..end]).trim().to_string();
+                    let behavior_at = significant(&tokens, end).unwrap_or(pto);
+                    let behavior = word(&tokens[behavior_at]).unwrap_or_default();
+                    let on = significant(&tokens, behavior_at + 1).unwrap_or(pto);
+                    let which = word(&tokens[on]).unwrap_or_default();
+                    if which == "empty" {
+                        on_empty = "default".to_string();
+                        on_empty_default = value;
+                    } else {
+                        on_error = "default".to_string();
+                        on_error_default = value;
+                    }
+                    let _ = behavior;
+                    at = on + 1;
+                }
+                Some(kind) => {
+                    // A behavior type: NULL, ERROR, TRUE, FALSE, UNKNOWN,
+                    // EMPTY [ARRAY|OBJECT], followed by `ON EMPTY|ERROR`.
+                    let mut j = key;
+                    let mut behavior = kind.to_string();
+                    if matches!(kind, "empty") {
+                        let next = significant(&tokens, j + 1).unwrap_or(pto);
+                        match word(&tokens[next]).as_deref() {
+                            Some(shape @ ("array" | "object")) => {
+                                behavior = format!("empty-{shape}");
+                                j = next;
+                            }
+                            _ => behavior = "empty-array".to_string(),
+                        }
+                    }
+                    let on = significant(&tokens, j + 1).unwrap_or(pto);
+                    let which = significant(&tokens, on + 1).unwrap_or(pto);
+                    if word(&tokens[on]).as_deref() != Some("on") {
+                        failed = true;
+                        break;
+                    }
+                    match word(&tokens[which]).as_deref() {
+                        Some("empty") => {
+                            on_empty = behavior;
+                            at = which + 1;
+                        }
+                        Some("error") => {
+                            on_error = behavior;
+                            at = which + 1;
+                        }
+                        _ => {
+                            failed = true;
+                            break;
+                        }
+                    }
+                }
+                None => break,
+            }
+        }
+        if failed {
+            i += 1;
+            continue;
+        }
+        let replacement = match name.as_str() {
+            "json_exists" => format!(
+                "pg_catalog.__json_exists__({doc}, '{format}', {path}, {vars}, '{on_error}')"
+            ),
+            "json_value" => format!(
+                "pg_catalog.__json_value__({doc}, '{format}', {path}, {vars}, '{returning}', \
+                 '{retformat}', '{on_empty}', {on_empty_default}, '{on_error}', \
+                 {on_error_default})"
+            ),
+            _ => format!(
+                "pg_catalog.__json_query__({doc}, '{format}', {path}, {vars}, '{returning}', \
+                 '{retformat}', '{wrapper}', '{quotes}', '{on_empty}', {on_empty_default}, \
+                 '{on_error}', {on_error_default})"
+            ),
+        };
+        if let Some(snippet) = snippet_tokens(&replacement) {
+            let len = snippet.len();
+            tokens.splice(i..=close, snippet);
+            i += len;
+            continue;
+        }
+        i += 1;
+    }
     tokens
 }
+
+/// The call a `PASSING` clause is rewritten to:
+/// `pg_catalog.__json_vars__('name', value, ...)`.
+pub const SQL_JSON_VARS_MARKER: &str = "__json_vars__";
 
 /// The first token of the expression ending just before `before`: a value
 /// with its `::type` casts, dotted names, and parenthesized or called parts.

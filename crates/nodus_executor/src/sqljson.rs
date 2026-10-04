@@ -1,6 +1,8 @@
 //! PostgreSQL's SQL/JSON functions (SQL:2023, PostgreSQL 16+): the
-//! `IS [NOT] JSON` predicates and the `JSON_*` value constructors, over the
-//! [`crate::jsonpath`] engine.
+//! `IS [NOT] JSON` predicates, the `JSON_*` constructors, and the
+//! `JSON_EXISTS`/`JSON_VALUE`/`JSON_QUERY` query functions. The path engine
+//! is [`crate::jsonpath`]'s; this module holds the conversion rules around it.
+
 /// The call `<expr> IS [NOT] JSON [VALUE|SCALAR|ARRAY|OBJECT]
 /// [WITH|WITHOUT UNIQUE [KEYS]]` is lowered to:
 /// `__IS_JSON__(value, kind, unique, negated)`.
@@ -9,6 +11,20 @@ pub(crate) const IS_JSON: &str = "__IS_JSON__";
 /// A call the planner reports before execution, as PostgreSQL words it:
 /// `__SQL_JSON_ERROR__(message, sqlstate)`.
 pub(crate) const SQL_JSON_ERROR: &str = "__SQL_JSON_ERROR__";
+
+/// The SQL/JSON query functions, as the parser rewrites them:
+/// `__JSON_EXISTS__(doc, format, path, vars, on_error)`,
+/// `__JSON_VALUE__(doc, format, path, vars, returning, retformat, on_empty,
+/// on_empty_default, on_error, on_error_default)`, and
+/// `__JSON_QUERY__(doc, format, path, vars, returning, retformat, wrapper,
+/// quotes, on_empty, on_empty_default, on_error, on_error_default)`.
+pub(crate) const JSON_EXISTS: &str = "__JSON_EXISTS__";
+pub(crate) const JSON_VALUE: &str = "__JSON_VALUE__";
+pub(crate) const JSON_QUERY: &str = "__JSON_QUERY__";
+
+/// The call a `PASSING` clause becomes: `__JSON_VARS__('name', value, ...)`,
+/// the variables object PostgreSQL hands the path evaluator.
+pub(crate) const JSON_VARS: &str = "__JSON_VARS__";
 
 /// The JSON value constructors: `__JSON__(value, unique-keys)`,
 /// `__JSON_SCALAR__(value)`, and
@@ -94,6 +110,249 @@ fn error(message: impl Into<String>, code: &str) -> String {
     crate::error_fields::DbError::new(message)
         .code(code)
         .into_text()
+}
+
+/// The document a SQL/JSON function reads, as a JSON value. The planner casts
+/// the document to `jsonb`, so a value here is one already.
+pub(crate) fn document(value: &crate::Value) -> Result<J, String> {
+    match value {
+        crate::Value::Jsonb(value) => Ok(value.clone()),
+        crate::Value::Json(text) | crate::Value::Text(text) => crate::json_text::parse(text),
+        other => Err(error(
+            format!(
+                "cannot cast type {} to jsonb",
+                crate::value::value_type_name(other)
+            ),
+            "42846",
+        )),
+    }
+}
+
+/// The variables a `PASSING` clause names, as the path evaluator's object.
+pub(crate) fn vars(value: &crate::Value) -> Result<J, String> {
+    match value {
+        crate::Value::Null => Ok(J::Object(serde_json::Map::new())),
+        crate::Value::Jsonb(value) => Ok(value.clone()),
+        crate::Value::Text(text) => crate::json_text::parse(text),
+        other => Err(error(
+            format!(
+                "cannot cast type {} to jsonb",
+                crate::value::value_type_name(other)
+            ),
+            "42846",
+        )),
+    }
+}
+
+/// The item as JSON text, in the canonical spelling.
+fn item_text(item: &J) -> String {
+    crate::json_text::jsonb_text(item)
+}
+
+/// The item as the scalar text a character or numeric RETURNING type takes:
+/// a string without its quotes, everything else as its JSON text.
+fn scalar_text(item: &J) -> String {
+    match item {
+        J::String(text) => text.clone(),
+        other => item_text(other),
+    }
+}
+
+/// A behavior clause as the parser encoded it.
+fn raises(behavior: &str) -> bool {
+    behavior == "error"
+}
+
+/// `JSON_EXISTS`: whether the path produces an item. An error the path raises
+/// is the ON ERROR clause's to handle (its default is FALSE).
+pub(crate) fn json_exists(
+    value: &crate::Value,
+    path: &str,
+    vars: Option<&crate::Value>,
+    on_error: &str,
+) -> Result<crate::Value, String> {
+    let doc = document(value)?;
+    let vars = match vars {
+        Some(vars) => Some(self::vars(vars)?),
+        None => None,
+    };
+    let found = crate::jsonpath::exists(&doc, path, vars.as_ref(), false);
+    let result = match found {
+        Ok(Some(found)) => found,
+        // A failure the ON ERROR clause handles; there is no ON EMPTY for
+        // this function, so an empty result is false, as PostgreSQL has it.
+        Ok(None) => false,
+        Err(text) => match on_error {
+            "true" => true,
+            "unknown" => return Ok(crate::Value::Null),
+            "error" => return Err(text),
+            _ => false,
+        },
+    };
+    Ok(crate::Value::Bool(result))
+}
+
+/// `JSON_VALUE`: the single scalar item the path produces, as the RETURNING
+/// type.
+pub(crate) fn json_value(
+    value: &crate::Value,
+    path: &str,
+    vars: Option<&crate::Value>,
+    returning: &str,
+    on_empty: &str,
+    on_empty_default: &crate::Value,
+    on_error: &str,
+    on_error_default: &crate::Value,
+) -> Result<crate::Value, String> {
+    let doc = document(value)?;
+    let vars = match vars {
+        Some(vars) => Some(self::vars(vars)?),
+        None => None,
+    };
+    let items = crate::jsonpath::execute(path, &doc, vars.as_ref(), false);
+    let items = match items {
+        Ok(items) => items,
+        Err(text) => {
+            return behavior(on_error, on_error_default, || Err(text));
+        }
+    };
+    match items.len() {
+        0 => behavior(on_empty, on_empty_default, || {
+            Err(error("no SQL/JSON item found for specified path", "22035"))
+        }),
+        1 => {
+            let item = &items[0];
+            // A JSON null is SQL NULL, whatever the RETURNING type.
+            if item.is_null() {
+                return Ok(crate::Value::Null);
+            }
+            if item.is_array() || item.is_object() {
+                return behavior(on_error, on_error_default, || {
+                    Err(error(
+                        "JSON path expression in JSON_VALUE must return single scalar item",
+                        "2203F",
+                    ))
+                });
+            }
+            match convert(item, returning) {
+                Ok(value) => Ok(value),
+                Err(text) => behavior(on_error, on_error_default, || Err(text)),
+            }
+        }
+        _ => behavior(on_error, on_error_default, || {
+            Err(error(
+                "JSON path expression in JSON_VALUE must return single scalar item",
+                "22034",
+            ))
+        }),
+    }
+}
+
+/// `JSON_QUERY`: the path's items, wrapped as the clause asks, as the
+/// RETURNING type.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn json_query(
+    value: &crate::Value,
+    path: &str,
+    vars: Option<&crate::Value>,
+    returning: &str,
+    wrapper: &str,
+    quotes: &str,
+    on_empty: &str,
+    on_empty_default: &crate::Value,
+    on_error: &str,
+    on_error_default: &crate::Value,
+) -> Result<crate::Value, String> {
+    let doc = document(value)?;
+    let vars = match vars {
+        Some(vars) => Some(self::vars(vars)?),
+        None => None,
+    };
+    let items = crate::jsonpath::execute(path, &doc, vars.as_ref(), false);
+    let items = match items {
+        Ok(items) => items,
+        Err(text) => {
+            return behavior(on_error, on_error_default, || Err(text));
+        }
+    };
+    if items.is_empty() {
+        return behavior(on_empty, on_empty_default, || {
+            Err(error("no SQL/JSON item found for specified path", "22035"))
+        });
+    }
+    let wrapped = wrapper == "with" || (wrapper == "conditional" && items.len() > 1);
+    if !wrapped && items.len() > 1 {
+        return behavior(on_error, on_error_default, || {
+            Err(error(
+                "JSON path expression in JSON_QUERY must return single item when no wrapper \
+                 is requested",
+                "22034",
+            ))
+        });
+    }
+    let result = if wrapped {
+        J::Array(items)
+    } else {
+        items.into_iter().next().expect("checked above")
+    };
+    // A character type takes the item's JSON text, with its quotes, unless
+    // `OMIT QUOTES` unwraps a scalar string.
+    if is_text_target(returning) {
+        let text = if !wrapped && quotes == "omit" && matches!(result, J::String(_)) {
+            scalar_text(&result)
+        } else {
+            item_text(&result)
+        };
+        return crate::value::fit_character(&text, returning, false).map(crate::Value::Text);
+    }
+    convert(&result, returning)
+}
+
+/// The value a behavior clause yields when its case arises: the DEFAULT
+/// expression, NULL, an empty array or object, or the error itself.
+fn behavior(
+    kind: &str,
+    default: &crate::Value,
+    error: impl FnOnce() -> Result<crate::Value, String>,
+) -> Result<crate::Value, String> {
+    match kind {
+        "default" => Ok(default.clone()),
+        "error" => error(),
+        "empty-array" => Ok(crate::Value::Jsonb(J::Array(Vec::new()))),
+        "empty-object" => Ok(crate::Value::Jsonb(J::Object(serde_json::Map::new()))),
+        // NULL, and the default where a clause was not given.
+        _ => Ok(crate::Value::Null),
+    }
+}
+
+/// Whether a RETURNING type is a character type (where quotes may be
+/// omitted).
+fn is_text_target(returning: &str) -> bool {
+    let upper = returning.trim().to_ascii_uppercase();
+    let base = upper.split('(').next().unwrap_or_default().trim();
+    matches!(
+        base,
+        "TEXT" | "VARCHAR" | "CHARACTER VARYING" | "CHAR" | "CHARACTER" | "BPCHAR"
+    )
+}
+
+/// An item as the RETURNING type: a character type takes the scalar text, a
+/// numeric or temporal one its input syntax, and `json`/`jsonb` the item's
+/// JSON text.
+fn convert(item: &J, returning: &str) -> Result<crate::Value, String> {
+    let upper = returning.trim().to_ascii_uppercase();
+    let base = upper.split('(').next().unwrap_or_default().trim();
+    if matches!(base, "JSON" | "JSONB") {
+        return Ok(match base {
+            "JSON" => crate::Value::Json(item_text(item)),
+            _ => crate::Value::Jsonb(item.clone()),
+        });
+    }
+    let text = scalar_text(item);
+    if is_text_target(returning) || base.is_empty() {
+        return crate::value::fit_character(&text, returning, false).map(crate::Value::Text);
+    }
+    crate::planner::try_cast(crate::Value::Text(text), returning)
 }
 
 /// Whether a value is a JSON value of the predicate's kind. An invalid text
@@ -313,6 +572,92 @@ mod tests {
             Ok(value) => crate::render(&value),
             Err(error) => format!("error: {error}"),
         }
+    }
+
+    #[test]
+    fn query_functions_match_postgresql() {
+        let exists = |doc: &str, path: &str, on_error: &str| {
+            shown(json_exists(&document_of(doc), path, None, on_error))
+        };
+        assert_eq!(exists("{\"a\":1}", "$.a", ""), "t");
+        assert_eq!(exists("{\"a\":1}", "$.b", ""), "f");
+        assert_eq!(exists("{\"a\":1}", "strict $.b", ""), "f");
+        assert_eq!(exists("{\"a\":1}", "strict $.b", "true"), "t");
+        assert_eq!(exists("{\"a\":1}", "strict $.b", "unknown"), "<NULL>");
+        assert!(exists("{\"a\":1}", "strict $.b", "error").starts_with("error: "));
+
+        let query = |doc: &str, path: &str, wrapper: &str, quotes: &str, on_empty: &str| {
+            shown(json_query(
+                &document_of(doc),
+                path,
+                None,
+                "text",
+                wrapper,
+                quotes,
+                on_empty,
+                &crate::Value::Null,
+                "",
+                &crate::Value::Null,
+            ))
+        };
+        assert_eq!(query("{\"a\":1}", "$.a", "", "", ""), "1");
+        assert_eq!(query("{\"a\":\"x\"}", "$.a", "", "", ""), "\"x\"");
+        assert_eq!(query("{\"a\":\"x\"}", "$.a", "", "omit", ""), "x");
+        assert_eq!(query("{\"a\":[1,2]}", "$.a[*]", "with", "", ""), "[1, 2]");
+        assert_eq!(
+            query("{\"a\":[1,2]}", "$.a[*]", "conditional", "", ""),
+            "[1, 2]"
+        );
+        assert_eq!(query("{\"a\":[1,2]}", "$.a[0]", "conditional", "", ""), "1");
+        assert_eq!(query("{\"a\":1}", "$.b", "", "", ""), "<NULL>");
+        assert_eq!(query("{\"a\":1}", "$.b", "", "", "empty-object"), "{}");
+
+        let value_of = |doc: &str, path: &str, returning: &str| {
+            shown(json_value(
+                &document_of(doc),
+                path,
+                None,
+                returning,
+                "",
+                &crate::Value::Null,
+                "",
+                &crate::Value::Null,
+            ))
+        };
+        assert_eq!(value_of("{\"a\":1}", "$.a", "text"), "1");
+        assert_eq!(value_of("{\"a\":\"x\"}", "$.a", "text"), "x");
+        assert_eq!(value_of("{\"a\":\"1\"}", "$.a", "int"), "1");
+        assert_eq!(value_of("{\"a\":null}", "$.a", "int"), "<NULL>");
+        assert_eq!(value_of("{\"a\":[1]}", "$.a", "int"), "<NULL>");
+        assert_eq!(value_of("{\"b\":1}", "$.a", "int"), "<NULL>");
+        assert_eq!(value_of("{\"a\":\"x\"}", "$.a", "int"), "<NULL>");
+        assert!(
+            shown(json_value(
+                &document_of("{\"a\":\"x\"}"),
+                "$.a",
+                None,
+                "int",
+                "",
+                &crate::Value::Null,
+                "error",
+                &crate::Value::Null,
+            ))
+            .starts_with("error: ")
+        );
+        // The DEFAULT clause for ON EMPTY.
+        assert_eq!(
+            shown(json_value(
+                &document_of("{\"b\":1}"),
+                "$.a",
+                None,
+                "int",
+                "default",
+                &crate::Value::Int(42),
+                "",
+                &crate::Value::Null,
+            )),
+            "42"
+        );
     }
 
     #[test]
