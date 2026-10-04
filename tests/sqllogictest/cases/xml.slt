@@ -1,0 +1,1003 @@
+# The xml type: values, well-formedness, and the SQL/XML functions.
+query T
+select '<a/>'::xml;
+----
+<a/>
+
+query T
+select 'a'::xml;
+----
+a
+
+query T
+select '<a/>text'::xml;
+----
+<a/>text
+
+query T
+select pg_typeof('<a/>'::xml);
+----
+xml
+
+query T
+select '<a/>'::xml::text;
+----
+<a/>
+
+query T
+select '<?xml version="1.0" encoding="UTF-8"?><a/>'::xml;
+----
+<a/>
+
+query T
+select '<?xml version="1.1"?><a/>'::xml;
+----
+<?xml version="1.1"?><a/>
+
+query T
+select '<?xml version="1.0" standalone="yes"?><a/>'::xml;
+----
+<?xml version="1.0" standalone="yes"?><a/>
+
+query T
+select E'\n<a/>'::xml;
+----
+<a/>
+
+query T
+select length('<a>bc</a>'::xml::text);
+----
+9
+
+query T
+select '<a/>'::xml || 'x';
+----
+<a/>x
+
+query T
+select 'x'::text || '<a/>'::xml;
+----
+x<a/>
+
+query T
+select pg_typeof('<a/>'::xml || 'x');
+----
+text
+
+query T
+select format('%s', '<?xml version="1.0" encoding="UTF-8"?><a/>'::xml);
+----
+<a/>
+
+query T
+select concat('<?xml version="1.0" encoding="UTF-8"?><a/>'::xml);
+----
+<a/>
+
+query T
+select concat_ws('-', '<a/>'::xml, '<b/>'::xml);
+----
+<a/>-<b/>
+
+query T
+select array['<a/>'::xml, '<b/>'::xml];
+----
+{<a/>,<b/>}
+
+query T
+select pg_typeof(array['<a/>'::xml]);
+----
+xml[]
+
+query T
+select row('<a/>'::xml)::text;
+----
+(<a/>)
+
+query T
+select '<a/>'::xml::varchar;
+----
+<a/>
+
+query T
+select '<a/>'::xml::char(6);
+----
+<a/>  
+
+statement error
+select '<a>'::xml;
+
+statement error
+select '<a></b>'::xml;
+
+statement error
+select '<a>&foo;</a>'::xml;
+
+statement error
+select '<a b=1/>'::xml;
+
+statement error
+select '<a b="1" b="2"/>'::xml;
+
+statement error
+select 1::xml;
+
+statement error
+select 'a'::xml::int;
+
+statement error
+select '<a/>'::xml || '<b/>'::xml;
+
+statement error
+select '<a/>'::xml = '<a/>'::xml;
+
+statement error
+select '<a/>'::xml < '<b/>'::xml;
+
+statement error
+select '<a/>'::xml = 'x'::text;
+
+statement error
+select '<a/>'::xml || 1;
+
+statement error
+select 1 || '<a/>'::xml;
+
+statement error
+select '<a/>'::xml in ('<a/>', 'x');
+
+statement error
+select '<?xml ?><a/>'::xml;
+
+statement error
+select xml_is_well_formed('<a/>'::xml);
+
+statement error
+select xml_is_well_formed(1);
+
+statement error
+select xmlcomment('a--b');
+
+statement error
+select xmlcomment('a-');
+
+statement error
+select xmlcomment(1);
+
+statement error
+select xmltext(1);
+
+statement error
+select xmlconcat('a'::text);
+
+statement error
+select xmlconcat(1);
+
+statement error
+select 1 is document;
+
+statement error
+select xmlparse(document 'text');
+
+statement error
+select xmlparse(content '<a>');
+
+statement error
+select xmlserialize(document 'a'::xml as text);
+
+statement error
+select xmlserialize(content '<a/>'::xml as int);
+
+query T
+select xml_is_well_formed('<a/>');
+----
+t
+
+query T
+select xml_is_well_formed('<a>');
+----
+f
+
+query T
+select xml_is_well_formed('text');
+----
+t
+
+query T
+select xml_is_well_formed('');
+----
+t
+
+query T
+select xml_is_well_formed('  ');
+----
+t
+
+query T
+select xml_is_well_formed('<a/>junk');
+----
+t
+
+query T
+select xml_is_well_formed('<a/><b/>');
+----
+t
+
+query T
+select xml_is_well_formed('</a>');
+----
+f
+
+query T
+select xml_is_well_formed('<a></a >');
+----
+t
+
+query T
+select xml_is_well_formed('<a></a:b>');
+----
+f
+
+query T
+select xml_is_well_formed('<a:b/>');
+----
+t
+
+query T
+select xml_is_well_formed('<a:b:c/>');
+----
+t
+
+query T
+select xml_is_well_formed('<a></a>');
+----
+t
+
+query T
+select xml_is_well_formed('<1a/>');
+----
+f
+
+query T
+select xml_is_well_formed('< a/>');
+----
+f
+
+query T
+select xml_is_well_formed('<>');
+----
+f
+
+query T
+select xml_is_well_formed('<a>&#x41;</a>');
+----
+t
+
+query T
+select xml_is_well_formed('<a>&#X41;</a>');
+----
+f
+
+query T
+select xml_is_well_formed('<a>&#x0;</a>');
+----
+f
+
+query T
+select xml_is_well_formed('<a>&#xFFFE;</a>');
+----
+f
+
+query T
+select xml_is_well_formed('<a>&#xD800;</a>');
+----
+f
+
+query T
+select xml_is_well_formed('<a>&#x1F600;</a>');
+----
+t
+
+query T
+select xml_is_well_formed('<a>&amp</a>');
+----
+f
+
+query T
+select xml_is_well_formed('<a>&#38;</a>');
+----
+t
+
+query T
+select xml_is_well_formed('<a>x]]>y</a>');
+----
+f
+
+query T
+select xml_is_well_formed('<![CDATA[x]]>');
+----
+t
+
+query T
+select xml_is_well_formed('<a><![CDATA[x]]>]]></a>');
+----
+f
+
+query T
+select xml_is_well_formed('<a><!-- x --></a>');
+----
+t
+
+query T
+select xml_is_well_formed('<!-- x -- y -->');
+----
+f
+
+query T
+select xml_is_well_formed('<!--->');
+----
+f
+
+query T
+select xml_is_well_formed('<?xmlfoo x?>');
+----
+t
+
+query T
+select xml_is_well_formed('<?xml x?>');
+----
+f
+
+query T
+select xml_is_well_formed('<?pi?><a/>');
+----
+t
+
+query T
+select xml_is_well_formed('<?xml version="1.0"?><a/>');
+----
+t
+
+query T
+select xml_is_well_formed('<?xml version="2.0"?><a/>');
+----
+t
+
+query T
+select xml_is_well_formed('<!DOCTYPE a><a/>');
+----
+t
+
+query T
+select xml_is_well_formed('<!DOCTYPE a SYSTEM "x.dtd"><a/>');
+----
+t
+
+query T
+select xml_is_well_formed('<!DOCTYPE a [<!ENTITY e "x">]><a>&e;</a>');
+----
+t
+
+query T
+select xml_is_well_formed('<!DOCTYPE a [<!ENTITY e "<b>">]><a>&e;</a>');
+----
+f
+
+query T
+select xml_is_well_formed('<!DOCTYPE a [<!ENTITY e "<b/>">]><a>&e;</a>');
+----
+t
+
+query T
+select xml_is_well_formed('<!DOCTYPE a [<!ENTITY e "&e;">]><a>&e;</a>');
+----
+f
+
+query T
+select xml_is_well_formed_document('<a/>');
+----
+t
+
+query T
+select xml_is_well_formed_document('<a/>junk');
+----
+f
+
+query T
+select xml_is_well_formed_document('<a/><b/>');
+----
+f
+
+query T
+select xml_is_well_formed_document('  ');
+----
+f
+
+query T
+select xml_is_well_formed_document('<?xml version="1.0"?><a/>');
+----
+t
+
+query T
+select xml_is_well_formed_document('<?xml version="1.1"?><a/>');
+----
+t
+
+query T
+select xml_is_well_formed_document('<?xml version="2.0"?><a/>');
+----
+f
+
+query T
+select xml_is_well_formed_document('<?xml version="1.0"?>');
+----
+f
+
+query T
+select xml_is_well_formed_content('<a/>');
+----
+t
+
+query T
+select xml_is_well_formed_content('<a/>text');
+----
+t
+
+query T
+select xml_is_well_formed_content('text');
+----
+t
+
+query T
+select xml_is_well_formed_content('');
+----
+t
+
+query T
+select xml_is_well_formed_content('  ');
+----
+t
+
+query T
+select xml_is_well_formed_content('<a/><b/>');
+----
+t
+
+query T
+select xml_is_well_formed(null);
+----
+NULL
+
+query T
+select xmlparse(document '<a>b</a>');
+----
+<a>b</a>
+
+query T
+select xmlparse(content '<a>b</a>');
+----
+<a>b</a>
+
+query T
+select xmlparse(content 'text');
+----
+text
+
+query T
+select xmlparse(content '<a/>x<b/>');
+----
+<a/>x<b/>
+
+query T
+select xmlparse(content '<?xml version="1.0" encoding="UTF-8"?><a/>');
+----
+<a/>
+
+query T
+select xmlparse(document '<?xml version="1.0"?><!DOCTYPE a><a/>');
+----
+<!DOCTYPE a><a/>
+
+query T
+select xmlparse(content '<!DOCTYPE a><a/>');
+----
+<!DOCTYPE a><a/>
+
+query T
+select xmlparse(document '<a/>'::xml);
+----
+<a/>
+
+query T
+select xmlserialize(content '<a>b</a>'::xml as text);
+----
+<a>b</a>
+
+query T
+select xmlserialize(content '<a/>'::xml as varchar(10));
+----
+<a/>
+
+query T
+select xmlserialize(content '<a/>'::xml as bpchar);
+----
+<a/>
+
+query T
+select xmlserialize(document '<a/>'::xml as text);
+----
+<a/>
+
+query T
+select xmlserialize(content '<?xml version="1.0"?><a/>'::xml as text);
+----
+<?xml version="1.0"?><a/>
+
+query T
+select xmlserialize(content '<a> <b/> </a>'::xml as text indent) = E'<a>\n  <b/>\n</a>';
+----
+t
+
+query T
+select xmlserialize(content '<a><b/><c/></a>'::xml as text indent) = E'<a>\n  <b/>\n  <c/>\n</a>';
+----
+t
+
+query T
+select xmlserialize(content '<a><b><c/></b></a>'::xml as text indent) = E'<a>\n  <b>\n    <c/>\n  </b>\n</a>';
+----
+t
+
+query T
+select xmlserialize(content '<a>  x  <b/> </a>'::xml as text indent) = E'<a>  x  <b/> </a>';
+----
+t
+
+query T
+select xmlserialize(content '<a>  </a>'::xml as text indent) = E'<a>  </a>';
+----
+t
+
+query T
+select xmlserialize(content '<a>&#65;<!--c--><b/></a>'::xml as text indent) = E'<a>A<!--c--><b/></a>';
+----
+t
+
+query T
+select xmlserialize(content '<a></a>'::xml as text indent) = E'<a/>';
+----
+t
+
+query T
+select xmlserialize(content 'a<b/>c'::xml as text indent) = E'a\n<b/>c';
+----
+t
+
+query T
+select xmlserialize(content '<a/>text'::xml as text indent) = E'<a/>text';
+----
+t
+
+query T
+select xmlserialize(content '  '::xml as text indent) = E'  ';
+----
+t
+
+query T
+select xmlserialize(content '<a/> '::xml as text indent) = E'<a/> ';
+----
+t
+
+query T
+select xmlserialize(document '<a/>'::xml as text indent) = E'<a/>';
+----
+t
+
+query T
+select xmlserialize(document '<a/><!--c-->'::xml as text indent) = E'<a/>\n<!--c-->';
+----
+t
+
+query T
+select xmlserialize(document '<?xml version="1.0"?><a/>'::xml as text indent) = E'<?xml version="1.0" encoding="UTF-8"?>\n<a/>';
+----
+t
+
+query T
+select xmlserialize(document '<!DOCTYPE a><a/>'::xml as text indent) = E'<!DOCTYPE a>\n<a/>';
+----
+t
+
+query T
+select xmlserialize(content '<!DOCTYPE a><a/>'::xml as text indent) = E'<!DOCTYPE a>\n<a/>';
+----
+f
+
+query T
+select xmlserialize(content '<a b="&#34;&#39;&amp;&lt;&gt;"/>'::xml as text indent) = E'<a b="&quot;''&amp;&lt;&gt;"/>';
+----
+t
+
+query T
+select xmlserialize(content '<a>&#13;x</a>'::xml as text indent) = E'<a>&#xD;x</a>';
+----
+t
+
+query T
+select xmlserialize(content '<a><![CDATA[x]]></a>'::xml as text indent) = E'<a><![CDATA[x]]></a>';
+----
+t
+
+query T
+select xmlconcat('<a/>'::xml, '<b/>'::xml);
+----
+<a/><b/>
+
+query T
+select xmlconcat('<a/>'::xml);
+----
+<a/>
+
+query T
+select xmlconcat('  <a/>  '::xml);
+----
+  <a/>  
+
+query T
+select xmlconcat('<?xml version="1.0"?><a/>'::xml, '<b/>'::xml);
+----
+<a/><b/>
+
+query T
+select xmlconcat('<?xml version="1.1"?><a/>'::xml, '<?xml version="1.1"?><b/>'::xml);
+----
+<?xml version="1.1"?><a/><b/>
+
+query T
+select xmlconcat('<?xml version="1.1"?><a/>'::xml, '<b/>'::xml);
+----
+<a/><b/>
+
+query T
+select xmlconcat('<?xml version="1.0" standalone="yes"?><a/>'::xml, '<?xml version="1.0"?><b/>'::xml);
+----
+<a/><b/>
+
+query T
+select xmlconcat(NULL::xml);
+----
+NULL
+
+query T
+select xmlconcat('<a/>'::xml, NULL::xml);
+----
+<a/>
+
+query T
+select xmlconcat(NULL::xml, NULL::xml);
+----
+NULL
+
+query T
+select xmlcomment('ok');
+----
+<!--ok-->
+
+query T
+select xmlcomment('');
+----
+<!---->
+
+query T
+select xmlcomment('<&>');
+----
+<!--<&>-->
+
+query T
+select xmlcomment(null);
+----
+NULL
+
+query T
+select xmltext('<a>b</a>');
+----
+&lt;a&gt;b&lt;/a&gt;
+
+query T
+select xmltext('a"''<&>');
+----
+a&quot;'&lt;&amp;&gt;
+
+query T
+select xmltext('plain');
+----
+plain
+
+query T
+select '<a/>'::xml is document;
+----
+t
+
+query T
+select 'text'::xml is document;
+----
+f
+
+query T
+select '<a/>text'::xml is document;
+----
+f
+
+query T
+select '<a/>'::xml is not document;
+----
+f
+
+query T
+select 'text' is document;
+----
+f
+
+query T
+select 'text' is not document;
+----
+t
+
+query T
+select null::xml is document;
+----
+NULL
+
+query T
+select null::xml is not document;
+----
+NULL
+
+query T
+select xmlparse(document '<a/>') is document;
+----
+t
+
+query TTTTTTTTTTTTT
+select oid, typname, typlen, typbyval, typtype, typcategory, typdelim, typcollation, typalign, typstorage, typtypmod, typndims, typbasetype from pg_type where oid in (142,143);
+----
+142	xml	-1	f	b	U	,	0	i	x	-1	0	0
+143	_xml	-1	f	b	A	,	0	i	x	-1	0	0
+
+query T
+select format_type(142, null);
+----
+xml
+
+query T
+select format_type(143, null);
+----
+xml[]
+
+query T
+select pg_typeof('<a/>'::xml is document);
+----
+boolean
+
+# The SQL/XML constructors: XMLELEMENT, XMLATTRIBUTES, XMLFOREST, XMLPI, XMLROOT.
+query T
+select xmlelement(name foo);
+----
+<foo/>
+
+query T
+select xmlelement(name foo, 'bar'::text);
+----
+<foo>bar</foo>
+
+query T
+select xmlelement(name foo, 1);
+----
+<foo>1</foo>
+
+query T
+select xmlelement(name foo, 1, true, 2.5);
+----
+<foo>1true2.5</foo>
+
+query T
+select xmlelement(name foo, null::text);
+----
+<foo/>
+
+query T
+select xmlelement(name foo, '<b/>'::xml);
+----
+<foo><b/></foo>
+
+query T
+select xmlelement(name foo, '<b/>'::text);
+----
+<foo>&lt;b/&gt;</foo>
+
+query T
+select xmlelement(name foo, '<b/>');
+----
+<foo>&lt;b/&gt;</foo>
+
+query T
+select xmlelement(name foo, '<b/>'::xml, '<c/>'::text);
+----
+<foo><b/>&lt;c/&gt;</foo>
+
+query T
+select xmlelement(name foo, array[1,2,null,3]);
+----
+<foo><element>1</element><element>2</element><element>3</element></foo>
+
+query T
+select xmlelement(name foo, xmlattributes(1 as a, 'x<y>' as b));
+----
+<foo a="1" b="x&lt;y&gt;"/>
+
+query T
+select xmlelement(name foo, xmlattributes('&' as a), 'bar');
+----
+<foo a="&amp;">bar</foo>
+
+query T
+select xmlelement(name foo, xmlattributes(true as x, null as y));
+----
+<foo x="true"/>
+
+query T
+select xmlelement(name foo, xmlattributes('a"b' as x));
+----
+<foo x="a&quot;b"/>
+
+query T
+select xmlelement(name foo, E'a\rb');
+----
+<foo>a&#x0d;b</foo>
+
+query T
+select xmlelement(name "Foo bar", 'x');
+----
+<Foo_x0020_bar>x</Foo_x0020_bar>
+
+query T
+select xmlelement(name "xmlfoo", 'x');
+----
+<xmlfoo>x</xmlfoo>
+
+query T
+select xmlelement(name foo, xmlattributes(1 as "a b"));
+----
+<foo a_x0020_b="1"/>
+
+statement error
+select xmlelement(name foo, xmlattributes(1));
+
+statement error
+select xmlelement(name foo, xmlattributes(1 as a, 2 as a));
+
+query T
+select xmlforest('<b/>'::xml as a, 'x<y' as b);
+----
+<a><b/></a><b>x&lt;y</b>
+
+query T
+select xmlforest(1 as a, null::int as b);
+----
+<a>1</a>
+
+query T
+select xmlforest(null::int as a);
+----
+NULL
+
+query T
+select xmlforest('x' as a);
+----
+<a>x</a>
+
+query T
+select xmlpi(name foo, 'bar');
+----
+<?foo bar?>
+
+query T
+select xmlpi(name foo);
+----
+<?foo?>
+
+query T
+select xmlpi(name "a b", 'x');
+----
+<?a_x0020_b x?>
+
+query T
+select xmlpi(name foo, null::text);
+----
+NULL
+
+statement error
+select xmlpi(name xml);
+
+statement error
+select xmlpi(name foo, '<?>');
+
+query T
+select xmlroot('<a/>'::xml, version '1.1');
+----
+<?xml version="1.1"?><a/>
+
+query T
+select xmlroot('<a/>'::xml, version no value);
+----
+<a/>
+
+query T
+select xmlroot('<a/>'::xml, version '1.0', standalone no);
+----
+<?xml version="1.0" standalone="no"?><a/>
+
+query T
+select xmlroot('<a/>'::xml, version '1.1', standalone yes);
+----
+<?xml version="1.1" standalone="yes"?><a/>
+
+query T
+select xmlroot('<?xml version="1.1"?><a/>'::xml, version no value, standalone no value);
+----
+<a/>
+
+query T
+select xmlroot('<a/>'::xml, version '', standalone no value);
+----
+<?xml version=""?><a/>
+
+query T
+select xmlroot('<?xml version="1.1"?><a/>'::xml, version '1.0', standalone no value);
+----
+<a/>
+
+statement ok
+create table xml_data(x xml);
+
+statement ok
+insert into xml_data values ('<b/>'), ('<a/>'), (null);
+
+query T
+select xmlagg(x) from xml_data;
+----
+<b/><a/>
+
+query T
+select xmlagg(null::xml);
+----
+NULL
+
+query T
+select xmlagg('<a/>');
+----
+<a/>
+
+statement error
+select xmlagg(1);
+
+statement error
+select xmlagg(x order by x) from xml_data;
+
+statement error
+select xmlserialize(content '<a/>'::xml as varchar(3));
+
+query T
+select pg_typeof(xmlelement(name foo, 'x'));
+----
+xml
+
+query T
+select pg_typeof(xmlforest('x' as a));
+----
+xml
+
+query T
+select pg_typeof(xmlpi(name foo));
+----
+xml
