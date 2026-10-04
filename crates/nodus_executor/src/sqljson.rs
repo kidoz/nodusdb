@@ -39,6 +39,10 @@ pub(crate) const JSON_SERIALIZE: &str = "__JSON_SERIALIZE__";
 pub(crate) const JSON_ARRAY: &str = "__JSON_ARRAY__";
 pub(crate) const JSON_OBJECT: &str = "__JSON_OBJECT__";
 
+/// The `FORMAT JSON [ENCODING name]` clause on an element of a constructor,
+/// as the parser rewrites it: `__JSON_FORMAT__(value, encoding)`.
+pub(crate) const JSON_FORMAT: &str = "__JSON_FORMAT__";
+
 /// A value as it appears as an array element or an object's value: a JSON
 /// value keeps its own form, everything else is written as `to_json` writes
 /// it (a text value becomes a JSON string).
@@ -214,6 +218,33 @@ fn key_name(value: &crate::Value) -> Result<String, String> {
         ));
     }
     Ok(crate::render(value))
+}
+
+/// An element of a constructor under `FORMAT JSON`: the value read as a JSON
+/// document, its text kept. A NULL stays NULL (the null clause decides its
+/// fate), and anything but a string type is refused (the planner refuses it
+/// by its declared type already).
+pub(crate) fn format_json(value: &crate::Value) -> Result<crate::Value, String> {
+    Ok(match value {
+        crate::Value::Null => crate::Value::Null,
+        crate::Value::Json(text) => crate::Value::Json(text.clone()),
+        crate::Value::Jsonb(value) => crate::Value::Json(crate::json_text::jsonb_text(value)),
+        crate::Value::Text(text) => {
+            crate::json_text::parse(text)?;
+            crate::Value::Json(text.clone())
+        }
+        crate::Value::Bytea(bytes) => {
+            let text = String::from_utf8_lossy(bytes).into_owned();
+            crate::json_text::parse(&text)?;
+            crate::Value::Json(text)
+        }
+        _ => {
+            return Err(error(
+                "cannot use non-string types with explicit FORMAT JSON clause",
+                "42804",
+            ));
+        }
+    })
 }
 
 /// `JSON(expr [WITH UNIQUE KEYS])`: the value as a `json`, its text kept as
@@ -1019,6 +1050,28 @@ mod tests {
             object(true, false, &[(Value::Array(vec![]), Value::Int(1))]).starts_with(
                 "error: key value must be scalar, not array, composite, or json\u{1f}code=22023"
             )
+        );
+    }
+
+    #[test]
+    fn format_json_matches_postgresql() {
+        use crate::Value;
+        // An element under `FORMAT JSON`: the value read as a JSON document.
+        assert_eq!(shown(format_json(&Value::Text("1".into()))), "1");
+        assert_eq!(shown(format_json(&Value::Null)), "<NULL>");
+        assert_eq!(
+            shown(format_json(&Value::Json("{\"a\": 1}".into()))),
+            "{\"a\": 1}"
+        );
+        assert_eq!(shown(format_json(&Value::Jsonb(parse("[1, 2]")))), "[1, 2]");
+        assert_eq!(
+            shown(format_json(&Value::Bytea(b"{\"a\":1}".to_vec()))),
+            "{\"a\":1}"
+        );
+        assert!(shown(format_json(&Value::Int(1))).starts_with("error: "));
+        assert!(
+            shown(format_json(&Value::Text("abc".into()))).starts_with("error: "),
+            "an invalid document is refused"
         );
     }
 

@@ -1050,7 +1050,9 @@ fn rewrite_sql_json(
 /// with their clauses: `JSON_ARRAY` and `JSON_OBJECT`, each rewritten to the
 /// marker function the planner knows (see `sqljson.rs`). The shapes are
 /// `__json_array__(absent, returning, element...)` and
-/// `__json_object__(absent, unique, returning, key, value, ...)`.
+/// `__json_object__(absent, unique, returning, key, value, ...)`, with an
+/// element under `FORMAT JSON` as `pg_catalog.__json_format__(value,
+/// encoding)`.
 fn rewrite_json_constructors(
     mut tokens: Vec<sqlparser::tokenizer::TokenWithSpan>,
 ) -> Vec<sqlparser::tokenizer::TokenWithSpan> {
@@ -1128,10 +1130,41 @@ fn rewrite_json_constructors(
         }
         value_at
     };
-    // A value expression as the marker takes it.
-    let element = |tokens: &[TokenWithSpan], from: usize, to: usize| -> String {
-        render_tokens(&tokens[from..to])
+    // A trailing `FORMAT JSON [ENCODING name]` clause of the item ending at
+    // `to`: the value expression ends just before it, and the flag says
+    // whether an `ENCODING` clause was written.
+    let format_end = |tokens: &[TokenWithSpan], to: usize| -> Option<(usize, bool)> {
+        let mut end = to;
+        let mut encoding = false;
+        if let Some(name) = significant_back(tokens, end)
+            && let Some(at) = significant_back(tokens, name)
+            && word(&tokens[at]).as_deref() == Some("encoding")
+        {
+            encoding = true;
+            end = at;
+        }
+        if let Some(last) = significant_back(tokens, end)
+            && word(&tokens[last]).as_deref() == Some("json")
+            && let Some(at) = significant_back(tokens, last)
+            && word(&tokens[at]).as_deref() == Some("format")
+        {
+            return Some((at, encoding));
+        }
+        None
     };
+    // A value expression as the marker takes it: under `FORMAT JSON` it is
+    // read as a JSON document by the runtime, `encoding` marking an
+    // `ENCODING name` clause (only a `bytea` may take one).
+    let element =
+        |tokens: &[TokenWithSpan], from: usize, to: usize, format: Option<bool>| -> String {
+            let text = render_tokens(&tokens[from..to]);
+            match format {
+                Some(encoding) => {
+                    format!("pg_catalog.__json_format__({text}, {encoding})")
+                }
+                None => text,
+            }
+        };
     let mut i = 0;
     while i < tokens.len() {
         let name = word(&tokens[i]).unwrap_or_default();
@@ -1185,7 +1218,7 @@ fn rewrite_json_constructors(
                 }
             }
             if let Some(at) = returning_at {
-                let type_end = end;
+                let type_end = format_end(&tokens, end).map_or(end, |(at, _)| at);
                 returning = render_tokens(&tokens[at + 1..type_end]).trim().to_string();
                 end = at;
             }
@@ -1236,16 +1269,17 @@ fn rewrite_json_constructors(
         let mut parts: Vec<String> = Vec::new();
         if !failed {
             for (from, to) in items.iter().copied() {
-                let end = to;
+                let (end, format) = format_end(&tokens, to)
+                    .map_or((to, None), |(at, encoding)| (at, Some(encoding)));
                 if object {
                     let Some(sep) = pair_at(&tokens, from, end) else {
                         failed = true;
                         break;
                     };
                     let key = render_tokens(&tokens[from..sep]);
-                    parts.push(format!("{key}, {}", element(&tokens, sep + 1, end)));
+                    parts.push(format!("{key}, {}", element(&tokens, sep + 1, end, format)));
                 } else {
-                    parts.push(element(&tokens, from, end));
+                    parts.push(element(&tokens, from, end, format));
                 }
             }
         }

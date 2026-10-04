@@ -26,9 +26,11 @@ const NON_STRICT: &[&str] = &[
     crate::sqljson::JSON_VALUE,
     crate::sqljson::JSON_QUERY,
     // The array and object constructors: a NULL element or object value is
-    // kept or left out by the null clause.
+    // kept or left out by the null clause, and a NULL element under
+    // `FORMAT JSON` stays NULL.
     crate::sqljson::JSON_ARRAY,
     crate::sqljson::JSON_OBJECT,
+    crate::sqljson::JSON_FORMAT,
     // The SQL/XML constructors: a NULL argument is skipped (or, for `xmlpi`,
     // a NULL value), and the target-name and attribute-name checks come
     // before the NULL checks.
@@ -147,6 +149,7 @@ pub(crate) fn is_known(name: &str) -> bool {
                 | crate::sqljson::JSON | crate::sqljson::JSON_SCALAR
                 | crate::sqljson::JSON_SERIALIZE
                 | crate::sqljson::JSON_ARRAY | crate::sqljson::JSON_OBJECT
+                | crate::sqljson::JSON_FORMAT
                 // Dates and times.
                 | "NOW" | "CURRENT_TIMESTAMP" | "TRANSACTION_TIMESTAMP"
                 | "STATEMENT_TIMESTAMP" | "CLOCK_TIMESTAMP" | "CURRENT_DATE" | "CURRENT_TIME"
@@ -442,7 +445,9 @@ pub(crate) fn return_type(name: &str, arg_types: &[Option<String>]) -> Option<St
             crate::sqljson::JSON => "JSON",
             crate::sqljson::JSON_SCALAR => "JSON",
             crate::sqljson::JSON_SERIALIZE => "TEXT",
-            crate::sqljson::JSON_ARRAY | crate::sqljson::JSON_OBJECT => "JSON",
+            crate::sqljson::JSON_ARRAY
+            | crate::sqljson::JSON_OBJECT
+            | crate::sqljson::JSON_FORMAT => "JSON",
             crate::sqljson::JSON_VALUE | crate::sqljson::JSON_QUERY | crate::sqljson::JSON_VARS => {
                 "TEXT"
             }
@@ -721,6 +726,7 @@ fn takes_json(name: &str) -> bool {
                 // not as its text.
                 | crate::sqljson::JSON_ARRAY
                 | crate::sqljson::JSON_OBJECT
+                | crate::sqljson::JSON_FORMAT
                 // The vectors a JSON document builds take the document as a
                 // value, not as text.
                 | "TO_TSVECTOR"
@@ -2817,6 +2823,11 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
                 Err(error) => raise(error),
             }
         }
+        // An element of an array or object under `FORMAT JSON`.
+        crate::sqljson::JSON_FORMAT if arity(2) => match crate::sqljson::format_json(&args[0]) {
+            Ok(value) => value,
+            Err(error) => raise(error),
+        },
         // The XML type errors the planner reports before execution.
         crate::result_types::XML_ERROR if arity(2) => raise(
             crate::error_fields::DbError::new(text(&args[0]))

@@ -1390,6 +1390,42 @@ pub(crate) fn check_integer_ranges(
                 target: returning,
             };
         }
+        // An element of an array or object constructor under `FORMAT JSON`:
+        // the value is read as a JSON document, and the flag says whether an
+        // `ENCODING name` clause was written. The clause takes a string type,
+        // `json`, `jsonb`, or `bytea`; only a `bytea` may take an encoding.
+        ScalarExpr::Function { name, args }
+            if name == crate::sqljson::JSON_FORMAT && args.len() == 2 =>
+        {
+            let acceptable = |e: &ScalarExpr| {
+                matches!(e, ScalarExpr::Literal(Value::Text(_)))
+                    || scalar_type(e, column).is_none_or(|t| {
+                        let t = t.trim();
+                        t.is_empty()
+                            || t.eq_ignore_ascii_case("UNKNOWN")
+                            || is_text_type(t)
+                            || t.eq_ignore_ascii_case("json")
+                            || crate::value::is_jsonb_type(t)
+                            || crate::value::is_bytea_type(t)
+                    })
+            };
+            if !acceptable(&args[0]) {
+                return sql_json_error(
+                    "cannot use non-string types with explicit FORMAT JSON clause".to_string(),
+                    "42804",
+                );
+            }
+            if matches!(args[1], ScalarExpr::Literal(Value::Bool(true)))
+                && !scalar_type(&args[0], column)
+                    .is_some_and(|t| crate::value::is_bytea_type(&t))
+            {
+                return sql_json_error(
+                    "JSON ENCODING clause is only allowed for bytea input type".to_string(),
+                    "42804",
+                );
+            }
+            return checked.clone();
+        }
         // The JSON value constructors: `JSON(expr [WITH UNIQUE KEYS])`,
         // `JSON_SCALAR(expr)`, and
         // `JSON_SERIALIZE(expr [FORMAT JSON] [RETURNING type])`.
