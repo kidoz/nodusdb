@@ -1678,6 +1678,47 @@ pub(crate) fn check_integer_ranges(
                     }
                     return checked.clone();
                 }
+                // `xpath(expression, document [, namespaces])` and
+                // `xpath_exists(...)`: the expression is text, the document
+                // an XML value, and the namespaces a text array of pairs.
+                "XPATH" | "XPATH_EXISTS" if (2..=3).contains(&args.len()) => {
+                    let text_arg = |e: &ScalarExpr| {
+                        matches!(e, ScalarExpr::Literal(Value::Text(_) | Value::Null))
+                            || scalar_type(e, column).is_none_or(|t| {
+                                let t = t.trim();
+                                t.is_empty()
+                                    || t.eq_ignore_ascii_case("UNKNOWN")
+                                    || is_text_type(t)
+                            })
+                    };
+                    let namespaces_arg = |e: &ScalarExpr| {
+                        matches!(e, ScalarExpr::Literal(Value::Array(_)))
+                            || scalar_type(e, column).is_some_and(|t| {
+                                crate::value::array_element_type(&t)
+                                    .is_some_and(|element| {
+                                        crate::value::array_element_type(&element).is_some()
+                                            || element.eq_ignore_ascii_case("text")
+                                    })
+                            })
+                    };
+                    let ok = text_arg(&args[0])
+                        && (is_xml_type(&args[1], column)
+                            // An untyped literal is the xml it cast to.
+                            || matches!(
+                                args[1],
+                                ScalarExpr::Literal(Value::Text(_) | Value::Null)
+                            ))
+                        && args.get(2).is_none_or(namespaces_arg);
+                    if !ok {
+                        let spelled = name.to_ascii_lowercase();
+                        let types: Vec<String> = args
+                            .iter()
+                            .map(|arg| argument_type_name(arg, column))
+                            .collect();
+                        return bad_function_args(&spelled, &types);
+                    }
+                    return checked.clone();
+                }
                 // `xmlconcat(...)`: every argument is an XML value.
                 "XMLCONCAT" => {
                     if args.is_empty() {
@@ -3374,6 +3415,8 @@ fn is_xml_function(name: &str) -> bool {
     matches!(
         name,
         "XML_IS_WELL_FORMED"
+            | "XPATH"
+            | "XPATH_EXISTS"
             | "XML_IS_WELL_FORMED_DOCUMENT"
             | "XML_IS_WELL_FORMED_CONTENT"
             | "XMLCOMMENT"

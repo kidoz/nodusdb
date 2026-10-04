@@ -1378,6 +1378,38 @@ pub(crate) fn serialize(value: &str, mode: Mode, indent: bool) -> Result<String,
     Ok(out)
 }
 
+/// One node as libxml2 serializes it on its own, the form `xpath` returns a
+/// result node in.
+pub(crate) fn serialize_node(node: &Node) -> String {
+    let mut out = String::new();
+    let mut format = false;
+    dump(&mut out, node, 0, &mut format, true);
+    out
+}
+
+/// The whole document as libxml2 dumps it (its declaration included, and the
+/// trailing newline `xmlDocDump` writes).
+pub(crate) fn serialize_document(doc: &Document) -> String {
+    // `xmlDocDump` always writes the declaration, with the document's
+    // version (1.0 when it had none) and the encoding it saves as.
+    let mut out = format!(
+        "<?xml version=\"{}\" encoding=\"UTF-8\"",
+        doc.version.as_deref().unwrap_or("1.0")
+    );
+    match doc.standalone {
+        1 => out.push_str(" standalone=\"yes\""),
+        0 => out.push_str(" standalone=\"no\""),
+        _ => {}
+    }
+    out.push_str("?>\n");
+    for child in &doc.children {
+        let mut format = false;
+        dump(&mut out, child, 0, &mut format, true);
+    }
+    out.push('\n');
+    out
+}
+
 fn indent(out: &mut String, level: usize) {
     for _ in 0..level {
         out.push_str("  ");

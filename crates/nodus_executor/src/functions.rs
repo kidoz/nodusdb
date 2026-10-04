@@ -134,6 +134,7 @@ pub(crate) fn is_known(name: &str) -> bool {
                 // XML.
                 | "XML_IS_WELL_FORMED" | "XML_IS_WELL_FORMED_DOCUMENT"
                 | "XML_IS_WELL_FORMED_CONTENT" | "XMLCOMMENT" | "XMLTEXT" | "XMLCONCAT"
+                | "XPATH" | "XPATH_EXISTS"
                 | crate::result_types::XML_PARSE | crate::result_types::XML_SERIALIZE
                 | crate::result_types::XML_IS_DOCUMENT | crate::result_types::XML_ERROR
                 | crate::result_types::XML_OUT
@@ -427,6 +428,8 @@ pub(crate) fn return_type(name: &str, arg_types: &[Option<String>]) -> Option<St
             "TS_LEXIZE" => "TEXT[]",
             "TS_REWRITE" => "TSQUERY",
             "GET_CURRENT_TS_CONFIG" => "REGCONFIG",
+            "XPATH" => "XML[]",
+            "XPATH_EXISTS" => "BOOLEAN",
             "XML_IS_WELL_FORMED" | "XML_IS_WELL_FORMED_DOCUMENT" | "XML_IS_WELL_FORMED_CONTENT" => {
                 "BOOLEAN"
             }
@@ -733,6 +736,48 @@ fn takes_json(name: &str) -> bool {
                 | "JSON_TO_TSVECTOR"
                 | "JSONB_TO_TSVECTOR"
         )
+}
+
+/// The document an `xpath` call reads: an XML value must be a well-formed
+/// document, as libxml2 requires when it parses one.
+fn xpath_document(value: &Value) -> Result<crate::xml::Document, String> {
+    match crate::xml::parse(
+        &crate::xml::value_text(value),
+        crate::xml::Mode::Document,
+        true,
+    ) {
+        Ok(document) => Ok(document),
+        Err(_) => Err(
+            crate::error_fields::DbError::new("could not parse XML document")
+                .code("2200M")
+                .into_text(),
+        ),
+    }
+}
+
+/// The namespace pairs an `xpath` call's `text[]` argument carries: a
+/// two-dimensional array, each row a prefix and its URI.
+fn xpath_namespaces(value: &Value) -> Result<Vec<(String, String)>, String> {
+    let invalid = || {
+        crate::error_fields::DbError::new("invalid array for XML namespace mapping")
+            .code("22000")
+            .detail("The array must be two-dimensional with length of the second axis equal to 2.")
+            .into_text()
+    };
+    let Value::Array(rows) = value else {
+        return Err(invalid());
+    };
+    let mut namespaces = Vec::with_capacity(rows.len());
+    for row in rows {
+        let Value::Array(pair) = row else {
+            return Err(invalid());
+        };
+        let [prefix, uri] = pair.as_slice() else {
+            return Err(invalid());
+        };
+        namespaces.push((render(prefix), render(uri)));
+    }
+    Ok(namespaces)
 }
 
 /// `(expr)` without the parentheses when they enclose all of it.
@@ -2473,6 +2518,37 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
             Value::Bool(crate::xml::is_well_formed(&text(&args[0]), mode))
         }
         // `xmlcomment(text)`: the text as a comment.
+        // `xpath(expression, document [, namespaces])`: the selected nodes,
+        // each an XML value, in document order.
+        "XPATH" if arity(2) || arity(3) => {
+            let namespaces = match args.get(2).map(xpath_namespaces).transpose() {
+                Ok(namespaces) => namespaces.unwrap_or_default(),
+                Err(error) => return Some(raise(error)),
+            };
+            let document = match xpath_document(&args[1]) {
+                Ok(document) => document,
+                Err(error) => return Some(raise(error)),
+            };
+            match crate::xpath::xpath(&text(&args[0]), &document, &namespaces) {
+                Ok(nodes) => Value::Array(nodes.into_iter().map(Value::Text).collect()),
+                Err(error) => raise(error.into_text()),
+            }
+        }
+        // `xpath_exists(expression, document [, namespaces])`.
+        "XPATH_EXISTS" if arity(2) || arity(3) => {
+            let namespaces = match args.get(2).map(xpath_namespaces).transpose() {
+                Ok(namespaces) => namespaces.unwrap_or_default(),
+                Err(error) => return Some(raise(error)),
+            };
+            let document = match xpath_document(&args[1]) {
+                Ok(document) => document,
+                Err(error) => return Some(raise(error)),
+            };
+            match crate::xpath::xpath_exists(&text(&args[0]), &document, &namespaces) {
+                Ok(found) => Value::Bool(found),
+                Err(error) => raise(error.into_text()),
+            }
+        }
         "XMLCOMMENT" if arity(1) => match crate::xml::comment(&text(&args[0])) {
             Ok(value) => Value::Text(value),
             Err(error) => raise(crate::xml::error_text(error)),
