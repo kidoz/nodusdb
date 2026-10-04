@@ -1457,6 +1457,11 @@ fn figure_colname(expr: &sqlparser::ast::Expr) -> Option<String> {
                 match ident.value.to_ascii_lowercase().as_str() {
                     "__xmlparse__" => return Some("xmlparse".to_string()),
                     "__xmlserialize__" => return Some("xmlserialize".to_string()),
+                    "__xmlelement__" => return Some("xmlelement".to_string()),
+                    "__xmlforest__" => return Some("xmlforest".to_string()),
+                    "__xmlpi__" => return Some("xmlpi".to_string()),
+                    "__xmlroot__" => return Some("xmlroot".to_string()),
+                    "__xmlattributes__" => return None,
                     "__xml_is_document__" => return None,
                     _ => {}
                 }

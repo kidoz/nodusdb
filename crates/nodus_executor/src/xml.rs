@@ -19,6 +19,7 @@ const INVALID_DOCUMENT: &str = "2200M";
 const INVALID_CONTENT: &str = "2200N";
 const NOT_AN_XML_DOCUMENT: &str = "2200L";
 const INVALID_XML_COMMENT: &str = "2200S";
+const INVALID_XML_PI: &str = "2200T";
 
 /// How an XML value is parsed: `document` demands a whole document, while
 /// `content` accepts balanced content and lets a DOCTYPE force the document
@@ -1464,6 +1465,195 @@ fn dump(out: &mut String, node: &Node, level: usize, format: &mut bool, is_root:
     }
 }
 
+/// `map_sql_identifier_to_xml_name`: an SQL identifier as an XML name
+/// (SQL/XML:2008 9.2). With `fully_escaped`, a leading `xml` and colons are
+/// escaped too, which the names taken from column references are.
+pub(crate) fn identifier_to_xml_name(ident: &str, fully_escaped: bool) -> String {
+    let chars: Vec<char> = ident.chars().collect();
+    let mut out = String::new();
+    for (i, c) in chars.iter().enumerate() {
+        let first = i == 0;
+        // A leading `xml` is escaped where the name is fully escaped, so an
+        // identifier cannot spell a reserved name.
+        let head: String = chars.iter().take(3).collect();
+        let leading_xml =
+            fully_escaped && first && chars.len() >= 3 && head.eq_ignore_ascii_case("xml");
+        if *c == ':' && (first || fully_escaped) {
+            out.push_str("_x003A_");
+        } else if *c == '_' && chars.get(i + 1) == Some(&'x') {
+            out.push_str("_x005F_");
+        } else if leading_xml {
+            out.push_str(if *c == 'x' { "_x0078_" } else { "_x0058_" });
+        } else if (first && !is_valid_xml_name_start(*c)) || (!first && !is_valid_xml_name_char(*c))
+        {
+            out.push_str(&format!("_x{:04X}_", *c as u32));
+        } else {
+            out.push(*c);
+        }
+    }
+    out
+}
+
+/// SQL/XML's name characters: the XML 1.0 `Letter | '_' | ':'` set.
+fn is_valid_xml_name_start(c: char) -> bool {
+    c == '_'
+        || c == ':'
+        || ('A'..='Z').contains(&c)
+        || ('a'..='z').contains(&c)
+        || ('\u{C0}'..='\u{D6}').contains(&c)
+        || ('\u{D8}'..='\u{F6}').contains(&c)
+        || ('\u{F8}'..='\u{2FF}').contains(&c)
+        || ('\u{370}'..='\u{37D}').contains(&c)
+        || ('\u{37F}'..='\u{1FFF}').contains(&c)
+        || ('\u{200C}'..='\u{200D}').contains(&c)
+        || ('\u{2070}'..='\u{218F}').contains(&c)
+        || ('\u{2C00}'..='\u{2FEF}').contains(&c)
+        || ('\u{3001}'..='\u{D7FF}').contains(&c)
+        || ('\u{F900}'..='\u{FDCF}').contains(&c)
+        || ('\u{FDF0}'..='\u{FFFD}').contains(&c)
+        || c >= '\u{10000}'
+}
+
+/// The XML 1.0 `NameChar` set beyond [`is_valid_xml_name_start`].
+fn is_valid_xml_name_char(c: char) -> bool {
+    is_valid_xml_name_start(c)
+        || c == '-'
+        || c == '.'
+        || ('0'..='9').contains(&c)
+        || ('\u{300}'..='\u{345}').contains(&c)
+        || ('\u{660}'..='\u{669}').contains(&c)
+        || ('\u{6F0}'..='\u{6F9}').contains(&c)
+        || ('\u{966}'..='\u{96F}').contains(&c)
+        || ('\u{9E6}'..='\u{9EF}').contains(&c)
+        || ('\u{203F}'..='\u{2040}').contains(&c)
+}
+
+/// `escape_xml`: the characters SQL/XML escapes in a text value becoming XML
+/// content — the carriage return is written as a lower-case character
+/// reference here, unlike in the serializer.
+pub(crate) fn escape_xml(text: &str) -> String {
+    let mut out = String::new();
+    for c in text.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '\r' => out.push_str("&#x0d;"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// An element's content as SQL/XML maps a value of some other type: booleans
+/// as XSD's, everything else through its text.
+pub(crate) fn value_text(value: &crate::Value) -> String {
+    match value {
+        crate::Value::Bool(true) => "true".to_string(),
+        crate::Value::Bool(false) => "false".to_string(),
+        other => crate::render(other),
+    }
+}
+
+/// `xmlpi`: the processing instruction, with PostgreSQL's checks.
+pub(crate) fn pi(target: &str, arg: Option<&str>) -> Result<String, XmlError> {
+    if target.eq_ignore_ascii_case("xml") {
+        return Err(
+            XmlError::new(INVALID_XML_PI, "invalid XML processing instruction").detail(format!(
+                "XML processing instruction target name cannot be \"{target}\"."
+            )),
+        );
+    }
+    let mut out = format!("<?{target}");
+    if let Some(arg) = arg {
+        if arg.contains("?>") {
+            return Err(
+                XmlError::new(INVALID_XML_PI, "invalid XML processing instruction")
+                    .detail("XML processing instruction cannot contain \"?>\"."),
+            );
+        }
+        out.push(' ');
+        out.push_str(arg.trim_start_matches(' '));
+    }
+    out.push_str("?>");
+    Ok(out)
+}
+
+/// `xmlroot`: the value's declaration replaced. `standalone` is SQL/XML's
+/// clause: 0 `YES`, 1 `NO`, 2 `NO VALUE`, 3 omitted (keeps the value's own).
+pub(crate) fn root(value: &str, version: Option<&str>, standalone: i32) -> String {
+    let decl = parse_decl(value).unwrap_or(Decl {
+        len: 0,
+        version: None,
+        standalone: -1,
+    });
+    let standalone = match standalone {
+        0 => 1,
+        1 => 0,
+        2 => -1,
+        _ => decl.standalone,
+    };
+    let mut out = String::new();
+    print_decl(&mut out, version, standalone);
+    out.push_str(&value[decl.len..]);
+    out
+}
+
+/// `xmlelement`: the element, its attributes already rendered.
+pub(crate) fn element(name: &str, attrs: Option<&str>, content: &[String]) -> String {
+    let mut out = format!("<{name}");
+    if let Some(attrs) = attrs {
+        out.push_str(attrs);
+    }
+    if content.is_empty() {
+        out.push_str("/>");
+        return out;
+    }
+    out.push('>');
+    for part in content {
+        out.push_str(part);
+    }
+    out.push_str("</");
+    out.push_str(name);
+    out.push('>');
+    out
+}
+
+/// `xmlattributes`: each non-NULL value as `name="value"`, the values already
+/// escaped for an attribute.
+pub(crate) fn attributes(items: &[(String, bool, Option<String>)]) -> String {
+    let mut out = String::new();
+    for (name, fully_escaped, value) in items {
+        if let Some(value) = value {
+            out.push(' ');
+            out.push_str(&identifier_to_xml_name(name, *fully_escaped));
+            out.push_str("=\"");
+            out.push_str(value);
+            out.push('"');
+        }
+    }
+    out
+}
+
+/// `xmlforest`: each non-NULL value as an element; all of them NULL is NULL.
+pub(crate) fn forest(items: &[(String, bool, Option<String>)]) -> Option<String> {
+    let mut out = String::new();
+    let mut any = false;
+    for (name, fully_escaped, value) in items {
+        if let Some(value) = value {
+            let name = identifier_to_xml_name(name, *fully_escaped);
+            out.push_str(&format!("<{name}>{value}</{name}>"));
+            any = true;
+        }
+    }
+    any.then_some(out)
+}
+
+/// An element's value as an attribute: the writer's escaping.
+pub(crate) fn attribute_value(value: &crate::Value) -> String {
+    escape_attribute(&value_text(value))
+}
+
 /// libxml2's `xmlEscapeEntities`: the three markup characters and a carriage
 /// return; everything else is written as it is.
 fn escape_text(text: &str) -> String {
@@ -1700,6 +1890,51 @@ mod tests {
             ]),
             "<a/><b/>"
         );
+    }
+
+    #[test]
+    fn constructors_match_postgresql() {
+        let xml = |value: &str| crate::Value::Text(value.to_string());
+        assert_eq!(identifier_to_xml_name("Foo bar", false), "Foo_x0020_bar");
+        assert_eq!(identifier_to_xml_name("a b", false), "a_x0020_b");
+        assert_eq!(identifier_to_xml_name("xmlfoo", true), "_x0078_mlfoo");
+        assert_eq!(identifier_to_xml_name("xmlfoo", false), "xmlfoo");
+        assert_eq!(identifier_to_xml_name("a:x", true), "a_x003A_x");
+        assert_eq!(identifier_to_xml_name("a:x", false), "a:x");
+        assert_eq!(identifier_to_xml_name("_x1", false), "_x005F_x1");
+        assert_eq!(element("foo", None, &[]), "<foo/>");
+        assert_eq!(
+            element("foo", Some(" a=\"1\""), &["bar".to_string()]),
+            "<foo a=\"1\">bar</foo>"
+        );
+        assert_eq!(
+            attributes(&[("a b".to_string(), false, Some("x".to_string()),)]),
+            " a_x0020_b=\"x\""
+        );
+        assert_eq!(
+            forest(&[("a".to_string(), false, Some("1".to_string()))]),
+            Some("<a>1</a>".to_string())
+        );
+        assert_eq!(forest(&[("a".to_string(), false, None)]), None);
+        assert_eq!(escape_xml("a\r&<>"), "a&#x0d;&amp;&lt;&gt;");
+        assert_eq!(attribute_value(&xml("a\n\"b")), "a&#10;&quot;b");
+        assert_eq!(pi("foo", Some("bar")).unwrap(), "<?foo bar?>");
+        assert_eq!(pi("foo", None).unwrap(), "<?foo?>");
+        assert!(pi("xml", None).is_err());
+        assert!(pi("foo", Some("x?>y")).is_err());
+        assert_eq!(
+            root("<a/>", Some("1.1"), 0),
+            "<?xml version=\"1.1\" standalone=\"yes\"?><a/>"
+        );
+        assert_eq!(
+            root("<a/>", Some("1.0"), 1),
+            "<?xml version=\"1.0\" standalone=\"no\"?><a/>"
+        );
+        assert_eq!(root("<a/>", None, 2), "<a/>");
+        // `version no value` drops the declaration's version, and with it the
+        // declaration, even where the standalone clause is omitted.
+        assert_eq!(root("<?xml version=\"1.1\"?><a/>", None, 3), "<a/>");
+        assert_eq!(root("<?xml version=\"1.1\"?><a/>", Some("1.0"), 3), "<a/>");
     }
 
     #[test]

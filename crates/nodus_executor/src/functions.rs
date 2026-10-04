@@ -19,6 +19,14 @@ const NON_STRICT: &[&str] = &[
     // `xmlconcat` is not strict: it drops NULL arguments, and is NULL only
     // when every argument is.
     "XMLCONCAT",
+    // The SQL/XML constructors: a NULL argument is skipped (or, for `xmlpi`,
+    // a NULL value), and the target-name and attribute-name checks come
+    // before the NULL checks.
+    crate::result_types::XMLPI,
+    crate::result_types::XMLROOT,
+    crate::result_types::XMLELEMENT,
+    crate::result_types::XMLFOREST,
+    crate::result_types::XMLATTRIBUTES,
     // Range constructors read a NULL bound as unbounded; a multirange
     // constructor refuses a NULL among its members.
     "__MULTIRANGE_BUILD__",
@@ -117,6 +125,10 @@ pub(crate) fn is_known(name: &str) -> bool {
                 | crate::result_types::XML_PARSE | crate::result_types::XML_SERIALIZE
                 | crate::result_types::XML_IS_DOCUMENT | crate::result_types::XML_ERROR
                 | crate::result_types::XML_OUT
+                | crate::result_types::XMLPI | crate::result_types::XMLROOT
+                | crate::result_types::XMLELEMENT | crate::result_types::XMLFOREST
+                | crate::result_types::XMLATTRIBUTES
+                | crate::result_types::XML_ESCAPE | crate::result_types::XML_ATTR_VALUE
                 | crate::result_types::XML_SERIALIZE_TYPE
                 // Dates and times.
                 | "NOW" | "CURRENT_TIMESTAMP" | "TRANSACTION_TIMESTAMP"
@@ -400,7 +412,14 @@ pub(crate) fn return_type(name: &str, arg_types: &[Option<String>]) -> Option<St
             }
             "XMLCOMMENT" | "XMLTEXT" | "XMLCONCAT" | crate::result_types::XML_PARSE => "XML",
             crate::result_types::XML_SERIALIZE | crate::result_types::XML_OUT => "TEXT",
-            crate::result_types::XML_SERIALIZE_TYPE => "TEXT",
+            crate::result_types::XMLPI
+            | crate::result_types::XMLROOT
+            | crate::result_types::XMLELEMENT
+            | crate::result_types::XMLFOREST
+            | crate::result_types::XMLATTRIBUTES => "XML",
+            crate::result_types::XML_ESCAPE
+            | crate::result_types::XML_ATTR_VALUE
+            | crate::result_types::XML_SERIALIZE_TYPE => "TEXT",
             "PG_TS_CONFIG_IS_VISIBLE"
             | "PG_TS_DICT_IS_VISIBLE"
             | "PG_TS_PARSER_IS_VISIBLE"
@@ -2427,6 +2446,139 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
         // An XML value's output form, where text is built from it.
         crate::result_types::XML_OUT if arity(1) => {
             Value::Text(crate::xml::output(&text(&args[0])))
+        }
+        // `xmlpi(name target [, value])`.
+        crate::result_types::XMLPI if arity(1) || arity(2) => {
+            let target = text(&args[0]);
+            let value = match args.get(1) {
+                None => None,
+                Some(Value::Null) => return Some(Value::Null),
+                Some(value) => Some(text(value)),
+            };
+            let target = crate::xml::identifier_to_xml_name(&target, false);
+            match crate::xml::pi(&target, value.as_deref()) {
+                Ok(value) => Value::Text(value),
+                Err(error) => raise(crate::xml::error_text(error)),
+            }
+        }
+        // `xmlroot(value, version, standalone)`.
+        crate::result_types::XMLROOT if arity(3) => {
+            let version = match &args[1] {
+                Value::Null => None,
+                value => Some(text(value)),
+            };
+            let standalone = match &args[2] {
+                Value::Int(n) => *n as i32,
+                _ => 3,
+            };
+            Value::Text(crate::xml::root(&text(&args[0]), version.as_deref(), standalone))
+        }
+        // `xmlelement(name, attributes, content...)`.
+        // The name, the attributes (a NULL when none), then the content.
+        crate::result_types::XMLELEMENT if args.len() >= 2 => {
+            let attrs = match &args[1] {
+                Value::Null => None,
+                value => Some(text(value)),
+            };
+            let content: Vec<String> = args[2..]
+                .iter()
+                .filter(|a| !matches!(a, Value::Null))
+                .map(text)
+                .collect();
+            let name = crate::xml::identifier_to_xml_name(&text(&args[0]), false);
+            Value::Text(crate::xml::element(&name, attrs.as_deref(), &content))
+        }
+        // `xmlattributes(value, name, fully-escaped, ...)`: the rendered
+        // attributes, with PostgreSQL's checks on the names.
+        crate::result_types::XMLATTRIBUTES if args.len() >= 3 => {
+            let mut items = Vec::new();
+            let mut i = 0;
+            while i + 2 < args.len() + 1 && i < args.len() {
+                let name = match &args[i + 1] {
+                    Value::Null => {
+                        return Some(raise(
+                            crate::error_fields::DbError::new(
+                                "unnamed XML attribute value must be a column reference",
+                            )
+                            .code("42601")
+                            .into_text(),
+                        ));
+                    }
+                    value => text(value),
+                };
+                let fully_escaped = matches!(args[i + 2], Value::Bool(true));
+                let mapped = crate::xml::identifier_to_xml_name(&name, fully_escaped);
+                if items
+                    .iter()
+                    .any(|(other, other_escaped, _): &(String, bool, Option<String>)| {
+                        crate::xml::identifier_to_xml_name(other, *other_escaped) == mapped
+                    })
+                {
+                    return Some(raise(
+                        crate::error_fields::DbError::new(format!(
+                            "XML attribute name \"{mapped}\" appears more than once"
+                        ))
+                        .code("42601")
+                        .into_text(),
+                    ));
+                }
+                let value = match &args[i] {
+                    Value::Null => None,
+                    value => Some(text(value)),
+                };
+                items.push((name, fully_escaped, value));
+                i += 3;
+            }
+            Value::Text(crate::xml::attributes(&items))
+        }
+        // `xmlforest(value, name, fully-escaped, ...)`.
+        crate::result_types::XMLFOREST if args.len() >= 3 => {
+            let mut items = Vec::new();
+            let mut i = 0;
+            while i + 2 < args.len() + 1 && i < args.len() {
+                let name = match &args[i + 1] {
+                    Value::Null => {
+                        return Some(raise(
+                            crate::error_fields::DbError::new(
+                                "unnamed XML element value must be a column reference",
+                            )
+                            .code("42601")
+                            .into_text(),
+                        ));
+                    }
+                    value => text(value),
+                };
+                let fully_escaped = matches!(args[i + 2], Value::Bool(true));
+                let value = match &args[i] {
+                    Value::Null => None,
+                    value => Some(text(value)),
+                };
+                items.push((name, fully_escaped, value));
+                i += 3;
+            }
+            match crate::xml::forest(&items) {
+                Some(value) => Value::Text(value),
+                None => Value::Null,
+            }
+        }
+        // An element's content as SQL/XML maps a text value: escaped, with an
+        // array becoming an `<element>` per member.
+        crate::result_types::XML_ESCAPE if arity(1) => {
+            fn escape_value(value: &Value) -> String {
+                match value {
+                    Value::Array(items) => items
+                        .iter()
+                        .filter(|v| !matches!(v, Value::Null))
+                        .map(|v| format!("<element>{}</element>", escape_value(v)))
+                        .collect(),
+                    value => crate::xml::escape_xml(&crate::xml::value_text(value)),
+                }
+            }
+            Value::Text(escape_value(&args[0]))
+        }
+        // An attribute value: the type's text, escaped for the quotes.
+        crate::result_types::XML_ATTR_VALUE if arity(1) => {
+            Value::Text(crate::xml::attribute_value(&args[0]))
         }
         // The serialized text fitted to the target type, as the implicit cast
         // XMLSERIALIZE applies does: too long a value is refused.

@@ -48,7 +48,9 @@ pub fn parse_sql(
         }
     }
     let tokens = reorder_identity_options(reorder_sequence_options(rewrite_data_clauses(
-        rewrite_record_star(rewrite_xml_syntax(rewrite_query_syntax(tokens))),
+        rewrite_record_star(rewrite_xml_constructors(rewrite_xml_syntax(
+            rewrite_query_syntax(tokens),
+        ))),
     )));
     Parser::new(&dialect)
         .with_tokens_with_locations(tokens)
@@ -84,6 +86,323 @@ pub const XML_SERIALIZE_MARKER: &str = "__xmlserialize__";
 /// The function `xml IS [NOT] DOCUMENT` is written as:
 /// `pg_catalog.__xml_is_document__(value)`.
 pub const XML_IS_DOCUMENT_MARKER: &str = "__xml_is_document__";
+
+/// The functions the SQL/XML constructors are written as:
+/// `XMLPI(NAME t [, v])` — `pg_catalog.__xmlpi__('t' [, v])`;
+/// `XMLROOT(x, VERSION v, STANDALONE s)` —
+/// `pg_catalog.__xmlroot__(x, v, s)` (s: 0 yes, 1 no, 2 no value, 3 omitted);
+/// `XMLELEMENT(NAME t, ...)` —
+/// `pg_catalog.__xmlelement__('t', attrs, content...)`;
+/// `XMLFOREST(...)` — `pg_catalog.__xmlforest__(v, 'n', b, ...)`;
+/// `XMLATTRIBUTES(...)` — `pg_catalog.__xmlattributes__(v, 'n', b, ...)`.
+pub const XMLPI_MARKER: &str = "__xmlpi__";
+pub const XMLROOT_MARKER: &str = "__xmlroot__";
+pub const XMLELEMENT_MARKER: &str = "__xmlelement__";
+pub const XMLFOREST_MARKER: &str = "__xmlforest__";
+pub const XMLATTRIBUTES_MARKER: &str = "__xmlattributes__";
+
+/// The SQL/XML constructors, which the parser cannot read: `XMLPI`,
+/// `XMLROOT`, `XMLELEMENT` (with `XMLATTRIBUTES`), and `XMLFOREST`. An
+/// argument name that is not an `AS` label must be a column reference, as
+/// PostgreSQL requires; otherwise the name is NULL and the planner reports
+/// "unnamed XML attribute value must be a column reference".
+fn rewrite_xml_constructors(
+    mut tokens: Vec<sqlparser::tokenizer::TokenWithSpan>,
+) -> Vec<sqlparser::tokenizer::TokenWithSpan> {
+    use sqlparser::tokenizer::{Token, TokenWithSpan};
+    let word = |t: &TokenWithSpan| match &t.token {
+        Token::Word(w) if w.quote_style.is_none() => Some(w.value.clone()),
+        _ => None,
+    };
+    let identifier = |t: &TokenWithSpan| match &t.token {
+        Token::Word(w) => Some(w.value.clone()),
+        _ => None,
+    };
+    let significant = |tokens: &[TokenWithSpan], from: usize| {
+        (from..tokens.len()).find(|&i| !matches!(tokens[i].token, Token::Whitespace(_)))
+    };
+    let significant_back = |tokens: &[TokenWithSpan], from: usize| {
+        (0..from)
+            .rev()
+            .find(|&i| !matches!(tokens[i].token, Token::Whitespace(_)))
+    };
+    let matching_paren = |tokens: &[TokenWithSpan], open: usize| {
+        let mut depth = 0i32;
+        for (i, token) in tokens.iter().enumerate().skip(open) {
+            match token.token {
+                Token::LParen => depth += 1,
+                Token::RParen => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    };
+    // The ranges of the top-level `,`-separated items of a token range.
+    let split = |tokens: &[TokenWithSpan], from: usize, to: usize| {
+        let mut items = Vec::new();
+        let mut depth = 0i32;
+        let mut start = None;
+        for (i, token) in tokens.iter().enumerate().take(to).skip(from) {
+            match token.token {
+                Token::LParen => depth += 1,
+                Token::RParen => depth -= 1,
+                Token::Comma if depth == 0 => {
+                    items.push((start.unwrap_or(from), i));
+                    start = None;
+                    continue;
+                }
+                _ => {}
+            }
+            if start.is_none() && !matches!(token.token, Token::Whitespace(_)) {
+                start = Some(i);
+            }
+        }
+        if let Some(start) = start {
+            items.push((start, to));
+        }
+        items
+    };
+    // The last top-level `AS` of an item, and the name the item carries.
+    let labelled = |tokens: &[TokenWithSpan], from: usize, to: usize| {
+        let mut depth = 0i32;
+        let mut as_at = None;
+        for (i, token) in tokens.iter().enumerate().take(to).skip(from) {
+            match token.token {
+                Token::LParen => depth += 1,
+                Token::RParen => depth -= 1,
+                _ => {}
+            }
+            if depth == 0 && word(token).as_deref() == Some("as") {
+                as_at = Some(i);
+            }
+        }
+        if let Some(as_at) = as_at {
+            let label = significant(tokens, as_at + 1)?;
+            return Some((from, as_at, Some(identifier(&tokens[label])?), false));
+        }
+        // Without a label the item must be a column reference; its name is
+        // the last identifier, and it is fully escaped.
+        let mut last = None;
+        for token in tokens.iter().take(to).skip(from) {
+            match &token.token {
+                Token::Word(w) => last = Some(w.value.clone()),
+                Token::Period | Token::Whitespace(_) => {}
+                _ => return None,
+            }
+        }
+        Some((from, to, last, true))
+    };
+    let escape = |text: &str| text.replace('\'', "''");
+    // `XMLPI(NAME target [, value])`.
+    let mut i = 0;
+    while i < tokens.len() {
+        if word(&tokens[i]).as_deref() == Some("xmlpi")
+            && let Some(open) = significant(&tokens, i + 1)
+            && tokens[open].token == Token::LParen
+            && let Some(close) = matching_paren(&tokens, open)
+            && let Some(name_at) = significant(&tokens, open + 1)
+            && word(&tokens[name_at]).as_deref() == Some("name")
+            && let Some(label_at) = significant(&tokens, name_at + 1)
+            && let Some(label) = identifier(&tokens[label_at])
+        {
+            let value = significant(&tokens, label_at + 1)
+                .filter(|&k| tokens[k].token == Token::Comma)
+                .map(|comma| render_tokens(&tokens[comma + 1..close]));
+            let replacement = match value {
+                Some(value) => {
+                    format!("pg_catalog.{XMLPI_MARKER}('{}', {value})", escape(&label))
+                }
+                None => format!("pg_catalog.{XMLPI_MARKER}('{}')", escape(&label)),
+            };
+            if let Some(snippet) = snippet_tokens(&replacement) {
+                let len = snippet.len();
+                tokens.splice(i..=close, snippet);
+                i += len;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    // `XMLROOT(x, VERSION v [, STANDALONE s])`.
+    let mut i = 0;
+    while i < tokens.len() {
+        if word(&tokens[i]).as_deref() == Some("xmlroot")
+            && let Some(open) = significant(&tokens, i + 1)
+            && tokens[open].token == Token::LParen
+            && let Some(close) = matching_paren(&tokens, open)
+        {
+            let items = split(&tokens, open + 1, close);
+            if items.len() == 2 || items.len() == 3 {
+                let value = render_tokens(&tokens[items[0].0..items[0].1]);
+                let (vfrom, vto) = items[1];
+                let version = if word(&tokens[vfrom]).as_deref() == Some("version")
+                    && significant(&tokens, vfrom + 1).is_some_and(|no| {
+                        word(&tokens[no]).as_deref() == Some("no")
+                            && significant(&tokens, no + 1).is_some_and(|value| {
+                                word(&tokens[value]).as_deref() == Some("value")
+                            })
+                    }) {
+                    "NULL".to_string()
+                } else {
+                    let from = significant(&tokens, vfrom + 1).unwrap_or(vto);
+                    render_tokens(&tokens[from..vto])
+                };
+                let standalone = items
+                    .get(2)
+                    .and_then(|(sfrom, _)| {
+                        significant(&tokens, sfrom + 1)
+                            .and_then(|k| word(&tokens[k]).map(|w| (k, w)))
+                    })
+                    .and_then(|(k, w)| match w.as_str() {
+                        "yes" => Some(0),
+                        "no" => Some(
+                            if significant(&tokens, k + 1)
+                                .is_some_and(|v| word(&tokens[v]).as_deref() == Some("value"))
+                            {
+                                2
+                            } else {
+                                1
+                            },
+                        ),
+                        _ => None,
+                    })
+                    .unwrap_or(3);
+                let replacement =
+                    format!("pg_catalog.{XMLROOT_MARKER}({value}, {version}, {standalone})");
+                if let Some(snippet) = snippet_tokens(&replacement) {
+                    let len = snippet.len();
+                    tokens.splice(i..=close, snippet);
+                    i += len;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    // `XMLELEMENT(NAME name [, XMLATTRIBUTES(...)] [, content...])`.
+    let mut i = 0;
+    while i < tokens.len() {
+        if word(&tokens[i]).as_deref() == Some("xmlelement")
+            && let Some(open) = significant(&tokens, i + 1)
+            && tokens[open].token == Token::LParen
+            && let Some(close) = matching_paren(&tokens, open)
+            && let Some(name_at) = significant(&tokens, open + 1)
+            && word(&tokens[name_at]).as_deref() == Some("name")
+            && let Some(label_at) = significant(&tokens, name_at + 1)
+            && let Some(label) = identifier(&tokens[label_at])
+        {
+            let mut attrs = "NULL".to_string();
+            let mut content = Vec::new();
+            let mut ok = true;
+            let rest = significant(&tokens, label_at + 1)
+                .filter(|&k| tokens[k].token == Token::Comma)
+                .map(|comma| comma + 1);
+            if let Some(rest) = rest {
+                for (from, to) in split(&tokens, rest, close) {
+                    if word(&tokens[from]).as_deref() == Some("xmlattributes")
+                        && let Some(aopen) = significant(&tokens, from + 1)
+                        && tokens[aopen].token == Token::LParen
+                        && let Some(aclose) = matching_paren(&tokens, aopen)
+                    {
+                        let mut parts = vec![format!(
+                            "pg_catalog.{}(",
+                            XMLATTRIBUTES_MARKER.to_ascii_lowercase()
+                        )];
+                        for (index, (efrom, eto)) in
+                            split(&tokens, aopen + 1, aclose).into_iter().enumerate()
+                        {
+                            let Some((efrom, eend, name, fully)) = labelled(&tokens, efrom, eto)
+                            else {
+                                ok = false;
+                                break;
+                            };
+                            let value = render_tokens(&tokens[efrom..eend]);
+                            let name = match name {
+                                Some(name) => format!("'{}'", escape(&name)),
+                                None => "NULL".to_string(),
+                            };
+                            if index > 0 {
+                                parts.push(", ".to_string());
+                            }
+                            parts.push(format!("{value}, {name}, {fully}"));
+                        }
+                        parts.push(")".to_string());
+                        attrs = parts.concat();
+                    } else {
+                        content.push(render_tokens(&tokens[from..to]));
+                    }
+                }
+            }
+            if ok {
+                let mut replacement = format!(
+                    "pg_catalog.{XMLELEMENT_MARKER}('{}', {attrs}",
+                    escape(&label)
+                );
+                for item in &content {
+                    replacement.push_str(", ");
+                    replacement.push_str(item);
+                }
+                replacement.push(')');
+                if let Some(snippet) = snippet_tokens(&replacement) {
+                    let len = snippet.len();
+                    tokens.splice(i..=close, snippet);
+                    i += len;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    // `XMLFOREST(value [AS name], ...)`.
+    let mut i = 0;
+    while i < tokens.len() {
+        if word(&tokens[i]).as_deref() == Some("xmlforest")
+            && let Some(open) = significant(&tokens, i + 1)
+            && tokens[open].token == Token::LParen
+            && let Some(close) = matching_paren(&tokens, open)
+        {
+            let mut parts = vec![format!(
+                "pg_catalog.{}(",
+                XMLFOREST_MARKER.to_ascii_lowercase()
+            )];
+            let mut ok = true;
+            for (index, (from, to)) in split(&tokens, open + 1, close).into_iter().enumerate() {
+                let Some((from, eend, name, fully)) = labelled(&tokens, from, to) else {
+                    ok = false;
+                    break;
+                };
+                let value = render_tokens(&tokens[from..eend]);
+                let name = match name {
+                    Some(name) => format!("'{}'", escape(&name)),
+                    None => "NULL".to_string(),
+                };
+                if index > 0 {
+                    parts.push(", ".to_string());
+                }
+                parts.push(format!("{value}, {name}, {fully}"));
+            }
+            parts.push(")".to_string());
+            if ok {
+                let replacement = parts.concat();
+                if let Some(snippet) = snippet_tokens(&replacement) {
+                    let len = snippet.len();
+                    tokens.splice(i..=close, snippet);
+                    i += len;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    // A stray `XMLATTRIBUTES` outside `XMLELEMENT` is left to the parser.
+    let _ = significant_back(&tokens, 0);
+    tokens
+}
 
 /// The XML syntax the parser lacks: `xmlparse`, `xmlserialize`, and
 /// `IS [NOT] DOCUMENT`, each rewritten to the marker function the planner

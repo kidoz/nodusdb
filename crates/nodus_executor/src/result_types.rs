@@ -1499,6 +1499,72 @@ pub(crate) fn check_integer_ranges(
                         args: vec![as_xml(&args[0])],
                     };
                 }
+                // `XMLPI(NAME target [, value])`: the target name is checked
+                // when the value is built; the value coerces to text.
+                XMLPI => return checked.clone(),
+                // `XMLROOT(value, version, standalone)`: the value is xml.
+                XMLROOT => {
+                    if let Some(value) = args.first()
+                        && !is_xml_arg(value)
+                    {
+                        return bad_xml_argument(value, "XMLROOT");
+                    }
+                    let mut args = args.clone();
+                    if let Some(value) = args.first_mut()
+                        && untyped(value)
+                    {
+                        *value = as_xml(value);
+                    }
+                    return ScalarExpr::Function {
+                        name: name.clone(),
+                        args,
+                    };
+                }
+                // `XMLELEMENT(NAME name, attributes, content...)`: attributes
+                // carry their names; content is raw for an xml value and
+                // escaped for anything else.
+                XMLELEMENT => {
+                    let mut args = args.clone();
+                    for arg in args.iter_mut().skip(2) {
+                        if !is_xml_type(arg, column) {
+                            *arg = xml_call(XML_ESCAPE, arg);
+                        }
+                    }
+                    return ScalarExpr::Function {
+                        name: name.clone(),
+                        args,
+                    };
+                }
+                // `XMLFOREST(value, name, fully-escaped, ...)`.
+                XMLFOREST => {
+                    let mut args = args.clone();
+                    let mut i = 0;
+                    while i < args.len() {
+                        if !is_xml_type(&args[i], column) {
+                            args[i] = xml_call(XML_ESCAPE, &args[i]);
+                        }
+                        i += 3;
+                    }
+                    return ScalarExpr::Function {
+                        name: name.clone(),
+                        args,
+                    };
+                }
+                // `XMLATTRIBUTES(value, name, fully-escaped, ...)`.
+                XMLATTRIBUTES => {
+                    let mut args = args.clone();
+                    let mut i = 0;
+                    while i < args.len() {
+                        args[i] = xml_call(XML_ATTR_VALUE, &args[i]);
+                        i += 3;
+                    }
+                    return ScalarExpr::Function {
+                        name: name.clone(),
+                        args,
+                    };
+                }
+                // The value mappings themselves take the value as it is.
+                XML_ESCAPE | XML_ATTR_VALUE | XML_SERIALIZE_TYPE => return checked.clone(),
                 // The planner-built error call raises at evaluation time.
                 _ => return checked.clone(),
             }
@@ -2894,6 +2960,23 @@ pub(crate) const XML_ERROR: &str = "__XML_ERROR__";
 /// function, as PostgreSQL's `concat`/`format` use): `__XML_OUT__(value)`.
 pub(crate) const XML_OUT: &str = "__XML_OUT__";
 
+/// The SQL/XML constructors the parser rewrites: `__XMLPI__('target'
+/// [, value])`, `__XMLROOT__(value, version, standalone)`,
+/// `__XMLELEMENT__('name', attributes, content...)`,
+/// `__XMLFOREST__(value, name, fully-escaped, ...)`, and
+/// `__XMLATTRIBUTES__(value, name, fully-escaped, ...)`.
+pub(crate) const XMLPI: &str = "__XMLPI__";
+pub(crate) const XMLROOT: &str = "__XMLROOT__";
+pub(crate) const XMLELEMENT: &str = "__XMLELEMENT__";
+pub(crate) const XMLFOREST: &str = "__XMLFOREST__";
+pub(crate) const XMLATTRIBUTES: &str = "__XMLATTRIBUTES__";
+
+/// A constructor argument as SQL/XML maps it: text content with its special
+/// characters escaped (`__XML_ESCAPE__`), and an attribute value escaped for
+/// its quotes (`__XML_ATTR_VALUE__`).
+pub(crate) const XML_ESCAPE: &str = "__XML_ESCAPE__";
+pub(crate) const XML_ATTR_VALUE: &str = "__XML_ATTR_VALUE__";
+
 /// `XMLSERIALIZE`'s serialized text fitted to the target type as an implicit
 /// cast fits it (which raises "value too long" rather than truncating):
 /// `__XML_SERIALIZE_TYPE__(text, target)`.
@@ -2914,9 +2997,26 @@ fn is_xml_function(name: &str) -> bool {
             | XML_IS_DOCUMENT
             | XML_ERROR
             | XML_OUT
+            | XMLPI
+            | XMLROOT
+            | XMLELEMENT
+            | XMLFOREST
+            | XMLATTRIBUTES
+            | XML_ESCAPE
+            | XML_ATTR_VALUE
             | XML_SERIALIZE_TYPE
     )
 }
+
+/// The call an XML value's content is mapped through, and the one an
+/// attribute value is, as [`is_xml_function`] handles them.
+fn xml_call(name: &str, value: &ScalarExpr) -> ScalarExpr {
+    ScalarExpr::Function {
+        name: name.to_string(),
+        args: vec![value.clone()],
+    }
+}
+
 /// The call an XML type error is reported as at evaluation time.
 pub(crate) fn xml_error(message: String, code: &str) -> ScalarExpr {
     ScalarExpr::Function {
