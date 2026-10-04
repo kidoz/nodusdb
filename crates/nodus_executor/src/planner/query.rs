@@ -1463,6 +1463,9 @@ fn figure_colname(expr: &sqlparser::ast::Expr) -> Option<String> {
                     "__xmlroot__" => return Some("xmlroot".to_string()),
                     "__xmlattributes__" => return None,
                     "__xml_is_document__" => return None,
+                    "__json__" => return Some("json".to_string()),
+                    "__json_scalar__" => return Some("json_scalar".to_string()),
+                    "__json_serialize__" => return Some("json_serialize".to_string()),
                     _ => {}
                 }
             }

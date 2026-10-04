@@ -1,5 +1,6 @@
 //! PostgreSQL's SQL/JSON functions (SQL:2023, PostgreSQL 16+): the
-//! `IS [NOT] JSON` predicates, over the [`crate::jsonpath`] engine.
+//! `IS [NOT] JSON` predicates and the `JSON_*` value constructors, over the
+//! [`crate::jsonpath`] engine.
 /// The call `<expr> IS [NOT] JSON [VALUE|SCALAR|ARRAY|OBJECT]
 /// [WITH|WITHOUT UNIQUE [KEYS]]` is lowered to:
 /// `__IS_JSON__(value, kind, unique, negated)`.
@@ -8,6 +9,83 @@ pub(crate) const IS_JSON: &str = "__IS_JSON__";
 /// A call the planner reports before execution, as PostgreSQL words it:
 /// `__SQL_JSON_ERROR__(message, sqlstate)`.
 pub(crate) const SQL_JSON_ERROR: &str = "__SQL_JSON_ERROR__";
+
+/// The JSON value constructors: `__JSON__(value, unique-keys)`,
+/// `__JSON_SCALAR__(value)`, and
+/// `__JSON_SERIALIZE__(value, format, returning-type)`.
+pub(crate) const JSON: &str = "__JSON__";
+pub(crate) const JSON_SCALAR: &str = "__JSON_SCALAR__";
+pub(crate) const JSON_SERIALIZE: &str = "__JSON_SERIALIZE__";
+
+/// `JSON(expr [WITH UNIQUE KEYS])`: the value as a `json`, its text kept as
+/// written.
+pub(crate) fn json(value: &crate::Value, unique: &str) -> Result<crate::Value, String> {
+    let text = match value {
+        crate::Value::Jsonb(value) => crate::json_text::jsonb_text(value),
+        crate::Value::Json(text) => text.clone(),
+        crate::Value::Text(text) => {
+            crate::json_text::parse(text)?;
+            text.clone()
+        }
+        other => {
+            return Err(error(
+                format!(
+                    "cannot cast type {} to json",
+                    crate::value::value_type_name(other)
+                ),
+                "42846",
+            ));
+        }
+    };
+    if unique == "unique" && has_duplicate_key(&text) {
+        return Err(error("duplicate JSON object key value", "22030"));
+    }
+    Ok(crate::Value::Json(text))
+}
+
+/// `JSON_SCALAR(expr)`: the value as a `json`. A `json` or `jsonb` value is
+/// kept (a text value cast to one is JSON already), and any other value is
+/// written as `to_json` would write it. The planner names the JSON types,
+/// since a `json` value is also text at run time.
+pub(crate) fn json_scalar(value: &crate::Value, is_json: bool) -> crate::Value {
+    match value {
+        crate::Value::Json(text) => crate::Value::Json(text.clone()),
+        crate::Value::Jsonb(value) => crate::Value::Json(crate::json_text::jsonb_text(value)),
+        crate::Value::Text(text) if is_json => crate::Value::Json(text.clone()),
+        other => {
+            let mut out = String::new();
+            crate::json_text::value_json(other, false, &mut out);
+            crate::Value::Json(out)
+        }
+    }
+}
+
+/// `JSON_SERIALIZE(expr [FORMAT JSON] [RETURNING type])`: the JSON text of
+/// the value, as the RETURNING type (`text` by default).
+pub(crate) fn json_serialize(
+    value: &crate::Value,
+    returning: &str,
+) -> Result<crate::Value, String> {
+    let text = match value {
+        crate::Value::Jsonb(value) => crate::json_text::jsonb_text(value),
+        crate::Value::Json(text) => text.clone(),
+        crate::Value::Text(text) => text.clone(),
+        crate::Value::Bytea(bytes) => String::from_utf8_lossy(bytes).into_owned(),
+        other => {
+            return Err(error(
+                format!(
+                    "cannot cast type {} to json",
+                    crate::value::value_type_name(other)
+                ),
+                "42846",
+            ));
+        }
+    };
+    if crate::value::is_bytea_type(returning) {
+        return Ok(crate::Value::Bytea(text.into_bytes()));
+    }
+    crate::value::fit_character(&text, returning, false).map(crate::Value::Text)
+}
 
 use serde_json::Value as J;
 
@@ -235,6 +313,67 @@ mod tests {
             Ok(value) => crate::render(&value),
             Err(error) => format!("error: {error}"),
         }
+    }
+
+    #[test]
+    fn constructors_match_postgresql() {
+        // The `json` the test module defines above is the `json` value
+        // helper, so the constructor is named explicitly.
+        let constructor = |value: &crate::Value, unique: &str| match super::json(value, unique) {
+            Ok(crate::Value::Json(text)) => text,
+            Ok(other) => panic!("not json: {other:?}"),
+            Err(error) => format!("error: {error}"),
+        };
+        assert_eq!(
+            constructor(&crate::Value::Text("{\"a\":1}".into()), ""),
+            "{\"a\":1}"
+        );
+        assert_eq!(
+            constructor(&document_of("{\"a\":1}"), ""),
+            "{\"a\": 1}",
+            "a jsonb value is written canonically"
+        );
+        assert!(
+            constructor(&crate::Value::Text("{\"a\":1,\"a\":2}".into()), "unique")
+                .starts_with("error: ")
+        );
+        assert_eq!(
+            constructor(
+                &crate::Value::Text("{\"a\":1,\"a\":2}".into()),
+                "not-unique"
+            ),
+            "{\"a\":1,\"a\":2}"
+        );
+        assert_eq!(
+            shown(Ok(json_scalar(&crate::Value::Text("abc".into()), false))),
+            "\"abc\""
+        );
+        assert_eq!(shown(Ok(json_scalar(&crate::Value::Int(1), false))), "1");
+        assert_eq!(
+            shown(Ok(json_scalar(
+                &crate::Value::Text("{\"a\":1}".into()),
+                true
+            ))),
+            "{\"a\":1}"
+        );
+        assert_eq!(
+            shown(json_serialize(&document_of("{\"a\":1}"), "text")),
+            "{\"a\": 1}"
+        );
+        assert_eq!(
+            shown(json_serialize(
+                &crate::Value::Json("{\"a\":1}".into()),
+                "text"
+            )),
+            "{\"a\":1}"
+        );
+        assert!(
+            shown(json_serialize(
+                &crate::Value::Json("{}".into()),
+                "varchar(1)"
+            ))
+            .starts_with("error: ")
+        );
     }
 
     #[test]

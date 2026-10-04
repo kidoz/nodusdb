@@ -48,8 +48,8 @@ pub fn parse_sql(
         }
     }
     let tokens = reorder_identity_options(reorder_sequence_options(rewrite_data_clauses(
-        rewrite_record_star(rewrite_xml_constructors(rewrite_xml_syntax(
-            rewrite_query_syntax(tokens),
+        rewrite_record_star(rewrite_sql_json(rewrite_xml_constructors(
+            rewrite_xml_syntax(rewrite_query_syntax(tokens)),
         ))),
     )));
     Parser::new(&dialect)
@@ -548,6 +548,152 @@ fn rewrite_xml_syntax(
                     continue;
                 }
             }
+        }
+        i += 1;
+    }
+    tokens
+}
+
+/// The JSON value constructors, which the parser cannot read with their
+/// clauses: `JSON`, `JSON_SCALAR`, and `JSON_SERIALIZE` (see `sqljson.rs`):
+/// `__json__(value, unique-keys)`, `__json_scalar__(value, is-json)`,
+/// `__json_serialize__(value, format, returning-type)`.
+fn rewrite_sql_json(
+    mut tokens: Vec<sqlparser::tokenizer::TokenWithSpan>,
+) -> Vec<sqlparser::tokenizer::TokenWithSpan> {
+    use sqlparser::tokenizer::{Token, TokenWithSpan};
+    let word = |t: &TokenWithSpan| match &t.token {
+        Token::Word(w) if w.quote_style.is_none() => Some(w.value.clone()),
+        _ => None,
+    };
+    let significant = |tokens: &[TokenWithSpan], from: usize| {
+        (from..tokens.len()).find(|&i| !matches!(tokens[i].token, Token::Whitespace(_)))
+    };
+    let matching_paren = |tokens: &[TokenWithSpan], open: usize| {
+        let mut depth = 0i32;
+        for (i, token) in tokens.iter().enumerate().skip(open) {
+            match token.token {
+                Token::LParen => depth += 1,
+                Token::RParen => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    };
+    // The JSON value constructors: `JSON(expr [WITH|WITHOUT UNIQUE [KEYS]])`,
+    // `JSON_SCALAR(expr)`, and `JSON_SERIALIZE(expr [FORMAT JSON [ENCODING n]]
+    // [RETURNING type [FORMAT JSON]])`.
+    let mut i = 0;
+    while i < tokens.len() {
+        let name = word(&tokens[i]).unwrap_or_default();
+        if !matches!(name.as_str(), "json" | "json_scalar" | "json_serialize") {
+            i += 1;
+            continue;
+        }
+        let Some(open) = significant(&tokens, i + 1) else {
+            i += 1;
+            continue;
+        };
+        if tokens[open].token != Token::LParen {
+            i += 1;
+            continue;
+        }
+        let Some(close) = matching_paren(&tokens, open) else {
+            i += 1;
+            continue;
+        };
+        // A trailing `WITH|WITHOUT UNIQUE [KEYS]` clause, for `JSON`.
+        let mut unique = String::new();
+        let mut end = close;
+        if name == "json" {
+            for (at, token) in tokens.iter().enumerate().take(close).skip(open + 1) {
+                if matches!(word(token).as_deref(), Some("with" | "without"))
+                    && let Some(next) = significant(&tokens, at + 1)
+                    && word(&tokens[next]).as_deref() == Some("unique")
+                {
+                    unique = if word(token).as_deref() == Some("with") {
+                        "unique".to_string()
+                    } else {
+                        "not-unique".to_string()
+                    };
+                    end = at;
+                    break;
+                }
+            }
+        }
+        let mut failed = false;
+        // A `FORMAT JSON [ENCODING name]` clause, for `JSON_SERIALIZE`.
+        let mut format = String::new();
+        let mut doc_end = end;
+        let mut returning = String::new();
+        let mut returning_end = end;
+        if name == "json_serialize" {
+            // The RETURNING clause, if any, comes last.
+            for (at, token) in tokens.iter().enumerate().take(end).skip(open + 1) {
+                if word(token).as_deref() == Some("returning") {
+                    returning_end = at;
+                    break;
+                }
+            }
+            let has_returning = returning_end < end;
+            if has_returning {
+                let mut type_end = end;
+                for (at, token) in tokens.iter().enumerate().take(end).skip(returning_end + 1) {
+                    if word(token).as_deref() == Some("format") {
+                        // Only `FORMAT JSON` is a returning format; anything
+                        // else is the parser's own error.
+                        let shape = significant(&tokens, at + 1);
+                        if !shape.is_some_and(|s| word(&tokens[s]).as_deref() == Some("json")) {
+                            failed = true;
+                            break;
+                        }
+                        type_end = at;
+                        break;
+                    }
+                }
+                if failed {
+                    i += 1;
+                    continue;
+                }
+                returning = render_tokens(&tokens[returning_end + 1..type_end])
+                    .trim()
+                    .to_string();
+            }
+            if has_returning {
+                doc_end = returning_end;
+            }
+            for (at, token) in tokens.iter().enumerate().take(returning_end).skip(open + 1) {
+                if word(token).as_deref() == Some("format") {
+                    doc_end = at;
+                    let rest: String = render_tokens(&tokens[at..returning_end]);
+                    format = match rest.split_whitespace().nth(2) {
+                        Some(encoding) if rest.contains("encoding") => format!(
+                            "json:{}",
+                            encoding.trim_matches(|c: char| !c.is_alphanumeric())
+                        ),
+                        _ => "json".to_string(),
+                    };
+                    format = format.replace("utf8", "utf-8");
+                    break;
+                }
+            }
+        }
+        let value = render_tokens(&tokens[open + 1..doc_end]);
+        let replacement = match name.as_str() {
+            "json" => format!("pg_catalog.__json__({value}, '{unique}')"),
+            "json_scalar" => format!("pg_catalog.__json_scalar__({value}, false)"),
+            _ => format!("pg_catalog.__json_serialize__({value}, '{format}', '{returning}')"),
+        };
+        if let Some(snippet) = snippet_tokens(&replacement) {
+            let len = snippet.len();
+            tokens.splice(i..=close, snippet);
+            i += len;
+            continue;
         }
         i += 1;
     }

@@ -1363,6 +1363,127 @@ pub(crate) fn check_integer_ranges(
                 args,
             };
         }
+        // The JSON value constructors: `JSON(expr [WITH UNIQUE KEYS])`,
+        // `JSON_SCALAR(expr)`, and
+        // `JSON_SERIALIZE(expr [FORMAT JSON] [RETURNING type])`.
+        ScalarExpr::Function { name, args }
+            if matches!(
+                name.as_str(),
+                crate::sqljson::JSON | crate::sqljson::JSON_SCALAR | crate::sqljson::JSON_SERIALIZE
+            ) =>
+        {
+            let mut args = args.clone();
+            if name == crate::sqljson::JSON_SCALAR {
+                // Any value, as `to_json` would make it; a `json` or `jsonb`
+                // argument is JSON already and is named for the runtime.
+                let is_json = args.first().is_some_and(|value| {
+                    matches!(value, ScalarExpr::Literal(Value::Json(_) | Value::Jsonb(_)))
+                        || scalar_type(value, column).is_some_and(|t| {
+                            t.trim().eq_ignore_ascii_case("json")
+                                || crate::value::is_jsonb_type(&t)
+                        })
+                });
+                if let Some(flag) = args.get_mut(1) {
+                    *flag = ScalarExpr::Literal(Value::Bool(is_json));
+                }
+                return ScalarExpr::Cast {
+                    expr: Box::new(ScalarExpr::Function {
+                        name: name.clone(),
+                        args,
+                    }),
+                    target: "json".to_string(),
+                };
+            }
+            let declared = |e: &ScalarExpr| scalar_type(e, column).map(|t| t.trim().to_string());
+            let json_like =
+                |e: &ScalarExpr| matches!(e, ScalarExpr::Literal(Value::Json(_) | Value::Jsonb(_)));
+            let string_value = |e: &ScalarExpr| {
+                matches!(e, ScalarExpr::Literal(Value::Text(_)))
+                    || declared(e).is_none_or(|t| {
+                        t.is_empty()
+                            || t.eq_ignore_ascii_case("UNKNOWN")
+                            || is_text_type(&t)
+                            || (name == crate::sqljson::JSON_SERIALIZE
+                                && crate::value::is_bytea_type(&t))
+                    })
+            };
+            if let Some(doc) = args.get(0)
+                && !json_like(doc)
+                && !declared(doc).is_some_and(|t| {
+                    t.eq_ignore_ascii_case("json") || crate::value::is_jsonb_type(&t)
+                })
+                && !string_value(doc)
+            {
+                // `JSON` takes what casts to `json`, and complains that way;
+                // `JSON_SERIALIZE` refuses a non-string type itself.
+                if name == crate::sqljson::JSON {
+                    return sql_json_error(
+                        format!(
+                            "cannot cast type {} to json",
+                            argument_type_name(doc, column)
+                        ),
+                        "42846",
+                    );
+                }
+                let clause = match args.get(1) {
+                    Some(ScalarExpr::Literal(Value::Text(format))) if !format.is_empty() => {
+                        "explicit"
+                    }
+                    _ => "implicit",
+                };
+                return sql_json_error(
+                    format!("cannot use non-string types with {clause} FORMAT JSON clause"),
+                    "42804",
+                );
+            }
+            let returning = if name == crate::sqljson::JSON {
+                "json".to_string()
+            } else {
+                match args.get(2) {
+                    Some(ScalarExpr::Literal(Value::Text(target))) if !target.trim().is_empty() => {
+                        target.clone()
+                    }
+                    _ => "text".to_string(),
+                }
+            };
+            if name == crate::sqljson::JSON_SERIALIZE
+                && !is_text_type(&returning)
+                && !crate::value::is_bytea_type(&returning)
+            {
+                return sql_json_error_with_hint(
+                    format!(
+                        "cannot use type {} in RETURNING clause of JSON_SERIALIZE()",
+                        operator_type_name(&returning)
+                    ),
+                    "42804",
+                    "Try returning a string type or bytea.",
+                );
+            }
+            // The document is cast to `json`, which validates a text as
+            // PostgreSQL does. A bytea document is decoded instead.
+            if let Some(doc) = args.first().cloned() {
+                let already = json_like(&doc)
+                    || declared(&doc).is_some_and(|t| {
+                        t.eq_ignore_ascii_case("json")
+                            || crate::value::is_jsonb_type(&t)
+                            || (name == crate::sqljson::JSON_SERIALIZE
+                                && crate::value::is_bytea_type(&t))
+                    });
+                if !already {
+                    args[0] = ScalarExpr::Cast {
+                        expr: Box::new(doc),
+                        target: "json".to_string(),
+                    };
+                }
+            }
+            return ScalarExpr::Cast {
+                expr: Box::new(ScalarExpr::Function {
+                    name: name.clone(),
+                    args,
+                }),
+                target: returning,
+            };
+        }
         // `IS [NOT] JSON`: the operand is a string value (bytea included),
         // `json`, or `jsonb`; anything else PostgreSQL refuses.
         ScalarExpr::Function { name, args } if name == crate::sqljson::IS_JSON => {
