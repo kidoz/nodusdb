@@ -1,5 +1,6 @@
 //! Query planning: SELECT/set-op planning and object-name resolution.
 use super::*;
+use crate::plan_types::{JsonTableColumn, JsonTableColumnKind, JsonTableSpec};
 use crate::*;
 use anyhow::Result;
 use nodus_catalog::TableConstraint;
@@ -1061,6 +1062,13 @@ fn table_fn_from_factor(
                     _ => None,
                 })
                 .collect::<Option<_>>()?;
+            if name
+                .to_string()
+                .trim_start_matches("pg_catalog.")
+                .eq_ignore_ascii_case(JSON_TABLE_MARKER)
+            {
+                return json_table_factor(&exprs, params, *with_ordinality, alias.as_ref());
+            }
             let mut spec = build_table_fn_spec(
                 name.to_string().to_lowercase(),
                 Vec::new(),
@@ -1085,6 +1093,13 @@ fn table_fn_from_factor(
                     _ => None,
                 })
                 .collect::<Option<_>>()?;
+            if name
+                .to_string()
+                .trim_start_matches("pg_catalog.")
+                .eq_ignore_ascii_case(JSON_TABLE_MARKER)
+            {
+                return json_table_factor(&exprs, params, *with_ordinality, alias.as_ref());
+            }
             let mut spec = build_table_fn_spec(
                 name.to_string().to_lowercase(),
                 Vec::new(),
@@ -1111,6 +1126,320 @@ fn table_fn_from_factor(
         }
         _ => None,
     }
+}
+
+/// The first column name of a `JSON_TABLE` call that appears more than once.
+fn duplicate_column_name(columns: &[JsonTableColumn], names: &mut Vec<String>) -> Option<String> {
+    for column in columns {
+        if names.contains(&column.name) {
+            return Some(column.name.clone());
+        }
+        names.push(column.name.clone());
+    }
+    None
+}
+
+/// The `JSON_TABLE` marker, as `nodus_sql` rewrites the call:
+/// `__json_table__(context, path, on-error, vars, column...)`.
+const JSON_TABLE_MARKER: &str = "__json_table__";
+
+/// The marker of one `JSON_TABLE` column; the shapes are in
+/// `nodus_sql::rewrite_json_table`.
+const JSON_TABLE_COLUMN_MARKERS: &[&str] = &[
+    "__jt_col_ordinality__",
+    "__jt_col_exists__",
+    "__jt_col_scalar__",
+];
+
+/// Plans `JSON_TABLE(...)` from its rewritten call: the context, the row
+/// path, the `PASSING` variables, and the column markers.
+fn json_table_factor(
+    exprs: &[&sqlparser::ast::Expr],
+    params: &[Value],
+    with_ordinality: bool,
+    alias: Option<&sqlparser::ast::TableAlias>,
+) -> Option<TableFnSpec> {
+    if exprs.len() < 4 {
+        return None;
+    }
+    // The context item, with its `FORMAT JSON` clause as the marker the
+    // elements take — the runtime reads (and checks) the item through it —
+    // and the document read as `jsonb`.
+    let mut doc = lower_scalar(exprs[0], params)?;
+    let json_like = matches!(doc, ScalarExpr::Literal(Value::Json(_) | Value::Jsonb(_)))
+        || matches!(&doc, ScalarExpr::Cast { target, .. }
+            if target.eq_ignore_ascii_case("json") || crate::value::is_jsonb_type(target));
+    let mut refuse = None;
+    // A literal that is neither a string nor JSON is not a document, as
+    // PostgreSQL says when it reads one.
+    if !json_like
+        && let ScalarExpr::Literal(value) = &doc
+        && !matches!(value, Value::Text(_) | Value::Null)
+    {
+        refuse = Some(
+            crate::error_fields::DbError::new(format!(
+                "cannot cast type {} to jsonb",
+                crate::value::value_type_name(value)
+            ))
+            .code("42846")
+            .into_text(),
+        );
+    }
+    if !json_like {
+        doc = ScalarExpr::Cast {
+            expr: Box::new(doc),
+            target: "jsonb".to_string(),
+        };
+    }
+    let path = json_table_path(exprs[1], params, &mut refuse)?;
+    let on_error = marker_text(exprs[2])?;
+    // The `PASSING` variables, or a NULL placeholder.
+    let vars = lower_scalar(exprs[3], params)?;
+    let columns = json_table_columns(&exprs[4..], params, &mut refuse)?;
+    // A column name appears once, as PostgreSQL checks when it parses the
+    // call.
+    let mut names = Vec::new();
+    if let Some(name) = duplicate_column_name(&columns, &mut names)
+        && refuse.is_none()
+    {
+        refuse = Some(
+            crate::error_fields::DbError::new(format!(
+                "duplicate JSON_TABLE column or path name: {name}"
+            ))
+            .code("42712")
+            .into_text(),
+        );
+    }
+    let mut spec =
+        build_table_fn_spec("json_table".to_string(), Vec::new(), with_ordinality, alias);
+    spec.arg_exprs = vec![
+        doc,
+        ScalarExpr::Cast {
+            expr: Box::new(vars),
+            target: "jsonb".to_string(),
+        },
+    ];
+    spec.json_table = Some(JsonTableSpec {
+        path: ScalarExpr::Cast {
+            expr: Box::new(path),
+            target: "jsonpath".to_string(),
+        },
+        on_error,
+        columns,
+        refuse,
+    });
+    Some(spec)
+}
+
+/// A string literal a `JSON_TABLE` marker carries.
+fn marker_text(expr: &sqlparser::ast::Expr) -> Option<String> {
+    match expr {
+        sqlparser::ast::Expr::Value(sqlparser::ast::ValueWithSpan {
+            value: sqlparser::ast::Value::SingleQuotedString(text),
+            ..
+        }) => Some(text.clone()),
+        _ => None,
+    }
+}
+
+/// A `JSON_TABLE` path expression, as the `jsonpath` it is evaluated as.
+/// PostgreSQL parses a literal path when it parses the statement, so one
+/// that is not a path is refused before any row.
+fn json_table_path(
+    expr: &sqlparser::ast::Expr,
+    params: &[Value],
+    refuse: &mut Option<String>,
+) -> Option<ScalarExpr> {
+    if let Some(text) = marker_text(expr)
+        && let Err(error) = crate::jsonpath::canonical(&text)
+        && refuse.is_none()
+    {
+        *refuse = Some(error);
+    }
+    lower_scalar(expr, params)
+}
+
+/// The columns of a `JSON_TABLE` call, with the checks PostgreSQL makes when
+/// it parses one. A check it fails is carried in `refuse`, and raised when
+/// the table is evaluated.
+fn json_table_columns(
+    exprs: &[&sqlparser::ast::Expr],
+    params: &[Value],
+    refuse: &mut Option<String>,
+) -> Option<Vec<JsonTableColumn>> {
+    let mut columns = Vec::new();
+    for expr in exprs {
+        let sqlparser::ast::Expr::Function(function) = expr else {
+            return None;
+        };
+        let name = function
+            .name
+            .to_string()
+            .to_ascii_uppercase()
+            .trim_start_matches("PG_CATALOG.")
+            .to_string();
+        if !JSON_TABLE_COLUMN_MARKERS.contains(&name.to_ascii_lowercase().as_str()) {
+            return None;
+        }
+        let sqlparser::ast::FunctionArguments::List(list) = &function.args else {
+            return None;
+        };
+        let args: Vec<&sqlparser::ast::Expr> = list
+            .args
+            .iter()
+            .map(|a| match a {
+                sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(e)) => {
+                    Some(e)
+                }
+                _ => None,
+            })
+            .collect::<Option<_>>()?;
+        let refuse_now = |refuse: &mut Option<String>, message: String, code: &str| {
+            if refuse.is_none() {
+                *refuse = Some(
+                    crate::error_fields::DbError::new(message)
+                        .code(code)
+                        .into_text(),
+                );
+            }
+        };
+        let column = match name.as_str() {
+            "__JT_COL_ORDINALITY__" => {
+                let [column_name] = args.as_slice() else {
+                    return None;
+                };
+                JsonTableColumn {
+                    name: marker_text(column_name)?,
+                    kind: JsonTableColumnKind::Ordinality,
+                }
+            }
+            "__JT_COL_EXISTS__" => {
+                let [column_name, column_type, path, on_error] = args.as_slice() else {
+                    return None;
+                };
+                let column_type = marker_text(column_type)?;
+                let name = marker_text(column_name)?;
+                let on_error = marker_text(on_error)?;
+                if !matches!(
+                    on_error.as_str(),
+                    "" | "error" | "true" | "false" | "unknown"
+                ) {
+                    refuse_now(
+                        refuse,
+                        format!("invalid ON ERROR behavior for column \"{name}\""),
+                        "42601",
+                    );
+                }
+                JsonTableColumn {
+                    name,
+                    kind: JsonTableColumnKind::Exists {
+                        column_type,
+                        path: json_table_path(path, params, refuse)?,
+                        on_error,
+                    },
+                }
+            }
+            "__JT_COL_SCALAR__" => {
+                let [
+                    column_name,
+                    column_type,
+                    format,
+                    encoded,
+                    path,
+                    wrapper,
+                    quotes,
+                    on_empty,
+                    on_empty_default,
+                    on_error,
+                    on_error_default,
+                ] = args.as_slice()
+                else {
+                    return None;
+                };
+                let name = marker_text(column_name)?;
+                let column_type = marker_text(column_type)?;
+                let flag = |e: &sqlparser::ast::Expr| {
+                    matches!(
+                        e,
+                        sqlparser::ast::Expr::Value(sqlparser::ast::ValueWithSpan {
+                            value: sqlparser::ast::Value::Boolean(true),
+                            ..
+                        })
+                    )
+                };
+                let format = flag(format);
+                let encoded = flag(encoded);
+                if encoded && !crate::value::is_bytea_type(&column_type) {
+                    refuse_now(
+                        refuse,
+                        "cannot set JSON encoding for non-bytea output types".to_string(),
+                        "0A000",
+                    );
+                }
+                if format && !json_table_format_type(&column_type) {
+                    refuse_now(
+                        refuse,
+                        "cannot use JSON format with non-string output types".to_string(),
+                        "0A000",
+                    );
+                }
+                let jsonish = crate::value::is_json_type(&column_type)
+                    || crate::value::is_jsonb_type(&column_type);
+                for (clause, behavior) in [
+                    ("ON EMPTY", marker_text(on_empty)?),
+                    ("ON ERROR", marker_text(on_error)?),
+                ] {
+                    let allowed = matches!(behavior.as_str(), "" | "null" | "error" | "default")
+                        || (jsonish && matches!(behavior.as_str(), "empty-array" | "empty-object"));
+                    if !allowed {
+                        refuse_now(
+                            refuse,
+                            format!("invalid {clause} behavior for column \"{name}\""),
+                            "42601",
+                        );
+                    }
+                }
+                JsonTableColumn {
+                    name,
+                    kind: JsonTableColumnKind::Scalar {
+                        column_type,
+                        format,
+                        encoded,
+                        path: json_table_path(path, params, refuse)?,
+                        wrapper: marker_text(wrapper)?,
+                        quotes: marker_text(quotes)?,
+                        on_empty: marker_text(on_empty)?,
+                        on_empty_default: lower_scalar(on_empty_default, params),
+                        on_error: marker_text(on_error)?,
+                        on_error_default: lower_scalar(on_error_default, params),
+                    },
+                }
+            }
+            _ => return None,
+        };
+        columns.push(column);
+    }
+    Some(columns)
+}
+
+/// The types a `JSON_TABLE` column's `FORMAT JSON` clause takes, besides
+/// `json` and `jsonb`.
+fn json_table_format_type(data_type: &str) -> bool {
+    let upper = data_type.trim().to_ascii_uppercase();
+    let base = upper.split('(').next().unwrap_or_default().trim();
+    matches!(
+        base,
+        "TEXT"
+            | "VARCHAR"
+            | "CHARACTER VARYING"
+            | "CHAR"
+            | "CHARACTER"
+            | "BPCHAR"
+            | "NAME"
+            | "BYTEA"
+            | "JSON"
+            | "JSONB"
+    )
 }
 
 /// A table function's arguments: constants and column references as
@@ -1214,6 +1543,7 @@ fn lift_set_returning_functions(
             column_types: Vec::new(),
             arg_exprs: args.clone(),
             rows_from: Vec::new(),
+            json_table: None,
         }
     };
     Some(TableFnSpec {
@@ -1225,6 +1555,7 @@ fn lift_set_returning_functions(
         column_types: Vec::new(),
         arg_exprs: Vec::new(),
         rows_from: calls.iter().map(|(call, _)| member(call)).collect(),
+        json_table: None,
     })
 }
 
@@ -1326,6 +1657,7 @@ fn select_list_table_function(
         column_types: Vec::new(),
         arg_exprs: Vec::new(),
         rows_from: Vec::new(),
+        json_table: None,
     };
     set_table_fn_args(&mut spec, &exprs, params)?;
     Some(spec)
@@ -1358,6 +1690,7 @@ fn build_table_fn_spec(
             .unwrap_or_default(),
         arg_exprs: Vec::new(),
         rows_from: Vec::new(),
+        json_table: None,
     }
 }
 

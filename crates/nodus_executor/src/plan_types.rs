@@ -130,6 +130,80 @@ pub struct TableFnSpec {
     /// `name` and the arguments are unused. Defaulted so older plans decode.
     #[serde(default)]
     pub rows_from: Vec<TableFnSpec>,
+    /// `JSON_TABLE(...)`: the row path and the columns, with the context
+    /// document (and the `PASSING` variables) in `args`/`arg_exprs`.
+    /// Defaulted so older plans decode.
+    #[serde(default)]
+    pub json_table: Option<JsonTableSpec>,
+}
+
+/// The `JSON_TABLE` clause of a [`TableFnSpec`]: the row path with its
+/// `ON ERROR` behavior, and the columns in the order they were written.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct JsonTableSpec {
+    /// The row path (a `jsonpath`), evaluated against the context document.
+    pub path: ScalarExpr,
+    /// `{ ERROR | EMPTY [ARRAY] } ON ERROR`; the default is `EMPTY`.
+    pub on_error: String,
+    /// The columns of `COLUMNS (...)`, in order (nested groups included).
+    pub columns: Vec<JsonTableColumn>,
+    /// A clause PostgreSQL refuses when it parses the call, as the error it
+    /// raises; evaluating the table raises it before any row.
+    #[serde(default)]
+    pub refuse: Option<String>,
+}
+
+/// One `JSON_TABLE` column.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct JsonTableColumn {
+    /// The output column name (also the default path's key).
+    pub name: String,
+    /// What the column extracts.
+    pub kind: JsonTableColumnKind,
+}
+
+/// How a `JSON_TABLE` column produces its value.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum JsonTableColumnKind {
+    /// `name FOR ORDINALITY`: the 1-based number of the row.
+    Ordinality,
+    /// `name type EXISTS [PATH ...]`: whether the path has an item.
+    Exists {
+        /// The column's declared type (the boolean is cast to it).
+        column_type: String,
+        /// The path, defaulting to `$.name`.
+        path: ScalarExpr,
+        /// `{ ERROR | TRUE | FALSE | UNKNOWN } ON ERROR`; the default is
+        /// `FALSE`.
+        on_error: String,
+    },
+    /// `name type [FORMAT JSON] [PATH ...] [wrapper] [quotes] [behavior ON
+    /// EMPTY|ERROR]`: the item as the column's type.
+    Scalar {
+        /// The column's declared type.
+        column_type: String,
+        /// `FORMAT JSON`: the item is read as a JSON document, its text
+        /// converted to the column's type.
+        format: bool,
+        /// The `ENCODING name` clause of `FORMAT JSON`, which only a
+        /// `bytea` column takes.
+        #[serde(default)]
+        encoded: bool,
+        /// The path, defaulting to `$.name`.
+        path: ScalarExpr,
+        /// `WITHOUT | WITH [CONDITIONAL|UNCONDITIONAL] [ARRAY] WRAPPER`.
+        wrapper: String,
+        /// `KEEP | OMIT QUOTES [ON SCALAR STRING]`.
+        quotes: String,
+        /// `{ ERROR | NULL | DEFAULT expr [EMPTY ARRAY|OBJECT] } ON EMPTY`.
+        on_empty: String,
+        #[serde(default)]
+        on_empty_default: Option<ScalarExpr>,
+        /// The same behaviors `ON ERROR`.
+        on_error: String,
+        #[serde(default)]
+        on_error_default: Option<ScalarExpr>,
+    },
 }
 
 impl TableFnSpec {

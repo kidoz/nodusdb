@@ -771,6 +771,343 @@ impl KeyScan {
     }
 }
 
+/// A `JSON_TABLE` column tree whose paths and default expressions have been
+/// evaluated against the driving row.
+pub(crate) struct JsonTablePlan {
+    /// The row path (a `jsonpath`).
+    pub path: String,
+    /// `{ ERROR | EMPTY [ARRAY] } ON ERROR`.
+    pub on_error: String,
+    pub columns: Vec<JsonTablePlanColumn>,
+}
+
+/// One `JSON_TABLE` column, with its path and defaults evaluated.
+pub(crate) enum JsonTablePlanColumn {
+    /// `name FOR ORDINALITY`.
+    Ordinality { name: String },
+    /// `name type EXISTS [PATH ...] [behavior ON ERROR]`.
+    Exists {
+        name: String,
+        column_type: String,
+        path: String,
+        on_error: String,
+    },
+    /// `name type [FORMAT JSON] [PATH ...] [wrapper] [quotes] [behaviors]`.
+    Scalar {
+        name: String,
+        column_type: String,
+        format: bool,
+        path: String,
+        wrapper: String,
+        quotes: String,
+        on_empty: String,
+        on_empty_default: crate::Value,
+        on_error: String,
+        on_error_default: crate::Value,
+    },
+}
+
+/// `JSON_TABLE(...)`: the context document's row path selects items, and each
+/// item produces one row of the columns. Returns the output column names,
+/// their declared types, and the rows.
+pub(crate) fn json_table_rows(
+    doc: &crate::Value,
+    vars: Option<&crate::Value>,
+    table: &JsonTablePlan,
+) -> Result<Vec<Vec<crate::Value>>, String> {
+    let doc = document(doc)?;
+    let vars = match vars {
+        Some(vars) => Some(self::vars(vars)?),
+        None => None,
+    };
+    let items = match crate::jsonpath::execute(&table.path, &doc, vars.as_ref(), false) {
+        Ok(items) => items,
+        Err(error) => {
+            if table.on_error == "error" {
+                return Err(error);
+            }
+            // `EMPTY [ARRAY] ON ERROR`: no rows.
+            return Ok(Vec::new());
+        }
+    };
+    let mut rows = Vec::new();
+    for (index, item) in items.iter().enumerate() {
+        rows.extend(table_item_rows(
+            &table.columns,
+            item,
+            index + 1,
+            vars.as_ref(),
+        )?);
+    }
+    Ok(rows)
+}
+
+/// The output columns of a `JSON_TABLE` column tree, in the order PostgreSQL
+/// writes them: the level's plain columns first, then each nested group's.
+pub(crate) fn json_table_names(columns: &[JsonTablePlanColumn]) -> (Vec<String>, Vec<String>) {
+    let mut names = Vec::new();
+    let mut types = Vec::new();
+    column_names(columns, &mut names, &mut types);
+    (names, types)
+}
+
+/// The output columns of a `JSON_TABLE` column tree, in the order PostgreSQL
+/// writes them: the plain columns of a level first, then the columns of each
+/// nested group (recursively the same way).
+fn column_names(columns: &[JsonTablePlanColumn], names: &mut Vec<String>, types: &mut Vec<String>) {
+    // The plain columns, in order.
+    for column in columns {
+        match column {
+            JsonTablePlanColumn::Ordinality { name } => {
+                names.push(name.clone());
+                types.push("INTEGER".to_string());
+            }
+            JsonTablePlanColumn::Exists {
+                name, column_type, ..
+            }
+            | JsonTablePlanColumn::Scalar {
+                name, column_type, ..
+            } => {
+                names.push(name.clone());
+                types.push(column_type.clone());
+            }
+        }
+    }
+}
+/// The output position of each column of a level.
+fn column_offsets(columns: &[JsonTablePlanColumn]) -> Vec<usize> {
+    (0..columns.len()).collect()
+}
+
+/// The rows the columns produce for one row-path item.
+fn table_item_rows(
+    columns: &[JsonTablePlanColumn],
+    item: &J,
+    ordinal: usize,
+    vars: Option<&J>,
+) -> Result<Vec<Vec<crate::Value>>, String> {
+    let mut row = Vec::with_capacity(columns.len());
+    for column in columns {
+        row.push(column_value(column, item, ordinal, vars)?);
+    }
+    Ok(vec![row])
+}
+
+/// The value one column takes for a row item.
+fn column_value(
+    column: &JsonTablePlanColumn,
+    item: &J,
+    ordinal: usize,
+    vars: Option<&J>,
+) -> Result<crate::Value, String> {
+    match column {
+        JsonTablePlanColumn::Ordinality { .. } => Ok(crate::Value::Int(ordinal as i64)),
+        JsonTablePlanColumn::Exists {
+            column_type,
+            path,
+            on_error,
+            ..
+        } => {
+            let found = match crate::jsonpath::exists(item, path, vars, false) {
+                Ok(found) => found.unwrap_or(false),
+                Err(error) => match on_error.as_str() {
+                    "error" => return Err(error),
+                    "true" => true,
+                    "unknown" => return Ok(crate::Value::Null),
+                    _ => false,
+                },
+            };
+            // The boolean as the column's type; a type that refuses it
+            // leaves NULL, as PostgreSQL's conversion does.
+            Ok(
+                crate::planner::try_cast(crate::Value::Bool(found), column_type)
+                    .unwrap_or(crate::Value::Null),
+            )
+        }
+        JsonTablePlanColumn::Scalar {
+            name,
+            column_type,
+            format,
+            path,
+            wrapper,
+            quotes,
+            on_empty,
+            on_empty_default,
+            on_error,
+            on_error_default,
+        } => {
+            let items = match crate::jsonpath::execute(path, item, vars, false) {
+                Ok(items) => items,
+                Err(error) => return behavior(on_error, on_error_default, || Err(error)),
+            };
+            if items.is_empty() {
+                return behavior(on_empty, on_empty_default, || {
+                    Err(error(
+                        format!("no SQL/JSON item found for specified path of column \"{name}\""),
+                        "22035",
+                    ))
+                });
+            }
+            let json_type =
+                crate::value::is_json_type(column_type) || crate::value::is_jsonb_type(column_type);
+            // A JSON or array type, a wrapper, a quotes clause, or `FORMAT
+            // JSON` reads the item as a JSON query — no scalar requirement —
+            // while a plain scalar column takes a single scalar item.
+            let query = json_type
+                || *format
+                || !wrapper.is_empty()
+                || !quotes.is_empty()
+                || crate::value::array_element_type(column_type).is_some();
+            let wrapped = match wrapper.as_str() {
+                "with" => true,
+                "conditional" => items.len() > 1,
+                _ => false,
+            };
+            if !wrapped && items.len() > 1 {
+                let (message, code) = if json_type {
+                    (
+                        format!(
+                            "JSON path expression for column \"{name}\" must return single \
+                             item when no wrapper is requested"
+                        ),
+                        "22034",
+                    )
+                } else {
+                    (
+                        format!(
+                            "JSON path expression for column \"{name}\" must return single \
+                             scalar item"
+                        ),
+                        "2203F",
+                    )
+                };
+                return behavior(on_error, on_error_default, || Err(error(message, code)));
+            }
+            let value = if wrapped {
+                J::Array(items)
+            } else {
+                items.into_iter().next().expect("checked above")
+            };
+            // A string under `OMIT QUOTES` loses its quotes; without a
+            // clause a plain scalar column does that by default, while a
+            // JSON column — or one with a wrapper or FORMAT JSON, which
+            // PostgreSQL reads as a JSON query — keeps the item as it is.
+            let omit = match quotes.as_str() {
+                "omit" => true,
+                "keep" => false,
+                _ => !json_type && !*format && wrapper.is_empty(),
+            };
+            let failed = |error: String| behavior(on_error, on_error_default, || Err(error));
+            let convert = |value: crate::Value| match crate::planner::try_cast(value, column_type) {
+                Ok(value) => Ok(value),
+                Err(error) => failed(error),
+            };
+            if json_type {
+                // The item as JSON; a wrapped group is its array.
+                let text = match (&value, omit) {
+                    (J::String(text), true) => text.clone(),
+                    _ => item_text(&value),
+                };
+                return convert(crate::Value::Text(text));
+            }
+            if wrapped {
+                // The wrapped array's text, as the column's type takes it.
+                return convert(crate::Value::Text(item_text(&value)));
+            }
+            match &value {
+                J::Null => Ok(crate::Value::Null),
+                J::String(text) => {
+                    let text = if omit {
+                        text.clone()
+                    } else {
+                        item_text(&value)
+                    };
+                    convert(crate::Value::Text(text))
+                }
+                J::Number(number) => convert(crate::Value::Text(number.to_string())),
+                J::Bool(b) => {
+                    // PostgreSQL converts a boolean whose value stands alone
+                    // through its output text, so a character column takes
+                    // `t` or `f`; `FORMAT JSON` keeps the JSON spelling.
+                    if *format {
+                        convert(crate::Value::Text(item_text(&value)))
+                    } else if is_character_type(column_type) {
+                        convert(crate::Value::Text(if *b { "t" } else { "f" }.to_string()))
+                    } else {
+                        convert(crate::Value::Bool(*b))
+                    }
+                }
+                J::Array(_) | J::Object(_) => {
+                    // An array-typed column takes a JSON array, its elements
+                    // converted to the element type.
+                    if let Some(element_type) = crate::value::array_element_type(column_type) {
+                        return match array_item_value(&value, &element_type) {
+                            Ok(value) => Ok(value),
+                            Err(error) => failed(error),
+                        };
+                    }
+                    if query {
+                        return convert(crate::Value::Text(item_text(&value)));
+                    }
+                    // Otherwise not a scalar: the same error a multi-item path
+                    // raises.
+                    behavior(on_error, on_error_default, || {
+                        Err(error(
+                            format!(
+                                "JSON path expression for column \"{name}\" must return \
+                                 single scalar item"
+                            ),
+                            "2203F",
+                        ))
+                    })
+                }
+            }
+        }
+    }
+}
+
+/// A JSON array as an array-typed column's value: each element becomes the
+/// element type, a nested array another dimension.
+fn array_item_value(item: &J, element_type: &str) -> Result<crate::Value, String> {
+    let J::Array(items) = item else {
+        return Err(format!(
+            "cannot cast type json to {}",
+            crate::value::sql_type_name(element_type)
+        ));
+    };
+    let mut values = Vec::with_capacity(items.len());
+    for element in items {
+        values.push(match element {
+            J::Null => crate::Value::Null,
+            J::Array(_) => array_item_value(element, element_type)?,
+            J::String(text) => {
+                crate::planner::try_cast(crate::Value::Text(text.clone()), element_type)?
+            }
+            J::Number(number) => {
+                crate::planner::try_cast(crate::Value::Text(number.to_string()), element_type)?
+            }
+            J::Bool(b) => crate::planner::try_cast(crate::Value::Bool(*b), element_type)?,
+            J::Object(_) => {
+                return Err(format!(
+                    "cannot cast type json to {}",
+                    crate::value::sql_type_name(element_type)
+                ));
+            }
+        });
+    }
+    Ok(crate::Value::Array(values))
+}
+
+/// Whether a type takes character data (`text` and its spellings, `name`).
+fn is_character_type(data_type: &str) -> bool {
+    let upper = data_type.trim().to_ascii_uppercase();
+    let base = upper.split('(').next().unwrap_or_default().trim();
+    matches!(
+        base,
+        "TEXT" | "VARCHAR" | "CHARACTER VARYING" | "CHAR" | "CHARACTER" | "BPCHAR" | "NAME"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1082,6 +1419,146 @@ mod tests {
     /// A JSON document as the parser makes it, for the `jsonb` values.
     fn parse(text: &str) -> serde_json::Value {
         crate::json_text::parse(text).expect("valid JSON")
+    }
+
+    #[test]
+    fn json_table_matches_postgresql() {
+        use crate::Value;
+        let scalar = |name: &str, ty: &str, path: &str| JsonTablePlanColumn::Scalar {
+            name: name.to_string(),
+            column_type: ty.to_string(),
+            format: false,
+            path: path.to_string(),
+            wrapper: String::new(),
+            quotes: String::new(),
+            on_empty: String::new(),
+            on_empty_default: Value::Null,
+            on_error: String::new(),
+            on_error_default: Value::Null,
+        };
+        let table = |path: &str, columns: Vec<JsonTablePlanColumn>| JsonTablePlan {
+            path: path.to_string(),
+            on_error: String::new(),
+            columns,
+        };
+        let doc = |text: &str| Value::Text(text.to_string());
+        let rows = |table: &JsonTablePlan, text: &str| {
+            let (names, _) = json_table_names(&table.columns);
+            let rows = json_table_rows(&doc(text), None, table).expect("rows");
+            (names, rows)
+        };
+        // The row path selects items, each of which one row of columns.
+        let plan = table(
+            "$.\"a\"[*]",
+            vec![
+                JsonTablePlanColumn::Ordinality {
+                    name: "ord".to_string(),
+                },
+                scalar("v", "int", "$"),
+            ],
+        );
+        assert_eq!(
+            rows(&plan, "{\"a\":[1,2]}"),
+            (
+                vec!["ord".to_string(), "v".to_string()],
+                vec![
+                    vec![Value::Int(1), Value::Int(1)],
+                    vec![Value::Int(2), Value::Int(2)],
+                ]
+            )
+        );
+        // An empty row path leaves no rows at all.
+        let plan = table("$.\"b\"[*]", vec![scalar("v", "int", "$")]);
+        assert_eq!(rows(&plan, "{\"a\":[1,2]}").1, Vec::<Vec<Value>>::new());
+
+        // The column default of an omitted PATH is the column name.
+        let plan = table("$", vec![scalar("a", "int", "$.\"a\"")]);
+        assert_eq!(rows(&plan, "{\"a\":1}").1, vec![vec![Value::Int(1)]]);
+
+        // The scalar conversions PostgreSQL makes: a string keeps its
+        // content for a plain column, a boolean is its output text `t`, and
+        // `FORMAT JSON` keeps the item as written.
+        let plan = table(
+            "$",
+            vec![
+                scalar("s", "text", "$.\"s\""),
+                scalar("b", "text", "$.\"b\""),
+                scalar("n", "numeric", "$.\"n\""),
+            ],
+        );
+        assert_eq!(
+            rows(&plan, "{\"s\":\"x\",\"b\":true,\"n\":1.50}").1,
+            vec![vec![
+                Value::Text("x".to_string()),
+                Value::Text("t".to_string()),
+                Value::Numeric("1.50".parse().unwrap()),
+            ]]
+        );
+        let mut format = scalar("j", "text", "$.\"a\"");
+        if let JsonTablePlanColumn::Scalar { format: f, .. } = &mut format {
+            *f = true;
+        }
+        let plan = table("$", vec![format]);
+        assert_eq!(
+            rows(&plan, "{\"a\":\"x\"}").1,
+            vec![vec![Value::Text("\"x\"".to_string())]]
+        );
+
+        // A JSON column takes the item as JSON; an array column takes a JSON
+        // array, its elements converted.
+        let plan = table(
+            "$",
+            vec![
+                scalar("j", "jsonb", "$.\"a\""),
+                scalar("arr", "int[]", "$.\"b\""),
+            ],
+        );
+        assert_eq!(
+            rows(&plan, "{\"a\":{\"b\":1},\"b\":[1,2]}").1,
+            vec![vec![
+                Value::Jsonb(parse("{\"b\": 1}")),
+                Value::Array(vec![Value::Int(1), Value::Int(2)]),
+            ]]
+        );
+
+        // A behavior clause takes the case it names: `DEFAULT` an empty path,
+        // `ERROR` one that raises, and `NULL` the default.
+        let mut column = scalar("v", "int", "$.\"q\"");
+        if let JsonTablePlanColumn::Scalar {
+            on_empty,
+            on_empty_default,
+            ..
+        } = &mut column
+        {
+            *on_empty = "default".to_string();
+            *on_empty_default = Value::Int(-1);
+        }
+        let plan = table("$", vec![column]);
+        assert_eq!(rows(&plan, "{\"a\":1}").1, vec![vec![Value::Int(-1)]]);
+
+        let mut column = scalar("v", "int", "$.\"q\"");
+        if let JsonTablePlanColumn::Scalar { on_empty, .. } = &mut column {
+            *on_empty = "error".to_string();
+        }
+        let plan = table("$", vec![column]);
+        assert!(
+            json_table_rows(&doc("{\"a\":1}"), None, &plan)
+                .unwrap_err()
+                .starts_with("no SQL/JSON item found for specified path of column \"v\"")
+        );
+
+        // `EXISTS` reports whether the path has an item.
+        let plan = table(
+            "$",
+            vec![JsonTablePlanColumn::Exists {
+                name: "ex".to_string(),
+                column_type: "boolean".to_string(),
+                path: "$.\"a\"".to_string(),
+                on_error: String::new(),
+            }],
+        );
+        assert_eq!(rows(&plan, "{\"a\":1}").1, vec![vec![Value::Bool(true)]]);
+        assert_eq!(rows(&plan, "{\"b\":1}").1, vec![vec![Value::Bool(false)]]);
     }
 
     #[test]

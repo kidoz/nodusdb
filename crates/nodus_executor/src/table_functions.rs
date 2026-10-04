@@ -4,6 +4,8 @@
 //! which both the standalone path (materialized like a CTE) and the lateral
 //! join path (evaluated per driving row) call.
 
+use crate::plan_types::{JsonTableColumn, JsonTableColumnKind, JsonTableSpec};
+use crate::sqljson::{JsonTablePlan, JsonTablePlanColumn};
 use crate::{MemExecutor, QueryOutput, Row, TableFnSpec, Value};
 use anyhow::Result;
 
@@ -20,6 +22,9 @@ impl MemExecutor {
     ) -> Result<(Vec<String>, Vec<String>, Vec<Vec<Value>>)> {
         if !spec.rows_from.is_empty() {
             return self.eval_rows_from(spec, row, col_names);
+        }
+        if let Some(table) = &spec.json_table {
+            return self.eval_json_table(spec, table, row, col_names);
         }
         let args: Vec<Value> = if spec.arg_exprs.is_empty() {
             spec.args
@@ -622,6 +627,121 @@ fn json_to_record_rows(
         rows.push(row);
     }
     Ok((types, rows))
+}
+
+impl MemExecutor {
+    /// Evaluates a `JSON_TABLE`: the context document and the `PASSING`
+    /// variables are the call's arguments, and the paths and default
+    /// expressions of the columns are evaluated against the driving row.
+    fn eval_json_table(
+        &self,
+        spec: &crate::TableFnSpec,
+        table: &JsonTableSpec,
+        row: &[Value],
+        col_names: &[String],
+    ) -> Result<(Vec<String>, Vec<String>, Vec<Vec<Value>>)> {
+        if let Some(refuse) = &table.refuse {
+            anyhow::bail!(refuse.clone());
+        }
+        // A column's type must be one, as PostgreSQL checks when it parses
+        // the call; the session's catalog is the one that says so.
+        if let Some(ty) = json_table_type_error(&table.columns) {
+            anyhow::bail!(crate::user_types::missing_type(&ty));
+        }
+        let eval = |e: &crate::ScalarExpr| crate::eval_scalar_expr(e, row, col_names);
+        let plan = JsonTablePlan {
+            path: value_text(&eval(&table.path)),
+            on_error: table.on_error.clone(),
+            columns: table
+                .columns
+                .iter()
+                .map(|c| table_column(c, &eval))
+                .collect(),
+        };
+        // The columns are the same for every row; `AS jt(b, ...)` renames
+        // them positionally.
+        let (names, types) = crate::sqljson::json_table_names(&plan.columns);
+        let names = names
+            .into_iter()
+            .enumerate()
+            .map(|(i, name)| spec.column_aliases.get(i).cloned().unwrap_or(name))
+            .collect();
+        let doc = spec.arg_exprs.first().map_or(Value::Null, |e| eval(e));
+        if matches!(doc, Value::Null) {
+            return Ok((names, types, Vec::new()));
+        }
+        let vars = spec.arg_exprs.get(1).map_or(Value::Null, |e| eval(e));
+        let vars = (!matches!(vars, Value::Null)).then_some(vars);
+        let rows = crate::sqljson::json_table_rows(&doc, vars.as_ref(), &plan)
+            .map_err(|error| anyhow::anyhow!(error))?;
+        Ok((names, types, rows))
+    }
+}
+
+/// The first column type of a `JSON_TABLE` spec that is not a type at all.
+fn json_table_type_error(columns: &[JsonTableColumn]) -> Option<String> {
+    for column in columns {
+        let ty = match &column.kind {
+            JsonTableColumnKind::Scalar { column_type, .. }
+            | JsonTableColumnKind::Exists { column_type, .. } => column_type,
+            JsonTableColumnKind::Ordinality => continue,
+        };
+        if !crate::user_types::is_known_type(ty) {
+            return Some(ty.clone());
+        }
+    }
+    None
+}
+
+/// One `JSON_TABLE` column, with its path and defaults evaluated.
+fn table_column(
+    column: &JsonTableColumn,
+    eval: &impl Fn(&crate::ScalarExpr) -> Value,
+) -> JsonTablePlanColumn {
+    use JsonTableColumnKind as Kind;
+    let text = |e: &crate::ScalarExpr| value_text(&eval(e));
+    let default = |e: &Option<crate::ScalarExpr>, behavior: &str| match (behavior, e) {
+        ("default", Some(e)) => eval(e),
+        _ => Value::Null,
+    };
+    match &column.kind {
+        Kind::Ordinality => JsonTablePlanColumn::Ordinality {
+            name: column.name.clone(),
+        },
+        Kind::Exists {
+            column_type,
+            path,
+            on_error,
+        } => JsonTablePlanColumn::Exists {
+            name: column.name.clone(),
+            column_type: column_type.clone(),
+            path: text(path),
+            on_error: on_error.clone(),
+        },
+        Kind::Scalar {
+            column_type,
+            format,
+            path,
+            wrapper,
+            quotes,
+            on_empty,
+            on_empty_default,
+            on_error,
+            on_error_default,
+            ..
+        } => JsonTablePlanColumn::Scalar {
+            name: column.name.clone(),
+            column_type: column_type.clone(),
+            format: *format,
+            path: text(path),
+            wrapper: wrapper.clone(),
+            quotes: quotes.clone(),
+            on_empty: on_empty.clone(),
+            on_empty_default: default(on_empty_default, on_empty),
+            on_error: on_error.clone(),
+            on_error_default: default(on_error_default, on_error),
+        },
+    }
 }
 
 /// `generate_subscripts(array, dim [, reverse])`: the subscripts of the

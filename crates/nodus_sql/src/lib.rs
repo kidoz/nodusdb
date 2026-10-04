@@ -48,8 +48,10 @@ pub fn parse_sql(
         }
     }
     let tokens = reorder_identity_options(reorder_sequence_options(rewrite_data_clauses(
-        rewrite_record_star(rewrite_sql_json(rewrite_json_constructors(
-            rewrite_xml_constructors(rewrite_xml_syntax(rewrite_query_syntax(tokens))),
+        rewrite_record_star(rewrite_json_table(rewrite_sql_json(
+            rewrite_json_constructors(rewrite_xml_constructors(rewrite_xml_syntax(
+                rewrite_query_syntax(tokens),
+            ))),
         ))),
     )));
     Parser::new(&dialect)
@@ -1374,6 +1376,599 @@ fn rewrite_json_constructors(
         i += 1;
     }
     tokens
+}
+
+/// The SQL/JSON `JSON_TABLE(...)` call, which the parser cannot read with
+/// its `COLUMNS` clause, rewritten to the marker function the table-function
+/// planner knows (see `sqljson.rs`):
+/// `pg_catalog.__json_table__(context, path, on-error, vars, column...)`.
+/// Each column becomes `pg_catalog.__jt_col_ordinality__('name')`,
+/// `pg_catalog.__jt_col_exists__('name', 'type', path, on-error)`,
+/// `pg_catalog.__jt_col_scalar__('name', 'type', format, path, wrapper,
+/// quotes, on-empty, on-empty-default, on-error, on-error-default)`.
+fn rewrite_json_table(
+    mut tokens: Vec<sqlparser::tokenizer::TokenWithSpan>,
+) -> Vec<sqlparser::tokenizer::TokenWithSpan> {
+    use sqlparser::tokenizer::{Token, TokenWithSpan};
+    let word = |t: &TokenWithSpan| match &t.token {
+        Token::Word(w) if w.quote_style.is_none() => Some(w.value.clone()),
+        _ => None,
+    };
+    let significant = |tokens: &[TokenWithSpan], from: usize| {
+        (from..tokens.len()).find(|&i| !matches!(tokens[i].token, Token::Whitespace(_)))
+    };
+    let significant_back = |tokens: &[TokenWithSpan], from: usize| {
+        (0..from)
+            .rev()
+            .find(|&i| !matches!(tokens[i].token, Token::Whitespace(_)))
+    };
+    let matching_paren = |tokens: &[TokenWithSpan], open: usize| {
+        let mut depth = 0i32;
+        for (i, token) in tokens.iter().enumerate().skip(open) {
+            match token.token {
+                Token::LParen => depth += 1,
+                Token::RParen => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    };
+    // The ranges of the top-level `,`-separated items of a token range.
+    let split = |tokens: &[TokenWithSpan], from: usize, to: usize| {
+        let mut items = Vec::new();
+        let mut depth = 0i32;
+        let mut start = None;
+        for (i, token) in tokens.iter().enumerate().take(to).skip(from) {
+            match token.token {
+                Token::LParen | Token::LBracket => depth += 1,
+                Token::RParen | Token::RBracket => depth -= 1,
+                Token::Comma if depth == 0 => {
+                    items.push((start.unwrap_or(from), i));
+                    start = None;
+                    continue;
+                }
+                _ => {}
+            }
+            if start.is_none() && !matches!(token.token, Token::Whitespace(_)) {
+                start = Some(i);
+            }
+        }
+        if let Some(start) = start {
+            items.push((start, to));
+        }
+        items
+    };
+    // A `FORMAT JSON [ENCODING name]` clause of the item ending at `to`:
+    // the value expression ends just before it.
+    let format_end = |tokens: &[TokenWithSpan], to: usize| -> Option<usize> {
+        let mut end = to;
+        if let Some(name) = significant_back(tokens, end)
+            && let Some(encoding) = significant_back(tokens, name)
+            && word(&tokens[encoding]).as_deref() == Some("encoding")
+        {
+            end = encoding;
+        }
+        if let Some(last) = significant_back(tokens, end)
+            && word(&tokens[last]).as_deref() == Some("json")
+            && let Some(at) = significant_back(tokens, last)
+            && word(&tokens[at]).as_deref() == Some("format")
+        {
+            return Some(at);
+        }
+        None
+    };
+    let mut i = 0;
+    while i < tokens.len() {
+        if word(&tokens[i]).as_deref() != Some("json_table") {
+            i += 1;
+            continue;
+        }
+        let Some(open) = significant(&tokens, i + 1) else {
+            i += 1;
+            continue;
+        };
+        if tokens[open].token != Token::LParen {
+            i += 1;
+            continue;
+        }
+        let Some(close) = matching_paren(&tokens, open) else {
+            i += 1;
+            continue;
+        };
+        let items = split(&tokens, open + 1, close);
+        if items.len() != 2 {
+            i += 1;
+            continue;
+        }
+        // The context item, with its `FORMAT JSON` clause.
+        let (df, dto) = items[0];
+        let mut doc_end = dto;
+        let mut format = false;
+        if let Some(at) = format_end(&tokens, dto) {
+            format = true;
+            doc_end = at;
+        }
+        let doc = render_tokens(&tokens[df..doc_end]);
+        if doc.trim().is_empty() {
+            i += 1;
+            continue;
+        }
+        // The row path, its `AS` name, the `PASSING` variables, the
+        // `COLUMNS` clause, and the table's `ON ERROR` clause.
+        let (pf, pto) = items[1];
+        let mut at = pf;
+        let mut path_end = pto;
+        while at < pto {
+            if let Some(w) = word(&tokens[at])
+                && matches!(w.as_str(), "as" | "passing" | "columns")
+            {
+                path_end = at;
+                break;
+            }
+            at += 1;
+        }
+        let path = render_tokens(&tokens[pf..path_end]);
+        if path.trim().is_empty() {
+            i += 1;
+            continue;
+        }
+        at = significant(&tokens, path_end).unwrap_or(pto);
+        if word(&tokens[at]).as_deref() == Some("as") {
+            let Some(name) = significant(&tokens, at + 1).filter(|&i| i < pto) else {
+                i += 1;
+                continue;
+            };
+            at = significant(&tokens, name + 1).unwrap_or(pto);
+        }
+        let mut vars = "NULL".to_string();
+        if word(&tokens[at]).as_deref() == Some("passing") {
+            // `<value> AS <name>` pairs run to the `COLUMNS` keyword.
+            let mut end = pto;
+            for (index, token) in tokens.iter().enumerate().take(pto).skip(at + 1) {
+                if word(token).as_deref() == Some("columns") {
+                    end = index;
+                    break;
+                }
+            }
+            let mut parts = vec![format!(
+                "pg_catalog.{}(",
+                crate::SQL_JSON_VARS_MARKER.to_ascii_lowercase()
+            )];
+            let mut ok = true;
+            for (index, (vf, vto)) in split(&tokens, at + 1, end).into_iter().enumerate() {
+                let mut as_at = None;
+                let mut depth = 0i32;
+                for (j, token) in tokens.iter().enumerate().take(vto).skip(vf) {
+                    match token.token {
+                        Token::LParen | Token::LBracket => depth += 1,
+                        Token::RParen | Token::RBracket => depth -= 1,
+                        _ => {}
+                    }
+                    if depth == 0 && word(token).as_deref() == Some("as") {
+                        as_at = Some(j);
+                    }
+                }
+                let Some(as_at) = as_at else {
+                    ok = false;
+                    break;
+                };
+                let value = render_tokens(&tokens[vf..as_at]);
+                let name = render_tokens(&tokens[as_at + 1..vto])
+                    .trim()
+                    .replace('\'', "''");
+                if name.is_empty() {
+                    ok = false;
+                    break;
+                }
+                if index > 0 {
+                    parts.push(", ".to_string());
+                }
+                parts.push(format!("'{name}', {value}"));
+            }
+            parts.push(")".to_string());
+            if !ok {
+                i += 1;
+                continue;
+            }
+            vars = parts.concat();
+            at = significant(&tokens, end).unwrap_or(pto);
+        }
+        if word(&tokens[at]).as_deref() != Some("columns") {
+            i += 1;
+            continue;
+        }
+        let Some(copen) = significant(&tokens, at + 1).filter(|&i| i < pto) else {
+            i += 1;
+            continue;
+        };
+        if tokens[copen].token != Token::LParen {
+            i += 1;
+            continue;
+        }
+        let Some(cclose) = matching_paren(&tokens, copen) else {
+            i += 1;
+            continue;
+        };
+        let Some(columns) = json_table_columns(&tokens, copen + 1, cclose) else {
+            i += 1;
+            continue;
+        };
+        // The table's `{ ERROR | EMPTY [ARRAY] } ON ERROR`.
+        let mut on_error = String::new();
+        let mut end = significant(&tokens, cclose + 1).unwrap_or(pto);
+        if end < pto {
+            let Some((kind, which, _, next)) = json_table_behavior(&tokens, end, pto) else {
+                i += 1;
+                continue;
+            };
+            if which != "error" || !matches!(kind.as_str(), "error" | "empty-array") {
+                i += 1;
+                continue;
+            }
+            on_error = kind;
+            end = next;
+        }
+        if end < pto {
+            // Anything after the table's `ON ERROR` is not a JSON_TABLE.
+            i += 1;
+            continue;
+        }
+        let doc = if format {
+            format!("pg_catalog.__json_format__({doc}, false)")
+        } else {
+            doc
+        };
+        let replacement =
+            format!("pg_catalog.__json_table__({doc}, {path}, '{on_error}', {vars}, {columns})");
+        if let Some(snippet) = snippet_tokens(&replacement) {
+            tokens.splice(i..=close, snippet);
+            // The arguments may hold further JSON_TABLE calls; scan again.
+            i = 0;
+            continue;
+        }
+        i += 1;
+    }
+    tokens
+}
+
+/// The columns of a `JSON_TABLE` call, between `from` and `to`, as the
+/// marker calls the table-function planner reads. `None` when a column is
+/// not one PostgreSQL would take, leaving the call to the parser's error.
+fn json_table_columns(
+    tokens: &[sqlparser::tokenizer::TokenWithSpan],
+    from: usize,
+    to: usize,
+) -> Option<String> {
+    use sqlparser::tokenizer::{Token, TokenWithSpan};
+    let word = |t: &TokenWithSpan| match &t.token {
+        Token::Word(w) if w.quote_style.is_none() => Some(w.value.clone()),
+        _ => None,
+    };
+    let significant = |tokens: &[TokenWithSpan], from: usize| {
+        (from..tokens.len()).find(|&i| !matches!(tokens[i].token, Token::Whitespace(_)))
+    };
+    let split = |tokens: &[TokenWithSpan], from: usize, to: usize| {
+        let mut items = Vec::new();
+        let mut depth = 0i32;
+        let mut start = None;
+        for (i, token) in tokens.iter().enumerate().take(to).skip(from) {
+            match token.token {
+                Token::LParen | Token::LBracket => depth += 1,
+                Token::RParen | Token::RBracket => depth -= 1,
+                Token::Comma if depth == 0 => {
+                    items.push((start.unwrap_or(from), i));
+                    start = None;
+                    continue;
+                }
+                _ => {}
+            }
+            if start.is_none() && !matches!(token.token, Token::Whitespace(_)) {
+                start = Some(i);
+            }
+        }
+        if let Some(start) = start {
+            items.push((start, to));
+        }
+        items
+    };
+    let clause_word = |w: &str| {
+        matches!(
+            w,
+            "path"
+                | "exists"
+                | "format"
+                | "keep"
+                | "omit"
+                | "error"
+                | "null"
+                | "default"
+                | "empty"
+                | "true"
+                | "false"
+                | "unknown"
+                | "with"
+                | "without"
+        )
+    };
+    let mut parts: Vec<String> = Vec::new();
+    for (cf, cto) in split(tokens, from, to) {
+        let mut at = significant(tokens, cf).filter(|&i| i < cto)?;
+        // `name FOR ORDINALITY`.
+        let Token::Word(name) = &tokens[at].token else {
+            return None;
+        };
+        let quoted = name.quote_style.is_some();
+        let column_name = name.value.clone();
+        at = significant(tokens, at + 1).filter(|&i| i < cto)?;
+        if word(&tokens[at]).as_deref() == Some("for") {
+            at = significant(tokens, at + 1).filter(|&i| i < cto)?;
+            if word(&tokens[at]).as_deref() != Some("ordinality") {
+                return None;
+            }
+            at = significant(tokens, at + 1).unwrap_or(cto);
+            if at < cto {
+                return None;
+            }
+            parts.push(format!("pg_catalog.__jt_col_ordinality__('{column_name}')"));
+            continue;
+        }
+        // The column's type runs to the first clause keyword.
+        let type_from = at;
+        while at < cto {
+            if clause_word(&word(&tokens[at]).unwrap_or_default())
+                && !(word(&tokens[at]).as_deref() == Some("with")
+                    && significant(tokens, at + 1)
+                        .is_some_and(|n| word(&tokens[n]).as_deref() == Some("time")))
+            {
+                break;
+            }
+            at += 1;
+        }
+        let column_type = render_tokens(&tokens[type_from..at]).trim().to_string();
+        if column_type.is_empty() {
+            return None;
+        }
+        let escaped_type = column_type.replace('\'', "''");
+        let name_path = if quoted || !column_name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            format!(
+                "'$.\"{}\"'",
+                column_name.replace('\\', "\\\\").replace('"', "\\\"")
+            )
+        } else {
+            format!("'$.{column_name}'")
+        };
+        // `EXISTS [PATH p] [behavior ON ERROR]`.
+        if word(&tokens[at]).as_deref() == Some("exists") {
+            let mut at = significant(tokens, at + 1).unwrap_or(cto);
+            let mut path = name_path;
+            if word(&tokens[at]).as_deref() == Some("path") {
+                at = significant(tokens, at + 1).filter(|&i| i < cto)?;
+                let from = at;
+                while at < cto {
+                    if clause_word(&word(&tokens[at]).unwrap_or_default()) {
+                        break;
+                    }
+                    at += 1;
+                }
+                let text = render_tokens(&tokens[from..at]);
+                if text.trim().is_empty() {
+                    return None;
+                }
+                path = text;
+            }
+            let mut on_error = String::new();
+            let mut at = significant(tokens, at).unwrap_or(cto);
+            if at < cto {
+                let (kind, _, _, next) = json_table_behavior(tokens, at, cto)?;
+                if !matches!(kind.as_str(), "error" | "true" | "false" | "unknown") {
+                    return None;
+                }
+                on_error = kind;
+                at = next;
+            }
+            if at < cto {
+                return None;
+            }
+            parts.push(format!(
+                "pg_catalog.__jt_col_exists__('{column_name}', '{escaped_type}', {path}, \
+                 '{on_error}')"
+            ));
+            continue;
+        }
+        // `[FORMAT JSON [ENCODING name]] [PATH p] [wrapper] [quotes]
+        // [behavior ON EMPTY] [behavior ON ERROR]`.
+        let mut format = "false";
+        let mut encoded = "false";
+        let mut path = name_path;
+        let mut wrapper = String::new();
+        let mut quotes = String::new();
+        let mut on_empty = String::new();
+        let mut on_empty_default = "NULL".to_string();
+        let mut on_error = String::new();
+        let mut on_error_default = "NULL".to_string();
+        // The clauses appear in PostgreSQL's order; one out of place is a
+        // syntax error there, so the call is left to the parser.
+        let mut stage = 0;
+        while let Some(key) = significant(tokens, at).filter(|&i| i < cto) {
+            match word(&tokens[key]).as_deref() {
+                Some("format") if stage <= 1 => {
+                    stage = 2;
+                    let json_at = significant(tokens, key + 1).filter(|&i| i < cto)?;
+                    if word(&tokens[json_at]).as_deref() != Some("json") {
+                        return None;
+                    }
+                    format = "true";
+                    let mut next = significant(tokens, json_at + 1).unwrap_or(cto);
+                    if next < cto && word(&tokens[next]).as_deref() == Some("encoding") {
+                        encoded = "true";
+                        let name = significant(tokens, next + 1).filter(|&i| i < cto)?;
+                        next = significant(tokens, name + 1).unwrap_or(cto);
+                    }
+                    at = next;
+                }
+                Some("path") if stage <= 2 => {
+                    stage = 3;
+                    let from = significant(tokens, key + 1).filter(|&i| i < cto)?;
+                    let mut to = from;
+                    while to < cto {
+                        if clause_word(&word(&tokens[to]).unwrap_or_default()) {
+                            break;
+                        }
+                        to += 1;
+                    }
+                    let text = render_tokens(&tokens[from..to]);
+                    if text.trim().is_empty() {
+                        return None;
+                    }
+                    path = text;
+                    at = to;
+                }
+                Some(kind @ ("with" | "without")) if stage <= 3 => {
+                    stage = 4;
+                    let mut next = significant(tokens, key + 1).filter(|&i| i < cto)?;
+                    let mut conditional = false;
+                    if matches!(
+                        word(&tokens[next]).as_deref(),
+                        Some("conditional" | "unconditional")
+                    ) {
+                        conditional = word(&tokens[next]).as_deref() == Some("conditional");
+                        next = significant(tokens, next + 1).filter(|&i| i < cto)?;
+                    }
+                    if word(&tokens[next]).as_deref() == Some("array") {
+                        next = significant(tokens, next + 1).filter(|&i| i < cto)?;
+                    }
+                    if word(&tokens[next]).as_deref() != Some("wrapper") {
+                        return None;
+                    }
+                    wrapper = if kind == "without" {
+                        "without".to_string()
+                    } else if conditional {
+                        "conditional".to_string()
+                    } else {
+                        "with".to_string()
+                    };
+                    at = significant(tokens, next + 1).unwrap_or(cto);
+                }
+                Some(kind @ ("keep" | "omit")) if stage <= 4 => {
+                    stage = 5;
+                    let quotes_at = significant(tokens, key + 1).filter(|&i| i < cto)?;
+                    if word(&tokens[quotes_at]).as_deref() != Some("quotes") {
+                        return None;
+                    }
+                    let mut next = significant(tokens, quotes_at + 1).unwrap_or(cto);
+                    if next < cto && word(&tokens[next]).as_deref() == Some("on") {
+                        // `ON SCALAR STRING`.
+                        let scalar = significant(tokens, next + 1).filter(|&i| i < cto)?;
+                        if word(&tokens[scalar]).as_deref() != Some("scalar") {
+                            return None;
+                        }
+                        let string = significant(tokens, scalar + 1).filter(|&i| i < cto)?;
+                        if word(&tokens[string]).as_deref() != Some("string") {
+                            return None;
+                        }
+                        next = significant(tokens, string + 1).unwrap_or(cto);
+                    }
+                    quotes = kind.to_string();
+                    at = next;
+                }
+                _ if stage <= 5 => {
+                    let (kind, which, value, next) = json_table_behavior(tokens, key, cto)?;
+                    stage = if which == "empty" { 6 } else { 7 };
+                    if which == "empty" {
+                        on_empty = kind;
+                        if let Some((vf, vto)) = value {
+                            on_empty_default = render_tokens(&tokens[vf..vto]);
+                        }
+                    } else {
+                        on_error = kind;
+                        if let Some((vf, vto)) = value {
+                            on_error_default = render_tokens(&tokens[vf..vto]);
+                        }
+                    }
+                    at = next;
+                }
+                _ => return None,
+            }
+        }
+        parts.push(format!(
+            "pg_catalog.__jt_col_scalar__('{column_name}', '{escaped_type}', {format}, {encoded}, \
+             {path}, '{wrapper}', '{quotes}', '{on_empty}', {on_empty_default}, '{on_error}', \
+             {on_error_default})"
+        ));
+    }
+    Some(parts.join(", "))
+}
+
+/// A behavior clause (`NULL | ERROR | DEFAULT expr | EMPTY [ARRAY|OBJECT] |
+/// TRUE | FALSE | UNKNOWN`) followed by `ON EMPTY|ERROR`: its kind, the case
+/// it handles (`empty` or `error`), the default expression's token range,
+/// and the position after the clause.
+type JsonTableBehavior = (String, String, Option<(usize, usize)>, usize);
+
+fn json_table_behavior(
+    tokens: &[sqlparser::tokenizer::TokenWithSpan],
+    at: usize,
+    to: usize,
+) -> Option<JsonTableBehavior> {
+    use sqlparser::tokenizer::Token;
+    let word = |t: &sqlparser::tokenizer::TokenWithSpan| match &t.token {
+        Token::Word(w) if w.quote_style.is_none() => Some(w.value.clone()),
+        _ => None,
+    };
+    let significant = |tokens: &[sqlparser::tokenizer::TokenWithSpan], from: usize| {
+        (from..tokens.len()).find(|&i| !matches!(tokens[i].token, Token::Whitespace(_)))
+    };
+    let kind = word(&tokens[at])?;
+    let (kind, mut next) = match kind.as_str() {
+        "error" | "null" | "true" | "false" | "unknown" => (kind.clone(), at + 1),
+        "empty" => {
+            let after = significant(tokens, at + 1).filter(|&i| i < to);
+            match after.and_then(|i| word(&tokens[i])).as_deref() {
+                Some(shape @ ("array" | "object")) => {
+                    (format!("empty-{shape}"), significant(tokens, at + 1)? + 1)
+                }
+                _ => ("empty-array".to_string(), at + 1),
+            }
+        }
+        "default" => {
+            let mut depth = 0i32;
+            let mut on_at = None;
+            for (i, token) in tokens.iter().enumerate().take(to).skip(at + 1) {
+                match token.token {
+                    Token::LParen | Token::LBracket => depth += 1,
+                    Token::RParen | Token::RBracket => depth -= 1,
+                    _ => {}
+                }
+                if depth == 0 && word(token).as_deref() == Some("on") {
+                    on_at = Some(i);
+                    break;
+                }
+            }
+            (kind.clone(), on_at?)
+        }
+        _ => return None,
+    };
+    let on = significant(tokens, next).filter(|&i| i < to)?;
+    if word(&tokens[on]).as_deref() != Some("on") {
+        return None;
+    }
+    let which_at = significant(tokens, on + 1).filter(|&i| i < to)?;
+    let which = word(&tokens[which_at])?;
+    if !matches!(which.as_str(), "empty" | "error") {
+        return None;
+    }
+    next = significant(tokens, which_at + 1).unwrap_or(to);
+    let value = if kind == "default" {
+        Some((at + 1, on))
+    } else {
+        None
+    };
+    Some((kind, which, value, next))
 }
 
 /// The call a `PASSING` clause is rewritten to:
@@ -2855,5 +3450,53 @@ mod tests {
             let res = parse_sql(&query);
             prop_assert!(res.is_ok(), "Failed to parse: {}", query);
         }
+    }
+}
+
+#[cfg(test)]
+mod json_table_rewrite_tests {
+    use crate::*;
+
+    /// The SQL a statement is tokenized, rewritten, and rendered as.
+    fn rewritten(sql: &str) -> String {
+        let dialect = sqlparser::dialect::PostgreSqlDialect {};
+        let mut tokens = sqlparser::tokenizer::Tokenizer::new(&dialect, sql)
+            .tokenize_with_location()
+            .expect("tokenize");
+        for token in &mut tokens {
+            if let sqlparser::tokenizer::Token::Word(word) = &mut token.token
+                && word.quote_style.is_none()
+            {
+                word.value.make_ascii_lowercase();
+            }
+        }
+        render_tokens(&rewrite_json_table(tokens))
+    }
+
+    #[test]
+    fn json_table_becomes_its_markers() {
+        assert_eq!(
+            rewritten("select * from json_table('{\"a\":1}', '$' columns (a int))"),
+            "select * from pg_catalog.__json_table__('{\"a\":1}', '$' , '', NULL, \
+             pg_catalog.__jt_col_scalar__('a', 'int', false, false, '$.a', '', '', '', \
+             NULL, '', NULL))"
+        );
+        // A column's clauses reach the marker; the `PASSING` variables become
+        // the `__json_vars__` call the query functions take.
+        let sql = rewritten(
+            "select * from json_table(doc, '$.x[*]' passing 1 as n columns (\
+             ord for ordinality, v int path '$.v' default 0 on empty, \
+             e boolean exists path '$.e'))",
+        );
+        assert!(sql.contains("pg_catalog.__json_vars__('n', 1"), "{sql}");
+        assert!(
+            sql.contains("pg_catalog.__jt_col_ordinality__('ord')"),
+            "{sql}"
+        );
+        assert!(sql.contains("'default',  0 , '', NULL)"), "{sql}");
+        assert!(
+            sql.contains("pg_catalog.__jt_col_exists__('e', 'boolean', '$.e', '')"),
+            "{sql}"
+        );
     }
 }
