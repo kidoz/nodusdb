@@ -1354,3 +1354,77 @@ select json_object('a': to_jsonb(1) returning json);;
 
 statement error
 select json_object('{"a":1}'::jsonb: 1);;
+
+# JSON_ARRAY(SELECT ...): the subquery form, PG 18.4.
+query T
+select json_array(select v from (values (1),(2)) x(v) order by v);;
+----
+[1, 2]
+
+query T
+select json_array(select v from (values (1),(null::int)) x(v) order by v);;
+----
+[1]
+
+query T
+select json_array(select v from (values ('x'),(null::text)) x(v) order by v);;
+----
+["x"]
+
+query T
+select json_array(select v from (values (1)) x(v) where v > 5);;
+----
+NULL
+
+query T
+select json_array(select json_object('a': v) from (values (1),(2)) x(v) order by v);;
+----
+[{"a" : 1}, {"a" : 2}]
+
+query T
+select json_array(select to_jsonb(v) from (values (1),(2)) x(v) order by v format json);;
+----
+[1, 2]
+
+query T
+select json_array(values (1),(2));;
+----
+[1, 2]
+
+query T
+select json_array(with x as (select 1 as a) select a from x);;
+----
+[1]
+
+query T
+select json_array(select v from (values (1),(2)) x(v) order by v returning jsonb);;
+----
+[1, 2]
+
+query T
+select json_array(select v::text from (values (1),(2)) x(v) order by v returning jsonb format json);;
+----
+["1", "2"]
+
+query T
+select json_array(select json_array(select 1));;
+----
+[[1]]
+
+query T
+select json_array((select 1));;
+----
+[1]
+
+query T
+select json_array(select count(*) from (values (1),(2)) x(v));;
+----
+[2]
+
+query T
+select json_array(select v from (values (1),(2)) x(v) order by v desc);;
+----
+[2, 1]
+
+statement error
+select json_array(select v from (values (1)) x(v) absent on null);;

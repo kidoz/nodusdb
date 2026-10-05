@@ -1812,6 +1812,22 @@ fn rewrite_json_constructors(
         }
         value_at
     };
+    // The last top-level `word` of a token range, if any.
+    let last_top = |tokens: &[TokenWithSpan], from: usize, to: usize, wanted: &str| {
+        let mut found = None;
+        let mut depth = 0i32;
+        for (at, token) in tokens.iter().enumerate().take(to).skip(from) {
+            match token.token {
+                Token::LParen | Token::LBracket => depth += 1,
+                Token::RParen | Token::RBracket => depth -= 1,
+                _ => {}
+            }
+            if depth == 0 && word(token).as_deref() == Some(wanted) {
+                found = Some(at);
+            }
+        }
+        found
+    };
     // A trailing `FORMAT JSON [ENCODING name]` clause of the item ending at
     // `to`: the value expression ends just before it, and the flag says
     // whether an `ENCODING` clause was written.
@@ -1871,6 +1887,53 @@ fn rewrite_json_constructors(
             i += 1;
             continue;
         };
+        // `json_array(SELECT ...)`: the subquery form, which PostgreSQL
+        // reads as the array aggregate over the subquery's one column
+        // (`json_arrayagg` with `ABSENT ON NULL`).
+        if name == "json_array"
+            && let Some(first) = significant(&tokens, open + 1).filter(|&at| at < close)
+            && matches!(
+                word(&tokens[first]).as_deref(),
+                Some("select" | "with" | "values")
+            )
+        {
+            let mut end = close;
+            let mut returning = String::new();
+            if let Some(at) = last_top(&tokens, first, end, "returning") {
+                // The type ends before a trailing `FORMAT JSON`, as
+                // PostgreSQL reads the clause.
+                let type_end = format_end(&tokens, end).map_or(end, |(at, _)| at);
+                returning = render_tokens(&tokens[at + 1..type_end]).trim().to_string();
+                end = at;
+            }
+            let mut format = None;
+            if let Some((at, encoding)) = format_end(&tokens, end) {
+                format = Some(encoding);
+                end = at;
+            }
+            let query = render_tokens(&tokens[first..end]);
+            if query.trim().is_empty() {
+                i += 1;
+                continue;
+            }
+            let element = match format {
+                Some(encoding) => format!("pg_catalog.__json_format__(q.a, {encoding})"),
+                None => "q.a".to_string(),
+            };
+            let returning = returning.replace('\'', "''");
+            let replacement = format!(
+                "(select pg_catalog.__json_array_query__({element}, true, '{returning}') \
+                 from ({query}) as q(a))"
+            );
+            if let Some(snippet) = snippet_tokens(&replacement) {
+                tokens.splice(i..=close, snippet);
+                // The subquery may hold further constructors; scan again.
+                i = 0;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
         // `DISTINCT` is a syntax error in PostgreSQL for these functions;
         // leave it to the parser.
         if significant(&tokens, open + 1)
@@ -4216,6 +4279,22 @@ mod rewrite_tests {
 
     fn xmltable_rewritten(sql: &str) -> String {
         rewritten_by(sql, rewrite_xmltable)
+    }
+
+    #[test]
+    fn json_array_query_becomes_its_aggregate() {
+        // `json_array(SELECT ...)` is the array aggregate over the
+        // subquery's one column, with `ABSENT ON NULL` and the clauses.
+        let constructors = |sql: &str| rewritten_by(sql, rewrite_json_constructors);
+        assert_eq!(
+            constructors("select json_array(select a from t order by a)"),
+            "select (select pg_catalog.__json_array_query__(q.a, true, '') from \
+             (select a from t order by a) as q(a))"
+        );
+        assert!(
+            constructors("select json_array(select a from t format json returning jsonb)")
+                .contains("pg_catalog.__json_format__(q.a, false), true, 'jsonb'")
+        );
     }
 
     #[test]

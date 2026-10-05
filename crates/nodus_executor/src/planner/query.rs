@@ -2246,6 +2246,7 @@ fn figure_colname(expr: &sqlparser::ast::Expr) -> Option<String> {
                     "__json_array__" => return Some("json_array".to_string()),
                     "__json_object__" => return Some("json_object".to_string()),
                     "__json_arrayagg__" => return Some("json_arrayagg".to_string()),
+                    "__json_array_query__" => return Some("json_array".to_string()),
                     "__json_objectagg__" => return Some("json_objectagg".to_string()),
                     "__json_format__" => return None,
                     "__xmlexists__" => return Some("xmlexists".to_string()),
