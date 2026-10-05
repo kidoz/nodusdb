@@ -248,7 +248,8 @@ impl MemExecutor {
                             (&joined, names),
                         )?;
                         let new_row = crate::dml::table_row(&holder, &tbl, stored, &row);
-                        self.replace_row(ctx, &holder, key, stored, &new_row)?;
+                        // A partition key change may move the row.
+                        self.relocate_partition_row(ctx, &tbl, &holder, key, stored, &new_row)?;
                         if referenced.iter().any(|r| r.id == holder.id) {
                             changed
                                 .entry(holder.id)

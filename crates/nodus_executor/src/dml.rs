@@ -483,6 +483,9 @@ impl MemExecutor {
         // reference the table.
         let referenced = on_conflict.is_some() && self.is_referenced(&tbl)?;
         let mut changed = Vec::new();
+        // The tables rows were written into (a partitioned target's rows
+        // live in its partitions).
+        let mut insert_tables: Vec<nodus_catalog::TableDescriptor> = Vec::new();
 
         for (row_idx, values) in values_list.iter().enumerate() {
             if values.len() > targets.len() {
@@ -582,6 +585,13 @@ impl MemExecutor {
             crate::eval_error::check()?;
             Self::compute_generated(&tbl, &mut row, &col_names);
             self.check_not_null(&tbl, &row)?;
+            // A partitioned target routes the row to the partition holding
+            // its key; a partition refuses a row outside its bound.
+            let tbl = self.route_row("default", &tbl, &row)?;
+            self.check_partition_constraint("default", &tbl, &row)?;
+            if !insert_tables.iter().any(|t| t.id == tbl.id) {
+                insert_tables.push(tbl.clone());
+            }
 
             if let Some(clause) = &on_conflict
                 && let Some((existing_key, existing_row)) =
@@ -686,7 +696,12 @@ impl MemExecutor {
                 returning_rows.push(row);
             }
         }
-        self.enforce_references(ctx, &tbl, &[], &changed)?;
+        if insert_tables.is_empty() {
+            insert_tables.push(tbl.clone());
+        }
+        for table in &insert_tables {
+            self.enforce_references(ctx, table, &[], &changed)?;
+        }
         Ok(scope.returning_output(
             self,
             ctx,
@@ -778,7 +793,15 @@ impl MemExecutor {
                 self.apply_assignments(ctx, &tbl, &assignments, &old_row, (&joined, &scope.names))?;
             // The statement's columns map back onto the row's own table.
             let new_row = table_row(&target.table, &tbl, &target.row, &row);
-            self.replace_row(ctx, &target.table, &target.key, &target.row, &new_row)?;
+            // A partition key change may move the row to another partition.
+            self.relocate_partition_row(
+                ctx,
+                &tbl,
+                &target.table,
+                &target.key,
+                &target.row,
+                &new_row,
+            )?;
             updated += 1;
             if referenced.iter().any(|t| t.id == target.table.id) {
                 changed
@@ -1317,6 +1340,62 @@ impl MemExecutor {
     /// Replaces the stored row at `old_key` with `row`: re-checks uniqueness
     /// (excluding the row itself) and table constraints, moves the row when its
     /// key changes, and maintains every index. Returns the row's new key.
+    /// Writes a row into `table` as an INSERT would: NOT NULL, uniqueness,
+    /// and CHECK constraints, then the row and its index entries.
+    pub(crate) fn insert_row_checked(
+        &self,
+        ctx: &ExecutionContext,
+        table: &nodus_catalog::TableDescriptor,
+        row: &[Value],
+    ) -> Result<()> {
+        self.check_not_null(table, row)?;
+        self.check_unique_constraints(ctx, table, row, None)?;
+        let col_names: Vec<String> = table.columns.iter().map(|c| c.name.clone()).collect();
+        self.check_table_constraints(ctx, table, row, None, &col_names)?;
+        let pk = if Self::uses_synthetic_rowid(table) {
+            synthetic_rowid()
+        } else {
+            Self::row_pk(&Self::pk_positions(table), row)
+        };
+        let key = format!("{}:{}", table.id, pk);
+        self.write_row(&ctx.session_id, key, crate::value::encode_row(row)?)?;
+        for idx in &table.indexes {
+            if let Some(index_val) = Self::index_leading_value(table, idx, row) {
+                self.write_index_entry(&ctx.session_id, idx.id, &index_val, &pk)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Replaces a row whose table belongs to a partition hierarchy, as the
+    /// statement's own relation decides: an update through a partitioned
+    /// relation routes the new row (which may move it to another partition,
+    /// or fail when no partition claims it), while one through a partition
+    /// enforces that partition's constraint where the row stays.
+    pub(crate) fn relocate_partition_row(
+        &self,
+        ctx: &ExecutionContext,
+        statement_target: &nodus_catalog::TableDescriptor,
+        table: &nodus_catalog::TableDescriptor,
+        old_key: &str,
+        old_row: &[Value],
+        new_row: &[Value],
+    ) -> Result<()> {
+        if statement_target.partition_by.is_none() {
+            self.check_partition_constraint("default", table, new_row)?;
+            self.replace_row(ctx, table, old_key, old_row, new_row)?;
+            return Ok(());
+        }
+        let destination = self.route_row("default", statement_target, new_row)?;
+        self.check_partition_constraint("default", &destination, new_row)?;
+        if destination.id == table.id {
+            self.replace_row(ctx, table, old_key, old_row, new_row)?;
+            return Ok(());
+        }
+        self.remove_row(ctx, table, old_key, old_row)?;
+        self.insert_row_checked(ctx, &destination, new_row)
+    }
+
     pub(crate) fn replace_row(
         &self,
         ctx: &ExecutionContext,

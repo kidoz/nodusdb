@@ -104,6 +104,14 @@ pub struct TableDescriptor {
     /// Defaulted so older descriptors decode.
     #[serde(default)]
     pub parents: Vec<TableId>,
+    /// A partitioned table's `PARTITION BY`, as canonical text
+    /// (`RANGE (id)`). Defaulted so older descriptors decode.
+    #[serde(default)]
+    pub partition_by: Option<String>,
+    /// A partition's bound, as canonical text (`FOR VALUES FROM (1) TO
+    /// (10)`, or `DEFAULT`). Defaulted so older descriptors decode.
+    #[serde(default)]
+    pub partition_bound: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -228,6 +236,11 @@ pub struct IndexDescriptor {
     pub key_columns: Vec<IndexColumn>,
     pub include_columns: Vec<ColumnId>,
     pub unique: bool,
+    /// Whether the index backs a PRIMARY KEY / UNIQUE *constraint* rather
+    /// than a `CREATE [UNIQUE] INDEX` (a partition's copy of a constraint's
+    /// index is named for the constraint, not for its columns).
+    #[serde(default)]
+    pub constraint: bool,
     pub global: bool,
     pub predicate: Option<Expression>,
     pub expressions: Vec<Expression>,

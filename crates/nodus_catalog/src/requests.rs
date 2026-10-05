@@ -4,9 +4,9 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone)]
 pub enum ObjectDescriptor {
-    Database(DatabaseDescriptor),
-    Schema(SchemaDescriptor),
-    Table(TableDescriptor),
+    Database(Box<DatabaseDescriptor>),
+    Schema(Box<SchemaDescriptor>),
+    Table(Box<TableDescriptor>),
 }
 
 // API Traits
@@ -50,6 +50,12 @@ pub struct CreateTableRequest {
     /// The tables the new one inherits from (`INHERITS`).
     #[serde(default)]
     pub parents: Vec<TableId>,
+    /// A partitioned table's `PARTITION BY`, as canonical text.
+    #[serde(default)]
+    pub partition_by: Option<String>,
+    /// A partition's bound, as canonical text.
+    #[serde(default)]
+    pub partition_bound: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -141,6 +147,12 @@ pub enum TableDescriptorChange {
     SetParents {
         table_id: TableId,
         parents: Vec<TableId>,
+    },
+    /// Replaces the table's partition bound (`ATTACH` / `DETACH
+    /// PARTITION`).
+    SetPartitionBound {
+        table_id: TableId,
+        bound: Option<String>,
     },
 }
 

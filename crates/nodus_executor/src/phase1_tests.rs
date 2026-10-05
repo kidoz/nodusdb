@@ -47,6 +47,9 @@ fn test_offset_distinct_returning() {
             constraints: vec![],
             name: "t".into(),
             columns: cols(&[("id", "int"), ("val", "text")]),
+            partition_by: None,
+            partition_of: None,
+            for_values: None,
         },
     )
     .unwrap();

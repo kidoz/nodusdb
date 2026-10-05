@@ -74,6 +74,9 @@ fn create_role_and_grant_require_grant_management() {
             constraints: vec![],
             name: "t".into(),
             columns: cols(&[("id", "INT")]),
+            partition_by: None,
+            partition_of: None,
+            for_values: None,
         },
     )
     .unwrap();
@@ -157,6 +160,9 @@ fn create_table_denied_then_allowed_by_grant() {
         constraints: vec![],
         name: "t1".into(),
         columns: cols(&[("id", "INT"), ("name", "TEXT")]),
+        partition_by: None,
+        partition_of: None,
+        for_values: None,
     };
 
     assert!(exec.execute_logical(&ctx, plan()).is_err());
@@ -216,6 +222,9 @@ fn create_insert_select_round_trip() {
             constraints: vec![],
             name: "books".into(),
             columns: cols(&[("id", "INT"), ("title", "TEXT"), ("author", "TEXT")]),
+            partition_by: None,
+            partition_of: None,
+            for_values: None,
         },
     )
     .unwrap();
@@ -403,6 +412,9 @@ fn rows_keyed_by_declared_pk_not_first_column() {
             constraints: vec![],
             name: "t".into(),
             columns,
+            partition_by: None,
+            partition_of: None,
+            for_values: None,
         },
     )
     .unwrap();
@@ -526,6 +538,9 @@ fn typed_values_round_trip_and_filter_by_int() {
             constraints: vec![],
             name: "items".into(),
             columns: cols(&[("id", "INT"), ("name", "TEXT"), ("active", "BOOL")]),
+            partition_by: None,
+            partition_of: None,
+            for_values: None,
         },
     )
     .unwrap();
@@ -615,6 +630,9 @@ fn update_and_delete_rows() {
             constraints: vec![],
             name: "t".into(),
             columns: cols(&[("id", "INT"), ("name", "TEXT")]),
+            partition_by: None,
+            partition_of: None,
+            for_values: None,
         },
     )
     .unwrap();
@@ -740,6 +758,9 @@ fn test_join_execution() {
             constraints: vec![],
             name: "authors".into(),
             columns: cols(&[("id", "INT"), ("name", "TEXT")]),
+            partition_by: None,
+            partition_of: None,
+            for_values: None,
         },
     )
     .unwrap();
@@ -757,6 +778,9 @@ fn test_join_execution() {
             constraints: vec![],
             name: "books".into(),
             columns: cols(&[("id", "INT"), ("title", "TEXT"), ("author_id", "INT")]),
+            partition_by: None,
+            partition_of: None,
+            for_values: None,
         },
     )
     .unwrap();
@@ -904,6 +928,9 @@ fn transactions_are_isolated_per_session() {
             constraints: vec![],
             name: "t".into(),
             columns: cols(&[("id", "INT"), ("name", "TEXT")]),
+            partition_by: None,
+            partition_of: None,
+            for_values: None,
         },
     )
     .unwrap();
@@ -1043,6 +1070,9 @@ fn test_complex_filters() {
             constraints: vec![],
             name: "t".into(),
             columns: cols(&[("id", "int"), ("name", "text"), ("status", "text")]),
+            partition_by: None,
+            partition_of: None,
+            for_values: None,
         },
     )
     .unwrap();
@@ -1127,6 +1157,9 @@ fn test_left_outer_join() {
             constraints: vec![],
             name: "users".into(),
             columns: cols(&[("id", "int"), ("name", "text")]),
+            partition_by: None,
+            partition_of: None,
+            for_values: None,
         },
     )
     .unwrap();
@@ -1143,6 +1176,9 @@ fn test_left_outer_join() {
             constraints: vec![],
             name: "orders".into(),
             columns: cols(&[("id", "int"), ("user_id", "int"), ("amount", "int")]),
+            partition_by: None,
+            partition_of: None,
+            for_values: None,
         },
     )
     .unwrap();

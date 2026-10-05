@@ -1316,6 +1316,19 @@ pub enum AlterTableOp {
         parent: String,
         attach: bool,
     },
+    /// `ALTER TABLE parent ATTACH PARTITION child ...`, written as the
+    /// marker call the parser lacks.
+    AttachPartition {
+        parent: String,
+        partition: String,
+        /// The bound text (or `DEFAULT`).
+        bound: String,
+    },
+    /// `ALTER TABLE parent DETACH PARTITION child`.
+    DetachPartition {
+        parent: String,
+        partition: String,
+    },
 }
 
 /// A constraint `ALTER TABLE ... ADD` creates.
@@ -1396,6 +1409,18 @@ pub enum LogicalPlan {
         /// `INHERITS (parents)`, as written. Defaulted so older plans decode.
         #[serde(default)]
         inherits: Vec<String>,
+        /// `PARTITION BY RANGE|LIST|HASH (columns)`, as canonical text.
+        /// Defaulted so older plans decode.
+        #[serde(default)]
+        partition_by: Option<String>,
+        /// `PARTITION OF parent`, as written.
+        #[serde(default)]
+        partition_of: Option<String>,
+        /// The partition's bound, as canonical text (`FOR VALUES FROM (1)
+        /// TO (10)`, `FOR VALUES IN ('a')`, `FOR VALUES WITH (modulus 4,
+        /// remainder 0)`, or `DEFAULT`).
+        #[serde(default)]
+        for_values: Option<String>,
     },
     /// `DROP TABLE names` or, with `materialized`, `DROP MATERIALIZED
     /// VIEW names`; with `cascade`, the objects depending on them go too.

@@ -49,6 +49,9 @@ fn test_group_by_aggregates() {
             constraints: vec![],
             name: "sales".into(),
             columns: cols(&[("id", "int"), ("category", "text"), ("amount", "int")]),
+            partition_by: None,
+            partition_of: None,
+            for_values: None,
         },
     )
     .unwrap();
@@ -278,6 +281,9 @@ fn test_set_operations() {
                 constraints: vec![],
                 name: t.into(),
                 columns: cols(&[("id", "int"), ("n", "int")]),
+                partition_by: None,
+                partition_of: None,
+                for_values: None,
             },
         )
         .unwrap();
@@ -376,6 +382,9 @@ fn test_cross_join() {
                 constraints: vec![],
                 name: t.into(),
                 columns: cols(&[("id", "int"), (col, "text")]),
+                partition_by: None,
+                partition_of: None,
+                for_values: None,
             },
         )
         .unwrap();
@@ -443,6 +452,9 @@ fn test_having() {
             constraints: vec![],
             name: "sales".into(),
             columns: cols(&[("id", "int"), ("category", "text"), ("amount", "int")]),
+            partition_by: None,
+            partition_of: None,
+            for_values: None,
         },
     )
     .unwrap();
@@ -536,6 +548,9 @@ fn test_window_functions() {
             constraints: vec![],
             name: "emp".into(),
             columns: cols(&[("id", "int"), ("amount", "int")]),
+            partition_by: None,
+            partition_of: None,
+            for_values: None,
         },
     )
     .unwrap();

@@ -343,6 +343,13 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                     .iter()
                     .map(|name| name.to_string())
                     .collect(),
+                partition_by: partition_by_text(create_table)?,
+                partition_of: create_table.partition_of.as_ref().map(|n| n.to_string()),
+                for_values: create_table
+                    .for_values
+                    .as_ref()
+                    .map(for_values_text)
+                    .transpose()?,
                 like: match &create_table.like {
                     Some(
                         sqlparser::ast::CreateTableLikeKind::Parenthesized(like)
@@ -825,6 +832,47 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                     only: false,
                 }),
                 _ => anyhow::bail!("malformed INHERIT"),
+            }
+        }
+        Statement::Query(query)
+            if rewritten_call(query, nodus_sql::ATTACH_PARTITION_FUNCTION).is_some() =>
+        {
+            match rewritten_call(query, nodus_sql::ATTACH_PARTITION_FUNCTION).as_deref() {
+                Some(
+                    [
+                        crate::Value::Text(parent),
+                        crate::Value::Text(partition),
+                        crate::Value::Text(bound),
+                    ],
+                ) => Ok(LogicalPlan::AlterTable {
+                    table_name: parent.clone(),
+                    operations: vec![AlterTableOp::AttachPartition {
+                        parent: parent.clone(),
+                        partition: partition.clone(),
+                        bound: bound.clone(),
+                    }],
+                    if_exists: false,
+                    only: false,
+                }),
+                _ => anyhow::bail!("malformed ATTACH PARTITION"),
+            }
+        }
+        Statement::Query(query)
+            if rewritten_call(query, nodus_sql::DETACH_PARTITION_FUNCTION).is_some() =>
+        {
+            match rewritten_call(query, nodus_sql::DETACH_PARTITION_FUNCTION).as_deref() {
+                Some([crate::Value::Text(parent), crate::Value::Text(partition)]) => {
+                    Ok(LogicalPlan::AlterTable {
+                        table_name: parent.clone(),
+                        operations: vec![AlterTableOp::DetachPartition {
+                            parent: parent.clone(),
+                            partition: partition.clone(),
+                        }],
+                        if_exists: false,
+                        only: false,
+                    })
+                }
+                _ => anyhow::bail!("malformed DETACH PARTITION"),
             }
         }
         Statement::Query(query)
@@ -1410,6 +1458,65 @@ fn explain_options(
         }
     }
     Ok(out)
+}
+
+/// `PARTITION BY RANGE|LIST|HASH (columns)`, as canonical text. The parser
+/// hands the clause over as the call `RANGE (id)`.
+fn partition_by_text(create_table: &sqlparser::ast::CreateTable) -> Result<Option<String>> {
+    let Some(expr) = &create_table.partition_by else {
+        return Ok(None);
+    };
+    let sqlparser::ast::Expr::Function(function) = &**expr else {
+        anyhow::bail!("Unsupported PARTITION BY clause: {expr}");
+    };
+    let strategy = match function.name.to_string().to_ascii_uppercase().as_str() {
+        "RANGE" => "RANGE",
+        "LIST" => "LIST",
+        "HASH" => "HASH",
+        other => anyhow::bail!("unsupported partition strategy: {other}"),
+    };
+    let sqlparser::ast::FunctionArguments::List(list) = &function.args else {
+        anyhow::bail!("Unsupported PARTITION BY clause: {expr}");
+    };
+    let mut columns = Vec::new();
+    for arg in &list.args {
+        match arg {
+            sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+                sqlparser::ast::Expr::Identifier(ident),
+            )) => columns.push(ident.value.clone()),
+            other => anyhow::bail!("partition by expressions are not supported: {other}"),
+        }
+    }
+    Ok(Some(format!("{strategy} ({})", columns.join(", "))))
+}
+
+/// A partition's bound, as PostgreSQL renders it.
+fn for_values_text(for_values: &sqlparser::ast::ForValues) -> Result<String> {
+    use sqlparser::ast::{ForValues, PartitionBoundValue};
+    let value = |v: &PartitionBoundValue| match v {
+        PartitionBoundValue::Expr(expr) => expr.to_string(),
+        PartitionBoundValue::MinValue => "MINVALUE".to_string(),
+        PartitionBoundValue::MaxValue => "MAXVALUE".to_string(),
+    };
+    let list =
+        |values: &[PartitionBoundValue]| values.iter().map(value).collect::<Vec<_>>().join(", ");
+    Ok(match for_values {
+        ForValues::In(values) => format!(
+            "FOR VALUES IN ({})",
+            values
+                .iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        ForValues::From { from, to } => {
+            format!("FOR VALUES FROM ({}) TO ({})", list(from), list(to))
+        }
+        ForValues::With { modulus, remainder } => {
+            format!("FOR VALUES WITH (modulus {modulus}, remainder {remainder})")
+        }
+        ForValues::Default => "DEFAULT".to_string(),
+    })
 }
 
 /// Whether `WITH [NO] DATA` said `NO DATA`; the SQL front end records it as

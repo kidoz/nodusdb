@@ -167,6 +167,11 @@ impl MemExecutor {
                 sequence,
                 identity,
             } => {
+                // A partition's columns belong to its parent (an operation
+                // the parent propagates reaches the partition as `propagated`).
+                if !propagated && tbl.partition_bound.is_some() {
+                    anyhow::bail!("cannot add column to a partition");
+                }
                 // A `serial` or identity column's sequence comes first; its
                 // values fill the rows already there.
                 let default = match sequence {
@@ -316,6 +321,22 @@ impl MemExecutor {
                 }
             }
             AlterTableOp::OwnerTo => Ok(()),
+            AlterTableOp::AttachPartition {
+                parent,
+                partition,
+                bound,
+            } => {
+                if propagated {
+                    return Ok(());
+                }
+                self.attach_partition(ctx, tbl, &parent, &partition, &bound)
+            }
+            AlterTableOp::DetachPartition { parent, partition } => {
+                if propagated {
+                    return Ok(());
+                }
+                self.detach_partition(ctx, tbl, &parent, &partition)
+            }
             AlterTableOp::Inherit { parent, attach } => {
                 // A link belongs to the table the statement names.
                 if propagated {
@@ -358,6 +379,159 @@ impl MemExecutor {
                 }
             }
         }
+    }
+
+    /// `ALTER TABLE parent ATTACH PARTITION child FOR VALUES ...`: the child
+    /// takes the parent's columns' shape, keeps every row inside the bound,
+    /// and becomes a partition of the parent.
+    fn attach_partition(
+        &self,
+        ctx: &ExecutionContext,
+        parent: &TableDescriptor,
+        _parent_name: &str,
+        partition: &str,
+        bound_text: &str,
+    ) -> Result<()> {
+        let Some(key_text) = parent.partition_by.clone() else {
+            anyhow::bail!(
+                DbError::new(format!(
+                    "ALTER action ATTACH PARTITION cannot be performed on relation \"{}\"",
+                    parent.name
+                ))
+                .detail("This operation is not supported for tables.")
+                .into_text()
+            );
+        };
+        if bound_text.trim().is_empty() {
+            anyhow::bail!("partition bound specification is missing");
+        }
+        let (db_name, schema_name, partition_only) = parse_object_name(partition)?;
+        let child = self
+            .catalog_reader
+            .get_table(db_name, schema_name, partition_only)?;
+        if !child.parents.is_empty() {
+            anyhow::bail!("\"{}\" is already a partition", child.name);
+        }
+        // The two are both temporary or both not.
+        let parent_temp = crate::search_path::is_temp_schema(&self.schema_name_of(parent));
+        let child_temp = crate::search_path::is_temp_schema(&self.schema_name_of(&child));
+        if child_temp && !parent_temp {
+            anyhow::bail!(
+                "cannot attach a temporary relation as partition of permanent relation \"{}\"",
+                parent.name
+            );
+        }
+        if !child_temp && parent_temp {
+            anyhow::bail!(
+                "cannot attach a permanent relation as partition of temporary relation \"{}\"",
+                parent.name
+            );
+        }
+        // The child must have the parent's columns, in shape and NOT NULL.
+        for column in &parent.columns {
+            match child.columns.iter().find(|c| c.name == column.name) {
+                None => anyhow::bail!("child table is missing column \"{}\"", column.name),
+                Some(c) if c.data_type != column.data_type => anyhow::bail!(
+                    "child table \"{}\" has different type for column \"{}\"",
+                    child.name,
+                    column.name
+                ),
+                Some(c) if !column.nullable && c.nullable => anyhow::bail!(
+                    "column \"{}\" in child table \"{}\" must be marked NOT NULL",
+                    column.name,
+                    child.name
+                ),
+                Some(_) => {}
+            }
+        }
+        if let Some(extra) = child
+            .columns
+            .iter()
+            .find(|c| !parent.columns.iter().any(|p| p.name == c.name))
+        {
+            anyhow::bail!(
+                DbError::new(format!(
+                    "table \"{}\" contains column \"{}\" not found in parent \"{}\"",
+                    child.name, extra.name, parent.name
+                ))
+                .detail("The new partition may contain only the columns present in parent.")
+                .into_text()
+            );
+        }
+        let key = crate::partitioning::PartitionKey::parse(&key_text)?;
+        let types = crate::partitioning::key_types(parent, &key);
+        let bound = crate::partitioning::parse_bound(bound_text, &key, &types)?;
+        self.check_partition_bound(
+            ctx,
+            parent,
+            &key,
+            &types,
+            &bound,
+            &child.name,
+            Some(child.id),
+        )?;
+        // Every row the child holds must fall inside its new bound.
+        for (_key, row) in self.scan_rows_keyed(child.id, &ctx.session_id)? {
+            let values = crate::partitioning::key_values(parent, &key, &row)?;
+            if !crate::partitioning::contains(&bound, &values, &types) {
+                anyhow::bail!(
+                    "partition constraint of relation \"{}\" is violated by some row",
+                    child.name
+                );
+            }
+        }
+        self.change(TableDescriptorChange::SetParents {
+            table_id: child.id,
+            parents: vec![parent.id],
+        })?;
+        self.change(TableDescriptorChange::SetPartitionBound {
+            table_id: child.id,
+            bound: Some(crate::partitioning::render_bound(&bound)),
+        })?;
+        self.create_partition_indexes(&child, parent)?;
+        Ok(())
+    }
+
+    /// `ALTER TABLE parent DETACH PARTITION child`: the child keeps its rows
+    /// and its indexes and stops being a partition.
+    fn detach_partition(
+        &self,
+        ctx: &ExecutionContext,
+        parent: &TableDescriptor,
+        _parent_name: &str,
+        partition: &str,
+    ) -> Result<()> {
+        if parent.partition_by.is_none() {
+            anyhow::bail!(
+                DbError::new(format!(
+                    "ALTER action DETACH PARTITION cannot be performed on relation \"{}\"",
+                    parent.name
+                ))
+                .detail("This operation is not supported for tables.")
+                .into_text()
+            );
+        }
+        let (db_name, schema_name, partition_only) = parse_object_name(partition)?;
+        let child = self
+            .catalog_reader
+            .get_table(db_name, schema_name, partition_only)?;
+        if !child.parents.contains(&parent.id) {
+            anyhow::bail!(
+                "relation \"{}\" is not a partition of relation \"{}\"",
+                child.name,
+                parent.name
+            );
+        }
+        let _ = ctx;
+        self.change(TableDescriptorChange::SetParents {
+            table_id: child.id,
+            parents: Vec::new(),
+        })?;
+        self.change(TableDescriptorChange::SetPartitionBound {
+            table_id: child.id,
+            bound: None,
+        })?;
+        Ok(())
     }
 
     fn change(&self, change: TableDescriptorChange) -> Result<()> {
@@ -1017,7 +1191,7 @@ impl MemExecutor {
                 if self.relation_name_taken(&name)? {
                     anyhow::bail!("relation \"{name}\" already exists");
                 }
-                let index = Self::new_index(tbl, name, IndexType::Unique, &columns, None)?;
+                let index = Self::new_index(tbl, name, IndexType::Unique, &columns, None, true)?;
                 self.add_index(ctx, tbl, index)
             }
             NewConstraint::PrimaryKey { name, columns } => {
@@ -1046,7 +1220,8 @@ impl MemExecutor {
                         return Err(self.contains_nulls(tbl, &tbl.columns[p].name));
                     }
                 }
-                let key = Self::new_index(tbl, name.clone(), IndexType::Unique, &columns, None)?;
+                let key =
+                    Self::new_index(tbl, name.clone(), IndexType::Unique, &columns, None, true)?;
                 self.check_unique_key(ctx, tbl, &key, None)?;
                 for &p in &positions {
                     if tbl.columns[p].nullable {
@@ -1064,6 +1239,7 @@ impl MemExecutor {
                         IndexType::Primary,
                         std::slice::from_ref(column),
                         None,
+                        true,
                     )?;
                     self.install_index(ctx, tbl, index)?;
                 }

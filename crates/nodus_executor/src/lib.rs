@@ -47,6 +47,7 @@ mod multiranges;
 mod net;
 pub mod numeric;
 mod parameters;
+mod partitioning;
 mod pg_catalog;
 mod pg_regex;
 mod plan_types;

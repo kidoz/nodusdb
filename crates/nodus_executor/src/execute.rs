@@ -58,6 +58,9 @@ impl MemExecutor {
                 on_commit,
                 like,
                 inherits,
+                partition_by,
+                partition_of,
+                for_values,
             } => {
                 let mut copied = Vec::new();
                 for (source, defaults) in &like {
@@ -73,6 +76,11 @@ impl MemExecutor {
                     (unique_constraints, key_names),
                     None,
                     inherits.clone(),
+                    (
+                        partition_by.clone(),
+                        partition_of.clone(),
+                        for_values.clone(),
+                    ),
                 )?;
                 if let Some(action) = on_commit {
                     self.note_on_commit(ctx, name, action);

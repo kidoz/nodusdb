@@ -700,24 +700,39 @@ impl MemExecutor {
             self.descendants(db_name, tbl.id)?
         };
         if !descendant_tables.is_empty() {
+            // A partitioned table holds no rows of its own: PostgreSQL's
+            // Append lists only its partitions, each scan aliased after the
+            // query's name for the parent (`p_1`, `p_2`, ...).
+            let partitioned = tbl.partition_by.is_some();
+            let parent_alias = relation_name(table_alias.unwrap_or(table_only));
             let mut children = Vec::new();
             let mut child_rows = 0.0;
             let mut child_pages = 0.0;
-            for (at, table) in std::iter::once(tbl.clone())
+            let tables: Vec<_> = std::iter::once(tbl.clone())
                 .chain(descendant_tables)
-                .enumerate()
-            {
+                .collect();
+            for (at, table) in tables.iter().enumerate() {
+                if partitioned && at == 0 {
+                    continue;
+                }
+                let alias = if partitioned {
+                    format!("{parent_alias}_{at}")
+                } else {
+                    table.name.clone()
+                };
                 let table_rows = self.scan_rows(table.id, &ctx.session_id)?.len() as f64;
                 let table_width: u32 = table.columns.iter().map(|c| type_width(&c.data_type)).sum();
                 let pages = (table_rows * table_width as f64 / 8192.0).ceil().max(1.0);
                 let headline = if at == 0 {
                     format!("Seq Scan on {label}")
+                } else if partitioned {
+                    format!("Seq Scan on {} {alias}", relation_name(&table.name))
                 } else {
                     format!("Seq Scan on {}", relation_name(&table.name))
                 };
                 let mut child = Node::new("Seq Scan", headline, table_rows, table_width)
                     .prop("Relation Name", json!(table.name))
-                    .prop("Alias", json!(table.name));
+                    .prop("Alias", json!(alias));
                 child.startup = 0.0;
                 child.total = pages * PAGE + table_rows * CPU_TUPLE;
                 children.push(child);

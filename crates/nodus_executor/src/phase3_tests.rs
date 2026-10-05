@@ -77,6 +77,9 @@ fn test_ddl_and_subqueries() {
                     sequence: None,
                 },
             ],
+            partition_by: None,
+            partition_of: None,
+            for_values: None,
         },
     )
     .unwrap();
@@ -180,6 +183,9 @@ fn test_ddl_and_subqueries() {
             constraints: vec![],
             name: "departments".into(),
             columns: cols(&[("id", "int"), ("name", "text")]),
+            partition_by: None,
+            partition_of: None,
+            for_values: None,
         },
     )
     .unwrap();
@@ -317,6 +323,9 @@ fn test_unique_constraints() {
                     sequence: None,
                 },
             ],
+            partition_by: None,
+            partition_of: None,
+            for_values: None,
         },
     )
     .unwrap();
@@ -477,6 +486,9 @@ fn test_secondary_indexing() {
                     sequence: None,
                 },
             ],
+            partition_by: None,
+            partition_of: None,
+            for_values: None,
         },
     )
     .unwrap();
@@ -770,6 +782,9 @@ fn test_index_value_containing_separator_does_not_overmatch() {
                     sequence: None,
                 },
             ],
+            partition_by: None,
+            partition_of: None,
+            for_values: None,
         },
     )
     .unwrap();
@@ -900,6 +915,9 @@ fn test_alter_table_migrations() {
                     sequence: None,
                 },
             ],
+            partition_by: None,
+            partition_of: None,
+            for_values: None,
         },
     )
     .unwrap();

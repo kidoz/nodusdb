@@ -83,7 +83,8 @@ impl CatalogWriter for RaftCatalogWriter {
             | TableDescriptorChange::DropConstraint { table_id, .. }
             | TableDescriptorChange::SetSchema { table_id, .. }
             | TableDescriptorChange::SetViewQuery { table_id, .. }
-            | TableDescriptorChange::SetParents { table_id, .. } => *table_id,
+            | TableDescriptorChange::SetParents { table_id, .. }
+            | TableDescriptorChange::SetPartitionBound { table_id, .. } => *table_id,
         };
         self.replicate(
             "update_table_descriptor",

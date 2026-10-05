@@ -186,6 +186,9 @@ fn exec_with_rows(
                     sequence: None,
                 },
             ],
+            partition_by: None,
+            partition_of: None,
+            for_values: None,
         },
     )
     .unwrap();

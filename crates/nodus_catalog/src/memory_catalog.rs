@@ -245,20 +245,20 @@ impl CatalogReader for MemoryCatalog {
         // Table lookup: DB, Schema, and Name provided
         if let (Some(db_name), Some(schema_name)) = (&request.database, &request.schema) {
             if let Ok(table) = self.get_table(db_name, schema_name, &request.name) {
-                return Ok(ObjectDescriptor::Table(table));
+                return Ok(ObjectDescriptor::Table(Box::new(table)));
             }
         }
 
         // Schema lookup: DB and Name provided
         if let Some(db_name) = &request.database {
             if let Ok(schema) = self.get_schema(db_name, &request.name) {
-                return Ok(ObjectDescriptor::Schema(schema));
+                return Ok(ObjectDescriptor::Schema(Box::new(schema)));
             }
         }
 
         // Database lookup
         if let Ok(db) = self.get_database(&request.name) {
-            return Ok(ObjectDescriptor::Database(db));
+            return Ok(ObjectDescriptor::Database(Box::new(db)));
         }
 
         anyhow::bail!("Object not found: {:?}", request.name)
@@ -528,6 +528,8 @@ impl CatalogWriter for MemoryCatalog {
             materialized_query: request.materialized_query,
             comment: None,
             parents: request.parents,
+            partition_by: request.partition_by,
+            partition_bound: request.partition_bound,
         };
         guard.insert(key, desc.clone());
         drop(guard);
@@ -627,7 +629,8 @@ impl CatalogWriter for MemoryCatalog {
             | TableDescriptorChange::DropConstraint { table_id, .. }
             | TableDescriptorChange::SetSchema { table_id, .. }
             | TableDescriptorChange::SetViewQuery { table_id, .. }
-            | TableDescriptorChange::SetParents { table_id, .. } => *table_id,
+            | TableDescriptorChange::SetParents { table_id, .. }
+            | TableDescriptorChange::SetPartitionBound { table_id, .. } => *table_id,
         };
 
         let mut target_key = None;
@@ -731,6 +734,9 @@ impl CatalogWriter for MemoryCatalog {
             }
             TableDescriptorChange::SetParents { parents, .. } => {
                 table.parents = parents;
+            }
+            TableDescriptorChange::SetPartitionBound { bound, .. } => {
+                table.partition_bound = bound;
             }
         }
 
@@ -1102,6 +1108,8 @@ mod tests {
                 view_query: None,
                 materialized_query: None,
                 parents: Vec::new(),
+                partition_by: None,
+                partition_bound: None,
             })
             .unwrap();
         assert_eq!(tbl.name, "users");

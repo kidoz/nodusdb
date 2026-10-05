@@ -1881,6 +1881,8 @@ mod tests {
             view_query: None,
             materialized_query: None,
             parents: Vec::new(),
+            partition_by: None,
+            partition_bound: None,
         };
 
         catalog.create_table(req.clone()).unwrap();
@@ -1897,6 +1899,8 @@ mod tests {
             view_query: None,
             materialized_query: None,
             parents: Vec::new(),
+            partition_by: None,
+            partition_bound: None,
         };
         assert!(!table_create_already_applied(
             Some(&reader),

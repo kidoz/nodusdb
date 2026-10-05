@@ -25,6 +25,7 @@ impl MemExecutor {
         (unique_constraints, key_names): (Vec<Vec<String>>, Vec<(Vec<String>, String)>),
         materialized_query: Option<String>,
         inherits: Vec<String>,
+        partition: (Option<String>, Option<String>, Option<String>),
     ) -> Result<QueryOutput> {
         // The name given to the key over `columns`, if any.
         let key_name = |columns: &[String]| -> Option<String> {
@@ -65,14 +66,119 @@ impl MemExecutor {
             }
             anyhow::bail!("relation \"{}\" already exists", table_only);
         }
-        // The parents' columns lead the new table's, and their CHECK
-        // constraints come along; a conflict fails before anything is made.
-        let parents = self.resolve_parents(&inherits)?;
+        // `PARTITION BY` fixes the table's key; `PARTITION OF` makes the new
+        // table a partition of the parent its bound names.
+        let (partition_by, partition_of, for_values) = partition;
+        let mut parents = self.resolve_parents(&inherits)?;
         let mut constraints = constraints;
-        if !parents.is_empty() {
+        let mut partition_bound_text: Option<String> = None;
+        if let Some(parent_name) = &partition_of {
+            if !parents.is_empty() {
+                anyhow::bail!("cannot use \"INHERITS\" with \"PARTITION OF\"");
+            }
+            if !columns.is_empty() {
+                anyhow::bail!("cannot specify columns for a partition");
+            }
+            let (parent_db, parent_schema, parent_only) = parse_object_name(parent_name)?;
+            let parent = self
+                .catalog_reader
+                .get_table(parent_db, parent_schema, parent_only)?;
+            if parent.view_query.is_some() {
+                anyhow::bail!(
+                    "inherited relation \"{parent_only}\" is not a table or foreign table"
+                );
+            }
+            // A partition and its parent are both temporary or both not.
+            let parent_temp = crate::search_path::is_temp_schema(parent_schema);
+            if parent_temp && !temp {
+                anyhow::bail!(
+                    "cannot create a permanent relation as partition of temporary relation \"{parent_only}\""
+                );
+            }
+            if temp && !parent_temp {
+                anyhow::bail!(
+                    "cannot create a temporary relation as partition of permanent relation \"{parent_only}\""
+                );
+            }
+            let Some(key_text) = parent.partition_by.clone() else {
+                anyhow::bail!("\"{parent_only}\" is not partitioned");
+            };
+            let Some(bound_spec) = for_values else {
+                anyhow::bail!("partition bound specification is missing");
+            };
+            let key = crate::partitioning::PartitionKey::parse(&key_text)?;
+            let types = crate::partitioning::key_types(&parent, &key);
+            let bound = crate::partitioning::parse_bound(&bound_spec, &key, &types)?;
+            self.check_partition_bound(ctx, &parent, &key, &types, &bound, table_only, None)?;
+            // The partition takes the parent's columns (and their defaults)
+            // and CHECK constraints.
+            columns = parent
+                .columns
+                .iter()
+                .map(|c| ColumnDef {
+                    name: c.name.clone(),
+                    data_type: c.data_type.clone(),
+                    nullable: c.nullable,
+                    unique: false,
+                    primary: false,
+                    default: c
+                        .default_expr
+                        .as_deref()
+                        .and_then(|e| serde_json::from_str(e).ok()),
+                    sequence: None,
+                })
+                .collect();
+            constraints.extend(
+                parent
+                    .constraints
+                    .iter()
+                    .filter(|c| matches!(c, nodus_catalog::TableConstraint::Check { .. }))
+                    .cloned(),
+            );
+            parents = vec![parent];
+            partition_bound_text = Some(crate::partitioning::render_bound(&bound));
+        } else if !parents.is_empty() {
+            // The parents' columns lead the new table's, and their CHECK
+            // constraints come along; a conflict fails before anything is made.
             let (merged, inherited_checks) = self.merge_inherited(ctx, &parents, columns)?;
             columns = merged;
             constraints.extend(inherited_checks);
+        }
+        // A key of the new table's own: its columns must exist and every
+        // unique constraint must cover it.
+        if let Some(key_text) = &partition_by {
+            let key = crate::partitioning::PartitionKey::parse(key_text)?;
+            for column in &key.columns {
+                if !columns.iter().any(|c| &c.name == column) {
+                    anyhow::bail!("column \"{column}\" named in partition key does not exist");
+                }
+            }
+            let mut uniques: Vec<(&str, Vec<String>)> = Vec::new();
+            let primary: Vec<String> = columns
+                .iter()
+                .filter(|c| c.primary)
+                .map(|c| c.name.clone())
+                .collect();
+            if !primary.is_empty() {
+                uniques.push(("PRIMARY KEY", primary));
+            }
+            for c in columns.iter().filter(|c| c.unique && !c.primary) {
+                uniques.push(("UNIQUE", vec![c.name.clone()]));
+            }
+            for group in &unique_constraints {
+                uniques.push(("UNIQUE", group.clone()));
+            }
+            for (kind, columns) in uniques {
+                if let Some(missing) = key.columns.iter().find(|column| !columns.contains(column)) {
+                    anyhow::bail!(DbError::new(
+                        "unique constraint on partitioned table must include all partitioning columns"
+                    )
+                    .detail(format!(
+                        "{kind} constraint on table \"{table_only}\" lacks column \"{missing}\" which is part of the partition key."
+                    ))
+                    .into_text());
+                }
+            }
         }
         self.reject_type_name(schema_name, table_only)?;
         for column in &columns {
@@ -176,6 +282,8 @@ impl MemExecutor {
             view_query: None,
             materialized_query,
             parents: parents.iter().map(|p| p.id).collect(),
+            partition_by: partition_by.clone(),
+            partition_bound: partition_bound_text.clone(),
         })?;
 
         for (col, primary) in unique_cols {
@@ -203,6 +311,7 @@ impl MemExecutor {
                 }],
                 include_columns: vec![],
                 unique: true,
+                constraint: true,
                 global: false,
                 predicate: None,
                 expressions: vec![],
@@ -233,6 +342,7 @@ impl MemExecutor {
                     .collect(),
                 include_columns: vec![],
                 unique: true,
+                constraint: true,
                 global: false,
                 predicate: None,
                 expressions: vec![],
@@ -247,8 +357,126 @@ impl MemExecutor {
         for (sequence, state) in owned_sequences {
             self.create_sequence(ctx, &sequence, state)?;
         }
+        // A partition carries a copy of each of its parent's indexes.
+        if partition_bound_text.is_some()
+            && let Some(parent) = parents.first()
+        {
+            self.create_partition_indexes(&tbl, parent)?;
+        }
 
         Ok(QueryOutput::tag("CREATE TABLE"))
+    }
+
+    /// The partition copies of a parent's indexes, named as PostgreSQL names
+    /// them: `<partition>_pkey`, `<partition>_<columns>_key` for a
+    /// constraint's, `<partition>_<columns>_idx` for a plain one.
+    pub(crate) fn create_partition_indexes(
+        &self,
+        partition: &nodus_catalog::TableDescriptor,
+        parent: &nodus_catalog::TableDescriptor,
+    ) -> Result<()> {
+        let fresh = self.catalog_reader.get_table_by_id(partition.id)?;
+        let partition = &fresh;
+        for index in &parent.indexes {
+            // An expression key part has no column of its own.
+            let names: Vec<String> = index
+                .key_columns
+                .iter()
+                .map(|k| {
+                    if k.column_id == crate::index_keys::EXPRESSION_KEY {
+                        "expr".to_string()
+                    } else {
+                        parent
+                            .columns
+                            .iter()
+                            .find(|c| c.id == k.column_id)
+                            .map(|c| c.name.clone())
+                            .unwrap_or_default()
+                    }
+                })
+                .collect();
+            // A partition that already has an index over the same columns
+            // keeps it, as PostgreSQL attaches it rather than making one —
+            // but a constraint's own index belongs to that constraint.
+            let covered = partition.indexes.iter().any(|existing| {
+                let existing_names: Vec<String> = existing
+                    .key_columns
+                    .iter()
+                    .filter_map(|k| {
+                        partition
+                            .columns
+                            .iter()
+                            .find(|c| c.id == k.column_id)
+                            .map(|c| c.name.clone())
+                    })
+                    .collect();
+                existing_names == names
+                    && existing.constraint == index.constraint
+                    && existing.unique == index.unique
+                    && existing.predicate.as_ref().map(|p| &p.sql)
+                        == index.predicate.as_ref().map(|p| &p.sql)
+            });
+            if covered {
+                continue;
+            }
+            let name = match index.index_type {
+                nodus_catalog::IndexType::Primary => format!("{}_pkey", partition.name),
+                nodus_catalog::IndexType::Unique if index.constraint => {
+                    format!("{}_{}_key", partition.name, names.join("_"))
+                }
+                _ => format!("{}_{}_idx", partition.name, names.join("_")),
+            };
+            let key_columns = index
+                .key_columns
+                .iter()
+                .filter_map(|k| {
+                    if k.column_id == crate::index_keys::EXPRESSION_KEY {
+                        return Some(nodus_catalog::IndexColumn {
+                            column_id: crate::index_keys::EXPRESSION_KEY,
+                            descending: k.descending,
+                        });
+                    }
+                    parent
+                        .columns
+                        .iter()
+                        .find(|c| c.id == k.column_id)
+                        .and_then(|c| {
+                            partition
+                                .columns
+                                .iter()
+                                .find(|p| p.name == c.name)
+                                .map(|p| nodus_catalog::IndexColumn {
+                                    column_id: p.id,
+                                    descending: k.descending,
+                                })
+                        })
+                })
+                .collect();
+            let mirror = nodus_catalog::IndexDescriptor {
+                id: nodus_catalog::IndexId::new(),
+                name,
+                version: 1,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+                state: DescriptorState::Public,
+                index_type: index.index_type.clone(),
+                index_state: nodus_catalog::IndexState::Ready,
+                key_columns,
+                include_columns: vec![],
+                unique: index.unique,
+                constraint: index.constraint,
+                global: index.global,
+                predicate: index.predicate.clone(),
+                expressions: index.expressions.clone(),
+            };
+            self.catalog_writer.update_table_descriptor(
+                nodus_catalog::TableDescriptorChange::AddIndex {
+                    table_id: partition.id,
+                    index: mirror,
+                },
+            )?;
+        }
+        Ok(())
     }
 
     /// `CREATE SEQUENCE`.
@@ -311,6 +539,7 @@ impl MemExecutor {
             Default::default(),
             None,
             Vec::new(),
+            (None, None, None),
         )?;
         let (db_name, schema_name, table_only) = parse_object_name(name)?;
         let tbl = self
@@ -486,6 +715,7 @@ impl MemExecutor {
             Default::default(),
             materialized_query,
             Vec::new(),
+            (None, None, None),
         )?;
         if !with_data {
             return Ok(QueryOutput::tag(command));
@@ -676,6 +906,8 @@ impl MemExecutor {
             view_query: Some(view_query_json),
             materialized_query: None,
             parents: Vec::new(),
+            partition_by: None,
+            partition_bound: None,
         })?;
 
         Ok(QueryOutput::tag("CREATE VIEW"))
@@ -717,6 +949,16 @@ impl MemExecutor {
             self.authorize(ctx, Action::CreateTable, ResourceRef::Table(tbl.id))?;
             if !targets.iter().any(|t| t.id == tbl.id) {
                 targets.push(tbl);
+            }
+        }
+        // A partitioned table takes its partitions with it.
+        for target in targets.clone() {
+            if target.partition_by.is_some() {
+                for descendant in self.descendants("default", target.id)? {
+                    if !targets.iter().any(|t| t.id == descendant.id) {
+                        targets.push(descendant);
+                    }
+                }
             }
         }
         let dependents = self.dependents(&targets)?;
@@ -966,7 +1208,7 @@ impl MemExecutor {
                 );
             }
         }
-        let mut index = Self::new_index(&tbl, name, index_type, &plain, predicate)?;
+        let mut index = Self::new_index(&tbl, name, index_type, &plain, predicate, false)?;
         if expressions.iter().any(Option::is_some) {
             let mut plain_keys = index.key_columns.into_iter();
             index.key_columns = expressions
@@ -989,7 +1231,27 @@ impl MemExecutor {
         for (key, descending) in index.key_columns.iter_mut().zip(&descending) {
             key.descending = *descending;
         }
+        // A unique index on a partitioned table must cover its key.
+        if unique && let Some(key_text) = &tbl.partition_by {
+            let key = crate::partitioning::PartitionKey::parse(key_text)?;
+            if let Some(missing) = key.columns.iter().find(|column| !plain.contains(column)) {
+                anyhow::bail!(DbError::new(
+                    "unique constraint on partitioned table must include all partitioning columns"
+                )
+                .detail(format!(
+                    "UNIQUE constraint on table \"{table_only}\" lacks column \"{missing}\" which is part of the partition key."
+                ))
+                .into_text());
+            }
+        }
         self.add_index(ctx, &tbl, index)?;
+        // A partitioned table's new index reaches the partitions it has.
+        if tbl.partition_by.is_some() {
+            let fresh = self.catalog_reader.get_table_by_id(tbl.id)?;
+            for partition in self.partition_children(db_name, tbl.id)? {
+                self.create_partition_indexes(&partition, &fresh)?;
+            }
+        }
         Ok(QueryOutput::tag("CREATE INDEX"))
     }
 
@@ -1000,6 +1262,7 @@ impl MemExecutor {
         index_type: nodus_catalog::IndexType,
         columns: &[String],
         predicate: Option<String>,
+        constraint: bool,
     ) -> Result<nodus_catalog::IndexDescriptor> {
         let key_columns = columns
             .iter()
@@ -1022,6 +1285,7 @@ impl MemExecutor {
             updated_at: Utc::now(),
             state: DescriptorState::Public,
             unique: index_type != nodus_catalog::IndexType::LocalSecondary,
+            constraint,
             index_type,
             index_state: nodus_catalog::IndexState::Creating,
             key_columns,

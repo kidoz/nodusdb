@@ -3318,6 +3318,16 @@ pub const TYPE_FUNCTION: &str = "pg_catalog.nodus_alter_type";
 /// the parser takes no inheritance operation.
 pub const INHERIT_FUNCTION: &str = "pg_catalog.nodus_inherit";
 
+/// The function `ALTER TABLE parent ATTACH PARTITION child FOR VALUES ...`
+/// is written as — `SELECT pg_catalog.nodus_attach_partition('parent',
+/// 'child', 'FOR VALUES ...')` — since the parser's `ATTACH PARTITION` is
+/// the storage-engine form, not PostgreSQL's.
+pub const ATTACH_PARTITION_FUNCTION: &str = "pg_catalog.nodus_attach_partition";
+
+/// The function `ALTER TABLE parent DETACH PARTITION child` is written as
+/// — `SELECT pg_catalog.nodus_detach_partition('parent', 'child')`.
+pub const DETACH_PARTITION_FUNCTION: &str = "pg_catalog.nodus_detach_partition";
+
 /// The function `(value).*` — a record expanded into its fields — is
 /// written as — `pg_catalog.nodus_expand_record(value)` — since the parser
 /// has no `.*` after a parenthesized expression.
@@ -3475,6 +3485,46 @@ fn rewrite_statement_form(
                 quote(name.trim()),
                 quote(&schema)
             );
+            if let Some(mut tokens) = snippet_tokens(&sql) {
+                tokens.extend(tail(&statement));
+                return tokens;
+            }
+            return statement;
+        }
+    }
+
+    // `ALTER TABLE [ONLY] parent ATTACH | DETACH PARTITION child ...`.
+    if is(0, "alter") && is(1, "table") && n >= 5 {
+        let at = if is(2, "only") { 3 } else { 2 };
+        let keyword =
+            (at..n - 1).find(|&k| (is(k, "attach") || is(k, "detach")) && is(k + 1, "partition"));
+        if let Some(k) = keyword {
+            let name = render_tokens(&statement[significant[at]..=significant[k - 1]]);
+            let child_end = (k + 2..n)
+                .find(|&j| {
+                    is(j, "for") || is(j, "default") || is(j, "concurrently") || is(j, "finalize")
+                })
+                .unwrap_or(n);
+            let child = render_tokens(&statement[significant[k + 2]..=significant[child_end - 1]]);
+            let sql = if is(k, "attach") {
+                let bound = if child_end < n {
+                    render_tokens(&statement[significant[child_end]..=significant[n - 1]])
+                } else {
+                    String::new()
+                };
+                format!(
+                    "SELECT {ATTACH_PARTITION_FUNCTION}('{}', '{}', '{}')",
+                    quote(name.trim()),
+                    quote(child.trim()),
+                    quote(bound.trim())
+                )
+            } else {
+                format!(
+                    "SELECT {DETACH_PARTITION_FUNCTION}('{}', '{}')",
+                    quote(name.trim()),
+                    quote(child.trim())
+                )
+            };
             if let Some(mut tokens) = snippet_tokens(&sql) {
                 tokens.extend(tail(&statement));
                 return tokens;
