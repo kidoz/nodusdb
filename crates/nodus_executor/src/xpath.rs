@@ -64,6 +64,24 @@ fn undefined_prefix() -> XpError {
     )
 }
 
+/// A call with the wrong argument count, as libxml2 fails to evaluate one.
+fn invalid_arity() -> XpError {
+    XpError::with_detail(
+        "could not create XPath object",
+        "10608",
+        "Invalid number of arguments",
+    )
+}
+
+/// A call to a function libxml2 does not know.
+fn unregistered_function() -> XpError {
+    XpError::with_detail(
+        "could not create XPath object",
+        "10608",
+        "Unregistered function",
+    )
+}
+
 /// `xpath(expression, document [, namespaces])`: the nodes the expression
 /// selects, serialized, in document order; a result that is not a node-set
 /// is one entry holding its string value.
@@ -76,8 +94,10 @@ pub(crate) fn xpath(
     let value = evaluate(expression, &tree, namespaces)?;
     Ok(match value {
         Value::Nodes(nodes) => nodes.iter().map(|&node| tree.serialize(node)).collect(),
-        // A result that is not a node-set becomes an XML value: its string
-        // is written markup-safe, as libxml2 writes one.
+        // A number is the DOUBLE PRECISION a PostgreSQL XPath object
+        // carries, written as PostgreSQL writes one; any other result is a
+        // string written markup-safe.
+        Value::Num(number) => vec![crate::xml::escape_xml(&float8_to_string(number))],
         other => vec![crate::xml::escape_xml(&other.string_value(&tree))],
     })
 }
@@ -286,6 +306,25 @@ impl<'a> Tree<'a> {
 
     fn parent(&self, node: usize) -> Option<usize> {
         self.nodes[node].parent
+    }
+
+    /// The language in force at a node: the value of the nearest `xml:lang`
+    /// on the node or an ancestor, as libxml2's `xmlNodeGetLang` finds it.
+    fn language(&self, node: usize) -> Option<String> {
+        let mut at = Some(node);
+        while let Some(current) = at {
+            if let Kind::Element { attrs, .. } = &self.nodes[current].kind {
+                for &attr in attrs {
+                    if let Kind::Attribute { name, value } = &self.nodes[attr].kind
+                        && name.strip_prefix("xml:") == Some("lang")
+                    {
+                        return Some(value.to_string());
+                    }
+                }
+            }
+            at = self.parent(current);
+        }
+        None
     }
 
     /// The node's (prefix, local name, namespace URI).
@@ -736,8 +775,10 @@ impl Parser<'_> {
             }
         }
         let mut steps = Vec::new();
+        let mut descendant = false;
         let absolute = if self.eat('/') {
             if self.eat('/') {
+                descendant = true;
                 steps.push(Step {
                     axis: Axis::DescendantOrSelf,
                     test: NodeTest::Node,
@@ -748,8 +789,8 @@ impl Parser<'_> {
         } else {
             false
         };
-        if absolute && self.at_step_end() {
-            // `/` alone: the document node.
+        if absolute && !descendant && self.at_step_end() {
+            // `/` alone: the document node. `//` alone is not an expression.
             return Ok(Expr::Path { absolute, steps });
         }
         self.step(&mut steps)?;
@@ -1029,9 +1070,7 @@ impl Parser<'_> {
                         text.push(self.bump().expect("checked"));
                     }
                 }
-                text.parse::<f64>()
-                    .map(Expr::Number)
-                    .map_err(|_| invalid_expression())
+                Ok(Expr::Number(libxml2_number(&text)))
             }
             Some(c) if c.is_alphabetic() || c == '_' => {
                 let name = self.word();
@@ -1042,6 +1081,11 @@ impl Parser<'_> {
                 let mut args = Vec::new();
                 self.skip_ws();
                 if !self.eat(')') {
+                    // libxml2 reads an argument list cut off at the end of
+                    // the expression as a call with no arguments.
+                    if self.peek().is_none() {
+                        return Ok(Expr::Call(name, args));
+                    }
                     loop {
                         args.push(self.expr()?);
                         self.skip_ws();
@@ -1079,6 +1123,65 @@ fn axis_named(name: &str) -> Result<Axis, XpError> {
     })
 }
 
+/// A number literal as libxml2 reads one: each digit accumulates into a
+/// double as it is read and the fraction divides once, so a literal with
+/// more significant digits than a double holds can land on a different
+/// double than a correctly-rounded parse would.
+fn libxml2_number(text: &str) -> f64 {
+    let digits = text.as_bytes();
+    let mut at = 0;
+    let mut number = 0.0f64;
+    while at < digits.len() && digits[at].is_ascii_digit() {
+        number = number * 10.0 + (digits[at] - b'0') as f64;
+        at += 1;
+    }
+    if at < digits.len() && digits[at] == b'.' {
+        at += 1;
+        // Up to 20 digits are read, after any leading zeros.
+        let mut consumed = 0usize;
+        while at < digits.len() && digits[at] == b'0' {
+            consumed += 1;
+            at += 1;
+        }
+        let most = consumed + 20;
+        let mut fraction = 0.0f64;
+        while at < digits.len() && digits[at].is_ascii_digit() && consumed < most {
+            fraction = fraction * 10.0 + (digits[at] - b'0') as f64;
+            consumed += 1;
+            at += 1;
+        }
+        fraction /= 10f64.powf(consumed as f64);
+        number += fraction;
+        while at < digits.len() && digits[at].is_ascii_digit() {
+            at += 1;
+        }
+    }
+    if at < digits.len() && (digits[at] | 0x20) == b'e' {
+        at += 1;
+        let negative = match digits.get(at) {
+            Some(b'-') => {
+                at += 1;
+                true
+            }
+            Some(b'+') => {
+                at += 1;
+                false
+            }
+            _ => false,
+        };
+        let mut exponent: i32 = 0;
+        while at < digits.len() && digits[at].is_ascii_digit() {
+            if exponent < 1_000_000 {
+                exponent = exponent * 10 + (digits[at] - b'0') as i32;
+            }
+            at += 1;
+        }
+        let exponent = if negative { -exponent } else { exponent };
+        number *= 10f64.powf(exponent as f64);
+    }
+    number
+}
+
 // ---------------------------------------------------------------------------
 // Evaluation.
 
@@ -1094,7 +1197,7 @@ impl Value {
     fn string_value(&self, tree: &Tree) -> String {
         match self {
             Value::Str(text) => text.clone(),
-            Value::Num(number) => number_to_string(*number),
+            Value::Num(number) => number_text(*number),
             Value::Bool(b) => if *b { "true" } else { "false" }.to_string(),
             Value::Nodes(nodes) => nodes
                 .first()
@@ -1128,8 +1231,10 @@ impl Value {
     }
 }
 
-/// A number as XPath prints one (an integer without a decimal point).
-fn number_to_string(number: f64) -> String {
+/// A number as libxml2 prints one, its `xmlXPathFormatNumber`: at most 15
+/// significant digits, scientific notation outside `[1e-5, 1e9]`, and no
+/// sign on a zero. This is what a number casts to in an XPath expression.
+pub(crate) fn number_text(number: f64) -> String {
     if number.is_nan() {
         return "NaN".to_string();
     }
@@ -1139,10 +1244,92 @@ fn number_to_string(number: f64) -> String {
     if number == f64::NEG_INFINITY {
         return "-Infinity".to_string();
     }
-    if number.fract() == 0.0 && number.abs() < 1e15 {
-        return format!("{}", number as i64);
+    if number == 0.0 {
+        // The sign of a zero is dropped.
+        return "0".to_string();
     }
-    format!("{number}")
+    let absolute = number.abs();
+    if absolute > i32::MIN as f64 && absolute < i32::MAX as f64 && number == (number as i32) as f64
+    {
+        return format!("{}", number as i32);
+    }
+    if absolute > 1e9 || absolute < 1e-5 {
+        // `%.14e`, the mantissa's trailing zeros (and a lone point) gone.
+        let text = format!("{number:.14e}");
+        let (mantissa, exponent) = text.split_once('e').expect("exponential form");
+        let exponent: i64 = exponent.parse().expect("an exponent");
+        let mantissa = mantissa.trim_end_matches('0');
+        let mantissa = mantissa.strip_suffix('.').unwrap_or(mantissa);
+        format!(
+            "{mantissa}e{}{:02}",
+            if exponent < 0 { "-" } else { "+" },
+            exponent.abs()
+        )
+    } else {
+        // As many fraction digits as 15 significant ones leave.
+        let integer_place = absolute.log10() as i32;
+        let fraction_place = if integer_place > 0 {
+            15 - integer_place - 1
+        } else {
+            15 - integer_place
+        } as usize;
+        let text = format!("{number:.fraction_place$}");
+        let text = text.trim_end_matches('0');
+        text.strip_suffix('.').unwrap_or(text).to_string()
+    }
+}
+
+/// A number as PostgreSQL's `float8` output writes one: the shortest form
+/// that reads back as the same number, regular notation for decimal
+/// exponents -4 to 14 and scientific above, with a signed two-digit
+/// exponent. This is what `xpath` returns for an expression whose result is
+/// a number (the DOUBLE PRECISION value's output).
+fn float8_to_string(number: f64) -> String {
+    if number.is_nan() {
+        return "NaN".to_string();
+    }
+    if number == f64::INFINITY {
+        return "Infinity".to_string();
+    }
+    if number == f64::NEG_INFINITY {
+        return "-Infinity".to_string();
+    }
+    if number == 0.0 {
+        return if number.is_sign_negative() { "-0" } else { "0" }.to_string();
+    }
+    // Rust's `{:e}` writes the shortest digits back as `d[.ddd]e[-]X`.
+    let text = format!("{number:e}");
+    let (mantissa, exponent) = text.split_once('e').expect("exponential form");
+    let exponent: i32 = exponent.parse().expect("an exponent");
+    let (sign, mantissa) = match mantissa.strip_prefix('-') {
+        Some(rest) => ("-", rest),
+        None => ("", mantissa),
+    };
+    let digits = mantissa.replace('.', "");
+    let digits = digits.trim_end_matches('0');
+    if (-4..15).contains(&exponent) {
+        if exponent >= 0 {
+            let point = exponent as usize + 1;
+            if digits.len() > point {
+                format!("{sign}{}.{}", &digits[..point], &digits[point..])
+            } else {
+                format!("{sign}{digits}{}", "0".repeat(point - digits.len()))
+            }
+        } else {
+            format!("{sign}0.{}{digits}", "0".repeat((-exponent - 1) as usize))
+        }
+    } else {
+        let mut mantissa = digits[..1].to_string();
+        if digits.len() > 1 {
+            mantissa.push('.');
+            mantissa.push_str(&digits[1..]);
+        }
+        format!(
+            "{sign}{mantissa}e{}{:02}",
+            if exponent < 0 { "-" } else { "+" },
+            exponent.abs()
+        )
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1390,6 +1577,24 @@ impl<'a> Context<'a> {
     }
 
     fn call(&self, name: &str, args: &[Expr]) -> Result<Value, XpError> {
+        // libxml2 checks a function's argument count as it evaluates the
+        // call: too few or too many fails to build the XPath object.
+        let arity = match name {
+            "last" | "position" | "true" | "false" => args.len() == 0,
+            "count" | "id" | "sum" | "floor" | "ceiling" | "round" | "boolean" | "not" | "lang" => {
+                args.len() == 1
+            }
+            "string" | "string-length" | "normalize-space" | "number" | "name" | "local-name"
+            | "namespace-uri" => args.len() <= 1,
+            "concat" => args.len() >= 2,
+            "starts-with" | "contains" | "substring-before" | "substring-after" => args.len() == 2,
+            "substring" => (2..=3).contains(&args.len()),
+            "translate" => args.len() == 3,
+            _ => true,
+        };
+        if !arity {
+            return Err(invalid_arity());
+        }
         let arg = |index: usize| -> Result<Value, XpError> {
             match args.get(index) {
                 Some(expr) => self.eval(expr),
@@ -1579,13 +1784,32 @@ impl<'a> Context<'a> {
             // `id()` finds elements by a DTD's ID attributes, which a
             // PostgreSQL value does not carry.
             "id" => Value::Nodes(Vec::new()),
+            // `lang(name)`: whether the language in force at the context
+            // node — the nearest `xml:lang` — is the name or starts with it
+            // and a hyphen.
+            "lang" => {
+                let wanted = arg(0)?.string_value(self.tree);
+                let found = self.tree.language(self.node).unwrap_or_default();
+                let lang: Vec<char> = found.chars().collect();
+                let wanted: Vec<char> = wanted.chars().collect();
+                let matches = lang.len() >= wanted.len()
+                    && wanted
+                        .iter()
+                        .zip(&lang)
+                        .all(|(a, b)| a.eq_ignore_ascii_case(b))
+                    && match lang.get(wanted.len()) {
+                        None | Some('-') => true,
+                        _ => false,
+                    };
+                Value::Bool(matches)
+            }
             "floor" => Value::Num(arg(0)?.number_value(self.tree).floor()),
             "ceiling" => Value::Num(arg(0)?.number_value(self.tree).ceil()),
             "round" => {
                 let number = arg(0)?.number_value(self.tree);
                 Value::Num((number + 0.5).floor())
             }
-            _ => return Err(invalid_expression()),
+            _ => return Err(unregistered_function()),
         })
     }
 }

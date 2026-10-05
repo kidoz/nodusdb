@@ -431,3 +431,72 @@ query T
 select xpath('string(/a)', '<a>x&amp;y</a>'::xml);;
 ----
 {x&amp;y}
+
+# libxml2's number spelling, its evaluation errors, and `lang()`.
+query T
+select xpath('-0.0', '<a/>'::xml);;
+----
+{-0}
+
+query T
+select xpath('1 div 3', '<a/>'::xml);;
+----
+{0.3333333333333333}
+
+query T
+select xpath('string(1 div 3)', '<a/>'::xml);;
+----
+{0.333333333333333}
+
+query T
+select xpath('0.000001 * 1', '<a/>'::xml);;
+----
+{1e-06}
+
+query T
+select xpath('string(0.000001 * 1)', '<a/>'::xml);;
+----
+{1e-06}
+
+query T
+select xpath('10000000000 * 1', '<a/>'::xml);;
+----
+{10000000000}
+
+query T
+select xpath('123456789012345678', '<a/>'::xml);;
+----
+{1.234567890123457e+17}
+
+query T
+select xpath('string(123456789012345678)', '<a/>'::xml);;
+----
+{1.23456789012346e+17}
+
+query T
+select xpath('lang("en")', '<a xml:lang="en"/>'::xml);;
+----
+{false}
+
+query T
+select xpath('lang("en")', '<a xml:lang="en"><b xml:lang="en-GB"/></a>'::xml);;
+----
+{false}
+
+statement error
+select xpath('concat("a")', '<a/>'::xml);;
+
+statement error
+select xpath('sum(1,2)', '<a/>'::xml);;
+
+statement error
+select xpath('string(1, 2)', '<a/>'::xml);;
+
+statement error
+select xpath('invalid(', '<a/>'::xml);;
+
+statement error
+select xpath('//', '<a/>'::xml);;
+
+statement error
+select xpath('/a/', '<a/>'::xml);;
