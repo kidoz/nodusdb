@@ -1,0 +1,662 @@
+# Declarative table partitioning: PARTITION BY, PARTITION OF, routing,
+# movement, attach/detach, and the catalogs.
+statement ok
+drop table if exists pt cascade;
+
+statement ok
+create table pt (id int, v text) partition by range (id);
+
+statement error
+insert into pt values (50, 'x');
+
+statement ok
+create table pt1 partition of pt for values from (1) to (10);
+
+statement ok
+create table pt2 partition of pt for values from (10) to (20);
+
+statement ok
+create table ptd partition of pt default;
+
+statement ok
+insert into pt values (5, 'a'), (15, 'b'), (77, 'c');
+
+query TTT
+select tableoid::regclass, id, v from pt order by id;
+----
+pt1	5	a
+pt2	15	b
+ptd	77	c
+
+statement error
+insert into pt1 values (60, 'x');
+
+query TT
+select id, v from pt1 order by id;
+----
+5	a
+
+query T
+select count(*) from only pt;
+----
+0
+
+statement ok
+update pt set id = 12 where id = 5;
+
+query TTT
+select tableoid::regclass, id, v from pt order by id;
+----
+pt2	12	a
+pt2	15	b
+ptd	77	c
+
+statement ok
+update pt set id = 5000 where id = 12;
+
+query TTT
+select tableoid::regclass, id, v from pt order by id;
+----
+pt2	15	b
+ptd	77	c
+ptd	5000	a
+
+statement error
+update ptd set id = 12 where id = 5000;
+
+statement ok
+update pt set id = 12 where id = 5000;
+
+query TTT
+select tableoid::regclass, id, v from pt order by id;
+----
+pt2	12	a
+pt2	15	b
+ptd	77	c
+
+statement ok
+update pt2 set v = 'b2' where id = 12;
+
+query TTT
+select tableoid::regclass, id, v from pt order by id;
+----
+pt2	12	b2
+pt2	15	b
+ptd	77	c
+
+statement ok
+delete from pt where id = 15;
+
+query TT
+select id, v from pt order by id;
+----
+12	b2
+77	c
+
+statement error
+insert into ptd values (6, 'x');
+
+statement ok
+insert into ptd values (88, 'x');
+
+query TTT
+select tableoid::regclass, id, v from pt order by id;
+----
+pt2	12	b2
+ptd	77	c
+ptd	88	x
+
+# The parent holds no rows of its own.
+query T
+select count(*) from pt;
+----
+3
+
+# Multi-column ranges compare lexicographically.
+statement ok
+create table m2 (a int, b int, v text) partition by range (a, b);
+
+statement ok
+create table m2a partition of m2 for values from (1, 1) to (1, 10);
+
+statement ok
+create table m2b partition of m2 for values from (1, 10) to (2, 1);
+
+statement ok
+create table m2c partition of m2 for values from (2, 1) to (MAXVALUE, MAXVALUE);
+
+statement ok
+insert into m2 values (1, 5, 'x'), (1, 10, 'y'), (2, 0, 'z'), (9, 9, 'w');
+
+query TTT
+select tableoid::regclass, a, b from m2 order by a, b;
+----
+m2a	1	5
+m2b	1	10
+m2b	2	0
+m2c	9	9
+
+query T
+select pg_get_partkeydef('m2'::regclass);
+----
+RANGE (a, b)
+
+query T
+select pg_get_expr(relpartbound, oid) from pg_class where relname = 'm2c';
+----
+FOR VALUES FROM (2, 1) TO (MAXVALUE, MAXVALUE)
+
+# Lists match by equality, NULL included.
+statement ok
+create table l2 (v text) partition by list (v);
+
+statement ok
+create table l2a partition of l2 for values in ('a', 'b', NULL);
+
+statement ok
+insert into l2 values ('a'), (NULL);
+
+query TT
+select tableoid::regclass, v from l2 order by v nulls last;
+----
+l2a	a
+l2a	NULL
+
+query T
+select pg_get_expr(relpartbound, oid) from pg_class where relname = 'l2a';
+----
+FOR VALUES IN ('a', 'b', NULL)
+
+statement error
+insert into l2 values ('c');
+
+# Hash partitions follow PostgreSQL's own hash functions.
+statement ok
+create table h2 (id int) partition by hash (id);
+
+statement ok
+create table h2a partition of h2 for values with (modulus 4, remainder 0);
+
+statement ok
+create table h2b partition of h2 for values with (modulus 4, remainder 1);
+
+statement ok
+create table h2c partition of h2 for values with (modulus 4, remainder 2);
+
+statement ok
+create table h2d partition of h2 for values with (modulus 4, remainder 3);
+
+statement ok
+insert into h2 select generate_series(1, 10);
+
+query TT rowsort
+select tableoid::regclass, count(*) from h2 group by 1;
+----
+h2d	4
+h2c	1
+h2b	4
+h2a	1
+
+query T rowsort
+select id from h2 order by id;
+----
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+
+query TTTTT
+select partstrat, partnatts, partattrs, partclass, partcollation from pg_partitioned_table where partrelid = 'h2'::regclass;
+----
+h	1	1	10020	0
+
+statement ok
+create table hs (v text) partition by hash (v);
+
+statement ok
+create table hs0 partition of hs for values with (modulus 2, remainder 0);
+
+statement ok
+create table hs1 partition of hs for values with (modulus 2, remainder 1);
+
+statement ok
+insert into hs values ('alpha'), ('beta'), ('gamma'), ('delta');
+
+query TT rowsort
+select tableoid::regclass, v from hs;
+----
+hs0	beta
+hs0	delta
+hs1	alpha
+hs1	gamma
+
+statement error
+create table hz partition of h2 for values with (modulus 4, remainder 0);
+
+statement error
+create table hq partition of h2 for values with (modulus 4, remainder 9);
+
+statement error
+create table hm partition of h2 for values with (modulus 5, remainder 0);
+
+# Sub-partitioning: a partition can have a key of its own.
+statement ok
+create table sn (id int, v text) partition by list (v);
+
+statement ok
+create table sna partition of sn for values in ('x', 'y') partition by range (id);
+
+statement ok
+create table sna1 partition of sna for values from (1) to (10);
+
+statement ok
+create table sna2 partition of sna for values from (10) to (20);
+
+statement ok
+insert into sn values (5, 'x'), (15, 'y');
+
+query TTT
+select tableoid::regclass, id, v from sn order by id;
+----
+sna1	5	x
+sna2	15	y
+
+statement ok
+update sn set id = 12 where id = 5;
+
+query TTT
+select tableoid::regclass, id, v from sn order by id;
+----
+sna2	12	x
+sna2	15	y
+
+statement error
+update sn set id = 50 where id = 12;
+
+statement error
+insert into sn values (5, 'z');
+
+query T
+select pg_get_partkeydef('sna'::regclass);
+----
+RANGE (id)
+
+# A partitioned table refuses constraints that miss its key.
+statement error
+create table uq (id int, v text, unique (v)) partition by range (id);
+
+statement error
+create table pk (id int, v text, primary key (v)) partition by range (id);
+
+statement ok
+create table pkok (id int, v text, primary key (id, v)) partition by range (id);
+
+statement ok
+create table pkok1 partition of pkok for values from (1) to (10);
+
+statement ok
+insert into pkok values (5, 'a');
+
+statement error
+insert into pkok values (5, 'a');
+
+statement ok
+insert into pkok values (5, 'a') on conflict do nothing;
+
+statement ok
+insert into pkok values (5, 'a') on conflict (id, v) do update set v = 'b';
+
+query TTT
+select tableoid::regclass, id, v from pkok order by id, v;
+----
+pkok1	5	b
+
+query TTT
+select relname, relkind, relispartition from pg_class where relname like 'pkok%' order by relname;
+----
+pkok	p	f
+pkok1	r	t
+pkok1_pkey	i	t
+pkok_pkey	I	f
+
+# Indexes mirror onto the partitions.
+statement ok
+create table ix (id int, v text) partition by range (id);
+
+statement ok
+create index ix_idx on ix (v);
+
+statement ok
+create table ix1 partition of ix for values from (1) to (10);
+
+statement ok
+create table ix2 partition of ix for values from (10) to (20);
+
+statement ok
+create index ix_id on ix (id);
+
+query TTT
+select relname, relkind, relispartition from pg_class where relname like 'ix%' order by relname;
+----
+ix	p	f
+ix1	r	t
+ix1_id_idx	i	t
+ix1_v_idx	i	t
+ix2	r	t
+ix2_id_idx	i	t
+ix2_v_idx	i	t
+ix_id	I	f
+ix_idx	I	f
+
+statement ok
+insert into ix values (5, 'a'), (15, 'b');
+
+query TT
+select id, v from ix where v = 'b';
+----
+15	b
+
+# ATTACH and DETACH.
+statement ok
+create table at (id int) partition by range (id);
+
+statement ok
+create table at1 (id int);
+
+statement ok
+insert into at1 values (5);
+
+statement ok
+alter table at attach partition at1 for values from (1) to (10);
+
+query TTT
+select relname, relispartition, pg_get_expr(relpartbound, oid) from pg_class where relname in ('at', 'at1') order by relname;
+----
+at	f	NULL
+at1	t	FOR VALUES FROM (1) TO (10)
+
+query T
+select id from at;
+----
+5
+
+statement ok
+alter table at detach partition at1;
+
+query TTT
+select relname, relispartition, relpartbound from pg_class where relname in ('at', 'at1') order by relname;
+----
+at	f	NULL
+at1	f	NULL
+
+query T
+select id from at1;
+----
+5
+
+statement error
+insert into at values (5);
+
+statement ok
+alter table at attach partition at1 for values from (1) to (10);
+
+query T
+select id from at;
+----
+5
+
+statement error
+create table at2 partition of at for values from (5) to (20);
+
+statement ok
+create table at3 (id int);
+
+statement ok
+insert into at3 values (60);
+
+statement error
+alter table at attach partition at3 for values from (1) to (10);
+
+statement ok
+alter table at attach partition at3 for values from (10) to (100);
+
+query T
+select id from at order by id;
+----
+5
+60
+
+statement error
+alter table at detach partition pt1;
+
+statement ok
+create table at9 (id int not null) partition by range (id);
+
+statement ok
+create table at9a (id int);
+
+statement error
+alter table at9 attach partition at9a for values from (1) to (10);
+
+statement ok
+create table at8 (id int) partition by range (id);
+
+statement ok
+create table at8x (id int);
+
+statement error
+alter table at8x attach partition at8 for values from (1) to (10);
+
+# ALTER TABLE reaches the partitions.
+statement ok
+create table al (id int, v text) partition by range (id);
+
+statement ok
+create table al1 partition of al for values from (1) to (10);
+
+statement ok
+alter table al add column w int default 4;
+
+statement ok
+insert into al values (5, 'x', 9);
+
+query TTT
+select * from al1;
+----
+5	x	9
+
+statement ok
+alter table al rename column w to ww;
+
+query TTT
+select * from al order by id;
+----
+5	x	9
+
+statement ok
+truncate al;
+
+query T
+select count(*) from al;
+----
+0
+
+# COPY routes too.
+statement ok
+create table cp (id int, v text) partition by range (id);
+
+statement ok
+create table cp1 partition of cp for values from (1) to (10);
+
+statement ok
+create table cp2 partition of cp for values from (10) to (20);
+
+query T
+select tableoid::regclass, id, v from cp order by id;
+----
+
+statement ok
+insert into cp select g, 'g' from generate_series(1, 15) g;
+
+query T
+select count(*) from cp;
+----
+15
+
+# A default partition takes rows no bound claims, and a new bound must not
+# steal its rows.
+statement ok
+create table df (id int) partition by range (id);
+
+statement ok
+create table df1 partition of df for values from (1) to (10);
+
+statement ok
+create table dfd partition of df default;
+
+statement ok
+insert into dfd values (50);
+
+statement error
+create table df2 partition of df for values from (40) to (60);
+
+statement ok
+create table df3 partition of df for values from (60) to (70);
+
+statement ok
+update dfd set id = 75;
+
+query TT
+select tableoid::regclass, id from df order by id;
+----
+dfd	75
+
+statement ok
+insert into dfd values (55);
+
+query TT
+select tableoid::regclass, id from df order by id;
+----
+dfd	55
+dfd	75
+
+# A partition takes the parent's defaults.
+statement ok
+create table de (id int default 7) partition by range (id);
+
+statement ok
+create table de1 partition of de for values from (1) to (10);
+
+statement ok
+insert into de1 default values;
+
+statement ok
+insert into de default values;
+
+query TT
+select tableoid::regclass, id from de order by id;
+----
+de1	7
+de1	7
+
+# DROP TABLE of a partitioned table takes its partitions with it.
+statement ok
+drop table df;
+
+statement ok
+drop table if exists dfd;
+
+statement ok
+drop table if exists df1;
+
+statement error
+select * from dfd;
+
+# A partition key may not be an expression (PostgreSQL allows it; we refuse).
+statement error
+create table pe (id int) partition by range ((id + 1));
+
+# `PARTITION OF` needs a bound, and takes no column definitions.
+statement error
+create table pz partition of pt;
+
+statement error
+create table pz2 partition of pt (extra int);
+
+statement error
+create table pz3 partition of pt for values from (1) to (10);
+
+statement ok
+create table pz4 partition of pt for values from (30) to (40);
+
+query TT
+select relname, relkind from pg_class where relname = 'pt' or relname = 'pz4' order by relname;
+----
+pt	p
+pz4	r
+
+statement error
+create table pd2 partition of pt default;
+
+statement error
+create table po partition of pt for values from (5) to (15);
+
+statement ok
+drop table pt;
+
+statement ok
+drop table if exists m2;
+
+statement ok
+drop table if exists l2;
+
+statement ok
+drop table if exists h2;
+
+statement ok
+drop table if exists hs;
+
+statement ok
+drop table if exists sn;
+
+statement ok
+drop table if exists pkok;
+
+statement ok
+drop table if exists ix;
+
+statement ok
+drop table if exists at;
+
+statement ok
+drop table if exists at1;
+
+statement ok
+drop table if exists at3;
+
+statement ok
+drop table if exists at8x;
+
+statement ok
+drop table if exists at8;
+
+statement ok
+drop table if exists at9;
+
+statement ok
+drop table if exists at9a;
+
+statement ok
+drop table if exists al;
+
+statement ok
+drop table if exists cp;
+
+statement ok
+drop table if exists de;
