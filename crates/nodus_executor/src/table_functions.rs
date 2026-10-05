@@ -889,9 +889,34 @@ impl MemExecutor {
         let tableforest = matches!(eval(&mapping.tableforest), Value::Bool(true));
         let targetns = value_text(&eval(&mapping.targetns));
         let text = match &mapping.kind {
-            // A whole schema's, or the database's, tables.
-            XmlMappingKind::Schema(_) | XmlMappingKind::Database => {
-                anyhow::bail!("schema_to_xml is not implemented yet");
+            // A whole schema's, or the database's, tables in name order.
+            XmlMappingKind::Schema(source) => {
+                let schema = value_text(&eval(source));
+                let tables = self.mapping_tables(ctx, Some(&schema))?;
+                mapping_multi(
+                    &tables,
+                    &[schema],
+                    nulls,
+                    tableforest,
+                    &targetns,
+                    mapping.form,
+                    true,
+                )
+                .map_err(|error| anyhow::anyhow!(error))?
+            }
+            XmlMappingKind::Database => {
+                let tables = self.mapping_tables(ctx, None)?;
+                let schemas = self.mapping_schemas()?;
+                mapping_multi(
+                    &tables,
+                    &schemas,
+                    nulls,
+                    tableforest,
+                    &targetns,
+                    mapping.form,
+                    false,
+                )
+                .map_err(|error| anyhow::anyhow!(error))?
             }
             XmlMappingKind::Table(source) => {
                 let (columns, rows, schema, name) = self.mapping_table_rows(ctx, &eval(source))?;
@@ -1016,10 +1041,79 @@ impl MemExecutor {
         let out = self.run_mapping_query(ctx, &format!("select * from {rendered}"))?;
         Ok((mapping_columns(&out), shown_rows(out), schema, table.name))
     }
+
+    /// The tables, views, and materialized views of a schema (or of every
+    /// schema), in name order, with their rows read.
+    fn mapping_tables(
+        &self,
+        ctx: &crate::ExecutionContext,
+        only_schema: Option<&str>,
+    ) -> Result<Vec<MappingTable>> {
+        let catalog = self.catalog_reader.as_ref();
+        let schemas = catalog.list_schemas(DATABASE).unwrap_or_default();
+        // A named schema must be one, as PostgreSQL looks it up.
+        if let Some(wanted) = only_schema
+            && !schemas.iter().any(|schema| schema.name == wanted)
+        {
+            anyhow::bail!(
+                crate::error_fields::DbError::new(format!("schema \"{wanted}\" does not exist"))
+                    .code("3F000")
+                    .into_text()
+            );
+        }
+        let mut tables = Vec::new();
+        for table in catalog.list_all_tables(DATABASE).unwrap_or_default() {
+            let schema = crate::MemExecutor::schema_name_by_id(DATABASE, &schemas, table.schema_id);
+            if only_schema.is_some_and(|wanted| wanted != schema) {
+                continue;
+            }
+            let rendered = if schema == "public" {
+                crate::functions::quote_ident(&table.name)
+            } else {
+                format!(
+                    "{}.{}",
+                    crate::functions::quote_ident(&schema),
+                    crate::functions::quote_ident(&table.name)
+                )
+            };
+            let out = self.run_mapping_query(ctx, &format!("select * from {rendered}"))?;
+            tables.push(MappingTable {
+                schema,
+                name: table.name,
+                columns: mapping_columns(&out),
+                rows: shown_rows(out),
+            });
+        }
+        tables.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(tables)
+    }
+
+    /// Every schema a `database_to_xml` mapping covers: all but the system
+    /// ones, in name order.
+    fn mapping_schemas(&self) -> Result<Vec<String>> {
+        let catalog = self.catalog_reader.as_ref();
+        let mut schemas: Vec<String> = catalog
+            .list_schemas(DATABASE)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|schema| schema.name)
+            .filter(|name| !name.starts_with("pg_") && name != "information_schema")
+            .collect();
+        schemas.sort();
+        Ok(schemas)
+    }
 }
 
 /// The database the mapping covers; NodusDB serves one.
 const DATABASE: &str = "default";
+
+/// One table of a `schema_to_xml`/`database_to_xml` mapping.
+struct MappingTable {
+    schema: String,
+    name: String,
+    columns: Vec<(String, String)>,
+    rows: Vec<Vec<Value>>,
+}
 
 /// A result's columns as (name, type) pairs.
 fn mapping_columns(out: &crate::QueryOutput) -> Vec<(String, String)> {
@@ -1028,6 +1122,104 @@ fn mapping_columns(out: &crate::QueryOutput) -> Vec<(String, String)> {
         .zip(&out.types)
         .map(|(name, ty)| (name.clone(), ty.clone()))
         .collect()
+}
+
+/// The `schema_to_xml`/`database_to_xml` document: every table's mapping
+/// under the schema's (or the database's) root element, with the XSD schema
+/// when asked for.
+#[allow(clippy::too_many_arguments)]
+fn mapping_multi(
+    tables: &[MappingTable],
+    schemas: &[String],
+    nulls: bool,
+    tableforest: bool,
+    targetns: &str,
+    form: crate::plan_types::XmlMappingForm,
+    schema_root: bool,
+) -> Result<String, String> {
+    use crate::plan_types::XmlMappingForm;
+    use crate::xmlmap::{identifier_to_xml_name, root_element_end, root_element_start};
+    let own_schema = match form {
+        XmlMappingForm::Data => None,
+        _ => {
+            let mut text = String::new();
+            crate::xmlmap::xsd_schema_start(&mut text, targetns);
+            let columns: Vec<(String, String)> = tables
+                .iter()
+                .flat_map(|table| table.columns.iter().cloned())
+                .collect();
+            text.push_str(&crate::xmlmap::column_types_schema(&columns));
+            if schema_root {
+                let names: Vec<&str> = tables.iter().map(|table| table.name.as_str()).collect();
+                text.push_str(&crate::xmlmap::schema_schema(
+                    DATABASE,
+                    &schemas[0],
+                    &names,
+                    tableforest,
+                ));
+            } else {
+                let names: Vec<&str> = schemas.iter().map(String::as_str).collect();
+                text.push_str(&crate::xmlmap::catalog_schema(DATABASE, &names));
+            }
+            crate::xmlmap::xsd_schema_end(&mut text);
+            Some(text)
+        }
+    };
+    if form == XmlMappingForm::Schema {
+        return Ok(own_schema.unwrap_or_default());
+    }
+    let mut out = String::new();
+    let root = if schema_root {
+        schemas[0].clone()
+    } else {
+        DATABASE.to_string()
+    };
+    root_element_start(
+        &mut out,
+        &identifier_to_xml_name(&root),
+        own_schema.as_deref(),
+        targetns,
+        true,
+    );
+    out.push('\n');
+    if let Some(text) = &own_schema {
+        out.push_str(text);
+        out.push_str("\n\n");
+    }
+    let mut whole_schema = |schema: &str, top_level: bool| -> Result<(), String> {
+        let xmlsn = identifier_to_xml_name(schema);
+        if !top_level {
+            root_element_start(&mut out, &xmlsn, None, targetns, false);
+            out.push('\n');
+        }
+        for table in tables.iter().filter(|table| table.schema == schema) {
+            out.push_str(&crate::xmlmap::map_rows(
+                &table.columns,
+                &table.rows,
+                Some(&table.name),
+                nulls,
+                tableforest,
+                targetns,
+                None,
+                false,
+            )?);
+            out.push('\n');
+        }
+        if !top_level {
+            root_element_end(&mut out, &xmlsn);
+            out.push('\n');
+        }
+        Ok(())
+    };
+    if schema_root {
+        whole_schema(&schemas[0], true)?;
+    } else {
+        for schema in schemas {
+            whole_schema(schema, false)?;
+        }
+    }
+    root_element_end(&mut out, &identifier_to_xml_name(&root));
+    Ok(out)
 }
 
 impl MemExecutor {
