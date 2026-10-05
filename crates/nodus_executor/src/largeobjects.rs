@@ -16,6 +16,11 @@ use crate::Value;
 /// The page size `pg_largeobject` divides objects into.
 pub(crate) const PAGE_SIZE: i64 = 2048;
 
+/// `INV_WRITE` of `lo_open`.
+pub(crate) const INV_WRITE: i64 = 0x20000;
+/// `INV_READ` of `lo_open`.
+pub(crate) const INV_READ: i64 = 0x40000;
+
 /// `MAX_LARGE_OBJECT_SIZE`: what a seek target, a truncation length, and a
 /// write's end are bounded by.
 const MAX_LARGE_OBJECT_SIZE: i64 = i32::MAX as i64 * PAGE_SIZE;
@@ -24,6 +29,18 @@ const MAX_LARGE_OBJECT_SIZE: i64 = i32::MAX as i64 * PAGE_SIZE;
 const SUPERUSER_OID: i64 = 10;
 /// The key the next large object's OID counts up from.
 const OID_COUNTER: &str = "lo_oid";
+
+/// One open descriptor: what `lo_open` returned an index for.
+pub(crate) struct Descriptor {
+    oid: i64,
+    flags: i64,
+    offset: i64,
+    /// The transaction that opened it; its end closes the descriptor.
+    txn: Option<nodus_storage_api::TxnId>,
+}
+
+/// A session's descriptors, by the descriptor number `lo_open` returns.
+pub(crate) type Descriptors = Vec<Option<Descriptor>>;
 
 fn meta_key(oid: i64) -> String {
     format!("lo:{oid}")
@@ -340,14 +357,203 @@ impl MemExecutor {
         Ok(())
     }
 
-    /// `lo_unlink(oid)`: the object and its pages.
+    /// `lo_unlink(oid)`: the object and its pages, while no descriptor
+    /// stays open on it.
     pub(crate) fn lo_unlink(&self, session: &str, oid: i64) -> Result<i64> {
         self.lo_require(session, oid)?;
         for (page, _) in self.lo_pages(session, oid)? {
             self.delete_row(session, page_key(oid, page));
         }
         self.delete_row(session, meta_key(oid));
+        let mut all = self.large_objects.lock();
+        if let Some(descriptors) = all.get_mut(session) {
+            for descriptor in descriptors.iter_mut() {
+                if descriptor.as_ref().is_some_and(|d| d.oid == oid) {
+                    *descriptor = None;
+                }
+            }
+        }
         Ok(1)
+    }
+
+    /// `lo_open(oid, flags)`: a descriptor number for the session.
+    pub(crate) fn lo_open(
+        &self,
+        session: &str,
+        oid: i64,
+        flags: i64,
+        txn: Option<nodus_storage_api::TxnId>,
+    ) -> Result<i64> {
+        // PostgreSQL refuses a mode with neither `INV_READ` nor `INV_WRITE`
+        // set, before it looks at the object.
+        if flags & (INV_READ | INV_WRITE) == 0 {
+            anyhow::bail!(
+                crate::error_fields::DbError::new(format!(
+                    "invalid flags for opening a large object: {flags}"
+                ))
+                .code("22023")
+                .into_text()
+            );
+        }
+        self.lo_require(session, oid)?;
+        let mut all = self.large_objects.lock();
+        let descriptors = all.entry(session.to_string()).or_default();
+        let at = descriptors
+            .iter()
+            .position(Option::is_none)
+            .unwrap_or(descriptors.len());
+        if at == descriptors.len() {
+            descriptors.push(None);
+        }
+        descriptors[at] = Some(Descriptor {
+            oid,
+            flags,
+            offset: 0,
+            txn,
+        });
+        Ok(at as i64)
+    }
+
+    fn lo_with_descriptor<R>(
+        &self,
+        session: &str,
+        fd: i64,
+        use_it: impl FnOnce(&mut Descriptor) -> Result<R>,
+    ) -> Result<R> {
+        let mut all = self.large_objects.lock();
+        let found = all
+            .get_mut(session)
+            .and_then(|descriptors| descriptors.get_mut(fd.max(0) as usize))
+            .and_then(Option::as_mut);
+        let Some(descriptor) = found else {
+            anyhow::bail!(
+                crate::error_fields::DbError::new(format!("invalid large-object descriptor: {fd}"))
+                    .code("42704")
+                    .into_text()
+            );
+        };
+        use_it(descriptor)
+    }
+
+    /// `lo_close(fd)`.
+    pub(crate) fn lo_close(&self, session: &str, fd: i64) -> Result<()> {
+        let mut all = self.large_objects.lock();
+        let found = all
+            .get_mut(session)
+            .and_then(|descriptors| descriptors.get_mut(fd.max(0) as usize))
+            .and_then(Option::take);
+        if found.is_none() {
+            anyhow::bail!(
+                crate::error_fields::DbError::new(format!("invalid large-object descriptor: {fd}"))
+                    .code("42704")
+                    .into_text()
+            );
+        }
+        Ok(())
+    }
+
+    /// `lo_lseek(fd, offset, whence)`, returning the new position.
+    pub(crate) fn lo_lseek(&self, session: &str, fd: i64, offset: i64, whence: i64) -> Result<i64> {
+        self.lo_with_descriptor(session, fd, |descriptor| {
+            let size = self.lo_require(session, descriptor.oid)?;
+            let target = match whence {
+                0 => offset,
+                1 => descriptor.offset + offset,
+                2 => size + offset,
+                other => {
+                    anyhow::bail!(
+                        crate::error_fields::DbError::new(format!(
+                            "invalid whence setting: {other}"
+                        ))
+                        .code("22023")
+                        .into_text()
+                    );
+                }
+            };
+            if target < 0 || target > MAX_LARGE_OBJECT_SIZE {
+                anyhow::bail!(seek_error(target));
+            }
+            descriptor.offset = target;
+            Ok(target)
+        })
+    }
+
+    /// `lo_tell(fd)`.
+    pub(crate) fn lo_tell(&self, session: &str, fd: i64) -> Result<i64> {
+        self.lo_with_descriptor(session, fd, |descriptor| Ok(descriptor.offset))
+    }
+
+    /// `loread(fd, len)`: bytes from the descriptor's position.
+    pub(crate) fn lo_read(&self, session: &str, fd: i64, len: i64) -> Result<Vec<u8>> {
+        self.lo_with_descriptor(session, fd, |descriptor| {
+            // A descriptor opened for writing can be read from, as
+            // PostgreSQL grants `INV_WRITE` the read lock too.
+            if descriptor.flags & (INV_READ | INV_WRITE) == 0 {
+                anyhow::bail!(
+                    crate::error_fields::DbError::new(format!(
+                        "large object descriptor {fd} was not opened for reading"
+                    ))
+                    .code("55000")
+                    .into_text()
+                );
+            }
+            let offset = descriptor.offset;
+            let len = len.max(0);
+            let data = self.lo_get(session, descriptor.oid, offset, Some(len))?;
+            descriptor.offset += data.len() as i64;
+            Ok(data)
+        })
+    }
+
+    /// `lowrite(fd, data)`: bytes at the descriptor's position.
+    pub(crate) fn lo_write(&self, session: &str, fd: i64, data: &[u8]) -> Result<i64> {
+        self.lo_with_descriptor(session, fd, |descriptor| {
+            if descriptor.flags & INV_WRITE == 0 {
+                anyhow::bail!(
+                    crate::error_fields::DbError::new(format!(
+                        "large object descriptor {fd} was not opened for writing"
+                    ))
+                    .code("55000")
+                    .into_text()
+                );
+            }
+            let offset = descriptor.offset;
+            self.lo_put(session, descriptor.oid, offset, data)?;
+            descriptor.offset = offset + data.len() as i64;
+            Ok(data.len() as i64)
+        })
+    }
+
+    /// `lo_truncate(fd, len)`.
+    pub(crate) fn lo_truncate_fd(&self, session: &str, fd: i64, length: i64) -> Result<()> {
+        self.lo_with_descriptor(session, fd, |descriptor| {
+            if descriptor.flags & INV_WRITE == 0 {
+                anyhow::bail!(
+                    crate::error_fields::DbError::new(format!(
+                        "large object descriptor {fd} was not opened for writing"
+                    ))
+                    .code("55000")
+                    .into_text()
+                );
+            }
+            if length < 0 || length > MAX_LARGE_OBJECT_SIZE {
+                anyhow::bail!(
+                    crate::error_fields::DbError::new(format!(
+                        "invalid large object truncation target: {length}"
+                    ))
+                    .code("22023")
+                    .into_text()
+                );
+            }
+            let oid = descriptor.oid;
+            self.lo_truncate(session, oid, length)
+        })
+    }
+
+    /// A transaction's end: its descriptors close, as PostgreSQL's cookies
+    /// do.
+    pub(crate) fn end_transaction_large_objects(&self, session: &str) {
+        self.large_objects.lock().remove(session);
     }
 }
 

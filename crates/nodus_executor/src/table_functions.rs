@@ -1117,6 +1117,7 @@ impl MemExecutor {
         row: &[Value],
         col_names: &[String],
     ) -> Result<(Vec<String>, Vec<String>, Vec<Vec<Value>>)> {
+        use crate::largeobjects::INV_WRITE;
         let session = ctx.session_id.as_str();
         // An argument can itself be a call (the planner lowers every one to a
         // scalar subquery), evaluated before the one it feeds.
@@ -1165,6 +1166,18 @@ impl MemExecutor {
             }
             Ok(())
         };
+        let small = |fd: i64, value: i64, what: &str| -> Result<i64> {
+            if i32::try_from(value).is_err() {
+                anyhow::bail!(
+                    crate::error_fields::DbError::new(format!(
+                        "{what} result out of range for large-object descriptor {fd}"
+                    ))
+                    .code("22003")
+                    .into_text()
+                );
+            }
+            Ok(value)
+        };
         let value = match object.function.as_str() {
             "lo_create" => {
                 writable("lo_create()")?;
@@ -1197,6 +1210,50 @@ impl MemExecutor {
             "lo_unlink" => {
                 writable("lo_unlink()")?;
                 Value::Int(self.lo_unlink(session, int(0)?)?)
+            }
+            "lo_open" => {
+                let flags = int(1)?;
+                if flags & INV_WRITE != 0 {
+                    writable("lo_open(INV_WRITE)")?;
+                }
+                let txn = self.active_txns.read().get(session).map(|txn| txn.txn_id);
+                Value::Int(self.lo_open(session, int(0)?, flags, txn)?)
+            }
+            "lo_close" => {
+                self.lo_close(session, int(0)?)?;
+                Value::Int(0)
+            }
+            "lo_lseek" => {
+                let fd = int(0)?;
+                Value::Int(small(
+                    fd,
+                    self.lo_lseek(session, fd, int(1)?, int(2)?)?,
+                    "lo_lseek",
+                )?)
+            }
+            "lo_lseek64" => Value::Int(self.lo_lseek(session, int(0)?, int(1)?, int(2)?)?),
+            "lo_tell" => {
+                let fd = int(0)?;
+                Value::Int(small(fd, self.lo_tell(session, fd)?, "lo_tell")?)
+            }
+            "lo_tell64" => Value::Int(self.lo_tell(session, int(0)?)?),
+            "lo_truncate" => {
+                writable("lo_truncate()")?;
+                self.lo_truncate_fd(session, int(0)?, int(1)?)?;
+                Value::Int(0)
+            }
+            "lo_truncate64" => {
+                writable("lo_truncate64()")?;
+                self.lo_truncate_fd(session, int(0)?, int(1)?)?;
+                Value::Int(0)
+            }
+            "loread" => {
+                let len = int(1)?;
+                Value::Bytea(self.lo_read(session, int(0)?, len)?)
+            }
+            "lowrite" => {
+                writable("lowrite()")?;
+                Value::Int(self.lo_write(session, int(0)?, &bytes(1))?)
             }
             other => anyhow::bail!("unsupported large object function: {other}"),
         };

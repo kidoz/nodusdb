@@ -74,6 +74,7 @@ impl MemExecutor {
         let commit_ts = self.commit_or_release(txn.txn_id)?;
         self.kv.commit(txn.txn_id, commit_ts)?;
         self.end_transaction_cursors(&ctx.session_id, txn.txn_id, true);
+        self.end_transaction_large_objects(&ctx.session_id);
         self.deliver_notifications(&ctx.session_id, txn.pending_notifications.clone());
         self.after_commit(ctx);
         Ok(QueryOutput::tag("COMMIT"))
@@ -190,6 +191,7 @@ impl MemExecutor {
         self.restore_settings(ctx, txn.settings_before.clone());
         self.advisory.end_transaction(&ctx.session_id);
         self.end_transaction_cursors(&ctx.session_id, txn.txn_id, false);
+        self.end_transaction_large_objects(&ctx.session_id);
         self.txn.abort_txn(txn.txn_id)?;
         self.kv.abort(txn.txn_id)?;
         Ok(QueryOutput::tag("ROLLBACK"))

@@ -406,6 +406,9 @@ pub struct MemExecutor {
         parking_lot::Mutex<HashMap<String, std::collections::BTreeMap<String, PreparedStatement>>>,
     /// Per session, its open cursors. See [`crate::cursors`].
     pub(crate) cursors: parking_lot::Mutex<HashMap<String, cursors::Cursors>>,
+    /// Per session, its open large-object descriptors. See
+    /// [`crate::largeobjects`].
+    pub(crate) large_objects: parking_lot::Mutex<HashMap<String, largeobjects::Descriptors>>,
     /// The node's advisory locks.
     pub(crate) advisory: Arc<advisory::AdvisoryLocks>,
     /// Per session, the channels it listens on (`LISTEN`).
@@ -478,6 +481,7 @@ impl MemExecutor {
             temp_relations: parking_lot::Mutex::new(HashMap::new()),
             prepared: parking_lot::Mutex::new(HashMap::new()),
             cursors: parking_lot::Mutex::new(HashMap::new()),
+            large_objects: parking_lot::Mutex::new(HashMap::new()),
             advisory: Arc::new(advisory::AdvisoryLocks::default()),
             listeners: parking_lot::RwLock::new(HashMap::new()),
             notifications: parking_lot::Mutex::new(HashMap::new()),
@@ -1309,6 +1313,7 @@ impl MemExecutor {
         if let Some(txn_id) = implicit_txn {
             self.active_txns.write().remove(&ctx.session_id);
             self.advisory.end_transaction(&ctx.session_id);
+            self.end_transaction_large_objects(&ctx.session_id);
             match &result {
                 Ok(_) => {
                     let commit_ts = self.commit_or_release(txn_id)?;
@@ -1420,6 +1425,7 @@ impl Executor for MemExecutor {
         self.activity.write().remove(session_id);
         self.notices.lock().remove(session_id);
         self.sequences.end_session(session_id);
+        self.end_transaction_large_objects(session_id);
     }
 }
 

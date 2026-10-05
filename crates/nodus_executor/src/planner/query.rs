@@ -1640,9 +1640,10 @@ pub(crate) fn xml_mapping_spec(
     Some(spec)
 }
 
-/// The bytea large-object functions — `lo_create`, `lo_from_bytea`,
-/// `lo_get`, `lo_put`, and `lo_unlink` — as the one-row plan the call
-/// is the value of; `None` for any other expression.
+/// The large-object functions — `lo_create`, `lo_from_bytea`, `lo_get`,
+/// `lo_put`, `lo_unlink`, the `lo_open` descriptor family, and
+/// `loread`/`lowrite` — as the one-row plan the call is the value of;
+/// `None` for any other expression.
 pub(crate) fn large_object_spec(
     expr: &sqlparser::ast::Expr,
     params: &[Value],
@@ -1663,6 +1664,13 @@ pub(crate) fn large_object_spec(
         "LO_GET" => (&[1, 3], "BYTEA"),
         "LO_PUT" => (&[3], "VOID"),
         "LO_UNLINK" => (&[1], "INTEGER"),
+        "LO_OPEN" => (&[2], "INTEGER"),
+        "LO_CLOSE" => (&[1], "INTEGER"),
+        "LO_LSEEK" | "LO_LSEEK64" => (&[3], "INTEGER"),
+        "LO_TELL" | "LO_TELL64" => (&[1], "INTEGER"),
+        "LO_TRUNCATE" | "LO_TRUNCATE64" => (&[2], "INTEGER"),
+        "LOREAD" => (&[2], "BYTEA"),
+        "LOWRITE" => (&[2], "INTEGER"),
         _ => return None,
     };
     let sqlparser::ast::FunctionArguments::List(list) = &function.args else {
