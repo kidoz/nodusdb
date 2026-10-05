@@ -1,6 +1,9 @@
 //! Query planning: SELECT/set-op planning and object-name resolution.
 use super::*;
-use crate::plan_types::{JsonTableColumn, JsonTableColumnKind, JsonTableSpec};
+use crate::plan_types::{
+    JsonTableColumn, JsonTableColumnKind, JsonTableSpec, XmlTableColumn, XmlTableColumnKind,
+    XmlTableNamespace, XmlTableSpec,
+};
 use crate::*;
 use anyhow::Result;
 use nodus_catalog::TableConstraint;
@@ -1069,6 +1072,13 @@ fn table_fn_from_factor(
             {
                 return json_table_factor(&exprs, params, *with_ordinality, alias.as_ref());
             }
+            if name
+                .to_string()
+                .trim_start_matches("pg_catalog.")
+                .eq_ignore_ascii_case(XML_TABLE_MARKER)
+            {
+                return xml_table_factor(&exprs, params, *with_ordinality, alias.as_ref());
+            }
             let mut spec = build_table_fn_spec(
                 name.to_string().to_lowercase(),
                 Vec::new(),
@@ -1099,6 +1109,13 @@ fn table_fn_from_factor(
                 .eq_ignore_ascii_case(JSON_TABLE_MARKER)
             {
                 return json_table_factor(&exprs, params, *with_ordinality, alias.as_ref());
+            }
+            if name
+                .to_string()
+                .trim_start_matches("pg_catalog.")
+                .eq_ignore_ascii_case(XML_TABLE_MARKER)
+            {
+                return xml_table_factor(&exprs, params, *with_ordinality, alias.as_ref());
             }
             let mut spec = build_table_fn_spec(
                 name.to_string().to_lowercase(),
@@ -1236,6 +1253,310 @@ fn json_table_factor(
         refuse,
     });
     Some(spec)
+}
+
+/// The `XMLTABLE` marker, as `nodus_sql` rewrites the call:
+/// `__xml_table__(document, path, refuse, namespace..., column...)`.
+const XML_TABLE_MARKER: &str = "__xml_table__";
+
+/// The markers of an `XMLTABLE`'s namespaces and columns; the shapes are in
+/// `nodus_sql::rewrite_xmltable`.
+const XML_TABLE_NAMESPACE_MARKER: &str = "__xt_ns__";
+const XML_TABLE_COLUMN_MARKERS: &[&str] = &["__xt_col_ordinality__", "__xt_col__"];
+
+/// Plans `XMLTABLE(...)` from its rewritten call: the document, the row
+/// path, the `XMLNAMESPACES` items, and the column markers.
+fn xml_table_factor(
+    exprs: &[&sqlparser::ast::Expr],
+    params: &[Value],
+    with_ordinality: bool,
+    alias: Option<&sqlparser::ast::TableAlias>,
+) -> Option<TableFnSpec> {
+    if exprs.len() < 4 {
+        return None;
+    }
+    let refuse_now = |refuse: &mut Option<String>, message: String, code: &str| {
+        if refuse.is_none() {
+            *refuse = Some(
+                crate::error_fields::DbError::new(message)
+                    .code(code)
+                    .into_text(),
+            );
+        }
+    };
+    let mut refuse = None;
+    // The document, which PostgreSQL only implicitly casts to xml: a
+    // literal of another type is not one.
+    let doc = lower_scalar(exprs[0], params)?;
+    match &doc {
+        ScalarExpr::Literal(value) if !matches!(value, Value::Text(_) | Value::Null) => {
+            refuse_now(
+                &mut refuse,
+                format!(
+                    "argument of XMLTABLE must be type xml, not type {}",
+                    crate::value::value_type_name(value)
+                ),
+                "42804",
+            );
+        }
+        ScalarExpr::Cast { target, .. } if !crate::xml::is_type(target) => {
+            refuse_now(
+                &mut refuse,
+                format!("argument of XMLTABLE must be type xml, not type {target}"),
+                "42804",
+            );
+        }
+        _ => {}
+    }
+    let path = lower_scalar(exprs[1], params)?;
+    // The `refuse` string the rewriter carries: a clause PostgreSQL refuses
+    // when its grammar or parse analysis reads the call.
+    let rewriter_refuse = marker_text(exprs[2])?;
+    if !rewriter_refuse.is_empty() && refuse.is_none() {
+        refuse = Some(
+            crate::error_fields::DbError::new(rewriter_refuse)
+                .code("42601")
+                .into_text(),
+        );
+    }
+    let mut namespaces = Vec::new();
+    let mut columns = Vec::new();
+    for expr in &exprs[3..] {
+        let sqlparser::ast::Expr::Function(function) = expr else {
+            return None;
+        };
+        let name = function
+            .name
+            .to_string()
+            .to_ascii_uppercase()
+            .trim_start_matches("PG_CATALOG.")
+            .to_string();
+        let sqlparser::ast::FunctionArguments::List(list) = &function.args else {
+            return None;
+        };
+        let args: Vec<&sqlparser::ast::Expr> = list
+            .args
+            .iter()
+            .map(|a| match a {
+                sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(e)) => {
+                    Some(e)
+                }
+                _ => None,
+            })
+            .collect::<Option<_>>()?;
+        let marker = name.to_ascii_lowercase();
+        if marker == XML_TABLE_NAMESPACE_MARKER {
+            let [prefix, uri] = args.as_slice() else {
+                return None;
+            };
+            let prefix = match *prefix {
+                sqlparser::ast::Expr::Value(sqlparser::ast::ValueWithSpan {
+                    value: sqlparser::ast::Value::Null,
+                    ..
+                }) => None,
+                other => Some(marker_text(other)?),
+            };
+            namespaces.push(XmlTableNamespace {
+                prefix,
+                uri: lower_scalar(uri, params)?,
+            });
+            continue;
+        }
+        if !XML_TABLE_COLUMN_MARKERS.contains(&marker.as_str()) {
+            return None;
+        }
+        if marker == "__xt_col_ordinality__" {
+            let [column_name] = args.as_slice() else {
+                return None;
+            };
+            columns.push(XmlTableColumn {
+                name: marker_text(column_name)?,
+                kind: XmlTableColumnKind::Ordinality,
+            });
+            continue;
+        }
+        let [column_name, column_type, path, default, not_null] = args.as_slice() else {
+            return None;
+        };
+        let column_type = marker_text(column_type)?;
+        let path = marker_expression(path, params)?;
+        // A `DEFAULT` literal is coerced to the column's type now, as
+        // PostgreSQL coerces it when it parses the call; a literal it
+        // cannot take is refused there.
+        let mut default = marker_expression(default, params)?;
+        if let Some(expr) = &default
+            && let ScalarExpr::Literal(value) = expr
+            && !matches!(value, Value::Text(_) | Value::Null)
+        {
+            // PostgreSQL coerces the default to the column's type with an
+            // assignment cast when it parses the call; a literal with no
+            // such cast is refused then.
+            match xmltable_default_cast(value, &column_type) {
+                Some(converted) => default = Some(ScalarExpr::Literal(converted)),
+                None => refuse_now(
+                    &mut refuse,
+                    format!(
+                        "argument of XMLTABLE must be type {column_type}, not type {}",
+                        crate::value::value_type_name(value)
+                    ),
+                    "42804",
+                ),
+            }
+        }
+        columns.push(XmlTableColumn {
+            name: marker_text(column_name)?,
+            kind: XmlTableColumnKind::Value {
+                column_type,
+                path,
+                default,
+                not_null: matches!(
+                    not_null,
+                    sqlparser::ast::Expr::Value(sqlparser::ast::ValueWithSpan {
+                        value: sqlparser::ast::Value::Boolean(true),
+                        ..
+                    })
+                ),
+            },
+        });
+    }
+    // One column per name, and one FOR ORDINALITY column, as PostgreSQL
+    // checks when it parses the call.
+    if refuse.is_none() {
+        let mut names = Vec::new();
+        let mut ordinality = false;
+        for column in &columns {
+            if matches!(column.kind, XmlTableColumnKind::Ordinality) {
+                if ordinality {
+                    refuse = Some(
+                        crate::error_fields::DbError::new(
+                            "only one FOR ORDINALITY column is allowed",
+                        )
+                        .code("42601")
+                        .into_text(),
+                    );
+                    break;
+                }
+                ordinality = true;
+            }
+            if names.contains(&column.name) {
+                refuse = Some(
+                    crate::error_fields::DbError::new(format!(
+                        "column name \"{}\" is not unique",
+                        column.name
+                    ))
+                    .code("42601")
+                    .into_text(),
+                );
+                break;
+            }
+            names.push(column.name.clone());
+        }
+    }
+    // The namespaces are checked after the columns, as PostgreSQL's parse
+    // analysis reads them.
+    if refuse.is_none() {
+        let mut seen = Vec::new();
+        let mut default_seen = false;
+        for namespace in &namespaces {
+            match &namespace.prefix {
+                Some(prefix) => {
+                    if seen.contains(prefix) {
+                        refuse = Some(
+                            crate::error_fields::DbError::new(format!(
+                                "namespace name \"{prefix}\" is not unique"
+                            ))
+                            .code("42601")
+                            .into_text(),
+                        );
+                        break;
+                    }
+                    seen.push(prefix.clone());
+                }
+                None => {
+                    if default_seen {
+                        refuse = Some(
+                            crate::error_fields::DbError::new(
+                                "only one default namespace is allowed",
+                            )
+                            .code("42601")
+                            .into_text(),
+                        );
+                        break;
+                    }
+                    default_seen = true;
+                }
+            }
+        }
+    }
+    let mut spec = build_table_fn_spec("xml_table".to_string(), Vec::new(), with_ordinality, alias);
+    spec.arg_exprs = vec![doc];
+    spec.xml_table = Some(XmlTableSpec {
+        path,
+        namespaces,
+        columns,
+        refuse,
+    });
+    Some(spec)
+}
+
+/// A `DEFAULT` literal as PostgreSQL's assignment cast takes it: a number
+/// goes to a numeric or character type and a boolean to a character one;
+/// anything else has no cast, and the column's default is refused.
+fn xmltable_default_cast(value: &Value, column_type: &str) -> Option<Value> {
+    let upper = column_type.trim().to_ascii_uppercase();
+    let base = upper.split('(').next().unwrap_or_default().trim();
+    let character = matches!(
+        base,
+        "TEXT" | "VARCHAR" | "CHARACTER VARYING" | "CHAR" | "CHARACTER" | "BPCHAR" | "NAME"
+    );
+    let numeric = matches!(
+        base,
+        "SMALLINT"
+            | "INT2"
+            | "INTEGER"
+            | "INT"
+            | "INT4"
+            | "BIGINT"
+            | "INT8"
+            | "REAL"
+            | "FLOAT4"
+            | "DOUBLE PRECISION"
+            | "FLOAT8"
+            | "FLOAT"
+            | "NUMERIC"
+            | "DECIMAL"
+            | "OID"
+            | "MONEY"
+    );
+    match value {
+        Value::Int(_) | Value::Float(_) | Value::Numeric(_) if numeric => {
+            crate::planner::try_cast(value.clone(), column_type).ok()
+        }
+        Value::Int(_) | Value::Float(_) | Value::Numeric(_) if character => {
+            crate::value::fit_character(&crate::render(value), column_type, false)
+                .ok()
+                .map(Value::Text)
+        }
+        // A boolean's text is `true`/`false`.
+        Value::Bool(flag) if character => {
+            crate::value::fit_character(if *flag { "true" } else { "false" }, column_type, false)
+                .ok()
+                .map(Value::Text)
+        }
+        _ => None,
+    }
+}
+
+/// A marker argument that is an expression, or the NULL placeholder a
+/// missing `PATH`/`DEFAULT` leaves.
+fn marker_expression(expr: &sqlparser::ast::Expr, params: &[Value]) -> Option<Option<ScalarExpr>> {
+    match expr {
+        sqlparser::ast::Expr::Value(sqlparser::ast::ValueWithSpan {
+            value: sqlparser::ast::Value::Null,
+            ..
+        }) => Some(None),
+        other => Some(Some(lower_scalar(other, params)?)),
+    }
 }
 
 /// A string literal a `JSON_TABLE` marker carries.
@@ -1562,6 +1883,7 @@ fn lift_set_returning_functions(
             arg_exprs: args.clone(),
             rows_from: Vec::new(),
             json_table: None,
+            xml_table: None,
         }
     };
     Some(TableFnSpec {
@@ -1574,6 +1896,7 @@ fn lift_set_returning_functions(
         arg_exprs: Vec::new(),
         rows_from: calls.iter().map(|(call, _)| member(call)).collect(),
         json_table: None,
+        xml_table: None,
     })
 }
 
@@ -1676,6 +1999,7 @@ fn select_list_table_function(
         arg_exprs: Vec::new(),
         rows_from: Vec::new(),
         json_table: None,
+        xml_table: None,
     };
     set_table_fn_args(&mut spec, &exprs, params)?;
     Some(spec)
@@ -1709,6 +2033,7 @@ fn build_table_fn_spec(
         arg_exprs: Vec::new(),
         rows_from: Vec::new(),
         json_table: None,
+        xml_table: None,
     }
 }
 

@@ -135,6 +135,68 @@ pub struct TableFnSpec {
     /// Defaulted so older plans decode.
     #[serde(default)]
     pub json_table: Option<JsonTableSpec>,
+    /// `XMLTABLE(...)`: the row path, the namespaces, and the columns, with
+    /// the document in `args`/`arg_exprs`. Defaulted so older plans decode.
+    #[serde(default)]
+    pub xml_table: Option<XmlTableSpec>,
+}
+
+/// The `XMLTABLE(...)` clause of a [`TableFnSpec`]: the row path, the
+/// namespace prefixes, and the columns in the order they were written.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct XmlTableSpec {
+    /// The row path: the XPath expression the rows are selected with.
+    pub path: ScalarExpr,
+    /// `XMLNAMESPACES('uri' AS prefix, ...)`: the prefixes the paths may
+    /// use; `None` is a `DEFAULT` item, which PostgreSQL refuses.
+    #[serde(default)]
+    pub namespaces: Vec<XmlTableNamespace>,
+    /// The columns of `COLUMNS (...)`, in order.
+    pub columns: Vec<XmlTableColumn>,
+    /// A clause PostgreSQL refuses when it parses the call, as the error it
+    /// raises; evaluating the table raises it before any row.
+    #[serde(default)]
+    pub refuse: Option<String>,
+}
+
+/// One item of `XMLTABLE`'s `XMLNAMESPACES` clause.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct XmlTableNamespace {
+    /// The prefix, or `None` for `DEFAULT`.
+    pub prefix: Option<String>,
+    /// The namespace URI, a text expression.
+    pub uri: ScalarExpr,
+}
+
+/// One `XMLTABLE` column.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct XmlTableColumn {
+    /// The output column name (also the default path, when none is given).
+    pub name: String,
+    /// What the column extracts.
+    pub kind: XmlTableColumnKind,
+}
+
+/// How an `XMLTABLE` column produces its value.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum XmlTableColumnKind {
+    /// `name FOR ORDINALITY`: the 1-based number of the row.
+    Ordinality,
+    /// `name type [PATH path] [DEFAULT expr] [NOT NULL | NULL]`: the node
+    /// the path selects as the column's type.
+    Value {
+        /// The column's declared type.
+        column_type: String,
+        /// The path, defaulting to the column name.
+        #[serde(default)]
+        path: Option<ScalarExpr>,
+        /// `DEFAULT expr`, already coerced to the column type.
+        #[serde(default)]
+        default: Option<ScalarExpr>,
+        /// `NOT NULL`: a null value is refused.
+        #[serde(default)]
+        not_null: bool,
+    },
 }
 
 /// The `JSON_TABLE` clause of a [`TableFnSpec`]: the row path with its

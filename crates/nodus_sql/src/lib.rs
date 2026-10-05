@@ -49,8 +49,8 @@ pub fn parse_sql(
     }
     let tokens = reorder_identity_options(reorder_sequence_options(rewrite_data_clauses(
         rewrite_record_star(rewrite_json_table(rewrite_sql_json(
-            rewrite_json_constructors(rewrite_xmlexists(rewrite_xml_constructors(
-                rewrite_xml_syntax(rewrite_query_syntax(tokens)),
+            rewrite_json_constructors(rewrite_xmlexists(rewrite_xmltable(
+                rewrite_xml_constructors(rewrite_xml_syntax(rewrite_query_syntax(tokens))),
             ))),
         ))),
     )));
@@ -1046,6 +1046,489 @@ fn rewrite_sql_json(
         i += 1;
     }
     tokens
+}
+
+/// Whether a word starts an `XMLTABLE` column option.
+fn xmltable_option_word(word: &str) -> bool {
+    matches!(word, "path" | "default" | "not" | "null")
+}
+
+/// One `XMLNAMESPACES` item: `'uri' AS prefix` or `DEFAULT 'uri'`, as the
+/// prefix (lowercased when it was not quoted) and the URI expression.
+fn xmltable_namespace(
+    tokens: &[sqlparser::tokenizer::TokenWithSpan],
+    from: usize,
+    to: usize,
+) -> Option<(Option<String>, String)> {
+    use sqlparser::tokenizer::Token;
+    let word = |t: &sqlparser::tokenizer::TokenWithSpan| match &t.token {
+        Token::Word(w) if w.quote_style.is_none() => Some(w.value.clone()),
+        _ => None,
+    };
+    let significant =
+        |from: usize| (from..to).find(|&i| !matches!(tokens[i].token, Token::Whitespace(_)));
+    let at = significant(from)?;
+    if word(&tokens[at]).as_deref() == Some("default") {
+        let uri_from = significant(at + 1)?;
+        let uri = render_tokens(&tokens[uri_from..to]);
+        if uri.trim().is_empty() {
+            return None;
+        }
+        return Some((None, uri));
+    }
+    // The top-level `AS`: the prefix follows it, the URI is before it.
+    let mut as_at = None;
+    let mut depth = 0i32;
+    for (index, token) in tokens.iter().enumerate().take(to).skip(at) {
+        match token.token {
+            Token::LParen | Token::LBracket => depth += 1,
+            Token::RParen | Token::RBracket => depth -= 1,
+            _ => {}
+        }
+        if depth == 0 && word(token).as_deref() == Some("as") {
+            as_at = Some(index);
+            break;
+        }
+    }
+    let as_at = as_at?;
+    let uri = render_tokens(&tokens[at..as_at]);
+    if uri.trim().is_empty() {
+        return None;
+    }
+    let prefix_at = significant(as_at + 1)?;
+    let Token::Word(prefix) = &tokens[prefix_at].token else {
+        return None;
+    };
+    if significant(prefix_at + 1).is_some_and(|at| at < to) {
+        return None;
+    }
+    let prefix = if prefix.quote_style.is_some() {
+        prefix.value.clone()
+    } else {
+        prefix.value.to_lowercase()
+    };
+    Some((Some(prefix), uri))
+}
+
+/// The expression of an `XMLTABLE` column option, as the SQL it was written
+/// as: one `b_expr` up to the next option keyword. Returns it with the
+/// index it ends at, or `None` when there is none.
+fn xmltable_option_expression(
+    tokens: &[sqlparser::tokenizer::TokenWithSpan],
+    from: usize,
+    to: usize,
+) -> Option<(String, usize)> {
+    use sqlparser::tokenizer::Token;
+    let word = |t: &sqlparser::tokenizer::TokenWithSpan| match &t.token {
+        Token::Word(w) if w.quote_style.is_none() => Some(w.value.clone()),
+        _ => None,
+    };
+    let significant =
+        |from: usize| (from..to).find(|&i| !matches!(tokens[i].token, Token::Whitespace(_)));
+    let start = significant(from)?;
+    // A leading `NULL` is an expression of its own, so that a `default
+    // null` and the option after it both read right.
+    let end = if word(&tokens[start]).as_deref() == Some("null") {
+        start + 1
+    } else {
+        let mut at = start;
+        let mut depth = 0i32;
+        while at < to {
+            match tokens[at].token {
+                Token::LParen | Token::LBracket => depth += 1,
+                Token::RParen | Token::RBracket => depth -= 1,
+                _ => {}
+            }
+            if depth == 0
+                && at > start
+                && xmltable_option_word(&word(&tokens[at]).unwrap_or_default())
+            {
+                break;
+            }
+            at += 1;
+        }
+        at
+    };
+    let text = render_tokens(&tokens[start..end]);
+    if text.trim().is_empty() {
+        return None;
+    }
+    Some((text, end))
+}
+
+/// The columns of an `XMLTABLE` call, between `from` and `to`, as the
+/// marker calls the table-function planner reads. `None` when a column is
+/// not one PostgreSQL would take, leaving the call to the parser's error;
+/// a clause PostgreSQL's grammar refuses when it reads the column is left
+/// in `refuse`, for the planner to raise before any row.
+fn xmltable_columns(
+    tokens: &[sqlparser::tokenizer::TokenWithSpan],
+    from: usize,
+    to: usize,
+    refuse: &mut String,
+) -> Option<String> {
+    use sqlparser::tokenizer::Token;
+    let word = |t: &sqlparser::tokenizer::TokenWithSpan| match &t.token {
+        Token::Word(w) if w.quote_style.is_none() => Some(w.value.clone()),
+        _ => None,
+    };
+    let significant =
+        |from: usize| (from..to).find(|&i| !matches!(tokens[i].token, Token::Whitespace(_)));
+    let set_refuse = |refuse: &mut String, message: String| {
+        if refuse.is_empty() {
+            *refuse = message;
+        }
+    };
+    let mut parts = Vec::new();
+    for (cf, cto) in split_top_level(tokens, from, to) {
+        let mut at = significant(cf)?;
+        let Token::Word(name) = &tokens[at].token else {
+            return None;
+        };
+        let column_name = if name.quote_style.is_some() {
+            name.value.clone()
+        } else {
+            name.value.to_lowercase()
+        };
+        at = significant(at + 1)?;
+        // `name FOR ORDINALITY`.
+        if word(&tokens[at]).as_deref() == Some("for") {
+            at = significant(at + 1)?;
+            if word(&tokens[at]).as_deref() != Some("ordinality") {
+                return None;
+            }
+            if significant(at + 1).is_some_and(|at| at < cto) {
+                return None;
+            }
+            parts.push(format!(
+                "pg_catalog.__xt_col_ordinality__('{}')",
+                column_name.replace('\'', "''")
+            ));
+            continue;
+        }
+        // The column's type runs to the first option keyword.
+        let type_from = at;
+        while at < cto && !xmltable_option_word(&word(&tokens[at]).unwrap_or_default()) {
+            at += 1;
+        }
+        let column_type = render_tokens(&tokens[type_from..at]).trim().to_string();
+        if column_type.is_empty() {
+            return None;
+        }
+        // A column cannot be `SETOF`.
+        if column_type
+            .split_whitespace()
+            .next()
+            .is_some_and(|word| word.eq_ignore_ascii_case("setof"))
+        {
+            set_refuse(
+                refuse,
+                format!("column \"{column_name}\" cannot be declared SETOF"),
+            );
+        }
+        // `[PATH expr] [DEFAULT expr] [NOT NULL | NULL]`, any order.
+        let mut path: Option<String> = None;
+        let mut default: Option<String> = None;
+        let mut not_null = false;
+        let mut nullability_seen = false;
+        while let Some(key) = significant(at).filter(|&at| at < cto) {
+            let at_next;
+            match word(&tokens[key]).as_deref() {
+                Some("path") => {
+                    let (expr, next) = xmltable_option_expression(tokens, key + 1, cto)?;
+                    if path.is_some() {
+                        set_refuse(
+                            refuse,
+                            "only one PATH value per column is allowed".to_string(),
+                        );
+                    }
+                    path = Some(expr);
+                    at_next = next;
+                }
+                Some("default") => {
+                    let (expr, next) = xmltable_option_expression(tokens, key + 1, cto)?;
+                    if default.is_some() {
+                        set_refuse(refuse, "only one DEFAULT value is allowed".to_string());
+                    }
+                    default = Some(expr);
+                    at_next = next;
+                }
+                Some("not") => {
+                    let null_at = significant(key + 1).filter(|&at| at < cto)?;
+                    if word(&tokens[null_at]).as_deref() != Some("null") {
+                        return None;
+                    }
+                    if nullability_seen {
+                        set_refuse(
+                            refuse,
+                            format!(
+                                "conflicting or redundant NULL / NOT NULL declarations \
+                                 for column \"{column_name}\""
+                            ),
+                        );
+                    }
+                    not_null = true;
+                    nullability_seen = true;
+                    at_next = null_at + 1;
+                }
+                Some("null") => {
+                    if nullability_seen {
+                        set_refuse(
+                            refuse,
+                            format!(
+                                "conflicting or redundant NULL / NOT NULL declarations \
+                                 for column \"{column_name}\""
+                            ),
+                        );
+                    }
+                    not_null = false;
+                    nullability_seen = true;
+                    at_next = key + 1;
+                }
+                Some(option) => {
+                    // An unknown option, `name value`, which PostgreSQL
+                    // refuses as it reads the column.
+                    let (_, next) = xmltable_option_expression(tokens, key + 1, cto)?;
+                    set_refuse(refuse, format!("unrecognized column option \"{option}\""));
+                    at_next = next;
+                }
+                None => return None,
+            }
+            at = at_next;
+        }
+        let type_literal = column_type.replace('\'', "''");
+        let path = path.unwrap_or_else(|| "NULL".to_string());
+        let default = default.unwrap_or_else(|| "NULL".to_string());
+        parts.push(format!(
+            "pg_catalog.__xt_col__('{}', '{type_literal}', {path}, {default}, {not_null})",
+            column_name.replace('\'', "''")
+        ));
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some(parts.join(", "))
+}
+
+/// The SQL/XML `XMLTABLE(...)` table function, which the parser cannot read
+/// with its `COLUMNS` clause, rewritten to the marker function the
+/// table-function planner knows (see `xmltable.rs`):
+/// `pg_catalog.__xml_table__(document, path, refuse, namespace..., column...)`.
+/// Each `XMLNAMESPACES` item becomes
+/// `pg_catalog.__xt_ns__('prefix' | NULL, uri)`, and each column
+/// `pg_catalog.__xt_col_ordinality__('name')` or
+/// `pg_catalog.__xt_col__('name', 'type', path, default, not-null)`. The
+/// `refuse` string carries a clause PostgreSQL rejects when its grammar or
+/// parse analysis reads the call, so the error is raised when the table is
+/// evaluated.
+fn rewrite_xmltable(
+    mut tokens: Vec<sqlparser::tokenizer::TokenWithSpan>,
+) -> Vec<sqlparser::tokenizer::TokenWithSpan> {
+    use sqlparser::tokenizer::{Token, TokenWithSpan};
+    let word = |t: &TokenWithSpan| match &t.token {
+        Token::Word(w) if w.quote_style.is_none() => Some(w.value.clone()),
+        _ => None,
+    };
+    let significant = |tokens: &[TokenWithSpan], from: usize| {
+        (from..tokens.len()).find(|&i| !matches!(tokens[i].token, Token::Whitespace(_)))
+    };
+    let matching_paren = |tokens: &[TokenWithSpan], open: usize| {
+        let mut depth = 0i32;
+        for (i, token) in tokens.iter().enumerate().skip(open) {
+            match token.token {
+                Token::LParen => depth += 1,
+                Token::RParen => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    };
+    // The top-level word `expected` of a token range.
+    let top_level_word = |tokens: &[TokenWithSpan], from: usize, to: usize, expected: &str| {
+        let mut depth = 0i32;
+        for (i, token) in tokens.iter().enumerate().take(to).skip(from) {
+            match token.token {
+                Token::LParen | Token::LBracket => depth += 1,
+                Token::RParen | Token::RBracket => depth -= 1,
+                _ => {}
+            }
+            if depth == 0 && word(token).as_deref() == Some(expected) {
+                return Some(i);
+            }
+        }
+        None
+    };
+    // `by {ref|value}`, as the index its keyword starts at.
+    let by_kind = |tokens: &[TokenWithSpan], at: usize, limit: usize| -> Option<usize> {
+        let by = significant(tokens, at).filter(|&k| k < limit)?;
+        if word(&tokens[by]).as_deref() != Some("by") {
+            return None;
+        }
+        let kind = significant(tokens, by + 1).filter(|&k| k < limit)?;
+        matches!(word(&tokens[kind]).as_deref(), Some("ref" | "value")).then_some(by)
+    };
+    let mut i = 0;
+    while i < tokens.len() {
+        if word(&tokens[i]).as_deref() != Some("xmltable") {
+            i += 1;
+            continue;
+        }
+        let Some(open) = significant(&tokens, i + 1) else {
+            i += 1;
+            continue;
+        };
+        if tokens[open].token != Token::LParen {
+            i += 1;
+            continue;
+        }
+        let Some(close) = matching_paren(&tokens, open) else {
+            i += 1;
+            continue;
+        };
+        let mut at = open + 1;
+        let mut refuse = String::new();
+        // The optional `XMLNAMESPACES('uri' AS prefix, ...),` lead.
+        let mut namespaces: Vec<(Option<String>, String)> = Vec::new();
+        if let Some(first) = significant(&tokens, at).filter(|&k| k < close)
+            && word(&tokens[first]).as_deref() == Some("xmlnamespaces")
+        {
+            let Some(nopen) = significant(&tokens, first + 1).filter(|&k| k < close) else {
+                i += 1;
+                continue;
+            };
+            if tokens[nopen].token != Token::LParen {
+                i += 1;
+                continue;
+            }
+            let Some(nclose) = matching_paren(&tokens, nopen).filter(|&k| k < close) else {
+                i += 1;
+                continue;
+            };
+            let Some(comma) = significant(&tokens, nclose + 1).filter(|&k| k < close) else {
+                i += 1;
+                continue;
+            };
+            if tokens[comma].token != Token::Comma {
+                i += 1;
+                continue;
+            }
+            let mut ok = true;
+            for (nf, nto) in split_top_level(&tokens, nopen + 1, nclose) {
+                match xmltable_namespace(&tokens, nf, nto) {
+                    Some(namespace) => namespaces.push(namespace),
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if !ok {
+                i += 1;
+                continue;
+            }
+            at = comma + 1;
+        }
+        // The row expression, up to `PASSING`.
+        let Some(passing) = top_level_word(&tokens, at, close, "passing") else {
+            i += 1;
+            continue;
+        };
+        let path = render_tokens(&tokens[at..passing]);
+        if path.trim().is_empty() {
+            i += 1;
+            continue;
+        }
+        // `PASSING [BY {REF|VALUE}] document [BY {REF|VALUE}] COLUMNS ...`.
+        let Some(columns) = top_level_word(&tokens, passing + 1, close, "columns") else {
+            i += 1;
+            continue;
+        };
+        let mut document_from = passing + 1;
+        if let Some(by) = by_kind(&tokens, document_from, columns)
+            && let Some(kind) = significant(&tokens, by + 1)
+        {
+            document_from = significant(&tokens, kind + 1).unwrap_or(columns);
+        }
+        // A trailing `BY {REF|VALUE}` ends the document.
+        let mut rest = columns;
+        let mut by_at = document_from;
+        while by_at < columns {
+            match by_kind(&tokens, by_at, columns) {
+                Some(by) => {
+                    rest = by;
+                    break;
+                }
+                None => by_at += 1,
+            }
+        }
+        let document = render_tokens(&tokens[document_from..rest]);
+        if document.trim().is_empty() {
+            i += 1;
+            continue;
+        }
+        // `COLUMNS` is not parenthesized, as PostgreSQL's grammar has it:
+        // the columns run to the table's closing parenthesis.
+        let Some(columns) = xmltable_columns(&tokens, columns + 1, close, &mut refuse) else {
+            i += 1;
+            continue;
+        };
+        let mut namespace_args = String::new();
+        for (prefix, uri) in &namespaces {
+            let prefix = match prefix {
+                Some(prefix) => format!("'{}'", prefix.replace('\'', "''")),
+                None => "NULL".to_string(),
+            };
+            namespace_args.push_str(&format!(", pg_catalog.__xt_ns__({prefix}, {uri})"));
+        }
+        let replacement = format!(
+            "pg_catalog.__xml_table__({document}, {path}, '{}', {columns}{namespace_args})",
+            refuse.replace('\'', "''")
+        );
+        if let Some(snippet) = snippet_tokens(&replacement) {
+            tokens.splice(i..=close, snippet);
+            // The arguments may hold further XMLTABLE calls; scan again.
+            i = 0;
+            continue;
+        }
+        i += 1;
+    }
+    tokens
+}
+
+/// The top-level `,`-separated items of a token range.
+fn split_top_level(
+    tokens: &[sqlparser::tokenizer::TokenWithSpan],
+    from: usize,
+    to: usize,
+) -> Vec<(usize, usize)> {
+    use sqlparser::tokenizer::Token;
+    let mut items = Vec::new();
+    let mut depth = 0i32;
+    let mut start = None;
+    for (i, token) in tokens.iter().enumerate().take(to).skip(from) {
+        match token.token {
+            Token::LParen | Token::LBracket => depth += 1,
+            Token::RParen | Token::RBracket => depth -= 1,
+            Token::Comma if depth == 0 => {
+                items.push((start.unwrap_or(from), i));
+                start = None;
+                continue;
+            }
+            _ => {}
+        }
+        if start.is_none() && !matches!(token.token, Token::Whitespace(_)) {
+            start = Some(i);
+        }
+    }
+    if let Some(start) = start {
+        items.push((start, to));
+    }
+    items
 }
 
 /// `XMLEXISTS(expression PASSING [BY {REF|VALUE}] document [BY {REF|VALUE}])`
@@ -3729,6 +4212,42 @@ mod rewrite_tests {
 
     fn xmlexists_rewritten(sql: &str) -> String {
         rewritten_by(sql, rewrite_xmlexists)
+    }
+
+    fn xmltable_rewritten(sql: &str) -> String {
+        rewritten_by(sql, rewrite_xmltable)
+    }
+
+    #[test]
+    fn xmltable_becomes_its_markers() {
+        assert_eq!(
+            xmltable_rewritten(
+                "select * from xmltable('/a/b' passing '<a><b>1</b></a>' columns v int path '.')"
+            ),
+            "select * from pg_catalog.__xml_table__( '<a><b>1</b></a>' , '/a/b' , '', \
+             pg_catalog.__xt_col__('v', 'int', '.', NULL, false))"
+        );
+        assert_eq!(
+            xmltable_rewritten(
+                "select * from xmltable(xmlnamespaces('urn:x' as x), '/x:a' passing by value \
+                 '<x:a/>' columns n for ordinality, v text path 'b' default 'd' not null)"
+            ),
+            "select * from pg_catalog.__xml_table__('<x:a/>' ,  '/x:a' , '', \
+             pg_catalog.__xt_col_ordinality__('n'), pg_catalog.__xt_col__('v', 'text', 'b' , 'd' , \
+             true), pg_catalog.__xt_ns__('x', 'urn:x' ))"
+        );
+    }
+
+    #[test]
+    fn xmltable_refuses_a_bad_column_when_evaluated() {
+        // A clause PostgreSQL's grammar refuses when it reads the column
+        // travels as the table's `refuse`, for the planner to raise.
+        assert!(
+            xmltable_rewritten(
+                "select * from xmltable('/a' passing '<a/>' columns v int path 'a' path 'b')"
+            )
+            .contains("'only one PATH value per column is allowed'")
+        );
     }
 
     #[test]

@@ -90,15 +90,18 @@ pub(crate) fn xpath(
     document: &Document,
     namespaces: &[(String, String)],
 ) -> Result<Vec<String>, XpError> {
-    let tree = Tree::build(document);
-    let value = evaluate(expression, &tree, namespaces)?;
-    Ok(match value {
-        Value::Nodes(nodes) => nodes.iter().map(|&node| tree.serialize(node)).collect(),
+    if expression.trim().is_empty() {
+        return Err(XpError::new("empty XPath expression", "10608"));
+    }
+    let doc = XpDoc::new(document, namespaces);
+    let ast = doc.compile(expression)?;
+    Ok(match doc.value_at(&ast, doc.document_node())? {
+        XpValue::Nodes(nodes) => nodes.iter().map(|&node| doc.node_xml(node)).collect(),
         // A number is the DOUBLE PRECISION a PostgreSQL XPath object
         // carries, written as PostgreSQL writes one; any other result is a
         // string written markup-safe.
-        Value::Num(number) => vec![crate::xml::escape_xml(&float8_to_string(number))],
-        other => vec![crate::xml::escape_xml(&other.string_value(&tree))],
+        XpValue::Num(number) => vec![crate::xml::escape_xml(&float8_to_string(number))],
+        other => vec![crate::xml::escape_xml(&other.string_value(&doc.tree))],
     })
 }
 
@@ -109,37 +112,82 @@ pub(crate) fn xpath_exists(
     document: &Document,
     namespaces: &[(String, String)],
 ) -> Result<bool, XpError> {
-    let tree = Tree::build(document);
-    Ok(matches!(
-        evaluate(expression, &tree, namespaces)?,
-        Value::Nodes(nodes) if !nodes.is_empty()
-    ))
-}
-
-/// Parses the expression and evaluates it with the document node as the
-/// context node.
-fn evaluate(
-    expression: &str,
-    tree: &Tree,
-    namespaces: &[(String, String)],
-) -> Result<Value, XpError> {
     if expression.trim().is_empty() {
         return Err(XpError::new("empty XPath expression", "10608"));
     }
-    let mut parser = Parser {
-        chars: expression.chars().collect(),
-        pos: 0,
-        namespaces,
-    };
-    let ast = parser.parse()?;
-    Context {
-        tree,
-        ns: namespaces,
-        node: 0,
-        position: 1,
-        size: 1,
+    let doc = XpDoc::new(document, namespaces);
+    let ast = doc.compile(expression)?;
+    Ok(matches!(
+        doc.value_at(&ast, doc.document_node())?,
+        XpValue::Nodes(nodes) if !nodes.is_empty()
+    ))
+}
+
+/// A compiled XPath expression.
+pub(crate) struct XpExpr(Expr);
+
+/// A document prepared for XPath evaluation, with the namespace prefixes a
+/// call registers: expressions compile once and evaluate at any node of the
+/// tree, the document node being the context a row path starts from.
+pub(crate) struct XpDoc<'a> {
+    tree: Tree<'a>,
+    ns: Vec<(String, String)>,
+}
+
+impl<'a> XpDoc<'a> {
+    pub(crate) fn new(document: &'a Document, namespaces: &[(String, String)]) -> XpDoc<'a> {
+        XpDoc {
+            tree: Tree::build(document),
+            ns: namespaces.to_vec(),
+        }
     }
-    .eval(&ast)
+
+    /// The document node, the context a row path is evaluated at.
+    pub(crate) fn document_node(&self) -> usize {
+        0
+    }
+
+    /// Compiles an expression: libxml2 parses one when a filter is
+    /// installed, before any row.
+    pub(crate) fn compile(&self, expression: &str) -> Result<XpExpr, XpError> {
+        let mut parser = Parser {
+            chars: expression.chars().collect(),
+            pos: 0,
+            namespaces: &self.ns,
+        };
+        parser.parse().map(XpExpr)
+    }
+
+    /// Evaluates a compiled expression with `node` as the context node.
+    pub(crate) fn value_at(&self, expr: &XpExpr, node: usize) -> Result<XpValue, XpError> {
+        Context {
+            tree: &self.tree,
+            ns: &self.ns,
+            node,
+            position: 1,
+            size: 1,
+        }
+        .eval(&expr.0)
+    }
+
+    /// The items a row path selects with the document as context: the rows
+    /// of an `XMLTABLE`. A result that is not a node-set selects none.
+    pub(crate) fn row_items(&self, expr: &XpExpr) -> Result<Vec<usize>, XpError> {
+        Ok(match self.value_at(expr, 0)? {
+            XpValue::Nodes(nodes) => nodes,
+            _ => Vec::new(),
+        })
+    }
+
+    /// A node as an XML value: how an `xml` column takes one.
+    pub(crate) fn node_xml(&self, node: usize) -> String {
+        self.tree.serialize(node)
+    }
+
+    /// A node's string value: how another column type takes one.
+    pub(crate) fn node_string(&self, node: usize) -> String {
+        self.tree.string_value(node)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1186,20 +1234,20 @@ fn libxml2_number(text: &str) -> f64 {
 // Evaluation.
 
 /// An XPath value: a node-set, a string, a number, or a boolean.
-enum Value {
+pub(crate) enum XpValue {
     Nodes(Vec<usize>),
     Str(String),
     Num(f64),
     Bool(bool),
 }
 
-impl Value {
+impl XpValue {
     fn string_value(&self, tree: &Tree) -> String {
         match self {
-            Value::Str(text) => text.clone(),
-            Value::Num(number) => number_text(*number),
-            Value::Bool(b) => if *b { "true" } else { "false" }.to_string(),
-            Value::Nodes(nodes) => nodes
+            XpValue::Str(text) => text.clone(),
+            XpValue::Num(number) => number_text(*number),
+            XpValue::Bool(b) => if *b { "true" } else { "false" }.to_string(),
+            XpValue::Nodes(nodes) => nodes
                 .first()
                 .map(|&node| tree.string_value(node))
                 .unwrap_or_default(),
@@ -1208,25 +1256,25 @@ impl Value {
 
     fn number_value(&self, tree: &Tree) -> f64 {
         match self {
-            Value::Num(number) => *number,
-            Value::Bool(b) => {
+            XpValue::Num(number) => *number,
+            XpValue::Bool(b) => {
                 if *b {
                     1.0
                 } else {
                     0.0
                 }
             }
-            Value::Str(text) => text.trim().parse().unwrap_or(f64::NAN),
-            Value::Nodes(_) => self.string_value(tree).trim().parse().unwrap_or(f64::NAN),
+            XpValue::Str(text) => text.trim().parse().unwrap_or(f64::NAN),
+            XpValue::Nodes(_) => self.string_value(tree).trim().parse().unwrap_or(f64::NAN),
         }
     }
 
     fn bool_value(&self) -> bool {
         match self {
-            Value::Bool(b) => *b,
-            Value::Num(number) => *number != 0.0 && !number.is_nan(),
-            Value::Str(text) => !text.is_empty(),
-            Value::Nodes(nodes) => !nodes.is_empty(),
+            XpValue::Bool(b) => *b,
+            XpValue::Num(number) => *number != 0.0 && !number.is_nan(),
+            XpValue::Str(text) => !text.is_empty(),
+            XpValue::Nodes(nodes) => !nodes.is_empty(),
         }
     }
 }
@@ -1352,19 +1400,19 @@ impl<'a> Context<'a> {
         }
     }
 
-    fn eval(&self, expr: &Expr) -> Result<Value, XpError> {
+    fn eval(&self, expr: &Expr) -> Result<XpValue, XpError> {
         Ok(match expr {
             Expr::Or(left, right) => {
-                Value::Bool(self.eval(left)?.bool_value() || self.eval(right)?.bool_value())
+                XpValue::Bool(self.eval(left)?.bool_value() || self.eval(right)?.bool_value())
             }
             Expr::And(left, right) => {
-                Value::Bool(self.eval(left)?.bool_value() && self.eval(right)?.bool_value())
+                XpValue::Bool(self.eval(left)?.bool_value() && self.eval(right)?.bool_value())
             }
-            Expr::Neg(inner) => Value::Num(-self.eval(inner)?.number_value(self.tree)),
+            Expr::Neg(inner) => XpValue::Num(-self.eval(inner)?.number_value(self.tree)),
             Expr::Arith(op, left, right) => {
                 let left = self.eval(left)?.number_value(self.tree);
                 let right = self.eval(right)?.number_value(self.tree);
-                Value::Num(match op {
+                XpValue::Num(match op {
                     ArithOp::Add => left + right,
                     ArithOp::Sub => left - right,
                     ArithOp::Mul => left * right,
@@ -1375,23 +1423,23 @@ impl<'a> Context<'a> {
             Expr::Cmp(op, left, right) => {
                 let left = self.eval(left)?;
                 let right = self.eval(right)?;
-                Value::Bool(compare(*op, &left, &right, self.tree))
+                XpValue::Bool(compare(*op, &left, &right, self.tree))
             }
             Expr::Union(left, right) => {
                 let mut nodes = match self.eval(left)? {
-                    Value::Nodes(nodes) => nodes,
+                    XpValue::Nodes(nodes) => nodes,
                     _ => return Err(invalid_expression()),
                 };
                 match self.eval(right)? {
-                    Value::Nodes(other) => nodes.extend(other),
+                    XpValue::Nodes(other) => nodes.extend(other),
                     _ => return Err(invalid_expression()),
                 }
                 nodes.sort_unstable();
                 nodes.dedup();
-                Value::Nodes(nodes)
+                XpValue::Nodes(nodes)
             }
             Expr::Path { absolute, steps } => {
-                let mut value = Value::Nodes(vec![if *absolute { 0 } else { self.node }]);
+                let mut value = XpValue::Nodes(vec![if *absolute { 0 } else { self.node }]);
                 for step in steps {
                     value = self.step(step, value)?;
                 }
@@ -1405,14 +1453,14 @@ impl<'a> Context<'a> {
                 value
             }
             Expr::Call(name, args) => self.call(name, args)?,
-            Expr::Number(number) => Value::Num(*number),
-            Expr::Literal(text) => Value::Str(text.clone()),
+            Expr::Number(number) => XpValue::Num(*number),
+            Expr::Literal(text) => XpValue::Str(text.clone()),
         })
     }
 
     /// Applies one step to a node-set.
-    fn step(&self, step: &Step, value: Value) -> Result<Value, XpError> {
-        let Value::Nodes(nodes) = value else {
+    fn step(&self, step: &Step, value: XpValue) -> Result<XpValue, XpError> {
+        let XpValue::Nodes(nodes) = value else {
             return Err(invalid_expression());
         };
         let mut out = Vec::new();
@@ -1431,7 +1479,7 @@ impl<'a> Context<'a> {
         }
         out.sort_unstable();
         out.dedup();
-        Ok(Value::Nodes(out))
+        Ok(XpValue::Nodes(out))
     }
 
     /// Whether a node passes every predicate, at its proximity position.
@@ -1439,7 +1487,7 @@ impl<'a> Context<'a> {
         for predicate in predicates {
             let value = self.eval(predicate)?;
             let keep = match value {
-                Value::Num(number) => number == self.position as f64,
+                XpValue::Num(number) => number == self.position as f64,
                 other => other.bool_value(),
             };
             if !keep {
@@ -1450,8 +1498,8 @@ impl<'a> Context<'a> {
     }
 
     /// Filters a node-set by a predicate over the whole set.
-    fn filter(&self, value: Value, predicate: &Expr) -> Result<Value, XpError> {
-        let Value::Nodes(nodes) = value else {
+    fn filter(&self, value: XpValue, predicate: &Expr) -> Result<XpValue, XpError> {
+        let XpValue::Nodes(nodes) = value else {
             return Err(invalid_expression());
         };
         let size = nodes.len();
@@ -1459,14 +1507,14 @@ impl<'a> Context<'a> {
         for (index, node) in nodes.iter().enumerate() {
             let value = self.at(*node, index + 1, size).eval(predicate)?;
             let keep = match value {
-                Value::Num(number) => number == (index + 1) as f64,
+                XpValue::Num(number) => number == (index + 1) as f64,
                 other => other.bool_value(),
             };
             if keep {
                 out.push(*node);
             }
         }
-        Ok(Value::Nodes(out))
+        Ok(XpValue::Nodes(out))
     }
 
     /// The nodes the axis selects from `node`.
@@ -1576,7 +1624,7 @@ impl<'a> Context<'a> {
         }
     }
 
-    fn call(&self, name: &str, args: &[Expr]) -> Result<Value, XpError> {
+    fn call(&self, name: &str, args: &[Expr]) -> Result<XpValue, XpError> {
         // libxml2 checks a function's argument count as it evaluates the
         // call: too few or too many fails to build the XPath object.
         let arity = match name {
@@ -1595,7 +1643,7 @@ impl<'a> Context<'a> {
         if !arity {
             return Err(invalid_arity());
         }
-        let arg = |index: usize| -> Result<Value, XpError> {
+        let arg = |index: usize| -> Result<XpValue, XpError> {
             match args.get(index) {
                 Some(expr) => self.eval(expr),
                 None => Err(invalid_expression()),
@@ -1611,19 +1659,19 @@ impl<'a> Context<'a> {
         Ok(match name {
             "true" => {
                 no_args(0)?;
-                Value::Bool(true)
+                XpValue::Bool(true)
             }
             "false" => {
                 no_args(0)?;
-                Value::Bool(false)
+                XpValue::Bool(false)
             }
-            "not" => Value::Bool(!arg(0)?.bool_value()),
-            "boolean" => Value::Bool(arg(0)?.bool_value()),
-            "string" => Value::Str(match args.len() {
+            "not" => XpValue::Bool(!arg(0)?.bool_value()),
+            "boolean" => XpValue::Bool(arg(0)?.bool_value()),
+            "string" => XpValue::Str(match args.len() {
                 0 => self.tree.string_value(self.node),
                 _ => arg(0)?.string_value(self.tree),
             }),
-            "number" => Value::Num(match args.len() {
+            "number" => XpValue::Num(match args.len() {
                 0 => self
                     .tree
                     .string_value(self.node)
@@ -1634,21 +1682,21 @@ impl<'a> Context<'a> {
             }),
             "position" => {
                 no_args(0)?;
-                Value::Num(self.position as f64)
+                XpValue::Num(self.position as f64)
             }
             "last" => {
                 no_args(0)?;
-                Value::Num(self.size as f64)
+                XpValue::Num(self.size as f64)
             }
             "count" => match arg(0)? {
-                Value::Nodes(nodes) => Value::Num(nodes.len() as f64),
+                XpValue::Nodes(nodes) => XpValue::Num(nodes.len() as f64),
                 _ => return Err(invalid_expression()),
             },
             "name" | "local-name" | "namespace-uri" => {
                 let node = match args.len() {
                     0 => Some(self.node),
                     _ => match arg(0)? {
-                        Value::Nodes(nodes) => nodes.first().copied(),
+                        XpValue::Nodes(nodes) => nodes.first().copied(),
                         _ => return Err(invalid_expression()),
                     },
                 };
@@ -1656,42 +1704,42 @@ impl<'a> Context<'a> {
                     || (String::new(), String::new(), String::new()),
                     |node| self.tree.name(node),
                 );
-                Value::Str(match name {
+                XpValue::Str(match name {
                     "local-name" => local,
                     "namespace-uri" => uri,
                     _ => local,
                 })
             }
             "text" => match arg(0)? {
-                Value::Nodes(nodes) => Value::Str(
+                XpValue::Nodes(nodes) => XpValue::Str(
                     nodes
                         .first()
                         .map(|&node| self.tree.string_value(node))
                         .unwrap_or_default(),
                 ),
-                other => Value::Str(other.string_value(self.tree)),
+                other => XpValue::Str(other.string_value(self.tree)),
             },
             "concat" => {
                 let mut out = String::new();
                 for index in 0..args.len() {
                     out.push_str(&arg(index)?.string_value(self.tree));
                 }
-                Value::Str(out)
+                XpValue::Str(out)
             }
             "starts-with" => {
                 let haystack = arg(0)?.string_value(self.tree);
                 let needle = arg(1)?.string_value(self.tree);
-                Value::Bool(haystack.starts_with(&needle))
+                XpValue::Bool(haystack.starts_with(&needle))
             }
             "contains" => {
                 let haystack = arg(0)?.string_value(self.tree);
                 let needle = arg(1)?.string_value(self.tree);
-                Value::Bool(haystack.contains(&needle))
+                XpValue::Bool(haystack.contains(&needle))
             }
             "substring-before" => {
                 let haystack = arg(0)?.string_value(self.tree);
                 let needle = arg(1)?.string_value(self.tree);
-                Value::Str(match haystack.find(&needle) {
+                XpValue::Str(match haystack.find(&needle) {
                     Some(at) => haystack[..at].to_string(),
                     None => String::new(),
                 })
@@ -1699,7 +1747,7 @@ impl<'a> Context<'a> {
             "substring-after" => {
                 let haystack = arg(0)?.string_value(self.tree);
                 let needle = arg(1)?.string_value(self.tree);
-                Value::Str(match haystack.find(&needle) {
+                XpValue::Str(match haystack.find(&needle) {
                     Some(at) => haystack[at + needle.len()..].to_string(),
                     None => String::new(),
                 })
@@ -1736,21 +1784,21 @@ impl<'a> Context<'a> {
                 };
                 let from = from.min(text.len());
                 let to = to.clamp(from, text.len());
-                Value::Str(text[from..to].iter().collect())
+                XpValue::Str(text[from..to].iter().collect())
             }
             "string-length" => {
                 let text = match args.len() {
                     0 => self.tree.string_value(self.node),
                     _ => arg(0)?.string_value(self.tree),
                 };
-                Value::Num(text.chars().count() as f64)
+                XpValue::Num(text.chars().count() as f64)
             }
             "normalize-space" => {
                 let text = match args.len() {
                     0 => self.tree.string_value(self.node),
                     _ => arg(0)?.string_value(self.tree),
                 };
-                Value::Str(text.split_whitespace().collect::<Vec<_>>().join(" "))
+                XpValue::Str(text.split_whitespace().collect::<Vec<_>>().join(" "))
             }
             "translate" => {
                 let text: Vec<char> = arg(0)?.string_value(self.tree).chars().collect();
@@ -1764,10 +1812,10 @@ impl<'a> Context<'a> {
                         None => out.push(c),
                     }
                 }
-                Value::Str(out)
+                XpValue::Str(out)
             }
             "sum" => match arg(0)? {
-                Value::Nodes(nodes) => {
+                XpValue::Nodes(nodes) => {
                     let mut total = 0.0;
                     for node in nodes {
                         total += self
@@ -1777,13 +1825,13 @@ impl<'a> Context<'a> {
                             .parse::<f64>()
                             .unwrap_or(f64::NAN);
                     }
-                    Value::Num(total)
+                    XpValue::Num(total)
                 }
                 _ => return Err(invalid_expression()),
             },
             // `id()` finds elements by a DTD's ID attributes, which a
             // PostgreSQL value does not carry.
-            "id" => Value::Nodes(Vec::new()),
+            "id" => XpValue::Nodes(Vec::new()),
             // `lang(name)`: whether the language in force at the context
             // node — the nearest `xml:lang` — is the name or starts with it
             // and a hyphen.
@@ -1801,13 +1849,13 @@ impl<'a> Context<'a> {
                         None | Some('-') => true,
                         _ => false,
                     };
-                Value::Bool(matches)
+                XpValue::Bool(matches)
             }
-            "floor" => Value::Num(arg(0)?.number_value(self.tree).floor()),
-            "ceiling" => Value::Num(arg(0)?.number_value(self.tree).ceil()),
+            "floor" => XpValue::Num(arg(0)?.number_value(self.tree).floor()),
+            "ceiling" => XpValue::Num(arg(0)?.number_value(self.tree).ceil()),
             "round" => {
                 let number = arg(0)?.number_value(self.tree);
-                Value::Num((number + 0.5).floor())
+                XpValue::Num((number + 0.5).floor())
             }
             _ => return Err(unregistered_function()),
         })
@@ -1816,28 +1864,28 @@ impl<'a> Context<'a> {
 
 /// An XPath comparison, with the node-set rules: a comparison over a
 /// node-set holds when any of its nodes makes it hold.
-fn compare(op: CmpOp, left: &Value, right: &Value, tree: &Tree) -> bool {
-    let pairs: (Vec<Value>, Vec<Value>) = match (left, right) {
-        (Value::Nodes(left), Value::Nodes(right)) => (
+fn compare(op: CmpOp, left: &XpValue, right: &XpValue, tree: &Tree) -> bool {
+    let pairs: (Vec<XpValue>, Vec<XpValue>) = match (left, right) {
+        (XpValue::Nodes(left), XpValue::Nodes(right)) => (
             left.iter()
-                .map(|&n| Value::Str(tree.string_value(n)))
+                .map(|&n| XpValue::Str(tree.string_value(n)))
                 .collect(),
             right
                 .iter()
-                .map(|&n| Value::Str(tree.string_value(n)))
+                .map(|&n| XpValue::Str(tree.string_value(n)))
                 .collect(),
         ),
-        (Value::Nodes(left), other) => (
+        (XpValue::Nodes(left), other) => (
             left.iter()
-                .map(|&n| Value::Str(tree.string_value(n)))
+                .map(|&n| XpValue::Str(tree.string_value(n)))
                 .collect(),
             vec![clone_value(other)],
         ),
-        (other, Value::Nodes(right)) => (
+        (other, XpValue::Nodes(right)) => (
             vec![clone_value(other)],
             right
                 .iter()
-                .map(|&n| Value::Str(tree.string_value(n)))
+                .map(|&n| XpValue::Str(tree.string_value(n)))
                 .collect(),
         ),
         (left, right) => (vec![clone_value(left)], vec![clone_value(right)]),
@@ -1852,19 +1900,19 @@ fn compare(op: CmpOp, left: &Value, right: &Value, tree: &Tree) -> bool {
     false
 }
 
-fn clone_value(value: &Value) -> Value {
+fn clone_value(value: &XpValue) -> XpValue {
     match value {
-        Value::Str(text) => Value::Str(text.clone()),
-        Value::Num(number) => Value::Num(*number),
-        Value::Bool(b) => Value::Bool(*b),
-        Value::Nodes(nodes) => Value::Nodes(nodes.clone()),
+        XpValue::Str(text) => XpValue::Str(text.clone()),
+        XpValue::Num(number) => XpValue::Num(*number),
+        XpValue::Bool(b) => XpValue::Bool(*b),
+        XpValue::Nodes(nodes) => XpValue::Nodes(nodes.clone()),
     }
 }
 
-fn compare_one(op: CmpOp, left: &Value, right: &Value, tree: &Tree) -> bool {
+fn compare_one(op: CmpOp, left: &XpValue, right: &XpValue, tree: &Tree) -> bool {
     // A boolean or numeric operand compares as numbers, otherwise both sides
     // are strings (`<` never compares a string and a number as text).
-    if matches!(left, Value::Bool(_)) || matches!(right, Value::Bool(_)) {
+    if matches!(left, XpValue::Bool(_)) || matches!(right, XpValue::Bool(_)) {
         let left = left.bool_value();
         let right = right.bool_value();
         return match op {
@@ -1876,7 +1924,7 @@ fn compare_one(op: CmpOp, left: &Value, right: &Value, tree: &Tree) -> bool {
             CmpOp::Ge => left | !right,
         };
     }
-    if matches!(left, Value::Num(_)) || matches!(right, Value::Num(_)) {
+    if matches!(left, XpValue::Num(_)) || matches!(right, XpValue::Num(_)) {
         let left = left.number_value(tree);
         let right = right.number_value(tree);
         return match op {

@@ -80,6 +80,7 @@ mod value;
 mod view_helpers;
 mod windows;
 mod xml;
+mod xmltable;
 mod xpath;
 pub use cursors::FetchDirection;
 pub use error_fields::{error_fields, error_message};

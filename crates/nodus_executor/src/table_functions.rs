@@ -26,6 +26,9 @@ impl MemExecutor {
         if let Some(table) = &spec.json_table {
             return self.eval_json_table(spec, table, row, col_names);
         }
+        if let Some(table) = &spec.xml_table {
+            return self.eval_xml_table(spec, table, row, col_names);
+        }
         let args: Vec<Value> = if spec.arg_exprs.is_empty() {
             spec.args
                 .iter()
@@ -674,6 +677,188 @@ impl MemExecutor {
         let vars = (!matches!(vars, Value::Null)).then_some(vars);
         let rows = crate::sqljson::json_table_rows(&doc, vars.as_ref(), &plan)
             .map_err(|error| anyhow::anyhow!(error))?;
+        Ok((names, types, rows))
+    }
+}
+
+impl MemExecutor {
+    /// Evaluates an `XMLTABLE`: the document is the call's argument, and
+    /// the row path, the namespaces, and the columns' paths and defaults
+    /// are evaluated against the driving row. The order is PostgreSQL's:
+    /// the document, the namespaces, the row filter, the column filters,
+    /// and only then the rows themselves.
+    fn eval_xml_table(
+        &self,
+        spec: &crate::TableFnSpec,
+        table: &crate::plan_types::XmlTableSpec,
+        row: &[Value],
+        col_names: &[String],
+    ) -> Result<(Vec<String>, Vec<String>, Vec<Vec<Value>>)> {
+        use crate::plan_types::XmlTableColumnKind;
+        if let Some(refuse) = &table.refuse {
+            anyhow::bail!(refuse.clone());
+        }
+        // Every column's type must be one, as PostgreSQL checks when it
+        // parses the call; the session's catalog is the one that says so.
+        for column in &table.columns {
+            if let XmlTableColumnKind::Value { column_type, .. } = &column.kind
+                && !crate::user_types::is_known_type(column_type)
+            {
+                anyhow::bail!(crate::user_types::missing_type(column_type));
+            }
+        }
+        let eval = |e: &crate::ScalarExpr| crate::eval_scalar_expr(e, row, col_names);
+        // The columns are the same for every row; `AS x(a, ...)` renames
+        // them positionally.
+        let names: Vec<String> = table
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(at, column)| {
+                spec.column_aliases
+                    .get(at)
+                    .cloned()
+                    .unwrap_or_else(|| column.name.clone())
+            })
+            .collect();
+        let types: Vec<String> = table
+            .columns
+            .iter()
+            .map(|column| match &column.kind {
+                XmlTableColumnKind::Ordinality => "INTEGER".to_string(),
+                XmlTableColumnKind::Value { column_type, .. } => column_type.clone(),
+            })
+            .collect();
+        let doc = spec.arg_exprs.first().map_or(Value::Null, |e| eval(e));
+        if matches!(doc, Value::Null) {
+            return Ok((names, types, Vec::new()));
+        }
+        // The document parses first: an XML value that is not one stops
+        // here, before any namespace or path is read.
+        let document = crate::xml::parse(
+            &crate::xml::value_text(&doc),
+            crate::xml::Mode::Document,
+            true,
+        )
+        .map_err(|_| {
+            anyhow::anyhow!(
+                crate::error_fields::DbError::new("could not parse XML document")
+                    .code("2200M")
+                    .into_text()
+            )
+        })?;
+        let mut namespaces = Vec::with_capacity(table.namespaces.len());
+        for namespace in &table.namespaces {
+            let uri = eval(&namespace.uri);
+            if matches!(uri, Value::Null) {
+                anyhow::bail!(
+                    crate::error_fields::DbError::new("namespace URI must not be null")
+                        .code("22004")
+                        .into_text()
+                );
+            }
+            let Some(prefix) = &namespace.prefix else {
+                anyhow::bail!(
+                    crate::error_fields::DbError::new("DEFAULT namespace is not supported")
+                        .code("0A000")
+                        .into_text()
+                );
+            };
+            namespaces.push((prefix.clone(), value_text(&uri)));
+        }
+        let doc = crate::xpath::XpDoc::new(&document, &namespaces);
+        let table_error = crate::xmltable::table_error;
+        // The row filter, then the column filters, compile before any row.
+        let row_path = value_text(&eval(&table.path));
+        if row_path.is_empty() {
+            anyhow::bail!(
+                crate::error_fields::DbError::new("row path filter must not be empty string")
+                    .code("2200S")
+                    .into_text()
+            );
+        }
+        let row_expr = doc
+            .compile(&row_path)
+            .map_err(|error| anyhow::anyhow!(table_error(error)))?;
+        let mut filters = Vec::with_capacity(table.columns.len());
+        for column in &table.columns {
+            let XmlTableColumnKind::Value { path, .. } = &column.kind else {
+                filters.push(None);
+                continue;
+            };
+            let path = match path {
+                Some(expr) => value_text(&eval(expr)),
+                None => column.name.clone(),
+            };
+            if path.is_empty() {
+                anyhow::bail!(
+                    crate::error_fields::DbError::new(
+                        "column path filter must not be empty string"
+                    )
+                    .code("2200S")
+                    .into_text()
+                );
+            }
+            let filter = doc
+                .compile(&path)
+                .map_err(|error| anyhow::anyhow!(table_error(error)))?;
+            filters.push(Some(filter));
+        }
+        // The rows, then each column of each row.
+        let items = doc
+            .row_items(&row_expr)
+            .map_err(|error| anyhow::anyhow!(table_error(error)))?;
+        let mut rows = Vec::with_capacity(items.len());
+        for (index, &node) in items.iter().enumerate() {
+            let mut out = Vec::with_capacity(table.columns.len());
+            for (at, column) in table.columns.iter().enumerate() {
+                let XmlTableColumnKind::Value {
+                    column_type,
+                    default,
+                    not_null,
+                    ..
+                } = &column.kind
+                else {
+                    out.push(Value::Int(index as i64 + 1));
+                    continue;
+                };
+                let filter = filters[at].as_ref().expect("a value column's filter");
+                let text = crate::xmltable::column_text(&doc, filter, node, column_type)
+                    .map_err(|error| anyhow::anyhow!(error))?;
+                let mut value = match text {
+                    Some(text) => Some(
+                        crate::xmltable::convert_text(&text, column_type)
+                            .map_err(|error| anyhow::anyhow!(error))?,
+                    ),
+                    None => None,
+                };
+                // A null value takes the default, which is already of the
+                // column's type.
+                if value.is_none()
+                    && let Some(default) = default
+                {
+                    value = Some(match eval(default) {
+                        Value::Null => Value::Null,
+                        Value::Text(text) => crate::xmltable::convert_text(&text, column_type)
+                            .map_err(|error| anyhow::anyhow!(error))?,
+                        other => crate::planner::try_cast(other, column_type)
+                            .map_err(|error| anyhow::anyhow!(error))?,
+                    });
+                }
+                if value.is_none() && *not_null {
+                    anyhow::bail!(
+                        crate::error_fields::DbError::new(format!(
+                            "null is not allowed in column \"{}\"",
+                            column.name
+                        ))
+                        .code("22004")
+                        .into_text()
+                    );
+                }
+                out.push(value.unwrap_or(Value::Null));
+            }
+            rows.push(out);
+        }
         Ok((names, types, rows))
     }
 }
