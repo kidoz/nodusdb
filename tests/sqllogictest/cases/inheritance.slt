@@ -1,0 +1,283 @@
+# Table inheritance: INHERITS, ONLY, scans, ALTER/DROP propagation, PG 18.4.
+statement ok
+create table ip (a int not null, b text default 'x', ck int check (ck > 0));
+
+statement ok
+create table ic (z int) inherits (ip);
+
+statement ok
+create table ig () inherits (ic);
+
+query TTTTT
+select table_name, column_name, ordinal_position, is_nullable, column_default from information_schema.columns where table_name = 'ic' and table_schema = 'public' order by ordinal_position;
+----
+ic	a	1	NO	NULL
+ic	b	2	YES	'x'::text
+ic	ck	3	YES	NULL
+ic	z	4	YES	NULL
+
+query TTT rowsort
+select conname, conrelid::regclass, contype from pg_constraint where conrelid in ('ip'::regclass, 'ic'::regclass, 'ig'::regclass) order by 1, 2::text;
+----
+ip_a_not_null	ig	n
+ip_a_not_null	ip	n
+ip_a_not_null	ic	n
+ip_ck_check	ip	c
+ip_ck_check	ic	c
+ip_ck_check	ig	c
+
+query TTT rowsort
+select inhrelid::regclass, inhparent::regclass, inhseqno from pg_inherits where inhrelid in ('ip'::regclass, 'ic'::regclass, 'ig'::regclass) order by 1::text, 2;
+----
+ic	ip	1
+ig	ic	1
+
+query TT rowsort
+select relname, relhassubclass from pg_class where relname in ('ip','ic','ig') order by relname;
+----
+ic	t
+ig	f
+ip	t
+
+statement ok
+insert into ip values (1, 'p', 1);
+
+statement ok
+insert into ic values (2, 'c', 2, 9);
+
+statement ok
+insert into ig values (3, 'g', 3, 8);
+
+query TT
+select a, b from ip order by a;
+----
+1	p
+2	c
+3	g
+
+query T
+select a from only ip;
+----
+1
+
+query T
+select a from only ic order by a;
+----
+2
+
+query TT rowsort
+select tableoid::regclass, a from ip order by a;
+----
+ip	1
+ic	2
+ig	3
+
+query T
+select count(*) from ip where ck > 1;
+----
+2
+
+statement ok
+update ip set b = 'u' where a = 2;
+
+query T
+select b from ic;
+----
+u
+g
+
+statement ok
+delete from only ip;
+
+query T
+select count(*) from ip;
+----
+2
+
+statement ok
+truncate only ic;
+
+query T
+select count(*) from only ic;
+----
+0
+
+query T
+select count(*) from ig;
+----
+1
+
+query T
+select count(*) from ip;
+----
+1
+
+statement error
+select a from only nosuch;
+
+statement error
+create table c1 () inherits (nosuch);
+
+statement error
+create table c2 (a text) inherits (ip);
+
+statement ok
+create view iv as select 1 as x;
+
+statement error
+create table c4 () inherits (iv);
+
+statement ok
+alter table ip add column n int default 7;
+
+query TT
+select table_name, string_agg(column_name, ',' order by ordinal_position) from information_schema.columns where table_name in ('ic','ig') and table_schema = 'public' group by table_name order by table_name;
+----
+ic	a,b,ck,z,n
+ig	a,b,ck,z,n
+
+query T
+select column_default from information_schema.columns where table_name = 'ic' and column_name = 'n';
+----
+7
+
+statement ok
+alter table ip add constraint ck2 check (n > 0);
+
+query T rowsort
+select conrelid::regclass from pg_constraint where conname = 'ck2' order by 1::text;
+----
+ip
+ic
+ig
+
+statement ok
+alter table ip rename column n to nn;
+
+query T
+select string_agg(column_name, ',' order by ordinal_position) from information_schema.columns where table_name = 'ig' and table_schema = 'public';
+----
+a,b,ck,z,nn
+
+statement ok
+alter table ip drop column nn;
+
+query T
+select string_agg(column_name, ',' order by ordinal_position) from information_schema.columns where table_name = 'ic' and table_schema = 'public';
+----
+a,b,ck,z
+
+statement ok
+alter table ip alter column b type varchar(3);
+
+query T
+select data_type from information_schema.columns where table_name = 'ig' and column_name = 'b';
+----
+character varying
+
+statement error
+alter table only ip add column o int;
+
+statement error
+alter table only ip rename column a to aa;
+
+statement error
+alter table only ip add constraint ck3 check (a > 0);
+
+statement error
+alter table only ip alter column a type bigint;
+
+statement error
+alter table ic rename column a to aa;
+
+statement error
+alter table ic drop column a;
+
+statement error
+alter table ic alter column a type bigint;
+
+statement error
+alter table ic drop constraint ck2;
+
+statement error
+alter table ip inherit ic;
+
+statement error
+alter table ic inherit ip;
+
+query T
+select count(*) from pg_inherits where inhrelid = 'ic'::regclass;
+----
+1
+
+statement error
+drop table ip;
+
+statement ok
+alter table ic no inherit ip;
+
+query T
+select count(*) from pg_inherits where inhrelid = 'ic'::regclass;
+----
+0
+
+query T
+select count(*) from ip;
+----
+0
+
+statement error
+alter table ic no inherit ip;
+
+statement ok
+drop table ip;
+
+query T
+select count(*) from ic;
+----
+1
+
+statement ok
+create table a1 (a int not null default 5, ck int check (ck > 0));
+
+statement ok
+create table a2 (a int, ck int);
+
+statement error
+alter table a2 inherit a1;
+
+statement ok
+alter table a2 alter column a set not null;
+
+statement error
+alter table a2 inherit a1;
+
+statement ok
+alter table a2 add constraint a1_ck_check check (ck > 0);
+
+statement ok
+alter table a2 inherit a1;
+
+query T
+select count(*) from pg_inherits where inhrelid = 'a2'::regclass;
+----
+1
+
+statement error
+alter table a2 inherit a1;
+
+statement ok
+insert into a1 values (1, 1);
+
+query T
+select a from a1 order by a;
+----
+1
+
+statement ok
+alter table a2 no inherit a1;
+
+query T
+select a from a1;
+----
+1
