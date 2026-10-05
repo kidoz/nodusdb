@@ -285,6 +285,7 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
             sort,
             group_exprs: Vec::new(),
             distinct_on: Vec::new(),
+            sample: None,
         });
     }
 
@@ -343,7 +344,7 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
         };
         return select_from_result(literal, ctes, query, params);
     }
-    let (table_name, table_alias, mut joins) = plan_from(&select.from, &mut ctes, params)?;
+    let (table_name, table_alias, mut joins, sample) = plan_from(&select.from, &mut ctes, params)?;
 
     // Projection: a lone `*` is empty (all columns); `*` among other items,
     // and `t.*`, stand for columns the executor expands once the relations'
@@ -434,6 +435,7 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
             using_columns: Vec::new(),
             natural: false,
             lateral: None,
+            sample: None,
         });
     }
 
@@ -454,6 +456,7 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
         sort,
         group_exprs,
         distinct_on,
+        sample,
     })
 }
 
@@ -502,14 +505,124 @@ pub(crate) fn plan_ctes(
     Ok(ctes)
 }
 
+/// The `TABLESAMPLE` clause of a FROM factor, as the plan carries it.
+/// PostgreSQL allows the clause on a plain table — and a materialized view,
+/// which is a table here — and its grammar rejects every other shape; the
+/// checks below reproduce those errors.
+fn factor_sample(
+    factor: &sqlparser::ast::TableFactor,
+    params: &[Value],
+) -> Result<Option<crate::SampleSpec>> {
+    use sqlparser::ast::*;
+    let (sample, plain_table) = match factor {
+        TableFactor::Table { args, sample, .. } => (sample.as_ref(), args.is_none()),
+        TableFactor::Derived { sample, .. } => (sample.as_ref(), false),
+        _ => (None, false),
+    };
+    let Some(sample) = sample else {
+        return Ok(None);
+    };
+    if !plain_table {
+        anyhow::bail!(sample_syntax_error("tablesample"));
+    }
+    let sample = match sample {
+        TableSampleKind::BeforeTableAlias(sample) | TableSampleKind::AfterTableAlias(sample) => {
+            sample.as_ref()
+        }
+    };
+    if sample.modifier != TableSampleModifier::TableSample {
+        anyhow::bail!(sample_syntax_error("sample"));
+    }
+    let method = match &sample.name {
+        Some(TableSampleMethod::Bernoulli) => "bernoulli",
+        Some(TableSampleMethod::System) => "system",
+        // `ROW` is a keyword, so PostgreSQL's grammar never reaches the
+        // method check for it; `BLOCK` is a plain name and gets the check.
+        Some(TableSampleMethod::Row) => anyhow::bail!(sample_syntax_error("(")),
+        Some(TableSampleMethod::Block) => anyhow::bail!(method_error("block")),
+        None => {
+            // An unknown method is parsed as a call — `TABLESAMPLE vacuum
+            // (10)` reads as the expression `vacuum(10)` — so its name is
+            // recoverable from the quantity's expression.
+            if let Some(TableSampleQuantity {
+                value: Expr::Function(function),
+                ..
+            }) = &sample.quantity
+            {
+                anyhow::bail!(method_error(
+                    &function.name.to_string().to_ascii_lowercase()
+                ));
+            }
+            anyhow::bail!(sample_syntax_error("tablesample"));
+        }
+    };
+    let quantity = match &sample.quantity {
+        Some(quantity) if quantity.parenthesized => quantity,
+        Some(quantity) => anyhow::bail!(sample_syntax_error(&quantity.value.to_string())),
+        None => anyhow::bail!(sample_syntax_error("tablesample")),
+    };
+    if let Some(unit) = quantity.unit {
+        let token = match unit {
+            TableSampleUnit::Percent => "percent",
+            TableSampleUnit::Rows => "rows",
+        };
+        anyhow::bail!(sample_syntax_error(token));
+    }
+    if sample.bucket.is_some() || sample.offset.is_some() {
+        anyhow::bail!(sample_syntax_error("tablesample"));
+    }
+    if let Some(seed) = &sample.seed
+        && seed.modifier != TableSampleSeedModifier::Repeatable
+    {
+        anyhow::bail!(sample_syntax_error("seed"));
+    }
+    let percent = lower_scalar(&quantity.value, params).ok_or_else(|| {
+        anyhow::anyhow!("Unsupported expression in TABLESAMPLE: {}", quantity.value)
+    })?;
+    let seed = match &sample.seed {
+        Some(seed) => Some(
+            lower_scalar(&Expr::Value(seed.value.clone()), params).ok_or_else(|| {
+                anyhow::anyhow!("Unsupported expression in TABLESAMPLE: {}", seed.value)
+            })?,
+        ),
+        None => None,
+    };
+    Ok(Some(crate::SampleSpec {
+        method: method.to_string(),
+        percent,
+        seed,
+    }))
+}
+
+/// The syntax error (42601) PostgreSQL's grammar gives for a shape it does
+/// not accept.
+fn sample_syntax_error(token: &str) -> String {
+    crate::error_fields::DbError::new(format!("syntax error at or near \"{token}\""))
+        .code("42601")
+        .into_text()
+}
+
+/// The error an unknown `TABLESAMPLE` method raises, as PostgreSQL words it.
+fn method_error(name: &str) -> String {
+    crate::error_fields::DbError::new(format!("tablesample method {name} does not exist"))
+        .code("42704")
+        .into_text()
+}
+
 /// Plans a FROM list: its first relation, and a join for each relation after
 /// it. Derived tables and set-returning functions are added to `ctes`.
 fn plan_from(
     from: &[sqlparser::ast::TableWithJoins],
     ctes: &mut Vec<(String, Box<LogicalPlan>)>,
     params: &[Value],
-) -> Result<(String, Option<String>, Vec<crate::Join>)> {
+) -> Result<(
+    String,
+    Option<String>,
+    Vec<crate::Join>,
+    Option<crate::SampleSpec>,
+)> {
     use sqlparser::ast::*;
+    let sample = factor_sample(&from[0].relation, params)?;
     let (table_name, table_alias) =
         if let Some(spec) = table_fn_from_factor(&from[0].relation, params) {
             // A set-returning function as the sole driving relation (e.g.
@@ -573,7 +686,7 @@ fn plan_from(
             joins.push(plan_join(&j.relation, constraint, ctes, params)?);
         }
     }
-    Ok((table_name, table_alias, joins))
+    Ok((table_name, table_alias, joins, sample))
 }
 
 /// A FROM list as a query of all its joined rows: the relations an
@@ -583,7 +696,7 @@ pub(crate) fn plan_relations(
     params: &[Value],
 ) -> Result<LogicalPlan> {
     let mut ctes = Vec::new();
-    let (table_name, table_alias, joins) = plan_from(from, &mut ctes, params)?;
+    let (table_name, table_alias, joins, sample) = plan_from(from, &mut ctes, params)?;
     Ok(LogicalPlan::Select {
         ctes,
         table_name,
@@ -601,6 +714,7 @@ pub(crate) fn plan_relations(
         sort: Vec::new(),
         group_exprs: Vec::new(),
         distinct_on: Vec::new(),
+        sample,
     })
 }
 
@@ -2585,6 +2699,7 @@ fn plan_join(
     params: &[Value],
 ) -> Result<crate::Join> {
     use sqlparser::ast::TableFactor;
+    let sample = factor_sample(relation, params)?;
     let join = |table_name: String, table_alias: Option<String>| crate::Join {
         table_name,
         table_alias,
@@ -2594,6 +2709,7 @@ fn plan_join(
         natural,
         table_fn: None,
         lateral: None,
+        sample: sample.clone(),
     };
     if let Some(spec) = table_fn_from_factor(relation, params) {
         let alias = spec.alias.clone().unwrap_or_else(|| spec.name.clone());
@@ -2681,5 +2797,6 @@ fn select_from_result(
         sort,
         group_exprs: Vec::new(),
         distinct_on: Vec::new(),
+        sample: None,
     })
 }

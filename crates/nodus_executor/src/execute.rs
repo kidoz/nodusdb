@@ -214,6 +214,7 @@ impl MemExecutor {
                 sort,
                 group_exprs,
                 distinct_on,
+                sample,
             } => {
                 // Older plans carry their keys in `order_by`.
                 let sort = if sort.is_empty() {
@@ -239,6 +240,7 @@ impl MemExecutor {
                     distinct,
                     distinct_on,
                     false,
+                    sample,
                 )
             }
             LogicalPlan::Update {

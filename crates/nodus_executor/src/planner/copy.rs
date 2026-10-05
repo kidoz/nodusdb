@@ -79,6 +79,7 @@ pub fn plan_copy_out(sql: &str) -> Result<(LogicalPlan, CopyOutputFormat, bool)>
             limit: None,
             offset: None,
             distinct: false,
+            sample: None,
         },
     };
     Ok((plan, format, header))

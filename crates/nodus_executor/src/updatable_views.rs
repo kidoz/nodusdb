@@ -309,6 +309,7 @@ impl MemExecutor {
             table_name,
             table_alias,
             projection,
+            sample,
             ..
         } = &level.plan
         else {
@@ -331,6 +332,7 @@ impl MemExecutor {
             sort: Vec::new(),
             group_exprs: Vec::new(),
             distinct_on: Vec::new(),
+            sample: sample.clone(),
         };
         let input = Self::level_input(wv, at);
         let bound = QueryOutput {

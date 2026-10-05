@@ -246,6 +246,7 @@ fn create_insert_select_round_trip() {
         .execute_logical(
             &ctx,
             LogicalPlan::Select {
+                sample: None,
                 ctes: vec![],
                 table_alias: None,
                 group_by: vec![],
@@ -274,6 +275,7 @@ fn create_insert_select_round_trip() {
         .execute_logical(
             &ctx,
             LogicalPlan::Select {
+                sample: None,
                 ctes: vec![],
                 table_alias: None,
                 group_by: vec![],
@@ -421,6 +423,7 @@ fn rows_keyed_by_declared_pk_not_first_column() {
     }
 
     let select_all = || LogicalPlan::Select {
+        sample: None,
         ctes: vec![],
         table_alias: None,
         group_by: vec![],
@@ -544,6 +547,7 @@ fn typed_values_round_trip_and_filter_by_int() {
         .execute_logical(
             &ctx,
             LogicalPlan::Select {
+                sample: None,
                 ctes: vec![],
                 table_alias: None,
                 group_by: vec![],
@@ -645,6 +649,7 @@ fn update_and_delete_rows() {
         exec.execute_logical(
             &ctx,
             LogicalPlan::Select {
+                sample: None,
                 ctes: vec![],
                 table_alias: None,
                 group_by: vec![],
@@ -789,11 +794,13 @@ fn test_join_execution() {
     }
 
     let join_plan = LogicalPlan::Select {
+        sample: None,
         ctes: vec![],
         table_alias: None,
         group_by: vec![],
         table_name: "books".into(),
         joins: vec![Join {
+            sample: None,
             table_alias: None,
             table_name: "authors".into(),
             condition: Some(FilterExpr::Predicate(Predicate {
@@ -917,6 +924,7 @@ fn transactions_are_isolated_per_session() {
         exec.execute_logical(
             ctx,
             LogicalPlan::Select {
+                sample: None,
                 ctes: vec![],
                 table_alias: None,
                 group_by: vec![],

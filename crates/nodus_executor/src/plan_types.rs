@@ -394,6 +394,21 @@ pub struct Join {
     /// side for that left row.
     #[serde(default)]
     pub lateral: Option<Box<LogicalPlan>>,
+    /// This relation's `TABLESAMPLE` clause. Defaulted so older plans decode.
+    #[serde(default)]
+    pub sample: Option<SampleSpec>,
+}
+
+/// A relation's `TABLESAMPLE` clause: how a scan draws its rows.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SampleSpec {
+    /// The method, `"bernoulli"` or `"system"`.
+    pub method: String,
+    /// The sampling percentage, evaluated once when the scan starts.
+    pub percent: ScalarExpr,
+    /// The `REPEATABLE` seed, evaluated once when the scan starts.
+    #[serde(default)]
+    pub seed: Option<ScalarExpr>,
 }
 
 /// The unique key an `ON CONFLICT` clause arbitrates on.
@@ -1543,6 +1558,10 @@ pub enum LogicalPlan {
         /// distinct key is kept. Defaulted so older plans decode.
         #[serde(default)]
         distinct_on: Vec<SortTarget>,
+        /// The driving relation's `TABLESAMPLE` clause, if it has one.
+        /// Defaulted so older plans decode.
+        #[serde(default)]
+        sample: Option<SampleSpec>,
     },
     Update {
         table_name: String,

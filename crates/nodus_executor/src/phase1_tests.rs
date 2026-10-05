@@ -84,6 +84,7 @@ fn test_offset_distinct_returning() {
             .execute_logical(
                 &ctx,
                 LogicalPlan::Select {
+                    sample: None,
                     ctes: vec![],
                     table_alias: None,
                     group_by: vec![],

@@ -67,6 +67,7 @@ mod streaming;
 mod subqueries;
 mod system_views;
 mod table_functions;
+mod tablesample;
 mod temp_tables;
 mod textsearch;
 mod timezone;
@@ -91,7 +92,7 @@ pub use json_text::{json_text, jsonb_text};
 pub use plan_types::{
     AggregateOp, AlterTableOp, CompareOp, ConflictTarget, DeferredItem, FilterExpr, Join, JoinType,
     LogicalPlan, MergeAction, MergeClause, MergeKind, NewConstraint, OnConflictClause, Operand,
-    PatternKind, Predicate, ProjectionItem, ReturningExpr, ScalarBinaryOp, ScalarExpr,
+    PatternKind, Predicate, ProjectionItem, ReturningExpr, SampleSpec, ScalarBinaryOp, ScalarExpr,
     ScalarUnaryOp, SetOpKind, SortKey, SortTarget, SubPlan, SubqueryKind, TableFnSpec,
 };
 pub use planner::{

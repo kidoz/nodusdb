@@ -201,6 +201,7 @@ fn test_ddl_and_subqueries() {
     .unwrap();
 
     let subquery = LogicalPlan::Select {
+        sample: None,
         ctes: vec![],
         table_alias: None,
         group_by: vec![],
@@ -233,6 +234,7 @@ fn test_ddl_and_subqueries() {
         .execute_logical(
             &ctx,
             LogicalPlan::Select {
+                sample: None,
                 ctes: vec![],
                 table_alias: None,
                 group_by: vec![],
@@ -533,6 +535,7 @@ fn test_secondary_indexing() {
         .execute_logical(
             &ctx,
             LogicalPlan::Select {
+                sample: None,
                 ctes: vec![],
                 table_alias: None,
                 table_name: "products".into(),
@@ -589,6 +592,7 @@ fn test_secondary_indexing() {
         .execute_logical(
             &ctx,
             LogicalPlan::Select {
+                sample: None,
                 ctes: vec![],
                 table_alias: None,
                 table_name: "products".into(),
@@ -619,6 +623,7 @@ fn test_secondary_indexing() {
         .execute_logical(
             &ctx,
             LogicalPlan::Select {
+                sample: None,
                 ctes: vec![],
                 table_alias: None,
                 table_name: "products".into(),
@@ -667,6 +672,7 @@ fn test_secondary_indexing() {
         .execute_logical(
             &ctx,
             LogicalPlan::Select {
+                sample: None,
                 ctes: vec![],
                 table_alias: None,
                 table_name: "products".into(),
@@ -789,6 +795,7 @@ fn test_index_value_containing_separator_does_not_overmatch() {
         exec.execute_logical(
             &ctx,
             LogicalPlan::Select {
+                sample: None,
                 ctes: vec![],
                 table_alias: None,
                 table_name: "labels".into(),
@@ -919,6 +926,7 @@ fn test_alter_table_migrations() {
         .execute_logical(
             &ctx,
             LogicalPlan::Select {
+                sample: None,
                 ctes: vec![],
                 table_alias: None,
                 table_name: "users".into(),
@@ -960,6 +968,7 @@ fn test_alter_table_migrations() {
         .execute_logical(
             &ctx,
             LogicalPlan::Select {
+                sample: None,
                 ctes: vec![],
                 table_alias: None,
                 table_name: "users".into(),
@@ -1000,6 +1009,7 @@ fn test_alter_table_migrations() {
         .execute_logical(
             &ctx,
             LogicalPlan::Select {
+                sample: None,
                 ctes: vec![],
                 table_alias: None,
                 table_name: "users".into(),

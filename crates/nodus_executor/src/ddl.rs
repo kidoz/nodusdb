@@ -1417,6 +1417,7 @@ fn shape_only(query: LogicalPlan) -> LogicalPlan {
             sort,
             group_exprs,
             distinct_on,
+            sample,
             ..
         } => LogicalPlan::Select {
             ctes,
@@ -1435,6 +1436,7 @@ fn shape_only(query: LogicalPlan) -> LogicalPlan {
             sort,
             group_exprs,
             distinct_on,
+            sample,
         },
         other => other,
     }

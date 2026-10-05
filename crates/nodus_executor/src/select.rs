@@ -125,6 +125,7 @@ impl MemExecutor {
             table_alias,
             joins,
             filter,
+            sample,
             ..
         } = plan
         else {
@@ -148,6 +149,7 @@ impl MemExecutor {
             false,
             Vec::new(),
             true,
+            sample,
         )
     }
 
@@ -170,6 +172,7 @@ impl MemExecutor {
         distinct: bool,
         distinct_on: Vec<SortTarget>,
         raw: bool,
+        sample: Option<crate::SampleSpec>,
     ) -> Result<QueryOutput> {
         // The keys each output row is sorted by, then deduplicated on.
         let key_targets: Vec<SortTarget> = sort
@@ -240,6 +243,9 @@ impl MemExecutor {
         let (tbl_cols, mut col_names, mut stored_rows) = if let Some(cte_out) =
             crate::cte_scope::lookup(&table_name)
         {
+            if sample.is_some() {
+                anyhow::bail!(crate::tablesample::relation_error());
+            }
             let mut cols = Vec::new();
             for (i, c) in cte_out.columns.iter().enumerate() {
                 let ty = cte_out
@@ -283,6 +289,10 @@ impl MemExecutor {
                 query_has_virtual = true;
                 let (cols, rows) =
                     self.get_virtual_table(db_name, schema_name, table_only, &ctx.session_id)?;
+                let rows = match &sample {
+                    Some(spec) => self.sampled_rows(ctx, spec, rows)?,
+                    None => rows,
+                };
                 let prefix = table_alias.as_deref().unwrap_or(&table_name);
                 let col_names: Vec<String> = cols
                     .iter()
@@ -306,11 +316,12 @@ impl MemExecutor {
                 // Equality on an indexed column uses the index. The session's
                 // uncommitted overlay is merged into the result, so the index is
                 // usable inside a transaction rather than forcing a full scan.
-                if let Some(FilterExpr::Predicate(Predicate {
-                    left,
-                    op: CompareOp::Eq,
-                    right: right @ Operand::Literal(_),
-                })) = filter.as_ref()
+                if sample.is_none()
+                    && let Some(FilterExpr::Predicate(Predicate {
+                        left,
+                        op: CompareOp::Eq,
+                        right: right @ Operand::Literal(_),
+                    })) = filter.as_ref()
                 {
                     let col_name = left.split('.').last().unwrap_or(left);
                     if let Some(col) = tbl.columns.iter().find(|c| c.name == *col_name) {
@@ -359,6 +370,15 @@ impl MemExecutor {
                             self.scan_rows(tbl.id, &ctx.session_id)?
                         }
                     }
+                };
+                let rows = match &sample {
+                    Some(spec) => {
+                        if tbl.view_query.is_some() {
+                            anyhow::bail!(crate::tablesample::relation_error());
+                        }
+                        self.sampled_rows(ctx, spec, rows)?
+                    }
+                    None => rows,
                 };
                 (tbl.columns.clone(), col_names, rows)
             };
@@ -534,6 +554,9 @@ impl MemExecutor {
 
             let (j_cols, j_rows) = if let Some(cte_out) = crate::cte_scope::lookup(&join.table_name)
             {
+                if join.sample.is_some() {
+                    anyhow::bail!(crate::tablesample::relation_error());
+                }
                 let mut cols = Vec::new();
                 for (i, c) in cte_out.columns.iter().enumerate() {
                     let ty = cte_out
@@ -571,6 +594,10 @@ impl MemExecutor {
                     query_has_virtual = true;
                     let (cols, rows) =
                         self.get_virtual_table(j_db, j_sch, j_tbl_name, &ctx.session_id)?;
+                    let rows = match &join.sample {
+                        Some(spec) => self.sampled_rows(ctx, spec, rows)?,
+                        None => rows,
+                    };
                     (cols, rows)
                 } else {
                     let j_tbl = self.catalog_reader.get_table(j_db, j_sch, j_tbl_name)?;
@@ -582,6 +609,15 @@ impl MemExecutor {
                         out.rows.iter().map(|r| r.values.clone()).collect()
                     } else {
                         self.scan_rows(j_tbl.id, &ctx.session_id)?
+                    };
+                    let j_rows = match &join.sample {
+                        Some(spec) => {
+                            if j_tbl.view_query.is_some() {
+                                anyhow::bail!(crate::tablesample::relation_error());
+                            }
+                            self.sampled_rows(ctx, spec, j_rows)?
+                        }
+                        None => j_rows,
                     };
                     (j_tbl.columns.clone(), j_rows)
                 }

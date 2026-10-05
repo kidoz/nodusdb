@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 #[derive(Clone, Copy)]
-struct State {
+pub(crate) struct State {
     s0: u64,
     s1: u64,
 }
@@ -21,7 +21,7 @@ fn splitmix64(state: &mut u64) -> u64 {
 }
 
 impl State {
-    fn seeded(mut seed: u64) -> State {
+    pub(crate) fn seeded(mut seed: u64) -> State {
         let mut state = State {
             s0: splitmix64(&mut seed),
             s1: splitmix64(&mut seed),
@@ -44,7 +44,7 @@ impl State {
     }
 
     /// A float in `[0, 1)` from 52 random bits.
-    fn double(&mut self) -> f64 {
+    pub(crate) fn double(&mut self) -> f64 {
         (self.next() >> 12) as f64 * 2f64.powi(-52)
     }
 

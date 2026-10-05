@@ -57,7 +57,9 @@ impl MemExecutor {
             sort,
             group_exprs,
             distinct_on,
+            sample,
         } = &plan
+            && sample.is_none()
             && ctes.is_empty()
             && joins.is_empty()
             && group_by.is_empty()
