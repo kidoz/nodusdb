@@ -1,0 +1,117 @@
+# TABLESAMPLE: bernoulli/system sampling, percentages, seeds, and refusals,
+# PG 18.4. Random-percentage rows differ run to run (and from PostgreSQL's
+# generator), so only the deterministic 0/100 cases and errors are recorded.
+statement ok
+create table st (a int);
+
+statement ok
+insert into st select generate_series(1, 100);
+
+query T
+select count(*) from st tablesample bernoulli (0);
+----
+0
+
+query T
+select count(*) from st tablesample system (0);
+----
+0
+
+query T
+select count(*) from st tablesample bernoulli (100);
+----
+100
+
+query T
+select count(*) from st tablesample system (100);
+----
+100
+
+query T
+select count(*) from st tablesample bernoulli (100) where a > 50;
+----
+50
+
+query T
+select count(*) from st t tablesample bernoulli (0);
+----
+0
+
+query T
+select count(*) from st as t tablesample bernoulli (0);
+----
+0
+
+query T
+select count(*) from st tablesample bernoulli (0) repeatable (1);
+----
+0
+
+query T
+select count(*) from st tablesample bernoulli (100) repeatable (7);
+----
+100
+
+query T
+select count(*) from st tablesample bernoulli ('0');
+----
+0
+
+query T
+select count(*) from st tablesample system (100) repeatable (0);
+----
+100
+
+query T
+select count(*) from st t1 join st t2 tablesample bernoulli (0) on t1.a = t2.a;
+----
+0
+
+query T
+select count(*) from pg_class tablesample bernoulli (0);
+----
+0
+
+statement ok
+create view v_st as select * from st;
+
+statement error
+select count(*) from v_st tablesample bernoulli (0);
+
+statement error
+with c as (select * from st) select count(*) from c tablesample bernoulli (0);
+
+statement ok
+create materialized view mv_st as select * from st;
+
+query T
+select count(*) from mv_st tablesample bernoulli (0);
+----
+0
+
+statement error
+select count(*) from st tablesample bernoulli (101);
+
+statement error
+select count(*) from st tablesample bernoulli (-1);
+
+statement error
+select count(*) from st tablesample bernoulli (NULL);
+
+statement error
+select count(*) from st tablesample bernoulli (10) repeatable (NULL);
+
+statement error
+select count(*) from st tablesample vacuum (10);
+
+statement error
+select count(*) from st tablesample block (10);
+
+statement error
+select count(*) from st tablesample row (10);
+
+statement error
+select count(*) from st tablesample bernoulli (10 percent);
+
+statement error
+select count(*) from (select * from st) s tablesample bernoulli (0);
