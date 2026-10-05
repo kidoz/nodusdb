@@ -1,0 +1,218 @@
+# Large objects: the bytea API, descriptors, and the catalogs, PG 18.4.
+statement ok
+select lo_unlink(oid) from pg_largeobject_metadata where oid between 91000 and 91999;
+
+query T
+select lo_create(91001);
+----
+91001
+
+query T
+select lo_from_bytea(91002, 'hello world'::bytea);
+----
+91002
+
+query T
+select encode(lo_get(91002), 'hex');
+----
+68656c6c6f20776f726c64
+
+query T
+select encode(lo_get(91002, 6, 5), 'hex');
+----
+776f726c64
+
+statement ok
+select lo_put(91002, 6, 'there'::bytea);
+
+query T
+select encode(lo_get(91002), 'hex');
+----
+68656c6c6f207468657265
+
+query T
+select encode(lo_get(91002, 0, 1000), 'hex');
+----
+68656c6c6f207468657265
+
+query T
+select octet_length(lo_get(91002, 100, 5));
+----
+0
+
+statement error
+select lo_get(91002, 0, -1);
+
+statement error
+select lo_get(91002, -1, 5);
+
+statement error
+select lo_get(91002, 4398046511105, 5);
+
+statement ok
+select lo_put(91002, 8, ''::bytea);
+
+query T
+select encode(lo_get(91002), 'hex');
+----
+68656c6c6f207468657265
+
+query T
+select lo_from_bytea(91003, repeat('ab', 1500)::bytea);
+----
+91003
+
+query TT
+select pageno, length(data) from pg_largeobject where loid = 91003;
+----
+0	2048
+1	952
+
+query TTT rowsort
+select loid, pageno, length(data) from pg_largeobject where loid = 91002;
+----
+91002	0	11
+
+query TTT
+select oid, lomowner, lomacl from pg_largeobject_metadata where oid = 91003;
+----
+91003	10	NULL
+
+query T
+select 'pg_largeobject'::regclass;
+----
+pg_largeobject
+
+query T
+select 'pg_largeobject_metadata'::regclass;
+----
+pg_largeobject_metadata
+
+query T
+select count(*) from pg_largeobject_metadata where oid = 91003;
+----
+1
+
+query T
+select lo_unlink(91003);
+----
+1
+
+query T
+select count(*) from pg_largeobject_metadata where oid = 91003;
+----
+0
+
+query T
+select count(*) from pg_largeobject where loid = 91003;
+----
+0
+
+statement error
+select lo_get(91003);
+
+statement error
+select lo_unlink(91003);
+
+statement error
+select lo_create(91001);
+
+statement error
+select lo_open(91001, 0);
+
+statement error
+select lo_open(91001, 65536);
+
+query T
+select lo_open(91001, 262144);
+----
+0
+
+query T
+select lo_open(91001, -1);
+----
+0
+
+query T
+select lo_open(91001, 393216);
+----
+0
+
+query T
+select loread(lo_open(91002, 262144), 3);
+----
+\x68656c
+
+query T
+select loread(lo_open(91002, 131072), 3);
+----
+\x68656c
+
+query T
+select lo_tell(lo_open(91002, 262144));
+----
+0
+
+query T
+select lo_lseek(lo_open(91002, 262144), 5, 0);
+----
+5
+
+query T
+select lo_lseek(lo_open(91002, 262144), 0, 2);
+----
+11
+
+statement error
+select lo_lseek(lo_open(91002, 262144), -1, 0);
+
+statement error
+select lo_lseek(lo_open(91002, 262144), 0, 3);
+
+query T
+select lo_truncate(lo_open(91002, 393216), 5);
+----
+0
+
+query T
+select encode(lo_get(91002), 'hex');
+----
+68656c6c6f
+
+query T
+select lo_truncate64(lo_open(91002, 393216), 8);
+----
+0
+
+query T
+select encode(lo_get(91002), 'hex');
+----
+68656c6c6f000000
+
+statement error
+select lo_truncate64(lo_open(91002, 393216), -1);
+
+query T
+select lowrite(lo_open(91002, 393216), 'ZZ'::bytea);
+----
+2
+
+query T
+select encode(lo_get(91002), 'hex');
+----
+5a5a6c6c6f000000
+
+statement error
+select lowrite(lo_open(91002, 262144), 'x'::bytea);
+
+statement error
+select loread(0, 2);
+
+statement error
+select lo_close(5);
+
+statement error
+select lo_lseek64(lo_open(91002, 262144), 4398046511105, 0);
+
+statement error
+select lo_put(91003, 0, 'x'::bytea);
