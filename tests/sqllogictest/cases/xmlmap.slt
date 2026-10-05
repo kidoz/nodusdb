@@ -1,0 +1,172 @@
+# The SQL-to-XML mapping functions (table_to_xml, query_to_xml,
+# schema_to_xml, database_to_xml, and their schema forms), PG 18.4. The
+# documents' newlines show as `@` so each value is one line.
+statement ok
+create table t1(a int, b text, c date);
+
+statement ok
+insert into t1 values (1, 'x', '2020-01-02'), (2, null, null);
+
+statement ok
+create schema s2;
+
+statement ok
+create table s2.t2(x numeric, y bool, z bytea, w uuid);
+
+statement ok
+insert into s2.t2 values (1.5, true, '\xab', 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11');
+
+statement ok
+create view v1 as select a, b from t1;
+
+query T
+select replace((table_to_xml('t1', true, false, ''))::text, chr(10), '@');;
+----
+<t1 xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">@@<row>@  <a>1</a>@  <b>x</b>@  <c>2020-01-02</c>@</row>@@<row>@  <a>2</a>@  <b xsi:nil="true"/>@  <c xsi:nil="true"/>@</row>@@</t1>@
+
+query T
+select replace((table_to_xml('t1', false, false, ''))::text, chr(10), '@');;
+----
+<t1 xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">@@<row>@  <a>1</a>@  <b>x</b>@  <c>2020-01-02</c>@</row>@@<row>@  <a>2</a>@</row>@@</t1>@
+
+query T
+select replace((table_to_xml('t1', true, true, ''))::text, chr(10), '@');;
+----
+<t1 xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">@  <a>1</a>@  <b>x</b>@  <c>2020-01-02</c>@</t1>@@<t1 xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">@  <a>2</a>@  <b xsi:nil="true"/>@  <c xsi:nil="true"/>@</t1>@@
+
+query T
+select replace((table_to_xml('t1', false, true, ''))::text, chr(10), '@');;
+----
+<t1 xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">@  <a>1</a>@  <b>x</b>@  <c>2020-01-02</c>@</t1>@@<t1 xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">@  <a>2</a>@</t1>@@
+
+query T
+select replace((table_to_xml('t1', true, false, 'urn:x'))::text, chr(10), '@');;
+----
+<t1 xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns="urn:x">@@<row>@  <a>1</a>@  <b>x</b>@  <c>2020-01-02</c>@</row>@@<row>@  <a>2</a>@  <b xsi:nil="true"/>@  <c xsi:nil="true"/>@</row>@@</t1>@
+
+query T
+select replace((table_to_xml('s2.t2', true, false, ''))::text, chr(10), '@');;
+----
+<t2 xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">@@<row>@  <x>1.5</x>@  <y>true</y>@  <z>qw==</z>@  <w>a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11</w>@</row>@@</t2>@
+
+query T
+select replace((table_to_xml('v1', true, false, ''))::text, chr(10), '@');;
+----
+<v1 xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">@@<row>@  <a>1</a>@  <b>x</b>@</row>@@<row>@  <a>2</a>@  <b xsi:nil="true"/>@</row>@@</v1>@
+
+query T
+select replace((table_to_xmlschema('t1', true, false, ''))::text, chr(10), '@');;
+----
+<xsd:schema@    xmlns:xsd="http://www.w3.org/2001/XMLSchema">@@<xsd:simpleType name="INTEGER">@  <xsd:restriction base="xsd:int">@    <xsd:maxInclusive value="2147483647"/>@    <xsd:minInclusive value="-2147483648"/>@  </xsd:restriction>@</xsd:simpleType>@@<xsd:simpleType name="UDT.default.pg_catalog.text">@  <xsd:restriction base="xsd:string">@  </xsd:restriction>@</xsd:simpleType>@@<xsd:simpleType name="DATE">@  <xsd:restriction base="xsd:date">@    <xsd:pattern value="\p{Nd}{4}-\p{Nd}{2}-\p{Nd}{2}"/>@  </xsd:restriction>@</xsd:simpleType>@@<xsd:complexType name="RowType.default.public.t1">@  <xsd:sequence>@    <xsd:element name="a" type="INTEGER" nillable="true"></xsd:element>@    <xsd:element name="b" type="UDT.default.pg_catalog.text" nillable="true"></xsd:element>@    <xsd:element name="c" type="DATE" nillable="true"></xsd:element>@  </xsd:sequence>@</xsd:complexType>@@<xsd:complexType name="TableType.default.public.t1">@  <xsd:sequence>@    <xsd:element name="row" type="RowType.default.public.t1" minOccurs="0" maxOccurs="unbounded"/>@  </xsd:sequence>@</xsd:complexType>@@<xsd:element name="t1" type="TableType.default.public.t1"/>@@</xsd:schema>
+
+query T
+select replace((table_to_xmlschema('t1', false, true, ''))::text, chr(10), '@');;
+----
+<xsd:schema@    xmlns:xsd="http://www.w3.org/2001/XMLSchema">@@<xsd:simpleType name="INTEGER">@  <xsd:restriction base="xsd:int">@    <xsd:maxInclusive value="2147483647"/>@    <xsd:minInclusive value="-2147483648"/>@  </xsd:restriction>@</xsd:simpleType>@@<xsd:simpleType name="UDT.default.pg_catalog.text">@  <xsd:restriction base="xsd:string">@  </xsd:restriction>@</xsd:simpleType>@@<xsd:simpleType name="DATE">@  <xsd:restriction base="xsd:date">@    <xsd:pattern value="\p{Nd}{4}-\p{Nd}{2}-\p{Nd}{2}"/>@  </xsd:restriction>@</xsd:simpleType>@@<xsd:complexType name="RowType.default.public.t1">@  <xsd:sequence>@    <xsd:element name="a" type="INTEGER" minOccurs="0"></xsd:element>@    <xsd:element name="b" type="UDT.default.pg_catalog.text" minOccurs="0"></xsd:element>@    <xsd:element name="c" type="DATE" minOccurs="0"></xsd:element>@  </xsd:sequence>@</xsd:complexType>@@<xsd:element name="t1" type="RowType.default.public.t1"/>@@</xsd:schema>
+
+query T
+select replace((table_to_xmlschema('s2.t2', true, false, 'urn:t'))::text, chr(10), '@');;
+----
+<xsd:schema@    xmlns:xsd="http://www.w3.org/2001/XMLSchema"@    targetNamespace="urn:t"@    elementFormDefault="qualified">@@<xsd:simpleType name="NUMERIC">@</xsd:simpleType>@@<xsd:simpleType name="BOOLEAN">@  <xsd:restriction base="xsd:boolean"></xsd:restriction>@</xsd:simpleType>@@<xsd:simpleType name="UDT.default.pg_catalog.bytea">@  <xsd:restriction base="xsd:base64Binary">@  </xsd:restriction>@</xsd:simpleType>@@<xsd:simpleType name="UDT.default.pg_catalog.uuid">@</xsd:simpleType>@@<xsd:complexType name="RowType.default.s2.t2">@  <xsd:sequence>@    <xsd:element name="x" type="NUMERIC" nillable="true"></xsd:element>@    <xsd:element name="y" type="BOOLEAN" nillable="true"></xsd:element>@    <xsd:element name="z" type="UDT.default.pg_catalog.bytea" nillable="true"></xsd:element>@    <xsd:element name="w" type="UDT.default.pg_catalog.uuid" nillable="true"></xsd:element>@  </xsd:sequence>@</xsd:complexType>@@<xsd:complexType name="TableType.default.s2.t2">@  <xsd:sequence>@    <xsd:element name="row" type="RowType.default.s2.t2" minOccurs="0" maxOccurs="unbounded"/>@  </xsd:sequence>@</xsd:complexType>@@<xsd:element name="t2" type="TableType.default.s2.t2"/>@@</xsd:schema>
+
+query T
+select replace((table_to_xml_and_xmlschema('t1', true, false, ''))::text, chr(10), '@');;
+----
+<t1 xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="#">@@<xsd:schema@    xmlns:xsd="http://www.w3.org/2001/XMLSchema">@@<xsd:simpleType name="INTEGER">@  <xsd:restriction base="xsd:int">@    <xsd:maxInclusive value="2147483647"/>@    <xsd:minInclusive value="-2147483648"/>@  </xsd:restriction>@</xsd:simpleType>@@<xsd:simpleType name="UDT.default.pg_catalog.text">@  <xsd:restriction base="xsd:string">@  </xsd:restriction>@</xsd:simpleType>@@<xsd:simpleType name="DATE">@  <xsd:restriction base="xsd:date">@    <xsd:pattern value="\p{Nd}{4}-\p{Nd}{2}-\p{Nd}{2}"/>@  </xsd:restriction>@</xsd:simpleType>@@<xsd:complexType name="RowType.default.public.t1">@  <xsd:sequence>@    <xsd:element name="a" type="INTEGER" nillable="true"></xsd:element>@    <xsd:element name="b" type="UDT.default.pg_catalog.text" nillable="true"></xsd:element>@    <xsd:element name="c" type="DATE" nillable="true"></xsd:element>@  </xsd:sequence>@</xsd:complexType>@@<xsd:complexType name="TableType.default.public.t1">@  <xsd:sequence>@    <xsd:element name="row" type="RowType.default.public.t1" minOccurs="0" maxOccurs="unbounded"/>@  </xsd:sequence>@</xsd:complexType>@@<xsd:element name="t1" type="TableType.default.public.t1"/>@@</xsd:schema>@@<row>@  <a>1</a>@  <b>x</b>@  <c>2020-01-02</c>@</row>@@<row>@  <a>2</a>@  <b xsi:nil="true"/>@  <c xsi:nil="true"/>@</row>@@</t1>@
+
+query T
+select replace((query_to_xml('select * from t1 order by a', true, false, ''))::text, chr(10), '@');;
+----
+<table xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">@@<row>@  <a>1</a>@  <b>x</b>@  <c>2020-01-02</c>@</row>@@<row>@  <a>2</a>@  <b xsi:nil="true"/>@  <c xsi:nil="true"/>@</row>@@</table>@
+
+query T
+select replace((query_to_xml('select * from t1 order by a', false, false, ''))::text, chr(10), '@');;
+----
+<table xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">@@<row>@  <a>1</a>@  <b>x</b>@  <c>2020-01-02</c>@</row>@@<row>@  <a>2</a>@</row>@@</table>@
+
+query T
+select replace((query_to_xml('select * from t1 order by a', true, true, ''))::text, chr(10), '@');;
+----
+<row xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">@  <a>1</a>@  <b>x</b>@  <c>2020-01-02</c>@</row>@@<row xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">@  <a>2</a>@  <b xsi:nil="true"/>@  <c xsi:nil="true"/>@</row>@@
+
+query T
+select replace((query_to_xml('select ''2020-01-02 03:04:05''::timestamp as t, ''\x1234''::bytea as b, 1.5::float8 as f, true as bo, array[1,2] as arr, null::int as n', true, false, ''))::text, chr(10), '@');;
+----
+<table xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">@@<row>@  <t>2020-01-02T03:04:05</t>@  <b>EjQ=</b>@  <f>1.5</f>@  <bo>true</bo>@  <arr><element>1</element><element>2</element></arr>@  <n xsi:nil="true"/>@</row>@@</table>@
+
+query T
+select replace((query_to_xml('select 1 as "a b", 2 as "xmlx"', true, false, ''))::text, chr(10), '@');;
+----
+<table xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">@@<row>@  <a_x0020_b>1</a_x0020_b>@  <_x0078_mlx>2</_x0078_mlx>@</row>@@</table>@
+
+query T
+select replace((query_to_xml('select * from t1 where a > 100', true, false, ''))::text, chr(10), '@');;
+----
+<table xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">@@</table>@
+
+query T
+select replace((query_to_xmlschema('select * from t1', true, false, ''))::text, chr(10), '@');;
+----
+<xsd:schema@    xmlns:xsd="http://www.w3.org/2001/XMLSchema">@@<xsd:simpleType name="INTEGER">@  <xsd:restriction base="xsd:int">@    <xsd:maxInclusive value="2147483647"/>@    <xsd:minInclusive value="-2147483648"/>@  </xsd:restriction>@</xsd:simpleType>@@<xsd:simpleType name="UDT.default.pg_catalog.text">@  <xsd:restriction base="xsd:string">@  </xsd:restriction>@</xsd:simpleType>@@<xsd:simpleType name="DATE">@  <xsd:restriction base="xsd:date">@    <xsd:pattern value="\p{Nd}{4}-\p{Nd}{2}-\p{Nd}{2}"/>@  </xsd:restriction>@</xsd:simpleType>@@<xsd:complexType name="RowType">@  <xsd:sequence>@    <xsd:element name="a" type="INTEGER" nillable="true"></xsd:element>@    <xsd:element name="b" type="UDT.default.pg_catalog.text" nillable="true"></xsd:element>@    <xsd:element name="c" type="DATE" nillable="true"></xsd:element>@  </xsd:sequence>@</xsd:complexType>@@<xsd:complexType name="TableType">@  <xsd:sequence>@    <xsd:element name="row" type="RowType" minOccurs="0" maxOccurs="unbounded"/>@  </xsd:sequence>@</xsd:complexType>@@<xsd:element name="table" type="TableType"/>@@</xsd:schema>
+
+query T
+select replace((query_to_xml_and_xmlschema('select 1 as a', true, false, ''))::text, chr(10), '@');;
+----
+<table xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="#">@@<xsd:schema@    xmlns:xsd="http://www.w3.org/2001/XMLSchema">@@<xsd:simpleType name="INTEGER">@  <xsd:restriction base="xsd:int">@    <xsd:maxInclusive value="2147483647"/>@    <xsd:minInclusive value="-2147483648"/>@  </xsd:restriction>@</xsd:simpleType>@@<xsd:complexType name="RowType">@  <xsd:sequence>@    <xsd:element name="a" type="INTEGER" nillable="true"></xsd:element>@  </xsd:sequence>@</xsd:complexType>@@<xsd:complexType name="TableType">@  <xsd:sequence>@    <xsd:element name="row" type="RowType" minOccurs="0" maxOccurs="unbounded"/>@  </xsd:sequence>@</xsd:complexType>@@<xsd:element name="table" type="TableType"/>@@</xsd:schema>@@<row>@  <a>1</a>@</row>@@</table>@
+
+query T
+select replace((schema_to_xml('public', true, false, ''))::text, chr(10), '@');;
+----
+<public xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">@@<t1>@@<row>@  <a>1</a>@  <b>x</b>@  <c>2020-01-02</c>@</row>@@<row>@  <a>2</a>@  <b xsi:nil="true"/>@  <c xsi:nil="true"/>@</row>@@</t1>@@<v1>@@<row>@  <a>1</a>@  <b>x</b>@</row>@@<row>@  <a>2</a>@  <b xsi:nil="true"/>@</row>@@</v1>@@</public>@
+
+query T
+select replace((schema_to_xml('public', false, true, ''))::text, chr(10), '@');;
+----
+<public xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">@@<t1>@  <a>1</a>@  <b>x</b>@  <c>2020-01-02</c>@</t1>@@<t1>@  <a>2</a>@</t1>@@@<v1>@  <a>1</a>@  <b>x</b>@</v1>@@<v1>@  <a>2</a>@</v1>@@@</public>@
+
+query T
+select replace((schema_to_xml('s2', true, false, 'urn:s'))::text, chr(10), '@');;
+----
+<s2 xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns="urn:s">@@<t2>@@<row>@  <x>1.5</x>@  <y>true</y>@  <z>qw==</z>@  <w>a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11</w>@</row>@@</t2>@@</s2>@
+
+query T
+select replace((schema_to_xmlschema('public', true, false, ''))::text, chr(10), '@');;
+----
+<xsd:schema@    xmlns:xsd="http://www.w3.org/2001/XMLSchema">@@<xsd:simpleType name="INTEGER">@  <xsd:restriction base="xsd:int">@    <xsd:maxInclusive value="2147483647"/>@    <xsd:minInclusive value="-2147483648"/>@  </xsd:restriction>@</xsd:simpleType>@@<xsd:simpleType name="UDT.default.pg_catalog.text">@  <xsd:restriction base="xsd:string">@  </xsd:restriction>@</xsd:simpleType>@@<xsd:simpleType name="DATE">@  <xsd:restriction base="xsd:date">@    <xsd:pattern value="\p{Nd}{4}-\p{Nd}{2}-\p{Nd}{2}"/>@  </xsd:restriction>@</xsd:simpleType>@@<xsd:complexType name="SchemaType.default.public">@  <xsd:all>@    <xsd:element name="t1" type="TableType.default.public.t1"/>@    <xsd:element name="v1" type="TableType.default.public.v1"/>@  </xsd:all>@</xsd:complexType>@@<xsd:element name="public" type="SchemaType.default.public"/>@@</xsd:schema>
+
+query T
+select replace((schema_to_xmlschema('public', true, true, ''))::text, chr(10), '@');;
+----
+<xsd:schema@    xmlns:xsd="http://www.w3.org/2001/XMLSchema">@@<xsd:simpleType name="INTEGER">@  <xsd:restriction base="xsd:int">@    <xsd:maxInclusive value="2147483647"/>@    <xsd:minInclusive value="-2147483648"/>@  </xsd:restriction>@</xsd:simpleType>@@<xsd:simpleType name="UDT.default.pg_catalog.text">@  <xsd:restriction base="xsd:string">@  </xsd:restriction>@</xsd:simpleType>@@<xsd:simpleType name="DATE">@  <xsd:restriction base="xsd:date">@    <xsd:pattern value="\p{Nd}{4}-\p{Nd}{2}-\p{Nd}{2}"/>@  </xsd:restriction>@</xsd:simpleType>@@<xsd:complexType name="SchemaType.default.public">@  <xsd:sequence>@    <xsd:element name="t1" type="RowType.default.public.t1" minOccurs="0" maxOccurs="unbounded"/>@    <xsd:element name="v1" type="RowType.default.public.v1" minOccurs="0" maxOccurs="unbounded"/>@  </xsd:sequence>@</xsd:complexType>@@<xsd:element name="public" type="SchemaType.default.public"/>@@</xsd:schema>
+
+query T
+select replace((schema_to_xml_and_xmlschema('s2', true, false, ''))::text, chr(10), '@');;
+----
+<s2 xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="#">@@<xsd:schema@    xmlns:xsd="http://www.w3.org/2001/XMLSchema">@@<xsd:simpleType name="NUMERIC">@</xsd:simpleType>@@<xsd:simpleType name="BOOLEAN">@  <xsd:restriction base="xsd:boolean"></xsd:restriction>@</xsd:simpleType>@@<xsd:simpleType name="UDT.default.pg_catalog.bytea">@  <xsd:restriction base="xsd:base64Binary">@  </xsd:restriction>@</xsd:simpleType>@@<xsd:simpleType name="UDT.default.pg_catalog.uuid">@</xsd:simpleType>@@<xsd:complexType name="SchemaType.default.s2">@  <xsd:all>@    <xsd:element name="t2" type="TableType.default.s2.t2"/>@  </xsd:all>@</xsd:complexType>@@<xsd:element name="s2" type="SchemaType.default.s2"/>@@</xsd:schema>@@<t2>@@<row>@  <x>1.5</x>@  <y>true</y>@  <z>qw==</z>@  <w>a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11</w>@</row>@@</t2>@@</s2>@
+
+query T
+select replace((database_to_xml(true, false, ''))::text, chr(10), '@');;
+----
+<default xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">@@<public>@@<t1>@@<row>@  <a>1</a>@  <b>x</b>@  <c>2020-01-02</c>@</row>@@<row>@  <a>2</a>@  <b xsi:nil="true"/>@  <c xsi:nil="true"/>@</row>@@</t1>@@<v1>@@<row>@  <a>1</a>@  <b>x</b>@</row>@@<row>@  <a>2</a>@  <b xsi:nil="true"/>@</row>@@</v1>@@</public>@@<s2>@@<t2>@@<row>@  <x>1.5</x>@  <y>true</y>@  <z>qw==</z>@  <w>a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11</w>@</row>@@</t2>@@</s2>@@</default>@
+
+query T
+select replace((database_to_xml(false, true, ''))::text, chr(10), '@');;
+----
+<default xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">@@<public>@@<t1>@  <a>1</a>@  <b>x</b>@  <c>2020-01-02</c>@</t1>@@<t1>@  <a>2</a>@</t1>@@@<v1>@  <a>1</a>@  <b>x</b>@</v1>@@<v1>@  <a>2</a>@</v1>@@@</public>@@<s2>@@<t2>@  <x>1.5</x>@  <y>true</y>@  <z>qw==</z>@  <w>a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11</w>@</t2>@@@</s2>@@</default>@
+
+query T
+select replace((database_to_xml_and_xmlschema(true, false, ''))::text, chr(10), '@');;
+----
+<default xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="#">@@<xsd:schema@    xmlns:xsd="http://www.w3.org/2001/XMLSchema">@@<xsd:simpleType name="INTEGER">@  <xsd:restriction base="xsd:int">@    <xsd:maxInclusive value="2147483647"/>@    <xsd:minInclusive value="-2147483648"/>@  </xsd:restriction>@</xsd:simpleType>@@<xsd:simpleType name="UDT.default.pg_catalog.text">@  <xsd:restriction base="xsd:string">@  </xsd:restriction>@</xsd:simpleType>@@<xsd:simpleType name="DATE">@  <xsd:restriction base="xsd:date">@    <xsd:pattern value="\p{Nd}{4}-\p{Nd}{2}-\p{Nd}{2}"/>@  </xsd:restriction>@</xsd:simpleType>@@<xsd:simpleType name="NUMERIC">@</xsd:simpleType>@@<xsd:simpleType name="BOOLEAN">@  <xsd:restriction base="xsd:boolean"></xsd:restriction>@</xsd:simpleType>@@<xsd:simpleType name="UDT.default.pg_catalog.bytea">@  <xsd:restriction base="xsd:base64Binary">@  </xsd:restriction>@</xsd:simpleType>@@<xsd:simpleType name="UDT.default.pg_catalog.uuid">@</xsd:simpleType>@@<xsd:complexType name="CatalogType.default">@  <xsd:all>@    <xsd:element name="public" type="SchemaType.default.public"/>@    <xsd:element name="s2" type="SchemaType.default.s2"/>@  </xsd:all>@</xsd:complexType>@@<xsd:element name="default" type="CatalogType.default"/>@@</xsd:schema>@@<public>@@<t1>@@<row>@  <a>1</a>@  <b>x</b>@  <c>2020-01-02</c>@</row>@@<row>@  <a>2</a>@  <b xsi:nil="true"/>@  <c xsi:nil="true"/>@</row>@@</t1>@@<v1>@@<row>@  <a>1</a>@  <b>x</b>@</row>@@<row>@  <a>2</a>@  <b xsi:nil="true"/>@</row>@@</v1>@@</public>@@<s2>@@<t2>@@<row>@  <x>1.5</x>@  <y>true</y>@  <z>qw==</z>@  <w>a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11</w>@</row>@@</t2>@@</s2>@@</default>@
+
+statement error
+select table_to_xml('nosuch', true, false, '');;
+
+statement error
+select table_to_xmlschema('nosuch', true, false, '');;
+
+statement error
+select schema_to_xml('nosuch', true, false, '');;
+
+statement error
+select query_to_xml('insert into t1 values (3)', true, false, '');;
