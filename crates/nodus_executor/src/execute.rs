@@ -406,7 +406,7 @@ impl MemExecutor {
                 left,
                 right,
             } => self.exec_set_op(ctx, op, all, left, right),
-            LogicalPlan::TableFunction(spec) => self.exec_table_function(spec),
+            LogicalPlan::TableFunction(spec) => self.exec_table_function(ctx, spec),
             LogicalPlan::Values { rows } => self.exec_values(ctx, rows),
             LogicalPlan::Renamed { input, columns } => {
                 let mut out = self.execute_logical_inner(ctx, *input)?;

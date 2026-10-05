@@ -4841,7 +4841,7 @@ fn unistr(s: &str) -> Result<String, String> {
     Ok(out)
 }
 
-fn quote_ident(s: &str) -> String {
+pub(crate) fn quote_ident(s: &str) -> String {
     let plain = s
         .chars()
         .next()

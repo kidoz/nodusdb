@@ -1547,6 +1547,95 @@ fn xmltable_default_cast(value: &Value, column_type: &str) -> Option<Value> {
     }
 }
 
+/// The SQL-to-XML mapping functions — `table_to_xml`, `query_to_xml`,
+/// `cursor_to_xml`, `schema_to_xml`, `database_to_xml`, and their
+/// `*_xmlschema` and `*_and_xmlschema` forms — as the one-row plan the call
+/// is the value of; `None` for any other expression.
+pub(crate) fn xml_mapping_spec(
+    expr: &sqlparser::ast::Expr,
+    params: &[Value],
+) -> Option<TableFnSpec> {
+    use crate::plan_types::{XmlMappingForm, XmlMappingKind, XmlMappingSpec};
+    let sqlparser::ast::Expr::Function(function) = expr else {
+        return None;
+    };
+    let name = function
+        .name
+        .to_string()
+        .to_ascii_uppercase()
+        .trim_start_matches("PG_CATALOG.")
+        .to_string();
+    let (source, form) = match name.as_str() {
+        "TABLE_TO_XML" => ("table", XmlMappingForm::Data),
+        "TABLE_TO_XMLSCHEMA" => ("table", XmlMappingForm::Schema),
+        "TABLE_TO_XML_AND_XMLSCHEMA" => ("table", XmlMappingForm::AndSchema),
+        "QUERY_TO_XML" => ("query", XmlMappingForm::Data),
+        "QUERY_TO_XMLSCHEMA" => ("query", XmlMappingForm::Schema),
+        "QUERY_TO_XML_AND_XMLSCHEMA" => ("query", XmlMappingForm::AndSchema),
+        "CURSOR_TO_XML" => ("cursor", XmlMappingForm::Data),
+        "CURSOR_TO_XMLSCHEMA" => ("cursor", XmlMappingForm::Schema),
+        "SCHEMA_TO_XML" => ("schema", XmlMappingForm::Data),
+        "SCHEMA_TO_XMLSCHEMA" => ("schema", XmlMappingForm::Schema),
+        "SCHEMA_TO_XML_AND_XMLSCHEMA" => ("schema", XmlMappingForm::AndSchema),
+        "DATABASE_TO_XML" => ("database", XmlMappingForm::Data),
+        "DATABASE_TO_XMLSCHEMA" => ("database", XmlMappingForm::Schema),
+        "DATABASE_TO_XML_AND_XMLSCHEMA" => ("database", XmlMappingForm::AndSchema),
+        _ => return None,
+    };
+    let sqlparser::ast::FunctionArguments::List(list) = &function.args else {
+        return None;
+    };
+    let args: Vec<&sqlparser::ast::Expr> = list
+        .args
+        .iter()
+        .map(|a| match a {
+            sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(e)) => {
+                Some(e)
+            }
+            _ => None,
+        })
+        .collect::<Option<_>>()?;
+    // The shape each form takes: the source, then the flags; a cursor
+    // takes its row count between them.
+    let expected = match source {
+        "database" => 3,
+        "cursor" => 5,
+        _ => 4,
+    };
+    if args.len() != expected {
+        return None;
+    }
+    let flag = |e: &sqlparser::ast::Expr| lower_scalar(e, params);
+    let kind = match source {
+        "table" => XmlMappingKind::Table(flag(args[0])?),
+        "query" => XmlMappingKind::Query(flag(args[0])?),
+        "schema" => XmlMappingKind::Schema(flag(args[0])?),
+        "database" => XmlMappingKind::Database,
+        _ => XmlMappingKind::Cursor {
+            name: flag(args[0])?,
+            count: flag(args[1])?,
+        },
+    };
+    let base = if source == "database" {
+        0
+    } else if source == "cursor" {
+        2
+    } else {
+        1
+    };
+    let function = name.to_ascii_lowercase();
+    let mut spec = build_table_fn_spec(function.clone(), Vec::new(), false, None);
+    spec.xml_mapping = Some(XmlMappingSpec {
+        function,
+        kind,
+        nulls: flag(args[base])?,
+        tableforest: flag(args[base + 1])?,
+        targetns: flag(args[base + 2])?,
+        form,
+    });
+    Some(spec)
+}
+
 /// A marker argument that is an expression, or the NULL placeholder a
 /// missing `PATH`/`DEFAULT` leaves.
 fn marker_expression(expr: &sqlparser::ast::Expr, params: &[Value]) -> Option<Option<ScalarExpr>> {
@@ -1884,6 +1973,7 @@ fn lift_set_returning_functions(
             rows_from: Vec::new(),
             json_table: None,
             xml_table: None,
+            xml_mapping: None,
         }
     };
     Some(TableFnSpec {
@@ -1897,6 +1987,7 @@ fn lift_set_returning_functions(
         rows_from: calls.iter().map(|(call, _)| member(call)).collect(),
         json_table: None,
         xml_table: None,
+        xml_mapping: None,
     })
 }
 
@@ -2000,6 +2091,7 @@ fn select_list_table_function(
         rows_from: Vec::new(),
         json_table: None,
         xml_table: None,
+        xml_mapping: None,
     };
     set_table_fn_args(&mut spec, &exprs, params)?;
     Some(spec)
@@ -2034,6 +2126,7 @@ fn build_table_fn_spec(
         rows_from: Vec::new(),
         json_table: None,
         xml_table: None,
+        xml_mapping: None,
     }
 }
 

@@ -479,7 +479,8 @@ impl MemExecutor {
                     .or_else(|| spec.alias.clone())
                     .unwrap_or_else(|| spec.name.clone());
                 // Headers are row-independent; derive them once.
-                let (hdr_names, hdr_types, _) = self.eval_table_function(spec, &[], &col_names)?;
+                let (hdr_names, hdr_types, _) =
+                    self.eval_table_function(ctx, spec, &[], &col_names)?;
                 let now = Utc::now();
                 let fn_cols: Vec<ColumnDescriptor> = hdr_names
                     .iter()
@@ -506,7 +507,7 @@ impl MemExecutor {
                 let width = hdr_names.len();
                 let mut next_rows = Vec::new();
                 for r1 in &stored_rows {
-                    let (_, _, fn_rows) = self.eval_table_function(spec, r1, &col_names)?;
+                    let (_, _, fn_rows) = self.eval_table_function(ctx, spec, r1, &col_names)?;
                     if fn_rows.is_empty() && keep_empty {
                         // LEFT JOIN LATERAL: keep the driving row, NULL-filling the
                         // function's columns when it produces nothing.

@@ -787,6 +787,14 @@ fn lower_pattern(
 /// supported, so the planner can fall back to its existing handling.
 pub(crate) fn lower_scalar(expr: &sqlparser::ast::Expr, params: &[Value]) -> Option<ScalarExpr> {
     use sqlparser::ast::{BinaryOperator as B, Expr, UnaryOperator as U};
+    // The SQL-to-XML mapping functions gather their rows through a plan of
+    // their own: the call becomes the value of a one-row subquery.
+    if let Some(spec) = super::query::xml_mapping_spec(expr, params) {
+        return Some(ScalarExpr::Subquery {
+            plan: SubPlan(Box::new(LogicalPlan::TableFunction(spec))),
+            kind: SubqueryKind::Scalar,
+        });
+    }
     match expr {
         // A placeholder is unbound while a statement is planned for Describe,
         // which only needs the plan's shape; Execute binds the real value.

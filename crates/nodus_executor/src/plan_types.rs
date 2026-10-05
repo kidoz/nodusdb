@@ -139,6 +139,57 @@ pub struct TableFnSpec {
     /// the document in `args`/`arg_exprs`. Defaulted so older plans decode.
     #[serde(default)]
     pub xml_table: Option<XmlTableSpec>,
+    /// The `table_to_xml` family: the mapping's rows are gathered by this
+    /// plan. Defaulted so older plans decode.
+    #[serde(default)]
+    pub xml_mapping: Option<XmlMappingSpec>,
+}
+
+/// The SQL-to-XML mapping of a [`TableFnSpec`] (`table_to_xml`,
+/// `query_to_xml`, `cursor_to_xml`, `schema_to_xml`, `database_to_xml`, and
+/// their `*_xmlschema` and `*_and_xmlschema` forms): the mapping produces
+/// one `xml` value, its rows read where the plan runs.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct XmlMappingSpec {
+    /// The function's name, which the result column takes.
+    pub function: String,
+    /// Where the mapped rows come from.
+    pub kind: XmlMappingKind,
+    /// `nulls`: write a null as an `xsi:nil` element.
+    pub nulls: ScalarExpr,
+    /// `tableforest`: one element per row, instead of a `<table>` root.
+    pub tableforest: ScalarExpr,
+    /// `targetns`: the target namespace, declared on the top-level element.
+    pub targetns: ScalarExpr,
+    /// Which of the three forms the function writes.
+    pub form: XmlMappingForm,
+}
+
+/// Where an [`XmlMappingSpec`]'s rows come from.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum XmlMappingKind {
+    /// `table_to_xml(tbl, ...)`: a relation, by name or OID.
+    Table(ScalarExpr),
+    /// `query_to_xml(query, ...)`: a query, read when the mapping runs.
+    Query(ScalarExpr),
+    /// `cursor_to_xml(name, count, ...)`: rows fetched from an open cursor.
+    Cursor { name: ScalarExpr, count: ScalarExpr },
+    /// `schema_to_xml(schema, ...)`: every table of the schema.
+    Schema(ScalarExpr),
+    /// `database_to_xml(...)`: every table of the database.
+    Database,
+}
+
+/// Which of the family's three forms a mapping writes.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum XmlMappingForm {
+    /// The mapped rows (`table_to_xml`, ...).
+    Data,
+    /// Only the XSD schema (`table_to_xmlschema`, ...).
+    Schema,
+    /// The rows with the schema after the root element's start
+    /// (`table_to_xml_and_xmlschema`, ...).
+    AndSchema,
 }
 
 /// The `XMLTABLE(...)` clause of a [`TableFnSpec`]: the row path, the

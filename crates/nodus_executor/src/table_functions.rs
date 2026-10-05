@@ -16,12 +16,16 @@ impl MemExecutor {
     /// (lateral); literal arguments ignore them.
     pub(crate) fn eval_table_function(
         &self,
+        ctx: &crate::ExecutionContext,
         spec: &TableFnSpec,
         row: &[Value],
         col_names: &[String],
     ) -> Result<(Vec<String>, Vec<String>, Vec<Vec<Value>>)> {
         if !spec.rows_from.is_empty() {
-            return self.eval_rows_from(spec, row, col_names);
+            return self.eval_rows_from(ctx, spec, row, col_names);
+        }
+        if let Some(mapping) = &spec.xml_mapping {
+            return self.eval_xml_mapping(ctx, mapping, row, col_names);
         }
         if let Some(table) = &spec.json_table {
             return self.eval_json_table(spec, table, row, col_names);
@@ -309,6 +313,7 @@ impl MemExecutor {
     /// the shorter's missing values are NULL.
     fn eval_rows_from(
         &self,
+        ctx: &crate::ExecutionContext,
         spec: &TableFnSpec,
         row: &[Value],
         col_names: &[String],
@@ -317,7 +322,7 @@ impl MemExecutor {
         let mut outputs = Vec::new();
         for member in &spec.rows_from {
             let (member_names, member_types, member_rows) =
-                self.eval_table_function(member, row, col_names)?;
+                self.eval_table_function(ctx, member, row, col_names)?;
             names.extend(member_names);
             outputs.push((member_types, member_rows));
         }
@@ -346,8 +351,12 @@ impl MemExecutor {
 
     /// Executes a standalone (non-lateral) table function into a [`QueryOutput`]
     /// — the `SELECT * FROM generate_series(...)` form, materialized like a CTE.
-    pub(crate) fn exec_table_function(&self, spec: TableFnSpec) -> Result<QueryOutput> {
-        let (columns, types, rows) = self.eval_table_function(&spec, &[], &[])?;
+    pub(crate) fn exec_table_function(
+        &self,
+        ctx: &crate::ExecutionContext,
+        spec: TableFnSpec,
+    ) -> Result<QueryOutput> {
+        let (columns, types, rows) = self.eval_table_function(ctx, &spec, &[], &[])?;
         let count = rows.len();
         Ok(QueryOutput {
             columns,
@@ -861,6 +870,183 @@ impl MemExecutor {
         }
         Ok((names, types, rows))
     }
+}
+
+impl MemExecutor {
+    /// Evaluates a `table_to_xml`-family call: the mapping's rows are read
+    /// here — a relation, a query, a cursor's fetched rows, or a schema's
+    /// tables — and written as PostgreSQL's SQL-to-XML mapping writes them.
+    fn eval_xml_mapping(
+        &self,
+        ctx: &crate::ExecutionContext,
+        mapping: &crate::plan_types::XmlMappingSpec,
+        row: &[Value],
+        col_names: &[String],
+    ) -> Result<(Vec<String>, Vec<String>, Vec<Vec<Value>>)> {
+        use crate::plan_types::{XmlMappingForm, XmlMappingKind};
+        let eval = |e: &crate::ScalarExpr| crate::eval_scalar_expr(e, row, col_names);
+        let nulls = matches!(eval(&mapping.nulls), Value::Bool(true));
+        let tableforest = matches!(eval(&mapping.tableforest), Value::Bool(true));
+        let targetns = value_text(&eval(&mapping.targetns));
+        let text = match &mapping.kind {
+            // A whole schema's, or the database's, tables.
+            XmlMappingKind::Schema(_) | XmlMappingKind::Database => {
+                anyhow::bail!("schema_to_xml is not implemented yet");
+            }
+            XmlMappingKind::Table(source) => {
+                let (columns, rows, _schema, name) = self.mapping_table_rows(ctx, &eval(source))?;
+                if mapping.form != XmlMappingForm::Data {
+                    anyhow::bail!("the XSD schema forms are not implemented yet");
+                }
+                crate::xmlmap::map_rows(
+                    &columns,
+                    &rows,
+                    Some(&name),
+                    nulls,
+                    tableforest,
+                    &targetns,
+                    None,
+                    true,
+                )
+                .map_err(|error| anyhow::anyhow!(error))?
+            }
+
+            XmlMappingKind::Query(_) | XmlMappingKind::Cursor { .. } => {
+                let (columns, rows) = match &mapping.kind {
+                    XmlMappingKind::Query(source) => {
+                        let out = self.run_mapping_query(ctx, &value_text(&eval(source)))?;
+                        (mapping_columns(&out), shown_rows(out))
+                    }
+                    _ => {
+                        let XmlMappingKind::Cursor { name, count } = &mapping.kind else {
+                            unreachable!()
+                        };
+                        let cursor = value_text(&eval(name));
+                        let count = value_as_i64(&eval(count)).unwrap_or(0);
+                        let direction = if count < 0 {
+                            crate::FetchDirection::Backward(-count)
+                        } else {
+                            crate::FetchDirection::Forward(count)
+                        };
+                        let out = self.exec_fetch_cursor(ctx, &cursor, direction, false)?;
+                        (mapping_columns(&out), shown_rows(out))
+                    }
+                };
+                if mapping.form != XmlMappingForm::Data {
+                    anyhow::bail!("the XSD schema forms are not implemented yet");
+                }
+                crate::xmlmap::map_rows(
+                    &columns,
+                    &rows,
+                    None,
+                    nulls,
+                    tableforest,
+                    &targetns,
+                    None,
+                    true,
+                )
+                .map_err(|error| anyhow::anyhow!(error))?
+            }
+        };
+        Ok((
+            vec![mapping.function.clone()],
+            vec!["XML".to_string()],
+            vec![vec![Value::Text(text)]],
+        ))
+    }
+
+    /// A relation argument of `table_to_xml`: its columns (name and type),
+    /// its rows, and its schema and bare name.
+    fn mapping_table_rows(
+        &self,
+        ctx: &crate::ExecutionContext,
+        value: &Value,
+    ) -> Result<(Vec<(String, String)>, Vec<Vec<Value>>, String, String)> {
+        let catalog = self.catalog_reader.as_ref();
+        // The argument is a relation: its name, or the OID a `regclass`
+        // value carries.
+        let oid = match value {
+            Value::Int(oid) => *oid,
+            other => {
+                let name = value_text(other);
+                crate::MemExecutor::relation_oid(catalog, &name).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        crate::error_fields::DbError::new(format!(
+                            "relation \"{name}\" does not exist"
+                        ))
+                        .code("42P01")
+                        .into_text()
+                    )
+                })?
+            }
+        };
+        let table = crate::MemExecutor::relation_by_oid(catalog, oid).ok_or_else(|| {
+            anyhow::anyhow!(
+                crate::error_fields::DbError::new("cache lookup failed for relation")
+                    .code("XX000")
+                    .into_text()
+            )
+        })?;
+        let schemas = catalog.list_schemas(DATABASE).unwrap_or_default();
+        let schema = crate::MemExecutor::schema_name_by_id(DATABASE, &schemas, table.schema_id);
+        let rendered = crate::MemExecutor::object_name(catalog, "regclass", oid)
+            .unwrap_or_else(|| table.name.clone());
+        let out = self.run_mapping_query(ctx, &format!("select * from {rendered}"))?;
+        Ok((mapping_columns(&out), shown_rows(out), schema, table.name))
+    }
+}
+
+/// The database the mapping covers; NodusDB serves one.
+const DATABASE: &str = "default";
+
+/// A result's columns as (name, type) pairs.
+fn mapping_columns(out: &crate::QueryOutput) -> Vec<(String, String)> {
+    out.columns
+        .iter()
+        .zip(&out.types)
+        .map(|(name, ty)| (name.clone(), ty.clone()))
+        .collect()
+}
+
+impl MemExecutor {
+    /// Runs a mapping's query string, as PostgreSQL's SPI does for
+    /// `query_to_xml`: one statement, and it must be a query.
+    fn run_mapping_query(
+        &self,
+        ctx: &crate::ExecutionContext,
+        sql: &str,
+    ) -> Result<crate::QueryOutput> {
+        let statements =
+            nodus_sql::parse_sql(sql).map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let invalid = || {
+            anyhow::anyhow!(
+                crate::error_fields::DbError::new("invalid query")
+                    .code("22000")
+                    .into_text()
+            )
+        };
+        let [statement] = statements.as_slice() else {
+            return Err(invalid());
+        };
+        // Only a query returns rows, as PostgreSQL's SPI checks.
+        if !matches!(statement, sqlparser::ast::Statement::Query(_)) {
+            return Err(invalid());
+        }
+        let plan = crate::plan_statement(statement, &[])?;
+        self.execute_logical_inner(ctx, plan)
+    }
+}
+
+/// A mapping's rows as the session shows its values (a zoned timestamp in
+/// the session's zone, an `xml` value in its output form), before the
+/// mapping escapes them.
+fn shown_rows(mut out: crate::QueryOutput) -> Vec<Vec<Value>> {
+    if let Some(forms) = crate::timezone::output_forms(&out.types) {
+        for row in &mut out.rows {
+            crate::timezone::show_row(&mut row.values, &forms);
+        }
+    }
+    out.rows.into_iter().map(|row| row.values).collect()
 }
 
 /// The first column type of a `JSON_TABLE` spec that is not a type at all.
