@@ -352,3 +352,264 @@ fn merge_column(into: &mut ColumnDef, inherited: &ColumnDef) {
         into.default = inherited.default.clone();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::dml_join_tests::{rows, session};
+
+    /// The rows of a select, rendered.
+    fn values(
+        sql: &impl Fn(&str) -> anyhow::Result<crate::QueryOutput>,
+        statement: &str,
+    ) -> Vec<String> {
+        rows(&sql(statement).unwrap())
+    }
+
+    #[test]
+    fn children_inherit_columns_constraints_and_scans() {
+        let sql = session();
+        sql("create table ip (a int not null, b text default 'x', ck int check (ck > 0))").unwrap();
+        sql("create table ic (z int) inherits (ip)").unwrap();
+        // The parents' columns come first.
+        assert_eq!(
+            values(
+                &sql,
+                "select string_agg(column_name, ',' order by ordinal_position) from information_schema.columns \
+                 where table_name = 'ic' and table_schema = 'public'"
+            ),
+            ["a,b,ck,z"]
+        );
+        // CHECK and NOT NULL come down.
+        assert_eq!(
+            values(
+                &sql,
+                "select conname from pg_constraint where conrelid = 'ic'::regclass order by conname"
+            ),
+            ["ip_a_not_null", "ip_ck_check"]
+        );
+        // Scanning the parent reads the child; ONLY and tableoid follow.
+        sql("insert into ip values (1, 'p', 1)").unwrap();
+        sql("insert into ic values (2, 'c', 2, 9)").unwrap();
+        assert_eq!(values(&sql, "select a from ip order by a"), ["1", "2"]);
+        assert_eq!(values(&sql, "select a from only ip"), ["1"]);
+        assert_eq!(
+            values(&sql, "select tableoid::regclass, a from ip order by a"),
+            ["ic|2", "ip|1"]
+        );
+        // Writes through the parent reach the child's rows.
+        sql("update ip set b = 'u' where a = 2").unwrap();
+        assert_eq!(values(&sql, "select b from ic"), ["u"]);
+        sql("delete from ip where a = 1").unwrap();
+        assert_eq!(values(&sql, "select count(*) from ip"), ["1"]);
+        // TRUNCATE takes descendants unless ONLY.
+        sql("truncate only ic").unwrap();
+        assert_eq!(values(&sql, "select count(*) from ic"), ["0"]);
+        // DROP without CASCADE is refused while the child exists.
+        let err = sql("drop table ip").unwrap_err();
+        assert!(
+            crate::error_fields::error_message(&err.to_string())
+                .contains("cannot drop table ip because other objects depend on it"),
+            "{err}"
+        );
+        sql("drop table ip cascade").unwrap();
+        assert!(
+            sql("select count(*) from ic").is_err(),
+            "cascade dropped ic"
+        );
+    }
+
+    #[test]
+    fn only_reads_just_the_table() {
+        let sql = session();
+        sql("create table op (a int)").unwrap();
+        sql("create table oc () inherits (op)").unwrap();
+        sql("create table og () inherits (oc)").unwrap();
+        sql("insert into op values (1)").unwrap();
+        sql("insert into oc values (2)").unwrap();
+        sql("insert into og values (3)").unwrap();
+        assert_eq!(values(&sql, "select a from op order by a"), ["1", "2", "3"]);
+        assert_eq!(values(&sql, "select a from only op"), ["1"]);
+        assert_eq!(values(&sql, "select a from only oc"), ["2"]);
+        assert_eq!(values(&sql, "select a from only op x"), ["1"]);
+        assert_eq!(values(&sql, "select a from only op as x"), ["1"]);
+        assert_eq!(
+            values(
+                &sql,
+                "select p1.a from op p1 join only oc c on true order by p1.a"
+            ),
+            ["1", "2", "3"]
+        );
+    }
+
+    /// One message, without the field suffix a `DbError` carries.
+    fn message(error: &anyhow::Error) -> String {
+        crate::error_fields::error_message(&error.to_string()).to_string()
+    }
+
+    #[test]
+    fn alters_and_drops_reach_descendants() {
+        let sql = session();
+        sql("create table hp (a int not null, ck int check (ck > 0))").unwrap();
+        sql("create table hc () inherits (hp)").unwrap();
+        sql("create table hg () inherits (hc)").unwrap();
+        let columns = |table: &str| {
+            values(
+                &sql,
+                &format!(
+                    "select string_agg(column_name, ',' order by ordinal_position) \
+                     from information_schema.columns where table_name = '{table}' \
+                     and table_schema = 'public'"
+                ),
+            )
+        };
+        sql("alter table hp add column n int default 7").unwrap();
+        assert_eq!(columns("hc"), ["a,ck,n"]);
+        assert_eq!(columns("hg"), ["a,ck,n"]);
+        sql("alter table hp add constraint ck2 check (n > 0)").unwrap();
+        assert_eq!(
+            values(
+                &sql,
+                "select conrelid::regclass from pg_constraint where conname = 'ck2' order by 1::text"
+            ),
+            ["hc", "hg", "hp"]
+        );
+        sql("alter table hp rename column n to nn").unwrap();
+        assert_eq!(columns("hc"), ["a,ck,nn"]);
+        sql("alter table hp drop column nn").unwrap();
+        assert_eq!(columns("hc"), ["a,ck"]);
+        // A separate constraint, since dropping a column takes the checks
+        // that name it with it.
+        sql("alter table hp add constraint ck3 check (ck > 0)").unwrap();
+        for (statement, expected) in [
+            (
+                "alter table only hp add column o int",
+                "column must be added to child tables too",
+            ),
+            (
+                "alter table only hp rename column a to b",
+                "inherited column \"a\" must be renamed in child tables too",
+            ),
+            (
+                "alter table only hp add constraint cx check (a > 0)",
+                "constraint must be added to child tables too",
+            ),
+            (
+                "alter table hc rename column a to b",
+                "cannot rename inherited column \"a\"",
+            ),
+            (
+                "alter table hc drop column a",
+                "cannot drop inherited column \"a\"",
+            ),
+            (
+                "alter table hc alter column a type bigint",
+                "cannot alter inherited column \"a\"",
+            ),
+            (
+                "alter table hc drop constraint ck3",
+                "cannot drop inherited constraint \"ck3\" of relation \"hc\"",
+            ),
+        ] {
+            let err = sql(statement).unwrap_err();
+            assert_eq!(message(&err), expected, "{statement}");
+        }
+        sql("insert into hp values (1, 1)").unwrap();
+        sql("insert into hc values (2, 2)").unwrap();
+        sql("insert into hg values (3, 3)").unwrap();
+        // TRUNCATE takes the descendants; ONLY does not.
+        sql("truncate only hc").unwrap();
+        assert_eq!(values(&sql, "select count(*) from only hc"), ["0"]);
+        assert_eq!(values(&sql, "select count(*) from hg"), ["1"]);
+        sql("truncate hp").unwrap();
+        assert_eq!(values(&sql, "select count(*) from hg"), ["0"]);
+        // DROP takes the children only with CASCADE.
+        let err = sql("drop table hp").unwrap_err();
+        assert_eq!(
+            message(&err),
+            "cannot drop table hp because other objects depend on it"
+        );
+        sql("drop table hp cascade").unwrap();
+        assert!(sql("select count(*) from hc").is_err());
+    }
+
+    #[test]
+    fn inherit_and_no_inherit_attach_and_detach() {
+        let sql = session();
+        sql("create table ip (a int not null default 5, ck int check (ck > 0))").unwrap();
+        sql("create table ic (a int, ck int)").unwrap();
+        let err = sql("alter table ic inherit ip").unwrap_err();
+        assert_eq!(
+            message(&err),
+            "column \"a\" in child table \"ic\" must be marked NOT NULL"
+        );
+        sql("alter table ic alter column a set not null").unwrap();
+        let err = sql("alter table ic inherit ip").unwrap_err();
+        assert_eq!(
+            message(&err),
+            "child table is missing constraint \"ip_ck_check\""
+        );
+        sql("alter table ic add constraint ip_ck_check check (ck > 0)").unwrap();
+        sql("alter table ic inherit ip").unwrap();
+        assert_eq!(
+            values(
+                &sql,
+                "select count(*) from pg_inherits where inhrelid = 'ic'::regclass"
+            ),
+            ["1"]
+        );
+        sql("insert into ip values (1, 1)").unwrap();
+        sql("insert into ic values (2, 2)").unwrap();
+        assert_eq!(values(&sql, "select a from ip order by a"), ["1", "2"]);
+        let err = sql("alter table ic inherit ip").unwrap_err();
+        assert_eq!(
+            message(&err),
+            "relation \"ip\" would be inherited from more than once"
+        );
+        sql("alter table ic no inherit ip").unwrap();
+        assert_eq!(values(&sql, "select a from ip"), ["1"]);
+        let err = sql("alter table ic no inherit ip").unwrap_err();
+        assert_eq!(
+            message(&err),
+            "relation \"ip\" is not a parent of relation \"ic\""
+        );
+    }
+
+    #[test]
+    fn inheritance_errors_match_postgresql() {
+        let sql = session();
+        sql("create table ep (a int)").unwrap();
+        sql("create table ec () inherits (ep)").unwrap();
+        sql("create view ev as select 1 as x").unwrap();
+        for (statement, expected) in [
+            (
+                "create table x1 () inherits (nosuch)",
+                "relation \"nosuch\" does not exist",
+            ),
+            (
+                "create table x2 () inherits (ev)",
+                "inherited relation \"ev\" is not a table or foreign table",
+            ),
+            (
+                "create table x3 (a text) inherits (ep)",
+                "column \"a\" has a type conflict",
+            ),
+            (
+                "alter table only ep add column o int",
+                "column must be added to child tables too",
+            ),
+        ] {
+            let err = sql(statement).unwrap_err();
+            assert_eq!(
+                crate::error_fields::error_message(&err.to_string()),
+                expected,
+                "{statement}"
+            );
+        }
+        sql("create table x4 (b int)").unwrap();
+        let err = sql("alter table x4 inherit ep").unwrap_err();
+        assert_eq!(
+            crate::error_fields::error_message(&err.to_string()),
+            "child table is missing column \"a\""
+        );
+    }
+}

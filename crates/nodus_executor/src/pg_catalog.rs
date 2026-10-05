@@ -177,7 +177,8 @@ impl MemExecutor {
                         ),
                         Value::Bool(false),
                         Value::Bool(false),
-                        Value::Bool(false),
+                        // relhassubclass: a table with children.
+                        Value::Bool(tables.iter().any(|child| child.parents.contains(&table.id))),
                         Value::Bool(false),
                         Value::Bool(false),
                         Value::Bool(true),
@@ -1627,15 +1628,35 @@ impl MemExecutor {
                 ]),
                 Vec::new(),
             )),
-            "pg_inherits" => Some((
-                Self::virtual_columns(&[
-                    ("inhrelid", "OID"),
-                    ("inhparent", "OID"),
-                    ("inhseqno", "INT"),
-                    ("inhdetachpending", "BOOL"),
-                ]),
-                Vec::new(),
-            )),
+            "pg_inherits" => {
+                let mut rows = Vec::new();
+                for table in &tables {
+                    let schema_name = Self::schema_name_by_id(db_name, &schemas, table.schema_id);
+                    let child = Self::table_oid(db_name, &schema_name, &table.name);
+                    for (seqno, parent) in table.parents.iter().enumerate() {
+                        // Only a table that still exists has a parent.
+                        if let Some(parent) = tables.iter().find(|t| t.id == *parent) {
+                            let parent_schema =
+                                Self::schema_name_by_id(db_name, &schemas, parent.schema_id);
+                            rows.push(vec![
+                                Value::Int(child),
+                                Value::Int(Self::table_oid(db_name, &parent_schema, &parent.name)),
+                                Value::Int(seqno as i64 + 1),
+                                Value::Bool(false),
+                            ]);
+                        }
+                    }
+                }
+                Some((
+                    Self::virtual_columns(&[
+                        ("inhrelid", "OID"),
+                        ("inhparent", "OID"),
+                        ("inhseqno", "INT"),
+                        ("inhdetachpending", "BOOL"),
+                    ]),
+                    rows,
+                ))
+            }
             _ => None,
         };
         Ok(result)
@@ -2832,12 +2853,15 @@ impl MemExecutor {
                     Value::Null,
                 ]);
             }
-            // PostgreSQL 18 records each NOT NULL column as a constraint.
+            // PostgreSQL 18 records each NOT NULL column as a constraint,
+            // named for the table that declared the NOT NULL: a child's
+            // inherited one keeps its ancestor's name.
             for (idx, column) in table.columns.iter().enumerate() {
                 if column.nullable || table.view_query.is_some() {
                     continue;
                 }
-                let conname = format!("{}_{}_not_null", table.name, column.name);
+                let origin = not_null_origin(&tables, table, &column.name);
+                let conname = format!("{}_{}_not_null", origin, column.name);
                 rows.push(vec![
                     Value::Int(Self::constraint_oid(
                         db_name,
@@ -3693,4 +3717,39 @@ pub(crate) fn text_search_config_name(oid: i64) -> Option<&'static str> {
         13282 => Some("english"),
         _ => None,
     }
+}
+
+/// The table whose NOT NULL on `column` a child inherits: the farthest
+/// ancestor (or the table itself) that has the column non-nullable.
+fn not_null_origin(
+    tables: &[nodus_catalog::TableDescriptor],
+    table: &nodus_catalog::TableDescriptor,
+    column: &str,
+) -> String {
+    let mut origin = table.name.clone();
+    let mut frontier = vec![table.id];
+    let mut seen = vec![table.id];
+    while let Some(id) = frontier.pop() {
+        let Some(current) = tables.iter().find(|t| t.id == id) else {
+            continue;
+        };
+        for parent_id in &current.parents {
+            if seen.contains(parent_id) {
+                continue;
+            }
+            seen.push(*parent_id);
+            let Some(parent) = tables.iter().find(|t| t.id == *parent_id) else {
+                continue;
+            };
+            if parent
+                .columns
+                .iter()
+                .any(|c| c.name == column && !c.nullable)
+            {
+                origin = parent.name.clone();
+            }
+            frontier.push(parent.id);
+        }
+    }
+    origin
 }
