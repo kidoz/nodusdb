@@ -1,0 +1,383 @@
+# XMLTABLE (SQL/XML), PG 18.4.
+query T
+select * from xmltable('/a/b' passing '<a><b>1</b><b>2</b></a>' columns v int path '.');;
+----
+1
+2
+
+query TT
+select * from xmltable('/a/b' passing '<a><b>1</b><b>2</b></a>' columns n for ordinality, v int path '.');;
+----
+1	1
+2	2
+
+query TT
+select * from xmltable('/a/b' passing '<a><b>1</b><b>2</b></a>' columns v int path '.', n for ordinality);;
+----
+1	1
+2	2
+
+query T
+select * from xmltable('//b' passing '<a><b>1</b><c><b>2</b></c></a>' columns v int path '.');;
+----
+1
+2
+
+query T
+select * from xmltable('//b' passing '<a><c><b>1</b></c><b>2</b></a>' columns v int path '.');;
+----
+1
+2
+
+query T
+select * from xmltable('/a/b' passing '<a><b><c>7</c></b><b/></a>' columns v int path 'c');;
+----
+7
+NULL
+
+query T
+select * from xmltable('/a/b' passing '<a><b><b>7</b></b></a>' columns v int path 'b');;
+----
+7
+
+query TTT
+select * from xmltable('/a/b' passing '<a><b>1</b><b>2</b></a>' columns v text path '.', w text path 'x', d text path 'y' default 'none');;
+----
+1	NULL	none
+2	NULL	none
+
+query T
+select * from xmltable('/a/b' passing '<a><b>1</b><b>2</b></a>' columns v xml path '.');;
+----
+<b>1</b>
+<b>2</b>
+
+query T
+select * from xmltable('/a/b' passing '<a><b><c>1</c><c>2</c></b></a>' columns v xml path 'c');;
+----
+<c>1</c><c>2</c>
+
+query T
+select * from xmltable('/a/b' passing '<a><b><c>1</c></b></a>' columns v xml path 'c');;
+----
+<c>1</c>
+
+query TT
+select * from xmltable('/a/b' passing '<a><b><c> a &amp; b </c></b></a>' columns v text path 'c', u xml path 'c');;
+----
+ a & b 	<c> a &amp; b </c>
+
+query T
+select * from xmltable('/a/b' passing '<a><b>1</b></a>' columns v xml path 'text()');;
+----
+1
+
+query T
+select * from xmltable('/a/b' passing '<a><b>1</b></a>' columns v xml path 'true()');;
+----
+true
+
+query TTT
+select * from xmltable('/a/b' passing '<a><b>1</b></a>' columns v text path 'true()', b int path 'true()', f text path 'false()');;
+----
+true	1	false
+
+query TTTT
+select * from xmltable('/a/b' passing '<a><b>3</b></a>' columns v text path '1 div 3', w text path '0.1 + 0.2', x text path '0.000001 * 1', y text path '10000000000 * 1');;
+----
+0.333333333333333	0.3	1e-06	1e+10
+
+query TT
+select * from xmltable('/a/b' passing '<a><b>1</b><b>2</b></a>' columns v int path '.', w text path 'ancestor::a');;
+----
+1	12
+2	12
+
+query T
+select * from xmltable('/a' passing '<a><b x="5">1</b></a>' columns v int path 'b/@x');;
+----
+5
+
+query TT
+select * from xmltable('/a' passing '<a><b x="5">1</b></a>' columns v text path 'b/@x', w text path 'b/text()');;
+----
+5	1
+
+query TTT
+select * from xmltable('/a/b' passing '<a><b>1</b></a>' columns v text path 'name()', w text path 'local-name()', x int path 'string-length(.)');;
+----
+b	b	1
+
+query T
+select * from xmltable('/a' passing '<a xml:lang="en"><b/></a>' columns v text path 'lang("en")');;
+----
+true
+
+query TT
+select * from xmltable('/a' passing '<a xml:lang="en-GB"><b/></a>' columns v text path 'lang("en")', w text path 'lang("fr")');;
+----
+true	false
+
+query T
+select * from xmltable('/a/b' passing '<a><b>1</b></a>' columns v int path 'sum(//b)');;
+----
+1
+
+query T
+select * from xmltable('/a/b' passing '<a><b>1</b></a>' columns v text path 'concat(., "-", "x")');;
+----
+1-x
+
+query TT
+select * from xmltable('/a' passing '<a><b/></a>' columns v text path 'x' default 'd', w text path 'x' null);;
+----
+d	NULL
+
+query T
+select * from xmltable('/a' passing '<a/>' columns v text path 'x' not null default 'd');;
+----
+d
+
+query T
+select * from xmltable('/a' passing '<a/>' columns v text path 'x' default null);;
+----
+NULL
+
+query T
+select * from xmltable('/a' passing '<a/>' columns v text path 'x' default 5);;
+----
+5
+
+query T
+select * from xmltable('/a' passing '<a/>' columns v text path 'x' default true);;
+----
+true
+
+query T
+select * from xmltable('/a' passing '<a/>' columns v int path 'x' default 1.5);;
+----
+2
+
+query T
+select * from xmltable('/a' passing '<a/>' columns v int path 'x' default '7');;
+----
+7
+
+query T
+select * from xmltable('/a' passing '<a/>' columns v int path 'x' default null);;
+----
+NULL
+
+query TT
+select * from xmltable('/a/b' passing '<a><b>1</b></a>' columns b int, c int path 'c');;
+----
+NULL	NULL
+
+query T
+select * from xmltable('/a' passing '<a xml:lang="en"><b>7</b></a>' columns v int path '.');;
+----
+7
+
+query T
+select * from xmltable('/' passing '<a><b>1</b></a>' columns v text path '.');;
+----
+1
+
+query T
+select * from xmltable('/a/b/text()' passing '<a><b>1</b><c>x</c></a>' columns v text path '.');;
+----
+1
+
+query TT
+select * from xmltable('/a/b/@x' passing '<a><b x="1"/><b x="2"/></a>' columns v text path '.', n for ordinality);;
+----
+1	1
+2	2
+
+query T
+select * from xmltable('/nomatch' passing '<a/>' columns v int path '.');;
+----
+
+query T
+select * from xmltable('count(//b)' passing '<a><b/><b/></a>' columns v int path '.');;
+----
+
+query T
+select * from xmltable('/a/b' passing by value '<a><b>1</b></a>' by value columns v int path '.');;
+----
+1
+
+query T
+select * from xmltable('/a/b' passing by ref '<a><b>1</b></a>' by ref columns v int path '.');;
+----
+1
+
+query T
+select * from xmltable(xmlnamespaces('urn:x' as x), '/x:a/b' passing '<x:a xmlns:x="urn:x"><b>1</b></x:a>' columns v int path '.');;
+----
+1
+
+query TT
+select * from xmltable(xmlnamespaces('urn:x' as x), '/x:a/b' passing '<x:a xmlns:x="urn:x"><b>1</b></x:a>' columns v int path '.', w xml path '.');;
+----
+1	<b>1</b>
+
+query T
+select * from xmltable(xmlnamespaces('urn:x' as x, 'urn:y' as y), '/x:a/y:b' passing '<x:a xmlns:x="urn:x" xmlns:y="urn:y"><y:b>1</y:b></x:a>' columns v int path '.');;
+----
+1
+
+query T
+select * from xmltable(xmlnamespaces('urn:x' as x), '/a/b' passing '<a><b>1</b></a>' columns v text path 'x:b');;
+----
+NULL
+
+query T
+select * from xmltable('/a/b' passing '<a><b>1</b></a>' columns v int path '.') x;;
+----
+1
+
+query TT
+select * from xmltable('/a/b' passing '<a><b>1</b><b>2</b></a>' columns v int path '.', w text path '.') as x(v, w);;
+----
+1	1
+2	2
+
+query T
+select v from xmltable('/a/b' passing '<a><b>1</b><b>2</b></a>' columns v int path '.') where v > 1;;
+----
+2
+
+query T
+select v + n from xmltable('/a/b' passing '<a><b>1</b><b>2</b></a>' columns n for ordinality, v int path '.');;
+----
+2
+4
+
+query TT
+select * from (values ('<a><b>1</b></a>'::xml)) t(d), xmltable('/a/b' passing d columns v int path '.');;
+----
+<a><b>1</b></a>	1
+
+query T
+select * from xmltable('/a' passing '<a><b>1</b><b>2</b><b>3</b></a>' columns v int path 'b[2]');;
+----
+2
+
+query T
+select * from xmltable('/a' passing '<a><b>1</b><b>2</b><b>3</b></a>' columns v int path 'b[last()]');;
+----
+3
+
+query T
+select * from xmltable('/a' passing '<a><b>1</b></a>' columns v int path '..//b');;
+----
+1
+
+query T
+select * from xmltable('/a/b' passing '<a><b>1</b><b>2</b></a>' columns v int path '.') x(v) where v = 2;;
+----
+2
+
+query T
+select * from xmltable('/a' passing null columns v int path '.');;
+----
+
+query T
+select * from xmltable('/a' passing '<a/>' columns v varchar(2) path 'text()');;
+----
+NULL
+
+query T
+select * from xmltable('/a' passing '<a>abc</a>' columns v char(5) path 'text()');;
+----
+abc  
+
+statement error
+select * from xmltable('/a' passing '<a/>' columns v int path '');;
+
+statement error
+select * from xmltable('' passing '<a/>' columns v int path '.');;
+
+statement error
+select * from xmltable('//' passing '<a/>' columns v int path '.');;
+
+statement error
+select * from xmltable('invalid(' passing '<a/>' columns v int path '.');;
+
+statement error
+select * from xmltable('/a' passing '<a/>' columns v int path 'invalid(');;
+
+statement error
+select * from xmltable('/a' passing '<a/>' columns v int path '//');;
+
+statement error
+select * from xmltable('/x:a' passing '<a/>' columns v int path '.');;
+
+statement error
+select * from xmltable('/a' passing '<a/>' columns v int path 'x:a');;
+
+statement error
+select * from xmltable('/a' passing '<a>' columns v int path '.');;
+
+statement error
+select * from xmltable('/a' passing '<a/>' columns v int path '.', w int path '.');;
+
+query T
+select * from xmltable('/a' passing '<a/>' columns v int path 'x');;
+----
+NULL
+
+statement error
+select * from xmltable('/a' passing '<a/>' columns v text path 'x' not null);;
+
+statement error
+select * from xmltable('/a' passing '<a/>' columns v int path 'x' not null);;
+
+statement error
+select * from xmltable('/a/b' passing '<a><b><c>1</c><c>2</c></b></a>' columns v text path 'c');;
+
+statement error
+select * from xmltable('/a' passing '<a/><b/>' columns v int path '.');;
+
+statement error
+select * from xmltable('/a' passing '<a/>' columns v date path 'x' default 'nope');;
+
+statement error
+select * from xmltable('/a' passing '<a/>' columns v nosuchtype path '.');;
+
+statement error
+select * from xmltable('/a' passing '<a/>' columns v int path '.', v int path '.');;
+
+statement error
+select * from xmltable('/a' passing '<a/>' columns n for ordinality, m for ordinality);;
+
+statement error
+select * from xmltable('/a' passing '<a/>' columns v int path '.' path 'x');;
+
+statement error
+select * from xmltable('/a' passing '<a/>' columns v int path '.' default 1 default 2);;
+
+statement error
+select * from xmltable('/a' passing '<a/>' columns v int not null null);;
+
+statement error
+select * from xmltable('/a' passing '<a/>' columns v int foo 'bar');;
+
+statement error
+select * from xmltable(xmlnamespaces(default 'urn:x'), '/a' passing '<a xmlns="urn:x"/>' columns v int path '.');;
+
+statement error
+select * from xmltable(xmlnamespaces(null as x), '/a' passing '<a/>' columns v int path '.');;
+
+statement error
+select * from xmltable(xmlnamespaces('urn:x' as x, 'urn:y' as x), '/a' passing '<a/>' columns v int path '.');;
+
+statement error
+select * from xmltable(xmlnamespaces(default 'urn:x', default 'urn:y'), '/a' passing '<a/>' columns v int path '.');;
+
+statement error
+select * from xmltable('/a' passing 1 columns v int path '.');;
+
+statement error
+select * from xmltable('/a' passing '<a>abc</a>' columns v varchar(2) path 'text()');;
