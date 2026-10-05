@@ -40,6 +40,7 @@ mod index_keys;
 mod information_schema;
 mod json_text;
 mod jsonpath;
+mod largeobjects;
 mod merge;
 mod multiranges;
 mod net;
@@ -1297,20 +1298,28 @@ impl MemExecutor {
                 .or_default()
                 .push(notice);
         }
+        // Large-object calls write through the row store from a plan whose
+        // shape reads, so the implicit transaction must also settle when the
+        // statement wrote but `is_read_only` believes it did not.
+        let wrote = self
+            .active_txns
+            .read()
+            .get(&ctx.session_id)
+            .is_some_and(|txn| !txn.write_log.is_empty());
         if let Some(txn_id) = implicit_txn {
             self.active_txns.write().remove(&ctx.session_id);
             self.advisory.end_transaction(&ctx.session_id);
             match &result {
                 Ok(_) => {
                     let commit_ts = self.commit_or_release(txn_id)?;
-                    if !is_read_only {
+                    if !is_read_only || wrote {
                         self.kv.commit(txn_id, commit_ts)?;
                     }
                     self.after_commit(ctx);
                 }
                 Err(_) => {
                     let _ = self.txn.abort_txn(txn_id);
-                    if !is_read_only {
+                    if !is_read_only || wrote {
                         let _ = self.kv.abort(txn_id);
                     }
                 }

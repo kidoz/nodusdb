@@ -1640,6 +1640,61 @@ pub(crate) fn xml_mapping_spec(
     Some(spec)
 }
 
+/// The bytea large-object functions — `lo_create`, `lo_from_bytea`,
+/// `lo_get`, `lo_put`, and `lo_unlink` — as the one-row plan the call
+/// is the value of; `None` for any other expression.
+pub(crate) fn large_object_spec(
+    expr: &sqlparser::ast::Expr,
+    params: &[Value],
+) -> Option<TableFnSpec> {
+    let sqlparser::ast::Expr::Function(function) = expr else {
+        return None;
+    };
+    let name = function
+        .name
+        .to_string()
+        .to_ascii_uppercase()
+        .trim_start_matches("PG_CATALOG.")
+        .to_string();
+    // Each function's accepted arities, and the type it returns.
+    let (arities, return_type): (&[usize], &str) = match name.as_str() {
+        "LO_CREATE" | "LO_CREAT" => (&[1], "OID"),
+        "LO_FROM_BYTEA" => (&[2], "OID"),
+        "LO_GET" => (&[1, 3], "BYTEA"),
+        "LO_PUT" => (&[3], "VOID"),
+        "LO_UNLINK" => (&[1], "INTEGER"),
+        _ => return None,
+    };
+    let sqlparser::ast::FunctionArguments::List(list) = &function.args else {
+        return None;
+    };
+    let args: Vec<&sqlparser::ast::Expr> = list
+        .args
+        .iter()
+        .map(|a| match a {
+            sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(e)) => {
+                Some(e)
+            }
+            _ => None,
+        })
+        .collect::<Option<_>>()?;
+    if !arities.contains(&args.len()) {
+        return None;
+    }
+    let lowered = args
+        .iter()
+        .map(|arg| lower_scalar(arg, params))
+        .collect::<Option<Vec<_>>>()?;
+    let function = name.to_ascii_lowercase();
+    let mut spec = build_table_fn_spec(function.clone(), Vec::new(), false, None);
+    spec.large_object = Some(crate::plan_types::LargeObjectSpec {
+        function,
+        args: lowered,
+        return_type: return_type.to_string(),
+    });
+    Some(spec)
+}
+
 /// A marker argument that is an expression, or the NULL placeholder a
 /// missing `PATH`/`DEFAULT` leaves.
 fn marker_expression(expr: &sqlparser::ast::Expr, params: &[Value]) -> Option<Option<ScalarExpr>> {
@@ -1978,6 +2033,7 @@ fn lift_set_returning_functions(
             json_table: None,
             xml_table: None,
             xml_mapping: None,
+            large_object: None,
         }
     };
     Some(TableFnSpec {
@@ -1992,6 +2048,7 @@ fn lift_set_returning_functions(
         json_table: None,
         xml_table: None,
         xml_mapping: None,
+        large_object: None,
     })
 }
 
@@ -2096,6 +2153,7 @@ fn select_list_table_function(
         json_table: None,
         xml_table: None,
         xml_mapping: None,
+        large_object: None,
     };
     set_table_fn_args(&mut spec, &exprs, params)?;
     Some(spec)
@@ -2131,6 +2189,7 @@ fn build_table_fn_spec(
         json_table: None,
         xml_table: None,
         xml_mapping: None,
+        large_object: None,
     }
 }
 

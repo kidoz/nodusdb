@@ -795,6 +795,14 @@ pub(crate) fn lower_scalar(expr: &sqlparser::ast::Expr, params: &[Value]) -> Opt
             kind: SubqueryKind::Scalar,
         });
     }
+    // The large-object functions run where the plan runs, in the
+    // statement's transaction, for the same reason.
+    if let Some(spec) = super::query::large_object_spec(expr, params) {
+        return Some(ScalarExpr::Subquery {
+            plan: SubPlan(Box::new(LogicalPlan::TableFunction(spec))),
+            kind: SubqueryKind::Scalar,
+        });
+    }
     match expr {
         // A placeholder is unbound while a statement is planned for Describe,
         // which only needs the plan's shape; Execute binds the real value.

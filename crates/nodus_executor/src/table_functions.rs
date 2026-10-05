@@ -27,6 +27,9 @@ impl MemExecutor {
         if let Some(mapping) = &spec.xml_mapping {
             return self.eval_xml_mapping(ctx, mapping, row, col_names);
         }
+        if let Some(object) = &spec.large_object {
+            return self.eval_large_object(ctx, object, row, col_names);
+        }
         if let Some(table) = &spec.json_table {
             return self.eval_json_table(spec, table, row, col_names);
         }
@@ -1101,6 +1104,107 @@ impl MemExecutor {
             .collect();
         schemas.sort();
         Ok(schemas)
+    }
+}
+
+impl MemExecutor {
+    /// Evaluates a large-object call: the operation runs here, in the
+    /// statement's transaction, and its one value is the call's result.
+    fn eval_large_object(
+        &self,
+        ctx: &crate::ExecutionContext,
+        object: &crate::plan_types::LargeObjectSpec,
+        row: &[Value],
+        col_names: &[String],
+    ) -> Result<(Vec<String>, Vec<String>, Vec<Vec<Value>>)> {
+        let session = ctx.session_id.as_str();
+        // An argument can itself be a call (the planner lowers every one to a
+        // scalar subquery), evaluated before the one it feeds.
+        let args: Vec<Value> = object
+            .args
+            .iter()
+            .map(|arg| self.eval_expr(ctx, arg, row, col_names))
+            .collect();
+        let int = |index: usize| -> Result<i64> {
+            match args.get(index) {
+                Some(Value::Int(value)) => Ok(*value),
+                Some(Value::Text(text)) => text.trim().parse().map_err(|_| {
+                    anyhow::anyhow!(
+                        crate::error_fields::DbError::new(format!(
+                            "invalid input syntax for type oid: \"{text}\""
+                        ))
+                        .code("22P02")
+                        .into_text()
+                    )
+                }),
+                _ => Ok(0),
+            }
+        };
+        let bytes = |index: usize| -> Vec<u8> {
+            match args.get(index) {
+                Some(Value::Bytea(data)) => data.clone(),
+                _ => Vec::new(),
+            }
+        };
+        // Writing operations refuse a read-only transaction, as PostgreSQL
+        // checks before running them.
+        let writable = |what: &str| -> Result<()> {
+            let read_only = self
+                .active_txns
+                .read()
+                .get(session)
+                .is_some_and(|txn| txn.read_only);
+            if read_only {
+                anyhow::bail!(
+                    crate::error_fields::DbError::new(format!(
+                        "cannot execute {what} in a read-only transaction"
+                    ))
+                    .code("25006")
+                    .into_text()
+                );
+            }
+            Ok(())
+        };
+        let value = match object.function.as_str() {
+            "lo_create" => {
+                writable("lo_create()")?;
+                Value::Int(self.lo_create(session, int(0)?)?)
+            }
+            "lo_creat" => {
+                writable("lo_creat()")?;
+                Value::Int(self.lo_create(session, 0)?)
+            }
+            "lo_from_bytea" => {
+                writable("lo_from_bytea()")?;
+                let oid = self.lo_create(session, int(0)?)?;
+                self.lo_put(session, oid, 0, &bytes(1))?;
+                Value::Int(oid)
+            }
+            "lo_get" => {
+                let oid = int(0)?;
+                let (offset, nbytes) = if args.len() == 1 {
+                    (0, None)
+                } else {
+                    (int(1)?, Some(int(2)?))
+                };
+                Value::Bytea(self.lo_get(session, oid, offset, nbytes)?)
+            }
+            "lo_put" => {
+                writable("lo_put()")?;
+                self.lo_put(session, int(0)?, int(1)?, &bytes(2))?;
+                crate::session_functions::void()
+            }
+            "lo_unlink" => {
+                writable("lo_unlink()")?;
+                Value::Int(self.lo_unlink(session, int(0)?)?)
+            }
+            other => anyhow::bail!("unsupported large object function: {other}"),
+        };
+        Ok((
+            vec![object.function.clone()],
+            vec![object.return_type.clone()],
+            vec![vec![value]],
+        ))
     }
 }
 

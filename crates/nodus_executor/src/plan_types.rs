@@ -143,6 +143,24 @@ pub struct TableFnSpec {
     /// plan. Defaulted so older plans decode.
     #[serde(default)]
     pub xml_mapping: Option<XmlMappingSpec>,
+    /// A `lo_*`/`loread`/`lowrite` call: the large-object operation runs
+    /// where the plan runs, in the statement's transaction. Defaulted so
+    /// older plans decode.
+    #[serde(default)]
+    pub large_object: Option<LargeObjectSpec>,
+}
+
+/// The large-object call of a [`TableFnSpec`]: the function's name, its
+/// arguments, and the type it returns.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LargeObjectSpec {
+    /// The function's name (lower-cased), which the result column takes.
+    pub function: String,
+    /// The call's arguments, evaluated where the plan runs.
+    pub args: Vec<ScalarExpr>,
+    /// The type the call returns (`OID`, `BYTEA`, `INTEGER`, `BIGINT`, or
+    /// `VOID`).
+    pub return_type: String,
 }
 
 /// The SQL-to-XML mapping of a [`TableFnSpec`] (`table_to_xml`,
