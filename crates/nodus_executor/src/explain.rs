@@ -259,6 +259,7 @@ impl MemExecutor {
                 sort,
                 group_exprs,
                 distinct_on,
+                sample,
                 ..
             } => {
                 let mut scope: Vec<(String, &LogicalPlan)> = ctes.to_vec();
@@ -272,6 +273,7 @@ impl MemExecutor {
                     table_alias.as_deref(),
                     scan_filter,
                     &scope,
+                    sample.as_ref(),
                 )?;
                 for join in joins {
                     let right = match (&join.lateral, &join.table_fn) {
@@ -292,6 +294,7 @@ impl MemExecutor {
                             join.table_alias.as_deref(),
                             None,
                             &scope,
+                            join.sample.as_ref(),
                         )?,
                     };
                     let (suffix, kind) = match join.join_type {
@@ -538,8 +541,14 @@ impl MemExecutor {
                 ..
             } => {
                 let source = self.explain_node(ctx, source, ctes)?;
-                let target =
-                    self.explain_relation(ctx, table_name, table_alias.as_deref(), None, ctes)?;
+                let target = self.explain_relation(
+                    ctx,
+                    table_name,
+                    table_alias.as_deref(),
+                    None,
+                    ctes,
+                    None,
+                )?;
                 let mut join =
                     Node::over("Nested Loop", "Nested Loop Left Join", vec![source, target])
                         .prop("Join Type", json!("Left"));
@@ -582,9 +591,10 @@ impl MemExecutor {
         ctes: &[(String, &LogicalPlan)],
     ) -> Result<Node> {
         let child = match source {
-            None => self.explain_relation(ctx, table_name, table_alias, filter, ctes)?,
+            None => self.explain_relation(ctx, table_name, table_alias, filter, ctes, None)?,
             Some(source) => {
-                let target = self.explain_relation(ctx, table_name, table_alias, None, ctes)?;
+                let target =
+                    self.explain_relation(ctx, table_name, table_alias, None, ctes, None)?;
                 let source = self.explain_node(ctx, source, ctes)?;
                 let mut join = Node::over("Nested Loop", "Nested Loop", vec![target, source])
                     .prop("Join Type", json!("Inner"));
@@ -619,6 +629,7 @@ impl MemExecutor {
         table_alias: Option<&str>,
         filter: Option<&FilterExpr>,
         ctes: &[(String, &LogicalPlan)],
+        sample: Option<&crate::SampleSpec>,
     ) -> Result<Node> {
         let with_filter = |mut node: Node| {
             if let Some(f) = filter {
@@ -677,11 +688,12 @@ impl MemExecutor {
         let width: u32 = tbl.columns.iter().map(|c| type_width(&c.data_type)).sum();
         let pages = (rows * width as f64 / 8192.0).ceil().max(1.0);
         // The executor looks up `col = value` on an indexed column by index.
-        if let Some(FilterExpr::Predicate(Predicate {
-            left,
-            op: CompareOp::Eq,
-            right: Operand::Literal(_),
-        })) = filter
+        if sample.is_none()
+            && let Some(FilterExpr::Predicate(Predicate {
+                left,
+                op: CompareOp::Eq,
+                right: Operand::Literal(_),
+            })) = filter
         {
             let name = left.rsplit('.').next().unwrap_or(left);
             if let Some(col) = tbl.columns.iter().find(|c| c.name == name)
@@ -713,9 +725,23 @@ impl MemExecutor {
                 return Ok(node);
             }
         }
-        let mut node = Node::new("Seq Scan", format!("Seq Scan on {label}"), rows, width)
-            .prop("Relation Name", json!(table_only))
-            .prop("Alias", json!(table_alias.unwrap_or(table_only)));
+        let mut node = match sample {
+            Some(spec) => {
+                let (detail, rows) = sampling_detail(spec, rows);
+                Node::new(
+                    "Sample Scan",
+                    format!("Sample Scan on {label}"),
+                    rows,
+                    width,
+                )
+                .prop("Relation Name", json!(table_only))
+                .prop("Alias", json!(table_alias.unwrap_or(table_only)))
+                .detail("Sampling", detail)
+            }
+            None => Node::new("Seq Scan", format!("Seq Scan on {label}"), rows, width)
+                .prop("Relation Name", json!(table_only))
+                .prop("Alias", json!(table_alias.unwrap_or(table_only))),
+        };
         node.total = pages * PAGE + rows * CPU_TUPLE;
         Ok(with_filter(node))
     }
@@ -869,6 +895,33 @@ fn sort_key_text(key: &SortKey, projection: &[ProjectionItem], qualified: bool) 
         _ => {}
     }
     text
+}
+
+/// PostgreSQL's `Sampling:` detail for a sampled scan — the method, the
+/// percentage as the `real` it is read as, and any `REPEATABLE` seed —
+/// together with the row estimate the percentage scales.
+fn sampling_detail(spec: &crate::SampleSpec, rows: f64) -> (String, f64) {
+    let argument = match &spec.percent {
+        crate::ScalarExpr::Literal(v) => format!("'{}'::real", render(v)),
+        other => deparse_scalar(other, false),
+    };
+    let mut detail = format!("{} ({argument})", spec.method);
+    if let Some(seed) = &spec.seed {
+        let seed_text = match seed {
+            crate::ScalarExpr::Literal(v) => format!("'{}'::double precision", render(v)),
+            other => deparse_scalar(other, false),
+        };
+        detail.push_str(&format!(" REPEATABLE ({seed_text})"));
+    }
+    let percent = match &spec.percent {
+        crate::ScalarExpr::Literal(v) => crate::value::render(v).parse::<f64>().ok(),
+        _ => None,
+    };
+    let sampled = match percent {
+        Some(percent) if rows > 0.0 => (rows * percent / 100.0).max(1.0).round(),
+        _ => rows,
+    };
+    (detail, sampled)
 }
 
 fn literal(value: &Value) -> String {
