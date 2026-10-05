@@ -157,6 +157,8 @@ impl MemExecutor {
                                 "m"
                             } else if crate::sequences::is_sequence(table) {
                                 "S"
+                            } else if table.partition_by.is_some() {
+                                "p"
                             } else {
                                 "r"
                             }
@@ -183,13 +185,18 @@ impl MemExecutor {
                         Value::Bool(false),
                         Value::Bool(true),
                         Value::Text("d".into()),
-                        Value::Bool(false),
+                        // relispartition, relrewrite, ...
+                        Value::Bool(table.partition_bound.is_some()),
                         Value::Int(0),
                         Value::Int(0),
                         Value::Int(0),
                         Value::Null,
                         Value::Null,
-                        Value::Null,
+                        table
+                            .partition_bound
+                            .clone()
+                            .map(Value::Text)
+                            .unwrap_or(Value::Null),
                     ]);
                     for index in &Self::table_indexes(table) {
                         let index_oid =
@@ -211,7 +218,17 @@ impl MemExecutor {
                             Value::Bool(false),
                             Value::Bool(false),
                             Value::Text("p".into()),
-                            Value::Text("i".into()),
+                            // A partitioned table's index is a partitioned
+                            // index ('I'); one on a partition is attached to
+                            // it (relispartition).
+                            Value::Text(
+                                if table.partition_by.is_some() {
+                                    "I"
+                                } else {
+                                    "i"
+                                }
+                                .into(),
+                            ),
                             Value::Int(index.key_columns.len() as i64),
                             Value::Int(0),
                             Value::Bool(false),
@@ -221,7 +238,7 @@ impl MemExecutor {
                             Value::Bool(false),
                             Value::Bool(true),
                             Value::Text("n".into()),
-                            Value::Bool(false),
+                            Value::Bool(table.partition_bound.is_some()),
                             Value::Int(0),
                             Value::Int(0),
                             Value::Int(0),
@@ -1653,6 +1670,87 @@ impl MemExecutor {
                         ("inhparent", "OID"),
                         ("inhseqno", "INT"),
                         ("inhdetachpending", "BOOL"),
+                    ]),
+                    rows,
+                ))
+            }
+            "pg_partitioned_table" => {
+                let mut rows = Vec::new();
+                for table in &tables {
+                    let Some(key_text) = table.partition_by.as_deref() else {
+                        continue;
+                    };
+                    let Ok(key) = crate::partitioning::PartitionKey::parse(key_text) else {
+                        continue;
+                    };
+                    let schema_name = Self::schema_name_by_id(db_name, &schemas, table.schema_id);
+                    let column = |name: &String| table.columns.iter().find(|c| &c.name == name);
+                    let attattrs: Vec<String> = key
+                        .columns
+                        .iter()
+                        .map(|name| {
+                            column(name)
+                                .map(|c| {
+                                    (table.columns.iter().position(|t| t.id == c.id).unwrap() + 1)
+                                        .to_string()
+                                })
+                                .unwrap_or_default()
+                        })
+                        .collect();
+                    let classes: Vec<String> = key
+                        .columns
+                        .iter()
+                        .map(|name| {
+                            column(name)
+                                .and_then(|c| {
+                                    crate::partitioning::opclass_oid(&c.data_type, key.strategy)
+                                })
+                                .map(|oid| oid.to_string())
+                                .unwrap_or_default()
+                        })
+                        .collect();
+                    let collations: Vec<String> = key
+                        .columns
+                        .iter()
+                        .map(|name| {
+                            column(name)
+                                .map(|c| {
+                                    if crate::partitioning::is_collatable(&c.data_type) {
+                                        "100"
+                                    } else {
+                                        "0"
+                                    }
+                                    .to_string()
+                                })
+                                .unwrap_or_default()
+                        })
+                        .collect();
+                    rows.push(vec![
+                        Value::Int(Self::table_oid(db_name, &schema_name, &table.name)),
+                        Value::Text(
+                            match key.strategy {
+                                crate::partitioning::Strategy::Range => "r",
+                                crate::partitioning::Strategy::List => "l",
+                                crate::partitioning::Strategy::Hash => "h",
+                            }
+                            .into(),
+                        ),
+                        Value::Int(key.columns.len() as i64),
+                        Value::Text(attattrs.join(" ")),
+                        Value::Text(classes.join(" ")),
+                        Value::Text(collations.join(" ")),
+                        Value::Null,
+                    ]);
+                }
+                Some((
+                    Self::virtual_columns(&[
+                        ("partrelid", "OID"),
+                        ("partstrat", "PG_CHAR"),
+                        ("partnatts", "INT"),
+                        ("partattrs", "TEXT"),
+                        ("partclass", "TEXT"),
+                        ("partcollation", "TEXT"),
+                        ("partexprs", "TEXT"),
                     ]),
                     rows,
                 ))
@@ -3214,6 +3312,15 @@ impl MemExecutor {
         })
     }
 
+    /// `pg_get_partkeydef(oid)`: the partitioned table's key, or nothing for
+    /// a table that is not partitioned.
+    pub(crate) fn partkeydef(
+        catalog: &dyn nodus_catalog::CatalogReader,
+        oid: i64,
+    ) -> Option<String> {
+        Self::relation_by_oid(catalog, oid)?.partition_by
+    }
+
     /// The index whose `pg_class` OID is `oid`, with its table.
     pub(crate) fn index_by_oid(
         catalog: &dyn nodus_catalog::CatalogReader,
@@ -3633,6 +3740,7 @@ const SYSTEM_CATALOG_OIDS: &[(&str, i64)] = &[
     ("pg_constraint", 2606),
     ("pg_index", 2610),
     ("pg_inherits", 2611),
+    ("pg_partitioned_table", 3350),
     ("pg_language", 2612),
     ("pg_largeobject", 2613),
     ("pg_opclass", 2616),

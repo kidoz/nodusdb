@@ -953,3 +953,194 @@ impl crate::MemExecutor {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dml_join_tests::{rows, session};
+
+    /// The rows of a select, rendered.
+    fn values(
+        sql: &impl Fn(&str) -> anyhow::Result<crate::QueryOutput>,
+        statement: &str,
+    ) -> Vec<String> {
+        rows(&sql(statement).unwrap())
+    }
+
+    #[test]
+    fn partitions_route_inserts_and_updates() {
+        let sql = session();
+        sql("create table pt (id int, v text) partition by range (id)").unwrap();
+        // No partition yet: the row has nowhere to go.
+        assert!(sql("insert into pt values (5, 'a')").is_err());
+        sql("create table pt1 partition of pt for values from (1) to (10)").unwrap();
+        sql("create table ptd partition of pt default").unwrap();
+        sql("insert into pt values (5, 'a'), (50, 'b')").unwrap();
+        assert_eq!(
+            values(&sql, "select tableoid::regclass, id from pt order by id"),
+            ["pt1|5", "ptd|50"]
+        );
+        // A leaf takes no row outside its bound; the default takes no row a
+        // sibling claims.
+        assert!(sql("insert into pt1 values (60, 'x')").is_err());
+        assert!(sql("insert into ptd values (6, 'x')").is_err());
+        // A key change moves the row through the parent; through a
+        // partition it must stay inside.
+        sql("update pt set id = 7 where id = 5").unwrap();
+        assert!(sql("update pt1 set id = 60 where id = 7").is_err());
+        sql("update pt set id = 60 where id = 7").unwrap();
+        assert_eq!(
+            values(&sql, "select tableoid::regclass, id from pt order by id"),
+            ["ptd|50", "ptd|60"]
+        );
+        // The parent holds no rows; the catalogs show the shape.
+        assert_eq!(values(&sql, "select count(*) from only pt"), ["0"]);
+        assert_eq!(
+            values(
+                &sql,
+                "select relkind, relispartition from pg_class where relname = 'pt1'"
+            ),
+            ["r|t"]
+        );
+        assert_eq!(
+            values(&sql, "select pg_get_partkeydef('pt'::regclass)"),
+            ["RANGE (id)"]
+        );
+    }
+
+    #[test]
+    fn hash_partitions_place_rows_as_postgresql_does() {
+        let sql = session();
+        sql("create table h2 (id int) partition by hash (id)").unwrap();
+        for remainder in 0..4 {
+            sql(&format!(
+                "create table h2r{remainder} partition of h2 for values with (modulus 4, remainder {remainder})"
+            ))
+            .unwrap();
+        }
+        sql("insert into h2 select generate_series(1, 10)").unwrap();
+        // PostgreSQL 18.4's own placement: remainder 1 holds 3, 5, 8, 9.
+        assert_eq!(
+            values(
+                &sql,
+                "select string_agg(id::text, ',' order by id) from h2r1"
+            ),
+            ["3,5,8,9"]
+        );
+        assert_eq!(
+            values(
+                &sql,
+                "select string_agg(id::text, ',' order by id) from h2r3"
+            ),
+            ["4,6,7,10"]
+        );
+        // The same remainder twice would overlap.
+        assert!(
+            sql("create table h2x partition of h2 for values with (modulus 4, remainder 0)")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn attach_and_detach_change_the_link() {
+        let sql = session();
+        sql("create table at (id int) partition by range (id)").unwrap();
+        sql("create table at1 (id int)").unwrap();
+        sql("insert into at1 values (5)").unwrap();
+        // The rows must fall inside the bound being attached.
+        assert!(sql("alter table at attach partition at1 for values from (1) to (3)").is_err());
+        sql("alter table at attach partition at1 for values from (1) to (10)").unwrap();
+        assert_eq!(values(&sql, "select id from at"), ["5"]);
+        assert_eq!(
+            values(
+                &sql,
+                "select relispartition from pg_class where relname = 'at1'"
+            ),
+            ["t"]
+        );
+        sql("alter table at detach partition at1").unwrap();
+        // The table keeps its rows and stops being a partition.
+        assert_eq!(values(&sql, "select id from at1"), ["5"]);
+        assert!(sql("insert into at values (5)").is_err());
+    }
+
+    #[test]
+    fn keys_and_bounds_parse_and_render() {
+        let key = PartitionKey::parse("RANGE (id, v)").unwrap();
+        assert_eq!(key.strategy, Strategy::Range);
+        assert_eq!(key.columns, ["id", "v"]);
+        assert_eq!(key.render(), "RANGE (id, v)");
+        let types = ["integer".to_string(), "text".to_string()];
+        let bound = parse_bound("FOR VALUES FROM (1, 'a') TO (3, 'b')", &key, &types).unwrap();
+        assert_eq!(render_bound(&bound), "FOR VALUES FROM (1, 'a') TO (3, 'b')");
+        let bound = parse_bound("FOR VALUES FROM (MINVALUE) TO (MAXVALUE)", &key, &types).unwrap();
+        assert_eq!(
+            render_bound(&bound),
+            "FOR VALUES FROM (MINVALUE) TO (MAXVALUE)"
+        );
+        let list = PartitionKey::parse("LIST (v)").unwrap();
+        let bound =
+            parse_bound("FOR VALUES IN ('a,b', NULL)", &list, &["text".to_string()]).unwrap();
+        assert_eq!(render_bound(&bound), "FOR VALUES IN ('a,b', NULL)");
+        let hash = PartitionKey::parse("HASH (id)").unwrap();
+        let bound = parse_bound(
+            "FOR VALUES WITH (modulus 4, remainder 1)",
+            &hash,
+            &["integer".to_string()],
+        )
+        .unwrap();
+        assert_eq!(
+            render_bound(&bound),
+            "FOR VALUES WITH (modulus 4, remainder 1)"
+        );
+        assert_eq!(render_bound(&Bound::Default), "DEFAULT");
+        assert!(parse_bound("FOR VALUES IN (1)", &key, &types).is_err());
+        assert!(parse_bound("FOR VALUES FROM ('x') TO ('y')", &key, &types).is_err());
+    }
+
+    #[test]
+    fn bounds_match_their_values() {
+        let types = ["integer".to_string()];
+        let key = PartitionKey::parse("RANGE (id)").unwrap();
+        let bound = parse_bound("FOR VALUES FROM (1) TO (10)", &key, &types).unwrap();
+        assert!(contains(&bound, &[Value::Int(1)], &types));
+        assert!(contains(&bound, &[Value::Int(9)], &types));
+        assert!(!contains(&bound, &[Value::Int(10)], &types));
+        assert!(!contains(&bound, &[Value::Int(0)], &types));
+        assert!(!contains(&bound, &[Value::Null], &types));
+        let list = PartitionKey::parse("LIST (v)").unwrap();
+        let ltypes = ["text".to_string()];
+        let bound = parse_bound("FOR VALUES IN ('a', NULL)", &list, &ltypes).unwrap();
+        assert!(contains(&bound, &[Value::Text("a".into())], &ltypes));
+        assert!(!contains(&bound, &[Value::Text("b".into())], &ltypes));
+        assert!(contains(&bound, &[Value::Null], &ltypes));
+    }
+
+    #[test]
+    fn hashes_match_postgresql() {
+        // The distribution PostgreSQL's own hash partitioning gives, from
+        // `select v, ... satisfies_hash_partition('h2'::regclass, 4, r, v)`
+        // on 18.4: remainder 0: 1, 1000; 1: 3, 5, 8, 9, 100; 2: 2;
+        // 3: 4, 6, 7, 10.
+        let remainder = |value: i64| {
+            let types = ["integer".to_string()];
+            (row_hash(&[Value::Int(value)], &types).expect("integer hashes") % 4) as i64
+        };
+        for (value, expected) in [
+            (1, 0),
+            (1000, 0),
+            (3, 1),
+            (5, 1),
+            (8, 1),
+            (9, 1),
+            (100, 1),
+            (2, 2),
+            (4, 3),
+            (6, 3),
+            (7, 3),
+            (10, 3),
+        ] {
+            assert_eq!(remainder(value), expected, "remainder of {value}");
+        }
+    }
+}

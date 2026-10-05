@@ -404,6 +404,7 @@ impl MemExecutor {
                 | "pg_publication_namespace"
                 | "pg_publication_rel"
                 | "pg_inherits"
+                | "pg_partitioned_table"
                 | "pg_ts_config"
                 | "pg_ts_config_map"
                 | "pg_ts_dict"

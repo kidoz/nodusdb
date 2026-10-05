@@ -183,7 +183,8 @@ pub(crate) fn is_known(name: &str) -> bool {
                 | "INET_CLIENT_PORT" | "OBJ_DESCRIPTION" | "COL_DESCRIPTION"
                 | "SHOBJ_DESCRIPTION" | "FORMAT_TYPE" | "PG_GET_EXPR"
                 | "PG_RELATION_IS_PUBLISHABLE" | "PG_GET_STATISTICSOBJDEF_COLUMNS"
-                | "PG_GET_INDEXDEF" | "PG_GET_CONSTRAINTDEF" | "__OBJECT_NAME__"
+                | "PG_GET_INDEXDEF" | "PG_GET_CONSTRAINTDEF" | "PG_GET_PARTKEYDEF"
+                | "__OBJECT_NAME__"
                 | "PG_GET_VIEWDEF" | "PG_RELATION_SIZE" | "PG_TABLE_SIZE" | "PG_INDEXES_SIZE"
                 | "PG_TOTAL_RELATION_SIZE" | "PG_DATABASE_SIZE"
                 // Sequences.
@@ -3744,6 +3745,16 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
                 crate::MemExecutor::constraint_definition(catalog, int(arg(0))?, pretty)
             })
         }
+        // By OID or by (possibly qualified) name.
+        "PG_GET_PARTKEYDEF" if arity(1) => catalog_text(|catalog| {
+            let oid = match arg(0) {
+                Value::Text(name) if name.trim().parse::<i64>().is_err() => {
+                    crate::MemExecutor::relation_oid(catalog, name)?
+                }
+                other => int(other)?,
+            };
+            crate::MemExecutor::partkeydef(catalog, oid)
+        }),
         // Any table could be published (there are no publications).
         "PG_RELATION_IS_PUBLISHABLE" if arity(1) => Value::Bool(true),
         // There are no extended statistics objects.
