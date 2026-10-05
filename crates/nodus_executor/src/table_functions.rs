@@ -894,23 +894,34 @@ impl MemExecutor {
                 anyhow::bail!("schema_to_xml is not implemented yet");
             }
             XmlMappingKind::Table(source) => {
-                let (columns, rows, _schema, name) = self.mapping_table_rows(ctx, &eval(source))?;
-                if mapping.form != XmlMappingForm::Data {
-                    anyhow::bail!("the XSD schema forms are not implemented yet");
+                let (columns, rows, schema, name) = self.mapping_table_rows(ctx, &eval(source))?;
+                let table = (DATABASE, schema.as_str(), name.as_str());
+                let schema_text = match mapping.form {
+                    XmlMappingForm::Data => None,
+                    _ => Some(crate::xmlmap::table_schema(
+                        &columns,
+                        Some(table),
+                        nulls,
+                        tableforest,
+                        &targetns,
+                    )),
+                };
+                if mapping.form == XmlMappingForm::Schema {
+                    schema_text.unwrap_or_default()
+                } else {
+                    crate::xmlmap::map_rows(
+                        &columns,
+                        &rows,
+                        Some(&name),
+                        nulls,
+                        tableforest,
+                        &targetns,
+                        schema_text.as_deref(),
+                        true,
+                    )
+                    .map_err(|error| anyhow::anyhow!(error))?
                 }
-                crate::xmlmap::map_rows(
-                    &columns,
-                    &rows,
-                    Some(&name),
-                    nulls,
-                    tableforest,
-                    &targetns,
-                    None,
-                    true,
-                )
-                .map_err(|error| anyhow::anyhow!(error))?
             }
-
             XmlMappingKind::Query(_) | XmlMappingKind::Cursor { .. } => {
                 let (columns, rows) = match &mapping.kind {
                     XmlMappingKind::Query(source) => {
@@ -932,20 +943,31 @@ impl MemExecutor {
                         (mapping_columns(&out), shown_rows(out))
                     }
                 };
-                if mapping.form != XmlMappingForm::Data {
-                    anyhow::bail!("the XSD schema forms are not implemented yet");
+                let schema_text = match mapping.form {
+                    XmlMappingForm::Data => None,
+                    _ => Some(crate::xmlmap::table_schema(
+                        &columns,
+                        None,
+                        nulls,
+                        tableforest,
+                        &targetns,
+                    )),
+                };
+                if mapping.form == XmlMappingForm::Schema {
+                    schema_text.unwrap_or_default()
+                } else {
+                    crate::xmlmap::map_rows(
+                        &columns,
+                        &rows,
+                        None,
+                        nulls,
+                        tableforest,
+                        &targetns,
+                        schema_text.as_deref(),
+                        true,
+                    )
+                    .map_err(|error| anyhow::anyhow!(error))?
                 }
-                crate::xmlmap::map_rows(
-                    &columns,
-                    &rows,
-                    None,
-                    nulls,
-                    tableforest,
-                    &targetns,
-                    None,
-                    true,
-                )
-                .map_err(|error| anyhow::anyhow!(error))?
             }
         };
         Ok((

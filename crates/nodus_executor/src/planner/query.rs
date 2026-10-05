@@ -1595,11 +1595,13 @@ pub(crate) fn xml_mapping_spec(
             _ => None,
         })
         .collect::<Option<_>>()?;
-    // The shape each form takes: the source, then the flags; a cursor
-    // takes its row count between them.
+    // The shape each form takes: the source, then the flags; a cursor's
+    // data form takes its row count between them (its schema form has
+    // none).
+    let cursor_count = source == "cursor" && form == XmlMappingForm::Data;
     let expected = match source {
         "database" => 3,
-        "cursor" => 5,
+        "cursor" if cursor_count => 5,
         _ => 4,
     };
     if args.len() != expected {
@@ -1611,17 +1613,19 @@ pub(crate) fn xml_mapping_spec(
         "query" => XmlMappingKind::Query(flag(args[0])?),
         "schema" => XmlMappingKind::Schema(flag(args[0])?),
         "database" => XmlMappingKind::Database,
-        _ => XmlMappingKind::Cursor {
+        _ if cursor_count => XmlMappingKind::Cursor {
             name: flag(args[0])?,
             count: flag(args[1])?,
         },
+        _ => XmlMappingKind::Cursor {
+            name: flag(args[0])?,
+            count: ScalarExpr::Literal(Value::Null),
+        },
     };
-    let base = if source == "database" {
-        0
-    } else if source == "cursor" {
-        2
-    } else {
-        1
+    let base = match source {
+        "database" => 0,
+        "cursor" if cursor_count => 2,
+        _ => 1,
     };
     let function = name.to_ascii_lowercase();
     let mut spec = build_table_fn_spec(function.clone(), Vec::new(), false, None);

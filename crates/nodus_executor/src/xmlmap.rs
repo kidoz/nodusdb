@@ -345,6 +345,267 @@ pub(crate) fn map_rows(
     Ok(out)
 }
 
+/// `xsd_schema_element_start`.
+pub(crate) fn xsd_schema_start(out: &mut String, targetns: &str) {
+    out.push_str("<xsd:schema\n    xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\"");
+    if !targetns.is_empty() {
+        out.push_str(&format!(
+            "\n    targetNamespace=\"{targetns}\"\n    elementFormDefault=\"qualified\""
+        ));
+    }
+    out.push_str(">\n\n");
+}
+
+/// `xsd_schema_element_end`.
+pub(crate) fn xsd_schema_end(out: &mut String) {
+    out.push_str("</xsd:schema>");
+}
+
+/// The type a column's declared type names, lower-cased and without its
+/// modifiers.
+fn base_of(data_type: &str) -> String {
+    data_type
+        .trim()
+        .split('(')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+}
+
+/// `map_sql_type_to_xml_name` with no type modifier: a built-in's XSD name,
+/// or the `UDT.` name of anything else.
+pub(crate) fn type_xml_name(data_type: &str) -> String {
+    match base_of(data_type).as_str() {
+        "bpchar" | "char" | "character" => "CHAR".to_string(),
+        "varchar" | "character varying" => "VARCHAR".to_string(),
+        "numeric" | "decimal" => "NUMERIC".to_string(),
+        "int4" | "int" | "integer" => "INTEGER".to_string(),
+        "int2" | "smallint" => "SMALLINT".to_string(),
+        "int8" | "bigint" => "BIGINT".to_string(),
+        "float4" | "real" => "REAL".to_string(),
+        "float8" | "double precision" | "float" => "DOUBLE".to_string(),
+        "bool" | "boolean" => "BOOLEAN".to_string(),
+        "time" | "time without time zone" => "TIME".to_string(),
+        "timetz" | "time with time zone" => "TIME_WTZ".to_string(),
+        "timestamp" | "timestamp without time zone" => "TIMESTAMP".to_string(),
+        "timestamptz" | "timestamp with time zone" => "TIMESTAMP_WTZ".to_string(),
+        "date" => "DATE".to_string(),
+        "xml" => "XML".to_string(),
+        _ => udt_xml_name(data_type),
+    }
+}
+
+/// The XSD name of a type that has none of its own: `UDT.default.<schema>.
+/// <name>` (a domain takes `Domain`), the built-in ones in `pg_catalog`.
+fn udt_xml_name(data_type: &str) -> String {
+    let base = base_of(data_type);
+    if let Some(found) = crate::user_types::lookup(&base) {
+        let kind = match found.definition {
+            crate::user_types::TypeDefinition::Domain { .. } => "Domain",
+            _ => "UDT",
+        };
+        return multipart_name(&[kind, "default", &found.schema, &found.name]);
+    }
+    multipart_name(&["UDT", "default", "pg_catalog", &base])
+}
+
+/// `map_sql_type_to_xmlschema_type` with no type modifier: the XSD
+/// definition of a column's type.
+pub(crate) fn type_definition(data_type: &str) -> String {
+    let name = type_xml_name(data_type);
+    let base = base_of(data_type);
+    if base == "xml" {
+        return "  <xsd:complexType mixed=\"true\">\n  <xsd:sequence>\n    <xsd:any name=\"element\" minOccurs=\"0\" maxOccurs=\"unbounded\" processContents=\"skip\"/>\n  </xsd:sequence>\n</xsd:complexType>\n".to_string();
+    }
+    let pattern = |value: &str| {
+        format!(
+            "  <xsd:restriction base=\"xsd:{base}\">\n    <xsd:pattern value=\"{value}\"/>\n  </xsd:restriction>\n"
+        )
+    };
+    let body = match base.as_str() {
+        "text" | "bpchar" | "char" | "character" | "varchar" | "character varying" => {
+            "  <xsd:restriction base=\"xsd:string\">\n  </xsd:restriction>\n".to_string()
+        }
+        "bytea" => {
+            "  <xsd:restriction base=\"xsd:base64Binary\">\n  </xsd:restriction>\n".to_string()
+        }
+        "int2" | "smallint" => "  <xsd:restriction base=\"xsd:short\">\n    <xsd:maxInclusive value=\"32767\"/>\n    <xsd:minInclusive value=\"-32768\"/>\n  </xsd:restriction>\n".to_string(),
+        "int4" | "int" | "integer" => "  <xsd:restriction base=\"xsd:int\">\n    <xsd:maxInclusive value=\"2147483647\"/>\n    <xsd:minInclusive value=\"-2147483648\"/>\n  </xsd:restriction>\n".to_string(),
+        "int8" | "bigint" => "  <xsd:restriction base=\"xsd:long\">\n    <xsd:maxInclusive value=\"9223372036854775807\"/>\n    <xsd:minInclusive value=\"-9223372036854775808\"/>\n  </xsd:restriction>\n".to_string(),
+        "float4" | "real" => {
+            "  <xsd:restriction base=\"xsd:float\"></xsd:restriction>\n".to_string()
+        }
+        "float8" | "double precision" | "float" => {
+            "  <xsd:restriction base=\"xsd:double\"></xsd:restriction>\n".to_string()
+        }
+        "bool" | "boolean" => {
+            "  <xsd:restriction base=\"xsd:boolean\"></xsd:restriction>\n".to_string()
+        }
+        "time" | "time without time zone" => {
+            pattern(r"\p{Nd}{2}:\p{Nd}{2}:\p{Nd}{2}(.\p{Nd}+)?")
+        }
+        "timetz" | "time with time zone" => {
+            pattern(r"\p{Nd}{2}:\p{Nd}{2}:\p{Nd}{2}(.\p{Nd}+)?(\+|-)\p{Nd}{2}:\p{Nd}{2}")
+        }
+        "timestamp" | "timestamp without time zone" => {
+            pattern(r"\p{Nd}{4}-\p{Nd}{2}-\p{Nd}{2}T\p{Nd}{2}:\p{Nd}{2}:\p{Nd}{2}(.\p{Nd}+)?")
+        }
+        "timestamptz" | "timestamp with time zone" => {
+            pattern(r"\p{Nd}{4}-\p{Nd}{2}-\p{Nd}{2}T\p{Nd}{2}:\p{Nd}{2}:\p{Nd}{2}(.\p{Nd}+)?(\+|-)\p{Nd}{2}:\p{Nd}{2}")
+        }
+        "date" => pattern(r"\p{Nd}{4}-\p{Nd}{2}-\p{Nd}{2}"),
+        // `numeric` without a modifier, and every type without a case of
+        // its own, has an empty definition.
+        _ => String::new(),
+    };
+    format!("<xsd:simpleType name=\"{name}\">\n{body}</xsd:simpleType>\n")
+}
+
+/// `map_sql_typecoll_to_xmlschema_types`: the definitions of the distinct
+/// column types, in column order.
+pub(crate) fn column_types_schema(columns: &[(String, String)]) -> String {
+    let mut seen: Vec<String> = Vec::new();
+    let mut out = String::new();
+    for (_, data_type) in columns {
+        let name = type_xml_name(data_type);
+        if seen.contains(&name) {
+            continue;
+        }
+        seen.push(name);
+        out.push_str(&type_definition(data_type));
+        out.push('\n');
+    }
+    out
+}
+
+/// `map_sql_table_to_xmlschema`: a table's (or a query's, with no table) XSD
+/// schema.
+pub(crate) fn table_schema(
+    columns: &[(String, String)],
+    table: Option<(&str, &str, &str)>,
+    nulls: bool,
+    tableforest: bool,
+    targetns: &str,
+) -> String {
+    let (xmltn, tabletypename, rowtypename) = match table {
+        Some((database, schema, name)) => (
+            identifier_to_xml_name(name),
+            multipart_name(&["TableType", database, schema, name]),
+            multipart_name(&["RowType", database, schema, name]),
+        ),
+        None if tableforest => (
+            "row".to_string(),
+            "TableType".to_string(),
+            "RowType".to_string(),
+        ),
+        None => (
+            "table".to_string(),
+            "TableType".to_string(),
+            "RowType".to_string(),
+        ),
+    };
+    let mut out = String::new();
+    xsd_schema_start(&mut out, targetns);
+    out.push_str(&column_types_schema(columns));
+    out.push_str(&format!(
+        "<xsd:complexType name=\"{rowtypename}\">\n  <xsd:sequence>\n"
+    ));
+    for (name, data_type) in columns {
+        out.push_str(&format!(
+            "    <xsd:element name=\"{}\" type=\"{}\"{}></xsd:element>\n",
+            identifier_to_xml_name(name),
+            type_xml_name(data_type),
+            if nulls {
+                " nillable=\"true\""
+            } else {
+                " minOccurs=\"0\""
+            }
+        ));
+    }
+    out.push_str("  </xsd:sequence>\n</xsd:complexType>\n\n");
+    if !tableforest {
+        out.push_str(&format!(
+            "<xsd:complexType name=\"{tabletypename}\">\n  <xsd:sequence>\n    <xsd:element name=\"row\" type=\"{rowtypename}\" minOccurs=\"0\" maxOccurs=\"unbounded\"/>\n  </xsd:sequence>\n</xsd:complexType>\n\n"
+        ));
+        out.push_str(&format!(
+            "<xsd:element name=\"{xmltn}\" type=\"{tabletypename}\"/>\n\n"
+        ));
+    } else {
+        out.push_str(&format!(
+            "<xsd:element name=\"{xmltn}\" type=\"{rowtypename}\"/>\n\n"
+        ));
+    }
+    xsd_schema_end(&mut out);
+    out
+}
+
+/// `map_sql_schema_to_xmlschema_types`: a schema's XSD schema, over its
+/// tables' names.
+pub(crate) fn schema_schema(
+    database: &str,
+    schema: &str,
+    tables: &[&str],
+    tableforest: bool,
+) -> String {
+    let xmlsn = identifier_to_xml_name(schema);
+    let schematypename = multipart_name(&["SchemaType", database, schema]);
+    let mut out = format!("<xsd:complexType name=\"{schematypename}\">\n");
+    out.push_str(if tableforest {
+        "  <xsd:sequence>\n"
+    } else {
+        "  <xsd:all>\n"
+    });
+    for name in tables {
+        let xmltn = identifier_to_xml_name(name);
+        let tabletypename = multipart_name(&[
+            if tableforest { "RowType" } else { "TableType" },
+            database,
+            schema,
+            name,
+        ]);
+        if tableforest {
+            out.push_str(&format!(
+                "    <xsd:element name=\"{xmltn}\" type=\"{tabletypename}\" minOccurs=\"0\" maxOccurs=\"unbounded\"/>\n"
+            ));
+        } else {
+            out.push_str(&format!(
+                "    <xsd:element name=\"{xmltn}\" type=\"{tabletypename}\"/>\n"
+            ));
+        }
+    }
+    out.push_str(if tableforest {
+        "  </xsd:sequence>\n"
+    } else {
+        "  </xsd:all>\n"
+    });
+    out.push_str("</xsd:complexType>\n\n");
+    out.push_str(&format!(
+        "<xsd:element name=\"{xmlsn}\" type=\"{schematypename}\"/>\n\n"
+    ));
+    out
+}
+
+/// `map_sql_catalog_to_xmlschema_types`: the database's XSD schema, over its
+/// schemas' names.
+pub(crate) fn catalog_schema(database: &str, schemas: &[&str]) -> String {
+    let xmlcn = identifier_to_xml_name(database);
+    let catalogtypename = multipart_name(&["CatalogType", database]);
+    let mut out = format!("<xsd:complexType name=\"{catalogtypename}\">\n  <xsd:all>\n");
+    for schema in schemas {
+        let xmlsn = identifier_to_xml_name(schema);
+        let schematypename = multipart_name(&["SchemaType", database, schema]);
+        out.push_str(&format!(
+            "    <xsd:element name=\"{xmlsn}\" type=\"{schematypename}\"/>\n"
+        ));
+    }
+    out.push_str("  </xsd:all>\n</xsd:complexType>\n\n");
+    out.push_str(&format!(
+        "<xsd:element name=\"{xmlcn}\" type=\"{catalogtypename}\"/>\n\n"
+    ));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -362,6 +623,25 @@ mod tests {
         assert_eq!(
             multipart_name(&["TableType", "default", "public", "a.b"]),
             "TableType.default.public.a_x002E_b"
+        );
+    }
+
+    #[test]
+    fn type_names_and_definitions_match_postgresql() {
+        assert_eq!(type_xml_name("int"), "INTEGER");
+        assert_eq!(type_xml_name("character varying(20)"), "VARCHAR");
+        assert_eq!(type_xml_name("text"), "UDT.default.pg_catalog.text");
+        assert_eq!(type_xml_name("int8"), "BIGINT");
+        assert_eq!(type_xml_name("timestamptz"), "TIMESTAMP_WTZ");
+        assert_eq!(type_xml_name("jsonb"), "UDT.default.pg_catalog.jsonb");
+        assert_eq!(
+            type_definition("int2"),
+            "<xsd:simpleType name=\"SMALLINT\">\n  <xsd:restriction base=\"xsd:short\">\n    <xsd:maxInclusive value=\"32767\"/>\n    <xsd:minInclusive value=\"-32768\"/>\n  </xsd:restriction>\n</xsd:simpleType>\n"
+        );
+        // `numeric` without a modifier has an empty definition.
+        assert_eq!(
+            type_definition("numeric"),
+            "<xsd:simpleType name=\"NUMERIC\">\n</xsd:simpleType>\n"
         );
     }
 }
