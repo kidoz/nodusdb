@@ -316,6 +316,7 @@ impl MemExecutor {
             return Ok(Vec::new());
         };
         let plan = LogicalPlan::Select {
+            only: false,
             ctes: Vec::new(),
             table_name: table_name.clone(),
             table_alias: table_alias.clone(),

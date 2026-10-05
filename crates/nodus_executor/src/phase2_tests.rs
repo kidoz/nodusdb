@@ -40,6 +40,7 @@ fn test_group_by_aggregates() {
     exec.execute_logical(
         &ctx,
         LogicalPlan::CreateTable {
+            inherits: Vec::new(),
             on_commit: None,
             like: Vec::new(),
             unique_constraints: vec![],
@@ -114,6 +115,7 @@ fn test_group_by_aggregates() {
     exec.execute_logical(
         &ctx,
         LogicalPlan::Delete {
+            only: false,
             table_name: "sales".into(),
             filter: None,
             returning: vec![],
@@ -267,6 +269,7 @@ fn test_set_operations() {
         exec.execute_logical(
             &ctx,
             LogicalPlan::CreateTable {
+                inherits: Vec::new(),
                 on_commit: None,
                 like: Vec::new(),
                 unique_constraints: vec![],
@@ -364,6 +367,7 @@ fn test_cross_join() {
         exec.execute_logical(
             &ctx,
             LogicalPlan::CreateTable {
+                inherits: Vec::new(),
                 on_commit: None,
                 like: Vec::new(),
                 unique_constraints: vec![],
@@ -430,6 +434,7 @@ fn test_having() {
     exec.execute_logical(
         &ctx,
         LogicalPlan::CreateTable {
+            inherits: Vec::new(),
             on_commit: None,
             like: Vec::new(),
             unique_constraints: vec![],
@@ -522,6 +527,7 @@ fn test_window_functions() {
     exec.execute_logical(
         &ctx,
         LogicalPlan::CreateTable {
+            inherits: Vec::new(),
             on_commit: None,
             like: Vec::new(),
             unique_constraints: vec![],

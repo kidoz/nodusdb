@@ -1880,6 +1880,7 @@ mod tests {
             constraints: Vec::new(),
             view_query: None,
             materialized_query: None,
+            parents: Vec::new(),
         };
 
         catalog.create_table(req.clone()).unwrap();
@@ -1895,6 +1896,7 @@ mod tests {
             constraints: Vec::new(),
             view_query: None,
             materialized_query: None,
+            parents: Vec::new(),
         };
         assert!(!table_create_already_applied(
             Some(&reader),

@@ -1278,6 +1278,7 @@ impl MemExecutor {
             constraints: vec![],
             view_query: None,
             materialized_query: None,
+            parents: Vec::new(),
         })?;
         forget_found();
         Ok(QueryOutput::tag(if domain {

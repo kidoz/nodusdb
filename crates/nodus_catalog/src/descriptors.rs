@@ -100,6 +100,10 @@ pub struct TableDescriptor {
     /// The table's `COMMENT ON` text.
     #[serde(default)]
     pub comment: Option<String>,
+    /// The tables this one inherits from (`INHERITS`), in that order.
+    /// Defaulted so older descriptors decode.
+    #[serde(default)]
+    pub parents: Vec<TableId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

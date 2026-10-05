@@ -397,6 +397,10 @@ pub struct Join {
     /// This relation's `TABLESAMPLE` clause. Defaulted so older plans decode.
     #[serde(default)]
     pub sample: Option<SampleSpec>,
+    /// `ONLY`: the join reads just this relation, not its descendants.
+    /// Defaulted so older plans decode.
+    #[serde(default)]
+    pub only: bool,
 }
 
 /// A relation's `TABLESAMPLE` clause: how a scan draws its rows.
@@ -1306,6 +1310,12 @@ pub enum AlterTableOp {
     },
     /// `OWNER TO role`: NodusDB tracks no owners, so this changes nothing.
     OwnerTo,
+    /// `ALTER TABLE child INHERIT | NO INHERIT parent`, written as the
+    /// [`nodus_sql::INHERIT_FUNCTION`](crate::planner) call the parser lacks.
+    Inherit {
+        parent: String,
+        attach: bool,
+    },
 }
 
 /// A constraint `ALTER TABLE ... ADD` creates.
@@ -1383,6 +1393,9 @@ pub enum LogicalPlan {
         /// the new one's, and whether their defaults come too.
         #[serde(default)]
         like: Vec<(String, bool)>,
+        /// `INHERITS (parents)`, as written. Defaulted so older plans decode.
+        #[serde(default)]
+        inherits: Vec<String>,
     },
     /// `DROP TABLE names` or, with `materialized`, `DROP MATERIALIZED
     /// VIEW names`; with `cascade`, the objects depending on them go too.
@@ -1422,6 +1435,10 @@ pub enum LogicalPlan {
         operations: Vec<AlterTableOp>,
         #[serde(default)]
         if_exists: bool,
+        /// `ALTER TABLE ONLY`: the operations do not reach descendants.
+        /// Defaulted so older plans decode.
+        #[serde(default)]
+        only: bool,
     },
     CreateIndex {
         /// Empty for an unnamed index, which gets PostgreSQL's name for it.
@@ -1562,6 +1579,10 @@ pub enum LogicalPlan {
         /// Defaulted so older plans decode.
         #[serde(default)]
         sample: Option<SampleSpec>,
+        /// `FROM ONLY t`: the scan reads just the table, not its
+        /// descendants. Defaulted so older plans decode.
+        #[serde(default)]
+        only: bool,
     },
     Update {
         table_name: String,
@@ -1579,6 +1600,10 @@ pub enum LogicalPlan {
         /// older plans decode.
         #[serde(default)]
         table_alias: Option<String>,
+        /// `ONLY`: the statement reads just the table, not its
+        /// descendants. Defaulted so older plans decode.
+        #[serde(default)]
+        only: bool,
         /// `FROM`: the relations joined to each target row, whose columns the
         /// filter and assignments may read.
         #[serde(default)]
@@ -1596,6 +1621,10 @@ pub enum LogicalPlan {
         /// The name the target table goes by (`DELETE FROM t AS x`).
         #[serde(default)]
         table_alias: Option<String>,
+        /// `ONLY`: the statement reads just the table, not its
+        /// descendants. Defaulted so older plans decode.
+        #[serde(default)]
+        only: bool,
         /// `USING`: the relations joined to each target row, whose columns
         /// the filter may read.
         #[serde(default)]
@@ -1802,6 +1831,10 @@ pub enum LogicalPlan {
     Merge {
         table_name: String,
         table_alias: Option<String>,
+        /// `ONLY`: the statement reads just the table, not its
+        /// descendants. Defaulted so older plans decode.
+        #[serde(default)]
+        only: bool,
         /// The source relation, read with its columns qualified.
         source: Box<LogicalPlan>,
         on: Option<FilterExpr>,

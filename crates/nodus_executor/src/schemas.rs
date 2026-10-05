@@ -395,6 +395,7 @@ impl MemExecutor {
                                 Dependent::Constraint { table, name } => {
                                     format!("constraint {table} {name}")
                                 }
+                                Dependent::ChildTable(child) => format!("table {}", child.id),
                             };
                             if seen.insert(key) {
                                 described.push(dependent.object_description());
@@ -461,6 +462,16 @@ impl MemExecutor {
                     )?;
                 }
                 Dependent::View(view) => self.drop_relation(&view)?,
+                Dependent::ChildTable(child) => {
+                    for descendant in self.descendants("default", child.id)?.into_iter().rev() {
+                        if self.catalog_reader.get_table_by_id(descendant.id).is_ok() {
+                            self.drop_relation(&descendant)?;
+                        }
+                    }
+                    if self.catalog_reader.get_table_by_id(child.id).is_ok() {
+                        self.drop_relation(&child)?;
+                    }
+                }
             }
         }
         for dependent in external_types {
@@ -982,6 +993,7 @@ impl MemExecutor {
                     constraints: vec![],
                     view_query: None,
                     materialized_query: None,
+                    parents: Vec::new(),
                 })?
             }
         };

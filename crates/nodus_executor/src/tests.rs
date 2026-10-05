@@ -65,6 +65,7 @@ fn create_role_and_grant_require_grant_management() {
     exec.execute_logical(
         &admin_ctx,
         LogicalPlan::CreateTable {
+            inherits: Vec::new(),
             on_commit: None,
             like: Vec::new(),
             unique_constraints: vec![],
@@ -147,6 +148,7 @@ fn create_table_denied_then_allowed_by_grant() {
         .unwrap();
     let ctx = ctx_for(user.id);
     let plan = || LogicalPlan::CreateTable {
+        inherits: Vec::new(),
         on_commit: None,
         like: Vec::new(),
         unique_constraints: vec![],
@@ -205,6 +207,7 @@ fn create_insert_select_round_trip() {
     exec.execute_logical(
         &ctx,
         LogicalPlan::CreateTable {
+            inherits: Vec::new(),
             on_commit: None,
             like: Vec::new(),
             unique_constraints: vec![],
@@ -246,6 +249,7 @@ fn create_insert_select_round_trip() {
         .execute_logical(
             &ctx,
             LogicalPlan::Select {
+                only: false,
                 sample: None,
                 ctes: vec![],
                 table_alias: None,
@@ -275,6 +279,7 @@ fn create_insert_select_round_trip() {
         .execute_logical(
             &ctx,
             LogicalPlan::Select {
+                only: false,
                 sample: None,
                 ctes: vec![],
                 table_alias: None,
@@ -389,6 +394,7 @@ fn rows_keyed_by_declared_pk_not_first_column() {
     exec.execute_logical(
         &ctx,
         LogicalPlan::CreateTable {
+            inherits: Vec::new(),
             on_commit: None,
             like: Vec::new(),
             unique_constraints: vec![],
@@ -423,6 +429,7 @@ fn rows_keyed_by_declared_pk_not_first_column() {
     }
 
     let select_all = || LogicalPlan::Select {
+        only: false,
         sample: None,
         ctes: vec![],
         table_alias: None,
@@ -468,6 +475,7 @@ fn rows_keyed_by_declared_pk_not_first_column() {
     exec.execute_logical(
         &ctx,
         LogicalPlan::Delete {
+            only: false,
             table_name: "t".into(),
             filter: eq("id", "1"),
             returning: vec![],
@@ -509,6 +517,7 @@ fn typed_values_round_trip_and_filter_by_int() {
     exec.execute_logical(
         &ctx,
         LogicalPlan::CreateTable {
+            inherits: Vec::new(),
             on_commit: None,
             like: Vec::new(),
             unique_constraints: vec![],
@@ -547,6 +556,7 @@ fn typed_values_round_trip_and_filter_by_int() {
         .execute_logical(
             &ctx,
             LogicalPlan::Select {
+                only: false,
                 sample: None,
                 ctes: vec![],
                 table_alias: None,
@@ -596,6 +606,7 @@ fn update_and_delete_rows() {
     exec.execute_logical(
         &ctx,
         LogicalPlan::CreateTable {
+            inherits: Vec::new(),
             on_commit: None,
             like: Vec::new(),
             unique_constraints: vec![],
@@ -632,6 +643,7 @@ fn update_and_delete_rows() {
         .execute_logical(
             &ctx,
             LogicalPlan::Update {
+                only: false,
                 table_name: "t".into(),
                 assignments: vec![("name".into(), ScalarExpr::Literal(Value::Text("B".into())))],
                 filter: eq("id", "2"),
@@ -649,6 +661,7 @@ fn update_and_delete_rows() {
         exec.execute_logical(
             &ctx,
             LogicalPlan::Select {
+                only: false,
                 sample: None,
                 ctes: vec![],
                 table_alias: None,
@@ -678,6 +691,7 @@ fn update_and_delete_rows() {
         .execute_logical(
             &ctx,
             LogicalPlan::Delete {
+                only: false,
                 table_name: "t".into(),
                 filter: eq("id", "1"),
 
@@ -717,6 +731,7 @@ fn test_join_execution() {
     exec.execute_logical(
         &ctx,
         LogicalPlan::CreateTable {
+            inherits: Vec::new(),
             on_commit: None,
             like: Vec::new(),
             unique_constraints: vec![],
@@ -733,6 +748,7 @@ fn test_join_execution() {
     exec.execute_logical(
         &ctx,
         LogicalPlan::CreateTable {
+            inherits: Vec::new(),
             on_commit: None,
             like: Vec::new(),
             unique_constraints: vec![],
@@ -794,12 +810,14 @@ fn test_join_execution() {
     }
 
     let join_plan = LogicalPlan::Select {
+        only: false,
         sample: None,
         ctes: vec![],
         table_alias: None,
         group_by: vec![],
         table_name: "books".into(),
         joins: vec![Join {
+            only: false,
             sample: None,
             table_alias: None,
             table_name: "authors".into(),
@@ -877,6 +895,7 @@ fn transactions_are_isolated_per_session() {
     exec.execute_logical(
         &ctx_a,
         LogicalPlan::CreateTable {
+            inherits: Vec::new(),
             on_commit: None,
             like: Vec::new(),
             unique_constraints: vec![],
@@ -924,6 +943,7 @@ fn transactions_are_isolated_per_session() {
         exec.execute_logical(
             ctx,
             LogicalPlan::Select {
+                only: false,
                 sample: None,
                 ctes: vec![],
                 table_alias: None,
@@ -1014,6 +1034,7 @@ fn test_complex_filters() {
     exec.execute_logical(
         &ctx,
         LogicalPlan::CreateTable {
+            inherits: Vec::new(),
             on_commit: None,
             like: Vec::new(),
             unique_constraints: vec![],
@@ -1097,6 +1118,7 @@ fn test_left_outer_join() {
     exec.execute_logical(
         &ctx,
         LogicalPlan::CreateTable {
+            inherits: Vec::new(),
             on_commit: None,
             like: Vec::new(),
             unique_constraints: vec![],
@@ -1112,6 +1134,7 @@ fn test_left_outer_join() {
     exec.execute_logical(
         &ctx,
         LogicalPlan::CreateTable {
+            inherits: Vec::new(),
             on_commit: None,
             like: Vec::new(),
             unique_constraints: vec![],

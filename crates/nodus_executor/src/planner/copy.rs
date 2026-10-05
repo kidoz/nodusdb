@@ -60,6 +60,7 @@ pub fn plan_copy_out(sql: &str) -> Result<(LogicalPlan, CopyOutputFormat, bool)>
             table_name,
             columns,
         } => LogicalPlan::Select {
+            only: false,
             ctes: vec![],
             table_name: table_name.to_string(),
             table_alias: None,

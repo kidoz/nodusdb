@@ -527,6 +527,7 @@ impl CatalogWriter for MemoryCatalog {
             view_query: request.view_query,
             materialized_query: request.materialized_query,
             comment: None,
+            parents: request.parents,
         };
         guard.insert(key, desc.clone());
         drop(guard);
@@ -625,7 +626,8 @@ impl CatalogWriter for MemoryCatalog {
             | TableDescriptorChange::AddConstraint { table_id, .. }
             | TableDescriptorChange::DropConstraint { table_id, .. }
             | TableDescriptorChange::SetSchema { table_id, .. }
-            | TableDescriptorChange::SetViewQuery { table_id, .. } => *table_id,
+            | TableDescriptorChange::SetViewQuery { table_id, .. }
+            | TableDescriptorChange::SetParents { table_id, .. } => *table_id,
         };
 
         let mut target_key = None;
@@ -726,6 +728,9 @@ impl CatalogWriter for MemoryCatalog {
                 } else {
                     anyhow::bail!("\"{}\" is not a view", table.name);
                 }
+            }
+            TableDescriptorChange::SetParents { parents, .. } => {
+                table.parents = parents;
             }
         }
 
@@ -1096,6 +1101,7 @@ mod tests {
                 constraints: vec![],
                 view_query: None,
                 materialized_query: None,
+                parents: Vec::new(),
             })
             .unwrap();
         assert_eq!(tbl.name, "users");

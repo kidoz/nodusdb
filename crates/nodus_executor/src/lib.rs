@@ -38,6 +38,7 @@ mod functions;
 mod geometric;
 mod index_keys;
 mod information_schema;
+mod inheritance;
 mod json_text;
 mod jsonpath;
 mod largeobjects;

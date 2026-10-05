@@ -57,6 +57,7 @@ impl MemExecutor {
                 key_names,
                 on_commit,
                 like,
+                inherits,
             } => {
                 let mut copied = Vec::new();
                 for (source, defaults) in &like {
@@ -71,6 +72,7 @@ impl MemExecutor {
                     if_not_exists,
                     (unique_constraints, key_names),
                     None,
+                    inherits.clone(),
                 )?;
                 if let Some(action) = on_commit {
                     self.note_on_commit(ctx, name, action);
@@ -215,6 +217,7 @@ impl MemExecutor {
                 group_exprs,
                 distinct_on,
                 sample,
+                only,
             } => {
                 // Older plans carry their keys in `order_by`.
                 let sort = if sort.is_empty() {
@@ -241,6 +244,7 @@ impl MemExecutor {
                     distinct_on,
                     false,
                     sample,
+                    only,
                 )
             }
             LogicalPlan::Update {
@@ -251,6 +255,7 @@ impl MemExecutor {
                 returning_exprs,
                 table_alias,
                 from,
+                only,
             } => self.exec_update(
                 ctx,
                 (table_name, table_alias),
@@ -258,6 +263,7 @@ impl MemExecutor {
                 from.map(|from| *from),
                 filter,
                 crate::dml::Returning::new(returning, returning_exprs),
+                only,
             ),
             LogicalPlan::Delete {
                 table_name,
@@ -266,12 +272,14 @@ impl MemExecutor {
                 returning_exprs,
                 table_alias,
                 using,
+                only,
             } => self.exec_delete(
                 ctx,
                 (table_name, table_alias),
                 using.map(|using| *using),
                 filter,
                 crate::dml::Returning::new(returning, returning_exprs),
+                only,
             ),
             LogicalPlan::Merge {
                 table_name,
@@ -281,6 +289,7 @@ impl MemExecutor {
                 clauses,
                 returning,
                 returning_exprs,
+                only,
             } => self.exec_merge(
                 ctx,
                 (table_name, table_alias),
@@ -288,6 +297,7 @@ impl MemExecutor {
                 on,
                 clauses,
                 crate::dml::Returning::new(returning, returning_exprs),
+                only,
             ),
             LogicalPlan::Truncate {
                 tables,
@@ -303,7 +313,8 @@ impl MemExecutor {
                 table_name,
                 operations,
                 if_exists,
-            } => self.exec_alter_table(ctx, table_name, operations, if_exists),
+                only,
+            } => self.exec_alter_table(ctx, table_name, operations, if_exists, only),
             LogicalPlan::CreateIndex {
                 name,
                 table_name,

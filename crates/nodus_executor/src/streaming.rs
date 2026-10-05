@@ -58,6 +58,7 @@ impl MemExecutor {
             group_exprs,
             distinct_on,
             sample,
+            only,
         } = &plan
             && sample.is_none()
             && ctes.is_empty()
@@ -80,6 +81,7 @@ impl MemExecutor {
                 ctx,
                 table_name,
                 table_alias.as_deref(),
+                *only,
                 projection,
                 filter.as_ref(),
                 *limit,
@@ -116,6 +118,7 @@ impl MemExecutor {
         ctx: &ExecutionContext,
         table_name: &str,
         table_alias: Option<&str>,
+        only: bool,
         projection: &[ProjectionItem],
         filter: Option<&FilterExpr>,
         limit: Option<usize>,
@@ -150,6 +153,12 @@ impl MemExecutor {
 
         // Views recurse into a subquery; let the full path handle them.
         if tbl.view_query.is_some() {
+            return Ok(None);
+        }
+
+        // A table with descendants scans them too, with a tableoid column;
+        // let the full path handle that. `ONLY` reads just the table.
+        if !only && !self.descendants(db_name, tbl.id)?.is_empty() {
             return Ok(None);
         }
 

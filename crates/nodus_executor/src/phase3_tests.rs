@@ -40,6 +40,7 @@ fn test_ddl_and_subqueries() {
     exec.execute_logical(
         &ctx,
         LogicalPlan::CreateTable {
+            inherits: Vec::new(),
             on_commit: None,
             like: Vec::new(),
             unique_constraints: vec![],
@@ -111,6 +112,7 @@ fn test_ddl_and_subqueries() {
     exec.execute_logical(
         &ctx,
         LogicalPlan::AlterTable {
+            only: false,
             table_name: "employees".into(),
             operations: vec![AlterTableOp::AddColumn {
                 name: "salary".into(),
@@ -153,6 +155,7 @@ fn test_ddl_and_subqueries() {
     exec.execute_logical(
         &ctx,
         LogicalPlan::AlterTable {
+            only: false,
             table_name: "employees".into(),
             operations: vec![AlterTableOp::RenameTable {
                 new_name: "staff".into(),
@@ -168,6 +171,7 @@ fn test_ddl_and_subqueries() {
     exec.execute_logical(
         &ctx,
         LogicalPlan::CreateTable {
+            inherits: Vec::new(),
             on_commit: None,
             like: Vec::new(),
             unique_constraints: vec![],
@@ -201,6 +205,7 @@ fn test_ddl_and_subqueries() {
     .unwrap();
 
     let subquery = LogicalPlan::Select {
+        only: false,
         sample: None,
         ctes: vec![],
         table_alias: None,
@@ -234,6 +239,7 @@ fn test_ddl_and_subqueries() {
         .execute_logical(
             &ctx,
             LogicalPlan::Select {
+                only: false,
                 sample: None,
                 ctes: vec![],
                 table_alias: None,
@@ -283,6 +289,7 @@ fn test_unique_constraints() {
     exec.execute_logical(
         &ctx,
         LogicalPlan::CreateTable {
+            inherits: Vec::new(),
             on_commit: None,
             like: Vec::new(),
             unique_constraints: vec![],
@@ -376,6 +383,7 @@ fn test_unique_constraints() {
     let res3 = exec.execute_logical(
         &ctx,
         LogicalPlan::Update {
+            only: false,
             table_name: "users".into(),
             assignments: vec![(
                 "email".into(),
@@ -397,6 +405,7 @@ fn test_unique_constraints() {
     let res4 = exec.execute_logical(
         &ctx,
         LogicalPlan::Update {
+            only: false,
             table_name: "users".into(),
             assignments: vec![(
                 "email".into(),
@@ -440,6 +449,7 @@ fn test_secondary_indexing() {
     exec.execute_logical(
         &ctx,
         LogicalPlan::CreateTable {
+            inherits: Vec::new(),
             on_commit: None,
             like: Vec::new(),
             unique_constraints: vec![],
@@ -535,6 +545,7 @@ fn test_secondary_indexing() {
         .execute_logical(
             &ctx,
             LogicalPlan::Select {
+                only: false,
                 sample: None,
                 ctes: vec![],
                 table_alias: None,
@@ -569,6 +580,7 @@ fn test_secondary_indexing() {
     exec.execute_logical(
         &ctx,
         LogicalPlan::Update {
+            only: false,
             table_name: "products".into(),
             assignments: vec![(
                 "category".into(),
@@ -592,6 +604,7 @@ fn test_secondary_indexing() {
         .execute_logical(
             &ctx,
             LogicalPlan::Select {
+                only: false,
                 sample: None,
                 ctes: vec![],
                 table_alias: None,
@@ -623,6 +636,7 @@ fn test_secondary_indexing() {
         .execute_logical(
             &ctx,
             LogicalPlan::Select {
+                only: false,
                 sample: None,
                 ctes: vec![],
                 table_alias: None,
@@ -653,6 +667,7 @@ fn test_secondary_indexing() {
     exec.execute_logical(
         &ctx,
         LogicalPlan::Delete {
+            only: false,
             table_name: "products".into(),
             filter: Some(FilterExpr::Predicate(Predicate {
                 left: "id".into(),
@@ -672,6 +687,7 @@ fn test_secondary_indexing() {
         .execute_logical(
             &ctx,
             LogicalPlan::Select {
+                only: false,
                 sample: None,
                 ctes: vec![],
                 table_alias: None,
@@ -726,6 +742,7 @@ fn test_index_value_containing_separator_does_not_overmatch() {
     exec.execute_logical(
         &ctx,
         LogicalPlan::CreateTable {
+            inherits: Vec::new(),
             on_commit: None,
             like: Vec::new(),
             unique_constraints: vec![],
@@ -795,6 +812,7 @@ fn test_index_value_containing_separator_does_not_overmatch() {
         exec.execute_logical(
             &ctx,
             LogicalPlan::Select {
+                only: false,
                 sample: None,
                 ctes: vec![],
                 table_alias: None,
@@ -854,6 +872,7 @@ fn test_alter_table_migrations() {
     exec.execute_logical(
         &ctx,
         LogicalPlan::CreateTable {
+            inherits: Vec::new(),
             on_commit: None,
             like: Vec::new(),
             unique_constraints: vec![],
@@ -906,6 +925,7 @@ fn test_alter_table_migrations() {
     exec.execute_logical(
         &ctx,
         LogicalPlan::AlterTable {
+            only: false,
             table_name: "users".into(),
             operations: vec![AlterTableOp::AddColumn {
                 name: "age".into(),
@@ -926,6 +946,7 @@ fn test_alter_table_migrations() {
         .execute_logical(
             &ctx,
             LogicalPlan::Select {
+                only: false,
                 sample: None,
                 ctes: vec![],
                 table_alias: None,
@@ -953,6 +974,7 @@ fn test_alter_table_migrations() {
     exec.execute_logical(
         &ctx,
         LogicalPlan::Update {
+            only: false,
             table_name: "users".into(),
             assignments: vec![("age".into(), ScalarExpr::Literal(Value::Int(30)))],
             filter: None,
@@ -968,6 +990,7 @@ fn test_alter_table_migrations() {
         .execute_logical(
             &ctx,
             LogicalPlan::Select {
+                only: false,
                 sample: None,
                 ctes: vec![],
                 table_alias: None,
@@ -994,6 +1017,7 @@ fn test_alter_table_migrations() {
     exec.execute_logical(
         &ctx,
         LogicalPlan::AlterTable {
+            only: false,
             table_name: "users".into(),
             operations: vec![AlterTableOp::DropColumn {
                 name: "age".into(),
@@ -1009,6 +1033,7 @@ fn test_alter_table_migrations() {
         .execute_logical(
             &ctx,
             LogicalPlan::Select {
+                only: false,
                 sample: None,
                 ctes: vec![],
                 table_alias: None,

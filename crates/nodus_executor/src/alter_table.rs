@@ -20,6 +20,7 @@ impl MemExecutor {
         table_name: String,
         operations: Vec<AlterTableOp>,
         if_exists: bool,
+        only: bool,
     ) -> Result<QueryOutput> {
         let (db_name, schema_name, table_only) = parse_object_name(&table_name)?;
         let tbl = match self
@@ -39,11 +40,114 @@ impl MemExecutor {
             Err(_) => anyhow::bail!("relation \"{table_only}\" does not exist"),
         };
         self.authorize(ctx, Action::CreateTable, ResourceRef::Table(tbl.id))?;
+        // An inherited table's columns pass to its descendants, unless ONLY.
+        let descendants = if only {
+            Vec::new()
+        } else {
+            self.descendants(db_name, tbl.id)?
+        };
+        let has_descendants = self.descendants(db_name, tbl.id)?.len() > 0;
+        let ancestors = self.ancestors(db_name, tbl.id)?;
         for operation in operations {
+            self.check_inherited_alter(
+                &tbl,
+                &descendants,
+                &ancestors,
+                only,
+                has_descendants,
+                &operation,
+            )?;
             let tbl = self.catalog_reader.get_table_by_id(tbl.id)?;
-            self.alter_table_op(ctx, &tbl, operation)?;
+            self.alter_table_op(ctx, &tbl, operation.clone(), false)?;
+            for descendant in &descendants {
+                let current = self.catalog_reader.get_table_by_id(descendant.id)?;
+                self.alter_table_op(ctx, &current, operation.clone(), true)?;
+            }
         }
         Ok(QueryOutput::tag("ALTER TABLE"))
+    }
+
+    /// The refusals PostgreSQL makes for an inherited table's `ALTER TABLE`:
+    /// an `ONLY` operation that must reach children, and an operation on a
+    /// column or constraint the table inherits.
+    fn check_inherited_alter(
+        &self,
+        tbl: &TableDescriptor,
+        descendants: &[TableDescriptor],
+        ancestors: &[TableDescriptor],
+        only: bool,
+        has_descendants: bool,
+        operation: &AlterTableOp,
+    ) -> Result<()> {
+        if only && has_descendants {
+            match operation {
+                AlterTableOp::AddColumn {
+                    name,
+                    if_not_exists,
+                    ..
+                } if !(*if_not_exists && tbl.columns.iter().any(|c| c.name == *name)) => {
+                    anyhow::bail!("column must be added to child tables too");
+                }
+                AlterTableOp::RenameColumn { old_name, .. } => {
+                    anyhow::bail!(
+                        "inherited column \"{old_name}\" must be renamed in child tables too"
+                    );
+                }
+                AlterTableOp::AlterColumnType { name, .. } => {
+                    anyhow::bail!(
+                        "type of inherited column \"{name}\" must be changed in child tables too"
+                    );
+                }
+                AlterTableOp::AddConstraint {
+                    constraint: NewConstraint::Check { .. },
+                    ..
+                } => {
+                    anyhow::bail!("constraint must be added to child tables too");
+                }
+                _ => {}
+            }
+        }
+        let _ = descendants;
+        if ancestors.is_empty() {
+            return Ok(());
+        }
+        let inherited_column = |name: &str| {
+            ancestors
+                .iter()
+                .any(|a| a.columns.iter().any(|c| c.name == name))
+        };
+        let inherited_constraint = |name: &str| {
+            ancestors.iter().any(|a| {
+                a.constraints
+                    .iter()
+                    .any(|c| c.effective_name(&a.name) == name)
+            })
+        };
+        match operation {
+            AlterTableOp::RenameColumn { old_name, .. } if inherited_column(old_name) => {
+                anyhow::bail!("cannot rename inherited column \"{old_name}\"");
+            }
+            AlterTableOp::DropColumn { name, .. } if inherited_column(name) => {
+                anyhow::bail!("cannot drop inherited column \"{name}\"");
+            }
+            AlterTableOp::AlterColumnType { name, .. } if inherited_column(name) => {
+                anyhow::bail!("cannot alter inherited column \"{name}\"");
+            }
+            AlterTableOp::DropConstraint { name, .. } if inherited_constraint(name) => {
+                anyhow::bail!(
+                    "cannot drop inherited constraint \"{name}\" of relation \"{}\"",
+                    tbl.name
+                );
+            }
+            AlterTableOp::RenameConstraint { old_name, .. } if inherited_constraint(old_name) => {
+                anyhow::bail!(
+                    "cannot rename inherited constraint \"{old_name}\" of relation \"{}\"",
+                    tbl.name
+                );
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     fn alter_table_op(
@@ -51,6 +155,7 @@ impl MemExecutor {
         ctx: &ExecutionContext,
         tbl: &TableDescriptor,
         operation: AlterTableOp,
+        propagated: bool,
     ) -> Result<()> {
         match operation {
             AlterTableOp::AddColumn {
@@ -65,7 +170,9 @@ impl MemExecutor {
                 // A `serial` or identity column's sequence comes first; its
                 // values fill the rows already there.
                 let default = match sequence {
-                    Some(spec) if !tbl.columns.iter().any(|c| c.name == name) => {
+                    // A descendant takes the parent's sequence-backed
+                    // default, never a sequence of its own.
+                    Some(spec) if !propagated && !tbl.columns.iter().any(|c| c.name == name) => {
                         let schema = self
                             .catalog_reader
                             .list_schemas("default")?
@@ -98,6 +205,27 @@ impl MemExecutor {
                     }
                     _ => default,
                 };
+                // A descendant that already has the column (added to it
+                // first) merges the definitions instead.
+                if propagated && let Some(existing) = tbl.columns.iter().find(|c| c.name == name) {
+                    if existing.data_type != data_type {
+                        anyhow::bail!(
+                            crate::error_fields::DbError::new(format!(
+                                "column \"{name}\" has a type conflict"
+                            ))
+                            .detail(format!("{} versus {}", existing.data_type, data_type))
+                            .into_text()
+                        );
+                    }
+                    self.notice(
+                        ctx,
+                        DbError::new(format!(
+                            "merging definition of column \"{name}\" for child \"{}\"",
+                            tbl.name
+                        )),
+                    );
+                    return Ok(());
+                }
                 self.add_column(
                     ctx,
                     tbl,
@@ -125,7 +253,12 @@ impl MemExecutor {
                     data_type,
                 })
             }
-            AlterTableOp::RenameTable { new_name } => self.rename_table(tbl, new_name),
+            AlterTableOp::RenameTable { new_name } => {
+                if propagated {
+                    return Ok(());
+                }
+                self.rename_table(tbl, new_name)
+            }
             AlterTableOp::SetDefault { column, default } => {
                 let mut column = column_of(tbl, &column)?.clone();
                 column.default_expr = default.as_ref().and_then(|e| serde_json::to_string(e).ok());
@@ -137,13 +270,39 @@ impl MemExecutor {
             AlterTableOp::AddConstraint {
                 constraint,
                 not_valid,
-            } => self.add_constraint(ctx, tbl, constraint, not_valid),
+            } => {
+                // Only CHECK constraints are inherited; the rest stay on the
+                // table the statement names.
+                if propagated && !matches!(constraint, NewConstraint::Check { .. }) {
+                    return Ok(());
+                }
+                self.add_constraint(ctx, tbl, constraint, not_valid)
+            }
             AlterTableOp::DropConstraint {
                 name,
                 if_exists,
                 cascade,
-            } => self.drop_constraint(ctx, tbl, &name, if_exists, cascade),
+            } => {
+                // A descendant without the constraint has nothing to drop.
+                if propagated
+                    && !tbl
+                        .constraints
+                        .iter()
+                        .any(|c| c.effective_name(&tbl.name) == name)
+                {
+                    return Ok(());
+                }
+                self.drop_constraint(ctx, tbl, &name, if_exists, cascade)
+            }
             AlterTableOp::RenameConstraint { old_name, new_name } => {
+                if propagated
+                    && !tbl
+                        .constraints
+                        .iter()
+                        .any(|c| c.effective_name(&tbl.name) == old_name)
+                {
+                    return Ok(());
+                }
                 self.rename_constraint(tbl, &old_name, &new_name)
             }
             AlterTableOp::ValidateConstraint { name } => {
@@ -157,6 +316,47 @@ impl MemExecutor {
                 }
             }
             AlterTableOp::OwnerTo => Ok(()),
+            AlterTableOp::Inherit { parent, attach } => {
+                // A link belongs to the table the statement names.
+                if propagated {
+                    return Ok(());
+                }
+                let parents = self.resolve_parents(std::slice::from_ref(&parent))?;
+                let parent = &parents[0];
+                if attach {
+                    if tbl.parents.contains(&parent.id) {
+                        anyhow::bail!(
+                            "relation \"{}\" would be inherited from more than once",
+                            parent.name
+                        );
+                    }
+                    self.alter_inherit_parents(tbl, std::slice::from_ref(parent))?;
+                    let mut list = tbl.parents.clone();
+                    list.push(parent.id);
+                    self.change(TableDescriptorChange::SetParents {
+                        table_id: tbl.id,
+                        parents: list,
+                    })
+                } else {
+                    if !tbl.parents.contains(&parent.id) {
+                        anyhow::bail!(
+                            "relation \"{}\" is not a parent of relation \"{}\"",
+                            parent.name,
+                            tbl.name
+                        );
+                    }
+                    let list: Vec<_> = tbl
+                        .parents
+                        .iter()
+                        .copied()
+                        .filter(|id| *id != parent.id)
+                        .collect();
+                    self.change(TableDescriptorChange::SetParents {
+                        table_id: tbl.id,
+                        parents: list,
+                    })
+                }
+            }
         }
     }
 

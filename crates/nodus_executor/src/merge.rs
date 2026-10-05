@@ -15,6 +15,7 @@ impl MemExecutor {
         on: Option<FilterExpr>,
         clauses: Vec<MergeClause>,
         returning: crate::dml::Returning,
+        only: bool,
     ) -> Result<QueryOutput> {
         let (db_name, schema_name, table_only) = parse_object_name(&table_name)?;
         let tbl = self
@@ -119,13 +120,31 @@ impl MemExecutor {
         // row with the target rows `on` matches it to, or alone when there are
         // none, then each target row no source row matches. It is computed in
         // full first, so no change the statement makes affects it.
-        let targets = self.scan_rows_keyed(tbl.id, &ctx.session_id)?;
+        let mut target_tables = vec![tbl.clone()];
+        if !only {
+            target_tables.extend(self.descendants("default", tbl.id)?);
+        }
+        let mut targets = Vec::new();
+        for table in &target_tables {
+            let projection: Vec<Option<usize>> = tbl
+                .columns
+                .iter()
+                .map(|c| table.columns.iter().position(|t| t.name == c.name))
+                .collect();
+            for (key, row) in self.scan_rows_keyed(table.id, &ctx.session_id)? {
+                let projected: Vec<Value> = projection
+                    .iter()
+                    .map(|at| at.and_then(|i| row.get(i)).cloned().unwrap_or(Value::Null))
+                    .collect();
+                targets.push((table.clone(), key, row, projected));
+            }
+        }
         let mut join = Vec::new();
         let mut target_matched = vec![false; targets.len()];
         for (s, source) in scope.source_rows.iter().enumerate() {
             let before = join.len();
-            for (t, (_, target)) in targets.iter().enumerate() {
-                let joined = [target.as_slice(), source].concat();
+            for (t, target) in targets.iter().enumerate() {
+                let joined = [target.3.as_slice(), source].concat();
                 if self
                     .eval_filter(ctx, &joined, &scope.names, &scope.columns, on.as_ref())
                     .unwrap_or(false)
@@ -147,14 +166,26 @@ impl MemExecutor {
         let target_nulls = vec![Value::Null; tbl.columns.len()];
         let source_nulls = vec![Value::Null; scope.names.len() - tbl.columns.len()];
         let mut modified = vec![false; targets.len()];
-        // The rows removed and changed, for the foreign keys that reference
-        // the table.
-        let referenced = self.is_referenced(&tbl)?;
-        let (mut removed, mut changed) = (Vec::new(), Vec::new());
+        // The rows removed and changed, per table, for the foreign keys that
+        // reference one: an inherited MERGE may change several tables' rows.
+        let mut referenced: Vec<nodus_catalog::TableDescriptor> = Vec::new();
+        for table in std::iter::once(tbl.clone()).chain(if only {
+            Vec::new()
+        } else {
+            self.descendants("default", tbl.id)?
+        }) {
+            if self.is_referenced(&table)? {
+                referenced.push(table);
+            }
+        }
+        let (mut removed, mut changed) = (
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+        );
         let mut count = 0;
         let mut returning_rows = Vec::new();
         for (t, s) in join {
-            let target = t.map_or(target_nulls.as_slice(), |t| targets[t].1.as_slice());
+            let target = t.map_or(target_nulls.as_slice(), |t| targets[t].3.as_slice());
             let source = s.map_or(source_nulls.as_slice(), |s| scope.source_rows[s].as_slice());
             let kind = match (t, s) {
                 (Some(_), Some(_)) => MergeKind::Matched,
@@ -205,7 +236,9 @@ impl MemExecutor {
                         anyhow::bail!("MERGE command cannot affect row a second time");
                     }
                     modified[t] = true;
-                    let key = &targets[t].0;
+                    let holder = targets[t].0.clone();
+                    let key = &targets[t].1;
+                    let stored = &targets[t].2;
                     if let MergeAction::Update(assignments) = action {
                         let row = self.apply_assignments(
                             ctx,
@@ -214,18 +247,25 @@ impl MemExecutor {
                             target,
                             (&joined, names),
                         )?;
-                        self.replace_row(ctx, &tbl, key, target, &row)?;
-                        if referenced {
-                            changed.push((target.to_vec(), row.clone()));
+                        let new_row = crate::dml::table_row(&holder, &tbl, stored, &row);
+                        self.replace_row(ctx, &holder, key, stored, &new_row)?;
+                        if referenced.iter().any(|r| r.id == holder.id) {
+                            changed
+                                .entry(holder.id)
+                                .or_insert_with(Vec::new)
+                                .push((stored.clone(), new_row.clone()));
                         }
                         if !returning.is_empty() {
                             let action = [Value::Text("UPDATE".to_string())];
                             returning_rows.push([row.as_slice(), source, target, &action].concat());
                         }
                     } else {
-                        self.remove_row(ctx, &tbl, key, target)?;
-                        if referenced {
-                            removed.push(target.to_vec());
+                        self.remove_row(ctx, &holder, key, stored)?;
+                        if referenced.iter().any(|r| r.id == holder.id) {
+                            removed
+                                .entry(holder.id)
+                                .or_insert_with(Vec::new)
+                                .push(stored.clone());
                         }
                         if !returning.is_empty() {
                             let action = [Value::Text("DELETE".to_string())];
@@ -238,7 +278,11 @@ impl MemExecutor {
             }
             count += 1;
         }
-        self.enforce_references(ctx, &tbl, &removed, &changed)?;
+        for table in &referenced {
+            let removed_rows = removed.get(&table.id).cloned().unwrap_or_default();
+            let changed_rows = changed.get(&table.id).cloned().unwrap_or_default();
+            self.enforce_references(ctx, table, &removed_rows, &changed_rows)?;
+        }
         Ok(scope.returning_output(
             self,
             ctx,

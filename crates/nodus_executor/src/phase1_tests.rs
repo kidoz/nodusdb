@@ -38,6 +38,7 @@ fn test_offset_distinct_returning() {
     exec.execute_logical(
         &ctx,
         LogicalPlan::CreateTable {
+            inherits: Vec::new(),
             on_commit: None,
             like: Vec::new(),
             unique_constraints: vec![],
@@ -84,6 +85,7 @@ fn test_offset_distinct_returning() {
             .execute_logical(
                 &ctx,
                 LogicalPlan::Select {
+                    only: false,
                     sample: None,
                     ctes: vec![],
                     table_alias: None,
@@ -136,6 +138,7 @@ fn test_offset_distinct_returning() {
         .execute_logical(
             &ctx,
             LogicalPlan::Update {
+                only: false,
                 table_name: "t".into(),
                 assignments: vec![("val".into(), ScalarExpr::Literal(Value::Text("Z".into())))],
                 filter: Some(FilterExpr::Predicate(Predicate {

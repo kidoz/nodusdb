@@ -704,6 +704,7 @@ impl MemExecutor {
         from: Option<LogicalPlan>,
         filter: Option<FilterExpr>,
         returning: Returning,
+        only: bool,
     ) -> Result<QueryOutput> {
         let (db_name, schema_name, table_only) = parse_object_name(&table_name)?;
         let tbl = self
@@ -750,22 +751,40 @@ impl MemExecutor {
 
         let mut updated = 0;
         let mut returning_rows = Vec::new();
-        // The changed rows, for the foreign keys that reference the table.
-        let referenced = self.is_referenced(&tbl)?;
-        let mut changed = Vec::new();
+        // The changed rows, per table, for the foreign keys that reference
+        // one: an inherited statement may change several tables' rows.
+        let mut referenced: Vec<nodus_catalog::TableDescriptor> = Vec::new();
+        for table in std::iter::once(tbl.clone()).chain(if only {
+            Vec::new()
+        } else {
+            self.descendants("default", tbl.id)?
+        }) {
+            if self.is_referenced(&table)? {
+                referenced.push(table);
+            }
+        }
+        let mut changed: std::collections::HashMap<
+            nodus_catalog::TableId,
+            Vec<(Vec<Value>, Vec<Value>)>,
+        > = std::collections::HashMap::new();
         // Two-phase: pick the matching rows before mutating, so a subquery in
         // the filter evaluates against the pre-statement state.
-        for (old_key, old_row, joined) in
-            self.matching_targets(ctx, &tbl, &scope, filter.as_ref())?
-        {
+        for target in self.matching_targets(ctx, &tbl, &scope, filter.as_ref(), only)? {
+            let old_row = target.projected.clone();
+            let joined = target.joined.clone();
             // Assignments evaluate against the row's OLD values, joined to
             // the first FROM row that matches it.
             let row =
                 self.apply_assignments(ctx, &tbl, &assignments, &old_row, (&joined, &scope.names))?;
-            self.replace_row(ctx, &tbl, &old_key, &old_row, &row)?;
+            // The statement's columns map back onto the row's own table.
+            let new_row = table_row(&target.table, &tbl, &target.row, &row);
+            self.replace_row(ctx, &target.table, &target.key, &target.row, &new_row)?;
             updated += 1;
-            if referenced {
-                changed.push((old_row.clone(), row.clone()));
+            if referenced.iter().any(|t| t.id == target.table.id) {
+                changed
+                    .entry(target.table.id)
+                    .or_default()
+                    .push((target.row.clone(), new_row.clone()));
             }
             if !returning.is_empty() {
                 let mut returned = joined;
@@ -774,7 +793,10 @@ impl MemExecutor {
                 returning_rows.push(returned);
             }
         }
-        self.enforce_references(ctx, &tbl, &[], &changed)?;
+        for table in &referenced {
+            let rows = changed.get(&table.id).cloned().unwrap_or_default();
+            self.enforce_references(ctx, table, &[], &rows)?;
+        }
         Ok(scope.returning_output(
             self,
             ctx,
@@ -791,6 +813,7 @@ impl MemExecutor {
         using: Option<LogicalPlan>,
         filter: Option<FilterExpr>,
         returning: Returning,
+        only: bool,
     ) -> Result<QueryOutput> {
         let (db_name, schema_name, table_only) = parse_object_name(&table_name)?;
         let tbl = self
@@ -826,25 +849,42 @@ impl MemExecutor {
 
         let mut deleted = 0;
         let mut returning_rows = Vec::new();
-        // The removed rows, for the foreign keys that reference the table.
-        let referenced = self.is_referenced(&tbl)?;
-        let mut removed = Vec::new();
+        // The removed rows, per table, for the foreign keys that reference
+        // one: an inherited statement may remove several tables' rows.
+        let mut referenced: Vec<nodus_catalog::TableDescriptor> = Vec::new();
+        for table in std::iter::once(tbl.clone()).chain(if only {
+            Vec::new()
+        } else {
+            self.descendants("default", tbl.id)?
+        }) {
+            if self.is_referenced(&table)? {
+                referenced.push(table);
+            }
+        }
+        let mut removed: std::collections::HashMap<nodus_catalog::TableId, Vec<Vec<Value>>> =
+            std::collections::HashMap::new();
         // Two-phase: decide WHICH rows match before mutating anything, so a
         // subquery in the filter (e.g. `WHERE a = (SELECT max(a) ...)`) sees
         // the pre-statement state rather than partially-deleted data.
-        for (key, row, joined) in self.matching_targets(ctx, &tbl, &scope, filter.as_ref())? {
-            self.remove_row(ctx, &tbl, &key, &row)?;
+        for target in self.matching_targets(ctx, &tbl, &scope, filter.as_ref(), only)? {
+            self.remove_row(ctx, &target.table, &target.key, &target.row)?;
             deleted += 1;
-            if referenced {
-                removed.push(row.clone());
+            if referenced.iter().any(|t| t.id == target.table.id) {
+                removed
+                    .entry(target.table.id)
+                    .or_default()
+                    .push(target.row.clone());
             }
             if !returning.is_empty() {
                 // A deleted row has no values as written.
-                let written = vec![Value::Null; row.len() + 1];
-                returning_rows.push([joined, row, written].concat());
+                let written = vec![Value::Null; target.projected.len() + 1];
+                returning_rows.push([target.joined, target.projected, written].concat());
             }
         }
-        self.enforce_references(ctx, &tbl, &removed, &[])?;
+        for table in &referenced {
+            let rows = removed.get(&table.id).cloned().unwrap_or_default();
+            self.enforce_references(ctx, table, &rows, &[])?;
+        }
         Ok(scope.returning_output(
             self,
             ctx,
@@ -865,7 +905,11 @@ impl MemExecutor {
     ) -> Result<QueryOutput> {
         let mut targets: Vec<nodus_catalog::TableDescriptor> = Vec::new();
         for table_name in &tables {
-            let (db_name, schema_name, table_only) = parse_object_name(table_name)?;
+            let (only, table_name) = match table_name.strip_prefix(nodus_sql::ONLY_MARK) {
+                Some(rest) => (true, rest.to_string()),
+                None => (false, table_name.clone()),
+            };
+            let (db_name, schema_name, table_only) = parse_object_name(&table_name)?;
             let tbl = self
                 .catalog_reader
                 .get_table(db_name, schema_name, table_only)?;
@@ -876,7 +920,15 @@ impl MemExecutor {
                 anyhow::bail!("\"{table_only}\" is not a table");
             }
             if !targets.iter().any(|t| t.id == tbl.id) {
-                targets.push(tbl);
+                targets.push(tbl.clone());
+            }
+            // Truncating a table empties its descendants too, unless ONLY.
+            if !only {
+                for descendant in self.descendants(db_name, tbl.id)? {
+                    if !targets.iter().any(|t| t.id == descendant.id) {
+                        targets.push(descendant);
+                    }
+                }
             }
         }
         // A table a foreign key references is emptied only with the tables
@@ -1021,22 +1073,47 @@ impl MemExecutor {
         tbl: &nodus_catalog::TableDescriptor,
         scope: &TargetScope,
         filter: Option<&FilterExpr>,
-    ) -> Result<Vec<(String, Vec<Value>, Vec<Value>)>> {
+        only: bool,
+    ) -> Result<Vec<TargetMatch>> {
         // A condition that is plainly false (a describe probe's) reads nothing.
         if let Some(FilterExpr::Scalar(ScalarExpr::Literal(Value::Bool(false)))) = filter {
             return Ok(Vec::new());
         }
+        // An inherited statement's rows come from the table and, unless it
+        // reads `ONLY`, every descendant, as the statement's own columns see
+        // them.
+        let mut tables = vec![tbl.clone()];
+        if !only {
+            tables.extend(self.descendants("default", tbl.id)?);
+        }
         let mut matches = Vec::new();
-        for (key, row) in self.scan_rows_keyed(tbl.id, &ctx.session_id)? {
-            let joined = scope.source_rows.iter().find_map(|source| {
-                let mut joined = row.clone();
-                joined.extend(source.iter().cloned());
-                self.eval_filter(ctx, &joined, &scope.names, &scope.columns, filter)
-                    .unwrap_or(false)
-                    .then_some(joined)
-            });
-            if let Some(joined) = joined {
-                matches.push((key, row, joined));
+        for table in &tables {
+            let projection: Vec<Option<usize>> = tbl
+                .columns
+                .iter()
+                .map(|c| table.columns.iter().position(|t| t.name == c.name))
+                .collect();
+            for (key, row) in self.scan_rows_keyed(table.id, &ctx.session_id)? {
+                let projected: Vec<Value> = projection
+                    .iter()
+                    .map(|at| at.and_then(|i| row.get(i)).cloned().unwrap_or(Value::Null))
+                    .collect();
+                let joined = scope.source_rows.iter().find_map(|source| {
+                    let mut joined = projected.clone();
+                    joined.extend(source.iter().cloned());
+                    self.eval_filter(ctx, &joined, &scope.names, &scope.columns, filter)
+                        .unwrap_or(false)
+                        .then_some(joined)
+                });
+                if let Some(joined) = joined {
+                    matches.push(TargetMatch {
+                        table: table.clone(),
+                        key,
+                        row,
+                        projected,
+                        joined,
+                    });
+                }
             }
         }
         Ok(matches)
@@ -1418,4 +1495,37 @@ impl MemExecutor {
         }
         Ok(None)
     }
+}
+
+/// The statement's row values mapped back onto the row's own table: columns
+/// the statement's table does not have (after `ALTER TABLE ONLY parent DROP
+/// COLUMN`) keep their stored values.
+pub(crate) fn table_row(
+    source: &nodus_catalog::TableDescriptor,
+    statement: &nodus_catalog::TableDescriptor,
+    stored: &[Value],
+    updated: &[Value],
+) -> Vec<Value> {
+    source
+        .columns
+        .iter()
+        .enumerate()
+        .map(
+            |(i, c)| match statement.columns.iter().position(|s| s.name == c.name) {
+                Some(at) => updated.get(at).cloned().unwrap_or(Value::Null),
+                None => stored.get(i).cloned().unwrap_or(Value::Null),
+            },
+        )
+        .collect()
+}
+
+/// A row an inherited `UPDATE`/`DELETE` targets: the table that holds it,
+/// its stored key and row, the row as the statement's columns see it, and it
+/// joined with the statement's FROM rows.
+struct TargetMatch {
+    table: nodus_catalog::TableDescriptor,
+    key: String,
+    row: Vec<Value>,
+    projected: Vec<Value>,
+    joined: Vec<Value>,
 }

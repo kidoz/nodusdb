@@ -50,7 +50,9 @@ pub fn parse_sql(
     let tokens = reorder_identity_options(reorder_sequence_options(rewrite_data_clauses(
         rewrite_record_star(rewrite_json_table(rewrite_sql_json(
             rewrite_json_constructors(rewrite_xmlexists(rewrite_xmltable(
-                rewrite_xml_constructors(rewrite_xml_syntax(rewrite_query_syntax(tokens))),
+                rewrite_xml_constructors(rewrite_xml_syntax(rewrite_query_syntax(rewrite_only(
+                    tokens,
+                )))),
             ))),
         ))),
     )));
@@ -2873,8 +2875,108 @@ fn operand_start(tokens: &[sqlparser::tokenizer::TokenWithSpan], before: usize) 
     }
 }
 
-/// `(value).*`, a record expanded into its fields
-/// ([`EXPAND_RECORD_FUNCTION`]).
+/// The mark `ONLY <name>` is left behind as, for the planner to strip: the
+/// parser cannot take `ONLY` before a table name (it reads `only` as the
+/// name and the real name as its alias, or fails on `ONLY t AS x`).
+pub const ONLY_MARK: &str = "\u{0}only:";
+
+/// Rewrites `FROM/JOIN/UPDATE/DELETE ONLY <name>` into a marked name the
+/// planner recognizes. A `TRUNCATE ... ONLY` is left alone: the parser
+/// understands that form itself.
+fn rewrite_only(
+    tokens: Vec<sqlparser::tokenizer::TokenWithSpan>,
+) -> Vec<sqlparser::tokenizer::TokenWithSpan> {
+    use sqlparser::keywords::Keyword;
+    use sqlparser::tokenizer::{Token, Word};
+    let mut out: Vec<sqlparser::tokenizer::TokenWithSpan> = Vec::with_capacity(tokens.len());
+    let mut statement: Option<String> = None;
+    let mut i = 0;
+    while i < tokens.len() {
+        match &tokens[i].token {
+            Token::SemiColon => statement = None,
+            Token::Word(word) => {
+                if statement.is_none() {
+                    statement = Some(word.value.clone());
+                }
+                let mut previous: Option<&str> = None;
+                for token in out.iter().rev() {
+                    match &token.token {
+                        Token::Whitespace(_) => continue,
+                        Token::Word(w) => previous = Some(w.value.as_str()),
+                        Token::Comma => previous = Some(","),
+                        _ => {}
+                    }
+                    break;
+                }
+                let reads_only = matches!(
+                    previous,
+                    Some("from") | Some("join") | Some("update") | Some(",")
+                );
+                if word.value == "only"
+                    && word.quote_style.is_none()
+                    && statement.as_deref() != Some("truncate")
+                    && reads_only
+                    && let Some((name, next)) = object_name(&tokens, i + 1)
+                {
+                    out.push(sqlparser::tokenizer::TokenWithSpan {
+                        token: Token::Word(Word {
+                            value: format!("{ONLY_MARK}{name}"),
+                            quote_style: Some('"'),
+                            keyword: Keyword::NoKeyword,
+                        }),
+                        span: tokens[i].span,
+                    });
+                    i = next;
+                    continue;
+                }
+            }
+            _ => {}
+        }
+        out.push(tokens[i].clone());
+        i += 1;
+    }
+    out
+}
+
+/// The `[schema.]name` at `at`, with each part written as the planner reads
+/// it (quotes kept, so a quoted name keeps its case), and the index after it.
+fn object_name(
+    tokens: &[sqlparser::tokenizer::TokenWithSpan],
+    at: usize,
+) -> Option<(String, usize)> {
+    use sqlparser::tokenizer::Token;
+    // Whitespace and comments between the parts carry no meaning.
+    let significant = |mut i: usize| -> Option<usize> {
+        while let Some(token) = tokens.get(i) {
+            match &token.token {
+                Token::Whitespace(_) => i += 1,
+                _ => return Some(i),
+            }
+        }
+        None
+    };
+    let mut parts: Vec<String> = Vec::new();
+    let mut i = significant(at)?;
+    while let Token::Word(word) = &tokens[i].token {
+        parts.push(match word.quote_style {
+            Some(_) => format!("\"{}\"", word.value.replace('"', "\"\"")),
+            None => word.value.clone(),
+        });
+        let after = match significant(i + 1) {
+            Some(j) if matches!(tokens[j].token, Token::Period) => j + 1,
+            _ => break,
+        };
+        match significant(after) {
+            Some(j) if matches!(tokens[j].token, Token::Word(_)) => i = j,
+            _ => break,
+        }
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some((parts.join("."), i + 1))
+}
+
 fn rewrite_record_star(
     mut tokens: Vec<sqlparser::tokenizer::TokenWithSpan>,
 ) -> Vec<sqlparser::tokenizer::TokenWithSpan> {
@@ -3211,6 +3313,11 @@ pub const CREATE_SCHEMA_FUNCTION: &str = "pg_catalog.nodus_create_schema";
 /// 'int')` — since the parser takes only enum operations.
 pub const TYPE_FUNCTION: &str = "pg_catalog.nodus_alter_type";
 
+/// The function `ALTER TABLE child INHERIT | NO INHERIT parent` is written
+/// as — `SELECT pg_catalog.nodus_inherit('child', 'parent', true)` — since
+/// the parser takes no inheritance operation.
+pub const INHERIT_FUNCTION: &str = "pg_catalog.nodus_inherit";
+
 /// The function `(value).*` — a record expanded into its fields — is
 /// written as — `pg_catalog.nodus_expand_record(value)` — since the parser
 /// has no `.*` after a parenthesized expression.
@@ -3367,6 +3474,28 @@ fn rewrite_statement_form(
                 "SELECT {SET_SCHEMA_FUNCTION}('{kind}', {if_exists}, '{}', '{}')",
                 quote(name.trim()),
                 quote(&schema)
+            );
+            if let Some(mut tokens) = snippet_tokens(&sql) {
+                tokens.extend(tail(&statement));
+                return tokens;
+            }
+            return statement;
+        }
+    }
+
+    // `ALTER TABLE [ONLY] child INHERIT | NO INHERIT parent`.
+    if is(0, "alter") && is(1, "table") && n >= 4 {
+        let at = if is(2, "only") { 3 } else { 2 };
+        let keyword = (at..n).find(|&k| is(k, "inherit"));
+        if let Some(k) = keyword {
+            let attach = !(k > at && is(k - 1, "no"));
+            let keyword_at = if attach { k } else { k - 1 };
+            let name = render_tokens(&statement[significant[at]..=significant[keyword_at - 1]]);
+            let parent = render_tokens(&statement[significant[k + 1]..=significant[n - 1]]);
+            let sql = format!(
+                "SELECT {INHERIT_FUNCTION}('{}', '{}', {attach})",
+                quote(name.trim()),
+                quote(parent.trim())
             );
             if let Some(mut tokens) = snippet_tokens(&sql) {
                 tokens.extend(tail(&statement));
@@ -4170,6 +4299,35 @@ mod tests {
         assert!(
             one("INSERT INTO t VALUES (1) ON CONFLICT (lower(e)) DO NOTHING")
                 .contains(&format!("ON CONSTRAINT \"{CONFLICT_EXPRESSIONS}lower(e)\""))
+        );
+    }
+
+    #[test]
+    fn only_marks_names() {
+        let one = |sql: &str| parse_sql(sql).unwrap()[0].to_string();
+        assert_eq!(
+            one("SELECT a FROM ONLY ip"),
+            "SELECT a FROM \"\u{0}only:ip\""
+        );
+        assert_eq!(
+            one("SELECT a FROM ONLY ip AS x"),
+            "SELECT a FROM \"\u{0}only:ip\" AS x"
+        );
+        assert_eq!(
+            one("UPDATE ONLY ip SET b = 'z'"),
+            "UPDATE \"\u{0}only:ip\" SET b = 'z'"
+        );
+        assert_eq!(one("SELECT a FROM only"), "SELECT a FROM only");
+        // A quoted `only` is a table of that name, and TRUNCATE keeps its own.
+        assert_eq!(one("SELECT a FROM \"only\""), "SELECT a FROM \"only\"");
+        assert_eq!(one("TRUNCATE ONLY t"), "TRUNCATE ONLY t");
+        assert_eq!(
+            one("ALTER TABLE ic INHERIT ip"),
+            "SELECT pg_catalog.nodus_inherit('ic', 'ip', true)"
+        );
+        assert_eq!(
+            one("ALTER TABLE ic NO INHERIT ip"),
+            "SELECT pg_catalog.nodus_inherit('ic', 'ip', false)"
         );
     }
 

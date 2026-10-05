@@ -19,11 +19,12 @@ impl MemExecutor {
         &self,
         ctx: &ExecutionContext,
         name: String,
-        columns: Vec<ColumnDef>,
+        mut columns: Vec<ColumnDef>,
         constraints: Vec<nodus_catalog::TableConstraint>,
         if_not_exists: bool,
         (unique_constraints, key_names): (Vec<Vec<String>>, Vec<(Vec<String>, String)>),
         materialized_query: Option<String>,
+        inherits: Vec<String>,
     ) -> Result<QueryOutput> {
         // The name given to the key over `columns`, if any.
         let key_name = |columns: &[String]| -> Option<String> {
@@ -63,6 +64,15 @@ impl MemExecutor {
                 return Ok(QueryOutput::tag("CREATE TABLE"));
             }
             anyhow::bail!("relation \"{}\" already exists", table_only);
+        }
+        // The parents' columns lead the new table's, and their CHECK
+        // constraints come along; a conflict fails before anything is made.
+        let parents = self.resolve_parents(&inherits)?;
+        let mut constraints = constraints;
+        if !parents.is_empty() {
+            let (merged, inherited_checks) = self.merge_inherited(ctx, &parents, columns)?;
+            columns = merged;
+            constraints.extend(inherited_checks);
         }
         self.reject_type_name(schema_name, table_only)?;
         for column in &columns {
@@ -165,6 +175,7 @@ impl MemExecutor {
             constraints,
             view_query: None,
             materialized_query,
+            parents: parents.iter().map(|p| p.id).collect(),
         })?;
 
         for (col, primary) in unique_cols {
@@ -299,6 +310,7 @@ impl MemExecutor {
             false,
             Default::default(),
             None,
+            Vec::new(),
         )?;
         let (db_name, schema_name, table_only) = parse_object_name(name)?;
         let tbl = self
@@ -473,6 +485,7 @@ impl MemExecutor {
             false,
             Default::default(),
             materialized_query,
+            Vec::new(),
         )?;
         if !with_data {
             return Ok(QueryOutput::tag(command));
@@ -662,6 +675,7 @@ impl MemExecutor {
             constraints: vec![],
             view_query: Some(view_query_json),
             materialized_query: None,
+            parents: Vec::new(),
         })?;
 
         Ok(QueryOutput::tag("CREATE VIEW"))
@@ -750,6 +764,18 @@ impl MemExecutor {
                     )?;
                 }
                 Dependent::View(view) => self.drop_relation(view)?,
+                Dependent::ChildTable(child) => {
+                    // The child's own descendants go first, deepest last; one
+                    // an earlier dependent already dropped is skipped.
+                    for descendant in self.descendants("default", child.id)?.into_iter().rev() {
+                        if self.catalog_reader.get_table_by_id(descendant.id).is_ok() {
+                            self.drop_relation(&descendant)?;
+                        }
+                    }
+                    if self.catalog_reader.get_table_by_id(child.id).is_ok() {
+                        self.drop_relation(child)?;
+                    }
+                }
             }
         }
         for tbl in &targets {
@@ -832,6 +858,23 @@ impl MemExecutor {
             }
         }
         for target in targets {
+            // A child table depends on its parent.
+            for child in self.descendants("default", target.id)? {
+                if targets.iter().any(|t| t.id == child.id) || seen.contains(&child.id) {
+                    continue;
+                }
+                seen.push(child.id);
+                let parent = child
+                    .parents
+                    .first()
+                    .and_then(|id| tables.iter().find(|t| t.id == *id))
+                    .map(|t| t.name.clone())
+                    .unwrap_or_else(|| target.name.clone());
+                found.push(DependentObject {
+                    description: format!("table {} depends on table {}", child.name, parent),
+                    object: Dependent::ChildTable(child),
+                });
+            }
             for reference in self.references_to(target)? {
                 if targets.iter().any(|t| t.id == reference.child.id) {
                     continue;
@@ -1310,6 +1353,8 @@ pub(crate) enum Dependent {
         name: String,
     },
     View(nodus_catalog::TableDescriptor),
+    /// A child table (`INHERITS`).
+    ChildTable(nodus_catalog::TableDescriptor),
 }
 
 /// Whether the stored plan `query` of a view reads relation `name`.
@@ -1420,6 +1465,7 @@ fn shape_only(query: LogicalPlan) -> LogicalPlan {
             sample,
             ..
         } => LogicalPlan::Select {
+            only: false,
             ctes,
             table_name,
             table_alias,

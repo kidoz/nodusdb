@@ -336,6 +336,13 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                     Some(sqlparser::ast::OnCommit::DeleteRows) => Some("DELETE ROWS".to_string()),
                     _ => None,
                 },
+                inherits: create_table
+                    .inherits
+                    .clone()
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|name| name.to_string())
+                    .collect(),
                 like: match &create_table.like {
                     Some(
                         sqlparser::ast::CreateTableLikeKind::Parenthesized(like)
@@ -800,6 +807,26 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                 _ => anyhow::bail!("malformed SET SCHEMA"),
             }
         }
+        Statement::Query(query) if rewritten_call(query, nodus_sql::INHERIT_FUNCTION).is_some() => {
+            match rewritten_call(query, nodus_sql::INHERIT_FUNCTION).as_deref() {
+                Some(
+                    [
+                        crate::Value::Text(child),
+                        crate::Value::Text(parent),
+                        crate::Value::Bool(attach),
+                    ],
+                ) => Ok(LogicalPlan::AlterTable {
+                    table_name: child.clone(),
+                    operations: vec![AlterTableOp::Inherit {
+                        parent: parent.clone(),
+                        attach: *attach,
+                    }],
+                    if_exists: false,
+                    only: false,
+                }),
+                _ => anyhow::bail!("malformed INHERIT"),
+            }
+        }
         Statement::Query(query)
             if rewritten_call(query, nodus_sql::CREATE_SCHEMA_FUNCTION).is_some() =>
         {
@@ -896,7 +923,7 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
             if !update.table.joins.is_empty() {
                 anyhow::bail!("UPDATE of a joined relation is not supported");
             }
-            let (table_name, table_alias) = target_table(&update.table.relation)?;
+            let (table_name, table_alias, only) = target_table(&update.table.relation)?;
             let from = match &update.from {
                 Some(
                     UpdateTableFromKind::AfterSet(from) | UpdateTableFromKind::BeforeSet(from),
@@ -906,6 +933,7 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
             let (returning, returning_exprs) =
                 plan_returning(&update.returning, ReturningOf::Change, params)?;
             Ok(LogicalPlan::Update {
+                only,
                 assignments: plan_assignments(&update.assignments, params)?,
                 filter: parse_predicates(&update.selection, params)?,
                 returning,
@@ -929,7 +957,7 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                 .first()
                 .ok_or_else(|| anyhow::anyhow!("DELETE without a table"))?
                 .relation;
-            let (table_name, table_alias) = target_table(relation)?;
+            let (table_name, table_alias, only) = target_table(relation)?;
             let using = match &delete.using {
                 Some(using) => Some(Box::new(plan_relations(using, params)?)),
                 None => None,
@@ -937,6 +965,7 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
             let (returning, returning_exprs) =
                 plan_returning(&delete.returning, ReturningOf::Change, params)?;
             Ok(LogicalPlan::Delete {
+                only,
                 table_name,
                 filter: parse_predicates(&delete.selection, params)?,
                 returning,
@@ -1013,10 +1042,18 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
             })
         }
         Statement::Truncate(truncate) => Ok(LogicalPlan::Truncate {
+            // `ONLY` is carried as the mark the token rewriter uses for the
+            // statement forms the parser cannot take.
             tables: truncate
                 .table_names
                 .iter()
-                .map(|t| t.name.to_string())
+                .map(|t| {
+                    if t.only {
+                        format!("{}{}", nodus_sql::ONLY_MARK, t.name)
+                    } else {
+                        t.name.to_string()
+                    }
+                })
                 .collect(),
             restart_identity: matches!(
                 truncate.identity,
@@ -1295,6 +1332,7 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                 table_name,
                 operations,
                 if_exists: alter_table.if_exists,
+                only: alter_table.only,
             })
         }
         Statement::AlterIndex {
@@ -2150,7 +2188,7 @@ fn plan_merge(merge: &sqlparser::ast::Merge, params: &[Value]) -> Result<Logical
         MergeAction as Action, MergeClauseKind, MergeInsertKind, MergeUpdateKind, OutputClause,
         TableWithJoins,
     };
-    let (table_name, table_alias) = target_table(&merge.table)?;
+    let (table_name, table_alias, only) = target_table(&merge.table)?;
     let (returning, returning_exprs) = match &merge.output {
         Some(OutputClause::Returning { select_items, .. }) => {
             plan_returning(&Some(select_items.clone()), ReturningOf::Merge, params)?
@@ -2236,6 +2274,7 @@ fn plan_merge(merge: &sqlparser::ast::Merge, params: &[Value]) -> Result<Logical
         });
     }
     Ok(LogicalPlan::Merge {
+        only,
         table_name,
         table_alias,
         source: Box::new(source),

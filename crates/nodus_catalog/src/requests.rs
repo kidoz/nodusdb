@@ -47,6 +47,9 @@ pub struct CreateTableRequest {
     /// For a materialized view, the query its rows are computed from.
     #[serde(default)]
     pub materialized_query: Option<String>,
+    /// The tables the new one inherits from (`INHERITS`).
+    #[serde(default)]
+    pub parents: Vec<TableId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -132,6 +135,12 @@ pub enum TableDescriptorChange {
     SetViewQuery {
         table_id: TableId,
         query: String,
+    },
+    /// Replaces the table's inheritance (`ALTER TABLE ... INHERIT` /
+    /// `NO INHERIT`).
+    SetParents {
+        table_id: TableId,
+        parents: Vec<TableId>,
     },
 }
 

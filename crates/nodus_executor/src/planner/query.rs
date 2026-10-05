@@ -10,7 +10,7 @@ use nodus_catalog::TableConstraint;
 
 pub(crate) fn table_name_of(relation: &sqlparser::ast::TableFactor) -> Result<String> {
     match relation {
-        sqlparser::ast::TableFactor::Table { name, .. } => Ok(name.to_string()),
+        sqlparser::ast::TableFactor::Table { name, .. } => Ok(factor_only(name).0),
         other => anyhow::bail!("Unsupported table relation: {other}"),
     }
 }
@@ -18,13 +18,28 @@ pub(crate) fn table_name_of(relation: &sqlparser::ast::TableFactor) -> Result<St
 /// The table a data-modifying statement writes, and the alias it goes by.
 pub(crate) fn target_table(
     relation: &sqlparser::ast::TableFactor,
-) -> Result<(String, Option<String>)> {
+) -> Result<(String, Option<String>, bool)> {
     match relation {
         sqlparser::ast::TableFactor::Table { name, alias, .. } => {
-            Ok((name.to_string(), table_alias_name(alias.as_ref())?))
+            let (name, only) = factor_only(name);
+            Ok((name, table_alias_name(alias.as_ref())?, only))
         }
         other => anyhow::bail!("Unsupported table relation: {other}"),
     }
+}
+
+/// The name a table factor reads, and whether `ONLY` preceded it. The token
+/// rewriter leaves `ONLY` behind as a marked name for the spellings the
+/// parser cannot take (`FROM ONLY t AS x`), which is stripped here.
+pub(crate) fn factor_only(name: &sqlparser::ast::ObjectName) -> (String, bool) {
+    const MARK: &str = "\u{0}only:";
+    let parts = &name.0;
+    if let [sqlparser::ast::ObjectNamePart::Identifier(ident)] = parts.as_slice()
+        && let Some(rest) = ident.value.strip_prefix(MARK)
+    {
+        return (rest.to_string(), true);
+    }
+    (name.to_string(), false)
 }
 
 pub fn parse_object_name(name: &str) -> Result<(&str, &str, &str)> {
@@ -269,6 +284,7 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
         ));
         let (limit, offset) = plan_limit(query, params, &mut sort)?;
         return Ok(LogicalPlan::Select {
+            only: false,
             ctes,
             table_name: SRF_RELATION.to_string(),
             table_alias: None,
@@ -344,7 +360,8 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
         };
         return select_from_result(literal, ctes, query, params);
     }
-    let (table_name, table_alias, mut joins, sample) = plan_from(&select.from, &mut ctes, params)?;
+    let (table_name, table_alias, mut joins, sample, only) =
+        plan_from(&select.from, &mut ctes, params)?;
 
     // Projection: a lone `*` is empty (all columns); `*` among other items,
     // and `t.*`, stand for columns the executor expands once the relations'
@@ -427,6 +444,7 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
             );
         }
         joins.push(crate::Join {
+            only: false,
             table_name: SRF_RELATION.to_string(),
             table_alias: Some(SRF_RELATION.to_string()),
             condition: None,
@@ -440,6 +458,7 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
     }
 
     Ok(LogicalPlan::Select {
+        only,
         ctes,
         table_name,
         table_alias,
@@ -620,9 +639,11 @@ fn plan_from(
     Option<String>,
     Vec<crate::Join>,
     Option<crate::SampleSpec>,
+    bool,
 )> {
     use sqlparser::ast::*;
     let sample = factor_sample(&from[0].relation, params)?;
+    let mut first_only = false;
     let (table_name, table_alias) =
         if let Some(spec) = table_fn_from_factor(&from[0].relation, params) {
             // A set-returning function as the sole driving relation (e.g.
@@ -634,7 +655,9 @@ fn plan_from(
         } else {
             match &from[0].relation {
                 TableFactor::Table { name, alias, .. } => {
-                    (name.to_string(), table_alias_name(alias.as_ref())?)
+                    let (name, only) = factor_only(name);
+                    first_only = only;
+                    (name, table_alias_name(alias.as_ref())?)
                 }
                 // The first relation has nothing to its left, so LATERAL means
                 // nothing there.
@@ -686,7 +709,7 @@ fn plan_from(
             joins.push(plan_join(&j.relation, constraint, ctes, params)?);
         }
     }
-    Ok((table_name, table_alias, joins, sample))
+    Ok((table_name, table_alias, joins, sample, first_only))
 }
 
 /// A FROM list as a query of all its joined rows: the relations an
@@ -696,7 +719,7 @@ pub(crate) fn plan_relations(
     params: &[Value],
 ) -> Result<LogicalPlan> {
     let mut ctes = Vec::new();
-    let (table_name, table_alias, joins, sample) = plan_from(from, &mut ctes, params)?;
+    let (table_name, table_alias, joins, sample, only) = plan_from(from, &mut ctes, params)?;
     Ok(LogicalPlan::Select {
         ctes,
         table_name,
@@ -715,6 +738,7 @@ pub(crate) fn plan_relations(
         group_exprs: Vec::new(),
         distinct_on: Vec::new(),
         sample,
+        only,
     })
 }
 
@@ -2701,6 +2725,7 @@ fn plan_join(
     use sqlparser::ast::TableFactor;
     let sample = factor_sample(relation, params)?;
     let join = |table_name: String, table_alias: Option<String>| crate::Join {
+        only: false,
         table_name,
         table_alias,
         condition: condition.clone(),
@@ -2728,7 +2753,11 @@ fn plan_join(
     }
     match relation {
         TableFactor::Table { name, alias, .. } => {
-            Ok(join(name.to_string(), table_alias_name(alias.as_ref())?))
+            let (name, only) = factor_only(name);
+            Ok(crate::Join {
+                only,
+                ..join(name, table_alias_name(alias.as_ref())?)
+            })
         }
         TableFactor::Derived {
             lateral,
@@ -2781,6 +2810,7 @@ fn select_from_result(
     let name = "\u{0}result".to_string();
     ctes.push((name.clone(), Box::new(result)));
     Ok(LogicalPlan::Select {
+        only: false,
         ctes,
         table_name: name,
         table_alias: None,

@@ -260,6 +260,7 @@ impl MemExecutor {
                 group_exprs,
                 distinct_on,
                 sample,
+                only,
                 ..
             } => {
                 let mut scope: Vec<(String, &LogicalPlan)> = ctes.to_vec();
@@ -274,6 +275,7 @@ impl MemExecutor {
                     scan_filter,
                     &scope,
                     sample.as_ref(),
+                    *only,
                 )?;
                 for join in joins {
                     let right = match (&join.lateral, &join.table_fn) {
@@ -295,6 +297,7 @@ impl MemExecutor {
                             None,
                             &scope,
                             join.sample.as_ref(),
+                            join.only,
                         )?,
                     };
                     let (suffix, kind) = match join.join_type {
@@ -548,6 +551,7 @@ impl MemExecutor {
                     None,
                     ctes,
                     None,
+                    false,
                 )?;
                 let mut join =
                     Node::over("Nested Loop", "Nested Loop Left Join", vec![source, target])
@@ -591,10 +595,12 @@ impl MemExecutor {
         ctes: &[(String, &LogicalPlan)],
     ) -> Result<Node> {
         let child = match source {
-            None => self.explain_relation(ctx, table_name, table_alias, filter, ctes, None)?,
+            None => {
+                self.explain_relation(ctx, table_name, table_alias, filter, ctes, None, false)?
+            }
             Some(source) => {
                 let target =
-                    self.explain_relation(ctx, table_name, table_alias, None, ctes, None)?;
+                    self.explain_relation(ctx, table_name, table_alias, None, ctes, None, false)?;
                 let source = self.explain_node(ctx, source, ctes)?;
                 let mut join = Node::over("Nested Loop", "Nested Loop", vec![target, source])
                     .prop("Join Type", json!("Inner"));
@@ -630,6 +636,7 @@ impl MemExecutor {
         filter: Option<&FilterExpr>,
         ctes: &[(String, &LogicalPlan)],
         sample: Option<&crate::SampleSpec>,
+        only: bool,
     ) -> Result<Node> {
         let with_filter = |mut node: Node| {
             if let Some(f) = filter {
@@ -685,6 +692,45 @@ impl MemExecutor {
             return Ok(with_filter(node));
         }
         let rows = self.scan_rows(tbl.id, &ctx.session_id)?.len() as f64;
+        // A scan reads the table's descendants too, appending each table's
+        // rows; `ONLY` reads just the table.
+        let descendant_tables = if only {
+            Vec::new()
+        } else {
+            self.descendants(db_name, tbl.id)?
+        };
+        if !descendant_tables.is_empty() {
+            let mut children = Vec::new();
+            let mut child_rows = 0.0;
+            let mut child_pages = 0.0;
+            for (at, table) in std::iter::once(tbl.clone())
+                .chain(descendant_tables)
+                .enumerate()
+            {
+                let table_rows = self.scan_rows(table.id, &ctx.session_id)?.len() as f64;
+                let table_width: u32 = table.columns.iter().map(|c| type_width(&c.data_type)).sum();
+                let pages = (table_rows * table_width as f64 / 8192.0).ceil().max(1.0);
+                let headline = if at == 0 {
+                    format!("Seq Scan on {label}")
+                } else {
+                    format!("Seq Scan on {}", relation_name(&table.name))
+                };
+                let mut child = Node::new("Seq Scan", headline, table_rows, table_width)
+                    .prop("Relation Name", json!(table.name))
+                    .prop("Alias", json!(table.name));
+                child.startup = 0.0;
+                child.total = pages * PAGE + table_rows * CPU_TUPLE;
+                children.push(child);
+                child_rows += table_rows;
+                child_pages += pages;
+            }
+            let mut node = Node::over("Append", "Append", children);
+            node.rows = child_rows;
+            node.width = width_of(&tbl);
+            node.startup = 0.0;
+            node.total = child_pages * PAGE + child_rows * CPU_TUPLE;
+            return Ok(with_filter(node));
+        }
         let width: u32 = tbl.columns.iter().map(|c| type_width(&c.data_type)).sum();
         let pages = (rows * width as f64 / 8192.0).ceil().max(1.0);
         // The executor looks up `col = value` on an indexed column by index.
@@ -895,6 +941,11 @@ fn sort_key_text(key: &SortKey, projection: &[ProjectionItem], qualified: bool) 
         _ => {}
     }
     text
+}
+
+/// A relation's rows' width.
+fn width_of(table: &nodus_catalog::TableDescriptor) -> u32 {
+    table.columns.iter().map(|c| type_width(&c.data_type)).sum()
 }
 
 /// PostgreSQL's `Sampling:` detail for a sampled scan — the method, the

@@ -126,6 +126,7 @@ impl MemExecutor {
             joins,
             filter,
             sample,
+            only,
             ..
         } = plan
         else {
@@ -150,6 +151,7 @@ impl MemExecutor {
             Vec::new(),
             true,
             sample,
+            only,
         )
     }
 
@@ -173,6 +175,7 @@ impl MemExecutor {
         distinct_on: Vec<SortTarget>,
         raw: bool,
         sample: Option<crate::SampleSpec>,
+        only: bool,
     ) -> Result<QueryOutput> {
         // The keys each output row is sorted by, then deduplicated on.
         let key_targets: Vec<SortTarget> = sort
@@ -240,6 +243,8 @@ impl MemExecutor {
         // validation is skipped for those, since driver introspection relies on
         // leniently selecting catalog columns that may not all be materialized.
         let mut query_has_virtual = false;
+        // The hidden `tableoid` columns' positions, which `*` does not show.
+        let mut hidden: Vec<usize> = Vec::new();
         let (tbl_cols, mut col_names, mut stored_rows) = if let Some(cte_out) =
             crate::cte_scope::lookup(&table_name)
         {
@@ -294,16 +299,31 @@ impl MemExecutor {
                     None => rows,
                 };
                 let prefix = table_alias.as_deref().unwrap_or(&table_name);
-                let col_names: Vec<String> = cols
+                let mut cols = cols;
+                let mut col_names: Vec<String> = cols
                     .iter()
                     .map(|c| format!("{}.{}", prefix, c.name))
                     .collect();
+                let tableoid = Self::table_oid(db_name, schema_name, table_only);
+                hidden.push(col_names.len());
+                cols.push(tableoid_column());
+                col_names.push(format!("{prefix}.tableoid"));
+                let mut rows = rows;
+                for row in &mut rows {
+                    row.push(Value::Int(tableoid));
+                }
                 (cols, col_names, rows)
             } else {
                 let tbl = self
                     .catalog_reader
                     .get_table(db_name, schema_name, table_only)?;
                 self.authorize(ctx, Action::Select, ResourceRef::Table(tbl.id))?;
+                // A table's scan reads its descendants too, unless `ONLY`.
+                let descendants = if only {
+                    Vec::new()
+                } else {
+                    self.descendants(db_name, tbl.id)?
+                };
 
                 let prefix = table_alias.as_deref().unwrap_or(&table_name);
                 let col_names: Vec<String> = tbl
@@ -317,6 +337,7 @@ impl MemExecutor {
                 // uncommitted overlay is merged into the result, so the index is
                 // usable inside a transaction rather than forcing a full scan.
                 if sample.is_none()
+                    && descendants.is_empty()
                     && let Some(FilterExpr::Predicate(Predicate {
                         left,
                         op: CompareOp::Eq,
@@ -371,7 +392,14 @@ impl MemExecutor {
                         }
                     }
                 };
-                let rows = match &sample {
+                // The descendants' rows join the table's, and the sample
+                // applies to the whole scan.
+                let rows = if descendants.is_empty() {
+                    rows
+                } else {
+                    self.inherited_rows(ctx, &tbl)?
+                };
+                let mut rows = match &sample {
                     Some(spec) => {
                         if tbl.view_query.is_some() {
                             anyhow::bail!(crate::tablesample::relation_error());
@@ -380,7 +408,22 @@ impl MemExecutor {
                     }
                     None => rows,
                 };
-                (tbl.columns.clone(), col_names, rows)
+                let mut cols = tbl.columns.clone();
+                let mut col_names = col_names;
+                if tbl.view_query.is_none() {
+                    // Every row carries the table it came from as `tableoid`;
+                    // a descendant's rows were tagged by `inherited_rows`.
+                    if descendants.is_empty() {
+                        let tableoid = Self::table_oid(db_name, schema_name, &tbl.name);
+                        for row in &mut rows {
+                            row.push(Value::Int(tableoid));
+                        }
+                    }
+                    hidden.push(col_names.len());
+                    cols.push(tableoid_column());
+                    col_names.push(format!("{prefix}.tableoid"));
+                }
+                (cols, col_names, rows)
             };
             (tbl_cols, col_names, Some(rows))
         };
@@ -392,6 +435,7 @@ impl MemExecutor {
         // in turn, except that a join's USING (or NATURAL) columns come first,
         // once, in place of the columns they merge.
         let mut star: Vec<usize> = (0..col_names.len()).collect();
+        star.retain(|i| !hidden.contains(i));
         for join in &joins {
             let left_width = col_names.len();
             // A LATERAL subquery runs for each left row, with that row's values
@@ -598,19 +642,33 @@ impl MemExecutor {
                         Some(spec) => self.sampled_rows(ctx, spec, rows)?,
                         None => rows,
                     };
+                    let mut cols = cols;
+                    let mut rows = rows;
+                    let tableoid = Self::table_oid(j_db, j_sch, j_tbl_name);
+                    cols.push(tableoid_column());
+                    for row in &mut rows {
+                        row.push(Value::Int(tableoid));
+                    }
                     (cols, rows)
                 } else {
                     let j_tbl = self.catalog_reader.get_table(j_db, j_sch, j_tbl_name)?;
                     self.authorize(ctx, Action::Select, ResourceRef::Table(j_tbl.id))?;
+                    let j_descendants = if join.only || j_tbl.view_query.is_some() {
+                        Vec::new()
+                    } else {
+                        self.descendants(j_db, j_tbl.id)?
+                    };
                     let j_rows = if let Some(vq) = &j_tbl.view_query {
                         let plan: LogicalPlan = serde_json::from_str(vq)?;
                         let out =
                             crate::cte_scope::isolated(|| self.execute_logical_inner(ctx, plan))?;
                         out.rows.iter().map(|r| r.values.clone()).collect()
-                    } else {
+                    } else if j_descendants.is_empty() {
                         self.scan_rows(j_tbl.id, &ctx.session_id)?
+                    } else {
+                        self.inherited_rows(ctx, &j_tbl)?
                     };
-                    let j_rows = match &join.sample {
+                    let mut j_rows = match &join.sample {
                         Some(spec) => {
                             if j_tbl.view_query.is_some() {
                                 anyhow::bail!(crate::tablesample::relation_error());
@@ -619,7 +677,17 @@ impl MemExecutor {
                         }
                         None => j_rows,
                     };
-                    (j_tbl.columns.clone(), j_rows)
+                    let mut cols = j_tbl.columns.clone();
+                    if j_tbl.view_query.is_none() {
+                        if j_descendants.is_empty() {
+                            let tableoid = Self::table_oid(j_db, j_sch, &j_tbl.name);
+                            for row in &mut j_rows {
+                                row.push(Value::Int(tableoid));
+                            }
+                        }
+                        cols.push(tableoid_column());
+                    }
+                    (cols, j_rows)
                 }
             };
 
@@ -628,6 +696,13 @@ impl MemExecutor {
                 .iter()
                 .map(|c| format!("{}.{}", j_prefix, c.name))
                 .collect();
+            // The right side's own hidden tableoid column, when it has one.
+            if j_col_names
+                .last()
+                .is_some_and(|name| name.ends_with(".tableoid"))
+            {
+                hidden.push(col_names.len() + j_col_names.len() - 1);
+            }
 
             let mut combined_cols = col_names.clone();
             combined_cols.extend(j_col_names.clone());
@@ -774,6 +849,7 @@ impl MemExecutor {
             col_names = combined_cols;
             joined_columns = combined_desc;
         }
+        star.retain(|i| !hidden.contains(i));
 
         // `*` and `t.*` in the select list stand for columns by position; a
         // plain `*` without merged columns keeps the whole row.
@@ -822,8 +898,10 @@ impl MemExecutor {
                             col_names
                                 .iter()
                                 .filter(|name| {
-                                    name.rsplit_once('.')
-                                        .is_some_and(|(q, _)| q == relation || q.ends_with(&inner))
+                                    !hidden_scan_column(name)
+                                        && name.rsplit_once('.').is_some_and(|(q, _)| {
+                                            q == relation || q.ends_with(&inner)
+                                        })
                                 })
                                 .map(|name| ProjectionItem::Column(name.clone())),
                         );
@@ -1275,13 +1353,22 @@ impl MemExecutor {
         // Read as the relations of a data-modifying statement: the joined
         // rows, under their qualified column names.
         if raw {
+            // The hidden scan columns are not part of the relation.
+            let types: Vec<String> = star
+                .iter()
+                .map(|&i| joined_columns[i].data_type.clone())
+                .collect();
+            let columns: Vec<String> = star.iter().map(|&i| col_names[i].clone()).collect();
+            let rows = stored_rows
+                .into_iter()
+                .map(|values| Row {
+                    values: star.iter().map(|&i| values[i].clone()).collect(),
+                })
+                .collect();
             return Ok(QueryOutput {
-                types: joined_columns.iter().map(|c| c.data_type.clone()).collect(),
-                columns: col_names,
-                rows: stored_rows
-                    .into_iter()
-                    .map(|values| Row { values })
-                    .collect(),
+                types,
+                columns,
+                rows,
                 tag: String::new(),
             });
         }
@@ -2580,6 +2667,30 @@ impl MemExecutor {
 /// bits (1 for each argument the set leaves out), and with `rollup` a
 /// grouping column the set leaves out as NULL, except inside aggregates,
 /// which read every row's real values.
+/// Whether a scanned column is one of the hidden `tableoid`s a scan
+/// carries: PostgreSQL forbids a column of that name, so it is never the
+/// query's own.
+fn hidden_scan_column(name: &str) -> bool {
+    name.rsplit_once('.')
+        .is_some_and(|(_, column)| column.eq_ignore_ascii_case("tableoid"))
+}
+
+/// The `tableoid` columns a scan carries: the table each row came from.
+fn tableoid_column() -> ColumnDescriptor {
+    ColumnDescriptor {
+        id: nodus_catalog::ColumnId::new(),
+        name: "tableoid".to_string(),
+        version: 1,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+        state: nodus_catalog::DescriptorState::Public,
+        data_type: "OID".to_string(),
+        nullable: false,
+        default_expr: None,
+        comment: None,
+    }
+}
+
 fn for_grouping_set(
     expr: &ScalarExpr,
     active: &dyn Fn(&str) -> bool,
@@ -2837,6 +2948,7 @@ fn whole_row(name: &str, col_names: &[String], scalars: &[String]) -> Option<Sca
     }
     let args: Vec<ScalarExpr> = col_names
         .iter()
+        .filter(|c| !hidden_scan_column(c))
         .filter_map(|c| {
             let (relation, column) = c.rsplit_once('.')?;
             (relation == name || relation.ends_with(&inner)).then(|| {
@@ -2887,6 +2999,7 @@ fn expand_record_fields(
             let inner = format!(".{name}");
             let fields: Vec<String> = col_names
                 .iter()
+                .filter(|c| !hidden_scan_column(c))
                 .filter_map(|c| c.rsplit_once('.'))
                 .filter(|(relation, _)| *relation == name || relation.ends_with(&inner))
                 .map(|(_, column)| column.to_string())
