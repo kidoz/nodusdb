@@ -991,3 +991,103 @@ SELECT jsonb_path_query('{"a":"xy"}', '$.a like_regex "x" flag "x"');
 
 statement error
 SELECT '{".a"}'::jsonpath[];
+
+# jsonpath variable paths ($x) with the vars argument, PG 18.4.
+query T
+select jsonb_path_query('{}', '$x', '{"x":1}'::jsonb);;
+----
+1
+
+query T
+select jsonb_path_query('{}', 'strict $x', '{"x":1}'::jsonb);;
+----
+1
+
+query T
+select jsonb_path_query('{}', '$x.b', '{"x":{"b":1}}'::jsonb);;
+----
+1
+
+query T
+select jsonb_path_query('{}', '$x.b.c', '{"x":{"b":{"c":5}}}'::jsonb);;
+----
+5
+
+query T
+select jsonb_path_query('{}', '$x[1]', '{"x":[10,20]}'::jsonb);;
+----
+20
+
+query T
+select jsonb_path_query('{}', '$x[*].b', '{"x":[{"b":1},{"b":2}]}'::jsonb);;
+----
+1
+2
+
+query T
+select jsonb_path_query('{}', '$x."b c"', '{"x":{"b c":5}}'::jsonb);;
+----
+5
+
+query T
+select jsonb_path_query('{}', '$x.b + 1', '{"x":{"b":1}}'::jsonb);;
+----
+2
+
+query T
+select jsonb_path_query('{}', '$x[*] ? (@ > 1)', '{"x":[1,2,3]}'::jsonb);;
+----
+2
+3
+
+query T
+select jsonb_path_query('{}', '$x == 1', '{"x":1}'::jsonb);;
+----
+true
+
+query T
+select jsonb_path_query('{"a":[1,2,3]}', '$.a[*] ? (@ > $min)', '{"min":1}'::jsonb);;
+----
+2
+3
+
+query T
+select jsonb_path_exists('{}', 'exists($x.b)', '{"x":{"b":1}}'::jsonb);;
+----
+t
+
+query T
+select jsonb_path_query_array('{}', '$x.b', '{"x":{"b":1}}'::jsonb);;
+----
+[1]
+
+query T
+select '$.b'::jsonpath;;
+----
+$."b"
+
+query T
+select '$x'::jsonpath;;
+----
+$"x"
+
+query T
+select '$x.b'::jsonpath;;
+----
+$"x"."b"
+
+query T
+select '$x[1]'::jsonpath;;
+----
+$"x"[1]
+
+query T
+select '$x[*].y'::jsonpath;;
+----
+$"x"[*]."y"
+
+statement error
+select jsonb_path_query('{}', '$x.b', '{}'::jsonb);;
+
+statement error
+select jsonb_path_query('{}', 'lax $x', '{}'::jsonb);;

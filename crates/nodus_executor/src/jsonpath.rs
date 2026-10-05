@@ -80,11 +80,20 @@ pub(crate) struct Path {
     pub expr: Expr,
 }
 
+/// Where a path starts: the document (`$`), the current item (`@`), or a
+/// jsonpath variable (`$name`, whose value comes from the `vars` object).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum PathBase {
+    Root,
+    Current,
+    Var(String),
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Expr {
-    /// `$`/`@` followed by steps; `root` is true for `$`.
+    /// `$`, `@`, or a variable, followed by steps.
     Path {
-        root: bool,
+        base: PathBase,
         steps: Vec<Step>,
     },
     Compare(CmpOp, Box<Expr>, Box<Expr>),
@@ -771,6 +780,15 @@ impl Parser {
             }
             Tok::Var(name) => {
                 self.bump();
+                // Accessors continue a variable as a path root; methods and
+                // a bare variable are value expressions.
+                if matches!(self.peek(), Tok::Dot | Tok::LBracket | Tok::Question) {
+                    let steps = self.steps()?;
+                    return Ok(Expr::Path {
+                        base: PathBase::Var(name),
+                        steps,
+                    });
+                }
                 let mut expr = Expr::Var(name);
                 while let Some(method) = self.method_suffix()? {
                     expr = Expr::MethodCall {
@@ -831,12 +849,19 @@ impl Parser {
 
     /// `$`/`@` followed by steps; a filter's predicate is a full expression.
     fn path_expr(&mut self) -> Result<Expr> {
-        let root = match self.peek() {
-            Tok::Dollar => true,
-            Tok::At => false,
+        let base = match self.peek() {
+            Tok::Dollar => PathBase::Root,
+            Tok::At => PathBase::Current,
             _ => return Err(self.syntax_here()),
         };
         self.bump();
+        let steps = self.steps()?;
+        Ok(Expr::Path { base, steps })
+    }
+
+    /// The accessors of a path: `.key`, `[index]`, `? (predicate)`, and the
+    /// like, until one that is not.
+    fn steps(&mut self) -> Result<Vec<Step>> {
         let mut steps: Vec<Step> = Vec::new();
         loop {
             match self.peek().clone() {
@@ -897,7 +922,7 @@ impl Parser {
                 _ => break,
             }
         }
-        Ok(Expr::Path { root, steps })
+        Ok(steps)
     }
 
     /// A `.name()` method suffix, when one follows.
@@ -1099,7 +1124,9 @@ pub(crate) fn parse(text: &str) -> Result<Path> {
 /// expression. Inside a filter's predicate `@` is the current item.
 fn uses_current_at_root(expr: &Expr) -> bool {
     match expr {
-        Expr::Path { root, steps } => !root || steps.iter().any(uses_at_in_step),
+        Expr::Path { base, steps } => {
+            matches!(base, PathBase::Current) || steps.iter().any(uses_at_in_step)
+        }
         Expr::Compare(_, l, r) | Expr::And(l, r) | Expr::Or(l, r) | Expr::Arith(_, l, r) => {
             uses_current_at_root(l) || uses_current_at_root(r)
         }
@@ -1208,8 +1235,15 @@ fn write_expr(expr: &Expr, parent: u8, out: &mut String) {
         out.push('(');
     }
     match expr {
-        Expr::Path { root, steps } => {
-            out.push(if *root { '$' } else { '@' });
+        Expr::Path { base, steps } => {
+            match base {
+                PathBase::Root => out.push('$'),
+                PathBase::Current => out.push('@'),
+                PathBase::Var(name) => {
+                    out.push('$');
+                    escape_string(name, out);
+                }
+            }
             for step in steps {
                 write_step(step, out);
             }
@@ -1383,9 +1417,13 @@ impl<'a> Eval<'a> {
     fn stream(&mut self, expr: &Expr, current: &J, out: &mut Vec<J>) -> Result<()> {
         match expr {
             Expr::Nested(inner) => self.stream(inner, current, out),
-            Expr::Path { root, steps } => {
-                let start = if *root { self.root } else { current };
-                let mut items = vec![start.clone()];
+            Expr::Path { base, steps } => {
+                let start = match base {
+                    PathBase::Root => self.root.clone(),
+                    PathBase::Current => current.clone(),
+                    PathBase::Var(name) => self.variable(name)?,
+                };
+                let mut items = vec![start];
                 for (i, step) in steps.iter().enumerate() {
                     let last = i + 1 == steps.len();
                     let mut next = Vec::new();
@@ -2347,6 +2385,31 @@ mod tests {
         let partial = query(&target(r#"[1,"x"]"#), "$[*].floor()", None, true).expect("silent");
         assert_eq!(partial, [J::from(1)]);
         assert!(query(&target(r#"[1,"x"]"#), "$[*].floor()", None, false).is_err());
+    }
+
+    #[test]
+    fn variable_paths_start_at_the_variable() {
+        // `$x.b` is a path rooted at the variable, whose value comes from
+        // the `vars` object.
+        let vars = target(r#"{"x":{"b":{"c":5}}}"#);
+        assert_eq!(
+            query(&target("null"), "$x.b.c", Some(&vars), false).expect("runs"),
+            [J::from(5)]
+        );
+        assert_eq!(
+            query(
+                &target("null"),
+                "$x[*].b",
+                Some(&target(r#"{"x":[{"b":1},{"b":2}]}"#)),
+                false
+            )
+            .expect("runs"),
+            [J::from(1), J::from(2)]
+        );
+        let missing = query(&target("null"), "$x.b", None, false);
+        assert!(matches!(missing, Err(message) if message.contains("variable")));
+        // The output form quotes the variable, as PostgreSQL prints it.
+        assert_eq!(canonical("$x.b").expect("parses"), "$\"x\".\"b\"");
     }
 
     #[test]
