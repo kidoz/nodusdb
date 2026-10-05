@@ -10,9 +10,10 @@ impl MemExecutor {
         db_name: &str,
         schema_name: &str,
         table_only: &str,
+        session: &str,
     ) -> Result<(Vec<ColumnDescriptor>, Vec<Vec<Value>>)> {
         if schema_name.eq_ignore_ascii_case("pg_catalog") {
-            if let Some(table) = self.pg_catalog_virtual_table(db_name, table_only)? {
+            if let Some(table) = self.pg_catalog_virtual_table(db_name, table_only, session)? {
                 return Ok(padded(table));
             }
             anyhow::bail!("relation \"pg_catalog.{}\" does not exist", table_only);

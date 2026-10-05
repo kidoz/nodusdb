@@ -9,6 +9,7 @@ impl MemExecutor {
         &self,
         db_name: &str,
         table_only: &str,
+        session: &str,
     ) -> Result<Option<(Vec<ColumnDescriptor>, Vec<Vec<Value>>)>> {
         let schemas = self
             .catalog_reader
@@ -925,6 +926,16 @@ impl MemExecutor {
                     ("description", "TEXT"),
                 ]),
                 Vec::new(),
+            )),
+            // The large objects' pages, and their metadata rows; both come
+            // from the store the `lo_*` functions write.
+            "pg_largeobject" => Some((
+                Self::virtual_columns(&[("loid", "OID"), ("pageno", "INT"), ("data", "BYTEA")]),
+                self.large_object_pages_catalog(session)?,
+            )),
+            "pg_largeobject_metadata" => Some((
+                Self::virtual_columns(&[("oid", "OID"), ("lomowner", "OID"), ("lomacl", "TEXT[]")]),
+                self.large_object_metadata_catalog(session)?,
             )),
             // Enum types are not yet a NodusDB concept, so there are no labels to
             // list. The relation is still presented (with its real shape) because
@@ -3599,6 +3610,7 @@ const SYSTEM_CATALOG_OIDS: &[(&str, i64)] = &[
     ("pg_index", 2610),
     ("pg_inherits", 2611),
     ("pg_language", 2612),
+    ("pg_largeobject", 2613),
     ("pg_opclass", 2616),
     ("pg_operator", 2617),
     ("pg_rewrite", 2618),
@@ -3619,6 +3631,7 @@ const SYSTEM_CATALOG_OIDS: &[(&str, i64)] = &[
     ("pg_ts_config", 3602),
     ("pg_ts_config_map", 3603),
     ("pg_ts_template", 3764),
+    ("pg_largeobject_metadata", 2995),
 ];
 
 /// `pg_constraint`'s letter for a foreign key action.

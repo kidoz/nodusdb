@@ -365,6 +365,8 @@ impl MemExecutor {
                 | "pg_attrdef"
                 | "pg_description"
                 | "pg_shdescription"
+                | "pg_largeobject"
+                | "pg_largeobject_metadata"
                 | "pg_enum"
                 | "pg_collation"
                 | "pg_am"

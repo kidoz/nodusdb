@@ -181,6 +181,31 @@ impl MemExecutor {
         Ok(oids.into_keys().collect())
     }
 
+    /// `pg_largeobject`'s rows: every page of every object.
+    pub(crate) fn large_object_pages_catalog(&self, session: &str) -> Result<Vec<Vec<Value>>> {
+        let mut rows = Vec::new();
+        for oid in self.lo_list(session)? {
+            for (page, data) in self.lo_pages(session, oid)? {
+                rows.push(vec![Value::Int(oid), Value::Int(page), Value::Bytea(data)]);
+            }
+        }
+        Ok(rows)
+    }
+
+    /// `pg_largeobject_metadata`'s rows: every object, its owner, and its
+    /// (always empty) ACL.
+    pub(crate) fn large_object_metadata_catalog(&self, session: &str) -> Result<Vec<Vec<Value>>> {
+        let mut rows = Vec::new();
+        for oid in self.lo_list(session)? {
+            rows.push(vec![
+                Value::Int(oid),
+                Value::Int(SUPERUSER_OID),
+                Value::Null,
+            ]);
+        }
+        Ok(rows)
+    }
+
     /// An object's size, or `None` when it does not exist.
     pub(crate) fn lo_size(&self, session: &str, oid: i64) -> Result<Option<i64>> {
         Ok(self
@@ -584,4 +609,205 @@ pub(crate) fn decode_hex(text: &str) -> Vec<u8> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::dml_join_tests::{rows, session};
+
+    /// One statement's single value, rendered.
+    fn value(sql: &impl Fn(&str) -> anyhow::Result<crate::QueryOutput>, statement: &str) -> String {
+        let out = sql(statement).unwrap();
+        assert_eq!(out.rows.len(), 1, "{statement}");
+        crate::render(&out.rows[0].values[0])
+    }
+
+    /// One statement, its result discarded.
+    fn run(sql: &impl Fn(&str) -> anyhow::Result<crate::QueryOutput>, statement: &str) {
+        sql(statement).unwrap();
+    }
+
+    /// Its message, without the field suffix a `DbError` carries.
+    fn message(error: &anyhow::Error) -> String {
+        crate::error_fields::error_message(&error.to_string()).to_string()
+    }
+
+    #[test]
+    fn pages_are_read_back_and_listed() {
+        let sql = session();
+        assert_eq!(
+            value(
+                &sql,
+                "select lo_from_bytea(90001, repeat('a', 2050)::bytea)"
+            ),
+            "90001"
+        );
+        assert_eq!(value(&sql, "select octet_length(lo_get(90001))"), "2050");
+        assert_eq!(
+            value(&sql, "select octet_length(lo_get(90001, 2040, 20))"),
+            "10"
+        );
+        assert_eq!(
+            value(&sql, "select encode(lo_get(90001, 2048, 4), 'hex')"),
+            "6161"
+        );
+        let out =
+            sql("select pageno, length(data) from pg_largeobject where loid = 90001").unwrap();
+        assert_eq!(rows(&out), ["0|2048", "1|2"]);
+        let out =
+            sql("select oid, lomowner, lomacl from pg_largeobject_metadata where oid = 90001")
+                .unwrap();
+        assert_eq!(rows(&out), ["90001|10|"]);
+    }
+
+    #[test]
+    fn writes_zero_fill_a_gap_and_truncate_bounds() {
+        let sql = session();
+        assert_eq!(value(&sql, "select lo_create(90002)"), "90002");
+        assert_eq!(value(&sql, "select encode(lo_get(90002), 'hex')"), "");
+        run(&sql, "select lo_put(90002, 5, 'x'::bytea)");
+        assert_eq!(
+            value(&sql, "select encode(lo_get(90002), 'hex')"),
+            "000000000078"
+        );
+        assert_eq!(
+            value(&sql, "select lo_truncate(lo_open(90002, 393216), 3)"),
+            "0"
+        );
+        assert_eq!(value(&sql, "select encode(lo_get(90002), 'hex')"), "000000");
+        assert_eq!(
+            value(&sql, "select lo_truncate64(lo_open(90002, 393216), 6)"),
+            "0"
+        );
+        assert_eq!(
+            value(&sql, "select encode(lo_get(90002), 'hex')"),
+            "000000000000"
+        );
+    }
+
+    #[test]
+    fn descriptors_follow_the_transaction() {
+        let sql = session();
+        value(&sql, "select lo_from_bytea(90003, 'abcdefghij'::bytea)");
+        assert_eq!(value(&sql, "select lo_open(90003, 262144)"), "0");
+        // A descriptor from a finished statement is gone.
+        let err = sql("select loread(0, 2)").unwrap_err();
+        assert_eq!(message(&err), "invalid large-object descriptor: 0");
+        run(&sql, "begin");
+        assert_eq!(value(&sql, "select lo_open(90003, 262144)"), "0");
+        assert_eq!(value(&sql, "select lo_open(90003, 393216)"), "1");
+        assert_eq!(value(&sql, "select loread(1, 2)"), "\\x6162");
+        assert_eq!(value(&sql, "select lo_close(0)"), "0");
+        // The closed index is reused, as PostgreSQL's cookie slots are.
+        assert_eq!(value(&sql, "select lo_open(90003, 131072)"), "0");
+        run(&sql, "commit");
+        let err = sql("select loread(0, 2)").unwrap_err();
+        assert_eq!(message(&err), "invalid large-object descriptor: 0");
+    }
+
+    #[test]
+    fn write_opened_descriptors_can_be_read() {
+        let sql = session();
+        value(&sql, "select lo_from_bytea(90004, 'abcdefghij'::bytea)");
+        run(&sql, "begin");
+        assert_eq!(value(&sql, "select lo_open(90004, 131072)"), "0");
+        assert_eq!(value(&sql, "select lo_tell(0)"), "0");
+        assert_eq!(value(&sql, "select loread(0, 3)"), "\\x616263");
+        assert_eq!(value(&sql, "select lowrite(0, 'Z'::bytea)"), "1");
+        assert_eq!(value(&sql, "select lo_tell(0)"), "4");
+        run(&sql, "commit");
+    }
+
+    #[test]
+    fn errors_match_postgresql() {
+        let sql = session();
+        value(&sql, "select lo_create(90005)");
+        let err = sql("select lo_create(90005)").unwrap_err();
+        assert!(
+            message(&err).contains(
+                "duplicate key value violates unique constraint \
+                 \"pg_largeobject_metadata_oid_index\""
+            ),
+            "{err}"
+        );
+        let err = sql("select lo_get(90006)").unwrap_err();
+        assert_eq!(message(&err), "large object 90006 does not exist");
+        let err = sql("select lo_open(90005, 0)").unwrap_err();
+        assert_eq!(message(&err), "invalid flags for opening a large object: 0");
+        let err = sql("select loread(0, 2)").unwrap_err();
+        assert_eq!(message(&err), "invalid large-object descriptor: 0");
+        let err = sql("select lo_get(90005, -1, 5)").unwrap_err();
+        assert_eq!(message(&err), "invalid large object seek target: -1");
+        let err = sql("select lo_get(90005, 0, -1)").unwrap_err();
+        assert_eq!(message(&err), "requested length cannot be negative");
+        let err = sql("select lo_get(90005, 4398046511105, 5)").unwrap_err();
+        assert_eq!(
+            message(&err),
+            "invalid large object seek target: 4398046511105"
+        );
+        let err = sql("select lo_truncate64(lo_open(90005, 393216), -1)").unwrap_err();
+        assert_eq!(message(&err), "invalid large object truncation target: -1");
+        let err = sql("select lo_lseek(lo_open(90005, 262144), 0, 3)").unwrap_err();
+        assert_eq!(message(&err), "invalid whence setting: 3");
+        let err = sql("select lo_lseek(lo_open(90005, 262144), -1, 0)").unwrap_err();
+        assert_eq!(message(&err), "invalid large object seek target: -1");
+    }
+
+    #[test]
+    fn unlink_removes_pages_metadata_and_descriptors() {
+        let sql = session();
+        value(&sql, "select lo_from_bytea(90007, 'abc'::bytea)");
+        run(&sql, "begin");
+        assert_eq!(value(&sql, "select lo_open(90007, 262144)"), "0");
+        assert_eq!(value(&sql, "select lo_unlink(90007)"), "1");
+        assert_eq!(
+            value(
+                &sql,
+                "select count(*) from pg_largeobject where loid = 90007"
+            ),
+            "0"
+        );
+        assert_eq!(
+            value(
+                &sql,
+                "select count(*) from pg_largeobject_metadata where oid = 90007"
+            ),
+            "0"
+        );
+        let err = sql("select loread(0, 2)").unwrap_err();
+        assert_eq!(message(&err), "invalid large-object descriptor: 0");
+        run(&sql, "rollback");
+        assert_eq!(value(&sql, "select octet_length(lo_get(90007))"), "3");
+    }
+
+    #[test]
+    fn a_read_only_transaction_refuses_writes() {
+        let sql = session();
+        value(&sql, "select lo_from_bytea(90008, 'abc'::bytea)");
+        for (statement, function) in [
+            ("select lo_create(90009)", "lo_create()"),
+            ("select lo_creat(-1)", "lo_creat()"),
+            ("select lo_from_bytea(90009, 'x'::bytea)", "lo_from_bytea()"),
+            ("select lo_put(90008, 0, 'x'::bytea)", "lo_put()"),
+            ("select lo_unlink(90008)", "lo_unlink()"),
+            (
+                "select lo_truncate(lo_open(90008, 393216), 1)",
+                "lo_open(INV_WRITE)",
+            ),
+            (
+                "select lowrite(lo_open(90008, 131072), 'x'::bytea)",
+                "lo_open(INV_WRITE)",
+            ),
+        ] {
+            run(&sql, "begin read only");
+            let err = sql(statement).unwrap_err();
+            assert_eq!(
+                message(&err),
+                format!("cannot execute {function} in a read-only transaction"),
+                "{statement}"
+            );
+            run(&sql, "rollback");
+        }
+        assert_eq!(value(&sql, "select octet_length(lo_get(90008))"), "3");
+    }
 }

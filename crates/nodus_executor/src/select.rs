@@ -281,7 +281,8 @@ impl MemExecutor {
             };
             let (tbl_cols, col_names, rows) = if Self::is_virtual_schema(schema_name) {
                 query_has_virtual = true;
-                let (cols, rows) = self.get_virtual_table(db_name, schema_name, table_only)?;
+                let (cols, rows) =
+                    self.get_virtual_table(db_name, schema_name, table_only, &ctx.session_id)?;
                 let prefix = table_alias.as_deref().unwrap_or(&table_name);
                 let col_names: Vec<String> = cols
                     .iter()
@@ -568,7 +569,8 @@ impl MemExecutor {
                 };
                 if Self::is_virtual_schema(j_sch) {
                     query_has_virtual = true;
-                    let (cols, rows) = self.get_virtual_table(j_db, j_sch, j_tbl_name)?;
+                    let (cols, rows) =
+                        self.get_virtual_table(j_db, j_sch, j_tbl_name, &ctx.session_id)?;
                     (cols, rows)
                 } else {
                     let j_tbl = self.catalog_reader.get_table(j_db, j_sch, j_tbl_name)?;
