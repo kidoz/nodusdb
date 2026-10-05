@@ -267,6 +267,12 @@ pub(crate) fn sqlstate_for_execution_error(err_str: &str) -> &'static str {
         } else {
             "42P07" // duplicate_table (relation / table / index / view)
         }
+    // A construct NodusDB's planner rejects the way PostgreSQL's grammar
+    // would; the message is already PostgreSQL's.
+    } else if err_str.starts_with("syntax error at or near")
+        || err_str.starts_with("syntax error at end of input")
+    {
+        "42601" // syntax_error
     // Missing object (class 42 / 3B).
     } else if err_str.contains("savepoint \"") && err_str.contains("does not exist") {
         "3B001" // invalid_savepoint_specification
