@@ -466,6 +466,9 @@ impl MemExecutor {
                     ("indnatts", "INT"),
                     ("indnkeyatts", "INT"),
                     ("indisunique", "BOOL"),
+                    // PostgreSQL 15's column: a unique index that treats
+                    // NULLs as equal.
+                    ("indnullsnotdistinct", "BOOL"),
                     ("indisprimary", "BOOL"),
                     ("indisexclusion", "BOOL"),
                     ("indimmediate", "BOOL"),
@@ -516,6 +519,7 @@ impl MemExecutor {
                             Value::Int(index.key_columns.len() as i64),
                             Value::Int(index.key_columns.len() as i64),
                             Value::Bool(index.unique),
+                            Value::Bool(index.nulls_not_distinct),
                             Value::Bool(matches!(
                                 index.index_type,
                                 nodus_catalog::IndexType::Primary
@@ -3455,8 +3459,13 @@ impl MemExecutor {
             .as_ref()
             .map(|p| format!(" WHERE ({})", p.sql))
             .unwrap_or_default();
+        let nulls = if index.nulls_not_distinct {
+            " NULLS NOT DISTINCT"
+        } else {
+            ""
+        };
         format!(
-            "CREATE {}INDEX {} ON {relation} USING btree ({}){predicate}",
+            "CREATE {}INDEX {} ON {relation} USING btree ({}){nulls}{predicate}",
             if index.unique { "UNIQUE " } else { "" },
             quote_ident(&index.name),
             keys.join(", ")
@@ -3492,6 +3501,11 @@ impl MemExecutor {
                         "UNIQUE"
                     };
                     let columns = column_list(&mut index.key_columns.iter().map(|k| k.column_id));
+                    let nulls = if index.nulls_not_distinct {
+                        " NULLS NOT DISTINCT"
+                    } else {
+                        ""
+                    };
                     let deferral = if !index.deferrable {
                         ""
                     } else if index.initially_deferred {
@@ -3499,7 +3513,7 @@ impl MemExecutor {
                     } else {
                         " DEFERRABLE"
                     };
-                    return Some(format!("{kind} ({columns}){deferral}"));
+                    return Some(format!("{kind}{nulls} ({columns}){deferral}"));
                 }
             }
             for column in table.columns.iter().filter(|c| !c.nullable) {

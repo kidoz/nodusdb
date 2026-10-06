@@ -501,3 +501,46 @@ fn deferrable_constraints_refuse_what_postgresql_refuses() {
         "constraint \"al1_pkey\" of relation \"al1\" is not a foreign key constraint"
     );
 }
+
+#[test]
+fn nulls_not_distinct_keys_treat_nulls_as_equal() {
+    let (sql, _) = session();
+    sql("CREATE TABLE nn (a int UNIQUE NULLS NOT DISTINCT)").unwrap();
+    sql("INSERT INTO nn VALUES (NULL)").unwrap();
+    let (message, listed) = fields(sql("INSERT INTO nn VALUES (NULL)").unwrap_err());
+    assert_eq!(
+        message,
+        "duplicate key value violates unique constraint \"nn_a_key\""
+    );
+    assert_eq!(
+        field(&listed, "detail").unwrap(),
+        "Key (a)=(null) already exists."
+    );
+    // The default allows any number of NULLs.
+    sql("CREATE TABLE nd (a int UNIQUE)").unwrap();
+    sql("INSERT INTO nd VALUES (NULL), (NULL)").unwrap();
+    // A table constraint compares the whole key; a NULL is a value.
+    sql("CREATE TABLE nn2 (a int, b int, CONSTRAINT uq2 UNIQUE NULLS NOT DISTINCT (a, b))")
+        .unwrap();
+    sql("INSERT INTO nn2 VALUES (NULL, 1), (NULL, 2)").unwrap();
+    assert!(sql("INSERT INTO nn2 VALUES (NULL, 1)").is_err());
+    // A unique index takes the clause, and ON CONFLICT finds the NULL row.
+    sql("CREATE TABLE nn4 (a int)").unwrap();
+    sql("CREATE UNIQUE INDEX nn4_i ON nn4 (a) NULLS NOT DISTINCT").unwrap();
+    sql("INSERT INTO nn4 VALUES (NULL)").unwrap();
+    sql("INSERT INTO nn4 VALUES (NULL) ON CONFLICT (a) DO NOTHING").unwrap();
+    assert_eq!(rows(&sql("SELECT count(*) FROM nn4").unwrap()), ["1"]);
+    sql("INSERT INTO nn4 VALUES (NULL) ON CONFLICT (a) DO UPDATE SET a = 1").unwrap();
+    assert_eq!(rows(&sql("SELECT a FROM nn4").unwrap()), ["1"]);
+    assert_eq!(
+        rows(
+            &sql("SELECT indnullsnotdistinct FROM pg_index WHERE indexrelid = 'nn4_i'::regclass")
+                .unwrap()
+        ),
+        ["t"]
+    );
+    assert_eq!(
+        rows(&sql("SELECT pg_get_indexdef('nn4_i'::regclass)").unwrap()),
+        ["CREATE UNIQUE INDEX nn4_i ON public.nn4 USING btree (a) NULLS NOT DISTINCT"]
+    );
+}
