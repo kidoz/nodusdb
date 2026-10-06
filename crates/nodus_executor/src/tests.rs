@@ -77,6 +77,7 @@ fn create_role_and_grant_require_grant_management() {
             partition_by: None,
             partition_of: None,
             for_values: None,
+            key_flags: vec![],
         },
     )
     .unwrap();
@@ -163,6 +164,7 @@ fn create_table_denied_then_allowed_by_grant() {
         partition_by: None,
         partition_of: None,
         for_values: None,
+        key_flags: vec![],
     };
 
     assert!(exec.execute_logical(&ctx, plan()).is_err());
@@ -225,6 +227,7 @@ fn create_insert_select_round_trip() {
             partition_by: None,
             partition_of: None,
             for_values: None,
+            key_flags: vec![],
         },
     )
     .unwrap();
@@ -415,6 +418,7 @@ fn rows_keyed_by_declared_pk_not_first_column() {
             partition_by: None,
             partition_of: None,
             for_values: None,
+            key_flags: vec![],
         },
     )
     .unwrap();
@@ -541,6 +545,7 @@ fn typed_values_round_trip_and_filter_by_int() {
             partition_by: None,
             partition_of: None,
             for_values: None,
+            key_flags: vec![],
         },
     )
     .unwrap();
@@ -633,6 +638,7 @@ fn update_and_delete_rows() {
             partition_by: None,
             partition_of: None,
             for_values: None,
+            key_flags: vec![],
         },
     )
     .unwrap();
@@ -761,6 +767,7 @@ fn test_join_execution() {
             partition_by: None,
             partition_of: None,
             for_values: None,
+            key_flags: vec![],
         },
     )
     .unwrap();
@@ -781,6 +788,7 @@ fn test_join_execution() {
             partition_by: None,
             partition_of: None,
             for_values: None,
+            key_flags: vec![],
         },
     )
     .unwrap();
@@ -931,6 +939,7 @@ fn transactions_are_isolated_per_session() {
             partition_by: None,
             partition_of: None,
             for_values: None,
+            key_flags: vec![],
         },
     )
     .unwrap();
@@ -1073,6 +1082,7 @@ fn test_complex_filters() {
             partition_by: None,
             partition_of: None,
             for_values: None,
+            key_flags: vec![],
         },
     )
     .unwrap();
@@ -1160,6 +1170,7 @@ fn test_left_outer_join() {
             partition_by: None,
             partition_of: None,
             for_values: None,
+            key_flags: vec![],
         },
     )
     .unwrap();
@@ -1179,6 +1190,7 @@ fn test_left_outer_join() {
             partition_by: None,
             partition_of: None,
             for_values: None,
+            key_flags: vec![],
         },
     )
     .unwrap();

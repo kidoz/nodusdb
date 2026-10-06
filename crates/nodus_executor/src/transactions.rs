@@ -62,11 +62,315 @@ impl MemExecutor {
         Ok(QueryOutput::tag("BEGIN"))
     }
 
+    /// Whether a constraint is currently deferred in a transaction:
+    /// PostgreSQL's `SET CONSTRAINTS` override, else the constraint's own
+    /// `INITIALLY DEFERRED` (and only a `DEFERRABLE` constraint can defer).
+    pub(crate) fn deferred_in(
+        modes: &HashMap<String, bool>,
+        name: &str,
+        deferrable: bool,
+        initially_deferred: bool,
+    ) -> bool {
+        deferrable && modes.get(name).copied().unwrap_or(initially_deferred)
+    }
+
+    /// Whether the constraint `name` is deferred in the session's current
+    /// transaction (a write's check is skipped when it is).
+    pub(crate) fn constraint_deferred(
+        &self,
+        session_id: &str,
+        name: &str,
+        deferrable: bool,
+        initially_deferred: bool,
+    ) -> bool {
+        self.active_txns.read().get(session_id).is_some_and(|txn| {
+            Self::deferred_in(&txn.constraint_modes, name, deferrable, initially_deferred)
+        })
+    }
+
+    /// Notes a write under a deferred constraint, so the commit re-checks
+    /// `table` before it goes through.
+    pub(crate) fn note_deferred_write(&self, session_id: &str, table: nodus_catalog::TableId) {
+        if let Some(txn) = self.active_txns.write().get_mut(session_id) {
+            txn.deferred_tables.insert(table);
+        }
+    }
+
+    /// Enforces every deferred constraint of the tables a transaction wrote,
+    /// as PostgreSQL does when it commits: the violation surfaces then, and
+    /// the whole transaction is lost.
+    pub(crate) fn check_deferred_constraints(
+        &self,
+        ctx: &ExecutionContext,
+        modes: &HashMap<String, bool>,
+        tables: &std::collections::HashSet<nodus_catalog::TableId>,
+    ) -> Result<()> {
+        for table_id in tables {
+            let Ok(table) = self.catalog_reader.get_table_by_id(*table_id) else {
+                continue;
+            };
+            self.check_table_deferred(ctx, &table, modes)?;
+        }
+        Ok(())
+    }
+
+    /// The deferred constraints of one table, each checked against its rows.
+    fn check_table_deferred(
+        &self,
+        ctx: &ExecutionContext,
+        table: &nodus_catalog::TableDescriptor,
+        modes: &HashMap<String, bool>,
+    ) -> Result<()> {
+        // Foreign keys first, as PostgreSQL's triggers fire in the order of
+        // the columns that declared them (a transaction with several
+        // pending violations may report another one than PostgreSQL does).
+        for constraint in &table.constraints {
+            let nodus_catalog::TableConstraint::ForeignKey {
+                name,
+                columns,
+                foreign_table,
+                deferrable,
+                initially_deferred,
+                ..
+            } = constraint
+            else {
+                continue;
+            };
+            let name = name
+                .clone()
+                .unwrap_or_else(|| crate::referential::foreign_key_name(&table.name, columns));
+            if !Self::deferred_in(modes, &name, *deferrable, *initially_deferred) {
+                continue;
+            }
+            if let Some(reference) = self.resolve_reference(table, constraint)? {
+                self.check_reference_holds(ctx, &reference)?;
+            }
+            let _ = foreign_table;
+        }
+        // A composite primary key is stored as one primary index per column;
+        // the check covers the whole column tuple.
+        let primary: Vec<nodus_catalog::IndexDescriptor> = table
+            .indexes
+            .iter()
+            .filter(|i| i.index_type == nodus_catalog::IndexType::Primary)
+            .cloned()
+            .collect();
+        if let Some(first) = primary.first()
+            && Self::deferred_in(
+                modes,
+                &first.name,
+                first.deferrable,
+                first.initially_deferred,
+            )
+        {
+            self.check_unique_holds(ctx, table, &first.name, &Self::pk_positions_declared(table))?;
+        }
+        for index in table.indexes.iter().filter(|i| {
+            i.unique
+                && i.index_type != nodus_catalog::IndexType::Primary
+                && !crate::index_keys::has_expressions(i)
+        }) {
+            if !Self::deferred_in(
+                modes,
+                &index.name,
+                index.deferrable,
+                index.initially_deferred,
+            ) {
+                continue;
+            }
+            let positions: Vec<usize> = index
+                .key_columns
+                .iter()
+                .filter_map(|key| table.columns.iter().position(|c| c.id == key.column_id))
+                .collect();
+            self.check_unique_holds(ctx, table, &index.name, &positions)?;
+        }
+        Ok(())
+    }
+
+    /// `SET CONSTRAINTS {ALL | names} {DEFERRED | IMMEDIATE}`: changes the
+    /// timing of deferrable constraints for the rest of the transaction.
+    /// `IMMEDIATE` also enforces them at once.
+    pub(crate) fn exec_set_constraints(
+        &self,
+        ctx: &ExecutionContext,
+        all: bool,
+        names: Vec<String>,
+        deferred: bool,
+    ) -> Result<QueryOutput> {
+        if !self.in_explicit_txn(&ctx.session_id) {
+            self.notice(
+                ctx,
+                warning(
+                    "SET CONSTRAINTS can only be used in transaction blocks",
+                    "25P01",
+                ),
+            );
+            return Ok(QueryOutput::tag("SET CONSTRAINTS"));
+        }
+        // Every deferrable constraint, by name: unique / primary keys and
+        // foreign keys.
+        let mut all_constraints: Vec<(String, bool, bool)> = Vec::new();
+        for table in self.catalog_reader.list_all_tables("default")? {
+            for index in table.indexes.iter().filter(|i| i.deferrable) {
+                all_constraints.push((
+                    index.name.clone(),
+                    index.deferrable,
+                    index.initially_deferred,
+                ));
+            }
+            for constraint in &table.constraints {
+                if let nodus_catalog::TableConstraint::ForeignKey {
+                    name,
+                    columns,
+                    deferrable,
+                    initially_deferred,
+                    ..
+                } = constraint
+                    && *deferrable
+                {
+                    let name = name.clone().unwrap_or_else(|| {
+                        crate::referential::foreign_key_name(&table.name, columns)
+                    });
+                    all_constraints.push((name, *deferrable, *initially_deferred));
+                }
+            }
+        }
+        let targets: Vec<(String, bool, bool)> = if all {
+            all_constraints
+        } else {
+            let mut targets = Vec::new();
+            for name in &names {
+                let short = name.rsplit('.').next().unwrap_or(name).to_string();
+                match all_constraints.iter().find(|(n, _, _)| *n == short) {
+                    Some(found) => targets.push(found.clone()),
+                    None => {
+                        // A constraint that exists but cannot defer has its
+                        // own refusal.
+                        let exists = self.constraint_exists(&short)?;
+                        if exists {
+                            anyhow::bail!("constraint \"{short}\" is not deferrable");
+                        }
+                        anyhow::bail!("constraint \"{short}\" does not exist");
+                    }
+                }
+            }
+            targets
+        };
+        // `IMMEDIATE` enforces the constraints at once.
+        if !deferred {
+            for (name, deferrable, initially_deferred) in &targets {
+                let _ = deferrable;
+                let _ = initially_deferred;
+                self.check_constraint_named(ctx, name)?;
+            }
+        }
+        if let Some(txn) = self.active_txns.write().get_mut(&ctx.session_id) {
+            for (name, _, _) in &targets {
+                txn.constraint_modes.insert(name.clone(), deferred);
+            }
+        }
+        Ok(QueryOutput::tag("SET CONSTRAINTS"))
+    }
+
+    /// Whether any constraint of the catalog is named `name` (a unique /
+    /// primary key index or a foreign key).
+    fn constraint_exists(&self, name: &str) -> Result<bool> {
+        Ok(self
+            .catalog_reader
+            .list_all_tables("default")?
+            .iter()
+            .any(|table| {
+                table.indexes.iter().any(|i| i.name == name)
+                    || table.constraints.iter().any(|c| {
+                        matches!(c, nodus_catalog::TableConstraint::ForeignKey { .. })
+                            && c.effective_name(&table.name) == name
+                    })
+            }))
+    }
+
+    /// Enforces the constraint `name` over its table's rows at once
+    /// (`SET CONSTRAINTS ... IMMEDIATE`).
+    fn check_constraint_named(&self, ctx: &ExecutionContext, name: &str) -> Result<()> {
+        for table in self.catalog_reader.list_all_tables("default")? {
+            let named = table.indexes.iter().any(|i| i.unique && i.name == name)
+                || table.constraints.iter().any(|c| {
+                    matches!(c, nodus_catalog::TableConstraint::ForeignKey { .. })
+                        && c.effective_name(&table.name) == name
+                });
+            if named {
+                return self.check_table_named(ctx, &table, name);
+            }
+        }
+        Ok(())
+    }
+
+    /// One table's rows against the constraint `name` of it.
+    fn check_table_named(
+        &self,
+        ctx: &ExecutionContext,
+        table: &nodus_catalog::TableDescriptor,
+        name: &str,
+    ) -> Result<()> {
+        if table
+            .indexes
+            .iter()
+            .any(|i| i.index_type == nodus_catalog::IndexType::Primary && i.name == name)
+        {
+            return self.check_unique_holds(ctx, table, name, &Self::pk_positions_declared(table));
+        }
+        if let Some(index) = table
+            .indexes
+            .iter()
+            .find(|i| i.unique && i.name == name && !crate::index_keys::has_expressions(i))
+        {
+            let positions: Vec<usize> = index
+                .key_columns
+                .iter()
+                .filter_map(|key| table.columns.iter().position(|c| c.id == key.column_id))
+                .collect();
+            return self.check_unique_holds(ctx, table, &index.name, &positions);
+        }
+        for constraint in &table.constraints {
+            if matches!(
+                constraint,
+                nodus_catalog::TableConstraint::ForeignKey { .. }
+            ) && constraint.effective_name(&table.name) == name
+                && let Some(reference) = self.resolve_reference(table, constraint)?
+            {
+                return self.check_reference_holds(ctx, &reference);
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn exec_commit(&self, ctx: &ExecutionContext) -> Result<QueryOutput> {
-        let Some(txn) = self.active_txns.write().remove(&ctx.session_id) else {
+        if self.active_txns.read().get(&ctx.session_id).is_none() {
             self.notice(ctx, warning("there is no transaction in progress", "25P01"));
             return Ok(QueryOutput::tag("COMMIT"));
+        }
+        // Deferred constraints are enforced here, while the transaction's
+        // own writes are still visible to the checks: a violation fails the
+        // commit, and the transaction is lost, as in PostgreSQL.
+        let check = {
+            let guard = self.active_txns.read();
+            let txn = guard.get(&ctx.session_id).expect("checked above");
+            self.check_deferred_constraints(ctx, &txn.constraint_modes, &txn.deferred_tables)
         };
+        let txn = self
+            .active_txns
+            .write()
+            .remove(&ctx.session_id)
+            .expect("checked above");
+        if let Err(error) = check {
+            self.restore_settings(ctx, txn.settings_before.clone());
+            self.advisory.end_transaction(&ctx.session_id);
+            self.end_transaction_cursors(&ctx.session_id, txn.txn_id, false);
+            self.end_transaction_large_objects(&ctx.session_id);
+            let _ = self.txn.abort_txn(txn.txn_id);
+            let _ = self.kv.abort(txn.txn_id);
+            return Err(error);
+        }
         // A `SET LOCAL` and transaction-level advisory locks end with the
         // transaction.
         self.restore_settings(ctx, txn.local_settings.clone());

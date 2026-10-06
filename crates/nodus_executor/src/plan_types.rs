@@ -1329,6 +1329,15 @@ pub enum AlterTableOp {
         parent: String,
         partition: String,
     },
+    /// `ALTER TABLE t ALTER CONSTRAINT name ...`, written as the marker
+    /// call the parser lacks: the constraint's new `DEFERRABLE` /
+    /// `INITIALLY DEFERRED` (unmentioned characteristics take PostgreSQL's
+    /// defaults, so both are given).
+    AlterConstraint {
+        name: String,
+        deferrable: bool,
+        initially_deferred: bool,
+    },
 }
 
 /// A constraint `ALTER TABLE ... ADD` creates.
@@ -1343,10 +1352,22 @@ pub enum NewConstraint {
     Unique {
         name: Option<String>,
         columns: Vec<String>,
+        /// `DEFERRABLE`; defaulted so older plans decode.
+        #[serde(default)]
+        deferrable: bool,
+        /// `INITIALLY DEFERRED`; defaulted so older plans decode.
+        #[serde(default)]
+        initially_deferred: bool,
     },
     PrimaryKey {
         name: Option<String>,
         columns: Vec<String>,
+        /// `DEFERRABLE`; defaulted so older plans decode.
+        #[serde(default)]
+        deferrable: bool,
+        /// `INITIALLY DEFERRED`; defaulted so older plans decode.
+        #[serde(default)]
+        initially_deferred: bool,
     },
 }
 
@@ -1399,6 +1420,10 @@ pub enum LogicalPlan {
         /// their columns; the others get PostgreSQL's names.
         #[serde(default)]
         key_names: Vec<(Vec<String>, String)>,
+        /// Key constraints' `DEFERRABLE` / `INITIALLY DEFERRED`, by their
+        /// columns. Defaulted so older plans decode.
+        #[serde(default)]
+        key_flags: Vec<(Vec<String>, bool, bool)>,
         /// A temporary table's `ON COMMIT` action: `DROP` or `DELETE ROWS`.
         #[serde(default)]
         on_commit: Option<String>,
@@ -1762,6 +1787,13 @@ pub enum LogicalPlan {
         name: Option<String>,
     },
     /// `LOCK [TABLE] names [IN mode MODE] [NOWAIT]`.
+    /// `SET CONSTRAINTS {ALL | names} {DEFERRED | IMMEDIATE}`, changing the
+    /// timing of deferrable constraints for the current transaction.
+    SetConstraints {
+        all: bool,
+        names: Vec<String>,
+        deferred: bool,
+    },
     LockTable {
         tables: Vec<String>,
     },

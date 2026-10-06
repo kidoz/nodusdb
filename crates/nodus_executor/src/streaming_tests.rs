@@ -189,6 +189,7 @@ fn exec_with_rows(
             partition_by: None,
             partition_of: None,
             for_values: None,
+            key_flags: vec![],
         },
     )
     .unwrap();

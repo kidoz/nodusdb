@@ -871,6 +871,8 @@ impl MemExecutor {
                     referred_columns,
                     on_delete,
                     on_update,
+                    deferrable,
+                    initially_deferred,
                 } = constraint
                 else {
                     continue;
@@ -896,6 +898,8 @@ impl MemExecutor {
                             referred_columns: referred_columns.clone(),
                             on_delete: *on_delete,
                             on_update: *on_update,
+                            deferrable: *deferrable,
+                            initially_deferred: *initially_deferred,
                         },
                     },
                 )?;

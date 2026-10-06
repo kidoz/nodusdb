@@ -132,6 +132,14 @@ pub enum TableConstraint {
         /// What changing a referenced key does to the rows referencing it.
         #[serde(default)]
         on_update: ReferentialAction,
+        /// `DEFERRABLE`: the check may be deferred to `COMMIT` (by the
+        /// constraint's own `INITIALLY DEFERRED` or `SET CONSTRAINTS`).
+        #[serde(default)]
+        deferrable: bool,
+        /// `INITIALLY DEFERRED`: checked at `COMMIT` unless `SET
+        /// CONSTRAINTS` makes it immediate.
+        #[serde(default)]
+        initially_deferred: bool,
     },
 }
 
@@ -241,6 +249,13 @@ pub struct IndexDescriptor {
     /// index is named for the constraint, not for its columns).
     #[serde(default)]
     pub constraint: bool,
+    /// `DEFERRABLE`: the uniqueness check may be deferred to `COMMIT`.
+    #[serde(default)]
+    pub deferrable: bool,
+    /// `INITIALLY DEFERRED`: checked at `COMMIT` unless `SET CONSTRAINTS`
+    /// makes it immediate.
+    #[serde(default)]
+    pub initially_deferred: bool,
     pub global: bool,
     pub predicate: Option<Expression>,
     pub expressions: Vec<Expression>,

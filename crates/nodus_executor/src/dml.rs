@@ -407,7 +407,14 @@ impl MemExecutor {
     /// (PostgreSQL heap semantics) whatever other indexes it has. Everything
     /// that finds a row again goes by its stored key.
     pub(crate) fn uses_synthetic_rowid(tbl: &nodus_catalog::TableDescriptor) -> bool {
+        // A DEFERRABLE primary key cannot key the rows: two rows may hold the
+        // same key until the constraint is checked, so they need identities
+        // of their own.
         Self::pk_positions_declared(tbl).is_empty()
+            || tbl
+                .indexes
+                .iter()
+                .any(|i| i.index_type == nodus_catalog::IndexType::Primary && i.deferrable)
     }
 
     /// Renders a row's primary-key string from the given column positions. A
@@ -1466,6 +1473,14 @@ impl MemExecutor {
         target: Option<&crate::plan_types::ConflictTarget>,
     ) -> Result<Option<(String, Vec<Value>)>> {
         use crate::plan_types::ConflictTarget;
+        // PostgreSQL refuses deferrable constraints as arbiters.
+        if tbl.indexes.iter().any(|i| i.unique && i.deferrable) {
+            anyhow::bail!(crate::error_fields::DbError::new(
+                "ON CONFLICT does not support deferrable unique constraints/exclusion constraints as arbiters"
+            )
+            .code("0A000")
+            .into_text());
+        }
         let primary = tbl
             .indexes
             .iter()

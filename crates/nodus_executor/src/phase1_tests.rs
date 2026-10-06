@@ -50,6 +50,7 @@ fn test_offset_distinct_returning() {
             partition_by: None,
             partition_of: None,
             for_values: None,
+            key_flags: vec![],
         },
     )
     .unwrap();

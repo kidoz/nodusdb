@@ -3041,6 +3041,7 @@ impl MemExecutor {
                         referred_columns,
                         on_delete,
                         on_update,
+                        ..
                     } => {
                         let conname = name.clone().unwrap_or_else(|| {
                             format!("{}_{}_fkey", table.name, columns.join("_"))
@@ -3519,6 +3520,7 @@ impl MemExecutor {
                         referred_columns,
                         on_delete,
                         on_update,
+                        ..
                     } => {
                         let name = name.clone().unwrap_or_else(|| {
                             format!("{}_{}_fkey", table.name, columns.join("_"))

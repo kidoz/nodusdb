@@ -17,6 +17,10 @@ pub(crate) struct Reference {
     pub(crate) parent_positions: Vec<usize>,
     pub(crate) on_delete: ReferentialAction,
     pub(crate) on_update: ReferentialAction,
+    /// `DEFERRABLE INITIALLY DEFERRED` of the constraint (a `NO ACTION`
+    /// check may then wait for `COMMIT`).
+    pub(crate) deferrable: bool,
+    pub(crate) initially_deferred: bool,
 }
 
 /// A table's columns and the keys a foreign key may reference: its
@@ -94,7 +98,7 @@ fn same_key(a: &[Value], b: &[Value]) -> bool {
 }
 
 /// A key as a set member: equal keys give equal strings.
-fn key_string(key: &[Value]) -> String {
+pub(crate) fn key_string(key: &[Value]) -> String {
     key.iter()
         .map(|v| render(&crate::value::key_form(v)))
         .collect::<Vec<_>>()
@@ -119,6 +123,8 @@ impl MemExecutor {
             referred_columns,
             on_delete,
             on_update,
+            deferrable,
+            initially_deferred,
         } = fk
         else {
             return Ok(fk);
@@ -166,6 +172,56 @@ impl MemExecutor {
                 "there is no unique constraint matching given keys for referenced table \"{table}\""
             );
         }
+        // The referenced key may not be a deferrable one.
+        if let Some(parent) = &parent {
+            let names_of = |i: &nodus_catalog::IndexDescriptor| -> Vec<String> {
+                let mut names: Vec<String> = i
+                    .key_columns
+                    .iter()
+                    .filter_map(|k| {
+                        parent
+                            .columns
+                            .iter()
+                            .find(|c| c.id == k.column_id)
+                            .map(|c| c.name.clone())
+                    })
+                    .collect();
+                names.sort_unstable();
+                names
+            };
+            let mut referred = referred_columns.clone();
+            referred.sort_unstable();
+            let primary: Vec<&nodus_catalog::IndexDescriptor> = parent
+                .indexes
+                .iter()
+                .filter(|i| i.index_type == nodus_catalog::IndexType::Primary)
+                .collect();
+            let primary_deferrable = primary.iter().any(|i| i.deferrable);
+            let deferrable_keys: Vec<Vec<String>> = parent
+                .indexes
+                .iter()
+                .filter(|i| i.unique && i.deferrable)
+                .map(&names_of)
+                .collect();
+            // A composite primary key is one index per column; its whole
+            // column set counts as the key.
+            if primary_deferrable {
+                let mut whole: Vec<String> =
+                    primary.iter().flat_map(|i| names_of(i)).collect::<Vec<_>>();
+                whole.sort_unstable();
+                whole.dedup();
+                if whole == referred {
+                    anyhow::bail!(
+                        "cannot use a deferrable unique constraint for referenced table \"{table}\""
+                    );
+                }
+            }
+            if deferrable_keys.iter().any(|key| *key == referred) {
+                anyhow::bail!(
+                    "cannot use a deferrable unique constraint for referenced table \"{table}\""
+                );
+            }
+        }
         Ok(TableConstraint::ForeignKey {
             name: Some(name.unwrap_or_else(|| foreign_key_name(&child.name, &columns))),
             columns,
@@ -173,6 +229,8 @@ impl MemExecutor {
             referred_columns,
             on_delete,
             on_update,
+            deferrable,
+            initially_deferred,
         })
     }
 
@@ -184,8 +242,56 @@ impl MemExecutor {
             .unwrap_or_else(|_| "public".to_string())
     }
 
+    /// Re-checks a deferred foreign key: every row of the child table must
+    /// find its referenced key (PostgreSQL raises the violation when the
+    /// constraint stops being deferred).
+    pub(crate) fn check_reference_holds(
+        &self,
+        ctx: &ExecutionContext,
+        reference: &Reference,
+    ) -> Result<()> {
+        let keys: std::collections::HashSet<String> = self
+            .scan_rows(reference.parent.id, &ctx.session_id)?
+            .iter()
+            .filter_map(|row| key_tuple(row, &reference.parent_positions))
+            .map(|key| key_string(&key))
+            .collect();
+        for row in self.scan_rows(reference.child.id, &ctx.session_id)? {
+            let Some(tuple) = key_tuple(&row, &reference.child_positions) else {
+                continue;
+            };
+            if !keys.contains(&key_string(&tuple)) {
+                return Err(self.missing_key_error(&reference.child, reference, &tuple));
+            }
+        }
+        Ok(())
+    }
+
+    /// The error for a child row whose referenced key does not exist.
+    fn missing_key_error(
+        &self,
+        child: &TableDescriptor,
+        reference: &Reference,
+        key: &[Value],
+    ) -> anyhow::Error {
+        DbError::new(format!(
+            "insert or update on table \"{}\" violates foreign key constraint \"{}\"",
+            child.name, reference.name
+        ))
+        .detail(format!(
+            "Key ({})=({}) is not present in table \"{}\".",
+            listed_columns(child, &reference.child_positions),
+            listed(key),
+            reference.parent.name
+        ))
+        .schema(self.schema_name_of(child))
+        .table(&child.name)
+        .constraint(&reference.name)
+        .into()
+    }
+
     /// `fk`, a foreign key of `child`, resolved against the table it names.
-    fn resolve_reference(
+    pub(crate) fn resolve_reference(
         &self,
         child: &TableDescriptor,
         fk: &TableConstraint,
@@ -197,6 +303,8 @@ impl MemExecutor {
             referred_columns,
             on_delete,
             on_update,
+            deferrable,
+            initially_deferred,
         } = fk
         else {
             return Ok(None);
@@ -245,6 +353,8 @@ impl MemExecutor {
             parent_positions,
             on_delete: *on_delete,
             on_update: *on_update,
+            deferrable: *deferrable,
+            initially_deferred: *initially_deferred,
         }))
     }
 
@@ -294,6 +404,16 @@ impl MemExecutor {
             let Some(reference) = self.resolve_reference(tbl, constraint)? else {
                 continue;
             };
+            // A deferred key is checked when the transaction commits.
+            if self.constraint_deferred(
+                &ctx.session_id,
+                &reference.name,
+                reference.deferrable,
+                reference.initially_deferred,
+            ) {
+                self.note_deferred_write(&ctx.session_id, tbl.id);
+                continue;
+            }
             let Some(key) = key_tuple(row, &reference.child_positions) else {
                 continue;
             };
@@ -318,20 +438,7 @@ impl MemExecutor {
                         .is_some_and(|k| same_key(&k, &key))
                 });
             if !found {
-                return Err(DbError::new(format!(
-                    "insert or update on table \"{}\" violates foreign key constraint \"{}\"",
-                    tbl.name, reference.name
-                ))
-                .detail(format!(
-                    "Key ({})=({}) is not present in table \"{}\".",
-                    listed_columns(tbl, &reference.child_positions),
-                    listed(&key),
-                    reference.parent.name
-                ))
-                .schema(self.schema_name_of(tbl))
-                .table(&tbl.name)
-                .constraint(&reference.name)
-                .into());
+                return Err(self.missing_key_error(tbl, &reference, &key));
             }
         }
         Ok(())
@@ -472,8 +579,17 @@ impl MemExecutor {
             }
         }
         // NO ACTION: at the end of the statement no row may reference a key
-        // that is gone.
+        // that is gone — a deferred key waits for COMMIT instead.
         for reference in unresolved {
+            if self.constraint_deferred(
+                &ctx.session_id,
+                &reference.name,
+                reference.deferrable,
+                reference.initially_deferred,
+            ) {
+                self.note_deferred_write(&ctx.session_id, reference.child.id);
+                continue;
+            }
             let keys: std::collections::HashSet<String> = self
                 .scan_rows(tbl.id, &ctx.session_id)?
                 .iter()

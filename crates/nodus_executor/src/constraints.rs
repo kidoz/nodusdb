@@ -29,6 +29,16 @@ impl MemExecutor {
                 && idx.index_type != nodus_catalog::IndexType::Primary
                 && !crate::index_keys::has_expressions(idx)
         }) {
+            // A deferred constraint is checked when the transaction commits.
+            if self.constraint_deferred(
+                &ctx.session_id,
+                &idx.name,
+                idx.deferrable,
+                idx.initially_deferred,
+            ) {
+                self.note_deferred_write(&ctx.session_id, tbl.id);
+                continue;
+            }
             let positions: Vec<usize> = idx
                 .key_columns
                 .iter()
@@ -47,7 +57,22 @@ impl MemExecutor {
             }
             unique_keys.push((idx.name.as_str(), positions, predicate));
         }
-        let pk_positions = Self::pk_positions_declared(tbl);
+        let mut pk_positions = Self::pk_positions_declared(tbl);
+        if !pk_positions.is_empty()
+            && let Some(primary) = tbl
+                .indexes
+                .iter()
+                .find(|i| i.index_type == nodus_catalog::IndexType::Primary)
+            && self.constraint_deferred(
+                &ctx.session_id,
+                &primary.name,
+                primary.deferrable,
+                primary.initially_deferred,
+            )
+        {
+            self.note_deferred_write(&ctx.session_id, tbl.id);
+            pk_positions = Vec::new();
+        }
         let new_pk = key_tuple(new_row, &pk_positions);
         if unique_keys.is_empty() && pk_positions.is_empty() {
             return Ok(());
@@ -163,7 +188,13 @@ impl MemExecutor {
         {
             return Ok(Some(Vec::new()));
         }
-        let declared = Self::pk_positions_declared(tbl);
+        // A table whose rows have synthetic identities (no primary key, or a
+        // deferrable one) has no row stored under its key's text.
+        let declared = if Self::uses_synthetic_rowid(tbl) {
+            Vec::new()
+        } else {
+            Self::pk_positions_declared(tbl)
+        };
         if !declared.is_empty() && positions == declared.as_slice() {
             // A row is stored under its key's text, which only these types
             // spell one way.
@@ -367,6 +398,42 @@ impl MemExecutor {
 impl MemExecutor {
     /// The error for a row whose key `positions` duplicates another's under
     /// unique constraint `name`.
+    /// Re-checks a deferred unique or primary key against the table's rows:
+    /// any two rows sharing a key are PostgreSQL's duplicate-key violation
+    /// (raised when the constraint stops being deferred).
+    pub(crate) fn check_unique_holds(
+        &self,
+        ctx: &ExecutionContext,
+        tbl: &nodus_catalog::TableDescriptor,
+        name: &str,
+        positions: &[usize],
+    ) -> Result<()> {
+        let col_names: Vec<String> = tbl.columns.iter().map(|c| c.name.clone()).collect();
+        let predicate = tbl
+            .indexes
+            .iter()
+            .find(|i| i.name == name)
+            .and_then(|i| i.predicate.as_ref())
+            .map(|p| self.index_predicate(&p.sql))
+            .transpose()?;
+        let mut seen = std::collections::HashSet::new();
+        for (_key, row) in self.scan_rows_keyed(tbl.id, &ctx.session_id)? {
+            // A key with a NULL never collides.
+            let Some(tuple) = key_tuple(&row, positions) else {
+                continue;
+            };
+            if let Some(filter) = &predicate
+                && self.eval_filter(ctx, &row, &col_names, &tbl.columns, Some(filter)) != Some(true)
+            {
+                continue;
+            }
+            if !seen.insert(crate::referential::key_string(&tuple)) {
+                return Err(self.duplicate_key(tbl, name, positions, &row));
+            }
+        }
+        Ok(())
+    }
+
     fn duplicate_key(
         &self,
         tbl: &nodus_catalog::TableDescriptor,

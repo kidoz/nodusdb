@@ -3328,6 +3328,16 @@ pub const ATTACH_PARTITION_FUNCTION: &str = "pg_catalog.nodus_attach_partition";
 /// — `SELECT pg_catalog.nodus_detach_partition('parent', 'child')`.
 pub const DETACH_PARTITION_FUNCTION: &str = "pg_catalog.nodus_detach_partition";
 
+/// The function `SET CONSTRAINTS {ALL | names} {DEFERRED | IMMEDIATE}` is
+/// written as — `SELECT pg_catalog.nodus_set_constraints(true, 'deferred',
+/// '')` — since the parser reads `SET CONSTRAINTS` as a variable SET.
+pub const SET_CONSTRAINTS_FUNCTION: &str = "pg_catalog.nodus_set_constraints";
+
+/// The function `ALTER TABLE t ALTER CONSTRAINT name ...` is written as —
+/// `SELECT pg_catalog.nodus_alter_constraint('t', 'name', true, true)` —
+/// since the parser has no `ALTER CONSTRAINT`.
+pub const ALTER_CONSTRAINT_FUNCTION: &str = "pg_catalog.nodus_alter_constraint";
+
 /// The function `(value).*` — a record expanded into its fields — is
 /// written as — `pg_catalog.nodus_expand_record(value)` — since the parser
 /// has no `.*` after a parenthesized expression.
@@ -3484,6 +3494,81 @@ fn rewrite_statement_form(
                 "SELECT {SET_SCHEMA_FUNCTION}('{kind}', {if_exists}, '{}', '{}')",
                 quote(name.trim()),
                 quote(&schema)
+            );
+            if let Some(mut tokens) = snippet_tokens(&sql) {
+                tokens.extend(tail(&statement));
+                return tokens;
+            }
+            return statement;
+        }
+    }
+
+    // `SET CONSTRAINTS {ALL | name [, ...]} {DEFERRED | IMMEDIATE}`.
+    if is(0, "set") && is(1, "constraints") && n >= 4 {
+        let mut at = 2;
+        let all = is(at, "all");
+        if all {
+            at += 1;
+        }
+        let mode_at = n - 1;
+        let mode = render_tokens(&statement[significant[mode_at]..=significant[mode_at]]);
+        let names = if all {
+            String::new()
+        } else {
+            render_tokens(&statement[significant[at]..=significant[mode_at - 1]])
+        };
+        let sql = format!(
+            "SELECT {SET_CONSTRAINTS_FUNCTION}({all}, '{}', '{}')",
+            quote(mode.trim()),
+            quote(names.trim())
+        );
+        if let Some(mut tokens) = snippet_tokens(&sql) {
+            tokens.extend(tail(&statement));
+            return tokens;
+        }
+        return statement;
+    }
+
+    // `ALTER TABLE [ONLY] t ALTER CONSTRAINT name ...`.
+    if is(0, "alter") && is(1, "table") && n >= 6 {
+        let at = if is(2, "only") { 3 } else { 2 };
+        let keyword = (at..n - 1).find(|&k| is(k, "alter") && is(k + 1, "constraint"));
+        if let Some(k) = keyword {
+            let name = render_tokens(&statement[significant[at]..=significant[k - 1]]);
+            let constraint = match &statement[significant[k + 2]].token {
+                Token::Word(w) => w.value.clone(),
+                other => other.to_string(),
+            };
+            // The characteristics: absent ones keep PostgreSQL's defaults
+            // (`NOT DEFERRABLE`, `INITIALLY IMMEDIATE`). Anything else is
+            // left to the parser's own error.
+            let (mut deferrable, mut initially) = (false, false);
+            let mut c = k + 3;
+            let mut ok = true;
+            while c < n && ok {
+                if is(c, "not") && is(c + 1, "deferrable") {
+                    deferrable = false;
+                    c += 2;
+                } else if is(c, "deferrable") {
+                    deferrable = true;
+                    c += 1;
+                } else if is(c, "initially") && is(c + 1, "deferred") {
+                    deferrable = true;
+                    initially = true;
+                    c += 2;
+                } else if is(c, "initially") && is(c + 1, "immediate") {
+                    c += 2;
+                } else {
+                    ok = false;
+                }
+            }
+            if !ok {
+                return statement;
+            }
+            let sql = format!(
+                "SELECT {ALTER_CONSTRAINT_FUNCTION}('{}', '{}', {deferrable}, {initially})",
+                quote(name.trim()),
+                quote(&constraint)
             );
             if let Some(mut tokens) = snippet_tokens(&sql) {
                 tokens.extend(tail(&statement));

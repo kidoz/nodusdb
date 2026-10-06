@@ -22,7 +22,11 @@ impl MemExecutor {
         mut columns: Vec<ColumnDef>,
         constraints: Vec<nodus_catalog::TableConstraint>,
         if_not_exists: bool,
-        (unique_constraints, key_names): (Vec<Vec<String>>, Vec<(Vec<String>, String)>),
+        (unique_constraints, key_names, key_flags): (
+            Vec<Vec<String>>,
+            Vec<(Vec<String>, String)>,
+            Vec<(Vec<String>, bool, bool)>,
+        ),
         materialized_query: Option<String>,
         inherits: Vec<String>,
         partition: (Option<String>, Option<String>, Option<String>),
@@ -33,6 +37,17 @@ impl MemExecutor {
                 (key.len() == columns.len() && key.iter().all(|k| columns.contains(k)))
                     .then(|| name.clone())
             })
+        };
+        // The `DEFERRABLE` `(deferrable, initially deferred)` of the key over
+        // `columns`, if it was marked so.
+        let key_flags = |columns: &[String]| -> (bool, bool) {
+            key_flags
+                .iter()
+                .find(|(key, _, _)| {
+                    key.len() == columns.len() && key.iter().all(|k| columns.contains(k))
+                })
+                .map(|(_, deferrable, initially)| (*deferrable, *initially))
+                .unwrap_or((false, false))
         };
         let primary_columns: Vec<String> = columns
             .iter()
@@ -267,7 +282,8 @@ impl MemExecutor {
                     .map(|ids| {
                         let name = key_name(names)
                             .unwrap_or_else(|| format!("{table_only}_{}_key", names.join("_")));
-                        (name, ids)
+                        let flags = key_flags(names);
+                        (name, ids, flags)
                     })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -286,7 +302,15 @@ impl MemExecutor {
             partition_bound: partition_bound_text.clone(),
         })?;
 
+        // A composite primary key is one index per column, but its
+        // deferrability belongs to the whole key.
+        let primary_flags = key_flags(&primary_columns);
         for (col, primary) in unique_cols {
+            let (deferrable, initially_deferred) = if primary {
+                primary_flags
+            } else {
+                key_flags(std::slice::from_ref(&col.name))
+            };
             let index = nodus_catalog::IndexDescriptor {
                 id: nodus_catalog::IndexId::new(),
                 name: if primary {
@@ -312,6 +336,8 @@ impl MemExecutor {
                 include_columns: vec![],
                 unique: true,
                 constraint: true,
+                deferrable,
+                initially_deferred,
                 global: false,
                 predicate: None,
                 expressions: vec![],
@@ -323,7 +349,7 @@ impl MemExecutor {
                 },
             )?;
         }
-        for (name, column_ids) in unique_groups {
+        for (name, column_ids, flags) in unique_groups {
             let index = nodus_catalog::IndexDescriptor {
                 id: nodus_catalog::IndexId::new(),
                 name,
@@ -343,6 +369,8 @@ impl MemExecutor {
                 include_columns: vec![],
                 unique: true,
                 constraint: true,
+                deferrable: flags.0,
+                initially_deferred: flags.1,
                 global: false,
                 predicate: None,
                 expressions: vec![],
@@ -465,6 +493,8 @@ impl MemExecutor {
                 include_columns: vec![],
                 unique: index.unique,
                 constraint: index.constraint,
+                deferrable: index.deferrable,
+                initially_deferred: index.initially_deferred,
                 global: index.global,
                 predicate: index.predicate.clone(),
                 expressions: index.expressions.clone(),
@@ -1286,6 +1316,8 @@ impl MemExecutor {
             state: DescriptorState::Public,
             unique: index_type != nodus_catalog::IndexType::LocalSecondary,
             constraint,
+            deferrable: false,
+            initially_deferred: false,
             index_type,
             index_state: nodus_catalog::IndexState::Creating,
             key_columns,

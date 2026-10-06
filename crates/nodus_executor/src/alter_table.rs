@@ -337,6 +337,16 @@ impl MemExecutor {
                 }
                 self.detach_partition(ctx, tbl, &parent, &partition)
             }
+            AlterTableOp::AlterConstraint {
+                name,
+                deferrable,
+                initially_deferred,
+            } => {
+                if propagated {
+                    return Ok(());
+                }
+                self.alter_constraint(tbl, &name, deferrable, initially_deferred)
+            }
             AlterTableOp::Inherit { parent, attach } => {
                 // A link belongs to the table the statement names.
                 if propagated {
@@ -490,6 +500,60 @@ impl MemExecutor {
         })?;
         self.create_partition_indexes(&child, parent)?;
         Ok(())
+    }
+
+    /// `ALTER TABLE t ALTER CONSTRAINT name ...`: a foreign key's
+    /// `DEFERRABLE` / `INITIALLY DEFERRED` change (PostgreSQL allows no
+    /// other constraint kind here).
+    fn alter_constraint(
+        &self,
+        tbl: &TableDescriptor,
+        name: &str,
+        deferrable: bool,
+        initially_deferred: bool,
+    ) -> Result<()> {
+        // A unique or primary key index of the table is no foreign key.
+        if tbl.indexes.iter().any(|i| i.name == name) {
+            anyhow::bail!(
+                "constraint \"{name}\" of relation \"{}\" is not a foreign key constraint",
+                tbl.name
+            );
+        }
+        for constraint in &tbl.constraints {
+            if constraint.effective_name(&tbl.name) != name {
+                continue;
+            }
+            let TableConstraint::ForeignKey {
+                name,
+                columns,
+                foreign_table,
+                referred_columns,
+                on_delete,
+                on_update,
+                ..
+            } = constraint
+            else {
+                anyhow::bail!(
+                    "constraint \"{name}\" of relation \"{}\" is not a foreign key constraint",
+                    tbl.name
+                );
+            };
+            let updated = TableConstraint::ForeignKey {
+                name: name.clone(),
+                columns: columns.clone(),
+                foreign_table: foreign_table.clone(),
+                referred_columns: referred_columns.clone(),
+                on_delete: *on_delete,
+                on_update: *on_update,
+                deferrable,
+                initially_deferred,
+            };
+            return self.replace_constraint(tbl, constraint, updated);
+        }
+        anyhow::bail!(
+            "constraint \"{name}\" of relation \"{}\" does not exist",
+            tbl.name
+        )
     }
 
     /// `ALTER TABLE parent DETACH PARTITION child`: the child keeps its rows
@@ -947,6 +1011,8 @@ impl MemExecutor {
                     referred_columns,
                     on_delete,
                     on_update,
+                    deferrable,
+                    initially_deferred,
                 } if columns.iter().any(|c| c == old)
                     || (names_table(foreign_table, &tbl.name)
                         && referred_columns.iter().any(|c| c == old)) =>
@@ -963,6 +1029,8 @@ impl MemExecutor {
                         },
                         on_delete: *on_delete,
                         on_update: *on_update,
+                        deferrable: *deferrable,
+                        initially_deferred: *initially_deferred,
                     }
                 }
                 _ => continue,
@@ -982,6 +1050,8 @@ impl MemExecutor {
                     referred_columns,
                     on_delete,
                     on_update,
+                    deferrable,
+                    initially_deferred,
                 } = constraint
                     && names_table(foreign_table, &tbl.name)
                     && referred_columns.iter().any(|c| c == old)
@@ -993,6 +1063,8 @@ impl MemExecutor {
                         referred_columns: rename(referred_columns),
                         on_delete: *on_delete,
                         on_update: *on_update,
+                        deferrable: *deferrable,
+                        initially_deferred: *initially_deferred,
                     };
                     self.replace_constraint(&child, constraint, renamed)?;
                 }
@@ -1087,6 +1159,8 @@ impl MemExecutor {
                     referred_columns,
                     on_delete,
                     on_update,
+                    deferrable,
+                    initially_deferred,
                 } = constraint
                     && names_table(foreign_table, &tbl.name)
                 {
@@ -1103,6 +1177,8 @@ impl MemExecutor {
                         referred_columns: referred_columns.clone(),
                         on_delete: *on_delete,
                         on_update: *on_update,
+                        deferrable: *deferrable,
+                        initially_deferred: *initially_deferred,
                     };
                     self.replace_constraint(&child, constraint, renamed)?;
                 }
@@ -1178,7 +1254,12 @@ impl MemExecutor {
                     constraint: fk,
                 })
             }
-            NewConstraint::Unique { name, columns } => {
+            NewConstraint::Unique {
+                name,
+                columns,
+                deferrable,
+                initially_deferred,
+            } => {
                 let name = match name {
                     Some(name) => name,
                     None => self.unused_relation_name(&format!(
@@ -1191,10 +1272,18 @@ impl MemExecutor {
                 if self.relation_name_taken(&name)? {
                     anyhow::bail!("relation \"{name}\" already exists");
                 }
-                let index = Self::new_index(tbl, name, IndexType::Unique, &columns, None, true)?;
+                let mut index =
+                    Self::new_index(tbl, name, IndexType::Unique, &columns, None, true)?;
+                index.deferrable = deferrable;
+                index.initially_deferred = initially_deferred;
                 self.add_index(ctx, tbl, index)
             }
-            NewConstraint::PrimaryKey { name, columns } => {
+            NewConstraint::PrimaryKey {
+                name,
+                columns,
+                deferrable,
+                initially_deferred,
+            } => {
                 if !Self::pk_positions_declared(tbl).is_empty() {
                     anyhow::bail!(
                         "multiple primary keys for table \"{}\" are not allowed",
@@ -1233,7 +1322,7 @@ impl MemExecutor {
                 // One primary index per column, as CREATE TABLE stores a
                 // primary key.
                 for column in &columns {
-                    let index = Self::new_index(
+                    let mut index = Self::new_index(
                         tbl,
                         name.clone(),
                         IndexType::Primary,
@@ -1241,6 +1330,8 @@ impl MemExecutor {
                         None,
                         true,
                     )?;
+                    index.deferrable = deferrable;
+                    index.initially_deferred = initially_deferred;
                     self.install_index(ctx, tbl, index)?;
                 }
                 let after = self.catalog_reader.get_table_by_id(tbl.id)?;
@@ -1401,6 +1492,8 @@ impl MemExecutor {
                     referred_columns,
                     on_delete,
                     on_update,
+                    deferrable,
+                    initially_deferred,
                     ..
                 } => TableConstraint::ForeignKey {
                     name: Some(new.to_string()),
@@ -1409,6 +1502,8 @@ impl MemExecutor {
                     referred_columns,
                     on_delete,
                     on_update,
+                    deferrable,
+                    initially_deferred,
                 },
             };
             return self.replace_constraint(tbl, constraint, renamed);

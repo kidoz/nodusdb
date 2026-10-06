@@ -52,6 +52,7 @@ fn test_group_by_aggregates() {
             partition_by: None,
             partition_of: None,
             for_values: None,
+            key_flags: vec![],
         },
     )
     .unwrap();
@@ -284,6 +285,7 @@ fn test_set_operations() {
                 partition_by: None,
                 partition_of: None,
                 for_values: None,
+                key_flags: vec![],
             },
         )
         .unwrap();
@@ -385,6 +387,7 @@ fn test_cross_join() {
                 partition_by: None,
                 partition_of: None,
                 for_values: None,
+                key_flags: vec![],
             },
         )
         .unwrap();
@@ -455,6 +458,7 @@ fn test_having() {
             partition_by: None,
             partition_of: None,
             for_values: None,
+            key_flags: vec![],
         },
     )
     .unwrap();
@@ -551,6 +555,7 @@ fn test_window_functions() {
             partition_by: None,
             partition_of: None,
             for_values: None,
+            key_flags: vec![],
         },
     )
     .unwrap();

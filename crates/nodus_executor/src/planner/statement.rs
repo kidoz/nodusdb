@@ -97,6 +97,9 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
             let mut tbl_constraints = Vec::new();
             // The names given to key constraints, by their columns.
             let mut key_names: Vec<(Vec<String>, String)> = Vec::new();
+            // Key constraints' `DEFERRABLE` / `INITIALLY DEFERRED`, by their
+            // columns.
+            let mut key_flags: Vec<(Vec<String>, bool, bool)> = Vec::new();
             for c in columns {
                 let mut nullable = true;
                 let mut unique = false;
@@ -235,17 +238,25 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                             default = Some(lowered);
                         }
                         // `PRIMARY KEY` column option implies unique + not-null.
-                        sqlparser::ast::ColumnOption::PrimaryKey(_) => {
+                        sqlparser::ast::ColumnOption::PrimaryKey(pk) => {
                             if let Some(name) = &opt.name {
                                 key_names.push((vec![c.name.value.clone()], name.value.clone()));
+                            }
+                            let flags = deferral(&pk.characteristics)?;
+                            if flags != (false, false) {
+                                key_flags.push((vec![c.name.value.clone()], flags.0, flags.1));
                             }
                             unique = true;
                             nullable = false;
                             primary = true;
                         }
-                        sqlparser::ast::ColumnOption::Unique(_) => {
+                        sqlparser::ast::ColumnOption::Unique(uc) => {
                             if let Some(name) = &opt.name {
                                 key_names.push((vec![c.name.value.clone()], name.value.clone()));
+                            }
+                            let flags = deferral(&uc.characteristics)?;
+                            if flags != (false, false) {
+                                key_flags.push((vec![c.name.value.clone()], flags.0, flags.1));
                             }
                             unique = true;
                         }
@@ -285,6 +296,10 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                         if let Some(name) = &uc.name {
                             key_names.push((names.clone(), name.value.clone()));
                         }
+                        let flags = deferral(&uc.characteristics)?;
+                        if flags != (false, false) {
+                            key_flags.push((names.clone(), flags.0, flags.1));
+                        }
                         if let [col] = names.as_slice() {
                             if let Some(c) = cols.iter_mut().find(|c| &c.name == col) {
                                 c.unique = true;
@@ -297,6 +312,11 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                     sqlparser::ast::TableConstraint::PrimaryKey(pk) => {
                         if let Some(name) = &pk.name {
                             key_names.push((index_column_names(&pk.columns), name.value.clone()));
+                        }
+                        let flags = deferral(&pk.characteristics)?;
+                        if flags != (false, false) {
+                            let names = index_column_names(&pk.columns);
+                            key_flags.push((names, flags.0, flags.1));
                         }
                         for col in index_column_names(&pk.columns) {
                             if let Some(c) = cols.iter_mut().find(|c| c.name == col) {
@@ -331,6 +351,7 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                 if_not_exists: create_table.if_not_exists,
                 unique_constraints,
                 key_names,
+                key_flags,
                 on_commit: match create_table.on_commit {
                     Some(sqlparser::ast::OnCommit::Drop) => Some("DROP".to_string()),
                     Some(sqlparser::ast::OnCommit::DeleteRows) => Some("DELETE ROWS".to_string()),
@@ -832,6 +853,52 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                     only: false,
                 }),
                 _ => anyhow::bail!("malformed INHERIT"),
+            }
+        }
+        Statement::Query(query)
+            if rewritten_call(query, nodus_sql::SET_CONSTRAINTS_FUNCTION).is_some() =>
+        {
+            match rewritten_call(query, nodus_sql::SET_CONSTRAINTS_FUNCTION).as_deref() {
+                Some(
+                    [
+                        crate::Value::Bool(all),
+                        crate::Value::Text(mode),
+                        crate::Value::Text(names),
+                    ],
+                ) => Ok(LogicalPlan::SetConstraints {
+                    all: *all,
+                    names: names
+                        .split(',')
+                        .map(|n| n.trim().to_string())
+                        .filter(|n| !n.is_empty())
+                        .collect(),
+                    deferred: mode.eq_ignore_ascii_case("deferred"),
+                }),
+                _ => anyhow::bail!("malformed SET CONSTRAINTS"),
+            }
+        }
+        Statement::Query(query)
+            if rewritten_call(query, nodus_sql::ALTER_CONSTRAINT_FUNCTION).is_some() =>
+        {
+            match rewritten_call(query, nodus_sql::ALTER_CONSTRAINT_FUNCTION).as_deref() {
+                Some(
+                    [
+                        crate::Value::Text(table),
+                        crate::Value::Text(name),
+                        crate::Value::Bool(deferrable),
+                        crate::Value::Bool(initially_deferred),
+                    ],
+                ) => Ok(LogicalPlan::AlterTable {
+                    table_name: table.clone(),
+                    operations: vec![AlterTableOp::AlterConstraint {
+                        name: name.clone(),
+                        deferrable: *deferrable,
+                        initially_deferred: *initially_deferred,
+                    }],
+                    if_exists: false,
+                    only: false,
+                }),
+                _ => anyhow::bail!("malformed ALTER CONSTRAINT"),
             }
         }
         Statement::Query(query)
@@ -1957,15 +2024,23 @@ fn plan_alter_table_op(
                             anyhow::anyhow!("Unsupported DEFAULT expression for column {column}")
                         })?);
                     }
-                    ColumnOption::Unique(_) => constraints.push(NewConstraint::Unique {
-                        name,
-                        columns: vec![column.clone()],
-                    }),
-                    ColumnOption::PrimaryKey(_) => {
+                    ColumnOption::Unique(uc) => {
+                        let (deferrable, initially_deferred) = deferral(&uc.characteristics)?;
+                        constraints.push(NewConstraint::Unique {
+                            name,
+                            columns: vec![column.clone()],
+                            deferrable,
+                            initially_deferred,
+                        })
+                    }
+                    ColumnOption::PrimaryKey(pk) => {
                         nullable = false;
+                        let (deferrable, initially_deferred) = deferral(&pk.characteristics)?;
                         constraints.push(NewConstraint::PrimaryKey {
                             name,
                             columns: vec![column.clone()],
+                            deferrable,
+                            initially_deferred,
                         });
                     }
                     ColumnOption::Check(check) => {
@@ -2079,14 +2154,24 @@ fn plan_alter_table_op(
                         expr: check.expr.to_string(),
                     }
                 }
-                C::Unique(unique) => NewConstraint::Unique {
-                    name: unique.name.as_ref().map(|n| n.value.clone()),
-                    columns: index_column_names(&unique.columns),
-                },
-                C::PrimaryKey(pk) => NewConstraint::PrimaryKey {
-                    name: pk.name.as_ref().map(|n| n.value.clone()),
-                    columns: index_column_names(&pk.columns),
-                },
+                C::Unique(unique) => {
+                    let (deferrable, initially_deferred) = deferral(&unique.characteristics)?;
+                    NewConstraint::Unique {
+                        name: unique.name.as_ref().map(|n| n.value.clone()),
+                        columns: index_column_names(&unique.columns),
+                        deferrable,
+                        initially_deferred,
+                    }
+                }
+                C::PrimaryKey(pk) => {
+                    let (deferrable, initially_deferred) = deferral(&pk.characteristics)?;
+                    NewConstraint::PrimaryKey {
+                        name: pk.name.as_ref().map(|n| n.value.clone()),
+                        columns: index_column_names(&pk.columns),
+                        deferrable,
+                        initially_deferred,
+                    }
+                }
                 C::ForeignKey(fk) => NewConstraint::ForeignKey(foreign_key(
                     fk.name.as_ref(),
                     fk.columns.iter().map(|c| c.value.clone()).collect(),
@@ -2153,6 +2238,7 @@ fn foreign_key(
         Some(sqlparser::ast::ReferentialAction::SetNull) => A::SetNull,
         Some(sqlparser::ast::ReferentialAction::SetDefault) => A::SetDefault,
     };
+    let (deferrable, initially_deferred) = deferral(&fk.characteristics)?;
     Ok(nodus_catalog::TableConstraint::ForeignKey {
         name: name.map(|n| n.value.clone()),
         columns,
@@ -2164,7 +2250,29 @@ fn foreign_key(
             .collect(),
         on_delete: action(fk.on_delete),
         on_update: action(fk.on_update),
+        deferrable,
+        initially_deferred,
     })
+}
+
+/// A constraint's `DEFERRABLE` / `INITIALLY DEFERRED` characteristics as a
+/// `(deferrable, initially deferred)` pair. `INITIALLY DEFERRED` implies
+/// `DEFERRABLE`, as in PostgreSQL.
+fn deferral(
+    characteristics: &Option<sqlparser::ast::ConstraintCharacteristics>,
+) -> Result<(bool, bool)> {
+    use sqlparser::ast::DeferrableInitial;
+    let Some(c) = characteristics else {
+        return Ok((false, false));
+    };
+    if matches!(c.enforced, Some(false)) {
+        anyhow::bail!("NOT ENFORCED constraints are not supported");
+    }
+    let initially = matches!(c.initially, Some(DeferrableInitial::Deferred));
+    if c.deferrable == Some(false) && initially {
+        anyhow::bail!("constraint declared INITIALLY DEFERRED must be DEFERRABLE");
+    }
+    Ok((c.deferrable.unwrap_or(initially), initially))
 }
 
 /// Which statement a `RETURNING` list belongs to.

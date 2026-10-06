@@ -55,6 +55,7 @@ impl MemExecutor {
                 if_not_exists,
                 unique_constraints,
                 key_names,
+                key_flags,
                 on_commit,
                 like,
                 inherits,
@@ -73,7 +74,7 @@ impl MemExecutor {
                     columns,
                     constraints,
                     if_not_exists,
-                    (unique_constraints, key_names),
+                    (unique_constraints, key_names, key_flags),
                     None,
                     inherits.clone(),
                     (
@@ -87,6 +88,11 @@ impl MemExecutor {
                 }
                 Ok(out)
             }
+            LogicalPlan::SetConstraints {
+                all,
+                names,
+                deferred,
+            } => self.exec_set_constraints(ctx, all, names.clone(), deferred),
             LogicalPlan::Discard { what } => self.exec_discard(ctx, what),
             LogicalPlan::Prepare {
                 name,

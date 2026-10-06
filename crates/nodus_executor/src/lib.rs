@@ -213,6 +213,12 @@ pub(crate) struct ActiveTxn {
     /// Notifications (`NOTIFY`) sent in it, delivered when it commits:
     /// channel and payload.
     pub(crate) pending_notifications: Vec<(String, String)>,
+    /// `SET CONSTRAINTS` overrides of constraint names for this transaction
+    /// (`true`: deferred), on top of each constraint's own `INITIALLY`.
+    pub(crate) constraint_modes: HashMap<String, bool>,
+    /// The tables written under a deferred constraint; the commit checks
+    /// their deferred constraints before it can go through.
+    pub(crate) deferred_tables: std::collections::HashSet<nodus_catalog::TableId>,
 }
 
 impl ActiveTxn {
@@ -230,6 +236,8 @@ impl ActiveTxn {
             settings_before: HashMap::new(),
             local_settings: HashMap::new(),
             pending_notifications: Vec::new(),
+            constraint_modes: HashMap::new(),
+            deferred_tables: std::collections::HashSet::new(),
         }
     }
 }
@@ -1313,7 +1321,22 @@ impl MemExecutor {
             .read()
             .get(&ctx.session_id)
             .is_some_and(|txn| !txn.write_log.is_empty());
+        let mut result = result;
         if let Some(txn_id) = implicit_txn {
+            // Deferred constraints are enforced when this statement's
+            // implicit transaction commits, while its own writes are still
+            // visible to the checks: the violation fails the statement, as
+            // PostgreSQL reports it then.
+            if result.is_ok()
+                && let Some(txn) = self.active_txns.read().get(&ctx.session_id)
+                && let Err(error) = self.check_deferred_constraints(
+                    ctx,
+                    &txn.constraint_modes,
+                    &txn.deferred_tables,
+                )
+            {
+                result = Err(error);
+            }
             self.active_txns.write().remove(&ctx.session_id);
             self.advisory.end_transaction(&ctx.session_id);
             self.end_transaction_large_objects(&ctx.session_id);
