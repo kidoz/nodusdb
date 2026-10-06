@@ -359,3 +359,145 @@ fn unique_indexes_check_what_they_constrain() {
         ["2"]
     );
 }
+
+#[test]
+fn deferrable_constraints_wait_for_commit() {
+    let (sql, _) = session();
+    sql("CREATE TABLE dp (a int PRIMARY KEY)").unwrap();
+    sql("CREATE TABLE dc (a int REFERENCES dp (a) DEFERRABLE INITIALLY DEFERRED, b int UNIQUE DEFERRABLE INITIALLY DEFERRED)")
+        .unwrap();
+    // Inside the transaction the violations are pending: the parent may
+    // arrive later, and the duplicate key is allowed until COMMIT.
+    sql("BEGIN").unwrap();
+    // The parents exist, so the duplicate key is the only pending violation.
+    sql("INSERT INTO dp VALUES (5), (6)").unwrap();
+    sql("INSERT INTO dc VALUES (5, 5)").unwrap();
+    sql("INSERT INTO dc VALUES (6, 5)").unwrap();
+    let (message, listed) = fields(sql("COMMIT").unwrap_err());
+    assert_eq!(
+        message,
+        "duplicate key value violates unique constraint \"dc_b_key\""
+    );
+    assert_eq!(
+        field(&listed, "detail").unwrap(),
+        "Key (b)=(5) already exists."
+    );
+    // The failed COMMIT lost the transaction.
+    assert_eq!(rows(&sql("SELECT count(*) FROM dc").unwrap()), ["0"]);
+
+    sql("BEGIN").unwrap();
+    sql("INSERT INTO dc VALUES (1, 1)").unwrap();
+    sql("INSERT INTO dp VALUES (1)").unwrap();
+    sql("COMMIT").unwrap();
+    assert_eq!(rows(&sql("SELECT count(*) FROM dc").unwrap()), ["1"]);
+    // A missing parent still fails at COMMIT.
+    sql("BEGIN").unwrap();
+    sql("INSERT INTO dc VALUES (9, 9)").unwrap();
+    let (message, listed) = fields(sql("COMMIT").unwrap_err());
+    assert_eq!(
+        message,
+        "insert or update on table \"dc\" violates foreign key constraint \"dc_a_fkey\""
+    );
+    assert_eq!(
+        field(&listed, "detail").unwrap(),
+        "Key (a)=(9) is not present in table \"dp\"."
+    );
+}
+
+#[test]
+fn deferrable_primary_keys_swap_and_duplicate() {
+    let (sql, _) = session();
+    sql("CREATE TABLE sw (a int PRIMARY KEY DEFERRABLE INITIALLY DEFERRED)").unwrap();
+    sql("INSERT INTO sw VALUES (1), (2)").unwrap();
+    // The swap is legal: the key is only unique at COMMIT.
+    sql("BEGIN").unwrap();
+    sql("UPDATE sw SET a = CASE WHEN a = 1 THEN 2 ELSE 1 END").unwrap();
+    sql("COMMIT").unwrap();
+    assert_eq!(
+        rows(&sql("SELECT string_agg(a::text, ',' ORDER BY a) FROM sw").unwrap()),
+        ["1,2"]
+    );
+    // A duplicate is refused at COMMIT.
+    sql("BEGIN").unwrap();
+    sql("INSERT INTO sw VALUES (3)").unwrap();
+    sql("INSERT INTO sw VALUES (3)").unwrap();
+    let (message, _) = fields(sql("COMMIT").unwrap_err());
+    assert_eq!(
+        message,
+        "duplicate key value violates unique constraint \"sw_pkey\""
+    );
+}
+
+#[test]
+fn set_constraints_changes_the_timing() {
+    let (sql, notices) = session();
+    sql("CREATE TABLE u (a int UNIQUE DEFERRABLE)").unwrap();
+    // Initially immediate: the duplicate fails at once.
+    sql("BEGIN").unwrap();
+    sql("INSERT INTO u VALUES (1)").unwrap();
+    assert!(sql("INSERT INTO u VALUES (1)").is_err());
+    sql("ROLLBACK").unwrap();
+    // Deferred: it waits for COMMIT, and IMMEDIATE enforces it at once.
+    sql("BEGIN").unwrap();
+    sql("SET CONSTRAINTS ALL DEFERRED").unwrap();
+    sql("INSERT INTO u VALUES (1)").unwrap();
+    sql("INSERT INTO u VALUES (1)").unwrap();
+    let (message, _) = fields(sql("SET CONSTRAINTS u_a_key IMMEDIATE").unwrap_err());
+    assert_eq!(
+        message,
+        "duplicate key value violates unique constraint \"u_a_key\""
+    );
+    sql("ROLLBACK").unwrap();
+    // Outside a transaction block it is only a warning.
+    sql("SET CONSTRAINTS ALL DEFERRED").unwrap();
+    assert!(
+        notices()
+            .iter()
+            .any(|n| n.contains("SET CONSTRAINTS can only be used in transaction blocks"))
+    );
+    // A constraint that cannot defer says so.
+    sql("CREATE TABLE nd (a int UNIQUE)").unwrap();
+    sql("BEGIN").unwrap();
+    let (message, _) = fields(sql("SET CONSTRAINTS nd_a_key DEFERRED").unwrap_err());
+    assert_eq!(message, "constraint \"nd_a_key\" is not deferrable");
+    let (message, _) = fields(sql("SET CONSTRAINTS nosuch DEFERRED").unwrap_err());
+    assert_eq!(message, "constraint \"nosuch\" does not exist");
+    sql("ROLLBACK").unwrap();
+}
+
+#[test]
+fn deferrable_constraints_refuse_what_postgresql_refuses() {
+    let (sql, _) = session();
+    sql("CREATE TABLE dr (a int, b int, UNIQUE (b) DEFERRABLE)").unwrap();
+    // A deferrable constraint is no ON CONFLICT arbiter.
+    let (message, _) =
+        fields(sql("INSERT INTO dr VALUES (1, 1) ON CONFLICT (b) DO NOTHING").unwrap_err());
+    assert_eq!(
+        message,
+        "ON CONFLICT does not support deferrable unique constraints/exclusion constraints as arbiters"
+    );
+    // A foreign key may not reference a deferrable key.
+    sql("CREATE TABLE dq (a int PRIMARY KEY DEFERRABLE)").unwrap();
+    let (message, _) = fields(sql("CREATE TABLE dq2 (a int REFERENCES dq (a))").unwrap_err());
+    assert_eq!(
+        message,
+        "cannot use a deferrable unique constraint for referenced table \"dq\""
+    );
+    // ALTER CONSTRAINT changes only foreign keys.
+    sql("CREATE TABLE al1 (a int PRIMARY KEY)").unwrap();
+    sql("CREATE TABLE al2 (a int REFERENCES al1 (a))").unwrap();
+    sql("ALTER TABLE al2 ALTER CONSTRAINT al2_a_fkey DEFERRABLE INITIALLY DEFERRED").unwrap();
+    assert_eq!(
+        rows(&sql(
+            "SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'al2'::regclass AND contype = 'f'"
+        )
+        .unwrap()),
+        ["FOREIGN KEY (a) REFERENCES al1(a) DEFERRABLE INITIALLY DEFERRED"]
+    );
+    let (message, _) =
+        fields(sql("ALTER TABLE al1 ALTER CONSTRAINT al1_pkey DEFERRABLE").unwrap_err());
+    assert_eq!(
+        message,
+        "constraint \"al1_pkey\" of relation \"al1\" is not a foreign key constraint"
+    );
+}

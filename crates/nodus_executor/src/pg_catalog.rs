@@ -2922,8 +2922,8 @@ impl MemExecutor {
                         }
                         .into(),
                     ),
-                    Value::Bool(false),
-                    Value::Bool(false),
+                    Value::Bool(index.deferrable),
+                    Value::Bool(index.initially_deferred),
                     Value::Bool(true),
                     Value::Int(relid),
                     Value::Int(0),
@@ -3041,7 +3041,8 @@ impl MemExecutor {
                         referred_columns,
                         on_delete,
                         on_update,
-                        ..
+                        deferrable,
+                        initially_deferred,
                     } => {
                         let conname = name.clone().unwrap_or_else(|| {
                             format!("{}_{}_fkey", table.name, columns.join("_"))
@@ -3074,8 +3075,8 @@ impl MemExecutor {
                             Value::Text(conname),
                             Value::Int(namespace),
                             Value::Text("f".into()),
-                            Value::Bool(false),
-                            Value::Bool(false),
+                            Value::Bool(*deferrable),
+                            Value::Bool(*initially_deferred),
                             Value::Bool(true),
                             Value::Int(relid),
                             Value::Int(0),
@@ -3491,7 +3492,14 @@ impl MemExecutor {
                         "UNIQUE"
                     };
                     let columns = column_list(&mut index.key_columns.iter().map(|k| k.column_id));
-                    return Some(format!("{kind} ({columns})"));
+                    let deferral = if !index.deferrable {
+                        ""
+                    } else if index.initially_deferred {
+                        " DEFERRABLE INITIALLY DEFERRED"
+                    } else {
+                        " DEFERRABLE"
+                    };
+                    return Some(format!("{kind} ({columns}){deferral}"));
                 }
             }
             for column in table.columns.iter().filter(|c| !c.nullable) {
@@ -3520,7 +3528,8 @@ impl MemExecutor {
                         referred_columns,
                         on_delete,
                         on_update,
-                        ..
+                        deferrable,
+                        initially_deferred,
                     } => {
                         let name = name.clone().unwrap_or_else(|| {
                             format!("{}_{}_fkey", table.name, columns.join("_"))
@@ -3542,8 +3551,15 @@ impl MemExecutor {
                                     .collect::<Vec<_>>()
                                     .join(", ")
                             };
+                            let deferral = if !*deferrable {
+                                ""
+                            } else if *initially_deferred {
+                                " DEFERRABLE INITIALLY DEFERRED"
+                            } else {
+                                " DEFERRABLE"
+                            };
                             return Some(format!(
-                                "FOREIGN KEY ({}) REFERENCES {}({}){actions}",
+                                "FOREIGN KEY ({}) REFERENCES {}({}){actions}{deferral}",
                                 quote(columns),
                                 foreign_table,
                                 quote(referred_columns)
