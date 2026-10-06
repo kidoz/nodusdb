@@ -195,6 +195,7 @@ fn exec_with_rows(
             partition_of: None,
             for_values: None,
             key_flags: vec![],
+            key_includes: Vec::new(),
         },
     )
     .unwrap();

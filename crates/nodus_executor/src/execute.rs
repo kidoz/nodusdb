@@ -56,6 +56,7 @@ impl MemExecutor {
                 unique_constraints,
                 key_names,
                 key_flags,
+                key_includes,
                 on_commit,
                 like,
                 inherits,
@@ -74,7 +75,7 @@ impl MemExecutor {
                     columns,
                     constraints,
                     if_not_exists,
-                    (unique_constraints, key_names, key_flags),
+                    (unique_constraints, key_names, key_flags, key_includes),
                     None,
                     inherits.clone(),
                     (
@@ -337,6 +338,7 @@ impl MemExecutor {
                 nulls_not_distinct,
                 if_not_exists,
                 predicate,
+                include,
                 expressions,
                 descending,
             } => self.exec_create_index(
@@ -346,6 +348,7 @@ impl MemExecutor {
                 (columns, expressions, descending),
                 (unique, nulls_not_distinct, predicate),
                 if_not_exists,
+                include,
             ),
             LogicalPlan::DropIndex { name, if_exists } => {
                 self.exec_drop_index(ctx, name, if_exists)

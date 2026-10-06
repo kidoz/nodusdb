@@ -703,7 +703,7 @@ impl MemExecutor {
             // Maintain secondary indexes.
             for idx in &tbl.indexes {
                 if let Some(index_val) = Self::index_leading_value(&tbl, idx, &row) {
-                    self.write_index_entry(&ctx.session_id, idx.id, &index_val, &pk)?;
+                    self.write_row_index_entry(&ctx.session_id, &tbl, idx, &index_val, &pk, &row)?;
                 }
             }
 
@@ -1200,16 +1200,21 @@ impl MemExecutor {
         self.delete_row(&ctx.session_id, key.to_string())?;
         // Every key column's entry: older binaries kept one for each.
         for idx in &tbl.indexes {
-            for kcol in &idx.key_columns {
+            for (at, kcol) in idx.key_columns.iter().enumerate() {
                 if let Some(pos) = tbl.columns.iter().position(|c| c.id == kcol.column_id) {
                     let index_val = row.get(pos).unwrap_or(&Value::Null);
-                    self.delete_index_entry(&ctx.session_id, idx.id, index_val, &pk_str)?;
+                    if at == 0 {
+                        self.delete_row_index_entry(&ctx.session_id, tbl, idx, index_val, &pk_str)?;
+                    } else {
+                        // Older binaries kept one entry per key column.
+                        self.delete_index_entry(&ctx.session_id, idx.id, index_val, &pk_str)?;
+                    }
                 }
             }
             if crate::index_keys::has_expressions(idx)
                 && let Some(value) = Self::index_leading_value(tbl, idx, row)
             {
-                self.delete_index_entry(&ctx.session_id, idx.id, &value, &pk_str)?;
+                self.delete_row_index_entry(&ctx.session_id, tbl, idx, &value, &pk_str)?;
             }
         }
         Ok(())
@@ -1404,7 +1409,7 @@ impl MemExecutor {
         self.write_row(&ctx.session_id, key, crate::value::encode_row(row)?)?;
         for idx in &table.indexes {
             if let Some(index_val) = Self::index_leading_value(table, idx, row) {
-                self.write_index_entry(&ctx.session_id, idx.id, &index_val, &pk)?;
+                self.write_row_index_entry(&ctx.session_id, table, idx, &index_val, &pk, row)?;
             }
         }
         Ok(())
@@ -1479,10 +1484,14 @@ impl MemExecutor {
             if let (Some(old_val), Some(new_val)) = (
                 Self::index_leading_value(tbl, idx, old_row),
                 Self::index_leading_value(tbl, idx, row),
-            ) && (old_val != new_val || old_pk != pk)
+            ) && (old_val != new_val
+                || old_pk != pk
+                // An entry carries the `INCLUDE` columns' values.
+                || Self::index_entry_payload(tbl, idx, old_row)
+                    != Self::index_entry_payload(tbl, idx, row))
             {
-                self.delete_index_entry(&ctx.session_id, idx.id, &old_val, &old_pk)?;
-                self.write_index_entry(&ctx.session_id, idx.id, &new_val, &pk)?;
+                self.delete_row_index_entry(&ctx.session_id, tbl, idx, &old_val, &old_pk)?;
+                self.write_row_index_entry(&ctx.session_id, tbl, idx, &new_val, &pk, row)?;
             }
         }
         Ok(new_key)

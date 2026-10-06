@@ -253,6 +253,11 @@ pub struct IndexDescriptor {
     /// index is named for the constraint, not for its columns).
     #[serde(default)]
     pub constraint: bool,
+    /// The encoding of the index's entry keys: 0 is the legacy text form
+    /// (equality lookups only), 2 the order-preserving one (range scans
+    /// too). Defaulted so descriptors persisted before it decode as legacy.
+    #[serde(default)]
+    pub key_version: u64,
     /// `DEFERRABLE`: the uniqueness check may be deferred to `COMMIT`.
     #[serde(default)]
     pub deferrable: bool,

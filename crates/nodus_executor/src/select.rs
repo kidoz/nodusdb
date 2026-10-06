@@ -112,6 +112,30 @@ impl MemExecutor {
         Ok(bindings)
     }
 
+    /// The leading column a filter bounds, with its bounds: the first
+    /// indexed column a `<`, `<=`, `>` or `>=` predicate (a `BETWEEN` is
+    /// their conjunction) reaches.
+    pub(crate) fn leading_range(
+        filter: &FilterExpr,
+        tbl: &nodus_catalog::TableDescriptor,
+    ) -> Option<(String, (Option<(Value, bool)>, Option<(Value, bool)>))> {
+        for idx in &tbl.indexes {
+            let Some(key) = idx.key_columns.first() else {
+                continue;
+            };
+            if crate::index_keys::is_expression_key(key) {
+                continue;
+            }
+            let Some(column) = tbl.columns.iter().find(|c| c.id == key.column_id) else {
+                continue;
+            };
+            if let Some(bounds) = crate::index_keys::range_bounds(filter, &column.name) {
+                return Some((column.name.clone(), bounds));
+            }
+        }
+        None
+    }
+
     /// The joined rows of the relations a data-modifying statement reads
     /// (planned as a `SELECT *` over them), under their qualified names.
     pub(crate) fn relation_rows(
@@ -333,42 +357,147 @@ impl MemExecutor {
                     .collect();
 
                 let mut rows = None;
+                // The columns the statement reads: a covering index is
+                // preferred when one serves them all.
+                let needed_columns =
+                    crate::index_keys::index_only_needed(&projection, filter.as_ref()).and_then(
+                        |mut needed| {
+                            needed.extend(crate::index_keys::sort_columns(&sort, &projection)?);
+                            Some(needed)
+                        },
+                    );
+                // A query whose columns the index covers reads them from the
+                // index alone; a simple shape keeps that safe (nothing later
+                // reads an uncovered column).
+                let index_only = if joins.is_empty()
+                    && group_by.is_empty()
+                    && distinct_on.is_empty()
+                    && !distinct
+                    && having.is_none()
+                    && grouping_sets.is_none()
+                {
+                    needed_columns.clone()
+                } else {
+                    None
+                };
                 // Equality on an indexed column uses the index. The session's
                 // uncommitted overlay is merged into the result, so the index is
                 // usable inside a transaction rather than forcing a full scan.
                 if sample.is_none()
                     && descendants.is_empty()
-                    && let Some(FilterExpr::Predicate(Predicate {
-                        left,
-                        op: CompareOp::Eq,
-                        right: right @ Operand::Literal(_),
-                    })) = filter.as_ref()
-                {
-                    let col_name = left.split('.').last().unwrap_or(left);
-                    if let Some(col) = tbl.columns.iter().find(|c| c.name == *col_name) {
-                        let col_pos = tbl.columns.iter().position(|c| c.id == col.id);
-                        for idx in &tbl.indexes {
-                            // Entries are kept for an index's leading column.
-                            if idx
-                                .key_columns
-                                .first()
-                                .is_some_and(|kc| kc.column_id == col.id)
-                            {
-                                let val = self.eval_operand(&[], &[], &[], right, &col.data_type);
-                                if let Ok(indexed_rows) =
-                                    self.index_scan(idx.id, &val, tbl.id, &ctx.session_id)
-                                {
-                                    rows = Some(self.merge_overlay_eq(
-                                        indexed_rows,
-                                        tbl.id,
-                                        col_pos,
-                                        &val,
-                                        &ctx.session_id,
-                                    ));
-                                    break;
-                                }
-                            }
+                    && let Some((col, right)) = tbl.indexes.iter().find_map(|idx| {
+                        let key = idx.key_columns.first()?;
+                        if crate::index_keys::is_expression_key(key) {
+                            return None;
                         }
+                        let column = tbl.columns.iter().find(|c| c.id == key.column_id)?;
+                        let operand =
+                            crate::index_keys::equality_operand(filter.as_ref()?, &column.name)?;
+                        Some((column.clone(), operand.clone()))
+                    })
+                {
+                    let col_pos = tbl.columns.iter().position(|c| c.id == col.id);
+                    for idx in crate::index_keys::equality_index(
+                        &tbl,
+                        &tbl.indexes,
+                        col.id,
+                        needed_columns.as_deref(),
+                    )
+                    .into_iter()
+                    {
+                        let val = self.eval_operand(&[], &[], &[], &right, &col.data_type);
+                        let only = index_only
+                            .as_ref()
+                            .is_some_and(|needed| {
+                                crate::index_keys::index_covers(&tbl, idx, needed)
+                            })
+                            .then(|| {
+                                self.index_only_scan(idx.id, &val, &tbl, idx, &ctx.session_id)
+                                    .ok()
+                            })
+                            .flatten();
+                        let indexed = only.or_else(|| {
+                            let (data_type, ordered) = Self::index_entry_encoding(&tbl, idx);
+                            self.index_scan(
+                                idx.id,
+                                &val,
+                                tbl.id,
+                                &data_type,
+                                ordered,
+                                &ctx.session_id,
+                            )
+                            .ok()
+                        });
+                        if let Some(indexed_rows) = indexed {
+                            rows = Some(self.merge_overlay_eq(
+                                indexed_rows,
+                                tbl.id,
+                                col_pos,
+                                &val,
+                                &ctx.session_id,
+                            ));
+                            break;
+                        }
+                    }
+                }
+                // An inequality on an indexed leading column reads the
+                // index's key order. PostgreSQL's planner costs this; ours
+                // has no statistics, so it takes the index when the session
+                // asks for index scans (`SET enable_seqscan = off`).
+                if rows.is_none()
+                    && sample.is_none()
+                    && joins.is_empty()
+                    && descendants.is_empty()
+                    && crate::session_env::setting("enable_seqscan").as_deref() == Some("off")
+                    && let Some(filter) = filter.as_ref()
+                    && let Some((col_name, (lower, upper))) = Self::leading_range(filter, &tbl)
+                    && let Some(col) = tbl.columns.iter().find(|c| c.name == col_name)
+                    && let Some(idx) = crate::index_keys::equality_index(
+                        &tbl,
+                        &tbl.indexes,
+                        col.id,
+                        needed_columns.as_deref(),
+                    )
+                    .filter(|i| Self::index_entry_encoding(&tbl, i).1)
+                {
+                    let col_pos = tbl.columns.iter().position(|c| c.id == col.id);
+                    // The rows come from the index alone when it covers
+                    // every column the statement reads.
+                    let only = index_only
+                        .as_ref()
+                        .is_some_and(|needed| crate::index_keys::index_covers(&tbl, idx, needed))
+                        .then(|| {
+                            self.index_only_range_scan(
+                                idx.id,
+                                lower.as_ref(),
+                                upper.as_ref(),
+                                &tbl,
+                                idx,
+                                &ctx.session_id,
+                            )
+                            .ok()
+                        })
+                        .flatten();
+                    let indexed_rows = match only {
+                        Some(rows) => Ok(rows),
+                        None => self.index_range_scan(
+                            idx.id,
+                            lower.as_ref(),
+                            upper.as_ref(),
+                            tbl.id,
+                            &col.data_type,
+                            &ctx.session_id,
+                        ),
+                    };
+                    if let Ok(indexed_rows) = indexed_rows {
+                        rows = Some(self.merge_overlay_range(
+                            indexed_rows,
+                            tbl.id,
+                            col_pos,
+                            lower.as_ref(),
+                            upper.as_ref(),
+                            &ctx.session_id,
+                        ));
                     }
                 }
                 let rows = match rows {

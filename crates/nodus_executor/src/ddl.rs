@@ -22,10 +22,11 @@ impl MemExecutor {
         mut columns: Vec<ColumnDef>,
         constraints: Vec<nodus_catalog::TableConstraint>,
         if_not_exists: bool,
-        (unique_constraints, key_names, key_flags): (
+        (unique_constraints, key_names, key_flags, key_includes): (
             Vec<Vec<String>>,
             Vec<(Vec<String>, String)>,
             Vec<(Vec<String>, bool, bool, bool)>,
+            Vec<(Vec<String>, Vec<String>)>,
         ),
         materialized_query: Option<String>,
         inherits: Vec<String>,
@@ -298,6 +299,21 @@ impl MemExecutor {
             })
             .collect::<Result<Vec<_>>>()?;
 
+        // The `INCLUDE (...)` columns a key constraint declared, by its
+        // columns, resolved before the table is created.
+        let key_include_ids = key_includes
+            .iter()
+            .map(|(names, include)| {
+                Self::include_columns(&descriptors, include).map(|ids| (names.clone(), ids))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let key_include = |columns: &[String]| -> Vec<nodus_catalog::ColumnId> {
+            key_include_ids
+                .iter()
+                .find(|(names, _)| names == columns)
+                .map(|(_, ids)| ids.clone())
+                .unwrap_or_default()
+        };
         let tbl = self.catalog_writer.create_table(CreateTableRequest {
             id: nodus_catalog::TableId::new(),
             database_id: db.id,
@@ -321,6 +337,7 @@ impl MemExecutor {
             } else {
                 key_flags(std::slice::from_ref(&col.name))
             };
+            let include_columns = key_include(std::slice::from_ref(&col.name));
             let index = nodus_catalog::IndexDescriptor {
                 id: nodus_catalog::IndexId::new(),
                 name: if primary {
@@ -343,9 +360,10 @@ impl MemExecutor {
                     column_id: col.id,
                     descending: false,
                 }],
-                include_columns: vec![],
+                include_columns,
                 unique: true,
                 constraint: true,
+                key_version: 2,
                 deferrable,
                 initially_deferred,
                 nulls_not_distinct,
@@ -360,7 +378,18 @@ impl MemExecutor {
                 },
             )?;
         }
+        let key_columns_by_id = |ids: &[nodus_catalog::ColumnId]| -> Vec<String> {
+            ids.iter()
+                .filter_map(|id| {
+                    tbl.columns
+                        .iter()
+                        .find(|c| c.id == *id)
+                        .map(|c| c.name.clone())
+                })
+                .collect()
+        };
         for (name, column_ids, flags) in unique_groups {
+            let include_columns = key_include(&key_columns_by_id(&column_ids));
             let index = nodus_catalog::IndexDescriptor {
                 id: nodus_catalog::IndexId::new(),
                 name,
@@ -377,9 +406,10 @@ impl MemExecutor {
                         descending: false,
                     })
                     .collect(),
-                include_columns: vec![],
+                include_columns,
                 unique: true,
                 constraint: true,
+                key_version: 2,
                 deferrable: flags.0,
                 initially_deferred: flags.1,
                 nulls_not_distinct: flags.2,
@@ -505,6 +535,7 @@ impl MemExecutor {
                 include_columns: vec![],
                 unique: index.unique,
                 constraint: index.constraint,
+                key_version: index.key_version,
                 deferrable: index.deferrable,
                 initially_deferred: index.initially_deferred,
                 nulls_not_distinct: index.nulls_not_distinct,
@@ -1194,6 +1225,7 @@ impl MemExecutor {
         (columns, expressions, descending): (Vec<String>, Vec<Option<String>>, Vec<bool>),
         (unique, nulls_not_distinct, predicate): (bool, bool, Option<String>),
         if_not_exists: bool,
+        include: Vec<String>,
     ) -> Result<QueryOutput> {
         let (db_name, schema_name, table_only) = parse_object_name(&table_name)?;
         let tbl = self
@@ -1253,6 +1285,7 @@ impl MemExecutor {
         }
         let mut index = Self::new_index(&tbl, name, index_type, &plain, predicate, false)?;
         index.nulls_not_distinct = nulls_not_distinct;
+        index.include_columns = Self::include_columns(&tbl.columns, &include)?;
         if expressions.iter().any(Option::is_some) {
             let mut plain_keys = index.key_columns.into_iter();
             index.key_columns = expressions
@@ -1299,6 +1332,25 @@ impl MemExecutor {
         Ok(QueryOutput::tag("CREATE INDEX"))
     }
 
+    /// The include columns of an index, as PostgreSQL validates them: each
+    /// must name a column of the table (PostgreSQL accepts a repeat, even
+    /// of a key column, and keeps it in the definition).
+    pub(crate) fn include_columns(
+        columns: &[nodus_catalog::ColumnDescriptor],
+        include: &[String],
+    ) -> Result<Vec<nodus_catalog::ColumnId>> {
+        include
+            .iter()
+            .map(|column| {
+                columns
+                    .iter()
+                    .find(|c| &c.name == column)
+                    .map(|c| c.id)
+                    .ok_or_else(|| anyhow::anyhow!("column \"{column}\" does not exist"))
+            })
+            .collect()
+    }
+
     /// An index of `tbl` named `name` over `columns`.
     pub(crate) fn new_index(
         tbl: &nodus_catalog::TableDescriptor,
@@ -1330,6 +1382,7 @@ impl MemExecutor {
             state: DescriptorState::Public,
             unique: index_type != nodus_catalog::IndexType::LocalSecondary,
             constraint,
+            key_version: 2,
             deferrable: false,
             initially_deferred: false,
             nulls_not_distinct: false,
@@ -1429,7 +1482,7 @@ impl MemExecutor {
         for (key, row) in self.scan_rows_keyed(tbl.id, &ctx.session_id)? {
             let pk = key.strip_prefix(&prefix).unwrap_or(&key);
             if let Some(value) = Self::index_leading_value(tbl, &index, &row) {
-                self.write_index_entry(&ctx.session_id, index.id, &value, pk)?;
+                self.write_row_index_entry(&ctx.session_id, tbl, &index, &value, pk, &row)?;
             }
         }
         self.catalog_writer.update_index_state(

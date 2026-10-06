@@ -923,16 +923,21 @@ impl MemExecutor {
         for index in tbl.indexes.iter().filter(|i| i.name == name) {
             for (key, row) in &rows {
                 let pk = key.strip_prefix(&prefix).unwrap_or(key);
-                for k in &index.key_columns {
+                for (at, k) in index.key_columns.iter().enumerate() {
                     if let Some(p) = tbl.columns.iter().position(|c| c.id == k.column_id) {
                         let value = row.get(p).unwrap_or(&Value::Null);
-                        self.delete_index_entry(&ctx.session_id, index.id, value, pk)?;
+                        if at == 0 {
+                            self.delete_row_index_entry(&ctx.session_id, tbl, index, value, pk)?;
+                        } else {
+                            // Older binaries kept one entry per key column.
+                            self.delete_index_entry(&ctx.session_id, index.id, value, pk)?;
+                        }
                     }
                 }
                 if crate::index_keys::has_expressions(index)
                     && let Some(value) = Self::index_leading_value(tbl, index, row)
                 {
-                    self.delete_index_entry(&ctx.session_id, index.id, &value, pk)?;
+                    self.delete_row_index_entry(&ctx.session_id, tbl, index, &value, pk)?;
                 }
             }
         }
@@ -973,8 +978,8 @@ impl MemExecutor {
             )?;
             for index in &tbl.indexes {
                 if let Some(value) = Self::index_leading_value(tbl, index, &row) {
-                    self.delete_index_entry(&ctx.session_id, index.id, &value, &old_pk)?;
-                    self.write_index_entry(&ctx.session_id, index.id, &value, &new_pk)?;
+                    self.delete_row_index_entry(&ctx.session_id, tbl, index, &value, &old_pk)?;
+                    self.write_row_index_entry(&ctx.session_id, tbl, index, &value, &new_pk, &row)?;
                 }
             }
         }

@@ -1486,6 +1486,10 @@ pub enum LogicalPlan {
         /// decode.
         #[serde(default)]
         key_flags: Vec<(Vec<String>, bool, bool, bool)>,
+        /// Key constraints' `INCLUDE (...)` columns, by their key columns.
+        /// Defaulted so older plans decode.
+        #[serde(default)]
+        key_includes: Vec<(Vec<String>, Vec<String>)>,
         /// A temporary table's `ON COMMIT` action: `DROP` or `DELETE ROWS`.
         #[serde(default)]
         on_commit: Option<String>,
@@ -1574,6 +1578,10 @@ pub enum LogicalPlan {
         /// Parallel to `columns`: whether each key part sorts descending.
         #[serde(default)]
         descending: Vec<bool>,
+        /// `INCLUDE (...)` columns: stored in the index for index-only
+        /// scans, not part of its key.
+        #[serde(default)]
+        include: Vec<String>,
     },
     DropIndex {
         name: String,

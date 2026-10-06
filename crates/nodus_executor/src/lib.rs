@@ -923,6 +923,8 @@ impl MemExecutor {
         index_id: nodus_catalog::IndexId,
         index_val: &Value,
         table_id: TableId,
+        data_type: &str,
+        ordered: bool,
         session: &str,
     ) -> Result<Vec<(String, Vec<Value>)>> {
         let read_ts = self.read_ts(session);
@@ -934,26 +936,337 @@ impl MemExecutor {
                 end: Bytes::from(format!("{};", table_id)),
             },
         )?;
-        let escaped = Self::escape_index_value(&render(&crate::value::key_form(index_val)));
-        let prefix = format!("i:{}:{}:", index_id, escaped);
-        let start = Bytes::from(prefix.clone());
-        let end_prefix = format!("i:{}:{};", index_id, escaped);
-        let end = Bytes::from(end_prefix);
-
         let columns = self.table_columns(table_id);
         let mut rows = Vec::new();
-        for pair in self.kv.scan(KeyRange { start, end }, read_ts)? {
-            let pair = pair?;
-            let key_str = String::from_utf8_lossy(&pair.key);
-            if let Some(pk) = key_str.strip_prefix(&prefix) {
-                // Fetch the actual row
-                let row_key = Bytes::from(format!("{}:{}", table_id, pk));
-                if let Some(row_val) = self.kv.get(&row_key, read_ts)? {
-                    rows.push((pk.to_string(), Self::decode_row(&row_val, &columns)?));
-                }
+        for (pk, _) in self.index_entries(index_id, index_val, data_type, ordered, read_ts)? {
+            // Fetch the actual row
+            let row_key = Bytes::from(format!("{}:{}", table_id, pk));
+            if let Some(row_val) = self.kv.get(&row_key, read_ts)? {
+                rows.push((pk, Self::decode_row(&row_val, &columns)?));
             }
         }
         Ok(rows)
+    }
+
+    /// The entries under one leading value of an index: each row's key and
+    /// the entry's payload (an index's `INCLUDE` columns).
+    pub(crate) fn index_entries(
+        &self,
+        index_id: nodus_catalog::IndexId,
+        index_val: &Value,
+        data_type: &str,
+        ordered: bool,
+        read_ts: u64,
+    ) -> Result<Vec<(String, Vec<u8>)>> {
+        let (prefix, start, end) =
+            Self::index_value_region(index_id, index_val, data_type, ordered);
+        self.entries_between(&prefix, &start, &end, read_ts)
+    }
+
+    /// The entries between two keys, each with its row key (the key's tail
+    /// after `prefix`).
+    fn entries_between(
+        &self,
+        prefix: &str,
+        start: &str,
+        end: &str,
+        read_ts: u64,
+    ) -> Result<Vec<(String, Vec<u8>)>> {
+        let start = Bytes::from(start.to_string());
+        let end = Bytes::from(end.to_string());
+        let mut entries = Vec::new();
+        for pair in self.kv.scan(KeyRange { start, end }, read_ts)? {
+            let pair = pair?;
+            let key_str = String::from_utf8_lossy(&pair.key);
+            if let Some(pk) = key_str.strip_prefix(prefix) {
+                entries.push((pk.to_string(), pair.value.to_vec()));
+            }
+        }
+        Ok(entries)
+    }
+
+    /// The entries of an index's leading column between two bounds, with the
+    /// rows they point at: `<`, `<=`, `>`, `>=` and their conjunctions, read
+    /// from the index's key order.
+    pub(crate) fn index_range_scan(
+        &self,
+        index_id: nodus_catalog::IndexId,
+        lower: Option<&(Value, bool)>,
+        upper: Option<&(Value, bool)>,
+        table_id: TableId,
+        data_type: &str,
+        session: &str,
+    ) -> Result<Vec<(String, Vec<Value>)>> {
+        let Some((start, end)) = Self::index_range_region(index_id, lower, upper, data_type) else {
+            return Ok(Vec::new());
+        };
+        let read_ts = self.read_ts(session);
+        let columns = self.table_columns(table_id);
+        let mut rows = Vec::new();
+        let start_bytes = Bytes::from(start.clone());
+        let end_bytes = Bytes::from(end.clone());
+        for pair in self.kv.scan(
+            KeyRange {
+                start: start_bytes,
+                end: end_bytes,
+            },
+            read_ts,
+        )? {
+            let pair = pair?;
+            let key_str = String::from_utf8_lossy(&pair.key);
+            let Some(tail) = key_str.strip_prefix(&format!("i:{index_id}:")) else {
+                continue;
+            };
+            // The row key follows the value's encoding and a `-`.
+            let Some((_, pk)) = tail.split_once('-') else {
+                continue;
+            };
+            let row_key = Bytes::from(format!("{}:{}", table_id, pk));
+            if let Some(row_val) = self.kv.get(&row_key, read_ts)? {
+                rows.push((pk.to_string(), Self::decode_row(&row_val, &columns)?));
+            }
+        }
+        Ok(rows)
+    }
+
+    /// An index-only range scan: like [`Self::index_only_scan`], over the
+    /// entries between two bounds, each row's leading value decoded from its
+    /// entry key.
+    pub(crate) fn index_only_range_scan(
+        &self,
+        index_id: nodus_catalog::IndexId,
+        lower: Option<&(Value, bool)>,
+        upper: Option<&(Value, bool)>,
+        table: &nodus_catalog::TableDescriptor,
+        index: &nodus_catalog::IndexDescriptor,
+        session: &str,
+    ) -> Result<Vec<(String, Vec<Value>)>> {
+        let (data_type, ordered) = Self::index_entry_encoding(table, index);
+        let Some((start, end)) = Self::index_range_region(index_id, lower, upper, &data_type)
+        else {
+            return Ok(Vec::new());
+        };
+        let read_ts = self.read_ts(session);
+        let prefix = format!("i:{index_id}:");
+        let mut rows = Vec::new();
+        let entries = self.entries_between(&prefix, &start, &end, read_ts)?;
+        for (tail, payload) in entries {
+            let Some((encoded, pk)) = tail.split_once('-') else {
+                continue;
+            };
+            let leading = match Self::decode_key_component(encoded, &data_type, ordered) {
+                Some(value) => value,
+                None => continue,
+            };
+            // An index with no `INCLUDE` columns carries a key value and an
+            // empty payload.
+            if payload.is_empty() && !index.include_columns.is_empty() {
+                continue;
+            }
+            let included = Self::decode_row(
+                &payload,
+                &index
+                    .include_columns
+                    .iter()
+                    .filter_map(|id| table.columns.iter().find(|c| c.id == *id))
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            )?;
+            let mut row = vec![Value::Null; table.columns.len()];
+            for key in &index.key_columns {
+                if crate::index_keys::is_expression_key(key) {
+                    continue;
+                }
+                if let Some(at) = table.columns.iter().position(|c| c.id == key.column_id) {
+                    row[at] = leading.clone();
+                }
+            }
+            for (id, value) in index.include_columns.iter().zip(included) {
+                if let Some(at) = table.columns.iter().position(|c| c.id == *id) {
+                    row[at] = value;
+                }
+            }
+            rows.push((pk.to_string(), row));
+        }
+        Ok(rows)
+    }
+
+    /// A key component's value, as it was encoded.
+    fn decode_key_component(encoded: &str, data_type: &str, ordered: bool) -> Option<Value> {
+        if !ordered {
+            // The legacy encoding is the escaped rendering of the value.
+            let unescaped = encoded.replace("\\:", ":").replace("\\\\", "\\");
+            return Some(Value::Text(unescaped));
+        }
+        let bytes: Vec<u8> = encoded
+            .as_bytes()
+            .chunks(2)
+            .filter_map(|pair| {
+                std::str::from_utf8(pair)
+                    .ok()
+                    .and_then(|text| u8::from_str_radix(text, 16).ok())
+            })
+            .collect();
+        match bytes.first()? {
+            0x02 => Some(Value::Null),
+            0x01 => {
+                let payload = &bytes[1..bytes.len().saturating_sub(1)];
+                // A temporal column's bytes are the instant's count.
+                if let Some(kind) = crate::datetime::Kind::of_type(data_type)
+                    && payload.len() == 8
+                {
+                    use crate::datetime::Kind;
+                    let raw = (u64::from_be_bytes(payload.try_into().ok()?) ^ (1 << 63)) as i64;
+                    return Some(match kind {
+                        Kind::Date => Value::Text(crate::datetime::format_date(
+                            chrono::NaiveDate::default()
+                                .checked_add_days(chrono::Days::new(raw.max(0) as u64))?,
+                        )),
+                        Kind::Timestamp | Kind::TimestampTz => {
+                            let instant = chrono::DateTime::from_timestamp_micros(raw)?;
+                            Value::Text(crate::value::format_timestamp(
+                                instant.naive_utc(),
+                                matches!(kind, Kind::TimestampTz),
+                            ))
+                        }
+                        _ => return None,
+                    });
+                }
+                match crate::value::column_type(data_type) {
+                    crate::value::ColumnType::Int if payload.len() == 8 => {
+                        let raw = u64::from_be_bytes(payload.try_into().ok()?) ^ (1 << 63);
+                        Some(Value::Int(raw as i64))
+                    }
+                    crate::value::ColumnType::Float if payload.len() == 8 => {
+                        let bits = u64::from_be_bytes(payload.try_into().ok()?);
+                        let unflipped = if bits & (1 << 63) != 0 {
+                            bits ^ (1 << 63)
+                        } else {
+                            !bits
+                        };
+                        Some(Value::Float(f64::from_bits(unflipped)))
+                    }
+                    crate::value::ColumnType::Bool if payload.len() == 1 => {
+                        Some(Value::Bool(payload[0] != 0))
+                    }
+                    _ => {
+                        // Text, or a temporal instant: the bytes were the
+                        // UTF-8 text of the value.
+                        let text = std::str::from_utf8(payload).ok()?;
+                        Some(Value::Text(text.to_string()))
+                    }
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// An index-only scan: the rows of an index's entries under one leading
+    /// value, read from the entries themselves. The rows are full-width, the
+    /// columns the index does not cover left NULL — the caller reads only
+    /// covered columns.
+    pub(crate) fn index_only_scan(
+        &self,
+        index_id: nodus_catalog::IndexId,
+        index_val: &Value,
+        table: &nodus_catalog::TableDescriptor,
+        index: &nodus_catalog::IndexDescriptor,
+        session: &str,
+    ) -> Result<Vec<(String, Vec<Value>)>> {
+        let read_ts = self.read_ts(session);
+        let mut rows = Vec::new();
+        let (data_type, ordered) = Self::index_entry_encoding(table, index);
+        for (pk, payload) in
+            self.index_entries(index_id, index_val, &data_type, ordered, read_ts)?
+        {
+            // An index with no `INCLUDE` columns carries a key value and an
+            // empty payload.
+            if payload.is_empty() && !index.include_columns.is_empty() {
+                continue;
+            }
+            let included = Self::decode_row(
+                &payload,
+                &index
+                    .include_columns
+                    .iter()
+                    .filter_map(|id| table.columns.iter().find(|c| c.id == *id))
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            )?;
+            let mut row = vec![Value::Null; table.columns.len()];
+            for (key, value) in index
+                .key_columns
+                .iter()
+                .zip(std::iter::once(index_val.clone()))
+            {
+                if crate::index_keys::is_expression_key(key) {
+                    continue;
+                }
+                if let Some(at) = table.columns.iter().position(|c| c.id == key.column_id) {
+                    row[at] = value.clone();
+                }
+            }
+            for (id, value) in index.include_columns.iter().zip(included) {
+                if let Some(at) = table.columns.iter().position(|c| c.id == *id) {
+                    row[at] = value;
+                }
+            }
+            rows.push((pk, row));
+        }
+        Ok(rows)
+    }
+
+    /// Merges the session's uncommitted overlay into committed range
+    /// index-scan results, as `merge_overlay_eq` does for one value.
+    pub(crate) fn merge_overlay_range(
+        &self,
+        committed: Vec<(String, Vec<Value>)>,
+        table_id: TableId,
+        col_pos: Option<usize>,
+        lower: Option<&(Value, bool)>,
+        upper: Option<&(Value, bool)>,
+        session: &str,
+    ) -> Vec<Vec<Value>> {
+        let mut map: std::collections::BTreeMap<String, Vec<Value>> =
+            committed.into_iter().collect();
+        let columns = self.table_columns(table_id);
+        if let Some(txn) = self.active_txns.read().get(session) {
+            let start = format!("{}:", table_id);
+            let end = format!("{};", table_id);
+            for (key, value) in txn.overlay.range(start.clone()..end) {
+                let pk = key.strip_prefix(&start).unwrap_or(key).to_string();
+                match value {
+                    None => {
+                        map.remove(&pk);
+                    }
+                    Some(encoded) => {
+                        if let Ok(row) = Self::decode_row(encoded.as_bytes(), &columns) {
+                            let within = col_pos.and_then(|p| row.get(p)).is_some_and(|value| {
+                                lower.as_ref().is_none_or(|(bound, inclusive)| {
+                                    match compare(value, bound) {
+                                        std::cmp::Ordering::Greater => true,
+                                        std::cmp::Ordering::Equal => *inclusive,
+                                        std::cmp::Ordering::Less => false,
+                                    }
+                                }) && upper
+                                    .as_ref()
+                                    .is_none_or(|(bound, inclusive)| match compare(value, bound) {
+                                        std::cmp::Ordering::Less => true,
+                                        std::cmp::Ordering::Equal => *inclusive,
+                                        std::cmp::Ordering::Greater => false,
+                                    })
+                            });
+                            if within {
+                                map.insert(pk, row);
+                            } else {
+                                map.remove(&pk);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        map.into_values().collect()
     }
 
     /// Merges the session's uncommitted overlay into committed equality
@@ -1036,19 +1349,20 @@ impl MemExecutor {
     /// (its own pending index entries and rows included), keyed by primary key.
     pub(crate) fn index_rows(
         &self,
-        index_id: nodus_catalog::IndexId,
+        tbl: &nodus_catalog::TableDescriptor,
+        index: &nodus_catalog::IndexDescriptor,
         index_val: &Value,
         table_id: TableId,
         session: &str,
     ) -> Result<Vec<(String, Vec<Value>)>> {
-        let escaped = Self::escape_index_value(&render(&crate::value::key_form(index_val)));
-        let prefix = format!("i:{}:{}:", index_id, escaped);
-        let end = format!("i:{}:{};", index_id, escaped);
+        let (data_type, ordered) = Self::index_entry_encoding(tbl, index);
+        let (prefix, start, end) =
+            Self::index_value_region(index.id, index_val, &data_type, ordered);
         let read_ts = self.read_ts(session);
         let mut pks = std::collections::BTreeSet::new();
         for pair in self.kv.scan(
             KeyRange {
-                start: Bytes::from(prefix.clone()),
+                start: Bytes::from(start),
                 end: Bytes::from(end.clone()),
             },
             read_ts,
@@ -1120,6 +1434,107 @@ impl MemExecutor {
         )
     }
 
+    /// How an index's entry keys encode their leading value: the leading
+    /// column's type, and whether the order-preserving encoding applies. An
+    /// expression key or a type outside the encoding uses the legacy text
+    /// form (equality lookups only).
+    pub(crate) fn index_entry_encoding(
+        tbl: &nodus_catalog::TableDescriptor,
+        idx: &nodus_catalog::IndexDescriptor,
+    ) -> (String, bool) {
+        let column = idx.key_columns.first().and_then(|key| {
+            (!crate::index_keys::is_expression_key(key))
+                .then(|| tbl.columns.iter().find(|c| c.id == key.column_id))
+                .flatten()
+        });
+        match column {
+            Some(column)
+                if idx.key_version >= 2
+                    && crate::index_keys::order_encoded_type(&column.data_type) =>
+            {
+                (column.data_type.clone(), true)
+            }
+            _ => (String::new(), false),
+        }
+    }
+
+    /// The entry key of a leading value: the order-preserving encoding when
+    /// `ordered`, the legacy text form otherwise.
+    fn index_key_for(
+        index_id: nodus_catalog::IndexId,
+        index_val: &Value,
+        pk: &str,
+        data_type: &str,
+        ordered: bool,
+    ) -> String {
+        if ordered && let Some(hex) = crate::index_keys::key_component(index_val, data_type) {
+            return format!("i:{index_id}:{hex}-{pk}");
+        }
+        Self::index_key(index_id, index_val, pk)
+    }
+
+    /// Where an index's entries for one leading value live: the prefix they
+    /// share (their key is the prefix plus the row's key, `-`-separated in
+    /// the order-preserving encoding), and the range their scan reads.
+    fn index_value_region(
+        index_id: nodus_catalog::IndexId,
+        index_val: &Value,
+        data_type: &str,
+        ordered: bool,
+    ) -> (String, String, String) {
+        // The order-preserving encoding keys a value (`UPPER` hex of its
+        // bytes, terminated), so entry ranges can be bounded.
+        if ordered && let Some(hex) = crate::index_keys::key_component(index_val, data_type) {
+            let start = format!("i:{index_id}:{hex}");
+            let end = format!("i:{index_id}:{hex};");
+            let prefix = format!("{start}-");
+            return (prefix, start, end);
+        }
+        // The legacy text encoding: one escaped value, `:`-separated.
+        let escaped = Self::escape_index_value(&render(&crate::value::key_form(index_val)));
+        let prefix = format!("i:{}:{}:", index_id, escaped);
+        let start = prefix.clone();
+        let end = format!("i:{}:{};", index_id, escaped);
+        (prefix, start, end)
+    }
+
+    /// The entries of an index between two bounds of one leading value: the
+    /// keys the order-preserving encoding lies between, either end open or
+    /// closed to a value.
+    fn index_range_region(
+        index_id: nodus_catalog::IndexId,
+        lower: Option<&(Value, bool)>,
+        upper: Option<&(Value, bool)>,
+        data_type: &str,
+    ) -> Option<(String, String)> {
+        let start = match lower {
+            // `>= v` reads from the value's own encoding (its entries extend
+            // it); `> v` skips them, staying below any longer value's.
+            Some((value, inclusive)) => {
+                let hex = crate::index_keys::key_component(value, data_type)?;
+                if *inclusive {
+                    format!("i:{index_id}:{hex}")
+                } else {
+                    format!("i:{index_id}:{hex}01")
+                }
+            }
+            None => format!("i:{index_id}:"),
+        };
+        let end = match upper {
+            // `<= v` includes the value's own entries; `< v` excludes them.
+            Some((value, inclusive)) => {
+                let hex = crate::index_keys::key_component(value, data_type)?;
+                if *inclusive {
+                    format!("i:{index_id}:{hex}01")
+                } else {
+                    format!("i:{index_id}:{hex}")
+                }
+            }
+            None => format!("i:{index_id};"),
+        };
+        Some((start, end))
+    }
+
     pub(crate) fn write_index_entry(
         &self,
         session: &str,
@@ -1127,8 +1542,60 @@ impl MemExecutor {
         index_val: &Value,
         pk: &str,
     ) -> Result<()> {
+        self.write_index_entry_payload(session, index_id, index_val, pk, "")
+    }
+
+    /// Writes an entry whose payload holds the index's `INCLUDE` columns.
+    pub(crate) fn write_index_entry_payload(
+        &self,
+        session: &str,
+        index_id: nodus_catalog::IndexId,
+        index_val: &Value,
+        pk: &str,
+        payload: &str,
+    ) -> Result<()> {
         let key = Self::index_key(index_id, index_val, pk);
-        self.write_row(session, key, "".to_string())
+        self.write_row(session, key, payload.to_string())
+    }
+
+    /// Whether an index reads and writes the order-preserving entry keys.
+    fn index_ordered(
+        &self,
+        tbl: &nodus_catalog::TableDescriptor,
+        idx: &nodus_catalog::IndexDescriptor,
+    ) -> bool {
+        Self::index_entry_encoding(tbl, idx).1
+    }
+
+    /// Writes `tbl`'s entry of `idx` for `row`, payload included — the one
+    /// call every index-maintaining path makes.
+    pub(crate) fn write_row_index_entry(
+        &self,
+        session: &str,
+        tbl: &nodus_catalog::TableDescriptor,
+        idx: &nodus_catalog::IndexDescriptor,
+        index_val: &Value,
+        pk: &str,
+        row: &[Value],
+    ) -> Result<()> {
+        let payload = Self::index_entry_payload(tbl, idx, row);
+        let (data_type, ordered) = Self::index_entry_encoding(tbl, idx);
+        let key = Self::index_key_for(idx.id, index_val, pk, &data_type, ordered);
+        self.write_row(session, key, payload)
+    }
+
+    /// Removes `tbl`'s entry of `idx` for `row`, keyed as it was written.
+    pub(crate) fn delete_row_index_entry(
+        &self,
+        session: &str,
+        tbl: &nodus_catalog::TableDescriptor,
+        idx: &nodus_catalog::IndexDescriptor,
+        index_val: &Value,
+        pk: &str,
+    ) -> Result<()> {
+        let (data_type, ordered) = Self::index_entry_encoding(tbl, idx);
+        let key = Self::index_key_for(idx.id, index_val, pk, &data_type, ordered);
+        self.delete_row(session, key)
     }
 
     pub(crate) fn delete_index_entry(

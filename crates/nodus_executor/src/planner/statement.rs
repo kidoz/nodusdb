@@ -100,6 +100,8 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
             // Key constraints' `DEFERRABLE` / `INITIALLY DEFERRED` /
             // `NULLS NOT DISTINCT`, by their columns.
             let mut key_flags: Vec<(Vec<String>, bool, bool, bool)> = Vec::new();
+            // Key constraints' `INCLUDE (...)` columns, by their columns.
+            let mut key_includes: Vec<(Vec<String>, Vec<String>)> = Vec::new();
             for c in columns {
                 let mut nullable = true;
                 let mut unique = false;
@@ -310,6 +312,15 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                         if let Some(name) = &uc.name {
                             key_names.push((names.clone(), name.value.clone()));
                         }
+                        if !uc.include.is_empty() {
+                            key_includes.push((
+                                names.clone(),
+                                uc.include
+                                    .iter()
+                                    .map(|column| column.value.clone())
+                                    .collect(),
+                            ));
+                        }
                         let flags = deferral(&uc.characteristics)?;
                         let nnd = nulls_not_distinct(uc);
                         if flags != (false, false) || nnd {
@@ -327,6 +338,15 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                     sqlparser::ast::TableConstraint::PrimaryKey(pk) => {
                         if let Some(name) = &pk.name {
                             key_names.push((index_column_names(&pk.columns), name.value.clone()));
+                        }
+                        if !pk.include.is_empty() {
+                            key_includes.push((
+                                index_column_names(&pk.columns),
+                                pk.include
+                                    .iter()
+                                    .map(|column| column.value.clone())
+                                    .collect(),
+                            ));
                         }
                         let flags = deferral(&pk.characteristics)?;
                         if flags != (false, false) {
@@ -367,6 +387,7 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                 unique_constraints,
                 key_names,
                 key_flags,
+                key_includes,
                 on_commit: match create_table.on_commit {
                     Some(sqlparser::ast::OnCommit::Drop) => Some("DROP".to_string()),
                     Some(sqlparser::ast::OnCommit::DeleteRows) => Some("DELETE ROWS".to_string()),
@@ -546,6 +567,11 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                 predicate,
                 expressions,
                 descending,
+                include: create_index
+                    .include
+                    .iter()
+                    .map(|column| column.value.clone())
+                    .collect(),
             })
         }
         Statement::CreateRole(create_role) => {

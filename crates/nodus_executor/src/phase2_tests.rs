@@ -58,6 +58,7 @@ fn test_group_by_aggregates() {
             partition_of: None,
             for_values: None,
             key_flags: vec![],
+            key_includes: Vec::new(),
         },
     )
     .unwrap();
@@ -306,6 +307,7 @@ fn test_set_operations() {
                 partition_of: None,
                 for_values: None,
                 key_flags: vec![],
+                key_includes: Vec::new(),
             },
         )
         .unwrap();
@@ -413,6 +415,7 @@ fn test_cross_join() {
                 partition_of: None,
                 for_values: None,
                 key_flags: vec![],
+                key_includes: Vec::new(),
             },
         )
         .unwrap();
@@ -489,6 +492,7 @@ fn test_having() {
             partition_of: None,
             for_values: None,
             key_flags: vec![],
+            key_includes: Vec::new(),
         },
     )
     .unwrap();
@@ -591,6 +595,7 @@ fn test_window_functions() {
             partition_of: None,
             for_values: None,
             key_flags: vec![],
+            key_includes: Vec::new(),
         },
     )
     .unwrap();

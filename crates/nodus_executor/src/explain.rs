@@ -320,7 +320,28 @@ impl MemExecutor {
                 let single = joins.is_empty();
                 // A filter on one relation is shown on its scan.
                 let scan_filter = if single { filter.as_ref() } else { None };
-                let mut node = self.explain_relation(
+                // The columns the statement reads: a covering index is
+                // preferred for them, and — when nothing later reads an
+                // uncovered column — serves them alone.
+                let sort_keys: Vec<crate::plan_types::SortKey> = if sort.is_empty() {
+                    order_by.iter().cloned().map(SortKey::from_legacy).collect()
+                } else {
+                    sort.clone()
+                };
+                let needed_columns =
+                    crate::index_keys::index_only_needed(projection, filter.as_ref()).and_then(
+                        |mut needed| {
+                            needed.extend(crate::index_keys::sort_columns(&sort_keys, projection)?);
+                            Some(needed)
+                        },
+                    );
+                let allow_index_only = single
+                    && group_by.is_empty()
+                    && distinct_on.is_empty()
+                    && !*distinct
+                    && having.is_none()
+                    && sample.is_none();
+                let mut node = self.explain_relation_reading(
                     ctx,
                     table_name,
                     table_alias.as_deref(),
@@ -328,6 +349,8 @@ impl MemExecutor {
                     &scope,
                     sample.as_ref(),
                     *only,
+                    needed_columns.as_deref(),
+                    allow_index_only,
                 )?;
                 for join in joins {
                     let right = match (&join.lateral, &join.table_fn) {
@@ -457,7 +480,40 @@ impl MemExecutor {
                 } else {
                     sort.clone()
                 };
-                if !sort.is_empty() {
+                // An index scan already reads the leading column in order,
+                // so `ORDER BY` it adds no Sort, as PostgreSQL plans it.
+                let index_ordered = |node: &Node| -> Option<(String, bool)> {
+                    if node.kind != "Index Scan" && node.kind != "Index Only Scan" {
+                        return None;
+                    }
+                    let name = node
+                        .props
+                        .iter()
+                        .find(|(name, _)| *name == "Index Name")
+                        .and_then(|(_, value)| value.as_str())
+                        .map(str::to_string)?;
+                    let (db, schema, table) = parse_object_name(table_name).ok()?;
+                    let tbl = self.catalog_reader.get_table(db, schema, table).ok()?;
+                    let idx = tbl.indexes.iter().find(|i| i.name == name)?;
+                    let key = idx.key_columns.first()?;
+                    if crate::index_keys::is_expression_key(key) {
+                        return None;
+                    }
+                    let column = tbl.columns.iter().find(|c| c.id == key.column_id)?;
+                    Some((column.name.clone(), true))
+                };
+                let sorted_by_the_index = matches!(
+                    (index_ordered(&node), sort.as_slice()),
+                    (Some((column, true)), [key])
+                        if key.ascending
+                            && key.nulls_first.is_none()
+                            && matches!(
+                                &key.target,
+                                SortTarget::Name(name)
+                                    if name.rsplit('.').next() == Some(column.as_str())
+                            )
+                );
+                if !sort.is_empty() && !sorted_by_the_index {
                     let keys: Vec<String> = sort
                         .iter()
                         .map(|k| sort_key_text(k, projection, qualified))
@@ -830,6 +886,34 @@ impl MemExecutor {
         sample: Option<&crate::SampleSpec>,
         only: bool,
     ) -> Result<Node> {
+        self.explain_relation_reading(
+            ctx,
+            table_name,
+            table_alias,
+            filter,
+            ctes,
+            sample,
+            only,
+            None,
+            false,
+        )
+    }
+
+    /// A scan with the columns the statement reads: when an index covers
+    /// them all, it is an index-only scan.
+    #[allow(clippy::too_many_arguments)]
+    fn explain_relation_reading(
+        &self,
+        ctx: &ExecutionContext,
+        table_name: &str,
+        table_alias: Option<&str>,
+        filter: Option<&FilterExpr>,
+        ctes: &[(String, &LogicalPlan)],
+        sample: Option<&crate::SampleSpec>,
+        only: bool,
+        index_only: Option<&[String]>,
+        allow_index_only: bool,
+    ) -> Result<Node> {
         let with_filter = |mut node: Node| {
             if let Some(f) = filter {
                 node = node.detail("Filter", deparse_filter(f, false));
@@ -908,43 +992,123 @@ impl MemExecutor {
         }
         let width: u32 = tbl.columns.iter().map(|c| type_width(&c.data_type)).sum();
         let pages = (rows * width as f64 / 8192.0).ceil().max(1.0);
-        // The executor looks up `col = value` on an indexed column by index.
-        if sample.is_none()
-            && let Some(FilterExpr::Predicate(Predicate {
-                left,
-                op: CompareOp::Eq,
-                right: Operand::Literal(_),
-            })) = filter
-        {
-            let name = left.rsplit('.').next().unwrap_or(left);
-            if let Some(col) = tbl.columns.iter().find(|c| c.name == name)
-                && let Some(idx) = tbl
-                    .indexes
-                    .iter()
-                    .find(|i| i.key_columns.iter().any(|k| k.column_id == col.id))
-            {
-                let mut node = Node::new(
-                    "Index Scan",
-                    format!("Index Scan using {} on {label}", idx.name),
-                    if idx.unique {
-                        1.0
-                    } else {
-                        (rows * 0.005).max(1.0)
-                    },
-                    width,
-                )
-                .prop("Scan Direction", json!("Forward"))
-                .prop("Index Name", json!(idx.name))
-                .prop("Relation Name", json!(table_only))
-                .prop("Alias", json!(table_alias.unwrap_or(table_only)))
-                .detail(
-                    "Index Cond",
-                    deparse_filter(filter.expect("matched"), false),
-                );
-                node.startup = 0.15;
-                node.total = 8.17;
-                return Ok(node);
+        // The executor reads `col = value` on an indexed column by index,
+        // and — when the session asks for index scans — a range over the
+        // leading column from the index's key order (`SET enable_seqscan =
+        // off`).
+        // The index the scan reads: an equality on the leading column of
+        // one (found in a conjunction), or — when the session asks for index
+        // scans — a range over it (`SET enable_seqscan = off`).
+        let scan_index = tbl.indexes.iter().find_map(|idx| {
+            let key = idx.key_columns.first()?;
+            if crate::index_keys::is_expression_key(key) {
+                return None;
             }
+            let column = tbl.columns.iter().find(|c| c.id == key.column_id)?;
+            let equality = filter
+                .and_then(|filter| {
+                    crate::index_keys::equality_operand(filter, &column.name).map(|_| ())
+                })
+                .is_some();
+            let range = !equality
+                && crate::session_env::setting("enable_seqscan").as_deref() == Some("off")
+                && filter
+                    .and_then(|filter| crate::index_keys::range_bounds(filter, &column.name))
+                    .is_some()
+                && Self::index_entry_encoding(&tbl, idx).1;
+            (equality || range).then_some((column, idx))
+        });
+        if sample.is_none()
+            && let Some((col, idx)) = scan_index
+            && let Some(idx) =
+                crate::index_keys::equality_index(&tbl, &tbl.indexes, col.id, index_only)
+        {
+            // The scan's own condition is what the index is read by; the
+            // rest of the filter is applied to each row (`Filter:`), as
+            // PostgreSQL splits them.
+            let (index_cond_text, residual_filter) = match filter {
+                Some(filter) => {
+                    let mut index_conds: Vec<&FilterExpr> = Vec::new();
+                    let mut residuals: Vec<&FilterExpr> = Vec::new();
+                    for conjunct in crate::index_keys::conjuncts(filter) {
+                        let usable = match conjunct {
+                            FilterExpr::Predicate(Predicate { left, op, right }) => {
+                                let name = left.rsplit('.').next().unwrap_or(left);
+                                name == col.name
+                                    && matches!(
+                                        op,
+                                        CompareOp::Eq
+                                            | CompareOp::Lt
+                                            | CompareOp::Le
+                                            | CompareOp::Gt
+                                            | CompareOp::Ge
+                                    )
+                                    && matches!(right, Operand::Literal(_))
+                            }
+                            _ => false,
+                        };
+                        if usable {
+                            index_conds.push(conjunct);
+                        } else {
+                            residuals.push(conjunct);
+                        }
+                    }
+                    let join = |parts: &[&FilterExpr]| -> Option<String> {
+                        match parts {
+                            [] => None,
+                            [one] => Some(deparse_filter(one, false)),
+                            many => Some(format!(
+                                "({})",
+                                many.iter()
+                                    .map(|part| deparse_filter(part, false))
+                                    .collect::<Vec<_>>()
+                                    .join(" AND ")
+                            )),
+                        }
+                    };
+                    (
+                        join(&index_conds).unwrap_or_else(|| deparse_filter(filter, false)),
+                        join(&residuals),
+                    )
+                }
+                None => (String::new(), None),
+            };
+            let only = allow_index_only
+                && index_only
+                    .is_some_and(|needed| crate::index_keys::index_covers(&tbl, idx, needed));
+            let mut node = Node::new(
+                if only {
+                    "Index Only Scan"
+                } else {
+                    "Index Scan"
+                },
+                format!(
+                    "{} using {} on {label}",
+                    if only {
+                        "Index Only Scan"
+                    } else {
+                        "Index Scan"
+                    },
+                    idx.name
+                ),
+                if idx.unique {
+                    1.0
+                } else {
+                    (rows * 0.005).max(1.0)
+                },
+                width,
+            )
+            .prop("Scan Direction", json!("Forward"))
+            .prop("Index Name", json!(idx.name))
+            .prop("Relation Name", json!(table_only))
+            .prop("Alias", json!(table_alias.unwrap_or(table_only)))
+            .detail("Index Cond", index_cond_text);
+            if let Some(residual) = residual_filter {
+                node = node.detail("Filter", residual);
+            }
+            node.startup = 0.15;
+            node.total = 8.17;
+            return Ok(node);
         }
         let mut node = match sample {
             Some(spec) => {

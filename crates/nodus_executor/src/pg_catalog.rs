@@ -378,14 +378,17 @@ impl MemExecutor {
                             Value::Text(String::new()),
                         ]);
                     }
-                    // An index's attributes are its key columns.
+                    // An index's attributes are its key columns, then the
+                    // included ones.
                     for index in &Self::table_indexes(table) {
                         let index_oid =
                             Self::index_oid(db_name, &schema_name, &table.name, &index.name);
                         let keys = index
                             .key_columns
                             .iter()
-                            .filter_map(|key| table.columns.iter().find(|c| c.id == key.column_id));
+                            .map(|key| key.column_id)
+                            .chain(index.include_columns.iter().copied())
+                            .filter_map(|id| table.columns.iter().find(|c| c.id == id));
                         for (idx, column) in keys.enumerate() {
                             let type_oid = Self::pg_type_oid(&column.data_type);
                             rows.push(vec![
@@ -516,7 +519,9 @@ impl MemExecutor {
                                 &index.name,
                             )),
                             Value::Int(relid),
-                            Value::Int(index.key_columns.len() as i64),
+                            Value::Int(
+                                (index.key_columns.len() + index.include_columns.len()) as i64,
+                            ),
                             Value::Int(index.key_columns.len() as i64),
                             Value::Bool(index.unique),
                             Value::Bool(index.nulls_not_distinct),
@@ -3619,8 +3624,23 @@ impl MemExecutor {
         } else {
             ""
         };
+        // `INCLUDE (...)` follows the key list, as PostgreSQL prints it.
+        let include = if index.include_columns.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " INCLUDE ({})",
+                index
+                    .include_columns
+                    .iter()
+                    .filter_map(|id| table.columns.iter().find(|c| c.id == *id))
+                    .map(|c| quote_ident(&c.name))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
         format!(
-            "CREATE {}INDEX {} ON {relation} USING btree ({}){nulls}{predicate}",
+            "CREATE {}INDEX {} ON {relation} USING btree ({}){include}{nulls}{predicate}",
             if index.unique { "UNIQUE " } else { "" },
             quote_ident(&index.name),
             keys.join(", ")
@@ -3656,6 +3676,14 @@ impl MemExecutor {
                         "UNIQUE"
                     };
                     let columns = column_list(&mut index.key_columns.iter().map(|k| k.column_id));
+                    let include = if index.include_columns.is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            " INCLUDE ({})",
+                            column_list(&mut index.include_columns.iter().copied())
+                        )
+                    };
                     let nulls = if index.nulls_not_distinct {
                         " NULLS NOT DISTINCT"
                     } else {
@@ -3668,7 +3696,7 @@ impl MemExecutor {
                     } else {
                         " DEFERRABLE"
                     };
-                    return Some(format!("{kind}{nulls} ({columns}){deferral}"));
+                    return Some(format!("{kind}{nulls} ({columns}){include}{deferral}"));
                 }
             }
             for column in table.columns.iter().filter(|c| !c.nullable) {

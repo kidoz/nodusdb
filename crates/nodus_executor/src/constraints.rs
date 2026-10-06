@@ -243,7 +243,8 @@ impl MemExecutor {
             return Ok(None);
         }
         Ok(Some(self.index_rows(
-            index.id,
+            tbl,
+            index,
             &row[leading],
             tbl.id,
             session,
@@ -340,7 +341,7 @@ impl MemExecutor {
                 .map(|(k, r)| (k.strip_prefix(&prefix).unwrap_or(&k).to_string(), r))
                 .collect()
         } else {
-            self.index_rows(idx.id, &key[0], tbl.id, session)?
+            self.index_rows(tbl, idx, &key[0], tbl.id, session)?
         };
         Ok(candidates
             .into_iter()

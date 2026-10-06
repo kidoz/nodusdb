@@ -86,6 +86,7 @@ fn test_ddl_and_subqueries() {
             partition_of: None,
             for_values: None,
             key_flags: vec![],
+            key_includes: Vec::new(),
         },
     )
     .unwrap();
@@ -153,6 +154,7 @@ fn test_ddl_and_subqueries() {
             predicate: None,
             expressions: vec![],
             descending: vec![],
+            include: Vec::new(),
             nulls_not_distinct: false,
         },
     )
@@ -194,6 +196,7 @@ fn test_ddl_and_subqueries() {
             partition_of: None,
             for_values: None,
             key_flags: vec![],
+            key_includes: Vec::new(),
         },
     )
     .unwrap();
@@ -340,6 +343,7 @@ fn test_unique_constraints() {
             partition_of: None,
             for_values: None,
             key_flags: vec![],
+            key_includes: Vec::new(),
         },
     )
     .unwrap();
@@ -509,6 +513,7 @@ fn test_secondary_indexing() {
             partition_of: None,
             for_values: None,
             key_flags: vec![],
+            key_includes: Vec::new(),
         },
     )
     .unwrap();
@@ -547,6 +552,7 @@ fn test_secondary_indexing() {
             predicate: None,
             expressions: vec![],
             descending: vec![],
+            include: Vec::new(),
             nulls_not_distinct: false,
         },
     )
@@ -812,6 +818,7 @@ fn test_index_value_containing_separator_does_not_overmatch() {
             partition_of: None,
             for_values: None,
             key_flags: vec![],
+            key_includes: Vec::new(),
         },
     )
     .unwrap();
@@ -846,6 +853,7 @@ fn test_index_value_containing_separator_does_not_overmatch() {
             predicate: None,
             expressions: vec![],
             descending: vec![],
+            include: Vec::new(),
             nulls_not_distinct: false,
         },
     )
@@ -952,6 +960,7 @@ fn test_alter_table_migrations() {
             partition_of: None,
             for_values: None,
             key_flags: vec![],
+            key_includes: Vec::new(),
         },
     )
     .unwrap();
