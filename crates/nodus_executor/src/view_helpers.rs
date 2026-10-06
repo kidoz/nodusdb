@@ -66,6 +66,16 @@ impl MemExecutor {
         )
     }
 
+    /// The OID `tableoid` shows for a row of `table`.
+    pub(crate) fn tableoid_of(&self, table: &nodus_catalog::TableDescriptor) -> i64 {
+        let schemas = self
+            .catalog_reader
+            .list_schemas("default")
+            .unwrap_or_default();
+        let schema = Self::schema_name_by_id("default", &schemas, table.schema_id);
+        Self::table_oid("default", &schema, &table.name)
+    }
+
     /// The OID of a relation's row type (`pg_class.reltype`,
     /// `pg_type.typrelid`).
     pub(crate) fn row_type_oid(db_name: &str, schema_name: &str, table_name: &str) -> i64 {

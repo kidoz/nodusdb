@@ -200,6 +200,27 @@ pub(crate) fn parse_filter_expr(
                     subquery: Box::new(plan_query(query, params)?),
                 }),
                 _ => extract_operand(right, params).map(|right| {
+                    // `col = col` is `col IS NOT NULL`, as PostgreSQL plans
+                    // it — the same column, so the qualifiers must agree.
+                    if cmp == CompareOp::Eq
+                        && let Operand::Ident(name) = &right
+                        && {
+                            let (left_qualifier, left_name) = match left_col.rsplit_once('.') {
+                                Some((qualifier, bare)) => (qualifier, bare),
+                                None => ("", left_col.as_str()),
+                            };
+                            let (right_qualifier, right_name) = match name.rsplit_once('.') {
+                                Some((qualifier, bare)) => (qualifier, bare),
+                                None => ("", name.as_str()),
+                            };
+                            left_name == right_name
+                                && (right_qualifier.is_empty()
+                                    || left_qualifier.is_empty()
+                                    || left_qualifier == right_qualifier)
+                        }
+                    {
+                        return FilterExpr::IsNotNull(left_col);
+                    }
                     FilterExpr::Predicate(Predicate {
                         left: left_col,
                         op: cmp,

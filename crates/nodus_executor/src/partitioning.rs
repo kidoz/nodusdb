@@ -74,9 +74,11 @@ impl PartitionKey {
             "HASH" => Strategy::Hash,
             other => anyhow::bail!("unsupported partition strategy: {other}"),
         };
-        let columns: Vec<String> = rest
-            .trim_end_matches(')')
-            .split(',')
+        // The clause's closing parenthesis (one, not a nested one).
+        let rest = rest.trim_end();
+        let rest = rest.strip_suffix(')').unwrap_or(rest);
+        let columns: Vec<String> = split_values(rest)?
+            .into_iter()
             .map(|c| c.trim().to_string())
             .filter(|c| !c.is_empty())
             .collect();
@@ -356,36 +358,68 @@ pub(crate) fn contains(bound: &Bound, values: &[Value], types: &[String]) -> boo
     }
 }
 
-/// The key values of a row, by the parent's key columns.
+/// The key values of a row: a part that names a column reads it, an
+/// expression part (`lower(n)`) is evaluated over the row.
 pub(crate) fn key_values(
     parent: &TableDescriptor,
     key: &PartitionKey,
     row: &[Value],
 ) -> Result<Vec<Value>> {
+    let names: Vec<String> = parent.columns.iter().map(|c| c.name.clone()).collect();
     key.columns
         .iter()
-        .map(|column| {
-            parent
-                .columns
-                .iter()
-                .position(|c| &c.name == column)
-                .and_then(|at| row.get(at))
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("column \"{column}\" does not exist"))
+        .map(|part| {
+            if let Some(at) = parent.columns.iter().position(|c| &c.name == part) {
+                return row
+                    .get(at)
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("column \"{part}\" does not exist"));
+            }
+            let expr = key_expression(part)?;
+            Ok(crate::planner::eval_scalar_expr(&expr, row, &names))
         })
         .collect()
 }
 
-/// The key columns' declared types.
+/// The compiled expression a key part names, cached: the text is fixed by
+/// `PARTITION BY`, and the expression references columns by name.
+pub(crate) fn key_expression(part: &str) -> Result<crate::ScalarExpr> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<String, crate::ScalarExpr>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(expr) = cache.lock().unwrap().get(part) {
+        return Ok(expr.clone());
+    }
+    let parsed = sqlparser::parser::Parser::new(&sqlparser::dialect::PostgreSqlDialect {})
+        .try_with_sql(part)
+        .and_then(|mut parser| parser.parse_expr())
+        .map_err(|e| anyhow::anyhow!("partition key \"{part}\" cannot be evaluated: {e}"))?;
+    let expr = crate::planner::lower_scalar(&parsed, &[])
+        .ok_or_else(|| anyhow::anyhow!("partition key \"{part}\" cannot be evaluated"))?;
+    cache.lock().unwrap().insert(part.to_string(), expr.clone());
+    Ok(expr)
+}
+
+/// The key's declared types: a column part's, or an expression part's
+/// result type.
 pub(crate) fn key_types(parent: &TableDescriptor, key: &PartitionKey) -> Vec<String> {
+    let column_type = |name: &str| {
+        parent
+            .columns
+            .iter()
+            .find(|c| c.name == name)
+            .map(|c| c.data_type.clone())
+    };
     key.columns
         .iter()
-        .map(|column| {
-            parent
-                .columns
-                .iter()
-                .find(|c| &c.name == column)
-                .map(|c| c.data_type.clone())
+        .map(|part| {
+            if let Some(column) = parent.columns.iter().find(|c| &c.name == part) {
+                return column.data_type.clone();
+            }
+            key_expression(part)
+                .ok()
+                .and_then(|expr| crate::result_types::expr_type(&expr, &column_type))
                 .unwrap_or_else(|| "text".to_string())
         })
         .collect()
@@ -837,6 +871,31 @@ impl crate::MemExecutor {
         candidate: &str,
         exclude: Option<nodus_catalog::TableId>,
     ) -> Result<()> {
+        // A range with no values: PostgreSQL refuses it by name.
+        if let Bound::Range { from, to } = bound
+            && bound_vec_cmp(from, to) != std::cmp::Ordering::Less
+        {
+            let render = |values: &[BoundValue]| {
+                values
+                    .iter()
+                    .map(|value| match value {
+                        BoundValue::Min => "MINVALUE".to_string(),
+                        BoundValue::Max => "MAXVALUE".to_string(),
+                        BoundValue::Value(value) => render_literal(value),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            return Err(crate::error_fields::DbError::new(format!(
+                "empty range bound specified for partition \"{candidate}\""
+            ))
+            .detail(format!(
+                "Specified lower bound ({}) is greater than or equal to upper bound ({}).",
+                render(from),
+                render(to)
+            ))
+            .into());
+        }
         let mut default: Option<TableDescriptor> = None;
         for sibling in self
             .partition_children("default", parent.id)?
@@ -954,10 +1013,463 @@ impl crate::MemExecutor {
     }
 }
 
+/// What a filter says about a partition key.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum KeyConstraint {
+    /// `key = v` / `key IN (v, ...)`: the key is one of these values.
+    Equals(Vec<Value>),
+    /// `key <cmp> v`: the key lies in this interval, the flags telling
+    /// whether an end is inclusive.
+    Range {
+        lower: Option<(Value, bool)>,
+        upper: Option<(Value, bool)>,
+    },
+}
+
+/// The partitions of `children` a filter can leave rows in, as PostgreSQL
+/// prunes them at plan time: `AND` keeps what both sides keep, `OR` what
+/// either keeps, and a comparison against a key value narrows to the
+/// partitions its interval reaches. A `DEFAULT` partition survives unless
+/// the named ones cover everything the filter allows.
+pub(crate) fn surviving_partitions(
+    parent: &TableDescriptor,
+    key: &PartitionKey,
+    children: &[TableDescriptor],
+    filter: Option<&crate::plan_types::FilterExpr>,
+) -> Vec<usize> {
+    let types = key_types(parent, key);
+    let bounds: Vec<Option<Bound>> = children
+        .iter()
+        .map(|child| {
+            child
+                .partition_bound
+                .as_deref()
+                .and_then(|text| parse_bound(text, key, &types).ok())
+        })
+        .collect();
+    let satisfies = |at: usize, constraint: &KeyConstraint| {
+        bounds[at]
+            .as_ref()
+            .is_some_and(|bound| bound_reaches(bound, constraint, &types))
+    };
+    let mut survivors: Vec<bool> = match filter {
+        Some(filter) => filter_survivors(key, filter, &satisfies, children.len()),
+        None => vec![true; children.len()],
+    };
+    // A default partition that no constraint reaches may still hold rows:
+    // it survives unless the named partitions cover the whole constraint.
+    for at in 0..children.len() {
+        if bounds[at] != Some(Bound::Default) {
+            continue;
+        }
+        let covers = match filter {
+            Some(filter) => default_is_covered(key, filter, &survivors, &bounds, &types),
+            None => false,
+        };
+        survivors[at] = !covers;
+    }
+    (0..children.len()).filter(|at| survivors[*at]).collect()
+}
+
+/// The survivors of a filter over `len` partitions; `satisfies` says
+/// whether a partition can hold a row meeting one constraint.
+fn filter_survivors(
+    key: &PartitionKey,
+    filter: &crate::plan_types::FilterExpr,
+    satisfies: &impl Fn(usize, &KeyConstraint) -> bool,
+    len: usize,
+) -> Vec<bool> {
+    use crate::plan_types::FilterExpr;
+    match filter {
+        FilterExpr::And(left, right) => {
+            let mut left = filter_survivors(key, left, satisfies, len);
+            let right = filter_survivors(key, right, satisfies, len);
+            for at in 0..len {
+                left[at] &= right[at];
+            }
+            left
+        }
+        FilterExpr::Or(left, right) => {
+            let mut left = filter_survivors(key, left, satisfies, len);
+            let right = filter_survivors(key, right, satisfies, len);
+            for at in 0..len {
+                left[at] |= right[at];
+            }
+            left
+        }
+        _ => match key_constraint(key, filter) {
+            Some(constraint) => (0..len).map(|at| satisfies(at, &constraint)).collect(),
+            None => vec![true; len],
+        },
+    }
+}
+
+/// The constraint a single predicate puts on the key, when it compares a
+/// key column (or the key's expression, as written) with a literal.
+fn key_constraint(
+    key: &PartitionKey,
+    filter: &crate::plan_types::FilterExpr,
+) -> Option<KeyConstraint> {
+    use crate::plan_types::{CompareOp, FilterExpr, Operand, ScalarExpr};
+    let part = key.columns.first()?;
+    let matches = |left: &str| {
+        let name = left.rsplit('.').next().unwrap_or(left).trim_matches('"');
+        name == part
+    };
+    let constraint = |op: CompareOp, value: &Value| match op {
+        CompareOp::Eq => Some(KeyConstraint::Equals(vec![value.clone()])),
+        CompareOp::Lt => Some(KeyConstraint::Range {
+            lower: None,
+            upper: Some((value.clone(), false)),
+        }),
+        CompareOp::Le => Some(KeyConstraint::Range {
+            lower: None,
+            upper: Some((value.clone(), true)),
+        }),
+        CompareOp::Gt => Some(KeyConstraint::Range {
+            lower: Some((value.clone(), false)),
+            upper: None,
+        }),
+        CompareOp::Ge => Some(KeyConstraint::Range {
+            lower: Some((value.clone(), true)),
+            upper: None,
+        }),
+        _ => None,
+    };
+    match filter {
+        FilterExpr::Predicate(predicate) if matches(&predicate.left) => match &predicate.right {
+            Operand::Literal(value) => constraint(predicate.op, value),
+            Operand::Ident(_) => None,
+        },
+        FilterExpr::ExprCmp { left, op, right } => {
+            let rendered = crate::explain::deparse_scalar(left, false);
+            if !matches(&rendered) {
+                return None;
+            }
+            match right {
+                ScalarExpr::Literal(value) => constraint(*op, value),
+                _ => None,
+            }
+        }
+        // A whole expression compared with a literal (`lower(n) = 'bob'`).
+        FilterExpr::Scalar(ScalarExpr::Binary { op, left, right }) => {
+            use crate::plan_types::ScalarBinaryOp as B;
+            let rendered = crate::explain::deparse_scalar(left, false);
+            if !matches(&rendered) {
+                return None;
+            }
+            let ScalarExpr::Literal(value) = right.as_ref() else {
+                return None;
+            };
+            match op {
+                B::Eq => Some(KeyConstraint::Equals(vec![value.clone()])),
+                B::Lt => Some(KeyConstraint::Range {
+                    lower: None,
+                    upper: Some((value.clone(), false)),
+                }),
+                B::LtEq => Some(KeyConstraint::Range {
+                    lower: None,
+                    upper: Some((value.clone(), true)),
+                }),
+                B::Gt => Some(KeyConstraint::Range {
+                    lower: Some((value.clone(), false)),
+                    upper: None,
+                }),
+                B::GtEq => Some(KeyConstraint::Range {
+                    lower: Some((value.clone(), true)),
+                    upper: None,
+                }),
+                _ => None,
+            }
+        }
+        FilterExpr::InList {
+            left,
+            list,
+            negated: false,
+        } if matches(left) => {
+            let mut values = Vec::new();
+            for item in list {
+                match item {
+                    Operand::Literal(value) => values.push(value.clone()),
+                    Operand::Ident(_) => return None,
+                }
+            }
+            Some(KeyConstraint::Equals(values))
+        }
+        _ => None,
+    }
+}
+
+/// Whether a partition bound can hold a key meeting the constraint.
+fn bound_reaches(bound: &Bound, constraint: &KeyConstraint, types: &[String]) -> bool {
+    match constraint {
+        KeyConstraint::Equals(values) => values.iter().any(|value| match bound {
+            // The default partition holds what none of its siblings claim;
+            // the caller settles it from the other bounds.
+            Bound::Default => true,
+            _ => contains(bound, std::slice::from_ref(value), types),
+        }),
+        KeyConstraint::Range { lower, upper } => match bound {
+            // A range key's partition is an interval: they are disjoint
+            // when one ends before the other starts.
+            Bound::Range { from, to } => {
+                let starts_before_key_ends = match upper {
+                    Some((value, inclusive)) => {
+                        let end = [BoundValue::Value(value.clone())];
+                        let ord = bound_vec_cmp(from, &end);
+                        ord == std::cmp::Ordering::Less
+                            || (ord == std::cmp::Ordering::Equal && *inclusive)
+                    }
+                    None => true,
+                };
+                let ends_after_key_starts = match lower {
+                    Some((value, _)) => {
+                        let start = [BoundValue::Value(value.clone())];
+                        bound_vec_cmp(&start, to) == std::cmp::Ordering::Less
+                    }
+                    None => true,
+                };
+                starts_before_key_ends && ends_after_key_starts
+            }
+            // A list partition holds specific values.
+            Bound::List(elements) => elements.iter().any(|element| {
+                let Some(element) = element else {
+                    return false;
+                };
+                let lower_ok = match lower {
+                    Some((value, inclusive)) => match crate::value::compare(element, value) {
+                        std::cmp::Ordering::Greater => true,
+                        std::cmp::Ordering::Equal => *inclusive,
+                        std::cmp::Ordering::Less => false,
+                    },
+                    None => true,
+                };
+                let upper_ok = match upper {
+                    Some((value, inclusive)) => match crate::value::compare(element, value) {
+                        std::cmp::Ordering::Less => true,
+                        std::cmp::Ordering::Equal => *inclusive,
+                        std::cmp::Ordering::Greater => false,
+                    },
+                    None => true,
+                };
+                lower_ok && upper_ok
+            }),
+            // A hash partition claims values whose hash lands on its
+            // remainder; a range says nothing about that.
+            Bound::Hash { .. } => match (lower, upper) {
+                (None, None) => true,
+                // A single-value range is an equality.
+                (Some((low, _)), Some((high, _)))
+                    if crate::value::compare(low, high) == std::cmp::Ordering::Equal =>
+                {
+                    contains(bound, std::slice::from_ref(low), types)
+                }
+                _ => true,
+            },
+            Bound::Default => true,
+        },
+    }
+}
+
+/// Whether the named partitions cover everything a filter allows, so a
+/// default partition cannot hold a matching row.
+fn default_is_covered(
+    key: &PartitionKey,
+    filter: &crate::plan_types::FilterExpr,
+    survivors: &[bool],
+    bounds: &[Option<Bound>],
+    types: &[String],
+) -> bool {
+    use crate::plan_types::FilterExpr;
+    // The conjunction's constraints on the key, folded into one interval (or
+    // value set): `a >= 0 AND a <= 5` is the range [0, 5].
+    let mut equals: Option<Vec<Value>> = None;
+    let mut lower: Option<(Value, bool)> = None;
+    let mut upper: Option<(Value, bool)> = None;
+    let mut found = false;
+    let mut current = Some(filter);
+    while let Some(filter) = current {
+        match filter {
+            FilterExpr::And(left, right) => {
+                if let Some(constraint) = key_constraint(key, left) {
+                    found = true;
+                    match constraint {
+                        KeyConstraint::Equals(values) => {
+                            equals = Some(match equals.take() {
+                                Some(previous) => previous
+                                    .into_iter()
+                                    .filter(|value| {
+                                        values.iter().any(|other| {
+                                            crate::value::compare(value, other)
+                                                == std::cmp::Ordering::Equal
+                                        })
+                                    })
+                                    .collect(),
+                                None => values,
+                            });
+                        }
+                        KeyConstraint::Range {
+                            lower: low,
+                            upper: high,
+                        } => {
+                            if let Some(low) = low {
+                                lower = Some(match lower.take() {
+                                    Some(previous) => stricter_lower(previous, low),
+                                    None => low,
+                                });
+                            }
+                            if let Some(high) = high {
+                                upper = Some(match upper.take() {
+                                    Some(previous) => stricter_upper(previous, high),
+                                    None => high,
+                                });
+                            }
+                        }
+                    }
+                }
+                current = Some(right);
+            }
+            other => {
+                if let Some(constraint) = key_constraint(key, other) {
+                    found = true;
+                    match constraint {
+                        KeyConstraint::Equals(values) => equals = Some(values),
+                        KeyConstraint::Range {
+                            lower: low,
+                            upper: high,
+                        } => {
+                            if let Some(low) = low {
+                                lower = Some(low);
+                            }
+                            if let Some(high) = high {
+                                upper = Some(high);
+                            }
+                        }
+                    }
+                }
+                current = None;
+            }
+        }
+    }
+    if !found {
+        return false;
+    }
+    // Every value the constraint allows must be claimed by a named
+    // partition.
+    let claimed = |value: &Value| {
+        bounds.iter().enumerate().any(|(at, bound)| {
+            survivors[at]
+                && bound.as_ref().is_some_and(|bound| {
+                    !matches!(bound, Bound::Default)
+                        && contains(bound, std::slice::from_ref(value), types)
+                })
+        })
+    };
+    if let Some(values) = equals {
+        // The range narrows the value set further.
+        let within = |value: &Value| {
+            let lower_ok = lower.as_ref().is_none_or(|(bound, inclusive)| {
+                match crate::value::compare(value, bound) {
+                    std::cmp::Ordering::Greater => true,
+                    std::cmp::Ordering::Equal => *inclusive,
+                    std::cmp::Ordering::Less => false,
+                }
+            });
+            let upper_ok = upper.as_ref().is_none_or(|(bound, inclusive)| {
+                match crate::value::compare(value, bound) {
+                    std::cmp::Ordering::Less => true,
+                    std::cmp::Ordering::Equal => *inclusive,
+                    std::cmp::Ordering::Greater => false,
+                }
+            });
+            lower_ok && upper_ok
+        };
+        return values.iter().filter(|value| within(value)).all(claimed);
+    }
+    let (Some((low, low_inclusive)), Some((high, high_inclusive))) = (lower, upper) else {
+        // An unbounded interval may reach beyond the named partitions.
+        return false;
+    };
+    // A bounded interval: the named ranges must cover it end to end.
+    let mut cursor = low;
+    let mut cursor_inclusive = low_inclusive;
+    loop {
+        let covering = bounds.iter().enumerate().find_map(|(at, bound)| {
+            if !survivors[at] {
+                return None;
+            }
+            let Some(Bound::Range { from, to }) = bound.as_ref() else {
+                return None;
+            };
+            let start = [BoundValue::Value(cursor.clone())];
+            if bound_vec_cmp(from, &start) == std::cmp::Ordering::Greater {
+                return None;
+            }
+            match to.as_slice() {
+                [BoundValue::Value(value)] => {
+                    let ord = crate::value::compare(value, &cursor);
+                    match ord {
+                        std::cmp::Ordering::Greater => Some(value.clone()),
+                        std::cmp::Ordering::Equal if !cursor_inclusive => Some(value.clone()),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            }
+        });
+        let Some(next) = covering else {
+            return false;
+        };
+        let ord = crate::value::compare(&next, &high);
+        if ord == std::cmp::Ordering::Greater
+            || (ord == std::cmp::Ordering::Equal && high_inclusive)
+        {
+            return true;
+        }
+        cursor = next;
+        cursor_inclusive = true;
+    }
+}
+
+/// The stricter of two lower bounds: the greater value, the exclusive one at
+/// a tie.
+fn stricter_lower(a: (Value, bool), b: (Value, bool)) -> (Value, bool) {
+    match crate::value::compare(&a.0, &b.0) {
+        std::cmp::Ordering::Greater => a,
+        std::cmp::Ordering::Less => b,
+        std::cmp::Ordering::Equal => (a.0, a.1 && b.1),
+    }
+}
+
+/// The stricter of two upper bounds: the smaller value, the exclusive one at
+/// a tie.
+fn stricter_upper(a: (Value, bool), b: (Value, bool)) -> (Value, bool) {
+    match crate::value::compare(&a.0, &b.0) {
+        std::cmp::Ordering::Less => a,
+        std::cmp::Ordering::Greater => b,
+        std::cmp::Ordering::Equal => (a.0, a.1 && b.1),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::dml_join_tests::{rows, session};
+
+    /// A statement's rows in the order they come out (a plan prints line by
+    /// line).
+    fn lines(out: &crate::QueryOutput) -> Vec<String> {
+        out.rows
+            .iter()
+            .map(|row| {
+                row.values
+                    .iter()
+                    .map(crate::value::render)
+                    .collect::<Vec<_>>()
+                    .join("|")
+            })
+            .collect()
+    }
 
     /// The rows of a select, rendered.
     fn values(
@@ -1114,6 +1626,221 @@ mod tests {
         assert!(contains(&bound, &[Value::Text("a".into())], &ltypes));
         assert!(!contains(&bound, &[Value::Text("b".into())], &ltypes));
         assert!(contains(&bound, &[Value::Null], &ltypes));
+    }
+
+    #[test]
+    fn filters_prune_partitions_as_postgresql_does() {
+        let sql = session();
+        sql("create table pp (a int, b text) partition by range (a)").unwrap();
+        sql("create table pp1 partition of pp for values from (0) to (10)").unwrap();
+        sql("create table pp2 partition of pp for values from (10) to (20)").unwrap();
+        sql("create table pp3 partition of pp for values from (20) to (30)").unwrap();
+        let plan =
+            |sql_text: &str| lines(&sql(&format!("explain (costs off) {sql_text}")).unwrap());
+        // One partition: no Append, the query's own alias.
+        assert_eq!(
+            plan("select * from pp where a = 5"),
+            ["Seq Scan on pp1 pp", "  Filter: (a = 5)"]
+        );
+        // `OR` keeps what either side keeps.
+        assert_eq!(
+            plan("select * from pp where a = 5 or a = 25"),
+            [
+                "Append",
+                "  ->  Seq Scan on pp1 pp_1",
+                "        Filter: ((a = 5) OR (a = 25))",
+                "  ->  Seq Scan on pp3 pp_2",
+                "        Filter: ((a = 5) OR (a = 25))",
+            ]
+        );
+        assert_eq!(
+            plan("select * from pp where a between 8 and 12"),
+            [
+                "Append",
+                "  ->  Seq Scan on pp1 pp_1",
+                "        Filter: ((a >= 8) AND (a <= 12))",
+                "  ->  Seq Scan on pp2 pp_2",
+                "        Filter: ((a >= 8) AND (a <= 12))",
+            ]
+        );
+        // A predicate on a non-key column prunes nothing.
+        assert_eq!(plan("select * from pp where b = 'x'").len(), 7);
+        // No partition can hold the row.
+        assert_eq!(
+            plan("select * from pp where a = 100"),
+            ["Result", "  One-Time Filter: false"]
+        );
+        // A list key: the `IN` list keeps the partitions it names.
+        sql("create table pl (a int) partition by list (a)").unwrap();
+        sql("create table pl1 partition of pl for values in (1, 2)").unwrap();
+        sql("create table pl2 partition of pl for values in (3, 4)").unwrap();
+        assert_eq!(
+            plan("select * from pl where a in (2, 3)"),
+            [
+                "Append",
+                "  ->  Seq Scan on pl1 pl_1",
+                "        Filter: (a = ANY ('{2,3}'::integer[]))",
+                "  ->  Seq Scan on pl2 pl_2",
+                "        Filter: (a = ANY ('{2,3}'::integer[]))",
+            ]
+        );
+        // A hash key: an equality lands on one remainder.
+        sql("create table ph (a int) partition by hash (a)").unwrap();
+        for remainder in 0..4 {
+            sql(&format!(
+                "create table ph{remainder} partition of ph for values with (modulus 4, remainder {remainder})"
+            ))
+            .unwrap();
+        }
+        assert_eq!(
+            plan("select * from ph where a = 5"),
+            ["Seq Scan on ph1 ph", "  Filter: (a = 5)"]
+        );
+        // A default partition is kept only when the named ones leave room.
+        sql("create table pd (a int) partition by range (a)").unwrap();
+        sql("create table pd1 partition of pd for values from (0) to (10)").unwrap();
+        sql("create table pdd partition of pd default").unwrap();
+        assert_eq!(
+            plan("select * from pd where a = 5"),
+            ["Seq Scan on pd1 pd", "  Filter: (a = 5)"]
+        );
+        assert_eq!(
+            plan("select * from pd where a = 15"),
+            ["Seq Scan on pdd pd", "  Filter: (a = 15)"]
+        );
+        assert_eq!(
+            plan("select * from pd where a > 5").len(),
+            5,
+            "an unbounded range reaches the default partition"
+        );
+    }
+
+    #[test]
+    fn data_statements_prune_their_scan() {
+        let sql = session();
+        sql("create table pq (a int, b text) partition by range (a)").unwrap();
+        sql("create table pq1 partition of pq for values from (0) to (10)").unwrap();
+        sql("create table pq2 partition of pq for values from (10) to (20)").unwrap();
+        sql("insert into pq values (5, 'x'), (15, 'y')").unwrap();
+        // `RETURNING tableoid` names the partition each row lives in.
+        assert_eq!(
+            values(
+                &sql,
+                "insert into pq values (6, 'z') returning tableoid::regclass::text, b"
+            ),
+            ["pq1|z"]
+        );
+        assert_eq!(
+            values(
+                &sql,
+                "update pq set b = 'q' where a = 15 returning tableoid::regclass::text"
+            ),
+            ["pq2"]
+        );
+        assert_eq!(
+            values(
+                &sql,
+                "delete from pq where a = 5 returning tableoid::regclass::text"
+            ),
+            ["pq1"]
+        );
+        // A partition key change moves the row, and `tableoid` shows where.
+        sql("update pq set a = 2 where a = 15").unwrap();
+        assert_eq!(
+            values(
+                &sql,
+                "update pq set a = 12 where a = 2 returning tableoid::regclass::text"
+            ),
+            ["pq2"]
+        );
+        // The plan names every result relation and scans the partitions a
+        // filter reaches.
+        assert_eq!(
+            lines(&sql("explain (costs off) update pq set b = 'w' where a = 5").unwrap()),
+            [
+                "Update on pq",
+                "  Update on pq1 pq_1",
+                "  ->  Seq Scan on pq1 pq_1",
+                "        Filter: (a = 5)",
+            ]
+        );
+        assert_eq!(
+            lines(&sql("explain (costs off) delete from pq where a = 100").unwrap()),
+            [
+                "Delete on pq",
+                "  ->  Result",
+                "        One-Time Filter: false"
+            ]
+        );
+        // An inherited target computes the new row in a Result.
+        sql("create table pi (a int)").unwrap();
+        sql("create table pi1 () inherits (pi)").unwrap();
+        assert_eq!(
+            lines(&sql("explain (costs off) update pi set a = 0").unwrap()),
+            [
+                "Update on pi",
+                "  Update on pi pi_1",
+                "  Update on pi1 pi_2",
+                "  ->  Result",
+                "        ->  Append",
+                "              ->  Seq Scan on pi pi_1",
+                "              ->  Seq Scan on pi1 pi_2",
+            ]
+        );
+    }
+
+    #[test]
+    fn expression_keys_partition_and_prune() {
+        let sql = session();
+        sql("create table pe (n text) partition by range (lower(n))").unwrap();
+        sql("create table pe1 partition of pe for values from ('a') to ('m')").unwrap();
+        sql("create table pe2 partition of pe for values from ('m') to (maxvalue)").unwrap();
+        sql("insert into pe values ('Bob'), ('zoe')").unwrap();
+        assert_eq!(
+            values(
+                &sql,
+                "select tableoid::regclass::text, n from pe order by n"
+            ),
+            ["pe1|Bob", "pe2|zoe"]
+        );
+        assert_eq!(
+            lines(&sql("explain (costs off) select * from pe where lower(n) = 'bob'").unwrap()),
+            ["Seq Scan on pe1 pe", "  Filter: (lower(n) = 'bob'::text)"]
+        );
+        assert_eq!(
+            lines(&sql("explain (costs off) select * from pe where n = 'bob'").unwrap()).len(),
+            5,
+            "a predicate on the column itself cannot prune"
+        );
+        assert_eq!(
+            values(&sql, "select pg_get_partkeydef('pe'::regclass)"),
+            ["RANGE (lower(n))"]
+        );
+        assert_eq!(
+            values(
+                &sql,
+                "select partattrs, partclass from pg_partitioned_table where partrelid = 'pe'::regclass"
+            ),
+            ["0|3126"]
+        );
+        // A key change moves the row across partitions.
+        sql("update pe set n = 'anna' where n = 'Bob'").unwrap();
+        assert_eq!(
+            values(
+                &sql,
+                "select tableoid::regclass::text, n from pe order by n"
+            ),
+            ["pe1|anna", "pe2|zoe"]
+        );
+        // A bound with no values is refused by name.
+        sql("create table pz (n text)").unwrap();
+        let error = sql("alter table pe attach partition pz for values from ('m') to (minvalue)")
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            crate::error_message(&error),
+            "empty range bound specified for partition \"pz\""
+        );
     }
 
     #[test]

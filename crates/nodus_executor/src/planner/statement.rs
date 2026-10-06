@@ -1668,9 +1668,14 @@ fn partition_by_text(create_table: &sqlparser::ast::CreateTable) -> Result<Optio
     let mut columns = Vec::new();
     for arg in &list.args {
         match arg {
+            // A key part is a column name or an expression (`lower(n)`), as
+            // written.
             sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
                 sqlparser::ast::Expr::Identifier(ident),
             )) => columns.push(ident.value.clone()),
+            sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(expr)) => {
+                columns.push(expr.to_string())
+            }
             other => anyhow::bail!("partition by expressions are not supported: {other}"),
         }
     }

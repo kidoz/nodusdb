@@ -163,9 +163,19 @@ impl MemExecutor {
         // unique constraint must cover it.
         if let Some(key_text) = &partition_by {
             let key = crate::partitioning::PartitionKey::parse(key_text)?;
-            for column in &key.columns {
-                if !columns.iter().any(|c| &c.name == column) {
-                    anyhow::bail!("column \"{column}\" named in partition key does not exist");
+            for part in &key.columns {
+                // A part is a column name or an expression; an expression's
+                // references must exist.
+                if let Some(column) = columns.iter().find(|c| &c.name == part) {
+                    let _ = column;
+                    continue;
+                }
+                let mut refs = Vec::new();
+                if let Ok(expr) = crate::partitioning::key_expression(part) {
+                    crate::filter_eval::scalar_column_refs(&expr, &mut refs);
+                }
+                if refs.is_empty() || refs.iter().any(|r| !columns.iter().any(|c| &c.name == r)) {
+                    anyhow::bail!("column \"{part}\" named in partition key does not exist");
                 }
             }
             let mut uniques: Vec<(&str, Vec<String>)> = Vec::new();

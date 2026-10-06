@@ -1678,6 +1678,9 @@ impl MemExecutor {
                     };
                     let schema_name = Self::schema_name_by_id(db_name, &schemas, table.schema_id);
                     let column = |name: &String| table.columns.iter().find(|c| &c.name == name);
+                    // An expression key part has `partattrs` 0 and its
+                    // expression's result type's opclass and collation.
+                    let types = crate::partitioning::key_types(table, &key);
                     let attattrs: Vec<String> = key
                         .columns
                         .iter()
@@ -1687,17 +1690,18 @@ impl MemExecutor {
                                     (table.columns.iter().position(|t| t.id == c.id).unwrap() + 1)
                                         .to_string()
                                 })
-                                .unwrap_or_default()
+                                .unwrap_or_else(|| "0".to_string())
                         })
                         .collect();
                     let classes: Vec<String> = key
                         .columns
                         .iter()
-                        .map(|name| {
-                            column(name)
-                                .and_then(|c| {
-                                    crate::partitioning::opclass_oid(&c.data_type, key.strategy)
-                                })
+                        .zip(&types)
+                        .map(|(name, data_type)| {
+                            let data_type = column(name)
+                                .map(|c| c.data_type.clone())
+                                .unwrap_or_else(|| data_type.clone());
+                            crate::partitioning::opclass_oid(&data_type, key.strategy)
                                 .map(|oid| oid.to_string())
                                 .unwrap_or_default()
                         })
@@ -1705,19 +1709,28 @@ impl MemExecutor {
                     let collations: Vec<String> = key
                         .columns
                         .iter()
-                        .map(|name| {
-                            column(name)
-                                .map(|c| {
-                                    if crate::partitioning::is_collatable(&c.data_type) {
-                                        "100"
-                                    } else {
-                                        "0"
-                                    }
-                                    .to_string()
-                                })
-                                .unwrap_or_default()
+                        .zip(&types)
+                        .map(|(name, data_type)| {
+                            let data_type = column(name)
+                                .map(|c| c.data_type.clone())
+                                .unwrap_or_else(|| data_type.clone());
+                            if crate::partitioning::is_collatable(&data_type) {
+                                "100"
+                            } else {
+                                "0"
+                            }
+                            .to_string()
                         })
                         .collect();
+                    // PostgreSQL's `partexprs` is a node tree; ours names the
+                    // expression as written (non-NULL when the key has one).
+                    let partexprs = key
+                        .columns
+                        .iter()
+                        .filter(|name| column(name).is_none())
+                        .map(|name| format!("({name})"))
+                        .collect::<Vec<_>>()
+                        .join(" ");
                     rows.push(vec![
                         Value::Int(Self::table_oid(db_name, &schema_name, &table.name)),
                         Value::Text(
@@ -1732,7 +1745,11 @@ impl MemExecutor {
                         Value::Text(attattrs.join(" ")),
                         Value::Text(classes.join(" ")),
                         Value::Text(collations.join(" ")),
-                        Value::Null,
+                        if partexprs.is_empty() {
+                            Value::Null
+                        } else {
+                            Value::Text(partexprs)
+                        },
                     ]);
                 }
                 Some((

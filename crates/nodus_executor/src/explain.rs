@@ -31,6 +31,45 @@ impl Default for ExplainOptions {
     }
 }
 
+/// A pruned-away partition: a scan that reads nothing.
+fn empty_scan() -> Node {
+    let mut node =
+        Node::new("Result", "Result", 1.0, 0).detail("One-Time Filter", "false".to_string());
+    node.rows = 0.0;
+    node.width = 0;
+    node.startup = 0.0;
+    node.total = 0.0;
+    node
+}
+
+/// The lone partition that survived pruning, under the query's own name for
+/// the parent.
+fn single_scan(
+    mut children: Vec<Node>,
+    table: &nodus_catalog::TableDescriptor,
+    parent_alias: &str,
+) -> Node {
+    let mut only = children.remove(0);
+    only.label = format!("Seq Scan on {} {parent_alias}", relation_name(&table.name));
+    only.props.retain(|(name, _)| *name != "Alias");
+    only
+}
+
+/// An `Append` over the scans of a partitioned or inherited table.
+fn append_scan(parent: &nodus_catalog::TableDescriptor, children: Vec<Node>) -> Node {
+    let child_rows: f64 = children.iter().map(|c| c.rows).sum();
+    let child_pages: f64 = children
+        .iter()
+        .map(|c| (c.rows * c.width as f64 / 8192.0).ceil().max(1.0))
+        .sum();
+    let mut node = Node::over("Append", "Append", children);
+    node.rows = child_rows;
+    node.width = width_of(parent);
+    node.startup = 0.0;
+    node.total = child_pages * PAGE + child_rows * CPU_TUPLE;
+    node
+}
+
 /// A plan node as `EXPLAIN` shows it.
 struct Node {
     /// `Seq Scan`, `Nested Loop`, ...
@@ -42,6 +81,9 @@ struct Node {
     /// What the node computes, e.g. `Filter: (a = 1)`: a line under the
     /// headline in text format, a property after the costs in JSON.
     details: Vec<(&'static str, String, J)>,
+    /// Lines under the headline that are not `name: value` (PostgreSQL's
+    /// `Update on partition alias` result relations).
+    notes: Vec<String>,
     rows: f64,
     width: u32,
     startup: f64,
@@ -58,6 +100,7 @@ impl Node {
             label: label.into(),
             props: Vec::new(),
             details: Vec::new(),
+            notes: Vec::new(),
             rows: rows.max(1.0).round(),
             width,
             startup: 0.0,
@@ -79,6 +122,12 @@ impl Node {
 
     fn detail(mut self, name: &'static str, text: String) -> Node {
         self.details.push((name, text.clone(), J::String(text)));
+        self
+    }
+
+    /// A line under the headline, as written.
+    fn note(mut self, line: impl Into<String>) -> Node {
+        self.notes.push(line.into());
         self
     }
 
@@ -110,6 +159,9 @@ impl Node {
         let inner = if depth == 0 { 2 } else { depth + 6 };
         for (name, text, _) in &self.details {
             out.push(format!("{}{name}: {text}", " ".repeat(inner)));
+        }
+        for note in &self.notes {
+            out.push(format!("{}{note}", " ".repeat(inner)));
         }
         for child in &self.children {
             child.write_text(inner, opts, "", out);
@@ -594,11 +646,57 @@ impl MemExecutor {
         filter: Option<&FilterExpr>,
         ctes: &[(String, &LogicalPlan)],
     ) -> Result<Node> {
-        let child = match source {
-            None => {
-                self.explain_relation(ctx, table_name, table_alias, filter, ctes, None, false)?
+        // A target with descendants is scanned partition by partition, each
+        // listed as a result relation; the scan itself is pruned the way a
+        // query's is.
+        let scans =
+            match source {
+                None => parse_object_name(table_name).ok().and_then(
+                    |(db_name, schema_name, table_only)| {
+                        let tbl = self
+                            .catalog_reader
+                            .get_table(db_name, schema_name, table_only)
+                            .ok()?;
+                        if tbl.view_query.is_some() {
+                            return None;
+                        }
+                        let scans = self
+                            .scan_tables(db_name, &tbl, table_alias, table_only, filter, false)
+                            .ok()?;
+                        (!scans.is_empty()).then_some((tbl, scans))
+                    },
+                ),
+                Some(_) => None,
+            };
+        let (child, result_lines) = match (source, scans) {
+            (None, Some((tbl, scans))) => {
+                let mut lines = Vec::new();
+                for (table, alias) in &scans {
+                    lines.push(format!(
+                        "{operation} on {} {alias}",
+                        relation_name(&table.name)
+                    ));
+                }
+                let children = self.scan_children(ctx, &scans, filter)?;
+                let scan = if children.len() == 1 {
+                    children.into_iter().next().unwrap()
+                } else {
+                    append_scan(&tbl, children)
+                };
+                // `UPDATE` on an inherited (not partitioned) target computes
+                // the new row in a `Result` over the scan.
+                let scan = if operation == "Update" && tbl.partition_by.is_none() {
+                    Node::over("Result", "Result", vec![scan])
+                } else {
+                    scan
+                };
+                (scan, lines)
             }
-            Some(source) => {
+            (None, None) => (
+                self.explain_relation(ctx, table_name, table_alias, filter, ctes, None, false)?,
+                Vec::new(),
+            ),
+            (Some(source), _) => {
                 let target =
                     self.explain_relation(ctx, table_name, table_alias, None, ctes, None, false)?;
                 let source = self.explain_node(ctx, source, ctes)?;
@@ -607,7 +705,7 @@ impl MemExecutor {
                 if let Some(f) = filter {
                     join = join.detail("Join Filter", deparse_filter(f, true));
                 }
-                join
+                (join, Vec::new())
             }
         };
         let mut node = Node::over(
@@ -620,9 +718,103 @@ impl MemExecutor {
         )
         .prop("Operation", json!(operation))
         .prop("Relation Name", json!(relation_name(table_name)));
+        for line in result_lines {
+            node = node.note(line);
+        }
         node.rows = 0.0;
         node.width = 0;
         Ok(node)
+    }
+
+    /// A scan's tables: a partitioned table's partitions after pruning, or
+    /// an inherited table and its descendants; each with the alias the plan
+    /// gives it (`t_1`, `t_2`, ...). Empty when nothing can match.
+    fn scan_tables(
+        &self,
+        db_name: &str,
+        tbl: &nodus_catalog::TableDescriptor,
+        table_alias: Option<&str>,
+        table_only: &str,
+        filter: Option<&FilterExpr>,
+        only: bool,
+    ) -> Result<Vec<(nodus_catalog::TableDescriptor, String)>> {
+        // A partitioned table holds no rows of its own: PostgreSQL's Append
+        // lists only its partitions; an inherited table lists itself first.
+        let partitioned = tbl.partition_by.is_some();
+        let parent_alias = relation_name(table_alias.unwrap_or(table_only));
+        let descendants = if only {
+            Vec::new()
+        } else {
+            self.descendants(db_name, tbl.id)?
+        };
+        if descendants.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut tables: Vec<nodus_catalog::TableDescriptor> = if partitioned {
+            descendants
+        } else {
+            std::iter::once(tbl.clone()).chain(descendants).collect()
+        };
+        // Plan-time pruning: only the partitions a filter can reach are
+        // scanned. A sub-partitioned child is kept whole (its own
+        // partitions are not pruned here).
+        if partitioned {
+            let direct = self.partition_children(db_name, tbl.id)?;
+            if direct.len() == tables.len() {
+                let text = tbl.partition_by.as_deref().unwrap_or_default();
+                let key = crate::partitioning::PartitionKey::parse(text)?;
+                let kept = crate::partitioning::surviving_partitions(tbl, &key, &tables, filter);
+                tables = kept.into_iter().map(|at| tables[at].clone()).collect();
+            }
+        }
+        Ok(tables
+            .into_iter()
+            .enumerate()
+            .map(|(at, table)| (table, format!("{parent_alias}_{}", at + 1)))
+            .collect())
+    }
+
+    /// The scans of `scan_tables`' tables, each carrying the filter, as
+    /// PostgreSQL plans them.
+    fn scan_children(
+        &self,
+        ctx: &ExecutionContext,
+        scans: &[(nodus_catalog::TableDescriptor, String)],
+        filter: Option<&FilterExpr>,
+    ) -> Result<Vec<Node>> {
+        scans
+            .iter()
+            .map(|(table, alias)| self.scan_node(ctx, table, alias, filter))
+            .collect()
+    }
+
+    /// One table's `Seq Scan`, filter included.
+    fn scan_node(
+        &self,
+        ctx: &ExecutionContext,
+        table: &nodus_catalog::TableDescriptor,
+        alias: &str,
+        filter: Option<&FilterExpr>,
+    ) -> Result<Node> {
+        let table_rows = self.scan_rows(table.id, &ctx.session_id)?.len() as f64;
+        let table_width: u32 = table.columns.iter().map(|c| type_width(&c.data_type)).sum();
+        let pages = (table_rows * table_width as f64 / 8192.0).ceil().max(1.0);
+        let mut child = Node::new(
+            "Seq Scan",
+            format!("Seq Scan on {} {alias}", relation_name(&table.name)),
+            table_rows,
+            table_width,
+        )
+        .prop("Relation Name", json!(table.name))
+        .prop("Alias", json!(alias));
+        child.startup = 0.0;
+        child.total = pages * PAGE + table_rows * CPU_TUPLE;
+        if let Some(f) = filter {
+            child = child.detail("Filter", deparse_filter(f, false));
+            child.total += child.rows * CPU_OPERATOR;
+            child.rows = (child.rows * selectivity(f)).max(1.0).round();
+        }
+        Ok(child)
     }
 
     /// The scan of one relation: a table (by index when the filter is an
@@ -699,52 +891,20 @@ impl MemExecutor {
         } else {
             self.descendants(db_name, tbl.id)?
         };
-        if !descendant_tables.is_empty() {
-            // A partitioned table holds no rows of its own: PostgreSQL's
-            // Append lists only its partitions, each scan aliased after the
-            // query's name for the parent (`p_1`, `p_2`, ...).
-            let partitioned = tbl.partition_by.is_some();
-            let parent_alias = relation_name(table_alias.unwrap_or(table_only));
-            let mut children = Vec::new();
-            let mut child_rows = 0.0;
-            let mut child_pages = 0.0;
-            let tables: Vec<_> = std::iter::once(tbl.clone())
-                .chain(descendant_tables)
-                .collect();
-            for (at, table) in tables.iter().enumerate() {
-                if partitioned && at == 0 {
-                    continue;
-                }
-                let alias = if partitioned {
-                    format!("{parent_alias}_{at}")
-                } else {
-                    table.name.clone()
-                };
-                let table_rows = self.scan_rows(table.id, &ctx.session_id)?.len() as f64;
-                let table_width: u32 = table.columns.iter().map(|c| type_width(&c.data_type)).sum();
-                let pages = (table_rows * table_width as f64 / 8192.0).ceil().max(1.0);
-                let headline = if at == 0 {
-                    format!("Seq Scan on {label}")
-                } else if partitioned {
-                    format!("Seq Scan on {} {alias}", relation_name(&table.name))
-                } else {
-                    format!("Seq Scan on {}", relation_name(&table.name))
-                };
-                let mut child = Node::new("Seq Scan", headline, table_rows, table_width)
-                    .prop("Relation Name", json!(table.name))
-                    .prop("Alias", json!(alias));
-                child.startup = 0.0;
-                child.total = pages * PAGE + table_rows * CPU_TUPLE;
-                children.push(child);
-                child_rows += table_rows;
-                child_pages += pages;
+        let scans = self.scan_tables(db_name, &tbl, table_alias, table_only, filter, only)?;
+        if !scans.is_empty() {
+            let children = self.scan_children(ctx, &scans, filter)?;
+            // One partition alone needs no Append: its scan stands in for
+            // the parent, under the query's own name.
+            if tbl.partition_by.is_some() && children.len() == 1 {
+                let parent_alias = relation_name(table_alias.unwrap_or(table_only));
+                return Ok(single_scan(children, &scans[0].0, &parent_alias));
             }
-            let mut node = Node::over("Append", "Append", children);
-            node.rows = child_rows;
-            node.width = width_of(&tbl);
-            node.startup = 0.0;
-            node.total = child_pages * PAGE + child_rows * CPU_TUPLE;
-            return Ok(with_filter(node));
+            return Ok(append_scan(&tbl, children));
+        }
+        if !descendant_tables.is_empty() {
+            // Every partition was pruned: no rows come back.
+            return Ok(empty_scan());
         }
         let width: u32 = tbl.columns.iter().map(|c| type_width(&c.data_type)).sum();
         let pages = (rows * width as f64 / 8192.0).ceil().max(1.0);
@@ -1004,6 +1164,38 @@ fn literal(value: &Value) -> String {
     }
 }
 
+/// The SQL type of an array literal's elements, when their values show it.
+fn array_element_type(value: &Value) -> Option<&'static str> {
+    match value {
+        Value::Int(_) => Some("integer"),
+        Value::Float(_) => Some("double precision"),
+        Value::Numeric(_) => Some("numeric"),
+        Value::Bool(_) => Some("boolean"),
+        Value::Text(_) => Some("text"),
+        _ => None,
+    }
+}
+
+/// One element of an array literal, as PostgreSQL prints it (quoted when it
+/// holds what an array literal treats specially).
+fn array_element(value: &Value) -> String {
+    match value {
+        Value::Null => "NULL".to_string(),
+        Value::Text(text) => {
+            let quoted = text.is_empty()
+                || text.contains([',', '{', '}', '"', '\\', ' '])
+                || text.eq_ignore_ascii_case("null");
+            let escaped = text.replace('\\', "\\\\").replace('"', "\\\"");
+            if quoted {
+                format!("\"{escaped}\"")
+            } else {
+                escaped
+            }
+        }
+        other => render(other),
+    }
+}
+
 fn compare_op(op: &CompareOp) -> &'static str {
     match op {
         CompareOp::Eq => "=",
@@ -1084,15 +1276,53 @@ pub(crate) fn deparse_filter(filter: &FilterExpr, qualified: bool) -> String {
             left,
             list,
             negated,
-        } => format!(
-            "({} {} ({}))",
-            column(left, qualified),
-            if *negated { "NOT IN" } else { "IN" },
-            list.iter()
-                .map(|o| operand(o, qualified))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
+        } => {
+            // A list of constants is one array test, as PostgreSQL plans it
+            // (`a = ANY ('{1,2}'::integer[])`).
+            let op = if *negated { "<> ALL" } else { "= ANY" };
+            // A NULL element takes its siblings' type.
+            if let Some(element_type) = list
+                .iter()
+                .map(|item| match item {
+                    Operand::Literal(Value::Null) => Some(None),
+                    Operand::Literal(value) => array_element_type(value).map(Some),
+                    Operand::Ident(_) => None,
+                })
+                .collect::<Option<Vec<_>>>()
+                .and_then(|types| {
+                    let typed: Vec<&str> = types.into_iter().flatten().collect();
+                    typed
+                        .windows(2)
+                        .all(|pair| pair[0] == pair[1])
+                        .then(|| typed.first().copied())?
+                })
+            {
+                let values = list
+                    .iter()
+                    .map(|item| match item {
+                        Operand::Literal(value) => array_element(value),
+                        Operand::Ident(_) => String::new(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                return format!(
+                    "({} {} ('{{{}}}'::{}[]))",
+                    column(left, qualified),
+                    op,
+                    values,
+                    element_type
+                );
+            }
+            format!(
+                "({} {} ({}))",
+                column(left, qualified),
+                if *negated { "NOT IN" } else { "IN" },
+                list.iter()
+                    .map(|o| operand(o, qualified))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        }
         FilterExpr::InSubquery { left, negated, .. } => format!(
             "({}{} IN (SubPlan 1))",
             if *negated { "NOT " } else { "" },

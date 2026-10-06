@@ -72,6 +72,10 @@ pub(crate) struct TargetScope {
     pub(crate) width: usize,
     /// The target table's own name when an alias hides it.
     pub(crate) hidden: Option<String>,
+    /// Whether the scope carries the hidden `tableoid` pseudo-column (a
+    /// target with descendants does): each returned row then appends the
+    /// OID of the table it really lives in.
+    pub(crate) tableoid: bool,
 }
 
 impl TargetScope {
@@ -664,7 +668,12 @@ impl MemExecutor {
                             changed.push((existing_row.clone(), updated.clone()));
                         }
                         if !returning.is_empty() {
-                            returning_rows.push([updated, existing_row].concat());
+                            let at = updated.len();
+                            let mut row = [updated, existing_row].concat();
+                            if scope.tableoid {
+                                row.insert(at, Value::Int(self.tableoid_of(&tbl)));
+                            }
+                            returning_rows.push(row);
                         }
                         continue;
                     }
@@ -700,7 +709,11 @@ impl MemExecutor {
 
             inserted_count += 1;
             if !returning.is_empty() {
-                returning_rows.push(row);
+                let mut returned = row;
+                if scope.tableoid {
+                    returned.push(Value::Int(self.tableoid_of(&tbl)));
+                }
+                returning_rows.push(returned);
             }
         }
         if insert_tables.is_empty() {
@@ -800,8 +813,9 @@ impl MemExecutor {
                 self.apply_assignments(ctx, &tbl, &assignments, &old_row, (&joined, &scope.names))?;
             // The statement's columns map back onto the row's own table.
             let new_row = table_row(&target.table, &tbl, &target.row, &row);
-            // A partition key change may move the row to another partition.
-            self.relocate_partition_row(
+            // A partition key change may move the row to another partition;
+            // `RETURNING tableoid` shows where it ended up.
+            let destination = self.relocate_partition_row(
                 ctx,
                 &tbl,
                 &target.table,
@@ -819,6 +833,9 @@ impl MemExecutor {
             if !returning.is_empty() {
                 let mut returned = joined;
                 returned.splice(..row.len(), row);
+                if scope.tableoid {
+                    returned.push(Value::Int(self.tableoid_of(&destination)));
+                }
                 returned.extend(old_row);
                 returning_rows.push(returned);
             }
@@ -908,7 +925,12 @@ impl MemExecutor {
             if !returning.is_empty() {
                 // A deleted row has no values as written.
                 let written = vec![Value::Null; target.projected.len() + 1];
-                returning_rows.push([target.joined, target.projected, written].concat());
+                let at = target.joined.len();
+                let mut row = [target.joined, target.projected, written].concat();
+                if scope.tableoid {
+                    row.insert(at, Value::Int(self.tableoid_of(&target.table)));
+                }
+                returning_rows.push(row);
             }
         }
         for table in &referenced {
@@ -1043,13 +1065,22 @@ impl MemExecutor {
             .collect();
         let mut columns = tbl.columns.clone();
         let hidden = table_alias.map(|_| refname(table_name));
+        // A target with descendants has rows in several tables: `tableoid`
+        // names the one each row really lives in, as it does in a scan.
+        let has_descendants = !self.descendants("default", tbl.id)?.is_empty();
+        let tableoid = has_descendants.then(|| format!("{prefix}.tableoid"));
         let Some(source) = source else {
+            if let Some(name) = &tableoid {
+                names.push(name.clone());
+                columns.push(Self::virtual_column("tableoid", "OID"));
+            }
             return Ok(TargetScope {
                 names,
                 columns,
                 source_rows: vec![Vec::new()],
                 width: tbl.columns.len(),
                 hidden,
+                tableoid: tableoid.is_some(),
             });
         };
         let out = self.relation_rows(ctx, source)?;
@@ -1085,12 +1116,17 @@ impl MemExecutor {
                 }),
         );
         names.extend(out.columns);
+        if let Some(name) = &tableoid {
+            names.push(name.clone());
+            columns.push(Self::virtual_column("tableoid", "OID"));
+        }
         Ok(TargetScope {
             names,
             columns,
             source_rows: out.rows.into_iter().map(|r| r.values).collect(),
             width: tbl.columns.len(),
             hidden,
+            tableoid: tableoid.is_some(),
         })
     }
 
@@ -1387,20 +1423,21 @@ impl MemExecutor {
         old_key: &str,
         old_row: &[Value],
         new_row: &[Value],
-    ) -> Result<()> {
+    ) -> Result<nodus_catalog::TableDescriptor> {
         if statement_target.partition_by.is_none() {
             self.check_partition_constraint("default", table, new_row)?;
             self.replace_row(ctx, table, old_key, old_row, new_row)?;
-            return Ok(());
+            return Ok(table.clone());
         }
         let destination = self.route_row("default", statement_target, new_row)?;
         self.check_partition_constraint("default", &destination, new_row)?;
         if destination.id == table.id {
             self.replace_row(ctx, table, old_key, old_row, new_row)?;
-            return Ok(());
+            return Ok(destination);
         }
         self.remove_row(ctx, table, old_key, old_row)?;
-        self.insert_row_checked(ctx, &destination, new_row)
+        self.insert_row_checked(ctx, &destination, new_row)?;
+        Ok(destination)
     }
 
     pub(crate) fn replace_row(
