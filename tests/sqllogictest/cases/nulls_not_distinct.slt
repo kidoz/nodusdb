@@ -1,0 +1,235 @@
+# NULLS NOT DISTINCT unique constraints and indexes. Expectations from
+# PostgreSQL 18.4.
+statement ok
+drop table if exists nn1 cascade;
+
+# A column constraint treats NULLs as equal.
+statement ok
+create table nn1 (a int unique nulls not distinct);
+
+statement ok
+insert into nn1 values (null);
+
+statement error
+insert into nn1 values (null);
+
+query I
+select count(*) from nn1;
+----
+1
+
+# The default still lets NULLs past.
+statement ok
+drop table if exists nd1 cascade;
+
+statement ok
+create table nd1 (a int unique);
+
+statement ok
+insert into nd1 values (null), (null), (null);
+
+query I
+select count(*) from nd1;
+----
+3
+
+# A table constraint compares the whole key.
+statement ok
+drop table if exists nn2 cascade;
+
+statement ok
+create table nn2 (a int, b int, constraint uq2 unique nulls not distinct (a, b));
+
+statement error
+insert into nn2 values (null, 1), (null, 1);
+
+statement ok
+insert into nn2 values (null, 1), (null, 2);
+
+query I
+select count(*) from nn2;
+----
+2
+
+query T
+select pg_get_constraintdef(oid) from pg_constraint where conrelid = 'nn2'::regclass and contype = 'u';
+----
+UNIQUE NULLS NOT DISTINCT (a, b)
+
+# The index form, its catalog columns and its definition.
+statement ok
+drop table if exists nn4 cascade;
+
+statement ok
+create table nn4 (a int);
+
+statement ok
+create unique index nn4_i on nn4 (a) nulls not distinct;
+
+statement ok
+insert into nn4 values (null);
+
+statement error
+insert into nn4 values (null);
+
+query B
+select indnullsnotdistinct from pg_index where indexrelid = 'nn4_i'::regclass;
+----
+t
+
+query T
+select pg_get_indexdef('nn4_i'::regclass);
+----
+CREATE UNIQUE INDEX nn4_i ON public.nn4 USING btree (a) NULLS NOT DISTINCT
+
+# ON CONFLICT finds the NULL row.
+statement ok
+insert into nn4 values (null) on conflict (a) do nothing;
+
+query I
+select count(*) from nn4;
+----
+1
+
+statement ok
+insert into nn4 values (null) on conflict (a) do update set a = 1;
+
+query I
+select count(*) from nn4;
+----
+1
+
+query I
+select a from nn4;
+----
+1
+
+# ALTER TABLE ADD CONSTRAINT takes the clause too.
+statement ok
+drop table if exists nn5 cascade;
+
+statement ok
+create table nn5 (a int);
+
+statement ok
+alter table nn5 add constraint uq5 unique nulls not distinct (a);
+
+statement ok
+insert into nn5 values (null);
+
+statement error
+insert into nn5 values (null);
+
+# Explicit NULLS DISTINCT is the default.
+statement ok
+drop table if exists nd2 cascade;
+
+statement ok
+create table nd2 (a int);
+
+statement ok
+create unique index nd2_i on nd2 (a) nulls distinct;
+
+statement ok
+insert into nd2 values (null);
+
+statement ok
+insert into nd2 values (null);
+
+query I
+select count(*) from nd2;
+----
+2
+
+# A partial index constrains only the rows its predicate holds for.
+statement ok
+drop table if exists nn7 cascade;
+
+statement ok
+create table nn7 (a int);
+
+statement ok
+create unique index nn7_i on nn7 (a) nulls not distinct where a > 0;
+
+statement ok
+insert into nn7 values (null), (null);
+
+statement ok
+insert into nn7 values (1);
+
+statement error
+insert into nn7 values (1);
+
+# Deferrable and NULLS NOT DISTINCT together.
+statement ok
+drop table if exists nn8 cascade;
+
+statement ok
+create table nn8 (a int, unique nulls not distinct (a) deferrable initially deferred);
+
+statement ok
+begin;
+
+statement ok
+insert into nn8 values (null);
+
+statement ok
+insert into nn8 values (null);
+
+statement error
+commit;
+
+# An expression index treats equal NULL results as equal.
+statement ok
+drop table if exists nx cascade;
+
+statement ok
+create table nx (a text);
+
+statement ok
+create unique index nx_i on nx (lower(a)) nulls not distinct;
+
+statement ok
+insert into nx values (null);
+
+statement ok
+insert into nx values ('A');
+
+statement error
+insert into nx values ('a');
+
+query I
+select count(*) from nx;
+----
+2
+
+# A primary key cannot be NULLS NOT DISTINCT.
+statement error
+create table np (a int, primary key (a) nulls not distinct);
+
+statement ok
+drop table nn1;
+
+statement ok
+drop table nd1;
+
+statement ok
+drop table nn2;
+
+statement ok
+drop table nn4;
+
+statement ok
+drop table nn5;
+
+statement ok
+drop table nd2;
+
+statement ok
+drop table nn7;
+
+statement ok
+drop table nn8;
+
+statement ok
+drop table nx;
