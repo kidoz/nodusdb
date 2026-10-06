@@ -1,0 +1,183 @@
+# Index range scans, covering (`INCLUDE`) indexes, and index-only scans.
+# Plans and results from PostgreSQL 18.4.
+
+statement ok
+drop table if exists ir cascade;
+
+statement ok
+create table ir (a int, b text, c int);
+
+statement ok
+insert into ir select g, 'row' || g, g % 7 from generate_series(1, 100) g;
+
+statement ok
+create index ir_a on ir (a);
+
+# PostgreSQL's planner costs an index scan from statistics; ours has none,
+# so it reads an index when the session asks for index scans
+# (`SET enable_seqscan = off`).
+statement ok
+analyze ir;
+
+statement ok
+set enable_seqscan = off;
+
+query TT
+explain (costs off) select * from ir where a > 98;
+----
+Index Scan using ir_a on ir
+  Index Cond: (a > 98)
+
+query TT
+explain (costs off) select * from ir where a < 2;
+----
+Index Scan using ir_a on ir
+  Index Cond: (a < 2)
+
+# A projection the index covers is an index-only scan.
+query TT
+explain (costs off) select a from ir where a > 98;
+----
+Index Only Scan using ir_a on ir
+  Index Cond: (a > 98)
+
+# `ORDER BY` the indexed column adds no Sort: the index reads it in order.
+query TT
+explain (costs off) select * from ir where a >= 98 order by a;
+----
+Index Scan using ir_a on ir
+  Index Cond: (a >= 98)
+
+query TT
+select a, b from ir where a > 98 order by a;
+----
+99	row99
+100	row100
+
+query I
+select a from ir where a < 3 order by a;
+----
+1
+2
+
+query I
+select count(*) from ir where a >= 50 and a <= 59;
+----
+10
+
+query I
+select a from ir where a >= 50 and a <= 52 order by a;
+----
+50
+51
+52
+
+# The index's own condition and the rest of the filter are shown apart.
+query TT
+explain (costs off) select * from ir where a = 50 and c > 3;
+----
+Index Scan using ir_a on ir
+  Index Cond: (a = 50)
+  Filter: (c > 3)
+
+# Without the setting, ranges read the table.
+statement ok
+reset enable_seqscan;
+
+query TT
+explain (costs off) select * from ir where a > 98;
+----
+Seq Scan on ir
+  Filter: (a > 98)
+
+# `INCLUDE` columns are stored in the index for index-only scans, and the
+# catalogs show them.
+statement ok
+create index ir_inc on ir (a) include (b);
+
+statement ok
+analyze ir;
+
+query T
+select indexdef from pg_indexes where indexname = 'ir_inc';
+----
+CREATE INDEX ir_inc ON public.ir USING btree (a) INCLUDE (b)
+
+query II
+select indnatts, indnkeyatts from pg_index where indexrelid = 'ir_inc'::regclass;
+----
+2	1
+
+query TT
+select attname, attnum from pg_attribute where attrelid = 'ir_inc'::regclass order by attnum;
+----
+a	1
+b	2
+
+statement ok
+set enable_seqscan = off;
+
+query TT
+explain (costs off) select a, b from ir where a > 98;
+----
+Index Only Scan using ir_inc on ir
+  Index Cond: (a > 98)
+
+query TT
+select a, b from ir where a > 98 order by a;
+----
+99	row99
+100	row100
+
+statement ok
+reset enable_seqscan;
+
+# An updated included column is rewritten in the index entry.
+statement ok
+update ir set b = 'changed' where a = 100;
+
+statement ok
+set enable_seqscan = off;
+
+query TT
+select a, b from ir where a > 98 order by a;
+----
+99	row99
+100	changed
+
+statement ok
+reset enable_seqscan;
+
+# Text keys read the index in their own order.
+statement ok
+drop table if exists tr;
+
+statement ok
+create table tr (n text, v int);
+
+statement ok
+insert into tr values ('apple', 1), ('banana', 2), ('cherry', 3), ('date', 4), ('elder', 5);
+
+statement ok
+create index tr_n on tr (n);
+
+statement ok
+analyze tr;
+
+statement ok
+set enable_seqscan = off;
+
+query TT
+explain (costs off) select * from tr where n > 'b';
+----
+Index Scan using tr_n on tr
+  Index Cond: (n > 'b'::text)
+
+query T
+select n from tr where n >= 'b' and n < 'd' order by n;
+----
+banana
+cherry
+
+statement ok
+reset enable_seqscan;
