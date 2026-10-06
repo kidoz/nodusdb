@@ -1,0 +1,179 @@
+# Roles, GRANT / REVOKE, and the role catalogs. Expectations from
+# PostgreSQL 18.4.
+
+statement ok
+create role rl_a;
+
+statement ok
+create role rl_b login password 'pw' createdb createrole connection limit 3;
+
+query TTBB
+select rolname, rolcanlogin, rolcreatedb, rolsuper from pg_roles where rolname like 'rl_%' order by rolname;
+----
+rl_a	f	f	f
+rl_b	t	t	f
+
+statement error
+create role rl_a;
+
+# `ALTER ROLE` attributes; a negative `CONNECTION LIMIT` is PostgreSQL's
+# default.
+statement ok
+alter role rl_b nologin connection limit -1 inherit;
+
+query TI
+select rolcanlogin, rolconnlimit from pg_roles where rolname = 'rl_b';
+----
+f	-1
+
+statement ok
+alter role rl_b rename to rl_bx;
+
+statement error
+alter role rl_bx rename to rl_a;
+
+# `ALTER ROLE ... SET` lands in `pg_db_role_setting`.
+statement ok
+alter role rl_bx set search_path to public;
+
+query T
+select setconfig from pg_db_role_setting where setrole = 'rl_bx'::regrole::oid;
+----
+{search_path=public}
+
+statement ok
+alter role rl_bx reset search_path;
+
+query I
+select count(*) from pg_db_role_setting where setrole = 'rl_bx'::regrole::oid;
+----
+0
+
+# Privileges, and the `WITH GRANT OPTION` suffix of `has_table_privilege`.
+statement ok
+create table rl_t (a int);
+
+statement ok
+grant select, insert on rl_t to rl_a;
+
+query BB
+select has_table_privilege('rl_a', 'rl_t', 'SELECT'), has_table_privilege('rl_a', 'rl_t', 'DELETE');
+----
+t	f
+
+statement ok
+grant update on rl_t to rl_a with grant option;
+
+query BB
+select has_table_privilege('rl_a', 'rl_t', 'UPDATE WITH GRANT OPTION'), has_table_privilege('rl_a', 'rl_t', 'SELECT WITH GRANT OPTION');
+----
+t	f
+
+statement ok
+revoke select on rl_t from rl_a;
+
+query B
+select has_table_privilege('rl_a', 'rl_t', 'SELECT');
+----
+f
+
+# `GRANT role TO member` and its admin option.
+statement ok
+grant rl_a to rl_bx;
+
+query TTT
+select roleid::regrole, member::regrole, admin_option from pg_auth_members where roleid = 'rl_a'::regrole;
+----
+rl_a	rl_bx	f
+
+statement ok
+grant rl_a to rl_bx with admin option;
+
+query T
+select admin_option from pg_auth_members where roleid = 'rl_a'::regrole;
+----
+t
+
+query BB
+select pg_has_role('rl_bx', 'rl_a', 'MEMBER'), pg_has_role('rl_a', 'rl_bx', 'MEMBER');
+----
+t	f
+
+statement error
+grant rl_bx to rl_a;
+
+statement ok
+revoke rl_a from rl_bx;
+
+query B
+select pg_has_role('rl_bx', 'rl_a', 'MEMBER');
+----
+f
+
+# The owner holds every privilege on its relation, grantable.
+statement ok
+create role rl_own;
+
+statement ok
+create table rl_owned (a int);
+
+statement ok
+alter table rl_owned owner to rl_own;
+
+query BBB
+select has_table_privilege('rl_own', 'rl_owned', 'SELECT'), has_table_privilege('rl_own', 'rl_owned', 'TRUNCATE'), has_table_privilege('rl_own', 'rl_owned', 'SELECT WITH GRANT OPTION');
+----
+t	t	t
+
+statement ok
+grant select, insert on rl_t to rl_a with grant option;
+
+query TTT
+select grantee::regrole, privilege_type, is_grantable from information_schema.table_privileges where table_name = 'rl_t' and grantee = 'rl_a' order by privilege_type;
+----
+rl_a	INSERT	YES
+rl_a	SELECT	YES
+rl_a	UPDATE	YES
+
+# `SET ROLE` switches the role the session acts as; `session_user` stays the
+# authenticated one.
+statement ok
+set role rl_a;
+
+query TT
+select current_user, session_user;
+----
+rl_a	nodus
+
+statement ok
+reset role;
+
+query TT
+select current_user, session_user;
+----
+nodus	nodus
+
+# What a role holds blocks `DROP ROLE`, and the privileges are named.
+statement error
+drop role rl_a;
+
+statement ok
+revoke all on rl_t from rl_a;
+
+statement ok
+drop role rl_a;
+
+statement error
+drop role rl_own;
+
+statement ok
+drop table rl_owned;
+
+statement ok
+drop role rl_own;
+
+statement ok
+drop table rl_t;
+
+statement ok
+drop role rl_bx;
