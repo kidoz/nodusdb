@@ -569,6 +569,7 @@ async fn create_role(
             name: body.name,
             principal_type: nodus_catalog::PrincipalType::Role,
             database_id: None,
+            attributes: Default::default(),
         })
     })
     .await;
@@ -637,6 +638,8 @@ async fn create_grant(State(state): State<AdminState>, Json(body): Json<GrantBod
             principal_id,
             resource: ResourceRef::Table(table_id),
             privilege,
+            grantable: false,
+            grantor: None,
         })
     })
     .await;
@@ -1515,6 +1518,8 @@ mod import_tests {
                 name: "importer".into(),
                 principal_type: PrincipalType::User,
                 database_id: None,
+
+                attributes: Default::default(),
             })
             .unwrap();
         catalog
@@ -1523,6 +1528,9 @@ mod import_tests {
                 principal_id: admin.id,
                 resource: ResourceRef::System,
                 privilege: "ALL".into(),
+
+                grantable: false,
+                grantor: None,
             })
             .unwrap();
 

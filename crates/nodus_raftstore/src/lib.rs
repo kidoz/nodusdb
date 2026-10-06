@@ -120,6 +120,10 @@ pub enum ShardCommand {
     CreateTable(nodus_catalog::CreateTableRequest),
     DropTable(nodus_catalog::TableId),
     DropSchema(nodus_catalog::SchemaId),
+    SetSchemaOwner {
+        id: nodus_catalog::SchemaId,
+        owner_role_id: Option<nodus_catalog::RoleId>,
+    },
     GrantPrivileges(nodus_catalog::GrantPrivilegesRequest),
     RevokePrivileges(nodus_catalog::RevokePrivilegesRequest),
     UpdateTableDescriptor(nodus_catalog::TableDescriptorChange),
@@ -127,6 +131,9 @@ pub enum ShardCommand {
     GrantPrivilege(nodus_catalog::GrantPrivilegeRequest),
     RevokePrivilege(nodus_catalog::RevokePrivilegeRequest),
     AddRoleMember(nodus_catalog::AddRoleMemberRequest),
+    RemoveRoleMember(nodus_catalog::RemoveRoleMemberRequest),
+    UpdatePrincipal(nodus_catalog::UpdatePrincipalRequest),
+    DropPrincipal(nodus_catalog::PrincipalId),
     UpdateIndexState {
         table_id: nodus_catalog::TableId,
         index_id: nodus_catalog::IndexId,
@@ -1333,6 +1340,11 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
                                     tracing::debug!("DropSchema error: {}", e);
                                 }
                             }
+                            ShardCommand::SetSchemaOwner { id, owner_role_id } => {
+                                if let Err(e) = catalog.set_schema_owner(*id, *owner_role_id) {
+                                    tracing::debug!("SetSchemaOwner error: {}", e);
+                                }
+                            }
                             ShardCommand::GrantPrivileges(req) => {
                                 let _ = catalog.grant_privileges(req.clone());
                             }
@@ -1355,6 +1367,15 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
                             }
                             ShardCommand::AddRoleMember(req) => {
                                 let _ = catalog.add_role_member(req.clone());
+                            }
+                            ShardCommand::RemoveRoleMember(req) => {
+                                let _ = catalog.remove_role_member(req.clone());
+                            }
+                            ShardCommand::UpdatePrincipal(req) => {
+                                let _ = catalog.update_principal(req.clone());
+                            }
+                            ShardCommand::DropPrincipal(id) => {
+                                let _ = catalog.drop_principal(*id);
                             }
                             ShardCommand::UpdateIndexState {
                                 table_id,

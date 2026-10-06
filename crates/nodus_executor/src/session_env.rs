@@ -11,8 +11,11 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 pub(crate) struct SessionEnv {
-    /// The session's authenticated role name.
+    /// The effective role name (`SET ROLE` changes it).
     pub(crate) user: String,
+    /// The session's authenticated role name (`SET SESSION AUTHORIZATION`
+    /// changes it).
+    pub(crate) session_user: String,
     /// Effective run-time settings: the session's `SET` overrides (lowercase
     /// names). Unset variables fall back to their built-in defaults.
     pub(crate) settings: HashMap<String, String>,

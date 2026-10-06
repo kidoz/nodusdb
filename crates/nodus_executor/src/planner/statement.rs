@@ -471,6 +471,10 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                     cascade: *cascade,
                     domain: false,
                 }),
+                sqlparser::ast::ObjectType::Role => Ok(LogicalPlan::DropRole {
+                    names: names.iter().map(|n| n.to_string()).collect(),
+                    if_exists: *if_exists,
+                }),
                 // Dropping only the first of several names would report the
                 // others dropped too.
                 _ if names.len() > 1 => {
@@ -550,61 +554,122 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                 .first()
                 .ok_or_else(|| anyhow::anyhow!("CREATE ROLE without a name"))?
                 .to_string();
-            Ok(LogicalPlan::CreateRole { name })
+            if create_role.names.len() > 1 {
+                anyhow::bail!("CREATE ROLE with several names is not supported");
+            }
+            Ok(LogicalPlan::CreateRole {
+                name,
+                attributes: role_attributes(
+                    create_role.login,
+                    create_role.inherit,
+                    create_role.bypassrls,
+                    create_role.superuser,
+                    create_role.create_db,
+                    create_role.create_role,
+                    create_role.replication,
+                    &create_role.connection_limit,
+                    &create_role.valid_until,
+                    &create_role.password,
+                    params,
+                )?,
+            })
         }
         Statement::Grant(grant) => {
-            let privilege = match &grant.privileges {
-                sqlparser::ast::Privileges::Actions(actions) => actions
-                    .first()
-                    .map(|a| a.to_string())
-                    .unwrap_or_else(|| "ALL".to_string()),
-                _ => "ALL".to_string(),
-            };
-            let grantee = grant
-                .grantees
-                .first()
-                .ok_or_else(|| anyhow::anyhow!("GRANT without grantee"))?
-                .to_string();
-            if let Some(GrantObjects::Tables(tables)) = &grant.objects {
-                let object_name = tables
-                    .first()
-                    .ok_or_else(|| anyhow::anyhow!("GRANT without table name"))?
-                    .to_string();
-                Ok(LogicalPlan::Grant {
-                    privilege,
-                    object_name,
-                    grantee,
-                })
-            } else {
-                anyhow::bail!("Unsupported GRANT target");
-            }
+            let privileges = grant_privileges(&grant.privileges);
+            let grantees = grant.grantees.iter().map(|g| g.to_string()).collect();
+            Ok(LogicalPlan::Grant {
+                privileges,
+                objects: grant_objects(grant.objects.as_ref(), params)?,
+                grantees,
+                with_grant_option: grant.with_grant_option,
+            })
         }
         Statement::Revoke(revoke) => {
-            let privilege = match &revoke.privileges {
-                sqlparser::ast::Privileges::Actions(actions) => actions
-                    .first()
-                    .map(|a| a.to_string())
-                    .unwrap_or_else(|| "ALL".to_string()),
-                _ => "ALL".to_string(),
-            };
-            let revokee = revoke
-                .grantees
-                .first()
-                .ok_or_else(|| anyhow::anyhow!("REVOKE without revokee"))?
-                .to_string();
-            if let Some(GrantObjects::Tables(tables)) = &revoke.objects {
-                let object_name = tables
-                    .first()
-                    .ok_or_else(|| anyhow::anyhow!("REVOKE without table name"))?
-                    .to_string();
-                Ok(LogicalPlan::Revoke {
-                    privilege,
-                    object_name,
-                    revokee,
+            let privileges = grant_privileges(&revoke.privileges);
+            let grantees = revoke.grantees.iter().map(|g| g.to_string()).collect();
+            Ok(LogicalPlan::Revoke {
+                grant_option_for: revoke.grant_option_for,
+                privileges,
+                objects: grant_objects(revoke.objects.as_ref(), params)?,
+                grantees,
+            })
+        }
+        Statement::Set(sqlparser::ast::Set::SetRole { role_name, .. }) => {
+            Ok(LogicalPlan::SetRole {
+                role: role_name.as_ref().map(|r| r.value.clone()),
+                session_authorization: false,
+            })
+        }
+        Statement::Set(sqlparser::ast::Set::SetSessionAuthorization(param)) => match &param.kind {
+            sqlparser::ast::SetSessionAuthorizationParamKind::User(name) => {
+                Ok(LogicalPlan::SetRole {
+                    role: Some(name.value.clone()),
+                    session_authorization: true,
                 })
-            } else {
-                anyhow::bail!("Unsupported REVOKE target");
             }
+            _ => Ok(LogicalPlan::SetRole {
+                role: None,
+                session_authorization: true,
+            }),
+        },
+        Statement::AlterRole { name, operation } => {
+            use sqlparser::ast::AlterRoleOperation as Op;
+            let action = match operation {
+                Op::RenameRole { role_name } => crate::plan_types::AlterRoleAction::Rename {
+                    name: role_name.value.clone(),
+                },
+                Op::WithOptions { options } => crate::plan_types::AlterRoleAction::Attributes {
+                    patch: role_attrs_patch(options, params)?,
+                },
+                Op::Set {
+                    config_name,
+                    config_value,
+                    in_database,
+                } => {
+                    if in_database.is_some() {
+                        anyhow::bail!("ALTER ROLE ... IN DATABASE is not supported");
+                    }
+                    let value = match config_value {
+                        sqlparser::ast::SetConfigValue::Default
+                        | sqlparser::ast::SetConfigValue::FromCurrent => None,
+                        sqlparser::ast::SetConfigValue::Value(expr) => {
+                            Some(match expr_to_value(expr, params) {
+                                Some(crate::Value::Text(text)) => text,
+                                Some(value) => crate::render(&value),
+                                None => expr.to_string().trim_matches('\'').to_string(),
+                            })
+                        }
+                    };
+                    match value {
+                        Some(value) => crate::plan_types::AlterRoleAction::SetSetting {
+                            name: config_name.to_string(),
+                            value,
+                        },
+                        None => crate::plan_types::AlterRoleAction::ResetSetting {
+                            name: config_name.to_string(),
+                        },
+                    }
+                }
+                Op::Reset {
+                    config_name,
+                    in_database,
+                } => {
+                    if in_database.is_some() {
+                        anyhow::bail!("ALTER ROLE ... IN DATABASE is not supported");
+                    }
+                    crate::plan_types::AlterRoleAction::ResetSetting {
+                        name: match config_name {
+                            sqlparser::ast::ResetConfig::ALL => String::new(),
+                            sqlparser::ast::ResetConfig::ConfigName(name) => name.to_string(),
+                        },
+                    }
+                }
+                other => anyhow::bail!("ALTER ROLE {other} is not supported"),
+            };
+            Ok(LogicalPlan::AlterRole {
+                name: name.value.clone(),
+                action,
+            })
         }
         Statement::Insert(insert) => {
             let table_name = match &insert.table {
@@ -869,6 +934,34 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                     only: false,
                 }),
                 _ => anyhow::bail!("malformed INHERIT"),
+            }
+        }
+        Statement::Query(query)
+            if rewritten_call(query, nodus_sql::GRANT_ROLE_FUNCTION).is_some() =>
+        {
+            match rewritten_call(query, nodus_sql::GRANT_ROLE_FUNCTION).as_deref() {
+                Some(
+                    [
+                        crate::Value::Text(roles),
+                        crate::Value::Text(members),
+                        crate::Value::Text(mode),
+                    ],
+                ) => {
+                    let split = |text: &str| -> Vec<String> {
+                        text.split(',')
+                            .map(|name| name.trim().to_string())
+                            .filter(|name| !name.is_empty())
+                            .collect()
+                    };
+                    Ok(LogicalPlan::GrantRole {
+                        roles: split(roles),
+                        members: split(members),
+                        admin_option: matches!(mode.as_str(), "grant_admin" | "revoke_admin"),
+                        admin_only: mode == "revoke_admin",
+                        grant: mode.starts_with("grant"),
+                    })
+                }
+                _ => anyhow::bail!("malformed GRANT role"),
             }
         }
         Statement::Query(query)
@@ -1215,15 +1308,26 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
             chain: true,
             savepoint: None,
         } => Ok(LogicalPlan::Chain { rollback: true }),
-        Statement::Reset(reset) => Ok(LogicalPlan::ResetVariable {
-            variable: match &reset.reset {
-                sqlparser::ast::Reset::ConfigurationParameter(name) => Some(name.to_string()),
-                sqlparser::ast::Reset::ALL => None,
-                sqlparser::ast::Reset::SessionAuthorization => {
-                    anyhow::bail!("RESET SESSION AUTHORIZATION is not supported")
-                }
-            },
-        }),
+        Statement::Reset(reset) => match &reset.reset {
+            // `RESET ROLE` parses as a variable named `role`, which no
+            // setting answers to.
+            sqlparser::ast::Reset::ConfigurationParameter(name)
+                if name.to_string().eq_ignore_ascii_case("role") =>
+            {
+                Ok(LogicalPlan::SetRole {
+                    role: None,
+                    session_authorization: false,
+                })
+            }
+            sqlparser::ast::Reset::ConfigurationParameter(name) => Ok(LogicalPlan::ResetVariable {
+                variable: Some(name.to_string()),
+            }),
+            sqlparser::ast::Reset::ALL => Ok(LogicalPlan::ResetVariable { variable: None }),
+            sqlparser::ast::Reset::SessionAuthorization => Ok(LogicalPlan::SetRole {
+                role: None,
+                session_authorization: true,
+            }),
+        },
         Statement::Commit { .. } => Ok(LogicalPlan::Commit),
         Statement::Rollback { savepoint, .. } => {
             if let Some(name) = savepoint {
@@ -2228,7 +2332,14 @@ fn plan_alter_table_op(
             };
             vec![AlterTableOp::RenameTable { new_name }]
         }
-        Op::OwnerTo { .. } => vec![AlterTableOp::OwnerTo],
+        Op::OwnerTo { new_owner } => vec![AlterTableOp::OwnerTo {
+            owner: match new_owner {
+                sqlparser::ast::Owner::Ident(ident) => ident.value.clone(),
+                sqlparser::ast::Owner::CurrentRole
+                | sqlparser::ast::Owner::CurrentUser
+                | sqlparser::ast::Owner::SessionUser => "current_user".to_string(),
+            },
+        }],
         _ => anyhow::bail!(
             "ALTER TABLE ... {} is not supported",
             leading_keywords(&op.to_string())
@@ -2304,6 +2415,193 @@ fn deferral(
         anyhow::bail!("constraint declared INITIALLY DEFERRED must be DEFERRABLE");
     }
     Ok((c.deferrable.unwrap_or(initially), initially))
+}
+
+/// The privilege names of a `GRANT` / `REVOKE`, uppercased as PostgreSQL
+/// reports them; `ALL` covers `ALL [PRIVILEGES]`.
+fn grant_privileges(privileges: &sqlparser::ast::Privileges) -> Vec<String> {
+    match privileges {
+        sqlparser::ast::Privileges::All { .. } => vec!["ALL".to_string()],
+        sqlparser::ast::Privileges::Actions(actions) => actions
+            .iter()
+            .map(|action| match action {
+                // PostgreSQL reports both spellings as TEMP.
+                sqlparser::ast::Action::Temporary => "TEMP".to_string(),
+                other => other.to_string().to_ascii_uppercase(),
+            })
+            .collect(),
+    }
+}
+
+/// The objects a `GRANT` / `REVOKE` names.
+fn grant_objects(
+    objects: Option<&sqlparser::ast::GrantObjects>,
+    _params: &[Value],
+) -> Result<crate::plan_types::GrantObjectsPlan> {
+    use crate::plan_types::GrantObjectsPlan;
+    use sqlparser::ast::GrantObjects as O;
+    let Some(objects) = objects else {
+        anyhow::bail!("GRANT or REVOKE without objects");
+    };
+    // The identifier's own text: `"default"` names `default`, and a
+    // qualified name keeps its qualifier.
+    let names = |names: &[sqlparser::ast::ObjectName]| -> Vec<String> {
+        names
+            .iter()
+            .map(|name| {
+                name.0
+                    .iter()
+                    .filter_map(|part| part.as_ident().map(|ident| ident.value.clone()))
+                    .collect::<Vec<_>>()
+                    .join(".")
+            })
+            .collect()
+    };
+    Ok(match objects {
+        O::Tables(names_list) => GrantObjectsPlan::ByName {
+            kind: "TABLE".to_string(),
+            names: names(names_list),
+        },
+        O::Views(names_list) => GrantObjectsPlan::ByName {
+            kind: "VIEW".to_string(),
+            names: names(names_list),
+        },
+        O::Sequences(names_list) => GrantObjectsPlan::ByName {
+            kind: "SEQUENCE".to_string(),
+            names: names(names_list),
+        },
+        O::Schemas(names_list) => GrantObjectsPlan::ByName {
+            kind: "SCHEMA".to_string(),
+            names: names(names_list),
+        },
+        O::Databases(names_list) => GrantObjectsPlan::ByName {
+            kind: "DATABASE".to_string(),
+            names: names(names_list),
+        },
+        O::AllTablesInSchema { schemas } => GrantObjectsPlan::AllInSchema {
+            kind: "TABLE".to_string(),
+            schemas: names(schemas),
+        },
+        O::AllSequencesInSchema { schemas } => GrantObjectsPlan::AllInSchema {
+            kind: "SEQUENCE".to_string(),
+            schemas: names(schemas),
+        },
+        O::AllViewsInSchema { schemas } => GrantObjectsPlan::AllInSchema {
+            kind: "VIEW".to_string(),
+            schemas: names(schemas),
+        },
+        other => anyhow::bail!("GRANT or REVOKE target {other} is not supported"),
+    })
+}
+
+/// A password expression as a SCRAM-SHA-256 verifier (never the plaintext).
+fn password_verifier(password: &sqlparser::ast::Password, params: &[Value]) -> Result<String> {
+    let sqlparser::ast::Password::Password(expr) = password else {
+        anyhow::bail!("PASSWORD NULL is not supported; use ALTER ROLE ... PASSWORD NULL");
+    };
+    let Some(Value::Text(text)) = expr_to_value(expr, params) else {
+        anyhow::bail!("PASSWORD must be a string literal");
+    };
+    let salt = uuid::Uuid::new_v4().as_bytes().to_vec();
+    Ok(
+        nodus_security::ScramKeys::derive(&text, salt, nodus_security::PBKDF2_ITERATIONS)
+            .to_verifier_string(),
+    )
+}
+
+/// A `CONNECTION LIMIT` / `VALID UNTIL` expression.
+fn role_integer(expr: &sqlparser::ast::Expr, params: &[Value], what: &str) -> Result<i32> {
+    let value = match expr {
+        sqlparser::ast::Expr::UnaryOp { op, expr } => {
+            let sqlparser::ast::UnaryOperator::Minus = op else {
+                anyhow::bail!("{what} must be an integer constant");
+            };
+            match expr_to_value(expr, params) {
+                Some(Value::Int(n)) => Value::Int(-n),
+                _ => anyhow::bail!("{what} must be an integer constant"),
+            }
+        }
+        other => expr_to_value(other, params)
+            .ok_or_else(|| anyhow::anyhow!("{what} must be an integer constant"))?,
+    };
+    match value {
+        Value::Int(n) => i32::try_from(n).map_err(|_| anyhow::anyhow!("{what} is out of range")),
+        _ => anyhow::bail!("{what} must be an integer constant"),
+    }
+}
+
+/// `CREATE ROLE`'s attributes.
+#[allow(clippy::too_many_arguments)]
+fn role_attributes(
+    login: Option<bool>,
+    inherit: Option<bool>,
+    bypassrls: Option<bool>,
+    superuser: Option<bool>,
+    create_db: Option<bool>,
+    create_role: Option<bool>,
+    replication: Option<bool>,
+    connection_limit: &Option<sqlparser::ast::Expr>,
+    valid_until: &Option<sqlparser::ast::Expr>,
+    password: &Option<sqlparser::ast::Password>,
+    params: &[Value],
+) -> Result<nodus_catalog::RoleAttributes> {
+    let mut attributes = nodus_catalog::RoleAttributes::default();
+    attributes.can_login = login.unwrap_or(false);
+    attributes.inherit = inherit.unwrap_or(true);
+    attributes.bypass_rls = bypassrls.unwrap_or(false);
+    attributes.superuser = superuser.unwrap_or(false);
+    attributes.create_db = create_db.unwrap_or(false);
+    attributes.create_role = create_role.unwrap_or(false);
+    attributes.replication = replication.unwrap_or(false);
+    if let Some(limit) = connection_limit {
+        attributes.connection_limit = role_integer(limit, params, "CONNECTION LIMIT")?;
+    }
+    if let Some(until) = valid_until {
+        match expr_to_value(until, params) {
+            Some(Value::Text(text)) => attributes.valid_until = Some(text),
+            _ => anyhow::bail!("VALID UNTIL must be a string literal"),
+        }
+    }
+    if let Some(password) = password {
+        attributes.password = Some(password_verifier(password, params)?);
+    }
+    Ok(attributes)
+}
+
+/// `ALTER ROLE`'s option patch.
+fn role_attrs_patch(
+    options: &[sqlparser::ast::RoleOption],
+    params: &[Value],
+) -> Result<crate::plan_types::RoleAttrsPatch> {
+    use sqlparser::ast::RoleOption as O;
+    let mut patch = crate::plan_types::RoleAttrsPatch::default();
+    for option in options {
+        match option {
+            O::Login(flag) => patch.can_login = Some(*flag),
+            O::Inherit(flag) => patch.inherit = Some(*flag),
+            O::BypassRLS(flag) => patch.bypass_rls = Some(*flag),
+            O::SuperUser(flag) => patch.superuser = Some(*flag),
+            O::CreateDB(flag) => patch.create_db = Some(*flag),
+            O::CreateRole(flag) => patch.create_role = Some(*flag),
+            O::Replication(flag) => patch.replication = Some(*flag),
+            O::ConnectionLimit(expr) => {
+                patch.connection_limit = Some(role_integer(expr, params, "CONNECTION LIMIT")?)
+            }
+            O::ValidUntil(expr) => match expr_to_value(expr, params) {
+                Some(Value::Text(text)) => patch.valid_until = Some(Some(text)),
+                Some(Value::Null) => patch.valid_until = Some(None),
+                _ => anyhow::bail!("VALID UNTIL must be a string literal"),
+            },
+            O::Password(password) => match password {
+                sqlparser::ast::Password::Password(expr) => {
+                    patch.password = Some(password_verifier(password, params)?)
+                }
+                sqlparser::ast::Password::NullPassword => patch.password = None,
+            },
+        }
+    }
+    let _ = params;
+    Ok(patch)
 }
 
 /// Which statement a `RETURNING` list belongs to.

@@ -26,6 +26,8 @@ fn test_group_by_aggregates() {
             name: "admin".into(),
             principal_type: nodus_catalog::PrincipalType::User,
             database_id: None,
+
+            attributes: Default::default(),
         })
         .unwrap();
     cat.grant_privilege(nodus_catalog::GrantPrivilegeRequest {
@@ -33,6 +35,9 @@ fn test_group_by_aggregates() {
         principal_id: admin.id,
         resource: nodus_catalog::ResourceRef::System,
         privilege: "ALL".into(),
+
+        grantable: false,
+        grantor: None,
     })
     .unwrap();
     let ctx = test_ctx(admin.id);
@@ -143,6 +148,8 @@ fn test_scalar_functions() {
             name: "admin".into(),
             principal_type: nodus_catalog::PrincipalType::User,
             database_id: None,
+
+            attributes: Default::default(),
         })
         .unwrap();
     cat.grant_privilege(nodus_catalog::GrantPrivilegeRequest {
@@ -150,6 +157,9 @@ fn test_scalar_functions() {
         principal_id: admin.id,
         resource: nodus_catalog::ResourceRef::System,
         privilege: "ALL".into(),
+
+        grantable: false,
+        grantor: None,
     })
     .unwrap();
     let ctx = test_ctx(admin.id);
@@ -191,6 +201,8 @@ fn test_table_functions() {
             name: "admin".into(),
             principal_type: nodus_catalog::PrincipalType::User,
             database_id: None,
+
+            attributes: Default::default(),
         })
         .unwrap();
     cat.grant_privilege(nodus_catalog::GrantPrivilegeRequest {
@@ -198,6 +210,9 @@ fn test_table_functions() {
         principal_id: admin.id,
         resource: nodus_catalog::ResourceRef::System,
         privilege: "ALL".into(),
+
+        grantable: false,
+        grantor: None,
     })
     .unwrap();
     let ctx = test_ctx(admin.id);
@@ -258,6 +273,8 @@ fn test_set_operations() {
             name: "admin".into(),
             principal_type: nodus_catalog::PrincipalType::User,
             database_id: None,
+
+            attributes: Default::default(),
         })
         .unwrap();
     cat.grant_privilege(nodus_catalog::GrantPrivilegeRequest {
@@ -265,6 +282,9 @@ fn test_set_operations() {
         principal_id: admin.id,
         resource: nodus_catalog::ResourceRef::System,
         privilege: "ALL".into(),
+
+        grantable: false,
+        grantor: None,
     })
     .unwrap();
     let ctx = test_ctx(admin.id);
@@ -360,6 +380,8 @@ fn test_cross_join() {
             name: "admin".into(),
             principal_type: nodus_catalog::PrincipalType::User,
             database_id: None,
+
+            attributes: Default::default(),
         })
         .unwrap();
     cat.grant_privilege(nodus_catalog::GrantPrivilegeRequest {
@@ -367,6 +389,9 @@ fn test_cross_join() {
         principal_id: admin.id,
         resource: nodus_catalog::ResourceRef::System,
         privilege: "ALL".into(),
+
+        grantable: false,
+        grantor: None,
     })
     .unwrap();
     let ctx = test_ctx(admin.id);
@@ -432,6 +457,8 @@ fn test_having() {
             name: "admin".into(),
             principal_type: nodus_catalog::PrincipalType::User,
             database_id: None,
+
+            attributes: Default::default(),
         })
         .unwrap();
     cat.grant_privilege(nodus_catalog::GrantPrivilegeRequest {
@@ -439,6 +466,9 @@ fn test_having() {
         principal_id: admin.id,
         resource: nodus_catalog::ResourceRef::System,
         privilege: "ALL".into(),
+
+        grantable: false,
+        grantor: None,
     })
     .unwrap();
     let ctx = test_ctx(admin.id);
@@ -529,6 +559,8 @@ fn test_window_functions() {
             name: "admin".into(),
             principal_type: nodus_catalog::PrincipalType::User,
             database_id: None,
+
+            attributes: Default::default(),
         })
         .unwrap();
     cat.grant_privilege(nodus_catalog::GrantPrivilegeRequest {
@@ -536,6 +568,9 @@ fn test_window_functions() {
         principal_id: admin.id,
         resource: nodus_catalog::ResourceRef::System,
         privilege: "ALL".into(),
+
+        grantable: false,
+        grantor: None,
     })
     .unwrap();
     let ctx = test_ctx(admin.id);
@@ -617,6 +652,8 @@ fn test_index_ddl() {
             name: "admin".into(),
             principal_type: nodus_catalog::PrincipalType::User,
             database_id: None,
+
+            attributes: Default::default(),
         })
         .unwrap();
     cat.grant_privilege(nodus_catalog::GrantPrivilegeRequest {
@@ -624,6 +661,9 @@ fn test_index_ddl() {
         principal_id: admin.id,
         resource: nodus_catalog::ResourceRef::System,
         privilege: "ALL".into(),
+
+        grantable: false,
+        grantor: None,
     })
     .unwrap();
     let ctx = test_ctx(admin.id);
@@ -653,6 +693,8 @@ fn test_general_case() {
             name: "admin".into(),
             principal_type: nodus_catalog::PrincipalType::User,
             database_id: None,
+
+            attributes: Default::default(),
         })
         .unwrap();
     cat.grant_privilege(nodus_catalog::GrantPrivilegeRequest {
@@ -660,6 +702,9 @@ fn test_general_case() {
         principal_id: admin.id,
         resource: nodus_catalog::ResourceRef::System,
         privilege: "ALL".into(),
+
+        grantable: false,
+        grantor: None,
     })
     .unwrap();
     let ctx = test_ctx(admin.id);
@@ -693,6 +738,8 @@ fn test_index_overlay_merge() {
             name: "admin".into(),
             principal_type: nodus_catalog::PrincipalType::User,
             database_id: None,
+
+            attributes: Default::default(),
         })
         .unwrap();
     cat.grant_privilege(nodus_catalog::GrantPrivilegeRequest {
@@ -700,6 +747,9 @@ fn test_index_overlay_merge() {
         principal_id: admin.id,
         resource: nodus_catalog::ResourceRef::System,
         privilege: "ALL".into(),
+
+        grantable: false,
+        grantor: None,
     })
     .unwrap();
     let ctx = test_ctx(admin.id);

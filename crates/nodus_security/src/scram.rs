@@ -39,6 +39,37 @@ pub struct ScramKeys {
 }
 
 impl ScramKeys {
+    /// The keys as PostgreSQL stores a password verifier —
+    /// `SCRAM-SHA-256$<iterations>:<salt>$<stored key>:<server key>` — so
+    /// role passwords survive in the catalog and any node can verify them.
+    pub fn to_verifier_string(&self) -> String {
+        use base64::Engine;
+        use base64::engine::general_purpose::STANDARD;
+        format!(
+            "SCRAM-SHA-256${}:{}${}:{}",
+            self.iterations,
+            STANDARD.encode(&self.salt),
+            STANDARD.encode(self.stored_key),
+            STANDARD.encode(self.server_key)
+        )
+    }
+
+    /// Reads a verifier string [`Self::to_verifier_string`] wrote.
+    pub fn from_verifier_string(text: &str) -> Option<ScramKeys> {
+        use base64::Engine;
+        use base64::engine::general_purpose::STANDARD;
+        let rest = text.strip_prefix("SCRAM-SHA-256$")?;
+        let (iteration_salt, keys) = rest.split_once('$')?;
+        let (iterations, salt) = iteration_salt.split_once(':')?;
+        let (stored_key, server_key) = keys.split_once(':')?;
+        Some(ScramKeys {
+            iterations: iterations.parse().ok()?,
+            salt: STANDARD.decode(salt).ok()?,
+            stored_key: STANDARD.decode(stored_key).ok()?.try_into().ok()?,
+            server_key: STANDARD.decode(server_key).ok()?.try_into().ok()?,
+        })
+    }
+
     /// Derives SCRAM keys from a plaintext password, salt, and iteration count.
     pub fn derive(password: &str, salt: Vec<u8>, iterations: u32) -> Self {
         let salted = pbkdf2_sha256(password.as_bytes(), &salt, iterations);

@@ -144,6 +144,8 @@ fn exec_with_rows(
             name: "admin".into(),
             principal_type: PrincipalType::User,
             database_id: None,
+
+            attributes: Default::default(),
         })
         .unwrap();
     cat.grant_privilege(GrantPrivilegeRequest {
@@ -151,6 +153,9 @@ fn exec_with_rows(
         principal_id: admin.id,
         resource: ResourceRef::System,
         privilege: "ALL".into(),
+
+        grantable: false,
+        grantor: None,
     })
     .unwrap();
     let ctx = ctx_for(admin.id);

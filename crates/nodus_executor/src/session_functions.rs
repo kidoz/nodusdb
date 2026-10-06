@@ -403,10 +403,18 @@ fn privilege(
     action: impl Fn(&str) -> Option<Action>,
 ) -> Value {
     let mut actions = Vec::new();
+    // `X WITH GRANT OPTION` asks whether the holder may grant X onward.
+    let mut grant_option = false;
     for privilege in privileges.split(',') {
-        let upper = privilege.trim().to_ascii_uppercase();
-        let upper = upper.trim_end_matches("WITH GRANT OPTION").trim();
-        match action(upper) {
+        let mut upper = privilege.trim().to_ascii_uppercase();
+        match upper.strip_suffix("WITH GRANT OPTION") {
+            Some(rest) => {
+                grant_option = true;
+                upper = rest.trim().to_string();
+            }
+            None => upper = upper.trim().to_string(),
+        }
+        match action(&upper) {
             Some(a) => actions.push(a),
             None => {
                 return raise(format!(
@@ -433,6 +441,56 @@ fn privilege(
     };
     if is_superuser(&user.unwrap_or_else(current_user)) {
         return Value::Bool(true);
+    }
+    if grant_option {
+        // The privilege must be held *with* the grant option — the owner's
+        // implicit ones are grantable.
+        let catalog = session_env::with(|env| env.and_then(|e| e.catalog.clone()));
+        let Some(catalog) = catalog else {
+            return Value::Bool(false);
+        };
+        let owns = |owner: Option<nodus_catalog::RoleId>| {
+            owner.is_some_and(|owner| {
+                catalog
+                    .get_effective_principals(principal)
+                    .unwrap_or_default()
+                    .contains(&nodus_catalog::PrincipalId(owner.0))
+            })
+        };
+        let owned = match &resource {
+            ResourceRef::Table(id) => catalog
+                .get_table_by_id(*id)
+                .ok()
+                .is_some_and(|table| owns(table.owner_role_id)),
+            ResourceRef::Schema(id) => catalog
+                .get_schema_by_id(*id)
+                .ok()
+                .is_some_and(|schema| owns(schema.owner_role_id)),
+            ResourceRef::Database(id) => catalog
+                .get_database_by_id(*id)
+                .ok()
+                .is_some_and(|database| owns(database.owner_role_id)),
+            _ => false,
+        };
+        if owned {
+            return Value::Bool(true);
+        }
+        let effective = catalog
+            .get_effective_principals(principal)
+            .unwrap_or_default();
+        let grants = catalog
+            .get_grants_for_resource(resource.clone())
+            .unwrap_or_default();
+        let allowed = actions.into_iter().all(|action| {
+            let wanted = action.to_privilege();
+            grants.iter().any(|grant| {
+                effective.contains(&grant.principal_id)
+                    && grant.grantable
+                    && (grant.privilege.eq_ignore_ascii_case(wanted)
+                        || grant.privilege.eq_ignore_ascii_case("ALL"))
+            })
+        });
+        return Value::Bool(allowed);
     }
     let allowed = actions.into_iter().any(|action| {
         authz

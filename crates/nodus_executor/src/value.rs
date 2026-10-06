@@ -124,6 +124,7 @@ pub(crate) fn object_identifier_type(data_type: &str) -> Option<&'static str> {
         "REGDICTIONARY" => Some("REGDICTIONARY"),
         "REGTYPE" => Some("REGTYPE"),
         "REGNAMESPACE" => Some("REGNAMESPACE"),
+        "REGROLE" => Some("REGROLE"),
         _ => None,
     }
 }

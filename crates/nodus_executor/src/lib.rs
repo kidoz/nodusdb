@@ -56,6 +56,7 @@ mod random;
 mod ranges;
 mod referential;
 mod result_types;
+mod roles;
 mod schemas;
 mod search_path;
 mod select;
@@ -393,6 +394,9 @@ pub struct MemExecutor {
     /// a map of lowercased variable name to its set value. Cleared on session
     /// end so it cannot grow unbounded. See [`crate::session_vars`].
     pub(crate) session_vars: parking_lot::RwLock<HashMap<String, HashMap<String, String>>>,
+    /// Per-session `SET ROLE` / `SET SESSION AUTHORIZATION` overrides, keyed
+    /// by session id. Cleared on session end.
+    pub(crate) session_roles: parking_lot::RwLock<HashMap<String, crate::roles::SessionRole>>,
     /// Set while a restore is replacing the engine's data: new statements are
     /// rejected so no query observes a partially restored state.
     pub(crate) restoring: Arc<std::sync::atomic::AtomicBool>,
@@ -484,6 +488,7 @@ impl MemExecutor {
             sequences,
             active_txns: parking_lot::RwLock::new(HashMap::new()),
             session_vars: parking_lot::RwLock::new(HashMap::new()),
+            session_roles: parking_lot::RwLock::new(HashMap::new()),
             restoring: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             restore_gate: Arc::new(parking_lot::RwLock::new(())),
             notices: parking_lot::Mutex::new(HashMap::new()),
@@ -704,12 +709,19 @@ impl MemExecutor {
             .get(&ctx.session_id)
             .map_or(statement_micros, |txn| txn.read_ts as i64);
         let backend_pid = temp_tables::backend_pid(&ctx.session_id);
+        let authenticated = self
+            .catalog_reader
+            .get_principal_by_id(ctx.principal_id)
+            .map(|p| p.name)
+            .unwrap_or_else(|_| "unknown".to_string());
+        let session_role = self.session_role(&ctx.session_id);
+        let session_user = match &session_role {
+            Some(role) if role.session_authorization => role.name.clone(),
+            _ => authenticated.clone(),
+        };
         session_env::SessionEnv {
-            user: self
-                .catalog_reader
-                .get_principal_by_id(ctx.principal_id)
-                .map(|p| p.name)
-                .unwrap_or_else(|_| "unknown".to_string()),
+            user: session_role.map_or(authenticated, |role| role.name),
+            session_user,
             settings: {
                 let mut settings = self
                     .session_vars
@@ -1137,9 +1149,20 @@ impl MemExecutor {
         action: Action,
         resource: ResourceRef,
     ) -> Result<()> {
+        // A session's `SET ROLE` replaces the principal privileges are
+        // checked as; its memberships come from the catalog.
+        let session_role = self.session_role(&ctx.session_id);
+        let principal_id = session_role
+            .as_ref()
+            .map_or(ctx.principal_id, |role| role.id);
+        let active_roles = if session_role.is_some() {
+            Vec::new()
+        } else {
+            ctx.active_roles.clone()
+        };
         let decision = self.authz.authorize(AuthzRequest {
-            principal_id: ctx.principal_id,
-            active_roles: ctx.active_roles.clone(),
+            principal_id,
+            active_roles,
             action: action.clone(),
             resource: resource.clone(),
             context: AuthzContext { database_id: None },
@@ -1443,6 +1466,7 @@ impl Executor for MemExecutor {
         // Its temporary relations go with it.
         self.drop_temp_relations(session_id);
         self.session_vars.write().remove(session_id);
+        self.session_roles.write().remove(session_id);
         self.session_resets.write().remove(session_id);
         self.parameter_changes.lock().remove(session_id);
         self.discard_session_state(session_id);

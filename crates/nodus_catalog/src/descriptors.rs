@@ -87,6 +87,10 @@ pub struct TableDescriptor {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub state: DescriptorState,
+    /// The relation's owner (`OWNER TO`); defaulted so descriptors
+    /// persisted before ownership decode (to the bootstrap superuser).
+    #[serde(default)]
+    pub owner_role_id: Option<RoleId>,
     pub columns: Vec<ColumnDescriptor>,
     pub indexes: Vec<IndexDescriptor>,
     #[serde(default)]

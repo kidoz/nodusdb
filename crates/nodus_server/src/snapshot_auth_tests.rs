@@ -54,6 +54,8 @@ async fn snapshot_catalog_replacement_keeps_bootstrap_login_and_respects_revocat
             name: "nodus".into(),
             principal_type: PrincipalType::User,
             database_id: None,
+
+            attributes: Default::default(),
         })
         .unwrap();
     incoming
@@ -62,6 +64,9 @@ async fn snapshot_catalog_replacement_keeps_bootstrap_login_and_respects_revocat
             principal_id: id,
             resource: ResourceRef::System,
             privilege: "ALL".into(),
+
+            grantable: false,
+            grantor: None,
         })
         .unwrap();
     // Exercise the same atomic catalog projection replacement used by Raft

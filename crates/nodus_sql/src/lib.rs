@@ -3334,6 +3334,11 @@ pub const DETACH_PARTITION_FUNCTION: &str = "pg_catalog.nodus_detach_partition";
 /// constraint's (unused) index name.
 pub const NULLS_NOT_DISTINCT_MARK: &str = "__nulls_not_distinct__";
 
+/// The function `GRANT role [, ...] TO member [, ...]` (and the `REVOKE`)
+/// is written as — `SELECT pg_catalog.nodus_grant_role('roles', 'members',
+/// 'grant')` — since the parser reads only privilege grants.
+pub const GRANT_ROLE_FUNCTION: &str = "pg_catalog.nodus_grant_role";
+
 /// The function `SET CONSTRAINTS {ALL | names} {DEFERRED | IMMEDIATE}` is
 /// written as — `SELECT pg_catalog.nodus_set_constraints(true, 'deferred',
 /// '')` — since the parser reads `SET CONSTRAINTS` as a variable SET.
@@ -3584,6 +3589,112 @@ fn rewrite_statement_form(
                 "SELECT {SET_SCHEMA_FUNCTION}('{kind}', {if_exists}, '{}', '{}')",
                 quote(name.trim()),
                 quote(&schema)
+            );
+            if let Some(mut tokens) = snippet_tokens(&sql) {
+                tokens.extend(tail(&statement));
+                return tokens;
+            }
+            return statement;
+        }
+    }
+
+    // `TEMP` in a privilege list (`GRANT TEMP ON ...`): the parser knows
+    // only the `TEMPORARY` spelling. Only the words before the `ON` are
+    // privileges; anything parenthesized is a column list.
+    if (is(0, "grant") || is(0, "revoke")) && (2..n).any(|at| is(at, "on")) {
+        let end = (2..n).find(|&at| is(at, "on")).unwrap_or(n);
+        let mut temp = None;
+        let mut depth = 0;
+        for at in 1..end {
+            match statement[significant[at]].token {
+                Token::LParen => depth += 1,
+                Token::RParen => depth -= 1,
+                _ if depth == 0 && is(at, "temp") => temp = Some(significant[at]),
+                _ => {}
+            }
+        }
+        if let Some(at) = temp
+            && let Some(tokens) = snippet_tokens("temporary")
+        {
+            // The word the parser wants; a space only where none follows.
+            let space = !matches!(
+                statement.get(at + 1).map(|token| &token.token),
+                Some(Token::Whitespace(_))
+            );
+            let mut out = Vec::with_capacity(statement.len() + 2);
+            out.extend_from_slice(&statement[..at]);
+            out.extend(tokens);
+            if space && let Some(pad) = snippet_tokens(" ") {
+                out.extend(pad);
+            }
+            out.extend_from_slice(&statement[at + 1..]);
+            return out;
+        }
+    }
+
+    // `CONNECTION LIMIT -1`: the parser reads the option's number without a
+    // sign, so the minus folds into the literal.
+    if (is(0, "create") || is(0, "alter")) && (is(1, "role") || is(1, "user")) {
+        let mut fold = None;
+        for at in 0..significant.len().saturating_sub(3) {
+            if !(is(at, "connection") && is(at + 1, "limit")) {
+                continue;
+            }
+            if statement[significant[at + 2]].token != Token::Minus {
+                continue;
+            }
+            if let Token::Number(text, long) = &statement[significant[at + 3]].token {
+                fold = Some((
+                    significant[at + 2],
+                    significant[at + 3],
+                    format!("-{text}"),
+                    *long,
+                ));
+            }
+        }
+        if let Some((minus_at, number_at, text, long)) = fold {
+            let mut out = statement.clone();
+            out[number_at].token = Token::Number(text, long);
+            out.remove(minus_at);
+            return out;
+        }
+    }
+
+    // `GRANT role [, ...] TO member [, ...] [WITH ADMIN OPTION]` and
+    // `REVOKE [ADMIN OPTION FOR] role [, ...] FROM member [, ...]`. A
+    // privilege grant always names objects with `ON`.
+    if (is(0, "grant") || is(0, "revoke")) && !(2..n).any(|k| is(k, "on")) {
+        let separator = if is(0, "grant") { "to" } else { "from" };
+        if let Some(split) = (1..n).find(|&k| is(k, separator)) {
+            let mode = if is(0, "grant") {
+                let admin = (split..n).any(|k| is(k, "with") && is(k + 1, "admin"));
+                if admin { "grant_admin" } else { "grant" }
+            } else {
+                let admin_only = is(1, "admin") && is(2, "option");
+                if admin_only { "revoke_admin" } else { "revoke" }
+            };
+            let names_at = if is(0, "grant") {
+                1
+            } else if is(1, "admin") {
+                4
+            } else {
+                1
+            };
+            let roles = render_tokens(&statement[significant[names_at]..=significant[split - 1]]);
+            let tail_end = if is(0, "grant") {
+                (split + 1..n)
+                    .find(|&k| is(k, "with"))
+                    .map_or(n - 1, |k| k - 1)
+            } else {
+                (split + 1..n)
+                    .find(|&k| is(k, "cascade") || is(k, "restrict") || is(k, "granted"))
+                    .map_or(n - 1, |k| k - 1)
+            };
+            let members = render_tokens(&statement[significant[split + 1]..=significant[tail_end]]);
+            let sql = format!(
+                "SELECT {GRANT_ROLE_FUNCTION}('{}', '{}', '{mode}')",
+                quote(roles.trim()),
+                quote(members.trim())
             );
             if let Some(mut tokens) = snippet_tokens(&sql) {
                 tokens.extend(tail(&statement));
@@ -4373,6 +4484,23 @@ pub fn set_variable_parts(stmt: &sqlparser::ast::Statement) -> Option<(String, S
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn negative_connection_limit_is_folded() {
+        let one = |sql: &str| parse_sql(sql).unwrap().remove(0).to_string();
+        assert_eq!(
+            one("ALTER ROLE r CONNECTION LIMIT -1"),
+            "ALTER ROLE r WITH CONNECTION LIMIT -1"
+        );
+        assert_eq!(
+            one("ALTER ROLE r NOLOGIN CONNECTION LIMIT -1"),
+            "ALTER ROLE r WITH NOLOGIN CONNECTION LIMIT -1"
+        );
+        assert_eq!(
+            one("CREATE ROLE r CONNECTION LIMIT -1"),
+            "CREATE ROLE r CONNECTION LIMIT -1"
+        );
+    }
+
     use super::*;
 
     #[test]

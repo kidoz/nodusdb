@@ -19,6 +19,8 @@ pub(crate) fn session() -> (
             name: "admin".into(),
             principal_type: nodus_catalog::PrincipalType::User,
             database_id: None,
+
+            attributes: Default::default(),
         })
         .unwrap();
     cat.grant_privilege(nodus_catalog::GrantPrivilegeRequest {
@@ -26,6 +28,9 @@ pub(crate) fn session() -> (
         principal_id: admin.id,
         resource: nodus_catalog::ResourceRef::System,
         privilege: "ALL".into(),
+
+        grantable: false,
+        grantor: None,
     })
     .unwrap();
     let ctx = ExecutionContext {

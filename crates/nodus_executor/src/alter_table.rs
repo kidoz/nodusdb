@@ -320,7 +320,16 @@ impl MemExecutor {
                     None => Err(constraint_missing(tbl, &name)),
                 }
             }
-            AlterTableOp::OwnerTo => Ok(()),
+            AlterTableOp::OwnerTo { owner } => {
+                let principal = self.resolve_grantee_name(ctx, &owner)?;
+                self.catalog_writer.update_table_descriptor(
+                    nodus_catalog::TableDescriptorChange::SetOwner {
+                        table_id: tbl.id,
+                        owner_role_id: Some(nodus_catalog::RoleId(principal.id.0)),
+                    },
+                )?;
+                Ok(())
+            }
             AlterTableOp::AttachPartition {
                 parent,
                 partition,

@@ -365,6 +365,15 @@ impl CatalogReader for RelationCatalog {
     fn list_grants(&self) -> Result<Vec<nodus_catalog::GrantDescriptor>> {
         self.0.list_grants()
     }
+    fn get_grants_for_principal(
+        &self,
+        principal: nodus_catalog::PrincipalId,
+    ) -> Result<Vec<nodus_catalog::GrantDescriptor>> {
+        self.0.get_grants_for_principal(principal)
+    }
+    fn list_role_memberships(&self) -> Result<Vec<nodus_catalog::RoleMembershipEdge>> {
+        self.0.list_role_memberships()
+    }
     fn export_snapshot(&self) -> nodus_catalog::CatalogSnapshot {
         self.0.export_snapshot()
     }

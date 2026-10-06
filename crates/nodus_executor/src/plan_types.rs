@@ -1308,8 +1308,10 @@ pub enum AlterTableOp {
     ValidateConstraint {
         name: String,
     },
-    /// `OWNER TO role`: NodusDB tracks no owners, so this changes nothing.
-    OwnerTo,
+    /// `OWNER TO role`.
+    OwnerTo {
+        owner: String,
+    },
     /// `ALTER TABLE child INHERIT | NO INHERIT parent`, written as the
     /// [`nodus_sql::INHERIT_FUNCTION`](crate::planner) call the parser lacks.
     Inherit {
@@ -1372,6 +1374,62 @@ pub enum NewConstraint {
         #[serde(default)]
         initially_deferred: bool,
     },
+}
+
+/// The objects of a `GRANT` / `REVOKE`: named objects of one kind, or every
+/// object of a kind in some schemas.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum GrantObjectsPlan {
+    /// `ON TABLE|SEQUENCE|SCHEMA|DATABASE a [, ...]`.
+    ByName { kind: String, names: Vec<String> },
+    /// `ON ALL TABLES|SEQUENCES|VIEWS IN SCHEMA a [, ...]`.
+    AllInSchema { kind: String, schemas: Vec<String> },
+}
+
+/// What an `ALTER ROLE` changes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum AlterRoleAction {
+    /// The mentioned options replace the role's; the rest stay.
+    Attributes {
+        patch: RoleAttrsPatch,
+    },
+    Rename {
+        name: String,
+    },
+    /// `SET configuration_parameter { TO | = } value`.
+    SetSetting {
+        name: String,
+        value: String,
+    },
+    /// `RESET configuration_parameter` (`name` empty: `RESET ALL`).
+    ResetSetting {
+        name: String,
+    },
+}
+
+/// `ALTER ROLE`'s option patch: only the mentioned options are set.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RoleAttrsPatch {
+    #[serde(default)]
+    pub can_login: Option<bool>,
+    #[serde(default)]
+    pub superuser: Option<bool>,
+    #[serde(default)]
+    pub create_db: Option<bool>,
+    #[serde(default)]
+    pub create_role: Option<bool>,
+    #[serde(default)]
+    pub inherit: Option<bool>,
+    #[serde(default)]
+    pub bypass_rls: Option<bool>,
+    #[serde(default)]
+    pub replication: Option<bool>,
+    #[serde(default)]
+    pub connection_limit: Option<i32>,
+    #[serde(default)]
+    pub valid_until: Option<Option<String>>,
+    #[serde(default)]
+    pub password: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1528,16 +1586,48 @@ pub enum LogicalPlan {
     },
     CreateRole {
         name: String,
+        /// The role's attributes; defaulted so older plans decode.
+        #[serde(default)]
+        attributes: nodus_catalog::RoleAttributes,
+    },
+    /// `GRANT role [, ...] TO member [, ...] [WITH ADMIN OPTION]` and its
+    /// `REVOKE`.
+    GrantRole {
+        roles: Vec<String>,
+        members: Vec<String>,
+        admin_option: bool,
+        /// `REVOKE ADMIN OPTION FOR`: the membership stays, its admin
+        /// option goes.
+        #[serde(default)]
+        admin_only: bool,
+        grant: bool,
+    },
+    /// `DROP ROLE [IF EXISTS] name [, ...]`.
+    DropRole {
+        names: Vec<String>,
+        if_exists: bool,
+    },
+    /// `ALTER ROLE name ...`.
+    AlterRole {
+        name: String,
+        action: AlterRoleAction,
+    },
+    /// `SET ROLE name` / `RESET ROLE` / `SET SESSION AUTHORIZATION name`.
+    SetRole {
+        role: Option<String>,
+        session_authorization: bool,
     },
     Grant {
-        privilege: String,
-        object_name: String,
-        grantee: String,
+        privileges: Vec<String>,
+        objects: GrantObjectsPlan,
+        grantees: Vec<String>,
+        with_grant_option: bool,
     },
     Revoke {
-        privilege: String,
-        object_name: String,
-        revokee: String,
+        grant_option_for: bool,
+        privileges: Vec<String>,
+        objects: GrantObjectsPlan,
+        grantees: Vec<String>,
     },
     Insert {
         table_name: String,

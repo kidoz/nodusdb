@@ -521,11 +521,11 @@ impl MemExecutor {
             .map_err(|_| missing_schema(&name))?;
         self.authorize(ctx, Action::CreateSchema, ResourceRef::Schema(schema.id))?;
         if let Some(owner) = owner {
-            if self.catalog_reader.get_principal_by_name(&owner).is_err() {
-                return Err(DbError::new(format!("role \"{owner}\" does not exist"))
-                    .code("42704")
-                    .into());
-            }
+            let principal = self.resolve_grantee_name(ctx, &owner).map_err(|_| {
+                DbError::new(format!("role \"{owner}\" does not exist")).code("42704")
+            })?;
+            self.catalog_writer
+                .set_schema_owner(schema.id, Some(nodus_catalog::RoleId(principal.id.0)))?;
             return Ok(QueryOutput::tag("ALTER SCHEMA"));
         }
         let Some(new_name) = new_name.map(|n| unquote(&n)) else {

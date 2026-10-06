@@ -176,6 +176,8 @@ fn grants_to_public_reach_every_principal() {
             name: name.into(),
             principal_type: nodus_catalog::PrincipalType::User,
             database_id: None,
+
+            attributes: Default::default(),
         })
         .unwrap()
     };
@@ -185,6 +187,9 @@ fn grants_to_public_reach_every_principal() {
         principal_id: admin.id,
         resource: nodus_catalog::ResourceRef::System,
         privilege: "ALL".into(),
+
+        grantable: false,
+        grantor: None,
     })
     .unwrap();
     let user = principal("alice");

@@ -547,6 +547,8 @@ async fn sql_savepoints_preserve_rows_indexes_and_original_epoch() {
             name: "admin".into(),
             principal_type: PrincipalType::User,
             database_id: None,
+
+            attributes: Default::default(),
         })
         .unwrap();
     fx.catalog
@@ -555,6 +557,9 @@ async fn sql_savepoints_preserve_rows_indexes_and_original_epoch() {
             principal_id: principal,
             resource: ResourceRef::System,
             privilege: "ALL".into(),
+
+            grantable: false,
+            grantor: None,
         })
         .unwrap();
     let executor = Arc::new(MemExecutor::new(

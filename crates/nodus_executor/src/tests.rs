@@ -52,6 +52,8 @@ fn create_role_and_grant_require_grant_management() {
             name: "admin".into(),
             principal_type: PrincipalType::User,
             database_id: None,
+
+            attributes: Default::default(),
         })
         .unwrap();
     cat.grant_privilege(GrantPrivilegeRequest {
@@ -59,6 +61,9 @@ fn create_role_and_grant_require_grant_management() {
         principal_id: admin.id,
         resource: ResourceRef::System,
         privilege: "ALL".into(),
+
+        grantable: false,
+        grantor: None,
     })
     .unwrap();
     let admin_ctx = ctx_for(admin.id);
@@ -89,6 +94,8 @@ fn create_role_and_grant_require_grant_management() {
             name: "bob".into(),
             principal_type: PrincipalType::User,
             database_id: None,
+
+            attributes: Default::default(),
         })
         .unwrap();
     let bob_ctx = ctx_for(bob.id);
@@ -96,7 +103,8 @@ fn create_role_and_grant_require_grant_management() {
         exec.execute_logical(
             &bob_ctx,
             LogicalPlan::CreateRole {
-                name: "evil".into()
+                name: "evil".into(),
+                attributes: Default::default(),
             },
         )
         .is_err(),
@@ -106,9 +114,13 @@ fn create_role_and_grant_require_grant_management() {
         exec.execute_logical(
             &bob_ctx,
             LogicalPlan::Grant {
-                privilege: "SELECT".into(),
-                object_name: "t".into(),
-                grantee: "bob".into(),
+                privileges: vec!["SELECT".into()],
+                objects: crate::plan_types::GrantObjectsPlan::ByName {
+                    kind: "TABLE".to_string(),
+                    names: vec!["t".to_string()],
+                },
+                grantees: vec!["bob".into()],
+                with_grant_option: false,
             },
         )
         .is_err(),
@@ -120,7 +132,8 @@ fn create_role_and_grant_require_grant_management() {
         exec.execute_logical(
             &admin_ctx,
             LogicalPlan::CreateRole {
-                name: "auditor".into()
+                name: "auditor".into(),
+                attributes: Default::default(),
             },
         )
         .is_ok()
@@ -129,9 +142,13 @@ fn create_role_and_grant_require_grant_management() {
         exec.execute_logical(
             &admin_ctx,
             LogicalPlan::Grant {
-                privilege: "SELECT".into(),
-                object_name: "t".into(),
-                grantee: "bob".into(),
+                privileges: vec!["SELECT".into()],
+                objects: crate::plan_types::GrantObjectsPlan::ByName {
+                    kind: "TABLE".to_string(),
+                    names: vec!["t".to_string()],
+                },
+                grantees: vec!["bob".into()],
+                with_grant_option: false,
             },
         )
         .is_ok()
@@ -148,6 +165,8 @@ fn create_table_denied_then_allowed_by_grant() {
             name: "bob".into(),
             principal_type: PrincipalType::User,
             database_id: None,
+
+            attributes: Default::default(),
         })
         .unwrap();
     let ctx = ctx_for(user.id);
@@ -175,6 +194,9 @@ fn create_table_denied_then_allowed_by_grant() {
         principal_id: user.id,
         resource: ResourceRef::Schema(sch.id),
         privilege: "CREATE".into(),
+
+        grantable: false,
+        grantor: None,
     })
     .unwrap();
     assert!(exec.execute_logical(&ctx, plan()).is_ok());
@@ -201,6 +223,8 @@ fn create_insert_select_round_trip() {
             name: "admin".into(),
             principal_type: PrincipalType::User,
             database_id: None,
+
+            attributes: Default::default(),
         })
         .unwrap();
     cat.grant_privilege(GrantPrivilegeRequest {
@@ -208,6 +232,9 @@ fn create_insert_select_round_trip() {
         principal_id: admin.id,
         resource: ResourceRef::System,
         privilege: "ALL".into(),
+
+        grantable: false,
+        grantor: None,
     })
     .unwrap();
     let ctx = ctx_for(admin.id);
@@ -371,6 +398,8 @@ fn rows_keyed_by_declared_pk_not_first_column() {
             name: "admin".into(),
             principal_type: PrincipalType::User,
             database_id: None,
+
+            attributes: Default::default(),
         })
         .unwrap();
     cat.grant_privilege(GrantPrivilegeRequest {
@@ -378,6 +407,9 @@ fn rows_keyed_by_declared_pk_not_first_column() {
         principal_id: admin.id,
         resource: ResourceRef::System,
         privilege: "ALL".into(),
+
+        grantable: false,
+        grantor: None,
     })
     .unwrap();
     let ctx = ctx_for(admin.id);
@@ -519,6 +551,8 @@ fn typed_values_round_trip_and_filter_by_int() {
             name: "admin".into(),
             principal_type: PrincipalType::User,
             database_id: None,
+
+            attributes: Default::default(),
         })
         .unwrap();
     cat.grant_privilege(GrantPrivilegeRequest {
@@ -526,6 +560,9 @@ fn typed_values_round_trip_and_filter_by_int() {
         principal_id: admin.id,
         resource: ResourceRef::System,
         privilege: "ALL".into(),
+
+        grantable: false,
+        grantor: None,
     })
     .unwrap();
     let ctx = ctx_for(admin.id);
@@ -612,6 +649,8 @@ fn update_and_delete_rows() {
             name: "admin".into(),
             principal_type: PrincipalType::User,
             database_id: None,
+
+            attributes: Default::default(),
         })
         .unwrap();
     cat.grant_privilege(GrantPrivilegeRequest {
@@ -619,6 +658,9 @@ fn update_and_delete_rows() {
         principal_id: admin.id,
         resource: ResourceRef::System,
         privilege: "ALL".into(),
+
+        grantable: false,
+        grantor: None,
     })
     .unwrap();
     let ctx = ctx_for(admin.id);
@@ -740,6 +782,8 @@ fn test_join_execution() {
             name: "admin".into(),
             principal_type: PrincipalType::User,
             database_id: None,
+
+            attributes: Default::default(),
         })
         .unwrap();
     cat.grant_privilege(GrantPrivilegeRequest {
@@ -747,6 +791,9 @@ fn test_join_execution() {
         principal_id: admin.id,
         resource: ResourceRef::System,
         privilege: "ALL".into(),
+
+        grantable: false,
+        grantor: None,
     })
     .unwrap();
     let ctx = ctx_for(admin.id);
@@ -901,6 +948,8 @@ fn transactions_are_isolated_per_session() {
             name: "admin".into(),
             principal_type: PrincipalType::User,
             database_id: None,
+
+            attributes: Default::default(),
         })
         .unwrap();
     cat.grant_privilege(GrantPrivilegeRequest {
@@ -908,6 +957,9 @@ fn transactions_are_isolated_per_session() {
         principal_id: admin.id,
         resource: ResourceRef::System,
         privilege: "ALL".into(),
+
+        grantable: false,
+        grantor: None,
     })
     .unwrap();
 
@@ -1056,6 +1108,8 @@ fn test_complex_filters() {
             name: "admin".into(),
             principal_type: PrincipalType::User,
             database_id: None,
+
+            attributes: Default::default(),
         })
         .unwrap();
     cat.grant_privilege(GrantPrivilegeRequest {
@@ -1063,6 +1117,9 @@ fn test_complex_filters() {
         principal_id: admin.id,
         resource: ResourceRef::System,
         privilege: "ALL".into(),
+
+        grantable: false,
+        grantor: None,
     })
     .unwrap();
     let ctx = ctx_for(admin.id);
@@ -1144,6 +1201,8 @@ fn test_left_outer_join() {
             name: "admin".into(),
             principal_type: PrincipalType::User,
             database_id: None,
+
+            attributes: Default::default(),
         })
         .unwrap();
     cat.grant_privilege(GrantPrivilegeRequest {
@@ -1151,6 +1210,9 @@ fn test_left_outer_join() {
         principal_id: admin.id,
         resource: ResourceRef::System,
         privilege: "ALL".into(),
+
+        grantable: false,
+        grantor: None,
     })
     .unwrap();
     let ctx = ctx_for(admin.id);

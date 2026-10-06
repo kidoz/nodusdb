@@ -3504,8 +3504,14 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
             "PostgreSQL {} (NodusDB)",
             session_env::setting("server_version").unwrap_or_default()
         )),
-        "CURRENT_USER" | "SESSION_USER" | "CURRENT_ROLE" | "USER" if arity(0) => {
+        "CURRENT_USER" | "CURRENT_ROLE" | "USER" if arity(0) => {
             match session_env::with(|e| e.map(|e| e.user.clone())) {
+                Some(user) => Value::Text(user),
+                None => session_unavailable(name),
+            }
+        }
+        "SESSION_USER" if arity(0) => {
+            match session_env::with(|e| e.map(|e| e.session_user.clone())) {
                 Some(user) => Value::Text(user),
                 None => session_unavailable(name),
             }

@@ -165,7 +165,9 @@ where
 /// Sends a fatal `28P01` (invalid authorization) and closes the connection. Used
 /// for every SCRAM failure mode so the client cannot distinguish an unknown user
 /// from a bad password or a malformed message.
-async fn reject_authentication<C>(client: &mut C) -> PgWireResult<()>
+/// Rejects the connection as PostgreSQL does: `for user "..."` on a bad
+/// password, and a role that may not log in named as such.
+async fn reject_for<C>(client: &mut C, username: &str) -> PgWireResult<()>
 where
     C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send,
     C::Error: Debug,
@@ -174,8 +176,47 @@ where
     let error_info = ErrorInfo::new(
         "FATAL".to_owned(),
         "28P01".to_owned(),
-        "password authentication failed".to_owned(),
+        format!("password authentication failed for user \"{username}\""),
     );
+    reject_with(client, error_info).await
+}
+
+/// `role "..." does not exist`.
+async fn reject_unknown_role<C>(client: &mut C, username: &str) -> PgWireResult<()>
+where
+    C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send,
+    C::Error: Debug,
+    PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+{
+    let error_info = ErrorInfo::new(
+        "FATAL".to_owned(),
+        "42704".to_owned(),
+        format!("role \"{username}\" does not exist"),
+    );
+    reject_with(client, error_info).await
+}
+
+/// `role "..." is not permitted to log in`.
+async fn reject_not_permitted<C>(client: &mut C, username: &str) -> PgWireResult<()>
+where
+    C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send,
+    C::Error: Debug,
+    PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+{
+    let error_info = ErrorInfo::new(
+        "FATAL".to_owned(),
+        "28000".to_owned(),
+        format!("role \"{username}\" is not permitted to log in"),
+    );
+    reject_with(client, error_info).await
+}
+
+async fn reject_with<C>(client: &mut C, error_info: ErrorInfo) -> PgWireResult<()>
+where
+    C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send,
+    C::Error: Debug,
+    PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+{
     client
         .feed(PgWireBackendMessage::ErrorResponse(ErrorResponse::from(
             error_info,
@@ -221,12 +262,12 @@ impl StartupHandler for NodusStartupHandler {
                     // user's verifier, and answer with server-first.
                     let sasl = msg.into_sasl_initial_response()?;
                     if sasl.auth_method != SCRAM_SHA_256 {
-                        return reject_authentication(client).await;
+                        return reject_for(client, "").await;
                     }
                     let data = sasl.data.unwrap_or_default();
                     let cf = match nodus_security::ClientFirst::parse(&data) {
                         Ok(cf) => cf,
-                        Err(_) => return reject_authentication(client).await,
+                        Err(_) => return reject_for(client, "").await,
                     };
                     // PostgreSQL carries the username in the startup `user`
                     // parameter, not in the SCRAM `n=` field (which clients leave
@@ -236,7 +277,13 @@ impl StartupHandler for NodusStartupHandler {
                         .map(|u| u.to_string())
                         .unwrap_or_default();
                     let Some(keys) = self.authenticator.scram_keys(&username) else {
-                        return reject_authentication(client).await;
+                        if self.authenticator.unknown_role(&username) {
+                            return reject_unknown_role(client, &username).await;
+                        }
+                        if self.authenticator.may_not_log_in(&username) {
+                            return reject_not_permitted(client, &username).await;
+                        }
+                        return reject_for(client, &username).await;
                     };
                     let server_nonce = uuid::Uuid::new_v4().simple().to_string();
                     let (server_first, verifier) = ScramVerifier::start(&cf, &keys, &server_nonce);
@@ -252,11 +299,12 @@ impl StartupHandler for NodusStartupHandler {
                     let sasl = msg.into_sasl_response()?;
                     let exchange = self.scram.lock().unwrap().take();
                     let Some(exchange) = exchange else {
-                        return reject_authentication(client).await;
+                        return reject_for(client, "").await;
                     };
+                    // The proof did not check out: PostgreSQL names the user.
                     let server_final = match exchange.verifier.finish(&sasl.data) {
                         Ok(msg) => msg,
-                        Err(_) => return reject_authentication(client).await,
+                        Err(_) => return reject_for(client, &exchange.username).await,
                     };
                     client
                         .send(PgWireBackendMessage::Authentication(
@@ -273,7 +321,10 @@ impl StartupHandler for NodusStartupHandler {
                             );
                             finish_nodus_authentication(client, &self.param_provider).await?;
                         }
-                        Err(_) => return reject_authentication(client).await,
+                        Err(_) => match self.authenticator.may_not_log_in(&exchange.username) {
+                            true => return reject_not_permitted(client, &exchange.username).await,
+                            false => return reject_for(client, &exchange.username).await,
+                        },
                     }
                 }
             }

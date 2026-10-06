@@ -723,11 +723,37 @@ pub async fn run_server_with_config(
         }
     });
 
+    let admin_password = config.admin.password.clone().unwrap_or_else(|| {
+        let generated = uuid::Uuid::new_v4().to_string();
+        tracing::warn!(
+            "No admin.password configured; generated random password for 'nodus' superuser: {}",
+            generated
+        );
+        generated
+    });
+    // The bootstrap superuser's verifier, as PostgreSQL stores it in
+    // `pg_authid.rolpassword` (its `pg_roles` row shows it as `********`).
+    let admin_verifier = nodus_security::ScramKeys::derive(
+        &admin_password,
+        uuid::Uuid::new_v4().as_bytes().to_vec(),
+        nodus_security::PBKDF2_ITERATIONS,
+    )
+    .to_verifier_string();
     let admin = match catalog.create_role(CreateRoleRequest {
         id: nodus_catalog::PrincipalId::new(),
         name: "nodus".into(),
         principal_type: PrincipalType::User,
         database_id: None,
+        attributes: nodus_catalog::RoleAttributes {
+            superuser: true,
+            can_login: true,
+            create_db: true,
+            create_role: true,
+            replication: true,
+            bypass_rls: true,
+            password: Some(admin_verifier),
+            ..Default::default()
+        },
     }) {
         Ok(desc) => desc,
         Err(e) if e.to_string().contains("already exists") => {
@@ -737,25 +763,58 @@ pub async fn run_server_with_config(
     };
     tracing::debug!("Admin seeded");
 
+    // PostgreSQL's default ACL on a database: `PUBLIC` may connect and
+    // create temporary tables. Materialized here so `has_database_privilege`
+    // and `REVOKE ... FROM PUBLIC` behave as they do there.
+    if let Ok(database) = catalog.get_database("default") {
+        let public_id = match catalog.get_principal_by_name(nodus_catalog::PUBLIC_ROLE) {
+            Ok(public) => Some(public.id),
+            Err(_) => catalog
+                .create_role(CreateRoleRequest {
+                    id: nodus_catalog::PrincipalId::new(),
+                    name: nodus_catalog::PUBLIC_ROLE.to_string(),
+                    principal_type: nodus_catalog::PrincipalType::Public,
+                    database_id: None,
+                    attributes: Default::default(),
+                })
+                .ok()
+                .map(|public| public.id),
+        };
+        if let Some(public_id) = public_id {
+            let grants = catalog
+                .get_grants_for_resource(nodus_catalog::ResourceRef::Database(database.id))
+                .unwrap_or_default();
+            for privilege in ["CONNECT", "TEMP"] {
+                if !grants.iter().any(|grant| {
+                    grant.principal_id == public_id
+                        && grant.privilege.eq_ignore_ascii_case(privilege)
+                }) {
+                    let _ = catalog.grant_privilege(GrantPrivilegeRequest {
+                        id: nodus_catalog::GrantId::new(),
+                        principal_id: public_id,
+                        resource: nodus_catalog::ResourceRef::Database(database.id),
+                        privilege: privilege.to_string(),
+                        grantable: false,
+                        grantor: None,
+                    });
+                }
+            }
+        }
+    }
+
     // Bootstrap superuser: ALL on System bypasses per-resource grant checks.
     let _ = catalog.grant_privilege(GrantPrivilegeRequest {
         id: nodus_catalog::GrantId::new(),
         principal_id: admin.id,
         resource: ResourceRef::System,
         privilege: "ALL".into(),
+        grantable: false,
+        grantor: None,
     });
     // A read-only authz engine over the same catalog for the admin explain API.
     let authz = Arc::new(nodus_authz::DefaultAuthzEngine::new(catalog.clone()));
     let authenticator = Arc::new(PasswordAuthenticator::new(catalog.clone()));
 
-    let admin_password = config.admin.password.clone().unwrap_or_else(|| {
-        let generated = uuid::Uuid::new_v4().to_string();
-        tracing::warn!(
-            "No admin.password configured; generated random password for 'nodus' superuser: {}",
-            generated
-        );
-        generated
-    });
     authenticator.set_bootstrap_password(&admin_password);
 
     // The pgwire and HTTP listeners share one TLS config and its reloadable

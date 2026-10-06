@@ -7,7 +7,7 @@ use bytes::Bytes;
 use nodus_storage_api::IntentReplacement;
 
 /// A warning a transaction statement raises in the wrong place.
-fn warning(message: &str, code: &str) -> crate::error_fields::DbError {
+pub(crate) fn warning(message: impl Into<String>, code: &str) -> crate::error_fields::DbError {
     crate::error_fields::DbError::new(message)
         .code(code)
         .severity("WARNING")

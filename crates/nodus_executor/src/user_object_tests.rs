@@ -269,6 +269,8 @@ fn type_ddl_is_authorized() {
             name: name.into(),
             principal_type: nodus_catalog::PrincipalType::User,
             database_id: None,
+
+            attributes: Default::default(),
         })
         .unwrap()
     };
@@ -278,6 +280,9 @@ fn type_ddl_is_authorized() {
         principal_id: admin.id,
         resource: nodus_catalog::ResourceRef::System,
         privilege: "ALL".into(),
+
+        grantable: false,
+        grantor: None,
     })
     .unwrap();
     let guest = role("guest");

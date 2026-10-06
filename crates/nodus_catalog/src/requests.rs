@@ -64,6 +64,11 @@ pub struct GrantPrivilegesRequest {
     pub principal_id: PrincipalId,
     pub resource: ResourceRef,
     pub privilege: String,
+    /// `WITH GRANT OPTION`; defaulted so older requests decode.
+    #[serde(default)]
+    pub grantable: bool,
+    #[serde(default)]
+    pub grantor: Option<PrincipalId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -154,6 +159,11 @@ pub enum TableDescriptorChange {
         table_id: TableId,
         bound: Option<String>,
     },
+    /// Sets the relation's owner (`OWNER TO`).
+    SetOwner {
+        table_id: TableId,
+        owner_role_id: Option<RoleId>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -162,6 +172,9 @@ pub struct CreateRoleRequest {
     pub name: String,
     pub principal_type: PrincipalType,
     pub database_id: Option<DatabaseId>,
+    /// The role's attributes; defaulted so older requests decode.
+    #[serde(default)]
+    pub attributes: crate::RoleAttributes,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -170,6 +183,11 @@ pub struct GrantPrivilegeRequest {
     pub principal_id: PrincipalId,
     pub resource: ResourceRef,
     pub privilege: String,
+    /// `WITH GRANT OPTION`; defaulted so older requests decode.
+    #[serde(default)]
+    pub grantable: bool,
+    #[serde(default)]
+    pub grantor: Option<PrincipalId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -185,7 +203,35 @@ pub struct AddRoleMemberRequest {
     pub role_principal_id: PrincipalId,
     /// The principal (user, service account, or nested role) being granted membership.
     pub member_id: PrincipalId,
+    /// `WITH ADMIN OPTION`; defaulted so older requests decode.
+    #[serde(default)]
+    pub admin_option: bool,
+    /// The role that granted the membership (`pg_auth_members.grantor`);
+    /// defaulted so older requests decode.
+    #[serde(default)]
+    pub grantor: Option<PrincipalId>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoveRoleMemberRequest {
+    /// The role the member is being removed from.
+    pub role_principal_id: PrincipalId,
+    /// The principal being removed.
+    pub member_id: PrincipalId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdatePrincipalRequest {
+    pub principal_id: PrincipalId,
+    /// The attributes that replace the principal's.
+    pub attributes: PrincipalDescriptorAttributes,
+    /// A new name for `ALTER ROLE ... RENAME TO`.
+    #[serde(default)]
+    pub new_name: Option<String>,
+}
+
+/// The attributes of an [`UpdatePrincipalRequest`].
+pub type PrincipalDescriptorAttributes = crate::RoleAttributes;
 
 /// A serializable point-in-time snapshot of catalog state, used for backups.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

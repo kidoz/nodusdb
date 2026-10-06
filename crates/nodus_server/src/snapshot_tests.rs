@@ -65,12 +65,17 @@ async fn meta_snapshot_preserves_local_shards_and_recovers_catalog_authorization
             name: name.into(),
             principal_type,
             database_id: None,
+
+            attributes: Default::default(),
         })
         .unwrap();
     }
     cat.add_role_member(AddRoleMemberRequest {
         role_principal_id: role,
         member_id: user,
+
+        admin_option: false,
+        grantor: None,
     })
     .unwrap();
     put(src.as_ref(), b"meta:shard_placements", b"routing", 10);

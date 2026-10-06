@@ -58,6 +58,13 @@ impl CatalogWriter for RaftCatalogWriter {
         self.replicate("drop_schema", ShardCommand::DropSchema(id))
     }
 
+    fn set_schema_owner(&self, id: SchemaId, owner_role_id: Option<RoleId>) -> Result<()> {
+        self.replicate(
+            "set_schema_owner",
+            ShardCommand::SetSchemaOwner { id, owner_role_id },
+        )
+    }
+
     fn grant_privileges(&self, request: GrantPrivilegesRequest) -> Result<GrantDescriptor> {
         let id = request.id;
         self.replicate("grant_privileges", ShardCommand::GrantPrivileges(request))?;
@@ -84,7 +91,8 @@ impl CatalogWriter for RaftCatalogWriter {
             | TableDescriptorChange::SetSchema { table_id, .. }
             | TableDescriptorChange::SetViewQuery { table_id, .. }
             | TableDescriptorChange::SetParents { table_id, .. }
-            | TableDescriptorChange::SetPartitionBound { table_id, .. } => *table_id,
+            | TableDescriptorChange::SetPartitionBound { table_id, .. }
+            | TableDescriptorChange::SetOwner { table_id, .. } => *table_id,
         };
         self.replicate(
             "update_table_descriptor",
@@ -111,6 +119,23 @@ impl CatalogWriter for RaftCatalogWriter {
 
     fn add_role_member(&self, request: AddRoleMemberRequest) -> Result<()> {
         self.replicate("add_role_member", ShardCommand::AddRoleMember(request))
+    }
+
+    fn remove_role_member(&self, request: RemoveRoleMemberRequest) -> Result<()> {
+        self.replicate(
+            "remove_role_member",
+            ShardCommand::RemoveRoleMember(request),
+        )
+    }
+
+    fn update_principal(&self, request: UpdatePrincipalRequest) -> Result<PrincipalDescriptor> {
+        let id = request.principal_id;
+        self.replicate("update_principal", ShardCommand::UpdatePrincipal(request))?;
+        self.reader.get_principal_by_id(id)
+    }
+
+    fn drop_principal(&self, id: PrincipalId) -> Result<()> {
+        self.replicate("drop_principal", ShardCommand::DropPrincipal(id))
     }
 
     fn update_index_state(

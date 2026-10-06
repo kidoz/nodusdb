@@ -22,6 +22,15 @@ pub trait CatalogReader: Send + Sync {
     fn get_principal_by_id(&self, id: PrincipalId) -> Result<PrincipalDescriptor>;
     fn get_cluster_version(&self) -> Result<ClusterVersion>;
     fn get_grants_for_resource(&self, resource: ResourceRef) -> Result<Vec<GrantDescriptor>>;
+    /// Every grant a principal holds directly.
+    fn get_grants_for_principal(&self, principal: PrincipalId) -> Result<Vec<GrantDescriptor>> {
+        let _ = principal;
+        Ok(Vec::new())
+    }
+    /// The role-membership edges: `(role, member, admin option, grantor)`.
+    fn list_role_memberships(&self) -> Result<Vec<RoleMembershipEdge>> {
+        Ok(Vec::new())
+    }
     fn get_grant_by_id(&self, id: GrantId) -> Result<GrantDescriptor>;
     fn get_effective_roles(&self, principal: PrincipalId) -> Result<Vec<RoleId>>;
     /// Returns the principal itself plus the transitive closure of role
@@ -67,6 +76,8 @@ pub trait CatalogWriter: Send + Sync {
     fn create_table(&self, request: CreateTableRequest) -> Result<TableDescriptor>;
     fn drop_table(&self, id: TableId) -> Result<()>;
     fn drop_schema(&self, id: SchemaId) -> Result<()>;
+    /// `ALTER SCHEMA ... OWNER TO`.
+    fn set_schema_owner(&self, id: SchemaId, owner_role_id: Option<RoleId>) -> Result<()>;
     fn grant_privileges(&self, request: GrantPrivilegesRequest) -> Result<GrantDescriptor>;
     fn revoke_privileges(&self, request: RevokePrivilegesRequest) -> Result<()>;
     fn update_table_descriptor(&self, change: TableDescriptorChange) -> Result<TableDescriptor>;
@@ -74,6 +85,12 @@ pub trait CatalogWriter: Send + Sync {
     fn grant_privilege(&self, request: GrantPrivilegeRequest) -> Result<GrantDescriptor>;
     fn revoke_privilege(&self, request: RevokePrivilegeRequest) -> Result<()>;
     fn add_role_member(&self, request: AddRoleMemberRequest) -> Result<()>;
+    /// `REVOKE role FROM member`.
+    fn remove_role_member(&self, request: RemoveRoleMemberRequest) -> Result<()>;
+    /// `ALTER ROLE`: replaces a principal's attributes (and name).
+    fn update_principal(&self, request: UpdatePrincipalRequest) -> Result<PrincipalDescriptor>;
+    /// `DROP ROLE`: removes a principal (its grants are gone by then).
+    fn drop_principal(&self, id: PrincipalId) -> Result<()>;
     fn update_index_state(
         &self,
         table_id: TableId,

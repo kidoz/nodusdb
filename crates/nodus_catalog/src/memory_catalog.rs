@@ -4,9 +4,10 @@ use crate::{
     ClusterVersion, CreateDatabaseRequest, CreateRoleRequest, CreateSchemaRequest,
     CreateTableRequest, DatabaseDescriptor, DatabaseId, DescriptorState, GrantDescriptor, GrantId,
     GrantPrivilegeRequest, GrantPrivilegesRequest, IndexId, IndexState, ObjectDescriptor,
-    PrincipalDescriptor, PrincipalId, ResolveObjectRequest, ResourceRef, RevokePrivilegeRequest,
-    RevokePrivilegesRequest, RoleId, RoleMembershipDescriptor, SchemaDescriptor, SchemaId,
-    TableDescriptor, TableDescriptorChange, TableId,
+    PrincipalDescriptor, PrincipalId, RemoveRoleMemberRequest, ResolveObjectRequest, ResourceRef,
+    RevokePrivilegeRequest, RevokePrivilegesRequest, RoleId, RoleMembershipDescriptor,
+    SchemaDescriptor, SchemaId, TableDescriptor, TableDescriptorChange, TableId,
+    UpdatePrincipalRequest,
 };
 use anyhow::Result;
 use chrono::Utc;
@@ -24,8 +25,9 @@ pub struct MemoryCatalog {
     principals: RwLock<HashMap<String, PrincipalDescriptor>>,
     grants: RwLock<Vec<GrantDescriptor>>,
     roles: RwLock<Vec<RoleMembershipDescriptor>>,
-    /// (role_principal_id, member_id) edges of the role-membership graph.
-    memberships: RwLock<Vec<(PrincipalId, PrincipalId)>>,
+    /// `(role_principal_id, member_id, admin option)` edges of the
+    /// role-membership graph.
+    memberships: RwLock<Vec<crate::RoleMembershipEdge>>,
     catalog_version: RwLock<u64>,
     /// Durable backing store; `None` for a purely in-memory catalog.
     store: Option<std::sync::Arc<dyn CatalogStore>>,
@@ -48,7 +50,7 @@ struct MemoryCatalogState {
     principals: HashMap<String, PrincipalDescriptor>,
     grants: Vec<GrantDescriptor>,
     roles: Vec<RoleMembershipDescriptor>,
-    memberships: Vec<(PrincipalId, PrincipalId)>,
+    memberships: Vec<crate::RoleMembershipEdge>,
     catalog_version: u64,
 }
 
@@ -336,6 +338,22 @@ impl CatalogReader for MemoryCatalog {
         })
     }
 
+    fn get_grants_for_principal(&self, principal: PrincipalId) -> Result<Vec<GrantDescriptor>> {
+        let _snapshot = self.raft_snapshot_gate.lock();
+        Ok(self
+            .grants
+            .read()
+            .iter()
+            .filter(|g| g.principal_id == principal)
+            .cloned()
+            .collect())
+    }
+
+    fn list_role_memberships(&self) -> Result<Vec<crate::RoleMembershipEdge>> {
+        let _snapshot = self.raft_snapshot_gate.lock();
+        Ok(self.memberships.read().clone())
+    }
+
     fn get_grants_for_resource(&self, resource: ResourceRef) -> Result<Vec<GrantDescriptor>> {
         let _snapshot = self.raft_snapshot_gate.lock();
         let guard = self.grants.read();
@@ -389,7 +407,7 @@ impl CatalogReader for MemoryCatalog {
         let mut result = vec![principal];
         let mut frontier = vec![principal];
         while let Some(current) = frontier.pop() {
-            for (role_principal_id, member_id) in edges.iter() {
+            for (role_principal_id, member_id, ..) in edges.iter() {
                 if *member_id == current && !result.contains(role_principal_id) {
                     result.push(*role_principal_id);
                     frontier.push(*role_principal_id);
@@ -521,6 +539,7 @@ impl CatalogWriter for MemoryCatalog {
             created_at: Utc::now(),
             updated_at: Utc::now(),
             state: DescriptorState::Public,
+            owner_role_id: None,
             columns: request.columns,
             indexes: vec![],
             constraints: request.constraints,
@@ -554,6 +573,27 @@ impl CatalogWriter for MemoryCatalog {
         }
     }
 
+    fn set_schema_owner(&self, id: SchemaId, owner_role_id: Option<RoleId>) -> Result<()> {
+        let _snapshot = self.raft_snapshot_gate.lock();
+        let mut guard = self.schemas.write();
+        let key = guard
+            .iter()
+            .find(|(_, s)| s.id == id)
+            .map(|(k, _)| k.clone());
+        if let Some(key) = key {
+            if let Some(schema) = guard.get_mut(&key) {
+                schema.owner_role_id = owner_role_id;
+                schema.version = self.increment_version();
+                schema.updated_at = Utc::now();
+            }
+            drop(guard);
+            self.persist();
+            Ok(())
+        } else {
+            anyhow::bail!("Schema ID {} not found", id)
+        }
+    }
+
     fn drop_schema(&self, id: SchemaId) -> Result<()> {
         let _snapshot = self.raft_snapshot_gate.lock();
         let mut guard = self.schemas.write();
@@ -584,6 +624,8 @@ impl CatalogWriter for MemoryCatalog {
             principal_id: request.principal_id,
             resource: request.resource,
             privilege: request.privilege,
+            grantable: request.grantable,
+            grantor: request.grantor,
         };
         guard.push(desc.clone());
         drop(guard);
@@ -630,7 +672,8 @@ impl CatalogWriter for MemoryCatalog {
             | TableDescriptorChange::SetSchema { table_id, .. }
             | TableDescriptorChange::SetViewQuery { table_id, .. }
             | TableDescriptorChange::SetParents { table_id, .. }
-            | TableDescriptorChange::SetPartitionBound { table_id, .. } => *table_id,
+            | TableDescriptorChange::SetPartitionBound { table_id, .. }
+            | TableDescriptorChange::SetOwner { table_id, .. } => *table_id,
         };
 
         let mut target_key = None;
@@ -738,6 +781,9 @@ impl CatalogWriter for MemoryCatalog {
             TableDescriptorChange::SetPartitionBound { bound, .. } => {
                 table.partition_bound = bound;
             }
+            TableDescriptorChange::SetOwner { owner_role_id, .. } => {
+                table.owner_role_id = owner_role_id;
+            }
         }
 
         let out = table.clone();
@@ -763,6 +809,7 @@ impl CatalogWriter for MemoryCatalog {
             state: DescriptorState::Public,
             principal_type: request.principal_type,
             database_id: request.database_id,
+            attributes: request.attributes,
         };
         guard.insert(request.name.clone(), desc.clone());
         drop(guard);
@@ -783,6 +830,8 @@ impl CatalogWriter for MemoryCatalog {
             principal_id: request.principal_id,
             resource: request.resource,
             privilege: request.privilege,
+            grantable: request.grantable,
+            grantor: request.grantor,
         };
         guard.push(desc.clone());
         drop(guard);
@@ -808,13 +857,71 @@ impl CatalogWriter for MemoryCatalog {
         let _snapshot = self.raft_snapshot_gate.lock();
         let edge = (request.role_principal_id, request.member_id);
         let mut guard = self.memberships.write();
-        if !guard.contains(&edge) {
-            guard.push(edge);
+        if let Some(existing) = guard.iter_mut().find(|e| e.0 == edge.0 && e.1 == edge.1) {
+            existing.2 = request.admin_option;
+            if request.grantor.is_some() {
+                existing.3 = request.grantor;
+            }
+        } else {
+            guard.push((edge.0, edge.1, request.admin_option, request.grantor));
         }
         self.increment_version();
         drop(guard);
         self.persist();
         Ok(())
+    }
+
+    fn remove_role_member(&self, request: RemoveRoleMemberRequest) -> Result<()> {
+        let _snapshot = self.raft_snapshot_gate.lock();
+        let mut guard = self.memberships.write();
+        guard.retain(|e| !(e.0 == request.role_principal_id && e.1 == request.member_id));
+        drop(guard);
+        // The membership records `GRANT role` wrote, when any exist.
+        self.roles.write().retain(|r| {
+            !(r.role_id.0 == request.role_principal_id.0 && r.member_id == request.member_id)
+        });
+        self.increment_version();
+        self.persist();
+        Ok(())
+    }
+
+    fn drop_principal(&self, id: PrincipalId) -> Result<()> {
+        let _snapshot = self.raft_snapshot_gate.lock();
+        self.principals.write().retain(|_, p| p.id != id);
+        self.memberships.write().retain(|e| e.0 != id && e.1 != id);
+        self.increment_version();
+        self.persist();
+        Ok(())
+    }
+
+    fn update_principal(&self, request: UpdatePrincipalRequest) -> Result<PrincipalDescriptor> {
+        let _snapshot = self.raft_snapshot_gate.lock();
+        let mut guard = self.principals.write();
+        let Some(existing) = guard
+            .values()
+            .find(|p| p.id == request.principal_id)
+            .cloned()
+        else {
+            anyhow::bail!("Principal not found")
+        };
+        if let Some(new_name) = &request.new_name
+            && new_name != &existing.name
+            && guard.contains_key(new_name)
+        {
+            anyhow::bail!("Principal {new_name} already exists");
+        }
+        let mut desc = existing.clone();
+        desc.attributes = request.attributes;
+        desc.version = self.increment_version();
+        desc.updated_at = Utc::now();
+        if let Some(new_name) = request.new_name {
+            guard.remove(&existing.name);
+            desc.name = new_name;
+        }
+        guard.insert(desc.name.clone(), desc.clone());
+        drop(guard);
+        self.persist();
+        Ok(desc)
     }
 
     fn update_index_state(

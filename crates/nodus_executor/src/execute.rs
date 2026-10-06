@@ -353,17 +353,57 @@ impl MemExecutor {
             LogicalPlan::RenameIndex { name, new_name } => {
                 self.exec_rename_index(ctx, &name, &new_name)
             }
-            LogicalPlan::CreateRole { name } => self.exec_create_role(ctx, name),
+            LogicalPlan::CreateRole { name, attributes } => {
+                self.exec_create_role(ctx, name, attributes.clone())
+            }
             LogicalPlan::Grant {
-                privilege,
-                object_name,
-                grantee,
-            } => self.exec_grant(ctx, privilege, object_name, grantee),
+                privileges,
+                objects,
+                grantees,
+                with_grant_option,
+            } => self.exec_grant(
+                ctx,
+                privileges.clone(),
+                objects.clone(),
+                grantees.clone(),
+                with_grant_option,
+            ),
             LogicalPlan::Revoke {
-                privilege,
-                object_name,
-                revokee,
-            } => self.exec_revoke(ctx, privilege, object_name, revokee),
+                grant_option_for,
+                privileges,
+                objects,
+                grantees,
+            } => self.exec_revoke(
+                ctx,
+                privileges.clone(),
+                objects.clone(),
+                grantees.clone(),
+                grant_option_for,
+            ),
+            LogicalPlan::GrantRole {
+                roles,
+                members,
+                admin_option,
+                admin_only,
+                grant,
+            } => self.exec_grant_role(
+                ctx,
+                roles.clone(),
+                members.clone(),
+                admin_option,
+                admin_only,
+                grant,
+            ),
+            LogicalPlan::DropRole { names, if_exists } => {
+                self.exec_drop_role(ctx, names.clone(), if_exists)
+            }
+            LogicalPlan::AlterRole { name, action } => {
+                self.exec_alter_role(ctx, name.clone(), action.clone())
+            }
+            LogicalPlan::SetRole {
+                role,
+                session_authorization,
+            } => self.exec_set_role(ctx, role.clone(), session_authorization),
             LogicalPlan::Begin {
                 read_only,
                 isolation,

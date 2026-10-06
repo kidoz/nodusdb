@@ -229,7 +229,7 @@ enum CredentialIdentity {
 /// The count each credential was derived with is stored alongside it
 /// (`ScramKeys::iterations`) and used for verification, so this can be lowered
 /// without invalidating existing credentials.
-const PBKDF2_ITERATIONS: u32 = 100_000;
+pub const PBKDF2_ITERATIONS: u32 = 100_000;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -318,25 +318,54 @@ impl PasswordAuthenticator {
     /// by the SASL/SCRAM startup handler to run a challenge/response without ever
     /// seeing the plaintext password.
     pub fn scram_keys(&self, username: &str) -> Option<ScramKeys> {
-        self.credentials
-            .read()
-            .unwrap()
-            .get(username)
-            .map(|c| c.keys.clone())
+        if let Some(credential) = self.credentials.read().unwrap().get(username) {
+            return Some(credential.keys.clone());
+        }
+        // A role's verifier is the catalog's (`CREATE ROLE ... LOGIN
+        // PASSWORD '...'`), as PostgreSQL keeps it in `pg_authid`.
+        let principal = self.catalog.get_principal_by_name(username).ok()?;
+        if !principal.attributes.can_login {
+            return None;
+        }
+        ScramKeys::from_verifier_string(principal.attributes.password.as_deref()?)
+    }
+
+    /// Whether the catalog knows no principal named `username` — PostgreSQL
+    /// reports that differently from a failed password.
+    pub fn unknown_role(&self, username: &str) -> bool {
+        self.catalog.get_principal_by_name(username).is_err()
+    }
+
+    /// Whether the catalog knows `username` as a principal that may not log
+    /// in — PostgreSQL reports that differently from a failed password.
+    pub fn may_not_log_in(&self, username: &str) -> bool {
+        self.catalog
+            .get_principal_by_name(username)
+            .is_ok_and(|principal| !principal.attributes.can_login)
     }
 
     /// Issues a session for an already-authenticated user (e.g. after a SCRAM
     /// exchange has verified the client's proof). Rechecks identity and current
     /// bootstrap eligibility after the exchange, including snapshot replacement.
     pub fn issue_session(&self, username: &str) -> Result<Session, AuthError> {
-        let identity = self
+        if let Some(identity) = self
             .credentials
             .read()
             .unwrap()
             .get(username)
             .map(|c| c.identity)
-            .ok_or_else(|| AuthError::UnknownUser(username.to_string()))?;
-        self.build_session(username, identity)
+        {
+            return self.build_session(username, identity);
+        }
+        // A role the catalog holds a password for, and that may log in.
+        let principal = self
+            .catalog
+            .get_principal_by_name(username)
+            .map_err(|_| AuthError::UnknownUser(username.to_string()))?;
+        if !principal.attributes.can_login || principal.attributes.password.is_none() {
+            return Err(AuthError::InvalidCredentials(username.to_string()));
+        }
+        self.build_session(username, CredentialIdentity::Principal(principal.id))
     }
 
     fn build_session(
@@ -354,10 +383,10 @@ impl PasswordAuthenticator {
         .map_err(|_| denied())?;
         if principal.name != username
             || principal.state != DescriptorState::Public
-            || !matches!(
+            || !(matches!(
                 principal.principal_type,
                 PrincipalType::User | PrincipalType::ServiceAccount
-            )
+            ) || principal.attributes.can_login)
         {
             return Err(denied());
         }
@@ -393,23 +422,39 @@ impl PasswordAuthenticator {
 
 impl Authenticator for PasswordAuthenticator {
     fn authenticate(&self, username: &str, password: &str) -> Result<Session, AuthError> {
-        let cred = {
+        let (identity, keys) = {
             let guard = self.credentials.read().unwrap();
-            guard
-                .get(username)
-                .cloned()
-                .ok_or_else(|| AuthError::UnknownUser(username.to_string()))?
+            match guard.get(username) {
+                Some(credential) => (credential.identity, credential.keys.clone()),
+                None => {
+                    // A role of the catalog, as `scram_keys` reads it.
+                    let principal = self
+                        .catalog
+                        .get_principal_by_name(username)
+                        .map_err(|_| AuthError::UnknownUser(username.to_string()))?;
+                    if !principal.attributes.can_login {
+                        return Err(AuthError::InvalidCredentials(username.to_string()));
+                    }
+                    let keys = principal
+                        .attributes
+                        .password
+                        .as_deref()
+                        .and_then(ScramKeys::from_verifier_string)
+                        .ok_or_else(|| AuthError::InvalidCredentials(username.to_string()))?;
+                    (CredentialIdentity::Principal(principal.id), keys)
+                }
+            }
         };
 
         // Re-derive the SCRAM StoredKey from the supplied password and compare it
         // to the stored one in constant time. This keeps the admin Basic-auth
         // path working off the same material the SCRAM handshake uses.
-        let candidate = ScramKeys::derive(password, cred.keys.salt.clone(), cred.keys.iterations);
-        if !constant_time_eq(&candidate.stored_key, &cred.keys.stored_key) {
+        let candidate = ScramKeys::derive(password, keys.salt.clone(), keys.iterations);
+        if !constant_time_eq(&candidate.stored_key, &keys.stored_key) {
             return Err(AuthError::InvalidCredentials(username.to_string()));
         }
 
-        self.build_session(username, cred.identity)
+        self.build_session(username, identity)
     }
 }
 
@@ -451,7 +496,9 @@ impl TlsConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nodus_catalog::{CatalogWriter, CreateRoleRequest, MemoryCatalog, PrincipalType};
+    use nodus_catalog::{
+        CatalogWriter, CreateRoleRequest, MemoryCatalog, PrincipalType, RoleAttributes,
+    };
 
     fn user(catalog: &MemoryCatalog, name: &str) -> PrincipalId {
         catalog
@@ -460,9 +507,66 @@ mod tests {
                 name: name.into(),
                 principal_type: PrincipalType::User,
                 database_id: None,
+
+                attributes: Default::default(),
             })
             .unwrap()
             .id
+    }
+
+    #[test]
+    fn a_roles_catalog_verifier_logs_it_in() {
+        let local = Arc::new(MemoryCatalog::new());
+        let verifier = ScramKeys::derive(
+            "role-secret",
+            Uuid::new_v4().as_bytes().to_vec(),
+            PBKDF2_ITERATIONS,
+        )
+        .to_verifier_string();
+        let role = local
+            .create_role(CreateRoleRequest {
+                id: PrincipalId::new(),
+                name: "librarian".into(),
+                principal_type: PrincipalType::Role,
+                database_id: None,
+                attributes: RoleAttributes {
+                    can_login: true,
+                    password: Some(verifier),
+                    ..Default::default()
+                },
+            })
+            .unwrap();
+        let auth = PasswordAuthenticator::new(local.clone());
+        // The SASL handshake reads the verifier from the catalog.
+        assert!(auth.scram_keys("librarian").is_some());
+        assert_eq!(
+            auth.issue_session("librarian").unwrap().principal_id,
+            role.id
+        );
+        assert!(auth.authenticate("librarian", "role-secret").is_ok());
+        assert!(auth.authenticate("librarian", "wrong").is_err());
+        // A role that may not log in is named as such.
+        let nologin = local
+            .create_role(CreateRoleRequest {
+                id: PrincipalId::new(),
+                name: "auditor".into(),
+                principal_type: PrincipalType::Role,
+                database_id: None,
+                attributes: RoleAttributes {
+                    password: Some(
+                        ScramKeys::derive("pw", vec![1, 2, 3], PBKDF2_ITERATIONS)
+                            .to_verifier_string(),
+                    ),
+                    ..Default::default()
+                },
+            })
+            .unwrap();
+        assert!(!nologin.attributes.can_login);
+        assert!(auth.scram_keys("auditor").is_none());
+        assert!(auth.may_not_log_in("auditor"));
+        assert!(!auth.may_not_log_in("librarian"));
+        assert!(auth.unknown_role("nobody"));
+        assert!(!auth.unknown_role("librarian"));
     }
 
     #[test]
@@ -498,6 +602,8 @@ mod tests {
                     name: "nodus".into(),
                     principal_type,
                     database_id,
+
+                    attributes: Default::default(),
                 })
                 .unwrap();
             catalog
@@ -506,6 +612,9 @@ mod tests {
                     principal_id: id,
                     resource: ResourceRef::System,
                     privilege: "ALL".into(),
+
+                    grantable: false,
+                    grantor: None,
                 })
                 .unwrap();
             let auth = PasswordAuthenticator::new(catalog);
@@ -533,6 +642,9 @@ mod tests {
                 principal_id: id,
                 resource: ResourceRef::System,
                 privilege: "ALL".into(),
+
+                grantable: false,
+                grantor: None,
             })
             .unwrap();
         local
@@ -573,6 +685,8 @@ mod tests {
                 name: "alice".into(),
                 principal_type: PrincipalType::User,
                 database_id: None,
+
+                attributes: Default::default(),
             })
             .unwrap();
         let auth = PasswordAuthenticator::new(catalog);

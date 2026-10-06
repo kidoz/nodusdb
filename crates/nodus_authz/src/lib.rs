@@ -163,6 +163,34 @@ impl DefaultAuthzEngine {
     }
 }
 
+impl DefaultAuthzEngine {
+    /// Whether the principal — itself or through a role it holds — owns the
+    /// request's resource, which PostgreSQL lets do anything with it.
+    fn owns(&self, request: &AuthzRequest, effective: &[PrincipalId]) -> Result<bool> {
+        use nodus_catalog::ResourceRef;
+        // A resource the catalog does not know has no owner.
+        let owner = match &request.resource {
+            ResourceRef::Table(id) => self
+                .catalog
+                .get_table_by_id(*id)
+                .ok()
+                .and_then(|table| table.owner_role_id),
+            ResourceRef::Schema(id) => self
+                .catalog
+                .get_schema_by_id(*id)
+                .ok()
+                .and_then(|schema| schema.owner_role_id),
+            ResourceRef::Database(id) => self
+                .catalog
+                .get_database_by_id(*id)
+                .ok()
+                .and_then(|database| database.owner_role_id),
+            _ => None,
+        };
+        Ok(owner.is_some_and(|owner| effective.contains(&PrincipalId(owner.0))))
+    }
+}
+
 impl AuthzEngine for DefaultAuthzEngine {
     fn authorize(&self, request: AuthzRequest) -> Result<AuthzDecision> {
         // Deny-by-default: a request is allowed only when a grant on the
@@ -173,6 +201,16 @@ impl AuthzEngine for DefaultAuthzEngine {
             return Ok(AuthzDecision {
                 allowed: true,
                 reason: AuthzReason::Superuser,
+                matched_grants: vec![],
+                matched_policies: vec![],
+                catalog_version,
+            });
+        }
+
+        if self.owns(&request, &effective)? {
+            return Ok(AuthzDecision {
+                allowed: true,
+                reason: AuthzReason::Owner,
                 matched_grants: vec![],
                 matched_policies: vec![],
                 catalog_version,
@@ -299,6 +337,8 @@ mod tests {
                 name: "alice".into(),
                 principal_type: PrincipalType::User,
                 database_id: None,
+
+                attributes: Default::default(),
             })
             .unwrap();
         let table = ResourceRef::Table(TableId::new());
@@ -308,6 +348,9 @@ mod tests {
                 principal_id: user.id,
                 resource: table.clone(),
                 privilege: "SELECT".into(),
+
+                grantable: false,
+                grantor: None,
             })
             .unwrap();
         let engine = DefaultAuthzEngine::new(catalog);
@@ -326,6 +369,8 @@ mod tests {
                 name: "readers".into(),
                 principal_type: PrincipalType::Role,
                 database_id: None,
+
+                attributes: Default::default(),
             })
             .unwrap();
         let user = catalog
@@ -334,12 +379,17 @@ mod tests {
                 name: "bob".into(),
                 principal_type: PrincipalType::User,
                 database_id: None,
+
+                attributes: Default::default(),
             })
             .unwrap();
         catalog
             .add_role_member(AddRoleMemberRequest {
                 role_principal_id: role.id,
                 member_id: user.id,
+
+                admin_option: false,
+                grantor: None,
             })
             .unwrap();
         let table = ResourceRef::Table(TableId::new());
@@ -349,6 +399,9 @@ mod tests {
                 principal_id: role.id,
                 resource: table.clone(),
                 privilege: "SELECT".into(),
+
+                grantable: false,
+                grantor: None,
             })
             .unwrap();
         let engine = DefaultAuthzEngine::new(catalog);
