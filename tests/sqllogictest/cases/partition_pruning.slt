@@ -1,0 +1,267 @@
+# Partition pruning, `RETURNING tableoid`, and expression partition keys.
+# Plans and results from PostgreSQL 18.4.
+
+statement ok
+create table pp (a int, b text) partition by range (a);
+
+statement ok
+create table pp1 partition of pp for values from (0) to (10);
+
+statement ok
+create table pp2 partition of pp for values from (10) to (20);
+
+statement ok
+create table pp3 partition of pp for values from (20) to (30);
+
+# One partition is left: no Append, and the scan carries the filter.
+query TT
+explain (costs off) select * from pp where a = 5;
+----
+Seq Scan on pp1 pp
+  Filter: (a = 5)
+
+# `OR` keeps the partitions either side reaches; the survivors are
+# renumbered.
+query TT
+explain (costs off) select * from pp where a = 5 or a = 25;
+----
+Append
+  ->  Seq Scan on pp1 pp_1
+        Filter: ((a = 5) OR (a = 25))
+  ->  Seq Scan on pp3 pp_2
+        Filter: ((a = 5) OR (a = 25))
+
+query TT
+explain (costs off) select * from pp where a between 8 and 12;
+----
+Append
+  ->  Seq Scan on pp1 pp_1
+        Filter: ((a >= 8) AND (a <= 12))
+  ->  Seq Scan on pp2 pp_2
+        Filter: ((a >= 8) AND (a <= 12))
+
+# A predicate on another column reaches every partition.
+query TT
+explain (costs off) select * from pp where b = 'x';
+----
+Append
+  ->  Seq Scan on pp1 pp_1
+        Filter: (b = 'x'::text)
+  ->  Seq Scan on pp2 pp_2
+        Filter: (b = 'x'::text)
+  ->  Seq Scan on pp3 pp_3
+        Filter: (b = 'x'::text)
+
+# No partition can hold a matching row.
+query TT
+explain (costs off) select * from pp where a = 100;
+----
+Result
+  One-Time Filter: false
+
+query I
+select count(*) from pp where a = 100;
+----
+0
+
+# A list key keeps the partitions its values name.
+statement ok
+create table pl (a int) partition by list (a);
+
+statement ok
+create table pl1 partition of pl for values in (1, 2);
+
+statement ok
+create table pl2 partition of pl for values in (3, 4);
+
+query TT
+explain (costs off) select * from pl where a in (2, 3);
+----
+Append
+  ->  Seq Scan on pl1 pl_1
+        Filter: (a = ANY ('{2,3}'::integer[]))
+  ->  Seq Scan on pl2 pl_2
+        Filter: (a = ANY ('{2,3}'::integer[]))
+
+# A hash key's equality lands on one remainder.
+statement ok
+create table ph (a int) partition by hash (a);
+
+statement ok
+create table ph1 partition of ph for values with (modulus 4, remainder 0);
+
+statement ok
+create table ph2 partition of ph for values with (modulus 4, remainder 1);
+
+statement ok
+create table ph3 partition of ph for values with (modulus 4, remainder 2);
+
+statement ok
+create table ph4 partition of ph for values with (modulus 4, remainder 3);
+
+query TT
+explain (costs off) select * from ph where a = 5;
+----
+Seq Scan on ph2 ph
+  Filter: (a = 5)
+
+# A default partition is kept only when the named ones leave room.
+statement ok
+create table pd (a int) partition by range (a);
+
+statement ok
+create table pd1 partition of pd for values from (0) to (10);
+
+statement ok
+create table pdd partition of pd default;
+
+query TT
+explain (costs off) select * from pd where a = 5;
+----
+Seq Scan on pd1 pd
+  Filter: (a = 5)
+
+query TT
+explain (costs off) select * from pd where a = 15;
+----
+Seq Scan on pdd pd
+  Filter: (a = 15)
+
+# `RETURNING tableoid` names the partition a row lives in, and an update
+# that moves it reports where it landed.
+statement ok
+create table pt (a int, b text) partition by range (a);
+
+statement ok
+create table pt1 partition of pt for values from (0) to (10);
+
+statement ok
+create table pt2 partition of pt for values from (10) to (20);
+
+query TT
+insert into pt values (5, 'x') returning tableoid::regclass::text, b;
+----
+pt1	x
+
+query TT
+update pt set b = 'q' where a = 5 returning tableoid::regclass::text, b;
+----
+pt1	q
+
+query TT
+update pt set a = 15 returning tableoid::regclass::text, b;
+----
+pt2	q
+
+query T
+delete from pt where a = 15 returning tableoid::regclass::text;
+----
+pt2
+
+# A data statement's plan lists its result relations and prunes the scan.
+statement ok
+insert into pt values (1, 'a');
+
+query TT
+explain (costs off) update pt set b = 'w' where a = 1;
+----
+Update on pt
+  Update on pt1 pt_1
+  ->  Seq Scan on pt1 pt_1
+        Filter: (a = 1)
+
+query TT
+explain (costs off) delete from pt where a = 100;
+----
+Delete on pt
+  ->  Result
+        One-Time Filter: false
+
+# An inherited (not partitioned) target computes the new row in a Result.
+statement ok
+create table pi (a int);
+
+statement ok
+create table pi1 () inherits (pi);
+
+query TT
+explain (costs off) update pi set a = 0 where a = 1;
+----
+Update on pi
+  Update on pi pi_1
+  Update on pi1 pi_2
+  ->  Result
+        ->  Append
+              ->  Seq Scan on pi pi_1
+                    Filter: (a = 1)
+              ->  Seq Scan on pi1 pi_2
+                    Filter: (a = 1)
+
+# A partition key may be an expression, as written.
+statement ok
+create table pe (n text) partition by range (lower(n));
+
+statement ok
+create table pe1 partition of pe for values from ('a') to ('m');
+
+statement ok
+create table pe2 partition of pe for values from ('m') to (maxvalue);
+
+statement ok
+insert into pe values ('Bob'), ('zoe');
+
+query TT
+select tableoid::regclass::text, n from pe order by n;
+----
+pe1	Bob
+pe2	zoe
+
+# The same expression in the filter prunes; the column alone cannot.
+query TT
+explain (costs off) select * from pe where lower(n) = 'bob';
+----
+Seq Scan on pe1 pe
+  Filter: (lower(n) = 'bob'::text)
+
+query TT
+explain (costs off) select * from pe where n = 'bob';
+----
+Append
+  ->  Seq Scan on pe1 pe_1
+        Filter: (n = 'bob'::text)
+  ->  Seq Scan on pe2 pe_2
+        Filter: (n = 'bob'::text)
+
+query T
+select pg_get_partkeydef('pe'::regclass);
+----
+RANGE (lower(n))
+
+query TT
+select partattrs, partclass from pg_partitioned_table where partrelid = 'pe'::regclass;
+----
+0	3126
+
+# A key change moves the row across partitions.
+statement ok
+update pe set n = 'anna' where n = 'Bob';
+
+query TT
+select tableoid::regclass::text, n from pe order by n;
+----
+pe1	anna
+pe2	zoe
+
+# Attaching a table whose rows do not fit is refused, and a range with no
+# values is named.
+statement ok
+create table px (n text);
+
+statement ok
+insert into px values ('bob');
+
+statement error
+alter table pe attach partition px for values from ('m') to ('z');
+
+statement error
+alter table pe attach partition px for values from ('m') to (minvalue);
