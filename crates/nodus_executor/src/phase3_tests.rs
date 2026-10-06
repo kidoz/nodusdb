@@ -148,6 +148,7 @@ fn test_ddl_and_subqueries() {
             predicate: None,
             expressions: vec![],
             descending: vec![],
+            nulls_not_distinct: false,
         },
     )
     .unwrap();
@@ -531,6 +532,7 @@ fn test_secondary_indexing() {
             predicate: None,
             expressions: vec![],
             descending: vec![],
+            nulls_not_distinct: false,
         },
     )
     .unwrap();
@@ -824,6 +826,7 @@ fn test_index_value_containing_separator_does_not_overmatch() {
             predicate: None,
             expressions: vec![],
             descending: vec![],
+            nulls_not_distinct: false,
         },
     )
     .unwrap();

@@ -256,6 +256,9 @@ pub struct IndexDescriptor {
     /// makes it immediate.
     #[serde(default)]
     pub initially_deferred: bool,
+    /// `NULLS NOT DISTINCT`: a unique key treats NULLs as equal.
+    #[serde(default)]
+    pub nulls_not_distinct: bool,
     pub global: bool,
     pub predicate: Option<Expression>,
     pub expressions: Vec<Expression>,

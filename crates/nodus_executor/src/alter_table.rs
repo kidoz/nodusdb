@@ -1259,6 +1259,7 @@ impl MemExecutor {
                 columns,
                 deferrable,
                 initially_deferred,
+                nulls_not_distinct,
             } => {
                 let name = match name {
                     Some(name) => name,
@@ -1276,6 +1277,7 @@ impl MemExecutor {
                     Self::new_index(tbl, name, IndexType::Unique, &columns, None, true)?;
                 index.deferrable = deferrable;
                 index.initially_deferred = initially_deferred;
+                index.nulls_not_distinct = nulls_not_distinct;
                 self.add_index(ctx, tbl, index)
             }
             NewConstraint::PrimaryKey {

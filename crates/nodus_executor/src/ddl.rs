@@ -25,7 +25,7 @@ impl MemExecutor {
         (unique_constraints, key_names, key_flags): (
             Vec<Vec<String>>,
             Vec<(Vec<String>, String)>,
-            Vec<(Vec<String>, bool, bool)>,
+            Vec<(Vec<String>, bool, bool, bool)>,
         ),
         materialized_query: Option<String>,
         inherits: Vec<String>,
@@ -38,16 +38,16 @@ impl MemExecutor {
                     .then(|| name.clone())
             })
         };
-        // The `DEFERRABLE` `(deferrable, initially deferred)` of the key over
-        // `columns`, if it was marked so.
-        let key_flags = |columns: &[String]| -> (bool, bool) {
+        // The `(DEFERRABLE, INITIALLY DEFERRED, NULLS NOT DISTINCT)` of the
+        // key over `columns`, if it was marked so.
+        let key_flags = |columns: &[String]| -> (bool, bool, bool) {
             key_flags
                 .iter()
-                .find(|(key, _, _)| {
+                .find(|(key, _, _, _)| {
                     key.len() == columns.len() && key.iter().all(|k| columns.contains(k))
                 })
-                .map(|(_, deferrable, initially)| (*deferrable, *initially))
-                .unwrap_or((false, false))
+                .map(|(_, deferrable, initially, nnd)| (*deferrable, *initially, *nnd))
+                .unwrap_or((false, false, false))
         };
         let primary_columns: Vec<String> = columns
             .iter()
@@ -306,7 +306,7 @@ impl MemExecutor {
         // deferrability belongs to the whole key.
         let primary_flags = key_flags(&primary_columns);
         for (col, primary) in unique_cols {
-            let (deferrable, initially_deferred) = if primary {
+            let (deferrable, initially_deferred, nulls_not_distinct) = if primary {
                 primary_flags
             } else {
                 key_flags(std::slice::from_ref(&col.name))
@@ -338,6 +338,7 @@ impl MemExecutor {
                 constraint: true,
                 deferrable,
                 initially_deferred,
+                nulls_not_distinct,
                 global: false,
                 predicate: None,
                 expressions: vec![],
@@ -371,6 +372,7 @@ impl MemExecutor {
                 constraint: true,
                 deferrable: flags.0,
                 initially_deferred: flags.1,
+                nulls_not_distinct: flags.2,
                 global: false,
                 predicate: None,
                 expressions: vec![],
@@ -495,6 +497,7 @@ impl MemExecutor {
                 constraint: index.constraint,
                 deferrable: index.deferrable,
                 initially_deferred: index.initially_deferred,
+                nulls_not_distinct: index.nulls_not_distinct,
                 global: index.global,
                 predicate: index.predicate.clone(),
                 expressions: index.expressions.clone(),
@@ -1179,7 +1182,7 @@ impl MemExecutor {
         name: String,
         table_name: String,
         (columns, expressions, descending): (Vec<String>, Vec<Option<String>>, Vec<bool>),
-        (unique, predicate): (bool, Option<String>),
+        (unique, nulls_not_distinct, predicate): (bool, bool, Option<String>),
         if_not_exists: bool,
     ) -> Result<QueryOutput> {
         let (db_name, schema_name, table_only) = parse_object_name(&table_name)?;
@@ -1239,6 +1242,7 @@ impl MemExecutor {
             }
         }
         let mut index = Self::new_index(&tbl, name, index_type, &plain, predicate, false)?;
+        index.nulls_not_distinct = nulls_not_distinct;
         if expressions.iter().any(Option::is_some) {
             let mut plain_keys = index.key_columns.into_iter();
             index.key_columns = expressions
@@ -1318,6 +1322,7 @@ impl MemExecutor {
             constraint,
             deferrable: false,
             initially_deferred: false,
+            nulls_not_distinct: false,
             index_type,
             index_state: nodus_catalog::IndexState::Creating,
             key_columns,

@@ -1358,6 +1358,9 @@ pub enum NewConstraint {
         /// `INITIALLY DEFERRED`; defaulted so older plans decode.
         #[serde(default)]
         initially_deferred: bool,
+        /// `NULLS NOT DISTINCT`; defaulted so older plans decode.
+        #[serde(default)]
+        nulls_not_distinct: bool,
     },
     PrimaryKey {
         name: Option<String>,
@@ -1420,10 +1423,11 @@ pub enum LogicalPlan {
         /// their columns; the others get PostgreSQL's names.
         #[serde(default)]
         key_names: Vec<(Vec<String>, String)>,
-        /// Key constraints' `DEFERRABLE` / `INITIALLY DEFERRED`, by their
-        /// columns. Defaulted so older plans decode.
+        /// Key constraints' `DEFERRABLE` / `INITIALLY DEFERRED` /
+        /// `NULLS NOT DISTINCT`, by their columns. Defaulted so older plans
+        /// decode.
         #[serde(default)]
-        key_flags: Vec<(Vec<String>, bool, bool)>,
+        key_flags: Vec<(Vec<String>, bool, bool, bool)>,
         /// A temporary table's `ON COMMIT` action: `DROP` or `DELETE ROWS`.
         #[serde(default)]
         on_commit: Option<String>,
@@ -1496,6 +1500,9 @@ pub enum LogicalPlan {
         table_name: String,
         columns: Vec<String>,
         unique: bool,
+        /// `NULLS NOT DISTINCT`; defaulted so older plans decode.
+        #[serde(default)]
+        nulls_not_distinct: bool,
         if_not_exists: bool,
         /// A partial index's `WHERE` condition. Defaulted so older plans
         /// decode.

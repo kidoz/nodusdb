@@ -3328,6 +3328,12 @@ pub const ATTACH_PARTITION_FUNCTION: &str = "pg_catalog.nodus_attach_partition";
 /// — `SELECT pg_catalog.nodus_detach_partition('parent', 'child')`.
 pub const DETACH_PARTITION_FUNCTION: &str = "pg_catalog.nodus_detach_partition";
 
+/// The name a *column* constraint's `UNIQUE NULLS NOT DISTINCT` is written
+/// with — `unique __nulls_not_distinct__` — since the parser reads the
+/// NULLS clause only on table constraints. It stands in for the
+/// constraint's (unused) index name.
+pub const NULLS_NOT_DISTINCT_MARK: &str = "__nulls_not_distinct__";
+
 /// The function `SET CONSTRAINTS {ALL | names} {DEFERRED | IMMEDIATE}` is
 /// written as — `SELECT pg_catalog.nodus_set_constraints(true, 'deferred',
 /// '')` — since the parser reads `SET CONSTRAINTS` as a variable SET.
@@ -3408,6 +3414,90 @@ fn rewrite_statement_form(
         Token::Word(w) if w.quote_style.is_none() => Some(w.value.clone()),
         _ => None,
     };
+    // `UNIQUE NULLS NOT DISTINCT` on a *column* — the parser takes the
+    // clause only on table constraints — becomes a marker-named constraint
+    // of the same column (`unique constraint __nulls_not_distinct__ unique`)
+    // which the planner reads as the flag. `NULLS DISTINCT` is the default
+    // and goes. A table constraint's clause is left alone (its column list
+    // follows the words).
+    {
+        let significant: Vec<usize> = statement
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| {
+                !matches!(
+                    t.token,
+                    Token::Whitespace(_) | Token::SemiColon | Token::EOF
+                )
+            })
+            .map(|(i, _)| i)
+            .collect();
+        let at_word = |at: usize| significant.get(at).and_then(|&i| word(&statement[i]));
+        let first = at_word(0);
+        let second = at_word(1);
+        let table_statement = matches!(first.as_deref(), Some("create") | Some("alter"))
+            && second.as_deref() == Some("table");
+        if table_statement {
+            let mut edits: Vec<(usize, usize, Option<&'static str>)> = Vec::new();
+            for at in 0..significant.len() {
+                if at_word(at).as_deref() != Some("nulls") {
+                    continue;
+                }
+                // Only a column option's clause: `unique` precedes it and no
+                // `(` (a table constraint's column list) follows it.
+                if at == 0 || at_word(at - 1).as_deref() != Some("unique") {
+                    continue;
+                }
+                let next = at_word(at + 1);
+                let (end, not_distinct) = if next.as_deref() == Some("not")
+                    && at_word(at + 2).as_deref() == Some("distinct")
+                {
+                    (at + 2, true)
+                } else if next.as_deref() == Some("distinct") {
+                    (at + 1, false)
+                } else {
+                    continue;
+                };
+                // A table constraint's column list follows its words.
+                let followed_by_columns = significant
+                    .get(end + 1)
+                    .is_some_and(|&i| matches!(statement[i].token, Token::LParen));
+                if followed_by_columns {
+                    continue;
+                }
+                let marker = not_distinct.then_some(NULLS_NOT_DISTINCT_MARK);
+                let (start, stop) = (significant[at], significant[end]);
+                if marker.is_none() {
+                    edits.push((start, stop, None));
+                    continue;
+                }
+                edits.push((start, stop, Some(NULLS_NOT_DISTINCT_MARK)));
+            }
+            if !edits.is_empty() {
+                let mut out = Vec::with_capacity(statement.len());
+                let mut i = 0;
+                let mut edit = edits.into_iter().peekable();
+                while i < statement.len() {
+                    if let Some((start, stop, marker)) = edit.peek().copied()
+                        && i == start
+                    {
+                        if let Some(marker) = marker
+                            && let Some(tokens) =
+                                snippet_tokens(&format!("constraint {marker} unique"))
+                        {
+                            out.extend(tokens);
+                        }
+                        i = stop + 1;
+                        edit.next();
+                        continue;
+                    }
+                    out.push(statement[i].clone());
+                    i += 1;
+                }
+                statement = out;
+            }
+        }
+    }
     let significant: Vec<usize> = statement
         .iter()
         .enumerate()

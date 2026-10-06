@@ -1485,9 +1485,10 @@ impl MemExecutor {
             .indexes
             .iter()
             .find(|i| i.index_type == nodus_catalog::IndexType::Primary);
-        let mut keys: Vec<(&str, Vec<usize>)> = Vec::new();
+        // Each key with whether its index treats NULLs as equal.
+        let mut keys: Vec<(&str, Vec<usize>, bool)> = Vec::new();
         if let Some(primary) = primary {
-            keys.push((primary.name.as_str(), Self::pk_positions(tbl)));
+            keys.push((primary.name.as_str(), Self::pk_positions(tbl), false));
         }
         let mut expression_keys: Vec<&nodus_catalog::IndexDescriptor> = tbl
             .indexes
@@ -1504,7 +1505,7 @@ impl MemExecutor {
                     .iter()
                     .filter_map(|kc| tbl.columns.iter().position(|c| c.id == kc.column_id))
                     .collect();
-                keys.push((idx.name.as_str(), positions));
+                keys.push((idx.name.as_str(), positions, idx.nulls_not_distinct));
             }
         }
         match target {
@@ -1529,13 +1530,13 @@ impl MemExecutor {
                     .map(|c| Self::column_position(tbl, c))
                     .collect::<Result<Vec<_>>>()?;
                 wanted.sort_unstable();
-                keys.retain(|(_, positions)| {
+                keys.retain(|(_, positions, _)| {
                     let mut p = positions.clone();
                     p.sort_unstable();
                     p == wanted
                 });
             }
-            Some(ConflictTarget::Constraint(name)) => keys.retain(|(n, _)| n == name),
+            Some(ConflictTarget::Constraint(name)) => keys.retain(|(n, _, _)| n == name),
         }
         if target.is_some() && keys.is_empty() && expression_keys.is_empty() {
             anyhow::bail!(
@@ -1553,18 +1554,31 @@ impl MemExecutor {
         }
         let proposed: Vec<Option<Vec<Value>>> = keys
             .iter()
-            .map(|(_, positions)| crate::constraints::key_tuple(row, positions))
+            .map(|(_, positions, nulls_equal)| {
+                if *nulls_equal {
+                    crate::constraints::key_tuple_including_nulls(row, positions)
+                } else {
+                    crate::constraints::key_tuple(row, positions)
+                }
+            })
             .collect();
+        let key_of = |existing: &[Value], positions: &[usize], nulls_equal: bool| {
+            if nulls_equal {
+                crate::constraints::key_tuple_including_nulls(existing, positions)
+            } else {
+                crate::constraints::key_tuple(existing, positions)
+            }
+        };
         // Look each key up where that is exact; scan the table otherwise.
         let mut looked_up = true;
-        for ((name, positions), wanted) in keys.iter().zip(&proposed) {
+        for ((name, positions, nulls_equal), wanted) in keys.iter().zip(&proposed) {
             let index = tbl.indexes.iter().find(|i| i.name == *name);
             let index = index.filter(|i| i.index_type != nodus_catalog::IndexType::Primary);
             match self.key_candidates(session, tbl, positions, index, row)? {
                 Some(found) => {
                     for (pk, existing) in found {
                         if let (Some(wanted), Some(have)) =
-                            (wanted, crate::constraints::key_tuple(&existing, positions))
+                            (wanted, key_of(&existing, positions, *nulls_equal))
                             && wanted.iter().zip(&have).all(|(a, b)| values_equal(a, b))
                         {
                             return Ok(Some((format!("{}:{pk}", tbl.id), existing)));
@@ -1578,9 +1592,9 @@ impl MemExecutor {
             return Ok(None);
         }
         for (key, existing) in self.scan_rows_keyed(tbl.id, session)? {
-            for ((_, positions), wanted) in keys.iter().zip(&proposed) {
+            for ((_, positions, nulls_equal), wanted) in keys.iter().zip(&proposed) {
                 if let (Some(wanted), Some(have)) =
-                    (wanted, crate::constraints::key_tuple(&existing, positions))
+                    (wanted, key_of(&existing, positions, *nulls_equal))
                     && wanted.iter().zip(&have).all(|(a, b)| values_equal(a, b))
                 {
                     return Ok(Some((key, existing)));

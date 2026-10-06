@@ -55,7 +55,12 @@ impl MemExecutor {
             {
                 continue;
             }
-            unique_keys.push((idx.name.as_str(), positions, predicate));
+            unique_keys.push((
+                idx.name.as_str(),
+                positions,
+                predicate,
+                idx.nulls_not_distinct,
+            ));
         }
         let mut pk_positions = Self::pk_positions_declared(tbl);
         if !pk_positions.is_empty()
@@ -84,18 +89,24 @@ impl MemExecutor {
                 .map_or_else(|| format!("{}_pkey", tbl.name), |i| i.name.clone())
         };
         // Look the keys up where that is exact; scan the table otherwise.
-        let equal = |existing: &[Value], positions: &[usize]| {
-            matches!(
-                (key_tuple(existing, positions), key_tuple(new_row, positions)),
-                (Some(a), Some(b)) if a.iter().zip(&b).all(|(x, y)| values_equal(x, y))
-            )
+        // A `NULLS NOT DISTINCT` key keeps its NULLs as values.
+        let equal = |existing: &[Value], positions: &[usize], nulls_equal: bool| {
+            let key = |row: &[Value]| {
+                if nulls_equal {
+                    key_tuple_including_nulls(row, positions)
+                } else {
+                    key_tuple(row, positions)
+                }
+            };
+            matches!((key(existing), key(new_row)),
+                (Some(a), Some(b)) if a.iter().zip(&b).all(|(x, y)| values_equal(x, y)))
         };
         let mut looked_up = true;
         if !pk_positions.is_empty() {
             match self.key_candidates(&ctx.session_id, tbl, &pk_positions, None, new_row)? {
                 Some(found) => {
                     for (pk, existing) in found {
-                        if Some(pk.as_str()) != skip_pk && equal(&existing, &pk_positions) {
+                        if Some(pk.as_str()) != skip_pk && equal(&existing, &pk_positions, false) {
                             return Err(self.duplicate_key(
                                 tbl,
                                 &primary_name(),
@@ -108,13 +119,13 @@ impl MemExecutor {
                 None => looked_up = false,
             }
         }
-        for (idx_name, positions, predicate) in &unique_keys {
+        for (idx_name, positions, predicate, nulls_equal) in &unique_keys {
             let index = tbl.indexes.iter().find(|i| i.name == *idx_name);
             match self.key_candidates(&ctx.session_id, tbl, positions, index, new_row)? {
                 Some(found) => {
                     for (pk, existing) in found {
                         if Some(pk.as_str()) != skip_pk
-                            && equal(&existing, positions)
+                            && equal(&existing, positions, *nulls_equal)
                             && predicate.as_ref().is_none_or(|filter| {
                                 self.eval_filter(
                                     ctx,
@@ -152,11 +163,16 @@ impl MemExecutor {
                     .map_or_else(|| format!("{}_pkey", tbl.name), |i| i.name.clone());
                 return Err(self.duplicate_key(tbl, &name, &pk_positions, new_row));
             }
-            for (idx_name, positions, predicate) in &unique_keys {
-                if let (Some(a), Some(b)) = (
-                    key_tuple(&existing, positions),
-                    key_tuple(new_row, positions),
-                ) && a.iter().zip(&b).all(|(x, y)| values_equal(x, y))
+            for (idx_name, positions, predicate, nulls_equal) in &unique_keys {
+                let key = |row: &[Value]| {
+                    if *nulls_equal {
+                        key_tuple_including_nulls(row, positions)
+                    } else {
+                        key_tuple(row, positions)
+                    }
+                };
+                if let (Some(a), Some(b)) = (key(&existing), key(new_row))
+                    && a.iter().zip(&b).all(|(x, y)| values_equal(x, y))
                     && predicate.as_ref().is_none_or(|filter| {
                         self.eval_filter(ctx, &existing, &col_names, &tbl.columns, Some(filter))
                             == Some(true)
@@ -186,6 +202,11 @@ impl MemExecutor {
             .iter()
             .any(|&p| matches!(row.get(p), None | Some(Value::Null)))
         {
+            // Under `NULLS NOT DISTINCT` a NULL key may equal a row, so the
+            // caller scans; otherwise it equals none.
+            if index.is_some_and(|index| index.nulls_not_distinct) {
+                return Ok(None);
+            }
             return Ok(Some(Vec::new()));
         }
         // A table whose rows have synthetic identities (no primary key, or a
@@ -266,7 +287,10 @@ impl MemExecutor {
                 let parts = crate::index_keys::index_parts(tbl, idx);
                 let values: Vec<String> = crate::index_keys::key_values(tbl, &parts, new_row)
                     .iter()
-                    .map(render)
+                    .map(|value| match value {
+                        Value::Null => "null".to_string(),
+                        other => render(other),
+                    })
                     .collect();
                 return Err(DbError::new(format!(
                     "duplicate key value violates unique constraint \"{}\"",
@@ -297,11 +321,19 @@ impl MemExecutor {
     ) -> Result<Vec<(String, Vec<Value>)>> {
         let parts = crate::index_keys::index_parts(tbl, idx);
         let key = crate::index_keys::key_values(tbl, &parts, row);
-        if key.is_empty() || key.iter().any(|v| matches!(v, Value::Null)) {
+        if key.is_empty() {
             return Ok(Vec::new());
         }
-        // A float's text does not decide equality (`-0` is `0`).
-        let candidates = if matches!(key[0], Value::Float(_)) {
+        // Under `NULLS NOT DISTINCT` a NULL key may equal a row.
+        let nulls_equal = idx.nulls_not_distinct;
+        if !nulls_equal && key.iter().any(|v| matches!(v, Value::Null)) {
+            return Ok(Vec::new());
+        }
+        // A float's text does not decide equality (`-0` is `0`), and a NULL
+        // leading value has no index entry.
+        let candidates = if matches!(key[0], Value::Float(_))
+            || (nulls_equal && matches!(key[0], Value::Null))
+        {
             let prefix = format!("{}:", tbl.id);
             self.scan_rows_keyed(tbl.id, session)?
                 .into_iter()
@@ -409,17 +441,22 @@ impl MemExecutor {
         positions: &[usize],
     ) -> Result<()> {
         let col_names: Vec<String> = tbl.columns.iter().map(|c| c.name.clone()).collect();
-        let predicate = tbl
-            .indexes
-            .iter()
-            .find(|i| i.name == name)
+        let index = tbl.indexes.iter().find(|i| i.name == name);
+        let predicate = index
             .and_then(|i| i.predicate.as_ref())
             .map(|p| self.index_predicate(&p.sql))
             .transpose()?;
+        let nulls_equal = index.is_some_and(|i| i.nulls_not_distinct);
         let mut seen = std::collections::HashSet::new();
         for (_key, row) in self.scan_rows_keyed(tbl.id, &ctx.session_id)? {
-            // A key with a NULL never collides.
-            let Some(tuple) = key_tuple(&row, positions) else {
+            // A key with a NULL never collides, unless the constraint is
+            // `NULLS NOT DISTINCT`.
+            let tuple = if nulls_equal {
+                key_tuple_including_nulls(&row, positions)
+            } else {
+                key_tuple(&row, positions)
+            };
+            let Some(tuple) = tuple else {
                 continue;
             };
             if let Some(filter) = &predicate
@@ -447,7 +484,11 @@ impl MemExecutor {
             .collect();
         let values: Vec<String> = positions
             .iter()
-            .map(|&p| row.get(p).map(render).unwrap_or_default())
+            .map(|&p| match row.get(p) {
+                Some(Value::Null) => "null".to_string(),
+                Some(value) => render(value),
+                None => String::new(),
+            })
             .collect();
         DbError::new(format!(
             "duplicate key value violates unique constraint \"{name}\""
@@ -530,6 +571,11 @@ pub(crate) fn failing_row_typed(
 
 /// A row's values at `positions`, or `None` if any is NULL: a key containing
 /// NULL never equals another (NULLs are distinct).
+/// A key keeping any NULLs as values, for a `NULLS NOT DISTINCT` index.
+pub(crate) fn key_tuple_including_nulls(row: &[Value], positions: &[usize]) -> Option<Vec<Value>> {
+    positions.iter().map(|&p| row.get(p).cloned()).collect()
+}
+
 pub(crate) fn key_tuple(row: &[Value], positions: &[usize]) -> Option<Vec<Value>> {
     positions
         .iter()

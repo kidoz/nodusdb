@@ -334,6 +334,7 @@ impl MemExecutor {
                 table_name,
                 columns,
                 unique,
+                nulls_not_distinct,
                 if_not_exists,
                 predicate,
                 expressions,
@@ -343,7 +344,7 @@ impl MemExecutor {
                 name,
                 table_name,
                 (columns, expressions, descending),
-                (unique, predicate),
+                (unique, nulls_not_distinct, predicate),
                 if_not_exists,
             ),
             LogicalPlan::DropIndex { name, if_exists } => {

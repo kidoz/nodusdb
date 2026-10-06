@@ -97,13 +97,17 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
             let mut tbl_constraints = Vec::new();
             // The names given to key constraints, by their columns.
             let mut key_names: Vec<(Vec<String>, String)> = Vec::new();
-            // Key constraints' `DEFERRABLE` / `INITIALLY DEFERRED`, by their
-            // columns.
-            let mut key_flags: Vec<(Vec<String>, bool, bool)> = Vec::new();
+            // Key constraints' `DEFERRABLE` / `INITIALLY DEFERRED` /
+            // `NULLS NOT DISTINCT`, by their columns.
+            let mut key_flags: Vec<(Vec<String>, bool, bool, bool)> = Vec::new();
             for c in columns {
                 let mut nullable = true;
                 let mut unique = false;
                 let mut primary = false;
+                // The column key's flags, pushed after its options are read
+                // (a `NULLS NOT DISTINCT` marker may follow the constraint).
+                let mut col_nnd = false;
+                let mut col_key: Option<((bool, bool), bool)> = None;
                 let mut default = None;
                 let mut sequence = None;
                 let mut data_type = c.data_type.to_string();
@@ -242,22 +246,26 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                             if let Some(name) = &opt.name {
                                 key_names.push((vec![c.name.value.clone()], name.value.clone()));
                             }
-                            let flags = deferral(&pk.characteristics)?;
-                            if flags != (false, false) {
-                                key_flags.push((vec![c.name.value.clone()], flags.0, flags.1));
-                            }
+                            col_key = Some((deferral(&pk.characteristics)?, false));
                             unique = true;
                             nullable = false;
                             primary = true;
                         }
                         sqlparser::ast::ColumnOption::Unique(uc) => {
+                            // The marker name is the `NULLS NOT DISTINCT` a
+                            // column clause was rewritten to.
+                            if opt.name.as_ref().is_some_and(|name| {
+                                name.value == nodus_sql::NULLS_NOT_DISTINCT_MARK
+                            }) {
+                                col_nnd = true;
+                                unique = true;
+                                continue;
+                            }
                             if let Some(name) = &opt.name {
                                 key_names.push((vec![c.name.value.clone()], name.value.clone()));
                             }
-                            let flags = deferral(&uc.characteristics)?;
-                            if flags != (false, false) {
-                                key_flags.push((vec![c.name.value.clone()], flags.0, flags.1));
-                            }
+                            col_key =
+                                Some((deferral(&uc.characteristics)?, nulls_not_distinct(uc)));
                             unique = true;
                         }
                         sqlparser::ast::ColumnOption::Check(check) => {
@@ -275,6 +283,12 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                             )?);
                         }
                         _ => {}
+                    }
+                }
+                if let Some((flags, nnd)) = col_key {
+                    let nnd = nnd || col_nnd;
+                    if flags != (false, false) || nnd {
+                        key_flags.push((vec![c.name.value.clone()], flags.0, flags.1, nnd));
                     }
                 }
                 cols.push(crate::ColumnDef {
@@ -297,8 +311,9 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                             key_names.push((names.clone(), name.value.clone()));
                         }
                         let flags = deferral(&uc.characteristics)?;
-                        if flags != (false, false) {
-                            key_flags.push((names.clone(), flags.0, flags.1));
+                        let nnd = nulls_not_distinct(uc);
+                        if flags != (false, false) || nnd {
+                            key_flags.push((names.clone(), flags.0, flags.1, nnd));
                         }
                         if let [col] = names.as_slice() {
                             if let Some(c) = cols.iter_mut().find(|c| &c.name == col) {
@@ -316,7 +331,7 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                         let flags = deferral(&pk.characteristics)?;
                         if flags != (false, false) {
                             let names = index_column_names(&pk.columns);
-                            key_flags.push((names, flags.0, flags.1));
+                            key_flags.push((names, flags.0, flags.1, false));
                         }
                         for col in index_column_names(&pk.columns) {
                             if let Some(c) = cols.iter_mut().find(|c| c.name == col) {
@@ -522,6 +537,7 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                 table_name: create_index.table_name.to_string(),
                 columns: cols,
                 unique: create_index.unique,
+                nulls_not_distinct: create_index.nulls_distinct == Some(false),
                 if_not_exists: create_index.if_not_exists,
                 predicate,
                 expressions,
@@ -2031,6 +2047,7 @@ fn plan_alter_table_op(
                             columns: vec![column.clone()],
                             deferrable,
                             initially_deferred,
+                            nulls_not_distinct: nulls_not_distinct(uc),
                         })
                     }
                     ColumnOption::PrimaryKey(pk) => {
@@ -2161,6 +2178,7 @@ fn plan_alter_table_op(
                         columns: index_column_names(&unique.columns),
                         deferrable,
                         initially_deferred,
+                        nulls_not_distinct: nulls_not_distinct(unique),
                     }
                 }
                 C::PrimaryKey(pk) => {
@@ -2253,6 +2271,19 @@ fn foreign_key(
         deferrable,
         initially_deferred,
     })
+}
+
+/// Whether a `UNIQUE` constraint says `NULLS NOT DISTINCT` — read from the
+/// parser's clause, or from the marker a column constraint is rewritten to
+/// ([`nodus_sql::NULLS_NOT_DISTINCT_MARK`]).
+fn nulls_not_distinct(constraint: &sqlparser::ast::UniqueConstraint) -> bool {
+    matches!(
+        constraint.nulls_distinct,
+        sqlparser::ast::NullsDistinctOption::NotDistinct
+    ) || constraint
+        .index_name
+        .as_ref()
+        .is_some_and(|name| name.value == nodus_sql::NULLS_NOT_DISTINCT_MARK)
 }
 
 /// A constraint's `DEFERRABLE` / `INITIALLY DEFERRED` characteristics as a
