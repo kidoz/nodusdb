@@ -189,8 +189,16 @@ impl Node {
             map.insert((*name).to_string(), value.clone());
         }
         map.insert("Disabled".into(), J::Bool(false));
+        // Join nodes name their inner side's uniqueness, as PostgreSQL does.
+        if self.props.iter().any(|(name, _)| *name == "Join Type") {
+            map.insert("Inner Unique".into(), J::Bool(false));
+        }
         for (name, _, value) in &self.details {
-            map.insert((*name).to_string(), value.clone());
+            if *name == "Disabled" {
+                map.insert((*name).to_string(), J::Bool(true));
+            } else {
+                map.insert((*name).to_string(), value.clone());
+            }
         }
         if !self.children.is_empty() {
             let children = self
@@ -318,6 +326,10 @@ impl MemExecutor {
                 let mut scope: Vec<(String, &LogicalPlan)> = ctes.to_vec();
                 scope.extend(own.iter().map(|(n, p)| (n.clone(), &**p)));
                 let single = joins.is_empty();
+                // The relations on the left of the join being rendered,
+                // which decide whose column references are whose.
+                let mut joined_prefixes: Vec<String> =
+                    vec![relation_name(table_alias.as_deref().unwrap_or(table_name))];
                 // A filter on one relation is shown on its scan.
                 let scan_filter = if single { filter.as_ref() } else { None };
                 // The columns the statement reads: a covering index is
@@ -381,6 +393,32 @@ impl MemExecutor {
                         JoinType::FullOuter => (" Full Join", "Full"),
                         JoinType::Inner | JoinType::Cross => ("", "Inner"),
                     };
+                    // The equalities between the sides hash (a `Hash Join`),
+                    // unless the session turned hash joins off; anything
+                    // else is the nested loop the executor runs, over a
+                    // materialized inner.
+                    let left_prefixes = joined_prefixes.clone();
+                    let right_prefixes = vec![relation_name(
+                        join.table_alias.as_deref().unwrap_or(&join.table_name),
+                    )];
+                    let left_refs: Vec<&str> = left_prefixes.iter().map(String::as_str).collect();
+                    let right_refs: Vec<&str> = right_prefixes.iter().map(String::as_str).collect();
+                    let hash = (crate::session_env::setting("enable_hashjoin").as_deref()
+                        != Some("off"))
+                    .then(|| {
+                        // A `USING` join's named columns are equalities too.
+                        let condition = match (&join.condition, join.using_columns.is_empty()) {
+                            (Some(condition), _) => Some(condition.clone()),
+                            (None, false) => Some(crate::joins::using_condition(
+                                &join.using_columns,
+                                &left_prefixes,
+                                &right_prefixes,
+                            )?),
+                            (None, true) => None,
+                        };
+                        crate::joins::hash_plan(condition.as_ref(), &left_refs, &right_refs)
+                    })
+                    .flatten();
                     let rows = match (&join.join_type, &join.condition) {
                         (JoinType::Cross, _) | (_, None) if join.using_columns.is_empty() => {
                             node.rows * right.rows
@@ -389,33 +427,145 @@ impl MemExecutor {
                     };
                     let width = node.width + right.width;
                     let total = node.total + node.rows * right.total;
-                    let mut joined =
-                        Node::new("Nested Loop", format!("Nested Loop{suffix}"), rows, width)
-                            .prop("Join Type", json!(kind));
-                    joined.total = total + rows * CPU_TUPLE;
-                    let condition = match &join.condition {
-                        Some(c) => Some(deparse_filter(c, true)),
-                        None if !join.using_columns.is_empty() => Some(format!(
-                            "({})",
-                            join.using_columns
+                    // The hashed equalities (or the condition), and the
+                    // condition checked on each matched pair.
+                    // A right join prints as the swapped left join: its
+                    // condition names the probe side first, as scanned.
+                    let swapped_join = matches!(join.join_type, JoinType::RightOuter);
+                    let (hashed_condition, condition) = match (&hash, &join.condition) {
+                        (Some(plan), _) => {
+                            let mut text = plan
+                                .hash_pairs
                                 .iter()
-                                .map(|c| format!(
-                                    "{}.{c} = {}.{c}",
-                                    relation_name(&node.label_relation()),
-                                    relation_name(
-                                        join.table_alias.as_deref().unwrap_or(&join.table_name)
-                                    )
-                                ))
+                                .map(|(left, right)| {
+                                    if swapped_join {
+                                        format!("({right} = {left})")
+                                    } else {
+                                        format!("({left} = {right})")
+                                    }
+                                })
                                 .collect::<Vec<_>>()
-                                .join(" AND ")
-                        )),
-                        None => None,
+                                .join(" AND ");
+                            if plan.hash_pairs.len() > 1 {
+                                text = format!("({text})");
+                            }
+                            (true, Some(text))
+                        }
+                        (None, Some(c)) => (false, Some(deparse_filter(c, true))),
+                        (None, None) if !join.using_columns.is_empty() => (
+                            false,
+                            Some(format!(
+                                "({})",
+                                join.using_columns
+                                    .iter()
+                                    .map(|c| format!(
+                                        "{}.{c} = {}.{c}",
+                                        relation_name(&node.label_relation()),
+                                        relation_name(
+                                            join.table_alias.as_deref().unwrap_or(&join.table_name)
+                                        )
+                                    ))
+                                    .collect::<Vec<_>>()
+                                    .join(" AND ")
+                            )),
+                        ),
+                        (None, None) => (false, None),
                     };
-                    if let Some(condition) = condition {
-                        joined = joined.detail("Join Filter", condition);
+                    let pair_filter = hash.as_ref().and_then(|plan| plan.join_filter());
+                    let swapped = swapped_join;
+                    let (first, second) = if swapped {
+                        (right, node)
+                    } else {
+                        (node, right)
+                    };
+                    let materialized = !swapped
+                        && crate::session_env::setting("enable_material").as_deref() != Some("off")
+                        && hash.is_none()
+                        && !matches!(second.kind.as_str(), "Index Scan" | "Index Only Scan");
+                    let (label_kind, label) = match (&hash, &join.join_type) {
+                        (Some(_), JoinType::LeftOuter | JoinType::RightOuter) => {
+                            ("Left", "Hash Left Join".to_string())
+                        }
+                        (Some(_), JoinType::FullOuter) => ("Full", "Hash Full Join".to_string()),
+                        (Some(_), _) => ("Inner", "Hash Join".to_string()),
+                        (None, _) => (kind, format!("Nested Loop{suffix}")),
+                    };
+                    let mut joined = Node::new(
+                        if hash.is_some() {
+                            "Hash Join"
+                        } else {
+                            "Nested Loop"
+                        },
+                        label,
+                        rows,
+                        width,
+                    )
+                    .prop("Join Type", json!(label_kind));
+                    joined.total = total + rows * CPU_TUPLE;
+                    // A nested loop chosen with the method disabled says so.
+                    if hash.is_none()
+                        && crate::session_env::setting("enable_nestloop").as_deref() == Some("off")
+                    {
+                        joined = joined.detail("Disabled", "true".to_string());
                     }
-                    joined.children = vec![node, right];
+                    if let Some(condition) = condition {
+                        joined = joined.detail(
+                            if hashed_condition {
+                                "Hash Cond"
+                            } else {
+                                "Join Filter"
+                            },
+                            condition,
+                        );
+                    }
+                    if let Some(filter) = &pair_filter {
+                        joined = joined.detail("Join Filter", deparse_filter(filter, true));
+                    }
+                    // A side's own conditions go on its scan, as
+                    // PostgreSQL pushes them.
+                    let with_side_filter = |mut child: Node, filter: Option<&FilterExpr>| {
+                        let Some(filter) = filter else {
+                            return child;
+                        };
+                        let text = deparse_filter(filter, false);
+                        match child
+                            .details
+                            .iter_mut()
+                            .find(|(name, _, _)| *name == "Filter")
+                        {
+                            Some((_, existing, json)) => {
+                                *existing = format!("({existing} AND {text})");
+                                *json = json!(existing.clone());
+                            }
+                            None => child = child.detail("Filter", text),
+                        }
+                        child
+                    };
+                    let (first, second) = match &hash {
+                        Some(plan) => (
+                            with_side_filter(first, plan.left_filter().as_ref()),
+                            with_side_filter(second, plan.right_filter().as_ref()),
+                        ),
+                        None => (first, second),
+                    };
+                    let mut children = vec![first];
+                    match &hash {
+                        Some(_) => {
+                            let mut hashed = Node::over("Hash", "Hash", vec![second]);
+                            hashed.total = 0.0;
+                            children.push(hashed);
+                        }
+                        None if materialized => {
+                            let mut materialize =
+                                Node::over("Materialize", "Materialize", vec![second]);
+                            materialize.total = 0.0;
+                            children.push(materialize);
+                        }
+                        None => children.push(second),
+                    }
+                    joined.children = children;
                     node = joined;
+                    joined_prefixes.push(right_prefixes[0].clone());
                 }
                 if let (false, Some(f)) = (single, filter) {
                     node = node.detail("Filter", deparse_filter(f, true));
