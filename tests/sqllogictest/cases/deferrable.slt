@@ -1,0 +1,370 @@
+# DEFERRABLE constraints and SET CONSTRAINTS: when the checks run, the
+# errors they raise, and the catalogs. Expectations from PostgreSQL 18.4.
+statement ok
+drop table if exists dp cascade;
+
+statement ok
+drop table if exists dc cascade;
+
+statement ok
+create table dp (a int primary key);
+
+statement ok
+create table dc (a int references dp (a) deferrable initially deferred, b int unique deferrable initially deferred);
+
+# Pending violations wait for COMMIT.
+statement ok
+begin;
+
+statement ok
+insert into dc values (5, 5);
+
+statement ok
+insert into dc values (6, 5);
+
+statement error
+commit;
+
+query I
+select count(*) from dc;
+----
+0
+
+# A parent that arrives later in the same transaction satisfies the key.
+statement ok
+begin;
+
+statement ok
+insert into dc values (1, 1);
+
+statement ok
+insert into dp values (1);
+
+statement ok
+commit;
+
+query I
+select count(*) from dc;
+----
+1
+
+# A missing parent still fails at COMMIT.
+statement ok
+begin;
+
+statement ok
+insert into dc values (9, 9);
+
+statement error
+commit;
+
+# An unresolved duplicate still fails at COMMIT; resolving it first lets
+# the transaction through (the parents may arrive in the same transaction).
+statement ok
+begin;
+
+statement ok
+insert into dc values (2, 2);
+
+statement ok
+insert into dc values (3, 2);
+
+statement ok
+insert into dp values (2), (3);
+
+statement error
+commit;
+
+query I
+select count(*) from dc;
+----
+1
+
+statement ok
+begin;
+
+statement ok
+insert into dc values (2, 2);
+
+statement ok
+insert into dc values (3, 2);
+
+statement ok
+insert into dp values (2), (3);
+
+statement ok
+delete from dc where a = 2;
+
+statement ok
+commit;
+
+query I
+select count(*) from dc;
+----
+2
+
+# A deferrable primary key swaps its values, and still refuses duplicates.
+statement ok
+create table sw (a int primary key deferrable initially deferred, v text);
+
+statement ok
+insert into sw values (1, 'one'), (2, 'two');
+
+statement ok
+begin;
+
+statement ok
+update sw set a = case when a = 1 then 2 else 1 end;
+
+statement ok
+commit;
+
+query IT
+select a, v from sw order by a;
+----
+1	two
+2	one
+
+statement ok
+begin;
+
+statement ok
+insert into sw values (3, 'three');
+
+statement ok
+insert into sw values (3, 'tres');
+
+statement error
+commit;
+
+query I
+select count(*) from sw;
+----
+2
+
+# In autocommit the implicit transaction commits with the statement, so the
+# error surfaces on the statement itself.
+statement error
+insert into sw values (1, 'dup');
+
+statement ok
+delete from sw;
+
+# SET CONSTRAINTS changes the timing of deferrable constraints.
+statement ok
+create table u (a int unique deferrable);
+
+statement ok
+begin;
+
+statement ok
+insert into u values (1);
+
+statement error
+insert into u values (1);
+
+statement ok
+rollback;
+
+statement ok
+begin;
+
+statement ok
+set constraints all deferred;
+
+statement ok
+insert into u values (1);
+
+statement ok
+insert into u values (1);
+
+statement error
+set constraints all immediate;
+
+statement ok
+rollback;
+
+statement ok
+begin;
+
+statement ok
+set constraints u_a_key deferred;
+
+statement ok
+insert into u values (1);
+
+statement ok
+insert into u values (1);
+
+statement error
+commit;
+
+statement ok
+begin;
+
+statement ok
+set constraints u_a_key deferred;
+
+statement ok
+insert into u values (1);
+
+statement ok
+insert into u values (1);
+
+statement error
+set constraints u_a_key immediate;
+
+statement ok
+rollback;
+
+query I
+select count(*) from u;
+----
+0
+
+# The mode resets at the transaction's end.
+statement ok
+begin;
+
+statement ok
+insert into u values (1);
+
+statement error
+insert into u values (1);
+
+statement ok
+rollback;
+
+# A constraint that cannot defer says so; so does a missing one.
+statement ok
+begin;
+
+statement ok
+set constraints u_a_key deferred;
+
+statement ok
+rollback;
+
+statement ok
+create table nd (a int unique);
+
+statement ok
+begin;
+
+statement error
+set constraints nd_a_key deferred;
+
+statement error
+set constraints nosuch deferred;
+
+statement ok
+rollback;
+
+# The deferrable flag reaches the catalogs.
+query TTBB rowsort
+select conname, contype, condeferrable, condeferred from pg_constraint where conrelid = 'dc'::regclass and contype = 'f';
+----
+dc_a_fkey	f	t	t
+
+query TTBB rowsort
+select conname, contype, condeferrable, condeferred from pg_constraint where conrelid = 'dc'::regclass and contype = 'u';
+----
+dc_b_key	u	t	t
+
+query T
+select pg_get_constraintdef(oid) from pg_constraint where conrelid = 'dc'::regclass and contype = 'f';
+----
+FOREIGN KEY (a) REFERENCES dp(a) DEFERRABLE INITIALLY DEFERRED
+
+query T
+select pg_get_constraintdef(oid) from pg_constraint where conrelid = 'dc'::regclass and contype = 'u';
+----
+UNIQUE (b) DEFERRABLE INITIALLY DEFERRED
+
+# ALTER CONSTRAINT changes a foreign key's deferrability.
+statement ok
+drop table if exists al2 cascade;
+
+statement ok
+drop table if exists al1 cascade;
+
+statement ok
+create table al1 (a int primary key);
+
+statement ok
+create table al2 (a int references al1 (a));
+
+query T
+select pg_get_constraintdef(oid) from pg_constraint where conrelid = 'al2'::regclass and contype = 'f';
+----
+FOREIGN KEY (a) REFERENCES al1(a)
+
+statement ok
+alter table al2 alter constraint al2_a_fkey deferrable initially deferred;
+
+query BB
+select condeferrable, condeferred from pg_constraint where conrelid = 'al2'::regclass and contype = 'f';
+----
+t	t
+
+query T
+select pg_get_constraintdef(oid) from pg_constraint where conrelid = 'al2'::regclass and contype = 'f';
+----
+FOREIGN KEY (a) REFERENCES al1(a) DEFERRABLE INITIALLY DEFERRED
+
+statement ok
+alter table al2 alter constraint al2_a_fkey not deferrable;
+
+query BB
+select condeferrable, condeferred from pg_constraint where conrelid = 'al2'::regclass and contype = 'f';
+----
+f	f
+
+statement error
+alter table al1 alter constraint al1_pkey deferrable;
+
+# PostgreSQL's refusals.
+statement error
+insert into u values (1) on conflict (a) do nothing;
+
+statement error
+create table dq (a int references sw (a));
+
+statement ok
+create table dq (a int primary key deferrable);
+
+statement error
+create table dq2 (a int references dq (a));
+
+# SET CONSTRAINTS outside a transaction block only warns.
+statement ok
+set constraints all deferred;
+
+query T
+select 'done' as note;
+----
+done
+
+statement ok
+drop table u;
+
+statement ok
+drop table nd;
+
+statement ok
+drop table dq;
+
+statement ok
+drop table al2;
+
+statement ok
+drop table al1;
+
+statement ok
+drop table dc;
+
+statement ok
+drop table dp;
+
+statement ok
+drop table sw;
