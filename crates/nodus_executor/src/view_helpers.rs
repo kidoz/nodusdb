@@ -50,6 +50,15 @@ impl MemExecutor {
         }
     }
 
+    /// The OID `pg_roles` and friends show for a principal; the bootstrap
+    /// `nodus` is PostgreSQL's 10.
+    pub(crate) fn principal_oid(name: &str) -> i64 {
+        if name == "nodus" {
+            return 10;
+        }
+        Self::stable_oid(&format!("role:{name}"), 30_000)
+    }
+
     pub(crate) fn table_oid(db_name: &str, schema_name: &str, table_name: &str) -> i64 {
         Self::stable_oid(
             &format!("table:{db_name}.{schema_name}.{table_name}"),
@@ -379,6 +388,7 @@ impl MemExecutor {
                 | "pg_timezone_names"
                 | "pg_timezone_abbrevs"
                 | "pg_auth_members"
+                | "pg_db_role_setting"
                 | "pg_tablespace"
                 | "pg_event_trigger"
                 | "pg_extension"

@@ -744,7 +744,7 @@ impl MemExecutor {
                         let mut row = vec![
                             Value::Text(schema_name),
                             Value::Text(t.name.clone()),
-                            Value::Text("nodus".into()),
+                            Value::Text(self.owner_name(t)),
                         ];
                         if materialized {
                             row.extend([
@@ -773,7 +773,7 @@ impl MemExecutor {
                     rows.push(vec![
                         Value::Text(Self::schema_name_by_id(db_name, &schemas, table.schema_id)),
                         Value::Text(table.name.clone()),
-                        Value::Text("nodus".into()),
+                        Value::Text(self.owner_name(table)),
                         Value::Text(crate::functions::format_type_name(Self::pg_type_oid(
                             &state.data_type,
                         ))),
@@ -1154,19 +1154,8 @@ impl MemExecutor {
                     ],
                 ],
             )),
-            // Role membership graph: no role-in-role membership is modeled yet.
-            "pg_auth_members" => Some((
-                Self::virtual_columns(&[
-                    ("oid", "OID"),
-                    ("roleid", "OID"),
-                    ("member", "OID"),
-                    ("grantor", "OID"),
-                    ("admin_option", "BOOL"),
-                    ("inherit_option", "BOOL"),
-                    ("set_option", "BOOL"),
-                ]),
-                Vec::new(),
-            )),
+            "pg_auth_members" => Some(self.pg_auth_members_virtual_table()),
+            "pg_db_role_setting" => Some(self.pg_db_role_setting_virtual_table()),
             // Tablespaces: NodusDB has no user tablespaces, but the two built-in
             // ones always exist in PostgreSQL and some tools assume them.
             "pg_tablespace" => Some((
@@ -2768,21 +2757,34 @@ impl MemExecutor {
             ("rolbypassrls", "BOOL"),
             ("rolconfig", "TEXT[]"),
         ]);
-        let rows = vec![vec![
-            Value::Int(10),
-            Value::Text("nodus".into()),
-            Value::Bool(true),
-            Value::Bool(true),
-            Value::Bool(true),
-            Value::Bool(true),
-            Value::Bool(true),
-            Value::Bool(false),
-            Value::Int(-1),
-            Value::Text("********".into()),
-            Value::Null,
-            Value::Bool(false),
-            Value::Null,
-        ]];
+        let rows = self
+            .principal_rows()
+            .into_iter()
+            .map(|principal| {
+                let attributes = &principal.attributes;
+                vec![
+                    Value::Int(Self::principal_oid(&principal.name)),
+                    Value::Text(principal.name.clone()),
+                    Value::Bool(attributes.superuser),
+                    Value::Bool(attributes.inherit),
+                    Value::Bool(attributes.create_role),
+                    Value::Bool(attributes.create_db),
+                    Value::Bool(attributes.can_login),
+                    Value::Bool(attributes.replication),
+                    Value::Int(i64::from(attributes.connection_limit)),
+                    match &attributes.password {
+                        Some(_) => Value::Text("********".into()),
+                        None => Value::Null,
+                    },
+                    match &attributes.valid_until {
+                        Some(text) => Self::valid_until_value(text),
+                        None => Value::Null,
+                    },
+                    Value::Bool(attributes.bypass_rls),
+                    Self::role_settings(&attributes.settings),
+                ]
+            })
+            .collect();
         (cols, rows)
     }
 
@@ -2798,18 +2800,144 @@ impl MemExecutor {
             ("valuntil", "TIMESTAMPTZ"),
             ("useconfig", "TEXT[]"),
         ]);
-        let rows = vec![vec![
-            Value::Text("nodus".into()),
-            Value::Int(10),
-            Value::Bool(true),
-            Value::Bool(true),
-            Value::Bool(false),
-            Value::Bool(false),
-            Value::Text("********".into()),
-            Value::Null,
-            Value::Null,
-        ]];
+        let rows = self
+            .principal_rows()
+            .into_iter()
+            .filter(|principal| principal.attributes.can_login)
+            .map(|principal| {
+                let attributes = &principal.attributes;
+                vec![
+                    Value::Text(principal.name.clone()),
+                    Value::Int(Self::principal_oid(&principal.name)),
+                    Value::Bool(attributes.create_db),
+                    Value::Bool(attributes.superuser),
+                    Value::Bool(attributes.replication),
+                    Value::Bool(attributes.bypass_rls),
+                    match &attributes.password {
+                        Some(_) => Value::Text("********".into()),
+                        None => Value::Null,
+                    },
+                    match &attributes.valid_until {
+                        Some(text) => Self::valid_until_value(text),
+                        None => Value::Null,
+                    },
+                    Self::role_settings(&attributes.settings),
+                ]
+            })
+            .collect();
         (cols, rows)
+    }
+
+    /// `pg_auth_members`: the role-membership edges, one row each.
+    pub(crate) fn pg_auth_members_virtual_table(&self) -> (Vec<ColumnDescriptor>, Vec<Vec<Value>>) {
+        let cols = Self::virtual_columns(&[
+            ("oid", "OID"),
+            ("roleid", "OID"),
+            ("member", "OID"),
+            ("grantor", "OID"),
+            ("admin_option", "BOOL"),
+            ("inherit_option", "BOOL"),
+            ("set_option", "BOOL"),
+        ]);
+        let principals = self.principal_rows();
+        let oid_of = |id: &nodus_catalog::PrincipalId| {
+            principals
+                .iter()
+                .find(|principal| principal.id == *id)
+                .map(|principal| Self::principal_oid(&principal.name))
+        };
+        let mut rows = Vec::new();
+        for (role, member, admin_option, grantor) in self
+            .catalog_reader
+            .list_role_memberships()
+            .unwrap_or_default()
+        {
+            let (Some(role_oid), Some(member_oid)) = (oid_of(&role), oid_of(&member)) else {
+                continue;
+            };
+            rows.push(vec![
+                Value::Int(Self::stable_oid(
+                    &format!("authmember:{role_oid}:{member_oid}"),
+                    40_000,
+                )),
+                Value::Int(role_oid),
+                Value::Int(member_oid),
+                Value::Int(grantor.and_then(|g| oid_of(&g)).unwrap_or(10)),
+                Value::Bool(admin_option),
+                Value::Bool(true),
+                Value::Bool(true),
+            ]);
+        }
+        (cols, rows)
+    }
+
+    /// `pg_db_role_setting`: the per-role settings `ALTER ROLE ... SET`
+    /// recorded. A role's settings apply cluster-wide (`setdatabase` 0).
+    pub(crate) fn pg_db_role_setting_virtual_table(
+        &self,
+    ) -> (Vec<ColumnDescriptor>, Vec<Vec<Value>>) {
+        let cols = Self::virtual_columns(&[
+            ("setrole", "OID"),
+            ("setdatabase", "OID"),
+            ("setconfig", "TEXT[]"),
+        ]);
+        let rows = self
+            .principal_rows()
+            .into_iter()
+            .filter(|principal| !principal.attributes.settings.is_empty())
+            .map(|principal| {
+                vec![
+                    Value::Int(Self::principal_oid(&principal.name)),
+                    Value::Int(0),
+                    Self::role_settings(&principal.attributes.settings),
+                ]
+            })
+            .collect();
+        (cols, rows)
+    }
+
+    /// Every principal, `nodus` first, then by OID (`pg_roles`' order).
+    /// `PUBLIC` is a pseudo-role PostgreSQL's role catalogs do not list.
+    fn principal_rows(&self) -> Vec<nodus_catalog::PrincipalDescriptor> {
+        let mut principals = self.catalog_reader.list_principals().unwrap_or_default();
+        principals
+            .retain(|principal| principal.principal_type != nodus_catalog::PrincipalType::Public);
+        principals.sort_by_key(|principal| Self::principal_oid(&principal.name));
+        principals
+    }
+
+    /// `VALID UNTIL` as PostgreSQL shows it: the instant in the session's
+    /// `TimeZone`.
+    fn valid_until_value(text: &str) -> Value {
+        use crate::datetime::{Kind, Temporal};
+        let Some(temporal) = Temporal::parse_as(text, Kind::TimestampTz) else {
+            return Value::Text(text.to_string());
+        };
+        match temporal {
+            Temporal::TimestampTz(utc) => {
+                let (local, offset) = crate::timezone::to_session_local(utc);
+                Value::Text(format!(
+                    "{}{}",
+                    crate::value::format_timestamp(local, false),
+                    crate::timezone::offset_text(offset)
+                ))
+            }
+            other => other.to_value(),
+        }
+    }
+
+    /// A role's settings as the `TEXT[]` form the catalogs show
+    /// (`{search_path=public}`), NULL when it has none.
+    fn role_settings(settings: &[(String, String)]) -> Value {
+        if settings.is_empty() {
+            return Value::Null;
+        }
+        Value::Array(
+            settings
+                .iter()
+                .map(|(name, value)| Value::Text(format!("{name}={value}")))
+                .collect(),
+        )
     }
 
     pub(crate) fn pg_tables_virtual_table(
@@ -2840,7 +2968,7 @@ impl MemExecutor {
                 vec![
                     Value::Text(Self::schema_name_by_id(db_name, schemas, table.schema_id)),
                     Value::Text(table.name.clone()),
-                    Value::Text("nodus".into()),
+                    Value::Text(self.owner_name(table)),
                     Value::Null,
                     Value::Bool(!table.indexes.is_empty()),
                     Value::Bool(false),
@@ -3140,6 +3268,9 @@ impl MemExecutor {
         }
         let found = match kind {
             "REGCLASS" => catalog.and_then(|c| Self::relation_oid(c.as_ref(), &name)),
+            "REGROLE" => catalog
+                .and_then(|c| c.get_principal_by_name(name.trim().trim_matches('"')).ok())
+                .map(|p| Self::principal_oid(&p.name)),
             "REGNAMESPACE" => catalog
                 .and_then(|c| c.get_schema("default", name.trim().trim_matches('"')).ok())
                 .map(|s| Self::schema_oid("default", &s.name)),
@@ -3147,6 +3278,7 @@ impl MemExecutor {
         };
         found.map(Value::Int).ok_or_else(|| match kind {
             "REGCLASS" => format!("relation \"{name}\" does not exist"),
+            "REGROLE" => format!("role \"{name}\" does not exist"),
             "REGNAMESPACE" => format!("schema \"{name}\" does not exist"),
             _ => format!("type \"{name}\" does not exist"),
         })
@@ -3204,6 +3336,12 @@ impl MemExecutor {
             "REGDICTIONARY" => crate::ts_dict::dictionary_by_oid(oid)
                 .map(|config| config.dictionary_name().to_string()),
             "REGTYPE" => Some(crate::functions::format_type_name(oid)),
+            "REGROLE" => catalog
+                .list_principals()
+                .ok()?
+                .into_iter()
+                .find(|p| Self::principal_oid(&p.name) == oid)
+                .map(|p| p.name),
             "REGNAMESPACE" => schemas
                 .iter()
                 .find(|s| Self::schema_oid(db, &s.name) == oid)
@@ -3762,6 +3900,10 @@ const PG_CLASS_OID: i64 = 1259;
 /// The system catalogs' fixed OIDs, as `'pg_class'::regclass` gives them.
 const SYSTEM_CATALOG_OIDS: &[(&str, i64)] = &[
     ("pg_class", PG_CLASS_OID),
+    ("pg_roles", 12000),
+    ("pg_user", 12014),
+    ("pg_auth_members", 1261),
+    ("pg_db_role_setting", 2964),
     ("pg_type", 1247),
     ("pg_attribute", 1249),
     ("pg_proc", 1255),

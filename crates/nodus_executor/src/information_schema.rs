@@ -38,6 +38,9 @@ impl MemExecutor {
             }
             "indexes" => Some(self.information_schema_indexes(db_name, &schemas, &tables)),
             "schemata" => Some(self.information_schema_schemata(db_name, &schemas)),
+            "table_privileges" => {
+                Some(self.information_schema_table_privileges(db_name, &schemas, &tables))
+            }
             "views" => {
                 let rows = tables
                     .iter()
@@ -700,6 +703,123 @@ impl MemExecutor {
         (cols, rows)
     }
 
+    /// `information_schema.table_privileges`: every privilege on every
+    /// table, the owner's implicit ones included. PostgreSQL's view walks a
+    /// relation's ACL backwards, so the owner's rows come last.
+    pub(crate) fn information_schema_table_privileges(
+        &self,
+        db_name: &str,
+        schemas: &[nodus_catalog::SchemaDescriptor],
+        tables: &[nodus_catalog::TableDescriptor],
+    ) -> (Vec<ColumnDescriptor>, Vec<Vec<Value>>) {
+        let cols = Self::virtual_columns(&[
+            ("grantor", "TEXT"),
+            ("grantee", "TEXT"),
+            ("table_catalog", "TEXT"),
+            ("table_schema", "TEXT"),
+            ("table_name", "TEXT"),
+            ("privilege_type", "TEXT"),
+            ("is_grantable", "TEXT"),
+            ("with_hierarchy", "TEXT"),
+        ]);
+        // The relation privileges, in the (reversed) order the view's rows
+        // come out in.
+        const PRIVILEGES: &[&str] = &[
+            "TRIGGER",
+            "REFERENCES",
+            "TRUNCATE",
+            "DELETE",
+            "UPDATE",
+            "SELECT",
+            "INSERT",
+        ];
+        let grants = self.catalog_reader.list_grants().unwrap_or_default();
+        let order = |privilege: &str| {
+            PRIVILEGES
+                .iter()
+                .position(|p| *p == privilege)
+                .unwrap_or(PRIVILEGES.len())
+        };
+        let mut tables: Vec<&nodus_catalog::TableDescriptor> = tables
+            .iter()
+            .filter(|table| !crate::sequences::is_sequence(table))
+            .collect();
+        tables.sort_by_key(|table| table.created_at);
+        let mut rows = Vec::new();
+        for table in tables {
+            let schema = Self::schema_name_by_id(db_name, schemas, table.schema_id);
+            let owner = self.owner_name(table);
+            // A grant's grantee and grantor; `PUBLIC` as PostgreSQL shows
+            // it.
+            let name_of = |id: nodus_catalog::PrincipalId| {
+                self.principal_name(id).map_or_else(
+                    || "nodus".to_string(),
+                    |name| {
+                        if name == nodus_catalog::PUBLIC_ROLE {
+                            "PUBLIC".to_string()
+                        } else {
+                            name
+                        }
+                    },
+                )
+            };
+            // Each grantee's privileges (and grant options), in the order
+            // the grantees first appear: the output reverses that.
+            let mut entries: Vec<(String, String, Vec<(String, bool)>)> = Vec::new();
+            for grant in grants
+                .iter()
+                .filter(|grant| grant.resource == nodus_catalog::ResourceRef::Table(table.id))
+            {
+                let grantee = name_of(grant.principal_id);
+                if grantee == owner {
+                    // The owner's implicit privileges stand in for it.
+                    continue;
+                }
+                let grantor = grant
+                    .grantor
+                    .map_or_else(|| owner.clone(), |id| name_of(id));
+                let declared = grant.privilege.to_ascii_uppercase();
+                let held: Vec<String> = if declared == "ALL" {
+                    PRIVILEGES.iter().map(|p| (*p).to_string()).collect()
+                } else {
+                    vec![declared]
+                };
+                match entries.iter_mut().find(|(_, name, _)| *name == grantee) {
+                    Some((_, _, list)) => {
+                        list.extend(held.into_iter().map(|p| (p, grant.grantable)))
+                    }
+                    None => entries.push((
+                        grantor,
+                        grantee,
+                        held.into_iter().map(|p| (p, grant.grantable)).collect(),
+                    )),
+                }
+            }
+            let mut push = |grantor: &str, grantee: &str, privilege: &str, grantable: bool| {
+                rows.push(vec![
+                    Value::Text(grantor.to_string()),
+                    Value::Text(grantee.to_string()),
+                    Value::Text(db_name.to_string()),
+                    Value::Text(schema.clone()),
+                    Value::Text(table.name.clone()),
+                    Value::Text(privilege.to_string()),
+                    Value::Text(if grantable { "YES" } else { "NO" }.to_string()),
+                    Value::Text(if privilege == "SELECT" { "YES" } else { "NO" }.to_string()),
+                ]);
+            };
+            for (grantor, grantee, mut held) in entries.into_iter().rev() {
+                held.sort_by_key(|(privilege, _)| order(privilege));
+                for (privilege, grantable) in held {
+                    push(&grantor, &grantee, &privilege, grantable);
+                }
+            }
+            for privilege in PRIVILEGES {
+                push(&owner, &owner, privilege, true);
+            }
+        }
+        (cols, rows)
+    }
+
     pub(crate) fn information_schema_schemata(
         &self,
         db_name: &str,
@@ -724,10 +844,16 @@ impl MemExecutor {
         let rows = names
             .into_iter()
             .map(|name| {
+                let owner = schemas
+                    .iter()
+                    .find(|schema| schema.name == name)
+                    .and_then(|schema| schema.owner_role_id)
+                    .and_then(|owner| self.principal_name(nodus_catalog::PrincipalId(owner.0)))
+                    .unwrap_or_else(|| "nodus".to_string());
                 vec![
                     Value::Text(db_name.into()),
                     Value::Text(name),
-                    Value::Text("nodus".into()),
+                    Value::Text(owner),
                     Value::Null,
                     Value::Null,
                     Value::Null,

@@ -1570,6 +1570,8 @@ mod phase2_tests;
 #[cfg(test)]
 mod phase3_tests;
 #[cfg(test)]
+mod role_tests;
+#[cfg(test)]
 mod session_tests;
 #[cfg(test)]
 mod sql_feature_tests;
