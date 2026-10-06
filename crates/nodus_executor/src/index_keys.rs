@@ -535,20 +535,17 @@ pub(crate) fn conjuncts(
     filter: &crate::plan_types::FilterExpr,
 ) -> Vec<&crate::plan_types::FilterExpr> {
     use crate::plan_types::FilterExpr;
-    let mut out = Vec::new();
-    let mut current = Some(filter);
-    while let Some(filter) = current {
+    fn walk<'a>(filter: &'a FilterExpr, out: &mut Vec<&'a FilterExpr>) {
         match filter {
             FilterExpr::And(left, right) => {
-                out.push(&**left);
-                current = Some(right);
+                walk(left, out);
+                walk(right, out);
             }
-            other => {
-                out.push(other);
-                current = None;
-            }
+            other => out.push(other),
         }
     }
+    let mut out = Vec::new();
+    walk(filter, &mut out);
     out
 }
 

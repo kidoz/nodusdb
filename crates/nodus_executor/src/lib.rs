@@ -39,6 +39,7 @@ mod geometric;
 mod index_keys;
 mod information_schema;
 mod inheritance;
+mod joins;
 mod json_text;
 mod jsonpath;
 mod largeobjects;

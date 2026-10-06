@@ -10,6 +10,32 @@ use chrono::Utc;
 use nodus_catalog::{ColumnDescriptor, DescriptorState};
 use nodus_storage_api::{KeyRange, KvEngine};
 
+/// The keys a hash join hashes: each side's positions in its own row, the
+/// conditions one side applies alone, and the ones checked per matched
+/// pair.
+struct HashJoinKeys {
+    left_positions: Vec<usize>,
+    right_positions: Vec<usize>,
+    left_filter: Option<FilterExpr>,
+    right_filter: Option<FilterExpr>,
+    join_filter: Option<FilterExpr>,
+}
+
+/// A row's hash key over `positions`: the values' canonical text, joined;
+/// `None` when any is NULL (which never matches, as `=` never does).
+fn hash_key(row: &[Value], positions: &[usize]) -> Option<String> {
+    let mut key = String::new();
+    for position in positions {
+        let value = row.get(*position)?;
+        if *value == Value::Null {
+            return None;
+        }
+        key.push_str(&render(&crate::value::key_form(value)));
+        key.push('\u{1}');
+    }
+    Some(key)
+}
+
 impl MemExecutor {
     /// Runs a `WITH RECURSIVE` CTE to a fixpoint: execute the seed once, then
     /// repeatedly run the recursive term against the previous step's rows (the
@@ -110,6 +136,73 @@ impl MemExecutor {
             bindings.push(crate::cte_scope::bind(&name, out));
         }
         Ok(bindings)
+    }
+
+    /// The keys a hash join hashes, when the join's condition has
+    /// equalities between its sides and the session allows one. `None`
+    /// falls back to the nested loop.
+    fn hash_join_keys(
+        &self,
+        join: &Join,
+        named_eq_pairs: &Option<Vec<(String, usize, usize)>>,
+        left_names: &[String],
+        right_names: &[String],
+    ) -> Result<Option<HashJoinKeys>> {
+        if crate::session_env::setting("enable_hashjoin").as_deref() == Some("off") {
+            return Ok(None);
+        }
+        // A `USING` / `NATURAL` join hashes its named columns.
+        if let Some(pairs) = named_eq_pairs
+            && !pairs.is_empty()
+        {
+            return Ok(Some(HashJoinKeys {
+                left_positions: pairs.iter().map(|(_, l, _)| *l).collect(),
+                right_positions: pairs
+                    .iter()
+                    .map(|(_, _, r)| r.saturating_sub(left_names.len()))
+                    .collect(),
+                left_filter: None,
+                right_filter: None,
+                join_filter: None,
+            }));
+        }
+        let qualifiers = |names: &[String]| -> Vec<String> {
+            let mut out: Vec<String> = Vec::new();
+            for name in names {
+                if let Some((qualifier, _)) = name.rsplit_once('.')
+                    && !out.iter().any(|q| q == qualifier)
+                {
+                    out.push(qualifier.to_string());
+                }
+            }
+            out
+        };
+        let left_prefixes = qualifiers(left_names);
+        let right_prefixes = qualifiers(right_names);
+        let left_refs: Vec<&str> = left_prefixes.iter().map(String::as_str).collect();
+        let right_refs: Vec<&str> = right_prefixes.iter().map(String::as_str).collect();
+        let Some(plan) = crate::joins::hash_plan(join.condition.as_ref(), &left_refs, &right_refs)
+        else {
+            return Ok(None);
+        };
+        let position = |names: &[String], name: &String| names.iter().position(|n| n == name);
+        let mut left_positions = Vec::new();
+        let mut right_positions = Vec::new();
+        for (left, right) in &plan.hash_pairs {
+            let (Some(l), Some(r)) = (position(left_names, left), position(right_names, right))
+            else {
+                return Ok(None);
+            };
+            left_positions.push(l);
+            right_positions.push(r);
+        }
+        Ok(Some(HashJoinKeys {
+            left_positions,
+            right_positions,
+            left_filter: plan.left_filter(),
+            right_filter: plan.right_filter(),
+            join_filter: plan.join_filter(),
+        }))
     }
 
     /// The leading column a filter bounds, with its bounds: the first
@@ -892,37 +985,114 @@ impl MemExecutor {
             }
             let mut next_rows = Vec::new();
             let mut right_matched = vec![false; j_rows.len()];
-            for r1 in &stored_rows {
-                let mut matched = false;
-                for (j_idx, r2) in j_rows.iter().enumerate() {
-                    let mut combined_row = r1.clone();
-                    combined_row.extend(r2.clone());
-                    let is_match = match &named_eq_pairs {
-                        Some(pairs) => pairs.iter().all(|(_, l, r)| {
-                            crate::value::values_equal(&combined_row[*l], &combined_row[*r])
-                        }),
-                        None => self
-                            .eval_filter(
-                                ctx,
-                                &combined_row,
-                                &combined_cols,
-                                &combined_desc,
-                                join.condition.as_ref(),
-                            )
-                            .unwrap_or(false),
-                    };
-                    if is_match {
-                        next_rows.push(combined_row);
-                        matched = true;
-                        right_matched[j_idx] = true;
+            // The condition's equalities between the sides are hashed: each
+            // left row probes the right side's table. The rows keep the
+            // nested loop's order (the right rows in their own order).
+            let hashed = self.hash_join_keys(join, &named_eq_pairs, &col_names, &j_col_names)?;
+            match &hashed {
+                Some(hash) => {
+                    let mut table: std::collections::HashMap<String, Vec<(usize, Vec<Value>)>> =
+                        std::collections::HashMap::new();
+                    for (j_idx, r2) in j_rows.iter().enumerate() {
+                        if let Some(filter) = &hash.right_filter
+                            && !self
+                                .eval_filter(ctx, r2, &j_col_names, &j_cols, Some(filter))
+                                .unwrap_or(false)
+                        {
+                            continue;
+                        }
+                        let Some(key) = hash_key(r2, &hash.right_positions) else {
+                            continue;
+                        };
+                        table.entry(key).or_default().push((j_idx, r2.clone()));
+                    }
+                    for r1 in &stored_rows {
+                        if let Some(filter) = &hash.left_filter
+                            && !self
+                                .eval_filter(ctx, r1, &col_names, &joined_columns, Some(filter))
+                                .unwrap_or(false)
+                        {
+                            continue;
+                        }
+                        let mut matched = false;
+                        if let Some(key) = hash_key(r1, &hash.left_positions) {
+                            for (j_idx, r2) in table.get(&key).into_iter().flatten() {
+                                // The hash may collide: the keys must be equal.
+                                if !hash
+                                    .left_positions
+                                    .iter()
+                                    .zip(&hash.right_positions)
+                                    .all(|(l, r)| crate::value::values_equal(&r1[*l], &r2[*r]))
+                                {
+                                    continue;
+                                }
+                                let mut combined_row = r1.clone();
+                                combined_row.extend(r2.clone());
+                                if let Some(filter) = &hash.join_filter
+                                    && !self
+                                        .eval_filter(
+                                            ctx,
+                                            &combined_row,
+                                            &combined_cols,
+                                            &combined_desc,
+                                            Some(filter),
+                                        )
+                                        .unwrap_or(false)
+                                {
+                                    continue;
+                                }
+                                next_rows.push(combined_row);
+                                matched = true;
+                                right_matched[*j_idx] = true;
+                            }
+                        }
+                        if !matched
+                            && matches!(join.join_type, JoinType::LeftOuter | JoinType::FullOuter)
+                        {
+                            let mut combined_row = r1.clone();
+                            // Left or Full join requires filling the right side with NULLs
+                            let num_nulls = j_cols.len();
+                            combined_row.extend(vec![Value::Null; num_nulls]);
+                            next_rows.push(combined_row);
+                        }
                     }
                 }
-                if !matched && matches!(join.join_type, JoinType::LeftOuter | JoinType::FullOuter) {
-                    let mut combined_row = r1.clone();
-                    // Left or Full join requires filling the right side with NULLs
-                    let num_nulls = j_cols.len();
-                    combined_row.extend(vec![Value::Null; num_nulls]);
-                    next_rows.push(combined_row);
+                None => {
+                    for r1 in &stored_rows {
+                        let mut matched = false;
+                        for (j_idx, r2) in j_rows.iter().enumerate() {
+                            let mut combined_row = r1.clone();
+                            combined_row.extend(r2.clone());
+                            let is_match = match &named_eq_pairs {
+                                Some(pairs) => pairs.iter().all(|(_, l, r)| {
+                                    crate::value::values_equal(&combined_row[*l], &combined_row[*r])
+                                }),
+                                None => self
+                                    .eval_filter(
+                                        ctx,
+                                        &combined_row,
+                                        &combined_cols,
+                                        &combined_desc,
+                                        join.condition.as_ref(),
+                                    )
+                                    .unwrap_or(false),
+                            };
+                            if is_match {
+                                next_rows.push(combined_row);
+                                matched = true;
+                                right_matched[j_idx] = true;
+                            }
+                        }
+                        if !matched
+                            && matches!(join.join_type, JoinType::LeftOuter | JoinType::FullOuter)
+                        {
+                            let mut combined_row = r1.clone();
+                            // Left or Full join requires filling the right side with NULLs
+                            let num_nulls = j_cols.len();
+                            combined_row.extend(vec![Value::Null; num_nulls]);
+                            next_rows.push(combined_row);
+                        }
+                    }
                 }
             }
             if matches!(join.join_type, JoinType::RightOuter | JoinType::FullOuter) {

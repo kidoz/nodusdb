@@ -457,6 +457,48 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
         });
     }
 
+    // With one comma-join, a `WHERE` condition over both sides is the
+    // join's own (`Join Filter` / `Hash Cond`), as PostgreSQL plans it.
+    let mut filter = parse_predicates(&select.selection, params)?;
+    if joins.len() == 1
+        && joins[0].table_fn.is_none()
+        && joins[0].lateral.is_none()
+        && joins[0].condition.is_none()
+        && joins[0].using_columns.is_empty()
+        && !joins[0].natural
+        && matches!(joins[0].join_type, JoinType::Cross)
+        && let Some(filter_expr) = &filter
+    {
+        let left = table_alias.as_deref().unwrap_or(&table_name).to_string();
+        let right = joins[0]
+            .table_alias
+            .as_deref()
+            .unwrap_or(&joins[0].table_name)
+            .to_string();
+        let mut hoisted = Vec::new();
+        let mut remaining = Vec::new();
+        for conjunct in crate::index_keys::conjuncts(filter_expr) {
+            let mut refs = Vec::new();
+            crate::filter_eval::filter_column_refs(conjunct, &mut refs);
+            let on = |prefix: &str| {
+                refs.iter().any(|reference| {
+                    reference
+                        .rsplit_once('.')
+                        .is_some_and(|(qualifier, _)| qualifier == prefix)
+                })
+            };
+            let qualified = refs.iter().all(|reference| reference.contains('.'));
+            if qualified && on(&left) && on(&right) {
+                hoisted.push(conjunct.clone());
+            } else {
+                remaining.push(conjunct.clone());
+            }
+        }
+        if !hoisted.is_empty() {
+            joins[0].condition = crate::joins::conjunction(&hoisted);
+            filter = crate::joins::conjunction(&remaining);
+        }
+    }
     Ok(LogicalPlan::Select {
         only,
         ctes,
@@ -465,7 +507,7 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
         joins,
         projection,
         group_by,
-        filter: parse_predicates(&select.selection, params)?,
+        filter,
         having,
         grouping_sets,
         order_by: Vec::new(),
