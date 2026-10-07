@@ -1,0 +1,85 @@
+# cargo-deny configuration for the NodusDB workspace.
+#
+# Run from the repository root:
+#     cargo deny check
+# The separate fuzz workspace shares this file:
+#     cargo deny --manifest-path tests/fuzz/Cargo.toml check
+#
+# The three accepted unmaintained advisories below are deliberate, tracked
+# holds; anything new fails the gate. See the dependency-maintainer skill for
+# the surrounding policy.
+
+[graph]
+# Check every platform's dependency set, not just the host, so that
+# target-specific advisories (e.g. wasm, uefi) surface on any machine.
+targets = []
+
+[advisories]
+version = 2
+# Ignored advisories are accepted, documented holds: this list is the
+# authoritative record, so keep the reasons current when a hold is lifted.
+unmaintained = "all"
+yanked = "warn"
+ignore = [
+    # NodusDB holds bincode at 2.x on purpose: 3.0.0 on crates.io is only a
+    # compile_error! tombstone. bincode 1.3.3 also arrives via madsim, which
+    # cannot be moved. Revisit when a real bincode 3.x lands.
+    { id = "RUSTSEC-2025-0141", reason = "bincode 2.x is a deliberate hold; 3.0.0 is a compile_error! tombstone, and madsim pulls 1.3" },
+    # paste is a transitive proc-macro of porcupine-rs, a test-only
+    # linearizability checker used by the distributed tests. No maintained
+    # release of porcupine-rs exists without it yet.
+    { id = "RUSTSEC-2024-0436", reason = "paste is a test-only transitive dep via porcupine-rs; no maintained replacement path yet" },
+    # rustls-pemfile is used by nodus_server to load TLS certificates.
+    # The advisory has no safe upgrade; the documented migration is to the
+    # PemObject trait in rustls-pki-types. Tracked as a follow-up; the
+    # tls_handshake compatibility test gates that change.
+    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile has no safe upgrade; migration to rustls-pki-types PemObject is a tracked follow-up" },
+]
+
+[licenses]
+version = 2
+# Permissive allow-list only. Anything copyleft must be added deliberately as
+# a per-crate exception below.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    # ar_archive_writer (build dependency chain of sqlparser via psm/stacker)
+    # carries this as its sole license; the exception is permissive.
+    "Apache-2.0 WITH LLVM-exception",
+    "ISC",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Zlib",
+    "Unicode-3.0",
+    "Unlicense",
+    "CC0-1.0",
+    "MIT-0",
+    "CDLA-Permissive-2.0",
+    "BSL-1.0",
+]
+
+# MPL-2.0 is file-level copyleft and acceptable for an unmodified dependency,
+# but scoped to the single crate that needs it: a new MPL-2.0 dependency
+# should fail the gate until reviewed. x509-certificate is used unmodified
+# via pgwire's certificate handling.
+[[licenses.exceptions]]
+name = "x509-certificate"
+allow = ["MPL-2.0"]
+
+[bans]
+# The tree legitimately carries duplicate versions (base64, bincode, itertools,
+# syn, thiserror, ...). Review duplicates manually when bumping dependencies
+# rather than failing the gate on them.
+multiple-versions = "allow"
+# Wildcard version requirements are denied for registry dependencies, but
+# path dependencies on unpublished workspace members deliberately omit
+# versions throughout this repository.
+wildcards = "deny"
+allow-wildcard-paths = true
+highlight = "all"
+
+[sources]
+# Dependencies must come from crates.io; no git sources or unknown registries.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
