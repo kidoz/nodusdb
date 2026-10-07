@@ -1,0 +1,193 @@
+# Uncorrelated subqueries: a one-time subquery is an `InitPlan` (a bare
+# `EXISTS` behind a `Result` node's one-time filter, a scalar read once),
+# and a set comparison the executor hashes is a `hashed SubPlan` — both
+# evaluated once per statement, as PostgreSQL does. `= ANY`/`IN` over an
+# uncorrelated subquery is a semi join, as in `semi_join.slt`. Plans and
+# numbers are from PostgreSQL 18.4.
+
+statement ok
+drop table if exists u1 cascade;
+
+statement ok
+drop table if exists u2 cascade;
+
+statement ok
+create table u1 (a int, b text);
+
+statement ok
+create table u2 (a int, b text);
+
+statement ok
+insert into u1 select g, 'x' || g from generate_series(1, 20) g;
+
+statement ok
+insert into u2 select g, 'y' || g from generate_series(1, 10) g;
+
+statement ok
+analyze u1;
+
+statement ok
+analyze u2;
+
+# A bare uncorrelated `EXISTS` filters the whole plan once.
+query T
+explain (costs off) select * from u1 where exists (select 1 from u2);
+----
+Result
+  One-Time Filter: (InitPlan 1).col1
+  InitPlan 1
+    ->  Seq Scan on u2
+  ->  Seq Scan on u1
+
+
+query T
+explain (costs off) select * from u1 where not exists (select 1 from u2);
+----
+Result
+  One-Time Filter: (NOT (InitPlan 1).col1)
+  InitPlan 1
+    ->  Seq Scan on u2
+  ->  Seq Scan on u1
+
+
+# With other conditions, the rest stays on the scan.
+query T
+explain (costs off) select * from u1 where exists (select 1 from u2 where u2.a = 5) and b = 'x5';
+----
+Result
+  One-Time Filter: (InitPlan 1).col1
+  InitPlan 1
+    ->  Seq Scan on u2
+          Filter: (a = 5)
+  ->  Seq Scan on u1
+        Filter: (b = 'x5'::text)
+
+
+# `IN` and `= ANY` over an uncorrelated subquery are semi joins; with a
+# comparison other than equality the join is a nested loop.
+query T
+explain (costs off) select * from u1 where a in (select a from u2);
+----
+Hash Semi Join
+  Hash Cond: (u1.a = u2.a)
+  ->  Seq Scan on u1
+  ->  Hash
+        ->  Seq Scan on u2
+
+
+query T
+explain (costs off) select * from u1 where a = any (select a from u2);
+----
+Hash Semi Join
+  Hash Cond: (u1.a = u2.a)
+  ->  Seq Scan on u1
+  ->  Hash
+        ->  Seq Scan on u2
+
+
+query T
+explain (costs off) select * from u1 where a > any (select a from u2);
+----
+Nested Loop Semi Join
+  Join Filter: (u1.a > u2.a)
+  ->  Seq Scan on u1
+  ->  Materialize
+        ->  Seq Scan on u2
+
+
+# `ALL` reads the whole subquery, materialized.
+query T
+explain (costs off) select * from u1 where a > all (select a from u2);
+----
+Seq Scan on u1
+  Filter: (ALL (a > (SubPlan 1).col1))
+  SubPlan 1
+    ->  Materialize
+          ->  Seq Scan on u2
+
+
+# A scalar subquery is a one-time `InitPlan`.
+query T
+explain (costs off) select * from u1 where b = (select max(b) from u2);
+----
+Seq Scan on u1
+  Filter: (b = (InitPlan 1).col1)
+  InitPlan 1
+    ->  Aggregate
+          ->  Seq Scan on u2
+
+
+query T
+explain (costs off) select a, (select count(*) from u2) from u1;
+----
+Seq Scan on u1
+  InitPlan 1
+    ->  Aggregate
+          ->  Seq Scan on u2
+
+
+# Two subqueries are numbered in the order PostgreSQL reaches them, the
+# select list first. (PostgreSQL renames the second scan of a relation
+# whose name it repeats — `u2 u2_1`; NodusDB leaves both as written.)
+query T
+explain (costs off) select a, (select max(b) from u2) from u1 where b = (select min(b) from u2);
+----
+Seq Scan on u1
+  Filter: (b = (InitPlan 2).col1)
+  InitPlan 1
+    ->  Aggregate
+          ->  Seq Scan on u2
+  InitPlan 2
+    ->  Aggregate
+          ->  Seq Scan on u2
+
+
+# A correlated scalar subquery runs with each row's values.
+query T
+explain (costs off) select * from u1 where b = (select max(b) from u2 where u2.a = u1.a);
+----
+Seq Scan on u1
+  Filter: (b = (SubPlan 1))
+  SubPlan 1
+    ->  Aggregate
+          ->  Seq Scan on u2
+                Filter: (a = u1.a)
+
+
+# The results are the same whether the subquery runs once or per row.
+query T
+select count(*) from u1 where exists (select 1 from u2 where u2.a = 5);
+----
+20
+
+
+query T
+select count(*) from u1 where not exists (select 1 from u2);
+----
+0
+
+
+query T
+select count(*) from u1 where a in (select a from u2);
+----
+10
+
+
+query T
+select count(*) from u1 where a > all (select a from u2);
+----
+10
+
+
+query T
+select min(u1.b), (select max(b) from u2) from u1;
+----
+x1	y9
+
+
+query T
+select count(*) from u1 where b = (select max(b) from u2 where u2.a = u1.a);
+----
+0
+
+
