@@ -304,9 +304,9 @@ impl MemExecutor {
                 }
                 // The subquery yields a single scalar; coerce it to the left
                 // column's type so comparison agrees (e.g. text "40" vs int 40).
-                // Outer references are substituted first (correlation).
-                let correlated = self.correlate_subplan(subquery, row, col_names);
-                let out = self.run_subquery(ctx, correlated)?;
+                // Outer references are substituted first (correlation); an
+                // uncorrelated subquery is evaluated once.
+                let out = self.run_subplan(ctx, subquery, row, col_names)?;
                 if out.rows.len() > 1 {
                     crate::eval_error::raise(
                         "more than one row returned by a subquery used as an expression",
@@ -421,8 +421,7 @@ impl MemExecutor {
 
                 // Blocking execution; outer references in the subquery are
                 // substituted with this row's values first (correlation).
-                let correlated = self.correlate_subplan(subquery, row, col_names);
-                let out = self.run_subquery(ctx, correlated)?;
+                let out = self.run_subplan(ctx, subquery, row, col_names)?;
 
                 let mut matches = false;
                 let mut found_null = false;
@@ -481,9 +480,12 @@ impl MemExecutor {
             FilterExpr::Exists { subquery, negated } => {
                 // Substitute any outer-column references in the subquery with
                 // this row's values (correlation), then execute it. The result
-                // is true iff the subquery yields at least one row.
-                let correlated = self.correlate_subplan(subquery, row, col_names);
-                let exists = !self.run_subquery(ctx, correlated)?.rows.is_empty();
+                // is true iff the subquery yields at least one row; an
+                // uncorrelated `EXISTS` is evaluated once.
+                let exists = !self
+                    .run_subplan(ctx, subquery, row, col_names)?
+                    .rows
+                    .is_empty();
                 Some(if *negated { !exists } else { exists })
             }
             FilterExpr::Scalar(e) => match self.eval_expr(ctx, e, row, col_names) {
@@ -497,8 +499,7 @@ impl MemExecutor {
                 all,
             } => {
                 let left = self.eval_expr(ctx, left, row, col_names);
-                let correlated = self.correlate_subplan(subquery, row, col_names);
-                let out = self.run_subquery(ctx, correlated)?;
+                let out = self.run_subplan(ctx, subquery, row, col_names)?;
                 let values = out
                     .rows
                     .into_iter()
@@ -553,6 +554,43 @@ impl MemExecutor {
         correlate_plan(plan, outer_row, outer_cols, &[])
     }
 
+    /// Runs a condition's subquery for one row: a correlated subquery is
+    /// rewritten with the row's values and run; an uncorrelated one is run
+    /// once per statement and the result reused (PostgreSQL's `InitPlan`).
+    pub(crate) fn run_subplan(
+        &self,
+        ctx: &ExecutionContext,
+        plan: &LogicalPlan,
+        row: &[Value],
+        col_names: &[String],
+    ) -> Option<QueryOutput> {
+        if subquery_is_correlated(plan) {
+            return self.run_subquery(ctx, self.correlate_subplan(plan, row, col_names));
+        }
+        let key = serde_json::to_string(plan).ok();
+        if let Some(key) = &key {
+            let cached = {
+                let cache = self.subplan_cache.lock();
+                cache
+                    .get(&ctx.session_id)
+                    .and_then(|session| session.get(key))
+                    .cloned()
+            };
+            if let Some(out) = cached {
+                return Some(out);
+            }
+        }
+        let out = self.run_subquery(ctx, plan.clone())?;
+        if let Some(key) = key {
+            self.subplan_cache
+                .lock()
+                .entry(ctx.session_id.clone())
+                .or_default()
+                .insert(key, out.clone());
+        }
+        Some(out)
+    }
+
     pub(crate) fn row_matches(
         &self,
         ctx: &ExecutionContext,
@@ -590,6 +628,53 @@ pub(crate) fn is_outer_ref(name: &str, inner_quals: &[String]) -> bool {
         }
         None => false,
     }
+}
+
+/// Whether a subquery reads the enclosing query's columns: PostgreSQL
+/// evaluates an uncorrelated subquery once (`InitPlan`, or a hashed set it
+/// probes), and re-runs a correlated one per outer row.
+pub(crate) fn subquery_is_correlated(plan: &LogicalPlan) -> bool {
+    let LogicalPlan::Select {
+        joins,
+        filter,
+        having,
+        projection,
+        ..
+    } = plan
+    else {
+        return false;
+    };
+    let quals = crate::joins::relation_quals(plan);
+    let mut refs = Vec::new();
+    if let Some(filter) = filter {
+        filter_column_refs(filter, &mut refs);
+    }
+    if let Some(having) = having {
+        filter_column_refs(having, &mut refs);
+    }
+    for join in joins {
+        if let Some(condition) = &join.condition {
+            filter_column_refs(condition, &mut refs);
+        }
+    }
+    for item in projection {
+        match item {
+            crate::plan_types::ProjectionItem::Column(name)
+            | crate::plan_types::ProjectionItem::AliasedColumn(name, _) => refs.push(name.clone()),
+            crate::plan_types::ProjectionItem::Expr { expr, .. } => {
+                scalar_column_refs(expr, &mut refs);
+            }
+            crate::plan_types::ProjectionItem::ScalarFunction { args, .. } => {
+                refs.extend(args.iter().cloned());
+            }
+            crate::plan_types::ProjectionItem::JsonAccess { left, right, .. } => {
+                refs.push(left.clone());
+                refs.push(right.clone());
+            }
+            _ => {}
+        }
+    }
+    refs.iter().any(|name| is_outer_ref(name, &quals))
 }
 
 /// Resolves a qualified outer column reference to its value in the outer row.

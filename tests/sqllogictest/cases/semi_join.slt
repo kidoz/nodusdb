@@ -140,22 +140,28 @@ Nested Loop Semi Join
               Filter: (b = 'y5'::text)
 
 
-# Shapes PostgreSQL plans without a semi join keep the `SubPlan`
-# predicate: an uncorrelated subquery (PostgreSQL plans a one-time
-# `InitPlan`), `NOT IN` (NULL semantics), and an `OR` over the
-# existential.
+# Shapes a semi join cannot express: an uncorrelated subquery is a
+# one-time `InitPlan` (a bare `EXISTS` behind a `Result` node's one-time
+# filter), and `NOT IN` a hashed `SubPlan`. PostgreSQL rewrites an `OR`
+# over a correlated existential into its hashed form; NodusDB keeps the
+# `SubPlan` it re-reads per row.
 query T
 explain (costs off) select * from t1 where exists (select 1 from t2);
 ----
-Seq Scan on t1
-  Filter: EXISTS(SubPlan 1)
+Result
+  One-Time Filter: (InitPlan 1).col1
+  InitPlan 1
+    ->  Seq Scan on t2
+  ->  Seq Scan on t1
 
 
 query T
 explain (costs off) select * from t1 where a not in (select a from t2);
 ----
 Seq Scan on t1
-  Filter: (NOT a IN (SubPlan 1))
+  Filter: (NOT (ANY (a = (hashed SubPlan 1).col1)))
+  SubPlan 1
+    ->  Seq Scan on t2
 
 
 query T
@@ -163,6 +169,9 @@ explain (costs off) select * from t1 where exists (select 1 from t2 where t2.a =
 ----
 Seq Scan on t1
   Filter: (EXISTS(SubPlan 1) OR (b = 'x1'::text))
+  SubPlan 1
+    ->  Seq Scan on t2
+          Filter: (a = t1.a)
 
 
 # NULL keys match nothing, and the correlated subquery sees each row

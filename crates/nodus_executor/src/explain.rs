@@ -91,6 +91,10 @@ struct Node {
     /// `ANALYZE`'s measurements, as JSON properties.
     actual: Vec<(&'static str, J)>,
     children: Vec<Node>,
+    /// The node's subplans (`InitPlan N`, `SubPlan N`): each is a tree
+    /// printed under the details in text format, and a child with an
+    /// `InitPlan`/`SubPlan` relationship and a `Subplan Name` in JSON.
+    subplans: Vec<Node>,
 }
 
 impl Node {
@@ -107,6 +111,7 @@ impl Node {
             total: 0.0,
             actual: Vec::new(),
             children: Vec::new(),
+            subplans: Vec::new(),
         }
     }
 
@@ -163,6 +168,20 @@ impl Node {
         for note in &self.notes {
             out.push(format!("{}{note}", " ".repeat(inner)));
         }
+        // A subplan's tree hangs off its `InitPlan N` line, one indent in.
+        for subplan in &self.subplans {
+            let mut line = format!("{}{}", " ".repeat(inner), subplan.label);
+            if opts.costs {
+                line.push_str(&format!(
+                    "  (cost={:.2}..{:.2} rows={} width={})",
+                    subplan.startup, subplan.total, subplan.rows, subplan.width
+                ));
+            }
+            out.push(line);
+            for child in &subplan.children {
+                child.write_text(inner + 2, opts, "", out);
+            }
+        }
         for child in &self.children {
             child.write_text(inner, opts, "", out);
         }
@@ -215,6 +234,110 @@ impl Node {
 
 fn round2(x: f64) -> f64 {
     (x * 100.0).round() / 100.0
+}
+
+/// Reprints a correlated subplan's scan condition with its columns
+/// qualified: the condition may name the enclosing query's columns, which
+/// the subplan's own scan cannot tell apart unqualified.
+fn requalify_subplan_filter(mut node: Node, plan: &LogicalPlan, subplans: &Subplans) -> Node {
+    let LogicalPlan::Select { joins, filter, .. } = plan else {
+        return node;
+    };
+    if !joins.is_empty() {
+        return node;
+    }
+    let Some(filter) = filter else {
+        return node;
+    };
+    fn walk(node: &mut Node, filter: &FilterExpr, subplans: &Subplans) {
+        if matches!(
+            node.kind.as_str(),
+            "Seq Scan" | "Index Scan" | "Index Only Scan"
+        ) && let Some(detail) = node
+            .details
+            .iter_mut()
+            .find(|(name, _, _)| *name == "Filter")
+        {
+            let text = deparse_filter_with(filter, true, Some(subplans));
+            detail.1 = text.clone();
+            detail.2 = serde_json::json!(text);
+        }
+        for child in &mut node.children {
+            walk(child, filter, subplans);
+        }
+    }
+    walk(&mut node, filter, subplans);
+    // Only the outer references name another query: the subquery's own
+    // relations print bare, as they do in a scan of their own.
+    let labels = crate::joins::relation_labels(plan);
+    strip_labels(&mut node, &labels);
+    node
+}
+
+/// Removes `label.` (outside quotes) from a node's details.
+fn strip_labels(node: &mut Node, labels: &[String]) {
+    for (_, text, json) in &mut node.details {
+        let stripped = strip_qualified(text, labels);
+        *text = stripped.clone();
+        *json = serde_json::json!(stripped);
+    }
+    for child in &mut node.children {
+        strip_labels(child, labels);
+    }
+}
+
+/// `(u2.a = u1.a)` names the subquery's own column bare: `(a = u1.a)`.
+fn strip_qualified(text: &str, labels: &[String]) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    let mut quoted = false;
+    while let Some(c) = chars.next() {
+        if c == '\'' {
+            quoted = !quoted;
+            out.push(c);
+            continue;
+        }
+        if !quoted {
+            let ahead: String = std::iter::once(c).chain(chars.clone()).collect();
+            let word_before = out.chars().last();
+            if let Some(label) = labels.iter().find(|label| {
+                ahead.starts_with(&format!("{label}."))
+                    && word_before.is_none_or(|prev| !prev.is_alphanumeric() && prev != '_')
+            }) {
+                // `c` is the label's first character.
+                for _ in 1..label.chars().count() {
+                    chars.next();
+                }
+                chars.next();
+                continue;
+            }
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// A collected subquery as a node: its `InitPlan N` / `SubPlan N` line over
+/// the subquery's own plan tree.
+fn subplan_node(entry: &SubplanEntry, tree: Node, correlated: bool) -> Node {
+    // An uncorrelated `SubPlan` is read again for every outer row, so its
+    // rows are materialized; a correlated one runs with each row's values,
+    // an `InitPlan` is read once, and a hashed `SubPlan` keeps its values
+    // in the hash table.
+    let mut tree = tree;
+    if !entry.name.starts_with("InitPlan")
+        && !entry.hashed
+        && !correlated
+        && crate::session_env::setting("enable_material").as_deref() != Some("off")
+        && !matches!(tree.kind.as_str(), "Index Scan" | "Index Only Scan")
+    {
+        tree = Node::over("Materialize", "Materialize", vec![tree]);
+    }
+    let mut wrapper = Node::new(&entry.name, entry.name.clone(), tree.rows, tree.width);
+    wrapper.startup = tree.startup;
+    wrapper.total = tree.total;
+    wrapper.children = vec![tree];
+    wrapper
 }
 
 /// PostgreSQL's default planner cost constants.
@@ -326,12 +449,25 @@ impl MemExecutor {
                 let mut scope: Vec<(String, &LogicalPlan)> = ctes.to_vec();
                 scope.extend(own.iter().map(|(n, p)| (n.clone(), &**p)));
                 let single = joins.is_empty();
+                // An uncorrelated `EXISTS` is evaluated once, as the
+                // `Result` node's one-time filter, out of the condition.
+                let (hoisted_exists, filter_rest) = split_uncorrelated_exists(filter.as_ref());
+                let filter = filter_rest.as_ref();
+                // The plan's subqueries, numbered for the filter text.
+                let mut subplans = Subplans::default();
+                collect_subplans(
+                    projection,
+                    &hoisted_exists,
+                    filter,
+                    having.as_ref(),
+                    &mut subplans,
+                );
                 // The relations on the left of the join being rendered,
                 // which decide whose column references are whose.
                 let mut joined_prefixes: Vec<String> =
                     vec![relation_name(table_alias.as_deref().unwrap_or(table_name))];
                 // A filter on one relation is shown on its scan.
-                let scan_filter = if single { filter.as_ref() } else { None };
+                let scan_filter = if single { filter } else { None };
                 // The columns the statement reads: a covering index is
                 // preferred for them, and — when nothing later reads an
                 // uncovered column — serves them alone.
@@ -340,13 +476,11 @@ impl MemExecutor {
                 } else {
                     sort.clone()
                 };
-                let needed_columns =
-                    crate::index_keys::index_only_needed(projection, filter.as_ref()).and_then(
-                        |mut needed| {
-                            needed.extend(crate::index_keys::sort_columns(&sort_keys, projection)?);
-                            Some(needed)
-                        },
-                    );
+                let needed_columns = crate::index_keys::index_only_needed(projection, filter)
+                    .and_then(|mut needed| {
+                        needed.extend(crate::index_keys::sort_columns(&sort_keys, projection)?);
+                        Some(needed)
+                    });
                 let allow_index_only = single
                     && group_by.is_empty()
                     && distinct_on.is_empty()
@@ -363,6 +497,7 @@ impl MemExecutor {
                     *only,
                     needed_columns.as_deref(),
                     allow_index_only,
+                    Some(&subplans),
                 )?;
                 for join in joins {
                     let right = match (&join.semi_subquery, &join.lateral, &join.table_fn) {
@@ -582,8 +717,57 @@ impl MemExecutor {
                     joined_prefixes.push(right_prefixes[0].clone());
                 }
                 if let (false, Some(f)) = (single, filter) {
-                    node = node.detail("Filter", deparse_filter(f, true));
+                    node = node.detail("Filter", deparse_filter_with(f, true, Some(&subplans)));
                     node.rows = (node.rows / 3.0).max(1.0).round();
+                }
+                // The subqueries the filter and projection read hang off the
+                // node that reads them, above any sort or limit.
+                let hoisted: Vec<&LogicalPlan> =
+                    hoisted_exists.iter().map(|(plan, _)| plan).collect();
+                let mut wrappers = Vec::new();
+                for (plan, entry) in subplans.collected() {
+                    if hoisted.iter().any(|h| fingerprint(h) == fingerprint(plan)) {
+                        continue;
+                    }
+                    let tree = self.explain_node(ctx, plan, &scope)?;
+                    // A correlated subplan's conditions name the enclosing
+                    // query's columns too, so they print qualified.
+                    let correlated = crate::filter_eval::subquery_is_correlated(plan);
+                    let tree = if correlated {
+                        requalify_subplan_filter(tree, plan, &subplans)
+                    } else {
+                        tree
+                    };
+                    wrappers.push(subplan_node(entry, tree, correlated));
+                }
+                if !wrappers.is_empty() {
+                    node.subplans = wrappers;
+                }
+                if !hoisted_exists.is_empty() {
+                    let mut conditions = Vec::new();
+                    let mut wrappers = Vec::new();
+                    for (plan, negated) in &hoisted_exists {
+                        let reference = subplans
+                            .entry(plan)
+                            .map(|entry| entry.name.clone())
+                            .unwrap_or_else(|| "InitPlan 1".to_string());
+                        conditions.push(if *negated {
+                            format!("(NOT ({reference}).col1)")
+                        } else {
+                            format!("({reference}).col1")
+                        });
+                        let tree = self.explain_node(ctx, plan, &scope)?;
+                        let entry = subplans.entry(plan).cloned();
+                        let entry = entry.unwrap_or(SubplanEntry {
+                            name: "InitPlan 1".to_string(),
+                            hashed: false,
+                        });
+                        wrappers.push(subplan_node(&entry, tree, false));
+                    }
+                    let mut result = Node::over("Result", "Result", vec![node]);
+                    result.total += result.rows * CPU_OPERATOR;
+                    result.subplans = wrappers;
+                    node = result.detail("One-Time Filter", conditions.join(" AND "));
                 }
                 let qualified = !single;
                 let aggregated = !group_by.is_empty()
@@ -1060,6 +1244,7 @@ impl MemExecutor {
             only,
             None,
             false,
+            None,
         )
     }
 
@@ -1077,10 +1262,11 @@ impl MemExecutor {
         only: bool,
         index_only: Option<&[String]>,
         allow_index_only: bool,
+        subplans: Option<&Subplans>,
     ) -> Result<Node> {
         let with_filter = |mut node: Node| {
             if let Some(f) = filter {
-                node = node.detail("Filter", deparse_filter(f, false));
+                node = node.detail("Filter", deparse_filter_with(f, false, subplans));
                 node.total += node.rows * CPU_OPERATOR;
                 node.rows = (node.rows * selectivity(f)).max(1.0).round();
             }
@@ -1577,9 +1763,179 @@ fn operand(op: &Operand, qualified: bool) -> String {
     }
 }
 
+/// A plan's subqueries, numbered as PostgreSQL numbers them: `InitPlan N`
+/// for a subquery evaluated once, `SubPlan N` for one read per outer row —
+/// `hashed` when a set of values is hashed and probed. The executor caches
+/// both kinds per statement; a plan's filter references them by number.
+/// Keyed by the subquery plan's JSON, the same fingerprint the cache uses.
+#[derive(Default)]
+pub(crate) struct Subplans {
+    entries: Vec<(LogicalPlan, SubplanEntry)>,
+}
+
+#[derive(Clone)]
+pub(crate) struct SubplanEntry {
+    /// `InitPlan 1`, `SubPlan 2`.
+    pub(crate) name: String,
+    pub(crate) hashed: bool,
+}
+
+fn fingerprint(plan: &LogicalPlan) -> String {
+    serde_json::to_string(plan).unwrap_or_default()
+}
+
+impl Subplans {
+    fn number(&mut self, plan: &LogicalPlan, init: bool, hashed: bool) {
+        let key = fingerprint(plan);
+        if self.entries.iter().any(|(p, _)| fingerprint(p) == key) {
+            return;
+        }
+        let name = format!(
+            "{}{}",
+            if init { "InitPlan " } else { "SubPlan " },
+            self.entries.len() + 1
+        );
+        self.entries
+            .push((plan.clone(), SubplanEntry { name, hashed }));
+    }
+
+    pub(crate) fn entry(&self, plan: &LogicalPlan) -> Option<&SubplanEntry> {
+        let key = fingerprint(plan);
+        self.entries
+            .iter()
+            .find(|(p, _)| fingerprint(p) == key)
+            .map(|(_, entry)| entry)
+    }
+
+    /// How a filter names the subquery: `InitPlan 1`, `hashed SubPlan 2`.
+    pub(crate) fn reference(&self, plan: &LogicalPlan) -> Option<String> {
+        let entry = self.entry(plan)?;
+        Some(if entry.hashed {
+            format!("hashed {}", entry.name)
+        } else {
+            entry.name.clone()
+        })
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// The collected subqueries in number order, with their plans.
+    pub(crate) fn collected(&self) -> &[(LogicalPlan, SubplanEntry)] {
+        &self.entries
+    }
+}
+
+/// A select's subqueries, by the plan they read, in the order PostgreSQL
+/// numbers them (the projection's first, then the filter's).
+fn collect_subplans(
+    projection: &[crate::plan_types::ProjectionItem],
+    hoisted: &[(LogicalPlan, bool)],
+    filter: Option<&FilterExpr>,
+    having: Option<&FilterExpr>,
+    subplans: &mut Subplans,
+) {
+    for plan in hoisted.iter().map(|(plan, _)| plan) {
+        subplans.number(plan, true, false);
+    }
+    for item in projection {
+        if let crate::plan_types::ProjectionItem::Subquery { plan, .. } = item {
+            subplans.number(plan, true, false);
+        }
+    }
+    if let Some(filter) = filter {
+        number_filter_subplans(filter, subplans);
+    }
+    if let Some(having) = having {
+        number_filter_subplans(having, subplans);
+    }
+}
+
+/// Numbers the subqueries a condition reads: a scalar one is an `InitPlan`
+/// when it stands alone (PostgreSQL evaluates it once), a set comparison a
+/// `SubPlan` — hashed when the values can be hashed.
+fn number_filter_subplans(filter: &FilterExpr, subplans: &mut Subplans) {
+    match filter {
+        FilterExpr::And(left, right) | FilterExpr::Or(left, right) => {
+            number_filter_subplans(left, subplans);
+            number_filter_subplans(right, subplans);
+        }
+        FilterExpr::Not(inner) => number_filter_subplans(inner, subplans),
+        FilterExpr::CompareSubquery { subquery, .. } => {
+            let init = !crate::filter_eval::subquery_is_correlated(subquery);
+            subplans.number(subquery, init, false);
+        }
+        FilterExpr::Exists { subquery, .. } => {
+            let init = !crate::filter_eval::subquery_is_correlated(subquery);
+            subplans.number(subquery, init, false);
+        }
+        FilterExpr::InSubquery { subquery, .. } => {
+            let uncorrelated = !crate::filter_eval::subquery_is_correlated(subquery);
+            subplans.number(subquery, false, uncorrelated);
+        }
+        FilterExpr::QuantifiedSubquery {
+            subquery, all, op, ..
+        } => {
+            let uncorrelated = !crate::filter_eval::subquery_is_correlated(subquery);
+            let hashable = !*all && matches!(op, crate::plan_types::ScalarBinaryOp::Eq);
+            subplans.number(subquery, false, uncorrelated && hashable);
+        }
+        _ => {}
+    }
+}
+
+/// The `WHERE`'s uncorrelated `EXISTS` conjuncts — which PostgreSQL
+/// evaluates once, as a `Result` node's one-time filter — and the rest of
+/// the condition.
+fn split_uncorrelated_exists(
+    filter: Option<&FilterExpr>,
+) -> (Vec<(LogicalPlan, bool)>, Option<FilterExpr>) {
+    let Some(filter) = filter else {
+        return (Vec::new(), None);
+    };
+    let mut hoisted = Vec::new();
+    let mut remaining = Vec::new();
+    for conjunct in crate::index_keys::conjuncts(filter) {
+        let (subquery, negated) = match conjunct {
+            FilterExpr::Exists { subquery, negated } => (&**subquery, *negated),
+            FilterExpr::Not(inner) => match &**inner {
+                FilterExpr::Exists {
+                    subquery,
+                    negated: false,
+                } => (&**subquery, true),
+                _ => {
+                    remaining.push(conjunct.clone());
+                    continue;
+                }
+            },
+            _ => {
+                remaining.push(conjunct.clone());
+                continue;
+            }
+        };
+        if crate::filter_eval::subquery_is_correlated(subquery) {
+            remaining.push(conjunct.clone());
+        } else {
+            hoisted.push((subquery.clone(), negated));
+        }
+    }
+    (hoisted, crate::joins::conjunction(&remaining))
+}
+
 /// A condition as PostgreSQL prints it in a plan: `((a > 1) AND (b = 'x'::text))`.
 pub(crate) fn deparse_filter(filter: &FilterExpr, qualified: bool) -> String {
-    let f = |e: &FilterExpr| deparse_filter(e, qualified);
+    deparse_filter_with(filter, qualified, None)
+}
+
+/// As [`deparse_filter`], naming subqueries by the numbers `subplans`
+/// assigned them (without it, the inline `(SubPlan 1)` form).
+pub(crate) fn deparse_filter_with(
+    filter: &FilterExpr,
+    qualified: bool,
+    subplans: Option<&Subplans>,
+) -> String {
+    let f = |e: &FilterExpr| deparse_filter_with(e, qualified, subplans);
     match filter {
         FilterExpr::Predicate(p) => format!(
             "({} {} {})",
@@ -1651,14 +2007,36 @@ pub(crate) fn deparse_filter(filter: &FilterExpr, qualified: bool) -> String {
                     .join(", ")
             )
         }
-        FilterExpr::InSubquery { left, negated, .. } => format!(
-            "({}{} IN (SubPlan 1))",
-            if *negated { "NOT " } else { "" },
-            column(left, qualified)
-        ),
-        FilterExpr::CompareSubquery { left, op, .. } => {
+        FilterExpr::InSubquery {
+            left,
+            subquery,
+            negated,
+            ..
+        } => {
+            let reference = subplans
+                .and_then(|s| s.reference(subquery))
+                .unwrap_or_else(|| "SubPlan 1".to_string());
+            if *negated {
+                format!(
+                    "(NOT (ANY ({} = ({reference}).col1)))",
+                    column(left, qualified)
+                )
+            } else {
+                format!("(ANY ({} = ({reference}).col1))", column(left, qualified))
+            }
+        }
+        FilterExpr::CompareSubquery { left, op, subquery } => {
+            // A one-time subplan names its single output column; one read
+            // per row stands for its value.
+            let reference = match subplans.and_then(|s| s.entry(subquery)) {
+                Some(entry) if entry.name.starts_with("InitPlan") => {
+                    format!("({}).col1", entry.name)
+                }
+                Some(entry) => format!("({})", entry.name),
+                None => "(SubPlan 1)".to_string(),
+            };
             format!(
-                "({} {} (SubPlan 1))",
+                "({} {} {reference})",
                 column(left, qualified),
                 compare_op(op)
             )
@@ -1669,11 +2047,14 @@ pub(crate) fn deparse_filter(filter: &FilterExpr, qualified: bool) -> String {
             compare_op(op),
             deparse_scalar(right, qualified)
         ),
-        FilterExpr::Exists { negated, .. } => {
+        FilterExpr::Exists { subquery, negated } => {
+            let reference = subplans
+                .and_then(|s| s.reference(subquery))
+                .unwrap_or_else(|| "SubPlan 1".to_string());
             if *negated {
-                "(NOT EXISTS(SubPlan 1))".to_string()
+                format!("(NOT EXISTS({reference}))")
             } else {
-                "EXISTS(SubPlan 1)".to_string()
+                format!("EXISTS({reference})")
             }
         }
         FilterExpr::Scalar(e) => {
@@ -1684,12 +2065,22 @@ pub(crate) fn deparse_filter(filter: &FilterExpr, qualified: bool) -> String {
                 format!("({text})")
             }
         }
-        FilterExpr::QuantifiedSubquery { left, op, all, .. } => format!(
-            "({} {} {} (SubPlan 1))",
-            deparse_scalar(left, qualified),
-            binary_op(op),
-            if *all { "ALL" } else { "ANY" }
-        ),
+        FilterExpr::QuantifiedSubquery {
+            left,
+            op,
+            all,
+            subquery,
+        } => {
+            let reference = subplans
+                .and_then(|s| s.reference(subquery))
+                .unwrap_or_else(|| "SubPlan 1".to_string());
+            format!(
+                "({} ({} {} ({reference}).col1))",
+                if *all { "ALL" } else { "ANY" },
+                deparse_scalar(left, qualified),
+                binary_op(op),
+            )
+        }
     }
 }
 
@@ -2098,5 +2489,64 @@ fn shown_relation(table_name: &str) -> String {
             name.to_string()
         }
         _ => table_name.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The `WHERE` of a query, unconverted.
+    fn where_filter(sql: &str) -> FilterExpr {
+        let mut statements = nodus_sql::parse_sql(sql).unwrap();
+        let sqlparser::ast::Statement::Query(query) = statements.remove(0) else {
+            panic!("a query");
+        };
+        let sqlparser::ast::SetExpr::Select(select) = *query.body else {
+            panic!("a select");
+        };
+        crate::planner::parse_predicates(&select.selection, &[])
+            .unwrap()
+            .unwrap()
+    }
+
+    #[test]
+    fn uncorrelated_existentials_are_evaluated_once() {
+        let (hoisted, rest) = split_uncorrelated_exists(Some(&where_filter(
+            "select * from t1 where exists (select 1 from t2)",
+        )));
+        assert_eq!(hoisted.len(), 1);
+        assert!(!hoisted[0].1 && rest.is_none());
+
+        let (hoisted, _) = split_uncorrelated_exists(Some(&where_filter(
+            "select * from t1 where not exists (select 1 from t2)",
+        )));
+        assert_eq!(hoisted.len(), 1);
+        assert!(hoisted[0].1);
+
+        // Other conditions stay on the scan.
+        let (hoisted, rest) = split_uncorrelated_exists(Some(&where_filter(
+            "select * from t1 where exists (select 1 from t2 where t2.a = 5) and b = 'x'",
+        )));
+        assert_eq!(hoisted.len(), 1);
+        assert_eq!(
+            rest.as_ref().map(|f| deparse_filter(f, true)).as_deref(),
+            Some("(b = 'x'::text)")
+        );
+
+        // A correlated existential is not one-time.
+        let (hoisted, rest) = split_uncorrelated_exists(Some(&where_filter(
+            "select * from t1 where exists (select 1 from t2 where t2.a = t1.a)",
+        )));
+        assert!(hoisted.is_empty() && rest.is_some());
+    }
+
+    #[test]
+    fn a_subplans_own_columns_print_bare() {
+        let text = "(u2.a = u1.a)";
+        assert_eq!(strip_qualified(text, &["u2".to_string()]), "(a = u1.a)");
+        // Inside a literal, the name is not a column reference.
+        let text = "(b = 'u2.a'::text)";
+        assert_eq!(strip_qualified(text, &["u2".to_string()]), text);
     }
 }

@@ -123,6 +123,19 @@ pub(crate) fn conjunction(parts: &[FilterExpr]) -> Option<FilterExpr> {
     }))
 }
 
+/// The comparison an `ANY` operator stands for.
+fn compare_of(op: &crate::plan_types::ScalarBinaryOp) -> Option<CompareOp> {
+    Some(match op {
+        crate::plan_types::ScalarBinaryOp::Eq => CompareOp::Eq,
+        crate::plan_types::ScalarBinaryOp::NotEq => CompareOp::Ne,
+        crate::plan_types::ScalarBinaryOp::Lt => CompareOp::Lt,
+        crate::plan_types::ScalarBinaryOp::LtEq => CompareOp::Le,
+        crate::plan_types::ScalarBinaryOp::Gt => CompareOp::Gt,
+        crate::plan_types::ScalarBinaryOp::GtEq => CompareOp::Ge,
+        _ => return None,
+    })
+}
+
 /// The relations a plan's `FROM` reads, by the label each is scanned
 /// under: its alias, else its name.
 pub(crate) fn relation_labels(plan: &LogicalPlan) -> Vec<String> {
@@ -193,7 +206,19 @@ pub(crate) fn semi_join(
             subquery,
             negated: false,
             left_value: None,
-        } => (&**subquery, false, Some(left.clone())),
+        } => (
+            &**subquery,
+            false,
+            Some((left.clone(), crate::plan_types::ScalarBinaryOp::Eq)),
+        ),
+        // `<column> <op> ANY (<subquery>)` is the same comparison as a
+        // semi join over the comparison written out.
+        FilterExpr::QuantifiedSubquery {
+            left: crate::plan_types::ScalarExpr::Column(left),
+            op,
+            subquery,
+            all: false,
+        } => (&**subquery, false, Some((left.clone(), op.clone()))),
         // `not (exists (...))` is the same predicate as `not exists (...)`.
         FilterExpr::Not(inner) => match &**inner {
             FilterExpr::Exists {
@@ -254,8 +279,9 @@ pub(crate) fn semi_join(
         return None;
     }
     let mut lifted = Vec::new();
-    if let Some(in_key) = &in_key {
-        // `IN` compares against the subquery's single output column.
+    if let Some((comparison, any_op)) = &in_key {
+        // `IN`/`ANY` compares against the subquery's single output column.
+        let op = compare_of(any_op)?;
         let [
             crate::plan_types::ProjectionItem::Column(key)
             | crate::plan_types::ProjectionItem::AliasedColumn(key, _),
@@ -276,7 +302,7 @@ pub(crate) fn semi_join(
             };
             Some(format!("{label}.{name}"))
         };
-        let left = qualify(in_key, outer_quals.to_vec())?;
+        let left = qualify(&comparison, outer_quals.to_vec())?;
         let key = qualify(key, relation_labels(subquery))?;
         // A self-referencing subquery would shadow an outer name, which the
         // join cannot express.
@@ -285,7 +311,7 @@ pub(crate) fn semi_join(
         }
         lifted.push(FilterExpr::Predicate(Predicate {
             left,
-            op: CompareOp::Eq,
+            op,
             right: Operand::Ident(key),
         }));
     }
@@ -489,6 +515,33 @@ mod tests {
         assert_eq!(
             filter.as_ref().map(deparse).as_deref(),
             Some("(t2.b = 'y'::text)")
+        );
+    }
+
+    #[test]
+    fn any_subqueries_become_semi_joins() {
+        let (join_type, _, condition) = semi_join(
+            &where_filter("select * from t1 where a = any (select b from t2)"),
+            &outer_quals(&["t1"]),
+        )
+        .unwrap();
+        assert!(matches!(join_type, JoinType::Semi));
+        assert_eq!(deparse(&condition), "(t1.a = t2.b)");
+
+        let (_, _, condition) = semi_join(
+            &where_filter("select * from t1 where a > any (select b from t2)"),
+            &outer_quals(&["t1"]),
+        )
+        .unwrap();
+        assert_eq!(deparse(&condition), "(t1.a > t2.b)");
+
+        // `ALL` reads every row: not a semi join.
+        assert!(
+            semi_join(
+                &where_filter("select * from t1 where a > all (select b from t2)"),
+                &outer_quals(&["t1"]),
+            )
+            .is_none()
         );
     }
 

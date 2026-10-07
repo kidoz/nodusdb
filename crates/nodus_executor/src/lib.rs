@@ -434,6 +434,12 @@ pub struct MemExecutor {
     pub(crate) notifications: parking_lot::Mutex<HashMap<String, Vec<(i32, String, String)>>>,
     /// Per session, what it is doing, for `pg_stat_activity`.
     pub(crate) activity: parking_lot::RwLock<HashMap<String, SessionActivity>>,
+    /// Per session, the results of uncorrelated subqueries, by the
+    /// subquery plan's JSON: PostgreSQL evaluates such a subquery once
+    /// (`InitPlan`) or hashes its values, and the entry lives for one
+    /// statement — [`Self::execute_logical`] clears the session's map when
+    /// a statement starts.
+    pub(crate) subplan_cache: parking_lot::Mutex<HashMap<String, HashMap<String, QueryOutput>>>,
 }
 
 /// What a session is doing, as `pg_stat_activity` shows it.
@@ -502,6 +508,7 @@ impl MemExecutor {
             advisory: Arc::new(advisory::AdvisoryLocks::default()),
             listeners: parking_lot::RwLock::new(HashMap::new()),
             notifications: parking_lot::Mutex::new(HashMap::new()),
+            subplan_cache: parking_lot::Mutex::new(HashMap::new()),
             activity: parking_lot::RwLock::new(HashMap::new()),
         }
     }
@@ -1870,6 +1877,8 @@ impl Executor for MemExecutor {
             anyhow::bail!("restore in progress; retry shortly");
         }
         let _drain_guard = self.restore_gate.read();
+        // A statement's uncorrelated subqueries are evaluated afresh.
+        self.subplan_cache.lock().remove(&ctx.session_id);
         self.note_activity(ctx, true);
         let result = self.execute_logical_tracked(ctx, plan);
         self.note_activity(ctx, false);
