@@ -1,0 +1,272 @@
+# Semi and anti joins: `[NOT] EXISTS (...)` and `IN (...)` correlate with
+# the outer row through the subquery's `WHERE`, which becomes the join's
+# condition, with the subquery's relations as an inner side that adds no
+# columns. Results and plans are from PostgreSQL 18.4; the divergences
+# below are noted where they occur.
+
+statement ok
+drop table if exists t1 cascade;
+
+statement ok
+drop table if exists t2 cascade;
+
+statement ok
+create table t1 (a int, b text);
+
+statement ok
+create table t2 (a int, b text);
+
+statement ok
+insert into t1 values (1, 'x1'), (2, 'x2'), (3, 'x3'), (null, 'xn'), (4, 'x4');
+
+statement ok
+insert into t2 values (2, 'y2'), (3, 'y3'), (3, 'y3b'), (null, 'yn'), (5, 'y5');
+
+statement ok
+analyze t1;
+
+statement ok
+analyze t2;
+
+# An equality correlation hashes the inner side.
+query T
+explain (costs off) select * from t1 where exists (select 1 from t2 where t2.a = t1.a);
+----
+Hash Semi Join
+  Hash Cond: (t1.a = t2.a)
+  ->  Seq Scan on t1
+  ->  Hash
+        ->  Seq Scan on t2
+
+
+# `NOT EXISTS` is the anti join.
+query T
+explain (costs off) select * from t1 where not exists (select 1 from t2 where t2.a = t1.a);
+----
+Hash Anti Join
+  Hash Cond: (t1.a = t2.a)
+  ->  Seq Scan on t1
+  ->  Hash
+        ->  Seq Scan on t2
+
+
+query T
+explain (costs off) select * from t1 where not (exists (select 1 from t2 where t2.a = t1.a));
+----
+Hash Anti Join
+  Hash Cond: (t1.a = t2.a)
+  ->  Seq Scan on t1
+  ->  Hash
+        ->  Seq Scan on t2
+
+
+# `IN` compares against the subquery's output column.
+query T
+explain (costs off) select * from t1 where a in (select a from t2);
+----
+Hash Semi Join
+  Hash Cond: (t1.a = t2.a)
+  ->  Seq Scan on t1
+  ->  Hash
+        ->  Seq Scan on t2
+
+
+# A condition over the inner side alone is pushed onto its scan.
+query T
+explain (costs off) select * from t1 where exists (select 1 from t2 where t2.a = t1.a and t2.b = 'y3');
+----
+Hash Semi Join
+  Hash Cond: (t1.a = t2.a)
+  ->  Seq Scan on t1
+  ->  Hash
+        ->  Seq Scan on t2
+              Filter: (b = 'y3'::text)
+
+
+# With no equality to hash, the join is a nested loop over a materialized
+# inner, and the correlation is its join filter.
+query T
+explain (costs off) select * from t1 where exists (select 1 from t2 where t2.a > t1.a);
+----
+Nested Loop Semi Join
+  Join Filter: (t2.a > t1.a)
+  ->  Seq Scan on t1
+  ->  Materialize
+        ->  Seq Scan on t2
+
+
+query T
+explain (costs off) select * from t1 where not exists (select 1 from t2 where t2.a > t1.a);
+----
+Nested Loop Anti Join
+  Join Filter: (t2.a > t1.a)
+  ->  Seq Scan on t1
+  ->  Materialize
+        ->  Seq Scan on t2
+
+
+# Existence ignores the subquery's ordering, duplicate removal, and a
+# limit of one or more.
+query T
+explain (costs off) select * from t1 where exists (select distinct a from t2 where t2.a = t1.a);
+----
+Hash Semi Join
+  Hash Cond: (t1.a = t2.a)
+  ->  Seq Scan on t1
+  ->  Hash
+        ->  Seq Scan on t2
+
+
+query T
+explain (costs off) select * from t1 where exists (select 1 from t2 where t2.a = t1.a order by t2.b limit 1);
+----
+Hash Semi Join
+  Hash Cond: (t1.a = t2.a)
+  ->  Seq Scan on t1
+  ->  Hash
+        ->  Seq Scan on t2
+
+
+# A correlation that is not a bare equality stays a join filter over a
+# hashed inner.
+query T
+explain (costs off) select * from t1 where exists (select 1 from t2 where t2.a > t1.a and t2.b = 'y5');
+----
+Nested Loop Semi Join
+  Join Filter: (t2.a > t1.a)
+  ->  Seq Scan on t1
+  ->  Materialize
+        ->  Seq Scan on t2
+              Filter: (b = 'y5'::text)
+
+
+# Shapes PostgreSQL plans without a semi join keep the `SubPlan`
+# predicate: an uncorrelated subquery (PostgreSQL plans a one-time
+# `InitPlan`), `NOT IN` (NULL semantics), and an `OR` over the
+# existential.
+query T
+explain (costs off) select * from t1 where exists (select 1 from t2);
+----
+Seq Scan on t1
+  Filter: EXISTS(SubPlan 1)
+
+
+query T
+explain (costs off) select * from t1 where a not in (select a from t2);
+----
+Seq Scan on t1
+  Filter: (NOT a IN (SubPlan 1))
+
+
+query T
+explain (costs off) select * from t1 where exists (select 1 from t2 where t2.a = t1.a) or b = 'x1';
+----
+Seq Scan on t1
+  Filter: (EXISTS(SubPlan 1) OR (b = 'x1'::text))
+
+
+# NULL keys match nothing, and the correlated subquery sees each row
+# in turn.
+query T
+select count(*) from t1 where exists (select 1 from t2 where t2.a = t1.a);
+----
+2
+
+
+query T
+select count(*) from t1 where not exists (select 1 from t2 where t2.a = t1.a);
+----
+3
+
+
+query T
+select count(*) from t1 where a in (select a from t2);
+----
+2
+
+
+query T
+select count(*) from t1 where a not in (select a from t2);
+----
+0
+
+
+query T
+select t1.a, t1.b from t1 where exists (select 1 from t2 where t2.a = t1.a) order by 1;
+----
+2	x2
+3	x3
+
+
+query T
+select t1.a from t1 where not exists (select 1 from t2 where t2.a = t1.a) order by 1;
+----
+1
+4
+NULL
+
+
+query T
+select t1.a from t1 where exists (select 1 from t2 where t2.a > t1.a) order by 1;
+----
+1
+2
+3
+4
+
+
+query T
+select t1.a from t1 where exists (select 1 from t2 where t2.a > t1.a and t2.b = 'y5') order by 1;
+----
+1
+2
+3
+4
+
+
+query T
+select t1.a from t1 where a in (select a from t2 where t2.b <> 'y3b') order by 1;
+----
+2
+3
+
+
+query T
+select t1.a from t1 where exists (select 1 from t2 where t2.a = t1.a limit 0) order by 1;
+----
+
+
+query T
+select t1.a from t1 where exists (select 1 from t2 where t2.a = t1.a and t1.a > 2) order by 1;
+----
+3
+
+
+query T
+select t1.a, t2.a from t1 join t2 on t1.a = t2.a where exists (select 1 from t2 y where y.a = t1.a) order by 1, 2;
+----
+2	2
+3	3
+3	3
+
+
+# A data statement's predicate sees the same rows.
+statement ok
+update t1 set b = 'q' || b where exists (select 1 from t2 where t2.a = t1.a);
+
+query T
+select t1.a, t1.b from t1 where b like 'q%' order by 1;
+----
+2	qx2
+3	qx3
+
+
+statement ok
+delete from t1 where not exists (select 1 from t2 where t2.a = t1.a);
+
+query T
+select count(*) from t1;
+----
+2
+
+
