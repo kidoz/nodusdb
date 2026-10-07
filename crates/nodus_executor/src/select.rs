@@ -660,6 +660,143 @@ impl MemExecutor {
         star.retain(|i| !hidden.contains(i));
         for join in &joins {
             let left_width = col_names.len();
+            // A semi/anti join (from `[NOT] EXISTS` / `IN`) runs its
+            // subquery once, hashed or scanned per left row, and adds no
+            // columns: the left row is kept (semi) or kept only when
+            // nothing matched (anti).
+            if let Some(plan) = &join.semi_subquery {
+                let out = self.execute_logical_inner(ctx, (**plan).clone())?;
+                let inner_names: Vec<String> = out.columns.clone();
+                let now = Utc::now();
+                let inner_desc: Vec<ColumnDescriptor> = inner_names
+                    .iter()
+                    .zip(
+                        out.types
+                            .iter()
+                            .chain(std::iter::repeat(&"VARCHAR".to_string())),
+                    )
+                    .map(|(name, ty)| ColumnDescriptor {
+                        id: nodus_catalog::ColumnId::new(),
+                        name: name.clone(),
+                        version: 1,
+                        created_at: now,
+                        updated_at: now,
+                        state: DescriptorState::Public,
+                        data_type: ty.clone(),
+                        nullable: true,
+                        default_expr: None,
+                        comment: None,
+                    })
+                    .collect();
+                let mut combined_cols = col_names.clone();
+                combined_cols.extend(inner_names.iter().cloned());
+                let mut combined_desc = joined_columns.clone();
+                combined_desc.extend(inner_desc);
+                if !query_has_virtual && let Some(condition) = join.condition.as_ref() {
+                    let mut refs = Vec::new();
+                    crate::filter_eval::filter_column_refs(condition, &mut refs);
+                    crate::filter_eval::check_column_refs(refs, &combined_cols)?;
+                }
+                let anti = matches!(join.join_type, JoinType::Anti);
+                let hashed = self.hash_join_keys(join, &None, &col_names, &inner_names)?;
+                let matches_inner = |r1: &Vec<Value>, r2: &crate::Row| -> Result<bool> {
+                    let mut combined = r1.clone();
+                    combined.extend(r2.values.clone());
+                    Ok(self
+                        .eval_filter(
+                            ctx,
+                            &combined,
+                            &combined_cols,
+                            &combined_desc,
+                            join.condition.as_ref(),
+                        )
+                        .unwrap_or(false))
+                };
+                let mut next_rows = Vec::new();
+                match &hashed {
+                    Some(hash) => {
+                        let mut table: std::collections::HashMap<String, Vec<Vec<Value>>> =
+                            std::collections::HashMap::new();
+                        for r2 in &out.rows {
+                            if let Some(filter) = &hash.right_filter
+                                && !self
+                                    .eval_filter(
+                                        ctx,
+                                        &r2.values,
+                                        &inner_names,
+                                        &combined_desc[left_width..],
+                                        Some(filter),
+                                    )
+                                    .unwrap_or(false)
+                            {
+                                continue;
+                            }
+                            let Some(key) = hash_key(&r2.values, &hash.right_positions) else {
+                                continue;
+                            };
+                            table.entry(key).or_default().push(r2.values.clone());
+                        }
+                        for r1 in &stored_rows {
+                            if let Some(filter) = &hash.left_filter
+                                && !self
+                                    .eval_filter(ctx, r1, &col_names, &joined_columns, Some(filter))
+                                    .unwrap_or(false)
+                            {
+                                continue;
+                            }
+                            let mut matched = false;
+                            if let Some(key) = hash_key(r1, &hash.left_positions) {
+                                for r2 in table.get(&key).into_iter().flatten() {
+                                    if !hash
+                                        .left_positions
+                                        .iter()
+                                        .zip(&hash.right_positions)
+                                        .all(|(l, r)| crate::value::values_equal(&r1[*l], &r2[*r]))
+                                    {
+                                        continue;
+                                    }
+                                    if let Some(filter) = &hash.join_filter {
+                                        let mut combined = r1.clone();
+                                        combined.extend(r2.iter().cloned());
+                                        if !self
+                                            .eval_filter(
+                                                ctx,
+                                                &combined,
+                                                &combined_cols,
+                                                &combined_desc,
+                                                Some(filter),
+                                            )
+                                            .unwrap_or(false)
+                                        {
+                                            continue;
+                                        }
+                                    }
+                                    matched = true;
+                                }
+                            }
+                            if matched != anti {
+                                next_rows.push(r1.clone());
+                            }
+                        }
+                    }
+                    None => {
+                        for r1 in &stored_rows {
+                            let mut matched = false;
+                            for r2 in &out.rows {
+                                if matches_inner(r1, r2)? {
+                                    matched = true;
+                                    break;
+                                }
+                            }
+                            if matched != anti {
+                                next_rows.push(r1.clone());
+                            }
+                        }
+                    }
+                }
+                stored_rows = next_rows;
+                continue;
+            }
             // A LATERAL subquery runs for each left row, with that row's values
             // for its outer references; its rows join that row.
             if let Some(plan) = &join.lateral {

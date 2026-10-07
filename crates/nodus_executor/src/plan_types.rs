@@ -98,6 +98,13 @@ pub enum JoinType {
     FullOuter,
     /// Cartesian product (`CROSS JOIN`); carries no `ON` condition.
     Cross,
+    /// `[NOT] EXISTS (...)` / `IN (...)`: the left row is kept when the
+    /// subquery's rows match it (kept when none do, for `Anti`), and the
+    /// subquery's own columns are not part of the output. The subquery is
+    /// [`Join::semi_subquery`]; the condition over the two sides is built
+    /// from the subquery's correlation predicates.
+    Semi,
+    Anti,
 }
 
 /// A set-returning function used in `FROM` (e.g. `unnest(arr)`,
@@ -401,6 +408,13 @@ pub struct Join {
     /// Defaulted so older plans decode.
     #[serde(default)]
     pub only: bool,
+    /// A `[NOT] EXISTS (...)` / `IN (...)` subquery this join was built from
+    /// (with [`JoinType::Semi`] / [`JoinType::Anti`]): executed once as the
+    /// join's inner side, with the correlation predicates lifted into
+    /// `condition` — so the plan is uncorrelated, unlike the `lateral` field.
+    /// Defaulted so older plans decode.
+    #[serde(default)]
+    pub semi_subquery: Option<Box<LogicalPlan>>,
 }
 
 /// A relation's `TABLESAMPLE` clause: how a scan draws its rows.

@@ -581,7 +581,7 @@ fn flip_op(op: &CompareOp) -> CompareOp {
 /// True if `name` is qualified by an alias that is NOT the subquery's own
 /// table/alias — i.e. it references an outer (correlated) column. Bare names
 /// are treated as inner references.
-fn is_outer_ref(name: &str, inner_quals: &[String]) -> bool {
+pub(crate) fn is_outer_ref(name: &str, inner_quals: &[String]) -> bool {
     match name.rsplit_once('.') {
         Some((qual, _)) => {
             let qual = qual.to_lowercase();

@@ -365,8 +365,11 @@ impl MemExecutor {
                     allow_index_only,
                 )?;
                 for join in joins {
-                    let right = match (&join.lateral, &join.table_fn) {
-                        (Some(sub), _) => {
+                    let right = match (&join.semi_subquery, &join.lateral, &join.table_fn) {
+                        // A semi/anti join's inner side is its subquery's
+                        // own relations, with no node of their own.
+                        (Some(sub), _, _) => self.explain_node(ctx, sub, &scope)?,
+                        (None, Some(sub), _) => {
                             let child = self.explain_node(ctx, sub, &scope)?;
                             let alias = join.table_alias.as_deref().unwrap_or(&join.table_name);
                             Node::over(
@@ -376,8 +379,8 @@ impl MemExecutor {
                             )
                             .prop("Alias", json!(relation_name(alias)))
                         }
-                        (None, Some(spec)) => function_scan(spec),
-                        (None, None) => self.explain_relation(
+                        (None, None, Some(spec)) => function_scan(spec),
+                        (None, None, None) => self.explain_relation(
                             ctx,
                             &join.table_name,
                             join.table_alias.as_deref(),
@@ -391,6 +394,8 @@ impl MemExecutor {
                         JoinType::LeftOuter => (" Left Join", "Left"),
                         JoinType::RightOuter => (" Right Join", "Right"),
                         JoinType::FullOuter => (" Full Join", "Full"),
+                        JoinType::Semi => (" Semi Join", "Semi"),
+                        JoinType::Anti => (" Anti Join", "Anti"),
                         JoinType::Inner | JoinType::Cross => ("", "Inner"),
                     };
                     // The equalities between the sides hash (a `Hash Join`),
@@ -398,9 +403,12 @@ impl MemExecutor {
                     // else is the nested loop the executor runs, over a
                     // materialized inner.
                     let left_prefixes = joined_prefixes.clone();
-                    let right_prefixes = vec![relation_name(
-                        join.table_alias.as_deref().unwrap_or(&join.table_name),
-                    )];
+                    let right_prefixes = match &join.semi_subquery {
+                        Some(sub) => crate::joins::relation_quals(sub),
+                        None => vec![relation_name(
+                            join.table_alias.as_deref().unwrap_or(&join.table_name),
+                        )],
+                    };
                     let left_refs: Vec<&str> = left_prefixes.iter().map(String::as_str).collect();
                     let right_refs: Vec<&str> = right_prefixes.iter().map(String::as_str).collect();
                     let hash = (crate::session_env::setting("enable_hashjoin").as_deref()
@@ -425,7 +433,11 @@ impl MemExecutor {
                         }
                         _ => node.rows.max(right.rows),
                     };
-                    let width = node.width + right.width;
+                    // A semi/anti join emits the left row alone.
+                    let width = match join.join_type {
+                        JoinType::Semi | JoinType::Anti => node.width,
+                        _ => node.width + right.width,
+                    };
                     let total = node.total + node.rows * right.total;
                     // The hashed equalities (or the condition), and the
                     // condition checked on each matched pair.
@@ -487,6 +499,8 @@ impl MemExecutor {
                             ("Left", "Hash Left Join".to_string())
                         }
                         (Some(_), JoinType::FullOuter) => ("Full", "Hash Full Join".to_string()),
+                        (Some(_), JoinType::Semi) => ("Semi", "Hash Semi Join".to_string()),
+                        (Some(_), JoinType::Anti) => ("Anti", "Hash Anti Join".to_string()),
                         (Some(_), _) => ("Inner", "Hash Join".to_string()),
                         (None, _) => (kind, format!("Nested Loop{suffix}")),
                     };
@@ -1007,7 +1021,7 @@ impl MemExecutor {
         let pages = (table_rows * table_width as f64 / 8192.0).ceil().max(1.0);
         let mut child = Node::new(
             "Seq Scan",
-            format!("Seq Scan on {} {alias}", relation_name(&table.name)),
+            format!("Seq Scan on {}", scan_label_name(&table.name, Some(alias))),
             table_rows,
             table_width,
         )
@@ -1946,13 +1960,61 @@ pub(crate) fn deparse_query(plan: &LogicalPlan) -> Option<String> {
         "\n   FROM {}",
         scan_label_name_qualified(table_name, table_alias.as_deref())
     ));
+    let mut exists_clauses = Vec::new();
     for join in joins {
+        // A semi/anti join came from `[NOT] EXISTS` in `WHERE`.
+        if let (JoinType::Semi | JoinType::Anti, Some(sub)) = (&join.join_type, &join.semi_subquery)
+            && let LogicalPlan::Select {
+                table_name: inner_name,
+                table_alias: inner_alias,
+                joins: inner_joins,
+                filter: inner_filter,
+                ..
+            } = &**sub
+        {
+            let mut inner = format!(
+                "SELECT 1 FROM {}",
+                scan_label_name_qualified(inner_name, inner_alias.as_deref())
+            );
+            for inner_join in inner_joins {
+                inner.push_str(&format!(
+                    "\n     JOIN {}",
+                    scan_label_name_qualified(
+                        &inner_join.table_name,
+                        inner_join.table_alias.as_deref()
+                    )
+                ));
+                if let Some(condition) = &inner_join.condition {
+                    inner.push_str(&format!(" ON {}", deparse_filter(condition, true)));
+                }
+            }
+            let mut conditions = Vec::new();
+            if let Some(condition) = &join.condition {
+                conditions.push(unwrap(deparse_filter(condition, true)));
+            }
+            if let Some(inner_filter) = inner_filter {
+                conditions.push(unwrap(deparse_filter(inner_filter, true)));
+            }
+            if !conditions.is_empty() {
+                inner.push_str(&format!("\n  WHERE {}", conditions.join(" AND ")));
+            }
+            exists_clauses.push(format!(
+                "{}EXISTS ({inner})",
+                if matches!(join.join_type, JoinType::Anti) {
+                    "NOT "
+                } else {
+                    ""
+                }
+            ));
+            continue;
+        }
         let kind = match join.join_type {
             JoinType::Inner => "JOIN",
             JoinType::LeftOuter => "LEFT JOIN",
             JoinType::RightOuter => "RIGHT JOIN",
             JoinType::FullOuter => "FULL JOIN",
             JoinType::Cross => "CROSS JOIN",
+            JoinType::Semi | JoinType::Anti => "JOIN",
         };
         sql.push_str(&format!(
             "\n     {kind} {}",
@@ -1962,11 +2024,12 @@ pub(crate) fn deparse_query(plan: &LogicalPlan) -> Option<String> {
             sql.push_str(&format!(" ON {}", deparse_filter(condition, true)));
         }
     }
+    let mut conditions = exists_clauses;
     if let Some(filter) = filter {
-        sql.push_str(&format!(
-            "\n  WHERE {}",
-            unwrap(deparse_filter(filter, qualified))
-        ));
+        conditions.push(unwrap(deparse_filter(filter, qualified)));
+    }
+    if !conditions.is_empty() {
+        sql.push_str(&format!("\n  WHERE {}", conditions.join(" AND ")));
     }
     if !group_by.is_empty() {
         let keys: Vec<String> = group_by.iter().map(|g| column(g, qualified)).collect();

@@ -2,7 +2,7 @@
 //! each side applies alone. Shared by the executor and `EXPLAIN`, so a plan
 //! shows the join the executor runs.
 
-use crate::plan_types::{CompareOp, FilterExpr, Operand, Predicate};
+use crate::plan_types::{CompareOp, FilterExpr, JoinType, LogicalPlan, Operand, Predicate};
 
 /// How a join's condition splits for a hash join: the equalities hashed
 /// (`(left column, right column)`), the conditions only one side's rows
@@ -123,6 +123,222 @@ pub(crate) fn conjunction(parts: &[FilterExpr]) -> Option<FilterExpr> {
     }))
 }
 
+/// The relations a plan's `FROM` reads, by the label each is scanned
+/// under: its alias, else its name.
+pub(crate) fn relation_labels(plan: &LogicalPlan) -> Vec<String> {
+    let LogicalPlan::Select {
+        table_name,
+        table_alias,
+        joins,
+        ..
+    } = plan
+    else {
+        return Vec::new();
+    };
+    std::iter::once(table_alias.clone().unwrap_or_else(|| table_name.clone()))
+        .chain(joins.iter().map(|j| {
+            j.table_alias
+                .clone()
+                .unwrap_or_else(|| j.table_name.clone())
+        }))
+        .collect()
+}
+
+/// The relations a plan's `FROM` reads, by the names that reach them: an
+/// alias hides the table name.
+pub(crate) fn relation_quals(plan: &LogicalPlan) -> Vec<String> {
+    let LogicalPlan::Select {
+        table_name,
+        table_alias,
+        joins,
+        ..
+    } = plan
+    else {
+        return Vec::new();
+    };
+    let mut quals = Vec::new();
+    let mut add = |name: &str, alias: Option<&String>| match alias {
+        Some(alias) => quals.push(alias.to_lowercase()),
+        None => {
+            quals.push(name.to_lowercase());
+            if let Some(last) = name.rsplit('.').next() {
+                quals.push(last.to_lowercase());
+            }
+        }
+    };
+    add(table_name, table_alias.as_ref());
+    for join in joins {
+        add(&join.table_name, join.table_alias.as_ref());
+    }
+    quals
+}
+
+/// The `[NOT] EXISTS (...)` / `IN (...)` conjuncts a semi/anti join can run:
+/// the subquery's correlation predicates against the outer row become the
+/// join's condition, and its inner side is the subquery with the projection
+/// dropped — existence ignores it.
+///
+/// Returns the join type, the inner side, and the condition. `None` keeps
+/// the subquery as a `SubPlan` predicate, as PostgreSQL does for shapes a
+/// semi join cannot express (an uncorrelated subquery, an aggregate,
+/// `NOT IN`'s NULL semantics, a LIMIT or OFFSET).
+pub(crate) fn semi_join(
+    conjunct: &FilterExpr,
+    outer_quals: &[String],
+) -> Option<(JoinType, Box<LogicalPlan>, FilterExpr)> {
+    let (subquery, anti, in_key) = match conjunct {
+        FilterExpr::Exists { subquery, negated } => (&**subquery, *negated, None),
+        FilterExpr::InSubquery {
+            left,
+            subquery,
+            negated: false,
+            left_value: None,
+        } => (&**subquery, false, Some(left.clone())),
+        // `not (exists (...))` is the same predicate as `not exists (...)`.
+        FilterExpr::Not(inner) => match &**inner {
+            FilterExpr::Exists {
+                subquery,
+                negated: false,
+            } => (&**subquery, true, None),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let LogicalPlan::Select {
+        joins,
+        projection,
+        group_by,
+        filter,
+        having,
+        limit,
+        offset,
+        sort,
+        group_exprs,
+        grouping_sets,
+        ..
+    } = subquery
+    else {
+        return None;
+    };
+    // Shapes whose row count an existence check cannot ignore: an aggregate
+    // or window function yields a row regardless of the rows below it, and a
+    // set-returning function in the select list runs as a join of its own.
+    if !group_by.is_empty()
+        || having.is_some()
+        || !group_exprs.is_empty()
+        || grouping_sets.is_some()
+        || offset.is_some()
+        || limit.is_some_and(|rows| rows == 0)
+        || joins.iter().any(|j| j.table_name == "\u{0}srf")
+        || projection.iter().any(|item| {
+            matches!(
+                item,
+                crate::plan_types::ProjectionItem::Aggregate(..)
+                    | crate::plan_types::ProjectionItem::WindowFunction { .. }
+            )
+        })
+    {
+        return None;
+    }
+    let inner_quals = relation_quals(subquery);
+    let is_outer = |name: &str| crate::filter_eval::is_outer_ref(name, &inner_quals);
+    // The subquery's joins must be self-contained; only its `WHERE`
+    // correlates with the outer row.
+    if joins.iter().any(|j| {
+        j.condition.as_ref().is_some_and(|condition| {
+            let mut refs = Vec::new();
+            crate::filter_eval::filter_column_refs(condition, &mut refs);
+            refs.iter().any(|r| is_outer(r))
+        })
+    }) {
+        return None;
+    }
+    let mut lifted = Vec::new();
+    if let Some(in_key) = &in_key {
+        // `IN` compares against the subquery's single output column.
+        let [
+            crate::plan_types::ProjectionItem::Column(key)
+            | crate::plan_types::ProjectionItem::AliasedColumn(key, _),
+        ] = projection.as_slice()
+        else {
+            return None;
+        };
+        // The left side is written in the outer query, the key in the
+        // subquery, so a bare name on either side belongs to its own
+        // relations: qualify it with the only relation it can be, leaving
+        // an ambiguous name to the `SubPlan`.
+        let qualify = |name: &String, labels: Vec<String>| -> Option<String> {
+            if name.contains('.') {
+                return Some(name.clone());
+            }
+            let [label] = labels.as_slice() else {
+                return None;
+            };
+            Some(format!("{label}.{name}"))
+        };
+        let left = qualify(in_key, outer_quals.to_vec())?;
+        let key = qualify(key, relation_labels(subquery))?;
+        // A self-referencing subquery would shadow an outer name, which the
+        // join cannot express.
+        if !is_outer(&left) {
+            return None;
+        }
+        lifted.push(FilterExpr::Predicate(Predicate {
+            left,
+            op: CompareOp::Eq,
+            right: Operand::Ident(key),
+        }));
+    }
+    let mut crossed = !lifted.is_empty();
+    let mut kept = Vec::new();
+    for conjunct in filter
+        .as_ref()
+        .map(crate::index_keys::conjuncts)
+        .unwrap_or_default()
+    {
+        let mut refs = Vec::new();
+        crate::filter_eval::filter_column_refs(conjunct, &mut refs);
+        if refs.iter().any(|r| is_outer(r)) {
+            crossed |= refs.iter().any(|r| !is_outer(r));
+            lifted.push(conjunct.clone());
+        } else {
+            kept.push(conjunct.clone());
+        }
+    }
+    // No correlation with the outer row: that is PostgreSQL's one-time
+    // `InitPlan` shape, which is not a semi join.
+    if !crossed {
+        return None;
+    }
+    let condition = conjunction(&lifted)?;
+    let mut inner = subquery.clone();
+    let LogicalPlan::Select {
+        projection: inner_projection,
+        filter: inner_filter,
+        sort: inner_sort,
+        distinct: inner_distinct,
+        distinct_on: inner_distinct_on,
+        limit: inner_limit,
+        ..
+    } = &mut inner
+    else {
+        return None;
+    };
+    // Existence ignores the subquery's projection, ordering, and duplicate
+    // removal.
+    inner_projection.clear();
+    *inner_filter = conjunction(&kept);
+    inner_sort.clear();
+    *inner_distinct = false;
+    inner_distinct_on.clear();
+    *inner_limit = None;
+    Some((
+        if anti { JoinType::Anti } else { JoinType::Semi },
+        Box::new(inner),
+        condition,
+    ))
+}
+
 impl JoinPlan {
     /// The `Join Filter` PostgreSQL shows: the conditions checked on each
     /// matched pair.
@@ -198,5 +414,121 @@ mod tests {
 
     fn deparse(filter: &FilterExpr) -> String {
         crate::explain::deparse_filter(filter, true)
+    }
+
+    /// The `WHERE` of a query, unconverted.
+    fn where_filter(sql: &str) -> FilterExpr {
+        let mut statements = nodus_sql::parse_sql(sql).unwrap();
+        let sqlparser::ast::Statement::Query(query) = statements.remove(0) else {
+            panic!("a query");
+        };
+        let sqlparser::ast::SetExpr::Select(select) = *query.body else {
+            panic!("a select");
+        };
+        crate::planner::parse_predicates(&select.selection, &[])
+            .unwrap()
+            .unwrap()
+    }
+
+    fn outer_quals(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| name.to_string()).collect()
+    }
+
+    #[test]
+    fn correlated_subqueries_become_semi_and_anti_joins() {
+        let (join_type, inner, condition) = semi_join(
+            &where_filter("select * from t1 where exists (select 1 from t2 where t2.a = t1.a)"),
+            &outer_quals(&["t1"]),
+        )
+        .unwrap();
+        assert!(matches!(join_type, JoinType::Semi));
+        assert_eq!(deparse(&condition), "(t2.a = t1.a)");
+        // The inner side keeps the relation, without its projection or the
+        // lifted correlation.
+        let LogicalPlan::Select {
+            table_name,
+            filter,
+            projection,
+            ..
+        } = &*inner
+        else {
+            panic!("a select");
+        };
+        assert_eq!(table_name, "t2");
+        assert!(filter.is_none() && projection.is_empty());
+
+        let (join_type, _, _) = semi_join(
+            &where_filter("select * from t1 where not exists (select 1 from t2 where t2.a = t1.a)"),
+            &outer_quals(&["t1"]),
+        )
+        .unwrap();
+        assert!(matches!(join_type, JoinType::Anti));
+
+        // `IN` compares the outer column with the subquery's output; a bare
+        // name on either side takes its own relation's qualifier.
+        let (join_type, _, condition) = semi_join(
+            &where_filter("select * from t1 where a in (select b from t2)"),
+            &outer_quals(&["t1"]),
+        )
+        .unwrap();
+        assert!(matches!(join_type, JoinType::Semi));
+        assert_eq!(deparse(&condition), "(t1.a = t2.b)");
+
+        // The subquery's own conditions stay with it.
+        let (_, inner, condition) = semi_join(
+            &where_filter(
+                "select * from t1 where exists (select 1 from t2 where t2.a = t1.a and t2.b = 'y')",
+            ),
+            &outer_quals(&["t1"]),
+        )
+        .unwrap();
+        assert_eq!(deparse(&condition), "(t2.a = t1.a)");
+        let LogicalPlan::Select { filter, .. } = &*inner else {
+            panic!("a select");
+        };
+        assert_eq!(
+            filter.as_ref().map(deparse).as_deref(),
+            Some("(t2.b = 'y'::text)")
+        );
+    }
+
+    #[test]
+    fn subquery_shapes_a_semi_join_cannot_take_stay_subplans() {
+        for sql in [
+            // Uncorrelated: PostgreSQL plans a one-time `InitPlan`.
+            "select * from t1 where exists (select 1 from t2)",
+            // `NOT IN` has NULL semantics an anti join does not reproduce.
+            "select * from t1 where a not in (select b from t2)",
+            // The row count is not the inner rows'.
+            "select * from t1 where exists (select max(a) from t2 where t2.a = t1.a)",
+            "select * from t1 where exists (select 1 from t2 group by a, t2.a having t2.a = t1.a)",
+            // A zero limit matches nothing.
+            "select * from t1 where exists (select 1 from t2 where t2.a = t1.a limit 0)",
+        ] {
+            assert!(
+                semi_join(&where_filter(sql), &outer_quals(&["t1"])).is_none(),
+                "{sql}"
+            );
+        }
+        // An ambiguous bare name (two outer relations could own it).
+        assert!(
+            semi_join(
+                &where_filter("select * from t1, t2 where b in (select b from t2)"),
+                &outer_quals(&["t1", "t2"])
+            )
+            .is_none()
+        );
+        // A limit of one and an ordering do not change existence.
+        let (_, inner, _) = semi_join(
+            &where_filter(
+                "select * from t1 where exists (select 1 from t2 where t2.a = t1.a order by t2.b limit 1)",
+            ),
+            &outer_quals(&["t1"]),
+        )
+        .unwrap();
+        let LogicalPlan::Select { limit, sort, .. } = &*inner else {
+            panic!("a select");
+        };
+        assert!(limit.is_none() && sort.is_empty());
     }
 }

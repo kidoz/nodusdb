@@ -918,6 +918,7 @@ fn test_join_execution() {
             using_columns: vec![],
             natural: false,
             table_fn: None,
+            semi_subquery: None,
         }],
         projection: vec![
             ProjectionItem::Column("books.title".into()),
