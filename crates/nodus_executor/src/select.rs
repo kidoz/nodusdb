@@ -23,7 +23,7 @@ struct HashJoinKeys {
 
 /// A row's hash key over `positions`: the values' canonical text, joined;
 /// `None` when any is NULL (which never matches, as `=` never does).
-fn hash_key(row: &[Value], positions: &[usize]) -> Option<String> {
+pub(crate) fn hash_key(row: &[Value], positions: &[usize]) -> Option<String> {
     let mut key = String::new();
     for position in positions {
         let value = row.get(*position)?;

@@ -32,7 +32,7 @@ impl MemExecutor {
             self.authorize(ctx, action, ResourceRef::Table(tbl.id))?;
         }
         let target = (table_name.as_str(), table_alias.as_deref());
-        let scope = self.target_scope(ctx, &tbl, target, Some(source), true)?;
+        let scope = self.target_scope(ctx, &tbl, target, Some(source), &[], true)?;
         let returning = scope.returning_positions(&returning, true)?;
 
         // What each part of the statement can name: a NOT MATCHED BY SOURCE

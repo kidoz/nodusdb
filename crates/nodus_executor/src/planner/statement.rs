@@ -1182,15 +1182,26 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
             };
             let (returning, returning_exprs) =
                 plan_returning(&update.returning, ReturningOf::Change, params)?;
+            // `[NOT] EXISTS` / `IN` in the condition join the target as
+            // semi/anti joins, as PostgreSQL plans them.
+            let mut quals = vec![table_alias.clone().unwrap_or_else(|| table_name.clone())];
+            if let Some(from) = &from {
+                quals.extend(crate::joins::relation_labels(from));
+            }
+            let (joins, filter) = crate::joins::semi_joins(
+                parse_predicates(&update.selection, params)?.as_ref(),
+                &quals,
+            );
             Ok(LogicalPlan::Update {
                 only,
                 assignments: plan_assignments(&update.assignments, params)?,
-                filter: parse_predicates(&update.selection, params)?,
+                filter,
                 returning,
                 returning_exprs,
                 table_name,
                 table_alias,
                 from,
+                joins,
             })
         }
         Statement::Delete(delete) => {
@@ -1214,14 +1225,25 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
             };
             let (returning, returning_exprs) =
                 plan_returning(&delete.returning, ReturningOf::Change, params)?;
+            // `[NOT] EXISTS` / `IN` in the condition join the target as
+            // semi/anti joins, as PostgreSQL plans them.
+            let mut quals = vec![table_alias.clone().unwrap_or_else(|| table_name.clone())];
+            if let Some(using) = &using {
+                quals.extend(crate::joins::relation_labels(using));
+            }
+            let (joins, filter) = crate::joins::semi_joins(
+                parse_predicates(&delete.selection, params)?.as_ref(),
+                &quals,
+            );
             Ok(LogicalPlan::Delete {
                 only,
                 table_name,
-                filter: parse_predicates(&delete.selection, params)?,
+                filter,
                 returning,
                 returning_exprs,
                 table_alias,
                 using,
+                joins,
             })
         }
         Statement::Merge(merge) => plan_merge(merge, params),

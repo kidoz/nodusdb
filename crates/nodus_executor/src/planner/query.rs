@@ -504,33 +504,16 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
     // `[NOT] EXISTS (...)` and `IN (...)`: when the subquery correlates with
     // the outer row through its `WHERE`, the correlation predicates become a
     // semi/anti join over the subquery's relations, as PostgreSQL plans it.
-    if let Some(filter_expr) = &filter {
+    if filter.is_some() {
         let mut outer_quals = vec![table_alias.clone().unwrap_or_else(|| table_name.clone())];
         outer_quals.extend(joins.iter().map(|j| {
             j.table_alias
                 .clone()
                 .unwrap_or_else(|| j.table_name.clone())
         }));
-        let mut remaining = Vec::new();
-        for conjunct in crate::index_keys::conjuncts(filter_expr) {
-            match crate::joins::semi_join(conjunct, &outer_quals) {
-                Some((join_type, subquery, condition)) => joins.push(crate::Join {
-                    only: false,
-                    table_name: String::new(),
-                    table_alias: None,
-                    condition: Some(condition),
-                    join_type,
-                    using_columns: Vec::new(),
-                    natural: false,
-                    table_fn: None,
-                    lateral: None,
-                    sample: None,
-                    semi_subquery: Some(subquery),
-                }),
-                None => remaining.push(conjunct.clone()),
-            }
-        }
-        filter = crate::joins::conjunction(&remaining);
+        let (semi, rest) = crate::joins::semi_joins(filter.as_ref(), &outer_quals);
+        joins.extend(semi);
+        filter = rest;
     }
     Ok(LogicalPlan::Select {
         only,

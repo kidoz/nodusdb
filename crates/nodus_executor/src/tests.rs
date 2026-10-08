@@ -533,6 +533,7 @@ fn rows_keyed_by_declared_pk_not_first_column() {
             returning: vec![],
             table_alias: None,
             using: None,
+            joins: vec![],
             returning_exprs: vec![],
         },
     )
@@ -723,6 +724,7 @@ fn update_and_delete_rows() {
                 returning: vec![],
                 table_alias: None,
                 from: None,
+                joins: vec![],
                 returning_exprs: vec![],
             },
         )
@@ -770,6 +772,7 @@ fn update_and_delete_rows() {
                 returning: vec![],
                 table_alias: None,
                 using: None,
+                joins: vec![],
                 returning_exprs: vec![],
             },
         )

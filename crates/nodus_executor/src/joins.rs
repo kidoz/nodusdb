@@ -123,6 +123,39 @@ pub(crate) fn conjunction(parts: &[FilterExpr]) -> Option<FilterExpr> {
     }))
 }
 
+/// The semi/anti joins a condition's `[NOT] EXISTS` / `IN` conjuncts
+/// become, and the rest of the condition. Shared by `SELECT` and by
+/// `UPDATE`/`DELETE`, whose plans carry the joins beside the target.
+pub(crate) fn semi_joins(
+    filter: Option<&FilterExpr>,
+    outer_quals: &[String],
+) -> (Vec<crate::Join>, Option<FilterExpr>) {
+    let Some(filter) = filter else {
+        return (Vec::new(), None);
+    };
+    let mut joins = Vec::new();
+    let mut remaining = Vec::new();
+    for conjunct in crate::index_keys::conjuncts(filter) {
+        match semi_join(conjunct, outer_quals) {
+            Some((join_type, subquery, condition)) => joins.push(crate::Join {
+                only: false,
+                table_name: String::new(),
+                table_alias: None,
+                condition: Some(condition),
+                join_type,
+                using_columns: Vec::new(),
+                natural: false,
+                table_fn: None,
+                lateral: None,
+                sample: None,
+                semi_subquery: Some(subquery),
+            }),
+            None => remaining.push(conjunct.clone()),
+        }
+    }
+    (joins, conjunction(&remaining))
+}
+
 /// The comparison an `ANY` operator stands for.
 fn compare_of(op: &crate::plan_types::ScalarBinaryOp) -> Option<CompareOp> {
     Some(match op {
@@ -134,6 +167,19 @@ fn compare_of(op: &crate::plan_types::ScalarBinaryOp) -> Option<CompareOp> {
         crate::plan_types::ScalarBinaryOp::GtEq => CompareOp::Ge,
         _ => return None,
     })
+}
+
+/// The distinct qualifiers of a row's column names, in order.
+pub(crate) fn qualifiers(names: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for name in names {
+        if let Some((qualifier, _)) = name.rsplit_once('.')
+            && !out.iter().any(|q| q == qualifier)
+        {
+            out.push(qualifier.to_string());
+        }
+    }
+    out
 }
 
 /// The relations a plan's `FROM` reads, by the label each is scanned
@@ -542,6 +588,25 @@ mod tests {
                 &outer_quals(&["t1"]),
             )
             .is_none()
+        );
+    }
+
+    #[test]
+    fn a_condition_splits_into_semi_joins_and_the_rest() {
+        let filter = where_filter(
+            "select * from t1 where exists (select 1 from t2 where t2.a = t1.a) and b = 'x'",
+        );
+        let (joins, rest) = semi_joins(Some(&filter), &outer_quals(&["t1"]));
+        assert_eq!(joins.len(), 1);
+        assert!(matches!(joins[0].join_type, JoinType::Semi));
+        assert!(joins[0].semi_subquery.is_some());
+        assert_eq!(
+            joins[0].condition.as_ref().map(deparse).as_deref(),
+            Some("(t2.a = t1.a)")
+        );
+        assert_eq!(
+            rest.as_ref().map(deparse).as_deref(),
+            Some("(b = 'x'::text)")
         );
     }
 

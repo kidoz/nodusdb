@@ -131,6 +131,7 @@ fn test_group_by_aggregates() {
             returning: vec![],
             table_alias: None,
             using: None,
+            joins: vec![],
             returning_exprs: vec![],
         },
     )

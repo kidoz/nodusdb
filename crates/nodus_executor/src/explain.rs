@@ -969,12 +969,14 @@ impl MemExecutor {
                 table_alias,
                 filter,
                 from,
+                joins,
                 ..
             } => self.explain_modify(
                 ctx,
                 "Update",
                 (table_name, table_alias.as_deref()),
                 from.as_deref(),
+                joins,
                 filter.as_ref(),
                 ctes,
             )?,
@@ -983,12 +985,14 @@ impl MemExecutor {
                 table_alias,
                 filter,
                 using,
+                joins,
                 ..
             } => self.explain_modify(
                 ctx,
                 "Delete",
                 (table_name, table_alias.as_deref()),
                 using.as_deref(),
+                joins,
                 filter.as_ref(),
                 ctes,
             )?,
@@ -1047,9 +1051,24 @@ impl MemExecutor {
         operation: &str,
         (table_name, table_alias): (&str, Option<&str>),
         source: Option<&LogicalPlan>,
+        joins: &[crate::Join],
         filter: Option<&FilterExpr>,
         ctes: &[(String, &LogicalPlan)],
     ) -> Result<Node> {
+        // An equality between the target and the relations hashes, with
+        // each side's own conditions on its scan, as PostgreSQL plans it.
+        let target_prefix = relation_name(table_alias.unwrap_or(table_name));
+        let source_plan = source;
+        let source_prefixes = source_plan
+            .map(crate::joins::relation_labels)
+            .unwrap_or_default();
+        let target_refs: Vec<&str> = std::iter::once(target_prefix.as_str()).collect();
+        let source_refs: Vec<&str> = source_prefixes.iter().map(String::as_str).collect();
+        let hash =
+            source_plan.and_then(|_| crate::joins::hash_plan(filter, &target_refs, &source_refs));
+        let target_filter = hash.as_ref().and_then(|plan| plan.left_filter());
+        let source_filter = hash.as_ref().and_then(|plan| plan.right_filter());
+        let pair_filter = hash.as_ref().and_then(|plan| plan.join_filter());
         // A target with descendants is scanned partition by partition, each
         // listed as a result relation; the scan itself is pruned the way a
         // query's is.
@@ -1065,7 +1084,14 @@ impl MemExecutor {
                             return None;
                         }
                         let scans = self
-                            .scan_tables(db_name, &tbl, table_alias, table_only, filter, false)
+                            .scan_tables(
+                                db_name,
+                                &tbl,
+                                table_alias,
+                                table_only,
+                                target_filter.as_ref().or(filter),
+                                false,
+                            )
                             .ok()?;
                         (!scans.is_empty()).then_some((tbl, scans))
                     },
@@ -1081,7 +1107,8 @@ impl MemExecutor {
                         relation_name(&table.name)
                     ));
                 }
-                let children = self.scan_children(ctx, &scans, filter)?;
+                let children =
+                    self.scan_children(ctx, &scans, target_filter.as_ref().or(filter))?;
                 let scan = if children.len() == 1 {
                     children.into_iter().next().unwrap()
                 } else {
@@ -1097,28 +1124,175 @@ impl MemExecutor {
                 (scan, lines)
             }
             (None, None) => (
-                self.explain_relation(ctx, table_name, table_alias, filter, ctes, None, false)?,
+                self.explain_relation(
+                    ctx,
+                    table_name,
+                    table_alias,
+                    target_filter.as_ref().or(filter),
+                    ctes,
+                    None,
+                    false,
+                )?,
                 Vec::new(),
             ),
             (Some(source), _) => {
-                let target =
-                    self.explain_relation(ctx, table_name, table_alias, None, ctes, None, false)?;
-                let source = self.explain_node(ctx, source, ctes)?;
-                let mut join = Node::over("Nested Loop", "Nested Loop", vec![target, source])
-                    .prop("Join Type", json!("Inner"));
-                if let Some(f) = filter {
-                    join = join.detail("Join Filter", deparse_filter(f, true));
+                let target = self.explain_relation(
+                    ctx,
+                    table_name,
+                    table_alias,
+                    target_filter.as_ref(),
+                    ctes,
+                    None,
+                    false,
+                )?;
+                let mut source_node = self.explain_node(ctx, source, ctes)?;
+                if let Some(f) = &source_filter {
+                    source_node = source_node.detail("Filter", deparse_filter(f, false));
                 }
-                (join, Vec::new())
+                let mut node = match &hash {
+                    Some(plan) => {
+                        let text = plan
+                            .hash_pairs
+                            .iter()
+                            .map(|(target, source)| format!("({target} = {source})"))
+                            .collect::<Vec<_>>()
+                            .join(" AND ");
+                        let text = if text.matches(" = ").count() > 1 {
+                            format!("({text})")
+                        } else {
+                            text
+                        };
+                        let mut hashed = Node::over("Hash", "Hash", vec![source_node]);
+                        hashed.total = 0.0;
+                        let join = Node::over("Hash Join", "Hash Join", vec![target, hashed])
+                            .prop("Join Type", json!("Inner"))
+                            .detail("Hash Cond", text);
+                        if let Some(f) = &pair_filter {
+                            join.detail("Join Filter", deparse_filter(f, true))
+                        } else {
+                            join
+                        }
+                    }
+                    None => {
+                        // A nested loop reads the relations' rows again for
+                        // every target row, so they are materialized.
+                        if crate::session_env::setting("enable_material").as_deref() != Some("off")
+                            && !matches!(
+                                source_node.kind.as_str(),
+                                "Index Scan" | "Index Only Scan"
+                            )
+                        {
+                            let mut materialize =
+                                Node::over("Materialize", "Materialize", vec![source_node]);
+                            materialize.total = 0.0;
+                            source_node = materialize;
+                        }
+                        let mut join =
+                            Node::over("Nested Loop", "Nested Loop", vec![target, source_node])
+                                .prop("Join Type", json!("Inner"));
+                        if let Some(f) = filter {
+                            join = join.detail("Join Filter", deparse_filter(f, true));
+                        }
+                        join
+                    }
+                };
+                (node, Vec::new())
             }
         };
+        // The condition's `[NOT] EXISTS` / `IN` subqueries join as
+        // semi/anti joins.
+        let mut node = child;
+        let mut outer_prefixes = vec![target_prefix.clone()];
+        if source_plan.is_some() {
+            outer_prefixes.extend(source_prefixes.iter().cloned());
+        }
+        for join in joins {
+            let Some(plan) = &join.semi_subquery else {
+                continue;
+            };
+            let inner = self.explain_node(ctx, plan, ctes)?;
+            let inner_prefixes = crate::joins::relation_quals(plan);
+            let left_refs: Vec<&str> = outer_prefixes.iter().map(String::as_str).collect();
+            let right_refs: Vec<&str> = inner_prefixes.iter().map(String::as_str).collect();
+            let sub_hash =
+                crate::joins::hash_plan(join.condition.as_ref(), &left_refs, &right_refs);
+            let anti = matches!(join.join_type, crate::JoinType::Anti);
+            let (kind, label) = match (&sub_hash, anti) {
+                (Some(_), false) => ("Semi", "Hash Semi Join"),
+                (Some(_), true) => ("Anti", "Hash Anti Join"),
+                (None, false) => ("Semi", "Nested Loop Semi Join"),
+                (None, true) => ("Anti", "Nested Loop Anti Join"),
+            };
+            let (hashed_condition, condition) = match (&sub_hash, &join.condition) {
+                (Some(plan), _) => {
+                    let text = plan
+                        .hash_pairs
+                        .iter()
+                        .map(|(left, right)| format!("({left} = {right})"))
+                        .collect::<Vec<_>>()
+                        .join(" AND ");
+                    let text = if plan.hash_pairs.len() > 1 {
+                        format!("({text})")
+                    } else {
+                        text
+                    };
+                    (true, Some(text))
+                }
+                (None, Some(c)) => (false, Some(deparse_filter(c, true))),
+                (None, None) => (false, None),
+            };
+            let width = node.width;
+            let rows = node.rows.max(inner.rows);
+            let mut joined = Node::over(
+                if sub_hash.is_some() {
+                    "Hash Join"
+                } else {
+                    "Nested Loop"
+                },
+                label,
+                vec![node],
+            )
+            .prop("Join Type", json!(kind));
+            joined.width = width;
+            joined.rows = rows;
+            if let Some(condition) = condition {
+                joined = joined.detail(
+                    if hashed_condition {
+                        "Hash Cond"
+                    } else {
+                        "Join Filter"
+                    },
+                    condition,
+                );
+            }
+            if let Some(plan) = &sub_hash
+                && let Some(f) = plan.join_filter()
+            {
+                joined = joined.detail("Join Filter", deparse_filter(&f, true));
+            }
+            if sub_hash.is_some() {
+                let mut hashed = Node::over("Hash", "Hash", vec![inner]);
+                hashed.total = 0.0;
+                joined.children.push(hashed);
+            } else if crate::session_env::setting("enable_material").as_deref() != Some("off")
+                && !matches!(inner.kind.as_str(), "Index Scan" | "Index Only Scan")
+            {
+                let mut materialize = Node::over("Materialize", "Materialize", vec![inner]);
+                materialize.total = 0.0;
+                joined.children.push(materialize);
+            } else {
+                joined.children.push(inner);
+            }
+            node = joined;
+            outer_prefixes.extend(inner_prefixes);
+        }
         let mut node = Node::over(
             "ModifyTable",
             format!(
                 "{operation} on {}",
                 scan_label_name(table_name, table_alias)
             ),
-            vec![child],
+            vec![node],
         )
         .prop("Operation", json!(operation))
         .prop("Relation Name", json!(relation_name(table_name)));

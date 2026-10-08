@@ -586,8 +586,14 @@ impl MemExecutor {
         for row in &rows {
             self.check_view_option(ctx, &wv, row)?;
         }
-        let scope =
-            self.target_scope(ctx, &wv.view, (&table_name, alias.as_deref()), None, false)?;
+        let scope = self.target_scope(
+            ctx,
+            &wv.view,
+            (&table_name, alias.as_deref()),
+            None,
+            &[],
+            false,
+        )?;
         let returned = scope.returning_positions(&returning, false)?;
         let view_rows = if returned.is_empty() {
             Vec::new()
@@ -606,6 +612,7 @@ impl MemExecutor {
         (table_name, table_alias): (String, Option<String>),
         assignments: Vec<(String, ScalarExpr)>,
         from: Option<LogicalPlan>,
+        joins: Vec<crate::Join>,
         filter: Option<FilterExpr>,
         returning: Returning,
     ) -> Result<QueryOutput> {
@@ -619,6 +626,7 @@ impl MemExecutor {
             &wv.view,
             (&table_name, table_alias.as_deref()),
             from,
+            &joins,
             false,
         )?;
         let returned = scope.returning_positions(&returning, false)?;
@@ -700,6 +708,7 @@ impl MemExecutor {
         wv: WritableView,
         (table_name, table_alias): (String, Option<String>),
         using: Option<LogicalPlan>,
+        joins: Vec<crate::Join>,
         filter: Option<FilterExpr>,
         returning: Returning,
     ) -> Result<QueryOutput> {
@@ -709,6 +718,7 @@ impl MemExecutor {
             &wv.view,
             (&table_name, table_alias.as_deref()),
             using,
+            &joins,
             false,
         )?;
         let returned = scope.returning_positions(&returning, false)?;

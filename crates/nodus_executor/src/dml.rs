@@ -76,6 +76,23 @@ pub(crate) struct TargetScope {
     /// target with descendants does): each returned row then appends the
     /// OID of the table it really lives in.
     pub(crate) tableoid: bool,
+    /// The `[NOT] EXISTS` / `IN` subqueries the condition was split into:
+    /// each runs once and is probed per matched row, as PostgreSQL's
+    /// semi/anti joins do.
+    pub(crate) semi_joins: Vec<SemiJoinSide>,
+}
+
+/// A semi/anti join beside a data-modifying statement's target: the
+/// subquery's rows, and the keys (when the condition has equalities) or the
+/// condition itself to decide a match.
+pub(crate) struct SemiJoinSide {
+    anti: bool,
+    rows: Vec<Vec<Value>>,
+    names: Vec<String>,
+    columns: Vec<ColumnDescriptor>,
+    condition: Option<FilterExpr>,
+    /// `(joined-row position, subquery-row position)` equalities.
+    keys: Option<(Vec<usize>, Vec<usize>)>,
 }
 
 impl TargetScope {
@@ -466,7 +483,7 @@ impl MemExecutor {
             );
         }
         self.authorize(ctx, Action::Insert, ResourceRef::Table(tbl.id))?;
-        let scope = self.target_scope(ctx, &tbl, (&table_name, alias), None, false)?;
+        let scope = self.target_scope(ctx, &tbl, (&table_name, alias), None, &[], false)?;
         let returning = scope.returning_positions(&returning, false)?;
 
         // Target column positions, in the order values are supplied.
@@ -737,6 +754,7 @@ impl MemExecutor {
         (table_name, table_alias): (String, Option<String>),
         assignments: Vec<(String, ScalarExpr)>,
         from: Option<LogicalPlan>,
+        joins: Vec<crate::Join>,
         filter: Option<FilterExpr>,
         returning: Returning,
         only: bool,
@@ -753,6 +771,7 @@ impl MemExecutor {
                 (table_name, table_alias),
                 assignments,
                 from,
+                joins,
                 filter,
                 returning,
             );
@@ -767,6 +786,7 @@ impl MemExecutor {
             &tbl,
             (&table_name, table_alias.as_deref()),
             from,
+            &joins,
             false,
         )?;
         let returning = scope.returning_positions(&returning, false)?;
@@ -858,6 +878,7 @@ impl MemExecutor {
         ctx: &ExecutionContext,
         (table_name, table_alias): (String, Option<String>),
         using: Option<LogicalPlan>,
+        joins: Vec<crate::Join>,
         filter: Option<FilterExpr>,
         returning: Returning,
         only: bool,
@@ -873,6 +894,7 @@ impl MemExecutor {
                 view,
                 (table_name, table_alias),
                 using,
+                joins,
                 filter,
                 returning,
             );
@@ -884,6 +906,7 @@ impl MemExecutor {
             &tbl,
             (&table_name, table_alias.as_deref()),
             using,
+            &joins,
             false,
         )?;
         let returning = scope.returning_positions(&returning, false)?;
@@ -1048,6 +1071,7 @@ impl MemExecutor {
         tbl: &nodus_catalog::TableDescriptor,
         (table_name, table_alias): (&str, Option<&str>),
         source: Option<LogicalPlan>,
+        joins: &[crate::Join],
         merge: bool,
     ) -> Result<TargetScope> {
         let refname = |qualified: &str| {
@@ -1074,6 +1098,7 @@ impl MemExecutor {
                 names.push(name.clone());
                 columns.push(Self::virtual_column("tableoid", "OID"));
             }
+            let semi_joins = self.semi_join_sides(ctx, &joins, &names, &columns)?;
             return Ok(TargetScope {
                 names,
                 columns,
@@ -1081,6 +1106,7 @@ impl MemExecutor {
                 width: tbl.columns.len(),
                 hidden,
                 tableoid: tableoid.is_some(),
+                semi_joins,
             });
         };
         let out = self.relation_rows(ctx, source)?;
@@ -1120,6 +1146,7 @@ impl MemExecutor {
             names.push(name.clone());
             columns.push(Self::virtual_column("tableoid", "OID"));
         }
+        let semi_joins = self.semi_join_sides(ctx, &joins, &names, &columns)?;
         Ok(TargetScope {
             names,
             columns,
@@ -1127,7 +1154,76 @@ impl MemExecutor {
             width: tbl.columns.len(),
             hidden,
             tableoid: tableoid.is_some(),
+            semi_joins,
         })
+    }
+
+    /// The semi/anti joins a `UPDATE`/`DELETE` condition was split into:
+    /// each subquery runs once, and its condition's equalities become probe
+    /// keys against the statement's rows.
+    fn semi_join_sides(
+        &self,
+        ctx: &ExecutionContext,
+        joins: &[crate::Join],
+        names: &[String],
+        columns: &[ColumnDescriptor],
+    ) -> Result<Vec<SemiJoinSide>> {
+        let mut sides = Vec::new();
+        for join in joins {
+            let Some(plan) = &join.semi_subquery else {
+                continue;
+            };
+            // Uncorrelated by construction: one execution, cached per
+            // statement.
+            let out = self
+                .run_subplan(ctx, plan, &[], names)
+                .unwrap_or_else(|| QueryOutput::default());
+            let inner_names: Vec<String> = out.columns.clone();
+            let now = Utc::now();
+            let inner_columns: Vec<ColumnDescriptor> = inner_names
+                .iter()
+                .zip(
+                    out.types
+                        .iter()
+                        .chain(std::iter::repeat(&"VARCHAR".to_string())),
+                )
+                .map(|(name, ty)| ColumnDescriptor {
+                    id: nodus_catalog::ColumnId::new(),
+                    name: name.clone(),
+                    version: 1,
+                    created_at: now,
+                    updated_at: now,
+                    state: DescriptorState::Public,
+                    data_type: ty.clone(),
+                    nullable: true,
+                    default_expr: None,
+                    comment: None,
+                })
+                .collect();
+            let outer_quals = crate::joins::qualifiers(names);
+            let inner_quals = crate::joins::qualifiers(&inner_names);
+            let outer_refs: Vec<&str> = outer_quals.iter().map(String::as_str).collect();
+            let inner_refs: Vec<&str> = inner_quals.iter().map(String::as_str).collect();
+            let keys = crate::joins::hash_plan(join.condition.as_ref(), &outer_refs, &inner_refs)
+                .and_then(|plan| {
+                    let mut left = Vec::new();
+                    let mut right = Vec::new();
+                    for (outer, inner) in &plan.hash_pairs {
+                        left.push(crate::filter_eval::col_pos(names, outer)?);
+                        right.push(crate::filter_eval::col_pos(&inner_names, inner)?);
+                    }
+                    Some((left, right))
+                });
+            sides.push(SemiJoinSide {
+                anti: matches!(join.join_type, crate::JoinType::Anti),
+                rows: out.rows.into_iter().map(|r| r.values).collect(),
+                names: inner_names,
+                columns: inner_columns,
+                condition: join.condition.clone(),
+                keys,
+            });
+        }
+        Ok(sides)
     }
 
     /// Each target row `filter` matches, as `(key, row, joined row)`: the
@@ -1152,6 +1248,45 @@ impl MemExecutor {
         if !only {
             tables.extend(self.descendants("default", tbl.id)?);
         }
+        // The target's rows join the relations' rows: an equality between
+        // the sides hashes (with each side's own conditions applied to it),
+        // anything else reads them in turn. The subqueries the condition
+        // was split into probe each matched row.
+        let width = scope.width;
+        let source_names: Vec<String> = scope.names[width..].to_vec();
+        let source_columns: Vec<ColumnDescriptor> = scope.columns[width..].to_vec();
+        let target_quals = crate::joins::qualifiers(&scope.names[..width]);
+        let source_quals = crate::joins::qualifiers(&source_names);
+        let target_refs: Vec<&str> = target_quals.iter().map(String::as_str).collect();
+        let source_refs: Vec<&str> = source_quals.iter().map(String::as_str).collect();
+        let hash = crate::joins::hash_plan(filter, &target_refs, &source_refs).and_then(|plan| {
+            let mut left = Vec::new();
+            let mut right = Vec::new();
+            for (target, source) in &plan.hash_pairs {
+                left.push(scope.names.iter().position(|n| n == target)?);
+                right.push(source_names.iter().position(|n| n == source)?);
+            }
+            Some((left, right, plan))
+        });
+        // The relations' rows by their key, in their own order.
+        let buckets: Option<std::collections::HashMap<String, Vec<Vec<Value>>>> =
+            hash.as_ref().map(|(_, right, plan)| {
+                let mut table: std::collections::HashMap<String, Vec<Vec<Value>>> =
+                    std::collections::HashMap::new();
+                for source in &scope.source_rows {
+                    if let Some(f) = plan.right_filter()
+                        && !self
+                            .eval_filter(ctx, source, &source_names, &source_columns, Some(&f))
+                            .unwrap_or(false)
+                    {
+                        continue;
+                    }
+                    if let Some(key) = crate::select::hash_key(source, right) {
+                        table.entry(key).or_default().push(source.clone());
+                    }
+                }
+                table
+            });
         let mut matches = Vec::new();
         for table in &tables {
             let projection: Vec<Option<usize>> = tbl
@@ -1164,12 +1299,78 @@ impl MemExecutor {
                     .iter()
                     .map(|at| at.and_then(|i| row.get(i)).cloned().unwrap_or(Value::Null))
                     .collect();
-                let joined = scope.source_rows.iter().find_map(|source| {
-                    let mut joined = projected.clone();
-                    joined.extend(source.iter().cloned());
-                    self.eval_filter(ctx, &joined, &scope.names, &scope.columns, filter)
+                // The target's own conditions, before the join.
+                if let Some((_, _, plan)) = &hash
+                    && let Some(f) = plan.left_filter()
+                    && !self
+                        .eval_filter(ctx, &projected, &scope.names, &scope.columns, Some(&f))
                         .unwrap_or(false)
-                        .then_some(joined)
+                {
+                    continue;
+                }
+                let joined = match &hash {
+                    Some((left, right, _)) => {
+                        crate::select::hash_key(&projected, left).and_then(|key| {
+                            buckets.as_ref()?.get(&key).and_then(|rows| {
+                                rows.iter().find_map(|source| {
+                                    if !left.iter().zip(right).all(|(l, r)| {
+                                        crate::value::values_equal(&projected[*l], &source[*r])
+                                    }) {
+                                        return None;
+                                    }
+                                    let mut joined = projected.clone();
+                                    joined.extend(source.iter().cloned());
+                                    self.eval_filter(
+                                        ctx,
+                                        &joined,
+                                        &scope.names,
+                                        &scope.columns,
+                                        filter,
+                                    )
+                                    .unwrap_or(false)
+                                    .then_some(joined)
+                                })
+                            })
+                        })
+                    }
+                    None => scope.source_rows.iter().find_map(|source| {
+                        let mut joined = projected.clone();
+                        joined.extend(source.iter().cloned());
+                        self.eval_filter(ctx, &joined, &scope.names, &scope.columns, filter)
+                            .unwrap_or(false)
+                            .then_some(joined)
+                    }),
+                };
+                // The statement's semi/anti joins decide the row.
+                let joined = joined.filter(|joined| {
+                    scope.semi_joins.iter().all(|side| {
+                        let hit = match &side.keys {
+                            Some((left, right)) => side.rows.iter().any(|inner| {
+                                left.iter().zip(right).all(|(l, r)| {
+                                    crate::value::values_equal(&joined[*l], &inner[*r])
+                                })
+                            }),
+                            None => {
+                                let mut names = scope.names.clone();
+                                names.extend(side.names.iter().cloned());
+                                let mut columns = scope.columns.clone();
+                                columns.extend(side.columns.iter().cloned());
+                                side.rows.iter().any(|inner| {
+                                    let mut combined = joined.clone();
+                                    combined.extend(inner.iter().cloned());
+                                    self.eval_filter(
+                                        ctx,
+                                        &combined,
+                                        &names,
+                                        &columns,
+                                        side.condition.as_ref(),
+                                    )
+                                    .unwrap_or(false)
+                                })
+                            }
+                        };
+                        hit != side.anti
+                    })
                 });
                 if let Some(joined) = joined {
                     matches.push(TargetMatch {

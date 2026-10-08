@@ -1777,6 +1777,12 @@ pub enum LogicalPlan {
         /// filter and assignments may read.
         #[serde(default)]
         from: Option<Box<LogicalPlan>>,
+        /// `[NOT] EXISTS` / `IN` subqueries out of the condition, run as
+        /// semi/anti joins against each target row (`JoinType::Semi` /
+        /// `Anti` with `Join::semi_subquery`). Defaulted so older plans
+        /// decode.
+        #[serde(default)]
+        joins: Vec<Join>,
     },
     Delete {
         table_name: String,
@@ -1798,6 +1804,11 @@ pub enum LogicalPlan {
         /// the filter may read.
         #[serde(default)]
         using: Option<Box<LogicalPlan>>,
+        /// `[NOT] EXISTS` / `IN` subqueries out of the condition, run as
+        /// semi/anti joins against each target row. Defaulted so older plans
+        /// decode.
+        #[serde(default)]
+        joins: Vec<Join>,
     },
     /// `BEGIN [READ ONLY | READ WRITE] [ISOLATION LEVEL ...]`, or with
     /// `start` `START TRANSACTION ...`.

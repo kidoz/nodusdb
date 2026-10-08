@@ -424,6 +424,7 @@ fn test_unique_constraints() {
             returning: vec![],
             table_alias: None,
             from: None,
+            joins: vec![],
             returning_exprs: vec![],
         },
     );
@@ -446,6 +447,7 @@ fn test_unique_constraints() {
             returning: vec![],
             table_alias: None,
             from: None,
+            joins: vec![],
             returning_exprs: vec![],
         },
     );
@@ -633,6 +635,7 @@ fn test_secondary_indexing() {
             returning: vec![],
             table_alias: None,
             from: None,
+            joins: vec![],
             returning_exprs: vec![],
         },
     )
@@ -716,6 +719,7 @@ fn test_secondary_indexing() {
             returning: vec![],
             table_alias: None,
             using: None,
+            joins: vec![],
             returning_exprs: vec![],
         },
     )
@@ -1042,6 +1046,7 @@ fn test_alter_table_migrations() {
             returning: vec![],
             table_alias: None,
             from: None,
+            joins: vec![],
             returning_exprs: vec![],
         },
     )

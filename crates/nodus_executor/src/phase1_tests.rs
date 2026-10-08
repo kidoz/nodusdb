@@ -159,6 +159,7 @@ fn test_offset_distinct_returning() {
                 returning: vec!["id".into(), "val".into()],
                 table_alias: None,
                 from: None,
+                joins: vec![],
                 returning_exprs: vec![],
             },
         )
