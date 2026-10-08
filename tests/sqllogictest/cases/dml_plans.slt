@@ -1,0 +1,177 @@
+# `UPDATE ... FROM` / `DELETE ... USING` plan their relations as a hash
+# join against the target, with each side's own conditions on its scan,
+# and `[NOT] EXISTS` / `IN` in the condition as semi/anti joins under the
+# `Update`/`Delete` node — as PostgreSQL plans them. Results are from
+# PostgreSQL 18.4; where PostgreSQL hashes the other side, the join is
+# the mirror of its plan.
+
+statement ok
+drop table if exists d1 cascade;
+
+statement ok
+drop table if exists d2 cascade;
+
+statement ok
+create table d1 (a int, b text);
+
+statement ok
+create table d2 (a int, b text);
+
+statement ok
+insert into d1 values (1, 'x1'), (2, 'x2'), (3, 'x3'), (null, 'xn'), (4, 'x4');
+
+statement ok
+insert into d2 values (2, 'y2'), (3, 'y3'), (3, 'y3b'), (null, 'yn'), (5, 'y5');
+
+statement ok
+analyze d1;
+
+statement ok
+analyze d2;
+
+query T
+explain (costs off) delete from d1 using d2 where d1.a = d2.a and d2.b = 'y2';
+----
+Delete on d1
+  ->  Hash Join
+        Hash Cond: (d1.a = d2.a)
+        ->  Seq Scan on d1
+        ->  Hash
+              ->  Seq Scan on d2
+                    Filter: (b = 'y2'::text)
+
+
+query T
+explain (costs off) update d1 set b = 'z' from d2 where d1.a = d2.a;
+----
+Update on d1
+  ->  Hash Join
+        Hash Cond: (d1.a = d2.a)
+        ->  Seq Scan on d1
+        ->  Hash
+              ->  Seq Scan on d2
+
+
+# A correlation with no equality is a nested loop over a materialized
+# source, with one side's own conditions on its scan.
+query T
+explain (costs off) update d1 set b = 'z' from d2 where d1.a > d2.a;
+----
+Update on d1
+  ->  Nested Loop
+        Join Filter: (d1.a > d2.a)
+        ->  Seq Scan on d1
+        ->  Materialize
+              ->  Seq Scan on d2
+
+
+# The condition's existentials join the target too.
+query T
+explain (costs off) delete from d1 where exists (select 1 from d2 where d2.a = d1.a);
+----
+Delete on d1
+  ->  Hash Semi Join
+        Hash Cond: (d1.a = d2.a)
+        ->  Seq Scan on d1
+        ->  Hash
+              ->  Seq Scan on d2
+
+
+query T
+explain (costs off) delete from d1 where not exists (select 1 from d2 where d2.a = d1.a);
+----
+Delete on d1
+  ->  Hash Anti Join
+        Hash Cond: (d1.a = d2.a)
+        ->  Seq Scan on d1
+        ->  Hash
+              ->  Seq Scan on d2
+
+
+query T
+explain (costs off) update d1 set b = 'z' where a in (select a from d2);
+----
+Update on d1
+  ->  Hash Semi Join
+        Hash Cond: (d1.a = d2.a)
+        ->  Seq Scan on d1
+        ->  Hash
+              ->  Seq Scan on d2
+
+
+# A residual condition stays beside the semi join.
+query T
+explain (costs off) update d1 set b = 'z' where a in (select a from d2) and b <> 'x1';
+----
+Update on d1
+  ->  Hash Semi Join
+        Hash Cond: (d1.a = d2.a)
+        ->  Seq Scan on d1
+              Filter: (b <> 'x1'::text)
+        ->  Hash
+              ->  Seq Scan on d2
+
+
+query T
+explain (costs off) delete from d1 where a > 3;
+----
+Delete on d1
+  ->  Seq Scan on d1
+        Filter: (a > 3)
+
+
+# The join decides which rows change, and `RETURNING` reports them.
+query T rowsort
+update d1 set b = 'z' from d2 where d1.a = d2.a returning d1.a, d1.b;
+----
+2	z
+3	z
+
+
+query T
+select a, b from d1 order by 1;
+----
+1	x1
+2	z
+3	z
+4	x4
+NULL	xn
+
+
+query T
+delete from d1 using d2 where d1.a = d2.a and d2.b = 'y3b' returning d1.a;
+----
+3
+
+
+query T
+select a, b from d1 order by 1;
+----
+1	x1
+2	z
+4	x4
+NULL	xn
+
+
+query T
+delete from d1 where not exists (select 1 from d2 where d2.a = d1.a);
+----
+
+
+query T
+select a, b from d1 order by 1;
+----
+2	z
+
+
+query T
+update d1 set b = 'q' where a in (select a from d2);
+----
+
+
+query T
+select a, b from d1 order by 1;
+----
+2	q
+
+
