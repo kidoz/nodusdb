@@ -591,7 +591,7 @@ pub(crate) fn equality_index<'a>(
     tbl: &TableDescriptor,
     indexes: &'a [IndexDescriptor],
     leading: nodus_catalog::ColumnId,
-    needed: Option<&[String]>,
+    needed: Option<&NeededColumns>,
 ) -> Option<&'a IndexDescriptor> {
     let matches = |idx: &IndexDescriptor| {
         idx.key_columns
@@ -601,7 +601,7 @@ pub(crate) fn equality_index<'a>(
     if let Some(needed) = needed
         && let Some(covering) = indexes
             .iter()
-            .find(|idx| matches(idx) && index_covers(tbl, idx, needed))
+            .find(|idx| matches(idx) && needed_covered(tbl, idx, needed))
     {
         return Some(covering);
     }
@@ -611,14 +611,22 @@ pub(crate) fn equality_index<'a>(
 /// The columns a scan reads when it reads only named columns with no sort,
 /// grouping, or join: `None` when the statement is more than that, or reads
 /// a column that is not named (so no index-only scan).
+#[derive(Clone, Debug)]
+pub(crate) enum NeededColumns {
+    /// Only these columns (bare names).
+    Named(Vec<String>),
+    /// Every column of the scanned relation (`SELECT *`).
+    All,
+}
+
 pub(crate) fn index_only_needed(
     projection: &[crate::plan_types::ProjectionItem],
     filter: Option<&crate::plan_types::FilterExpr>,
-) -> Option<Vec<String>> {
+) -> Option<NeededColumns> {
     use crate::plan_types::ProjectionItem;
     // No projection is every column.
     if projection.is_empty() {
-        return None;
+        return Some(NeededColumns::All);
     }
     let mut needed = Vec::new();
     for item in projection {
@@ -637,7 +645,33 @@ pub(crate) fn index_only_needed(
                 .map(|name| name.rsplit('.').next().unwrap_or(name.as_str()).to_string()),
         );
     }
-    Some(needed)
+    Some(NeededColumns::Named(needed))
+}
+
+/// The columns an addition to a projection reads (a sort's keys).
+pub(crate) fn add_needed(needed: NeededColumns, extra: &[String]) -> NeededColumns {
+    match needed {
+        NeededColumns::All => NeededColumns::All,
+        NeededColumns::Named(mut names) => {
+            names.extend(extra.iter().cloned());
+            NeededColumns::Named(names)
+        }
+    }
+}
+
+/// Whether an index serves every column the statement reads.
+pub(crate) fn needed_covered(
+    tbl: &TableDescriptor,
+    idx: &IndexDescriptor,
+    needed: &NeededColumns,
+) -> bool {
+    match needed {
+        NeededColumns::All => tbl
+            .columns
+            .iter()
+            .all(|column| index_covers(tbl, idx, std::slice::from_ref(&column.name))),
+        NeededColumns::Named(names) => index_covers(tbl, idx, names),
+    }
 }
 
 impl MemExecutor {

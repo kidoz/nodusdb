@@ -485,10 +485,13 @@ impl MemExecutor {
                 } else {
                     sort.clone()
                 };
-                let needed_columns = crate::index_keys::index_only_needed(projection, filter)
-                    .and_then(|mut needed| {
-                        needed.extend(crate::index_keys::sort_columns(&sort_keys, projection)?);
-                        Some(needed)
+                let needed_columns =
+                    crate::index_keys::index_only_needed(projection, filter).map(|needed| {
+                        crate::index_keys::add_needed(
+                            needed,
+                            &crate::index_keys::sort_columns(&sort_keys, projection)
+                                .unwrap_or_default(),
+                        )
                     });
                 let allow_index_only = single
                     && group_by.is_empty()
@@ -504,7 +507,7 @@ impl MemExecutor {
                     &scope,
                     sample.as_ref(),
                     *only,
-                    needed_columns.as_deref(),
+                    needed_columns.as_ref(),
                     allow_index_only,
                     Some(&subplans),
                 )?;
@@ -1463,7 +1466,7 @@ impl MemExecutor {
         ctes: &[(String, &LogicalPlan)],
         sample: Option<&crate::SampleSpec>,
         only: bool,
-        index_only: Option<&[String]>,
+        index_only: Option<&crate::index_keys::NeededColumns>,
         allow_index_only: bool,
         subplans: Option<&Subplans>,
     ) -> Result<Node> {
@@ -1628,7 +1631,7 @@ impl MemExecutor {
             };
             let only = allow_index_only
                 && index_only
-                    .is_some_and(|needed| crate::index_keys::index_covers(&tbl, idx, needed));
+                    .is_some_and(|needed| crate::index_keys::needed_covered(&tbl, idx, needed));
             let mut node = Node::new(
                 if only {
                     "Index Only Scan"

@@ -494,13 +494,16 @@ impl MemExecutor {
                 let mut rows = None;
                 // The columns the statement reads: a covering index is
                 // preferred when one serves them all.
-                let needed_columns =
-                    crate::index_keys::index_only_needed(&projection, filter.as_ref()).and_then(
-                        |mut needed| {
-                            needed.extend(crate::index_keys::sort_columns(&sort, &projection)?);
-                            Some(needed)
-                        },
-                    );
+                let needed_columns = crate::index_keys::index_only_needed(
+                    &projection,
+                    filter.as_ref(),
+                )
+                .map(|needed| {
+                    crate::index_keys::add_needed(
+                        needed,
+                        &crate::index_keys::sort_columns(&sort, &projection).unwrap_or_default(),
+                    )
+                });
                 // A query whose columns the index covers reads them from the
                 // index alone; a simple shape keeps that safe (nothing later
                 // reads an uncovered column).
@@ -536,7 +539,7 @@ impl MemExecutor {
                         &tbl,
                         &tbl.indexes,
                         col.id,
-                        needed_columns.as_deref(),
+                        needed_columns.as_ref(),
                     )
                     .into_iter()
                     {
@@ -544,7 +547,7 @@ impl MemExecutor {
                         let only = index_only
                             .as_ref()
                             .is_some_and(|needed| {
-                                crate::index_keys::index_covers(&tbl, idx, needed)
+                                crate::index_keys::needed_covered(&tbl, idx, needed)
                             })
                             .then(|| {
                                 self.index_only_scan(idx.id, &val, &tbl, idx, &ctx.session_id)
@@ -591,7 +594,7 @@ impl MemExecutor {
                         &tbl,
                         &tbl.indexes,
                         col.id,
-                        needed_columns.as_deref(),
+                        needed_columns.as_ref(),
                     )
                     .filter(|i| Self::index_entry_encoding(&tbl, i).1)
                 {
@@ -600,7 +603,7 @@ impl MemExecutor {
                     // every column the statement reads.
                     let only = index_only
                         .as_ref()
-                        .is_some_and(|needed| crate::index_keys::index_covers(&tbl, idx, needed))
+                        .is_some_and(|needed| crate::index_keys::needed_covered(&tbl, idx, needed))
                         .then(|| {
                             self.index_only_range_scan(
                                 idx.id,
