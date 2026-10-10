@@ -1,0 +1,122 @@
+# Composite index conditions: a version-3 index encodes its whole key
+# tuple, so conjuncts on trailing key columns fold into the `Index Cond`
+# — equalities after equalities, a range after them, and a later
+# column's condition the index checks. Plans and results from PostgreSQL
+# 18.4, with `enable_seqscan = off` (PostgreSQL's planner costs the
+# choice; NodusDB has no statistics).
+
+statement ok
+drop table if exists i1 cascade;
+
+statement ok
+create table i1 (a int, b text, c int);
+
+statement ok
+insert into i1 select g, 'r' || g, g % 10 from generate_series(1, 100) g;
+
+statement ok
+create index i1_ab on i1 (a, b);
+
+statement ok
+analyze i1;
+
+statement ok
+set enable_seqscan = off;
+
+# Equalities on the key prefix fold together.
+query T
+explain (costs off) select * from i1 where a = 5 and b = 'r5';
+----
+Index Scan using i1_ab on i1
+  Index Cond: ((a = 5) AND (b = 'r5'::text))
+
+
+query T
+explain (costs off) select a, b from i1 where a = 5 and b = 'r5';
+----
+Index Only Scan using i1_ab on i1
+  Index Cond: ((a = 5) AND (b = 'r5'::text))
+
+
+# A range after the equalities narrows what follows it.
+query T
+explain (costs off) select * from i1 where a = 5 and b > 'r5';
+----
+Index Scan using i1_ab on i1
+  Index Cond: ((a = 5) AND (b > 'r5'::text))
+
+
+# A covering index takes the whole row, and folds its own columns.
+statement ok
+create index i1_abc on i1 (a, b, c);
+
+statement ok
+analyze i1;
+
+query T
+explain (costs off) select * from i1 where a = 5 and b = 'r5' and c = 5;
+----
+Index Only Scan using i1_abc on i1
+  Index Cond: ((a = 5) AND (b = 'r5'::text) AND (c = 5))
+
+
+query T
+explain (costs off) select * from i1 where a >= 90 and b = 'r90';
+----
+Index Only Scan using i1_abc on i1
+  Index Cond: ((a >= 90) AND (b = 'r90'::text))
+
+
+query T
+explain (costs off) select * from i1 where a between 50 and 52 and c = 0;
+----
+Index Only Scan using i1_abc on i1
+  Index Cond: ((a >= 50) AND (a <= 52) AND (c = 0))
+
+
+# The rows agree with the plain comparison.
+query T
+select a, b, c from i1 where a = 5 and b = 'r5';
+----
+5	r5	5
+
+
+query T
+select a, b, c from i1 where a >= 90 and b = 'r90';
+----
+90	r90	0
+
+
+query T
+select count(*) from i1 where a = 5 and b > 'r50';
+----
+0
+
+
+query T
+select count(*) from i1 where a between 50 and 52 and c = 0;
+----
+1
+
+
+query T
+update i1 set b = 'changed' where a = 5 and b = 'r5';
+----
+
+
+query T
+select a, b, c from i1 where a = 5 and b = 'changed';
+----
+5	changed	5
+
+
+# A trailing condition on an unindexed column stays a filter.
+query T
+select count(*) from i1 where a = 5 and b = 'changed' and c = 5;
+----
+1
+
+
+statement ok
+reset enable_seqscan;
+
