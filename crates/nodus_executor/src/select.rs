@@ -642,10 +642,26 @@ impl MemExecutor {
                             .ok()
                         })
                         .flatten();
-                    let indexed_rows = match only {
-                        Some(rows) => Ok(rows),
-                        None => {
-                            self.index_prefix_scan(idx.id, &prefix, bounds, tbl.id, &ctx.session_id)
+                    // A range across much of the table reads through a
+                    // bitmap, as PostgreSQL plans it.
+                    let table_rows = self
+                        .scan_rows(tbl.id, &ctx.session_id)
+                        .map(|rows| rows.len() as f64)
+                        .unwrap_or(0.0);
+                    let entries = self.index_prefix_count(idx.id, &prefix, bounds, &ctx.session_id);
+                    let bitmap = crate::index_keys::bitmap_scan_is_wider(table_rows, entries);
+                    let indexed_rows = if bitmap {
+                        self.bitmap_heap_scan(idx.id, &prefix, bounds, tbl.id, &ctx.session_id)
+                    } else {
+                        match only {
+                            Some(rows) => Ok(rows),
+                            None => self.index_prefix_scan(
+                                idx.id,
+                                &prefix,
+                                bounds,
+                                tbl.id,
+                                &ctx.session_id,
+                            ),
                         }
                     };
                     if let Ok(indexed_rows) = indexed_rows {
@@ -695,16 +711,27 @@ impl MemExecutor {
                             .ok()
                         })
                         .flatten();
-                    let indexed_rows = match only {
-                        Some(rows) => Ok(rows),
-                        None => self.index_range_scan(
-                            idx.id,
-                            lower.as_ref(),
-                            upper.as_ref(),
-                            tbl.id,
-                            &col.data_type,
-                            &ctx.session_id,
-                        ),
+                    let bounds = Some((col.data_type.as_str(), lower.as_ref(), upper.as_ref()));
+                    let table_rows = self
+                        .scan_rows(tbl.id, &ctx.session_id)
+                        .map(|rows| rows.len() as f64)
+                        .unwrap_or(0.0);
+                    let entries = self.index_prefix_count(idx.id, "", bounds, &ctx.session_id);
+                    let bitmap = crate::index_keys::bitmap_scan_is_wider(table_rows, entries);
+                    let indexed_rows = if bitmap {
+                        self.bitmap_heap_scan(idx.id, "", bounds, tbl.id, &ctx.session_id)
+                    } else {
+                        match only {
+                            Some(rows) => Ok(rows),
+                            None => self.index_range_scan(
+                                idx.id,
+                                lower.as_ref(),
+                                upper.as_ref(),
+                                tbl.id,
+                                &col.data_type,
+                                &ctx.session_id,
+                            ),
+                        }
                     };
                     if let Ok(indexed_rows) = indexed_rows {
                         rows = Some(self.merge_overlay_range(

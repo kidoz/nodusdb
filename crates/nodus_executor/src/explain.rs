@@ -1651,6 +1651,99 @@ impl MemExecutor {
             let only = allow_index_only
                 && index_only
                     .is_some_and(|needed| crate::index_keys::needed_covered(&tbl, idx, needed));
+            // A range across much of the table reads through a bitmap, as
+            // PostgreSQL plans it: the matching entry keys first, then the
+            // heap in its own order, rechecking the condition.
+            let bitmap = if only {
+                false
+            } else {
+                let entries = match &composite {
+                    Some((cidx, conds)) => {
+                        let mut prefix = String::new();
+                        let mut encodable = true;
+                        for (name, operand) in &conds.equalities {
+                            let Some(data_type) = tbl
+                                .columns
+                                .iter()
+                                .find(|c| c.name == *name)
+                                .map(|c| c.data_type.clone())
+                            else {
+                                encodable = false;
+                                break;
+                            };
+                            let value = self.eval_operand(&[], &[], &[], operand, &data_type);
+                            match crate::index_keys::key_component(&value, &data_type) {
+                                Some(hex) => {
+                                    if !prefix.is_empty() {
+                                        prefix.push('!');
+                                    }
+                                    prefix.push_str(&hex);
+                                }
+                                None => {
+                                    encodable = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if !encodable {
+                            None
+                        } else {
+                            let bounds = conds.range.as_ref().and_then(|(name, lower, upper)| {
+                                let data_type = tbl
+                                    .columns
+                                    .iter()
+                                    .find(|c| c.name == *name)?
+                                    .data_type
+                                    .clone();
+                                Some((data_type, lower.clone(), upper.clone()))
+                            });
+                            Some((prefix, bounds))
+                        }
+                        .map(|(prefix, bounds)| {
+                            let bounds = bounds.as_ref().map(|(ty, lower, upper)| {
+                                (ty.as_str(), lower.as_ref(), upper.as_ref())
+                            });
+                            self.index_prefix_count(cidx.id, &prefix, bounds, &ctx.session_id)
+                        })
+                    }
+                    None => filter
+                        .and_then(|filter| Self::leading_range(filter, &tbl))
+                        .map(|(name, (lower, upper))| {
+                            let data_type = tbl
+                                .columns
+                                .iter()
+                                .find(|c| c.name == name)
+                                .map(|c| c.data_type.clone())
+                                .unwrap_or_default();
+                            let bounds = (data_type.as_str(), lower.as_ref(), upper.as_ref());
+                            self.index_prefix_count(idx.id, "", Some(bounds), &ctx.session_id)
+                        }),
+                };
+                entries
+                    .is_some_and(|entries| crate::index_keys::bitmap_scan_is_wider(rows, entries))
+            };
+            if bitmap {
+                let inner = Node::new(
+                    "Bitmap Index Scan",
+                    format!("Bitmap Index Scan on {}", idx.name),
+                    (rows * 0.005).max(1.0),
+                    0,
+                )
+                .detail("Index Cond", index_cond_text.clone());
+                let mut node = Node::over(
+                    "Bitmap Heap Scan",
+                    format!("Bitmap Heap Scan on {label}"),
+                    vec![inner],
+                )
+                .prop("Recheck Cond", json!(&index_cond_text))
+                .detail("Recheck Cond", index_cond_text.clone());
+                if let Some(residual) = residual_filter {
+                    node = node.detail("Filter", residual);
+                }
+                node.startup = 0.15;
+                node.total = 8.17;
+                return Ok(node);
+            }
             let mut node = Node::new(
                 if only {
                     "Index Only Scan"

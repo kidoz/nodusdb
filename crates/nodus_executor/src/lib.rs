@@ -992,6 +992,63 @@ impl MemExecutor {
         Ok(entries)
     }
 
+    /// How many entries an index holds under an encoded key prefix, within
+    /// optional bounds — what a bitmap scan's choice is made on.
+    pub(crate) fn index_prefix_count(
+        &self,
+        index_id: nodus_catalog::IndexId,
+        prefix_hex: &str,
+        bounds: Option<(&str, Option<&(Value, bool)>, Option<&(Value, bool)>)>,
+        session: &str,
+    ) -> usize {
+        let read_ts = self.read_ts(session);
+        self.prefix_entry_tails(index_id, prefix_hex, bounds, read_ts)
+            .map(|entries| entries.len())
+            .unwrap_or(0)
+    }
+
+    /// The rows a bitmap of an index's entries point at: every matching row
+    /// key gathered first, then the table read in its own order, as
+    /// PostgreSQL's `Bitmap Heap Scan` does.
+    pub(crate) fn bitmap_heap_scan(
+        &self,
+        index_id: nodus_catalog::IndexId,
+        prefix_hex: &str,
+        bounds: Option<(&str, Option<&(Value, bool)>, Option<&(Value, bool)>)>,
+        table_id: TableId,
+        session: &str,
+    ) -> Result<Vec<(String, Vec<Value>)>> {
+        let read_ts = self.read_ts(session);
+        let mut wanted = std::collections::HashSet::new();
+        for (tail, _) in self.prefix_entry_tails(index_id, prefix_hex, bounds, read_ts)? {
+            if let Some((_, pk)) = tail.split_once('-') {
+                wanted.insert(pk.to_string());
+            }
+        }
+        self.maybe_read_range_barrier(
+            session,
+            KeyRange {
+                start: Bytes::from(format!("{table_id}:")),
+                end: Bytes::from(format!("{table_id};")),
+            },
+        )?;
+        let columns = self.table_columns(table_id);
+        let start = Bytes::from(format!("{table_id}:"));
+        let end = Bytes::from(format!("{table_id};"));
+        let mut rows = Vec::new();
+        for pair in self.kv.scan(KeyRange { start, end }, read_ts)? {
+            let pair = pair?;
+            let key_str = String::from_utf8_lossy(&pair.key);
+            let Some(pk) = key_str.strip_prefix(&format!("{table_id}:")) else {
+                continue;
+            };
+            if wanted.contains(pk) {
+                rows.push((pk.to_string(), Self::decode_row(&pair.value, &columns)?));
+            }
+        }
+        Ok(rows)
+    }
+
     /// The rows an index's entries under an encoded key prefix point at:
     /// the stored rows, fetched by their keys.
     pub(crate) fn index_prefix_scan(

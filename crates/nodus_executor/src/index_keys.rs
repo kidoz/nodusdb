@@ -565,6 +565,16 @@ pub(crate) fn index_conds(
     (!conds.equalities.is_empty() || conds.range.is_some()).then_some(conds)
 }
 
+/// Whether a range reads through a bitmap: the session allows bitmap scans,
+/// the table has enough rows for one to pay off, and the entries cover a
+/// large part of it. PostgreSQL chooses by cost; NodusDB has no statistics,
+/// so only a wide range of a table with some size becomes a bitmap.
+pub(crate) fn bitmap_scan_is_wider(table_rows: f64, entries: usize) -> bool {
+    crate::session_env::setting("enable_bitmapscan").as_deref() != Some("off")
+        && table_rows >= 100.0
+        && entries as f64 * 5.0 >= table_rows
+}
+
 /// The version-3 index a composite scan reads: the first whose key columns
 /// the conditions fold into (an equality prefix and a possible range),
 /// preferring one that covers every column the statement reads. A range
