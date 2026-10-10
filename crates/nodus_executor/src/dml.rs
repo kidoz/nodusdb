@@ -91,8 +91,13 @@ pub(crate) struct SemiJoinSide {
     names: Vec<String>,
     columns: Vec<ColumnDescriptor>,
     condition: Option<FilterExpr>,
-    /// `(joined-row position, subquery-row position)` equalities.
-    keys: Option<(Vec<usize>, Vec<usize>)>,
+    /// The condition's equalities, when they hash: the statement-side keys,
+    /// the subquery-side keys, and the equalities themselves to re-check.
+    keys: Option<(
+        Vec<crate::joins::HashKey>,
+        Vec<crate::joins::HashKey>,
+        Vec<FilterExpr>,
+    )>,
 }
 
 impl TargetScope {
@@ -1205,14 +1210,12 @@ impl MemExecutor {
             let outer_refs: Vec<&str> = outer_quals.iter().map(String::as_str).collect();
             let inner_refs: Vec<&str> = inner_quals.iter().map(String::as_str).collect();
             let keys = crate::joins::hash_plan(join.condition.as_ref(), &outer_refs, &inner_refs)
-                .and_then(|plan| {
-                    let mut left = Vec::new();
-                    let mut right = Vec::new();
-                    for (outer, inner) in &plan.hash_pairs {
-                        left.push(crate::filter_eval::col_pos(names, outer)?);
-                        right.push(crate::filter_eval::col_pos(&inner_names, inner)?);
-                    }
-                    Some((left, right))
+                .map(|plan| {
+                    (
+                        plan.hash_pairs.iter().map(|(l, _)| l.clone()).collect(),
+                        plan.hash_pairs.iter().map(|(_, r)| r.clone()).collect(),
+                        plan.pair_tests,
+                    )
                 });
             sides.push(SemiJoinSide {
                 anti: matches!(join.join_type, crate::JoinType::Anti),
@@ -1259,18 +1262,12 @@ impl MemExecutor {
         let source_quals = crate::joins::qualifiers(&source_names);
         let target_refs: Vec<&str> = target_quals.iter().map(String::as_str).collect();
         let source_refs: Vec<&str> = source_quals.iter().map(String::as_str).collect();
-        let hash = crate::joins::hash_plan(filter, &target_refs, &source_refs).and_then(|plan| {
-            let mut left = Vec::new();
-            let mut right = Vec::new();
-            for (target, source) in &plan.hash_pairs {
-                left.push(scope.names.iter().position(|n| n == target)?);
-                right.push(source_names.iter().position(|n| n == source)?);
-            }
-            Some((left, right, plan))
-        });
+        let hash = crate::joins::hash_plan(filter, &target_refs, &source_refs);
         // The relations' rows by their key, in their own order.
         let buckets: Option<std::collections::HashMap<String, Vec<Vec<Value>>>> =
-            hash.as_ref().map(|(_, right, plan)| {
+            hash.as_ref().map(|plan| {
+                let right_keys: Vec<crate::joins::HashKey> =
+                    plan.hash_pairs.iter().map(|(_, r)| r.clone()).collect();
                 let mut table: std::collections::HashMap<String, Vec<Vec<Value>>> =
                     std::collections::HashMap::new();
                 for source in &scope.source_rows {
@@ -1281,7 +1278,7 @@ impl MemExecutor {
                     {
                         continue;
                     }
-                    if let Some(key) = crate::select::hash_key(source, right) {
+                    if let Some(key) = self.hash_key(ctx, source, &source_names, &right_keys) {
                         table.entry(key).or_default().push(source.clone());
                     }
                 }
@@ -1300,7 +1297,7 @@ impl MemExecutor {
                     .map(|at| at.and_then(|i| row.get(i)).cloned().unwrap_or(Value::Null))
                     .collect();
                 // The target's own conditions, before the join.
-                if let Some((_, _, plan)) = &hash
+                if let Some(plan) = &hash
                     && let Some(f) = plan.left_filter()
                     && !self
                         .eval_filter(ctx, &projected, &scope.names, &scope.columns, Some(&f))
@@ -1309,29 +1306,38 @@ impl MemExecutor {
                     continue;
                 }
                 let joined = match &hash {
-                    Some((left, right, _)) => {
-                        crate::select::hash_key(&projected, left).and_then(|key| {
-                            buckets.as_ref()?.get(&key).and_then(|rows| {
-                                rows.iter().find_map(|source| {
-                                    if !left.iter().zip(right).all(|(l, r)| {
-                                        crate::value::values_equal(&projected[*l], &source[*r])
-                                    }) {
-                                        return None;
-                                    }
-                                    let mut joined = projected.clone();
-                                    joined.extend(source.iter().cloned());
-                                    self.eval_filter(
-                                        ctx,
-                                        &joined,
-                                        &scope.names,
-                                        &scope.columns,
-                                        filter,
-                                    )
-                                    .unwrap_or(false)
-                                    .then_some(joined)
+                    Some(plan) => {
+                        let left_keys: Vec<crate::joins::HashKey> =
+                            plan.hash_pairs.iter().map(|(l, _)| l.clone()).collect();
+                        self.hash_key(ctx, &projected, &scope.names, &left_keys)
+                            .and_then(|key| {
+                                buckets.as_ref()?.get(&key).and_then(|rows| {
+                                    rows.iter().find_map(|source| {
+                                        let mut joined = projected.clone();
+                                        joined.extend(source.iter().cloned());
+                                        // The hash may collide: the equalities
+                                        // must hold.
+                                        if !self.pair_tests_hold(
+                                            ctx,
+                                            &joined,
+                                            &scope.names,
+                                            &scope.columns,
+                                            &plan.pair_tests,
+                                        ) {
+                                            return None;
+                                        }
+                                        self.eval_filter(
+                                            ctx,
+                                            &joined,
+                                            &scope.names,
+                                            &scope.columns,
+                                            filter,
+                                        )
+                                        .unwrap_or(false)
+                                        .then_some(joined)
+                                    })
                                 })
                             })
-                        })
                     }
                     None => scope.source_rows.iter().find_map(|source| {
                         let mut joined = projected.clone();
@@ -1341,34 +1347,50 @@ impl MemExecutor {
                             .then_some(joined)
                     }),
                 };
-                // The statement's semi/anti joins decide the row.
+                // The statement's semi/anti joins decide the row: a key
+                // narrows the subquery's rows, its equalities settle it.
                 let joined = joined.filter(|joined| {
                     scope.semi_joins.iter().all(|side| {
-                        let hit = match &side.keys {
-                            Some((left, right)) => side.rows.iter().any(|inner| {
-                                left.iter().zip(right).all(|(l, r)| {
-                                    crate::value::values_equal(&joined[*l], &inner[*r])
-                                })
-                            }),
-                            None => {
-                                let mut names = scope.names.clone();
-                                names.extend(side.names.iter().cloned());
-                                let mut columns = scope.columns.clone();
-                                columns.extend(side.columns.iter().cloned());
-                                side.rows.iter().any(|inner| {
-                                    let mut combined = joined.clone();
-                                    combined.extend(inner.iter().cloned());
-                                    self.eval_filter(
-                                        ctx,
-                                        &combined,
-                                        &names,
-                                        &columns,
-                                        side.condition.as_ref(),
-                                    )
-                                    .unwrap_or(false)
-                                })
-                            }
+                        let mut names = scope.names.clone();
+                        names.extend(side.names.iter().cloned());
+                        let mut columns = scope.columns.clone();
+                        columns.extend(side.columns.iter().cloned());
+                        let probe = |inner: &Vec<Value>| {
+                            let mut combined = joined.clone();
+                            combined.extend(inner.iter().cloned());
+                            self.eval_filter(
+                                ctx,
+                                &combined,
+                                &names,
+                                &columns,
+                                side.condition.as_ref(),
+                            )
+                            .unwrap_or(false)
                         };
+                        let hit = match &side.keys {
+                            Some((outer_keys, inner_keys, tests)) => {
+                                match self.hash_key(ctx, joined, &scope.names, outer_keys) {
+                                    Some(key) => side.rows.iter().any(|inner| {
+                                        self.hash_key(ctx, inner, &side.names, inner_keys)
+                                            == Some(key.clone())
+                                            && self.pair_tests_hold(
+                                                ctx,
+                                                &{
+                                                    let mut combined = joined.clone();
+                                                    combined.extend(inner.iter().cloned());
+                                                    combined
+                                                },
+                                                &names,
+                                                &columns,
+                                                tests,
+                                            )
+                                    }),
+                                    None => false,
+                                }
+                            }
+                            None => side.rows.iter().any(probe),
+                        };
+                        let _ = &probe;
                         hit != side.anti
                     })
                 });

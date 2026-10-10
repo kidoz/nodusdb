@@ -10,30 +10,63 @@ use chrono::Utc;
 use nodus_catalog::{ColumnDescriptor, DescriptorState};
 use nodus_storage_api::{KeyRange, KvEngine};
 
-/// The keys a hash join hashes: each side's positions in its own row, the
-/// conditions one side applies alone, and the ones checked per matched
-/// pair.
+/// The keys a hash join hashes: each side's key over its own row (a bare
+/// column or a value computed per row), the conditions one side applies
+/// alone, and the ones checked per matched pair.
 struct HashJoinKeys {
-    left_positions: Vec<usize>,
-    right_positions: Vec<usize>,
+    left_keys: Vec<crate::joins::HashKey>,
+    right_keys: Vec<crate::joins::HashKey>,
+    /// The condition's equalities, re-checked on each candidate pair so a
+    /// hashed match means exactly what the condition says.
+    pair_tests: Vec<FilterExpr>,
     left_filter: Option<FilterExpr>,
     right_filter: Option<FilterExpr>,
     join_filter: Option<FilterExpr>,
 }
 
-/// A row's hash key over `positions`: the values' canonical text, joined;
-/// `None` when any is NULL (which never matches, as `=` never does).
-pub(crate) fn hash_key(row: &[Value], positions: &[usize]) -> Option<String> {
-    let mut key = String::new();
-    for position in positions {
-        let value = row.get(*position)?;
-        if *value == Value::Null {
-            return None;
+impl MemExecutor {
+    /// A row's hash key over `keys`: the values' canonical text, joined;
+    /// `None` when any is NULL (which never matches, as `=` never does).
+    pub(crate) fn hash_key(
+        &self,
+        ctx: &ExecutionContext,
+        row: &[Value],
+        col_names: &[String],
+        keys: &[crate::joins::HashKey],
+    ) -> Option<String> {
+        let mut key = String::new();
+        for part in keys {
+            let value = match part {
+                crate::joins::HashKey::Column(name) => {
+                    let position = crate::filter_eval::col_pos(col_names, name)?;
+                    row.get(position)?.clone()
+                }
+                crate::joins::HashKey::Expr(expr) => self.eval_expr(ctx, expr, row, col_names),
+            };
+            if value == Value::Null {
+                return None;
+            }
+            key.push_str(&render(&crate::value::key_form(&value)));
+            key.push('\u{1}');
         }
-        key.push_str(&render(&crate::value::key_form(value)));
-        key.push('\u{1}');
+        Some(key)
     }
-    Some(key)
+
+    /// Whether every equality the hash matched on holds for a candidate
+    /// pair, as the condition's own comparison does.
+    pub(crate) fn pair_tests_hold(
+        &self,
+        ctx: &ExecutionContext,
+        combined: &[Value],
+        combined_cols: &[String],
+        combined_desc: &[nodus_catalog::ColumnDescriptor],
+        tests: &[FilterExpr],
+    ) -> bool {
+        tests.iter().all(|test| {
+            self.eval_filter(ctx, combined, combined_cols, combined_desc, Some(test))
+                .unwrap_or(false)
+        })
+    }
 }
 
 impl MemExecutor {
@@ -156,10 +189,29 @@ impl MemExecutor {
             && !pairs.is_empty()
         {
             return Ok(Some(HashJoinKeys {
-                left_positions: pairs.iter().map(|(_, l, _)| *l).collect(),
-                right_positions: pairs
+                left_keys: pairs
                     .iter()
-                    .map(|(_, _, r)| r.saturating_sub(left_names.len()))
+                    .map(|(_, l, _)| crate::joins::HashKey::Column(left_names[*l].clone()))
+                    .collect(),
+                right_keys: pairs
+                    .iter()
+                    .map(|(_, _, r)| {
+                        crate::joins::HashKey::Column(
+                            right_names[r.saturating_sub(left_names.len())].clone(),
+                        )
+                    })
+                    .collect(),
+                pair_tests: pairs
+                    .iter()
+                    .map(|(_, l, r)| {
+                        FilterExpr::Predicate(crate::plan_types::Predicate {
+                            left: left_names[*l].clone(),
+                            op: crate::plan_types::CompareOp::Eq,
+                            right: crate::plan_types::Operand::Ident(
+                                right_names[r.saturating_sub(left_names.len())].clone(),
+                            ),
+                        })
+                    })
                     .collect(),
                 left_filter: None,
                 right_filter: None,
@@ -185,20 +237,10 @@ impl MemExecutor {
         else {
             return Ok(None);
         };
-        let position = |names: &[String], name: &String| names.iter().position(|n| n == name);
-        let mut left_positions = Vec::new();
-        let mut right_positions = Vec::new();
-        for (left, right) in &plan.hash_pairs {
-            let (Some(l), Some(r)) = (position(left_names, left), position(right_names, right))
-            else {
-                return Ok(None);
-            };
-            left_positions.push(l);
-            right_positions.push(r);
-        }
         Ok(Some(HashJoinKeys {
-            left_positions,
-            right_positions,
+            left_keys: plan.hash_pairs.iter().map(|(l, _)| l.clone()).collect(),
+            right_keys: plan.hash_pairs.iter().map(|(_, r)| r.clone()).collect(),
+            pair_tests: plan.pair_tests.clone(),
             left_filter: plan.left_filter(),
             right_filter: plan.right_filter(),
             join_filter: plan.join_filter(),
@@ -731,7 +773,9 @@ impl MemExecutor {
                             {
                                 continue;
                             }
-                            let Some(key) = hash_key(&r2.values, &hash.right_positions) else {
+                            let Some(key) =
+                                self.hash_key(ctx, &r2.values, &inner_names, &hash.right_keys)
+                            else {
                                 continue;
                             };
                             table.entry(key).or_default().push(r2.values.clone());
@@ -745,20 +789,21 @@ impl MemExecutor {
                                 continue;
                             }
                             let mut matched = false;
-                            if let Some(key) = hash_key(r1, &hash.left_positions) {
+                            if let Some(key) = self.hash_key(ctx, r1, &col_names, &hash.left_keys) {
                                 for r2 in table.get(&key).into_iter().flatten() {
-                                    if !hash
-                                        .left_positions
-                                        .iter()
-                                        .zip(&hash.right_positions)
-                                        .all(|(l, r)| crate::value::values_equal(&r1[*l], &r2[*r]))
-                                    {
+                                    let mut combined = r1.clone();
+                                    combined.extend(r2.iter().cloned());
+                                    if !self.pair_tests_hold(
+                                        ctx,
+                                        &combined,
+                                        &combined_cols,
+                                        &combined_desc,
+                                        &hash.pair_tests,
+                                    ) {
                                         continue;
                                     }
-                                    if let Some(filter) = &hash.join_filter {
-                                        let mut combined = r1.clone();
-                                        combined.extend(r2.iter().cloned());
-                                        if !self
+                                    if let Some(filter) = &hash.join_filter
+                                        && !self
                                             .eval_filter(
                                                 ctx,
                                                 &combined,
@@ -767,9 +812,8 @@ impl MemExecutor {
                                                 Some(filter),
                                             )
                                             .unwrap_or(false)
-                                        {
-                                            continue;
-                                        }
+                                    {
+                                        continue;
                                     }
                                     matched = true;
                                 }
@@ -1138,7 +1182,8 @@ impl MemExecutor {
                         {
                             continue;
                         }
-                        let Some(key) = hash_key(r2, &hash.right_positions) else {
+                        let Some(key) = self.hash_key(ctx, r2, &j_col_names, &hash.right_keys)
+                        else {
                             continue;
                         };
                         table.entry(key).or_default().push((j_idx, r2.clone()));
@@ -1152,19 +1197,20 @@ impl MemExecutor {
                             continue;
                         }
                         let mut matched = false;
-                        if let Some(key) = hash_key(r1, &hash.left_positions) {
+                        if let Some(key) = self.hash_key(ctx, r1, &col_names, &hash.left_keys) {
                             for (j_idx, r2) in table.get(&key).into_iter().flatten() {
-                                // The hash may collide: the keys must be equal.
-                                if !hash
-                                    .left_positions
-                                    .iter()
-                                    .zip(&hash.right_positions)
-                                    .all(|(l, r)| crate::value::values_equal(&r1[*l], &r2[*r]))
-                                {
-                                    continue;
-                                }
                                 let mut combined_row = r1.clone();
                                 combined_row.extend(r2.clone());
+                                // The hash may collide: the equalities must hold.
+                                if !self.pair_tests_hold(
+                                    ctx,
+                                    &combined_row,
+                                    &combined_cols,
+                                    &combined_desc,
+                                    &hash.pair_tests,
+                                ) {
+                                    continue;
+                                }
                                 if let Some(filter) = &hash.join_filter
                                     && !self
                                         .eval_filter(

@@ -4,13 +4,25 @@
 
 use crate::plan_types::{CompareOp, FilterExpr, JoinType, LogicalPlan, Operand, Predicate};
 
+/// One side of a hashed equality: a bare column, or a value computed per
+/// row (PostgreSQL hashes `e1.a + 1 = e2.a` on the expression).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum HashKey {
+    Column(String),
+    Expr(crate::plan_types::ScalarExpr),
+}
+
 /// How a join's condition splits for a hash join: the equalities hashed
-/// (`(left column, right column)`), the conditions only one side's rows
-/// must satisfy (which PostgreSQL pushes into its scan), and the conditions
-/// over both sides, checked on each matched pair.
+/// (`(left key, right key)` — bare columns or computed values), the
+/// conditions only one side's rows must satisfy (which PostgreSQL pushes
+/// into its scan), and the conditions over both sides, checked on each
+/// matched pair.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct JoinPlan {
-    pub(crate) hash_pairs: Vec<(String, String)>,
+    pub(crate) hash_pairs: Vec<(HashKey, HashKey)>,
+    /// The original equalities, re-checked on each candidate pair so a
+    /// hashed match means exactly what the condition says.
+    pub(crate) pair_tests: Vec<FilterExpr>,
     pub(crate) left_only: Vec<FilterExpr>,
     pub(crate) right_only: Vec<FilterExpr>,
     pub(crate) join_filter: Vec<FilterExpr>,
@@ -45,51 +57,112 @@ pub(crate) fn hash_plan(
     let condition = condition?;
     let mut plan = JoinPlan::default();
     for conjunct in crate::index_keys::conjuncts(condition) {
-        match conjunct {
-            FilterExpr::Predicate(Predicate {
-                left,
-                op: CompareOp::Eq,
-                right: Operand::Ident(right),
-            }) => match (
-                side(left, left_prefixes, right_prefixes),
-                side(right, left_prefixes, right_prefixes),
-            ) {
-                // One column from each side: hashed (left side first, as
-                // PostgreSQL prints the condition).
-                (Some(true), Some(false)) => plan.hash_pairs.push((left.clone(), right.clone())),
-                (Some(false), Some(true)) => plan.hash_pairs.push((right.clone(), left.clone())),
-                (Some(true), Some(true)) => plan.left_only.push(conjunct.clone()),
-                (Some(false), Some(false)) => plan.right_only.push(conjunct.clone()),
-                _ => plan.join_filter.push(conjunct.clone()),
-            },
-            other => {
-                let mut refs = Vec::new();
-                crate::filter_eval::filter_column_refs(other, &mut refs);
-                let mut on_left = false;
-                let mut on_right = false;
-                for reference in &refs {
-                    match side(reference, left_prefixes, right_prefixes) {
-                        Some(true) => on_left = true,
-                        Some(false) => on_right = true,
-                        None => {
-                            on_left = true;
-                            on_right = true;
-                        }
-                    }
-                }
-                if on_left && !on_right {
-                    plan.left_only.push(other.clone());
-                } else if on_right && !on_left {
-                    plan.right_only.push(other.clone());
-                } else {
-                    plan.join_filter.push(other.clone());
+        // An equality whose sides each come from one side of the join
+        // hashes, whether a side is a bare column or a computed value.
+        if let Some((left, right)) = equality_sides(conjunct, left_prefixes, right_prefixes) {
+            plan.hash_pairs.push((left, right));
+            plan.pair_tests.push(conjunct.clone());
+            continue;
+        }
+        let mut refs = Vec::new();
+        crate::filter_eval::filter_column_refs(conjunct, &mut refs);
+        let mut on_left = false;
+        let mut on_right = false;
+        for reference in &refs {
+            match side(reference, left_prefixes, right_prefixes) {
+                Some(true) => on_left = true,
+                Some(false) => on_right = true,
+                None => {
+                    on_left = true;
+                    on_right = true;
                 }
             }
+        }
+        if on_left && !on_right {
+            plan.left_only.push(conjunct.clone());
+        } else if on_right && !on_left {
+            plan.right_only.push(conjunct.clone());
+        } else {
+            plan.join_filter.push(conjunct.clone());
         }
     }
     // `a = a` and the like are no hash pair.
     plan.hash_pairs.dedup();
     (!plan.hash_pairs.is_empty()).then_some(plan)
+}
+
+/// The `(left key, right key)` an equality conjunct hashes (left side
+/// first, as PostgreSQL prints the condition), when each side's references
+/// come from exactly one side of the join.
+fn equality_sides(
+    conjunct: &FilterExpr,
+    left_prefixes: &[&str],
+    right_prefixes: &[&str],
+) -> Option<(HashKey, HashKey)> {
+    let (left, right) = match conjunct {
+        FilterExpr::Predicate(Predicate {
+            left,
+            op: CompareOp::Eq,
+            right: Operand::Ident(right),
+        }) => (
+            crate::plan_types::ScalarExpr::Column(left.clone()),
+            crate::plan_types::ScalarExpr::Column(right.clone()),
+        ),
+        FilterExpr::ExprCmp {
+            left,
+            op: CompareOp::Eq,
+            right,
+        } => (left.clone(), right.clone()),
+        // A comparison of two computed sides parses as one scalar binary.
+        FilterExpr::Scalar(crate::plan_types::ScalarExpr::Binary {
+            op: crate::plan_types::ScalarBinaryOp::Eq,
+            left,
+            right,
+        }) => ((**left).clone(), (**right).clone()),
+        _ => return None,
+    };
+    let (left_side, right_side) = (
+        scalar_side(&left, left_prefixes, right_prefixes),
+        scalar_side(&right, left_prefixes, right_prefixes),
+    );
+    let key = |expr: &crate::plan_types::ScalarExpr| match expr {
+        crate::plan_types::ScalarExpr::Column(name) => HashKey::Column(name.clone()),
+        other => HashKey::Expr(other.clone()),
+    };
+    match (left_side, right_side) {
+        (Some(true), Some(false)) => Some((key(&left), key(&right))),
+        (Some(false), Some(true)) => Some((key(&right), key(&left))),
+        _ => None,
+    }
+}
+
+/// Which side a scalar expression's references belong to: `Some(true)` /
+/// `Some(false)` when every reference is on one side (and at least one on
+/// the side alone), `None` otherwise.
+fn scalar_side(
+    expr: &crate::plan_types::ScalarExpr,
+    left_prefixes: &[&str],
+    right_prefixes: &[&str],
+) -> Option<bool> {
+    let mut refs = Vec::new();
+    crate::filter_eval::scalar_column_refs(expr, &mut refs);
+    if refs.is_empty() {
+        return None;
+    }
+    let mut on_left = false;
+    let mut on_right = false;
+    for reference in &refs {
+        match side(reference, left_prefixes, right_prefixes) {
+            Some(true) => on_left = true,
+            Some(false) => on_right = true,
+            None => return None,
+        }
+    }
+    match (on_left, on_right) {
+        (true, false) => Some(true),
+        (false, true) => Some(false),
+        _ => None,
+    }
 }
 
 /// The equalities a `USING (...)` (or `NATURAL`) join matches on: one
@@ -255,12 +328,16 @@ pub(crate) fn semi_join(
         } => (
             &**subquery,
             false,
-            Some((left.clone(), crate::plan_types::ScalarBinaryOp::Eq)),
+            Some((
+                crate::plan_types::ScalarExpr::Column(left.clone()),
+                crate::plan_types::ScalarBinaryOp::Eq,
+            )),
         ),
-        // `<column> <op> ANY (<subquery>)` is the same comparison as a
-        // semi join over the comparison written out.
+        // `<expr> <op> ANY (<subquery>)` is the same comparison as a semi
+        // join over the comparison written out; the left side may be
+        // computed (`a + 1 in (...)`).
         FilterExpr::QuantifiedSubquery {
-            left: crate::plan_types::ScalarExpr::Column(left),
+            left,
             op,
             subquery,
             all: false,
@@ -348,18 +425,33 @@ pub(crate) fn semi_join(
             };
             Some(format!("{label}.{name}"))
         };
-        let left = qualify(&comparison, outer_quals.to_vec())?;
         let key = qualify(key, relation_labels(subquery))?;
-        // A self-referencing subquery would shadow an outer name, which the
-        // join cannot express.
-        if !is_outer(&left) {
-            return None;
-        }
-        lifted.push(FilterExpr::Predicate(Predicate {
-            left,
-            op,
-            right: Operand::Ident(key),
-        }));
+        let left = match comparison {
+            crate::plan_types::ScalarExpr::Column(name) => {
+                let name = qualify(name, outer_quals.to_vec())?;
+                // A self-referencing subquery would shadow an outer name,
+                // which the join cannot express.
+                if !is_outer(&name) {
+                    return None;
+                }
+                crate::plan_types::ScalarExpr::Column(name)
+            }
+            other => other.clone(),
+        };
+        // A bare column keeps the condition's usual shape; a computed side
+        // becomes the comparison written out.
+        lifted.push(match left {
+            crate::plan_types::ScalarExpr::Column(name) => FilterExpr::Predicate(Predicate {
+                left: name,
+                op,
+                right: Operand::Ident(key),
+            }),
+            other => FilterExpr::Scalar(crate::plan_types::ScalarExpr::Binary {
+                op: any_op.clone(),
+                left: Box::new(other),
+                right: Box::new(crate::plan_types::ScalarExpr::Column(key)),
+            }),
+        });
     }
     let mut crossed = !lifted.is_empty();
     let mut kept = Vec::new();
@@ -448,7 +540,13 @@ mod tests {
             &["b"],
         )
         .unwrap();
-        assert_eq!(plan.hash_pairs, [("a.x".to_string(), "b.x".to_string())]);
+        assert_eq!(
+            plan.hash_pairs,
+            [(
+                HashKey::Column("a.x".to_string()),
+                HashKey::Column("b.x".to_string())
+            )]
+        );
         assert!(plan.join_filter().is_none() && plan.left_filter().is_none());
 
         let plan = hash_plan(
@@ -562,6 +660,24 @@ mod tests {
             filter.as_ref().map(deparse).as_deref(),
             Some("(t2.b = 'y'::text)")
         );
+    }
+
+    #[test]
+    fn computed_equalities_hash() {
+        let plan = hash_plan(
+            Some(&condition("select * from a join b on a.x + 1 = b.y")),
+            &["a"],
+            &["b"],
+        )
+        .unwrap();
+        assert_eq!(plan.hash_pairs.len(), 1, "{:?}", plan.hash_pairs);
+        let plan = hash_plan(
+            Some(&condition("select * from a join b on (a.x)::text = b.y")),
+            &["a"],
+            &["b"],
+        )
+        .unwrap();
+        assert_eq!(plan.hash_pairs.len(), 1, "{:?}", plan.hash_pairs);
     }
 
     #[test]

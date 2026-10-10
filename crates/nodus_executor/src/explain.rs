@@ -232,6 +232,15 @@ impl Node {
     }
 }
 
+/// A hashed key as PostgreSQL prints it: a bare column, or the computed
+/// expression wrapped the way a condition's operand is.
+fn hash_key_text(key: &crate::joins::HashKey, qualified: bool) -> String {
+    match key {
+        crate::joins::HashKey::Column(name) => column(name, qualified),
+        crate::joins::HashKey::Expr(expr) => deparse_scalar(expr, qualified),
+    }
+}
+
 fn round2(x: f64) -> f64 {
     (x * 100.0).round() / 100.0
 }
@@ -586,9 +595,17 @@ impl MemExecutor {
                                 .iter()
                                 .map(|(left, right)| {
                                     if swapped_join {
-                                        format!("({right} = {left})")
+                                        format!(
+                                            "({} = {})",
+                                            hash_key_text(right, true),
+                                            hash_key_text(left, true)
+                                        )
                                     } else {
-                                        format!("({left} = {right})")
+                                        format!(
+                                            "({} = {})",
+                                            hash_key_text(left, true),
+                                            hash_key_text(right, true)
+                                        )
                                     }
                                 })
                                 .collect::<Vec<_>>()
@@ -1154,7 +1171,13 @@ impl MemExecutor {
                         let text = plan
                             .hash_pairs
                             .iter()
-                            .map(|(target, source)| format!("({target} = {source})"))
+                            .map(|(target, source)| {
+                                format!(
+                                    "({} = {})",
+                                    hash_key_text(target, true),
+                                    hash_key_text(source, true)
+                                )
+                            })
                             .collect::<Vec<_>>()
                             .join(" AND ");
                         let text = if text.matches(" = ").count() > 1 {
@@ -1228,7 +1251,13 @@ impl MemExecutor {
                     let text = plan
                         .hash_pairs
                         .iter()
-                        .map(|(left, right)| format!("({left} = {right})"))
+                        .map(|(left, right)| {
+                            format!(
+                                "({} = {})",
+                                hash_key_text(left, true),
+                                hash_key_text(right, true)
+                            )
+                        })
                         .collect::<Vec<_>>()
                         .join(" AND ");
                     let text = if plan.hash_pairs.len() > 1 {
