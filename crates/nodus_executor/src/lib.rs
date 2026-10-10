@@ -931,8 +931,75 @@ impl MemExecutor {
         index_id: nodus_catalog::IndexId,
         index_val: &Value,
         table_id: TableId,
-        data_type: &str,
+        types: &[String],
         ordered: bool,
+        session: &str,
+    ) -> Result<Vec<(String, Vec<Value>)>> {
+        if ordered
+            && let Some(hex) = types
+                .first()
+                .and_then(|ty| crate::index_keys::key_component(index_val, ty))
+        {
+            return self.index_prefix_scan(index_id, &hex, None, table_id, session);
+        }
+        let read_ts = self.read_ts(session);
+        self.maybe_read_range_barrier(
+            session,
+            KeyRange {
+                start: Bytes::from(format!("{table_id}:")),
+                end: Bytes::from(format!("{table_id};")),
+            },
+        )?;
+        let columns = self.table_columns(table_id);
+        let mut rows = Vec::new();
+        for (pk, _) in self.index_entries(index_id, index_val, types, ordered, read_ts)? {
+            let row_key = Bytes::from(format!("{table_id}:{pk}"));
+            if let Some(row_val) = self.kv.get(&row_key, read_ts)? {
+                rows.push((pk, Self::decode_row(&row_val, &columns)?));
+            }
+        }
+        Ok(rows)
+    }
+
+    /// The entry keys' tails (`{components}-{pk}`) under an encoded key
+    /// prefix, optionally bounded on the component that follows the
+    /// equalities, each with the entry's payload.
+    fn prefix_entry_tails(
+        &self,
+        index_id: nodus_catalog::IndexId,
+        prefix_hex: &str,
+        bounds: Option<(&str, Option<&(Value, bool)>, Option<&(Value, bool)>)>,
+        read_ts: u64,
+    ) -> Result<Vec<(String, Vec<u8>)>> {
+        let Some((_, start, end)) = Self::index_prefix_region(index_id, prefix_hex, bounds) else {
+            return Ok(Vec::new());
+        };
+        let whole = format!("i:{index_id}:");
+        let mut entries = Vec::new();
+        for pair in self.kv.scan(
+            KeyRange {
+                start: Bytes::from(start),
+                end: Bytes::from(end),
+            },
+            read_ts,
+        )? {
+            let pair = pair?;
+            let key_str = String::from_utf8_lossy(&pair.key);
+            if let Some(tail) = key_str.strip_prefix(&whole) {
+                entries.push((tail.to_string(), pair.value.to_vec()));
+            }
+        }
+        Ok(entries)
+    }
+
+    /// The rows an index's entries under an encoded key prefix point at:
+    /// the stored rows, fetched by their keys.
+    pub(crate) fn index_prefix_scan(
+        &self,
+        index_id: nodus_catalog::IndexId,
+        prefix_hex: &str,
+        bounds: Option<(&str, Option<&(Value, bool)>, Option<&(Value, bool)>)>,
+        table_id: TableId,
         session: &str,
     ) -> Result<Vec<(String, Vec<Value>)>> {
         let read_ts = self.read_ts(session);
@@ -940,18 +1007,80 @@ impl MemExecutor {
         self.maybe_read_range_barrier(
             session,
             KeyRange {
-                start: Bytes::from(format!("{}:", table_id)),
-                end: Bytes::from(format!("{};", table_id)),
+                start: Bytes::from(format!("{table_id}:")),
+                end: Bytes::from(format!("{table_id};")),
             },
         )?;
         let columns = self.table_columns(table_id);
         let mut rows = Vec::new();
-        for (pk, _) in self.index_entries(index_id, index_val, data_type, ordered, read_ts)? {
-            // Fetch the actual row
-            let row_key = Bytes::from(format!("{}:{}", table_id, pk));
+        for (tail, _) in self.prefix_entry_tails(index_id, prefix_hex, bounds, read_ts)? {
+            let Some((_, pk)) = tail.split_once('-') else {
+                continue;
+            };
+            let row_key = Bytes::from(format!("{table_id}:{pk}"));
             if let Some(row_val) = self.kv.get(&row_key, read_ts)? {
-                rows.push((pk, Self::decode_row(&row_val, &columns)?));
+                rows.push((pk.to_string(), Self::decode_row(&row_val, &columns)?));
             }
+        }
+        Ok(rows)
+    }
+
+    /// The rows an index's entries under an encoded key prefix hold
+    /// themselves: every key column's value decoded from the entry key, the
+    /// `INCLUDE` columns' from the payload.
+    pub(crate) fn index_only_prefix_scan(
+        &self,
+        index_id: nodus_catalog::IndexId,
+        prefix_hex: &str,
+        bounds: Option<(&str, Option<&(Value, bool)>, Option<&(Value, bool)>)>,
+        table: &nodus_catalog::TableDescriptor,
+        index: &nodus_catalog::IndexDescriptor,
+        session: &str,
+    ) -> Result<Vec<(String, Vec<Value>)>> {
+        let read_ts = self.read_ts(session);
+        let (types, ordered) = Self::index_entry_encoding(table, index);
+        let key_positions: Vec<Option<usize>> = index
+            .key_columns
+            .iter()
+            .map(|key| table.columns.iter().position(|c| c.id == key.column_id))
+            .collect();
+        let mut rows = Vec::new();
+        for (tail, payload) in self.prefix_entry_tails(index_id, prefix_hex, bounds, read_ts)? {
+            let Some((components, pk)) = tail.split_once('-') else {
+                continue;
+            };
+            // An index with no `INCLUDE` columns carries a key value and an
+            // empty payload.
+            if payload.is_empty() && !index.include_columns.is_empty() {
+                continue;
+            }
+            let included = Self::decode_row(
+                &payload,
+                &index
+                    .include_columns
+                    .iter()
+                    .filter_map(|id| table.columns.iter().find(|c| c.id == *id))
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            )?;
+            let mut row = vec![Value::Null; table.columns.len()];
+            for (at, component) in components.split('!').enumerate() {
+                let Some(position) = key_positions.get(at).copied().flatten() else {
+                    continue;
+                };
+                let Some(data_type) = types.get(at) else {
+                    continue;
+                };
+                if let Some(value) = Self::decode_key_component(component, data_type, ordered) {
+                    row[position] = value;
+                }
+            }
+            for (id, value) in index.include_columns.iter().zip(included) {
+                if let Some(at) = table.columns.iter().position(|c| c.id == *id) {
+                    row[at] = value;
+                }
+            }
+            rows.push((pk.to_string(), row));
         }
         Ok(rows)
     }
@@ -962,12 +1091,26 @@ impl MemExecutor {
         &self,
         index_id: nodus_catalog::IndexId,
         index_val: &Value,
-        data_type: &str,
+        types: &[String],
         ordered: bool,
         read_ts: u64,
     ) -> Result<Vec<(String, Vec<u8>)>> {
-        let (prefix, start, end) =
-            Self::index_value_region(index_id, index_val, data_type, ordered);
+        let (prefix, start, end) = match ordered.then(|| {
+            crate::index_keys::key_component(index_val, types.first()?)
+                .and_then(|hex| Self::index_prefix_region(index_id, &hex, None))
+        }) {
+            Some(Some(region)) => region,
+            _ => {
+                // The legacy text encoding: one escaped value, `:`-separated.
+                let escaped = Self::escape_index_value(&render(&crate::value::key_form(index_val)));
+                let prefix = format!("i:{}:{}:", index_id, escaped);
+                (
+                    prefix.clone(),
+                    prefix,
+                    format!("i:{}:{};", index_id, escaped),
+                )
+            }
+        };
         self.entries_between(&prefix, &start, &end, read_ts)
     }
 
@@ -1005,36 +1148,13 @@ impl MemExecutor {
         data_type: &str,
         session: &str,
     ) -> Result<Vec<(String, Vec<Value>)>> {
-        let Some((start, end)) = Self::index_range_region(index_id, lower, upper, data_type) else {
-            return Ok(Vec::new());
-        };
-        let read_ts = self.read_ts(session);
-        let columns = self.table_columns(table_id);
-        let mut rows = Vec::new();
-        let start_bytes = Bytes::from(start.clone());
-        let end_bytes = Bytes::from(end.clone());
-        for pair in self.kv.scan(
-            KeyRange {
-                start: start_bytes,
-                end: end_bytes,
-            },
-            read_ts,
-        )? {
-            let pair = pair?;
-            let key_str = String::from_utf8_lossy(&pair.key);
-            let Some(tail) = key_str.strip_prefix(&format!("i:{index_id}:")) else {
-                continue;
-            };
-            // The row key follows the value's encoding and a `-`.
-            let Some((_, pk)) = tail.split_once('-') else {
-                continue;
-            };
-            let row_key = Bytes::from(format!("{}:{}", table_id, pk));
-            if let Some(row_val) = self.kv.get(&row_key, read_ts)? {
-                rows.push((pk.to_string(), Self::decode_row(&row_val, &columns)?));
-            }
-        }
-        Ok(rows)
+        self.index_prefix_scan(
+            index_id,
+            "",
+            Some((data_type, lower, upper)),
+            table_id,
+            session,
+        )
     }
 
     /// An index-only range scan: like [`Self::index_only_scan`], over the
@@ -1049,57 +1169,20 @@ impl MemExecutor {
         index: &nodus_catalog::IndexDescriptor,
         session: &str,
     ) -> Result<Vec<(String, Vec<Value>)>> {
-        let (data_type, ordered) = Self::index_entry_encoding(table, index);
-        let Some((start, end)) = Self::index_range_region(index_id, lower, upper, &data_type)
-        else {
+        let (types, _) = Self::index_entry_encoding(table, index);
+        let Some(data_type) = types.first().cloned() else {
             return Ok(Vec::new());
         };
-        let read_ts = self.read_ts(session);
-        let prefix = format!("i:{index_id}:");
-        let mut rows = Vec::new();
-        let entries = self.entries_between(&prefix, &start, &end, read_ts)?;
-        for (tail, payload) in entries {
-            let Some((encoded, pk)) = tail.split_once('-') else {
-                continue;
-            };
-            let leading = match Self::decode_key_component(encoded, &data_type, ordered) {
-                Some(value) => value,
-                None => continue,
-            };
-            // An index with no `INCLUDE` columns carries a key value and an
-            // empty payload.
-            if payload.is_empty() && !index.include_columns.is_empty() {
-                continue;
-            }
-            let included = Self::decode_row(
-                &payload,
-                &index
-                    .include_columns
-                    .iter()
-                    .filter_map(|id| table.columns.iter().find(|c| c.id == *id))
-                    .cloned()
-                    .collect::<Vec<_>>(),
-            )?;
-            let mut row = vec![Value::Null; table.columns.len()];
-            for key in &index.key_columns {
-                if crate::index_keys::is_expression_key(key) {
-                    continue;
-                }
-                if let Some(at) = table.columns.iter().position(|c| c.id == key.column_id) {
-                    row[at] = leading.clone();
-                }
-            }
-            for (id, value) in index.include_columns.iter().zip(included) {
-                if let Some(at) = table.columns.iter().position(|c| c.id == *id) {
-                    row[at] = value;
-                }
-            }
-            rows.push((pk.to_string(), row));
-        }
-        Ok(rows)
+        self.index_only_prefix_scan(
+            index_id,
+            "",
+            Some((&data_type, lower, upper)),
+            table,
+            index,
+            session,
+        )
     }
 
-    /// A key component's value, as it was encoded.
     fn decode_key_component(encoded: &str, data_type: &str, ordered: bool) -> Option<Value> {
         if !ordered {
             // The legacy encoding is the escaped rendering of the value.
@@ -1169,10 +1252,8 @@ impl MemExecutor {
         }
     }
 
-    /// An index-only scan: the rows of an index's entries under one leading
-    /// value, read from the entries themselves. The rows are full-width, the
-    /// columns the index does not cover left NULL — the caller reads only
-    /// covered columns.
+    /// An index-only scan: the row's columns synthesized from the entry key
+    /// (its leading value) and the `INCLUDE` payload.
     pub(crate) fn index_only_scan(
         &self,
         index_id: nodus_catalog::IndexId,
@@ -1181,14 +1262,17 @@ impl MemExecutor {
         index: &nodus_catalog::IndexDescriptor,
         session: &str,
     ) -> Result<Vec<(String, Vec<Value>)>> {
+        let (types, ordered) = Self::index_entry_encoding(table, index);
+        if ordered
+            && let Some(hex) = types
+                .first()
+                .and_then(|ty| crate::index_keys::key_component(index_val, ty))
+        {
+            return self.index_only_prefix_scan(index_id, &hex, None, table, index, session);
+        }
         let read_ts = self.read_ts(session);
         let mut rows = Vec::new();
-        let (data_type, ordered) = Self::index_entry_encoding(table, index);
-        for (pk, payload) in
-            self.index_entries(index_id, index_val, &data_type, ordered, read_ts)?
-        {
-            // An index with no `INCLUDE` columns carries a key value and an
-            // empty payload.
+        for (pk, payload) in self.index_entries(index_id, index_val, &types, ordered, read_ts)? {
             if payload.is_empty() && !index.include_columns.is_empty() {
                 continue;
             }
@@ -1202,16 +1286,12 @@ impl MemExecutor {
                     .collect::<Vec<_>>(),
             )?;
             let mut row = vec![Value::Null; table.columns.len()];
-            for (key, value) in index
-                .key_columns
-                .iter()
-                .zip(std::iter::once(index_val.clone()))
-            {
+            for key in &index.key_columns {
                 if crate::index_keys::is_expression_key(key) {
                     continue;
                 }
                 if let Some(at) = table.columns.iter().position(|c| c.id == key.column_id) {
-                    row[at] = value.clone();
+                    row[at] = index_val.clone();
                 }
             }
             for (id, value) in index.include_columns.iter().zip(included) {
@@ -1290,6 +1370,23 @@ impl MemExecutor {
         val: &Value,
         session: &str,
     ) -> Vec<Vec<Value>> {
+        self.merge_overlay_by(committed, table_id, session, |row| {
+            col_pos
+                .and_then(|p| row.get(p))
+                .map(|cv| compare(cv, val) == std::cmp::Ordering::Equal)
+                .unwrap_or(false)
+        })
+    }
+
+    /// As [`Self::merge_overlay_eq`], with the caller's test deciding which
+    /// of the session's own rows the scan's condition matches.
+    pub(crate) fn merge_overlay_by(
+        &self,
+        committed: Vec<(String, Vec<Value>)>,
+        table_id: TableId,
+        session: &str,
+        matches: impl Fn(&[Value]) -> bool,
+    ) -> Vec<Vec<Value>> {
         let mut map: std::collections::BTreeMap<String, Vec<Value>> =
             committed.into_iter().collect();
         let columns = self.table_columns(table_id);
@@ -1304,11 +1401,7 @@ impl MemExecutor {
                     }
                     Some(encoded) => {
                         if let Ok(row) = Self::decode_row(encoded.as_bytes(), &columns) {
-                            let matches = col_pos
-                                .and_then(|p| row.get(p))
-                                .map(|cv| compare(cv, val) == std::cmp::Ordering::Equal)
-                                .unwrap_or(false);
-                            if matches {
+                            if matches(&row) {
                                 map.insert(pk, row);
                             } else {
                                 map.remove(&pk);
@@ -1359,13 +1452,32 @@ impl MemExecutor {
         &self,
         tbl: &nodus_catalog::TableDescriptor,
         index: &nodus_catalog::IndexDescriptor,
-        index_val: &Value,
+        key: &[Value],
         table_id: TableId,
         session: &str,
     ) -> Result<Vec<(String, Vec<Value>)>> {
-        let (data_type, ordered) = Self::index_entry_encoding(tbl, index);
-        let (prefix, start, end) =
-            Self::index_value_region(index.id, index_val, &data_type, ordered);
+        let (types, ordered) = Self::index_entry_encoding(tbl, index);
+        let region = key
+            .first()
+            .and_then(|_| {
+                ordered
+                    .then(|| Self::index_key_components(&types, key))
+                    .flatten()
+            })
+            .and_then(|hex| Self::index_prefix_region(index.id, &hex, None));
+        let (prefix, start, end) = match region {
+            Some(region) => region,
+            None => {
+                let leading = key.first().unwrap_or(&Value::Null);
+                let escaped = Self::escape_index_value(&render(&crate::value::key_form(leading)));
+                let prefix = format!("i:{}:{}:", index.id, escaped);
+                (
+                    prefix.clone(),
+                    prefix,
+                    format!("i:{}:{};", index.id, escaped),
+                )
+            }
+        };
         let read_ts = self.read_ts(session);
         let mut pks = std::collections::BTreeSet::new();
         for pair in self.kv.scan(
@@ -1442,27 +1554,43 @@ impl MemExecutor {
         )
     }
 
-    /// How an index's entry keys encode their leading value: the leading
-    /// column's type, and whether the order-preserving encoding applies. An
-    /// expression key or a type outside the encoding uses the legacy text
-    /// form (equality lookups only).
+    /// How an index's entry keys encode their key columns: each column's
+    /// type, and whether the order-preserving encoding applies. A version-3
+    /// index encodes every key column (`{hex}[!{hex}]*-{pk}`), a version-2
+    /// one just the leading value (`{hex}-{pk}`); an expression key or a
+    /// type outside the encoding uses the legacy text form (equality
+    /// lookups only).
     pub(crate) fn index_entry_encoding(
         tbl: &nodus_catalog::TableDescriptor,
         idx: &nodus_catalog::IndexDescriptor,
-    ) -> (String, bool) {
-        let column = idx.key_columns.first().and_then(|key| {
-            (!crate::index_keys::is_expression_key(key))
-                .then(|| tbl.columns.iter().find(|c| c.id == key.column_id))
-                .flatten()
-        });
-        match column {
-            Some(column)
-                if idx.key_version >= 2
-                    && crate::index_keys::order_encoded_type(&column.data_type) =>
-            {
-                (column.data_type.clone(), true)
-            }
-            _ => (String::new(), false),
+    ) -> (Vec<String>, bool) {
+        let column_type = |key: &nodus_catalog::IndexColumn| {
+            tbl.columns
+                .iter()
+                .find(|c| c.id == key.column_id)
+                .map(|c| c.data_type.clone())
+        };
+        let all = idx
+            .key_columns
+            .iter()
+            .all(|key| {
+                !crate::index_keys::is_expression_key(key)
+                    && column_type(key).is_some_and(|ty| crate::index_keys::order_encoded_type(&ty))
+            })
+            .then(|| {
+                idx.key_columns
+                    .iter()
+                    .filter_map(column_type)
+                    .collect::<Vec<String>>()
+            });
+        match all {
+            Some(types) if idx.key_version >= 3 => (types, true),
+            _ => match idx.key_columns.first().and_then(column_type) {
+                Some(ty) if idx.key_version >= 2 && crate::index_keys::order_encoded_type(&ty) => {
+                    (vec![ty], true)
+                }
+                _ => (Vec::new(), false),
+            },
         }
     }
 
@@ -1472,38 +1600,86 @@ impl MemExecutor {
         index_id: nodus_catalog::IndexId,
         index_val: &Value,
         pk: &str,
-        data_type: &str,
+        types: &[String],
         ordered: bool,
+        key: &[Value],
     ) -> String {
-        if ordered && let Some(hex) = crate::index_keys::key_component(index_val, data_type) {
+        if ordered && let Some(hex) = Self::index_key_components(types, key) {
             return format!("i:{index_id}:{hex}-{pk}");
         }
         Self::index_key(index_id, index_val, pk)
     }
 
-    /// Where an index's entries for one leading value live: the prefix they
-    /// share (their key is the prefix plus the row's key, `-`-separated in
-    /// the order-preserving encoding), and the range their scan reads.
-    fn index_value_region(
-        index_id: nodus_catalog::IndexId,
-        index_val: &Value,
-        data_type: &str,
-        ordered: bool,
-    ) -> (String, String, String) {
-        // The order-preserving encoding keys a value (`UPPER` hex of its
-        // bytes, terminated), so entry ranges can be bounded.
-        if ordered && let Some(hex) = crate::index_keys::key_component(index_val, data_type) {
-            let start = format!("i:{index_id}:{hex}");
-            let end = format!("i:{index_id}:{hex};");
-            let prefix = format!("{start}-");
-            return (prefix, start, end);
+    /// The entry key's encoded components — every key column's value
+    /// (`types` holds their types), `!`-separated so a shorter value sorts
+    /// before a longer one that starts with it.
+    fn index_key_components(types: &[String], key: &[Value]) -> Option<String> {
+        let mut out = String::new();
+        for (at, data_type) in types.iter().enumerate() {
+            if at > 0 {
+                out.push('!');
+            }
+            out.push_str(&crate::index_keys::key_component(key.get(at)?, data_type)?);
         }
-        // The legacy text encoding: one escaped value, `:`-separated.
-        let escaped = Self::escape_index_value(&render(&crate::value::key_form(index_val)));
-        let prefix = format!("i:{}:{}:", index_id, escaped);
-        let start = prefix.clone();
-        let end = format!("i:{}:{};", index_id, escaped);
-        (prefix, start, end)
+        Some(out)
+    }
+
+    /// The key columns' values in a stored row.
+    fn row_key_values(
+        tbl: &nodus_catalog::TableDescriptor,
+        idx: &nodus_catalog::IndexDescriptor,
+        row: &[Value],
+    ) -> Vec<Value> {
+        let parts = crate::index_keys::index_parts(tbl, idx);
+        crate::index_keys::key_values(tbl, &parts, row)
+    }
+
+    /// Where an index's entries under an encoded key prefix live — the
+    /// equalities' components, `!`-joined — optionally bounded on the
+    /// component that follows: the prefix their keys share (tail and pk are
+    /// `-`-separated), and the range their scan reads.
+    fn index_prefix_region(
+        index_id: nodus_catalog::IndexId,
+        prefix_hex: &str,
+        range: Option<(&str, Option<&(Value, bool)>, Option<&(Value, bool)>)>,
+    ) -> Option<(String, String, String)> {
+        let base = format!("i:{index_id}:{prefix_hex}");
+        let (start, end) = match range {
+            // The equalities alone: every entry under the prefix. `G` is
+            // above every hex digit, so it bounds them all.
+            None => (base.clone(), format!("{base}G")),
+            Some((data_type, lower, upper)) => {
+                // `>= v` reads from the value's own encoding (its entries
+                // extend it); `> v` skips them, staying below any longer
+                // value's.
+                let start = match lower {
+                    Some((value, inclusive)) => {
+                        let hex = crate::index_keys::key_component(value, data_type)?;
+                        if *inclusive {
+                            format!("{base}{hex}")
+                        } else {
+                            format!("{base}{hex}01")
+                        }
+                    }
+                    None => base.clone(),
+                };
+                // `<= v` includes the value's own entries; `< v` excludes
+                // them.
+                let end = match upper {
+                    Some((value, inclusive)) => {
+                        let hex = crate::index_keys::key_component(value, data_type)?;
+                        if *inclusive {
+                            format!("{base}{hex}01")
+                        } else {
+                            format!("{base}{hex}")
+                        }
+                    }
+                    None => format!("{base}G"),
+                };
+                (start, end)
+            }
+        };
+        Some((format!("{base}-"), start, end))
     }
 
     /// The entries of an index between two bounds of one leading value: the
@@ -1587,12 +1763,14 @@ impl MemExecutor {
         row: &[Value],
     ) -> Result<()> {
         let payload = Self::index_entry_payload(tbl, idx, row);
-        let (data_type, ordered) = Self::index_entry_encoding(tbl, idx);
-        let key = Self::index_key_for(idx.id, index_val, pk, &data_type, ordered);
+        let (types, ordered) = Self::index_entry_encoding(tbl, idx);
+        let key_values = Self::row_key_values(tbl, idx, row);
+        let key = Self::index_key_for(idx.id, index_val, pk, &types, ordered, &key_values);
         self.write_row(session, key, payload)
     }
 
-    /// Removes `tbl`'s entry of `idx` for `row`, keyed as it was written.
+    /// Removes `tbl`'s entry of `idx` for `row` (the row as stored, whose
+    /// key columns the entry encoded), keyed as it was written.
     pub(crate) fn delete_row_index_entry(
         &self,
         session: &str,
@@ -1600,9 +1778,11 @@ impl MemExecutor {
         idx: &nodus_catalog::IndexDescriptor,
         index_val: &Value,
         pk: &str,
+        row: &[Value],
     ) -> Result<()> {
-        let (data_type, ordered) = Self::index_entry_encoding(tbl, idx);
-        let key = Self::index_key_for(idx.id, index_val, pk, &data_type, ordered);
+        let (types, ordered) = Self::index_entry_encoding(tbl, idx);
+        let key_values = Self::row_key_values(tbl, idx, row);
+        let key = Self::index_key_for(idx.id, index_val, pk, &types, ordered, &key_values);
         self.delete_row(session, key)
     }
 

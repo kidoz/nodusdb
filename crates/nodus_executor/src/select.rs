@@ -578,6 +578,85 @@ impl MemExecutor {
                         }
                     }
                 }
+                // A version-3 index folds conjuncts on trailing key
+                // columns into the scan too: the leading equalities bound
+                // the key prefix, then a range on the next column.
+                let composite = if rows.is_none()
+                    && sample.is_none()
+                    && joins.is_empty()
+                    && descendants.is_empty()
+                {
+                    crate::index_keys::composite_index(
+                        &tbl,
+                        &tbl.indexes,
+                        filter.as_ref(),
+                        index_only.as_ref(),
+                    )
+                    .and_then(|(idx, conds)| {
+                        let mut values = Vec::new();
+                        let mut prefix = String::new();
+                        for (name, operand) in &conds.equalities {
+                            let data_type = tbl
+                                .columns
+                                .iter()
+                                .find(|c| c.name == *name)?
+                                .data_type
+                                .clone();
+                            let value = self.eval_operand(&[], &[], &[], operand, &data_type);
+                            if !prefix.is_empty() {
+                                prefix.push('!');
+                            }
+                            prefix.push_str(&crate::index_keys::key_component(&value, &data_type)?);
+                            values.push(value);
+                        }
+                        let bounds = conds.range.as_ref().and_then(|(name, lower, upper)| {
+                            let data_type = tbl
+                                .columns
+                                .iter()
+                                .find(|c| c.name == *name)?
+                                .data_type
+                                .clone();
+                            Some((data_type, lower.clone(), upper.clone()))
+                        });
+                        Some((idx, conds, values, prefix, bounds))
+                    })
+                } else {
+                    None
+                };
+                if let Some((idx, conds, values, prefix, bounds)) = composite {
+                    let bounds = bounds
+                        .as_ref()
+                        .map(|(ty, lower, upper)| (ty.as_str(), lower.as_ref(), upper.as_ref()));
+                    let only = index_only
+                        .as_ref()
+                        .is_some_and(|needed| crate::index_keys::needed_covered(&tbl, idx, needed))
+                        .then(|| {
+                            self.index_only_prefix_scan(
+                                idx.id,
+                                &prefix,
+                                bounds,
+                                &tbl,
+                                idx,
+                                &ctx.session_id,
+                            )
+                            .ok()
+                        })
+                        .flatten();
+                    let indexed_rows = match only {
+                        Some(rows) => Ok(rows),
+                        None => {
+                            self.index_prefix_scan(idx.id, &prefix, bounds, tbl.id, &ctx.session_id)
+                        }
+                    };
+                    if let Ok(indexed_rows) = indexed_rows {
+                        rows = Some(self.merge_overlay_by(
+                            indexed_rows,
+                            tbl.id,
+                            &ctx.session_id,
+                            |row| crate::index_keys::index_conds_match(&tbl, &conds, &values, row),
+                        ));
+                    }
+                }
                 // An inequality on an indexed leading column reads the
                 // index's key order. PostgreSQL's planner costs this; ours
                 // has no statistics, so it takes the index when the session

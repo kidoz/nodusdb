@@ -1427,7 +1427,14 @@ impl MemExecutor {
                 if let Some(pos) = tbl.columns.iter().position(|c| c.id == kcol.column_id) {
                     let index_val = row.get(pos).unwrap_or(&Value::Null);
                     if at == 0 {
-                        self.delete_row_index_entry(&ctx.session_id, tbl, idx, index_val, &pk_str)?;
+                        self.delete_row_index_entry(
+                            &ctx.session_id,
+                            tbl,
+                            idx,
+                            index_val,
+                            &pk_str,
+                            row,
+                        )?;
                     } else {
                         // Older binaries kept one entry per key column.
                         self.delete_index_entry(&ctx.session_id, idx.id, index_val, &pk_str)?;
@@ -1437,7 +1444,7 @@ impl MemExecutor {
             if crate::index_keys::has_expressions(idx)
                 && let Some(value) = Self::index_leading_value(tbl, idx, row)
             {
-                self.delete_row_index_entry(&ctx.session_id, tbl, idx, &value, &pk_str)?;
+                self.delete_row_index_entry(&ctx.session_id, tbl, idx, &value, &pk_str, row)?;
             }
         }
         Ok(())
@@ -1713,7 +1720,7 @@ impl MemExecutor {
                 || Self::index_entry_payload(tbl, idx, old_row)
                     != Self::index_entry_payload(tbl, idx, row))
             {
-                self.delete_row_index_entry(&ctx.session_id, tbl, idx, &old_val, &old_pk)?;
+                self.delete_row_index_entry(&ctx.session_id, tbl, idx, &old_val, &old_pk, old_row)?;
                 self.write_row_index_entry(&ctx.session_id, tbl, idx, &new_val, &pk, row)?;
             }
         }

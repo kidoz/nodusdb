@@ -1555,6 +1555,9 @@ impl MemExecutor {
         // The index the scan reads: an equality on the leading column of
         // one (found in a conjunction), or — when the session asks for index
         // scans — a range over it (`SET enable_seqscan = off`).
+        // A version-3 index folds conjuncts on trailing key columns into
+        // the index condition; older ones read the leading column alone.
+        let composite = crate::index_keys::composite_index(&tbl, &tbl.indexes, filter, index_only);
         let scan_index = tbl.indexes.iter().find_map(|idx| {
             let key = idx.key_columns.first()?;
             if crate::index_keys::is_expression_key(key) {
@@ -1574,6 +1577,18 @@ impl MemExecutor {
                 && Self::index_entry_encoding(&tbl, idx).1;
             (equality || range).then_some((column, idx))
         });
+        let scan_index = match &composite {
+            Some((idx, _)) => tbl
+                .columns
+                .iter()
+                .find(|c| {
+                    idx.key_columns
+                        .first()
+                        .is_some_and(|key| key.column_id == c.id)
+                })
+                .map(|column| (column, *idx)),
+            None => scan_index,
+        };
         if sample.is_none()
             && let Some((col, idx)) = scan_index
             && let Some(idx) =
@@ -1586,11 +1601,15 @@ impl MemExecutor {
                 Some(filter) => {
                     let mut index_conds: Vec<&FilterExpr> = Vec::new();
                     let mut residuals: Vec<&FilterExpr> = Vec::new();
+                    let consumed: Vec<String> = composite
+                        .as_ref()
+                        .map(|(_, conds)| conds.columns.clone())
+                        .unwrap_or_else(|| vec![col.name.clone()]);
                     for conjunct in crate::index_keys::conjuncts(filter) {
                         let usable = match conjunct {
                             FilterExpr::Predicate(Predicate { left, op, right }) => {
                                 let name = left.rsplit('.').next().unwrap_or(left);
-                                name == col.name
+                                consumed.iter().any(|c| c == name)
                                     && matches!(
                                         op,
                                         CompareOp::Eq

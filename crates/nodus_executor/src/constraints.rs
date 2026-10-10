@@ -242,13 +242,9 @@ impl MemExecutor {
         if matches!(row[leading], Value::Float(_)) {
             return Ok(None);
         }
-        Ok(Some(self.index_rows(
-            tbl,
-            index,
-            &row[leading],
-            tbl.id,
-            session,
-        )?))
+        let parts = crate::index_keys::index_parts(tbl, index);
+        let key = crate::index_keys::key_values(tbl, &parts, row);
+        Ok(Some(self.index_rows(tbl, index, &key, tbl.id, session)?))
     }
 
     /// Rejects `new_row` when a unique index on expressions of `tbl` has
@@ -341,7 +337,7 @@ impl MemExecutor {
                 .map(|(k, r)| (k.strip_prefix(&prefix).unwrap_or(&k).to_string(), r))
                 .collect()
         } else {
-            self.index_rows(tbl, idx, &key[0], tbl.id, session)?
+            self.index_rows(tbl, idx, &key, tbl.id, session)?
         };
         Ok(candidates
             .into_iter()

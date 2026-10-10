@@ -490,20 +490,164 @@ pub(crate) fn range_bounds(
     let mut lower: Option<(Value, bool)> = None;
     let mut upper: Option<(Value, bool)> = None;
     // A conjunction may bound both ends (`BETWEEN`); an `OR` bounds nothing.
-    let mut current = Some(filter);
-    while let Some(filter) = current {
-        match filter {
-            FilterExpr::And(left, right) => {
-                tighten(left, column, &mut lower, &mut upper);
-                current = Some(right);
+    for conjunct in conjuncts(filter) {
+        tighten(conjunct, column, &mut lower, &mut upper);
+    }
+    (lower.is_some() || upper.is_some()).then_some((lower, upper))
+}
+
+/// The conditions a filter puts on an index's key columns, in key order:
+/// equalities on the leading ones, then a range on the next.
+#[derive(Debug, Default)]
+pub(crate) struct IndexConds {
+    /// `(column name, literal)` equalities on the leading key columns.
+    pub(crate) equalities: Vec<(String, crate::plan_types::Operand)>,
+    /// The first key column after them that a range bounds: its column
+    /// name and the bounds.
+    pub(crate) range: Option<(String, Option<(Value, bool)>, Option<(Value, bool)>)>,
+    /// The columns the conditions read, in key order.
+    pub(crate) columns: Vec<String>,
+}
+
+/// The conditions a v3 index's scan reads: following the key columns,
+/// equalities on the leading ones then a range on the next (PostgreSQL
+/// folds both into the `Index Cond`). `None` when the index is not one the
+/// scan can use — no leading equality or range, an expression key, or a
+/// type outside the encoding.
+pub(crate) fn index_conds(
+    tbl: &TableDescriptor,
+    idx: &IndexDescriptor,
+    filter: Option<&crate::plan_types::FilterExpr>,
+) -> Option<IndexConds> {
+    let filter = filter?;
+    if idx.key_version < 3 || has_expressions(idx) {
+        return None;
+    }
+    let mut conds = IndexConds::default();
+    let mut columns: Vec<String> = idx
+        .key_columns
+        .iter()
+        .map(|key| {
+            tbl.columns
+                .iter()
+                .find(|c| c.id == key.column_id)
+                .map(|c| c.name.clone())
+        })
+        .collect::<Option<Vec<_>>>()?;
+    // The leading key columns: equalities first, then one range.
+    let equalities = columns
+        .iter()
+        .take_while(|name| equality_operand(filter, name).is_some())
+        .count();
+    for name in columns.drain(..equalities) {
+        let operand = equality_operand(filter, &name)?;
+        conds.equalities.push((name.clone(), operand.clone()));
+        conds.columns.push(name);
+    }
+    if let Some(name) = columns.first()
+        && let Some((lower, upper)) = range_bounds(filter, name)
+    {
+        conds.range = Some((name.clone(), lower, upper));
+        conds.columns.push(name.clone());
+        columns.remove(0);
+    }
+    // Later key columns' conditions do not narrow the scan, but the index
+    // checks them too, as PostgreSQL's `Index Cond` shows.
+    for name in &columns {
+        let narrowed = conds.equalities.iter().any(|(c, _)| c == name)
+            || conds.range.as_ref().is_some_and(|(c, _, _)| c == name);
+        if !narrowed
+            && (equality_operand(filter, name).is_some() || range_bounds(filter, name).is_some())
+        {
+            conds.columns.push(name.clone());
+        }
+    }
+    (!conds.equalities.is_empty() || conds.range.is_some()).then_some(conds)
+}
+
+/// The version-3 index a composite scan reads: the first whose key columns
+/// the conditions fold into (an equality prefix and a possible range),
+/// preferring one that covers every column the statement reads. A range
+/// requires the session's index-scan request, as elsewhere.
+pub(crate) fn composite_index<'a>(
+    tbl: &TableDescriptor,
+    indexes: &'a [IndexDescriptor],
+    filter: Option<&crate::plan_types::FilterExpr>,
+    needed: Option<&NeededColumns>,
+) -> Option<(&'a IndexDescriptor, IndexConds)> {
+    let qualifies = |idx: &'a IndexDescriptor| -> Option<IndexConds> {
+        let conds = index_conds(tbl, idx, filter)?;
+        // The plain paths read one leading equality or one range; the
+        // composite one takes over when more columns are involved.
+        if conds.columns.len() < 2
+            && conds.equalities.len() + usize::from(conds.range.is_some()) < 2
+        {
+            return None;
+        }
+        if conds.range.is_some()
+            && crate::session_env::setting("enable_seqscan").as_deref() != Some("off")
+        {
+            return None;
+        }
+        Some(conds)
+    };
+    if let Some(needed) = needed
+        && let Some(found) = indexes.iter().find_map(|idx| {
+            qualifies(idx)
+                .filter(|_| needed_covered(tbl, idx, needed))
+                .map(|conds| (idx, conds))
+        })
+    {
+        return Some(found);
+    }
+    indexes
+        .iter()
+        .find_map(|idx| qualifies(idx).map(|conds| (idx, conds)))
+}
+
+/// Whether a row satisfies the conditions, so the session's own
+/// (uncommitted) rows can be merged into an index scan's result: a NULL
+/// never decides against a row — the residual filter does.
+pub(crate) fn index_conds_match(
+    tbl: &TableDescriptor,
+    conds: &IndexConds,
+    values: &[Value],
+    row: &[Value],
+) -> bool {
+    for ((name, _), value) in conds.equalities.iter().zip(values) {
+        let Some(position) = tbl.columns.iter().position(|c| c.name == *name) else {
+            return false;
+        };
+        let cell = row.get(position).unwrap_or(&Value::Null);
+        if cell != &Value::Null && !crate::value::values_equal(cell, value) {
+            return false;
+        }
+    }
+    if let Some((name, lower, upper)) = &conds.range {
+        let Some(position) = tbl.columns.iter().position(|c| c.name == *name) else {
+            return false;
+        };
+        let cell = row.get(position).unwrap_or(&Value::Null);
+        if cell != &Value::Null {
+            if let Some((bound, inclusive)) = lower {
+                let ord = crate::value::compare(cell, bound);
+                if !(ord == std::cmp::Ordering::Greater
+                    || (*inclusive && ord == std::cmp::Ordering::Equal))
+                {
+                    return false;
+                }
             }
-            other => {
-                tighten(other, column, &mut lower, &mut upper);
-                current = None;
+            if let Some((bound, inclusive)) = upper {
+                let ord = crate::value::compare(cell, bound);
+                if !(ord == std::cmp::Ordering::Less
+                    || (*inclusive && ord == std::cmp::Ordering::Equal))
+                {
+                    return false;
+                }
             }
         }
     }
-    (lower.is_some() || upper.is_some()).then_some((lower, upper))
+    true
 }
 
 /// The columns a sort's keys read, when they are plain columns (`None`
@@ -556,37 +700,20 @@ pub(crate) fn equality_operand<'a>(
     column: &str,
 ) -> Option<&'a crate::plan_types::Operand> {
     use crate::plan_types::{CompareOp, FilterExpr, Operand};
-    let mut current = Some(filter);
-    while let Some(filter) = current {
-        match filter {
-            FilterExpr::And(left, right) => {
-                if let FilterExpr::Predicate(predicate) = &**left
-                    && predicate.op == CompareOp::Eq
+    conjuncts(filter)
+        .into_iter()
+        .find_map(|conjunct| match conjunct {
+            FilterExpr::Predicate(predicate)
+                if predicate.op == CompareOp::Eq
                     && predicate.left.rsplit('.').next().unwrap_or(&predicate.left) == column
-                    && matches!(predicate.right, Operand::Literal(_))
-                {
-                    return Some(&predicate.right);
-                }
-                current = Some(right);
+                    && matches!(predicate.right, Operand::Literal(_)) =>
+            {
+                Some(&predicate.right)
             }
-            other => {
-                if let FilterExpr::Predicate(predicate) = other
-                    && predicate.op == CompareOp::Eq
-                    && predicate.left.rsplit('.').next().unwrap_or(&predicate.left) == column
-                    && matches!(predicate.right, Operand::Literal(_))
-                {
-                    return Some(&predicate.right);
-                }
-                current = None;
-            }
-        }
-    }
-    None
+            _ => None,
+        })
 }
 
-/// The index an equality lookup on `leading` uses: the first covering every
-/// column the statement reads, when it reads only those, else the first over
-/// the leading column.
 pub(crate) fn equality_index<'a>(
     tbl: &TableDescriptor,
     indexes: &'a [IndexDescriptor],
