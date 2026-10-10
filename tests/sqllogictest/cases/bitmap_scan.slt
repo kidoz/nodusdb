@@ -1,0 +1,102 @@
+# Bitmap heap scans: a range across much of a table gathers the
+# matching entry keys first and reads the heap in its own order, with
+# the condition rechecked — a `Bitmap Heap Scan` over a `Bitmap Index
+# Scan`. Within a fifth of the table the index is read directly.
+# PostgreSQL's planner costs the choice and may prefer a bitmap even for
+# a narrow range; NodusDB has no statistics, so only a wide range
+# becomes a bitmap. Plans and results otherwise from PostgreSQL 18.4,
+# with `enable_seqscan = off`.
+
+statement ok
+drop table if exists b1 cascade;
+
+statement ok
+create table b1 (a int, b text);
+
+statement ok
+insert into b1 select g, 'r' || g from generate_series(1, 500) g;
+
+statement ok
+create index b1_a on b1 (a);
+
+statement ok
+analyze b1;
+
+statement ok
+set enable_seqscan = off;
+
+# A range over 40% of the rows reads through a bitmap.
+query T
+explain (costs off) select * from b1 where a between 100 and 300;
+----
+Bitmap Heap Scan on b1
+  Recheck Cond: ((a >= 100) AND (a <= 300))
+  ->  Bitmap Index Scan on b1_a
+        Index Cond: ((a >= 100) AND (a <= 300))
+
+
+# A narrow range reads the index directly.
+query T
+explain (costs off) select * from b1 where a >= 490;
+----
+Index Scan using b1_a on b1
+  Index Cond: (a >= 490)
+
+
+query T
+explain (costs off) select * from b1 where a < 3;
+----
+Index Scan using b1_a on b1
+  Index Cond: (a < 3)
+
+
+# `enable_bitmapscan = off` reads the index directly.
+statement ok
+set enable_bitmapscan = off;
+
+query T
+explain (costs off) select * from b1 where a between 100 and 300;
+----
+Index Scan using b1_a on b1
+  Index Cond: ((a >= 100) AND (a <= 300))
+
+
+statement ok
+reset enable_bitmapscan;
+
+# The rows are the same either way.
+query T
+select count(*) from b1 where a between 100 and 300;
+----
+201
+
+
+query T
+select count(*) from b1 where a >= 490;
+----
+11
+
+
+query T
+select a, b from b1 where a between 100 and 102 order by a;
+----
+100	r100
+101	r101
+102	r102
+
+
+query T
+update b1 set b = 'changed' where a between 100 and 101;
+----
+
+
+query T
+select a, b from b1 where a between 100 and 101 order by a;
+----
+100	changed
+101	changed
+
+
+statement ok
+reset enable_seqscan;
+
