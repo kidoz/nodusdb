@@ -1,0 +1,99 @@
+# Covering indexes: when one index holds every column the statement
+# reads — including `SELECT *` over an index on all of a table's
+# columns — the scan reads the index alone as an index-only scan, for
+# equalities and ranges alike. Plans and results match PostgreSQL 18.4;
+# the session asks for index scans (`enable_seqscan = off`) because
+# PostgreSQL's planner costs the choice and NodusDB has no statistics.
+
+statement ok
+drop table if exists i1 cascade;
+
+statement ok
+create table i1 (a int, b text, c int);
+
+statement ok
+insert into i1 select g, 'r' || g, g % 10 from generate_series(1, 100) g;
+
+statement ok
+create index i1_abc on i1 (a, b, c);
+
+statement ok
+analyze i1;
+
+# The covering index serves the whole row.
+statement ok
+set enable_seqscan = off;
+
+query T
+explain (costs off) select * from i1 where a = 5;
+----
+Index Only Scan using i1_abc on i1
+  Index Cond: (a = 5)
+
+
+# A range reads it in order too.
+query T
+explain (costs off) select * from i1 where a >= 90;
+----
+Index Only Scan using i1_abc on i1
+  Index Cond: (a >= 90)
+
+
+query T
+explain (costs off) select c from i1 where a = 5;
+----
+Index Only Scan using i1_abc on i1
+  Index Cond: (a = 5)
+
+
+# The columns come back whole after writes.
+query T
+select a, b, c from i1 where a = 5;
+----
+5	r5	5
+
+
+query T
+select a, b from i1 where a >= 98 order by a;
+----
+98	r98
+99	r99
+100	r100
+
+
+query T
+update i1 set c = 77 where a = 5;
+----
+
+
+query T
+select a, b, c from i1 where a = 5;
+----
+5	r5	77
+
+
+query T
+delete from i1 where a = 99;
+----
+
+
+query T
+select count(*) from i1 where a = 99;
+----
+0
+
+
+query T
+insert into i1 values (5, 'r5', 5);
+----
+
+
+query T
+select count(*) from i1 where a = 5;
+----
+2
+
+
+statement ok
+reset enable_seqscan;
+
