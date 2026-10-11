@@ -749,6 +749,10 @@ pub enum ScalarExpr {
 pub struct WindowCall {
     /// The upper-cased function name (`ROW_NUMBER`, `SUM`, `LAG`).
     pub func: String,
+    /// The `WINDOW w AS ...` name the call's `OVER` used, when it named
+    /// one; the plan's `Window:` text prints it instead of `wN`.
+    #[serde(default)]
+    pub name: Option<String>,
     pub args: Vec<ScalarExpr>,
     #[serde(default)]
     pub filter: Option<ScalarExpr>,
@@ -831,6 +835,7 @@ impl WindowCall {
         });
         WindowCall {
             func: self.func.clone(),
+            name: self.name.clone(),
             args: self.args.iter().map(&mut *f).collect(),
             filter: self.filter.as_ref().map(&mut *f),
             partition_by: self.partition_by.iter().map(&mut *f).collect(),

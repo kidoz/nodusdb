@@ -573,6 +573,7 @@ mod tests {
     ) -> WindowCall {
         WindowCall {
             func: func.to_string(),
+            name: None,
             args,
             filter: None,
             partition_by: vec![],

@@ -2319,6 +2319,13 @@ fn lower_window(
     use crate::plan_types::{FrameBound, FrameExclude, FrameSpec, WindowCall, WindowFrameUnits};
     use sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArguments, WindowFrameBound};
     let over = func.over.as_ref()?;
+    // The name an `OVER w` referred to, which the plan's window text keeps.
+    let window_name = match over {
+        sqlparser::ast::WindowType::NamedWindow(name) => Some(name.value.clone()),
+        sqlparser::ast::WindowType::WindowSpec(spec) => {
+            spec.window_name.as_ref().map(|name| name.value.clone())
+        }
+    };
     let spec = match resolve_window(over) {
         Ok(spec) => spec,
         Err(message) => return plan_error(message),
@@ -2478,6 +2485,7 @@ fn lower_window(
     };
     Some(ScalarExpr::Window(Box::new(WindowCall {
         func: name.to_string(),
+        name: window_name,
         args,
         filter,
         partition_by,

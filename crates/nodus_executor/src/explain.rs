@@ -3,6 +3,7 @@
 //! rough cost and row estimates, as text or JSON. `ANALYZE` runs the
 //! statement and reports its actual rows and time.
 
+use crate::plan_types::{FrameBound, FrameExclude, FrameSpec, WindowCall, WindowFrameUnits};
 use crate::*;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -952,6 +953,33 @@ impl MemExecutor {
                     node = result.detail("One-Time Filter", conditions.join(" AND "));
                 }
                 let qualified = !single;
+                let sort: Vec<SortKey> = if sort.is_empty() {
+                    order_by.iter().cloned().map(SortKey::from_legacy).collect()
+                } else {
+                    sort.clone()
+                };
+                // An index scan already reads the leading column in order,
+                // so `ORDER BY` it adds no Sort, as PostgreSQL plans it.
+                let index_ordered = |node: &Node| -> Option<(String, bool)> {
+                    if node.kind != "Index Scan" && node.kind != "Index Only Scan" {
+                        return None;
+                    }
+                    let name = node
+                        .props
+                        .iter()
+                        .find(|(name, _)| *name == "Index Name")
+                        .and_then(|(_, value)| value.as_str())
+                        .map(str::to_string)?;
+                    let (db, schema, table) = parse_object_name(table_name).ok()?;
+                    let tbl = self.catalog_reader.get_table(db, schema, table).ok()?;
+                    let idx = tbl.indexes.iter().find(|i| i.name == name)?;
+                    let key = idx.key_columns.first()?;
+                    if crate::index_keys::is_expression_key(key) {
+                        return None;
+                    }
+                    let column = tbl.columns.iter().find(|c| c.id == key.column_id)?;
+                    Some((column.name.clone(), true))
+                };
                 let aggregated = !group_by.is_empty()
                     || having.is_some()
                     || projection.iter().any(|p| match p {
@@ -990,7 +1018,87 @@ impl MemExecutor {
                         node = node.detail("Filter", deparse_filter(h, qualified));
                     }
                 }
-                if projection
+                // Window functions evaluate in layers above the
+                // aggregation: one `WindowAgg` per window clause, with the
+                // sort its window's ordering needs. Clauses sharing an
+                // ordering stack in the order written (the first innermost);
+                // different orderings stack with the last written innermost,
+                // and `OVER ()` outermost — as PostgreSQL plans them.
+                let mut calls: Vec<&WindowCall> = Vec::new();
+                for item in projection {
+                    if let ProjectionItem::Expr { expr, .. } = item {
+                        window_calls(expr, &mut calls);
+                    }
+                }
+                for key in &sort {
+                    if let SortTarget::Expr(expr) = &key.target {
+                        window_calls(expr, &mut calls);
+                    }
+                }
+                // The ordering the outermost window leaves the rows in,
+                // which a matching `ORDER BY` reuses.
+                let mut window_keys: Option<Vec<String>> = None;
+                let mut window_names: std::collections::HashMap<String, String> =
+                    std::collections::HashMap::new();
+                if !calls.is_empty() {
+                    let mut layers: Vec<WindowLayer> = Vec::new();
+                    for call in &calls {
+                        let key = window_layer_key(call, qualified);
+                        match layers.iter_mut().find(|layer| layer.key == key) {
+                            Some(layer) => layer.calls.push(call),
+                            None => layers.push(WindowLayer {
+                                calls: vec![call],
+                                key,
+                            }),
+                        }
+                    }
+                    let mut clusters: Vec<Vec<usize>> = Vec::new();
+                    for (i, layer) in layers.iter().enumerate() {
+                        let same = clusters.iter_mut().find(|cluster| {
+                            let base = &layers[cluster[0]];
+                            base.window().partition_by == layer.window().partition_by
+                                && base.window().order_by == layer.window().order_by
+                        });
+                        match same {
+                            Some(cluster) => cluster.push(i),
+                            None => clusters.push(vec![i]),
+                        }
+                    }
+                    let (unordered, ordered): (Vec<_>, Vec<_>) = clusters
+                        .into_iter()
+                        .partition(|cluster| layers[cluster[0]].is_unordered());
+                    let order: Vec<usize> = ordered
+                        .into_iter()
+                        .rev()
+                        .chain(unordered)
+                        .flatten()
+                        .collect();
+                    let mut provided: Option<Vec<String>> = None;
+                    for (number, index) in order.iter().enumerate() {
+                        let layer = &layers[*index];
+                        window_names.insert(layer.key.clone(), layer.display_name(number + 1));
+                        let keys = layer.sort_keys(qualified);
+                        let covered = provided.as_ref().is_some_and(|p| p.starts_with(&keys));
+                        let ordered_by_index = matches!(
+                            (index_ordered(&node), keys.as_slice()),
+                            (Some((column, true)), [key]) if key == &column
+                        );
+                        if !keys.is_empty() && !covered && !ordered_by_index {
+                            let n = node.rows.max(2.0);
+                            let mut sorted = Node::over("Sort", "Sort", vec![node])
+                                .keys("Sort Key", keys.clone());
+                            sorted.startup = sorted.total + n * n.log2() * 2.0 * CPU_OPERATOR;
+                            sorted.total = sorted.startup + n * CPU_TUPLE;
+                            node = sorted;
+                        }
+                        node = Node::over("WindowAgg", "WindowAgg", vec![node])
+                            .detail("Window", layer.text(number + 1, qualified));
+                        if !keys.is_empty() {
+                            provided = Some(keys);
+                        }
+                    }
+                    window_keys = provided;
+                } else if projection
                     .iter()
                     .any(|p| matches!(p, ProjectionItem::WindowFunction { .. }))
                 {
@@ -999,59 +1107,54 @@ impl MemExecutor {
                 if *distinct {
                     let keys: Vec<String> = projection
                         .iter()
-                        .map(|p| projection_text(p, qualified))
+                        .map(|p| match p {
+                            ProjectionItem::Expr {
+                                expr: ScalarExpr::Window(call),
+                                ..
+                            } => window_call_text(call, &window_names, qualified),
+                            other => projection_text(other, qualified),
+                        })
                         .collect();
                     node = Node::over("Aggregate", "HashAggregate", vec![node])
                         .prop("Strategy", json!("Hashed"))
                         .keys("Group Key", keys);
                 }
-                let sort = if sort.is_empty() {
-                    order_by.iter().cloned().map(SortKey::from_legacy).collect()
-                } else {
-                    sort.clone()
-                };
-                // An index scan already reads the leading column in order,
-                // so `ORDER BY` it adds no Sort, as PostgreSQL plans it.
-                let index_ordered = |node: &Node| -> Option<(String, bool)> {
-                    if node.kind != "Index Scan" && node.kind != "Index Only Scan" {
-                        return None;
-                    }
-                    let name = node
-                        .props
-                        .iter()
-                        .find(|(name, _)| *name == "Index Name")
-                        .and_then(|(_, value)| value.as_str())
-                        .map(str::to_string)?;
-                    let (db, schema, table) = parse_object_name(table_name).ok()?;
-                    let tbl = self.catalog_reader.get_table(db, schema, table).ok()?;
-                    let idx = tbl.indexes.iter().find(|i| i.name == name)?;
-                    let key = idx.key_columns.first()?;
-                    if crate::index_keys::is_expression_key(key) {
-                        return None;
-                    }
-                    let column = tbl.columns.iter().find(|c| c.id == key.column_id)?;
-                    Some((column.name.clone(), true))
-                };
-                let sorted_by_the_index = matches!(
-                    (index_ordered(&node), sort.as_slice()),
-                    (Some((column, true)), [key])
-                        if key.ascending
-                            && key.nulls_first.is_none()
-                            && matches!(
-                                &key.target,
-                                SortTarget::Name(name)
-                                    if name.rsplit('.').next() == Some(column.as_str())
-                            )
-                );
-                if !sort.is_empty() && !sorted_by_the_index {
-                    let keys: Vec<String> = sort
-                        .iter()
-                        .map(|k| sort_key_text(k, projection, qualified))
-                        .collect();
+                let keys: Vec<String> = sort
+                    .iter()
+                    .map(|k| sort_key_text(k, projection, qualified, &window_names))
+                    .collect();
+                // An index scan or a window leaves the rows in their
+                // ordering; `ORDER BY` reuses it — exactly, or as an
+                // Incremental Sort over the prefix it already has.
+                let presorted: Option<Vec<String>> = index_ordered(&node)
+                    .filter(|(_, ascending)| *ascending)
+                    .map(|(name, _)| vec![column(&name, qualified)])
+                    .or_else(|| window_keys.clone());
+                let covered = presorted
+                    .as_ref()
+                    .is_some_and(|presorted| presorted.starts_with(&keys));
+                let incremental = !covered
+                    && !keys.is_empty()
+                    && presorted.as_ref().is_some_and(|presorted| {
+                        !presorted.is_empty() && keys.starts_with(presorted)
+                    });
+                if !sort.is_empty() && !covered {
                     let n = node.rows.max(2.0);
-                    let mut sorted = Node::over("Sort", "Sort", vec![node]).keys("Sort Key", keys);
-                    sorted.startup = sorted.total + n * n.log2() * 2.0 * CPU_OPERATOR;
-                    sorted.total = sorted.startup + n * CPU_TUPLE;
+                    let mut sorted = if incremental {
+                        let mut sorted =
+                            Node::over("Incremental Sort", "Incremental Sort", vec![node])
+                                .keys("Sort Key", keys.clone())
+                                .keys("Presorted Key", presorted.clone().unwrap());
+                        sorted.startup = sorted.total + n * n.log2() * 2.0 * CPU_OPERATOR;
+                        sorted.total = sorted.startup + n * CPU_TUPLE;
+                        sorted
+                    } else {
+                        let mut sorted =
+                            Node::over("Sort", "Sort", vec![node]).keys("Sort Key", keys.clone());
+                        sorted.startup = sorted.total + n * n.log2() * 2.0 * CPU_OPERATOR;
+                        sorted.total = sorted.startup + n * CPU_TUPLE;
+                        sorted
+                    };
                     node = sorted;
                 }
                 if !distinct_on.is_empty() {
@@ -1081,6 +1184,7 @@ impl MemExecutor {
                         let append = Node::over("Append", "Append", children);
                         Node::over("Aggregate", "HashAggregate", vec![append])
                             .prop("Strategy", json!("Hashed"))
+                            .keys("Group Key", setop_group_keys(left))
                     }
                     (SetOpKind::Intersect, _) => {
                         Node::over("SetOp", "HashSetOp Intersect", children)
@@ -2089,16 +2193,294 @@ fn projection_text(item: &ProjectionItem, qualified: bool) -> String {
     }
 }
 
-fn sort_key_text(key: &SortKey, projection: &[ProjectionItem], qualified: bool) -> String {
+/// The window calls an expression reads, in order of appearance.
+fn window_calls<'a>(expr: &'a ScalarExpr, out: &mut Vec<&'a WindowCall>) {
+    match expr {
+        ScalarExpr::Window(call) => out.push(call),
+        ScalarExpr::Unary { expr, .. }
+        | ScalarExpr::Cast { expr, .. }
+        | ScalarExpr::Extract { expr, .. }
+        | ScalarExpr::IsNull { expr, .. } => window_calls(expr, out),
+        ScalarExpr::Binary { left, right, .. } => {
+            window_calls(left, out);
+            window_calls(right, out);
+        }
+        ScalarExpr::Function { args, .. } => {
+            for arg in args {
+                window_calls(arg, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Whether a window function ignores its frame: a clause with only such
+/// calls prints `ROWS UNBOUNDED PRECEDING`, as PostgreSQL rewrites it.
+fn frame_blind(func: &str) -> bool {
+    matches!(
+        func,
+        "ROW_NUMBER"
+            | "RANK"
+            | "DENSE_RANK"
+            | "PERCENT_RANK"
+            | "CUME_DIST"
+            | "NTILE"
+            | "LAG"
+            | "LEAD"
+    )
+}
+
+/// A frame's bounds as written, in PostgreSQL's words — `None` for the
+/// default (`RANGE UNBOUNDED PRECEDING`).
+fn frame_bounds_text(frame: &FrameSpec) -> String {
+    if frame.units == WindowFrameUnits::Range
+        && frame.start == FrameBound::UnboundedPreceding
+        && frame.end == FrameBound::CurrentRow
+        && frame.exclude == FrameExclude::NoOthers
+    {
+        return String::new();
+    }
+    let units = match frame.units {
+        WindowFrameUnits::Rows => "ROWS",
+        WindowFrameUnits::Range => "RANGE",
+        WindowFrameUnits::Groups => "GROUPS",
+    };
+    let offset = |e: &ScalarExpr| match e {
+        // PostgreSQL types a frame's row offset as a bigint constant.
+        ScalarExpr::Literal(Value::Int(n)) => format!("'{n}'::bigint"),
+        other => deparse_scalar(other, false),
+    };
+    let bound = |b: &FrameBound| -> String {
+        match b {
+            FrameBound::UnboundedPreceding => "UNBOUNDED PRECEDING".to_string(),
+            FrameBound::Preceding(e) => format!("{} PRECEDING", offset(e)),
+            FrameBound::CurrentRow => "CURRENT ROW".to_string(),
+            FrameBound::Following(e) => format!("{} FOLLOWING", offset(e)),
+            FrameBound::UnboundedFollowing => "UNBOUNDED FOLLOWING".to_string(),
+        }
+    };
+    let mut text =
+        if frame.start == FrameBound::UnboundedPreceding && frame.end == FrameBound::CurrentRow {
+            format!("{units} UNBOUNDED PRECEDING")
+        } else {
+            format!(
+                "{units} BETWEEN {} AND {}",
+                bound(&frame.start),
+                bound(&frame.end)
+            )
+        };
+    text.push_str(match frame.exclude {
+        FrameExclude::NoOthers => "",
+        FrameExclude::CurrentRow => " EXCLUDE CURRENT ROW",
+        FrameExclude::Group => " EXCLUDE GROUP",
+        FrameExclude::Ties => " EXCLUDE TIES",
+    });
+    text
+}
+
+/// The columns a `UNION`'s dedup groups by: the left input's output
+/// columns, named for the relation they read.
+fn setop_group_keys(plan: &LogicalPlan) -> Vec<String> {
+    let LogicalPlan::Select {
+        table_name,
+        table_alias,
+        projection,
+        ..
+    } = plan
+    else {
+        return Vec::new();
+    };
+    let bare = |name: &str| name.rsplit('.').next().unwrap_or(name).to_string();
+    let prefix = relation_name(table_alias.as_deref().unwrap_or(table_name));
+    projection
+        .iter()
+        .map(|item| match item {
+            ProjectionItem::Column(c) | ProjectionItem::AliasedColumn(c, _) => {
+                format!("{prefix}.{}", bare(c))
+            }
+            ProjectionItem::Expr { expr, alias } => match (expr, alias) {
+                (ScalarExpr::Column(c), _) => format!("{prefix}.{}", bare(c)),
+                (_, Some(alias)) => alias.clone(),
+                (expr, None) => deparse_scalar(expr, false),
+            },
+            other => projection_text(other, false),
+        })
+        .collect()
+}
+
+/// A window key expression: a bare column, or parenthesized, as
+/// PostgreSQL's `Sort Key` and window texts print them.
+fn window_expr_text(expr: &ScalarExpr, qualified: bool) -> String {
+    match expr {
+        ScalarExpr::Column(name) => column(name, qualified),
+        other => format!("({})", deparse_scalar(other, qualified)),
+    }
+}
+
+/// The key two calls share when their `OVER` is the same window:
+/// partition, order and frame as written.
+fn window_layer_key(call: &WindowCall, qualified: bool) -> String {
+    format!(
+        "{}|{}|{}",
+        call.partition_by
+            .iter()
+            .map(|e| window_expr_text(e, qualified))
+            .collect::<Vec<_>>()
+            .join(","),
+        call.order_by
+            .iter()
+            .map(|k| format!("{}{}", window_expr_text(&k.0, qualified), k.1))
+            .collect::<Vec<_>>()
+            .join(","),
+        call.frame
+            .as_ref()
+            .map(frame_bounds_text)
+            .unwrap_or_default(),
+    )
+}
+
+/// A window call as a plan's keys print it: `rank() OVER w1`.
+fn window_call_text(
+    call: &WindowCall,
+    windows: &std::collections::HashMap<String, String>,
+    qualified: bool,
+) -> String {
+    let args: Vec<String> = call
+        .args
+        .iter()
+        .map(|arg| deparse_scalar(arg, qualified))
+        .collect();
+    let name = windows
+        .get(&window_layer_key(call, qualified))
+        .cloned()
+        .unwrap_or_else(|| "(?)".to_string());
+    format!(
+        "{}({}) OVER {}",
+        call.func.to_ascii_lowercase(),
+        args.join(", "),
+        name
+    )
+}
+
+/// One `WindowAgg` layer: the calls whose `OVER` shares partition, order
+/// and frame, in the order written.
+struct WindowLayer<'a> {
+    calls: Vec<&'a WindowCall>,
+    key: String,
+}
+
+impl<'a> WindowLayer<'a> {
+    fn window(&self) -> &'a WindowCall {
+        self.calls[0]
+    }
+
+    /// The ordering the layer's input must be in: partition, then order.
+    fn sort_keys(&self, qualified: bool) -> Vec<String> {
+        let window = self.window();
+        let mut keys: Vec<String> = window
+            .partition_by
+            .iter()
+            .map(|e| window_expr_text(e, qualified))
+            .collect();
+        keys.extend(window.order_by.iter().map(|key| {
+            let mut text = window_expr_text(&key.0, qualified);
+            if !key.1 {
+                text.push_str(" DESC");
+            }
+            match (key.2, key.1) {
+                (Some(true), true) => text.push_str(" NULLS FIRST"),
+                (Some(false), false) => text.push_str(" NULLS LAST"),
+                _ => {}
+            }
+            text
+        }));
+        keys
+    }
+
+    /// Whether the layer's `OVER ()` names no ordering at all.
+    fn is_unordered(&self) -> bool {
+        let window = self.window();
+        window.partition_by.is_empty() && window.order_by.is_empty()
+    }
+
+    /// The name the layer's `Window:` line prints: the named window's, or
+    /// `wN` by position.
+    fn display_name(&self, number: usize) -> String {
+        self.calls
+            .iter()
+            .find_map(|call| call.name.clone())
+            .unwrap_or_else(|| format!("w{number}"))
+    }
+
+    /// The `wN AS (...)` text of the layer's `Window:` line.
+    fn text(&self, number: usize, qualified: bool) -> String {
+        let window = self.window();
+        let partition: Vec<String> = window
+            .partition_by
+            .iter()
+            .map(|e| window_expr_text(e, qualified))
+            .collect();
+        let order: Vec<String> = window
+            .order_by
+            .iter()
+            .map(|key| {
+                let mut text = window_expr_text(&key.0, qualified);
+                if !key.1 {
+                    text.push_str(" DESC");
+                }
+                match (key.2, key.1) {
+                    (Some(true), true) => text.push_str(" NULLS FIRST"),
+                    (Some(false), false) => text.push_str(" NULLS LAST"),
+                    _ => {}
+                }
+                text
+            })
+            .collect();
+        let mut parts: Vec<String> = Vec::new();
+        if !partition.is_empty() {
+            parts.push(format!("PARTITION BY {}", partition.join(", ")));
+        }
+        if !order.is_empty() {
+            parts.push(format!("ORDER BY {}", order.join(", ")));
+        }
+        let frame = if self.calls.iter().all(|c| frame_blind(&c.func)) {
+            "ROWS UNBOUNDED PRECEDING".to_string()
+        } else {
+            window
+                .frame
+                .as_ref()
+                .map(frame_bounds_text)
+                .unwrap_or_default()
+        };
+        if !frame.is_empty() {
+            parts.push(frame);
+        }
+        format!("{} AS ({})", self.display_name(number), parts.join(" "))
+    }
+}
+
+fn sort_key_text(
+    key: &SortKey,
+    projection: &[ProjectionItem],
+    qualified: bool,
+    windows: &std::collections::HashMap<String, String>,
+) -> String {
     let mut text = match &key.target {
         SortTarget::Output(i) => match projection.get(*i) {
             Some(item @ (ProjectionItem::Column(_) | ProjectionItem::AliasedColumn(..))) => {
                 projection_text(item, qualified)
             }
+            Some(ProjectionItem::Expr {
+                expr: ScalarExpr::Window(call),
+                ..
+            }) => format!("({})", window_call_text(call, windows, qualified)),
             Some(item) => format!("({})", projection_text(item, qualified)),
             None => format!("{}", i + 1),
         },
         SortTarget::Name(n) => column(n, qualified),
+        SortTarget::Expr(ScalarExpr::Window(call)) => {
+            format!("({})", window_call_text(call, windows, qualified))
+        }
         SortTarget::Expr(e) => format!("({})", deparse_scalar(e, qualified)),
     };
     if !key.ascending {
@@ -2915,7 +3297,7 @@ pub(crate) fn deparse_query(plan: &LogicalPlan) -> Option<String> {
     if !sort.is_empty() {
         let keys: Vec<String> = sort
             .iter()
-            .map(|k| sort_key_text(k, projection, qualified))
+            .map(|k| sort_key_text(k, projection, qualified, &Default::default()))
             .collect();
         sql.push_str(&format!("\n  ORDER BY {}", keys.join(", ")));
     }
