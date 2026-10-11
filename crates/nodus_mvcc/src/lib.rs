@@ -54,6 +54,20 @@ impl MvccValue {
     }
 }
 
+/// The outcome of reading a version chain at a timestamp, distinguishing
+/// "no version is visible" from "the newest visible version is a tombstone".
+/// A store that falls through to an older source on `Absent` must stop on
+/// `Tombstone`: a newer committed delete hides every value in older sources.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VisibleVersion<'a> {
+    /// No committed version is visible at the read timestamp.
+    Absent,
+    /// The newest visible version is a tombstone: the key is deleted.
+    Tombstone,
+    /// The newest visible version's value.
+    Value(&'a [u8]),
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct VersionChain {
     pub versions: Vec<MvccValue>,
@@ -66,13 +80,29 @@ impl VersionChain {
         }
     }
 
-    /// Read the most recent visible value for the given timestamp.
-    pub fn read(&self, read_ts: Timestamp) -> Option<&[u8]> {
-        self.versions
+    /// Read the newest version visible at `read_ts`, telling a visible
+    /// tombstone apart from the absence of any visible version.
+    pub fn read_visible(&self, read_ts: Timestamp) -> VisibleVersion<'_> {
+        match self
+            .versions
             .iter()
             .filter(|v| v.is_visible(read_ts))
             .max_by_key(|v| v.version)
-            .and_then(|v| v.value.as_deref())
+        {
+            Some(version) => match &version.value {
+                Some(value) => VisibleVersion::Value(value),
+                None => VisibleVersion::Tombstone,
+            },
+            None => VisibleVersion::Absent,
+        }
+    }
+
+    /// Read the most recent visible value for the given timestamp.
+    pub fn read(&self, read_ts: Timestamp) -> Option<&[u8]> {
+        match self.read_visible(read_ts) {
+            VisibleVersion::Value(value) => Some(value),
+            VisibleVersion::Absent | VisibleVersion::Tombstone => None,
+        }
     }
 
     /// Finds an existing active intent. In standard MVCC, there is usually only
@@ -263,6 +293,30 @@ mod tests {
         assert!(chain.active_intent().is_some());
         chain.commit(pending, 20_000).unwrap();
         assert_eq!(chain.read(u64::MAX), Some(b"pending".as_slice()));
+    }
+
+    #[test]
+    fn read_visible_distinguishes_tombstone_from_absent() {
+        let mut chain = VersionChain::new();
+        let txn1 = TxnId::new();
+        chain.write_intent(txn1, b"val1".to_vec()).unwrap();
+        chain.commit(txn1, 10).unwrap();
+
+        let txn2 = TxnId::new();
+        chain.delete_intent(txn2).unwrap();
+        chain.commit(txn2, 20).unwrap();
+
+        // Before the delete: value visible. After it: a visible tombstone,
+        // not mere absence. With no version at all: absent.
+        assert_eq!(chain.read_visible(15), VisibleVersion::Value(b"val1"));
+        assert_eq!(chain.read_visible(20), VisibleVersion::Tombstone);
+        assert_eq!(chain.read_visible(u64::MAX), VisibleVersion::Tombstone);
+        assert_eq!(chain.read_visible(5), VisibleVersion::Absent);
+        assert_eq!(VersionChain::new().read_visible(100), VisibleVersion::Absent);
+        // An uncommitted intent is never visible.
+        let txn3 = TxnId::new();
+        chain.write_intent(txn3, b"pending".to_vec()).unwrap();
+        assert_eq!(chain.read_visible(u64::MAX), VisibleVersion::Tombstone);
     }
 
     #[test]

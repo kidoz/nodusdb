@@ -381,6 +381,29 @@ mod tests {
     }
 
     #[test]
+    fn get_reads_a_committed_delete_as_absent() {
+        // The `KvEngine::get` contract: after a delete commits, the key reads
+        // as absent at timestamps at or after the commit (a tombstone is not
+        // "no version"), while older snapshots still see the value.
+        let engine = MemKvEngine::new();
+        let k = Bytes::from("k");
+
+        let t1 = TxnId::new();
+        engine
+            .write_intent(t1, k.clone(), Bytes::from("v1"))
+            .unwrap();
+        engine.commit(t1, 10).unwrap();
+
+        let t2 = TxnId::new();
+        engine.delete_intent(t2, k.clone()).unwrap();
+        engine.commit(t2, 20).unwrap();
+
+        assert_eq!(engine.get(k.as_ref(), 20).unwrap(), None);
+        assert_eq!(engine.get(k.as_ref(), u64::MAX).unwrap(), None);
+        assert_eq!(engine.get(k.as_ref(), 15).unwrap(), Some(Bytes::from("v1")));
+    }
+
+    #[test]
     fn test_garbage_collect_prunes_old_versions() {
         let engine = MemKvEngine::new();
         let k = Bytes::from("k");

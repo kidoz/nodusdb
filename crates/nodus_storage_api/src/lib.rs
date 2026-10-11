@@ -105,6 +105,10 @@ pub trait KvEngine: Send + Sync {
         anyhow::bail!("atomic snapshot replacement is unsupported by this engine")
     }
 
+    /// The newest value visible at `read_ts`, or `None` when no version is
+    /// visible OR the newest visible version is a committed tombstone: a
+    /// delete must hide values held by older sources (older SSTables), never
+    /// fall through to them.
     fn get(&self, key: &[u8], read_ts: Timestamp) -> Result<Option<Bytes>>;
     fn scan(
         &self,

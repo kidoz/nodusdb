@@ -1531,3 +1531,55 @@ fn failed_kv_commit_releases_intents_implicit_txn() {
     assert_eq!(out.rows.len(), 2);
 }
 
+// ---------------------------------------------------------------------------
+// Regression: on an LSM engine, a point read must not resurrect a deleted row
+// from an older SSTable. These probes drive the unique/foreign-key paths that
+// call `kv.get` (crates/nodus_executor/src/constraints.rs) against a real
+// `LsmKvEngine` with a flush between the delete and the probe.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn lsm_deleted_rows_stay_deleted_for_constraint_probes() {
+    let dir = std::env::temp_dir().join(format!(
+        "nodus-executor-lsm-test-{}",
+        nodus_storage_api::TxnId::new().0
+    ));
+    let kv = Arc::new(nodus_storage_lsm::LsmKvEngine::with_wal(&dir, None).unwrap());
+    let (exec, ctx) = executor_with_kv(kv.clone());
+
+    sql(&exec, &ctx, "CREATE TABLE parent (id INT PRIMARY KEY)").unwrap();
+    sql(
+        &exec,
+        &ctx,
+        "CREATE TABLE child (id INT PRIMARY KEY, pid INT REFERENCES parent(id))",
+    )
+    .unwrap();
+    sql(&exec, &ctx, "INSERT INTO parent VALUES (1)").unwrap();
+    // Flush so the value sits in an SSTable; the delete's tombstone then lands
+    // in a *newer* source, which is the state the resurrection bug needs.
+    kv.flush().unwrap();
+
+    // Delete the row and flush so the tombstone moves to an SSTable while the
+    // old value remains in an older one.
+    sql(&exec, &ctx, "DELETE FROM parent WHERE id = 1").unwrap();
+    kv.flush().unwrap();
+
+    // Unique probe: re-inserting the deleted primary key must succeed — the
+    // duplicate-key check (`kv.get`) must not see the deleted row.
+    sql(&exec, &ctx, "INSERT INTO parent VALUES (1)")
+        .expect("re-inserting a deleted primary key must not raise duplicate key");
+
+    // Foreign-key probe: referencing a deleted parent must fail — the FK
+    // existence check must not see the deleted row either. (Parent id 2 was
+    // never inserted; the resurrected id 1 row must not satisfy it either.)
+    sql(&exec, &ctx, "DELETE FROM parent WHERE id = 1").unwrap();
+    kv.flush().unwrap();
+    let error = sql(&exec, &ctx, "INSERT INTO child VALUES (10, 1)").unwrap_err();
+    assert!(
+        error.to_string().contains("foreign key"),
+        "expected a foreign-key violation, got: {error}"
+    );
+
+    drop(exec);
+    let _ = std::fs::remove_dir_all(&dir);
+}

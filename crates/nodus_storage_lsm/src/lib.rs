@@ -3,7 +3,7 @@ use bytes::Bytes;
 mod snapshot;
 pub mod sstable;
 
-use nodus_mvcc::VersionChain;
+use nodus_mvcc::{VersionChain, VisibleVersion};
 use nodus_storage_api::{
     IntentReplacement, KeyRange, KvEngine, KvPair, KvResult, KvVersion, Timestamp, TxnId,
 };
@@ -660,20 +660,28 @@ impl KvEngine for LsmKvEngine {
     fn get(&self, key: &[u8], read_ts: Timestamp) -> Result<Option<Bytes>> {
         let _snapshot = self.snapshot_gate.read().unwrap();
         self.snapshot_available()?;
+        // A visible tombstone in a newer source hides every older source:
+        // stop there instead of falling through, or the deleted row would
+        // resurrect from an SSTable/older state. `Absent` (no version visible
+        // at `read_ts` in this chain) keeps searching older sources.
         let guard = self.memtable.read().unwrap();
-        if let Some(chain) = guard.get(key)
-            && let Some(val) = chain.read(read_ts)
-        {
-            return Ok(Some(Bytes::from(val.to_vec())));
+        if let Some(chain) = guard.get(key) {
+            match chain.read_visible(read_ts) {
+                VisibleVersion::Value(val) => return Ok(Some(Bytes::from(val.to_vec()))),
+                VisibleVersion::Tombstone => return Ok(None),
+                VisibleVersion::Absent => {}
+            }
         }
 
         // Search through sstables from newest to oldest
         let sst_guard = self.sstables.read().unwrap();
         for sst in sst_guard.iter().rev() {
-            if let Some(chain) = sst.get(key)?
-                && let Some(val) = chain.read(read_ts)
-            {
-                return Ok(Some(Bytes::from(val.to_vec())));
+            if let Some(chain) = sst.get(key)? {
+                match chain.read_visible(read_ts) {
+                    VisibleVersion::Value(val) => return Ok(Some(Bytes::from(val.to_vec()))),
+                    VisibleVersion::Tombstone => return Ok(None),
+                    VisibleVersion::Absent => {}
+                }
             }
         }
 
@@ -1856,5 +1864,49 @@ mod sst_tests {
         let engine = LsmKvEngine::with_wal(dir.path(), None).unwrap();
         assert_eq!(engine.get(b"k1", 100).unwrap(), Some(Bytes::from("a")));
         assert_eq!(engine.get(b"k2", 100).unwrap(), Some(Bytes::from("b")));
+    }
+
+    #[test]
+    fn point_read_does_not_resurrect_a_deleted_row() {
+        // Regression: `get` used to fall through to older sources whenever the
+        // newer chain had no visible *value*, conflating "no version exists"
+        // with "the newest visible version is a tombstone" — a delete followed
+        // by a flush resurrected the old row until compaction hid it.
+        let dir = TempDir::new().unwrap();
+        let engine = LsmKvEngine::with_wal(dir.path(), None).unwrap();
+
+        let put = TxnId::new();
+        engine
+            .write_intent(put, Bytes::from("k"), Bytes::from("v1"))
+            .unwrap();
+        engine.commit(put, 10).unwrap();
+        engine.flush().unwrap();
+
+        let delete = TxnId::new();
+        engine.delete_intent(delete, Bytes::from("k")).unwrap();
+        engine.commit(delete, 20).unwrap();
+
+        // Before the tombstone is flushed: the memtable tombstone must hide the
+        // SSTable value (and snapshot reads still see the old value).
+        assert_eq!(engine.get(b"k", 25).unwrap(), None, "tombstone in memtable");
+        assert_eq!(engine.get(b"k", 15).unwrap(), Some(Bytes::from("v1")));
+
+        // After the flush: the newer SSTable's tombstone must hide the older
+        // SSTable's value.
+        engine.flush().unwrap();
+        assert_eq!(engine.get(b"k", 25).unwrap(), None, "tombstone in sstable");
+        assert_eq!(engine.get(b"k", 15).unwrap(), Some(Bytes::from("v1")));
+
+        // After compaction (the merged chain keeps the tombstone; GC watermark
+        // is 0, so nothing is reclaimed).
+        engine.compact().unwrap();
+        assert_eq!(engine.get(b"k", 25).unwrap(), None, "after compaction");
+        assert_eq!(engine.get(b"k", 15).unwrap(), Some(Bytes::from("v1")));
+        drop(engine);
+
+        // After reopen: replay + SSTables must agree the key is deleted.
+        let engine = LsmKvEngine::with_wal(dir.path(), None).unwrap();
+        assert_eq!(engine.get(b"k", 25).unwrap(), None, "after reopen");
+        assert_eq!(engine.get(b"k", 15).unwrap(), Some(Bytes::from("v1")));
     }
 }
