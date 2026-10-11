@@ -810,10 +810,11 @@ async fn create_backup(
                 for version_res in iter {
                     match version_res {
                         Ok(version) => {
-                            if version.key.as_ref()
-                                == nodus_storage_api::recovery::RECOVERY_GENERATION_KEY
-                                || version.key.starts_with(b"\x01upgrade/")
-                            {
+                            // Node-local and consensus-local namespaces never
+                            // round-trip through a backup (raft votes/logs,
+                            // recovery generation, upgrade authority, migration
+                            // control); see nodus_backup::is_backup_excluded_key.
+                            if nodus_backup::is_backup_excluded_key(&version.key) {
                                 continue;
                             }
                             // The HLC watermark is a clock *reservation* committed
@@ -860,10 +861,7 @@ async fn create_backup(
                 for version_res in iter {
                     match version_res {
                         Ok(version) => {
-                            if version.key.as_ref()
-                                == nodus_storage_api::recovery::RECOVERY_GENERATION_KEY
-                                || version.key.starts_with(b"\x01upgrade/")
-                            {
+                            if nodus_backup::is_backup_excluded_key(&version.key) {
                                 continue;
                             }
                             let key = version.key.to_vec();

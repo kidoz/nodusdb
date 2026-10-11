@@ -76,6 +76,10 @@ Two behaviours are worth knowing before you run this:
 - **Validation happens before mutation.** Every backup object is parsed first,
   so a malformed backup is rejected having changed nothing.
 
+Node-local and consensus-local records (Raft votes/logs, recovery generation,
+upgrade authority, migration control keys) are neither exported nor replayed;
+see [backup contracts](../reference/backup-contracts.md) for the exact set.
+
 ## Restore to a point in time
 
 Add `target_ts` to replay archived write-ahead log records up to a timestamp:

@@ -22,6 +22,23 @@ source upgrade-authority records are excluded from export and skipped during
 replay. They transfer through meta Raft snapshots instead. See the
 [upgrade authority contract](../explanation/upgrade-authority.md).
 
+The same is true of every node-local or consensus-local namespace: export drops
+them and replay skips them (base dump and PITR WAL alike), so a restore can
+never import another node's local control state. The excluded set is defined by
+`nodus_backup::is_backup_excluded_key` and covers, also inside `shard-{id}\0`
+data-group namespaces:
+
+- `\x00raft\x00…` — Raft votes, applied pointers, log entries, snapshot
+  metadata. Restoring a rolled-back vote on rejoin would break election safety.
+- `\x00recovery\x00generation` — the local storage recovery generation.
+- `\x01upgrade/…` — upgrade authority and admission ledger.
+- `\x01migration/…` — shard-migration fences and coordinator journals.
+
+Everything else round-trips deliberately: user and catalog data, `meta:*`
+shard maps and placements, the `\x00catalog\x00state` blob, `\x00txn2pc\x00…`
+two-phase-commit decision records (needed to resolve restored prepared
+intents), and the `\x00hlc\x00watermark` clock reservation.
+
 ## Repository layout
 
 Append-only object paths, so a repository can be made immutable:

@@ -148,6 +148,50 @@ impl BackupRepository for MemBackupRepository {
 // volume-mounted (NFS/EBS) production backups.
 use std::path::{Path, PathBuf};
 
+/// A KV key that must never round-trip through a backup: it is excluded at
+/// export time and skipped if encountered during replay (base dump or PITR
+/// WAL), so a restore can never import another node's — or another point in
+/// time's — local control state.
+///
+/// Excluded namespaces (checked after stripping a `shard-{id}\0` data-group
+/// namespace prefix, so a group's private records are covered wherever they
+/// physically live):
+///
+/// - `\x00raft\x00…` — Raft consensus records (vote, applied pointer, log,
+///   snapshot metadata). Node-local and term-scoped: restoring a rolled-back
+///   vote or applied pointer on rejoin would break election safety.
+/// - `\x00recovery\x00generation` — the local storage recovery generation;
+///   the destination engine keeps its own.
+/// - `\x01upgrade/…` — the upgrade authority and admission ledger. Restores
+///   retain the destination cluster's upgrade policy; these transfer through
+///   meta Raft snapshots instead (see `docs/reference/backup-contracts.md`).
+/// - `\x01migration/…` — shard-migration fences and coordinator journals:
+///   transient control state for an in-flight operation that must not be
+///   resurrected onto a restored node.
+///
+/// Everything else round-trips deliberately: user/catalog data, `meta:*`
+/// shard maps and placements, `\x00catalog\x00state`, `\x00txn2pc\x00…` 2PC
+/// decision records (needed to resolve restored prepared intents), and the
+/// `\x00hlc\x00watermark` clock reservation.
+pub fn is_backup_excluded_key(key: &[u8]) -> bool {
+    let inner = shard_namespace_inner(key);
+    inner.starts_with(b"\x00raft\x00")
+        || inner == nodus_storage_api::recovery::RECOVERY_GENERATION_KEY
+        || inner.starts_with(b"\x01upgrade/")
+        || inner.starts_with(b"\x01migration/")
+}
+
+/// Strips a `shard-{id}\0` data-group namespace prefix, returning the inner
+/// key. Unprefixed (meta-group / node-local) keys are returned unchanged.
+fn shard_namespace_inner(key: &[u8]) -> &[u8] {
+    if let Some(rest) = key.strip_prefix(b"shard-")
+        && let Some(pos) = rest.iter().position(|&b| b == 0)
+    {
+        return &rest[pos + 1..];
+    }
+    key
+}
+
 pub struct FsBackupRepository {
     root: PathBuf,
 }
@@ -1149,7 +1193,7 @@ impl BackupOrchestrator {
                         active_txns.insert(txn_id);
                     }
                     WalRecordV1::WriteIntent { txn_id, key, value } => {
-                        if key.starts_with(b"\x01upgrade/") {
+                        if is_backup_excluded_key(&key) {
                             continue;
                         }
                         kv.write_intent(txn_id, Bytes::from(key), Bytes::from(value))?;
@@ -1157,7 +1201,7 @@ impl BackupOrchestrator {
                         report.writes_applied += 1;
                     }
                     WalRecordV1::DeleteIntent { txn_id, key } => {
-                        if key.starts_with(b"\x01upgrade/") {
+                        if is_backup_excluded_key(&key) {
                             continue;
                         }
                         kv.delete_intent(txn_id, Bytes::from(key))?;
@@ -1209,7 +1253,7 @@ impl BackupOrchestrator {
                 let Some(key) = json_bytes_field(&pair, "key") else {
                     continue;
                 };
-                if key.starts_with(b"\x01upgrade/") {
+                if is_backup_excluded_key(&key) {
                     continue;
                 }
                 let Some(version) = pair.get("version").and_then(|value| value.as_u64()) else {
@@ -1486,6 +1530,142 @@ mod tests {
         let bytes = std::fs::read(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         Bytes::from(bytes)
+    }
+
+    #[test]
+    fn backup_exclusion_covers_node_local_namespaces() {
+        // Consensus and node-local control state never round-trips.
+        for key in [
+            b"\x00raft\x00vote".as_slice(),
+            b"\x00raft\x00applied",
+            b"\x00raft\x00log\x00\x00\x00\x00\x00\x00\x00\x00\x01",
+            b"\x00raft\x00snapshot_meta",
+            b"\x00recovery\x00generation",
+            b"\x01upgrade/v1/state",
+            b"\x01upgrade/admission/v1/state",
+            b"\x01migration/v1/fence",
+            b"\x01migration/v2/table/abc",
+            // Same namespaces inside a data-group shard prefix.
+            b"shard-1234\0\x00raft\x00vote",
+            b"shard-1234\0\x01migration/v1/fence",
+        ] {
+            assert!(
+                is_backup_excluded_key(key),
+                "{} must be excluded",
+                String::from_utf8_lossy(key)
+            );
+        }
+        // Replicated/user state must round-trip.
+        for key in [
+            b"\x00hlc\x00watermark".as_slice(),
+            b"\x00txn2pc\x00decision",
+            b"\x00catalog\x00state",
+            b"meta:shard_placements",
+            b"meta:shard_map:t1",
+            b"shard-1234\0user-row",
+            b"01234567-89ab-cdef-0123-456789abcdef:\x00pk",
+        ] {
+            assert!(
+                !is_backup_excluded_key(key),
+                "{} must round-trip",
+                String::from_utf8_lossy(key)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn restore_skips_excluded_keys_in_base_dump_and_wal() {
+        let kv = MemKvEngine::new();
+        let objects = vec![BackupObject {
+            name: "kv_data.json".into(),
+            bytes: Bytes::from(
+                serde_json::to_vec(&serde_json::json!([
+                    {"key": b"row".to_vec(), "value": b"v".to_vec(), "deleted": false, "version": 10},
+                    {"key": b"\x00raft\x00vote".to_vec(), "value": b"foreign-vote".to_vec(), "deleted": false, "version": 10},
+                    {"key": b"shard-7\0\x00raft\x00applied".to_vec(), "value": b"foreign-applied".to_vec(), "deleted": false, "version": 10},
+                    {"key": b"\x01migration/v1/fence".to_vec(), "value": b"foreign-fence".to_vec(), "deleted": false, "version": 10},
+                    {"key": b"\x00recovery\x00generation".to_vec(), "value": vec![0,0,0,9], "deleted": false, "version": 10},
+                ]))
+                .unwrap(),
+            ),
+        }];
+        let report = BackupOrchestrator::restore_backup_objects_to_kv(&objects, &kv).unwrap();
+        assert_eq!(report.base_kv_versions_restored, 1);
+        assert_eq!(kv.get(b"row", 100).unwrap().as_deref(), Some(b"v".as_slice()));
+        for excluded in [
+            b"\x00raft\x00vote".as_slice(),
+            b"shard-7\0\x00raft\x00applied",
+            b"\x01migration/v1/fence",
+            b"\x00recovery\x00generation",
+        ] {
+            assert!(
+                kv.get(excluded, 100).unwrap().is_none(),
+                "excluded key must not be restored"
+            );
+        }
+
+        // PITR WAL replay skips the same namespaces.
+        let txn = TxnId::new();
+        let wal = test_wal_bytes(vec![
+            WalRecord::V1(WalRecordV1::BeginTxn { txn_id: txn }),
+            WalRecord::V1(WalRecordV1::WriteIntent {
+                txn_id: txn,
+                key: b"\x00raft\x00vote".to_vec(),
+                value: b"foreign-vote".to_vec(),
+            }),
+            WalRecord::V1(WalRecordV1::WriteIntent {
+                txn_id: txn,
+                key: b"\x01migration/v2/table/t".to_vec(),
+                value: b"foreign-journal".to_vec(),
+            }),
+            WalRecord::V1(WalRecordV1::DeleteIntent {
+                txn_id: txn,
+                key: b"\x00recovery\x00generation".to_vec(),
+            }),
+            WalRecord::V1(WalRecordV1::CommitTxn {
+                txn_id: txn,
+                commit_ts: 20,
+            }),
+        ]);
+        let repo: Arc<dyn BackupRepository> = Arc::new(MemBackupRepository::new());
+        let orch = BackupOrchestrator::new(repo);
+        orch.create_full_backup(
+            "cluster-1",
+            10,
+            1,
+            1,
+            vec![BackupObject {
+                name: "kv_data.json".into(),
+                bytes: Bytes::from("[]"),
+            }],
+        )
+        .await
+        .unwrap();
+        orch.archive_wal_indexed(
+            "1.log",
+            wal,
+            vec![txn.0.to_string()],
+            vec![WalCommittedTxn {
+                txn_id: txn.0.to_string(),
+                commit_ts: 20,
+            }],
+            Some(0),
+        )
+        .await
+        .unwrap();
+        let plan = orch.plan_pitr_restore(20).await.unwrap();
+        let segments = orch.load_pitr_wal_segments(&plan).await.unwrap();
+        BackupOrchestrator::replay_pitr_wal_segments(&plan, &segments, &kv, None).unwrap();
+        for excluded in [
+            b"\x00raft\x00vote".as_slice(),
+            b"\x01migration/v2/table/t",
+            b"\x00recovery\x00generation",
+        ] {
+            assert!(
+                kv.get(excluded, 100).unwrap().is_none(),
+                "PITR replay must skip excluded key"
+            );
+        }
     }
 
     #[tokio::test]
