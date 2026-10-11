@@ -453,67 +453,49 @@ impl RaftMetaStore {
         result
     }
 
-    fn put(&self, key: &[u8], value: Vec<u8>) {
-        let txn = TxnId::new();
-        if self
-            .kv
-            .write_intent(txn, Bytes::copy_from_slice(key), Bytes::from(value))
-            .is_ok()
-        {
-            let _ = self.kv.commit(txn, self.next_ts());
-        }
-    }
-
     /// Atomically persists several records in one transaction (one durable
     /// commit), so a multi-record write is all-or-nothing across a crash and
     /// costs a single fsync instead of one per record. Used for a batch of
     /// appended log entries: a partial batch can never survive recovery.
-    fn put_batch(&self, items: Vec<(Vec<u8>, Vec<u8>)>) {
+    /// Failures are reported — never swallowed — so a caller cannot ack a
+    /// write that was not durably stored.
+    fn put_batch(&self, items: Vec<(Vec<u8>, Vec<u8>)>) -> anyhow::Result<()> {
         if items.is_empty() {
-            return;
+            return Ok(());
         }
         let txn = TxnId::new();
-        for (key, value) in items {
-            if self
-                .kv
-                .write_intent(txn, Bytes::from(key), Bytes::from(value))
-                .is_err()
-            {
-                let _ = self.kv.abort(txn);
-                return;
+        let result = (|| {
+            for (key, value) in items {
+                self.kv
+                    .write_intent(txn, Bytes::from(key), Bytes::from(value))?;
             }
+            self.kv.commit(txn, self.next_ts())?;
+            Ok(())
+        })();
+        if result.is_err() {
+            // A failed commit can have an uncertain durable outcome. Report it
+            // to Raft even if abort succeeds; recovery is authoritative.
+            let _ = self.kv.abort(txn);
         }
-        let _ = self.kv.commit(txn, self.next_ts());
+        result
     }
 
     /// Persists a batch of log entries atomically (see [`Self::put_batch`]).
-    fn append_entries(&self, entries: &[Entry<NodusTypeConfig>]) {
+    fn append_entries(&self, entries: &[Entry<NodusTypeConfig>]) -> anyhow::Result<()> {
         let items: Vec<(Vec<u8>, Vec<u8>)> = entries
             .iter()
-            .filter_map(|entry| {
+            .map(|entry| {
                 serde_json::to_vec(entry)
-                    .ok()
                     .map(|bytes| (log_key(entry.log_id.index), encode_raft(bytes)))
+                    .map_err(anyhow::Error::from)
             })
-            .collect();
-        self.put_batch(items);
+            .collect::<anyhow::Result<_>>()?;
+        self.put_batch(items)
     }
 
-    fn delete(&self, key: &[u8]) {
-        let txn = TxnId::new();
-        if self
-            .kv
-            .delete_intent(txn, Bytes::copy_from_slice(key))
-            .is_ok()
-        {
-            let _ = self.kv.commit(txn, self.next_ts());
-        }
-    }
-
-    fn save_vote(&self, vote: &Vote<u64>) {
-        if let Ok(bytes) = serde_json::to_vec(vote) {
-            self.put(RAFT_VOTE_KEY, encode_raft(bytes));
-        }
+    fn save_vote(&self, vote: &Vote<u64>) -> anyhow::Result<()> {
+        let bytes = serde_json::to_vec(vote)?;
+        self.put_checked(RAFT_VOTE_KEY, encode_raft(bytes))
     }
 
     fn load_vote(&self) -> Option<Vote<u64>> {
@@ -524,8 +506,8 @@ impl RaftMetaStore {
             .and_then(|b| decode_raft(&b).and_then(|p| serde_json::from_slice(p).ok()))
     }
 
-    fn delete_entry(&self, index: u64) {
-        self.delete(&log_key(index));
+    fn delete_entry(&self, index: u64) -> anyhow::Result<()> {
+        self.delete_checked(&log_key(index))
     }
 
     fn load_log(&self) -> BTreeMap<u64, Entry<NodusTypeConfig>> {
@@ -546,10 +528,9 @@ impl RaftMetaStore {
         out
     }
 
-    fn save_applied(&self, state: &AppliedState) {
-        if let Ok(bytes) = serde_json::to_vec(state) {
-            self.put(RAFT_APPLIED_KEY, encode_raft(bytes));
-        }
+    fn save_applied(&self, state: &AppliedState) -> anyhow::Result<()> {
+        let bytes = serde_json::to_vec(state)?;
+        self.put_checked(RAFT_APPLIED_KEY, encode_raft(bytes))
     }
 
     fn load_applied(&self) -> AppliedState {
@@ -687,7 +668,13 @@ impl NodusRaftStore {
         if reconcile_torn_recovery(&mut log, &mut applied) {
             // Persist the repaired watermark so the consistent view is stable
             // across a subsequent restart, even if no apply/purge runs first.
-            meta.save_applied(&applied);
+            // A failure here is not fatal to opening the store: the reconcile
+            // is deterministic and re-runs on the next open, and the next
+            // successful apply or purge persists the watermark — but the failed
+            // durable write must not pass silently.
+            if let Err(e) = meta.save_applied(&applied) {
+                tracing::error!(error = %e, "failed to persist reconciled applied state");
+            }
         }
         // Recover the snapshot metadata so a restarted node can resume from the
         // on-disk snapshot (and the purged log below it) rather than replaying
@@ -777,15 +764,22 @@ impl NodusRaftStore {
     }
 
     /// Persists the current applied-state pointer (durable when backed by a
-    /// `KvEngine`; a no-op for the in-memory store).
-    fn persist_applied(&self, sm: &StateMachine) {
+    /// `KvEngine`; a no-op for the in-memory store). A durable-write failure is
+    /// reported so the apply is not acknowledged against state a crash would lose.
+    fn persist_applied(&self, sm: &StateMachine) -> Result<(), StorageError<u64>> {
         if let Some(meta) = &self.meta {
             meta.save_applied(&AppliedState {
                 last_applied: sm.last_applied_log,
                 last_membership: sm.last_membership.clone(),
                 last_purged: sm.last_purged,
-            });
+            })
+            .map_err(|e| {
+                StorageIOError::write_state_machine(AnyError::error(format!(
+                    "persist applied state: {e:#}"
+                )))
+            })?;
         }
+        Ok(())
     }
 }
 
@@ -1046,10 +1040,14 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
     type SnapshotBuilder = Self;
 
     async fn save_vote(&mut self, vote: &Vote<u64>) -> Result<(), StorageError<u64>> {
-        *self.vote.write().await = Some(*vote);
+        // Persist before caching: a vote acknowledged to openraft but lost to a
+        // crash could be double-cast after a restart.
         if let Some(meta) = &self.meta {
-            meta.save_vote(vote);
+            meta.save_vote(vote).map_err(|e| {
+                StorageIOError::write_vote(AnyError::error(format!("persist vote: {e:#}")))
+            })?;
         }
+        *self.vote.write().await = Some(*vote);
         Ok(())
     }
 
@@ -1078,11 +1076,14 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
     {
         let mut log = self.log.write().await;
         let batch: Vec<Entry<NodusTypeConfig>> = entries.into_iter().collect();
-        // Persist the whole append atomically before caching, so a crash never
-        // leaves an acked-but-lost entry and a multi-entry append is never half
-        // durable — a leader must not ack a write it hasn't durably stored.
+        // Persist the whole append atomically before caching and surface any
+        // failure to openraft, so a crash never loses an acked entry and a
+        // multi-entry append is never half durable — a leader must not ack a
+        // write it hasn't durably stored.
         if let Some(meta) = &self.meta {
-            meta.append_entries(&batch);
+            meta.append_entries(&batch).map_err(|e| {
+                StorageIOError::write_logs(AnyError::error(format!("persist log append: {e:#}")))
+            })?;
         }
         for entry in batch {
             log.insert(entry.log_id.index, entry);
@@ -1097,10 +1098,18 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
         let mut log = self.log.write().await;
         let keys: Vec<u64> = log.range(log_id.index..).map(|(k, _)| *k).collect();
         for key in keys {
-            log.remove(&key);
+            // Drop the durable record before the cache entry: on failure the
+            // entry stays cached and openraft sees the error, so a conflict
+            // truncation is never acknowledged while the conflicting entry
+            // would survive a restart.
             if let Some(meta) = &self.meta {
-                meta.delete_entry(key);
+                meta.delete_entry(key).map_err(|e| {
+                    StorageIOError::write_logs(AnyError::error(format!(
+                        "delete conflict log entry {key}: {e:#}"
+                    )))
+                })?;
             }
+            log.remove(&key);
         }
         Ok(())
     }
@@ -1428,8 +1437,10 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
             sm.last_applied_log = Some(entry.log_id);
         }
         // Persist how far we've applied (and the membership at that point) so a
-        // restart resumes from here instead of re-applying the whole log.
-        self.persist_applied(&sm);
+        // restart resumes from here instead of re-applying the whole log. A
+        // durable-write failure aborts the apply: openraft must not treat these
+        // entries as applied when a crash would forget them.
+        self.persist_applied(&sm)?;
         Ok(res)
     }
 
@@ -1553,6 +1564,166 @@ mod tests {
         );
     }
 
+    /// Test-only engine that injects durable-write failures, proving the store
+    /// reports them to openraft instead of acking writes a crash would lose.
+    #[derive(Default)]
+    struct FailingKv {
+        inner: nodus_storage_mem::MemKvEngine,
+        fail_writes: std::sync::atomic::AtomicBool,
+        fail_commits: std::sync::atomic::AtomicBool,
+    }
+
+    impl FailingKv {
+        fn injected() -> KvError {
+            KvError::Other(anyhow::anyhow!("injected durable failure"))
+        }
+    }
+
+    impl KvEngine for FailingKv {
+        fn get(&self, key: &[u8], ts: u64) -> anyhow::Result<Option<Bytes>> {
+            self.inner.get(key, ts)
+        }
+        fn scan(
+            &self,
+            range: KeyRange,
+            ts: u64,
+        ) -> anyhow::Result<
+            Box<dyn Iterator<Item = anyhow::Result<nodus_storage_api::KvPair>> + Send>,
+        > {
+            self.inner.scan(range, ts)
+        }
+        fn write_intent(&self, txn: TxnId, key: Bytes, value: Bytes) -> KvResult<()> {
+            if self.fail_writes.load(Ordering::SeqCst) {
+                return Err(Self::injected());
+            }
+            self.inner.write_intent(txn, key, value)
+        }
+        fn delete_intent(&self, txn: TxnId, key: Bytes) -> KvResult<()> {
+            if self.fail_writes.load(Ordering::SeqCst) {
+                return Err(Self::injected());
+            }
+            self.inner.delete_intent(txn, key)
+        }
+        fn replace_intent(
+            &self,
+            txn: TxnId,
+            key: Bytes,
+            replacement: nodus_storage_api::IntentReplacement,
+        ) -> KvResult<()> {
+            self.inner.replace_intent(txn, key, replacement)
+        }
+        fn commit(&self, txn: TxnId, ts: u64) -> KvResult<()> {
+            if self.fail_commits.load(Ordering::SeqCst) {
+                return Err(Self::injected());
+            }
+            self.inner.commit(txn, ts)
+        }
+        fn abort(&self, txn: TxnId) -> KvResult<()> {
+            self.inner.abort(txn)
+        }
+    }
+
+    fn failing_store() -> (NodusRaftStore, Arc<FailingKv>) {
+        let engine = Arc::new(FailingKv::default());
+        let store = NodusRaftStore::with_kv(engine.clone());
+        (store, engine)
+    }
+
+    /// A failed durable append is returned to openraft and the entry never
+    /// enters the in-memory log, so no write is acked that a crash would lose.
+    #[tokio::test]
+    async fn append_to_log_reports_durable_failure_and_caches_nothing() {
+        let (mut store, engine) = failing_store();
+        engine.fail_commits.store(true, Ordering::SeqCst);
+        let err = store
+            .append_to_log(vec![blank_entry(1, 1)])
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("injected durable failure"),
+            "error must carry the storage cause: {err}"
+        );
+        assert!(
+            store.log.read().await.is_empty(),
+            "a failed append must not enter the cache"
+        );
+        // A failed intent write (before commit) propagates the same way.
+        engine.fail_commits.store(false, Ordering::SeqCst);
+        engine.fail_writes.store(true, Ordering::SeqCst);
+        assert!(
+            store.append_to_log(vec![blank_entry(1, 1)]).await.is_err(),
+            "write-intent failure must also be reported"
+        );
+        assert!(store.log.read().await.is_empty());
+    }
+
+    /// A failed durable vote write is returned to openraft and the cached vote
+    /// keeps its previous value, so a vote cannot be lost-then-double-cast.
+    #[tokio::test]
+    async fn save_vote_reports_durable_failure_and_keeps_prior_vote() {
+        let (mut store, engine) = failing_store();
+        store.save_vote(&Vote::new(1, 1)).await.unwrap();
+        engine.fail_commits.store(true, Ordering::SeqCst);
+        let err = store.save_vote(&Vote::new(2, 1)).await.unwrap_err();
+        assert!(
+            err.to_string().contains("injected durable failure"),
+            "error must carry the storage cause: {err}"
+        );
+        assert_eq!(
+            store.read_vote().await.unwrap(),
+            Some(Vote::new(1, 1)),
+            "a failed vote write must not update the cache"
+        );
+    }
+
+    /// A failed applied-state persist fails the apply, so openraft does not
+    /// treat entries as applied when a restart would forget them.
+    #[tokio::test]
+    async fn apply_to_state_machine_reports_applied_persist_failure() {
+        let (mut store, engine) = failing_store();
+        store.append_to_log(vec![blank_entry(1, 1)]).await.unwrap();
+        engine.fail_commits.store(true, Ordering::SeqCst);
+        let err = store
+            .apply_to_state_machine(&[blank_entry(1, 1)])
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("injected durable failure"),
+            "error must carry the storage cause: {err}"
+        );
+    }
+
+    /// A failed durable conflict-truncation is returned to openraft and the
+    /// conflicting entries stay in the log, so truncation is never acked while
+    /// the entries would survive a restart.
+    #[tokio::test]
+    async fn delete_conflict_logs_reports_durable_failure_and_keeps_entries() {
+        let (mut store, engine) = failing_store();
+        store
+            .append_to_log(vec![
+                blank_entry(1, 1),
+                blank_entry(1, 2),
+                blank_entry(1, 3),
+            ])
+            .await
+            .unwrap();
+        engine.fail_commits.store(true, Ordering::SeqCst);
+        let err = store
+            .delete_conflict_logs_since(LogId::new(openraft::CommittedLeaderId::new(1, 1), 2))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("injected durable failure"),
+            "error must carry the storage cause: {err}"
+        );
+        let entries = store.try_get_log_entries(1..=3).await.unwrap();
+        assert_eq!(
+            entries.len(),
+            3,
+            "a failed truncation must not drop cached entries"
+        );
+    }
+
     #[test]
     fn apply_kv_result_tolerates_replay_but_fails_on_real_errors() {
         let tid = TxnId::new();
@@ -1649,8 +1820,8 @@ mod tests {
         // Simulate the torn durability: the applied-state record survived, but
         // the log entries (separate KV records) did not.
         let meta = RaftMetaStore::new(kv.clone());
-        meta.delete_entry(1);
-        meta.delete_entry(2);
+        meta.delete_entry(1).unwrap();
+        meta.delete_entry(2).unwrap();
 
         // Reopen — recovery must reconcile rather than expose a torn view.
         let mut store = NodusRaftStore::with_kv(kv.clone());
