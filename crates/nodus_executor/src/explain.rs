@@ -512,43 +512,11 @@ impl MemExecutor {
                     Some(&subplans),
                 )?;
                 for join in joins {
-                    let right = match (&join.semi_subquery, &join.lateral, &join.table_fn) {
-                        // A semi/anti join's inner side is its subquery's
-                        // own relations, with no node of their own.
-                        (Some(sub), _, _) => self.explain_node(ctx, sub, &scope)?,
-                        (None, Some(sub), _) => {
-                            let child = self.explain_node(ctx, sub, &scope)?;
-                            let alias = join.table_alias.as_deref().unwrap_or(&join.table_name);
-                            Node::over(
-                                "Subquery Scan",
-                                format!("Subquery Scan on {}", relation_name(alias)),
-                                vec![child],
-                            )
-                            .prop("Alias", json!(relation_name(alias)))
-                        }
-                        (None, None, Some(spec)) => function_scan(spec),
-                        (None, None, None) => self.explain_relation(
-                            ctx,
-                            &join.table_name,
-                            join.table_alias.as_deref(),
-                            None,
-                            &scope,
-                            join.sample.as_ref(),
-                            join.only,
-                        )?,
-                    };
-                    let (suffix, kind) = match join.join_type {
-                        JoinType::LeftOuter => (" Left Join", "Left"),
-                        JoinType::RightOuter => (" Right Join", "Right"),
-                        JoinType::FullOuter => (" Full Join", "Full"),
-                        JoinType::Semi => (" Semi Join", "Semi"),
-                        JoinType::Anti => (" Anti Join", "Anti"),
-                        JoinType::Inner | JoinType::Cross => ("", "Inner"),
-                    };
                     // The equalities between the sides hash (a `Hash Join`),
                     // unless the session turned hash joins off; anything
                     // else is the nested loop the executor runs, over a
-                    // materialized inner.
+                    // materialized inner — or an inner index read by the
+                    // join's equality, as PostgreSQL plans it.
                     let left_prefixes = joined_prefixes.clone();
                     let right_prefixes = match &join.semi_subquery {
                         Some(sub) => crate::joins::relation_quals(sub),
@@ -574,6 +542,110 @@ impl MemExecutor {
                         crate::joins::hash_plan(condition.as_ref(), &left_refs, &right_refs)
                     })
                     .flatten();
+                    // A nested loop's inner side reads an index by the
+                    // join's equality when one names its leading column.
+                    let inner_index = if hash.is_none()
+                        && join.semi_subquery.is_none()
+                        && join.lateral.is_none()
+                        && join.table_fn.is_none()
+                        && join.sample.is_none()
+                        && crate::cte_scope::lookup(&join.table_name).is_none()
+                        && !matches!(join.join_type, JoinType::RightOuter | JoinType::FullOuter)
+                    {
+                        parse_object_name(&join.table_name)
+                            .ok()
+                            .and_then(|(j_db, j_sch, j_tbl_name)| {
+                                (!Self::is_virtual_schema(&j_sch)).then_some(())?;
+                                let tbl = self
+                                    .catalog_reader
+                                    .get_table(j_db.clone(), j_sch.clone(), j_tbl_name)
+                                    .ok()?;
+                                // The executor reads a plain base table this
+                                // way: not a view, and no descendants to
+                                // append.
+                                (tbl.view_query.is_none()
+                                    && (join.only
+                                        || self.descendants(j_db, tbl.id).ok()?.is_empty()))
+                                .then_some(tbl)
+                            })
+                            .and_then(|tbl| {
+                                let found = tbl.indexes.iter().find_map(|idx| {
+                                    crate::joins::inner_index_equality(
+                                        join.condition.as_ref(),
+                                        idx,
+                                        &tbl,
+                                        &left_refs,
+                                        &right_refs,
+                                    )
+                                    .map(|(column, outer)| (idx.name.clone(), column, outer))
+                                })?;
+                                Some((found.0, found.1, found.2))
+                            })
+                    } else {
+                        None
+                    };
+                    let right = match (&join.semi_subquery, &join.lateral, &join.table_fn) {
+                        // A semi/anti join's inner side is its subquery's
+                        // own relations, with no node of their own.
+                        (Some(sub), _, _) => self.explain_node(ctx, sub, &scope)?,
+                        (None, Some(sub), _) => {
+                            let child = self.explain_node(ctx, sub, &scope)?;
+                            let alias = join.table_alias.as_deref().unwrap_or(&join.table_name);
+                            Node::over(
+                                "Subquery Scan",
+                                format!("Subquery Scan on {}", relation_name(alias)),
+                                vec![child],
+                            )
+                            .prop("Alias", json!(relation_name(alias)))
+                        }
+                        (None, None, Some(spec)) => function_scan(spec),
+                        (None, None, None) => match &inner_index {
+                            Some((index_name, column, outer)) => Node::new(
+                                "Index Scan",
+                                format!(
+                                    "Index Scan using {} on {}",
+                                    index_name,
+                                    scan_label_name(&join.table_name, join.table_alias.as_deref())
+                                ),
+                                node.rows.max(1.0) * 0.01,
+                                node.width,
+                            )
+                            .prop("Scan Direction", json!("Forward"))
+                            .prop("Index Name", json!(index_name))
+                            .prop("Relation Name", json!(relation_name(&join.table_name)))
+                            .prop(
+                                "Alias",
+                                json!(
+                                    join.table_alias
+                                        .as_deref()
+                                        .map(str::to_string)
+                                        .unwrap_or_else(|| relation_name(&join.table_name))
+                                ),
+                            )
+                            .detail(
+                                "Index Cond",
+                                format!("({column} = {})", deparse_scalar(outer, true)),
+                            ),
+                            None => self.explain_relation(
+                                ctx,
+                                &join.table_name,
+                                join.table_alias.as_deref(),
+                                None,
+                                &scope,
+                                join.sample.as_ref(),
+                                join.only,
+                            )?,
+                        },
+                    };
+                    let (suffix, kind) = match join.join_type {
+                        JoinType::LeftOuter => (" Left Join", "Left"),
+                        JoinType::RightOuter => (" Right Join", "Right"),
+                        JoinType::FullOuter => (" Full Join", "Full"),
+                        JoinType::Semi => (" Semi Join", "Semi"),
+                        JoinType::Anti => (" Anti Join", "Anti"),
+                        JoinType::Inner | JoinType::Cross => ("", "Inner"),
+                    };
+
                     let rows = match (&join.join_type, &join.condition) {
                         (JoinType::Cross, _) | (_, None) if join.using_columns.is_empty() => {
                             node.rows * right.rows
@@ -639,6 +711,31 @@ impl MemExecutor {
                         (None, None) => (false, None),
                     };
                     let pair_filter = hash.as_ref().and_then(|plan| plan.join_filter());
+                    // With an inner index read, the equality is the index
+                    // condition; each side's own conditions sit on its
+                    // scan, as PostgreSQL plans them.
+                    let (inner_only, outer_only, nested) = match (&hash, &inner_index) {
+                        (None, Some(_)) => match crate::joins::classify(
+                            join.condition.as_ref(),
+                            &left_refs,
+                            &right_refs,
+                        ) {
+                            Some(plan) => (
+                                plan.right_filter(),
+                                plan.left_filter(),
+                                Some(plan.join_filter()),
+                            ),
+                            None => (None, None, None),
+                        },
+                        _ => (None, None, None),
+                    };
+                    // With an inner index read, the equality is the Index
+                    // Cond and each side's own conditions sit on its scan;
+                    // only what both sides decide together stays a filter.
+                    let (condition, pair_filter) = match (&inner_index, nested) {
+                        (Some(_), Some(filter)) => (filter.map(|f| deparse_filter(&f, true)), None),
+                        _ => (condition, pair_filter),
+                    };
                     let swapped = swapped_join;
                     let (first, second) = if swapped {
                         (right, node)
@@ -714,6 +811,10 @@ impl MemExecutor {
                         Some(plan) => (
                             with_side_filter(first, plan.left_filter().as_ref()),
                             with_side_filter(second, plan.right_filter().as_ref()),
+                        ),
+                        None if inner_index.is_some() => (
+                            with_side_filter(first, outer_only.as_ref()),
+                            with_side_filter(second, inner_only.as_ref()),
                         ),
                         None => (first, second),
                     };

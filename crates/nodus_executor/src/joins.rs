@@ -54,6 +54,18 @@ pub(crate) fn hash_plan(
     left_prefixes: &[&str],
     right_prefixes: &[&str],
 ) -> Option<JoinPlan> {
+    let plan = classify(condition, left_prefixes, right_prefixes)?;
+    (!plan.hash_pairs.is_empty()).then_some(plan)
+}
+
+/// Splits `condition` by the side each conjunct reads: the equalities that
+/// could hash, the conditions only one side's rows must satisfy, and the
+/// rest. `None` when there is no condition at all.
+pub(crate) fn classify(
+    condition: Option<&FilterExpr>,
+    left_prefixes: &[&str],
+    right_prefixes: &[&str],
+) -> Option<JoinPlan> {
     let condition = condition?;
     let mut plan = JoinPlan::default();
     for conjunct in crate::index_keys::conjuncts(condition) {
@@ -88,7 +100,7 @@ pub(crate) fn hash_plan(
     }
     // `a = a` and the like are no hash pair.
     plan.hash_pairs.dedup();
-    (!plan.hash_pairs.is_empty()).then_some(plan)
+    Some(plan)
 }
 
 /// The `(left key, right key)` an equality conjunct hashes (left side
@@ -227,6 +239,75 @@ pub(crate) fn semi_joins(
         }
     }
     (joins, conjunction(&remaining))
+}
+
+/// The equality a nested loop's inner side can read an index by: the inner
+/// side is one of `idx`'s leading key columns, and the other side reads
+/// the outer row. `(inner column name, outer expression)`.
+pub(crate) fn inner_index_equality(
+    condition: Option<&FilterExpr>,
+    index: &nodus_catalog::IndexDescriptor,
+    tbl: &nodus_catalog::TableDescriptor,
+    left_prefixes: &[&str],
+    right_prefixes: &[&str],
+) -> Option<(String, crate::plan_types::ScalarExpr)> {
+    let condition = condition?;
+    let key = index.key_columns.first()?;
+    if is_expression_key_of(index) {
+        return None;
+    }
+    let column = tbl.columns.iter().find(|c| c.id == key.column_id)?;
+    for conjunct in crate::index_keys::conjuncts(condition) {
+        let (left, right) = match conjunct {
+            FilterExpr::Predicate(Predicate {
+                left,
+                op: CompareOp::Eq,
+                right: Operand::Ident(right),
+            }) => (
+                crate::plan_types::ScalarExpr::Column(left.clone()),
+                crate::plan_types::ScalarExpr::Column(right.clone()),
+            ),
+            FilterExpr::ExprCmp {
+                left,
+                op: CompareOp::Eq,
+                right,
+            } => (left.clone(), right.clone()),
+            FilterExpr::Scalar(crate::plan_types::ScalarExpr::Binary {
+                op: crate::plan_types::ScalarBinaryOp::Eq,
+                left,
+                right,
+            }) => ((**left).clone(), (**right).clone()),
+            _ => continue,
+        };
+        for (inner, outer) in [(&left, &right), (&right, &left)] {
+            let crate::plan_types::ScalarExpr::Column(name) = inner else {
+                continue;
+            };
+            if unqualified(name) != column.name {
+                continue;
+            }
+            if !side(name, left_prefixes, right_prefixes).is_some_and(|on_left| !on_left) {
+                continue;
+            }
+            if scalar_side(outer, left_prefixes, right_prefixes) == Some(true) {
+                return Some((column.name.clone(), outer.clone()));
+            }
+        }
+    }
+    None
+}
+
+/// The bare name of a (possibly qualified) column reference.
+fn unqualified(name: &str) -> &str {
+    name.rsplit('.').next().unwrap_or(name)
+}
+
+/// Whether an index's leading key is an expression.
+fn is_expression_key_of(index: &nodus_catalog::IndexDescriptor) -> bool {
+    index
+        .key_columns
+        .first()
+        .is_some_and(crate::index_keys::is_expression_key)
 }
 
 /// The comparison an `ANY` operator stands for.
@@ -764,5 +845,120 @@ mod tests {
             panic!("a select");
         };
         assert!(limit.is_none() && sort.is_empty());
+    }
+
+    /// A plain table `b (x, y)` with an index on `x`.
+    fn indexed_table() -> (
+        nodus_catalog::TableDescriptor,
+        nodus_catalog::IndexDescriptor,
+    ) {
+        let id = |n: u64| format!("00000000-0000-0000-0000-{n:012}");
+        let tbl: nodus_catalog::TableDescriptor = serde_json::from_str(&format!(
+            r#"{{"id": "{}", "database_id": "{}", "schema_id": "{}", "name": "b",
+                "version": 1, "created_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-01-01T00:00:00Z", "state": "Public",
+                "columns": [
+                    {{"id": "{}", "name": "x", "version": 1,
+                     "created_at": "2026-01-01T00:00:00Z",
+                     "updated_at": "2026-01-01T00:00:00Z", "state": "Public",
+                     "data_type": "int", "nullable": true}},
+                    {{"id": "{}", "name": "y", "version": 1,
+                     "created_at": "2026-01-01T00:00:00Z",
+                     "updated_at": "2026-01-01T00:00:00Z", "state": "Public",
+                     "data_type": "text", "nullable": true}}],
+                "indexes": []}}"#,
+            id(7),
+            id(1),
+            id(1),
+            id(11),
+            id(12),
+        ))
+        .unwrap();
+        let idx: nodus_catalog::IndexDescriptor = serde_json::from_str(&format!(
+            r#"{{"id": "{}", "name": "b_x", "version": 1,
+                "created_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-01-01T00:00:00Z", "state": "Public",
+                "index_type": "LocalSecondary", "index_state": "Ready",
+                "key_columns": [{{"column_id": "{}", "descending": false}}],
+                "include_columns": [], "unique": false, "global": false,
+                "predicate": null, "expressions": []}}"#,
+            id(3),
+            id(11),
+        ))
+        .unwrap();
+        (tbl, idx)
+    }
+
+    #[test]
+    fn an_equality_with_an_indexed_inner_column_takes_its_index() {
+        let (tbl, idx) = indexed_table();
+        let sql = |sql: &str| {
+            inner_index_equality(Some(&condition(sql)), &idx, &tbl, &["a"], &["b"])
+                .map(|(column, outer)| (column, crate::explain::deparse_scalar(&outer, true)))
+        };
+        // Either operand order names the inner index column and the outer value.
+        assert_eq!(
+            sql("select * from a join b on a.x = b.x"),
+            Some(("x".to_string(), "a.x".to_string()))
+        );
+        assert_eq!(
+            sql("select * from a join b on b.x = a.x"),
+            Some(("x".to_string(), "a.x".to_string()))
+        );
+        // The outer side may be an expression.
+        assert!(sql("select * from a join b on a.x + 1 = b.x").is_some());
+        // A condition on the other column takes no index.
+        assert_eq!(sql("select * from a join b on a.y = b.y"), None);
+        // Nor does an equality within the inner side alone.
+        assert!(
+            inner_index_equality(
+                Some(&condition("select * from c join b on b.x = b.x")),
+                &idx,
+                &tbl,
+                &["c"],
+                &["b"],
+            )
+            .is_none()
+        );
+        // An expression key is not a plain column.
+        let mut expression_key = idx.clone();
+        expression_key.key_columns[0].column_id = crate::index_keys::EXPRESSION_KEY;
+        assert!(
+            inner_index_equality(
+                Some(&condition("select * from a join b on a.x = b.x")),
+                &expression_key,
+                &tbl,
+                &["a"],
+                &["b"],
+            )
+            .is_none()
+        );
+        // A composite index reads its leading key only: a condition on a
+        // later column takes no lookup, the leading one does.
+        let mut composite = idx.clone();
+        composite.key_columns.push(nodus_catalog::IndexColumn {
+            column_id: tbl.columns[1].id,
+            descending: false,
+        });
+        assert!(
+            inner_index_equality(
+                Some(&condition("select * from a join b on a.y = b.y")),
+                &composite,
+                &tbl,
+                &["a"],
+                &["b"],
+            )
+            .is_none()
+        );
+        assert!(
+            inner_index_equality(
+                Some(&condition("select * from a join b on a.x = b.x")),
+                &composite,
+                &tbl,
+                &["a"],
+                &["b"],
+            )
+            .is_some()
+        );
     }
 }

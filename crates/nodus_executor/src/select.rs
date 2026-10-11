@@ -1203,6 +1203,25 @@ impl MemExecutor {
                 }
             };
 
+            // The inner relation when it is a plain base table: a CTE,
+            // view, virtual table, table function, lateral, sample, or a
+            // target with descendants has no single index a nested loop
+            // could read per outer row.
+            let inner_table: Option<(nodus_catalog::TableDescriptor, TableId, bool)> =
+                if crate::cte_scope::lookup(&join.table_name).is_none()
+                    && join.table_fn.is_none()
+                    && join.lateral.is_none()
+                    && join.sample.is_none()
+                    && let Ok((j_db, j_sch, j_tbl_name)) = parse_object_name(&join.table_name)
+                    && !Self::is_virtual_schema(j_sch)
+                    && let Ok(tbl) = self.catalog_reader.get_table(j_db, j_sch, j_tbl_name)
+                {
+                    let plain = tbl.view_query.is_none()
+                        && (join.only || self.descendants(j_db, tbl.id)?.is_empty());
+                    Some((tbl.clone(), tbl.id, plain))
+                } else {
+                    None
+                };
             let j_prefix = join.table_alias.as_deref().unwrap_or(&join.table_name);
             let j_col_names: Vec<String> = j_cols
                 .iter()
@@ -1350,24 +1369,163 @@ impl MemExecutor {
                     }
                 }
                 None => {
+                    // For an inner join, each side's own conditions sit on
+                    // its scan, and an equality between an outer column and
+                    // an indexed inner column reads that index per outer
+                    // row — as PostgreSQL plans a nested loop.
+                    let inner_join = matches!(join.join_type, JoinType::Inner | JoinType::Cross);
+                    let left_quals = crate::joins::qualifiers(&col_names);
+                    let right_quals = crate::joins::qualifiers(&j_col_names);
+                    let left_refs: Vec<&str> = left_quals.iter().map(String::as_str).collect();
+                    let right_refs: Vec<&str> = right_quals.iter().map(String::as_str).collect();
+                    let split =
+                        crate::joins::classify(join.condition.as_ref(), &left_refs, &right_refs);
+                    let (left_only, right_only, pair_tests, join_filter) = match &split {
+                        Some(plan) if inner_join => (
+                            plan.left_filter(),
+                            plan.right_filter(),
+                            plan.pair_tests.clone(),
+                            plan.join_filter(),
+                        ),
+                        _ => (None, None, Vec::new(), None),
+                    };
+                    // The filtered inner rows, shared by every outer row
+                    // (the index lookup replaces them when it applies).
+                    let stated_rows: Vec<Vec<Value>> = match &right_only {
+                        Some(filter) => j_rows
+                            .iter()
+                            .filter(|row| {
+                                self.eval_filter(ctx, row, &j_col_names, &j_cols, Some(filter))
+                                    .unwrap_or(false)
+                            })
+                            .cloned()
+                            .collect(),
+                        None => j_rows.clone(),
+                    };
+                    let inner_index = inner_table
+                        .as_ref()
+                        .and_then(|(tbl, tbl_id, plain)| {
+                            plain.then(|| {
+                                tbl.indexes.iter().find_map(|idx| {
+                                    crate::joins::inner_index_equality(
+                                        join.condition.as_ref(),
+                                        idx,
+                                        tbl,
+                                        &left_refs,
+                                        &right_refs,
+                                    )
+                                    .map(|(column, outer)| (idx, column, outer, *tbl_id))
+                                })
+                            })?
+                        })
+                        // A right or full join marks matched right rows by
+                        // their position in `j_rows`, so only joins that
+                        // emit per outer row read the inner by index.
+                        .filter(|_| {
+                            !matches!(join.join_type, JoinType::RightOuter | JoinType::FullOuter)
+                        });
                     for r1 in &stored_rows {
+                        if let Some(filter) = &left_only
+                            && !self
+                                .eval_filter(ctx, r1, &col_names, &joined_columns, Some(filter))
+                                .unwrap_or(false)
+                        {
+                            continue;
+                        }
+                        let looked_up: Vec<Vec<Value>>;
+                        let rows: &[Vec<Value>] = match &inner_index {
+                            Some((idx, _, outer, tbl_id)) => {
+                                let value = self.eval_expr(ctx, outer, r1, &col_names);
+                                let (types, ordered) = Self::index_entry_encoding(
+                                    inner_table
+                                        .as_ref()
+                                        .map(|(tbl, _, _)| tbl)
+                                        .expect("the inner table"),
+                                    idx,
+                                );
+                                // The scan's rows carry the hidden tableoid
+                                // column the join layout declares, as the
+                                // materialized path's rows do.
+                                let tableoid = parse_object_name(&join.table_name)
+                                    .map(|(db, sch, name)| {
+                                        Value::Int(Self::table_oid(&db, &sch, &name))
+                                    })
+                                    .unwrap_or(Value::Null);
+                                looked_up = self
+                                    .index_scan(
+                                        idx.id,
+                                        &value,
+                                        *tbl_id,
+                                        &types,
+                                        ordered,
+                                        &ctx.session_id,
+                                    )?
+                                    .into_iter()
+                                    .map(|(_, mut row)| {
+                                        row.push(tableoid.clone());
+                                        row
+                                    })
+                                    .filter(|row| match &right_only {
+                                        // The index settled the equality;
+                                        // the inner side's own conditions
+                                        // still decide which rows match.
+                                        Some(filter) => self
+                                            .eval_filter(
+                                                ctx,
+                                                row,
+                                                &j_col_names,
+                                                &j_cols,
+                                                Some(filter),
+                                            )
+                                            .unwrap_or(false),
+                                        None => true,
+                                    })
+                                    .collect();
+                                &looked_up
+                            }
+                            None => &stated_rows,
+                        };
                         let mut matched = false;
-                        for (j_idx, r2) in j_rows.iter().enumerate() {
+                        for (j_idx, r2) in rows.iter().enumerate() {
                             let mut combined_row = r1.clone();
                             combined_row.extend(r2.clone());
-                            let is_match = match &named_eq_pairs {
-                                Some(pairs) => pairs.iter().all(|(_, l, r)| {
-                                    crate::value::values_equal(&combined_row[*l], &combined_row[*r])
-                                }),
-                                None => self
-                                    .eval_filter(
+                            // The index lookup settled the equality; the
+                            // rest of the condition still holds.
+                            let is_match = if inner_index.is_some() && inner_join {
+                                self.pair_tests_hold(
+                                    ctx,
+                                    &combined_row,
+                                    &combined_cols,
+                                    &combined_desc,
+                                    &pair_tests,
+                                ) && join_filter.as_ref().is_none_or(|filter| {
+                                    self.eval_filter(
                                         ctx,
                                         &combined_row,
                                         &combined_cols,
                                         &combined_desc,
-                                        join.condition.as_ref(),
+                                        Some(filter),
                                     )
-                                    .unwrap_or(false),
+                                    .unwrap_or(false)
+                                })
+                            } else {
+                                match &named_eq_pairs {
+                                    Some(pairs) => pairs.iter().all(|(_, l, r)| {
+                                        crate::value::values_equal(
+                                            &combined_row[*l],
+                                            &combined_row[*r],
+                                        )
+                                    }),
+                                    None => self
+                                        .eval_filter(
+                                            ctx,
+                                            &combined_row,
+                                            &combined_cols,
+                                            &combined_desc,
+                                            join.condition.as_ref(),
+                                        )
+                                        .unwrap_or(false),
+                                }
                             };
                             if is_match {
                                 next_rows.push(combined_row);
