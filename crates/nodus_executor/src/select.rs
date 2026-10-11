@@ -804,13 +804,75 @@ impl MemExecutor {
         let mut joined_columns = tbl_cols;
         let mut stored_rows = stored_rows.unwrap();
 
+        // A `WHERE` conjunct one relation alone decides is applied at that
+        // relation's scan, as PostgreSQL plans it; a null-rejecting conjunct
+        // on the null side of an outer join first turns it into an inner
+        // join. The join types are the reduced ones from here on.
+        let inputs: Vec<Vec<String>> = std::iter::once(crate::joins::qualifiers(&col_names))
+            .chain(joins.iter().map(|join| {
+                vec![
+                    join.table_alias
+                        .clone()
+                        .unwrap_or_else(|| join.table_name.clone()),
+                ]
+            }))
+            .collect();
+        let pushable: Vec<bool> = std::iter::once(true)
+            .chain(joins.iter().map(|join| {
+                join.semi_subquery.is_none() && join.lateral.is_none() && join.table_fn.is_none()
+            }))
+            .collect();
+        let pushed = crate::joins::pushed_filter(
+            filter.as_ref(),
+            &inputs,
+            &pushable,
+            &joins
+                .iter()
+                .map(|join| join.join_type.clone())
+                .collect::<Vec<_>>(),
+        );
+        let reduced: Option<Vec<Join>> = pushed
+            .join_types
+            .iter()
+            .zip(joins.iter())
+            .any(|(join_type, join)| *join_type != join.join_type)
+            .then(|| {
+                joins
+                    .iter()
+                    .cloned()
+                    .zip(pushed.join_types.iter())
+                    .map(|(mut join, join_type)| {
+                        join.join_type = join_type.clone();
+                        join
+                    })
+                    .collect()
+            });
+        let joins: &[Join] = reduced.as_deref().unwrap_or(&joins);
+        if let Some(head_filter) = &pushed.inputs[0] {
+            // The conjuncts are typed by the relations they read, so each
+            // part is lowered where its columns are known.
+            let column_type = |name: &str| {
+                crate::filter_eval::col_pos(&col_names, name)
+                    .and_then(|i| joined_columns.get(i))
+                    .map(|c| c.data_type.clone())
+            };
+            let head_filter =
+                crate::result_types::check_filter_integer_ranges(head_filter, &column_type);
+            stored_rows.retain(|row| {
+                self.eval_filter(ctx, row, &col_names, &joined_columns, Some(&head_filter))
+                    .unwrap_or(false)
+            });
+        }
+
         // The columns `*` stands for, as positions in the row: each relation's
         // in turn, except that a join's USING (or NATURAL) columns come first,
         // once, in place of the columns they merge.
         let mut star: Vec<usize> = (0..col_names.len()).collect();
         star.retain(|i| !hidden.contains(i));
-        for join in &joins {
+        for (join_index, join) in joins.iter().enumerate() {
             let left_width = col_names.len();
+            // The `WHERE` conjuncts this member's scan alone decides.
+            let member_filter = pushed.inputs.get(join_index + 1).and_then(Option::as_ref);
             // A semi/anti join (from `[NOT] EXISTS` / `IN`) runs its
             // subquery once, hashed or scanned per left row, and adds no
             // columns: the left row is kept (semi) or kept only when
@@ -1241,6 +1303,22 @@ impl MemExecutor {
             let mut combined_desc = joined_columns.clone();
             combined_desc.extend(j_cols.clone());
 
+            let mut j_rows = j_rows;
+            let member_filter = member_filter.map(|filter| {
+                let column_type = |name: &str| {
+                    crate::filter_eval::col_pos(&j_col_names, name)
+                        .and_then(|i| j_cols.get(i))
+                        .map(|c| c.data_type.clone())
+                };
+                crate::result_types::check_filter_integer_ranges(filter, &column_type)
+            });
+            if let Some(filter) = &member_filter {
+                j_rows.retain(|row| {
+                    self.eval_filter(ctx, row, &j_col_names, &j_cols, Some(filter))
+                        .unwrap_or(false)
+                });
+            }
+
             // `USING (cols)` / `NATURAL` are equi-joins over named columns common
             // to both inputs. Resolve them here, against the actual (prefixed) row
             // schemas, into pairs of combined-row indices to compare for equality
@@ -1402,6 +1480,16 @@ impl MemExecutor {
                             .collect(),
                         None => j_rows.clone(),
                     };
+                    // The inner side's conditions — its own `ON`
+                    // conjuncts and the member's `WHERE` ones — for
+                    // looked-up rows, which skip the scan above.
+                    let lookup_filter = crate::joins::conjunction(
+                        &right_only
+                            .iter()
+                            .chain(member_filter.as_ref())
+                            .cloned()
+                            .collect::<Vec<_>>(),
+                    );
                     let inner_index = inner_table
                         .as_ref()
                         .and_then(|(tbl, tbl_id, plain)| {
@@ -1465,7 +1553,7 @@ impl MemExecutor {
                                         row.push(tableoid.clone());
                                         row
                                     })
-                                    .filter(|row| match &right_only {
+                                    .filter(|row| match &lookup_filter {
                                         // The index settled the equality;
                                         // the inner side's own conditions
                                         // still decide which rows match.
@@ -2093,9 +2181,11 @@ impl MemExecutor {
             stored_rows.clear();
         }
 
-        // WHERE: conjunction of typed predicates.
+        // WHERE: conjunction of typed predicates — what the scans above
+        // did not already decide.
+        let residual = pushed.residual.as_ref().map(check_filter);
         stored_rows.retain(|r| {
-            self.eval_filter(ctx, r, &col_names, &joined_columns, filter.as_ref())
+            self.eval_filter(ctx, r, &col_names, &joined_columns, residual.as_ref())
                 .unwrap_or(false)
         });
 

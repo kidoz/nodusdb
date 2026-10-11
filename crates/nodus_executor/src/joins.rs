@@ -208,6 +208,210 @@ pub(crate) fn conjunction(parts: &[FilterExpr]) -> Option<FilterExpr> {
     }))
 }
 
+/// What a `WHERE` filter becomes once its single-relation conjuncts move
+/// to the input they read, as PostgreSQL plans them.
+#[derive(Debug)]
+pub(crate) struct PushedFilter {
+    /// The join types after null-rejecting conjuncts removed outer joins.
+    pub join_types: Vec<JoinType>,
+    /// The filter each FROM input applies, in join order: the head relation
+    /// first, then each join's member.
+    pub inputs: Vec<Option<FilterExpr>>,
+    /// The conjuncts no single input can take.
+    pub residual: Option<FilterExpr>,
+}
+
+/// `filter`, rewritten for the FROM inputs named by `inputs` (each input's
+/// qualifiers, in join order, the head relation first). A null-rejecting
+/// conjunct confined to an outer join's null side removes that side's
+/// null-extension, so the join is planned without it — a `LEFT JOIN` whose
+/// filter reads the right side becomes an inner join, a `FULL JOIN` becomes
+/// the outer join that keeps the filtered side. After that, a conjunct one
+/// input alone decides is applied at that input. `pushable[i]` is false for
+/// an input whose rows the caller cannot filter on its own (a lateral,
+/// table function or semi-join member): its conjuncts stay in the residual.
+pub(crate) fn pushed_filter(
+    filter: Option<&FilterExpr>,
+    inputs: &[Vec<String>],
+    pushable: &[bool],
+    join_types: &[JoinType],
+) -> PushedFilter {
+    let conjuncts: Vec<&FilterExpr> = match filter {
+        Some(filter) => crate::index_keys::conjuncts(filter),
+        None => Vec::new(),
+    };
+    let mut types = join_types.to_vec();
+    // A reduced join can expose another, so reduce to a fixed point.
+    loop {
+        let mut changed = false;
+        for i in 1..=types.len() {
+            let left: Vec<usize> = (0..i).collect();
+            let on_left = conjuncts
+                .iter()
+                .any(|c| null_rejecting(c) && confined(c, &left, inputs));
+            let on_right = conjuncts
+                .iter()
+                .any(|c| null_rejecting(c) && confined(c, &[i], inputs));
+            types[i - 1] = match types[i - 1] {
+                JoinType::LeftOuter if on_right => JoinType::Inner,
+                JoinType::RightOuter if on_left => JoinType::Inner,
+                JoinType::FullOuter if on_left => JoinType::LeftOuter,
+                JoinType::FullOuter if on_right => JoinType::RightOuter,
+                _ => continue,
+            };
+            changed = true;
+        }
+        if !changed {
+            break;
+        }
+    }
+    // What each input's rows can be after the reductions: null-supplied
+    // inputs must keep their conjuncts for after the joins.
+    let mut nullable = vec![false; inputs.len()];
+    for (i, join_type) in types.iter().enumerate() {
+        match join_type {
+            JoinType::LeftOuter => nullable[i + 1] = true,
+            JoinType::RightOuter => nullable[..=i].fill(true),
+            JoinType::FullOuter => nullable[..=i + 1].fill(true),
+            _ => {}
+        }
+    }
+    let mut per_input: Vec<Vec<FilterExpr>> = vec![Vec::new(); inputs.len()];
+    let mut rest: Vec<FilterExpr> = Vec::new();
+    for conjunct in &conjuncts {
+        match single_input(conjunct, inputs) {
+            // A conjunct reading a subquery stays where the join's rows
+            // are: the subquery may correlate to any of them.
+            Some(i)
+                if !has_subquery(conjunct)
+                    && pushable.get(i).copied().unwrap_or(false)
+                    && !nullable[i] =>
+            {
+                per_input[i].push((*conjunct).clone());
+            }
+            _ => rest.push((*conjunct).clone()),
+        }
+    }
+    PushedFilter {
+        join_types: types,
+        inputs: per_input
+            .into_iter()
+            .map(|parts| conjunction(&parts))
+            .collect(),
+        residual: conjunction(&rest),
+    }
+}
+
+/// Whether every reference a conjunct makes lands among the given inputs —
+/// and it makes at least one.
+fn confined(filter: &FilterExpr, side: &[usize], inputs: &[Vec<String>]) -> bool {
+    let refs = refs_of(filter);
+    !refs.is_empty()
+        && refs
+            .iter()
+            .all(|name| input_of(name, inputs).is_some_and(|i| side.contains(&i)))
+}
+
+/// Whether any conjunct reads more than one of the inputs — the
+/// conditions PostgreSQL shows as a join qual (`Join Filter`).
+pub(crate) fn spans_inputs(filter: &FilterExpr, inputs: &[Vec<String>]) -> bool {
+    crate::index_keys::conjuncts(filter)
+        .iter()
+        .any(|c| !refs_of(c).is_empty() && single_input(c, inputs).is_none())
+}
+
+/// The one input every reference a conjunct makes lands in.
+fn single_input(filter: &FilterExpr, inputs: &[Vec<String>]) -> Option<usize> {
+    let mut found = None;
+    for name in refs_of(filter) {
+        let i = input_of(&name, inputs)?;
+        match found {
+            None => found = Some(i),
+            Some(previous) if previous == i => {}
+            Some(_) => return None,
+        }
+    }
+    found
+}
+
+/// The input a column reference names, by its qualifier.
+fn input_of(name: &str, inputs: &[Vec<String>]) -> Option<usize> {
+    let qualifier = prefix(name)?;
+    inputs
+        .iter()
+        .position(|qualifiers| qualifiers.iter().any(|q| q == qualifier))
+}
+
+/// The column references a conjunct makes (a subquery's own are its own).
+fn refs_of(filter: &FilterExpr) -> Vec<String> {
+    let mut refs = Vec::new();
+    crate::filter_eval::filter_column_refs(filter, &mut refs);
+    refs
+}
+
+/// Whether a conjunct reads a subquery — which may correlate to any of the
+/// join's inputs, so the conjunct cannot move to one of them.
+fn has_subquery(filter: &FilterExpr) -> bool {
+    fn scalar(expr: &crate::plan_types::ScalarExpr) -> bool {
+        use crate::plan_types::ScalarExpr;
+        match expr {
+            ScalarExpr::Subquery { .. } => true,
+            ScalarExpr::Literal(_) | ScalarExpr::Column(_) => false,
+            ScalarExpr::Unary { expr, .. }
+            | ScalarExpr::Cast { expr, .. }
+            | ScalarExpr::Extract { expr, .. } => scalar(expr),
+            ScalarExpr::Binary { left, right, .. } => scalar(left) || scalar(right),
+            ScalarExpr::Function { args, .. } => args.iter().any(scalar),
+            // Conservative: anything else may hide one.
+            _ => true,
+        }
+    }
+    match filter {
+        FilterExpr::ExprCmp { left, right, .. } => scalar(left) || scalar(right),
+        FilterExpr::And(a, b) | FilterExpr::Or(a, b) => has_subquery(a) || has_subquery(b),
+        FilterExpr::Not(inner) => has_subquery(inner),
+        FilterExpr::InSubquery { .. }
+        | FilterExpr::CompareSubquery { .. }
+        | FilterExpr::QuantifiedSubquery { .. }
+        | FilterExpr::Exists { .. } => true,
+        _ => false,
+    }
+}
+
+/// Whether a conjunct is never true when a value it reads is NULL — what an
+/// outer join's null-extension cannot satisfy. Conservative: only the
+/// shapes PostgreSQL's own null-rejection test surely covers.
+fn null_rejecting(filter: &FilterExpr) -> bool {
+    fn strict_operand(operand: &Operand) -> bool {
+        match operand {
+            Operand::Ident(_) | Operand::Literal(_) => true,
+        }
+    }
+    fn strict(expr: &crate::plan_types::ScalarExpr) -> bool {
+        use crate::plan_types::ScalarExpr;
+        match expr {
+            ScalarExpr::Literal(_) | ScalarExpr::Column(_) => true,
+            ScalarExpr::Unary { expr, .. } | ScalarExpr::Cast { expr, .. } => strict(expr),
+            ScalarExpr::Binary { left, right, .. } => strict(left) && strict(right),
+            // A function may read NULL as a value (`coalesce`).
+            _ => false,
+        }
+    }
+    match filter {
+        FilterExpr::Predicate(p) => strict_operand(&p.right),
+        FilterExpr::ExprCmp { left, right, .. } => strict(left) && strict(right),
+        // `x IN (...)` and `x <op> (subquery)` are true only when x is not
+        // NULL; `NOT` keeps a strict inner's null-rejection.
+        FilterExpr::InList { .. }
+        | FilterExpr::InSubquery { .. }
+        | FilterExpr::CompareSubquery { .. }
+        | FilterExpr::QuantifiedSubquery { .. } => true,
+        FilterExpr::And(a, b) => null_rejecting(a) && null_rejecting(b),
+        FilterExpr::Not(inner) => null_rejecting(inner),
+        _ => false,
+    }
+}
+
 /// The semi/anti joins a condition's `[NOT] EXISTS` / `IN` conjuncts
 /// become, and the rest of the condition. Shared by `SELECT` and by
 /// `UPDATE`/`DELETE`, whose plans carry the joins beside the target.
@@ -845,6 +1049,107 @@ mod tests {
             panic!("a select");
         };
         assert!(limit.is_none() && sort.is_empty());
+    }
+
+    #[test]
+    fn a_where_conjunct_moves_to_the_input_it_reads() {
+        let inputs = vec![vec!["a".to_string()], vec!["b".to_string()]];
+        let push = |sql: &str, join_types: &[JoinType]| {
+            pushed_filter(Some(&where_filter(sql)), &inputs, &[true, true], join_types)
+        };
+        // An inner join applies each side's conjuncts at its own scan.
+        let plan = push(
+            "select * from a join b on a.x = b.x where a.x < 5",
+            &[JoinType::Inner],
+        );
+        assert_eq!(
+            plan.inputs[0].as_ref().map(deparse).as_deref(),
+            Some("(a.x < 5)")
+        );
+        assert!(plan.inputs[1].is_none() && plan.residual.is_none());
+
+        // A conjunct naming both sides stays after the join.
+        let plan = push(
+            "select * from a join b on a.x = b.x where a.x < b.x",
+            &[JoinType::Inner],
+        );
+        assert!(plan.inputs.iter().all(Option::is_none));
+        assert_eq!(
+            plan.residual.as_ref().map(deparse).as_deref(),
+            Some("(a.x < b.x)")
+        );
+
+        // A `LEFT JOIN` whose filter reads the right side becomes inner.
+        let plan = push(
+            "select * from a left join b on a.x = b.x where b.y = 2",
+            &[JoinType::LeftOuter],
+        );
+        assert_eq!(plan.join_types, [JoinType::Inner]);
+        assert_eq!(
+            plan.inputs[1].as_ref().map(deparse).as_deref(),
+            Some("(b.y = 2)")
+        );
+        assert!(plan.residual.is_none());
+
+        // `IS NULL` reads NULLs by definition: the join stays outer and
+        // the conjunct stays after it.
+        let plan = push(
+            "select * from a left join b on a.x = b.x where b.y is null",
+            &[JoinType::LeftOuter],
+        );
+        assert_eq!(plan.join_types, [JoinType::LeftOuter]);
+        assert!(plan.inputs.iter().all(Option::is_none) && plan.residual.is_some());
+
+        // A conjunct on the preserved side stays there.
+        let plan = push(
+            "select * from a left join b on a.x = b.x where a.x < 5",
+            &[JoinType::LeftOuter],
+        );
+        assert_eq!(plan.join_types, [JoinType::LeftOuter]);
+        assert_eq!(
+            plan.inputs[0].as_ref().map(deparse).as_deref(),
+            Some("(a.x < 5)")
+        );
+
+        // A `FULL JOIN` filtered on one side becomes that side's outer
+        // join, and one filtered on both becomes inner.
+        for (sql, kept) in [
+            (
+                "select * from a full join b on a.x = b.x where a.x < 5",
+                JoinType::LeftOuter,
+            ),
+            (
+                "select * from a full join b on a.x = b.x where b.y = 2",
+                JoinType::RightOuter,
+            ),
+            (
+                "select * from a full join b on a.x = b.x where a.x < 5 and b.y = 2",
+                JoinType::Inner,
+            ),
+        ] {
+            let plan = push(sql, &[JoinType::FullOuter]);
+            assert_eq!(plan.join_types, [kept], "{sql}");
+        }
+
+        // `coalesce` reads NULL as a value: no reduction, no push.
+        let plan = push(
+            "select * from a left join b on a.x = b.x where coalesce(b.y, 0) = 2",
+            &[JoinType::LeftOuter],
+        );
+        assert_eq!(plan.join_types, [JoinType::LeftOuter]);
+        assert!(plan.inputs.iter().all(Option::is_none) && plan.residual.is_some());
+
+        // An input whose rows the caller cannot filter (a lateral, table
+        // function or semi-join member) keeps its conjuncts after the join.
+        let plan = pushed_filter(
+            Some(&where_filter(
+                "select * from a join b on a.x = b.x where b.y = 2",
+            )),
+            &inputs,
+            &[true, false],
+            &[JoinType::Inner],
+        );
+        assert!(plan.inputs.iter().all(Option::is_none) && plan.residual.is_some());
     }
 
     /// A plain table `b (x, y)` with an index on `x`.

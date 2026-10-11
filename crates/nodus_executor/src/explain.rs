@@ -475,6 +475,50 @@ impl MemExecutor {
                 // which decide whose column references are whose.
                 let mut joined_prefixes: Vec<String> =
                     vec![relation_name(table_alias.as_deref().unwrap_or(table_name))];
+                // A `WHERE` conjunct one relation decides is shown at that
+                // relation's scan, as PostgreSQL plans it; a null-rejecting
+                // one on an outer join's null side first turns it into an
+                // inner join.
+                let inputs: Vec<Vec<String>> = std::iter::once(joined_prefixes.clone())
+                    .chain(joins.iter().map(|join| match &join.semi_subquery {
+                        Some(sub) => crate::joins::relation_quals(sub),
+                        None => vec![relation_name(
+                            join.table_alias.as_deref().unwrap_or(&join.table_name),
+                        )],
+                    }))
+                    .collect();
+                let pushed = crate::joins::pushed_filter(
+                    filter,
+                    &inputs,
+                    &std::iter::once(true)
+                        .chain(joins.iter().map(|join| {
+                            join.semi_subquery.is_none()
+                                && join.lateral.is_none()
+                                && join.table_fn.is_none()
+                        }))
+                        .collect::<Vec<_>>(),
+                    &joins
+                        .iter()
+                        .map(|join| join.join_type.clone())
+                        .collect::<Vec<_>>(),
+                );
+                let reduced: Option<Vec<Join>> = pushed
+                    .join_types
+                    .iter()
+                    .zip(joins.iter())
+                    .any(|(join_type, join)| *join_type != join.join_type)
+                    .then(|| {
+                        joins
+                            .iter()
+                            .cloned()
+                            .zip(pushed.join_types.iter())
+                            .map(|(mut join, join_type)| {
+                                join.join_type = join_type.clone();
+                                join
+                            })
+                            .collect()
+                    });
+                let joins: &[Join] = reduced.as_deref().unwrap_or(joins);
                 // A filter on one relation is shown on its scan.
                 let scan_filter = if single { filter } else { None };
                 // The columns the statement reads: a covering index is
@@ -499,6 +543,26 @@ impl MemExecutor {
                     && !*distinct
                     && having.is_none()
                     && sample.is_none();
+                // A side's own conditions go on its scan, as PostgreSQL
+                // pushes them.
+                let with_side_filter = |mut child: Node, filter: Option<&FilterExpr>| {
+                    let Some(filter) = filter else {
+                        return child;
+                    };
+                    let text = deparse_filter(filter, false);
+                    match child
+                        .details
+                        .iter_mut()
+                        .find(|(name, _, _)| *name == "Filter")
+                    {
+                        Some((_, existing, json)) => {
+                            *existing = format!("({existing} AND {text})");
+                            *json = json!(existing.clone());
+                        }
+                        None => child = child.detail("Filter", text),
+                    }
+                    child
+                };
                 let mut node = self.explain_relation_reading(
                     ctx,
                     table_name,
@@ -511,7 +575,11 @@ impl MemExecutor {
                     allow_index_only,
                     Some(&subplans),
                 )?;
-                for join in joins {
+                // The head relation's own `WHERE` conjuncts sit on its scan.
+                if !single && let Some(head_filter) = &pushed.inputs[0] {
+                    node = with_side_filter(node, Some(head_filter));
+                }
+                for (join_index, join) in joins.iter().enumerate() {
                     // The equalities between the sides hash (a `Hash Join`),
                     // unless the session turned hash joins off; anything
                     // else is the nested loop the executor runs, over a
@@ -736,6 +804,12 @@ impl MemExecutor {
                         (Some(_), Some(filter)) => (filter.map(|f| deparse_filter(&f, true)), None),
                         _ => (condition, pair_filter),
                     };
+                    // The member's own `WHERE` conjuncts sit on its scan
+                    // (before a right join's swap, where it is `right`).
+                    let right = match pushed.inputs.get(join_index + 1).and_then(Option::as_ref) {
+                        Some(member_filter) => with_side_filter(right, Some(member_filter)),
+                        None => right,
+                    };
                     let swapped = swapped_join;
                     let (first, second) = if swapped {
                         (right, node)
@@ -787,26 +861,6 @@ impl MemExecutor {
                     if let Some(filter) = &pair_filter {
                         joined = joined.detail("Join Filter", deparse_filter(filter, true));
                     }
-                    // A side's own conditions go on its scan, as
-                    // PostgreSQL pushes them.
-                    let with_side_filter = |mut child: Node, filter: Option<&FilterExpr>| {
-                        let Some(filter) = filter else {
-                            return child;
-                        };
-                        let text = deparse_filter(filter, false);
-                        match child
-                            .details
-                            .iter_mut()
-                            .find(|(name, _, _)| *name == "Filter")
-                        {
-                            Some((_, existing, json)) => {
-                                *existing = format!("({existing} AND {text})");
-                                *json = json!(existing.clone());
-                            }
-                            None => child = child.detail("Filter", text),
-                        }
-                        child
-                    };
                     let (first, second) = match &hash {
                         Some(plan) => (
                             with_side_filter(first, plan.left_filter().as_ref()),
@@ -837,8 +891,15 @@ impl MemExecutor {
                     node = joined;
                     joined_prefixes.push(right_prefixes[0].clone());
                 }
-                if let (false, Some(f)) = (single, filter) {
-                    node = node.detail("Filter", deparse_filter_with(f, true, Some(&subplans)));
+                if let (false, Some(f)) = (single, pushed.residual.as_ref()) {
+                    // A conjunct reading more than one input is a join
+                    // qual, as PostgreSQL shows it.
+                    let label = if crate::joins::spans_inputs(f, &inputs) {
+                        "Join Filter"
+                    } else {
+                        "Filter"
+                    };
+                    node = node.detail(label, deparse_filter_with(f, true, Some(&subplans)));
                     node.rows = (node.rows / 3.0).max(1.0).round();
                 }
                 // The subqueries the filter and projection read hang off the
