@@ -70,6 +70,11 @@ impl RaftRouter {
     /// shard whose group is created later is reachable without re-spawning.
     pub fn spawn(manager: Arc<MultiRaftManager>) -> Self {
         let (tx, mut rx) = mpsc::unbounded_channel::<RouterRequest>();
+        // The admin token doubles as the internode credential: forwarded writes
+        // and read-index requests post to a peer's `/raft/...` ingress, which
+        // requires the same bearer token as the admin API when the peer serves
+        // Raft routes on its public listener.
+        let auth_token = manager.auth_token();
         // Built on first actual use, inside `forward`/`fetch_read_index`. The
         // client is only needed to forward a request to a remote leader (or run a
         // cross-node read barrier); a single-node leader does neither, so it is
@@ -110,14 +115,23 @@ impl RaftRouter {
                         });
                     }
                     (Some(raft), RouterRequest::Write { cmd, resp, .. }) => {
+                        let auth_token = auth_token.clone();
                         tokio::spawn(async move {
-                            let res = replicate(raft, &shard_id, cmd, &http).await;
+                            let res =
+                                replicate(raft, &shard_id, cmd, &http, auth_token.as_deref()).await;
                             let _ = resp.send(res);
                         });
                     }
                     (Some(raft), RouterRequest::Barrier { resp, .. }) => {
+                        let auth_token = auth_token.clone();
                         tokio::spawn(async move {
-                            let res = linearizable_barrier(raft, &shard_id, &http).await;
+                            let res = linearizable_barrier(
+                                raft,
+                                &shard_id,
+                                &http,
+                                auth_token.as_deref(),
+                            )
+                            .await;
                             let _ = resp.send(res);
                         });
                     }
@@ -253,6 +267,7 @@ async fn replicate(
     group_id: &str,
     cmd: ShardCommand,
     http: &std::sync::OnceLock<reqwest::Client>,
+    auth_token: Option<&str>,
 ) -> WriteResult {
     // A stable id for this logical write, shared across every retry/forward
     // below, so the leader can dedup a re-forwarded write whose prior response
@@ -270,6 +285,7 @@ async fn replicate(
                 group_id,
                 &cmd,
                 &request_id,
+                auth_token,
             )
             .await
             {
@@ -299,12 +315,17 @@ async fn forward(
     group_id: &str,
     cmd: &ShardCommand,
     request_id: &str,
+    auth_token: Option<&str>,
 ) -> WriteResult {
     let url = format!("http://{addr}/raft/{group_id}/write");
-    let resp = http
+    let mut req = http
         .post(&url)
         .header(nodus_raftstore::server::REQUEST_ID_HEADER, request_id)
-        .json(cmd)
+        .json(cmd);
+    if let Some(token) = auth_token {
+        req = req.bearer_auth(token);
+    }
+    let resp = req
         .send()
         .await
         .map_err(|e| anyhow!("forward to {addr}: {e}"))?;
@@ -335,6 +356,7 @@ async fn linearizable_barrier(
     raft: Raft<NodusTypeConfig>,
     group_id: &str,
     http: &std::sync::OnceLock<reqwest::Client>,
+    auth_token: Option<&str>,
 ) -> Result<()> {
     for _ in 0..25 {
         match raft.ensure_linearizable().await {
@@ -346,8 +368,13 @@ async fn linearizable_barrier(
                 leader_node: Some(node),
                 ..
             }))) => {
-                match fetch_read_index(http.get_or_init(reqwest::Client::new), &node.addr, group_id)
-                    .await
+                match fetch_read_index(
+                    http.get_or_init(reqwest::Client::new),
+                    &node.addr,
+                    group_id,
+                    auth_token,
+                )
+                .await
                 {
                     Ok(Some(index)) => {
                         raft.wait(Some(BARRIER_WAIT))
@@ -387,10 +414,14 @@ async fn fetch_read_index(
     http: &reqwest::Client,
     addr: &str,
     group_id: &str,
+    auth_token: Option<&str>,
 ) -> Result<Option<u64>> {
     let url = format!("http://{addr}/raft/{group_id}/read_index");
-    let resp = http
-        .post(&url)
+    let mut req = http.post(&url);
+    if let Some(token) = auth_token {
+        req = req.bearer_auth(token);
+    }
+    let resp = req
         .send()
         .await
         .map_err(|e| anyhow!("read-index to {addr}: {e}"))?;

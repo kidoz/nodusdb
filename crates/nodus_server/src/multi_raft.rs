@@ -261,6 +261,12 @@ impl MultiRaftManager {
         self.node_id
     }
 
+    /// The admin bearer token, reused as the internode credential for peers
+    /// that serve Raft HTTP routes on their public listener.
+    pub(crate) fn auth_token(&self) -> Option<String> {
+        self.admin_token.clone()
+    }
+
     /// Durable directory for `shard_id`'s snapshots, or a unique temp dir when no
     /// data dir is configured (ephemeral / in-memory mode).
     fn group_snapshot_dir(&self, shard_id: &str) -> std::path::PathBuf {

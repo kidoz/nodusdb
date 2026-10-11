@@ -82,7 +82,17 @@ async fn node(
         .unwrap();
     let tls = crate::load_raft_tls_config(&cluster.tls).unwrap();
     let server = tokio::spawn(async move {
-        let app = raft_routes().with_state(state);
+        // Match production: mTLS listeners are transport-authenticated; the
+        // plain loopback fixture listener opts into unauthenticated access.
+        let auth = if tls.is_some() {
+            nodus_raftstore::server::RaftRouteAuth::TransportAuthenticated
+        } else {
+            nodus_raftstore::server::RaftRouteAuth::AdminToken {
+                token: None,
+                allow_insecure: true,
+            }
+        };
+        let app = raft_routes(auth).with_state(state);
         if let Some((cfg, _)) = tls {
             axum_server::from_tcp_rustls(
                 listener.into_std().unwrap(),

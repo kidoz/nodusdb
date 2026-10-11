@@ -417,9 +417,17 @@ async fn exercise_learner_snapshot(mvcc: bool) {
             .await
             .insert("shard-a".into(), raft.clone());
         servers.push(tokio::spawn(async move {
-            axum::serve(listener, raft_routes().with_state(state))
-                .await
-                .unwrap();
+            // Loopback fixture cluster: no credential on the Raft routes.
+            axum::serve(
+                listener,
+                raft_routes(nodus_raftstore::server::RaftRouteAuth::AdminToken {
+                    token: None,
+                    allow_insecure: true,
+                })
+                .with_state(state),
+            )
+            .await
+            .unwrap();
         }));
         stores.push(store);
         rafts.push(raft);

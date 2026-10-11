@@ -13,6 +13,16 @@ max_connections = 100
 node_id = 1
 raft_advertise_addr = "127.0.0.1:8088"
 join_peers = []
+# Optional dedicated listener for inter-node Raft RPCs. When set together with
+# [cluster.tls], peers authenticate by cluster-CA client certificate (mTLS).
+# When unset, Raft routes share the public HTTP listener and require the admin
+# bearer token (below) exactly like /api/v1/*.
+# raft_listen_addr = "127.0.0.1:8090"
+# [cluster.tls]
+# enabled = true
+# cert_path = "/etc/nodus/tls/node.crt"
+# key_path = "/etc/nodus/tls/node.key"
+# ca_path = "/etc/nodus/tls/ca.crt"
 
 [storage]
 # Required for durable data. If unset, nodusd uses in-memory storage.
@@ -30,6 +40,9 @@ password = "change-me"
 # The admin API falls back to the 'nodus' superuser when unauthenticated, so the
 # server refuses to start with a non-loopback http_addr and no token. Set a token
 # (below) or, only when the admin port is network-isolated, set allow_insecure.
+# This token also authenticates the internal /raft/* endpoints when they share
+# the public HTTP listener (no cluster.raft_listen_addr): internode RPCs and
+# forwarded writes attach it as a bearer token automatically.
 token = "change-me-admin-token"
 # allow_insecure = false
 

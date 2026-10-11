@@ -227,11 +227,15 @@ async fn test_cluster_partition_linearizability() {
                 .await
                 .insert("shard-meta".to_string(), raft);
 
-            let app = raft_routes()
-                .route("/test/init", post(init_cluster))
-                .route("/test/write", post(write_val))
-                .route("/test/read", get(read_val))
-                .with_state(raft_state);
+            // Loopback-only model-check fixture: no credential required.
+            let app = raft_routes(nodus_raftstore::server::RaftRouteAuth::AdminToken {
+                token: None,
+                allow_insecure: true,
+            })
+            .route("/test/init", post(init_cluster))
+            .route("/test/write", post(write_val))
+            .route("/test/read", get(read_val))
+            .with_state(raft_state);
 
             let listener = tokio::net::TcpListener::bind(addr)
                 .await

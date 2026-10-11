@@ -1,6 +1,7 @@
-use axum::extract::{Path, State};
-use axum::http::HeaderMap;
-use axum::response::IntoResponse;
+use axum::extract::{Path, Request, State};
+use axum::http::{HeaderMap, StatusCode};
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
 use openraft::Raft;
@@ -82,7 +83,76 @@ impl Default for RaftState {
     }
 }
 
-pub fn raft_routes() -> Router<RaftState> {
+/// How the Raft HTTP endpoints (`/raft/...`) authenticate callers. These
+/// endpoints carry inter-node consensus RPCs and forwarded client writes —
+/// including shard-map and transaction commands — so they must never be
+/// reachable anonymously on a listener that untrusted clients can reach.
+#[derive(Clone)]
+pub enum RaftRouteAuth {
+    /// The routes share a listener with admin/web traffic. Callers must present
+    /// `Authorization: Bearer <token>` matching the configured admin token —
+    /// the same credential the admin API accepts — so internode and forwarded
+    /// writes are authenticated with the cluster's shared secret. When no token
+    /// is configured, anonymous access is permitted only with the same explicit
+    /// `admin.allow_insecure` opt-in that opens the admin API; otherwise every
+    /// request is rejected (mirroring the admin API, which is also unusable in
+    /// that configuration, so no working deployment regressions).
+    AdminToken {
+        token: Option<Arc<str>>,
+        allow_insecure: bool,
+    },
+    /// The routes are served on a dedicated peer listener whose transport
+    /// already authenticates callers: `cluster.tls` mandates a client
+    /// certificate signed by the cluster CA, so the TLS handshake itself is the
+    /// peer credential. Bearer tokens are not required here — mixed-version
+    /// clusters during a rolling upgrade include older binaries that present
+    /// their certificate but no token, and rejecting them would break Raft
+    /// mid-upgrade.
+    TransportAuthenticated,
+}
+
+/// Constant-time bearer-token comparison (avoids timing oracles on the token).
+fn bearer_token_matches(provided: &str, expected: &str) -> bool {
+    let (a, b) = (provided.as_bytes(), expected.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+async fn require_raft_auth(
+    State(auth): State<RaftRouteAuth>,
+    req: Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    match &auth {
+        RaftRouteAuth::TransportAuthenticated => Ok(next.run(req).await),
+        RaftRouteAuth::AdminToken {
+            token,
+            allow_insecure,
+        } => {
+            if let Some(expected) = token {
+                let ok = req
+                    .headers()
+                    .get(axum::http::header::AUTHORIZATION)
+                    .and_then(|h| h.to_str().ok())
+                    .and_then(|h| h.strip_prefix("Bearer "))
+                    .is_some_and(|bearer| bearer_token_matches(bearer, expected));
+                if ok {
+                    Ok(next.run(req).await)
+                } else {
+                    Err(StatusCode::UNAUTHORIZED)
+                }
+            } else if *allow_insecure {
+                Ok(next.run(req).await)
+            } else {
+                Err(StatusCode::UNAUTHORIZED)
+            }
+        }
+    }
+}
+
+pub fn raft_routes(auth: RaftRouteAuth) -> Router<RaftState> {
     Router::new()
         .route("/raft/capabilities/v1", post(capabilities))
         .route("/raft/{shard_id}/vote", post(vote))
@@ -90,6 +160,10 @@ pub fn raft_routes() -> Router<RaftState> {
         .route("/raft/{shard_id}/snapshot", post(snapshot))
         .route("/raft/{shard_id}/write", post(write))
         .route("/raft/{shard_id}/read_index", post(read_index))
+        .route_layer(axum::middleware::from_fn_with_state(
+            auth,
+            require_raft_auth,
+        ))
 }
 
 async fn capabilities(

@@ -23,7 +23,9 @@ Status uses a leader ReadIndex barrier and reads durable state directly. Followe
 return an actionable error; send upgrade operations to the meta leader. The old
 in-memory coordinator is no longer part of server or state-machine wiring.
 Legacy `UpgradeStart`/node-name/finalize commands cannot activate features, and
-all upgrade commands are rejected by generic `/raft/{group}/write` ingress.
+all upgrade commands are rejected by generic `/raft/{group}/write` ingress —
+which itself requires the admin bearer token on the public listener, or a
+cluster-CA client certificate on the dedicated peer listener.
 The authorized admin service submits directly to its verified local leader.
 
 The leader probes every voter and learner at its applied membership address.

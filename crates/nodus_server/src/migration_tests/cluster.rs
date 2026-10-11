@@ -1,7 +1,16 @@
 use super::*;
-use nodus_raftstore::server::{NodusRaft, RaftState, raft_routes};
+use nodus_raftstore::server::{NodusRaft, RaftRouteAuth, RaftState, raft_routes};
 use std::collections::BTreeMap;
 use std::time::Duration;
+
+/// Test fixtures serve the Raft routes without a credential: they bind
+/// loopback-only ephemeral ports and never mix with production wiring.
+fn test_raft_routes() -> axum::Router<RaftState> {
+    raft_routes(RaftRouteAuth::AdminToken {
+        token: None,
+        allow_insecure: true,
+    })
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fence_replicates_over_tcp_and_survives_leader_failure() {
@@ -43,7 +52,7 @@ async fn fence_replicates_over_tcp_and_survives_leader_failure() {
             .await
             .insert("fixture".into(), raft.clone());
         servers.push(tokio::spawn(async move {
-            axum::serve(listener, raft_routes().with_state(state))
+            axum::serve(listener, test_raft_routes().with_state(state))
                 .await
                 .unwrap();
         }));
@@ -262,7 +271,7 @@ async fn coordinator_journal_resumes_on_new_tcp_leader_without_acquire_ack() {
             .await
             .insert("shard-meta".into(), raft.clone());
         servers.push(tokio::spawn(async move {
-            axum::serve(listener, raft_routes().with_state(state))
+            axum::serve(listener, test_raft_routes().with_state(state))
                 .await
                 .unwrap();
         }));

@@ -29,7 +29,8 @@ use tempfile::TempDir;
 use tokio::net::{TcpListener, TcpSocket};
 use tokio::sync::watch;
 
-/// Shared admin token; joining nodes present it as a bearer token to the seed.
+/// Shared admin token; joining nodes present it as a bearer token to the seed,
+/// and it authenticates the internal `/raft/...` ingress on the public listener.
 pub const ADMIN_TOKEN: &str = "cluster-test-token";
 
 /// Reserves a currently-free loopback port (bind ephemeral with `SO_REUSEADDR`,
@@ -272,6 +273,27 @@ impl ClusterFixture {
             .http
             .post(url)
             .bearer_auth(ADMIN_TOKEN)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    }
+
+    /// Authenticated admin `POST` with a JSON body to node `idx`, returning the
+    /// JSON body.
+    pub async fn admin_post_json(
+        &self,
+        idx: usize,
+        path: &str,
+        body: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let url = format!("http://{}{}", self.nodes[idx].http_addr(), path);
+        Ok(self
+            .http
+            .post(url)
+            .bearer_auth(ADMIN_TOKEN)
+            .json(&body)
             .send()
             .await?
             .error_for_status()?

@@ -20,6 +20,25 @@ rejected at startup unless `allow_insecure` is set explicitly.
 An invalid token, an undecodable Basic header, or credentials that fail
 authentication all return `401 Unauthorized`.
 
+## Internal Raft routes (`/raft/...`)
+
+The inter-node Raft endpoints (consensus RPCs, forwarded writes, read-index
+probes) are authenticated too, because a forwarded write can carry shard-map
+and transaction commands:
+
+- When `cluster.raft_listen_addr` is **unset** (the default), the Raft routes
+  share the public HTTP listener and require the admin bearer token — the same
+  credential as `/api/v1/*`. Internode RPCs and forwarded writes attach it
+  automatically. With no token configured, anonymous Raft access is possible
+  only under the same explicit `[admin] allow_insecure = true` opt-in that
+  opens the admin API; otherwise every Raft request is refused with `401`.
+- When `cluster.raft_listen_addr` **is** set, the dedicated peer listener
+  speaks mandatory client-certificate mTLS (`cluster.tls`), and the
+  cluster-CA-signed certificate is the peer credential — no bearer token is
+  required there, so rolling upgrades that mix with older binaries (which
+  present certificates but no token) keep working. A dedicated listener
+  *without* `cluster.tls` falls back to the bearer-token requirement above.
+
 The configured bootstrap password (`admin.password`) is an operator credential
 for `nodus`, shared by SQL SCRAM authentication and HTTP Basic authentication.
 New logins resolve the current catalog identity only if it is an active global

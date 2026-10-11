@@ -17,6 +17,10 @@ pub struct RaftTransport {
     scheme: Arc<str>,
     check_snapshots: bool,
     admission_source: Option<Arc<dyn nodus_storage_api::KvEngine>>,
+    /// Bearer token attached to every outbound Raft HTTP RPC. Peers serving the
+    /// routes on their public listener require it (the admin token doubles as
+    /// the cluster's shared secret); mTLS-only peer listeners ignore it.
+    auth_token: Option<Arc<str>>,
 }
 
 /// The outbound HTTP client behind a [`RaftTransport`].
@@ -48,6 +52,20 @@ impl RaftTransport {
         self.admission_source = Some(kv);
         self
     }
+
+    /// Attach a bearer token to every outbound Raft RPC (see the field docs).
+    pub fn with_auth_token(mut self, token: Option<String>) -> Self {
+        self.auth_token = token.map(Into::into);
+        self
+    }
+
+    /// Applies the configured bearer credential to an outbound request.
+    fn authorize(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.auth_token {
+            Some(token) => req.bearer_auth(token),
+            None => req,
+        }
+    }
     fn requires_admission_reader(&self) -> anyhow::Result<bool> {
         self.admission_source.as_ref().map_or(Ok(false), |kv| {
             Ok(crate::upgrade::admission::read(kv.as_ref())?.is_some())
@@ -72,8 +90,7 @@ impl RaftTransport {
             "remote upgrade verification requires peer mTLS"
         );
         let mut response = self
-            .client()
-            .post(format!("https://{addr}/raft/capabilities/v1"))
+            .authorize(self.client().post(format!("https://{addr}/raft/capabilities/v1")))
             .timeout(std::time::Duration::from_secs(3))
             .json(&crate::upgrade::ProbeV1 {
                 challenge,
@@ -102,6 +119,7 @@ impl RaftTransport {
             scheme: Arc::from("http"),
             check_snapshots: false,
             admission_source: None,
+            auth_token: None,
         }
     }
 
@@ -113,6 +131,7 @@ impl RaftTransport {
             scheme: scheme.into(),
             check_snapshots: false,
             admission_source: None,
+            auth_token: None,
         }
     }
 
@@ -175,8 +194,8 @@ impl RaftNetwork<NodusTypeConfig> for NodusNetwork {
             self.scheme, self.target_node.addr, self.shard_id
         );
         let resp = self
-            .client
-            .post(url)
+            .transport
+            .authorize(self.client.post(url))
             .json(&rpc)
             .send()
             .await
@@ -239,8 +258,8 @@ impl RaftNetwork<NodusTypeConfig> for NodusNetwork {
             self.scheme, self.target_node.addr, self.shard_id
         );
         let resp = self
-            .client
-            .post(url)
+            .transport
+            .authorize(self.client.post(url))
             .json(&rpc)
             .send()
             .await
@@ -264,8 +283,8 @@ impl RaftNetwork<NodusTypeConfig> for NodusNetwork {
             self.scheme, self.target_node.addr, self.shard_id
         );
         let resp = self
-            .client
-            .post(url)
+            .transport
+            .authorize(self.client.post(url))
             .json(&rpc)
             .send()
             .await

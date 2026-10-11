@@ -338,6 +338,17 @@ fn build_raft_transport(
     ))
 }
 
+/// The auth policy for Raft HTTP routes when they are reachable without
+/// transport-level peer authentication (the shared public listener, or a
+/// dedicated listener without `cluster.tls`): the admin bearer token, with the
+/// same explicit `allow_insecure` opt-out as the admin API.
+fn raft_route_auth(config: &NodusConfig) -> nodus_raftstore::server::RaftRouteAuth {
+    nodus_raftstore::server::RaftRouteAuth::AdminToken {
+        token: config.admin.token.clone().map(Into::into),
+        allow_insecure: config.admin.allow_insecure,
+    }
+}
+
 /// Starts the server with default configuration.
 pub async fn run_server(
     pgwire_listener: TcpListener,
@@ -486,10 +497,13 @@ pub async fn run_server_with_config(
     ))?);
 
     // Outbound Raft transport: plain HTTP, or an mTLS `https` client when
-    // inter-node TLS is configured.
+    // inter-node TLS is configured. The admin token is attached as a bearer
+    // credential so peers that serve Raft RPCs on their public listener accept
+    // them (mTLS peer listeners authenticate via the client certificate).
     let raft_transport = build_raft_transport(&config.cluster)?
         .with_snapshot_checks()
-        .with_admission_source(local_kv.clone());
+        .with_admission_source(local_kv.clone())
+        .with_auth_token(config.admin.token.clone());
     let authority = nodus_raftstore::upgrade::read(local_kv.as_ref())?;
     let admissions = nodus_raftstore::upgrade::admission::read(local_kv.as_ref())?;
     nodus_raftstore::upgrade::admission::approved(&authority, admissions.as_ref())?;
@@ -1037,7 +1051,12 @@ pub async fn run_server_with_config(
         .merge(admin_routes(admin_state))
         .merge(nodus_web_console::web_console_routes());
     if raft_listen_addr.is_none() {
-        app = app.merge(nodus_raftstore::server::raft_routes().with_state(raft_state.clone()));
+        // On the shared listener the Raft endpoints are reachable by anything
+        // that can reach the admin API, so they require the same credential.
+        app = app.merge(
+            nodus_raftstore::server::raft_routes(raft_route_auth(&config))
+                .with_state(raft_state.clone()),
+        );
     }
     let app = app.layer(cors);
 
@@ -1048,9 +1067,17 @@ pub async fn run_server_with_config(
         let raft_tls = load_raft_tls_config(&config.cluster.tls)?;
         raft_tls_resolver = raft_tls.as_ref().map(|(_, resolver)| resolver.clone());
         let raft_server_config = raft_tls.map(|(cfg, _)| cfg);
+        // With mTLS the TLS handshake (cluster-CA client certificate) is the
+        // peer credential; without it the listener falls back to the same
+        // bearer-token requirement as the public app.
+        let raft_auth = if raft_server_config.is_some() {
+            nodus_raftstore::server::RaftRouteAuth::TransportAuthenticated
+        } else {
+            raft_route_auth(&config)
+        };
         let raft_listener = TcpListener::bind(&addr).await?;
-        let raft_app =
-            Router::new().merge(nodus_raftstore::server::raft_routes().with_state(raft_state));
+        let raft_app = Router::new()
+            .merge(nodus_raftstore::server::raft_routes(raft_auth).with_state(raft_state));
         let mut raft_shutdown = shutdown.clone();
         tracing::info!(
             "Raft peer listener on {} (mTLS: {})",
@@ -1335,13 +1362,17 @@ mod tests {
             ..Default::default()
         };
 
-        // Server: serve the Raft routes with mandatory client-cert mTLS.
+        // Server: serve the Raft routes with mandatory client-cert mTLS. The
+        // certificate is the peer credential on this listener, so the routes
+        // run in transport-authenticated mode (no bearer token required).
         let (server_cfg, _resolver) = load_raft_tls_config(&cluster.tls).unwrap().unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let app = Router::new().merge(
-            nodus_raftstore::server::raft_routes()
-                .with_state(nodus_raftstore::server::RaftState::new()),
+            nodus_raftstore::server::raft_routes(
+                nodus_raftstore::server::RaftRouteAuth::TransportAuthenticated,
+            )
+            .with_state(nodus_raftstore::server::RaftState::new()),
         );
         let tls_config = axum_server::tls_rustls::RustlsConfig::from_config(server_cfg);
         tokio::spawn(async move {
@@ -1384,6 +1415,86 @@ mod tests {
         assert!(
             no_cert_client.post(&url).json(&body).send().await.is_err(),
             "a peer without a client certificate must be rejected"
+        );
+    }
+
+    /// Raft routes on a non-mTLS listener require the admin bearer token: no
+    /// token and wrong tokens get 401, the right token reaches the handler
+    /// (unknown shard → 404), and anonymous access works only under the
+    /// explicit `allow_insecure` opt-in.
+    #[tokio::test]
+    async fn raft_routes_require_admin_bearer_token() {
+        use nodus_raftstore::server::{RaftRouteAuth, RaftState, raft_routes};
+        let body = serde_json::json!({
+            "vote": {"leader_id": {"term": 1, "node_id": 1}, "committed": false},
+            "last_log_id": null
+        });
+        let serve = |auth: RaftRouteAuth| async move {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let app = Router::new().merge(raft_routes(auth).with_state(RaftState::new()));
+            tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+            addr
+        };
+
+        let addr = serve(RaftRouteAuth::AdminToken {
+            token: Some("t0ken".into()),
+            allow_insecure: false,
+        })
+        .await;
+        let url = format!("http://{addr}/raft/shard-meta/vote");
+        let http = reqwest::Client::new();
+        assert_eq!(
+            http.post(&url).json(&body).send().await.unwrap().status(),
+            reqwest::StatusCode::UNAUTHORIZED,
+            "anonymous raft RPC must be rejected"
+        );
+        assert_eq!(
+            http.post(&url)
+                .bearer_auth("wrong")
+                .json(&body)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            http.post(&url)
+                .bearer_auth("t0ken")
+                .json(&body)
+                .send()
+                .await
+                .unwrap()
+            .status(),
+            reqwest::StatusCode::NOT_FOUND,
+            "authenticated request reaches the handler (unknown shard)"
+        );
+
+        // No token configured and no insecure opt-in: still denied.
+        let addr = serve(RaftRouteAuth::AdminToken {
+            token: None,
+            allow_insecure: false,
+        })
+        .await;
+        let url = format!("http://{addr}/raft/shard-meta/vote");
+        assert_eq!(
+            http.post(&url).json(&body).send().await.unwrap().status(),
+            reqwest::StatusCode::UNAUTHORIZED
+        );
+
+        // Explicit opt-in mirrors the admin API's anonymous-superuser escape.
+        let addr = serve(RaftRouteAuth::AdminToken {
+            token: None,
+            allow_insecure: true,
+        })
+        .await;
+        let url = format!("http://{addr}/raft/shard-meta/vote");
+        assert_eq!(
+            http.post(&url).json(&body).send().await.unwrap().status(),
+            reqwest::StatusCode::NOT_FOUND
         );
     }
 

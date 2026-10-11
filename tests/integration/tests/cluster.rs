@@ -36,6 +36,9 @@ async fn seed_shard_fixture(cluster: &ClusterFixture, table: &str) {
     ] {
         let response: serde_json::Value = http
             .post(&url)
+            // The internal Raft ingress requires the cluster credential, same
+            // as the admin API on the shared listener.
+            .bearer_auth(nodus_testkit::cluster::ADMIN_TOKEN)
             .json(&command)
             .send()
             .await
