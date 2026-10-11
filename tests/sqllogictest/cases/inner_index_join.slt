@@ -1,0 +1,162 @@
+# Inner index scans: when a nested loop's inner relation is a plain base
+# table and the join's equality pairs an outer value with an indexed
+# column of it, the inner side is read per outer row through that index
+# — the equality moves from the `Join Filter` to the `Index Cond`, and
+# each side's own conditions sit on its scan. PostgreSQL plans the same
+# shape when it keeps the scanned table inside; it costs the join order
+# and the inner access, so it may instead flip the join (`b1` scanned
+# outside, `s1` materialized inside), read a parameterized bitmap, or
+# show an `Index Only Scan` for a covered inner — NodusDB reads the
+# inner with an index scan. A single-relation WHERE conjunct stays on
+# the join in NodusDB where PostgreSQL pushes it to the scan. Plans and
+# results otherwise from PostgreSQL 18.4, with `enable_hashjoin` and
+# `enable_mergejoin` off.
+
+statement ok
+drop table if exists s1 cascade;
+
+statement ok
+drop table if exists b1 cascade;
+
+statement ok
+create table s1 (a int, tag text);
+
+statement ok
+create table b1 (a int, b text);
+
+statement ok
+insert into s1 values (1, 'p'), (2, 'q'), (3, 'r');
+
+statement ok
+insert into b1 select g % 40, 'r' || (g % 5) from generate_series(1, 500) g;
+
+statement ok
+create index b1_a on b1 (a);
+
+statement ok
+analyze s1;
+
+statement ok
+analyze b1;
+
+statement ok
+set enable_hashjoin = off;
+
+statement ok
+set enable_mergejoin = off;
+
+# The inner side is read through its index, per outer row.
+query T
+explain (costs off) select * from s1 join b1 x on s1.a = x.a;
+----
+Nested Loop
+  ->  Seq Scan on s1
+  ->  Index Scan using b1_a on b1 x
+        Index Cond: (a = s1.a)
+
+
+# Either operand order names the index column first.
+query T
+explain (costs off) select * from s1 join b1 x on x.a = s1.a;
+----
+Nested Loop
+  ->  Seq Scan on s1
+  ->  Index Scan using b1_a on b1 x
+        Index Cond: (a = s1.a)
+
+
+# The outer side's own conditions sit on its scan. (PostgreSQL places
+# them the same way but reads the inner with a parameterized bitmap
+# here, by cost.)
+query T
+explain (costs off) select * from s1 join b1 x on s1.a = x.a and s1.tag <> 'zz';
+----
+Nested Loop
+  ->  Seq Scan on s1
+        Filter: (tag <> 'zz'::text)
+  ->  Index Scan using b1_a on b1 x
+        Index Cond: (a = s1.a)
+
+
+# A left join reads the inner side the same way.
+query T
+explain (costs off) select * from s1 left join b1 x on s1.a = x.a;
+----
+Nested Loop Left Join
+  ->  Seq Scan on s1
+  ->  Index Scan using b1_a on b1 x
+        Index Cond: (a = s1.a)
+
+
+query T
+select count(*) from s1 join b1 x on s1.a = x.a;
+----
+39
+
+
+# The inner side's own condition decides which looked-up rows match.
+query T
+select count(*) from s1 join b1 x on s1.a = x.a and x.b = 'r1';
+----
+13
+
+
+# A condition naming both sides is checked on each matched pair.
+query T
+select count(*) from s1 join b1 x on s1.a = x.a and s1.tag <> x.b;
+----
+39
+
+
+# A lookup keeps the join layout for a second, chained join.
+query T
+select count(*) from s1 join b1 x on s1.a = x.a join b1 y on x.a = y.a;
+----
+507
+
+
+statement ok
+insert into s1 values (99, 'z');
+
+# An outer row with no match is filled with NULLs.
+query T
+select s1.a, x.b from s1 left join b1 x on s1.a = x.a where s1.a = 99;
+----
+99	NULL
+
+
+query T
+select count(*) from s1 left join b1 x on s1.a = x.a and x.b = 'r1';
+----
+16
+
+
+query T
+select count(*) from s1 join b1 x on s1.a = x.a where x.b = 'r1';
+----
+13
+
+
+query T
+select s1.a, x.a, x.b from s1 join b1 x on s1.a = x.a where s1.a = 2 and x.b = 'r2' order by 3;
+----
+2	2	r2
+2	2	r2
+2	2	r2
+2	2	r2
+2	2	r2
+2	2	r2
+2	2	r2
+2	2	r2
+2	2	r2
+2	2	r2
+2	2	r2
+2	2	r2
+2	2	r2
+
+
+statement ok
+reset enable_hashjoin;
+
+statement ok
+reset enable_mergejoin;
