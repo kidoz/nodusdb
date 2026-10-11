@@ -93,7 +93,9 @@ clusters/{cluster_id}/
 7. A protected timestamp is registered before MVCC data is exported and stays
    active until the backup completes, or fails and is cleaned up.
 8. MVCC garbage collection and WAL cleanup consult retained restore points
-   before deleting versions or segments.
+   before deleting versions or segments. Both fail closed: an unreadable
+   backup repository pins the GC watermark at 0 (unreadable manifests) or
+   skips the GC tick entirely (repository error), never "no protection".
 9. An incremental backup fails if the parent chain is incomplete, the parent is
    not complete, or required MVCC history is gone.
 10. Restore defaults to a fresh data directory or a new cluster timeline.

@@ -588,6 +588,19 @@ struct ManifestTemplate {
     status: BackupStatus,
 }
 
+/// Outcome of scanning the repository for final manifests.
+#[derive(Debug, Default)]
+struct ManifestScan {
+    /// Manifests that decode, are `Completed`, and reference present objects.
+    completed: Vec<BackupManifest>,
+    /// Backup ids whose `manifest.json` is undecodable, carries an
+    /// unsupported version, or references missing objects. Such a manifest
+    /// may still anchor a restore point, so protection paths (GC watermark,
+    /// WAL cleanup, dependent-child deletion) must treat it as protective
+    /// rather than silently dropping it.
+    unreadable: Vec<String>,
+}
+
 /// Drives backups and restores against a [`BackupRepository`], writing a
 /// versioned manifest and per-file SHA-256 checksums. The manifest is only
 /// marked `Completed` after every object and the manifest itself are durably
@@ -898,7 +911,10 @@ impl BackupOrchestrator {
     /// every selected archived WAL object, and rejects gaps in the indexed WAL
     /// segment sequence needed for replay.
     pub async fn plan_pitr_restore(&self, target_ts: u64) -> Result<PitrRestorePlan> {
-        let manifests = self.completed_manifests().await?;
+        // Restore planning uses listing semantics: only decodable COMPLETE
+        // manifests are eligible base backups; unreadable manifests are
+        // logged by the scan and cannot serve as a restore base.
+        let manifests = self.scan_manifests().await?.completed;
         let base = manifests
             .iter()
             .filter(|manifest| manifest.snapshot_ts <= target_ts)
@@ -1294,8 +1310,22 @@ impl BackupOrchestrator {
     }
 
     /// Deletes a backup's manifest and associated data files.
+    ///
+    /// Fails closed: while any manifest in the repository is unreadable
+    /// (undecodable, unsupported version, or referencing missing objects) the
+    /// dependency graph cannot be computed, so deletion of any backup is
+    /// denied rather than risking a parent that a retained restore point
+    /// still needs.
     pub async fn delete_backup(&self, backup_id: &str) -> Result<()> {
-        for manifest in self.completed_manifests().await? {
+        let scan = self.scan_manifests().await?;
+        if !scan.unreadable.is_empty() {
+            anyhow::bail!(
+                "cannot delete backup {backup_id}; {} unreadable manifest(s) may still depend on it: {}",
+                scan.unreadable.len(),
+                scan.unreadable.join(", ")
+            );
+        }
+        for manifest in scan.completed {
             if manifest.parent_backup_id.as_deref() == Some(backup_id) {
                 anyhow::bail!(
                     "cannot delete backup {backup_id}; retained backup {} depends on it",
@@ -1311,35 +1341,84 @@ impl BackupOrchestrator {
         Ok(())
     }
 
-    /// Lists the ids of backups that have a manifest in the repository.
+    /// Lists the ids of backups that have a decodable COMPLETE manifest with
+    /// all referenced objects present. Manifests that fail these checks are
+    /// skipped here (and logged by `scan_manifests`); the protection paths
+    /// below treat them as protective instead.
     pub async fn list_backups(&self) -> Result<Vec<String>> {
-        let mut backups = Vec::new();
-        for manifest in self.completed_manifests().await? {
-            backups.push(manifest.backup_id);
-        }
-        Ok(backups)
+        let scan = self.scan_manifests().await?;
+        Ok(scan
+            .completed
+            .into_iter()
+            .map(|manifest| manifest.backup_id)
+            .collect())
     }
 
-    async fn completed_manifests(&self) -> Result<Vec<BackupManifest>> {
+    /// Scans the repository for final manifests, separating decodable
+    /// COMPLETE manifests from anything unreadable. Callers that decide
+    /// whether data may be reclaimed or deleted must fail closed on
+    /// `scan.unreadable` — matching the LSM engine's posture of refusing to
+    /// advance on an unreadable manifest.
+    async fn scan_manifests(&self) -> Result<ManifestScan> {
         let objects = self.repo.list_objects("").await?;
-        let mut manifests = Vec::new();
+        let mut scan = ManifestScan::default();
         for object in objects {
-            if let Some(backup_id) = object.key.strip_suffix("/manifest.json")
-                && let Ok(manifest) = self.load_manifest(backup_id).await
-                && manifest.status == BackupStatus::Completed
-            {
-                manifests.push(manifest);
+            let Some(backup_id) = object.key.strip_suffix("/manifest.json") else {
+                continue;
+            };
+            match self.load_manifest(backup_id).await {
+                Ok(manifest) if manifest.status != BackupStatus::Completed => {}
+                Ok(manifest) => {
+                    if self.manifest_files_present(&manifest).await? {
+                        scan.completed.push(manifest);
+                    } else {
+                        tracing::warn!(
+                            backup_id = %manifest.backup_id,
+                            "backup manifest references missing objects; treating as protective"
+                        );
+                        scan.unreadable.push(manifest.backup_id.clone());
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        backup_id,
+                        %error,
+                        "unreadable backup manifest; treating as protective"
+                    );
+                    scan.unreadable.push(backup_id.to_string());
+                }
             }
         }
-        Ok(manifests)
+        Ok(scan)
+    }
+
+    /// Lightweight presence check for a manifest's recorded files. Unlike
+    /// `verify_manifest_files` this does not read or checksum object bytes, so
+    /// it is cheap enough to run on protection-path scans.
+    async fn manifest_files_present(&self, manifest: &BackupManifest) -> Result<bool> {
+        for key in &manifest.files {
+            if !self.repo.object_exists(key).await? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// Returns the oldest backup snapshot that still protects MVCC history for
     /// future incrementals. Runtime GC must not advance beyond this timestamp.
+    ///
+    /// Fails closed: if any manifest is unreadable it may anchor a restore
+    /// point at an unknown timestamp, so the watermark is pinned at 0 (GC
+    /// reclaims nothing). This stays `Ok(Some(0))` rather than an error; the
+    /// server's GC loop additionally treats an `Err` from this call as "do
+    /// not advance GC this tick" rather than "no protection".
     pub async fn protected_gc_watermark(&self) -> Result<Option<u64>> {
-        Ok(self
-            .completed_manifests()
-            .await?
+        let scan = self.scan_manifests().await?;
+        if !scan.unreadable.is_empty() {
+            return Ok(Some(0));
+        }
+        Ok(scan
+            .completed
             .into_iter()
             .filter_map(|manifest| manifest.protected_timestamp.map(|_| manifest.snapshot_ts))
             .min())
@@ -1347,13 +1426,19 @@ impl BackupOrchestrator {
 
     /// Local WAL segment deletion is unsafe until WAL archive indexes can prove
     /// no retained restore point needs a segment. Archiving may continue, but
-    /// cleanup should wait while any completed backup is retained.
+    /// cleanup should wait while any completed backup is retained or any
+    /// manifest is unreadable (it may still anchor a restore point).
     pub async fn wal_cleanup_allowed(&self) -> Result<bool> {
-        Ok(self.completed_manifests().await?.is_empty())
+        let scan = self.scan_manifests().await?;
+        Ok(scan.completed.is_empty() && scan.unreadable.is_empty())
     }
 
     pub async fn wal_segment_cleanup_allowed(&self, filename: &str) -> Result<bool> {
-        let completed = self.completed_manifests().await?;
+        let scan = self.scan_manifests().await?;
+        if !scan.unreadable.is_empty() {
+            return Ok(false);
+        }
+        let completed = scan.completed;
         if completed.is_empty() {
             return Ok(true);
         }
@@ -2158,6 +2243,159 @@ mod tests {
         assert!(orch.wal_segment_cleanup_allowed("2.log").await.unwrap());
         assert!(orch.wal_segment_cleanup_allowed("3.log").await.unwrap());
         assert!(orch.wal_segment_cleanup_allowed("4.log").await.unwrap());
+    }
+
+    /// Builds a repository holding one healthy completed backup whose WAL
+    /// segment "1.log" is provably reclaimable, then plants `bad_bytes` as
+    /// `bad-id/manifest.json` and asserts every protection path fails closed.
+    async fn assert_unreadable_manifest_fails_closed(bad_bytes: Bytes) {
+        let repo: Arc<dyn BackupRepository> = Arc::new(MemBackupRepository::new());
+        let orch = BackupOrchestrator::new(repo.clone());
+
+        let full = orch
+            .create_full_backup(
+                "cluster-1",
+                10,
+                1,
+                1,
+                vec![BackupObject {
+                    name: "kv_data.json".into(),
+                    bytes: Bytes::from("full"),
+                }],
+            )
+            .await
+            .unwrap();
+        orch.archive_wal_indexed(
+            "1.log",
+            Bytes::from("before"),
+            vec!["before-txn".into()],
+            vec![WalCommittedTxn {
+                txn_id: "before-txn".into(),
+                commit_ts: 5,
+            }],
+            Some(0),
+        )
+        .await
+        .unwrap();
+
+        // Baseline: with only healthy manifests the segment is reclaimable.
+        assert!(orch.wal_segment_cleanup_allowed("1.log").await.unwrap());
+        assert_eq!(orch.protected_gc_watermark().await.unwrap(), Some(10));
+
+        repo.put_object("bad-id/manifest.json", bad_bytes, PutOptions::default())
+            .await
+            .unwrap();
+
+        // (a) The bad manifest is not listed; the healthy one still is.
+        let listed = orch.list_backups().await.unwrap();
+        assert_eq!(listed, vec![full.backup_id.clone()]);
+
+        // (b) WAL segment cleanup is denied.
+        assert!(!orch.wal_segment_cleanup_allowed("1.log").await.unwrap());
+        assert!(!orch.wal_cleanup_allowed().await.unwrap());
+
+        // (c) Deleting any backup is denied while the dependency graph
+        // cannot be computed.
+        assert!(orch.delete_backup(&full.backup_id).await.is_err());
+        assert!(orch.delete_backup("bad-id").await.is_err());
+
+        // (d) The GC watermark clamps to 0 (reclaim nothing) instead of
+        // advancing past the unknown restore point.
+        assert_eq!(orch.protected_gc_watermark().await.unwrap(), Some(0));
+    }
+
+    fn completed_manifest_template(backup_id: &str) -> BackupManifest {
+        BackupManifest {
+            manifest_version: CURRENT_MANIFEST_VERSION,
+            repository_layout_version: CURRENT_REPOSITORY_LAYOUT_VERSION,
+            object_format_version: CURRENT_OBJECT_FORMAT_VERSION,
+            backup_id: backup_id.to_string(),
+            cluster_id: "c".to_string(),
+            timeline_id: DEFAULT_TIMELINE_ID.to_string(),
+            backup_type: BackupType::Full,
+            parent_backup_id: None,
+            started_at: Utc::now(),
+            completed_at: Some(Utc::now()),
+            snapshot_ts: 1,
+            backup_ts: 1,
+            catalog_version: 1,
+            cluster_version: 1,
+            wal_start: None,
+            wal_end: None,
+            files: Vec::new(),
+            checksums: HashMap::new(),
+            compression: None,
+            encryption: None,
+            restore_validation: None,
+            protected_timestamp: None,
+            repository_capabilities: RepositoryCapabilities::default(),
+            status: BackupStatus::Completed,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_garbage_manifest_fails_closed() {
+        assert_unreadable_manifest_fails_closed(Bytes::from_static(b"\xff\xfe not json")).await;
+    }
+
+    #[tokio::test]
+    async fn test_wrong_schema_manifest_fails_closed() {
+        let bytes = Bytes::from(serde_json::to_vec(&serde_json::json!({"not": "a manifest"})).unwrap());
+        assert_unreadable_manifest_fails_closed(bytes).await;
+    }
+
+    #[tokio::test]
+    async fn test_newer_version_manifest_fails_closed() {
+        let mut manifest = completed_manifest_template("bad-id");
+        manifest.manifest_version = CURRENT_MANIFEST_VERSION + 1;
+        let bytes = Bytes::from(serde_json::to_vec(&manifest).unwrap());
+        assert_unreadable_manifest_fails_closed(bytes).await;
+    }
+
+    #[tokio::test]
+    async fn test_manifest_with_missing_objects_fails_closed() {
+        let mut manifest = completed_manifest_template("bad-id");
+        manifest.files = vec!["bad-id/data/missing.bin".to_string()];
+        manifest
+            .checksums
+            .insert("bad-id/data/missing.bin".to_string(), "abc".to_string());
+        let bytes = Bytes::from(serde_json::to_vec(&manifest).unwrap());
+        assert_unreadable_manifest_fails_closed(bytes).await;
+    }
+
+    #[tokio::test]
+    async fn test_protection_recovers_once_unreadable_manifest_removed() {
+        let repo: Arc<dyn BackupRepository> = Arc::new(MemBackupRepository::new());
+        let orch = BackupOrchestrator::new(repo.clone());
+
+        let full = orch
+            .create_full_backup(
+                "cluster-1",
+                10,
+                1,
+                1,
+                vec![BackupObject {
+                    name: "kv_data.json".into(),
+                    bytes: Bytes::from("full"),
+                }],
+            )
+            .await
+            .unwrap();
+        repo.put_object(
+            "bad-id/manifest.json",
+            Bytes::from_static(b"garbage"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(orch.protected_gc_watermark().await.unwrap(), Some(0));
+        assert!(orch.delete_backup(&full.backup_id).await.is_err());
+
+        repo.delete_object("bad-id/manifest.json").await.unwrap();
+        assert_eq!(orch.protected_gc_watermark().await.unwrap(), Some(10));
+        orch.delete_backup(&full.backup_id).await.unwrap();
+        assert_eq!(orch.protected_gc_watermark().await.unwrap(), None);
+        assert!(orch.wal_cleanup_allowed().await.unwrap());
     }
 
     #[tokio::test]

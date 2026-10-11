@@ -855,7 +855,19 @@ pub async fn run_server_with_config(
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
-                    let protected = gc_backup.protected_gc_watermark().await.ok().flatten();
+                    // Fail closed: an unreadable backup repository must not
+                    // collapse to `None` ("no protection"), or GC could reclaim
+                    // versions a retained restore point still needs. Skip the
+                    // tick instead; the next tick retries.
+                    let protected = match gc_backup.protected_gc_watermark().await {
+                        Ok(watermark) => watermark,
+                        Err(error) => {
+                            tracing::warn!(
+                                "backup repository unreadable; skipping GC tick: {error}"
+                            );
+                            continue;
+                        }
+                    };
                     if let Ok(reclaimed) = gc_executor.run_gc_with_protected_watermark(protected)
                         && reclaimed > 0
                     {
