@@ -30,7 +30,7 @@ use tokio::net::{TcpListener, TcpSocket};
 use tokio::sync::watch;
 
 /// Shared admin token; joining nodes present it as a bearer token to the seed.
-const ADMIN_TOKEN: &str = "cluster-test-token";
+pub const ADMIN_TOKEN: &str = "cluster-test-token";
 
 /// Reserves a currently-free loopback port (bind ephemeral with `SO_REUSEADDR`,
 /// read the assigned port, release it). The node rebinds the same port with

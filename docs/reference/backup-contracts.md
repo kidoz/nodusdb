@@ -99,7 +99,17 @@ clusters/{cluster_id}/
 9. An incremental backup fails if the parent chain is incomplete, the parent is
    not complete, or required MVCC history is gone.
 10. Restore defaults to a fresh data directory or a new cluster timeline.
-    In-place restore over live data is out of scope.
+    In-place restore over live data is out of scope, and the server enforces
+    it: `POST /api/v1/backups/{id}/restore` fails with `409 Conflict`
+    (`restore_destination_not_empty`) when the destination engine holds
+    anything beyond bootstrap-internal state (Raft/consensus records, the HLC
+    watermark, the recovery generation, upgrade records, the bootstrap
+    catalog blob), and with `409 Conflict` (`restore_clustered_unsupported`)
+    on a node whose meta group has more than one member, because restore
+    writes bypass Raft and would diverge replicas. The one exception is
+    retrying a restore that failed mid-mutation: the engine stays fenced and
+    the idempotent retry is allowed to complete. To restore a cluster, restore
+    on a fresh single node and then re-form the cluster.
 11. Backup, restore, delete, retention, and key-access operations pass
     authorization and emit audit events.
 
@@ -157,7 +167,7 @@ A backup strategy that has never been restored and queried is unproven.
 | Full plus incremental restore | Parent chain resolved in order; final state includes changed versions and tombstones. | Incremental restore integration test. |
 | Required MVCC history collected | Incremental fails and directs the operator to a new full backup. | Protected timestamp test. |
 | Point-in-time restore | WAL replay stops at the target; incomplete transactions stay invisible. | WAL replay integration test. |
-| Restore into a non-empty directory | Restore fails absent an explicit unsafe override. | Restore executor test. |
+| Restore into a non-empty directory | Restore is refused with `409 Conflict` before any mutation. | Admin API integration test. |
 | Secondary indexes after restore | Indexes validated or rebuilt before read-write promotion. | Index validation test. |
 | Delete with a dependent incremental | Retention refuses to remove required parent data. | Retention planner test. |
 | Stale WAL archive | Lag metric exceeds the configured recovery point objective and alerts. | Monitoring test and alert rule check. |

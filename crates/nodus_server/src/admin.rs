@@ -1052,37 +1052,99 @@ fn apply_restore(
     apply_restore_mutations(objects, catalog_snapshot, pitr, kv, catalog_writer, wal_key)
 }
 
+/// Why a restore was refused before mutating anything. Mapped to `409
+/// Conflict` (with an actionable message) rather than the generic in-body
+/// error, so operators and automation can distinguish a rejected restore from
+/// a failed one.
+enum RestoreFailure {
+    /// Pre-mutation guard rejection; the engine is untouched and unfenced.
+    Rejected(&'static str, String),
+    /// Validation or mid-mutation failure (existing semantics: a mid-mutation
+    /// failure keeps the engine fenced).
+    Failed(anyhow::Error),
+}
+
+/// Keys a freshly bootstrapped — but never written — engine legitimately
+/// holds: node-local/consensus-local namespaces (the same set backups exclude)
+/// plus the HLC clock reservation and the bootstrap catalog blob. Anything
+/// else means the destination has (or once had) user/catalog/cluster data, so
+/// an overlaying restore would silently merge two states.
+fn is_restore_bootstrap_key(key: &[u8]) -> bool {
+    nodus_backup::is_backup_excluded_key(key)
+        || key == crate::HLC_WATERMARK_KEY
+        || key == nodus_executor::CATALOG_STATE_KEY
+}
+
+/// Scans the destination engine for any key beyond bootstrap-internal state
+/// (tombstones count: a deleted dataset's MVCC history would still merge with
+/// the restored versions). Returns the first offending key. Runs inside the
+/// restore fence, so no concurrent write can slip past the check.
+fn restore_destination_data_key(
+    kv: &dyn nodus_storage_api::KvEngine,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    let range = nodus_storage_api::KeyRange {
+        start: Bytes::new(),
+        end: Bytes::from(vec![255u8; 1024]),
+    };
+    for version in kv.scan_versions(range, 0, u64::MAX)? {
+        let version = version?;
+        if !is_restore_bootstrap_key(&version.key) {
+            return Ok(Some(version.key.to_vec()));
+        }
+    }
+    Ok(None)
+}
+
 async fn restore_backup(
     State(state): State<AdminState>,
     Path(id): Path<String>,
     Query(query): Query<RestoreQuery>,
-) -> Json<Value> {
+) -> axum::response::Response {
     // Serialize restores: two interleaving restores would corrupt the result.
     let _restore_guard = match state.restore_lock.try_lock() {
         Ok(guard) => guard,
         Err(_) => {
-            return Json(json!({ "restored": 0, "error": "a restore is already in progress" }));
+            return Json(json!({ "restored": 0, "error": "a restore is already in progress" }))
+                .into_response();
         }
     };
+
+    // Restore writes go straight into the local engine and bypass Raft
+    // consensus, so on a replicated node the replicas would silently diverge.
+    // Restore-through-Raft is not implemented (the replay writes raw MVCC
+    // versions across every group, which does not map onto per-group command
+    // application), so until it is, refuse restores on a clustered node:
+    // restore into a fresh single node, then re-form the cluster.
+    if state.manager.cluster_members().await.len() > 1 {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "restored": 0,
+                "code": "restore_clustered_unsupported",
+                "error": "restore is supported only on a single-node server: restore into a fresh single node, then add peers (restore writes bypass Raft and would diverge replicas)"
+            })),
+        )
+            .into_response();
+    }
 
     let (objects, pitr) = if let Some(target_ts) = query.target_ts {
         let plan = match state.backup.plan_pitr_restore(target_ts).await {
             Ok(plan) => plan,
-            Err(e) => return Json(json!({ "restored": 0, "error": e.to_string() })),
+            Err(e) => return Json(json!({ "restored": 0, "error": e.to_string() })).into_response(),
         };
         let objects = match state.backup.restore(&plan.base_backup_id).await {
             Ok(objects) => objects,
-            Err(e) => return Json(json!({ "restored": 0, "error": e.to_string() })),
+            Err(e) => return Json(json!({ "restored": 0, "error": e.to_string() })).into_response(),
         };
         let wal_segments = match state.backup.load_pitr_wal_segments(&plan).await {
             Ok(segments) => segments,
-            Err(e) => return Json(json!({ "restored": 0, "error": e.to_string() })),
+            Err(e) => return Json(json!({ "restored": 0, "error": e.to_string() })).into_response(),
         };
         (objects, Some((plan, wal_segments)))
     } else {
         let objects = match state.backup.restore(&id).await {
             Ok(objects) => objects,
-            Err(e) => return Json(json!({ "restored": 0, "error": e.to_string() })),
+            Err(e) => return Json(json!({ "restored": 0, "error": e.to_string() })).into_response(),
         };
         (objects, None)
     };
@@ -1107,13 +1169,44 @@ async fn restore_backup(
     let restore_gate = state.restore_gate.clone();
     let replay = tokio::task::spawn_blocking(move || {
         // Validate first — a bad backup changes nothing and must not fence.
-        let catalog_snapshot = validate_restore_objects(&objects)?;
+        let catalog_snapshot =
+            validate_restore_objects(&objects).map_err(RestoreFailure::Failed)?;
 
         // Begin fencing: reject new statements, then take the exclusive gate,
         // which blocks until every in-flight statement has drained. From here no
         // query can observe the engine until we finish.
-        restoring.store(true, std::sync::atomic::Ordering::Release);
+        //
+        // `resume_after_failure`: a previous restore that failed mid-mutation
+        // left the engine fenced; that attempt's retry must skip the emptiness
+        // guard — the partial state it overlays is its own, and completing the
+        // idempotent restore is the recovery path.
+        let resume_after_failure = restoring.swap(true, std::sync::atomic::Ordering::Release);
         let _exclusive = restore_gate.write();
+
+        // Backup contract #10: in-place restore over live data is out of scope.
+        // The replay only writes keys present in the backup, so restoring into
+        // a non-empty engine would silently merge destination and backup states.
+        // Refuse while nothing has been mutated (the check runs under the
+        // exclusive gate, so no write can race it).
+        if !resume_after_failure {
+            match restore_destination_data_key(kv.as_ref()) {
+                Ok(Some(key)) => {
+                    restoring.store(false, std::sync::atomic::Ordering::Release);
+                    return Err(RestoreFailure::Rejected(
+                        "restore_destination_not_empty",
+                        format!(
+                            "restore destination is not empty (found data key 0x{}); restore requires a fresh data directory — restart the node with empty storage and retry",
+                            hex::encode(key)
+                        ),
+                    ));
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    restoring.store(false, std::sync::atomic::Ordering::Release);
+                    return Err(RestoreFailure::Failed(error));
+                }
+            }
+        }
 
         let result = apply_restore_mutations(
             &objects,
@@ -1129,7 +1222,7 @@ async fn restore_backup(
         if result.is_ok() {
             restoring.store(false, std::sync::atomic::Ordering::Release);
         }
-        result
+        result.map_err(RestoreFailure::Failed)
     })
     .await;
 
@@ -1139,17 +1232,29 @@ async fn restore_backup(
             "objects": names,
             "pitr": pitr_response,
             "replay": report,
-        })),
-        Ok(Err(e)) => Json(json!({
+        }))
+        .into_response(),
+        Ok(Err(RestoreFailure::Rejected(code, message))) => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "restored": 0,
+                "code": code,
+                "error": message,
+            })),
+        )
+            .into_response(),
+        Ok(Err(RestoreFailure::Failed(e))) => Json(json!({
             "restored": 0,
             "error": e.to_string(),
             "queries_fenced": state.restoring.load(std::sync::atomic::Ordering::Acquire),
-        })),
+        }))
+        .into_response(),
         Err(e) => Json(json!({
             "restored": 0,
             "error": format!("restore task failed: {e}"),
             "queries_fenced": state.restoring.load(std::sync::atomic::Ordering::Acquire),
-        })),
+        }))
+        .into_response(),
     }
 }
 

@@ -75,6 +75,14 @@ Two behaviours are worth knowing before you run this:
   interleaving with the first.
 - **Validation happens before mutation.** Every backup object is parsed first,
   so a malformed backup is rejected having changed nothing.
+- **The destination must be empty and single-node.** Restore overlays the
+  engine, so the server refuses (HTTP `409`, `restore_destination_not_empty`)
+  when the destination holds anything beyond bootstrap-internal state, and
+  refuses (HTTP `409`, `restore_clustered_unsupported`) on a clustered node
+  because restore writes bypass Raft. Restore into a fresh single node, then
+  re-form the cluster around it. The only exception: retrying a restore that
+  failed mid-mutation — the engine stays fenced and the idempotent retry
+  completes it.
 
 Node-local and consensus-local records (Raft votes/logs, recovery generation,
 upgrade authority, migration control keys) are neither exported nor replayed;

@@ -313,7 +313,7 @@ pub trait Executor: Send + Sync {
 
 /// Reserved KV key under which the catalog's serialized state is stored. The
 /// leading NUL keeps it out of any `{table_id}:{pk}` row key space.
-const CATALOG_STATE_KEY: &[u8] = b"\x00catalog\x00state";
+pub const CATALOG_STATE_KEY: &[u8] = b"\x00catalog\x00state";
 
 /// Session GUC requesting linearizable reads (read-your-writes across nodes).
 /// See [`MemExecutor::linearizable_reads`].

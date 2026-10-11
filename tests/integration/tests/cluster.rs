@@ -588,3 +588,30 @@ async fn sharded_table_replicates_and_survives_leader_failure() {
         "all rows survive the failover and the new write lands across the data group"
     );
 }
+
+/// Restore writes bypass Raft consensus, so the restore endpoint refuses to run
+/// on a clustered node (409) rather than silently diverging replicas. The guard
+/// fires before the backup is even loaded, so any backup id exercises it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial(cluster)]
+async fn restore_is_rejected_on_a_clustered_node() {
+    let cluster = ClusterFixture::start(3)
+        .await
+        .expect("3-node cluster forms");
+    assert!(cluster.wait_nodes_live(3, Duration::from_secs(45)).await);
+
+    let http = reqwest::Client::new();
+    let resp = http
+        .post(format!(
+            "http://{}/api/v1/backups/any-backup/restore",
+            cluster.nodes[1].http_addr()
+        ))
+        .bearer_auth(nodus_testkit::cluster::ADMIN_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["code"], "restore_clustered_unsupported");
+}
+

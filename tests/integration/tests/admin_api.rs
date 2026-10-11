@@ -224,6 +224,69 @@ async fn admin_backup_api_create_list_verify_restore() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn restore_into_non_empty_engine_is_rejected_without_fencing() {
+    let server = TestServer::start().await.expect("server starts");
+    let client = connect(&server.pgwire_addr).await;
+    client
+        .simple_query("CREATE TABLE guarded (id INT PRIMARY KEY, v TEXT)")
+        .await
+        .unwrap();
+    client
+        .simple_query("INSERT INTO guarded (id, v) VALUES (1, 'x')")
+        .await
+        .unwrap();
+
+    let http = reqwest::Client::new();
+    let base = format!("http://{}", server.http_addr);
+    let created: serde_json::Value = http
+        .post(format!("{base}/api/v1/backups"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let id = created["backup_id"].as_str().expect("backup_id").to_string();
+
+    // Backup contract #10: overlaying a live engine is refused with 409
+    // before anything is mutated, and the rejection is audited.
+    let resp = http
+        .post(format!("{base}/api/v1/backups/{id}/restore"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["code"], "restore_destination_not_empty");
+    assert_eq!(body["restored"], 0);
+
+    // A refused restore must not fence the engine: queries keep working.
+    let rows = client
+        .query("SELECT v FROM guarded WHERE id = 1", &[])
+        .await
+        .unwrap();
+    assert_eq!(rows[0].get::<_, String>(0), "x");
+
+    let audit: serde_json::Value = http
+        .get(format!("{base}/api/v1/audit"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let reason = format!("POST /api/v1/backups/{id}/restore");
+    assert!(
+        audit.as_array().unwrap().iter().any(|event| {
+            event["action"] == "ManageBackups"
+                && event["result"] == "Failure"
+                && event["reason"] == reason
+        }),
+        "rejected restore must be audited: {audit}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn admin_upgrade_api_drives_lifecycle() {
     let server = TestServer::start().await.expect("server starts");
     let http = reqwest::Client::new();
