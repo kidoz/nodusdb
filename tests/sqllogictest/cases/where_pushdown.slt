@@ -1,0 +1,186 @@
+# `WHERE` conjuncts: a condition one relation alone decides is applied at
+# that relation's scan, as PostgreSQL plans it, and a null-rejecting
+# conjunct that reads only the null side of an outer join removes that
+# side — `b1 LEFT JOIN a1 ... WHERE a1.id < 10` is planned as an inner
+# join, and a `FULL JOIN` filtered on one side becomes the outer join
+# that keeps the filtered side (`LEFT JOIN` here keeps b1). `IS NULL`
+# reads NULLs by definition, so the join stays outer and the conjunct
+# stays on it. A conjunct reading both sides stays on the join too.
+# PostgreSQL may swap the join's inputs by cost — it prints a reduced
+# `FULL JOIN` (and a `LEFT JOIN` filtered on its preserved side) as a
+# `Hash Right Join` with the other side probed, and its nested loop
+# probes the other side — and it reassociates a chain of joins. NodusDB
+# keeps the written order, so one plan below (the `FULL JOIN` filtered
+# on the right side) reads the other way round with the same rows.
+# Plans and results otherwise from PostgreSQL 18.4.
+
+statement ok
+drop table if exists a1 cascade;
+
+statement ok
+drop table if exists b1 cascade;
+
+statement ok
+create table a1 (id int, k int, tag text);
+
+statement ok
+create table b1 (id int, k int, note text);
+
+statement ok
+insert into a1 select g, g % 5, 'a' || g from generate_series(1, 60) g;
+
+statement ok
+insert into b1 select g, g % 7, 'b' || g from generate_series(1, 400) g;
+
+statement ok
+analyze a1;
+
+statement ok
+analyze b1;
+
+# Either side's conjunct sits on its scan.
+query T
+explain (costs off) select * from b1 join a1 on a1.k = b1.k where a1.id < 10;
+----
+Hash Join
+  Hash Cond: (b1.k = a1.k)
+  ->  Seq Scan on b1
+  ->  Hash
+        ->  Seq Scan on a1
+              Filter: (id < 10)
+
+
+query T
+explain (costs off) select * from b1 join a1 on a1.k = b1.k where b1.id < 10;
+----
+Hash Join
+  Hash Cond: (b1.k = a1.k)
+  ->  Seq Scan on b1
+        Filter: (id < 10)
+  ->  Hash
+        ->  Seq Scan on a1
+
+
+# A conjunct naming both sides stays on the join.
+query T
+explain (costs off) select * from b1 join a1 on a1.k = b1.k where a1.id + b1.id < 20;
+----
+Hash Join
+  Hash Cond: (b1.k = a1.k)
+  Join Filter: ((a1.id + b1.id) < 20)
+  ->  Seq Scan on b1
+  ->  Hash
+        ->  Seq Scan on a1
+
+
+# A filter on the preserved side keeps the join.
+query T
+explain (costs off) select * from b1 left join a1 on a1.k = b1.k where b1.id < 10;
+----
+Hash Left Join
+  Hash Cond: (b1.k = a1.k)
+  ->  Seq Scan on b1
+        Filter: (id < 10)
+  ->  Hash
+        ->  Seq Scan on a1
+
+
+# One on the null side removes it: an inner join.
+query T
+explain (costs off) select * from b1 left join a1 on a1.k = b1.k where a1.id < 10;
+----
+Hash Join
+  Hash Cond: (b1.k = a1.k)
+  ->  Seq Scan on b1
+  ->  Hash
+        ->  Seq Scan on a1
+              Filter: (id < 10)
+
+
+# `IS NULL` cannot be null-rejected: the join stays outer.
+query T
+explain (costs off) select * from b1 left join a1 on a1.k = b1.k where a1.id is null;
+----
+Hash Left Join
+  Hash Cond: (b1.k = a1.k)
+  Filter: (a1.id IS NULL)
+  ->  Seq Scan on b1
+  ->  Hash
+        ->  Seq Scan on a1
+
+
+# A right join filtered on its null side is an inner join too.
+query T
+explain (costs off) select * from b1 right join a1 on a1.k = b1.k where b1.id < 10;
+----
+Hash Join
+  Hash Cond: (b1.k = a1.k)
+  ->  Seq Scan on b1
+        Filter: (id < 10)
+  ->  Hash
+        ->  Seq Scan on a1
+
+
+# A full join filtered on one side keeps that side; on both, it is inner.
+query T
+explain (costs off) select * from b1 full join a1 on a1.k = b1.k where a1.id < 10;
+----
+Hash Left Join
+  Hash Cond: (a1.k = b1.k)
+  ->  Seq Scan on a1
+        Filter: (id < 10)
+  ->  Hash
+        ->  Seq Scan on b1
+
+
+query T
+explain (costs off) select * from b1 full join a1 on a1.k = b1.k where a1.id < 10 and b1.id < 10;
+----
+Hash Join
+  Hash Cond: (b1.k = a1.k)
+  ->  Seq Scan on b1
+        Filter: (id < 10)
+  ->  Hash
+        ->  Seq Scan on a1
+              Filter: (id < 10)
+
+
+# The rows are the same either way.
+query T
+select count(*) from b1 join a1 on a1.k = b1.k where a1.id < 10;
+----
+515
+
+
+query T
+select count(*) from b1 left join a1 on a1.k = b1.k where a1.id < 10;
+----
+515
+
+
+query T
+select count(*) from b1 left join a1 on a1.k = b1.k where a1.id is null;
+----
+114
+
+
+# An outer row with no match survives a preserved-side filter.
+statement ok
+insert into a1 values (61, 99, 'lonely');
+
+query T
+select a1.id, b1.id from a1 left join b1 on a1.k = b1.k where a1.id = 61;
+----
+61	NULL
+
+
+query T
+select count(*) from b1 full join a1 on a1.k = b1.k where a1.id = 61;
+----
+1
+
+
+query T
+select count(*) from b1 left join a1 on a1.k = b1.k where a1.id = 61;
+----
+0
