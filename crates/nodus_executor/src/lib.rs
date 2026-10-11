@@ -371,7 +371,12 @@ impl nodus_catalog::CatalogStore for KvCatalogStore {
             Bytes::from_static(CATALOG_STATE_KEY),
             Bytes::copy_from_slice(bytes),
         )?;
-        self.kv.commit(txn, ts)?;
+        // A failed commit must not strand the catalog-write intent: later
+        // saves would conflict with it forever.
+        if let Err(error) = self.kv.commit(txn, ts) {
+            let _ = self.kv.abort(txn);
+            return Err(error.into());
+        }
         Ok(())
     }
 }
@@ -2079,7 +2084,7 @@ impl MemExecutor {
                 Ok(_) => {
                     let commit_ts = self.commit_or_release(txn_id)?;
                     if !is_read_only || wrote {
-                        self.kv.commit(txn_id, commit_ts)?;
+                        self.commit_released_txn(txn_id, commit_ts)?;
                     }
                     self.after_commit(ctx);
                 }

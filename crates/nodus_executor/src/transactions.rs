@@ -376,7 +376,7 @@ impl MemExecutor {
         self.restore_settings(ctx, txn.local_settings.clone());
         self.advisory.end_transaction(&ctx.session_id);
         let commit_ts = self.commit_or_release(txn.txn_id)?;
-        self.kv.commit(txn.txn_id, commit_ts)?;
+        self.commit_released_txn(txn.txn_id, commit_ts)?;
         self.end_transaction_cursors(&ctx.session_id, txn.txn_id, true);
         self.end_transaction_large_objects(&ctx.session_id);
         self.deliver_notifications(&ctx.session_id, txn.pending_notifications.clone());
@@ -484,6 +484,18 @@ impl MemExecutor {
         self.txn.commit_txn(txn_id).inspect_err(|_| {
             let _ = self.kv.abort(txn_id);
         })
+    }
+
+    /// Commits the storage intents of a transaction `commit_or_release` has
+    /// already marked committed. If the storage commit fails (e.g. a Raft
+    /// submit that never landed), the intents are released instead of leaking:
+    /// left pending, they would block every later write to those keys and
+    /// stall snapshot builds. The client-facing error is returned unchanged.
+    pub(crate) fn commit_released_txn(&self, txn_id: TxnId, commit_ts: Timestamp) -> Result<()> {
+        self.kv.commit(txn_id, commit_ts).inspect_err(|_| {
+            let _ = self.kv.abort(txn_id);
+        })?;
+        Ok(())
     }
 
     pub(crate) fn exec_rollback(&self, ctx: &ExecutionContext) -> Result<QueryOutput> {

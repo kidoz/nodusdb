@@ -1350,3 +1350,184 @@ fn test_left_outer_join() {
     assert_eq!(bob_row.values[3], Value::Null); // order.user_id
     assert_eq!(bob_row.values[4], Value::Null); // order.amount
 }
+
+
+// ---------------------------------------------------------------------------
+// Regression: a failed `kv.commit` after `commit_or_release` must release the
+// transaction's intents instead of leaking them (they would block every later
+// writer to those keys and stall snapshot builds).
+// ---------------------------------------------------------------------------
+
+/// A `MemKvEngine` wrapper whose `commit` fails while `fail_commit` is set,
+/// modelling a Raft submit that never landed.
+struct FailCommitKv {
+    inner: nodus_storage_mem::MemKvEngine,
+    fail_commit: std::sync::atomic::AtomicBool,
+}
+
+impl FailCommitKv {
+    fn new() -> Self {
+        Self {
+            inner: nodus_storage_mem::MemKvEngine::new(),
+            fail_commit: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+}
+
+impl KvEngine for FailCommitKv {
+    fn get(&self, key: &[u8], read_ts: Timestamp) -> Result<Option<Bytes>> {
+        self.inner.get(key, read_ts)
+    }
+
+    fn scan(
+        &self,
+        range: KeyRange,
+        read_ts: Timestamp,
+    ) -> Result<Box<dyn Iterator<Item = Result<nodus_storage_api::KvPair>> + Send>> {
+        self.inner.scan(range, read_ts)
+    }
+
+    fn write_intent(
+        &self,
+        txn_id: TxnId,
+        key: Bytes,
+        value: Bytes,
+    ) -> nodus_storage_api::KvResult<()> {
+        self.inner.write_intent(txn_id, key, value)
+    }
+
+    fn delete_intent(&self, txn_id: TxnId, key: Bytes) -> nodus_storage_api::KvResult<()> {
+        self.inner.delete_intent(txn_id, key)
+    }
+
+    fn replace_intent(
+        &self,
+        txn_id: TxnId,
+        key: Bytes,
+        replacement: IntentReplacement,
+    ) -> nodus_storage_api::KvResult<()> {
+        self.inner.replace_intent(txn_id, key, replacement)
+    }
+
+    fn commit(&self, txn_id: TxnId, commit_ts: Timestamp) -> nodus_storage_api::KvResult<()> {
+        if self.fail_commit.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(nodus_storage_api::KvError::Other(anyhow::anyhow!(
+                "injected commit failure"
+            )));
+        }
+        self.inner.commit(txn_id, commit_ts)
+    }
+
+    fn abort(&self, txn_id: TxnId) -> nodus_storage_api::KvResult<()> {
+        self.inner.abort(txn_id)
+    }
+
+    fn pending_intent_keys(&self, txn_id: TxnId) -> Vec<Bytes> {
+        self.inner.pending_intent_keys(txn_id)
+    }
+
+    fn has_pending_intents(&self, prefix: &[u8]) -> Result<bool> {
+        self.inner.has_pending_intents(prefix)
+    }
+}
+
+fn sql(exec: &MemExecutor, ctx: &ExecutionContext, sql: &str) -> Result<QueryOutput> {
+    let mut stmts = nodus_sql::parse_sql(sql).unwrap();
+    let plan = plan_statement(&stmts.remove(0), &[]).unwrap();
+    exec.execute_logical(ctx, plan)
+}
+
+fn executor_with_kv(kv: Arc<dyn KvEngine>) -> (Arc<MemExecutor>, ExecutionContext) {
+    let cat = Arc::new(MemoryCatalog::new());
+    let db = cat
+        .create_database(nodus_catalog::CreateDatabaseRequest {
+            id: nodus_catalog::DatabaseId::new(),
+            name: "default".into(),
+            owner_role_id: None,
+        })
+        .unwrap();
+    cat.create_schema(nodus_catalog::CreateSchemaRequest {
+        id: nodus_catalog::SchemaId::new(),
+        database_id: db.id,
+        name: "public".into(),
+        owner_role_id: None,
+        managed_access: false,
+    })
+    .unwrap();
+    let admin = cat
+        .create_role(CreateRoleRequest {
+            id: nodus_catalog::PrincipalId::new(),
+            name: "admin".into(),
+            principal_type: PrincipalType::User,
+            database_id: None,
+            attributes: Default::default(),
+        })
+        .unwrap();
+    cat.grant_privilege(GrantPrivilegeRequest {
+        id: nodus_catalog::GrantId::new(),
+        principal_id: admin.id,
+        resource: ResourceRef::System,
+        privilege: "ALL".into(),
+        grantable: false,
+        grantor: None,
+    })
+    .unwrap();
+    let txn = Arc::new(nodus_txn::MemTxnManager::new());
+    let authz = Arc::new(nodus_authz::DefaultAuthzEngine::new(cat.clone()));
+    let exec = Arc::new(MemExecutor::new(
+        cat.clone(),
+        cat,
+        authz,
+        Arc::new(MemoryAuditSink::new()),
+        kv,
+        txn,
+    ));
+    (exec, ctx_for(admin.id))
+}
+
+#[test]
+fn failed_kv_commit_releases_intents_explicit_txn() {
+    let kv = Arc::new(FailCommitKv::new());
+    let (exec, ctx) = executor_with_kv(kv.clone());
+    sql(&exec, &ctx, "CREATE TABLE t (id INT PRIMARY KEY)").unwrap();
+
+    sql(&exec, &ctx, "BEGIN").unwrap();
+    sql(&exec, &ctx, "INSERT INTO t VALUES (1)").unwrap();
+    kv.fail_commit.store(true, std::sync::atomic::Ordering::SeqCst);
+    let error = sql(&exec, &ctx, "COMMIT").unwrap_err();
+    assert!(
+        error.to_string().contains("injected commit failure"),
+        "client-facing error is the storage failure, got: {error}"
+    );
+    kv.fail_commit.store(false, std::sync::atomic::Ordering::SeqCst);
+
+    // The failed commit released its intents: nothing is pending, and a later
+    // transaction writing the same key neither conflicts nor resurrects the
+    // never-committed row.
+    assert!(!kv.has_pending_intents(b"").unwrap());
+    sql(&exec, &ctx, "INSERT INTO t VALUES (1)").unwrap();
+    let out = sql(&exec, &ctx, "SELECT * FROM t").unwrap();
+    assert_eq!(out.rows.len(), 1);
+}
+
+#[test]
+fn failed_kv_commit_releases_intents_implicit_txn() {
+    let kv = Arc::new(FailCommitKv::new());
+    let (exec, ctx) = executor_with_kv(kv.clone());
+    sql(&exec, &ctx, "CREATE TABLE t (id INT PRIMARY KEY)").unwrap();
+
+    kv.fail_commit.store(true, std::sync::atomic::Ordering::SeqCst);
+    let error = sql(&exec, &ctx, "INSERT INTO t VALUES (1)").unwrap_err();
+    assert!(
+        error.to_string().contains("injected commit failure"),
+        "client-facing error is the storage failure, got: {error}"
+    );
+    kv.fail_commit.store(false, std::sync::atomic::Ordering::SeqCst);
+
+    assert!(!kv.has_pending_intents(b"").unwrap());
+    sql(&exec, &ctx, "INSERT INTO t VALUES (1)").unwrap();
+    sql(&exec, &ctx, "INSERT INTO t VALUES (2)").unwrap();
+    let out = sql(&exec, &ctx, "SELECT * FROM t").unwrap();
+    assert_eq!(out.rows.len(), 2);
+}
+
