@@ -1,0 +1,326 @@
+# Window plans: each window clause is a `WindowAgg` above the input, with
+# the sort its ordering needs and the clause printed PostgreSQL's way —
+# `wN AS (...)` numbered from the innermost out (a named `WINDOW w`
+# prints its name), the default frame omitted, and a clause whose
+# functions ignore the frame rewritten to `ROWS UNBOUNDED PRECEDING`.
+# Clauses sharing an ordering stack in the order written (the first
+# innermost); different orderings stack with the last written innermost,
+# and `OVER ()` outermost. A query `ORDER BY` that a window already
+# satisfies adds no Sort, one it only partly satisfies is an
+# `Incremental Sort` over the prefix. A `UNION`'s dedup groups by the
+# left input's columns. Plans and results from PostgreSQL 18.4.
+
+statement ok
+drop table if exists g1 cascade;
+
+statement ok
+drop table if exists g2 cascade;
+
+statement ok
+create table g1 (k int, v int);
+
+statement ok
+create table g2 (k int, w int);
+
+statement ok
+insert into g1 select g, (g * 7) % 90 from generate_series(1, 90) g;
+
+statement ok
+insert into g2 select g % 4, g from generate_series(1, 40) g;
+
+statement ok
+analyze g1;
+
+statement ok
+analyze g2;
+
+query T
+explain (costs off) select k, rank() over (order by v) from g1;
+----
+WindowAgg
+  Window: w1 AS (ORDER BY v ROWS UNBOUNDED PRECEDING)
+  ->  Sort
+        Sort Key: v
+        ->  Seq Scan on g1
+
+query T
+explain (costs off) select k, sum(v) over (partition by k order by v) from g1;
+----
+WindowAgg
+  Window: w1 AS (PARTITION BY k ORDER BY v)
+  ->  Sort
+        Sort Key: k, v
+        ->  Seq Scan on g1
+
+query T
+explain (costs off) select k, rank() over (order by v), sum(v) over () from g1;
+----
+WindowAgg
+  Window: w2 AS ()
+  ->  WindowAgg
+        Window: w1 AS (ORDER BY v ROWS UNBOUNDED PRECEDING)
+        ->  Sort
+              Sort Key: v
+              ->  Seq Scan on g1
+
+query T
+explain (costs off) select k, rank() over (order by v) from g1 order by v;
+----
+WindowAgg
+  Window: w1 AS (ORDER BY v ROWS UNBOUNDED PRECEDING)
+  ->  Sort
+        Sort Key: v
+        ->  Seq Scan on g1
+
+query T
+explain (costs off) select k, rank() over (partition by k) from g1 order by k;
+----
+WindowAgg
+  Window: w1 AS (PARTITION BY k ROWS UNBOUNDED PRECEDING)
+  ->  Sort
+        Sort Key: k
+        ->  Seq Scan on g1
+
+query T
+explain (costs off) select k, rank() over w from g1 window w as (order by v);
+----
+WindowAgg
+  Window: w AS (ORDER BY v ROWS UNBOUNDED PRECEDING)
+  ->  Sort
+        Sort Key: v
+        ->  Seq Scan on g1
+
+query T
+explain (costs off) select k, rank() over (order by count(*)) from g1 group by k;
+----
+WindowAgg
+  Window: w1 AS (ORDER BY (count(*)) ROWS UNBOUNDED PRECEDING)
+  ->  Sort
+        Sort Key: (count(*))
+        ->  HashAggregate
+              Group Key: k
+              ->  Seq Scan on g1
+
+query T
+explain (costs off) select k, rank() over (order by v) from g1 limit 3;
+----
+Limit
+  ->  WindowAgg
+        Window: w1 AS (ORDER BY v ROWS UNBOUNDED PRECEDING)
+        ->  Sort
+              Sort Key: v
+              ->  Seq Scan on g1
+
+query T
+explain (costs off) select distinct rank() over (order by v) from g1;
+----
+HashAggregate
+  Group Key: rank() OVER w1
+  ->  WindowAgg
+        Window: w1 AS (ORDER BY v ROWS UNBOUNDED PRECEDING)
+        ->  Sort
+              Sort Key: v
+              ->  Seq Scan on g1
+
+query T
+explain (costs off) select k, sum(v) over (order by v rows between 1 preceding and current row) from g1;
+----
+WindowAgg
+  Window: w1 AS (ORDER BY v ROWS BETWEEN '1'::bigint PRECEDING AND CURRENT ROW)
+  ->  Sort
+        Sort Key: v
+        ->  Seq Scan on g1
+
+query T
+explain (costs off) select k, sum(v) over (order by v rows between 1 preceding and 2 following) from g1;
+----
+WindowAgg
+  Window: w1 AS (ORDER BY v ROWS BETWEEN '1'::bigint PRECEDING AND '2'::bigint FOLLOWING)
+  ->  Sort
+        Sort Key: v
+        ->  Seq Scan on g1
+
+query T
+explain (costs off) select k, sum(v) over (order by v range between unbounded preceding and unbounded following) from g1;
+----
+WindowAgg
+  Window: w1 AS (ORDER BY v RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
+  ->  Sort
+        Sort Key: v
+        ->  Seq Scan on g1
+
+query T
+explain (costs off) select k, rank() over (order by v), rank() over (order by k) from g1;
+----
+WindowAgg
+  Window: w2 AS (ORDER BY v ROWS UNBOUNDED PRECEDING)
+  ->  Sort
+        Sort Key: v
+        ->  WindowAgg
+              Window: w1 AS (ORDER BY k ROWS UNBOUNDED PRECEDING)
+              ->  Sort
+                    Sort Key: k
+                    ->  Seq Scan on g1
+
+query T
+explain (costs off) select k, first_value(v) over (order by v), last_value(v) over (order by k) from g1;
+----
+WindowAgg
+  Window: w2 AS (ORDER BY v)
+  ->  Sort
+        Sort Key: v
+        ->  WindowAgg
+              Window: w1 AS (ORDER BY k)
+              ->  Sort
+                    Sort Key: k
+                    ->  Seq Scan on g1
+
+query T
+explain (costs off) select k, rank() over (order by v) from g1 order by v, k;
+----
+Incremental Sort
+  Sort Key: v, k
+  Presorted Key: v
+  ->  WindowAgg
+        Window: w1 AS (ORDER BY v ROWS UNBOUNDED PRECEDING)
+        ->  Sort
+              Sort Key: v
+              ->  Seq Scan on g1
+
+query T
+explain (costs off) select k from g1 order by rank() over (order by v);
+----
+Sort
+  Sort Key: (rank() OVER w1)
+  ->  WindowAgg
+        Window: w1 AS (ORDER BY v ROWS UNBOUNDED PRECEDING)
+        ->  Sort
+              Sort Key: v
+              ->  Seq Scan on g1
+
+query T
+explain (costs off) select k from g1 union select w from g2;
+----
+HashAggregate
+  Group Key: g1.k
+  ->  Append
+        ->  Seq Scan on g1
+        ->  Seq Scan on g2
+
+query T
+explain (costs off) select k, count(*) from g1 group by k having count(*) > 25;
+----
+HashAggregate
+  Group Key: k
+  Filter: (count(*) > 25)
+  ->  Seq Scan on g1
+
+# The rows the windows yield.
+query T
+select k, count(*), sum(cnt) over (order by k) from (select k, count(*) cnt from g1 group by k) t group by k, cnt order by k;
+----
+1	1	1
+2	1	2
+3	1	3
+4	1	4
+5	1	5
+6	1	6
+7	1	7
+8	1	8
+9	1	9
+10	1	10
+11	1	11
+12	1	12
+13	1	13
+14	1	14
+15	1	15
+16	1	16
+17	1	17
+18	1	18
+19	1	19
+20	1	20
+21	1	21
+22	1	22
+23	1	23
+24	1	24
+25	1	25
+26	1	26
+27	1	27
+28	1	28
+29	1	29
+30	1	30
+31	1	31
+32	1	32
+33	1	33
+34	1	34
+35	1	35
+36	1	36
+37	1	37
+38	1	38
+39	1	39
+40	1	40
+41	1	41
+42	1	42
+43	1	43
+44	1	44
+45	1	45
+46	1	46
+47	1	47
+48	1	48
+49	1	49
+50	1	50
+51	1	51
+52	1	52
+53	1	53
+54	1	54
+55	1	55
+56	1	56
+57	1	57
+58	1	58
+59	1	59
+60	1	60
+61	1	61
+62	1	62
+63	1	63
+64	1	64
+65	1	65
+66	1	66
+67	1	67
+68	1	68
+69	1	69
+70	1	70
+71	1	71
+72	1	72
+73	1	73
+74	1	74
+75	1	75
+76	1	76
+77	1	77
+78	1	78
+79	1	79
+80	1	80
+81	1	81
+82	1	82
+83	1	83
+84	1	84
+85	1	85
+86	1	86
+87	1	87
+88	1	88
+89	1	89
+90	1	90
+
+query T
+select v, rank() over (order by v), dense_rank() over (order by v) from g1 order by v limit 4;
+----
+0	1	1
+1	2	2
+2	3	3
+3	4	4
+
+query T
+select k, sum(v) over (partition by k order by v rows between unbounded preceding and current row) from g1 order by k, v limit 3;
+----
+1	7
+2	14
+3	21
