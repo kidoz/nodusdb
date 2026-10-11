@@ -32,10 +32,11 @@ struct Manifest {
     /// Oldest WAL segment id that crash recovery must replay. Recovery walks the
     /// `SegmentHeader.predecessor` lineage back from `active_wal` down to (and
     /// including) this floor. The floor only advances past a flush that retained
-    /// no uncommitted intents — otherwise an intent whose records were rotated
-    /// into an older segment (with its commit landing in a newer one) would be
-    /// dropped, losing a committed transaction. `#[serde(default)]` keeps legacy
-    /// manifests (floor 0 ⇒ replay the full available lineage) readable.
+    /// no uncommitted intents and saw no intent WAL append in flight —
+    /// otherwise an intent whose records were rotated into an older segment
+    /// (with its commit landing in a newer one) would be dropped, losing a
+    /// committed transaction. `#[serde(default)]` keeps legacy manifests
+    /// (floor 0 ⇒ replay the full available lineage) readable.
     #[serde(default)]
     min_replay_wal: u64,
 }
@@ -60,7 +61,48 @@ pub struct LsmKvEngine {
     gc_watermark: AtomicU64,
     /// Serializes flush and compaction (both rewrite the SSTable set + manifest).
     flush_compact_lock: Mutex<()>,
+    /// Intent WAL appends (write/delete) that have started but not yet
+    /// registered their intent in the memtable. Flush must not advance the
+    /// replay floor while any are in flight: such an append may already sit in
+    /// the segment being rotated away from while its registration (and later
+    /// `CommitTxn`) is still pending — advancing the floor would exclude the
+    /// `WriteIntent` from crash replay and its commit would be dropped.
+    inflight_appends: AtomicUsize,
+    /// Test-only pause point between an intent's WAL append and its memtable
+    /// registration, for deterministic coverage of the flush race window.
+    #[cfg(test)]
+    append_pause: AppendPause,
     _wal_key: Option<[u8; 32]>,
+}
+
+/// Decrements [`LsmKvEngine::inflight_appends`] on drop, so every exit from an
+/// intent write — success or error — balances the increment.
+struct InflightAppendGuard<'a> {
+    counter: &'a AtomicUsize,
+}
+
+impl Drop for InflightAppendGuard<'_> {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Test-only gate that parks a writer thread after its intent's WAL append,
+/// before memtable registration, until the test releases it.
+#[cfg(test)]
+#[derive(Default)]
+struct AppendPause {
+    state: Mutex<AppendPauseState>,
+    parked: std::sync::Condvar,
+    release: std::sync::Condvar,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct AppendPauseState {
+    armed: bool,
+    parked: usize,
+    generation: usize,
 }
 
 /// Approximate in-memory size of a key's version chain, for the flush threshold.
@@ -195,6 +237,9 @@ impl LsmKvEngine {
             flush_threshold: AtomicUsize::new(DEFAULT_FLUSH_THRESHOLD),
             gc_watermark: AtomicU64::new(0),
             flush_compact_lock: Mutex::new(()),
+            inflight_appends: AtomicUsize::new(0),
+            #[cfg(test)]
+            append_pause: AppendPause::default(),
             _wal_key: None,
         }
     }
@@ -267,6 +312,9 @@ impl LsmKvEngine {
             flush_threshold: AtomicUsize::new(DEFAULT_FLUSH_THRESHOLD),
             gc_watermark: AtomicU64::new(0),
             flush_compact_lock: Mutex::new(()),
+            inflight_appends: AtomicUsize::new(0),
+            #[cfg(test)]
+            append_pause: AppendPause::default(),
             _wal_key: key,
         };
 
@@ -391,18 +439,28 @@ impl LsmKvEngine {
                 predecessor: Some(predecessor),
             }))?;
             new_wal.sync()?;
-            // Advance the replay floor only when this flush retained no
-            // uncommitted intents: then all committed data is durably in
-            // SSTables and no older segment needs replaying. If intents were
-            // retained (`mem_guard` still holds their keys), an older segment may
-            // carry their `WriteIntent`/committed-version records while the
-            // matching `CommitTxn` will land in this new segment, so the floor
-            // must stay put to keep the whole lineage in the replay window.
-            if mem_guard.is_empty() {
-                self.min_replay_wal.store(wal_id, Ordering::Relaxed);
-            }
+            // Rotate first: any WAL append that already completed (or is in
+            // flight with its `inflight_appends` mark visible below) landed in
+            // an older segment, and any append starting after this swap lands
+            // in the new one. The `wal` write lock orders the swap against
+            // every in-flight append, so reading the counter here sees every
+            // append that could still belong to an older segment.
             *self.wal.write().unwrap() = Some(new_wal);
             self.active_wal_id.store(wal_id, Ordering::Relaxed);
+            // Advance the replay floor only when nothing in an older segment
+            // can still be needed: this flush retained no uncommitted intents
+            // AND no intent append is in flight. If intents were retained
+            // (`mem_guard` still holds their keys), an older segment may carry
+            // their `WriteIntent`/committed-version records while the matching
+            // `CommitTxn` will land in this new segment, so the floor must
+            // stay put to keep the whole lineage in the replay window. An
+            // in-flight append is the same situation one step earlier: its
+            // `WriteIntent` is already in the old segment but its registration
+            // is still pending, so a floor advance would drop a transaction
+            // whose commit lands after the rotation.
+            if mem_guard.is_empty() && self.inflight_appends.load(Ordering::SeqCst) == 0 {
+                self.min_replay_wal.store(wal_id, Ordering::Relaxed);
+            }
             self.save_manifest()?;
         }
 
@@ -499,6 +557,64 @@ impl LsmKvEngine {
             self.flush_inner()?;
         }
         Ok(())
+    }
+
+    /// Marks the start of an intent WAL append. The returned guard ends the
+    /// in-flight window on drop; the caller must hold it from before the WAL
+    /// append until the intent is registered in the memtable (or the write
+    /// fails), so `flush_inner` can tell a not-yet-registered append apart
+    /// from quiescence before it advances the replay floor.
+    fn track_append(&self) -> InflightAppendGuard<'_> {
+        self.inflight_appends.fetch_add(1, Ordering::SeqCst);
+        InflightAppendGuard {
+            counter: &self.inflight_appends,
+        }
+    }
+
+    /// Test-only pause point between an intent's WAL append and its memtable
+    /// registration. A no-op unless a test armed the pause.
+    #[inline]
+    fn pause_after_wal_append(&self) {
+        #[cfg(test)]
+        {
+            let mut state = self.append_pause.state.lock().unwrap();
+            if !state.armed {
+                return;
+            }
+            state.parked += 1;
+            self.append_pause.parked.notify_all();
+            let generation = state.generation;
+            while state.generation == generation {
+                state = self.append_pause.release.wait(state).unwrap();
+            }
+            state.parked -= 1;
+        }
+    }
+
+    /// Arms the post-WAL-append pause for subsequent intent writes (tests).
+    #[cfg(test)]
+    fn arm_append_pause(&self) {
+        self.append_pause.state.lock().unwrap().armed = true;
+    }
+
+    /// Blocks until `n` writers are parked between WAL append and intent
+    /// registration (tests).
+    #[cfg(test)]
+    fn wait_for_parked_appends(&self, n: usize) {
+        let mut state = self.append_pause.state.lock().unwrap();
+        while state.parked < n {
+            state = self.append_pause.parked.wait(state).unwrap();
+        }
+    }
+
+    /// Releases every writer parked between WAL append and intent
+    /// registration and disarms the pause (tests).
+    #[cfg(test)]
+    fn release_parked_appends(&self) {
+        let mut state = self.append_pause.state.lock().unwrap();
+        state.armed = false;
+        state.generation += 1;
+        self.append_pause.release.notify_all();
     }
 
     fn recover(&self) -> Result<()> {
@@ -805,22 +921,28 @@ impl KvEngine for LsmKvEngine {
     fn write_intent(&self, txn_id: TxnId, key: Bytes, value: Bytes) -> KvResult<()> {
         let _snapshot = self.snapshot_gate.read().unwrap();
         self.snapshot_available()?;
-        // Append to the WAL and release the WAL lock *before* taking the memtable
-        // lock, so this never holds wal+memtable in the opposite order from
-        // `flush` (which holds memtable then rotates the WAL) — avoiding deadlock.
-        {
-            let wal_guard = self.wal.read().unwrap();
-            if let Some(wal) = wal_guard.as_ref() {
-                wal.append(WalRecord::V1(WalRecordV1::WriteIntent {
-                    txn_id,
-                    key: key.to_vec(),
-                    value: value.to_vec(),
-                }))?;
-            }
-        }
-
         let added = key.len() + value.len() + 32;
         {
+            // In flight from the WAL append until the intent is registered:
+            // flush consults `inflight_appends` before advancing the replay
+            // floor, so this record's segment is never rotated out of the
+            // replay window while its registration is still pending.
+            let _inflight = self.track_append();
+            // Append to the WAL and release the WAL lock *before* taking the memtable
+            // lock, so this never holds wal+memtable in the opposite order from
+            // `flush` (which holds memtable then rotates the WAL) — avoiding deadlock.
+            {
+                let wal_guard = self.wal.read().unwrap();
+                if let Some(wal) = wal_guard.as_ref() {
+                    wal.append(WalRecord::V1(WalRecordV1::WriteIntent {
+                        txn_id,
+                        key: key.to_vec(),
+                        value: value.to_vec(),
+                    }))?;
+                }
+            }
+            self.pause_after_wal_append();
+
             let mut store_guard = self.memtable.write().unwrap();
             let mut intents_guard = self.intents.write().unwrap();
 
@@ -836,18 +958,21 @@ impl KvEngine for LsmKvEngine {
     fn delete_intent(&self, txn_id: TxnId, key: Bytes) -> KvResult<()> {
         let _snapshot = self.snapshot_gate.read().unwrap();
         self.snapshot_available()?;
-        {
-            let wal_guard = self.wal.read().unwrap();
-            if let Some(wal) = wal_guard.as_ref() {
-                wal.append(WalRecord::V1(WalRecordV1::DeleteIntent {
-                    txn_id,
-                    key: key.to_vec(),
-                }))?;
-            }
-        }
-
         let added = key.len() + 32;
         {
+            // In flight exactly as in `write_intent`.
+            let _inflight = self.track_append();
+            {
+                let wal_guard = self.wal.read().unwrap();
+                if let Some(wal) = wal_guard.as_ref() {
+                    wal.append(WalRecord::V1(WalRecordV1::DeleteIntent {
+                        txn_id,
+                        key: key.to_vec(),
+                    }))?;
+                }
+            }
+            self.pause_after_wal_append();
+
             let mut store_guard = self.memtable.write().unwrap();
             let mut intents_guard = self.intents.write().unwrap();
 
@@ -1908,5 +2033,64 @@ mod sst_tests {
         let engine = LsmKvEngine::with_wal(dir.path(), None).unwrap();
         assert_eq!(engine.get(b"k", 25).unwrap(), None, "after reopen");
         assert_eq!(engine.get(b"k", 15).unwrap(), Some(Bytes::from("v1")));
+    }
+
+    #[test]
+    fn commit_survives_when_append_races_flush_floor_advance() {
+        // Regression: an intent whose `WriteIntent` append completed but whose
+        // memtable registration was still pending when a flush rotated the WAL
+        // used to lose the replay floor: crash replay started at the new
+        // segment, saw the `CommitTxn` without its intent, and dropped a
+        // committed transaction. The pause hook makes the interleaving
+        // deterministic: the writer is parked exactly in the append→register
+        // window while the flush runs.
+        let dir = TempDir::new().unwrap();
+        let txn = TxnId::new();
+        {
+            let engine = Arc::new(LsmKvEngine::with_wal(dir.path(), None).unwrap());
+            let floor_before = engine.min_replay_wal.load(Ordering::Relaxed);
+
+            // A committed key so the flush has work to do.
+            let stable = TxnId::new();
+            engine
+                .write_intent(stable, Bytes::from("stable"), Bytes::from("s"))
+                .unwrap();
+            engine.commit(stable, 10).unwrap();
+
+            // Park the writer after its `WriteIntent` WAL append, before the
+            // intent is registered.
+            engine.arm_append_pause();
+            let writer = {
+                let engine = engine.clone();
+                std::thread::spawn(move || {
+                    engine.write_intent(txn, Bytes::from("raced"), Bytes::from("v1"))
+                })
+            };
+            engine.wait_for_parked_appends(1);
+
+            // The flush cannot see the unregistered intent; it must still keep
+            // the replay floor because the append is in flight.
+            engine.flush().unwrap();
+            assert_eq!(
+                engine.min_replay_wal.load(Ordering::Relaxed),
+                floor_before,
+                "flush advanced the replay floor while a WAL append was in flight"
+            );
+
+            engine.release_parked_appends();
+            writer.join().unwrap().unwrap();
+            // The commit lands in the new active segment.
+            engine.commit(txn, 30).unwrap();
+            // Engine drops here, simulating a crash/restart (commit() fsynced).
+        }
+
+        let engine = LsmKvEngine::with_wal(dir.path(), None).unwrap();
+        assert_eq!(
+            engine.get(b"raced", 100).unwrap(),
+            Some(Bytes::from("v1")),
+            "committed value lost: replay dropped the commit whose intent \
+             append raced the flush"
+        );
+        assert_eq!(engine.get(b"stable", 100).unwrap(), Some(Bytes::from("s")));
     }
 }
