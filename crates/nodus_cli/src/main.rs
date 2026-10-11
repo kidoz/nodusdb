@@ -291,6 +291,15 @@ enum ClusterCmd {
         #[arg(long, default_value = DEFAULT_ADDR)]
         addr: String,
     },
+    /// Remove a permanently dead node from cluster membership (meta group and
+    /// every data group it votes in). Does not move data — drain a live node
+    /// first instead; removal never contacts the target node.
+    RemoveNode {
+        #[arg(long)]
+        id: u64,
+        #[arg(long, default_value = DEFAULT_ADDR)]
+        addr: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -343,6 +352,23 @@ async fn main() -> anyhow::Result<()> {
             );
             println!("QPS            : {:.1}", o.qps);
             println!("Active alerts  : {}", o.active_alerts);
+        }
+        Commands::Cluster {
+            cmd: ClusterCmd::RemoveNode { id, addr },
+        } => {
+            let resp: serde_json::Value = client
+                .post(format!("{addr}/api/v1/cluster/remove"))
+                .json(&serde_json::json!({ "node_id": id }))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            println!(
+                "Node {id} removed from cluster membership (data groups updated: {}, pending: {})",
+                resp["data_groups_updated"].as_array().map_or(0, Vec::len),
+                resp["data_groups_pending"].as_array().map_or(0, Vec::len),
+            );
         }
         Commands::Metrics { addr } => {
             let body = client

@@ -550,6 +550,13 @@ impl MultiRaftManager {
     /// restarted replicas and adds members that joined after the group formed.
     /// This is what makes membership self-healing regardless of *which* node
     /// leads the group (see the leadership-aware pass in [`Self::reconcile`]).
+    ///
+    /// Convergence runs in both directions: voters that are no longer in the
+    /// cluster roster (removed through `POST /api/v1/cluster/remove`, which
+    /// shrinks the meta group first) are dropped from the voter set, so a dead
+    /// node's slots are reclaimed cluster-wide instead of only on the node that
+    /// served the removal request. Removed voters are not retained as learners,
+    /// so nothing here can fold them back in.
     async fn ensure_group_membership(&self, group_id: &str, raft: &NodusRaft) -> Result<()> {
         let metrics = raft.metrics();
         let (is_leader, current): (bool, BTreeSet<u64>) = {
@@ -602,7 +609,11 @@ impl MultiRaftManager {
             );
         }
         drop(meta);
-        let mut target = current.clone();
+        let roster_ids: BTreeSet<u64> = members.keys().copied().collect();
+        // Start from the voters that are still legitimate roster members; a
+        // voter outside the roster was expelled from the cluster and loses its
+        // slot here (this is the convergent half of node removal).
+        let mut target: BTreeSet<u64> = current.intersection(&roster_ids).copied().collect();
         for (id, addr) in &members {
             if *id == self.node_id {
                 continue;
@@ -619,13 +630,36 @@ impl MultiRaftManager {
                     tracing::warn!("add_learner {id} for {group_id} failed: {e}");
                     continue;
                 }
-                target.insert(*id);
             }
+            target.insert(*id);
         }
         if target != current {
-            raft.change_membership(target, true)
+            // `retain = false`: expelled voters must not linger as learners, or
+            // the roster (which includes learners) would still list them and
+            // this pass would fold them straight back in.
+            raft.change_membership(target, false)
                 .await
                 .map_err(|e| anyhow::anyhow!("change_membership for {group_id}: {e}"))?;
+        }
+        // Purge learners that are no longer in the roster: `retain = false`
+        // above only drops removed *voters*, and a learner slot pointing at a
+        // dead node means pointless replication attempts forever.
+        let stale_learners: BTreeSet<u64> = {
+            let m = raft.metrics().borrow().clone();
+            m.membership_config
+                .membership()
+                .nodes()
+                .map(|(id, _)| *id)
+                .filter(|id| !roster_ids.contains(id))
+                .collect::<BTreeSet<_>>()
+                .difference(&m.membership_config.membership().voter_ids().collect())
+                .copied()
+                .collect()
+        };
+        if !stale_learners.is_empty() {
+            raft.change_membership(openraft::ChangeMembers::RemoveNodes(stale_learners), false)
+                .await
+                .map_err(|e| anyhow::anyhow!("removing stale learners for {group_id}: {e}"))?;
         }
         Ok(())
     }
@@ -1017,6 +1051,97 @@ mod tests {
         assert_eq!(
             voters, 1,
             "no cluster members to add, so still single-voter"
+        );
+    }
+
+    /// A node expelled from the meta roster (the admin removal path shrinks the
+    /// meta group with `retain = false`) must disappear from the roster
+    /// reconcile reads, and reconcile must not fold it back into a led group.
+    /// Voter-shrink against a *dead* voter needs a majority of the old config,
+    /// so it is exercised by the 3-node integration test; here the expelled
+    /// node is a learner, which needs no quorum of the departed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconcile_does_not_readd_a_node_expelled_from_the_meta_roster() {
+        let mgr = manager(); // node_id = 1
+        let catalog = Arc::new(nodus_catalog::MemoryCatalog::new());
+        let meta = mgr
+            .create_meta(
+                Arc::new(nodus_storage_mem::MemKvEngine::new()),
+                catalog.clone(),
+                catalog.clone(),
+                Arc::new(nodus_meta::MemMetaStore::new()),
+            )
+            .await
+            .unwrap();
+        assert!(elect_single_node(&meta).await, "meta group should elect");
+
+        // A led-but-unowned data group, as after a failover onto this node.
+        let group = mgr.get_or_create_data("shard-expel").await.unwrap();
+        mgr.init_single(&group).await;
+        for _ in 0..30 {
+            if group.metrics().borrow().current_leader == Some(1) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+
+        // Node 2 appears in the roster as a learner (as mid-join), and a stale
+        // learner slot for it exists on the data group too...
+        meta.add_learner(2, openraft::BasicNode::new("127.0.0.1:2"), false)
+            .await
+            .unwrap();
+        group
+            .add_learner(2, openraft::BasicNode::new("127.0.0.1:2"), false)
+            .await
+            .unwrap();
+        let mut listed = false;
+        for _ in 0..30 {
+            if mgr.cluster_members().await.contains_key(&2) {
+                listed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(listed, "the learner should appear in the roster");
+
+        // ...and is then expelled from the meta roster, exactly as the removal
+        // endpoint does for a learner-only member.
+        meta.change_membership(
+            openraft::ChangeMembers::RemoveNodes(std::collections::BTreeSet::from([2])),
+            false,
+        )
+        .await
+        .unwrap();
+        let mut expelled = false;
+        for _ in 0..30 {
+            if !mgr.cluster_members().await.contains_key(&2) {
+                expelled = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(expelled, "the roster should reflect the expulsion");
+
+        // Reconcile visits the led group: with the roster back to node 1 alone,
+        // the expelled node is neither re-instantiated nor folded back in, and
+        // its stale learner slot on the data group is purged.
+        mgr.reconcile(&HashMap::new()).await.unwrap();
+        let membership = group
+            .metrics()
+            .borrow()
+            .membership_config
+            .membership()
+            .clone();
+        let voters: BTreeSet<u64> = membership.voter_ids().collect();
+        assert_eq!(
+            voters,
+            BTreeSet::from([1]),
+            "the expelled node must not be re-added to the group"
+        );
+        assert_eq!(
+            membership.nodes().count(),
+            1,
+            "the expelled node's learner slot must be purged"
         );
     }
 

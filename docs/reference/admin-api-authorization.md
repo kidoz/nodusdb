@@ -92,6 +92,35 @@ records an audit event carrying the actor, the action, the method and path, and
 the result. Denials are audited as `Denied` with the reason, so a rejected
 privileged request is as visible as a successful one.
 
+## Cluster membership: join, remove, drain
+
+Membership mutations live under `/api/v1/cluster` (`ManageCluster`) and are
+audited like every other mutation.
+
+- `POST /api/v1/cluster/join` — adds a node (`node_id`, `raft_advertise_addr`)
+  to the meta group. Idempotent; retryable `503` until the meta leader is
+  reachable.
+- `POST /api/v1/cluster/remove` — expels a permanently dead node (`node_id`)
+  from cluster membership: the meta group's voter set shrinks with
+  `retain = false` (the roster reconcile reads, so the node is never folded
+  back in), and every data group this node leads is shrunk in the same call;
+  groups led by other live nodes converge on their leaders' next reconcile
+  pass. The target is never contacted, so a dead node cannot block its own
+  expulsion. Guards: `404` for a node that is not a member, `409` when asked to
+  remove the node serving the request (issue the removal against a surviving
+  peer), when it would remove the last meta voter, or while an upgrade has
+  frozen the roster (`Idle` phase required); `503` when this node is not the
+  meta leader. Removal does **not** move data — shard placements are unchanged,
+  so shards whose primary was the removed node keep serving through their
+  failover leaders.
+- `POST /api/v1/node/drain` (`ManageNode`) — for a *live* node: stops new
+  traffic, cancels sessions, and transfers leadership off the node, but keeps
+  its membership. Drain a live node before decommissioning it; remove a node
+  only when it is gone for good.
+
+`nodusctl cluster remove-node --id <N>` maps to the remove endpoint (like the
+rest of `nodus_cli`, it sends no `Authorization` header — see below).
+
 ## Client support
 
 `nodus_cli` sends no `Authorization` header. Its `/api/v1/` subcommands

@@ -109,8 +109,12 @@ to the per-probe and ReadIndex bounds. Large or slow clusters may need retries.
 There is no automatic coordinator recovery worker; the joining node's existing
 join loop or an operator retry drives the recorded operation forward.
 
-Removal, address replacement, promotion of a pre-existing base learner, and
-cancellation of an approved candidate remain unsupported. Cancellation needs a
+Removal through `POST /api/v1/cluster/remove` is supported only in the `Idle`
+phase — while an upgrade is in flight the roster is frozen, and after
+finalization membership admission is verified-additive only, so the endpoint
+rejects removal with `409` in both. Address replacement, promotion of a
+pre-existing base learner, and cancellation of an approved candidate remain
+unsupported. Cancellation needs a
 fence against a late learner RPC; editing the ledger is unsafe. Restore the
 candidate at the reserved address to resume. Data groups reconcile against the
 base roster plus approved additions, including the pending candidate once it

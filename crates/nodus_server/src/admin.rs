@@ -280,6 +280,7 @@ pub fn admin_routes(state: AdminState) -> Router {
             post(take_leadership),
         )
         .route("/api/v1/cluster/join", post(cluster_join))
+        .route("/api/v1/cluster/remove", post(cluster_remove))
         .route_layer(from_fn_with_state(state.clone(), require_token))
         .with_state(state)
 }
@@ -399,6 +400,196 @@ async fn cluster_join(
             Json(json!({ "error": format!("change_membership failed: {}", e) })),
         ),
     }
+}
+
+#[derive(serde::Deserialize)]
+pub struct RemoveRequest {
+    pub node_id: u64,
+}
+
+/// Expels a node from cluster membership — the operator recourse for a
+/// permanently dead node that still holds voter slots. The meta group's voter
+/// set is the authoritative roster every reconcile pass converges on, so
+/// shrinking it here (with `retain = false`, so the node does not linger as a
+/// learner) is what stops [`MultiRaftManager::ensure_group_membership`] from
+/// ever folding the node back in. Data groups hosted and led by this node are
+/// shrunk in the same call; groups led elsewhere converge on their leaders'
+/// next reconcile pass.
+///
+/// Semantics vs. drain: drain keeps membership and only moves leadership off a
+/// *live* node; removal is for a node that is gone for good — it never contacts
+/// the target, so a dead node does not block its own expulsion.
+///
+/// Guards and retry behavior mirror `cluster_join`:
+///   - `503` (retryable) when there is no meta group yet or this node is not
+///     the meta leader — the caller retries against the current leader;
+///   - `404` when the node is not a cluster member (nothing to remove; a retry
+///     of a completed removal lands here and changes nothing further);
+///   - `409` when removal is unsafe: the target is this node itself (issue the
+///     removal against a surviving peer so the cluster always has a leader
+///     path), it would leave the meta group without voters, or an upgrade has
+///     frozen the roster.
+async fn cluster_remove(
+    State(state): State<AdminState>,
+    Json(req): Json<RemoveRequest>,
+) -> impl axum::response::IntoResponse {
+    let _guard = state.membership_lock.lock().await;
+    let Some(raft) = state
+        .raft_state
+        .rafts
+        .read()
+        .await
+        .get("shard-meta")
+        .cloned()
+    else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "meta group not initialized yet" })),
+        );
+    };
+
+    let metrics = raft.metrics().borrow().clone();
+    if metrics.current_leader != Some(metrics.id) {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "not leader", "leader": metrics.current_leader })),
+        );
+    }
+    // Membership is frozen while an upgrade is in flight, and post-finalization
+    // admission is verified-additive only: removal requires the Idle phase.
+    if let Err(error) = state.upgrade.check_membership_change() {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error": error.to_string()})),
+        );
+    }
+
+    let voters: std::collections::BTreeSet<u64> =
+        metrics.membership_config.membership().voter_ids().collect();
+    let known: std::collections::BTreeSet<u64> = metrics
+        .membership_config
+        .membership()
+        .nodes()
+        .map(|(id, _)| *id)
+        .collect();
+    if !known.contains(&req.node_id) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("node {} is not a cluster member", req.node_id) })),
+        );
+    }
+    if req.node_id == metrics.id {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "refusing to remove the node serving this request; issue the removal against a surviving peer so the cluster keeps a leader path" })),
+        );
+    }
+    if voters.contains(&req.node_id) && voters.len() <= 1 {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "refusing to remove the last meta-group voter" })),
+        );
+    }
+
+    let mut target = voters.clone();
+    target.remove(&req.node_id);
+    if voters.contains(&req.node_id) {
+        // `retain = false` fully expels the voter — it must not linger as a
+        // learner, or the roster would still list it and reconcile would fold
+        // it back into every data group.
+        if let Err(e) = raft.change_membership(target, false).await {
+            // Transient (e.g. leadership changed mid-call, or the surviving
+            // voters cannot currently commit) — retryable.
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "error": format!("change_membership failed: {}", e) })),
+            );
+        }
+    } else {
+        // A learner-only member (an interrupted join): shrinking the voter set
+        // would leave it behind, so remove the node record directly.
+        if let Err(e) = raft
+            .change_membership(
+                openraft::ChangeMembers::RemoveNodes(std::collections::BTreeSet::from([
+                    req.node_id,
+                ])),
+                false,
+            )
+            .await
+        {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "error": format!("change_membership failed: {}", e) })),
+            );
+        }
+    }
+
+    // Best-effort: drop the voter from every data group this node leads. The
+    // target is never contacted — removal exists precisely for nodes that
+    // cannot answer. Groups led by other live nodes keep the dead voter only
+    // until their next reconcile pass, which removes non-roster voters.
+    let mut groups_updated: Vec<String> = Vec::new();
+    let mut groups_pending: Vec<String> = Vec::new();
+    let rafts: Vec<(String, nodus_raftstore::server::NodusRaft)> = state
+        .raft_state
+        .rafts
+        .read()
+        .await
+        .iter()
+        .map(|(id, raft)| (id.clone(), raft.clone()))
+        .collect();
+    for (group_id, raft) in rafts {
+        if group_id == crate::multi_raft::META_SHARD {
+            continue;
+        }
+        let metrics = raft.metrics().borrow().clone();
+        let membership = metrics.membership_config.membership();
+        let group_voters: std::collections::BTreeSet<u64> = membership.voter_ids().collect();
+        let is_member = membership.nodes().any(|(id, _)| *id == req.node_id);
+        if !is_member {
+            continue;
+        }
+        if metrics.current_leader != Some(metrics.id) {
+            groups_pending.push(group_id);
+            continue;
+        }
+        let result = if group_voters.contains(&req.node_id) {
+            let mut target = group_voters;
+            target.remove(&req.node_id);
+            if target.is_empty() {
+                groups_pending.push(group_id);
+                continue;
+            }
+            raft.change_membership(target, false).await.map(|_| ())
+        } else {
+            // Learner-only slot: drop the node record outright.
+            raft.change_membership(
+                openraft::ChangeMembers::RemoveNodes(std::collections::BTreeSet::from([
+                    req.node_id,
+                ])),
+                false,
+            )
+            .await
+            .map(|_| ())
+        };
+        match result {
+            Ok(()) => groups_updated.push(group_id),
+            Err(e) => {
+                tracing::warn!("removing node {} from {} failed: {}", req.node_id, group_id, e);
+                groups_pending.push(group_id);
+            }
+        }
+    }
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "removed": true,
+            "node_id": req.node_id,
+            "data_groups_updated": groups_updated,
+            "data_groups_pending": groups_pending,
+        })),
+    )
 }
 
 async fn slow_queries(State(state): State<AdminState>) -> Json<Vec<SlowQuery>> {

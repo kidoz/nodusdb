@@ -618,3 +618,162 @@ async fn restore_is_rejected_on_a_clustered_node() {
     assert_eq!(body["code"], "restore_clustered_unsupported");
 }
 
+/// Node removal is the operator recourse for a permanently dead node: it is
+/// expelled from the meta roster (so no reconcile pass ever folds it back in)
+/// and from every data group's voter set, while the surviving majority keeps
+/// quorum and serves writes. Guards reject unknown nodes and self-removal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial(cluster)]
+async fn removing_a_dead_node_keeps_quorum_and_is_not_readded() {
+    let mut cluster = ClusterFixture::start(3)
+        .await
+        .expect("3-node cluster forms");
+    assert!(cluster.wait_nodes_live(3, Duration::from_secs(45)).await);
+
+    // A sharded table whose data group spans all three nodes, so removal must
+    // shrink both the meta group and a real data group.
+    let leader = cluster.pg_client(0).await.unwrap();
+    leader
+        .simple_query("CREATE TABLE rm (id INT PRIMARY KEY, v TEXT)")
+        .await
+        .unwrap();
+    let resolved = cluster
+        .admin_get(0, "/api/v1/catalog/table?name=rm")
+        .await
+        .expect("resolve table id");
+    let table = resolved
+        .get("id")
+        .and_then(|v| v.as_str())
+        .expect("table id")
+        .to_string();
+    seed_shard_fixture(&cluster, &table).await;
+    let group_id = format!("shard-{table}");
+    let mut formed = false;
+    for _ in 0..100 {
+        let a = cluster.admin_get(0, "/api/v1/cluster/groups").await;
+        let c = cluster.admin_get(2, "/api/v1/cluster/groups").await;
+        if let (Ok(a), Ok(c)) = (a, c)
+            && voters_of(&a, &group_id) == 3
+            && voters_of(&c, &group_id) == 3
+        {
+            formed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(formed, "data group should span all three nodes");
+    leader
+        .simple_query("INSERT INTO rm (id, v) VALUES (1, 'before')")
+        .await
+        .unwrap();
+
+    // Guards: an unknown node is 404, and removing the node serving the request
+    // is 409 (the removal must be issued against a surviving peer).
+    let http = reqwest::Client::new();
+    let remove_url = format!(
+        "http://{}/api/v1/cluster/remove",
+        cluster.nodes[0].http_addr()
+    );
+    for (node_id, expected) in [
+        (99_u64, reqwest::StatusCode::NOT_FOUND),
+        (1, reqwest::StatusCode::CONFLICT),
+    ] {
+        let resp = http
+            .post(&remove_url)
+            .bearer_auth(nodus_testkit::cluster::ADMIN_TOKEN)
+            .json(&serde_json::json!({ "node_id": node_id }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            expected,
+            "removal guard for node {node_id}"
+        );
+    }
+
+    // Kill node 3 (idx 2), then expel it. Removal never contacts the target, so
+    // the dead node cannot block its own expulsion; retry past a transient
+    // leadership handoff (503).
+    cluster.stop(2).await.unwrap();
+    let mut removed = serde_json::Value::Null;
+    for _ in 0..50 {
+        let resp = http
+            .post(&remove_url)
+            .bearer_auth(nodus_testkit::cluster::ADMIN_TOKEN)
+            .json(&serde_json::json!({ "node_id": 3 }))
+            .send()
+            .await
+            .unwrap();
+        if resp.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            continue;
+        }
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        removed = resp.json().await.unwrap();
+        break;
+    }
+    assert_eq!(removed["removed"], true, "removal must succeed");
+
+    // The surviving two nodes are still a quorum: writes keep committing.
+    leader
+        .simple_query("INSERT INTO rm (id, v) VALUES (2, 'after')")
+        .await
+        .expect("the surviving majority still serves writes");
+
+    // The meta roster converges to two nodes...
+    let mut total = 3_u64;
+    for _ in 0..150 {
+        if let Ok(ov) = cluster.overview(0).await {
+            total = ov["nodes_total"].as_u64().unwrap_or(3);
+            if total == 2 {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert_eq!(total, 2, "meta roster should shrink to the survivors");
+
+    // ...and so does the data group's voter set on both survivors.
+    let mut shrunk = false;
+    for _ in 0..100 {
+        let a = cluster.admin_get(0, "/api/v1/cluster/groups").await;
+        let b = cluster.admin_get(1, "/api/v1/cluster/groups").await;
+        if let (Ok(a), Ok(b)) = (a, b)
+            && voters_of(&a, &group_id) == 2
+            && voters_of(&b, &group_id) == 2
+        {
+            shrunk = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(
+        shrunk,
+        "the removed node should lose its data-group voter slot"
+    );
+
+    // Across several reconcile passes (the loop ticks every 10s), the removed
+    // node must not be re-added — neither to the roster nor to the data group.
+    tokio::time::sleep(Duration::from_secs(21)).await;
+    let ov = cluster.overview(0).await.unwrap();
+    assert_eq!(
+        ov["nodes_total"].as_u64(),
+        Some(2),
+        "reconcile must not re-add the removed node"
+    );
+    let groups = cluster
+        .admin_get(0, "/api/v1/cluster/groups")
+        .await
+        .unwrap();
+    assert_eq!(voters_of(&groups, &group_id), 2);
+
+    // Both rows survive and stay readable on the leader.
+    let rows = leader
+        .query("SELECT v FROM rm ORDER BY id", &[])
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].get::<_, String>(0), "before");
+    assert_eq!(rows[1].get::<_, String>(0), "after");
+}
