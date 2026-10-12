@@ -438,6 +438,7 @@ impl MemExecutor {
         Ok(match plan {
             LogicalPlan::Select {
                 ctes: own,
+                cte_hints,
                 table_name,
                 table_alias,
                 joins,
@@ -463,8 +464,102 @@ impl MemExecutor {
                 // `Result` node's one-time filter, out of the condition.
                 let (hoisted_exists, filter_rest) = split_uncorrelated_exists(filter.as_ref());
                 let filter = filter_rest.as_ref();
+                // A CTE the query reads once, side-effect-free and
+                // non-recursive — and that PostgreSQL can pull up — is
+                // inlined into it, as PostgreSQL 12+ plans them; the rest
+                // materialize once, and a `CTE Scan` reads them.
+                let mut inlined: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                let mut labels: std::collections::HashMap<String, String> =
+                    std::collections::HashMap::new();
+                // Inside a CTE's body its own relations' columns print
+                // qualified, as PostgreSQL's plan texts show them.
+                if rendering_cte_body() {
+                    let mut qualify = |prefix: &str| {
+                        if let Ok((db, schema, table)) = parse_object_name(prefix)
+                            && let Ok(tbl) = self.catalog_reader.get_table(db, schema, table)
+                        {
+                            for column in &tbl.columns {
+                                labels
+                                    .entry(column.name.clone())
+                                    .or_insert(format!("{prefix}.{}", column.name));
+                            }
+                        }
+                    };
+                    qualify(table_alias.as_deref().unwrap_or(table_name));
+                    for join in joins {
+                        if join.lateral.is_none()
+                            && join.semi_subquery.is_none()
+                            && join.table_fn.is_none()
+                        {
+                            qualify(join.table_alias.as_deref().unwrap_or(&join.table_name));
+                        }
+                    }
+                }
+                let mut materialized: Vec<(String, &LogicalPlan)> = Vec::new();
+                for (name, plan) in own {
+                    let body = &**plan;
+                    // A set operation's wrapper and a table function are
+                    // not user CTEs: they render in place either way.
+                    if name.starts_with('\u{0}') || matches!(body, LogicalPlan::TableFunction(_)) {
+                        continue;
+                    }
+                    let mut references = (table_name.as_str() == name.as_str()) as usize
+                        + joins
+                            .iter()
+                            .filter(|join| join.table_name.as_str() == name.as_str())
+                            .count();
+                    for join in joins {
+                        if let Some(lateral) = &join.lateral {
+                            references += plan_cte_references(lateral, name);
+                        }
+                    }
+                    for (other, plan) in own {
+                        if other != name {
+                            references += plan_cte_references(plan, name);
+                        }
+                    }
+                    let mut refs_subplans = Subplans::default();
+                    collect_subplans(projection, &[], filter, having.as_ref(), &mut refs_subplans);
+                    for (plan, _) in refs_subplans.collected() {
+                        references += plan_cte_references(plan, name);
+                    }
+                    if references == 0 {
+                        continue;
+                    }
+                    let hinted = cte_hints
+                        .iter()
+                        .find(|(hinted, _)| hinted == name)
+                        .map(|(_, materialized)| *materialized);
+                    if cte_materialized(body, name, references, hinted) || !cte_pullable(body) {
+                        materialized.push((name.clone(), body));
+                        continue;
+                    }
+                    inlined.insert(name.clone());
+                    // Each reference to the CTE prints the body's columns.
+                    let mut add_labels = |site: &str| {
+                        for (output, target) in cte_outputs(body) {
+                            labels.insert(format!("{site}.{output}"), target);
+                        }
+                    };
+                    if table_name.as_str() == name.as_str() {
+                        add_labels(table_alias.as_deref().unwrap_or(table_name));
+                    }
+                    for join in joins {
+                        if join.table_name.as_str() == name.as_str() {
+                            add_labels(join.table_alias.as_deref().unwrap_or(&join.table_name));
+                        }
+                    }
+                }
+                let shadowed: Vec<String> = own.iter().map(|(name, _)| name.clone()).collect();
+                let _cte_scope = CteScopeGuard::extend(labels, inlined, &shadowed);
+
                 // The plan's subqueries, numbered for the filter text.
+                // A materialized CTE's block counts as one too.
                 let mut subplans = Subplans::default();
+                for (_, plan) in &materialized {
+                    subplans.number(plan, true, false);
+                }
                 collect_subplans(
                     projection,
                     &hoisted_exists,
@@ -900,7 +995,11 @@ impl MemExecutor {
                     } else {
                         "Filter"
                     };
-                    node = node.detail(label, deparse_filter_with(f, true, Some(&subplans)));
+                    node = merge_filter_detail(
+                        node,
+                        label,
+                        deparse_filter_with(f, true, Some(&subplans)),
+                    );
                     node.rows = (node.rows / 3.0).max(1.0).round();
                 }
                 // The subqueries the filter and projection read hang off the
@@ -910,6 +1009,14 @@ impl MemExecutor {
                 let mut wrappers = Vec::new();
                 for (plan, entry) in subplans.collected() {
                     if hoisted.iter().any(|h| fingerprint(h) == fingerprint(plan)) {
+                        continue;
+                    }
+                    // A materialized CTE's plan is numbered here but
+                    // rendered as its own `CTE c` block.
+                    if materialized
+                        .iter()
+                        .any(|(_, block)| fingerprint(block) == fingerprint(plan))
+                    {
                         continue;
                     }
                     let tree = self.explain_node(ctx, plan, &scope)?;
@@ -952,7 +1059,7 @@ impl MemExecutor {
                     result.subplans = wrappers;
                     node = result.detail("One-Time Filter", conditions.join(" AND "));
                 }
-                let qualified = !single;
+                let qualified = !single || rendering_cte_body();
                 let sort: Vec<SortKey> = if sort.is_empty() {
                     order_by.iter().cloned().map(SortKey::from_legacy).collect()
                 } else {
@@ -1166,6 +1273,25 @@ impl MemExecutor {
                     limited.rows = rows.max(1.0);
                     node = limited;
                 }
+                // A materialized CTE's plan hangs off the query's top
+                // node, before its other subplans.
+                let mut cte_at = 0;
+                for (name, plan) in materialized {
+                    let _cte_body = CteBodyGuard::enter();
+                    let tree = self.explain_node(ctx, plan, &scope)?;
+                    drop(_cte_body);
+                    let mut block = Node::new(
+                        &format!("CTE {name}"),
+                        format!("CTE {name}"),
+                        tree.rows,
+                        tree.width,
+                    );
+                    block.startup = tree.startup;
+                    block.total = tree.total;
+                    block.children = vec![tree];
+                    node.subplans.insert(cte_at, block);
+                    cte_at += 1;
+                }
                 node
             }
             LogicalPlan::SetOp {
@@ -1319,10 +1445,35 @@ impl MemExecutor {
                 node.width = 0;
                 node
             }
-            LogicalPlan::With { ctes: own, body } => {
+            LogicalPlan::With {
+                ctes: own,
+                cte_hints,
+                body,
+            } => {
                 let mut scope: Vec<(String, &LogicalPlan)> = ctes.to_vec();
                 scope.extend(own.iter().map(|(n, p)| (n.clone(), &**p)));
-                self.explain_node(ctx, body, &scope)?
+                let mut node = self.explain_node(ctx, body, &scope)?;
+                // A `WITH` over a data-modifying statement materializes the
+                // queries it reads: each one's plan hangs off the top node.
+                for (name, plan) in own {
+                    if plan_cte_references(body, name) == 0 {
+                        continue;
+                    }
+                    let _cte_body = CteBodyGuard::enter();
+                    let tree = self.explain_node(ctx, &**plan, &scope)?;
+                    drop(_cte_body);
+                    let mut block = Node::new(
+                        &format!("CTE {name}"),
+                        format!("CTE {name}"),
+                        tree.rows,
+                        tree.width,
+                    );
+                    block.startup = tree.startup;
+                    block.total = tree.total;
+                    block.children = vec![tree];
+                    node.subplans.push(block);
+                }
+                node
             }
             LogicalPlan::CreateTableAs { query, .. } => self.explain_node(ctx, query, ctes)?,
             _ => anyhow::bail!("EXPLAIN is not supported for this statement"),
@@ -1738,14 +1889,16 @@ impl MemExecutor {
     ) -> Result<Node> {
         let with_filter = |mut node: Node| {
             if let Some(f) = filter {
-                node = node.detail("Filter", deparse_filter_with(f, false, subplans));
+                node = merge_filter_detail(node, "Filter", deparse_filter_with(f, false, subplans));
                 node.total += node.rows * CPU_OPERATOR;
                 node.rows = (node.rows * selectivity(f)).max(1.0).round();
             }
             node
         };
         if let Some((name, plan)) = ctes.iter().rev().find(|(name, _)| name == table_name) {
+            let _cte_body = CteBodyGuard::enter();
             let child = self.explain_node(ctx, plan, ctes)?;
+            drop(_cte_body);
             // The wrapper a query over a set operation or VALUES list gets.
             if name == "\u{0}result" {
                 return Ok(with_filter(child));
@@ -1753,13 +1906,23 @@ impl MemExecutor {
             if let LogicalPlan::TableFunction(spec) = plan {
                 return Ok(with_filter(function_scan(spec)));
             }
+            // The body of a CTE the query reads once stands in for the
+            // reference, as PostgreSQL's inlining plans it.
+            if cte_inlined_here(table_name) {
+                return Ok(with_filter(child));
+            }
+
+            // A materialized CTE is read by a `CTE Scan`; its plan hangs
+            // off the query's top node as a `CTE c` block.
             let alias = relation_name(table_alias.unwrap_or(name));
-            let node = Node::over(
-                "Subquery Scan",
-                format!("Subquery Scan on {alias}"),
-                vec![child],
-            )
-            .prop("Alias", json!(alias));
+            let label = if alias == relation_name(name) {
+                format!("CTE Scan on {name}")
+            } else {
+                format!("CTE Scan on {name} {alias}")
+            };
+            let node = Node::new("CTE Scan", label, child.rows, child.width)
+                .prop("CTE Name", json!(name))
+                .prop("Alias", json!(alias));
             return Ok(with_filter(node));
         }
         let (db_name, schema_name, table_only) = parse_object_name(table_name)?;
@@ -2169,7 +2332,111 @@ fn projection_width(projection: &[ProjectionItem]) -> u32 {
 
 /// A column reference as a plan shows it: without its qualifier when the
 /// query reads one relation.
+thread_local! {
+    /// The plan of an inlined CTE's column references: a reference to the
+    /// CTE's output prints the body's own name (or expression), as
+    /// PostgreSQL's inlined plans do. Also the names being inlined.
+    static CTE_SCOPE: std::cell::RefCell<CteScope> =
+        std::cell::RefCell::new(CteScope::default());
+}
+
+#[derive(Default)]
+struct CteScope {
+    /// Stored reference -> the stored reference it prints as.
+    labels: std::collections::HashMap<String, String>,
+    /// The CTE names inlined at this level.
+    inlined: std::collections::HashSet<String>,
+}
+
+/// Adds a `Filter`-style detail, ANDing into the existing one — a scan
+/// shows one filter, as PostgreSQL plans it.
+fn merge_filter_detail(mut node: Node, name: &'static str, text: String) -> Node {
+    match node
+        .details
+        .iter_mut()
+        .find(|(detail, _, _)| *detail == name)
+    {
+        Some((_, existing, json)) => {
+            *existing = format!("({existing} AND {text})");
+            *json = json!(existing.clone());
+        }
+        None => node = node.detail(name, text),
+    }
+    node
+}
+
+/// Restores the enclosing CTE scope when dropped.
+struct CteScopeGuard(CteScope);
+
+impl CteScopeGuard {
+    fn extend(
+        labels: std::collections::HashMap<String, String>,
+        inlined: std::collections::HashSet<String>,
+        shadowed: &[String],
+    ) -> Self {
+        let previous = CTE_SCOPE.with(|scope| {
+            let mut scope = scope.borrow_mut();
+            let previous = std::mem::take(&mut *scope);
+            scope.labels = previous.labels.clone();
+            // A CTE this level declares hides the enclosing one of the
+            // same name.
+            for name in shadowed {
+                scope
+                    .labels
+                    .retain(|reference, _| !reference.starts_with(&format!("{name}.")));
+            }
+            scope.labels.extend(labels);
+            scope.inlined = previous.inlined.clone();
+            for name in shadowed {
+                scope.inlined.remove(name);
+            }
+            scope.inlined.extend(inlined);
+            previous
+        });
+        CteScopeGuard(previous)
+    }
+}
+
+impl Drop for CteScopeGuard {
+    fn drop(&mut self) {
+        let previous = std::mem::take(&mut self.0);
+        CTE_SCOPE.with(|scope| *scope.borrow_mut() = previous);
+    }
+}
+
+/// Whether a CTE read at this level is inlined into it.
+fn cte_inlined_here(name: &str) -> bool {
+    CTE_SCOPE.with(|scope| scope.borrow().inlined.contains(name))
+}
+
+thread_local! {
+    /// Whether a CTE's body is being rendered: its columns print
+    /// qualified, as PostgreSQL's plan texts show them.
+    static CTE_BODY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn rendering_cte_body() -> bool {
+    CTE_BODY.with(|body| body.get())
+}
+
+/// Sets [`CTE_BODY`] for the body's rendering, restoring it after.
+struct CteBodyGuard(bool);
+
+impl CteBodyGuard {
+    fn enter() -> Self {
+        CteBodyGuard(CTE_BODY.with(|body| body.replace(true)))
+    }
+}
+
+impl Drop for CteBodyGuard {
+    fn drop(&mut self) {
+        CTE_BODY.with(|body| body.set(self.0));
+    }
+}
+
 fn column(name: &str, qualified: bool) -> String {
+    let renamed = CTE_SCOPE.with(|scope| scope.borrow().labels.get(name).cloned());
+    let name = renamed.as_deref().unwrap_or(name);
     if qualified {
         name.to_string()
     } else {
@@ -2315,6 +2582,223 @@ fn window_expr_text(expr: &ScalarExpr, qualified: bool) -> String {
         ScalarExpr::Column(name) => column(name, qualified),
         other => format!("({})", deparse_scalar(other, qualified)),
     }
+}
+
+/// The columns a CTE's body yields, as `(output name, stored reference)`
+/// pairs — what a reference to that column prints as when inlined.
+fn cte_outputs(plan: &LogicalPlan) -> Vec<(String, String)> {
+    match plan {
+        LogicalPlan::Renamed { input, columns } => {
+            let mut outputs = cte_outputs(input);
+            for (output, column_name) in outputs.iter_mut().zip(columns) {
+                *output = (column_name.clone(), column_name.clone());
+            }
+            outputs
+        }
+        LogicalPlan::ViewCheckOption { query, .. } => cte_outputs(query),
+        LogicalPlan::Select {
+            projection,
+            table_name,
+            table_alias,
+            ..
+        } => {
+            // A bare column is the body's own relation's column.
+            let prefix = table_alias.as_deref().unwrap_or(table_name);
+            let qualified = |name: &str| {
+                if name.contains('.') {
+                    name.to_string()
+                } else {
+                    format!("{prefix}.{name}")
+                }
+            };
+            projection
+                .iter()
+                .map(|item| match item {
+                    ProjectionItem::Column(c) => {
+                        (c.rsplit('.').next().unwrap_or(c).to_string(), qualified(c))
+                    }
+                    ProjectionItem::AliasedColumn(c, alias) => (alias.clone(), qualified(c)),
+                    ProjectionItem::Expr {
+                        expr: ScalarExpr::Column(c),
+                        alias,
+                    } => (
+                        alias
+                            .clone()
+                            .unwrap_or_else(|| c.rsplit('.').next().unwrap_or(c).to_string()),
+                        qualified(c),
+                    ),
+                    ProjectionItem::Expr { expr, alias } => (
+                        alias.clone().unwrap_or_else(|| "?column?".to_string()),
+                        format!("({})", deparse_scalar(expr, true)),
+                    ),
+                    other => (projection_text(other, false), projection_text(other, true)),
+                })
+                .collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Whether PostgreSQL can pull a CTE's body into the query that reads
+/// it: a limit, offset or distinct on the body's own query is a barrier.
+fn cte_pullable(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Select {
+            distinct,
+            distinct_on,
+            ..
+        } => !*distinct && distinct_on.is_empty(),
+        LogicalPlan::Renamed { input, .. } | LogicalPlan::ViewCheckOption { query: input, .. } => {
+            cte_pullable(input)
+        }
+        _ => true,
+    }
+}
+
+/// Whether a CTE must be materialized: it reads itself (recursive), its
+/// body modifies data, or the query reads it more than once — PostgreSQL
+/// inlines only a single-use, side-effect-free, non-recursive CTE.
+fn cte_materialized(
+    plan: &LogicalPlan,
+    name: &str,
+    references: usize,
+    hinted: Option<bool>,
+) -> bool {
+    plan_cte_references(plan, name) > 0
+        || plan_contains_dml(plan)
+        // An explicit `AS [NOT] MATERIALIZED` decides; otherwise a CTE
+        // read more than once materializes.
+        || hinted.unwrap_or(references != 1)
+}
+
+/// Whether a plan runs a data-modifying statement (which is never inlined).
+fn plan_contains_dml(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Insert { .. }
+        | LogicalPlan::Update { .. }
+        | LogicalPlan::Delete { .. }
+        | LogicalPlan::Merge { .. } => true,
+        LogicalPlan::Renamed { input, .. } | LogicalPlan::ViewCheckOption { query: input, .. } => {
+            plan_contains_dml(input)
+        }
+        LogicalPlan::SetOp { left, right, .. } => {
+            plan_contains_dml(left) || plan_contains_dml(right)
+        }
+        LogicalPlan::RecursiveCte {
+            seed,
+            recursive_term,
+            ..
+        } => plan_contains_dml(seed) || plan_contains_dml(recursive_term),
+        LogicalPlan::With { ctes, body, .. } => {
+            ctes.iter().any(|(_, plan)| plan_contains_dml(plan)) || plan_contains_dml(body)
+        }
+        LogicalPlan::Select { ctes, .. } => ctes.iter().any(|(_, plan)| plan_contains_dml(plan)),
+        _ => false,
+    }
+}
+
+/// The references a plan makes to a CTE: FROM and join members at every
+/// level, plus the subqueries its conditions read.
+fn plan_cte_references(plan: &LogicalPlan, name: &str) -> usize {
+    match plan {
+        LogicalPlan::Select {
+            table_name,
+            joins,
+            ctes,
+            projection,
+            filter,
+            having,
+            ..
+        } => {
+            let mut count = (table_name == name) as usize;
+            for join in joins {
+                if join.table_name == name {
+                    count += 1;
+                }
+                if let Some(lateral) = &join.lateral {
+                    count += plan_cte_references(lateral, name);
+                }
+                if let Some(sub) = &join.semi_subquery {
+                    count += plan_cte_references(sub, name);
+                }
+            }
+            for (other, plan) in ctes {
+                if other != name {
+                    count += plan_cte_references(plan, name);
+                }
+            }
+            let mut subplans = Subplans::default();
+            collect_subplans(
+                projection,
+                &[],
+                filter.as_ref(),
+                having.as_ref(),
+                &mut subplans,
+            );
+            for (plan, _) in subplans.collected() {
+                count += plan_cte_references(plan, name);
+            }
+            count
+        }
+        LogicalPlan::Renamed { input, .. } | LogicalPlan::ViewCheckOption { query: input, .. } => {
+            plan_cte_references(input, name)
+        }
+        LogicalPlan::SetOp { left, right, .. } => {
+            plan_cte_references(left, name) + plan_cte_references(right, name)
+        }
+        LogicalPlan::RecursiveCte {
+            seed,
+            recursive_term,
+            ..
+        } => plan_cte_references(seed, name) + plan_cte_references(recursive_term, name),
+        LogicalPlan::With { ctes, body, .. } => {
+            ctes.iter()
+                .filter(|(other, _)| other != name)
+                .map(|(_, plan)| plan_cte_references(plan, name))
+                .sum::<usize>()
+                + plan_cte_references(body, name)
+        }
+        LogicalPlan::Update {
+            table_name,
+            joins,
+            filter,
+            ..
+        }
+        | LogicalPlan::Delete {
+            table_name,
+            joins,
+            filter,
+            ..
+        } => {
+            (table_name == name) as usize
+                + joins.iter().filter(|join| join.table_name == name).count()
+                + dml_filter_references(filter.as_ref(), name)
+        }
+        LogicalPlan::Insert {
+            table_name, source, ..
+        } => {
+            (table_name == name) as usize
+                + source.as_ref().map_or(0, |p| plan_cte_references(p, name))
+        }
+        LogicalPlan::Merge {
+            table_name, source, ..
+        } => (table_name == name) as usize + plan_cte_references(source, name),
+        _ => 0,
+    }
+}
+
+/// The references a statement's filter subqueries make to a CTE.
+fn dml_filter_references(filter: Option<&FilterExpr>, name: &str) -> usize {
+    let Some(filter) = filter else {
+        return 0;
+    };
+    let mut subplans = Subplans::default();
+    number_filter_subplans(filter, &mut subplans);
+    subplans
+        .collected()
+        .iter()
+        .map(|(plan, _)| plan_cte_references(plan, name))
+        .sum()
 }
 
 /// The key two calls share when their `OVER` is the same window:

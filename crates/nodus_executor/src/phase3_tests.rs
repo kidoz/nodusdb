@@ -222,6 +222,7 @@ fn test_ddl_and_subqueries() {
     .unwrap();
 
     let subquery = LogicalPlan::Select {
+        cte_hints: Vec::new(),
         only: false,
         sample: None,
         ctes: vec![],
@@ -256,6 +257,7 @@ fn test_ddl_and_subqueries() {
         .execute_logical(
             &ctx,
             LogicalPlan::Select {
+                cte_hints: Vec::new(),
                 only: false,
                 sample: None,
                 ctes: vec![],
@@ -586,6 +588,7 @@ fn test_secondary_indexing() {
         .execute_logical(
             &ctx,
             LogicalPlan::Select {
+                cte_hints: Vec::new(),
                 only: false,
                 sample: None,
                 ctes: vec![],
@@ -646,6 +649,7 @@ fn test_secondary_indexing() {
         .execute_logical(
             &ctx,
             LogicalPlan::Select {
+                cte_hints: Vec::new(),
                 only: false,
                 sample: None,
                 ctes: vec![],
@@ -678,6 +682,7 @@ fn test_secondary_indexing() {
         .execute_logical(
             &ctx,
             LogicalPlan::Select {
+                cte_hints: Vec::new(),
                 only: false,
                 sample: None,
                 ctes: vec![],
@@ -730,6 +735,7 @@ fn test_secondary_indexing() {
         .execute_logical(
             &ctx,
             LogicalPlan::Select {
+                cte_hints: Vec::new(),
                 only: false,
                 sample: None,
                 ctes: vec![],
@@ -867,6 +873,7 @@ fn test_index_value_containing_separator_does_not_overmatch() {
         exec.execute_logical(
             &ctx,
             LogicalPlan::Select {
+                cte_hints: Vec::new(),
                 only: false,
                 sample: None,
                 ctes: vec![],
@@ -1011,6 +1018,7 @@ fn test_alter_table_migrations() {
         .execute_logical(
             &ctx,
             LogicalPlan::Select {
+                cte_hints: Vec::new(),
                 only: false,
                 sample: None,
                 ctes: vec![],
@@ -1056,6 +1064,7 @@ fn test_alter_table_migrations() {
         .execute_logical(
             &ctx,
             LogicalPlan::Select {
+                cte_hints: Vec::new(),
                 only: false,
                 sample: None,
                 ctes: vec![],
@@ -1099,6 +1108,7 @@ fn test_alter_table_migrations() {
         .execute_logical(
             &ctx,
             LogicalPlan::Select {
+                cte_hints: Vec::new(),
                 only: false,
                 sample: None,
                 ctes: vec![],

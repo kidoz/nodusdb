@@ -228,6 +228,7 @@ fn select_plan(
     filter: Option<FilterExpr>,
 ) -> LogicalPlan {
     LogicalPlan::Select {
+        cte_hints: Vec::new(),
         only: false,
         sample: None,
         ctes: vec![],
@@ -322,6 +323,7 @@ fn streaming_projects_columns_with_where_and_limit() {
         right: Operand::Literal(Value::Text("n7".into())),
     }));
     let plan = LogicalPlan::Select {
+        cte_hints: Vec::new(),
         only: false,
         sample: None,
         ctes: vec![],
@@ -375,6 +377,7 @@ fn streaming_falls_back_for_non_streamable_shapes() {
     // ORDER BY needs the full input, so this takes the fallback path; the result
     // must still be correct (and sorted).
     let plan = LogicalPlan::Select {
+        cte_hints: Vec::new(),
         only: false,
         sample: None,
         ctes: vec![],

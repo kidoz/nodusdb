@@ -873,10 +873,14 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
             };
             let body = plan_statement(statement, params)?;
             match &query.with {
-                Some(with) => Ok(LogicalPlan::With {
-                    ctes: plan_ctes(with, params)?,
-                    body: Box::new(body),
-                }),
+                Some(with) => {
+                    let (ctes, cte_hints) = plan_ctes(with, params)?;
+                    Ok(LogicalPlan::With {
+                        ctes,
+                        cte_hints,
+                        body: Box::new(body),
+                    })
+                }
                 None => Ok(body),
             }
         }

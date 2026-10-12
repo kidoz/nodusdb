@@ -62,6 +62,7 @@ pub fn plan_copy_out(sql: &str) -> Result<(LogicalPlan, CopyOutputFormat, bool)>
         } => LogicalPlan::Select {
             only: false,
             ctes: vec![],
+            cte_hints: Vec::new(),
             table_name: table_name.to_string(),
             table_alias: None,
             joins: vec![],

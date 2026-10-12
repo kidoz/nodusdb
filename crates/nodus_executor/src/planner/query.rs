@@ -157,9 +157,9 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
 
     let _depth_guard = PlanDepthGuard::enter()?;
 
-    let mut ctes = match &query.with {
+    let (mut ctes, cte_hints) = match &query.with {
         Some(with) => plan_ctes(with, params)?,
-        None => Vec::new(),
+        None => (Vec::new(), Vec::new()),
     };
 
     if let SetExpr::SetOperation {
@@ -196,7 +196,7 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
             left: Box::new(left_plan),
             right: Box::new(right_plan),
         };
-        return select_from_result(set_op, ctes, query, params);
+        return select_from_result(set_op, ctes, cte_hints, query, params);
     }
 
     // A data-modifying statement as a query (a CTE's body): its RETURNING
@@ -220,7 +220,7 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
         {
             return Ok(inner_plan);
         }
-        return select_from_result(inner_plan, ctes, query, params);
+        return select_from_result(inner_plan, ctes, cte_hints, query, params);
     }
 
     // A `VALUES` list as the query: `VALUES (1, 'a'), (2, 'b')`.
@@ -243,7 +243,7 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
             anyhow::bail!("VALUES lists must all be the same length");
         }
         let rows = typed_values_rows(rows);
-        return select_from_result(LogicalPlan::Values { rows }, ctes, query, params);
+        return select_from_result(LogicalPlan::Values { rows }, ctes, cte_hints, query, params);
     }
 
     let SetExpr::Select(select) = &*query.body else {
@@ -259,7 +259,13 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
         && let [item] = select.projection.as_slice()
         && let Some(spec) = select_list_table_function(item, params)
     {
-        return select_from_result(LogicalPlan::TableFunction(spec), ctes, query, params);
+        return select_from_result(
+            LogicalPlan::TableFunction(spec),
+            ctes,
+            cte_hints,
+            query,
+            params,
+        );
     }
 
     // Set-returning functions elsewhere in a FROM-less select list: the
@@ -286,6 +292,7 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
         return Ok(LogicalPlan::Select {
             only: false,
             ctes,
+            cte_hints,
             table_name: SRF_RELATION.to_string(),
             table_alias: None,
             joins: Vec::new(),
@@ -358,7 +365,7 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
             filter: parse_predicates(&select.selection, params)?,
             deferred,
         };
-        return select_from_result(literal, ctes, query, params);
+        return select_from_result(literal, ctes, cte_hints, query, params);
     }
     let (table_name, table_alias, mut joins, sample, only) =
         plan_from(&select.from, &mut ctes, params)?;
@@ -518,6 +525,7 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
     Ok(LogicalPlan::Select {
         only,
         ctes,
+        cte_hints,
         table_name,
         table_alias,
         joins,
@@ -537,12 +545,14 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
     })
 }
 
-/// Plans a `WITH` list: each CTE's query, recursive or renamed as declared.
+/// Plans a `WITH` list: each CTE's query, recursive or renamed as
+/// declared, and its explicit `AS [NOT] MATERIALIZED` hint.
 pub(crate) fn plan_ctes(
     with: &sqlparser::ast::With,
     params: &[Value],
-) -> Result<Vec<(String, Box<LogicalPlan>)>> {
+) -> Result<(Vec<(String, Box<LogicalPlan>)>, Vec<(String, bool)>)> {
     let mut ctes = Vec::new();
+    let mut hints = Vec::new();
     for cte in &with.cte_tables {
         let cte_name = cte.alias.name.value.clone();
         let column_aliases: Vec<String> = cte
@@ -577,9 +587,18 @@ pub(crate) fn plan_ctes(
             },
             other => other,
         };
+        match cte.materialized {
+            Some(sqlparser::ast::CteAsMaterialized::Materialized) => {
+                hints.push((cte_name.clone(), true));
+            }
+            Some(sqlparser::ast::CteAsMaterialized::NotMaterialized) => {
+                hints.push((cte_name.clone(), false));
+            }
+            None => {}
+        }
         ctes.push((cte_name, Box::new(cte_plan)));
     }
-    Ok(ctes)
+    Ok((ctes, hints))
 }
 
 /// The `TABLESAMPLE` clause of a FROM factor, as the plan carries it.
@@ -780,6 +799,7 @@ pub(crate) fn plan_relations(
     let (table_name, table_alias, joins, sample, only) = plan_from(from, &mut ctes, params)?;
     Ok(LogicalPlan::Select {
         ctes,
+        cte_hints: Vec::new(),
         table_name,
         table_alias,
         joins,
@@ -2849,6 +2869,7 @@ fn plan_join(
 fn select_from_result(
     result: LogicalPlan,
     mut ctes: Vec<(String, Box<LogicalPlan>)>,
+    cte_hints: Vec<(String, bool)>,
     query: &sqlparser::ast::Query,
     params: &[Value],
 ) -> Result<LogicalPlan> {
@@ -2871,6 +2892,7 @@ fn select_from_result(
     Ok(LogicalPlan::Select {
         only: false,
         ctes,
+        cte_hints,
         table_name: name,
         table_alias: None,
         joins: Vec::new(),

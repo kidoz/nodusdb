@@ -291,6 +291,7 @@ fn create_insert_select_round_trip() {
         .execute_logical(
             &ctx,
             LogicalPlan::Select {
+                cte_hints: Vec::new(),
                 only: false,
                 sample: None,
                 ctes: vec![],
@@ -321,6 +322,7 @@ fn create_insert_select_round_trip() {
         .execute_logical(
             &ctx,
             LogicalPlan::Select {
+                cte_hints: Vec::new(),
                 only: false,
                 sample: None,
                 ctes: vec![],
@@ -481,6 +483,7 @@ fn rows_keyed_by_declared_pk_not_first_column() {
     }
 
     let select_all = || LogicalPlan::Select {
+        cte_hints: Vec::new(),
         only: false,
         sample: None,
         ctes: vec![],
@@ -619,6 +622,7 @@ fn typed_values_round_trip_and_filter_by_int() {
         .execute_logical(
             &ctx,
             LogicalPlan::Select {
+                cte_hints: Vec::new(),
                 only: false,
                 sample: None,
                 ctes: vec![],
@@ -735,6 +739,7 @@ fn update_and_delete_rows() {
         exec.execute_logical(
             &ctx,
             LogicalPlan::Select {
+                cte_hints: Vec::new(),
                 only: false,
                 sample: None,
                 ctes: vec![],
@@ -900,6 +905,7 @@ fn test_join_execution() {
     }
 
     let join_plan = LogicalPlan::Select {
+        cte_hints: Vec::new(),
         only: false,
         sample: None,
         ctes: vec![],
@@ -1044,6 +1050,7 @@ fn transactions_are_isolated_per_session() {
         exec.execute_logical(
             ctx,
             LogicalPlan::Select {
+                cte_hints: Vec::new(),
                 only: false,
                 sample: None,
                 ctes: vec![],
@@ -1351,7 +1358,6 @@ fn test_left_outer_join() {
     assert_eq!(bob_row.values[4], Value::Null); // order.amount
 }
 
-
 // ---------------------------------------------------------------------------
 // Regression: a failed `kv.commit` after `commit_or_release` must release the
 // transaction's intents instead of leaking them (they would block every later
@@ -1493,13 +1499,15 @@ fn failed_kv_commit_releases_intents_explicit_txn() {
 
     sql(&exec, &ctx, "BEGIN").unwrap();
     sql(&exec, &ctx, "INSERT INTO t VALUES (1)").unwrap();
-    kv.fail_commit.store(true, std::sync::atomic::Ordering::SeqCst);
+    kv.fail_commit
+        .store(true, std::sync::atomic::Ordering::SeqCst);
     let error = sql(&exec, &ctx, "COMMIT").unwrap_err();
     assert!(
         error.to_string().contains("injected commit failure"),
         "client-facing error is the storage failure, got: {error}"
     );
-    kv.fail_commit.store(false, std::sync::atomic::Ordering::SeqCst);
+    kv.fail_commit
+        .store(false, std::sync::atomic::Ordering::SeqCst);
 
     // The failed commit released its intents: nothing is pending, and a later
     // transaction writing the same key neither conflicts nor resurrects the
@@ -1516,13 +1524,15 @@ fn failed_kv_commit_releases_intents_implicit_txn() {
     let (exec, ctx) = executor_with_kv(kv.clone());
     sql(&exec, &ctx, "CREATE TABLE t (id INT PRIMARY KEY)").unwrap();
 
-    kv.fail_commit.store(true, std::sync::atomic::Ordering::SeqCst);
+    kv.fail_commit
+        .store(true, std::sync::atomic::Ordering::SeqCst);
     let error = sql(&exec, &ctx, "INSERT INTO t VALUES (1)").unwrap_err();
     assert!(
         error.to_string().contains("injected commit failure"),
         "client-facing error is the storage failure, got: {error}"
     );
-    kv.fail_commit.store(false, std::sync::atomic::Ordering::SeqCst);
+    kv.fail_commit
+        .store(false, std::sync::atomic::Ordering::SeqCst);
 
     assert!(!kv.has_pending_intents(b"").unwrap());
     sql(&exec, &ctx, "INSERT INTO t VALUES (1)").unwrap();

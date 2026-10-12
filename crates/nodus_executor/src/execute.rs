@@ -233,6 +233,7 @@ impl MemExecutor {
                 distinct_on,
                 sample,
                 only,
+                ..
             } => {
                 // Older plans carry their keys in `order_by`.
                 let sort = if sort.is_empty() {
@@ -324,7 +325,7 @@ impl MemExecutor {
                 cascade,
             } => self.exec_truncate(ctx, tables, restart_identity, cascade),
             LogicalPlan::Explain { plan, options } => self.exec_explain(ctx, *plan, options),
-            LogicalPlan::With { ctes, body } => {
+            LogicalPlan::With { ctes, body, .. } => {
                 let _bindings = self.bind_ctes(ctx, ctes)?;
                 self.execute_logical_inner(ctx, *body)
             }

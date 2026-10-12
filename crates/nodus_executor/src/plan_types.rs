@@ -1707,6 +1707,11 @@ pub enum LogicalPlan {
     },
     Select {
         ctes: Vec<(String, Box<LogicalPlan>)>,
+        /// The `AS MATERIALIZED` / `AS NOT MATERIALIZED` CTEs, by name
+        /// (`true` materialized, `false` not). Defaulted so older plans
+        /// decode.
+        #[serde(default)]
+        cte_hints: Vec<(String, bool)>,
         table_name: String,
         table_alias: Option<String>,
         joins: Vec<Join>,
@@ -2043,6 +2048,11 @@ pub enum LogicalPlan {
     /// it can read.
     With {
         ctes: Vec<(String, Box<LogicalPlan>)>,
+        /// The `AS MATERIALIZED` / `AS NOT MATERIALIZED` CTEs, by name
+        /// (`true` materialized, `false` not). Defaulted so older plans
+        /// decode.
+        #[serde(default)]
+        cte_hints: Vec<(String, bool)>,
         body: Box<LogicalPlan>,
     },
     /// `TRUNCATE`: empties each table, and with `RESTART IDENTITY` restarts

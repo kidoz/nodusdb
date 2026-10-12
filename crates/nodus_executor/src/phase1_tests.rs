@@ -95,6 +95,7 @@ fn test_offset_distinct_returning() {
             .execute_logical(
                 &ctx,
                 LogicalPlan::Select {
+                    cte_hints: Vec::new(),
                     only: false,
                     sample: None,
                     ctes: vec![],

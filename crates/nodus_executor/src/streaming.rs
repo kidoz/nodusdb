@@ -59,6 +59,7 @@ impl MemExecutor {
             distinct_on,
             sample,
             only,
+            ..
         } = &plan
             && sample.is_none()
             && ctes.is_empty()

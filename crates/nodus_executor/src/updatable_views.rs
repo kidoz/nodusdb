@@ -318,6 +318,7 @@ impl MemExecutor {
         let plan = LogicalPlan::Select {
             only: false,
             ctes: Vec::new(),
+            cte_hints: Vec::new(),
             table_name: table_name.clone(),
             table_alias: table_alias.clone(),
             joins: Vec::new(),

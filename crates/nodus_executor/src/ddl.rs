@@ -1730,6 +1730,7 @@ fn shape_only(query: LogicalPlan) -> LogicalPlan {
             sample,
             ..
         } => LogicalPlan::Select {
+            cte_hints: Vec::new(),
             only: false,
             ctes,
             table_name,
