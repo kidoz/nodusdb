@@ -1,0 +1,123 @@
+# CTE plans: a CTE the query reads once — non-recursive, side-effect-free
+# (its body modifies no data) and without a DISTINCT — is inlined into
+# the query that reads it, as PostgreSQL 12+ plans them: its plan stands
+# where the reference was, and references to its columns print the
+# body's own names. The rest materialize once: a `CTE c` block hangs off
+# the query's top node and `CTE Scan on c` reads it. `AS MATERIALIZED`
+# and `AS NOT MATERIALIZED` decide explicitly. PostgreSQL numbers the
+# CTE's block among the statement's subplans and gives a second
+# reference's scan a `c_1` (or its relation's `g1_1`) alias, and it
+# may swap an inlined join's
+# inputs by cost; NodusDB leaves those as written — the rows agree.
+# Plans and results otherwise from PostgreSQL 18.4.
+
+statement ok
+drop table if exists g1 cascade;
+
+statement ok
+drop table if exists g2 cascade;
+
+statement ok
+create table g1 (k int, v int);
+
+statement ok
+create table g2 (k int, w int);
+
+statement ok
+insert into g1 select g % 3, g from generate_series(1, 90) g;
+
+statement ok
+insert into g2 select g % 4, g from generate_series(1, 40) g;
+
+statement ok
+analyze g1;
+
+statement ok
+analyze g2;
+
+# Read once: inlined.
+query T
+explain (costs off) with c as (select k, count(*) n from g1 group by k) select * from c;
+----
+HashAggregate
+  Group Key: g1.k
+  ->  Seq Scan on g1
+
+query T
+explain (costs off) with c as (select k from g1) select * from c where c.k > 1;
+----
+Seq Scan on g1
+  Filter: (k > 1)
+
+query T
+explain (costs off) select x.k from (select k from g1) x;
+----
+Seq Scan on g1
+
+query T
+explain (costs off) select x.k from (select k from g1 limit 5) x;
+----
+Limit
+  ->  Seq Scan on g1
+
+query T
+explain (costs off) with c as (select k from g1 where k > 1) select * from c where c.k < 3;
+----
+Seq Scan on g1
+  Filter: ((k > 1) AND (k < 3))
+
+# Read twice, or materialized by the clause: a `CTE Scan` over the
+# block.
+query T
+explain (costs off) with c as (select k from g1) select * from c a join c b on b.k = a.k;
+----
+Hash Join
+  Hash Cond: (a.k = b.k)
+  CTE c
+    ->  Seq Scan on g1
+  ->  CTE Scan on c a
+  ->  Hash
+        ->  CTE Scan on c b
+
+query T
+explain (costs off) with c as materialized (select k, count(*) n from g1 group by k) select * from c;
+----
+CTE Scan on c
+  CTE c
+    ->  HashAggregate
+          Group Key: g1.k
+          ->  Seq Scan on g1
+
+# A data-modifying CTE materializes even read once.
+query T
+explain (costs off) with c as (delete from g2 returning k) select * from c;
+----
+CTE Scan on c
+  CTE c
+    ->  Delete on g2
+          ->  Seq Scan on g2
+
+# A `NOT MATERIALIZED` CTE inlines however often it is read.
+query T
+with c as not materialized (select k from g1) select count(*) from c a join c b on b.k = a.k;
+----
+2700
+
+query T
+with c as (select k from g1) select count(*) from c a join c b on b.k = a.k;
+----
+2700
+
+query T
+with c as materialized (select k, count(*) n from g1 group by k) select * from c order by k;
+----
+0	30
+1	30
+2	30
+
+query T
+select * from (with c as (select k, count(*) n from g1 group by k) select * from c) t order by k;
+----
+0	30
+1	30
+2	30
