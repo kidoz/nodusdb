@@ -55,6 +55,16 @@ require_client_auth = false
 
 [backup]
 # Required in production. Empty disables backups.
+# file:///path or a bare path selects a local filesystem directory.
+# s3://bucket[/prefix] selects an S3-compatible object store; credentials,
+# region, and endpoint come from the standard AWS-compatible environment
+# variables, never from this file:
+#   AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY  credentials
+#   AWS_REGION                                 region (default us-east-1)
+#   AWS_ENDPOINT_URL                           e.g. http://127.0.0.1:9000 for MinIO
+#   AWS_ALLOW_HTTP=true                        required for plain-HTTP endpoints
+#   AWS_VIRTUAL_HOSTED_STYLE_REQUEST=false     path-style, required by MinIO (default)
+# Any other URI scheme fails startup.
 repository_uri = "file:///var/lib/nodus/backups"
 # repository_uri = "s3://nodus-backups/prod/cluster-a"
 

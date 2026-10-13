@@ -69,25 +69,29 @@ The current implementation is a useful MVP and should be read as one:
 - The admin API exposes create, list, verify, delete, and restore.
 - A full backup captures a catalog snapshot, audit events, and a full key-value
   dump.
-- A background WAL archiver flushes the local LSM and archives closed segments.
+- A background WAL archiver flushes the local LSM and archives closed segments,
+  recording per-segment archive indexes (commit-timestamp range, transaction
+  ids, lineage, checksum, upload state); local segment cleanup is gated on
+  those indexes and on retained restore points.
 - Restore can replay archived WAL records up to a target timestamp.
-- Incremental backups are metadata-only: they verify the parent and write an
-  empty manifest.
+- Incremental backups write real checksummed objects chained to a verified
+  parent and record a protected timestamp; the export is currently a full
+  snapshot per incremental rather than a delta of changed MVCC versions.
 
-The gaps that matter: no real incremental data export, no protected backup
-timestamp, weak WAL archive indexing, no repository immutability contract, no
-schedule or job model, no restore drills, and no distributed coordination.
+The gaps that matter: incrementals are not delta exports, no repository
+immutability enforcement, no schedule or job model, no restore drills, and no
+distributed coordination.
 
 | Capability | Today | Target |
 | --- | --- | --- |
-| Repository backends | Filesystem and S3-compatible. | Repositories expose capability metadata for immutability, conditional put, range reads, multipart upload, and encryption. |
+| Repository backends | Filesystem and S3-compatible, selected by `[backup] repository_uri` (`file://` / bare path / `s3://`). | Repositories expose capability metadata for immutability, conditional put, range reads, multipart upload, and encryption. |
 | Manifest | Versioned JSON with object checksums. | Manifest V2 as the immutable commit record: timeline, WAL coverage, layout version, format versions, compression, encryption metadata, restore validation status. |
 | Full backup | Catalog, audit events, full KV dump. | Catalog, shard metadata, and shard data at a protected snapshot timestamp, with WAL coverage sufficient for point-in-time recovery. |
-| Incremental backup | Metadata-only. | Exports changed MVCC versions and tombstones since the parent, fails when required history was collected, bounds chain length. |
-| WAL archiving | Background task archives closed local segments. | Segments indexed by timeline, timestamp range, checksum, byte range, encryption key id, and upload state. |
+| Incremental backup | Full-snapshot export chained to a verified parent, with a protected timestamp. | Exports changed MVCC versions and tombstones since the parent, fails when required history was collected, bounds chain length. |
+| WAL archiving | Background task archives closed local segments with per-segment indexes; cleanup is gated on retained restore points. | Segments indexed by timeline, timestamp range, checksum, byte range, encryption key id, and upload state. |
 | Restore | Loads backup objects, replays WAL to a timestamp. | Explicit idempotent planning, validated inputs, fresh directory or new timeline only, consistency checks before readiness. |
 | Job control | Admin and CLI operations, no durable model. | Durable job records with inspect, retry, cancel, pause, resume, audit, and policy enforcement. |
-| Retention | Manual delete. | Graph-aware retention that never removes anything a retained restore point needs. |
+| Retention | Manual delete with dependency checks; GC and WAL cleanup fail closed on retained or unreadable manifests. | Graph-aware retention that never removes anything a retained restore point needs. |
 | Distributed backup | Not coordinated across shard groups. | Raft-coordinated cluster snapshot timestamp, parallel per-shard export, migration operations serialized behind backup barriers. |
 | Restore drills | None. | Periodic scratch restores that persist reports and measure compliance. |
 

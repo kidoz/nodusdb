@@ -4,9 +4,22 @@ This guide creates a backup of a running server, verifies it, and restores it �
 including restoring to a point in time.
 
 Backups go to the repository named by `[backup] repository_uri` in the server
-configuration. The example configuration uses a local directory
-(`file://./.local/nodus/backups`); production deployments use an S3-compatible
-repository.
+configuration. Two backends are supported:
+
+- **Filesystem** — `file:///var/lib/nodus/backups` or a bare path. The example
+  configuration uses a local directory (`file://./.local/nodus/backups`);
+  an empty URI falls back to a unique temp directory so the API is usable in
+  dev and tests.
+- **S3-compatible object store** — `s3://bucket[/prefix]`. Credentials, region,
+  and endpoint are never read from the config file; they come from the standard
+  AWS-compatible environment variables consumed by the `object_store` crate:
+  `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION` (default
+  `us-east-1`), `AWS_ENDPOINT_URL` (e.g. `http://127.0.0.1:9000` for MinIO),
+  and `AWS_ALLOW_HTTP=true` for plain-HTTP endpoints. Any other URI scheme
+  fails startup with an error naming the scheme.
+
+The repository decision is made once at server startup; every backup, WAL
+archive, and restore on that server uses it.
 
 Every route below requires the `ManageBackups` privilege. See
 [admin API authorization](../reference/admin-api-authorization.md) for the auth
@@ -116,8 +129,12 @@ curl -X DELETE -H "Authorization: Bearer nodus-dev-token" \
      http://127.0.0.1:8088/api/v1/backups/<backup_id>
 ```
 
-Deletion is manual today. Retention is not yet chain-aware, so check that no
-restore point you care about depends on the backup before removing it.
+Deletion is manual today, but it is chain-aware and fails closed: the server
+refuses to delete a backup that a retained incremental still depends on, and
+refuses to delete anything while any manifest in the repository is unreadable
+(an unreadable manifest may still anchor a restore point whose dependencies
+cannot be computed). There is no scheduled retention policy yet — deleting
+backups you no longer need is an operator action.
 
 ## The CLI equivalents
 

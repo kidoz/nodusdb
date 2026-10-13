@@ -19,7 +19,7 @@ mod upgrade_tests;
 
 use admin::{AdminState, admin_routes};
 use axum::Router;
-use nodus_backup::{BackupOrchestrator, FsBackupRepository, WalCommittedTxn};
+use nodus_backup::{BackupOrchestrator, BackupRepository, FsBackupRepository, S3BackupRepository, WalCommittedTxn};
 use nodus_catalog::{
     CatalogReader, CatalogWriter, CreateRoleRequest, GrantPrivilegeRequest, PrincipalType,
     ResourceRef,
@@ -107,6 +107,62 @@ fn backup_dir(uri: &str) -> PathBuf {
         std::env::temp_dir().join(format!("nodus-backups-{}", uuid::Uuid::new_v4()))
     } else {
         PathBuf::from(trimmed)
+    }
+}
+
+/// The backup repository selected by `backup.repository_uri`.
+#[derive(Debug, PartialEq, Eq)]
+enum BackupRepositoryKind {
+    /// Local filesystem directory (`file://…` or a bare path; empty falls back
+    /// to a unique temp directory so the backup API stays usable in dev/tests).
+    Fs(PathBuf),
+    /// S3-compatible object store (`s3://bucket[/prefix]`). Credentials,
+    /// region, and endpoint come from the standard AWS-compatible environment
+    /// variables, never from the config file.
+    S3 { bucket: String, prefix: String },
+}
+
+fn parse_backup_repository_uri(uri: &str) -> anyhow::Result<BackupRepositoryKind> {
+    if let Some(rest) = uri.strip_prefix("s3://") {
+        let (bucket, prefix) = rest.split_once('/').unwrap_or((rest, ""));
+        if bucket.is_empty() {
+            anyhow::bail!(
+                "backup.repository_uri {uri:?} must name a bucket: s3://<bucket>[/<prefix>]"
+            );
+        }
+        return Ok(BackupRepositoryKind::S3 {
+            bucket: bucket.to_string(),
+            prefix: prefix.to_string(),
+        });
+    }
+    if let Some((scheme, _)) = uri.split_once("://")
+        && scheme != "file"
+    {
+        anyhow::bail!(
+            "backup.repository_uri {uri:?} uses unsupported scheme {scheme:?}; expected file:// or s3://"
+        );
+    }
+    Ok(BackupRepositoryKind::Fs(backup_dir(uri)))
+}
+
+/// Builds the backup repository for `backup.repository_uri`: filesystem for
+/// `file://`/bare paths, S3-compatible object store for `s3://`. Unknown
+/// schemes fail startup with an actionable error rather than silently becoming
+/// an unintended local directory name.
+fn backup_repository(uri: &str) -> anyhow::Result<Arc<dyn BackupRepository>> {
+    match parse_backup_repository_uri(uri)? {
+        BackupRepositoryKind::Fs(dir) => Ok(Arc::new(FsBackupRepository::new(dir))),
+        BackupRepositoryKind::S3 { bucket, prefix } => {
+            let repo = S3BackupRepository::from_env(&bucket, &prefix).map_err(|error| {
+                anyhow::anyhow!(
+                    "backup.repository_uri {uri:?}: {error}; S3 credentials, region, and \
+                     endpoint come from the AWS-compatible environment (AWS_ACCESS_KEY_ID, \
+                     AWS_SECRET_ACCESS_KEY, AWS_REGION, AWS_ENDPOINT_URL, AWS_ALLOW_HTTP)"
+                )
+            })?;
+            tracing::info!(bucket, prefix, "backup repository: S3-compatible object store");
+            Ok(Arc::new(repo))
+        }
     }
 }
 
@@ -842,9 +898,7 @@ pub async fn run_server_with_config(
         .map(|c| Arc::new(TlsAcceptor::from(c.clone())));
     tracing::debug!("TLS acceptor loaded");
 
-    let repo = Arc::new(FsBackupRepository::new(backup_dir(
-        &config.backup.repository_uri,
-    )));
+    let repo = backup_repository(&config.backup.repository_uri)?;
     let backup = Arc::new(BackupOrchestrator::new(repo).with_recovery_source(local_kv.clone()));
 
     // Graceful Raft shutdown: when the server is told to stop, shut down its
@@ -1616,6 +1670,78 @@ mod tests {
         );
         // Empty falls back to a unique temp dir.
         assert!(backup_dir("").starts_with(std::env::temp_dir()));
+    }
+
+    #[test]
+    fn backup_repository_uri_dispatch() {
+        // file:// and bare paths stay on the filesystem backend.
+        assert_eq!(
+            parse_backup_repository_uri("file:///var/lib/nodus/backups").unwrap(),
+            BackupRepositoryKind::Fs(PathBuf::from("/var/lib/nodus/backups"))
+        );
+        assert_eq!(
+            parse_backup_repository_uri("/var/lib/nodus/backups").unwrap(),
+            BackupRepositoryKind::Fs(PathBuf::from("/var/lib/nodus/backups"))
+        );
+        assert_eq!(
+            parse_backup_repository_uri("relative/dir").unwrap(),
+            BackupRepositoryKind::Fs(PathBuf::from("relative/dir"))
+        );
+        // s3://bucket[/prefix] selects the object-store backend.
+        assert_eq!(
+            parse_backup_repository_uri("s3://nodus-backups").unwrap(),
+            BackupRepositoryKind::S3 {
+                bucket: "nodus-backups".into(),
+                prefix: String::new(),
+            }
+        );
+        assert_eq!(
+            parse_backup_repository_uri("s3://nodus-backups/prod/cluster-a").unwrap(),
+            BackupRepositoryKind::S3 {
+                bucket: "nodus-backups".into(),
+                prefix: "prod/cluster-a".into(),
+            }
+        );
+        // s3:// without a bucket is a startup error.
+        let error = parse_backup_repository_uri("s3://").unwrap_err().to_string();
+        assert!(error.contains("bucket"), "{error}");
+        // Unknown schemes fail startup with an actionable error instead of
+        // silently becoming a local directory named e.g. "gs:/bucket".
+        let error = parse_backup_repository_uri("gs://bucket").unwrap_err().to_string();
+        assert!(error.contains("gs"), "{error}");
+        assert!(error.contains("file://"), "{error}");
+        assert!(error.contains("s3://"), "{error}");
+        assert!(parse_backup_repository_uri("http://example.com/backups").is_err());
+    }
+
+    #[test]
+    fn backup_repository_constructs_selected_backend() {
+        // Filesystem backend constructs for file://, bare paths, and the empty
+        // dev default.
+        backup_repository("file:///var/lib/nodus/backups").unwrap();
+        backup_repository("relative/dir").unwrap();
+        backup_repository("").unwrap();
+        // Unknown schemes error before any construction.
+        assert!(backup_repository("gs://bucket").is_err());
+    }
+
+    #[test]
+    fn backup_repository_constructs_s3_from_env() {
+        // SAFETY: no other test in this crate reads or writes these variables;
+        // they are set before construction and removed after.
+        unsafe {
+            std::env::set_var("AWS_ACCESS_KEY_ID", "nodus-test");
+            std::env::set_var("AWS_SECRET_ACCESS_KEY", "nodus-test-secret");
+            std::env::set_var("AWS_REGION", "us-east-1");
+        }
+        let result = backup_repository("s3://nodus-test-bucket/prod");
+        unsafe {
+            std::env::remove_var("AWS_ACCESS_KEY_ID");
+            std::env::remove_var("AWS_SECRET_ACCESS_KEY");
+            std::env::remove_var("AWS_REGION");
+        }
+        let repo = result.unwrap();
+        assert!(repo.capabilities().range_reads);
     }
 
     #[test]

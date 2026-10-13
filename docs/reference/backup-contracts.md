@@ -67,6 +67,34 @@ clusters/{cluster_id}/
 `manifest.json` is the commit point. A backup carrying only
 `manifest.pending.json` is not restorable.
 
+## Repository backends
+
+The server selects the repository from `[backup] repository_uri` at startup:
+
+- `file:///path` or a bare path — local filesystem (`FsBackupRepository`).
+  Writes are durable and atomic: temp file, fsync, rename, directory fsync.
+- `s3://bucket[/prefix]` — S3-compatible object store (`S3BackupRepository`
+  over the `object_store` crate). Credentials, region, and endpoint come from
+  the standard AWS-compatible environment variables (`AWS_ACCESS_KEY_ID`,
+  `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, `AWS_ENDPOINT_URL`, `AWS_ALLOW_HTTP`),
+  never from the config file. Existence checks distinguish genuine absence
+  (`404 NotFound`) from transient errors, so a network outage fails the
+  protection paths closed instead of flipping manifests to unreadable.
+
+Any other URI scheme fails startup with an error naming the scheme.
+
+CI coverage: the S3 repository's put/get/list/delete logic and the full
+backup → verify → restore orchestration run against an in-memory object store
+in `nodus_backup` unit tests. The only real-endpoint coverage is the ignored
+`s3_backup_round_trip` test in `crates/nodus_backup/src/s3.rs`, run manually
+against MinIO:
+
+```bash
+NODUS_S3_ENDPOINT=http://127.0.0.1:9000 NODUS_S3_BUCKET=nodus \
+NODUS_S3_KEY=nodus NODUS_S3_SECRET=nodus-secret \
+cargo test -p nodus_backup -- --ignored
+```
+
 ## Core concepts
 
 | Term | Definition |

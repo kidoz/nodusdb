@@ -233,8 +233,13 @@ pub struct TlsConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct BackupConfig {
-    /// Backup repository URI (e.g. `file:///var/lib/nodus/backups`). Required in
-    /// production; empty disables backups.
+    /// Backup repository URI. `file:///path` or a bare path selects a local
+    /// filesystem directory; `s3://bucket[/prefix]` selects an S3-compatible
+    /// object store whose credentials, region, and endpoint come from the
+    /// standard AWS-compatible environment variables (`AWS_ACCESS_KEY_ID`,
+    /// `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, `AWS_ENDPOINT_URL`,
+    /// `AWS_ALLOW_HTTP`), never from this file. Any other scheme fails
+    /// startup. Required in production; empty disables backups.
     pub repository_uri: String,
 }
 

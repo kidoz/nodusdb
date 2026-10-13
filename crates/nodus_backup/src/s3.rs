@@ -62,6 +62,28 @@ impl S3BackupRepository {
     pub fn with_store(store: Arc<dyn ObjectStore>) -> Self {
         Self { store }
     }
+
+    /// Builds a repository for `bucket` (optionally rooted under `prefix`)
+    /// from the standard AWS-compatible environment variables consumed by
+    /// [`AmazonS3Builder::from_env`]: `AWS_ACCESS_KEY_ID`,
+    /// `AWS_SECRET_ACCESS_KEY`, `AWS_REGION` (default `us-east-1`),
+    /// `AWS_ENDPOINT_URL`/`AWS_ENDPOINT`, `AWS_ALLOW_HTTP` for plain-HTTP
+    /// endpoints such as MinIO, plus the usual session-token, profile, and
+    /// addressing-style variables. Credentials never enter the server
+    /// configuration file. An empty `prefix` addresses the bucket root.
+    pub fn from_env(bucket: &str, prefix: &str) -> Result<Self> {
+        let store: Arc<dyn ObjectStore> = Arc::new(
+            AmazonS3Builder::from_env()
+                .with_bucket_name(bucket)
+                .build()?,
+        );
+        let store = if prefix.is_empty() {
+            store
+        } else {
+            Arc::new(object_store::prefix::PrefixStore::new(store, prefix))
+        };
+        Ok(Self { store })
+    }
 }
 
 #[async_trait]
@@ -129,7 +151,16 @@ impl BackupRepository for S3BackupRepository {
     }
 
     async fn object_exists(&self, key: &str) -> Result<bool> {
-        Ok(self.store.head(&ObjPath::from(key)).await.is_ok())
+        // Only genuine absence counts as missing. Network errors, 403s, and
+        // throttling propagate instead: the fail-closed protection paths
+        // treat an error as "unknown" (protective), whereas mapping every
+        // error to `false` would flip manifests to unreadable — or, worse,
+        // report a needed object as gone — on a transient S3 outage.
+        match self.store.head(&ObjPath::from(key)).await {
+            Ok(_) => Ok(true),
+            Err(object_store::Error::NotFound { .. }) => Ok(false),
+            Err(error) => Err(error.into()),
+        }
     }
 }
 
