@@ -8,6 +8,7 @@ use anyhow::Result;
 use bytes::Bytes;
 use nodus_catalog::TableId;
 use nodus_raftstore::ShardCommand;
+use nodus_raftstore::server::NodusRaft;
 use nodus_sharding::ShardRouter;
 use nodus_storage_api::{
     IntentReplacement, KeyRange, KvEngine, KvPair, KvResult, NamespacedKvEngine, Timestamp, TxnId,
@@ -370,6 +371,66 @@ impl RaftKvEngine {
         }
         self.metrics.txn_recoveries_total.inc_by(repaired as u64);
         Ok(repaired)
+    }
+}
+
+/// Re-drives decided-but-incomplete cross-shard commits whenever THIS node
+/// leads the meta group — both on leadership gain and periodically while
+/// leader. Recovery previously ran only in the bootstrap branch
+/// (`join_peers.is_empty()`), so a cluster whose decision-recording node died
+/// permanently — survivors having joined via `join_peers` — never re-drove the
+/// commit: participant intents stayed pending (invisible, but blocking
+/// writers, GC, and snapshot builds) and the client had seen an error for a
+/// transaction that could later surface.
+///
+/// Re-driving is idempotent (committing an already-committed transaction is a
+/// benign no-op, and clearing the record twice is harmless), so overlapping
+/// runs — a leadership-gain trigger racing the periodic tick, or two nodes
+/// both believing they lead meta while a partition heals — are safe: a stale
+/// node's `drive_commit` submissions are rejected by the real leader's Raft
+/// group (`ForwardToLeader`), and double-driving a decided commit converges.
+pub(crate) async fn pending_txn_recovery_loop(
+    meta_raft: NodusRaft,
+    kv: Arc<RaftKvEngine>,
+    node_id: u64,
+    interval: std::time::Duration,
+    mut shutdown: tokio::sync::watch::Receiver<()>,
+) {
+    let mut metrics = meta_raft.metrics();
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut was_leader = false;
+    loop {
+        tokio::select! {
+            res = metrics.changed() => {
+                if res.is_err() {
+                    break;
+                }
+                let leader = metrics.borrow().current_leader == Some(node_id);
+                let gained = leader && !was_leader;
+                was_leader = leader;
+                if !gained {
+                    continue;
+                }
+            }
+            _ = ticker.tick() => {
+                was_leader = metrics.borrow().current_leader == Some(node_id);
+                if !was_leader {
+                    continue;
+                }
+            }
+            _ = shutdown.changed() => break,
+        }
+        let kv = kv.clone();
+        // Submits through the Raft router, so it must run on a blocking thread.
+        match tokio::task::spawn_blocking(move || kv.recover_pending_txns()).await {
+            Ok(Ok(n)) if n > 0 => {
+                tracing::info!("Recovered {n} pending cross-shard commit(s) as meta leader")
+            }
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => tracing::warn!("2PC recovery failed: {e}"),
+            Err(e) => tracing::warn!("2PC recovery task panicked: {e}"),
+        }
     }
 }
 
@@ -1196,6 +1257,83 @@ mod tests {
             engine.get(row_t.as_bytes(), 100).unwrap(),
             Some(Bytes::from_static(b"vt"))
         );
+        fx.engine.manager.shutdown_all().await;
+    }
+
+    /// A decided-but-incomplete 2PC commit is re-driven by the meta-leader
+    /// recovery LOOP — the path any meta leader runs, not the bootstrap branch
+    /// (this engine never ran bootstrap recovery).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn meta_leadership_loop_redrives_decided_but_incomplete_commit() {
+        let fx = setup_two_shards().await;
+        let engine = fx.engine.clone();
+        let row_t = format!("{}:pk", fx.table_t);
+        let row_u = format!("{}:pk", fx.table_u);
+        let (group_t, group_u) = (fx.group_t.clone(), fx.group_u.clone());
+
+        // Crash-after-decision state: intents on both groups, decision
+        // recorded, only group T committed.
+        let e = engine.clone();
+        let (rt, ru) = (row_t.clone(), row_u.clone());
+        tokio::task::spawn_blocking(move || {
+            let txn = TxnId::new();
+            e.write_intent(txn, Bytes::from(rt.into_bytes()), Bytes::from_static(b"vt"))
+                .unwrap();
+            e.write_intent(txn, Bytes::from(ru.into_bytes()), Bytes::from_static(b"vu"))
+                .unwrap();
+            let txn_str = txn.0.to_string();
+            let record = serde_json::to_vec(&PendingTxn {
+                participants: vec![group_t.clone(), group_u.clone()],
+                commit_ts: 10,
+                epochs: BTreeMap::new(),
+            })
+            .unwrap();
+            e.meta_put_committed(&record_key(&txn_str), &record, 10)
+                .unwrap();
+            e.drive_commit(
+                &txn_str,
+                std::slice::from_ref(&group_t),
+                10,
+                &BTreeMap::new(),
+            )
+            .unwrap();
+        })
+        .await
+        .unwrap();
+        assert_eq!(engine.get(row_u.as_bytes(), 100).unwrap(), None);
+
+        // The recovery loop, as wired by the server for the meta leader.
+        let meta_raft = engine.manager.get(META_SHARD).await.unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+        let loop_handle = tokio::spawn(pending_txn_recovery_loop(
+            meta_raft,
+            engine.clone(),
+            1,
+            std::time::Duration::from_millis(50),
+            shutdown_rx,
+        ));
+
+        // The loop — not any bootstrap call — re-drives the commit to group U.
+        let mut visible = false;
+        for _ in 0..100 {
+            if engine.get(row_u.as_bytes(), 100).unwrap() == Some(Bytes::from_static(b"vu")) {
+                visible = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(visible, "the meta-leader loop must re-drive the commit");
+        assert!(engine.metrics.txn_recoveries_total.get() >= 1);
+
+        shutdown_tx.send(()).unwrap();
+        loop_handle.await.unwrap();
+
+        // The decision record is cleared: an explicit recovery finds nothing.
+        let e = engine.clone();
+        let again = tokio::task::spawn_blocking(move || e.recover_pending_txns().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(again, 0);
         fx.engine.manager.shutdown_all().await;
     }
 }

@@ -637,6 +637,25 @@ pub async fn run_server_with_config(
         shard_id: crate::multi_raft::META_SHARD.to_string(),
     });
 
+    // 2PC recovery runs on ANY meta-group leader — on leadership gain and
+    // periodically while leader — not just in the bootstrap branch: if the
+    // node that recorded a commit decision dies permanently, a survivor that
+    // joined via join_peers re-drives the decided commit (see
+    // `raft_kv::pending_txn_recovery_loop`).
+    let recovery_raft = raft.clone();
+    let recovery_kv = raft_kv.clone();
+    let recovery_shutdown = shutdown.clone();
+    let recovery_task = tokio::spawn(async move {
+        crate::raft_kv::pending_txn_recovery_loop(
+            recovery_raft,
+            recovery_kv,
+            node_id,
+            std::time::Duration::from_secs(10),
+            recovery_shutdown,
+        )
+        .await;
+    });
+
     let authz = Arc::new(nodus_authz::DefaultAuthzEngine::new(catalog.clone()));
 
     let executor = Arc::new(nodus_executor::MemExecutor::new(
@@ -652,7 +671,6 @@ pub async fn run_server_with_config(
 
     let _executor_clone = executor.clone();
     let state_clone = state.clone();
-    let recover_kv = raft_kv.clone();
     let reconcile_meta = meta.clone();
     let reconcile_manager = multi_raft.clone();
     tokio::spawn(async move {
@@ -695,16 +713,10 @@ pub async fn run_server_with_config(
                 }
             }
 
-            // Re-drive any cross-shard commit that was decided but not fully
-            // applied before a restart. Runs on a blocking thread (it submits
-            // through the Raft router) now that this node leads the meta group.
-            let recover_kv = recover_kv.clone();
-            match tokio::task::spawn_blocking(move || recover_kv.recover_pending_txns()).await {
-                Ok(Ok(n)) if n > 0 => tracing::info!("Recovered {n} pending cross-shard commit(s)"),
-                Ok(Ok(_)) => {}
-                Ok(Err(e)) => tracing::warn!("2PC recovery failed: {e}"),
-                Err(e) => tracing::warn!("2PC recovery task panicked: {e}"),
-            }
+            // Decided-but-incomplete cross-shard commits are re-driven by the
+            // meta-leader recovery loop (`pending_txn_recovery_loop`), which
+            // fires on leadership gain — including this bootstrap election —
+            // and periodically thereafter.
 
             // Re-host data-shard groups assigned to this node. Placement is
             // durable (see `PersistentMetaStore`), so after a restart this
@@ -1459,6 +1471,7 @@ pub async fn run_server_with_config(
             let mut tasks = vec![
                 gc_task,
                 janitor_task,
+                recovery_task,
                 wal_archiver_task,
                 raft_shutdown_task,
                 shard_reconcile_task,
