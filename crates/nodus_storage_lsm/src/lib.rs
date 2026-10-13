@@ -72,6 +72,11 @@ pub struct LsmKvEngine {
     /// registration, for deterministic coverage of the flush race window.
     #[cfg(test)]
     append_pause: AppendPause,
+    /// Test-only pause point inside the WAL rotation, after the segment swap
+    /// and before the manifest publication, for deterministic coverage of the
+    /// swap→publish window.
+    #[cfg(test)]
+    flush_pause: AppendPause,
     _wal_key: Option<[u8; 32]>,
 }
 
@@ -240,6 +245,8 @@ impl LsmKvEngine {
             inflight_appends: AtomicUsize::new(0),
             #[cfg(test)]
             append_pause: AppendPause::default(),
+            #[cfg(test)]
+            flush_pause: AppendPause::default(),
             _wal_key: None,
         }
     }
@@ -315,6 +322,8 @@ impl LsmKvEngine {
             inflight_appends: AtomicUsize::new(0),
             #[cfg(test)]
             append_pause: AppendPause::default(),
+            #[cfg(test)]
+            flush_pause: AppendPause::default(),
             _wal_key: key,
         };
 
@@ -439,13 +448,21 @@ impl LsmKvEngine {
                 predecessor: Some(predecessor),
             }))?;
             new_wal.sync()?;
-            // Rotate first: any WAL append that already completed (or is in
-            // flight with its `inflight_appends` mark visible below) landed in
-            // an older segment, and any append starting after this swap lands
-            // in the new one. The `wal` write lock orders the swap against
-            // every in-flight append, so reading the counter here sees every
-            // append that could still belong to an older segment.
-            *self.wal.write().unwrap() = Some(new_wal);
+            // Hold the WAL write lock from the swap until the manifest naming
+            // the new segment is durable. No append may land in the new segment
+            // before recovery could ever find it: a commit() fsyncing its
+            // `CommitTxn` into a segment the manifest does not yet name would
+            // be silently dropped by a crash before the manifest commit — an
+            // acknowledged write lost ('no ack before durable publication').
+            // The critical section is one manifest write + fsync. Writers
+            // increment `inflight_appends` BEFORE acquiring `wal.read`, so this
+            // lock is the only synchronization needed: the floor check below is
+            // a single load, never a wait, and cannot deadlock against a writer
+            // blocked on `wal.read` here. Lock order note: `commit`/`write_intent`
+            // release `wal.read` before taking the memtable lock, so holding
+            // `mem_guard` + `wal` write here creates no lock cycle.
+            let mut wal_guard = self.wal.write().unwrap();
+            let previous_wal = (*wal_guard).replace(new_wal);
             self.active_wal_id.store(wal_id, Ordering::Relaxed);
             // Advance the replay floor only when nothing in an older segment
             // can still be needed: this flush retained no uncommitted intents
@@ -458,10 +475,23 @@ impl LsmKvEngine {
             // `WriteIntent` is already in the old segment but its registration
             // is still pending, so a floor advance would drop a transaction
             // whose commit lands after the rotation.
+            let previous_floor = self.min_replay_wal.load(Ordering::Relaxed);
             if mem_guard.is_empty() && self.inflight_appends.load(Ordering::SeqCst) == 0 {
                 self.min_replay_wal.store(wal_id, Ordering::Relaxed);
             }
-            self.save_manifest()?;
+            self.pause_before_manifest_save();
+            if let Err(error) = self.save_manifest() {
+                // Publication failed: the manifest on disk still names the old
+                // segment. Roll the in-memory rotation back so future appends
+                // keep landing in the published segment recovery will replay,
+                // instead of an orphan the manifest never names. (The SSTable
+                // push above is not rolled back: after a crash its data is
+                // rebuilt from the retained WAL lineage, so it stays correct.)
+                *wal_guard = previous_wal;
+                self.active_wal_id.store(predecessor, Ordering::Relaxed);
+                self.min_replay_wal.store(previous_floor, Ordering::Relaxed);
+                return Err(error);
+            }
         }
 
         // Bound read amplification once enough SSTables have accumulated.
@@ -598,6 +628,54 @@ impl LsmKvEngine {
     #[cfg(test)]
     fn arm_append_pause(&self) {
         self.append_pause.state.lock().unwrap().armed = true;
+    }
+
+    /// Test-only pause point inside the WAL rotation, after the segment swap
+    /// and before the manifest publication. A no-op unless a test armed the
+    /// pause. Runs while the `wal` write lock is held, so a racing commit
+    /// blocks on `wal.read` for the whole parked window.
+    #[inline]
+    fn pause_before_manifest_save(&self) {
+        #[cfg(test)]
+        {
+            let mut state = self.flush_pause.state.lock().unwrap();
+            if !state.armed {
+                return;
+            }
+            state.parked += 1;
+            self.flush_pause.parked.notify_all();
+            let generation = state.generation;
+            while state.generation == generation {
+                state = self.flush_pause.release.wait(state).unwrap();
+            }
+            state.parked -= 1;
+        }
+    }
+
+    /// Arms the pre-manifest-save pause for the next flush (tests).
+    #[cfg(test)]
+    fn arm_flush_pause(&self) {
+        self.flush_pause.state.lock().unwrap().armed = true;
+    }
+
+    /// Blocks until `n` flushes are parked between the WAL swap and the
+    /// manifest publication (tests).
+    #[cfg(test)]
+    fn wait_for_parked_flush(&self, n: usize) {
+        let mut state = self.flush_pause.state.lock().unwrap();
+        while state.parked < n {
+            state = self.flush_pause.parked.wait(state).unwrap();
+        }
+    }
+
+    /// Releases every flush parked before the manifest publication and
+    /// disarms the pause (tests).
+    #[cfg(test)]
+    fn release_parked_flush(&self) {
+        let mut state = self.flush_pause.state.lock().unwrap();
+        state.armed = false;
+        state.generation += 1;
+        self.flush_pause.release.notify_all();
     }
 
     /// Blocks until `n` writers are parked between WAL append and intent
@@ -2161,4 +2239,94 @@ mod sst_tests {
         );
     }
 
+    #[test]
+    fn commit_cannot_fsync_into_an_unpublished_wal_segment() {
+        // Regression: flush swapped the in-memory WAL to a new segment and only
+        // then published the manifest naming it. A commit landing in that gap
+        // appended+fsynced its `CommitTxn` into the new segment, which crash
+        // recovery (walking the manifest's lineage) would never open — a
+        // durable commit one manifest failure away from being lost after an
+        // ack. Flush now holds the WAL write lock across the swap and the
+        // manifest publication, so no append can reach a segment recovery does
+        // not yet know about. The pause hook parks the flush exactly in that
+        // window.
+        let dir = TempDir::new().unwrap();
+        let raced = TxnId::new();
+        {
+            let engine = Arc::new(LsmKvEngine::with_wal(dir.path(), None).unwrap());
+
+            // A committed key so the flush has work to do, and an open intent
+            // whose commit will race the flush.
+            let stable = TxnId::new();
+            engine
+                .write_intent(stable, Bytes::from("stable"), Bytes::from("s"))
+                .unwrap();
+            engine.commit(stable, 10).unwrap();
+            engine
+                .write_intent(raced, Bytes::from("raced"), Bytes::from("v1"))
+                .unwrap();
+
+            // Park the flush after the WAL swap, before the manifest save.
+            engine.arm_flush_pause();
+            let flusher = {
+                let engine = engine.clone();
+                std::thread::spawn(move || engine.flush())
+            };
+            engine.wait_for_parked_flush(1);
+            let unpublished = engine.active_wal_id.load(Ordering::Relaxed);
+
+            // The racing commit must block on the WAL lock the parked flush
+            // holds: it can neither be acknowledged nor leave a durable record
+            // in the unpublished segment.
+            let (tx, rx) = std::sync::mpsc::channel();
+            let committer = {
+                let engine = engine.clone();
+                std::thread::spawn(move || {
+                    let result = engine.commit(raced, 30);
+                    let _ = tx.send(result);
+                })
+            };
+            assert!(
+                rx.recv_timeout(std::time::Duration::from_millis(200))
+                    .is_err(),
+                "commit acknowledged before the manifest named its WAL segment"
+            );
+            // Poll the unpublished segment: a `CommitTxn` frame appearing here
+            // means a commit became durable where recovery cannot find it.
+            let probe =
+                FileWalEngine::with_encryption(dir.path().join(format!("{unpublished}.log")), None)
+                    .unwrap();
+            let mut leaked = false;
+            for _ in 0..50 {
+                let records = probe.recover().unwrap();
+                if records
+                    .iter()
+                    .any(|r| matches!(r, WalRecord::V1(WalRecordV1::CommitTxn { .. })))
+                {
+                    leaked = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(
+                !leaked,
+                "commit fsynced into a WAL segment the manifest does not yet name"
+            );
+
+            engine.release_parked_flush();
+            flusher.join().unwrap().unwrap();
+            committer.join().unwrap();
+            // The commit is acknowledged only after the manifest publication.
+            rx.recv().unwrap().unwrap();
+            // Engine drops here, simulating a crash/restart (commit() fsynced).
+        }
+
+        let engine = LsmKvEngine::with_wal(dir.path(), None).unwrap();
+        assert_eq!(
+            engine.get(b"raced", 100).unwrap(),
+            Some(Bytes::from("v1")),
+            "acknowledged commit lost across crash recovery"
+        );
+        assert_eq!(engine.get(b"stable", 100).unwrap(), Some(Bytes::from("s")));
+    }
 }
