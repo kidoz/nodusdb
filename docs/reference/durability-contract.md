@@ -26,11 +26,25 @@ use. Production deployments must set `data_dir`.
 Each row is covered by a named test. Crash residue is reproduced directly —
 truncating and corrupting files, leaving orphan SSTables and manifests — rather
 than through a runtime fault injector, so the recovery code sees exactly the
-on-disk state a crash would leave.
+on-disk state a crash would leave. Power loss is simulated with a
+sync-tracking WAL wrapper (`nodus_storage_lsm::powercut_tests`): the wrapper
+delegates to the real `FileWalEngine` and records how many bytes each `fdatasync`
+made durable, then the segment is cut back to a state a power failure could
+legitimately leave — synced prefix intact, the unsynced tail kept up to an
+arbitrary byte boundary, optionally with a torn final write — and recovery runs
+as the real engine reopen. Unlike SIGKILL (whose surviving OS still flushes the
+dead process's dirty pages), this distinguishes "written" from "fsynced", which
+is what the commit-acknowledgement ordering rests on.
 
 | Scenario (crash residue) | Validated by |
 | --- | --- |
 | Torn or partial trailing WAL record | `nodus_storage_lsm`: `torn_wal_tail_does_not_prevent_recovery` |
+| Torn WAL tail truncates at recovery, and commits acknowledged after that recovery survive the next power cut | `nodus_storage_wal`: `recover_truncates_a_torn_tail_so_later_appends_stay_replayable`; `nodus_storage_lsm`: `powercut_tests::torn_wal_tail_recovers_and_later_commits_survive_the_next_power_cut` |
+| Power cut after acknowledged commits, cut at every byte of the unsynced WAL tail (clean and torn variants) | `nodus_storage_lsm`: `powercut_tests::acknowledged_commits_survive_power_cut_at_every_byte_of_the_unsynced_tail` |
+| Power cut with a commit whose fsync never completed is all-or-nothing, never partially applied | `nodus_storage_lsm`: `powercut_tests::unacknowledged_commit_is_never_partially_applied_after_power_cut` |
+| WAL segment power cut keeps exactly the fsynced prefix; garbled or flipped tails are rejected | `nodus_storage_wal`: `power_cut_preserves_exactly_the_synced_prefix`, `power_cut_with_garbled_tail_recovers_the_synced_prefix` |
+| Power cut on either side of the flush's manifest rename (old or new manifest, orphan files present or lost, never a hybrid) | `nodus_storage_lsm`: `powercut_tests::power_cut_around_flush_publishes_old_or_new_manifest` |
+| Power cut on either side of the checkpoint's manifest rename (old or new snapshot in full) | `nodus_storage_lsm`: `powercut_tests::power_cut_around_checkpoint_publishes_old_or_new_snapshot` |
 | Partial SSTable (`*.sst.tmp`) from a crash mid-build | `nodus_storage_lsm`: `partial_sstable_tmp_is_ignored_on_recovery` |
 | Orphan SSTable absent from the manifest (crash before swap) | `nodus_storage_lsm`: `orphan_sstable_not_in_manifest_is_ignored` |
 | Corrupt or torn manifest | `nodus_storage_lsm`: `corrupt_manifest_recovers_via_directory_scan` |
@@ -138,5 +152,5 @@ prove power-loss durability. See the [protocol and compatibility limits](../expl
 | On-disk formats are not backward compatible across the hardening changes (WAL CRC frame, SSTable v2, catalog-in-KV) | Upgrading across those changes requires a clean restart. There is no cross-version on-disk compatibility guarantee yet. |
 | Catalog persistence writes a full-state blob per DDL | Catalog writes are not incremental per entry. |
 | WAL retention has two boundaries | Local cleanup waits for both backup retention and the durable local replay floor; retained intents or restore points can delay reclamation. |
-| General runtime fault injection is not wired into the storage engines | Snapshot tests have targeted test-only subprocess exit hooks; these and existing disk-residue tests do not establish power-loss durability. |
+| General runtime error injection is not wired into the storage engines | Power loss is simulated by cutting files back to their fsynced prefixes (`powercut_tests`, above), which proves the fsync discipline under a device that honors fsync. It does not prove real device behavior: volatile write caches, drives or filesystems that lie about fsync, and fsync error handling on subsequent writes are out of scope for in-process tests. The `FaultPoint`/`FaultAction` injector in `nodus_testkit` remains a registry without production call sites. |
 | Single-node scope | This contract covers local durability. Replication and cross-node durability are properties of the Raft layer, not of this contract. |

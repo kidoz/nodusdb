@@ -155,8 +155,12 @@ impl WalEngine for FileWalEngine {
 
     fn recover(&self) -> anyhow::Result<Vec<WalRecord>> {
         let file = File::open(&self.path)?;
+        let file_len = file.metadata()?.len();
         let mut reader = BufReader::new(file);
         let mut records = Vec::new();
+        // Offset just past the last fully-valid frame: the point recovery
+        // truncates back to when the tail is torn.
+        let mut valid_end: u64 = 0;
 
         loop {
             // A clean end of log: nothing more to read.
@@ -195,6 +199,9 @@ impl WalEngine for FileWalEngine {
             } else {
                 buf
             };
+            // The frame is complete and authentic: everything up to here is
+            // replayable, whatever happens to the record decode below.
+            valid_end += 8 + len as u64;
 
             // Dispatch on the record envelope: parse a supported version or
             // legacy (pre-envelope) bytes; refuse a record from a newer WAL
@@ -217,6 +224,17 @@ impl WalEngine for FileWalEngine {
                     }
                 }
             }
+        }
+
+        // A tail past the last valid frame is crash residue: bytes that were
+        // never fsynced (or a torn final write) and were therefore never
+        // acknowledged. Truncate them away — otherwise new appends would land
+        // behind undecodable bytes and every later recovery would stop at the
+        // same tear, silently dropping records written after this one.
+        if valid_end < file_len {
+            let file = OpenOptions::new().write(true).open(&self.path)?;
+            file.set_len(valid_end)?;
+            file.sync_data()?;
         }
 
         Ok(records)
@@ -339,5 +357,144 @@ mod tests {
         write_legacy_frame(&path, &future);
 
         assert!(FileWalEngine::new(&path).unwrap().recover().is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Simulated power loss. A real power cut preserves exactly what fsync
+    // returned over, may keep any prefix of the unsynced tail, and may leave
+    // the final write torn. These tests reproduce those on-disk states by
+    // truncating the segment file at every byte boundary of the unsynced
+    // region, then running the real `recover` over the result.
+    // -----------------------------------------------------------------------
+
+    fn checkpoint(ts: Timestamp) -> WalRecord {
+        WalRecord::V1(WalRecordV1::Checkpoint { ts })
+    }
+
+    /// The `ts` of every recovered `Checkpoint` record, for equality assertions
+    /// (the record enums do not derive `PartialEq`).
+    fn checkpoint_ts(records: &[WalRecord]) -> Vec<Timestamp> {
+        records
+            .iter()
+            .map(|r| match r {
+                WalRecord::V1(WalRecordV1::Checkpoint { ts }) => *ts,
+                other => panic!("unexpected record: {other:?}"),
+            })
+            .collect()
+    }
+
+    /// Rewrites `path` to the crash image: the first `keep` bytes of `image`,
+    /// plus `garbage` bytes of torn-write residue.
+    fn apply_power_cut(path: &Path, image: &[u8], keep: usize, garbage: usize) {
+        let mut crashed = image[..keep].to_vec();
+        crashed.extend(std::iter::repeat_n(0xA5u8, garbage));
+        std::fs::write(path, &crashed).unwrap();
+        File::open(path).unwrap().sync_all().unwrap();
+    }
+
+    #[test]
+    fn power_cut_preserves_exactly_the_synced_prefix() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        let synced_len;
+        let image;
+        {
+            let engine = FileWalEngine::new(&path).unwrap();
+            engine.append(checkpoint(1)).unwrap();
+            engine.append(checkpoint(2)).unwrap();
+            engine.sync().unwrap();
+            // Everything the fsync returned over is durable; anything appended
+            // afterwards is the unsynced tail a power cut may drop or tear.
+            synced_len = std::fs::metadata(&path).unwrap().len() as usize;
+            engine.append(checkpoint(3)).unwrap();
+            image = std::fs::read(&path).unwrap();
+            assert!(synced_len < image.len());
+        }
+
+        // A power cut may preserve any prefix of the unsynced tail: cut at
+        // every byte boundary of that region.
+        for keep in synced_len..=image.len() {
+            apply_power_cut(&path, &image, keep, 0);
+            let recovered = FileWalEngine::new(&path).unwrap().recover().unwrap();
+            let expected = if keep == image.len() {
+                vec![1, 2, 3]
+            } else {
+                vec![1, 2]
+            };
+            assert_eq!(
+                checkpoint_ts(&recovered),
+                expected,
+                "cut at byte {keep} of {}",
+                image.len()
+            );
+        }
+    }
+
+    #[test]
+    fn power_cut_with_garbled_tail_recovers_the_synced_prefix() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        let synced_len;
+        let image;
+        {
+            let engine = FileWalEngine::new(&path).unwrap();
+            engine.append(checkpoint(1)).unwrap();
+            engine.sync().unwrap();
+            synced_len = std::fs::metadata(&path).unwrap().len() as usize;
+            engine.append(checkpoint(2)).unwrap();
+            image = std::fs::read(&path).unwrap();
+        }
+
+        // A torn write can also leave garbage behind (a partial sector), not
+        // just a short file: a few residue bytes past any cut point must be
+        // rejected by the frame CRC, never replayed.
+        for keep in (synced_len..image.len()).step_by(7) {
+            apply_power_cut(&path, &image, keep, 11);
+            let recovered = FileWalEngine::new(&path).unwrap().recover().unwrap();
+            assert_eq!(checkpoint_ts(&recovered), vec![1], "cut at byte {keep}");
+        }
+        // A bit flip inside a fully-present but never-synced frame: the record
+        // is corrupt, so it is dropped with the rest of the tail.
+        let mut flipped = image.clone();
+        flipped[synced_len + 9] ^= 0xFF;
+        std::fs::write(&path, &flipped).unwrap();
+        let recovered = FileWalEngine::new(&path).unwrap().recover().unwrap();
+        assert_eq!(checkpoint_ts(&recovered), vec![1]);
+    }
+
+    #[test]
+    fn recover_truncates_a_torn_tail_so_later_appends_stay_replayable() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        let engine = FileWalEngine::new(&path).unwrap();
+        engine.append(checkpoint(1)).unwrap();
+        engine.sync().unwrap();
+        let valid_len = std::fs::metadata(&path).unwrap().len();
+
+        // Crash mid-append: a torn frame claims 1000 payload bytes and stops.
+        {
+            let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+            f.write_u32::<LittleEndian>(1000).unwrap();
+            f.write_all(&[1, 2, 3, 4]).unwrap();
+            f.sync_all().unwrap();
+        }
+
+        // Recovery replays the valid prefix and truncates the tear, so the
+        // segment can keep serving as the active log.
+        assert_eq!(checkpoint_ts(&engine.recover().unwrap()), vec![1]);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            valid_len,
+            "torn tail must be truncated"
+        );
+
+        // A record appended after the tear must survive the next recovery —
+        // without truncation it would sit behind undecodable bytes and every
+        // later replay would stop at the same tear.
+        engine.append(checkpoint(2)).unwrap();
+        engine.sync().unwrap();
+        drop(engine);
+        let recovered = FileWalEngine::new(&path).unwrap().recover().unwrap();
+        assert_eq!(checkpoint_ts(&recovered), vec![1, 2]);
     }
 }

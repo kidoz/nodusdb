@@ -1,5 +1,7 @@
 use anyhow::Result;
 use bytes::Bytes;
+#[cfg(test)]
+mod powercut_tests;
 mod snapshot;
 pub mod sstable;
 
