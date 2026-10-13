@@ -1147,7 +1147,71 @@ impl MemExecutor {
                     });
                 if aggregated {
                     let input_rows = node.rows;
-                    node = if group_by.is_empty() {
+                    // A query of nothing but `min`/`max` over indexed
+                    // columns reads the ends of their indexes: a `Result`
+                    // over one `InitPlan` per aggregate, as PostgreSQL
+                    // plans it.
+                    let minmax = if single
+                        && sample.is_none()
+                        && filter.is_none()
+                        && group_by.is_empty()
+                        && let Ok((db, schema, table_only)) = parse_object_name(table_name)
+                        && let Ok(tbl) = self.catalog_reader.get_table(db, schema, table_only)
+                        && tbl.view_query.is_none()
+                        && self.descendants(db, tbl.id).is_ok_and(|d| d.is_empty())
+                    {
+                        crate::index_keys::minmax_indexes(&tbl, projection)
+                    } else {
+                        None
+                    };
+                    node = if let Some(minmax) = minmax {
+                        let label = scan_label_name(table_name, table_alias.as_deref());
+                        let mut subplans = Vec::new();
+                        for (number, (backwards, column, _, index_name)) in
+                            minmax.iter().enumerate()
+                        {
+                            let mut scan = Node::new(
+                                "Index Only Scan",
+                                format!(
+                                    "Index Only Scan{} using {} on {}",
+                                    if *backwards { " Backward" } else { "" },
+                                    index_name,
+                                    label
+                                ),
+                                node.rows.max(1.0),
+                                node.width,
+                            )
+                            .prop(
+                                "Scan Direction",
+                                json!(if *backwards { "Backward" } else { "Forward" }),
+                            )
+                            .prop("Index Name", json!(index_name))
+                            .prop("Relation Name", json!(relation_name(table_name)))
+                            .prop(
+                                "Alias",
+                                json!(scan_label_name(table_name, table_alias.as_deref())),
+                            )
+                            .detail("Index Cond", format!("({column} IS NOT NULL)"));
+                            scan.startup = 0.15;
+                            scan.total = 8.17;
+                            let mut limit = Node::over("Limit", "Limit", vec![scan]);
+                            limit.rows = 1.0;
+                            let mut wrapper = Node::new(
+                                &format!("InitPlan {}", number + 1),
+                                format!("InitPlan {}", number + 1),
+                                limit.rows,
+                                limit.width,
+                            );
+                            wrapper.startup = limit.startup;
+                            wrapper.total = limit.total;
+                            wrapper.children = vec![limit];
+                            subplans.push(wrapper);
+                        }
+                        let mut result = Node::new("Result", "Result", 1.0, node.width);
+                        result.total = input_rows * CPU_TUPLE;
+                        result.subplans = subplans;
+                        result
+                    } else if group_by.is_empty() {
                         let mut agg = Node::over("Aggregate", "Aggregate", vec![node])
                             .prop("Strategy", json!("Plain"))
                             .prop("Partial Mode", json!("Simple"));

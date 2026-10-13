@@ -835,6 +835,40 @@ impl MemExecutor {
                             Some(self.merge_overlay_by(indexed, tbl.id, &ctx.session_id, |_| true));
                     }
                 }
+                // A query of nothing but `min`/`max` over indexed columns
+                // reads the ends of their indexes and aggregates over what
+                // it finds, as PostgreSQL plans it.
+                if rows.is_none()
+                    && sample.is_none()
+                    && joins.is_empty()
+                    && descendants.is_empty()
+                    && filter.is_none()
+                    && group_by.is_empty()
+                    && let Some(minmax) = crate::index_keys::minmax_indexes(&tbl, &projection)
+                {
+                    let mut candidates: Vec<(String, Vec<Value>)> = Vec::new();
+                    for (backwards, column, index_id, _) in &minmax {
+                        let data_type = tbl
+                            .columns
+                            .iter()
+                            .find(|c| c.name == *column)
+                            .map(|c| c.data_type.clone())
+                            .unwrap_or_default();
+                        if let Ok(end) = self.index_end_rows(
+                            *index_id,
+                            tbl.id,
+                            &data_type,
+                            !backwards,
+                            &ctx.session_id,
+                        ) {
+                            candidates.extend(end);
+                        }
+                    }
+                    candidates.sort_by(|a, b| a.0.cmp(&b.0));
+                    candidates.dedup_by(|a, b| a.0 == b.0);
+                    rows =
+                        Some(self.merge_overlay_by(candidates, tbl.id, &ctx.session_id, |_| true));
+                }
                 let rows = match rows {
                     Some(r) => r,
                     None => {

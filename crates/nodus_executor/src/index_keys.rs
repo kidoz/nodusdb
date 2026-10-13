@@ -791,6 +791,44 @@ pub(crate) fn index_only_needed(
     Some(NeededColumns::Named(needed))
 }
 
+/// The `min`/`max` aggregates a query is made of, each with the index its
+/// column's values are read from and whether that read runs backwards —
+/// the one-entry scans PostgreSQL plans instead of aggregating. `None`
+/// when the query is anything else.
+pub(crate) fn minmax_indexes(
+    tbl: &nodus_catalog::TableDescriptor,
+    projection: &[crate::plan_types::ProjectionItem],
+) -> Option<Vec<(bool, String, nodus_catalog::IndexId, String)>> {
+    use crate::plan_types::{AggregateOp, ProjectionItem};
+    if projection.is_empty() {
+        return None;
+    }
+    let mut minmax = Vec::new();
+    for item in projection {
+        let ProjectionItem::Aggregate(op, arg) = item else {
+            return None;
+        };
+        let backwards = match op {
+            AggregateOp::Min => false,
+            AggregateOp::Max => true,
+            _ => return None,
+        };
+        let bare = arg.rsplit('.').next().unwrap_or(arg);
+        let column = tbl
+            .columns
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(bare))?;
+        let index = tbl.indexes.iter().find(|idx| {
+            idx.key_columns
+                .first()
+                .is_some_and(|key| !is_expression_key(key) && key.column_id == column.id)
+                && crate::MemExecutor::index_entry_encoding(tbl, idx).1
+        })?;
+        minmax.push((backwards, column.name.clone(), index.id, index.name.clone()));
+    }
+    Some(minmax)
+}
+
 /// The columns an addition to a projection reads (a sort's keys).
 pub(crate) fn add_needed(needed: NeededColumns, extra: &[String]) -> NeededColumns {
     match needed {

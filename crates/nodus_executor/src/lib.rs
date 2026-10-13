@@ -1090,6 +1090,70 @@ impl MemExecutor {
         Ok(rows)
     }
 
+    /// The row at an index's end, for `min`/`max`: the first entry's row
+    /// (or, when `first` is false, the last's) — the one-entry index read
+    /// PostgreSQL plans for them.
+    pub(crate) fn index_end_rows(
+        &self,
+        index_id: nodus_catalog::IndexId,
+        table_id: TableId,
+        data_type: &str,
+        first: bool,
+        session: &str,
+    ) -> Result<Vec<(String, Vec<Value>)>> {
+        let read_ts = self.read_ts(session);
+        // Barrier the table group whose row this index lookup will fetch.
+        self.maybe_read_range_barrier(
+            session,
+            KeyRange {
+                start: Bytes::from(format!("{table_id}:")),
+                end: Bytes::from(format!("{table_id};")),
+            },
+        )?;
+        let columns = self.table_columns(table_id);
+        let Some((_, start, end)) = Self::index_prefix_region(index_id, "", None) else {
+            return Ok(Vec::new());
+        };
+        let whole = format!("i:{index_id}:");
+        let mut chosen: Option<String> = None;
+        for pair in self.kv.scan(
+            KeyRange {
+                start: Bytes::from(start),
+                end: Bytes::from(end),
+            },
+            read_ts,
+        )? {
+            let pair = pair?;
+            let key = String::from_utf8_lossy(&pair.key);
+            let Some(tail) = key.strip_prefix(&whole) else {
+                continue;
+            };
+            let Some((components, pk)) = tail.split_once('-') else {
+                continue;
+            };
+            if first {
+                chosen = Some(pk.to_string());
+                break;
+            }
+            // Nulls sort after values, so the greatest is the last entry
+            // that is not one.
+            let component = components.split('!').next().unwrap_or(components);
+            if Self::decode_key_component(component, data_type, true)
+                .is_some_and(|value| value != Value::Null)
+            {
+                chosen = Some(pk.to_string());
+            }
+        }
+        let Some(pk) = chosen else {
+            return Ok(Vec::new());
+        };
+        let row_key = Bytes::from(format!("{table_id}:{pk}"));
+        if let Some(row_val) = self.kv.get(&row_key, read_ts)? {
+            return Ok(vec![(pk, Self::decode_row(&row_val, &columns)?)]);
+        }
+        Ok(Vec::new())
+    }
+
     /// The rows an index's entries under an encoded key prefix hold
     /// themselves: every key column's value decoded from the entry key, the
     /// `INCLUDE` columns' from the payload.
