@@ -167,6 +167,10 @@ pub struct MultiRaftManager {
     /// KV write/read path can check group membership without awaiting the
     /// async `RaftState` lock. Always updated alongside `state`.
     hosted: Arc<RwLock<HashSet<String>>>,
+    /// Per-group snapshot-deferral tracker handles, captured at group creation
+    /// so the metrics loop can report deferral streaks without reaching into
+    /// openraft's storage adaptor.
+    deferrals: Arc<RwLock<HashMap<String, nodus_raftstore::SnapshotDeferral>>>,
     machines: tokio::sync::RwLock<
         std::collections::HashMap<String, Arc<tokio::sync::RwLock<nodus_raftstore::StateMachine>>>,
     >,
@@ -214,6 +218,7 @@ impl MultiRaftManager {
             state,
             base_kv,
             hosted: Arc::new(RwLock::new(HashSet::new())),
+            deferrals: Arc::new(RwLock::new(HashMap::new())),
             machines: tokio::sync::RwLock::new(std::collections::HashMap::new()),
             admin_token,
             http: std::sync::OnceLock::new(),
@@ -303,6 +308,34 @@ impl MultiRaftManager {
     pub fn hosted_group_ids(&self) -> Vec<String> {
         self.hosted.read().unwrap().iter().cloned().collect()
     }
+
+    /// Current snapshot-deferral streak per hosted group, for metrics and the
+    /// log-growth warning. Groups whose builds succeed report no streak.
+    pub fn snapshot_deferrals(&self) -> Vec<(String, nodus_raftstore::DeferralSnapshot)> {
+        self.deferrals
+            .read()
+            .unwrap()
+            .iter()
+            .filter_map(|(group, tracker)| tracker.current().map(|snap| (group.clone(), snap)))
+            .collect()
+    }
+
+    /// Retained Raft log entries per hosted group (`last_log_index` minus the
+    /// purge watermark): the log-growth signal while snapshot builds defer.
+    pub async fn log_retention(&self) -> Vec<(String, u64)> {
+        let rafts = self.state.rafts.read().await;
+        rafts
+            .iter()
+            .map(|(id, raft)| {
+                let watch = raft.metrics();
+                let metrics = watch.borrow();
+                let last = metrics.last_log_index.unwrap_or(0);
+                let purged = metrics.purged.map(|id| id.index).unwrap_or(0);
+                (id.clone(), last.saturating_sub(purged))
+            })
+            .collect()
+    }
+
     /// Health of the data-shard groups hosted here: `(total, without_leader)`.
     /// A group with no current leader is unavailable for reads/writes. The meta
     /// group is excluded. Feeds the cluster-overview shard health.
@@ -365,6 +398,10 @@ impl MultiRaftManager {
     /// returns the handle. The network factory carries `shard_id` so RPCs are
     /// routed to `/raft/{shard_id}/...` on peers.
     async fn spawn_group(&self, shard_id: &str, store: NodusRaftStore) -> Result<NodusRaft> {
+        self.deferrals
+            .write()
+            .unwrap()
+            .insert(shard_id.to_string(), store.deferral());
         let store = store
             .with_snapshot_group(shard_id)
             .with_snapshot_compatibility(Arc::new(
@@ -695,6 +732,7 @@ impl MultiRaftManager {
             .map(|(_, r)| r)
             .collect();
         self.hosted.write().unwrap().clear();
+        self.deferrals.write().unwrap().clear();
         self.machines.write().await.clear();
         for raft in groups {
             let _ = raft.shutdown().await;
@@ -708,6 +746,7 @@ impl MultiRaftManager {
     pub async fn remove_group(&self, group_id: &str) -> Result<()> {
         let raft = self.state.rafts.write().await.remove(group_id);
         self.hosted.write().unwrap().remove(group_id);
+        self.deferrals.write().unwrap().remove(group_id);
         self.machines.write().await.remove(group_id);
         if let Some(raft) = raft {
             let _ = raft.shutdown().await;

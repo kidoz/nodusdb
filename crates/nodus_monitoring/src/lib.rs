@@ -1,5 +1,6 @@
 use axum::{Router, http::StatusCode, routing::get};
 use prometheus_client::metrics::counter::Counter;
+use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::metrics::histogram::{Histogram, exponential_buckets};
 use prometheus_client::registry::Registry;
@@ -48,6 +49,14 @@ pub struct Metrics {
     pub janitor_aborts_total: Counter,
     /// Pending intents observed by the janitor's most recent sweep.
     pub pending_intents: Gauge,
+    /// Raft log entries retained per group (`group` label) — grows without
+    /// bound while a group's snapshot build keeps deferring.
+    pub raft_log_entries: Family<Vec<(String, String)>, Gauge>,
+    /// Snapshot builds deferred per group (`group` label).
+    pub snapshot_deferrals_total: Family<Vec<(String, String)>, Counter>,
+    /// Duration (seconds) of each group's current unbroken snapshot-deferral
+    /// streak (`group` label); 0 when builds are succeeding.
+    pub snapshot_deferred_seconds: Family<Vec<(String, String)>, Gauge>,
 }
 
 impl Default for Metrics {
@@ -69,6 +78,9 @@ impl Default for Metrics {
             shard_groups_unavailable: Gauge::default(),
             janitor_aborts_total: Counter::default(),
             pending_intents: Gauge::default(),
+            raft_log_entries: Family::default(),
+            snapshot_deferrals_total: Family::default(),
+            snapshot_deferred_seconds: Family::default(),
         }
     }
 }
@@ -150,6 +162,21 @@ impl Metrics {
             "nodus_pending_intents",
             "Pending intents observed by the janitor's most recent sweep",
             m.pending_intents.clone(),
+        );
+        registry.register(
+            "nodus_raft_log_entries",
+            "Raft log entries retained per group",
+            m.raft_log_entries.clone(),
+        );
+        registry.register(
+            "nodus_snapshot_deferrals_total",
+            "Snapshot builds deferred per group",
+            m.snapshot_deferrals_total.clone(),
+        );
+        registry.register(
+            "nodus_snapshot_deferred_seconds",
+            "Duration of each group's current unbroken snapshot-deferral streak",
+            m.snapshot_deferred_seconds.clone(),
         );
         m
     }
@@ -367,10 +394,20 @@ mod tests {
         let metrics = Metrics::register(&mut registry);
         metrics.queries_total.inc();
         metrics.janitor_aborts_total.inc_by(2);
+        metrics
+            .raft_log_entries
+            .get_or_create(&vec![("group".to_string(), "shard-meta".to_string())])
+            .set(42);
+        metrics
+            .snapshot_deferrals_total
+            .get_or_create(&vec![("group".to_string(), "shard-meta".to_string())])
+            .inc();
         let mut buf = String::new();
         prometheus_client::encoding::text::encode(&mut buf, &registry).unwrap();
         // prometheus-client appends its own `_total` to counter samples.
         assert!(buf.contains("nodus_queries_total"));
         assert!(buf.contains("nodus_janitor_aborts_total_total 2"));
+        assert!(buf.contains("nodus_raft_log_entries{group=\"shard-meta\"} 42"));
+        assert!(buf.contains("nodus_snapshot_deferrals_total_total{group=\"shard-meta\"} 1"));
     }
 }

@@ -98,14 +98,19 @@ async fn a_deferred_build_waits_out_the_retry_interval() {
     // The pending intent defers the build.
     let deferred = store.build_snapshot().await.unwrap();
     assert_eq!(deferred.meta.snapshot_id, original.meta.snapshot_id);
+    // The deferral is tracked for log-growth visibility.
+    let streak = store.deferral().current().expect("deferral tracked");
+    assert_eq!(streak.count, 1);
     // Once it commits, a build right away still reports no progress
     // without scanning; after the interval it snapshots.
     kv.commit(txn, 20).unwrap();
     let throttled = store.build_snapshot().await.unwrap();
     assert_eq!(throttled.meta.snapshot_id, original.meta.snapshot_id);
-    *store.snapshot_deferred_at.lock().unwrap() = None;
+    store.deferral().clear();
     let fresh = store.build_snapshot().await.unwrap();
     assert_ne!(fresh.meta.snapshot_id, original.meta.snapshot_id);
+    // A successful build ends the streak.
+    assert!(store.deferral().current().is_none());
 }
 
 #[tokio::test]
@@ -275,7 +280,7 @@ async fn mvcc_snapshots_require_finalization_and_every_voter_and_learner() {
         snapshot.meta.last_log_id.is_none() && snapshot.meta.snapshot_id == "deferred"
     };
     let retry_now = |store: &NodusRaftStore| {
-        *store.snapshot_deferred_at.lock().unwrap() = None;
+        store.deferral().clear();
     };
     assert!(deferred(&source.build_snapshot().await.unwrap()));
     compatibility.finalized.store(2, Ordering::SeqCst);

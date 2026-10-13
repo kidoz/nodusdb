@@ -34,6 +34,83 @@ pub mod server;
 mod snapshots;
 pub use snapshots::v2::SnapshotCompatibility;
 
+/// Shared, cheap-to-clone tracker for a group's snapshot-build deferrals.
+/// `build_snapshot` records every deferral here; the owning
+/// `MultiRaftManager` keeps one handle per group so the node's metrics loop
+/// can expose per-group deferral counts and how long the current unbroken
+/// deferral streak has lasted (pending intents or retained MVCC history block
+/// legacy snapshot builds, and while deferred the Raft log cannot be purged).
+#[derive(Clone, Default)]
+pub struct SnapshotDeferral {
+    inner: Arc<std::sync::Mutex<Option<DeferralState>>>,
+}
+
+#[derive(Debug)]
+struct DeferralState {
+    /// When the current unbroken deferral streak began.
+    since: std::time::Instant,
+    /// When the most recent deferral happened (drives the retry throttle).
+    last: std::time::Instant,
+    /// Deferrals in the current streak.
+    count: u64,
+    reason: &'static str,
+}
+
+/// A point-in-time view of a group's ongoing deferral streak.
+#[derive(Debug, Clone)]
+pub struct DeferralSnapshot {
+    pub since: std::time::Instant,
+    pub count: u64,
+    pub reason: &'static str,
+}
+
+impl SnapshotDeferral {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<DeferralState>> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub(crate) fn record(&self, reason: &'static str) {
+        let now = std::time::Instant::now();
+        let mut guard = self.lock();
+        match &mut *guard {
+            Some(state) => {
+                state.last = now;
+                state.count += 1;
+                state.reason = reason;
+            }
+            None => {
+                *guard = Some(DeferralState {
+                    since: now,
+                    last: now,
+                    count: 1,
+                    reason,
+                });
+            }
+        }
+    }
+
+    pub(crate) fn clear(&self) {
+        *self.lock() = None;
+    }
+
+    /// Whether a build was deferred within `within`, so the next build reports
+    /// no progress without rescanning the whole state machine.
+    pub(crate) fn recently_deferred(&self, within: std::time::Duration) -> bool {
+        self.lock()
+            .as_ref()
+            .is_some_and(|state| state.last.elapsed() < within)
+    }
+
+    /// The current deferral streak, if any.
+    pub fn current(&self) -> Option<DeferralSnapshot> {
+        self.lock().as_ref().map(|state| DeferralSnapshot {
+            since: state.since,
+            count: state.count,
+            reason: state.reason,
+        })
+    }
+}
+
 openraft::declare_raft_types!(
     /// Declare the type configuration for `openraft`.
     #[derive(serde::Serialize, serde::Deserialize, Hash)]
@@ -611,9 +688,10 @@ pub struct StateMachine {
 pub struct NodusRaftStore {
     snapshot_group: String,
     snapshot_compatibility: Option<Arc<dyn SnapshotCompatibility>>,
-    /// When a snapshot was last deferred, so the next build within
-    /// [`SNAPSHOT_RETRY_INTERVAL`] reports no progress without rescanning.
-    snapshot_deferred_at: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
+    /// Snapshot-build deferral streak, so the next build within
+    /// [`SNAPSHOT_RETRY_INTERVAL`] reports no progress without rescanning, and
+    /// the node's metrics loop can watch per-group deferrals.
+    deferral: SnapshotDeferral,
     pub log: Arc<RwLock<BTreeMap<u64, Entry<NodusTypeConfig>>>>,
     pub vote: Arc<RwLock<Option<Vote<u64>>>>,
     pub state_machine: Arc<RwLock<StateMachine>>,
@@ -647,6 +725,12 @@ fn temp_snapshot_dir() -> PathBuf {
 }
 
 impl NodusRaftStore {
+    /// This group's snapshot-deferral tracker (shared handle). The manager
+    /// captures one per group at creation for the node's metrics loop.
+    pub fn deferral(&self) -> SnapshotDeferral {
+        self.deferral.clone()
+    }
+
     /// In-memory store (no durability) — for tests and ephemeral groups.
     pub fn new() -> Self {
         Self {
@@ -664,7 +748,7 @@ impl NodusRaftStore {
             meta: None,
             snapshot_group: "unscoped".into(),
             snapshot_compatibility: None,
-            snapshot_deferred_at: Arc::default(),
+            deferral: SnapshotDeferral::default(),
             snapshot_dir: temp_snapshot_dir(),
             current_snapshot_meta: Arc::new(RwLock::new(None)),
         }
@@ -723,7 +807,7 @@ impl NodusRaftStore {
             meta: Some(meta),
             snapshot_group: "unscoped".into(),
             snapshot_compatibility: None,
-            snapshot_deferred_at: Arc::default(),
+            deferral: SnapshotDeferral::default(),
             snapshot_dir,
             current_snapshot_meta: Arc::new(RwLock::new(snapshot_meta)),
         })
@@ -1010,28 +1094,21 @@ const SNAPSHOT_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_s
 
 impl RaftSnapshotBuilder<NodusTypeConfig> for NodusRaftStore {
     async fn build_snapshot(&mut self) -> Result<Snapshot<NodusTypeConfig>, StorageError<u64>> {
-        let recently_deferred = self
-            .snapshot_deferred_at
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_some_and(|at| at.elapsed() < SNAPSHOT_RETRY_INTERVAL);
-        if recently_deferred {
+        if self.deferral.recently_deferred(SNAPSHOT_RETRY_INTERVAL) {
             return self.unchanged_snapshot().await;
         }
         match self.build_atomic_snapshot().await {
             Ok(snapshot) => {
-                *self
-                    .snapshot_deferred_at
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner()) = None;
+                self.deferral.clear();
                 Ok(snapshot)
             }
             Err(e) if e.downcast_ref::<snapshots::SnapshotDeferred>().is_some() => {
                 tracing::debug!(reason = %e, "snapshot deferred");
-                *self
-                    .snapshot_deferred_at
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner()) = Some(std::time::Instant::now());
+                let reason = e
+                    .downcast_ref::<snapshots::SnapshotDeferred>()
+                    .map(|d| d.0)
+                    .unwrap_or("snapshot deferred");
+                self.deferral.record(reason);
                 self.unchanged_snapshot().await
             }
             Err(e) => Err(snapshot_io_err("build snapshot", e)),

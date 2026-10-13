@@ -1267,6 +1267,17 @@ pub async fn run_server_with_config(
     tokio::spawn(async move {
         use std::sync::atomic::Ordering::Relaxed;
         let mut shard_tick = tokio::time::interval(std::time::Duration::from_secs(2));
+        // Per-group snapshots of the last reported deferral counters (to turn
+        // cumulative counts into deltas) and last warning time (to throttle
+        // the log-growth warning to one line per group per minute).
+        let mut deferral_counts: std::collections::HashMap<String, u64> =
+            std::collections::HashMap::new();
+        let mut deferral_warned: std::collections::HashMap<String, tokio::time::Instant> =
+            std::collections::HashMap::new();
+        /// Warn when a group's snapshot build has deferred continuously this
+        /// long: while deferred the Raft log cannot be purged and grows with
+        /// every write.
+        const DEFERRAL_WARN_AFTER: std::time::Duration = std::time::Duration::from_secs(600);
         loop {
             tokio::select! {
                 res = raft_metrics.changed() => {
@@ -1297,6 +1308,70 @@ pub async fn run_server_with_config(
                     metrics_state.cluster.shards_unavailable.store(unavailable, Relaxed);
                     metrics_state.metrics.shard_groups.set(total as i64);
                     metrics_state.metrics.shard_groups_unavailable.set(unavailable as i64);
+
+                    // Log-growth visibility: retained Raft log entries per group.
+                    for (group, retained) in metrics_manager.log_retention().await {
+                        metrics_state
+                            .metrics
+                            .raft_log_entries
+                            .get_or_create(&vec![("group".to_string(), group)])
+                            .set(retained as i64);
+                    }
+                    // Snapshot-build deferrals: cumulative count plus the current
+                    // streak's duration, and a (throttled) warning past the
+                    // threshold.
+                    let deferrals = metrics_manager.snapshot_deferrals();
+                    for (group, deferral) in &deferrals {
+                        let labels = vec![("group".to_string(), group.clone())];
+                        let previous = deferral_counts.get(group).copied().unwrap_or(0);
+                        if deferral.count > previous {
+                            metrics_state
+                                .metrics
+                                .snapshot_deferrals_total
+                                .get_or_create(&labels)
+                                .inc_by(deferral.count - previous);
+                            deferral_counts.insert(group.clone(), deferral.count);
+                        }
+                        let deferred_for = deferral.since.elapsed();
+                        metrics_state
+                            .metrics
+                            .snapshot_deferred_seconds
+                            .get_or_create(&labels)
+                            .set(deferred_for.as_secs() as i64);
+                        if deferred_for >= DEFERRAL_WARN_AFTER {
+                            let quiet = deferral_warned
+                                .get(group)
+                                .is_none_or(|at| at.elapsed() >= std::time::Duration::from_secs(60));
+                            if quiet {
+                                tracing::warn!(
+                                    group,
+                                    deferred_secs = deferred_for.as_secs(),
+                                    reason = deferral.reason,
+                                    deferrals = deferral.count,
+                                    "snapshot build keeps deferring; the group's Raft log grows until it succeeds"
+                                );
+                                deferral_warned.insert(group.clone(), tokio::time::Instant::now());
+                            }
+                        }
+                    }
+                    // Groups whose builds now succeed (or which are gone) drop
+                    // out of the deferral map: reset their streak gauge and the
+                    // delta bookkeeping so a later streak counts from zero.
+                    let active: std::collections::HashSet<&str> = deferrals
+                        .iter()
+                        .map(|(group, _)| group.as_str())
+                        .collect();
+                    deferral_counts.retain(|group, _| active.contains(group.as_str()));
+                    deferral_warned.retain(|group, _| active.contains(group.as_str()));
+                    for group in metrics_manager.hosted_group_ids() {
+                        if !active.contains(group.as_str()) {
+                            metrics_state
+                                .metrics
+                                .snapshot_deferred_seconds
+                                .get_or_create(&vec![("group".to_string(), group)])
+                                .set(0);
+                        }
+                    }
                 }
                 _ = rm_shutdown.changed() => {
                     break;
