@@ -1,0 +1,132 @@
+# `min`/`max` through the index: a query of nothing but those aggregates
+# over indexed columns reads the ends of their indexes instead of
+# scanning the table — a `Result` over one `InitPlan` per aggregate, the
+# ascending end for `min` and `Index Only Scan Backward` for `max`, each
+# bounded by `Limit` and with the column's `IS NOT NULL` condition, as
+# PostgreSQL 18 plans it. Any other aggregate, a `GROUP BY`, a `WHERE`
+# or a column without an order-encoded index keeps the ordinary
+# aggregation. PostgreSQL gives a repeat reference a `g1_1` alias;
+# NodusDB prints the bare name. Plans and results otherwise from
+# PostgreSQL 18.4.
+
+statement ok
+drop table if exists g1 cascade;
+
+statement ok
+create table g1 (k int, v int);
+
+statement ok
+insert into g1 select g % 3, g from generate_series(1, 90) g;
+
+statement ok
+create index g1_v on g1 (v);
+
+statement ok
+analyze g1;
+
+query T
+explain (costs off) select min(v) from g1;
+----
+Result
+  InitPlan 1
+    ->  Limit
+          ->  Index Only Scan using g1_v on g1
+                Index Cond: (v IS NOT NULL)
+
+query T
+explain (costs off) select max(v) from g1;
+----
+Result
+  InitPlan 1
+    ->  Limit
+          ->  Index Only Scan Backward using g1_v on g1
+                Index Cond: (v IS NOT NULL)
+
+query T
+explain (costs off) select min(v), max(v) from g1;
+----
+Result
+  InitPlan 1
+    ->  Limit
+          ->  Index Only Scan using g1_v on g1
+                Index Cond: (v IS NOT NULL)
+  InitPlan 2
+    ->  Limit
+          ->  Index Only Scan Backward using g1_v on g1
+                Index Cond: (v IS NOT NULL)
+
+query T
+explain (costs off) select min(k) from g1;
+----
+Aggregate
+  ->  Seq Scan on g1
+
+query T
+explain (costs off) select min(v), count(*) from g1;
+----
+Aggregate
+  ->  Seq Scan on g1
+
+query T
+explain (costs off) select sum(v) from g1;
+----
+Aggregate
+  ->  Seq Scan on g1
+
+query T
+select min(v), max(v) from g1;
+----
+1	90
+
+
+query T
+insert into g1 values (0, -5), (1, 100);
+----
+
+
+query T
+select min(v) from g1;
+----
+-5
+
+
+query T
+delete from g1 where v in (-5, 100);
+----
+
+
+query T
+create table n1 (v int);
+----
+
+
+statement ok
+insert into n1 values (null), (7), (null);
+
+statement ok
+create index n1_v on n1 (v);
+
+query T
+select min(v), max(v) from n1;
+----
+7	7
+
+
+query T
+create table e1 (v int);
+----
+
+
+statement ok
+create index e1_v on e1 (v);
+
+query T
+select min(v) from e1;
+----
+NULL
+
+
+query T
+select min(k) from g1;
+----
+0
