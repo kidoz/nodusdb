@@ -191,6 +191,12 @@ pub trait KvEngine: Send + Sync {
     /// committed versions strictly older than the newest version at or below
     /// `watermark` are removed. `watermark` must be ≤ the oldest active read
     /// timestamp. Returns the number of versions reclaimed. Default: no-op.
+    ///
+    /// An engine whose reads fall through to older sources (a memtable above
+    /// SSTables) must RETAIN the newest-visible tombstone of each key: erasing
+    /// it would empty the chain and resurrect the deleted value from the older
+    /// source. Only a pass that merges every source (compaction) or a
+    /// single-source engine may reclaim such a tombstone outright.
     fn garbage_collect(&self, _watermark: Timestamp) -> Result<usize> {
         Ok(0)
     }

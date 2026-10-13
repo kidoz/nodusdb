@@ -3,7 +3,7 @@ use bytes::Bytes;
 mod snapshot;
 pub mod sstable;
 
-use nodus_mvcc::{VersionChain, VisibleVersion};
+use nodus_mvcc::{GcMode, VersionChain, VisibleVersion};
 use nodus_storage_api::{
     IntentReplacement, KeyRange, KvEngine, KvPair, KvResult, KvVersion, Timestamp, TxnId,
 };
@@ -526,11 +526,14 @@ impl LsmKvEngine {
             }
         }
         // Normalize each merged chain (dedup + drop GC-able versions); drop keys
-        // left with no versions.
+        // left with no versions. Compaction merges ALL SSTables into one output,
+        // so the merged chain is the key's complete history and a newest-visible
+        // tombstone is fully reclaimable (`GcMode::Complete`) — this is what
+        // bounds tombstone accumulation.
         merged.retain(|_, chain| {
             chain.versions.sort_by_key(|v| v.version);
             chain.versions.dedup();
-            chain.garbage_collect(watermark);
+            chain.garbage_collect(watermark, GcMode::Complete);
             !chain.versions.is_empty()
         });
 
@@ -1089,7 +1092,12 @@ impl KvEngine for LsmKvEngine {
         let mut dead_keys = Vec::new();
 
         for (key, chain) in store.iter_mut() {
-            removed += chain.garbage_collect(watermark);
+            // The memtable is layered over SSTables that may still hold the
+            // key, so the newest-visible tombstone must be RETAINED: erasing
+            // it would empty the chain and `get` would fall through to an
+            // SSTable, resurrecting the deleted row. Compaction (which merges
+            // every source) is where tombstones are fully reclaimed.
+            removed += chain.garbage_collect(watermark, GcMode::Layered);
             if chain.versions.is_empty() {
                 dead_keys.push(key.clone());
             }
@@ -2093,4 +2101,64 @@ mod sst_tests {
         );
         assert_eq!(engine.get(b"stable", 100).unwrap(), Some(Bytes::from("s")));
     }
+
+    #[test]
+    fn gc_keeps_the_memtable_tombstone_until_compaction() {
+        // Regression: executor-driven GC (watermark past the delete) erased the
+        // newest-visible tombstone from the memtable chain entirely. The empty
+        // chain made `get` fall through to the SSTable below, resurrecting the
+        // deleted row. Memtable GC must retain that tombstone; only compaction
+        // — which merges every source — may reclaim it fully.
+        let dir = TempDir::new().unwrap();
+        let engine = LsmKvEngine::with_wal(dir.path(), None).unwrap();
+        let put = |key: &str, value: &str, ts: Timestamp| {
+            let txn = TxnId::new();
+            engine
+                .write_intent(
+                    txn,
+                    Bytes::from(key.to_owned()),
+                    Bytes::from(value.to_owned()),
+                )
+                .unwrap();
+            engine.commit(txn, ts).unwrap();
+        };
+
+        // k@5 flushed to an SSTable; k@10 and the delete@20 stay in the memtable.
+        put("k", "v1", 5);
+        engine.flush().unwrap();
+        put("k", "v2", 10);
+        let delete = TxnId::new();
+        engine
+            .delete_intent(delete, Bytes::from_static(b"k"))
+            .unwrap();
+        engine.commit(delete, 20).unwrap();
+
+        // GC at a watermark past the delete: k@10 goes, the tombstone must stay.
+        engine.garbage_collect(20).unwrap();
+        assert_eq!(
+            engine.get(b"k", 30).unwrap(),
+            None,
+            "tombstone erased by GC: deleted row resurrected from the SSTable"
+        );
+        assert_eq!(
+            engine.get(b"k", 6).unwrap(),
+            Some(Bytes::from("v1")),
+            "snapshot reads still see the SSTable value"
+        );
+
+        // Flush the tombstone into an SSTable, then compact. The compaction
+        // merges ALL sources, so no older source remains that could resurrect
+        // the key and the tombstone is reclaimed outright — this is what
+        // bounds tombstone accumulation.
+        engine.flush().unwrap();
+        engine.compact().unwrap();
+        assert_eq!(engine.get(b"k", 30).unwrap(), None, "after compaction");
+        let sstables = engine.sstables.read().unwrap();
+        assert_eq!(sstables.len(), 1, "the two SSTables merged into one");
+        assert!(
+            sstables[0].get(b"k").unwrap().is_none(),
+            "compaction did not fully reclaim the deleted key"
+        );
+    }
+
 }

@@ -1,6 +1,6 @@
 use anyhow::Result;
 use bytes::Bytes;
-use nodus_mvcc::VersionChain;
+use nodus_mvcc::{GcMode, VersionChain};
 use nodus_storage_api::{
     IntentReplacement, KeyRange, KvEngine, KvPair, KvResult, KvVersion, Timestamp, TxnId,
 };
@@ -305,7 +305,10 @@ impl KvEngine for MemKvEngine {
         let mut dead_keys = Vec::new();
 
         for (key, chain) in store.iter_mut() {
-            removed += chain.garbage_collect(watermark);
+            // Single-source store: there is no older source a reader could
+            // fall through to, so a newest-visible tombstone is fully
+            // reclaimable here.
+            removed += chain.garbage_collect(watermark, GcMode::Complete);
             if chain.versions.is_empty() {
                 dead_keys.push(key.clone());
             }

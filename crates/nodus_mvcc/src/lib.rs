@@ -68,6 +68,23 @@ pub enum VisibleVersion<'a> {
     Value(&'a [u8]),
 }
 
+/// Whether a garbage-collected chain is layered over older sources that may
+/// still hold the key, or is the key's complete remaining history. This
+/// decides what may happen to a newest-visible tombstone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GcMode {
+    /// The chain sits above older sources (a memtable over SSTables). The
+    /// newest visible tombstone must be RETAINED: erasing it would empty the
+    /// chain, and a reader falling through to an older source would resurrect
+    /// the deleted value.
+    Layered,
+    /// The chain is the key's complete history (compaction output merging all
+    /// SSTables, or a single-source store). A newest-visible tombstone at or
+    /// below the watermark is fully reclaimable — no older source remains
+    /// that could resurrect the key — which bounds tombstone accumulation.
+    Complete,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct VersionChain {
     pub versions: Vec<MvccValue>,
@@ -180,8 +197,9 @@ impl VersionChain {
 
     /// Reclaims MVCC versions strictly older than the `watermark`.
     /// Leaves at least one version strictly older than watermark so that
-    /// reads at watermark still see the correct value.
-    pub fn garbage_collect(&mut self, watermark: Timestamp) -> usize {
+    /// reads at watermark still see the correct value. `mode` decides whether
+    /// a newest-visible tombstone may itself be reclaimed (see [`GcMode`]).
+    pub fn garbage_collect(&mut self, watermark: Timestamp, mode: GcMode) -> usize {
         // We only care about committed versions. Intents are untouched.
         let mut committed: Vec<_> = self.versions.iter().filter(|v| !v.is_intent).collect();
         committed.sort_by_key(|v| std::cmp::Reverse(v.version)); // Newest first
@@ -205,21 +223,23 @@ impl VersionChain {
                 self.versions
                     .retain(|v| v.is_intent || v.version >= keep_version);
 
-                // If the retained element is a tombstone and strictly older than watermark,
-                // and there are no newer versions, we might be able to drop it entirely,
-                // but for simplicity standard GC keeps the tombstone or drops it if no one can see it.
                 // If the visible element AT watermark is a tombstone, and there are NO versions newer
                 // than watermark, the key is logically fully deleted for all active and future readers.
-                let newest = self.versions.iter().map(|v| v.version).max().unwrap_or(0);
-                if newest <= watermark {
-                    // Check if the newest is a tombstone.
-                    if let Some(newest_v) = self.versions.iter().find(|v| v.version == newest)
-                        && newest_v.value.is_none()
-                        && !newest_v.is_intent
-                    {
-                        // Fully reclaimable tombstone
-                        self.versions.retain(|v| v.version != newest);
-                        reclaimed += 1;
+                // Reclaiming it is only safe when this chain is the key's complete history
+                // (`GcMode::Complete`): a layered chain must keep the tombstone, or a reader
+                // falling through to an older source would resurrect the deleted value.
+                if mode == GcMode::Complete {
+                    let newest = self.versions.iter().map(|v| v.version).max().unwrap_or(0);
+                    if newest <= watermark {
+                        // Check if the newest is a tombstone.
+                        if let Some(newest_v) = self.versions.iter().find(|v| v.version == newest)
+                            && newest_v.value.is_none()
+                            && !newest_v.is_intent
+                        {
+                            // Fully reclaimable tombstone
+                            self.versions.retain(|v| v.version != newest);
+                            reclaimed += 1;
+                        }
                     }
                 }
             }
@@ -287,7 +307,7 @@ mod tests {
         // version visible at the watermark goes.
         let pending = TxnId::new();
         chain.write_intent(pending, b"pending".to_vec()).unwrap();
-        assert_eq!(chain.garbage_collect(5005), 499);
+        assert_eq!(chain.garbage_collect(5005, GcMode::Complete), 499);
         assert_eq!(chain.read(5005), Some(500u64.to_be_bytes().as_slice()));
         assert_eq!(chain.read(4000), None);
         assert!(chain.active_intent().is_some());
@@ -357,11 +377,11 @@ mod tests {
         assert_eq!(chain.versions.len(), 3);
 
         // GC at 15: keeps version 10 (visible at 15), 20, 30
-        assert_eq!(chain.garbage_collect(15), 0);
+        assert_eq!(chain.garbage_collect(15, GcMode::Complete), 0);
         assert_eq!(chain.versions.len(), 3);
 
         // GC at 25: keeps version 20 (visible at 25), drops 10. Keeps 30.
-        assert_eq!(chain.garbage_collect(25), 1);
+        assert_eq!(chain.garbage_collect(25, GcMode::Complete), 1);
         assert_eq!(chain.versions.len(), 2);
         assert_eq!(chain.read(25), Some(b"val2".as_slice()));
 
@@ -372,9 +392,34 @@ mod tests {
 
         // GC at 45. The newest version visible at 45 is a tombstone (40).
         // It's the absolute newest version, so the key is dead to everyone.
-        // It drops 20, 30, and the tombstone itself!
-        let reclaimed = chain.garbage_collect(45);
+        // `GcMode::Complete` (this chain is the key's whole history) drops
+        // 20, 30, and the tombstone itself.
+        let reclaimed = chain.garbage_collect(45, GcMode::Complete);
         assert_eq!(reclaimed, 3);
         assert!(chain.versions.is_empty());
+    }
+
+    #[test]
+    fn gc_retains_the_tombstone_when_layered_over_older_sources() {
+        // A memtable chain sits above SSTables that may still hold the key:
+        // erasing the newest-visible tombstone would empty the chain and let
+        // a reader falling through to the older source resurrect the deleted
+        // value. `GcMode::Layered` keeps it; `GcMode::Complete` reclaims it.
+        let mut chain = VersionChain::new();
+        let put = TxnId::new();
+        chain.write_intent(put, b"v".to_vec()).unwrap();
+        chain.commit(put, 10).unwrap();
+        let delete = TxnId::new();
+        chain.delete_intent(delete).unwrap();
+        chain.commit(delete, 20).unwrap();
+
+        let mut layered = chain.clone();
+        assert_eq!(layered.garbage_collect(20, GcMode::Layered), 1);
+        assert_eq!(layered.read_visible(30), VisibleVersion::Tombstone);
+        assert_eq!(layered.read_visible(5), VisibleVersion::Absent);
+
+        let mut complete = chain;
+        assert_eq!(complete.garbage_collect(20, GcMode::Complete), 2);
+        assert!(complete.versions.is_empty());
     }
 }
