@@ -53,6 +53,8 @@ fn single_scan(
     let mut only = children.remove(0);
     only.label = format!("Seq Scan on {} {parent_alias}", relation_name(&table.name));
     only.props.retain(|(name, _)| *name != "Alias");
+    // The scan reads the partition under the parent's name.
+    only = only.prop("Alias", json!(parent_alias));
     only
 }
 
@@ -63,7 +65,7 @@ fn append_scan(parent: &nodus_catalog::TableDescriptor, children: Vec<Node>) -> 
         .iter()
         .map(|c| (c.rows * c.width as f64 / 8192.0).ceil().max(1.0))
         .sum();
-    let mut node = Node::over("Append", "Append", children);
+    let mut node = Node::over("Append", "Append", children).prop("Subplans Removed", json!(0));
     node.rows = child_rows;
     node.width = width_of(parent);
     node.startup = 0.0;
@@ -220,14 +222,41 @@ impl Node {
                 map.insert((*name).to_string(), value.clone());
             }
         }
-        if !self.children.is_empty() {
-            let children = self
-                .children
-                .iter()
-                .enumerate()
-                .map(|(i, c)| c.to_json(opts, Some(if i == 0 { "Outer" } else { "Inner" })))
-                .collect();
-            map.insert("Plans".into(), J::Array(children));
+        let mut plans: Vec<J> = Vec::new();
+        // `Append` (and the bitmap combines) list their inputs as members.
+        let member_children = matches!(
+            self.kind.as_str(),
+            "Append" | "Merge Append" | "BitmapAnd" | "BitmapOr"
+        );
+        // A subplan's wrapper names it; PostgreSQL puts the name on the
+        // subplan's own root node, before the node's children.
+        for subplan in &self.subplans {
+            let Some(root) = subplan.children.first() else {
+                continue;
+            };
+            let relationship = if subplan.kind.starts_with("SubPlan") {
+                "SubPlan"
+            } else {
+                "InitPlan"
+            };
+            let mut entry = root.to_json(opts, Some(relationship));
+            if let J::Object(entry) = &mut entry {
+                entry.insert("Subplan Name".into(), J::String(subplan.label.clone()));
+            }
+            plans.push(entry);
+        }
+        plans.extend(self.children.iter().enumerate().map(|(i, c)| {
+            let relationship = if member_children {
+                "Member"
+            } else if i == 0 {
+                "Outer"
+            } else {
+                "Inner"
+            };
+            c.to_json(opts, Some(relationship))
+        }));
+        if !plans.is_empty() {
+            map.insert("Plans".into(), J::Array(plans));
         }
         J::Object(map)
     }
@@ -1098,7 +1127,8 @@ impl MemExecutor {
                     let input_rows = node.rows;
                     node = if group_by.is_empty() {
                         let mut agg = Node::over("Aggregate", "Aggregate", vec![node])
-                            .prop("Strategy", json!("Plain"));
+                            .prop("Strategy", json!("Plain"))
+                            .prop("Partial Mode", json!("Simple"));
                         agg.rows = 1.0;
                         agg.startup = agg.total;
                         agg
@@ -1115,6 +1145,7 @@ impl MemExecutor {
                             .collect();
                         let mut agg = Node::over("Aggregate", "HashAggregate", vec![node])
                             .prop("Strategy", json!("Hashed"))
+                            .prop("Partial Mode", json!("Simple"))
                             .keys("Group Key", keys);
                         agg.rows = (input_rows / 10.0).clamp(1.0, 200.0).round();
                         agg.startup = agg.total;
@@ -1224,6 +1255,7 @@ impl MemExecutor {
                         .collect();
                     node = Node::over("Aggregate", "HashAggregate", vec![node])
                         .prop("Strategy", json!("Hashed"))
+                        .prop("Partial Mode", json!("Simple"))
                         .keys("Group Key", keys);
                 }
                 let keys: Vec<String> = sort
@@ -1277,7 +1309,7 @@ impl MemExecutor {
                 // node, before its other subplans.
                 let mut cte_at = 0;
                 for (name, plan) in materialized {
-                    let _cte_body = CteBodyGuard::enter();
+                    let _cte_body = CteBodyGuard::enter(&name);
                     let tree = self.explain_node(ctx, plan, &scope)?;
                     drop(_cte_body);
                     let mut block = Node::new(
@@ -1305,19 +1337,25 @@ impl MemExecutor {
                     self.explain_node(ctx, right, ctes)?,
                 ];
                 match (op, all) {
-                    (SetOpKind::Union, true) => Node::over("Append", "Append", children),
+                    (SetOpKind::Union, true) => {
+                        Node::over("Append", "Append", children).prop("Subplans Removed", json!(0))
+                    }
                     (SetOpKind::Union, false) => {
-                        let append = Node::over("Append", "Append", children);
+                        let append = Node::over("Append", "Append", children)
+                            .prop("Subplans Removed", json!(0));
                         Node::over("Aggregate", "HashAggregate", vec![append])
                             .prop("Strategy", json!("Hashed"))
+                            .prop("Partial Mode", json!("Simple"))
                             .keys("Group Key", setop_group_keys(left))
                     }
                     (SetOpKind::Intersect, _) => {
                         Node::over("SetOp", "HashSetOp Intersect", children)
                             .prop("Command", json!("Intersect"))
+                            .prop("Strategy", json!("Hashed"))
                     }
                     (SetOpKind::Except, _) => Node::over("SetOp", "HashSetOp Except", children)
-                        .prop("Command", json!("Except")),
+                        .prop("Command", json!("Except"))
+                        .prop("Strategy", json!("Hashed")),
                 }
             }
             LogicalPlan::Values { rows } => values_scan(rows.len()),
@@ -1364,7 +1402,8 @@ impl MemExecutor {
                     vec![child],
                 )
                 .prop("Operation", json!("Insert"))
-                .prop("Relation Name", json!(relation_name(table_name)));
+                .prop("Relation Name", json!(relation_name(table_name)))
+                .prop("Alias", json!(relation_name(table_name)));
                 node.rows = 0.0;
                 node.width = 0;
                 if let Some(clause) = on_conflict {
@@ -1440,7 +1479,11 @@ impl MemExecutor {
                     vec![join],
                 )
                 .prop("Operation", json!("Merge"))
-                .prop("Relation Name", json!(relation_name(table_name)));
+                .prop("Relation Name", json!(relation_name(table_name)))
+                .prop(
+                    "Alias",
+                    json!(relation_name(table_alias.as_deref().unwrap_or(table_name))),
+                );
                 node.rows = 0.0;
                 node.width = 0;
                 node
@@ -1459,7 +1502,7 @@ impl MemExecutor {
                     if plan_cte_references(body, name) == 0 {
                         continue;
                     }
-                    let _cte_body = CteBodyGuard::enter();
+                    let _cte_body = CteBodyGuard::enter(&name);
                     let tree = self.explain_node(ctx, &**plan, &scope)?;
                     drop(_cte_body);
                     let mut block = Node::new(
@@ -1744,7 +1787,11 @@ impl MemExecutor {
             vec![node],
         )
         .prop("Operation", json!(operation))
-        .prop("Relation Name", json!(relation_name(table_name)));
+        .prop("Relation Name", json!(relation_name(table_name)))
+        .prop(
+            "Alias",
+            json!(relation_name(table_alias.unwrap_or(table_name))),
+        );
         for line in result_lines {
             node = node.note(line);
         }
@@ -1896,8 +1943,15 @@ impl MemExecutor {
             node
         };
         if let Some((name, plan)) = ctes.iter().rev().find(|(name, _)| name == table_name) {
-            let _cte_body = CteBodyGuard::enter();
-            let child = self.explain_node(ctx, plan, ctes)?;
+            let _cte_body = CteBodyGuard::enter(name);
+            // A recursive CTE reads itself: rendering its body again
+            // would never end, so the scan stands alone.
+            let recursive = matches!(&**plan, LogicalPlan::RecursiveCte { .. });
+            let child = if recursive {
+                Node::new("CTE Scan", format!("CTE Scan on {name}"), 100.0, 64)
+            } else {
+                self.explain_node(ctx, plan, ctes)?
+            };
             drop(_cte_body);
             // The wrapper a query over a set operation or VALUES list gets.
             if name == "\u{0}result" {
@@ -1910,6 +1964,19 @@ impl MemExecutor {
             // reference, as PostgreSQL's inlining plans it.
             if cte_inlined_here(table_name) {
                 return Ok(with_filter(child));
+            }
+            // Inside a recursive CTE's own body, its self-reference is
+            // the working table.
+            if recursive && rendering_body_of(name) {
+                let node = Node::new(
+                    "WorkTable Scan",
+                    format!("WorkTable Scan on {name}"),
+                    child.rows,
+                    child.width,
+                )
+                .prop("CTE Name", json!(name))
+                .prop("Alias", json!(relation_name(name)));
+                return Ok(with_filter(node));
             }
 
             // A materialized CTE is read by a `CTE Scan`; its plan hangs
@@ -2410,27 +2477,40 @@ fn cte_inlined_here(name: &str) -> bool {
 }
 
 thread_local! {
-    /// Whether a CTE's body is being rendered: its columns print
-    /// qualified, as PostgreSQL's plan texts show them.
-    static CTE_BODY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The CTE bodies being rendered: their columns print qualified, as
+    /// PostgreSQL's plan texts show them, and a recursive body's
+    /// self-reference is a `WorkTable Scan`.
+    static CTE_BODIES: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 fn rendering_cte_body() -> bool {
-    CTE_BODY.with(|body| body.get())
+    CTE_BODIES.with(|bodies| !bodies.borrow().is_empty())
 }
 
-/// Sets [`CTE_BODY`] for the body's rendering, restoring it after.
-struct CteBodyGuard(bool);
+fn rendering_body_of(name: &str) -> bool {
+    CTE_BODIES.with(|bodies| bodies.borrow().iter().any(|body| body == name))
+}
+
+/// Marks a CTE's body as being rendered, restoring the stack after.
+struct CteBodyGuard(Option<String>);
 
 impl CteBodyGuard {
-    fn enter() -> Self {
-        CteBodyGuard(CTE_BODY.with(|body| body.replace(true)))
+    fn enter(name: &str) -> Self {
+        let previous = CTE_BODIES.with(|bodies| {
+            let mut bodies = bodies.borrow_mut();
+            bodies.push(name.to_string());
+            (bodies.len() > 1).then(|| bodies[bodies.len() - 2].clone())
+        });
+        CteBodyGuard(previous)
     }
 }
 
 impl Drop for CteBodyGuard {
     fn drop(&mut self) {
-        CTE_BODY.with(|body| body.set(self.0));
+        CTE_BODIES.with(|bodies| {
+            bodies.borrow_mut().pop();
+        });
     }
 }
 
@@ -3841,6 +3921,59 @@ fn shown_relation(table_name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The JSON plan keeps PostgreSQL's shapes: subplans and CTE blocks as
+    /// `Plans` entries, aggregate strategies, an `Append`'s members, a
+    /// `ModifyTable`'s alias, and a recursive CTE's working table.
+    #[test]
+    fn plans_serialize_postgresqls_json_shape() {
+        let (sql, _) = crate::constraint_tests::session();
+        sql("create table t (a int, b int)").unwrap();
+        sql("insert into t values (1, 2), (2, 3)").unwrap();
+        let explain = |query: &str| {
+            let out = sql(&format!("explain (format json, costs off) {query}")).unwrap();
+            crate::render(&out.rows[0].values[0])
+        };
+
+        let plan = explain("select count(*) from t");
+        assert!(plan.contains("\"Strategy\": \"Plain\""), "{plan}");
+        assert!(plan.contains("\"Partial Mode\": \"Simple\""), "{plan}");
+
+        let plan = explain("select (select max(a) from t) from t");
+        assert!(
+            plan.contains("\"Parent Relationship\": \"InitPlan\""),
+            "{plan}"
+        );
+        assert!(plan.contains("\"Subplan Name\": \"InitPlan 1\""), "{plan}");
+
+        let plan =
+            explain("with c as (select a from t) select * from c c1 join c c2 on c1.a = c2.a");
+        assert!(plan.contains("\"Subplan Name\": \"CTE c\""), "{plan}");
+        assert!(plan.contains("\"Node Type\": \"CTE Scan\""), "{plan}");
+
+        let plan = explain("update t set b = 0 where a = 1");
+        assert!(plan.contains("\"Operation\": \"Update\""), "{plan}");
+        assert!(plan.contains("\"Alias\": \"t\""), "{plan}");
+
+        let plan = explain(
+            "with recursive r(n) as (select 1 union all select n + 1 from r where n < 5) select * from r",
+        );
+        assert!(
+            plan.contains("\"Node Type\": \"Recursive Union\""),
+            "{plan}"
+        );
+        assert!(plan.contains("\"Node Type\": \"WorkTable Scan\""), "{plan}");
+
+        sql("create table pt (id int) partition by range (id)").unwrap();
+        sql("create table pt1 partition of pt for values from (0) to (10)").unwrap();
+        sql("create table pt2 partition of pt for values from (10) to (20)").unwrap();
+        let plan = explain("select * from pt");
+        assert!(plan.contains("\"Subplans Removed\": 0"), "{plan}");
+        assert!(
+            plan.contains("\"Parent Relationship\": \"Member\""),
+            "{plan}"
+        );
+    }
 
     /// The `WHERE` of a query, unconverted.
     fn where_filter(sql: &str) -> FilterExpr {
