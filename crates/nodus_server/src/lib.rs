@@ -938,9 +938,10 @@ pub async fn run_server_with_config(
                     // Fail closed: an unreadable backup repository must not
                     // collapse to `None` ("no protection"), or GC could reclaim
                     // versions a retained restore point still needs. Skip the
-                    // tick instead; the next tick retries.
-                    let protected = match gc_backup.protected_gc_watermark().await {
-                        Ok(watermark) => watermark,
+                    // tick instead; the next tick retries. One retention view
+                    // per tick keeps the pass to a single repository scan.
+                    let protected = match gc_backup.retention_view().await {
+                        Ok(view) => view.protected_gc_watermark(),
                         Err(error) => {
                             tracing::warn!(
                                 "backup repository unreadable; skipping GC tick: {error}"
@@ -1070,43 +1071,68 @@ pub async fn run_server_with_config(
                             }
                             if !logs.is_empty() {
                                 let max_id = logs.iter().map(|(id, _)| *id).max().unwrap();
+                                // Phase 1: archive every closed segment.
+                                let mut archived = Vec::new();
                                 for (id, path) in logs {
-                                    if id < max_id {
-                                        if let Ok(bytes) = std::fs::read(&path) {
-                                            let filename = format!("{}.log", id);
-                                            if let Ok((
-                                                record_txn_ids,
-                                                committed_txns,
-                                                predecessor,
-                                            )) = wal_archive_txn_index(&bytes, wal_key)
+                                    if id >= max_id {
+                                        continue;
+                                    }
+                                    if let Ok(bytes) = std::fs::read(&path) {
+                                        let filename = format!("{}.log", id);
+                                        if let Ok((
+                                            record_txn_ids,
+                                            committed_txns,
+                                            predecessor,
+                                        )) = wal_archive_txn_index(&bytes, wal_key)
+                                        {
+                                            if backup_clone
+                                                .archive_wal_indexed(
+                                                    &filename,
+                                                    bytes::Bytes::from(bytes),
+                                                    record_txn_ids,
+                                                    committed_txns,
+                                                    predecessor,
+                                                )
+                                                .await
+                                                .is_ok()
                                             {
-                                                let data = bytes::Bytes::from(bytes);
-                                                if backup_clone
-                                                    .archive_wal_indexed(
-                                                        &filename,
-                                                        data,
-                                                        record_txn_ids,
-                                                        committed_txns,
-                                                        predecessor,
-                                                    )
-                                                    .await
-                                                    .is_ok()
-                                                    && backup_clone
-                                                        .wal_segment_cleanup_allowed(&filename)
-                                                        .await
-                                                        .unwrap_or(false)
-                                                {
-                                                    if let Err(error) = local_kv_clone.reclaim_archived_wal_segment(id) {
-                                                        tracing::warn!(segment_id = id, %error, "archived WAL cleanup failed; retaining local segment");
-                                                    }
-                                                }
-                                            } else {
-                                                let _ = backup_clone
-                                                    .archive_wal(
-                                                        &filename,
-                                                        bytes::Bytes::from(bytes),
-                                                    )
-                                                    .await;
+                                                archived.push((id, filename));
+                                            }
+                                        } else {
+                                            let _ = backup_clone
+                                                .archive_wal(
+                                                    &filename,
+                                                    bytes::Bytes::from(bytes),
+                                                )
+                                                .await;
+                                        }
+                                    }
+                                }
+                                // Phase 2: one repository scan serves every
+                                // cleanup decision in the pass. Scanning per
+                                // segment would cost K full scans per tick — a
+                                // quadratic request storm against object
+                                // stores. A failed scan fails closed: cleanup
+                                // is denied this pass, archiving already ran.
+                                if !archived.is_empty() {
+                                    let retention = match backup_clone.retention_view().await {
+                                        Ok(view) => Some(view),
+                                        Err(error) => {
+                                            tracing::warn!(%error, "backup repository scan failed; WAL cleanup denied this pass");
+                                            None
+                                        }
+                                    };
+                                    for (id, filename) in archived {
+                                        let cleanup_allowed = match &retention {
+                                            Some(view) => view
+                                                .wal_segment_cleanup_allowed(&filename)
+                                                .await
+                                                .unwrap_or(false),
+                                            None => false,
+                                        };
+                                        if cleanup_allowed {
+                                            if let Err(error) = local_kv_clone.reclaim_archived_wal_segment(id) {
+                                                tracing::warn!(segment_id = id, %error, "archived WAL cleanup failed; retaining local segment");
                                             }
                                         }
                                     }

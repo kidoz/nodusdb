@@ -1404,6 +1404,20 @@ impl BackupOrchestrator {
         Ok(true)
     }
 
+    /// Computes a [`RetentionView`] with a single repository scan. Batch
+    /// callers (the server's WAL archiver and GC loops) should compute one
+    /// view per pass and make every per-segment/per-watermark decision
+    /// against it: scanning per segment costs K full repository scans per
+    /// pass, a quadratic request storm against object stores like S3.
+    pub async fn retention_view(&self) -> Result<RetentionView> {
+        let scan = self.scan_manifests().await?;
+        Ok(RetentionView {
+            repo: self.repo.clone(),
+            scan,
+            wal_indexes: tokio::sync::OnceCell::new(),
+        })
+    }
+
     /// Returns the oldest backup snapshot that still protects MVCC history for
     /// future incrementals. Runtime GC must not advance beyond this timestamp.
     ///
@@ -1412,76 +1426,32 @@ impl BackupOrchestrator {
     /// reclaims nothing). This stays `Ok(Some(0))` rather than an error; the
     /// server's GC loop additionally treats an `Err` from this call as "do
     /// not advance GC this tick" rather than "no protection".
+    ///
+    /// Convenience wrapper around [`RetentionView::protected_gc_watermark`]
+    /// that performs its own scan; batch callers should share one view.
     pub async fn protected_gc_watermark(&self) -> Result<Option<u64>> {
-        let scan = self.scan_manifests().await?;
-        if !scan.unreadable.is_empty() {
-            return Ok(Some(0));
-        }
-        Ok(scan
-            .completed
-            .into_iter()
-            .filter_map(|manifest| manifest.protected_timestamp.map(|_| manifest.snapshot_ts))
-            .min())
+        Ok(self.retention_view().await?.protected_gc_watermark())
     }
 
     /// Local WAL segment deletion is unsafe until WAL archive indexes can prove
     /// no retained restore point needs a segment. Archiving may continue, but
     /// cleanup should wait while any completed backup is retained or any
     /// manifest is unreadable (it may still anchor a restore point).
+    ///
+    /// Convenience wrapper around [`RetentionView::wal_cleanup_allowed`] that
+    /// performs its own scan; batch callers should share one view.
     pub async fn wal_cleanup_allowed(&self) -> Result<bool> {
-        let scan = self.scan_manifests().await?;
-        Ok(scan.completed.is_empty() && scan.unreadable.is_empty())
+        Ok(self.retention_view().await?.wal_cleanup_allowed())
     }
 
+    /// Convenience wrapper around
+    /// [`RetentionView::wal_segment_cleanup_allowed`] that performs its own
+    /// scan; batch callers should share one view.
     pub async fn wal_segment_cleanup_allowed(&self, filename: &str) -> Result<bool> {
-        let scan = self.scan_manifests().await?;
-        if !scan.unreadable.is_empty() {
-            return Ok(false);
-        }
-        let completed = scan.completed;
-        if completed.is_empty() {
-            return Ok(true);
-        }
-        let oldest_needed_ts = completed
-            .iter()
-            .filter_map(|manifest| {
-                manifest
-                    .protected_timestamp
-                    .as_ref()
-                    .map(|_| manifest.snapshot_ts)
-            })
-            .min()
-            .ok_or_else(|| anyhow::anyhow!("retained backups have no protected timestamps"))?;
-        let indexes = self.load_wal_archive_indexes().await?;
-        let Some(index) = indexes.iter().find(|index| {
-            index.segment_id == filename || index.wal_object_key == wal_key(filename)
-        }) else {
-            return Ok(false);
-        };
-
-        if index.upload_state != WalArchiveUploadState::Completed {
-            return Ok(false);
-        }
-        if index
-            .last_commit_ts
-            .is_some_and(|last_commit_ts| last_commit_ts >= oldest_needed_ts)
-        {
-            return Ok(false);
-        }
-
-        let mut commits_needed_after_segment = std::collections::HashSet::new();
-        for archived in &indexes {
-            for committed in &archived.committed_txns {
-                if committed.commit_ts >= oldest_needed_ts {
-                    commits_needed_after_segment.insert(committed.txn_id.as_str());
-                }
-            }
-        }
-
-        Ok(!index
-            .record_txn_ids
-            .iter()
-            .any(|txn_id| commits_needed_after_segment.contains(txn_id.as_str())))
+        self.retention_view()
+            .await?
+            .wal_segment_cleanup_allowed(filename)
+            .await
     }
 
     /// Archives a WAL segment.
@@ -1558,18 +1528,7 @@ impl BackupOrchestrator {
     }
 
     pub async fn load_wal_archive_indexes(&self) -> Result<Vec<WalArchiveIndex>> {
-        let objects = self.repo.list_objects("wal_archive/").await?;
-        let mut indexes = Vec::new();
-        for object in objects {
-            if !object.key.ends_with(".index.json") {
-                continue;
-            }
-            let bytes = self.repo.get_object(&object.key, None).await?;
-            let index = serde_json::from_slice::<WalArchiveIndex>(&bytes)?;
-            indexes.push(index);
-        }
-        indexes.sort_by(|left, right| left.segment_id.cmp(&right.segment_id));
-        Ok(indexes)
+        load_wal_archive_indexes_from(&self.repo).await
     }
 
     /// Retrieves all archived WAL segments, sorted chronologically by numeric file stem.
@@ -1595,6 +1554,123 @@ impl BackupOrchestrator {
                 .unwrap_or(0)
         });
         Ok(wals)
+    }
+}
+
+async fn load_wal_archive_indexes_from(
+    repo: &Arc<dyn BackupRepository>,
+) -> Result<Vec<WalArchiveIndex>> {
+    let objects = repo.list_objects("wal_archive/").await?;
+    let mut indexes = Vec::new();
+    for object in objects {
+        if !object.key.ends_with(".index.json") {
+            continue;
+        }
+        let bytes = repo.get_object(&object.key, None).await?;
+        let index = serde_json::from_slice::<WalArchiveIndex>(&bytes)?;
+        indexes.push(index);
+    }
+    indexes.sort_by(|left, right| left.segment_id.cmp(&right.segment_id));
+    Ok(indexes)
+}
+
+/// A point-in-time snapshot of the repository state the retention paths
+/// decide against: one manifest scan, plus the WAL archive indexes loaded
+/// lazily once on the first per-segment query. Computing one view per cleanup
+/// or GC pass replaces scanning the repository per segment — K segments would
+/// otherwise cost K full scans (list + fetch every manifest + an existence
+/// check per referenced object) per pass, a quadratic request storm against
+/// object stores like S3.
+///
+/// The view is a snapshot: backups created mid-pass take effect on the next
+/// pass. Fail-closed semantics are identical to the per-call wrappers on
+/// [`BackupOrchestrator`]: any unreadable manifest denies segment cleanup and
+/// pins the GC watermark at 0.
+pub struct RetentionView {
+    repo: Arc<dyn BackupRepository>,
+    scan: ManifestScan,
+    wal_indexes: tokio::sync::OnceCell<Vec<WalArchiveIndex>>,
+}
+
+impl RetentionView {
+    /// Oldest backup snapshot that still protects MVCC history for future
+    /// incrementals; `Some(0)` (GC reclaims nothing) while any manifest is
+    /// unreadable. See [`BackupOrchestrator::protected_gc_watermark`].
+    pub fn protected_gc_watermark(&self) -> Option<u64> {
+        if !self.scan.unreadable.is_empty() {
+            return Some(0);
+        }
+        self.scan
+            .completed
+            .iter()
+            .filter_map(|manifest| manifest.protected_timestamp.as_ref().map(|_| manifest.snapshot_ts))
+            .min()
+    }
+
+    /// Whether local WAL segment deletion is unconditionally safe. See
+    /// [`BackupOrchestrator::wal_cleanup_allowed`].
+    pub fn wal_cleanup_allowed(&self) -> bool {
+        self.scan.completed.is_empty() && self.scan.unreadable.is_empty()
+    }
+
+    /// Per-segment cleanup decision against the snapshot: denied while any
+    /// manifest is unreadable, unconditionally allowed while no backup is
+    /// retained, otherwise gated on the WAL archive indexes proving no
+    /// retained restore point still needs the segment.
+    pub async fn wal_segment_cleanup_allowed(&self, filename: &str) -> Result<bool> {
+        if !self.scan.unreadable.is_empty() {
+            return Ok(false);
+        }
+        let completed = &self.scan.completed;
+        if completed.is_empty() {
+            return Ok(true);
+        }
+        let oldest_needed_ts = completed
+            .iter()
+            .filter_map(|manifest| {
+                manifest
+                    .protected_timestamp
+                    .as_ref()
+                    .map(|_| manifest.snapshot_ts)
+            })
+            .min()
+            .ok_or_else(|| anyhow::anyhow!("retained backups have no protected timestamps"))?;
+        let indexes = self
+            .wal_indexes
+            .get_or_try_init(|| {
+                let repo = self.repo.clone();
+                async move { load_wal_archive_indexes_from(&repo).await }
+            })
+            .await?;
+        let Some(index) = indexes.iter().find(|index| {
+            index.segment_id == filename || index.wal_object_key == wal_key(filename)
+        }) else {
+            return Ok(false);
+        };
+
+        if index.upload_state != WalArchiveUploadState::Completed {
+            return Ok(false);
+        }
+        if index
+            .last_commit_ts
+            .is_some_and(|last_commit_ts| last_commit_ts >= oldest_needed_ts)
+        {
+            return Ok(false);
+        }
+
+        let mut commits_needed_after_segment = std::collections::HashSet::new();
+        for archived in indexes {
+            for committed in &archived.committed_txns {
+                if committed.commit_ts >= oldest_needed_ts {
+                    commits_needed_after_segment.insert(committed.txn_id.as_str());
+                }
+            }
+        }
+
+        Ok(!index
+            .record_txn_ids
+            .iter()
+            .any(|txn_id| commits_needed_after_segment.contains(txn_id.as_str())))
     }
 }
 
@@ -2246,6 +2322,113 @@ mod tests {
         assert!(orch.wal_segment_cleanup_allowed("2.log").await.unwrap());
         assert!(orch.wal_segment_cleanup_allowed("3.log").await.unwrap());
         assert!(orch.wal_segment_cleanup_allowed("4.log").await.unwrap());
+    }
+
+    /// A `MemBackupRepository` wrapper that counts `list_objects` calls, to
+    /// prove a cleanup pass costs a bounded number of repository scans no
+    /// matter how many segments it decides on.
+    struct CountingRepository {
+        inner: MemBackupRepository,
+        list_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingRepository {
+        fn new() -> Self {
+            Self {
+                inner: MemBackupRepository::new(),
+                list_calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn list_calls(&self) -> usize {
+            self.list_calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn reset_list_calls(&self) {
+            self.list_calls
+                .store(0, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait]
+    impl BackupRepository for CountingRepository {
+        async fn put_object(
+            &self,
+            key: &str,
+            body: Bytes,
+            options: PutOptions,
+        ) -> Result<ObjectMetadata> {
+            self.inner.put_object(key, body, options).await
+        }
+
+        async fn get_object(&self, key: &str, range: Option<ByteRange>) -> Result<Bytes> {
+            self.inner.get_object(key, range).await
+        }
+
+        async fn list_objects(&self, prefix: &str) -> Result<Vec<ObjectMetadata>> {
+            self.list_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.list_objects(prefix).await
+        }
+
+        async fn delete_object(&self, key: &str) -> Result<()> {
+            self.inner.delete_object(key).await
+        }
+
+        async fn object_exists(&self, key: &str) -> Result<bool> {
+            self.inner.object_exists(key).await
+        }
+    }
+
+    #[tokio::test]
+    async fn retention_view_scans_once_per_cleanup_pass() {
+        let repo = Arc::new(CountingRepository::new());
+        let orch = BackupOrchestrator::new(repo.clone());
+
+        // A retained backup snapshot at ts=10, and five archived segments
+        // whose commits all predate it, so every segment is reclaimable.
+        orch.create_full_backup(
+            "cluster-1",
+            10,
+            1,
+            1,
+            vec![BackupObject {
+                name: "kv_data.json".into(),
+                bytes: Bytes::from("full"),
+            }],
+        )
+        .await
+        .unwrap();
+        for id in 1..=5u64 {
+            orch.archive_wal_indexed(
+                &format!("{id}.log"),
+                Bytes::from("old"),
+                vec![format!("txn-{id}")],
+                vec![WalCommittedTxn {
+                    txn_id: format!("txn-{id}"),
+                    commit_ts: 5,
+                }],
+                Some(id - 1),
+            )
+            .await
+            .unwrap();
+        }
+
+        repo.reset_list_calls();
+        let view = orch.retention_view().await.unwrap();
+        for id in 1..=5u64 {
+            assert!(
+                view.wal_segment_cleanup_allowed(&format!("{id}.log"))
+                    .await
+                    .unwrap()
+            );
+        }
+        assert_eq!(view.protected_gc_watermark(), Some(10));
+        assert!(!view.wal_cleanup_allowed());
+        // One list for the manifest scan plus one (lazy, cached) list of the
+        // WAL archive indexes — independent of the segment count, where the
+        // per-call wrapper would cost one full scan per segment.
+        assert_eq!(repo.list_calls(), 2);
     }
 
     /// Builds a repository holding one healthy completed backup whose WAL
