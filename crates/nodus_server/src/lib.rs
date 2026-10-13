@@ -1040,6 +1040,7 @@ pub async fn run_server_with_config(
         restore_lock: Arc::new(tokio::sync::Mutex::new(())),
         restoring: executor.restoring_flag(),
         restore_gate: executor.restore_gate(),
+        restore_in_flight: Arc::new(parking_lot::Mutex::new(None)),
     };
 
     // Raft RPCs run on a dedicated, mTLS-capable listener when

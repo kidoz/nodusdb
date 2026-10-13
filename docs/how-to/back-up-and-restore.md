@@ -82,7 +82,11 @@ Two behaviours are worth knowing before you run this:
   because restore writes bypass Raft. Restore into a fresh single node, then
   re-form the cluster around it. The only exception: retrying a restore that
   failed mid-mutation — the engine stays fenced and the idempotent retry
-  completes it.
+  completes it. The retry must name the same restore (the same backup id, or
+  the same base backup and `target_ts` for PITR); a mismatched retry is
+  refused with HTTP `409` (`restore_mismatched_retry`) so a different backup
+  can never overlay a partially restored engine. To abandon a fenced restore,
+  restart the node with an empty data directory.
 
 Node-local and consensus-local records (Raft votes/logs, recovery generation,
 upgrade authority, migration control keys) are neither exported nor replayed;

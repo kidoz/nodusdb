@@ -73,6 +73,12 @@ pub struct AdminState {
     /// Drain/exclusion gate shared with the executor: a restore takes the write
     /// guard to drain in-flight statements and run with exclusive access.
     pub restore_gate: Arc<parking_lot::RwLock<()>>,
+    /// Identity of the restore that is mutating the engine ("backup:{id}" or
+    /// "pitr:{base}:{target_ts}"). Set while fenced; cleared on success. A
+    /// retry after a mid-mutation failure must name the same restore —
+    /// overlaying a different backup onto the partial state would silently
+    /// merge the two.
+    pub restore_in_flight: Arc<parking_lot::Mutex<Option<String>>>,
 }
 
 /// The authenticated principal for a request, made available to handlers via a
@@ -1243,10 +1249,35 @@ fn apply_restore(
     apply_restore_mutations(objects, catalog_snapshot, pitr, kv, catalog_writer, wal_key)
 }
 
+/// Records the identity of a restore that is about to mutate the engine, or —
+/// when a previous restore failed mid-mutation and left the engine fenced —
+/// verifies the retry is the same restore. Overlaying a different backup onto
+/// a partially restored engine would silently merge the two states.
+fn record_or_check_restore(
+    in_flight: &parking_lot::Mutex<Option<String>>,
+    identity: &str,
+    resume_after_failure: bool,
+) -> Result<(), String> {
+    let mut guard = in_flight.lock();
+    if !resume_after_failure {
+        *guard = Some(identity.to_string());
+        return Ok(());
+    }
+    match guard.as_deref() {
+        Some(previous) if previous == identity => Ok(()),
+        Some(previous) => Err(format!(
+            "a previous restore ({previous}) failed mid-mutation and the engine stays fenced; retry that restore to completion (or restart with an empty data directory) before restoring {identity}"
+        )),
+        None => Err(format!(
+            "the engine is fenced by a previous restore whose identity is unknown; restart with an empty data directory before restoring {identity}"
+        )),
+    }
+}
+
 /// Why a restore was refused before mutating anything. Mapped to `409
-/// Conflict` (with an actionable message) rather than the generic in-body
-/// error, so operators and automation can distinguish a rejected restore from
-/// a failed one.
+/// Conflict` (with a `code` field) so operators and automation can distinguish
+/// a rejected restore from a failed one. Note the mismatched-retry case is
+/// rejected while the engine remains fenced by the earlier failed restore.
 enum RestoreFailure {
     /// Pre-mutation guard rejection; the engine is untouched and unfenced.
     Rejected(&'static str, String),
@@ -1350,6 +1381,13 @@ async fn restore_backup(
         })
     });
 
+    // Identity of this restore, recorded while the engine is fenced so that a
+    // retry after a mid-mutation failure can only resume the same restore.
+    let restore_identity = match &pitr {
+        Some((plan, _)) => format!("pitr:{}:{}", plan.base_backup_id, plan.target_ts),
+        None => format!("backup:{id}"),
+    };
+
     // Catalog/KV writes route through the synchronous traits, which submit
     // to the async RaftRouter via `blocking_recv`; run them on the blocking
     // pool so we never park (or panic on) a reactor worker thread.
@@ -1358,6 +1396,7 @@ async fn restore_backup(
     let wal_key = state.wal_key;
     let restoring = state.restoring.clone();
     let restore_gate = state.restore_gate.clone();
+    let restore_in_flight = state.restore_in_flight.clone();
     let replay = tokio::task::spawn_blocking(move || {
         // Validate first — a bad backup changes nothing and must not fence.
         let catalog_snapshot =
@@ -1366,13 +1405,21 @@ async fn restore_backup(
         // Begin fencing: reject new statements, then take the exclusive gate,
         // which blocks until every in-flight statement has drained. From here no
         // query can observe the engine until we finish.
-        //
         // `resume_after_failure`: a previous restore that failed mid-mutation
         // left the engine fenced; that attempt's retry must skip the emptiness
         // guard — the partial state it overlays is its own, and completing the
-        // idempotent restore is the recovery path.
+        // idempotent restore is the recovery path. The retry must name the
+        // same restore: a different backup would silently merge with the
+        // partial state.
         let resume_after_failure = restoring.swap(true, std::sync::atomic::Ordering::Release);
         let _exclusive = restore_gate.write();
+
+        if let Err(message) =
+            record_or_check_restore(&restore_in_flight, &restore_identity, resume_after_failure)
+        {
+            // Stay fenced: the earlier partial restore still owns the engine.
+            return Err(RestoreFailure::Rejected("restore_mismatched_retry", message));
+        }
 
         // Backup contract #10: in-place restore over live data is out of scope.
         // The replay only writes keys present in the backup, so restoring into
@@ -1382,6 +1429,7 @@ async fn restore_backup(
         if !resume_after_failure {
             match restore_destination_data_key(kv.as_ref()) {
                 Ok(Some(key)) => {
+                    *restore_in_flight.lock() = None;
                     restoring.store(false, std::sync::atomic::Ordering::Release);
                     return Err(RestoreFailure::Rejected(
                         "restore_destination_not_empty",
@@ -1393,6 +1441,7 @@ async fn restore_backup(
                 }
                 Ok(None) => {}
                 Err(error) => {
+                    *restore_in_flight.lock() = None;
                     restoring.store(false, std::sync::atomic::Ordering::Release);
                     return Err(RestoreFailure::Failed(error));
                 }
@@ -1411,6 +1460,7 @@ async fn restore_backup(
         // (fail-closed) so a partially restored state is never served; the
         // idempotent restore can be retried to completion.
         if result.is_ok() {
+            *restore_in_flight.lock() = None;
             restoring.store(false, std::sync::atomic::Ordering::Release);
         }
         result.map_err(RestoreFailure::Failed)
@@ -1431,6 +1481,7 @@ async fn restore_backup(
                 "restored": 0,
                 "code": code,
                 "error": message,
+                "queries_fenced": state.restoring.load(std::sync::atomic::Ordering::Acquire),
             })),
         )
             .into_response(),
@@ -1930,5 +1981,31 @@ mod restore_tests {
 
         assert!(apply_restore(&objects, None, kv.as_ref(), cat.as_ref(), None).is_err());
         assert!(kv.get(b"k", u64::MAX).unwrap().is_none());
+    }
+
+    #[test]
+    fn restore_retry_must_match_the_fenced_restore() {
+        let in_flight = parking_lot::Mutex::new(None);
+
+        // A fresh restore records its identity.
+        record_or_check_restore(&in_flight, "backup:a", false).unwrap();
+        assert_eq!(in_flight.lock().as_deref(), Some("backup:a"));
+
+        // A fenced retry of the same restore resumes; a PITR variant of the
+        // same base is a different restore and must not overlay the partial
+        // state.
+        record_or_check_restore(&in_flight, "backup:a", true).unwrap();
+        let err = record_or_check_restore(&in_flight, "pitr:a:123", true).unwrap_err();
+        assert!(err.contains("backup:a"), "{err}");
+        assert_eq!(
+            in_flight.lock().as_deref(),
+            Some("backup:a"),
+            "a rejected retry must not displace the fenced restore's identity"
+        );
+
+        // A fenced engine whose restore identity is unknown (e.g. state lost)
+        // rejects any resume attempt.
+        let unknown = parking_lot::Mutex::new(None);
+        assert!(record_or_check_restore(&unknown, "backup:b", true).is_err());
     }
 }
