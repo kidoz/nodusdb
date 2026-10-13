@@ -744,6 +744,97 @@ impl MemExecutor {
                         ));
                     }
                 }
+                // With index scans asked for, an `ORDER BY` on an index's
+                // leading column reads the index in its own order, as
+                // PostgreSQL plans it — no `WHERE` needed.
+                if rows.is_none()
+                    && sample.is_none()
+                    && joins.is_empty()
+                    && descendants.is_empty()
+                    && crate::session_env::setting("enable_seqscan").as_deref() == Some("off")
+                    && let Some(key) = sort.first()
+                    && key.ascending
+                    && let Some(name) = match &key.target {
+                        SortTarget::Name(name) => Some(name.clone()),
+                        SortTarget::Output(i) => match projection.get(*i) {
+                            Some(ProjectionItem::Column(c))
+                            | Some(ProjectionItem::AliasedColumn(c, _)) => Some(c.clone()),
+                            _ => None,
+                        },
+                        _ => None,
+                    }
+                    && let Some(col) = tbl.columns.iter().find(|c| {
+                        c.name
+                            .eq_ignore_ascii_case(name.rsplit('.').next().unwrap_or(&name))
+                    })
+                    && let Some(idx) = tbl.indexes.iter().find(|idx| {
+                        let Some(key) = idx.key_columns.first() else {
+                            return false;
+                        };
+                        !crate::index_keys::is_expression_key(key)
+                            && key.column_id == col.id
+                            && Self::index_entry_encoding(&tbl, idx).1
+                    })
+                {
+                    // The rows come from the index alone when it covers
+                    // every column the statement reads.
+                    let only = index_only
+                        .as_ref()
+                        .is_some_and(|needed| crate::index_keys::needed_covered(&tbl, idx, needed))
+                        .then(|| {
+                            self.index_only_range_scan(
+                                idx.id,
+                                None,
+                                None,
+                                &tbl,
+                                idx,
+                                &ctx.session_id,
+                            )
+                            .ok()
+                        })
+                        .flatten();
+                    let indexed = only.or_else(|| {
+                        self.index_range_scan(
+                            idx.id,
+                            None,
+                            None,
+                            tbl.id,
+                            &col.data_type,
+                            &ctx.session_id,
+                        )
+                        .ok()
+                    });
+                    if let Some(indexed) = indexed {
+                        rows =
+                            Some(self.merge_overlay_by(indexed, tbl.id, &ctx.session_id, |_| true));
+                    }
+                }
+                // With index scans asked for, a covering index serves the
+                // whole scan when nothing orders or filters it, as
+                // PostgreSQL plans a bare count.
+                if rows.is_none()
+                    && sample.is_none()
+                    && joins.is_empty()
+                    && descendants.is_empty()
+                    && crate::session_env::setting("enable_seqscan").as_deref() == Some("off")
+                    && let Some(idx) = tbl.indexes.iter().find(|idx| {
+                        let Some(key) = idx.key_columns.first() else {
+                            return false;
+                        };
+                        !crate::index_keys::is_expression_key(key)
+                            && Self::index_entry_encoding(&tbl, idx).1
+                            && index_only.as_ref().is_some_and(|needed| {
+                                crate::index_keys::needed_covered(&tbl, idx, needed)
+                            })
+                    })
+                {
+                    if let Ok(indexed) =
+                        self.index_only_range_scan(idx.id, None, None, &tbl, idx, &ctx.session_id)
+                    {
+                        rows =
+                            Some(self.merge_overlay_by(indexed, tbl.id, &ctx.session_id, |_| true));
+                    }
+                }
                 let rows = match rows {
                     Some(r) => r,
                     None => {

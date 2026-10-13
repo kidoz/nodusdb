@@ -771,6 +771,12 @@ pub(crate) fn index_only_needed(
             ProjectionItem::Column(name) | ProjectionItem::AliasedColumn(name, _) => {
                 needed.push(name.rsplit('.').next().unwrap_or(name).to_string())
             }
+            // An aggregate over no column (`count(*)`) reads nothing; one
+            // over a bare column reads it.
+            ProjectionItem::Aggregate(_, arg) if arg == "*" => {}
+            ProjectionItem::Aggregate(_, arg) => {
+                needed.push(arg.rsplit('.').next().unwrap_or(arg).to_string())
+            }
             _ => return None,
         }
     }

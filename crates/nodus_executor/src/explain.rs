@@ -688,11 +688,33 @@ impl MemExecutor {
                     }
                     child
                 };
+                // An `ORDER BY` on an index's leading column reads the
+                // index in its own order, as PostgreSQL plans it — no
+                // `WHERE` needed.
+                let ordering: Option<String> = if single
+                    && sample.is_none()
+                    && crate::session_env::setting("enable_seqscan").as_deref() == Some("off")
+                    && let Some(key) = sort.first()
+                    && key.ascending
+                {
+                    match &key.target {
+                        SortTarget::Name(name) => Some(name.clone()),
+                        SortTarget::Output(i) => match projection.get(*i) {
+                            Some(ProjectionItem::Column(c))
+                            | Some(ProjectionItem::AliasedColumn(c, _)) => Some(c.clone()),
+                            _ => None,
+                        },
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
                 let mut node = self.explain_relation_reading(
                     ctx,
                     table_name,
                     table_alias.as_deref(),
                     scan_filter,
+                    ordering.as_deref(),
                     &scope,
                     sample.as_ref(),
                     *only,
@@ -1909,6 +1931,7 @@ impl MemExecutor {
             table_name,
             table_alias,
             filter,
+            None,
             ctes,
             sample,
             only,
@@ -1927,6 +1950,7 @@ impl MemExecutor {
         table_name: &str,
         table_alias: Option<&str>,
         filter: Option<&FilterExpr>,
+        ordering: Option<&str>,
         ctes: &[(String, &LogicalPlan)],
         sample: Option<&crate::SampleSpec>,
         only: bool,
@@ -2085,6 +2109,55 @@ impl MemExecutor {
                 .map(|column| (column, *idx)),
             None => scan_index,
         };
+        // An `ORDER BY` on an index's leading column reads the index in
+        // its own order, with no condition of its own.
+        let ordering_index = ordering.and_then(|ordering| {
+            if crate::session_env::setting("enable_seqscan").as_deref() != Some("off") {
+                return None;
+            }
+            let bare = ordering.rsplit('.').next().unwrap_or(ordering);
+            tbl.indexes.iter().find_map(|idx| {
+                let key = idx.key_columns.first()?;
+                if crate::index_keys::is_expression_key(key) {
+                    return None;
+                }
+                let column = tbl.columns.iter().find(|c| c.id == key.column_id)?;
+                (column.name.eq_ignore_ascii_case(bare) && Self::index_entry_encoding(&tbl, idx).1)
+                    .then_some((column, idx))
+            })
+        });
+        let scan_index = scan_index.or(ordering_index);
+        // With index scans asked for, a covering index serves the whole
+        // scan when nothing orders or filters it.
+        let covering_index = if allow_index_only
+            && crate::session_env::setting("enable_seqscan").as_deref() == Some("off")
+        {
+            index_only.and_then(|needed| {
+                tbl.indexes
+                    .iter()
+                    .find(|idx| {
+                        let Some(key) = idx.key_columns.first() else {
+                            return false;
+                        };
+                        !crate::index_keys::is_expression_key(key)
+                            && Self::index_entry_encoding(&tbl, idx).1
+                            && crate::index_keys::needed_covered(&tbl, idx, needed)
+                    })
+                    .and_then(|idx| {
+                        tbl.columns
+                            .iter()
+                            .find(|c| {
+                                idx.key_columns
+                                    .first()
+                                    .is_some_and(|key| key.column_id == c.id)
+                            })
+                            .map(|column| (column, idx))
+                    })
+            })
+        } else {
+            None
+        };
+        let scan_index = scan_index.or(covering_index);
         if sample.is_none()
             && let Some((col, idx)) = scan_index
             && let Some(idx) =
@@ -2150,7 +2223,7 @@ impl MemExecutor {
             // A range across much of the table reads through a bitmap, as
             // PostgreSQL plans it: the matching entry keys first, then the
             // heap in its own order, rechecking the condition.
-            let bitmap = if only {
+            let bitmap = if only || ordering.is_some() {
                 false
             } else {
                 let entries = match &composite {
@@ -2265,8 +2338,11 @@ impl MemExecutor {
             .prop("Scan Direction", json!("Forward"))
             .prop("Index Name", json!(idx.name))
             .prop("Relation Name", json!(table_only))
-            .prop("Alias", json!(table_alias.unwrap_or(table_only)))
-            .detail("Index Cond", index_cond_text);
+            .prop("Alias", json!(table_alias.unwrap_or(table_only)));
+            // An ordering scan has no condition of its own.
+            if !index_cond_text.is_empty() {
+                node = node.detail("Index Cond", index_cond_text);
+            }
             if let Some(residual) = residual_filter {
                 node = node.detail("Filter", residual);
             }
@@ -2287,9 +2363,17 @@ impl MemExecutor {
                 .prop("Alias", json!(table_alias.unwrap_or(table_only)))
                 .detail("Sampling", detail)
             }
-            None => Node::new("Seq Scan", format!("Seq Scan on {label}"), rows, width)
-                .prop("Relation Name", json!(table_only))
-                .prop("Alias", json!(table_alias.unwrap_or(table_only))),
+            None => {
+                let scan = Node::new("Seq Scan", format!("Seq Scan on {label}"), rows, width)
+                    .prop("Relation Name", json!(table_only))
+                    .prop("Alias", json!(table_alias.unwrap_or(table_only)));
+                // A scan chosen while sequential scans are disabled says so.
+                if crate::session_env::setting("enable_seqscan").as_deref() == Some("off") {
+                    scan.detail("Disabled", "true".to_string())
+                } else {
+                    scan
+                }
+            }
         };
         node.total = pages * PAGE + rows * CPU_TUPLE;
         Ok(with_filter(node))
