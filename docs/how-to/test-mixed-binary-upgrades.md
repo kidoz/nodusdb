@@ -178,6 +178,12 @@ R6b do not turn an arbitrary old executable downgrade into a safe operation.
 The tests do not certify older revisions, member removal/address replacement,
 original learner promotion, cancellation, power loss, live-reader continuity,
 S3 recovery, or a crash between the two joint-consensus commits. Migration remains
-disabled. See [upgrade authority](../explanation/upgrade-authority.md) for the
+disabled. The fixture's peers authenticate over the dedicated mTLS listener;
+it does not exercise the shared-listener bearer-token path, where old binaries
+send no token and upgraded nodes refuse their Raft RPCs — see the
+rolling-upgrade caveat in
+[authentication rules](../reference/admin-api-authorization.md#internal-raft-routes-raft)
+before upgrading a token-configured cluster that has no dedicated listener.
+See [upgrade authority](../explanation/upgrade-authority.md) for the
 protocol and [durability contract](../reference/durability-contract.md) for the
 storage guarantees.

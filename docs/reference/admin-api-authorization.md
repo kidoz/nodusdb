@@ -39,6 +39,17 @@ and transaction commands:
   present certificates but no token) keep working. A dedicated listener
   *without* `cluster.tls` falls back to the bearer-token requirement above.
 
+> **Rolling-upgrade caveat.** Binaries from before Raft-route authentication
+> never send a bearer token. On the **shared** listener (no
+> `cluster.raft_listen_addr`), an upgraded node therefore refuses old peers'
+> votes/appends with `401` while versions are mixed — quorum can stall
+> mid-upgrade. Before rolling a token-configured cluster onto a release with
+> Raft-route auth, move internode traffic to the dedicated mTLS listener
+> (`cluster.raft_listen_addr` + `cluster.tls`), whose certificate credential
+> needs no token. If you cannot, plan for a Raft availability gap and upgrade
+> fast enough that a quorum of upgraded nodes forms quickly (new → old traffic
+> still works, since old servers ignore the header).
+
 The configured bootstrap password (`admin.password`) is an operator credential
 for `nodus`, shared by SQL SCRAM authentication and HTTP Basic authentication.
 New logins resolve the current catalog identity only if it is an active global
