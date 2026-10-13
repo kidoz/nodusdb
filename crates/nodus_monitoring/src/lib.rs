@@ -44,6 +44,10 @@ pub struct Metrics {
     /// Data-shard Raft groups hosted on this node, and how many lack a leader.
     pub shard_groups: Gauge,
     pub shard_groups_unavailable: Gauge,
+    /// Pending intents aborted by the abandoned-intent janitor.
+    pub janitor_aborts_total: Counter,
+    /// Pending intents observed by the janitor's most recent sweep.
+    pub pending_intents: Gauge,
 }
 
 impl Default for Metrics {
@@ -63,6 +67,8 @@ impl Default for Metrics {
             linearizable_reads_total: Counter::default(),
             shard_groups: Gauge::default(),
             shard_groups_unavailable: Gauge::default(),
+            janitor_aborts_total: Counter::default(),
+            pending_intents: Gauge::default(),
         }
     }
 }
@@ -134,6 +140,16 @@ impl Metrics {
             "nodus_shard_groups_unavailable",
             "Hosted data-shard groups currently without a leader",
             m.shard_groups_unavailable.clone(),
+        );
+        registry.register(
+            "nodus_janitor_aborts_total",
+            "Pending intents aborted by the abandoned-intent janitor",
+            m.janitor_aborts_total.clone(),
+        );
+        registry.register(
+            "nodus_pending_intents",
+            "Pending intents observed by the janitor's most recent sweep",
+            m.pending_intents.clone(),
         );
         m
     }
@@ -350,8 +366,11 @@ mod tests {
         let mut registry = Registry::default();
         let metrics = Metrics::register(&mut registry);
         metrics.queries_total.inc();
+        metrics.janitor_aborts_total.inc_by(2);
         let mut buf = String::new();
         prometheus_client::encoding::text::encode(&mut buf, &registry).unwrap();
+        // prometheus-client appends its own `_total` to counter samples.
         assert!(buf.contains("nodus_queries_total"));
+        assert!(buf.contains("nodus_janitor_aborts_total_total 2"));
     }
 }

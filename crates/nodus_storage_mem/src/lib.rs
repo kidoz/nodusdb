@@ -2,7 +2,8 @@ use anyhow::Result;
 use bytes::Bytes;
 use nodus_mvcc::{GcMode, VersionChain};
 use nodus_storage_api::{
-    IntentReplacement, KeyRange, KvEngine, KvPair, KvResult, KvVersion, Timestamp, TxnId,
+    IntentReplacement, KeyRange, KvEngine, KvPair, KvResult, KvVersion, PendingIntents, Timestamp,
+    TxnId,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::sync::RwLock;
@@ -11,7 +12,9 @@ pub struct MemKvEngine {
     snapshot_gate: RwLock<()>,
     // simplified: key -> version chain
     store: RwLock<BTreeMap<Bytes, VersionChain>>,
-    intents: RwLock<HashMap<TxnId, Vec<Bytes>>>,
+    /// Transaction id → its outstanding intent keys, each stamped with its
+    /// write time (HLC-scale wall-clock µs) so intent age survives restart.
+    intents: RwLock<HashMap<TxnId, Vec<(Bytes, Timestamp)>>>,
 }
 
 impl MemKvEngine {
@@ -97,16 +100,46 @@ impl KvEngine for MemKvEngine {
             },
         );
         intents.clear();
+        // Snapshot rows carry no intent timestamps, so restored intents are
+        // stamped now: they read as young, deferring janitor action (the safe
+        // direction) until they genuinely age out here.
+        let installed_at = nodus_storage_api::wallclock_micros();
         for (key, chain) in store.iter() {
             for v in &chain.versions {
                 if v.is_intent
                     && let Some(txn) = v.txn_id
                 {
-                    intents.entry(txn).or_default().push(key.clone());
+                    intents
+                        .entry(txn)
+                        .or_default()
+                        .push((key.clone(), installed_at));
                 }
             }
         }
         Ok(())
+    }
+
+    fn pending_intents(&self, prefix: &[u8]) -> Result<Vec<PendingIntents>> {
+        let _snapshot = self.snapshot_gate.read().unwrap();
+        let intents = self.intents.read().unwrap();
+        Ok(intents
+            .iter()
+            .filter_map(|(txn_id, keys)| {
+                let matched: Vec<&(Bytes, Timestamp)> = keys
+                    .iter()
+                    .filter(|(k, _)| k.starts_with(prefix))
+                    .collect();
+                if matched.is_empty() {
+                    return None;
+                }
+                let oldest_ts = matched.iter().map(|(_, ts)| *ts).min().unwrap_or(0);
+                Some(PendingIntents {
+                    txn_id: *txn_id,
+                    keys: matched.iter().map(|(k, _)| k.clone()).collect(),
+                    oldest_ts,
+                })
+            })
+            .collect())
     }
 
     fn has_pending_intents(&self, prefix: &[u8]) -> Result<bool> {
@@ -117,7 +150,7 @@ impl KvEngine for MemKvEngine {
             .unwrap()
             .values()
             .flatten()
-            .any(|key| key.starts_with(prefix)))
+            .any(|(key, _)| key.starts_with(prefix)))
     }
 
     fn get(&self, key: &[u8], read_ts: Timestamp) -> Result<Option<Bytes>> {
@@ -208,7 +241,10 @@ impl KvEngine for MemKvEngine {
         let chain = store_guard.entry(key.clone()).or_default();
         chain.write_intent(txn_id, value.to_vec())?;
 
-        intents_guard.entry(txn_id).or_default().push(key);
+        intents_guard
+            .entry(txn_id)
+            .or_default()
+            .push((key, nodus_storage_api::wallclock_micros()));
         Ok(())
     }
 
@@ -220,7 +256,10 @@ impl KvEngine for MemKvEngine {
         let chain = store_guard.entry(key.clone()).or_default();
         chain.delete_intent(txn_id)?;
 
-        intents_guard.entry(txn_id).or_default().push(key);
+        intents_guard
+            .entry(txn_id)
+            .or_default()
+            .push((key, nodus_storage_api::wallclock_micros()));
         Ok(())
     }
 
@@ -240,15 +279,21 @@ impl KvEngine for MemKvEngine {
         match replacement {
             IntentReplacement::Put(value) => {
                 chain.write_intent(txn_id, value.to_vec())?;
-                intents_guard.entry(txn_id).or_default().push(key);
+                intents_guard
+                    .entry(txn_id)
+                    .or_default()
+                    .push((key, nodus_storage_api::wallclock_micros()));
             }
             IntentReplacement::Delete => {
                 chain.delete_intent(txn_id)?;
-                intents_guard.entry(txn_id).or_default().push(key);
+                intents_guard
+                    .entry(txn_id)
+                    .or_default()
+                    .push((key, nodus_storage_api::wallclock_micros()));
             }
             IntentReplacement::Clear => {
                 if let Some(keys) = intents_guard.get_mut(&txn_id) {
-                    keys.retain(|k| k != &key);
+                    keys.retain(|(k, _)| k != &key);
                     if keys.is_empty() {
                         intents_guard.remove(&txn_id);
                     }
@@ -264,7 +309,7 @@ impl KvEngine for MemKvEngine {
             .read()
             .unwrap()
             .get(&txn_id)
-            .cloned()
+            .map(|keys| keys.iter().map(|(k, _)| k.clone()).collect())
             .unwrap_or_default()
     }
 
@@ -274,7 +319,7 @@ impl KvEngine for MemKvEngine {
         let mut intents_guard = self.intents.write().unwrap();
 
         if let Some(keys) = intents_guard.remove(&txn_id) {
-            for key in keys {
+            for (key, _) in keys {
                 if let Some(chain) = store_guard.get_mut(&key) {
                     let _ = chain.commit(txn_id, commit_ts);
                 }
@@ -289,7 +334,7 @@ impl KvEngine for MemKvEngine {
         let mut intents_guard = self.intents.write().unwrap();
 
         if let Some(keys) = intents_guard.remove(&txn_id) {
-            for key in keys {
+            for (key, _) in keys {
                 if let Some(chain) = store_guard.get_mut(&key) {
                     let _ = chain.abort(txn_id);
                 }
@@ -324,6 +369,7 @@ impl KvEngine for MemKvEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nodus_storage_api::KvError;
 
     #[test]
     fn test_mvcc_visibility() {
@@ -404,6 +450,69 @@ mod tests {
         assert_eq!(engine.get(k.as_ref(), 20).unwrap(), None);
         assert_eq!(engine.get(k.as_ref(), u64::MAX).unwrap(), None);
         assert_eq!(engine.get(k.as_ref(), 15).unwrap(), Some(Bytes::from("v1")));
+    }
+
+    #[test]
+    fn pending_intents_lists_keys_with_write_age() {
+        let engine = MemKvEngine::new();
+        let before = nodus_storage_api::wallclock_micros();
+        let txn = TxnId::new();
+        engine
+            .write_intent(txn, Bytes::from("a"), Bytes::from("1"))
+            .unwrap();
+        engine
+            .write_intent(txn, Bytes::from("b"), Bytes::from("2"))
+            .unwrap();
+        let other = TxnId::new();
+        engine
+            .write_intent(other, Bytes::from("z"), Bytes::from("9"))
+            .unwrap();
+
+        let all = engine.pending_intents(b"").unwrap();
+        assert_eq!(all.len(), 2);
+        let listed = all.iter().find(|p| p.txn_id == txn).unwrap();
+        assert_eq!(listed.keys.len(), 2);
+        assert!(listed.oldest_ts >= before);
+        assert!(listed.oldest_ts <= nodus_storage_api::wallclock_micros());
+
+        // Prefix filtering matches keys, and abort removes the listing.
+        let filtered = engine.pending_intents(b"a").unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].keys, vec![Bytes::from("a")]);
+        engine.abort(txn).unwrap();
+        assert_eq!(engine.pending_intents(b"a").unwrap().len(), 0);
+        assert!(!engine.has_pending_intents(b"a").unwrap());
+        assert!(engine.has_pending_intents(b"z").unwrap());
+    }
+
+    #[test]
+    fn aborting_an_intent_unblocks_a_blocked_writer() {
+        // The janitor's core guarantee: once the abandoned intent is aborted,
+        // a transaction blocked on WriteConflict can write and commit.
+        let engine = MemKvEngine::new();
+        let key = Bytes::from("k");
+
+        let abandoned = TxnId::new();
+        engine
+            .write_intent(abandoned, key.clone(), Bytes::from("stale"))
+            .unwrap();
+
+        let writer = TxnId::new();
+        let blocked = engine.write_intent(writer, key.clone(), Bytes::from("new"));
+        assert!(
+            matches!(blocked, Err(KvError::WriteConflict(_))),
+            "the pending intent must block the writer"
+        );
+
+        engine.abort(abandoned).unwrap();
+        engine
+            .write_intent(writer, key.clone(), Bytes::from("new"))
+            .unwrap();
+        engine.commit(writer, 10).unwrap();
+        assert_eq!(
+            engine.get(key.as_ref(), 10).unwrap(),
+            Some(Bytes::from("new"))
+        );
     }
 
     #[test]

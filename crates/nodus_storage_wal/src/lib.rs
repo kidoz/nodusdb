@@ -26,6 +26,12 @@ pub enum WalRecordV1 {
         txn_id: TxnId,
         key: Vec<u8>,
         value: Vec<u8>,
+        /// Write time (HLC-scale wall-clock µs), so an intent's age survives
+        /// crash replay for the abandoned-intent janitor. Absent in records
+        /// written before this field existed; replay stamps those at replay
+        /// time (they read as young — the safe direction).
+        #[serde(default)]
+        started_at: Option<Timestamp>,
     },
     CommitTxn {
         txn_id: TxnId,
@@ -37,6 +43,9 @@ pub enum WalRecordV1 {
     DeleteIntent {
         txn_id: TxnId,
         key: Vec<u8>,
+        /// See `WriteIntent::started_at`.
+        #[serde(default)]
+        started_at: Option<Timestamp>,
     },
     Checkpoint {
         ts: Timestamp,

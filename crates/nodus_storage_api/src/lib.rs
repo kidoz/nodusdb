@@ -10,6 +10,17 @@ use uuid::Uuid;
 
 pub type Timestamp = u64;
 
+/// Wall-clock microseconds since the Unix epoch — the physical component of
+/// the transaction HLC's timestamps, so values from this clock compare
+/// directly against `read_ts`/`commit_ts`/intent ages. Returns 0 if the
+/// system clock is before the epoch (never panics).
+pub fn wallclock_micros() -> Timestamp {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as u64)
+        .unwrap_or(0)
+}
+
 /// A typed failure from a `KvEngine` mutation. The distinguished variants let a
 /// caller — notably Raft state-machine apply — tell a benign, idempotent outcome
 /// (e.g. committing a transaction whose intent was already consumed, which
@@ -33,7 +44,7 @@ pub enum KvError {
 
 pub type KvResult<T> = std::result::Result<T, KvError>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct TxnId(pub Uuid);
 
 impl TxnId {
@@ -69,6 +80,21 @@ pub enum IntentReplacement {
     Put(Bytes),
     Delete,
     Clear,
+}
+
+/// One transaction's outstanding intents in an engine, as listed by
+/// [`KvEngine::pending_intents`] for the intent janitor. `txn_id` is the id as
+/// recorded in *this* engine: a namespaced group view reports the stored
+/// (already namespace-mapped) id, which is what an abort of it must carry.
+#[derive(Debug, Clone)]
+pub struct PendingIntents {
+    pub txn_id: TxnId,
+    /// The transaction's intent keys that matched the requested prefix.
+    pub keys: Vec<Bytes>,
+    /// Write time (HLC-scale wall-clock microseconds) of the oldest matched
+    /// intent. Sourced from the durable intent record, so the age survives a
+    /// server restart rather than restarting with the process.
+    pub oldest_ts: Timestamp,
 }
 
 pub trait KvEngine: Send + Sync {
@@ -170,6 +196,25 @@ pub trait KvEngine: Send + Sync {
         anyhow::bail!("pending-intent inspection is unsupported by this engine")
     }
 
+    /// Lists every transaction with outstanding intents under `prefix`, with
+    /// the matched keys and the oldest matched intent's write timestamp.
+    /// Used by the intent janitor to find intents abandoned by dead sessions.
+    /// Unsupported engines must fail closed (like [`Self::has_pending_intents`]):
+    /// an empty answer would let the janitor conclude there is nothing to do.
+    fn pending_intents(&self, _prefix: &[u8]) -> Result<Vec<PendingIntents>> {
+        anyhow::bail!("pending-intent listing is unsupported by this engine")
+    }
+
+    /// Aborts the intents recorded under exactly `txn_id` in this engine,
+    /// bypassing any namespace id remapping that [`Self::abort`] applies. The
+    /// intent janitor aborts orphans by their *recorded* id (the only one
+    /// recoverable from the store after a restart), so Raft apply falls back
+    /// to this when the mapped lookup finds nothing. Default: same as `abort`
+    /// (correct for engines without id remapping).
+    fn abort_physical(&self, txn_id: TxnId) -> KvResult<()> {
+        self.abort(txn_id)
+    }
+
     /// Ensures this engine reflects every write committed before the call for the
     /// group that owns `key` — a linearizable-read barrier. A reader that runs
     /// this before scanning observes all earlier committed writes, closing the
@@ -254,6 +299,13 @@ impl NamespacedKvEngine {
         let ns = Uuid::new_v5(&Uuid::NAMESPACE_OID, &self.prefix);
         TxnId(Uuid::new_v5(&ns, txn_id.0.as_bytes()))
     }
+
+    /// The id under which `txn_id`'s intents are recorded in the shared inner
+    /// engine. Callers scanning the raw store (the intent janitor) use this to
+    /// recognize a live session's intents among the recorded ids.
+    pub fn map_txn_id(&self, txn_id: TxnId) -> TxnId {
+        self.namespaced_txn(txn_id)
+    }
 }
 
 impl KvEngine for NamespacedKvEngine {
@@ -288,6 +340,28 @@ impl KvEngine for NamespacedKvEngine {
 
     fn has_pending_intents(&self, prefix: &[u8]) -> Result<bool> {
         self.inner.has_pending_intents(&self.physical_key(prefix))
+    }
+
+    /// Lists the namespace's pending intents. Keys are stripped of the
+    /// namespace prefix; the transaction ids stay as *recorded* in the shared
+    /// engine (i.e. namespace-mapped) — they are the ids [`Self::abort_physical`]
+    /// expects, and the only ids recoverable after a restart.
+    fn pending_intents(&self, prefix: &[u8]) -> Result<Vec<PendingIntents>> {
+        let physical = self.physical_key(prefix);
+        let mut out = self.inner.pending_intents(&physical)?;
+        for txn in &mut out {
+            txn.keys.retain(|k| k.starts_with(self.prefix.as_ref()));
+            for key in &mut txn.keys {
+                *key = Bytes::copy_from_slice(&key[self.prefix.len()..]);
+            }
+        }
+        out.retain(|txn| !txn.keys.is_empty());
+        Ok(out)
+    }
+
+    fn abort_physical(&self, txn_id: TxnId) -> KvResult<()> {
+        // Bypass `namespaced_txn`: `txn_id` is already the id as recorded.
+        self.inner.abort(txn_id)
     }
 
     fn get(&self, key: &[u8], read_ts: Timestamp) -> Result<Option<Bytes>> {

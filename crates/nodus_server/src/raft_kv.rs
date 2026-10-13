@@ -1,4 +1,5 @@
 mod epochs;
+mod janitor;
 mod routing;
 #[cfg(test)]
 mod routing_tests;
@@ -134,6 +135,22 @@ impl RaftKvEngine {
         }
     }
 
+    /// The transaction's groups, without deregistering it: the entry must
+    /// stay in `txn_groups` until the commit/abort has fully run, so the
+    /// intent janitor still sees the transaction as live while its 2PC is in
+    /// flight (between prepare and the recorded decision, age is the only
+    /// other guard). Callers remove the entry with [`Self::finalize_targets`]
+    /// once finalization has completed — on success OR failure, so a leaked
+    /// entry cannot exempt abandoned intents from the janitor forever.
+    fn finalize_targets_peek(&self, txn_id: TxnId) -> BTreeMap<String, TxnParticipant> {
+        self.txn_groups
+            .lock()
+            .unwrap()
+            .get(&txn_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
     fn finalize_targets(&self, txn_id: TxnId) -> BTreeMap<String, TxnParticipant> {
         self.txn_groups
             .lock()
@@ -240,6 +257,7 @@ impl RaftKvEngine {
                 ShardCommand::AbortTxn {
                     txn_id: txn.to_string(),
                     shard_id: Self::shard_field(group_id),
+                    recorded: false,
                 },
             );
         }
@@ -441,38 +459,50 @@ impl KvEngine for RaftKvEngine {
     }
 
     fn commit(&self, txn_id: TxnId, commit_ts: Timestamp) -> KvResult<()> {
-        let targets = self.finalize_targets(txn_id);
-        if targets.len() <= 1 {
-            for (group, target) in &targets {
-                self.router.submit(
-                    group,
-                    self.epoch_command(
+        // Peek, don't remove: the janitor must keep seeing this transaction as
+        // live for the whole finalize window (see `finalize_targets_peek`).
+        let targets = self.finalize_targets_peek(txn_id);
+        let result = (|| {
+            if targets.len() <= 1 {
+                for (group, target) in &targets {
+                    self.router.submit(
                         group,
-                        target.epoch,
-                        nodus_raftstore::migration::EpochMutationV1::Commit {
-                            txn_id: txn_id.0,
-                            commit_ts,
-                        },
-                    ),
-                )?;
+                        self.epoch_command(
+                            group,
+                            target.epoch,
+                            nodus_raftstore::migration::EpochMutationV1::Commit {
+                                txn_id: txn_id.0,
+                                commit_ts,
+                            },
+                        ),
+                    )?;
+                }
+            } else {
+                self.commit_cross_shard(txn_id, &targets, commit_ts)?;
             }
-        } else {
-            self.commit_cross_shard(txn_id, &targets, commit_ts)?;
-        }
-        Ok(())
+            Ok(())
+        })();
+        self.finalize_targets(txn_id);
+        result
     }
 
     fn abort(&self, txn_id: TxnId) -> KvResult<()> {
-        for group_id in self.finalize_targets(txn_id).keys() {
-            self.router.submit(
-                group_id,
-                ShardCommand::AbortTxn {
-                    txn_id: txn_id.0.to_string(),
-                    shard_id: Self::shard_field(group_id),
-                },
-            )?;
-        }
-        Ok(())
+        let targets = self.finalize_targets_peek(txn_id);
+        let result = (|| {
+            for group_id in targets.keys() {
+                self.router.submit(
+                    group_id,
+                    ShardCommand::AbortTxn {
+                        txn_id: txn_id.0.to_string(),
+                        shard_id: Self::shard_field(group_id),
+                        recorded: false,
+                    },
+                )?;
+            }
+            Ok(())
+        })();
+        self.finalize_targets(txn_id);
+        result
     }
 
     fn read_barrier(&self, key: &[u8]) -> KvResult<()> {
@@ -748,6 +778,7 @@ mod tests {
                     ShardCommand::AbortTxn {
                         txn_id: txn.0.to_string(),
                         shard_id: Some(gu.clone()),
+                        recorded: false,
                     },
                 )
                 .unwrap();
@@ -981,5 +1012,190 @@ mod tests {
             PendingTxn::decode(br#"{"participants":["a"],"commit_ts":7,"epochs":{"a":1}}"#)
                 .is_err()
         );
+    }
+
+    /// An intent whose owner vanished (written straight into the group's slice
+    /// of the shared store, exactly as crash replay leaves it) is aborted by
+    /// the janitor once older than the TTL, and the abort unblocks writers.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn janitor_aborts_abandoned_intents_and_unblocks_writers() {
+        let fx = setup_two_shards().await;
+        let engine = fx.engine.clone();
+        let base = engine.local.clone();
+        let group_t = fx.group_t.clone();
+        let row_t = format!("{}:pk", fx.table_t);
+
+        let orphan = TxnId::new();
+        let recorded = NamespacedKvEngine::new(base.clone(), &group_t).map_txn_id(orphan);
+        NamespacedKvEngine::new(base.clone(), &group_t)
+            .write_intent(
+                orphan,
+                Bytes::from(row_t.clone().into_bytes()),
+                Bytes::from_static(b"stale"),
+            )
+            .unwrap();
+        // The raw store records the namespaced id, not the session id.
+        assert!(
+            base.pending_intents(b"").unwrap().iter().any(|p| p.txn_id == recorded),
+            "the recorded (namespaced) id is what a raw scan sees"
+        );
+        // A concurrent writer is blocked by the abandoned intent (the write is
+        // rejected, not lost; the typed WriteConflict is covered at the engine
+        // level in the storage crates).
+        let e = engine.clone();
+        let rt = row_t.clone();
+        let blocked = tokio::task::spawn_blocking(move || {
+            e.write_intent(TxnId::new(), Bytes::from(rt.into_bytes()), Bytes::from_static(b"x"))
+        })
+        .await
+        .unwrap();
+        assert!(blocked.is_err(), "the pending intent must block the writer");
+
+        // Sweep as of 600s in the future: the orphan is past the 300s TTL.
+        let future = nodus_storage_api::wallclock_micros() + 600_000_000;
+        let report = engine
+            .sweep_abandoned_intents(std::time::Duration::from_secs(300), future)
+            .await
+            .unwrap();
+        assert_eq!(report.aborted, 1, "the orphan should be aborted: {report:?}");
+        assert_eq!(report.failed, 0);
+        assert!(!base.has_pending_intents(b"").unwrap());
+
+        // The writer is unblocked through the real raft write path.
+        let e = engine.clone();
+        let rt = row_t.clone();
+        tokio::task::spawn_blocking(move || {
+            let t = TxnId::new();
+            e.write_intent(t, Bytes::from(rt.into_bytes()), Bytes::from_static(b"new"))
+                .unwrap();
+            e.commit(t, 10).unwrap();
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            engine.get(row_t.as_bytes(), 100).unwrap(),
+            Some(Bytes::from_static(b"new"))
+        );
+        fx.engine.manager.shutdown_all().await;
+    }
+
+    /// The janitor never aborts a live session's transaction (however old) nor
+    /// a young orphan, however dead it looks.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn janitor_skips_live_sessions_and_young_orphans() {
+        let fx = setup_two_shards().await;
+        let engine = fx.engine.clone();
+
+        // A live transaction: a real raft write, still open (in `txn_groups`).
+        let live = TxnId::new();
+        let row_t = format!("{}:live", fx.table_t);
+        let e = engine.clone();
+        let rt = row_t.clone();
+        tokio::task::spawn_blocking(move || {
+            e.write_intent(live, Bytes::from(rt.into_bytes()), Bytes::from_static(b"v"))
+                .unwrap();
+        })
+        .await
+        .unwrap();
+
+        // A young orphan on the meta group (raw key space).
+        let orphan = TxnId::new();
+        engine
+            .local
+            .write_intent(orphan, Bytes::from_static(b"\x00orphan"), Bytes::from_static(b"v"))
+            .unwrap();
+
+        let ttl = std::time::Duration::from_secs(300);
+        // As of now: the live txn is live, the orphan is young; nothing aborts.
+        let report = engine
+            .sweep_abandoned_intents(ttl, nodus_storage_api::wallclock_micros())
+            .await
+            .unwrap();
+        assert_eq!(report.aborted, 0, "nothing may abort: {report:?}");
+        assert_eq!(report.live, 1, "the live txn is skipped: {report:?}");
+        assert_eq!(report.young, 1, "the young orphan is skipped: {report:?}");
+
+        // Far in the future: the live txn is STILL protected; the orphan
+        // (ownerless) is collected.
+        let future = nodus_storage_api::wallclock_micros() + 600_000_000;
+        let report = engine.sweep_abandoned_intents(ttl, future).await.unwrap();
+        assert_eq!(report.aborted, 1, "only the orphan aborts: {report:?}");
+        assert_eq!(report.live, 1);
+        assert!(
+            engine
+                .local
+                .pending_intents(b"")
+                .unwrap()
+                .iter()
+                .all(|p| p.txn_id != orphan),
+            "the orphan's intents are gone"
+        );
+
+        // Cleanup: the live transaction still aborts cleanly.
+        let e = engine.clone();
+        tokio::task::spawn_blocking(move || e.abort(live).unwrap())
+            .await
+            .unwrap();
+        fx.engine.manager.shutdown_all().await;
+    }
+
+    /// A participant intent of a decided cross-shard commit belongs to the 2PC
+    /// recovery machinery; the janitor must never abort it, even past the TTL.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn janitor_never_aborts_decided_2pc_participants() {
+        let fx = setup_two_shards().await;
+        let engine = fx.engine.clone();
+        let row_t = format!("{}:pk", fx.table_t);
+
+        // An orphaned intent on group T plus a durable commit decision naming
+        // the transaction (as in a crash between decision and drive).
+        let orphan = TxnId::new();
+        NamespacedKvEngine::new(engine.local.clone(), &fx.group_t)
+            .write_intent(
+                orphan,
+                Bytes::from(row_t.clone().into_bytes()),
+                Bytes::from_static(b"vt"),
+            )
+            .unwrap();
+        let e = engine.clone();
+        let (gt, gu) = (fx.group_t.clone(), fx.group_u.clone());
+        tokio::task::spawn_blocking(move || {
+            let record = PendingTxn {
+                participants: vec![gt, gu],
+                commit_ts: 10,
+                epochs: BTreeMap::new(),
+            };
+            e.meta_put_committed(
+                &record_key(&orphan.0.to_string()),
+                &serde_json::to_vec(&record).unwrap(),
+                10,
+            )
+            .unwrap();
+        })
+        .await
+        .unwrap();
+
+        let future = nodus_storage_api::wallclock_micros() + 600_000_000;
+        let report = engine
+            .sweep_abandoned_intents(std::time::Duration::from_secs(300), future)
+            .await
+            .unwrap();
+        assert_eq!(report.aborted, 0, "a decided 2PC intent is never aborted");
+        assert_eq!(report.coordinated, 1);
+        assert!(engine.local.has_pending_intents(b"").unwrap());
+
+        // The recovery machinery, not the janitor, resolves it: re-driving the
+        // decision commits the intent and clears the record.
+        let e = engine.clone();
+        let repaired = tokio::task::spawn_blocking(move || e.recover_pending_txns().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(repaired, 1);
+        assert!(!engine.local.has_pending_intents(b"").unwrap());
+        assert_eq!(
+            engine.get(row_t.as_bytes(), 100).unwrap(),
+            Some(Bytes::from_static(b"vt"))
+        );
+        fx.engine.manager.shutdown_all().await;
     }
 }

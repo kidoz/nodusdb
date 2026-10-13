@@ -1208,7 +1208,7 @@ impl BackupOrchestrator {
                     WalRecordV1::BeginTxn { txn_id } => {
                         active_txns.insert(txn_id);
                     }
-                    WalRecordV1::WriteIntent { txn_id, key, value } => {
+                    WalRecordV1::WriteIntent { txn_id, key, value, .. } => {
                         if is_backup_excluded_key(&key) {
                             continue;
                         }
@@ -1216,7 +1216,7 @@ impl BackupOrchestrator {
                         active_txns.insert(txn_id);
                         report.writes_applied += 1;
                     }
-                    WalRecordV1::DeleteIntent { txn_id, key } => {
+                    WalRecordV1::DeleteIntent { txn_id, key, .. } => {
                         if is_backup_excluded_key(&key) {
                             continue;
                         }
@@ -1697,15 +1697,18 @@ mod tests {
                 txn_id: txn,
                 key: b"\x00raft\x00vote".to_vec(),
                 value: b"foreign-vote".to_vec(),
+                started_at: None,
             }),
             WalRecord::V1(WalRecordV1::WriteIntent {
                 txn_id: txn,
                 key: b"\x01migration/v2/table/t".to_vec(),
                 value: b"foreign-journal".to_vec(),
+                started_at: None,
             }),
             WalRecord::V1(WalRecordV1::DeleteIntent {
                 txn_id: txn,
                 key: b"\x00recovery\x00generation".to_vec(),
+                started_at: None,
             }),
             WalRecord::V1(WalRecordV1::CommitTxn {
                 txn_id: txn,
@@ -2776,16 +2779,19 @@ mod tests {
                 txn_id: committed,
                 key: b"a".to_vec(),
                 value: b"15".to_vec(),
+                started_at: None,
             }),
             WalRecord::V1(WalRecordV1::WriteIntent {
                 txn_id: committed,
                 key: b"\x01upgrade/v1/state".to_vec(),
                 value: b"foreign policy".to_vec(),
+                started_at: None,
             }),
             WalRecord::V1(WalRecordV1::WriteIntent {
                 txn_id: committed,
                 key: b"\x01upgrade/admission/v1/state".to_vec(),
                 value: b"foreign admission".to_vec(),
+                started_at: None,
             }),
             WalRecord::V1(WalRecordV1::CommitTxn {
                 txn_id: committed,
@@ -2796,6 +2802,7 @@ mod tests {
                 txn_id: exact,
                 key: b"e".to_vec(),
                 value: b"20".to_vec(),
+                started_at: None,
             }),
             WalRecord::V1(WalRecordV1::CommitTxn {
                 txn_id: exact,
@@ -2806,6 +2813,7 @@ mod tests {
                 txn_id: late,
                 key: b"l".to_vec(),
                 value: b"25".to_vec(),
+                started_at: None,
             }),
             WalRecord::V1(WalRecordV1::CommitTxn {
                 txn_id: late,
@@ -2816,6 +2824,7 @@ mod tests {
                 txn_id: pending,
                 key: b"p".to_vec(),
                 value: b"pending".to_vec(),
+                started_at: None,
             }),
         ]);
         orch.archive_wal_indexed(
@@ -2908,6 +2917,7 @@ mod tests {
                 txn_id: put,
                 key: b"d".to_vec(),
                 value: b"visible-before-delete".to_vec(),
+                started_at: None,
             }),
             WalRecord::V1(WalRecordV1::CommitTxn {
                 txn_id: put,
@@ -2916,6 +2926,7 @@ mod tests {
             WalRecord::V1(WalRecordV1::DeleteIntent {
                 txn_id: delete,
                 key: b"d".to_vec(),
+                started_at: None,
             }),
             WalRecord::V1(WalRecordV1::CommitTxn {
                 txn_id: delete,
@@ -2925,6 +2936,7 @@ mod tests {
                 txn_id: aborted,
                 key: b"x".to_vec(),
                 value: b"aborted".to_vec(),
+                started_at: None,
             }),
             WalRecord::V1(WalRecordV1::AbortTxn { txn_id: aborted }),
         ]);

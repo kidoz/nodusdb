@@ -78,6 +78,15 @@ impl KvEngine for ClockAdvancingKvEngine {
     fn has_pending_intents(&self, prefix: &[u8]) -> Result<bool> {
         self.inner.has_pending_intents(prefix)
     }
+    fn pending_intents(
+        &self,
+        prefix: &[u8],
+    ) -> Result<Vec<nodus_storage_api::PendingIntents>> {
+        self.inner.pending_intents(prefix)
+    }
+    fn abort_physical(&self, txn_id: TxnId) -> KvResult<()> {
+        self.inner.abort_physical(txn_id)
+    }
 
     fn get(&self, key: &[u8], read_ts: Timestamp) -> Result<Option<Bytes>> {
         self.inner.get(key, read_ts)
@@ -289,6 +298,11 @@ impl MultiRaftManager {
         self.hosted.read().unwrap().contains(shard_id)
     }
 
+    /// Every group currently hosted on this node (meta + data), for the intent
+    /// janitor's per-group ownership attribution.
+    pub fn hosted_group_ids(&self) -> Vec<String> {
+        self.hosted.read().unwrap().iter().cloned().collect()
+    }
     /// Health of the data-shard groups hosted here: `(total, without_leader)`.
     /// A group with no current leader is unavailable for reads/writes. The meta
     /// group is excluded. Feeds the cluster-overview shard health.

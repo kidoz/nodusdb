@@ -5,7 +5,8 @@ pub mod sstable;
 
 use nodus_mvcc::{GcMode, VersionChain, VisibleVersion};
 use nodus_storage_api::{
-    IntentReplacement, KeyRange, KvEngine, KvPair, KvResult, KvVersion, Timestamp, TxnId,
+    IntentReplacement, KeyRange, KvEngine, KvPair, KvResult, KvVersion, PendingIntents, Timestamp,
+    TxnId, wallclock_micros,
 };
 use nodus_storage_wal::{FileWalEngine, WalEngine, WalRecord, WalRecordV1};
 use serde::{Deserialize, Serialize};
@@ -46,7 +47,10 @@ pub struct LsmKvEngine {
     snapshot_failed: std::sync::atomic::AtomicBool,
     data_dir: Option<PathBuf>,
     memtable: RwLock<BTreeMap<Bytes, VersionChain>>,
-    intents: RwLock<HashMap<TxnId, Vec<Bytes>>>,
+    /// Transaction id → its outstanding intent keys, each stamped with its
+    /// write time (HLC-scale wall-clock µs, recorded in the WAL) so an
+    /// intent's age survives crash replay for the abandoned-intent janitor.
+    intents: RwLock<HashMap<TxnId, Vec<(Bytes, Timestamp)>>>,
     sstables: RwLock<Vec<Sstable>>,
     wal: RwLock<Option<Arc<dyn WalEngine>>>,
     /// Id of the active WAL segment (`{id}.log`), recorded in the manifest.
@@ -408,8 +412,7 @@ impl LsmKvEngine {
                 .read()
                 .unwrap()
                 .values()
-                .flatten()
-                .cloned()
+                .flat_map(|keys| keys.iter().map(|(k, _)| k.clone()))
                 .collect();
             let mut to_flush = BTreeMap::new();
             mem_guard.retain(|k, chain| {
@@ -756,21 +759,39 @@ impl LsmKvEngine {
                 for record in records {
                     let WalRecord::V1(rec) = record;
                     match rec {
-                        WalRecordV1::WriteIntent { txn_id, key, value } => {
+                        WalRecordV1::WriteIntent {
+                            txn_id,
+                            key,
+                            value,
+                            started_at,
+                        } => {
                             let k = Bytes::from(key);
                             let chain = mem_guard.entry(k.clone()).or_default();
                             let _ = chain.write_intent(txn_id, value);
-                            int_guard.entry(txn_id).or_default().push(k);
+                            // Records from before `started_at` existed fall back
+                            // to the replay time: the intent reads as young,
+                            // deferring janitor action (the safe direction).
+                            int_guard
+                                .entry(txn_id)
+                                .or_default()
+                                .push((k, started_at.unwrap_or_else(wallclock_micros)));
                         }
-                        WalRecordV1::DeleteIntent { txn_id, key } => {
+                        WalRecordV1::DeleteIntent {
+                            txn_id,
+                            key,
+                            started_at,
+                        } => {
                             let k = Bytes::from(key);
                             let chain = mem_guard.entry(k.clone()).or_default();
                             let _ = chain.delete_intent(txn_id);
-                            int_guard.entry(txn_id).or_default().push(k);
+                            int_guard
+                                .entry(txn_id)
+                                .or_default()
+                                .push((k, started_at.unwrap_or_else(wallclock_micros)));
                         }
                         WalRecordV1::CommitTxn { txn_id, commit_ts } => {
                             if let Some(keys) = int_guard.remove(&txn_id) {
-                                for key in keys {
+                                for (key, _) in keys {
                                     if let Some(chain) = mem_guard.get_mut(&key) {
                                         let _ = chain.commit(txn_id, commit_ts);
                                     }
@@ -779,7 +800,7 @@ impl LsmKvEngine {
                         }
                         WalRecordV1::AbortTxn { txn_id } => {
                             if let Some(keys) = int_guard.remove(&txn_id) {
-                                for key in keys {
+                                for (key, _) in keys {
                                     if let Some(chain) = mem_guard.get_mut(&key) {
                                         let _ = chain.abort(txn_id);
                                     }
@@ -847,7 +868,7 @@ impl KvEngine for LsmKvEngine {
             .unwrap()
             .values()
             .flatten()
-            .any(|key| key.starts_with(prefix)))
+            .any(|(key, _)| key.starts_with(prefix)))
     }
 
     fn flush(&self) -> Result<()> {
@@ -1003,6 +1024,7 @@ impl KvEngine for LsmKvEngine {
         let _snapshot = self.snapshot_gate.read().unwrap();
         self.snapshot_available()?;
         let added = key.len() + value.len() + 32;
+        let started_at = wallclock_micros();
         {
             // In flight from the WAL append until the intent is registered:
             // flush consults `inflight_appends` before advancing the replay
@@ -1019,6 +1041,7 @@ impl KvEngine for LsmKvEngine {
                         txn_id,
                         key: key.to_vec(),
                         value: value.to_vec(),
+                        started_at: Some(started_at),
                     }))?;
                 }
             }
@@ -1029,7 +1052,10 @@ impl KvEngine for LsmKvEngine {
 
             let chain = store_guard.entry(key.clone()).or_default();
             chain.write_intent(txn_id, value.to_vec())?;
-            intents_guard.entry(txn_id).or_default().push(key);
+            intents_guard
+                .entry(txn_id)
+                .or_default()
+                .push((key, started_at));
         }
         self.memtable_bytes.fetch_add(added, Ordering::Relaxed);
         self.maybe_flush_by_size()?;
@@ -1040,6 +1066,7 @@ impl KvEngine for LsmKvEngine {
         let _snapshot = self.snapshot_gate.read().unwrap();
         self.snapshot_available()?;
         let added = key.len() + 32;
+        let started_at = wallclock_micros();
         {
             // In flight exactly as in `write_intent`.
             let _inflight = self.track_append();
@@ -1049,6 +1076,7 @@ impl KvEngine for LsmKvEngine {
                     wal.append(WalRecord::V1(WalRecordV1::DeleteIntent {
                         txn_id,
                         key: key.to_vec(),
+                        started_at: Some(started_at),
                     }))?;
                 }
             }
@@ -1059,7 +1087,10 @@ impl KvEngine for LsmKvEngine {
 
             let chain = store_guard.entry(key.clone()).or_default();
             chain.delete_intent(txn_id)?;
-            intents_guard.entry(txn_id).or_default().push(key);
+            intents_guard
+                .entry(txn_id)
+                .or_default()
+                .push((key, started_at));
         }
         self.memtable_bytes.fetch_add(added, Ordering::Relaxed);
         self.maybe_flush_by_size()?;
@@ -1083,15 +1114,21 @@ impl KvEngine for LsmKvEngine {
         match replacement {
             IntentReplacement::Put(value) => {
                 chain.write_intent(txn_id, value.to_vec())?;
-                intents_guard.entry(txn_id).or_default().push(key);
+                intents_guard
+                    .entry(txn_id)
+                    .or_default()
+                    .push((key, wallclock_micros()));
             }
             IntentReplacement::Delete => {
                 chain.delete_intent(txn_id)?;
-                intents_guard.entry(txn_id).or_default().push(key);
+                intents_guard
+                    .entry(txn_id)
+                    .or_default()
+                    .push((key, wallclock_micros()));
             }
             IntentReplacement::Clear => {
                 if let Some(keys) = intents_guard.get_mut(&txn_id) {
-                    keys.retain(|k| k != &key);
+                    keys.retain(|(k, _)| k != &key);
                     if keys.is_empty() {
                         intents_guard.remove(&txn_id);
                     }
@@ -1107,8 +1144,32 @@ impl KvEngine for LsmKvEngine {
             .read()
             .unwrap()
             .get(&txn_id)
-            .cloned()
+            .map(|keys| keys.iter().map(|(k, _)| k.clone()).collect())
             .unwrap_or_default()
+    }
+
+    fn pending_intents(&self, prefix: &[u8]) -> Result<Vec<PendingIntents>> {
+        let _snapshot = self.snapshot_gate.read().unwrap();
+        self.snapshot_available()?;
+        let intents = self.intents.read().unwrap();
+        Ok(intents
+            .iter()
+            .filter_map(|(txn_id, keys)| {
+                let matched: Vec<&(Bytes, Timestamp)> = keys
+                    .iter()
+                    .filter(|(k, _)| k.starts_with(prefix))
+                    .collect();
+                if matched.is_empty() {
+                    return None;
+                }
+                let oldest_ts = matched.iter().map(|(_, ts)| *ts).min().unwrap_or(0);
+                Some(PendingIntents {
+                    txn_id: *txn_id,
+                    keys: matched.iter().map(|(k, _)| k.clone()).collect(),
+                    oldest_ts,
+                })
+            })
+            .collect())
     }
 
     fn commit(&self, txn_id: TxnId, commit_ts: Timestamp) -> KvResult<()> {
@@ -1126,7 +1187,7 @@ impl KvEngine for LsmKvEngine {
         let mut intents_guard = self.intents.write().unwrap();
 
         if let Some(keys) = intents_guard.remove(&txn_id) {
-            for key in keys {
+            for (key, _) in keys {
                 if let Some(chain) = store_guard.get_mut(&key) {
                     let _ = chain.commit(txn_id, commit_ts);
                 }
@@ -1150,7 +1211,7 @@ impl KvEngine for LsmKvEngine {
         let mut intents_guard = self.intents.write().unwrap();
 
         if let Some(keys) = intents_guard.remove(&txn_id) {
-            for key in keys {
+            for (key, _) in keys {
                 if let Some(chain) = store_guard.get_mut(&key) {
                     let _ = chain.abort(txn_id);
                 }
@@ -2328,5 +2389,49 @@ mod sst_tests {
             "acknowledged commit lost across crash recovery"
         );
         assert_eq!(engine.get(b"stable", 100).unwrap(), Some(Bytes::from("s")));
+    }
+
+    #[test]
+    fn pending_intents_keep_their_age_across_restart() {
+        // The janitor's TTL accounting must survive a restart: an intent's age
+        // comes from the WAL record's HLC-scale write stamp, not process uptime.
+        let dir = TempDir::new().unwrap();
+        let txn = TxnId::new();
+        let stamped = {
+            let engine = LsmKvEngine::with_wal(dir.path(), None).unwrap();
+            engine
+                .write_intent(txn, Bytes::from("orphan"), Bytes::from("v"))
+                .unwrap();
+            let listed = engine.pending_intents(b"").unwrap();
+            assert_eq!(listed.len(), 1);
+            assert_eq!(listed[0].txn_id, txn);
+            listed[0].oldest_ts
+            // Engine drops here, simulating a crash with the intent uncommitted.
+        };
+
+        let engine = LsmKvEngine::with_wal(dir.path(), None).unwrap();
+        let listed = engine.pending_intents(b"").unwrap();
+        assert_eq!(listed.len(), 1, "the intent must survive crash recovery");
+        assert_eq!(
+            listed[0].oldest_ts, stamped,
+            "the intent's write stamp must survive the restart"
+        );
+        assert!(listed[0].oldest_ts <= wallclock_micros());
+
+        // Aborting the orphan unblocks a writer that was conflicting on it.
+        let writer = TxnId::new();
+        assert!(matches!(
+            engine.write_intent(writer, Bytes::from("orphan"), Bytes::from("new")),
+            Err(nodus_storage_api::KvError::WriteConflict(_))
+        ));
+        engine.abort(txn).unwrap();
+        engine
+            .write_intent(writer, Bytes::from("orphan"), Bytes::from("new"))
+            .unwrap();
+        engine.commit(writer, stamped + 1).unwrap();
+        assert_eq!(
+            engine.get(b"orphan", stamped + 1).unwrap(),
+            Some(Bytes::from("new"))
+        );
     }
 }

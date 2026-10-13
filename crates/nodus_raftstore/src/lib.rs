@@ -78,6 +78,15 @@ pub enum ShardCommand {
         txn_id: String,
         #[serde(default)]
         shard_id: Option<String>,
+        /// `true` when `txn_id` is the id as RECORDED in this group's store
+        /// (the intent janitor's orphan aborts — the only id recoverable from
+        /// a raw store scan after a restart), bypassing the namespace id
+        /// mapping a session's abort applies. Defaults to `false`, so older
+        /// binaries parse the command unchanged (they apply it as a session
+        /// abort, a benign no-op for recorded ids, and the janitor refrains
+        /// from submitting these while a rolling upgrade is in flight).
+        #[serde(default)]
+        recorded: bool,
     },
     /// Two-phase-commit prepare vote for a cross-shard transaction. The intents
     /// were already durably replicated by their `PutIntent`s; applying this
@@ -1279,10 +1288,21 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
                                     )?;
                                 }
                             }
-                            ShardCommand::AbortTxn { txn_id, .. } => {
+                            ShardCommand::AbortTxn {
+                                txn_id, recorded, ..
+                            } => {
                                 if let Ok(tid) = uuid::Uuid::from_str(txn_id) {
-                                    error =
-                                        apply_kv_result("AbortTxn", txn_id, kv.abort(TxnId(tid)))?;
+                                    // Session aborts name the session's txn id,
+                                    // which a namespaced group engine maps to
+                                    // the recorded id. Janitor aborts
+                                    // (`recorded`) name the id as stored, so
+                                    // they bypass the mapping.
+                                    let result = if *recorded {
+                                        kv.abort_physical(TxnId(tid))
+                                    } else {
+                                        kv.abort(TxnId(tid))
+                                    };
+                                    error = apply_kv_result("AbortTxn", txn_id, result)?;
                                 }
                             }
                             ShardCommand::PrepareTxn { txn_id, .. } => {

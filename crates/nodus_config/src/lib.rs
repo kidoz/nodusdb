@@ -31,6 +31,7 @@ pub struct NodusConfig {
     pub observability: ObservabilityConfig,
     pub admin: AdminConfig,
     pub audit: AuditConfig,
+    pub txn: TxnConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -189,6 +190,26 @@ impl Default for AuditConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
+pub struct TxnConfig {
+    /// How old a pending write intent must be before the abandoned-intent
+    /// janitor may abort it (seconds). Intents of transactions owned by a live
+    /// session or a decided cross-shard commit are never aborted. The default
+    /// (300s) must exceed the longest legitimate transaction: a transaction
+    /// coordinated by ANOTHER node is invisible to this node's liveness check,
+    /// so the TTL is the only guard there.
+    pub abandoned_intent_ttl_secs: u64,
+}
+
+impl Default for TxnConfig {
+    fn default() -> Self {
+        Self {
+            abandoned_intent_ttl_secs: 300,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct ServerConfig {
     /// PostgreSQL wire-protocol listen address.
     pub pgwire_addr: String,
@@ -241,6 +262,7 @@ impl Default for NodusConfig {
             observability: ObservabilityConfig::default(),
             admin: AdminConfig::default(),
             audit: AuditConfig::default(),
+            txn: TxnConfig::default(),
         }
     }
 }
@@ -320,6 +342,11 @@ impl NodusConfig {
         if self.server.max_connections == 0 {
             return Err(ConfigError::Invalid(
                 "server.max_connections must be > 0".into(),
+            ));
+        }
+        if self.txn.abandoned_intent_ttl_secs == 0 {
+            return Err(ConfigError::Invalid(
+                "txn.abandoned_intent_ttl_secs must be > 0".into(),
             ));
         }
         let lvl = self.observability.log_level.to_lowercase();

@@ -895,6 +895,56 @@ pub async fn run_server_with_config(
         }
     });
 
+    // Background abandoned-intent janitor: aborts pending intents whose owning
+    // transaction is definitively dead (no live session here, no 2PC decision
+    // record, older than txn.abandoned_intent_ttl_secs) on groups this node
+    // leads, so they cannot block writers, pin MVCC GC, or stall snapshot
+    // builds forever. Safety rules: `raft_kv::janitor`.
+    let janitor_kv = raft_kv.clone();
+    let janitor_metrics = state.metrics.clone();
+    let janitor_ttl = std::time::Duration::from_secs(config.txn.abandoned_intent_ttl_secs);
+    let mut janitor_shutdown = shutdown.clone();
+    let janitor_task = tokio::spawn(async move {
+        // Sweep often enough to converge promptly, never so often that sweeps
+        // dominate: half the TTL, clamped to [1s, 30s].
+        let interval = (janitor_ttl / 2).clamp(
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(30),
+        );
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {
+                    let now = nodus_storage_api::wallclock_micros();
+                    match janitor_kv.sweep_abandoned_intents(janitor_ttl, now).await {
+                        Ok(report) => {
+                            janitor_metrics.pending_intents.set(report.pending as i64);
+                            if report.aborted > 0 {
+                                janitor_metrics.janitor_aborts_total.inc_by(report.aborted as u64);
+                                tracing::info!(
+                                    aborted = report.aborted,
+                                    pending = report.pending,
+                                    "intent janitor sweep aborted abandoned intents"
+                                );
+                            }
+                            if report.failed > 0 {
+                                tracing::warn!(
+                                    failed = report.failed,
+                                    "intent janitor sweep had abort failures"
+                                );
+                            }
+                        }
+                        Err(e) => tracing::warn!("intent janitor sweep failed: {e}"),
+                    }
+                }
+                _ = janitor_shutdown.changed() => {
+                    break;
+                }
+            }
+        }
+    });
+
     // Slow-query log: queries slower than 200ms are retained (most recent 100).
     let slow_log = Arc::new(nodus_monitoring::SlowQueryLog::new(100, 200));
 
@@ -1279,6 +1329,7 @@ pub async fn run_server_with_config(
         background_tasks: {
             let mut tasks = vec![
                 gc_task,
+                janitor_task,
                 wal_archiver_task,
                 raft_shutdown_task,
                 shard_reconcile_task,
@@ -1582,6 +1633,7 @@ mod tests {
             txn_id,
             key: b"k".to_vec(),
             value: b"v".to_vec(),
+            started_at: None,
         }))
         .unwrap();
         wal.append(WalRecord::V1(WalRecordV1::CommitTxn {

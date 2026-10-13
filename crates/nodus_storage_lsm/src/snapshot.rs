@@ -111,7 +111,11 @@ impl LsmKvEngine {
             size <= SNAPSHOT_MEMORY_LIMIT,
             "replacement exceeds 128 MiB checkpoint memory limit"
         );
-        let mut live = HashMap::<TxnId, Vec<Bytes>>::new();
+        // Snapshot rows carry no intent timestamps, so restored intents are
+        // stamped at install time: they read as young to the janitor (the safe
+        // direction) until they genuinely age out on this node.
+        let installed_at = wallclock_micros();
+        let mut live = HashMap::<TxnId, Vec<(Bytes, Timestamp)>>::new();
         let mut pending = BTreeMap::new();
         for (key, chain) in &merged {
             if chain.versions.iter().any(|v| v.is_intent) {
@@ -120,7 +124,7 @@ impl LsmKvEngine {
                     let txn = v
                         .txn_id
                         .ok_or_else(|| anyhow::anyhow!("snapshot intent has no transaction"))?;
-                    live.entry(txn).or_default().push(key.clone());
+                    live.entry(txn).or_default().push((key.clone(), installed_at));
                 }
             }
         }
@@ -173,10 +177,12 @@ impl LsmKvEngine {
                         txn_id,
                         key: key.to_vec(),
                         value: value.clone(),
+                        started_at: Some(installed_at),
                     },
                     None => WalRecordV1::DeleteIntent {
                         txn_id,
                         key: key.to_vec(),
+                        started_at: Some(installed_at),
                     },
                 };
                 wal.append(WalRecord::V1(record))?;
