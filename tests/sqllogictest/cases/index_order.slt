@@ -1,0 +1,118 @@
+# Ordering from an index: with index scans asked for (`SET enable_seqscan
+# = off`), an `ORDER BY` on an index's leading column reads the index in
+# its own order — no `WHERE` needed — and a covering index serves the
+# whole scan when nothing orders or filters it (a bare `count(*)`). An
+# ordering the index only starts is an `Incremental Sort` over its
+# prefix; a chosen sequential scan says `Disabled: true`. PostgreSQL
+# reads an index backwards for `DESC` (`Index Scan Backward`) and can
+# index-scan each partition of an ordered scan of a partitioned table;
+# NodusDB sorts instead. Plans and results otherwise from PostgreSQL
+# 18.4.
+
+statement ok
+drop table if exists g1 cascade;
+
+statement ok
+create table g1 (k int, v int);
+
+statement ok
+insert into g1 select g % 3, g from generate_series(1, 90) g;
+
+statement ok
+create index g1_v on g1 (v);
+
+statement ok
+analyze g1;
+
+statement ok
+set enable_seqscan = off;
+
+query T
+explain (costs off) select * from g1 order by v;
+----
+Index Scan using g1_v on g1
+
+query T
+explain (costs off) select v from g1 order by v;
+----
+Index Only Scan using g1_v on g1
+
+query T
+explain (costs off) select v from g1 order by v limit 5;
+----
+Limit
+  ->  Index Only Scan using g1_v on g1
+
+query T
+explain (costs off) select * from g1 order by v, k;
+----
+Incremental Sort
+  Sort Key: v, k
+  Presorted Key: v
+  ->  Index Scan using g1_v on g1
+
+query T
+explain (costs off) select * from g1 order by v, k limit 3;
+----
+Limit
+  ->  Incremental Sort
+        Sort Key: v, k
+        Presorted Key: v
+        ->  Index Scan using g1_v on g1
+
+query T
+explain (costs off) select count(*) from g1;
+----
+Aggregate
+  ->  Index Only Scan using g1_v on g1
+
+query T
+explain (costs off) select * from g1 order by k;
+----
+Sort
+  Sort Key: k
+  ->  Seq Scan on g1
+        Disabled: true
+
+query T
+select v from g1 order by v limit 5;
+----
+1
+2
+3
+4
+5
+
+
+query T
+select v, k from g1 order by v limit 4;
+----
+1	1
+2	2
+3	0
+4	1
+
+
+query T
+select count(*) from g1;
+----
+90
+
+
+query T
+select v from g1 order by v desc limit 3;
+----
+90
+89
+88
+
+
+statement ok
+reset enable_seqscan;
+
+query T
+explain (costs off) select * from g1 order by v;
+----
+Sort
+  Sort Key: v
+  ->  Seq Scan on g1
