@@ -170,7 +170,7 @@ async fn snapshot_admission_requires_anchor_applied_index_and_no_omission() {
             .unwrap();
             kv.commit(txn, 11).unwrap();
         }
-        let mut receiver = crate::NodusRaftStore::with_kv(kv.clone());
+        let mut receiver = crate::NodusRaftStore::with_kv(kv.clone()).unwrap();
         receiver.state_machine.write().await.meta_store =
             Some(Arc::new(nodus_meta::MemMetaStore::new()));
         let original = receiver.build_snapshot().await.unwrap();

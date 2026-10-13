@@ -31,7 +31,7 @@ async fn fence_replicates_over_tcp_and_survives_leader_failure() {
     let mut servers = Vec::new();
     for (i, listener) in listeners.into_iter().enumerate() {
         let kv: Arc<dyn KvEngine> = Arc::new(nodus_storage_mem::MemKvEngine::new());
-        let store = NodusRaftStore::with_kv_at(kv.clone(), dir.path().join(i.to_string()));
+        let store = NodusRaftStore::with_kv_at(kv.clone(), dir.path().join(i.to_string())).unwrap();
         let (log, sm) = openraft::storage::Adaptor::new(store);
         let raft = NodusRaft::new(
             i as u64 + 1,
@@ -248,7 +248,7 @@ async fn coordinator_journal_resumes_on_new_tcp_leader_without_acquire_ack() {
     let mut servers = Vec::new();
     for (i, listener) in listeners.into_iter().enumerate() {
         let kv: Arc<dyn KvEngine> = Arc::new(nodus_storage_mem::MemKvEngine::new());
-        let store = NodusRaftStore::with_kv_at(kv.clone(), dir.path().join(i.to_string()));
+        let store = NodusRaftStore::with_kv_at(kv.clone(), dir.path().join(i.to_string())).unwrap();
         store.state_machine.write().await.meta_store =
             Some(Arc::new(nodus_meta::MemMetaStore::new()));
         let (log, sm) = openraft::storage::Adaptor::new(store);

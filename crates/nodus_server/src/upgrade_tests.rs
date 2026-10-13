@@ -256,6 +256,7 @@ async fn finalized_authority_survives_abrupt_exit_and_snapshot_transfer() {
     let kv = Arc::new(LsmKvEngine::with_wal(dir.path().join("kv"), None).unwrap());
     assert_eq!(upgrade::read(kv.as_ref()).unwrap().phase, Phase::Finalized);
     let mut store = NodusRaftStore::with_kv_at(kv.clone(), dir.path().join("snapshots/shard-meta"))
+        .unwrap()
         .with_snapshot_group(META_SHARD)
         .with_snapshot_compatibility(Arc::new(upgrade::DurableSnapshotCompatibility(kv.clone())));
     store.state_machine.write().await.meta_store =
@@ -280,6 +281,7 @@ async fn finalized_authority_survives_abrupt_exit_and_snapshot_transfer() {
     let target = tempfile::tempdir().unwrap();
     let dst = Arc::new(LsmKvEngine::with_wal(target.path().join("kv"), None).unwrap());
     let mut receiver = NodusRaftStore::with_kv_at(dst.clone(), target.path().join("snap"))
+        .unwrap()
         .with_snapshot_group(META_SHARD);
     receiver.state_machine.write().await.meta_store =
         Some(Arc::new(nodus_meta::PersistentMetaStore::new(dst.clone())));

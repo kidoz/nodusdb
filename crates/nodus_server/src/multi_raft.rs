@@ -325,7 +325,8 @@ impl MultiRaftManager {
             catalog_reader,
             meta_store,
             self.group_snapshot_dir(META_SHARD),
-        );
+        )
+        .map_err(|e| anyhow::anyhow!("recover meta group store: {e:#}"))?;
         self.spawn_group(META_SHARD, store).await
     }
 
@@ -339,7 +340,10 @@ impl MultiRaftManager {
         let kv: Arc<dyn KvEngine> =
             Arc::new(NamespacedKvEngine::new(self.base_kv.clone(), shard_id));
         let kv = ClockAdvancingKvEngine::wrap(kv, self.clock.clone());
-        let store = NodusRaftStore::with_kv_at(kv, self.group_snapshot_dir(shard_id));
+        let store =
+            NodusRaftStore::with_kv_at(kv, self.group_snapshot_dir(shard_id)).map_err(|e| {
+                anyhow::anyhow!("recover data group store for shard '{shard_id}': {e:#}")
+            })?;
         self.spawn_group(shard_id, store).await
     }
 

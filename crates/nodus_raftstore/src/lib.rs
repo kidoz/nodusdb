@@ -498,34 +498,40 @@ impl RaftMetaStore {
         self.put_checked(RAFT_VOTE_KEY, encode_raft(bytes))
     }
 
-    fn load_vote(&self) -> Option<Vote<u64>> {
-        self.kv
-            .get(RAFT_VOTE_KEY, u64::MAX)
-            .ok()
-            .flatten()
-            .and_then(|b| decode_raft(&b).and_then(|p| serde_json::from_slice(p).ok()))
+    /// Reads the persisted vote. Distinguishes a genuine first boot (key
+    /// absent) from a storage read failure: the error is propagated so the
+    /// caller fails closed. Dropping a persisted vote would let a restarted
+    /// node vote again in the same term — a double-vote election-safety
+    /// violation.
+    fn load_vote(&self) -> anyhow::Result<Option<Vote<u64>>> {
+        Ok(self
+            .kv
+            .get(RAFT_VOTE_KEY, u64::MAX)?
+            .and_then(|b| decode_raft(&b).and_then(|p| serde_json::from_slice(p).ok())))
     }
 
     fn delete_entry(&self, index: u64) -> anyhow::Result<()> {
         self.delete_checked(&log_key(index))
     }
 
-    fn load_log(&self) -> BTreeMap<u64, Entry<NodusTypeConfig>> {
+    /// Reads the persisted log. A scan failure or an unreadable record is
+    /// propagated (fail closed): silently dropping the log tail would invite
+    /// re-application of committed entries or loss of unreplicated ones.
+    fn load_log(&self) -> anyhow::Result<BTreeMap<u64, Entry<NodusTypeConfig>>> {
         let mut out = BTreeMap::new();
         let range = KeyRange {
             start: Bytes::from_static(RAFT_LOG_PREFIX),
             end: Bytes::from_static(RAFT_LOG_END),
         };
-        if let Ok(iter) = self.kv.scan(range, u64::MAX) {
-            for pair in iter.flatten() {
-                if let Some(entry) = decode_raft(&pair.value)
-                    .and_then(|p| serde_json::from_slice::<Entry<NodusTypeConfig>>(p).ok())
-                {
-                    out.insert(entry.log_id.index, entry);
-                }
+        for pair in self.kv.scan(range, u64::MAX)? {
+            let pair = pair?;
+            if let Some(entry) = decode_raft(&pair.value)
+                .and_then(|p| serde_json::from_slice::<Entry<NodusTypeConfig>>(p).ok())
+            {
+                out.insert(entry.log_id.index, entry);
             }
         }
-        out
+        Ok(out)
     }
 
     fn save_applied(&self, state: &AppliedState) -> anyhow::Result<()> {
@@ -533,21 +539,26 @@ impl RaftMetaStore {
         self.put_checked(RAFT_APPLIED_KEY, encode_raft(bytes))
     }
 
-    fn load_applied(&self) -> AppliedState {
-        self.kv
-            .get(RAFT_APPLIED_KEY, u64::MAX)
-            .ok()
-            .flatten()
+    /// Reads the persisted applied-state (applied pointer, membership, purge
+    /// watermark). Absence means a first boot (default state); a storage read
+    /// failure is propagated so recovery cannot silently restart from zero and
+    /// re-apply or lose committed state.
+    fn load_applied(&self) -> anyhow::Result<AppliedState> {
+        Ok(self
+            .kv
+            .get(RAFT_APPLIED_KEY, u64::MAX)?
             .and_then(|b| decode_raft(&b).and_then(|p| serde_json::from_slice(p).ok()))
-            .unwrap_or_default()
+            .unwrap_or_default())
     }
 
-    fn load_snapshot_meta(&self) -> Option<NodusSnapshotMeta> {
-        self.kv
-            .get(RAFT_SNAPSHOT_META_KEY, u64::MAX)
-            .ok()
-            .flatten()
-            .and_then(|b| decode_raft(&b).and_then(|p| serde_json::from_slice(p).ok()))
+    /// Reads the persisted snapshot metadata. Absence means no snapshot was
+    /// ever built; a storage read failure is propagated so a restarted node
+    /// does not wrongly conclude it has no snapshot to resume from.
+    fn load_snapshot_meta(&self) -> anyhow::Result<Option<NodusSnapshotMeta>> {
+        Ok(self
+            .kv
+            .get(RAFT_SNAPSHOT_META_KEY, u64::MAX)?
+            .and_then(|b| decode_raft(&b).and_then(|p| serde_json::from_slice(p).ok())))
     }
 }
 
@@ -653,18 +664,24 @@ impl NodusRaftStore {
     /// Builds a durable store over `kv`, **recovering** any previously persisted
     /// vote, log, and applied-state so a restarted node resumes its term,
     /// membership, and committed log.
+    ///
+    /// Fails closed: a durable read error during recovery aborts construction
+    /// rather than starting the group with partial amnesia (a dropped vote
+    /// invites a double-vote in the same term; a dropped applied pointer or log
+    /// tail invites re-application or data loss). Genuine absence of the keys
+    /// — a first boot — recovers as empty state.
     fn with(
         kv: Arc<dyn nodus_storage_api::KvEngine>,
         catalog_writer: Option<Arc<dyn nodus_catalog::CatalogWriter>>,
         catalog_reader: Option<Arc<dyn nodus_catalog::CatalogReader>>,
         meta_store: Option<Arc<dyn nodus_meta::MetaStore>>,
         snapshot_dir: PathBuf,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
         let _ = std::fs::create_dir_all(&snapshot_dir);
         let meta = Arc::new(RaftMetaStore::new(kv.clone()));
-        let mut log = meta.load_log();
-        let vote = meta.load_vote();
-        let mut applied = meta.load_applied();
+        let mut log = meta.load_log()?;
+        let vote = meta.load_vote()?;
+        let mut applied = meta.load_applied()?;
         if reconcile_torn_recovery(&mut log, &mut applied) {
             // Persist the repaired watermark so the consistent view is stable
             // across a subsequent restart, even if no apply/purge runs first.
@@ -680,9 +697,9 @@ impl NodusRaftStore {
         // on-disk snapshot (and the purged log below it) rather than replaying
         // the whole log. Only honor it if the snapshot file is actually present.
         let snapshot_meta = meta
-            .load_snapshot_meta()
+            .load_snapshot_meta()?
             .filter(|_| snapshot_dir.join(CURRENT_SNAPSHOT_FILE).exists());
-        Self {
+        Ok(Self {
             log: Arc::new(RwLock::new(log)),
             vote: Arc::new(RwLock::new(vote)),
             state_machine: Arc::new(RwLock::new(StateMachine {
@@ -700,14 +717,14 @@ impl NodusRaftStore {
             snapshot_deferred_at: Arc::default(),
             snapshot_dir,
             current_snapshot_meta: Arc::new(RwLock::new(snapshot_meta)),
-        }
+        })
     }
 
     pub fn with_kv_and_catalog(
         kv: Arc<dyn nodus_storage_api::KvEngine>,
         catalog_writer: Arc<dyn nodus_catalog::CatalogWriter>,
         catalog_reader: Arc<dyn nodus_catalog::CatalogReader>,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
         Self::with(
             kv,
             Some(catalog_writer),
@@ -719,28 +736,33 @@ impl NodusRaftStore {
 
     /// Builds a store for a data shard with an ephemeral snapshot dir (tests /
     /// inert groups). Use [`Self::with_kv_at`] to back snapshots with a durable
-    /// directory.
-    pub fn with_kv(kv: Arc<dyn nodus_storage_api::KvEngine>) -> Self {
+    /// directory. Fails closed on a durable read error during recovery.
+    pub fn with_kv(kv: Arc<dyn nodus_storage_api::KvEngine>) -> anyhow::Result<Self> {
         Self::with(kv, None, None, None, temp_snapshot_dir())
     }
 
     /// Builds a data-shard store whose snapshots are streamed to/from durable
     /// files under `snapshot_dir`. Catalog/RBAC and upgrade commands are no-ops
-    /// on a data group — those are owned by the meta group.
-    pub fn with_kv_at(kv: Arc<dyn nodus_storage_api::KvEngine>, snapshot_dir: PathBuf) -> Self {
+    /// on a data group — those are owned by the meta group. Fails closed on a
+    /// durable read error during recovery.
+    pub fn with_kv_at(
+        kv: Arc<dyn nodus_storage_api::KvEngine>,
+        snapshot_dir: PathBuf,
+    ) -> anyhow::Result<Self> {
         Self::with(kv, None, None, None, snapshot_dir)
     }
 
     /// Builds the meta-group store with full catalog/RBAC/upgrade components plus
     /// the local cluster-metadata store that shard-map/placement commands apply
-    /// to. Snapshots stream to/from durable files under `snapshot_dir`.
+    /// to. Snapshots stream to/from durable files under `snapshot_dir`. Fails
+    /// closed on a durable read error during recovery.
     pub fn with_components(
         kv: Arc<dyn nodus_storage_api::KvEngine>,
         catalog_writer: Arc<dyn nodus_catalog::CatalogWriter>,
         catalog_reader: Arc<dyn nodus_catalog::CatalogReader>,
         meta_store: Arc<dyn nodus_meta::MetaStore>,
         snapshot_dir: PathBuf,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
         Self::with(
             kv,
             Some(catalog_writer),
@@ -1527,7 +1549,7 @@ mod tests {
         let kv: Arc<dyn KvEngine> = Arc::new(nodus_storage_mem::MemKvEngine::new());
 
         {
-            let mut store = NodusRaftStore::with_kv(kv.clone());
+            let mut store = NodusRaftStore::with_kv(kv.clone()).unwrap();
             store.save_vote(&Vote::new(3, 1)).await.unwrap();
             store
                 .append_to_log(vec![
@@ -1545,7 +1567,7 @@ mod tests {
         }
 
         // Reopen over the same KV — recovery path runs in the constructor.
-        let mut store = NodusRaftStore::with_kv(kv.clone());
+        let mut store = NodusRaftStore::with_kv(kv.clone()).unwrap();
 
         assert_eq!(store.read_vote().await.unwrap(), Some(Vote::new(3, 1)));
 
@@ -1566,11 +1588,15 @@ mod tests {
 
     /// Test-only engine that injects durable-write failures, proving the store
     /// reports them to openraft instead of acking writes a crash would lose.
+    /// Also injects read failures, proving recovery fails closed instead of
+    /// mistaking a read error for absent state.
     #[derive(Default)]
     struct FailingKv {
         inner: nodus_storage_mem::MemKvEngine,
         fail_writes: std::sync::atomic::AtomicBool,
         fail_commits: std::sync::atomic::AtomicBool,
+        fail_gets: std::sync::atomic::AtomicBool,
+        fail_scans: std::sync::atomic::AtomicBool,
     }
 
     impl FailingKv {
@@ -1581,6 +1607,9 @@ mod tests {
 
     impl KvEngine for FailingKv {
         fn get(&self, key: &[u8], ts: u64) -> anyhow::Result<Option<Bytes>> {
+            if self.fail_gets.load(Ordering::SeqCst) {
+                return Err(Self::injected().into());
+            }
             self.inner.get(key, ts)
         }
         fn scan(
@@ -1590,6 +1619,9 @@ mod tests {
         ) -> anyhow::Result<
             Box<dyn Iterator<Item = anyhow::Result<nodus_storage_api::KvPair>> + Send>,
         > {
+            if self.fail_scans.load(Ordering::SeqCst) {
+                return Err(Self::injected().into());
+            }
             self.inner.scan(range, ts)
         }
         fn write_intent(&self, txn: TxnId, key: Bytes, value: Bytes) -> KvResult<()> {
@@ -1625,8 +1657,84 @@ mod tests {
 
     fn failing_store() -> (NodusRaftStore, Arc<FailingKv>) {
         let engine = Arc::new(FailingKv::default());
-        let store = NodusRaftStore::with_kv(engine.clone());
+        let store = NodusRaftStore::with_kv(engine.clone()).unwrap();
         (store, engine)
+    }
+
+    /// Recovery fails closed on a durable log-scan error: the store does not
+    /// open over a log tail it could not read, so committed entries are neither
+    /// re-applied nor silently dropped.
+    #[tokio::test]
+    async fn store_construction_fails_closed_on_a_log_scan_error() {
+        let (mut store, engine) = failing_store();
+        store
+            .append_to_log(vec![blank_entry(1, 1), blank_entry(1, 2)])
+            .await
+            .unwrap();
+        drop(store);
+
+        engine.fail_scans.store(true, Ordering::SeqCst);
+        let dyn_engine: Arc<dyn KvEngine> = engine.clone();
+        let err = match NodusRaftStore::with_kv(dyn_engine) {
+            Ok(_) => panic!("construction must fail closed on an injected scan error"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("injected durable failure"),
+            "error must carry the storage cause: {err}"
+        );
+
+        // Once the transient error clears, recovery succeeds and the log is intact.
+        engine.fail_scans.store(false, Ordering::SeqCst);
+        let dyn_engine: Arc<dyn KvEngine> = engine;
+        let mut store = NodusRaftStore::with_kv(dyn_engine).unwrap();
+        assert_eq!(store.try_get_log_entries(1..=2).await.unwrap().len(), 2);
+    }
+
+    /// Recovery fails closed on a durable point-read error: a persisted vote,
+    /// applied pointer, or snapshot meta that cannot be read aborts store
+    /// construction instead of being mistaken for a first boot — a dropped vote
+    /// would let the restarted node vote again in the same term.
+    #[tokio::test]
+    async fn store_construction_fails_closed_on_a_meta_read_error() {
+        let (mut store, engine) = failing_store();
+        store.save_vote(&Vote::new(3, 1)).await.unwrap();
+        store.append_to_log(vec![blank_entry(1, 1)]).await.unwrap();
+        store
+            .apply_to_state_machine(&[blank_entry(1, 1)])
+            .await
+            .unwrap();
+        drop(store);
+
+        engine.fail_gets.store(true, Ordering::SeqCst);
+        let dyn_engine: Arc<dyn KvEngine> = engine.clone();
+        let err = match NodusRaftStore::with_kv(dyn_engine) {
+            Ok(_) => panic!("construction must fail closed on an injected read error"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("injected durable failure"),
+            "error must carry the storage cause: {err}"
+        );
+
+        // Once the transient error clears, the persisted vote and applied
+        // pointer are recovered — they were never lost, only unreadable.
+        engine.fail_gets.store(false, Ordering::SeqCst);
+        let dyn_engine: Arc<dyn KvEngine> = engine;
+        let mut store = NodusRaftStore::with_kv(dyn_engine).unwrap();
+        assert_eq!(store.read_vote().await.unwrap(), Some(Vote::new(3, 1)));
+        let (applied, _) = store.last_applied_state().await.unwrap();
+        assert_eq!(applied.map(|l| l.index), Some(1));
+    }
+
+    /// Genuine absence (a first boot) is not an error: construction succeeds
+    /// with empty consensus state.
+    #[test]
+    fn store_construction_succeeds_on_genuine_absence() {
+        let engine: Arc<dyn KvEngine> = Arc::new(FailingKv::default());
+        let store = NodusRaftStore::with_kv(engine).unwrap();
+        assert!(store.log.blocking_read().is_empty());
+        assert!(store.vote.blocking_read().is_none());
     }
 
     /// A failed durable append is returned to openraft and the entry never
@@ -1807,7 +1915,7 @@ mod tests {
     async fn recovery_repairs_an_applied_pointer_that_outlives_the_log() {
         let kv: Arc<dyn KvEngine> = Arc::new(nodus_storage_mem::MemKvEngine::new());
         {
-            let mut store = NodusRaftStore::with_kv(kv.clone());
+            let mut store = NodusRaftStore::with_kv(kv.clone()).unwrap();
             store
                 .append_to_log(vec![blank_entry(1, 1), blank_entry(1, 2)])
                 .await
@@ -1824,7 +1932,7 @@ mod tests {
         meta.delete_entry(2).unwrap();
 
         // Reopen — recovery must reconcile rather than expose a torn view.
-        let mut store = NodusRaftStore::with_kv(kv.clone());
+        let mut store = NodusRaftStore::with_kv(kv.clone()).unwrap();
         let state = store.get_log_state().await.unwrap();
         assert_eq!(
             state.last_log_id.map(|l| l.index),
@@ -1854,7 +1962,7 @@ mod tests {
         let snapshot_dir = temp_snapshot_dir();
         let snapshot_id;
         {
-            let mut store = NodusRaftStore::with_kv_at(kv.clone(), snapshot_dir.clone());
+            let mut store = NodusRaftStore::with_kv_at(kv.clone(), snapshot_dir.clone()).unwrap();
             store.append_to_log(vec![blank_entry(1, 1)]).await.unwrap();
             store
                 .apply_to_state_machine(&[blank_entry(1, 1)])
@@ -1875,7 +1983,7 @@ mod tests {
         }
 
         // Reopen over the same engine and snapshot dir: the snapshot is recovered.
-        let mut store = NodusRaftStore::with_kv_at(kv.clone(), snapshot_dir.clone());
+        let mut store = NodusRaftStore::with_kv_at(kv.clone(), snapshot_dir.clone()).unwrap();
         let recovered = store
             .get_current_snapshot()
             .await
@@ -1894,7 +2002,7 @@ mod tests {
 
         // Source state machine carries one user key, captured in a snapshot.
         let src_kv: Arc<dyn KvEngine> = Arc::new(nodus_storage_mem::MemKvEngine::new());
-        let mut src = NodusRaftStore::with_kv(src_kv.clone());
+        let mut src = NodusRaftStore::with_kv(src_kv.clone()).unwrap();
         let tid = TxnId::new();
         src_kv
             .write_intent(
@@ -1908,7 +2016,7 @@ mod tests {
 
         // Target has an orphan key not present in the snapshot.
         let dst_kv: Arc<dyn KvEngine> = Arc::new(nodus_storage_mem::MemKvEngine::new());
-        let mut dst = NodusRaftStore::with_kv(dst_kv.clone());
+        let mut dst = NodusRaftStore::with_kv(dst_kv.clone()).unwrap();
         let t2 = TxnId::new();
         dst_kv
             .write_intent(
@@ -1944,7 +2052,7 @@ mod tests {
 
         // Build a snapshot on the source.
         let src_kv: Arc<dyn KvEngine> = Arc::new(nodus_storage_mem::MemKvEngine::new());
-        let mut src = NodusRaftStore::with_kv(src_kv.clone());
+        let mut src = NodusRaftStore::with_kv(src_kv.clone()).unwrap();
         let tid = TxnId::new();
         src_kv
             .write_intent(tid, Bytes::from_static(b"\x01k"), Bytes::from_static(b"v"))
@@ -1955,7 +2063,7 @@ mod tests {
         // Receiver: get a fresh receive file, stream the snapshot bytes into it
         // (as openraft would, chunk by chunk), then install.
         let dst_kv: Arc<dyn KvEngine> = Arc::new(nodus_storage_mem::MemKvEngine::new());
-        let mut dst = NodusRaftStore::with_kv(dst_kv.clone());
+        let mut dst = NodusRaftStore::with_kv(dst_kv.clone()).unwrap();
         let mut recv = dst.begin_receiving_snapshot().await.unwrap();
         let mut src_file = *snapshot.snapshot;
         src_file.seek(SeekFrom::Start(0)).await.unwrap();
@@ -1978,7 +2086,7 @@ mod tests {
     async fn truncated_log_entries_stay_gone_after_reopen() {
         let kv: Arc<dyn KvEngine> = Arc::new(nodus_storage_mem::MemKvEngine::new());
         {
-            let mut store = NodusRaftStore::with_kv(kv.clone());
+            let mut store = NodusRaftStore::with_kv(kv.clone()).unwrap();
             store
                 .append_to_log(vec![
                     blank_entry(1, 1),
@@ -1992,7 +2100,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let mut store = NodusRaftStore::with_kv(kv.clone());
+        let mut store = NodusRaftStore::with_kv(kv.clone()).unwrap();
         let entries = store.try_get_log_entries(1..=3).await.unwrap();
         assert_eq!(entries.len(), 1, "only the un-truncated entry survives");
         assert_eq!(entries[0].log_id.index, 1);

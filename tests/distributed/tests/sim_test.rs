@@ -195,7 +195,8 @@ async fn test_cluster_partition_linearizability() {
 
         let kv = Arc::new(nodus_storage_mem::MemKvEngine::new());
         let catalog = std::sync::Arc::new(nodus_catalog::MemoryCatalog::new());
-        let store = NodusRaftStore::with_kv_and_catalog(kv, catalog.clone(), catalog.clone());
+        let store =
+            NodusRaftStore::with_kv_and_catalog(kv, catalog.clone(), catalog.clone()).unwrap();
         stores.insert(i as u64, store.clone());
         let raft_config_clone = raft_config.clone();
         let part_clone = partitioned.clone();

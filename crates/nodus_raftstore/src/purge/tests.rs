@@ -122,7 +122,7 @@ fn entry(index: u64) -> Entry<NodusTypeConfig> {
 }
 
 async fn seed(kv: Arc<dyn KvEngine>, dir: PathBuf, count: u64) -> NodusRaftStore {
-    let mut store = NodusRaftStore::with_kv_at(kv, dir);
+    let mut store = NodusRaftStore::with_kv_at(kv, dir).unwrap();
     let mut entries: Vec<_> = (1..=count).map(entry).collect();
     entries[0].payload = EntryPayload::Membership(openraft::Membership::new(
         vec![std::collections::BTreeSet::from([1, 2, 3])],
@@ -142,11 +142,12 @@ async fn seed(kv: Arc<dyn KvEngine>, dir: PathBuf, count: u64) -> NodusRaftStore
 async fn assert_prefix(kv: Arc<dyn KvEngine>, dir: PathBuf, count: u64, purged: u64) {
     let meta = RaftMetaStore::new(kv.clone());
     assert_eq!(
-        meta.load_applied().last_membership.log_id(),
+        meta.load_applied().unwrap().last_membership.log_id(),
         &Some(entry(1).log_id)
     );
     assert_eq!(
         meta.load_applied()
+            .unwrap()
             .last_membership
             .membership()
             .voter_ids()
@@ -154,14 +155,14 @@ async fn assert_prefix(kv: Arc<dyn KvEngine>, dir: PathBuf, count: u64, purged: 
         vec![1, 2, 3]
     );
     assert_eq!(
-        meta.load_applied().last_purged.map(|id| id.index),
+        meta.load_applied().unwrap().last_purged.map(|id| id.index),
         (purged > 0).then_some(purged)
     );
     assert_eq!(
-        meta.load_log().keys().copied().collect::<Vec<_>>(),
+        meta.load_log().unwrap().keys().copied().collect::<Vec<_>>(),
         ((purged + 1)..=count).collect::<Vec<_>>()
     );
-    let mut reopened = NodusRaftStore::with_kv_at(kv, dir);
+    let mut reopened = NodusRaftStore::with_kv_at(kv, dir).unwrap();
     assert_eq!(
         reopened.get_log_state().await.unwrap().last_log_id,
         Some(entry(count).log_id)
@@ -214,7 +215,7 @@ async fn purge_exact_batch_and_empty_log_keep_the_durable_boundary() {
     drop(store);
     drop(kv);
     let kv = Arc::new(LsmKvEngine::with_wal(dir.path().join("data"), None).unwrap());
-    let mut store = NodusRaftStore::with_kv_at(kv, dir.path().join("snap"));
+    let mut store = NodusRaftStore::with_kv_at(kv, dir.path().join("snap")).unwrap();
     let state = store.get_log_state().await.unwrap();
     assert_eq!(state.last_purged_log_id, Some(entry(257).log_id));
     assert_eq!(state.last_log_id, Some(entry(257).log_id));
@@ -365,7 +366,7 @@ async fn benchmark_purge_commits() {
             for index in 1..=4000 {
                 meta.delete_checked(&log_key(index)).unwrap();
             }
-            let mut applied = meta.load_applied();
+            let mut applied = meta.load_applied().unwrap();
             applied.last_purged = Some(entry(4000).log_id);
             meta.put_checked(
                 RAFT_APPLIED_KEY,

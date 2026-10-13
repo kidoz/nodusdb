@@ -21,7 +21,7 @@ struct Harness {
 
 impl Harness {
     async fn new(kv: Arc<dyn KvEngine>, snapshots: std::path::PathBuf) -> Self {
-        let store = NodusRaftStore::with_kv_at(kv.clone(), snapshots);
+        let store = NodusRaftStore::with_kv_at(kv.clone(), snapshots).unwrap();
         store.state_machine.write().await.meta_store =
             Some(Arc::new(nodus_meta::MemMetaStore::new()));
         Self {
@@ -382,7 +382,7 @@ fn fence_survives_abrupt_exit_after_raft_acknowledgement() {
             let dir = std::path::PathBuf::from(dir);
             let kv: Arc<dyn KvEngine> =
                 Arc::new(nodus_storage_lsm::LsmKvEngine::with_wal(&dir, None).unwrap());
-            let store = NodusRaftStore::with_kv_at(kv, dir.join("snapshots"));
+            let store = NodusRaftStore::with_kv_at(kv, dir.join("snapshots")).unwrap();
             store.state_machine.write().await.meta_store =
                 Some(Arc::new(nodus_meta::MemMetaStore::new()));
             let (log, sm) = openraft::storage::Adaptor::new(store);

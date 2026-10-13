@@ -32,7 +32,7 @@ async fn meta_store(kv: Arc<dyn KvEngine>, dir: &Path) -> (NodusRaftStore, Arc<M
         MemoryCatalog::with_store(Arc::new(nodus_executor::KvCatalogStore::new(kv.clone())))
             .unwrap(),
     );
-    let store = NodusRaftStore::with_kv_at(kv.clone(), dir.into());
+    let store = NodusRaftStore::with_kv_at(kv.clone(), dir.into()).unwrap();
     {
         let mut sm = store.state_machine.write().await;
         sm.catalog_reader = Some(cat.clone());
@@ -241,7 +241,7 @@ async fn snapshot_install_crash_child() {
     }
     put(source.as_ref(), b"row", b"new", 20);
     put(source.as_ref(), b"index", b"new", 20);
-    let mut sender = NodusRaftStore::with_kv_at(source, dir.join("source-snap"));
+    let mut sender = NodusRaftStore::with_kv_at(source, dir.join("source-snap")).unwrap();
     sender.state_machine.write().await.last_applied_log = Some(openraft::LogId::new(
         openraft::CommittedLeaderId::new(1, 1),
         20,
@@ -262,7 +262,7 @@ async fn snapshot_install_crash_child() {
         inner,
         boundary: std::env::var("NODUS_TEST_RAFT_SNAPSHOT_BOUNDARY").unwrap(),
     });
-    let mut receiver = NodusRaftStore::with_kv_at(kv, dir.join("snap"));
+    let mut receiver = NodusRaftStore::with_kv_at(kv, dir.join("snap")).unwrap();
     receiver
         .install_snapshot(&snapshot.meta, snapshot.snapshot)
         .await
@@ -287,7 +287,7 @@ async fn exercise_install_crash(mvcc: bool) {
             let kv = Arc::new(LsmKvEngine::with_wal(dir.path().join("kv"), None).unwrap());
             put(kv.as_ref(), b"row", b"old", 10);
             put(kv.as_ref(), b"orphan", b"old", 10);
-            let mut receiver = NodusRaftStore::with_kv_at(kv, dir.path().join("snap"));
+            let mut receiver = NodusRaftStore::with_kv_at(kv, dir.path().join("snap")).unwrap();
             receiver.build_snapshot().await.unwrap();
         }
         let status = std::process::Command::new(std::env::current_exe().unwrap())
@@ -307,7 +307,7 @@ async fn exercise_install_crash(mvcc: bool) {
             "real checkpoint boundary must be reached"
         );
         let kv = Arc::new(LsmKvEngine::with_wal(dir.path().join("kv"), None).unwrap());
-        let mut receiver = NodusRaftStore::with_kv_at(kv.clone(), dir.path().join("snap"));
+        let mut receiver = NodusRaftStore::with_kv_at(kv.clone(), dir.path().join("snap")).unwrap();
         let installed = boundary == "after-checkpoint";
         assert_eq!(
             kv.get(b"row", u64::MAX).unwrap().unwrap().as_ref(),
@@ -392,7 +392,8 @@ async fn exercise_learner_snapshot(mvcc: bool) {
         let other = NamespacedKvEngine::new(kv.clone(), "shard-other");
         put(&other, b"row", b"local-other", 10);
         let group = Arc::new(NamespacedKvEngine::new(kv.clone(), "shard-a"));
-        let store = NodusRaftStore::with_kv_at(group, dir.path().join(format!("snap-{id}")));
+        let store =
+            NodusRaftStore::with_kv_at(group, dir.path().join(format!("snap-{id}"))).unwrap();
         let store = if mvcc {
             store
                 .with_snapshot_group("shard-a")
@@ -587,7 +588,7 @@ async fn exercise_learner_snapshot(mvcc: bool) {
         other.get(b"row", 10).unwrap().unwrap().as_ref(),
         b"local-other"
     );
-    let mut reopened = NodusRaftStore::with_kv_at(group, dir.path().join("snap-2"));
+    let mut reopened = NodusRaftStore::with_kv_at(group, dir.path().join("snap-2")).unwrap();
     assert!(reopened.get_current_snapshot().await.unwrap().is_some());
 }
 

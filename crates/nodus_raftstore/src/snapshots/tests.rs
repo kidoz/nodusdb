@@ -43,7 +43,7 @@ async fn malformed_payloads_preserve_rows_applied_and_current_snapshot() {
     ] {
         let kv = Arc::new(MemKvEngine::new());
         put(kv.as_ref(), b"old", b"keep", 10);
-        let mut store = NodusRaftStore::with_kv(kv.clone());
+        let mut store = NodusRaftStore::with_kv(kv.clone()).unwrap();
         store.state_machine.write().await.meta_store =
             Some(Arc::new(nodus_meta::MemMetaStore::new()));
         let original = store.build_snapshot().await.unwrap();
@@ -90,7 +90,7 @@ async fn malformed_payloads_preserve_rows_applied_and_current_snapshot() {
 async fn a_deferred_build_waits_out_the_retry_interval() {
     let kv = Arc::new(MemKvEngine::new());
     put(kv.as_ref(), b"row", b"first", 10);
-    let mut store = NodusRaftStore::with_kv(kv.clone());
+    let mut store = NodusRaftStore::with_kv(kv.clone()).unwrap();
     let original = store.build_snapshot().await.unwrap();
     let txn = TxnId::new();
     kv.write_intent(txn, Bytes::from_static(b"other"), Bytes::from_static(b"x"))
@@ -113,7 +113,7 @@ async fn legacy_build_refuses_intents_history_and_tombstones_without_replacing_s
     for state in ["intent", "history", "tombstone"] {
         let kv = Arc::new(MemKvEngine::new());
         put(kv.as_ref(), b"row", b"first", 10);
-        let mut store = NodusRaftStore::with_kv(kv.clone());
+        let mut store = NodusRaftStore::with_kv(kv.clone()).unwrap();
         let original = store.build_snapshot().await.unwrap();
         let txn = TxnId::new();
         if state == "tombstone" {
@@ -157,7 +157,7 @@ async fn legacy_build_refuses_intents_history_and_tombstones_without_replacing_s
 async fn catalog_kind_mismatch_is_rejected_before_replacing_data() {
     let kv = Arc::new(MemKvEngine::new());
     put(kv.as_ref(), b"old", b"keep", 10);
-    let mut store = NodusRaftStore::with_kv(kv.clone());
+    let mut store = NodusRaftStore::with_kv(kv.clone()).unwrap();
     let mut bytes = Vec::new();
     write_snapshot_header(
         &mut bytes,
@@ -181,7 +181,7 @@ async fn catalog_kind_mismatch_is_rejected_before_replacing_data() {
 async fn higher_term_snapshot_cannot_move_applied_index_backwards() {
     let kv = Arc::new(MemKvEngine::new());
     put(kv.as_ref(), b"old", b"keep", 10);
-    let mut store = NodusRaftStore::with_kv(kv.clone());
+    let mut store = NodusRaftStore::with_kv(kv.clone()).unwrap();
     let applied = LogId::new(openraft::CommittedLeaderId::new(1, 1), 10);
     store.state_machine.write().await.last_applied_log = Some(applied);
     let meta = SnapshotMeta {
@@ -251,6 +251,7 @@ async fn mvcc_source() -> (NodusRaftStore, Arc<MemKvEngine>, Arc<Compatibility>,
         formats: std::sync::Mutex::new(BTreeMap::from([(1, 2), (2, 1)])),
     });
     let store = NodusRaftStore::with_kv(kv.clone())
+        .unwrap()
         .with_snapshot_group("shard-a")
         .with_snapshot_compatibility(compatibility.clone());
     store.state_machine.write().await.last_membership = StoredMembership::new(
@@ -288,7 +289,9 @@ async fn mvcc_snapshots_require_finalization_and_every_voter_and_learner() {
     let snapshot = source.build_snapshot().await.unwrap();
     let built = snapshot.meta.snapshot_id.clone();
     let target = Arc::new(MemKvEngine::new());
-    let mut receiver = NodusRaftStore::with_kv(target.clone()).with_snapshot_group("shard-a");
+    let mut receiver = NodusRaftStore::with_kv(target.clone())
+        .unwrap()
+        .with_snapshot_group("shard-a");
     receiver
         .install_snapshot(&snapshot.meta, snapshot.snapshot)
         .await
@@ -332,8 +335,9 @@ async fn mvcc_payload_checksum_group_and_metadata_mismatch_leave_old_state() {
     for case in ["checksum", "metadata", "group", "truncated"] {
         let kv = Arc::new(MemKvEngine::new());
         put(kv.as_ref(), b"old", b"keep", 10);
-        let mut store =
-            NodusRaftStore::with_kv(kv.clone()).with_snapshot_group(if case == "group" {
+        let mut store = NodusRaftStore::with_kv(kv.clone())
+            .unwrap()
+            .with_snapshot_group(if case == "group" {
                 "shard-b"
             } else {
                 "shard-a"
