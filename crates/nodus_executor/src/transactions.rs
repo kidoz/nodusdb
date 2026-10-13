@@ -482,18 +482,24 @@ impl MemExecutor {
     /// they would block every later write to those keys.
     pub(crate) fn commit_or_release(&self, txn_id: TxnId) -> Result<Timestamp> {
         self.txn.commit_txn(txn_id).inspect_err(|_| {
-            let _ = self.kv.abort(txn_id);
+            if let Err(error) = self.kv.abort(txn_id) {
+                tracing::warn!(?txn_id, %error, "failed to release intents of a txn that lost the commit check");
+            }
         })
     }
 
     /// Commits the storage intents of a transaction `commit_or_release` has
     /// already marked committed. If the storage commit fails (e.g. a Raft
-    /// submit that never landed), the intents are released instead of leaking:
-    /// left pending, they would block every later write to those keys and
-    /// stall snapshot builds. The client-facing error is returned unchanged.
+    /// submit that never landed), a best-effort abort releases the intents
+    /// instead of leaking them: left pending, they would block every later
+    /// write to those keys and stall snapshot builds. The abort can itself
+    /// fail under the same outage; that is logged. The client-facing error is
+    /// returned unchanged.
     pub(crate) fn commit_released_txn(&self, txn_id: TxnId, commit_ts: Timestamp) -> Result<()> {
         self.kv.commit(txn_id, commit_ts).inspect_err(|_| {
-            let _ = self.kv.abort(txn_id);
+            if let Err(error) = self.kv.abort(txn_id) {
+                tracing::warn!(?txn_id, %error, "failed to release intents after a storage commit failure");
+            }
         })?;
         Ok(())
     }

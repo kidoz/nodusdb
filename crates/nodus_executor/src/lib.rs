@@ -372,9 +372,12 @@ impl nodus_catalog::CatalogStore for KvCatalogStore {
             Bytes::copy_from_slice(bytes),
         )?;
         // A failed commit must not strand the catalog-write intent: later
-        // saves would conflict with it forever.
+        // saves would conflict with it forever. The abort is best-effort —
+        // under the same outage it can fail too, so it is logged.
         if let Err(error) = self.kv.commit(txn, ts) {
-            let _ = self.kv.abort(txn);
+            if let Err(abort_error) = self.kv.abort(txn) {
+                tracing::warn!(?txn, %abort_error, "failed to release the catalog-write intent after a commit failure");
+            }
             return Err(error.into());
         }
         Ok(())
