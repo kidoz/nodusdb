@@ -1,0 +1,233 @@
+# Ordered scans of inherited tables merge: with index scans asked for
+# (`SET enable_seqscan = off`), an `ORDER BY` on a column the parts' indexes
+# lead reads as PostgreSQL's `Merge Append` — each partition's scan in the
+# merge key's order, forward or backward, index-only when that partition's
+# index covers the columns the statement reads — with the `Sort Key:` line
+# on the merge and no `Sort` above. A partition without such an index sorts
+# its own rows (its key text names the partition), a single surviving
+# partition stands in for the parent under its own name, and a scan chosen
+# while sequential scans are disabled says `Disabled: true`. Key texts name
+# the parent (`Sort Key: q1.v DESC`). Plans and results from PostgreSQL
+# 18.4.
+#
+# Known divergences: PostgreSQL's cost-based choices stay ours to make —
+# with sequential scans enabled PostgreSQL still merges an ordered scan
+# where NodusDB sorts, and on a small table PostgreSQL may sort an
+# `order by k` where NodusDB merges the partition indexes.
+
+statement ok
+drop table if exists q1 cascade;
+
+statement ok
+create table q1 (k int, v int) partition by range (k);
+
+statement ok
+create table q1a partition of q1 for values from (0) to (50);
+
+statement ok
+create table q1b partition of q1 for values from (50) to (100);
+
+statement ok
+insert into q1 select i, i * 7 % 997 from generate_series(1, 60) i;
+
+statement ok
+create index q1_v on q1 (v);
+
+statement ok
+analyze q1;
+
+statement ok
+drop table if exists h1 cascade;
+
+statement ok
+create table h1 (k int, v int);
+
+statement ok
+create table h1c () inherits (h1);
+
+statement ok
+insert into h1 select i, i * 7 % 997 from generate_series(1, 5) i;
+
+statement ok
+insert into h1c select i, i * 7 % 997 from generate_series(6, 10) i;
+
+statement ok
+create index h1_v on h1 (v);
+
+statement ok
+analyze h1;
+
+statement ok
+analyze h1c;
+
+statement ok
+set enable_seqscan = off;
+
+query T
+explain (costs off) select * from q1 order by v desc limit 5;
+----
+Limit
+  ->  Merge Append
+        Sort Key: q1.v DESC
+        ->  Index Scan Backward using q1a_v_idx on q1a q1_1
+        ->  Index Scan Backward using q1b_v_idx on q1b q1_2
+
+query T
+explain (costs off) select v from q1 order by v limit 3;
+----
+Limit
+  ->  Merge Append
+        Sort Key: q1.v
+        ->  Index Only Scan using q1a_v_idx on q1a q1_1
+        ->  Index Only Scan using q1b_v_idx on q1b q1_2
+
+query T
+explain (costs off) select * from q1 order by v desc;
+----
+Merge Append
+  Sort Key: q1.v DESC
+  ->  Index Scan Backward using q1a_v_idx on q1a q1_1
+  ->  Index Scan Backward using q1b_v_idx on q1b q1_2
+
+query T
+explain (costs off) select * from q1 where k < 60 order by v desc;
+----
+Merge Append
+  Sort Key: q1.v DESC
+  ->  Index Scan Backward using q1a_v_idx on q1a q1_1
+        Filter: (k < 60)
+  ->  Index Scan Backward using q1b_v_idx on q1b q1_2
+        Filter: (k < 60)
+
+query T
+explain (costs off) select * from q1 where v > 10 order by v;
+----
+Merge Append
+  Sort Key: q1.v
+  ->  Index Scan using q1a_v_idx on q1a q1_1
+        Index Cond: (v > 10)
+  ->  Index Scan using q1b_v_idx on q1b q1_2
+        Index Cond: (v > 10)
+
+query T
+explain (costs off) select * from q1 x order by v desc;
+----
+Merge Append
+  Sort Key: x.v DESC
+  ->  Index Scan Backward using q1a_v_idx on q1a x_1
+  ->  Index Scan Backward using q1b_v_idx on q1b x_2
+
+query T
+explain (costs off) select * from q1 order by v desc nulls last;
+----
+Sort
+  Sort Key: q1.v DESC NULLS LAST
+  ->  Append
+        ->  Seq Scan on q1a q1_1
+              Disabled: true
+        ->  Seq Scan on q1b q1_2
+              Disabled: true
+
+query T
+explain (costs off) select * from q1 where k < 30 order by v desc;
+----
+Index Scan Backward using q1a_v_idx on q1a q1
+  Filter: (k < 30)
+
+query T
+explain (costs off) select * from h1 order by v desc;
+----
+Merge Append
+  Sort Key: h1.v DESC
+  ->  Index Scan Backward using h1_v on h1 h1_1
+  ->  Sort
+        Sort Key: h1_2.v DESC
+        ->  Seq Scan on h1c h1_2
+              Disabled: true
+
+query T
+explain (costs off) select * from h1 order by v;
+----
+Merge Append
+  Sort Key: h1.v
+  ->  Index Scan using h1_v on h1 h1_1
+  ->  Sort
+        Sort Key: h1_2.v
+        ->  Seq Scan on h1c h1_2
+              Disabled: true
+
+query T
+select k, v from q1 order by v desc limit 5;
+----
+60	420
+59	413
+58	406
+57	399
+56	392
+
+query T
+select v from q1 order by v limit 3;
+----
+7
+14
+21
+
+query T
+select k, v from q1 where k < 60 order by v desc limit 4;
+----
+59	413
+58	406
+57	399
+56	392
+
+query T
+select k, v from q1 where k < 30 order by v desc limit 3;
+----
+29	203
+28	196
+27	189
+
+query T
+select k, v from q1 where v > 10 order by v limit 4;
+----
+2	14
+3	21
+4	28
+5	35
+
+query T
+select k, v from q1 order by v desc limit 4 offset 56;
+----
+4	28
+3	21
+2	14
+1	7
+
+statement ok
+begin;
+
+statement ok
+insert into q1 values (30, 99), (31, -3);
+
+statement ok
+delete from q1 where k = 2;
+
+query T
+select k, v from q1 order by v desc limit 4;
+----
+60	420
+59	413
+58	406
+57	399
+
+statement ok
+rollback;
+
+query T
+select k, v from q1 order by v limit 4;
+----
+1	7
+2	14
+3	21
+4	28
+
