@@ -1,0 +1,242 @@
+# Window orderings read the index: with index scans asked for (`SET
+# enable_seqscan = off`), the innermost `WindowAgg`'s ordering — its
+# partition columns first, then its ordering keys — is served by an index
+# scan, forward or backward, so the window sits directly over
+# `Index Scan [Only]` with no `Sort`; an ordering the index only starts is
+# an `Incremental Sort`. A window projection reads its arguments and its
+# window keys, so a covering index can serve it. A query that also has an
+# `ORDER BY` sorts above the window: PostgreSQL serves the lower consumer.
+# A window frame prints as written — the `BETWEEN` form only when
+# `BETWEEN` was written, an explicit frame even where it is the default
+# (which is a window clause of its own), a `RANGE` offset in the ordering
+# key's own type, and `LAG`/`LEAD` keep the default frame's text (only
+# the ranking functions print `ROWS UNBOUNDED PRECEDING`). Plans and
+# results from PostgreSQL 18.4.
+#
+# Known divergences: PostgreSQL's cost-based choices stay ours to make
+# (`enable_seqscan = off` gates the index paths — with sequential scans
+# enabled PostgreSQL still reads an index for a window's ordering, where
+# NodusDB sorts), and where more than one covering index could serve an
+# unordered window the two engines may pick differently.
+
+statement ok
+drop table if exists g1 cascade;
+
+statement ok
+create table g1 (k int primary key, v int);
+
+statement ok
+insert into g1 select i, i * 7 % 41 from generate_series(1, 40) i;
+
+statement ok
+create index g1_v on g1 (v);
+
+statement ok
+analyze g1;
+
+statement ok
+set enable_seqscan = off;
+
+query T
+explain (costs off) select row_number() over (order by v) from g1;
+----
+WindowAgg
+  Window: w1 AS (ORDER BY v ROWS UNBOUNDED PRECEDING)
+  ->  Index Only Scan using g1_v on g1
+
+query T
+explain (costs off) select row_number() over (order by v desc) from g1;
+----
+WindowAgg
+  Window: w1 AS (ORDER BY v ROWS UNBOUNDED PRECEDING)
+  ->  Index Only Scan Backward using g1_v on g1
+
+query T
+explain (costs off) select count(*) over (order by v desc) c from g1 limit 2;
+----
+Limit
+  ->  WindowAgg
+        Window: w1 AS (ORDER BY v)
+        ->  Index Only Scan Backward using g1_v on g1
+
+query T
+explain (costs off) select lag(v) over (order by v desc) from g1;
+----
+WindowAgg
+  Window: w1 AS (ORDER BY v)
+  ->  Index Only Scan Backward using g1_v on g1
+
+query T
+explain (costs off) select sum(v) over (partition by k order by v desc) from g1;
+----
+WindowAgg
+  Window: w1 AS (PARTITION BY k ORDER BY v)
+  ->  Incremental Sort
+        Sort Key: k, v DESC
+        Presorted Key: k
+        ->  Index Scan using g1_pkey on g1
+
+query T
+explain (costs off) select sum(v) over (partition by k) from g1;
+----
+WindowAgg
+  Window: w1 AS (PARTITION BY k)
+  ->  Index Scan using g1_pkey on g1
+
+query T
+explain (costs off) select sum(v) over (order by v desc) s, row_number() over (order by v desc) r from g1;
+----
+WindowAgg
+  Window: w1 AS (ORDER BY v)
+  ->  Index Only Scan Backward using g1_v on g1
+
+query T
+explain (costs off) select sum(v) over (order by v) a, count(*) over (order by v range between unbounded preceding and current row) b from g1;
+----
+WindowAgg
+  Window: w2 AS (ORDER BY v RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+  ->  WindowAgg
+        Window: w1 AS (ORDER BY v)
+        ->  Index Only Scan using g1_v on g1
+
+query T
+explain (costs off) select k, row_number() over (order by v) r from g1 order by v desc;
+----
+Sort
+  Sort Key: v DESC
+  ->  WindowAgg
+        Window: w1 AS (ORDER BY v ROWS UNBOUNDED PRECEDING)
+        ->  Index Scan using g1_v on g1
+
+query T
+explain (costs off) select sum(v) over (order by v desc) from g1 where v > 20;
+----
+WindowAgg
+  Window: w1 AS (ORDER BY v)
+  ->  Index Only Scan Backward using g1_v on g1
+        Index Cond: (v > 20)
+
+query T
+explain (costs off) select sum(v) over (order by v rows between 1 preceding and current row) from g1;
+----
+WindowAgg
+  Window: w1 AS (ORDER BY v ROWS BETWEEN '1'::bigint PRECEDING AND CURRENT ROW)
+  ->  Index Only Scan using g1_v on g1
+
+query T
+explain (costs off) select sum(v) over (order by v rows 3 preceding) from g1;
+----
+WindowAgg
+  Window: w1 AS (ORDER BY v ROWS '3'::bigint PRECEDING)
+  ->  Index Only Scan using g1_v on g1
+
+query T
+explain (costs off) select sum(v) over (order by v range 3 preceding) from g1;
+----
+WindowAgg
+  Window: w1 AS (ORDER BY v RANGE 3 PRECEDING)
+  ->  Index Only Scan using g1_v on g1
+
+query T
+explain (costs off) select sum(v) over (order by v groups 2 preceding) from g1;
+----
+WindowAgg
+  Window: w1 AS (ORDER BY v GROUPS '2'::bigint PRECEDING)
+  ->  Index Only Scan using g1_v on g1
+
+query T
+explain (costs off) select sum(v) over (order by v desc groups 2 preceding) from g1;
+----
+WindowAgg
+  Window: w1 AS (ORDER BY v GROUPS '2'::bigint PRECEDING)
+  ->  Index Only Scan Backward using g1_v on g1
+
+query T
+select v, row_number() over (order by v) r from g1 order by v limit 5;
+----
+1	1
+2	2
+3	3
+4	4
+5	5
+
+query T
+select v, row_number() over (order by v desc) r from g1 order by v desc limit 5;
+----
+40	1
+39	2
+38	3
+37	4
+36	5
+
+query T
+select v, sum(v) over (partition by k order by v) s from g1 order by v desc limit 5;
+----
+40	40
+39	39
+38	38
+37	37
+36	36
+
+query T
+select v, sum(v) over (order by v desc range 3 preceding) s from g1 order by v desc limit 5;
+----
+40	40
+39	79
+38	117
+37	154
+36	150
+
+query T
+select k, v, lag(v) over (order by v) l from g1 order by v limit 5;
+----
+6	1	NULL
+12	2	1
+18	3	2
+24	4	3
+30	5	4
+
+statement ok
+begin;
+
+statement ok
+insert into g1 values (100, 5), (101, 99);
+
+statement ok
+update g1 set v = 77 where k = 1;
+
+query T
+select v, row_number() over (order by v desc) r from g1 order by v desc limit 5;
+----
+99	1
+77	2
+40	3
+39	4
+38	5
+
+statement ok
+rollback;
+
+statement ok
+delete from g1 where k in (3, 7);
+
+query T
+select v, sum(v) over (order by v desc) s from g1 order by v desc limit 5;
+----
+40	40
+39	79
+38	117
+37	154
+36	190
+
+statement ok
+reset enable_seqscan;
+
+query T
+select v, sum(v) over (order by v) s from g1 order by v limit 4;
+----
+1	1
+2	3
+3	6
+4	10
+
