@@ -1,0 +1,108 @@
+# `EXPLAIN ANALYZE` measures every node: a scan reports the rows it read —
+# its own filter's removals as `Rows Removed by Filter` — a `Limit` stops at
+# its limit, a sort or hash reports all of its input, and every other node
+# carries the rows that reached its consumer. `BUFFERS OFF` (with
+# `SUMMARY OFF, TIMING OFF`) leaves PostgreSQL 18's plain measurements:
+# index scans add `Index Searches`, index-only scans `Heap Fetches`, sorts
+# their `Sort Method`, and a subplan nothing scanned reads
+# `(never executed)`. With buffers on, each node also reports its buffer use
+# and the planning pass gets a `Planning:` block. Plans and results from
+# PostgreSQL 18.4.
+#
+# Known divergences: a scan under a `LIMIT` reads all of its rows here, so
+# its measurement stops at the table while PostgreSQL's stops at the limit;
+# `Heap Fetches` is always 0 (every column comes from the index, where
+# PostgreSQL's counts heap visits the visibility map did not cover); buffer
+# and sort-memory numbers are approximations; and a sort PostgreSQL plans as
+# a top-N heapsort reports its whole input here.
+
+statement ok
+drop table if exists a1 cascade;
+
+statement ok
+create table a1 (k int primary key, v int);
+
+statement ok
+insert into a1 select i, i * 7 % 997 from generate_series(1, 40) i;
+
+statement ok
+create index a1_v on a1 (v);
+
+statement ok
+analyze a1;
+
+statement ok
+vacuum a1;
+
+statement ok
+drop table if exists a2 cascade;
+
+statement ok
+create table a2 (k int primary key, w int);
+
+statement ok
+insert into a2 select i, i * 3 % 89 from generate_series(1, 30) i;
+
+statement ok
+analyze a2;
+
+statement ok
+vacuum a2;
+
+statement ok
+set enable_seqscan = off;
+
+query T
+explain (analyze, costs off, summary off, timing off, buffers off) select * from a1 where v < 10;
+----
+Index Scan using a1_v on a1 (actual rows=1.00 loops=1)
+  Index Cond: (v < 10)
+  Index Searches: 1
+
+query T
+explain (analyze, costs off, summary off, timing off, buffers off) select * from a1 where v > 10 order by v desc;
+----
+Index Scan Backward using a1_v on a1 (actual rows=39.00 loops=1)
+  Index Cond: (v > 10)
+  Index Searches: 1
+
+query T
+explain (analyze, costs off, summary off, timing off, buffers off) select * from a1 order by v;
+----
+Index Scan using a1_v on a1 (actual rows=40.00 loops=1)
+  Index Searches: 1
+
+query T
+explain (analyze, costs off, summary off, timing off, buffers off) select distinct v from a1;
+----
+Unique (actual rows=40.00 loops=1)
+  ->  Index Only Scan using a1_v on a1 (actual rows=40.00 loops=1)
+        Heap Fetches: 0
+        Index Searches: 1
+
+query T
+explain (analyze, costs off, summary off, timing off, buffers off) select * from (select * from a1 where v > 20) s order by v desc;
+----
+Index Scan Backward using a1_v on a1 (actual rows=38.00 loops=1)
+  Index Cond: (v > 20)
+  Index Searches: 1
+
+query T
+explain (analyze, costs off, summary off, timing off, buffers off) select * from a1 order by v offset 38;
+----
+Limit (actual rows=2.00 loops=1)
+  ->  Index Scan using a1_v on a1 (actual rows=40.00 loops=1)
+        Index Searches: 1
+
+statement ok
+reset enable_seqscan;
+
+query T
+explain (analyze, costs off, summary off, timing off, buffers off) select * from a1 order by v offset 38;
+----
+Limit (actual rows=2.00 loops=1)
+  ->  Sort (actual rows=40.00 loops=1)
+        Sort Key: v
+        Sort Method: quicksort  Memory: 25kB
+        ->  Seq Scan on a1 (actual rows=40.00 loops=1)
+
