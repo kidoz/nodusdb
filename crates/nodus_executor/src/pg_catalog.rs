@@ -4036,6 +4036,36 @@ pub(crate) fn catalog_view_definition(view: &nodus_catalog::TableDescriptor) -> 
     crate::explain::deparse_query(&plan).map(|sql| format!("{sql};"))
 }
 
+/// A built-in function's `pg_proc` entry, as resolving one needs it.
+pub(crate) struct BuiltinFunction {
+    pub name: &'static str,
+    /// `prokind`: `f` a function, `a` an aggregate, `w` a window function.
+    pub kind: &'static str,
+    /// `proargtypes`, the argument types' OIDs.
+    pub arg_types: Vec<i64>,
+}
+
+/// The built-in functions of `pg_proc.tsv`, in its order.
+pub(crate) fn builtin_functions() -> Vec<BuiltinFunction> {
+    include_str!("pg_proc.tsv")
+        .lines()
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split('\t').collect();
+            let [_, name, kind, _, _, arg_types, ..] = fields[..] else {
+                return None;
+            };
+            Some(BuiltinFunction {
+                name,
+                kind,
+                arg_types: arg_types
+                    .split_whitespace()
+                    .filter_map(|t| t.parse().ok())
+                    .collect(),
+            })
+        })
+        .collect()
+}
+
 /// The OID of a text search configuration name (`english`,
 /// `pg_catalog.simple`, ...): the two configurations NodusDB ships, with
 /// PostgreSQL's OIDs for them.

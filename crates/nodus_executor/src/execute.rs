@@ -361,6 +361,14 @@ impl MemExecutor {
             LogicalPlan::RenameIndex { name, new_name } => {
                 self.exec_rename_index(ctx, &name, &new_name)
             }
+            LogicalPlan::CommentFunction {
+                kind,
+                name,
+                arg_types,
+                comment,
+            } => {
+                self.exec_comment_function(ctx, &kind, &name, arg_types.as_deref(), comment.clone())
+            }
             LogicalPlan::CreateRole { name, attributes } => {
                 self.exec_create_role(ctx, name, attributes.clone())
             }

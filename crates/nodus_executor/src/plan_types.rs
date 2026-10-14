@@ -1875,6 +1875,16 @@ pub enum LogicalPlan {
     Noop {
         tag: String,
     },
+    /// `COMMENT ON {FUNCTION | PROCEDURE | ROUTINE | AGGREGATE}`: the
+    /// function is resolved (a missing one is an error, as PostgreSQL's is);
+    /// `arg_types` is `None` when the statement leaves the signature out.
+    CommentFunction {
+        kind: String,
+        name: String,
+        #[serde(default)]
+        arg_types: Option<String>,
+        comment: Option<String>,
+    },
     /// `DISCARD ALL | PLANS | SEQUENCES | TEMP`.
     Discard {
         what: String,

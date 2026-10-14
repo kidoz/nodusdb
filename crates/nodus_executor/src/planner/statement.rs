@@ -907,6 +907,33 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                 _ => anyhow::bail!("malformed maintenance statement"),
             }
         }
+        // `COMMENT ON FUNCTION` and its siblings, whose signature the parser
+        // cannot take.
+        Statement::Query(query) if rewritten_call(query, nodus_sql::COMMENT_FUNCTION).is_some() => {
+            let args = rewritten_call(query, nodus_sql::COMMENT_FUNCTION)
+                .expect("guarded by the match arm");
+            let [
+                crate::Value::Text(kind),
+                crate::Value::Text(name),
+                crate::Value::Bool(has_args),
+                crate::Value::Text(arg_types),
+                comment,
+            ] = args.as_slice()
+            else {
+                anyhow::bail!("malformed COMMENT ON FUNCTION");
+            };
+            let comment = match comment {
+                crate::Value::Null => None,
+                crate::Value::Text(text) => Some(text.clone()),
+                _ => anyhow::bail!("malformed COMMENT ON FUNCTION"),
+            };
+            Ok(LogicalPlan::CommentFunction {
+                kind: kind.clone(),
+                name: name.clone(),
+                arg_types: has_args.then(|| arg_types.clone()),
+                comment,
+            })
+        }
         Statement::Query(query)
             if rewritten_call(query, nodus_sql::ALTER_SEQUENCE_FUNCTION).is_some() =>
         {

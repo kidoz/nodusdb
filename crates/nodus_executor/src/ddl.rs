@@ -917,6 +917,101 @@ impl MemExecutor {
         Ok(QueryOutput::tag("COMMENT"))
     }
 
+    /// `COMMENT ON {FUNCTION | PROCEDURE | ROUTINE | AGGREGATE}`: the
+    /// function's signature must find one — PostgreSQL's errors when it does
+    /// not — though the comment itself is not stored: there are no
+    /// user-defined functions to comment, and the built-ins keep
+    /// PostgreSQL's own.
+    pub(crate) fn exec_comment_function(
+        &self,
+        _ctx: &ExecutionContext,
+        kind: &str,
+        name: &str,
+        arg_types: Option<&str>,
+        _comment: Option<String>,
+    ) -> Result<QueryOutput> {
+        let parts: Vec<&str> = name.split('.').map(|p| p.trim_matches('"')).collect();
+        let (schema, function) = match parts.as_slice() {
+            [function] => (None, *function),
+            [schema, function] => (Some(*schema), *function),
+            [_, schema, function] => (Some(*schema), *function),
+            _ => anyhow::bail!("improper qualified name (too many dotted names): {name}"),
+        };
+        if let Some(schema) = schema
+            && !Self::is_virtual_schema(schema)
+        {
+            self.schema_id(schema)?;
+        }
+        let matches_kind = |prokind: &str| match kind {
+            "AGGREGATE" => prokind == "a",
+            "PROCEDURE" => prokind == "p",
+            // PostgreSQL's function lookup takes aggregates and window
+            // functions too.
+            "FUNCTION" => matches!(prokind, "f" | "a" | "w"),
+            _ => true,
+        };
+        let functions = crate::pg_catalog::builtin_functions();
+        let candidates: Vec<&crate::pg_catalog::BuiltinFunction> = functions
+            .iter()
+            .filter(|f| f.name == function && matches_kind(f.kind))
+            .collect();
+        // Without a signature the name alone must find one function.
+        let Some(arg_types) = arg_types else {
+            return match candidates.as_slice() {
+                [] => Err(
+                    DbError::new(format!("could not find a function named \"{function}\""))
+                        .code("42883")
+                        .into(),
+                ),
+                [_] => Ok(QueryOutput::tag("COMMENT")),
+                _ => Err(
+                    DbError::new(format!("function name \"{function}\" is not unique"))
+                        .code("42725")
+                        .into(),
+                ),
+            };
+        };
+        let args = function_arg_types(arg_types);
+        // An aggregate's signature takes at least one argument type.
+        if kind == "AGGREGATE" && args.is_empty() {
+            anyhow::bail!("syntax error at or near \")\"");
+        }
+        let oids: Vec<i64> = args.iter().map(|t| Self::pg_type_oid(t)).collect();
+        if candidates.iter().any(|f| f.arg_types == oids) {
+            return Ok(QueryOutput::tag("COMMENT"));
+        }
+        let types = oids
+            .iter()
+            .map(|oid| crate::functions::format_type_name(*oid))
+            .collect::<Vec<_>>()
+            .join(", ");
+        // A signature PostgreSQL has, under another kind, says so.
+        if functions
+            .iter()
+            .any(|f| f.name == function && f.arg_types == oids)
+        {
+            return Err(match kind {
+                "PROCEDURE" => DbError::new(format!("{function}({types}) is not a procedure")),
+                "AGGREGATE" => {
+                    DbError::new(format!("function {function}({types}) is not an aggregate"))
+                }
+                _ => DbError::new(format!("function {function}({types}) does not exist")),
+            }
+            .code("42809")
+            .into());
+        }
+        let noun = match kind {
+            "AGGREGATE" => "aggregate",
+            "PROCEDURE" => "procedure",
+            _ => "function",
+        };
+        Err(
+            DbError::new(format!("{noun} {function}({types}) does not exist"))
+                .code("42883")
+                .into(),
+        )
+    }
+
     /// The id of schema `name`, or PostgreSQL's error for a missing one.
     fn schema_id(&self, name: &str) -> Result<nodus_catalog::SchemaId> {
         self.catalog_reader
@@ -1742,6 +1837,34 @@ fn name_check_constraints(
 /// A relation name without its schema.
 fn table_name_of(name: &str) -> &str {
     name.rsplit('.').next().unwrap_or(name).trim_matches('"')
+}
+
+/// The argument types of a `COMMENT ON FUNCTION` signature: its top-level
+/// comma-separated parts (`numeric(10,2)` is one, its own comma nested).
+fn function_arg_types(args: &str) -> Vec<String> {
+    let mut types = Vec::new();
+    let mut depth = 0usize;
+    let mut current = String::new();
+    for c in args.chars() {
+        match c {
+            '(' => {
+                depth += 1;
+                current.push(c);
+            }
+            ')' => {
+                depth = depth.saturating_sub(1);
+                current.push(c);
+            }
+            ',' if depth == 0 => types.push(std::mem::take(&mut current)),
+            _ => current.push(c),
+        }
+    }
+    types.push(current);
+    types
+        .iter()
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .collect()
 }
 
 /// The name PostgreSQL gives an unnamed CHECK constraint `expr` of `table`:

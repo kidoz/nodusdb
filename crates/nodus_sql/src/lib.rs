@@ -3277,6 +3277,11 @@ pub const ALTER_SEQUENCE_FUNCTION: &str = "pg_catalog.nodus_alter_sequence";
 /// `PREPARE TRANSACTION`.
 pub const UTILITY_FUNCTION: &str = "pg_catalog.nodus_utility";
 
+/// The function call `COMMENT ON FUNCTION` and its siblings are written as —
+/// `pg_catalog.nodus_comment_function('FUNCTION', 'now', true, '', 'text')` —
+/// since their signature's parentheses are no object name.
+pub const COMMENT_FUNCTION: &str = "pg_catalog.nodus_comment_function";
+
 /// The function call `FETCH` and `MOVE` are written as — `SELECT
 /// pg_catalog.nodus_cursor('FETCH', 'relative -2', 'c')`, with the
 /// direction's words — since the parser takes them only in part.
@@ -4142,6 +4147,77 @@ fn rewrite_data_clause(
         };
     }
 
+    // `COMMENT ON {FUNCTION | PROCEDURE | ROUTINE | AGGREGATE}`: the
+    // signature's parentheses are no object name, so the statement becomes a
+    // call carrying the name, the argument types, and the comment.
+    if is(0, "comment") && is(1, "on") {
+        let kind = match words.get(2).and_then(|w| w.as_deref()) {
+            Some("function") => Some("FUNCTION"),
+            Some("procedure") => Some("PROCEDURE"),
+            Some("routine") => Some("ROUTINE"),
+            Some("aggregate") => Some("AGGREGATE"),
+            _ => None,
+        };
+        if let Some(kind) = kind {
+            if n < 4 {
+                return statement;
+            }
+            // The name: words joined by periods, as `ALTER SEQUENCE`'s is.
+            let mut name_end = 4;
+            while name_end + 1 < n
+                && statement
+                    .get(significant[name_end])
+                    .is_some_and(|t| t.token == Token::Period)
+            {
+                name_end += 2;
+            }
+            let name = render_tokens(&statement[significant[3]..=significant[name_end - 1]]);
+            // Its argument types, when it has a parenthesized signature.
+            let mut at = name_end;
+            let mut args = String::new();
+            let mut has_args = false;
+            if statement
+                .get(*significant.get(at).unwrap_or(&0))
+                .is_some_and(|t| t.token == Token::LParen)
+            {
+                let open = significant[at];
+                let mut depth = 0i32;
+                let close = (open..statement.len()).find(|&i| {
+                    match statement[i].token {
+                        Token::LParen => depth += 1,
+                        Token::RParen => depth -= 1,
+                        _ => {}
+                    }
+                    depth == 0
+                });
+                let Some(close) = close else {
+                    return statement;
+                };
+                args = render_tokens(&statement[open + 1..close]);
+                has_args = true;
+                at = significant.partition_point(|&i| i <= close);
+            }
+            // `IS` and the comment after it: a string, or `NULL`.
+            if !is(at, "is") || at + 1 > n - 1 {
+                return statement;
+            }
+            let comment = render_tokens(&statement[significant[at + 1]..=significant[n - 1]]);
+            if !comment.eq_ignore_ascii_case("null") && !comment.starts_with('\'') {
+                return statement;
+            }
+            let sql = format!(
+                "SELECT {COMMENT_FUNCTION}('{kind}', '{}', {has_args}, '{}', {comment})",
+                name.replace('\'', "''"),
+                args.replace('\'', "''")
+            );
+            if let Some(mut tokens) = snippet_tokens(&sql) {
+                tokens.extend(tail);
+                return tokens;
+            }
+            return statement;
+        }
+    }
+
     // Maintenance statements, by their command tag.
     let utility = if is(0, "checkpoint") {
         Some("CHECKPOINT")
@@ -4545,6 +4621,14 @@ mod tests {
         assert_eq!(
             one("REINDEX TABLE t"),
             format!("SELECT {UTILITY_FUNCTION}('REINDEX')")
+        );
+        assert_eq!(
+            one("COMMENT ON FUNCTION f(int) IS 'x'"),
+            format!("SELECT {COMMENT_FUNCTION}('FUNCTION', 'f', true, 'int', 'x')")
+        );
+        assert_eq!(
+            one("COMMENT ON FUNCTION now() IS NULL"),
+            format!("SELECT {COMMENT_FUNCTION}('FUNCTION', 'now', true, '', NULL)")
         );
         assert_eq!(
             one("SELECT a FROM t FOR NO KEY UPDATE"),
