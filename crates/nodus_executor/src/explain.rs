@@ -482,6 +482,7 @@ impl MemExecutor {
                 sort,
                 group_exprs,
                 distinct_on,
+                grouping_sets,
                 sample,
                 only,
                 ..
@@ -682,7 +683,6 @@ impl MemExecutor {
                 let allow_index_only = single
                     && group_by.is_empty()
                     && distinct_on.is_empty()
-                    && !*distinct
                     && having.is_none()
                     && sample.is_none();
                 // A side's own conditions go on its scan, as PostgreSQL
@@ -1181,6 +1181,37 @@ impl MemExecutor {
                     let column = tbl.columns.iter().find(|c| c.id == key.column_id)?;
                     Some((column.name.clone(), !backwards))
                 };
+                // The columns an index scan leads with, in the index's own
+                // order: a `Unique`-style dedup needs them all.
+                let index_key_columns = |node: &Node| -> Option<Vec<String>> {
+                    if node.kind != "Index Scan" && node.kind != "Index Only Scan" {
+                        return None;
+                    }
+                    let name = node
+                        .props
+                        .iter()
+                        .find(|(name, _)| *name == "Index Name")
+                        .and_then(|(_, value)| value.as_str())?;
+                    let relation = node
+                        .props
+                        .iter()
+                        .find(|(name, _)| *name == "Relation Name")
+                        .and_then(|(_, value)| value.as_str())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| table_name.to_string());
+                    let (db, schema, table) = parse_object_name(&relation).ok()?;
+                    let tbl = self.catalog_reader.get_table(db, schema, table).ok()?;
+                    let idx = tbl.indexes.iter().find(|i| i.name == name)?;
+                    let mut columns = Vec::new();
+                    for key in &idx.key_columns {
+                        if crate::index_keys::is_expression_key(key) {
+                            return None;
+                        }
+                        let column = tbl.columns.iter().find(|c| c.id == key.column_id)?;
+                        columns.push(column.name.clone());
+                    }
+                    Some(columns)
+                };
                 let aggregated = !group_by.is_empty()
                     || having.is_some()
                     || projection.iter().any(|p| match p {
@@ -1364,7 +1395,46 @@ impl MemExecutor {
                 {
                     node = Node::over("WindowAgg", "WindowAgg", vec![node]);
                 }
-                if *distinct {
+                // `DISTINCT` over a projection that is all columns dedups
+                // the stream an index orders (`Unique`) instead of hashing,
+                // as PostgreSQL plans it — the scan in the columns' order,
+                // the query's `ORDER BY` extended to the whole distinct
+                // list (only such an order leaves equal rows adjacent).
+                let distinct_columns: Option<Vec<String>> = if *distinct
+                    && group_by.is_empty()
+                    && having.is_none()
+                    && grouping_sets.is_none()
+                {
+                    projection
+                        .iter()
+                        .map(|item| match item {
+                            ProjectionItem::Column(c) | ProjectionItem::AliasedColumn(c, _) => {
+                                Some(c.rsplit('.').next().unwrap_or(c).to_string())
+                            }
+                            _ => None,
+                        })
+                        .collect::<Option<Vec<String>>>()
+                } else {
+                    None
+                };
+                let ordered = !sort.is_empty();
+                let unique_distinct = distinct_columns.as_ref().is_some_and(|columns| {
+                    if ordered {
+                        // The sort groups the whole distinct list either way;
+                        // PostgreSQL hashes when the scan is not an index.
+                        index_ordered(&node).is_some()
+                    } else {
+                        // Without `ORDER BY` only a free dedup: the index
+                        // must lead with exactly the distinct columns.
+                        index_key_columns(&node).is_some_and(|keys| {
+                            keys.len() >= columns.len()
+                                && columns
+                                    .iter()
+                                    .all(|column| keys[..columns.len()].contains(column))
+                        })
+                    }
+                });
+                if *distinct && !unique_distinct {
                     let keys: Vec<String> = projection
                         .iter()
                         .map(|p| match p {
@@ -1379,6 +1449,31 @@ impl MemExecutor {
                         .prop("Strategy", json!("Hashed"))
                         .prop("Partial Mode", json!("Simple"))
                         .keys("Group Key", keys);
+                }
+                // The dedup order is the whole distinct list: PostgreSQL
+                // appends the columns the `ORDER BY` omits.
+                let mut sort = sort;
+                if let (Some(columns), true) = (&distinct_columns, ordered) {
+                    for name in columns {
+                        let present = sort.iter().any(|key| match &key.target {
+                            SortTarget::Name(n) => n.rsplit('.').next() == Some(name.as_str()),
+                            SortTarget::Output(i) => matches!(
+                                projection.get(*i),
+                                Some(ProjectionItem::Column(c))
+                                    | Some(ProjectionItem::AliasedColumn(c, _))
+                                    if c.rsplit('.').next() == Some(name.as_str())
+                            ),
+                            _ => false,
+                        });
+                        if !present {
+                            sort.push(SortKey {
+                                target: SortTarget::Name(name.clone()),
+                                ascending: true,
+                                nulls_first: None,
+                                with_ties: false,
+                            });
+                        }
+                    }
                 }
                 let keys: Vec<String> = sort
                     .iter()
@@ -1426,6 +1521,11 @@ impl MemExecutor {
                         sorted
                     };
                     node = sorted;
+                }
+                // The stream the sort leaves is grouped by the distinct
+                // columns, so adjacent duplicates collapse.
+                if unique_distinct {
+                    node = Node::over("Unique", "Unique", vec![node]);
                 }
                 if !distinct_on.is_empty() {
                     node = Node::over("Unique", "Unique", vec![node]);

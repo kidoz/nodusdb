@@ -506,11 +506,11 @@ impl MemExecutor {
                 });
                 // A query whose columns the index covers reads them from the
                 // index alone; a simple shape keeps that safe (nothing later
-                // reads an uncovered column).
+                // reads an uncovered column). `DISTINCT` reads exactly its
+                // projection, so a covering index serves it too.
                 let index_only = if joins.is_empty()
                     && group_by.is_empty()
                     && distinct_on.is_empty()
-                    && !distinct
                     && having.is_none()
                     && grouping_sets.is_none()
                 {
