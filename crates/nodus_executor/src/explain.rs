@@ -298,7 +298,9 @@ impl Node {
         }
         map.insert("Disabled".into(), J::Bool(false));
         // Join nodes name their inner side's uniqueness, as PostgreSQL does.
-        if self.props.iter().any(|(name, _)| *name == "Join Type") {
+        if self.props.iter().any(|(name, _)| *name == "Join Type")
+            && !self.props.iter().any(|(name, _)| *name == "Inner Unique")
+        {
             map.insert("Inner Unique".into(), J::Bool(false));
         }
         for (name, _, value) in &self.details {
@@ -540,6 +542,71 @@ impl MemExecutor {
 
     /// The plan node for `plan`; `ctes` are the relations its enclosing
     /// queries bind by name.
+    /// Whether a semi join's inner relation is unique on the columns its
+    /// hash pairs read: a unique index covers them all, as the `Inner
+    /// Unique` witness plan requires.
+    fn inner_unique_on_keys(
+        &self,
+        inner: &LogicalPlan,
+        pairs: &[(crate::joins::HashKey, crate::joins::HashKey)],
+    ) -> bool {
+        let LogicalPlan::Select {
+            table_name, joins, ..
+        } = inner
+        else {
+            return false;
+        };
+        if !joins.is_empty() {
+            return false;
+        }
+        let mut columns: Vec<String> = Vec::new();
+        for (_, right) in pairs {
+            let crate::joins::HashKey::Column(name) = right else {
+                return false;
+            };
+            columns.push(name.rsplit('.').next().unwrap_or(name).to_string());
+        }
+        let Some((db, schema, name)) = parse_object_name(table_name).ok() else {
+            return false;
+        };
+        let Ok(tbl) = self.catalog_reader.get_table(db, schema, name) else {
+            return false;
+        };
+        // A primary key's columns come as one descriptor each: merge them
+        // by name before testing uniqueness.
+        let mut merged: Vec<(String, bool, Vec<String>)> = Vec::new();
+        for index in &tbl.indexes {
+            let mut usable = !index.key_columns.is_empty();
+            let key_names: Vec<String> = index
+                .key_columns
+                .iter()
+                .filter_map(|key| {
+                    if crate::index_keys::is_expression_key(key) {
+                        usable = false;
+                        return None;
+                    }
+                    match tbl.columns.iter().find(|column| column.id == key.column_id) {
+                        Some(column) => Some(column.name.clone()),
+                        None => {
+                            usable = false;
+                            None
+                        }
+                    }
+                })
+                .collect();
+            match merged.iter_mut().find(|(name, _, _)| *name == index.name) {
+                Some((_, unique, keys)) => {
+                    *unique &= index.unique && usable;
+                    keys.extend(key_names);
+                }
+                None => merged.push((index.name.clone(), index.unique && usable, key_names)),
+            }
+        }
+        merged
+            .iter()
+            .any(|(_, unique, keys)| *unique && keys.iter().all(|key| columns.contains(key)))
+    }
+
     /// Whether any relation under `node` was scanned during the execution.
     fn subtree_scanned(&self, node: &Node) -> bool {
         if node.props.iter().any(|(name, value)| {
@@ -1242,11 +1309,21 @@ impl MemExecutor {
                         && crate::session_env::setting("enable_material").as_deref() != Some("off")
                         && hash.is_none()
                         && !matches!(second.kind.as_str(), "Index Scan" | "Index Only Scan");
+                    // An inner unique on the join keys matches at most one
+                    // row, so the semi join is a plain inner join —
+                    // PostgreSQL's `Inner Unique` witness plan.
+                    let witness = matches!(join.join_type, JoinType::Semi)
+                        && hash.as_ref().is_some_and(|hash| {
+                            join.semi_subquery.as_ref().is_some_and(|inner| {
+                                self.inner_unique_on_keys(inner, &hash.hash_pairs)
+                            })
+                        });
                     let (label_kind, label) = match (&hash, &join.join_type) {
                         (Some(_), JoinType::LeftOuter | JoinType::RightOuter) => {
                             ("Left", "Hash Left Join".to_string())
                         }
                         (Some(_), JoinType::FullOuter) => ("Full", "Hash Full Join".to_string()),
+                        (Some(_), JoinType::Semi) if witness => ("Inner", "Hash Join".to_string()),
                         (Some(_), JoinType::Semi) => ("Semi", "Hash Semi Join".to_string()),
                         (Some(_), JoinType::Anti) => ("Anti", "Hash Anti Join".to_string()),
                         (Some(_), _) => ("Inner", "Hash Join".to_string()),
@@ -1263,6 +1340,11 @@ impl MemExecutor {
                         width,
                     )
                     .prop("Join Type", json!(label_kind));
+                    joined = if witness {
+                        joined.prop("Inner Unique", json!(true))
+                    } else {
+                        joined
+                    };
                     joined.total = total + rows * CPU_TUPLE;
                     // A nested loop chosen with the method disabled says so.
                     if hash.is_none()
@@ -2326,7 +2408,15 @@ impl MemExecutor {
             let sub_hash =
                 crate::joins::hash_plan(join.condition.as_ref(), &left_refs, &right_refs);
             let anti = matches!(join.join_type, crate::JoinType::Anti);
+            // An inner unique on the join keys matches at most one row, so
+            // the semi join is a plain inner join — PostgreSQL's `Inner
+            // Unique` witness plan.
+            let witness = !anti
+                && sub_hash
+                    .as_ref()
+                    .is_some_and(|hash| self.inner_unique_on_keys(plan, &hash.hash_pairs));
             let (kind, label) = match (&sub_hash, anti) {
+                (Some(_), false) if witness => ("Inner", "Hash Join"),
                 (Some(_), false) => ("Semi", "Hash Semi Join"),
                 (Some(_), true) => ("Anti", "Hash Anti Join"),
                 (None, false) => ("Semi", "Nested Loop Semi Join"),
@@ -2368,6 +2458,9 @@ impl MemExecutor {
                 vec![node],
             )
             .prop("Join Type", json!(kind));
+            if witness {
+                joined = joined.prop("Inner Unique", json!(true));
+            }
             joined.width = width;
             joined.rows = rows;
             if let Some(condition) = condition {
