@@ -2423,6 +2423,7 @@ fn lower_window(
             units: WindowFrameUnits::Range,
             start: FrameBound::UnboundedPreceding,
             end: FrameBound::CurrentRow,
+            between: false,
             exclude,
         }),
         Some(frame) => {
@@ -2479,6 +2480,8 @@ fn lower_window(
                 units,
                 start,
                 end,
+                // The short form writes a start bound alone.
+                between: frame.end_bound.is_some(),
                 exclude,
             })
         }

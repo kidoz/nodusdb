@@ -635,6 +635,7 @@ mod tests {
                 units,
                 start,
                 end,
+                between: true,
                 exclude,
             })
         };

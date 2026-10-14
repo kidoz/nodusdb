@@ -771,6 +771,12 @@ pub struct FrameSpec {
     pub units: WindowFrameUnits,
     pub start: FrameBound,
     pub end: FrameBound,
+    /// Whether the frame was written with `BETWEEN`; a start bound alone is
+    /// PostgreSQL's short form, and its plan text keeps them apart
+    /// (`ROWS 3 PRECEDING` against `ROWS BETWEEN 3 PRECEDING AND CURRENT
+    /// ROW`).
+    #[serde(default)]
+    pub between: bool,
     #[serde(default)]
     pub exclude: FrameExclude,
 }
@@ -831,6 +837,7 @@ impl WindowCall {
             units: fr.units.clone(),
             start: bound(&fr.start),
             end: bound(&fr.end),
+            between: fr.between,
             exclude: fr.exclude,
         });
         WindowCall {

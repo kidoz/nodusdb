@@ -2756,39 +2756,29 @@ fn window_calls<'a>(expr: &'a ScalarExpr, out: &mut Vec<&'a WindowCall>) {
 
 /// Whether a window function ignores its frame: a clause with only such
 /// calls prints `ROWS UNBOUNDED PRECEDING`, as PostgreSQL rewrites it.
+/// `LAG`/`LEAD` read individual rows and keep the default frame's text.
 fn frame_blind(func: &str) -> bool {
     matches!(
         func,
-        "ROW_NUMBER"
-            | "RANK"
-            | "DENSE_RANK"
-            | "PERCENT_RANK"
-            | "CUME_DIST"
-            | "NTILE"
-            | "LAG"
-            | "LEAD"
+        "ROW_NUMBER" | "RANK" | "DENSE_RANK" | "PERCENT_RANK" | "CUME_DIST" | "NTILE"
     )
 }
 
-/// A frame's bounds as written, in PostgreSQL's words — `None` for the
-/// default (`RANGE UNBOUNDED PRECEDING`).
+/// A frame's bounds as written, in PostgreSQL's words: the short form
+/// (`ROWS 3 PRECEDING`) when the clause wrote a start bound alone, the
+/// `BETWEEN` form otherwise — even where the bounds are the default's.
 fn frame_bounds_text(frame: &FrameSpec) -> String {
-    if frame.units == WindowFrameUnits::Range
-        && frame.start == FrameBound::UnboundedPreceding
-        && frame.end == FrameBound::CurrentRow
-        && frame.exclude == FrameExclude::NoOthers
-    {
-        return String::new();
-    }
     let units = match frame.units {
         WindowFrameUnits::Rows => "ROWS",
         WindowFrameUnits::Range => "RANGE",
         WindowFrameUnits::Groups => "GROUPS",
     };
-    let offset = |e: &ScalarExpr| match e {
-        // PostgreSQL types a frame's row offset as a bigint constant.
-        ScalarExpr::Literal(Value::Int(n)) => format!("'{n}'::bigint"),
-        other => deparse_scalar(other, false),
+    let offset = |e: &ScalarExpr| match (&frame.units, e) {
+        // PostgreSQL types a `ROWS`/`GROUPS` offset as a bigint constant; a
+        // `RANGE` offset keeps the ordering key's own type.
+        (WindowFrameUnits::Range, other) => deparse_scalar(other, false),
+        (_, ScalarExpr::Literal(Value::Int(n))) => format!("'{n}'::bigint"),
+        (_, other) => deparse_scalar(other, false),
     };
     let bound = |b: &FrameBound| -> String {
         match b {
@@ -2799,16 +2789,15 @@ fn frame_bounds_text(frame: &FrameSpec) -> String {
             FrameBound::UnboundedFollowing => "UNBOUNDED FOLLOWING".to_string(),
         }
     };
-    let mut text =
-        if frame.start == FrameBound::UnboundedPreceding && frame.end == FrameBound::CurrentRow {
-            format!("{units} UNBOUNDED PRECEDING")
-        } else {
-            format!(
-                "{units} BETWEEN {} AND {}",
-                bound(&frame.start),
-                bound(&frame.end)
-            )
-        };
+    let mut text = if frame.between {
+        format!(
+            "{units} BETWEEN {} AND {}",
+            bound(&frame.start),
+            bound(&frame.end)
+        )
+    } else {
+        format!("{units} {}", bound(&frame.start))
+    };
     text.push_str(match frame.exclude {
         FrameExclude::NoOthers => "",
         FrameExclude::CurrentRow => " EXCLUDE CURRENT ROW",
