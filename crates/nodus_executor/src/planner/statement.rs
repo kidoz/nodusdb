@@ -1299,6 +1299,7 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                 O::Schema => "SCHEMA",
                 O::Type => "TYPE",
                 O::Domain => "DOMAIN",
+                O::Index => "INDEX",
                 other => anyhow::bail!("COMMENT ON {other} is not supported"),
             };
             let mut parts: Vec<String> = object_name.0.iter().map(|p| p.to_string()).collect();

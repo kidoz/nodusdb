@@ -44,7 +44,7 @@ fn check_schema_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn missing_schema(name: &str) -> anyhow::Error {
+pub(crate) fn missing_schema(name: &str) -> anyhow::Error {
     DbError::new(format!("schema \"{name}\" does not exist"))
         .code("3F000")
         .into()

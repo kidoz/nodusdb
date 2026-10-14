@@ -3682,8 +3682,8 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
         // Connections are not described to the executor; PostgreSQL reports
         // NULL the same way for a Unix-socket connection.
         "INET_SERVER_ADDR" | "INET_CLIENT_ADDR" | "INET_CLIENT_PORT" if arity(0) => Value::Null,
-        // NodusDB has no COMMENT ON, so no object has a description.
-        // Only relations and their columns take comments.
+        // Only relations (and their columns) and indexes carry comments;
+        // the schemas and types catalog holds its own.
         "OBJ_DESCRIPTION" if arity(1) || arity(2) => {
             if arity(2) && text(arg(1)) != "pg_class" {
                 return Some(
@@ -3692,7 +3692,12 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
                 );
             }
             catalog_text(|catalog| {
-                crate::MemExecutor::relation_by_oid(catalog, int(arg(0))?)?.comment
+                let oid = int(arg(0))?;
+                if let Some(relation) = crate::MemExecutor::relation_by_oid(catalog, oid) {
+                    return relation.comment;
+                }
+                crate::MemExecutor::index_by_oid(catalog, oid)
+                    .and_then(|(_, index)| index.comment)
             })
         }
         // Column 0 is the relation itself.

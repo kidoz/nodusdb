@@ -271,6 +271,9 @@ pub struct IndexDescriptor {
     pub global: bool,
     pub predicate: Option<Expression>,
     pub expressions: Vec<Expression>,
+    /// The index's `COMMENT ON INDEX` text.
+    #[serde(default)]
+    pub comment: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

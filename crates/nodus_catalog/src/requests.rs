@@ -120,6 +120,13 @@ pub enum TableDescriptorChange {
         column: Option<String>,
         comment: Option<String>,
     },
+    /// `COMMENT ON INDEX`: sets the comment on the table's index
+    /// `index_name`; `None` removes it.
+    SetIndexComment {
+        table_id: TableId,
+        index_name: String,
+        comment: Option<String>,
+    },
     /// Replaces the column with the same id (its default, nullability).
     ReplaceColumn {
         table_id: TableId,

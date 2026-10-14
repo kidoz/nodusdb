@@ -928,6 +928,23 @@ impl MemExecutor {
                             ]);
                         }
                     }
+                    // An index comment is a comment on the index's own
+                    // `pg_class` entry.
+                    for index in &table.indexes {
+                        if let Some(comment) = &index.comment {
+                            rows.push(vec![
+                                Value::Int(Self::index_oid(
+                                    db_name,
+                                    &schema_name,
+                                    &table.name,
+                                    &index.name,
+                                )),
+                                Value::Int(1259),
+                                Value::Int(0),
+                                Value::Text(comment.clone()),
+                            ]);
+                        }
+                    }
                 }
                 rows.extend(crate::schemas::schema_and_type_descriptions(
                     self.types_catalog.as_ref(),

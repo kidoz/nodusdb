@@ -370,6 +370,7 @@ impl MemExecutor {
                 global: false,
                 predicate: None,
                 expressions: vec![],
+                comment: None,
             };
             self.catalog_writer.update_table_descriptor(
                 nodus_catalog::TableDescriptorChange::AddIndex {
@@ -416,6 +417,7 @@ impl MemExecutor {
                 global: false,
                 predicate: None,
                 expressions: vec![],
+                comment: None,
             };
             self.catalog_writer.update_table_descriptor(
                 nodus_catalog::TableDescriptorChange::AddIndex {
@@ -542,6 +544,7 @@ impl MemExecutor {
                 global: index.global,
                 predicate: index.predicate.clone(),
                 expressions: index.expressions.clone(),
+                comment: index.comment.clone(),
             };
             self.catalog_writer.update_table_descriptor(
                 nodus_catalog::TableDescriptorChange::AddIndex {
@@ -825,6 +828,7 @@ impl MemExecutor {
         match kind {
             "SCHEMA" => return self.exec_comment_schema(ctx, relation, comment),
             "TYPE" | "DOMAIN" => return self.exec_comment_type(ctx, kind, relation, comment),
+            "INDEX" => return self.exec_comment_index(ctx, relation, comment),
             _ => {}
         }
         let (db_name, schema_name, table_only) = parse_object_name(relation)?;
@@ -859,6 +863,66 @@ impl MemExecutor {
             },
         )?;
         Ok(QueryOutput::tag("COMMENT"))
+    }
+
+    /// `COMMENT ON INDEX`: sets or removes the comment on an index, which
+    /// `pg_description` reports as a comment on the index's `pg_class` entry.
+    pub(crate) fn exec_comment_index(
+        &self,
+        ctx: &ExecutionContext,
+        name: &str,
+        comment: Option<String>,
+    ) -> Result<QueryOutput> {
+        let parts: Vec<String> = name
+            .split('.')
+            .map(|part| part.trim_matches('"').to_string())
+            .collect();
+        let (schema, index_name) = match parts.as_slice() {
+            [index] => (None, index.clone()),
+            [schema, index] => (Some(schema.clone()), index.clone()),
+            [_, schema, index] => (Some(schema.clone()), index.clone()),
+            _ => anyhow::bail!("improper qualified name (too many dotted names): {name}"),
+        };
+        // The name as PostgreSQL prints it back: its words, dot-joined.
+        let written = parts.join(".");
+        // A schema-qualified name must name a schema that exists.
+        let schema_id = match &schema {
+            Some(schema) if !Self::is_virtual_schema(schema) => Some(self.schema_id(schema)?),
+            _ => None,
+        };
+        let tables = self.catalog_reader.list_all_tables("default")?;
+        let in_schema =
+            |tbl: &nodus_catalog::TableDescriptor| schema_id.is_none_or(|id| tbl.schema_id == id);
+        let holder = tables
+            .iter()
+            .find(|tbl| in_schema(tbl) && tbl.indexes.iter().any(|i| i.name == index_name));
+        let Some(tbl) = holder else {
+            // A relation of that name that is no index gets its own error.
+            if tables
+                .iter()
+                .any(|tbl| in_schema(tbl) && tbl.name == index_name)
+            {
+                anyhow::bail!("\"{index_name}\" is not an index");
+            }
+            anyhow::bail!("relation \"{written}\" does not exist");
+        };
+        self.authorize(ctx, Action::CreateTable, ResourceRef::Table(tbl.id))?;
+        self.catalog_writer.update_table_descriptor(
+            nodus_catalog::TableDescriptorChange::SetIndexComment {
+                table_id: tbl.id,
+                index_name,
+                comment: comment.filter(|c| !c.is_empty()),
+            },
+        )?;
+        Ok(QueryOutput::tag("COMMENT"))
+    }
+
+    /// The id of schema `name`, or PostgreSQL's error for a missing one.
+    fn schema_id(&self, name: &str) -> Result<nodus_catalog::SchemaId> {
+        self.catalog_reader
+            .get_schema("default", name)
+            .map(|schema| schema.id)
+            .map_err(|_| crate::schemas::missing_schema(name))
     }
 
     pub(crate) fn exec_refresh_materialized_view(
@@ -1393,6 +1457,7 @@ impl MemExecutor {
             global: false,
             predicate: predicate.map(|sql| nodus_catalog::Expression { sql }),
             expressions: vec![],
+            comment: None,
         })
     }
 
