@@ -1,0 +1,160 @@
+# Backward index scans: with index scans asked for (`SET enable_seqscan
+# = off`), an `ORDER BY` on an index's leading column that descends reads
+# the index backwards — `Index Scan Backward` / `Index Only Scan
+# Backward` — as PostgreSQL plans it, since a descending key is the
+# index's own order reversed (NULLs first, PostgreSQL's placement for
+# `DESC`). An explicit placement the other way (`NULLS LAST` on `DESC`,
+# `NULLS FIRST` on `ASC`) cannot use it and sorts instead, and an
+# ordering the index only starts is an `Incremental Sort` over its
+# prefix. Plans and results from PostgreSQL 18.4.
+#
+# Known divergences: PostgreSQL's cost-based choices stay ours to make
+# (`enable_seqscan = off` gates the index paths; a cheap index-only scan
+# under a `LIMIT` is chosen by PostgreSQL even with sequential scans
+# enabled) — with sequential scans enabled NodusDB sorts. When the
+# ordering's relation comes through a pulled-up derived table,
+# PostgreSQL still reads the index in order; NodusDB sorts. A `DISTINCT`
+# with an ordering PostgreSQL serves from a deduplicating index `Unique`
+# is NodusDB's `HashAggregate` plus sort (pre-existing, as for ascending
+# orderings).
+
+statement ok
+drop table if exists g1 cascade;
+
+statement ok
+create table g1 (k int primary key, v int);
+
+statement ok
+insert into g1 select i, i * 7 % 41 from generate_series(1, 40) i;
+
+statement ok
+insert into g1 values (100, null);
+
+statement ok
+create index g1_v on g1 (v);
+
+statement ok
+analyze g1;
+
+statement ok
+set enable_seqscan = off;
+
+query T
+explain (costs off) select * from g1 order by v desc;
+----
+Index Scan Backward using g1_v on g1
+
+query T
+explain (costs off) select v from g1 order by v desc;
+----
+Index Only Scan Backward using g1_v on g1
+
+query T
+explain (costs off) select * from g1 where v > 20 order by v desc;
+----
+Index Scan Backward using g1_v on g1
+  Index Cond: (v > 20)
+
+query T
+explain (costs off) select * from g1 order by v desc nulls last;
+----
+Sort
+  Sort Key: v DESC NULLS LAST
+  ->  Seq Scan on g1
+        Disabled: true
+
+query T
+explain (costs off) select * from g1 order by v asc nulls first;
+----
+Sort
+  Sort Key: v NULLS FIRST
+  ->  Seq Scan on g1
+        Disabled: true
+
+query T
+explain (costs off) select * from g1 order by v desc, k limit 5;
+----
+Limit
+  ->  Incremental Sort
+        Sort Key: v DESC, k
+        Presorted Key: v
+        ->  Index Scan Backward using g1_v on g1
+
+query T
+explain (costs off) select * from g1 order by v desc offset 3;
+----
+Limit
+  ->  Index Scan Backward using g1_v on g1
+
+query T
+explain (costs off) select * from g1 order by k desc;
+----
+Index Scan Backward using g1_pkey on g1
+
+query T
+select k, v from g1 order by v desc limit 5;
+----
+100	NULL
+35	40
+29	39
+23	38
+17	37
+
+query T
+select k, v from g1 order by v desc offset 36;
+----
+30	5
+24	4
+18	3
+12	2
+6	1
+
+query T
+select k, v from g1 where v > 20 order by v desc limit 4;
+----
+35	40
+29	39
+23	38
+17	37
+
+query T
+select * from g1 order by v desc, k limit 3;
+----
+100	NULL
+35	40
+29	39
+
+statement ok
+begin;
+
+statement ok
+insert into g1 values (101, 41), (102, -1);
+
+statement ok
+update g1 set v = 99 where k = 1;
+
+statement ok
+delete from g1 where k = 2;
+
+query T
+select k, v from g1 order by v desc limit 5;
+----
+100	NULL
+1	99
+101	41
+35	40
+29	39
+
+statement ok
+rollback;
+
+statement ok
+reset enable_seqscan;
+
+query T
+select k, v from g1 order by v desc limit 4;
+----
+100	NULL
+35	40
+29	39
+23	38

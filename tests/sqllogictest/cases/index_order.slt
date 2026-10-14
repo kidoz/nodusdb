@@ -3,11 +3,11 @@
 # its own order — no `WHERE` needed — and a covering index serves the
 # whole scan when nothing orders or filters it (a bare `count(*)`). An
 # ordering the index only starts is an `Incremental Sort` over its
-# prefix; a chosen sequential scan says `Disabled: true`. PostgreSQL
-# reads an index backwards for `DESC` (`Index Scan Backward`) and can
-# index-scan each partition of an ordered scan of a partitioned table;
-# NodusDB sorts instead. Plans and results otherwise from PostgreSQL
-# 18.4.
+# prefix; a chosen sequential scan says `Disabled: true`. A descending
+# ordering reads the index backwards — `index_backward.slt`. PostgreSQL
+# can also index-scan each partition of an ordered scan of a partitioned
+# table; NodusDB sorts instead. Plans and results otherwise from
+# PostgreSQL 18.4.
 
 statement ok
 drop table if exists g1 cascade;
