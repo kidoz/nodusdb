@@ -499,25 +499,45 @@ impl MemExecutor {
                     filter.as_ref(),
                 )
                 .map(|needed| {
-                    crate::index_keys::add_needed(
-                        needed,
-                        &crate::index_keys::sort_columns(&sort, &projection).unwrap_or_default(),
-                    )
+                    // Grouped output reads its grouping columns — an
+                    // expression grouping reads the columns it names — and
+                    // `HAVING` names too.
+                    let mut extra: Vec<String> = Vec::new();
+                    for name in &group_by {
+                        match group_exprs.iter().find(|(n, _)| n == name) {
+                            Some((_, expr)) => {
+                                let mut refs = Vec::new();
+                                crate::filter_eval::scalar_column_refs(expr, &mut refs);
+                                extra.extend(refs.into_iter().map(|name| {
+                                    name.rsplit('.').next().unwrap_or(&name).to_string()
+                                }));
+                            }
+                            None => extra.push(name.rsplit('.').next().unwrap_or(name).to_string()),
+                        }
+                    }
+                    if let Some(having) = having.as_ref() {
+                        let mut refs = Vec::new();
+                        crate::filter_eval::filter_column_refs(having, &mut refs);
+                        extra.extend(
+                            refs.into_iter()
+                                .map(|name| name.rsplit('.').next().unwrap_or(&name).to_string()),
+                        );
+                    }
+                    extra.extend(
+                        crate::index_keys::sort_columns(&sort, &projection).unwrap_or_default(),
+                    );
+                    crate::index_keys::add_needed(needed, &extra)
                 });
                 // A query whose columns the index covers reads them from the
                 // index alone; a simple shape keeps that safe (nothing later
-                // reads an uncovered column). `DISTINCT` reads exactly its
-                // projection, so a covering index serves it too.
-                let index_only = if joins.is_empty()
-                    && group_by.is_empty()
-                    && distinct_on.is_empty()
-                    && having.is_none()
-                    && grouping_sets.is_none()
-                {
-                    needed_columns.clone()
-                } else {
-                    None
-                };
+                // reads an uncovered column — `DISTINCT` and `GROUP BY` read
+                // exactly what they are given above).
+                let index_only =
+                    if joins.is_empty() && distinct_on.is_empty() && grouping_sets.is_none() {
+                        needed_columns.clone()
+                    } else {
+                        None
+                    };
                 // Equality on an indexed column uses the index. The session's
                 // uncommitted overlay is merged into the result, so the index is
                 // usable inside a transaction rather than forcing a full scan.
@@ -754,8 +774,12 @@ impl MemExecutor {
                     && joins.is_empty()
                     && descendants.is_empty()
                     && crate::session_env::setting("enable_seqscan").as_deref() == Some("off")
-                    && let Some((name, _backwards)) =
-                        crate::explain::ordering_index_column(&sort, &projection)
+                    && let Some((name, _backwards)) = crate::explain::ordering_index_column(
+                        &sort,
+                        &projection,
+                        &group_by,
+                        &group_exprs,
+                    )
                     && let Some(col) = tbl.columns.iter().find(|c| {
                         c.name
                             .eq_ignore_ascii_case(name.rsplit('.').next().unwrap_or(&name))

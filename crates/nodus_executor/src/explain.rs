@@ -674,17 +674,36 @@ impl MemExecutor {
                     (own, _) => own,
                 }
                 .map(|needed| {
-                    crate::index_keys::add_needed(
-                        needed,
-                        &crate::index_keys::sort_columns(&sort_keys, projection)
-                            .unwrap_or_default(),
-                    )
+                    // Grouped output reads its grouping columns — an
+                    // expression grouping reads the columns it names — and
+                    // `HAVING` names too.
+                    let mut extra: Vec<String> = Vec::new();
+                    for name in group_by {
+                        match group_exprs.iter().find(|(n, _)| n == name) {
+                            Some((_, expr)) => {
+                                let mut refs = Vec::new();
+                                crate::filter_eval::scalar_column_refs(expr, &mut refs);
+                                extra.extend(refs.into_iter().map(|name| {
+                                    name.rsplit('.').next().unwrap_or(&name).to_string()
+                                }));
+                            }
+                            None => extra.push(name.rsplit('.').next().unwrap_or(name).to_string()),
+                        }
+                    }
+                    if let Some(having) = having {
+                        let mut refs = Vec::new();
+                        crate::filter_eval::filter_column_refs(having, &mut refs);
+                        extra.extend(
+                            refs.into_iter()
+                                .map(|name| name.rsplit('.').next().unwrap_or(&name).to_string()),
+                        );
+                    }
+                    extra.extend(
+                        crate::index_keys::sort_columns(&sort_keys, projection).unwrap_or_default(),
+                    );
+                    crate::index_keys::add_needed(needed, &extra)
                 });
-                let allow_index_only = single
-                    && group_by.is_empty()
-                    && distinct_on.is_empty()
-                    && having.is_none()
-                    && sample.is_none();
+                let allow_index_only = single && distinct_on.is_empty() && sample.is_none();
                 // A side's own conditions go on its scan, as PostgreSQL
                 // pushes them.
                 let with_side_filter = |mut child: Node, filter: Option<&FilterExpr>| {
@@ -713,7 +732,7 @@ impl MemExecutor {
                     && sample.is_none()
                     && crate::session_env::setting("enable_seqscan").as_deref() == Some("off")
                 {
-                    ordering_index_column(&sort, projection).or_else(|| {
+                    ordering_index_column(&sort, projection, group_by, group_exprs).or_else(|| {
                         // A pulled-up body that adds no ordering of its own
                         // takes the outer query's, as PostgreSQL's plans show.
                         let mut calls: Vec<&WindowCall> = Vec::new();
@@ -1219,6 +1238,9 @@ impl MemExecutor {
                         ProjectionItem::Expr { expr, .. } => scalar_has_aggregate(expr),
                         _ => false,
                     });
+                // The order a streaming `Group`/`GroupAggregate` leaves its
+                // groups in, which a matching `ORDER BY` reuses.
+                let mut streamed_order: Option<Vec<String>> = None;
                 if aggregated {
                     let input_rows = node.rows;
                     // A query of nothing but `min`/`max` over indexed
@@ -1303,10 +1325,82 @@ impl MemExecutor {
                                     .unwrap_or_else(|| column(g, qualified))
                             })
                             .collect();
-                        let mut agg = Node::over("Aggregate", "HashAggregate", vec![node])
-                            .prop("Strategy", json!("Hashed"))
-                            .prop("Partial Mode", json!("Simple"))
-                            .keys("Group Key", keys);
+                        // A grouping the scan's own order already collects —
+                        // its columns lead an order-preserving index — reads
+                        // as PostgreSQL's streaming `Group`, not a hash.
+                        let bare = |name: &str| name.rsplit('.').next().unwrap_or(name).to_string();
+                        let streamed: Option<Vec<String>> = group_exprs
+                            .is_empty()
+                            .then(|| {
+                                index_key_columns(&node).filter(|columns| {
+                                    columns.len() >= group_by.len()
+                                        && group_by
+                                            .iter()
+                                            .all(|g| columns[..group_by.len()].contains(&bare(g)))
+                                })
+                            })
+                            .flatten()
+                            .map(|columns| {
+                                columns[..group_by.len()]
+                                    .iter()
+                                    .map(|name| column(name, qualified))
+                                    .collect()
+                            });
+                        // A `GROUP BY` the query's own `ORDER BY` sorts by
+                        // streams over that sort too — PostgreSQL sorts
+                        // first and collects the groups off the sorted
+                        // stream.
+                        let sort_names: Option<Vec<String>> = (group_exprs.is_empty()
+                            && !sort.is_empty()
+                            && sort.len() >= group_by.len())
+                        .then(|| sort_keys_columns(&sort[..group_by.len()], projection))
+                        .flatten()
+                        .filter(|columns| group_by.iter().all(|g| columns.contains(&bare(g))));
+                        let sort_texts: Vec<String> = sort
+                            .iter()
+                            .map(|key| {
+                                sort_key_text(key, projection, qualified, &Default::default())
+                            })
+                            .collect();
+                        let only_keys = !projection.iter().any(|item| match item {
+                            ProjectionItem::Aggregate(..) => true,
+                            ProjectionItem::Expr { expr, .. } => scalar_has_aggregate(expr),
+                            _ => false,
+                        });
+                        let kind = if only_keys { "Group" } else { "GroupAggregate" };
+                        let mut agg = match (&streamed, &sort_names) {
+                            (Some(keys), _) => {
+                                // The groups leave in the scan's order, every
+                                // group key included.
+                                streamed_order = index_ordered(&node).map(|(_, ascending)| {
+                                    keys.iter()
+                                        .map(|key| {
+                                            if ascending {
+                                                key.clone()
+                                            } else {
+                                                format!("{key} DESC")
+                                            }
+                                        })
+                                        .collect()
+                                });
+                                Node::over(kind, kind, vec![node]).keys("Group Key", keys.clone())
+                            }
+                            (None, Some(names)) => {
+                                let n = node.rows.max(2.0);
+                                let mut sorted = Node::over("Sort", "Sort", vec![node])
+                                    .keys("Sort Key", sort_texts.clone());
+                                sorted.startup = sorted.total + n * n.log2() * 2.0 * CPU_OPERATOR;
+                                sorted.total = sorted.startup + n * CPU_TUPLE;
+                                streamed_order = Some(sort_texts);
+                                let keys: Vec<String> =
+                                    names.iter().map(|name| column(name, qualified)).collect();
+                                Node::over(kind, kind, vec![sorted]).keys("Group Key", keys)
+                            }
+                            (None, None) => Node::over("Aggregate", "HashAggregate", vec![node])
+                                .prop("Strategy", json!("Hashed"))
+                                .prop("Partial Mode", json!("Simple"))
+                                .keys("Group Key", keys),
+                        };
                         agg.rows = (input_rows / 10.0).clamp(1.0, 200.0).round();
                         agg.startup = agg.total;
                         agg
@@ -1479,9 +1573,9 @@ impl MemExecutor {
                     .iter()
                     .map(|k| sort_key_text(k, projection, qualified, &window_names))
                     .collect();
-                // An index scan or a window leaves the rows in their
-                // ordering; `ORDER BY` reuses it — exactly, or as an
-                // Incremental Sort over the prefix it already has.
+                // An index scan, a streaming group or a window leaves the
+                // rows in their ordering; `ORDER BY` reuses it — exactly, or
+                // as an Incremental Sort over the prefix it already has.
                 let presorted: Option<Vec<String>> = index_ordered(&node)
                     .map(|(name, ascending)| {
                         let name = column(&name, qualified);
@@ -1491,6 +1585,7 @@ impl MemExecutor {
                             format!("{name} DESC")
                         }]
                     })
+                    .or_else(|| streamed_order.clone())
                     .or_else(|| window_keys.clone());
                 let covered = presorted
                     .as_ref()
@@ -3267,6 +3362,23 @@ fn window_layer_order<'a>(
     (layers, order)
 }
 
+/// The bare columns a slice of sort keys reads, when they are plain columns
+/// (`None` otherwise).
+fn sort_keys_columns(keys: &[SortKey], projection: &[ProjectionItem]) -> Option<Vec<String>> {
+    keys.iter()
+        .map(|key| match &key.target {
+            SortTarget::Name(name) => Some(name.rsplit('.').next().unwrap_or(name).to_string()),
+            SortTarget::Output(i) => match projection.get(*i) {
+                Some(ProjectionItem::Column(c)) | Some(ProjectionItem::AliasedColumn(c, _)) => {
+                    Some(c.rsplit('.').next().unwrap_or(c).to_string())
+                }
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
+}
+
 /// PostgreSQL names presorted columns without their direction
 /// (`Presorted Key: v`).
 fn presorted_keys_text(keys: &[String]) -> Vec<String> {
@@ -3276,17 +3388,36 @@ fn presorted_keys_text(keys: &[String]) -> Vec<String> {
 }
 
 /// The bare column a query's ordering wants its scan to read an index by,
-/// and whether that read runs backward: the innermost window layer's
-/// ordering first — its partition columns first, then its ordering keys, as
-/// the `WindowAgg` nearest the scan needs them — else the query's own
-/// `ORDER BY`. PostgreSQL serves the lower consumer and sorts above it.
-/// `None` when neither names a column an order-preserving index read could
-/// serve.
+/// and whether that read runs backward, in the order the consumers stack:
+/// a `GROUP BY`'s leading column first (its groups must be collected in one
+/// order), then the innermost window layer's ordering (its partition
+/// columns first, then its ordering keys — what the `WindowAgg` nearest the
+/// scan needs), then the query's own `ORDER BY`. PostgreSQL serves the
+/// lower consumer and sorts above it. `None` when none names a column an
+/// order-preserving index read could serve.
 pub(crate) fn ordering_index_column(
     sort: &[crate::plan_types::SortKey],
     projection: &[crate::plan_types::ProjectionItem],
+    group_by: &[String],
+    group_exprs: &[(String, ScalarExpr)],
 ) -> Option<(String, bool)> {
     use crate::plan_types::{ProjectionItem, SortTarget};
+    let bare = |name: &str| name.rsplit('.').next().unwrap_or(name).to_string();
+    // A `GROUP BY` whose leading column is plain streams its groups in the
+    // index's order — the lowest consumer of the scan — and takes the
+    // `ORDER BY`'s direction when that orders the same column.
+    if let Some(first) = group_by.first()
+        && !group_exprs.iter().any(|(name, _)| name == first)
+    {
+        let ordered = sort.first().filter(
+            |key| matches!(&key.target, SortTarget::Name(name) if bare(name) == bare(first)),
+        );
+        let (ascending, nulls_first) =
+            ordered.map_or((true, None), |key| (key.ascending, key.nulls_first));
+        if crate::index_keys::index_serves_ordering(ascending, nulls_first) {
+            return Some((first.clone(), ordered.is_some() && !ascending));
+        }
+    }
     let mut calls: Vec<&WindowCall> = Vec::new();
     for item in projection {
         if let ProjectionItem::Expr { expr, .. } = item {

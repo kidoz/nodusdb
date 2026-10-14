@@ -660,13 +660,13 @@ pub(crate) fn index_conds_match(
     true
 }
 
-/// Whether an expression computes a window call (whose columns the window
-/// machinery reads).
-fn expr_has_window(expr: &crate::ScalarExpr) -> bool {
-    if matches!(expr, crate::ScalarExpr::Window(_)) {
+/// Whether an expression computes a subquery (whose correlation reads
+/// columns the reference walk cannot see).
+fn expr_has_subquery(expr: &crate::ScalarExpr) -> bool {
+    if matches!(expr, crate::ScalarExpr::Subquery { .. }) {
         return true;
     }
-    expr.children().into_iter().any(expr_has_window)
+    expr.children().into_iter().any(expr_has_subquery)
 }
 
 /// Whether an order-preserving index read serves this sort key: reading the
@@ -811,7 +811,10 @@ pub(crate) fn index_only_needed(
                     .chain(order_by.iter().map(|(column, _)| column))
                     .map(|name| name.rsplit('.').next().unwrap_or(name).to_string()),
             ),
-            ProjectionItem::Expr { expr, .. } if expr_has_window(expr) => {
+            // An expression reads the columns it names; one computing a
+            // subquery is left out (its correlation reads columns the walk
+            // cannot see).
+            ProjectionItem::Expr { expr, .. } if !expr_has_subquery(expr) => {
                 let mut refs = Vec::new();
                 crate::filter_eval::scalar_column_refs(expr, &mut refs);
                 needed.extend(
