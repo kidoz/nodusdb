@@ -1689,10 +1689,10 @@ fn explain_options(
             "costs" => out.costs = flag()?,
             "timing" => out.timing = flag()?,
             "summary" => out.summary = Some(flag()?),
+            "buffers" => out.buffers = Some(flag()?),
             "format" => set_format(&mut out, arg.as_deref().unwrap_or(""))?,
             // Details the executor has no counterpart for.
-            "verbose" | "buffers" | "settings" | "wal" | "generic_plan" | "memory"
-            | "serialize" => {}
+            "verbose" | "settings" | "wal" | "generic_plan" | "memory" | "serialize" => {}
             other => anyhow::bail!("unrecognized EXPLAIN option \"{other}\""),
         }
     }

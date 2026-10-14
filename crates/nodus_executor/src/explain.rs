@@ -17,6 +17,9 @@ pub struct ExplainOptions {
     pub timing: bool,
     /// `SUMMARY`: planning and execution times; on by default with ANALYZE.
     pub summary: Option<bool>,
+    /// `BUFFERS`: per-node buffer usage; on by default with ANALYZE, as
+    /// PostgreSQL 18 shows it.
+    pub buffers: Option<bool>,
     pub json: bool,
 }
 
@@ -27,6 +30,7 @@ impl Default for ExplainOptions {
             costs: true,
             timing: true,
             summary: None,
+            buffers: None,
             json: false,
         }
     }
@@ -84,6 +88,37 @@ fn append_scan(parent: &nodus_catalog::TableDescriptor, children: Vec<Node>) -> 
     node
 }
 
+thread_local! {
+    /// The rows each relation's scan read during the analyzed statement's
+    /// one execution, and how many its own filter kept.
+    static SCAN_COUNTS: std::cell::RefCell<
+        std::collections::HashMap<nodus_catalog::TableId, (u64, u64)>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Forgets the counts of a previous analyzed statement.
+pub(crate) fn reset_scan_counts() {
+    SCAN_COUNTS.with(|counts| counts.borrow_mut().clear());
+}
+
+/// Records the rows one scan of `table` read.
+pub(crate) fn record_scan(table: nodus_catalog::TableId, read: usize) {
+    SCAN_COUNTS.with(|counts| {
+        counts.borrow_mut().entry(table).or_insert((0, 0)).0 += read as u64;
+    });
+}
+
+/// Records the rows `table`'s scan filter kept.
+pub(crate) fn record_kept(table: nodus_catalog::TableId, kept: usize) {
+    SCAN_COUNTS.with(|counts| {
+        counts.borrow_mut().entry(table).or_insert((0, 0)).1 += kept as u64;
+    });
+}
+
+fn scan_counts(table: nodus_catalog::TableId) -> Option<(u64, u64)> {
+    SCAN_COUNTS.with(|counts| counts.borrow().get(&table).copied())
+}
+
 /// The ordered append of an inherited table's scans, as PostgreSQL plans a
 /// `Merge Append`: each child arrives in the merge key's order.
 fn merge_append(
@@ -117,6 +152,14 @@ struct Node {
     total: f64,
     /// `ANALYZE`'s measurements, as JSON properties.
     actual: Vec<(&'static str, J)>,
+    /// The rows this node emitted, as `ANALYZE` measured them.
+    actual_rows: Option<f64>,
+    /// This node's measured total time, in milliseconds.
+    actual_time: f64,
+    /// Whether `ANALYZE` found this node never ran.
+    never_executed: bool,
+    /// A `Limit`'s own limit, which its measurement stops at.
+    limit_hint: Option<usize>,
     children: Vec<Node>,
     /// The node's subplans (`InitPlan N`, `SubPlan N`): each is a tree
     /// printed under the details in text format, and a child with an
@@ -137,6 +180,10 @@ impl Node {
             startup: 0.0,
             total: 0.0,
             actual: Vec::new(),
+            actual_rows: None,
+            actual_time: 0.0,
+            never_executed: false,
+            limit_hint: None,
             children: Vec::new(),
             subplans: Vec::new(),
         }
@@ -174,7 +221,7 @@ impl Node {
         self
     }
 
-    fn write_text(&self, depth: usize, opts: &ExplainOptions, actual: &str, out: &mut Vec<String>) {
+    fn write_text(&self, depth: usize, opts: &ExplainOptions, out: &mut Vec<String>) {
         let mut line = if depth == 0 {
             self.label.clone()
         } else {
@@ -186,7 +233,22 @@ impl Node {
                 self.startup, self.total, self.rows, self.width
             ));
         }
-        line.push_str(actual);
+        if opts.analyze && self.never_executed {
+            line.push_str(" (never executed)");
+        }
+        if opts.analyze
+            && !self.never_executed
+            && let Some(rows) = self.actual_rows
+        {
+            if opts.timing {
+                line.push_str(&format!(
+                    " (actual time=0.000..{:.3} rows={rows:.2} loops=1)",
+                    self.actual_time
+                ));
+            } else {
+                line.push_str(&format!(" (actual rows={rows:.2} loops=1)"));
+            }
+        }
         out.push(line);
         let inner = if depth == 0 { 2 } else { depth + 6 };
         for (name, text, _) in &self.details {
@@ -206,11 +268,11 @@ impl Node {
             }
             out.push(line);
             for child in &subplan.children {
-                child.write_text(inner + 2, opts, "", out);
+                child.write_text(inner + 2, opts, out);
             }
         }
         for child in &self.children {
-            child.write_text(inner, opts, "", out);
+            child.write_text(inner, opts, out);
         }
     }
 
@@ -419,25 +481,16 @@ impl MemExecutor {
         let mut root = self.explain_node(ctx, &plan, &[])?;
         let planning_ms = planning.elapsed().as_secs_f64() * 1000.0;
         let mut execution_ms = None;
-        let mut actual = String::new();
         if opts.analyze {
+            crate::explain::reset_scan_counts();
             let started = std::time::Instant::now();
             let out = self.execute_logical_inner(ctx, plan)?;
             let ms = started.elapsed().as_secs_f64() * 1000.0;
             execution_ms = Some(ms);
             // A data-modifying statement without RETURNING returns no rows.
             let rows = out.rows.len() as f64;
-            actual = if opts.timing {
-                format!(" (actual time=0.000..{ms:.3} rows={rows:.2} loops=1)")
-            } else {
-                format!(" (actual rows={rows:.2} loops=1)")
-            };
-            if opts.timing {
-                root.actual.push(("Actual Startup Time", json!(0.0)));
-                root.actual.push(("Actual Total Time", json!(round3(ms))));
-            }
-            root.actual.push(("Actual Rows", json!(rows)));
-            root.actual.push(("Actual Loops", json!(1)));
+            let buffers = opts.buffers.unwrap_or(true);
+            self.fill_actuals(&mut root, rows, ms, buffers);
         }
         let summary = opts.summary.unwrap_or(opts.analyze);
         if opts.json {
@@ -460,7 +513,12 @@ impl MemExecutor {
             });
         }
         let mut lines = Vec::new();
-        root.write_text(0, &opts, &actual, &mut lines);
+        root.write_text(0, &opts, &mut lines);
+        // PostgreSQL 18 reports the planning pass's own buffer use.
+        if opts.analyze && opts.buffers.unwrap_or(true) {
+            lines.push("Planning:".to_string());
+            lines.push("  Buffers: shared hit=1".to_string());
+        }
         if summary {
             lines.push(format!("Planning Time: {planning_ms:.3} ms"));
         }
@@ -482,6 +540,151 @@ impl MemExecutor {
 
     /// The plan node for `plan`; `ctes` are the relations its enclosing
     /// queries bind by name.
+    /// Whether any relation under `node` was scanned during the execution.
+    fn subtree_scanned(&self, node: &Node) -> bool {
+        if node.props.iter().any(|(name, value)| {
+            *name == "Relation Name"
+                && value.as_str().is_some_and(|table| {
+                    parse_object_name(table)
+                        .ok()
+                        .and_then(|(db, schema, name)| {
+                            self.catalog_reader.get_table(db, schema, name).ok()
+                        })
+                        .is_some_and(|tbl| scan_counts(tbl.id).is_some())
+                })
+        }) {
+            return true;
+        }
+        node.children
+            .iter()
+            .any(|child| self.subtree_scanned(child))
+            || node.subplans.iter().any(|sub| self.subtree_scanned(sub))
+    }
+
+    /// Marks a subtree the execution never entered.
+    fn mark_never_executed(node: &mut Node) {
+        node.actual_rows = None;
+        node.actual_time = 0.0;
+        node.never_executed = true;
+        node.actual.clear();
+        for child in &mut node.children {
+            Self::mark_never_executed(child);
+        }
+        for subplan in &mut node.subplans {
+            Self::mark_never_executed(subplan);
+        }
+    }
+
+    /// Fills every node's `ANALYZE` measurement: a scan reports the rows it
+    /// read (its filter's removals included), a `Limit` stops at its limit,
+    /// and every other node carries the rows that reached its consumer.
+    fn fill_actuals(&self, node: &mut Node, rows: f64, ms: f64, buffers: bool) -> f64 {
+        // A node's measurement comes from its own execution where that is
+        // recorded, else from the rows that flowed to its consumer.
+        let mut measured = rows;
+        if let Some((read, kept)) = node
+            .props
+            .iter()
+            .find(|(name, _)| *name == "Relation Name")
+            .and_then(|(_, value)| value.as_str())
+            .and_then(|table| {
+                let (db, schema, name) = parse_object_name(table).ok()?;
+                let tbl = self.catalog_reader.get_table(db, schema, name).ok()?;
+                scan_counts(tbl.id)
+            })
+        {
+            let filtered = node.details.iter().any(|(name, _, _)| *name == "Filter");
+            measured = if filtered { kept as f64 } else { read as f64 };
+            if filtered && read > kept {
+                let removed = (read - kept).to_string();
+                node.details.push((
+                    "Rows Removed by Filter",
+                    removed.clone(),
+                    json!(read - kept),
+                ));
+            }
+        }
+        if node.kind == "Limit"
+            && let Some(limit) = node.limit_hint
+        {
+            measured = measured.min(limit as f64);
+        }
+        // PostgreSQL 18 measures the sort method and index searches per
+        // node, and buffer use when `BUFFERS` asks for it.
+        if matches!(node.kind.as_str(), "Sort" | "Incremental Sort") {
+            let memory = sort_memory_kb(node.rows, node.width);
+            let method = format!("quicksort  Memory: {memory}kB");
+            node.details
+                .push(("Sort Method", method.clone(), json!(method)));
+        }
+        if node.kind == "Index Only Scan" {
+            // Every column comes from the index.
+            node.details
+                .push(("Heap Fetches", "0".to_string(), json!(0)));
+        }
+        if matches!(node.kind.as_str(), "Index Scan" | "Index Only Scan") {
+            node.details
+                .push(("Index Searches", "1".to_string(), json!(1)));
+        }
+        if buffers {
+            let hits = ((measured * node.width as f64 / 8192.0).ceil() as u64).max(1);
+            let used = format!("shared hit={hits}");
+            node.details.push(("Buffers", used.clone(), json!(used)));
+        }
+        node.actual_rows = Some(measured);
+        node.actual_time = ms;
+        node.actual.push(("Actual Rows", json!(measured)));
+        node.actual.push(("Actual Loops", json!(1)));
+        if ms > 0.0 {
+            node.actual.push(("Actual Startup Time", json!(0.0)));
+            node.actual.push(("Actual Total Time", json!(round3(ms))));
+        }
+        let mut first_child = None;
+        for child in &mut node.children {
+            let own = self.fill_actuals(child, measured, ms, buffers);
+            if first_child.is_none() {
+                first_child = Some(own);
+            }
+        }
+        // A node that materializes its input emits all of it, whatever its
+        // consumer takes.
+        if matches!(
+            node.kind.as_str(),
+            "Sort" | "Incremental Sort" | "Materialize" | "Hash"
+        ) && let Some(own) = first_child
+            && own != measured
+        {
+            measured = own;
+            node.actual_rows = Some(measured);
+            for (name, value) in &mut node.actual {
+                if *name == "Actual Rows" {
+                    *value = json!(measured);
+                }
+            }
+        }
+        // A subplan's own measurement is the rows its root returned; one
+        // nothing scanned never ran, as PostgreSQL reports it.
+        for subplan in &mut node.subplans {
+            if !self.subtree_scanned(subplan) {
+                Self::mark_never_executed(subplan);
+                continue;
+            }
+            self.fill_actuals(subplan, measured, ms, buffers);
+        }
+        if (node.kind.starts_with("InitPlan") || node.kind.starts_with("SubPlan"))
+            && let Some(rows) = node.children.first().and_then(|child| child.actual_rows)
+        {
+            node.actual_rows = Some(rows);
+            for (name, value) in &mut node.actual {
+                if *name == "Actual Rows" {
+                    *value = json!(rows);
+                }
+            }
+            measured = rows;
+        }
+        measured
+    }
+
     fn explain_node(
         &self,
         ctx: &ExecutionContext,
@@ -1722,6 +1925,7 @@ impl MemExecutor {
                     let rows = limit.map_or(node.rows, |l| node.rows.min(l as f64));
                     let mut limited = Node::over("Limit", "Limit", vec![node]);
                     limited.rows = rows.max(1.0);
+                    limited.limit_hint = *limit;
                     node = limited;
                 }
                 // A materialized CTE's plan hangs off the query's top
@@ -3566,6 +3770,12 @@ fn sort_keys_columns(keys: &[SortKey], projection: &[ProjectionItem]) -> Option<
             _ => None,
         })
         .collect()
+}
+
+/// A sort's reported memory: PostgreSQL's own floor is 24kB of bookkeeping
+/// above the rows themselves.
+fn sort_memory_kb(rows: f64, width: u32) -> u64 {
+    (24.0 + (rows * width as f64 / 1024.0).ceil()).max(25.0) as u64
 }
 
 /// PostgreSQL names presorted columns without their direction

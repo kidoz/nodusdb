@@ -404,6 +404,8 @@ impl MemExecutor {
         let mut query_has_virtual = false;
         // The hidden `tableoid` columns' positions, which `*` does not show.
         let mut hidden: Vec<usize> = Vec::new();
+        // The relation this statement scans, for `EXPLAIN ANALYZE`'s counts.
+        let mut scanned_table: Option<nodus_catalog::TableId> = None;
         let (tbl_cols, mut col_names, mut stored_rows) = if let Some(cte_out) =
             crate::cte_scope::lookup(&table_name)
         {
@@ -477,6 +479,7 @@ impl MemExecutor {
                     .catalog_reader
                     .get_table(db_name, schema_name, table_only)?;
                 self.authorize(ctx, Action::Select, ResourceRef::Table(tbl.id))?;
+                scanned_table = Some(tbl.id);
                 // A table's scan reads its descendants too, unless `ONLY`.
                 let descendants = if only {
                     Vec::new()
@@ -923,6 +926,8 @@ impl MemExecutor {
                     }
                     None => rows,
                 };
+                // The rows this scan reads, for `EXPLAIN ANALYZE`.
+                crate::explain::record_scan(tbl.id, rows.len());
                 let mut cols = tbl.columns.clone();
                 let mut col_names = col_names;
                 if tbl.view_query.is_none() {
@@ -1379,10 +1384,17 @@ impl MemExecutor {
                         let out =
                             crate::cte_scope::isolated(|| self.execute_logical_inner(ctx, plan))?;
                         out.rows.iter().map(|r| r.values.clone()).collect()
-                    } else if j_descendants.is_empty() {
-                        self.scan_rows(j_tbl.id, &ctx.session_id)?
                     } else {
-                        self.inherited_rows(ctx, &j_tbl)?
+                        let rows = if j_descendants.is_empty() {
+                            self.scan_rows(j_tbl.id, &ctx.session_id)?
+                        } else {
+                            self.inherited_rows(ctx, &j_tbl)?
+                        };
+                        // The rows this side of a join reads, for
+                        // `EXPLAIN ANALYZE`.
+                        crate::explain::record_scan(j_tbl.id, rows.len());
+                        crate::explain::record_kept(j_tbl.id, rows.len());
+                        rows
                     };
                     let mut j_rows = match &join.sample {
                         Some(spec) => {
@@ -2330,6 +2342,10 @@ impl MemExecutor {
             self.eval_filter(ctx, r, &col_names, &joined_columns, residual.as_ref())
                 .unwrap_or(false)
         });
+        // The rows this scan's own conditions kept, for `EXPLAIN ANALYZE`.
+        if let Some(table) = scanned_table {
+            crate::explain::record_kept(table, stored_rows.len());
+        }
 
         // Read as the relations of a data-modifying statement: the joined
         // rows, under their qualified column names.
