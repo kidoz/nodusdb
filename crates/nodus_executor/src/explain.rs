@@ -51,9 +51,20 @@ fn single_scan(
     parent_alias: &str,
 ) -> Node {
     let mut only = children.remove(0);
-    only.label = format!("Seq Scan on {} {parent_alias}", relation_name(&table.name));
+    // The scan reads the one partition under the parent's own name,
+    // whatever kind of scan it is.
+    let child_alias = only
+        .props
+        .iter()
+        .find(|(name, _)| *name == "Alias")
+        .and_then(|(_, value)| value.as_str())
+        .map(str::to_string);
+    if let Some(child_alias) = child_alias
+        && let Some(head) = only.label.strip_suffix(&format!(" {child_alias}"))
+    {
+        only.label = format!("{head} {parent_alias}");
+    }
     only.props.retain(|(name, _)| *name != "Alias");
-    // The scan reads the partition under the parent's name.
     only = only.prop("Alias", json!(parent_alias));
     only
 }
@@ -71,6 +82,19 @@ fn append_scan(parent: &nodus_catalog::TableDescriptor, children: Vec<Node>) -> 
     node.startup = 0.0;
     node.total = child_pages * PAGE + child_rows * CPU_TUPLE;
     node
+}
+
+/// The ordered append of an inherited table's scans, as PostgreSQL plans a
+/// `Merge Append`: each child arrives in the merge key's order.
+fn merge_append(
+    parent: &nodus_catalog::TableDescriptor,
+    children: Vec<Node>,
+    sort_key: &[String],
+) -> Node {
+    let mut node = append_scan(parent, children);
+    node.kind = "Merge Append".to_string();
+    node.label = "Merge Append".to_string();
+    node.keys("Sort Key", sort_key.to_vec())
 }
 
 /// A plan node as `EXPLAIN` shows it.
@@ -1158,7 +1182,36 @@ impl MemExecutor {
                     result.subplans = wrappers;
                     node = result.detail("One-Time Filter", conditions.join(" AND "));
                 }
+                // A scan of an inherited table reads its children, and
+                // PostgreSQL qualifies the keys with the parent's name, as
+                // it does for a join's inputs.
+                let inherited = !only
+                    && parse_object_name(table_name).is_ok_and(|(db, schema, table)| {
+                        self.catalog_reader
+                            .get_table(db, schema, table)
+                            .is_ok_and(|tbl| {
+                                self.descendants(db, tbl.id)
+                                    .is_ok_and(|children| !children.is_empty())
+                            })
+                    });
                 let qualified = !single || rendering_cte_body();
+                // PostgreSQL's key texts name the parent of an inherited
+                // scan (`Sort Key: p1.v`, `Group Key: p1.v`).
+                let parent_key = |text: String, target: &SortTarget| {
+                    if !inherited {
+                        return text;
+                    }
+                    let parent =
+                        relation_name(table_alias.as_deref().unwrap_or_else(|| {
+                            table_name.rsplit('.').next().unwrap_or(table_name)
+                        }));
+                    match key_column(target, projection) {
+                        Some(name) if !name.contains('.') && text.starts_with(&name) => {
+                            format!("{parent}.{text}")
+                        }
+                        _ => text,
+                    }
+                };
                 let sort: Vec<SortKey> = if sort.is_empty() {
                     order_by.iter().cloned().map(SortKey::from_legacy).collect()
                 } else {
@@ -1343,7 +1396,10 @@ impl MemExecutor {
                             .map(|columns| {
                                 columns[..group_by.len()]
                                     .iter()
-                                    .map(|name| column(name, qualified))
+                                    .map(|name| {
+                                        let name = column(name, qualified);
+                                        parent_key(name.clone(), &SortTarget::Name(name))
+                                    })
                                     .collect()
                             });
                         // A `GROUP BY` the query's own `ORDER BY` sorts by
@@ -1359,7 +1415,10 @@ impl MemExecutor {
                         let sort_texts: Vec<String> = sort
                             .iter()
                             .map(|key| {
-                                sort_key_text(key, projection, qualified, &Default::default())
+                                parent_key(
+                                    sort_key_text(key, projection, qualified, &Default::default()),
+                                    &key.target,
+                                )
                             })
                             .collect();
                         let only_keys = !projection.iter().any(|item| match item {
@@ -1375,11 +1434,12 @@ impl MemExecutor {
                                 streamed_order = index_ordered(&node).map(|(_, ascending)| {
                                     keys.iter()
                                         .map(|key| {
-                                            if ascending {
+                                            let text = if ascending {
                                                 key.clone()
                                             } else {
                                                 format!("{key} DESC")
-                                            }
+                                            };
+                                            parent_key(text, &SortTarget::Name(key.clone()))
                                         })
                                         .collect()
                                 });
@@ -1392,14 +1452,27 @@ impl MemExecutor {
                                 sorted.startup = sorted.total + n * n.log2() * 2.0 * CPU_OPERATOR;
                                 sorted.total = sorted.startup + n * CPU_TUPLE;
                                 streamed_order = Some(sort_texts);
-                                let keys: Vec<String> =
-                                    names.iter().map(|name| column(name, qualified)).collect();
+                                let keys: Vec<String> = names
+                                    .iter()
+                                    .map(|name| {
+                                        let name = column(name, qualified);
+                                        parent_key(name.clone(), &SortTarget::Name(name))
+                                    })
+                                    .collect();
                                 Node::over(kind, kind, vec![sorted]).keys("Group Key", keys)
                             }
-                            (None, None) => Node::over("Aggregate", "HashAggregate", vec![node])
-                                .prop("Strategy", json!("Hashed"))
-                                .prop("Partial Mode", json!("Simple"))
-                                .keys("Group Key", keys),
+                            (None, None) => {
+                                let keys: Vec<String> = keys
+                                    .iter()
+                                    .map(|key| {
+                                        parent_key(key.clone(), &SortTarget::Name(key.clone()))
+                                    })
+                                    .collect();
+                                Node::over("Aggregate", "HashAggregate", vec![node])
+                                    .prop("Strategy", json!("Hashed"))
+                                    .prop("Partial Mode", json!("Simple"))
+                                    .keys("Group Key", keys)
+                            }
                         };
                         agg.rows = (input_rows / 10.0).clamp(1.0, 200.0).round();
                         agg.startup = agg.total;
@@ -1571,20 +1644,40 @@ impl MemExecutor {
                 }
                 let keys: Vec<String> = sort
                     .iter()
-                    .map(|k| sort_key_text(k, projection, qualified, &window_names))
+                    .map(|k| {
+                        parent_key(
+                            sort_key_text(k, projection, qualified, &window_names),
+                            &k.target,
+                        )
+                    })
                     .collect();
                 // An index scan, a streaming group or a window leaves the
                 // rows in their ordering; `ORDER BY` reuses it — exactly, or
                 // as an Incremental Sort over the prefix it already has.
+                // The merged parts leave the rows in the ordering they
+                // merged by.
+                let merged_order: Option<Vec<String>> = (node.kind == "Merge Append")
+                    .then(|| ordering.as_ref())
+                    .flatten()
+                    .map(|(ordering_column, backwards)| {
+                        let name = column(ordering_column, qualified);
+                        let text = if *backwards {
+                            format!("{name} DESC")
+                        } else {
+                            name
+                        };
+                        vec![parent_key(text, &SortTarget::Name(ordering_column.clone()))]
+                    });
                 let presorted: Option<Vec<String>> = index_ordered(&node)
                     .map(|(name, ascending)| {
-                        let name = column(&name, qualified);
-                        vec![if ascending {
-                            name
+                        let text = if ascending {
+                            column(&name, qualified)
                         } else {
-                            format!("{name} DESC")
-                        }]
+                            format!("{} DESC", column(&name, qualified))
+                        };
+                        vec![parent_key(text, &SortTarget::Name(name))]
                     })
+                    .or_else(|| merged_order)
                     .or_else(|| streamed_order.clone())
                     .or_else(|| window_keys.clone());
                 let covered = presorted
@@ -2188,6 +2281,59 @@ impl MemExecutor {
             .collect()
     }
 
+    /// The ordered scans of `scan_tables`' tables — one per partition for a
+    /// `Merge Append`: each reads the index its ordering column leads
+    /// (index-only when it covers the columns the statement reads), or
+    /// sorts its own rows when it has no such index, as PostgreSQL plans
+    /// them.
+    fn merge_children(
+        &self,
+        ctx: &ExecutionContext,
+        schema_name: &str,
+        scans: &[(nodus_catalog::TableDescriptor, String)],
+        filter: Option<&FilterExpr>,
+        ordering: (&str, bool),
+        index_only: Option<&crate::index_keys::NeededColumns>,
+        allow_index_only: bool,
+        subplans: Option<&Subplans>,
+    ) -> Result<Vec<Node>> {
+        scans
+            .iter()
+            .map(|(table, alias)| {
+                let name = format!("{schema_name}.{}", table.name);
+                let child = self.explain_relation_reading(
+                    ctx,
+                    &name,
+                    Some(alias),
+                    filter,
+                    Some(ordering),
+                    &[],
+                    None,
+                    true,
+                    index_only,
+                    allow_index_only,
+                    subplans,
+                )?;
+                // A partition without an index on the ordering sorts its
+                // own rows, as PostgreSQL sorts each unsorted child.
+                if !matches!(child.kind.as_str(), "Index Scan" | "Index Only Scan") {
+                    let name = format!("{alias}.{}", ordering.0);
+                    let keys = vec![if ordering.1 {
+                        format!("{name} DESC")
+                    } else {
+                        name
+                    }];
+                    let n = child.rows.max(2.0);
+                    let mut sorted = Node::over("Sort", "Sort", vec![child]).keys("Sort Key", keys);
+                    sorted.startup = sorted.total + n * n.log2() * 2.0 * CPU_OPERATOR;
+                    sorted.total = sorted.startup + n * CPU_TUPLE;
+                    return Ok(sorted);
+                }
+                Ok(child)
+            })
+            .collect()
+    }
+
     /// One table's `Seq Scan`, filter included.
     fn scan_node(
         &self,
@@ -2209,6 +2355,10 @@ impl MemExecutor {
         .prop("Alias", json!(alias));
         child.startup = 0.0;
         child.total = pages * PAGE + table_rows * CPU_TUPLE;
+        // A scan chosen while sequential scans are disabled says so.
+        if crate::session_env::setting("enable_seqscan").as_deref() == Some("off") {
+            child = child.detail("Disabled", "true".to_string());
+        }
         if let Some(f) = filter {
             child = child.detail("Filter", deparse_filter(f, false));
             child.total += child.rows * CPU_OPERATOR;
@@ -2371,12 +2521,38 @@ impl MemExecutor {
         };
         let scans = self.scan_tables(db_name, &tbl, table_alias, table_only, filter, only)?;
         if !scans.is_empty() {
-            let children = self.scan_children(ctx, &scans, filter)?;
+            // An ordering their indexes can serve merges the parts' ordered
+            // scans, as PostgreSQL plans a `Merge Append`.
+            let merge = ordering.map(|ordering| {
+                let name = relation_name(table_alias.unwrap_or(table_only));
+                let key = vec![format!(
+                    "{name}.{}{}",
+                    ordering.0,
+                    if ordering.1 { " DESC" } else { "" }
+                )];
+                (ordering, key)
+            });
+            let children = match merge {
+                Some((ordering, _)) => self.merge_children(
+                    ctx,
+                    schema_name,
+                    &scans,
+                    filter,
+                    ordering,
+                    index_only,
+                    allow_index_only,
+                    subplans,
+                )?,
+                None => self.scan_children(ctx, &scans, filter)?,
+            };
             // One partition alone needs no Append: its scan stands in for
             // the parent, under the query's own name.
             if tbl.partition_by.is_some() && children.len() == 1 {
                 let parent_alias = relation_name(table_alias.unwrap_or(table_only));
                 return Ok(single_scan(children, &scans[0].0, &parent_alias));
+            }
+            if let Some((_, key)) = merge {
+                return Ok(merge_append(&tbl, children, &key));
             }
             return Ok(append_scan(&tbl, children));
         }
@@ -2535,10 +2711,9 @@ impl MemExecutor {
                             )),
                         }
                     };
-                    (
-                        join(&index_conds).unwrap_or_else(|| deparse_filter(filter, false)),
-                        join(&residuals),
-                    )
+                    // No conjunct belongs to the index (an ordering scan):
+                    // the whole condition is the scan's `Filter`.
+                    (join(&index_conds).unwrap_or_default(), join(&residuals))
                 }
                 None => (String::new(), None),
             };
@@ -2968,6 +3143,20 @@ fn column(name: &str, qualified: bool) -> String {
         name.to_string()
     } else {
         name.rsplit('.').next().unwrap_or(name).to_string()
+    }
+}
+
+/// The bare column a key names, when it is a plain column.
+fn key_column(target: &SortTarget, projection: &[ProjectionItem]) -> Option<String> {
+    match target {
+        SortTarget::Name(name) => Some(name.rsplit('.').next().unwrap_or(name).to_string()),
+        SortTarget::Output(i) => match projection.get(*i) {
+            Some(ProjectionItem::Column(c)) | Some(ProjectionItem::AliasedColumn(c, _)) => {
+                Some(c.rsplit('.').next().unwrap_or(c).to_string())
+            }
+            _ => None,
+        },
+        _ => None,
     }
 }
 

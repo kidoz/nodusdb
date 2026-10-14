@@ -26,7 +26,8 @@ fn select_list_set_returning_functions_repeat_their_rows() {
     // grouped — PostgreSQL's own complaint.
     let err = sql("SELECT count(*), unnest(tags) FROM t").unwrap_err();
     assert!(
-        err.to_string().contains("must appear in the GROUP BY clause"),
+        err.to_string()
+            .contains("must appear in the GROUP BY clause"),
         "{err}"
     );
 }
