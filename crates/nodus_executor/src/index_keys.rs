@@ -660,6 +660,15 @@ pub(crate) fn index_conds_match(
     true
 }
 
+/// Whether an expression computes a window call (whose columns the window
+/// machinery reads).
+fn expr_has_window(expr: &crate::ScalarExpr) -> bool {
+    if matches!(expr, crate::ScalarExpr::Window(_)) {
+        return true;
+    }
+    expr.children().into_iter().any(expr_has_window)
+}
+
 /// Whether an order-preserving index read serves this sort key: reading the
 /// index forward leaves its leading column ascending with the NULLs last,
 /// reading it backward descending with them first — PostgreSQL's own default
@@ -787,6 +796,28 @@ pub(crate) fn index_only_needed(
             ProjectionItem::Aggregate(_, arg) if arg == "*" => {}
             ProjectionItem::Aggregate(_, arg) => {
                 needed.push(arg.rsplit('.').next().unwrap_or(arg).to_string())
+            }
+            // A window call reads its arguments and its window's keys, so a
+            // covering index can serve the scan under it.
+            ProjectionItem::WindowFunction {
+                args,
+                partition_by,
+                order_by,
+                ..
+            } => needed.extend(
+                args.iter()
+                    .filter(|arg| arg.as_str() != "*")
+                    .chain(partition_by)
+                    .chain(order_by.iter().map(|(column, _)| column))
+                    .map(|name| name.rsplit('.').next().unwrap_or(name).to_string()),
+            ),
+            ProjectionItem::Expr { expr, .. } if expr_has_window(expr) => {
+                let mut refs = Vec::new();
+                crate::filter_eval::scalar_column_refs(expr, &mut refs);
+                needed.extend(
+                    refs.into_iter()
+                        .map(|name| name.rsplit('.').next().unwrap_or(&name).to_string()),
+                );
             }
             _ => return None,
         }

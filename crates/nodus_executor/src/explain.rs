@@ -688,26 +688,15 @@ impl MemExecutor {
                     }
                     child
                 };
-                // An `ORDER BY` on an index's leading column reads the
-                // index in its own order — forward when ascending, backward
-                // when descending — as PostgreSQL plans it, with no `WHERE`
-                // needed.
+                // An `ORDER BY` — or the innermost window's ordering — on an
+                // index's leading column reads the index in its own order —
+                // forward when ascending, backward when descending — as
+                // PostgreSQL plans it, with no `WHERE` needed.
                 let ordering: Option<(String, bool)> = if single
                     && sample.is_none()
                     && crate::session_env::setting("enable_seqscan").as_deref() == Some("off")
-                    && let Some(key) = sort.first()
-                    && crate::index_keys::index_serves_ordering(key.ascending, key.nulls_first)
                 {
-                    let name = match &key.target {
-                        SortTarget::Name(name) => Some(name.clone()),
-                        SortTarget::Output(i) => match projection.get(*i) {
-                            Some(ProjectionItem::Column(c))
-                            | Some(ProjectionItem::AliasedColumn(c, _)) => Some(c.clone()),
-                            _ => None,
-                        },
-                        _ => None,
-                    };
-                    name.map(|name| (name, !key.ascending))
+                    ordering_index_column(&sort, projection)
                 } else {
                     None
                 };
@@ -1274,61 +1263,45 @@ impl MemExecutor {
                 let mut window_names: std::collections::HashMap<String, String> =
                     std::collections::HashMap::new();
                 if !calls.is_empty() {
-                    let mut layers: Vec<WindowLayer> = Vec::new();
-                    for call in &calls {
-                        let key = window_layer_key(call, qualified);
-                        match layers.iter_mut().find(|layer| layer.key == key) {
-                            Some(layer) => layer.calls.push(call),
-                            None => layers.push(WindowLayer {
-                                calls: vec![call],
-                                key,
-                            }),
-                        }
-                    }
-                    let mut clusters: Vec<Vec<usize>> = Vec::new();
-                    for (i, layer) in layers.iter().enumerate() {
-                        let same = clusters.iter_mut().find(|cluster| {
-                            let base = &layers[cluster[0]];
-                            base.window().partition_by == layer.window().partition_by
-                                && base.window().order_by == layer.window().order_by
-                        });
-                        match same {
-                            Some(cluster) => cluster.push(i),
-                            None => clusters.push(vec![i]),
-                        }
-                    }
-                    let (unordered, ordered): (Vec<_>, Vec<_>) = clusters
-                        .into_iter()
-                        .partition(|cluster| layers[cluster[0]].is_unordered());
-                    let order: Vec<usize> = ordered
-                        .into_iter()
-                        .rev()
-                        .chain(unordered)
-                        .flatten()
-                        .collect();
+                    let (layers, order) = window_layer_order(&calls, qualified);
                     let mut provided: Option<Vec<String>> = None;
                     for (number, index) in order.iter().enumerate() {
                         let layer = &layers[*index];
                         window_names.insert(layer.key.clone(), layer.display_name(number + 1));
                         let keys = layer.sort_keys(qualified);
-                        let covered = provided.as_ref().is_some_and(|p| p.starts_with(&keys));
                         // An index scan leaves its column in the order it
-                        // reads: ascending forward, descending backward.
-                        let ordered_by_index = match (index_ordered(&node), keys.as_slice()) {
-                            (Some((ordered_column, ascending)), [key]) => {
-                                let name = column(&ordered_column, qualified);
-                                *key == if ascending {
+                        // reads: ascending forward, descending backward. A
+                        // layer's ordering it only starts is an
+                        // `Incremental Sort` over the prefix.
+                        let presorted: Option<Vec<String>> =
+                            index_ordered(&node).map(|(name, ascending)| {
+                                let name = column(&name, qualified);
+                                vec![if ascending {
                                     name
                                 } else {
                                     format!("{name} DESC")
-                                }
-                            }
-                            _ => false,
-                        };
-                        if !keys.is_empty() && !covered && !ordered_by_index {
+                                }]
+                            });
+                        let covered = provided.as_ref().is_some_and(|p| p.starts_with(&keys))
+                            || presorted.as_ref().is_some_and(|p| p.starts_with(&keys));
+                        let incremental = !covered
+                            && !keys.is_empty()
+                            && presorted
+                                .as_ref()
+                                .is_some_and(|p| !p.is_empty() && keys.starts_with(p));
+                        if !keys.is_empty() && !covered {
                             let n = node.rows.max(2.0);
-                            let mut sorted = Node::over("Sort", "Sort", vec![node])
-                                .keys("Sort Key", keys.clone());
+                            let mut sorted = if incremental {
+                                Node::over("Incremental Sort", "Incremental Sort", vec![node])
+                                    .keys("Sort Key", keys.clone())
+                                    .keys(
+                                        "Presorted Key",
+                                        presorted_keys_text(presorted.as_ref().unwrap()),
+                                    )
+                            } else {
+                                Node::over("Sort", "Sort", vec![node])
+                                    .keys("Sort Key", keys.clone())
+                            };
                             sorted.startup = sorted.total + n * n.log2() * 2.0 * CPU_OPERATOR;
                             sorted.total = sorted.startup + n * CPU_TUPLE;
                             node = sorted;
@@ -1390,21 +1363,12 @@ impl MemExecutor {
                 if !sort.is_empty() && !covered {
                     let n = node.rows.max(2.0);
                     let mut sorted = if incremental {
-                        // PostgreSQL names the presorted columns without
-                        // their direction (`Presorted Key: v`).
                         let mut sorted =
                             Node::over("Incremental Sort", "Incremental Sort", vec![node])
                                 .keys("Sort Key", keys.clone())
                                 .keys(
                                     "Presorted Key",
-                                    presorted
-                                        .clone()
-                                        .unwrap()
-                                        .iter()
-                                        .map(|key| {
-                                            key.strip_suffix(" DESC").unwrap_or(key).to_string()
-                                        })
-                                        .collect::<Vec<_>>(),
+                                    presorted_keys_text(presorted.as_ref().unwrap()),
                                 );
                         sorted.startup = sorted.total + n * n.log2() * 2.0 * CPU_OPERATOR;
                         sorted.total = sorted.startup + n * CPU_TUPLE;
@@ -3065,6 +3029,110 @@ fn dml_filter_references(filter: Option<&FilterExpr>, name: &str) -> usize {
 
 /// The key two calls share when their `OVER` is the same window:
 /// partition, order and frame as written.
+/// The window layers of a query, innermost first: clauses sharing an
+/// ordering stack in the written order (the first innermost); different
+/// orderings stack with the last written innermost, and `OVER ()`
+/// outermost — as PostgreSQL plans them.
+fn window_layer_order<'a>(
+    calls: &[&'a WindowCall],
+    qualified: bool,
+) -> (Vec<WindowLayer<'a>>, Vec<usize>) {
+    let mut layers: Vec<WindowLayer> = Vec::new();
+    for call in calls {
+        let key = window_layer_key(call, qualified);
+        match layers.iter_mut().find(|layer| layer.key == key) {
+            Some(layer) => layer.calls.push(call),
+            None => layers.push(WindowLayer {
+                calls: vec![call],
+                key,
+            }),
+        }
+    }
+    let mut clusters: Vec<Vec<usize>> = Vec::new();
+    for (i, layer) in layers.iter().enumerate() {
+        let same = clusters.iter_mut().find(|cluster| {
+            let base = &layers[cluster[0]];
+            base.window().partition_by == layer.window().partition_by
+                && base.window().order_by == layer.window().order_by
+        });
+        match same {
+            Some(cluster) => cluster.push(i),
+            None => clusters.push(vec![i]),
+        }
+    }
+    let (unordered, ordered): (Vec<_>, Vec<_>) = clusters
+        .into_iter()
+        .partition(|cluster| layers[cluster[0]].is_unordered());
+    let order: Vec<usize> = ordered
+        .into_iter()
+        .rev()
+        .chain(unordered)
+        .flatten()
+        .collect();
+    (layers, order)
+}
+
+/// PostgreSQL names presorted columns without their direction
+/// (`Presorted Key: v`).
+fn presorted_keys_text(keys: &[String]) -> Vec<String> {
+    keys.iter()
+        .map(|key| key.strip_suffix(" DESC").unwrap_or(key).to_string())
+        .collect()
+}
+
+/// The bare column a query's ordering wants its scan to read an index by,
+/// and whether that read runs backward: the innermost window layer's
+/// ordering first — its partition columns first, then its ordering keys, as
+/// the `WindowAgg` nearest the scan needs them — else the query's own
+/// `ORDER BY`. PostgreSQL serves the lower consumer and sorts above it.
+/// `None` when neither names a column an order-preserving index read could
+/// serve.
+pub(crate) fn ordering_index_column(
+    sort: &[crate::plan_types::SortKey],
+    projection: &[crate::plan_types::ProjectionItem],
+) -> Option<(String, bool)> {
+    use crate::plan_types::{ProjectionItem, SortTarget};
+    let mut calls: Vec<&WindowCall> = Vec::new();
+    for item in projection {
+        if let ProjectionItem::Expr { expr, .. } = item {
+            window_calls(expr, &mut calls);
+        }
+    }
+    for key in sort {
+        if let SortTarget::Expr(expr) = &key.target {
+            window_calls(expr, &mut calls);
+        }
+    }
+    if !calls.is_empty() {
+        let (layers, order) = window_layer_order(&calls, true);
+        let window = layers[*order.first()?].window();
+        let leading = match window.partition_by.first() {
+            Some(expr) => Some((expr, true, None)),
+            None => window.order_by.first().map(|(e, asc, nf)| (e, *asc, *nf)),
+        };
+        if let Some((ScalarExpr::Column(name), ascending, nulls_first)) = leading
+            && crate::index_keys::index_serves_ordering(ascending, nulls_first)
+        {
+            return Some((name.clone(), !ascending));
+        }
+    }
+    let key = sort.first()?;
+    if !crate::index_keys::index_serves_ordering(key.ascending, key.nulls_first) {
+        return None;
+    }
+    let name = match &key.target {
+        SortTarget::Name(name) => Some(name.clone()),
+        SortTarget::Output(i) => match projection.get(*i) {
+            Some(ProjectionItem::Column(c)) | Some(ProjectionItem::AliasedColumn(c, _)) => {
+                Some(c.clone())
+            }
+            _ => None,
+        },
+        _ => None,
+    };
+    name.map(|name| (name, !key.ascending))
+}
+
 fn window_layer_key(call: &WindowCall, qualified: bool) -> String {
     format!(
         "{}|{}|{}",
