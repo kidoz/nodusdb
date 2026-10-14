@@ -1,0 +1,252 @@
+# Pulled-up bodies and streaming `DISTINCT`: a derived table or single-use
+# CTE is pulled up, so the outer query's `ORDER BY` and the columns it
+# reads reach the body's own scan — the index reads in that order (with no
+# `Sort`) and covers what the whole statement needs (`Index Only Scan`).
+# With index scans asked for (`SET enable_seqscan = off`), a `DISTINCT`
+# over a projection that is all columns dedups the stream an index orders
+# (`Unique`) instead of hashing: the scan reads the columns in an index's
+# order — forward or backward — and the query's `ORDER BY` is extended to
+# the whole distinct list, since only such an order leaves equal rows
+# adjacent (`Incremental Sort` over the index's prefix). Plans and results
+# from PostgreSQL 18.4.
+#
+# Known divergences: PostgreSQL's cost-based choices stay ours to make
+# (`distinct k` alone hashes on a small table where PostgreSQL reads the
+# index, and a whole-table descending `DISTINCT` goes through a bitmap
+# scan; with sequential scans enabled PostgreSQL still reads the index for
+# a distinct order). A pulled-up body's columns print qualified in
+# PostgreSQL's key texts (`Sort Key: g1.v DESC`); ours print them bare.
+# When a `WHERE` range has its own index, NodusDB reads that index and
+# sorts where PostgreSQL prefers the one that also serves the ordering or
+# the dedup. A `DISTINCT` without `ORDER BY` returns rows in the engine's
+# own order (`LIMIT`ed or not).
+
+statement ok
+drop table if exists g1 cascade;
+
+statement ok
+create table g1 (k int primary key, v int);
+
+statement ok
+insert into g1 select i, i * 7 % 41 from generate_series(1, 40) i;
+
+statement ok
+create index g1_v on g1 (v);
+
+statement ok
+analyze g1;
+
+statement ok
+set enable_seqscan = off;
+
+query T
+explain (costs off) select * from (select * from g1 where v > 20) s order by v desc;
+----
+Index Scan Backward using g1_v on g1
+  Index Cond: (v > 20)
+
+query T
+explain (costs off) select * from (select * from g1 where v > 20) s order by v;
+----
+Index Scan using g1_v on g1
+  Index Cond: (v > 20)
+
+query T
+explain (costs off) select * from (select * from g1) s order by v desc limit 5;
+----
+Limit
+  ->  Index Scan Backward using g1_v on g1
+
+query T
+explain (costs off) with c as (select * from g1 where v > 20) select * from c order by v desc;
+----
+Index Scan Backward using g1_v on g1
+  Index Cond: (v > 20)
+
+query T
+explain (costs off) select distinct v from g1;
+----
+Unique
+  ->  Index Only Scan using g1_v on g1
+
+query T
+explain (costs off) select distinct v from g1 order by v;
+----
+Unique
+  ->  Index Only Scan using g1_v on g1
+
+query T
+explain (costs off) select distinct v from g1 order by v desc;
+----
+Unique
+  ->  Index Only Scan Backward using g1_v on g1
+
+query T
+explain (costs off) select distinct v from g1 where v > 10 order by v desc;
+----
+Unique
+  ->  Index Only Scan Backward using g1_v on g1
+        Index Cond: (v > 10)
+
+query T
+explain (costs off) select distinct v from g1 limit 3;
+----
+Limit
+  ->  Unique
+        ->  Index Only Scan using g1_v on g1
+
+query T
+explain (costs off) select distinct v from g1 order by v nulls first;
+----
+Unique
+  ->  Sort
+        Sort Key: v NULLS FIRST
+        ->  Index Only Scan using g1_v on g1
+
+query T
+explain (costs off) select distinct v from g1 order by v limit 3 offset 2;
+----
+Limit
+  ->  Unique
+        ->  Index Only Scan using g1_v on g1
+
+query T
+explain (costs off) select distinct v from (select * from g1 where v > 5) s order by v desc;
+----
+Unique
+  ->  Index Only Scan Backward using g1_v on g1
+        Index Cond: (v > 5)
+
+statement ok
+insert into g1 values (100, null), (101, 60), (102, 61);
+
+query T
+select distinct v from g1 order by v nulls first limit 4;
+----
+NULL
+1
+2
+3
+
+query T
+select distinct v from g1 order by v desc nulls last;
+----
+61
+60
+40
+39
+38
+37
+36
+35
+34
+33
+32
+31
+30
+29
+28
+27
+26
+25
+24
+23
+22
+21
+20
+19
+18
+17
+16
+15
+14
+13
+12
+11
+10
+9
+8
+7
+6
+5
+4
+3
+2
+1
+NULL
+
+query T
+select distinct v, k from g1 order by v nulls first, k limit 4;
+----
+NULL	100
+1	6
+2	12
+3	18
+
+query T
+select k, v from (select * from g1 where v > 20) s order by v desc limit 5;
+----
+102	61
+101	60
+35	40
+29	39
+23	38
+
+statement ok
+begin;
+
+statement ok
+insert into g1 values (200, 99);
+
+statement ok
+delete from g1 where k = 1;
+
+query T
+select distinct v from g1 order by v desc nulls last limit 5;
+----
+99
+61
+60
+40
+39
+
+statement ok
+rollback;
+
+query T
+select distinct v from g1 where v > 20 order by v desc;
+----
+61
+60
+40
+39
+38
+37
+36
+35
+34
+33
+32
+31
+30
+29
+28
+27
+26
+25
+24
+23
+22
+21
+
+statement ok
+reset enable_seqscan;
+
+query T
+select distinct v from g1 order by v desc nulls last limit 4;
+----
+61
+60
+40
+39
+
