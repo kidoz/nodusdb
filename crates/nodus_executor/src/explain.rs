@@ -689,15 +689,16 @@ impl MemExecutor {
                     child
                 };
                 // An `ORDER BY` on an index's leading column reads the
-                // index in its own order, as PostgreSQL plans it — no
-                // `WHERE` needed.
-                let ordering: Option<String> = if single
+                // index in its own order — forward when ascending, backward
+                // when descending — as PostgreSQL plans it, with no `WHERE`
+                // needed.
+                let ordering: Option<(String, bool)> = if single
                     && sample.is_none()
                     && crate::session_env::setting("enable_seqscan").as_deref() == Some("off")
                     && let Some(key) = sort.first()
-                    && key.ascending
+                    && crate::index_keys::index_serves_ordering(key.ascending, key.nulls_first)
                 {
-                    match &key.target {
+                    let name = match &key.target {
                         SortTarget::Name(name) => Some(name.clone()),
                         SortTarget::Output(i) => match projection.get(*i) {
                             Some(ProjectionItem::Column(c))
@@ -705,7 +706,8 @@ impl MemExecutor {
                             _ => None,
                         },
                         _ => None,
-                    }
+                    };
+                    name.map(|name| (name, !key.ascending))
                 } else {
                     None
                 };
@@ -714,7 +716,9 @@ impl MemExecutor {
                     table_name,
                     table_alias.as_deref(),
                     scan_filter,
-                    ordering.as_deref(),
+                    ordering
+                        .as_ref()
+                        .map(|(name, backwards)| (name.as_str(), *backwards)),
                     &scope,
                     sample.as_ref(),
                     *only,
@@ -1116,8 +1120,9 @@ impl MemExecutor {
                 } else {
                     sort.clone()
                 };
-                // An index scan already reads the leading column in order,
-                // so `ORDER BY` it adds no Sort, as PostgreSQL plans it.
+                // An index scan already reads the leading column in order —
+                // forward or backward — so `ORDER BY` it adds no Sort, as
+                // PostgreSQL plans it.
                 let index_ordered = |node: &Node| -> Option<(String, bool)> {
                     if node.kind != "Index Scan" && node.kind != "Index Only Scan" {
                         return None;
@@ -1128,6 +1133,10 @@ impl MemExecutor {
                         .find(|(name, _)| *name == "Index Name")
                         .and_then(|(_, value)| value.as_str())
                         .map(str::to_string)?;
+                    let backwards = node
+                        .props
+                        .iter()
+                        .any(|(name, value)| *name == "Scan Direction" && value == "Backward");
                     let (db, schema, table) = parse_object_name(table_name).ok()?;
                     let tbl = self.catalog_reader.get_table(db, schema, table).ok()?;
                     let idx = tbl.indexes.iter().find(|i| i.name == name)?;
@@ -1136,7 +1145,7 @@ impl MemExecutor {
                         return None;
                     }
                     let column = tbl.columns.iter().find(|c| c.id == key.column_id)?;
-                    Some((column.name.clone(), true))
+                    Some((column.name.clone(), !backwards))
                 };
                 let aggregated = !group_by.is_empty()
                     || having.is_some()
@@ -1303,10 +1312,19 @@ impl MemExecutor {
                         window_names.insert(layer.key.clone(), layer.display_name(number + 1));
                         let keys = layer.sort_keys(qualified);
                         let covered = provided.as_ref().is_some_and(|p| p.starts_with(&keys));
-                        let ordered_by_index = matches!(
-                            (index_ordered(&node), keys.as_slice()),
-                            (Some((column, true)), [key]) if key == &column
-                        );
+                        // An index scan leaves its column in the order it
+                        // reads: ascending forward, descending backward.
+                        let ordered_by_index = match (index_ordered(&node), keys.as_slice()) {
+                            (Some((ordered_column, ascending)), [key]) => {
+                                let name = column(&ordered_column, qualified);
+                                *key == if ascending {
+                                    name
+                                } else {
+                                    format!("{name} DESC")
+                                }
+                            }
+                            _ => false,
+                        };
                         if !keys.is_empty() && !covered && !ordered_by_index {
                             let n = node.rows.max(2.0);
                             let mut sorted = Node::over("Sort", "Sort", vec![node])
@@ -1352,8 +1370,14 @@ impl MemExecutor {
                 // ordering; `ORDER BY` reuses it — exactly, or as an
                 // Incremental Sort over the prefix it already has.
                 let presorted: Option<Vec<String>> = index_ordered(&node)
-                    .filter(|(_, ascending)| *ascending)
-                    .map(|(name, _)| vec![column(&name, qualified)])
+                    .map(|(name, ascending)| {
+                        let name = column(&name, qualified);
+                        vec![if ascending {
+                            name
+                        } else {
+                            format!("{name} DESC")
+                        }]
+                    })
                     .or_else(|| window_keys.clone());
                 let covered = presorted
                     .as_ref()
@@ -1366,10 +1390,22 @@ impl MemExecutor {
                 if !sort.is_empty() && !covered {
                     let n = node.rows.max(2.0);
                     let mut sorted = if incremental {
+                        // PostgreSQL names the presorted columns without
+                        // their direction (`Presorted Key: v`).
                         let mut sorted =
                             Node::over("Incremental Sort", "Incremental Sort", vec![node])
                                 .keys("Sort Key", keys.clone())
-                                .keys("Presorted Key", presorted.clone().unwrap());
+                                .keys(
+                                    "Presorted Key",
+                                    presorted
+                                        .clone()
+                                        .unwrap()
+                                        .iter()
+                                        .map(|key| {
+                                            key.strip_suffix(" DESC").unwrap_or(key).to_string()
+                                        })
+                                        .collect::<Vec<_>>(),
+                                );
                         sorted.startup = sorted.total + n * n.log2() * 2.0 * CPU_OPERATOR;
                         sorted.total = sorted.startup + n * CPU_TUPLE;
                         sorted
@@ -2014,7 +2050,9 @@ impl MemExecutor {
         table_name: &str,
         table_alias: Option<&str>,
         filter: Option<&FilterExpr>,
-        ordering: Option<&str>,
+        // The column an `ORDER BY` reads the index in order by, and whether
+        // it reads it backward (`DESC`).
+        ordering: Option<(&str, bool)>,
         ctes: &[(String, &LogicalPlan)],
         sample: Option<&crate::SampleSpec>,
         only: bool,
@@ -2175,7 +2213,7 @@ impl MemExecutor {
         };
         // An `ORDER BY` on an index's leading column reads the index in
         // its own order, with no condition of its own.
-        let ordering_index = ordering.and_then(|ordering| {
+        let ordering_index = ordering.and_then(|(ordering, _)| {
             if crate::session_env::setting("enable_seqscan").as_deref() != Some("off") {
                 return None;
             }
@@ -2222,6 +2260,13 @@ impl MemExecutor {
             None
         };
         let scan_index = scan_index.or(covering_index);
+        // A descending `ORDER BY` reads the index backward, whichever way
+        // the scan's own condition picked it.
+        let backwards = ordering.is_some_and(|(name, backwards)| {
+            let bare = name.rsplit('.').next().unwrap_or(name);
+            backwards
+                && scan_index.is_some_and(|(column, _)| column.name.eq_ignore_ascii_case(bare))
+        });
         if sample.is_none()
             && let Some((col, idx)) = scan_index
             && let Some(idx) =
@@ -2377,19 +2422,16 @@ impl MemExecutor {
                 node.total = 8.17;
                 return Ok(node);
             }
+            let scan_kind = if only {
+                "Index Only Scan"
+            } else {
+                "Index Scan"
+            };
             let mut node = Node::new(
-                if only {
-                    "Index Only Scan"
-                } else {
-                    "Index Scan"
-                },
+                scan_kind,
                 format!(
-                    "{} using {} on {label}",
-                    if only {
-                        "Index Only Scan"
-                    } else {
-                        "Index Scan"
-                    },
+                    "{scan_kind}{} using {} on {label}",
+                    if backwards { " Backward" } else { "" },
                     idx.name
                 ),
                 if idx.unique {
@@ -2399,7 +2441,10 @@ impl MemExecutor {
                 },
                 width,
             )
-            .prop("Scan Direction", json!("Forward"))
+            .prop(
+                "Scan Direction",
+                json!(if backwards { "Backward" } else { "Forward" }),
+            )
             .prop("Index Name", json!(idx.name))
             .prop("Relation Name", json!(table_only))
             .prop("Alias", json!(table_alias.unwrap_or(table_only)));
@@ -3132,21 +3177,12 @@ impl<'a> WindowLayer<'a> {
             .iter()
             .map(|e| window_expr_text(e, qualified))
             .collect();
+        // PostgreSQL's `Window:` line names the ordering's expressions
+        // without their direction or NULLS placement.
         let order: Vec<String> = window
             .order_by
             .iter()
-            .map(|key| {
-                let mut text = window_expr_text(&key.0, qualified);
-                if !key.1 {
-                    text.push_str(" DESC");
-                }
-                match (key.2, key.1) {
-                    (Some(true), true) => text.push_str(" NULLS FIRST"),
-                    (Some(false), false) => text.push_str(" NULLS LAST"),
-                    _ => {}
-                }
-                text
-            })
+            .map(|key| window_expr_text(&key.0, qualified))
             .collect();
         let mut parts: Vec<String> = Vec::new();
         if !partition.is_empty() {

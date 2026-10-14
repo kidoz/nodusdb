@@ -660,6 +660,17 @@ pub(crate) fn index_conds_match(
     true
 }
 
+/// Whether an order-preserving index read serves this sort key: reading the
+/// index forward leaves its leading column ascending with the NULLs last,
+/// reading it backward descending with them first — PostgreSQL's own default
+/// placements. An explicit placement the other way needs a Sort.
+pub(crate) fn index_serves_ordering(ascending: bool, nulls_first: Option<bool>) -> bool {
+    match ascending {
+        true => nulls_first != Some(true),
+        false => nulls_first != Some(false),
+    }
+}
+
 /// The columns a sort's keys read, when they are plain columns (`None`
 /// otherwise, so nothing index-only reads an unknown column).
 pub(crate) fn sort_columns(

@@ -745,15 +745,16 @@ impl MemExecutor {
                     }
                 }
                 // With index scans asked for, an `ORDER BY` on an index's
-                // leading column reads the index in its own order, as
-                // PostgreSQL plans it — no `WHERE` needed.
+                // leading column reads the index in its own order — forward
+                // for ascending, backward for descending — as PostgreSQL
+                // plans it, with no `WHERE` needed.
                 if rows.is_none()
                     && sample.is_none()
                     && joins.is_empty()
                     && descendants.is_empty()
                     && crate::session_env::setting("enable_seqscan").as_deref() == Some("off")
                     && let Some(key) = sort.first()
-                    && key.ascending
+                    && crate::index_keys::index_serves_ordering(key.ascending, key.nulls_first)
                     && let Some(name) = match &key.target {
                         SortTarget::Name(name) => Some(name.clone()),
                         SortTarget::Output(i) => match projection.get(*i) {
