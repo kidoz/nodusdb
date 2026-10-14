@@ -654,14 +654,31 @@ impl MemExecutor {
                 } else {
                     sort.clone()
                 };
-                let needed_columns =
-                    crate::index_keys::index_only_needed(projection, filter).map(|needed| {
-                        crate::index_keys::add_needed(
-                            needed,
-                            &crate::index_keys::sort_columns(&sort_keys, projection)
-                                .unwrap_or_default(),
-                        )
-                    });
+                // What the outer query left for a pulled-up body of ours.
+                let subordinate = take_subordinate();
+                let needed_columns = match (
+                    crate::index_keys::index_only_needed(projection, filter),
+                    subordinate.needed,
+                ) {
+                    // A `SELECT *` body reads what the outer query reads —
+                    // its own conditions included — as PostgreSQL's pull-up
+                    // plans it.
+                    (Some(crate::index_keys::NeededColumns::All), Some(outer)) => {
+                        let mut refs = Vec::new();
+                        if let Some(filter) = filter {
+                            crate::filter_eval::filter_column_refs(filter, &mut refs);
+                        }
+                        Some(crate::index_keys::add_needed(outer, &refs))
+                    }
+                    (own, _) => own,
+                }
+                .map(|needed| {
+                    crate::index_keys::add_needed(
+                        needed,
+                        &crate::index_keys::sort_columns(&sort_keys, projection)
+                            .unwrap_or_default(),
+                    )
+                });
                 let allow_index_only = single
                     && group_by.is_empty()
                     && distinct_on.is_empty()
@@ -696,7 +713,26 @@ impl MemExecutor {
                     && sample.is_none()
                     && crate::session_env::setting("enable_seqscan").as_deref() == Some("off")
                 {
-                    ordering_index_column(&sort, projection)
+                    ordering_index_column(&sort, projection).or_else(|| {
+                        // A pulled-up body that adds no ordering of its own
+                        // takes the outer query's, as PostgreSQL's plans show.
+                        let mut calls: Vec<&WindowCall> = Vec::new();
+                        for item in projection {
+                            if let ProjectionItem::Expr { expr, .. } = item {
+                                window_calls(expr, &mut calls);
+                            }
+                        }
+                        (sort.is_empty()
+                            && group_by.is_empty()
+                            && !*distinct
+                            && distinct_on.is_empty()
+                            && having.is_none()
+                            && limit.is_none()
+                            && offset.is_none()
+                            && calls.is_empty())
+                        .then(|| subordinate.ordering.clone())
+                        .flatten()
+                    })
                 } else {
                     None
                 };
@@ -1126,7 +1162,16 @@ impl MemExecutor {
                         .props
                         .iter()
                         .any(|(name, value)| *name == "Scan Direction" && value == "Backward");
-                    let (db, schema, table) = parse_object_name(table_name).ok()?;
+                    // The scan may belong to a pulled-up body: it names its
+                    // own relation.
+                    let relation = node
+                        .props
+                        .iter()
+                        .find(|(name, _)| *name == "Relation Name")
+                        .and_then(|(_, value)| value.as_str())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| table_name.to_string());
+                    let (db, schema, table) = parse_object_name(&relation).ok()?;
                     let tbl = self.catalog_reader.get_table(db, schema, table).ok()?;
                     let idx = tbl.indexes.iter().find(|i| i.name == name)?;
                     let key = idx.key_columns.first()?;
@@ -2037,11 +2082,23 @@ impl MemExecutor {
             // A recursive CTE reads itself: rendering its body again
             // would never end, so the scan stands alone.
             let recursive = matches!(&**plan, LogicalPlan::RecursiveCte { .. });
+            // A derived table or single-use CTE is pulled up: the query's
+            // ordering and its column needs reach the body's own scan, as
+            // PostgreSQL's pull-up plans show.
+            let _subordinate = (cte_inlined_here(table_name)
+                && matches!(&**plan, LogicalPlan::Select { .. }))
+            .then(|| {
+                SubordinateGuard::enter(Subordinate {
+                    ordering: ordering.map(|(name, backwards)| (name.to_string(), backwards)),
+                    needed: index_only.cloned(),
+                })
+            });
             let child = if recursive {
                 Node::new("CTE Scan", format!("CTE Scan on {name}"), 100.0, 64)
             } else {
                 self.explain_node(ctx, plan, ctes)?
             };
+            drop(_subordinate);
             drop(_cte_body);
             // The wrapper a query over a set operation or VALUES list gets.
             if name == "\u{0}result" {
@@ -2639,6 +2696,44 @@ thread_local! {
     /// self-reference is a `WorkTable Scan`.
     static CTE_BODIES: std::cell::RefCell<Vec<String>> =
         const { std::cell::RefCell::new(Vec::new()) };
+}
+
+thread_local! {
+    /// What the outer query needs of a pulled-up body's scan — its ordering
+    /// and the columns it reads — reaching the base scan, as PostgreSQL's
+    /// pull-up plans it. Consumed once by the body.
+    static SUBORDINATE: std::cell::RefCell<Option<Subordinate>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// A pulled-up body's inherited requirements.
+#[derive(Default)]
+struct Subordinate {
+    ordering: Option<(String, bool)>,
+    needed: Option<crate::index_keys::NeededColumns>,
+}
+
+/// Takes what the outer query left for a pulled-up body, if anything.
+fn take_subordinate() -> Subordinate {
+    SUBORDINATE
+        .with(|slot| slot.borrow_mut().take())
+        .unwrap_or_default()
+}
+
+/// Leaves the outer query's requirements for a pulled-up `Select` body,
+/// restoring the slot after the body renders.
+struct SubordinateGuard(Option<Subordinate>);
+
+impl SubordinateGuard {
+    fn enter(subordinate: Subordinate) -> Self {
+        SubordinateGuard(SUBORDINATE.with(|slot| slot.borrow_mut().replace(subordinate)))
+    }
+}
+
+impl Drop for SubordinateGuard {
+    fn drop(&mut self) {
+        SUBORDINATE.with(|slot| *slot.borrow_mut() = self.0.take());
+    }
 }
 
 fn rendering_cte_body() -> bool {
