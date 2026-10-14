@@ -1,0 +1,222 @@
+# Witness joins: an `[NOT] EXISTS` / `IN` whose inner is unique on the join
+# keys — a primary key or unique index covering the columns the equality
+# reads — matches at most one row, so PostgreSQL plans it as a plain inner
+# join, marked `"Inner Unique": true`, instead of a semi join. A non-unique
+# inner keeps the semi join (`Hash Semi Join`), `NOT EXISTS` keeps its anti
+# join, and a composite unique index witnesses only when every one of its
+# columns takes part. Plans and results from PostgreSQL 18.4; JSON parity is
+# covered by the parsed-tree sweep (multi-line JSON values do not fit a
+# sqllogictest record).
+#
+# Known divergences: a non-unique inner that PostgreSQL makes unique by
+# deduplicating it (`HashAggregate` under the `Hash`) keeps its semi join
+# here; the nested-loop form (`Nested Loop` with `Inner Unique`, when hash
+# joins are disabled) keeps its `Nested Loop Semi Join` label.
+
+statement ok
+drop table if exists w1 cascade;
+
+statement ok
+create table w1 (k int primary key, v int);
+
+statement ok
+insert into w1 select i, i * 7 % 41 from generate_series(1, 40) i;
+
+statement ok
+analyze w1;
+
+statement ok
+drop table if exists w2 cascade;
+
+statement ok
+create table w2 (a int, b int, c int, primary key (a, b));
+
+statement ok
+insert into w2 select i % 5, i, i from generate_series(1, 20) i;
+
+statement ok
+analyze w2;
+
+statement ok
+set enable_mergejoin = off;
+
+statement ok
+set enable_nestloop = off;
+
+query T
+explain (costs off) select * from w1 g where exists (select 1 from w1 x where x.k = g.v);
+----
+Hash Join
+  Hash Cond: (g.v = x.k)
+  ->  Seq Scan on w1 g
+  ->  Hash
+        ->  Seq Scan on w1 x
+
+query T
+explain (costs off) select * from w1 g where g.v in (select x.k from w1 x);
+----
+Hash Join
+  Hash Cond: (g.v = x.k)
+  ->  Seq Scan on w1 g
+  ->  Hash
+        ->  Seq Scan on w1 x
+
+query T
+explain (costs off) select * from w1 g where exists (select 1 from w1 x where x.k = g.v and x.v > 20);
+----
+Hash Join
+  Hash Cond: (g.v = x.k)
+  ->  Seq Scan on w1 g
+  ->  Hash
+        ->  Seq Scan on w1 x
+              Filter: (v > 20)
+
+query T
+explain (costs off) select * from w1 g where not exists (select 1 from w1 x where x.k = g.v);
+----
+Hash Anti Join
+  Hash Cond: (g.v = x.k)
+  ->  Seq Scan on w1 g
+  ->  Hash
+        ->  Seq Scan on w1 x
+
+query T
+explain (costs off) select * from w1 g where exists (select 1 from w1 x where x.v = g.v);
+----
+Hash Semi Join
+  Hash Cond: (g.v = x.v)
+  ->  Seq Scan on w1 g
+  ->  Hash
+        ->  Seq Scan on w1 x
+
+query T
+explain (costs off) select * from w2 g where exists (select 1 from w2 x where x.a = g.c and x.b = g.a);
+----
+Hash Join
+  Hash Cond: ((g.c = x.a) AND (g.a = x.b))
+  ->  Seq Scan on w2 g
+  ->  Hash
+        ->  Seq Scan on w2 x
+
+query T
+explain (costs off) delete from w1 g where exists (select 1 from w1 x where x.k = g.v);
+----
+Delete on w1 g
+  ->  Hash Join
+        Hash Cond: (g.v = x.k)
+        ->  Seq Scan on w1 g
+        ->  Hash
+              ->  Seq Scan on w1 x
+
+query T
+explain (costs off) update w1 g set v = 0 where exists (select 1 from w1 x where x.k = g.v);
+----
+Update on w1 g
+  ->  Hash Join
+        Hash Cond: (g.v = x.k)
+        ->  Seq Scan on w1 g
+        ->  Hash
+              ->  Seq Scan on w1 x
+
+query T
+select g.k, g.v from w1 g where exists (select 1 from w1 x where x.k = g.v) order by g.k;
+----
+1	7
+2	14
+3	21
+4	28
+5	35
+6	1
+7	8
+8	15
+9	22
+10	29
+11	36
+12	2
+13	9
+14	16
+15	23
+16	30
+17	37
+18	3
+19	10
+20	17
+21	24
+22	31
+23	38
+24	4
+25	11
+26	18
+27	25
+28	32
+29	39
+30	5
+31	12
+32	19
+33	26
+34	33
+35	40
+36	6
+37	13
+38	20
+39	27
+40	34
+
+query T
+select g.k from w1 g where g.v in (select x.k from w1 x) order by g.k;
+----
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+24
+25
+26
+27
+28
+29
+30
+31
+32
+33
+34
+35
+36
+37
+38
+39
+40
+
+query T
+select g.k from w1 g where not exists (select 1 from w1 x where x.k = g.v) order by g.k;
+----
+
+query T
+select count(*) from w1 g where exists (select 1 from w1 x where x.k = g.v);
+----
+40
+
+query T
+select count(*) from w1 g where exists (select 1 from w1 x where x.v = g.v);
+----
+40
+
