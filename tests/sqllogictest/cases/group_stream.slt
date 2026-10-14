@@ -1,0 +1,214 @@
+# Grouped aggregation as a stream: a `GROUP BY` whose columns lead an
+# order-preserving index reads as PostgreSQL's streaming `Group` (no
+# aggregates) or `GroupAggregate` over that index scan — forward, or
+# backward when the `ORDER BY` descends — with no `Sort` and no
+# `HashAggregate`; the query's own `ORDER BY` is reused when the sort's
+# keys start with the grouping columns (PostgreSQL sorts first and
+# collects the groups off the sorted stream). A grouped query reads its
+# grouping columns and `HAVING` names, so a covering index serves it
+# (`Index Only Scan`). Every column a grouped query reads outside an
+# aggregate must be grouped, as PostgreSQL requires. Plans and results
+# from PostgreSQL 18.4.
+#
+# Known divergences: PostgreSQL's cost-based choices stay ours to make
+# (`enable_seqscan = off` gates ours; with sequential scans enabled
+# PostgreSQL still streams where NodusDB hashes); a grouping the primary
+# key functionally determines is reduced in PostgreSQL's `Group Key:`
+# (`group by v, k` with `k` unique shows `Group Key: k`); expression
+# groupings hash in both engines. The ungrouped-column message names the
+# column bare here where PostgreSQL qualifies it.
+
+statement error
+select v, k from g1 group by v;
+
+statement error
+select k from g1 group by v;
+
+statement error
+select v from g1 group by v order by k;
+
+statement error
+select v from g1 group by v having k > 0;
+
+statement error
+select row_number() over (order by k) from g1 group by v;
+
+statement ok
+drop table if exists g1 cascade;
+
+statement ok
+create table g1 (k int primary key, v int);
+
+statement ok
+insert into g1 select i, i * 7 % 41 from generate_series(1, 40) i;
+
+statement ok
+create index g1_v on g1 (v);
+
+statement ok
+analyze g1;
+
+statement ok
+drop table if exists g2 cascade;
+
+statement ok
+create table g2 (a int, b int);
+
+statement ok
+insert into g2 select i * 7 % 41, i from generate_series(1, 40) i;
+
+statement ok
+create index g2_ab on g2 (a, b);
+
+statement ok
+analyze g2;
+
+statement ok
+set enable_seqscan = off;
+
+query T
+explain (costs off) select v from g1 group by v order by v desc;
+----
+Group
+  Group Key: v
+  ->  Index Only Scan Backward using g1_v on g1
+
+query T
+explain (costs off) select v, count(*) from g1 group by v order by v desc;
+----
+GroupAggregate
+  Group Key: v
+  ->  Index Only Scan Backward using g1_v on g1
+
+query T
+explain (costs off) select k, count(*) from g1 group by k;
+----
+GroupAggregate
+  Group Key: k
+  ->  Index Only Scan using g1_pkey on g1
+
+query T
+explain (costs off) select v from g1 group by v;
+----
+Group
+  Group Key: v
+  ->  Index Only Scan using g1_v on g1
+
+query T
+explain (costs off) select v, count(*) c from g1 group by v having count(*) > 0 order by v desc;
+----
+GroupAggregate
+  Group Key: v
+  Filter: (count(*) > 0)
+  ->  Index Only Scan Backward using g1_v on g1
+
+query T
+explain (costs off) select count(*) from g1 group by v;
+----
+GroupAggregate
+  Group Key: v
+  ->  Index Only Scan using g1_v on g1
+
+query T
+explain (costs off) select v, max(k) from g1 group by v order by v;
+----
+GroupAggregate
+  Group Key: v
+  ->  Index Scan using g1_v on g1
+
+query T
+explain (costs off) select v + 1 from g1 group by v + 1;
+----
+HashAggregate
+  Group Key: (v + 1)
+  ->  Index Only Scan using g1_v on g1
+
+query T
+explain (costs off) select b, count(*) from g2 group by b order by b desc;
+----
+GroupAggregate
+  Group Key: b
+  ->  Sort
+        Sort Key: b DESC
+        ->  Index Only Scan using g2_ab on g2
+
+query T
+explain (costs off) select a, b from g2 group by b, a order by a, b;
+----
+Group
+  Group Key: a, b
+  ->  Index Only Scan using g2_ab on g2
+
+query T
+explain (costs off) select a, b, count(*) from g2 group by a, b;
+----
+GroupAggregate
+  Group Key: a, b
+  ->  Index Only Scan using g2_ab on g2
+
+query T
+explain (costs off) select a from g2 group by a order by a desc;
+----
+Group
+  Group Key: a
+  ->  Index Only Scan Backward using g2_ab on g2
+
+statement ok
+insert into g1 values (100, null), (101, 5);
+
+query T
+select v, count(*) from g1 group by v order by v nulls first limit 4;
+----
+NULL	1
+1	1
+2	1
+3	1
+
+query T
+select v from g1 group by v order by v desc nulls last limit 3;
+----
+40
+39
+38
+
+query T
+select v, count(*) c from g1 group by v having count(*) > 0 order by v desc nulls last limit 5;
+----
+40	1
+39	1
+38	1
+37	1
+36	1
+
+query T
+select v, count(*) from g1 group by v having count(*) > 1;
+----
+5	2
+
+statement ok
+begin;
+
+statement ok
+insert into g1 values (200, 99);
+
+statement ok
+delete from g1 where k = 1;
+
+query T
+select v, count(*) from g1 group by v order by v desc nulls last limit 4;
+----
+99	1
+40	1
+39	1
+38	1
+
+statement ok
+rollback;
+
+query T
+select v from g1 group by v order by v asc nulls first limit 3;
+----
+NULL
+1
+2
+
