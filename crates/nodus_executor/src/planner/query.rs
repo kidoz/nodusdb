@@ -432,6 +432,49 @@ pub(crate) fn plan_query(query: &sqlparser::ast::Query, params: &[Value]) -> Res
         .as_ref()
         .map(|expr| parse_having(expr, params))
         .transpose()?;
+    // PostgreSQL's rule for a grouped query: every column read outside an
+    // aggregate must be a grouping column (or inside a grouping expression).
+    if !group_by.is_empty() || having.is_some() || projection.iter().any(item_aggregated) {
+        for item in &projection {
+            match item {
+                ProjectionItem::Column(name) | ProjectionItem::AliasedColumn(name, _) => {
+                    check_grouped_expr(&ScalarExpr::Column(name.clone()), &group_by, &group_exprs)?;
+                }
+                ProjectionItem::Expr { expr, .. } => {
+                    check_grouped_expr(expr, &group_by, &group_exprs)?;
+                }
+                ProjectionItem::Aggregate(..) => {}
+                // Legacy item shapes are left out rather than refusing a
+                // query PostgreSQL accepts.
+                _ => {}
+            }
+        }
+        for key in &sort {
+            match &key.target {
+                SortTarget::Expr(expr) => check_grouped_expr(expr, &group_by, &group_exprs)?,
+                SortTarget::Name(name) => {
+                    // A name that is no output column of the select list is
+                    // an input column.
+                    let output = projection.iter().any(|item| {
+                        item_alias(item) == Some(name.as_str())
+                            || matches!(item, ProjectionItem::Column(c)
+                                if c.rsplit('.').next() == Some(name.as_str()))
+                    });
+                    if !output {
+                        check_grouped_expr(
+                            &ScalarExpr::Column(name.clone()),
+                            &group_by,
+                            &group_exprs,
+                        )?;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some(FilterExpr::Scalar(expr)) = &having {
+            check_grouped_expr(expr, &group_by, &group_exprs)?;
+        }
+    }
 
     // Set-returning functions in the select list run per input row, as a
     // lateral join whose columns stand in for the calls. Grouping and
@@ -851,6 +894,61 @@ fn item_expr(item: &ProjectionItem) -> Option<ScalarExpr> {
 }
 
 /// A select item's `AS` name, if it has one.
+/// Whether a select item computes an aggregate.
+fn item_aggregated(item: &ProjectionItem) -> bool {
+    match item {
+        ProjectionItem::Aggregate(..) => true,
+        ProjectionItem::Expr { expr, .. } => scalar_has_aggregate(expr),
+        _ => false,
+    }
+}
+
+/// Checks one expression of a grouped query: every column it reads outside
+/// an aggregate must be a grouping column, or the whole expression one of
+/// the grouping expressions, as PostgreSQL's check requires.
+fn check_grouped_expr(
+    expr: &ScalarExpr,
+    group_by: &[String],
+    group_exprs: &[(String, ScalarExpr)],
+) -> Result<()> {
+    // Column names compare by the column they name, qualified or not.
+    fn bare(name: &str) -> &str {
+        name.rsplit('.').next().unwrap_or(name)
+    }
+    fn bare_columns(expr: &ScalarExpr) -> ScalarExpr {
+        if let ScalarExpr::Column(name) = expr {
+            return ScalarExpr::Column(name.rsplit('.').next().unwrap_or(name).to_string());
+        }
+        expr.map_children(&mut |child| bare_columns(child))
+    }
+    // A whole grouping expression stands for the columns inside it.
+    if group_exprs
+        .iter()
+        .any(|(_, grouped)| bare_columns(grouped) == bare_columns(expr))
+    {
+        return Ok(());
+    }
+    match expr {
+        // An aggregate reads its own rows, not the group's.
+        ScalarExpr::Aggregate { .. } => Ok(()),
+        ScalarExpr::Column(name) => {
+            if group_by.iter().any(|group| bare(group) == bare(name)) {
+                Ok(())
+            } else {
+                anyhow::bail!(
+                    "column \"{name}\" must appear in the GROUP BY clause or be used in an aggregate function"
+                )
+            }
+        }
+        other => {
+            for child in other.children() {
+                check_grouped_expr(child, group_by, group_exprs)?;
+            }
+            Ok(())
+        }
+    }
+}
+
 fn item_alias(item: &ProjectionItem) -> Option<&str> {
     match item {
         ProjectionItem::AliasedColumn(_, a) | ProjectionItem::AliasedLiteral(_, a) => Some(a),
