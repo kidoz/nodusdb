@@ -1,0 +1,210 @@
+# Maintenance DDL the parser has no grammar for. `COMMENT ON INDEX` stores
+# a comment on the index, which `pg_description` and `obj_description`
+# report as a comment on the index's `pg_class` entry. `COMMENT ON
+# FUNCTION` (and `PROCEDURE`, `ROUTINE`, `AGGREGATE`) resolves the
+# signature against PostgreSQL's built-in functions — an unknown name, a
+# signature no overload takes, and an ambiguous bare name are PostgreSQL's
+# errors — but keeps no comment: there are no user-defined functions to
+# comment, and the built-ins keep PostgreSQL's own. `REINDEX` resolves
+# (and so validates) its target, `CREATE STATISTICS` the table and its
+# columns, and `DROP`/`ALTER STATISTICS` are their tag alone. Errors,
+# results, and command tags are PostgreSQL 18.4's.
+#
+# Known divergences: the built-in catalog indexes PostgreSQL has (a
+# `REINDEX INDEX pg_class_oid_index` finds one there) have no names here;
+# a statistics object is not kept, so `CREATE STATISTICS` never reports a
+# duplicate name and a `DROP`/`ALTER` of a missing one does not fail; a
+# comment on a function is not stored; `CREATE STATISTICS` checks plain
+# column targets only (an expression target's columns are left
+# unresolved), keeps the statistics kinds unvalidated, and does not refuse
+# `CREATE STATISTICS` where PostgreSQL takes an `on` name; `REINDEX
+# (VERBOSE)` reports nothing; a `REINDEX` that would rebuild something
+# rebuilds nothing; PostgreSQL wraps a multi-statement simple query in an
+# implicit transaction block, so a statement of one that fails takes the
+# batch's earlier statements with it (and `REINDEX SCHEMA`/`DATABASE`/
+# `SYSTEM` and `REINDEX CONCURRENTLY` are refused in a batch), where
+# NodusDB commits each statement of a batch on its own.
+
+statement ok
+drop table if exists t1 cascade;
+
+statement ok
+create table t1 (k int primary key, v int);
+
+statement ok
+create unique index t1_v on t1 (v);
+
+statement ok
+comment on index t1_v is 'the v index';
+
+query T
+select obj_description((select oid from pg_class where relname = 't1_v'), 'pg_class');
+----
+the v index
+
+query T
+select description from pg_description
+where objoid = (select oid from pg_class where relname = 't1_v');
+----
+the v index
+
+statement ok
+comment on index t1_v is 'better';
+
+query T
+select obj_description((select oid from pg_class where relname = 't1_v'), 'pg_class');
+----
+better
+
+statement ok
+comment on index t1_pkey is 'the key';
+
+query I
+select count(*) from pg_description
+where description = 'the key'
+  and objoid = (select oid from pg_class where relname = 't1_pkey');
+----
+1
+
+statement ok
+comment on index t1_v is null;
+
+query T
+select obj_description((select oid from pg_class where relname = 't1_v'), 'pg_class');
+----
+NULL
+
+statement error does not exist
+comment on index t1_nosuch is 'x';
+
+statement error is not an index
+comment on index t1 is 'x';
+
+statement error does not exist
+comment on index nope.t1_v is 'x';
+
+statement ok
+comment on function now() is 'x';
+
+statement ok
+comment on function pg_catalog.now() is null;
+
+statement ok
+comment on function upper(text) is 'x';
+
+statement ok
+comment on function sum(int) is 'x';
+
+statement error is not a procedure
+comment on procedure now() is 'x';
+
+statement error syntax error at or near ")"
+comment on aggregate nosuchagg() is 'x';
+
+statement error is not an aggregate
+comment on aggregate upper(text) is 'x';
+
+statement error does not exist
+comment on function t1_nosuchfunc() is 'x';
+
+statement error does not exist
+comment on function now(int) is 'x';
+
+statement error does not exist
+comment on aggregate nosuchagg(int) is 'x';
+
+statement error is not unique
+comment on function abs is 'x';
+
+statement error could not find a function named
+comment on function nosuchfunc is 'x';
+
+statement error does not exist
+comment on function nope.nosuch is 'x';
+
+statement ok
+reindex table t1;
+
+statement ok
+reindex index t1_v;
+
+statement ok
+reindex index concurrently t1_v;
+
+statement ok
+reindex schema public;
+
+statement ok
+reindex system;
+
+statement ok
+reindex database;
+
+statement ok
+reindex (verbose) table t1;
+
+statement error syntax error at or near "only"
+reindex table only t1;
+
+statement error does not exist
+reindex index t1_nosuch;
+
+statement error does not exist
+reindex table t1_nosuch;
+
+statement error does not exist
+reindex schema t1_nosuch;
+
+statement error can only reindex the currently open database
+reindex database nosuch;
+
+statement error cannot reindex system catalogs concurrently
+reindex system concurrently;
+
+statement error syntax error at end of input
+reindex;
+
+statement error syntax error at or near "verbose"
+reindex verbose;
+
+statement error syntax error at or near "."
+reindex schema public.nope;
+
+statement ok
+create statistics t1_stats on k, v from t1;
+
+statement ok
+create statistics if not exists t1_stats on k, v from t1;
+
+statement ok
+create statistics t1_stats2 (ndistinct) on (k + 1), v from t1;
+
+statement ok
+create statistics public.t1_stats3 on k, v from only t1;
+
+statement error extended statistics require at least 2 columns
+create statistics t1_stats4 on v from t1;
+
+statement error does not exist
+create statistics t1_stats5 on k, v from t1_nosuch;
+
+statement error column "nosuchcol" does not exist
+create statistics t1_stats6 on k, nosuchcol from t1;
+
+statement error only a single relation is allowed in CREATE STATISTICS
+create statistics t1_stats7 on k, v from t1, t1;
+
+statement error syntax error at or near "v"
+create statistics t1_stats8 on k v from t1;
+
+statement ok
+alter statistics t1_stats set statistics 100;
+
+statement ok
+drop statistics t1_stats;
+
+statement ok
+drop statistics t1_stats2, t1_stats3;
+
+statement ok
+drop table t1 cascade;
