@@ -242,7 +242,17 @@ impl SimpleQueryHandler for NodusQueryHandler {
                 Err(e) => {
                     error!("Failed to plan SQL: {}", e);
                     self.metrics.query_errors_total.inc();
-                    return Err(planning_error(&e.to_string()));
+                    // A batch stops at its first failure, after the
+                    // statements before it report, as PostgreSQL's does.
+                    let message = e.to_string();
+                    let code = match sqlstate_for_execution_error(&message) {
+                        "XX000" => "0A000",
+                        code => code,
+                    };
+                    responses.push(Response::Error(Box::new(error_info(
+                        "ERROR", code, &message,
+                    ))));
+                    break;
                 }
             };
 
@@ -257,18 +267,20 @@ impl SimpleQueryHandler for NodusQueryHandler {
                     let code = sqlstate_for_execution_error(&err_str);
                     let err = error_info("ERROR", code, &err_str);
                     mark_execution_failed(client, &executed_plan);
-                    return Err(PgWireError::UserError(Box::new(err)));
+                    responses.push(Response::Error(Box::new(err)));
+                    break;
                 }
             };
 
             if self.registry.is_query_cancelled(&session_id) {
                 self.metrics.query_errors_total.inc();
                 mark_error_status(client);
-                return Err(user_error(
+                responses.push(Response::Error(Box::new(error_info(
                     "ERROR",
                     "57014",
                     "canceling statement due to user request",
-                ));
+                ))));
+                break;
             }
 
             // No projected columns => a command tag (CREATE TABLE, INSERT, BEGIN...).
