@@ -1875,6 +1875,13 @@ pub enum LogicalPlan {
     Noop {
         tag: String,
     },
+    /// `CREATE STATISTICS [IF NOT EXISTS] name [(kinds)] ON targets FROM
+    /// table`: the table and its columns are resolved — PostgreSQL's errors
+    /// when they are not — though no statistics are kept (nothing plans
+    /// with them).
+    CreateStatistics {
+        target: String,
+    },
     /// `COMMENT ON {FUNCTION | PROCEDURE | ROUTINE | AGGREGATE}`: the
     /// function is resolved (a missing one is an error, as PostgreSQL's is);
     /// `arg_types` is `None` when the statement leaves the signature out.

@@ -4218,6 +4218,38 @@ fn rewrite_data_clause(
         }
     }
 
+    // `CREATE STATISTICS` and its siblings: the parser has no such object
+    // type. A `CREATE` carries its text, so the executor can resolve the
+    // table and its columns; the others are only their tag.
+    if is(0, "create") && is(1, "statistics") {
+        let target = match significant.get(2) {
+            Some(&first) => render_tokens(&statement[first..]),
+            None => String::new(),
+        };
+        let sql = format!(
+            "SELECT {UTILITY_FUNCTION}('CREATE STATISTICS', '{}')",
+            target.replace('\'', "''")
+        );
+        if let Some(mut tokens) = snippet_tokens(&sql) {
+            tokens.extend(tail);
+            return tokens;
+        }
+        return statement;
+    }
+    if (is(0, "drop") || is(0, "alter")) && is(1, "statistics") {
+        let tag = if is(0, "drop") {
+            "DROP STATISTICS"
+        } else {
+            "ALTER STATISTICS"
+        };
+        let sql = format!("SELECT {UTILITY_FUNCTION}('{tag}')");
+        if let Some(mut tokens) = snippet_tokens(&sql) {
+            tokens.extend(tail);
+            return tokens;
+        }
+        return statement;
+    }
+
     // Maintenance statements, by their command tag.
     let utility = if is(0, "checkpoint") {
         Some("CHECKPOINT")
@@ -4621,6 +4653,14 @@ mod tests {
         assert_eq!(
             one("REINDEX TABLE t"),
             format!("SELECT {UTILITY_FUNCTION}('REINDEX')")
+        );
+        assert_eq!(
+            one("CREATE STATISTICS s ON a, b FROM t"),
+            format!("SELECT {UTILITY_FUNCTION}('CREATE STATISTICS', 's on a, b from t')")
+        );
+        assert_eq!(
+            one("DROP STATISTICS s"),
+            format!("SELECT {UTILITY_FUNCTION}('DROP STATISTICS')")
         );
         assert_eq!(
             one("COMMENT ON FUNCTION f(int) IS 'x'"),

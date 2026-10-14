@@ -1012,6 +1012,156 @@ impl MemExecutor {
         )
     }
 
+    /// `CREATE STATISTICS [IF NOT EXISTS] name [(kinds)] ON {column |
+    /// (expression)} [, ...] FROM [ONLY] table`: PostgreSQL's errors for a
+    /// missing table or column, for more than one relation, and for fewer
+    /// than two targets. Nothing else happens — there is no
+    /// extended-statistics planner to feed, so the object is not kept.
+    pub(crate) fn exec_create_statistics(&self, target: &str) -> Result<QueryOutput> {
+        use sqlparser::tokenizer::{Token, Tokenizer};
+        let tokens: Vec<Token> = Tokenizer::new(&sqlparser::dialect::PostgreSqlDialect {}, target)
+            .tokenize()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|t| !matches!(t, Token::Whitespace(_) | Token::EOF))
+            .collect();
+        let mut at = 0;
+        let is_word = |at: usize, w: &str| matches!(tokens.get(at), Some(Token::Word(word)) if word.value.eq_ignore_ascii_case(w));
+        if is_word(at, "if") {
+            if !is_word(at + 1, "not") || !is_word(at + 2, "exists") {
+                return Err(statement_syntax_error(&tokens, at + 1));
+            }
+            at += 3;
+        }
+        // The statistics object's name: its schema must exist.
+        let name = read_object_name(&tokens, &mut at);
+        if let Some(schema) = name.iter().rev().nth(1)
+            && name.len() > 1
+            && !Self::is_virtual_schema(schema)
+        {
+            self.schema_id(schema)?;
+        }
+        if name.is_empty() {
+            return Err(statement_syntax_error(&tokens, at));
+        }
+        // `(kinds)`: which statistics to gather, which decide nothing here.
+        if tokens.get(at) == Some(&Token::LParen) {
+            let mut depth = 0usize;
+            let mut closed = false;
+            while at < tokens.len() {
+                match tokens[at] {
+                    Token::LParen => depth += 1,
+                    Token::RParen => {
+                        depth -= 1;
+                        if depth == 0 {
+                            at += 1;
+                            closed = true;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                at += 1;
+            }
+            if !closed {
+                return Err(statement_syntax_error(&tokens, tokens.len()));
+            }
+        }
+        if !is_word(at, "on") {
+            return Err(statement_syntax_error(&tokens, at));
+        }
+        at += 1;
+        // The targets: plain columns, or parenthesized expressions.
+        let mut columns: Vec<String> = Vec::new();
+        let mut targets = 0usize;
+        loop {
+            match tokens.get(at) {
+                Some(Token::LParen) => {
+                    let mut depth = 0usize;
+                    while at < tokens.len() {
+                        match tokens[at] {
+                            Token::LParen => depth += 1,
+                            Token::RParen => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    at += 1;
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                        at += 1;
+                    }
+                    if depth > 0 {
+                        return Err(statement_syntax_error(&tokens, tokens.len()));
+                    }
+                    targets += 1;
+                }
+                Some(Token::Word(word)) => {
+                    columns.push(match word.quote_style {
+                        Some(_) => word.value.clone(),
+                        None => word.value.to_lowercase(),
+                    });
+                    targets += 1;
+                    at += 1;
+                }
+                _ => return Err(statement_syntax_error(&tokens, at)),
+            }
+            if tokens.get(at) == Some(&Token::Comma) {
+                at += 1;
+            } else {
+                break;
+            }
+        }
+        if !is_word(at, "from") {
+            return Err(statement_syntax_error(&tokens, at));
+        }
+        at += 1;
+        if is_word(at, "only") {
+            at += 1;
+        }
+        // The table, whose schema and then existence must hold.
+        let table = read_object_name(&tokens, &mut at);
+        if table.is_empty() {
+            return Err(statement_syntax_error(&tokens, at));
+        }
+        if let Some(schema) = table.iter().rev().nth(1)
+            && table.len() > 1
+            && !Self::is_virtual_schema(schema)
+        {
+            self.schema_id(schema)?;
+        }
+        let written = table.join(".");
+        let (db_name, schema_name, table_only) = parse_object_name(&written)?;
+        let tbl = self
+            .catalog_reader
+            .get_table(db_name, schema_name, table_only)
+            .map_err(|_| anyhow::anyhow!("relation \"{written}\" does not exist"))?;
+        if tokens.get(at) == Some(&Token::Comma) {
+            return Err(
+                DbError::new("only a single relation is allowed in CREATE STATISTICS")
+                    .code("0A000")
+                    .into(),
+            );
+        }
+        if at < tokens.len() {
+            return Err(statement_syntax_error(&tokens, at));
+        }
+        for column in &columns {
+            if !tbl.columns.iter().any(|c| &c.name == column) {
+                anyhow::bail!("column \"{column}\" does not exist");
+            }
+        }
+        if targets < 2 {
+            return Err(
+                DbError::new("extended statistics require at least 2 columns")
+                    .code("42P17")
+                    .into(),
+            );
+        }
+        Ok(QueryOutput::tag("CREATE STATISTICS"))
+    }
+
     /// The id of schema `name`, or PostgreSQL's error for a missing one.
     fn schema_id(&self, name: &str) -> Result<nodus_catalog::SchemaId> {
         self.catalog_reader
@@ -1865,6 +2015,59 @@ fn function_arg_types(args: &str) -> Vec<String> {
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty())
         .collect()
+}
+
+/// A dotted object name at `at`: its words, folded as PostgreSQL folds an
+/// unquoted one, with `at` left just past the last of them. A trailing
+/// period is no part of a name, so `at` stays on it for the caller to
+/// report.
+fn read_object_name(tokens: &[sqlparser::tokenizer::Token], at: &mut usize) -> Vec<String> {
+    use sqlparser::tokenizer::Token;
+    let mut parts: Vec<String> = Vec::new();
+    let mut after_period = false;
+    loop {
+        match tokens.get(*at) {
+            Some(Token::Word(word)) if parts.is_empty() || after_period => {
+                let value = match word.quote_style {
+                    Some(_) => word.value.clone(),
+                    None => word.value.to_lowercase(),
+                };
+                // `ONLY t` arrives as the mark the token rewriter left on
+                // the name.
+                match value.strip_prefix(nodus_sql::ONLY_MARK) {
+                    Some(rest) => parts.extend(
+                        rest.split('.')
+                            .map(|part| part.trim_matches('"').to_string()),
+                    ),
+                    None => parts.push(value),
+                }
+                after_period = false;
+                *at += 1;
+            }
+            Some(Token::Period) if !parts.is_empty() && !after_period => {
+                after_period = true;
+                *at += 1;
+            }
+            _ => break,
+        }
+    }
+    if after_period {
+        *at -= 1;
+    }
+    parts
+}
+
+/// PostgreSQL's message for a statement's text that ends, or holds a token
+/// the grammar has no place for.
+fn statement_syntax_error(tokens: &[sqlparser::tokenizer::Token], at: usize) -> anyhow::Error {
+    use sqlparser::tokenizer::Token;
+    match tokens.get(at) {
+        Some(Token::Word(w)) if w.quote_style.is_none() => {
+            anyhow::anyhow!("syntax error at or near \"{}\"", w.value)
+        }
+        Some(token) => anyhow::anyhow!("syntax error at or near \"{token}\""),
+        None => anyhow::anyhow!("syntax error at end of input"),
+    }
 }
 
 /// The name PostgreSQL gives an unnamed CHECK constraint `expr` of `table`:

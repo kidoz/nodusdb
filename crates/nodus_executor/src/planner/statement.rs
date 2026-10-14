@@ -903,6 +903,13 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                         .hint("Set \"max_prepared_transactions\" to a nonzero value.")
                         .into(),
                 ),
+                Some([crate::Value::Text(tag), crate::Value::Text(target)])
+                    if tag == "CREATE STATISTICS" =>
+                {
+                    Ok(LogicalPlan::CreateStatistics {
+                        target: target.clone(),
+                    })
+                }
                 Some([crate::Value::Text(tag)]) => Ok(LogicalPlan::Noop { tag: tag.clone() }),
                 _ => anyhow::bail!("malformed maintenance statement"),
             }
