@@ -1875,6 +1875,12 @@ pub enum LogicalPlan {
     Noop {
         tag: String,
     },
+    /// `REINDEX { INDEX | TABLE | SCHEMA | DATABASE | SYSTEM } name`: the
+    /// target is resolved (a missing one is an error, as PostgreSQL's is),
+    /// though nothing is rebuilt.
+    Reindex {
+        target: String,
+    },
     /// `CREATE STATISTICS [IF NOT EXISTS] name [(kinds)] ON targets FROM
     /// table`: the table and its columns are resolved — PostgreSQL's errors
     /// when they are not — though no statistics are kept (nothing plans

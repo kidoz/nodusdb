@@ -4250,11 +4250,27 @@ fn rewrite_data_clause(
         return statement;
     }
 
+    // `REINDEX`'s target travels with the tag, so the executor can resolve
+    // it: `REINDEX INDEX nosuch` is an error, not a no-op.
+    if is(0, "reindex") {
+        let target = significant
+            .get(1)
+            .map(|&first| render_tokens(&statement[first..=significant[n - 1]]))
+            .unwrap_or_default();
+        let sql = format!(
+            "SELECT {UTILITY_FUNCTION}('REINDEX', '{}')",
+            target.replace('\'', "''")
+        );
+        if let Some(mut tokens) = snippet_tokens(&sql) {
+            tokens.extend(tail);
+            return tokens;
+        }
+        return statement;
+    }
+
     // Maintenance statements, by their command tag.
     let utility = if is(0, "checkpoint") {
         Some("CHECKPOINT")
-    } else if is(0, "reindex") {
-        Some("REINDEX")
     } else if is(0, "cluster") {
         Some("CLUSTER")
     } else if is(0, "load") {
@@ -4652,7 +4668,11 @@ mod tests {
         );
         assert_eq!(
             one("REINDEX TABLE t"),
-            format!("SELECT {UTILITY_FUNCTION}('REINDEX')")
+            format!("SELECT {UTILITY_FUNCTION}('REINDEX', 'table t')")
+        );
+        assert_eq!(
+            one("REINDEX INDEX CONCURRENTLY t_idx"),
+            format!("SELECT {UTILITY_FUNCTION}('REINDEX', 'index concurrently t_idx')")
         );
         assert_eq!(
             one("CREATE STATISTICS s ON a, b FROM t"),

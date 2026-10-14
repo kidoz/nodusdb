@@ -361,6 +361,7 @@ impl MemExecutor {
             LogicalPlan::RenameIndex { name, new_name } => {
                 self.exec_rename_index(ctx, &name, &new_name)
             }
+            LogicalPlan::Reindex { target } => self.exec_reindex(ctx, &target),
             LogicalPlan::CreateStatistics { target } => self.exec_create_statistics(&target),
             LogicalPlan::CommentFunction {
                 kind,

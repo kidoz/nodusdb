@@ -1162,6 +1162,112 @@ impl MemExecutor {
         Ok(QueryOutput::tag("CREATE STATISTICS"))
     }
 
+    /// `REINDEX { INDEX | TABLE | SCHEMA | DATABASE | SYSTEM } [CONCURRENTLY]
+    /// name`: the target must exist — PostgreSQL's errors when it does not —
+    /// though no index is rebuilt (there is nothing to rebuild).
+    pub(crate) fn exec_reindex(&self, ctx: &ExecutionContext, target: &str) -> Result<QueryOutput> {
+        let (kind, concurrently, name) = parse_reindex_target(target)?;
+        // `CONCURRENTLY`, and the whole-schema and whole-database forms, need
+        // a transaction of their own.
+        let in_transaction_block = self
+            .active_txns
+            .read()
+            .get(&ctx.session_id)
+            .is_some_and(|txn| txn.explicit);
+        if in_transaction_block && concurrently {
+            return Err(
+                DbError::new("REINDEX CONCURRENTLY cannot run inside a transaction block")
+                    .code("25001")
+                    .into(),
+            );
+        }
+        let whole = match kind {
+            ReindexKind::Schema => Some("SCHEMA"),
+            ReindexKind::Database => Some("DATABASE"),
+            ReindexKind::System => Some("SYSTEM"),
+            _ => None,
+        };
+        if let Some(word) = whole
+            && in_transaction_block
+        {
+            return Err(DbError::new(format!(
+                "REINDEX {word} cannot run inside a transaction block"
+            ))
+            .code("25001")
+            .into());
+        }
+        // The name as PostgreSQL prints it back: its words, lower-cased and
+        // dot-joined as written.
+        let written = name.join(".");
+        match kind {
+            ReindexKind::Index | ReindexKind::Table => {
+                let (schema, object) = match name.as_slice() {
+                    [object] => (None, object),
+                    [schema, object] => (Some(schema), object),
+                    [db, schema, object] => {
+                        if db != "default" {
+                            return Err(DbError::new(format!(
+                                "cross-database references are not implemented: \"{written}\""
+                            ))
+                            .code("0A000")
+                            .into());
+                        }
+                        (Some(schema), object)
+                    }
+                    _ => unreachable!("a REINDEX name has one to three words"),
+                };
+                // A schema-qualified name must name a schema that exists.
+                let schema_id = match schema {
+                    Some(schema) if !Self::is_virtual_schema(schema) => {
+                        Some(self.schema_id(schema)?)
+                    }
+                    _ => None,
+                };
+                let found = if kind == ReindexKind::Index {
+                    self.catalog_reader
+                        .list_all_tables("default")?
+                        .iter()
+                        .any(|t| {
+                            t.indexes.iter().any(|i| i.name == *object)
+                                && schema_id.is_none_or(|id| t.schema_id == id)
+                        })
+                } else {
+                    // A table, resolved as any relation name is — through
+                    // the search path when it is not schema-qualified.
+                    let (db, schema_name, table_only) = parse_object_name(&written)?;
+                    self.catalog_reader
+                        .get_table(db, schema_name, table_only)
+                        .is_ok()
+                        || Self::is_pg_catalog_virtual_table_name(table_only)
+                };
+                if !found {
+                    anyhow::bail!("relation \"{written}\" does not exist");
+                }
+            }
+            ReindexKind::Schema => {
+                let name = written;
+                if !Self::is_virtual_schema(&name) {
+                    self.schema_id(&name)?;
+                }
+            }
+            // `REINDEX SYSTEM` and `REINDEX DATABASE` name the database to
+            // reindex: the open one, the only one there is.
+            ReindexKind::System | ReindexKind::Database => {
+                if concurrently && kind == ReindexKind::System {
+                    return Err(DbError::new("cannot reindex system catalogs concurrently")
+                        .code("0A000")
+                        .into());
+                }
+                if !name.is_empty() && written != "default" {
+                    return Err(DbError::new("can only reindex the currently open database")
+                        .code("0A000")
+                        .into());
+                }
+            }
+        }
+        Ok(QueryOutput::tag("REINDEX"))
+    }
+
     /// The id of schema `name`, or PostgreSQL's error for a missing one.
     fn schema_id(&self, name: &str) -> Result<nodus_catalog::SchemaId> {
         self.catalog_reader
@@ -2055,6 +2161,120 @@ fn read_object_name(tokens: &[sqlparser::tokenizer::Token], at: &mut usize) -> V
         *at -= 1;
     }
     parts
+}
+
+/// What a `REINDEX` target names.
+#[derive(Clone, Copy, PartialEq)]
+enum ReindexKind {
+    Index,
+    Table,
+    Schema,
+    Database,
+    System,
+}
+
+/// The `{ INDEX | TABLE | SCHEMA | DATABASE | SYSTEM } [CONCURRENTLY] name`
+/// part of a `REINDEX`: its kind, whether it says `CONCURRENTLY`, and the
+/// words of its name, the last of which is the object's (`SCHEMA` and
+/// `DATABASE` take a bare one). The name is absent when the statement leaves
+/// it out, as `REINDEX DATABASE` and `REINDEX SYSTEM` may (they mean the open
+/// database). A target the grammar has no place for gets PostgreSQL's syntax
+/// error for it.
+fn parse_reindex_target(target: &str) -> Result<(ReindexKind, bool, Vec<String>)> {
+    use sqlparser::tokenizer::{Token, Tokenizer};
+    let tokens: Vec<Token> = Tokenizer::new(&sqlparser::dialect::PostgreSqlDialect {}, target)
+        .tokenize()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|t| !matches!(t, Token::Whitespace(_) | Token::EOF))
+        .collect();
+    let mut at = 0;
+    // `( options )`: which details REINDEX reports, which decide nothing here.
+    if tokens.first() == Some(&Token::LParen) {
+        let mut depth = 0usize;
+        let mut closed = false;
+        while at < tokens.len() {
+            match tokens[at] {
+                Token::LParen => depth += 1,
+                Token::RParen => {
+                    depth -= 1;
+                    if depth == 0 {
+                        at += 1;
+                        closed = true;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            at += 1;
+        }
+        if !closed {
+            return Err(statement_syntax_error(&tokens, tokens.len()));
+        }
+    }
+    let word_at = |at: usize| match tokens.get(at) {
+        Some(Token::Word(w)) => Some(w.value.as_str()),
+        _ => None,
+    };
+    let kind = match word_at(at).map(str::to_lowercase).as_deref() {
+        Some("index") => ReindexKind::Index,
+        Some("table") => ReindexKind::Table,
+        Some("schema") => ReindexKind::Schema,
+        Some("database") => ReindexKind::Database,
+        Some("system") => ReindexKind::System,
+        _ => return Err(statement_syntax_error(&tokens, at)),
+    };
+    at += 1;
+    let concurrently = word_at(at).is_some_and(|w| w.eq_ignore_ascii_case("concurrently"));
+    if concurrently {
+        at += 1;
+    }
+    // The name: words joined by periods, an unquoted one folded as PostgreSQL
+    // folds it. `SCHEMA`, `DATABASE`, and `SYSTEM` take a bare name, so a
+    // period there is the syntax error PostgreSQL reports for it.
+    let plain_name = matches!(
+        kind,
+        ReindexKind::Schema | ReindexKind::Database | ReindexKind::System
+    );
+    let mut name: Vec<String> = Vec::new();
+    let mut after_period = false;
+    loop {
+        match tokens.get(at) {
+            // `CONCURRENTLY` is no name: unquoted, the grammar has no place
+            // for it in one.
+            Some(Token::Word(w))
+                if (name.is_empty() || after_period)
+                    && !(w.quote_style.is_none()
+                        && (w.value.eq_ignore_ascii_case("concurrently")
+                            || w.value.eq_ignore_ascii_case("only"))) =>
+            {
+                name.push(match w.quote_style {
+                    Some(_) => w.value.clone(),
+                    None => w.value.to_lowercase(),
+                });
+                after_period = false;
+                at += 1;
+            }
+            Some(Token::Period) if !name.is_empty() && !after_period && !plain_name => {
+                after_period = true;
+                at += 1;
+            }
+            _ => break,
+        }
+    }
+    if after_period || at < tokens.len() {
+        return Err(statement_syntax_error(&tokens, at));
+    }
+    if name.len() > 3 {
+        anyhow::bail!(
+            "improper qualified name (too many dotted names): {}",
+            name.join(".")
+        );
+    }
+    if name.is_empty() && !matches!(kind, ReindexKind::Database | ReindexKind::System) {
+        return Err(statement_syntax_error(&tokens, at));
+    }
+    Ok((kind, concurrently, name))
 }
 
 /// PostgreSQL's message for a statement's text that ends, or holds a token
