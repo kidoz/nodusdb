@@ -77,8 +77,9 @@ async fn run_record(client: &Client, record: &Record) -> Result<(), String> {
                 record.sql
             )),
             Err(e) => match contains {
-                Some(sub) if !e.to_string().contains(sub) => Err(format!(
-                    "error message mismatch: got '{e}', expected substring '{sub}'\n  SQL: {}",
+                Some(sub) if !err_text(&e).contains(sub) => Err(format!(
+                    "error message mismatch: got '{}', expected substring '{sub}'\n  SQL: {}",
+                    err_text(&e),
                     record.sql
                 )),
                 _ => Ok(()),
