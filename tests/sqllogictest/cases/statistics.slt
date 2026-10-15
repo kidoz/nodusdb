@@ -1,0 +1,176 @@
+# The statistics the `pg_stat_*` views and their `pg_stat_get_*` functions
+# report: per-table counters (inserts, updates, deletes, live and dead rows,
+# sequential and index scans, modifications since the last analyze), the
+# times and counts of `VACUUM`/`ANALYZE`, and `ANALYZE`'s row count and page
+# count on `pg_class`. They live as long as the server does, as PostgreSQL's
+# statistics collector does, and a `TRUNCATE` takes a table's live and dead
+# counts with the rows.
+#
+# Known divergences: PostgreSQL's counts appear only once the writing
+# transaction commits *and* its statistics have been flushed (up to a second
+# later) — reading them in the same transaction sees the values before the
+# write, where NodusDB reports the current ones at once; PostgreSQL counts
+# one extra `seq_scan` when rows are inserted into a table that has an
+# index; there is no autovacuum, so the `auto*` times and counts stay null
+# and zero; the buffer counters (`pg_stat_get_blocks_fetched`/`_hit`, the
+# `pg_statio_*` views) are not modelled and read zero; `relpages` comes from
+# NodusDB's own storage, so it is self-consistent — `relpages` × 8 kB is
+# `pg_relation_size` — without matching PostgreSQL's page count; `VACUUM
+# (VERBOSE)` and `ANALYZE VERBOSE` report no `INFO` lines; `ANALYZE` records
+# the row count only, where PostgreSQL also samples column statistics into
+# `pg_statistic`/`pg_stats`; a join's inner-side reads are not
+# counted either; `pg_stat_get_xact_*` (transaction-local counters) are
+# not implemented; and `pg_stat_get_snapshot_timestamp()` is the
+# current time.
+
+statement ok
+drop table if exists st cascade;
+
+statement ok
+create table st (k int primary key, v int);
+
+statement ok
+insert into st select g, g % 7 from generate_series(1, 500) g;
+
+query II
+select n_tup_ins, n_live_tup from pg_stat_user_tables where relname = 'st';
+----
+500	500
+
+query II
+select pg_stat_get_tuples_inserted(oid), pg_stat_get_live_tuples(oid)
+from pg_class where relname = 'st';
+----
+500	500
+
+statement ok
+set enable_indexscan = off;
+
+statement ok
+set enable_indexonlyscan = off;
+
+statement ok
+set enable_bitmapscan = off;
+
+statement ok
+select count(*) from st where v = 3;
+
+query II
+select seq_scan, seq_tup_read from pg_stat_user_tables where relname = 'st';
+----
+1	500
+
+statement ok
+set enable_indexscan = on;
+
+statement ok
+set enable_indexonlyscan = on;
+
+statement ok
+set enable_bitmapscan = on;
+
+statement ok
+select k, v from st where k = 42;
+
+query II
+select idx_scan, idx_tup_fetch from pg_stat_user_tables where relname = 'st';
+----
+1	1
+
+query III
+select indexrelname, idx_scan, idx_tup_read from pg_stat_user_indexes where relname = 'st';
+----
+st_pkey	1	1
+
+query I
+select pg_stat_get_numscans(oid) from pg_class where relname = 'st_pkey';
+----
+1
+
+statement ok
+update st set v = v + 1 where k <= 10;
+
+# The inserted rows count as modifications since the last analyze too.
+query III
+select n_tup_upd, n_dead_tup, n_mod_since_analyze from pg_stat_user_tables where relname = 'st';
+----
+10	10	510
+
+statement ok
+delete from st where k > 490;
+
+query III
+select n_tup_del, n_live_tup, n_dead_tup from pg_stat_user_tables where relname = 'st';
+----
+10	490	20
+
+statement ok
+analyze st;
+
+# `reltuples` is the row count the analysis found, and `relpages` what the
+# rows then occupied — the same pages `pg_relation_size` reports.
+query II
+select reltuples, relpages = pg_relation_size('st') / 8192 from pg_class where relname = 'st';
+----
+490	t
+
+query III
+select last_analyze is not null, analyze_count, n_mod_since_analyze
+from pg_stat_user_tables where relname = 'st';
+----
+t	1	0
+
+query II
+select pg_stat_get_analyze_count(oid), pg_stat_get_last_analyze_time(oid) is not null
+from pg_class where relname = 'st';
+----
+1	t
+
+statement ok
+vacuum st;
+
+query IIII
+select last_vacuum is not null, vacuum_count, n_dead_tup, n_ins_since_vacuum
+from pg_stat_user_tables where relname = 'st';
+----
+t	1	0	0
+
+statement ok
+vacuum analyze st;
+
+query IIII
+select last_vacuum is not null, last_analyze is not null, vacuum_count, analyze_count
+from pg_stat_user_tables where relname = 'st';
+----
+t	t	2	2
+
+statement ok
+truncate st;
+
+# The cumulative counters stay; the live and dead counts go with the rows.
+query IIII
+select n_live_tup, n_dead_tup, n_tup_ins, n_tup_upd from pg_stat_user_tables where relname = 'st';
+----
+0	0	500	10
+
+statement ok
+vacuum;
+
+statement ok
+analyze;
+
+# A view, a sequence, or an index named by `VACUUM`/`ANALYZE` is skipped.
+statement ok
+vacuum st_pkey;
+
+statement ok
+analyze st_pkey;
+
+statement error does not exist
+analyze st_nosuch;
+
+statement error does not exist
+vacuum st_nosuch;
+
+statement ok
+drop table st cascade;
