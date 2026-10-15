@@ -121,11 +121,13 @@ pub enum TableDescriptorChange {
         comment: Option<String>,
     },
     /// `ANALYZE`: records the row count and pages the table's statistics
-    /// report (`pg_class.reltuples`/`relpages`).
+    /// report (`pg_class.reltuples`/`relpages`), and what each column's
+    /// analysis found (`pg_statistic`).
     SetStatistics {
         table_id: TableId,
         reltuples: f64,
         relpages: i64,
+        statistics: Vec<crate::ColumnStatistics>,
     },
     /// `COMMENT ON INDEX`: sets the comment on the table's index
     /// `index_name`; `None` removes it.

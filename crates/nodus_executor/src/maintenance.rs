@@ -51,7 +51,8 @@ impl MemExecutor {
 
     /// The analysis itself: the table's live rows and the pages its rows and
     /// indexes occupy, written through the catalog as PostgreSQL writes
-    /// `pg_class`, plus the counters and times.
+    /// `pg_class`, the per-column statistics (`pg_statistic`), plus the
+    /// counters and times.
     fn record_analysis(
         &self,
         ctx: &ExecutionContext,
@@ -60,11 +61,13 @@ impl MemExecutor {
         self.authorize(ctx, Action::Delete, ResourceRef::Table(tbl.id))?;
         let (rows, _) = self.stored_pages(ctx, tbl)?;
         let reltuples = self.stats.table(tbl.id).n_live_tup.max(0) as f64;
+        let statistics = crate::column_stats::analyze_table(self, ctx, tbl)?;
         self.catalog_writer.update_table_descriptor(
             nodus_catalog::TableDescriptorChange::SetStatistics {
                 table_id: tbl.id,
                 reltuples,
                 relpages: rows / 8192,
+                statistics,
             },
         )?;
         let now = Utc::now();

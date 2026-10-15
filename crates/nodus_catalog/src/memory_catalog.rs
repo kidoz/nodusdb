@@ -548,6 +548,7 @@ impl CatalogWriter for MemoryCatalog {
             comment: None,
             reltuples: None,
             relpages: None,
+            statistics: Vec::new(),
             parents: request.parents,
             partition_by: request.partition_by,
             partition_bound: request.partition_bound,
@@ -747,10 +748,12 @@ impl CatalogWriter for MemoryCatalog {
             TableDescriptorChange::SetStatistics {
                 reltuples,
                 relpages,
+                statistics,
                 ..
             } => {
                 table.reltuples = Some(reltuples);
                 table.relpages = Some(relpages);
+                table.statistics = statistics;
             }
             TableDescriptorChange::SetIndexComment {
                 index_name,

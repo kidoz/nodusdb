@@ -111,6 +111,10 @@ pub struct TableDescriptor {
     /// The pages those rows occupied (`pg_class.relpages`), if analyzed.
     #[serde(default)]
     pub relpages: Option<i64>,
+    /// What the last `ANALYZE` found per column — the `pg_statistic` rows
+    /// this table would have, in column order.
+    #[serde(default)]
+    pub statistics: Vec<ColumnStatistics>,
     /// The tables this one inherits from (`INHERITS`), in that order.
     /// Defaulted so older descriptors decode.
     #[serde(default)]
@@ -123,6 +127,46 @@ pub struct TableDescriptor {
     /// (10)`, or `DEFAULT`). Defaulted so older descriptors decode.
     #[serde(default)]
     pub partition_bound: Option<String>,
+}
+
+/// One column's `ANALYZE` findings — a `pg_statistic` row's content beyond
+/// the relation and attribute (PostgreSQL's `stanullfrac`, `stawidth`,
+/// `stadistinct`, and the five statistic slots).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ColumnStatistics {
+    /// The column's attribute number (`pg_attribute.attnum`): 1-based.
+    pub attnum: i32,
+    /// The fraction of sampled rows that were NULL (`stanullfrac`).
+    pub null_frac: f32,
+    /// The average width in bytes of the non-NULL values (`stawidth`).
+    pub avg_width: i32,
+    /// The estimated number of distinct non-NULL values (`stadistinct`); a
+    /// negative value is a fraction of the row count.
+    pub n_distinct: f32,
+    /// The statistic slots (`stakindN`/`staopN`/...), in PostgreSQL's slot
+    /// order: MCV list, histogram, correlation, then the array or range
+    /// kinds.
+    #[serde(default)]
+    pub slots: Vec<StatSlot>,
+}
+
+/// One `pg_statistic` statistic slot: what kind of statistic it is
+/// (`stakindN`), the operator it is meaningful for (`staopN`), the collation
+/// it was computed with (`stacollN`), and its numbers (`stanumbersN`, float4)
+/// and values (`stavaluesN`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StatSlot {
+    pub kind: i16,
+    pub op: i64,
+    pub coll: i64,
+    /// `stanumbersN`; `None` is SQL NULL.
+    #[serde(default)]
+    pub numbers: Option<Vec<f32>>,
+    /// `stavaluesN`, each the executor's serialized `Value` (opaque to the
+    /// catalog, like [`ColumnDescriptor::default_expr`]); `None` is SQL NULL,
+    /// and an empty list is an empty array.
+    #[serde(default)]
+    pub values: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
