@@ -1969,7 +1969,9 @@ impl MemExecutor {
             );
             Ok(QueryOutput::tag("DROP INDEX"))
         } else {
-            anyhow::bail!("index \"{}\" does not exist", name)
+            Err(DbError::new(format!("index \"{name}\" does not exist"))
+                .code("42704")
+                .into())
         }
     }
 }

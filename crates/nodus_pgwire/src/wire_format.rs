@@ -282,6 +282,8 @@ pub(crate) fn sqlstate_for_execution_error(err_str: &str) -> &'static str {
         || err_str.starts_with("invalid reference to FROM-clause entry for table")
     {
         "42P01" // undefined_table
+    } else if err_str.starts_with("index \"") && err_str.ends_with("\" does not exist") {
+        "42704" // undefined_object: `DROP INDEX` names the index, not a relation
     } else if err_str.starts_with("function ") && err_str.ends_with(" does not exist") {
         "42883" // undefined_function
     } else if err_str.contains("column") && err_str.contains("does not exist") {
@@ -585,8 +587,10 @@ mod tests {
             "42P01"
         );
         assert_eq!(
+            // `DROP INDEX`: PostgreSQL reports the index itself as the
+            // missing object, not a relation.
             sqlstate_for_execution_error("index \"idx_x\" does not exist"),
-            "42P01"
+            "42704"
         );
         assert_eq!(
             sqlstate_for_execution_error("column \"missing\" does not exist"),
