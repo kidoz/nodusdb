@@ -380,6 +380,8 @@ impl MemExecutor {
                 | "pg_sequences"
                 | "pg_stat_user_tables"
                 | "pg_stat_all_tables"
+                | "pg_stat_user_indexes"
+                | "pg_stat_all_indexes"
                 | "pg_indexes"
                 | "pg_attrdef"
                 | "pg_description"

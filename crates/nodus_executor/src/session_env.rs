@@ -30,6 +30,8 @@ pub(crate) struct SessionEnv {
     pub(crate) staged_notifications: Vec<(String, String)>,
     /// The node's advisory locks.
     pub(crate) advisory: Option<std::sync::Arc<crate::advisory::AdvisoryLocks>>,
+    /// The relations' statistics, for the `pg_stat_get_*` functions.
+    pub(crate) stats: Option<std::sync::Arc<crate::stats::Stats>>,
     /// The authorization engine and the session's principal, for the
     /// privilege-inquiry functions (`has_table_privilege`).
     pub(crate) authz: Option<(

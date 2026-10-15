@@ -187,6 +187,17 @@ pub(crate) fn is_known(name: &str) -> bool {
                 | "__OBJECT_NAME__"
                 | "PG_GET_VIEWDEF" | "PG_RELATION_SIZE" | "PG_TABLE_SIZE" | "PG_INDEXES_SIZE"
                 | "PG_TOTAL_RELATION_SIZE" | "PG_DATABASE_SIZE"
+                | "PG_STAT_GET_NUMSCANS" | "PG_STAT_GET_TUPLES_RETURNED"
+                | "PG_STAT_GET_TUPLES_FETCHED" | "PG_STAT_GET_TUPLES_INSERTED"
+                | "PG_STAT_GET_TUPLES_UPDATED" | "PG_STAT_GET_TUPLES_DELETED"
+                | "PG_STAT_GET_TUPLES_HOT_UPDATED" | "PG_STAT_GET_TUPLES_NEWPAGE_UPDATED"
+                | "PG_STAT_GET_LIVE_TUPLES" | "PG_STAT_GET_DEAD_TUPLES"
+                | "PG_STAT_GET_VACUUM_COUNT" | "PG_STAT_GET_AUTOVACUUM_COUNT"
+                | "PG_STAT_GET_ANALYZE_COUNT" | "PG_STAT_GET_AUTOANALYZE_COUNT"
+                | "PG_STAT_GET_LAST_VACUUM_TIME" | "PG_STAT_GET_LAST_AUTOVACUUM_TIME"
+                | "PG_STAT_GET_LAST_ANALYZE_TIME" | "PG_STAT_GET_LAST_AUTOANALYZE_TIME"
+                | "PG_STAT_GET_BLOCKS_FETCHED" | "PG_STAT_GET_BLOCKS_HIT"
+                | "PG_STAT_GET_SNAPSHOT_TIMESTAMP"
                 // Sequences.
                 | "NEXTVAL" | "CURRVAL" | "LASTVAL" | "SETVAL" | "PG_GET_SERIAL_SEQUENCE"
                 | crate::sequences::SERIAL
@@ -359,6 +370,28 @@ pub(crate) fn return_type(name: &str, arg_types: &[Option<String>]) -> Option<St
             | "LASTVAL"
             | "SETVAL" => "BIGINT",
             "PG_GET_SERIAL_SEQUENCE" => "TEXT",
+            // The `pg_stat_get_*` counters and their times.
+            "PG_STAT_GET_NUMSCANS"
+            | "PG_STAT_GET_TUPLES_RETURNED"
+            | "PG_STAT_GET_TUPLES_FETCHED"
+            | "PG_STAT_GET_TUPLES_INSERTED"
+            | "PG_STAT_GET_TUPLES_UPDATED"
+            | "PG_STAT_GET_TUPLES_DELETED"
+            | "PG_STAT_GET_TUPLES_HOT_UPDATED"
+            | "PG_STAT_GET_TUPLES_NEWPAGE_UPDATED"
+            | "PG_STAT_GET_LIVE_TUPLES"
+            | "PG_STAT_GET_DEAD_TUPLES"
+            | "PG_STAT_GET_VACUUM_COUNT"
+            | "PG_STAT_GET_AUTOVACUUM_COUNT"
+            | "PG_STAT_GET_ANALYZE_COUNT"
+            | "PG_STAT_GET_AUTOANALYZE_COUNT"
+            | "PG_STAT_GET_BLOCKS_FETCHED"
+            | "PG_STAT_GET_BLOCKS_HIT" => "BIGINT",
+            "PG_STAT_GET_LAST_VACUUM_TIME"
+            | "PG_STAT_GET_LAST_AUTOVACUUM_TIME"
+            | "PG_STAT_GET_LAST_ANALYZE_TIME"
+            | "PG_STAT_GET_LAST_AUTOANALYZE_TIME"
+            | "PG_STAT_GET_SNAPSHOT_TIMESTAMP" => "TIMESTAMPTZ",
             "RANDOM" | "PI" | "DATE_PART" => "DOUBLE PRECISION",
             "NOW"
             | "CURRENT_TIMESTAMP"
@@ -3568,6 +3601,12 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
             }
             .to_string(),
         ),
+        // The `pg_stat_*` views' counters, by relation OID (`pg_stat_get_*`).
+        name if name.starts_with("PG_STAT_GET_") && arity(1) => stat_counter(name, arg(0))?,
+        // When the statistics were last read: the counters are current.
+        "PG_STAT_GET_SNAPSHOT_TIMESTAMP" if arity(0) => {
+            timestamp(session_env::wall_micros(), true)
+        }
         "PG_SIZE_PRETTY" if arity(1) => Value::Text(size_pretty(int(arg(0))?)),
         // A relation's forks other than its main one are empty.
         "PG_RELATION_SIZE" if arity(2) && text(arg(1)) != "main" => relation_size(arg(0), |_, _| 0),
@@ -5654,6 +5693,77 @@ fn strip_nulls(json: &mut serde_json::Value, in_arrays: bool) {
         }
         _ => {}
     }
+}
+
+/// `pg_stat_get_*(rel)`: one relation's statistic, from the statistics the
+/// server keeps (PostgreSQL's statistics collector). A table and an index
+/// report different sets; a counter a relation does not have is zero, and an
+/// OID that is no relation of this server is NULL, as PostgreSQL reports it.
+fn stat_counter(name: &str, rel: &Value) -> Option<Value> {
+    let oid = match rel {
+        // These take an OID, not a `regclass`: a name would only be parsed
+        // as one, which PostgreSQL refuses.
+        Value::Text(name) if name.trim().parse::<i64>().is_err() => {
+            return Some(raise(format!(
+                "invalid input syntax for type oid: \"{name}\""
+            )));
+        }
+        other => int(other)?,
+    };
+    session_env::with(|env| {
+        let env = env?;
+        let (stats, catalog) = (env.stats.as_ref()?, env.catalog.as_ref()?);
+        let relation = stats.by_oid(catalog.as_ref(), oid)?;
+        let table = match &relation {
+            crate::stats::RelationStats::Table(table) => Some(table),
+            crate::stats::RelationStats::Index(_) => None,
+        };
+        let index = match &relation {
+            crate::stats::RelationStats::Index(index) => Some(index),
+            crate::stats::RelationStats::Table(_) => None,
+        };
+        let time = |value: Option<chrono::DateTime<chrono::Utc>>| match value {
+            Some(at) => timestamp(at.timestamp_micros(), true),
+            None => Value::Null,
+        };
+        Some(match name {
+            "PG_STAT_GET_NUMSCANS" => Value::Int(match (table, index) {
+                (Some(table), _) => table.seq_scan,
+                (_, Some(index)) => index.idx_scan,
+                _ => 0,
+            }),
+            "PG_STAT_GET_TUPLES_RETURNED" => Value::Int(match (table, index) {
+                (Some(table), _) => table.seq_tup_read,
+                (_, Some(index)) => index.idx_tup_read,
+                _ => 0,
+            }),
+            "PG_STAT_GET_TUPLES_FETCHED" => Value::Int(match (table, index) {
+                (Some(table), _) => table.idx_tup_fetch,
+                (_, Some(index)) => index.idx_tup_fetch,
+                _ => 0,
+            }),
+            "PG_STAT_GET_TUPLES_INSERTED" => Value::Int(table.map_or(0, |t| t.n_tup_ins)),
+            "PG_STAT_GET_TUPLES_UPDATED" => Value::Int(table.map_or(0, |t| t.n_tup_upd)),
+            "PG_STAT_GET_TUPLES_DELETED" => Value::Int(table.map_or(0, |t| t.n_tup_del)),
+            "PG_STAT_GET_TUPLES_HOT_UPDATED" => Value::Int(table.map_or(0, |t| t.n_tup_hot_upd)),
+            "PG_STAT_GET_TUPLES_NEWPAGE_UPDATED" => {
+                Value::Int(table.map_or(0, |t| t.n_tup_newpage_upd))
+            }
+            "PG_STAT_GET_LIVE_TUPLES" => Value::Int(table.map_or(0, |t| t.n_live_tup)),
+            "PG_STAT_GET_DEAD_TUPLES" => Value::Int(table.map_or(0, |t| t.n_dead_tup)),
+            "PG_STAT_GET_VACUUM_COUNT" => Value::Int(table.map_or(0, |t| t.vacuum_count)),
+            "PG_STAT_GET_AUTOVACUUM_COUNT" => Value::Int(table.map_or(0, |t| t.autovacuum_count)),
+            "PG_STAT_GET_ANALYZE_COUNT" => Value::Int(table.map_or(0, |t| t.analyze_count)),
+            "PG_STAT_GET_AUTOANALYZE_COUNT" => Value::Int(table.map_or(0, |t| t.autoanalyze_count)),
+            "PG_STAT_GET_LAST_VACUUM_TIME" => time(table.and_then(|t| t.last_vacuum)),
+            "PG_STAT_GET_LAST_AUTOVACUUM_TIME" => time(table.and_then(|t| t.last_autovacuum)),
+            "PG_STAT_GET_LAST_ANALYZE_TIME" => time(table.and_then(|t| t.last_analyze)),
+            "PG_STAT_GET_LAST_AUTOANALYZE_TIME" => time(table.and_then(|t| t.last_autoanalyze)),
+            // Buffer access is not modelled: every read is a hit's absence.
+            "PG_STAT_GET_BLOCKS_FETCHED" | "PG_STAT_GET_BLOCKS_HIT" => Value::Int(0),
+            _ => return None,
+        })
+    })
 }
 
 /// A size function over relation `rel` (an OID or a name): `measure` gets

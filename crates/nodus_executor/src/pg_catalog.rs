@@ -847,9 +847,28 @@ impl MemExecutor {
                     ("schemaname", "NAME"),
                     ("relname", "NAME"),
                 ];
-                columns.extend(counters.iter().map(|c| (*c, "INT8")));
+                // PostgreSQL 16's order: each counter's own last-scan time
+                // follows the counter, and the total times close the view.
+                for (counter, kind) in counters.iter().map(|c| (*c, "INT8")) {
+                    columns.push((counter, kind));
+                    match counter {
+                        "seq_scan" => columns.push(("last_seq_scan", "TIMESTAMPTZ")),
+                        "idx_scan" => columns.push(("last_idx_scan", "TIMESTAMPTZ")),
+                        _ => {}
+                    }
+                }
                 columns.extend(times.iter().map(|c| (*c, "TIMESTAMPTZ")));
                 columns.extend(counts.iter().map(|c| (*c, "INT8")));
+                columns.extend(
+                    [
+                        "total_vacuum_time",
+                        "total_autovacuum_time",
+                        "total_analyze_time",
+                        "total_autoanalyze_time",
+                    ]
+                    .iter()
+                    .map(|c| (*c, "FLOAT8")),
+                );
                 let rows = tables
                     .iter()
                     .filter(|t| t.view_query.is_none() && !crate::sequences::is_sequence(t))
@@ -860,12 +879,111 @@ impl MemExecutor {
                             Value::Text(schema_name),
                             Value::Text(t.name.clone()),
                         ];
-                        row.extend(counters.iter().map(|_| Value::Int(0)));
-                        row.extend(times.iter().map(|_| Value::Null));
-                        row.extend(counts.iter().map(|_| Value::Int(0)));
+                        // The counters the server has kept for this table
+                        // since it started (or the last `TRUNCATE`).
+                        let stats = self.stats.table(t.id);
+                        let counter = |name: &str| match name {
+                            "seq_scan" => stats.seq_scan,
+                            "seq_tup_read" => stats.seq_tup_read,
+                            "idx_scan" => stats.idx_scan,
+                            "idx_tup_fetch" => stats.idx_tup_fetch,
+                            "n_tup_ins" => stats.n_tup_ins,
+                            "n_tup_upd" => stats.n_tup_upd,
+                            "n_tup_del" => stats.n_tup_del,
+                            "n_tup_hot_upd" => stats.n_tup_hot_upd,
+                            "n_tup_newpage_upd" => stats.n_tup_newpage_upd,
+                            "n_live_tup" => stats.n_live_tup,
+                            "n_dead_tup" => stats.n_dead_tup,
+                            "n_mod_since_analyze" => stats.n_mod_since_analyze,
+                            "n_ins_since_vacuum" => stats.n_ins_since_vacuum,
+                            _ => 0,
+                        };
+                        let time = |value: Option<chrono::DateTime<Utc>>| match value {
+                            Some(at) => {
+                                Value::Text(crate::value::format_timestamp(at.naive_utc(), true))
+                            }
+                            None => Value::Null,
+                        };
+                        for name in counters.iter() {
+                            row.push(Value::Int(counter(name)));
+                            match *name {
+                                // A scan's own time is not modelled: the
+                                // counters are, the timestamps are not.
+                                "seq_scan" | "idx_scan" => row.push(Value::Null),
+                                _ => {}
+                            }
+                        }
+                        row.extend(times.iter().map(|name| {
+                            time(match *name {
+                                "last_vacuum" => stats.last_vacuum,
+                                "last_autovacuum" => stats.last_autovacuum,
+                                "last_analyze" => stats.last_analyze,
+                                _ => stats.last_autoanalyze,
+                            })
+                        }));
+                        row.extend(counts.iter().map(|name| {
+                            Value::Int(match *name {
+                                "vacuum_count" => stats.vacuum_count,
+                                "autovacuum_count" => stats.autovacuum_count,
+                                "analyze_count" => stats.analyze_count,
+                                _ => stats.autoanalyze_count,
+                            })
+                        }));
+                        // The seconds spent vacuuming or analyzing are not
+                        // measured.
+                        row.extend(std::iter::repeat_n(Value::Float(0.0), 4));
                         row
                     })
                     .collect();
+                Some((Self::virtual_columns(&columns), rows))
+            }
+            // The counters of every index, as its own view reports them.
+            "pg_stat_user_indexes" | "pg_stat_all_indexes" => {
+                let mut columns = vec![
+                    ("relid", "OID"),
+                    ("indexrelid", "OID"),
+                    ("schemaname", "NAME"),
+                    ("relname", "NAME"),
+                    ("indexrelname", "NAME"),
+                ];
+                columns.extend(
+                    ["idx_scan", "last_idx_scan", "idx_tup_read", "idx_tup_fetch"]
+                        .iter()
+                        .map(|c| {
+                            (
+                                *c,
+                                if *c == "last_idx_scan" {
+                                    "TIMESTAMPTZ"
+                                } else {
+                                    "INT8"
+                                },
+                            )
+                        }),
+                );
+                let mut rows = Vec::new();
+                for table in &tables {
+                    let schema_name = Self::schema_name_by_id(db_name, &schemas, table.schema_id);
+                    let relid = Self::table_oid(db_name, &schema_name, &table.name);
+                    for index in &table.indexes {
+                        let stats = self.stats.index(index.id);
+                        rows.push(vec![
+                            Value::Int(relid),
+                            Value::Int(Self::index_oid(
+                                db_name,
+                                &schema_name,
+                                &table.name,
+                                &index.name,
+                            )),
+                            Value::Text(schema_name.clone()),
+                            Value::Text(table.name.clone()),
+                            Value::Text(index.name.clone()),
+                            Value::Int(stats.idx_scan),
+                            Value::Null,
+                            Value::Int(stats.idx_tup_read),
+                            Value::Int(stats.idx_tup_fetch),
+                        ]);
+                    }
+                }
                 Some((Self::virtual_columns(&columns), rows))
             }
             "pg_indexes" => Some(self.pg_indexes_virtual_table(db_name, &schemas, &tables)),

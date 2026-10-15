@@ -67,6 +67,7 @@ mod session_functions;
 mod session_vars;
 mod set_ops;
 mod sqljson;
+mod stats;
 mod streaming;
 mod subqueries;
 mod system_views;
@@ -450,6 +451,8 @@ pub struct MemExecutor {
     pub(crate) large_objects: parking_lot::Mutex<HashMap<String, largeobjects::Descriptors>>,
     /// The node's advisory locks.
     pub(crate) advisory: Arc<advisory::AdvisoryLocks>,
+    /// The relations' statistics, as the `pg_stat_*` views report them.
+    pub(crate) stats: Arc<stats::Stats>,
     /// Per session, the channels it listens on (`LISTEN`).
     pub(crate) listeners: parking_lot::RwLock<HashMap<String, std::collections::BTreeSet<String>>>,
     /// Per session, notifications for it not yet taken by the wire layer:
@@ -529,6 +532,7 @@ impl MemExecutor {
             cursors: parking_lot::Mutex::new(HashMap::new()),
             large_objects: parking_lot::Mutex::new(HashMap::new()),
             advisory: Arc::new(advisory::AdvisoryLocks::default()),
+            stats: stats::Stats::new(),
             listeners: parking_lot::RwLock::new(HashMap::new()),
             notifications: parking_lot::Mutex::new(HashMap::new()),
             subplan_cache: parking_lot::Mutex::new(HashMap::new()),
@@ -773,6 +777,7 @@ impl MemExecutor {
             staged_notices: Vec::new(),
             staged_notifications: Vec::new(),
             advisory: Some(self.advisory.clone()),
+            stats: Some(self.stats.clone()),
             authz: Some((self.authz.clone(), ctx.principal_id)),
             in_explicit_txn: self
                 .active_txns

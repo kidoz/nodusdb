@@ -744,6 +744,8 @@ impl MemExecutor {
         for table in &insert_tables {
             self.enforce_references(ctx, table, &[], &changed)?;
         }
+        self.stats
+            .wrote(tbl.id, crate::stats::Write::Inserted(inserted_count as i64));
         Ok(scope.returning_output(
             self,
             ctx,
@@ -827,6 +829,9 @@ impl MemExecutor {
             nodus_catalog::TableId,
             Vec<(Vec<Value>, Vec<Value>)>,
         > = std::collections::HashMap::new();
+        // The rows each table had rewritten, for its statistics.
+        let mut rewritten: std::collections::HashMap<nodus_catalog::TableId, i64> =
+            std::collections::HashMap::new();
         // Two-phase: pick the matching rows before mutating, so a subquery in
         // the filter evaluates against the pre-statement state.
         for target in self.matching_targets(ctx, &tbl, &scope, filter.as_ref(), only)? {
@@ -849,6 +854,7 @@ impl MemExecutor {
                 &new_row,
             )?;
             updated += 1;
+            *rewritten.entry(target.table.id).or_default() += 1;
             if referenced.iter().any(|t| t.id == target.table.id) {
                 changed
                     .entry(target.table.id)
@@ -868,6 +874,9 @@ impl MemExecutor {
         for table in &referenced {
             let rows = changed.get(&table.id).cloned().unwrap_or_default();
             self.enforce_references(ctx, table, &[], &rows)?;
+        }
+        for (table, rows) in rewritten {
+            self.stats.wrote(table, crate::stats::Write::Updated(rows));
         }
         Ok(scope.returning_output(
             self,
@@ -938,12 +947,16 @@ impl MemExecutor {
         }
         let mut removed: std::collections::HashMap<nodus_catalog::TableId, Vec<Vec<Value>>> =
             std::collections::HashMap::new();
+        // The rows each table lost, for its statistics.
+        let mut lost: std::collections::HashMap<nodus_catalog::TableId, i64> =
+            std::collections::HashMap::new();
         // Two-phase: decide WHICH rows match before mutating anything, so a
         // subquery in the filter (e.g. `WHERE a = (SELECT max(a) ...)`) sees
         // the pre-statement state rather than partially-deleted data.
         for target in self.matching_targets(ctx, &tbl, &scope, filter.as_ref(), only)? {
             self.remove_row(ctx, &target.table, &target.key, &target.row)?;
             deleted += 1;
+            *lost.entry(target.table.id).or_default() += 1;
             if referenced.iter().any(|t| t.id == target.table.id) {
                 removed
                     .entry(target.table.id)
@@ -964,6 +977,9 @@ impl MemExecutor {
         for table in &referenced {
             let rows = removed.get(&table.id).cloned().unwrap_or_default();
             self.enforce_references(ctx, table, &rows, &[])?;
+        }
+        for (table, rows) in lost {
+            self.stats.wrote(table, crate::stats::Write::Deleted(rows));
         }
         Ok(scope.returning_output(
             self,
@@ -1063,6 +1079,10 @@ impl MemExecutor {
             for sequence in sequences {
                 self.sequences.restart(&sequence)?;
             }
+        }
+        // PostgreSQL's live and dead counts go with the rows.
+        for tbl in &targets {
+            self.stats.wrote(tbl.id, crate::stats::Write::Truncated);
         }
         Ok(QueryOutput::tag("TRUNCATE TABLE"))
     }

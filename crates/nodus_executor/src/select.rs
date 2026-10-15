@@ -495,6 +495,9 @@ impl MemExecutor {
                     .collect();
 
                 let mut rows = None;
+                // The index that supplied the rows, for the scan's
+                // statistics (`pg_stat_user_tables`/`_indexes`).
+                let mut scanned_index: Option<nodus_catalog::IndexId> = None;
                 // The columns the statement reads: a covering index is
                 // preferred when one serves them all.
                 let needed_columns = crate::index_keys::index_only_needed(
@@ -590,6 +593,7 @@ impl MemExecutor {
                             .ok()
                         });
                         if let Some(indexed_rows) = indexed {
+                            scanned_index = Some(idx.id);
                             rows = Some(self.merge_overlay_eq(
                                 indexed_rows,
                                 tbl.id,
@@ -688,6 +692,7 @@ impl MemExecutor {
                         }
                     };
                     if let Ok(indexed_rows) = indexed_rows {
+                        scanned_index = Some(idx.id);
                         rows = Some(self.merge_overlay_by(
                             indexed_rows,
                             tbl.id,
@@ -757,6 +762,7 @@ impl MemExecutor {
                         }
                     };
                     if let Ok(indexed_rows) = indexed_rows {
+                        scanned_index = Some(idx.id);
                         rows = Some(self.merge_overlay_range(
                             indexed_rows,
                             tbl.id,
@@ -868,6 +874,7 @@ impl MemExecutor {
                 {
                     let mut candidates: Vec<(String, Vec<Value>)> = Vec::new();
                     for (backwards, column, index_id, _) in &minmax {
+                        scanned_index = Some(*index_id);
                         let data_type = tbl
                             .columns
                             .iter()
@@ -928,6 +935,9 @@ impl MemExecutor {
                 };
                 // The rows this scan reads, for `EXPLAIN ANALYZE`.
                 crate::explain::record_scan(tbl.id, rows.len());
+                // And the scan's statistics: an index scan's counters when an
+                // index supplied the rows, a sequential scan's otherwise.
+                self.stats.scanned(tbl.id, scanned_index, rows.len());
                 let mut cols = tbl.columns.clone();
                 let mut col_names = col_names;
                 if tbl.view_query.is_none() {
