@@ -633,7 +633,7 @@ impl MemExecutor {
             return Ok(QueryOutput::tag("SET"));
         }
         let mut guard = self.active_txns.write();
-        let Some(txn) = guard.get_mut(&ctx.session_id).filter(|t| t.explicit) else {
+        let Some(txn) = guard.get_mut(&ctx.session_id).filter(|t| t.in_block()) else {
             drop(guard);
             self.notice(
                 ctx,
@@ -645,7 +645,11 @@ impl MemExecutor {
             return Ok(QueryOutput::tag("SET"));
         };
         if txn.queried && isolation.as_ref().is_some_and(|i| *i != txn.isolation) {
-            anyhow::bail!("SET TRANSACTION ISOLATION LEVEL must be called before any query");
+            return Err(crate::error_fields::DbError::new(
+                "SET TRANSACTION ISOLATION LEVEL must be called before any query",
+            )
+            .code("25001")
+            .into());
         }
         if txn.queried && read_only == Some(false) && txn.read_only {
             anyhow::bail!("transaction read-write mode must be set before any query");
@@ -697,7 +701,14 @@ impl MemExecutor {
         let mut guard = self.active_txns.write();
         let txn = guard
             .get_mut(&ctx.session_id)
-            .ok_or_else(|| anyhow::anyhow!("SAVEPOINT can only be used in transaction blocks"))?;
+            .filter(|txn| txn.explicit)
+            .ok_or_else(|| -> anyhow::Error {
+                crate::error_fields::DbError::new(
+                    "SAVEPOINT can only be used in transaction blocks",
+                )
+                .code("25P01")
+                .into()
+            })?;
         txn.savepoints.push(SavepointState {
             name,
             write_log_len: txn.write_log.len(),
@@ -713,9 +724,16 @@ impl MemExecutor {
     ) -> Result<QueryOutput> {
         let (txn_id, affected, snapshot, keep_len, keep_savepoints) = {
             let guard = self.active_txns.read();
-            let txn = guard.get(&ctx.session_id).ok_or_else(|| {
-                anyhow::anyhow!("ROLLBACK TO SAVEPOINT can only be used in transaction blocks")
-            })?;
+            let txn = guard
+                .get(&ctx.session_id)
+                .filter(|txn| txn.explicit)
+                .ok_or_else(|| -> anyhow::Error {
+                    crate::error_fields::DbError::new(
+                        "ROLLBACK TO SAVEPOINT can only be used in transaction blocks",
+                    )
+                    .code("25P01")
+                    .into()
+                })?;
             let savepoint_idx = txn
                 .savepoints
                 .iter()
@@ -760,9 +778,16 @@ impl MemExecutor {
         name: String,
     ) -> Result<QueryOutput> {
         let mut guard = self.active_txns.write();
-        let txn = guard.get_mut(&ctx.session_id).ok_or_else(|| {
-            anyhow::anyhow!("RELEASE SAVEPOINT can only be used in transaction blocks")
-        })?;
+        let txn = guard
+            .get_mut(&ctx.session_id)
+            .filter(|txn| txn.explicit)
+            .ok_or_else(|| -> anyhow::Error {
+                crate::error_fields::DbError::new(
+                    "RELEASE SAVEPOINT can only be used in transaction blocks",
+                )
+                .code("25P01")
+                .into()
+            })?;
         let savepoint_idx = txn
             .savepoints
             .iter()

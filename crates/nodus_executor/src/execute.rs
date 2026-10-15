@@ -346,6 +346,7 @@ impl MemExecutor {
                 include,
                 expressions,
                 descending,
+                concurrently,
             } => self.exec_create_index(
                 ctx,
                 name,
@@ -354,10 +355,13 @@ impl MemExecutor {
                 (unique, nulls_not_distinct, predicate),
                 if_not_exists,
                 include,
+                concurrently,
             ),
-            LogicalPlan::DropIndex { name, if_exists } => {
-                self.exec_drop_index(ctx, name, if_exists)
-            }
+            LogicalPlan::DropIndex {
+                name,
+                if_exists,
+                concurrently,
+            } => self.exec_drop_index(ctx, name, if_exists, concurrently),
             LogicalPlan::RenameIndex { name, new_name } => {
                 self.exec_rename_index(ctx, &name, &new_name)
             }
@@ -454,7 +458,19 @@ impl MemExecutor {
                 value,
                 local,
             } => self.exec_set_variable(ctx, variable, value, local),
-            LogicalPlan::Noop { tag } => Ok(QueryOutput::tag(&tag)),
+            LogicalPlan::Noop { tag } => {
+                // `VACUUM` needs a transaction of its own, as PostgreSQL
+                // says; `CHECKPOINT`, `CLUSTER`, and `ANALYZE` may run in
+                // one.
+                if tag == "VACUUM" && self.in_transaction_block(ctx) {
+                    return Err(crate::error_fields::DbError::new(
+                        "VACUUM cannot run inside a transaction block",
+                    )
+                    .code("25001")
+                    .into());
+                }
+                Ok(QueryOutput::tag(&tag))
+            }
             LogicalPlan::DeclareCursor {
                 name,
                 query,

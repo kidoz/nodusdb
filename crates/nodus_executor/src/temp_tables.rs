@@ -153,13 +153,12 @@ impl MemExecutor {
         };
         match what.as_str() {
             "ALL" => {
-                if self
-                    .active_txns
-                    .read()
-                    .get(&ctx.session_id)
-                    .is_some_and(|t| t.explicit)
-                {
-                    anyhow::bail!("DISCARD ALL cannot run inside a transaction block");
+                if self.in_transaction_block(ctx) {
+                    return Err(crate::error_fields::DbError::new(
+                        "DISCARD ALL cannot run inside a transaction block",
+                    )
+                    .code("25001")
+                    .into());
                 }
                 self.exec_reset_variable(ctx, None)?;
                 self.drop_temp_relations(&ctx.session_id);

@@ -155,6 +155,7 @@ fn test_ddl_and_subqueries() {
             expressions: vec![],
             descending: vec![],
             include: Vec::new(),
+            concurrently: false,
             nulls_not_distinct: false,
         },
     )
@@ -557,6 +558,7 @@ fn test_secondary_indexing() {
             expressions: vec![],
             descending: vec![],
             include: Vec::new(),
+            concurrently: false,
             nulls_not_distinct: false,
         },
     )
@@ -864,6 +866,7 @@ fn test_index_value_containing_separator_does_not_overmatch() {
             expressions: vec![],
             descending: vec![],
             include: Vec::new(),
+            concurrently: false,
             nulls_not_distinct: false,
         },
     )

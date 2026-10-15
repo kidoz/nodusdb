@@ -501,10 +501,22 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                 _ if names.len() > 1 => {
                     anyhow::bail!("DROP of several objects in one statement is not supported")
                 }
-                sqlparser::ast::ObjectType::Index => Ok(LogicalPlan::DropIndex {
-                    name,
-                    if_exists: *if_exists,
-                }),
+                sqlparser::ast::ObjectType::Index => {
+                    // The name as `DROP INDEX` found it: quoted when the
+                    // statement quoted it, and carrying the token rewriter's
+                    // `CONCURRENTLY` mark when the statement had one.
+                    let unquoted = name.trim_matches('"');
+                    let (name, concurrently) =
+                        match unquoted.strip_prefix(nodus_sql::CONCURRENT_MARK) {
+                            Some(rest) => (rest.to_string(), true),
+                            None => (unquoted.to_string(), false),
+                        };
+                    Ok(LogicalPlan::DropIndex {
+                        name,
+                        if_exists: *if_exists,
+                        concurrently,
+                    })
+                }
                 _ => anyhow::bail!("DROP {object_type} is not supported"),
             }
         }
@@ -572,6 +584,7 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                     .iter()
                     .map(|column| column.value.clone())
                     .collect(),
+                concurrently: create_index.concurrently,
             })
         }
         Statement::CreateRole(create_role) => {

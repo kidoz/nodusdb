@@ -1608,10 +1608,18 @@ pub enum LogicalPlan {
         /// scans, not part of its key.
         #[serde(default)]
         include: Vec<String>,
+        /// `CONCURRENTLY`: refused inside a transaction block, as
+        /// PostgreSQL refuses it. Defaulted so older plans decode.
+        #[serde(default)]
+        concurrently: bool,
     },
     DropIndex {
         name: String,
         if_exists: bool,
+        /// `CONCURRENTLY`: refused inside a transaction block, as
+        /// PostgreSQL refuses it. Defaulted so older plans decode.
+        #[serde(default)]
+        concurrently: bool,
     },
     /// `ALTER INDEX name RENAME TO new_name`.
     RenameIndex {

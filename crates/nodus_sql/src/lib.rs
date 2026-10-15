@@ -2880,6 +2880,10 @@ fn operand_start(tokens: &[sqlparser::tokenizer::TokenWithSpan], before: usize) 
 /// name and the real name as its alias, or fails on `ONLY t AS x`).
 pub const ONLY_MARK: &str = "\u{0}only:";
 
+/// The mark `DROP INDEX CONCURRENTLY`'s name is left behind as, for the
+/// planner to strip: the parser's `DROP INDEX` has no `CONCURRENTLY`.
+pub const CONCURRENT_MARK: &str = "\u{0}conc:";
+
 /// Rewrites `FROM/JOIN/UPDATE/DELETE ONLY <name>` into a marked name the
 /// planner recognizes. A `TRUNCATE ... ONLY` is left alone: the parser
 /// understands that form itself.
@@ -4215,6 +4219,35 @@ fn rewrite_data_clause(
                 return tokens;
             }
             return statement;
+        }
+    }
+
+    // `DROP INDEX CONCURRENTLY`: the parser has no such word for it, so it
+    // goes and the index's name carries the mark the planner reads.
+    if is(0, "drop") && is(1, "index") && is(2, "concurrently") {
+        let name_at = if is(3, "if") && is(4, "exists") { 5 } else { 3 };
+        if let Some(&name_index) = significant.get(name_at)
+            && let Some(Token::Word(word)) = statement.get(name_index).map(|t| &t.token)
+        {
+            let mut marked = word.clone();
+            marked.value = format!("{CONCURRENT_MARK}{}", word.value);
+            marked.quote_style = Some('"');
+            let span = statement[name_index].span;
+            let mut out: Vec<TokenWithSpan> = Vec::with_capacity(statement.len());
+            for (i, token) in statement.iter().enumerate() {
+                if i == significant[2] {
+                    continue;
+                }
+                if i == name_index {
+                    out.push(TokenWithSpan {
+                        token: Token::Word(marked.clone()),
+                        span,
+                    });
+                    continue;
+                }
+                out.push(token.clone());
+            }
+            return out;
         }
     }
 

@@ -1169,11 +1169,7 @@ impl MemExecutor {
         let (kind, concurrently, name) = parse_reindex_target(target)?;
         // `CONCURRENTLY`, and the whole-schema and whole-database forms, need
         // a transaction of their own.
-        let in_transaction_block = self
-            .active_txns
-            .read()
-            .get(&ctx.session_id)
-            .is_some_and(|txn| txn.explicit);
+        let in_transaction_block = self.in_transaction_block(ctx);
         if in_transaction_block && concurrently {
             return Err(
                 DbError::new("REINDEX CONCURRENTLY cannot run inside a transaction block")
@@ -1641,7 +1637,15 @@ impl MemExecutor {
         (unique, nulls_not_distinct, predicate): (bool, bool, Option<String>),
         if_not_exists: bool,
         include: Vec<String>,
+        concurrently: bool,
     ) -> Result<QueryOutput> {
+        if concurrently && self.in_transaction_block(ctx) {
+            return Err(DbError::new(
+                "CREATE INDEX CONCURRENTLY cannot run inside a transaction block",
+            )
+            .code("25001")
+            .into());
+        }
         let (db_name, schema_name, table_only) = parse_object_name(&table_name)?;
         let tbl = self
             .catalog_reader
@@ -1935,7 +1939,15 @@ impl MemExecutor {
         ctx: &ExecutionContext,
         name: String,
         if_exists: bool,
+        concurrently: bool,
     ) -> Result<QueryOutput> {
+        if concurrently && self.in_transaction_block(ctx) {
+            return Err(DbError::new(
+                "DROP INDEX CONCURRENTLY cannot run inside a transaction block",
+            )
+            .code("25001")
+            .into());
+        }
         // DROP INDEX names the index, not its table, so locate the owning table.
         let tables = self.catalog_reader.list_all_tables("default")?;
         for tbl in tables {
