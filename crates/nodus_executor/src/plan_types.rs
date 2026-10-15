@@ -1875,6 +1875,15 @@ pub enum LogicalPlan {
     Noop {
         tag: String,
     },
+    /// The implicit transaction block a multi-statement simple query runs in,
+    /// which the wire layer opens before its first statement. PostgreSQL
+    /// wraps such a batch in one transaction: it commits once, at the end.
+    BatchBegin,
+    /// The end of that block: `commit` is `true` when every statement ran, so
+    /// the batch's writes go through; `false` rolls them all back.
+    BatchEnd {
+        commit: bool,
+    },
     /// `REINDEX { INDEX | TABLE | SCHEMA | DATABASE | SYSTEM } name`: the
     /// target is resolved (a missing one is an error, as PostgreSQL's is),
     /// though nothing is rebuilt.

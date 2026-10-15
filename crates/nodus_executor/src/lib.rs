@@ -199,6 +199,11 @@ pub(crate) struct ActiveTxn {
     /// transactions are surfaced in `pg_locks`, so a bare `SELECT FROM pg_locks`
     /// (itself implicitly wrapped) does not report its own throwaway xid.
     pub(crate) explicit: bool,
+    /// `true` for the implicit transaction block a multi-statement simple
+    /// query runs in (`BatchBegin`/`BatchEnd`), which may span statements but
+    /// is nobody's `BEGIN`: a `BEGIN` inside it adopts the block (and is told
+    /// a transaction is already in progress).
+    pub(crate) batch: bool,
     /// `READ ONLY`: statements that write are refused.
     pub(crate) read_only: bool,
     /// The isolation level it reports (`read committed`).
@@ -224,6 +229,15 @@ pub(crate) struct ActiveTxn {
 }
 
 impl ActiveTxn {
+    /// Whether the session is in a transaction block, which PostgreSQL's
+    /// statements that need a transaction of their own (`VACUUM`,
+    /// `CREATE INDEX CONCURRENTLY`, ...) refuse: a user's `BEGIN`, or the
+    /// implicit block of a multi-statement simple query — but not the
+    /// throwaway transaction a single statement wraps itself in.
+    pub(crate) fn in_block(&self) -> bool {
+        self.explicit || self.batch
+    }
+
     pub(crate) fn new(txn_id: TxnId, read_ts: Timestamp, explicit: bool) -> Self {
         Self {
             txn_id,
@@ -232,6 +246,7 @@ impl ActiveTxn {
             overlay: std::collections::BTreeMap::new(),
             savepoints: Vec::new(),
             explicit,
+            batch: false,
             read_only: false,
             isolation: "read committed".to_string(),
             queried: false,
@@ -558,11 +573,13 @@ impl MemExecutor {
         if notes.is_empty() {
             return;
         }
+        // A batch's block is a transaction for `NOTIFY` too: the
+        // notifications go out when it commits, or not at all.
         if let Some(txn) = self
             .active_txns
             .write()
             .get_mut(&ctx.session_id)
-            .filter(|t| t.explicit)
+            .filter(|t| t.in_block())
         {
             txn.pending_notifications.extend(notes);
             return;
@@ -2008,6 +2025,8 @@ impl MemExecutor {
         let is_txn_control = matches!(
             plan,
             LogicalPlan::Begin { .. }
+                | LogicalPlan::BatchBegin
+                | LogicalPlan::BatchEnd { .. }
                 | LogicalPlan::Chain { .. }
                 | LogicalPlan::Commit
                 | LogicalPlan::Rollback

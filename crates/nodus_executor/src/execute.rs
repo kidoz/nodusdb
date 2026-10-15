@@ -434,6 +434,8 @@ impl MemExecutor {
                     out
                 })
             }
+            LogicalPlan::BatchBegin => self.exec_batch_begin(ctx),
+            LogicalPlan::BatchEnd { commit } => self.exec_batch_end(ctx, commit),
             LogicalPlan::Chain { rollback } => self.exec_chain(ctx, rollback),
             LogicalPlan::SetTransaction {
                 read_only,

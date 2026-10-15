@@ -171,8 +171,10 @@ impl MemExecutor {
             .active_txns
             .read()
             .get(&ctx.session_id)
-            .map(|t| (t.txn_id, t.explicit));
-        if !hold && !txn.is_some_and(|(_, explicit)| explicit) {
+            .map(|t| (t.txn_id, t.in_block()));
+        // A batch's implicit block is a transaction block a cursor can live
+        // in, as PostgreSQL lets one.
+        if !hold && !txn.is_some_and(|(_, in_block)| in_block) {
             return Err(
                 DbError::new("DECLARE CURSOR can only be used in transaction blocks")
                     .code("25P01")
@@ -202,7 +204,7 @@ impl MemExecutor {
             scroll,
             hold,
             binary,
-            txn_id: txn.filter(|(_, explicit)| *explicit).map(|(id, _)| id),
+            txn_id: txn.filter(|(_, in_block)| *in_block).map(|(id, _)| id),
             created: crate::session_env::wall_micros(),
         };
         self.cursors

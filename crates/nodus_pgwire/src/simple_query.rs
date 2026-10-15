@@ -235,7 +235,25 @@ impl SimpleQueryHandler for NodusQueryHandler {
             }
         };
 
+        // A multi-statement simple query is one implicit transaction block in
+        // PostgreSQL: its writes go through together when the last statement
+        // has run, and are rolled back when any statement fails. A lone
+        // statement keeps its own implicit transaction.
+        let batch = statements.len() > 1;
         let mut responses = Vec::new();
+        let mut failed = false;
+        let block_open = batch;
+        if batch {
+            let plan = nodus_executor::LogicalPlan::BatchBegin;
+            if let Err(e) = execute_off_reactor(self.executor.clone(), ctx.clone(), plan).await {
+                let err_str = e.to_string();
+                let code = sqlstate_for_execution_error(&err_str);
+                responses.push(Response::Error(Box::new(error_info(
+                    "ERROR", code, &err_str,
+                ))));
+                return Ok(responses);
+            }
+        }
         for stmt in statements {
             let plan = match nodus_executor::plan_statement(&stmt, &[]) {
                 Ok(plan) => plan,
@@ -252,6 +270,7 @@ impl SimpleQueryHandler for NodusQueryHandler {
                     responses.push(Response::Error(Box::new(error_info(
                         "ERROR", code, &message,
                     ))));
+                    failed = true;
                     break;
                 }
             };
@@ -268,6 +287,7 @@ impl SimpleQueryHandler for NodusQueryHandler {
                     let err = error_info("ERROR", code, &err_str);
                     mark_execution_failed(client, &executed_plan);
                     responses.push(Response::Error(Box::new(err)));
+                    failed = true;
                     break;
                 }
             };
@@ -280,7 +300,21 @@ impl SimpleQueryHandler for NodusQueryHandler {
                     "57014",
                     "canceling statement due to user request",
                 ))));
+                failed = true;
                 break;
+            }
+
+            // A statement that ends the block (`COMMIT`, `ROLLBACK`) leaves
+            // the batch's later statements in a fresh one, as PostgreSQL
+            // wraps each run of them.
+            if batch
+                && matches!(
+                    executed_plan,
+                    nodus_executor::LogicalPlan::Commit | nodus_executor::LogicalPlan::Rollback
+                )
+            {
+                let plan = nodus_executor::LogicalPlan::BatchBegin;
+                let _ = execute_off_reactor(self.executor.clone(), ctx.clone(), plan).await;
             }
 
             // No projected columns => a command tag (CREATE TABLE, INSERT, BEGIN...).
@@ -303,6 +337,25 @@ impl SimpleQueryHandler for NodusQueryHandler {
             let mut response = QueryResponse::new(field_info, stream::iter(data_rows));
             response.set_command_tag(&row_response_command(&out.tag));
             responses.push(Response::Query(response));
+        }
+        if block_open {
+            let plan = nodus_executor::LogicalPlan::BatchEnd { commit: !failed };
+            let ended = execute_off_reactor(self.executor.clone(), ctx.clone(), plan).await;
+            // A commit a deferred constraint refuses fails after the
+            // statements before it reported — but the last one's result is
+            // held back until the block commits, as PostgreSQL holds it, so
+            // only the error goes out for it.
+            if let Err(e) = ended
+                && !failed
+            {
+                self.metrics.query_errors_total.inc();
+                responses.pop();
+                let err_str = e.to_string();
+                let code = sqlstate_for_execution_error(&err_str);
+                responses.push(Response::Error(Box::new(error_info(
+                    "ERROR", code, &err_str,
+                ))));
+            }
         }
         Ok(responses)
     }

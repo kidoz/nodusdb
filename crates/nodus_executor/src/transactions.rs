@@ -51,6 +51,20 @@ impl MemExecutor {
             );
             return Ok(QueryOutput::tag("BEGIN"));
         }
+        // A batch's implicit block becomes the user's transaction: `BEGIN;`
+        // inside one is silent (PostgreSQL counts the block as implicit) and
+        // leaves the transaction open past the batch's end.
+        if let Some(txn) = self.active_txns.write().get_mut(&ctx.session_id)
+            && txn.batch
+        {
+            txn.batch = false;
+            txn.explicit = true;
+            txn.read_only = read_only.unwrap_or(txn.read_only);
+            if let Some(isolation) = isolation {
+                txn.isolation = isolation;
+            }
+            return Ok(QueryOutput::tag("BEGIN"));
+        }
         let txn_record = self.txn.begin_txn()?;
         let mut txn =
             self.new_active_txn(&ctx.session_id, txn_record.txn_id, txn_record.read_ts, true);
@@ -60,6 +74,59 @@ impl MemExecutor {
         }
         self.active_txns.write().insert(ctx.session_id.clone(), txn);
         Ok(QueryOutput::tag("BEGIN"))
+    }
+
+    /// Whether the session is in a transaction block: a user's `BEGIN`, or
+    /// the implicit block of a multi-statement simple query.
+    pub(crate) fn in_transaction_block(&self, ctx: &ExecutionContext) -> bool {
+        self.active_txns
+            .read()
+            .get(&ctx.session_id)
+            .is_some_and(|txn| txn.in_block())
+    }
+
+    /// Opens the implicit transaction block a multi-statement simple query
+    /// runs in. Statements then join it instead of wrapping themselves in
+    /// their own transaction, and the batch's writes go through together when
+    /// it ends. A session already in a transaction (a user's `BEGIN`, or one
+    /// this batch opened) keeps it.
+    pub(crate) fn exec_batch_begin(&self, ctx: &ExecutionContext) -> Result<QueryOutput> {
+        if self.active_txns.read().contains_key(&ctx.session_id) {
+            return Ok(QueryOutput::tag("BEGIN"));
+        }
+        let txn_record = self.txn.begin_txn()?;
+        let mut txn = self.new_active_txn(
+            &ctx.session_id,
+            txn_record.txn_id,
+            txn_record.read_ts,
+            false,
+        );
+        txn.batch = true;
+        self.active_txns.write().insert(ctx.session_id.clone(), txn);
+        Ok(QueryOutput::tag("BEGIN"))
+    }
+
+    /// Ends a batch's implicit block: `commit` sends its writes through,
+    /// otherwise they are rolled back. A transaction the batch's own `BEGIN`
+    /// adopted (or one a client already had open) is left alone.
+    pub(crate) fn exec_batch_end(
+        &self,
+        ctx: &ExecutionContext,
+        commit: bool,
+    ) -> Result<QueryOutput> {
+        let is_batch = self
+            .active_txns
+            .read()
+            .get(&ctx.session_id)
+            .is_some_and(|txn| txn.batch);
+        if !is_batch {
+            return Ok(QueryOutput::tag(if commit { "COMMIT" } else { "ROLLBACK" }));
+        }
+        if commit {
+            self.exec_commit(ctx)
+        } else {
+            self.exec_rollback(ctx)
+        }
     }
 
     /// Whether a constraint is currently deferred in a transaction:
@@ -445,7 +512,7 @@ impl MemExecutor {
             .active_txns
             .write()
             .get_mut(&ctx.session_id)
-            .filter(|t| t.explicit)
+            .filter(|t| t.in_block())
         {
             txn.settings_before
                 .entry(key.to_string())
