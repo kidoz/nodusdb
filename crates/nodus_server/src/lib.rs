@@ -19,7 +19,9 @@ mod upgrade_tests;
 
 use admin::{AdminState, admin_routes};
 use axum::Router;
-use nodus_backup::{BackupOrchestrator, BackupRepository, FsBackupRepository, S3BackupRepository, WalCommittedTxn};
+use nodus_backup::{
+    BackupOrchestrator, BackupRepository, FsBackupRepository, S3BackupRepository, WalCommittedTxn,
+};
 use nodus_catalog::{
     CatalogReader, CatalogWriter, CreateRoleRequest, GrantPrivilegeRequest, PrincipalType,
     ResourceRef,
@@ -160,7 +162,11 @@ fn backup_repository(uri: &str) -> anyhow::Result<Arc<dyn BackupRepository>> {
                      AWS_SECRET_ACCESS_KEY, AWS_REGION, AWS_ENDPOINT_URL, AWS_ALLOW_HTTP)"
                 )
             })?;
-            tracing::info!(bucket, prefix, "backup repository: S3-compatible object store");
+            tracing::info!(
+                bucket,
+                prefix,
+                "backup repository: S3-compatible object store"
+            );
             Ok(Arc::new(repo))
         }
     }
@@ -1688,7 +1694,7 @@ mod tests {
                 .send()
                 .await
                 .unwrap()
-            .status(),
+                .status(),
             reqwest::StatusCode::NOT_FOUND,
             "authenticated request reaches the handler (unknown shard)"
         );
@@ -1817,11 +1823,15 @@ mod tests {
             }
         );
         // s3:// without a bucket is a startup error.
-        let error = parse_backup_repository_uri("s3://").unwrap_err().to_string();
+        let error = parse_backup_repository_uri("s3://")
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("bucket"), "{error}");
         // Unknown schemes fail startup with an actionable error instead of
         // silently becoming a local directory named e.g. "gs:/bucket".
-        let error = parse_backup_repository_uri("gs://bucket").unwrap_err().to_string();
+        let error = parse_backup_repository_uri("gs://bucket")
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("gs"), "{error}");
         assert!(error.contains("file://"), "{error}");
         assert!(error.contains("s3://"), "{error}");

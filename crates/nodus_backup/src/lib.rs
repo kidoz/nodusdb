@@ -1208,7 +1208,9 @@ impl BackupOrchestrator {
                     WalRecordV1::BeginTxn { txn_id } => {
                         active_txns.insert(txn_id);
                     }
-                    WalRecordV1::WriteIntent { txn_id, key, value, .. } => {
+                    WalRecordV1::WriteIntent {
+                        txn_id, key, value, ..
+                    } => {
                         if is_backup_excluded_key(&key) {
                             continue;
                         }
@@ -1603,7 +1605,12 @@ impl RetentionView {
         self.scan
             .completed
             .iter()
-            .filter_map(|manifest| manifest.protected_timestamp.as_ref().map(|_| manifest.snapshot_ts))
+            .filter_map(|manifest| {
+                manifest
+                    .protected_timestamp
+                    .as_ref()
+                    .map(|_| manifest.snapshot_ts)
+            })
             .min()
     }
 
@@ -1752,7 +1759,10 @@ mod tests {
         }];
         let report = BackupOrchestrator::restore_backup_objects_to_kv(&objects, &kv).unwrap();
         assert_eq!(report.base_kv_versions_restored, 1);
-        assert_eq!(kv.get(b"row", 100).unwrap().as_deref(), Some(b"v".as_slice()));
+        assert_eq!(
+            kv.get(b"row", 100).unwrap().as_deref(),
+            Some(b"v".as_slice())
+        );
         for excluded in [
             b"\x00raft\x00vote".as_slice(),
             b"shard-7\0\x00raft\x00applied",
@@ -2526,7 +2536,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_wrong_schema_manifest_fails_closed() {
-        let bytes = Bytes::from(serde_json::to_vec(&serde_json::json!({"not": "a manifest"})).unwrap());
+        let bytes =
+            Bytes::from(serde_json::to_vec(&serde_json::json!({"not": "a manifest"})).unwrap());
         assert_unreadable_manifest_fails_closed(bytes).await;
     }
 

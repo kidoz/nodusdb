@@ -204,7 +204,10 @@ fn spawn_server(data_dir: &std::path::Path, http_port: u16, pg_port: u16) -> Ser
         .env("NODUS_CLUSTER__NODE_ID", "1")
         .env("NODUS_SERVER__HTTP_ADDR", format!("127.0.0.1:{http_port}"))
         .env("NODUS_SERVER__PGWIRE_ADDR", format!("127.0.0.1:{pg_port}"))
-        .env("NODUS_CLUSTER__RAFT_ADVERTISE_ADDR", format!("127.0.0.1:{http_port}"))
+        .env(
+            "NODUS_CLUSTER__RAFT_ADVERTISE_ADDR",
+            format!("127.0.0.1:{http_port}"),
+        )
         .env("NODUS_CLUSTER__JOIN_PEERS", "[]")
         .env("NODUS_STORAGE__DATA_DIR", data_dir)
         .env("NODUS_ADMIN__PASSWORD", "nodus")

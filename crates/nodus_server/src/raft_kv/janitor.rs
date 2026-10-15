@@ -39,7 +39,7 @@ use std::time::Duration;
 
 use crate::multi_raft::META_SHARD;
 
-use super::{RaftKvEngine, TXN2PC_PREFIX, PendingTxn};
+use super::{PendingTxn, RaftKvEngine, TXN2PC_PREFIX};
 
 /// What the janitor concluded about one transaction's pending intents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,8 +118,9 @@ impl RaftKvEngine {
         let mut protected = HashSet::new();
         for pair in self.local.scan(range, u64::MAX)? {
             let pair = pair?;
-            let record = PendingTxn::decode(&pair.value)
-                .map_err(|e| anyhow::anyhow!("undecodable 2PC record; failing sweep closed: {e}"))?;
+            let record = PendingTxn::decode(&pair.value).map_err(|e| {
+                anyhow::anyhow!("undecodable 2PC record; failing sweep closed: {e}")
+            })?;
             let txn = std::str::from_utf8(&pair.key[TXN2PC_PREFIX.len()..])?;
             let txn_id = TxnId(uuid::Uuid::parse_str(txn)?);
             for group in &record.participants {
@@ -195,7 +196,9 @@ impl RaftKvEngine {
                     None if key.starts_with(b"shard-") => continue, // unhosted namespace
                     None => META_SHARD.to_string(),
                 };
-                let entry = by_txn.entry((group, intents.txn_id)).or_insert(intents.oldest_ts);
+                let entry = by_txn
+                    .entry((group, intents.txn_id))
+                    .or_insert(intents.oldest_ts);
                 *entry = (*entry).min(intents.oldest_ts);
             }
         }

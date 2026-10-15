@@ -487,7 +487,9 @@ async fn cluster_remove(
     if req.node_id == metrics.id {
         return (
             StatusCode::CONFLICT,
-            Json(json!({ "error": "refusing to remove the node serving this request; issue the removal against a surviving peer so the cluster keeps a leader path" })),
+            Json(
+                json!({ "error": "refusing to remove the node serving this request; issue the removal against a surviving peer so the cluster keeps a leader path" }),
+            ),
         );
     }
     if voters.contains(&req.node_id) && voters.len() <= 1 {
@@ -517,7 +519,7 @@ async fn cluster_remove(
         if let Err(e) = raft
             .change_membership(
                 openraft::ChangeMembers::RemoveNodes(std::collections::BTreeSet::from([
-                    req.node_id,
+                    req.node_id
                 ])),
                 false,
             )
@@ -571,7 +573,7 @@ async fn cluster_remove(
             // Learner-only slot: drop the node record outright.
             raft.change_membership(
                 openraft::ChangeMembers::RemoveNodes(std::collections::BTreeSet::from([
-                    req.node_id,
+                    req.node_id
                 ])),
                 false,
             )
@@ -581,7 +583,12 @@ async fn cluster_remove(
         match result {
             Ok(()) => groups_updated.push(group_id),
             Err(e) => {
-                tracing::warn!("removing node {} from {} failed: {}", req.node_id, group_id, e);
+                tracing::warn!(
+                    "removing node {} from {} failed: {}",
+                    req.node_id,
+                    group_id,
+                    e
+                );
                 groups_pending.push(group_id);
             }
         }
@@ -1352,21 +1359,29 @@ async fn restore_backup(
     let (objects, pitr) = if let Some(target_ts) = query.target_ts {
         let plan = match state.backup.plan_pitr_restore(target_ts).await {
             Ok(plan) => plan,
-            Err(e) => return Json(json!({ "restored": 0, "error": e.to_string() })).into_response(),
+            Err(e) => {
+                return Json(json!({ "restored": 0, "error": e.to_string() })).into_response();
+            }
         };
         let objects = match state.backup.restore(&plan.base_backup_id).await {
             Ok(objects) => objects,
-            Err(e) => return Json(json!({ "restored": 0, "error": e.to_string() })).into_response(),
+            Err(e) => {
+                return Json(json!({ "restored": 0, "error": e.to_string() })).into_response();
+            }
         };
         let wal_segments = match state.backup.load_pitr_wal_segments(&plan).await {
             Ok(segments) => segments,
-            Err(e) => return Json(json!({ "restored": 0, "error": e.to_string() })).into_response(),
+            Err(e) => {
+                return Json(json!({ "restored": 0, "error": e.to_string() })).into_response();
+            }
         };
         (objects, Some((plan, wal_segments)))
     } else {
         let objects = match state.backup.restore(&id).await {
             Ok(objects) => objects,
-            Err(e) => return Json(json!({ "restored": 0, "error": e.to_string() })).into_response(),
+            Err(e) => {
+                return Json(json!({ "restored": 0, "error": e.to_string() })).into_response();
+            }
         };
         (objects, None)
     };

@@ -332,7 +332,10 @@ mod tests {
         assert_eq!(chain.read_visible(20), VisibleVersion::Tombstone);
         assert_eq!(chain.read_visible(u64::MAX), VisibleVersion::Tombstone);
         assert_eq!(chain.read_visible(5), VisibleVersion::Absent);
-        assert_eq!(VersionChain::new().read_visible(100), VisibleVersion::Absent);
+        assert_eq!(
+            VersionChain::new().read_visible(100),
+            VisibleVersion::Absent
+        );
         // An uncommitted intent is never visible.
         let txn3 = TxnId::new();
         chain.write_intent(txn3, b"pending".to_vec()).unwrap();

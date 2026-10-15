@@ -685,11 +685,7 @@ async fn removing_a_dead_node_keeps_quorum_and_is_not_readded() {
             .send()
             .await
             .unwrap();
-        assert_eq!(
-            resp.status(),
-            expected,
-            "removal guard for node {node_id}"
-        );
+        assert_eq!(resp.status(), expected, "removal guard for node {node_id}");
     }
 
     // Kill node 3 (idx 2), then expel it. Removal never contacts the target, so

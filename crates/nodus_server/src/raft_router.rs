@@ -125,13 +125,9 @@ impl RaftRouter {
                     (Some(raft), RouterRequest::Barrier { resp, .. }) => {
                         let auth_token = auth_token.clone();
                         tokio::spawn(async move {
-                            let res = linearizable_barrier(
-                                raft,
-                                &shard_id,
-                                &http,
-                                auth_token.as_deref(),
-                            )
-                            .await;
+                            let res =
+                                linearizable_barrier(raft, &shard_id, &http, auth_token.as_deref())
+                                    .await;
                             let _ = resp.send(res);
                         });
                     }

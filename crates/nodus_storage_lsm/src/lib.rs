@@ -1157,10 +1157,8 @@ impl KvEngine for LsmKvEngine {
         Ok(intents
             .iter()
             .filter_map(|(txn_id, keys)| {
-                let matched: Vec<&(Bytes, Timestamp)> = keys
-                    .iter()
-                    .filter(|(k, _)| k.starts_with(prefix))
-                    .collect();
+                let matched: Vec<&(Bytes, Timestamp)> =
+                    keys.iter().filter(|(k, _)| k.starts_with(prefix)).collect();
                 if matched.is_empty() {
                     return None;
                 }

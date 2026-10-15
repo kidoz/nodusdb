@@ -90,7 +90,10 @@ impl RaftTransport {
             "remote upgrade verification requires peer mTLS"
         );
         let mut response = self
-            .authorize(self.client().post(format!("https://{addr}/raft/capabilities/v1")))
+            .authorize(
+                self.client()
+                    .post(format!("https://{addr}/raft/capabilities/v1")),
+            )
             .timeout(std::time::Duration::from_secs(3))
             .json(&crate::upgrade::ProbeV1 {
                 challenge,

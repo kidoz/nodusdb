@@ -1097,7 +1097,10 @@ mod tests {
             .unwrap();
         // The raw store records the namespaced id, not the session id.
         assert!(
-            base.pending_intents(b"").unwrap().iter().any(|p| p.txn_id == recorded),
+            base.pending_intents(b"")
+                .unwrap()
+                .iter()
+                .any(|p| p.txn_id == recorded),
             "the recorded (namespaced) id is what a raw scan sees"
         );
         // A concurrent writer is blocked by the abandoned intent (the write is
@@ -1106,7 +1109,11 @@ mod tests {
         let e = engine.clone();
         let rt = row_t.clone();
         let blocked = tokio::task::spawn_blocking(move || {
-            e.write_intent(TxnId::new(), Bytes::from(rt.into_bytes()), Bytes::from_static(b"x"))
+            e.write_intent(
+                TxnId::new(),
+                Bytes::from(rt.into_bytes()),
+                Bytes::from_static(b"x"),
+            )
         })
         .await
         .unwrap();
@@ -1118,7 +1125,10 @@ mod tests {
             .sweep_abandoned_intents(std::time::Duration::from_secs(300), future)
             .await
             .unwrap();
-        assert_eq!(report.aborted, 1, "the orphan should be aborted: {report:?}");
+        assert_eq!(
+            report.aborted, 1,
+            "the orphan should be aborted: {report:?}"
+        );
         assert_eq!(report.failed, 0);
         assert!(!base.has_pending_intents(b"").unwrap());
 
@@ -1163,7 +1173,11 @@ mod tests {
         let orphan = TxnId::new();
         engine
             .local
-            .write_intent(orphan, Bytes::from_static(b"\x00orphan"), Bytes::from_static(b"v"))
+            .write_intent(
+                orphan,
+                Bytes::from_static(b"\x00orphan"),
+                Bytes::from_static(b"v"),
+            )
             .unwrap();
 
         let ttl = std::time::Duration::from_secs(300);

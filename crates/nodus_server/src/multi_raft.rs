@@ -78,10 +78,7 @@ impl KvEngine for ClockAdvancingKvEngine {
     fn has_pending_intents(&self, prefix: &[u8]) -> Result<bool> {
         self.inner.has_pending_intents(prefix)
     }
-    fn pending_intents(
-        &self,
-        prefix: &[u8],
-    ) -> Result<Vec<nodus_storage_api::PendingIntents>> {
+    fn pending_intents(&self, prefix: &[u8]) -> Result<Vec<nodus_storage_api::PendingIntents>> {
         self.inner.pending_intents(prefix)
     }
     fn abort_physical(&self, txn_id: TxnId) -> KvResult<()> {

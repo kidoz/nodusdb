@@ -246,7 +246,10 @@ async fn restore_into_non_empty_engine_is_rejected_without_fencing() {
         .json()
         .await
         .unwrap();
-    let id = created["backup_id"].as_str().expect("backup_id").to_string();
+    let id = created["backup_id"]
+        .as_str()
+        .expect("backup_id")
+        .to_string();
 
     // Backup contract #10: overlaying a live engine is refused with 409
     // before anything is mutated, and the rejection is audited.

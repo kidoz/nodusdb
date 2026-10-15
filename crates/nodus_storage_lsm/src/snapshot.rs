@@ -124,7 +124,9 @@ impl LsmKvEngine {
                     let txn = v
                         .txn_id
                         .ok_or_else(|| anyhow::anyhow!("snapshot intent has no transaction"))?;
-                    live.entry(txn).or_default().push((key.clone(), installed_at));
+                    live.entry(txn)
+                        .or_default()
+                        .push((key.clone(), installed_at));
                 }
             }
         }
