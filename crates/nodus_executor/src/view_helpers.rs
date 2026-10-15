@@ -382,6 +382,8 @@ impl MemExecutor {
                 | "pg_stat_all_tables"
                 | "pg_stat_user_indexes"
                 | "pg_stat_all_indexes"
+                | "pg_statistic"
+                | "pg_stats"
                 | "pg_indexes"
                 | "pg_attrdef"
                 | "pg_description"

@@ -988,6 +988,191 @@ impl MemExecutor {
                 }
                 Some((Self::virtual_columns(&columns), rows))
             }
+            // What `ANALYZE` found in each column: PostgreSQL's pg_statistic,
+            // one row per analyzed column, and the readable pg_stats view
+            // over it.
+            "pg_statistic" | "pg_stats" => {
+                fn catalog_slot<'a>(
+                    stats: &'a nodus_catalog::ColumnStatistics,
+                    kind: i16,
+                ) -> Option<&'a nodus_catalog::StatSlot> {
+                    stats.slots.iter().find(|slot| slot.kind == kind)
+                }
+                let decoded = |slot: &nodus_catalog::StatSlot| -> Option<Vec<Value>> {
+                    slot.values.as_ref().map(|values| {
+                        values
+                            .iter()
+                            .map(|text| {
+                                crate::column_stats::statistic_value(
+                                    serde_json::from_str(text).unwrap_or(Value::Null),
+                                )
+                            })
+                            .collect()
+                    })
+                };
+                let numbers = |slot: &nodus_catalog::StatSlot| -> Option<Value> {
+                    slot.numbers.as_ref().map(|numbers| {
+                        Value::Array(numbers.iter().map(|n| Value::Float(*n as f64)).collect())
+                    })
+                };
+                let values = |stats: &nodus_catalog::ColumnStatistics, kind: i16| -> Value {
+                    catalog_slot(stats, kind)
+                        .and_then(decoded)
+                        .map(Value::Array)
+                        .unwrap_or(Value::Null)
+                };
+                let numbers_of = |stats: &nodus_catalog::ColumnStatistics, kind: i16| -> Value {
+                    catalog_slot(stats, kind)
+                        .and_then(numbers)
+                        .unwrap_or(Value::Null)
+                };
+                let first_number = |stats: &nodus_catalog::ColumnStatistics, kind: i16| -> Value {
+                    catalog_slot(stats, kind)
+                        .and_then(|slot| slot.numbers.as_ref())
+                        .and_then(|numbers| numbers.first())
+                        .map(|n| Value::Float(*n as f64))
+                        .unwrap_or(Value::Null)
+                };
+                if table == "pg_statistic" {
+                    let columns = Self::virtual_columns(&[
+                        ("starelid", "OID"),
+                        ("staattnum", "INT"),
+                        ("stainherit", "BOOL"),
+                        ("stanullfrac", "FLOAT4"),
+                        ("stawidth", "INT"),
+                        ("stadistinct", "FLOAT4"),
+                        ("stakind1", "INT"),
+                        ("stakind2", "INT"),
+                        ("stakind3", "INT"),
+                        ("stakind4", "INT"),
+                        ("stakind5", "INT"),
+                        ("staop1", "OID"),
+                        ("staop2", "OID"),
+                        ("staop3", "OID"),
+                        ("staop4", "OID"),
+                        ("staop5", "OID"),
+                        ("stacoll1", "OID"),
+                        ("stacoll2", "OID"),
+                        ("stacoll3", "OID"),
+                        ("stacoll4", "OID"),
+                        ("stacoll5", "OID"),
+                        ("stanumbers1", "FLOAT4[]"),
+                        ("stanumbers2", "FLOAT4[]"),
+                        ("stanumbers3", "FLOAT4[]"),
+                        ("stanumbers4", "FLOAT4[]"),
+                        ("stanumbers5", "FLOAT4[]"),
+                        ("stavalues1", "TEXT[]"),
+                        ("stavalues2", "TEXT[]"),
+                        ("stavalues3", "TEXT[]"),
+                        ("stavalues4", "TEXT[]"),
+                        ("stavalues5", "TEXT[]"),
+                    ]);
+                    let mut rows = Vec::new();
+                    for table in &tables {
+                        let schema_name =
+                            Self::schema_name_by_id(db_name, &schemas, table.schema_id);
+                        let relid = Self::table_oid(db_name, &schema_name, &table.name);
+                        for stats in &table.statistics {
+                            let mut row = vec![
+                                Value::Int(relid),
+                                Value::Int(stats.attnum as i64),
+                                Value::Bool(false),
+                                Value::Float(stats.null_frac as f64),
+                                Value::Int(stats.avg_width as i64),
+                                Value::Float(stats.n_distinct as f64),
+                            ];
+                            for position in 0..5 {
+                                row.push(Value::Int(
+                                    stats.slots.get(position).map_or(0, |slot| slot.kind as i64),
+                                ));
+                            }
+                            for position in 0..5 {
+                                row.push(Value::Int(
+                                    stats.slots.get(position).map_or(0, |slot| slot.op),
+                                ));
+                            }
+                            for position in 0..5 {
+                                row.push(Value::Int(
+                                    stats.slots.get(position).map_or(0, |slot| slot.coll),
+                                ));
+                            }
+                            for position in 0..5 {
+                                row.push(
+                                    stats
+                                        .slots
+                                        .get(position)
+                                        .and_then(numbers)
+                                        .unwrap_or(Value::Null),
+                                );
+                            }
+                            for position in 0..5 {
+                                row.push(
+                                    stats
+                                        .slots
+                                        .get(position)
+                                        .and_then(decoded)
+                                        .map(Value::Array)
+                                        .unwrap_or(Value::Null),
+                                );
+                            }
+                            rows.push(row);
+                        }
+                    }
+                    Some((columns, rows))
+                } else {
+                    let columns = Self::virtual_columns(&[
+                        ("schemaname", "NAME"),
+                        ("tablename", "NAME"),
+                        ("attname", "NAME"),
+                        ("inherited", "BOOL"),
+                        ("null_frac", "FLOAT4"),
+                        ("avg_width", "INT"),
+                        ("n_distinct", "FLOAT4"),
+                        ("most_common_vals", "TEXT[]"),
+                        ("most_common_freqs", "FLOAT4[]"),
+                        ("histogram_bounds", "TEXT[]"),
+                        ("correlation", "FLOAT4"),
+                        ("most_common_elems", "TEXT[]"),
+                        ("most_common_elem_freqs", "FLOAT4[]"),
+                        ("elem_count_histogram", "FLOAT4[]"),
+                        ("range_length_histogram", "FLOAT8[]"),
+                        ("range_empty_frac", "FLOAT4"),
+                        ("range_bounds_histogram", "TEXT[]"),
+                    ]);
+                    let mut rows = Vec::new();
+                    for table in &tables {
+                        let schema_name =
+                            Self::schema_name_by_id(db_name, &schemas, table.schema_id);
+                        for stats in &table.statistics {
+                            let attname = table
+                                .columns
+                                .get(stats.attnum as usize - 1)
+                                .map(|column| column.name.clone())
+                                .unwrap_or_default();
+                            rows.push(vec![
+                                Value::Text(schema_name.clone()),
+                                Value::Text(table.name.clone()),
+                                Value::Text(attname),
+                                Value::Bool(false),
+                                Value::Float(stats.null_frac as f64),
+                                Value::Int(stats.avg_width as i64),
+                                Value::Float(stats.n_distinct as f64),
+                                values(stats, 1),
+                                numbers_of(stats, 1),
+                                values(stats, 2),
+                                first_number(stats, 3),
+                                values(stats, 4),
+                                numbers_of(stats, 4),
+                                numbers_of(stats, 5),
+                                values(stats, 6),
+                                first_number(stats, 6),
+                                values(stats, 7),
+                            ]);
+                        }
+                    }
+                    Some((columns, rows))
+                }
+            }
             "pg_indexes" => Some(self.pg_indexes_virtual_table(db_name, &schemas, &tables)),
             "pg_attrdef" => {
                 let mut rows = Vec::new();
