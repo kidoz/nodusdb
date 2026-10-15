@@ -932,6 +932,27 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                         target: target.clone(),
                     })
                 }
+                Some([crate::Value::Text(tag), crate::Value::Text(target)])
+                    if tag == "DROP STATISTICS" =>
+                {
+                    Ok(LogicalPlan::DropStatistics {
+                        target: target.clone(),
+                    })
+                }
+                Some([crate::Value::Text(tag), crate::Value::Text(target)])
+                    if tag == "ALTER STATISTICS" =>
+                {
+                    Ok(LogicalPlan::AlterStatistics {
+                        target: target.clone(),
+                    })
+                }
+                Some([crate::Value::Text(tag), crate::Value::Text(target)])
+                    if tag == "COMMENT ON STATISTICS" =>
+                {
+                    Ok(LogicalPlan::CommentStatistics {
+                        target: target.clone(),
+                    })
+                }
                 Some([crate::Value::Text(tag)]) => Ok(LogicalPlan::Noop { tag: tag.clone() }),
                 _ => anyhow::bail!("malformed maintenance statement"),
             }

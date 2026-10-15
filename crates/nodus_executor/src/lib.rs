@@ -69,6 +69,7 @@ mod session_functions;
 mod session_vars;
 mod set_ops;
 mod sqljson;
+mod statistics;
 mod stats;
 mod streaming;
 mod subqueries;

@@ -238,7 +238,9 @@ pub(crate) fn is_type_relation(table: &TableDescriptor) -> bool {
 /// Whether a relation holds catalog facts rather than rows (a type's, or a
 /// schema's own), which no query sees.
 pub(crate) fn is_hidden_relation(table: &TableDescriptor) -> bool {
-    is_type_relation(table) || crate::schemas::is_schema_relation(table)
+    is_type_relation(table)
+        || crate::schemas::is_schema_relation(table)
+        || crate::statistics::is_statistics_relation(table)
 }
 
 /// A type relation's definition.

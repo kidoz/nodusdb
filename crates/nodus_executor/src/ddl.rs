@@ -1017,7 +1017,11 @@ impl MemExecutor {
     /// missing table or column, for more than one relation, and for fewer
     /// than two targets. Nothing else happens — there is no
     /// extended-statistics planner to feed, so the object is not kept.
-    pub(crate) fn exec_create_statistics(&self, target: &str) -> Result<QueryOutput> {
+    pub(crate) fn exec_create_statistics(
+        &self,
+        ctx: &ExecutionContext,
+        target: &str,
+    ) -> Result<QueryOutput> {
         use sqlparser::tokenizer::{Token, Tokenizer};
         let tokens: Vec<Token> = Tokenizer::new(&sqlparser::dialect::PostgreSqlDialect {}, target)
             .tokenize()
@@ -1027,10 +1031,12 @@ impl MemExecutor {
             .collect();
         let mut at = 0;
         let is_word = |at: usize, w: &str| matches!(tokens.get(at), Some(Token::Word(word)) if word.value.eq_ignore_ascii_case(w));
+        let mut if_not_exists = false;
         if is_word(at, "if") {
             if !is_word(at + 1, "not") || !is_word(at + 2, "exists") {
                 return Err(statement_syntax_error(&tokens, at + 1));
             }
+            if_not_exists = true;
             at += 3;
         }
         // The statistics object's name: its schema must exist.
@@ -1044,12 +1050,13 @@ impl MemExecutor {
         if name.is_empty() {
             return Err(statement_syntax_error(&tokens, at));
         }
-        // `(kinds)`: which statistics to gather, which decide nothing here.
+        // `(kinds)`: which statistics to gather.
+        let mut kinds: Vec<char> = Vec::new();
         if tokens.get(at) == Some(&Token::LParen) {
             let mut depth = 0usize;
             let mut closed = false;
             while at < tokens.len() {
-                match tokens[at] {
+                match &tokens[at] {
                     Token::LParen => depth += 1,
                     Token::RParen => {
                         depth -= 1;
@@ -1058,6 +1065,21 @@ impl MemExecutor {
                             closed = true;
                             break;
                         }
+                    }
+                    Token::Word(word) if depth == 1 => {
+                        let kind = match word.value.to_ascii_lowercase().as_str() {
+                            "ndistinct" => 'd',
+                            "dependencies" => 'f',
+                            "mcv" => 'm',
+                            other => {
+                                return Err(DbError::new(format!(
+                                    "unrecognized statistics kind \"{other}\""
+                                ))
+                                .code("42601")
+                                .into());
+                            }
+                        };
+                        kinds.push(kind);
                     }
                     _ => {}
                 }
@@ -1071,12 +1093,14 @@ impl MemExecutor {
             return Err(statement_syntax_error(&tokens, at));
         }
         at += 1;
-        // The targets: plain columns, or parenthesized expressions.
+        // The keys: plain columns, or parenthesized expressions.
         let mut columns: Vec<String> = Vec::new();
+        let mut expressions: Vec<String> = Vec::new();
         let mut targets = 0usize;
         loop {
             match tokens.get(at) {
                 Some(Token::LParen) => {
+                    let open = at;
                     let mut depth = 0usize;
                     while at < tokens.len() {
                         match tokens[at] {
@@ -1084,7 +1108,6 @@ impl MemExecutor {
                             Token::RParen => {
                                 depth -= 1;
                                 if depth == 0 {
-                                    at += 1;
                                     break;
                                 }
                             }
@@ -1092,9 +1115,11 @@ impl MemExecutor {
                         }
                         at += 1;
                     }
-                    if depth > 0 {
+                    if depth > 0 || at == open + 1 {
                         return Err(statement_syntax_error(&tokens, tokens.len()));
                     }
+                    expressions.push(render_expression_tokens(&tokens[open + 1..at]));
+                    at += 1;
                     targets += 1;
                 }
                 Some(Token::Word(word)) => {
@@ -1152,14 +1177,67 @@ impl MemExecutor {
                 anyhow::bail!("column \"{column}\" does not exist");
             }
         }
-        if targets < 2 {
+        if columns.len() < 2 && expressions.len() != 1 {
             return Err(
                 DbError::new("extended statistics require at least 2 columns")
                     .code("42P17")
                     .into(),
             );
         }
-        Ok(QueryOutput::tag("CREATE STATISTICS"))
+        if expressions.len() == 1 && columns.is_empty() && !kinds.is_empty() {
+            return Err(DbError::new(
+                "when building statistics on a single expression, statistics kinds may not be specified",
+            )
+            .code("0A000")
+            .into());
+        }
+        // The keys in the order each is declared, resolved to attribute
+        // numbers.
+        let mut keys: Vec<crate::statistics::StatisticsKey> = Vec::new();
+        for text in &expressions {
+            keys.push(crate::statistics::StatisticsKey::Expression { text: text.clone() });
+        }
+        for column in &columns {
+            let attnum = tbl
+                .columns
+                .iter()
+                .position(|c| &c.name == column)
+                .map(|index| index as i32 + 1)
+                .unwrap_or(0);
+            keys.push(crate::statistics::StatisticsKey::Column { attnum });
+        }
+        // The kinds in PostgreSQL's own order: ndistinct, dependencies, MCV,
+        // and expression statistics whenever there are expressions. No kinds
+        // means all three.
+        let requested = kinds.clone();
+        // Without kinds, all three are built — but only for an object of two
+        // or more keys; a single expression gets its own statistics only.
+        let all = requested.is_empty() && targets >= 2;
+        let mut kinds: Vec<char> = Vec::new();
+        if all || requested.contains(&'d') {
+            kinds.push('d');
+        }
+        if all || requested.contains(&'f') {
+            kinds.push('f');
+        }
+        if all || requested.contains(&'m') {
+            kinds.push('m');
+        }
+        if !expressions.is_empty() {
+            kinds.push('e');
+        }
+        let object_name = name.join(".");
+        if if_not_exists && crate::statistics::find(&object_name).is_some() {
+            self.notice(
+                ctx,
+                DbError::new(format!(
+                    "statistics object \"{}\" already exists, skipping",
+                    name.last().cloned().unwrap_or_default()
+                )),
+            );
+            return Ok(QueryOutput::tag("CREATE STATISTICS"));
+        }
+        self.exec_create_statistics_full(ctx, object_name, keys, kinds, &tbl)
     }
 
     /// `REINDEX { INDEX | TABLE | SCHEMA | DATABASE | SYSTEM } [CONCURRENTLY]
@@ -1506,6 +1584,10 @@ impl MemExecutor {
             }
         }
         for tbl in &targets {
+            // A table's extended statistics objects go with it, silently.
+            for object in self.statistics_objects(tbl.id) {
+                self.catalog_writer.drop_table(object.id)?;
+            }
             self.drop_relation(tbl)?;
         }
         Ok(QueryOutput::tag(kind.tag()))
@@ -2293,7 +2375,29 @@ fn parse_reindex_target(target: &str) -> Result<(ReindexKind, bool, Vec<String>)
 
 /// PostgreSQL's message for a statement's text that ends, or holds a token
 /// the grammar has no place for.
-fn statement_syntax_error(tokens: &[sqlparser::tokenizer::Token], at: usize) -> anyhow::Error {
+/// A key expression's tokens as SQL text: the parser's own printing of each
+/// token, spaced so the expression parses back the same way.
+fn render_expression_tokens(tokens: &[sqlparser::tokenizer::Token]) -> String {
+    use sqlparser::tokenizer::Token;
+    let mut out = String::new();
+    let mut previous: Option<&Token> = None;
+    for token in tokens {
+        let text = token.to_string();
+        let attaches = matches!(token, Token::Comma | Token::RParen | Token::Period)
+            || matches!(previous, Some(Token::LParen | Token::Period));
+        if !out.is_empty() && !attaches {
+            out.push(' ');
+        }
+        out.push_str(&text);
+        previous = Some(token);
+    }
+    out
+}
+
+pub(crate) fn statement_syntax_error(
+    tokens: &[sqlparser::tokenizer::Token],
+    at: usize,
+) -> anyhow::Error {
     use sqlparser::tokenizer::Token;
     match tokens.get(at) {
         Some(Token::Word(w)) if w.quote_style.is_none() => {

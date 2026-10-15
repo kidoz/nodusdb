@@ -1918,10 +1918,21 @@ pub enum LogicalPlan {
         target: String,
     },
     /// `CREATE STATISTICS [IF NOT EXISTS] name [(kinds)] ON targets FROM
-    /// table`: the table and its columns are resolved — PostgreSQL's errors
-    /// when they are not — though no statistics are kept (nothing plans
-    /// with them).
+    /// table`: the object is stored for `ANALYZE` to fill.
     CreateStatistics {
+        target: String,
+    },
+    /// `DROP STATISTICS [IF EXISTS] name [, ...]`.
+    DropStatistics {
+        target: String,
+    },
+    /// `ALTER STATISTICS name ...`: its statistics target, name, schema or
+    /// owner.
+    AlterStatistics {
+        target: String,
+    },
+    /// `COMMENT ON STATISTICS name IS '...'`.
+    CommentStatistics {
         target: String,
     },
     /// `COMMENT ON {FUNCTION | PROCEDURE | ROUTINE | AGGREGATE}`: the

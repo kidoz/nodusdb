@@ -4275,7 +4275,30 @@ fn rewrite_data_clause(
         } else {
             "ALTER STATISTICS"
         };
-        let sql = format!("SELECT {UTILITY_FUNCTION}('{tag}')");
+        // The object's name and the action travel with the tag.
+        let target = match significant.get(2) {
+            Some(&first) => render_tokens(&statement[first..significant[n - 1] + 1]),
+            None => String::new(),
+        };
+        let sql = format!(
+            "SELECT {UTILITY_FUNCTION}('{tag}', '{}')",
+            target.replace('\'', "''")
+        );
+        if let Some(mut tokens) = snippet_tokens(&sql) {
+            tokens.extend(tail);
+            return tokens;
+        }
+        return statement;
+    }
+    if is(0, "comment") && is(1, "on") && is(2, "statistics") {
+        let target = match significant.get(3) {
+            Some(_) => render_tokens(&statement[significant[3]..significant[n - 1] + 1]),
+            None => String::new(),
+        };
+        let sql = format!(
+            "SELECT {UTILITY_FUNCTION}('COMMENT ON STATISTICS', '{}')",
+            target.replace('\'', "''")
+        );
         if let Some(mut tokens) = snippet_tokens(&sql) {
             tokens.extend(tail);
             return tokens;
@@ -4733,7 +4756,15 @@ mod tests {
         );
         assert_eq!(
             one("DROP STATISTICS s"),
-            format!("SELECT {UTILITY_FUNCTION}('DROP STATISTICS')")
+            format!("SELECT {UTILITY_FUNCTION}('DROP STATISTICS', 's')")
+        );
+        assert_eq!(
+            one("ALTER STATISTICS s SET STATISTICS 10"),
+            format!("SELECT {UTILITY_FUNCTION}('ALTER STATISTICS', 's set statistics 10')")
+        );
+        assert_eq!(
+            one("COMMENT ON STATISTICS s IS 'x'"),
+            format!("SELECT {UTILITY_FUNCTION}('COMMENT ON STATISTICS', 's is ''x''')")
         );
         assert_eq!(
             one("COMMENT ON FUNCTION f(int) IS 'x'"),
