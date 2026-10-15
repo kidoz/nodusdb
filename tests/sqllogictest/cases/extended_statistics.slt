@@ -1,0 +1,244 @@
+# Extended statistics: `CREATE STATISTICS` objects — `pg_statistic_ext` and
+# the data `ANALYZE` builds for them (`pg_statistic_ext_data`), readable
+# through `pg_stats_ext` and `pg_stats_ext_exprs`. The numbers are
+# PostgreSQL 18's own algorithms, transcribed from its `mvdistinct.c`,
+# `dependencies.c` and `mcv.c`: the Duj1 estimate of every key
+# combination's distinct count, the functional dependencies of every
+# ascending determinant set, and the most-common combinations with their
+# own and their independent-columns frequencies.
+#
+# Known divergences: `stxdmcv`'s bytes are NodusDB's own framing (the binary
+# MCV layout and `pg_mcv_list_items` are not reproduced), `stxexprs` and
+# `stxdexpr` read NULL (PostgreSQL stores a node tree and a `pg_statistic[]`
+# — the readable forms are `pg_stats_ext.exprs` and `pg_stats_ext_exprs`),
+# the order of *equally frequent* most-common combinations can differ once
+# an object has many groups (PostgreSQL's internal sort order is not
+# reproduced; the items and their frequencies match), `stxowner` is the
+# bootstrap role rather than the creator, `stxkeys`/`stxkind` are declared
+# `int2vector`/`text[]` (printed as PostgreSQL prints them), and the
+# statistics target is the object's own or the default 100 (`ALTER COLUMN
+# ... SET STATISTICS` is not supported, so a column's own target cannot
+# raise it).
+
+statement ok
+drop table if exists est cascade;
+
+statement ok
+create table est (a int, b int, c text);
+
+statement ok
+insert into est select g % 10, g % 7, 'x' || (g % 3) from generate_series(1, 200) g;
+
+statement ok
+create statistics est_ab (ndistinct, dependencies, mcv) on a, b from est;
+
+statement ok
+analyze est;
+
+# The object itself: its keys, its kinds in PostgreSQL's own order, and no
+# target of its own.
+query TTTI
+select stxname, stxkeys::text, stxkind::text, coalesce(stxstattarget, -1) from pg_statistic_ext where stxname = 'est_ab';
+----
+est_ab	1 2	{d,f,m}	-1
+
+# The data: one row per inheritance flag, the distinct counts of every key
+# combination (`{"attnums": count}`), and the dependencies — NULL when none
+# was found, as PostgreSQL stores it.
+query TITB
+select stxdndistinct::text, stxddependencies is null, stxdinherit, stxdmcv is not null from pg_statistic_ext_data d join pg_statistic_ext s on s.oid = d.stxoid where s.stxname = 'est_ab';
+----
+{"1, 2": 70}	t	f	t
+
+# The readable view: the covered table and statistics names, the attribute
+# names, the kinds, and the same numbers.
+query TT
+select statistics_name || ' on ' || tablename, attnames::text from pg_stats_ext where statistics_name = 'est_ab';
+----
+est_ab on est	{a,b}
+
+query T
+select n_distinct from pg_stats_ext where statistics_name = 'est_ab';
+----
+{"1, 2": 70}
+
+query TT
+select kinds::text, dependencies from pg_stats_ext where statistics_name = 'est_ab';
+----
+{d,f,m}	NULL
+
+# A dependency: `city` determines `zip`, so the object records it (with its
+# degree) and drops the permutations that are the same determinant set.
+statement ok
+drop table if exists estdep cascade;
+
+statement ok
+create table estdep (zip int, city text);
+
+statement ok
+insert into estdep select g % 50, 'city' || (g % 50) from generate_series(1, 500) g;
+
+statement ok
+create statistics estdep_st (dependencies) on zip, city from estdep;
+
+statement ok
+analyze estdep;
+
+query T
+select dependencies from pg_stats_ext where statistics_name = 'estdep_st';
+----
+{"1 => 2": 1.000000, "2 => 1": 1.000000}
+
+# The most common combinations of three columns, with each item's frequency
+# and the frequency independent columns would give.
+statement ok
+drop table if exists estmcv cascade;
+
+statement ok
+create table estmcv (a int, b int);
+
+statement ok
+insert into estmcv select g % 4, g % 3 from generate_series(1, 600) g;
+
+statement ok
+create statistics estmcv_st (mcv) on a, b from estmcv;
+
+statement ok
+analyze estmcv;
+
+query T
+select most_common_vals::text from pg_stats_ext where statistics_name = 'estmcv_st';
+----
+{{0,0},{0,1},{0,2},{1,0},{1,1},{1,2},{2,0},{2,1},{2,2},{3,0},{3,1},{3,2}}
+
+query T
+select most_common_freqs from pg_stats_ext where statistics_name = 'estmcv_st';
+----
+{0.08333333333333333,0.08333333333333333,0.08333333333333333,0.08333333333333333,0.08333333333333333,0.08333333333333333,0.08333333333333333,0.08333333333333333,0.08333333333333333,0.08333333333333333,0.08333333333333333,0.08333333333333333}
+
+query T
+select most_common_val_nulls::text from pg_stats_ext where statistics_name = 'estmcv_st';
+----
+{{f,f},{f,f},{f,f},{f,f},{f,f},{f,f},{f,f},{f,f},{f,f},{f,f},{f,f},{f,f}}
+
+# An expression key: the object covers the column and the expression, its
+# kinds gain `e`, and the expression gets its own statistics — the same
+# numbers `pg_stats` would show for a column.
+statement ok
+drop table if exists estex cascade;
+
+statement ok
+create table estex (a int, b int);
+
+statement ok
+insert into estex select g, g % 5 from generate_series(1, 100) g;
+
+statement ok
+create statistics estex_st on b, (a + 1) from estex;
+
+statement ok
+analyze estex;
+
+query TT
+select stxkeys::text, stxkind::text from pg_statistic_ext where stxname = 'estex_st';
+----
+2	{d,f,m,e}
+
+statement ok
+insert into estex select 0, 0;
+
+statement ok
+analyze estex;
+
+query TT
+select attnames, exprs from pg_stats_ext where statistics_name = 'estex_st';
+----
+{b}	{"(a + 1)"}
+
+query TI
+select expr, avg_width from pg_stats_ext_exprs where statistics_name = 'estex_st';
+----
+(a + 1)	4
+
+# The definition functions, as psql reads them for `\d`.
+query TT
+select pg_get_statisticsobjdef(oid), pg_get_statisticsobjdef_columns(oid) from pg_statistic_ext where stxname = 'estex_st';
+----
+CREATE STATISTICS public.estex_st ON b, (a + 1) FROM estex	b, (a + 1)
+
+query T
+select pg_get_statisticsobjdef_expressions(oid) from pg_statistic_ext where stxname = 'estex_st';
+----
+{"(a + 1)"}
+
+# A statistics target of the object's own limits its MCV list.
+statement ok
+create statistics estex_b (mcv) on a, b from estex;
+
+statement ok
+alter statistics estex_b set statistics 3;
+
+statement ok
+analyze estex;
+
+query IT
+select stxstattarget, kinds::text from pg_statistic_ext s join pg_stats_ext e on e.statistics_name = s.stxname where s.stxname = 'estex_b';
+----
+3	{m}
+
+query I
+select array_length(most_common_vals, 1) from pg_stats_ext where statistics_name = 'estex_b';
+----
+3
+
+# Renaming, commenting, and dropping.
+statement ok
+alter statistics estex_b rename to estex_b2;
+
+query T
+select obj_description(oid, 'pg_statistic_ext') from pg_statistic_ext where stxname = 'estex_b2';
+----
+NULL
+
+statement ok
+comment on statistics estex_b2 is 'a target of three';
+
+query T
+select obj_description(oid, 'pg_statistic_ext') from pg_statistic_ext where stxname = 'estex_b2';
+----
+a target of three
+
+statement ok
+drop statistics estex_b2;
+
+statement ok
+drop statistics if exists estex_b2;
+
+statement error does not exist
+drop statistics estex_b2;
+
+statement error already exists
+create statistics estex_st on a, b from estex;
+
+query I
+select count(*) from pg_statistic_ext where stxname = 'estex_st';
+----
+1
+
+# A table's statistics objects go with it.
+statement ok
+drop table estex;
+
+query I
+select count(*) from pg_statistic_ext where stxname = 'estex_st';
+----
+0
+
+statement ok
+drop table est cascade;
+
+statement ok
+drop table estdep cascade;
+
+statement ok
+drop table estmcv cascade;
