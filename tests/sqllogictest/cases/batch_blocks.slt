@@ -1,0 +1,189 @@
+# A multi-statement simple query is one implicit transaction block in
+# PostgreSQL: its statements' writes go through together when the last one
+# has run, and every one of them is rolled back when any statement fails
+# (while the statements before the failure still report). A `BEGIN` inside
+# one joins that block — no "already in progress" warning, since the block
+# is implicit — and leaves the transaction open past the batch's end; a
+# `COMMIT`/`ROLLBACK` ends it, and the statements after it run in a fresh
+# block. Statements that need a transaction of their own are refused
+# inside a block (a batch's or a client's): `VACUUM`, `CREATE INDEX
+# CONCURRENTLY`, `DROP INDEX CONCURRENTLY`, `DISCARD ALL`, and the
+# whole-database forms of `REINDEX`; `ANALYZE`, `CHECKPOINT`, `CLUSTER`,
+# `REINDEX TABLE/INDEX`, and a cursor's `DECLARE` are allowed. A block's
+# commit that a deferred constraint refuses reports only the error: the
+# last statement's result is held back until the commit, as PostgreSQL
+# holds it. Commands, tags, and errors are PostgreSQL 18.4's.
+#
+# Known divergences: catalog DDL does not take part in a transaction here —
+# a `CREATE TABLE` (or `DROP`/`ALTER`) in a block that fails, or a
+# transaction that rolls back, keeps its catalog change (NodusDB's catalog
+# is replicated metadata, not part of the row store's MVCC). PostgreSQL
+# also reports the position of a syntax error (`LINE n:` and a caret),
+# which NodusDB does not send.
+
+statement ok
+drop table if exists yb cascade;
+
+statement ok
+create table yb (k int primary key, v int);
+
+statement ok
+insert into yb values (1, 10); insert into yb values (2, 20);
+
+query I
+select count(*) from yb;
+----
+2
+
+statement error division by zero
+insert into yb values (3, 30); select 1/0;
+
+query I
+select count(*) from yb;
+----
+2
+
+statement ok
+begin; insert into yb values (4, 40); insert into yb values (5, 50); commit;
+
+query I
+select count(*) from yb;
+----
+4
+
+statement ok
+begin; insert into yb values (6, 60); rollback;
+
+query I
+select count(*) from yb;
+----
+4
+
+statement ok
+select 1; begin; insert into yb values (7, 70);
+
+query I
+select count(*) from yb;
+----
+5
+
+statement ok
+rollback;
+
+query I
+select count(*) from yb;
+----
+4
+
+statement ok
+begin; savepoint sp; insert into yb values (8, 80); rollback to sp;
+insert into yb values (9, 90); commit;
+
+query I
+select count(*) from yb;
+----
+5
+
+statement error duplicate key value
+insert into yb values (10, 10); insert into yb values (1, 1);
+
+query I
+select count(*) from yb;
+----
+5
+
+statement error does not exist
+select k from yb; select nosuchcol from yb;
+
+query I
+select count(*) from yb;
+----
+5
+
+statement ok
+select 1; analyze yb;
+
+statement ok
+select 1; checkpoint;
+
+statement ok
+select 1; reindex table yb;
+
+statement ok
+select 1; cluster yb using yb_pkey;
+
+statement error VACUUM cannot run inside a transaction block
+select 1; vacuum yb;
+
+# A lone VACUUM has a transaction of its own, so it runs.
+statement ok
+vacuum yb;
+
+statement error CREATE INDEX CONCURRENTLY cannot run inside a transaction block
+select 1; create index concurrently yb_c1 on yb (v);
+
+statement ok
+create index concurrently yb_c1 on yb (v);
+
+statement error DROP INDEX CONCURRENTLY cannot run inside a transaction block
+select 1; drop index concurrently yb_c1;
+
+statement ok
+drop index concurrently yb_c1;
+
+statement error DISCARD ALL cannot run inside a transaction block
+select 1; discard all;
+
+statement error REINDEX SCHEMA cannot run inside a transaction block
+select 1; reindex schema public;
+
+statement error VACUUM cannot run inside a transaction block
+begin; vacuum yb; rollback;
+
+# The batch stopped at the refusal, so its own ROLLBACK never ran: the
+# transaction is left aborted, as PostgreSQL leaves it, and only a rollback
+# of its own ends it.
+statement ok
+rollback;
+
+statement error CREATE INDEX CONCURRENTLY cannot run inside a transaction block
+begin; create index concurrently yb_c2 on yb (v); rollback;
+
+statement ok
+rollback;
+
+query I
+declare yb_c2 cursor for select k from yb order by k; fetch all from yb_c2; close yb_c2;
+----
+1
+2
+4
+5
+9
+
+statement error can only be used in transaction blocks
+declare yb_c3 cursor for select 1;
+
+statement ok
+begin; declare yb_c4 cursor for select k from yb order by k; fetch all from yb_c4;
+close yb_c4; commit;
+
+statement ok
+drop table if exists yb_par cascade;
+
+statement ok
+create table yb_par (k int primary key);
+
+statement ok
+create table yb_ref (k int references yb_par (k) deferrable initially deferred);
+
+statement error violates foreign key constraint
+insert into yb_ref values (1); select 1;
+
+query I
+select count(*) from yb_ref;
+----
+0
+
+statement ok
+drop table yb_ref, yb_par, yb cascade;
