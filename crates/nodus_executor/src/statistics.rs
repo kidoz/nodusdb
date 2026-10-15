@@ -476,6 +476,437 @@ impl MemExecutor {
 
 }
 
+// --- what ANALYZE computes ------------------------------------------------
+
+/// Fills every statistics object covering `tbl` with what the sample shows,
+/// for PostgreSQL's two passes (the table's own rows, and its inheritance
+/// tree's).
+pub(crate) fn analyze_objects(
+    executor: &MemExecutor,
+    tbl: &TableDescriptor,
+    rows: &[Vec<Value>],
+    inherited: bool,
+) -> Result<()> {
+    // A pass with no sampled rows stores nothing, as PostgreSQL's does.
+    if rows.is_empty() {
+        return Ok(());
+    }
+    for object in executor.statistics_objects(tbl.id) {
+        let mut definition = object.definition.clone();
+        // The object's own target; the columns' targets are all the default,
+        // so the system default (100) stands in for the maximum.
+        let stattarget = definition.target.unwrap_or(DEFAULT_TARGET);
+        // A target of zero leaves the existing statistics alone.
+        if stattarget == 0 {
+            continue;
+        }
+        let data = BuildData::build(tbl, &definition, rows);
+        let attnums = definition.attnums();
+        let mut computed = StatisticsData {
+            inherited,
+            ..Default::default()
+        };
+        if definition.kinds.contains(&'d') {
+            computed.n_distinct = build_ndistinct(&data, &attnums);
+        }
+        if definition.kinds.contains(&'f') {
+            computed.dependencies = build_dependencies(&data, &attnums);
+        }
+        if definition.kinds.contains(&'m') {
+            computed.mcv = build_mcv(&data, stattarget as usize);
+        }
+        if definition.kinds.contains(&'e') {
+            computed.expressions = expression_statistics(tbl, &definition, rows)?;
+        }
+        definition.data.retain(|data| data.inherited != inherited);
+        definition.data.push(computed);
+        executor.write_statistics(&object, &definition)?;
+    }
+    Ok(())
+}
+
+/// PostgreSQL's `default_statistics_target`.
+const DEFAULT_TARGET: i32 = 100;
+
+/// `compute_expr_stats`: each expression's own statistics, as a column's
+/// would be (the same machinery `ANALYZE` uses).
+fn expression_statistics(
+    tbl: &TableDescriptor,
+    definition: &StatisticsDefinition,
+    rows: &[Vec<Value>],
+) -> Result<Vec<nodus_catalog::ColumnStatistics>> {
+    let names: Vec<String> = tbl.columns.iter().map(|c| c.name.clone()).collect();
+    let column_type = |name: &str| -> Option<String> {
+        tbl.columns
+            .iter()
+            .find(|c| c.name == name)
+            .map(|c| c.data_type.clone())
+    };
+    let mut all = Vec::new();
+    for (index, text) in definition.expressions().iter().enumerate() {
+        let expr =
+            crate::index_keys::parse_expression(text).unwrap_or(ScalarExpr::Literal(Value::Null));
+        let data_type =
+            crate::result_types::expr_type(&expr, &column_type).unwrap_or_else(|| "text".into());
+        let values: Vec<Value> = rows
+            .iter()
+            .map(|row| crate::eval_scalar_expr(&expr, row, &names))
+            .collect();
+        let cells: Vec<&Value> = values.iter().collect();
+        let attnum = index as i32 + 1;
+        if let Some(statistics) =
+            crate::column_stats::analyze_values(attnum, &data_type, &cells, rows.len() as f64)
+        {
+            all.push(statistics);
+        }
+    }
+    Ok(all)
+}
+
+// --- the computations (PostgreSQL's algorithms) ---------------------------
+
+/// One key's values over the sample rows, and whether each is NULL.
+struct KeyValues {
+    values: Vec<Value>,
+    nulls: Vec<bool>,
+}
+
+/// What an analysis works on: the keys' values per row.
+struct BuildData {
+    keys: Vec<KeyValues>,
+    numrows: usize,
+    totalrows: f64,
+}
+
+impl BuildData {
+    /// The sample's values for one key: a column by position, an expression
+    /// evaluated over the row.
+    fn build(
+        tbl: &TableDescriptor,
+        definition: &StatisticsDefinition,
+        rows: &[Vec<Value>],
+    ) -> BuildData {
+        let names: Vec<String> = tbl.columns.iter().map(|c| c.name.clone()).collect();
+        let mut keys = Vec::new();
+        for key in &definition.keys {
+            let values: Vec<Value> = match key {
+                StatisticsKey::Column { attnum } => rows
+                    .iter()
+                    .map(|row| {
+                        row.get(*attnum as usize - 1)
+                            .cloned()
+                            .unwrap_or(Value::Null)
+                    })
+                    .collect(),
+                StatisticsKey::Expression { text } => {
+                    let expr = crate::index_keys::parse_expression(text)
+                        .unwrap_or(ScalarExpr::Literal(Value::Null));
+                    rows.iter()
+                        .map(|row| crate::eval_scalar_expr(&expr, row, &names))
+                        .collect()
+                }
+            };
+            let nulls = values
+                .iter()
+                .map(|value| matches!(value, Value::Null))
+                .collect();
+            keys.push(KeyValues { values, nulls });
+        }
+        BuildData {
+            keys,
+            numrows: rows.len(),
+            totalrows: rows.len() as f64,
+        }
+    }
+}
+
+/// A row's key values over the subset an ordering uses, with its count.
+#[derive(Clone)]
+struct SortItem {
+    values: Vec<Value>,
+    nulls: Vec<bool>,
+    count: usize,
+}
+
+/// The order of two rows over the given key positions: by each key's value,
+/// NULLs first, as PostgreSQL orders them.
+fn cmp_items(a: &SortItem, b: &SortItem, positions: &[usize]) -> std::cmp::Ordering {
+    for &position in positions {
+        let order = match (a.nulls[position], b.nulls[position]) {
+            (true, true) => std::cmp::Ordering::Equal,
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            (false, false) => crate::value::compare(&a.values[position], &b.values[position]),
+        };
+        if order != std::cmp::Ordering::Equal {
+            return order;
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+/// The rows as sort items over a subset of keys, in order.
+fn sorted_items(data: &BuildData, positions: &[usize]) -> Vec<SortItem> {
+    let mut items: Vec<SortItem> = (0..data.numrows)
+        .map(|row| SortItem {
+            values: positions
+                .iter()
+                .map(|&key| {
+                    if data.keys[key].nulls[row] {
+                        Value::Null
+                    } else {
+                        data.keys[key].values[row].clone()
+                    }
+                })
+                .collect(),
+            nulls: positions
+                .iter()
+                .map(|&key| data.keys[key].nulls[row])
+                .collect(),
+            count: 1,
+        })
+        .collect();
+    let all: Vec<usize> = (0..positions.len()).collect();
+    items.sort_by(|a, b| cmp_items(a, b, &all));
+    items
+}
+
+/// All combinations of `k` of `n` indexes, lexicographic ascending, as
+/// PostgreSQL's combination generator walks them.
+fn combinations(n: usize, k: usize) -> Vec<Vec<usize>> {
+    let mut out = Vec::new();
+    let mut pick: Vec<usize> = (0..k).collect();
+    if k > n {
+        return out;
+    }
+    loop {
+        out.push(pick.clone());
+        let mut i = k;
+        while i > 0 {
+            i -= 1;
+            if pick[i] != i + n - k {
+                break;
+            }
+            if i == 0 {
+                return out;
+            }
+        }
+        pick[i] += 1;
+        for j in i + 1..k {
+            pick[j] = pick[j - 1] + 1;
+        }
+    }
+}
+
+/// The dependencies of `k` keys PostgreSQL's generator produces: each
+/// ascending set of `k - 1` determinants, and each remaining key as the
+/// dependent, in that order.
+fn dependent_sets(n: usize, k: usize) -> Vec<Vec<usize>> {
+    let mut out = Vec::new();
+    for determinants in combinations(n, k - 1) {
+        for dependent in 0..n {
+            if determinants.contains(&dependent) {
+                continue;
+            }
+            let mut set = determinants.clone();
+            set.push(dependent);
+            out.push(set);
+        }
+    }
+    out
+}
+
+/// The Duj1 estimator's result, as `estimate_ndistinct` computes it.
+fn estimate_ndistinct(totalrows: f64, numrows: usize, d: usize, f1: usize) -> f64 {
+    let numer = numrows as f64 * d as f64;
+    let denom = (numrows - f1) as f64 + f1 as f64 * numrows as f64 / totalrows;
+    let mut ndistinct = numer / denom;
+    if ndistinct < d as f64 {
+        ndistinct = d as f64;
+    }
+    if ndistinct > totalrows {
+        ndistinct = totalrows;
+    }
+    (ndistinct + 0.5).floor()
+}
+
+/// `statext_ndistinct_build`: every combination of two or more keys, with
+/// the Duj1 estimate of its distinct count, keyed by the attribute numbers.
+fn build_ndistinct(data: &BuildData, attnums: &[i32]) -> Vec<(Vec<i32>, f64)> {
+    let n = data.keys.len();
+    let mut out = Vec::new();
+    for k in 2..=n {
+        for combination in combinations(n, k) {
+            // The sorted rows split into runs of equal key values: the runs
+            // are the distinct combinations, and `f1` counts the singletons.
+            let items = sorted_items(data, &combination);
+            let all: Vec<usize> = (0..k).collect();
+            let mut f1 = 0usize;
+            let mut d = 1usize;
+            let mut count = 1usize;
+            for i in 1..items.len() {
+                if cmp_items(&items[i], &items[i - 1], &all) != std::cmp::Ordering::Equal {
+                    if count == 1 {
+                        f1 += 1;
+                    }
+                    d += 1;
+                    count = 0;
+                }
+                count += 1;
+            }
+            if count == 1 {
+                f1 += 1;
+            }
+            let attributes: Vec<i32> = combination.iter().map(|&key| attnums[key]).collect();
+            out.push((
+                attributes,
+                estimate_ndistinct(data.totalrows, data.numrows, d, f1),
+            ));
+        }
+    }
+    out
+}
+
+/// `dependency_degree`: the rows sorted by all the keys and grouped by the
+/// determinants; a group whose dependent value never changes supports the
+/// dependency, and the degree is the supporting rows' share.
+fn dependency_degree(data: &BuildData, dependency: &[usize]) -> f64 {
+    let items = sorted_items(data, dependency);
+    let determinants: Vec<usize> = (0..dependency.len() - 1).collect();
+    let dependent = dependency.len() - 1;
+    let mut supporting = 0usize;
+    let mut violations = 0usize;
+    let mut group_size = 1usize;
+    for i in 1..=items.len() {
+        let group_ended = i == items.len()
+            || cmp_items(&items[i - 1], &items[i], &determinants) != std::cmp::Ordering::Equal;
+        if group_ended {
+            if violations == 0 {
+                supporting += group_size;
+            }
+            violations = 0;
+            group_size = 1;
+            continue;
+        }
+        if cmp_items(&items[i - 1], &items[i], &[dependent]) != std::cmp::Ordering::Equal {
+            violations += 1;
+        }
+        group_size += 1;
+    }
+    supporting as f64 / data.numrows as f64
+}
+
+/// `statext_dependencies_build`: every ordered key set of two or more whose
+/// last member the others determine with a non-zero degree.
+fn build_dependencies(data: &BuildData, attnums: &[i32]) -> Vec<(Vec<i32>, f64)> {
+    let n = data.keys.len();
+    let mut out = Vec::new();
+    for k in 2..=n {
+        for dependency in dependent_sets(n, k) {
+            let degree = dependency_degree(data, &dependency);
+            if degree == 0.0 {
+                continue;
+            }
+            let attributes: Vec<i32> = dependency.iter().map(|&key| attnums[key]).collect();
+            out.push((attributes, degree));
+        }
+    }
+    out
+}
+
+/// `get_mincount_for_mcv_list`: the cutoff a combination's count must reach
+/// to be kept.
+fn mincount_for_mcv_list(numrows: usize, totalrows: f64) -> f64 {
+    let n = numrows as f64;
+    let big_n = totalrows;
+    let denom = big_n - n + 0.04 * n * (big_n - 1.0);
+    if denom == 0.0 {
+        return 0.0;
+    }
+    n * (big_n - n) / denom
+}
+
+/// `statext_mcv_build`: the most common key combinations, kept while their
+/// counts reach the cutoff, each with its frequency and the frequency
+/// independent columns would give.
+fn build_mcv(data: &BuildData, stattarget: usize) -> Vec<McvItem> {
+    let n = data.keys.len();
+    if data.numrows == 0 {
+        return Vec::new();
+    }
+    let positions: Vec<usize> = (0..n).collect();
+    let items = sorted_items(data, &positions);
+    // The distinct combinations, in value order, with their counts.
+    let mut groups: Vec<SortItem> = Vec::new();
+    for item in items {
+        match groups.last_mut() {
+            Some(last) if cmp_items(last, &item, &positions) == std::cmp::Ordering::Equal => {
+                last.count += 1;
+            }
+            _ => {
+                let mut group = item;
+                group.count = 1;
+                groups.push(group);
+            }
+        }
+    }
+    // By frequency, descending; the sort keeps the value order for ties.
+    groups.sort_by(|a, b| b.count.cmp(&a.count));
+    let mut nitems = stattarget.min(groups.len());
+    let mincount = mincount_for_mcv_list(data.numrows, data.totalrows);
+    for i in 0..nitems {
+        if (groups[i].count as f64) < mincount {
+            nitems = i;
+            break;
+        }
+    }
+    // Each key's value frequencies over all the groups.
+    let mut frequencies: Vec<Vec<(Value, bool, usize)>> = Vec::with_capacity(n);
+    for key in 0..n {
+        let mut values: Vec<(Value, bool, usize)> = Vec::new();
+        for group in &groups {
+            let value = group.values[key].clone();
+            let null = group.nulls[key];
+            match values.iter_mut().find(|(existing, existing_null, _)| {
+                *existing_null == null
+                    && (null
+                        || crate::value::compare(existing, &value) == std::cmp::Ordering::Equal)
+            }) {
+                Some((_, _, count)) => *count += group.count,
+                None => values.push((value, null, group.count)),
+            }
+        }
+        frequencies.push(values);
+    }
+    let mut out = Vec::with_capacity(nitems);
+    for group in groups.iter().take(nitems) {
+        let mut base_frequency = 1.0f64;
+        for key in 0..n {
+            let count = frequencies[key]
+                .iter()
+                .find(|(value, null, _)| {
+                    *null == group.nulls[key]
+                        && (*null
+                            || crate::value::compare(value, &group.values[key])
+                                == std::cmp::Ordering::Equal)
+                })
+                .map_or(0, |(_, _, count)| *count);
+            base_frequency *= count as f64 / data.numrows as f64;
+        }
+        out.push(McvItem {
+            values: group
+                .values
+                .iter()
+                .zip(&group.nulls)
+                .map(|(value, null)| if *null { None } else { Some(value.clone()) })
+                .collect(),
+            frequency: group.count as f64 / data.numrows as f64,
+            base_frequency,
+        });
+    }
+    out
+}
+
 /// `ALTER STATISTICS`'s target text: the object's name, the action, and its
 /// value.
 fn parse_alter_statistics(target: &str) -> Result<(String, String, String)> {

@@ -44,6 +44,7 @@ pub(crate) fn analyze_table(
 ) -> Result<Vec<ColumnStatistics>> {
     let rows = executor.scan_rows(tbl.id, &ctx.session_id)?;
     let mut all = column_statistics(tbl, &rows, false);
+    crate::statistics::analyze_objects(executor, tbl, &rows, false)?;
     let descendants = executor.descendants("default", tbl.id)?;
     if !descendants.is_empty() {
         // The parent's rows, then each descendant's, as PostgreSQL's
@@ -53,6 +54,7 @@ pub(crate) fn analyze_table(
             inherited.extend(executor.scan_rows(child.id, &ctx.session_id)?);
         }
         all.extend(column_statistics(tbl, &inherited, true));
+        crate::statistics::analyze_objects(executor, tbl, &inherited, true)?;
     }
     Ok(all)
 }
@@ -85,6 +87,17 @@ fn column_statistics(
         }
     }
     all
+}
+
+/// One expression's statistics, as a column's would be: what extended
+/// statistics record for an expression key (`pg_stats_ext_exprs`).
+pub(crate) fn analyze_values(
+    attnum: i32,
+    data_type: &str,
+    cells: &[&Value],
+    totalrows: f64,
+) -> Option<ColumnStatistics> {
+    analyze_column(attnum, data_type, cells, totalrows)
 }
 
 /// One column's statistics, or `None` when the sample had no rows at all.
