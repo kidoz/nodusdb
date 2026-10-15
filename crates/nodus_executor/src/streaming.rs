@@ -163,6 +163,29 @@ impl MemExecutor {
             return Ok(None);
         }
 
+        // A condition on a column an index leads with is an index scan: the
+        // buffered path reads it through the index — faster than streaming
+        // the whole table — and its scan counters say so, as PostgreSQL's do.
+        // Let that path take it.
+        if let Some(condition) = filter {
+            let mut refs = Vec::new();
+            crate::filter_eval::filter_column_refs(condition, &mut refs);
+            let indexed = tbl.indexes.iter().any(|index| {
+                index
+                    .key_columns
+                    .first()
+                    .filter(|key| !crate::index_keys::is_expression_key(key))
+                    .and_then(|key| tbl.columns.iter().find(|c| c.id == key.column_id))
+                    .is_some_and(|column| {
+                        refs.iter()
+                            .any(|name| name.rsplit('.').next().unwrap_or(name) == column.name)
+                    })
+            });
+            if indexed {
+                return Ok(None);
+            }
+        }
+
         // A capped/streamed committed scan could skip a pending row that sorts
         // within the result, so fall back when the session has uncommitted writes
         // to this table. A read-only/autocommit statement has none.
