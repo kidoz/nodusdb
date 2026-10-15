@@ -136,6 +136,10 @@ pub struct TableDescriptor {
 pub struct ColumnStatistics {
     /// The column's attribute number (`pg_attribute.attnum`): 1-based.
     pub attnum: i32,
+    /// `stainherit`: these are a parent's statistics over its whole
+    /// inheritance tree's rows, not the table's own.
+    #[serde(default)]
+    pub inherited: bool,
     /// The fraction of sampled rows that were NULL (`stanullfrac`).
     pub null_frac: f32,
     /// The average width in bytes of the non-NULL values (`stawidth`).

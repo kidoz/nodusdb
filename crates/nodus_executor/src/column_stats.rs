@@ -34,20 +34,34 @@ const ENUM_LT: i64 = 3518;
 
 /// The columns' statistics, in column order: one entry per column whose
 /// analysis found something (PostgreSQL stores no `pg_statistic` row for a
-/// zero-row table's columns).
+/// zero-row table's columns). A table with descendants also gets, after its
+/// own rows, a pass over its whole inheritance tree's rows, recorded with
+/// `stainherit` as PostgreSQL records it.
 pub(crate) fn analyze_table(
     executor: &MemExecutor,
     ctx: &ExecutionContext,
     tbl: &nodus_catalog::TableDescriptor,
 ) -> Result<Vec<ColumnStatistics>> {
     let rows = executor.scan_rows(tbl.id, &ctx.session_id)?;
-    Ok(column_statistics(tbl, &rows))
+    let mut all = column_statistics(tbl, &rows, false);
+    let descendants = executor.descendants("default", tbl.id)?;
+    if !descendants.is_empty() {
+        // The parent's rows, then each descendant's, as PostgreSQL's
+        // inherited sample reads them.
+        let mut inherited = rows;
+        for child in &descendants {
+            inherited.extend(executor.scan_rows(child.id, &ctx.session_id)?);
+        }
+        all.extend(column_statistics(tbl, &inherited, true));
+    }
+    Ok(all)
 }
 
 /// One pass over `rows`: each of `tbl`'s columns analyzed, in column order.
 fn column_statistics(
     tbl: &nodus_catalog::TableDescriptor,
     rows: &[Vec<Value>],
+    inherited: bool,
 ) -> Vec<ColumnStatistics> {
     // PostgreSQL draws a sample of 300 * statistics target rows at random;
     // taking the first rows of the scan keeps ANALYZE deterministic.
@@ -65,7 +79,8 @@ fn column_statistics(
             .map(|row| row.get(index).unwrap_or(&fill))
             .collect();
         let attnum = index as i32 + 1;
-        if let Some(statistics) = analyze_column(attnum, &column.data_type, &cells, totalrows) {
+        if let Some(mut statistics) = analyze_column(attnum, &column.data_type, &cells, totalrows) {
+            statistics.inherited = inherited;
             all.push(statistics);
         }
     }
@@ -142,6 +157,7 @@ fn analyze_column(
         // estimates them unique).
         return Some(ColumnStatistics {
             attnum,
+            inherited: false,
             null_frac,
             avg_width,
             n_distinct: -(1.0 - null_frac as f64) as f32,
@@ -153,6 +169,7 @@ fn analyze_column(
         // Only nulls: PostgreSQL assumes the column is entirely null.
         return Some(ColumnStatistics {
             attnum,
+            inherited: false,
             null_frac,
             avg_width,
             n_distinct: 0.0,
@@ -165,6 +182,7 @@ fn analyze_column(
         // PostgreSQL, which stores zero.
         return Some(ColumnStatistics {
             attnum,
+            inherited: false,
             null_frac,
             avg_width,
             n_distinct: 0.0,
@@ -179,6 +197,7 @@ fn analyze_column(
         tsvector_stats(&nonnull, &mut slots);
         return Some(ColumnStatistics {
             attnum,
+            inherited: false,
             null_frac,
             avg_width,
             n_distinct: -(1.0 - null_frac as f64) as f32,
@@ -200,6 +219,7 @@ fn analyze_column(
     }
     Some(ColumnStatistics {
         attnum,
+        inherited: false,
         null_frac,
         avg_width,
         n_distinct: n_distinct as f32,

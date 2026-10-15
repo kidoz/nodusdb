@@ -1076,7 +1076,7 @@ impl MemExecutor {
                             let mut row = vec![
                                 Value::Int(relid),
                                 Value::Int(stats.attnum as i64),
-                                Value::Bool(false),
+                                Value::Bool(stats.inherited),
                                 Value::Float(stats.null_frac as f64),
                                 Value::Int(stats.avg_width as i64),
                                 Value::Float(stats.n_distinct as f64),
@@ -1153,7 +1153,7 @@ impl MemExecutor {
                                 Value::Text(schema_name.clone()),
                                 Value::Text(table.name.clone()),
                                 Value::Text(attname),
-                                Value::Bool(false),
+                                Value::Bool(stats.inherited),
                                 Value::Float(stats.null_frac as f64),
                                 Value::Int(stats.avg_width as i64),
                                 Value::Float(stats.n_distinct as f64),

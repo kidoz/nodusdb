@@ -111,7 +111,15 @@ impl MemExecutor {
                 Ok(table)
                     if table.view_query.is_none() && !crate::sequences::is_sequence(&table) =>
                 {
+                    // A named table's maintenance covers its inheritance tree,
+                    // as PostgreSQL's does: the table and its descendants.
+                    let children = self.descendants("default", table.id)?;
                     found.push(table);
+                    for child in children {
+                        if !found.iter().any(|t| t.id == child.id) {
+                            found.push(child);
+                        }
+                    }
                 }
                 named => {
                     let is_index = self
