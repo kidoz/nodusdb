@@ -182,7 +182,7 @@ pub(crate) fn is_known(name: &str) -> bool {
                 | "INET_SERVER_ADDR" | "INET_SERVER_PORT" | "INET_CLIENT_ADDR"
                 | "INET_CLIENT_PORT" | "OBJ_DESCRIPTION" | "COL_DESCRIPTION"
                 | "SHOBJ_DESCRIPTION" | "FORMAT_TYPE" | "PG_GET_EXPR"
-                | "PG_RELATION_IS_PUBLISHABLE" | "PG_GET_STATISTICSOBJDEF_COLUMNS"
+                | "PG_RELATION_IS_PUBLISHABLE" | "PG_GET_STATISTICSOBJDEF_COLUMNS" | "PG_GET_STATISTICSOBJDEF" | "PG_GET_STATISTICSOBJDEF_EXPRESSIONS"
                 | "PG_GET_INDEXDEF" | "PG_GET_CONSTRAINTDEF" | "PG_GET_PARTKEYDEF"
                 | "__OBJECT_NAME__"
                 | "PG_GET_VIEWDEF" | "PG_RELATION_SIZE" | "PG_TABLE_SIZE" | "PG_INDEXES_SIZE"
@@ -3724,6 +3724,11 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
         // Only relations (and their columns) and indexes carry comments;
         // the schemas and types catalog holds its own.
         "OBJ_DESCRIPTION" if arity(1) || arity(2) => {
+            if arity(2) && text(arg(1)) == "pg_statistic_ext" {
+                return Some(
+                    crate::statistics::description(int(arg(0))?).map_or(Value::Null, Value::Text),
+                );
+            }
             if arity(2) && text(arg(1)) != "pg_class" {
                 return Some(
                     crate::schemas::schema_or_type_description(int(arg(0))?, &text(arg(1)))
@@ -3807,8 +3812,37 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
         }),
         // Any table could be published (there are no publications).
         "PG_RELATION_IS_PUBLISHABLE" if arity(1) => Value::Bool(true),
-        // There are no extended statistics objects.
-        "PG_GET_STATISTICSOBJDEF_COLUMNS" if arity(1) => Value::Null,
+        // These read the statistics objects' own relations, which the
+        // queries' catalog hides.
+        "PG_GET_STATISTICSOBJDEF" if arity(1) => {
+            let definition = int(arg(0)).and_then(|oid| {
+                session_env::with(|env| env.and_then(|e| e.types.clone())).and_then(|catalog| {
+                    crate::MemExecutor::statistics_definition(catalog.as_ref(), oid)
+                })
+            });
+            definition.map_or(Value::Null, Value::Text)
+        }
+        "PG_GET_STATISTICSOBJDEF_COLUMNS" if arity(1) => {
+            let columns = int(arg(0)).and_then(|oid| {
+                session_env::with(|env| env.and_then(|e| e.types.clone())).and_then(|catalog| {
+                    crate::MemExecutor::statistics_columns(catalog.as_ref(), oid)
+                })
+            });
+            columns.map_or(Value::Null, Value::Text)
+        }
+        "PG_GET_STATISTICSOBJDEF_EXPRESSIONS" if arity(1) => {
+            let expressions = int(arg(0)).and_then(|oid| {
+                session_env::with(|env| env.and_then(|e| e.types.clone())).and_then(|catalog| {
+                    crate::MemExecutor::statistics_expressions(catalog.as_ref(), oid)
+                })
+            });
+            match expressions {
+                Some(Some(expressions)) => {
+                    Value::Array(expressions.into_iter().map(Value::Text).collect())
+                }
+                _ => Value::Null,
+            }
+        }
         name if crate::value::is_visibility_fn(name) && arity(1) => Value::Bool(true),
 
         // ---- UUIDs ------------------------------------------------------------------

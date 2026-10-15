@@ -474,6 +474,79 @@ impl MemExecutor {
             .collect()
     }
 
+    /// `pg_get_statisticsobjdef(oid)`: `CREATE STATISTICS public.s ON c,
+    /// (a + b) FROM t`.
+    pub(crate) fn statistics_definition(
+        catalog: &dyn nodus_catalog::CatalogReader,
+        oid: i64,
+    ) -> Option<String> {
+        let object = object_of_oid(catalog, oid)?;
+        let table = catalog.get_table_by_id(object.definition.table_id).ok()?;
+        Some(format!(
+            "CREATE STATISTICS {}.{} ON {} FROM {}",
+            object.schema,
+            object.name,
+            object.definition.key_list_named(&table),
+            table.name,
+        ))
+    }
+
+    /// `pg_get_statisticsobjdef_columns(oid)`: `c, (a + b)`.
+    pub(crate) fn statistics_columns(
+        catalog: &dyn nodus_catalog::CatalogReader,
+        oid: i64,
+    ) -> Option<String> {
+        let object = object_of_oid(catalog, oid)?;
+        let table = catalog.get_table_by_id(object.definition.table_id).ok()?;
+        Some(object.definition.key_list_named(&table))
+    }
+
+    /// `pg_get_statisticsobjdef_expressions(oid)`: the expressions, each in
+    /// parentheses, or NULL when the object has none.
+    pub(crate) fn statistics_expressions(
+        catalog: &dyn nodus_catalog::CatalogReader,
+        oid: i64,
+    ) -> Option<Option<Vec<String>>> {
+        let object = object_of_oid(catalog, oid)?;
+        let expressions = object.definition.expressions();
+        if expressions.is_empty() {
+            return Some(None);
+        }
+        Some(Some(
+            expressions.iter().map(|text| format!("({text})")).collect(),
+        ))
+    }
+}
+
+/// A statistics object's comment, for `obj_description`.
+pub(crate) fn description(oid: i64) -> Option<String> {
+    let catalog = crate::session_env::with(|env| env.and_then(|e| e.types.clone()))?;
+    object_of_oid(catalog.as_ref(), oid)?.definition.comment
+}
+
+/// The statistics object a catalog holds for an OID.
+fn object_of_oid(catalog: &dyn nodus_catalog::CatalogReader, oid: i64) -> Option<StatisticsObject> {
+    statistics_of(catalog)
+        .into_iter()
+        .find(|object| object.oid() == oid)
+}
+
+impl StatisticsDefinition {
+    /// The keys as a definition prints them: the columns by name, then the
+    /// expressions in parentheses.
+    fn key_list_named(&self, table: &TableDescriptor) -> String {
+        self.keys
+            .iter()
+            .filter_map(|key| match key {
+                StatisticsKey::Column { attnum } => table
+                    .columns
+                    .get(*attnum as usize - 1)
+                    .map(|column| column.name.clone()),
+                StatisticsKey::Expression { text } => Some(format!("({text})")),
+            })
+            .collect::<Vec<String>>()
+            .join(", ")
+    }
 }
 
 // --- what ANALYZE computes ------------------------------------------------
@@ -561,6 +634,83 @@ fn expression_statistics(
         }
     }
     Ok(all)
+}
+
+// --- serializations (PostgreSQL's binary forms) ---------------------------
+
+/// `statext_ndistinct_serialize`: magic, version, item count, then each
+/// item's distinct count, member count and attribute numbers.
+pub(crate) fn serialize_ndistinct(items: &[(Vec<i32>, f64)]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(12 + items.len() * 14);
+    out.extend_from_slice(&NDISTINCT_MAGIC.to_le_bytes());
+    out.extend_from_slice(&TYPE_BASIC.to_le_bytes());
+    out.extend_from_slice(&(items.len() as u32).to_le_bytes());
+    for (attributes, ndistinct) in items {
+        out.extend_from_slice(&ndistinct.to_le_bytes());
+        out.extend_from_slice(&(attributes.len() as i32).to_le_bytes());
+        for attnum in attributes {
+            out.extend_from_slice(&(*attnum as i16).to_le_bytes());
+        }
+    }
+    out
+}
+
+/// `pg_ndistinct_out`: `{"1, 2": 70}` with the count as an integer.
+pub(crate) fn ndistinct_text(items: &[(Vec<i32>, f64)]) -> String {
+    let rendered: Vec<String> = items
+        .iter()
+        .map(|(attributes, ndistinct)| {
+            let names: Vec<String> = attributes.iter().map(|a| a.to_string()).collect();
+            format!("\"{}\": {}", names.join(", "), *ndistinct as i64)
+        })
+        .collect();
+    format!("{{{}}}", rendered.join(", "))
+}
+
+/// `statext_dependencies_serialize`: magic, version, dependency count, then
+/// each dependency's degree, member count and attribute numbers.
+pub(crate) fn serialize_dependencies(items: &[(Vec<i32>, f64)]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(12 + items.len() * 14);
+    out.extend_from_slice(&DEPENDENCIES_MAGIC.to_le_bytes());
+    out.extend_from_slice(&TYPE_BASIC.to_le_bytes());
+    out.extend_from_slice(&(items.len() as u32).to_le_bytes());
+    for (attributes, degree) in items {
+        out.extend_from_slice(&degree.to_le_bytes());
+        out.extend_from_slice(&(attributes.len() as i16).to_le_bytes());
+        for attnum in attributes {
+            out.extend_from_slice(&(*attnum as i16).to_le_bytes());
+        }
+    }
+    out
+}
+
+/// `pg_dependencies_out`: `{"1, 2 => 3": 0.918367}` with six decimals.
+pub(crate) fn dependencies_text(items: &[(Vec<i32>, f64)]) -> String {
+    let rendered: Vec<String> = items
+        .iter()
+        .map(|(attributes, degree)| {
+            let names: Vec<String> = attributes.iter().map(|a| a.to_string()).collect();
+            let (dependent, determinants) = names.split_last().expect("a dependency has members");
+            format!(
+                "\"{determinants} => {dependent}\": {degree:.6}",
+                determinants = determinants.join(", ")
+            )
+        })
+        .collect();
+    format!("{{{}}}", rendered.join(", "))
+}
+
+/// `stxdmcv`'s value: a bytea framed by NodusDB's own header (PostgreSQL's
+/// binary MCV layout is not reproduced) with the items as JSON, so the
+/// statistics views can decode them.
+pub(crate) fn serialize_mcv(items: &[McvItem]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&MCV_MAGIC.to_le_bytes());
+    out.extend_from_slice(&TYPE_BASIC.to_le_bytes());
+    out.extend_from_slice(&(items.len() as u32).to_le_bytes());
+    let json = serde_json::to_vec(items).unwrap_or_default();
+    out.extend_from_slice(&json);
+    out
 }
 
 // --- the computations (PostgreSQL's algorithms) ---------------------------

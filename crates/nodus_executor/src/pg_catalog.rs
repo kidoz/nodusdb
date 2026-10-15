@@ -1173,6 +1173,273 @@ impl MemExecutor {
                     Some((columns, rows))
                 }
             }
+            // The extended statistics objects `CREATE STATISTICS` defines,
+            // what `ANALYZE` found for them, and the readable views over
+            // that data.
+            "pg_statistic_ext"
+            | "pg_statistic_ext_data"
+            | "pg_stats_ext"
+            | "pg_stats_ext_exprs" => {
+                let objects = crate::statistics::all(self);
+                let table_of = |object: &crate::statistics::StatisticsObject| {
+                    tables.iter().find(|t| t.id == object.definition.table_id)
+                };
+                // What a name resolves to for display: the covered table and
+                // its schema.
+                let names = |object: &crate::statistics::StatisticsObject| {
+                    table_of(object).map(|table| {
+                        (
+                            Self::schema_name_by_id(db_name, &schemas, table.schema_id),
+                            table.name.clone(),
+                        )
+                    })
+                };
+                let mcv_values = |items: &[crate::statistics::McvItem]| -> Value {
+                    if items.is_empty() {
+                        return Value::Null;
+                    }
+                    Value::Array(
+                        items
+                            .iter()
+                            .map(|item| {
+                                Value::Array(
+                                    item.values
+                                        .iter()
+                                        .map(|value| value.clone().unwrap_or(Value::Null))
+                                        .collect(),
+                                )
+                            })
+                            .collect(),
+                    )
+                };
+                let mcv_nulls = |items: &[crate::statistics::McvItem]| -> Value {
+                    if items.is_empty() {
+                        return Value::Null;
+                    }
+                    Value::Array(
+                        items
+                            .iter()
+                            .map(|item| {
+                                Value::Array(
+                                    item.values
+                                        .iter()
+                                        .map(|value| Value::Bool(value.is_none()))
+                                        .collect(),
+                                )
+                            })
+                            .collect(),
+                    )
+                };
+                let frequencies = |items: &[crate::statistics::McvItem], base: bool| -> Value {
+                    if items.is_empty() {
+                        return Value::Null;
+                    }
+                    Value::Array(
+                        items
+                            .iter()
+                            .map(|item| {
+                                Value::Float(if base {
+                                    item.base_frequency
+                                } else {
+                                    item.frequency
+                                })
+                            })
+                            .collect(),
+                    )
+                };
+                let columns = match table.as_str() {
+                    "pg_statistic_ext" => Self::virtual_columns(&[
+                        ("oid", "OID"),
+                        ("stxrelid", "OID"),
+                        ("stxname", "NAME"),
+                        ("stxnamespace", "OID"),
+                        ("stxowner", "OID"),
+                        ("stxkeys", "INT2VECTOR"),
+                        ("stxstattarget", "INT"),
+                        ("stxkind", "TEXT[]"),
+                        ("stxexprs", "TEXT"),
+                    ]),
+                    "pg_statistic_ext_data" => Self::virtual_columns(&[
+                        ("stxoid", "OID"),
+                        ("stxdinherit", "BOOL"),
+                        ("stxdndistinct", "TEXT"),
+                        ("stxddependencies", "TEXT"),
+                        ("stxdmcv", "BYTEA"),
+                        ("stxdexpr", "TEXT"),
+                    ]),
+                    "pg_stats_ext_exprs" => Self::virtual_columns(&[
+                        ("schemaname", "NAME"),
+                        ("tablename", "NAME"),
+                        ("statistics_schemaname", "NAME"),
+                        ("statistics_name", "NAME"),
+                        ("statistics_owner", "NAME"),
+                        ("expr", "TEXT"),
+                        ("inherited", "BOOL"),
+                        ("null_frac", "FLOAT4"),
+                        ("avg_width", "INT"),
+                        ("n_distinct", "FLOAT4"),
+                        ("most_common_vals", "TEXT[]"),
+                        ("most_common_freqs", "FLOAT4[]"),
+                        ("histogram_bounds", "TEXT[]"),
+                        ("correlation", "FLOAT4"),
+                    ]),
+                    _ => Self::virtual_columns(&[
+                        ("schemaname", "NAME"),
+                        ("tablename", "NAME"),
+                        ("statistics_schemaname", "NAME"),
+                        ("statistics_name", "NAME"),
+                        ("statistics_owner", "NAME"),
+                        ("attnames", "TEXT[]"),
+                        ("exprs", "TEXT[]"),
+                        ("kinds", "TEXT[]"),
+                        ("inherited", "BOOL"),
+                        ("n_distinct", "TEXT"),
+                        ("dependencies", "TEXT"),
+                        ("most_common_vals", "TEXT[]"),
+                        ("most_common_val_nulls", "BOOL[]"),
+                        ("most_common_freqs", "FLOAT8[]"),
+                        ("most_common_base_freqs", "FLOAT8[]"),
+                    ]),
+                };
+                let mut rows = Vec::new();
+                for object in &objects {
+                    let Some((table_schema, table_name)) = names(object) else {
+                        continue;
+                    };
+                    if table == "pg_statistic_ext" {
+                        rows.push(vec![
+                            Value::Int(object.oid()),
+                            Value::Int(Self::table_oid(db_name, &table_schema, &table_name)),
+                            Value::Text(object.name.clone()),
+                            Value::Int(Self::schema_oid(db_name, &object.schema)),
+                            Value::Int(10),
+                            Value::Text(object.definition.stxkeys_text()),
+                            object
+                                .definition
+                                .target
+                                .map(|target| Value::Int(target as i64))
+                                .unwrap_or(Value::Null),
+                            Value::Array(
+                                object
+                                    .definition
+                                    .kinds
+                                    .iter()
+                                    .map(|kind| Value::Text(kind.to_string()))
+                                    .collect(),
+                            ),
+                            Value::Null,
+                        ]);
+                        continue;
+                    }
+                    for data in &object.definition.data {
+                        let exprs: Vec<Value> = object
+                            .definition
+                            .expressions()
+                            .iter()
+                            .map(|text| Value::Text(format!("({text})")))
+                            .collect();
+                        if table == "pg_statistic_ext_data" {
+                            rows.push(vec![
+                                Value::Int(object.oid()),
+                                Value::Bool(data.inherited),
+                                if object.definition.kinds.contains(&'d') {
+                                    Value::Text(crate::statistics::ndistinct_text(&data.n_distinct))
+                                } else {
+                                    Value::Null
+                                },
+                                if object.definition.kinds.contains(&'f')
+                                    && !data.dependencies.is_empty()
+                                {
+                                    Value::Text(crate::statistics::dependencies_text(
+                                        &data.dependencies,
+                                    ))
+                                } else {
+                                    Value::Null
+                                },
+                                if object.definition.kinds.contains(&'m') {
+                                    Value::Text(crate::bytea::hex_text(
+                                        &crate::statistics::serialize_mcv(&data.mcv),
+                                    ))
+                                } else {
+                                    Value::Null
+                                },
+                                Value::Null,
+                            ]);
+                            continue;
+                        }
+                        if table == "pg_stats_ext_exprs" {
+                            for (index, statistics) in data.expressions.iter().enumerate() {
+                                let expr = exprs.get(index).cloned().unwrap_or(Value::Null);
+                                rows.push(vec![
+                                    Value::Text(table_schema.clone()),
+                                    Value::Text(table_name.clone()),
+                                    Value::Text(object.schema.clone()),
+                                    Value::Text(object.name.clone()),
+                                    Value::Text("nodus".into()),
+                                    expr,
+                                    Value::Bool(data.inherited),
+                                    Value::Float(statistics.null_frac as f64),
+                                    Value::Int(statistics.avg_width as i64),
+                                    Value::Float(statistics.n_distinct as f64),
+                                    statistics_slot(statistics, 1, true),
+                                    statistics_slot(statistics, 1, false),
+                                    statistics_slot(statistics, 2, true),
+                                    statistics_slot(statistics, 3, false),
+                                ]);
+                            }
+                            continue;
+                        }
+                        let attnames: Vec<Value> = object
+                            .definition
+                            .column_keys()
+                            .iter()
+                            .filter_map(|attnum| {
+                                table_of(object)?
+                                    .columns
+                                    .get(*attnum as usize - 1)
+                                    .map(|column| Value::Text(column.name.clone()))
+                            })
+                            .collect();
+                        rows.push(vec![
+                            Value::Text(table_schema.clone()),
+                            Value::Text(table_name.clone()),
+                            Value::Text(object.schema.clone()),
+                            Value::Text(object.name.clone()),
+                            Value::Text("nodus".into()),
+                            Value::Array(attnames),
+                            Value::Array(exprs),
+                            Value::Array(
+                                object
+                                    .definition
+                                    .kinds
+                                    .iter()
+                                    .map(|kind| Value::Text(kind.to_string()))
+                                    .collect(),
+                            ),
+                            Value::Bool(data.inherited),
+                            if object.definition.kinds.contains(&'d') {
+                                Value::Text(crate::statistics::ndistinct_text(&data.n_distinct))
+                            } else {
+                                Value::Null
+                            },
+                            if object.definition.kinds.contains(&'f')
+                                && !data.dependencies.is_empty()
+                            {
+                                Value::Text(crate::statistics::dependencies_text(
+                                    &data.dependencies,
+                                ))
+                            } else {
+                                Value::Null
+                            },
+                            mcv_values(&data.mcv),
+                            mcv_nulls(&data.mcv),
+                            frequencies(&data.mcv, false),
+                            frequencies(&data.mcv, true),
+                        ]);
+                    }
+                }
+                Some((columns, rows))
+            }
             "pg_indexes" => Some(self.pg_indexes_virtual_table(db_name, &schemas, &tables)),
             "pg_attrdef" => {
                 let mut rows = Vec::new();
@@ -1249,6 +1516,18 @@ impl MemExecutor {
                                 Value::Text(comment.clone()),
                             ]);
                         }
+                    }
+                }
+                // A statistics object's comment is a comment on its own
+                // `pg_statistic_ext` entry.
+                for object in crate::statistics::all(self) {
+                    if let Some(comment) = &object.definition.comment {
+                        rows.push(vec![
+                            Value::Int(object.oid()),
+                            Value::Int(3381),
+                            Value::Int(0),
+                            Value::Text(comment.clone()),
+                        ]);
                     }
                 }
                 rows.extend(crate::schemas::schema_and_type_descriptions(
@@ -4431,4 +4710,34 @@ fn not_null_origin(
         }
     }
     origin
+}
+
+/// One of a statistics entry's slots as the views print it: the slot's
+/// values, or its numbers, NULL when the slot is absent.
+fn statistics_slot(statistics: &nodus_catalog::ColumnStatistics, kind: i16, values: bool) -> Value {
+    let Some(slot) = statistics.slots.iter().find(|slot| slot.kind == kind) else {
+        return Value::Null;
+    };
+    if values {
+        slot.values
+            .as_ref()
+            .map(|values| {
+                Value::Array(
+                    values
+                        .iter()
+                        .map(|text| {
+                            crate::column_stats::statistic_value(
+                                serde_json::from_str(text).unwrap_or(Value::Null),
+                            )
+                        })
+                        .collect(),
+                )
+            })
+            .unwrap_or(Value::Null)
+    } else {
+        slot.numbers
+            .as_ref()
+            .map(|numbers| Value::Array(numbers.iter().map(|n| Value::Float(*n as f64)).collect()))
+            .unwrap_or(Value::Null)
+    }
 }
