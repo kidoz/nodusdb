@@ -31,7 +31,7 @@ pub(crate) fn render_scalar_text(value: &nodus_executor::Value, declared: &Type)
                 "f".to_owned()
             }
         }
-        nodus_executor::Value::Array(arr) => render_array_text(arr),
+        nodus_executor::Value::Array(arr) => render_array_text(arr, &element_type(declared)),
         nodus_executor::Value::Jsonb(j) if *declared == Type::JSON => nodus_executor::json_text(j),
         nodus_executor::Value::Jsonb(j) => nodus_executor::jsonb_text(j),
         nodus_executor::Value::Json(text) => text.clone(),
@@ -48,16 +48,27 @@ pub(crate) fn render_bytea_text(raw: &str) -> String {
     }
 }
 
-pub(crate) fn render_array_text(arr: &[nodus_executor::Value]) -> String {
+pub(crate) fn render_array_text(arr: &[nodus_executor::Value], element: &Type) -> String {
     let rendered = arr
         .iter()
         .map(|v| match v {
             nodus_executor::Value::Null => "NULL".to_owned(),
-            nodus_executor::Value::Array(nested) => render_array_text(nested),
-            _ => quote_array_value(&render_scalar_text(v, &Type::TEXT)),
+            nodus_executor::Value::Array(nested) => render_array_text(nested, element),
+            _ => quote_array_value(&render_scalar_text(v, element)),
         })
         .collect::<Vec<_>>();
     format!("{{{}}}", rendered.join(","))
+}
+
+/// The type an array's elements render as: the declared array's own element
+/// type where its text differs (a `float4[]` element prints as a float4, not
+/// as the float8 its value widens to), and text for everything else.
+fn element_type(declared: &Type) -> Type {
+    if *declared == Type::FLOAT4_ARRAY {
+        Type::FLOAT4
+    } else {
+        Type::TEXT
+    }
 }
 
 pub(crate) fn quote_array_value(value: &str) -> String {
