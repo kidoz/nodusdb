@@ -546,6 +546,8 @@ impl CatalogWriter for MemoryCatalog {
             view_query: request.view_query,
             materialized_query: request.materialized_query,
             comment: None,
+            reltuples: None,
+            relpages: None,
             parents: request.parents,
             partition_by: request.partition_by,
             partition_bound: request.partition_bound,
@@ -666,6 +668,7 @@ impl CatalogWriter for MemoryCatalog {
             TableDescriptorChange::AddIndex { table_id, .. } => *table_id,
             TableDescriptorChange::DropIndex { table_id, .. } => *table_id,
             TableDescriptorChange::SetComment { table_id, .. }
+            | TableDescriptorChange::SetStatistics { table_id, .. }
             | TableDescriptorChange::SetIndexComment { table_id, .. }
             | TableDescriptorChange::ReplaceColumn { table_id, .. }
             | TableDescriptorChange::AddConstraint { table_id, .. }
@@ -741,6 +744,14 @@ impl CatalogWriter for MemoryCatalog {
                     None => anyhow::bail!("Column {} not found", name),
                 },
             },
+            TableDescriptorChange::SetStatistics {
+                reltuples,
+                relpages,
+                ..
+            } => {
+                table.reltuples = Some(reltuples);
+                table.relpages = Some(relpages);
+            }
             TableDescriptorChange::SetIndexComment {
                 index_name,
                 comment,

@@ -4283,6 +4283,24 @@ fn rewrite_data_clause(
         return statement;
     }
 
+    // `VACUUM`'s target travels with the tag too: the tables it covers have
+    // their statistics stamped, and `VACUUM ANALYZE` analyzes them.
+    if is(0, "vacuum") {
+        let target = significant
+            .get(1)
+            .map(|&first| render_tokens(&statement[first..=significant[n - 1]]))
+            .unwrap_or_default();
+        let sql = format!(
+            "SELECT {UTILITY_FUNCTION}('VACUUM', '{}')",
+            target.replace('\'', "''")
+        );
+        if let Some(mut tokens) = snippet_tokens(&sql) {
+            tokens.extend(tail);
+            return tokens;
+        }
+        return statement;
+    }
+
     // `REINDEX`'s target travels with the tag, so the executor can resolve
     // it: `REINDEX INDEX nosuch` is an error, not a no-op.
     if is(0, "reindex") {
@@ -4308,8 +4326,6 @@ fn rewrite_data_clause(
         Some("CLUSTER")
     } else if is(0, "load") {
         Some("LOAD")
-    } else if is(0, "vacuum") && n > 1 {
-        Some("VACUUM")
     } else if is(0, "prepare") && is(1, "transaction") {
         Some("PREPARE TRANSACTION")
     } else {
@@ -4697,7 +4713,11 @@ mod tests {
         );
         assert_eq!(
             one("VACUUM (VERBOSE, ANALYZE) t"),
-            format!("SELECT {UTILITY_FUNCTION}('VACUUM')")
+            format!("SELECT {UTILITY_FUNCTION}('VACUUM', '(verbose, analyze) t')")
+        );
+        assert_eq!(
+            one("vacuum t1, t2"),
+            format!("SELECT {UTILITY_FUNCTION}('VACUUM', 't1, t2')")
         );
         assert_eq!(
             one("REINDEX TABLE t"),

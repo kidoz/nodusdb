@@ -104,6 +104,13 @@ pub struct TableDescriptor {
     /// The table's `COMMENT ON` text.
     #[serde(default)]
     pub comment: Option<String>,
+    /// The rows `ANALYZE` last counted (`pg_class.reltuples`) — `None` never
+    /// analyzed, which PostgreSQL reports as `-1`.
+    #[serde(default)]
+    pub reltuples: Option<f64>,
+    /// The pages those rows occupied (`pg_class.relpages`), if analyzed.
+    #[serde(default)]
+    pub relpages: Option<i64>,
     /// The tables this one inherits from (`INHERITS`), in that order.
     /// Defaulted so older descriptors decode.
     #[serde(default)]

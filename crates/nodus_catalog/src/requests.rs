@@ -120,6 +120,13 @@ pub enum TableDescriptorChange {
         column: Option<String>,
         comment: Option<String>,
     },
+    /// `ANALYZE`: records the row count and pages the table's statistics
+    /// report (`pg_class.reltuples`/`relpages`).
+    SetStatistics {
+        table_id: TableId,
+        reltuples: f64,
+        relpages: i64,
+    },
     /// `COMMENT ON INDEX`: sets the comment on the table's index
     /// `index_name`; `None` removes it.
     SetIndexComment {

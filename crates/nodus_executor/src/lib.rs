@@ -43,6 +43,7 @@ mod joins;
 mod json_text;
 mod jsonpath;
 mod largeobjects;
+mod maintenance;
 mod merge;
 mod multiranges;
 mod net;

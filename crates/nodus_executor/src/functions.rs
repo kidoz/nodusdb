@@ -5803,7 +5803,7 @@ fn relation_size(rel: &Value, measure: impl Fn(i64, i64) -> i64) -> Value {
 
 /// The bytes a table's rows and its indexes take, each in whole 8 kB pages
 /// as PostgreSQL measures them.
-fn stored_size(
+pub(crate) fn stored_size(
     kv: &dyn nodus_storage_api::KvEngine,
     read_ts: nodus_storage_api::Timestamp,
     table: &nodus_catalog::TableDescriptor,
@@ -5838,7 +5838,7 @@ fn range_bytes(
 }
 
 /// `bytes` rounded up to whole 8 kB pages.
-fn pages(bytes: i64) -> i64 {
+pub(crate) fn pages(bytes: i64) -> i64 {
     (bytes + 8191) / 8192 * 8192
 }
 

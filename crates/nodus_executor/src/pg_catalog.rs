@@ -143,8 +143,10 @@ impl MemExecutor {
                         Value::Int(if heap { 2 } else { 0 }),
                         Value::Int(oid),
                         Value::Int(0),
-                        Value::Int(0),
-                        Value::Float(0.0),
+                        // relpages/reltuples: what `ANALYZE` recorded, and
+                        // PostgreSQL's "not analyzed yet" without one.
+                        Value::Int(table.relpages.unwrap_or(0)),
+                        Value::Float(table.reltuples.unwrap_or(-1.0)),
                         Value::Int(0),
                         Value::Int(0),
                         Value::Bool(!table.indexes.is_empty()),

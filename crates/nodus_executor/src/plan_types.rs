@@ -1883,6 +1883,25 @@ pub enum LogicalPlan {
     Noop {
         tag: String,
     },
+    /// `VACUUM [FULL] [FREEZE] [VERBOSE] [ANALYZE] [table]`: the statistics
+    /// of the tables it covers move (`last_vacuum`, ...), and an `ANALYZE`
+    /// among them records their counts. Nothing is reclaimed (there are no
+    /// vacuum-to-do versions to sweep).
+    Vacuum {
+        /// The tables named, or every table when none is.
+        #[serde(default)]
+        tables: Option<Vec<String>>,
+        /// `VACUUM ANALYZE`: it analyzes the tables too.
+        #[serde(default)]
+        analyze: bool,
+    },
+    /// `ANALYZE [VERBOSE] [table]`: records the tables' row counts
+    /// (`pg_class.reltuples`/`relpages`) and stamps the analysis.
+    Analyze {
+        /// The tables named, or every table when none is.
+        #[serde(default)]
+        tables: Option<Vec<String>>,
+    },
     /// The implicit transaction block a multi-statement simple query runs in,
     /// which the wire layer opens before its first statement. PostgreSQL
     /// wraps such a batch in one transaction: it commits once, at the end.

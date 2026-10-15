@@ -916,6 +916,10 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                         .hint("Set \"max_prepared_transactions\" to a nonzero value.")
                         .into(),
                 ),
+                Some([crate::Value::Text(tag), crate::Value::Text(target)]) if tag == "VACUUM" => {
+                    let (tables, analyze) = vacuum_target(target)?;
+                    Ok(LogicalPlan::Vacuum { tables, analyze })
+                }
                 Some([crate::Value::Text(tag), crate::Value::Text(target)]) if tag == "REINDEX" => {
                     Ok(LogicalPlan::Reindex {
                         target: target.clone(),
@@ -1394,11 +1398,11 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
             ),
         }),
         // Statistics and space are managed by the storage engine.
-        Statement::Analyze(_) => Ok(LogicalPlan::Noop {
-            tag: "ANALYZE".to_string(),
-        }),
-        Statement::Vacuum(_) => Ok(LogicalPlan::Noop {
-            tag: "VACUUM".to_string(),
+        Statement::Analyze(analyze) => Ok(LogicalPlan::Analyze {
+            tables: analyze
+                .table_name
+                .as_ref()
+                .map(|name| vec![name.to_string()]),
         }),
         Statement::StartTransaction { modes, begin, .. } => {
             let (read_only, isolation) = transaction_modes(modes);
@@ -3123,4 +3127,86 @@ fn sequence_spec(
         }
     }
     Ok(spec)
+}
+
+/// What a `VACUUM` covers: the tables its target text names (or none, which
+/// every table means), and whether it also analyzes them. The options —
+/// `FULL`, `FREEZE`, `VERBOSE`, `ANALYZE`, and a parenthesized option list —
+/// decide only `ANALYZE` here: nothing is reclaimed to report the rest of.
+fn vacuum_target(target: &str) -> Result<(Option<Vec<String>>, bool)> {
+    use sqlparser::tokenizer::{Token, Tokenizer};
+    let tokens: Vec<Token> = Tokenizer::new(&sqlparser::dialect::PostgreSqlDialect {}, target)
+        .tokenize()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|t| !matches!(t, Token::Whitespace(_) | Token::EOF))
+        .collect();
+    let mut analyze = false;
+    let mut tables: Vec<String> = Vec::new();
+    let mut at = 0;
+    while at < tokens.len() {
+        match &tokens[at] {
+            // `VACUUM (FULL, ANALYZE) t`: the option list's words.
+            Token::LParen => {
+                while at < tokens.len() {
+                    if let Token::Word(word) = &tokens[at]
+                        && word.value.eq_ignore_ascii_case("analyze")
+                    {
+                        analyze = true;
+                    }
+                    if tokens[at] == Token::RParen {
+                        break;
+                    }
+                    at += 1;
+                }
+                at += 1;
+            }
+            Token::Word(word) => {
+                let name = match word.quote_style {
+                    Some(_) => format!("\"{}\"", word.value.replace('"', "\"\"")),
+                    None => word.value.clone(),
+                };
+                let upper = word.value.to_ascii_uppercase();
+                if word.quote_style.is_none()
+                    && matches!(
+                        upper.as_str(),
+                        "FULL" | "FREEZE" | "VERBOSE" | "ANALYZE" | "SKIP_LOCKED" | "INDEX_CLEANUP"
+                    )
+                {
+                    if upper == "ANALYZE" {
+                        analyze = true;
+                    }
+                } else if tokens.get(at + 1) == Some(&Token::Period) {
+                    // A qualified name: its words join with periods, and a
+                    // column list after it is not this statement's business.
+                    let mut qualified = name;
+                    while tokens.get(at + 1) == Some(&Token::Period) {
+                        let Some(Token::Word(next)) = tokens.get(at + 2) else {
+                            break;
+                        };
+                        qualified.push('.');
+                        qualified.push_str(&next.value);
+                        at += 2;
+                    }
+                    tables.push(qualified);
+                } else {
+                    tables.push(name);
+                }
+                at += 1;
+            }
+            _ => at += 1,
+        }
+        // A `(column, ...)` list after a table name is skipped.
+        if at < tokens.len() && tables.last().is_some() {
+            if tokens[at] == Token::LParen {
+                while at < tokens.len() && tokens[at] != Token::RParen {
+                    at += 1;
+                }
+                at += 1;
+            } else if tokens[at] == Token::Comma {
+                at += 1;
+            }
+        }
+    }
+    Ok(((!tables.is_empty()).then_some(tables), analyze))
 }
