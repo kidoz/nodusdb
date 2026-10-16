@@ -1,0 +1,163 @@
+# The server-side statistics views: `pg_stat_database` and its
+# `pg_stat_get_db_*()` functions, the writer's, checkpointer's, WAL's,
+# SLRU's, IO's and archiver's counters, replication, subscriptions,
+# functions, the per-relation IO views, and the progress reports of
+# operations this engine runs to completion. The shapes are PostgreSQL
+# 18's own — every one of these views' columns was compared against it —
+# and the counters are the ones the engine keeps: transactions committed
+# and rolled back, sessions, and the tuples relations returned and
+# changed. The rest read zero.
+#
+# Known divergences: there is no block IO, checkpointer, or background
+# writer to report on, so those counters are zero; the transaction and
+# session counters are the server's, shown on each database's row, where
+# PostgreSQL tracks them per database; only the databases this engine has
+# (`default`, and the shared-objects row) appear, where a PostgreSQL
+# cluster also has its templates and `postgres`; a write's counters move
+# when it is attempted, so an inserted-then-rolled-back row still counts
+# where PostgreSQL's transactional counters would not; `pg_statio_*`
+# read zero and list only this engine's own relations;
+# `pg_stat_user_functions` has no rows (the functions here are built in),
+# and `pg_stat_replication`/`pg_stat_subscription` none (replication runs
+# through Raft); `stats_reset` is NULL, as these counters start with the
+# server; and these views' columns do not appear in `pg_attribute`, where
+# PostgreSQL's catalogs describe themselves.
+
+statement ok
+drop table if exists sv1 cascade;
+
+statement ok
+create table sv1 (a int, b text);
+
+statement ok
+insert into sv1 select g, 'v' || g from generate_series(1, 20) g;
+
+# The database's row: its name, the connections open, and the counters
+# that moved.
+query TTT
+select datname, numbackends > 0, stats_reset is null from pg_stat_database where datname = 'default';
+----
+default	t	t
+
+query TTTT
+select xact_commit > 0, xact_rollback, tup_inserted, tup_deleted from pg_stat_database where datname = 'default';
+----
+t	0	20	0
+
+# The shared-objects row comes first, as PostgreSQL's does.
+query TI
+select datname is null, datid from pg_stat_database order by datid limit 1;
+----
+t	0
+
+# The same counters through the `pg_stat_get_db_*()` functions.
+query TTT
+select pg_stat_get_db_xact_commit(oid) > 0, pg_stat_get_db_numbackends(oid) > 0, pg_stat_get_db_tuples_inserted(oid) from pg_database where datname = 'default';
+----
+t	t	20
+
+query TT
+select pg_stat_get_db_stat_reset_time(oid) is null, pg_stat_get_db_deadlocks(oid) from pg_database where datname = 'default';
+----
+t	0
+
+# An OID that is no database of this server is NULL, as PostgreSQL
+# reports it.
+query T
+select pg_stat_get_db_xact_commit(1) is null;
+----
+t
+
+# The writer's, checkpointer's, WAL's, and archiver's counters: one row
+# each, all zero, with no reset time.
+query TTT
+select buffers_clean, maxwritten_clean, stats_reset is null from pg_stat_bgwriter;
+----
+0	0	t
+
+query TT
+select num_timed, num_requested from pg_stat_checkpointer;
+----
+0	0
+
+query TT
+select wal_records, wal_bytes from pg_stat_wal;
+----
+0	0
+
+query TT
+select archived_count, failed_count from pg_stat_archiver;
+----
+0	0
+
+# SLRU keeps PostgreSQL's own names, in its order.
+query I
+select count(*) from pg_stat_slru;
+----
+8
+
+query T
+select name from pg_stat_slru order by name;
+----
+commit_timestamp
+multixact_member
+multixact_offset
+notify
+other
+serializable
+subtransaction
+transaction
+
+# IO has a row per backend type, object, and context, as PostgreSQL 18
+# reports them, all zero.
+query I
+select count(*) from pg_stat_io;
+----
+79
+
+query TT
+select object, context from pg_stat_io where backend_type = 'client backend' order by object, context;
+----
+relation	bulkread
+relation	bulkwrite
+relation	init
+relation	normal
+relation	vacuum
+temp relation	normal
+wal	init
+wal	normal
+
+# Replication, subscriptions, and functions have no rows.
+query IIIII
+select (select count(*) from pg_stat_replication), (select count(*) from pg_stat_subscription), (select count(*) from pg_stat_user_functions), (select count(*) from pg_stat_progress_vacuum), (select count(*) from pg_stat_progress_copy);
+----
+0	0	0	0	0
+
+# The per-relation IO views list this engine's relations, reading zero.
+query TT
+select relname, heap_blks_read from pg_statio_user_tables where relname = 'sv1';
+----
+sv1	0
+
+query T
+select count(*) from pg_statio_user_tables where relname = 'sv1';
+----
+1
+
+# A rolled-back transaction counts as a rollback.
+statement ok
+begin;
+
+statement ok
+insert into sv1 values (21, 'v21');
+
+statement ok
+rollback;
+
+query TT
+select xact_rollback > 0, tup_deleted from pg_stat_database where datname = 'default';
+----
+t	0
+
+statement ok
+drop table sv1 cascade;
