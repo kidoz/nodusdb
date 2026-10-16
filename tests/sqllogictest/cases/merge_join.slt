@@ -15,11 +15,11 @@
 # and operand order agree. PostgreSQL reads a side from an ordered index
 # when one exists, where NodusDB always sorts the side. A semi join
 # PostgreSQL can prove unique is deduplicated (`HashAggregate`) into a
-# plain `Merge Join`; NodusDB prints `Merge Semi Join`. Join row
-# estimates are the larger input's, where PostgreSQL uses the columns'
-# distinct counts (`rows=600` here against our `rows=201`). The merge's
-# internal order is the join keys' canonical text, so a plan's row order
-# can differ from PostgreSQL's. A data-modifying statement's joins
+# plain `Merge Join`; NodusDB prints `Merge Semi Join`. Join row estimates
+# are PostgreSQL's own from the columns' distinct counts and most common
+# values (`eqjoinsel`), so a join of these tables estimates `rows=600`.
+# The merge's internal order is the join keys' canonical text, so a plan's
+# row order can differ from PostgreSQL's. A data-modifying statement's joins
 # (`UPDATE ... FROM`, `DELETE ... USING`, and their `EXISTS`/`IN`) are
 # not reached by the join-method settings at all — see `dml_plans.slt`.
 

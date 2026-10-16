@@ -4,8 +4,11 @@
 # `Update`/`Delete` node — as PostgreSQL plans them. Results are from
 # PostgreSQL 18.4; where PostgreSQL hashes the other side, the join is
 # the mirror of its plan. The session's join-method settings
-# (`enable_hashjoin`, `enable_mergejoin`, `enable_nestloop`) do not
-# reach these joins, where PostgreSQL plans them by them.
+# (`enable_hashjoin`, `enable_mergejoin`, `enable_nestloop`) neither
+# reach these joins, where PostgreSQL plans them by them, nor do the
+# sides' statistics estimate their rows — PostgreSQL's `eqjoinsel` gives
+# a `UPDATE ... FROM` join of analyzed tables 360 rows where these show
+# the target's own count.
 
 statement ok
 drop table if exists d1 cascade;

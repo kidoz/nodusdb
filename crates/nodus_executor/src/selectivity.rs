@@ -1020,6 +1020,129 @@ pub(crate) fn neq_semi_join_selectivity(outer: &JoinSide) -> f64 {
 mod tests {
     use super::*;
 
+    /// A join's rows come from both sides' statistics — PostgreSQL's
+    /// `eqjoinsel` over their most common values and distinct counts, its
+    /// semi variant, its one-over-the-referenced-size rule for a foreign
+    /// key, and its defaults for the rest. These are its own numbers for
+    /// the same data.
+    #[test]
+    fn join_estimates_match_postgresql() {
+        let (sql, _) = crate::constraint_tests::session();
+        let join_rows = |query: &str| -> String {
+            let out = sql(&format!("explain {query}")).unwrap();
+            let plan = out
+                .rows
+                .iter()
+                .map(|row| crate::render(&row.values[0]))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let line = plan
+                .lines()
+                .find(|line| line.contains("Join") || line.contains("Nested Loop"))
+                .unwrap_or_default();
+            line.split("rows=")
+                .nth(1)
+                .and_then(|rest| rest.split(' ').next())
+                .unwrap_or_default()
+                .to_string()
+        };
+        sql("create table j1 (a int, b int, t text)").unwrap();
+        sql("create table j2 (a int, b int, t text)").unwrap();
+        sql("insert into j1 select g % 50, g % 7, 'k' || (g % 25) from generate_series(1, 200) g")
+            .unwrap();
+        sql("insert into j2 select g % 30, g % 5, 'k' || (g % 35) from generate_series(1, 150) g")
+            .unwrap();
+        sql("insert into j1 values (null, null, null)").unwrap();
+        sql("insert into j2 values (null, null, null)").unwrap();
+        sql("analyze j1").unwrap();
+        sql("analyze j2").unwrap();
+
+        // Both sides' most common values meet in the middle: the smaller of
+        // the two points of view.
+        assert_eq!(join_rows("select * from j1 join j2 on j1.a = j2.a"), "600");
+        assert_eq!(
+            join_rows("select * from j1 left join j2 on j1.a = j2.a"),
+            "600"
+        );
+        assert_eq!(
+            join_rows("select * from j1 right join j2 on j1.a = j2.a"),
+            "600"
+        );
+        assert_eq!(
+            join_rows("select * from j1 full join j2 on j1.a = j2.a"),
+            "600"
+        );
+        assert_eq!(
+            join_rows("select * from j1 join j2 on j1.a = j2.a and j1.b = j2.b"),
+            "85"
+        );
+        // A bound beside the equality keeps a third.
+        assert_eq!(
+            join_rows("select * from j1 join j2 on j1.a = j2.a and j1.b < j2.b"),
+            "200"
+        );
+        assert_eq!(join_rows("select * from j1 join j2 on j1.t = j2.t"), "880");
+        // Semi and anti joins: the fraction of the outer rows with a partner.
+        assert_eq!(
+            join_rows("select * from j1 where exists (select 1 from j2 where j2.a = j1.a)"),
+            "120"
+        );
+        assert_eq!(
+            join_rows("select * from j1 where not exists (select 1 from j2 where j2.a = j1.a)"),
+            "81"
+        );
+        // `<>` as one minus the equality; a cross join as the product.
+        assert_eq!(
+            join_rows("select * from j1 join j2 on j1.a <> j2.a"),
+            "29751"
+        );
+        assert_eq!(join_rows("select * from j1, j2"), "30351");
+        sql("drop table j1").unwrap();
+        sql("drop table j2").unwrap();
+
+        // A foreign key: each referencing row matches exactly one referenced
+        // row, so the join keeps the referencing table's size.
+        sql("create table parent (id int primary key, v text)").unwrap();
+        sql("create table child (id int, pid int references parent (id), w text)").unwrap();
+        sql("insert into parent select g, 'p' || g from generate_series(1, 100) g").unwrap();
+        sql("insert into child select g, g % 100 + 1, 'c' || g from generate_series(1, 500) g")
+            .unwrap();
+        sql("analyze parent").unwrap();
+        sql("analyze child").unwrap();
+        assert_eq!(
+            join_rows("select * from child join parent on child.pid = parent.id"),
+            "500"
+        );
+        assert_eq!(
+            join_rows("select * from parent join child on child.pid = parent.id"),
+            "500"
+        );
+        assert_eq!(
+            join_rows("select * from child left join parent on child.pid = parent.id"),
+            "500"
+        );
+        assert_eq!(
+            join_rows(
+                "select * from child where exists (select 1 from parent where parent.id = child.pid)"
+            ),
+            "500"
+        );
+        assert_eq!(
+            join_rows(
+                "select * from child where not exists (select 1 from parent where parent.id = child.pid)"
+            ),
+            "1"
+        );
+        // The foreign key's clause is dropped from the equalities, so a
+        // conjunct on the referencing side still applies.
+        assert_eq!(
+            join_rows(
+                "select * from child join parent on child.pid = parent.id and child.w <> 'c1'"
+            ),
+            "499"
+        );
+    }
+
     /// The estimates `EXPLAIN` prints come from the statistics `ANALYZE`
     /// recorded — PostgreSQL 18.4's own selectivity model, so these are its
     /// row counts for the same data (verified against it query by query).
