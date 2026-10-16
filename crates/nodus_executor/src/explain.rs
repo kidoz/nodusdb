@@ -1083,9 +1083,13 @@ impl MemExecutor {
                     };
                     let left_refs: Vec<&str> = left_prefixes.iter().map(String::as_str).collect();
                     let right_refs: Vec<&str> = right_prefixes.iter().map(String::as_str).collect();
-                    let hash = (crate::session_env::setting("enable_hashjoin").as_deref()
-                        != Some("off"))
-                    .then(|| {
+                    // The equalities between the sides: a hash join's keys,
+                    // or — with hash joins turned off — a merge join's,
+                    // which orders the sides by them instead.
+                    let join_plan = |setting: &str| -> Option<crate::joins::JoinPlan> {
+                        if crate::session_env::setting(setting).as_deref() == Some("off") {
+                            return None;
+                        }
                         // A `USING` join's named columns are equalities too.
                         let condition = match (&join.condition, join.using_columns.is_empty()) {
                             (Some(condition), _) => Some(condition.clone()),
@@ -1097,11 +1101,17 @@ impl MemExecutor {
                             (None, true) => None,
                         };
                         crate::joins::hash_plan(condition.as_ref(), &left_refs, &right_refs)
-                    })
-                    .flatten();
+                    };
+                    let hash = join_plan("enable_hashjoin");
+                    let merge = if hash.is_none() {
+                        join_plan("enable_mergejoin")
+                    } else {
+                        None
+                    };
                     // A nested loop's inner side reads an index by the
                     // join's equality when one names its leading column.
                     let inner_index = if hash.is_none()
+                        && merge.is_none()
                         && join.semi_subquery.is_none()
                         && join.lateral.is_none()
                         && join.table_fn.is_none()
@@ -1220,54 +1230,60 @@ impl MemExecutor {
                     // A right join prints as the swapped left join: its
                     // condition names the probe side first, as scanned.
                     let swapped_join = matches!(join.join_type, JoinType::RightOuter);
-                    let (hashed_condition, condition) = match (&hash, &join.condition) {
-                        (Some(plan), _) => {
-                            let mut text = plan
-                                .hash_pairs
-                                .iter()
-                                .map(|(left, right)| {
-                                    if swapped_join {
-                                        format!(
-                                            "({} = {})",
-                                            hash_key_text(right, true),
-                                            hash_key_text(left, true)
-                                        )
-                                    } else {
-                                        format!(
-                                            "({} = {})",
-                                            hash_key_text(left, true),
-                                            hash_key_text(right, true)
-                                        )
-                                    }
-                                })
-                                .collect::<Vec<_>>()
-                                .join(" AND ");
-                            if plan.hash_pairs.len() > 1 {
-                                text = format!("({text})");
-                            }
-                            (true, Some(text))
-                        }
-                        (None, Some(c)) => (false, Some(deparse_filter(c, true))),
-                        (None, None) if !join.using_columns.is_empty() => (
-                            false,
-                            Some(format!(
-                                "({})",
-                                join.using_columns
+                    let (hashed_condition, condition) =
+                        match (hash.as_ref().or(merge.as_ref()), &join.condition) {
+                            (Some(plan), _) => {
+                                let mut text = plan
+                                    .hash_pairs
                                     .iter()
-                                    .map(|c| format!(
-                                        "{}.{c} = {}.{c}",
-                                        relation_name(&node.label_relation()),
-                                        relation_name(
-                                            join.table_alias.as_deref().unwrap_or(&join.table_name)
-                                        )
-                                    ))
+                                    .map(|(left, right)| {
+                                        if swapped_join {
+                                            format!(
+                                                "({} = {})",
+                                                hash_key_text(right, true),
+                                                hash_key_text(left, true)
+                                            )
+                                        } else {
+                                            format!(
+                                                "({} = {})",
+                                                hash_key_text(left, true),
+                                                hash_key_text(right, true)
+                                            )
+                                        }
+                                    })
                                     .collect::<Vec<_>>()
-                                    .join(" AND ")
-                            )),
-                        ),
-                        (None, None) => (false, None),
-                    };
-                    let pair_filter = hash.as_ref().and_then(|plan| plan.join_filter());
+                                    .join(" AND ");
+                                if plan.hash_pairs.len() > 1 {
+                                    text = format!("({text})");
+                                }
+                                (true, Some(text))
+                            }
+                            (None, Some(c)) => (false, Some(deparse_filter(c, true))),
+                            (None, None) if !join.using_columns.is_empty() => (
+                                false,
+                                Some(format!(
+                                    "({})",
+                                    join.using_columns
+                                        .iter()
+                                        .map(|c| format!(
+                                            "{}.{c} = {}.{c}",
+                                            relation_name(&node.label_relation()),
+                                            relation_name(
+                                                join.table_alias
+                                                    .as_deref()
+                                                    .unwrap_or(&join.table_name)
+                                            )
+                                        ))
+                                        .collect::<Vec<_>>()
+                                        .join(" AND ")
+                                )),
+                            ),
+                            (None, None) => (false, None),
+                        };
+                    let pair_filter = hash
+                        .as_ref()
+                        .or(merge.as_ref())
+                        .and_then(|plan| plan.join_filter());
                     // With an inner index read, the equality is the index
                     // condition; each side's own conditions sit on its
                     // scan, as PostgreSQL plans them.
@@ -1308,6 +1324,7 @@ impl MemExecutor {
                     let materialized = !swapped
                         && crate::session_env::setting("enable_material").as_deref() != Some("off")
                         && hash.is_none()
+                        && merge.is_none()
                         && !matches!(second.kind.as_str(), "Index Scan" | "Index Only Scan");
                     // An inner unique on the join keys matches at most one
                     // row, so the semi join is a plain inner join —
@@ -1318,20 +1335,42 @@ impl MemExecutor {
                                 self.inner_unique_on_keys(inner, &hash.hash_pairs)
                             })
                         });
-                    let (label_kind, label) = match (&hash, &join.join_type) {
-                        (Some(_), JoinType::LeftOuter | JoinType::RightOuter) => {
+                    // The method's own name for the join kind: PostgreSQL's
+                    // `Merge Left Join` beside its `Hash Left Join`.
+                    let method = if hash.is_some() {
+                        "Hash"
+                    } else if merge.is_some() {
+                        "Merge"
+                    } else {
+                        ""
+                    };
+                    let (label_kind, label) = match (&hash, &merge, &join.join_type) {
+                        (Some(_), _, JoinType::LeftOuter | JoinType::RightOuter) => {
                             ("Left", "Hash Left Join".to_string())
                         }
-                        (Some(_), JoinType::FullOuter) => ("Full", "Hash Full Join".to_string()),
-                        (Some(_), JoinType::Semi) if witness => ("Inner", "Hash Join".to_string()),
-                        (Some(_), JoinType::Semi) => ("Semi", "Hash Semi Join".to_string()),
-                        (Some(_), JoinType::Anti) => ("Anti", "Hash Anti Join".to_string()),
-                        (Some(_), _) => ("Inner", "Hash Join".to_string()),
-                        (None, _) => (kind, format!("Nested Loop{suffix}")),
+                        (Some(_), _, JoinType::FullOuter) => ("Full", "Hash Full Join".to_string()),
+                        (Some(_), _, JoinType::Semi) if witness => {
+                            ("Inner", "Hash Join".to_string())
+                        }
+                        (Some(_), _, JoinType::Semi) => ("Semi", "Hash Semi Join".to_string()),
+                        (Some(_), _, JoinType::Anti) => ("Anti", "Hash Anti Join".to_string()),
+                        (Some(_), _, _) => ("Inner", "Hash Join".to_string()),
+                        (None, Some(_), JoinType::LeftOuter | JoinType::RightOuter) => {
+                            ("Left", "Merge Left Join".to_string())
+                        }
+                        (None, Some(_), JoinType::FullOuter) => {
+                            ("Full", "Merge Full Join".to_string())
+                        }
+                        (None, Some(_), JoinType::Semi) => ("Semi", "Merge Semi Join".to_string()),
+                        (None, Some(_), JoinType::Anti) => ("Anti", "Merge Anti Join".to_string()),
+                        (None, Some(_), _) => ("Inner", "Merge Join".to_string()),
+                        (None, None, _) => (kind, format!("Nested Loop{suffix}")),
                     };
                     let mut joined = Node::new(
                         if hash.is_some() {
                             "Hash Join"
+                        } else if merge.is_some() {
+                            "Merge Join"
                         } else {
                             "Nested Loop"
                         },
@@ -1348,16 +1387,17 @@ impl MemExecutor {
                     joined.total = total + rows * CPU_TUPLE;
                     // A nested loop chosen with the method disabled says so.
                     if hash.is_none()
+                        && merge.is_none()
                         && crate::session_env::setting("enable_nestloop").as_deref() == Some("off")
                     {
                         joined = joined.detail("Disabled", "true".to_string());
                     }
                     if let Some(condition) = condition {
                         joined = joined.detail(
-                            if hashed_condition {
-                                "Hash Cond"
-                            } else {
-                                "Join Filter"
+                            match (&hash, &merge) {
+                                (Some(_), _) => "Hash Cond",
+                                (None, Some(_)) => "Merge Cond",
+                                (None, None) => "Join Filter",
                             },
                             condition,
                         );
@@ -1365,31 +1405,64 @@ impl MemExecutor {
                     if let Some(filter) = &pair_filter {
                         joined = joined.detail("Join Filter", deparse_filter(filter, true));
                     }
-                    let (first, second) = match &hash {
-                        Some(plan) => (
+                    let (first, second) = match (&hash, &merge) {
+                        (Some(plan), _) | (None, Some(plan)) => (
                             with_side_filter(first, plan.left_filter().as_ref()),
                             with_side_filter(second, plan.right_filter().as_ref()),
                         ),
-                        None if inner_index.is_some() => (
+                        (None, None) if inner_index.is_some() => (
                             with_side_filter(first, outer_only.as_ref()),
                             with_side_filter(second, inner_only.as_ref()),
                         ),
-                        None => (first, second),
+                        _ => (first, second),
                     };
-                    let mut children = vec![first];
-                    match &hash {
-                        Some(_) => {
+                    let mut children = Vec::new();
+                    match (&hash, &merge) {
+                        (Some(_), _) => {
+                            children.push(first);
                             let mut hashed = Node::over("Hash", "Hash", vec![second]);
                             hashed.total = 0.0;
                             children.push(hashed);
                         }
-                        None if materialized => {
+                        (None, Some(plan)) => {
+                            // Each side is ordered by its own join keys.
+                            let left_keys = plan
+                                .hash_pairs
+                                .iter()
+                                .map(|(left, _)| hash_key_text(left, true))
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            let right_keys = plan
+                                .hash_pairs
+                                .iter()
+                                .map(|(_, right)| hash_key_text(right, true))
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            let (outer_keys, inner_keys) = if swapped {
+                                (right_keys, left_keys)
+                            } else {
+                                (left_keys, right_keys)
+                            };
+                            for (child, keys) in [(first, outer_keys), (second, inner_keys)] {
+                                let n = child.rows.max(2.0);
+                                let mut sorted = Node::over("Sort", "Sort", vec![child])
+                                    .keys("Sort Key", vec![keys]);
+                                sorted.startup = sorted.total + n * n.log2() * 2.0 * CPU_OPERATOR;
+                                sorted.total = sorted.startup + n * CPU_TUPLE;
+                                children.push(sorted);
+                            }
+                        }
+                        (None, None) if materialized => {
+                            children.push(first);
                             let mut materialize =
                                 Node::over("Materialize", "Materialize", vec![second]);
                             materialize.total = 0.0;
                             children.push(materialize);
                         }
-                        None => children.push(second),
+                        (None, None) => {
+                            children.push(first);
+                            children.push(second);
+                        }
                     }
                     joined.children = children;
                     node = joined;

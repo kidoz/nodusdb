@@ -143,18 +143,20 @@ Nested Loop
 statement ok
 reset enable_nestloop;
 
-# With hash joins off PostgreSQL plans a merge join; NodusDB has no
-# merge join and falls back to a nested loop.
+# With hash joins off, the equalities merge instead.
 statement ok
 set enable_hashjoin = off;
 
 query T
 explain (costs off) select * from hj1 join hj2 on hj1.a = hj2.a;
 ----
-Nested Loop
-  Join Filter: (hj1.a = hj2.a)
-  ->  Seq Scan on hj1
-  ->  Materialize
+Merge Join
+  Merge Cond: (hj1.a = hj2.a)
+  ->  Sort
+        Sort Key: hj1.a
+        ->  Seq Scan on hj1
+  ->  Sort
+        Sort Key: hj2.a
         ->  Seq Scan on hj2
 
 
