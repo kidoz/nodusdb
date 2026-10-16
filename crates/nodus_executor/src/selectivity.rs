@@ -429,22 +429,7 @@ impl<'a> Estimates<'a> {
 
     /// A column's most common values and their frequencies.
     fn mcv(&self, stats: &ColumnStatistics) -> Vec<(Value, f32)> {
-        let Some(slot) = stats.slots.iter().find(|slot| slot.kind == 1) else {
-            return Vec::new();
-        };
-        let (Some(values), Some(numbers)) = (&slot.values, &slot.numbers) else {
-            return Vec::new();
-        };
-        values
-            .iter()
-            .zip(numbers)
-            .map(|(text, frequency)| {
-                (
-                    serde_json::from_str(text).unwrap_or(Value::Null),
-                    *frequency,
-                )
-            })
-            .collect()
+        mcv_of(stats)
     }
 
     /// A column's histogram bounds.
@@ -800,6 +785,235 @@ fn numeric(value: Value, data_type: &str) -> Option<f64> {
         },
         _ => None,
     }
+}
+
+// --- join selectivity (PostgreSQL's `eqjoinsel` and friends) ----------------
+
+/// One side of a join key: the statistics recorded for the column, the
+/// relation's estimated rows, its raw tuple count, and whether a unique
+/// index proves it distinct — `eqjoinsel`'s inputs.
+pub(crate) struct JoinSide<'a> {
+    pub(crate) stats: Option<&'a ColumnStatistics>,
+    /// The column's declared type, for the boolean special case.
+    pub(crate) data_type: Option<&'a str>,
+    /// The relation's estimated rows (filtered).
+    pub(crate) rows: f64,
+    /// The relation's raw `reltuples`.
+    pub(crate) tuples: f64,
+    /// A unique index (or key) covers the column alone.
+    pub(crate) unique: bool,
+}
+
+impl JoinSide<'_> {
+    fn null_frac(&self) -> f64 {
+        self.stats.map_or(0.0, |stats| stats.null_frac as f64)
+    }
+
+    fn mcv(&self) -> Vec<(Value, f32)> {
+        self.stats.map(mcv_of).unwrap_or_default()
+    }
+
+    /// `get_variable_numdistinct`: the column's distinct count and whether
+    /// it is a default guess.
+    fn num_distinct(&self) -> (f64, bool) {
+        let null_frac = self.null_frac();
+        let mut distinct = match self.stats {
+            Some(stats) => stats.n_distinct as f64,
+            // Two distinct values, presumably, for a boolean.
+            None if self.data_type.is_some_and(|t| {
+                t.trim().eq_ignore_ascii_case("boolean") || t.trim().eq_ignore_ascii_case("bool")
+            }) =>
+            {
+                2.0
+            }
+            None => 0.0,
+        };
+        if self.unique {
+            distinct = -1.0 * (1.0 - null_frac);
+        }
+        if distinct > 0.0 {
+            return (clamp_rows(distinct), false);
+        }
+        if self.tuples <= 0.0 {
+            return (DEFAULT_NUM_DISTINCT, true);
+        }
+        if distinct < 0.0 {
+            return (clamp_rows(-distinct * self.tuples), false);
+        }
+        // No data: assume the table's own size for a small one.
+        if self.tuples < DEFAULT_NUM_DISTINCT {
+            (clamp_rows(self.tuples), false)
+        } else {
+            (DEFAULT_NUM_DISTINCT, true)
+        }
+    }
+}
+
+/// `clamp_row_est`: a positive whole number of rows, at least one.
+fn clamp_rows(rows: f64) -> f64 {
+    if rows > 1.0 { rows.round() } else { 1.0 }
+}
+
+/// A column's most common values and their frequencies.
+fn mcv_of(stats: &ColumnStatistics) -> Vec<(Value, f32)> {
+    let Some(slot) = stats.slots.iter().find(|slot| slot.kind == 1) else {
+        return Vec::new();
+    };
+    let (Some(values), Some(numbers)) = (&slot.values, &slot.numbers) else {
+        return Vec::new();
+    };
+    values
+        .iter()
+        .zip(numbers)
+        .map(|(text, frequency)| {
+            (
+                serde_json::from_str(text).unwrap_or(Value::Null),
+                *frequency,
+            )
+        })
+        .collect()
+}
+
+/// `eqjoinsel_inner`: the equalities the two sides' most common values share,
+/// and the rest of the distributions' — the smaller estimate of the two points
+/// of view.
+pub(crate) fn eq_join_selectivity(left: &JoinSide, right: &JoinSide) -> f64 {
+    let (nd1, _) = left.num_distinct();
+    let (nd2, _) = right.num_distinct();
+    let null_frac1 = left.null_frac();
+    let null_frac2 = right.null_frac();
+    let mcv1 = left.mcv();
+    let mcv2 = right.mcv();
+    if mcv1.is_empty() || mcv2.is_empty() {
+        let mut selec = (1.0 - null_frac1) * (1.0 - null_frac2);
+        selec /= if nd1 > nd2 { nd1 } else { nd2 };
+        return selec.clamp(0.0, 1.0);
+    }
+    // Which of each list's values find a partner in the other's.
+    let mut matched1 = vec![false; mcv1.len()];
+    let mut matched2 = vec![false; mcv2.len()];
+    let mut match_freq = 0.0f64;
+    let mut matches = 0usize;
+    for (i, (value, frequency)) in mcv1.iter().enumerate() {
+        for (j, (other, other_frequency)) in mcv2.iter().enumerate() {
+            if matched2[j] {
+                continue;
+            }
+            if crate::value::compare(value, other) == std::cmp::Ordering::Equal {
+                matched1[i] = true;
+                matched2[j] = true;
+                match_freq += *frequency as f64 * *other_frequency as f64;
+                matches += 1;
+                break;
+            }
+        }
+    }
+    match_freq = match_freq.clamp(0.0, 1.0);
+    let sum = |freqs: &[(Value, f32)], matched: &[bool], wanted: bool| -> f64 {
+        freqs
+            .iter()
+            .zip(matched)
+            .filter(|(_, flag)| **flag == wanted)
+            .map(|((_, frequency), _)| *frequency as f64)
+            .sum::<f64>()
+            .clamp(0.0, 1.0)
+    };
+    let match_freq1 = sum(&mcv1, &matched1, true);
+    let unmatch_freq1 = sum(&mcv1, &matched1, false);
+    let match_freq2 = sum(&mcv2, &matched2, true);
+    let unmatch_freq2 = sum(&mcv2, &matched2, false);
+    // The non-null values outside the lists.
+    let other_freq1 = (1.0 - null_frac1 - match_freq1 - unmatch_freq1).clamp(0.0, 1.0);
+    let other_freq2 = (1.0 - null_frac2 - match_freq2 - unmatch_freq2).clamp(0.0, 1.0);
+    // The matched pairs, the lists' unpartnered values against the others'
+    // remaining population — from each point of view.
+    let mut total1 = match_freq;
+    if nd2 > mcv2.len() as f64 {
+        total1 += unmatch_freq1 * other_freq2 / (nd2 - mcv2.len() as f64);
+    }
+    if nd2 > matches as f64 {
+        total1 += other_freq1 * (other_freq2 + unmatch_freq2) / (nd2 - matches as f64);
+    }
+    let mut total2 = match_freq;
+    if nd1 > mcv1.len() as f64 {
+        total2 += unmatch_freq2 * other_freq1 / (nd1 - mcv1.len() as f64);
+    }
+    if nd1 > matches as f64 {
+        total2 += other_freq2 * (other_freq1 + unmatch_freq1) / (nd1 - matches as f64);
+    }
+    if total1 < total2 { total1 } else { total2 }
+}
+
+/// `eqjoinsel` for a semi or anti join: the fraction of the outer rows that
+/// have a partner.
+pub(crate) fn semi_join_selectivity(outer: &JoinSide, inner: &JoinSide) -> f64 {
+    let null_frac = outer.null_frac();
+    let (mut nd1, isdefault1) = outer.num_distinct();
+    let (mut nd2, mut isdefault2) = inner.num_distinct();
+    // There can't be more distinct inner values than inner rows.
+    if nd2 >= inner.rows {
+        nd2 = inner.rows;
+        isdefault2 = false;
+    }
+    let mcv1 = outer.mcv();
+    let mcv2 = inner.mcv();
+    if mcv1.is_empty() || mcv2.is_empty() {
+        return if !isdefault1 && !isdefault2 {
+            if nd1 <= nd2 || nd2 < 0.0 {
+                1.0 - null_frac
+            } else {
+                (nd2 / nd1) * (1.0 - null_frac)
+            }
+        } else {
+            0.5 * (1.0 - null_frac)
+        }
+        .clamp(0.0, 1.0);
+    }
+    // The outer values that certainly have a partner.
+    let mut matched2 = vec![false; mcv2.len()];
+    let mut match_freq1 = 0.0f64;
+    let mut matches = 0usize;
+    for (value, frequency) in &mcv1 {
+        for (j, (other, _)) in mcv2.iter().enumerate() {
+            if matched2[j] {
+                continue;
+            }
+            if crate::value::compare(value, other) == std::cmp::Ordering::Equal {
+                matched2[j] = true;
+                match_freq1 += *frequency as f64;
+                matches += 1;
+                break;
+            }
+        }
+    }
+    match_freq1 = match_freq1.clamp(0.0, 1.0);
+    // The rest: every outer value has a partner when the inner is the
+    // narrower side, else only the fraction its distinct count allows.
+    let uncertain_frac = if !isdefault1 && !isdefault2 {
+        nd1 -= matches as f64;
+        nd2 -= matches as f64;
+        if nd1 <= nd2 || nd2 < 0.0 {
+            1.0
+        } else {
+            nd2 / nd1
+        }
+    } else {
+        0.5
+    };
+    let uncertain = (1.0 - match_freq1 - null_frac).clamp(0.0, 1.0);
+    (match_freq1 + uncertain_frac * uncertain).clamp(0.0, 1.0)
+}
+
+/// `ineqjoinsel`: a bound between two columns keeps a third, without
+/// statistics to say otherwise.
+pub(crate) fn ineq_join_selectivity() -> f64 {
+    DEFAULT_INEQ_SEL
+}
+
+/// `neqjoinsel` for a semi or anti join: every non-null outer row has a
+/// partner to differ from.
+pub(crate) fn neq_semi_join_selectivity(outer: &JoinSide) -> f64 {
+    (1.0 - outer.null_frac()).clamp(0.0, 1.0)
 }
 
 #[cfg(test)]
