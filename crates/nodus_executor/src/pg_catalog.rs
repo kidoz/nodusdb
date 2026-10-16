@@ -814,6 +814,37 @@ impl MemExecutor {
                     rows,
                 ))
             }
+            // The server's own statistics: PostgreSQL 17+'s views over the
+            // counters this engine keeps and the shapes it does not.
+            "pg_stat_database"
+            | "pg_stat_bgwriter"
+            | "pg_stat_checkpointer"
+            | "pg_stat_wal"
+            | "pg_stat_archiver"
+            | "pg_stat_slru"
+            | "pg_stat_io"
+            | "pg_stat_replication"
+            | "pg_stat_subscription"
+            | "pg_stat_user_functions"
+            | "pg_stat_sys_functions"
+            | "pg_stat_all_functions"
+            | "pg_stat_progress_vacuum"
+            | "pg_stat_progress_analyze"
+            | "pg_stat_progress_create_index"
+            | "pg_stat_progress_basebackup"
+            | "pg_stat_progress_cluster"
+            | "pg_stat_progress_copy"
+            | "pg_statio_user_tables"
+            | "pg_statio_sys_tables"
+            | "pg_statio_all_tables"
+            | "pg_statio_user_indexes"
+            | "pg_statio_sys_indexes"
+            | "pg_statio_all_indexes"
+            | "pg_statio_user_sequences"
+            | "pg_statio_sys_sequences"
+            | "pg_statio_all_sequences" => {
+                Self::server_statistics_view(self, db_name, &tables, &schemas, &table)
+            }
             // Activity counters: NodusDB keeps none, so they read as a table
             // no one has touched since statistics were reset.
             "pg_stat_user_tables" | "pg_stat_all_tables" => {
