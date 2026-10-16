@@ -568,6 +568,7 @@ impl MemExecutor {
                 tracing::warn!(?txn_id, %error, "failed to release intents after a storage commit failure");
             }
         })?;
+        self.stats.committed();
         Ok(())
     }
 
@@ -576,6 +577,7 @@ impl MemExecutor {
             self.notice(ctx, warning("there is no transaction in progress", "25P01"));
             return Ok(QueryOutput::tag("ROLLBACK"));
         };
+        self.stats.rolled_back();
         // Settings changed in the transaction go back.
         self.restore_settings(ctx, txn.settings_before.clone());
         self.advisory.end_transaction(&ctx.session_id);

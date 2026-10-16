@@ -548,15 +548,17 @@ impl MemExecutor {
     fn note_activity(&self, ctx: &ExecutionContext, active: bool) {
         let now = session_env::wall_micros();
         let mut activity = self.activity.write();
-        let entry = activity
-            .entry(ctx.session_id.clone())
-            .or_insert_with(|| SessionActivity {
+        let entry = activity.entry(ctx.session_id.clone()).or_insert_with(|| {
+            // A session's first statement is its connection.
+            self.stats.session_started();
+            SessionActivity {
                 principal: ctx.principal_id,
                 backend_start: now,
                 query_start: now,
                 state_change: now,
                 active,
-            });
+            }
+        });
         entry.principal = ctx.principal_id;
         if active {
             entry.query_start = now;
@@ -2286,7 +2288,9 @@ impl Executor for MemExecutor {
         self.discard_session_state(session_id);
         crate::random::forget(session_id);
         self.notifications.lock().remove(session_id);
-        self.activity.write().remove(session_id);
+        if self.activity.write().remove(session_id).is_some() {
+            self.stats.session_ended();
+        }
         self.notices.lock().remove(session_id);
         self.sequences.end_session(session_id);
         self.end_transaction_large_objects(session_id);

@@ -8,6 +8,7 @@ use nodus_catalog::{IndexId, TableId};
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 
 /// A table's cumulative counters and last-run times.
 #[derive(Debug, Clone, Default)]
@@ -45,12 +46,24 @@ pub(crate) struct IndexStats {
     pub(crate) idx_tup_fetch: i64,
 }
 
+/// The server's own counters (`pg_stat_database`'s transaction and session
+/// numbers). This engine resolves unqualified names into one database, so
+/// they are kept server-wide and reported on each database's row.
+#[derive(Debug, Default)]
+pub(crate) struct ServerCounters {
+    xact_commit: AtomicI64,
+    xact_rollback: AtomicI64,
+    sessions: AtomicI64,
+    live_sessions: AtomicI64,
+}
+
 /// Every relation's statistics (`pg_stat_user_tables`,
-/// `pg_stat_user_indexes`).
+/// `pg_stat_user_indexes`) and the server's counters.
 #[derive(Debug, Default)]
 pub(crate) struct Stats {
     tables: RwLock<HashMap<TableId, TableStats>>,
     indexes: RwLock<HashMap<IndexId, IndexStats>>,
+    server: ServerCounters,
 }
 
 impl Stats {
@@ -67,6 +80,42 @@ impl Stats {
     pub(crate) fn update_table(&self, table: TableId, change: impl FnOnce(&mut TableStats)) {
         let mut guard = self.tables.write();
         change(guard.entry(table).or_default());
+    }
+
+    /// A transaction committed.
+    pub(crate) fn committed(&self) {
+        self.server.xact_commit.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A transaction rolled back.
+    pub(crate) fn rolled_back(&self) {
+        self.server.xact_rollback.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A session connected.
+    pub(crate) fn session_started(&self) {
+        self.server.sessions.fetch_add(1, Ordering::Relaxed);
+        self.server.live_sessions.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A session disconnected.
+    pub(crate) fn session_ended(&self) {
+        self.server.live_sessions.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// The sessions connected now.
+    pub(crate) fn live_sessions(&self) -> i64 {
+        self.server.live_sessions.load(Ordering::Relaxed)
+    }
+
+    /// The transactions committed, the ones rolled back, and the sessions
+    /// that have connected.
+    pub(crate) fn server_counters(&self) -> (i64, i64, i64) {
+        (
+            self.server.xact_commit.load(Ordering::Relaxed),
+            self.server.xact_rollback.load(Ordering::Relaxed),
+            self.server.sessions.load(Ordering::Relaxed),
+        )
     }
 
     /// Reads the index's statistics.
