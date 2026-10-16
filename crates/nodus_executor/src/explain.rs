@@ -895,6 +895,13 @@ impl MemExecutor {
                 // which decide whose column references are whose.
                 let mut joined_prefixes: Vec<String> =
                     vec![relation_name(table_alias.as_deref().unwrap_or(table_name))];
+                // Each side's relation, for the join estimates: the
+                // statistics of the columns a join key names.
+                let mut join_relations: Vec<(String, Option<nodus_catalog::TableDescriptor>)> =
+                    vec![(
+                        joined_prefixes[0].clone(),
+                        Self::join_relation(self, table_name),
+                    )];
                 // A `WHERE` conjunct one relation decides is shown at that
                 // relation's scan, as PostgreSQL plans it; a null-rejecting
                 // one on an outer join's null side first turns it into an
@@ -1000,7 +1007,12 @@ impl MemExecutor {
                 let allow_index_only = single && distinct_on.is_empty() && sample.is_none();
                 // A side's own conditions go on its scan, as PostgreSQL
                 // pushes them.
-                let with_side_filter = |mut child: Node, filter: Option<&FilterExpr>| {
+                let with_side_filter = |mut child: Node,
+                                        filter: Option<&FilterExpr>,
+                                        relations: &[(
+                    String,
+                    Option<nodus_catalog::TableDescriptor>,
+                )]| {
                     let Some(filter) = filter else {
                         return child;
                     };
@@ -1016,6 +1028,11 @@ impl MemExecutor {
                         }
                         None => child = child.detail("Filter", text),
                     }
+                    // The side's own condition keeps its rows back here,
+                    // as PostgreSQL estimates it.
+                    child.rows = (child.rows * self.side_filter_selectivity(relations, filter))
+                        .max(1.0)
+                        .round();
                     child
                 };
                 // An `ORDER BY` — or the innermost window's ordering — on an
@@ -1066,7 +1083,7 @@ impl MemExecutor {
                 )?;
                 // The head relation's own `WHERE` conjuncts sit on its scan.
                 if !single && let Some(head_filter) = &pushed.inputs[0] {
-                    node = with_side_filter(node, Some(head_filter));
+                    node = with_side_filter(node, Some(head_filter), &join_relations);
                 }
                 for (join_index, join) in joins.iter().enumerate() {
                     // The equalities between the sides hash (a `Hash Join`),
@@ -1083,6 +1100,20 @@ impl MemExecutor {
                     };
                     let left_refs: Vec<&str> = left_prefixes.iter().map(String::as_str).collect();
                     let right_refs: Vec<&str> = right_prefixes.iter().map(String::as_str).collect();
+                    // Each side's relation, for the join estimates and the
+                    // sides' own filter selectivities.
+                    let right_relation = match &join.semi_subquery {
+                        // The subquery's own relation, when it reads one.
+                        Some(sub) => match sub.as_ref() {
+                            crate::plan_types::LogicalPlan::Select {
+                                table_name, joins, ..
+                            } if joins.is_empty() => Self::join_relation(self, table_name),
+                            _ => None,
+                        },
+                        None => Self::join_relation(self, &join.table_name),
+                    };
+                    let mut sides = join_relations.clone();
+                    sides.push((right_prefixes[0].clone(), right_relation.clone()));
                     // The equalities between the sides: a hash join's keys,
                     // or — with hash joins turned off — a merge join's,
                     // which orders the sides by them instead.
@@ -1213,12 +1244,104 @@ impl MemExecutor {
                         JoinType::Inner | JoinType::Cross => ("", "Inner"),
                     };
 
-                    let rows = match (&join.join_type, &join.condition) {
-                        (JoinType::Cross, _) | (_, None) if join.using_columns.is_empty() => {
-                            node.rows * right.rows
-                        }
-                        _ => node.rows.max(right.rows),
+                    // The join's own selectivity, from the sides' recorded
+                    // statistics: the equalities through `eqjoinsel` (a
+                    // semi join's through its semi variant), a foreign key
+                    // as one over the referenced relation's size — and the
+                    // rest of the condition as PostgreSQL's defaults.
+                    let swapped_rows = matches!(join.join_type, JoinType::RightOuter);
+                    let (outer_rows, inner_rows) = if swapped_rows {
+                        (right.rows, node.rows)
+                    } else {
+                        (node.rows, right.rows)
                     };
+                    let semi = matches!(join.join_type, JoinType::Semi | JoinType::Anti);
+                    let mut jselec = 1.0f64;
+                    let mut fkselec = 1.0f64;
+                    let mut keyed = false;
+                    if let Some(plan) = hash.as_ref().or(merge.as_ref()) {
+                        // A foreign key between the sides replaces their own
+                        // equality estimates.
+                        let fk = if semi {
+                            None
+                        } else {
+                            join_foreign_key(&sides, &plan.hash_pairs)
+                        };
+                        if let Some(fk) = fk {
+                            fkselec = fk;
+                            keyed = true;
+                        }
+                        for (left_key, right_key) in &plan.hash_pairs {
+                            let (
+                                crate::joins::HashKey::Column(left_key),
+                                crate::joins::HashKey::Column(right_key),
+                            ) = (left_key, right_key)
+                            else {
+                                continue;
+                            };
+                            if keyed {
+                                continue;
+                            }
+                            let clause = FilterExpr::Predicate(Predicate {
+                                left: left_key.clone(),
+                                op: CompareOp::Eq,
+                                right: Operand::Ident(right_key.clone()),
+                            });
+                            jselec *= join_clause_selectivity(
+                                &sides, &clause, outer_rows, inner_rows, semi,
+                            );
+                        }
+                        // The condition's remaining clauses.
+                        if let Some(filter) = plan.join_filter() {
+                            for clause in crate::index_keys::conjuncts(&filter) {
+                                jselec *= join_clause_selectivity(
+                                    &sides, clause, outer_rows, inner_rows, semi,
+                                );
+                            }
+                        }
+                    } else if let Some(condition) = join.condition.as_ref() {
+                        // No hashed or merged keys: the condition's own
+                        // clauses still estimate.
+                        for clause in crate::index_keys::conjuncts(condition) {
+                            jselec *= join_clause_selectivity(
+                                &sides, clause, outer_rows, inner_rows, semi,
+                            );
+                        }
+                    }
+                    // The sides' own conditions keep their rows back before
+                    // the join multiplies them, as PostgreSQL estimates.
+                    let mut side_sel = 1.0f64;
+                    let split = hash
+                        .as_ref()
+                        .or(merge.as_ref())
+                        .map(|plan| (plan.left_filter(), plan.right_filter()))
+                        .or_else(|| {
+                            crate::joins::classify(join.condition.as_ref(), &left_refs, &right_refs)
+                                .map(|plan| (plan.left_filter(), plan.right_filter()))
+                        });
+                    if let Some((left_filter, right_filter)) = split {
+                        if let Some(filter) = left_filter {
+                            side_sel *= self.side_filter_selectivity(&sides, &filter);
+                        }
+                        if let Some(filter) = right_filter {
+                            side_sel *= self.side_filter_selectivity(&sides, &filter);
+                        }
+                    }
+                    if let Some(filter) = pushed.inputs.get(join_index + 1).and_then(Option::as_ref)
+                    {
+                        side_sel *= self.side_filter_selectivity(&sides, filter);
+                    }
+                    let joined = node.rows * right.rows * side_sel * fkselec * jselec;
+                    let rows = match join.join_type {
+                        JoinType::Cross => node.rows * right.rows,
+                        JoinType::Semi => node.rows * fkselec * jselec,
+                        JoinType::Anti => node.rows * (1.0 - fkselec * jselec),
+                        JoinType::RightOuter => joined.max(right.rows),
+                        JoinType::FullOuter => joined.max(node.rows).max(right.rows),
+                        _ => joined,
+                    }
+                    .max(1.0)
+                    .round();
                     // A semi/anti join emits the left row alone.
                     let width = match join.join_type {
                         JoinType::Semi | JoinType::Anti => node.width,
@@ -1312,7 +1435,7 @@ impl MemExecutor {
                     // The member's own `WHERE` conjuncts sit on its scan
                     // (before a right join's swap, where it is `right`).
                     let right = match pushed.inputs.get(join_index + 1).and_then(Option::as_ref) {
-                        Some(member_filter) => with_side_filter(right, Some(member_filter)),
+                        Some(member_filter) => with_side_filter(right, Some(member_filter), &sides),
                         None => right,
                     };
                     let swapped = swapped_join;
@@ -1407,12 +1530,12 @@ impl MemExecutor {
                     }
                     let (first, second) = match (&hash, &merge) {
                         (Some(plan), _) | (None, Some(plan)) => (
-                            with_side_filter(first, plan.left_filter().as_ref()),
-                            with_side_filter(second, plan.right_filter().as_ref()),
+                            with_side_filter(first, plan.left_filter().as_ref(), &sides),
+                            with_side_filter(second, plan.right_filter().as_ref(), &sides),
                         ),
                         (None, None) if inner_index.is_some() => (
-                            with_side_filter(first, outer_only.as_ref()),
-                            with_side_filter(second, inner_only.as_ref()),
+                            with_side_filter(first, outer_only.as_ref(), &sides),
+                            with_side_filter(second, inner_only.as_ref(), &sides),
                         ),
                         _ => (first, second),
                     };
@@ -1466,6 +1589,7 @@ impl MemExecutor {
                     }
                     joined.children = children;
                     node = joined;
+                    join_relations.push((right_prefixes[0].clone(), right_relation));
                     joined_prefixes.push(right_prefixes[0].clone());
                 }
                 if let (false, Some(f)) = (single, pushed.residual.as_ref()) {
@@ -3357,6 +3481,43 @@ fn values_scan(rows: usize) -> Node {
 }
 
 impl MemExecutor {
+    /// The relation a join side names, when it is a plain base table with
+    /// statistics to read.
+    fn join_relation(&self, table_name: &str) -> Option<nodus_catalog::TableDescriptor> {
+        if crate::cte_scope::lookup(table_name).is_some() {
+            return None;
+        }
+        let (db_name, schema_name, table_only) = parse_object_name(table_name).ok()?;
+        if Self::is_virtual_schema(&schema_name) {
+            return None;
+        }
+        self.catalog_reader
+            .get_table(db_name, schema_name, table_only)
+            .ok()
+    }
+
+    /// A join side's own filter's selectivity: from the relation its
+    /// columns name, when the side is known, by shape otherwise.
+    fn side_filter_selectivity(
+        &self,
+        relations: &[(String, Option<nodus_catalog::TableDescriptor>)],
+        filter: &FilterExpr,
+    ) -> f64 {
+        let mut refs = Vec::new();
+        crate::filter_eval::filter_column_refs(filter, &mut refs);
+        for name in refs {
+            let prefix = name.rsplit_once('.').map_or("", |(prefix, _)| prefix);
+            if let Some(table) = relations
+                .iter()
+                .find(|(qualifier, _)| qualifier.eq_ignore_ascii_case(prefix))
+                .and_then(|(_, table)| table.as_ref())
+            {
+                return crate::selectivity::Estimates::of(self, table).selectivity(filter);
+            }
+        }
+        selectivity(filter)
+    }
+
     /// A filter's selectivity over a relation named by the query: from the
     /// relation's own statistics when it has them, by shape otherwise.
     fn relation_selectivity(&self, table_name: &str, filter: &FilterExpr) -> f64 {
@@ -3371,6 +3532,192 @@ impl MemExecutor {
             Err(_) => selectivity(filter),
         }
     }
+}
+
+/// One side of a join key, from the side relation's recorded statistics.
+fn join_side<'a>(
+    relations: &'a [(String, Option<nodus_catalog::TableDescriptor>)],
+    name: &str,
+    rows: f64,
+) -> crate::selectivity::JoinSide<'a> {
+    let (prefix, column) = name.rsplit_once('.').unwrap_or(("", name));
+    let table = relations
+        .iter()
+        .find(|(qualifier, _)| qualifier.eq_ignore_ascii_case(prefix))
+        .and_then(|(_, table)| table.as_ref());
+    let found = table.and_then(|table| {
+        let column = table
+            .columns
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(column))?;
+        Some((table, column))
+    });
+    let stats = found.and_then(|(table, column)| {
+        let attnum = table.columns.iter().position(|c| c.id == column.id)? as i32 + 1;
+        table.statistics.iter().find(|stats| stats.attnum == attnum)
+    });
+    let unique = found.is_some_and(|(table, column)| {
+        table.indexes.iter().any(|index| {
+            index.unique
+                && index.key_columns.len() == 1
+                && index.key_columns[0].column_id == column.id
+        })
+    });
+    crate::selectivity::JoinSide {
+        stats,
+        data_type: found.map(|(_, column)| column.data_type.as_str()),
+        rows,
+        tuples: table.and_then(|table| table.reltuples).unwrap_or(0.0),
+        unique,
+    }
+}
+
+/// A join clause's selectivity between two columns: the equality through
+/// `eqjoinsel` (or its semi variant), `<>` as one minus it, and a bound as
+/// PostgreSQL's default one third.
+fn join_clause_selectivity(
+    relations: &[(String, Option<nodus_catalog::TableDescriptor>)],
+    filter: &FilterExpr,
+    outer_rows: f64,
+    inner_rows: f64,
+    semi: bool,
+) -> f64 {
+    use crate::plan_types::CompareOp;
+    let FilterExpr::Predicate(Predicate { left, op, right }) = filter else {
+        return 1.0;
+    };
+    let Operand::Ident(right_name) = right else {
+        return 1.0;
+    };
+    let (outer_side, inner_side) = if semi {
+        (
+            join_side(relations, left, outer_rows),
+            join_side(relations, right_name, inner_rows),
+        )
+    } else {
+        (
+            join_side(relations, left, outer_rows),
+            join_side(relations, right_name, inner_rows),
+        )
+    };
+    match op {
+        CompareOp::Eq => {
+            if semi {
+                let inner_side = crate::selectivity::JoinSide {
+                    rows: inner_rows,
+                    ..inner_side
+                };
+                let selec = crate::selectivity::semi_join_selectivity(&outer_side, &inner_side);
+                // A semi join cannot keep more rows than the inner join
+                // that produced them.
+                let inner_join = crate::selectivity::eq_join_selectivity(&outer_side, &inner_side);
+                selec.min(inner_rows * inner_join)
+            } else {
+                crate::selectivity::eq_join_selectivity(&outer_side, &inner_side)
+            }
+        }
+        CompareOp::Ne => {
+            if semi {
+                crate::selectivity::neq_semi_join_selectivity(&outer_side)
+            } else {
+                1.0 - crate::selectivity::eq_join_selectivity(&outer_side, &inner_side)
+            }
+        }
+        _ => crate::selectivity::ineq_join_selectivity(),
+    }
+}
+
+/// The foreign key between the sides, when the join's equalities match one:
+/// each referencing row matches exactly one referenced row, so PostgreSQL
+/// estimates the pair as one over the referenced relation's size and drops
+/// the clause from the equality estimates.
+fn join_foreign_key(
+    relations: &[(String, Option<nodus_catalog::TableDescriptor>)],
+    pairs: &[(crate::joins::HashKey, crate::joins::HashKey)],
+) -> Option<f64> {
+    let mut left: Vec<(String, String)> = Vec::new();
+    let mut right: Vec<(String, String)> = Vec::new();
+    for (left_key, right_key) in pairs {
+        let (crate::joins::HashKey::Column(left_key), crate::joins::HashKey::Column(right_key)) =
+            (left_key, right_key)
+        else {
+            return None;
+        };
+        let split = |name: &str| -> (String, String) {
+            let (prefix, bare) = name.rsplit_once('.').unwrap_or(("", name));
+            (prefix.to_string(), bare.to_string())
+        };
+        left.push(split(left_key));
+        right.push(split(right_key));
+    }
+    let relation_of = |prefix: &str| -> Option<&nodus_catalog::TableDescriptor> {
+        relations
+            .iter()
+            .find(|(qualifier, _)| qualifier.eq_ignore_ascii_case(prefix))
+            .and_then(|(_, table)| table.as_ref())
+    };
+    let mut fkselec = 1.0f64;
+    let mut matched = false;
+    // Either side may be the referencing one.
+    for child_first in [true, false] {
+        let (child, parent) = if child_first {
+            (&left, &right)
+        } else {
+            (&right, &left)
+        };
+        let Some(child_table) = relation_of(&child[0].0) else {
+            continue;
+        };
+        // Each child column's partner on the other side.
+        let partner = |column: &str| -> Option<&str> {
+            child
+                .iter()
+                .find(|(_, name)| name.eq_ignore_ascii_case(column))
+                .map(|(_, _)| ())
+                .and_then(|_| {
+                    let at = child
+                        .iter()
+                        .position(|(_, name)| name.eq_ignore_ascii_case(column))?;
+                    Some(parent[at].1.as_str())
+                })
+        };
+        for constraint in &child_table.constraints {
+            let nodus_catalog::TableConstraint::ForeignKey {
+                columns,
+                foreign_table,
+                referred_columns,
+                ..
+            } = constraint
+            else {
+                continue;
+            };
+            // Every key of the constraint has to be one of the equalities,
+            // against the column the constraint refers to.
+            if columns.len() != child.len() {
+                continue;
+            }
+            let matches = columns
+                .iter()
+                .zip(referred_columns)
+                .all(|(column, referred)| {
+                    partner(column).is_some_and(|joined| joined.eq_ignore_ascii_case(referred))
+                });
+            if !matches {
+                continue;
+            }
+            // One over the referenced relation's raw size.
+            let bare = foreign_table.rsplit('.').next().unwrap_or(foreign_table);
+            if let Some(referred) = relations
+                .iter()
+                .filter_map(|(_, table)| table.as_ref())
+                .find(|table| table.name.eq_ignore_ascii_case(bare))
+            {
+                fkselec *= 1.0 / referred.reltuples.unwrap_or(0.0).max(1.0);
+                matched = true;
+            }
+        }
+    }
+    matched.then_some(fkselec)
 }
 
 /// The planner's default fraction of rows a condition keeps.
