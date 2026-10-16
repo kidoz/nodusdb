@@ -197,6 +197,25 @@ pub(crate) fn is_known(name: &str) -> bool {
                 | "PG_STAT_GET_LAST_VACUUM_TIME" | "PG_STAT_GET_LAST_AUTOVACUUM_TIME"
                 | "PG_STAT_GET_LAST_ANALYZE_TIME" | "PG_STAT_GET_LAST_AUTOANALYZE_TIME"
                 | "PG_STAT_GET_BLOCKS_FETCHED" | "PG_STAT_GET_BLOCKS_HIT"
+                | "PG_STAT_GET_DB_NUMBACKENDS" | "PG_STAT_GET_DB_XACT_COMMIT"
+                | "PG_STAT_GET_DB_XACT_ROLLBACK" | "PG_STAT_GET_DB_BLOCKS_FETCHED"
+                | "PG_STAT_GET_DB_BLOCKS_HIT" | "PG_STAT_GET_DB_TUPLES_RETURNED"
+                | "PG_STAT_GET_DB_TUPLES_FETCHED" | "PG_STAT_GET_DB_TUPLES_INSERTED"
+                | "PG_STAT_GET_DB_TUPLES_UPDATED" | "PG_STAT_GET_DB_TUPLES_DELETED"
+                | "PG_STAT_GET_DB_CONFLICT_ALL" | "PG_STAT_GET_DB_CONFLICT_TABLESPACE"
+                | "PG_STAT_GET_DB_CONFLICT_LOCK" | "PG_STAT_GET_DB_CONFLICT_SNAPSHOT"
+                | "PG_STAT_GET_DB_CONFLICT_BUFFERPIN" | "PG_STAT_GET_DB_CONFLICT_STARTUP_DEADLOCK"
+                | "PG_STAT_GET_DB_CONFLICT_LOGICALSLOT" | "PG_STAT_GET_DB_TEMP_FILES"
+                | "PG_STAT_GET_DB_TEMP_BYTES" | "PG_STAT_GET_DB_DEADLOCKS"
+                | "PG_STAT_GET_DB_CHECKSUM_FAILURES" | "PG_STAT_GET_DB_CHECKSUM_LAST_FAILURE"
+                | "PG_STAT_GET_DB_BLK_READ_TIME" | "PG_STAT_GET_DB_BLK_WRITE_TIME"
+                | "PG_STAT_GET_DB_SESSION_TIME" | "PG_STAT_GET_DB_ACTIVE_TIME"
+                | "PG_STAT_GET_DB_IDLE_IN_TRANSACTION_TIME" | "PG_STAT_GET_DB_SESSIONS"
+                | "PG_STAT_GET_DB_SESSIONS_ABANDONED" | "PG_STAT_GET_DB_SESSIONS_FATAL"
+                | "PG_STAT_GET_DB_SESSIONS_KILLED"
+                | "PG_STAT_GET_DB_PARALLEL_WORKERS_TO_LAUNCH"
+                | "PG_STAT_GET_DB_PARALLEL_WORKERS_LAUNCHED"
+                | "PG_STAT_GET_DB_STAT_RESET_TIME"
                 | "PG_STAT_GET_SNAPSHOT_TIMESTAMP"
                 // Sequences.
                 | "NEXTVAL" | "CURRVAL" | "LASTVAL" | "SETVAL" | "PG_GET_SERIAL_SEQUENCE"
@@ -3601,6 +3620,8 @@ fn dispatch(name: &str, args: &[Value]) -> Option<Value> {
             }
             .to_string(),
         ),
+        // A database's counters, by its OID (`pg_stat_get_db_*`).
+        name if name.starts_with("PG_STAT_GET_DB_") && arity(1) => db_stat_counter(name, arg(0))?,
         // The `pg_stat_*` views' counters, by relation OID (`pg_stat_get_*`).
         name if name.starts_with("PG_STAT_GET_") && arity(1) => stat_counter(name, arg(0))?,
         // When the statistics were last read: the counters are current.
@@ -5727,6 +5748,75 @@ fn strip_nulls(json: &mut serde_json::Value, in_arrays: bool) {
         }
         _ => {}
     }
+}
+
+/// `pg_stat_get_db_*(oid)`: a database's counters, from the ones the
+/// server keeps. This engine resolves unqualified names into one
+/// database, so its transaction and session counters are the server's;
+/// the counters it does not keep read zero, and an OID that is no
+/// database of this server is NULL, as PostgreSQL reports it.
+fn db_stat_counter(name: &str, db: &Value) -> Option<Value> {
+    let oid = match db {
+        Value::Text(text) if text.trim().parse::<i64>().is_err() => {
+            return Some(raise(format!(
+                "invalid input syntax for type oid: \"{text}\""
+            )));
+        }
+        other => int(other)?,
+    };
+    session_env::with(|env| {
+        let env = env?;
+        let stats = env.stats.as_ref()?;
+        let catalog = env.catalog.as_ref()?;
+        // Only this server's database (and the shared objects' OID 0) exist;
+        // unqualified names resolve into `default`, so its counters are the
+        // server's.
+        let db_name = "default";
+        let known = [0, crate::MemExecutor::database_oid(db_name)];
+        if !known.contains(&oid) {
+            return Some(Value::Null);
+        }
+        let (commits, rollbacks, sessions) = stats.server_counters();
+        let backends = stats.live_sessions();
+        let tables = catalog.list_all_tables(db_name).unwrap_or_default();
+        let table = |table: nodus_catalog::TableId| stats.table(table);
+        Some(match name {
+            "PG_STAT_GET_DB_NUMBACKENDS" => Value::Int(backends),
+            "PG_STAT_GET_DB_XACT_COMMIT" => Value::Int(commits),
+            "PG_STAT_GET_DB_XACT_ROLLBACK" => Value::Int(rollbacks),
+            "PG_STAT_GET_DB_SESSIONS" => Value::Int(sessions),
+            "PG_STAT_GET_DB_TUPLES_RETURNED" => Value::Int(
+                tables
+                    .iter()
+                    .map(|entry| table(entry.id).seq_tup_read)
+                    .sum(),
+            ),
+            "PG_STAT_GET_DB_TUPLES_FETCHED" => Value::Int(
+                tables
+                    .iter()
+                    .map(|entry| table(entry.id).idx_tup_fetch)
+                    .sum(),
+            ),
+            "PG_STAT_GET_DB_TUPLES_INSERTED" => {
+                Value::Int(tables.iter().map(|entry| table(entry.id).n_tup_ins).sum())
+            }
+            "PG_STAT_GET_DB_TUPLES_UPDATED" => {
+                Value::Int(tables.iter().map(|entry| table(entry.id).n_tup_upd).sum())
+            }
+            "PG_STAT_GET_DB_TUPLES_DELETED" => {
+                Value::Int(tables.iter().map(|entry| table(entry.id).n_tup_del).sum())
+            }
+            "PG_STAT_GET_DB_CHECKSUM_LAST_FAILURE" | "PG_STAT_GET_DB_STAT_RESET_TIME" => {
+                Value::Null
+            }
+            "PG_STAT_GET_DB_BLK_READ_TIME"
+            | "PG_STAT_GET_DB_BLK_WRITE_TIME"
+            | "PG_STAT_GET_DB_SESSION_TIME"
+            | "PG_STAT_GET_DB_ACTIVE_TIME"
+            | "PG_STAT_GET_DB_IDLE_IN_TRANSACTION_TIME" => Value::Float(0.0),
+            _ => Value::Int(0),
+        })
+    })
 }
 
 /// `pg_stat_get_*(rel)`: one relation's statistic, from the statistics the
