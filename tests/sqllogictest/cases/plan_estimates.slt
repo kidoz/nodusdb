@@ -1,0 +1,107 @@
+# Plan estimates: what the statistics `ANALYZE` records do to a plan's
+# row counts and, through them, to the plan's shape — an equality's the
+# most-common-value frequencies, a range's the histogram, an index
+# scan's the column's own distribution, and the widths the average
+# column widths. The selectivity model is PostgreSQL 18's, transcribed
+# from `selfuncs.c` and `clausesel.c`; the numbers themselves are pinned
+# in the executor's own tests (their queries verified against PostgreSQL
+# 18.4), and the shapes they drive are here.
+#
+# Known divergences: PostgreSQL costs the index and bitmap paths and may
+# prefer a bitmap even for a narrow equality (it reads ten rows of a
+# thousand through one); NodusDB counts the index's entries and takes a
+# bitmap when they reach a fifth of the table, so the shapes agree on
+# wide and on unique lookups but not on every narrow one. The entries
+# are counted from committed rows, so a table written in the same
+# statement batch reads as empty until it commits. A table that was
+# never analyzed goes by the shape defaults and the declared types'
+# widths, where PostgreSQL estimates the row count from the file size.
+# Costs differ throughout, so only `COSTS OFF` plans are compared.
+
+statement ok
+drop table if exists pe cascade;
+
+statement ok
+create table pe (id int primary key, t text, n int, u int);
+
+statement ok
+insert into pe select g, 'v' || (g % 500), g % 3, g % 100 from generate_series(1, 5000) g;
+
+statement ok
+create index pe_n on pe (n);
+
+statement ok
+create index pe_u on pe (u);
+
+statement ok
+analyze pe;
+
+statement ok
+set enable_seqscan = off;
+
+# A unique index's equality.
+query T
+explain (costs off) select * from pe where id = 42;
+----
+Index Scan using pe_pkey on pe
+  Index Cond: (id = 42)
+
+# An equality whose entries are a third of the table reads through a
+# bitmap, as PostgreSQL's cost model chooses too.
+query T
+explain (costs off) select * from pe where n = 1;
+----
+Bitmap Heap Scan on pe
+  Recheck Cond: (n = 1)
+  ->  Bitmap Index Scan on pe_n
+        Index Cond: (n = 1)
+
+# A narrow range reads the index directly, and a wider one still within
+# a fifth of the table does too.
+query T
+explain (costs off) select * from pe where id < 100;
+----
+Index Scan using pe_pkey on pe
+  Index Cond: (id < 100)
+
+query T
+explain (costs off) select * from pe where id between 1000 and 1100;
+----
+Index Scan using pe_pkey on pe
+  Index Cond: ((id >= 1000) AND (id <= 1100))
+
+# The rows are the same through either path.
+query I
+select count(*) from pe where n = 1;
+----
+1667
+
+query I
+select count(*) from pe where id < 100;
+----
+99
+
+statement ok
+reset enable_seqscan;
+
+# An unanalyzed table has no statistics to read.
+statement ok
+drop table if exists pu cascade;
+
+statement ok
+create table pu (a int, t text);
+
+statement ok
+insert into pu select g, 'v' || g from generate_series(1, 1000) g;
+
+query T
+explain (costs off) select * from pu where t = 'v5';
+----
+Seq Scan on pu
+  Filter: (t = 'v5'::text)
+
+statement ok
+drop table pu cascade;
+
+statement ok
+drop table pe cascade;

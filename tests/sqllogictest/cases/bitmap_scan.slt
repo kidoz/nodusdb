@@ -3,9 +3,10 @@
 # the condition rechecked — a `Bitmap Heap Scan` over a `Bitmap Index
 # Scan`. Within a fifth of the table the index is read directly.
 # PostgreSQL's planner costs the choice and may prefer a bitmap even for
-# a narrow range; NodusDB has no statistics, so only a wide range
-# becomes a bitmap. Plans and results otherwise from PostgreSQL 18.4,
-# with `enable_seqscan = off`.
+# a narrow range; NodusDB counts the index's entries — a range's or an
+# equality's — and takes a bitmap when they reach a fifth of the table.
+# Plans and results otherwise from PostgreSQL 18.4, with
+# `enable_seqscan = off`.
 
 statement ok
 drop table if exists b1 cascade;

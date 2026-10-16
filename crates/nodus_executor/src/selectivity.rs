@@ -801,3 +801,90 @@ fn numeric(value: Value, data_type: &str) -> Option<f64> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The estimates `EXPLAIN` prints come from the statistics `ANALYZE`
+    /// recorded — PostgreSQL 18.4's own selectivity model, so these are its
+    /// row counts for the same data (verified against it query by query).
+    #[test]
+    fn estimates_read_the_recorded_statistics() {
+        let (sql, _) = crate::constraint_tests::session();
+        let explain = |query: &str| {
+            let out = sql(&format!("explain {query}")).unwrap();
+            crate::render(&out.rows[0].values[0])
+        };
+        sql("create table es (a int, b int, c text, big bigint, d numeric(10,2))").unwrap();
+        sql(
+            "insert into es select g % 10, g % 7, 'x' || (g % 40), g * 1000000, \
+             (g % 25)::numeric from generate_series(1, 2000) g",
+        )
+        .unwrap();
+        sql("analyze es").unwrap();
+
+        // An equality: a most common value's own frequency, an absent
+        // value's the rest of the distribution's.
+        assert!(explain("select * from es where a = 3").contains("rows=200 width=23"));
+        assert!(explain("select * from es where a = 100").contains("rows=1 width=23"));
+        assert!(explain("select * from es where c = 'x5'").contains("rows=50 width=23"));
+        // A range in the histogram.
+        assert!(explain("select * from es where c < 'x20'").contains("rows=650 width=23"));
+        assert!(explain("select * from es where big < 500000000").contains("rows=499 width=23"));
+        // Two bounds on one column merge as PostgreSQL's clausesel does.
+        assert!(explain("select * from es where d >= 12 and d < 18").contains("rows=480 width=23"));
+        assert!(explain("select * from es where a > 5 and a <= 8").contains("rows=600 width=23"));
+        // `IS NOT NULL` and the inequalities take the null fraction and the
+        // distinct estimate.
+        assert!(explain("select * from es where a is not null").contains("rows=2000 width=23"));
+        assert!(explain("select * from es where a <> 3 and b <> 2").contains("rows=1543 width=23"));
+
+        // An unanalyzed table falls back to the shape defaults and the
+        // declared types' widths.
+        sql("create table na (a int, t text)").unwrap();
+        sql("insert into na select g, 'v' || g from generate_series(1, 1000) g").unwrap();
+        assert!(explain("select * from na where t = 'v5'").contains("rows=5 width=36"));
+        sql("drop table na").unwrap();
+
+        // Functional dependencies and the multivariate MCV list.
+        sql("create table dep (zip int, city text, state text)").unwrap();
+        sql(
+            "insert into dep select g % 50, 'city' || (g % 50), 'st' || (g % 10) \
+             from generate_series(1, 500) g",
+        )
+        .unwrap();
+        sql("create statistics dep_st (dependencies, mcv) on zip, city from dep").unwrap();
+        sql("analyze dep").unwrap();
+        assert!(
+            explain("select * from dep where zip = 3 and city = 'city3'")
+                .contains("rows=10 width=14")
+        );
+        assert!(explain("select * from dep where zip = 3").contains("rows=10 width=14"));
+        assert!(
+            explain("select * from dep where zip = 3 and city = 'city4'")
+                .contains("rows=1 width=14")
+        );
+        assert!(
+            explain("select * from dep where zip > 40 and city = 'city45'")
+                .contains("rows=10 width=14")
+        );
+        sql("drop table es").unwrap();
+        sql("drop table dep").unwrap();
+
+        // An index scan's rows: a unique equality is one, a non-unique
+        // one's the column's own estimate, a range's the histogram's — and
+        // a wide one reads through a bitmap, as PostgreSQL plans it.
+        sql("create table ix (id int primary key, t text, n int)").unwrap();
+        sql("insert into ix select g, 'v' || (g % 500), g % 3 from generate_series(1, 5000) g")
+            .unwrap();
+        sql("create index ix_n on ix (n)").unwrap();
+        sql("analyze ix").unwrap();
+        assert!(explain("select * from ix where n = 1").contains("Bitmap Heap Scan on ix"));
+        let plan = explain("select * from ix where n = 1");
+        assert!(plan.contains("rows=1667 width=12"), "{plan}");
+        sql("set enable_seqscan = off").unwrap();
+        assert!(explain("select * from ix where id = 42").contains("rows=1 width=12"));
+        assert!(explain("select * from ix where id < 100").contains("rows=99 width=12"));
+    }
+}
