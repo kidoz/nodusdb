@@ -808,6 +808,74 @@ impl JoinPlan {
 mod tests {
     use super::*;
 
+    /// The merge join finds exactly what the hash join does — each key's
+    /// group is a cross product, NULL keys match nothing, and an outer
+    /// join keeps what the other side has no match for — and what the
+    /// nested loop does when neither method is available.
+    #[test]
+    fn merge_joins_match_hash_joins() {
+        let (sql, _) = crate::constraint_tests::session();
+        sql("create table m1 (a int, b text)").unwrap();
+        sql("create table m2 (a int, c text)").unwrap();
+        sql("insert into m1 select g % 7, 'x' || g from generate_series(1, 50) g").unwrap();
+        sql("insert into m2 select g % 5, 'y' || g from generate_series(1, 30) g").unwrap();
+        sql("insert into m1 values (null, 'xn')").unwrap();
+        sql("insert into m2 values (null, 'yn')").unwrap();
+        sql("analyze m1").unwrap();
+        sql("analyze m2").unwrap();
+        let queries = [
+            "select count(*) from m1 join m2 on m1.a = m2.a",
+            "select count(*) from m1 left join m2 on m1.a = m2.a",
+            "select count(*) from m1 right join m2 on m1.a = m2.a",
+            "select count(*) from m1 full join m2 on m1.a = m2.a",
+            "select count(*) from m1 where exists (select 1 from m2 where m2.a = m1.a)",
+            "select count(*) from m1 where not exists (select 1 from m2 where m2.a = m1.a)",
+            "select count(*) from m1 where a in (select a from m2)",
+            "select count(*) from m1 join m2 on m1.a = m2.a and m2.c <> 'y7'",
+            "select m1.a, m1.b, m2.c from m1 full join m2 on m1.a = m2.a \
+             order by 1 nulls last, 2 nulls last, 3 nulls last",
+        ];
+        let run = |query: &str| -> Vec<String> {
+            let out = sql(query).unwrap();
+            out.rows
+                .iter()
+                .map(|row| {
+                    row.values
+                        .iter()
+                        .map(crate::render)
+                        .collect::<Vec<_>>()
+                        .join("|")
+                })
+                .collect()
+        };
+        let results = |_| -> Vec<Vec<String>> { queries.iter().map(|q| run(q)).collect() };
+
+        // The merge join's own plan: the sides ordered by their keys.
+        sql("set enable_hashjoin = off").unwrap();
+        sql("set enable_nestloop = off").unwrap();
+        let out = sql("explain (costs off) select * from m1 join m2 on m1.a = m2.a").unwrap();
+        // The text format's plan comes back a line per row.
+        let plan = out
+            .rows
+            .iter()
+            .map(|row| crate::render(&row.values[0]))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(plan.contains("Merge Join"), "{plan}");
+        assert!(plan.contains("Merge Cond: (m1.a = m2.a)"), "{plan}");
+        assert!(plan.contains("Sort Key: m1.a"), "{plan}");
+        assert!(plan.contains("Sort Key: m2.a"), "{plan}");
+        let merged = results(());
+
+        // The hash join's, and the nested loop's.
+        sql("set enable_hashjoin = on").unwrap();
+        assert_eq!(merged, results(()));
+        sql("set enable_hashjoin = off").unwrap();
+        sql("set enable_mergejoin = off").unwrap();
+        sql("set enable_nestloop = on").unwrap();
+        assert_eq!(merged, results(()));
+    }
+
     fn condition(sql: &str) -> FilterExpr {
         let mut statements = nodus_sql::parse_sql(sql).unwrap();
         let plan = crate::planner::plan_statement(&statements.remove(0), &[]).unwrap();

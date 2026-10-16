@@ -1,0 +1,270 @@
+# Merge joins: when the session turns hash joins off, the equalities
+# between the sides are merged instead — both inputs ordered by the join
+# keys (`Sort` over each, with its `Sort Key`), read together so each
+# key's equal rows form one group, and the pairs that group holds are
+# the matches a hash join would find. `[NOT] EXISTS` and `IN` merge the
+# subquery's rows the same way, as `Merge Semi Join` / `Merge Anti Join`.
+# Plans and results from PostgreSQL 18.4, with `enable_hashjoin` and
+# `enable_nestloop` off.
+#
+# Known divergences: PostgreSQL costs the join order and may scan the
+# smaller side first, so its `Merge Cond` names that side's column first
+# and its outer join is labelled for the side it kept outer (`Merge
+# Right Join` where NodusDB's outer is the left one, `Merge Left Join`).
+# A `USING`/`NATURAL` join's sides stay as written here, so the labels
+# and operand order agree. PostgreSQL reads a side from an ordered index
+# when one exists, where NodusDB always sorts the side. A semi join
+# PostgreSQL can prove unique is deduplicated (`HashAggregate`) into a
+# plain `Merge Join`; NodusDB prints `Merge Semi Join`. Join row
+# estimates are the larger input's, where PostgreSQL uses the columns'
+# distinct counts (`rows=600` here against our `rows=201`). The merge's
+# internal order is the join keys' canonical text, so a plan's row order
+# can differ from PostgreSQL's. A data-modifying statement's joins
+# (`UPDATE ... FROM`, `DELETE ... USING`, and their `EXISTS`/`IN`) are
+# not reached by the join-method settings at all — see `dml_plans.slt`.
+
+statement ok
+drop table if exists mj1 cascade;
+
+statement ok
+drop table if exists mj2 cascade;
+
+statement ok
+create table mj1 (a int, b text);
+
+statement ok
+create table mj2 (a int, c text);
+
+statement ok
+insert into mj1 select g % 50, 'x' || g from generate_series(1, 200) g;
+
+statement ok
+insert into mj2 select g % 30, 'y' || g from generate_series(1, 150) g;
+
+statement ok
+insert into mj1 values (null, 'xn');
+
+statement ok
+insert into mj2 values (null, 'yn');
+
+statement ok
+create index mj2_a on mj2 (a);
+
+statement ok
+analyze mj1;
+
+statement ok
+analyze mj2;
+
+statement ok
+set enable_hashjoin = off;
+
+statement ok
+set enable_nestloop = off;
+
+# An equality join merges the sides' ordered rows.
+query T
+explain (costs off) select * from mj1 join mj2 on mj1.a = mj2.a;
+----
+Merge Join
+  Merge Cond: (mj1.a = mj2.a)
+  ->  Sort
+        Sort Key: mj1.a
+        ->  Seq Scan on mj1
+  ->  Sort
+        Sort Key: mj2.a
+        ->  Seq Scan on mj2
+
+# Outer joins keep their own side outer: a right join reads the right
+# side first, as PostgreSQL prints it.
+query T
+explain (costs off) select * from mj1 left join mj2 on mj1.a = mj2.a;
+----
+Merge Left Join
+  Merge Cond: (mj1.a = mj2.a)
+  ->  Sort
+        Sort Key: mj1.a
+        ->  Seq Scan on mj1
+  ->  Sort
+        Sort Key: mj2.a
+        ->  Seq Scan on mj2
+
+query T
+explain (costs off) select * from mj1 right join mj2 on mj1.a = mj2.a;
+----
+Merge Left Join
+  Merge Cond: (mj2.a = mj1.a)
+  ->  Sort
+        Sort Key: mj2.a
+        ->  Seq Scan on mj2
+  ->  Sort
+        Sort Key: mj1.a
+        ->  Seq Scan on mj1
+
+query T
+explain (costs off) select * from mj1 full join mj2 on mj1.a = mj2.a;
+----
+Merge Full Join
+  Merge Cond: (mj1.a = mj2.a)
+  ->  Sort
+        Sort Key: mj1.a
+        ->  Seq Scan on mj1
+  ->  Sort
+        Sort Key: mj2.a
+        ->  Seq Scan on mj2
+
+# `[NOT] EXISTS` and `IN` merge the subquery's rows by the join keys.
+query T
+explain (costs off) select * from mj1 where not exists (select 1 from mj2 where mj2.a = mj1.a);
+----
+Merge Anti Join
+  Merge Cond: (mj1.a = mj2.a)
+  ->  Sort
+        Sort Key: mj1.a
+        ->  Seq Scan on mj1
+  ->  Sort
+        Sort Key: mj2.a
+        ->  Seq Scan on mj2
+
+# The condition's own conjuncts sit on the side that decides them.
+query T
+explain (costs off) select * from mj1 join mj2 on mj1.a = mj2.a and mj1.b <> 'x3';
+----
+Merge Join
+  Merge Cond: (mj1.a = mj2.a)
+  ->  Sort
+        Sort Key: mj1.a
+        ->  Seq Scan on mj1
+              Filter: (b <> 'x3'::text)
+  ->  Sort
+        Sort Key: mj2.a
+        ->  Seq Scan on mj2
+
+# A key of several columns: one `Sort Key` and one equality each.
+statement ok
+drop table if exists mk1 cascade;
+
+statement ok
+drop table if exists mk2 cascade;
+
+statement ok
+create table mk1 (a int, b int, v text);
+
+statement ok
+create table mk2 (a int, b int, w text);
+
+statement ok
+insert into mk1 select g % 10, g % 4, 'u' || g from generate_series(1, 40) g;
+
+statement ok
+insert into mk2 select g % 8, g % 5, 'v' || g from generate_series(1, 32) g;
+
+statement ok
+analyze mk1;
+
+statement ok
+analyze mk2;
+
+query T
+explain (costs off) select * from mk1 join mk2 using (a, b);
+----
+Merge Join
+  Merge Cond: ((mk1.a = mk2.a) AND (mk1.b = mk2.b))
+  ->  Sort
+        Sort Key: mk1.a, mk1.b
+        ->  Seq Scan on mk1
+  ->  Sort
+        Sort Key: mk2.a, mk2.b
+        ->  Seq Scan on mk2
+
+query I
+select count(*) from mk1 join mk2 using (a, b);
+----
+28
+
+# The results are those of the hash join: each key's group is a cross
+# product, NULL keys match nothing, and an outer join keeps what the
+# other side has no match for.
+query I
+select count(*) from mj1 join mj2 on mj1.a = mj2.a;
+----
+600
+
+query I
+select count(*) from mj1 left join mj2 on mj1.a = mj2.a;
+----
+681
+
+query I
+select count(*) from mj1 right join mj2 on mj1.a = mj2.a;
+----
+601
+
+query I
+select count(*) from mj1 full join mj2 on mj1.a = mj2.a;
+----
+682
+
+query I
+select count(*) from mj1 where exists (select 1 from mj2 where mj2.a = mj1.a);
+----
+120
+
+query I
+select count(*) from mj1 where not exists (select 1 from mj2 where mj2.a = mj1.a);
+----
+81
+
+query I
+select count(*) from mj1 where a in (select a from mj2);
+----
+120
+
+query T
+select mj1.a, mj1.b, mj2.c from mj1 full join mj2 on mj1.a = mj2.a order by 1 nulls last, 2 nulls last, 3 nulls last limit 5;
+----
+0	x100	y120
+0	x100	y150
+0	x100	y30
+0	x100	y60
+0	x100	y90
+
+# The a right join's unmatched left rows keep their NULLs too.
+query I
+select count(*) from (select mj1.a from mj1 right join mj2 on mj1.a = mj2.a where mj1.a is null) s;
+----
+1
+
+# With merge joins off too, the nested loop is what remains.
+statement ok
+set enable_mergejoin = off;
+
+query T
+explain (costs off) select * from mj1 join mj2 on mj1.a = mj2.a;
+----
+Nested Loop
+  Disabled: true
+  ->  Seq Scan on mj1
+  ->  Index Scan using mj2_a on mj2
+        Index Cond: (a = mj1.a)
+
+statement ok
+reset enable_mergejoin;
+
+statement ok
+reset enable_nestloop;
+
+statement ok
+reset enable_hashjoin;
+
+statement ok
+drop table mk1 cascade;
+
+statement ok
+drop table mk2 cascade;
+
+statement ok
+drop table mj1 cascade;
+
+statement ok
+drop table mj2 cascade;

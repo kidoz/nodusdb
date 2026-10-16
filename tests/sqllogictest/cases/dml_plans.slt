@@ -3,7 +3,9 @@
 # and `[NOT] EXISTS` / `IN` in the condition as semi/anti joins under the
 # `Update`/`Delete` node — as PostgreSQL plans them. Results are from
 # PostgreSQL 18.4; where PostgreSQL hashes the other side, the join is
-# the mirror of its plan.
+# the mirror of its plan. The session's join-method settings
+# (`enable_hashjoin`, `enable_mergejoin`, `enable_nestloop`) do not
+# reach these joins, where PostgreSQL plans them by them.
 
 statement ok
 drop table if exists d1 cascade;
