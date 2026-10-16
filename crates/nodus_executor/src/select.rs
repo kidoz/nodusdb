@@ -580,18 +580,36 @@ impl MemExecutor {
                                     .ok()
                             })
                             .flatten();
-                        let indexed = only.or_else(|| {
-                            let (data_type, ordered) = Self::index_entry_encoding(&tbl, idx);
-                            self.index_scan(
-                                idx.id,
-                                &val,
-                                tbl.id,
-                                &data_type,
-                                ordered,
-                                &ctx.session_id,
-                            )
-                            .ok()
+                        // An equality whose key prefix holds much of the
+                        // table reads the heap through a bitmap, as
+                        // PostgreSQL plans it.
+                        let hex = crate::index_keys::key_component(&val, &col.data_type);
+                        let bitmap = hex.as_deref().is_some_and(|hex| {
+                            let table_rows = self
+                                .scan_rows(tbl.id, &ctx.session_id)
+                                .map(|rows| rows.len() as f64)
+                                .unwrap_or(0.0);
+                            let entries =
+                                self.index_prefix_count(idx.id, hex, None, &ctx.session_id);
+                            crate::index_keys::bitmap_scan_is_wider(table_rows, entries)
                         });
+                        let indexed = match hex.as_deref().filter(|_| bitmap) {
+                            Some(hex) => self
+                                .bitmap_heap_scan(idx.id, hex, None, tbl.id, &ctx.session_id)
+                                .ok(),
+                            None => only.or_else(|| {
+                                let (data_type, ordered) = Self::index_entry_encoding(&tbl, idx);
+                                self.index_scan(
+                                    idx.id,
+                                    &val,
+                                    tbl.id,
+                                    &data_type,
+                                    ordered,
+                                    &ctx.session_id,
+                                )
+                                .ok()
+                            }),
+                        };
                         if let Some(indexed_rows) = indexed {
                             scanned_index = Some(idx.id);
                             rows = Some(self.merge_overlay_eq(

@@ -3114,6 +3114,18 @@ impl MemExecutor {
                                 .unwrap_or_default();
                             let bounds = (data_type.as_str(), lower.as_ref(), upper.as_ref());
                             self.index_prefix_count(idx.id, "", Some(bounds), &ctx.session_id)
+                        })
+                        .or_else(|| {
+                            // An equality against a literal: the entries its
+                            // own key prefix holds.
+                            let value = match filter.and_then(|filter| {
+                                crate::index_keys::equality_operand(filter, &col.name)
+                            }) {
+                                Some(Operand::Literal(value)) => value.clone(),
+                                _ => return None,
+                            };
+                            let hex = crate::index_keys::key_component(&value, &col.data_type)?;
+                            Some(self.index_prefix_count(idx.id, &hex, None, &ctx.session_id))
                         }),
                 };
                 entries
@@ -3137,6 +3149,7 @@ impl MemExecutor {
                 if let Some(residual) = residual_filter {
                     node = node.detail("Filter", residual);
                 }
+                node.width = width;
                 node.startup = 0.15;
                 node.total = 8.17;
                 return Ok(node);
