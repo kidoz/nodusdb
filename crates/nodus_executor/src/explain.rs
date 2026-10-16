@@ -2639,8 +2639,13 @@ impl MemExecutor {
         alias: &str,
         filter: Option<&FilterExpr>,
     ) -> Result<Node> {
-        let table_rows = self.scan_rows(table.id, &ctx.session_id)?.len() as f64;
-        let table_width: u32 = table.columns.iter().map(|c| type_width(&c.data_type)).sum();
+        // The estimates come from what ANALYZE recorded — the row count it
+        // stamped, the columns' average widths, and the filter's selectivity
+        // from the most-common values and the histogram.
+        let estimates = crate::selectivity::Estimates::of(self, table);
+        let scanned = self.scan_rows(table.id, &ctx.session_id)?.len() as f64;
+        let table_rows = estimates.rows(scanned);
+        let table_width = estimates.width();
         let pages = (table_rows * table_width as f64 / 8192.0).ceil().max(1.0);
         let mut child = Node::new(
             "Seq Scan",
@@ -2659,7 +2664,7 @@ impl MemExecutor {
         if let Some(f) = filter {
             child = child.detail("Filter", deparse_filter(f, false));
             child.total += child.rows * CPU_OPERATOR;
-            child.rows = (child.rows * selectivity(f)).max(1.0).round();
+            child.rows = (child.rows * estimates.selectivity(f)).max(1.0).round();
         }
         Ok(child)
     }
@@ -2715,7 +2720,8 @@ impl MemExecutor {
             if let Some(f) = filter {
                 node = merge_filter_detail(node, "Filter", deparse_filter_with(f, false, subplans));
                 node.total += node.rows * CPU_OPERATOR;
-                node.rows = (node.rows * selectivity(f)).max(1.0).round();
+                let selectivity = self.relation_selectivity(table_name, f);
+                node.rows = (node.rows * selectivity).max(1.0).round();
             }
             node
         };
@@ -2808,7 +2814,32 @@ impl MemExecutor {
             .prop("Alias", json!(alias));
             return Ok(with_filter(node));
         }
-        let rows = self.scan_rows(tbl.id, &ctx.session_id)?.len() as f64;
+        let scanned = self.scan_rows(tbl.id, &ctx.session_id)?.len() as f64;
+        let estimates = crate::selectivity::Estimates::of(self, &tbl);
+        let rows = estimates.rows(scanned);
+        // The selectivity of the filter's conjuncts on the index's own
+        // columns: what the index condition keeps of the table.
+        let index_sel = |columns: &[&str]| -> f64 {
+            let Some(filter) = filter else {
+                return 1.0;
+            };
+            let conjuncts: Vec<&FilterExpr> = crate::index_keys::conjuncts(filter)
+                .into_iter()
+                .filter(|clause| match clause {
+                    FilterExpr::Predicate(Predicate { left, .. }) => {
+                        let name = left.rsplit('.').next().unwrap_or(left);
+                        columns
+                            .iter()
+                            .any(|column| column.eq_ignore_ascii_case(name))
+                    }
+                    _ => false,
+                })
+                .collect();
+            if conjuncts.is_empty() {
+                return 1.0;
+            }
+            estimates.conjunction(&conjuncts)
+        };
         // A scan reads the table's descendants too, appending each table's
         // rows; `ONLY` reads just the table.
         let descendant_tables = if only {
@@ -2857,7 +2888,7 @@ impl MemExecutor {
             // Every partition was pruned: no rows come back.
             return Ok(empty_scan());
         }
-        let width: u32 = tbl.columns.iter().map(|c| type_width(&c.data_type)).sum();
+        let width: u32 = estimates.width();
         let pages = (rows * width as f64 / 8192.0).ceil().max(1.0);
         // The executor reads `col = value` on an indexed column by index,
         // and — when the session asks for index scans — a range over the
@@ -3092,7 +3123,7 @@ impl MemExecutor {
                 let inner = Node::new(
                     "Bitmap Index Scan",
                     format!("Bitmap Index Scan on {}", idx.name),
-                    (rows * 0.005).max(1.0),
+                    (rows * index_sel(&[col.name.as_str()])).max(1.0),
                     0,
                 )
                 .detail("Index Cond", index_cond_text.clone());
@@ -3122,11 +3153,10 @@ impl MemExecutor {
                     if backwards { " Backward" } else { "" },
                     idx.name
                 ),
-                if idx.unique {
-                    1.0
-                } else {
-                    (rows * 0.005).max(1.0)
-                },
+                // A unique index's equality is one row, which the
+                // statistics' own estimate gives; a range reads the
+                // histogram.
+                (rows * index_sel(&[col.name.as_str()])).max(1.0),
                 width,
             )
             .prop(
@@ -3240,6 +3270,23 @@ fn values_scan(rows: usize) -> Node {
     node
 }
 
+impl MemExecutor {
+    /// A filter's selectivity over a relation named by the query: from the
+    /// relation's own statistics when it has them, by shape otherwise.
+    fn relation_selectivity(&self, table_name: &str, filter: &FilterExpr) -> f64 {
+        let Ok((db_name, schema_name, table_only)) = parse_object_name(table_name) else {
+            return selectivity(filter);
+        };
+        match self
+            .catalog_reader
+            .get_table(db_name, schema_name, table_only)
+        {
+            Ok(table) => crate::selectivity::Estimates::of(self, &table).selectivity(filter),
+            Err(_) => selectivity(filter),
+        }
+    }
+}
+
 /// The planner's default fraction of rows a condition keeps.
 fn selectivity(filter: &FilterExpr) -> f64 {
     match filter {
@@ -3253,7 +3300,7 @@ fn selectivity(filter: &FilterExpr) -> f64 {
 }
 
 /// The average stored width of a value of a declared type, in bytes.
-fn type_width(data_type: &str) -> u32 {
+pub(crate) fn type_width(data_type: &str) -> u32 {
     let t = data_type.trim().to_ascii_uppercase();
     if t.ends_with("[]") {
         32
@@ -4117,9 +4164,24 @@ fn sort_key_text(
     text
 }
 
-/// A relation's rows' width.
+/// A relation's rows' width: what `ANALYZE` measured per column, and a
+/// type's default width for a column without statistics.
 fn width_of(table: &nodus_catalog::TableDescriptor) -> u32 {
-    table.columns.iter().map(|c| type_width(&c.data_type)).sum()
+    table
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(index, column)| {
+            table
+                .statistics
+                .iter()
+                .find(|stats| stats.attnum == index as i32 + 1)
+                .map_or_else(
+                    || type_width(&column.data_type),
+                    |stats| stats.avg_width.max(0) as u32,
+                )
+        })
+        .sum()
 }
 
 /// PostgreSQL's `Sampling:` detail for a sampled scan — the method, the

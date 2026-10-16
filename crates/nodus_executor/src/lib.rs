@@ -63,6 +63,7 @@ mod roles;
 mod schemas;
 mod search_path;
 mod select;
+mod selectivity;
 mod sequences;
 mod session_env;
 mod session_functions;

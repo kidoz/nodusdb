@@ -136,6 +136,10 @@ pub struct TableDescriptor {
 pub struct ColumnStatistics {
     /// The column's attribute number (`pg_attribute.attnum`): 1-based.
     pub attnum: i32,
+    /// The column's declared type, so a reader of the statistics knows how
+    /// its values compare.
+    #[serde(default)]
+    pub data_type: String,
     /// `stainherit`: these are a parent's statistics over its whole
     /// inheritance tree's rows, not the table's own.
     #[serde(default)]

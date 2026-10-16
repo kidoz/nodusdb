@@ -170,6 +170,7 @@ fn analyze_column(
         // estimates them unique).
         return Some(ColumnStatistics {
             attnum,
+            data_type: data_type.to_string(),
             inherited: false,
             null_frac,
             avg_width,
@@ -182,6 +183,7 @@ fn analyze_column(
         // Only nulls: PostgreSQL assumes the column is entirely null.
         return Some(ColumnStatistics {
             attnum,
+            data_type: data_type.to_string(),
             inherited: false,
             null_frac,
             avg_width,
@@ -195,6 +197,7 @@ fn analyze_column(
         // PostgreSQL, which stores zero.
         return Some(ColumnStatistics {
             attnum,
+            data_type: data_type.to_string(),
             inherited: false,
             null_frac,
             avg_width,
@@ -210,6 +213,7 @@ fn analyze_column(
         tsvector_stats(&nonnull, &mut slots);
         return Some(ColumnStatistics {
             attnum,
+            data_type: data_type.to_string(),
             inherited: false,
             null_frac,
             avg_width,
@@ -232,6 +236,7 @@ fn analyze_column(
     }
     Some(ColumnStatistics {
         attnum,
+        data_type: data_type.to_string(),
         inherited: false,
         null_frac,
         avg_width,
