@@ -181,7 +181,45 @@ impl MemExecutor {
         left_names: &[String],
         right_names: &[String],
     ) -> Result<Option<HashJoinKeys>> {
-        if crate::session_env::setting("enable_hashjoin").as_deref() == Some("off") {
+        self.join_keys(
+            join,
+            named_eq_pairs,
+            left_names,
+            right_names,
+            "enable_hashjoin",
+        )
+    }
+
+    /// The keys a merge join sorts by: the same equalities a hash join
+    /// hashes, when the session allows a merge. `None` falls back to the
+    /// nested loop.
+    fn merge_join_keys(
+        &self,
+        join: &Join,
+        named_eq_pairs: &Option<Vec<(String, usize, usize)>>,
+        left_names: &[String],
+        right_names: &[String],
+    ) -> Result<Option<HashJoinKeys>> {
+        self.join_keys(
+            join,
+            named_eq_pairs,
+            left_names,
+            right_names,
+            "enable_mergejoin",
+        )
+    }
+
+    /// The equalities between the sides, as the keys of a hash or merge
+    /// join, when the session's setting allows that method.
+    fn join_keys(
+        &self,
+        join: &Join,
+        named_eq_pairs: &Option<Vec<(String, usize, usize)>>,
+        left_names: &[String],
+        right_names: &[String],
+        setting: &str,
+    ) -> Result<Option<HashJoinKeys>> {
+        if crate::session_env::setting(setting).as_deref() == Some("off") {
             return Ok(None);
         }
         // A `USING` / `NATURAL` join hashes its named columns.
@@ -1087,6 +1125,14 @@ impl MemExecutor {
                 }
                 let anti = matches!(join.join_type, JoinType::Anti);
                 let hashed = self.hash_join_keys(join, &None, &col_names, &inner_names)?;
+                // With hash joins turned off, the subquery's rows are
+                // ordered by the join keys and its equal keys line up with
+                // the left row's, as a merge join reads them.
+                let merged = if hashed.is_none() {
+                    self.merge_join_keys(join, &None, &col_names, &inner_names)?
+                } else {
+                    None
+                };
                 let matches_inner = |r1: &Vec<Value>, r2: &crate::Row| -> Result<bool> {
                     let mut combined = r1.clone();
                     combined.extend(r2.values.clone());
@@ -1101,8 +1147,8 @@ impl MemExecutor {
                         .unwrap_or(false))
                 };
                 let mut next_rows = Vec::new();
-                match &hashed {
-                    Some(hash) => {
+                match (&hashed, &merged) {
+                    (Some(hash), _) => {
                         let mut table: std::collections::HashMap<String, Vec<Vec<Value>>> =
                             std::collections::HashMap::new();
                         for r2 in &out.rows {
@@ -1169,7 +1215,77 @@ impl MemExecutor {
                             }
                         }
                     }
-                    None => {
+                    (None, Some(merge)) => {
+                        let mut right_keyed: Vec<(String, Vec<Value>)> = Vec::new();
+                        for r2 in &out.rows {
+                            if let Some(filter) = &merge.right_filter
+                                && !self
+                                    .eval_filter(
+                                        ctx,
+                                        &r2.values,
+                                        &inner_names,
+                                        &combined_desc[left_width..],
+                                        Some(filter),
+                                    )
+                                    .unwrap_or(false)
+                            {
+                                continue;
+                            }
+                            if let Some(key) =
+                                self.hash_key(ctx, &r2.values, &inner_names, &merge.right_keys)
+                            {
+                                right_keyed.push((key, r2.values.clone()));
+                            }
+                        }
+                        right_keyed.sort_by(|a, b| a.0.cmp(&b.0));
+                        for r1 in &stored_rows {
+                            if let Some(filter) = &merge.left_filter
+                                && !self
+                                    .eval_filter(ctx, r1, &col_names, &joined_columns, Some(filter))
+                                    .unwrap_or(false)
+                            {
+                                continue;
+                            }
+                            let mut matched = false;
+                            if let Some(key) = self.hash_key(ctx, r1, &col_names, &merge.left_keys)
+                            {
+                                let start = right_keyed.partition_point(|(other, _)| other < &key);
+                                let mut at = start;
+                                while at < right_keyed.len() && right_keyed[at].0 == key {
+                                    let mut combined = r1.clone();
+                                    combined.extend(right_keyed[at].1.clone());
+                                    at += 1;
+                                    if !self.pair_tests_hold(
+                                        ctx,
+                                        &combined,
+                                        &combined_cols,
+                                        &combined_desc,
+                                        &merge.pair_tests,
+                                    ) {
+                                        continue;
+                                    }
+                                    if let Some(filter) = &merge.join_filter
+                                        && !self
+                                            .eval_filter(
+                                                ctx,
+                                                &combined,
+                                                &combined_cols,
+                                                &combined_desc,
+                                                Some(filter),
+                                            )
+                                            .unwrap_or(false)
+                                    {
+                                        continue;
+                                    }
+                                    matched = true;
+                                }
+                            }
+                            if matched != anti {
+                                next_rows.push(r1.clone());
+                            }
+                        }
+                    }
+                    (None, None) => {
                         for r1 in &stored_rows {
                             let mut matched = false;
                             for r2 in &out.rows {
@@ -1558,8 +1674,16 @@ impl MemExecutor {
             // left row probes the right side's table. The rows keep the
             // nested loop's order (the right rows in their own order).
             let hashed = self.hash_join_keys(join, &named_eq_pairs, &col_names, &j_col_names)?;
-            match &hashed {
-                Some(hash) => {
+            // With hash joins turned off, the equalities merge instead:
+            // both sides are ordered by the join keys and read together,
+            // each key's equal rows lining up as one group.
+            let merged = if hashed.is_none() {
+                self.merge_join_keys(join, &named_eq_pairs, &col_names, &j_col_names)?
+            } else {
+                None
+            };
+            match (&hashed, &merged) {
+                (Some(hash), _) => {
                     let mut table: std::collections::HashMap<String, Vec<(usize, Vec<Value>)>> =
                         std::collections::HashMap::new();
                     for (j_idx, r2) in j_rows.iter().enumerate() {
@@ -1628,7 +1752,99 @@ impl MemExecutor {
                         }
                     }
                 }
-                None => {
+                (None, Some(merge)) => {
+                    // The merge join: the right side's rows under the
+                    // merge's own filter, keyed by their join values and
+                    // ordered; the left side's likewise — rows whose keys
+                    // are NULL are held back, matching nothing.
+                    let mut right_keyed: Vec<(String, usize, Vec<Value>)> = Vec::new();
+                    for (j_idx, r2) in j_rows.iter().enumerate() {
+                        if let Some(filter) = &merge.right_filter
+                            && !self
+                                .eval_filter(ctx, r2, &j_col_names, &j_cols, Some(filter))
+                                .unwrap_or(false)
+                        {
+                            continue;
+                        }
+                        if let Some(key) = self.hash_key(ctx, r2, &j_col_names, &merge.right_keys) {
+                            right_keyed.push((key, j_idx, r2.clone()));
+                        }
+                    }
+                    right_keyed.sort_by(|a, b| a.0.cmp(&b.0));
+                    let mut left_keyed: Vec<(String, Vec<Value>)> = Vec::new();
+                    let mut left_unkeyed: Vec<Vec<Value>> = Vec::new();
+                    for r1 in &stored_rows {
+                        if let Some(filter) = &merge.left_filter
+                            && !self
+                                .eval_filter(ctx, r1, &col_names, &joined_columns, Some(filter))
+                                .unwrap_or(false)
+                        {
+                            continue;
+                        }
+                        match self.hash_key(ctx, r1, &col_names, &merge.left_keys) {
+                            Some(key) => left_keyed.push((key, r1.clone())),
+                            None => left_unkeyed.push(r1.clone()),
+                        }
+                    }
+                    left_keyed.sort_by(|a, b| a.0.cmp(&b.0));
+                    // Read together: the left row's key group in the right
+                    // side's order is what a hash probe would find.
+                    for (key, r1) in &left_keyed {
+                        let start = right_keyed.partition_point(|(other, _, _)| other < key);
+                        let mut matched = false;
+                        let mut at = start;
+                        while at < right_keyed.len() && right_keyed[at].0 == *key {
+                            let (j_idx, r2) = (&right_keyed[at].1, &right_keyed[at].2);
+                            let mut combined_row = r1.clone();
+                            combined_row.extend(r2.clone());
+                            // The keys are equal; the condition's other
+                            // conjuncts still decide the pair.
+                            at += 1;
+                            if !self.pair_tests_hold(
+                                ctx,
+                                &combined_row,
+                                &combined_cols,
+                                &combined_desc,
+                                &merge.pair_tests,
+                            ) {
+                                continue;
+                            }
+                            if let Some(filter) = &merge.join_filter
+                                && !self
+                                    .eval_filter(
+                                        ctx,
+                                        &combined_row,
+                                        &combined_cols,
+                                        &combined_desc,
+                                        Some(filter),
+                                    )
+                                    .unwrap_or(false)
+                            {
+                                continue;
+                            }
+                            next_rows.push(combined_row);
+                            matched = true;
+                            right_matched[*j_idx] = true;
+                        }
+                        if !matched
+                            && matches!(join.join_type, JoinType::LeftOuter | JoinType::FullOuter)
+                        {
+                            let mut combined_row = r1.clone();
+                            combined_row.extend(vec![Value::Null; j_cols.len()]);
+                            next_rows.push(combined_row);
+                        }
+                    }
+                    // A row whose keys are NULL matches nothing, and is
+                    // kept alone by an outer join.
+                    if matches!(join.join_type, JoinType::LeftOuter | JoinType::FullOuter) {
+                        for r1 in left_unkeyed {
+                            let mut combined_row = r1;
+                            combined_row.extend(vec![Value::Null; j_cols.len()]);
+                            next_rows.push(combined_row);
+                        }
+                    }
+                }
+                (None, None) => {
                     // For an inner join, each side's own conditions sit on
                     // its scan, and an equality between an outer column and
                     // an indexed inner column reads that index per outer
