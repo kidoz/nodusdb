@@ -1810,8 +1810,13 @@ impl MemExecutor {
         target: Option<&crate::plan_types::ConflictTarget>,
     ) -> Result<Option<(String, Vec<Value>)>> {
         use crate::plan_types::ConflictTarget;
-        // PostgreSQL refuses deferrable constraints as arbiters.
-        if tbl.indexes.iter().any(|i| i.unique && i.deferrable) {
+        // PostgreSQL refuses deferrable constraints as arbiters — but a
+        // temporal key is no arbiter either way, so it is not considered.
+        if tbl
+            .indexes
+            .iter()
+            .any(|i| i.unique && i.deferrable && i.period.is_none())
+        {
             anyhow::bail!(crate::error_fields::DbError::new(
                 "ON CONFLICT does not support deferrable unique constraints/exclusion constraints as arbiters"
             )
@@ -1822,9 +1827,13 @@ impl MemExecutor {
             .indexes
             .iter()
             .find(|i| i.index_type == nodus_catalog::IndexType::Primary);
-        // Each key with whether its index treats NULLs as equal.
+        // Each key with whether its index treats NULLs as equal. A
+        // `WITHOUT OVERLAPS` constraint is an exclusion constraint, which
+        // PostgreSQL refuses as an arbiter.
         let mut keys: Vec<(&str, Vec<usize>, bool)> = Vec::new();
-        if let Some(primary) = primary {
+        if let Some(primary) = primary
+            && primary.period.is_none()
+        {
             keys.push((primary.name.as_str(), Self::pk_positions(tbl), false));
         }
         let mut expression_keys: Vec<&nodus_catalog::IndexDescriptor> = tbl
@@ -1835,6 +1844,7 @@ impl MemExecutor {
         for idx in &tbl.indexes {
             if idx.unique
                 && idx.index_type != nodus_catalog::IndexType::Primary
+                && idx.period.is_none()
                 && !crate::index_keys::has_expressions(idx)
             {
                 let positions = idx
@@ -1926,6 +1936,13 @@ impl MemExecutor {
             }
         }
         if looked_up {
+            // `ON CONFLICT DO NOTHING` without a target also skips a row
+            // that clashes with a temporal key.
+            if target.is_none()
+                && let Some(found) = self.temporal_conflict_row(tbl, row, session)?
+            {
+                return Ok(Some(found));
+            }
             return Ok(None);
         }
         for (key, existing) in self.scan_rows_keyed(tbl.id, session)? {
@@ -1934,6 +1951,69 @@ impl MemExecutor {
                     (wanted, key_of(&existing, positions, *nulls_equal))
                     && wanted.iter().zip(&have).all(|(a, b)| values_equal(a, b))
                 {
+                    return Ok(Some((key, existing)));
+                }
+            }
+        }
+        // `ON CONFLICT DO NOTHING` without a target also skips a row that
+        // clashes with a temporal key, as PostgreSQL's does.
+        if target.is_none()
+            && let Some(found) = self.temporal_conflict_row(tbl, row, session)?
+        {
+            return Ok(Some(found));
+        }
+        Ok(None)
+    }
+
+    /// The stored row an `ON CONFLICT DO NOTHING` clashes with on a temporal
+    /// key, if any.
+    fn temporal_conflict_row(
+        &self,
+        tbl: &nodus_catalog::TableDescriptor,
+        row: &[Value],
+        session: &str,
+    ) -> Result<Option<(String, Vec<Value>)>> {
+        let mut keys: Vec<(Vec<usize>, usize, bool)> = Vec::new();
+        if let Some(period) = tbl
+            .indexes
+            .iter()
+            .find(|i| i.index_type == nodus_catalog::IndexType::Primary)
+            .and_then(|i| Self::period_position(tbl, i))
+        {
+            keys.push((Self::pk_positions(tbl), period, false));
+        }
+        for index in tbl
+            .indexes
+            .iter()
+            .filter(|i| i.unique && i.index_type != nodus_catalog::IndexType::Primary)
+        {
+            let Some(period) = Self::period_position(tbl, index) else {
+                continue;
+            };
+            let positions: Vec<usize> = index
+                .key_columns
+                .iter()
+                .filter_map(|key| {
+                    tbl.columns
+                        .iter()
+                        .position(|column| column.id == key.column_id)
+                })
+                .collect();
+            keys.push((positions, period, index.nulls_not_distinct));
+        }
+        if keys.is_empty() {
+            return Ok(None);
+        }
+        for (key, existing) in self.scan_rows_keyed(tbl.id, session)? {
+            for (positions, period, nulls_equal) in &keys {
+                if crate::constraints::temporal_conflict(
+                    tbl,
+                    &existing,
+                    row,
+                    positions,
+                    *period,
+                    *nulls_equal,
+                ) {
                     return Ok(Some((key, existing)));
                 }
             }
