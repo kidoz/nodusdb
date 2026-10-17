@@ -1894,6 +1894,9 @@ pub enum LogicalPlan {
         /// `VACUUM ANALYZE`: it analyzes the tables too.
         #[serde(default)]
         analyze: bool,
+        /// `VACUUM VERBOSE`: the INFO report goes back to the client.
+        #[serde(default)]
+        verbose: bool,
     },
     /// `ANALYZE [VERBOSE] [table]`: records the tables' row counts
     /// (`pg_class.reltuples`/`relpages`) and stamps the analysis.
@@ -1901,6 +1904,9 @@ pub enum LogicalPlan {
         /// The tables named, or every table when none is.
         #[serde(default)]
         tables: Option<Vec<String>>,
+        /// `ANALYZE VERBOSE`: the INFO report goes back to the client.
+        #[serde(default)]
+        verbose: bool,
     },
     /// `ALTER TABLE ... ALTER COLUMN ... SET STATISTICS`: the statement's
     /// text, resolved by the executor.

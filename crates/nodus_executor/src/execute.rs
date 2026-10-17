@@ -464,6 +464,7 @@ impl MemExecutor {
             LogicalPlan::Vacuum {
                 tables,
                 analyze,
+                verbose,
             } => {
                 // `VACUUM` needs a transaction of its own, as PostgreSQL
                 // says (`ANALYZE` may run in one).
@@ -474,9 +475,9 @@ impl MemExecutor {
                     .code("25001")
                     .into());
                 }
-                self.exec_vacuum(ctx, tables, analyze)
+                self.exec_vacuum(ctx, tables, analyze, verbose)
             }
-            LogicalPlan::Analyze { tables } => self.exec_analyze(ctx, tables),
+            LogicalPlan::Analyze { tables, verbose } => self.exec_analyze(ctx, tables, verbose),
             LogicalPlan::AlterColumnStatistics { target } => {
                 self.exec_alter_column_statistics(ctx, &target)
             }

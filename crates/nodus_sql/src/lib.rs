@@ -4325,6 +4325,28 @@ fn rewrite_data_clause(
         }
         return statement;
     }
+
+    // `ANALYZE VERBOSE`: the parser reads `VERBOSE` as the table's name. The
+    // target travels with the tag, as `VACUUM`'s does.
+    if is(0, "analyze")
+        && (1..n)
+            .any(|i| is(i, "verbose") || (is(i, "(") && is(i + 1, "verbose") || is(i, "verbose)")))
+    {
+        let target = significant
+            .get(1)
+            .map(|&first| render_tokens(&statement[first..=significant[n - 1]]))
+            .unwrap_or_default();
+        let sql = format!(
+            "SELECT {UTILITY_FUNCTION}('ANALYZE', '{}')",
+            target.replace('\'', "''")
+        );
+        if let Some(mut tokens) = snippet_tokens(&sql) {
+            tokens.extend(tail);
+            return tokens;
+        }
+        return statement;
+    }
+
     // `VACUUM`'s target travels with the tag too: the tables it covers have
     // their statistics stamped, and `VACUUM ANALYZE` analyzes them.
     if is(0, "vacuum") {
@@ -4780,6 +4802,14 @@ mod tests {
             format!(
                 "SELECT {UTILITY_FUNCTION}('ALTER COLUMN STATISTICS', 'alter table s.t alter a set statistics 0')"
             )
+        );
+        assert_eq!(
+            one("ANALYZE VERBOSE t1"),
+            format!("SELECT {UTILITY_FUNCTION}('ANALYZE', 'verbose t1')")
+        );
+        assert_eq!(
+            one("ANALYZE (VERBOSE) t1"),
+            format!("SELECT {UTILITY_FUNCTION}('ANALYZE', '(verbose) t1')")
         );
         assert_eq!(
             one("CREATE STATISTICS s ON a, b FROM t"),

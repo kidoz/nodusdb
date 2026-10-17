@@ -917,8 +917,16 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                         .into(),
                 ),
                 Some([crate::Value::Text(tag), crate::Value::Text(target)]) if tag == "VACUUM" => {
-                    let (tables, analyze) = vacuum_target(target)?;
-                    Ok(LogicalPlan::Vacuum { tables, analyze })
+                    let (tables, analyze, verbose) = maintenance_target(target)?;
+                    Ok(LogicalPlan::Vacuum {
+                        tables,
+                        analyze,
+                        verbose,
+                    })
+                }
+                Some([crate::Value::Text(tag), crate::Value::Text(target)]) if tag == "ANALYZE" => {
+                    let (tables, _, verbose) = maintenance_target(target)?;
+                    Ok(LogicalPlan::Analyze { tables, verbose })
                 }
                 Some([crate::Value::Text(tag), crate::Value::Text(target)])
                     if tag == "ALTER COLUMN STATISTICS" =>
@@ -1431,6 +1439,7 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                 .table_name
                 .as_ref()
                 .map(|name| vec![name.to_string()]),
+            verbose: false,
         }),
         Statement::StartTransaction { modes, begin, .. } => {
             let (read_only, isolation) = transaction_modes(modes);
@@ -3157,11 +3166,12 @@ fn sequence_spec(
     Ok(spec)
 }
 
-/// What a `VACUUM` covers: the tables its target text names (or none, which
-/// every table means), and whether it also analyzes them. The options —
-/// `FULL`, `FREEZE`, `VERBOSE`, `ANALYZE`, and a parenthesized option list —
-/// decide only `ANALYZE` here: nothing is reclaimed to report the rest of.
-fn vacuum_target(target: &str) -> Result<(Option<Vec<String>>, bool)> {
+/// What a `VACUUM` or `ANALYZE` covers: the tables its target text names
+/// (or none, which every table means), whether it also analyzes them, and
+/// whether it asks for the INFO report. The options — `FULL`, `FREEZE`,
+/// `VERBOSE`, `ANALYZE`, and a parenthesized option list — decide only
+/// `ANALYZE` and `VERBOSE` here: nothing is reclaimed to report the rest of.
+fn maintenance_target(target: &str) -> Result<(Option<Vec<String>>, bool, bool)> {
     use sqlparser::tokenizer::{Token, Tokenizer};
     let tokens: Vec<Token> = Tokenizer::new(&sqlparser::dialect::PostgreSqlDialect {}, target)
         .tokenize()
@@ -3170,6 +3180,7 @@ fn vacuum_target(target: &str) -> Result<(Option<Vec<String>>, bool)> {
         .filter(|t| !matches!(t, Token::Whitespace(_) | Token::EOF))
         .collect();
     let mut analyze = false;
+    let mut verbose = false;
     let mut tables: Vec<String> = Vec::new();
     let mut at = 0;
     while at < tokens.len() {
@@ -3181,6 +3192,11 @@ fn vacuum_target(target: &str) -> Result<(Option<Vec<String>>, bool)> {
                         && word.value.eq_ignore_ascii_case("analyze")
                     {
                         analyze = true;
+                    }
+                    if let Token::Word(word) = &tokens[at]
+                        && word.value.eq_ignore_ascii_case("verbose")
+                    {
+                        verbose = true;
                     }
                     if tokens[at] == Token::RParen {
                         break;
@@ -3203,6 +3219,9 @@ fn vacuum_target(target: &str) -> Result<(Option<Vec<String>>, bool)> {
                 {
                     if upper == "ANALYZE" {
                         analyze = true;
+                    }
+                    if upper == "VERBOSE" {
+                        verbose = true;
                     }
                 } else if tokens.get(at + 1) == Some(&Token::Period) {
                     // A qualified name: its words join with periods, and a
@@ -3236,5 +3255,5 @@ fn vacuum_target(target: &str) -> Result<(Option<Vec<String>>, bool)> {
             }
         }
     }
-    Ok(((!tables.is_empty()).then_some(tables), analyze))
+    Ok(((!tables.is_empty()).then_some(tables), analyze, verbose))
 }

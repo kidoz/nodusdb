@@ -8,6 +8,12 @@ use crate::*;
 use anyhow::Result;
 use chrono::Utc;
 
+/// An `INFO` report, as PostgreSQL's `VACUUM VERBOSE` and `ANALYZE VERBOSE`
+/// raise them.
+fn info(message: impl Into<String>) -> crate::error_fields::DbError {
+    crate::error_fields::DbError::new(message).severity("INFO")
+}
+
 impl MemExecutor {
     /// `VACUUM [FULL] [FREEZE] [VERBOSE] [ANALYZE] [table]`: stamps the
     /// tables it covers, sweeps their dead-tuple count, and analyzes them
@@ -17,9 +23,11 @@ impl MemExecutor {
         ctx: &ExecutionContext,
         tables: Option<Vec<String>>,
         analyze: bool,
+        verbose: bool,
     ) -> Result<QueryOutput> {
         for tbl in self.maintained_tables(ctx, "vacuum", tables)? {
             self.authorize(ctx, Action::Delete, ResourceRef::Table(tbl.id))?;
+            let before = self.stats.table(tbl.id);
             let now = Utc::now();
             self.stats.update_table(tbl.id, |stats| {
                 stats.last_vacuum = Some(now);
@@ -29,8 +37,25 @@ impl MemExecutor {
                 stats.n_dead_tup = 0;
                 stats.n_ins_since_vacuum = 0;
             });
+            if verbose {
+                // The pages the table occupies, as `pg_class.relpages`
+                // reports them.
+                let (bytes, _) = self.stored_pages(ctx, &tbl).unwrap_or((0, 0));
+                let pages = bytes / 8192;
+                let name = self.qualified_name(&tbl);
+                self.notice(ctx, info(&format!("vacuuming \"{name}\"")));
+                self.notice(
+                    ctx,
+                    info(&format!(
+                        "finished vacuuming \"{name}\": index scans: 0\n\
+                         pages: 0 removed, {pages} remain, {pages} scanned (100.00% of total), 0 eagerly scanned\n\
+                         tuples: 0 removed, {live} remain, 0 are dead but not yet removable",
+                        live = self.scan_rows(tbl.id, &ctx.session_id)?.len(),
+                    )),
+                );
+            }
             if analyze {
-                self.record_analysis(ctx, &tbl)?;
+                self.record_analysis(ctx, &tbl, verbose)?;
             }
         }
         Ok(QueryOutput::tag("VACUUM"))
@@ -42,9 +67,10 @@ impl MemExecutor {
         &self,
         ctx: &ExecutionContext,
         tables: Option<Vec<String>>,
+        verbose: bool,
     ) -> Result<QueryOutput> {
         for tbl in self.maintained_tables(ctx, "analyze", tables)? {
-            self.record_analysis(ctx, &tbl)?;
+            self.record_analysis(ctx, &tbl, verbose)?;
         }
         Ok(QueryOutput::tag("ANALYZE"))
     }
@@ -57,16 +83,50 @@ impl MemExecutor {
         &self,
         ctx: &ExecutionContext,
         tbl: &nodus_catalog::TableDescriptor,
+        verbose: bool,
     ) -> Result<()> {
         self.authorize(ctx, Action::Delete, ResourceRef::Table(tbl.id))?;
-        let (rows, _) = self.stored_pages(ctx, tbl)?;
-        let reltuples = self.stats.table(tbl.id).n_live_tup.max(0) as f64;
+        let (bytes, _) = self.stored_pages(ctx, tbl)?;
+        let pages = bytes / 8192;
+        let stats = self.stats.table(tbl.id);
+        // The rows themselves: the counters do not survive a restart, and
+        // PostgreSQL's ANALYZE counts what it scanned.
+        let reltuples = self.scan_rows(tbl.id, &ctx.session_id)?.len() as f64;
+        if verbose {
+            // PostgreSQL's INFO report: the pages scanned, the rows they
+            // hold, and the sample ANALYZE drew.
+            let sample = self.sample_rows(tbl, reltuples);
+            self.notice(
+                ctx,
+                info(&format!(
+                    "analyzing \"{}.{}\"",
+                    self.schema_name(tbl),
+                    tbl.name
+                )),
+            );
+            self.notice(
+                ctx,
+                info(&format!(
+                    "\"{}\": scanned {pages} of {pages} pages, containing {} live rows and {} dead rows; {sample} rows in sample, {} estimated total rows",
+                    tbl.name, reltuples as i64, stats.n_dead_tup, reltuples as i64,
+                )),
+            );
+        }
         let statistics = crate::column_stats::analyze_table(self, ctx, tbl)?;
+        if verbose {
+            self.notice(
+                ctx,
+                info(&format!(
+                    "finished analyzing table \"{}\"",
+                    self.qualified_name(tbl)
+                )),
+            );
+        }
         self.catalog_writer.update_table_descriptor(
             nodus_catalog::TableDescriptorChange::SetStatistics {
                 table_id: tbl.id,
                 reltuples,
-                relpages: rows / 8192,
+                relpages: pages,
                 statistics,
             },
         )?;
@@ -145,6 +205,36 @@ impl MemExecutor {
 
     /// The pages a table's rows and its indexes occupy in the store — what
     /// `pg_relation_size` and `pg_indexes_size` report of it.
+    /// The table's schema, from the catalog: `default`'s schemas hold every
+    /// relation this engine resolves unqualified names into.
+    fn schema_name(&self, tbl: &nodus_catalog::TableDescriptor) -> String {
+        self.catalog_reader
+            .list_schemas("default")
+            .unwrap_or_default()
+            .into_iter()
+            .find(|schema| schema.id == tbl.schema_id)
+            .map(|schema| schema.name)
+            .unwrap_or_else(|| "public".to_string())
+    }
+
+    /// `database.schema.table`, as PostgreSQL's verbose reports name a
+    /// relation.
+    fn qualified_name(&self, tbl: &nodus_catalog::TableDescriptor) -> String {
+        format!("default.{}.{}", self.schema_name(tbl), tbl.name)
+    }
+
+    /// The rows `ANALYZE` sampled: 300 per statistics target, capped by the
+    /// table.
+    fn sample_rows(&self, tbl: &nodus_catalog::TableDescriptor, rows: f64) -> i64 {
+        let widest = tbl
+            .columns
+            .iter()
+            .map(crate::column_stats::column_target)
+            .max()
+            .unwrap_or(0);
+        (rows as i64).min((300 * widest) as i64)
+    }
+
     fn stored_pages(
         &self,
         ctx: &ExecutionContext,
