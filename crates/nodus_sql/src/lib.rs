@@ -4306,6 +4306,25 @@ fn rewrite_data_clause(
         return statement;
     }
 
+    // `ALTER TABLE ... ALTER COLUMN c SET STATISTICS n`: the parser has no
+    // such operation. The statement travels whole, so the executor can
+    // resolve the table and the column.
+    if is(0, "alter")
+        && is(1, "table")
+        && (0..n)
+            .any(|i| is(i, "set") && is(i + 1, "statistics") && significant.get(i + 2).is_some())
+    {
+        let text = render_tokens(&statement[..=significant[n - 1]]);
+        let sql = format!(
+            "SELECT {UTILITY_FUNCTION}('ALTER COLUMN STATISTICS', '{}')",
+            text.replace('\'', "''")
+        );
+        if let Some(mut tokens) = snippet_tokens(&sql) {
+            tokens.extend(tail);
+            return tokens;
+        }
+        return statement;
+    }
     // `VACUUM`'s target travels with the tag too: the tables it covers have
     // their statistics stamped, and `VACUUM ANALYZE` analyzes them.
     if is(0, "vacuum") {
@@ -4749,6 +4768,18 @@ mod tests {
         assert_eq!(
             one("REINDEX INDEX CONCURRENTLY t_idx"),
             format!("SELECT {UTILITY_FUNCTION}('REINDEX', 'index concurrently t_idx')")
+        );
+        assert_eq!(
+            one("ALTER TABLE t ALTER COLUMN a SET STATISTICS 500"),
+            format!(
+                "SELECT {UTILITY_FUNCTION}('ALTER COLUMN STATISTICS', 'alter table t alter column a set statistics 500')"
+            )
+        );
+        assert_eq!(
+            one("ALTER TABLE s.t ALTER a SET STATISTICS 0"),
+            format!(
+                "SELECT {UTILITY_FUNCTION}('ALTER COLUMN STATISTICS', 'alter table s.t alter a set statistics 0')"
+            )
         );
         assert_eq!(
             one("CREATE STATISTICS s ON a, b FROM t"),

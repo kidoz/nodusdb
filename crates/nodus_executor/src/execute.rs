@@ -461,7 +461,10 @@ impl MemExecutor {
                 value,
                 local,
             } => self.exec_set_variable(ctx, variable, value, local),
-            LogicalPlan::Vacuum { tables, analyze } => {
+            LogicalPlan::Vacuum {
+                tables,
+                analyze,
+            } => {
                 // `VACUUM` needs a transaction of its own, as PostgreSQL
                 // says (`ANALYZE` may run in one).
                 if self.in_transaction_block(ctx) {
@@ -474,6 +477,9 @@ impl MemExecutor {
                 self.exec_vacuum(ctx, tables, analyze)
             }
             LogicalPlan::Analyze { tables } => self.exec_analyze(ctx, tables),
+            LogicalPlan::AlterColumnStatistics { target } => {
+                self.exec_alter_column_statistics(ctx, &target)
+            }
             LogicalPlan::Noop { tag } => Ok(QueryOutput::tag(&tag)),
             LogicalPlan::DeclareCursor {
                 name,

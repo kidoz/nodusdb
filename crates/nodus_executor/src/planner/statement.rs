@@ -920,6 +920,13 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                     let (tables, analyze) = vacuum_target(target)?;
                     Ok(LogicalPlan::Vacuum { tables, analyze })
                 }
+                Some([crate::Value::Text(tag), crate::Value::Text(target)])
+                    if tag == "ALTER COLUMN STATISTICS" =>
+                {
+                    Ok(LogicalPlan::AlterColumnStatistics {
+                        target: target.clone(),
+                    })
+                }
                 Some([crate::Value::Text(tag), crate::Value::Text(target)]) if tag == "REINDEX" => {
                     Ok(LogicalPlan::Reindex {
                         target: target.clone(),

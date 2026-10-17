@@ -1013,6 +1013,101 @@ impl MemExecutor {
         )
     }
 
+    /// `ALTER TABLE [ONLY] table ALTER [COLUMN] column SET STATISTICS n`:
+    /// the column's statistics target, which `ANALYZE` then honors. `n` is
+    /// between 0 (the column is not analyzed) and 10000; `DEFAULT` restores
+    /// the session's `default_statistics_target`.
+    pub(crate) fn exec_alter_column_statistics(
+        &self,
+        ctx: &ExecutionContext,
+        target: &str,
+    ) -> Result<QueryOutput> {
+        use sqlparser::tokenizer::{Token, Tokenizer};
+        let tokens: Vec<Token> = Tokenizer::new(&sqlparser::dialect::PostgreSqlDialect {}, target)
+            .tokenize()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|t| !matches!(t, Token::Whitespace(_) | Token::EOF))
+            .collect();
+        let mut at = 0;
+        let is_word = |at: usize, w: &str| matches!(tokens.get(at), Some(Token::Word(word)) if word.value.eq_ignore_ascii_case(w));
+        if !is_word(at, "alter") || !is_word(at + 1, "table") {
+            return Err(statement_syntax_error(&tokens, at));
+        }
+        at += 2;
+        if is_word(at, "if") && is_word(at + 1, "exists") {
+            at += 2;
+        }
+        let table_name = read_object_name(&tokens, &mut at);
+        if table_name.is_empty() {
+            return Err(statement_syntax_error(&tokens, at));
+        }
+        if !is_word(at, "alter") {
+            return Err(statement_syntax_error(&tokens, at));
+        }
+        at += 1;
+        if is_word(at, "column") {
+            at += 1;
+        }
+        let column_name = read_object_name(&tokens, &mut at);
+        if column_name.is_empty() || !is_word(at, "set") || !is_word(at + 1, "statistics") {
+            return Err(statement_syntax_error(&tokens, at));
+        }
+        at += 2;
+        // `SET STATISTICS DEFAULT` restores the default; `-1` means unset.
+        let target = match tokens.get(at) {
+            Some(Token::Word(word)) if word.value.eq_ignore_ascii_case("default") => -1,
+            Some(Token::Number(number, false)) => {
+                let value: i64 = number.parse().unwrap_or(-1);
+                if !(0..=10000).contains(&value) {
+                    return Err(crate::error_fields::DbError::new(format!(
+                        "statistics target {value} is too large"
+                    ))
+                    .hint("Lower the target size.")
+                    .into());
+                }
+                value as i32
+            }
+            // A negative or otherwise unreadable target, as PostgreSQL
+            // reports it.
+            Some(Token::Minus) | Some(Token::Number(_, true)) => {
+                return Err(
+                    crate::error_fields::DbError::new("statistics target 0 is too small")
+                        .hint("Lower the target size.")
+                        .into(),
+                );
+            }
+            other => return Err(statement_syntax_error(&tokens, other.map_or(at, |_| at))),
+        };
+        // The table and the column must exist.
+        let name = table_name.join(".");
+        let (db_name, schema_name, table_only) = crate::planner::parse_object_name(&name)?;
+        let tbl = self
+            .catalog_reader
+            .get_table(db_name, schema_name, table_only)?;
+        self.authorize(ctx, Action::CreateTable, ResourceRef::Table(tbl.id))?;
+        let column = column_name.last().cloned().unwrap_or_default();
+        if !tbl
+            .columns
+            .iter()
+            .any(|c| c.name.eq_ignore_ascii_case(&column))
+        {
+            return Err(crate::error_fields::DbError::new(format!(
+                "column \"{column}\" of relation \"{}\" does not exist",
+                tbl.name
+            ))
+            .into());
+        }
+        self.catalog_writer.update_table_descriptor(
+            nodus_catalog::TableDescriptorChange::SetColumnStatisticsTarget {
+                table_id: tbl.id,
+                column_name: column,
+                target,
+            },
+        )?;
+        Ok(QueryOutput::tag("ALTER TABLE"))
+    }
+
     /// `CREATE STATISTICS [IF NOT EXISTS] name [(kinds)] ON {column |
     /// (expression)} [, ...] FROM [ONLY] table`: PostgreSQL's errors for a
     /// missing table or column, for more than one relation, and for fewer

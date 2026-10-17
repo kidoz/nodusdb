@@ -347,7 +347,13 @@ impl MemExecutor {
                             Value::Int(relid),
                             Value::Text(column.name.clone()),
                             Value::Int(type_oid),
-                            Value::Int(-1),
+                            // NULL means the session's
+                            // `default_statistics_target`.
+                            if column.statistics_target >= 0 {
+                                Value::Int(column.statistics_target as i64)
+                            } else {
+                                Value::Null
+                            },
                             Value::Int(Self::pg_type_length(&column.data_type)),
                             Value::Int((idx + 1) as i64),
                             Value::Int(if column.data_type.ends_with("[]") {

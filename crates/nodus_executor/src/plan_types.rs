@@ -1902,6 +1902,11 @@ pub enum LogicalPlan {
         #[serde(default)]
         tables: Option<Vec<String>>,
     },
+    /// `ALTER TABLE ... ALTER COLUMN ... SET STATISTICS`: the statement's
+    /// text, resolved by the executor.
+    AlterColumnStatistics {
+        target: String,
+    },
     /// The implicit transaction block a multi-statement simple query runs in,
     /// which the wire layer opens before its first statement. PostgreSQL
     /// wraps such a batch in one transaction: it commits once, at the end.

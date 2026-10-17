@@ -180,6 +180,17 @@ pub(crate) fn set_action(name: &str, raw: &str) -> Result<SetAction, String> {
     if key == "timezone" {
         return crate::timezone::zone_setting(raw).map(SetAction::Set);
     }
+    // PostgreSQL validates a parameter's range: the statistics target's own
+    // is 1 through 10000.
+    if key == "default_statistics_target" {
+        let number: i64 = value.trim().parse().unwrap_or(i64::MIN);
+        if !(1..=10000).contains(&number) {
+            return Err(format!(
+                "{} is outside the valid range for parameter \"{display}\" (1 .. 10000)",
+                value.trim()
+            ));
+        }
+    }
     let invalid = || format!("invalid value for parameter \"{display}\": \"{value}\"");
     Ok(SetAction::Set(match info.vartype {
         "bool" => match value.to_ascii_lowercase().as_str() {
