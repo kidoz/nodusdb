@@ -669,6 +669,7 @@ impl CatalogWriter for MemoryCatalog {
             TableDescriptorChange::AddIndex { table_id, .. } => *table_id,
             TableDescriptorChange::DropIndex { table_id, .. } => *table_id,
             TableDescriptorChange::SetComment { table_id, .. }
+            | TableDescriptorChange::SetColumnStatisticsTarget { table_id, .. }
             | TableDescriptorChange::SetStatistics { table_id, .. }
             | TableDescriptorChange::SetIndexComment { table_id, .. }
             | TableDescriptorChange::ReplaceColumn { table_id, .. }
@@ -744,6 +745,14 @@ impl CatalogWriter for MemoryCatalog {
                     Some(col) => col.comment = comment,
                     None => anyhow::bail!("Column {} not found", name),
                 },
+            },
+            TableDescriptorChange::SetColumnStatisticsTarget {
+                column_name,
+                target,
+                ..
+            } => match table.columns.iter_mut().find(|c| c.name == *column_name) {
+                Some(column) => column.statistics_target = target,
+                None => anyhow::bail!("Column {} not found", column_name),
             },
             TableDescriptorChange::SetStatistics {
                 reltuples,

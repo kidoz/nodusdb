@@ -674,6 +674,7 @@ impl MemExecutor {
             nullable,
             default_expr: default.as_ref().and_then(|e| serde_json::to_string(e).ok()),
             comment: None,
+            statistics_target: -1,
         };
         // Existing rows gain the column under their stored keys.
         for (key, mut row) in rows {

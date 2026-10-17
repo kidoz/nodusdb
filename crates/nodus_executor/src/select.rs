@@ -468,6 +468,7 @@ impl MemExecutor {
                     nullable: true,
                     default_expr: None,
                     comment: None,
+                    statistics_target: -1,
                 });
             }
             let prefix = table_alias.as_deref().unwrap_or(&table_name);
@@ -1112,6 +1113,7 @@ impl MemExecutor {
                         nullable: true,
                         default_expr: None,
                         comment: None,
+                        statistics_target: -1,
                     })
                     .collect();
                 let mut combined_cols = col_names.clone();
@@ -1352,6 +1354,7 @@ impl MemExecutor {
                         nullable: true,
                         default_expr: None,
                         comment: None,
+                        statistics_target: -1,
                     })
                     .collect();
                 let mut combined_cols = col_names.clone();
@@ -1426,6 +1429,7 @@ impl MemExecutor {
                         nullable: true,
                         default_expr: None,
                         comment: None,
+                        statistics_target: -1,
                     })
                     .collect();
                 let mut combined_cols = col_names.clone();
@@ -1484,6 +1488,7 @@ impl MemExecutor {
                         nullable: true,
                         default_expr: None,
                         comment: None,
+                        statistics_target: -1,
                     });
                 }
                 (
@@ -3929,6 +3934,7 @@ fn tableoid_column() -> ColumnDescriptor {
         nullable: false,
         default_expr: None,
         comment: None,
+        statistics_target: -1,
     }
 }
 

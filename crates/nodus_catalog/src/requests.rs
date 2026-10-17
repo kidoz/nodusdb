@@ -113,6 +113,13 @@ pub enum TableDescriptorChange {
         table_id: TableId,
         index_name: String,
     },
+    /// `ALTER COLUMN ... SET STATISTICS`: the column's statistics target;
+    /// -1 restores the session's `default_statistics_target`.
+    SetColumnStatisticsTarget {
+        table_id: TableId,
+        column_name: String,
+        target: i32,
+    },
     /// `COMMENT ON`: sets the comment on the table, or on its column
     /// `column`; `None` removes it.
     SetComment {

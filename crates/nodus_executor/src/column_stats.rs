@@ -9,10 +9,10 @@ use crate::*;
 use nodus_catalog::{ColumnStatistics, StatSlot};
 
 /// PostgreSQL's `default_statistics_target`: the MCV and histogram size.
-const TARGET: usize = 100;
+/// PostgreSQL's `default_statistics_target`.
+const DEFAULT_TARGET: usize = 100;
 /// PostgreSQL samples `300 * target` rows; a table up to that size is its
 /// own sample.
-const SAMPLE_ROWS: usize = 300 * TARGET;
 
 /// `pg_statistic`'s statistic kinds.
 const KIND_MCV: i16 = 1;
@@ -66,27 +66,64 @@ fn column_statistics(
     inherited: bool,
 ) -> Vec<ColumnStatistics> {
     // PostgreSQL draws a sample of 300 * statistics target rows at random;
-    // taking the first rows of the scan keeps ANALYZE deterministic.
-    let sampled: &[Vec<Value>] = if rows.len() > SAMPLE_ROWS {
-        &rows[..SAMPLE_ROWS]
+    // taking the first rows of the scan keeps ANALYZE deterministic. The
+    // sample covers the widest target among the table's columns.
+    let widest = tbl
+        .columns
+        .iter()
+        .map(|column| column_target(column))
+        .max()
+        .unwrap_or(0);
+    let sample_rows = 300 * widest;
+    // PostgreSQL's `totalrows` is the table's own row count, not the
+    // sample's: the distinct estimate and the MCV list's cutoff are scaled
+    // by it.
+    let totalrows = rows.len() as f64;
+    let sampled: &[Vec<Value>] = if rows.len() > sample_rows {
+        &rows[..sample_rows]
     } else {
         rows
     };
-    let totalrows = sampled.len() as f64;
     let mut all = Vec::new();
     for (index, column) in tbl.columns.iter().enumerate() {
+        // A column whose statistics target is zero is not analyzed, and
+        // keeps whatever statistics it had, as PostgreSQL leaves them.
+        let target = column_target(column);
+        if target == 0 {
+            if let Some(previous) = tbl
+                .statistics
+                .iter()
+                .find(|stats| stats.attnum == index as i32 + 1 && stats.inherited == inherited)
+            {
+                all.push(previous.clone());
+            }
+            continue;
+        }
         let fill = Value::Null;
         let cells: Vec<&Value> = sampled
             .iter()
             .map(|row| row.get(index).unwrap_or(&fill))
             .collect();
         let attnum = index as i32 + 1;
-        if let Some(mut statistics) = analyze_column(attnum, &column.data_type, &cells, totalrows) {
+        if let Some(mut statistics) =
+            analyze_column(attnum, &column.data_type, &cells, totalrows, target)
+        {
             statistics.inherited = inherited;
             all.push(statistics);
         }
     }
     all
+}
+
+/// A column's statistics target: its own (`ALTER COLUMN ... SET STATISTICS`),
+/// or the session's `default_statistics_target`.
+pub(crate) fn column_target(column: &nodus_catalog::ColumnDescriptor) -> usize {
+    if column.statistics_target >= 0 {
+        return column.statistics_target as usize;
+    }
+    crate::session_env::setting("default_statistics_target")
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_TARGET)
 }
 
 /// One expression's statistics, as a column's would be: what extended
@@ -96,8 +133,9 @@ pub(crate) fn analyze_values(
     data_type: &str,
     cells: &[&Value],
     totalrows: f64,
+    target: usize,
 ) -> Option<ColumnStatistics> {
-    analyze_column(attnum, data_type, cells, totalrows)
+    analyze_column(attnum, data_type, cells, totalrows, target)
 }
 
 /// One column's statistics, or `None` when the sample had no rows at all.
@@ -106,6 +144,7 @@ fn analyze_column(
     data_type: &str,
     cells: &[&Value],
     totalrows: f64,
+    target: usize,
 ) -> Option<ColumnStatistics> {
     let samplerows = cells.len();
     if samplerows == 0 {
@@ -165,7 +204,7 @@ fn analyze_column(
     // A range column has its own history: the bounds and length histograms.
     if let Some(kind) = range_kind {
         let mut slots = Vec::new();
-        report_range_stats(kind, &nonnull, samplerows - null_cnt, &mut slots);
+        report_range_stats(target, kind, &nonnull, samplerows - null_cnt, &mut slots);
         // Non-null ranges are assumed distinct ("unknown" would be 0; PG
         // estimates them unique).
         return Some(ColumnStatistics {
@@ -210,7 +249,7 @@ fn analyze_column(
     // A tsvector has no order statistics: its lexemes are its statistics
     // (PostgreSQL's `ts_typanalyze`).
     if base == "tsvector" {
-        tsvector_stats(&nonnull, &mut slots);
+        tsvector_stats(&nonnull, &mut slots, target);
         return Some(ColumnStatistics {
             attnum,
             data_type: data_type.to_string(),
@@ -222,6 +261,7 @@ fn analyze_column(
         });
     }
     let n_distinct = scalar_stats(
+        target,
         &base,
         &facts,
         &nonnull,
@@ -232,7 +272,7 @@ fn analyze_column(
         &mut slots,
     );
     if is_array {
-        array_stats(&nonnull, &base, &element_facts, &mut slots);
+        array_stats(target, &nonnull, &base, &element_facts, &mut slots);
     }
     Some(ColumnStatistics {
         attnum,
@@ -329,6 +369,7 @@ fn quote_element(text: &str) -> String {
 /// PostgreSQL's `compute_scalar_stats`: most common values, histogram,
 /// correlation, and the distinct estimate. Returns `stadistinct`.
 fn scalar_stats(
+    target: usize,
     base: &str,
     facts: &TypeFacts,
     nonnull: &[&Value],
@@ -363,8 +404,8 @@ fn scalar_stats(
             ndistinct += 1;
             if dups_cnt > 1 {
                 nmultiple += 1;
-                if track.len() < TARGET || dups_cnt > track[track.len() - 1].0 {
-                    if track.len() < TARGET {
+                if track.len() < target || dups_cnt > track[track.len() - 1].0 {
+                    if track.len() < target {
                         track.push((0, 0));
                     }
                     let mut j = track.len() - 1;
@@ -408,7 +449,7 @@ fn scalar_stats(
     }
 
     // How many MCVs to keep.
-    let num_mcv = if track.len() == ndistinct && n_distinct > 0.0 && track.len() <= TARGET {
+    let num_mcv = if track.len() == ndistinct && n_distinct > 0.0 && track.len() <= target {
         // The whole sample's values fit, and they are believed to be all
         // there is: keep the complete list.
         track.len()
@@ -441,8 +482,8 @@ fn scalar_stats(
 
     // The histogram: the non-MCV values, evenly spaced.
     let mut num_hist = ndistinct - num_mcv;
-    if num_hist > TARGET {
-        num_hist = TARGET + 1;
+    if num_hist > target {
+        num_hist = target + 1;
     }
     if num_hist >= 2 {
         // Collapse the MCV items out of the sorted values, in MCV position
@@ -559,7 +600,7 @@ fn analyze_mcv_list(
 /// PostgreSQL's `ts_typanalyze`: the most common lexemes of a tsvector
 /// column, with their frequencies. The lexemes are stored by length, then
 /// bytes, and the last two numbers are the smallest and the largest frequency.
-fn tsvector_stats(nonnull: &[&Value], slots: &mut Vec<StatSlot>) {
+fn tsvector_stats(nonnull: &[&Value], slots: &mut Vec<StatSlot>, target: usize) {
     let mut lexemes: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut nonnull_cnt = 0usize;
     for value in nonnull {
@@ -579,8 +620,8 @@ fn tsvector_stats(nonnull: &[&Value], slots: &mut Vec<StatSlot>) {
     }
     let mut kept: Vec<(String, usize)> = lexemes.into_iter().collect();
     kept.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    if kept.len() > TARGET * 10 {
-        kept.truncate(TARGET * 10);
+    if kept.len() > target * 10 {
+        kept.truncate(target * 10);
     }
     let minfreq = kept.iter().map(|(_, count)| *count).min().unwrap_or(0);
     let maxfreq = kept.iter().map(|(_, count)| *count).max().unwrap_or(0);
@@ -608,6 +649,7 @@ fn tsvector_stats(nonnull: &[&Value], slots: &mut Vec<StatSlot>) {
 /// PostgreSQL's `compute_array_stats`: the most common elements with their
 /// frequencies, and a histogram of the distinct element counts.
 fn array_stats(
+    target: usize,
     nonnull: &[&Value],
     element_base: &str,
     element: &TypeFacts,
@@ -652,8 +694,8 @@ fn array_stats(
         b.1.cmp(&a.1)
             .then_with(|| cmp_values(element_base, &a.0, &b.0))
     });
-    if kept.len() > TARGET * 10 {
-        kept.truncate(TARGET * 10);
+    if kept.len() > target * 10 {
+        kept.truncate(target * 10);
     }
     let minfreq = kept.iter().map(|(_, count)| *count).min().unwrap_or(0);
     let maxfreq = kept.iter().map(|(_, count)| *count).max().unwrap_or(0);
@@ -691,7 +733,7 @@ fn array_stats(
             }
         }
         let analyzed_rows = counts.len();
-        let num_hist = TARGET.max(2);
+        let num_hist = target.max(2);
         let delta = analyzed_rows as i64 - 1;
         let mut hist: Vec<f32> = Vec::with_capacity(num_hist + 1);
         let mut j = 0usize;
@@ -719,6 +761,7 @@ fn array_stats(
 /// PostgreSQL's `compute_range_stats`: the bounds histogram and the length
 /// histogram.
 fn report_range_stats(
+    target: usize,
     kind: crate::ranges::Kind,
     nonnull: &[&Value],
     non_null_cnt: usize,
@@ -747,8 +790,8 @@ fn report_range_stats(
         lowers.sort_by(|a, b| a.cmp_end(kind, b));
         uppers.sort_by(|a, b| a.cmp_end(kind, b));
         let mut num_hist = non_empty;
-        if num_hist > TARGET {
-            num_hist = TARGET + 1;
+        if num_hist > target {
+            num_hist = target + 1;
         }
         let delta = (non_empty - 1) / (num_hist - 1);
         let deltafrac = (non_empty - 1) % (num_hist - 1);
@@ -781,8 +824,8 @@ fn report_range_stats(
     if non_empty >= 2 {
         lengths.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let mut num_hist = non_empty;
-        if num_hist > TARGET {
-            num_hist = TARGET + 1;
+        if num_hist > target {
+            num_hist = target + 1;
         }
         let delta = (non_empty - 1) / (num_hist - 1);
         let deltafrac = (non_empty - 1) % (num_hist - 1);

@@ -264,6 +264,17 @@ pub struct ColumnDescriptor {
     /// The column's `COMMENT ON` text.
     #[serde(default)]
     pub comment: Option<String>,
+    /// The column's statistics target (`ALTER COLUMN ... SET STATISTICS`);
+    /// -1, the default, means the session's
+    /// `default_statistics_target` applies. Defaulted so descriptors
+    /// persisted before it decode.
+    #[serde(default = "default_statistics_target")]
+    pub statistics_target: i32,
+}
+
+/// An unset statistics target, as a column without `SET STATISTICS` has.
+fn default_statistics_target() -> i32 {
+    -1
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

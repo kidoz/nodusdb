@@ -1285,6 +1285,7 @@ impl MemExecutor {
                 nullable: true,
                 default_expr: None,
                 comment: None,
+                statistics_target: -1,
             }],
             constraints: vec![],
             view_query: None,

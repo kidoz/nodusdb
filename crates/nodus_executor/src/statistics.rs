@@ -328,6 +328,7 @@ impl MemExecutor {
                 nullable: true,
                 default_expr: None,
                 comment: None,
+                statistics_target: -1,
             }],
             constraints: vec![],
             view_query: None,
@@ -615,6 +616,8 @@ fn expression_statistics(
             .find(|c| c.name == name)
             .map(|c| c.data_type.clone())
     };
+    // An expression key is analyzed to the object's own target.
+    let stattarget = definition.target.unwrap_or(DEFAULT_TARGET).max(0) as usize;
     let mut all = Vec::new();
     for (index, text) in definition.expressions().iter().enumerate() {
         let expr =
@@ -627,9 +630,13 @@ fn expression_statistics(
             .collect();
         let cells: Vec<&Value> = values.iter().collect();
         let attnum = index as i32 + 1;
-        if let Some(statistics) =
-            crate::column_stats::analyze_values(attnum, &data_type, &cells, rows.len() as f64)
-        {
+        if let Some(statistics) = crate::column_stats::analyze_values(
+            attnum,
+            &data_type,
+            &cells,
+            rows.len() as f64,
+            stattarget,
+        ) {
             all.push(statistics);
         }
     }

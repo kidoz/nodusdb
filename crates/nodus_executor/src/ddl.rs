@@ -264,6 +264,7 @@ impl MemExecutor {
                     .as_ref()
                     .and_then(|e| serde_json::to_string(e).ok()),
                 comment: None,
+                statistics_target: -1,
             })
             .collect();
 
@@ -1454,6 +1455,7 @@ impl MemExecutor {
                 nullable: true,
                 default_expr: None,
                 comment: None,
+                statistics_target: -1,
             })
             .collect();
         if let Some(tbl) = existing {

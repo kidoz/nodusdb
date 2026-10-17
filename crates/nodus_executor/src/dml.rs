@@ -1164,6 +1164,7 @@ impl MemExecutor {
                     nullable: true,
                     default_expr: None,
                     comment: None,
+                    statistics_target: -1,
                 }),
         );
         names.extend(out.columns);
@@ -1223,6 +1224,7 @@ impl MemExecutor {
                     nullable: true,
                     default_expr: None,
                     comment: None,
+                    statistics_target: -1,
                 })
                 .collect();
             let outer_quals = crate::joins::qualifiers(names);
