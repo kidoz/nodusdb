@@ -335,11 +335,17 @@ impl MemExecutor {
                             .as_ref()
                             .and_then(crate::sequences::identity_kind)
                             .map_or("", |always| if always { "a" } else { "d" });
+                        // `s` is a stored generated column, `v` a virtual one.
                         let generated = if default
                             .as_ref()
                             .is_some_and(|d| Self::generation_expr(d).is_some())
                         {
                             "s"
+                        } else if default
+                            .as_ref()
+                            .is_some_and(|d| Self::virtual_expr(d).is_some())
+                        {
+                            "v"
                         } else {
                             ""
                         };
@@ -4098,7 +4104,9 @@ impl MemExecutor {
     /// A column default as `pg_get_expr(adbin, ...)` shows it; a generated
     /// column's default is its generation expression.
     pub(crate) fn default_text(default: &crate::ScalarExpr, data_type: &str) -> String {
-        let expr = Self::generation_expr(default).unwrap_or(default);
+        let expr = Self::generation_expr(default)
+            .or_else(|| Self::virtual_expr(default))
+            .unwrap_or(default);
         match expr {
             // A literal default is stored as a value of the column's type.
             crate::ScalarExpr::Literal(Value::Text(s)) => format!(

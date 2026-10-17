@@ -559,6 +559,14 @@ pub(crate) fn failing_row_typed(
         .iter()
         .enumerate()
         .map(|(i, v)| match v {
+            // A virtual generated column holds nothing in the heap, which is
+            // what PostgreSQL's report says.
+            _ if columns.get(i).is_some_and(|column| {
+                crate::MemExecutor::generated_kind(column).is_some_and(|(_, virtual_)| virtual_)
+            }) =>
+            {
+                "virtual".to_string()
+            }
             Value::Null => "null".to_string(),
             v => {
                 let kind = columns

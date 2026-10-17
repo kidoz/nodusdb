@@ -3415,6 +3415,85 @@ fn snippet_tokens(sql: &str) -> Option<Vec<sqlparser::tokenizer::TokenWithSpan>>
     Some(tokens)
 }
 
+/// The function a *virtual* generated column's expression is wrapped in —
+/// `GENERATED ALWAYS AS (__NODUS_VIRTUAL__(expr)) STORED` — since the
+/// PostgreSQL parser takes only `STORED`. The planner unwraps it and keeps
+/// the column virtual; the value is computed on read.
+pub const VIRTUAL_MARKER: &str = "__NODUS_VIRTUAL__";
+
+/// Rewrites `GENERATED ALWAYS AS (expr) VIRTUAL` to the parsable
+/// `GENERATED ALWAYS AS (__NODUS_VIRTUAL__(expr)) STORED`: the marker
+/// function tells the planner the column is virtual, and `STORED` is the
+/// modifier the parser accepts.
+fn rewrite_virtual_generation(
+    mut statement: Vec<sqlparser::tokenizer::TokenWithSpan>,
+) -> Vec<sqlparser::tokenizer::TokenWithSpan> {
+    use sqlparser::tokenizer::Token;
+    let significant: Vec<usize> = statement
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| !matches!(t.token, Token::Whitespace(_)))
+        .map(|(i, _)| i)
+        .collect();
+    let word = |i: usize| match &statement[i].token {
+        Token::Word(w) if w.quote_style.is_none() => Some(w.value.as_str()),
+        _ => None,
+    };
+    // `GENERATED ALWAYS AS ( ... ) VIRTUAL`: the `VIRTUAL` after the
+    // expression's closing parenthesis, and the matching parenthesis.
+    let mut marks = Vec::new();
+    for (pos, &at) in significant.iter().enumerate() {
+        if word(at) != Some("virtual") {
+            continue;
+        }
+        let Some(&close) = pos.checked_sub(1).and_then(|p| significant.get(p)) else {
+            continue;
+        };
+        if !matches!(statement[close].token, Token::RParen) {
+            continue;
+        }
+        let mut depth = 0usize;
+        let mut open = None;
+        for &j in significant[..pos].iter().rev() {
+            match statement[j].token {
+                Token::RParen => depth += 1,
+                Token::LParen => {
+                    depth -= 1;
+                    if depth == 0 {
+                        open = Some(j);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(open) = open else { continue };
+        let at_open = significant
+            .iter()
+            .position(|&j| j == open)
+            .expect("open is significant");
+        if at_open < 2 || word(significant[at_open - 1]) != Some("as") {
+            continue;
+        }
+        if word(significant[at_open - 2]) != Some("always") {
+            continue;
+        }
+        marks.push((open, close, at));
+    }
+    if marks.is_empty() {
+        return statement;
+    }
+    let replacement = snippet_tokens("stored").unwrap_or_default();
+    let marker = snippet_tokens(&format!("{VIRTUAL_MARKER}(")).unwrap_or_default();
+    let closer = snippet_tokens(")").unwrap_or_default();
+    // Splices from the end keep the earlier marks' indices valid.
+    for (open, close, at) in marks.into_iter().rev() {
+        statement.splice(at..=at, replacement.iter().cloned());
+        statement.splice(close..close, closer.iter().cloned());
+        statement.splice(open + 1..open + 1, marker.iter().cloned());
+    }
+    statement
+}
 
 /// Statements the parser lacks or takes only in part: `FETCH` and `MOVE`
 /// ([`CURSOR_FUNCTION`]), `ALTER DOMAIN` and `DROP DOMAIN`
@@ -3425,6 +3504,7 @@ fn rewrite_statement_form(
     mut statement: Vec<sqlparser::tokenizer::TokenWithSpan>,
 ) -> Vec<sqlparser::tokenizer::TokenWithSpan> {
     use sqlparser::tokenizer::{Token, TokenWithSpan};
+    statement = rewrite_virtual_generation(statement);
     let word = |t: &TokenWithSpan| match &t.token {
         Token::Word(w) if w.quote_style.is_none() => Some(w.value.clone()),
         _ => None,
@@ -4766,6 +4846,21 @@ mod tests {
     #[test]
     fn generated_columns_and_enforcement_are_rewritten() {
         let one = |sql: &str| parse_sql(sql).unwrap().remove(0).to_string();
+        // The parser takes only `STORED`: a virtual column's expression is
+        // wrapped in the marker the planner unwraps.
+        assert_eq!(
+            one("CREATE TABLE t (a int, b int GENERATED ALWAYS AS (a + 1) VIRTUAL)"),
+            "CREATE TABLE t (a INT, b INT GENERATED ALWAYS AS (__NODUS_VIRTUAL__(a + 1)) STORED)"
+        );
+        assert_eq!(
+            one("ALTER TABLE t ADD COLUMN b int GENERATED ALWAYS AS (a * 2) virtual"),
+            "ALTER TABLE t ADD COLUMN b INT GENERATED ALWAYS AS (__NODUS_VIRTUAL__(a * 2)) STORED"
+        );
+        // A plain STORED column keeps its expression as written.
+        assert_eq!(
+            one("CREATE TABLE t (a INT, b INT GENERATED ALWAYS AS (a + 1) STORED)"),
+            "CREATE TABLE t (a INT, b INT GENERATED ALWAYS AS (a + 1) STORED)"
+        );
         // `ALTER CONSTRAINT` carries only the characteristics the statement
         // mentions; the others are NULL.
         assert_eq!(

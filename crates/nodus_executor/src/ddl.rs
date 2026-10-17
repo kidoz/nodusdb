@@ -160,20 +160,40 @@ impl MemExecutor {
             columns = merged;
             constraints.extend(inherited_checks);
         }
-        // A key of the new table's own: its columns must exist and every
-        // unique constraint must cover it.
+        // Whether a column is generated — stored or virtual.
+        let is_generated = |c: &ColumnDef| {
+            c.default.as_ref().is_some_and(|d| {
+                MemExecutor::generation_expr(d).is_some() || MemExecutor::virtual_expr(d).is_some()
+            })
+        };
+        // A key of the new table's own: its columns must exist, no part may
+        // be a generated column, and every unique constraint must cover it.
         if let Some(key_text) = &partition_by {
             let key = crate::partitioning::PartitionKey::parse(key_text)?;
+            let generated_key_error = |column: &str| -> anyhow::Error {
+                crate::error_fields::DbError::new("cannot use generated column in partition key")
+                    .detail(format!("Column \"{column}\" is a generated column."))
+                    .into()
+            };
             for part in &key.columns {
                 // A part is a column name or an expression; an expression's
                 // references must exist.
                 if let Some(column) = columns.iter().find(|c| &c.name == part) {
-                    let _ = column;
+                    if is_generated(column) {
+                        return Err(generated_key_error(&column.name));
+                    }
                     continue;
                 }
                 let mut refs = Vec::new();
                 if let Ok(expr) = crate::partitioning::key_expression(part) {
                     crate::filter_eval::scalar_column_refs(&expr, &mut refs);
+                }
+                for r in &refs {
+                    if let Some(column) = columns.iter().find(|c| c.name.eq_ignore_ascii_case(r))
+                        && is_generated(column)
+                    {
+                        return Err(generated_key_error(&column.name));
+                    }
                 }
                 if refs.is_empty() || refs.iter().any(|r| !columns.iter().any(|c| &c.name == r)) {
                     anyhow::bail!("column \"{part}\" named in partition key does not exist");
@@ -209,6 +229,21 @@ impl MemExecutor {
         self.reject_type_name(schema_name, table_only)?;
         for column in &columns {
             crate::user_types::check_type_exists(&column.data_type)?;
+        }
+        // A generation expression reads the table's columns: each must
+        // exist and must not itself be generated.
+        {
+            let generated: Vec<(String, bool)> = columns
+                .iter()
+                .map(|c| (c.name.clone(), is_generated(c)))
+                .collect();
+            for column in &columns {
+                if let Some(expr) = column.default.as_ref().and_then(|d| {
+                    MemExecutor::generation_expr(d).or_else(|| MemExecutor::virtual_expr(d))
+                }) {
+                    crate::dml::check_generation_refs(expr, &generated)?;
+                }
+            }
         }
         let constraints = name_check_constraints(table_only, &columns, constraints);
         // Foreign keys get their names and referenced columns, checked
@@ -273,6 +308,28 @@ impl MemExecutor {
             if c.unique {
                 unique_cols.push((d.clone(), c.primary));
             }
+        }
+        // A virtual generated column is computed on read, so a key over it
+        // cannot be maintained.
+        let is_virtual = |d: &nodus_catalog::ColumnDescriptor| {
+            MemExecutor::generated_kind(d).is_some_and(|(_, virtual_column)| virtual_column)
+        };
+        for (column, primary) in &unique_cols {
+            if is_virtual(column) {
+                anyhow::bail!(if *primary {
+                    "primary keys on virtual generated columns are not supported"
+                } else {
+                    "unique constraints on virtual generated columns are not supported"
+                });
+            }
+        }
+        if unique_constraints.iter().flatten().any(|name| {
+            descriptors
+                .iter()
+                .find(|d| &d.name == name)
+                .is_some_and(is_virtual)
+        }) {
+            anyhow::bail!("unique constraints on virtual generated columns are not supported");
         }
         // Multi-column UNIQUE constraints, resolved to column ids up front so an
         // unknown column fails before the table is created.
@@ -1855,6 +1912,35 @@ impl MemExecutor {
             .filter(|(_, e)| e.is_none())
             .map(|(c, _)| c.clone())
             .collect();
+        // A virtual generated column is computed on read, so no index — key,
+        // expression, or INCLUDE — can hold it.
+        let virtual_column = |name: &str| {
+            let bare = name.rsplit('.').next().unwrap_or(name);
+            tbl.columns
+                .iter()
+                .find(|c| c.name == bare)
+                .is_some_and(|c| Self::generated_kind(c).is_some_and(|(_, virtual_)| virtual_))
+        };
+        if plain
+            .iter()
+            .chain(include.iter())
+            .any(|column| virtual_column(column))
+        {
+            anyhow::bail!("indexes on virtual generated columns are not supported");
+        }
+        for sql in expressions.iter().flatten() {
+            let lowered = sqlparser::parser::Parser::new(&sqlparser::dialect::PostgreSqlDialect {})
+                .try_with_sql(sql)
+                .and_then(|mut parser| parser.parse_expr())
+                .ok()
+                .and_then(|parsed| crate::planner::lower_scalar(&parsed, &[]));
+            let Some(lowered) = lowered else { continue };
+            let mut refs = Vec::new();
+            crate::filter_eval::scalar_column_refs(&lowered, &mut refs);
+            if refs.iter().any(|name| virtual_column(name)) {
+                anyhow::bail!("indexes on virtual generated columns are not supported");
+            }
+        }
         // A geometric column has no default operator class for btree.
         for column in &plain {
             let data_type = tbl

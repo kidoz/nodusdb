@@ -604,6 +604,7 @@ impl MemExecutor {
                 if !provided[i]
                     && let Some(expr) = default
                     && Self::generation_expr(&expr).is_none()
+                    && Self::virtual_expr(&expr).is_none()
                 {
                     raw[i] = eval_scalar_expr(&expr, &[], &[]);
                 }
@@ -1555,7 +1556,8 @@ impl MemExecutor {
             .and_then(|json| serde_json::from_str::<ScalarExpr>(json).ok())
     }
 
-    /// A generated column's expression: its default is `__GENERATED__(expr)`.
+    /// A *stored* generated column's expression: its default is
+    /// `__GENERATED__(expr)`.
     pub(crate) fn generation_expr(default: &ScalarExpr) -> Option<&ScalarExpr> {
         match default {
             ScalarExpr::Function { name, args } if name == "__GENERATED__" && args.len() == 1 => {
@@ -1565,10 +1567,34 @@ impl MemExecutor {
         }
     }
 
+    /// A *virtual* generated column's expression: its default is
+    /// `__VIRTUAL__(expr)`, computed on read.
+    pub(crate) fn virtual_expr(default: &ScalarExpr) -> Option<&ScalarExpr> {
+        match default {
+            ScalarExpr::Function { name, args } if name == "__VIRTUAL__" && args.len() == 1 => {
+                args.first()
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether the column is generated — stored or virtual — and which.
+    pub(crate) fn generated_kind(column: &ColumnDescriptor) -> Option<(ScalarExpr, bool)> {
+        // Only a column whose default names a marker is parsed: most are not.
+        let json = column.default_expr.as_ref()?;
+        if !json.contains("__GENERATED__") && !json.contains("__VIRTUAL__") {
+            return None;
+        }
+        let default: ScalarExpr = serde_json::from_str(json).ok()?;
+        Self::generation_expr(&default)
+            .map(|expr| (expr.clone(), false))
+            .or_else(|| Self::virtual_expr(&default).map(|expr| (expr.clone(), true)))
+    }
+
     /// Why a column rejects explicit values, if it does: it is generated, or
     /// a `GENERATED ALWAYS` identity.
     fn write_protection(default: &ScalarExpr) -> Option<&'static str> {
-        if Self::generation_expr(default).is_some() {
+        if Self::generation_expr(default).is_some() || Self::virtual_expr(default).is_some() {
             Some("it is a generated column")
         } else if crate::sequences::identity_kind(default) == Some(true) {
             Some("it is an identity column defined as GENERATED ALWAYS")
@@ -1577,17 +1603,17 @@ impl MemExecutor {
         }
     }
 
-    /// Computes every generated column of `row` from its other columns.
+    /// Computes every generated column of `row` from its other columns. A
+    /// virtual column's value is stored too, so constraints see it; scans
+    /// compute it again, which is what makes it virtual.
     fn compute_generated(
         tbl: &nodus_catalog::TableDescriptor,
         row: &mut [Value],
         col_names: &[String],
     ) {
         for (i, c) in tbl.columns.iter().enumerate() {
-            if let Some(default) = Self::column_default(c)
-                && let Some(expr) = Self::generation_expr(&default)
-            {
-                let value = eval_scalar_expr(expr, row, col_names);
+            if let Some((expr, _)) = Self::generated_kind(c) {
+                let value = eval_scalar_expr(&expr, row, col_names);
                 row[i] = crate::value::coerce_for_column(&value, &c.data_type);
             }
         }
@@ -1611,14 +1637,27 @@ impl MemExecutor {
             let is_default = matches!(expr,
                 ScalarExpr::Function { name, args } if name == "__COLUMN_DEFAULT__" && args.is_empty());
             if !is_default && default.as_ref().and_then(Self::write_protection).is_some() {
-                anyhow::bail!("column \"{col}\" can only be updated to DEFAULT");
+                // The DETAIL names the reason, as PostgreSQL's does.
+                let identity =
+                    default.as_ref().and_then(crate::sequences::identity_kind) == Some(true);
+                return Err(crate::error_fields::DbError::new(format!(
+                    "column \"{col}\" can only be updated to DEFAULT"
+                ))
+                .detail(if identity {
+                    format!("Column \"{col}\" is an identity column defined as GENERATED ALWAYS.")
+                } else {
+                    format!("Column \"{col}\" is a generated column.")
+                })
+                .into());
             }
             // `SET col = DEFAULT` sentinel: the declared default, else NULL. A
             // generated column is recomputed below.
             let val = if is_default {
                 default
                     .or_else(|| crate::user_types::domain_default(&tbl.columns[idx].data_type))
-                    .filter(|d| Self::generation_expr(d).is_none())
+                    .filter(|d| {
+                        Self::generation_expr(d).is_none() && Self::virtual_expr(d).is_none()
+                    })
                     .map(|e| eval_scalar_expr(&e, &[], &[]))
                     .unwrap_or(Value::Null)
             } else {
@@ -1900,6 +1939,60 @@ impl MemExecutor {
             }
         }
         Ok(None)
+    }
+}
+
+/// The bare column names a generation expression reads.
+pub(crate) fn generation_refs(expr: &ScalarExpr) -> Vec<String> {
+    let mut names = Vec::new();
+    crate::filter_eval::scalar_column_refs(expr, &mut names);
+    names
+        .into_iter()
+        .map(|name| name.rsplit('.').next().unwrap_or(&name).to_string())
+        .collect()
+}
+
+/// PostgreSQL's checks of a generation expression against the table's
+/// columns, as `(name, is generated)` pairs: every column it reads must
+/// exist, and must not itself be generated — a generated column cannot
+/// reference another.
+pub(crate) fn check_generation_refs(expr: &ScalarExpr, columns: &[(String, bool)]) -> Result<()> {
+    for name in generation_refs(expr) {
+        let Some((found, generated)) = columns
+            .iter()
+            .find(|(column, _)| column.eq_ignore_ascii_case(&name))
+        else {
+            anyhow::bail!("column \"{name}\" does not exist");
+        };
+        if *generated {
+            anyhow::bail!(
+                "{}",
+                crate::error_fields::DbError::new(format!(
+                    "cannot use generated column \"{found}\" in column generation expression"
+                ))
+                .detail("A generated column cannot reference another generated column.")
+                .into_text()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Computes a row's virtual generated columns from its other columns. Every
+/// read of a stored row runs this, which is what makes such a column
+/// virtual: the stored value is only a cache (and what constraints saw).
+pub(crate) fn compute_virtual_columns(
+    row: &mut [Value],
+    columns: &[nodus_catalog::ColumnDescriptor],
+) {
+    let names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
+    for (i, c) in columns.iter().enumerate() {
+        if i < row.len()
+            && let Some((expr, true)) = MemExecutor::generated_kind(c)
+        {
+            let value = eval_scalar_expr(&expr, row, &names);
+            row[i] = crate::value::coerce_for_column(&value, &c.data_type);
+        }
     }
 }
 

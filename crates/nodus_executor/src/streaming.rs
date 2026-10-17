@@ -304,7 +304,11 @@ impl MemExecutor {
             }
             let pair = pair?;
             let mut values: Vec<Value> = serde_json::from_slice(&pair.value)?;
+            if values.len() < tbl.columns.len() {
+                values.resize(tbl.columns.len(), Value::Null);
+            }
             crate::value::restore_row(&mut values, &tbl.columns);
+            crate::dml::compute_virtual_columns(&mut values, &tbl.columns);
 
             let keep = self
                 .eval_filter(ctx, &values, &col_names, &joined_columns, filter)

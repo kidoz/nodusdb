@@ -666,20 +666,24 @@ impl MemExecutor {
             }
             anyhow::bail!(exists);
         }
-        // Backfill for existing rows: the DEFAULT evaluated for each (a
-        // `nextval` or `random()` gives each its own), or NULL when none is
-        // declared (PostgreSQL semantics).
-        let backfill = || {
-            default
-                .as_ref()
-                .map(|e| {
-                    crate::value::coerce_for_column(
-                        &crate::planner::eval_scalar_expr(e, &[], &[]),
-                        &data_type,
-                    )
-                })
-                .unwrap_or(Value::Null)
-        };
+        // A generated column's value comes from each existing row; a plain
+        // DEFAULT is evaluated per row (a `nextval` or `random()` gives each
+        // its own); NULL when none is declared.
+        let generated = default.as_ref().and_then(|d| {
+            Self::generation_expr(d)
+                .map(|expr| (expr.clone(), false))
+                .or_else(|| Self::virtual_expr(d).map(|expr| (expr.clone(), true)))
+        });
+        if let Some((expr, _)) = &generated {
+            let mut columns: Vec<(String, bool)> = tbl
+                .columns
+                .iter()
+                .map(|c| (c.name.clone(), Self::generated_kind(c).is_some()))
+                .collect();
+            columns.push((name.clone(), true));
+            crate::dml::check_generation_refs(expr, &columns)?;
+        }
+        let scan_columns: Vec<String> = tbl.columns.iter().map(|c| c.name.clone()).collect();
         let rows = self.scan_rows_keyed(tbl.id, &ctx.session_id)?;
         if !nullable && default.is_none() && !rows.is_empty() {
             return Err(self.contains_nulls(tbl, &name));
@@ -699,7 +703,21 @@ impl MemExecutor {
         };
         // Existing rows gain the column under their stored keys.
         for (key, mut row) in rows {
-            let value = backfill();
+            let value = match &generated {
+                Some((expr, _)) => crate::value::coerce_for_column(
+                    &crate::planner::eval_scalar_expr(expr, &row, &scan_columns),
+                    &data_type,
+                ),
+                None => default
+                    .as_ref()
+                    .map(|e| {
+                        crate::value::coerce_for_column(
+                            &crate::planner::eval_scalar_expr(e, &[], &[]),
+                            &data_type,
+                        )
+                    })
+                    .unwrap_or(Value::Null),
+            };
             if !nullable && value == Value::Null {
                 return Err(self.contains_nulls(tbl, &column.name));
             }
@@ -1325,6 +1343,16 @@ impl MemExecutor {
                 initially_deferred,
                 nulls_not_distinct,
             } => {
+                if columns.iter().any(|column| {
+                    tbl.columns
+                        .iter()
+                        .find(|c| &c.name == column)
+                        .is_some_and(|c| Self::generated_kind(c).is_some_and(|(_, v)| v))
+                }) {
+                    anyhow::bail!(
+                        "unique constraints on virtual generated columns are not supported"
+                    );
+                }
                 let name = match name {
                     Some(name) => name,
                     None => self.unused_relation_name(&format!(
@@ -1350,6 +1378,14 @@ impl MemExecutor {
                 deferrable,
                 initially_deferred,
             } => {
+                if columns.iter().any(|column| {
+                    tbl.columns
+                        .iter()
+                        .find(|c| &c.name == column)
+                        .is_some_and(|c| Self::generated_kind(c).is_some_and(|(_, v)| v))
+                }) {
+                    anyhow::bail!("primary keys on virtual generated columns are not supported");
+                }
                 if !Self::pk_positions_declared(tbl).is_empty() {
                     anyhow::bail!(
                         "multiple primary keys for table \"{}\" are not allowed",

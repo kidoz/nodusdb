@@ -858,10 +858,17 @@ impl MemExecutor {
             .unwrap_or_default()
     }
 
-    /// Decodes a stored row into typed values (see [`crate::value::restore_row`]).
+    /// Decodes a stored row into typed values (see [`crate::value::restore_row`]),
+    /// computing its virtual generated columns from the rest.
     fn decode_row(bytes: &[u8], columns: &[ColumnDescriptor]) -> Result<Vec<Value>> {
         let mut row: Vec<Value> = serde_json::from_slice(bytes)?;
+        // A row written before a column was added need not have its slot
+        // yet: the added column reads NULL until the row is rewritten.
+        if row.len() < columns.len() {
+            row.resize(columns.len(), Value::Null);
+        }
         crate::value::restore_row(&mut row, columns);
+        crate::dml::compute_virtual_columns(&mut row, columns);
         Ok(row)
     }
 

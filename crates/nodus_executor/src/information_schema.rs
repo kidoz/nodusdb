@@ -281,9 +281,11 @@ impl MemExecutor {
                 );
                 let default = Self::column_default(column);
                 let identity = default.as_ref().and_then(crate::sequences::identity_kind);
-                let generated = default
-                    .as_ref()
-                    .and_then(|d| Self::generation_expr(d).cloned());
+                let generated = default.as_ref().and_then(|d| {
+                    Self::generation_expr(d)
+                        .or_else(|| Self::virtual_expr(d))
+                        .cloned()
+                });
                 let default_text = default
                     .as_ref()
                     .filter(|_| identity.is_none() && generated.is_none())

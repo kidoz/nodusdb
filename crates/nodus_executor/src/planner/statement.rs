@@ -190,11 +190,17 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                             });
                         }
                         // `GENERATED ALWAYS AS (expr) [STORED | VIRTUAL]`: computed
-                        // from the row whenever it is written.
+                        // from the row whenever it is written (stored) or read
+                        // (virtual; the token rewriter marks it, since the
+                        // parser takes only `STORED`).
                         sqlparser::ast::ColumnOption::Generated {
                             generation_expr: Some(expr),
                             ..
                         } => {
+                            let (expr, virtual_column) = match virtual_marked(expr) {
+                                Some(inner) => (inner, true),
+                                None => (expr, false),
+                            };
                             let computed = lower_scalar(expr, params).ok_or_else(|| {
                                 expression_error(expr, || {
                                     format!(
@@ -214,7 +220,11 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                                 );
                             }
                             default = Some(ScalarExpr::Function {
-                                name: "__GENERATED__".to_string(),
+                                name: if virtual_column {
+                                    "__VIRTUAL__".to_string()
+                                } else {
+                                    "__GENERATED__".to_string()
+                                },
                                 args: vec![computed],
                             });
                         }
@@ -2302,6 +2312,36 @@ fn plan_alter_table_op(
                         identity =
                             Some(matches!(generated_as, sqlparser::ast::GeneratedAs::Always));
                     }
+                    // `ADD COLUMN c type GENERATED ALWAYS AS (expr) [STORED |
+                    // VIRTUAL]`.
+                    ColumnOption::Generated {
+                        generation_expr: Some(expr),
+                        ..
+                    } => {
+                        let (expr, virtual_column) = match virtual_marked(expr) {
+                            Some(inner) => (inner, true),
+                            None => (expr, false),
+                        };
+                        let computed = lower_scalar(expr, params).ok_or_else(|| {
+                            anyhow::anyhow!("Unsupported generation expression for column {column}")
+                        })?;
+                        if crate::subqueries::contains_subquery(&computed) {
+                            anyhow::bail!("cannot use subquery in column generation expression");
+                        }
+                        if scalar_has_aggregate(&computed) {
+                            anyhow::bail!(
+                                "aggregate functions are not allowed in column generation expressions"
+                            );
+                        }
+                        default = Some(ScalarExpr::Function {
+                            name: if virtual_column {
+                                "__VIRTUAL__".to_string()
+                            } else {
+                                "__GENERATED__".to_string()
+                            },
+                            args: vec![computed],
+                        });
+                    }
                     ColumnOption::Null => {}
                     ColumnOption::NotNull => nullable = false,
                     ColumnOption::Default(e) => {
@@ -2570,6 +2610,33 @@ fn nulls_not_distinct(constraint: &sqlparser::ast::UniqueConstraint) -> bool {
         .is_some_and(|name| name.value == nodus_sql::NULLS_NOT_DISTINCT_MARK)
 }
 
+/// The expression a virtual generated column's marker wraps —
+/// `__NODUS_VIRTUAL__(expr)`, written by the token rewriter because the
+/// parser takes only `STORED`.
+fn virtual_marked(expr: &sqlparser::ast::Expr) -> Option<&sqlparser::ast::Expr> {
+    let sqlparser::ast::Expr::Function(function) = expr else {
+        return None;
+    };
+    if !function
+        .name
+        .to_string()
+        .eq_ignore_ascii_case(nodus_sql::VIRTUAL_MARKER)
+    {
+        return None;
+    }
+    let sqlparser::ast::FunctionArguments::List(list) = &function.args else {
+        return None;
+    };
+    if !list.clauses.is_empty() {
+        return None;
+    }
+    match list.args.as_slice() {
+        [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(inner))] => {
+            Some(inner)
+        }
+        _ => None,
+    }
+}
 
 
 /// A constraint's `ENFORCED` / `NOT ENFORCED` characteristic: enforced
