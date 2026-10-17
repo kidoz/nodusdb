@@ -1,0 +1,231 @@
+# PostgreSQL 18 temporal constraints: `PRIMARY KEY (... WITHOUT OVERLAPS)`
+# and `UNIQUE (... WITHOUT OVERLAPS)` make the key's last column a period —
+# two rows equal on the key's other columns conflict when their ranges (or
+# multiranges) overlap. The keys are recorded as exclusion-style indexes
+# (`conperiod`, `indisexclusion`), reported as PostgreSQL does
+# (`conflicting key value violates exclusion constraint`, or `could not
+# create exclusion constraint` when `ALTER TABLE` validates existing rows),
+# and cannot serve as `ON CONFLICT` arbiters. The messages and catalog
+# values are PostgreSQL 18.4's.
+#
+# Known divergences: the key's index is still a btree index in the store, so
+# plans may show it where PostgreSQL's GiST index could not serve the same
+# query; a failed multi-statement batch keeps its DDL (catalog changes commit
+# with the raft log), where PostgreSQL rolls the whole batch back.
+
+statement ok
+drop table if exists tc1 cascade;
+
+statement ok
+create table tc1 (id int, during tsrange, primary key (id, during without overlaps));
+
+# Adjacent periods do not overlap; another id's period may.
+statement ok
+insert into tc1 values (1, '[2020-01-01,2020-02-01)'), (1, '[2020-02-01,2020-03-01)'), (2, '[2020-01-01,2020-02-01)'), (2, '[2020-02-01,2020-03-01)'), (1, '[2019-01-01,2020-01-01)');
+
+query IT
+select id, during from tc1 order by id, during;
+----
+1	["2019-01-01 00:00:00","2020-01-01 00:00:00")
+1	["2020-01-01 00:00:00","2020-02-01 00:00:00")
+1	["2020-02-01 00:00:00","2020-03-01 00:00:00")
+2	["2020-01-01 00:00:00","2020-02-01 00:00:00")
+2	["2020-02-01 00:00:00","2020-03-01 00:00:00")
+
+statement error conflicting key value violates exclusion constraint "tc1_pkey"
+insert into tc1 values (1, '[2020-01-15,2020-02-15)');
+
+# The key is recorded, printed, and indexed as PostgreSQL's temporal key.
+query TTT
+select conname, contype, conperiod from pg_constraint where conrelid = 'tc1'::regclass order by conname;
+----
+tc1_during_not_null	n	f
+tc1_id_not_null	n	f
+tc1_pkey	p	t
+
+query T
+select pg_get_constraintdef(oid) from pg_constraint where conrelid = 'tc1'::regclass order by conname;
+----
+NOT NULL during
+NOT NULL id
+PRIMARY KEY (id, during WITHOUT OVERLAPS)
+
+query TTTT
+select indexrelid::regclass, indisunique, indisexclusion, indnullsnotdistinct from pg_index where indrelid = 'tc1'::regclass order by 1;
+----
+tc1_pkey	t	t	f
+
+query T
+select pg_get_indexdef(indexrelid) from pg_index where indrelid = 'tc1'::regclass order by 1;
+----
+CREATE UNIQUE INDEX tc1_pkey ON public.tc1 USING gist (id, during)
+
+# An update that moves a period onto another one fails.
+statement error conflicting key value violates exclusion constraint "tc1_pkey"
+update tc1 set during = '[2020-01-20,2020-02-10)' where id = 2 and during = '[2020-01-01,2020-02-01)';
+
+statement ok
+update tc1 set during = '[2020-01-10,2020-01-20)' where id = 2 and during = '[2020-01-01,2020-02-01)';
+
+query IT
+select id, during from tc1 where id = 2 order by during;
+----
+2	["2020-01-10 00:00:00","2020-01-20 00:00:00")
+2	["2020-02-01 00:00:00","2020-03-01 00:00:00")
+
+# NULL periods and NULL keys never conflict; `NULLS NOT DISTINCT` makes the
+# other key columns' NULLs equal while the periods must still overlap.
+statement ok
+drop table if exists tc2 cascade;
+
+statement ok
+create table tc2 (id int, during int4range, unique (id, during without overlaps));
+
+statement ok
+insert into tc2 values (1, '[1,5)'), (1, '[5,9)'), (2, '[1,5)'), (null, '[1,5)'), (null, '[1,5)'), (3, null), (3, null);
+
+query I
+select count(*) from tc2;
+----
+7
+
+statement error conflicting key value violates exclusion constraint "tc2_id_during_key"
+insert into tc2 values (1, '[4,6)');
+
+# `ON CONFLICT DO NOTHING` without a target skips the clashing row.
+statement ok
+insert into tc2 values (1, '[4,6)') on conflict do nothing;
+
+query I
+select count(*) from tc2;
+----
+7
+
+statement ok
+drop table if exists tc3 cascade;
+
+statement ok
+create table tc3 (id int, during tsrange, unique nulls not distinct (id, during without overlaps));
+
+statement ok
+insert into tc3 values (null, '[2020-01-01,2020-02-01)'), (null, '[2020-02-01,2020-03-01)');
+
+statement error conflicting key value violates exclusion constraint "tc3_id_during_key"
+insert into tc3 values (null, '[2020-01-15,2020-02-15)');
+
+# A multirange period works too.
+statement ok
+drop table if exists tc4 cascade;
+
+statement ok
+create table tc4 (id int, during tsmultirange, unique (id, during without overlaps));
+
+statement ok
+insert into tc4 values (1, '{[2020-01-01,2020-02-01)}');
+
+statement error conflicting key value violates exclusion constraint "tc4_id_during_key"
+insert into tc4 values (1, '{[2020-01-15,2020-02-15)}');
+
+# `ALTER TABLE ... ADD CONSTRAINT` validates the rows already there.
+statement ok
+drop table if exists tc5 cascade;
+
+statement ok
+create table tc5 (id int, during tsrange);
+
+statement ok
+insert into tc5 values (1, '[2020-01-01,2020-02-01)'), (1, '[2020-02-01,2020-03-01)');
+
+statement ok
+alter table tc5 add constraint tc5_u unique (id, during without overlaps);
+
+statement error conflicting key value violates exclusion constraint "tc5_u"
+insert into tc5 values (1, '[2020-02-15,2020-03-15)');
+
+statement ok
+drop table if exists tc6 cascade;
+
+statement ok
+create table tc6 (id int, during tsrange);
+
+statement ok
+insert into tc6 values (1, '[2020-01-01,2020-02-01)'), (1, '[2020-01-15,2020-02-15)');
+
+statement error could not create exclusion constraint "tc6_u"
+alter table tc6 add constraint tc6_u unique (id, during without overlaps);
+
+# A deferred temporal key reports its conflict at COMMIT.
+statement ok
+drop table if exists tc7 cascade;
+
+statement ok
+create table tc7 (id int, during tsrange, unique (id, during without overlaps) deferrable initially deferred);
+
+statement ok
+insert into tc7 values (1, '[2020-01-01,2020-02-01)');
+
+statement error conflicting key value violates exclusion constraint "tc7_id_during_key"
+begin; insert into tc7 values (1, '[2020-01-15,2020-02-15)'); commit;
+
+# A temporal key is an exclusion constraint: it cannot arbitrate ON CONFLICT.
+statement error there is no unique or exclusion constraint matching the ON CONFLICT specification
+insert into tc7 values (1, '[2020-03-01,2020-04-01)') on conflict (id, during) do nothing;
+
+# A partition enforces its own copy of the key.
+statement ok
+drop table if exists tc8 cascade;
+
+statement ok
+create table tc8 (id int, during tsrange, primary key (id, during without overlaps)) partition by range (id);
+
+statement ok
+create table tc8a partition of tc8 for values from (0) to (10);
+
+statement ok
+insert into tc8 values (1, '[2020-01-01,2020-02-01)');
+
+statement error conflicting key value violates exclusion constraint "tc8a_pkey"
+insert into tc8 values (1, '[2020-01-15,2020-02-15)');
+
+# Dropping the constraint allows overlapping periods again.
+statement ok
+alter table tc5 drop constraint tc5_u;
+
+statement ok
+insert into tc5 values (1, '[2020-02-15,2020-03-15)');
+
+query I
+select count(*) from tc5 where id = 1;
+----
+3
+
+# The period must be the key's last column and a range or multirange type.
+statement error constraint using WITHOUT OVERLAPS needs at least two columns
+create table tc9 (id int, during tsrange, unique (during without overlaps));
+
+statement error is not a range or multirange type
+create table tc10 (id int, during int, unique (id, during without overlaps));
+
+statement error syntax error at or near "overlaps"
+create table tc11 (id int, during tsrange, unique (id, without overlaps during));
+
+statement ok
+drop table tc8 cascade;
+
+statement ok
+drop table tc7 cascade;
+
+statement ok
+drop table tc5 cascade;
+
+statement ok
+drop table tc4 cascade;
+
+statement ok
+drop table tc3 cascade;
+
+statement ok
+drop table tc2 cascade;
+
+statement ok
+drop table tc1 cascade;
