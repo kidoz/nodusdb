@@ -22,11 +22,12 @@ impl MemExecutor {
         mut columns: Vec<ColumnDef>,
         constraints: Vec<nodus_catalog::TableConstraint>,
         if_not_exists: bool,
-        (unique_constraints, key_names, key_flags, key_includes): (
+        (unique_constraints, key_names, key_flags, key_includes, key_temporal): (
             Vec<Vec<String>>,
             Vec<(Vec<String>, String)>,
             Vec<(Vec<String>, bool, bool, bool)>,
             Vec<(Vec<String>, Vec<String>)>,
+            Vec<(Vec<String>, String)>,
         ),
         materialized_query: Option<String>,
         inherits: Vec<String>,
@@ -230,6 +231,21 @@ impl MemExecutor {
         for column in &columns {
             crate::user_types::check_type_exists(&column.data_type)?;
         }
+        // A temporal key's period is its last column, a range or multirange
+        // type.
+        for (key_columns, period) in &key_temporal {
+            let _ = key_columns;
+            let Some(column) = columns.iter().find(|c| &c.name == period) else {
+                anyhow::bail!("column \"{period}\" named in WITHOUT OVERLAPS does not exist");
+            };
+            if !crate::ranges::is_range_type(&column.data_type)
+                && !crate::multiranges::is_multirange_type(&column.data_type)
+            {
+                anyhow::bail!(
+                    "column \"{period}\" in WITHOUT OVERLAPS is not a range or multirange type"
+                );
+            }
+        }
         // A generation expression reads the table's columns: each must
         // exist and must not itself be generated.
         {
@@ -309,6 +325,23 @@ impl MemExecutor {
                 unique_cols.push((d.clone(), c.primary));
             }
         }
+        // A temporal key's period column, by id (resolved before the
+        // descriptors are moved into the table).
+        let temporal_columns: Vec<(Vec<String>, nodus_catalog::ColumnId)> = key_temporal
+            .iter()
+            .filter_map(|(names, period)| {
+                descriptors
+                    .iter()
+                    .find(|d| &d.name == period)
+                    .map(|d| (names.clone(), d.id))
+            })
+            .collect();
+        let temporal_column = |names: &[String]| -> Option<nodus_catalog::ColumnId> {
+            temporal_columns
+                .iter()
+                .find(|(key_columns, _)| key_columns == names)
+                .map(|(_, id)| *id)
+        };
         // A virtual generated column is computed on read, so a key over it
         // cannot be maintained.
         let is_virtual = |d: &nodus_catalog::ColumnDescriptor| {
@@ -396,6 +429,11 @@ impl MemExecutor {
                 key_flags(std::slice::from_ref(&col.name))
             };
             let include_columns = key_include(std::slice::from_ref(&col.name));
+            let period = if primary {
+                temporal_column(&primary_columns)
+            } else {
+                None
+            };
             let index = nodus_catalog::IndexDescriptor {
                 id: nodus_catalog::IndexId::new(),
                 name: if primary {
@@ -425,6 +463,7 @@ impl MemExecutor {
                 deferrable,
                 initially_deferred,
                 nulls_not_distinct,
+                period,
                 global: false,
                 predicate: None,
                 expressions: vec![],
@@ -449,6 +488,7 @@ impl MemExecutor {
         };
         for (name, column_ids, flags) in unique_groups {
             let include_columns = key_include(&key_columns_by_id(&column_ids));
+            let period = temporal_column(&key_columns_by_id(&column_ids));
             let index = nodus_catalog::IndexDescriptor {
                 id: nodus_catalog::IndexId::new(),
                 name,
@@ -472,6 +512,7 @@ impl MemExecutor {
                 deferrable: flags.0,
                 initially_deferred: flags.1,
                 nulls_not_distinct: flags.2,
+                period,
                 global: false,
                 predicate: None,
                 expressions: vec![],
@@ -599,6 +640,14 @@ impl MemExecutor {
                 deferrable: index.deferrable,
                 initially_deferred: index.initially_deferred,
                 nulls_not_distinct: index.nulls_not_distinct,
+                period: index.period.and_then(|id| {
+                    parent
+                        .columns
+                        .iter()
+                        .find(|c| c.id == id)
+                        .and_then(|c| partition.columns.iter().find(|p| p.name == c.name))
+                        .map(|p| p.id)
+                }),
                 global: index.global,
                 predicate: index.predicate.clone(),
                 expressions: index.expressions.clone(),
@@ -2070,6 +2119,7 @@ impl MemExecutor {
             deferrable: false,
             initially_deferred: false,
             nulls_not_distinct: false,
+            period: None,
             index_type,
             index_state: nodus_catalog::IndexState::Creating,
             key_columns,
@@ -2114,6 +2164,68 @@ impl MemExecutor {
         };
         let names: Vec<String> = tbl.columns.iter().map(|c| c.name.clone()).collect();
         let parts = crate::index_keys::index_parts(tbl, index);
+        // A temporal key conflicts pairwise: equal on the other columns with
+        // overlapping periods.
+        if let Some(period) = Self::period_position(tbl, index) {
+            let positions: Vec<usize> = index
+                .key_columns
+                .iter()
+                .filter_map(|key| {
+                    tbl.columns
+                        .iter()
+                        .position(|column| column.id == key.column_id)
+                })
+                .collect();
+            let rows: Vec<Vec<Value>> = self
+                .scan_rows(tbl.id, &ctx.session_id)?
+                .into_iter()
+                .filter(|row| {
+                    predicate.as_ref().is_none_or(|filter| {
+                        self.eval_filter(ctx, row, &names, &tbl.columns, Some(filter)) == Some(true)
+                    })
+                })
+                .collect();
+            for (i, row) in rows.iter().enumerate() {
+                for other in &rows[i + 1..] {
+                    if crate::constraints::temporal_conflict(
+                        tbl,
+                        row,
+                        other,
+                        &positions,
+                        period,
+                        index.nulls_not_distinct,
+                    ) {
+                        let columns = crate::index_keys::key_names(tbl, &parts);
+                        let rendered = |values: &[Value]| {
+                            positions
+                                .iter()
+                                .map(|&p| match values.get(p) {
+                                    Some(Value::Null) => "null".to_string(),
+                                    Some(value) => render(value),
+                                    None => String::new(),
+                                })
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        };
+                        return Err(DbError::new(format!(
+                            "could not create exclusion constraint \"{name}\""
+                        ))
+                        .detail(format!(
+                            "Key ({})=({}) conflicts with key ({})=({}).",
+                            columns.join(", "),
+                            rendered(row),
+                            columns.join(", "),
+                            rendered(other)
+                        ))
+                        .schema(self.schema_name_of(tbl))
+                        .table(&tbl.name)
+                        .constraint(name)
+                        .into());
+                    }
+                }
+            }
+            return Ok(());
+        }
         let mut seen = std::collections::HashSet::new();
         for row in self.scan_rows(tbl.id, &ctx.session_id)? {
             if let Some(filter) = &predicate

@@ -84,6 +84,7 @@ fn create_role_and_grant_require_grant_management() {
             for_values: None,
             key_flags: vec![],
             key_includes: Vec::new(),
+            key_temporal: Vec::new(),
         },
     )
     .unwrap();
@@ -186,6 +187,7 @@ fn create_table_denied_then_allowed_by_grant() {
         for_values: None,
         key_flags: vec![],
         key_includes: Vec::new(),
+        key_temporal: Vec::new(),
     };
 
     assert!(exec.execute_logical(&ctx, plan()).is_err());
@@ -258,6 +260,7 @@ fn create_insert_select_round_trip() {
             for_values: None,
             key_flags: vec![],
             key_includes: Vec::new(),
+            key_temporal: Vec::new(),
         },
     )
     .unwrap();
@@ -457,6 +460,7 @@ fn rows_keyed_by_declared_pk_not_first_column() {
             for_values: None,
             key_flags: vec![],
             key_includes: Vec::new(),
+            key_temporal: Vec::new(),
         },
     )
     .unwrap();
@@ -592,6 +596,7 @@ fn typed_values_round_trip_and_filter_by_int() {
             for_values: None,
             key_flags: vec![],
             key_includes: Vec::new(),
+            key_temporal: Vec::new(),
         },
     )
     .unwrap();
@@ -692,6 +697,7 @@ fn update_and_delete_rows() {
             for_values: None,
             key_flags: vec![],
             key_includes: Vec::new(),
+            key_temporal: Vec::new(),
         },
     )
     .unwrap();
@@ -830,6 +836,7 @@ fn test_join_execution() {
             for_values: None,
             key_flags: vec![],
             key_includes: Vec::new(),
+            key_temporal: Vec::new(),
         },
     )
     .unwrap();
@@ -852,6 +859,7 @@ fn test_join_execution() {
             for_values: None,
             key_flags: vec![],
             key_includes: Vec::new(),
+            key_temporal: Vec::new(),
         },
     )
     .unwrap();
@@ -1011,6 +1019,7 @@ fn transactions_are_isolated_per_session() {
             for_values: None,
             key_flags: vec![],
             key_includes: Vec::new(),
+            key_temporal: Vec::new(),
         },
     )
     .unwrap();
@@ -1161,6 +1170,7 @@ fn test_complex_filters() {
             for_values: None,
             key_flags: vec![],
             key_includes: Vec::new(),
+            key_temporal: Vec::new(),
         },
     )
     .unwrap();
@@ -1255,6 +1265,7 @@ fn test_left_outer_join() {
             for_values: None,
             key_flags: vec![],
             key_includes: Vec::new(),
+            key_temporal: Vec::new(),
         },
     )
     .unwrap();
@@ -1276,6 +1287,7 @@ fn test_left_outer_join() {
             for_values: None,
             key_flags: vec![],
             key_includes: Vec::new(),
+            key_temporal: Vec::new(),
         },
     )
     .unwrap();

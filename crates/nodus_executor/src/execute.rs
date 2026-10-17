@@ -57,6 +57,7 @@ impl MemExecutor {
                 key_names,
                 key_flags,
                 key_includes,
+                key_temporal,
                 on_commit,
                 like,
                 inherits,
@@ -75,7 +76,13 @@ impl MemExecutor {
                     columns,
                     constraints,
                     if_not_exists,
-                    (unique_constraints, key_names, key_flags, key_includes),
+                    (
+                        unique_constraints,
+                        key_names,
+                        key_flags,
+                        key_includes,
+                        key_temporal,
+                    ),
                     None,
                     inherits.clone(),
                     (

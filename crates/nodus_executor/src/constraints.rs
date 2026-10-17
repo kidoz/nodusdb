@@ -23,6 +23,10 @@ impl MemExecutor {
         // PRIMARY KEY is stored as one primary index per column).
         let col_names: Vec<String> = tbl.columns.iter().map(|c| c.name.clone()).collect();
         let mut unique_keys = Vec::new();
+        // A `WITHOUT OVERLAPS` key: positions, nulls equality, the period's
+        // position, and a partial index's predicate.
+        let mut temporal_keys: Vec<(&str, Vec<usize>, bool, usize, Option<crate::FilterExpr>)> =
+            Vec::new();
         self.check_expression_keys(ctx, tbl, new_row, skip_pk)?;
         for idx in tbl.indexes.iter().filter(|idx| {
             idx.unique
@@ -55,6 +59,16 @@ impl MemExecutor {
             {
                 continue;
             }
+            if let Some(period) = Self::period_position(tbl, idx) {
+                temporal_keys.push((
+                    idx.name.as_str(),
+                    positions,
+                    idx.nulls_not_distinct,
+                    period,
+                    predicate,
+                ));
+                continue;
+            }
             unique_keys.push((
                 idx.name.as_str(),
                 positions,
@@ -63,6 +77,13 @@ impl MemExecutor {
             ));
         }
         let mut pk_positions = Self::pk_positions_declared(tbl);
+        // A temporal primary key's period position; rows conflict on the
+        // other key columns with overlapping periods.
+        let mut pk_period: Option<usize> = tbl
+            .indexes
+            .iter()
+            .find(|i| i.index_type == nodus_catalog::IndexType::Primary)
+            .and_then(|i| Self::period_position(tbl, i));
         if !pk_positions.is_empty()
             && let Some(primary) = tbl
                 .indexes
@@ -77,9 +98,10 @@ impl MemExecutor {
         {
             self.note_deferred_write(&ctx.session_id, tbl.id);
             pk_positions = Vec::new();
+            pk_period = None;
         }
         let new_pk = key_tuple(new_row, &pk_positions);
-        if unique_keys.is_empty() && pk_positions.is_empty() {
+        if unique_keys.is_empty() && pk_positions.is_empty() && temporal_keys.is_empty() {
             return Ok(());
         }
         let primary_name = || {
@@ -102,7 +124,11 @@ impl MemExecutor {
                 (Some(a), Some(b)) if a.iter().zip(&b).all(|(x, y)| values_equal(x, y)))
         };
         let mut looked_up = true;
-        if !pk_positions.is_empty() {
+        // A temporal key's overlap cannot be looked up by its exact key.
+        if pk_period.is_some() || !temporal_keys.is_empty() {
+            looked_up = false;
+        }
+        if !pk_positions.is_empty() && pk_period.is_none() {
             match self.key_candidates(&ctx.session_id, tbl, &pk_positions, None, new_row)? {
                 Some(found) => {
                     for (pk, existing) in found {
@@ -152,7 +178,22 @@ impl MemExecutor {
             if Some(stored_pk) == skip_pk {
                 continue;
             }
-            if !pk_positions.is_empty()
+            if let Some(period) = pk_period {
+                if temporal_conflict(tbl, &existing, new_row, &pk_positions, period, false) {
+                    let name = tbl
+                        .indexes
+                        .iter()
+                        .find(|i| i.index_type == nodus_catalog::IndexType::Primary)
+                        .map_or_else(|| format!("{}_pkey", tbl.name), |i| i.name.clone());
+                    return Err(self.temporal_conflict(
+                        tbl,
+                        &name,
+                        &pk_positions,
+                        new_row,
+                        &existing,
+                    ));
+                }
+            } else if !pk_positions.is_empty()
                 && let (Some(a), Some(b)) = (key_tuple(&existing, &pk_positions), &new_pk)
                 && a.iter().zip(b).all(|(x, y)| values_equal(x, y))
             {
@@ -162,6 +203,18 @@ impl MemExecutor {
                     .find(|i| i.index_type == nodus_catalog::IndexType::Primary)
                     .map_or_else(|| format!("{}_pkey", tbl.name), |i| i.name.clone());
                 return Err(self.duplicate_key(tbl, &name, &pk_positions, new_row));
+            }
+            for (idx_name, positions, nulls_equal, period, predicate) in &temporal_keys {
+                if temporal_conflict(tbl, &existing, new_row, positions, *period, *nulls_equal)
+                    && predicate.as_ref().is_none_or(|filter| {
+                        self.eval_filter(ctx, &existing, &col_names, &tbl.columns, Some(filter))
+                            == Some(true)
+                    })
+                {
+                    return Err(
+                        self.temporal_conflict(tbl, idx_name, positions, new_row, &existing)
+                    );
+                }
             }
             for (idx_name, positions, predicate, nulls_equal) in &unique_keys {
                 let key = |row: &[Value]| {
@@ -452,6 +505,31 @@ impl MemExecutor {
             .map(|p| self.index_predicate(&p.sql))
             .transpose()?;
         let nulls_equal = index.is_some_and(|i| i.nulls_not_distinct);
+        // A temporal key conflicts pairwise: equal on the other columns with
+        // overlapping periods.
+        if let Some(period) = index.and_then(|i| Self::period_position(tbl, i)) {
+            let rows: Vec<Vec<Value>> = self
+                .scan_rows_keyed(tbl.id, &ctx.session_id)?
+                .into_iter()
+                .map(|(_, row)| row)
+                .filter(|row| {
+                    predicate.as_ref().is_none_or(|filter| {
+                        self.eval_filter(ctx, row, &col_names, &tbl.columns, Some(filter))
+                            == Some(true)
+                    })
+                })
+                .collect();
+            for (i, row) in rows.iter().enumerate() {
+                for other in &rows[i + 1..] {
+                    if temporal_conflict(tbl, row, other, positions, period, nulls_equal) {
+                        // The check runs after the writes: the later stored
+                        // row is the one PostgreSQL reports as the new key.
+                        return Err(self.temporal_conflict(tbl, name, positions, other, row));
+                    }
+                }
+            }
+            return Ok(());
+        }
         let mut seen = std::collections::HashSet::new();
         for (_key, row) in self.scan_rows_keyed(tbl.id, &ctx.session_id)? {
             // A key with a NULL never collides, unless the constraint is
@@ -502,6 +580,57 @@ impl MemExecutor {
             "Key ({})=({}) already exists.",
             columns.join(", "),
             values.join(", ")
+        ))
+        .schema(self.schema_name_of(tbl))
+        .table(&tbl.name)
+        .constraint(name)
+        .into()
+    }
+
+    /// The position of a temporal index's `WITHOUT OVERLAPS` period column.
+    pub(crate) fn period_position(
+        tbl: &nodus_catalog::TableDescriptor,
+        index: &nodus_catalog::IndexDescriptor,
+    ) -> Option<usize> {
+        index
+            .period
+            .and_then(|id| tbl.columns.iter().position(|c| c.id == id))
+    }
+
+    /// The error a `WITHOUT OVERLAPS` key raises when `row` overlaps the
+    /// existing row `existing`.
+    fn temporal_conflict(
+        &self,
+        tbl: &nodus_catalog::TableDescriptor,
+        name: &str,
+        positions: &[usize],
+        row: &[Value],
+        existing: &[Value],
+    ) -> anyhow::Error {
+        let columns: Vec<&str> = positions
+            .iter()
+            .map(|&p| tbl.columns[p].name.as_str())
+            .collect();
+        let rendered = |values: &[Value]| {
+            positions
+                .iter()
+                .map(|&p| match values.get(p) {
+                    Some(Value::Null) => "null".to_string(),
+                    Some(value) => render(value),
+                    None => String::new(),
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        DbError::new(format!(
+            "conflicting key value violates exclusion constraint \"{name}\""
+        ))
+        .detail(format!(
+            "Key ({})=({}) conflicts with existing key ({})=({}).",
+            columns.join(", "),
+            rendered(row),
+            columns.join(", "),
+            rendered(existing)
         ))
         .schema(self.schema_name_of(tbl))
         .table(&tbl.name)
@@ -597,4 +726,59 @@ pub(crate) fn key_tuple(row: &[Value], positions: &[usize]) -> Option<Vec<Value>
             Some(v) => Some(v.clone()),
         })
         .collect()
+}
+
+/// Whether two rows conflict on a temporal key: equal on every key column
+/// but the period, whose range or multirange values overlap.
+pub(crate) fn temporal_conflict(
+    tbl: &nodus_catalog::TableDescriptor,
+    a: &[Value],
+    b: &[Value],
+    positions: &[usize],
+    period: usize,
+    nulls_equal: bool,
+) -> bool {
+    let others: Vec<usize> = positions
+        .iter()
+        .copied()
+        .filter(|&position| position != period)
+        .collect();
+    let key = |row: &[Value]| {
+        if nulls_equal {
+            key_tuple_including_nulls(row, &others)
+        } else {
+            key_tuple(row, &others)
+        }
+    };
+    let equal = matches!(
+        (key(a), key(b)),
+        (Some(x), Some(y)) if x.iter().zip(&y).all(|(l, r)| values_equal(l, r))
+    );
+    if !equal {
+        return false;
+    }
+    match (a.get(period), b.get(period)) {
+        (Some(Value::Null), _) | (_, Some(Value::Null)) | (None, _) | (_, None) => false,
+        (Some(x), Some(y)) => ranges_overlap(&tbl.columns[period].data_type, x, y),
+    }
+}
+
+/// Whether two range or multirange values overlap (`&&`).
+pub(crate) fn ranges_overlap(data_type: &str, a: &Value, b: &Value) -> bool {
+    let (Value::Text(a), Value::Text(b)) = (a, b) else {
+        return false;
+    };
+    if let Some(kind) = crate::ranges::Kind::of(data_type) {
+        return matches!(
+            crate::ranges::operator("&&", kind, a, b, false),
+            Ok(Value::Bool(true))
+        );
+    }
+    if let Some(kind) = crate::multiranges::kind_of(data_type) {
+        return matches!(
+            crate::multiranges::operator("&&", kind, a, b, false),
+            Ok(Value::Bool(true))
+        );
+    }
+    false
 }

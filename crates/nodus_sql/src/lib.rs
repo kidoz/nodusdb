@@ -3415,6 +3415,153 @@ fn snippet_tokens(sql: &str) -> Option<Vec<sqlparser::tokenizer::TokenWithSpan>>
     Some(tokens)
 }
 
+/// The name a key's `WITHOUT OVERLAPS` is encoded in — the constraint's
+/// name becomes `\0nodus_temporal\0<period>\0<name>` — since the parser has
+/// no such clause. The planner strips the mark and keeps the period column.
+pub const TEMPORAL_MARK: &str = "\u{0}nodus_temporal\u{0}";
+
+/// Rewrites `PRIMARY KEY (id, during WITHOUT OVERLAPS)` (and `UNIQUE`) by
+/// dropping the two words and encoding the period column in the
+/// constraint's name ([`TEMPORAL_MARK`]); an existing name is kept inside
+/// the mark.
+fn rewrite_temporal_keys(
+    mut statement: Vec<sqlparser::tokenizer::TokenWithSpan>,
+) -> Vec<sqlparser::tokenizer::TokenWithSpan> {
+    use sqlparser::keywords::Keyword;
+    use sqlparser::tokenizer::{Token, Word};
+    let significant: Vec<usize> = statement
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| !matches!(t.token, Token::Whitespace(_)))
+        .map(|(i, _)| i)
+        .collect();
+    let word = |i: usize| match &statement[i].token {
+        Token::Word(w) if w.quote_style.is_none() => Some(w.value.as_str()),
+        _ => None,
+    };
+    // (remove_from, remove_to, insert_at, replacement, replace_existing)
+    let mut marks = Vec::new();
+    for (pos, &at) in significant.iter().enumerate() {
+        if word(at) != Some("without") {
+            continue;
+        }
+        let Some(&overlaps) = significant.get(pos + 1) else {
+            continue;
+        };
+        if word(overlaps) != Some("overlaps") {
+            continue;
+        }
+        let Some(&period) = pos.checked_sub(1).and_then(|p| significant.get(p)) else {
+            continue;
+        };
+        let Token::Word(period_word) = &statement[period].token else {
+            continue;
+        };
+        // The period is the last key column: `)` follows the words.
+        let Some(&after) = significant.get(pos + 2) else {
+            continue;
+        };
+        if !matches!(statement[after].token, Token::RParen) {
+            continue;
+        }
+        // The key list's opening parenthesis.
+        let mut depth = 0usize;
+        let mut open = None;
+        for &j in significant[..pos].iter().rev() {
+            match statement[j].token {
+                Token::RParen => depth += 1,
+                Token::LParen => {
+                    if depth == 0 {
+                        open = Some(j);
+                        break;
+                    }
+                    depth -= 1;
+                }
+                _ => {}
+            }
+        }
+        let Some(open) = open else { continue };
+        let at_open = significant
+            .iter()
+            .position(|&j| j == open)
+            .expect("open is significant");
+        // Backward from the list's `(`: [NULLS [NOT] DISTINCT], then
+        // PRIMARY KEY / UNIQUE, then an optional CONSTRAINT name.
+        let mut k = at_open;
+        if k >= 3
+            && word(significant[k - 1]) == Some("distinct")
+            && word(significant[k - 2]) == Some("not")
+            && word(significant[k - 3]) == Some("nulls")
+        {
+            k -= 3;
+        }
+        if k == 0 {
+            continue;
+        }
+        let keyword_start = if word(significant[k - 1]) == Some("key")
+            && k >= 2
+            && word(significant[k - 2]) == Some("primary")
+        {
+            k - 2
+        } else if word(significant[k - 1]) == Some("unique") {
+            k - 1
+        } else {
+            continue;
+        };
+        // `CONSTRAINT name` before the keyword: the name is replaced by the
+        // mark; otherwise the mark is inserted as a new constraint name.
+        let named =
+            keyword_start >= 2 && word(significant[keyword_start - 2]) == Some("constraint");
+        let (insert_at, name, replace) = if named {
+            // `CONSTRAINT name UNIQUE (...)`: the name sits between the
+            // keyword and the constraint kind.
+            let token = significant[keyword_start - 1];
+            let name = match &statement[token].token {
+                Token::Word(w) => w.value.clone(),
+                _ => String::new(),
+            };
+            (token, name, true)
+        } else {
+            (significant[keyword_start], String::new(), false)
+        };
+        let marked = format!("{TEMPORAL_MARK}{}\u{0}{name}", period_word.value);
+        let span = statement[insert_at].span;
+        let mark_token = sqlparser::tokenizer::TokenWithSpan {
+            token: Token::Word(Word {
+                value: marked,
+                quote_style: Some('"'),
+                keyword: Keyword::NoKeyword,
+            }),
+            span,
+        };
+        let replacement: Vec<_> = if replace {
+            vec![mark_token]
+        } else {
+            vec![
+                sqlparser::tokenizer::TokenWithSpan {
+                    token: Token::Word(Word {
+                        value: "constraint".to_string(),
+                        quote_style: None,
+                        keyword: Keyword::CONSTRAINT,
+                    }),
+                    span,
+                },
+                mark_token,
+            ]
+        };
+        marks.push((at, overlaps, insert_at, replacement, replace));
+    }
+    for (remove_from, remove_to, insert_at, replacement, replace) in marks.into_iter().rev() {
+        statement.splice(remove_from..=remove_to, []);
+        if replace {
+            statement.splice(insert_at..=insert_at, replacement);
+        } else {
+            statement.splice(insert_at..insert_at, replacement);
+        }
+    }
+    statement
+}
+
 /// The function a *virtual* generated column's expression is wrapped in —
 /// `GENERATED ALWAYS AS (__NODUS_VIRTUAL__(expr)) STORED` — since the
 /// PostgreSQL parser takes only `STORED`. The planner unwraps it and keeps
@@ -3505,6 +3652,7 @@ fn rewrite_statement_form(
 ) -> Vec<sqlparser::tokenizer::TokenWithSpan> {
     use sqlparser::tokenizer::{Token, TokenWithSpan};
     statement = rewrite_virtual_generation(statement);
+    statement = rewrite_temporal_keys(statement);
     let word = |t: &TokenWithSpan| match &t.token {
         Token::Word(w) if w.quote_style.is_none() => Some(w.value.clone()),
         _ => None,
@@ -4909,6 +5057,34 @@ mod tests {
                 "SELECT {UTILITY_FUNCTION}('ALTER COLUMN EXPRESSION', 'alter table t alter b drop expression')"
             )
         );
+    }
+
+    #[test]
+    fn temporal_keys_are_marked() {
+        let one = |sql: &str| parse_sql(sql).unwrap().remove(0).to_string();
+        // `WITHOUT OVERLAPS` goes; the constraint's name carries the period.
+        let primary =
+            one("CREATE TABLE t (id int, d tsrange, PRIMARY KEY (id, d WITHOUT OVERLAPS))");
+        assert!(
+            primary.contains(&format!("{}d\u{0}", TEMPORAL_MARK)),
+            "{primary}"
+        );
+        assert!(!primary.to_ascii_uppercase().contains("WITHOUT OVERLAPS"));
+        assert!(primary.contains("PRIMARY KEY (id, d)"), "{primary}");
+        // A named constraint keeps its name inside the mark.
+        let named = one(
+            "CREATE TABLE t (id int, d tsrange, CONSTRAINT u1 UNIQUE (id, d WITHOUT OVERLAPS))",
+        );
+        assert!(
+            named.contains(&format!("{}d\u{0}u1", TEMPORAL_MARK)),
+            "{named}"
+        );
+        let altered = one("ALTER TABLE t ADD CONSTRAINT u2 UNIQUE (id, d WITHOUT OVERLAPS)");
+        assert!(
+            altered.contains(&format!("{}d\u{0}u2", TEMPORAL_MARK)),
+            "{altered}"
+        );
+        assert!(altered.contains("UNIQUE (id, d)"), "{altered}");
     }
 
     #[test]

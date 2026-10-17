@@ -7,6 +7,27 @@ use nodus_catalog::TableConstraint;
 /// Resolves the bare column names referenced by an index-style constraint
 /// (`UNIQUE`/`PRIMARY KEY`), whose columns are now `IndexColumn` entries
 /// wrapping an `OrderByExpr`.
+/// A misplaced `WITHOUT OVERLAPS` — not after the key's last column —
+/// reaches the parser as an expression key part; PostgreSQL's error names
+/// it.
+fn reject_misplaced_overlaps(columns: &[sqlparser::ast::IndexColumn]) -> Result<()> {
+    for column in columns {
+        if extract_col_name(&column.column.expr).is_some() {
+            continue;
+        }
+        if column
+            .column
+            .expr
+            .to_string()
+            .to_ascii_lowercase()
+            .contains("overlaps")
+        {
+            anyhow::bail!("syntax error at or near \"overlaps\"");
+        }
+    }
+    Ok(())
+}
+
 fn index_column_names(columns: &[sqlparser::ast::IndexColumn]) -> Vec<String> {
     columns
         .iter()
@@ -318,12 +339,25 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
             }
 
             let mut unique_constraints = Vec::new();
+            let mut key_temporal: Vec<(Vec<String>, String)> = Vec::new();
             for tc in constraints {
                 match tc {
                     sqlparser::ast::TableConstraint::Unique(uc) => {
+                        reject_misplaced_overlaps(&uc.columns)?;
                         let names = index_column_names(&uc.columns);
-                        if let Some(name) = &uc.name {
-                            key_names.push((names.clone(), name.value.clone()));
+                        // `WITHOUT OVERLAPS`: the period is the key's last
+                        // column, and a temporal key needs another column.
+                        let (name, period) = temporal_key_name(uc.name.as_ref());
+                        if let Some(name) = &name {
+                            key_names.push((names.clone(), name.clone()));
+                        }
+                        if let Some(period) = &period {
+                            if names.len() < 2 || names.last() != Some(period) {
+                                anyhow::bail!(
+                                    "constraint using WITHOUT OVERLAPS needs at least two columns"
+                                );
+                            }
+                            key_temporal.push((names.clone(), period.clone()));
                         }
                         if !uc.include.is_empty() {
                             key_includes.push((
@@ -350,8 +384,19 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                         }
                     }
                     sqlparser::ast::TableConstraint::PrimaryKey(pk) => {
-                        if let Some(name) = &pk.name {
-                            key_names.push((index_column_names(&pk.columns), name.value.clone()));
+                        reject_misplaced_overlaps(&pk.columns)?;
+                        let (name, period) = temporal_key_name(pk.name.as_ref());
+                        if let Some(name) = &name {
+                            key_names.push((index_column_names(&pk.columns), name.clone()));
+                        }
+                        if let Some(period) = &period {
+                            let names = index_column_names(&pk.columns);
+                            if names.len() < 2 || names.last() != Some(period) {
+                                anyhow::bail!(
+                                    "constraint using WITHOUT OVERLAPS needs at least two columns"
+                                );
+                            }
+                            key_temporal.push((names, period.clone()));
                         }
                         if !pk.include.is_empty() {
                             key_includes.push((
@@ -404,6 +449,7 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                 key_names,
                 key_flags,
                 key_includes,
+                key_temporal,
                 on_commit: match create_table.on_commit {
                     Some(sqlparser::ast::OnCommit::Drop) => Some("DROP".to_string()),
                     Some(sqlparser::ast::OnCommit::DeleteRows) => Some("DELETE ROWS".to_string()),
@@ -2363,6 +2409,7 @@ fn plan_alter_table_op(
                             deferrable,
                             initially_deferred,
                             nulls_not_distinct: nulls_not_distinct(uc),
+                            period: None,
                         })
                     }
                     ColumnOption::PrimaryKey(pk) => {
@@ -2374,6 +2421,7 @@ fn plan_alter_table_op(
                             columns: vec![column.clone()],
                             deferrable,
                             initially_deferred,
+                            period: None,
                         });
                     }
                     ColumnOption::Check(check) => {
@@ -2490,24 +2538,30 @@ fn plan_alter_table_op(
                     }
                 }
                 C::Unique(unique) => {
+                    reject_misplaced_overlaps(&unique.columns)?;
                     reject_not_enforced_kind(&unique.characteristics, "UNIQUE")?;
                     let (deferrable, initially_deferred) = deferral(&unique.characteristics)?;
+                    let (name, period) = temporal_key_name(unique.name.as_ref());
                     NewConstraint::Unique {
-                        name: unique.name.as_ref().map(|n| n.value.clone()),
+                        name,
                         columns: index_column_names(&unique.columns),
                         deferrable,
                         initially_deferred,
                         nulls_not_distinct: nulls_not_distinct(unique),
+                        period,
                     }
                 }
                 C::PrimaryKey(pk) => {
+                    reject_misplaced_overlaps(&pk.columns)?;
                     reject_not_enforced_kind(&pk.characteristics, "PRIMARY KEY")?;
                     let (deferrable, initially_deferred) = deferral(&pk.characteristics)?;
+                    let (name, period) = temporal_key_name(pk.name.as_ref());
                     NewConstraint::PrimaryKey {
-                        name: pk.name.as_ref().map(|n| n.value.clone()),
+                        name,
                         columns: index_column_names(&pk.columns),
                         deferrable,
                         initially_deferred,
+                        period,
                     }
                 }
                 C::ForeignKey(fk) => NewConstraint::ForeignKey(foreign_key(
@@ -2613,6 +2667,20 @@ fn nulls_not_distinct(constraint: &sqlparser::ast::UniqueConstraint) -> bool {
         .index_name
         .as_ref()
         .is_some_and(|name| name.value == nodus_sql::NULLS_NOT_DISTINCT_MARK)
+}
+
+/// A key constraint's name as written, and its `WITHOUT OVERLAPS` period if
+/// the token rewriter marked it (see [`nodus_sql::TEMPORAL_MARK`]).
+fn temporal_key_name(name: Option<&sqlparser::ast::Ident>) -> (Option<String>, Option<String>) {
+    let Some(ident) = name else {
+        return (None, None);
+    };
+    let Some(rest) = ident.value.strip_prefix(nodus_sql::TEMPORAL_MARK) else {
+        return (Some(ident.value.clone()), None);
+    };
+    let (period, user) = rest.split_once('\u{0}').unwrap_or((rest, ""));
+    let user = (!user.is_empty()).then(|| user.to_string());
+    (user, Some(period.to_string()))
 }
 
 /// The expression a virtual generated column's marker wraps —

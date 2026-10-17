@@ -2028,6 +2028,7 @@ impl MemExecutor {
                     Value::Null,
                     Value::Null,
                     Value::Null,
+                    Value::Bool(false),
                 ]);
             }
         }

@@ -350,6 +350,11 @@ pub struct IndexDescriptor {
     /// `NULLS NOT DISTINCT`: a unique key treats NULLs as equal.
     #[serde(default)]
     pub nulls_not_distinct: bool,
+    /// `WITHOUT OVERLAPS`: the key's period column. Two rows equal on the
+    /// key's other columns conflict when their periods overlap — PostgreSQL
+    /// 18's temporal keys. Defaulted so older descriptors decode.
+    #[serde(default)]
+    pub period: Option<ColumnId>,
     pub global: bool,
     pub predicate: Option<Expression>,
     pub expressions: Vec<Expression>,

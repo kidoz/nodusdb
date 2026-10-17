@@ -543,7 +543,7 @@ impl MemExecutor {
                                 index.index_type,
                                 nodus_catalog::IndexType::Primary
                             )),
-                            Value::Bool(false),
+                            Value::Bool(index.period.is_some()),
                             Value::Bool(true),
                             Value::Bool(false),
                             Value::Bool(true),
@@ -591,8 +591,8 @@ impl MemExecutor {
                     ("confdelsetcols", "INT[]"),
                     ("conexclop", "OID[]"),
                     ("conbin", "TEXT"),
-                    // PostgreSQL 18's column: nodus has no period
-                    // constraints, so the rows leave it NULL.
+                    // PostgreSQL 18's column: a `WITHOUT OVERLAPS` key's
+                    // rows set it.
                     ("conperiod", "BOOL"),
                 ]);
                 let mut rows = self.pg_constraint_rows(db_name, &schemas, &tables);
@@ -3749,6 +3749,8 @@ impl MemExecutor {
                     Value::Null,
                     Value::Null,
                     Value::Null,
+                    // PostgreSQL 18's `conperiod`.
+                    Value::Bool(index.period.is_some()),
                 ]);
             }
             // PostgreSQL 18 records each NOT NULL column as a constraint,
@@ -3793,6 +3795,7 @@ impl MemExecutor {
                     Value::Null,
                     Value::Null,
                     Value::Null,
+                    Value::Bool(false),
                 ]);
             }
             for (idx, constraint) in table.constraints.iter().enumerate() {
@@ -3838,6 +3841,7 @@ impl MemExecutor {
                             Value::Null,
                             Value::Null,
                             Value::Text(expr.clone()),
+                            Value::Bool(false),
                         ]);
                     }
                     nodus_catalog::TableConstraint::ForeignKey {
@@ -3905,6 +3909,7 @@ impl MemExecutor {
                             Value::Null,
                             Value::Null,
                             Value::Null,
+                            Value::Bool(false),
                         ]);
                     }
                 }
@@ -4296,9 +4301,16 @@ impl MemExecutor {
             )
         };
         format!(
-            "CREATE {}INDEX {} ON {relation} USING btree ({}){include}{nulls}{predicate}",
+            // A `WITHOUT OVERLAPS` key's index is a GiST exclusion index in
+            // PostgreSQL.
+            "CREATE {}INDEX {} ON {relation} USING {} ({}){include}{nulls}{predicate}",
             if index.unique { "UNIQUE " } else { "" },
             quote_ident(&index.name),
+            if index.period.is_some() {
+                "gist"
+            } else {
+                "btree"
+            },
             keys.join(", ")
         )
     }
@@ -4331,7 +4343,26 @@ impl MemExecutor {
                     } else {
                         "UNIQUE"
                     };
-                    let columns = column_list(&mut index.key_columns.iter().map(|k| k.column_id));
+                    // `WITHOUT OVERLAPS` follows the period column, the
+                    // key's last.
+                    let columns = index
+                        .key_columns
+                        .iter()
+                        .map(|key| {
+                            let name = table
+                                .columns
+                                .iter()
+                                .find(|c| c.id == key.column_id)
+                                .map(|c| quote_ident(&c.name))
+                                .unwrap_or_default();
+                            if Some(key.column_id) == index.period {
+                                format!("{name} WITHOUT OVERLAPS")
+                            } else {
+                                name
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
                     let include = if index.include_columns.is_empty() {
                         String::new()
                     } else {

@@ -1345,7 +1345,9 @@ impl MemExecutor {
                 deferrable,
                 initially_deferred,
                 nulls_not_distinct,
+                period,
             } => {
+                let period = temporal_period(tbl, &columns, period)?;
                 if columns.iter().any(|column| {
                     tbl.columns
                         .iter()
@@ -1373,6 +1375,7 @@ impl MemExecutor {
                 index.deferrable = deferrable;
                 index.initially_deferred = initially_deferred;
                 index.nulls_not_distinct = nulls_not_distinct;
+                index.period = period;
                 self.add_index(ctx, tbl, index)
             }
             NewConstraint::PrimaryKey {
@@ -1380,7 +1383,9 @@ impl MemExecutor {
                 columns,
                 deferrable,
                 initially_deferred,
+                period,
             } => {
+                let period = temporal_period(tbl, &columns, period)?;
                 if columns.iter().any(|column| {
                     tbl.columns
                         .iter()
@@ -1414,8 +1419,9 @@ impl MemExecutor {
                         return Err(self.contains_nulls(tbl, &tbl.columns[p].name));
                     }
                 }
-                let key =
+                let mut key =
                     Self::new_index(tbl, name.clone(), IndexType::Unique, &columns, None, true)?;
+                key.period = period;
                 self.check_unique_key(ctx, tbl, &key, None)?;
                 for &p in &positions {
                     if tbl.columns[p].nullable {
@@ -1437,6 +1443,7 @@ impl MemExecutor {
                     )?;
                     index.deferrable = deferrable;
                     index.initially_deferred = initially_deferred;
+                    index.period = period;
                     self.install_index(ctx, tbl, index)?;
                 }
                 let after = self.catalog_reader.get_table_by_id(tbl.id)?;
@@ -1838,6 +1845,30 @@ fn constraint_missing(tbl: &TableDescriptor, name: &str) -> anyhow::Error {
         "constraint \"{name}\" of relation \"{}\" does not exist",
         tbl.name
     )
+}
+
+/// A `WITHOUT OVERLAPS` key's period column: the key's last, and a range or
+/// multirange type. `None` when the constraint is not temporal.
+fn temporal_period(
+    tbl: &TableDescriptor,
+    columns: &[String],
+    period: Option<String>,
+) -> Result<Option<nodus_catalog::ColumnId>> {
+    let Some(period) = period else {
+        return Ok(None);
+    };
+    if columns.len() < 2 || columns.last() != Some(&period) {
+        anyhow::bail!("constraint using WITHOUT OVERLAPS needs at least two columns");
+    }
+    let Some(column) = tbl.columns.iter().find(|c| c.name == period) else {
+        anyhow::bail!("column \"{period}\" named in WITHOUT OVERLAPS does not exist");
+    };
+    if !crate::ranges::is_range_type(&column.data_type)
+        && !crate::multiranges::is_multirange_type(&column.data_type)
+    {
+        anyhow::bail!("column \"{period}\" in WITHOUT OVERLAPS is not a range or multirange type");
+    }
+    Ok(Some(column.id))
 }
 
 fn column_position_of(tbl: &TableDescriptor, name: &str) -> Result<usize> {

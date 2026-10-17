@@ -87,6 +87,7 @@ fn test_ddl_and_subqueries() {
             for_values: None,
             key_flags: vec![],
             key_includes: Vec::new(),
+            key_temporal: Vec::new(),
         },
     )
     .unwrap();
@@ -198,6 +199,7 @@ fn test_ddl_and_subqueries() {
             for_values: None,
             key_flags: vec![],
             key_includes: Vec::new(),
+            key_temporal: Vec::new(),
         },
     )
     .unwrap();
@@ -347,6 +349,7 @@ fn test_unique_constraints() {
             for_values: None,
             key_flags: vec![],
             key_includes: Vec::new(),
+            key_temporal: Vec::new(),
         },
     )
     .unwrap();
@@ -519,6 +522,7 @@ fn test_secondary_indexing() {
             for_values: None,
             key_flags: vec![],
             key_includes: Vec::new(),
+            key_temporal: Vec::new(),
         },
     )
     .unwrap();
@@ -831,6 +835,7 @@ fn test_index_value_containing_separator_does_not_overmatch() {
             for_values: None,
             key_flags: vec![],
             key_includes: Vec::new(),
+            key_temporal: Vec::new(),
         },
     )
     .unwrap();
@@ -975,6 +980,7 @@ fn test_alter_table_migrations() {
             for_values: None,
             key_flags: vec![],
             key_includes: Vec::new(),
+            key_temporal: Vec::new(),
         },
     )
     .unwrap();

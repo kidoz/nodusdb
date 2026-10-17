@@ -1406,6 +1406,10 @@ pub enum NewConstraint {
         /// `NULLS NOT DISTINCT`; defaulted so older plans decode.
         #[serde(default)]
         nulls_not_distinct: bool,
+        /// `WITHOUT OVERLAPS`: the key's period column; defaulted so older
+        /// plans decode.
+        #[serde(default)]
+        period: Option<String>,
     },
     PrimaryKey {
         name: Option<String>,
@@ -1416,6 +1420,10 @@ pub enum NewConstraint {
         /// `INITIALLY DEFERRED`; defaulted so older plans decode.
         #[serde(default)]
         initially_deferred: bool,
+        /// `WITHOUT OVERLAPS`: the key's period column; defaulted so older
+        /// plans decode.
+        #[serde(default)]
+        period: Option<String>,
     },
 }
 
@@ -1533,6 +1541,10 @@ pub enum LogicalPlan {
         /// Defaulted so older plans decode.
         #[serde(default)]
         key_includes: Vec<(Vec<String>, Vec<String>)>,
+        /// Key constraints' `WITHOUT OVERLAPS` period column, by their key
+        /// columns. Defaulted so older plans decode.
+        #[serde(default)]
+        key_temporal: Vec<(Vec<String>, String)>,
         /// A temporary table's `ON COMMIT` action: `DROP` or `DELETE ROWS`.
         #[serde(default)]
         on_commit: Option<String>,

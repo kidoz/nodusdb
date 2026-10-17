@@ -57,6 +57,7 @@ fn test_offset_distinct_returning() {
             for_values: None,
             key_flags: vec![],
             key_includes: Vec::new(),
+            key_temporal: Vec::new(),
         },
     )
     .unwrap();
