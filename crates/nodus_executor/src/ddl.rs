@@ -268,6 +268,7 @@ impl MemExecutor {
         let keys = crate::referential::Keys {
             name: table_only.to_string(),
             columns: columns.iter().map(|c| c.name.clone()).collect(),
+            types: columns.iter().map(|c| c.data_type.clone()).collect(),
             primary: columns
                 .iter()
                 .filter(|c| c.primary)
@@ -278,6 +279,10 @@ impl MemExecutor {
                 .filter(|c| c.unique && !c.primary)
                 .map(|c| vec![c.name.clone()])
                 .chain(unique_constraints.iter().cloned())
+                .collect(),
+            temporal: key_temporal
+                .iter()
+                .map(|(columns, _)| columns.clone())
                 .collect(),
         };
         let constraints = constraints

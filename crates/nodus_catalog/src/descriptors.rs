@@ -195,6 +195,11 @@ pub enum TableConstraint {
         /// `ENFORCED` (the default) or `NOT ENFORCED`.
         #[serde(default = "enforced_by_default")]
         enforced: bool,
+        /// `PERIOD`: a temporal foreign key — the last column of each list
+        /// is a period, and a row is referenced when its period holds the
+        /// child's. Defaulted so older descriptors decode.
+        #[serde(default)]
+        period: bool,
         /// What deleting a referenced row does to the rows referencing it.
         /// Defaulted so descriptors persisted before it decode.
         #[serde(default)]

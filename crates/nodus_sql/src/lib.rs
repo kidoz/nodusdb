@@ -3562,6 +3562,239 @@ fn rewrite_temporal_keys(
     statement
 }
 
+/// The name a temporal foreign key's `PERIOD` is encoded in —
+/// `\0nodus_period\0<referencing>\0<referenced>\0<name>` with each flag
+/// `1` or `0` — since the parser has no such clause. The planner strips the
+/// mark and keeps the two flags to reject one-sided uses.
+pub const PERIOD_MARK: &str = "\u{0}nodus_period\u{0}";
+
+/// Rewrites `FOREIGN KEY (a, PERIOD b) REFERENCES t (c, PERIOD d)` by
+/// dropping the `PERIOD` words and encoding both flags (and an existing
+/// constraint name) in the key's name. A `PERIOD` the parser takes as an
+/// expression — a column-level `REFERENCES`, or one not after the last key
+/// column — is left for the parser's own error.
+fn rewrite_period_foreign_keys(
+    mut statement: Vec<sqlparser::tokenizer::TokenWithSpan>,
+) -> Vec<sqlparser::tokenizer::TokenWithSpan> {
+    use sqlparser::keywords::Keyword;
+    use sqlparser::tokenizer::{Token, Word};
+    let significant: Vec<usize> = statement
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| !matches!(t.token, Token::Whitespace(_)))
+        .map(|(i, _)| i)
+        .collect();
+    let word = |i: usize| match &statement[i].token {
+        Token::Word(w) if w.quote_style.is_none() => Some(w.value.as_str()),
+        _ => None,
+    };
+    // The index in `significant` of the `foreign` keyword that starts the
+    // table-level key enclosing the token at `at`, if any.
+    let enclosing_foreign = |at: usize| -> Option<usize> {
+        let pos = significant.iter().position(|&j| j == at)?;
+        let mut depth = 0usize;
+        let mut open = None;
+        for &j in significant[..pos].iter().rev() {
+            match statement[j].token {
+                Token::RParen => depth += 1,
+                Token::LParen => {
+                    if depth == 0 {
+                        open = Some(j);
+                        break;
+                    }
+                    depth -= 1;
+                }
+                _ => {}
+            }
+        }
+        let open = open?;
+        let at_open = significant.iter().position(|&j| j == open)?;
+        // `KEY (` — and `FOREIGN` before it.
+        if at_open < 2 || word(significant[at_open - 1]) != Some("key") {
+            return None;
+        }
+        if word(significant[at_open - 2]) == Some("foreign") {
+            Some(significant[at_open - 2])
+        } else {
+            None
+        }
+    };
+    // Whether the `(` at `open` starts a `REFERENCES name (` list of a
+    // table-level key.
+    let referenced_list = |open: usize| -> Option<usize> {
+        let at_open = significant.iter().position(|&j| j == open)?;
+        // Walk back over the table name (`t` or `s . t`).
+        let mut k = at_open;
+        while k > 0 {
+            match &statement[significant[k - 1]].token {
+                Token::Word(w) if w.quote_style.is_none() && w.value == "references" => {
+                    // `FOREIGN KEY (...) REFERENCES t (...)`: the `)` of the
+                    // referencing list precedes `REFERENCES`.
+                    let close = significant.get(k.wrapping_sub(2)).copied()?;
+                    if !matches!(statement[close].token, Token::RParen) {
+                        return None;
+                    }
+                    return enclosing_foreign(close);
+                }
+                Token::Word(_) | Token::Period => k -= 1,
+                _ => return None,
+            }
+        }
+        None
+    };
+    // (foreign token index, referencing flag, referenced flag, name token or
+    // insertion point, replace existing)
+    let mut marks: std::collections::BTreeMap<usize, (bool, bool, usize, bool, String)> =
+        std::collections::BTreeMap::new();
+    let mut removals: Vec<usize> = Vec::new();
+    for &at in &significant {
+        if word(at) != Some("period") {
+            continue;
+        }
+        let pos = significant
+            .iter()
+            .position(|&j| j == at)
+            .expect("significant");
+        // `PERIOD <column>` as the list's last entry.
+        let Some(&column) = significant.get(pos + 1) else {
+            continue;
+        };
+        if !matches!(statement[column].token, Token::Word(_)) {
+            continue;
+        }
+        let Some(&after) = significant.get(pos + 2) else {
+            continue;
+        };
+        if !matches!(statement[after].token, Token::RParen) {
+            continue;
+        }
+        // The enclosing list.
+        let mut depth = 0usize;
+        let mut open = None;
+        for &j in significant[..pos].iter().rev() {
+            match statement[j].token {
+                Token::RParen => depth += 1,
+                Token::LParen => {
+                    if depth == 0 {
+                        open = Some(j);
+                        break;
+                    }
+                    depth -= 1;
+                }
+                _ => {}
+            }
+        }
+        let Some(open) = open else { continue };
+        let side = if named_list_before(&statement, &significant, open) == Some("references") {
+            // The referenced side: only a table-level key may mark it.
+            let Some(foreign) = referenced_list(open) else {
+                continue;
+            };
+            (foreign, false, true)
+        } else {
+            // The referencing side.
+            let Some(foreign) = enclosing_foreign(at) else {
+                continue;
+            };
+            (foreign, true, false)
+        };
+        let (foreign, referencing, referenced) = side;
+        // `[CONSTRAINT name] FOREIGN KEY`: the name sits right before
+        // `foreign`, and `constraint` before the name.
+        let at_foreign = significant
+            .iter()
+            .position(|&j| j == foreign)
+            .expect("significant");
+        let (name_at, replace) =
+            if at_foreign >= 2 && word(significant[at_foreign - 2]) == Some("constraint") {
+                (significant[at_foreign - 1], true)
+            } else {
+                (foreign, false)
+            };
+        let name = if replace {
+            match &statement[name_at].token {
+                Token::Word(w) => w.value.clone(),
+                _ => String::new(),
+            }
+        } else {
+            String::new()
+        };
+        let entry = marks
+            .entry(foreign)
+            .or_insert((false, false, name_at, replace, name.clone()));
+        entry.0 |= referencing;
+        entry.1 |= referenced;
+        removals.push(at);
+    }
+    if marks.is_empty() {
+        return statement;
+    }
+    // Remove the `PERIOD` words from the end, then change each key's name.
+    for at in removals.into_iter().rev() {
+        statement.splice(at..=at, []);
+    }
+    for (foreign, (referencing, referenced, name_at, replace, name)) in marks.into_iter().rev() {
+        let marked = format!(
+            "{PERIOD_MARK}{}\u{0}{}\u{0}{name}",
+            u8::from(referencing),
+            u8::from(referenced)
+        );
+        let span = statement[name_at].span;
+        let mark_token = sqlparser::tokenizer::TokenWithSpan {
+            token: Token::Word(Word {
+                value: marked,
+                quote_style: Some('"'),
+                keyword: Keyword::NoKeyword,
+            }),
+            span,
+        };
+        if replace {
+            statement.splice(name_at..=name_at, [mark_token]);
+        } else {
+            let span = statement[foreign].span;
+            statement.splice(
+                foreign..foreign,
+                [
+                    sqlparser::tokenizer::TokenWithSpan {
+                        token: Token::Word(Word {
+                            value: "constraint".to_string(),
+                            quote_style: None,
+                            keyword: Keyword::CONSTRAINT,
+                        }),
+                        span,
+                    },
+                    mark_token,
+                ],
+            );
+        }
+    }
+    statement
+}
+
+/// The keyword the word before the list's `(` belongs to (`references` for
+/// a referenced list), skipping a table name and its schema.
+fn named_list_before(
+    statement: &[sqlparser::tokenizer::TokenWithSpan],
+    significant: &[usize],
+    open: usize,
+) -> Option<&'static str> {
+    use sqlparser::tokenizer::Token;
+    let at_open = significant.iter().position(|&j| j == open)?;
+    let mut k = at_open;
+    while k > 0 {
+        match &statement[significant[k - 1]].token {
+            Token::Word(w) if w.quote_style.is_none() && w.value == "references" => {
+                return Some("references");
+            }
+            // A `KEY` (the referencing list's) ends the search.
+            Token::Word(w) if w.quote_style.is_none() && w.value == "key" => return None,
+            Token::Word(_) | Token::Period => k -= 1,
+            _ => return None,
+        }
+    }
+    None
+}
+
 /// The function a *virtual* generated column's expression is wrapped in —
 /// `GENERATED ALWAYS AS (__NODUS_VIRTUAL__(expr)) STORED` — since the
 /// PostgreSQL parser takes only `STORED`. The planner unwraps it and keeps
@@ -3653,6 +3886,7 @@ fn rewrite_statement_form(
     use sqlparser::tokenizer::{Token, TokenWithSpan};
     statement = rewrite_virtual_generation(statement);
     statement = rewrite_temporal_keys(statement);
+    statement = rewrite_period_foreign_keys(statement);
     let word = |t: &TokenWithSpan| match &t.token {
         Token::Word(w) if w.quote_style.is_none() => Some(w.value.clone()),
         _ => None,
@@ -5085,6 +5319,33 @@ mod tests {
             "{altered}"
         );
         assert!(altered.contains("UNIQUE (id, d)"), "{altered}");
+    }
+
+    #[test]
+    fn period_foreign_keys_are_marked() {
+        let one = |sql: &str| parse_sql(sql).unwrap().remove(0).to_string();
+        let plain = one(
+            "CREATE TABLE c (id int, d tsrange, FOREIGN KEY (id, PERIOD d) REFERENCES p (id, PERIOD d))",
+        );
+        assert!(
+            plain.contains(&format!("{}1\u{0}1\u{0}", PERIOD_MARK)),
+            "{plain}"
+        );
+        assert!(!plain.to_ascii_uppercase().contains("PERIOD "), "{plain}");
+        // A named key keeps its name in the mark.
+        let named = one(
+            "CREATE TABLE c (id int, d tsrange, CONSTRAINT c_fk FOREIGN KEY (id, PERIOD d) REFERENCES p (id, PERIOD d))",
+        );
+        assert!(
+            named.contains(&format!("{}1\u{0}1\u{0}c_fk", PERIOD_MARK)),
+            "{named}"
+        );
+        // One side only: the flag says which.
+        let one_side = one("ALTER TABLE c ADD FOREIGN KEY (id, PERIOD d) REFERENCES p (id, d)");
+        assert!(
+            one_side.contains(&format!("{}1\u{0}0\u{0}", PERIOD_MARK)),
+            "{one_side}"
+        );
     }
 
     #[test]

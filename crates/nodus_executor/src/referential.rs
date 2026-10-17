@@ -21,6 +21,9 @@ pub(crate) struct Reference {
     /// check may then wait for `COMMIT`).
     pub(crate) deferrable: bool,
     pub(crate) initially_deferred: bool,
+    /// `PERIOD`: the key's last column on each side is a period, and a
+    /// parent row covers a child's when its period holds the child's.
+    pub(crate) period: bool,
 }
 
 /// A table's columns and the keys a foreign key may reference: its
@@ -28,8 +31,13 @@ pub(crate) struct Reference {
 pub(crate) struct Keys {
     pub(crate) name: String,
     pub(crate) columns: Vec<String>,
+    /// The columns' declared types, parallel to `columns`.
+    pub(crate) types: Vec<String>,
     pub(crate) primary: Vec<String>,
     pub(crate) unique: Vec<Vec<String>>,
+    /// The columns of the keys built `WITHOUT OVERLAPS`, primary and
+    /// unique: only these may back a `PERIOD` foreign key.
+    pub(crate) temporal: Vec<Vec<String>>,
 }
 
 impl Keys {
@@ -41,11 +49,11 @@ impl Keys {
                 .map(|c| c.name.clone())
                 .collect()
         };
-        let primary = MemExecutor::pk_positions_declared(table)
+        let primary: Vec<String> = MemExecutor::pk_positions_declared(table)
             .into_iter()
             .map(|p| table.columns[p].name.clone())
             .collect();
-        let unique = table
+        let unique: Vec<Vec<String>> = table
             .indexes
             .iter()
             .filter(|i| {
@@ -56,11 +64,32 @@ impl Keys {
             })
             .map(|i| names(&i.key_columns))
             .collect();
+        let mut temporal = Vec::new();
+        if table
+            .indexes
+            .iter()
+            .any(|i| i.index_type == nodus_catalog::IndexType::Primary && i.period.is_some())
+        {
+            temporal.push(primary.clone());
+        }
+        temporal.extend(
+            table
+                .indexes
+                .iter()
+                .filter(|i| {
+                    i.unique
+                        && i.index_type != nodus_catalog::IndexType::Primary
+                        && i.period.is_some()
+                })
+                .map(|i| names(&i.key_columns)),
+        );
         Keys {
             name: table.name.clone(),
             columns: table.columns.iter().map(|c| c.name.clone()).collect(),
+            types: table.columns.iter().map(|c| c.data_type.clone()).collect(),
             primary,
             unique,
+            temporal,
         }
     }
 
@@ -97,6 +126,54 @@ fn same_key(a: &[Value], b: &[Value]) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(x, y)| crate::values_equal(x, y))
 }
 
+/// Whether the parent rows' periods, merged, hold the child's: PostgreSQL's
+/// temporal foreign key test, where a child may span several adjacent
+/// parent rows.
+fn periods_cover(reference: &Reference, parents: &[Vec<Value>], child: &[Value]) -> bool {
+    let n = child.len();
+    if n == 0 || parents.iter().any(|parent| parent.len() != n) || child[n - 1] == Value::Null {
+        return false;
+    }
+    let data_type = reference
+        .parent
+        .columns
+        .get(reference.parent_positions[n - 1])
+        .map_or("", |c| c.data_type.as_str());
+    let range_kind = crate::ranges::Kind::of(data_type);
+    let kind = match range_kind.or_else(|| crate::multiranges::kind_of(data_type)) {
+        Some(kind) => kind,
+        None => return false,
+    };
+    let mut elements = Vec::new();
+    for parent in parents {
+        if !parent[..n - 1]
+            .iter()
+            .zip(&child[..n - 1])
+            .all(|(p, c)| crate::values_equal(p, c))
+        {
+            continue;
+        }
+        let Value::Text(text) = &parent[n - 1] else {
+            continue;
+        };
+        if range_kind.is_some() {
+            if let Ok(range) = crate::ranges::canonical_range(kind, text) {
+                elements.push(range);
+            }
+        } else {
+            elements.extend(crate::multiranges::parse(text).unwrap_or_default());
+        }
+    }
+    let union = crate::multiranges::format(&crate::multiranges::merge(kind, elements));
+    let Value::Text(child_period) = &child[n - 1] else {
+        return false;
+    };
+    matches!(
+        crate::multiranges::operator("@>", kind, &union, child_period, false),
+        Ok(Value::Bool(true))
+    )
+}
+
 /// A key as a set member: equal keys give equal strings.
 pub(crate) fn key_string(key: &[Value]) -> String {
     key.iter()
@@ -126,6 +203,7 @@ impl MemExecutor {
             deferrable,
             initially_deferred,
             enforced,
+            period,
         } = fk
         else {
             return Ok(fk);
@@ -172,6 +250,65 @@ impl MemExecutor {
             anyhow::bail!(
                 "there is no unique constraint matching given keys for referenced table \"{table}\""
             );
+        }
+        // A `PERIOD` key: only NO ACTION is supported, the referenced key
+        // must be a temporal one, and the two period columns must be ranges
+        // of the same kind.
+        if period {
+            if on_delete != ReferentialAction::NoAction {
+                anyhow::bail!(
+                    "unsupported ON DELETE action for foreign key constraint using PERIOD"
+                );
+            }
+            if on_update != ReferentialAction::NoAction {
+                anyhow::bail!(
+                    "unsupported ON UPDATE action for foreign key constraint using PERIOD"
+                );
+            }
+            let effective = name
+                .clone()
+                .unwrap_or_else(|| foreign_key_name(&child.name, &columns));
+            // The referenced columns must be a temporal key's.
+            let mut wanted = referred_columns.clone();
+            wanted.sort_unstable();
+            let temporal_key = parent_keys.temporal.iter().any(|key| {
+                let mut columns = key.clone();
+                columns.sort_unstable();
+                columns == wanted
+            });
+            if !temporal_key {
+                anyhow::bail!(
+                    "there is no unique constraint matching given keys for referenced table \"{table}\""
+                );
+            }
+            let period_column = referred_columns.last().cloned().unwrap_or_default();
+            let child_period = columns.last().cloned().unwrap_or_default();
+            let child_type = child
+                .columns
+                .iter()
+                .position(|c| c == &child_period)
+                .and_then(|at| child.types.get(at))
+                .cloned()
+                .unwrap_or_default();
+            let parent_type = parent_keys
+                .columns
+                .iter()
+                .position(|c| c == &period_column)
+                .and_then(|at| parent_keys.types.get(at))
+                .cloned()
+                .unwrap_or_default();
+            if !period_kinds_match(&child_type, &parent_type) {
+                let shown = |t: &str| crate::functions::format_type_name(Self::pg_type_oid(t));
+                return Err(DbError::new(format!(
+                    "foreign key constraint \"{effective}\" cannot be implemented"
+                ))
+                .detail(format!(
+                    "Key columns \"{child_period}\" of the referencing table and \"{period_column}\" of the referenced table are of incompatible types: {} and {}.",
+                    shown(&child_type),
+                    shown(&parent_type)
+                ))
+                .into());
+            }
         }
         // The referenced key may not be a deferrable one.
         if let Some(parent) = &parent {
@@ -233,6 +370,7 @@ impl MemExecutor {
             deferrable,
             initially_deferred,
             enforced,
+            period,
         })
     }
 
@@ -252,6 +390,22 @@ impl MemExecutor {
         ctx: &ExecutionContext,
         reference: &Reference,
     ) -> Result<()> {
+        if reference.period {
+            let parents: Vec<Vec<Value>> = self
+                .scan_rows(reference.parent.id, &ctx.session_id)?
+                .iter()
+                .filter_map(|row| key_tuple(row, &reference.parent_positions))
+                .collect();
+            for row in self.scan_rows(reference.child.id, &ctx.session_id)? {
+                let Some(tuple) = key_tuple(&row, &reference.child_positions) else {
+                    continue;
+                };
+                if !periods_cover(reference, &parents, &tuple) {
+                    return Err(self.missing_key_error(&reference.child, reference, &tuple));
+                }
+            }
+            return Ok(());
+        }
         let keys: std::collections::HashSet<String> = self
             .scan_rows(reference.parent.id, &ctx.session_id)?
             .iter()
@@ -308,6 +462,7 @@ impl MemExecutor {
             deferrable,
             initially_deferred,
             enforced,
+            period,
         } = fk
         else {
             return Ok(None);
@@ -362,6 +517,7 @@ impl MemExecutor {
             on_update: *on_update,
             deferrable: *deferrable,
             initially_deferred: *initially_deferred,
+            period: *period,
         }))
     }
 
@@ -437,13 +593,19 @@ impl MemExecutor {
             if self_reference {
                 continue;
             }
-            let found = self
-                .scan_rows(reference.parent.id, &ctx.session_id)?
-                .iter()
-                .any(|parent| {
+            let parents = self.scan_rows(reference.parent.id, &ctx.session_id)?;
+            let found = if reference.period {
+                let parent_keys: Vec<Vec<Value>> = parents
+                    .iter()
+                    .filter_map(|parent| key_tuple(parent, &reference.parent_positions))
+                    .collect();
+                periods_cover(&reference, &parent_keys, &key)
+            } else {
+                parents.iter().any(|parent| {
                     key_tuple(parent, &reference.parent_positions)
                         .is_some_and(|k| same_key(&k, &key))
-                });
+                })
+            };
             if !found {
                 return Err(self.missing_key_error(tbl, &reference, &key));
             }
@@ -526,6 +688,12 @@ impl MemExecutor {
             }
             let mut child_removed = Vec::new();
             let mut child_changed = Vec::new();
+            // A temporal key's only action is NO ACTION; the check after
+            // the writes below decides.
+            if reference.period {
+                unresolved.push(reference);
+                continue;
+            }
             for (key, row) in self.scan_rows_keyed(reference.child.id, &ctx.session_id)? {
                 let Some(tuple) = key_tuple(&row, &reference.child_positions) else {
                     continue;
@@ -597,12 +765,61 @@ impl MemExecutor {
                 self.note_deferred_write(&ctx.session_id, reference.child.id);
                 continue;
             }
-            let keys: std::collections::HashSet<String> = self
+            let parents: Vec<Vec<Value>> = self
                 .scan_rows(tbl.id, &ctx.session_id)?
                 .iter()
                 .filter_map(|row| key_tuple(row, &reference.parent_positions))
-                .map(|k| key_string(&k))
                 .collect();
+            if reference.period {
+                // The gone keys, as PostgreSQL's DETAIL reports them.
+                let gone: Vec<Vec<Value>> = removed
+                    .iter()
+                    .filter_map(|row| key_tuple(row, &reference.parent_positions))
+                    .chain(
+                        changed
+                            .iter()
+                            .filter_map(|(old, _)| key_tuple(old, &reference.parent_positions)),
+                    )
+                    .collect();
+                let child_period_type = reference
+                    .child
+                    .columns
+                    .get(*reference.child_positions.last().unwrap_or(&0))
+                    .map_or("", |c| c.data_type.as_str());
+                for row in self.scan_rows(reference.child.id, &ctx.session_id)? {
+                    let Some(tuple) = key_tuple(&row, &reference.child_positions) else {
+                        continue;
+                    };
+                    if periods_cover(reference, &parents, &tuple) {
+                        continue;
+                    }
+                    // A gone key that met the child, as PostgreSQL names it.
+                    let key = gone
+                        .iter()
+                        .find(|key| {
+                            key.len() == tuple.len()
+                                && key[..key.len() - 1]
+                                    .iter()
+                                    .zip(&tuple[..tuple.len() - 1])
+                                    .all(|(a, b)| crate::values_equal(a, b))
+                                && match (&key[key.len() - 1], &tuple[tuple.len() - 1]) {
+                                    (Value::Text(a), Value::Text(b)) => {
+                                        crate::constraints::ranges_overlap(
+                                            child_period_type,
+                                            &Value::Text(a.clone()),
+                                            &Value::Text(b.clone()),
+                                        )
+                                    }
+                                    _ => false,
+                                }
+                        })
+                        .unwrap_or(&tuple);
+                    return Err(self.still_referenced(reference, key));
+                }
+                continue;
+            }
+            let keys: std::collections::HashSet<String> =
+                parents.iter().map(|k| key_string(k)).collect();
             for row in self.scan_rows(reference.child.id, &ctx.session_id)? {
                 if let Some(tuple) = key_tuple(&row, &reference.child_positions)
                     && !keys.contains(&key_string(&tuple))
@@ -618,4 +835,19 @@ impl MemExecutor {
     fn table_now(&self, table: &TableDescriptor) -> Result<TableDescriptor> {
         self.catalog_reader.get_table_by_id(table.id)
     }
+}
+
+/// Whether two period columns' types are comparable: ranges of the same
+/// kind, or multiranges of the same kind.
+fn period_kinds_match(a: &str, b: &str) -> bool {
+    if let (Some(x), Some(y)) = (crate::ranges::Kind::of(a), crate::ranges::Kind::of(b)) {
+        return x == y;
+    }
+    if let (Some(x), Some(y)) = (
+        crate::multiranges::kind_of(a),
+        crate::multiranges::kind_of(b),
+    ) {
+        return x == y;
+    }
+    false
 }

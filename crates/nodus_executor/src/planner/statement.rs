@@ -2639,8 +2639,19 @@ fn foreign_key(
     };
     let (deferrable, initially_deferred) = deferral(&fk.characteristics)?;
     let enforced = enforced_flag(&fk.characteristics);
+    let (name, referencing, referenced) = period_key_name(name);
+    let period = match (referencing, referenced) {
+        (false, false) => false,
+        (true, false) => anyhow::bail!(
+            "foreign key uses PERIOD on the referencing table but not the referenced table"
+        ),
+        (false, true) => anyhow::bail!(
+            "foreign key uses PERIOD on the referenced table but not the referencing table"
+        ),
+        (true, true) => true,
+    };
     Ok(nodus_catalog::TableConstraint::ForeignKey {
-        name: name.map(|n| n.value.clone()),
+        name,
         columns,
         foreign_table: fk.foreign_table.to_string(),
         enforced,
@@ -2653,6 +2664,7 @@ fn foreign_key(
         on_update: action(fk.on_update),
         deferrable,
         initially_deferred,
+        period,
     })
 }
 
@@ -2681,6 +2693,27 @@ fn temporal_key_name(name: Option<&sqlparser::ast::Ident>) -> (Option<String>, O
     let (period, user) = rest.split_once('\u{0}').unwrap_or((rest, ""));
     let user = (!user.is_empty()).then(|| user.to_string());
     (user, Some(period.to_string()))
+}
+
+/// A foreign key's name as written, and its `PERIOD` flags (referencing,
+/// referenced) when the token rewriter marked it (see
+/// [`nodus_sql::PERIOD_MARK`]).
+fn period_key_name(name: Option<&sqlparser::ast::Ident>) -> (Option<String>, bool, bool) {
+    let Some(ident) = name else {
+        return (None, false, false);
+    };
+    let Some(rest) = ident.value.strip_prefix(nodus_sql::PERIOD_MARK) else {
+        return (Some(ident.value.clone()), false, false);
+    };
+    let mut parts = rest.split('\u{0}');
+    let referencing = parts.next() == Some("1");
+    let referenced = parts.next() == Some("1");
+    let user = parts.next().unwrap_or("");
+    (
+        (!user.is_empty()).then(|| user.to_string()),
+        referencing,
+        referenced,
+    )
 }
 
 /// The expression a virtual generated column's marker wraps —

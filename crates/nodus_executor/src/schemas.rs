@@ -874,6 +874,7 @@ impl MemExecutor {
                     deferrable,
                     initially_deferred,
                     enforced,
+                    period,
                 } = constraint
                 else {
                     continue;
@@ -902,6 +903,7 @@ impl MemExecutor {
                             deferrable: *deferrable,
                             initially_deferred: *initially_deferred,
                             enforced: *enforced,
+                            period: *period,
                         },
                     },
                 )?;

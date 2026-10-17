@@ -3854,6 +3854,7 @@ impl MemExecutor {
                         deferrable,
                         initially_deferred,
                         enforced,
+                        period,
                     } => {
                         let conname = name.clone().unwrap_or_else(|| {
                             format!("{}_{}_fkey", table.name, columns.join("_"))
@@ -3909,7 +3910,7 @@ impl MemExecutor {
                             Value::Null,
                             Value::Null,
                             Value::Null,
-                            Value::Bool(false),
+                            Value::Bool(*period),
                         ]);
                     }
                 }
@@ -4420,6 +4421,7 @@ impl MemExecutor {
                         deferrable,
                         initially_deferred,
                         enforced,
+                        period,
                     } => {
                         let name = name.clone().unwrap_or_else(|| {
                             format!("{}_{}_fkey", table.name, columns.join("_"))
@@ -4434,10 +4436,18 @@ impl MemExecutor {
                                         .map(|sql| format!(" ON {event} {sql}"))
                                 })
                                 .collect();
+                            // `PERIOD` precedes the last column of each list.
                             let quote = |names: &[String]| {
                                 names
                                     .iter()
-                                    .map(|n| quote_ident(n))
+                                    .enumerate()
+                                    .map(|(at, name)| {
+                                        if *period && at + 1 == names.len() {
+                                            format!("PERIOD {}", quote_ident(name))
+                                        } else {
+                                            quote_ident(name)
+                                        }
+                                    })
                                     .collect::<Vec<_>>()
                                     .join(", ")
                             };

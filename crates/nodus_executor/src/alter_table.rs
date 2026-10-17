@@ -559,6 +559,7 @@ impl MemExecutor {
                 deferrable: was_deferrable,
                 initially_deferred: was_initially_deferred,
                 enforced: was_enforced,
+                period: was_period,
             } = constraint
             else {
                 return Err(not_a_key(name));
@@ -580,6 +581,7 @@ impl MemExecutor {
                     *was_initially_deferred
                 },
                 enforced: enforced.unwrap_or(*was_enforced),
+                period: *was_period,
             };
             return self.replace_constraint(tbl, constraint, updated);
         }
@@ -1088,6 +1090,7 @@ impl MemExecutor {
                     deferrable,
                     initially_deferred,
                     enforced,
+                    period,
                 } if columns.iter().any(|c| c == old)
                     || (names_table(foreign_table, &tbl.name)
                         && referred_columns.iter().any(|c| c == old)) =>
@@ -1107,6 +1110,7 @@ impl MemExecutor {
                         deferrable: *deferrable,
                         initially_deferred: *initially_deferred,
                         enforced: *enforced,
+                        period: *period,
                     }
                 }
                 _ => continue,
@@ -1129,6 +1133,7 @@ impl MemExecutor {
                     deferrable,
                     initially_deferred,
                     enforced,
+                    period,
                 } = constraint
                     && names_table(foreign_table, &tbl.name)
                     && referred_columns.iter().any(|c| c == old)
@@ -1143,6 +1148,7 @@ impl MemExecutor {
                         deferrable: *deferrable,
                         initially_deferred: *initially_deferred,
                         enforced: *enforced,
+                        period: *period,
                     };
                     self.replace_constraint(&child, constraint, renamed)?;
                 }
@@ -1240,6 +1246,7 @@ impl MemExecutor {
                     deferrable,
                     initially_deferred,
                     enforced,
+                    period,
                 } = constraint
                     && names_table(foreign_table, &tbl.name)
                 {
@@ -1259,6 +1266,7 @@ impl MemExecutor {
                         deferrable: *deferrable,
                         initially_deferred: *initially_deferred,
                         enforced: *enforced,
+                        period: *period,
                     };
                     self.replace_constraint(&child, constraint, renamed)?;
                 }
@@ -1759,6 +1767,7 @@ impl MemExecutor {
                     deferrable,
                     initially_deferred,
                     enforced,
+                    period,
                     ..
                 } => TableConstraint::ForeignKey {
                     name: Some(new.to_string()),
@@ -1770,6 +1779,7 @@ impl MemExecutor {
                     deferrable,
                     initially_deferred,
                     enforced,
+                    period,
                 },
             };
             return self.replace_constraint(tbl, constraint, renamed);
