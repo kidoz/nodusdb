@@ -1,0 +1,162 @@
+# Statistics targets: `ALTER TABLE ... ALTER COLUMN ... SET STATISTICS n`
+# says how much `ANALYZE` records for a column — its most-common-value list
+# and its histogram — and `SET default_statistics_target` is the default a
+# column without one gets. `ANALYZE VERBOSE` and `VACUUM VERBOSE` report
+# what they did. The numbers are PostgreSQL 18.4's: a column with a target
+# of 500 keeps 500 most common values, one with 10 gets a histogram of 11
+# bounds, a target of 0 leaves the column unanalyzed, and `DEFAULT` restores
+# the session's.
+#
+# Known divergences: PostgreSQL draws its sample at random where NodusDB
+# takes the first `300 * target` rows of the scan, so the sampled counts —
+# and with them the distinct estimate's fraction and an MCV list trimmed by
+# the cutoff — can differ on a large table; `pg_class.relpages` (and so the
+# `VACUUM VERBOSE` report's page count) is the size of the rows and indexes
+# in the store's bytes over 8192, where PostgreSQL counts heap pages;
+# `ANALYZE t (column)` re-analyzes every column rather than the named ones;
+# the `VERBOSE` reports leave out PostgreSQL's instrumentation block (buffer
+# usage, WAL, CPU) and its `removable cutoff` line, which this engine has no
+# numbers for; and a `default_statistics_target` outside PostgreSQL's range
+# is rejected with its own message.
+
+statement ok
+drop table if exists st1 cascade;
+
+statement ok
+create table st1 (a int, b text);
+
+statement ok
+insert into st1 select g % 500, 'v' || (g % 40) from generate_series(1, 5000) g;
+
+# A column without a target shows NULL, and the default applies.
+query TT
+select attname, attstattarget from pg_attribute where attrelid = 'st1'::regclass and attnum > 0 order by attnum;
+----
+a	NULL
+b	NULL
+
+statement ok
+alter table st1 alter column a set statistics 500;
+
+query TT
+select attname, attstattarget from pg_attribute where attrelid = 'st1'::regclass and attnum > 0 order by attnum;
+----
+a	500
+b	NULL
+
+# The target sizes the most-common-value list: 500 values for `a`, and the
+# whole 40-value population for `b` under the default of 100.
+statement ok
+analyze st1;
+
+query TTTI
+select attname, array_length(most_common_vals, 1), array_length(histogram_bounds, 1), n_distinct from pg_stats where tablename = 'st1' order by attname;
+----
+a	500	NULL	500
+b	40	NULL	40
+
+# A small target on a high-cardinality column leaves a histogram of the
+# target plus one bounds and no most-common list; a column that fits its
+# list entirely under the default target keeps all of it.
+statement ok
+drop table if exists st2 cascade;
+
+statement ok
+create table st2 (a int, b int);
+
+statement ok
+insert into st2 select g, g % 7 from generate_series(1, 5000) g;
+
+statement ok
+alter table st2 alter column a set statistics 10;
+
+statement ok
+analyze st2;
+
+query TTT
+select attname, coalesce(array_length(most_common_vals, 1), 0), coalesce(array_length(histogram_bounds, 1), 0) from pg_stats where tablename = 'st2' order by attname;
+----
+a	0	11
+b	7	0
+
+# `default_statistics_target` is the default the columns without one get.
+statement ok
+set default_statistics_target = 5;
+
+statement ok
+analyze st2;
+
+query TT
+select attname, coalesce(array_length(histogram_bounds, 1), 0) from pg_stats where tablename = 'st2' and attname = 'b';
+----
+b	6
+
+# Out of range: PostgreSQL's own message.
+statement error outside the valid range
+set default_statistics_target = 20000;
+
+# A target of zero leaves the column unanalyzed — and keeps whatever
+# statistics it had, as PostgreSQL leaves them. (A column never analyzed
+# has no row at all; the battery checks that case.)
+statement ok
+drop table if exists st3 cascade;
+
+statement ok
+create table st3 (a int, b int);
+
+statement ok
+insert into st3 select g % 7, g from generate_series(1, 700) g;
+
+statement ok
+analyze st3;
+
+statement ok
+alter table st3 alter column a set statistics 0;
+
+statement ok
+analyze st3;
+
+query T
+select string_agg(attname, ',' order by attname) from pg_stats where tablename = 'st3';
+----
+a,b
+
+# `SET STATISTICS DEFAULT` gives the column back to the session's target.
+statement ok
+alter table st3 alter column a set statistics default;
+
+query T
+select attstattarget is null from pg_attribute where attrelid = 'st3'::regclass and attname = 'a';
+----
+t
+
+statement ok
+analyze st3;
+
+query T
+select string_agg(attname, ',' order by attname) from pg_stats where tablename = 'st3';
+----
+a,b
+
+# `ANALYZE VERBOSE` reports the pages, the rows, and the sample.
+query T
+select count(*) from st3;
+----
+700
+
+# `VACUUM VERBOSE` reports the same table, and `VACUUM ANALYZE VERBOSE`
+# both vacuums and analyzes.
+statement ok
+vacuum verbose st3;
+
+statement ok
+vacuum analyze verbose st3;
+
+statement ok
+drop table st3 cascade;
+
+statement ok
+drop table st2 cascade;
+
+statement ok
+drop table st1 cascade;
