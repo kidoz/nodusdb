@@ -1,0 +1,248 @@
+# PostgreSQL 18 `PERIOD` foreign keys: `FOREIGN KEY (id, PERIOD during)
+# REFERENCES p (id, PERIOD during)` marks the last column of each list as a
+# period, and a child row is valid when its period is held by the union of
+# the referenced rows' periods (so a child may span several adjacent parent
+# rows). Only `NO ACTION` is supported, the referenced columns must be a
+# `WITHOUT OVERLAPS` key, and both period columns must be ranges of the same
+# kind. Removing or narrowing a parent period a child still covers fails with
+# the standard reference error. The messages and catalog values are
+# PostgreSQL 18.4's.
+#
+# Known divergences: a column-level `REFERENCES p (id, PERIOD d)` is a
+# syntax error with this parser's wording rather than PostgreSQL's; a failed
+# multi-statement batch keeps its DDL (catalog changes commit with the raft
+# log), where PostgreSQL rolls the whole batch back.
+
+statement ok
+drop table if exists pf1, cf1 cascade;
+
+statement ok
+create table pf1 (id int, during tsrange, primary key (id, during without overlaps));
+
+statement ok
+create table cf1 (id int, during tsrange, foreign key (id, period during) references pf1 (id, period during));
+
+statement ok
+insert into pf1 values (1, '[2020-01-01,2020-12-31)'), (2, '[2020-01-01,2020-12-31)');
+
+# Equal and narrower periods are held; NULL keys and periods reference
+# nothing.
+statement ok
+insert into cf1 values (1, '[2020-01-01,2020-12-31)'), (1, '[2020-02-01,2020-03-01)'), (2, '[2020-05-01,2020-06-01)'), (null, '[2020-02-01,2020-03-01)'), (1, null), (null, null);
+
+query I
+select count(*) from cf1;
+----
+6
+
+statement error violates foreign key constraint "cf1_id_during_fkey"
+insert into cf1 values (1, '[2019-12-01,2020-02-01)');
+
+statement error violates foreign key constraint "cf1_id_during_fkey"
+insert into cf1 values (1, '[2020-02-01,2021-02-01)');
+
+# The key is recorded and printed as PostgreSQL's.
+query TTT
+select conname, contype, conperiod from pg_constraint where conrelid = 'cf1'::regclass order by conname;
+----
+cf1_id_during_fkey	f	t
+
+query T
+select pg_get_constraintdef(oid) from pg_constraint where conrelid = 'cf1'::regclass and contype = 'f';
+----
+FOREIGN KEY (id, PERIOD during) REFERENCES pf1(id, PERIOD during)
+
+# A child may span adjacent parent rows: their periods merge.
+statement ok
+drop table if exists pf2, cf2 cascade;
+
+statement ok
+create table pf2 (id int, during tsrange, primary key (id, during without overlaps));
+
+statement ok
+create table cf2 (id int, during tsrange, foreign key (id, period during) references pf2 (id, period during));
+
+statement ok
+insert into pf2 values (1, '[2020-01-01,2020-06-01)'), (1, '[2020-06-01,2020-12-31)');
+
+statement ok
+insert into cf2 values (1, '[2020-02-01,2020-09-01)');
+
+statement error violates foreign key constraint "cf2_id_during_fkey"
+insert into cf2 values (1, '[2019-12-01,2020-02-01)');
+
+# Removing the parent row a child spans fails; once the child is gone the
+# parent may go too.
+statement error violates foreign key constraint "cf2_id_during_fkey" on table "cf2"
+delete from pf2 where during = '[2020-01-01,2020-06-01)';
+
+statement ok
+delete from cf2;
+
+statement ok
+delete from pf2 where during = '[2020-06-01,2020-12-31)';
+
+query I
+select count(*) from pf2;
+----
+1
+
+# A multirange period works too.
+statement ok
+drop table if exists pf3, cf3 cascade;
+
+statement ok
+create table pf3 (id int, during tsmultirange, unique (id, during without overlaps));
+
+statement ok
+create table cf3 (id int, during tsmultirange, foreign key (id, period during) references pf3 (id, period during));
+
+statement ok
+insert into pf3 values (1, '{[2020-01-01,2020-06-01),[2020-07-01,2020-12-31)}');
+
+statement ok
+insert into cf3 values (1, '{[2020-02-01,2020-03-01),[2020-08-01,2020-09-01)}');
+
+statement error violates foreign key constraint "cf3_id_during_fkey"
+insert into cf3 values (1, '{[2020-05-15,2020-07-15)}');
+
+# The referenced key may be a temporal UNIQUE too.
+statement ok
+drop table if exists pf4, cf4 cascade;
+
+statement ok
+create table pf4 (id int, sub int, during numrange, primary key (id, sub, during without overlaps));
+
+statement ok
+create table cf4 (id int, sub int, during numrange, foreign key (id, sub, period during) references pf4 (id, sub, period during));
+
+statement ok
+insert into pf4 values (1, 1, '[1,5)'), (1, 2, '[1,5)');
+
+statement ok
+insert into cf4 values (1, 1, '[2,4)'), (1, 2, '[1,5)');
+
+statement error violates foreign key constraint "cf4_id_sub_during_fkey"
+insert into cf4 values (2, 1, '[2,4)');
+
+# A self-referencing temporal key.
+statement ok
+drop table if exists pf5 cascade;
+
+statement ok
+create table pf5 (id int, during tsrange, parent int, primary key (id, during without overlaps), foreign key (parent, period during) references pf5 (id, period during));
+
+statement ok
+insert into pf5 values (1, '[2020-01-01,2020-12-31)', null);
+
+statement ok
+insert into pf5 values (2, '[2020-02-01,2020-03-01)', 1);
+
+statement error violates foreign key constraint "pf5_parent_during_fkey"
+insert into pf5 values (3, '[2019-02-01,2019-03-01)', 1);
+
+# A deferred key checks at COMMIT.
+statement ok
+drop table if exists pf6, cf6 cascade;
+
+statement ok
+create table pf6 (id int, during tsrange, primary key (id, during without overlaps));
+
+statement ok
+create table cf6 (id int, during tsrange, foreign key (id, period during) references pf6 (id, period during) deferrable initially deferred);
+
+statement ok
+insert into pf6 values (1, '[2020-01-01,2020-12-31)');
+
+statement ok
+begin; insert into cf6 values (1, '[2020-02-01,2020-03-01)'); commit;
+
+statement error violates foreign key constraint "cf6_id_during_fkey"
+begin; insert into cf6 values (2, '[2020-02-01,2020-03-01)'); commit;
+
+# Only NO ACTION is supported.
+statement error unsupported ON DELETE action for foreign key constraint using PERIOD
+create table cf7 (id int, during tsrange, foreign key (id, period during) references pf6 (id, period during) on delete cascade);
+
+statement error unsupported ON UPDATE action for foreign key constraint using PERIOD
+create table cf8 (id int, during tsrange, foreign key (id, period during) references pf6 (id, period during) on update cascade);
+
+# Both sides must use PERIOD, and the referenced key must be temporal.
+statement error foreign key uses PERIOD on the referencing table but not the referenced table
+create table cf9 (id int, during tsrange, foreign key (id, period during) references pf6 (id, during));
+
+statement error foreign key uses PERIOD on the referenced table but not the referencing table
+create table cf10 (id int, during tsrange, foreign key (id, during) references pf6 (id, period during));
+
+statement ok
+drop table if exists pf7 cascade;
+
+statement ok
+create table pf7 (id int, during tsrange);
+
+statement error there is no unique constraint matching given keys for referenced table "pf7"
+create table cf11 (id int, during tsrange, foreign key (id, period during) references pf7 (id, period during));
+
+statement error cannot be implemented
+create table cf12 (id int, during int, foreign key (id, period during) references pf6 (id, period during));
+
+# `ALTER TABLE ... ADD CONSTRAINT` takes the same key.
+statement ok
+drop table if exists pf8 cascade;
+
+statement ok
+create table pf8 (id int, during tsrange, primary key (id, during without overlaps));
+
+statement ok
+insert into pf8 values (1, '[2020-01-01,2020-12-31)');
+
+statement ok
+drop table if exists cf13 cascade;
+
+statement ok
+create table cf13 (id int, during tsrange);
+
+statement ok
+alter table cf13 add constraint cf13_fk foreign key (id, period during) references pf8 (id, period during);
+
+query TT
+select conname, conperiod from pg_constraint where conrelid = 'cf13'::regclass and contype = 'f';
+----
+cf13_fk	t
+
+statement ok
+insert into cf13 values (1, '[2020-02-01,2020-03-01)');
+
+# A widening update of the parent period is fine; narrowing fails.
+statement ok
+update pf8 set during = '[2019-01-01,2021-01-01)';
+
+statement error violates foreign key constraint "cf13_fk" on table "cf13"
+update pf8 set during = '[2020-02-15,2021-01-01)';
+
+statement ok
+drop table cf13 cascade;
+
+statement ok
+drop table pf8 cascade;
+
+statement ok
+drop table pf7 cascade;
+
+statement ok
+drop table pf6 cascade;
+
+statement ok
+drop table pf5 cascade;
+
+statement ok
+drop table pf4 cascade;
+
+statement ok
+drop table pf3 cascade;
+
+statement ok
+drop table pf2 cascade;
+
+statement ok
+drop table pf1 cascade;
