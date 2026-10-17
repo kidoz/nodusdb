@@ -182,12 +182,19 @@ pub enum TableConstraint {
     Check {
         name: Option<String>,
         expr: String, // AST expr as string for evaluation
+        /// `ENFORCED` (the default) or `NOT ENFORCED`: a PostgreSQL 18
+        /// constraint may be declared without being checked.
+        #[serde(default = "enforced_by_default")]
+        enforced: bool,
     },
     ForeignKey {
         name: Option<String>,
         columns: Vec<String>,
         foreign_table: String,
         referred_columns: Vec<String>,
+        /// `ENFORCED` (the default) or `NOT ENFORCED`.
+        #[serde(default = "enforced_by_default")]
+        enforced: bool,
         /// What deleting a referenced row does to the rows referencing it.
         /// Defaulted so descriptors persisted before it decode.
         #[serde(default)]
@@ -204,6 +211,11 @@ pub enum TableConstraint {
         #[serde(default)]
         initially_deferred: bool,
     },
+}
+
+/// A constraint without `NOT ENFORCED` is enforced.
+fn enforced_by_default() -> bool {
+    true
 }
 
 impl TableConstraint {

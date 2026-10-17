@@ -1359,21 +1359,32 @@ pub enum AlterTableOp {
     },
     /// `ALTER TABLE t ALTER CONSTRAINT name ...`, written as the marker
     /// call the parser lacks: the constraint's new `DEFERRABLE` /
-    /// `INITIALLY DEFERRED` (unmentioned characteristics take PostgreSQL's
-    /// defaults, so both are given).
+    /// `INITIALLY DEFERRED` / `ENFORCED`. A characteristic the statement
+    /// leaves out keeps the constraint's own; a `DEFERRABLE` clause present
+    /// gives PostgreSQL's default for the pair (`INITIALLY IMMEDIATE`).
     AlterConstraint {
         name: String,
-        deferrable: bool,
+        deferrable: Option<bool>,
         initially_deferred: bool,
+        enforced: Option<bool>,
     },
 }
 
 /// A constraint `ALTER TABLE ... ADD` creates.
+/// A constraint without `NOT ENFORCED` is enforced.
+fn enforced_by_default() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum NewConstraint {
     Check {
         name: Option<String>,
         expr: String,
+        /// `ENFORCED` (the default) or `NOT ENFORCED`; defaulted so older
+        /// plans decode as enforced.
+        #[serde(default = "enforced_by_default")]
+        enforced: bool,
     },
     /// A foreign key, completed when it is added.
     ForeignKey(nodus_catalog::TableConstraint),

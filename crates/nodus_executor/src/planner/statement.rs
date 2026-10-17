@@ -248,6 +248,7 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                             if let Some(name) = &opt.name {
                                 key_names.push((vec![c.name.value.clone()], name.value.clone()));
                             }
+                            reject_not_enforced(&pk.characteristics)?;
                             col_key = Some((deferral(&pk.characteristics)?, false));
                             unique = true;
                             nullable = false;
@@ -266,6 +267,7 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                             if let Some(name) = &opt.name {
                                 key_names.push((vec![c.name.value.clone()], name.value.clone()));
                             }
+                            reject_not_enforced(&uc.characteristics)?;
                             col_key =
                                 Some((deferral(&uc.characteristics)?, nulls_not_distinct(uc)));
                             unique = true;
@@ -275,6 +277,7 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                             tbl_constraints.push(nodus_catalog::TableConstraint::Check {
                                 name: opt.name.as_ref().map(|n| n.value.clone()),
                                 expr: check.expr.to_string(),
+                                enforced: check.enforced.unwrap_or(true),
                             });
                         }
                         sqlparser::ast::ColumnOption::ForeignKey(fk) => {
@@ -321,6 +324,7 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                                     .collect(),
                             ));
                         }
+                        reject_not_enforced_kind(&uc.characteristics, "UNIQUE")?;
                         let flags = deferral(&uc.characteristics)?;
                         let nnd = nulls_not_distinct(uc);
                         if flags != (false, false) || nnd {
@@ -348,6 +352,7 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                                     .collect(),
                             ));
                         }
+                        reject_not_enforced_kind(&pk.characteristics, "PRIMARY KEY")?;
                         let flags = deferral(&pk.characteristics)?;
                         if flags != (false, false) {
                             let names = index_column_names(&pk.columns);
@@ -366,6 +371,7 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                         tbl_constraints.push(nodus_catalog::TableConstraint::Check {
                             name: check.name.as_ref().map(|n| n.value.clone()),
                             expr: check.expr.to_string(),
+                            enforced: check.enforced.unwrap_or(true),
                         });
                     }
                     sqlparser::ast::TableConstraint::ForeignKey(fk) => {
@@ -1116,19 +1122,27 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                     [
                         crate::Value::Text(table),
                         crate::Value::Text(name),
-                        crate::Value::Bool(deferrable),
+                        deferrable,
                         crate::Value::Bool(initially_deferred),
+                        enforced,
                     ],
-                ) => Ok(LogicalPlan::AlterTable {
-                    table_name: table.clone(),
-                    operations: vec![AlterTableOp::AlterConstraint {
-                        name: name.clone(),
-                        deferrable: *deferrable,
-                        initially_deferred: *initially_deferred,
-                    }],
-                    if_exists: false,
-                    only: false,
-                }),
+                ) => {
+                    let flag = |value: &crate::Value| match value {
+                        crate::Value::Bool(flag) => Some(*flag),
+                        _ => None,
+                    };
+                    Ok(LogicalPlan::AlterTable {
+                        table_name: table.clone(),
+                        operations: vec![AlterTableOp::AlterConstraint {
+                            name: name.clone(),
+                            deferrable: flag(deferrable),
+                            initially_deferred: *initially_deferred,
+                            enforced: flag(enforced),
+                        }],
+                        if_exists: false,
+                        only: false,
+                    })
+                }
                 _ => anyhow::bail!("malformed ALTER CONSTRAINT"),
             }
         }
@@ -2296,6 +2310,7 @@ fn plan_alter_table_op(
                         })?);
                     }
                     ColumnOption::Unique(uc) => {
+                        reject_not_enforced(&uc.characteristics)?;
                         let (deferrable, initially_deferred) = deferral(&uc.characteristics)?;
                         constraints.push(NewConstraint::Unique {
                             name,
@@ -2307,6 +2322,7 @@ fn plan_alter_table_op(
                     }
                     ColumnOption::PrimaryKey(pk) => {
                         nullable = false;
+                        reject_not_enforced(&pk.characteristics)?;
                         let (deferrable, initially_deferred) = deferral(&pk.characteristics)?;
                         constraints.push(NewConstraint::PrimaryKey {
                             name,
@@ -2320,6 +2336,7 @@ fn plan_alter_table_op(
                         constraints.push(NewConstraint::Check {
                             name,
                             expr: check.expr.to_string(),
+                            enforced: check.enforced.unwrap_or(true),
                         });
                     }
                     ColumnOption::ForeignKey(fk) => {
@@ -2424,9 +2441,11 @@ fn plan_alter_table_op(
                     NewConstraint::Check {
                         name: check.name.as_ref().map(|n| n.value.clone()),
                         expr: check.expr.to_string(),
+                        enforced: check.enforced.unwrap_or(true),
                     }
                 }
                 C::Unique(unique) => {
+                    reject_not_enforced_kind(&unique.characteristics, "UNIQUE")?;
                     let (deferrable, initially_deferred) = deferral(&unique.characteristics)?;
                     NewConstraint::Unique {
                         name: unique.name.as_ref().map(|n| n.value.clone()),
@@ -2437,6 +2456,7 @@ fn plan_alter_table_op(
                     }
                 }
                 C::PrimaryKey(pk) => {
+                    reject_not_enforced_kind(&pk.characteristics, "PRIMARY KEY")?;
                     let (deferrable, initially_deferred) = deferral(&pk.characteristics)?;
                     NewConstraint::PrimaryKey {
                         name: pk.name.as_ref().map(|n| n.value.clone()),
@@ -2519,10 +2539,12 @@ fn foreign_key(
         Some(sqlparser::ast::ReferentialAction::SetDefault) => A::SetDefault,
     };
     let (deferrable, initially_deferred) = deferral(&fk.characteristics)?;
+    let enforced = enforced_flag(&fk.characteristics);
     Ok(nodus_catalog::TableConstraint::ForeignKey {
         name: name.map(|n| n.value.clone()),
         columns,
         foreign_table: fk.foreign_table.to_string(),
+        enforced,
         referred_columns: fk
             .referred_columns
             .iter()
@@ -2548,6 +2570,47 @@ fn nulls_not_distinct(constraint: &sqlparser::ast::UniqueConstraint) -> bool {
         .is_some_and(|name| name.value == nodus_sql::NULLS_NOT_DISTINCT_MARK)
 }
 
+
+
+/// A constraint's `ENFORCED` / `NOT ENFORCED` characteristic: enforced
+/// unless it says otherwise.
+fn enforced_flag(characteristics: &Option<sqlparser::ast::ConstraintCharacteristics>) -> bool {
+    characteristics
+        .as_ref()
+        .and_then(|c| c.enforced)
+        .unwrap_or(true)
+}
+
+/// A table-level unique or primary key constraint cannot be `NOT ENFORCED`;
+/// its message names the kind.
+fn reject_not_enforced_kind(
+    characteristics: &Option<sqlparser::ast::ConstraintCharacteristics>,
+    kind: &str,
+) -> Result<()> {
+    if characteristics
+        .as_ref()
+        .and_then(|c| c.enforced)
+        .is_some_and(|enforced| !enforced)
+    {
+        anyhow::bail!("{kind} constraints cannot be marked NOT ENFORCED");
+    }
+    Ok(())
+}
+
+/// A *column* constraint's `NOT ENFORCED` has nowhere to go.
+fn reject_not_enforced(
+    characteristics: &Option<sqlparser::ast::ConstraintCharacteristics>,
+) -> Result<()> {
+    if characteristics
+        .as_ref()
+        .and_then(|c| c.enforced)
+        .is_some_and(|enforced| !enforced)
+    {
+        anyhow::bail!("misplaced NOT ENFORCED clause");
+    }
+    Ok(())
+}
+
 /// A constraint's `DEFERRABLE` / `INITIALLY DEFERRED` characteristics as a
 /// `(deferrable, initially deferred)` pair. `INITIALLY DEFERRED` implies
 /// `DEFERRABLE`, as in PostgreSQL.
@@ -2558,9 +2621,6 @@ fn deferral(
     let Some(c) = characteristics else {
         return Ok((false, false));
     };
-    if matches!(c.enforced, Some(false)) {
-        anyhow::bail!("NOT ENFORCED constraints are not supported");
-    }
     let initially = matches!(c.initially, Some(DeferrableInitial::Deferred));
     if c.deferrable == Some(false) && initially {
         anyhow::bail!("constraint declared INITIALLY DEFERRED must be DEFERRABLE");

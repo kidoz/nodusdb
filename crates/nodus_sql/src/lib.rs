@@ -3415,6 +3415,7 @@ fn snippet_tokens(sql: &str) -> Option<Vec<sqlparser::tokenizer::TokenWithSpan>>
     Some(tokens)
 }
 
+
 /// Statements the parser lacks or takes only in part: `FETCH` and `MOVE`
 /// ([`CURSOR_FUNCTION`]), `ALTER DOMAIN` and `DROP DOMAIN`
 /// ([`DOMAIN_FUNCTION`]), a domain's `NOT NULL` ([`DOMAIN_NOT_NULL`]), a
@@ -3749,24 +3750,37 @@ fn rewrite_statement_form(
                 Token::Word(w) => w.value.clone(),
                 other => other.to_string(),
             };
-            // The characteristics: absent ones keep PostgreSQL's defaults
-            // (`NOT DEFERRABLE`, `INITIALLY IMMEDIATE`). Anything else is
-            // left to the parser's own error.
-            let (mut deferrable, mut initially) = (false, false);
+            // The characteristics: a `DEFERRABLE` clause absent keeps the
+            // constraint's own setting, one present gives PostgreSQL's
+            // default for the pair (`INITIALLY IMMEDIATE`, so `NOT
+            // DEFERRABLE`). ENFORCED / NOT ENFORCED likewise. Anything else
+            // is left to the parser's own error.
+            let mut deferrable: Option<bool> = None;
+            let mut initially = false;
+            let mut enforced: Option<bool> = None;
             let mut c = k + 3;
             let mut ok = true;
             while c < n && ok {
                 if is(c, "not") && is(c + 1, "deferrable") {
-                    deferrable = false;
+                    deferrable = Some(false);
+                    initially = false;
                     c += 2;
                 } else if is(c, "deferrable") {
-                    deferrable = true;
+                    deferrable = Some(true);
                     c += 1;
                 } else if is(c, "initially") && is(c + 1, "deferred") {
-                    deferrable = true;
+                    deferrable = Some(true);
                     initially = true;
                     c += 2;
                 } else if is(c, "initially") && is(c + 1, "immediate") {
+                    deferrable = Some(false);
+                    initially = false;
+                    c += 2;
+                } else if is(c, "enforced") {
+                    enforced = Some(true);
+                    c += 1;
+                } else if is(c, "not") && is(c + 1, "enforced") {
+                    enforced = Some(false);
                     c += 2;
                 } else {
                     ok = false;
@@ -3775,8 +3789,16 @@ fn rewrite_statement_form(
             if !ok {
                 return statement;
             }
+            let deferrable = match deferrable {
+                Some(value) => value.to_string(),
+                None => "NULL".to_string(),
+            };
+            let enforced = match enforced {
+                Some(value) => value.to_string(),
+                None => "NULL".to_string(),
+            };
             let sql = format!(
-                "SELECT {ALTER_CONSTRAINT_FUNCTION}('{}', '{}', {deferrable}, {initially})",
+                "SELECT {ALTER_CONSTRAINT_FUNCTION}('{}', '{}', {deferrable}, {initially}, {enforced})",
                 quote(name.trim()),
                 quote(&constraint)
             );
@@ -4326,6 +4348,7 @@ fn rewrite_data_clause(
         return statement;
     }
 
+
     // `ANALYZE VERBOSE`: the parser reads `VERBOSE` as the table's name. The
     // target travels with the tag, as `VACUUM`'s does.
     if is(0, "analyze")
@@ -4739,6 +4762,25 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn generated_columns_and_enforcement_are_rewritten() {
+        let one = |sql: &str| parse_sql(sql).unwrap().remove(0).to_string();
+        // `ALTER CONSTRAINT` carries only the characteristics the statement
+        // mentions; the others are NULL.
+        assert_eq!(
+            one("ALTER TABLE t ALTER CONSTRAINT c NOT ENFORCED"),
+            format!("SELECT {ALTER_CONSTRAINT_FUNCTION}('t', 'c', NULL, false, false)")
+        );
+        assert_eq!(
+            one("ALTER TABLE t ALTER CONSTRAINT c DEFERRABLE INITIALLY DEFERRED ENFORCED"),
+            format!("SELECT {ALTER_CONSTRAINT_FUNCTION}('t', 'c', true, true, true)")
+        );
+        assert_eq!(
+            one("ALTER TABLE t ALTER CONSTRAINT c INITIALLY IMMEDIATE"),
+            format!("SELECT {ALTER_CONSTRAINT_FUNCTION}('t', 'c', false, false, NULL)")
+        );
+    }
 
     #[test]
     fn missing_query_syntax_is_rewritten() {

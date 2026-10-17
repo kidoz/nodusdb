@@ -350,11 +350,12 @@ impl MemExecutor {
                 name,
                 deferrable,
                 initially_deferred,
+                enforced,
             } => {
                 if propagated {
                     return Ok(());
                 }
-                self.alter_constraint(tbl, &name, deferrable, initially_deferred)
+                self.alter_constraint(tbl, &name, deferrable, initially_deferred, enforced)
             }
             AlterTableOp::Inherit { parent, attach } => {
                 // A link belongs to the table the statement names.
@@ -512,21 +513,34 @@ impl MemExecutor {
     }
 
     /// `ALTER TABLE t ALTER CONSTRAINT name ...`: a foreign key's
-    /// `DEFERRABLE` / `INITIALLY DEFERRED` change (PostgreSQL allows no
-    /// other constraint kind here).
+    /// `DEFERRABLE` / `INITIALLY DEFERRED` / `ENFORCED` change (PostgreSQL
+    /// allows no other constraint kind here).
     fn alter_constraint(
         &self,
         tbl: &TableDescriptor,
         name: &str,
-        deferrable: bool,
+        deferrable: Option<bool>,
         initially_deferred: bool,
+        enforced: Option<bool>,
     ) -> Result<()> {
-        // A unique or primary key index of the table is no foreign key.
+        // A unique or primary key index of the table is no foreign key —
+        // and its enforceability cannot be altered either.
+        let not_a_key = |name: &str| -> anyhow::Error {
+            if enforced.is_some() {
+                DbError::new(format!(
+                    "cannot alter enforceability of constraint \"{name}\" of relation \"{}\"",
+                    tbl.name
+                ))
+                .into()
+            } else {
+                anyhow::anyhow!(
+                    "constraint \"{name}\" of relation \"{}\" is not a foreign key constraint",
+                    tbl.name
+                )
+            }
+        };
         if tbl.indexes.iter().any(|i| i.name == name) {
-            anyhow::bail!(
-                "constraint \"{name}\" of relation \"{}\" is not a foreign key constraint",
-                tbl.name
-            );
+            return Err(not_a_key(name));
         }
         for constraint in &tbl.constraints {
             if constraint.effective_name(&tbl.name) != name {
@@ -539,14 +553,16 @@ impl MemExecutor {
                 referred_columns,
                 on_delete,
                 on_update,
-                ..
+                deferrable: was_deferrable,
+                initially_deferred: was_initially_deferred,
+                enforced: was_enforced,
             } = constraint
             else {
-                anyhow::bail!(
-                    "constraint \"{name}\" of relation \"{}\" is not a foreign key constraint",
-                    tbl.name
-                );
+                return Err(not_a_key(name));
             };
+            // A characteristic the statement leaves out keeps the
+            // constraint's own. A `DEFERRABLE` clause present gives the
+            // pair as written (`INITIALLY IMMEDIATE` when absent).
             let updated = TableConstraint::ForeignKey {
                 name: name.clone(),
                 columns: columns.clone(),
@@ -554,8 +570,13 @@ impl MemExecutor {
                 referred_columns: referred_columns.clone(),
                 on_delete: *on_delete,
                 on_update: *on_update,
-                deferrable,
-                initially_deferred,
+                deferrable: deferrable.unwrap_or(*was_deferrable),
+                initially_deferred: if deferrable.is_some() {
+                    initially_deferred
+                } else {
+                    *was_initially_deferred
+                },
+                enforced: enforced.unwrap_or(*was_enforced),
             };
             return self.replace_constraint(tbl, constraint, updated);
         }
@@ -1027,12 +1048,15 @@ impl MemExecutor {
         // The table's own constraints.
         for constraint in &tbl.constraints {
             let renamed = match constraint {
-                TableConstraint::Check { name, expr } if sql_mentions(expr, old) => {
-                    TableConstraint::Check {
-                        name: name.clone(),
-                        expr: rename_in_sql(expr, old, new),
-                    }
-                }
+                TableConstraint::Check {
+                    name,
+                    expr,
+                    enforced,
+                } if sql_mentions(expr, old) => TableConstraint::Check {
+                    name: name.clone(),
+                    expr: rename_in_sql(expr, old, new),
+                    enforced: *enforced,
+                },
                 TableConstraint::ForeignKey {
                     name,
                     columns,
@@ -1042,6 +1066,7 @@ impl MemExecutor {
                     on_update,
                     deferrable,
                     initially_deferred,
+                    enforced,
                 } if columns.iter().any(|c| c == old)
                     || (names_table(foreign_table, &tbl.name)
                         && referred_columns.iter().any(|c| c == old)) =>
@@ -1060,6 +1085,7 @@ impl MemExecutor {
                         on_update: *on_update,
                         deferrable: *deferrable,
                         initially_deferred: *initially_deferred,
+                        enforced: *enforced,
                     }
                 }
                 _ => continue,
@@ -1081,6 +1107,7 @@ impl MemExecutor {
                     on_update,
                     deferrable,
                     initially_deferred,
+                    enforced,
                 } = constraint
                     && names_table(foreign_table, &tbl.name)
                     && referred_columns.iter().any(|c| c == old)
@@ -1094,6 +1121,7 @@ impl MemExecutor {
                         on_update: *on_update,
                         deferrable: *deferrable,
                         initially_deferred: *initially_deferred,
+                        enforced: *enforced,
                     };
                     self.replace_constraint(&child, constraint, renamed)?;
                 }
@@ -1190,6 +1218,7 @@ impl MemExecutor {
                     on_update,
                     deferrable,
                     initially_deferred,
+                    enforced,
                 } = constraint
                     && names_table(foreign_table, &tbl.name)
                 {
@@ -1208,6 +1237,7 @@ impl MemExecutor {
                         on_update: *on_update,
                         deferrable: *deferrable,
                         initially_deferred: *initially_deferred,
+                        enforced: *enforced,
                     };
                     self.replace_constraint(&child, constraint, renamed)?;
                 }
@@ -1251,7 +1281,11 @@ impl MemExecutor {
         };
         let columns: Vec<String> = tbl.columns.iter().map(|c| c.name.clone()).collect();
         match constraint {
-            NewConstraint::Check { name, expr } => {
+            NewConstraint::Check {
+                name,
+                expr,
+                enforced,
+            } => {
                 let name = match name {
                     Some(name) => {
                         free(&name)?;
@@ -1262,8 +1296,9 @@ impl MemExecutor {
                 let constraint = TableConstraint::Check {
                     name: Some(name),
                     expr,
+                    enforced,
                 };
-                if !not_valid {
+                if !not_valid && enforced {
                     self.validate_constraint(ctx, tbl, &constraint)?;
                 }
                 self.change(TableDescriptorChange::AddConstraint {
@@ -1513,9 +1548,10 @@ impl MemExecutor {
             .find(|c| c.effective_name(&tbl.name) == old)
         {
             let renamed = match constraint.clone() {
-                TableConstraint::Check { expr, .. } => TableConstraint::Check {
+                TableConstraint::Check { expr, enforced, .. } => TableConstraint::Check {
                     name: Some(new.to_string()),
                     expr,
+                    enforced,
                 },
                 TableConstraint::ForeignKey {
                     columns,
@@ -1525,6 +1561,7 @@ impl MemExecutor {
                     on_update,
                     deferrable,
                     initially_deferred,
+                    enforced,
                     ..
                 } => TableConstraint::ForeignKey {
                     name: Some(new.to_string()),
@@ -1535,6 +1572,7 @@ impl MemExecutor {
                     on_update,
                     deferrable,
                     initially_deferred,
+                    enforced,
                 },
             };
             return self.replace_constraint(tbl, constraint, renamed);

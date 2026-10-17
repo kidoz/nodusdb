@@ -2269,13 +2269,18 @@ fn name_check_constraints(
     constraints
         .into_iter()
         .map(|constraint| match constraint {
-            TableConstraint::Check { name: None, expr } => {
+            TableConstraint::Check {
+                name: None,
+                expr,
+                enforced,
+            } => {
                 let column_names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
                 let name = check_constraint_name(table, &column_names, &expr, &taken);
                 taken.push(name.clone());
                 TableConstraint::Check {
                     name: Some(name),
                     expr,
+                    enforced,
                 }
             }
             other => other,

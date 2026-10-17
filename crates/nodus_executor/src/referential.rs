@@ -125,6 +125,7 @@ impl MemExecutor {
             on_update,
             deferrable,
             initially_deferred,
+            enforced,
         } = fk
         else {
             return Ok(fk);
@@ -231,6 +232,7 @@ impl MemExecutor {
             on_update,
             deferrable,
             initially_deferred,
+            enforced,
         })
     }
 
@@ -305,10 +307,15 @@ impl MemExecutor {
             on_update,
             deferrable,
             initially_deferred,
+            enforced,
         } = fk
         else {
             return Ok(None);
         };
+        // `NOT ENFORCED`: the key is declared, not checked.
+        if !enforced {
+            return Ok(None);
+        }
         let (db, schema, table) =
             parse_object_name(foreign_table).unwrap_or(("default", "public", foreign_table));
         let parent = if table == child.name && schema == self.schema_name_of(child) {

@@ -371,7 +371,15 @@ impl MemExecutor {
     ) -> Result<()> {
         for tc in &tbl.constraints {
             match tc {
-                nodus_catalog::TableConstraint::Check { name, expr } => {
+                nodus_catalog::TableConstraint::Check {
+                    name,
+                    expr,
+                    enforced,
+                } => {
+                    // `NOT ENFORCED`: the constraint is declared, not checked.
+                    if !enforced {
+                        continue;
+                    }
                     let ast_expr = match sqlparser::parser::Parser::new(
                         &sqlparser::dialect::PostgreSqlDialect {},
                     )

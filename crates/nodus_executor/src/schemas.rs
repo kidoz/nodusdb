@@ -873,6 +873,7 @@ impl MemExecutor {
                     on_update,
                     deferrable,
                     initially_deferred,
+                    enforced,
                 } = constraint
                 else {
                     continue;
@@ -900,6 +901,7 @@ impl MemExecutor {
                             on_update: *on_update,
                             deferrable: *deferrable,
                             initially_deferred: *initially_deferred,
+                            enforced: *enforced,
                         },
                     },
                 )?;

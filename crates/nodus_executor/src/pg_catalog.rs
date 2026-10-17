@@ -564,6 +564,7 @@ impl MemExecutor {
                     ("contype", "PG_CHAR"),
                     ("condeferrable", "BOOL"),
                     ("condeferred", "BOOL"),
+                    ("conenforced", "BOOL"),
                     ("convalidated", "BOOL"),
                     ("conrelid", "OID"),
                     ("contypid", "OID"),
@@ -3717,6 +3718,7 @@ impl MemExecutor {
                     Value::Bool(index.deferrable),
                     Value::Bool(index.initially_deferred),
                     Value::Bool(true),
+                    Value::Bool(true),
                     Value::Int(relid),
                     Value::Int(0),
                     Value::Int(Self::index_oid(
@@ -3765,6 +3767,7 @@ impl MemExecutor {
                     Value::Bool(false),
                     Value::Bool(false),
                     Value::Bool(true),
+                    Value::Bool(true),
                     Value::Int(relid),
                     Value::Int(0),
                     Value::Int(0),
@@ -3788,7 +3791,11 @@ impl MemExecutor {
             }
             for (idx, constraint) in table.constraints.iter().enumerate() {
                 match constraint {
-                    nodus_catalog::TableConstraint::Check { name, expr } => {
+                    nodus_catalog::TableConstraint::Check {
+                        name,
+                        expr,
+                        enforced,
+                    } => {
                         let conname = name
                             .clone()
                             .unwrap_or_else(|| format!("{}_check_{}", table.name, idx + 1));
@@ -3804,6 +3811,7 @@ impl MemExecutor {
                             Value::Text("c".into()),
                             Value::Bool(false),
                             Value::Bool(false),
+                            Value::Bool(*enforced),
                             Value::Bool(true),
                             Value::Int(relid),
                             Value::Int(0),
@@ -3835,6 +3843,7 @@ impl MemExecutor {
                         on_update,
                         deferrable,
                         initially_deferred,
+                        enforced,
                     } => {
                         let conname = name.clone().unwrap_or_else(|| {
                             format!("{}_{}_fkey", table.name, columns.join("_"))
@@ -3869,6 +3878,7 @@ impl MemExecutor {
                             Value::Text("f".into()),
                             Value::Bool(*deferrable),
                             Value::Bool(*initially_deferred),
+                            Value::Bool(*enforced),
                             Value::Bool(true),
                             Value::Int(relid),
                             Value::Int(0),
@@ -4344,15 +4354,20 @@ impl MemExecutor {
             }
             for (idx, constraint) in table.constraints.iter().enumerate() {
                 match constraint {
-                    nodus_catalog::TableConstraint::Check { name, expr } => {
+                    nodus_catalog::TableConstraint::Check {
+                        name,
+                        expr,
+                        enforced,
+                    } => {
                         let name = name
                             .clone()
                             .unwrap_or_else(|| format!("{}_check_{}", table.name, idx + 1));
                         if is(&name) {
+                            let suffix = if *enforced { "" } else { " NOT ENFORCED" };
                             return Some(if pretty {
-                                format!("CHECK ({expr})")
+                                format!("CHECK ({expr}){suffix}")
                             } else {
-                                format!("CHECK (({expr}))")
+                                format!("CHECK (({expr})){suffix}")
                             });
                         }
                     }
@@ -4365,6 +4380,7 @@ impl MemExecutor {
                         on_update,
                         deferrable,
                         initially_deferred,
+                        enforced,
                     } => {
                         let name = name.clone().unwrap_or_else(|| {
                             format!("{}_{}_fkey", table.name, columns.join("_"))
@@ -4393,8 +4409,9 @@ impl MemExecutor {
                             } else {
                                 " DEFERRABLE"
                             };
+                            let enforced = if *enforced { "" } else { " NOT ENFORCED" };
                             return Some(format!(
-                                "FOREIGN KEY ({}) REFERENCES {}({}){actions}{deferral}",
+                                "FOREIGN KEY ({}) REFERENCES {}({}){actions}{deferral}{enforced}",
                                 quote(columns),
                                 foreign_table,
                                 quote(referred_columns)

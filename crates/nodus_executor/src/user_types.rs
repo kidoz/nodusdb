@@ -2008,6 +2008,7 @@ impl MemExecutor {
                     Value::Bool(false),
                     Value::Bool(false),
                     Value::Bool(true),
+                    Value::Bool(true),
                     Value::Int(0),
                     Value::Int(t.oid()),
                     Value::Int(0),

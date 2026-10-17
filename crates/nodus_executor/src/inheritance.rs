@@ -253,6 +253,10 @@ impl MemExecutor {
                         TableConstraint::Check { expr, .. } => expr.clone(),
                         _ => unreachable!(),
                     },
+                    enforced: match constraint {
+                        TableConstraint::Check { enforced, .. } => *enforced,
+                        _ => true,
+                    },
                 });
             }
         }

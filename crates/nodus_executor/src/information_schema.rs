@@ -386,15 +386,21 @@ impl MemExecutor {
                 .columns
                 .iter()
                 .filter(|c| !c.nullable)
-                .map(|c| (format!("{}_{}_not_null", table.name, c.name), "CHECK"));
+                .map(|c| (format!("{}_{}_not_null", table.name, c.name), "CHECK", true));
             let constraints = table.constraints.iter().map(|constraint| {
-                let constraint_type = match constraint {
-                    nodus_catalog::TableConstraint::Check { .. } => "CHECK",
-                    nodus_catalog::TableConstraint::ForeignKey { .. } => "FOREIGN KEY",
+                let (constraint_type, enforced) = match constraint {
+                    nodus_catalog::TableConstraint::Check { enforced, .. } => ("CHECK", *enforced),
+                    nodus_catalog::TableConstraint::ForeignKey { enforced, .. } => {
+                        ("FOREIGN KEY", *enforced)
+                    }
                 };
-                (constraint.effective_name(&table.name), constraint_type)
+                (
+                    constraint.effective_name(&table.name),
+                    constraint_type,
+                    enforced,
+                )
             });
-            for (name, constraint_type) in not_null.chain(constraints) {
+            for (name, constraint_type, enforced) in not_null.chain(constraints) {
                 rows.push(vec![
                     Value::Text(db_name.into()),
                     Value::Text(schema_name.clone()),
@@ -404,7 +410,7 @@ impl MemExecutor {
                     Value::Text(constraint_type.into()),
                     Value::Text("NO".into()),
                     Value::Text("NO".into()),
-                    Value::Text("YES".into()),
+                    Value::Text(if enforced { "YES" } else { "NO" }.into()),
                 ]);
             }
         }
