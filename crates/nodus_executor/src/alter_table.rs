@@ -264,6 +264,9 @@ impl MemExecutor {
                 }
                 self.rename_table(tbl, new_name)
             }
+            AlterTableOp::SetExpression { column, expression } => {
+                self.set_generation_expression(ctx, tbl, &column, expression)
+            }
             AlterTableOp::SetDefault { column, default } => {
                 let mut column = column_of(tbl, &column)?.clone();
                 column.default_expr = default.as_ref().and_then(|e| serde_json::to_string(e).ok());
@@ -1444,6 +1447,157 @@ impl MemExecutor {
 
     /// Checks the rows `tbl` has against `constraint`, a CHECK constraint
     /// or foreign key of it.
+    /// `ALTER COLUMN c SET EXPRESSION AS (expr)` / `DROP EXPRESSION` on a
+    /// generated column: a stored column's rows are rewritten with the new
+    /// expression, a virtual column's recompute on read (its values are
+    /// still checked here, as PostgreSQL checks them).
+    fn set_generation_expression(
+        &self,
+        ctx: &ExecutionContext,
+        tbl: &TableDescriptor,
+        column: &str,
+        expression: Option<ScalarExpr>,
+    ) -> Result<()> {
+        let position = column_position_of(tbl, column)?;
+        let current = tbl.columns[position].clone();
+        let Some((_, virtual_column)) = Self::generated_kind(&current) else {
+            anyhow::bail!(
+                "column \"{column}\" of relation \"{}\" is not a generated column",
+                tbl.name
+            );
+        };
+        let Some(expression) = expression else {
+            // `DROP EXPRESSION`: the column keeps its stored values.
+            if virtual_column {
+                return Err(DbError::new(
+                    "ALTER TABLE / DROP EXPRESSION is not supported for virtual generated columns",
+                )
+                .detail(format!(
+                    "Column \"{column}\" of relation \"{}\" is a virtual generated column.",
+                    tbl.name
+                ))
+                .into());
+            }
+            let mut descriptor = current;
+            descriptor.default_expr = None;
+            return self.replace_column(tbl, descriptor);
+        };
+        // The expression reads the table's columns: each must exist and must
+        // not itself be generated.
+        let columns: Vec<(String, bool)> = tbl
+            .columns
+            .iter()
+            .map(|c| (c.name.clone(), Self::generated_kind(c).is_some()))
+            .collect();
+        crate::dml::check_generation_refs(&expression, &columns)?;
+        let names: Vec<String> = tbl.columns.iter().map(|c| c.name.clone()).collect();
+        if virtual_column {
+            // PostgreSQL cannot re-check a virtual column's values against
+            // the table's CHECK constraints.
+            if tbl
+                .constraints
+                .iter()
+                .any(|c| matches!(c, TableConstraint::Check { .. }))
+            {
+                return Err(DbError::new(
+                    "ALTER TABLE / SET EXPRESSION is not supported for virtual generated columns in tables with check constraints",
+                )
+                .detail(format!(
+                    "Column \"{column}\" of relation \"{}\" is a virtual generated column.",
+                    tbl.name
+                ))
+                .into());
+            }
+            // A NOT NULL column is checked by computing every row.
+            if !current.nullable {
+                for row in self.scan_rows(tbl.id, &ctx.session_id)? {
+                    let value = crate::value::coerce_for_column(
+                        &crate::planner::eval_scalar_expr(&expression, &row, &names),
+                        &current.data_type,
+                    );
+                    if value == Value::Null {
+                        crate::eval_error::check()?;
+                        return Err(self.contains_nulls(tbl, column));
+                    }
+                }
+            }
+            crate::eval_error::check()?;
+            let mut descriptor = current;
+            descriptor.default_expr = serde_json::to_string(&ScalarExpr::Function {
+                name: "__VIRTUAL__".to_string(),
+                args: vec![expression],
+            })
+            .ok();
+            return self.replace_column(tbl, descriptor);
+        }
+        self.rewrite_generation(ctx, tbl, position, &expression)
+    }
+
+    /// Rewrites every row of `tbl` with the stored generated column at
+    /// `position` recomputed from `expression`, revalidating the table's
+    /// enforced CHECK constraints as PostgreSQL does.
+    fn rewrite_generation(
+        &self,
+        ctx: &ExecutionContext,
+        tbl: &TableDescriptor,
+        position: usize,
+        expression: &ScalarExpr,
+    ) -> Result<()> {
+        let names: Vec<String> = tbl.columns.iter().map(|c| c.name.clone()).collect();
+        let checks: Vec<(String, crate::FilterExpr)> = tbl
+            .constraints
+            .iter()
+            .filter_map(|constraint| match constraint {
+                TableConstraint::Check {
+                    expr,
+                    enforced: true,
+                    ..
+                } => {
+                    let name = constraint.effective_name(&tbl.name);
+                    self.index_predicate(expr).ok().map(|filter| (name, filter))
+                }
+                _ => None,
+            })
+            .collect();
+        let column = &tbl.columns[position];
+        let rows = self.scan_rows_keyed(tbl.id, &ctx.session_id)?;
+        let mut planned = Vec::with_capacity(rows.len());
+        for (key, mut row) in rows {
+            let old_row = row.clone();
+            row[position] = crate::value::coerce_for_column(
+                &crate::planner::eval_scalar_expr(expression, &old_row, &names),
+                &column.data_type,
+            );
+            crate::eval_error::check()?;
+            if !column.nullable && row[position] == Value::Null {
+                return Err(self.contains_nulls(tbl, &column.name));
+            }
+            for (name, filter) in &checks {
+                if self.eval_filter(ctx, &row, &names, &tbl.columns, Some(filter)) == Some(false) {
+                    return Err(DbError::new(format!(
+                        "check constraint \"{name}\" of relation \"{}\" is violated by some row",
+                        tbl.name
+                    ))
+                    .schema(self.schema_name_of(tbl))
+                    .table(&tbl.name)
+                    .constraint(name)
+                    .into());
+                }
+            }
+            planned.push((key, old_row, row));
+        }
+        for (key, old_row, new_row) in planned {
+            self.replace_row(ctx, tbl, &key, &old_row, &new_row)?;
+        }
+        let mut descriptor = column.clone();
+        descriptor.default_expr = serde_json::to_string(&ScalarExpr::Function {
+            name: "__GENERATED__".to_string(),
+            args: vec![expression.clone()],
+        })
+        .ok();
+        self.replace_column(tbl, descriptor)
+    }
+
     fn validate_constraint(
         &self,
         ctx: &ExecutionContext,

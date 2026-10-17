@@ -4428,6 +4428,27 @@ fn rewrite_data_clause(
         return statement;
     }
 
+    // `ALTER TABLE ... ALTER COLUMN c SET EXPRESSION AS (expr)` and `DROP
+    // EXPRESSION`: the parser has no such operation. The statement travels
+    // whole, so the executor can resolve the table, the column, and the
+    // expression.
+    if is(0, "alter")
+        && is(1, "table")
+        && (0..n).any(|i| {
+            (is(i, "set") && is(i + 1, "expression")) || (is(i, "drop") && is(i + 1, "expression"))
+        })
+    {
+        let text = render_tokens(&statement[..=significant[n - 1]]);
+        let sql = format!(
+            "SELECT {UTILITY_FUNCTION}('ALTER COLUMN EXPRESSION', '{}')",
+            text.replace('\'', "''")
+        );
+        if let Some(mut tokens) = snippet_tokens(&sql) {
+            tokens.extend(tail);
+            return tokens;
+        }
+        return statement;
+    }
 
     // `ANALYZE VERBOSE`: the parser reads `VERBOSE` as the table's name. The
     // target travels with the tag, as `VACUUM`'s does.
@@ -4874,6 +4895,19 @@ mod tests {
         assert_eq!(
             one("ALTER TABLE t ALTER CONSTRAINT c INITIALLY IMMEDIATE"),
             format!("SELECT {ALTER_CONSTRAINT_FUNCTION}('t', 'c', false, false, NULL)")
+        );
+        // `SET EXPRESSION` and `DROP EXPRESSION` travel whole.
+        assert_eq!(
+            one("ALTER TABLE t ALTER COLUMN b SET EXPRESSION AS (a * 2)"),
+            format!(
+                "SELECT {UTILITY_FUNCTION}('ALTER COLUMN EXPRESSION', 'alter table t alter column b set expression as (a * 2)')"
+            )
+        );
+        assert_eq!(
+            one("ALTER TABLE t ALTER b DROP EXPRESSION"),
+            format!(
+                "SELECT {UTILITY_FUNCTION}('ALTER COLUMN EXPRESSION', 'alter table t alter b drop expression')"
+            )
         );
     }
 

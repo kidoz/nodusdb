@@ -2411,7 +2411,10 @@ fn function_arg_types(args: &str) -> Vec<String> {
 /// unquoted one, with `at` left just past the last of them. A trailing
 /// period is no part of a name, so `at` stays on it for the caller to
 /// report.
-fn read_object_name(tokens: &[sqlparser::tokenizer::Token], at: &mut usize) -> Vec<String> {
+pub(crate) fn read_object_name(
+    tokens: &[sqlparser::tokenizer::Token],
+    at: &mut usize,
+) -> Vec<String> {
     use sqlparser::tokenizer::Token;
     let mut parts: Vec<String> = Vec::new();
     let mut after_period = false;

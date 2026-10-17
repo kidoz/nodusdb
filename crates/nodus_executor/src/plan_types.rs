@@ -1368,6 +1368,12 @@ pub enum AlterTableOp {
         initially_deferred: bool,
         enforced: Option<bool>,
     },
+    /// `ALTER TABLE t ALTER COLUMN c SET EXPRESSION AS (expr)` (`Some`)
+    /// and `DROP EXPRESSION` (`None`), the operations the parser lacks.
+    SetExpression {
+        column: String,
+        expression: Option<ScalarExpr>,
+    },
 }
 
 /// A constraint `ALTER TABLE ... ADD` creates.

@@ -951,6 +951,11 @@ pub fn plan_statement(stmt: &sqlparser::ast::Statement, params: &[Value]) -> Res
                         target: target.clone(),
                     })
                 }
+                Some([crate::Value::Text(tag), crate::Value::Text(target)])
+                    if tag == "ALTER COLUMN EXPRESSION" =>
+                {
+                    alter_column_expression_plan(target, params)
+                }
                 Some([crate::Value::Text(tag), crate::Value::Text(target)]) if tag == "REINDEX" => {
                     Ok(LogicalPlan::Reindex {
                         target: target.clone(),
@@ -2638,6 +2643,105 @@ fn virtual_marked(expr: &sqlparser::ast::Expr) -> Option<&sqlparser::ast::Expr> 
     }
 }
 
+/// `ALTER TABLE [IF EXISTS] [ONLY] t ALTER [COLUMN] c SET EXPRESSION AS
+/// (expr)` / `DROP EXPRESSION`, from the token rewriter's statement text.
+fn alter_column_expression_plan(target: &str, params: &[Value]) -> Result<LogicalPlan> {
+    use sqlparser::tokenizer::{Token, Tokenizer};
+    let tokens: Vec<Token> = Tokenizer::new(&sqlparser::dialect::PostgreSqlDialect {}, target)
+        .tokenize()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|t| !matches!(t, Token::Whitespace(_) | Token::EOF))
+        .collect();
+    let mut at = 0;
+    let is_word = |at: usize, w: &str| matches!(tokens.get(at), Some(Token::Word(word)) if word.value.eq_ignore_ascii_case(w));
+    let syntax = |at: usize| crate::ddl::statement_syntax_error(&tokens, at);
+    if !is_word(at, "alter") || !is_word(at + 1, "table") {
+        return Err(syntax(at));
+    }
+    at += 2;
+    let mut if_exists = false;
+    if is_word(at, "if") && is_word(at + 1, "exists") {
+        if_exists = true;
+        at += 2;
+    }
+    let mut only = false;
+    if is_word(at, "only") {
+        only = true;
+        at += 1;
+    }
+    let table_name = crate::ddl::read_object_name(&tokens, &mut at);
+    if table_name.is_empty() || !is_word(at, "alter") {
+        return Err(syntax(at));
+    }
+    at += 1;
+    if is_word(at, "column") {
+        at += 1;
+    }
+    let column_name = crate::ddl::read_object_name(&tokens, &mut at);
+    if column_name.is_empty() {
+        return Err(syntax(at));
+    }
+    let column = column_name.last().cloned().unwrap_or_default();
+    let expression = if is_word(at, "set") && is_word(at + 1, "expression") && is_word(at + 2, "as")
+    {
+        at += 3;
+        if !matches!(tokens.get(at), Some(Token::LParen)) {
+            return Err(syntax(at));
+        }
+        // The expression runs to its matching parenthesis.
+        let open = at;
+        let mut depth = 0usize;
+        let mut close = None;
+        for (i, token) in tokens.iter().enumerate().skip(open) {
+            match token {
+                Token::LParen => depth += 1,
+                Token::RParen => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(close) = close else {
+            return Err(syntax(tokens.len()));
+        };
+        let text = tokens[open + 1..close]
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let parsed = sqlparser::parser::Parser::new(&sqlparser::dialect::PostgreSqlDialect {})
+            .try_with_sql(&text)
+            .and_then(|mut parser| parser.parse_expr())
+            .map_err(|_| syntax(open))?;
+        let computed = lower_scalar(&parsed, params).ok_or_else(|| {
+            expression_error(&parsed, || {
+                format!("Unsupported generation expression for column {column}")
+            })
+        })?;
+        if crate::subqueries::contains_subquery(&computed) {
+            anyhow::bail!("cannot use subquery in column generation expression");
+        }
+        if scalar_has_aggregate(&computed) {
+            anyhow::bail!("aggregate functions are not allowed in column generation expressions");
+        }
+        Some(computed)
+    } else if is_word(at, "drop") && is_word(at + 1, "expression") {
+        None
+    } else {
+        return Err(syntax(at));
+    };
+    Ok(LogicalPlan::AlterTable {
+        table_name: table_name.join("."),
+        operations: vec![AlterTableOp::SetExpression { column, expression }],
+        if_exists,
+        only,
+    })
+}
 
 /// A constraint's `ENFORCED` / `NOT ENFORCED` characteristic: enforced
 /// unless it says otherwise.
