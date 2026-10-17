@@ -1,0 +1,277 @@
+# PostgreSQL 18 generated columns and constraint enforcement:
+# `GENERATED ALWAYS AS (expr) VIRTUAL` computes its value on read, where
+# `STORED` computes and keeps it on write; `ALTER COLUMN ... SET EXPRESSION`
+# replaces a generated column's expression (rewriting a stored column's
+# rows) and `DROP EXPRESSION` makes it an ordinary column; a CHECK or
+# FOREIGN KEY constraint may be declared `NOT ENFORCED`, which records it
+# without checking it, and `ALTER CONSTRAINT ... ENFORCED` turns checking
+# back on. The messages and catalog values are PostgreSQL 18.4's.
+#
+# Known divergences: an expression that PostgreSQL rejects as not immutable
+# (`random()`, `now()`) is accepted; a failed multi-statement batch keeps
+# its DDL (catalog changes commit with the raft log) where PostgreSQL rolls
+# the whole batch back; and a stored column's `SET EXPRESSION` re-checks
+# unique indexes row by row, where PostgreSQL rebuilds them in bulk.
+
+statement ok
+drop table if exists gc1 cascade;
+
+# A virtual column is computed whenever a row is read.
+statement ok
+create table gc1 (a int, b int generated always as (a + 1) virtual, c int generated always as (a * 2) stored);
+
+statement ok
+insert into gc1 (a) values (1), (2);
+
+query ITT
+select a, b, c from gc1 order by a;
+----
+1	2	2
+2	3	4
+
+# `attgenerated` says `v` for virtual and `s` for stored; both have a
+# `pg_attrdef` row holding the generation expression.
+query TTT
+select attname, attgenerated, atthasdef from pg_attribute where attrelid = 'gc1'::regclass and attnum > 0 order by attnum;
+----
+a		f
+b	v	t
+c	s	t
+
+query T
+select pg_get_expr(adbin, adrelid) from pg_attrdef where adrelid = 'gc1'::regclass order by adnum;
+----
+(a + 1)
+(a * 2)
+
+query TTTT
+select column_name, is_generated, generation_expression, column_default from information_schema.columns where table_name = 'gc1' order by ordinal_position;
+----
+a	NEVER	NULL	NULL
+b	ALWAYS	(a + 1)	NULL
+c	ALWAYS	(a * 2)	NULL
+
+# An update that changes the source column changes the computed value.
+statement ok
+update gc1 set a = 10 where a = 1;
+
+query ITT
+select a, b, c from gc1 order by a;
+----
+2	3	4
+10	11	20
+
+# `SET b = DEFAULT` is the only way to assign a generated column.
+statement ok
+update gc1 set b = default where a = 2;
+
+query ITT
+select a, b, c from gc1 order by a;
+----
+2	3	4
+10	11	20
+
+statement error can only be updated to DEFAULT
+update gc1 set b = 5 where a = 2;
+
+statement error cannot insert a non-DEFAULT value into column "b"
+insert into gc1 (a, b) values (1, 5);
+
+# A CHECK constraint sees a virtual column's computed value when the row is
+# written.
+statement ok
+drop table if exists gc2 cascade;
+
+statement ok
+create table gc2 (a int, b int generated always as (a + 1) virtual, check (b > 0));
+
+statement ok
+insert into gc2 (a) values (1);
+
+statement error violates check constraint
+insert into gc2 (a) values (-5);
+
+# Virtual columns cannot be indexed, keyed, or partitioned on, and a
+# generated column cannot feed another one.
+statement error indexes on virtual generated columns are not supported
+create index gc2_b on gc2 (b);
+
+statement error unique constraints on virtual generated columns are not supported
+alter table gc2 add unique (b);
+
+statement error primary keys on virtual generated columns are not supported
+alter table gc2 add primary key (b);
+
+statement error cannot use generated column in partition key
+create table gc3 (a int, b int generated always as (a + 1) virtual) partition by range (b);
+
+statement error cannot use generated column "b" in column generation expression
+create table gc4 (a int, b int generated always as (a + 1) virtual, c int generated always as (b + 1) stored);
+
+statement error column "zz" does not exist
+create table gc5 (a int, b int generated always as (zz + 1) virtual);
+
+# `ADD COLUMN ... GENERATED` computes the value for rows already there.
+statement ok
+drop table if exists gc6 cascade;
+
+statement ok
+create table gc6 (a int);
+
+statement ok
+insert into gc6 (a) values (1), (2);
+
+statement ok
+alter table gc6 add column b int generated always as (a * 2) stored;
+
+statement ok
+alter table gc6 add column c int generated always as (a * 3) virtual;
+
+query ITT
+select a, b, c from gc6 order by a;
+----
+1	2	3
+2	4	6
+
+# `SET EXPRESSION` rewrites a stored column's rows and changes a virtual
+# column's expression; `DROP EXPRESSION` leaves a stored column with the
+# values it held.
+statement ok
+alter table gc6 alter column b set expression as (a * 10);
+
+statement ok
+alter table gc6 alter column c set expression as (a * 30);
+
+query ITT
+select a, b, c from gc6 order by a;
+----
+1	10	30
+2	20	60
+
+statement ok
+alter table gc6 alter column b drop expression;
+
+query TTT
+select attname, attgenerated, atthasdef from pg_attribute where attrelid = 'gc6'::regclass and attname = 'b';
+----
+b		f
+
+query ITT
+select a, b, c from gc6 order by a;
+----
+1	10	30
+2	20	60
+
+statement error is not a generated column
+alter table gc6 alter column a set expression as (a + 1);
+
+statement error is not a generated column
+alter table gc6 alter column a drop expression;
+
+# `NOT ENFORCED` constraints are recorded but not checked, and they fire no
+# referential action.
+statement ok
+drop table if exists gc7p, gc7c cascade;
+
+statement ok
+create table gc7p (a int primary key);
+
+statement ok
+create table gc7c (b int references gc7p(a) on delete cascade not enforced, c int check (c > 0) not enforced);
+
+statement ok
+insert into gc7c values (1, -1), (7, 2);
+
+query TTT
+select conname, contype, conenforced from pg_constraint where conrelid = 'gc7c'::regclass order by conname;
+----
+gc7c_b_fkey	f	f
+gc7c_c_check	c	f
+
+query TT
+select pg_get_constraintdef(oid) from pg_constraint where conrelid = 'gc7c'::regclass order by conname;
+----
+FOREIGN KEY (b) REFERENCES gc7p(a) ON DELETE CASCADE NOT ENFORCED
+CHECK ((c > 0)) NOT ENFORCED
+
+query TT
+select constraint_name, enforced from information_schema.table_constraints where table_name = 'gc7c' order by constraint_name;
+----
+gc7c_b_fkey	NO
+gc7c_c_check	NO
+
+statement ok
+delete from gc7p where a = 1;
+
+query I
+select count(*) from gc7c;
+----
+2
+
+statement ok
+alter table gc7c alter constraint gc7c_b_fkey enforced;
+
+statement error violates foreign key constraint
+insert into gc7c values (2, 1);
+
+# A table-level unique or primary key cannot be `NOT ENFORCED`; a column's
+# clause is misplaced.
+statement error misplaced NOT ENFORCED clause
+create table gc8 (a int unique not enforced);
+
+statement error UNIQUE constraints cannot be marked NOT ENFORCED
+create table gc9 (a int, unique (a) not enforced);
+
+statement error PRIMARY KEY constraints cannot be marked NOT ENFORCED
+create table gc10 (a int, primary key (a) not enforced);
+
+# `ALTER CONSTRAINT` keeps the characteristics the statement does not
+# mention.
+statement ok
+drop table if exists gc11p, gc11c cascade;
+
+statement ok
+create table gc11p (a int primary key);
+
+statement ok
+create table gc11c (b int references gc11p(a) deferrable initially deferred);
+
+statement ok
+alter table gc11c alter constraint gc11c_b_fkey not enforced;
+
+query TTT
+select condeferrable, condeferred, conenforced from pg_constraint where conname = 'gc11c_b_fkey';
+----
+t	t	f
+
+statement ok
+alter table gc11c alter constraint gc11c_b_fkey deferrable;
+
+query TTT
+select condeferrable, condeferred, conenforced from pg_constraint where conname = 'gc11c_b_fkey';
+----
+t	f	f
+
+statement error cannot alter enforceability
+alter table gc11p alter constraint gc11p_pkey not enforced;
+
+statement ok
+drop table gc11c cascade;
+
+statement ok
+drop table gc11p cascade;
+
+statement ok
+drop table gc7c cascade;
+
+statement ok
+drop table gc7p cascade;
+
+statement ok
+drop table gc6 cascade;
+
+statement ok
+drop table gc2 cascade;
+
+statement ok
+drop table gc1 cascade;
