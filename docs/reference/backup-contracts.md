@@ -83,17 +83,14 @@ The server selects the repository from `[backup] repository_uri` at startup:
 
 Any other URI scheme fails startup with an error naming the scheme.
 
-CI coverage: the S3 repository's put/get/list/delete logic and the full
-backup → verify → restore orchestration run against an in-memory object store
-in `nodus_backup` unit tests. The only real-endpoint coverage is the ignored
-`s3_backup_round_trip` test in `crates/nodus_backup/src/s3.rs`, run manually
-against MinIO:
-
-```bash
-NODUS_S3_ENDPOINT=http://127.0.0.1:9000 NODUS_S3_BUCKET=nodus \
-NODUS_S3_KEY=nodus NODUS_S3_SECRET=nodus-secret \
-cargo test -p nodus_backup -- --ignored
-```
+CI coverage includes an in-memory object-store round trip and an explicitly
+environment-gated live test. The infrastructure job starts a pinned MinIO source
+release, creates an isolated bucket per run, and exercises backup, verification,
+semantic restore, deletion, checksum failure, and unavailable-endpoint behavior.
+It also runs full, incremental, and PITR restore drills against MinIO and exports
+a real span to an OpenTelemetry Collector. Without `NODUS_S3_ENDPOINT` or
+`NODUS_OTLP_ENDPOINT`, the corresponding tests print an explicit skip; the live
+job always sets them, so its pass cannot be a vacuous skip.
 
 ## Core concepts
 
@@ -140,6 +137,19 @@ cargo test -p nodus_backup -- --ignored
     on a fresh single node and then re-form the cluster.
 11. Backup, restore, delete, retention, and key-access operations pass
     authorization and emit audit events.
+12. Archived WAL objects and indexes are append-only. Identical publication
+    retries are idempotent; a different segment or index at an existing key is
+    rejected without replacing the original. A restored node must use an isolated
+    repository prefix before resuming normal archiving until automatic timeline
+    allocation is implemented. The current check is not an atomic cross-writer
+    conditional put; concurrent repository writers require the distributed
+    coordination milestone, not independent node archivers pointed at one prefix.
+
+Level 1 sources write manifest V2 / object format V1 without role memberships.
+Level 2 sources write manifest V3 / object format V2 with principals, grants,
+and role memberships. New binaries read both pairs; older binaries reject V3.
+V2 backups remain useful for their recorded data but cannot prove complete
+role-membership recovery.
 
 ## Restore plan contents
 
@@ -186,19 +196,24 @@ A backup strategy that has never been restored and queried is unproven.
 
 | Scenario | Expected result | Coverage |
 | --- | --- | --- |
-| Full backup and restore round trip | Restored cluster contains catalog, audit, and KV data from the snapshot. | `nodus_backup` tests plus an admin API integration test. |
+| Full backup and restore round trip | Restored cluster contains catalog, audit, and KV data from the snapshot. | `nodus_backup` tests, admin API integration, and persistent filesystem/S3 restore drills. |
 | Failed backup after partial upload | No completed manifest published; listings exclude it. | Orchestrator failure-path tests. |
-| Missing data object | Verification fails before restore. | Repository corruption test. |
-| Checksum mismatch | Verification fails; restore refuses to proceed. | Repository corruption test. |
+| Missing data object | Verification fails before restore. | Repository corruption test and live MinIO gate. |
+| Checksum mismatch | Verification fails; restore refuses to proceed. | Repository corruption test and live MinIO gate. |
 | Manifest corruption | Load fails with an actionable error; backup is not restorable. | Manifest compatibility test. |
+| V2 manifest upgrade | New binary reads V2/V1; V3/V2 is written only at compatibility level 2 or later. | Manifest version tests and security-complete restore drills. |
 | Metadata-only incremental | Rejected once real incrementals are required. | Restore planner test. |
-| Full plus incremental restore | Parent chain resolved in order; final state includes changed versions and tombstones. | Incremental restore integration test. |
+| Full plus incremental restore | Parent chain resolved in order; final state includes changed versions and tombstones. | Persistent filesystem and live MinIO restore drills with restart checks. |
 | Required MVCC history collected | Incremental fails and directs the operator to a new full backup. | Protected timestamp test. |
-| Point-in-time restore | WAL replay stops at the target; incomplete transactions stay invisible. | WAL replay integration test. |
+| Point-in-time restore | WAL replay stops at the target; incomplete transactions stay invisible. | WAL replay tests and persistent filesystem/S3 PITR drills. |
+| Security metadata after restore | Principals, grants, memberships, and SCRAM login are preserved in V3 restores. | Catalog unit test and restore-drill transitive permission checks. |
 | Restore into a non-empty directory | Restore is refused with `409 Conflict` before any mutation. | Admin API integration test. |
-| Secondary indexes after restore | Indexes validated or rebuilt before read-write promotion. | Index validation test. |
+| Secondary indexes after restore | Index metadata survives restore and restart. | Restore-drill `pg_indexes` checks. |
+| WAL archive collision | Different bytes or metadata never replace an archived object; identical retries are idempotent. | WAL publication unit test and repeated destination drills. |
+| Unavailable object repository | Transport errors propagate and protection paths fail closed. | Live MinIO unavailable-endpoint test. |
 | Delete with a dependent incremental | Retention refuses to remove required parent data. | Retention planner test. |
-| Stale WAL archive | Lag metric exceeds the configured recovery point objective and alerts. | Monitoring test and alert rule check. |
+| Missing, stale, or failed restore drill | Alert fires from the drill's Prometheus textfile metrics. | Docker alert rules and Helm `PrometheusRule` rendering. |
+| Stale WAL archive | Lag metric exceeds the configured recovery point objective and alerts. | Not yet implemented. |
 | Shard movement during backup | Split, move, or merge waits behind the backup barrier or is represented in snapshot metadata. | Distributed coordination fault test. |
 
 ## Acceptance criteria

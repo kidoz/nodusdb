@@ -44,8 +44,11 @@ async fn snapshot_catalog_replacement_keeps_bootstrap_login_and_respects_revocat
     let old_id = server.catalog.get_principal_by_name("nodus").unwrap().id;
 
     let incoming = MemoryCatalog::new();
+    let legacy = incoming
+        .prepare_legacy_raft_catalog(server.catalog.export_snapshot())
+        .unwrap();
     incoming
-        .import_snapshot(server.catalog.export_snapshot())
+        .install_raft_catalog(&legacy, &mut || Ok(()))
         .unwrap();
     let id = PrincipalId::new();
     incoming

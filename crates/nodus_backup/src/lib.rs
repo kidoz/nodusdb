@@ -490,12 +490,25 @@ use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use uuid::Uuid;
 
-const CURRENT_MANIFEST_VERSION: u64 = 2;
+const COMPATIBLE_MANIFEST_VERSION: u64 = 2;
+const CURRENT_MANIFEST_VERSION: u64 = 3;
 const CURRENT_REPOSITORY_LAYOUT_VERSION: u64 = 2;
-const CURRENT_OBJECT_FORMAT_VERSION: u64 = 1;
+const COMPATIBLE_OBJECT_FORMAT_VERSION: u64 = 1;
+const CURRENT_OBJECT_FORMAT_VERSION: u64 = 2;
 const CURRENT_WAL_ARCHIVE_INDEX_VERSION: u64 = 1;
 const CURRENT_PITR_RESTORE_PLAN_VERSION: u64 = 1;
 const DEFAULT_TIMELINE_ID: &str = "default";
+
+fn manifest_format(cluster_version: u64) -> (u64, u64) {
+    if cluster_version >= 2 {
+        (CURRENT_MANIFEST_VERSION, CURRENT_OBJECT_FORMAT_VERSION)
+    } else {
+        (
+            COMPATIBLE_MANIFEST_VERSION,
+            COMPATIBLE_OBJECT_FORMAT_VERSION,
+        )
+    }
+}
 
 fn checksum(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
@@ -622,10 +635,11 @@ impl BackupOrchestrator {
     }
 
     fn manifest_template(&self, input: ManifestTemplate) -> BackupManifest {
+        let (manifest_version, object_format_version) = manifest_format(input.cluster_version);
         BackupManifest {
-            manifest_version: CURRENT_MANIFEST_VERSION,
+            manifest_version,
             repository_layout_version: CURRENT_REPOSITORY_LAYOUT_VERSION,
-            object_format_version: CURRENT_OBJECT_FORMAT_VERSION,
+            object_format_version,
             backup_id: input.backup_id,
             cluster_id: input.cluster_id,
             timeline_id: DEFAULT_TIMELINE_ID.to_string(),
@@ -770,10 +784,17 @@ impl BackupOrchestrator {
     pub async fn load_manifest(&self, backup_id: &str) -> Result<BackupManifest> {
         let body = self.repo.get_object(&manifest_key(backup_id), None).await?;
         let manifest = serde_json::from_slice::<BackupManifest>(&body)?;
-        if manifest.manifest_version != CURRENT_MANIFEST_VERSION {
+        if !matches!(
+            (manifest.manifest_version, manifest.object_format_version),
+            (
+                COMPATIBLE_MANIFEST_VERSION,
+                COMPATIBLE_OBJECT_FORMAT_VERSION
+            ) | (CURRENT_MANIFEST_VERSION, CURRENT_OBJECT_FORMAT_VERSION)
+        ) {
             anyhow::bail!(
-                "unsupported backup manifest version {} for backup {}",
+                "unsupported backup manifest/object format versions {}/{} for backup {}",
                 manifest.manifest_version,
+                manifest.object_format_version,
                 backup_id
             );
         }
@@ -2547,6 +2568,37 @@ mod tests {
         manifest.manifest_version = CURRENT_MANIFEST_VERSION + 1;
         let bytes = Bytes::from(serde_json::to_vec(&manifest).unwrap());
         assert_unreadable_manifest_fails_closed(bytes).await;
+    }
+
+    #[tokio::test]
+    async fn test_v2_manifest_remains_readable() {
+        let repo: Arc<dyn BackupRepository> = Arc::new(MemBackupRepository::new());
+        let orch = BackupOrchestrator::new(repo);
+        let mut manifest = completed_manifest_template("v2-backup");
+        manifest.manifest_version = COMPATIBLE_MANIFEST_VERSION;
+        manifest.object_format_version = COMPATIBLE_OBJECT_FORMAT_VERSION;
+        orch.put_final_manifest(&manifest).await.unwrap();
+        let loaded = orch.load_manifest("v2-backup").await.unwrap();
+        assert_eq!(loaded.manifest_version, COMPATIBLE_MANIFEST_VERSION);
+        assert_eq!(
+            loaded.object_format_version,
+            COMPATIBLE_OBJECT_FORMAT_VERSION
+        );
+    }
+
+    #[test]
+    fn test_manifest_format_follows_cluster_compatibility() {
+        assert_eq!(
+            manifest_format(1),
+            (
+                COMPATIBLE_MANIFEST_VERSION,
+                COMPATIBLE_OBJECT_FORMAT_VERSION
+            )
+        );
+        assert_eq!(
+            manifest_format(2),
+            (CURRENT_MANIFEST_VERSION, CURRENT_OBJECT_FORMAT_VERSION)
+        );
     }
 
     #[tokio::test]

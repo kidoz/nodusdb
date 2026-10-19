@@ -6,7 +6,7 @@ it are implemented; most of it is not. The rules it produces are collected in
 [backup contracts](../reference/backup-contracts.md), and the operations that
 work today are in [back up and restore](../how-to/back-up-and-restore.md).
 
-Last reviewed: 2026-06-25.
+Last reviewed: 2026-10-19.
 
 ## The argument
 
@@ -74,26 +74,25 @@ The current implementation is a useful MVP and should be read as one:
   ids, lineage, checksum, upload state); local segment cleanup is gated on
   those indexes and on retained restore points.
 - Restore can replay archived WAL records up to a target timestamp.
-- Incremental backups write real checksummed objects chained to a verified
-  parent and record a protected timestamp; the export is currently a full
-  snapshot per incremental rather than a delta of changed MVCC versions.
+- Incremental backups write changed MVCC versions and tombstones chained to a
+  verified parent and record a protected timestamp.
 
-The gaps that matter: incrementals are not delta exports, no repository
-immutability enforcement, no schedule or job model, no restore drills, and no
-distributed coordination.
+The gaps that matter: no repository immutability enforcement, no schedule or
+durable job model, no automatic restored-timeline allocation, and no distributed
+coordination.
 
 | Capability | Today | Target |
 | --- | --- | --- |
 | Repository backends | Filesystem and S3-compatible, selected by `[backup] repository_uri` (`file://` / bare path / `s3://`). | Repositories expose capability metadata for immutability, conditional put, range reads, multipart upload, and encryption. |
-| Manifest | Versioned JSON with object checksums. | Manifest V2 as the immutable commit record: timeline, WAL coverage, layout version, format versions, compression, encryption metadata, restore validation status. |
+| Manifest | V2/V1 before compatibility-level 2 and security-complete V3/V2 afterward, with object checksums; new binaries read both pairs. | Immutable commit records with timeline and WAL coverage, compression and encryption metadata, and restore validation status. |
 | Full backup | Catalog, audit events, full KV dump. | Catalog, shard metadata, and shard data at a protected snapshot timestamp, with WAL coverage sufficient for point-in-time recovery. |
-| Incremental backup | Full-snapshot export chained to a verified parent, with a protected timestamp. | Exports changed MVCC versions and tombstones since the parent, fails when required history was collected, bounds chain length. |
-| WAL archiving | Background task archives closed local segments with per-segment indexes; cleanup is gated on retained restore points. | Segments indexed by timeline, timestamp range, checksum, byte range, encryption key id, and upload state. |
-| Restore | Loads backup objects, replays WAL to a timestamp. | Explicit idempotent planning, validated inputs, fresh directory or new timeline only, consistency checks before readiness. |
+| Incremental backup | Changed MVCC versions and tombstones chained to a verified parent, with a protected timestamp. | Bounded chains with explicit failure whenever required history was collected. |
+| WAL archiving | Closed local segments have per-segment indexes and collision-refusing, idempotent publication; cleanup is gated on retained restore points. | Per-timeline segments indexed by timestamp range, checksum, byte range, encryption key id, and upload state. |
+| Restore | Loads backup objects, replays WAL to a timestamp, and enforces a fresh single-node destination. | Explicit idempotent planning, automatic destination timelines, and consistency checks before readiness. |
 | Job control | Admin and CLI operations, no durable model. | Durable job records with inspect, retry, cancel, pause, resume, audit, and policy enforcement. |
 | Retention | Manual delete with dependency checks; GC and WAL cleanup fail closed on retained or unreadable manifests. | Graph-aware retention that never removes anything a retained restore point needs. |
 | Distributed backup | Not coordinated across shard groups. | Raft-coordinated cluster snapshot timestamp, parallel per-shard export, migration operations serialized behind backup barriers. |
-| Restore drills | None. | Periodic scratch restores that persist reports and measure compliance. |
+| Restore drills | Persistent filesystem and live-S3 full/incremental/PITR drills check SQL, roles, indexes, and restart persistence, then write JSON and Prometheus reports. Scheduling is external. | Periodic scratch restores that persist reports and measure compliance. |
 
 ## Recovery objectives come first
 
@@ -191,27 +190,27 @@ repository verification finds checksum drift.
 
 Each phase has an exit gate; the gate is the point of the phase.
 
-**B1 — Manifest V2.** Add timeline id, snapshot timestamp, WAL start and end,
-layout and object format versions, encryption key id, compression, and
-validation status. Make `manifest.json` append-only with
-`manifest.pending.json` for in-flight work, and add repository capability
-metadata. *Gate:* an old manifest still loads, a V2 manifest round-trips, and a
-partially written V2 backup is not listed as restorable.
+**B1 — Versioned manifests (single-node scope complete).** V2/V1 preserves the
+old-reader boundary; level-2 sources write security-complete V3/V2. Final
+manifests are the commit point and pending work is never listed. *Gate passed:*
+V2 remains readable, newer/unsupported pairs fail closed, and partially written
+backups are not restorable.
 
-**B2 — Real incremental backups.** Add protected timestamp records, export
-changed versions and tombstones since the parent, and fail when history has been
-collected. *Gate:* full plus incremental restore passes for inserts, updates,
-deletes, and catalog changes.
+**B2 — Real incremental backups (single-node scope complete).** Protected
+timestamps, changed versions, and tombstones chain to a verified parent. *Gate
+passed:* full plus incremental restore passes for inserts, updates, deletes,
+catalog changes, permissions, indexes, and restart persistence.
 
-**B3 — WAL archive contract.** Add archive index objects with per-segment commit
-timestamp ranges, prevent deletion while any retained restore point needs a
-segment, and add lag metrics. *Gate:* restore planning can select the exact WAL
-range for a target timestamp and detect missing segments before execution.
+**B3 — WAL archive contract (partial).** Per-segment indexes, lineage, checksum
+verification, retention-gated cleanup, idempotent publication, and graceful
+shutdown archiving exist. Automatic destination timelines and archive-lag
+metrics remain. *Gate passed locally:* PITR selects the required segment range
+and rejects gaps or corrupted segments before execution.
 
-**B4 — Restore engine.** Replace ad hoc replay with a planner and executor,
-restore only into a fresh directory or new timeline, and validate catalog, MVCC
-visibility, indexes, and checksums before readiness. *Gate:* restore is
-idempotent, refuses unsafe targets, and records a validation report.
+**B4 — Restore engine (partial).** Restore validates inputs, refuses non-empty
+or clustered destinations, fences mutation, supports same-identity retry, and
+checks catalog, rows, permissions, and indexes through drills. *Remaining:* a
+formal resumable job state machine and automatic restored timeline.
 
 **B5 — Scheduler and job control.** Scheduled backups, pause, resume, cancel,
 retry, inspect, durable job state, CLI and admin controls. *Gate:* jobs survive
@@ -222,7 +221,8 @@ per-shard export, locality-aware destinations, and shard movement serialized
 across backup barriers. *Gate:* a cluster backup covers all shard ranges exactly
 once, and restore verifies placement metadata against restored data.
 
-**B7 — Restore drills and policy.** Automated scratch restores, persisted
-verification reports, and a policy that denies production-ready status to
-backups that are stale, unverifiable, or outside objectives. *Gate:* drills
-measure recovery time and effective data loss.
+**B7 — Restore drills and policy (partial).** Filesystem and live-S3 drills
+persist JSON/Prometheus reports with measured recovery time and observed data
+loss; alerts cover missing, stale, and failed drills. *Remaining:* built-in
+scheduling and a policy that denies production-ready status based on drill
+evidence.

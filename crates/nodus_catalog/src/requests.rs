@@ -264,4 +264,8 @@ pub struct CatalogSnapshot {
     pub tables: Vec<TableDescriptor>,
     pub principals: Vec<PrincipalDescriptor>,
     pub grants: Vec<GrantDescriptor>,
+    #[serde(default)]
+    pub roles: Vec<RoleMembershipDescriptor>,
+    #[serde(default)]
+    pub memberships: Vec<crate::RoleMembershipEdge>,
 }

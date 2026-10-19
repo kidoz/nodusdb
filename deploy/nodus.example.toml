@@ -56,7 +56,8 @@ require_client_auth = false
 # require_tls = true
 
 [backup]
-# Required in production. Empty disables backups.
+# Required in production; off-cluster S3 is the recommended production backend.
+# Empty selects a unique temp directory for development, not a durable backup.
 # file:///path or a bare path selects a local filesystem directory.
 # s3://bucket[/prefix] selects an S3-compatible object store; credentials,
 # region, and endpoint come from the standard AWS-compatible environment

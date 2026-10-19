@@ -425,6 +425,8 @@ impl CatalogReader for MemoryCatalog {
             tables: self.tables.read().values().cloned().collect(),
             principals: self.principals.read().values().cloned().collect(),
             grants: self.grants.read().clone(),
+            roles: self.roles.read().clone(),
+            memberships: self.memberships.read().clone(),
         }
     }
 }
@@ -995,7 +997,14 @@ impl CatalogWriter for MemoryCatalog {
             .into_iter()
             .map(|t| ((t.database_id, t.schema_id, t.name.clone()), t))
             .collect();
-        // Do not overwrite principals, grants, or roles to preserve server-level auth state
+        *self.principals.write() = snapshot
+            .principals
+            .into_iter()
+            .map(|principal| (principal.name.clone(), principal))
+            .collect();
+        *self.grants.write() = snapshot.grants;
+        *self.roles.write() = snapshot.roles;
+        *self.memberships.write() = snapshot.memberships;
         self.increment_version();
         self.persist();
         Ok(())
@@ -1256,5 +1265,67 @@ mod tests {
 
         let fetched_tbl = catalog.get_table("testdb", "public", "users").unwrap();
         assert_eq!(fetched_tbl.id, tbl.id);
+    }
+
+    #[test]
+    fn import_snapshot_restores_security_metadata() {
+        use crate::PrincipalType;
+
+        let source = MemoryCatalog::new();
+        let group = source
+            .create_role(CreateRoleRequest {
+                id: PrincipalId::new(),
+                name: "readers".into(),
+                principal_type: PrincipalType::Role,
+                database_id: None,
+                attributes: Default::default(),
+            })
+            .unwrap();
+        let user = source
+            .create_role(CreateRoleRequest {
+                id: PrincipalId::new(),
+                name: "reader".into(),
+                principal_type: PrincipalType::User,
+                database_id: None,
+                attributes: Default::default(),
+            })
+            .unwrap();
+        source
+            .add_role_member(AddRoleMemberRequest {
+                role_principal_id: group.id,
+                member_id: user.id,
+                admin_option: false,
+                grantor: None,
+            })
+            .unwrap();
+        source
+            .grant_privilege(GrantPrivilegeRequest {
+                id: GrantId::new(),
+                principal_id: group.id,
+                resource: ResourceRef::System,
+                privilege: "SELECT".into(),
+                grantable: false,
+                grantor: None,
+            })
+            .unwrap();
+
+        let target = MemoryCatalog::new();
+        target
+            .create_role(CreateRoleRequest {
+                id: PrincipalId::new(),
+                name: "destination-only".into(),
+                principal_type: PrincipalType::User,
+                database_id: None,
+                attributes: Default::default(),
+            })
+            .unwrap();
+        target.import_snapshot(source.export_snapshot()).unwrap();
+
+        assert!(target.get_principal_by_name("destination-only").is_err());
+        assert_eq!(target.get_principal_by_name("reader").unwrap().id, user.id);
+        assert_eq!(target.list_grants().unwrap().len(), 1);
+        assert_eq!(target.list_role_memberships().unwrap().len(), 1);
+        let effective = target.get_effective_principals(user.id).unwrap();
+        assert!(effective.contains(&group.id));
     }
 }

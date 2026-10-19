@@ -955,6 +955,18 @@ pub struct CreateBackupQuery {
     pub parent_backup_id: Option<String>,
 }
 
+fn catalog_snapshot_for_backup(
+    catalog: &dyn CatalogReader,
+    cluster_version: u64,
+) -> CatalogSnapshot {
+    let mut snapshot = catalog.export_snapshot();
+    if cluster_version < 2 {
+        snapshot.roles.clear();
+        snapshot.memberships.clear();
+    }
+    snapshot
+}
+
 /// Creates a full backup capturing a catalog snapshot and the audit trail.
 async fn create_backup(
     State(state): State<AdminState>,
@@ -986,7 +998,7 @@ async fn create_backup(
         None
     };
 
-    let snapshot = state.catalog.export_snapshot();
+    let snapshot = catalog_snapshot_for_backup(state.catalog.as_ref(), cluster_version);
     let catalog_bytes = match serde_json::to_vec(&snapshot) {
         Ok(b) => b,
         Err(e) => return Json(json!({ "error": format!("Failed to serialize catalog: {e}") })),
@@ -2004,6 +2016,43 @@ mod restore_tests {
 
         assert!(apply_restore(&objects, None, kv.as_ref(), cat.as_ref(), None).is_err());
         assert!(kv.get(b"k", u64::MAX).unwrap().is_none());
+    }
+
+    #[test]
+    fn backup_catalog_snapshot_gates_memberships_on_cluster_compatibility() {
+        let (_kv, catalog) = engine_and_catalog();
+        let group = catalog
+            .create_role(nodus_catalog::CreateRoleRequest {
+                id: PrincipalId::new(),
+                name: "readers".into(),
+                principal_type: nodus_catalog::PrincipalType::Role,
+                database_id: None,
+                attributes: Default::default(),
+            })
+            .unwrap();
+        let user = catalog
+            .create_role(nodus_catalog::CreateRoleRequest {
+                id: PrincipalId::new(),
+                name: "reader".into(),
+                principal_type: nodus_catalog::PrincipalType::User,
+                database_id: None,
+                attributes: Default::default(),
+            })
+            .unwrap();
+        catalog
+            .add_role_member(nodus_catalog::AddRoleMemberRequest {
+                role_principal_id: group.id,
+                member_id: user.id,
+                admin_option: false,
+                grantor: None,
+            })
+            .unwrap();
+
+        let compatible = catalog_snapshot_for_backup(catalog.as_ref(), 1);
+        assert!(compatible.roles.is_empty());
+        assert!(compatible.memberships.is_empty());
+        let security_complete = catalog_snapshot_for_backup(catalog.as_ref(), 2);
+        assert_eq!(security_complete.memberships.len(), 1);
     }
 
     #[test]
