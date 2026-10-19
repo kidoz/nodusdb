@@ -18,21 +18,27 @@ jobs:
           components: rustfmt, clippy
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked --version 0.19.9
+      - name: Check Rust dependencies
+        run: |
+          cargo deny check
+          cargo deny --manifest-path tests/fuzz/Cargo.toml check
       - name: Check Formatting
         run: cargo fmt --all --check
       - name: Lint
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
       - name: Raft partition regression (real TCP)
         shell: bash
         run: |
           cargo test -p nodus_distributed_tests --test sim_test --locked -- --list | grep -Fx 'test_cluster_partition_linearizability: test'
           cargo test -p nodus_distributed_tests --test sim_test --locked
       - name: Loom Concurrency Proof (txn/MVCC)
-        run: RUSTFLAGS="--cfg loom" LOOM_MAX_PREEMPTIONS=3 cargo test -p nodus_txn --release loom_
+        run: RUSTFLAGS="--cfg loom" LOOM_MAX_PREEMPTIONS=3 cargo test --locked -p nodus_txn --release loom_
       - name: Compile Storage Engine Benchmarks
-        run: cargo bench --no-run -p nodus_storage_lsm
+        run: cargo bench --locked --no-run -p nodus_storage_lsm
 
   frontend:
     name: Frontend build, lint, test, and audit

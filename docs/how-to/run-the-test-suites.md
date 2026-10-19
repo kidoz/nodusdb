@@ -104,6 +104,10 @@ The fuzz targets live in their own workspace, so they are not built by
 just fuzz-check
 ```
 
+The scheduled AFL workflow runs each target for 10 seconds as a startup and
+crash smoke test. Only timeout status 124 is an expected end; every other
+nonzero status and any crash artifact fails the job. These short runs do not
+establish long-running fuzzing assurance.
 
 ## Live infrastructure and restore drills
 

@@ -7,27 +7,52 @@ on:
 
 jobs:
   fuzz:
-    name: Fuzz nodus_sql
+    name: AFL smoke tests (10 seconds per target)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Install cargo-afl
-        run: cargo install cargo-afl
+        run: cargo install cargo-afl --locked --version 0.18.2
+      - name: Build AFL runtime for the selected Rust compiler
+        run: cargo afl config --build
       - name: Build fuzzer targets
-        run: cd tests/fuzz && cargo afl build
-      - name: Run AFL for SQL Parser (Smoke test, 10 seconds)
+        run: cd tests/fuzz && cargo afl build --locked
+      - name: Seed AFL inputs
         run: |
-          mkdir -p tests/fuzz/in_sql
+          mkdir -p tests/fuzz/in_sql tests/fuzz/in_raft tests/fuzz/in_wal
           echo "SELECT 1;" > tests/fuzz/in_sql/1.sql
-          cd tests/fuzz && timeout 10 cargo afl fuzz -i in_sql -o out_sql target/debug/fuzz_sql_parser || true
-      - name: Run AFL for Raft Command (Smoke test, 10 seconds)
-        run: |
-          mkdir -p tests/fuzz/in_raft
           echo "{}" > tests/fuzz/in_raft/1.json
-          cd tests/fuzz && timeout 10 cargo afl fuzz -i in_raft -o out_raft target/debug/fuzz_raft_command || true
-      - name: Run AFL for WAL Record (Smoke test, 10 seconds)
-        run: |
-          mkdir -p tests/fuzz/in_wal
           echo "{}" > tests/fuzz/in_wal/1.json
-          cd tests/fuzz && timeout 10 cargo afl fuzz -i in_wal -o out_wal target/debug/fuzz_wal_record || true
+      - name: Run AFL smoke tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_smoke() {
+            local name="$1"
+            local target="$2"
+            set +e
+            (cd tests/fuzz && timeout 10 cargo afl fuzz -i "in_${name}" -o "out_${name}" "target/debug/${target}")
+            local status=$?
+            set -e
+            if [[ ${status} -ne 0 && ${status} -ne 124 ]]; then
+              echo "AFL ${name} failed with status ${status}"
+              return "${status}"
+            fi
+            local crash
+            crash=$(find "tests/fuzz/out_${name}" -type f -path '*/crashes/id:*' -print -quit)
+            if [[ -n "${crash}" ]]; then
+              echo "AFL ${name} produced a crash artifact: ${crash}"
+              return 1
+            fi
+          }
+          run_smoke sql fuzz_sql_parser
+          run_smoke raft fuzz_raft_command
+          run_smoke wal fuzz_wal_record
+      - name: Upload AFL crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: afl-crashes-${{ github.run_id }}
+          path: tests/fuzz/out_*/**/crashes/**
+          if-no-files-found: ignore

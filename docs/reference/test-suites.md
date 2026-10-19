@@ -37,7 +37,16 @@ snapshot authorization blockers; this is not an uninterrupted-upgrade certificat
 
 **`tests/fuzz`.** A separate Cargo workspace with its own lockfile, so
 `cargo test --workspace` does not build it. Corpora and crash artefacts are not
-checked in.
+checked in. The scheduled workflow runs only 10-second AFL smoke tests; startup
+failures and crash artefacts fail the job, so these runs are not evidence of
+long-running fuzz coverage.
+
+CI also checks the main and fuzz Rust workspaces with `cargo deny`, and checks
+frontend production and development dependencies with `npm audit`. A dedicated
+infrastructure job runs live MinIO repository and restore-drill tests plus real
+OpenTelemetry Collector export. In-memory object-store tests and the in-process
+OTLP collector remain useful unit coverage, but do not substitute for those
+backend gates.
 
 **Loom tests.** Only run under `RUSTFLAGS="--cfg loom"`; they are compiled out of
 ordinary builds.
