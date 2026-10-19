@@ -85,20 +85,27 @@ fn validate_control(kv: &dyn KvEngine, row: &SnapshotRow) -> anyhow::Result<()> 
     Ok(())
 }
 
+/// Invalidate the descriptor before touching `current.snap`. A crash in the
+/// publication gap leaves no servable snapshot, never a mismatched file and
+/// descriptor. The complete KV state can rebuild it, including old binaries.
+pub(crate) fn remove_snapshot_publication(
+    meta: Option<&RaftMetaStore>,
+    snapshot_dir: &std::path::Path,
+) -> anyhow::Result<()> {
+    if let Some(meta) = meta {
+        meta.delete_checked(RAFT_SNAPSHOT_META_KEY)?;
+    }
+    match std::fs::remove_file(snapshot_dir.join(CURRENT_SNAPSHOT_FILE)) {
+        Ok(()) => sync_dir(snapshot_dir)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    Ok(())
+}
+
 impl NodusRaftStore {
-    /// Invalidate the descriptor before touching `current.snap`. A crash in the
-    /// publication gap leaves no servable snapshot, never a mismatched file and
-    /// descriptor. The complete KV state can rebuild it, including old binaries.
     fn invalidate_snapshot_file(&self) -> anyhow::Result<()> {
-        if let Some(meta) = &self.meta {
-            meta.delete_checked(RAFT_SNAPSHOT_META_KEY)?;
-        }
-        match std::fs::remove_file(self.snapshot_dir.join(CURRENT_SNAPSHOT_FILE)) {
-            Ok(()) => sync_dir(&self.snapshot_dir)?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e.into()),
-        }
-        Ok(())
+        remove_snapshot_publication(self.meta.as_deref(), &self.snapshot_dir)
     }
 
     pub(super) async fn build_atomic_snapshot(&self) -> anyhow::Result<Snapshot<NodusTypeConfig>> {

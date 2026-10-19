@@ -5,23 +5,29 @@ newer reader. Both contain the bootstrap-authentication and local WAL-retention
 fixes. The older reader still lacks admission commands; patching these defects
 must not erase the protocol boundary being tested.
 
-The September 14, 2026 pinned-pair run **passed all thirteen checkpoints in 360.45 seconds**
-with `passed: true`, `matrix_completed: true` and an empty blocker list. It used
-the pinned pair below, with neither `--candidate` nor `--diagnose`. Both snapshot
-directions, executable rollback before admission, admission refusals, four-node
-admission and crash/restart recovery passed. All five committed rows survived;
-the aborted row remained absent. No snapshot-login restart was needed.
+The October 19, 2026 pinned-pair run **passed all thirteen checkpoints in 277.55 seconds**
+with `passed: true`, `matrix_completed: true` and an empty blocker list. The
+working-tree candidate run based on `bbbb26c` with source patch SHA-256
+`5b9cf8ef8ad7e0dc6ee3c77b05e2c1e10d84b699edceed725954204a8f072312` (binary
+`3b0f68046aa55a49ec9a2869afaee3a50a8ee74ae1d80077050f662302b6c9de`) also
+**passed all thirteen checkpoints in 267.81 seconds**, with the same acceptance
+fields and no blockers. That candidate adds the inert level-3 upgrade-authority
+scaffolding (`migration-v3` target); the matrix proves the level 1→2 flows and
+record formats are unchanged for mixed binaries. The pinned run did not use `--candidate`; neither run used
+`--diagnose`. Both snapshot directions, executable rollback before
+admission, admission refusals, four-node admission and crash/restart recovery
+passed. All five committed rows survived; the aborted row remained absent. No
+snapshot-login restart was needed.
 
-The subsequent purge-batching **candidate run failed after four checkpoints**
-(373.75 seconds). During the v2 catch-up step, the pinned older node 2 panicked
-on restart: its recovered purge watermark was term 4/index 5019, beyond its saved
-term 1/index 5001 snapshot. The receiver failed before installing the candidate's
-snapshot. The older executable still uses separate per-entry purge commits and
-recovery that can advance the watermark past the saved snapshot after an interrupted
-purge. The candidate's atomic purge batches have separate fault-test coverage, but
-this failed matrix does **not** qualify the candidate for mixed-binary acceptance.
-Backport the purge/recovery fix to the maintenance reader and rerun the gate before
-making that claim. The pins below remain unchanged.
+The maintenance baseline now includes the bounded atomic purge/recovery fix and a
+torn-recovery repair that drops a snapshot descriptor older than the reconciled
+purge watermark, so a killed node rebuilds its snapshot from the durable state
+machine instead of panicking on `purge_upto > snapshot_last_log_id` at startup.
+That defect was caught by an October 19 candidate rerun (a SIGKILLed follower
+crash-looped on restart) and reproduced against the preserved data directory
+before the fix. These successful runs supersede the earlier runs, but they
+qualify only this maintenance/candidate pair, not arbitrary older binaries or
+future format changes.
 
 Run the compatibility gate with:
 
@@ -41,11 +47,13 @@ requires `matrix_completed: true`, `passed: true`, thirteen checks and no blocke
 | R6a maintenance | `65313a236ce54adb510dde1835e4a652ece3a0e8` | Absent; unknown commands are rejected |
 | Newer reader | `d1989d3c0d21d22f60507b681d1eb288a8f42dce` | Admission v1 |
 
-R6a maintenance backports only commits `225a5dc` (bootstrap authentication) and
-`f82094c` (local WAL retention) onto
-`31897cd7d7bbbf7b51cc3d522a2a77f4e7ec908a`. The reviewed
+R6a maintenance backports commits `225a5dc` (bootstrap authentication),
+`f82094c` (local WAL retention), and `16442b1` (bounded atomic purge and recovery)
+onto `31897cd7d7bbbf7b51cc3d522a2a77f4e7ec908a`, plus a tree-only recovery fix that
+drops a snapshot descriptor older than the reconciled purge watermark so a torn
+restart rebuilds the snapshot instead of panicking. The reviewed
 [backport patch](../../tools/testing/fixtures/r6a-maintenance.patch) reconstructs
-Git tree `9dd2beafcee4ae17bde6be0acc74d70d249d4d6d`. The runner verifies both the
+Git tree `879a5fd893f41dd59d735cb086ba4600076e92ef`. The runner verifies both the
 patch SHA-256 and this tree before building. It uses a temporary Git index, so
 staged changes and working files stay intact. This works in a fresh main-branch
 checkout without the local maintenance branch or its commit object. See

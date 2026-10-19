@@ -65,9 +65,10 @@ class BackportSourceTests(unittest.TestCase):
         self.assertNotEqual(missing.returncode, 0)
         tree = runner.patched_tree(runner.OLD_BASE, runner.OLD_PATCH,
                                    runner.OLD_PATCH_SHA, runner.OLD_TREE, repo=cold)
-        # Backporting fixes must not turn the historical command decoder into
-        # an admission-capable reader. The process gate checks this over the wire.
-        for path in ("crates/nodus_raftstore", "crates/nodus_server/src/raft_upgrade.rs"):
+        # Storage purge/recovery fixes are allowed, but backports must not turn
+        # the historical command decoder into an admission-capable reader. The
+        # process gate checks the actual wire behavior.
+        for path in ("crates/nodus_raftstore/src/upgrade", "crates/nodus_server/src/raft_upgrade.rs"):
             diff = subprocess.check_output(["git", "-C", str(cold), "diff",
                                             runner.OLD_BASE, tree, "--", path])
             self.assertEqual(diff, b"")

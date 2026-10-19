@@ -13,9 +13,9 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[2]
 OLD = "65313a236ce54adb510dde1835e4a652ece3a0e8"
 OLD_BASE = "31897cd7d7bbbf7b51cc3d522a2a77f4e7ec908a"
-OLD_TREE = "9dd2beafcee4ae17bde6be0acc74d70d249d4d6d"
+OLD_TREE = "879a5fd893f41dd59d735cb086ba4600076e92ef"
 OLD_PATCH = ROOT / "tools/testing/fixtures/r6a-maintenance.patch"
-OLD_PATCH_SHA = "8a459221ac0fbf7eb32fd5fb8ded3b3e7f351f61f90f2d034794b2aae5dc1244"
+OLD_PATCH_SHA = "33f63b8799a704a93b914987bbb22428fd004726d69bb54805bb12727880b38b"
 NEW = "d1989d3c0d21d22f60507b681d1eb288a8f42dce"
 
 

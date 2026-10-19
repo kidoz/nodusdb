@@ -1,8 +1,24 @@
 diff --git a/Cargo.lock b/Cargo.lock
-index ceef700d7e9ccf5f6276e13f9f6fde4f94e12b2f..cc4ccdf1c1eeb86cbc26920a595a69ef58a8f4ea 100644
+index ceef700d7e9ccf5f6276e13f9f6fde4f94e12b2f..79a98d3b8ab64722f50e8b045bd49cfdf85e642c 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
-@@ -2466,6 +2466,7 @@ dependencies = [
+@@ -2392,6 +2392,7 @@ dependencies = [
+  "nodus_meta",
+  "nodus_sharding",
+  "nodus_storage_api",
++ "nodus_storage_lsm",
+  "nodus_storage_mem",
+  "nodus_upgrade",
+  "openraft",
+@@ -2399,6 +2400,7 @@ dependencies = [
+  "serde",
+  "serde_json",
+  "sha2",
++ "tempfile",
+  "thiserror 2.0.20",
+  "tokio",
+  "tracing",
+@@ -2466,6 +2468,7 @@ dependencies = [
   "sqlparser",
   "tempfile",
   "tokio",
@@ -10,6 +26,645 @@ index ceef700d7e9ccf5f6276e13f9f6fde4f94e12b2f..cc4ccdf1c1eeb86cbc26920a595a69ef
   "tokio-rustls",
   "tower-http 0.7.1",
   "tracing",
+diff --git a/crates/nodus_raftstore/Cargo.toml b/crates/nodus_raftstore/Cargo.toml
+index 3dc4ad659576ab7ff164f2ccaa4c82eadcd4c5ff..096a7db25e2d680a2e4d4946e1f3a28f182136f9 100644
+--- a/crates/nodus_raftstore/Cargo.toml
++++ b/crates/nodus_raftstore/Cargo.toml
+@@ -28,6 +28,8 @@ nodus_upgrade = { version = "0.1.0", path = "../nodus_upgrade" }
+ 
+ [dev-dependencies]
+ nodus_storage_mem = { path = "../nodus_storage_mem" }
++nodus_storage_lsm = { path = "../nodus_storage_lsm" }
++tempfile = "3.27.0"
+ 
+ [lints]
+ workspace = true
+diff --git a/crates/nodus_raftstore/src/lib.rs b/crates/nodus_raftstore/src/lib.rs
+index 2f069b4a1502adf3caaec934ed500a6fa7cf5e91..b0aa34bbfc242f2d0f45aab0c080d0d9a99dd4e7 100644
+--- a/crates/nodus_raftstore/src/lib.rs
++++ b/crates/nodus_raftstore/src/lib.rs
+@@ -29,6 +29,7 @@ use serde::{Deserialize, Serialize};
+ 
+ pub mod migration;
+ pub mod network;
++mod purge;
+ pub mod server;
+ mod snapshots;
+ pub use snapshots::v2::SnapshotCompatibility;
+@@ -356,10 +357,11 @@ fn reconcile_torn_recovery(
+     };
+     let purged_idx = applied.last_purged.map(|l| l.index).unwrap_or(0);
+     let expected = applied_id.index.saturating_sub(purged_idx);
++    if expected == 0 {
++        return false; // No retained applied prefix to validate.
++    }
+     let present = log.range(purged_idx + 1..=applied_id.index).count() as u64;
+-    if present == expected
+-        && (expected == 0 || log.get(&applied_id.index).map(|e| e.log_id) == Some(applied_id))
+-    {
++    if present == expected && log.get(&applied_id.index).map(|e| e.log_id) == Some(applied_id) {
+         return false; // Applied prefix intact — healthy recovery.
+     }
+     applied.last_purged = Some(applied_id);
+@@ -667,6 +669,31 @@ impl NodusRaftStore {
+         let snapshot_meta = meta
+             .load_snapshot_meta()
+             .filter(|_| snapshot_dir.join(CURRENT_SNAPSHOT_FILE).exists());
++        // A torn recovery can leave the purge watermark above the durable
++        // snapshot: `reconcile_torn_recovery` raises the watermark to the
++        // applied pointer when the applied log prefix is lost, and that pointer
++        // may be newer than the last snapshot. openraft's startup rejects
++        // `purge_upto > snapshot_last_log_id` with a panic, so drop the stale
++        // descriptor instead: with no snapshot, openraft validates the
++        // watermark against the applied pointer and rebuilds the snapshot from
++        // the durable state machine through the normal gated builder before
++        // serving.
++        let snapshot_meta = match snapshot_meta {
++            Some(m) if applied.last_purged > m.last_log_id => {
++                tracing::warn!(
++                    purged = ?applied.last_purged,
++                    snapshot = ?m.last_log_id,
++                    "purge watermark outlived the durable snapshot; dropping the stale descriptor for rebuild"
++                );
++                if let Err(error) =
++                    snapshots::remove_snapshot_publication(Some(meta.as_ref()), &snapshot_dir)
++                {
++                    tracing::error!(%error, "failed to drop the stale snapshot descriptor");
++                }
++                None
++            }
++            other => other,
++        };
+         Self {
+             log: Arc::new(RwLock::new(log)),
+             vote: Arc::new(RwLock::new(vote)),
+@@ -1022,20 +1049,7 @@ impl RaftStorage<NodusTypeConfig> for NodusRaftStore {
+     }
+ 
+     async fn purge_logs_upto(&mut self, log_id: LogId<u64>) -> Result<(), StorageError<u64>> {
+-        {
+-            let mut log = self.log.write().await;
+-            let keys: Vec<u64> = log.range(..=log_id.index).map(|(k, _)| *k).collect();
+-            for key in keys {
+-                log.remove(&key);
+-                if let Some(meta) = &self.meta {
+-                    meta.delete_entry(key);
+-                }
+-            }
+-        }
+-        let mut sm = self.state_machine.write().await;
+-        sm.last_purged = Some(log_id);
+-        self.persist_applied(&sm);
+-        Ok(())
++        self.purge_log_prefix(log_id).await
+     }
+ 
+     async fn last_applied_state(
+diff --git a/crates/nodus_raftstore/src/purge.rs b/crates/nodus_raftstore/src/purge.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..3ba1545a8cca15870b0c344830226750db06e8ca
+--- /dev/null
++++ b/crates/nodus_raftstore/src/purge.rs
+@@ -0,0 +1,107 @@
++//! Bounded, durable Raft prefix removal. Every batch publishes its tombstones
++//! and purge watermark together, using the existing v1 record format.
++
++use super::*;
++
++const PURGE_BATCH_SIZE: usize = 256;
++
++impl RaftMetaStore {
++    fn purge_batch(&self, entries: &[LogId<u64>], applied: &AppliedState) -> anyhow::Result<()> {
++        let state = encode_raft(serde_json::to_vec(applied)?);
++        let txn = TxnId::new();
++        let result = (|| {
++            for entry in entries {
++                self.kv
++                    .delete_intent(txn, Bytes::from(log_key(entry.index)))?;
++            }
++            self.kv.write_intent(
++                txn,
++                Bytes::from_static(RAFT_APPLIED_KEY),
++                Bytes::from(state),
++            )?;
++            self.kv.commit(txn, self.next_ts())?;
++            Ok(())
++        })();
++        if result.is_err() {
++            // A failed commit can have an uncertain durable outcome. Report it
++            // to Raft even if abort succeeds; recovery is authoritative.
++            let _ = self.kv.abort(txn);
++        }
++        result
++    }
++}
++
++impl NodusRaftStore {
++    pub(super) async fn purge_log_prefix(
++        &self,
++        target: LogId<u64>,
++    ) -> Result<(), StorageError<u64>> {
++        let started = std::time::Instant::now();
++        // Same lock order as log-state reads. Apply/snapshot installation must
++        // not overwrite the applied record while a purge publishes its copy.
++        let mut log = self.log.clone().write_owned().await;
++        let mut sm = self.state_machine.clone().write_owned().await;
++        if sm.last_purged.is_some_and(|id| id.index >= target.index) {
++            return Ok(());
++        }
++        let meta = self.meta.clone();
++        // Own the guards inside the blocking task: cancelling the async caller
++        // cannot release them between durable publication and cache updates.
++        let result = tokio::task::spawn_blocking(move || -> anyhow::Result<(usize, usize)> {
++            let mut deleted = 0;
++            let mut batches = 0;
++            loop {
++                let entries: Vec<_> = log
++                    .range(..=target.index)
++                    .take(PURGE_BATCH_SIZE + 1)
++                    .map(|(_, e)| e.log_id)
++                    .collect();
++                let complete = entries.len() <= PURGE_BATCH_SIZE;
++                let entries = &entries[..entries.len().min(PURGE_BATCH_SIZE)];
++                let watermark = if complete {
++                    target
++                } else {
++                    entries[PURGE_BATCH_SIZE - 1]
++                };
++                let applied = AppliedState {
++                    last_applied: sm.last_applied_log,
++                    last_membership: sm.last_membership.clone(),
++                    last_purged: Some(watermark),
++                };
++                if let Some(meta) = &meta {
++                    meta.purge_batch(entries, &applied)?;
++                }
++                for entry in entries {
++                    log.remove(&entry.index);
++                }
++                sm.last_purged = Some(watermark);
++                deleted += entries.len();
++                batches += 1;
++                if complete {
++                    return Ok((deleted, batches));
++                }
++            }
++        })
++        .await;
++        let result = result.map_err(anyhow::Error::from).and_then(|r| r);
++        match result {
++            Ok((entries, batches)) => {
++                tracing::info!(group = %self.snapshot_group, target = target.index, entries, batches,
++                    elapsed_ms = started.elapsed().as_millis() as u64, "Raft log prefix purged");
++                Ok(())
++            }
++            Err(error) => {
++                tracing::error!(group = %self.snapshot_group, target = target.index, %error,
++                    elapsed_ms = started.elapsed().as_millis() as u64, "Raft log purge failed");
++                Err(StorageIOError::write_logs(AnyError::error(format!(
++                    "purge Raft log through {}: {error:#}",
++                    target.index
++                )))
++                .into())
++            }
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests;
+diff --git a/crates/nodus_raftstore/src/purge/tests.rs b/crates/nodus_raftstore/src/purge/tests.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..f8bf0d45c38d656be88c4f296f4646f4f41ff6b1
+--- /dev/null
++++ b/crates/nodus_raftstore/src/purge/tests.rs
+@@ -0,0 +1,382 @@
++use super::*;
++use nodus_storage_api::{IntentReplacement, KvPair};
++use nodus_storage_lsm::LsmKvEngine;
++use std::sync::Mutex;
++use std::sync::atomic::AtomicUsize;
++use std::time::Duration;
++
++#[derive(Clone, Copy, Default)]
++enum Fault {
++    #[default]
++    None,
++    Delete,
++    Watermark,
++    BeforeCommit,
++    AfterCommit,
++    ExitBeforeCommit,
++    ExitAfterCommit,
++}
++
++struct ProbeKv {
++    inner: Arc<dyn KvEngine>,
++    commits: AtomicUsize,
++    fault: Mutex<(usize, Fault)>,
++    entered: tokio::sync::Notify,
++    gate: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
++}
++
++impl ProbeKv {
++    fn new(inner: Arc<dyn KvEngine>) -> Self {
++        Self {
++            inner,
++            commits: AtomicUsize::new(0),
++            fault: Mutex::new((0, Fault::None)),
++            entered: tokio::sync::Notify::new(),
++            gate: Mutex::new(None),
++        }
++    }
++
++    fn arm(&self, batch: usize, fault: Fault) {
++        self.commits.store(0, Ordering::SeqCst);
++        *self.fault.lock().unwrap() = (batch, fault);
++    }
++
++    fn fault(&self) -> Fault {
++        let (batch, fault) = *self.fault.lock().unwrap();
++        if self.commits.load(Ordering::SeqCst) + 1 == batch {
++            fault
++        } else {
++            Fault::None
++        }
++    }
++
++    fn fail() -> KvResult<()> {
++        Err(KvError::Other(anyhow::anyhow!("injected purge failure")))
++    }
++}
++
++impl KvEngine for ProbeKv {
++    fn get(&self, key: &[u8], ts: u64) -> anyhow::Result<Option<Bytes>> {
++        self.inner.get(key, ts)
++    }
++    fn scan(
++        &self,
++        range: KeyRange,
++        ts: u64,
++    ) -> anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<KvPair>> + Send>> {
++        self.inner.scan(range, ts)
++    }
++    fn write_intent(&self, txn: TxnId, key: Bytes, value: Bytes) -> KvResult<()> {
++        if matches!(self.fault(), Fault::Watermark) && key.as_ref() == RAFT_APPLIED_KEY {
++            return Self::fail();
++        }
++        self.inner.write_intent(txn, key, value)
++    }
++    fn delete_intent(&self, txn: TxnId, key: Bytes) -> KvResult<()> {
++        self.inner.delete_intent(txn, key)?;
++        if matches!(self.fault(), Fault::Delete) {
++            return Self::fail();
++        }
++        Ok(())
++    }
++    fn replace_intent(
++        &self,
++        txn: TxnId,
++        key: Bytes,
++        replacement: IntentReplacement,
++    ) -> KvResult<()> {
++        self.inner.replace_intent(txn, key, replacement)
++    }
++    fn commit(&self, txn: TxnId, ts: u64) -> KvResult<()> {
++        if let Some(gate) = self.gate.lock().unwrap().take() {
++            self.entered.notify_one();
++            gate.recv_timeout(Duration::from_secs(5)).unwrap();
++        }
++        let fault = self.fault();
++        self.commits.fetch_add(1, Ordering::SeqCst);
++        if matches!(fault, Fault::BeforeCommit) {
++            return Self::fail();
++        }
++        if matches!(fault, Fault::ExitBeforeCommit) {
++            std::process::exit(73);
++        }
++        self.inner.commit(txn, ts)?;
++        if matches!(fault, Fault::AfterCommit) {
++            return Self::fail();
++        }
++        if matches!(fault, Fault::ExitAfterCommit) {
++            std::process::exit(73);
++        }
++        Ok(())
++    }
++    fn abort(&self, txn: TxnId) -> KvResult<()> {
++        self.inner.abort(txn)
++    }
++}
++
++fn entry(index: u64) -> Entry<NodusTypeConfig> {
++    Entry {
++        log_id: LogId::new(openraft::CommittedLeaderId::new(1, 1), index),
++        payload: EntryPayload::Blank,
++    }
++}
++
++async fn seed(kv: Arc<dyn KvEngine>, dir: PathBuf, count: u64) -> NodusRaftStore {
++    let mut store = NodusRaftStore::with_kv_at(kv, dir);
++    let mut entries: Vec<_> = (1..=count).map(entry).collect();
++    entries[0].payload = EntryPayload::Membership(openraft::Membership::new(
++        vec![std::collections::BTreeSet::from([1, 2, 3])],
++        None,
++    ));
++    store.append_to_log(entries.clone()).await.unwrap();
++    store
++        .apply_to_state_machine(&entries[..entries.len() - 1])
++        .await
++        .unwrap();
++    store.save_vote(&Vote::new(1, 1)).await.unwrap();
++    store
++}
++
++// Read persisted records directly first: constructor recovery reconciliation
++// must not mask a mismatch between the tombstones and the purge watermark.
++async fn assert_prefix(kv: Arc<dyn KvEngine>, dir: PathBuf, count: u64, purged: u64) {
++    let meta = RaftMetaStore::new(kv.clone());
++    assert_eq!(
++        meta.load_applied().last_membership.log_id(),
++        &Some(entry(1).log_id)
++    );
++    assert_eq!(
++        meta.load_applied()
++            .last_membership
++            .membership()
++            .voter_ids()
++            .collect::<Vec<_>>(),
++        vec![1, 2, 3]
++    );
++    assert_eq!(
++        meta.load_applied().last_purged.map(|id| id.index),
++        (purged > 0).then_some(purged)
++    );
++    assert_eq!(
++        meta.load_log().keys().copied().collect::<Vec<_>>(),
++        ((purged + 1)..=count).collect::<Vec<_>>()
++    );
++    let mut reopened = NodusRaftStore::with_kv_at(kv, dir);
++    assert_eq!(
++        reopened.get_log_state().await.unwrap().last_log_id,
++        Some(entry(count).log_id)
++    );
++    assert_eq!(
++        reopened.last_applied_state().await.unwrap().0,
++        Some(entry(count - 1).log_id)
++    );
++    assert_eq!(reopened.read_vote().await.unwrap(), Some(Vote::new(1, 1)));
++}
++
++#[tokio::test]
++async fn purge_batches_preserve_tail_and_recover_watermark() {
++    let dir = tempfile::tempdir().unwrap();
++    let inner = Arc::new(LsmKvEngine::with_wal(dir.path().join("data"), None).unwrap());
++    let kv = Arc::new(ProbeKv::new(inner));
++    let mut store = seed(kv.clone(), dir.path().join("snap"), 701).await;
++    kv.arm(0, Fault::None);
++    store.purge_logs_upto(entry(600).log_id).await.unwrap();
++    assert_eq!(
++        kv.commits.load(Ordering::SeqCst),
++        3,
++        "600 tombstones need only three durable commits"
++    );
++    store.purge_logs_upto(entry(500).log_id).await.unwrap();
++    assert_eq!(
++        kv.commits.load(Ordering::SeqCst),
++        3,
++        "stale request cannot regress watermark"
++    );
++    drop(store);
++    drop(kv);
++    let reopened = Arc::new(LsmKvEngine::with_wal(dir.path().join("data"), None).unwrap());
++    assert_prefix(reopened, dir.path().join("snap"), 701, 600).await;
++}
++
++#[tokio::test]
++async fn purge_exact_batch_and_empty_log_keep_the_durable_boundary() {
++    let dir = tempfile::tempdir().unwrap();
++    let kv = Arc::new(LsmKvEngine::with_wal(dir.path().join("data"), None).unwrap());
++    let mut store = seed(kv.clone(), dir.path().join("snap"), 257).await;
++    store.purge_logs_upto(entry(256).log_id).await.unwrap();
++    assert_prefix(kv.clone(), dir.path().join("snap"), 257, 256).await;
++    store.apply_to_state_machine(&[entry(257)]).await.unwrap();
++    store.purge_logs_upto(entry(257).log_id).await.unwrap();
++    // Snapshot-installed state may have no retained entries at the target.
++    // Reset only the purge pointer to exercise this case without fake logs.
++    store.state_machine.write().await.last_purged = None;
++    store.purge_logs_upto(entry(257).log_id).await.unwrap();
++    drop(store);
++    drop(kv);
++    let kv = Arc::new(LsmKvEngine::with_wal(dir.path().join("data"), None).unwrap());
++    let mut store = NodusRaftStore::with_kv_at(kv, dir.path().join("snap"));
++    let state = store.get_log_state().await.unwrap();
++    assert_eq!(state.last_purged_log_id, Some(entry(257).log_id));
++    assert_eq!(state.last_log_id, Some(entry(257).log_id));
++    assert!(store.try_get_log_entries(..).await.unwrap().is_empty());
++}
++
++#[tokio::test]
++async fn purge_failures_keep_a_recoverable_prefix_and_report_error() {
++    for fault in [
++        Fault::Delete,
++        Fault::Watermark,
++        Fault::BeforeCommit,
++        Fault::AfterCommit,
++    ] {
++        let dir = tempfile::tempdir().unwrap();
++        let inner = Arc::new(LsmKvEngine::with_wal(dir.path().join("data"), None).unwrap());
++        let kv = Arc::new(ProbeKv::new(inner));
++        let mut store = seed(kv.clone(), dir.path().join("snap"), 601).await;
++        kv.arm(2, fault);
++        let error = store.purge_logs_upto(entry(600).log_id).await.unwrap_err();
++        assert!(error.to_string().contains("injected purge failure"));
++        // Only acknowledged batches reach the cache, including ambiguous commit errors.
++        assert_eq!(
++            store.get_log_state().await.unwrap().last_purged_log_id,
++            Some(entry(256).log_id)
++        );
++        assert_eq!(
++            store.try_get_log_entries(257..=601).await.unwrap().len(),
++            345
++        );
++        drop(store);
++        drop(kv);
++        let reopened = Arc::new(LsmKvEngine::with_wal(dir.path().join("data"), None).unwrap());
++        let purged = if matches!(fault, Fault::AfterCommit) {
++            512
++        } else {
++            256
++        };
++        assert_prefix(reopened, dir.path().join("snap"), 601, purged).await;
++    }
++}
++
++#[tokio::test(flavor = "current_thread")]
++async fn cancelling_purge_keeps_publication_and_cache_update_together() {
++    let dir = tempfile::tempdir().unwrap();
++    let kv = Arc::new(ProbeKv::new(
++        Arc::new(nodus_storage_mem::MemKvEngine::new()),
++    ));
++    let store = seed(kv.clone(), dir.path().join("snap"), 301).await;
++    let mut worker = store.clone();
++    let (release, gate) = std::sync::mpsc::channel();
++    *kv.gate.lock().unwrap() = Some(gate);
++    let purge = tokio::spawn(async move { worker.purge_logs_upto(entry(300).log_id).await });
++    // On a single-worker runtime this only progresses if disk I/O is offloaded.
++    tokio::time::timeout(Duration::from_secs(2), kv.entered.notified())
++        .await
++        .unwrap();
++    purge.abort();
++    assert!(purge.await.unwrap_err().is_cancelled());
++    assert!(
++        store.log.try_read().is_err(),
++        "blocking task retains the cache lock"
++    );
++    release.send(()).unwrap();
++    let mut observer = store.clone();
++    let state = tokio::time::timeout(Duration::from_secs(2), observer.get_log_state())
++        .await
++        .unwrap()
++        .unwrap();
++    assert_eq!(state.last_purged_log_id, Some(entry(300).log_id));
++    assert_prefix(kv, dir.path().join("snap"), 301, 300).await;
++}
++
++#[tokio::test]
++async fn purge_crash_child() {
++    let Ok(path) = std::env::var("NODUS_PURGE_CRASH_DIR") else {
++        return;
++    };
++    let dir = PathBuf::from(path);
++    let kv = Arc::new(ProbeKv::new(Arc::new(
++        LsmKvEngine::with_wal(dir.join("data"), None).unwrap(),
++    )));
++    let mut store = seed(kv.clone(), dir.join("snap"), 601).await;
++    let after = std::env::var("NODUS_PURGE_CRASH_AFTER").unwrap() == "true";
++    kv.arm(
++        2,
++        if after {
++            Fault::ExitAfterCommit
++        } else {
++            Fault::ExitBeforeCommit
++        },
++    );
++    store.purge_logs_upto(entry(600).log_id).await.unwrap();
++    panic!("crash hook was not reached");
++}
++
++#[tokio::test]
++async fn abrupt_exit_during_purge_recovers_atomic_batches() {
++    for after in [false, true] {
++        let dir = tempfile::tempdir().unwrap();
++        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
++            .args(["--exact", "purge::tests::purge_crash_child", "--nocapture"])
++            .env("NODUS_PURGE_CRASH_DIR", dir.path())
++            .env("NODUS_PURGE_CRASH_AFTER", after.to_string())
++            .spawn()
++            .unwrap();
++        let deadline = std::time::Instant::now() + Duration::from_secs(20);
++        let status = loop {
++            if let Some(status) = child.try_wait().unwrap() {
++                break status;
++            }
++            if std::time::Instant::now() >= deadline {
++                child.kill().unwrap();
++                child.wait().unwrap();
++                panic!("purge crash child timed out");
++            }
++            tokio::time::sleep(Duration::from_millis(10)).await;
++        };
++        assert_eq!(
++            status.code(),
++            Some(73),
++            "child exited at the armed commit boundary without destructors"
++        );
++        let kv = Arc::new(LsmKvEngine::with_wal(dir.path().join("data"), None).unwrap());
++        assert_prefix(
++            kv,
++            dir.path().join("snap"),
++            601,
++            if after { 512 } else { 256 },
++        )
++        .await;
++    }
++}
++
++/// Repeatable local fsync comparison, deliberately excluded from normal tests.
++#[tokio::test]
++#[ignore = "local persistent purge benchmark"]
++async fn benchmark_purge_commits() {
++    for batched in [false, true] {
++        let dir = tempfile::tempdir().unwrap();
++        let kv = Arc::new(LsmKvEngine::with_wal(dir.path().join("data"), None).unwrap());
++        let mut store = seed(kv.clone(), dir.path().join("snap"), 4001).await;
++        let start = std::time::Instant::now();
++        if batched {
++            store.purge_logs_upto(entry(4000).log_id).await.unwrap();
++        } else {
++            let meta = RaftMetaStore::new(kv.clone());
++            for index in 1..=4000 {
++                meta.delete_checked(&log_key(index)).unwrap();
++            }
++            let mut applied = meta.load_applied();
++            applied.last_purged = Some(entry(4000).log_id);
++            meta.put_checked(
++                RAFT_APPLIED_KEY,
++                encode_raft(serde_json::to_vec(&applied).unwrap()),
++            )
++            .unwrap();
++        }
++        eprintln!(
++            "purge 4000 entries: batched={batched}, elapsed={:?}",
++            start.elapsed()
++        );
++        assert_prefix(kv, dir.path().join("snap"), 4001, 4000).await;
++    }
++}
+diff --git a/crates/nodus_raftstore/src/snapshots.rs b/crates/nodus_raftstore/src/snapshots.rs
+index f04a585e48feaf641c03afbb8829ab0df82d198c..6355db2bf3d7b642fb2aa56163537108aa98cfd2 100644
+--- a/crates/nodus_raftstore/src/snapshots.rs
++++ b/crates/nodus_raftstore/src/snapshots.rs
+@@ -64,20 +64,27 @@ fn validate_control(kv: &dyn KvEngine, row: &SnapshotRow) -> anyhow::Result<()>
+     Ok(())
+ }
+ 
++/// Invalidate the descriptor before touching `current.snap`. A crash in the
++/// publication gap leaves no servable snapshot, never a mismatched file and
++/// descriptor. The complete KV state can rebuild it, including old binaries.
++pub(crate) fn remove_snapshot_publication(
++    meta: Option<&RaftMetaStore>,
++    snapshot_dir: &std::path::Path,
++) -> anyhow::Result<()> {
++    if let Some(meta) = meta {
++        meta.delete_checked(RAFT_SNAPSHOT_META_KEY)?;
++    }
++    match std::fs::remove_file(snapshot_dir.join(CURRENT_SNAPSHOT_FILE)) {
++        Ok(()) => sync_dir(snapshot_dir)?,
++        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
++        Err(e) => return Err(e.into()),
++    }
++    Ok(())
++}
++
+ impl NodusRaftStore {
+-    /// Invalidate the descriptor before touching `current.snap`. A crash in the
+-    /// publication gap leaves no servable snapshot, never a mismatched file and
+-    /// descriptor. The complete KV state can rebuild it, including old binaries.
+     fn invalidate_snapshot_file(&self) -> anyhow::Result<()> {
+-        if let Some(meta) = &self.meta {
+-            meta.delete_checked(RAFT_SNAPSHOT_META_KEY)?;
+-        }
+-        match std::fs::remove_file(self.snapshot_dir.join(CURRENT_SNAPSHOT_FILE)) {
+-            Ok(()) => sync_dir(&self.snapshot_dir)?,
+-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+-            Err(e) => return Err(e.into()),
+-        }
+-        Ok(())
++        remove_snapshot_publication(self.meta.as_deref(), &self.snapshot_dir)
+     }
+ 
+     pub(super) async fn build_atomic_snapshot(&self) -> anyhow::Result<Snapshot<NodusTypeConfig>> {
 diff --git a/crates/nodus_security/src/lib.rs b/crates/nodus_security/src/lib.rs
 index 05aadf3315444eb9da13c451546c48f3184be9f4..73401b9a81f2600af168aaae314bac62352150ca 100644
 --- a/crates/nodus_security/src/lib.rs

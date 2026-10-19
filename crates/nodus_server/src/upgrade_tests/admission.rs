@@ -13,6 +13,24 @@ fn tls_config(dir: &Path) -> nodus_config::ClusterConfig {
         ..Default::default()
     }
 }
+
+async fn wait_for(
+    description: &str,
+    timeout: Duration,
+    mut condition: impl FnMut() -> bool + Send,
+) {
+    tokio::time::timeout(timeout, async move {
+        loop {
+            if condition() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out after {timeout:?} waiting for {description}"));
+}
+
 async fn finalize(nodes: &[Node]) -> usize {
     let leader = wait_leader(nodes).await;
     nodes[leader]
@@ -126,6 +144,17 @@ async fn admission_resumes_across_two_leaders_and_purged_snapshot_catchup() {
             .await
             .is_err()
     );
+    // Start catch-up from an empty candidate after the purge; otherwise an
+    // append-only transfer can silently satisfy the test without any snapshot.
+    let candidate_node = nodes.remove(
+        nodes
+            .iter()
+            .position(|node| node.service.manager.node_id() == 4)
+            .unwrap(),
+    );
+    candidate_node.stop().await;
+    std::fs::remove_dir_all(dir.path().join("4")).unwrap();
+
     let leader = replace_leader(&mut nodes, leader, dir.path(), &config, &members).await;
     let mut committed = 0;
     for (ts, value) in [(100, "old"), (200, "new")] {
@@ -163,20 +192,40 @@ async fn admission_resumes_across_two_leaders_and_purged_snapshot_catchup() {
         })
         .await
         .unwrap();
-    nodes[leader].raft.trigger().snapshot().await.unwrap();
-    tokio::time::timeout(Duration::from_secs(10), async {
-        while nodes[leader]
-            .raft
-            .metrics()
-            .borrow()
-            .purged
-            .is_none_or(|l| l.index < committed)
-        {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .unwrap();
+    wait_for(
+        "every voter to apply the committed writes",
+        Duration::from_secs(10),
+        || {
+            nodes.iter().all(|node| {
+                node.raft
+                    .metrics()
+                    .borrow()
+                    .last_applied
+                    .is_some_and(|log| log.index >= committed)
+            })
+        },
+    )
+    .await;
+    for node in &nodes {
+        node.raft.trigger().snapshot().await.unwrap();
+    }
+    wait_for(
+        "every voter to purge the committed log",
+        Duration::from_secs(30),
+        || {
+            nodes.iter().all(|node| {
+                node.raft
+                    .metrics()
+                    .borrow()
+                    .purged
+                    .is_some_and(|log| log.index >= committed)
+            })
+        },
+    )
+    .await;
+    let listener = TcpListener::bind(&members[&4].addr).await.unwrap();
+    nodes.push(node(4, &dir.path().join("4"), listener, &config).await);
+    let leader = wait_leader(&nodes).await;
     assert!(
         !nodes[leader]
             .service
@@ -196,7 +245,22 @@ async fn admission_resumes_across_two_leaders_and_purged_snapshot_catchup() {
     let learner = nodes
         .iter()
         .find(|n| n.service.manager.node_id() == 4)
-        .unwrap();
+        .expect("candidate node 4 should still be running");
+    wait_for(
+        "the learner to apply both historical row versions",
+        Duration::from_secs(30),
+        || {
+            learner
+                .kv
+                .get(b"admission-row", 100)
+                .is_ok_and(|value| value.as_deref() == Some(b"old".as_slice()))
+                && learner
+                    .kv
+                    .get(b"admission-row", 200)
+                    .is_ok_and(|value| value.as_deref() == Some(b"new".as_slice()))
+        },
+    )
+    .await;
     assert_eq!(
         learner
             .kv
@@ -216,13 +280,12 @@ async fn admission_resumes_across_two_leaders_and_purged_snapshot_catchup() {
         b"new"
     );
     let snapshot_path = dir.path().join("4/snapshots/shard-meta/current.snap");
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while !snapshot_path.exists() {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .unwrap();
+    wait_for(
+        "the learner to publish its snapshot",
+        Duration::from_secs(30),
+        || snapshot_path.exists(),
+    )
+    .await;
     assert_eq!(&std::fs::read(&snapshot_path).unwrap()[..6], b"NSNP\0\x02");
     assert!(
         learner
@@ -258,7 +321,7 @@ async fn admission_resumes_across_two_leaders_and_purged_snapshot_catchup() {
         })
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             if nodes.iter().all(|n| {
                 admission::read(n.kv.as_ref())
@@ -268,11 +331,13 @@ async fn admission_resumes_across_two_leaders_and_purged_snapshot_catchup() {
             }) {
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            let leader = wait_leader(&nodes).await;
+            nodes[leader].raft.trigger().heartbeat().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
         }
     })
     .await
-    .unwrap();
+    .unwrap_or_else(|_| panic!("timed out waiting for admission convergence"));
     for n in &nodes {
         assert_eq!(upgrade::read(n.kv.as_ref()).unwrap(), immutable);
         assert_eq!(

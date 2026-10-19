@@ -817,6 +817,29 @@ impl NodusRaftStore {
         let snapshot_meta = meta
             .load_snapshot_meta()?
             .filter(|_| snapshot_dir.join(CURRENT_SNAPSHOT_FILE).exists());
+        // A torn recovery can leave the purge watermark above the durable
+        // snapshot: `reconcile_torn_recovery` raises the watermark to the
+        // applied pointer when the applied log prefix is lost, and that pointer
+        // may be newer than the last snapshot. openraft's startup rejects
+        // `purge_upto > snapshot_last_log_id` with a panic, so drop the stale
+        // descriptor instead: with no snapshot, openraft validates the
+        // watermark against the applied pointer and rebuilds the snapshot from
+        // the durable state machine through the normal gated builder before
+        // serving. The descriptor is invalidated before the file, matching the
+        // publication-gap ordering, so a crash here never leaves a mismatched
+        // pair.
+        let snapshot_meta = match snapshot_meta {
+            Some(m) if applied.last_purged > m.last_log_id => {
+                tracing::warn!(
+                    purged = ?applied.last_purged,
+                    snapshot = ?m.last_log_id,
+                    "purge watermark outlived the durable snapshot; dropping the stale descriptor for rebuild"
+                );
+                snapshots::remove_snapshot_publication(Some(meta.as_ref()), &snapshot_dir)?;
+                None
+            }
+            other => other,
+        };
         Ok(Self {
             log: Arc::new(RwLock::new(log)),
             vote: Arc::new(RwLock::new(vote)),
@@ -2071,6 +2094,132 @@ mod tests {
             store.try_get_log_entries(1..=2).await.unwrap().is_empty(),
             "no stale entries below the purge watermark"
         );
+    }
+
+    /// When the reconciled purge watermark moves past the durable snapshot,
+    /// recovery must drop the stale snapshot descriptor: openraft rejects
+    /// `purge_upto > snapshot_last_log_id` with a startup panic, while a
+    /// missing descriptor makes it rebuild the snapshot from the durable state
+    /// machine through the normal builder.
+    #[tokio::test]
+    async fn recovery_drops_a_snapshot_older_than_the_reconciled_watermark() {
+        let kv: Arc<dyn KvEngine> = Arc::new(nodus_storage_mem::MemKvEngine::new());
+        let snapshot_dir = temp_snapshot_dir();
+        {
+            let mut store = NodusRaftStore::with_kv_at(kv.clone(), snapshot_dir.clone()).unwrap();
+            store
+                .append_to_log(vec![
+                    blank_entry(1, 1),
+                    blank_entry(1, 2),
+                    blank_entry(1, 3),
+                ])
+                .await
+                .unwrap();
+            store
+                .apply_to_state_machine(&[blank_entry(1, 1), blank_entry(1, 2)])
+                .await
+                .unwrap();
+            // A durable snapshot at index 2, then one more applied entry.
+            let snapshot = store.build_snapshot().await.unwrap();
+            assert_eq!(snapshot.meta.last_log_id.map(|l| l.index), Some(2));
+            store
+                .apply_to_state_machine(&[blank_entry(1, 3)])
+                .await
+                .unwrap();
+        }
+        // Simulate the torn durability: the applied pointer (@3) and the
+        // snapshot descriptor (@2) survived, but the log entries did not.
+        let meta = RaftMetaStore::new(kv.clone());
+        for index in 1..=3 {
+            meta.delete_entry(index).unwrap();
+        }
+
+        // Reopen: reconcile purges to the applied pointer (@3), which is newer
+        // than the snapshot (@2), so the descriptor must be dropped.
+        let mut store = NodusRaftStore::with_kv_at(kv.clone(), snapshot_dir.clone()).unwrap();
+        let state = store.get_log_state().await.unwrap();
+        assert_eq!(state.last_purged_log_id.map(|l| l.index), Some(3));
+        assert!(
+            store.get_current_snapshot().await.unwrap().is_none(),
+            "stale snapshot descriptor dropped so openraft rebuilds it"
+        );
+        assert!(
+            !snapshot_dir.join(CURRENT_SNAPSHOT_FILE).exists(),
+            "the stale snapshot file is removed with its descriptor"
+        );
+        assert!(
+            RaftMetaStore::new(kv.clone())
+                .load_snapshot_meta()
+                .unwrap()
+                .is_none(),
+            "the persisted descriptor is removed, not just the cache"
+        );
+
+        // The exact pre-fix failure mode: openraft startup must accept the
+        // repaired state — and rebuild the snapshot from the durable state
+        // machine — instead of panicking on `purge_upto > snapshot_last_log_id`.
+        let config = std::sync::Arc::new(
+            openraft::Config {
+                heartbeat_interval: 100,
+                election_timeout_min: 300,
+                election_timeout_max: 600,
+                ..Default::default()
+            }
+            .validate()
+            .unwrap(),
+        );
+        let (log, sm) = openraft::storage::Adaptor::new(store);
+        let raft = crate::server::NodusRaft::new(
+            1,
+            config,
+            crate::network::NodusNetworkFactory::new("unscoped".into(), Default::default()),
+            log,
+            sm,
+        )
+        .await
+        .unwrap();
+        raft.shutdown().await.unwrap();
+    }
+
+    /// A snapshot at or beyond the reconciled purge watermark still satisfies
+    /// openraft's invariant, so recovery must keep serving it.
+    #[tokio::test]
+    async fn recovery_keeps_a_snapshot_covering_the_reconciled_watermark() {
+        let kv: Arc<dyn KvEngine> = Arc::new(nodus_storage_mem::MemKvEngine::new());
+        let snapshot_dir = temp_snapshot_dir();
+        let snapshot_id;
+        {
+            let mut store = NodusRaftStore::with_kv_at(kv.clone(), snapshot_dir.clone()).unwrap();
+            store
+                .append_to_log(vec![
+                    blank_entry(1, 1),
+                    blank_entry(1, 2),
+                    blank_entry(1, 3),
+                ])
+                .await
+                .unwrap();
+            store
+                .apply_to_state_machine(&[blank_entry(1, 1), blank_entry(1, 2), blank_entry(1, 3)])
+                .await
+                .unwrap();
+            let snapshot = store.build_snapshot().await.unwrap();
+            snapshot_id = snapshot.meta.snapshot_id.clone();
+        }
+        let meta = RaftMetaStore::new(kv.clone());
+        for index in 1..=3 {
+            meta.delete_entry(index).unwrap();
+        }
+
+        let mut store = NodusRaftStore::with_kv_at(kv.clone(), snapshot_dir.clone()).unwrap();
+        let state = store.get_log_state().await.unwrap();
+        assert_eq!(state.last_purged_log_id.map(|l| l.index), Some(3));
+        let snapshot = store
+            .get_current_snapshot()
+            .await
+            .unwrap()
+            .expect("snapshot covering the purge watermark survives recovery");
+        assert_eq!(snapshot.meta.snapshot_id, snapshot_id);
+        assert_eq!(snapshot.meta.last_log_id.map(|l| l.index), Some(3));
     }
 
     /// A built snapshot is served by `get_current_snapshot` and is durable: a

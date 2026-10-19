@@ -90,6 +90,19 @@ injected errors, ambiguous commit results, cancellation on a single-worker runti
 and subprocess exit before/after the second batch's commit without running
 destructors. It inspects persisted records before constructor reconciliation.
 These subprocess tests demonstrate process-exit recovery, not power-loss behavior.
+
+Constructor reconciliation (`reconcile_torn_recovery`) handles a crash that
+durably keeps the applied-state pointer but loses log entries it refers to: the
+applied prefix is reported as purged and stale entries are dropped so openraft
+never reads a compacted index. If that reconciled watermark is newer than the
+durable snapshot descriptor, recovery drops the descriptor and its file before
+openraft starts — openraft would otherwise reject
+`purge_upto > snapshot_last_log_id` with a startup panic, and with no
+descriptor it rebuilds the snapshot from the durable state machine through the
+normal gated builder. `nodus_raftstore::tests` covers the descriptor drop, the
+preservation of a snapshot that still covers the watermark, and a full
+`Raft::new` startup over the repaired state.
+
 Run the local persistent comparison with:
 
 ```sh
@@ -149,7 +162,7 @@ prove power-loss durability. See the [protocol and compatibility limits](../expl
 | Limitation | Consequence |
 | --- | --- |
 | In-memory by default | Durability requires `[storage] data_dir`. |
-| On-disk formats are not backward compatible across the hardening changes (WAL CRC frame, SSTable v2, catalog-in-KV) | Upgrading across those changes requires a clean restart. There is no cross-version on-disk compatibility guarantee yet. |
+| No general cross-version on-disk compatibility guarantee | Upgrading across hardening changes (WAL CRC frame, SSTable v2, catalog-in-KV) requires a clean restart except for explicitly verified maintenance/candidate pairs. The October 18, 2026 mixed-binary runs passed only the pair documented in [the upgrade gate](../how-to/test-mixed-binary-upgrades.md); they do not establish compatibility with arbitrary older binaries or future formats. |
 | Catalog persistence writes a full-state blob per DDL | Catalog writes are not incremental per entry. |
 | WAL retention has two boundaries | Local cleanup waits for both backup retention and the durable local replay floor; retained intents or restore points can delay reclamation. |
 | General runtime error injection is not wired into the storage engines | Power loss is simulated by cutting files back to their fsynced prefixes (`powercut_tests`, above), which proves the fsync discipline under a device that honors fsync. It does not prove real device behavior: volatile write caches, drives or filesystems that lie about fsync, and fsync error handling on subsequent writes are out of scope for in-process tests. The `FaultPoint`/`FaultAction` injector in `nodus_testkit` remains a registry without production call sites. |
