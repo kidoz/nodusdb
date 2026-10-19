@@ -51,6 +51,9 @@ spec:
                 secretKeyRef:
                   name: {{ include "nodusdb.fullname" . }}-admin
                   key: admin-password
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
           ports:
             - name: pgwire
               containerPort: {{ .Values.service.pgwirePort }}
@@ -78,6 +81,10 @@ spec:
             {{- end }}
             - name: data
               mountPath: /var/lib/nodus
+            {{- if .Values.backupPersistence.enabled }}
+            - name: backup
+              mountPath: /var/lib/nodus/backups
+            {{- end }}
       volumes:
         - name: config
           configMap:
@@ -103,8 +110,9 @@ spec:
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-  {{- if .Values.persistence.enabled }}
+  {{- if or .Values.persistence.enabled .Values.backupPersistence.enabled }}
   volumeClaimTemplates:
+    {{- if .Values.persistence.enabled }}
     - metadata:
         name: data
       spec:
@@ -115,4 +123,17 @@ spec:
         resources:
           requests:
             storage: {{ .Values.persistence.size }}
+    {{- end }}
+    {{- if .Values.backupPersistence.enabled }}
+    - metadata:
+        name: backup
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- with .Values.backupPersistence.storageClass }}
+        storageClassName: {{ . }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.backupPersistence.size }}
+    {{- end }}
   {{- end }}

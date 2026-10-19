@@ -2309,11 +2309,14 @@ dependencies = [
 name = "nodus_integration_tests"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "nodus_backup",
  "nodus_config",
  "nodus_testkit",
  "reqwest",
  "serde_json",
  "serial_test",
+ "tempfile",
  "tokio",
  "tokio-postgres",
 ]

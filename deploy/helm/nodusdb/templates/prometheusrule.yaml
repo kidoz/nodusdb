@@ -1,0 +1,36 @@
+{{- if .Values.restoreDrillAlerts.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "nodusdb.fullname" . }}-restore-drills
+  labels:
+    {{- include "nodusdb.labels" . | nindent 4 }}
+spec:
+  groups:
+    - name: nodusdb-restore-drills
+      rules:
+        - alert: NodusRestoreDrillMissing
+          expr: absent(nodus_restore_drill_last_success_timestamp_seconds)
+          for: {{ .Values.restoreDrillAlerts.missingFor }}
+          labels:
+            severity: critical
+          annotations:
+            summary: "No successful NodusDB restore drill is reported"
+            description: "The restore-drill metrics pipeline is absent or no drill has ever succeeded."
+        - alert: NodusRestoreDrillFailed
+          expr: nodus_restore_drill_success == 0
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "NodusDB restore drill failed"
+            description: "The latest {{"{{ $labels.drill }}"}} restore drill failed its recovery or semantic checks."
+        - alert: NodusRestoreDrillStale
+          expr: time() - nodus_restore_drill_last_success_timestamp_seconds > {{ .Values.restoreDrillAlerts.staleAfterSeconds }}
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "NodusDB restore drill is stale"
+            description: "The last successful {{"{{ $labels.drill }}"}} restore drill exceeds the configured recovery-verification window."
+{{- end }}

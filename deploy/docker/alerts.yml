@@ -29,3 +29,32 @@ groups:
         annotations:
           summary: "No active sessions"
           description: "{{ $labels.instance }} has had no client sessions for 30 minutes."
+
+  - name: nodusdb-restore-drills
+    rules:
+      - alert: NodusRestoreDrillMissing
+        expr: absent(nodus_restore_drill_last_success_timestamp_seconds)
+        for: 1h
+        labels:
+          severity: critical
+        annotations:
+          summary: "No successful NodusDB restore drill is reported"
+          description: "The restore-drill metrics pipeline is absent or no drill has ever succeeded."
+
+      - alert: NodusRestoreDrillFailed
+        expr: nodus_restore_drill_success == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "NodusDB restore drill failed"
+          description: "The latest {{ $labels.drill }} restore drill failed its recovery or semantic checks."
+
+      - alert: NodusRestoreDrillStale
+        expr: time() - nodus_restore_drill_last_success_timestamp_seconds > 93600
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "NodusDB restore drill is stale"
+          description: "The last successful {{ $labels.drill }} restore drill is more than 26 hours old."

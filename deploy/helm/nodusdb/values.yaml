@@ -19,6 +19,8 @@ config:
   maxConnections: 100
   dataDir: /var/lib/nodus/data
   allowEphemeral: false
+  # Development default. Use s3://bucket/prefix with AWS_* Secret environment
+  # for production; a same-node filesystem backup is not node-loss protection.
   backupRepositoryUri: "file:///var/lib/nodus/backups"
   auditFilePath: /var/lib/nodus/audit/audit.jsonl
   auditMaxSizeBytes: 104857600
@@ -41,6 +43,13 @@ persistence:
   size: 10Gi
   # storageClass: ""
 
+# A distinct claim for file:// backup repositories. Disable only for development;
+# a backup on the same node is not protection against node loss.
+backupPersistence:
+  enabled: true
+  size: 20Gi
+  # storageClass: ""
+
 tls:
   enabled: false
   # Raw PEM content. Prefer --set-file tls.cert=server.crt --set-file tls.key=server.key.
@@ -60,6 +69,13 @@ serviceMonitor:
   enabled: false
   interval: 15s
 
+# Requires restore-drill .prom metrics to be exported through your metrics
+# pipeline. Enable only when that pipeline is configured.
+restoreDrillAlerts:
+  enabled: false
+  staleAfterSeconds: 93600
+  missingFor: 1h
+
 podSecurityContext:
   runAsNonRoot: true
   runAsUser: 10001
@@ -72,6 +88,10 @@ securityContext:
   capabilities:
     drop:
       - ALL
+
+# Additional container environment, including AWS_* valueFrom Secret references
+# for s3:// backup repositories. Do not put credentials in nodus.toml.
+extraEnv: []
 
 resources: {}
 nodeSelector: {}

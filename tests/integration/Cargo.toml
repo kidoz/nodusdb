@@ -11,6 +11,8 @@ publish = false
 workspace = true
 
 [dependencies]
+anyhow.workspace = true
+nodus_backup = { path = "../../crates/nodus_backup" }
 nodus_config = { path = "../../crates/nodus_config" }
 nodus_testkit = { path = "../../crates/nodus_testkit" }
 reqwest.workspace = true
@@ -18,5 +20,6 @@ serde_json.workspace = true
 # Serializes the heavy in-process multi-node cluster tests so they don't all run
 # at once (dozens of servers) and starve each other's election/replication timing.
 serial_test = "4.0.1"
+tempfile = "3.27.0"
 tokio.workspace = true
 tokio-postgres.workspace = true

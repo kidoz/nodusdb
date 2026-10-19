@@ -43,7 +43,8 @@ helm install nodus deploy/helm/nodusdb \
 
 The chart renders a `StatefulSet`, a headless `Service`, a `ConfigMap` for
 non-secret `nodus.toml` settings, an admin credential `Secret`, an optional TLS
-`Secret`, a `PodDisruptionBudget`, and an optional Prometheus `ServiceMonitor`.
+`Secret`, a `PodDisruptionBudget`, and optional Prometheus `ServiceMonitor` and
+`PrometheusRule` resources.
 
 The safe default is one replica. `replicaCount > 1` starts additional nodes with
 unique node IDs and seed-node join settings, but this is not production HA yet:
@@ -58,6 +59,52 @@ kubectl get secret nodus-nodusdb-admin \
 kubectl get secret nodus-nodusdb-admin \
   -o jsonpath='{.data.admin-token}' | base64 -d
 ```
+
+### Backup storage and recovery verification
+
+For a filesystem repository, `backupPersistence.enabled=true` creates a backup
+PVC separate from the data PVC and mounts it at `/var/lib/nodus/backups`. Size it
+from retained full backups, incremental chains, archived WAL, and enough headroom
+for one new full backup plus verification. A same-node filesystem backup is not
+node-loss protection; replicate it off-node or use S3 for production.
+
+Off-cluster S3 is the production default. Set a unique repository prefix per
+cluster and inject credentials through an existing Kubernetes `Secret`; do not
+put them in `nodus.toml`:
+
+```yaml
+config:
+  backupRepositoryUri: s3://production-backups/cluster-a
+backupPersistence:
+  enabled: false
+extraEnv:
+  - name: AWS_ACCESS_KEY_ID
+    valueFrom:
+      secretKeyRef:
+        name: production-backup-s3
+        key: access-key-id
+  - name: AWS_SECRET_ACCESS_KEY
+    valueFrom:
+      secretKeyRef:
+        name: production-backup-s3
+        key: secret-access-key
+  - name: AWS_REGION
+    value: us-east-1
+  - name: AWS_ENDPOINT_URL
+    value: https://s3.example.internal
+```
+
+Use TLS, encryption at rest, separate write/delete permissions, and immutable
+retention such as Object Lock. Keep a full backup, every incremental in its
+chain, and all WAL required through the latest allowed recovery point. Restored
+nodes need a new empty repository prefix before normal archiving resumes.
+
+Run the [full, incremental, and PITR restore drills](../docs/how-to/back-up-and-restore.md#run-restore-drills)
+on a schedule and publish their `.prom` files through your metrics pipeline.
+Enable `restoreDrillAlerts.enabled=true` to render missing, stale, and failed
+restore-drill alerts; `staleAfterSeconds` defaults to 26 hours. Enabling the
+rules without the drill metrics pipeline will correctly report missing evidence,
+not a healthy backup.
 
 ## systemd
 
