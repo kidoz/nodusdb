@@ -140,6 +140,7 @@ impl DefaultAuthzEngine {
         {
             effective.push(public.id);
         }
+        let effective = self.principals_in_scope(request, effective)?;
         let wanted = request.action.to_privilege();
         let grants = self
             .catalog
@@ -151,6 +152,25 @@ impl DefaultAuthzEngine {
                     || g.privilege.eq_ignore_ascii_case("ALL"))
         });
         Ok((matched, effective, catalog_version))
+    }
+
+    fn principals_in_scope(
+        &self,
+        request: &AuthzRequest,
+        effective: Vec<PrincipalId>,
+    ) -> Result<Vec<PrincipalId>> {
+        let mut scoped = Vec::with_capacity(effective.len());
+        for id in effective {
+            let Ok(principal) = self.catalog.get_principal_by_id(id) else {
+                continue;
+            };
+            if principal.database_id.is_none()
+                || principal.database_id == request.context.database_id
+            {
+                scoped.push(id);
+            }
+        }
+        Ok(scoped)
     }
 
     /// True when an effective principal holds an `ALL` grant on the `System`
@@ -317,6 +337,67 @@ mod tests {
         }
     }
 
+    fn request_in_db(
+        principal: PrincipalId,
+        action: Action,
+        resource: ResourceRef,
+        database_id: Option<DatabaseId>,
+    ) -> AuthzRequest {
+        AuthzRequest {
+            principal_id: principal,
+            active_roles: vec![],
+            action,
+            resource,
+            context: AuthzContext { database_id },
+        }
+    }
+
+    fn database(catalog: &Arc<MemoryCatalog>, name: &str) -> DatabaseId {
+        catalog
+            .create_database(nodus_catalog::CreateDatabaseRequest {
+                id: DatabaseId::new(),
+                name: name.into(),
+                owner_role_id: None,
+            })
+            .unwrap()
+            .id
+    }
+
+    fn principal(
+        catalog: &Arc<MemoryCatalog>,
+        name: &str,
+        principal_type: PrincipalType,
+        database_id: Option<DatabaseId>,
+    ) -> nodus_catalog::PrincipalDescriptor {
+        catalog
+            .create_role(CreateRoleRequest {
+                id: PrincipalId::new(),
+                name: name.into(),
+                principal_type,
+                database_id,
+                attributes: Default::default(),
+            })
+            .unwrap()
+    }
+
+    fn grant(
+        catalog: &Arc<MemoryCatalog>,
+        principal_id: PrincipalId,
+        resource: ResourceRef,
+        privilege: &str,
+    ) {
+        catalog
+            .grant_privilege(GrantPrivilegeRequest {
+                id: nodus_catalog::GrantId::new(),
+                principal_id,
+                resource,
+                privilege: privilege.into(),
+                grantable: false,
+                grantor: None,
+            })
+            .unwrap();
+    }
+
     #[test]
     fn deny_by_default_without_grant() {
         let catalog = Arc::new(MemoryCatalog::new());
@@ -414,5 +495,164 @@ mod tests {
             .authorize(request(PrincipalId::new(), vec![], Action::Select, table))
             .unwrap();
         assert!(!stranger.allowed);
+    }
+
+    #[test]
+    fn database_scoped_grants_and_superuser_are_limited_to_their_database() {
+        let catalog = Arc::new(MemoryCatalog::new());
+        let db1 = database(&catalog, "db1");
+        let db2 = database(&catalog, "db2");
+        let user = principal(&catalog, "scoped", PrincipalType::User, Some(db1));
+        let table = ResourceRef::Table(TableId::new());
+        grant(&catalog, user.id, table.clone(), "SELECT");
+        grant(&catalog, user.id, ResourceRef::System, "ALL");
+        let engine = DefaultAuthzEngine::new(catalog);
+
+        assert!(
+            engine
+                .authorize(request_in_db(
+                    user.id,
+                    Action::Select,
+                    table.clone(),
+                    Some(db1)
+                ))
+                .unwrap()
+                .allowed
+        );
+        assert!(
+            !engine
+                .authorize(request_in_db(
+                    user.id,
+                    Action::Select,
+                    table.clone(),
+                    Some(db2)
+                ))
+                .unwrap()
+                .allowed
+        );
+        assert!(
+            !engine
+                .authorize(request_in_db(user.id, Action::Select, table, None))
+                .unwrap()
+                .allowed
+        );
+        assert!(
+            engine
+                .authorize(request_in_db(
+                    user.id,
+                    Action::ManageGrants,
+                    ResourceRef::System,
+                    Some(db1),
+                ))
+                .unwrap()
+                .allowed
+        );
+        assert!(
+            !engine
+                .authorize(request_in_db(
+                    user.id,
+                    Action::ManageGrants,
+                    ResourceRef::System,
+                    Some(db2),
+                ))
+                .unwrap()
+                .allowed
+        );
+    }
+
+    #[test]
+    fn database_scoped_role_inheritance_is_limited_to_their_database() {
+        let catalog = Arc::new(MemoryCatalog::new());
+        let db1 = database(&catalog, "db1");
+        let db2 = database(&catalog, "db2");
+        let role = principal(&catalog, "readers", PrincipalType::Role, Some(db1));
+        let member = principal(&catalog, "member", PrincipalType::User, None);
+        catalog
+            .add_role_member(AddRoleMemberRequest {
+                role_principal_id: role.id,
+                member_id: member.id,
+                admin_option: false,
+                grantor: None,
+            })
+            .unwrap();
+        let table = ResourceRef::Table(TableId::new());
+        grant(&catalog, role.id, table.clone(), "SELECT");
+        let engine = DefaultAuthzEngine::new(catalog);
+
+        assert!(
+            engine
+                .authorize(request_in_db(
+                    member.id,
+                    Action::Select,
+                    table.clone(),
+                    Some(db1)
+                ))
+                .unwrap()
+                .allowed
+        );
+        assert!(
+            !engine
+                .authorize(request_in_db(member.id, Action::Select, table, Some(db2)))
+                .unwrap()
+                .allowed
+        );
+    }
+
+    #[test]
+    fn database_scoped_ownership_is_limited_to_their_database() {
+        let catalog = Arc::new(MemoryCatalog::new());
+        let db1 = database(&catalog, "db1");
+        let db2 = database(&catalog, "db2");
+        let owner = principal(&catalog, "owner", PrincipalType::User, Some(db1));
+        let schema = catalog
+            .create_schema(nodus_catalog::CreateSchemaRequest {
+                id: nodus_catalog::SchemaId::new(),
+                database_id: db1,
+                name: "public".into(),
+                owner_role_id: None,
+                managed_access: false,
+            })
+            .unwrap();
+        let table = catalog
+            .create_table(nodus_catalog::CreateTableRequest {
+                id: TableId::new(),
+                database_id: db1,
+                schema_id: schema.id,
+                name: "t".into(),
+                columns: vec![],
+                constraints: vec![],
+                view_query: None,
+                materialized_query: None,
+                parents: vec![],
+                partition_by: None,
+                partition_bound: None,
+            })
+            .unwrap();
+        catalog
+            .update_table_descriptor(nodus_catalog::TableDescriptorChange::SetOwner {
+                table_id: table.id,
+                owner_role_id: Some(nodus_catalog::RoleId(owner.id.0)),
+            })
+            .unwrap();
+        let engine = DefaultAuthzEngine::new(catalog);
+        let resource = ResourceRef::Table(table.id);
+
+        assert!(
+            engine
+                .authorize(request_in_db(
+                    owner.id,
+                    Action::Select,
+                    resource.clone(),
+                    Some(db1)
+                ))
+                .unwrap()
+                .allowed
+        );
+        assert!(
+            !engine
+                .authorize(request_in_db(owner.id, Action::Select, resource, Some(db2)))
+                .unwrap()
+                .allowed
+        );
     }
 }

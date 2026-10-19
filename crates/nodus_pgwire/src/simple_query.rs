@@ -208,12 +208,7 @@ impl SimpleQueryHandler for NodusQueryHandler {
         // startup handler; carry it into the execution context for authorization.
         let principal_id = principal_id_from_client(client);
 
-        let ctx = nodus_executor::ExecutionContext {
-            session_id: session_id.clone(),
-            principal_id,
-            active_roles: vec![],
-            authz_catalog_version: 1,
-        };
+        let ctx = execution_context(client, session_id.clone(), principal_id);
 
         let query_str = query;
         ensure_session_started(client, self.executor.as_ref());
@@ -431,12 +426,7 @@ impl NodusQueryHandler {
         ensure_session_started(client, self.executor.as_ref());
 
         let principal_id = principal_id_from_client(client);
-        let ctx = nodus_executor::ExecutionContext {
-            session_id: session_id.clone(),
-            principal_id,
-            active_roles: vec![],
-            authz_catalog_version: 1,
-        };
+        let ctx = execution_context(client, session_id.clone(), principal_id);
 
         // Producer: the (blocking) executor streams rows into the bounded channel.
         // The simple-query protocol always uses text format.

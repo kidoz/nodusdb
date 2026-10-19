@@ -499,7 +499,9 @@ fn privilege(
                 active_roles: vec![],
                 action,
                 resource: resource.clone(),
-                context: nodus_authz::AuthzContext { database_id: None },
+                context: nodus_authz::AuthzContext {
+                    database_id: session_env::with(|env| env.and_then(|env| env.database_id)),
+                },
             })
             .is_ok_and(|d| d.allowed)
     });

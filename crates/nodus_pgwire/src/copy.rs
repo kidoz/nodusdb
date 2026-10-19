@@ -19,7 +19,9 @@ use pgwire::messages::PgWireBackendMessage;
 use pgwire::messages::copy::{CopyData, CopyDone, CopyFail};
 use pgwire::messages::response::CommandComplete;
 
-use crate::client_meta::{mark_error_status, principal_id_from_client, session_id_from_client};
+use crate::client_meta::{
+    execution_context, mark_error_status, principal_id_from_client, session_id_from_client,
+};
 use crate::{METADATA_COPY_EXTENDED, METADATA_COPY_STMT};
 
 /// Upper bound on a single connection's buffered `COPY FROM STDIN` body. The
@@ -158,12 +160,7 @@ impl CopyHandler for NodusCopyHandler {
             .unwrap()
             .remove(&session_id)
             .unwrap_or_default();
-        let ctx = nodus_executor::ExecutionContext {
-            session_id: session_id.clone(),
-            principal_id: principal_id_from_client(client),
-            active_roles: vec![],
-            authz_catalog_version: 1,
-        };
+        let ctx = execution_context(client, session_id.clone(), principal_id_from_client(client));
 
         let executor = self.executor.clone();
         let ingested =

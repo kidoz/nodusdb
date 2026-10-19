@@ -38,6 +38,7 @@ pub(crate) fn session() -> (
         principal_id: admin.id,
         active_roles: vec![],
         authz_catalog_version: 1,
+        ..Default::default()
     };
     let notices = exec.clone();
     (

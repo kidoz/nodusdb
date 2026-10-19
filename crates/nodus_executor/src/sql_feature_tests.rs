@@ -205,6 +205,7 @@ fn grants_to_public_reach_every_principal() {
             principal_id,
             active_roles: vec![],
             authz_catalog_version: 1,
+            ..Default::default()
         };
         let mut statements = nodus_sql::parse_sql(statement)?;
         exec.execute_logical(&ctx, plan_statement(&statements.remove(0), &[])?)

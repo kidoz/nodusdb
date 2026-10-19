@@ -292,6 +292,7 @@ fn type_ddl_is_authorized() {
             principal_id: principal,
             active_roles: Vec::new(),
             authz_catalog_version: 1,
+            ..Default::default()
         };
         let mut statements = nodus_sql::parse_sql(sql)?;
         let plan = crate::plan_statement(&statements.remove(0), &[])?;

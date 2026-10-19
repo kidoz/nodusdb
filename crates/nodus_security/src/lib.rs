@@ -41,6 +41,7 @@ pub struct SessionInfo {
 
 struct SessionEntry {
     principal_id: PrincipalId,
+    database_id: Option<DatabaseId>,
     current_query: Option<String>,
     active_query: bool,
     started_at: DateTime<Utc>,
@@ -71,6 +72,7 @@ impl SessionRegistry {
             session.session_id.clone(),
             SessionEntry {
                 principal_id: session.principal_id,
+                database_id: session.database_id,
                 current_query: None,
                 active_query: false,
                 started_at: Utc::now(),
@@ -111,6 +113,12 @@ impl SessionRegistry {
     pub fn update_principal(&self, session_id: &str, principal_id: PrincipalId) {
         if let Some(e) = self.sessions.write().unwrap().get_mut(session_id) {
             e.principal_id = principal_id;
+        }
+    }
+
+    pub fn update_database(&self, session_id: &str, database_id: DatabaseId) {
+        if let Some(e) = self.sessions.write().unwrap().get_mut(session_id) {
+            e.database_id = Some(database_id);
         }
     }
 
@@ -342,6 +350,28 @@ impl PasswordAuthenticator {
         self.catalog
             .get_principal_by_name(username)
             .is_ok_and(|principal| !principal.attributes.can_login)
+    }
+
+    /// Resolves a startup database and verifies that a database-scoped
+    /// principal is used only in that database. Global principals have no
+    /// database restriction.
+    pub fn database_access(
+        &self,
+        principal_id: PrincipalId,
+        database: &str,
+    ) -> Result<DatabaseId, AuthError> {
+        let database = self
+            .catalog
+            .get_database(database)
+            .map_err(|_| AuthError::InvalidCredentials(database.to_string()))?;
+        let principal = self
+            .catalog
+            .get_principal_by_id(principal_id)
+            .map_err(|_| AuthError::InvalidCredentials(database.name.clone()))?;
+        if principal.database_id.is_some_and(|id| id != database.id) {
+            return Err(AuthError::InvalidCredentials(database.name));
+        }
+        Ok(database.id)
     }
 
     /// Issues a session for an already-authenticated user (e.g. after a SCRAM

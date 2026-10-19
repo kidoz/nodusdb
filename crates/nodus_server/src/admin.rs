@@ -1827,11 +1827,18 @@ async fn import_dump(
     // privileges and the executor audits it under their identity. Running as
     // superuser (as before) let any holder of the ManageBackups action execute
     // arbitrary catalog/data mutations and misattributed them to `nodus`.
+    let database_id = match state.catalog.get_database("default") {
+        Ok(database) => database.id,
+        Err(error) => {
+            return Json(json!({"error": format!("default database unavailable: {error}")}));
+        }
+    };
     let ctx = nodus_executor::ExecutionContext {
         session_id: format!("admin-import-{}", Uuid::new_v4()),
         principal_id,
         active_roles: vec![],
         authz_catalog_version: 1,
+        database_id: Some(database_id),
     };
     let opts = nodus_import::ImportOptions {
         batch_rows: query.batch_rows.unwrap_or(500).max(1),
@@ -1900,6 +1907,7 @@ mod import_tests {
             principal_id: admin.id,
             active_roles: vec![],
             authz_catalog_version: 1,
+            database_id: catalog.get_database("default").unwrap().id.into(),
         };
 
         let dump = "\

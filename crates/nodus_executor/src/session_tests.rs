@@ -36,6 +36,7 @@ fn sessions() -> (Arc<MemExecutor>, impl Fn(&str, &str) -> Result<QueryOutput>) 
             principal_id: admin.id,
             active_roles: vec![],
             authz_catalog_version: 1,
+            ..Default::default()
         };
         let mut statements = nodus_sql::parse_sql(sql)?;
         let plan = plan_statement(&statements.remove(0), &[])?;

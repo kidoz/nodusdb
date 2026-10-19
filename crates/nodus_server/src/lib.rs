@@ -42,7 +42,7 @@ use tokio_rustls::rustls::server::WebPkiClientVerifier;
 use tower_http::cors::{Any, CorsLayer};
 
 pub struct ServerHandle {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-utils"))]
     catalog: Arc<nodus_catalog::MemoryCatalog>,
     pub pgwire_addr: SocketAddr,
     pub http_addr: SocketAddr,
@@ -54,6 +54,13 @@ pub struct ServerHandle {
     pub background_tasks: Vec<JoinHandle<()>>,
     /// Shared registry of active client sessions (inspection + cancellation).
     pub registry: Arc<SessionRegistry>,
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+impl ServerHandle {
+    pub fn catalog(&self) -> Arc<nodus_catalog::MemoryCatalog> {
+        self.catalog.clone()
+    }
 }
 
 /// Reserved key under which the transaction clock's high-water mark is stored
@@ -1493,7 +1500,7 @@ pub async fn run_server_with_config(
     });
 
     Ok(ServerHandle {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-utils"))]
         catalog,
         pgwire_addr,
         http_addr,

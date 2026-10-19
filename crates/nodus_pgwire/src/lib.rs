@@ -17,6 +17,7 @@ pub use server::start_pgwire_server;
 
 pub(crate) const METADATA_NODUS_SESSION_ID: &str = "nodus_session_id";
 pub(crate) const METADATA_NODUS_PRINCIPAL_ID: &str = "nodus_principal_id";
+pub(crate) const METADATA_NODUS_DATABASE_ID: &str = "nodus_database_id";
 pub(crate) const METADATA_BACKEND_PID: &str = "nodus_backend_pid";
 pub(crate) const METADATA_BACKEND_SECRET: &str = "nodus_backend_secret";
 pub(crate) const METADATA_TX_STATUS: &str = "nodus_tx_status";

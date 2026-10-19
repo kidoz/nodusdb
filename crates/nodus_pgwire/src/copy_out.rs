@@ -9,7 +9,7 @@ use crate::{
 };
 use bytes::{Buf, BufMut, BytesMut};
 use futures_util::{Sink, SinkExt};
-use nodus_executor::{CopyOutputFormat, ExecutionContext, Executor};
+use nodus_executor::{CopyOutputFormat, Executor};
 use nodus_security::SessionRegistry;
 use pgwire::{
     api::{ClientInfo, portal::Format, results::FieldFormat},
@@ -122,12 +122,7 @@ where
         registry,
         session_id: &session_id,
     };
-    let ctx = ExecutionContext {
-        session_id: session_id.clone(),
-        principal_id: principal_id_from_client(client),
-        active_roles: vec![],
-        authz_catalog_version: 1,
-    };
+    let ctx = execution_context(client, session_id.clone(), principal_id_from_client(client));
     let wire_format = if format == CopyOutputFormat::Binary {
         Format::UnifiedBinary
     } else {

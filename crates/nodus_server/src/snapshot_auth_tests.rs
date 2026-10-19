@@ -34,7 +34,7 @@ async fn snapshot_catalog_replacement_keeps_bootstrap_login_and_respects_revocat
     .await
     .unwrap();
     let url = format!(
-        "host=127.0.0.1 port={} user=nodus password=snapshot-test-password dbname=nodus",
+        "host=127.0.0.1 port={} user=nodus password=snapshot-test-password dbname=default",
         server.pgwire_addr.port()
     );
     let (old_client, old_connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)

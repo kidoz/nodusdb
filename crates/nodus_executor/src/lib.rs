@@ -175,13 +175,16 @@ pub enum PhysicalPlan {
     },
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct ExecutionContext {
     pub session_id: String,
     /// Authenticated principal making the request; used for authorization.
     pub principal_id: PrincipalId,
     pub active_roles: Vec<RoleId>,
     pub authz_catalog_version: u64,
+    /// Database selected by the session. Database-scoped principals are valid
+    /// only in this database; global principals are valid everywhere.
+    pub database_id: Option<nodus_catalog::DatabaseId>,
 }
 
 #[derive(Debug, Clone)]
@@ -795,6 +798,7 @@ impl MemExecutor {
             statement_micros,
             backend_pid,
             session_id: ctx.session_id.clone(),
+            database_id: ctx.database_id,
             sequences: Some(self.sequences.clone()),
             catalog: Some(self.catalog_reader.clone()),
             types: Some(self.types_catalog.clone()),
@@ -1985,7 +1989,9 @@ impl MemExecutor {
             active_roles,
             action: action.clone(),
             resource: resource.clone(),
-            context: AuthzContext { database_id: None },
+            context: AuthzContext {
+                database_id: ctx.database_id,
+            },
         })?;
 
         // Record every authorization decision to the audit trail.

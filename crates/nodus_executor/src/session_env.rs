@@ -46,6 +46,8 @@ pub(crate) struct SessionEnv {
     pub(crate) backend_pid: i64,
     /// The session's id, which keys per-session state such as `currval`.
     pub(crate) session_id: String,
+    /// Database selected by the session, used to scope privilege checks.
+    pub(crate) database_id: Option<nodus_catalog::DatabaseId>,
     /// Sequence access for `nextval`, `setval`, `currval`, and `lastval`.
     pub(crate) sequences: Option<std::sync::Arc<crate::sequences::SequenceStore>>,
     /// The catalog, for functions that describe objects by OID

@@ -3,10 +3,10 @@
 //! and command-tag helpers.
 
 use crate::{
-    METADATA_NODUS_PRINCIPAL_ID, METADATA_NODUS_SESSION_ID, METADATA_SESSION_STARTED,
-    METADATA_TX_STATUS,
+    METADATA_NODUS_DATABASE_ID, METADATA_NODUS_PRINCIPAL_ID, METADATA_NODUS_SESSION_ID,
+    METADATA_SESSION_STARTED, METADATA_TX_STATUS,
 };
-use nodus_catalog::PrincipalId;
+use nodus_catalog::{DatabaseId, PrincipalId};
 use pgwire::api::ClientInfo;
 use pgwire::api::results::Tag;
 use pgwire::messages::response::TransactionStatus;
@@ -27,6 +27,28 @@ pub(crate) fn principal_id_from_client<C: ClientInfo>(client: &C) -> PrincipalId
         .and_then(|s| Uuid::parse_str(s).ok())
         .map(PrincipalId)
         .unwrap_or_default()
+}
+
+pub(crate) fn database_id_from_client<C: ClientInfo>(client: &C) -> Option<DatabaseId> {
+    client
+        .metadata()
+        .get(METADATA_NODUS_DATABASE_ID)
+        .and_then(|s| Uuid::parse_str(s).ok())
+        .map(DatabaseId)
+}
+
+pub(crate) fn execution_context<C: ClientInfo>(
+    client: &C,
+    session_id: String,
+    principal_id: PrincipalId,
+) -> nodus_executor::ExecutionContext {
+    nodus_executor::ExecutionContext {
+        session_id,
+        principal_id,
+        active_roles: vec![],
+        authz_catalog_version: 1,
+        database_id: database_id_from_client(client),
+    }
 }
 
 pub(crate) fn tx_status_from_client<C: ClientInfo>(client: &C) -> TransactionStatus {

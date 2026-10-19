@@ -14,6 +14,7 @@ fn test_ctx(admin_id: PrincipalId) -> ExecutionContext {
         principal_id: admin_id,
         active_roles: vec![],
         authz_catalog_version: 1,
+        ..Default::default()
     }
 }
 

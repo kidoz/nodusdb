@@ -103,6 +103,7 @@ impl MemExecutor {
             principal_id,
             active_roles: vec![],
             authz_catalog_version: 1,
+            ..Default::default()
         };
         let schema = crate::search_path::temp_schema_of(backend_pid(session_id));
         let names: Vec<String> = self

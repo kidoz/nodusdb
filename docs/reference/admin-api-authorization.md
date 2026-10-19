@@ -66,6 +66,20 @@ sessions also keep their original IDs and subsequent privileged operations must
 pass authorization against the current catalog. Reconnect after snapshot identity
 replacement. These rules do not change the separate admin-token mechanism.
 
+## Database-scoped SQL identities
+
+A SQL startup request names an existing database. If the startup packet omits
+one, NodusDB uses `default`; an unknown database is rejected. A principal with a
+`database_id` can authenticate only against that database, while a global
+principal is not restricted to one database.
+
+Authorization uses the database recorded at login. Database-scoped roles,
+grants, ownership, and system-wide `ALL` grants contribute only in their own
+database, including when they are inherited through another role. Global roles
+and `PUBLIC` grants remain applicable in every database. An existing session
+keeps its original principal and database identity; reconnect to pick up a
+replacement identity or a different database.
+
 ## Route privileges
 
 | Route prefix | Required action |

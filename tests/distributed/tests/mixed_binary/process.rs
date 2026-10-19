@@ -349,7 +349,7 @@ impl Matrix {
             Duration::from_secs(15),
             tokio_postgres::connect(
                 &format!(
-                    "host=127.0.0.1 port={} user=nodus password=nodus dbname=nodus",
+                    "host=127.0.0.1 port={} user=nodus password=nodus dbname=default",
                     self.nodes[index].pg
                 ),
                 tokio_postgres::NoTls,

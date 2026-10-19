@@ -14,6 +14,7 @@ fn ctx_for(principal: PrincipalId) -> ExecutionContext {
         principal_id: principal,
         active_roles: vec![],
         authz_catalog_version: 1,
+        ..Default::default()
     }
 }
 
@@ -994,12 +995,14 @@ fn transactions_are_isolated_per_session() {
         principal_id: admin.id,
         active_roles: vec![],
         authz_catalog_version: 1,
+        ..Default::default()
     };
     let ctx_b = ExecutionContext {
         session_id: "sess-b".into(),
         principal_id: admin.id,
         active_roles: vec![],
         authz_catalog_version: 1,
+        ..Default::default()
     };
 
     exec.execute_logical(

@@ -28,8 +28,8 @@ use pgwire::messages::startup::{Authentication, BackendKeyData, ParameterStatus,
 use crate::client_meta::*;
 use crate::server::ConnState;
 use crate::{
-    METADATA_BACKEND_PID, METADATA_BACKEND_SECRET, METADATA_NODUS_PRINCIPAL_ID,
-    METADATA_NODUS_SESSION_ID, METADATA_TX_STATUS,
+    METADATA_BACKEND_PID, METADATA_BACKEND_SECRET, METADATA_NODUS_DATABASE_ID,
+    METADATA_NODUS_PRINCIPAL_ID, METADATA_NODUS_SESSION_ID, METADATA_TX_STATUS,
 };
 
 const SCRAM_SHA_256: &str = "SCRAM-SHA-256";
@@ -313,11 +313,25 @@ impl StartupHandler for NodusStartupHandler {
                         .await?;
                     match self.authenticator.issue_session(&exchange.username) {
                         Ok(session) => {
+                            let login = LoginInfo::from_client_info(client);
+                            let database_name = login.database().unwrap_or("default").to_string();
+                            let database_id = match self
+                                .authenticator
+                                .database_access(session.principal_id, &database_name)
+                            {
+                                Ok(id) => id,
+                                Err(_) => return reject_for(client, &database_name).await,
+                            };
                             self.registry
                                 .update_principal(&session_id, session.principal_id);
+                            self.registry.update_database(&session_id, database_id);
                             client.metadata_mut().insert(
                                 METADATA_NODUS_PRINCIPAL_ID.to_string(),
                                 session.principal_id.to_string(),
+                            );
+                            client.metadata_mut().insert(
+                                METADATA_NODUS_DATABASE_ID.to_string(),
+                                database_id.to_string(),
                             );
                             finish_nodus_authentication(client, &self.param_provider).await?;
                         }

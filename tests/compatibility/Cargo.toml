@@ -14,6 +14,9 @@ workspace = true
 nodus_import = { path = "../../crates/nodus_import" }
 nodus_testkit = { path = "../../crates/nodus_testkit" }
 nodus_config = { path = "../../crates/nodus_config" }
+nodus_server = { path = "../../crates/nodus_server", features = ["test-utils"] }
+nodus_catalog = { path = "../../crates/nodus_catalog" }
+nodus_security = { path = "../../crates/nodus_security" }
 bytes.workspace = true
 chrono.workspace = true
 futures-util.workspace = true

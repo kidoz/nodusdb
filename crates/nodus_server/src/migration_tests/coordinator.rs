@@ -582,6 +582,7 @@ async fn sql_savepoints_preserve_rows_indexes_and_original_epoch() {
                 principal_id: principal,
                 active_roles: vec![],
                 authz_catalog_version: 1,
+                ..Default::default()
             };
             let stmt = nodus_sql::parse_sql(sql)?.remove(0);
             executor.execute_logical(&ctx, nodus_executor::plan_statement(&stmt, &[])?)

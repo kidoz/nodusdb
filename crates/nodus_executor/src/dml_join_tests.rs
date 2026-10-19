@@ -32,6 +32,7 @@ pub(crate) fn session() -> impl Fn(&str) -> Result<QueryOutput> {
         principal_id: admin.id,
         active_roles: vec![],
         authz_catalog_version: 1,
+        ..Default::default()
     };
     move |sql: &str| {
         let mut statements = nodus_sql::parse_sql(sql)?;

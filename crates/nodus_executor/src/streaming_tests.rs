@@ -90,6 +90,7 @@ fn ctx_for(principal: PrincipalId) -> ExecutionContext {
         principal_id: principal,
         active_roles: vec![],
         authz_catalog_version: 1,
+        ..Default::default()
     }
 }
 
