@@ -221,6 +221,86 @@ fn wal_archive_txn_index(
     result
 }
 
+async fn archive_closed_wal_segments(
+    dir_path: &std::path::Path,
+    backup: &BackupOrchestrator,
+    local_kv: &Arc<dyn nodus_storage_api::KvEngine>,
+    wal_key: Option<[u8; 32]>,
+) {
+    let _ = local_kv.flush();
+    let Ok(entries) = std::fs::read_dir(dir_path) else {
+        return;
+    };
+    let mut logs = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) == Some("log")
+            && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+            && let Ok(id) = stem.parse::<u64>()
+        {
+            logs.push((id, path));
+        }
+    }
+    logs.sort_by_key(|(id, _)| *id);
+    let Some(max_id) = logs.iter().map(|(id, _)| *id).max() else {
+        return;
+    };
+
+    let mut archived = Vec::new();
+    for (id, path) in logs {
+        if id >= max_id {
+            continue;
+        }
+        if let Ok(bytes) = std::fs::read(&path) {
+            let filename = format!("{}.log", id);
+            if let Ok((record_txn_ids, committed_txns, predecessor)) =
+                wal_archive_txn_index(&bytes, wal_key)
+            {
+                if backup
+                    .archive_wal_indexed(
+                        &filename,
+                        bytes::Bytes::from(bytes),
+                        record_txn_ids,
+                        committed_txns,
+                        predecessor,
+                    )
+                    .await
+                    .is_ok()
+                {
+                    archived.push((id, filename));
+                }
+            } else {
+                let _ = backup
+                    .archive_wal(&filename, bytes::Bytes::from(bytes))
+                    .await;
+            }
+        }
+    }
+
+    if archived.is_empty() {
+        return;
+    }
+    let retention = match backup.retention_view().await {
+        Ok(view) => Some(view),
+        Err(error) => {
+            tracing::warn!(%error, "backup repository scan failed; WAL cleanup denied this pass");
+            None
+        }
+    };
+    for (id, filename) in archived {
+        let cleanup_allowed = match &retention {
+            Some(view) => view
+                .wal_segment_cleanup_allowed(&filename)
+                .await
+                .unwrap_or(false),
+            None => false,
+        };
+        if cleanup_allowed && let Err(error) = local_kv.reclaim_archived_wal_segment(id) {
+            tracing::warn!(segment_id = id, %error, "archived WAL cleanup failed; retaining local segment");
+        }
+    }
+}
+
 /// Backoff for the cluster-join retry loop: exponential (250ms → cap 10s) with
 /// a deterministic per-node jitter so simultaneously-starting joiners don't
 /// retry in lockstep and hammer the seed node together.
@@ -1057,7 +1137,9 @@ pub async fn run_server_with_config(
         .allow_methods(Any)
         .allow_headers(Any);
 
-    // Background WAL archiver
+    // Background WAL archiver. A graceful shutdown runs one final flush/pass so
+    // the active segment is archived once writers have stopped; otherwise the
+    // last segment could exist only on the local node.
     let backup_clone = backup.clone();
     let data_dir_clone = config.storage.data_dir.clone();
     let local_kv_clone = local_kv.clone();
@@ -1065,96 +1147,27 @@ pub async fn run_server_with_config(
     let mut wal_shutdown = shutdown.clone();
     let wal_archiver_task = tokio::spawn(async move {
         if let Some(dir_path_str) = data_dir_clone {
-            let dir_path = std::path::Path::new(&dir_path_str);
+            let dir_path = std::path::PathBuf::from(dir_path_str);
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
             loop {
                 tokio::select! {
                     _ = ticker.tick() => {
-                        let _ = local_kv_clone.flush();
-                        if let Ok(entries) = std::fs::read_dir(dir_path) {
-                            let mut logs = Vec::new();
-                            for entry in entries.flatten() {
-                                let path = entry.path();
-                                if path.extension().and_then(|s| s.to_str()) == Some("log") {
-                                    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                                        if let Ok(id) = stem.parse::<u64>() {
-                                            logs.push((id, path));
-                                        }
-                                    }
-                                }
-                            }
-                            if !logs.is_empty() {
-                                let max_id = logs.iter().map(|(id, _)| *id).max().unwrap();
-                                // Phase 1: archive every closed segment.
-                                let mut archived = Vec::new();
-                                for (id, path) in logs {
-                                    if id >= max_id {
-                                        continue;
-                                    }
-                                    if let Ok(bytes) = std::fs::read(&path) {
-                                        let filename = format!("{}.log", id);
-                                        if let Ok((
-                                            record_txn_ids,
-                                            committed_txns,
-                                            predecessor,
-                                        )) = wal_archive_txn_index(&bytes, wal_key)
-                                        {
-                                            if backup_clone
-                                                .archive_wal_indexed(
-                                                    &filename,
-                                                    bytes::Bytes::from(bytes),
-                                                    record_txn_ids,
-                                                    committed_txns,
-                                                    predecessor,
-                                                )
-                                                .await
-                                                .is_ok()
-                                            {
-                                                archived.push((id, filename));
-                                            }
-                                        } else {
-                                            let _ = backup_clone
-                                                .archive_wal(
-                                                    &filename,
-                                                    bytes::Bytes::from(bytes),
-                                                )
-                                                .await;
-                                        }
-                                    }
-                                }
-                                // Phase 2: one repository scan serves every
-                                // cleanup decision in the pass. Scanning per
-                                // segment would cost K full scans per tick — a
-                                // quadratic request storm against object
-                                // stores. A failed scan fails closed: cleanup
-                                // is denied this pass, archiving already ran.
-                                if !archived.is_empty() {
-                                    let retention = match backup_clone.retention_view().await {
-                                        Ok(view) => Some(view),
-                                        Err(error) => {
-                                            tracing::warn!(%error, "backup repository scan failed; WAL cleanup denied this pass");
-                                            None
-                                        }
-                                    };
-                                    for (id, filename) in archived {
-                                        let cleanup_allowed = match &retention {
-                                            Some(view) => view
-                                                .wal_segment_cleanup_allowed(&filename)
-                                                .await
-                                                .unwrap_or(false),
-                                            None => false,
-                                        };
-                                        if cleanup_allowed {
-                                            if let Err(error) = local_kv_clone.reclaim_archived_wal_segment(id) {
-                                                tracing::warn!(segment_id = id, %error, "archived WAL cleanup failed; retaining local segment");
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                        archive_closed_wal_segments(
+                            &dir_path,
+                            &backup_clone,
+                            &local_kv_clone,
+                            wal_key,
+                        )
+                        .await;
                     }
                     _ = wal_shutdown.changed() => {
+                        archive_closed_wal_segments(
+                            &dir_path,
+                            &backup_clone,
+                            &local_kv_clone,
+                            wal_key,
+                        )
+                        .await;
                         break;
                     }
                 }

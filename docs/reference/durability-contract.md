@@ -56,7 +56,14 @@ is what the commit-acknowledgement ordering rests on.
 | Unreadable or missing SSTable during a read | `nodus_storage_lsm`: `unavailable_sstable_fails_reads_instead_of_hiding_committed_rows` |
 | Committed row and catalog survive a full restart | `tests/fault`: `committed_data_survives_a_restart` |
 | Rolled-back writes never visible, before or after restart | `tests/fault`: `rolled_back_writes_are_never_visible` |
-| Point-in-time restore replays archived WAL to a target time | `tests/integration`: `admin_backup_pitr_restore` |
+| Point-in-time restore replays archived WAL to a target time | `tests/integration`: `admin_backup_pitr_restore` and the persistent filesystem/S3 `restore_drill` scenarios |
+
+A graceful server shutdown runs a final storage flush and closed-segment archive
+pass before its archiver handle completes. This prevents acknowledged writes in
+the active segment from remaining local-only during an orderly recovery drill.
+It is not a distributed write-drain fence. An abrupt exit cannot perform that
+pass; PITR coverage after a crash is bounded by the last successfully archived
+segment.
 
 ## Local WAL archive cleanup
 
