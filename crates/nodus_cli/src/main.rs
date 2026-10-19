@@ -5,11 +5,26 @@ use reqwest::Client;
 #[derive(Parser)]
 #[command(author, version, about = "CLI for NodusDB", long_about = None)]
 struct Cli {
+    /// Bearer token for authenticated admin API requests. Falls back to
+    /// NODUS_ADMIN_TOKEN when omitted.
+    #[arg(long, global = true)]
+    token: Option<String>,
     #[command(subcommand)]
     command: Commands,
 }
 
 const DEFAULT_ADDR: &str = "http://127.0.0.1:8088";
+
+fn build_client(token: Option<&str>) -> anyhow::Result<Client> {
+    let mut headers = reqwest::header::HeaderMap::new();
+    if let Some(token) = token.filter(|token| !token.is_empty()) {
+        headers.insert(
+            reqwest::header::AUTHORIZATION,
+            reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))?,
+        );
+    }
+    Ok(Client::builder().default_headers(headers).build()?)
+}
 
 #[derive(Subcommand)]
 enum Commands {
@@ -321,7 +336,11 @@ enum SessionCmd {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let client = Client::new();
+    let token = cli
+        .token
+        .clone()
+        .or_else(|| std::env::var("NODUS_ADMIN_TOKEN").ok());
+    let client = build_client(token.as_deref())?;
 
     match &cli.command {
         Commands::Version => {
@@ -788,4 +807,41 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_global_token_option() {
+        let cli = Cli::try_parse_from(["nodusctl", "--token", "cli-secret", "health"]).unwrap();
+        assert_eq!(cli.token.as_deref(), Some("cli-secret"));
+    }
+
+    #[test]
+    fn client_rejects_invalid_header_values() {
+        assert!(build_client(Some("invalid\nvalue")).is_err());
+    }
+
+    #[tokio::test]
+    async fn bearer_token_authenticates_admin_requests() {
+        let mut config = nodus_config::NodusConfig::default();
+        config.admin.token = Some("cli-test-token".into());
+        let server = nodus_testkit::TestServer::start_with_config(config)
+            .await
+            .unwrap();
+        let url = format!("http://{}/api/v1/backups", server.http_addr);
+
+        let authorized = build_client(Some("cli-test-token"))
+            .unwrap()
+            .get(&url)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(authorized.status(), 200);
+
+        let unauthorized = build_client(None).unwrap().get(&url).send().await.unwrap();
+        assert_eq!(unauthorized.status(), 401);
+    }
 }

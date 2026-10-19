@@ -2156,7 +2156,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "nodus_config",
  "nodus_monitoring",
+ "nodus_testkit",
  "reqwest",
  "serde_json",
  "tokio",

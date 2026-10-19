@@ -14,5 +14,10 @@ tokio.workspace = true
 anyhow.workspace = true
 serde_json.workspace = true
 nodus_monitoring = { path = "../nodus_monitoring" }
+
+[dev-dependencies]
+nodus_testkit = { path = "../nodus_testkit" }
+nodus_config = { path = "../nodus_config" }
+
 [lints]
 workspace = true

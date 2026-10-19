@@ -143,14 +143,20 @@ audited like every other mutation.
   its membership. Drain a live node before decommissioning it; remove a node
   only when it is gone for good.
 
-`nodusctl cluster remove-node --id <N>` maps to the remove endpoint (like the
-rest of `nodus_cli`, it sends no `Authorization` header — see below).
+`nodusctl cluster remove-node --id <N>` maps to the remove endpoint.
 
 ## Client support
 
-`nodus_cli` sends no `Authorization` header. Its `/api/v1/` subcommands
-(`backup`, `import`, `shard`, `role`, `grant`, `session`, `audit`, `upgrade`,
-`node`, `queries`, `cluster`) therefore return `401 Unauthorized` against any
-server with an admin token configured. `nodus_cli health` works because
-`/healthz` is not part of the authorized surface. Use `curl` with an explicit
-header meanwhile.
+`nodusctl` accepts a bearer token through the global `--token` option or the
+`NODUS_ADMIN_TOKEN` environment variable. The token is sent as an
+`Authorization: Bearer ...` header on every HTTP request, including `/api/v1/`
+subcommands (`backup`, `import`, `shard`, `role`, `grant`, `session`, `audit`,
+`upgrade`, `node`, `queries`, `cluster`). If neither source is set, protected
+subcommands return `401 Unauthorized`. `nodusctl health` works without a token
+because `/healthz` is outside the authorized surface.
+
+```bash
+NODUS_ADMIN_TOKEN=nodus-dev-token nodusctl backup list
+# or, without placing the token in the process environment:
+nodusctl --token nodus-dev-token backup list
+```

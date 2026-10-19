@@ -58,10 +58,13 @@ Two query parameters control the run:
 | `on_error` | `continue` (default), `stop` | Whether a failing statement aborts the import. |
 | `batch_rows` | integer, default `500` | Rows folded into each synthesized `INSERT`. |
 
-> **`nodus_cli import` cannot authenticate.** The CLI sends no `Authorization`
-> header, so `nodus_cli import --file dump.sql` fails with `401 Unauthorized`
-> against any server that has admin auth configured. Use `curl` until the CLI
-> learns to pass credentials.
+The CLI sends the same bearer credential through its global token option or
+`NODUS_ADMIN_TOKEN`:
+
+```bash
+nodusctl --token nodus-dev-token import --file dump.sql
+NODUS_ADMIN_TOKEN=nodus-dev-token nodusctl import --file dump.sql
+```
 
 ## 3. Read the report
 
