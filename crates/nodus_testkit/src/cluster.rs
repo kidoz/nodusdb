@@ -8,15 +8,10 @@
 //! spawning OS subprocesses, and exercises the actual Raft network + join logic.
 //!
 //! Key detail: a node advertises its **HTTP address** for Raft, so the fixture
-//! reserves a concrete port per node up front and binds it (with `SO_REUSEADDR`,
-//! so a restart can reclaim it) — `raft_advertise_addr` must match the port the
-//! HTTP listener is actually bound to.
-//!
-//! Caveat: the Raft *log* is currently in-memory (`NodusRaftStore`), so a stopped
-//! node loses its consensus state; `restart` re-launches the process and reclaims
-//! its ports, but full log-durable rejoin awaits a persistent log store. The
-//! reliable, validated properties are **formation**, **replication**, and
-//! **quorum fault-tolerance**.
+//! binds each initial listener before launching any nodes and holds it until the
+//! corresponding server takes ownership. Restarts rebind the same ports with
+//! `SO_REUSEADDR`; `raft_advertise_addr` always matches the actual HTTP listener.
+//! Persistent data directories are retained across stop/restart.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -33,18 +28,9 @@ use tokio::sync::watch;
 /// and it authenticates the internal `/raft/...` ingress on the public listener.
 pub const ADMIN_TOKEN: &str = "cluster-test-token";
 
-/// Reserves a currently-free loopback port (bind ephemeral with `SO_REUSEADDR`,
-/// read the assigned port, release it). The node rebinds the same port with
-/// `SO_REUSEADDR`, so a restart can reclaim it even while it lingers in
-/// `TIME_WAIT`.
-fn reserve_port() -> Result<u16> {
-    let sock = TcpSocket::new_v4()?;
-    sock.set_reuseaddr(true)?;
-    sock.bind("127.0.0.1:0".parse().unwrap())?;
-    Ok(sock.local_addr()?.port())
-}
-
-/// Binds a listener on a specific loopback port with `SO_REUSEADDR`.
+/// Binds a listener on a specific loopback port with `SO_REUSEADDR`. Port zero
+/// asks the OS for a free port, which can be read from `local_addr` while the
+/// listener remains bound.
 fn bind_reuse(port: u16) -> Result<TcpListener> {
     let sock = TcpSocket::new_v4()?;
     sock.set_reuseaddr(true)?;
@@ -99,6 +85,15 @@ impl ClusterNode {
     async fn launch(&mut self) -> Result<()> {
         let pgwire_listener = bind_reuse(self.pgwire_port)?;
         let http_listener = bind_reuse(self.http_port)?;
+        self.launch_with_listeners(pgwire_listener, http_listener)
+            .await
+    }
+
+    async fn launch_with_listeners(
+        &mut self,
+        pgwire_listener: TcpListener,
+        http_listener: TcpListener,
+    ) -> Result<()> {
         let (shutdown_tx, shutdown_rx) = watch::channel(());
         let handle =
             run_server_with_config(pgwire_listener, http_listener, self.config(), shutdown_rx)
@@ -138,12 +133,16 @@ impl ClusterFixture {
         assert!(n >= 1, "a cluster needs at least one node");
         let http = reqwest::Client::new();
 
-        // Reserve all ports first so non-seed nodes can be told the seed's addr.
+        // Bind every initial listener before any server starts, so no other
+        // process can claim an assigned port before its node takes ownership.
         let mut nodes = Vec::with_capacity(n);
+        let mut listeners = Vec::with_capacity(n);
         let mut seed_http = None;
         for i in 0..n {
-            let http_port = reserve_port()?;
-            let pgwire_port = reserve_port()?;
+            let http_listener = bind_reuse(0)?;
+            let http_port = http_listener.local_addr()?.port();
+            let pgwire_listener = bind_reuse(0)?;
+            let pgwire_port = pgwire_listener.local_addr()?.port();
             if i == 0 {
                 seed_http = Some(format!("127.0.0.1:{http_port}"));
             }
@@ -158,6 +157,7 @@ impl ClusterFixture {
                 data_path,
                 running: None,
             });
+            listeners.push((pgwire_listener, http_listener));
         }
 
         let mut fixture = Self { nodes, http };
@@ -166,12 +166,18 @@ impl ClusterFixture {
         // after it has elected itself leader AND bootstrapped the catalog (the
         // `default` database/schema), so queries issued afterward see it. The
         // hardened join backoff tolerates the joiners racing this regardless.
-        fixture.nodes[0].launch().await?;
+        let (pgwire_listener, http_listener) = listeners.remove(0);
+        fixture.nodes[0]
+            .launch_with_listeners(pgwire_listener, http_listener)
+            .await?;
         if !fixture.wait_ready(0, Duration::from_secs(30)).await {
             anyhow::bail!("seed node did not become ready");
         }
         for i in 1..n {
-            fixture.nodes[i].launch().await?;
+            let (pgwire_listener, http_listener) = listeners.remove(0);
+            fixture.nodes[i]
+                .launch_with_listeners(pgwire_listener, http_listener)
+                .await?;
         }
 
         if !fixture
