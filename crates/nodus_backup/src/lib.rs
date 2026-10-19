@@ -1477,14 +1477,27 @@ impl BackupOrchestrator {
             .await
     }
 
+    async fn put_wal_object_without_overwrite(&self, key: &str, data: Bytes) -> Result<()> {
+        if self.repo.object_exists(key).await? {
+            let existing = self.repo.get_object(key, None).await?;
+            if existing.as_ref() != data.as_ref() {
+                anyhow::bail!(
+                    "archived WAL collision at {key}: refusing to overwrite different bytes; use an isolated repository prefix for a restored node"
+                );
+            }
+            return Ok(());
+        }
+        self.repo
+            .put_object(key, data, PutOptions::default())
+            .await
+            .map(|_| ())
+    }
+
     /// Archives a WAL segment.
     pub async fn archive_wal(&self, filename: &str, data: Bytes) -> Result<()> {
         self.sync_recovery_generation().await?;
         let key = wal_key(filename);
-        self.repo
-            .put_object(&key, data, PutOptions::default())
-            .await
-            .map(|_| ())
+        self.put_wal_object_without_overwrite(&key, data).await
     }
 
     pub async fn archive_wal_indexed(
@@ -1529,9 +1542,25 @@ impl BackupOrchestrator {
             upload_state: WalArchiveUploadState::Completed,
         };
 
-        self.repo
-            .put_object(&wal_object_key, data, PutOptions::default())
+        self.put_wal_object_without_overwrite(&wal_object_key, data)
             .await?;
+        self.publish_wal_archive_index(index).await
+    }
+
+    async fn publish_wal_archive_index(&self, index: WalArchiveIndex) -> Result<WalArchiveIndex> {
+        if self.repo.object_exists(&index.index_object_key).await? {
+            let body = self.repo.get_object(&index.index_object_key, None).await?;
+            let existing = serde_json::from_slice::<WalArchiveIndex>(&body)?;
+            let mut retry = index;
+            retry.archived_at = existing.archived_at;
+            if existing == retry {
+                return Ok(existing);
+            }
+            anyhow::bail!(
+                "archived WAL index collision at {}: refusing to overwrite different metadata; use an isolated repository prefix for a restored node",
+                existing.index_object_key
+            );
+        }
         self.put_wal_archive_index(&index).await?;
         Ok(index)
     }
@@ -2353,6 +2382,72 @@ mod tests {
         assert!(orch.wal_segment_cleanup_allowed("2.log").await.unwrap());
         assert!(orch.wal_segment_cleanup_allowed("3.log").await.unwrap());
         assert!(orch.wal_segment_cleanup_allowed("4.log").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn wal_archive_retry_is_idempotent_and_collision_fails_closed() {
+        let repo: Arc<dyn BackupRepository> = Arc::new(MemBackupRepository::new());
+        let orch = BackupOrchestrator::new(repo.clone());
+        let first = orch
+            .archive_wal_indexed(
+                "1.log",
+                Bytes::from("original"),
+                vec!["txn".into()],
+                vec![WalCommittedTxn {
+                    txn_id: "txn".into(),
+                    commit_ts: 5,
+                }],
+                None,
+            )
+            .await
+            .unwrap();
+        let retry = orch
+            .archive_wal_indexed(
+                "1.log",
+                Bytes::from("original"),
+                vec!["txn".into()],
+                vec![WalCommittedTxn {
+                    txn_id: "txn".into(),
+                    commit_ts: 5,
+                }],
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(retry, first);
+        assert!(
+            orch.archive_wal_indexed(
+                "1.log",
+                Bytes::from("different"),
+                vec!["txn".into()],
+                vec![WalCommittedTxn {
+                    txn_id: "txn".into(),
+                    commit_ts: 5,
+                }],
+                None,
+            )
+            .await
+            .is_err()
+        );
+        let archived = orch.get_archived_wals().await.unwrap();
+        assert_eq!(archived.len(), 1);
+        assert_eq!(archived[0].1, Bytes::from("original"));
+
+        orch.archive_wal("raw.log", Bytes::from("raw"))
+            .await
+            .unwrap();
+        orch.archive_wal("raw.log", Bytes::from("raw"))
+            .await
+            .unwrap();
+        assert!(
+            orch.archive_wal("raw.log", Bytes::from("changed"))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            repo.get_object("wal_archive/raw.log", None).await.unwrap(),
+            Bytes::from("raw")
+        );
     }
 
     /// A `MemBackupRepository` wrapper that counts `list_objects` calls, to
