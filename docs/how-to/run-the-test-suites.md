@@ -80,6 +80,38 @@ The fuzz targets live in their own workspace, so they are not built by
 just fuzz-check
 ```
 
+
+## Live infrastructure and restore drills
+
+The persistent filesystem restore drill needs no external service:
+
+```bash
+cargo test -p nodus_integration_tests --test restore_drill \
+  persistent_full_incremental_pitr_restore_drill --locked -- --nocapture
+```
+
+The `Live MinIO and OTLP recovery gates` CI job builds pinned official MinIO
+source releases, creates an isolated bucket, starts a pinned OpenTelemetry
+Collector, and runs these focused tests:
+
+```bash
+cargo test -p nodus_backup --locked \
+  s3_live_backup_verify_restore_delete_and_failures -- --nocapture
+cargo test -p nodus_telemetry --locked otlp_export_smoke -- --nocapture
+cargo test -p nodus_integration_tests --test restore_drill --locked \
+  s3_full_incremental_pitr_restore_drill -- --nocapture
+```
+
+Set the S3 and OTLP variables described in
+[back up and restore](back-up-and-restore.md#run-restore-drills) before running
+these locally. The tests print an explicit skip when their endpoint variable is
+absent; CI always supplies it. The Compose MinIO image can be built locally with
+`docker build -f deploy/docker/minio.Dockerfile -t nodus-minio:dev .` if you do
+not use the CI job's Go-based service setup.
+
+Restore drills write JSON recovery evidence and Prometheus textfile metrics under
+`target/restore-drill/`. CI uploads the S3 report even when the job fails.
+
 ## Running one test by name
 
 Any suite can be filtered. For example, the shard migration protocol tests:

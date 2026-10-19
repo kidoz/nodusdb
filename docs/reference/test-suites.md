@@ -15,6 +15,7 @@ Where tests live and what each place is for. For the commands, see
 | `tests/fault` | Crash, recovery, and fault-injection tests. | `just test-fault` |
 | `tests/distributed` | Real-TCP partition and distributed behaviour tests. | `just test-partition` |
 | `tests/fuzz` | Fuzz targets. A separate workspace, deliberately outside the main test flow. | `just fuzz-check` |
+| `deploy/docker/minio.Dockerfile` | Pinned MinIO source build, health endpoint, and non-root runtime used by Compose. | Live infrastructure CI job |
 | `crates/nodus_txn` (loom cfg) | Model-checked concurrency proofs for the transaction manager. | `just test-loom` |
 | `crates/nodus_storage_lsm/benches` | Criterion benchmarks for the storage engine. | `just bench` |
 

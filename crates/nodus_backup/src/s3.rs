@@ -168,13 +168,13 @@ impl BackupRepository for S3BackupRepository {
 mod tests {
     use super::*;
     use crate::BackupOrchestrator;
+    use nodus_storage_api::KvEngine;
     use std::sync::Arc;
 
     /// CI-runnable repository round-trip: drives the same `S3BackupRepository`
     /// put/get/list/delete code the S3 path uses, but over an in-memory object
-    /// store so no network or MinIO is required. This keeps the repository logic
-    /// (and the full backup → verify → restore orchestration) covered in CI; the
-    /// ignored test below still exercises the real S3 wire protocol on demand.
+    /// store so no network or MinIO is required. The environment-gated live test
+    /// below separately exercises the real S3 wire protocol.
     #[tokio::test]
     async fn s3_repository_round_trip_in_memory() {
         let store = Arc::new(object_store::memory::InMemory::new());
@@ -216,38 +216,93 @@ mod tests {
         assert_eq!(orch.restore(&manifest.backup_id).await.unwrap().len(), 1);
     }
 
-    /// End-to-end backup round-trip against a real MinIO/S3. Ignored by default;
-    /// run with a configured endpoint:
-    /// `NODUS_S3_ENDPOINT=http://127.0.0.1:9000 NODUS_S3_BUCKET=nodus \
-    ///  NODUS_S3_KEY=nodus NODUS_S3_SECRET=nodus-secret \
-    ///  cargo test -p nodus_backup -- --ignored`
+    /// Live S3/MinIO coverage is enabled explicitly by NODUS_S3_ENDPOINT. CI
+    /// supplies an isolated bucket; a unique prefix also isolates local runs that
+    /// share a development bucket.
     #[tokio::test]
-    #[ignore = "requires a running S3/MinIO endpoint"]
-    async fn s3_backup_round_trip() {
+    async fn s3_live_backup_verify_restore_delete_and_failures() {
+        let Ok(endpoint) = std::env::var("NODUS_S3_ENDPOINT") else {
+            eprintln!("skipping live S3 test: NODUS_S3_ENDPOINT is not set");
+            return;
+        };
         let cfg = S3Config {
-            endpoint: std::env::var("NODUS_S3_ENDPOINT").unwrap(),
-            bucket: std::env::var("NODUS_S3_BUCKET").unwrap(),
+            endpoint,
+            bucket: std::env::var("NODUS_S3_BUCKET")
+                .expect("NODUS_S3_BUCKET is required with NODUS_S3_ENDPOINT"),
             region: std::env::var("NODUS_S3_REGION").unwrap_or_else(|_| "us-east-1".into()),
-            access_key: std::env::var("NODUS_S3_KEY").unwrap(),
-            secret_key: std::env::var("NODUS_S3_SECRET").unwrap(),
+            access_key: std::env::var("NODUS_S3_KEY")
+                .expect("NODUS_S3_KEY is required with NODUS_S3_ENDPOINT"),
+            secret_key: std::env::var("NODUS_S3_SECRET")
+                .expect("NODUS_S3_SECRET is required with NODUS_S3_ENDPOINT"),
             path_style: true,
         };
-        let repo: Arc<dyn BackupRepository> = Arc::new(S3BackupRepository::new(cfg).unwrap());
-        let orch = BackupOrchestrator::new(repo);
+        let base = S3BackupRepository::new(cfg.clone()).unwrap();
+        let prefix = format!("live-test-{}", uuid::Uuid::new_v4());
+        let store = Arc::new(object_store::prefix::PrefixStore::new(base.store, prefix));
+        let repo: Arc<dyn BackupRepository> = Arc::new(S3BackupRepository::with_store(store));
+        let orch = BackupOrchestrator::new(repo.clone());
+
+        let dump = serde_json::to_vec(&serde_json::json!([
+            {"key": b"row".to_vec(), "value": b"value".to_vec(), "deleted": false, "version": 10},
+            {"key": b"deleted-row".to_vec(), "value": null, "deleted": true, "version": 11}
+        ]))
+        .unwrap();
         let manifest = orch
             .create_full_backup(
                 "cluster-1",
-                1,
+                11,
                 1,
                 1,
                 vec![crate::BackupObject {
-                    name: "catalog".into(),
-                    bytes: Bytes::from("data"),
+                    name: "kv_data.json".into(),
+                    bytes: Bytes::from(dump),
                 }],
             )
             .await
             .unwrap();
         orch.verify(&manifest.backup_id).await.unwrap();
-        assert_eq!(orch.restore(&manifest.backup_id).await.unwrap().len(), 1);
+
+        let restored = orch.restore(&manifest.backup_id).await.unwrap();
+        let kv = nodus_storage_mem::MemKvEngine::new();
+        let report = BackupOrchestrator::restore_backup_objects_to_kv(&restored, &kv).unwrap();
+        assert_eq!(report.base_kv_versions_restored, 2);
+        assert_eq!(
+            kv.get(b"row", u64::MAX).unwrap().as_deref(),
+            Some(b"value".as_slice())
+        );
+        assert!(kv.get(b"deleted-row", u64::MAX).unwrap().is_none());
+
+        let data_key = manifest.files[0].clone();
+        let original = repo.get_object(&data_key, None).await.unwrap();
+        repo.put_object(&data_key, Bytes::from("corrupt"), PutOptions::default())
+            .await
+            .unwrap();
+        assert!(orch.verify(&manifest.backup_id).await.is_err());
+        assert!(orch.restore(&manifest.backup_id).await.is_err());
+        repo.put_object(&data_key, original, PutOptions::default())
+            .await
+            .unwrap();
+        orch.verify(&manifest.backup_id).await.unwrap();
+
+        let unavailable = S3BackupRepository::new(S3Config {
+            endpoint: "http://127.0.0.1:9".into(),
+            ..cfg
+        })
+        .unwrap();
+        let unavailable_result = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            unavailable.object_exists("probe"),
+        )
+        .await
+        .expect("unavailable S3 endpoint did not fail within 30 seconds");
+        assert!(
+            unavailable_result.is_err(),
+            "transport failures must propagate instead of looking like object absence"
+        );
+
+        orch.delete_backup(&manifest.backup_id).await.unwrap();
+        assert!(orch.list_backups().await.unwrap().is_empty());
+        assert!(!repo.object_exists(&data_key).await.unwrap());
+        assert!(orch.verify(&manifest.backup_id).await.is_err());
     }
 }

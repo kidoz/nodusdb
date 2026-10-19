@@ -50,3 +50,92 @@ jobs:
       - run: npm ci
       - run: npm run build
       - run: npm run lint
+
+  infrastructure:
+    name: Live MinIO and OTLP recovery gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GOBIN: /tmp/nodus-go-bin-${{ github.run_id }}-${{ github.run_attempt }}
+      NODUS_OTLP_ENDPOINT: http://127.0.0.1:4318
+    services:
+      otel-collector:
+        image: otel/opentelemetry-collector:0.120.0@sha256:1daa4312b48312dbae2d543e67b77e897dd5d9c48e7651d1416cdb417026ad06
+        ports:
+          - 4318:4318
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.14'
+      - name: Install pinned MinIO source releases
+        # MinIO no longer publishes its community images; build the exact
+        # reviewed source commits instead of substituting another S3 service.
+        run: |
+          mkdir -p "$GOBIN"
+          go install github.com/minio/minio@9e49d5e7a648f00e26f2246f4dc28e6b07f8c84a
+          go install github.com/minio/mc@d6541ea280b73a834b64d4097e21f2be77676104
+      - name: Start MinIO and create an isolated bucket
+        env:
+          MINIO_ROOT_USER: nodus
+          MINIO_ROOT_PASSWORD: nodus-secret
+        run: |
+          "$GOBIN/minio" server "${{ runner.temp }}/minio-data" --address ":9000" --console-address ":9001" > "${{ runner.temp }}/minio.log" 2>&1 &
+          echo "$!" > "${{ runner.temp }}/minio.pid"
+          for attempt in {1..60}; do
+            if curl -fsS http://127.0.0.1:9000/minio/health/live; then
+              break
+            fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:9000/minio/health/live
+          "$GOBIN/mc" alias set nodus-test http://127.0.0.1:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD"
+          bucket="nodus-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          "$GOBIN/mc" mb --ignore-existing "nodus-test/${bucket}"
+          {
+            echo "NODUS_S3_ENDPOINT=http://127.0.0.1:9000"
+            echo "NODUS_S3_BUCKET=${bucket}"
+            echo "NODUS_S3_KEY=${MINIO_ROOT_USER}"
+            echo "NODUS_S3_SECRET=${MINIO_ROOT_PASSWORD}"
+            echo "NODUS_S3_REGION=us-east-1"
+            echo "AWS_ACCESS_KEY_ID=${MINIO_ROOT_USER}"
+            echo "AWS_SECRET_ACCESS_KEY=${MINIO_ROOT_PASSWORD}"
+            echo "AWS_REGION=us-east-1"
+            echo "AWS_ENDPOINT_URL=http://127.0.0.1:9000"
+            echo "AWS_ALLOW_HTTP=true"
+          } >> "$GITHUB_ENV"
+      - name: Test live S3 repository behavior
+        run: cargo test -p nodus_backup --locked s3_live_backup_verify_restore_delete_and_failures -- --nocapture
+      - name: Test live OTLP export
+        run: cargo test -p nodus_telemetry --locked otlp_export_smoke -- --nocapture
+      - name: Run live S3 full, incremental, and PITR restore drills
+        run: cargo test -p nodus_integration_tests --test restore_drill --locked s3_full_incremental_pitr_restore_drill -- --nocapture
+      - name: Validate Helm backup storage and drill alerts
+        run: |
+          docker run --rm -v "$GITHUB_WORKSPACE:/work:ro" -w /work alpine/helm:3.19.0@sha256:aef9b56f64e866207d9591d0abd8f6d767b36aadd12edf68f8a719716d9d29c9 lint deploy/helm/nodusdb
+          docker run --rm -v "$GITHUB_WORKSPACE:/work:ro" -w /work alpine/helm:3.19.0@sha256:aef9b56f64e866207d9591d0abd8f6d767b36aadd12edf68f8a719716d9d29c9 template nodus deploy/helm/nodusdb --set restoreDrillAlerts.enabled=true > /dev/null
+      - name: Build and smoke-test the Compose MinIO image
+        run: |
+          image="nodus-minio:${{ github.sha }}"
+          docker build -f deploy/docker/minio.Dockerfile -t "$image" .
+          container="$(docker run --rm -d -e MINIO_ROOT_USER=nodus -e MINIO_ROOT_PASSWORD=nodus-secret -p 127.0.0.1:19000:9000 "$image")"
+          trap 'docker rm -f "$container" >/dev/null 2>&1 || true' EXIT
+          for attempt in {1..60}; do
+            if curl -fsS http://127.0.0.1:19000/minio/health/live; then
+              break
+            fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:19000/minio/health/live
+          test "$(docker inspect --format '{{.Config.User}}' "$container")" = "10001"
+      - name: Upload recovery evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-infrastructure-recovery-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            target/restore-drill/s3.json
+            target/restore-drill/s3.prom
+            ${{ runner.temp }}/minio.log
+          if-no-files-found: warn
+          retention-days: 14

@@ -13,13 +13,23 @@ use opentelemetry_sdk::trace::SdkTracerProvider;
 
 const SERVICE: &str = "nodusd";
 
+fn traces_endpoint(endpoint: &str) -> String {
+    let endpoint = endpoint.trim_end_matches('/');
+    if endpoint.ends_with("/v1/traces") {
+        endpoint.to_string()
+    } else {
+        format!("{endpoint}/v1/traces")
+    }
+}
+
 /// Builds an OTLP (HTTP/protobuf) batch exporter to `endpoint` and installs it
-/// as the global tracer provider. Keep the returned provider alive for the
-/// process lifetime; spans are flushed on a background batch processor.
+/// as the global tracer provider. `endpoint` can be the collector base URL or a
+/// full `/v1/traces` URL. Keep the returned provider alive for the process
+/// lifetime; spans are flushed on a background batch processor.
 pub fn init_otlp(endpoint: &str) -> Result<SdkTracerProvider> {
     let exporter = opentelemetry_otlp::SpanExporter::builder()
         .with_http()
-        .with_endpoint(endpoint)
+        .with_endpoint(traces_endpoint(endpoint))
         .build()?;
     // opentelemetry_sdk's batch processor is thread-based and takes no runtime
     // argument.
@@ -42,6 +52,8 @@ mod tests {
     use opentelemetry::trace::TracerProvider as _;
     use opentelemetry_sdk::trace::InMemorySpanExporter;
 
+    static OTLP_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     #[test]
     fn span_is_exported_to_provider() {
         let exporter = InMemorySpanExporter::default();
@@ -57,6 +69,18 @@ mod tests {
         assert_eq!(spans[0].name.as_ref(), "unit-span");
     }
 
+    #[test]
+    fn trace_endpoint_accepts_base_and_full_urls() {
+        assert_eq!(
+            traces_endpoint("http://collector:4318"),
+            "http://collector:4318/v1/traces"
+        );
+        assert_eq!(
+            traces_endpoint("http://collector:4318/v1/traces/"),
+            "http://collector:4318/v1/traces"
+        );
+    }
+
     /// Verifies the OTLP/HTTP export network path end-to-end in CI by standing up
     /// a tiny in-process collector and asserting it actually receives the
     /// exported span batch — no external collector required.
@@ -69,18 +93,19 @@ mod tests {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        // A catch-all handler counts every POST the exporter makes (the path is
-        // `/v1/traces`, but matching anything keeps us robust to endpoint
-        // normalization).
+        let _guard = OTLP_TEST_LOCK.lock().await;
         let hits = Arc::new(AtomicUsize::new(0));
         let handler_hits = hits.clone();
-        let app = axum::Router::new().fallback(move || {
-            let hits = handler_hits.clone();
-            async move {
-                hits.fetch_add(1, Ordering::SeqCst);
-                axum::http::StatusCode::OK
-            }
-        });
+        let app = axum::Router::new().route(
+            "/v1/traces",
+            axum::routing::post(move || {
+                let hits = handler_hits.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    axum::http::StatusCode::OK
+                }
+            }),
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -91,9 +116,8 @@ mod tests {
         {
             let _span = start_span("otlp-span");
         }
-        let _ = provider.force_flush();
+        provider.force_flush().unwrap();
 
-        // The export batch is delivered on a background task; give it a moment.
         let mut received = false;
         for _ in 0..50 {
             if hits.load(Ordering::SeqCst) > 0 {
@@ -105,17 +129,21 @@ mod tests {
         assert!(received, "OTLP collector never received an export");
     }
 
-    /// Exercises real OTLP export against an external collector; ignored unless
-    /// one is reachable:
-    /// `NODUS_OTLP_ENDPOINT=http://127.0.0.1:4318 cargo test -p nodus_telemetry -- --ignored`
-    #[tokio::test]
-    #[ignore = "requires a running OTLP collector"]
+    /// Runs only when NODUS_OTLP_ENDPOINT names a real collector. Export errors
+    /// are asserted so a collector that rejects the batch fails the gate.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn otlp_export_smoke() {
-        let endpoint = std::env::var("NODUS_OTLP_ENDPOINT").unwrap();
+        let Ok(endpoint) = std::env::var("NODUS_OTLP_ENDPOINT") else {
+            eprintln!("skipping live OTLP test: NODUS_OTLP_ENDPOINT is not set");
+            return;
+        };
+        let _guard = OTLP_TEST_LOCK.lock().await;
         let provider = init_otlp(&endpoint).unwrap();
         {
-            let _span = start_span("otlp-span");
+            let _span = start_span("otlp-live-smoke");
         }
-        let _ = provider.force_flush();
+        provider
+            .force_flush()
+            .expect("live OTLP collector rejected the export");
     }
 }

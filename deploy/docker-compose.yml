@@ -22,7 +22,7 @@ services:
       - nodus-audit:/var/log/nodus
 
   prometheus:
-    image: prom/prometheus:latest
+    image: prom/prometheus:latest@sha256:efd719c99d83b060d9daefdcf00360461adf279f45ef5391f8d111892118753e
     ports:
       - "9090:9090"
     volumes:
@@ -32,7 +32,10 @@ services:
       - nodusd
 
   minio:
-    image: minio/minio:latest
+    build:
+      context: ..
+      dockerfile: deploy/docker/minio.Dockerfile
+    image: nodus-minio:dev
     command: server /data --console-address ":9001"
     ports:
       - "9000:9000"

@@ -31,7 +31,10 @@ docker compose -f deploy/docker-compose.yml up --build
 
 The Compose stack mounts `deploy/nodus.example.toml` into the container and
 overrides container bind addresses plus local-only test credentials through
-environment variables.
+environment variables. Its MinIO service builds the
+[official source release](https://github.com/minio/minio/releases/tag/RELEASE.2025-10-15T17-29-55Z)
+pinned in `deploy/docker/minio.Dockerfile`; no external MinIO image pull is
+required.
 
 ## Kubernetes (Helm)
 
