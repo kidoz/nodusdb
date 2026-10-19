@@ -1045,6 +1045,7 @@ pub async fn run_server_with_config(
             pgwire_authenticator,
             pgwire_slow_log,
             tls_acceptor,
+            config.tls.require_tls,
             pgwire_max_connections,
             pgwire_shutdown,
         )
@@ -1785,6 +1786,7 @@ mod tests {
             key_path: None,
             client_ca_path: None,
             require_client_auth: false,
+            require_tls: false,
         };
         assert!(load_tls_config(&cfg).is_err());
     }

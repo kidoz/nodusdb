@@ -48,6 +48,8 @@ tls:
   key: ""
   clientCa: ""
   requireClientAuth: false
+  # Reject plaintext PostgreSQL connections when TLS is enabled.
+  requireTls: true
 
 podDisruptionBudget:
   enabled: false

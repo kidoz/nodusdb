@@ -47,6 +47,8 @@ enabled = false
 # key_path = "./.local/nodus/tls/server.key"
 # client_ca_path = "./.local/nodus/tls/client-ca.crt"
 require_client_auth = false
+# Reject plaintext PostgreSQL connections when TLS is enabled.
+# require_tls = true
 
 [backup]
 repository_uri = "file://./.local/nodus/backups"

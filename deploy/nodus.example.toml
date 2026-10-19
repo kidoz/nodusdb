@@ -52,6 +52,8 @@ enabled = false
 # key_path = "/etc/nodus/tls/server.key"
 # client_ca_path = "/etc/nodus/tls/client-ca.crt"
 require_client_auth = false
+# Reject plaintext PostgreSQL connections when TLS is enabled.
+# require_tls = true
 
 [backup]
 # Required in production. Empty disables backups.

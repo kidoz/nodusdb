@@ -228,6 +228,9 @@ pub struct TlsConfig {
     pub client_ca_path: Option<String>,
     /// If true, clients must present a valid certificate signed by `client_ca_path`.
     pub require_client_auth: bool,
+    /// If true, PostgreSQL clients must negotiate TLS before startup; plaintext
+    /// connections are rejected. Requires `enabled = true`.
+    pub require_tls: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -291,6 +294,7 @@ impl Default for TlsConfig {
             key_path: None,
             client_ca_path: None,
             require_client_auth: false,
+            require_tls: false,
         }
     }
 }
@@ -364,6 +368,11 @@ impl NodusConfig {
         if self.tls.enabled && (self.tls.cert_path.is_none() || self.tls.key_path.is_none()) {
             return Err(ConfigError::Invalid(
                 "tls.enabled requires both cert_path and key_path".into(),
+            ));
+        }
+        if self.tls.require_tls && !self.tls.enabled {
+            return Err(ConfigError::Invalid(
+                "tls.require_tls requires tls.enabled = true".into(),
             ));
         }
         // Inter-node mTLS must run on its own listener: requiring client
@@ -492,6 +501,18 @@ mod tests {
             assert_eq!(cfg.server.pgwire_addr, "127.0.0.1:5432");
             Ok(())
         });
+    }
+
+    #[test]
+    fn require_tls_requires_tls_to_be_enabled() {
+        let mut cfg = NodusConfig::default();
+        cfg.tls.require_tls = true;
+        assert!(cfg.validate().is_err());
+
+        cfg.tls.enabled = true;
+        cfg.tls.cert_path = Some("server.crt".into());
+        cfg.tls.key_path = Some("server.key".into());
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]

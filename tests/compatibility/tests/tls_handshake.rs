@@ -54,15 +54,20 @@ fn generate_cert() -> CertFixture {
 }
 
 /// Starts a TestServer with TLS terminated using the fixture's cert/key.
-async fn start_tls_server(fixture: &CertFixture) -> TestServer {
+async fn start_tls_server_with_require(fixture: &CertFixture, require_tls: bool) -> TestServer {
     let mut config = nodus_config::NodusConfig::default();
     config.admin.password = Some("nodus".into());
     config.tls.enabled = true;
     config.tls.cert_path = Some(fixture.cert_path.to_string_lossy().into_owned());
     config.tls.key_path = Some(fixture.key_path.to_string_lossy().into_owned());
+    config.tls.require_tls = require_tls;
     TestServer::start_with_config(config)
         .await
         .expect("server starts with TLS")
+}
+
+async fn start_tls_server(fixture: &CertFixture) -> TestServer {
+    start_tls_server_with_require(fixture, false).await
 }
 
 /// Builds a rustls client connector that trusts exactly the given cert.
@@ -91,7 +96,7 @@ fn conn_str(server: &TestServer, sslmode: &str) -> String {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_tls_handshake_and_query_round_trip() {
     let fixture = generate_cert();
-    let server = start_tls_server(&fixture).await;
+    let server = start_tls_server_with_require(&fixture, true).await;
     let tls = tls_connector_trusting(&fixture.cert_der);
 
     let (client, connection) = tokio_postgres::connect(&conn_str(&server, "require"), tls)
@@ -115,7 +120,7 @@ async fn test_tls_handshake_and_query_round_trip() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_tls_handshake_rejects_untrusted_cert() {
     let fixture = generate_cert();
-    let server = start_tls_server(&fixture).await;
+    let server = start_tls_server_with_require(&fixture, true).await;
 
     // Trust an unrelated cert, not the server's.
     let other = generate_cert();
@@ -155,4 +160,18 @@ async fn test_tls_enabled_server_still_accepts_plaintext() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     panic!("plaintext connection to TLS-enabled server did not succeed");
+}
+
+/// When `tls.require_tls` is enabled, the same listener refuses a plaintext
+/// startup instead of allowing the client to downgrade.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_require_tls_rejects_plaintext() {
+    let fixture = generate_cert();
+    let server = start_tls_server_with_require(&fixture, true).await;
+
+    let result = tokio_postgres::connect(&conn_str(&server, "disable"), NoTls).await;
+    assert!(
+        result.is_err(),
+        "plaintext startup must be rejected when TLS is required"
+    );
 }

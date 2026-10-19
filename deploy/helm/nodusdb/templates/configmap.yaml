@@ -29,6 +29,7 @@ data:
     client_ca_path = "/etc/nodus/tls/client-ca.crt"
     {{ end }}
     require_client_auth = {{ .Values.tls.requireClientAuth }}
+    require_tls = {{ .Values.tls.requireTls }}
     {{ end }}
 
     [backup]

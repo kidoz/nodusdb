@@ -22,7 +22,7 @@ use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
 use pgwire::messages::cancel::CancelRequest;
 use pgwire::messages::startup::SecretKey;
 use pgwire::tokio::process_socket;
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tracing::{error, info, warn};
 
 use crate::NodusQueryHandler;
@@ -126,6 +126,40 @@ fn secret_key_to_i32(key: &SecretKey) -> i32 {
     }
 }
 
+const SSL_REQUEST_PACKET: [u8; 8] = [0, 0, 0, 8, 4, 210, 22, 47];
+
+async fn ensure_ssl_request(socket: &TcpStream) -> std::io::Result<()> {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let mut packet = [0u8; 8];
+            let read = socket.peek(&mut packet).await?;
+            if read == packet.len() {
+                if packet == SSL_REQUEST_PACKET {
+                    return Ok(());
+                }
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "plaintext PostgreSQL startup rejected because TLS is required",
+                ));
+            }
+            if read == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "connection closed before PostgreSQL SSL negotiation",
+                ));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "timed out waiting for PostgreSQL SSL negotiation",
+        )
+    })?
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn start_pgwire_server(
     listener: TcpListener,
@@ -135,9 +169,14 @@ pub async fn start_pgwire_server(
     authenticator: Arc<PasswordAuthenticator>,
     slow_log: Arc<nodus_monitoring::SlowQueryLog>,
     tls: Option<Arc<tokio_rustls::TlsAcceptor>>,
+    require_tls: bool,
     max_connections: usize,
     mut shutdown: tokio::sync::watch::Receiver<()>,
 ) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !require_tls || tls.is_some(),
+        "require_tls needs a configured TLS acceptor"
+    );
     let mut param_provider = DefaultServerParameterProvider::default();
     param_provider.server_version = "18.0".to_string();
     let param_provider = Arc::new(param_provider);
@@ -166,9 +205,10 @@ pub async fn start_pgwire_server(
     let conn_limiter = Arc::new(tokio::sync::Semaphore::new(max_connections));
 
     info!(
-        "PGWire server listening on {} (tls: {}, max_connections: {})",
+        "PGWire server listening on {} (tls: {}, require_tls: {}, max_connections: {})",
         listener.local_addr()?,
         tls.is_some(),
+        require_tls,
         max_connections,
     );
 
@@ -198,6 +238,12 @@ pub async fn start_pgwire_server(
                         tokio::spawn(async move {
                             // Held for the connection's lifetime; a slot frees on drop.
                             let _permit = permit;
+                            if require_tls
+                                && let Err(error) = ensure_ssl_request(&socket).await
+                            {
+                                warn!(%peer, %error, "rejecting PostgreSQL connection before TLS negotiation");
+                                return;
+                            }
                             metrics.pgwire_connections_total.inc();
                             metrics.active_sessions.inc();
 
