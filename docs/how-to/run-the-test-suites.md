@@ -71,6 +71,23 @@ revisions and checks upgrade, snapshot, admission and rollback behavior. It is
 ignored by ordinary workspace tests. Its diagnostic mode records known blockers
 and continues with explicit workarounds; blockers still make the gate fail.
 
+## Frontend and production container
+
+Install the locked frontend dependencies, then run the component tests and
+static checks:
+
+```bash
+cd frontend
+npm ci
+npm run format:check
+npm test
+npm run lint
+npm run build
+npm run build-storybook
+npm audit --audit-level=high
+npm audit --omit=dev --audit-level=high
+```
+
 From the repository root, build and smoke-test the production image, including
 SQL and the packaged console assets:
 

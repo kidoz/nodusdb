@@ -1,4 +1,4 @@
-import { useState } from "react"
+import { useState } from 'react'
 
 type PermissionExplorerProps = {
   principalPlaceholder?: string
@@ -11,15 +11,15 @@ type Explanation = {
   steps: string[]
 }
 
-const ACTIONS = ["SELECT", "INSERT", "UPDATE", "DELETE", "CREATE_TABLE"]
+const ACTIONS = ['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'CREATE_TABLE']
 
 export function PermissionExplorer({
-  principalPlaceholder = "Principal id (uuid)",
+  principalPlaceholder = 'Principal id (uuid)',
   resourcePlaceholder = "Table, e.g. 'users'",
-  apiBase = "http://127.0.0.1:8088",
+  apiBase = 'http://127.0.0.1:8088',
 }: PermissionExplorerProps) {
-  const [principal, setPrincipal] = useState("")
-  const [resource, setResource] = useState("")
+  const [principal, setPrincipal] = useState('')
+  const [resource, setResource] = useState('')
   const [action, setAction] = useState(ACTIONS[0])
   const [result, setResult] = useState<Explanation | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -32,12 +32,14 @@ export function PermissionExplorer({
     setResult(null)
     try {
       const params = new URLSearchParams({ principal, action })
-      if (resource.trim()) params.set("table", resource.trim())
-      const res = await fetch(`${apiBase}/api/v1/authz/explain?${params.toString()}`)
+      if (resource.trim()) params.set('table', resource.trim())
+      const res = await fetch(
+        `${apiBase}/api/v1/authz/explain?${params.toString()}`,
+      )
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
       setResult((await res.json()) as Explanation)
     } catch (err) {
-      setError(err instanceof Error ? err.message : "request failed")
+      setError(err instanceof Error ? err.message : 'request failed')
     } finally {
       setLoading(false)
     }
@@ -79,17 +81,17 @@ export function PermissionExplorer({
           />
         </label>
         <button type="submit" disabled={loading}>
-          {loading ? "Checking…" : "Check access"}
+          {loading ? 'Checking…' : 'Check access'}
         </button>
       </form>
       <div className="permission-result">
         {error && <span className="permission-error">Error: {error}</span>}
         {!error &&
           !result &&
-          "Enter a principal and resource to evaluate the authorization graph."}
+          'Enter a principal and resource to evaluate the authorization graph.'}
         {result && (
           <div>
-            <strong>{result.is_allowed ? "ALLOW" : "DENY"}</strong>
+            <strong>{result.is_allowed ? 'ALLOW' : 'DENY'}</strong>
             <ol>
               {result.steps.map((step, i) => (
                 <li key={i}>{step}</li>

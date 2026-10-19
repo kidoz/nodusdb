@@ -35,7 +35,7 @@ jobs:
         run: cargo bench --no-run -p nodus_storage_lsm
 
   frontend:
-    name: Frontend build and lint
+    name: Frontend build, lint, test, and audit
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -48,8 +48,13 @@ jobs:
           cache: npm
           cache-dependency-path: frontend/package-lock.json
       - run: npm ci
+      - run: npm run format:check
+      - run: npm test
       - run: npm run build
       - run: npm run lint
+      - run: npm run build-storybook
+      - run: npm audit --audit-level=high
+      - run: npm audit --omit=dev --audit-level=high
 
   container:
     name: Production container smoke
