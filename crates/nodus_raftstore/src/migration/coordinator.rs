@@ -1,10 +1,12 @@
 //! Version 2 coordinator journal. Acknowledgements are persisted separately
 //! from RPC completion; recovery never infers success from a missing response.
 pub mod driver;
+pub mod v3;
 
 use super::*;
 use nodus_meta::{MetaStore, ShardMap, ShardMapNotFound};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 pub const JOURNAL_PREFIX: &[u8] = b"\x01migration/v2/table/";
 
@@ -144,6 +146,87 @@ fn save(kv: &dyn KvEngine, record: &RecordV2, index: u64) -> Result<()> {
     write_version(kv, &key, record, index, 2)
 }
 
+/// Participant-level cancellation seal, shared by the V2 and V3 journals: even
+/// a never-acquired source is advanced and opened, so delayed Acquire RPCs of
+/// the cancelled operation are permanently stale. Pending transactions may
+/// delay the seal.
+pub(super) fn apply_cancel_participant(
+    kv: &dyn KvEngine,
+    operation: Uuid,
+    expected_epoch: u64,
+    index: u64,
+    is_meta: bool,
+) -> Result<ShardResponse> {
+    clean_control_intent(kv, FENCE_KEY, index)?;
+    let Some(epoch) = expected_epoch.checked_add(1) else {
+        return Ok(reject("epoch exhausted"));
+    };
+    let current = read_fence(kv)?;
+    if let Some(f) = &current {
+        if f.epoch > epoch {
+            return Ok(accepted());
+        } // the old acquire is permanently stale
+        if f.epoch == epoch && f.operation_id != operation {
+            return Ok(accepted());
+        }
+        if f.operation_id == operation && f.epoch == epoch {
+            if !f.closed {
+                return Ok(accepted());
+            }
+            return apply_control(
+                kv,
+                &MigrationCommandV1::Release {
+                    operation_id: operation,
+                    epoch,
+                },
+                index,
+                is_meta,
+            );
+        }
+        if f.closed {
+            return Ok(reject("another operation owns the source"));
+        }
+    }
+    if current.as_ref().map_or(0, |f| f.epoch) != expected_epoch {
+        return Ok(reject("unexpected cancellation epoch"));
+    }
+    if !quiescent(kv, is_meta)? {
+        return Ok(reject("pending transactions prevent cancellation seal"));
+    }
+    write(
+        kv,
+        FENCE_KEY,
+        &ParticipantFence {
+            operation_id: operation,
+            epoch,
+            closed: false,
+        },
+        index,
+    )?;
+    Ok(accepted())
+}
+
+/// Validates complete source coverage at apply — meta first and every row and
+/// secondary-index group of the expected map — not just descriptor IDs. The
+/// metadata store is consulted at apply, so a stale planner cannot pass a
+/// purely local check.
+pub(super) fn coverage_matches(
+    migration: &MigrationPlan,
+    expected_map: &Option<ShardMap>,
+    meta: &Arc<dyn MetaStore>,
+) -> Result<bool> {
+    use nodus_sharding::ShardRouter;
+    nodus_sharding::CatalogShardRouter::new(meta.clone()).snapshot(migration.table_id)?;
+    let mut expected = BTreeSet::from(["shard-meta".to_string()]); // includes current secondary index namespace
+    if let Some(map) = expected_map {
+        expected.extend(map.shards.iter().map(|s| format!("shard-{}", s.id)));
+    }
+    Ok(
+        migration.sources.first().map(String::as_str) == Some("shard-meta")
+            && expected == migration.sources.iter().cloned().collect(),
+    )
+}
+
 pub(super) fn apply_v2(
     kv: &dyn KvEngine,
     command: &CommandV2,
@@ -155,53 +238,7 @@ pub(super) fn apply_v2(
         expected_epoch,
     } = command
     {
-        clean_control_intent(kv, FENCE_KEY, index)?;
-        let Some(epoch) = expected_epoch.checked_add(1) else {
-            return Ok(reject("epoch exhausted"));
-        };
-        let current = read_fence(kv)?;
-        if let Some(f) = &current {
-            if f.epoch > epoch {
-                return Ok(accepted());
-            } // the old acquire is permanently stale
-            if f.epoch == epoch && f.operation_id != *operation {
-                return Ok(accepted());
-            }
-            if f.operation_id == *operation && f.epoch == epoch {
-                if !f.closed {
-                    return Ok(accepted());
-                }
-                return apply_control(
-                    kv,
-                    &MigrationCommandV1::Release {
-                        operation_id: *operation,
-                        epoch,
-                    },
-                    index,
-                    meta.is_some(),
-                );
-            }
-            if f.closed {
-                return Ok(reject("another operation owns the source"));
-            }
-        }
-        if current.as_ref().map_or(0, |f| f.epoch) != *expected_epoch {
-            return Ok(reject("unexpected cancellation epoch"));
-        }
-        if !quiescent(kv, meta.is_some())? {
-            return Ok(reject("pending transactions prevent cancellation seal"));
-        }
-        write(
-            kv,
-            FENCE_KEY,
-            &ParticipantFence {
-                operation_id: *operation,
-                epoch,
-                closed: false,
-            },
-            index,
-        )?;
-        return Ok(accepted());
+        return apply_cancel_participant(kv, *operation, *expected_epoch, index, meta.is_some());
     }
     let Some(meta) = meta else {
         return Ok(reject("coordinator journal belongs to the meta group"));
@@ -244,20 +281,17 @@ pub(super) fn apply_v2(
                 "V1 journal requires explicit reconciliation before V2 planning",
             ));
         }
+        if let Some(record) = v3::read_record_v3(kv, table)?
+            && !matches!(record.phase, v3::PhaseV3::Done | v3::PhaseV3::Cancelled)
+        {
+            return Ok(reject("V3 journal prevents V2 planning"));
+        }
         if !routing_matches(plan, meta.as_ref())? {
             return Ok(reject("source routing no longer matches the plan"));
         }
         // Validate complete coverage, not just descriptor IDs. Metadata stores
         // are consulted at apply, so a stale planner cannot pass a local check.
-        use nodus_sharding::ShardRouter;
-        nodus_sharding::CatalogShardRouter::new(meta.clone()).snapshot(table)?;
-        let mut expected = BTreeSet::from(["shard-meta".to_string()]); // includes current secondary index namespace
-        if let Some(map) = &plan.expected_map {
-            expected.extend(map.shards.iter().map(|s| format!("shard-{}", s.id)));
-        }
-        if p.sources.first().map(String::as_str) != Some("shard-meta")
-            || expected != p.sources.iter().cloned().collect()
-        {
+        if !coverage_matches(p, &plan.expected_map, meta)? {
             return Ok(reject("plan does not cover every row/index source group"));
         }
         save(

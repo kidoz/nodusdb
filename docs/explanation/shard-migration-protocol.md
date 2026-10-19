@@ -4,7 +4,9 @@
 paths are implemented and tested in isolated fixtures. Public initialization,
 split, merge, and rebalance remain disabled. Production SQL submission and
 internal HTTP client-write ingress reject the new command variants; there is no
-runtime switch to bypass verified cluster compatibility.
+runtime switch to bypass verified cluster compatibility. The activation design
+below is the agreed target; nothing in it is implemented yet unless a section
+says so.
 
 ## Coordinator journal
 
@@ -222,3 +224,150 @@ are implemented with the documented limits. Destination
 readiness, durable copy checkpoints, data validation, conditional map/placement
 publication, and source cleanup are not implemented by this pre-copy slice.
 Public shard mutations stay disabled until those conditions are satisfied.
+
+## Activation design (target, not implemented)
+
+This section defines how the dormant protocol becomes a complete, safe shard
+migration feature. It is the agreed design; the implementation lands behind the
+existing fences and each operation is enabled only after its fault matrix
+passes. The design uses the durable [upgrade authority](upgrade-authority.md)
+for activation; the legacy in-memory `nodus_upgrade` model never authorizes
+persisted or network format changes.
+
+### Version and command matrix
+
+Activation introduces a third journal envelope and a third cluster-compatibility
+level. Old binaries fail closed on both.
+
+| Record / surface | Version | Old-reader behavior |
+| --- | --- | --- |
+| V1 journal `\x01migration/v1/table/{id}`, participant fence `\x01migration/v1/fence` | envelope 1 | readable by all current binaries |
+| V2 journal `\x01migration/v2/table/{id}` (pre-copy fencing) | envelope 2 | decode bails on non-2; V1 journal blocks V2 planning and vice versa |
+| V3 journal `\x01migration/v3/table/{id}` (full copy/cutover phases) | envelope 3 | decode bails on non-3; a V1/V2 journal must be explicitly reconciled to completion or cancellation before V3 planning |
+| 2PC decision `\0txn2pc\0{txn}` | legacy JSON or envelope 2 | legacy bytes still decode; unknown versions stop recovery |
+| Routing `meta:shard_map:*`, `meta:shard_placements` | envelope 1 | unknown future versions are a hard error; conditional publication compares the expected envelope-1 content |
+| Upgrade authority `\x01upgrade/v1/state` | envelope 1, `cluster_version` 3 domain | `decode` hard-errors on unknown version or cluster level; additive capability fields use serde defaults so old readers persist identical records |
+
+Cluster-compatibility levels and what they unlock:
+
+| `cluster_version` | Target | Unlocks |
+| --- | --- | --- |
+| 1 | (initial) | existing formats only; all migration ingress rejected |
+| 2 | `snapshot-v2` | NSNP v2 snapshot writer (existing) |
+| 3 | `migration-v3` | V3 journal writes, epoch-aware SQL commands, authenticated V2 leader forwarding, and the per-operation enablement ladder below |
+
+`CapabilityV1` gains an optional `migration_version` report field (serde
+default, like `admission_version`). Finalization to level 3 requires a fresh
+report from every voter and learner with `migration_version >= 3`, the
+membership freeze, and the existing preflight: drained intents, no undecided
+2PC records, and no in-flight migration journals. Post-finalization membership
+changes continue through the admission ledger; an admitted member must report
+`migration_version >= 3` before promotion.
+
+### Per-operation enablement ladder
+
+The blanket 501 on `POST /api/v1/shards/{table}/{init|split|merge|rebalance}`
+is retired one operation at a time, in this order, each only after its fault
+matrix (below) passes on a finalized level-3 fixture:
+
+1. **init** — empty-table initialization. Even an empty table races concurrent
+   INSERTs, so init plans through the V3 journal (meta fence first) and
+   publishes the map conditionally; it simply has no copy phase.
+2. **split** — one source range into two children.
+3. **merge** — two adjacent sources into one child.
+4. **rebalance / move** — placement changes with cross-node data transfer.
+
+Each operation remains authenticated, authorized (`ManageShards`), and audited
+exactly as the fenced endpoints are today, including the audit of denied
+attempts before activation. Until level 3 finalizes, every behavior stays as
+documented in the dormant sections above: admin 501, router submission
+rejection, and HTTP ingress 501.
+
+### V3 journal phases and acknowledgement boundaries
+
+The V3 journal extends the V2 fencing state machine. Every transition is a Raft
+apply on the meta group with operation, phase, routing, and epoch revalidation;
+every participant interaction persists its acknowledgement separately before
+the phase can advance. Routing drift at any check requests cancellation rather
+than completing.
+
+`Planned → Fencing → Fenced` — as implemented for V2 (meta first, complete
+source coverage, quiescence including prepared transactions and durable 2PC
+decisions).
+
+`Fenced → Preparing → Copying → Validating → Publishing → Completing → Done` —
+the new copy/cutover spine:
+
+- **Preparing**: destination groups are formed replicated (placement durable in
+  the meta group first), and the destination clock is reserved above every
+  source's visible committed timestamp. The acknowledgement boundary is the
+  destination group reporting a durable, serving replica set.
+- **Copying**: a range-scoped snapshot plus tail writes move the exact key
+  multiset at a protected read timestamp; durable copy checkpoints in the
+  journal bound resume so a coordinator restart continues from the last
+  checkpoint instead of restarting the copy. GC is blocked below the protected
+  timestamp for the duration (reader/backup retention coordination).
+- **Validating**: destination and source key/version multisets are compared
+  exactly (per-range counts and versioned digests); a mismatch cancels, never
+  publishes.
+- **Publishing**: the shard map and placements flip by conditional apply —
+  the apply compares the expected current map content and journal phase and
+  fails closed on any drift. Once the publication commits, cancellation is no
+  longer possible; the operation can only complete.
+- **Completing**: residual writers observe the new map (fences open on the new
+  epoch), and every participant acknowledges the cutover.
+- **Done**: the source groups are decommissioned and their ranges purged —
+  only after the destination data and the replicated routing decision are both
+  durable. Source removal is journaled like every other step.
+
+`Cancelling → Cancelled` — reachable from every phase before `Publishing`
+commits, addressing every source including ones whose acquire/ack was lost;
+sealing semantics are the V2 ones (a cancelled source's delayed acquires are
+permanently stale; a newer operation at a higher epoch is untouched). A
+cancelled operation leaves destination groups to be removed as part of
+cancellation cleanup, journaled the same way.
+
+Crash and recovery rules follow the existing coordinator invariants: the
+journal and acknowledgements are durable before any external effect is trusted;
+`resume` after a meta-leader ReadIndex barrier advances at most one bounded
+step per call; a timeout is an uncertain outcome retried from persisted state;
+orphan and uncertain 2PC outcomes are resolved (never inferred) before the
+affected participant's epoch can advance. A bounded journal-discovery worker on
+the meta leader finds and resumes interrupted operations after restart or
+election — there is no start API beyond the admin endpoints.
+
+### Forwarding and membership/backup interactions
+
+- **Authenticated V2 forwarding**: leader forwarding of migration-protocol
+  commands moves onto the peer mTLS transport (the upgrade-probe path is the
+  precedent), requires the finalized level-3 record, and re-checks the
+  recipient's reported `migration_version` before sending. The shared-listener
+  bearer-token path never carries migration commands. Rejected forwards never
+  enter the dedup cache (existing behavior).
+- **Membership**: the upgrade authority freezes meta membership during an
+  upgrade; symmetrically, migration planning is refused while an upgrade or
+  admission ledger operation is in flight, and upgrade preflight (which already
+  scans `\x01migration/`) refuses to start while any migration journal is
+  active.
+- **Backup**: migration state remains excluded from backup export and replay.
+  Backup and restore operations serialize against migration through the meta
+  group: a backup publication waits for (or cancels) in-flight migrations, and
+  migration planning is refused while a backup holds a protected timestamp over
+  the affected ranges, so neither invalidates the other's reads.
+- **Rollback**: rollback to a binary that cannot enforce these formats after
+  deliberate V3 protocol writes is unsupported, matching the existing rule for
+  V2; the level-3 finalization record makes that boundary durable and visible
+  to old binaries (they fail closed on the unknown cluster version).
+
+### Fault matrix per operation
+
+Before an operation's 501 is retired, it must pass, with no lost, duplicated,
+or prematurely visible keys: process kill before and after every durable
+boundary above; concurrent reads and writes (including savepoints and prepared
+transactions) through copy and cutover; leader loss of the meta group and of
+any participant mid-phase; network partition and heal between coordinator and
+participants; request timeout and idempotent retry at every boundary;
+destination-node restart and snapshot catch-up during copy; cancellation at
+every cancellable phase; and rollback attempts after publication (must fail
+closed). Suites: migration unit/fault fixtures, integration, real-process
+three-node cluster, partition, loom, and the candidate mixed-binary matrix.

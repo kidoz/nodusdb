@@ -47,8 +47,10 @@ async fn node(
             heartbeat_interval: 200,
             max_in_snapshot_log_to_keep: 0,
             purge_batch_size: 1,
-            election_timeout_min: 700,
-            election_timeout_max: 1100,
+            // Avoid unrelated election storms while slow mTLS/WAL operations
+            // exercise admission, rather than testing election timing itself.
+            election_timeout_min: 2000,
+            election_timeout_max: 4000,
             ..Default::default()
         }
         .validate()
@@ -238,6 +240,75 @@ async fn upgrade_crash_child() {
     nodes[0].service.report_node_upgraded("1").await.unwrap();
     nodes[0].service.finalize_upgrade().await.unwrap();
     std::process::exit(88);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn migration_v3_scaffolding_lifecycle_and_feature_gates() {
+    let dir = tempfile::tempdir().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let node = node(1, &dir.path().join("1"), listener, &Default::default()).await;
+    node.raft
+        .initialize(BTreeMap::from([(1, openraft::BasicNode::new(addr))]))
+        .await
+        .unwrap();
+    let nodes = [node];
+    wait_leader(&nodes).await;
+    let service = &nodes[0].service;
+
+    // Level 3 cannot be started before snapshot-v2 finalization.
+    assert!(
+        service
+            .start_upgrade(upgrade::MIGRATION_TARGET.into())
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        service.get_state().await.unwrap()["feature_gates"],
+        serde_json::json!({"mvcc_snapshots": false, "migration_v3": false})
+    );
+    service.start_upgrade(upgrade::TARGET.into()).await.unwrap();
+    service.report_node_upgraded("1").await.unwrap();
+    service.finalize_upgrade().await.unwrap();
+    converge(&nodes, Phase::Finalized).await;
+    let gates = service.get_state().await.unwrap()["feature_gates"].clone();
+    assert_eq!(gates["mvcc_snapshots"], true);
+    assert_eq!(gates["migration_v3"], false);
+
+    // The next sequential target is migration-v3; the old target and arbitrary
+    // strings are rejected. The gate flips only after finalization.
+    assert!(service.start_upgrade(upgrade::TARGET.into()).await.is_err());
+    assert!(service.start_upgrade("0.3.0".into()).await.is_err());
+    service
+        .start_upgrade(upgrade::MIGRATION_TARGET.into())
+        .await
+        .unwrap();
+    service.report_node_upgraded("1").await.unwrap();
+    let record = upgrade::read(nodes[0].kv.as_ref()).unwrap();
+    assert_eq!(record.cluster_version, 2);
+    assert_eq!(
+        service.get_state().await.unwrap()["feature_gates"]["migration_v3"],
+        false
+    );
+    service.finalize_upgrade().await.unwrap();
+    converge(&nodes, Phase::Finalized).await;
+    assert_eq!(
+        upgrade::read(nodes[0].kv.as_ref()).unwrap().cluster_version,
+        3
+    );
+    let gates = service.get_state().await.unwrap()["feature_gates"].clone();
+    assert_eq!(gates["migration_v3"], true);
+    // No higher target exists; rollback stays closed after finalization.
+    assert!(
+        service
+            .start_upgrade(upgrade::MIGRATION_TARGET.into())
+            .await
+            .is_err()
+    );
+    assert!(service.rollback().await.is_err());
+    for node in nodes {
+        node.stop().await;
+    }
 }
 
 #[tokio::test]

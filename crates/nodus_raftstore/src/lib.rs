@@ -260,6 +260,28 @@ pub enum ShardCommand {
     },
     UpgradeControlV1(upgrade::CommandV1),
     UpgradeAdmissionV1(upgrade::admission::CommandV1),
+    /// Dormant V3 copy/cutover journal; same activation fences as V1/V2.
+    MigrationV3(migration::coordinator::v3::CommandV3),
+    /// Conditional routing publication: applies only if the current durable
+    /// shard-map content equals `expected` and the V3 journal for `table` is at
+    /// the `phase` step owned by `operation`. Old binaries fail closed on
+    /// decode; level-3 gating keeps them out of a cluster that emits these.
+    UpdateShardMapConditional {
+        table: nodus_catalog::TableId,
+        operation: uuid::Uuid,
+        phase: migration::coordinator::v3::PhaseV3,
+        expected: Option<nodus_meta::ShardMap>,
+        map: nodus_meta::ShardMap,
+    },
+    /// Conditional placements publication; same discipline as
+    /// [`ShardCommand::UpdateShardMapConditional`].
+    UpdateShardPlacementsConditional {
+        table: nodus_catalog::TableId,
+        operation: uuid::Uuid,
+        phase: migration::coordinator::v3::PhaseV3,
+        expected: std::collections::HashMap<nodus_catalog::ShardId, String>,
+        placements: std::collections::HashMap<nodus_catalog::ShardId, String>,
+    },
 }
 
 impl ShardCommand {
@@ -283,6 +305,9 @@ impl ShardCommand {
                 | Self::MigrationV2(_)
                 | Self::EpochRepairV2 { .. }
                 | Self::EpochPrepareV2 { .. }
+                | Self::MigrationV3(_)
+                | Self::UpdateShardMapConditional { .. }
+                | Self::UpdateShardPlacementsConditional { .. }
         )
     }
 }

@@ -14,6 +14,13 @@ pub mod admission;
 pub const KEY: &[u8] = b"\x01upgrade/v1/state";
 pub const MAX_MEMBERS: usize = 256;
 pub const TARGET: &str = "snapshot-v2";
+pub const MIGRATION_TARGET: &str = "migration-v3";
+/// Cluster-compatibility level activated by finalizing `MIGRATION_TARGET`.
+/// Level 3 is inert scaffolding: every migration fence stays in effect.
+pub const MIGRATION_LEVEL: u64 = 3;
+/// Migration protocol capability reported by this binary.
+pub const MIGRATION_VERSION: u64 = 3;
+pub const MAX_CLUSTER_VERSION: u64 = MIGRATION_LEVEL;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProbeV1 {
@@ -32,6 +39,8 @@ pub struct CapabilityV1 {
     pub ready_for_finalize: bool,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub admission_version: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub migration_version: Option<u64>,
 }
 fn is_zero(value: &u16) -> bool {
     *value == 0
@@ -48,6 +57,7 @@ impl CapabilityV1 {
             snapshot_version: 2,
             ready_for_finalize: false,
             admission_version: 1,
+            migration_version: Some(MIGRATION_VERSION),
         }
     }
     pub fn validate(&self, node: u64, challenge: Uuid) -> Result<()> {
@@ -100,7 +110,7 @@ impl Default for RecordV1 {
 impl RecordV1 {
     pub fn validate(&self) -> Result<()> {
         ensure!(
-            self.version == 1 && (1..=2).contains(&self.cluster_version),
+            self.version == 1 && (1..=MAX_CLUSTER_VERSION).contains(&self.cluster_version),
             "unsupported upgrade authority version"
         );
         let members = members(&self.membership)?;
@@ -114,7 +124,10 @@ impl RecordV1 {
         }
         if self.phase == Phase::Idle {
             ensure!(
-                members.is_empty() && self.reports.is_empty() && self.session.is_nil(),
+                self.cluster_version == 1
+                    && members.is_empty()
+                    && self.reports.is_empty()
+                    && self.session.is_nil(),
                 "invalid idle authority"
             );
         } else {
@@ -135,8 +148,10 @@ impl RecordV1 {
                 "incomplete upgrade reports"
             );
         }
+        // An in-flight upgrade keeps the previously finalized level, so only
+        // Finalized implies a level above 1; Idle is pinned to level 1 above.
         ensure!(
-            (self.phase == Phase::Finalized) == (self.cluster_version == 2),
+            self.phase != Phase::Finalized || self.cluster_version >= 2,
             "inconsistent finalized version"
         );
         Ok(())
@@ -209,16 +224,32 @@ fn transition(
     );
     let roster = members(current)?;
     ensure!(!roster.is_empty(), "upgrade requires membership");
-    ensure!(
-        old.phase != Phase::Finalized,
-        "upgrade finalized; rollback is closed and membership is frozen"
-    );
     if matches!(cmd.operation, OperationV1::Rollback) {
+        ensure!(
+            old.phase != Phase::Finalized,
+            "upgrade finalized; rollback is closed and membership is frozen"
+        );
         return Ok(RecordV1 {
             revision: index,
             ..RecordV1::default()
         });
     }
+    // A finalized authority may begin the next sequential upgrade: only Start
+    // reopens it, under a fresh session/revision, and only while a higher
+    // cluster-compatibility level exists. Refresh/Finalize/Rollback stay closed.
+    if old.phase == Phase::Finalized {
+        ensure!(
+            matches!(cmd.operation, OperationV1::Start),
+            "upgrade finalized; rollback is closed and membership is frozen"
+        );
+        ensure!(
+            old.cluster_version < MAX_CLUSTER_VERSION,
+            "cluster is already at the highest compatibility level"
+        );
+    }
+    // Levels activate sequentially: an in-flight upgrade keeps its base level,
+    // so the level a Start/Finalize targets is always the next one.
+    let target_level = old.cluster_version + 1;
     ensure!(
         !cmd.session.is_nil() && cmd.session != old.session,
         "stale capability challenge"
@@ -234,10 +265,20 @@ fn transition(
             "unknown capability node"
         );
         report.validate(report.node_id, cmd.session)?;
-        // R6a readers discard this optional field. Keep the immutable base
+        // Mirror the snapshot-v2 reader gate: at every step toward level 3,
+        // every voter and learner must already run a binary that reports the
+        // migration capability, so no member fails closed on the new record.
+        if target_level >= MIGRATION_LEVEL {
+            ensure!(
+                report.migration_version.unwrap_or(0) >= MIGRATION_VERSION,
+                "migration-v3 requires a migration version 3 report from every voter and learner"
+            );
+        }
+        // R6a readers discard these optional fields. Keep the immutable base
         // authority identical across both readers; admission has its own ledger.
         let mut report = report.clone();
         report.admission_version = 0;
+        report.migration_version = None;
         ensure!(
             reports.insert(report.node_id, report).is_none(),
             "duplicate capability report"
@@ -251,7 +292,10 @@ fn transition(
     }
     let phase = match cmd.operation {
         OperationV1::Start => {
-            ensure!(old.phase == Phase::Idle, "upgrade already active");
+            ensure!(
+                matches!(old.phase, Phase::Idle | Phase::Finalized),
+                "upgrade already active"
+            );
             Phase::RollingNodes
         }
         OperationV1::Refresh => {
@@ -281,7 +325,11 @@ fn transition(
     Ok(RecordV1 {
         version: 1,
         revision: index,
-        cluster_version: if phase == Phase::Finalized { 2 } else { 1 },
+        cluster_version: if phase == Phase::Finalized {
+            target_level
+        } else {
+            old.cluster_version
+        },
         phase,
         membership: current.clone(),
         reports,

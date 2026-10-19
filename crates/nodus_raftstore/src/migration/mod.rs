@@ -119,7 +119,9 @@ fn decode_record<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
 }
 
 pub(crate) fn is_control_key(key: &[u8]) -> bool {
-    key.starts_with(PREFIX) || key.starts_with(coordinator::JOURNAL_PREFIX)
+    key.starts_with(PREFIX)
+        || key.starts_with(coordinator::JOURNAL_PREFIX)
+        || key.starts_with(coordinator::v3::JOURNAL_PREFIX)
 }
 
 /// Snapshots cannot delete or roll back durable migration state.
@@ -148,6 +150,12 @@ pub(crate) fn validate_snapshot_record(
         let record = coordinator::decode(value)?;
         anyhow::ensure!(
             coordinator::key(record.plan.migration.table_id) == key,
+            "snapshot coordinator key does not match table"
+        );
+    } else if key.starts_with(coordinator::v3::JOURNAL_PREFIX) {
+        let record = coordinator::v3::decode(value)?;
+        anyhow::ensure!(
+            coordinator::v3::key(record.plan.migration.table_id) == key,
             "snapshot coordinator key does not match table"
         );
     } else {
@@ -302,6 +310,14 @@ fn apply_control(
             if coordinator::read_record_v2(kv, plan.table_id)?.is_some() {
                 return Ok(reject("V2 journal prevents legacy coordinator planning"));
             }
+            if let Some(record) = coordinator::v3::read_record_v3(kv, plan.table_id)?
+                && !matches!(
+                    record.phase,
+                    coordinator::v3::PhaseV3::Done | coordinator::v3::PhaseV3::Cancelled
+                )
+            {
+                return Ok(reject("V3 journal prevents legacy coordinator planning"));
+            }
             if let Some(current) = read_record(kv, plan.table_id)? {
                 return Ok(if current.plan == *plan {
                     accepted()
@@ -439,6 +455,33 @@ pub(crate) fn apply(
         }
         ShardCommand::MigrationV2(command) => {
             return coordinator::apply_v2(kv, command, index, meta).map(Some);
+        }
+        ShardCommand::MigrationV3(command) => {
+            return coordinator::v3::apply_v3(kv, command, index, meta).map(Some);
+        }
+        ShardCommand::UpdateShardMapConditional {
+            table,
+            operation,
+            phase,
+            expected,
+            map,
+        } => {
+            return coordinator::v3::apply_conditional_map(
+                kv, *table, *operation, *phase, expected, map, meta,
+            )
+            .map(Some);
+        }
+        ShardCommand::UpdateShardPlacementsConditional {
+            table,
+            operation,
+            phase,
+            expected,
+            placements,
+        } => {
+            return coordinator::v3::apply_conditional_placements(
+                kv, *table, *operation, *phase, expected, placements, meta,
+            )
+            .map(Some);
         }
         ShardCommand::EpochRepairV2 {
             epoch,

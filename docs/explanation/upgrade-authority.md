@@ -59,7 +59,8 @@ Use the existing authenticated `/api/v1/upgrade` API on the meta leader:
 1. `GET /api/v1/upgrade` to inspect phase, revision, cluster level, membership,
    reports and the `mvcc_snapshots` feature gate.
 2. `POST /api/v1/upgrade/start?target=snapshot-v2` to verify readers and persist
-   `RollingNodes`. Other target strings are rejected.
+   `RollingNodes`. After level 2 is finalized, `target=migration-v3` starts the
+   next sequential upgrade (see below). Other target strings are rejected.
 3. `POST /api/v1/upgrade/node-upgraded?node=<numeric-member-id>` to refresh reports
    from **all** members and persist `ReadyToFinalize`. The name supplied by the
    caller is not evidence that a binary was upgraded.
@@ -71,6 +72,28 @@ and returns to level 1. Finalization closes rollback. Repeated/stale commands
 cannot reset the phase or reuse an old challenge. A timed-out operation has an
 uncertain outcome; inspect status before retrying. Membership changes during
 probing invalidate the operation at apply. Joint membership cannot start/finalize.
+
+## Level 3 scaffolding (`migration-v3`)
+
+The authority also accepts the target **`migration-v3`**, startable only after
+level 2 is finalized, and finalizing it commits cluster-compatibility level 3.
+Every level-2 rule applies unchanged — stale-revision CAS, frozen membership,
+fresh session challenge, drained-intent/2PC/migration preflight, and a report
+from every voter and learner — and, mirroring the snapshot-v2 reader gate, every
+step toward level 3 additionally requires each member to report
+`migration_version >= 3` (this binary reports 3). The field is an optional
+serde-defaulted capability like `admission_version`: old readers ignore it, and
+base-authority transitions clear it before persisting, so old and new readers
+persist byte-identical records. A `Finalized` authority accepts only a fresh
+`Start` toward the next level while one exists; rollback and repeated
+finalize/refresh stay closed. Snapshot installation still rejects any revision
+or level rollback and any post-finalization mutation.
+
+Level 3 currently unlocks nothing. Status reports a `migration_v3` feature gate
+(`cluster_version >= 3`), but shard init/split/merge/rebalance remain `501`, the
+router submission gate and raft write-ingress rejection stay in effect, and no
+V3 migration journal can be planned. See the activation design in the
+[shard migration protocol](shard-migration-protocol.md).
 
 ## Adding members after finalization
 

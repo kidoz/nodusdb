@@ -1,6 +1,7 @@
 mod cluster;
 mod coordinator;
 mod faults;
+mod v3;
 use bytes::Bytes;
 use nodus_catalog::TableId;
 use nodus_raftstore::migration::{

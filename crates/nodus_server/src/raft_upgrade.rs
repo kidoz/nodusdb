@@ -37,12 +37,19 @@ impl RaftUpgradeCoordinator {
         self.leader().await?;
         let record = upgrade::read(self.kv.as_ref())?;
         let mut value = serde_json::to_value(&record)?;
-        value["target_version"] = if record.phase == Phase::Idle {
+        value["target_version"] = if record.phase == Phase::Idle
+            || record.cluster_version >= upgrade::MAX_CLUSTER_VERSION
+        {
             serde_json::Value::Null
+        } else if record.cluster_version >= 2 {
+            upgrade::MIGRATION_TARGET.into()
         } else {
             upgrade::TARGET.into()
         };
-        value["feature_gates"] = serde_json::json!({"mvcc_snapshots": record.cluster_version >= 2});
+        value["feature_gates"] = serde_json::json!({
+            "mvcc_snapshots": record.cluster_version >= 2,
+            "migration_v3": record.cluster_version >= 3,
+        });
         value["member_admission"] =
             serde_json::to_value(upgrade::admission::read(self.kv.as_ref())?)?;
         Ok(value)
@@ -55,9 +62,19 @@ impl RaftUpgradeCoordinator {
         Ok(())
     }
     pub async fn start_upgrade(&self, target: String) -> Result<()> {
+        let record = upgrade::read(self.kv.as_ref())?;
+        let expected = match record.cluster_version {
+            1 => upgrade::TARGET,
+            2 => upgrade::MIGRATION_TARGET,
+            _ => "",
+        };
         ensure!(
-            target == upgrade::TARGET,
-            "supported target is snapshot-v2; binary versions are reported by nodes"
+            !expected.is_empty(),
+            "cluster is already at the highest compatibility level"
+        );
+        ensure!(
+            target == expected,
+            "supported target is {expected}; binary versions are reported by nodes"
         );
         self.execute(OperationV1::Start, None).await
     }
