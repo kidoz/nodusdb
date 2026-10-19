@@ -1,6 +1,9 @@
-target/
+**/target/
 .git/
 frontend/node_modules/
+frontend/dist/
+frontend/storybook-static/
+frontend/coverage/
 **/*.md
 .agents/
 .claude/

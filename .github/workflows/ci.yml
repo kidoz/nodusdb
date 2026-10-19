@@ -51,6 +51,16 @@ jobs:
       - run: npm run build
       - run: npm run lint
 
+  container:
+    name: Production container smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build production image
+        run: docker build -f deploy/docker/Dockerfile -t nodusdb:${{ github.sha }} .
+      - name: Smoke-test production image
+        run: python3 -B tools/testing/container_smoke.py --image nodusdb:${{ github.sha }}
+
   infrastructure:
     name: Live MinIO and OTLP recovery gates
     runs-on: ubuntu-latest

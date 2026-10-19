@@ -13,6 +13,15 @@ docker run --rm \
   nodusdb:dev
 ```
 
+The production image builds the console with Node 24 and packages the static
+bundle at `/frontend/dist`; the server serves it from `/` on the HTTP listener.
+Build and smoke-test the image, authenticated admin behavior, UID 10001, a SQL
+round trip, and every referenced console asset with:
+
+```bash
+just docker-smoke
+```
+
 ## Local dev stack (Compose)
 
 Runs one `nodusd` node, Prometheus, and MinIO (for backup testing):

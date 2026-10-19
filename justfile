@@ -76,6 +76,10 @@ run:
 docker-build:
     docker build -f deploy/docker/Dockerfile -t nodusdb:dev .
 
+# Build and smoke-test the production container, SQL, and packaged console
+docker-smoke: docker-build
+    python3 -B tools/testing/container_smoke.py --image nodusdb:dev
+
 # Bring up the local dev stack (nodusd + Prometheus + MinIO)
 compose-up:
     docker compose -f deploy/docker-compose.yml up --build

@@ -96,7 +96,7 @@ services:
   # this same-origin dev server; Vite proxies /api/* to nodus1 over the compose
   # network (NODUS_API_TARGET), avoiding cross-origin requests to the backend.
   frontend:
-    image: node:24-bookworm-slim
+    image: node:24-bookworm-slim@sha256:a5f4366e834695d5f363b920c104953a535d3a9864d1bdf74566a0ebe01daee5
     container_name: nodus-console
     working_dir: /app
     command: sh -c "npm install && npm run dev -- --host 0.0.0.0 --port 5173"

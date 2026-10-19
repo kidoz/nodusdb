@@ -1,10 +1,17 @@
-# Multi-stage build for the NodusDB server and CLI.
-FROM rust:1-bookworm AS builder
+# Multi-stage build for the NodusDB server, CLI, and web console.
+FROM node:24-bookworm-slim@sha256:a5f4366e834695d5f363b920c104953a535d3a9864d1bdf74566a0ebe01daee5 AS frontend-builder
+WORKDIR /src/frontend
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci
+COPY frontend/ ./
+RUN npm run build
+
+FROM rust:1-bookworm@sha256:e12566d5abc17a0da741628782cdb504b68b8961f5bfcf677936bf3e8b32de29 AS builder
 WORKDIR /src
 COPY . .
-RUN cargo build --release --bin nodus_server --bin nodus_cli
+RUN cargo build --locked --release --bin nodus_server --bin nodus_cli
 
-FROM debian:bookworm-slim AS runtime
+FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587 AS runtime
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates gosu \
     && rm -rf /var/lib/apt/lists/*
@@ -17,6 +24,7 @@ RUN groupadd --system --gid 10001 nodus \
 
 COPY --from=builder /src/target/release/nodus_server /usr/local/bin/nodus_server
 COPY --from=builder /src/target/release/nodus_cli /usr/local/bin/nodusctl
+COPY --from=frontend-builder /src/frontend/dist /frontend/dist
 COPY deploy/nodus.example.toml /etc/nodus/nodus.toml
 COPY deploy/docker/entrypoint.sh /usr/local/bin/nodus-entrypoint
 

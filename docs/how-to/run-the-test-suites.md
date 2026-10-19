@@ -4,8 +4,8 @@ NodusDB separates tests by scope and runtime cost. This guide covers which
 command to run when. For what each suite actually contains, see
 [test suites](../reference/test-suites.md).
 
-The project uses [`just`](https://github.com/casey/just) as its task runner;
-each recipe is a thin wrapper around `cargo`.
+The project uses [`just`](https://github.com/casey/just) as its task runner.
+Most recipes wrap `cargo`; infrastructure recipes also drive Python and Docker.
 
 ## While you are editing code
 
@@ -70,6 +70,13 @@ The [mixed-binary gate](test-mixed-binary-upgrades.md) builds two pinned product
 revisions and checks upgrade, snapshot, admission and rollback behavior. It is
 ignored by ordinary workspace tests. Its diagnostic mode records known blockers
 and continues with explicit workarounds; blockers still make the gate fail.
+
+From the repository root, build and smoke-test the production image, including
+SQL and the packaged console assets:
+
+```bash
+just docker-smoke
+```
 
 ## Fuzz targets
 
