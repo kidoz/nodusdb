@@ -1,5 +1,6 @@
 mod cluster;
 mod coordinator;
+mod driver;
 mod faults;
 mod v3;
 use bytes::Bytes;

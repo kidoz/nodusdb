@@ -4,6 +4,8 @@
 //! Every transition is a Raft apply on the meta group with operation, phase,
 //! routing, and epoch revalidation; `Publishing` is the point of no return.
 //! Participant sealing shares the V2 `CancelParticipant` semantics verbatim.
+pub mod driver;
+
 use super::*;
 use nodus_catalog::ShardId;
 use nodus_meta::ShardMap;

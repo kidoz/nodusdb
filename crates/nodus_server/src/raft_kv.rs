@@ -77,7 +77,7 @@ pub struct TxnParticipant {
 
 /// Parses the leading `{table_id}` of a row key. Returns `None` for non-row keys
 /// (index keys, scalars) or malformed input — those stay on the meta group.
-fn parse_table_id(key: &[u8]) -> Option<TableId> {
+pub(crate) fn parse_table_id(key: &[u8]) -> Option<TableId> {
     if key.get(36) != Some(&b':') {
         return None;
     }
