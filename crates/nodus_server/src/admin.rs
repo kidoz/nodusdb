@@ -248,14 +248,15 @@ async fn require_token(
     // routing based on a process-local lock or an emptiness check. Keep this
     // after authentication/authorization and inside the normal audit path.
     // Replica hosting stays available so existing placements can recover.
-    // `init` and `split` are past the fence: they plan through the V3 journal
-    // and are admitted only once this node's durable upgrade authority has
-    // finalized the migration cluster level.
+    // Shard operations past the fence plan through the V3 journal (init,
+    // split, merge) and are admitted only once this node's durable upgrade
+    // authority has finalized the migration cluster level.
     let shard_op = path.rsplit('/').next();
     let unsafe_shard_mutation = method == axum::http::Method::POST
         && path.starts_with("/api/v1/shards/")
         && matches!(shard_op, Some("init" | "split" | "merge" | "rebalance"))
-        && !(matches!(shard_op, Some("init" | "split")) && shard_migration_enabled(&state));
+        && !(matches!(shard_op, Some("init" | "split" | "merge"))
+            && shard_migration_enabled(&state));
     let response = if unsafe_shard_mutation {
         shard_migration_unavailable()
     } else {
@@ -1957,33 +1958,109 @@ async fn shards_split(
     .await
 }
 
-/// Merges two adjacent shards, relocating both sources' data into the merged
-/// group before flipping routing and decommissioning the sources (no-op data
-/// move when the shards aren't placed on this node).
+/// Merges two adjacent shards through the V3 migration journal: fences the
+/// meta group and both sources, copies both exact key/version multisets into
+/// the merged group, validates the digest, then flips routing conditionally.
+/// The merged shard inherits the sources' placement (default: this node).
+/// Admitted only with the finalized migration cluster level.
 async fn shards_merge(
     State(state): State<AdminState>,
     Path(table): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-) -> Json<Value> {
+) -> Response {
+    use nodus_raftstore::migration::{MigrationPlan, coordinator::v3};
     let Some(table_id) = parse_table(&table) else {
-        return Json(json!({ "error": "invalid table id" }));
+        return Json(json!({ "error": "invalid table id" })).into_response();
     };
+    if !shard_migration_enabled(&state) {
+        return shard_migration_unavailable();
+    }
     let left = match params.get("left").and_then(|s| Uuid::parse_str(s).ok()) {
         Some(u) => ShardId(u),
-        None => return Json(json!({ "error": "missing or invalid left shard id" })),
+        None => {
+            return Json(json!({ "error": "missing or invalid left shard id" })).into_response();
+        }
     };
     let right = match params.get("right").and_then(|s| Uuid::parse_str(s).ok()) {
         Some(u) => ShardId(u),
-        None => return Json(json!({ "error": "missing or invalid right shard id" })),
+        None => {
+            return Json(json!({ "error": "missing or invalid right shard id" })).into_response();
+        }
     };
-    match state
-        .manager
-        .merge_shards(&state.shards, table_id, left, right)
-        .await
-    {
-        Ok(merged) => Json(json!({ "merged": merged.to_string() })),
-        Err(e) => Json(json!({ "error": e.to_string() })),
+    let planning = match meta_planning_state(&state).await {
+        Ok(p) => p,
+        Err(response) => return *response,
+    };
+    let map = match planning.meta.get_shard_map(table_id) {
+        Ok(map) => map,
+        Err(_) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({ "error": "table has no shard map; initialize it first" })),
+            )
+                .into_response();
+        }
+    };
+    let merge = match state.shards.plan_merge(table_id, left, right) {
+        Ok(plan) => plan,
+        Err(e) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({ "error": e.to_string() })),
+            )
+                .into_response();
+        }
+    };
+    let left_group = crate::multi_raft::MultiRaftManager::data_group_id(left);
+    let right_group = crate::multi_raft::MultiRaftManager::data_group_id(right);
+    let left_epoch = match group_fence_epoch(&state, &left_group).await {
+        Ok(epoch) => epoch,
+        Err(response) => return *response,
+    };
+    let right_epoch = match group_fence_epoch(&state, &right_group).await {
+        Ok(epoch) => epoch,
+        Err(response) => return *response,
+    };
+    let node = merge
+        .source_node
+        .clone()
+        .unwrap_or_else(|| state.manager.node_id().to_string());
+    let plan = v3::PlanV3 {
+        migration: MigrationPlan {
+            operation_id: Uuid::new_v4(),
+            table_id,
+            source_epochs: std::collections::BTreeMap::from([
+                (
+                    crate::multi_raft::META_SHARD.to_string(),
+                    planning.meta_epoch,
+                ),
+                (left_group.clone(), left_epoch),
+                (right_group.clone(), right_epoch),
+            ]),
+            sources: vec![
+                crate::multi_raft::META_SHARD.to_string(),
+                left_group,
+                right_group,
+            ],
+            destinations: vec![v3::destination_group(merge.merged.id)],
+        },
+        expected_map: Some(map),
+        expected_placements: planning.placements,
+        destination_map: Some(merge.new_map),
+        destination_placements: HashMap::from([(merge.merged.id, node)]),
+    };
+    let operation = plan.migration.operation_id;
+    let merged = merge.merged.id;
+    if let Err(response) = submit_v3_plan(&state, plan).await {
+        return *response;
     }
+    drive_v3(
+        &state,
+        table_id,
+        operation,
+        json!({ "merged": merged.to_string() }),
+    )
+    .await
 }
 
 /// Brings hosted Raft groups in line with current placements after an admin
