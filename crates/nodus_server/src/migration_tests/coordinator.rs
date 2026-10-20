@@ -740,3 +740,70 @@ async fn sql_savepoints_preserve_rows_indexes_and_original_epoch() {
     );
     fx.manager.shutdown_all().await;
 }
+
+/// The orphan/uncertain-2PC composition: an intent whose coordinator died
+/// before recording a decision blocks fence acquisition (epochs never advance
+/// past unresolved transactions), the janitor's replicated abort is the
+/// resolution, and the undecided transaction never becomes visible.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn orphan_intent_blocks_fencing_until_janitor_resolution() {
+    let dir = tempfile::tempdir().unwrap();
+    let fx = Fixture::new(Arc::new(nodus_storage_mem::MemKvEngine::new()), dir.path()).await;
+    let table = TableId::new();
+    let plan = plan_v2(table);
+    let operation = plan.migration.operation_id;
+
+    // A transaction whose coordinator crashed after the intent landed but
+    // before any decision record: uncertain, and uncommittable by recovery
+    // (no `\0txn2pc\0` record exists for it). Written straight into the meta
+    // group's slice of the store, exactly as crash replay leaves it — no live
+    // session on this node knows the txn.
+    let orphan = TxnId::new();
+    fx.engine
+        .local
+        .write_intent(orphan, Bytes::from_static(b"row"), Bytes::from_static(b"v"))
+        .unwrap();
+
+    // Fencing refuses: pending intents block the epoch advance.
+    let rejected = fx
+        .command(ShardCommand::MigrationV1(Control::Acquire {
+            operation_id: operation,
+            expected_epoch: 0,
+        }))
+        .await;
+    assert!(!rejected.success);
+    assert!(
+        rejected
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("pending intents"),
+        "quiescence rejection names the cause: {rejected:?}"
+    );
+
+    // Past the TTL, the janitor resolves the orphan with a replicated abort.
+    let future = nodus_storage_api::wallclock_micros() + 600_000_000;
+    let report = fx
+        .engine
+        .sweep_abandoned_intents(std::time::Duration::from_secs(300), future)
+        .await
+        .unwrap();
+    assert_eq!(report.aborted, 1, "the orphan is resolved: {report:?}");
+    assert_eq!(report.failed, 0);
+
+    // The fence now acquires, and the undecided transaction never surfaced.
+    assert!(
+        fx.command(ShardCommand::MigrationV1(Control::Acquire {
+            operation_id: operation,
+            expected_epoch: 0,
+        }))
+        .await
+        .success
+    );
+    assert_eq!(
+        fx.engine.get(b"row", u64::MAX).unwrap(),
+        None,
+        "an undecided transaction's writes are never visible"
+    );
+    fx.manager.shutdown_all().await;
+}

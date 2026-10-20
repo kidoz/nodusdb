@@ -161,9 +161,12 @@ impl RaftKvEngine {
     }
 
     /// Prepare participants, persist the meta decision, then drive commits.
-    /// Recovery retains the decision's recorded epochs. Uncertain decisions and
-    /// orphan intents still need further recovery work; migration quiescence
-    /// remains blocked while such intents or decisions exist.
+    /// Recovery retains the decision's recorded epochs. An uncertain window —
+    /// prepares acknowledged but no decision record, coordinator dead — is
+    /// resolved by the intent janitor's replicated abort once the TTL passes
+    /// (the TTL dwarfs any commit window, so expiry plus a missing decision
+    /// record means the transaction never decided); until then, migration
+    /// quiescence keeps the affected participants' epochs from advancing.
     fn commit_cross_shard(
         &self,
         txn_id: TxnId,
