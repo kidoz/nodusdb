@@ -280,28 +280,40 @@ impl ShardOrchestrator {
         self.placements.read().unwrap().get(&shard_id).cloned()
     }
 
-    /// A snapshot of all shard placements (`ShardId -> node id`), for the group
-    /// reconciler to decide which shards this node must host.
+    /// A snapshot of all shard placements (`ShardId -> node id`), read from
+    /// the authoritative (replicated) store — the in-process mirror is
+    /// maintained by legacy mutators and can lag Raft-applied conditional
+    /// publishes, so it is only a fallback for a store read error.
     pub fn placements(&self) -> HashMap<ShardId, String> {
-        self.placements.read().unwrap().clone()
+        match self.meta.get_shard_placements() {
+            Ok(p) => p,
+            // A store read error degrades to the mirror (which every legacy
+            // mutator maintains), never to a clobbering empty map.
+            Err(_) => self.placements.read().unwrap().clone(),
+        }
     }
 
     /// Evenly distributes a table's shards across `nodes` (round-robin by start
-    /// key) and records the resulting placements.
-    pub fn rebalance(&self, table_id: TableId, nodes: &[String]) -> Result<()> {
+    /// key) and records the resulting placements, returning the table's new
+    /// assignments. Reads and writes the authoritative replicated store.
+    pub fn rebalance(&self, table_id: TableId, nodes: &[String]) -> Result<Vec<(ShardId, String)>> {
         if nodes.is_empty() {
             anyhow::bail!("cannot rebalance onto zero nodes");
         }
         let map = self.meta.get_shard_map(table_id)?;
         let mut shards = map.shards.clone();
         shards.sort_by_key(|s| sort_key(&s.start_key));
-        let mut p = self.placements.write().unwrap();
+        let mut p = self.meta.get_shard_placements()?;
+        let mut assigned = Vec::with_capacity(shards.len());
         for (i, shard) in shards.iter().enumerate() {
-            p.insert(shard.id, nodes[i % nodes.len()].clone());
+            let node = nodes[i % nodes.len()].clone();
+            p.insert(shard.id, node.clone());
+            assigned.push((shard.id, node));
         }
-        drop(p);
-        self.save_placements()?;
-        Ok(())
+        self.meta.update_shard_placements(&p)?;
+        // Keep the legacy mirror in sync for its remaining readers.
+        *self.placements.write().unwrap() = p;
+        Ok(assigned)
     }
 }
 

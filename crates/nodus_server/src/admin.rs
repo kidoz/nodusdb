@@ -249,14 +249,14 @@ async fn require_token(
     // after authentication/authorization and inside the normal audit path.
     // Replica hosting stays available so existing placements can recover.
     // Shard operations past the fence plan through the V3 journal (init,
-    // split, merge) and are admitted only once this node's durable upgrade
-    // authority has finalized the migration cluster level.
+    // split, merge) or a guarded atomic placements write (rebalance); all are
+    // admitted only once this node's durable upgrade authority has finalized
+    // the migration cluster level.
     let shard_op = path.rsplit('/').next();
     let unsafe_shard_mutation = method == axum::http::Method::POST
         && path.starts_with("/api/v1/shards/")
         && matches!(shard_op, Some("init" | "split" | "merge" | "rebalance"))
-        && !(matches!(shard_op, Some("init" | "split" | "merge"))
-            && shard_migration_enabled(&state));
+        && !shard_migration_enabled(&state);
     let response = if unsafe_shard_mutation {
         shard_migration_unavailable()
     } else {
@@ -2071,30 +2071,108 @@ async fn reconcile_shards(state: &AdminState) {
     }
 }
 
+/// Reassigns a table's shard placements across `nodes`. Data groups are
+/// replicated to every cluster member, so a placement change moves primacy,
+/// not bytes: the write is a single Raft-replicated placements record (atomic,
+/// convergent on every node), and the reconcile loop re-forms groups on their
+/// new owners. Admitted only with the finalized migration cluster level, and
+/// refused while any migration journal could still drive routing changes — a
+/// migration's conditional publishes expect the placements it planned against.
 async fn shards_rebalance(
     State(state): State<AdminState>,
     Path(table): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-) -> Json<Value> {
+) -> Response {
     let Some(table_id) = parse_table(&table) else {
-        return Json(json!({ "error": "invalid table id" }));
+        return Json(json!({ "error": "invalid table id" })).into_response();
     };
+    if !shard_migration_enabled(&state) {
+        return shard_migration_unavailable();
+    }
     let nodes: Vec<String> = params
         .get("nodes")
-        .map(|s| s.split(',').map(|n| n.trim().to_string()).collect())
+        .map(|s| {
+            s.split(',')
+                .map(|n| n.trim().to_string())
+                .filter(|n| !n.is_empty())
+                .collect()
+        })
         .unwrap_or_default();
-    // Placement write replicates through Raft (blocking submit) — run off-reactor.
+    if nodes.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "cannot rebalance onto zero nodes" })),
+        )
+            .into_response();
+    }
+    // Placements must name live cluster members.
+    let roster = state.manager.cluster_members().await;
+    let unknown: Vec<&String> = nodes
+        .iter()
+        .filter(|n| !n.parse::<u64>().is_ok_and(|id| roster.contains_key(&id)))
+        .collect();
+    if !unknown.is_empty() {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": format!("nodes not in the cluster roster: {unknown:?}") })),
+        )
+            .into_response();
+    }
+    // Freshness barrier, then refuse while any migration journal is active:
+    // an in-flight operation's conditional publishes expect the placements it
+    // planned against (the race is also safe — drift cancels the migration —
+    // but refusing keeps the operator's intent explicit).
+    let router = state.router.clone();
+    let barrier =
+        tokio::task::spawn_blocking(move || router.read_barrier(crate::multi_raft::META_SHARD))
+            .await;
+    if let Err(e) = barrier
+        .map_err(|e| anyhow::anyhow!(e.to_string()))
+        .and_then(|r| r)
+    {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": format!("meta read barrier failed: {e}") })),
+        )
+            .into_response();
+    }
+    match crate::migration_coordinator::active_migration(&state.manager).await {
+        Ok(None) => {}
+        Ok(Some(active)) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": format!("migration in flight for table {active}; retry after it completes or cancels")
+                })),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "error": format!("migration journal scan failed: {e}") })),
+            )
+                .into_response();
+        }
+    }
+    // The placement write replicates through Raft (blocking submit) — run
+    // off-reactor.
     let shards = state.shards.clone();
     let nodes_for_task = nodes.clone();
     let result =
         tokio::task::spawn_blocking(move || shards.rebalance(table_id, &nodes_for_task)).await;
     match result {
-        Ok(Ok(())) => {
+        Ok(Ok(assigned)) => {
             reconcile_shards(&state).await;
-            Json(json!({ "rebalanced": true, "nodes": nodes }))
+            let assignments: Vec<Value> = assigned
+                .iter()
+                .map(|(shard, node)| json!({ "shard_id": shard.to_string(), "node": node }))
+                .collect();
+            Json(json!({ "rebalanced": true, "nodes": nodes, "assignments": assignments }))
+                .into_response()
         }
-        Ok(Err(e)) => Json(json!({ "error": e.to_string() })),
-        Err(e) => Json(json!({ "error": format!("task failed: {e}") })),
+        Ok(Err(e)) => Json(json!({ "error": e.to_string() })).into_response(),
+        Err(e) => Json(json!({ "error": format!("task failed: {e}") })).into_response(),
     }
 }
 
