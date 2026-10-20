@@ -48,19 +48,25 @@ fn fixture_plan(table: TableId) -> Fixture3 {
         ],
     };
     let source_group = format!("shard-{}", current.shards[0].id);
+    // Placements map shard ids to node ids; destination groups are named
+    // `shard-{shard-id}` (the v3::destination_group convention).
     let destination_placements = HashMap::from([
-        (destination.shards[0].id, "shard-d0".to_string()),
-        (destination.shards[1].id, "shard-d1".to_string()),
+        (destination.shards[0].id, "1".to_string()),
+        (destination.shards[1].id, "1".to_string()),
     ]);
-    let mut expected_placements = HashMap::from([(current.shards[0].id, source_group.clone())]);
-    expected_placements.extend(destination_placements.clone());
+    let expected_placements = HashMap::from([(current.shards[0].id, "1".to_string())]);
+    let destinations = destination
+        .shards
+        .iter()
+        .map(|s| v3::destination_group(s.id))
+        .collect();
     let plan = PlanV3 {
         migration: MigrationPlan {
             operation_id: Uuid::new_v4(),
             table_id: table,
             source_epochs: BTreeMap::from([(META_SHARD.to_string(), 0), (source_group.clone(), 0)]),
             sources: vec![META_SHARD.to_string(), source_group.clone()],
-            destinations: vec!["shard-d0".to_string(), "shard-d1".to_string()],
+            destinations,
         },
         expected_map: Some(current.clone()),
         expected_placements,
@@ -166,6 +172,18 @@ async fn prepare(h: &mut Harness, fx: &Fixture3) {
                 protected_read_ts: None,
             }
         )
+        .await
+        .success
+    );
+    // Destination placements become durable before group formation.
+    assert!(
+        h.apply(ShardCommand::UpdateShardPlacementsConditional {
+            table: fx.table,
+            operation: fx.operation,
+            phase: P3::Preparing,
+            expected: fx.plan.expected_placements.clone(),
+            placements: v3::prepare_placements(&fx.plan),
+        })
         .await
         .success
     );
@@ -301,11 +319,13 @@ async fn publish_map(h: &mut Harness, fx: &Fixture3) -> ShardResponse {
 }
 
 async fn publish_placements(h: &mut Harness, fx: &Fixture3) -> ShardResponse {
+    // At Publishing the placements hold the intermediate preparation content;
+    // the conditional flip expects exactly that and commits the cutover set.
     h.apply(ShardCommand::UpdateShardPlacementsConditional {
         table: fx.table,
         operation: fx.operation,
         phase: P3::Publishing,
-        expected: fx.plan.expected_placements.clone(),
+        expected: v3::prepare_placements(&fx.plan),
         placements: fx.plan.destination_placements.clone(),
     })
     .await
@@ -421,6 +441,19 @@ async fn cancel_out(h: &mut Harness, fx: &Fixture3) {
             .success
         );
     }
+    // Cancellation restores the pre-operation placements (an idempotent accept
+    // when the preparation flip never happened).
+    assert!(
+        h.apply(ShardCommand::UpdateShardPlacementsConditional {
+            table: fx.table,
+            operation: fx.operation,
+            phase: P3::Cancelling,
+            expected: v3::prepare_placements(&fx.plan),
+            placements: fx.plan.expected_placements.clone(),
+        })
+        .await
+        .success
+    );
     for destination in &fx.plan.migration.destinations {
         assert!(
             v3(
@@ -636,7 +669,7 @@ async fn publish_gate(h: &mut Harness, fx: &Fixture3) {
     assert_eq!(meta.get_shard_map(fx.table).unwrap().shards.len(), 2);
 
     // Publication replay after the journal advanced past Publishing is
-    // idempotent; a stale-expected replay is then rejected.
+    // idempotent; a replay claiming the wrong expected content fails closed.
     assert!(
         v3(
             h,
@@ -662,8 +695,8 @@ async fn publish_gate(h: &mut Harness, fx: &Fixture3) {
         })
         .await;
     assert!(
-        stale.success,
-        "already-applied content replays idempotently"
+        !stale.success,
+        "a replay with mismatched expected content is rejected"
     );
 }
 
@@ -826,15 +859,14 @@ fn fixture_plan_unsharded(table: TableId) -> Fixture3 {
         table_id: table,
         shards: vec![shard(table, "shard-b", b"", b"")],
     };
-    let destination_placements =
-        HashMap::from([(destination.shards[0].id, "shard-d0".to_string())]);
+    let destination_placements = HashMap::from([(destination.shards[0].id, "1".to_string())]);
     let plan = PlanV3 {
         migration: MigrationPlan {
             operation_id: Uuid::new_v4(),
             table_id: table,
             source_epochs: BTreeMap::from([(META_SHARD.to_string(), 0)]),
             sources: vec![META_SHARD.to_string()],
-            destinations: vec!["shard-d0".to_string()],
+            destinations: vec![v3::destination_group(destination.shards[0].id)],
         },
         expected_map: None,
         expected_placements: HashMap::new(),

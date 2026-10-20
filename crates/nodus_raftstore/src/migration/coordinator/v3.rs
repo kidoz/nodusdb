@@ -184,23 +184,46 @@ pub fn key(table: TableId) -> Vec<u8> {
     [JOURNAL_PREFIX, table.to_string().as_bytes()].concat()
 }
 
+/// The data-group id hosting a shard, matching the server's naming convention
+/// (also used by the coverage check in the parent module).
+pub fn destination_group(shard: ShardId) -> String {
+    format!("shard-{shard}")
+}
+
+/// Placements made durable before destination group formation: the expected
+/// content plus every destination shard's final placement. The Publishing flip
+/// later replaces this with `destination_placements` (sources dropped).
+pub fn prepare_placements(plan: &PlanV3) -> HashMap<ShardId, String> {
+    let mut placements = plan.expected_placements.clone();
+    if let Some(map) = &plan.destination_map {
+        for shard in &map.shards {
+            if let Some(node) = plan.destination_placements.get(&shard.id) {
+                placements.insert(shard.id, node.clone());
+            }
+        }
+    }
+    placements
+}
+
 fn valid_destinations(plan: &PlanV3) -> bool {
     let bounded = |placements: &HashMap<ShardId, String>| placements.len() <= MAX_PLACEMENTS;
     if !bounded(&plan.expected_placements) || !bounded(&plan.destination_placements) {
         return false;
     }
     let Some(map) = &plan.destination_map else {
+        // A plan publishing no map (e.g. drop-side merges) has no derivable
+        // destination groups; the planner's destination list stands.
         return true;
     };
-    let destinations: BTreeSet<&String> = plan.migration.destinations.iter().collect();
     let ids: std::collections::HashSet<ShardId> = map.shards.iter().map(|s| s.id).collect();
+    let groups: BTreeSet<String> = map.shards.iter().map(|s| destination_group(s.id)).collect();
     map.table_id == plan.migration.table_id
         && ids.len() == map.shards.len()
-        && map.shards.iter().all(|shard| {
-            plan.destination_placements
-                .get(&shard.id)
-                .is_some_and(|group| destinations.contains(group))
-        })
+        && groups.iter().collect::<BTreeSet<_>>() == plan.migration.destinations.iter().collect()
+        && map
+            .shards
+            .iter()
+            .all(|shard| plan.destination_placements.contains_key(&shard.id))
 }
 
 /// Decode-time invariants: a corrupt or inconsistent journal fails closed
@@ -343,12 +366,60 @@ fn canonical_placements(placements: &HashMap<ShardId, String>) -> BTreeMap<Strin
 }
 
 /// Routing revalidation compares the expected map *and* placements content.
+/// Valid before destination preparation flips placements (Plan/Begin/fence
+/// completion).
 pub fn routing_matches(plan: &PlanV3, meta: &dyn MetaStore) -> Result<bool> {
     if canonical(&plan.expected_map)? != canonical(&current_map(meta, plan.migration.table_id)?)? {
         return Ok(false);
     }
     Ok(canonical_placements(&plan.expected_placements)
         == canonical_placements(&meta.get_shard_placements()?))
+}
+
+/// Cutover-point revalidation: the map is still the expected content, but
+/// placements already carry the destination entries written during Preparing.
+/// Used by the `Publish` journal transition.
+pub fn cutover_routing_matches(plan: &PlanV3, meta: &dyn MetaStore) -> Result<bool> {
+    if canonical(&plan.expected_map)? != canonical(&current_map(meta, plan.migration.table_id)?)? {
+        return Ok(false);
+    }
+    Ok(canonical_placements(&prepare_placements(plan))
+        == canonical_placements(&meta.get_shard_placements()?))
+}
+
+/// Compares the current durable shard map against `map` (canonical content).
+pub fn map_matches(map: &Option<ShardMap>, meta: &dyn MetaStore, table: TableId) -> Result<bool> {
+    Ok(canonical(map)? == canonical(&current_map(meta, table)?)?)
+}
+
+/// Compares the current durable placements against `placements` (canonical).
+pub fn placements_match(
+    placements: &HashMap<ShardId, String>,
+    meta: &dyn MetaStore,
+) -> Result<bool> {
+    Ok(canonical_placements(placements) == canonical_placements(&meta.get_shard_placements()?))
+}
+
+/// The lowest protected read timestamp of any in-flight V3 copy, for GC
+/// watermark clamping. Journals at `Done`/`Cancelled` (or before the copy
+/// start) release their protection. Decode failures fail closed (error).
+pub fn protected_gc_watermark(kv: &dyn KvEngine) -> Result<Option<u64>> {
+    let range = nodus_storage_api::KeyRange {
+        start: Bytes::from_static(b"\x01migration/v3/"),
+        end: Bytes::from_static(b"\x01migration/v30"),
+    };
+    let mut protected = None;
+    for row in kv.scan(range, u64::MAX)? {
+        let record = decode(&row?.value)?;
+        if record.protected_read_ts > 0
+            && !matches!(record.phase, PhaseV3::Done | PhaseV3::Cancelled)
+        {
+            protected = Some(protected.map_or(record.protected_read_ts, |p: u64| {
+                p.min(record.protected_read_ts)
+            }));
+        }
+    }
+    Ok(protected)
 }
 
 fn save(kv: &dyn KvEngine, record: &RecordV3, index: u64) -> Result<()> {
@@ -589,7 +660,7 @@ pub fn apply_v3(
             if !record.validation.is_some_and(|v| v.matches) {
                 return Ok(reject("publication requires a matching validation report"));
             }
-            if !routing_matches(&record.plan, meta.as_ref())? {
+            if !cutover_routing_matches(&record.plan, meta.as_ref())? {
                 return Ok(reject("routing changed before publication"));
             }
             record.phase = PhaseV3::Publishing;
@@ -636,6 +707,11 @@ pub fn apply_v3(
                 }
                 if record.cancelled.len() != record.plan.migration.sources.len() {
                     return Ok(reject("not every source acknowledged cancellation"));
+                }
+                if !placements_match(&record.plan.expected_placements, meta.as_ref())? {
+                    return Ok(reject(
+                        "cancellation has not restored the pre-operation placements",
+                    ));
                 }
                 if !record.prepared.iter().all(|d| record.cleaned.contains(d)) {
                     return Ok(reject("prepared destinations are not cleaned up"));
@@ -731,13 +807,12 @@ fn conditional_reject(reason: &str) -> ShardResponse {
 }
 
 /// Common gates for both conditional routing commands: the V3 journal must own
-/// the operation, the phase token must be the publication step, and a fence
-/// owned by another operation closes the meta participant to this write.
+/// the operation, and a fence owned by another operation closes the meta
+/// participant to this write. Phase-token legality is per command.
 fn conditional_journal(
     kv: &dyn KvEngine,
     table: TableId,
     operation: Uuid,
-    phase: PhaseV3,
 ) -> Result<std::result::Result<RecordV3, ShardResponse>> {
     let Some(record) = read_record_v3(kv, table)? else {
         return Ok(Err(conditional_reject(
@@ -752,10 +827,8 @@ fn conditional_journal(
             "meta participant is fenced by another operation",
         )));
     }
-    if record.plan.migration.operation_id != operation || phase != PhaseV3::Publishing {
-        return Ok(Err(conditional_reject(
-            "stale operation or journal phase token",
-        )));
+    if record.plan.migration.operation_id != operation {
+        return Ok(Err(conditional_reject("stale operation")));
     }
     Ok(Ok(record))
 }
@@ -763,7 +836,8 @@ fn conditional_journal(
 /// Applies the new shard map only if the current durable content equals the
 /// expected content carried in the command, inside the journal's publication
 /// step. A replayed publication whose content already landed is accepted
-/// without rewriting; any other drift fails closed.
+/// without rewriting; any other drift fails closed. The map flips only at the
+/// `Publishing` step.
 pub fn apply_conditional_map(
     kv: &dyn KvEngine,
     table: TableId,
@@ -778,16 +852,18 @@ pub fn apply_conditional_map(
             "conditional routing belongs to the meta group",
         ));
     };
-    if map.table_id != table {
+    if map.table_id != table || phase != PhaseV3::Publishing {
         return Ok(conditional_reject(
-            "shard map does not match the journal table",
+            "shard map does not match the journal table or phase token",
         ));
     }
-    let record = match conditional_journal(kv, table, operation, phase)? {
+    let record = match conditional_journal(kv, table, operation)? {
         Ok(record) => record,
         Err(rejection) => return Ok(rejection),
     };
-    if canonical(&record.plan.destination_map)? != canonical(&Some(map.clone()))? {
+    if canonical(&record.plan.destination_map)? != canonical(&Some(map.clone()))?
+        || canonical(&record.plan.expected_map)? != canonical(expected)?
+    {
         return Ok(conditional_reject(
             "publication payload does not match the journaled plan",
         ));
@@ -807,7 +883,11 @@ pub fn apply_conditional_map(
     Ok(accepted())
 }
 
-/// Same conditional discipline for the global placement record.
+/// Same conditional discipline for the global placement record, with three
+/// legal steps: `Preparing` adds the destination placements before group
+/// formation (payload must be the derived [`prepare_placements`] content),
+/// `Publishing` commits the final cutover placements, and `Cancelling`
+/// restores the pre-operation placements after the preparation flip.
 pub fn apply_conditional_placements(
     kv: &dyn KvEngine,
     table: TableId,
@@ -822,30 +902,44 @@ pub fn apply_conditional_placements(
             "conditional routing belongs to the meta group",
         ));
     };
-    let record = match conditional_journal(kv, table, operation, phase)? {
+    let record = match conditional_journal(kv, table, operation)? {
         Ok(record) => record,
         Err(rejection) => return Ok(rejection),
     };
-    if canonical_placements(&record.plan.destination_placements) != canonical_placements(placements)
+    let (expected_content, payload_content) = match phase {
+        PhaseV3::Preparing => (
+            record.plan.expected_placements.clone(),
+            prepare_placements(&record.plan),
+        ),
+        PhaseV3::Publishing => (
+            prepare_placements(&record.plan),
+            record.plan.destination_placements.clone(),
+        ),
+        PhaseV3::Cancelling => (
+            prepare_placements(&record.plan),
+            record.plan.expected_placements.clone(),
+        ),
+        _ => {
+            return Ok(conditional_reject("stale journal phase token"));
+        }
+    };
+    if canonical_placements(&payload_content) != canonical_placements(placements)
+        || canonical_placements(&expected_content) != canonical_placements(expected)
     {
         return Ok(conditional_reject(
             "publication payload does not match the journaled plan",
         ));
     }
     let current = meta.get_shard_placements()?;
-    if past(&record, PhaseV3::Validating)
-        && canonical_placements(&current) == canonical_placements(placements)
-    {
-        return Ok(accepted()); // idempotent replay of an applied publication
+    if canonical_placements(&current) == canonical_placements(placements) {
+        return Ok(accepted()); // the requested content already landed
     }
-    if record.phase != PhaseV3::Publishing
-        || canonical_placements(&current) != canonical_placements(expected)
-    {
+    if record.phase != phase || canonical_placements(&current) != canonical_placements(expected) {
         return Ok(conditional_reject(
             "current routing does not match the expected content",
         ));
     }
     meta.update_shard_placements(placements)?;
-    tracing::info!(%table, %operation, "conditional placements publication applied");
+    tracing::info!(%table, %operation, phase = ?phase, "conditional placements publication applied");
     Ok(accepted())
 }
