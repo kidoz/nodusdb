@@ -239,3 +239,39 @@ fn stable_roster_checks_voters_as_well_as_addresses() {
     ledger.pending.as_mut().unwrap().base = changed;
     assert!(approved(&a, Some(&ledger)).is_err());
 }
+
+/// A cluster finalized at the migration level admits and promotes only members
+/// whose fresh reports carry `migration_version >= MIGRATION_VERSION`; a stale
+/// binary would fail closed on V3 records and diverge.
+#[test]
+fn level3_admission_requires_migration_capable_reports() {
+    let mut a = authority();
+    a.cluster_version = MIGRATION_LEVEL;
+
+    // Candidate without a migration capability report: refused at Approve.
+    let mut stale_candidate = approval(&a);
+    stale_candidate.reports[1].migration_version = None;
+    assert!(transition(&a, None, &stale_candidate, &a.membership, 11).is_err());
+
+    // An existing member whose fresh report went stale is refused too.
+    let mut stale_member = approval(&a);
+    stale_member.reports[0].migration_version = Some(MIGRATION_VERSION - 1);
+    assert!(transition(&a, None, &stale_member, &a.membership, 11).is_err());
+
+    // Capable reports admit, and promotion re-checks: a candidate that
+    // downgrades between Approve and Promote is refused.
+    let approved = transition(&a, None, &approval(&a), &a.membership, 11).unwrap();
+    assert!(approved.pending.is_some());
+    let learner = membership(vec![[1].into()], true);
+    let mut promote = command(Some(&approved), OperationV1::Promote, learner.clone());
+    promote.reports[1].migration_version = None;
+    assert!(transition(&a, Some(approved.clone()), &promote, &learner, 12).is_err());
+    let promote = command(Some(&approved), OperationV1::Promote, learner.clone());
+    assert!(transition(&a, Some(approved), &promote, &learner, 12).is_ok());
+
+    // Below the migration level the rule is inert (legacy admission unchanged).
+    let a2 = authority();
+    let mut legacy = approval(&a2);
+    legacy.reports[1].migration_version = None;
+    assert!(transition(&a2, None, &legacy, &a2.membership, 11).is_ok());
+}

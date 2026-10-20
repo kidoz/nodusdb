@@ -242,6 +242,26 @@ fn validate_reports(
     }
     Ok(reports)
 }
+/// A level-3 cluster may only admit or promote members that enforce the
+/// migration protocol: a stale binary would fail closed on V3 records and
+/// diverge from the group. Level 3 finalized only after every member reported
+/// `migration_version >= MIGRATION_VERSION`, so every fresh report must carry
+/// it too.
+fn require_migration_readers(
+    authority: &super::RecordV1,
+    reports: &BTreeMap<u64, CapabilityV1>,
+) -> Result<()> {
+    if authority.cluster_version >= MIGRATION_LEVEL {
+        for report in reports.values() {
+            ensure!(
+                report.migration_version >= Some(MIGRATION_VERSION),
+                "member {} does not enforce migration protocol v3",
+                report.node_id
+            );
+        }
+    }
+    Ok(())
+}
 fn transition(
     authority: &super::RecordV1,
     old: Option<RecordV1>,
@@ -287,6 +307,7 @@ fn transition(
             let mut extended = roster;
             extended.insert(*node_id, address.clone());
             let reports = validate_reports(cmd, &extended)?;
+            require_migration_readers(authority, &reports)?;
             next.admitted.insert(
                 *node_id,
                 MemberV1 {
@@ -322,6 +343,7 @@ fn transition(
                         "stale promotion report"
                     );
                     let reports = validate_reports(cmd, &roster)?;
+                    require_migration_readers(authority, &reports)?;
                     next.admitted
                         .get_mut(&plan.node_id)
                         .ok_or_else(|| anyhow::anyhow!("candidate absent"))?
