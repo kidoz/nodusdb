@@ -1,12 +1,14 @@
 # Shard migration protocol
 
-**Status: dormant.** A durable pre-copy coordinator and epoch-aware SQL write
-paths are implemented and tested in isolated fixtures. Public initialization,
-split, merge, and rebalance remain disabled. Production SQL submission and
-internal HTTP client-write ingress reject the new command variants; there is no
-runtime switch to bypass verified cluster compatibility. The activation design
-below is the agreed target; nothing in it is implemented yet unless a section
-says so.
+**Status: partially activated.** The durable pre-copy coordinator, the V3
+copy/cutover journal and driver, epoch-aware SQL write paths, authenticated
+mTLS forwarding of migration-protocol commands, and the meta-leader
+journal-discovery worker are implemented and tested. **Shard initialization is
+enabled** once the durable upgrade authority finalizes the migration cluster
+level; split, merge, and rebalance remain disabled (501) pending their fault
+matrices. Pre-finalization, SQL submission and HTTP ingress reject the
+migration command variants; there is no runtime switch to bypass verified
+cluster compatibility. Sections marked as design remain the agreed target.
 
 ## Coordinator journal
 
@@ -31,10 +33,14 @@ ReadIndex barrier. Each call advances at most one participant and has a
 five-second deadline covering reads, submission, and acknowledgement. A timeout
 has an uncertain outcome: a later call retries from persisted state. Operation,
 phase, source, and epoch checks at apply make overlapping or stale coordinators
-safe. Changed routing requests cancellation. The service is dormant, operates
-on a known table, and has no production journal-discovery worker or start API.
-Its production transport also cannot forward new commands to remote leaders
-while ingress is disabled.
+safe. Changed routing requests cancellation. There is no start API beyond the
+(fenced) admin endpoints; a bounded journal-discovery worker on the meta leader
+(`migration_coordinator::journal_discovery_loop`, wired beside the 2PC
+recovery loop) finds and resumes interrupted V2 and V3 journals after restart
+or election, driving each by a bounded number of steps per tick. The worker is
+inert until the durable migration cluster level is finalized, and forwarding of
+migration-protocol commands to remote leaders requires the mTLS peer transport
+(see the activation design below).
 
 ## Participant fencing and cancellation
 
@@ -59,8 +65,13 @@ epoch, and whether writes are closed. Epochs never decrease.
 
 The meta group is fenced first, preventing new index writes and 2PC decisions
 before other source epochs advance. This is a conservative pause of the whole
-meta write domain, not table-scoped online availability. Orphan transaction
-resolution and uncertain 2PC outcomes still require further work.
+meta write domain, not table-scoped online availability. Orphan and uncertain
+2PC outcomes are resolved, never inferred, before an affected participant's
+epoch advances: fencing refuses while any pending intent or undecided decision
+exists, a decided commit is re-driven by meta-leader recovery, and an intent
+whose transaction has no decision record past the abandoned-transaction TTL is
+resolved by the janitor's replicated abort (the composition is proven by
+`migration_tests::coordinator::orphan_intent_blocks_fencing_until_janitor_resolution`).
 
 ## SQL writes and savepoints
 
@@ -270,10 +281,22 @@ The blanket 501 on `POST /api/v1/shards/{table}/{init|split|merge|rebalance}`
 is retired one operation at a time, in this order, each only after its fault
 matrix (below) passes on a finalized level-3 fixture:
 
-1. **init** — empty-table initialization. Even an empty table races concurrent
-   INSERTs, so init plans through the V3 journal (meta fence first) and
-   publishes the map conditionally; it simply has no copy phase.
-2. **split** — one source range into two children.
+1. **init** — first-shard initialization (**enabled**). A table without a shard
+   map keeps its rows on the meta group, so init is not necessarily empty: its
+   copy phase moves the table's row keys off meta (secondary-index entries stay
+   on meta permanently; routing never moves them). Even an empty table races
+   concurrent INSERTs, so init plans through the V3 journal (meta fence first)
+   and publishes the map conditionally. `POST /api/v1/shards/{table}/init`
+   answers `200` when the synchronous drive completes, `202` when the operation
+   is journaled and left for the meta leader's discovery worker, `409` when a
+   map or an active migration already exists, and `501` before level 3
+   finalizes.
+2. **split** — one source range into two children (**enabled**).
+   `POST /api/v1/shards/{table}/split?shard={id}&key={bytes}` takes the raw
+   row-key split point (`{table}:{pk}` space), plans through the V3 journal
+   (meta fence, source fence, journaled copy checkpoints, exact-digest
+   validation, conditional publication), and answers 200/202/409/501 exactly
+   like init. The children inherit the source's placement.
 3. **merge** — two adjacent sources into one child.
 4. **rebalance / move** — placement changes with cross-node data transfer.
 
@@ -312,20 +335,29 @@ the new copy/cutover spine:
   publishes.
 - **Publishing**: the shard map and placements flip by conditional apply —
   the apply compares the expected current map content and journal phase and
-  fails closed on any drift. Once the publication commits, cancellation is no
-  longer possible; the operation can only complete.
+  fails closed on any drift. Before the flip the driver idempotently
+  re-prepares every destination group, so a driver restarted after
+  `Preparing` (which may physically lack a destination that received no
+  copied rows) never publishes routing to an unserved group. Once the
+  publication commits, cancellation is no longer possible; the operation
+  can only complete.
 - **Completing**: residual writers observe the new map (fences open on the new
   epoch), and every participant acknowledges the cutover.
 - **Done**: the source groups are decommissioned and their ranges purged —
   only after the destination data and the replicated routing decision are both
-  durable. Source removal is journaled like every other step.
+  durable. Source removal is journaled like every other step, one still-hosted
+  source group per driver step.
 
 `Cancelling → Cancelled` — reachable from every phase before `Publishing`
 commits, addressing every source including ones whose acquire/ack was lost;
 sealing semantics are the V2 ones (a cancelled source's delayed acquires are
-permanently stale; a newer operation at a higher epoch is untouched). A
-cancelled operation leaves destination groups to be removed as part of
-cancellation cleanup, journaled the same way.
+permanently stale; a newer operation at a higher epoch is untouched). After all
+sources are sealed, cancellation conditionally restores the pre-operation
+placements — the preparation step adds destination placements before group
+formation, so cleanup must undo that flip — then removes the prepared
+destination groups, each step journaled. `Cancelled` requires all source seals,
+the restored placements, and every prepared destination's cleanup
+acknowledgement.
 
 Crash and recovery rules follow the existing coordinator invariants: the
 journal and acknowledgements are durable before any external effect is trusted;
@@ -343,7 +375,11 @@ election — there is no start API beyond the admin endpoints.
   precedent), requires the finalized level-3 record, and re-checks the
   recipient's reported `migration_version` before sending. The shared-listener
   bearer-token path never carries migration commands. Rejected forwards never
-  enter the dedup cache (existing behavior).
+  enter the dedup cache (existing behavior). Consequently a multi-node cluster
+  must configure `cluster.tls` before finalizing level 3: without the mTLS
+  peer listener a migration-protocol command whose target group's leader is
+  remote cannot be forwarded and fails closed (single-node clusters never
+  forward and are unaffected).
 - **Membership**: the upgrade authority freezes meta membership during an
   upgrade; symmetrically, migration planning is refused while an upgrade or
   admission ledger operation is in flight, and upgrade preflight (which already
@@ -371,3 +407,24 @@ destination-node restart and snapshot catch-up during copy; cancellation at
 every cancellable phase; and rollback attempts after publication (must fail
 closed). Suites: migration unit/fault fixtures, integration, real-process
 three-node cluster, partition, loom, and the candidate mixed-binary matrix.
+
+**split coverage (retired 2026-10-21):** everything init covers, plus the
+SQL-visible exact-multiset proof across cutover
+(`tests/integration/tests/shard_split.rs`), a stale-plan fail-fast at apply
+(`v3_plan_with_stale_meta_epoch_is_rejected_at_planning`), and meta-leader loss
+mid-copy on a real three-node mTLS cluster with the surviving leader's
+discovery pass completing the operation
+(`migration_tests::cluster_v3::split_survives_meta_leader_loss_mid_copy`).
+
+**init coverage (retired 2026-10-20):** journal-level crash/resume and
+cancellation matrices are covered by the V3 journal and driver suites
+(`migration_tests::v3`, `migration_tests::driver`, including a subprocess
+crash between copy checkpoints); discovery-worker resume of an interrupted
+operation by `migration_tests::discovery`; the enablement path, the
+insert/init race, repeat-init conflict, and movement of rows written before
+the map existed (with secondary-index continuity) by
+`tests/integration/tests/shard_init.rs`; and the pre-finalization 501,
+routing/data preservation, and audit of denied attempts by
+`tests/integration/tests/shard_guard.rs`. Init places the first shard on the
+requesting node, so the multi-node leader-loss and partition rungs of the
+matrix are exercised with split, which has real source data movement.

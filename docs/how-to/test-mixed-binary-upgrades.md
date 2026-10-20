@@ -7,13 +7,18 @@ must not erase the protocol boundary being tested.
 
 The October 19, 2026 pinned-pair run **passed all thirteen checkpoints in 277.55 seconds**
 with `passed: true`, `matrix_completed: true` and an empty blocker list. The
-working-tree candidate run based on `bbbb26c` with source patch SHA-256
-`5b9cf8ef8ad7e0dc6ee3c77b05e2c1e10d84b699edceed725954204a8f072312` (binary
-`3b0f68046aa55a49ec9a2869afaee3a50a8ee74ae1d80077050f662302b6c9de`) also
-**passed all thirteen checkpoints in 267.81 seconds**, with the same acceptance
+working-tree candidate run based on `fbbe3d5` with source patch SHA-256
+`9d570c970cd328091e2811718bd269a0799b7460442ad424efe838f220fe8060` (binary
+`08f1eacdde9178571f4f215b95537c19e13f02766e1fe422f57bbc4fafcd9fd5`) also
+**passed all thirteen checkpoints in 277.68 seconds**, with the same acceptance
 fields and no blockers. That candidate adds the inert level-3 upgrade-authority
-scaffolding (`migration-v3` target); the matrix proves the level 1→2 flows and
-record formats are unchanged for mixed binaries. The pinned run did not use `--candidate`; neither run used
+scaffolding (`migration-v3` target), the V3 migration journal spine with its
+bounded copy/cutover driver, the meta-leader journal-discovery worker,
+transport-based forwarding for all peer writes (mTLS-checked for
+migration-protocol commands), and level-3-gated shard init and split through
+the V3 journal; the matrix proves the level 1→2 flows and record formats are
+unchanged for mixed binaries.
+The pinned run did not use `--candidate`; neither run used
 `--diagnose`. Both snapshot directions, executable rollback before
 admission, admission refusals, four-node admission and crash/restart recovery
 passed. All five committed rows survived; the aborted row remained absent. No

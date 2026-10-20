@@ -89,10 +89,13 @@ persist byte-identical records. A `Finalized` authority accepts only a fresh
 finalize/refresh stay closed. Snapshot installation still rejects any revision
 or level rollback and any post-finalization mutation.
 
-Level 3 currently unlocks nothing. Status reports a `migration_v3` feature gate
-(`cluster_version >= 3`), but shard init/split/merge/rebalance remain `501`, the
-router submission gate and raft write-ingress rejection stay in effect, and no
-V3 migration journal can be planned. See the activation design in the
+Level 3 unlocks the migration protocol spine: the router submission gate and
+the mTLS peer-listener ingress open for migration-protocol commands, the
+meta-leader journal-discovery worker resumes interrupted operations, and shard
+**init** (`POST /api/v1/shards/{table}/init`) and **split**
+(`POST /api/v1/shards/{table}/split`) are enabled through the V3 journal.
+Merge and rebalance remain `501` until their own fault matrices pass. Status reports a `migration_v3` feature gate
+(`cluster_version >= 3`). See the activation design in the
 [shard migration protocol](shard-migration-protocol.md).
 
 ## Adding members after finalization
