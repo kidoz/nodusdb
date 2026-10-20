@@ -48,6 +48,9 @@ pub struct AdminState {
     /// Hosts this node's Raft groups; reconciled after placement changes so a
     /// newly placed shard is activated without waiting for a restart.
     pub manager: Arc<crate::multi_raft::MultiRaftManager>,
+    /// Shard-command submission bridge; migration-protocol commands are gated
+    /// on the durable upgrade authority (see `shard_init_enabled`).
+    pub router: crate::raft_router::RaftRouter,
     pub slow_log: Arc<SlowQueryLog>,
     pub kv: Arc<dyn nodus_storage_api::KvEngine>,
     /// In-process query executor, used by the dump-import endpoint to replay
@@ -79,6 +82,27 @@ pub struct AdminState {
     /// overlaying a different backup onto the partial state would silently
     /// merge the two.
     pub restore_in_flight: Arc<parking_lot::Mutex<Option<String>>>,
+}
+
+/// Whether shard init/split are past the containment fence on this node: the
+/// durable upgrade authority has finalized the migration cluster level.
+/// Fails closed on any read error. Merge and rebalance stay fenced regardless.
+fn shard_migration_enabled(state: &AdminState) -> bool {
+    nodus_raftstore::upgrade::read(state.manager.base_kv().as_ref()).is_ok_and(|authority| {
+        authority.cluster_version >= nodus_raftstore::upgrade::MIGRATION_LEVEL
+    })
+}
+
+/// The 501 payload for shard mutations still behind containment.
+fn shard_migration_unavailable() -> Response {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(json!({
+            "code": "shard_migration_unavailable",
+            "error": "Shard initialization, split, merge, and rebalance are disabled until durable migration and cluster-wide fencing are implemented. Existing shard maps are unchanged; inspect them with GET /api/v1/shards/{table}."
+        })),
+    )
+        .into_response()
 }
 
 /// The authenticated principal for a request, made available to handlers via a
@@ -224,20 +248,16 @@ async fn require_token(
     // routing based on a process-local lock or an emptiness check. Keep this
     // after authentication/authorization and inside the normal audit path.
     // Replica hosting stays available so existing placements can recover.
+    // `init` and `split` are past the fence: they plan through the V3 journal
+    // and are admitted only once this node's durable upgrade authority has
+    // finalized the migration cluster level.
+    let shard_op = path.rsplit('/').next();
     let unsafe_shard_mutation = method == axum::http::Method::POST
         && path.starts_with("/api/v1/shards/")
-        && matches!(
-            path.rsplit('/').next(),
-            Some("init" | "split" | "merge" | "rebalance")
-        );
+        && matches!(shard_op, Some("init" | "split" | "merge" | "rebalance"))
+        && !(matches!(shard_op, Some("init" | "split")) && shard_migration_enabled(&state));
     let response = if unsafe_shard_mutation {
-        (
-            StatusCode::NOT_IMPLEMENTED,
-            Json(json!({
-                "code": "shard_migration_unavailable",
-                "error": "Shard initialization, split, merge, and rebalance are disabled until durable migration and cluster-wide fencing are implemented. Existing shard maps are unchanged; inspect them with GET /api/v1/shards/{table}."
-            })),
-        ).into_response()
+        shard_migration_unavailable()
     } else {
         next.run(req).await
     };
@@ -1587,33 +1607,226 @@ fn parse_table(id: &str) -> Option<TableId> {
     Uuid::parse_str(id).ok().map(TableId)
 }
 
-async fn shards_init(State(state): State<AdminState>, Path(table): Path<String>) -> Json<Value> {
-    let Some(table_id) = parse_table(&table) else {
-        return Json(json!({ "error": "invalid table id" }));
+/// Meta-group content for planning a V3 operation, read behind a linearizable
+/// barrier so the plan's expected content matches what the conditional apply
+/// compares.
+struct MetaPlanning {
+    placements: HashMap<ShardId, String>,
+    meta_epoch: u64,
+    meta: Arc<dyn nodus_meta::MetaStore>,
+}
+
+fn plan_error(status: StatusCode, error: impl std::fmt::Display) -> Box<Response> {
+    Box::new((status, Json(json!({ "error": error.to_string() }))).into_response())
+}
+
+async fn meta_planning_state(state: &AdminState) -> Result<MetaPlanning, Box<Response>> {
+    let router = state.router.clone();
+    let barrier =
+        tokio::task::spawn_blocking(move || router.read_barrier(crate::multi_raft::META_SHARD))
+            .await;
+    if let Err(e) = barrier
+        .map_err(|e| anyhow::anyhow!(e.to_string()))
+        .and_then(|r| r)
+    {
+        return Err(plan_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            format_args!("meta read barrier failed: {e}"),
+        ));
+    }
+    let machine = state
+        .manager
+        .machine(crate::multi_raft::META_SHARD)
+        .await
+        .map_err(|e| {
+            plan_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format_args!("meta group unavailable: {e}"),
+            )
+        })?;
+    let sm = machine.read().await;
+    let (Some(kv), Some(meta)) = (sm.kv.clone(), sm.meta_store.clone()) else {
+        return Err(plan_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "meta storage unavailable",
+        ));
     };
-    // Create the shard and place it on this node in one off-reactor step (both
-    // the shard-map and placement writes replicate through Raft via blocking
-    // submit). Without recording a placement, the shard belongs to no node, so a
-    // later split/merge would refuse — its locality check compares the placement
-    // against this node's id (see `MultiRaftManager::split_shard`).
-    let shards = state.shards.clone();
-    let mine = state.manager.node_id().to_string();
-    let result = tokio::task::spawn_blocking(move || {
-        let id = shards.init_single_shard(table_id)?;
-        shards.move_shard(id, &mine)?;
-        anyhow::Ok(id)
+    let placements = meta
+        .get_shard_placements()
+        .map_err(|e| plan_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let fence = nodus_raftstore::migration::read_fence(kv.as_ref())
+        .map_err(|e| plan_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(MetaPlanning {
+        placements,
+        meta_epoch: fence.map_or(0, |f| f.epoch),
+        meta,
+    })
+}
+
+/// The current fence epoch of a locally hosted group (0 when never fenced).
+/// All groups are replicated to every member once formed, so a missing group
+/// means the placement owner has not formed it yet.
+async fn group_fence_epoch(state: &AdminState, group: &str) -> Result<u64, Box<Response>> {
+    let machine = state.manager.machine(group).await.map_err(|e| {
+        plan_error(
+            StatusCode::CONFLICT,
+            format_args!("source group {group} not hosted yet: {e}"),
+        )
+    })?;
+    let sm = machine.read().await;
+    let Some(kv) = sm.kv.clone() else {
+        return Err(plan_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            format_args!("group {group} storage unavailable"),
+        ));
+    };
+    nodus_raftstore::migration::read_fence(kv.as_ref())
+        .map(|fence| fence.map_or(0, |f| f.epoch))
+        .map_err(|e| plan_error(StatusCode::INTERNAL_SERVER_ERROR, e))
+}
+
+/// Journals a V3 plan through the meta group (the router forwards to the meta
+/// leader over mTLS when needed). A rejection means nothing was journaled, so
+/// the operation is safe to re-plan and retry.
+async fn submit_v3_plan(
+    state: &AdminState,
+    plan: nodus_raftstore::migration::coordinator::v3::PlanV3,
+) -> Result<(), Box<Response>> {
+    let router = state.router.clone();
+    let submit = tokio::task::spawn_blocking(move || {
+        router.submit(
+            crate::multi_raft::META_SHARD,
+            nodus_raftstore::ShardCommand::MigrationV3(
+                nodus_raftstore::migration::coordinator::v3::CommandV3::Plan(plan),
+            ),
+        )
     })
     .await;
-    match result {
-        Ok(Ok(id)) => {
-            // Form the shard's data group locally so it is immediately hostable
-            // (and splittable) without waiting for an explicit rebalance.
-            reconcile_shards(&state).await;
-            Json(json!({ "table": table_id.to_string(), "shard_id": id.to_string() }))
-        }
-        Ok(Err(e)) => Json(json!({ "error": e.to_string() })),
-        Err(e) => Json(json!({ "error": format!("task failed: {e}") })),
+    match submit {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(plan_error(
+            StatusCode::CONFLICT,
+            format_args!("migration plan rejected (not journaled; safe to retry): {e}"),
+        )),
+        Err(e) => Err(plan_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format_args!("plan submission failed: {e}"),
+        )),
     }
+}
+
+/// Drives a journaled operation and maps the outcome: 200 when the drive
+/// reached `Done`; 202 when it is journaled but unfinished — the meta leader's
+/// discovery worker resumes it (the response says which, never inferred).
+async fn drive_v3(
+    state: &AdminState,
+    table: TableId,
+    operation: Uuid,
+    ok_fields: Value,
+) -> Response {
+    use nodus_raftstore::migration::coordinator::v3;
+    let backend = crate::migration_coordinator::v3_backend::ProductionBackendV3::new(
+        state.manager.clone(),
+        state.router.clone(),
+    );
+    let outcome = v3::driver::run(
+        &backend,
+        table,
+        crate::migration_coordinator::v3_backend::STEP_DEADLINE,
+        256,
+    )
+    .await;
+    let mut body = json!({ "table": table.to_string(), "operation": operation.to_string() });
+    if let (Value::Object(body), Value::Object(fields)) = (&mut body, ok_fields) {
+        body.extend(fields);
+    }
+    match outcome {
+        Ok(v3::PhaseV3::Done) => {
+            body["phase"] = json!("done");
+            Json(body).into_response()
+        }
+        Ok(phase) => {
+            body["phase"] = json!(format!("{phase:?}"));
+            body["note"] = json!("journaled; the meta leader's discovery worker resumes it");
+            (StatusCode::ACCEPTED, Json(body)).into_response()
+        }
+        Err(e) => {
+            body["error"] = json!(e.to_string());
+            body["note"] = json!("journaled; the meta leader's discovery worker resumes it");
+            (StatusCode::ACCEPTED, Json(body)).into_response()
+        }
+    }
+}
+
+/// Initializes a table's first shard through the V3 migration journal: the
+/// plan fences the meta group first (racing INSERTs are rejected, never lost),
+/// moves any pre-map rows off the meta group, forms the destination group, and
+/// publishes the map conditionally at the expected current content. Admitted
+/// only with the finalized migration cluster level; before that the
+/// containment middleware answers 501 (and this handler re-checks).
+async fn shards_init(State(state): State<AdminState>, Path(table): Path<String>) -> Response {
+    use nodus_raftstore::migration::{MigrationPlan, coordinator::v3};
+    let Some(table_id) = parse_table(&table) else {
+        return Json(json!({ "error": "invalid table id" })).into_response();
+    };
+    if !shard_migration_enabled(&state) {
+        return shard_migration_unavailable();
+    }
+    let planning = match meta_planning_state(&state).await {
+        Ok(p) => p,
+        Err(response) => return *response,
+    };
+    if planning.meta.get_shard_map(table_id).is_ok() {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": format!("table {table_id} already has a shard map") })),
+        )
+            .into_response();
+    }
+    let now = chrono::Utc::now();
+    let destination = nodus_catalog::ShardDescriptor {
+        id: ShardId::new(),
+        name: "shard-0".into(),
+        version: 1,
+        created_at: now,
+        updated_at: now,
+        state: nodus_catalog::DescriptorState::Public,
+        table_id,
+        start_key: vec![],
+        end_key: vec![],
+    };
+    let node = state.manager.node_id().to_string();
+    let plan = v3::PlanV3 {
+        migration: MigrationPlan {
+            operation_id: Uuid::new_v4(),
+            table_id,
+            source_epochs: std::collections::BTreeMap::from([(
+                crate::multi_raft::META_SHARD.to_string(),
+                planning.meta_epoch,
+            )]),
+            sources: vec![crate::multi_raft::META_SHARD.to_string()],
+            destinations: vec![v3::destination_group(destination.id)],
+        },
+        expected_map: None,
+        expected_placements: planning.placements,
+        destination_map: Some(nodus_meta::ShardMap {
+            table_id,
+            shards: vec![destination.clone()],
+        }),
+        destination_placements: HashMap::from([(destination.id, node)]),
+    };
+    let operation = plan.migration.operation_id;
+    let shard_id = destination.id;
+    if let Err(response) = submit_v3_plan(&state, plan).await {
+        return *response;
+    }
+    drive_v3(
+        &state,
+        table_id,
+        operation,
+        json!({ "shard_id": shard_id.to_string() }),
+    )
+    .await
 }
 
 async fn shards_map(State(state): State<AdminState>, Path(table): Path<String>) -> Json<Value> {
@@ -1639,34 +1852,109 @@ async fn shards_map(State(state): State<AdminState>, Path(table): Path<String>) 
     }
 }
 
+/// Splits one shard at `key` through the V3 migration journal: fences the meta
+/// group and the source, copies the exact key/version multiset into the two
+/// children at a protected timestamp, validates the digest, then flips routing
+/// conditionally. The children inherit the source's placement (default: this
+/// node). Admitted only with the finalized migration cluster level.
 async fn shards_split(
     State(state): State<AdminState>,
     Path(table): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-) -> Json<Value> {
+) -> Response {
+    use nodus_raftstore::migration::{MigrationPlan, coordinator::v3};
     let Some(table_id) = parse_table(&table) else {
-        return Json(json!({ "error": "invalid table id" }));
+        return Json(json!({ "error": "invalid table id" })).into_response();
     };
+    if !shard_migration_enabled(&state) {
+        return shard_migration_unavailable();
+    }
     let shard_id = match params.get("shard").and_then(|s| Uuid::parse_str(s).ok()) {
         Some(u) => ShardId(u),
-        None => return Json(json!({ "error": "missing or invalid shard id" })),
+        None => {
+            return Json(json!({ "error": "missing or invalid shard id" })).into_response();
+        }
     };
-    // Split key is given as a single unsigned byte for the MVP key space.
-    let split_key: Vec<u8> = match params.get("key").and_then(|k| k.parse::<u8>().ok()) {
-        Some(b) => vec![b],
-        None => return Json(json!({ "error": "missing or invalid key (expected 0-255)" })),
+    // The split key is the raw row-key split point (`{table}:{pk}` space).
+    let split_key: Vec<u8> = match params.get("key") {
+        Some(k) if !k.is_empty() => k.clone().into_bytes(),
+        _ => {
+            return Json(json!({ "error": "missing split key (raw row-key bytes)" }))
+                .into_response();
+        }
     };
-    // Physically relocates the shard's data into the children before flipping
-    // routing, and decommissions the source group (no-op data move when the
-    // shard isn't placed on this node).
-    match state
-        .manager
-        .split_shard(&state.shards, table_id, shard_id, split_key)
-        .await
-    {
-        Ok((l, r)) => Json(json!({ "left": l.to_string(), "right": r.to_string() })),
-        Err(e) => Json(json!({ "error": e.to_string() })),
+    let planning = match meta_planning_state(&state).await {
+        Ok(p) => p,
+        Err(response) => return *response,
+    };
+    let map = match planning.meta.get_shard_map(table_id) {
+        Ok(map) => map,
+        Err(_) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({ "error": "table has no shard map; initialize it first" })),
+            )
+                .into_response();
+        }
+    };
+    let split = match state.shards.plan_split(table_id, shard_id, split_key) {
+        Ok(plan) => plan,
+        Err(e) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({ "error": e.to_string() })),
+            )
+                .into_response();
+        }
+    };
+    let source_group = crate::multi_raft::MultiRaftManager::data_group_id(shard_id);
+    let source_epoch = match group_fence_epoch(&state, &source_group).await {
+        Ok(epoch) => epoch,
+        Err(response) => return *response,
+    };
+    // The children inherit the source's placement; an unplaced source defaults
+    // to this node.
+    let node = split
+        .source_node
+        .clone()
+        .unwrap_or_else(|| state.manager.node_id().to_string());
+    let plan = v3::PlanV3 {
+        migration: MigrationPlan {
+            operation_id: Uuid::new_v4(),
+            table_id,
+            source_epochs: std::collections::BTreeMap::from([
+                (
+                    crate::multi_raft::META_SHARD.to_string(),
+                    planning.meta_epoch,
+                ),
+                (source_group.clone(), source_epoch),
+            ]),
+            sources: vec![crate::multi_raft::META_SHARD.to_string(), source_group],
+            destinations: vec![
+                v3::destination_group(split.left.id),
+                v3::destination_group(split.right.id),
+            ],
+        },
+        expected_map: Some(map),
+        expected_placements: planning.placements,
+        destination_map: Some(split.new_map),
+        destination_placements: HashMap::from([
+            (split.left.id, node.clone()),
+            (split.right.id, node),
+        ]),
+    };
+    let operation = plan.migration.operation_id;
+    let (left, right) = (split.left.id, split.right.id);
+    if let Err(response) = submit_v3_plan(&state, plan).await {
+        return *response;
     }
+    drive_v3(
+        &state,
+        table_id,
+        operation,
+        json!({ "left": left.to_string(), "right": right.to_string() }),
+    )
+    .await
 }
 
 /// Merges two adjacent shards, relocating both sources' data into the merged

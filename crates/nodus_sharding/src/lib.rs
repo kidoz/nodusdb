@@ -94,6 +94,21 @@ impl ShardOrchestrator {
         Ok(id)
     }
 
+    /// Computes (but does not commit) the initial single-shard map for a
+    /// table. Fails when a map already exists: init is valid exactly once, and
+    /// a repeated call must never overwrite routing. The V3 migration journal
+    /// commits the map conditionally at the expected current content.
+    pub fn plan_init(&self, table_id: TableId) -> Result<ShardMap> {
+        anyhow::ensure!(
+            self.meta.get_shard_map(table_id).is_err(),
+            "table {table_id} already has a shard map"
+        );
+        Ok(ShardMap {
+            table_id,
+            shards: vec![new_shard(table_id, "shard-0".into(), vec![], vec![])],
+        })
+    }
+
     /// Returns the current shard map for a table.
     pub fn shard_map(&self, table_id: TableId) -> Result<ShardMap> {
         self.meta.get_shard_map(table_id)

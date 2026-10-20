@@ -1224,6 +1224,7 @@ pub async fn run_server_with_config(
         upgrade: raft_upgrade_coordinator,
         shards,
         manager: multi_raft.clone(),
+        router: raft_router.clone(),
         slow_log: slow_log.clone(),
         kv: executor.kv(),
         executor: executor.clone(),
