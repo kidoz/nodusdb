@@ -297,8 +297,18 @@ matrix (below) passes on a finalized level-3 fixture:
    (meta fence, source fence, journaled copy checkpoints, exact-digest
    validation, conditional publication), and answers 200/202/409/501 exactly
    like init. The children inherit the source's placement.
-3. **merge** — two adjacent sources into one child.
-4. **rebalance / move** — placement changes with cross-node data transfer.
+3. **merge** — two adjacent sources into one child (**enabled**).
+   `POST /api/v1/shards/{table}/merge?left={id}&right={id}` plans through the
+   V3 journal like split, with both sources' multisets copied and validated;
+   the merged shard inherits the sources' placement.
+4. **rebalance / move** — placement reassignment (**enabled**). Data groups
+   replicate to every cluster member, so a rebalance moves primacy, not bytes:
+   `POST /api/v1/shards/{table}/rebalance?nodes=1,2` is a guarded, atomic
+   placements write through the meta group (round-robin by start key over the
+   given live roster members), refused while any migration journal could still
+   drive routing changes. If placements later stop implying universal
+   replication, this rung must be revisited as a real data-movement operation
+   through the V3 journal.
 
 Each operation remains authenticated, authorized (`ManageShards`), and audited
 exactly as the fenced endpoints are today, including the audit of denied
@@ -407,6 +417,21 @@ destination-node restart and snapshot catch-up during copy; cancellation at
 every cancellable phase; and rollback attempts after publication (must fail
 closed). Suites: migration unit/fault fixtures, integration, real-process
 three-node cluster, partition, loom, and the candidate mixed-binary matrix.
+
+**rebalance coverage (retired 2026-10-21):** the migration-in-flight refusal
+and terminality tracking by
+`migration_tests::discovery::active_migration_tracks_journal_terminality`;
+containment, roster validation, assignment response, racing-rebalance
+convergence, and data untouchedness by
+`tests/integration/tests/shard_rebalance.rs`. No crash matrix applies: the
+operation is one atomic Raft write with no durable intermediate state.
+
+**merge coverage (retired 2026-10-21):** the two-source exact-multiset driver
+test (`v3_driver_merge_moves_the_exact_multiset`), journal-level cancellation
+from every phase, and the SQL-visible end-to-end proof
+(`tests/integration/tests/shard_merge.rs`). Multi-node leader-loss mechanics
+are shared with split verbatim (same driver and discovery path); merge's
+distinct risk — two sources — is covered at the driver and journal levels.
 
 **split coverage (retired 2026-10-21):** everything init covers, plus the
 SQL-visible exact-multiset proof across cutover

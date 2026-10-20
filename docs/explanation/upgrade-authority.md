@@ -92,9 +92,11 @@ or level rollback and any post-finalization mutation.
 Level 3 unlocks the migration protocol spine: the router submission gate and
 the mTLS peer-listener ingress open for migration-protocol commands, the
 meta-leader journal-discovery worker resumes interrupted operations, and shard
-**init** (`POST /api/v1/shards/{table}/init`) and **split**
-(`POST /api/v1/shards/{table}/split`) are enabled through the V3 journal.
-Merge and rebalance remain `501` until their own fault matrices pass. Status reports a `migration_v3` feature gate
+**init** (`POST /api/v1/shards/{table}/init`), **split**
+(`POST /api/v1/shards/{table}/split`), **merge**
+(`POST /api/v1/shards/{table}/merge`), and **rebalance**
+(`POST /api/v1/shards/{table}/rebalance`, a guarded atomic placements write —
+groups replicate roster-wide, so no bytes move) are enabled. Status reports a `migration_v3` feature gate
 (`cluster_version >= 3`). See the activation design in the
 [shard migration protocol](shard-migration-protocol.md).
 
