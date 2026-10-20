@@ -1,5 +1,7 @@
 mod cluster;
+mod cluster_v3;
 mod coordinator;
+mod discovery;
 mod driver;
 mod faults;
 mod v3;

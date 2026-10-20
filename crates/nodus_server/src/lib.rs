@@ -758,6 +758,25 @@ pub async fn run_server_with_config(
         .await;
     });
 
+    // Migration journal discovery: the meta leader finds and resumes
+    // interrupted V2/V3 operations after restart or election. Inert until the
+    // durable migration cluster level is finalized (the router gate).
+    let migration_raft = raft.clone();
+    let migration_manager = multi_raft.clone();
+    let migration_router = raft_router.clone();
+    let migration_shutdown = shutdown.clone();
+    let migration_task = tokio::spawn(async move {
+        crate::migration_coordinator::journal_discovery_loop(
+            migration_raft,
+            migration_manager,
+            migration_router,
+            node_id,
+            std::time::Duration::from_secs(10),
+            migration_shutdown,
+        )
+        .await;
+    });
+
     let authz = Arc::new(nodus_authz::DefaultAuthzEngine::new(catalog.clone()));
 
     let executor = Arc::new(nodus_executor::MemExecutor::new(
@@ -1534,6 +1553,7 @@ pub async fn run_server_with_config(
                 gc_task,
                 janitor_task,
                 recovery_task,
+                migration_task,
                 wal_archiver_task,
                 raft_shutdown_task,
                 shard_reconcile_task,

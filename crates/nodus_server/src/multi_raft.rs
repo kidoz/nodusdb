@@ -279,6 +279,17 @@ impl MultiRaftManager {
         self.transport.clone()
     }
 
+    /// The node's local KV store backing every group's state machine. The
+    /// migration backend scans source namespaces from it after a read barrier.
+    pub(crate) fn base_kv(&self) -> Arc<dyn KvEngine> {
+        self.base_kv.clone()
+    }
+
+    /// This node's transaction clock.
+    pub(crate) fn clock(&self) -> Arc<dyn nodus_txn::TxnManager> {
+        self.clock.clone()
+    }
+
     /// Durable directory for `shard_id`'s snapshots, or a unique temp dir when no
     /// data dir is configured (ephemeral / in-memory mode).
     fn group_snapshot_dir(&self, shard_id: &str) -> std::path::PathBuf {
