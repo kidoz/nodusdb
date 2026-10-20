@@ -1354,3 +1354,60 @@ async fn v3_out_of_phase_and_stale_commands_are_rejected() {
     complete(&mut h, &fx).await;
     assert_eq!(journal(&h, fx.table).await.phase, P3::Done);
 }
+
+/// A plan carrying a stale meta fence epoch could never fence (Acquire rejects
+/// stale epochs) and would wedge at Fencing with no way forward — so the Plan
+/// apply rejects it while planning is still retryable.
+#[tokio::test]
+async fn v3_plan_with_stale_meta_epoch_is_rejected_at_planning() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = new_harness(dir.path()).await;
+    let fx = fixture_plan(TableId::new());
+    prepare_routing(&meta_store(&h).await, &fx);
+
+    // Meta fence absent (epoch 0): a plan claiming epoch 1 is stale.
+    let mut stale = fx.plan.clone();
+    stale
+        .migration
+        .source_epochs
+        .insert(META_SHARD.to_string(), 1);
+    let rejected = v3(&mut h, C3::Plan(stale)).await;
+    assert!(!rejected.success);
+    assert!(
+        rejected.error.unwrap().contains("stale meta fence epoch"),
+        "rejection names the cause"
+    );
+
+    // The current epoch plans and fences, advancing the meta fence to 1.
+    assert!(v3(&mut h, C3::Plan(fx.plan.clone())).await.success);
+    assert!(
+        v3(
+            &mut h,
+            C3::Begin {
+                table: fx.table,
+                operation: fx.operation,
+            }
+        )
+        .await
+        .success
+    );
+    assert!(
+        h.apply(ShardCommand::MigrationV1(Control::Acquire {
+            operation_id: fx.operation,
+            expected_epoch: 0,
+        }))
+        .await
+        .success
+    );
+
+    // A different table's plan at meta epoch 0 is now stale; epoch 1 is fresh.
+    let fx2 = fixture_plan(TableId::new());
+    prepare_routing(&meta_store(&h).await, &fx2);
+    assert!(!v3(&mut h, C3::Plan(fx2.plan.clone())).await.success);
+    let mut fresh = fx2.plan.clone();
+    fresh
+        .migration
+        .source_epochs
+        .insert(META_SHARD.to_string(), 1);
+    assert!(v3(&mut h, C3::Plan(fresh)).await.success);
+}

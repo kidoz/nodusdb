@@ -480,6 +480,18 @@ fn apply_plan(
     if !coverage_matches(migration, &plan.expected_map, meta)? {
         return Ok(reject("plan does not cover every row/index source group"));
     }
+    // The meta fence epoch is readable at apply (this IS the meta group); a
+    // plan carrying a stale one could never fence and would wedge at Fencing
+    // with no way forward, so reject it while planning is still retryable.
+    // Data-group epochs are stable between a table's operations (per-table
+    // journal exclusion), so meta is the only racy epoch.
+    let planned_meta_epoch = migration.source_epochs.get("shard-meta");
+    let current_meta_epoch = crate::migration::read_fence(kv)?.map_or(0, |f| f.epoch);
+    if planned_meta_epoch != Some(&current_meta_epoch) {
+        return Ok(reject(
+            "stale meta fence epoch in plan; re-plan against current state",
+        ));
+    }
     save(
         kv,
         &RecordV3 {
