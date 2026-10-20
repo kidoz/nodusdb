@@ -111,6 +111,19 @@ pub enum RaftRouteAuth {
     TransportAuthenticated,
 }
 
+/// Which listener authentication admitted a `/raft/...` request. Recorded by
+/// `require_raft_auth` in the request extensions so handlers can distinguish
+/// the mTLS peer listener from the shared bearer-token one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RaftAuthMode {
+    /// Admitted by the admin bearer token (or the explicit insecure opt-in) on
+    /// a listener that untrusted clients may also reach.
+    AdminToken,
+    /// Admitted by the TLS handshake itself: the peer presented a certificate
+    /// signed by the cluster CA on the dedicated peer listener.
+    TransportAuthenticated,
+}
+
 /// Constant-time bearer-token comparison (avoids timing oracles on the token).
 fn bearer_token_matches(provided: &str, expected: &str) -> bool {
     let (a, b) = (provided.as_bytes(), expected.as_bytes());
@@ -125,33 +138,33 @@ fn bearer_token_matches(provided: &str, expected: &str) -> bool {
 
 async fn require_raft_auth(
     State(auth): State<RaftRouteAuth>,
-    req: Request,
+    mut req: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    match &auth {
-        RaftRouteAuth::TransportAuthenticated => Ok(next.run(req).await),
+    let admitted = match &auth {
+        RaftRouteAuth::TransportAuthenticated => Some(RaftAuthMode::TransportAuthenticated),
         RaftRouteAuth::AdminToken {
             token,
             allow_insecure,
         } => {
-            if let Some(expected) = token {
-                let ok = req
+            let ok = match token {
+                Some(expected) => req
                     .headers()
                     .get(axum::http::header::AUTHORIZATION)
                     .and_then(|h| h.to_str().ok())
                     .and_then(|h| h.strip_prefix("Bearer "))
-                    .is_some_and(|bearer| bearer_token_matches(bearer, expected));
-                if ok {
-                    Ok(next.run(req).await)
-                } else {
-                    Err(StatusCode::UNAUTHORIZED)
-                }
-            } else if *allow_insecure {
-                Ok(next.run(req).await)
-            } else {
-                Err(StatusCode::UNAUTHORIZED)
-            }
+                    .is_some_and(|bearer| bearer_token_matches(bearer, expected)),
+                None => *allow_insecure,
+            };
+            ok.then_some(RaftAuthMode::AdminToken)
         }
+    };
+    match admitted {
+        Some(mode) => {
+            req.extensions_mut().insert(mode);
+            Ok(next.run(req).await)
+        }
+        None => Err(StatusCode::UNAUTHORIZED),
     }
 }
 
@@ -251,6 +264,7 @@ async fn snapshot(
 async fn write(
     Path(shard_id): Path<String>,
     State(state): State<RaftState>,
+    auth_mode: Option<axum::Extension<RaftAuthMode>>,
     headers: HeaderMap,
     Json(cmd): Json<ShardCommand>,
 ) -> impl axum::response::IntoResponse {
@@ -262,11 +276,25 @@ async fn write(
             .into_response();
     }
     if cmd.requires_migration_protocol() {
-        return (
-            axum::http::StatusCode::NOT_IMPLEMENTED,
-            "migration protocol activation requires verified cluster-wide compatibility",
-        )
-            .into_response();
+        // Migration-protocol commands enter only through authenticated leader
+        // forwarding on the mTLS peer listener — never the shared bearer-token
+        // listener — and only once this node's durable upgrade authority has
+        // finalized the migration cluster level.
+        let admitted = matches!(
+            auth_mode,
+            Some(axum::Extension(RaftAuthMode::TransportAuthenticated))
+        ) && state
+            .capability_kv
+            .get()
+            .and_then(|kv| crate::upgrade::read(kv.as_ref()).ok())
+            .is_some_and(|authority| authority.cluster_version >= crate::upgrade::MIGRATION_LEVEL);
+        if !admitted {
+            return (
+                axum::http::StatusCode::NOT_IMPLEMENTED,
+                "migration protocol activation requires verified cluster-wide compatibility",
+            )
+                .into_response();
+        }
     }
     let Some(raft) = get_raft(&state, &shard_id).await else {
         return (axum::http::StatusCode::NOT_FOUND, "Shard not found").into_response();
@@ -335,6 +363,8 @@ async fn read_index(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nodus_storage_api::{KvEngine, TxnId};
+    use std::sync::Arc;
 
     #[test]
     fn request_dedup_remembers_and_bounds() {
@@ -352,5 +382,138 @@ mod tests {
         }
         assert!(dedup.order.len() <= REQUEST_DEDUP_CAPACITY);
         assert!(!dedup.contains("a"), "oldest id evicted once over capacity");
+    }
+
+    /// Stores a valid finalized upgrade-authority record at the migration
+    /// cluster level, the state a level-3 node serves from.
+    fn store_finalized_level3(kv: &dyn KvEngine) {
+        use openraft::{CommittedLeaderId, LogId, Membership, StoredMembership};
+        let session = uuid::Uuid::new_v4();
+        let mut report = crate::upgrade::CapabilityV1::local(1, session);
+        report.ready_for_finalize = true;
+        let record = crate::upgrade::RecordV1 {
+            version: 1,
+            revision: 3,
+            phase: crate::upgrade::Phase::Finalized,
+            cluster_version: crate::upgrade::MIGRATION_LEVEL,
+            session,
+            membership: StoredMembership::new(
+                Some(LogId::new(CommittedLeaderId::new(1, 1), 1)),
+                Membership::new(
+                    vec![[1].into()],
+                    std::collections::BTreeMap::from([(1, openraft::BasicNode::new("one"))]),
+                ),
+            ),
+            reports: std::collections::BTreeMap::from([(1, report)]),
+        };
+        crate::upgrade::decode(&serde_json::to_vec(&record).unwrap()).unwrap();
+        let txn = TxnId::new();
+        kv.write_intent(
+            txn,
+            bytes::Bytes::from_static(crate::upgrade::KEY),
+            bytes::Bytes::from(serde_json::to_vec(&record).unwrap()),
+        )
+        .unwrap();
+        kv.commit(txn, 1).unwrap();
+    }
+
+    /// Serves the Raft routes with `auth` over plain HTTP and returns the
+    /// bound address.
+    async fn serve(auth: RaftRouteAuth, state: RaftState) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = raft_routes(auth).with_state(state);
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        addr
+    }
+
+    async fn post_write(
+        addr: std::net::SocketAddr,
+        cmd: &ShardCommand,
+        token: Option<&str>,
+    ) -> reqwest::StatusCode {
+        let mut req = reqwest::Client::new()
+            .post(format!("http://{addr}/raft/shard-x/write"))
+            .json(cmd);
+        if let Some(token) = token {
+            req = req.bearer_auth(token);
+        }
+        req.send().await.unwrap().status()
+    }
+
+    fn migration_command() -> ShardCommand {
+        ShardCommand::EpochPrepareV2 {
+            epoch: 1,
+            txn_id: uuid::Uuid::new_v4(),
+            expect_intents: false,
+        }
+    }
+
+    /// Migration-protocol ingress: admitted only on the mTLS peer listener
+    /// (TransportAuthenticated) with a finalized level-3 authority; the shared
+    /// bearer-token listener never carries them, whatever the durable level.
+    /// The unknown-shard 404 proves a request passed the gate and reached the
+    /// handler body.
+    #[tokio::test]
+    async fn migration_ingress_requires_peer_transport_and_finalized_level() {
+        let ordinary = ShardCommand::PrepareTxn {
+            txn_id: "t".into(),
+            shard_id: None,
+        };
+
+        // Peer listener, no finalized authority (level 1): rejected.
+        let state = RaftState::new();
+        state.set_capability_storage(Arc::new(nodus_storage_mem::MemKvEngine::new()));
+        let addr = serve(RaftRouteAuth::TransportAuthenticated, state).await;
+        assert_eq!(
+            post_write(addr, &migration_command(), None).await,
+            reqwest::StatusCode::NOT_IMPLEMENTED
+        );
+        // Ordinary commands are unaffected on the same listener.
+        assert_eq!(
+            post_write(addr, &ordinary, None).await,
+            reqwest::StatusCode::NOT_FOUND
+        );
+
+        // Peer listener, finalized level 3: the gate opens.
+        let kv = nodus_storage_mem::MemKvEngine::new();
+        store_finalized_level3(&kv);
+        let state = RaftState::new();
+        state.set_capability_storage(Arc::new(kv));
+        let addr = serve(RaftRouteAuth::TransportAuthenticated, state).await;
+        assert_eq!(
+            post_write(addr, &migration_command(), None).await,
+            reqwest::StatusCode::NOT_FOUND,
+            "finalized level-3 peer listener admits migration commands"
+        );
+
+        // Shared bearer-token listener: never carries migration commands, even
+        // with a valid token and a finalized level-3 authority.
+        let kv = nodus_storage_mem::MemKvEngine::new();
+        store_finalized_level3(&kv);
+        let state = RaftState::new();
+        state.set_capability_storage(Arc::new(kv));
+        let addr = serve(
+            RaftRouteAuth::AdminToken {
+                token: Some("t0ken".into()),
+                allow_insecure: false,
+            },
+            state,
+        )
+        .await;
+        assert_eq!(
+            post_write(addr, &migration_command(), Some("t0ken")).await,
+            reqwest::StatusCode::NOT_IMPLEMENTED
+        );
+        assert_eq!(
+            post_write(addr, &ordinary, Some("t0ken")).await,
+            reqwest::StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            post_write(addr, &ordinary, Some("wrong")).await,
+            reqwest::StatusCode::UNAUTHORIZED
+        );
     }
 }

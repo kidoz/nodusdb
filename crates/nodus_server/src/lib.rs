@@ -699,8 +699,17 @@ pub async fn run_server_with_config(
     let bootstrap_catalog = catalog.clone();
 
     // Async write-submission actor: bridges the synchronous KV/catalog write
-    // traits to async Raft `client_write` without `block_in_place`.
-    let raft_router = crate::raft_router::RaftRouter::spawn(multi_raft.clone());
+    // traits to async Raft `client_write` without `block_in_place`. Migration
+    // protocol commands unlock only once this node's durable upgrade authority
+    // has finalized the migration cluster level; the gate fails closed on any
+    // read error.
+    let gate_kv = local_kv.clone();
+    let raft_router = crate::raft_router::RaftRouter::spawn(multi_raft.clone())
+        .with_migration_gate(move || {
+            nodus_raftstore::upgrade::read(gate_kv.as_ref()).is_ok_and(|authority| {
+                authority.cluster_version >= nodus_raftstore::upgrade::MIGRATION_LEVEL
+            })
+        });
 
     // Routing reads the LOCAL store (kept current by the meta group's apply
     // path), so every node routes identically.
@@ -1742,6 +1751,200 @@ mod tests {
         assert_eq!(
             http.post(&url).json(&body).send().await.unwrap().status(),
             reqwest::StatusCode::NOT_FOUND
+        );
+    }
+
+    /// Stores a valid finalized upgrade-authority record at the migration
+    /// cluster level — the durable state a level-3 node serves from.
+    pub(crate) fn store_finalized_level3(kv: &dyn nodus_storage_api::KvEngine) {
+        use nodus_raftstore::upgrade::{CapabilityV1, MIGRATION_LEVEL, Phase, RecordV1};
+        use nodus_storage_api::TxnId;
+        use openraft::{BasicNode, CommittedLeaderId, LogId, Membership, StoredMembership};
+        let session = uuid::Uuid::new_v4();
+        let mut report = CapabilityV1::local(1, session);
+        report.ready_for_finalize = true;
+        let record = RecordV1 {
+            version: 1,
+            revision: 3,
+            phase: Phase::Finalized,
+            cluster_version: MIGRATION_LEVEL,
+            session,
+            membership: StoredMembership::new(
+                Some(LogId::new(CommittedLeaderId::new(1, 1), 1)),
+                Membership::new(
+                    vec![[1].into()],
+                    std::collections::BTreeMap::from([(1, BasicNode::new("one"))]),
+                ),
+            ),
+            reports: std::collections::BTreeMap::from([(1, report)]),
+        };
+        let txn = TxnId::new();
+        kv.write_intent(
+            txn,
+            bytes::Bytes::from_static(nodus_raftstore::upgrade::KEY),
+            bytes::Bytes::from(serde_json::to_vec(&record).unwrap()),
+        )
+        .unwrap();
+        kv.commit(txn, 1).unwrap();
+    }
+
+    /// Migration-protocol forwarding end to end over real mTLS: the recipient's
+    /// gate opens only with a finalized level-3 durable authority, the probe
+    /// verifies the peer's capability and challenge, and the plain-HTTP
+    /// transport refuses to carry the command at all.
+    #[tokio::test]
+    async fn migration_forwarding_uses_mtls_and_recipient_level_gate() {
+        use nodus_raftstore::ShardCommand;
+        use nodus_raftstore::server::{RaftRouteAuth, RaftState, raft_routes};
+
+        let dir = tempfile::tempdir().unwrap();
+        let (cert_path, key_path, ca_path) = write_test_certs(dir.path());
+        let cluster = nodus_config::ClusterConfig {
+            tls: nodus_config::ClusterTlsConfig {
+                enabled: true,
+                cert_path: Some(cert_path),
+                key_path: Some(key_path),
+                ca_path: Some(ca_path),
+            },
+            raft_listen_addr: Some("127.0.0.1:0".into()),
+            ..Default::default()
+        };
+        let transport = build_raft_transport(&cluster).unwrap();
+        assert_eq!(transport.scheme(), "https");
+
+        // Serves the raft routes over mandatory-mTLS with the given authority state.
+        let serve_mtls = |level3: bool| {
+            let cluster = cluster.clone();
+            async move {
+                let kv = Arc::new(nodus_storage_mem::MemKvEngine::new());
+                if level3 {
+                    store_finalized_level3(kv.as_ref());
+                }
+                let state = RaftState::new();
+                state.set_node_id(1);
+                state.set_capability_storage(kv);
+                let (server_cfg, _resolver) = load_raft_tls_config(&cluster.tls).unwrap().unwrap();
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                let app = Router::new()
+                    .merge(raft_routes(RaftRouteAuth::TransportAuthenticated).with_state(state));
+                let tls_config = axum_server::tls_rustls::RustlsConfig::from_config(server_cfg);
+                tokio::spawn(async move {
+                    let _ = axum_server::from_tcp_rustls(listener.into_std().unwrap(), tls_config)
+                        .unwrap()
+                        .serve(app.into_make_service())
+                        .await;
+                });
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                addr
+            }
+        };
+
+        let migration_cmd = ShardCommand::EpochPrepareV2 {
+            epoch: 1,
+            txn_id: uuid::Uuid::new_v4(),
+            expect_intents: false,
+        };
+
+        // The plain-HTTP transport refuses to carry migration-protocol commands.
+        let plain = nodus_raftstore::network::RaftTransport::plain();
+        let error = plain
+            .forward_write("127.0.0.1:1", "shard-x", &migration_cmd, "r1")
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("requires peer mTLS"),
+            "plain transport must refuse: {error}"
+        );
+
+        // Level-3 recipient: capability probe validates, and the forwarded
+        // command passes the ingress gate (unknown shard then yields 404).
+        let addr = serve_mtls(true).await;
+        let report = transport
+            .probe(1, &addr.to_string(), uuid::Uuid::new_v4(), false)
+            .await
+            .unwrap();
+        assert_eq!(
+            report.migration_version,
+            Some(nodus_raftstore::upgrade::MIGRATION_VERSION)
+        );
+        let error = transport
+            .forward_write(&addr.to_string(), "shard-x", &migration_cmd, "r2")
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("404"),
+            "finalized level-3 recipient passes the gate, then 404: {error}"
+        );
+
+        // Level-1 recipient: the ingress gate stays closed (501).
+        let addr = serve_mtls(false).await;
+        let error = transport
+            .forward_write(&addr.to_string(), "shard-x", &migration_cmd, "r3")
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("501"),
+            "unfinalized recipient rejects with 501: {error}"
+        );
+    }
+
+    /// The router's production gate follows the durable upgrade authority:
+    /// closed at level 1, opened by the finalized level-3 record, with no
+    /// config or environment bypass.
+    #[tokio::test]
+    async fn router_migration_gate_follows_the_durable_authority() {
+        use nodus_raftstore::ShardCommand;
+        use nodus_storage_api::KvEngine;
+
+        let base: Arc<dyn KvEngine> = Arc::new(nodus_storage_mem::MemKvEngine::new());
+        let manager = Arc::new(crate::multi_raft::MultiRaftManager::new(
+            1,
+            "127.0.0.1:0".into(),
+            Arc::new(openraft::Config::default().validate().unwrap()),
+            nodus_raftstore::server::RaftState::new(),
+            base.clone(),
+            None,
+            Arc::new(nodus_txn::MemTxnManager::new()),
+            None,
+            Default::default(),
+        ));
+        let gate_kv = base.clone();
+        let router =
+            crate::raft_router::RaftRouter::spawn(manager).with_migration_gate(move || {
+                nodus_raftstore::upgrade::read(gate_kv.as_ref()).is_ok_and(|authority| {
+                    authority.cluster_version >= nodus_raftstore::upgrade::MIGRATION_LEVEL
+                })
+            });
+        let command = || ShardCommand::EpochPrepareV2 {
+            epoch: 1,
+            txn_id: uuid::Uuid::new_v4(),
+            expect_intents: false,
+        };
+
+        // Level 1 (no authority record): the gate rejects before dispatch.
+        let router2 = router.clone();
+        let error = tokio::task::spawn_blocking(move || router2.submit("shard-x", command()))
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("migration protocol activation requires"),
+            "closed gate rejects: {error}"
+        );
+
+        // Finalized level 3: the gate opens; the command reaches the
+        // dispatcher and fails only because the group does not exist.
+        store_finalized_level3(base.as_ref());
+        let error = tokio::task::spawn_blocking(move || router.submit("shard-x", command()))
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("not found"),
+            "open gate lets the command through: {error}"
         );
     }
 

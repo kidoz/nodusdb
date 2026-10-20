@@ -138,9 +138,100 @@ impl RaftTransport {
         }
     }
 
+    /// Asks the node at `addr` for `group_id`'s read log index over the
+    /// transport's own scheme and credentials (plain HTTP + bearer, or mTLS).
+    /// `Ok(None)` means the leader's log is empty; transport errors and
+    /// non-success statuses (unknown group, not the leader) are `Err`.
+    pub async fn read_index(&self, addr: &str, group_id: &str) -> anyhow::Result<Option<u64>> {
+        let response = self
+            .authorize(self.client().post(format!(
+                "{}://{addr}/raft/{group_id}/read_index",
+                self.scheme()
+            )))
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("read-index to {addr}: {e}"))?;
+        anyhow::ensure!(
+            response.status().is_success(),
+            "leader {addr} could not serve read-index: {}",
+            response.status()
+        );
+        let body: crate::ReadIndexResponse = response
+            .json()
+            .await
+            .map_err(|e| anyhow::anyhow!("parse read-index response from {addr}: {e}"))?;
+        Ok(body.index)
+    }
+
+    /// Asks the node at `addr` for `group_id`'s leader read index. Succeeds
+    /// only when the group is hosted there and currently has a leader — used
+    /// to verify a remotely placed destination group is serving before a
+    /// migration publishes routing to it.
+    pub async fn group_read_index(&self, addr: &str, group_id: &str) -> anyhow::Result<u64> {
+        self.read_index(addr, group_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("group {group_id} on {addr} has no committed log yet"))
+    }
+
     /// The URL scheme RPCs are issued over (`http` or `https`).
     pub fn scheme(&self) -> &str {
         &self.scheme
+    }
+
+    /// Forwards a client write to the leader-side `/raft/{group}/write`
+    /// endpoint at `addr` over the transport's own scheme and credentials,
+    /// tagged with `request_id` so the leader can dedup a retried forward.
+    /// Ordinary commands use this; migration-protocol commands must go through
+    /// [`Self::forward_write`], which additionally enforces mTLS.
+    pub async fn forward_command(
+        &self,
+        addr: &str,
+        group_id: &str,
+        cmd: &crate::ShardCommand,
+        request_id: &str,
+    ) -> anyhow::Result<crate::ShardResponse> {
+        let response = self
+            .authorize(
+                self.client()
+                    .post(format!("{}://{addr}/raft/{group_id}/write", self.scheme()))
+                    .header(crate::server::REQUEST_ID_HEADER, request_id)
+                    .json(cmd),
+            )
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("forward to {addr}: {e}"))?;
+        if response.status().is_success() {
+            // The leader returns the applied ShardResponse so a forwarded
+            // prepare's vote reaches the coordinator.
+            response
+                .json::<crate::ShardResponse>()
+                .await
+                .map_err(|e| anyhow::anyhow!("parse forwarded write response from {addr}: {e}"))
+        } else {
+            Err(anyhow::anyhow!(
+                "leader {addr} rejected forwarded write: {}",
+                response.status()
+            ))
+        }
+    }
+
+    /// Forwards a migration-protocol command to the leader over the peer
+    /// transport. Hard-requires the mTLS `https` scheme: migration-protocol
+    /// commands never travel the shared bearer-token listener. Pair with
+    /// [`Self::probe`] so the recipient's reported capabilities are re-verified
+    /// before sending.
+    pub async fn forward_write(
+        &self,
+        addr: &str,
+        group_id: &str,
+        cmd: &crate::ShardCommand,
+        request_id: &str,
+    ) -> anyhow::Result<crate::ShardResponse> {
+        anyhow::ensure!(
+            self.scheme() == "https",
+            "migration-protocol forwarding requires peer mTLS"
+        );
+        self.forward_command(addr, group_id, cmd, request_id).await
     }
 
     /// The HTTP client for outbound RPCs, building the lazy plain-HTTP client on

@@ -272,10 +272,11 @@ impl MultiRaftManager {
         self.node_id
     }
 
-    /// The admin bearer token, reused as the internode credential for peers
-    /// that serve Raft HTTP routes on their public listener.
-    pub(crate) fn auth_token(&self) -> Option<String> {
-        self.admin_token.clone()
+    /// The outbound peer transport (plain HTTP, or mTLS when `cluster.tls` is
+    /// configured). The router uses it for capability-checked forwarding of
+    /// migration-protocol commands.
+    pub(crate) fn transport(&self) -> nodus_raftstore::network::RaftTransport {
+        self.transport.clone()
     }
 
     /// Durable directory for `shard_id`'s snapshots, or a unique temp dir when no

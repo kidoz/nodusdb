@@ -16,7 +16,7 @@
 //! `tokio::task::spawn_blocking`), never directly on a reactor worker thread.
 
 use anyhow::{Result, anyhow};
-use nodus_raftstore::{NodusTypeConfig, ReadIndexResponse, ShardCommand, ShardResponse};
+use nodus_raftstore::{NodusTypeConfig, ShardCommand, ShardResponse};
 use openraft::Raft;
 use openraft::error::{CheckIsLeaderError, ClientWriteError, ForwardToLeader, RaftError};
 use std::sync::Arc;
@@ -60,8 +60,13 @@ enum RouterRequest {
 #[derive(Clone)]
 pub struct RaftRouter {
     tx: mpsc::UnboundedSender<RouterRequest>,
-    #[cfg(test)]
-    migration_enabled: bool,
+    /// Isolated-fixture override; combined (OR) with the durable gate.
+    migration_override: Arc<std::sync::atomic::AtomicBool>,
+    /// Production activation: reads the durable upgrade authority and opens
+    /// only once the migration cluster level is finalized. Evaluated per
+    /// migration-protocol submission (ordinary writes never call it) and must
+    /// fail closed. Defaults to closed.
+    migration_gate: Arc<dyn Fn() -> bool + Send + Sync>,
 }
 
 impl RaftRouter {
@@ -70,19 +75,13 @@ impl RaftRouter {
     /// shard whose group is created later is reachable without re-spawning.
     pub fn spawn(manager: Arc<MultiRaftManager>) -> Self {
         let (tx, mut rx) = mpsc::unbounded_channel::<RouterRequest>();
-        // The admin token doubles as the internode credential: forwarded writes
-        // and read-index requests post to a peer's `/raft/...` ingress, which
-        // requires the same bearer token as the admin API when the peer serves
-        // Raft routes on its public listener.
-        let auth_token = manager.auth_token();
-        // Built on first actual use, inside `forward`/`fetch_read_index`. The
-        // client is only needed to forward a request to a remote leader (or run a
-        // cross-node read barrier); a single-node leader does neither, so it is
-        // never constructed there. That matters because the first
-        // `reqwest::Client::new()` in a process initializes the rustls + aws-lc-rs
-        // TLS stack, whose native-library load on macOS goes through a Gatekeeper
-        // code-signing assessment that can block startup for seconds.
-        let http: Arc<std::sync::OnceLock<reqwest::Client>> = Arc::new(std::sync::OnceLock::new());
+        // All peer traffic — ordinary forwarded writes, read-index requests,
+        // and migration-protocol commands — rides the manager's transport: plain
+        // HTTP + the admin bearer token, or the mTLS peer client when
+        // `cluster.tls` is configured. Migration-protocol commands additionally
+        // require the mTLS scheme and a capability re-probe (see
+        // `forward_migration`).
+        let transport = manager.transport();
         tokio::spawn(async move {
             while let Some(req) = rx.recv().await {
                 let shard_id = match &req {
@@ -91,7 +90,6 @@ impl RaftRouter {
                     | RouterRequest::RepairLegacy { shard_id, .. } => shard_id.clone(),
                 };
                 let raft = manager.get(&shard_id).await;
-                let http = http.clone();
                 // Drive each request concurrently so independent submissions do
                 // not serialize behind one another.
                 match (raft, req) {
@@ -115,19 +113,16 @@ impl RaftRouter {
                         });
                     }
                     (Some(raft), RouterRequest::Write { cmd, resp, .. }) => {
-                        let auth_token = auth_token.clone();
+                        let transport = transport.clone();
                         tokio::spawn(async move {
-                            let res =
-                                replicate(raft, &shard_id, cmd, &http, auth_token.as_deref()).await;
+                            let res = replicate(raft, &shard_id, cmd, &transport).await;
                             let _ = resp.send(res);
                         });
                     }
                     (Some(raft), RouterRequest::Barrier { resp, .. }) => {
-                        let auth_token = auth_token.clone();
+                        let transport = transport.clone();
                         tokio::spawn(async move {
-                            let res =
-                                linearizable_barrier(raft, &shard_id, &http, auth_token.as_deref())
-                                    .await;
+                            let res = linearizable_barrier(raft, &shard_id, &transport).await;
                             let _ = resp.send(res);
                         });
                     }
@@ -142,26 +137,30 @@ impl RaftRouter {
         });
         Self {
             tx,
-            #[cfg(test)]
-            migration_enabled: false,
+            migration_override: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            migration_gate: Arc::new(|| false),
         }
     }
 
+    /// Wire the production activation gate: a durable-authority read that
+    /// opens only at the finalized migration cluster level. Fails closed on
+    /// any read error by construction of the closure.
+    pub fn with_migration_gate(mut self, gate: impl Fn() -> bool + Send + Sync + 'static) -> Self {
+        self.migration_gate = Arc::new(gate);
+        self
+    }
+
     pub(crate) fn migration_enabled(&self) -> bool {
-        #[cfg(test)]
-        {
-            self.migration_enabled
-        }
-        #[cfg(not(test))]
-        {
-            false
-        }
+        self.migration_override
+            .load(std::sync::atomic::Ordering::Acquire)
+            || (self.migration_gate)()
     }
 
     /// Isolated fixtures only: no config flag or production activation bypass.
     #[cfg(test)]
     pub(crate) fn enable_migration_for_test(&mut self) {
-        self.migration_enabled = true;
+        self.migration_override
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     pub(crate) fn repair_legacy(
@@ -262,8 +261,7 @@ async fn replicate(
     raft: Raft<NodusTypeConfig>,
     group_id: &str,
     cmd: ShardCommand,
-    http: &std::sync::OnceLock<reqwest::Client>,
-    auth_token: Option<&str>,
+    transport: &nodus_raftstore::network::RaftTransport,
 ) -> WriteResult {
     // A stable id for this logical write, shared across every retry/forward
     // below, so the leader can dedup a re-forwarded write whose prior response
@@ -273,24 +271,40 @@ async fn replicate(
         match raft.client_write(cmd.clone()).await {
             Ok(resp) => return Ok(resp.data),
             Err(RaftError::APIError(ClientWriteError::ForwardToLeader(ForwardToLeader {
+                leader_id,
                 leader_node: Some(node),
                 ..
-            }))) => match forward(
-                http.get_or_init(reqwest::Client::new),
-                &node.addr,
-                group_id,
-                &cmd,
-                &request_id,
-                auth_token,
-            )
-            .await
-            {
-                Ok(resp) => return Ok(resp),
-                // The leader may have just changed; re-evaluate after a beat.
-                Err(e) => {
-                    tracing::debug!("forward of {group_id} write to {} failed: {e}", node.addr)
+            }))) => {
+                let forwarded = if cmd.requires_migration_protocol() {
+                    if transport.scheme() != "https" {
+                        // No retry changes this: migration-protocol commands
+                        // never travel the shared bearer-token listener.
+                        return Err(anyhow!(
+                            "migration protocol command for '{group_id}' needs leader forwarding, which requires the mTLS peer transport (cluster.tls)"
+                        ));
+                    }
+                    forward_migration(
+                        transport,
+                        leader_id,
+                        &node.addr,
+                        group_id,
+                        &cmd,
+                        &request_id,
+                    )
+                    .await
+                } else {
+                    transport
+                        .forward_command(&node.addr, group_id, &cmd, &request_id)
+                        .await
+                };
+                match forwarded {
+                    Ok(resp) => return Ok(resp),
+                    // The leader may have just changed; re-evaluate after a beat.
+                    Err(e) => {
+                        tracing::debug!("forward of {group_id} write to {} failed: {e}", node.addr)
+                    }
                 }
-            },
+            }
             // No known leader yet — wait for an election, then retry.
             Err(RaftError::APIError(ClientWriteError::ForwardToLeader(ForwardToLeader {
                 leader_node: None,
@@ -303,40 +317,35 @@ async fn replicate(
     Err(anyhow!("raft write to '{group_id}' did not reach a leader"))
 }
 
-/// Posts a command to `addr`'s leader-side write endpoint for `group_id`,
-/// tagging it with `request_id` so the leader can dedup a retried forward.
-async fn forward(
-    http: &reqwest::Client,
+/// Forwards a migration-protocol command to the group's leader over the peer
+/// mTLS transport. The recipient is re-probed immediately before the send and
+/// must report a migration capability at or above `MIGRATION_VERSION`; the
+/// probe is challenge-bound to the TLS-authenticated peer, so a recipient that
+/// cannot enforce the protocol is never sent the command. Rejected forwards
+/// never enter the leader's dedup cache (leader-side behavior, unchanged).
+async fn forward_migration(
+    transport: &nodus_raftstore::network::RaftTransport,
+    leader_id: Option<u64>,
     addr: &str,
     group_id: &str,
     cmd: &ShardCommand,
     request_id: &str,
-    auth_token: Option<&str>,
 ) -> WriteResult {
-    let url = format!("http://{addr}/raft/{group_id}/write");
-    let mut req = http
-        .post(&url)
-        .header(nodus_raftstore::server::REQUEST_ID_HEADER, request_id)
-        .json(cmd);
-    if let Some(token) = auth_token {
-        req = req.bearer_auth(token);
-    }
-    let resp = req
-        .send()
+    let leader_id = leader_id
+        .ok_or_else(|| anyhow!("cannot forward migration command to {addr}: leader id unknown"))?;
+    let report = transport
+        .probe(leader_id, addr, uuid::Uuid::new_v4(), false)
         .await
-        .map_err(|e| anyhow!("forward to {addr}: {e}"))?;
-    if resp.status().is_success() {
-        // The leader returns the applied ShardResponse so a forwarded prepare's
-        // vote reaches the coordinator.
-        resp.json::<ShardResponse>()
-            .await
-            .map_err(|e| anyhow!("parse forwarded write response from {addr}: {e}"))
-    } else {
-        Err(anyhow!(
-            "leader {addr} rejected forwarded write: {}",
-            resp.status()
-        ))
-    }
+        .map_err(|e| anyhow!("migration forward to {addr}: capability probe failed: {e}"))?;
+    anyhow::ensure!(
+        report.migration_version >= Some(nodus_raftstore::upgrade::MIGRATION_VERSION),
+        "migration forward to {addr}: peer reports migration_version {:?}, below {}",
+        report.migration_version,
+        nodus_raftstore::upgrade::MIGRATION_VERSION
+    );
+    transport
+        .forward_write(addr, group_id, cmd, request_id)
+        .await
 }
 
 /// Runs a linearizable-read barrier on this node's replica of `group_id`.
@@ -351,8 +360,7 @@ async fn forward(
 async fn linearizable_barrier(
     raft: Raft<NodusTypeConfig>,
     group_id: &str,
-    http: &std::sync::OnceLock<reqwest::Client>,
-    auth_token: Option<&str>,
+    transport: &nodus_raftstore::network::RaftTransport,
 ) -> Result<()> {
     for _ in 0..25 {
         match raft.ensure_linearizable().await {
@@ -364,14 +372,7 @@ async fn linearizable_barrier(
                 leader_node: Some(node),
                 ..
             }))) => {
-                match fetch_read_index(
-                    http.get_or_init(reqwest::Client::new),
-                    &node.addr,
-                    group_id,
-                    auth_token,
-                )
-                .await
-                {
+                match transport.read_index(&node.addr, group_id).await {
                     Ok(Some(index)) => {
                         raft.wait(Some(BARRIER_WAIT))
                             .applied_index_at_least(Some(index), "linearizable read barrier")
@@ -401,35 +402,4 @@ async fn linearizable_barrier(
     Err(anyhow!(
         "linearizable barrier on '{group_id}' did not converge"
     ))
-}
-
-/// Asks the leader at `addr` for its read log index for `group_id`. The leader
-/// confirms its own leadership (quorum heartbeat) before answering, so the
-/// returned index is a safe linearization point for a follower to wait on.
-async fn fetch_read_index(
-    http: &reqwest::Client,
-    addr: &str,
-    group_id: &str,
-    auth_token: Option<&str>,
-) -> Result<Option<u64>> {
-    let url = format!("http://{addr}/raft/{group_id}/read_index");
-    let mut req = http.post(&url);
-    if let Some(token) = auth_token {
-        req = req.bearer_auth(token);
-    }
-    let resp = req
-        .send()
-        .await
-        .map_err(|e| anyhow!("read-index to {addr}: {e}"))?;
-    if resp.status().is_success() {
-        resp.json::<ReadIndexResponse>()
-            .await
-            .map(|r| r.index)
-            .map_err(|e| anyhow!("parse read-index response from {addr}: {e}"))
-    } else {
-        Err(anyhow!(
-            "leader {addr} could not serve read-index: {}",
-            resp.status()
-        ))
-    }
 }
