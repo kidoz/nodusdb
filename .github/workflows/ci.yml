@@ -39,6 +39,8 @@ jobs:
         run: RUSTFLAGS="--cfg loom" LOOM_MAX_PREEMPTIONS=3 cargo test --locked -p nodus_txn --release loom_
       - name: Compile Storage Engine Benchmarks
         run: cargo bench --locked --no-run -p nodus_storage_lsm
+      - name: Server benchmark smoke (1/100 scale sanity floor)
+        run: NODUS_BENCH_SCALE=smoke cargo bench --locked -p nodus_integration_tests --bench server_bench
 
   frontend:
     name: Frontend build, lint, test, and audit

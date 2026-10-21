@@ -2310,6 +2310,9 @@ name = "nodus_integration_tests"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
+ "criterion",
+ "futures-util",
  "nodus_backup",
  "nodus_config",
  "nodus_testkit",

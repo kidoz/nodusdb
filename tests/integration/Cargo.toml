@@ -23,3 +23,12 @@ serial_test = "4.0.1"
 tempfile = "3.27.0"
 tokio.workspace = true
 tokio-postgres.workspace = true
+
+[dev-dependencies]
+bytes.workspace = true
+criterion.workspace = true
+futures-util.workspace = true
+
+[[bench]]
+name = "server_bench"
+harness = false
