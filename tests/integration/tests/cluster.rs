@@ -592,18 +592,41 @@ async fn sharded_table_replicates_and_survives_leader_failure() {
     );
 }
 
-/// Restore writes bypass Raft consensus, so the restore endpoint refuses to run
-/// on a clustered node (409) rather than silently diverging replicas. The guard
-/// fires before the backup is even loaded, so any backup id exercises it.
+/// A cluster with data refuses restore before the backup is even loaded
+/// (`restore_clustered_not_empty`, 409): the replay would merge onto live
+/// state while peers keep serving. A fresh cluster proceeds to the backup
+/// lookup — an unknown backup id fails as an ordinary restore error instead.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial(cluster)]
-async fn restore_is_rejected_on_a_clustered_node() {
+async fn restore_on_a_cluster_requires_a_fresh_cluster() {
     let cluster = ClusterFixture::start(3)
         .await
         .expect("3-node cluster forms");
     assert!(cluster.wait_nodes_live(3, Duration::from_secs(45)).await);
 
     let http = reqwest::Client::new();
+    // Fresh cluster: the freshness gate passes and the unknown backup id is
+    // what fails (no cluster-level refusal).
+    let resp = http
+        .post(format!(
+            "http://{}/api/v1/backups/any-backup/restore",
+            cluster.nodes[1].http_addr()
+        ))
+        .bearer_auth(nodus_testkit::cluster::ADMIN_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_ne!(body["code"], "restore_clustered_not_empty");
+    assert!(body["error"].as_str().is_some());
+
+    // With data present, the freshness gate refuses before loading the backup.
+    let client = cluster.pg_client(0).await.unwrap();
+    client
+        .batch_execute("CREATE TABLE guard_t (id INT PRIMARY KEY); INSERT INTO guard_t VALUES (1)")
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
     let resp = http
         .post(format!(
             "http://{}/api/v1/backups/any-backup/restore",
@@ -615,7 +638,7 @@ async fn restore_is_rejected_on_a_clustered_node() {
         .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
     let body: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(body["code"], "restore_clustered_unsupported");
+    assert_eq!(body["code"], "restore_clustered_not_empty");
 }
 
 /// Node removal is the operator recourse for a permanently dead node: it is

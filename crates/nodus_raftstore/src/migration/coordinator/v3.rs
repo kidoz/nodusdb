@@ -482,6 +482,13 @@ fn apply_plan(
     if !coverage_matches(migration, &plan.expected_map, meta)? {
         return Ok(reject("plan does not cover every row/index source group"));
     }
+    // Symmetric exclusion: a backup export in flight must not interleave with
+    // a routing change (the backup journal's Plan refuses likewise).
+    for job in crate::backup::list_jobs(kv)? {
+        if job.phase == crate::backup::PhaseV1::Exporting {
+            return Ok(reject("a cluster backup is exporting; migration waits"));
+        }
+    }
     // The meta fence epoch is readable at apply (this IS the meta group); a
     // plan carrying a stale one could never fence and would wedge at Fencing
     // with no way forward, so reject it while planning is still retryable.

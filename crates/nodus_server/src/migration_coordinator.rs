@@ -7,11 +7,13 @@ use crate::{
     raft_router::RaftRouter,
 };
 use anyhow::{Result, anyhow, ensure};
-use bytes::Bytes;
 use nodus_catalog::TableId;
 use nodus_raftstore::{
     ShardCommand,
-    migration::coordinator::{self, PhaseV2, PlanV2, RecordV2, driver::Backend, v3},
+    migration::{
+        self,
+        coordinator::{self, PhaseV2, PlanV2, RecordV2, driver::Backend, v3},
+    },
 };
 use std::{sync::Arc, time::Duration};
 
@@ -232,12 +234,14 @@ pub async fn journal_discovery_loop(
 }
 
 /// The table id of any migration journal that could still drive routing
-/// changes: any V1 record (legacy, needs explicit reconciliation), a V2 record
-/// before `Fenced`, or a V3 record before `Done`/`Cancelled`. A V3 `Done`
-/// journal's residual work is source decommission only — placements are
-/// already final — so it does not block. Reads the local meta replica; callers
-/// needing currency take a meta read barrier first.
+/// changes, if one exists (see `migration::active_journal_table`). Reads the
+/// local meta replica behind a ReadIndex barrier.
 pub(crate) async fn active_migration(manager: &Arc<MultiRaftManager>) -> Result<Option<TableId>> {
+    let raft = manager
+        .get(META_SHARD)
+        .await
+        .ok_or_else(|| anyhow!("meta group unavailable"))?;
+    raft.ensure_linearizable().await?;
     let machine = manager.machine(META_SHARD).await?;
     let kv = machine
         .read()
@@ -245,36 +249,5 @@ pub(crate) async fn active_migration(manager: &Arc<MultiRaftManager>) -> Result<
         .kv
         .clone()
         .ok_or_else(|| anyhow!("meta storage unavailable"))?;
-    let table_of = |prefix: &[u8], key: &[u8]| -> Result<TableId> {
-        let suffix = std::str::from_utf8(&key[prefix.len()..])?;
-        Ok(TableId(uuid::Uuid::parse_str(suffix)?))
-    };
-    let scan = |prefix: &'static [u8], end: &'static [u8]| -> Result<Vec<(Bytes, Bytes)>> {
-        kv.scan(
-            nodus_storage_api::KeyRange {
-                start: prefix.into(),
-                end: end.into(),
-            },
-            u64::MAX,
-        )?
-        .map(|r| r.map(|p| (p.key, p.value)))
-        .collect()
-    };
-    // V1: any journal blocks until explicitly reconciled.
-    if let Some((key, _)) = scan(b"\x01migration/v1/table/", b"\x01migration/v1/table0")?.first() {
-        return Ok(Some(table_of(b"\x01migration/v1/table/", key)?));
-    }
-    for (_, value) in scan(coordinator::JOURNAL_PREFIX, b"\x01migration/v2/table0")? {
-        let record = coordinator::decode(&value)?;
-        if !matches!(record.phase, PhaseV2::Fenced | PhaseV2::Cancelled) {
-            return Ok(Some(record.plan.migration.table_id));
-        }
-    }
-    for (_, value) in scan(v3::JOURNAL_PREFIX, b"\x01migration/v3/table0")? {
-        let record = v3::decode(&value)?;
-        if !matches!(record.phase, v3::PhaseV3::Done | v3::PhaseV3::Cancelled) {
-            return Ok(Some(record.plan.migration.table_id));
-        }
-    }
-    Ok(None)
+    migration::active_journal_table(kv.as_ref())
 }

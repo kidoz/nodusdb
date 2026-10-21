@@ -2,7 +2,7 @@
 //! V2/V3 journals to their terminal phases, and terminal journals are left
 //! alone. Single-node fixtures exercise the real `ProductionBackendV3` and
 //! `MigrationCoordinator` against real in-process Raft groups.
-use super::driver::{assert_completed, new_mem_fixture, split_plan};
+use super::driver::{DriverFixture, assert_completed, new_mem_fixture, split_plan};
 use super::*;
 use crate::migration_coordinator::{drive_open_journals_once, v3_backend::ProductionBackendV3};
 use crate::multi_raft::META_SHARD;
@@ -258,5 +258,139 @@ async fn active_migration_tracks_journal_terminality() {
     }
     assert_eq!(fx.journal(table).await.phase, P3::Done);
     assert_eq!(active_migration(&fx.manager).await.unwrap(), None);
+    fx.manager.shutdown_all().await;
+}
+
+// ---- Backup job journal (journaled through the same meta group) ----
+
+use nodus_raftstore::backup::{self, CommandV1 as B1, JobV1, KindV1, PhaseV1 as BP};
+
+fn job(id: u128, updated_at_ms: u64) -> JobV1 {
+    JobV1 {
+        job_id: Uuid::from_u128(id),
+        backup_id: format!("backup-{id}"),
+        creator: 1,
+        cluster_id: "test".into(),
+        kind: KindV1::Full,
+        backup_ts: 0,
+        protected_ts: None,
+        updated_at_ms,
+        phase: BP::Exporting,
+        error: None,
+    }
+}
+
+async fn backup_cmd(fx: &DriverFixture, cmd: B1) -> ShardResponse {
+    fx.manager
+        .get(META_SHARD)
+        .await
+        .unwrap()
+        .client_write(ShardCommand::BackupJobV1(cmd))
+        .await
+        .unwrap()
+        .data
+}
+
+/// The mutual exclusion, both directions: a V3 migration plan is refused while
+/// a backup exports, and a backup job is refused while a migration journal is
+/// active. Completion frees both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn backup_and_migration_jobs_exclude_each_other() {
+    let (_dir, fx) = new_mem_fixture().await;
+
+    // A backup job blocks V3 planning.
+    assert!(
+        backup_cmd(&fx, B1::Plan(Box::new(job(1, 1_000))))
+            .await
+            .success
+    );
+    let table = TableId::new();
+    let orchestrator = ShardOrchestrator::new(fx.meta.clone());
+    let source = orchestrator.init_single_shard(table).unwrap();
+    orchestrator.move_shard(source, "1").unwrap();
+    let plan = split_plan(&fx, table, source);
+    let rejected = fx.command(C3::Plan(plan.clone())).await;
+    assert!(!rejected.success);
+    let error = rejected.error.unwrap_or_default();
+    assert!(error.contains("backup is exporting"), "{error}");
+
+    // Completing the export frees migration planning.
+    assert!(
+        backup_cmd(
+            &fx,
+            B1::Complete {
+                job: Uuid::from_u128(1)
+            }
+        )
+        .await
+        .success
+    );
+    assert!(fx.command(C3::Plan(plan)).await.success);
+
+    // And the reverse: a second job is refused while the migration is active.
+    let rejected = backup_cmd(&fx, B1::Plan(Box::new(job(2, 2_000)))).await;
+    assert!(!rejected.success);
+    let error = rejected.error.unwrap_or_default();
+    assert!(error.contains("migration"), "{error}");
+    fx.manager.shutdown_all().await;
+}
+
+/// The meta-leader sweep marks a job whose heartbeat stopped as `Failed` —
+/// never restorable — and leaves a heartbeating job alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sweep_fails_abandoned_jobs_and_spares_live_ones() {
+    let (_dir, fx) = new_mem_fixture().await;
+    let now = 10_000_000u64;
+    // Fresh job (heartbeat current): the sweep leaves it alone.
+    assert!(
+        backup_cmd(&fx, B1::Plan(Box::new(job(1, now))))
+            .await
+            .success
+    );
+    assert_eq!(
+        crate::backup_coordinator::sweep_stale_jobs_once(
+            &fx.manager,
+            &fx.router,
+            now,
+            std::time::Duration::from_secs(600),
+        )
+        .await
+        .unwrap(),
+        0
+    );
+    // Complete job 1 so job 2 can open; then job 2 goes silent.
+    assert!(
+        backup_cmd(
+            &fx,
+            B1::Complete {
+                job: Uuid::from_u128(1)
+            }
+        )
+        .await
+        .success
+    );
+    assert!(backup_cmd(&fx, B1::Plan(Box::new(job(2, 0)))).await.success);
+    assert_eq!(
+        crate::backup_coordinator::sweep_stale_jobs_once(
+            &fx.manager,
+            &fx.router,
+            now,
+            std::time::Duration::from_secs(600),
+        )
+        .await
+        .unwrap(),
+        1
+    );
+    let record = backup::read_job(fx.base.as_ref(), Uuid::from_u128(2))
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.phase, BP::Failed);
+    assert!(record.error.unwrap().contains("heartbeat stale"));
+    // The failed job frees the slot for the next export.
+    assert!(
+        backup_cmd(&fx, B1::Plan(Box::new(job(3, now))))
+            .await
+            .success
+    );
     fx.manager.shutdown_all().await;
 }

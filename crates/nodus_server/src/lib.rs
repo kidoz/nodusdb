@@ -1,5 +1,6 @@
 #![allow(clippy::collapsible_if)]
 mod admin;
+mod backup_coordinator;
 pub mod migration_coordinator;
 #[cfg(test)]
 mod migration_tests;
@@ -793,6 +794,25 @@ pub async fn run_server_full(
         .await;
     });
 
+    // Backup job sweep: the meta leader fails exporting jobs whose heartbeat
+    // proves the exporter died, so an abandoned cluster backup never blocks
+    // migrations or pins GC forever.
+    let backup_raft = raft.clone();
+    let backup_manager = multi_raft.clone();
+    let backup_router = raft_router.clone();
+    let backup_shutdown = shutdown.clone();
+    let backup_sweep_task = tokio::spawn(async move {
+        crate::backup_coordinator::backup_job_sweep_loop(
+            backup_raft,
+            backup_manager,
+            backup_router,
+            node_id,
+            std::time::Duration::from_secs(10),
+            backup_shutdown,
+        )
+        .await;
+    });
+
     let authz = Arc::new(nodus_authz::DefaultAuthzEngine::new(catalog.clone()));
 
     let executor = Arc::new(nodus_executor::MemExecutor::new(
@@ -1065,6 +1085,7 @@ pub async fn run_server_full(
     // oldest retained backup snapshot.
     let gc_executor = executor.clone();
     let gc_backup = backup.clone();
+    let gc_kv = local_kv.clone();
     let gc_metrics = state.metrics.clone();
     let mut gc_shutdown = shutdown.clone();
     let gc_task = tokio::spawn(async move {
@@ -1077,7 +1098,7 @@ pub async fn run_server_full(
                     // versions a retained restore point still needs. Skip the
                     // tick instead; the next tick retries. One retention view
                     // per tick keeps the pass to a single repository scan.
-                    let protected = match gc_backup.retention_view().await {
+                    let backup_pin = match gc_backup.retention_view().await {
                         Ok(view) => view.protected_gc_watermark(),
                         Err(error) => {
                             tracing::warn!(
@@ -1086,6 +1107,34 @@ pub async fn run_server_full(
                             continue;
                         }
                     };
+                    // An in-flight migration copy pins its protected read
+                    // timestamp: reclaiming below it would invalidate the copy
+                    // source. Same fail-closed rule as the backup pin.
+                    let migration_pin = match nodus_raftstore::migration::coordinator::v3::protected_gc_watermark(gc_kv.as_ref()) {
+                        Ok(pin) => pin,
+                        Err(error) => {
+                            tracing::warn!(
+                                "migration journal unreadable; skipping GC tick: {error}"
+                            );
+                            continue;
+                        }
+                    };
+                    // An in-flight incremental backup pins its parent's
+                    // snapshot timestamp so the exported version window
+                    // survives reclamation for the job's lifetime.
+                    let backup_job_pin = match nodus_raftstore::backup::protected_gc_watermark(gc_kv.as_ref()) {
+                        Ok(pin) => pin,
+                        Err(error) => {
+                            tracing::warn!(
+                                "backup job journal unreadable; skipping GC tick: {error}"
+                            );
+                            continue;
+                        }
+                    };
+                    let protected = [backup_pin, migration_pin, backup_job_pin]
+                        .into_iter()
+                        .flatten()
+                        .min();
                     if let Ok(reclaimed) = gc_executor.run_gc_with_protected_watermark(protected)
                         && reclaimed > 0
                     {
@@ -1574,6 +1623,7 @@ pub async fn run_server_full(
                 janitor_task,
                 recovery_task,
                 migration_task,
+                backup_sweep_task,
                 wal_archiver_task,
                 raft_shutdown_task,
                 shard_reconcile_task,

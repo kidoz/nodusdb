@@ -457,3 +457,141 @@ fn membership_members(
         .map(|(id, node)| (*id, node.clone()))
         .collect()
 }
+
+/// Meta-leader loss with an exporting backup job: the surviving leader's sweep
+/// marks the abandoned job `Failed`, so a crashed exporter never blocks future
+/// backups. The journal replicates; the sweep runs on the new leader.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn backup_job_abandoned_by_a_dead_exporter_is_swept_after_failover() {
+    use nodus_raftstore::backup::{self, JobV1, KindV1, PhaseV1 as BP};
+
+    let dir = tempfile::tempdir().unwrap();
+    let (cert_path, key_path, ca_path) = crate::tests::write_test_certs(dir.path());
+    let tls = nodus_config::ClusterTlsConfig {
+        enabled: true,
+        cert_path: Some(cert_path),
+        key_path: Some(key_path),
+        ca_path: Some(ca_path),
+    };
+    let mut listeners = Vec::new();
+    let mut members = BTreeMap::new();
+    for id in 1..=3u64 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        members.insert(
+            id,
+            openraft::BasicNode::new(listener.local_addr().unwrap().to_string()),
+        );
+        listeners.push((id, listener));
+    }
+    let membership = StoredMembership::new(
+        None,
+        Membership::new(vec![BTreeSet::from([1, 2, 3])], members),
+    );
+    let authority = finalized_level3(&membership);
+    let mut nodes = Vec::new();
+    for (id, listener) in listeners {
+        nodes.push(
+            v3_node(
+                id,
+                listener,
+                &dir.path().join(id.to_string()),
+                &tls,
+                &authority,
+            )
+            .await,
+        );
+    }
+    nodes[0]
+        .manager
+        .get(META_SHARD)
+        .await
+        .unwrap()
+        .initialize(membership_members(&membership))
+        .await
+        .unwrap();
+    assert_eq!(await_leader(&nodes, META_SHARD).await, 0);
+
+    // Node 1 (meta leader) opens an export and dies before completing it.
+    let job = JobV1 {
+        job_id: Uuid::from_u128(77),
+        backup_id: "backup-77".into(),
+        creator: 1,
+        cluster_id: "test".into(),
+        kind: KindV1::Full,
+        backup_ts: 0,
+        protected_ts: None,
+        updated_at_ms: 0,
+        phase: BP::Exporting,
+        error: None,
+    };
+    crate::backup_coordinator::plan_job(&nodes[0].router, job)
+        .await
+        .unwrap();
+    nodes[0].manager.shutdown_all().await;
+    nodes[0].server.take().unwrap().abort();
+
+    // The survivor leader sweeps the abandoned job.
+    let survivors: Vec<&V3Node> = nodes.iter().skip(1).collect();
+    let leader = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            for (i, node) in survivors.iter().enumerate() {
+                if node.meta_leader().await {
+                    return i;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let leader = survivors[leader];
+    let now_ms = 10_000_000u64;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let failed = crate::backup_coordinator::sweep_stale_jobs_once(
+                &leader.manager,
+                &leader.router,
+                now_ms,
+                crate::backup_coordinator::JOB_STALE_AFTER,
+            )
+            .await
+            .unwrap();
+            if failed == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let record = backup::read_job(leader.kv.as_ref(), Uuid::from_u128(77))
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.phase, BP::Failed, "journal replicated and swept");
+
+    // The failed job frees the slot: the next backup plans on the survivor.
+    crate::backup_coordinator::plan_job(
+        &leader.router,
+        JobV1 {
+            job_id: Uuid::from_u128(78),
+            backup_id: "backup-78".into(),
+            creator: leader.id,
+            cluster_id: "test".into(),
+            kind: KindV1::Full,
+            backup_ts: 0,
+            protected_ts: None,
+            updated_at_ms: now_ms,
+            phase: BP::Exporting,
+            error: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    for node in &mut nodes[1..] {
+        node.manager.shutdown_all().await;
+        if let Some(server) = node.server.take() {
+            server.abort();
+        }
+    }
+}

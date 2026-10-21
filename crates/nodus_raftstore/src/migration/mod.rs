@@ -124,6 +124,51 @@ pub(crate) fn is_control_key(key: &[u8]) -> bool {
         || key.starts_with(coordinator::v3::JOURNAL_PREFIX)
 }
 
+/// The table id of any migration journal that could still drive routing
+/// changes: any V1 record (legacy, needs explicit reconciliation), a V2 record
+/// before `Fenced`, or a V3 record before `Done`/`Cancelled`. A V3 `Done`
+/// journal's residual work is source decommission only — routing is final.
+/// Used by the backup journal's Plan (mutual exclusion) and the rebalance
+/// guard; reads whatever replica the caller's kv reflects.
+pub fn active_journal_table(kv: &dyn KvEngine) -> Result<Option<TableId>> {
+    let scan = |prefix: &'static [u8], end: &'static [u8]| -> Result<Vec<(Bytes, Bytes)>> {
+        kv.scan(
+            nodus_storage_api::KeyRange {
+                start: prefix.into(),
+                end: end.into(),
+            },
+            u64::MAX,
+        )?
+        .map(|r| r.map(|p| (p.key, p.value)))
+        .collect()
+    };
+    // V1: any journal blocks until explicitly reconciled.
+    let v1_prefix: &[u8] = b"\x01migration/v1/table/";
+    if let Some((key, _)) = scan(v1_prefix, b"\x01migration/v1/table0")?.first() {
+        let suffix = std::str::from_utf8(&key[v1_prefix.len()..])?;
+        return Ok(Some(TableId(uuid::Uuid::parse_str(suffix)?)));
+    }
+    for (_, value) in scan(coordinator::JOURNAL_PREFIX, b"\x01migration/v2/table0")? {
+        let record = coordinator::decode(&value)?;
+        if !matches!(
+            record.phase,
+            coordinator::PhaseV2::Fenced | coordinator::PhaseV2::Cancelled
+        ) {
+            return Ok(Some(record.plan.migration.table_id));
+        }
+    }
+    for (_, value) in scan(coordinator::v3::JOURNAL_PREFIX, b"\x01migration/v3/table0")? {
+        let record = coordinator::v3::decode(&value)?;
+        if !matches!(
+            record.phase,
+            coordinator::v3::PhaseV3::Done | coordinator::v3::PhaseV3::Cancelled
+        ) {
+            return Ok(Some(record.plan.migration.table_id));
+        }
+    }
+    Ok(None)
+}
+
 /// Snapshots cannot delete or roll back durable migration state.
 pub(crate) fn validate_snapshot_record(
     kv: &dyn KvEngine,
@@ -458,6 +503,9 @@ pub(crate) fn apply(
         }
         ShardCommand::MigrationV3(command) => {
             return coordinator::v3::apply_v3(kv, command, index, meta).map(Some);
+        }
+        ShardCommand::BackupJobV1(command) => {
+            return crate::backup::apply(kv, command, index).map(Some);
         }
         ShardCommand::UpdateShardMapConditional {
             table,

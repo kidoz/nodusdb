@@ -84,10 +84,10 @@ pub struct AdminState {
     pub restore_in_flight: Arc<parking_lot::Mutex<Option<String>>>,
 }
 
-/// Whether shard init/split are past the containment fence on this node: the
-/// durable upgrade authority has finalized the migration cluster level.
-/// Fails closed on any read error. Merge and rebalance stay fenced regardless.
-fn shard_migration_enabled(state: &AdminState) -> bool {
+/// Whether the durable upgrade authority has finalized the migration cluster
+/// level on this node. Fails closed on any read error. Gates shard mutations
+/// and the backup job journal.
+fn migration_level_finalized(state: &AdminState) -> bool {
     nodus_raftstore::upgrade::read(state.manager.base_kv().as_ref()).is_ok_and(|authority| {
         authority.cluster_version >= nodus_raftstore::upgrade::MIGRATION_LEVEL
     })
@@ -256,7 +256,7 @@ async fn require_token(
     let unsafe_shard_mutation = method == axum::http::Method::POST
         && path.starts_with("/api/v1/shards/")
         && matches!(shard_op, Some("init" | "split" | "merge" | "rebalance"))
-        && !shard_migration_enabled(&state);
+        && !migration_level_finalized(&state);
     let response = if unsafe_shard_mutation {
         shard_migration_unavailable()
     } else {
@@ -989,10 +989,30 @@ fn catalog_snapshot_for_backup(
 }
 
 /// Creates a full backup capturing a catalog snapshot and the audit trail.
+///
+/// At the finalized migration level the backup is journaled on the meta group
+/// before any export: the job pins GC for incremental windows, excludes
+/// concurrent migrations (and vice versa), and is marked `Failed` by the meta
+/// leader's sweep if this node dies mid-export. Below that level the
+/// node-local path is unchanged.
 async fn create_backup(
     State(state): State<AdminState>,
     Query(query): Query<CreateBackupQuery>,
 ) -> Json<Value> {
+    let journaled = migration_level_finalized(&state);
+    if journaled {
+        match crate::migration_coordinator::active_migration(&state.manager).await {
+            Ok(Some(active)) => {
+                return Json(json!({
+                    "error": format!("migration in flight for table {active}; backups wait for it to complete or cancel")
+                }));
+            }
+            Ok(None) => {}
+            Err(e) => {
+                return Json(json!({ "error": format!("migration journal scan failed: {e}") }));
+            }
+        }
+    }
     let generation = match state.backup.capture_generation() {
         Ok(generation) => generation,
         Err(error) => return Json(json!({ "error": error.to_string() })),
@@ -1018,6 +1038,69 @@ async fn create_backup(
     } else {
         None
     };
+
+    // Plan the journaled job before the export reads anything: an
+    // incremental's GC pin (parent snapshot + 1) must cover the whole scan,
+    // and a rejected plan means nothing was exported at all. The job id
+    // doubles as the manifest's backup id, so the cluster-visible job and the
+    // repository object share one identity. `backup_ts` is chosen by the scan
+    // below; the manifest carries it.
+    let job_id = Uuid::new_v4();
+    let mut heartbeat_stop = None;
+    if journaled {
+        let kind = match query.parent_backup_id.as_ref() {
+            Some(parent) => nodus_raftstore::backup::KindV1::Incremental {
+                parent: parent.clone(),
+            },
+            None => nodus_raftstore::backup::KindV1::Full,
+        };
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let job = nodus_raftstore::backup::JobV1 {
+            job_id,
+            backup_id: job_id.to_string(),
+            creator: state.manager.node_id(),
+            cluster_id: "local".into(),
+            kind,
+            backup_ts: 0,
+            protected_ts: parent_snapshot_ts.map(|ts| ts.saturating_add(1)),
+            updated_at_ms: now_ms,
+            phase: nodus_raftstore::backup::PhaseV1::Exporting,
+            error: None,
+        };
+        if let Err(e) = crate::backup_coordinator::plan_job(&state.router, job).await {
+            return Json(json!({
+                "error": format!("backup job not journaled; nothing exported: {e}")
+            }));
+        }
+        // Heartbeat while the export runs so a long scan is never mistaken
+        // for a dead creator by the meta leader's sweep.
+        let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
+        let heartbeat_router = state.router.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(30));
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        let now_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as u64)
+                            .unwrap_or(0);
+                        if let Err(e) =
+                            crate::backup_coordinator::heartbeat_job(&heartbeat_router, job_id, now_ms).await
+                        {
+                            tracing::warn!("backup job heartbeat failed: {e}");
+                        }
+                    }
+                    _ = stop_rx.changed() => break,
+                }
+            }
+        });
+        heartbeat_stop = Some(stop_tx);
+    }
+    let job_journal = journaled.then_some(job_id);
 
     let snapshot = catalog_snapshot_for_backup(state.catalog.as_ref(), cluster_version);
     let catalog_bytes = match serde_json::to_vec(&snapshot) {
@@ -1134,11 +1217,6 @@ async fn create_backup(
         }
     }
 
-    let kv_bytes = match serde_json::to_vec(&kv_dump) {
-        Ok(b) => b,
-        Err(e) => return Json(json!({ "error": format!("Failed to serialize KV dump: {e}") })),
-    };
-
     let mut objects = vec![
         BackupObject {
             name: "catalog.json".into(),
@@ -1148,49 +1226,155 @@ async fn create_backup(
             name: "audit.jsonl".into(),
             bytes: Bytes::from(audit_bytes),
         },
-        BackupObject {
+    ];
+    // Journaled (level ≥3) backups export per-shard objects plus a meta
+    // object, recorded in the manifest's shard coverage; the legacy layout is
+    // one kv_data.json dump. Rows whose namespace no live shard map claims
+    // (decommissioned groups awaiting GC) fold into meta.json, so no
+    // acknowledged data is silently dropped from the backup.
+    let mut shard_coverage = None;
+    if journaled {
+        let mut meta_rows: Vec<Value> = Vec::new();
+        let mut shard_rows: std::collections::BTreeMap<String, Vec<Value>> =
+            std::collections::BTreeMap::new();
+        for row in kv_dump {
+            match row
+                .get("key")
+                .and_then(|k| k.as_array())
+                .map(|bytes| {
+                    bytes
+                        .iter()
+                        .filter_map(|b| b.as_u64().map(|b| b as u8))
+                        .collect::<Vec<_>>()
+                })
+                .as_deref()
+                .and_then(shard_group_of_key)
+            {
+                Some(group) => shard_rows.entry(group).or_default().push(row),
+                None => meta_rows.push(row),
+            }
+        }
+        let dump_json = |rows: &Vec<Value>| serde_json::to_vec(rows);
+        let meta_bytes = match dump_json(&meta_rows) {
+            Ok(b) => b,
+            Err(e) => return Json(json!({ "error": format!("Failed to serialize KV dump: {e}") })),
+        };
+        objects.push(BackupObject {
+            name: "meta.json".into(),
+            bytes: Bytes::from(meta_bytes),
+        });
+        let mut coverage = Vec::new();
+        let placements = state.shards.placements();
+        for table in &snapshot.tables {
+            let Ok(map) = state.shards.shard_map(table.id) else {
+                continue;
+            };
+            for shard in &map.shards {
+                let group = crate::multi_raft::MultiRaftManager::data_group_id(shard.id);
+                let object = format!("{group}.json");
+                let rows = shard_rows.remove(&group).unwrap_or_default();
+                let bytes = match dump_json(&rows) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        return Json(
+                            json!({ "error": format!("Failed to serialize shard dump: {e}") }),
+                        );
+                    }
+                };
+                let row_count = rows.len() as u64;
+                objects.push(BackupObject {
+                    name: object.clone(),
+                    bytes: Bytes::from(bytes),
+                });
+                coverage.push(nodus_backup::ShardCoverage {
+                    shard_id: shard.id.to_string(),
+                    group,
+                    start_key: shard.start_key.clone(),
+                    end_key: shard.end_key.clone(),
+                    placed_on: placements.get(&shard.id).cloned().unwrap_or_default(),
+                    object,
+                    rows: row_count,
+                });
+            }
+        }
+        shard_coverage = Some(coverage);
+    } else {
+        let kv_bytes = match serde_json::to_vec(&kv_dump) {
+            Ok(b) => b,
+            Err(e) => return Json(json!({ "error": format!("Failed to serialize KV dump: {e}") })),
+        };
+        objects.push(BackupObject {
             name: "kv_data.json".into(),
             bytes: Bytes::from(kv_bytes),
-        },
-    ];
+        });
+    }
     if let Err(error) = state.backup.seal_export(generation, &mut objects) {
         return Json(json!({ "error": error.to_string() }));
     }
     let backup_ts = parent_snapshot_ts
         .map(|parent_ts| max_kv_version.max(parent_ts.saturating_add(1)))
         .unwrap_or(max_kv_version);
-    if let Some(parent_id) = query.parent_backup_id {
-        match state
+
+    let backup_id = job_id.to_string();
+    let result = if let Some(parent_id) = query.parent_backup_id.clone() {
+        state
             .backup
-            .create_incremental_backup(
+            .create_incremental_backup_named(
+                &backup_id,
                 "local",
                 &parent_id,
                 backup_ts,
                 version,
                 cluster_version,
                 objects,
+                shard_coverage.clone(),
             )
             .await
-        {
-            Ok(manifest) => Json(json!({
-                "backup_id": manifest.backup_id,
-                "status": format!("{:?}", manifest.status),
-                "files": manifest.files.len(),
-            })),
-            Err(e) => Json(json!({ "error": e.to_string() })),
-        }
     } else {
-        match state
+        state
             .backup
-            .create_full_backup("local", backup_ts, version, cluster_version, objects)
+            .create_full_backup_named(
+                &backup_id,
+                "local",
+                backup_ts,
+                version,
+                cluster_version,
+                objects,
+                shard_coverage,
+            )
             .await
-        {
-            Ok(manifest) => Json(json!({
+    };
+    if let Some(stop) = heartbeat_stop {
+        let _ = stop.send(true);
+    }
+    match (result, job_journal) {
+        (Ok(manifest), Some(job)) => {
+            // The manifest's commit point already landed; completing the
+            // journal is bookkeeping (a missed completion is swept to Failed
+            // by the staleness sweep only if the job never heartbeats again).
+            if let Err(e) = crate::backup_coordinator::complete_job(&state.router, job).await {
+                tracing::warn!("backup job completion not journaled: {e}");
+            }
+            Json(json!({
                 "backup_id": manifest.backup_id,
                 "status": format!("{:?}", manifest.status),
                 "files": manifest.files.len(),
-            })),
-            Err(e) => Json(json!({ "error": e.to_string() })),
+            }))
+        }
+        (Ok(manifest), None) => Json(json!({
+            "backup_id": manifest.backup_id,
+            "status": format!("{:?}", manifest.status),
+            "files": manifest.files.len(),
+        })),
+        (Err(e), job) => {
+            if let Some(job) = job {
+                if let Err(fail) =
+                    crate::backup_coordinator::fail_job(&state.router, job, e.to_string()).await
+                {
+                    tracing::warn!("backup job failure not journaled: {fail}");
+                }
+            }
+            Json(json!({ "error": e.to_string() }))
         }
     }
 }
@@ -1229,7 +1413,17 @@ type PitrInput = (
 
 /// Validates that every backup object parses, mutating nothing. Returns the
 /// parsed catalog snapshot (if present) for the mutation phase.
-fn validate_restore_objects(objects: &[BackupObject]) -> anyhow::Result<Option<CatalogSnapshot>> {
+/// Validates that every backup object parses, mutating nothing. Returns the
+/// parsed catalog snapshot (if present) for the mutation phase. When the base
+/// manifest records shard coverage (per-shard export layout), every covered
+/// shard's object must be present with its recorded row count.
+fn validate_restore_objects(
+    objects: &[BackupObject],
+    base_manifest: Option<&nodus_backup::BackupManifest>,
+) -> anyhow::Result<Option<CatalogSnapshot>> {
+    if let Some(manifest) = base_manifest {
+        BackupOrchestrator::validate_coverage(manifest, objects)?;
+    }
     let mut catalog_snapshot = None;
     for obj in objects {
         match obj.name.as_str() {
@@ -1239,9 +1433,12 @@ fn validate_restore_objects(objects: &[BackupObject]) -> anyhow::Result<Option<C
                         .map_err(|e| anyhow::anyhow!("invalid catalog snapshot in backup: {e}"))?,
                 );
             }
-            "kv_data.json" => {
+            name if name == "kv_data.json"
+                || name == "meta.json"
+                || (name.starts_with("shard-") && name.ends_with(".json")) =>
+            {
                 serde_json::from_slice::<Vec<serde_json::Value>>(&obj.bytes)
-                    .map_err(|e| anyhow::anyhow!("invalid kv_data.json in backup: {e}"))?;
+                    .map_err(|e| anyhow::anyhow!("invalid row dump {name} in backup: {e}"))?;
             }
             _ => {}
         }
@@ -1285,7 +1482,7 @@ fn apply_restore(
     catalog_writer: &dyn CatalogWriter,
     wal_key: Option<[u8; 32]>,
 ) -> anyhow::Result<nodus_backup::PitrReplayReport> {
-    let catalog_snapshot = validate_restore_objects(objects)?;
+    let catalog_snapshot = validate_restore_objects(objects, None)?;
     apply_restore_mutations(objects, catalog_snapshot, pitr, kv, catalog_writer, wal_key)
 }
 
@@ -1371,22 +1568,33 @@ async fn restore_backup(
         }
     };
 
-    // Restore writes go straight into the local engine and bypass Raft
-    // consensus, so on a replicated node the replicas would silently diverge.
-    // Restore-through-Raft is not implemented (the replay writes raw MVCC
-    // versions across every group, which does not map onto per-group command
-    // application), so until it is, refuse restores on a clustered node:
-    // restore into a fresh single node, then re-form the cluster.
+    // Replay writes go through each group's Raft log (raw `shard-*` and meta
+    // keys via the meta group, table rows via their shard group once routing
+    // is restored), so content reaches every member. What a clustered restore
+    // must not do is merge onto live data: the replay only writes keys present
+    // in the backup, and peer nodes keep serving reads mid-replay, so a
+    // cluster with existing data would serve a torn mix. Permit the restore
+    // only into a demonstrably fresh cluster — nothing to merge, nothing to
+    // tear. The gated check inside the replay re-verifies emptiness under the
+    // write fence before mutating.
     if state.manager.cluster_members().await.len() > 1 {
-        return (
-            StatusCode::CONFLICT,
-            Json(json!({
-                "restored": 0,
-                "code": "restore_clustered_unsupported",
-                "error": "restore is supported only on a single-node server: restore into a fresh single node, then add peers (restore writes bypass Raft and would diverge replicas)"
-            })),
-        )
-            .into_response();
+        match restore_destination_data_key(state.kv.as_ref()) {
+            Ok(Some(key)) => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(json!({
+                        "restored": 0,
+                        "code": "restore_clustered_not_empty",
+                        "error": format!("restore into a cluster requires a fresh cluster with no data (found data key 0x{})", hex::encode(key))
+                    })),
+                )
+                    .into_response();
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return Json(json!({ "restored": 0, "error": error.to_string() })).into_response();
+            }
+        }
     }
 
     let (objects, pitr) = if let Some(target_ts) = query.target_ts {
@@ -1420,6 +1628,30 @@ async fn restore_backup(
     };
 
     let names: Vec<String> = objects.iter().map(|o| o.name.clone()).collect();
+    // The manifest anchoring this restore (for PITR: the plan's base). Shard
+    // coverage validation runs against the chain's full base: incremental
+    // deltas share object names with it and are checksum-verified instead.
+    let anchor_id = pitr
+        .as_ref()
+        .map(|(plan, _)| plan.base_backup_id.clone())
+        .unwrap_or_else(|| id.clone());
+    let mut base_manifest = match state.backup.load_manifest(&anchor_id).await {
+        Ok(manifest) => manifest,
+        Err(e) => {
+            return Json(json!({ "restored": 0, "error": e.to_string() })).into_response();
+        }
+    };
+    while base_manifest.backup_type == nodus_backup::BackupType::Incremental {
+        let Some(parent) = base_manifest.parent_backup_id.clone() else {
+            break;
+        };
+        match state.backup.load_manifest(&parent).await {
+            Ok(manifest) => base_manifest = manifest,
+            Err(e) => {
+                return Json(json!({ "restored": 0, "error": e.to_string() })).into_response();
+            }
+        }
+    }
     let pitr_response = pitr.as_ref().map(|(plan, _)| {
         json!({
             "base_backup_id": &plan.base_backup_id,
@@ -1445,10 +1677,12 @@ async fn restore_backup(
     let restoring = state.restoring.clone();
     let restore_gate = state.restore_gate.clone();
     let restore_in_flight = state.restore_in_flight.clone();
+    let base_manifest = Some(base_manifest);
     let replay = tokio::task::spawn_blocking(move || {
         // Validate first — a bad backup changes nothing and must not fence.
         let catalog_snapshot =
-            validate_restore_objects(&objects).map_err(RestoreFailure::Failed)?;
+            validate_restore_objects(&objects, base_manifest.as_ref())
+                .map_err(RestoreFailure::Failed)?;
 
         // Begin fencing: reject new statements, then take the exclusive gate,
         // which blocks until every in-flight statement has drained. From here no
@@ -1608,6 +1842,15 @@ fn parse_table(id: &str) -> Option<TableId> {
     Uuid::parse_str(id).ok().map(TableId)
 }
 
+/// The owning data group of a raw store key, from its `shard-{id}\0`
+/// namespace prefix; `None` for meta-group (unprefixed) keys.
+fn shard_group_of_key(key: &[u8]) -> Option<String> {
+    let rest = key.strip_prefix(b"shard-")?;
+    let end = rest.iter().position(|b| *b == 0)?;
+    let group = std::str::from_utf8(&key[..b"shard-".len() + end]).ok()?;
+    Some(group.to_string())
+}
+
 /// Meta-group content for planning a V3 operation, read behind a linearizable
 /// barrier so the plan's expected content matches what the conditional apply
 /// compares.
@@ -1693,6 +1936,23 @@ async fn submit_v3_plan(
     state: &AdminState,
     plan: nodus_raftstore::migration::coordinator::v3::PlanV3,
 ) -> Result<(), Box<Response>> {
+    // Refuse to plan while a cluster backup is exporting (the apply path
+    // enforces the exclusion regardless; this surfaces a clean 409).
+    match crate::backup_coordinator::active_job(&state.manager).await {
+        Ok(None) => {}
+        Ok(Some(job)) => {
+            return Err(plan_error(
+                StatusCode::CONFLICT,
+                format_args!("cluster backup {job} is exporting; migration waits"),
+            ));
+        }
+        Err(e) => {
+            return Err(plan_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format_args!("backup journal scan failed: {e}"),
+            ));
+        }
+    }
     let router = state.router.clone();
     let submit = tokio::task::spawn_blocking(move || {
         router.submit(
@@ -1770,7 +2030,7 @@ async fn shards_init(State(state): State<AdminState>, Path(table): Path<String>)
     let Some(table_id) = parse_table(&table) else {
         return Json(json!({ "error": "invalid table id" })).into_response();
     };
-    if !shard_migration_enabled(&state) {
+    if !migration_level_finalized(&state) {
         return shard_migration_unavailable();
     }
     let planning = match meta_planning_state(&state).await {
@@ -1867,7 +2127,7 @@ async fn shards_split(
     let Some(table_id) = parse_table(&table) else {
         return Json(json!({ "error": "invalid table id" })).into_response();
     };
-    if !shard_migration_enabled(&state) {
+    if !migration_level_finalized(&state) {
         return shard_migration_unavailable();
     }
     let shard_id = match params.get("shard").and_then(|s| Uuid::parse_str(s).ok()) {
@@ -1972,7 +2232,7 @@ async fn shards_merge(
     let Some(table_id) = parse_table(&table) else {
         return Json(json!({ "error": "invalid table id" })).into_response();
     };
-    if !shard_migration_enabled(&state) {
+    if !migration_level_finalized(&state) {
         return shard_migration_unavailable();
     }
     let left = match params.get("left").and_then(|s| Uuid::parse_str(s).ok()) {
@@ -2086,7 +2346,7 @@ async fn shards_rebalance(
     let Some(table_id) = parse_table(&table) else {
         return Json(json!({ "error": "invalid table id" })).into_response();
     };
-    if !shard_migration_enabled(&state) {
+    if !migration_level_finalized(&state) {
         return shard_migration_unavailable();
     }
     let nodes: Vec<String> = params
@@ -2522,5 +2782,53 @@ mod restore_tests {
         // rejects any resume attempt.
         let unknown = parking_lot::Mutex::new(None);
         assert!(record_or_check_restore(&unknown, "backup:b", true).is_err());
+    }
+    /// Per-shard export coverage is validated against fetched objects before
+    /// any mutation: row-count drift, a missing object, and a tampered
+    /// manifest all fail the restore.
+    #[tokio::test]
+    async fn restore_validates_shard_coverage() {
+        let repo = Arc::new(nodus_backup::MemBackupRepository::new());
+        let orchestrator = BackupOrchestrator::new(repo);
+        let objects = vec![
+            BackupObject {
+                name: "meta.json".into(),
+                bytes: Bytes::from_static(b"[]"),
+            },
+            BackupObject {
+                name: "shard-abc.json".into(),
+                bytes: Bytes::from(
+                    serde_json::to_vec(&json!([{"key": [1], "value": [2], "version": 7}])).unwrap(),
+                ),
+            },
+        ];
+        let coverage = vec![nodus_backup::ShardCoverage {
+            shard_id: "abc".into(),
+            group: "shard-abc".into(),
+            start_key: vec![],
+            end_key: vec![],
+            placed_on: "1".into(),
+            object: "shard-abc.json".into(),
+            rows: 1,
+        }];
+        let manifest = orchestrator
+            .create_full_backup_named("b1", "local", 10, 1, 3, objects.clone(), Some(coverage))
+            .await
+            .unwrap();
+        assert_eq!(manifest.object_format_version, 3);
+        validate_restore_objects(&objects, Some(&manifest)).unwrap();
+
+        let mut wrong_count = manifest.clone();
+        wrong_count.shard_coverage.as_mut().unwrap()[0].rows = 2;
+        assert!(validate_restore_objects(&objects, Some(&wrong_count)).is_err());
+
+        let mut missing = manifest.clone();
+        missing.shard_coverage.as_mut().unwrap()[0].object = "shard-nope.json".into();
+        assert!(validate_restore_objects(&objects, Some(&missing)).is_err());
+
+        // A legacy manifest (no coverage) validates as before.
+        let mut legacy = manifest.clone();
+        legacy.shard_coverage = None;
+        validate_restore_objects(&objects, Some(&legacy)).unwrap();
     }
 }

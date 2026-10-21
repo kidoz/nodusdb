@@ -168,6 +168,8 @@ use std::path::{Path, PathBuf};
 /// - `\x01migration/…` — shard-migration fences and coordinator journals:
 ///   transient control state for an in-flight operation that must not be
 ///   resurrected onto a restored node.
+/// - `\x01backup/…` — backup job journals: transient control state for an
+///   in-flight export, likewise never resurrected.
 ///
 /// Everything else round-trips deliberately: user/catalog data, `meta:*`
 /// shard maps and placements, `\x00catalog\x00state`, `\x00txn2pc\x00…` 2PC
@@ -179,6 +181,7 @@ pub fn is_backup_excluded_key(key: &[u8]) -> bool {
         || inner == nodus_storage_api::recovery::RECOVERY_GENERATION_KEY
         || inner.starts_with(b"\x01upgrade/")
         || inner.starts_with(b"\x01migration/")
+        || inner.starts_with(b"\x01backup/")
 }
 
 /// Strips a `shard-{id}\0` data-group namespace prefix, returning the inner
@@ -457,6 +460,21 @@ pub struct PitrReplayReport {
     pub pending_txns_aborted: usize,
 }
 
+/// One shard's coverage in a backup: the group hosting it, its key range and
+/// placement at backup time, and the object holding its exported rows.
+/// Populated at cluster level ≥ 3 when per-shard exports land; `None` on the
+/// manifest means the backup predates per-shard coverage tracking.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ShardCoverage {
+    pub shard_id: String,
+    pub group: String,
+    pub start_key: Vec<u8>,
+    pub end_key: Vec<u8>,
+    pub placed_on: String,
+    pub object: String,
+    pub rows: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackupManifest {
     pub manifest_version: u64,
@@ -481,6 +499,15 @@ pub struct BackupManifest {
     pub encryption: Option<EncryptionMetadata>,
     pub restore_validation: Option<RestoreValidationStatus>,
     pub protected_timestamp: Option<ProtectedTimestamp>,
+    /// Shard coverage and placement metadata at backup time (see
+    /// [`ShardCoverage`]). Additive: old readers ignore it; manifests written
+    /// before per-shard exports carry `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shard_coverage: Option<Vec<ShardCoverage>>,
+    /// The recovery generation this backup belongs to, mirrored from the
+    /// data object so restore planning can read it without fetching objects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_generation: Option<String>,
     pub repository_capabilities: RepositoryCapabilities,
     pub status: BackupStatus,
 }
@@ -494,14 +521,18 @@ const COMPATIBLE_MANIFEST_VERSION: u64 = 2;
 const CURRENT_MANIFEST_VERSION: u64 = 3;
 const CURRENT_REPOSITORY_LAYOUT_VERSION: u64 = 2;
 const COMPATIBLE_OBJECT_FORMAT_VERSION: u64 = 1;
-const CURRENT_OBJECT_FORMAT_VERSION: u64 = 2;
+/// Format 2: one `kv_data.json` dump; format 3: `meta.json` + per-shard
+/// `shard-{id}.json` objects with manifest shard coverage. Readers accept both.
+const CURRENT_OBJECT_FORMAT_VERSION: u64 = 3;
 const CURRENT_WAL_ARCHIVE_INDEX_VERSION: u64 = 1;
 const CURRENT_PITR_RESTORE_PLAN_VERSION: u64 = 1;
 const DEFAULT_TIMELINE_ID: &str = "default";
 
 fn manifest_format(cluster_version: u64) -> (u64, u64) {
-    if cluster_version >= 2 {
+    if cluster_version >= 3 {
         (CURRENT_MANIFEST_VERSION, CURRENT_OBJECT_FORMAT_VERSION)
+    } else if cluster_version >= 2 {
+        (CURRENT_MANIFEST_VERSION, 2)
     } else {
         (
             COMPATIBLE_MANIFEST_VERSION,
@@ -598,6 +629,8 @@ struct ManifestTemplate {
     files: Vec<String>,
     checksums: HashMap<String, String>,
     protected_timestamp: Option<ProtectedTimestamp>,
+    shard_coverage: Option<Vec<ShardCoverage>>,
+    recovery_generation: Option<String>,
     status: BackupStatus,
 }
 
@@ -659,6 +692,8 @@ impl BackupOrchestrator {
             encryption: None,
             restore_validation: None,
             protected_timestamp: input.protected_timestamp,
+            shard_coverage: input.shard_coverage,
+            recovery_generation: input.recovery_generation,
             repository_capabilities: self.repo.capabilities(),
             status: input.status,
         }
@@ -743,8 +778,37 @@ impl BackupOrchestrator {
         cluster_version: u64,
         objects: Vec<BackupObject>,
     ) -> Result<BackupManifest> {
-        self.validate_export_generation(&objects).await?;
         let backup_id = Uuid::new_v4().to_string();
+        self.create_full_backup_named(
+            &backup_id,
+            cluster_id,
+            backup_ts,
+            catalog_version,
+            cluster_version,
+            objects,
+            None,
+        )
+        .await
+    }
+
+    /// Like [`Self::create_full_backup`] with a caller-chosen id, so the
+    /// cluster backup job journal and the manifest share one identity. The
+    /// append-only manifest publication refuses a reused id.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_full_backup_named(
+        &self,
+        backup_id: &str,
+        cluster_id: &str,
+        backup_ts: u64,
+        catalog_version: u64,
+        cluster_version: u64,
+        objects: Vec<BackupObject>,
+        shard_coverage: Option<Vec<ShardCoverage>>,
+    ) -> Result<BackupManifest> {
+        self.validate_export_generation(&objects).await?;
+        let recovery_generation =
+            recovery::object_generation(&objects)?.map(|generation| generation.id.to_string());
+        let backup_id = backup_id.to_string();
         let started_at = Utc::now();
         let (files, checksums) = self.upload_objects(&backup_id, &objects).await?;
 
@@ -760,6 +824,8 @@ impl BackupOrchestrator {
             files,
             checksums,
             protected_timestamp: Some(self.protected_timestamp(&backup_id, 0, backup_ts)),
+            shard_coverage,
+            recovery_generation,
             status: BackupStatus::Verifying,
         });
 
@@ -789,7 +855,8 @@ impl BackupOrchestrator {
             (
                 COMPATIBLE_MANIFEST_VERSION,
                 COMPATIBLE_OBJECT_FORMAT_VERSION
-            ) | (CURRENT_MANIFEST_VERSION, CURRENT_OBJECT_FORMAT_VERSION)
+            ) | (CURRENT_MANIFEST_VERSION, 2)
+                | (CURRENT_MANIFEST_VERSION, CURRENT_OBJECT_FORMAT_VERSION)
         ) {
             anyhow::bail!(
                 "unsupported backup manifest/object format versions {}/{} for backup {}",
@@ -823,6 +890,34 @@ impl BackupOrchestrator {
         objects: Vec<BackupObject>,
     ) -> Result<BackupManifest> {
         let backup_id = Uuid::new_v4().to_string();
+        self.create_incremental_backup_named(
+            &backup_id,
+            cluster_id,
+            parent_backup_id,
+            backup_ts,
+            catalog_version,
+            cluster_version,
+            objects,
+            None,
+        )
+        .await
+    }
+
+    /// Like [`Self::create_incremental_backup`] with a caller-chosen id (see
+    /// [`Self::create_full_backup_named`]).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_incremental_backup_named(
+        &self,
+        backup_id: &str,
+        cluster_id: &str,
+        parent_backup_id: &str,
+        backup_ts: u64,
+        catalog_version: u64,
+        cluster_version: u64,
+        objects: Vec<BackupObject>,
+        shard_coverage: Option<Vec<ShardCoverage>>,
+    ) -> Result<BackupManifest> {
+        let backup_id = backup_id.to_string();
         let started_at = Utc::now();
 
         if objects.is_empty() {
@@ -848,6 +943,8 @@ impl BackupOrchestrator {
         }
         self.validate_incremental_generation(&parent, &objects)
             .await?;
+        let recovery_generation =
+            recovery::object_generation(&objects)?.map(|generation| generation.id.to_string());
         let (files, checksums) = self.upload_objects(&backup_id, &objects).await?;
 
         let pending = self.manifest_template(ManifestTemplate {
@@ -866,6 +963,8 @@ impl BackupOrchestrator {
                 parent.snapshot_ts,
                 backup_ts,
             )),
+            shard_coverage,
+            recovery_generation,
             status: BackupStatus::Verifying,
         });
 
@@ -1275,6 +1374,42 @@ impl BackupOrchestrator {
         Ok(report)
     }
 
+    /// Validates a manifest's shard coverage against fetched objects: every
+    /// covered shard's object is in the manifest, was fetched, and replays the
+    /// recorded row count. No coverage recorded (legacy manifests) passes.
+    pub fn validate_coverage(manifest: &BackupManifest, objects: &[BackupObject]) -> Result<()> {
+        let Some(coverage) = &manifest.shard_coverage else {
+            return Ok(());
+        };
+        let mut seen = std::collections::HashSet::new();
+        for entry in coverage {
+            anyhow::ensure!(
+                seen.insert(entry.shard_id.clone()),
+                "duplicate shard {} in coverage",
+                entry.shard_id
+            );
+            let key = data_key(&manifest.backup_id, &entry.object);
+            anyhow::ensure!(
+                manifest.files.contains(&key),
+                "coverage object {} missing from manifest files",
+                entry.object
+            );
+            let object = objects
+                .iter()
+                .find(|o| o.name == entry.object)
+                .ok_or_else(|| anyhow::anyhow!("coverage object {} not fetched", entry.object))?;
+            let rows = serde_json::from_slice::<Vec<serde_json::Value>>(&object.bytes)?.len();
+            anyhow::ensure!(
+                rows as u64 == entry.rows,
+                "coverage row count mismatch for {}: {} rows, manifest says {}",
+                entry.object,
+                rows,
+                entry.rows
+            );
+        }
+        Ok(())
+    }
+
     pub fn restore_backup_objects_to_kv(
         objects: &[BackupObject],
         kv: &dyn KvEngine,
@@ -1284,7 +1419,10 @@ impl BackupOrchestrator {
             ..PitrReplayReport::default()
         };
         for obj in objects {
-            if obj.name != "kv_data.json" {
+            let is_rows = obj.name == "kv_data.json"
+                || obj.name == "meta.json"
+                || (obj.name.starts_with("shard-") && obj.name.ends_with(".json"));
+            if !is_rows {
                 continue;
             }
             let dump = serde_json::from_slice::<Vec<serde_json::Value>>(&obj.bytes)?;
@@ -2041,6 +2179,8 @@ mod tests {
             encryption: None,
             restore_validation: None,
             protected_timestamp: None,
+            shard_coverage: None,
+            recovery_generation: None,
             repository_capabilities: RepositoryCapabilities::default(),
             status: BackupStatus::Failed,
         };
@@ -2094,6 +2234,8 @@ mod tests {
             encryption: None,
             restore_validation: None,
             protected_timestamp: None,
+            shard_coverage: None,
+            recovery_generation: None,
             repository_capabilities: RepositoryCapabilities::default(),
             status: BackupStatus::Verifying,
         };
@@ -2141,6 +2283,8 @@ mod tests {
             encryption: None,
             restore_validation: None,
             protected_timestamp: None,
+            shard_coverage: None,
+            recovery_generation: None,
             repository_capabilities: RepositoryCapabilities::default(),
             status: BackupStatus::Completed,
         };
@@ -2616,6 +2760,38 @@ mod tests {
         assert_eq!(orch.protected_gc_watermark().await.unwrap(), Some(0));
     }
 
+    /// The v3 manifest's additive fields stay out of the bytes when unset (old
+    /// readers see a plain v3 manifest) and round-trip when populated.
+    #[test]
+    fn manifest_additive_coverage_fields_are_optional_and_roundtrip() {
+        let manifest = completed_manifest_template("additive");
+        let bytes = serde_json::to_vec(&manifest).unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(!text.contains("shard_coverage"));
+        assert!(!text.contains("recovery_generation"));
+        let back: BackupManifest = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(back.shard_coverage, None);
+        assert_eq!(back.recovery_generation, None);
+
+        let mut covered = manifest.clone();
+        covered.shard_coverage = Some(vec![ShardCoverage {
+            shard_id: "s1".into(),
+            group: "shard-s1".into(),
+            start_key: vec![],
+            end_key: vec![127],
+            placed_on: "1".into(),
+            object: "b1/data/shard-s1.json".into(),
+            rows: 42,
+        }]);
+        covered.recovery_generation = Some("3b9e1c2d-0000-4000-8000-000000000000".into());
+        let bytes = serde_json::to_vec(&covered).unwrap();
+        let back: BackupManifest = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(back.shard_coverage, covered.shard_coverage);
+        assert_eq!(
+            back.recovery_generation.as_deref(),
+            Some("3b9e1c2d-0000-4000-8000-000000000000")
+        );
+    }
     fn completed_manifest_template(backup_id: &str) -> BackupManifest {
         BackupManifest {
             manifest_version: CURRENT_MANIFEST_VERSION,
@@ -2640,6 +2816,8 @@ mod tests {
             encryption: None,
             restore_validation: None,
             protected_timestamp: None,
+            shard_coverage: None,
+            recovery_generation: None,
             repository_capabilities: RepositoryCapabilities::default(),
             status: BackupStatus::Completed,
         }
@@ -2690,8 +2868,11 @@ mod tests {
                 COMPATIBLE_OBJECT_FORMAT_VERSION
             )
         );
+        // Level 2 keeps object format V2 (single kv_data.json dump); level 3
+        // writes V3 (per-shard objects with manifest coverage).
+        assert_eq!(manifest_format(2), (CURRENT_MANIFEST_VERSION, 2));
         assert_eq!(
-            manifest_format(2),
+            manifest_format(3),
             (CURRENT_MANIFEST_VERSION, CURRENT_OBJECT_FORMAT_VERSION)
         );
     }

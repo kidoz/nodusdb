@@ -24,7 +24,7 @@ fn decode(bytes: &[u8]) -> Result<RecoveryGeneration> {
     );
     Ok(record.generation)
 }
-fn object_generation(objects: &[BackupObject]) -> Result<Option<RecoveryGeneration>> {
+pub(super) fn object_generation(objects: &[BackupObject]) -> Result<Option<RecoveryGeneration>> {
     let mut values = objects.iter().filter(|o| o.name == GENERATION_OBJECT);
     let value = values.next().map(|o| decode(&o.bytes)).transpose()?;
     anyhow::ensure!(

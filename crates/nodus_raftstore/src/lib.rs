@@ -27,6 +27,7 @@ use openraft::{
 };
 use serde::{Deserialize, Serialize};
 
+pub mod backup;
 pub mod migration;
 pub mod network;
 mod purge;
@@ -262,6 +263,9 @@ pub enum ShardCommand {
     UpgradeAdmissionV1(upgrade::admission::CommandV1),
     /// Dormant V3 copy/cutover journal; same activation fences as V1/V2.
     MigrationV3(migration::coordinator::v3::CommandV3),
+    /// Cluster backup job journal on the meta group; same activation fence as
+    /// the migration protocol (the level-3 lineage contains both decodes).
+    BackupJobV1(backup::CommandV1),
     /// Conditional routing publication: applies only if the current durable
     /// shard-map content equals `expected` and the V3 journal for `table` is at
     /// the `phase` step owned by `operation`. Old binaries fail closed on
@@ -306,6 +310,7 @@ impl ShardCommand {
                 | Self::EpochRepairV2 { .. }
                 | Self::EpochPrepareV2 { .. }
                 | Self::MigrationV3(_)
+                | Self::BackupJobV1(_)
                 | Self::UpdateShardMapConditional { .. }
                 | Self::UpdateShardPlacementsConditional { .. }
         )
