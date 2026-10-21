@@ -173,6 +173,27 @@ impl RaftTransport {
             .ok_or_else(|| anyhow::anyhow!("group {group_id} on {addr} has no committed log yet"))
     }
 
+    /// Asks the peer at `addr` to instantiate a local replica of `group_id`
+    /// over the peer transport (mTLS when configured), so replica formation
+    /// works on deployments whose Raft routes live on a dedicated listener
+    /// without the admin API.
+    pub async fn instantiate_replica(&self, addr: &str, group_id: &str) -> anyhow::Result<()> {
+        let response = self
+            .authorize(self.client().post(format!(
+                "{}://{addr}/raft/{group_id}/instantiate",
+                self.scheme()
+            )))
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("replica request to {addr}: {e}"))?;
+        anyhow::ensure!(
+            response.status().is_success(),
+            "replica instantiate on {addr} returned {}",
+            response.status()
+        );
+        Ok(())
+    }
+
     /// The URL scheme RPCs are issued over (`http` or `https`).
     pub fn scheme(&self) -> &str {
         &self.scheme

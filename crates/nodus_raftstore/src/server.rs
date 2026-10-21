@@ -50,6 +50,17 @@ impl RequestDedup {
     }
 }
 
+/// Forms a local replica of a data group on demand (installed by the server's
+/// group manager at startup).
+type InstantiateHook = Arc<
+    dyn Fn(
+            String,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send>>
+        + Send
+        + Sync,
+>;
+
 // Define a struct to hold our Raft instances so they can be passed via Axum State.
 #[derive(Clone)]
 pub struct RaftState {
@@ -58,6 +69,9 @@ pub struct RaftState {
     dedup: Arc<Mutex<RequestDedup>>,
     node_id: Arc<std::sync::atomic::AtomicU64>,
     capability_kv: Arc<std::sync::OnceLock<Arc<dyn nodus_storage_api::KvEngine>>>,
+    /// Forms a local replica of a data group on demand (the server's group
+    /// manager owns the mechanics; the hook is installed at startup).
+    instantiate_hook: Arc<std::sync::OnceLock<InstantiateHook>>,
 }
 
 impl RaftState {
@@ -67,12 +81,17 @@ impl RaftState {
     pub fn set_node_id(&self, id: u64) {
         self.node_id.store(id, std::sync::atomic::Ordering::Release);
     }
+    /// Installs the replica-instantiation hook (idempotent; the first wins).
+    pub fn set_instantiate_hook(&self, hook: InstantiateHook) {
+        let _ = self.instantiate_hook.set(hook);
+    }
     pub fn new() -> Self {
         Self {
             rafts: Arc::new(RwLock::new(HashMap::new())),
             dedup: Arc::new(Mutex::new(RequestDedup::default())),
             node_id: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             capability_kv: Arc::new(std::sync::OnceLock::new()),
+            instantiate_hook: Arc::new(std::sync::OnceLock::new()),
         }
     }
 }
@@ -176,6 +195,7 @@ pub fn raft_routes(auth: RaftRouteAuth) -> Router<RaftState> {
         .route("/raft/{shard_id}/snapshot", post(snapshot))
         .route("/raft/{shard_id}/write", post(write))
         .route("/raft/{shard_id}/read_index", post(read_index))
+        .route("/raft/{shard_id}/instantiate", post(instantiate))
         .route_layer(axum::middleware::from_fn_with_state(
             auth,
             require_raft_auth,
@@ -336,6 +356,30 @@ async fn write(
             axum::Json(resp.data).into_response()
         }
         Err(e) => (axum::http::StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response(),
+    }
+}
+
+/// Forms a local replica of a data group on demand so it can receive the
+/// group's log. Driven by the group's primary during formation/reconcile over
+/// the peer transport, never by an operator. Idempotent: re-instantiating
+/// reloads durable Raft state. Peer-authenticated like every raft route.
+async fn instantiate(
+    Path(shard_id): Path<String>,
+    State(state): State<RaftState>,
+) -> impl axum::response::IntoResponse {
+    if get_raft(&state, &shard_id).await.is_some() {
+        return axum::http::StatusCode::OK.into_response();
+    }
+    let Some(hook) = state.instantiate_hook.get().cloned() else {
+        return (
+            axum::http::StatusCode::NOT_IMPLEMENTED,
+            "replica instantiation is not wired on this node",
+        )
+            .into_response();
+    };
+    match hook(shard_id).await {
+        Ok(()) => axum::http::StatusCode::OK.into_response(),
+        Err(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 

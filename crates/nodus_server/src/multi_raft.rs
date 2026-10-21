@@ -171,16 +171,6 @@ pub struct MultiRaftManager {
     machines: tokio::sync::RwLock<
         std::collections::HashMap<String, Arc<tokio::sync::RwLock<nodus_raftstore::StateMachine>>>,
     >,
-    /// Bearer token presented when asking a peer to instantiate a replica of a
-    /// data group (the `/api/v1/shards/{group}/replica` admin endpoint).
-    admin_token: Option<String>,
-    /// Reused HTTP client for peer replica-instantiation requests, built on first
-    /// use. A single-node server (and every test) instantiates no remote replicas,
-    /// so the client is never constructed — which matters because the first
-    /// `reqwest::Client::new()` in a process initializes the rustls + aws-lc-rs
-    /// TLS stack, a one-time native-library load that on macOS goes through a
-    /// Gatekeeper code-signing assessment and can block startup for many seconds.
-    http: std::sync::OnceLock<reqwest::Client>,
     /// This node's transaction clock; advanced as groups apply committed writes
     /// so timestamps stay monotonic across leadership changes.
     clock: Arc<dyn nodus_txn::TxnManager>,
@@ -201,7 +191,7 @@ impl MultiRaftManager {
         config: Arc<openraft::Config>,
         state: RaftState,
         base_kv: Arc<dyn KvEngine>,
-        admin_token: Option<String>,
+        _admin_token: Option<String>,
         clock: Arc<dyn nodus_txn::TxnManager>,
         data_dir: Option<std::path::PathBuf>,
         transport: RaftTransport,
@@ -217,8 +207,6 @@ impl MultiRaftManager {
             hosted: Arc::new(RwLock::new(HashSet::new())),
             deferrals: Arc::new(RwLock::new(HashMap::new())),
             machines: tokio::sync::RwLock::new(std::collections::HashMap::new()),
-            admin_token,
-            http: std::sync::OnceLock::new(),
             clock,
             data_dir,
             transport,
@@ -277,6 +265,22 @@ impl MultiRaftManager {
     /// migration-protocol commands.
     pub(crate) fn transport(&self) -> nodus_raftstore::network::RaftTransport {
         self.transport.clone()
+    }
+
+    /// Wires the raft listener's replica-instantiation route to this manager.
+    /// Call once after the manager is shared.
+    pub fn install_instantiate_hook(self: &Arc<Self>) {
+        let manager = Arc::downgrade(self);
+        self.state.set_instantiate_hook(Arc::new(move |group| {
+            let manager = manager.clone();
+            Box::pin(async move {
+                let manager = manager
+                    .upgrade()
+                    .ok_or_else(|| anyhow::anyhow!("group manager is gone"))?;
+                manager.get_or_create_data(&group).await?;
+                Ok(())
+            })
+        }));
     }
 
     /// The node's local KV store backing every group's state machine. The
@@ -541,34 +545,12 @@ impl MultiRaftManager {
         false
     }
 
-    /// The HTTP client for peer replica-instantiation requests, built on first
-    /// use (see the `http` field).
-    fn http(&self) -> &reqwest::Client {
-        self.http.get_or_init(reqwest::Client::new)
-    }
-
     /// Asks the peer at `addr` to instantiate a local replica of `group_id` so it
     /// can receive the group's log. Idempotent on the peer side (re-instantiating
-    /// reloads durable Raft state). The peer's HTTP address doubles as its Raft
-    /// advertise address.
+    /// reloads durable Raft state). Goes over the peer transport — plain HTTP to
+    /// the shared listener, or mTLS to the dedicated raft listener.
     async fn instantiate_remote(&self, addr: &str, group_id: &str) -> Result<()> {
-        let url = format!("http://{addr}/api/v1/shards/{group_id}/replica");
-        let mut req = self.http().post(&url);
-        if let Some(token) = &self.admin_token {
-            req = req.bearer_auth(token);
-        }
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| anyhow::anyhow!("replica request to {addr}: {e}"))?;
-        if resp.status().is_success() {
-            Ok(())
-        } else {
-            Err(anyhow::anyhow!(
-                "replica instantiate on {addr} returned {}",
-                resp.status()
-            ))
-        }
+        self.transport.instantiate_replica(addr, group_id).await
     }
 
     /// Forms `group_id` as a Raft group replicated across all current cluster

@@ -517,6 +517,19 @@ pub async fn run_server_with_config(
     pgwire_listener: TcpListener,
     http_listener: TcpListener,
     config: NodusConfig,
+    shutdown: tokio::sync::watch::Receiver<()>,
+) -> anyhow::Result<ServerHandle> {
+    run_server_full(pgwire_listener, http_listener, None, config, shutdown).await
+}
+
+/// Full startup: optionally takes a prebound Raft peer listener so callers can
+/// pin its port without a bind race (the address must match
+/// `cluster.raft_listen_addr`, which is what peers dial).
+pub async fn run_server_full(
+    pgwire_listener: TcpListener,
+    http_listener: TcpListener,
+    raft_listener: Option<TcpListener>,
+    config: NodusConfig,
     mut shutdown: tokio::sync::watch::Receiver<()>,
 ) -> anyhow::Result<ServerHandle> {
     let pgwire_addr = pgwire_listener.local_addr()?;
@@ -674,6 +687,9 @@ pub async fn run_server_with_config(
             .map(std::path::PathBuf::from),
         raft_transport.clone(),
     ));
+    // Peer-driven replica formation works over the raft listener (including
+    // mTLS-only deployments that do not serve the admin API there).
+    multi_raft.install_instantiate_hook();
 
     // Local cluster-metadata store (shard maps + placements), KV-backed so it
     // survives restart. The meta group's state machine applies shard-map and
@@ -1274,7 +1290,10 @@ pub async fn run_server_with_config(
         } else {
             raft_route_auth(&config)
         };
-        let raft_listener = TcpListener::bind(&addr).await?;
+        let raft_listener = match raft_listener {
+            Some(listener) => listener,
+            None => TcpListener::bind(&addr).await?,
+        };
         let raft_app = Router::new()
             .merge(nodus_raftstore::server::raft_routes(raft_auth).with_state(raft_state));
         let mut raft_shutdown = shutdown.clone();
