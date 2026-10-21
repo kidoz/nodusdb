@@ -161,6 +161,42 @@ The first distributed milestone supports cluster-level restore only. Database
 and table-level restore needs dependency ordering, schema filtering, and index
 validation to mature first.
 
+### Job journal (implemented for single-participant exports)
+
+Cluster backup coordination lives in a versioned journal on the meta group at
+`\x01backup/v1/job/{job_id}`, replicated like the migration journal and gated
+by the same finalized migration cluster level (level 3): only binaries that
+report `migration_version >= 3` exist in such a cluster, and they all decode
+the journal. Below level 3, or whenever the journal is unavailable, backup
+keeps the node-local path unchanged.
+
+- A job record carries the job id, the manifest's `backup_id`, the creator
+  node, full/incremental type and parent, the backup timestamp, an optional
+  protected GC timestamp, a heartbeat wall-clock stamp, and the phase
+  `Exporting → Completed | Failed | Cancelled`.
+- `Plan` is one Raft apply that refuses to open a job while another job is
+  non-terminal or any migration journal is active — and migration planning
+  symmetrically refuses while a job is non-terminal. This is the backup ↔
+  migration serialization barrier.
+- An incremental job's protected timestamp pins MVCC GC above its parent
+  snapshot for the job's lifetime, so a long export cannot have its version
+  window reclaimed; the pin releases when the job terminates.
+- The exporter heartbeats the job; the meta leader's discovery sweep marks a
+  job `Failed` when its heartbeat is older than the staleness bound (its
+  creator died mid-export). A job that never reaches `Completed` is never
+  restorable — the manifest commit point stays the final arbiter.
+- Journal keys are excluded from backup export and replay, like migration and
+  upgrade records.
+
+Journaled backups also write object format V3: one `meta.json` plus one
+`shard-{id}.json` per shard, with `shard_coverage` (shard, group, range,
+placement, object, row count) in the manifest, and restore validates the
+coverage before mutating anything. Restoring into a *fresh* multi-node cluster
+is supported: the replay replicates to every member through the groups' Raft
+logs, and any cluster holding data refuses (`restore_clustered_not_empty`).
+Distributed export by per-shard participants on different nodes (the remaining
+B6 gate) builds on this journal.
+
 ## Security and ransomware resilience
 
 A backup repository is the thing an attacker wants to delete before they
@@ -216,10 +252,11 @@ formal resumable job state machine and automatic restored timeline.
 retry, inspect, durable job state, CLI and admin controls. *Gate:* jobs survive
 restart, cancellation is explicit, every transition is audited.
 
-**B6 — Distributed backup.** Raft-coordinated snapshot timestamps, parallel
-per-shard export, locality-aware destinations, and shard movement serialized
-across backup barriers. *Gate:* a cluster backup covers all shard ranges exactly
-once, and restore verifies placement metadata against restored data.
+**B6 — Distributed backup (partially landed).** The meta-group job journal,
+backup/migration barrier, per-shard object layout with manifest coverage, and
+fresh-cluster restore are implemented; a three-node mTLS cluster backup covers
+every shard exactly once. *Remaining:* exports distributed across per-shard
+participants on their own nodes, and locality-aware destinations.
 
 **B7 — Restore drills and policy (partial).** Filesystem and live-S3 drills
 persist JSON/Prometheus reports with measured recovery time and observed data

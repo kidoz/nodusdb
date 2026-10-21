@@ -59,6 +59,15 @@ Only `"status":"Completed"` means the backup is restorable. The final
 `manifest.json` is published after every referenced object passes checksum
 verification. A failed or interrupted backup is never advertised as complete.
 
+On clusters that finalized the migration level (`migration-v3`), every backup
+is additionally journaled on the meta group: the job is cluster-visible, an
+incremental export's parent snapshot is pinned against GC for the job's
+lifetime, and backups and shard migrations mutually exclude — a backup request
+during an in-flight migration (or a migration request during an export) is
+refused with a conflict so the operator can retry after it settles. If the
+exporting node dies mid-backup, the meta leader marks the abandoned job
+`Failed`; it never appears as a restorable backup.
+
 ## Create an incremental backup
 
 Pass the parent backup ID:
@@ -87,12 +96,16 @@ Verification checks the completed manifest, object existence, and SHA-256
 checksums. It is necessary but not sufficient: a semantic restore drill below
 proves that the catalog, permissions, indexes, and rows are usable.
 
-## Restore into a fresh single node
+## Restore into a fresh single node or cluster
 
-Restore requires an empty destination engine and a single-node server. In-place
-restore over live data and direct restore into a replicated cluster are refused
-with HTTP `409`. Restore into a fresh single node, validate it, and then re-form
-the cluster.
+Restore requires an empty destination engine. In-place restore over live data
+is refused with HTTP `409` (`restore_destination_not_empty`). On a cluster the
+restore runs only while the cluster is fresh (no data anywhere); a cluster
+holding data is refused with HTTP `409` (`restore_clustered_not_empty`). The
+replay replicates to every member through the groups' Raft logs, so all
+members serve the restored state afterwards. Restore a fresh cluster before
+opening it for traffic: the restore fences apply to the node serving the
+request, so other members must have nothing to serve yet.
 
 ```bash
 curl -X POST -H "Authorization: Bearer nodus-dev-token" \

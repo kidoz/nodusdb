@@ -129,12 +129,15 @@ job always sets them, so its pass cannot be a vacuous skip.
     (`restore_destination_not_empty`) when the destination engine holds
     anything beyond bootstrap-internal state (Raft/consensus records, the HLC
     watermark, the recovery generation, upgrade records, the bootstrap
-    catalog blob), and with `409 Conflict` (`restore_clustered_unsupported`)
-    on a node whose meta group has more than one member, because restore
-    writes bypass Raft and would diverge replicas. The one exception is
-    retrying a restore that failed mid-mutation: the engine stays fenced and
-    the idempotent retry is allowed to complete. To restore a cluster, restore
-    on a fresh single node and then re-form the cluster.
+    catalog blob). On a cluster (more than one meta-group member) the same
+    refusal is `409 Conflict` (`restore_clustered_not_empty`) when any data
+    exists; a **fresh** cluster accepts the restore, and the replay reaches
+    every member through each group's Raft log (the single-node fences stay
+    node-local, so a fresh cluster restore must complete before the cluster
+    opens for traffic). The one exception is retrying a restore that failed
+    mid-mutation: the engine stays fenced and the idempotent retry is allowed
+    to complete.
+
 11. Backup, restore, delete, retention, and key-access operations pass
     authorization and emit audit events.
 12. Archived WAL objects and indexes are append-only. Identical publication
@@ -144,12 +147,23 @@ job always sets them, so its pass cannot be a vacuous skip.
     allocation is implemented. The current check is not an atomic cross-writer
     conditional put; concurrent repository writers require the distributed
     coordination milestone, not independent node archivers pointed at one prefix.
+13. On clusters that finalized the migration level, every backup create is
+    journaled on the meta group before any export: one exporting job at a
+    time, migrations refused while a job exports and vice versa, the job
+    marked `Failed` by the meta leader if the exporter's heartbeat dies, and
+    an incremental job's parent snapshot pinned against MVCC GC for the job's
+    lifetime. Journaled backups write object format V3: `meta.json` plus one
+    `shard-{id}.json` object per shard, with `shard_coverage` in the manifest
+    (shard, group, range, placement, object, row count). Restore validates the
+    coverage against the fetched objects before mutating anything. Legacy
+    V2/V1-format backups restore unchanged.
 
 Level 1 sources write manifest V2 / object format V1 without role memberships.
 Level 2 sources write manifest V3 / object format V2 with principals, grants,
-and role memberships. New binaries read both pairs; older binaries reject V3.
-V2 backups remain useful for their recorded data but cannot prove complete
-role-membership recovery.
+and role memberships. Level 3 sources write manifest V3 / object format V3
+with per-shard coverage. New binaries read all three pairs; older binaries
+reject what they cannot decode. V2 backups remain useful for their recorded
+data but cannot prove complete role-membership recovery.
 
 ## Restore plan contents
 
@@ -214,7 +228,7 @@ A backup strategy that has never been restored and queried is unproven.
 | Delete with a dependent incremental | Retention refuses to remove required parent data. | Retention planner test. |
 | Missing, stale, or failed restore drill | Alert fires from the drill's Prometheus textfile metrics. | Docker alert rules and Helm `PrometheusRule` rendering. |
 | Stale WAL archive | Lag metric exceeds the configured recovery point objective and alerts. | Not yet implemented. |
-| Shard movement during backup | Split, move, or merge waits behind the backup barrier or is represented in snapshot metadata. | Distributed coordination fault test. |
+| Shard movement during backup | Split, move, or merge is refused while a backup job exports (and vice versa) on migration-level clusters; the journaled barrier is enforced at meta-group apply in both directions. | Covered by `migration_tests::discovery::backup_and_migration_jobs_exclude_each_other` and `migration_tests::cluster_v3::backup_job_abandoned_by_a_dead_exporter_is_swept_after_failover`; the three-node mTLS coverage/restore proof is `tests/integration/tests/cluster_backup.rs`. |
 
 ## Acceptance criteria
 
