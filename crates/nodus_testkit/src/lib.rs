@@ -156,3 +156,35 @@ impl Drop for TestServer {
         let _ = self.shutdown_tx.send(());
     }
 }
+
+/// Builds a tiny PKI — a CA plus one leaf certificate signed by it (valid for
+/// both server and client auth, with a `127.0.0.1` IP SAN) — and writes the
+/// leaf cert, leaf key, and CA cert PEMs into `dir`. The one leaf doubles as
+/// every node's identity, which is all a one-host mTLS test cluster needs.
+pub fn write_test_certs(dir: &std::path::Path) -> (String, String, String) {
+    let ca_key = rcgen::KeyPair::generate().unwrap();
+    let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+    let ca_issuer = rcgen::Issuer::new(ca_params, ca_key);
+
+    let leaf_key = rcgen::KeyPair::generate().unwrap();
+    let mut leaf_params = rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()]).unwrap();
+    leaf_params.extended_key_usages = vec![
+        rcgen::ExtendedKeyUsagePurpose::ServerAuth,
+        rcgen::ExtendedKeyUsagePurpose::ClientAuth,
+    ];
+    let leaf_cert = leaf_params.signed_by(&leaf_key, &ca_issuer).unwrap();
+
+    let cert_path = dir.join("node.crt");
+    let key_path = dir.join("node.key");
+    let ca_path = dir.join("ca.crt");
+    std::fs::write(&cert_path, leaf_cert.pem()).unwrap();
+    std::fs::write(&key_path, leaf_key.serialize_pem()).unwrap();
+    std::fs::write(&ca_path, ca_cert.pem()).unwrap();
+    (
+        cert_path.to_string_lossy().into_owned(),
+        key_path.to_string_lossy().into_owned(),
+        ca_path.to_string_lossy().into_owned(),
+    )
+}

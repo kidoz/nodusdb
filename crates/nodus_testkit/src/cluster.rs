@@ -45,6 +45,9 @@ struct Running {
 
 /// One cluster member: fixed ports + a persistent data dir, plus its running
 /// server (absent while stopped).
+/// Extra per-node configuration hook (see [`ClusterFixture::start_with`]).
+type ConfigHook = std::sync::Arc<dyn Fn(&mut NodusConfig) + Send + Sync>;
+
 pub struct ClusterNode {
     pub node_id: u64,
     pub http_port: u16,
@@ -55,6 +58,14 @@ pub struct ClusterNode {
     _data_dir: TempDir,
     data_path: PathBuf,
     running: Option<Running>,
+    /// Extra configuration applied after the fixture defaults (e.g. a shared
+    /// backup repository).
+    configure: Option<ConfigHook>,
+    /// Prebound dedicated raft peer listener (mTLS clusters), or None to share
+    /// the HTTP listener.
+    raft_listener: Option<TcpListener>,
+    /// Peer mTLS config (set for `start_cluster_mtls`).
+    tls_config: Option<nodus_config::ClusterTlsConfig>,
 }
 
 impl ClusterNode {
@@ -75,10 +86,23 @@ impl ClusterNode {
         config.admin.password = Some("nodus".into());
         config.admin.token = Some(ADMIN_TOKEN.into());
         config.cluster.node_id = self.node_id;
-        config.cluster.raft_advertise_addr = self.http_addr();
+        config.cluster.raft_advertise_addr = match &self.raft_listener {
+            Some(listener) => listener.local_addr().unwrap().to_string(),
+            None => self.http_addr(),
+        };
+        config.cluster.raft_listen_addr = self
+            .raft_listener
+            .as_ref()
+            .map(|listener| listener.local_addr().unwrap().to_string());
         config.cluster.join_peers = self.seed_http.clone().into_iter().collect();
         config.storage.data_dir = Some(self.data_path.to_string_lossy().into_owned());
+        if let Some(tls) = &self.tls_config {
+            config.cluster.tls = tls.clone();
+        }
         crate::apply_fast_raft_timers(&mut config);
+        if let Some(configure) = &self.configure {
+            configure(&mut config);
+        }
         config
     }
 
@@ -95,10 +119,21 @@ impl ClusterNode {
         http_listener: TcpListener,
     ) -> Result<()> {
         let (shutdown_tx, shutdown_rx) = watch::channel(());
-        let handle =
-            run_server_with_config(pgwire_listener, http_listener, self.config(), shutdown_rx)
-                .await
-                .with_context(|| format!("starting node {}", self.node_id))?;
+        let config = self.config();
+        let raft_listener = self.raft_listener.take();
+        let handle = if let Some(raft_listener) = raft_listener {
+            nodus_server::run_server_full(
+                pgwire_listener,
+                http_listener,
+                Some(raft_listener),
+                config,
+                shutdown_rx,
+            )
+            .await
+        } else {
+            run_server_with_config(pgwire_listener, http_listener, config, shutdown_rx).await
+        }
+        .with_context(|| format!("starting node {}", self.node_id))?;
         self.running = Some(Running {
             handle,
             shutdown_tx,
@@ -130,6 +165,42 @@ impl ClusterFixture {
     /// Starts an `n`-node cluster (node 1 seeds; 2..=n join it) and waits until
     /// the seed reports all `n` nodes live.
     pub async fn start(n: usize) -> Result<Self> {
+        Self::start_inner(n, None, None).await
+    }
+
+    /// Like [`Self::start`], with a per-node configuration hook applied after
+    /// the fixture defaults (e.g. a shared backup repository URI).
+    pub async fn start_with(
+        n: usize,
+        configure: impl Fn(&mut NodusConfig) + Send + Sync + 'static,
+    ) -> Result<Self> {
+        let configure: ConfigHook = std::sync::Arc::new(configure);
+        Self::start_inner(n, Some(configure), None).await
+    }
+
+    /// Starts an mTLS cluster: every node serves a dedicated raft peer listener
+    /// with mandatory client-certificate TLS (`certs` = node cert, key, cluster
+    /// CA from [`crate::write_test_certs`]). Admin/pgwire stay plain loopback.
+    pub async fn start_cluster_mtls(
+        n: usize,
+        certs: &(String, String, String),
+        configure: impl Fn(&mut NodusConfig) + Send + Sync + 'static,
+    ) -> Result<Self> {
+        let configure: ConfigHook = std::sync::Arc::new(configure);
+        let tls = nodus_config::ClusterTlsConfig {
+            enabled: true,
+            cert_path: Some(certs.0.clone()),
+            key_path: Some(certs.1.clone()),
+            ca_path: Some(certs.2.clone()),
+        };
+        Self::start_inner(n, Some(configure), Some(tls)).await
+    }
+
+    async fn start_inner(
+        n: usize,
+        configure: Option<ConfigHook>,
+        tls_config: Option<nodus_config::ClusterTlsConfig>,
+    ) -> Result<Self> {
         assert!(n >= 1, "a cluster needs at least one node");
         let http = reqwest::Client::new();
 
@@ -156,6 +227,12 @@ impl ClusterFixture {
                 _data_dir: dir,
                 data_path,
                 running: None,
+                configure: configure.clone(),
+                raft_listener: match &tls_config {
+                    Some(_) => Some(bind_reuse(0)?),
+                    None => None,
+                },
+                tls_config: tls_config.clone(),
             });
             listeners.push((pgwire_listener, http_listener));
         }

@@ -2599,6 +2599,7 @@ dependencies = [
  "nodus_security",
  "nodus_server",
  "porcupine-rs",
+ "rcgen",
  "reqwest",
  "serde_json",
  "tempfile",
