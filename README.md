@@ -24,21 +24,16 @@ NodusDB targets high-load OLTP workloads by combining the familiar PostgreSQL in
 - **Online Backup & Restore**: Streamlined physical snapshotting and Point-In-Time-Recovery (PITR) mechanisms.
 - **Observability First**: Built-in Prometheus metrics (`/metrics`), `/healthz`, and `/readyz` endpoints out-of-the-box.
 
-### Shard administration limitation
+### Shard administration
 
-Shard initialization, split, merge, and rebalance currently return HTTP `501`
-with code `shard_migration_unavailable`. These operations are disabled until
-durable migration and cluster-wide fencing can preserve committed data during
-routing changes. This includes initialization of an empty table, which can race
-concurrent writes. Read-only shard inspection and replication of existing shard
-placements remain available. This safeguard does not repair data made unreachable
-by earlier shard operations.
-
-A dormant [migration protocol foundation](docs/explanation/shard-migration-protocol.md)
-now persists operation journals and participant epochs, rejects stale writes at
-Raft apply, and refuses to fence participants with pending transactions. It is
-tested through direct Raft submissions. Network activation and the migration
-coordinator remain unavailable, so public shard mutations stay disabled.
+Shard initialization, split, merge, and rebalance are available after the
+cluster finalizes migration level 3 (`migration-v3`); before then they return
+HTTP `501`. The [migration protocol](docs/explanation/shard-migration-protocol.md)
+journals fencing, copy validation, conditional routing publication, and recovery.
+Data groups currently replicate to every member, so rebalance changes primacy
+rather than moving bytes. Source-group decommission after migration is
+driver-local; replicas on other members remain inert until roster-wide teardown
+is reconciled.
 
 For existing sharded tables, row scans visit every intersecting shard in key
 order at the transaction's fixed MVCC read timestamp. Version scans include

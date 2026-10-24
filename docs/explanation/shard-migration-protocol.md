@@ -1,14 +1,16 @@
 # Shard migration protocol
 
-**Status: partially activated.** The durable pre-copy coordinator, the V3
+**Status: partially activated.** The durable pre-copy coordinator, V3
 copy/cutover journal and driver, epoch-aware SQL write paths, authenticated
-mTLS forwarding of migration-protocol commands, and the meta-leader
-journal-discovery worker are implemented and tested. **Shard initialization is
-enabled** once the durable upgrade authority finalizes the migration cluster
-level; split, merge, and rebalance remain disabled (501) pending their fault
-matrices. Pre-finalization, SQL submission and HTTP ingress reject the
-migration command variants; there is no runtime switch to bypass verified
-cluster compatibility. Sections marked as design remain the agreed target.
+mTLS forwarding, and meta-leader journal-discovery worker are implemented and
+tested. Shard **init, split, merge, and rebalance are enabled** once the durable
+upgrade authority finalizes migration level 3. Pre-finalization, SQL submission
+and HTTP ingress reject migration commands and public operations return 501;
+there is no runtime switch to bypass cluster compatibility. Data groups
+currently replicate to every cluster member. Source-group decommission at
+`Done` is driver-local: replicas on other members remain inert until
+roster-wide teardown is reconciled. Sections marked as design remain the agreed
+target.
 
 ## Coordinator journal
 
