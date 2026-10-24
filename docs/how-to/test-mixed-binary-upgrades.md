@@ -7,19 +7,18 @@ must not erase the protocol boundary being tested.
 
 The October 19, 2026 pinned-pair run **passed all thirteen checkpoints in 277.55 seconds**
 with `passed: true`, `matrix_completed: true` and an empty blocker list. The
-working-tree candidate run at clean commit `2d1133d` (no patch delta; binary
-`77631c7f0825ce241d55ffa141b2bad7079d8e6f345140a89da3811173d2e7b3`) also
-**passed all thirteen checkpoints in 283.91 seconds**, with the same acceptance
-fields and no blockers. That candidate adds the inert level-3 upgrade-authority
-scaffolding (`migration-v3` target), the V3 migration journal spine with its
-bounded copy/cutover driver, the meta-leader journal-discovery worker,
-transport-based forwarding for all peer writes (mTLS-checked for
-migration-protocol commands), and level-3-gated shard init, split, merge, and
-rebalance; the matrix proves the level 1→2 flows and record formats are
-unchanged for mixed binaries. The pinned run did not use `--candidate`; neither run used
-`--diagnose`. Both snapshot directions, executable rollback before
-admission, admission refusals, four-node admission and crash/restart recovery
-passed. All five committed rows survived; the aborted row remained absent. No
+October 24 working-tree candidate run at commit
+`45106f9ffabe8f9fe58dd912004fdeaf6d30a69c` plus patch
+`58ef1210f32520ca6533ef66900cdc8e008cecf92f186b82da6734c3267a4925`
+(binary `5892ac94d7e12f83b5fc3c42cd34ab0cb2f4144cae1229861ea56516eba6615e`)
+also **passed all thirteen checkpoints in 278.416 seconds**, with the same
+acceptance fields and no blockers. The candidate includes the level-3 migration
+and cluster-backup work plus the prepared-query and transaction-lock fixes; the
+matrix proves the level 1→2 flows and record formats are unchanged for mixed
+binaries. The pinned run did not use `--candidate`; neither run used
+`--diagnose`. Both snapshot directions, executable rollback before admission,
+admission refusals, four-node admission and crash/restart recovery passed. All
+five committed rows survived; the aborted row remained absent. No
 snapshot-login restart was needed.
 
 The maintenance baseline now includes the bounded atomic purge/recovery fix and a
