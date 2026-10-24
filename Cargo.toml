@@ -27,6 +27,7 @@ members = [
     "crates/nodus_raftstore",
     "crates/nodus_backup",
     "crates/nodus_import",
+    "crates/nodus_iceberg",
     "crates/nodus_telemetry",
     "tests/integration",
     "tests/compatibility",
@@ -77,6 +78,15 @@ num-traits = "0.2.19"
 unicode-normalization = "0.1.25"
 proptest = "1.11.0"
 criterion = "0.8.2"
+iceberg = "=0.10.1"
+iceberg-catalog-rest = "=0.10.1"
+object_store = { version = "0.14.2", features = ["aws"] }
+typetag = "0.2"
+arrow-array = "58"
+arrow-schema = "58"
+arrow-ipc = "58"
+# The REST client currently exposes reqwest 0.12 in its custom-client API.
+iceberg-http = { package = "reqwest", version = "0.12", default-features = false, features = ["rustls-tls"] }
 
 [workspace.lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(madsim)'] }

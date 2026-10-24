@@ -2,6 +2,9 @@ use clap::{Parser, Subcommand};
 use nodus_monitoring::ClusterOverview;
 use reqwest::Client;
 
+#[cfg(feature = "iceberg")]
+mod iceberg;
+
 #[derive(Parser)]
 #[command(author, version, about = "CLI for NodusDB", long_about = None)]
 struct Cli {
@@ -28,6 +31,12 @@ fn build_client(token: Option<&str>) -> anyhow::Result<Client> {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Read external Iceberg tables (uses catalog credentials, not admin credentials)
+    #[cfg(feature = "iceberg")]
+    Iceberg {
+        #[command(subcommand)]
+        cmd: iceberg::IcebergCommand,
+    },
     /// Show client version
     Version,
     /// Check liveness of the server
@@ -336,6 +345,14 @@ enum SessionCmd {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    #[cfg(feature = "iceberg")]
+    if let Commands::Iceberg { cmd } = &cli.command {
+        anyhow::ensure!(
+            cli.token.is_none(),
+            "--token is for NodusDB administration; use NODUS_ICEBERG_TOKEN for the external catalog"
+        );
+        return iceberg::run(cmd).await;
+    }
     let token = cli
         .token
         .clone()
@@ -343,6 +360,8 @@ async fn main() -> anyhow::Result<()> {
     let client = build_client(token.as_deref())?;
 
     match &cli.command {
+        #[cfg(feature = "iceberg")]
+        Commands::Iceberg { cmd } => iceberg::run(cmd).await?,
         Commands::Version => {
             println!("nodusctl {}", env!("CARGO_PKG_VERSION"));
         }

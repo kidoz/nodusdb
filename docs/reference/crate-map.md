@@ -11,6 +11,7 @@ the answer is usually an existing crate.
 | `nodus_sql` | Parsing and SQL-facing planning concepts (wraps `sqlparser` with the PostgreSQL dialect). |
 | `nodus_executor` | Planning, execution, operator orchestration, expression evaluation, DML, constraints. |
 | `nodus_import` | Sink-agnostic import of plain-format PostgreSQL dumps: splitter, classifier, rewriter, `COPY` decoder, import report. |
+| `nodus_iceberg` | Read-only external Iceberg REST snapshots and Arrow batches. Used by the optional CLI integration; isolated from the OLTP executor and its storage contracts. |
 
 ## Catalog and metadata
 

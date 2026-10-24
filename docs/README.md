@@ -27,6 +27,7 @@ out, and every step is one you can complete.
 Recipes for people who already know what they want.
 
 - [Import a PostgreSQL dump](how-to/import-a-postgresql-dump.md)
+- [Read external Iceberg tables](how-to/read-iceberg-tables.md)
 - [Back up and restore](how-to/back-up-and-restore.md)
 - [Run the test suites](how-to/run-the-test-suites.md)
 - [Run the benchmarks](how-to/run-benchmarks.md)

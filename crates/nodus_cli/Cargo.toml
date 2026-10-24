@@ -7,6 +7,10 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
+[features]
+default = []
+iceberg = ["dep:nodus_iceberg", "dep:arrow-ipc", "dep:tempfile"]
+
 [dependencies]
 clap.workspace = true
 reqwest.workspace = true
@@ -14,10 +18,17 @@ tokio.workspace = true
 anyhow.workspace = true
 serde_json.workspace = true
 nodus_monitoring = { path = "../nodus_monitoring" }
+nodus_iceberg = { path = "../nodus_iceberg", optional = true }
+arrow-ipc = { workspace = true, optional = true }
+tempfile = { version = "3", optional = true }
 
 [dev-dependencies]
 nodus_testkit = { path = "../nodus_testkit" }
 nodus_config = { path = "../nodus_config" }
+iceberg.workspace = true
+arrow-array.workspace = true
+axum.workspace = true
+parquet = "58"
 
 [lints]
 workspace = true
