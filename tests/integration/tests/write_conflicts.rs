@@ -104,3 +104,92 @@ async fn commit_conflict_releases_the_losers_intents() {
         .unwrap();
     assert_eq!(value(&a).await, None);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn concurrent_reads_and_unique_writes_do_not_deadlock() {
+    let (_server, a, b) = setup().await;
+    let mut clients = vec![a, b];
+    for _ in 2..8 {
+        clients.push(connect(&_server.pgwire_addr).await);
+    }
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(9));
+    let mut tasks = Vec::new();
+    for (worker, client) in clients.into_iter().enumerate() {
+        let barrier = barrier.clone();
+        tasks.push(tokio::spawn(async move {
+            barrier.wait().await;
+            for i in (worker..40).step_by(8) {
+                if i % 5 == 0 {
+                    let id = (worker * 100 + i) as i32 + 10;
+                    client
+                        .execute("INSERT INTO cc VALUES ($1, $1)", &[&id])
+                        .await
+                        .unwrap();
+                } else {
+                    client
+                        .query_one("SELECT v FROM cc WHERE id = $1", &[&1i32])
+                        .await
+                        .unwrap();
+                }
+            }
+        }));
+    }
+    barrier.wait().await;
+    tokio::time::timeout(
+        Duration::from_secs(20),
+        futures_util::future::join_all(tasks),
+    )
+    .await
+    .expect("mixed reads and writes deadlocked")
+    .into_iter()
+    .collect::<Result<Vec<_>, _>>()
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn concurrent_deferred_constraint_checks_do_not_deadlock() {
+    let (_server, a, b) = setup().await;
+    a.batch_execute(
+        "CREATE TABLE dc (id INT PRIMARY KEY, u INT UNIQUE DEFERRABLE INITIALLY DEFERRED)",
+    )
+    .await
+    .unwrap();
+    let mut clients = vec![std::sync::Arc::new(a), std::sync::Arc::new(b)];
+    for _ in 2..8 {
+        clients.push(std::sync::Arc::new(connect(&_server.pgwire_addr).await));
+    }
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(9));
+
+    for round in 0..2 {
+        let mut tasks = Vec::new();
+        for (worker, client) in clients.iter().cloned().enumerate() {
+            let barrier = barrier.clone();
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                for i in (worker..16).step_by(8) {
+                    let id = (round * 1_000 + worker * 100 + i) as i32 + 10;
+                    if round == 1 {
+                        client.batch_execute("BEGIN").await.unwrap();
+                    }
+                    client
+                        .execute("INSERT INTO dc VALUES ($1, $1)", &[&id])
+                        .await
+                        .unwrap();
+                    if round == 1 {
+                        client.batch_execute("COMMIT").await.unwrap();
+                    }
+                }
+            }));
+        }
+        barrier.wait().await;
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            futures_util::future::join_all(tasks),
+        )
+        .await
+        .expect("deferred constraint checks deadlocked")
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    }
+}

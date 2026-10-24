@@ -766,6 +766,12 @@ impl MemExecutor {
             Some(role) if role.session_authorization => role.name.clone(),
             _ => authenticated.clone(),
         };
+        let in_explicit_txn = self
+            .active_txns
+            .read()
+            .get(&ctx.session_id)
+            .is_some_and(|t| t.explicit);
+        let read_ts = self.read_ts(&ctx.session_id);
         session_env::SessionEnv {
             user: session_role.map_or(authenticated, |role| role.name),
             session_user,
@@ -789,11 +795,7 @@ impl MemExecutor {
             advisory: Some(self.advisory.clone()),
             stats: Some(self.stats.clone()),
             authz: Some((self.authz.clone(), ctx.principal_id)),
-            in_explicit_txn: self
-                .active_txns
-                .read()
-                .get(&ctx.session_id)
-                .is_some_and(|t| t.explicit),
+            in_explicit_txn,
             transaction_micros,
             statement_micros,
             backend_pid,
@@ -802,7 +804,7 @@ impl MemExecutor {
             sequences: Some(self.sequences.clone()),
             catalog: Some(self.catalog_reader.clone()),
             types: Some(self.types_catalog.clone()),
-            storage: Some((self.kv.clone(), self.read_ts(&ctx.session_id))),
+            storage: Some((self.kv.clone(), read_ts)),
         }
     }
 
@@ -2178,13 +2180,14 @@ impl MemExecutor {
             // implicit transaction commits, while its own writes are still
             // visible to the checks: the violation fails the statement, as
             // PostgreSQL reports it then.
+            let deferred = self
+                .active_txns
+                .read()
+                .get(&ctx.session_id)
+                .map(|txn| (txn.constraint_modes.clone(), txn.deferred_tables.clone()));
             if result.is_ok()
-                && let Some(txn) = self.active_txns.read().get(&ctx.session_id)
-                && let Err(error) = self.check_deferred_constraints(
-                    ctx,
-                    &txn.constraint_modes,
-                    &txn.deferred_tables,
-                )
+                && let Some((modes, tables)) = deferred
+                && let Err(error) = self.check_deferred_constraints(ctx, &modes, &tables)
             {
                 result = Err(error);
             }

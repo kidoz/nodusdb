@@ -419,11 +419,12 @@ impl MemExecutor {
         // Deferred constraints are enforced here, while the transaction's
         // own writes are still visible to the checks: a violation fails the
         // commit, and the transaction is lost, as in PostgreSQL.
-        let check = {
+        let (modes, tables) = {
             let guard = self.active_txns.read();
             let txn = guard.get(&ctx.session_id).expect("checked above");
-            self.check_deferred_constraints(ctx, &txn.constraint_modes, &txn.deferred_tables)
+            (txn.constraint_modes.clone(), txn.deferred_tables.clone())
         };
+        let check = self.check_deferred_constraints(ctx, &modes, &tables);
         let txn = self
             .active_txns
             .write()
