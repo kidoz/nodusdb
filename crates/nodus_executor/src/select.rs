@@ -533,7 +533,9 @@ impl MemExecutor {
                     .map(|c| format!("{}.{}", prefix, c.name))
                     .collect();
 
-                let mut rows = None;
+                // LIMIT 0 never pulls from the base relation. Describe probes
+                // use it to obtain the result schema without a storage scan.
+                let mut rows = (limit == Some(0)).then_some(Vec::new());
                 // The index that supplied the rows, for the scan's
                 // statistics (`pg_stat_user_tables`/`_indexes`).
                 let mut scanned_index: Option<nodus_catalog::IndexId> = None;
@@ -586,7 +588,8 @@ impl MemExecutor {
                 // Equality on an indexed column uses the index. The session's
                 // uncommitted overlay is merged into the result, so the index is
                 // usable inside a transaction rather than forcing a full scan.
-                if sample.is_none()
+                if rows.is_none()
+                    && sample.is_none()
                     && descendants.is_empty()
                     && let Some((col, right)) = tbl.indexes.iter().find_map(|idx| {
                         let key = idx.key_columns.first()?;
@@ -609,6 +612,28 @@ impl MemExecutor {
                     .into_iter()
                     {
                         let val = self.eval_operand(&[], &[], &[], &right, &col.data_type);
+                        if idx.index_type == nodus_catalog::IndexType::Primary
+                            && col_pos.is_some_and(|position| {
+                                Self::pk_positions_declared(&tbl) == vec![position]
+                            })
+                            && !Self::uses_synthetic_rowid(&tbl)
+                            && matches!(val, Value::Int(_) | Value::Text(_) | Value::Bool(_))
+                        {
+                            let pk = Self::row_pk(&[0], std::slice::from_ref(&val));
+                            let indexed_rows = self
+                                .get_row(tbl.id, &pk, &ctx.session_id)?
+                                .map(|row| vec![(pk, row)])
+                                .unwrap_or_default();
+                            scanned_index = Some(idx.id);
+                            rows = Some(self.merge_overlay_eq(
+                                indexed_rows,
+                                tbl.id,
+                                col_pos,
+                                &val,
+                                &ctx.session_id,
+                            ));
+                            break;
+                        }
                         let only = index_only
                             .as_ref()
                             .is_some_and(|needed| {
@@ -621,9 +646,14 @@ impl MemExecutor {
                             .flatten();
                         // An equality whose key prefix holds much of the
                         // table reads the heap through a bitmap, as
-                        // PostgreSQL plans it.
+                        // PostgreSQL plans it. A single-column unique key has
+                        // at most one match, so costing a bitmap must not
+                        // scan the whole table before the point lookup.
                         let hex = crate::index_keys::key_component(&val, &col.data_type);
                         let bitmap = hex.as_deref().is_some_and(|hex| {
+                            if idx.unique && idx.key_columns.len() == 1 {
+                                return false;
+                            }
                             let table_rows = self
                                 .scan_rows(tbl.id, &ctx.session_id)
                                 .map(|rows| rows.len() as f64)
@@ -976,7 +1006,7 @@ impl MemExecutor {
                 };
                 // The descendants' rows join the table's, and the sample
                 // applies to the whole scan.
-                let rows = if descendants.is_empty() {
+                let rows = if descendants.is_empty() || limit == Some(0) {
                     rows
                 } else {
                     self.inherited_rows(ctx, &tbl)?

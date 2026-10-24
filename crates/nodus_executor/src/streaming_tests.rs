@@ -177,7 +177,7 @@ fn exec_with_rows(
                     name: "id".into(),
                     data_type: "INT".into(),
                     nullable: false,
-                    unique: false,
+                    unique: true,
                     primary: true,
                     default: None,
                     sequence: None,
@@ -463,6 +463,87 @@ fn pushdown_returns_the_same_rows_as_the_full_pipeline() {
             "LIMIT {limit} OFFSET {offset} must match the full pipeline's slice"
         );
     }
+}
+
+#[test]
+fn limit_zero_returns_schema_without_scanning() {
+    let (exec, scanned, _read_ts, ctx) = exec_with_rows(150);
+
+    scanned.store(0, Ordering::SeqCst);
+    let out = exec
+        .execute_logical(&ctx, select_plan(Some(0), None, None))
+        .unwrap();
+
+    assert!(out.rows.is_empty());
+    assert_eq!(out.columns, vec!["id", "name"]);
+    assert_eq!(out.types, vec!["INT", "TEXT"]);
+    assert_eq!(scanned.load(Ordering::SeqCst), 0);
+
+    let filter = Some(FilterExpr::Predicate(Predicate {
+        left: "id".into(),
+        op: CompareOp::Eq,
+        right: Operand::Literal(Value::Int(7)),
+    }));
+    let out = exec
+        .execute_logical(&ctx, select_plan(Some(0), None, filter))
+        .unwrap();
+    assert!(out.rows.is_empty());
+    assert_eq!(scanned.load(Ordering::SeqCst), 0);
+
+    let statement = nodus_sql::parse_sql("CREATE TABLE child () INHERITS (t)")
+        .unwrap()
+        .remove(0);
+    exec.execute_logical(&ctx, plan_statement(&statement, &[]).unwrap())
+        .unwrap();
+    scanned.store(0, Ordering::SeqCst);
+    let out = exec
+        .execute_logical(&ctx, select_plan(Some(0), None, None))
+        .unwrap();
+    assert!(out.rows.is_empty());
+    assert_eq!(scanned.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn primary_equality_reads_the_row_without_a_table_scan() {
+    let (exec, scanned, _read_ts, ctx) = exec_with_rows(150);
+    let filter = Some(FilterExpr::Predicate(Predicate {
+        left: "id".into(),
+        op: CompareOp::Eq,
+        right: Operand::Literal(Value::Int(7)),
+    }));
+
+    scanned.store(0, Ordering::SeqCst);
+    let out = exec
+        .execute_logical(&ctx, select_plan(None, None, filter))
+        .unwrap();
+
+    assert_eq!(out.rows.len(), 1);
+    assert_eq!(out.rows[0].values[0], Value::Int(7));
+    assert_eq!(
+        scanned.load(Ordering::SeqCst),
+        0,
+        "a primary-key lookup should fetch the row directly"
+    );
+}
+
+#[test]
+fn bound_primary_equality_reads_the_row_without_a_table_scan() {
+    let (exec, scanned, _read_ts, ctx) = exec_with_rows(150);
+    let statement = nodus_sql::parse_sql("SELECT id, name FROM t WHERE id = $1")
+        .unwrap()
+        .remove(0);
+    let plan = plan_statement(&statement, &[Value::Int(7)]).unwrap();
+
+    scanned.store(0, Ordering::SeqCst);
+    let out = exec.execute_logical(&ctx, plan).unwrap();
+
+    assert_eq!(out.rows.len(), 1);
+    assert_eq!(out.rows[0].values[0], Value::Int(7));
+    assert_eq!(
+        scanned.load(Ordering::SeqCst),
+        0,
+        "a bound primary-key lookup should fetch the row directly"
+    );
 }
 
 #[test]
