@@ -12,11 +12,11 @@ use nodus_testkit::TestServer;
 use std::time::{Duration, Instant};
 use tokio_postgres::NoTls;
 
-const FULL_ROWS: usize = 1_000;
+const FULL_ROWS: usize = 10_000;
 
 fn rows() -> usize {
     match std::env::var("NODUS_BENCH_SCALE").as_deref() {
-        Ok("smoke") => FULL_ROWS / 10,
+        Ok("smoke") => FULL_ROWS / 100,
         _ => FULL_ROWS,
     }
 }
@@ -29,6 +29,9 @@ fn smoke() -> bool {
 /// lands in the seconds range on fsync-bound writes; smoke is a CI sanity
 /// floor at 1/100 of the dataset with proportionally fewer ops.
 fn ops(smoke_ops: usize, full_ops: usize) -> usize {
+    if let Ok(value) = std::env::var("NODUS_BENCH_OPS") {
+        return value.parse().unwrap();
+    }
     if smoke() { smoke_ops } else { full_ops }
 }
 
@@ -130,6 +133,29 @@ fn bench_point_insert(c: &mut Criterion) {
 fn bench_point_read(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let (_server, client, _dir) = rt.block_on(server_with_rows(rows()));
+    if std::env::var("BENCH_DEBUG").is_ok() {
+        rt.block_on(async {
+            for row in client
+                .query("EXPLAIN (ANALYZE) SELECT note FROM bench WHERE id = 1", &[])
+                .await
+                .unwrap()
+            {
+                eprintln!("plan: {}", row.get::<usize, String>(0));
+            }
+            let start = Instant::now();
+            client
+                .query_one("SELECT note FROM bench WHERE id = 1", &[])
+                .await
+                .unwrap();
+            eprintln!("literal read: {:?}", start.elapsed());
+            let start = Instant::now();
+            client
+                .query_one("SELECT note FROM bench WHERE id = $1", &[&1i32])
+                .await
+                .unwrap();
+            eprintln!("bound read: {:?}", start.elapsed());
+        });
+    }
     let n = ops(200, 1_000);
     let mut group = c.benchmark_group("server/point_read");
     group.throughput(Throughput::Elements(n as u64));
@@ -153,30 +179,63 @@ fn bench_point_read(c: &mut Criterion) {
     rt.block_on(_server.shutdown());
 }
 
+async fn connect_addr(addr: std::net::SocketAddr) -> std::sync::Arc<tokio_postgres::Client> {
+    let (client, connection) = tokio_postgres::connect(
+        &format!(
+            "host={} port={} user=nodus password=nodus dbname=default",
+            addr.ip(),
+            addr.port()
+        ),
+        NoTls,
+    )
+    .await
+    .unwrap();
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    std::sync::Arc::new(client)
+}
+
 fn bench_mixed_oltp(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let (_server, client, _dir) = rt.block_on(server_with_rows(rows()));
+    let (_server, _client, _dir) = rt.block_on(server_with_rows(rows()));
+    let clients = rt.block_on(async {
+        let mut clients = Vec::new();
+        for _ in 0..8 {
+            clients.push(connect_addr(_server.pgwire_addr).await);
+        }
+        clients
+    });
+    let next_id = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(2_000_000));
     let n = ops(100, 500);
     let mut group = c.benchmark_group("server/mixed_oltp");
     group.throughput(Throughput::Elements(n as u64));
     group.bench_function(BenchmarkId::from_parameter(n), |b| {
         b.iter_custom(|iters| {
-            let client = client.clone();
+            let clients = clients.clone();
+            let next_id = next_id.clone();
             rt.block_on(async {
                 let start = Instant::now();
                 let mut tasks = Vec::new();
-                for worker in 0..8 {
-                    let client = client.clone();
+                let total = iters as usize * n;
+                for (worker, client) in clients.iter().cloned().enumerate() {
+                    let next_id = next_id.clone();
+                    let first = total * worker / 8;
+                    let end = total * (worker + 1) / 8;
                     tasks.push(tokio::spawn(async move {
-                        for i in 0..(iters as usize * n) / 8 {
-                            let id = ((worker + i) % rows()) as i32 + 1;
+                        for i in first..end {
+                            let debug = std::env::var("BENCH_DEBUG").is_ok();
+                            let op_start = Instant::now();
+                            if debug {
+                                eprintln!("mixed worker={worker} op={i} start");
+                            }
+                            let id = (i % rows()) as i32 + 1;
                             if i % 5 == 0 {
-                                // 20% writes
+                                let write_id = next_id
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                    as i32;
                                 client
-                                    .execute(
-                                        "INSERT INTO bench VALUES ($1, 'w') ON CONFLICT (id) DO NOTHING",
-                                        &[&(i as i32 + 2_000_000)],
-                                    )
+                                    .execute("INSERT INTO bench VALUES ($1, 'w')", &[&write_id])
                                     .await
                                     .unwrap();
                             } else {
@@ -184,6 +243,12 @@ fn bench_mixed_oltp(c: &mut Criterion) {
                                     .query_one("SELECT note FROM bench WHERE id = $1", &[&id])
                                     .await
                                     .unwrap();
+                            }
+                            if debug {
+                                eprintln!(
+                                    "mixed worker={worker} op={i} done in {:?}",
+                                    op_start.elapsed()
+                                );
                             }
                         }
                     }));
@@ -251,8 +316,8 @@ fn bench_range_scan(c: &mut Criterion) {
     rt.block_on(_server.shutdown());
 }
 
-/// Three-node mTLS cluster: mixed OLTP against the seed with reads sampled
-/// from every member. Skipped in smoke mode (cluster formation dominates).
+/// Three-node mTLS cluster: eight clients distributed across every member.
+/// Skipped in smoke mode (cluster formation dominates).
 fn bench_replicated_oltp(c: &mut Criterion) {
     if smoke() {
         return;
@@ -270,33 +335,42 @@ fn bench_replicated_oltp(c: &mut Criterion) {
             .unwrap();
         preload(&seed, rows(), 1).await;
         let mut clients = Vec::new();
-        for idx in 0..3 {
-            clients.push(connect_node(&cluster, idx).await);
+        for idx in 0..8 {
+            clients.push(connect_node(&cluster, idx % 3).await);
         }
         (cluster, clients, dir)
     });
     let _keep = &cluster;
+    let next_id = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(3_000_000));
     let n = ops(0, 200);
     let mut group = c.benchmark_group("server/replicated_oltp");
     group.throughput(Throughput::Elements(n as u64));
     group.bench_function(BenchmarkId::from_parameter(n), |b| {
         b.iter_custom(|iters| {
             let clients = clients.clone();
+            let next_id = next_id.clone();
             rt.block_on(async {
                 let start = Instant::now();
                 let mut tasks = Vec::new();
-                for worker in 0..8 {
-                    let clients = clients.clone();
+                let total = iters as usize * n;
+                for (worker, client) in clients.iter().cloned().enumerate() {
+                    let next_id = next_id.clone();
+                    let first = total * worker / 8;
+                    let end = total * (worker + 1) / 8;
                     tasks.push(tokio::spawn(async move {
-                        for i in 0..(iters as usize * n) / 8 {
-                            let id = ((worker + i) % rows()) as i32 + 1;
-                            let client = &clients[(worker + i) % 3];
+                        for i in first..end {
+                            let debug = std::env::var("BENCH_DEBUG").is_ok();
+                            let op_start = Instant::now();
+                            if debug {
+                                eprintln!("mixed worker={worker} op={i} start");
+                            }
+                            let id = (i % rows()) as i32 + 1;
                             if i % 5 == 0 {
+                                let write_id = next_id
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                    as i32;
                                 client
-                                    .execute(
-                                        "INSERT INTO bench VALUES ($1, 'w') ON CONFLICT (id) DO NOTHING",
-                                        &[&(i as i32 + 3_000_000)],
-                                    )
+                                    .execute("INSERT INTO bench VALUES ($1, 'w')", &[&write_id])
                                     .await
                                     .unwrap();
                             } else {
@@ -304,6 +378,12 @@ fn bench_replicated_oltp(c: &mut Criterion) {
                                     .query_one("SELECT note FROM bench WHERE id = $1", &[&id])
                                     .await
                                     .unwrap();
+                            }
+                            if debug {
+                                eprintln!(
+                                    "mixed worker={worker} op={i} done in {:?}",
+                                    op_start.elapsed()
+                                );
                             }
                         }
                     }));
@@ -322,21 +402,7 @@ async fn connect_node(
     cluster: &nodus_testkit::cluster::ClusterFixture,
     idx: usize,
 ) -> std::sync::Arc<tokio_postgres::Client> {
-    let addr = cluster.nodes[idx].pgwire_addr();
-    let (client, connection) = tokio_postgres::connect(
-        &format!(
-            "host={} port={} user=nodus password=nodus dbname=default",
-            addr.ip(),
-            addr.port()
-        ),
-        NoTls,
-    )
-    .await
-    .unwrap();
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    std::sync::Arc::new(client)
+    connect_addr(cluster.nodes[idx].pgwire_addr()).await
 }
 
 criterion_group! {

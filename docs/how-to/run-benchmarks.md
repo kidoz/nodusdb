@@ -17,6 +17,23 @@ That is `cargo bench -p nodus_storage_lsm`. Criterion writes its HTML reports
 and raw samples under `target/criterion`, which is build output — never commit
 it.
 
+## Run the server SQL benchmarks
+
+The server harness exercises real pgwire connections, persistent storage, and
+an optional three-node mTLS cluster:
+
+```bash
+cargo bench --locked -p nodus_integration_tests --bench server_bench
+NODUS_BENCH_SCALE=smoke cargo bench --locked -p nodus_integration_tests --bench server_bench
+```
+
+The full run uses the fixed datasets in
+[Server-level SQL workloads](../../benchmarks/workloads/server_sql.md) and can
+take a long time on fsync-bound storage. Smoke mode uses 1/100 of the dataset
+and skips the cluster variant. Run one workload by appending a filter, for
+example `-- point_read`. Do not run another build or test suite during a
+baseline capture.
+
 ## Check that they still compile
 
 Compiling the benchmarks is much faster than running them, and it is what CI
