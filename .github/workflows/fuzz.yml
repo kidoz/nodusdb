@@ -9,6 +9,9 @@ jobs:
   fuzz:
     name: AFL smoke tests (10 seconds per target)
     runs-on: ubuntu-latest
+    env:
+      AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES: '1'
+      AFL_SKIP_CPUFREQ: '1'
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
